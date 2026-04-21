@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Pre-commit hook — four gates:
+#   1. Merge conflict marker check (native git)
+#   2. CLAUDE.md size cap (prevents regression of the shrink work)
+#   3. Secret scan on staged diff (21 high-signal provider patterns)
+#   4. zig fmt --check on staged .zig files
+#
+# Bypass with: git commit --no-verify
+# Origin: Research/zig-session-analysis.md + zig-session-improvements.md (P7+)
+
+set -euo pipefail
+
+# ----- Gate 1: native merge-conflict marker check -----
+if ! git diff --cached --check >/dev/null 2>&1; then
+  echo "pre-commit: merge conflict markers or whitespace errors in staged content:" >&2
+  git diff --cached --check >&2 || true
+  echo "" >&2
+  echo "  Fix the markers / whitespace, re-stage, and commit again." >&2
+  echo "  Bypass (dangerous): git commit --no-verify" >&2
+  exit 1
+fi
+
+# ----- Gate 2: CLAUDE.md size cap -----
+# Threshold: 20 KB (~5K tokens). Current files range 3.7-11.6 KB so we have headroom;
+# a growth past 20 KB indicates the kind of drift that motivated the P1 split work.
+CLAUDE_CAP=20000
+if git diff --cached --name-only | grep -qE '(^|/)CLAUDE\.md$'; then
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    size=$(wc -c < "$f" | tr -d ' ')
+    if [ "$size" -gt "$CLAUDE_CAP" ]; then
+      echo "pre-commit: $f is ${size} bytes (cap ${CLAUDE_CAP})." >&2
+      echo "  Extract reference-heavy sections to .claude/refs/<topic>.md and leave a pointer." >&2
+      echo "  Precedent: see Izabella/.claude/refs/ for the recipe/ref split pattern." >&2
+      echo "  Bypass: git commit --no-verify" >&2
+      exit 1
+    fi
+  done < <(git diff --cached --name-only | grep -E '(^|/)CLAUDE\.md$')
+fi
+
+# ----- Gate 3: secret scan -----
+# Added lines only, excluding test/fixture paths and lockfiles.
+CHANGES=$(git diff --cached -U0 --diff-filter=ACM \
+  -- ':!test/**' ':!tests/**' ':!testdata/**' ':!fixtures/**' \
+     ':!*.lock' ':!*.sum' ':!*.snap' ':!*_test.*' ':!*.test.*' \
+     ':!**/__snapshots__/**' ':!**/vendor/**' ':!zig-pkg/**' \
+  2>/dev/null | grep -E '^\+[^+]' || true)
+
+if [ -n "$CHANGES" ]; then
+  SEP='@@@'
+  PATTERNS=(
+    "Databricks API token${SEP}dapi[a-f0-9]{32}(-[0-9])?"
+    "Anthropic API key${SEP}sk-ant-api03-[A-Za-z0-9_-]{93}AA"
+    "OpenAI API key (project)${SEP}sk-(proj|svcacct|admin)-[A-Za-z0-9_-]{58,}T3BlbkFJ[A-Za-z0-9_-]{58,}"
+    "OpenAI API key (legacy)${SEP}sk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20}"
+    "GitHub PAT${SEP}ghp_[0-9A-Za-z]{36}"
+    "GitHub fine-grained PAT${SEP}github_pat_[A-Za-z0-9_]{82}"
+    "GitHub OAuth${SEP}gho_[0-9A-Za-z]{36}"
+    "GitHub app/server token${SEP}(ghu|ghs|ghr)_[0-9A-Za-z]{36}"
+    "GitLab PAT${SEP}glpat-[A-Za-z0-9_-]{20}"
+    "AWS access key${SEP}(A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16}"
+    "Google API key${SEP}AIza[0-9A-Za-z_-]{35}"
+    "Stripe secret/restricted${SEP}(sk|rk)_(test|live|prod)_[A-Za-z0-9]{10,99}"
+    "Slack bot token${SEP}xoxb-[0-9]{10,13}-[0-9]{10,13}[0-9A-Za-z-]*"
+    "Slack app token${SEP}xapp-[0-9]-[A-Z0-9]+-[0-9]+-[a-z0-9]+"
+    "Slack webhook URL${SEP}hooks\\.slack\\.com/(services|workflows|triggers)/[A-Za-z0-9+/]{43,}"
+    "SendGrid API token${SEP}SG\\.[A-Za-z0-9=_.-]{66}"
+    "PyPI upload token${SEP}pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,}"
+    "NPM access token${SEP}npm_[A-Za-z0-9]{36}"
+    "Hugging Face token${SEP}hf_[A-Za-z]{34}"
+    "Notion API token${SEP}ntn_[0-9]{11}[A-Za-z0-9]{35}"
+    "PEM private key${SEP}-----BEGIN( [A-Z]+)? PRIVATE KEY( BLOCK)?-----"
+  )
+
+  violations=()
+  for pair in "${PATTERNS[@]}"; do
+    label="${pair%%${SEP}*}"
+    pattern="${pair#*${SEP}}"
+    if printf '%s\n' "$CHANGES" | grep -E -q -- "$pattern"; then
+      violations+=("$label")
+    fi
+  done
+
+  if [ "${#violations[@]}" -gt 0 ]; then
+    echo "pre-commit: possible secret(s) detected in staged content:" >&2
+    for v in "${violations[@]}"; do
+      echo "  x $v" >&2
+    done
+    echo "" >&2
+    echo "  Review:   git diff --cached" >&2
+    echo "  Bypass (only if certain it's not a secret):  git commit --no-verify" >&2
+    exit 1
+  fi
+fi
+
+# ----- Gate 4: zig fmt --check on staged .zig files -----
+STAGED_ZIG=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.zig$' || true)
+if [ -n "$STAGED_ZIG" ]; then
+  ZIG=""
+  for cand in zig /opt/homebrew/opt/zig@0.15/bin/zig /opt/homebrew/opt/zig/bin/zig /usr/local/bin/zig; do
+    if command -v "$cand" >/dev/null 2>&1; then
+      ZIG=$(command -v "$cand")
+      break
+    fi
+  done
+  if [ -z "$ZIG" ]; then
+    echo "pre-commit: zig not found on PATH — skipping fmt check." >&2
+    echo "  (install zig or edit .git/hooks/pre-commit to point at your zig binary)" >&2
+  else
+    echo "pre-commit: zig fmt --check on $(echo "$STAGED_ZIG" | wc -l | tr -d ' ') staged file(s)..."
+    if ! "$ZIG" fmt --check $STAGED_ZIG; then
+      cat >&2 <<EOF
+
+pre-commit: formatting issues in staged .zig files.
+Fix with:  $ZIG fmt $STAGED_ZIG && git add $STAGED_ZIG
+Bypass:    git commit --no-verify
+EOF
+      exit 1
+    fi
+  fi
+fi
+
+exit 0
