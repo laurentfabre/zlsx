@@ -91,6 +91,12 @@ pub fn build(b: *std.Build) void {
         .linkage = .dynamic,
         .root_module = c_abi_mod,
     });
+    // Reserve Mach-O load-command headerpad on macOS targets so
+    // Homebrew's install_name_tool can rewrite the dylib's install_name
+    // to an absolute cellar path after unpacking. Without this, brew's
+    // `fix_install_linkage` fails (the default `@rpath/libzlsx.dylib`
+    // install_name has no room to expand). No-op on non-Mach-O targets.
+    dylib.headerpad_max_install_names = true;
     b.installArtifact(dylib);
 
     // On Unix-likes, static and dynamic artifacts have different

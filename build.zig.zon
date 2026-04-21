@@ -1,6 +1,6 @@
 .{
     .name = .zlsx,
-    .version = "0.2.0",
+    .version = "0.2.1",
     .fingerprint = 0x3ec77e9bd40d849b,
     .minimum_zig_version = "0.15.0",
     .dependencies = .{},
