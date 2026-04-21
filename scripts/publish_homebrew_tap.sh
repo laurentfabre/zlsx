@@ -142,14 +142,23 @@ mkdir -p "$CLONE/Formula"
 cp "$GENERATED" "$CLONE/Formula/zlsx.rb"
 
 pushd "$CLONE" >/dev/null
-if git diff --quiet; then
+git add -A Formula/zlsx.rb
+# `git diff --cached --quiet` returns 0 when the staged tree is
+# identical to HEAD. Use --cached (not --quiet alone) so newly-added
+# files on a fresh / empty repo are detected correctly.
+if git diff --cached --quiet; then
   echo "  formula unchanged — nothing to commit."
   popd >/dev/null
   exit 0
 fi
-git add Formula/zlsx.rb
-git commit -m "zlsx $TAG" -m "Auto-published by scripts/publish_homebrew_tap.sh from $(gh repo view --json nameWithOwner -q .nameWithOwner)@$TAG." >/dev/null
-git push --quiet origin HEAD
+# Normalise branch name for fresh repos — `gh repo create` leaves the
+# clone with whatever default `init.defaultBranch` the runner uses.
+if ! git symbolic-ref -q HEAD | grep -q refs/heads/main; then
+  git branch -M main
+fi
+git commit -m "zlsx $TAG" \
+  -m "Auto-published by scripts/publish_homebrew_tap.sh from $(gh repo view --json nameWithOwner -q .nameWithOwner)@$TAG." >/dev/null
+git push --quiet -u origin main
 popd >/dev/null
 
 echo "  published $TAG to https://github.com/$TAP_REPO"
