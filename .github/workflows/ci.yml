@@ -18,9 +18,19 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Zig 0.15.2
-        uses: mlugg/setup-zig@v1
-        with:
-          version: "0.15.2"
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIG_VER=0.15.2
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)   T=x86_64-linux  ;;
+            Linux-ARM64) T=aarch64-linux ;;
+            macOS-X64)   T=x86_64-macos  ;;
+            macOS-ARM64) T=aarch64-macos ;;
+            *) echo "unsupported runner: ${{ runner.os }}-${{ runner.arch }}" >&2; exit 1 ;;
+          esac
+          curl -fsSL "https://ziglang.org/download/${ZIG_VER}/zig-${T}-${ZIG_VER}.tar.xz" | tar -xJ
+          echo "$PWD/zig-${T}-${ZIG_VER}" >> "$GITHUB_PATH"
 
       - name: zig fmt --check
         run: zig fmt --check src/ tests/ build.zig
@@ -55,8 +65,11 @@ jobs:
           - aarch64-macos
     steps:
       - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v1
-        with:
-          version: "0.15.2"
+      - name: Install Zig 0.15.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz" | tar -xJ
+          echo "$PWD/zig-x86_64-linux-0.15.2" >> "$GITHUB_PATH"
       - name: Cross-compile
         run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
