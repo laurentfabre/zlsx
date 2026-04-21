@@ -51,6 +51,24 @@ Designed for a real use case: Alfred's hotel-concierge pipeline needs to read a 
 
 ## Install
 
+### CLI binary
+
+Prebuilt binaries for macOS (ARM64, Intel), Linux (x86_64, ARM64 — static musl), and Windows (x86_64) ship with every tagged release:
+
+```bash
+# macOS (Apple Silicon)
+curl -fsSL -o zlsx.tar.gz "https://github.com/laurentfabre/zlsx/releases/latest/download/zlsx-0.2.0-aarch64-apple-darwin.tar.gz"
+tar -xzf zlsx.tar.gz && sudo mv zlsx-*/bin/zlsx /usr/local/bin/
+
+# Via Homebrew (once the tap is published)
+brew tap laurentfabre/zlsx
+brew install zlsx
+```
+
+Each release tarball also bundles `lib/libzlsx.{dylib,so,a}` and `include/zlsx.h` for C consumers.
+
+### As a Zig dependency
+
 `zlsx` is a plain Zig module. Add it to your `build.zig.zon`:
 
 ```zig

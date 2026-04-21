@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: test / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-22.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@v1
+        with:
+          version: "0.15.2"
+
+      - name: zig fmt --check
+        run: zig fmt --check src/ tests/ build.zig
+
+      - name: Build (Debug)
+        run: zig build
+
+      - name: Build (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Unit + fuzz-smoke tests
+        run: zig build test
+
+      - name: Fetch corpus + integration tests
+        run: |
+          bash scripts/fetch_test_corpus.sh
+          zig build test-corpus
+
+      - name: Single-threaded build compiles
+        run: zig build -Doptimize=ReleaseFast -Dsingle-threaded=true
+
+  cross-compile:
+    name: cross / ${{ matrix.target }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+          - x86_64-windows-gnu
+          - aarch64-macos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: "0.15.2"
+      - name: Cross-compile
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}

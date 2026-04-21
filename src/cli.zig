@@ -51,11 +51,7 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
             const v = argv[i];
-            if (std.mem.eql(u8, v, "jsonl")) out.format = .jsonl
-            else if (std.mem.eql(u8, v, "jsonl-dict")) out.format = .jsonl_dict
-            else if (std.mem.eql(u8, v, "tsv")) out.format = .tsv
-            else if (std.mem.eql(u8, v, "csv")) out.format = .csv
-            else return ArgError.BadFormat;
+            if (std.mem.eql(u8, v, "jsonl")) out.format = .jsonl else if (std.mem.eql(u8, v, "jsonl-dict")) out.format = .jsonl_dict else if (std.mem.eql(u8, v, "tsv")) out.format = .tsv else if (std.mem.eql(u8, v, "csv")) out.format = .csv else return ArgError.BadFormat;
         } else if (a.len > 0 and a[0] == '-') {
             return ArgError.UnknownFlag;
         } else {

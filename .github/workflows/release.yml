@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build:
+    name: build / ${{ matrix.target }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            archive_format: tar.gz
+            cli_name: zlsx
+            dylib_name: libzlsx.dylib
+            staticlib_name: libzlsx.a
+          - target: x86_64-apple-darwin
+            archive_format: tar.gz
+            cli_name: zlsx
+            dylib_name: libzlsx.dylib
+            staticlib_name: libzlsx.a
+          - target: x86_64-linux-musl
+            archive_format: tar.gz
+            cli_name: zlsx
+            dylib_name: libzlsx.so
+            staticlib_name: libzlsx.a
+          - target: aarch64-linux-musl
+            archive_format: tar.gz
+            cli_name: zlsx
+            dylib_name: libzlsx.so
+            staticlib_name: libzlsx.a
+          - target: x86_64-windows-gnu
+            archive_format: zip
+            cli_name: zlsx.exe
+            dylib_name: zlsx.dll
+            staticlib_name: zlsx_static.lib
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@v1
+        with:
+          version: "0.15.2"
+
+      - name: Extract version from tag
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release artifacts
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+
+      - name: Stage archive contents
+        run: |
+          STAGE="zlsx-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/include"
+          cp "zig-out/bin/${{ matrix.cli_name }}" "$STAGE/bin/"
+          cp "zig-out/lib/${{ matrix.dylib_name }}" "$STAGE/lib/"
+          cp "zig-out/lib/${{ matrix.staticlib_name }}" "$STAGE/lib/"
+          # Windows also installs an import library named zlsx.lib next
+          # to the DLL; copy it if present so consumers can link the DLL.
+          if [ -f "zig-out/lib/zlsx.lib" ]; then cp zig-out/lib/zlsx.lib "$STAGE/lib/"; fi
+          cp include/zlsx.h "$STAGE/include/"
+          cp README.md LICENSE "$STAGE/"
+          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
+
+      - name: Create tar.gz archive
+        if: matrix.archive_format == 'tar.gz'
+        run: tar -czf "${STAGE}.tar.gz" "$STAGE"
+
+      - name: Create zip archive
+        if: matrix.archive_format == 'zip'
+        run: zip -r "${STAGE}.zip" "$STAGE"
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            zlsx-${{ steps.ver.outputs.version }}-${{ matrix.target }}.${{ matrix.archive_format }}
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: ${{ contains(steps.ver.outputs.version, '-') }}
+
+  checksums:
+    name: checksums
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Extract version
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download release assets
+        run: |
+          mkdir -p dist
+          gh release download "v${{ steps.ver.outputs.version }}" --dir dist --repo "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Produce SHA256SUMS
+        run: |
+          cd dist
+          sha256sum zlsx-*.* > SHA256SUMS
+
+      - name: Upload SHA256SUMS
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/SHA256SUMS
+          fail_on_unmatched_files: true
