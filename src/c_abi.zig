@@ -274,9 +274,10 @@ export fn zlsx_rows_open(
     const state: *BookState = @ptrCast(@alignCast(book));
     // Retain BEFORE any state dereference so a concurrent zlsx_book_close
     // on another thread can't drop the refcount to zero while we're
-    // reading state.inner.sheets. errdefer unrefs on any failure path.
+    // reading state.inner.sheets. Every failure branch below releases
+    // this reference explicitly (the function signature is `?*Rows`, not
+    // an error union, so Zig's errdefer wouldn't fire across the C ABI).
     _ = state.refcount.fetchAdd(1, .acq_rel);
-    errdefer state.unref();
 
     if (sheet_idx >= state.inner.sheets.len) {
         writeError(err_buf, err_buf_len, "SheetIndexOutOfRange");
