@@ -13,6 +13,7 @@ from pathlib import Path
 
 def _candidates() -> list[Path]:
     out: list[Path] = []
+    here = Path(__file__).parent
 
     # 1. Explicit override — ZLSX_LIBRARY=/path/to/libzlsx.dylib
     if env := os.environ.get("ZLSX_LIBRARY"):
@@ -20,22 +21,25 @@ def _candidates() -> list[Path]:
 
     # 2. Bundled inside the wheel (same directory as this file). Populated
     #    by cibuildwheel in CI; absent in source-install mode.
-    here = Path(__file__).parent
     for name in ("libzlsx.dylib", "libzlsx.so", "zlsx.dll"):
         out.append(here / name)
 
-    # 3. Homebrew install path.
+    # 3. Local dev build at <repo>/zig-out/lib/. Placed BEFORE Homebrew
+    #    so when working on the Zig side with `pip install -e .`, the
+    #    freshly-built dylib shadows whatever brew installed. This makes
+    #    "edit, zig build, run pytest" loops work without needing
+    #    ZLSX_LIBRARY to be set manually.
+    for rel in ("../../zig-out/lib", "../../../zig-out/lib"):
+        out.append(here / rel / "libzlsx.dylib")
+        out.append(here / rel / "libzlsx.so")
+
+    # 4. Homebrew install path (fallback for end users).
     if sys.platform == "darwin":
         for prefix in ("/opt/homebrew/opt/zlsx", "/usr/local/opt/zlsx"):
             out.append(Path(prefix) / "lib" / "libzlsx.dylib")
     elif sys.platform.startswith("linux"):
         out.append(Path("/home/linuxbrew/.linuxbrew/opt/zlsx/lib/libzlsx.so"))
         out.append(Path("/usr/local/lib/libzlsx.so"))
-
-    # 4. Local dev build at <repo>/zig-out/lib/.
-    for rel in ("../../zig-out/lib", "../../../zig-out/lib"):
-        out.append(here / rel / "libzlsx.dylib")
-        out.append(here / rel / "libzlsx.so")
 
     return out
 
@@ -90,6 +94,8 @@ CELL_BOOLEAN = 4
 cell_ptr = ctypes.POINTER(Cell)
 book_handle = ctypes.c_void_p
 rows_handle = ctypes.c_void_p
+writer_handle = ctypes.c_void_p
+sheet_writer_handle = ctypes.c_void_p
 
 # ─── Function signatures ──────────────────────────────────────────────
 
@@ -146,6 +152,41 @@ lib.zlsx_rows_next.argtypes = [
     ctypes.c_size_t,
 ]
 lib.zlsx_rows_next.restype = ctypes.c_int32
+
+# ─── Writer exports (v0.2.2+) ─────────────────────────────────────────
+
+lib.zlsx_writer_create.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
+lib.zlsx_writer_create.restype = writer_handle
+
+lib.zlsx_writer_close.argtypes = [writer_handle]
+lib.zlsx_writer_close.restype = None
+
+lib.zlsx_writer_add_sheet.argtypes = [
+    writer_handle,
+    ctypes.c_char_p,
+    ctypes.c_size_t,
+    ctypes.c_char_p,
+    ctypes.c_size_t,
+]
+lib.zlsx_writer_add_sheet.restype = sheet_writer_handle
+
+lib.zlsx_sheet_writer_write_row.argtypes = [
+    sheet_writer_handle,
+    cell_ptr,
+    ctypes.c_size_t,
+    ctypes.c_char_p,
+    ctypes.c_size_t,
+]
+lib.zlsx_sheet_writer_write_row.restype = ctypes.c_int32
+
+lib.zlsx_writer_save.argtypes = [
+    writer_handle,
+    ctypes.c_char_p,
+    ctypes.c_size_t,
+    ctypes.c_char_p,
+    ctypes.c_size_t,
+]
+lib.zlsx_writer_save.restype = ctypes.c_int32
 
 # ─── ABI version check ────────────────────────────────────────────────
 

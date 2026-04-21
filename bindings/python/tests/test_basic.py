@@ -111,3 +111,92 @@ def test_close_book_while_rows_live():
 
     collected = list(rows)
     assert len(collected) == 3
+
+
+# ─── Writer ────────────────────────────────────────────────────────────
+
+
+def test_writer_round_trip(tmp_path):
+    out = tmp_path / "out.xlsx"
+    with zlsx.write(out) as w:
+        sheet = w.add_sheet("Summary")
+        sheet.write_row(["Name", "Age", "Active", "Pi"])
+        sheet.write_row(["Alice", 30, True, 3.14159])
+        sheet.write_row(["Bob", 25, False, None])
+
+    assert out.exists()
+
+    with zlsx.open(out) as book:
+        assert book.sheets == ["Summary"]
+        rows = list(book.sheet(0).rows())
+        assert rows[0] == ["Name", "Age", "Active", "Pi"]
+        assert rows[1][0] == "Alice"
+        assert rows[1][1] == 30
+        assert rows[1][2] is True
+        assert abs(rows[1][3] - 3.14159) < 1e-9
+        assert rows[2][0] == "Bob"
+        assert rows[2][1] == 25
+        assert rows[2][2] is False
+
+
+def test_writer_multi_sheet_sst_dedup(tmp_path):
+    out = tmp_path / "multi.xlsx"
+    with zlsx.write(out) as w:
+        s1 = w.add_sheet("Alpha")
+        s1.write_row(["hello"])
+        s1.write_row(["world"])
+        s2 = w.add_sheet("Beta")
+        s2.write_row(["hello"])   # dedups against s1
+        s2.write_row(["zig"])
+
+    with zlsx.open(out) as book:
+        assert book.sheets == ["Alpha", "Beta"]
+        a_rows = list(book.sheet("Alpha").rows())
+        b_rows = list(book.sheet("Beta").rows())
+        assert a_rows == [["hello"], ["world"]]
+        assert b_rows == [["hello"], ["zig"]]
+
+
+def test_writer_rejects_oversized_integer(tmp_path):
+    out = tmp_path / "overflow.xlsx"
+    with pytest.raises(zlsx.ZlsxError, match="IntegerExceedsExcelPrecision"):
+        with zlsx.write(out) as w:
+            sheet = w.add_sheet("S")
+            sheet.write_row([(1 << 53) + 1])   # not exactly representable
+
+
+def test_writer_no_save_on_exception(tmp_path):
+    out = tmp_path / "aborted.xlsx"
+    with pytest.raises(RuntimeError):
+        with zlsx.write(out) as w:
+            w.add_sheet("S").write_row(["a"])
+            raise RuntimeError("caller aborted")
+    assert not out.exists(), "exception should skip save"
+
+
+def test_writer_bool_and_int_distinct(tmp_path):
+    """Python bools are ints; verify we emit them as boolean cells, not
+    integer cells (openpyxl has historically done the wrong thing here).
+    """
+    out = tmp_path / "bools.xlsx"
+    with zlsx.write(out) as w:
+        sheet = w.add_sheet("S")
+        sheet.write_row([True, 1, False, 0])
+
+    with zlsx.open(out) as book:
+        row = next(book.sheet(0).rows())
+        assert row[0] is True
+        assert row[1] == 1 and isinstance(row[1], int)
+        assert row[2] is False
+        assert row[3] == 0 and isinstance(row[3], int)
+
+
+def test_writer_xml_special_chars_escape(tmp_path):
+    out = tmp_path / "entities.xlsx"
+    with zlsx.write(out) as w:
+        w.add_sheet("R&D").write_row(["a<b & c>d \"e\" 'f'"])
+
+    with zlsx.open(out) as book:
+        assert book.sheets == ["R&D"]
+        row = next(book.sheet(0).rows())
+        assert row[0] == "a<b & c>d \"e\" 'f'"

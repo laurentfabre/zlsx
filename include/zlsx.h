@@ -41,6 +41,8 @@ extern "C" {
 /* Opaque handles. Never dereference the struct contents directly. */
 typedef struct zlsx_book_t zlsx_book_t;
 typedef struct zlsx_rows_t zlsx_rows_t;
+typedef struct zlsx_writer_t zlsx_writer_t;
+typedef struct zlsx_sheet_writer_t zlsx_sheet_writer_t;
 
 /* Cell tag discriminator. */
 typedef enum {
@@ -143,6 +145,66 @@ int32_t zlsx_rows_next(zlsx_rows_t         * rows,
                        size_t             * out_len,
                        uint8_t            * err_buf,
                        size_t               err_buf_len);
+
+/* ─── Writer (ABI v1, added in 0.2.2) ─────────────────────────────── */
+
+/*
+ * Create a new empty Writer. Returns NULL on allocation failure; err_buf
+ * receives a null-terminated diagnostic.
+ */
+zlsx_writer_t * zlsx_writer_create(uint8_t * err_buf, size_t err_buf_len);
+
+/*
+ * Release all Writer state. Any zlsx_sheet_writer_t handles obtained
+ * from this Writer become invalid immediately — do not use them after
+ * closing the parent. NULL-safe (no-op).
+ */
+void zlsx_writer_close(zlsx_writer_t * writer);
+
+/*
+ * Add a sheet. The returned sheet-writer handle is BORROWED from the
+ * parent Writer — do not close it explicitly; it becomes invalid when
+ * the Writer is closed. `name_ptr` does not need to be null-terminated.
+ * Returns NULL on error.
+ */
+zlsx_sheet_writer_t * zlsx_writer_add_sheet(
+    zlsx_writer_t * writer,
+    const uint8_t * name_ptr,
+    size_t          name_len,
+    uint8_t       * err_buf,
+    size_t          err_buf_len);
+
+/*
+ * Append a row of cells. Each `zlsx_cell_t` is interpreted exactly the
+ * same way as on the read side — fill `tag` plus the field(s) matching
+ * that tag. Integers outside ±2^53-significant-bits round on open in
+ * Excel; the writer rejects those up front with err="IntegerExceedsExcelPrecision".
+ *
+ * On success returns 0 and the row is appended. On failure returns -1;
+ * the row buffer is unchanged (the validation pass runs before any
+ * mutation), so callers may retry / skip and keep writing.
+ *
+ * `cells_ptr` may be NULL iff `cells_len == 0` (emit an empty row).
+ */
+int32_t zlsx_sheet_writer_write_row(
+    zlsx_sheet_writer_t * sw,
+    const zlsx_cell_t   * cells_ptr,
+    size_t                cells_len,
+    uint8_t             * err_buf,
+    size_t                err_buf_len);
+
+/*
+ * Serialise the in-memory workbook and write it to `path` (the path
+ * does not need to be null-terminated; `path_len` bytes are used).
+ * Returns 0 on success, -1 on failure. The Writer remains usable —
+ * further rows may be appended and save() called again.
+ */
+int32_t zlsx_writer_save(
+    zlsx_writer_t * writer,
+    const uint8_t * path_ptr,
+    size_t          path_len,
+    uint8_t       * err_buf,
+    size_t          err_buf_len);
 
 #ifdef __cplusplus
 }

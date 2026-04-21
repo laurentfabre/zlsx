@@ -34,7 +34,16 @@ __version__ = "0.2.2"
 """Python-package version. Tracks the Zig library's major+minor; the patch
 level may drift when the binding ships a Python-only fix."""
 
-__all__ = ["open", "Book", "Sheet", "Rows", "ZlsxError"]
+__all__ = [
+    "open",
+    "write",
+    "Book",
+    "Sheet",
+    "Rows",
+    "Writer",
+    "SheetWriter",
+    "ZlsxError",
+]
 
 
 class ZlsxError(RuntimeError):
@@ -233,3 +242,193 @@ def open(path: Union[str, Path]) -> Book:  # noqa: A001  (shadows builtin by des
     xlsx archive. Raises :class:`ZlsxError` on parse failure.
     """
     return Book(path)
+
+
+# ─── Writer ───────────────────────────────────────────────────────────
+
+
+def _py_value_to_cell(value):
+    """Convert a Python value to a (ctypes Cell, optional keep-alive)
+    tuple. For string cells, the keep-alive is the ctypes buffer holding
+    the UTF-8 bytes — caller must hold it until the write call returns,
+    otherwise cell.str_ptr becomes a dangling pointer."""
+    cell = _ffi.Cell()
+    if value is None:
+        cell.tag = _ffi.CELL_EMPTY
+        return cell, None
+    if isinstance(value, bool):
+        # Check bool BEFORE int — `isinstance(True, int)` is True in
+        # Python, but we want True/False to emit as booleans.
+        cell.tag = _ffi.CELL_BOOLEAN
+        cell.b = 1 if value else 0
+        return cell, None
+    if isinstance(value, int):
+        cell.tag = _ffi.CELL_INTEGER
+        cell.i = value
+        return cell, None
+    if isinstance(value, float):
+        cell.tag = _ffi.CELL_NUMBER
+        cell.f = value
+        return cell, None
+    if isinstance(value, str):
+        raw = value.encode("utf-8")
+        cell.tag = _ffi.CELL_STRING
+        cell.str_len = len(raw)
+        # Create a ctypes array from the bytes and point str_ptr at it.
+        # The bytes object + buffer must outlive the write call — we
+        # return both so the caller holds the reference.
+        buf = (ctypes.c_ubyte * len(raw)).from_buffer_copy(raw)
+        cell.str_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte))
+        return cell, buf
+    raise TypeError(
+        f"unsupported cell type: {type(value).__name__} (expected None, bool, int, float, str)"
+    )
+
+
+class SheetWriter:
+    """A handle for writing rows to one sheet of a :class:`Writer`.
+
+    Obtained via :meth:`Writer.add_sheet`. The underlying C handle is
+    borrowed from the parent Writer and becomes invalid when the Writer
+    is closed — do not hold on to a SheetWriter after its parent exits.
+    """
+
+    def __init__(self, parent: "Writer", handle):
+        self._parent = parent
+        self._handle = handle
+        self._err = ctypes.create_string_buffer(_ERR_BUF_LEN)
+
+    def write_row(self, values) -> None:
+        """Append a row. ``values`` is any iterable of ``None | bool |
+        int | float | str``. Integers outside ±2^53-significant-bits
+        raise :class:`ZlsxError` (Excel stores numerics as IEEE-754
+        doubles — oversized ints would silently round on open)."""
+        cells_list = list(values)
+        n = len(cells_list)
+        if n == 0:
+            # Emit an empty row via the ABI's explicit null/zero path.
+            rc = _ffi.lib.zlsx_sheet_writer_write_row(
+                self._handle, None, 0, self._err, _ERR_BUF_LEN
+            )
+            if rc != 0:
+                raise ZlsxError(
+                    f"zlsx_sheet_writer_write_row (empty): {_decode_err(self._err)}"
+                )
+            return
+
+        cell_array = (_ffi.Cell * n)()
+        # Hold str buffers alive for the duration of the C call — the
+        # cell's str_ptr points into these buffers and ctypes won't
+        # keep them alive on its own.
+        keepers = []
+        for i, v in enumerate(cells_list):
+            cell, keeper = _py_value_to_cell(v)
+            cell_array[i] = cell
+            if keeper is not None:
+                keepers.append(keeper)
+
+        rc = _ffi.lib.zlsx_sheet_writer_write_row(
+            self._handle,
+            ctypes.cast(cell_array, _ffi.cell_ptr),
+            n,
+            self._err,
+            _ERR_BUF_LEN,
+        )
+        if rc != 0:
+            raise ZlsxError(f"zlsx_sheet_writer_write_row: {_decode_err(self._err)}")
+
+        # Reference `keepers` past the call so ctypes doesn't free the
+        # backing str buffers while the C side is still reading them.
+        del keepers
+
+
+class Writer:
+    """A xlsx workbook under construction.
+
+    Use :func:`zlsx.write` to construct one. Finalise by calling
+    :meth:`save` with a target path, then :meth:`close` to release
+    resources. The context-manager protocol wraps this: ``with
+    zlsx.write("out.xlsx") as w:`` saves automatically on clean exit.
+
+    Scope reminder: this MVP writer handles strings, integers, floats,
+    booleans, and empties. Styles, merged regions, formulas, and
+    load-modify-save round-trip are not yet supported — use openpyxl
+    for those until Phase 3b/3c ship.
+    """
+
+    def __init__(self, path: Union[str, Path, None] = None):
+        self._path = Path(path) if path is not None else None
+        self._err = ctypes.create_string_buffer(_ERR_BUF_LEN)
+        self._handle = _ffi.lib.zlsx_writer_create(self._err, _ERR_BUF_LEN)
+        if not self._handle:
+            raise ZlsxError(f"zlsx_writer_create: {_decode_err(self._err)}")
+        # Track sheets so we can surface their names in Python.
+        self._sheets: list[SheetWriter] = []
+
+    def add_sheet(self, name: str) -> SheetWriter:
+        """Add a sheet. The returned :class:`SheetWriter` is owned by
+        this Writer — it becomes invalid after :meth:`close` (or the
+        end of a ``with`` block)."""
+        name_bytes = name.encode("utf-8")
+        sw_handle = _ffi.lib.zlsx_writer_add_sheet(
+            self._handle, name_bytes, len(name_bytes), self._err, _ERR_BUF_LEN
+        )
+        if not sw_handle:
+            raise ZlsxError(f"zlsx_writer_add_sheet({name!r}): {_decode_err(self._err)}")
+        sw = SheetWriter(self, sw_handle)
+        self._sheets.append(sw)
+        return sw
+
+    def save(self, path: Union[str, Path, None] = None) -> None:
+        """Write the workbook to disk. Uses the path passed to
+        :func:`zlsx.write` if none is provided here."""
+        target = Path(path) if path is not None else self._path
+        if target is None:
+            raise ValueError("no save path: pass one to zlsx.write() or Writer.save()")
+        raw = str(target).encode("utf-8")
+        rc = _ffi.lib.zlsx_writer_save(
+            self._handle, raw, len(raw), self._err, _ERR_BUF_LEN
+        )
+        if rc != 0:
+            raise ZlsxError(f"zlsx_writer_save({target!r}): {_decode_err(self._err)}")
+
+    def close(self) -> None:
+        """Release all writer state. Any :class:`SheetWriter` obtained
+        from this Writer becomes invalid after close()."""
+        if self._handle:
+            _ffi.lib.zlsx_writer_close(self._handle)
+            self._handle = None
+            for sw in self._sheets:
+                sw._handle = None
+            self._sheets.clear()
+
+    def __enter__(self) -> "Writer":
+        return self
+
+    def __exit__(self, exc_type, *exc_info) -> None:
+        # Save on clean exit; propagate any exception. Always close.
+        try:
+            if exc_type is None and self._path is not None:
+                self.save()
+        finally:
+            self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def write(path: Union[str, Path, None] = None) -> Writer:
+    """Begin a new xlsx workbook.
+
+    If ``path`` is provided and this Writer is used as a context
+    manager, the workbook is saved automatically on clean exit::
+
+        with zlsx.write("out.xlsx") as w:
+            sheet = w.add_sheet("Summary")
+            sheet.write_row(["Name", "Count"])
+            sheet.write_row(["Alice", 42])
+    """
+    return Writer(path)
