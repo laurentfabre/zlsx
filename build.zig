@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const single_threaded = b.option(bool, "single-threaded", "Build the CLI and C ABI with -fsingle-threaded (smp_allocator is swapped for page_allocator)");
 
     // Public module. Consumers add zlsx to their build.zig.zon as a
     // path or git dependency, then `@import("zlsx")`.
@@ -40,6 +41,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/cli.zig"),
         .target = target,
         .optimize = optimize,
+        .single_threaded = single_threaded,
     });
     const cli_exe = b.addExecutable(.{ .name = "zlsx", .root_module = cli_mod });
     b.installArtifact(cli_exe);
@@ -52,4 +54,31 @@ pub fn build(b: *std.Build) void {
     // CLI unit tests (colLetter, JSON/CSV escapers, arg parser).
     const cli_tests = b.addTest(.{ .root_module = cli_mod });
     test_step.dependOn(&b.addRunArtifact(cli_tests).step);
+
+    // C ABI — both a shared library (for Python / cffi bindings) and a
+    // static library (for language toolchains that prefer linking in).
+    const c_abi_mod = b.createModule(.{
+        .root_source_file = b.path("src/c_abi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = single_threaded,
+    });
+    const dylib = b.addLibrary(.{
+        .name = "zlsx",
+        .linkage = .dynamic,
+        .root_module = c_abi_mod,
+    });
+    b.installArtifact(dylib);
+
+    const staticlib = b.addLibrary(.{
+        .name = "zlsx",
+        .linkage = .static,
+        .root_module = c_abi_mod,
+    });
+    b.installArtifact(staticlib);
+
+    // Unit tests for the ABI layer (version constant, CCell translation,
+    // and a corpus-gated end-to-end lifecycle smoke test).
+    const c_abi_tests = b.addTest(.{ .root_module = c_abi_mod });
+    test_step.dependOn(&b.addRunArtifact(c_abi_tests).step);
 }
