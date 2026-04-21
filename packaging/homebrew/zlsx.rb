@@ -25,20 +25,20 @@ class Zlsx < Formula
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/laurentfabre/zlsx/releases/download/v#{version}/zlsx-#{version}-aarch64-apple-darwin.tar.gz"
-      sha256 "REPLACE_WITH_ARM_SHA256"
+      sha256 "9cb20ed73b0217f5d9d4b90a4234507ec6d7d54fbd778390cb8630ca1d874cf0"
     else
       url "https://github.com/laurentfabre/zlsx/releases/download/v#{version}/zlsx-#{version}-x86_64-apple-darwin.tar.gz"
-      sha256 "REPLACE_WITH_INTEL_SHA256"
+      sha256 "2ab5b27a4e019d4ec6c9d3f716c3b7935da282cb153fcaafefbb424bfd045966"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
       url "https://github.com/laurentfabre/zlsx/releases/download/v#{version}/zlsx-#{version}-aarch64-linux-musl.tar.gz"
-      sha256 "REPLACE_WITH_LINUX_ARM_SHA256"
+      sha256 "b3a85a23159add32ed916d43395bd3e44cf6d5393e0796352376ff5c83b875ce"
     else
       url "https://github.com/laurentfabre/zlsx/releases/download/v#{version}/zlsx-#{version}-x86_64-linux-musl.tar.gz"
-      sha256 "REPLACE_WITH_LINUX_INTEL_SHA256"
+      sha256 "698a9c223fe36246c6d7e7ed05b44ae2e27ebc1ca7b0f9cd7c2f6e702c47be30"
     end
   end
 
