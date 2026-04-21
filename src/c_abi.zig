@@ -973,3 +973,189 @@ test "fuzz writer via C ABI: random operations round-trip" {
         try std.testing.expectEqual(expected_rows, read_rows);
     }
 }
+
+// ─── Deep C-ABI fuzz ────────────────────────────────────────────────
+
+test "fuzz C ABI: err_buf edge cases never overrun" {
+    // Known failure paths (missing file, unknown sheet name) with
+    // minimum-length / NULL error buffers. writeError must refuse to
+    // write anything when buf is NULL or len == 0, and must always
+    // null-terminate when len >= 1.
+    const iters = fuzzItersCabi();
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCabi());
+    const rng = prng.random();
+
+    const bogus_path: [*:0]const u8 = "/nonexistent/__zlsx_fuzz_404__.xlsx";
+    for (0..iters) |_| {
+        // Buffer length in the tricky range [0, 4].
+        const len = rng.intRangeAtMost(usize, 0, 4);
+        var buf_storage: [5]u8 = undefined;
+        // Poison the trailing byte so we can detect overruns.
+        buf_storage[buf_storage.len - 1] = 0xAA;
+        const buf_ptr: ?[*]u8 = if (rng.boolean()) null else if (len == 0) null else @ptrCast(&buf_storage);
+
+        const book = zlsx_book_open(bogus_path, buf_ptr, len);
+        try std.testing.expect(book == null);
+        // No overrun: the poisoned trailing byte is untouched.
+        try std.testing.expectEqual(@as(u8, 0xAA), buf_storage[buf_storage.len - 1]);
+        if (buf_ptr != null and len >= 1) {
+            // Must be null-terminated within [0, len-1].
+            var saw_null = false;
+            for (buf_storage[0..len]) |c| {
+                if (c == 0) {
+                    saw_null = true;
+                    break;
+                }
+            }
+            try std.testing.expect(saw_null);
+        }
+    }
+}
+
+test "fuzz C ABI: interleaved book + rows handles refcount correctly" {
+    // Open N books + rows iterators in random order, close in random
+    // order. Memory stays balanced (tested via testing.allocator's
+    // implicit leak check at end).
+    const corpus = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(corpus, .{}) catch return;
+
+    const iters = fuzzItersCabi() / 10;
+    const seed = fuzzSeedCabi();
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    const path_z: [*:0]const u8 = @ptrCast(corpus.ptr);
+    var err: [128]u8 = undefined;
+
+    for (0..iters) |_| {
+        var book_handles: [4]?*Book = [_]?*Book{null} ** 4;
+        var rows_handles: [8]?*Rows = [_]?*Rows{null} ** 8;
+
+        // Open 1-4 books (all pointing at the same file — refcount is
+        // per-handle, so this gives us independent copies of the state).
+        const n_books = rng.intRangeAtMost(usize, 1, 4);
+        for (0..n_books) |i| {
+            book_handles[i] = zlsx_book_open(path_z, &err, err.len);
+            try std.testing.expect(book_handles[i] != null);
+        }
+
+        // Open 1-8 row iterators across random books.
+        const n_rows = rng.intRangeAtMost(usize, 1, 8);
+        for (0..n_rows) |i| {
+            const bi = rng.intRangeAtMost(usize, 0, n_books - 1);
+            rows_handles[i] = zlsx_rows_open(book_handles[bi].?, 0, &err, err.len);
+            try std.testing.expect(rows_handles[i] != null);
+        }
+
+        // Close in random order (books + rows mixed).
+        var close_order: [12]u8 = undefined;
+        const total = n_books + n_rows;
+        for (0..total) |i| close_order[i] = @intCast(i);
+        rng.shuffle(u8, close_order[0..total]);
+
+        for (close_order[0..total]) |idx| {
+            if (idx < n_books) {
+                zlsx_book_close(book_handles[idx]);
+                book_handles[idx] = null;
+            } else {
+                const ri = idx - @as(u8, @intCast(n_books));
+                zlsx_rows_close(rows_handles[ri]);
+                rows_handles[ri] = null;
+            }
+        }
+        // If the refcount underflowed / leaked, testing.allocator's
+        // leak detector catches it at the end of the test.
+    }
+}
+
+test "fuzz C ABI writer: NULL err_buf + zero-cell rows" {
+    // NULL err_buf on all failure paths, plus write_row with NULL cells
+    // and cells_len=0 (which is a legitimate empty row per the ABI).
+    const iters = fuzzItersCabi();
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCabi());
+    const rng = prng.random();
+
+    const seed = fuzzSeedCabi();
+    var tmp_buf: [64]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, "/tmp/zlsx_fuzz_cabi_nullbuf_{x}.xlsx", .{seed});
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    for (0..iters / 50) |_| {
+        const w = zlsx_writer_create(null, 0);
+        try std.testing.expect(w != null);
+        defer zlsx_writer_close(w);
+
+        const name = "S";
+        const sw = zlsx_writer_add_sheet(w.?, name.ptr, name.len, null, 0);
+        try std.testing.expect(sw != null);
+
+        // Empty row via cells_ptr=NULL, cells_len=0.
+        try std.testing.expectEqual(
+            @as(i32, 0),
+            zlsx_sheet_writer_write_row(sw.?, null, 0, null, 0),
+        );
+
+        // Rows with random counts of random cells, all with NULL err_buf.
+        const n_rows = rng.intRangeAtMost(usize, 0, 3);
+        for (0..n_rows) |_| {
+            var cells: [3]CCell = undefined;
+            const nc = rng.intRangeAtMost(usize, 0, cells.len);
+            for (0..nc) |ci| {
+                cells[ci] = .{
+                    .tag = @intFromEnum(CellTag.empty),
+                    .str_len = 0,
+                    .str_ptr = @ptrCast("".ptr),
+                    .i = 0,
+                    .f = 0,
+                    .b = 0,
+                    ._pad = [_]u8{0} ** 7,
+                };
+            }
+            _ = zlsx_sheet_writer_write_row(sw.?, if (nc == 0) null else &cells, nc, null, 0);
+        }
+
+        try std.testing.expectEqual(
+            @as(i32, 0),
+            zlsx_writer_save(w.?, @ptrCast(tmp_path.ptr), tmp_path.len, null, 0),
+        );
+    }
+}
+
+test "fuzz C ABI: random u32 tag in CCell never panics through full row" {
+    // Goes beyond the existing fromCCell unit fuzz — runs the bad-tag
+    // CCell through an actual zlsx_sheet_writer_write_row call so the
+    // integer-precision pre-pass + error return path are also exercised.
+    const iters = fuzzItersCabi();
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCabi());
+    const rng = prng.random();
+    var err_buf: [64]u8 = undefined;
+
+    const w = zlsx_writer_create(&err_buf, err_buf.len);
+    try std.testing.expect(w != null);
+    defer zlsx_writer_close(w);
+    const name = "S";
+    const sw = zlsx_writer_add_sheet(w.?, name.ptr, name.len, &err_buf, err_buf.len);
+    try std.testing.expect(sw != null);
+
+    // Static backing buffer for string-tagged cells so str_ptr is always
+    // a valid dereferenceable pointer, even if the tag is bogus.
+    var backing: [32]u8 = undefined;
+    @memset(&backing, 'x');
+
+    for (0..iters) |_| {
+        var cells: [3]CCell = undefined;
+        for (&cells) |*c| {
+            c.* = .{
+                .tag = rng.int(u32),
+                .str_len = @intCast(rng.intRangeAtMost(usize, 0, backing.len)),
+                .str_ptr = @ptrCast(&backing),
+                .i = rng.int(i64),
+                .f = rng.float(f64),
+                .b = rng.int(u8),
+                ._pad = [_]u8{0} ** 7,
+            };
+        }
+        // Must either return 0 (all tags valid) or -1 (at least one
+        // BadCellTag / IntegerExceedsExcelPrecision), never panic.
+        _ = zlsx_sheet_writer_write_row(sw.?, &cells, cells.len, &err_buf, err_buf.len);
+    }
+}

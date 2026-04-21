@@ -1143,3 +1143,55 @@ test "fuzz Book.open against arbitrary bytes" {
 
 pub const Writer = @import("writer.zig").Writer;
 pub const SheetWriter = @import("writer.zig").SheetWriter;
+
+// ─── Deep reader fuzz: SST index pointing past the SST table ────────
+//
+// A malicious xlsx could reference a shared-string index that's beyond
+// the SST table's length. The reader's `Rows.next` resolves the index,
+// so it must bounds-check. This fuzz target synthesizes cells with
+// deliberately-high SST indices and confirms the reader doesn't crash.
+
+test "fuzz Rows.next on synthetic cells with out-of-range SST indices" {
+    const iters = fuzzIterations();
+    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    const rng = prng.random();
+
+    // Build a tiny SST of 3 entries (indices 0..2 valid).
+    const sst_entries = [_][]const u8{ "alpha", "beta", "gamma" };
+
+    // For each iteration, build synthetic sheet XML with a cell whose
+    // `<v>` value is a random u32 (likely out-of-range). Rows.next
+    // must either surface a MalformedXml error or return an empty
+    // slice — never crash.
+    var sheet_xml_buf: std.ArrayListUnmanaged(u8) = .{};
+    defer sheet_xml_buf.deinit(std.testing.allocator);
+
+    for (0..iters) |_| {
+        sheet_xml_buf.clearRetainingCapacity();
+        try sheet_xml_buf.appendSlice(std.testing.allocator, "<sheetData>");
+        const n_cells = rng.intRangeAtMost(usize, 1, 8);
+        for (0..n_cells) |i| {
+            const col_letter: u8 = @intCast('A' + (i % 26));
+            const idx = rng.int(u32);
+            try sheet_xml_buf.print(
+                std.testing.allocator,
+                "<row r=\"1\"><c r=\"{c}1\" t=\"s\"><v>{d}</v></c></row>",
+                .{ col_letter, idx },
+            );
+        }
+        try sheet_xml_buf.appendSlice(std.testing.allocator, "</sheetData>");
+
+        var rows: Rows = .{
+            .xml = sheet_xml_buf.items,
+            .pos = 0,
+            .shared_strings = &sst_entries,
+            .allocator = std.testing.allocator,
+            .row_cells = .{},
+            .owned = .{},
+        };
+        defer rows.deinit();
+
+        // Consume the rows — may error, must not panic.
+        while (rows.next() catch null) |_| {}
+    }
+}
