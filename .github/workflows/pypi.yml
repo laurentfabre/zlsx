@@ -1,0 +1,131 @@
+name: PyPI wheels
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Upload wheels to PyPI (requires Trusted Publisher setup)"
+        type: boolean
+        default: false
+
+# Build 5 platform wheels in parallel, then attach them to the GitHub
+# Release and (optionally) upload to PyPI via Trusted Publishing.
+#
+# PyPI setup: create py-zlsx on https://pypi.org/manage/account/publishing/
+# and register this workflow (repo laurentfabre/zlsx, workflow pypi.yml,
+# environment pypi). The publish job reads id-token permissions and
+# exchanges them for a short-lived PyPI token — no secrets stored.
+
+jobs:
+  build-wheels:
+    name: wheel / ${{ matrix.wheel_tag }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - zig_target: aarch64-macos
+            wheel_tag: macosx_11_0_arm64
+            libfile: libzlsx.dylib
+            lib_dir: lib
+          - zig_target: x86_64-macos
+            wheel_tag: macosx_10_12_x86_64
+            libfile: libzlsx.dylib
+            lib_dir: lib
+          - zig_target: x86_64-linux-gnu.2.28
+            wheel_tag: manylinux_2_28_x86_64
+            libfile: libzlsx.so
+            lib_dir: lib
+          - zig_target: aarch64-linux-gnu.2.28
+            wheel_tag: manylinux_2_28_aarch64
+            libfile: libzlsx.so
+            lib_dir: lib
+          - zig_target: x86_64-windows-gnu
+            wheel_tag: win_amd64
+            libfile: zlsx.dll
+            lib_dir: bin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.15.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz" | tar -xJ
+          echo "$PWD/zig-x86_64-linux-0.15.2" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build libzlsx (${{ matrix.zig_target }})
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.zig_target }}
+
+      - name: Stage native lib next to _ffi.py
+        run: cp "zig-out/${{ matrix.lib_dir }}/${{ matrix.libfile }}" bindings/python/zlsx/
+
+      - name: Build + tag wheel
+        working-directory: bindings/python
+        run: |
+          python -m pip install --upgrade pip build wheel
+          # Hatchling produces a py3-none-any wheel; retag it for the
+          # target platform so pip selects the right one per machine.
+          python -m build --wheel --outdir dist_untagged
+          python -m wheel tags \
+            --platform-tag ${{ matrix.wheel_tag }} \
+            --python-tag py3 \
+            --abi-tag none \
+            --remove \
+            dist_untagged/py_zlsx-*.whl
+          mkdir -p dist
+          mv dist_untagged/py_zlsx-*-py3-none-${{ matrix.wheel_tag }}.whl dist/
+
+      - name: Upload wheel to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bindings/python/dist/*.whl
+          fail_on_unmatched_files: true
+
+      - name: Upload wheel as job artefact (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.wheel_tag }}
+          path: bindings/python/dist/*.whl
+          retention-days: 14
+
+  publish:
+    name: publish to PyPI
+    needs: build-wheels
+    # Publish either on a tag push or an explicit dispatch with publish=true.
+    if: >-
+      startsWith(github.ref, 'refs/tags/') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
+    runs-on: ubuntu-22.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download all wheel artefacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+
+      - name: Sanity-check the artefact set
+        run: |
+          ls -la dist/
+          # Expect 5 wheels (one per matrix leg).
+          test "$(ls dist/*.whl | wc -l)" = "5"
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true
