@@ -5,14 +5,32 @@
 //! * All handles are opaque pointers. State lives on the heap, owned by
 //!   this layer; the caller holds a `zlsx_book_t*` / `zlsx_rows_t*` and
 //!   must close it to free memory.
-//! * Thread-safe: no global mutable state. Allocator is `smp_allocator`
-//!   (pure-Zig, no libc). Every handle carries its own scratch.
+//! * `BookState` is refcounted so a `zlsx_rows_t*` can safely outlive
+//!   the caller's `zlsx_book_t*` handle — the last reference closes the
+//!   underlying state. Rows retain in `zlsx_rows_open` *before*
+//!   dereferencing any book state, so a refcount bump races cleanly
+//!   with `zlsx_book_close` on the same handle.
+//! * Allocator is `smp_allocator` (pure-Zig, no libc). On single-threaded
+//!   builds this falls back to `page_allocator` since smp_allocator
+//!   asserts `!builtin.single_threaded` at comptime.
 //! * Error messages are written into caller-provided buffers — no
 //!   thread-local storage, no static strings.
 //! * String slices returned through cells point into the `Book`'s
 //!   internal buffers (or the row's short-lived scratch) and are valid
 //!   until the next `zlsx_rows_next` call or until the handle is closed.
 //!   Callers must copy if they need the string to outlive that window.
+//!
+//! Thread safety
+//! -------------
+//! * Distinct handles are fully independent; call them freely from any
+//!   threads, there is no shared mutable state between them.
+//! * Operations on the SAME handle must be externally synchronized —
+//!   do not call `zlsx_book_close` concurrently with any other call
+//!   that takes the same handle. (Same convention as sqlite3, libcurl,
+//!   and essentially every refcounted C API.) The refcount protects
+//!   against `book_close` racing with an *already-returned* `rows_t*`
+//!   from a previous `rows_open`, not against races on the book handle
+//!   itself.
 //!
 //! Stability
 //! ---------
@@ -254,23 +272,30 @@ export fn zlsx_rows_open(
     err_buf_len: usize,
 ) callconv(.c) ?*Rows {
     const state: *BookState = @ptrCast(@alignCast(book));
+    // Retain BEFORE any state dereference so a concurrent zlsx_book_close
+    // on another thread can't drop the refcount to zero while we're
+    // reading state.inner.sheets. errdefer unrefs on any failure path.
+    _ = state.refcount.fetchAdd(1, .acq_rel);
+    errdefer state.unref();
+
     if (sheet_idx >= state.inner.sheets.len) {
         writeError(err_buf, err_buf_len, "SheetIndexOutOfRange");
+        state.unref();
         return null;
     }
     const sheet = state.inner.sheets[sheet_idx];
     const inner = state.inner.rows(sheet, gpa) catch |e| {
         writeError(err_buf, err_buf_len, @errorName(e));
+        state.unref();
         return null;
     };
     const rs = gpa.create(RowsState) catch {
         var mutable = inner;
         mutable.deinit();
         writeError(err_buf, err_buf_len, "OutOfMemory");
+        state.unref();
         return null;
     };
-    // Retain the book for the lifetime of the iterator. Dropped on close.
-    _ = state.refcount.fetchAdd(1, .acq_rel);
     rs.* = .{ .book = state, .inner = inner, .c_cells = .{} };
     return @ptrCast(rs);
 }
