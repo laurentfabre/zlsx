@@ -74,6 +74,23 @@ Or, for local development, clone the repo next to your project and use a path de
 },
 ```
 
+## CLI
+
+A thin binary `zlsx` ships with this repo. It streams rows of the selected sheet to stdout — useful as an openpyxl replacement for shell / pipeline use:
+
+```bash
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/zlsx file.xlsx                          # JSONL (default)
+./zig-out/bin/zlsx file.xlsx --format tsv             # TSV with \N for empty
+./zig-out/bin/zlsx file.xlsx --format csv             # RFC 4180 CSV
+./zig-out/bin/zlsx file.xlsx --format jsonl-dict      # {"A": val, "B": val, …}
+./zig-out/bin/zlsx file.xlsx --sheet 2                # 0-indexed
+./zig-out/bin/zlsx file.xlsx --name "Summary"         # by name
+./zig-out/bin/zlsx file.xlsx --list-sheets            # one name per line
+```
+
+Emission overhead is within 3% of the tally-only benchmark — the CLI is fast enough that `zlsx big.xlsx | jq` beats any Python-based xlsx reader by 4×+.
+
 ## Performance
 
 20-run hyperfine median, real workload (`alfred_bdr_prospect_list.xlsx`, 261 KB, 1,008 rows × 35 cols):

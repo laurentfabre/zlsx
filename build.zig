@@ -33,4 +33,23 @@ pub fn build(b: *std.Build) void {
     const corpus_tests = b.addTest(.{ .root_module = corpus_mod });
     const corpus_step = b.step("test-corpus", "Run integration tests against tests/corpus/*.xlsx");
     corpus_step.dependOn(&b.addRunArtifact(corpus_tests).step);
+
+    // CLI: `zlsx` binary, streams xlsx rows to stdout in JSONL / TSV / CSV.
+    // `zig build` (default step) installs it at zig-out/bin/zlsx.
+    const cli_mod = b.createModule(.{
+        .root_source_file = b.path("src/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const cli_exe = b.addExecutable(.{ .name = "zlsx", .root_module = cli_mod });
+    b.installArtifact(cli_exe);
+
+    const run_cli = b.addRunArtifact(cli_exe);
+    if (b.args) |args| run_cli.addArgs(args);
+    const run_step = b.step("run", "Build and run the zlsx CLI (args after --)");
+    run_step.dependOn(&run_cli.step);
+
+    // CLI unit tests (colLetter, JSON/CSV escapers, arg parser).
+    const cli_tests = b.addTest(.{ .root_module = cli_mod });
+    test_step.dependOn(&b.addRunArtifact(cli_tests).step);
 }
