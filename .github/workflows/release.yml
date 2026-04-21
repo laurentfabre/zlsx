@@ -11,34 +11,50 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+    # `zig_target` is what Zig's build system accepts (`aarch64-macos`,
+    # not the LLVM triple `aarch64-apple-darwin`). `triple` is the
+    # conventional name used in the release archive so humans recognise
+    # the binary. They differ only on macOS.
+    # `dylib_dir` is `bin` on Windows (DLLs are "runtime" artefacts there)
+    # and `lib` everywhere else.
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: aarch64-apple-darwin
+          - zig_target: aarch64-macos
+            triple: aarch64-apple-darwin
             archive_format: tar.gz
             cli_name: zlsx
             dylib_name: libzlsx.dylib
+            dylib_dir: lib
             staticlib_name: libzlsx.a
-          - target: x86_64-apple-darwin
+          - zig_target: x86_64-macos
+            triple: x86_64-apple-darwin
             archive_format: tar.gz
             cli_name: zlsx
             dylib_name: libzlsx.dylib
+            dylib_dir: lib
             staticlib_name: libzlsx.a
-          - target: x86_64-linux-musl
+          - zig_target: x86_64-linux-musl
+            triple: x86_64-linux-musl
             archive_format: tar.gz
             cli_name: zlsx
             dylib_name: libzlsx.so
+            dylib_dir: lib
             staticlib_name: libzlsx.a
-          - target: aarch64-linux-musl
+          - zig_target: aarch64-linux-musl
+            triple: aarch64-linux-musl
             archive_format: tar.gz
             cli_name: zlsx
             dylib_name: libzlsx.so
+            dylib_dir: lib
             staticlib_name: libzlsx.a
-          - target: x86_64-windows-gnu
+          - zig_target: x86_64-windows-gnu
+            triple: x86_64-windows-gnu
             archive_format: zip
             cli_name: zlsx.exe
             dylib_name: zlsx.dll
+            dylib_dir: bin
             staticlib_name: zlsx_static.lib
     steps:
       - uses: actions/checkout@v4
@@ -53,17 +69,18 @@ jobs:
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Build release artifacts
-        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.zig_target }}
 
       - name: Stage archive contents
         run: |
-          STAGE="zlsx-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
+          STAGE="zlsx-${{ steps.ver.outputs.version }}-${{ matrix.triple }}"
           mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/include"
           cp "zig-out/bin/${{ matrix.cli_name }}" "$STAGE/bin/"
-          cp "zig-out/lib/${{ matrix.dylib_name }}" "$STAGE/lib/"
+          # Zig installs the shared library in `bin/` on Windows (DLLs are
+          # runtime artefacts) and in `lib/` elsewhere. The import lib
+          # (.lib) stays in `lib/` on Windows.
+          cp "zig-out/${{ matrix.dylib_dir }}/${{ matrix.dylib_name }}" "$STAGE/lib/"
           cp "zig-out/lib/${{ matrix.staticlib_name }}" "$STAGE/lib/"
-          # Windows also installs an import library named zlsx.lib next
-          # to the DLL; copy it if present so consumers can link the DLL.
           if [ -f "zig-out/lib/zlsx.lib" ]; then cp zig-out/lib/zlsx.lib "$STAGE/lib/"; fi
           cp include/zlsx.h "$STAGE/include/"
           cp README.md LICENSE "$STAGE/"
@@ -81,7 +98,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            zlsx-${{ steps.ver.outputs.version }}-${{ matrix.target }}.${{ matrix.archive_format }}
+            zlsx-${{ steps.ver.outputs.version }}-${{ matrix.triple }}.${{ matrix.archive_format }}
           fail_on_unmatched_files: true
           draft: false
           prerelease: ${{ contains(steps.ver.outputs.version, '-') }}
