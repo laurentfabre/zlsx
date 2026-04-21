@@ -2,6 +2,8 @@
 
 Tiny, read-only `.xlsx` parser for Zig. Single-file, no third-party deps, just `std.zip` + `std.compress.flate` + a hand-rolled XML walker scoped to what spreadsheets actually need.
 
+On a 261 KB / 1,008-row workbook: **10.7 ms** wall time, **4.2 MB** peak RSS. That's 1.4× faster than calamine-rust, 4× faster than python-calamine, 24× faster than openpyxl — at one tenth the memory of the Python stack. [Full benchmark table →](docs/benchmarks.md)
+
 ```zig
 const xlsx = @import("zlsx");
 
@@ -71,6 +73,19 @@ Or, for local development, clone the repo next to your project and use a path de
     .zlsx = .{ .path = "../zlsx" },
 },
 ```
+
+## Performance
+
+20-run hyperfine median, real workload (`alfred_bdr_prospect_list.xlsx`, 261 KB, 1,008 rows × 35 cols):
+
+| Library | Time | Memory | Speedup |
+|---|---|---|---|
+| **zlsx** | **10.7 ms** | **4.16 MB** | **1.00×** |
+| calamine-rust 0.26 | 15.3 ms | 4.94 MB | 1.44× slower |
+| python-calamine 0.6 | 44.9 ms | 23.69 MB | 4.21× slower |
+| openpyxl 3.1 (read_only) | 254.6 ms | 44.17 MB | 23.89× slower |
+
+zlsx edges calamine-rs because (a) the Zig binary is ~120 KB vs calamine's ~620 KB static link so startup is shorter, and (b) zlsx borrows string slices into the source xml buffer whenever possible, only allocating per-row owned strings when rich-text concatenation or entity decoding forces it. See [`docs/benchmarks.md`](docs/benchmarks.md) for the full 4-library × 5-file matrix, reproducibility commands, and counter-difference analysis.
 
 ## Zig version
 

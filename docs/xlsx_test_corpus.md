@@ -1,4 +1,4 @@
-# `ziglib.xlsx` — public test corpus
+# `zlsx` — public test corpus
 
 Curated set of publicly-downloadable xlsx files that exercise different parts of the parser. All are free, accessible without auth, and stable (government / open-data portals, long-standing library fixtures). Run `scripts/fetch_test_corpus.sh` to materialize them under `tests/corpus/`.
 
@@ -8,7 +8,7 @@ The parser was initially validated only against Alfred's BDR xlsx (openpyxl-gene
 
 ## Verified corpus (as of 2026-04-21)
 
-All four URLs below returned 200 OK and parsed through `ziglib.xlsx` without errors. Results captured in the "Live validation" section at the bottom.
+All four URLs below returned 200 OK and parsed through `zlsx` without errors. Results captured in the "Live validation" section at the bottom.
 
 | # | File | Direct URL | Size | Sheets | sharedStrings | What it tests |
 |---|---|---|---|---|---|---|
@@ -49,7 +49,7 @@ All four files decoded without `error.MalformedXml`, `error.BadZip`, or `error.U
 
 ## Known gaps this corpus does NOT cover
 
-| Edge case | Why it matters for `ziglib.xlsx` |
+| Edge case | Why it matters for `zlsx` |
 |---|---|
 | **`store` (uncompressed) entries** | Every file above uses deflate. Our code has a `.store` branch, but it's untested end-to-end. |
 | **Zip64 archives** (>4 GB) | `std.zip.Iterator` handles these, but `extractEntryToBuffer` hasn't been exercised against a >4 GB archive. |
@@ -81,9 +81,9 @@ ls -la "$dir"
 
 Total ~110 KB — small enough to commit to the repo under `tests/corpus/` if we prefer offline tests.
 
-## Next actions (in priority order)
+## Status
 
-1. **Write a corpus-backed integration test** in `ziglib` that opens each file and asserts expected row counts / header cells. Covers Frictionless + openpyxl + ph-poi + World Bank in one go.
-2. **Find and verify a `store`-method xlsx** (no deflate). Construct one via `zip -0` if a real one is hard to find.
-3. **Find a namespaced-SST xlsx** (`<x:sst>` prefix) — if it exists in the wild, our `<si` substring match silently fails and we'd report 0 shared strings while iterating cells that point into them. High-severity if real.
-4. **Download SheetJS formula stress test** and run through the library — confirms wall-clock on 1M-row workloads and pins the memory ceiling.
+- ✓ **Corpus-backed integration tests** live in `tests/xlsx_corpus.zig` and run via `zig build test-corpus` — four files, four tests, pins sheet names + SST size + header cells + row counts.
+- □ **`store`-method xlsx** (no deflate) — still untested in the wild. Synthetic fixture can be built with `zip -0`.
+- □ **Namespaced-SST xlsx** (`<x:sst>` prefix) — highest-risk silent-failure gap if real files exist; our `<si` substring match assumes the default namespace. No real producer found yet.
+- □ **SheetJS formula stress** (~43 MB, A1:H1048576) — untested. Would pin the wall-clock ceiling and reveal whether the row iterator can sustain 1M-row workloads without runaway RSS.
