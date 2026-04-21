@@ -5,6 +5,7 @@
 //! pipeable into jq / awk, no Python interpreter floor.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const xlsx = @import("xlsx.zig");
 
 const Format = enum { jsonl, jsonl_dict, tsv, csv };
@@ -224,9 +225,13 @@ fn writeRow(w: *std.Io.Writer, cells: []const xlsx.Cell, fmt: Format) !void {
 }
 
 pub fn main() !u8 {
+    // Debug builds use the leak-detecting allocator; release builds use
+    // c_allocator — faster, no bookkeeping, appropriate for a short-lived CLI.
     var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+    defer if (builtin.mode == .Debug) {
+        _ = gpa.deinit();
+    };
+    const alloc = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
 
     const raw_args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, raw_args);
