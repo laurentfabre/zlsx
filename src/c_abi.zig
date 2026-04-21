@@ -41,10 +41,14 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const xlsx = @import("xlsx.zig");
 
 pub const ZLSX_ABI_VERSION: u32 = 1;
-pub const ZLSX_VERSION_STRING: [*:0]const u8 = "0.2.0-dev";
+// Null-terminated version string derived from build.zig.zon. Using
+// comptimePrint guarantees a sentinel-terminated `[*:0]const u8` so the
+// C ABI export has the right type.
+pub const ZLSX_VERSION_STRING: [*:0]const u8 = std.fmt.comptimePrint("{s}", .{build_options.version});
 
 // Allocator used for all handle state. smp_allocator is a singleton —
 // no per-handle allocator lifetime to worry about. smp_allocator asserts

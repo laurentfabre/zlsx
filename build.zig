@@ -1,9 +1,21 @@
 const std = @import("std");
 
+// Single source of truth for the package version. Everything else
+// (C ABI `zlsx_version_string()`, release tarball names, Homebrew
+// formula) derives from this.
+const pkg_version: []const u8 = @import("build.zig.zon").version;
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const single_threaded = b.option(bool, "single-threaded", "Build the CLI and C ABI with -fsingle-threaded (smp_allocator is swapped for page_allocator)");
+
+    // Options module exposes `version` to downstream Zig code via
+    // `@import("build_options").version`. We share one instance across
+    // the CLI and C ABI modules so both report the same string.
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", pkg_version);
+    const build_options_mod = build_options.createModule();
 
     // Public module. Consumers add zlsx to their build.zig.zon as a
     // path or git dependency, then `@import("zlsx")`.
@@ -43,6 +55,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .single_threaded = single_threaded,
     });
+    cli_mod.addImport("build_options", build_options_mod);
     const cli_exe = b.addExecutable(.{ .name = "zlsx", .root_module = cli_mod });
     b.installArtifact(cli_exe);
 
@@ -72,6 +85,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .single_threaded = single_threaded,
     });
+    c_abi_mod.addImport("build_options", build_options_mod);
     const dylib = b.addLibrary(.{
         .name = "zlsx",
         .linkage = .dynamic,
