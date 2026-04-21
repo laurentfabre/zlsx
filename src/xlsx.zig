@@ -294,8 +294,7 @@ pub const Rows = struct {
             // than crashing on the [0] index.
             const raw = extractVValue(body) orelse "";
             break :blk .{ .boolean = raw.len > 0 and raw[0] == '1' };
-        }
-        else if (std.mem.eql(u8, cell_type, "e"))
+        } else if (std.mem.eql(u8, cell_type, "e"))
             .{ .string = try self.decodeVValue(body) }
         else
             try parseNumericCell(extractVValue(body) orelse "");
@@ -1133,3 +1132,14 @@ test "fuzz Book.open against arbitrary bytes" {
         }
     }
 }
+
+// ─── Writer re-exports ───────────────────────────────────────────────
+//
+// Expose the writer from the public zlsx module so downstream consumers
+// can do `@import("zlsx").Writer` and `@import("zlsx").SheetWriter`. The
+// writer lives in src/writer.zig and imports xlsx.Cell back; Zig handles
+// this mutual import cleanly because neither side introspects the other
+// at comptime.
+
+pub const Writer = @import("writer.zig").Writer;
+pub const SheetWriter = @import("writer.zig").SheetWriter;

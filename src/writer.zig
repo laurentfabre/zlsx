@@ -19,6 +19,12 @@ const xlsx = @import("xlsx.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// Largest integer that a double-precision float can represent exactly
+/// (2^53). Spreadsheets store every numeric cell as an IEEE-754 double,
+/// so writing an `i64` outside `±MAX_EXACT_INT` would silently round on
+/// open — the writer rejects those up front instead.
+pub const MAX_EXACT_INT: i64 = 9_007_199_254_740_992;
+
 // ─── OOXML skeleton strings ──────────────────────────────────────────
 
 const CONTENT_TYPES_HEAD: []const u8 =
@@ -151,11 +157,11 @@ pub const Writer = struct {
             defer wb.deinit(alloc);
             try wb.appendSlice(alloc, WORKBOOK_HEAD);
             for (self.sheets.items, 0..) |sw, i| {
-                try wb.print(
-                    alloc,
-                    "<sheet name=\"{s}\" sheetId=\"{d}\" r:id=\"rId{d}\"/>",
-                    .{ sw.name, i + 1, i + 1 },
-                );
+                // Sheet names can contain XML-special chars (e.g. "R&D",
+                // "x<y"); escape them before inlining into the attribute.
+                try wb.appendSlice(alloc, "<sheet name=\"");
+                try appendXmlEscaped(alloc, &wb, sw.name);
+                try wb.print(alloc, "\" sheetId=\"{d}\" r:id=\"rId{d}\"/>", .{ i + 1, i + 1 });
             }
             try wb.appendSlice(alloc, WORKBOOK_TAIL);
             try zw.addEntry("xl/workbook.xml", wb.items);
@@ -263,6 +269,14 @@ pub const SheetWriter = struct {
                     try self.body.print(alloc, "<c r=\"{s}\" t=\"s\"><v>{d}</v></c>", .{ ref, idx });
                 },
                 .integer => |n| {
+                    // Excel stores every numeric cell as an IEEE-754
+                    // double. Integers outside ±2^53 cannot be
+                    // represented exactly — if we just wrote them,
+                    // Excel would silently round on open. Reject
+                    // up front so the caller catches it.
+                    if (n > MAX_EXACT_INT or n < -MAX_EXACT_INT) {
+                        return error.IntegerExceedsExcelPrecision;
+                    }
                     try self.body.print(alloc, "<c r=\"{s}\"><v>{d}</v></c>", .{ ref, n });
                 },
                 .number => |f| {
@@ -562,4 +576,55 @@ test "Writer: xml entities in strings are escaped" {
     defer rows.deinit();
     const r = (try rows.next()).?;
     try std.testing.expectEqualStrings("a<b & c>d \"e\" 'f'", r[0].string);
+}
+
+test "Writer: sheet names with XML-special chars are escaped" {
+    const tmp_path = "/tmp/zlsx_writer_sheet_escape.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+        // Sheet names with ampersand, angles, and quote — all common
+        // in real workbooks ("R&D", "x<y", 'He said "hi"').
+        _ = try w.addSheet("R&D");
+        _ = try w.addSheet("x<y");
+        const s3 = try w.addSheet("quote\"it");
+        try s3.writeRow(&.{.{ .string = "marker" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 3), book.sheets.len);
+    try std.testing.expectEqualStrings("R&D", book.sheets[0].name);
+    try std.testing.expectEqualStrings("x<y", book.sheets[1].name);
+    try std.testing.expectEqualStrings("quote\"it", book.sheets[2].name);
+}
+
+test "Writer: reject integers outside IEEE-754 exact range" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    var sheet = try w.addSheet("S");
+    // 2^53 is representable exactly; 2^53 + 1 is not.
+    try sheet.writeRow(&.{.{ .integer = MAX_EXACT_INT }});
+    try std.testing.expectError(
+        error.IntegerExceedsExcelPrecision,
+        sheet.writeRow(&.{.{ .integer = MAX_EXACT_INT + 1 }}),
+    );
+    try std.testing.expectError(
+        error.IntegerExceedsExcelPrecision,
+        sheet.writeRow(&.{.{ .integer = -(MAX_EXACT_INT + 1) }}),
+    );
+}
+
+test "Writer: exposed via @import(\"xlsx.zig\") namespace re-export" {
+    // This ensures the re-export at the bottom of xlsx.zig actually
+    // compiles — downstream consumers rely on @import("zlsx").Writer.
+    const W = xlsx.Writer;
+    const SW = xlsx.SheetWriter;
+    comptime {
+        _ = W;
+        _ = SW;
+    }
 }
