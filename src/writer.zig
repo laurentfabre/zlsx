@@ -19,11 +19,26 @@ const xlsx = @import("xlsx.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// Largest integer that a double-precision float can represent exactly
-/// (2^53). Spreadsheets store every numeric cell as an IEEE-754 double,
-/// so writing an `i64` outside `±MAX_EXACT_INT` would silently round on
-/// open — the writer rejects those up front instead.
-pub const MAX_EXACT_INT: i64 = 9_007_199_254_740_992;
+/// Returns true iff `n` can be represented exactly as an IEEE-754 double
+/// (which is how spreadsheets store numeric cells). Integers with more
+/// than 53 significant bits (after stripping trailing zeros) round on
+/// open; those are rejected up front by `writeRow`.
+///
+/// Notes:
+/// * `2^53` fits (one significant bit after stripping trailing zeros).
+/// * `2^53 + 1` does not (54 significant bits).
+/// * `2^54`, `3 * 2^52`, `2^62`, etc. all fit — magnitude is irrelevant,
+///   only the count of bits after stripping trailing zeros matters.
+fn fitsExactlyInF64(n: i64) bool {
+    if (n == 0) return true;
+    // Take absolute value as u64 so std.math.minInt(i64) = -2^63 is
+    // representable (it flips to 2^63 which fits in u64 unchanged).
+    const abs_n: u64 = if (n < 0) @as(u64, @intCast(-(n + 1))) + 1 else @intCast(n);
+    const trailing = @ctz(abs_n);
+    const shifted = abs_n >> @intCast(trailing);
+    const bit_len = 64 - @clz(shifted);
+    return bit_len <= 53;
+}
 
 // ─── OOXML skeleton strings ──────────────────────────────────────────
 
@@ -252,6 +267,15 @@ pub const SheetWriter = struct {
     /// (OOXML treats missing cells as empty). Strings are interned into
     /// the parent's SST.
     pub fn writeRow(self: *SheetWriter, cells: []const xlsx.Cell) !void {
+        // Pre-validate integers BEFORE mutating `self.body`. This keeps
+        // writeRow atomic on IntegerExceedsExcelPrecision so the caller
+        // can catch the error and retry / skip that row without ending
+        // up with a half-emitted <row> in the sheet body.
+        for (cells) |cell| switch (cell) {
+            .integer => |n| if (!fitsExactlyInF64(n)) return error.IntegerExceedsExcelPrecision,
+            else => {},
+        };
+
         const alloc = self.parent.allocator;
         try self.body.print(alloc, "<row r=\"{d}\">", .{self.next_row});
 
@@ -269,14 +293,6 @@ pub const SheetWriter = struct {
                     try self.body.print(alloc, "<c r=\"{s}\" t=\"s\"><v>{d}</v></c>", .{ ref, idx });
                 },
                 .integer => |n| {
-                    // Excel stores every numeric cell as an IEEE-754
-                    // double. Integers outside ±2^53 cannot be
-                    // represented exactly — if we just wrote them,
-                    // Excel would silently round on open. Reject
-                    // up front so the caller catches it.
-                    if (n > MAX_EXACT_INT or n < -MAX_EXACT_INT) {
-                        return error.IntegerExceedsExcelPrecision;
-                    }
                     try self.body.print(alloc, "<c r=\"{s}\"><v>{d}</v></c>", .{ ref, n });
                 },
                 .number => |f| {
@@ -602,20 +618,94 @@ test "Writer: sheet names with XML-special chars are escaped" {
     try std.testing.expectEqualStrings("quote\"it", book.sheets[2].name);
 }
 
-test "Writer: reject integers outside IEEE-754 exact range" {
+test "Writer: reject only integers that round on IEEE-754 conversion" {
     var w = Writer.init(std.testing.allocator);
     defer w.deinit();
     var sheet = try w.addSheet("S");
-    // 2^53 is representable exactly; 2^53 + 1 is not.
-    try sheet.writeRow(&.{.{ .integer = MAX_EXACT_INT }});
+
+    // Exactly representable — must succeed.
+    try sheet.writeRow(&.{.{ .integer = 1 << 53 }}); // 2^53
+    try sheet.writeRow(&.{.{ .integer = 1 << 54 }}); // 2^54 — magnitude is fine
+    try sheet.writeRow(&.{.{ .integer = 1 << 62 }}); // 2^62 — still fits
+    try sheet.writeRow(&.{.{ .integer = 3 * (@as(i64, 1) << 52) }}); // 2 significant bits
+    try sheet.writeRow(&.{.{ .integer = -(1 << 54) }}); // negative power of two
+    try sheet.writeRow(&.{.{ .integer = std.math.minInt(i64) }}); // -2^63
+
+    // NOT exactly representable — 54+ significant bits.
     try std.testing.expectError(
         error.IntegerExceedsExcelPrecision,
-        sheet.writeRow(&.{.{ .integer = MAX_EXACT_INT + 1 }}),
+        sheet.writeRow(&.{.{ .integer = (1 << 53) + 1 }}),
     );
     try std.testing.expectError(
         error.IntegerExceedsExcelPrecision,
-        sheet.writeRow(&.{.{ .integer = -(MAX_EXACT_INT + 1) }}),
+        sheet.writeRow(&.{.{ .integer = -((1 << 53) + 1) }}),
     );
+    try std.testing.expectError(
+        error.IntegerExceedsExcelPrecision,
+        sheet.writeRow(&.{.{ .integer = std.math.maxInt(i64) }}), // 2^63 - 1
+    );
+}
+
+test "Writer: writeRow is atomic on IntegerExceedsExcelPrecision" {
+    const tmp_path = "/tmp/zlsx_writer_atomic.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    var sheet = try w.addSheet("S");
+
+    // First row succeeds.
+    try sheet.writeRow(&.{.{ .string = "ok" }});
+
+    // Second row fails validation — the bad integer is after a good cell,
+    // so a non-atomic writer would have already appended `<row>` + the
+    // first `<c>` before hitting the error.
+    try std.testing.expectError(
+        error.IntegerExceedsExcelPrecision,
+        sheet.writeRow(&.{
+            .{ .string = "first" },
+            .{ .integer = (1 << 53) + 1 }, // bad
+            .{ .string = "third" },
+        }),
+    );
+
+    // Third row succeeds and becomes row 2 (next_row wasn't advanced).
+    try sheet.writeRow(&.{.{ .string = "after" }});
+
+    try w.save(tmp_path);
+
+    // Reading back proves the file is well-formed: no partial row leaked.
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+
+    const r1 = (try rows.next()).?;
+    try std.testing.expectEqualStrings("ok", r1[0].string);
+    const r2 = (try rows.next()).?;
+    try std.testing.expectEqualStrings("after", r2[0].string);
+    try std.testing.expectEqual(@as(?[]const xlsx.Cell, null), try rows.next());
+}
+
+test "fitsExactlyInF64 matches round-trip reference" {
+    // Sanity check: fitsExactlyInF64(n) iff (f64 round-trip == n).
+    const test_values = [_]i64{
+        0,             1,                       -1,
+        1 << 52,       (1 << 52) - 1,           (1 << 52) + 1,
+        1 << 53,       (1 << 53) - 1,           (1 << 53) + 1,
+        1 << 54,       3 * (@as(i64, 1) << 52), 1 << 62,
+        (1 << 62) + 1, std.math.maxInt(i64),    std.math.minInt(i64),
+    };
+    for (test_values) |n| {
+        const f: f64 = @floatFromInt(n);
+        // Round-trip reference — only valid when f is in i64 range.
+        const lossless_via_roundtrip = blk: {
+            if (f >= 9.223372036854776e18 or f < -9.223372036854776e18) break :blk false;
+            const back: i64 = @intFromFloat(f);
+            break :blk back == n;
+        };
+        try std.testing.expectEqual(lossless_via_roundtrip, fitsExactlyInF64(n));
+    }
 }
 
 test "Writer: exposed via @import(\"xlsx.zig\") namespace re-export" {
