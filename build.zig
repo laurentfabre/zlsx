@@ -70,8 +70,11 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(dylib);
 
+    // Static lib gets a distinct basename so Windows (where both dynamic
+    // and static artifacts resolve to .lib) doesn't clobber one with
+    // the other in zig-out/lib/.
     const staticlib = b.addLibrary(.{
-        .name = "zlsx",
+        .name = "zlsx_static",
         .linkage = .static,
         .root_module = c_abi_mod,
     });

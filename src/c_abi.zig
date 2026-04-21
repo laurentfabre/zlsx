@@ -46,11 +46,27 @@ pub const Book = extern struct { _opaque: u8 };
 pub const Rows = extern struct { _opaque: u8 };
 
 // Internal state behind the opaque handles.
+//
+// BookState is refcounted: `zlsx_book_open` creates it with refcount=1,
+// `zlsx_rows_open` bumps it, `zlsx_rows_close` and `zlsx_book_close` both
+// drop a reference. Whoever brings the count to zero frees the state.
+// This makes it safe for a caller to close the book while rows are still
+// alive — a common FFI mistake that would otherwise read freed memory
+// (Rows borrows slices into the Book's decompressed XML and SST buffers).
 const BookState = struct {
     inner: xlsx.Book,
+    refcount: std.atomic.Value(u32) = .{ .raw = 1 },
+
+    fn unref(self: *BookState) void {
+        if (self.refcount.fetchSub(1, .acq_rel) == 1) {
+            self.inner.deinit();
+            gpa.destroy(self);
+        }
+    }
 };
 
 const RowsState = struct {
+    book: *BookState,
     inner: xlsx.Rows,
     // Per-row C-cell scratch, translated from the Zig cell list on each
     // `next()` call. Lives until the next call (or close).
@@ -180,12 +196,13 @@ export fn zlsx_book_open(
     return @ptrCast(state);
 }
 
-/// Close and free a Book handle. Safe to call with NULL (no-op).
+/// Drop the caller's reference to a Book. Safe to call with NULL (no-op).
+/// Active row iterators hold their own references, so this will not
+/// prematurely free the underlying state while rows are still being read.
 export fn zlsx_book_close(book: ?*Book) callconv(.c) void {
     if (book) |b| {
         const state: *BookState = @ptrCast(@alignCast(b));
-        state.inner.deinit();
-        gpa.destroy(state);
+        state.unref();
     }
 }
 
@@ -252,17 +269,23 @@ export fn zlsx_rows_open(
         writeError(err_buf, err_buf_len, "OutOfMemory");
         return null;
     };
-    rs.* = .{ .inner = inner, .c_cells = .{} };
+    // Retain the book for the lifetime of the iterator. Dropped on close.
+    _ = state.refcount.fetchAdd(1, .acq_rel);
+    rs.* = .{ .book = state, .inner = inner, .c_cells = .{} };
     return @ptrCast(rs);
 }
 
-/// Close and free a Rows handle. Safe with NULL.
+/// Close and free a Rows handle. Safe with NULL. Drops the reference
+/// on the underlying Book; if this was the last handle, the Book is
+/// freed too.
 export fn zlsx_rows_close(rows: ?*Rows) callconv(.c) void {
     if (rows) |r| {
         const rs: *RowsState = @ptrCast(@alignCast(r));
         rs.c_cells.deinit(gpa);
         rs.inner.deinit();
+        const book = rs.book;
         gpa.destroy(rs);
+        book.unref();
     }
 }
 
@@ -336,33 +359,74 @@ test "CCell round-trip for each tag" {
 }
 
 test "abi full lifecycle on smallest corpus file" {
-    // NOTE: this test assumes the corpus is present. It's run as part of
-    // the unit suite only when the file exists (skipped silently otherwise
-    // — corpus isn't committed).
-    const path = "tests/corpus/frictionless_2sheets.xlsx\x00";
-    const path_z: [*:0]const u8 = @ptrCast(path.ptr);
+    // Skip only when the corpus file is absent (the corpus isn't
+    // committed — scripts/fetch_test_corpus.sh materializes it). Any
+    // other failure path is a real regression and must fail the test.
+    const path_bytes = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path_bytes, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+
+    const path_z: [*:0]const u8 = "tests/corpus/frictionless_2sheets.xlsx";
     var err_buf: [128]u8 = undefined;
 
-    const book = zlsx_book_open(path_z, &err_buf, err_buf.len) orelse return;
+    const book = zlsx_book_open(path_z, &err_buf, err_buf.len);
+    try std.testing.expect(book != null);
     defer zlsx_book_close(book);
 
-    try std.testing.expect(zlsx_sheet_count(book) >= 1);
+    try std.testing.expect(zlsx_sheet_count(book.?) >= 1);
 
     var name_buf: [64]u8 = undefined;
-    const n = zlsx_sheet_name(book, 0, &name_buf, name_buf.len);
+    const n = zlsx_sheet_name(book.?, 0, &name_buf, name_buf.len);
     try std.testing.expect(n > 0);
 
-    const rows = zlsx_rows_open(book, 0, &err_buf, err_buf.len) orelse return;
+    const rows = zlsx_rows_open(book.?, 0, &err_buf, err_buf.len);
+    try std.testing.expect(rows != null);
     defer zlsx_rows_close(rows);
 
     var cells_ptr: [*]const CCell = undefined;
     var cells_len: usize = 0;
     var row_count: usize = 0;
     while (true) {
-        const rc = zlsx_rows_next(rows, &cells_ptr, &cells_len, &err_buf, err_buf.len);
+        const rc = zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len);
         if (rc == 0) break;
         try std.testing.expectEqual(@as(i32, 1), rc);
         row_count += 1;
     }
     try std.testing.expect(row_count >= 1);
+}
+
+test "refcount: close book before rows is safe" {
+    const path_bytes = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path_bytes, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+
+    const path_z: [*:0]const u8 = "tests/corpus/frictionless_2sheets.xlsx";
+    var err_buf: [128]u8 = undefined;
+
+    const book = zlsx_book_open(path_z, &err_buf, err_buf.len);
+    try std.testing.expect(book != null);
+    const rows = zlsx_rows_open(book.?, 0, &err_buf, err_buf.len);
+    try std.testing.expect(rows != null);
+
+    // Drop the book reference — rows still holds one, so the state
+    // must stay alive and iteration must still work.
+    zlsx_book_close(book);
+
+    var cells_ptr: [*]const CCell = undefined;
+    var cells_len: usize = 0;
+    var saw_row = false;
+    while (true) {
+        const rc = zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len);
+        if (rc == 0) break;
+        try std.testing.expectEqual(@as(i32, 1), rc);
+        saw_row = true;
+    }
+    try std.testing.expect(saw_row);
+
+    // Last reference — this is the call that actually frees.
+    zlsx_rows_close(rows);
 }
