@@ -55,6 +55,15 @@ pub fn build(b: *std.Build) void {
     const cli_tests = b.addTest(.{ .root_module = cli_mod });
     test_step.dependOn(&b.addRunArtifact(cli_tests).step);
 
+    // Writer unit tests (MVP: round-trip via the reader).
+    const writer_mod = b.createModule(.{
+        .root_source_file = b.path("src/writer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const writer_tests = b.addTest(.{ .root_module = writer_mod });
+    test_step.dependOn(&b.addRunArtifact(writer_tests).step);
+
     // C ABI — both a shared library (for Python / cffi bindings) and a
     // static library (for language toolchains that prefer linking in).
     const c_abi_mod = b.createModule(.{
