@@ -226,13 +226,19 @@ fn writeRow(w: *std.Io.Writer, cells: []const xlsx.Cell, fmt: Format) !void {
 
 pub fn main() !u8 {
     // Debug builds use the leak-detecting allocator; release builds use
-    // smp_allocator — fast, pure-Zig (no libc dep so cross-compile stays
-    // clean), appropriate for a short-lived CLI.
+    // smp_allocator — fast, pure-Zig (no libc dep). smp_allocator asserts
+    // !builtin.single_threaded, so single-threaded builds fall back to
+    // page_allocator (also pure-Zig, slightly higher per-alloc cost but
+    // fine for short-lived CLIs).
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer if (builtin.mode == .Debug) {
         _ = gpa.deinit();
     };
-    const alloc = if (builtin.mode == .Debug) gpa.allocator() else std.heap.smp_allocator;
+    const release_alloc: std.mem.Allocator = if (builtin.single_threaded)
+        std.heap.page_allocator
+    else
+        std.heap.smp_allocator;
+    const alloc = if (builtin.mode == .Debug) gpa.allocator() else release_alloc;
 
     const raw_args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, raw_args);
