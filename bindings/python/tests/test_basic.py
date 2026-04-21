@@ -200,3 +200,61 @@ def test_writer_xml_special_chars_escape(tmp_path):
         assert book.sheets == ["R&D"]
         row = next(book.sheet(0).rows())
         assert row[0] == "a<b & c>d \"e\" 'f'"
+
+
+# ─── Styles (Phase 3b) ────────────────────────────────────────────────
+
+
+def test_writer_add_style_dedups():
+    with zlsx.write() as w:
+        bold = w.add_style(zlsx.Style(font_bold=True))
+        bold_again = w.add_style(zlsx.Style(font_bold=True))
+        italic = w.add_style(zlsx.Style(font_italic=True))
+        assert bold == bold_again
+        assert italic != bold
+        assert bold >= 1   # 0 is reserved for default
+        assert italic >= 1
+
+
+def test_writer_styled_round_trip(tmp_path):
+    out = tmp_path / "styled.xlsx"
+    with zlsx.write(out) as w:
+        bold = w.add_style(zlsx.Style(font_bold=True))
+        italic = w.add_style(zlsx.Style(font_italic=True))
+        both = w.add_style(zlsx.Style(font_bold=True, font_italic=True))
+        sheet = w.add_sheet("Styled")
+        sheet.write_row(
+            ["bold", "italic", "both", "plain"],
+            styles=[bold, italic, both, 0],
+        )
+
+    # Reader ignores styles, but must still parse the file cleanly and
+    # preserve the cell values.
+    with zlsx.open(out) as book:
+        row = next(book.sheet(0).rows())
+        assert row == ["bold", "italic", "both", "plain"]
+
+
+def test_writer_styles_length_mismatch(tmp_path):
+    with zlsx.write(tmp_path / "x.xlsx") as w:
+        bold = w.add_style(zlsx.Style(font_bold=True))
+        sheet = w.add_sheet("S")
+        with pytest.raises(ValueError, match="styles length"):
+            sheet.write_row(["a", "b"], styles=[bold])
+
+
+def test_writer_no_styles_xml_when_unused(tmp_path):
+    """A writer that never calls add_style must produce a byte-identical
+    output to v0.2.3 — no styles.xml entry in the archive. This is
+    important so upgrades don't perturb hashes of previously-saved files.
+    """
+    import zipfile
+
+    out = tmp_path / "plain.xlsx"
+    with zlsx.write(out) as w:
+        w.add_sheet("S").write_row(["hello"])
+
+    with zipfile.ZipFile(out) as z:
+        names = set(z.namelist())
+    assert "xl/styles.xml" not in names
+    assert "xl/sharedStrings.xml" in names  # still present as before

@@ -641,6 +641,94 @@ export fn zlsx_writer_save(
     return 0;
 }
 
+// ─── Writer styles (Phase 3b stage 1) ────────────────────────────────
+//
+// Cell styles registered via `zlsx_writer_add_style` return a 1-based
+// index that the caller passes into `zlsx_sheet_writer_write_row_styled`
+// alongside cell values. Index 0 is always the default (no style).
+//
+// The Zig Style struct grows over time; the C ABI reflects new fields
+// additively — future versions add parameters to an `_ex` variant rather
+// than changing this function's signature, so existing callers keep
+// working.
+
+/// Register a cell style. Writes the 1-based style index into `out_index`
+/// and returns 0 on success, -1 on allocation failure.
+///
+/// Registering the same `{ font_bold, font_italic }` combination twice
+/// returns the same index (dedup).
+export fn zlsx_writer_add_style(
+    w: *Writer,
+    font_bold: u8,
+    font_italic: u8,
+    out_index: *u32,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state: *WriterState = @ptrCast(@alignCast(w));
+    const idx = state.inner.addStyle(.{
+        .font_bold = font_bold != 0,
+        .font_italic = font_italic != 0,
+    }) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    out_index.* = idx;
+    return 0;
+}
+
+/// Write a row with per-cell style indices. `styles_ptr` must point at
+/// an array of `cells_len` u32 values — use 0 for cells that should
+/// use the default no-style slot. Returns 0 on success, -1 on failure
+/// (err_buf receives the diagnostic).
+export fn zlsx_sheet_writer_write_row_styled(
+    sw: *SheetWriter,
+    cells_ptr: ?[*]const CCell,
+    styles_ptr: ?[*]const u32,
+    cells_len: usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+
+    // Translate caller-provided CCell[] into Zig xlsx.Cell[] using the
+    // same scratch-then-heap pattern as the unstyled write path.
+    var scratch: [128]xlsx.Cell = undefined;
+    var cells_slice: []xlsx.Cell = &.{};
+    var heap_owned: ?[]xlsx.Cell = null;
+    defer if (heap_owned) |h| gpa.free(h);
+
+    if (cells_len > 0) {
+        const src = cells_ptr.?;
+        if (cells_len <= scratch.len) {
+            cells_slice = scratch[0..cells_len];
+        } else {
+            heap_owned = gpa.alloc(xlsx.Cell, cells_len) catch {
+                writeError(err_buf, err_buf_len, "OutOfMemory");
+                return -1;
+            };
+            cells_slice = heap_owned.?;
+        }
+        for (0..cells_len) |i| {
+            cells_slice[i] = fromCCell(src[i]) catch |e| {
+                writeError(err_buf, err_buf_len, @errorName(e));
+                return -1;
+            };
+        }
+    }
+
+    const styles_slice: []const u32 = if (cells_len == 0)
+        &.{}
+    else
+        styles_ptr.?[0..cells_len];
+
+    sw_state.inner.writeRowStyled(cells_slice, styles_slice) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
 // ─── Writer tests ────────────────────────────────────────────────────
 
 test "writer: round-trip via reader" {

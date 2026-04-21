@@ -206,6 +206,47 @@ int32_t zlsx_writer_save(
     uint8_t       * err_buf,
     size_t          err_buf_len);
 
+/* ─── Styles (Phase 3b, added in 0.2.4) ──────────────────────────── */
+
+/*
+ * Register a cell style. Style index (1-based) is written into
+ * *out_index. Returns 0 on success, -1 on allocation failure.
+ *
+ * Dedup: registering the same { font_bold, font_italic } combination
+ * twice returns the same index. Style 0 is always the default no-style
+ * slot reserved by the library.
+ *
+ * Future Style fields will be exposed through `_ex` variants to keep
+ * this ABI stable.
+ */
+int32_t zlsx_writer_add_style(
+    zlsx_writer_t * writer,
+    uint8_t         font_bold,     /* 0 or 1 */
+    uint8_t         font_italic,   /* 0 or 1 */
+    uint32_t      * out_index,
+    uint8_t       * err_buf,
+    size_t          err_buf_len);
+
+/*
+ * Write a row with per-cell style indices. `styles_ptr` must point at
+ * an array of `cells_len` uint32_t values; use 0 for cells that should
+ * inherit the default (no-style) formatting.
+ *
+ * Atomicity contract is identical to zlsx_sheet_writer_write_row:
+ * integer-precision validation runs before any mutation, so a failed
+ * write leaves the sheet buffer unchanged and the caller can skip /
+ * retry the row.
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+int32_t zlsx_sheet_writer_write_row_styled(
+    zlsx_sheet_writer_t * sw,
+    const zlsx_cell_t   * cells_ptr,
+    const uint32_t      * styles_ptr,
+    size_t                cells_len,
+    uint8_t             * err_buf,
+    size_t                err_buf_len);
+
 #ifdef __cplusplus
 }
 #endif

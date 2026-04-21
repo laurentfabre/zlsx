@@ -42,8 +42,35 @@ __all__ = [
     "Rows",
     "Writer",
     "SheetWriter",
+    "Style",
     "ZlsxError",
 ]
+
+
+# ─── Styles (Phase 3b) ─────────────────────────────────────────────────
+#
+# `Style` is a dataclass that mirrors the Zig writer's Style struct. Keep
+# fields additive — openpyxl-parity fields land in subsequent releases
+# (alignment, fills, borders, number formats, etc).
+
+try:
+    from dataclasses import dataclass, field
+
+    @dataclass(frozen=True)
+    class Style:
+        """A cell-style specification. Pass an instance to
+        :meth:`Writer.add_style` and use the returned index with
+        :meth:`SheetWriter.write_row`'s ``styles`` argument."""
+
+        font_bold: bool = False
+        font_italic: bool = False
+
+except ImportError:   # pragma: no cover — dataclass is 3.7+
+    class Style:      # type: ignore[no-redef]
+        __slots__ = ("font_bold", "font_italic")
+        def __init__(self, font_bold: bool = False, font_italic: bool = False):
+            self.font_bold = font_bold
+            self.font_italic = font_italic
 
 
 class ZlsxError(RuntimeError):
@@ -298,13 +325,29 @@ class SheetWriter:
         self._handle = handle
         self._err = ctypes.create_string_buffer(_ERR_BUF_LEN)
 
-    def write_row(self, values) -> None:
+    def write_row(self, values, styles=None) -> None:
         """Append a row. ``values`` is any iterable of ``None | bool |
         int | float | str``. Integers outside ±2^53-significant-bits
         raise :class:`ZlsxError` (Excel stores numerics as IEEE-754
-        doubles — oversized ints would silently round on open)."""
+        doubles — oversized ints would silently round on open).
+
+        ``styles``, if provided, must be an iterable of the same length
+        as ``values`` where each element is a style index returned by
+        :meth:`Writer.add_style` (or 0 for the default no-style). If
+        ``styles`` is None, every cell inherits the default formatting.
+        """
         cells_list = list(values)
         n = len(cells_list)
+
+        if styles is not None:
+            styles_list = list(styles)
+            if len(styles_list) != n:
+                raise ValueError(
+                    f"styles length {len(styles_list)} must match values length {n}"
+                )
+        else:
+            styles_list = None
+
         if n == 0:
             # Emit an empty row via the ABI's explicit null/zero path.
             rc = _ffi.lib.zlsx_sheet_writer_write_row(
@@ -327,15 +370,37 @@ class SheetWriter:
             if keeper is not None:
                 keepers.append(keeper)
 
-        rc = _ffi.lib.zlsx_sheet_writer_write_row(
-            self._handle,
-            ctypes.cast(cell_array, _ffi.cell_ptr),
-            n,
-            self._err,
-            _ERR_BUF_LEN,
-        )
-        if rc != 0:
-            raise ZlsxError(f"zlsx_sheet_writer_write_row: {_decode_err(self._err)}")
+        if styles_list is None:
+            rc = _ffi.lib.zlsx_sheet_writer_write_row(
+                self._handle,
+                ctypes.cast(cell_array, _ffi.cell_ptr),
+                n,
+                self._err,
+                _ERR_BUF_LEN,
+            )
+            if rc != 0:
+                raise ZlsxError(
+                    f"zlsx_sheet_writer_write_row: {_decode_err(self._err)}"
+                )
+        else:
+            if not _ffi._HAS_STYLES:
+                raise RuntimeError(
+                    "loaded libzlsx does not expose zlsx_sheet_writer_write_row_styled "
+                    "(requires 0.2.4+); upgrade libzlsx or unset the styles argument"
+                )
+            style_array = (ctypes.c_uint32 * n)(*[int(s) for s in styles_list])
+            rc = _ffi.lib.zlsx_sheet_writer_write_row_styled(
+                self._handle,
+                ctypes.cast(cell_array, _ffi.cell_ptr),
+                style_array,
+                n,
+                self._err,
+                _ERR_BUF_LEN,
+            )
+            if rc != 0:
+                raise ZlsxError(
+                    f"zlsx_sheet_writer_write_row_styled: {_decode_err(self._err)}"
+                )
 
         # Reference `keepers` past the call so ctypes doesn't free the
         # backing str buffers while the C side is still reading them.
@@ -378,6 +443,28 @@ class Writer:
         sw = SheetWriter(self, sw_handle)
         self._sheets.append(sw)
         return sw
+
+    def add_style(self, style: "Style") -> int:
+        """Register a cell style and return its 1-based index. Pass the
+        returned value via ``styles=[…]`` to :meth:`SheetWriter.write_row`.
+        Duplicate registrations return the same index."""
+        if not _ffi._HAS_STYLES:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_writer_add_style "
+                "(requires 0.2.4+); upgrade libzlsx"
+            )
+        out_idx = ctypes.c_uint32(0)
+        rc = _ffi.lib.zlsx_writer_add_style(
+            self._handle,
+            1 if style.font_bold else 0,
+            1 if style.font_italic else 0,
+            ctypes.byref(out_idx),
+            self._err,
+            _ERR_BUF_LEN,
+        )
+        if rc != 0:
+            raise ZlsxError(f"zlsx_writer_add_style: {_decode_err(self._err)}")
+        return int(out_idx.value)
 
     def save(self, path: Union[str, Path, None] = None) -> None:
         """Write the workbook to disk. Uses the path passed to

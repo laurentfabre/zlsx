@@ -188,6 +188,37 @@ lib.zlsx_writer_save.argtypes = [
 ]
 lib.zlsx_writer_save.restype = ctypes.c_int32
 
+# ─── Styles (Phase 3b, available in libzlsx 0.2.4+) ───────────────────
+#
+# The `_ex` convention documented in the header leaves us with a single
+# addStyle signature per ABI revision — we consume it here with a
+# hasattr() guard so py-zlsx keeps importing against older dylibs.
+# Callers that try to use styles against an older library get a clear
+# AttributeError via the public Writer.add_style() wrapper.
+
+_HAS_STYLES = hasattr(lib, "zlsx_writer_add_style")
+
+if _HAS_STYLES:
+    lib.zlsx_writer_add_style.argtypes = [
+        writer_handle,
+        ctypes.c_uint8,
+        ctypes.c_uint8,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_writer_add_style.restype = ctypes.c_int32
+
+    lib.zlsx_sheet_writer_write_row_styled.argtypes = [
+        sheet_writer_handle,
+        cell_ptr,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_write_row_styled.restype = ctypes.c_int32
+
 # ─── ABI version check ────────────────────────────────────────────────
 
 EXPECTED_ABI_VERSION = 1

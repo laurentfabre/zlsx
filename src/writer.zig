@@ -83,7 +83,50 @@ const SST_HEAD_FMT: []const u8 =
 ;
 const SST_TAIL: []const u8 = "</sst>";
 
+// Static skeleton for xl/styles.xml. Fixed sections (fills at index 0=none
+// and 1=gray125, empty border, default cellStyleXfs entry, "Normal"
+// cellStyle) — fonts and cellXfs get appended dynamically.
+const STYLES_HEAD: []const u8 =
+    \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    \\<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+;
+const STYLES_FONTS_DEFAULT: []const u8 =
+    \\<font><sz val="11"/><name val="Calibri"/></font>
+;
+const STYLES_FILLS: []const u8 =
+    \\<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>
+;
+const STYLES_BORDERS: []const u8 =
+    \\<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+;
+const STYLES_CELL_STYLE_XFS: []const u8 =
+    \\<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+;
+const STYLES_DEFAULT_CELL_XF: []const u8 =
+    \\<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+;
+const STYLES_CELL_STYLES: []const u8 =
+    \\<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+;
+const STYLES_TAIL: []const u8 = "</styleSheet>";
+
 // ─── Writer public API ───────────────────────────────────────────────
+
+/// Cell style registered via `Writer.addStyle`. Start with the minimum
+/// surface that openpyxl users reach for and grow from here — each new
+/// field defaults to "unset" so registering `.{ .font_bold = true }`
+/// produces the same styles.xml as registering `.{}` with bold.
+///
+/// Phase 3b stages:
+///   - stage 1 (this release): font bold/italic
+///   - stage 2: font name/size/color, horizontal alignment, wrap_text
+///   - stage 3: fills (patternType, fg/bg rgb)
+///   - stage 4: borders (left/right/top/bottom + style + color)
+///   - stage 5: number formats, column widths, freeze panes, auto_filter
+pub const Style = struct {
+    font_bold: bool = false,
+    font_italic: bool = false,
+};
 
 pub const Writer = struct {
     allocator: Allocator,
@@ -95,6 +138,11 @@ pub const Writer = struct {
     // Total number of string-typed cells written across all sheets
     // (informational — OOXML's <sst count="..."> field).
     sst_count: u64 = 0,
+    // Registered styles (unique). Index 0 in the emitted <cellXfs> is the
+    // default no-style entry; user styles start at 1 so the value
+    // returned from `addStyle()` can be used directly as the cell's
+    // `s="N"` attribute.
+    styles: std.ArrayListUnmanaged(Style) = .{},
 
     pub fn init(allocator: Allocator) Writer {
         return .{ .allocator = allocator };
@@ -109,7 +157,20 @@ pub const Writer = struct {
         for (self.sst_strings.items) |s| self.allocator.free(s);
         self.sst_strings.deinit(self.allocator);
         self.sst_index.deinit(self.allocator);
+        self.styles.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Register a cell style and return its `s="…"` index. Dedupes —
+    /// registering the same `Style` twice returns the same index. The
+    /// returned value is 1-based (cellXfs[0] is the default no-style
+    /// record, reserved).
+    pub fn addStyle(self: *Writer, style: Style) !u32 {
+        for (self.styles.items, 0..) |existing, i| {
+            if (std.meta.eql(existing, style)) return @intCast(i + 1);
+        }
+        try self.styles.append(self.allocator, style);
+        return @intCast(self.styles.items.len);
     }
 
     /// Add a sheet and return a handle to append rows. Sheet is owned by
@@ -147,6 +208,8 @@ pub const Writer = struct {
 
         const alloc = self.allocator;
 
+        const have_styles = self.styles.items.len > 0;
+
         // 1. [Content_Types].xml
         {
             var ct: std.ArrayListUnmanaged(u8) = .{};
@@ -157,6 +220,12 @@ pub const Writer = struct {
                     alloc,
                     "<Override PartName=\"/xl/worksheets/sheet{d}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>",
                     .{i + 1},
+                );
+            }
+            if (have_styles) {
+                try ct.appendSlice(
+                    alloc,
+                    "<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>",
                 );
             }
             try ct.appendSlice(alloc, CONTENT_TYPES_TAIL);
@@ -200,6 +269,13 @@ pub const Writer = struct {
                 "<Relationship Id=\"rId{d}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/>",
                 .{self.sheets.items.len + 1},
             );
+            if (have_styles) {
+                try rels.print(
+                    alloc,
+                    "<Relationship Id=\"rId{d}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>",
+                    .{self.sheets.items.len + 2},
+                );
+            }
             try rels.appendSlice(alloc, WORKBOOK_RELS_TAIL);
             try zw.addEntry("xl/_rels/workbook.xml.rels", rels.items);
         }
@@ -230,6 +306,10 @@ pub const Writer = struct {
             try sst.appendSlice(alloc, SST_TAIL);
             try zw.addEntry("xl/sharedStrings.xml", sst.items);
         }
+
+        // 7. xl/styles.xml — only when the caller registered any styles.
+        // Keeps the "no styles" path byte-identical to v0.2.0-0.2.3 output.
+        if (have_styles) try emitStylesXml(alloc, &zw, self.styles.items);
 
         try zw.finalize();
 
@@ -267,6 +347,27 @@ pub const SheetWriter = struct {
     /// (OOXML treats missing cells as empty). Strings are interned into
     /// the parent's SST.
     pub fn writeRow(self: *SheetWriter, cells: []const xlsx.Cell) !void {
+        return self.writeRowImpl(cells, null);
+    }
+
+    /// Write a row with per-cell style indices. `styles.len` must equal
+    /// `cells.len`; use `0` (the default no-style slot) for cells that
+    /// should inherit the default formatting. Style indices come from
+    /// `Writer.addStyle` / `zlsx_writer_add_style`.
+    pub fn writeRowStyled(
+        self: *SheetWriter,
+        cells: []const xlsx.Cell,
+        styles: []const u32,
+    ) !void {
+        if (styles.len != cells.len) return error.StyleCountMismatch;
+        return self.writeRowImpl(cells, styles);
+    }
+
+    fn writeRowImpl(
+        self: *SheetWriter,
+        cells: []const xlsx.Cell,
+        styles: ?[]const u32,
+    ) !void {
         // Pre-validate integers BEFORE mutating `self.body`. This keeps
         // writeRow atomic on IntegerExceedsExcelPrecision so the caller
         // can catch the error and retry / skip that row without ending
@@ -280,28 +381,51 @@ pub const SheetWriter = struct {
         try self.body.print(alloc, "<row r=\"{d}\">", .{self.next_row});
 
         for (cells, 0..) |cell, col_idx| {
-            if (cell == .empty) continue;
+            const style_id: u32 = if (styles) |s| s[col_idx] else 0;
+            // `<c>` elements for empty cells are only emitted when a
+            // non-default style is applied — otherwise OOXML's
+            // "missing cell = empty" rule keeps the sheet smaller.
+            if (cell == .empty and style_id == 0) continue;
 
             var ref_buf: [16]u8 = undefined;
             const ref = try formatCellRef(&ref_buf, self.next_row, @intCast(col_idx));
 
             switch (cell) {
-                .empty => unreachable,
+                .empty => {
+                    // Styled-but-empty cell: emit just `<c r="…" s="N"/>`.
+                    try self.body.print(alloc, "<c r=\"{s}\" s=\"{d}\"/>", .{ ref, style_id });
+                },
                 .string => |s| {
                     const idx = try self.parent.sstIntern(s);
                     self.parent.sst_count += 1;
-                    try self.body.print(alloc, "<c r=\"{s}\" t=\"s\"><v>{d}</v></c>", .{ ref, idx });
+                    if (style_id == 0) {
+                        try self.body.print(alloc, "<c r=\"{s}\" t=\"s\"><v>{d}</v></c>", .{ ref, idx });
+                    } else {
+                        try self.body.print(alloc, "<c r=\"{s}\" s=\"{d}\" t=\"s\"><v>{d}</v></c>", .{ ref, style_id, idx });
+                    }
                 },
                 .integer => |n| {
-                    try self.body.print(alloc, "<c r=\"{s}\"><v>{d}</v></c>", .{ ref, n });
+                    if (style_id == 0) {
+                        try self.body.print(alloc, "<c r=\"{s}\"><v>{d}</v></c>", .{ ref, n });
+                    } else {
+                        try self.body.print(alloc, "<c r=\"{s}\" s=\"{d}\"><v>{d}</v></c>", .{ ref, style_id, n });
+                    }
                 },
                 .number => |f| {
                     // {d} renders the shortest round-trip decimal; Excel
                     // accepts decimal or scientific notation in <v>.
-                    try self.body.print(alloc, "<c r=\"{s}\"><v>{d}</v></c>", .{ ref, f });
+                    if (style_id == 0) {
+                        try self.body.print(alloc, "<c r=\"{s}\"><v>{d}</v></c>", .{ ref, f });
+                    } else {
+                        try self.body.print(alloc, "<c r=\"{s}\" s=\"{d}\"><v>{d}</v></c>", .{ ref, style_id, f });
+                    }
                 },
                 .boolean => |b| {
-                    try self.body.print(alloc, "<c r=\"{s}\" t=\"b\"><v>{d}</v></c>", .{ ref, @intFromBool(b) });
+                    if (style_id == 0) {
+                        try self.body.print(alloc, "<c r=\"{s}\" t=\"b\"><v>{d}</v></c>", .{ ref, @intFromBool(b) });
+                    } else {
+                        try self.body.print(alloc, "<c r=\"{s}\" s=\"{d}\" t=\"b\"><v>{d}</v></c>", .{ ref, style_id, @intFromBool(b) });
+                    }
                 },
             }
         }
@@ -326,6 +450,56 @@ fn formatCellRef(buf: *[16]u8, row: u32, col_idx: u32) ![]u8 {
     }
     const letters = col_chars[pos..];
     return std.fmt.bufPrint(buf, "{s}{d}", .{ letters, row });
+}
+
+/// Emit xl/styles.xml based on the registered style list. Fonts are
+/// deduped into a `<fonts>` list (default font at index 0; user styles
+/// each reference a new font entry, which is wasteful compared to
+/// deduping fonts separately from styles but is fine for the MVP scope
+/// of Phase 3b stage 1). `<cellXfs>` gets the default entry at index 0
+/// plus one entry per user style.
+fn emitStylesXml(
+    alloc: Allocator,
+    zw: *ZipWriter,
+    styles: []const Style,
+) !void {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    defer buf.deinit(alloc);
+
+    try buf.appendSlice(alloc, STYLES_HEAD);
+
+    // <fonts>: default at index 0 + one per user style.
+    try buf.print(alloc, "<fonts count=\"{d}\">", .{styles.len + 1});
+    try buf.appendSlice(alloc, STYLES_FONTS_DEFAULT);
+    for (styles) |s| {
+        try buf.appendSlice(alloc, "<font>");
+        if (s.font_bold) try buf.appendSlice(alloc, "<b/>");
+        if (s.font_italic) try buf.appendSlice(alloc, "<i/>");
+        try buf.appendSlice(alloc, "<sz val=\"11\"/><name val=\"Calibri\"/></font>");
+    }
+    try buf.appendSlice(alloc, "</fonts>");
+
+    try buf.appendSlice(alloc, STYLES_FILLS);
+    try buf.appendSlice(alloc, STYLES_BORDERS);
+    try buf.appendSlice(alloc, STYLES_CELL_STYLE_XFS);
+
+    // <cellXfs>: default at index 0 + one per user style. Style i (1-based
+    // to callers) references font[i] so each user style gets its own font.
+    try buf.print(alloc, "<cellXfs count=\"{d}\">", .{styles.len + 1});
+    try buf.appendSlice(alloc, STYLES_DEFAULT_CELL_XF);
+    for (styles, 0..) |_, i| {
+        try buf.print(
+            alloc,
+            "<xf numFmtId=\"0\" fontId=\"{d}\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/>",
+            .{i + 1},
+        );
+    }
+    try buf.appendSlice(alloc, "</cellXfs>");
+
+    try buf.appendSlice(alloc, STYLES_CELL_STYLES);
+    try buf.appendSlice(alloc, STYLES_TAIL);
+
+    try zw.addEntry("xl/styles.xml", buf.items);
 }
 
 fn appendXmlEscaped(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
@@ -592,6 +766,112 @@ test "Writer: xml entities in strings are escaped" {
     defer rows.deinit();
     const r = (try rows.next()).?;
     try std.testing.expectEqualStrings("a<b & c>d \"e\" 'f'", r[0].string);
+}
+
+test "Writer: styles — bold + italic round-trip" {
+    const tmp_path = "/tmp/zlsx_writer_styles_bold.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var registered_bold: u32 = 0;
+    var registered_italic: u32 = 0;
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+
+        registered_bold = try w.addStyle(.{ .font_bold = true });
+        registered_italic = try w.addStyle(.{ .font_italic = true });
+
+        // Dedup: registering the same style again returns the same index.
+        const again = try w.addStyle(.{ .font_bold = true });
+        try std.testing.expectEqual(registered_bold, again);
+
+        // Style indices are 1-based (0 is the default no-style slot).
+        try std.testing.expect(registered_bold >= 1);
+        try std.testing.expect(registered_italic != registered_bold);
+
+        var s = try w.addSheet("S");
+        try s.writeRowStyled(
+            &.{ .{ .string = "bold" }, .{ .string = "italic" }, .{ .string = "plain" } },
+            &.{ registered_bold, registered_italic, 0 },
+        );
+        // Unstyled path still works alongside styled rows.
+        try s.writeRow(&.{.{ .string = "unstyled row" }});
+
+        // styles.len != cells.len → error.StyleCountMismatch
+        try std.testing.expectError(error.StyleCountMismatch, s.writeRowStyled(
+            &.{.{ .string = "x" }},
+            &.{},
+        ));
+
+        try w.save(tmp_path);
+    }
+
+    // The reader ignores styles but the file must still parse cleanly
+    // and contain the cell values we wrote. Also grep the raw archive
+    // for xl/styles.xml + applyFont markers so we know styles.xml was
+    // actually emitted.
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    const r1 = (try rows.next()).?;
+    try std.testing.expectEqualStrings("bold", r1[0].string);
+    try std.testing.expectEqualStrings("italic", r1[1].string);
+    try std.testing.expectEqualStrings("plain", r1[2].string);
+    const r2 = (try rows.next()).?;
+    try std.testing.expectEqualStrings("unstyled row", r2[0].string);
+
+    // Read xl/styles.xml raw out of the archive and check for the bold +
+    // italic markers + applyFont attribute — proves the styles.xml
+    // emission path actually ran.
+    const styles_xml = blk: {
+        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        var fbuf: [4096]u8 = undefined;
+        var fr = file.reader(&fbuf);
+        var iter = try std.zip.Iterator.init(&fr);
+        var filename_buf: [64]u8 = undefined;
+        while (try iter.next()) |entry| {
+            if (entry.filename_len > filename_buf.len) continue;
+            try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            const filename = filename_buf[0..entry.filename_len];
+            try fr.interface.readSliceAll(filename);
+            if (std.mem.eql(u8, filename, "xl/styles.xml")) {
+                break :blk try extractEntryForTest(std.testing.allocator, entry, &fr);
+            }
+        }
+        return error.StylesXmlNotFound;
+    };
+    defer std.testing.allocator.free(styles_xml);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "<b/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "<i/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "applyFont=\"1\"") != null);
+}
+
+/// Test helper: mirror the reader's extractEntryToBuffer but keep it
+/// local so this test file doesn't reach into xlsx.zig internals.
+fn extractEntryForTest(
+    allocator: Allocator,
+    entry: std.zip.Iterator.Entry,
+    stream: anytype,
+) ![]u8 {
+    try stream.seekTo(entry.file_offset);
+    const local = try stream.interface.takeStruct(std.zip.LocalFileHeader, .little);
+    try stream.seekTo(entry.file_offset + @sizeOf(std.zip.LocalFileHeader) + local.filename_len + local.extra_len);
+    const out = try allocator.alloc(u8, entry.uncompressed_size);
+    errdefer allocator.free(out);
+    var w = std.Io.Writer.fixed(out);
+    switch (entry.compression_method) {
+        .store => try stream.interface.streamExact64(&w, entry.uncompressed_size),
+        .deflate => {
+            var flate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+            var decompress = std.compress.flate.Decompress.init(&stream.interface, .raw, &flate_buffer);
+            try decompress.reader.streamExact64(&w, entry.uncompressed_size);
+        },
+        else => unreachable,
+    }
+    return out;
 }
 
 test "Writer: sheet names with XML-special chars are escaped" {
