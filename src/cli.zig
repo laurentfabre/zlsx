@@ -370,3 +370,149 @@ test "parseArgs help" {
     const argv = [_][]const u8{"-h"};
     try std.testing.expectError(ArgError.HelpRequested, parseArgs(&argv));
 }
+
+// ─── Fuzz tests ──────────────────────────────────────────────────────
+
+fn fuzzItersCli() usize {
+    const env = std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_ITERS") catch return 1_000;
+    defer std.heap.page_allocator.free(env);
+    var digits: [32]u8 = undefined;
+    var di: usize = 0;
+    for (env) |c| {
+        if (c == '_') continue;
+        if (di == digits.len) break;
+        digits[di] = c;
+        di += 1;
+    }
+    return std.fmt.parseInt(usize, digits[0..di], 10) catch 1_000;
+}
+
+fn fuzzSeedCli() u64 {
+    if (std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_SEED")) |s| {
+        defer std.heap.page_allocator.free(s);
+        return std.fmt.parseInt(u64, s, 10) catch 0xA1F8ED;
+    } else |_| {
+        return @bitCast(std.time.milliTimestamp());
+    }
+}
+
+test "fuzz colLetter: output is uppercase A-Z" {
+    const iters = fuzzItersCli();
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCli());
+    const rng = prng.random();
+    var buf: [8]u8 = undefined;
+    for (0..iters) |_| {
+        // xlsx max is column 16383 (XFD); cap at 2^20 — beyond that the
+        // 8-byte buffer can't fit all letters and the function would
+        // wrap around via pos underflow. This is documented: caller is
+        // expected to stay within OOXML's column range.
+        const idx = rng.intRangeAtMost(usize, 0, 1_048_575);
+        const letters = colLetter(&buf, idx);
+        try std.testing.expect(letters.len >= 1);
+        for (letters) |c| {
+            try std.testing.expect(c >= 'A' and c <= 'Z');
+        }
+    }
+}
+
+test "fuzz parseArgs: arbitrary tokens never panic" {
+    const iters = fuzzItersCli();
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCli());
+    const rng = prng.random();
+
+    var token_pool: [8][32]u8 = undefined;
+    for (0..token_pool.len) |i| rng.bytes(&token_pool[i]);
+
+    for (0..iters) |_| {
+        const n_tokens = rng.intRangeAtMost(usize, 0, 12);
+        var argv_buf: [12][]const u8 = undefined;
+        for (0..n_tokens) |i| {
+            const k = rng.intRangeAtMost(usize, 0, token_pool.len - 1);
+            const l = rng.intRangeAtMost(usize, 0, token_pool[k].len);
+            argv_buf[i] = token_pool[k][0..l];
+        }
+        // Mix in a few well-known tokens so we hit more branches.
+        if (n_tokens >= 1 and rng.boolean()) argv_buf[0] = "--help";
+        if (n_tokens >= 2 and rng.boolean()) argv_buf[1] = "--format";
+
+        // Must never panic; errors are fine.
+        _ = parseArgs(argv_buf[0..n_tokens]) catch {};
+    }
+}
+
+test "fuzz writeJsonString: no raw control chars survive" {
+    const iters = fuzzItersCli();
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCli());
+    const rng = prng.random();
+
+    var input: [256]u8 = undefined;
+    var scratch: [4096]u8 = undefined;
+
+    for (0..iters) |_| {
+        const l = rng.intRangeAtMost(usize, 0, input.len);
+        rng.bytes(input[0..l]);
+        var w = std.Io.Writer.fixed(&scratch);
+        writeJsonString(&w, input[0..l]) catch continue;
+
+        const out = w.buffered();
+        try std.testing.expect(out.len >= 2); // at least "\"\""
+        try std.testing.expect(out[0] == '"');
+        try std.testing.expect(out[out.len - 1] == '"');
+
+        // Walk the interior (between the outer quotes). No bare control
+        // char (0..0x1f) except when preceded by a backslash. Quote and
+        // backslash always escaped too.
+        var i: usize = 1;
+        while (i < out.len - 1) : (i += 1) {
+            const c = out[i];
+            if (c == '\\') {
+                // Skip the escape sequence (\", \\, \n, \r, \t, \b, \f, \uXXXX).
+                i += 1;
+                if (i < out.len - 1 and out[i] == 'u') i += 4;
+                continue;
+            }
+            try std.testing.expect(c >= 0x20);
+            try std.testing.expect(c != '"');
+        }
+    }
+}
+
+test "fuzz writeCsvField: balanced quotes + no bare quote outside them" {
+    const iters = fuzzItersCli();
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCli());
+    const rng = prng.random();
+
+    var input: [256]u8 = undefined;
+    var scratch: [4096]u8 = undefined;
+
+    for (0..iters) |_| {
+        const l = rng.intRangeAtMost(usize, 0, input.len);
+        rng.bytes(input[0..l]);
+        var w = std.Io.Writer.fixed(&scratch);
+        writeCsvField(&w, input[0..l]) catch continue;
+
+        const out = w.buffered();
+        // If any RFC-4180 trigger byte was present, output must be
+        // quoted. Otherwise unquoted is fine.
+        var needs_quote = false;
+        for (input[0..l]) |c| {
+            if (c == ',' or c == '"' or c == '\n' or c == '\r') {
+                needs_quote = true;
+                break;
+            }
+        }
+        if (needs_quote) {
+            try std.testing.expect(out.len >= 2);
+            try std.testing.expectEqual(@as(u8, '"'), out[0]);
+            try std.testing.expectEqual(@as(u8, '"'), out[out.len - 1]);
+            // Every `"` inside must be doubled.
+            var i: usize = 1;
+            while (i < out.len - 1) : (i += 1) {
+                if (out[i] == '"') {
+                    try std.testing.expect(i + 1 < out.len - 1 and out[i + 1] == '"');
+                    i += 1;
+                }
+            }
+        }
+    }
+}

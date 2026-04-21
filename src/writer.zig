@@ -998,3 +998,287 @@ test "Writer: exposed via @import(\"xlsx.zig\") namespace re-export" {
         _ = SW;
     }
 }
+
+// ─── Fuzz tests ──────────────────────────────────────────────────────
+//
+// PRNG-driven fuzzing (Zig's coverage-guided `--fuzz` is broken on
+// macOS Mach-O — see src/xlsx.zig's fuzz block for the same pattern).
+// Iteration count comes from XLSX_FUZZ_ITERS (default 1_000); seed from
+// XLSX_FUZZ_SEED (default: current time). Each fuzz target enforces an
+// invariant beyond "no panic" so we catch logic bugs, not just crashes.
+
+const fuzz_default_iters_writer: usize = 1_000;
+
+fn fuzzIterationsW() usize {
+    const env = std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_ITERS") catch return fuzz_default_iters_writer;
+    defer std.heap.page_allocator.free(env);
+    var digits: [32]u8 = undefined;
+    var di: usize = 0;
+    for (env) |c| {
+        if (c == '_') continue;
+        if (di == digits.len) break;
+        digits[di] = c;
+        di += 1;
+    }
+    return std.fmt.parseInt(usize, digits[0..di], 10) catch fuzz_default_iters_writer;
+}
+
+fn fuzzSeedW() u64 {
+    if (std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_SEED")) |s| {
+        defer std.heap.page_allocator.free(s);
+        return std.fmt.parseInt(u64, s, 10) catch 0xA1F8ED;
+    } else |_| {
+        return @bitCast(std.time.milliTimestamp());
+    }
+}
+
+test "fuzz formatCellRef: no overflow, always starts with A-Z" {
+    const iters = fuzzIterationsW();
+    var prng = std.Random.DefaultPrng.init(fuzzSeedW());
+    const rng = prng.random();
+    var buf: [16]u8 = undefined;
+    for (0..iters) |_| {
+        const row = rng.intRangeAtMost(u32, 1, std.math.maxInt(u32));
+        // Cap col_idx at 2^20 — beyond that the letter repr would
+        // exceed the 8-byte scratch; real xlsx tops out at col 16384.
+        const col = rng.intRangeAtMost(u32, 0, 1_048_575);
+        const ref = formatCellRef(&buf, row, col) catch continue;
+        try std.testing.expect(ref.len >= 2);
+        try std.testing.expect(ref[0] >= 'A' and ref[0] <= 'Z');
+        // The last char must be a digit (the row part).
+        try std.testing.expect(ref[ref.len - 1] >= '0' and ref[ref.len - 1] <= '9');
+    }
+}
+
+test "fuzz appendXmlEscaped: no raw XML specials in output" {
+    const iters = fuzzIterationsW();
+    var prng = std.Random.DefaultPrng.init(fuzzSeedW());
+    const rng = prng.random();
+    var input_buf: [512]u8 = undefined;
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(std.testing.allocator);
+
+    for (0..iters) |_| {
+        const len = rng.intRangeAtMost(usize, 0, input_buf.len);
+        rng.bytes(input_buf[0..len]);
+        out.clearRetainingCapacity();
+        try appendXmlEscaped(std.testing.allocator, &out, input_buf[0..len]);
+
+        // Invariant: no raw `<`, `>`, `&`, `"`, `'` survives in the
+        // output. Each would have been expanded to its entity.
+        for (out.items) |c| {
+            try std.testing.expect(c != '<' and c != '>' and c != '"' and c != '\'');
+        }
+        // `&` can appear inside an entity reference like `&amp;`, so
+        // we can't forbid it outright. But every `&` must be followed
+        // by one of the known entities (amp, lt, gt, quot, apos).
+        var i: usize = 0;
+        while (i < out.items.len) : (i += 1) {
+            if (out.items[i] != '&') continue;
+            const rest = out.items[i + 1 ..];
+            const ok = std.mem.startsWith(u8, rest, "amp;") or
+                std.mem.startsWith(u8, rest, "lt;") or
+                std.mem.startsWith(u8, rest, "gt;") or
+                std.mem.startsWith(u8, rest, "quot;") or
+                std.mem.startsWith(u8, rest, "apos;");
+            try std.testing.expect(ok);
+        }
+    }
+}
+
+test "fuzz fitsExactlyInF64 matches round-trip reference" {
+    const iters = fuzzIterationsW();
+    var prng = std.Random.DefaultPrng.init(fuzzSeedW());
+    const rng = prng.random();
+
+    for (0..iters) |_| {
+        const n = rng.int(i64);
+        const f: f64 = @floatFromInt(n);
+        // Round-trip reference is valid when f stays inside i64 range
+        // after the int→float conversion. std.math.maxInt(i64) rounds
+        // up to 2^63 which would overflow @intFromFloat.
+        const reference: bool = blk: {
+            if (f >= 9.223372036854776e18) break :blk false;
+            if (f < -9.223372036854776e18) break :blk false;
+            const back: i64 = @intFromFloat(f);
+            break :blk back == n;
+        };
+        try std.testing.expectEqual(reference, fitsExactlyInF64(n));
+    }
+}
+
+test "fuzz Writer.sstIntern dedup invariant" {
+    const iters = fuzzIterationsW();
+    var prng = std.Random.DefaultPrng.init(fuzzSeedW());
+    const rng = prng.random();
+
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+
+    // Pool of 16 distinct candidate strings so the rng can hit dupes.
+    var pool_buf: [16][24]u8 = undefined;
+    var pool_lens: [16]usize = undefined;
+    for (0..16) |i| {
+        const l = rng.intRangeAtMost(usize, 1, pool_buf[i].len);
+        rng.bytes(pool_buf[i][0..l]);
+        pool_lens[i] = l;
+    }
+
+    var seen_indices: std.StringHashMap(u32) = .init(std.testing.allocator);
+    defer seen_indices.deinit();
+
+    for (0..iters) |_| {
+        const k = rng.intRangeAtMost(usize, 0, 15);
+        const s = pool_buf[k][0..pool_lens[k]];
+        const idx = try w.sstIntern(s);
+
+        if (seen_indices.get(s)) |prior| {
+            try std.testing.expectEqual(prior, idx);
+        } else {
+            try seen_indices.put(s, idx);
+        }
+        // strings.len must equal the distinct count.
+        try std.testing.expectEqual(@as(u32, @intCast(seen_indices.count())), @as(u32, @intCast(w.sst_strings.items.len)));
+    }
+}
+
+test "fuzz Writer.addStyle dedup on bool combos" {
+    const iters = fuzzIterationsW();
+    var prng = std.Random.DefaultPrng.init(fuzzSeedW());
+    const rng = prng.random();
+
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+
+    // 4 possible Style values (2 bool fields) — after the first 4 unique
+    // registrations the style count must plateau at 4.
+    var distinct = std.AutoHashMap(Style, u32).init(std.testing.allocator);
+    defer distinct.deinit();
+
+    for (0..iters) |_| {
+        const style: Style = .{
+            .font_bold = rng.boolean(),
+            .font_italic = rng.boolean(),
+        };
+        const idx = try w.addStyle(style);
+        if (distinct.get(style)) |prior| {
+            try std.testing.expectEqual(prior, idx);
+        } else {
+            try distinct.put(style, idx);
+        }
+        try std.testing.expect(w.styles.items.len <= 4);
+    }
+}
+
+test "fuzz Writer end-to-end round-trip via reader" {
+    const iters = fuzzIterationsW() / 10; // each iter does real zip I/O
+    const seed = fuzzSeedW();
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    var tmp_path_buf: [64]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "/tmp/zlsx_fuzz_writer_{x}.xlsx", .{seed});
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    for (0..iters) |_| {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+        const n_sheets = rng.intRangeAtMost(usize, 1, 3);
+        var expected_rows: [3]usize = .{ 0, 0, 0 };
+
+        for (0..n_sheets) |si| {
+            var name_buf: [12]u8 = undefined;
+            rng.bytes(&name_buf);
+            // Filter name_buf to printable ASCII to avoid UTF-8 issues.
+            for (&name_buf) |*b| b.* = (b.* % 94) + 32;
+            var sheet = try w.addSheet(&name_buf);
+
+            const n_rows = rng.intRangeAtMost(usize, 0, 8);
+            for (0..n_rows) |_| {
+                var cells: [6]xlsx.Cell = undefined;
+                const n_cells = rng.intRangeAtMost(usize, 0, cells.len);
+                for (0..n_cells) |ci| {
+                    cells[ci] = switch (rng.intRangeAtMost(u8, 0, 4)) {
+                        0 => .empty,
+                        1 => blk: {
+                            var sbuf: [16]u8 = undefined;
+                            const l = rng.intRangeAtMost(usize, 0, sbuf.len);
+                            rng.bytes(sbuf[0..l]);
+                            for (sbuf[0..l]) |*b| b.* = (b.* % 94) + 32;
+                            break :blk .{ .string = sbuf[0..l] };
+                        },
+                        2 => .{ .integer = rng.intRangeAtMost(i64, -(1 << 40), 1 << 40) },
+                        3 => .{ .number = rng.float(f64) * 1000 },
+                        else => .{ .boolean = rng.boolean() },
+                    };
+                }
+                sheet.writeRow(cells[0..n_cells]) catch |e| switch (e) {
+                    error.IntegerExceedsExcelPrecision => continue,
+                    else => return e,
+                };
+                expected_rows[si] += 1;
+            }
+        }
+
+        w.save(tmp_path) catch |e| switch (e) {
+            error.NoSheets => continue,
+            else => return e,
+        };
+
+        var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+        defer book.deinit();
+        try std.testing.expectEqual(n_sheets, book.sheets.len);
+        for (0..n_sheets) |si| {
+            var rows = try book.rows(book.sheets[si], std.testing.allocator);
+            defer rows.deinit();
+            var count: usize = 0;
+            while (try rows.next()) |_| count += 1;
+            try std.testing.expectEqual(expected_rows[si], count);
+        }
+    }
+}
+
+test "fuzz ZipWriter produces archives our reader can walk" {
+    const iters = fuzzIterationsW() / 10;
+    const seed = fuzzSeedW();
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    var tmp_path_buf: [64]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "/tmp/zlsx_fuzz_zipwriter_{x}.zip", .{seed});
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    for (0..iters) |_| {
+        var zip_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer zip_buf.deinit(std.testing.allocator);
+        var zw = ZipWriter.init(std.testing.allocator, &zip_buf);
+        defer zw.deinit();
+
+        const n_entries = rng.intRangeAtMost(usize, 1, 6);
+        var expected_names: [6][32]u8 = undefined;
+        var expected_name_lens: [6]usize = undefined;
+        for (0..n_entries) |i| {
+            const name_len = rng.intRangeAtMost(usize, 1, 24);
+            for (0..name_len) |j| expected_names[i][j] = 'a' + @as(u8, @intCast(rng.intRangeAtMost(u8, 0, 25)));
+            expected_name_lens[i] = name_len;
+            var payload: [512]u8 = undefined;
+            const payload_len = rng.intRangeAtMost(usize, 0, payload.len);
+            rng.bytes(payload[0..payload_len]);
+            try zw.addEntry(expected_names[i][0..name_len], payload[0..payload_len]);
+        }
+        try zw.finalize();
+
+        // Write to disk and walk it with std.zip.Iterator.
+        {
+            var file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+            defer file.close();
+            try file.writeAll(zip_buf.items);
+        }
+        var f = try std.fs.cwd().openFile(tmp_path, .{});
+        defer f.close();
+        var read_buf: [4096]u8 = undefined;
+        var fr = f.reader(&read_buf);
+        var iter = try std.zip.Iterator.init(&fr);
+        var seen: usize = 0;
+        while (try iter.next()) |_| seen += 1;
+        try std.testing.expectEqual(n_entries, seen);
+    }
+}

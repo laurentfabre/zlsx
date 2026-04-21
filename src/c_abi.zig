@@ -495,14 +495,17 @@ const SheetWriterState = struct {
 
 /// Reverse of `toCCell`: read a caller-provided CCell struct and produce
 /// a Zig Cell. Returns error.BadCellTag if the caller wrote an unknown
-/// tag value (forward-compat safety).
+/// tag value (forward-compat safety). An explicit int-to-enum mapping
+/// rather than `@enumFromInt` so a garbage tag from FFI can't trigger
+/// illegal-behavior panics in Debug/ReleaseSafe.
 fn fromCCell(c: CCell) !xlsx.Cell {
-    return switch (@as(CellTag, @enumFromInt(c.tag))) {
-        .empty => .empty,
-        .string => .{ .string = c.str_ptr[0..c.str_len] },
-        .integer => .{ .integer = c.i },
-        .number => .{ .number = c.f },
-        .boolean => .{ .boolean = c.b != 0 },
+    return switch (c.tag) {
+        @intFromEnum(CellTag.empty) => .empty,
+        @intFromEnum(CellTag.string) => .{ .string = c.str_ptr[0..c.str_len] },
+        @intFromEnum(CellTag.integer) => .{ .integer = c.i },
+        @intFromEnum(CellTag.number) => .{ .number = c.f },
+        @intFromEnum(CellTag.boolean) => .{ .boolean = c.b != 0 },
+        else => error.BadCellTag,
     };
 }
 
@@ -778,4 +781,195 @@ test "writer: round-trip via reader" {
     const r2 = (try rows.next()).?;
     try std.testing.expectEqualStrings("Alice", r2[0].string);
     try std.testing.expectEqual(@as(i64, 30), r2[1].integer);
+}
+
+// ─── Fuzz tests ──────────────────────────────────────────────────────
+
+fn fuzzItersCabi() usize {
+    const env = std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_ITERS") catch return 1_000;
+    defer std.heap.page_allocator.free(env);
+    var digits: [32]u8 = undefined;
+    var di: usize = 0;
+    for (env) |c| {
+        if (c == '_') continue;
+        if (di == digits.len) break;
+        digits[di] = c;
+        di += 1;
+    }
+    return std.fmt.parseInt(usize, digits[0..di], 10) catch 1_000;
+}
+
+fn fuzzSeedCabi() u64 {
+    if (std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_SEED")) |s| {
+        defer std.heap.page_allocator.free(s);
+        return std.fmt.parseInt(u64, s, 10) catch 0xA1F8ED;
+    } else |_| {
+        return @bitCast(std.time.milliTimestamp());
+    }
+}
+
+test "fuzz fromCCell: random tags never panic" {
+    const iters = fuzzItersCabi();
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCabi());
+    const rng = prng.random();
+
+    // Keep a valid-looking str_ptr so the string-tag branch can
+    // dereference without segfaulting. Content is zeros.
+    var pool: [64]u8 = undefined;
+    @memset(&pool, 0);
+
+    for (0..iters) |_| {
+        const c: CCell = .{
+            .tag = rng.int(u32),
+            // Cap str_len to the pool size so the returned string slice
+            // doesn't point past our buffer when the tag lands on STRING.
+            .str_len = @intCast(rng.intRangeAtMost(usize, 0, pool.len)),
+            .str_ptr = @ptrCast(&pool),
+            .i = rng.int(i64),
+            .f = rng.float(f64),
+            .b = rng.int(u8),
+            ._pad = [_]u8{0} ** 7,
+        };
+        const got = fromCCell(c) catch |e| {
+            try std.testing.expect(e == error.BadCellTag);
+            continue;
+        };
+        // If no error, the returned Cell's tag must match one of the
+        // 5 valid CellTag values — the type system already enforces
+        // this, but assert for docs' sake.
+        switch (got) {
+            .empty, .string, .integer, .number, .boolean => {},
+        }
+    }
+}
+
+test "fuzz toCCell ↔ fromCCell round-trip for valid Cells" {
+    const iters = fuzzItersCabi();
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCabi());
+    const rng = prng.random();
+
+    var strpool: [256]u8 = undefined;
+    for (&strpool) |*b| b.* = (rng.int(u8) % 94) + 32;
+
+    for (0..iters) |_| {
+        const cell: xlsx.Cell = switch (rng.intRangeAtMost(u8, 0, 4)) {
+            0 => .empty,
+            1 => blk: {
+                const start = rng.intRangeAtMost(usize, 0, strpool.len - 1);
+                const len = rng.intRangeAtMost(usize, 0, strpool.len - start);
+                break :blk .{ .string = strpool[start..][0..len] };
+            },
+            2 => .{ .integer = rng.int(i64) },
+            3 => .{ .number = rng.float(f64) },
+            else => .{ .boolean = rng.boolean() },
+        };
+
+        const cc = toCCell(cell);
+        const back = try fromCCell(cc);
+
+        switch (cell) {
+            .empty => try std.testing.expectEqual(@as(std.meta.Tag(xlsx.Cell), .empty), back),
+            .string => |s| try std.testing.expectEqualStrings(s, back.string),
+            .integer => |n| try std.testing.expectEqual(n, back.integer),
+            .number => |f| {
+                // NaN != NaN; treat as equal for round-trip purposes.
+                if (std.math.isNan(f)) {
+                    try std.testing.expect(std.math.isNan(back.number));
+                } else {
+                    try std.testing.expectEqual(f, back.number);
+                }
+            },
+            .boolean => |b| try std.testing.expectEqual(b, back.boolean),
+        }
+    }
+}
+
+test "fuzz writer via C ABI: random operations round-trip" {
+    const iters = fuzzItersCabi() / 20; // expensive — real zip I/O
+    const seed = fuzzSeedCabi();
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    var tmp_path_buf: [64]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "/tmp/zlsx_fuzz_cabi_{x}.xlsx", .{seed});
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var err_buf: [128]u8 = undefined;
+
+    for (0..iters) |_| {
+        const w = zlsx_writer_create(&err_buf, err_buf.len);
+        try std.testing.expect(w != null);
+        defer zlsx_writer_close(w);
+
+        // Add 1-3 styles at random bool combos.
+        const n_styles = rng.intRangeAtMost(usize, 0, 3);
+        var style_ids: [3]u32 = undefined;
+        for (0..n_styles) |i| {
+            var out_idx: u32 = 0;
+            const rc = zlsx_writer_add_style(
+                w.?,
+                @intFromBool(rng.boolean()),
+                @intFromBool(rng.boolean()),
+                &out_idx,
+                &err_buf,
+                err_buf.len,
+            );
+            try std.testing.expectEqual(@as(i32, 0), rc);
+            style_ids[i] = out_idx;
+        }
+
+        // Add a sheet with random name (printable ASCII, 1-20 chars).
+        var name_buf: [20]u8 = undefined;
+        const name_len = rng.intRangeAtMost(usize, 1, name_buf.len);
+        for (0..name_len) |i| name_buf[i] = (rng.int(u8) % 94) + 32;
+        const name_ptr: [*]const u8 = @ptrCast(&name_buf);
+        const sw = zlsx_writer_add_sheet(w.?, name_ptr, name_len, &err_buf, err_buf.len);
+        try std.testing.expect(sw != null);
+
+        // Write 0-5 rows with random cells.
+        const n_rows = rng.intRangeAtMost(usize, 0, 5);
+        var expected_rows: usize = 0;
+        for (0..n_rows) |_| {
+            var cells: [6]CCell = undefined;
+            var styles: [6]u32 = undefined;
+            const n_cells = rng.intRangeAtMost(usize, 0, cells.len);
+            var str_store: [6][16]u8 = undefined;
+            for (0..n_cells) |ci| {
+                styles[ci] = if (n_styles > 0 and rng.boolean())
+                    style_ids[rng.intRangeAtMost(usize, 0, n_styles - 1)]
+                else
+                    0;
+                const tag = rng.intRangeAtMost(u8, 0, 4);
+                const str_len = rng.intRangeAtMost(usize, 0, str_store[ci].len);
+                for (0..str_len) |i| str_store[ci][i] = (rng.int(u8) % 94) + 32;
+                cells[ci] = .{
+                    .tag = @intCast(tag),
+                    .str_len = @intCast(str_len),
+                    .str_ptr = @ptrCast(&str_store[ci]),
+                    .i = rng.intRangeAtMost(i64, -(1 << 40), 1 << 40),
+                    .f = rng.float(f64) * 1000,
+                    .b = @intFromBool(rng.boolean()),
+                    ._pad = [_]u8{0} ** 7,
+                };
+            }
+
+            const rc = if (rng.boolean() and n_cells > 0)
+                zlsx_sheet_writer_write_row_styled(sw.?, &cells, &styles, n_cells, &err_buf, err_buf.len)
+            else
+                zlsx_sheet_writer_write_row(sw.?, &cells, n_cells, &err_buf, err_buf.len);
+            if (rc == 0) expected_rows += 1;
+        }
+
+        const save_rc = zlsx_writer_save(w.?, @ptrCast(tmp_path.ptr), tmp_path.len, &err_buf, err_buf.len);
+        try std.testing.expectEqual(@as(i32, 0), save_rc);
+
+        // Re-read to verify the file isn't malformed.
+        var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+        defer book.deinit();
+        try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
+        var rows = try book.rows(book.sheets[0], std.testing.allocator);
+        defer rows.deinit();
+        var read_rows: usize = 0;
+        while (try rows.next()) |_| read_rows += 1;
+        try std.testing.expectEqual(expected_rows, read_rows);
+    }
 }
