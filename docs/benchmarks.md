@@ -119,7 +119,9 @@ Throughput at that size (rows/sec):
 
 zlsx Writer ships v0.2.4 with **stored (no-deflate) zip** — entries are written uncompressed so the zip emitter stays small and allocation-free. That's the 390 KB figure above. `xlsxwriter` and `openpyxl` both use deflate, so their outputs are ~7× smaller.
 
-For most users wall-time + RSS matter more than archive size (files go straight to a user's Downloads folder or a server's temp dir, not a long-term archive). Deflate is on the Phase 3c roadmap and would close the file-size gap while keeping zlsx faster than the Python libraries in wall-clock.
+For most users wall-time + RSS matter more than archive size (files go straight to a user's Downloads folder or a server's temp dir, not a long-term archive). The raw XML payloads are essentially identical across the three libraries (388 KB / 366 KB / 388 KB respectively) — the 7× gap is purely zip compression.
+
+**Blocked on upstream**: Zig 0.15.2's `std.compress.flate.Compress` + `Compress.Simple` are half-written — their hot paths contain `@panic("TODO")` and the `BlockWriter` struct references fields that don't exist. No pure-stdlib deflate compression is possible today. We tested both entry points; both fail to compile. Shipping deflate in zlsx therefore waits on either Zig stdlib completing its deflate work (tracked for Zig 0.16) or a decision to vendor a third-party deflate implementation (which would compromise the "zero third-party deps" value proposition). Until then, the wall-time advantage is real and the archive-size cost is the honest trade.
 
 ### Reproducing
 
@@ -170,4 +172,4 @@ Source for all four benches (~30 lines each) is in `tests/bench/` if you want to
 
 **On the read side**: zlsx is the fastest of the four, smallest RSS, and single-file droppable into a Zig build. Native parity with calamine on small files; ~1.4× edge on 1k+ rows thanks to narrower scope and borrow-when-safe string handling. Against Python libraries it's 4× to 24× faster. For the Alfred pipeline (reads 1,000-row BDR xlsx on every run), swapping openpyxl for zlsx is ~244 ms per run saved — compounded across a 10-minute distillation batch, that's a full minute back on a 1008-hotel refresh.
 
-**On the write side** (Phase 3b, v0.2.4): zlsx Writer is 17× faster than xlsxwriter and 36× faster than openpyxl for a 1,000-row styled workbook — at ~8× lower RSS than either Python library. The output is ~7× larger because zlsx uses stored (uncompressed) zip entries while xlsxwriter/openpyxl deflate; a future zlsx deflate mode (queued) would close the file-size gap while keeping the wall-clock lead.
+**On the write side** (Phase 3b, v0.2.4): zlsx Writer is 17× faster than xlsxwriter and 36× faster than openpyxl for a 1,000-row styled workbook — at ~8× lower RSS than either Python library. The output is ~7× larger because zlsx uses stored (uncompressed) zip entries while xlsxwriter/openpyxl deflate; closing this gap waits on Zig's stdlib finishing deflate compression (`std.compress.flate.Compress` is currently TODO) or on a decision to vendor a third-party deflate implementation.
