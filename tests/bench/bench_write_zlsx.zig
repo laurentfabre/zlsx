@@ -1,13 +1,17 @@
 // Writer benchmark — 1000 rows × 10 cols of mixed content, one header
 // row with a bold blue fill style, 3 number-format styles reused across
 // columns. Save to the path passed as argv[1].
+//
+// Uses `std.heap.smp_allocator` because that's what a production
+// writer would typically plug in — it's what Zig's own toolchain
+// reaches for when throughput matters. DebugAllocator would add
+// several-ms of per-alloc tracking overhead that isn't representative
+// of what downstream users see.
 const std = @import("std");
 const xlsx = @import("zlsx");
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+    const alloc = std.heap.smp_allocator;
 
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);

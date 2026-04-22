@@ -152,9 +152,9 @@ Emission overhead is within 3% of the tally-only benchmark — the CLI is fast e
 
 | Library | Time | Peak RSS | Output | Speedup |
 |---|---|---|---|---|
-| **zlsx Writer** | **3.4 ms** | **2.98 MB** | 390 KB | **1.00×** |
-| xlsxwriter 3.x (`constant_memory`) | 58.7 ms | 24.73 MB | 55 KB | 17.0× slower |
-| openpyxl 3.1 (`write_only`) | 125.8 ms | 42.27 MB | 53 KB | 36.5× slower |
+| **zlsx Writer** | **9.4 ms** | **4.34 MB** | 380 KB | **1.00×** |
+| xlsxwriter 3.2 (`constant_memory`) | 65.7 ms | 25.3 MB | 54 KB | 7.0× slower |
+| openpyxl 3.1 (`write_only`) | 99.4 ms | 28.8 MB | 52 KB | 10.5× slower |
 
 zlsx Writer emits uncompressed (stored) zip entries today — the raw XML payloads match the other libraries within 6%, but the ~7× archive-size gap is pure zip compression. Zig 0.15.2's stdlib deflate compressor is half-written (`std.compress.flate.Compress` hits `@panic("TODO")` on any non-trivial input), so zero-deps deflate isn't possible yet. See [`docs/benchmarks.md`](docs/benchmarks.md) for the full matrix + upstream-blocker notes.
 

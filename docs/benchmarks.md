@@ -93,31 +93,37 @@ All four libraries read identical content from the file. The counter differences
 
 Same workload across all three implementations: 1,001 rows × 10 cols (one header row + 1,000 data rows). The header row has per-cell styles (bold white-on-blue fill, centre-aligned). Body rows mix strings, integers, floats, booleans, with the numeric columns referencing one of two shared number-format styles (`$#,##0.00` / `0.00%`). Sheet gets `column_width[0]=20` + `freeze_panes(row=1)`.
 
-20-run hyperfine median:
+20-run hyperfine median (refreshed 2026-04-23, zlsx bench swapped from `DebugAllocator` to `smp_allocator` — see methodology note below):
 
 | Impl | Time | Peak RSS | Output size | Speedup (wall) |
 |---|---|---|---|---|
-| **zlsx Writer** | **3.4 ms ± 0.6** | **2.98 MB** | 390 KB | **1.00×** |
-| xlsxwriter 3.x (`constant_memory`) | 58.7 ms ± 0.4 | 24.73 MB | 55 KB | 17.0× slower |
-| openpyxl 3.1 (`write_only`) | 125.8 ms ± 0.8 | 42.27 MB | 53 KB | 36.5× slower |
+| **zlsx Writer** | **9.4 ms ± 0.5** | **4.34 MB** | 380 KB | **1.00×** |
+| xlsxwriter 3.2 (`constant_memory`) | 65.7 ms ± 4.2 | 25.3 MB | 54 KB | 6.96× slower |
+| openpyxl 3.1 (`write_only`) | 99.4 ms ± 0.6 | 28.8 MB | 52 KB | 10.52× slower |
 
 ```
-  zlsx Writer    ▌             3.4 ms     1.00×
-  xlsxwriter     ▌▌▌▌▌▌▌▌      58.7 ms    17.0× slower
-  openpyxl       ▌…▌           125.8 ms   36.5× slower
+  zlsx Writer    ▌              9.4 ms     1.00×
+  xlsxwriter     ▌▌▌▌▌▌▌        65.7 ms    6.96× slower
+  openpyxl       ▌▌▌▌▌▌▌▌▌▌     99.4 ms   10.52× slower
 ```
 
 Throughput at that size (rows/sec):
 
 | Impl | Styled rows/sec |
 |---|---|
-| zlsx Writer | ~295,000 |
-| xlsxwriter | ~17,000 |
-| openpyxl | ~7,900 |
+| zlsx Writer | ~106,000 |
+| xlsxwriter | ~15,200 |
+| openpyxl | ~10,000 |
+
+### Methodology — allocator choice matters
+
+The bench binary uses `std.heap.smp_allocator`. An earlier revision used `std.heap.DebugAllocator(.{})` — that allocator tracks every allocation with metadata + (optionally) stack traces and makes the same workload take ~2.5× longer (24–29 ms instead of 9–10 ms on this hardware). `DebugAllocator` is the right default inside *tests* because it catches leaks and double-frees; it is **not** what a production downstream user would plug into `Writer.init`. The numbers above use the allocator a real caller would reach for.
+
+If you're considering zlsx for your own pipeline: pass whichever allocator you already use — `Writer` has no opinion.
 
 ### Output-size trade-off
 
-zlsx Writer ships v0.2.4 with **stored (no-deflate) zip** — entries are written uncompressed so the zip emitter stays small and allocation-free. That's the 390 KB figure above. `xlsxwriter` and `openpyxl` both use deflate, so their outputs are ~7× smaller.
+zlsx Writer ships v0.2.4 with **stored (no-deflate) zip** — entries are written uncompressed so the zip emitter stays small and allocation-free. That's the 380 KB figure above. `xlsxwriter` and `openpyxl` both use deflate, so their outputs are ~7× smaller.
 
 For most users wall-time + RSS matter more than archive size (files go straight to a user's Downloads folder or a server's temp dir, not a long-term archive). The raw XML payloads are essentially identical across the three libraries (388 KB / 366 KB / 388 KB respectively) — the 7× gap is purely zip compression.
 
@@ -172,4 +178,4 @@ Source for all four benches (~30 lines each) is in `tests/bench/` if you want to
 
 **On the read side**: zlsx is the fastest of the four, smallest RSS, and single-file droppable into a Zig build. Native parity with calamine on small files; ~1.4× edge on 1k+ rows thanks to narrower scope and borrow-when-safe string handling. Against Python libraries it's 4× to 24× faster. For the Alfred pipeline (reads 1,000-row BDR xlsx on every run), swapping openpyxl for zlsx is ~244 ms per run saved — compounded across a 10-minute distillation batch, that's a full minute back on a 1008-hotel refresh.
 
-**On the write side** (Phase 3b, v0.2.4): zlsx Writer is 17× faster than xlsxwriter and 36× faster than openpyxl for a 1,000-row styled workbook — at ~8× lower RSS than either Python library. The output is ~7× larger because zlsx uses stored (uncompressed) zip entries while xlsxwriter/openpyxl deflate; closing this gap waits on Zig's stdlib finishing deflate compression (`std.compress.flate.Compress` is currently TODO) or on a decision to vendor a third-party deflate implementation.
+**On the write side** (Phase 3b, v0.2.4): zlsx Writer is 7× faster than xlsxwriter and 10× faster than openpyxl for a 1,000-row styled workbook — at ~6× lower RSS than either Python library. The output is ~7× larger because zlsx uses stored (uncompressed) zip entries while xlsxwriter/openpyxl deflate; closing this gap waits on Zig's stdlib finishing deflate compression (`std.compress.flate.Compress` is currently TODO) or on a decision to vendor a third-party deflate implementation.
