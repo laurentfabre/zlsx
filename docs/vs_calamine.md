@@ -2,7 +2,7 @@
 
 `calamine` (Rust, [docs.rs/calamine/0.26.1](https://docs.rs/calamine/0.26.1/)) is the reference pure-native xlsx reader in the ecosystem. This page inventories the gap so you can choose consciously.
 
-> **TL;DR**: zlsx is a narrower tool — xlsx-only, read-only, "just rows and cells" — deliberately limited to keep the parser compact and fast ([10.7 ms / 4.2 MB on a 1,008-row xlsx vs calamine's 15.3 ms / 4.9 MB](benchmarks.md)). If your use case needs `.xls`/`.xlsb`/`.ods`, native `DateTime`, formulas, defined names, merged-cell metadata, or serde integration, use calamine. For straight xlsx-row-ingest in Zig, zlsx is the leaner fit.
+> **TL;DR**: zlsx is a narrower tool — xlsx-only, no formula evaluation, "just rows and cells plus styled writes" — deliberately limited to keep the core compact and fast ([10.7 ms / 4.2 MB on a 1,008-row xlsx vs calamine's 15.3 ms / 4.9 MB](benchmarks.md)). Since v0.2.4, zlsx also ships a pragmatic openpyxl-parity **writer** — something calamine doesn't offer at all. If your use case needs `.xls`/`.xlsb`/`.ods`, native `DateTime`, formula evaluation, defined names, or serde deserialization, use calamine. For reading+writing xlsx in Zig (or via C/Python), zlsx is the complete option.
 
 ## Supported file formats
 
@@ -67,14 +67,28 @@ Calamine's `Data` enum vs zlsx's `Cell` union:
 | Pictures / embedded images | `reader.pictures() → Option<Vec<(String, Vec<u8>)>>` | ✗ |
 | VBA project | `reader.vba_project() → Option<Cow<VbaProject>>` | ✗ |
 | Workbook / sheet protection | ✗ *(file-level password required before read)* | ✗ |
-| Styles / number formats | ✗ in public API *(xlsx reader skips them)* | ✗ |
-| Rich-text formatting (bold runs etc.) | ✗ *(returns the concatenated text, no spans)* | ✗ *(same: concatenates `<t>` runs, drops `<rPr>`)* |
+| Styles / number formats | ✗ in public API *(xlsx reader skips them)* | **✓ on write** *(bold/italic, font name/size/color, alignment, wrap, fills, borders, number formats — Phase 3b)*; ✗ on read (reader ignores xl/styles.xml) |
+| Rich-text formatting (bold runs etc.) | ✗ *(returns the concatenated text, no spans)* | ✗ on read *(concatenates `<t>` runs)*; ✗ on write *(plain runs only — Phase 3b covers styling, not per-run formatting inside a cell)* |
 
-## Writing
+## Writing (Phase 3b, shipped in v0.2.4)
 
 | | calamine | zlsx |
 |---|---|---|
-| Write xlsx | ✗ *(calamine is read-only; writer is `rust_xlsxwriter`)* | ✗ |
+| Write xlsx | ✗ *(calamine is read-only; the ecosystem's writer is `rust_xlsxwriter`)* | **✓** |
+| Strings / numbers / booleans / empties | — | ✓ |
+| Shared-string table with dedup | — | ✓ |
+| Multi-sheet workbooks | — | ✓ |
+| Fonts (bold, italic, size, name, color) | — | ✓ |
+| Alignment (8 horizontal values) + wrap text | — | ✓ |
+| Fills (19 OOXML patternTypes, fg + bg ARGB) | — | ✓ |
+| Borders (5 sides × 14 styles, per-side colour, diagonal up/down) | — | ✓ |
+| Custom number formats (numFmtId ≥ 164) | — | ✓ |
+| Column widths (per-column override) | — | ✓ |
+| Freeze panes (top rows + left cols) | — | ✓ |
+| Auto-filter (A1-style range) | — | ✓ |
+| Load → modify → save round-trip | — | ✗ *(Phase 3c queued — preserves only what zlsx parses today)* |
+| Formulas (`<f>` emission on write) | — | ✗ *(explicitly out of scope; writer emits cached values only)* |
+| Pictures / charts / pivots | — | ✗ *(out of scope)* |
 
 ## Ownership model
 

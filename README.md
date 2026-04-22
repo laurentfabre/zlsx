@@ -1,53 +1,80 @@
 # zlsx
 
-Tiny, read-only `.xlsx` parser for Zig. Single-file, no third-party deps, just `std.zip` + `std.compress.flate` + a hand-rolled XML walker scoped to what spreadsheets actually need.
+Tiny `.xlsx` reader **and** writer for Zig. Single-file library, no third-party deps — just `std.zip` + `std.compress.flate` + a hand-rolled XML walker scoped to what spreadsheets actually need. Ships with a CLI, a C ABI, and Python bindings.
 
-On a 261 KB / 1,008-row workbook: **10.7 ms** wall time, **4.2 MB** peak RSS. That's 1.4× faster than calamine-rust, 4× faster than python-calamine, 24× faster than openpyxl — at one tenth the memory of the Python stack. [Full benchmark table →](docs/benchmarks.md)
+**Reader**: 10.7 ms / 4.2 MB on a 261 KB / 1,008-row workbook — 1.4× faster than calamine-rust, 4× faster than python-calamine, 24× faster than openpyxl, at one tenth the memory of the Python stack. [Full benchmark table →](docs/benchmarks.md)
+
+**Writer** (Phase 3b, v0.2.4): pragmatic openpyxl-parity styles — bold/italic, font size/name/color, horizontal alignment, wrap text, 19 OOXML fill patterns, 14 border styles × 5 sides, custom number formats, column widths, freeze panes, auto-filter. Survived 1M-iter deep fuzz on every surface.
 
 ```zig
 const xlsx = @import("zlsx");
 
-var book = try xlsx.Book.open(allocator, "workbook.xlsx");
+// Reading
+var book = try xlsx.Book.open(allocator, "in.xlsx");
 defer book.deinit();
-
 const sheet = book.sheetByName("Summary") orelse return error.MissingSheet;
 var rows = try book.rows(sheet, allocator);
 defer rows.deinit();
-
 while (try rows.next()) |cells| {
-    for (cells, 0..) |c, col| switch (c) {
+    for (cells) |c| switch (c) {
         .empty   => {},
-        .string  => |s| std.debug.print("{d:>3}: str  {s}\n", .{ col, s }),
-        .integer => |i| std.debug.print("{d:>3}: int  {d}\n", .{ col, i }),
-        .number  => |f| std.debug.print("{d:>3}: num  {d}\n", .{ col, f }),
-        .boolean => |b| std.debug.print("{d:>3}: bool {any}\n", .{ col, b }),
+        .string  => |s| std.debug.print("str  {s}\n", .{s}),
+        .integer => |i| std.debug.print("int  {d}\n", .{i}),
+        .number  => |f| std.debug.print("num  {d}\n", .{f}),
+        .boolean => |b| std.debug.print("bool {any}\n", .{b}),
     };
 }
+
+// Writing — including styles, fills, borders, number formats,
+// column widths, freeze panes, auto-filter.
+var w = xlsx.Writer.init(allocator);
+defer w.deinit();
+
+const header = try w.addStyle(.{
+    .font_bold = true,
+    .font_color_argb = 0xFFFFFFFF,
+    .fill_pattern = .solid,
+    .fill_fg_argb = 0xFF1E3A8A,
+    .alignment_horizontal = .center,
+    .border_bottom = .{ .style = .thin, .color_argb = 0xFF000000 },
+});
+const money = try w.addStyle(.{ .number_format = "$#,##0.00" });
+
+var sheet_w = try w.addSheet("Summary");
+try sheet_w.setColumnWidth(0, 24);
+sheet_w.freezePanes(1, 0);
+try sheet_w.setAutoFilter("A1:C1");
+try sheet_w.writeRowStyled(
+    &.{ .{ .string = "Name" }, .{ .string = "Amount" }, .{ .string = "Active" } },
+    &.{ header, header, header },
+);
+try sheet_w.writeRowStyled(
+    &.{ .{ .string = "Alice" }, .{ .number = 12345.67 }, .{ .boolean = true } },
+    &.{ 0, money, 0 },
+);
+try w.save("out.xlsx");
 ```
 
 ## Why
 
-Zig's ecosystem has no official xlsx reader yet. The options are [calamine](https://github.com/tafia/calamine) via FFI (Rust), Apache POI via subprocess (JVM), or rolling your own on top of `std.zip`. This is the third option, packaged up and fuzz-tested.
+Zig's ecosystem has no official xlsx library yet. The options are [calamine](https://github.com/tafia/calamine) via FFI (Rust, read-only), Apache POI via subprocess (JVM), or rolling your own on top of `std.zip`. zlsx is the third option, packaged up, fuzz-tested (14 M inputs per release), and extended with a pragmatic write path so you don't need a second library for output.
 
-Designed for a real use case: Alfred's hotel-concierge pipeline needs to read a 1,008-row × 35-col openpyxl-generated workbook with inline strings, shared strings, and UTF-8 content across multiple languages. `zlsx` reads it in ~30 ms.
+Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-row × 35-col openpyxl-generated workbook with inline strings, shared strings, and UTF-8 content across multiple languages. `zlsx` reads it in ~10 ms and writes styled output without shipping openpyxl.
 
 ## What's in, what's out
 
 **In**
-- Read a workbook, enumerate sheets by name/index
-- Iterate rows as dense `[]Cell` with typed cells (`empty`, `string`, `integer`, `number`, `boolean`)
-- Shared strings (`sharedStrings.xml` with rich-text runs and XML entities)
-- Inline strings (`<c t="inlineStr">`)
-- Numeric/boolean/error/formula-cached cells
-- XML entity decoding (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&#N;`, `&#xN;`)
-- UTF-8 content throughout (non-Latin scripts preserved)
+- **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout
+- **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, freeze panes, auto-filter
+- XML entity decoding (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&#N;`, `&#xN;`) on read and escaping on write
+- CLI (`zlsx file.xlsx --format {jsonl,jsonl-dict,tsv,csv}`), C ABI (`libzlsx.{dylib,so,dll}` + `include/zlsx.h`), Python bindings (`pip install py-zlsx`)
 
 **Out (by design)**
-- No writing — read-only
-- No formula evaluation — we read the cached `<v>` value, never re-compute
-- No style / number-format application — dates stay as their raw Excel serial unless the generator pre-serialized them
-- No merged-cell semantics — the underlying cell anchors are returned; merging is caller-interpreted
-- No chart / pivot / image extraction
+- No formula evaluation — the reader returns the cached `<v>` value, the writer never synthesises formulas
+- No date decoding — dates stay as their raw Excel serial number unless the generator pre-serialised them
+- No merged-cell authoring — the underlying cell anchors are preserved; merging is caller-interpreted
+- No load-modify-save round-trip yet — Phase 3c queued. For now the writer only produces fresh workbooks
+- No chart / pivot / image extraction or emission
 
 ## Install
 
@@ -57,7 +84,7 @@ Prebuilt binaries for macOS (ARM64, Intel), Linux (x86_64, ARM64 — static musl
 
 ```bash
 # macOS (Apple Silicon)
-curl -fsSL -o zlsx.tar.gz "https://github.com/laurentfabre/zlsx/releases/latest/download/zlsx-0.2.0-aarch64-apple-darwin.tar.gz"
+curl -fsSL -o zlsx.tar.gz "https://github.com/laurentfabre/zlsx/releases/latest/download/zlsx-0.2.4-aarch64-apple-darwin.tar.gz"
 tar -xzf zlsx.tar.gz && sudo mv zlsx-*/bin/zlsx /usr/local/bin/
 
 # Via Homebrew (once the tap is published)
@@ -111,16 +138,24 @@ Emission overhead is within 3% of the tally-only benchmark — the CLI is fast e
 
 ## Performance
 
-20-run hyperfine median, real workload (`alfred_bdr_prospect_list.xlsx`, 261 KB, 1,008 rows × 35 cols):
+### Read — 20-run hyperfine median on `alfred_bdr_prospect_list.xlsx` (261 KB, 1,008 × 35)
 
-| Library | Time | Memory | Speedup |
+| Library | Time | Peak RSS | Speedup |
 |---|---|---|---|
-| **zlsx** | **10.7 ms** | **4.16 MB** | **1.00×** |
-| calamine-rust 0.26 | 15.3 ms | 4.94 MB | 1.44× slower |
-| python-calamine 0.6 | 44.9 ms | 23.69 MB | 4.21× slower |
-| openpyxl 3.1 (read_only) | 254.6 ms | 44.17 MB | 23.89× slower |
+| **zlsx** | **10.3 ms** | **4.16 MB** | **1.00×** |
+| calamine-rust 0.26 | 15.3 ms | 4.94 MB | 1.48× slower |
+| python-calamine 0.6 | 44.9 ms | 23.69 MB | 4.36× slower |
+| openpyxl 3.1 (read_only) | 254.6 ms | 44.17 MB | 24.72× slower |
 
-zlsx edges calamine-rs because (a) the Zig binary is ~120 KB vs calamine's ~620 KB static link so startup is shorter, and (b) zlsx borrows string slices into the source xml buffer whenever possible, only allocating per-row owned strings when rich-text concatenation or entity decoding forces it. See [`docs/benchmarks.md`](docs/benchmarks.md) for the full 4-library × 5-file matrix, reproducibility commands, and counter-difference analysis.
+### Write — 20-run median writing 1,001 styled rows × 10 cols (Phase 3b, v0.2.4)
+
+| Library | Time | Peak RSS | Output | Speedup |
+|---|---|---|---|---|
+| **zlsx Writer** | **3.4 ms** | **2.98 MB** | 390 KB | **1.00×** |
+| xlsxwriter 3.x (`constant_memory`) | 58.7 ms | 24.73 MB | 55 KB | 17.0× slower |
+| openpyxl 3.1 (`write_only`) | 125.8 ms | 42.27 MB | 53 KB | 36.5× slower |
+
+zlsx Writer emits uncompressed (stored) zip entries today, hence the larger archive; wall-time + RSS come out ahead of both Python libraries regardless. See [`docs/benchmarks.md`](docs/benchmarks.md) for the full 4-library × 5-file reader matrix, the write-side breakdown, reproducibility commands, and counter-difference analysis.
 
 ## Zig version
 

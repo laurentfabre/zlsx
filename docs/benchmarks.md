@@ -89,6 +89,54 @@ Three behavioural deltas (not bugs):
 
 All four libraries read identical content from the file. The counter differences are interpretation, not correctness.
 
+## Writer benchmark (Phase 3b, v0.2.4)
+
+Same workload across all three implementations: 1,001 rows × 10 cols (one header row + 1,000 data rows). The header row has per-cell styles (bold white-on-blue fill, centre-aligned). Body rows mix strings, integers, floats, booleans, with the numeric columns referencing one of two shared number-format styles (`$#,##0.00` / `0.00%`). Sheet gets `column_width[0]=20` + `freeze_panes(row=1)`.
+
+20-run hyperfine median:
+
+| Impl | Time | Peak RSS | Output size | Speedup (wall) |
+|---|---|---|---|---|
+| **zlsx Writer** | **3.4 ms ± 0.6** | **2.98 MB** | 390 KB | **1.00×** |
+| xlsxwriter 3.x (`constant_memory`) | 58.7 ms ± 0.4 | 24.73 MB | 55 KB | 17.0× slower |
+| openpyxl 3.1 (`write_only`) | 125.8 ms ± 0.8 | 42.27 MB | 53 KB | 36.5× slower |
+
+```
+  zlsx Writer    ▌             3.4 ms     1.00×
+  xlsxwriter     ▌▌▌▌▌▌▌▌      58.7 ms    17.0× slower
+  openpyxl       ▌…▌           125.8 ms   36.5× slower
+```
+
+Throughput at that size (rows/sec):
+
+| Impl | Styled rows/sec |
+|---|---|
+| zlsx Writer | ~295,000 |
+| xlsxwriter | ~17,000 |
+| openpyxl | ~7,900 |
+
+### Output-size trade-off
+
+zlsx Writer ships v0.2.4 with **stored (no-deflate) zip** — entries are written uncompressed so the zip emitter stays small and allocation-free. That's the 390 KB figure above. `xlsxwriter` and `openpyxl` both use deflate, so their outputs are ~7× smaller.
+
+For most users wall-time + RSS matter more than archive size (files go straight to a user's Downloads folder or a server's temp dir, not a long-term archive). Deflate is on the Phase 3c roadmap and would close the file-size gap while keeping zlsx faster than the Python libraries in wall-clock.
+
+### Reproducing
+
+The writer bench mirrors the reader bench — sources in `tests/bench/`:
+
+```bash
+zig build-exe -O ReleaseFast \
+  --dep zlsx -Mroot=tests/bench/bench_write_zlsx.zig \
+  -Mzlsx=src/xlsx.zig \
+  -femit-bin=./bench_write_zlsx
+
+hyperfine --warmup 3 --runs 20 \
+  -n "zlsx"       "./bench_write_zlsx /tmp/out.xlsx" \
+  -n "xlsxwriter" "python tests/bench/bench_write_xlsxwriter.py /tmp/out.xlsx" \
+  -n "openpyxl"   "python tests/bench/bench_write_openpyxl.py /tmp/out.xlsx"
+```
+
 ## Reproducing
 
 ```bash
@@ -120,4 +168,6 @@ Source for all four benches (~30 lines each) is in `tests/bench/` if you want to
 
 ## Summary
 
-**zlsx is the fastest of the four, smallest RSS, and single-file dropped into a Zig build.** Native parity with calamine on small files; ~1.4× edge on 1k+ rows thanks to narrower scope and borrow-when-safe string handling. Against Python libraries it's 4× to 24× faster. For the Alfred pipeline (reads 1,000-row BDR xlsx on every run), swapping openpyxl for zlsx is ~244 ms per run saved — compounded across a 10-minute distillation batch, that's a full minute back on a 1008-hotel refresh.
+**On the read side**: zlsx is the fastest of the four, smallest RSS, and single-file droppable into a Zig build. Native parity with calamine on small files; ~1.4× edge on 1k+ rows thanks to narrower scope and borrow-when-safe string handling. Against Python libraries it's 4× to 24× faster. For the Alfred pipeline (reads 1,000-row BDR xlsx on every run), swapping openpyxl for zlsx is ~244 ms per run saved — compounded across a 10-minute distillation batch, that's a full minute back on a 1008-hotel refresh.
+
+**On the write side** (Phase 3b, v0.2.4): zlsx Writer is 17× faster than xlsxwriter and 36× faster than openpyxl for a 1,000-row styled workbook — at ~8× lower RSS than either Python library. The output is ~7× larger because zlsx uses stored (uncompressed) zip entries while xlsxwriter/openpyxl deflate; a future zlsx deflate mode (queued) would close the file-size gap while keeping the wall-clock lead.
