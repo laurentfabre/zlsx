@@ -723,6 +723,10 @@ pub const CStyle = extern struct {
     border_diagonal_color_argb: u32,
     font_name_ptr: [*]const u8,
     font_name_len: usize,
+    /// Stage-5 OOXML number-format string (e.g. "0.00" / "m/d/yyyy").
+    /// Used iff num_fmt_len > 0.
+    num_fmt_ptr: [*]const u8,
+    num_fmt_len: usize,
 };
 
 const FONT_SIZE_SET: u8 = 1 << 0;
@@ -801,6 +805,9 @@ export fn zlsx_writer_add_style_ex(
     if (spec.font_name_len > 0) {
         style.font_name = spec.font_name_ptr[0..spec.font_name_len];
     }
+    if (spec.num_fmt_len > 0) {
+        style.number_format = spec.num_fmt_ptr[0..spec.num_fmt_len];
+    }
 
     const idx = state.inner.addStyle(style) catch |e| {
         writeError(err_buf, err_buf_len, @errorName(e));
@@ -856,6 +863,60 @@ export fn zlsx_sheet_writer_write_row_styled(
         styles_ptr.?[0..cells_len];
 
     sw_state.inner.writeRowStyled(cells_slice, styles_slice) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
+// ─── Sheet-level features (Phase 3b stage 5) ─────────────────────────
+//
+// These operate on a SheetWriter — not the Writer itself — because
+// column widths / freeze panes / auto-filter are stored in each sheet's
+// XML, not in xl/styles.xml. Zero indicates "no freeze" per axis.
+
+/// Set the width (in character units) of column `col_idx` (0-based,
+/// A=0). Returns 0 on success, -1 on invalid width (non-finite or ≤ 0).
+export fn zlsx_sheet_writer_set_column_width(
+    sw: *SheetWriter,
+    col_idx: u32,
+    width: f32,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+    sw_state.inner.setColumnWidth(col_idx, width) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
+/// Freeze the top `rows` rows and left `cols` columns. Pass 0 on an
+/// axis to leave it unfrozen. Overrides any previous freeze on this
+/// sheet. Never fails.
+export fn zlsx_sheet_writer_freeze_panes(
+    sw: *SheetWriter,
+    rows: u32,
+    cols: u32,
+) callconv(.c) void {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+    sw_state.inner.freezePanes(rows, cols);
+}
+
+/// Apply an auto-filter over an A1-style range (e.g. "A1:E1"). The
+/// writer dupes the range, so the caller can free their buffer
+/// immediately after. Returns 0 on success, -1 on an empty range.
+export fn zlsx_sheet_writer_set_auto_filter(
+    sw: *SheetWriter,
+    range_ptr: [*]const u8,
+    range_len: usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+    const range = range_ptr[0..range_len];
+    sw_state.inner.setAutoFilter(range) catch |e| {
         writeError(err_buf, err_buf_len, @errorName(e));
         return -1;
     };

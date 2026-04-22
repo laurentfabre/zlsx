@@ -282,6 +282,9 @@ typedef struct {
     uint32_t        border_diagonal_color_argb;
     const uint8_t * font_name_ptr;        /* NULL or unused iff font_name_len == 0 */
     size_t          font_name_len;
+    /* Stage 5: OOXML number-format string (e.g., "0.00", "m/d/yyyy"). */
+    const uint8_t * num_fmt_ptr;          /* NULL or unused iff num_fmt_len == 0 */
+    size_t          num_fmt_len;
 } zlsx_style_t;
 
 #define ZLSX_FONT_SIZE_SET              0x01u
@@ -318,6 +321,37 @@ int32_t zlsx_sheet_writer_write_row_styled(
     const zlsx_cell_t   * cells_ptr,
     const uint32_t      * styles_ptr,
     size_t                cells_len,
+    uint8_t             * err_buf,
+    size_t                err_buf_len);
+
+/* Stage 5: per-sheet layout features (added 0.2.4). */
+
+/* Set the display width of column `col_idx` (0-based, A=0) in the
+ * spreadsheet "character unit" that Excel uses. Returns 0 on success
+ * or -1 with err="InvalidColumnWidth" for non-finite or non-positive
+ * values. */
+int32_t zlsx_sheet_writer_set_column_width(
+    zlsx_sheet_writer_t * sw,
+    uint32_t              col_idx,
+    float                 width,
+    uint8_t             * err_buf,
+    size_t                err_buf_len);
+
+/* Freeze the top `rows` rows and left `cols` columns on the sheet.
+ * Pass 0 on an axis to leave it unfrozen. Overrides any previous
+ * freeze on this sheet. Never fails. */
+void zlsx_sheet_writer_freeze_panes(
+    zlsx_sheet_writer_t * sw,
+    uint32_t              rows,
+    uint32_t              cols);
+
+/* Apply an auto-filter over an A1-style range (e.g. "A1:E1"). The
+ * writer dupes the range string immediately. Returns 0 on success or
+ * -1 with err="InvalidAutoFilterRange" on empty input. */
+int32_t zlsx_sheet_writer_set_auto_filter(
+    zlsx_sheet_writer_t * sw,
+    const uint8_t       * range_ptr,
+    size_t                range_len,
     uint8_t             * err_buf,
     size_t                err_buf_len);
 

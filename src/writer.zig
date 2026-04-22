@@ -71,11 +71,10 @@ const WORKBOOK_RELS_HEAD: []const u8 =
 ;
 const WORKBOOK_RELS_TAIL: []const u8 = "</Relationships>";
 
-const WORKSHEET_HEAD: []const u8 =
+const WORKSHEET_PROLOG: []const u8 =
     \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-    \\<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+    \\<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
 ;
-const WORKSHEET_TAIL: []const u8 = "</sheetData></worksheet>";
 
 const SST_HEAD_FMT: []const u8 =
     \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -109,6 +108,10 @@ const STYLES_CELL_STYLES: []const u8 =
     \\<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
 ;
 const STYLES_TAIL: []const u8 = "</styleSheet>";
+
+/// OOXML reserves numFmtIds 0..=49 for built-ins; user numFmts must
+/// start at 164 (Excel's convention — 50..=163 are "reserved").
+const NUM_FMT_BASE: u32 = 164;
 
 // ─── Writer public API ───────────────────────────────────────────────
 
@@ -230,6 +233,11 @@ pub const Style = struct {
     /// Draw the diagonal from the upper-left corner downward to the
     /// lower-right. Same `border_diagonal.style` gates rendering.
     diagonal_down: bool = false,
+    /// OOXML number format string (e.g., "0.00", "m/d/yyyy",
+    /// "$#,##0.00"). Null = General. Custom strings register as user
+    /// numFmts starting at id 164; multiple styles using the same
+    /// format string share a single numFmtId.
+    number_format: ?[]const u8 = null,
 };
 
 fn hasBorder(s: Style) bool {
@@ -256,6 +264,12 @@ pub const Writer = struct {
     // returned from `addStyle()` can be used directly as the cell's
     // `s="N"` attribute.
     styles: std.ArrayListUnmanaged(Style) = .{},
+    // Number-format pool (stage 5). Parallel arrays: `num_fmts` owns
+    // the format strings (writer-allocated); `num_fmt_index` maps
+    // format → numFmtId (starting at 164 — OOXML reserves 0..=49 for
+    // built-ins). All values are unique.
+    num_fmts: std.ArrayListUnmanaged([]u8) = .{},
+    num_fmt_index: std.StringHashMapUnmanaged(u32) = .{},
 
     pub fn init(allocator: Allocator) Writer {
         return .{ .allocator = allocator };
@@ -270,12 +284,17 @@ pub const Writer = struct {
         for (self.sst_strings.items) |s| self.allocator.free(s);
         self.sst_strings.deinit(self.allocator);
         self.sst_index.deinit(self.allocator);
-        // Each style owns its font_name slice (if any) on the writer's
-        // heap; drop them here before the styles ArrayList goes.
+        // Each style owns its font_name / number_format slices (if any)
+        // on the writer's heap; drop them here before the styles
+        // ArrayList goes.
         for (self.styles.items) |s| {
             if (s.font_name) |n| self.allocator.free(n);
+            if (s.number_format) |n| self.allocator.free(n);
         }
         self.styles.deinit(self.allocator);
+        for (self.num_fmts.items) |n| self.allocator.free(n);
+        self.num_fmts.deinit(self.allocator);
+        self.num_fmt_index.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -292,6 +311,17 @@ pub const Writer = struct {
         if (style.font_name) |n| {
             if (n.len == 0) return error.InvalidFontName;
         }
+        if (style.number_format) |n| {
+            if (n.len == 0) return error.InvalidNumberFormat;
+        }
+
+        // Side-effect of validation: register the format string in the
+        // numFmt pool (dedup via StringHashMap). Happens BEFORE dedup of
+        // the parent Style so we don't register formats for rejected
+        // styles.
+        if (style.number_format) |fmt| {
+            _ = try self.internNumFmt(fmt);
+        }
 
         // Linear-scan dedup. Need content-equal font_name comparison
         // (std.meta.eql on `?[]const u8` compares slice headers only).
@@ -299,14 +329,32 @@ pub const Writer = struct {
             if (stylesEqual(existing, style)) return @intCast(i + 1);
         }
 
-        // New entry — dupe font_name into writer-owned storage.
+        // New entry — dupe font_name / number_format into writer-owned
+        // storage so the caller can free their buffers immediately.
         var owned_style = style;
         if (style.font_name) |n| {
             owned_style.font_name = try self.allocator.dupe(u8, n);
         }
         errdefer if (owned_style.font_name) |n| self.allocator.free(n);
+        if (style.number_format) |n| {
+            owned_style.number_format = try self.allocator.dupe(u8, n);
+        }
+        errdefer if (owned_style.number_format) |n| self.allocator.free(n);
         try self.styles.append(self.allocator, owned_style);
         return @intCast(self.styles.items.len);
+    }
+
+    /// Return the numFmtId for `fmt`, allocating a new entry at id >=
+    /// NUM_FMT_BASE (164) on first sight. Subsequent calls with the
+    /// same content return the same id.
+    fn internNumFmt(self: *Writer, fmt: []const u8) !u32 {
+        if (self.num_fmt_index.get(fmt)) |id| return id;
+        const owned = try self.allocator.dupe(u8, fmt);
+        errdefer self.allocator.free(owned);
+        const id: u32 = @intCast(NUM_FMT_BASE + self.num_fmts.items.len);
+        try self.num_fmts.append(self.allocator, owned);
+        try self.num_fmt_index.put(self.allocator, owned, id);
+        return id;
     }
 
     /// Add a sheet and return a handle to append rows. Sheet is owned by
@@ -420,9 +468,51 @@ pub const Writer = struct {
         for (self.sheets.items, 0..) |sw, i| {
             var full: std.ArrayListUnmanaged(u8) = .{};
             defer full.deinit(alloc);
-            try full.appendSlice(alloc, WORKSHEET_HEAD);
+            try full.appendSlice(alloc, WORKSHEET_PROLOG);
+
+            // <sheetViews> — emitted when any pane is frozen (stage 5).
+            if (sw.freeze_rows != 0 or sw.freeze_cols != 0) {
+                try full.appendSlice(alloc, "<sheetViews><sheetView workbookViewId=\"0\">");
+                try full.appendSlice(alloc, "<pane");
+                if (sw.freeze_cols != 0) try full.print(alloc, " xSplit=\"{d}\"", .{sw.freeze_cols});
+                if (sw.freeze_rows != 0) try full.print(alloc, " ySplit=\"{d}\"", .{sw.freeze_rows});
+                var tl_buf: [16]u8 = undefined;
+                const top_left = try formatCellRef(&tl_buf, sw.freeze_rows + 1, sw.freeze_cols);
+                const active_pane: []const u8 = if (sw.freeze_rows != 0 and sw.freeze_cols != 0)
+                    "bottomRight"
+                else if (sw.freeze_rows != 0)
+                    "bottomLeft"
+                else
+                    "topRight";
+                try full.print(alloc, " topLeftCell=\"{s}\" activePane=\"{s}\" state=\"frozen\"/>", .{ top_left, active_pane });
+                try full.appendSlice(alloc, "</sheetView></sheetViews>");
+            }
+
+            // <cols> — one <col> per registered width override.
+            if (sw.column_widths.items.len > 0) {
+                try full.appendSlice(alloc, "<cols>");
+                for (sw.column_widths.items) |cw| {
+                    try full.print(
+                        alloc,
+                        "<col min=\"{d}\" max=\"{d}\" width=\"{d}\" customWidth=\"1\"/>",
+                        .{ cw.col_min, cw.col_max, cw.width },
+                    );
+                }
+                try full.appendSlice(alloc, "</cols>");
+            }
+
+            try full.appendSlice(alloc, "<sheetData>");
             try full.appendSlice(alloc, sw.body.items);
-            try full.appendSlice(alloc, WORKSHEET_TAIL);
+            try full.appendSlice(alloc, "</sheetData>");
+
+            // <autoFilter> must come after </sheetData>.
+            if (sw.auto_filter_range) |range| {
+                try full.appendSlice(alloc, "<autoFilter ref=\"");
+                try appendXmlEscaped(alloc, &full, range);
+                try full.appendSlice(alloc, "\"/>");
+            }
+
+            try full.appendSlice(alloc, "</worksheet>");
 
             var name_buf: [64]u8 = undefined;
             const entry_name = try std.fmt.bufPrint(&name_buf, "xl/worksheets/sheet{d}.xml", .{i + 1});
@@ -445,7 +535,13 @@ pub const Writer = struct {
 
         // 7. xl/styles.xml — only when the caller registered any styles.
         // Keeps the "no styles" path byte-identical to v0.2.0-0.2.3 output.
-        if (have_styles) try emitStylesXml(alloc, &zw, self.styles.items);
+        if (have_styles) try emitStylesXml(
+            alloc,
+            &zw,
+            self.styles.items,
+            self.num_fmts.items,
+            &self.num_fmt_index,
+        );
 
         try zw.finalize();
 
@@ -457,6 +553,15 @@ pub const Writer = struct {
 
 // ─── SheetWriter ─────────────────────────────────────────────────────
 
+/// Per-column width override. `col_min..=col_max` is the inclusive
+/// range this width applies to (xlsx indexes columns 1-based — the
+/// SheetWriter API takes 0-based indices and translates on emit).
+pub const ColumnWidth = struct {
+    col_min: u32,
+    col_max: u32,
+    width: f32,
+};
+
 pub const SheetWriter = struct {
     parent: *Writer,
     // Owned copy of the sheet name.
@@ -465,6 +570,15 @@ pub const SheetWriter = struct {
     body: std.ArrayListUnmanaged(u8) = .{},
     // 1-based row index (xlsx convention).
     next_row: u32 = 1,
+    // Stage 5: per-sheet layout features.
+    column_widths: std.ArrayListUnmanaged(ColumnWidth) = .{},
+    /// Number of rows frozen at the top (1 = freeze row 1). 0 = none.
+    freeze_rows: u32 = 0,
+    /// Number of columns frozen at the left (1 = freeze column A). 0 = none.
+    freeze_cols: u32 = 0,
+    /// Auto-filter range (e.g., "A1:E1"). null = no filter.
+    /// Owned by the SheetWriter.
+    auto_filter_range: ?[]u8 = null,
 
     fn init(parent: *Writer, name: []const u8) !SheetWriter {
         return .{
@@ -476,7 +590,39 @@ pub const SheetWriter = struct {
     fn deinit(self: *SheetWriter) void {
         self.parent.allocator.free(self.name);
         self.body.deinit(self.parent.allocator);
+        self.column_widths.deinit(self.parent.allocator);
+        if (self.auto_filter_range) |r| self.parent.allocator.free(r);
         self.* = undefined;
+    }
+
+    /// Set a column's width in character units (Excel's default is
+    /// 8.43). `col_idx` is 0-based (A=0, B=1, …). Multiple calls on
+    /// the same column append a new override — the emitter keeps them
+    /// in order, so a later call wins on overlap in Excel.
+    pub fn setColumnWidth(self: *SheetWriter, col_idx: u32, width: f32) !void {
+        if (!std.math.isFinite(width) or width <= 0) return error.InvalidColumnWidth;
+        const col_1based = col_idx + 1;
+        try self.column_widths.append(self.parent.allocator, .{
+            .col_min = col_1based,
+            .col_max = col_1based,
+            .width = width,
+        });
+    }
+
+    /// Freeze the top `rows` rows and left `cols` columns. Pass 0 to
+    /// disable one axis (e.g., `freezePanes(1, 0)` freezes only row 1).
+    /// Calling again overrides the previous setting.
+    pub fn freezePanes(self: *SheetWriter, rows: u32, cols: u32) void {
+        self.freeze_rows = rows;
+        self.freeze_cols = cols;
+    }
+
+    /// Apply an auto-filter over the given A1-style range (e.g.,
+    /// "A1:E1"). Caller-owned; the writer dupes it.
+    pub fn setAutoFilter(self: *SheetWriter, range: []const u8) !void {
+        if (range.len == 0) return error.InvalidAutoFilterRange;
+        if (self.auto_filter_range) |old| self.parent.allocator.free(old);
+        self.auto_filter_range = try self.parent.allocator.dupe(u8, range);
     }
 
     /// Write a row of cells. Empty cells are omitted from the output
@@ -614,6 +760,11 @@ fn stylesEqual(a: Style, b: Style) bool {
     if (a.font_name) |an| {
         if (!std.mem.eql(u8, an, b.font_name.?)) return false;
     }
+    // Content-compare number_format.
+    if ((a.number_format == null) != (b.number_format == null)) return false;
+    if (a.number_format) |an| {
+        if (!std.mem.eql(u8, an, b.number_format.?)) return false;
+    }
     return true;
 }
 
@@ -627,11 +778,26 @@ fn emitStylesXml(
     alloc: Allocator,
     zw: *ZipWriter,
     styles: []const Style,
+    num_fmts: []const []const u8,
+    num_fmt_index: *const std.StringHashMapUnmanaged(u32),
 ) !void {
     var buf: std.ArrayListUnmanaged(u8) = .{};
     defer buf.deinit(alloc);
 
     try buf.appendSlice(alloc, STYLES_HEAD);
+
+    // <numFmts> — emitted only when the user registered any custom
+    // format. Built-ins (General / 0..=49) don't go here.
+    if (num_fmts.len > 0) {
+        try buf.print(alloc, "<numFmts count=\"{d}\">", .{num_fmts.len});
+        for (num_fmts, 0..) |fmt, i| {
+            const id: u32 = @intCast(NUM_FMT_BASE + i);
+            try buf.print(alloc, "<numFmt numFmtId=\"{d}\" formatCode=\"", .{id});
+            try appendXmlEscaped(alloc, &buf, fmt);
+            try buf.appendSlice(alloc, "\"/>");
+        }
+        try buf.appendSlice(alloc, "</numFmts>");
+    }
 
     // <fonts>: default at index 0 + one per user style.
     try buf.print(alloc, "<fonts count=\"{d}\">", .{styles.len + 1});
@@ -734,11 +900,16 @@ fn emitStylesXml(
         const has_alignment = s.alignment_horizontal != .general or s.wrap_text;
         const fill_id = fill_ids[i];
         const border_id = border_ids[i];
+        const num_fmt_id: u32 = if (s.number_format) |fmt|
+            (num_fmt_index.get(fmt) orelse 0)
+        else
+            0;
         try buf.print(
             alloc,
-            "<xf numFmtId=\"0\" fontId=\"{d}\" fillId=\"{d}\" borderId=\"{d}\" xfId=\"0\" applyFont=\"1\"",
-            .{ i + 1, fill_id, border_id },
+            "<xf numFmtId=\"{d}\" fontId=\"{d}\" fillId=\"{d}\" borderId=\"{d}\" xfId=\"0\" applyFont=\"1\"",
+            .{ num_fmt_id, i + 1, fill_id, border_id },
         );
+        if (num_fmt_id != 0) try buf.appendSlice(alloc, " applyNumberFormat=\"1\"");
         if (fill_id != 0) try buf.appendSlice(alloc, " applyFill=\"1\"");
         if (border_id != 0) try buf.appendSlice(alloc, " applyBorder=\"1\"");
         if (has_alignment) {
@@ -1102,6 +1273,129 @@ test "Writer: xml entities in strings are escaped" {
     defer rows.deinit();
     const r = (try rows.next()).?;
     try std.testing.expectEqualStrings("a<b & c>d \"e\" 'f'", r[0].string);
+}
+
+test "Writer: stage-5 number format registers + emits numFmts" {
+    const tmp_path = "/tmp/zlsx_writer_numfmt.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+
+        const money = try w.addStyle(.{ .number_format = "$#,##0.00" });
+        const pct = try w.addStyle(.{ .number_format = "0.00%" });
+        const plain = try w.addStyle(.{ .font_bold = true });
+        // Dedup: same format returns same numFmtId inside styles.xml
+        // and same style index.
+        const money_again = try w.addStyle(.{ .number_format = "$#,##0.00" });
+        try std.testing.expectEqual(money, money_again);
+        try std.testing.expect(pct != money);
+        try std.testing.expect(plain != money);
+
+        // Empty format string is rejected.
+        try std.testing.expectError(error.InvalidNumberFormat, w.addStyle(.{ .number_format = "" }));
+
+        var sheet = try w.addSheet("S");
+        try sheet.writeRowStyled(
+            &.{ .{ .number = 123.45 }, .{ .number = 0.9 }, .{ .string = "boo" } },
+            &.{ money, pct, plain },
+        );
+        try w.save(tmp_path);
+    }
+
+    const styles_xml = blk: {
+        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        var fbuf: [4096]u8 = undefined;
+        var fr = file.reader(&fbuf);
+        var iter = try std.zip.Iterator.init(&fr);
+        var filename_buf: [64]u8 = undefined;
+        while (try iter.next()) |entry| {
+            if (entry.filename_len > filename_buf.len) continue;
+            try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            const filename = filename_buf[0..entry.filename_len];
+            try fr.interface.readSliceAll(filename);
+            if (std.mem.eql(u8, filename, "xl/styles.xml")) {
+                break :blk try extractEntryForTest(std.testing.allocator, entry, &fr);
+            }
+        }
+        return error.StylesXmlNotFound;
+    };
+    defer std.testing.allocator.free(styles_xml);
+
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "<numFmts count=\"2\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "numFmtId=\"164\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "numFmtId=\"165\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "formatCode=\"$#,##0.00\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "formatCode=\"0.00%\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "applyNumberFormat=\"1\"") != null);
+}
+
+test "Writer: stage-5 sheet-level features (cols, freeze, autoFilter)" {
+    const tmp_path = "/tmp/zlsx_writer_sheet_features.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Sheet1");
+        try sheet.setColumnWidth(0, 20.5);
+        try sheet.setColumnWidth(3, 12);
+        sheet.freezePanes(1, 2);
+        try sheet.setAutoFilter("A1:D1");
+
+        try std.testing.expectError(
+            error.InvalidColumnWidth,
+            sheet.setColumnWidth(1, -1),
+        );
+        try std.testing.expectError(
+            error.InvalidAutoFilterRange,
+            sheet.setAutoFilter(""),
+        );
+
+        try sheet.writeRow(&.{ .{ .string = "a" }, .{ .string = "b" }, .{ .string = "c" }, .{ .string = "d" } });
+        try w.save(tmp_path);
+    }
+
+    // Read the raw sheet1.xml to verify the new sections are present in
+    // the right order (sheetViews → cols → sheetData → autoFilter).
+    const sheet_xml = blk: {
+        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        var fbuf: [4096]u8 = undefined;
+        var fr = file.reader(&fbuf);
+        var iter = try std.zip.Iterator.init(&fr);
+        var filename_buf: [64]u8 = undefined;
+        while (try iter.next()) |entry| {
+            if (entry.filename_len > filename_buf.len) continue;
+            try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            const filename = filename_buf[0..entry.filename_len];
+            try fr.interface.readSliceAll(filename);
+            if (std.mem.eql(u8, filename, "xl/worksheets/sheet1.xml")) {
+                break :blk try extractEntryForTest(std.testing.allocator, entry, &fr);
+            }
+        }
+        return error.SheetXmlNotFound;
+    };
+    defer std.testing.allocator.free(sheet_xml);
+
+    // Ordering check — each segment must come before the next.
+    const sv = std.mem.indexOf(u8, sheet_xml, "<sheetViews>") orelse return error.MissingSheetViews;
+    const cols = std.mem.indexOf(u8, sheet_xml, "<cols>") orelse return error.MissingCols;
+    const data = std.mem.indexOf(u8, sheet_xml, "<sheetData>") orelse return error.MissingSheetData;
+    const af = std.mem.indexOf(u8, sheet_xml, "<autoFilter") orelse return error.MissingAutoFilter;
+    try std.testing.expect(sv < cols);
+    try std.testing.expect(cols < data);
+    try std.testing.expect(data < af);
+
+    // Specifics.
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "xSplit=\"2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "ySplit=\"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "state=\"frozen\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "width=\"20.5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "customWidth=\"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "ref=\"A1:D1\"") != null);
 }
 
 test "Writer: stage-4 border sides emit into styles.xml" {

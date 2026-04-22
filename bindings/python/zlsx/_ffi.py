@@ -253,6 +253,8 @@ class CStyle(ctypes.Structure):
         ("border_diagonal_color_argb", ctypes.c_uint32),
         ("font_name_ptr", ctypes.POINTER(ctypes.c_ubyte)),
         ("font_name_len", ctypes.c_size_t),
+        ("num_fmt_ptr", ctypes.POINTER(ctypes.c_ubyte)),
+        ("num_fmt_len", ctypes.c_size_t),
     ]
 
 
@@ -267,6 +269,36 @@ BORDER_RIGHT_COLOR_SET = 0x02
 BORDER_TOP_COLOR_SET = 0x04
 BORDER_BOTTOM_COLOR_SET = 0x08
 BORDER_DIAGONAL_COLOR_SET = 0x10
+
+
+# Stage-5 per-sheet functions (libzlsx 0.2.4+).
+_HAS_SHEET_FEATURES = hasattr(lib, "zlsx_sheet_writer_set_column_width")
+
+if _HAS_SHEET_FEATURES:
+    lib.zlsx_sheet_writer_set_column_width.argtypes = [
+        sheet_writer_handle,
+        ctypes.c_uint32,
+        ctypes.c_float,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_set_column_width.restype = ctypes.c_int32
+
+    lib.zlsx_sheet_writer_freeze_panes.argtypes = [
+        sheet_writer_handle,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+    ]
+    lib.zlsx_sheet_writer_freeze_panes.restype = None
+
+    lib.zlsx_sheet_writer_set_auto_filter.argtypes = [
+        sheet_writer_handle,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_set_auto_filter.restype = ctypes.c_int32
 
 _HAS_STYLES_EX = hasattr(lib, "zlsx_writer_add_style_ex")
 if _HAS_STYLES_EX:

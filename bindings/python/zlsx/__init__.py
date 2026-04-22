@@ -140,6 +140,10 @@ class Style:
     border_diagonal: "BorderSide" = field(default_factory=BorderSide)
     diagonal_up: bool = False
     diagonal_down: bool = False
+    # OOXML number format string (e.g. "0.00", "m/d/yyyy", "$#,##0.00").
+    # None = General. Custom formats register at numFmtId >= 164 and
+    # dedup across styles.
+    number_format: Optional[str] = None
 
 
 class ZlsxError(RuntimeError):
@@ -476,6 +480,70 @@ class SheetWriter:
         del keepers
 
 
+# Attach the stage-5 per-sheet methods to SheetWriter.
+# ------------------------------------------------------
+# Implemented as module-level function attachments so the class body
+# above stays focused on the stage 1-4 row-writing API.
+
+def _sheet_set_column_width(self: "SheetWriter", col_idx: int, width: float) -> None:
+    """Set the display width of column ``col_idx`` (0-based) in
+    character units (Excel default 8.43). Validated upfront."""
+    if not _ffi._HAS_SHEET_FEATURES:
+        raise RuntimeError(
+            "loaded libzlsx does not expose sheet layout features "
+            "(requires 0.2.4+); upgrade libzlsx"
+        )
+    rc = _ffi.lib.zlsx_sheet_writer_set_column_width(
+        self._handle, int(col_idx), float(width), self._err, _ERR_BUF_LEN
+    )
+    if rc != 0:
+        raise ZlsxError(
+            f"zlsx_sheet_writer_set_column_width: {_decode_err(self._err)}"
+        )
+
+
+def _sheet_freeze_panes(self: "SheetWriter", rows: int = 0, cols: int = 0) -> None:
+    """Freeze the top ``rows`` rows and left ``cols`` columns. Pass 0
+    on an axis to leave it unfrozen. Overrides any previous freeze."""
+    if not _ffi._HAS_SHEET_FEATURES:
+        raise RuntimeError(
+            "loaded libzlsx does not expose freeze_panes (requires 0.2.4+); "
+            "upgrade libzlsx"
+        )
+    _ffi.lib.zlsx_sheet_writer_freeze_panes(
+        self._handle, int(rows), int(cols)
+    )
+
+
+def _sheet_set_auto_filter(self: "SheetWriter", range_str: str) -> None:
+    """Apply an auto-filter over ``range_str`` (A1-style, e.g. 'A1:E1')."""
+    if not _ffi._HAS_SHEET_FEATURES:
+        raise RuntimeError(
+            "loaded libzlsx does not expose set_auto_filter (requires 0.2.4+); "
+            "upgrade libzlsx"
+        )
+    raw = range_str.encode("utf-8")
+    buf = (ctypes.c_ubyte * max(len(raw), 1)).from_buffer_copy(raw or b"\x00")
+    rc = _ffi.lib.zlsx_sheet_writer_set_auto_filter(
+        self._handle,
+        ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)),
+        len(raw),
+        self._err,
+        _ERR_BUF_LEN,
+    )
+    # Keep buf alive through the call.
+    del buf
+    if rc != 0:
+        raise ZlsxError(
+            f"zlsx_sheet_writer_set_auto_filter: {_decode_err(self._err)}"
+        )
+
+
+SheetWriter.set_column_width = _sheet_set_column_width   # type: ignore[attr-defined]
+SheetWriter.freeze_panes = _sheet_freeze_panes           # type: ignore[attr-defined]
+SheetWriter.set_auto_filter = _sheet_set_auto_filter     # type: ignore[attr-defined]
+
+
 class Writer:
     """A xlsx workbook under construction.
 
@@ -549,6 +617,7 @@ class Writer:
             or style.fill_fg_argb is not None
             or style.fill_bg_argb is not None
             or has_border
+            or style.number_format is not None
         )
 
         out_idx = ctypes.c_uint32(0)
@@ -588,14 +657,22 @@ class Writer:
         if style.font_name is None:
             name_bytes = b""
         elif style.font_name == "":
-            # Force Zig to see font_name = "" (len=0 with a non-null ptr
-            # via a different sentinel than the "unset" case).
             raise ZlsxError("InvalidFontName")
         else:
             name_bytes = style.font_name.encode("utf-8")
+
+        if style.number_format is None:
+            num_fmt_bytes = b""
+        elif style.number_format == "":
+            raise ZlsxError("InvalidNumberFormat")
+        else:
+            num_fmt_bytes = style.number_format.encode("utf-8")
         # Keep the bytes buffer alive through the FFI call.
         name_buf = (ctypes.c_ubyte * max(len(name_bytes), 1)).from_buffer_copy(
             name_bytes or b"\x00"
+        )
+        num_fmt_buf = (ctypes.c_ubyte * max(len(num_fmt_bytes), 1)).from_buffer_copy(
+            num_fmt_bytes or b"\x00"
         )
 
         if style.alignment_horizontal not in _HALIGN_VALUES:
@@ -650,6 +727,8 @@ class Writer:
             border_diagonal_color_argb=int(style.border_diagonal.color_argb or 0),
             font_name_ptr=ctypes.cast(name_buf, ctypes.POINTER(ctypes.c_ubyte)),
             font_name_len=len(name_bytes),
+            num_fmt_ptr=ctypes.cast(num_fmt_buf, ctypes.POINTER(ctypes.c_ubyte)),
+            num_fmt_len=len(num_fmt_bytes),
         )
         rc = _ffi.lib.zlsx_writer_add_style_ex(
             self._handle,

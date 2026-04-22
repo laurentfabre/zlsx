@@ -385,6 +385,72 @@ def test_writer_stage4_unknown_border_style_raises():
             ))
 
 
+def test_writer_stage5_number_formats(tmp_path):
+    import zipfile
+
+    out = tmp_path / "numfmt.xlsx"
+    with zlsx.write(out) as w:
+        money = w.add_style(zlsx.Style(number_format="$#,##0.00"))
+        pct = w.add_style(zlsx.Style(number_format="0.00%"))
+        money_again = w.add_style(zlsx.Style(number_format="$#,##0.00"))
+        assert money == money_again
+        assert pct != money
+
+        sheet = w.add_sheet("S")
+        sheet.write_row([123.45, 0.9], styles=[money, pct])
+
+    with zipfile.ZipFile(out) as z:
+        styles = z.read("xl/styles.xml").decode("utf-8")
+
+    assert '<numFmts count="2">' in styles
+    assert 'numFmtId="164"' in styles
+    assert 'numFmtId="165"' in styles
+    assert 'formatCode="$#,##0.00"' in styles
+    assert 'formatCode="0.00%"' in styles
+    assert 'applyNumberFormat="1"' in styles
+
+
+def test_writer_stage5_sheet_features(tmp_path):
+    import zipfile
+
+    out = tmp_path / "sheetfeat.xlsx"
+    with zlsx.write(out) as w:
+        sheet = w.add_sheet("Sheet1")
+        sheet.set_column_width(0, 20.5)
+        sheet.set_column_width(3, 12)
+        sheet.freeze_panes(rows=1, cols=2)
+        sheet.set_auto_filter("A1:D1")
+        sheet.write_row(["a", "b", "c", "d"])
+
+    with zipfile.ZipFile(out) as z:
+        sheet_xml = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+
+    # Ordering: sheetViews → cols → sheetData → autoFilter
+    sv = sheet_xml.index("<sheetViews>")
+    cols = sheet_xml.index("<cols>")
+    data = sheet_xml.index("<sheetData>")
+    af = sheet_xml.index("<autoFilter")
+    assert sv < cols < data < af
+
+    assert 'xSplit="2"' in sheet_xml
+    assert 'ySplit="1"' in sheet_xml
+    assert 'state="frozen"' in sheet_xml
+    assert 'width="20.5"' in sheet_xml
+    assert 'customWidth="1"' in sheet_xml
+    assert 'ref="A1:D1"' in sheet_xml
+
+
+def test_writer_stage5_invalid_inputs(tmp_path):
+    out = tmp_path / "bad.xlsx"
+    with zlsx.write(out) as w:
+        sheet = w.add_sheet("S")
+        sheet.write_row(["a"])
+        with pytest.raises(zlsx.ZlsxError, match="InvalidColumnWidth"):
+            sheet.set_column_width(0, -5)
+        with pytest.raises(zlsx.ZlsxError, match="InvalidAutoFilterRange"):
+            sheet.set_auto_filter("")
+
+
 def test_writer_no_styles_xml_when_unused(tmp_path):
     """A writer that never calls add_style must produce a byte-identical
     output to v0.2.3 — no styles.xml entry in the archive. This is
