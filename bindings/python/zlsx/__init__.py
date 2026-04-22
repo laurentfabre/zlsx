@@ -159,6 +159,21 @@ def _decode_err(buf: ctypes.Array) -> str:
     return bytes(buf.value).decode("utf-8", errors="replace")
 
 
+def _check_argb(name: str, value) -> int:
+    """Validate an ARGB colour is in the u32 range. ctypes.c_uint32
+    would silently mask a value like 0x1FFFFFFFF into 0xFFFFFFFF — a
+    user typo that'd ship the wrong colour without warning. Range-
+    check upfront and raise a ValueError that names the field."""
+    if value is None:
+        return 0
+    v = int(value)
+    if v < 0 or v > 0xFFFFFFFF:
+        raise ValueError(
+            f"{name} must be a 32-bit ARGB integer in [0, 0xFFFFFFFF], got {value!r}"
+        )
+    return v
+
+
 def _cell_to_py(cell: _ffi.Cell) -> Union[None, str, int, float, bool]:
     tag = cell.tag
     if tag == _ffi.CELL_EMPTY:
@@ -398,6 +413,17 @@ class SheetWriter:
         self._handle = handle
         self._err = ctypes.create_string_buffer(_ERR_BUF_LEN)
 
+    def _require_handle(self) -> None:
+        """Raise a clear error if this SheetWriter was invalidated by
+        ``Writer.close()``. Called at the top of every method that
+        would otherwise pass a NULL pointer to the C ABI (whose
+        signature is non-optional ``*SheetWriter`` and would null-deref
+        on field access)."""
+        if self._handle is None:
+            raise RuntimeError(
+                "SheetWriter used after its parent Writer was closed"
+            )
+
     def write_row(self, values, styles=None) -> None:
         """Append a row. ``values`` is any iterable of ``None | bool |
         int | float | str``. Integers outside ±2^53-significant-bits
@@ -409,6 +435,7 @@ class SheetWriter:
         :meth:`Writer.add_style` (or 0 for the default no-style). If
         ``styles`` is None, every cell inherits the default formatting.
         """
+        self._require_handle()
         cells_list = list(values)
         n = len(cells_list)
 
@@ -488,6 +515,7 @@ class SheetWriter:
 def _sheet_set_column_width(self: "SheetWriter", col_idx: int, width: float) -> None:
     """Set the display width of column ``col_idx`` (0-based) in
     character units (Excel default 8.43). Validated upfront."""
+    self._require_handle()
     if not _ffi._HAS_SHEET_FEATURES:
         raise RuntimeError(
             "loaded libzlsx does not expose sheet layout features "
@@ -510,6 +538,7 @@ def _sheet_set_column_width(self: "SheetWriter", col_idx: int, width: float) -> 
 def _sheet_freeze_panes(self: "SheetWriter", rows: int = 0, cols: int = 0) -> None:
     """Freeze the top ``rows`` rows and left ``cols`` columns. Pass 0
     on an axis to leave it unfrozen. Overrides any previous freeze."""
+    self._require_handle()
     if not _ffi._HAS_SHEET_FEATURES:
         raise RuntimeError(
             "loaded libzlsx does not expose freeze_panes (requires 0.2.4+); "
@@ -526,6 +555,7 @@ def _sheet_freeze_panes(self: "SheetWriter", rows: int = 0, cols: int = 0) -> No
 
 def _sheet_set_auto_filter(self: "SheetWriter", range_str: str) -> None:
     """Apply an auto-filter over ``range_str`` (A1-style, e.g. 'A1:E1')."""
+    self._require_handle()
     if not _ffi._HAS_SHEET_FEATURES:
         raise RuntimeError(
             "loaded libzlsx does not expose set_auto_filter (requires 0.2.4+); "
@@ -719,9 +749,9 @@ class Writer:
             fill_pattern=_PATTERN_VALUES[style.fill_pattern],
             flags2=flags2,
             font_size=float(style.font_size or 0.0),
-            font_color_argb=int(style.font_color_argb or 0),
-            fill_fg_argb=int(style.fill_fg_argb or 0),
-            fill_bg_argb=int(style.fill_bg_argb or 0),
+            font_color_argb=_check_argb("font_color_argb", style.font_color_argb),
+            fill_fg_argb=_check_argb("fill_fg_argb", style.fill_fg_argb),
+            fill_bg_argb=_check_argb("fill_bg_argb", style.fill_bg_argb),
             border_left_style=_bstyle(style.border_left),
             border_right_style=_bstyle(style.border_right),
             border_top_style=_bstyle(style.border_top),
@@ -729,11 +759,11 @@ class Writer:
             border_diagonal_style=_bstyle(style.border_diagonal),
             diagonal_up=1 if style.diagonal_up else 0,
             diagonal_down=1 if style.diagonal_down else 0,
-            border_left_color_argb=int(style.border_left.color_argb or 0),
-            border_right_color_argb=int(style.border_right.color_argb or 0),
-            border_top_color_argb=int(style.border_top.color_argb or 0),
-            border_bottom_color_argb=int(style.border_bottom.color_argb or 0),
-            border_diagonal_color_argb=int(style.border_diagonal.color_argb or 0),
+            border_left_color_argb=_check_argb("border_left.color_argb", style.border_left.color_argb),
+            border_right_color_argb=_check_argb("border_right.color_argb", style.border_right.color_argb),
+            border_top_color_argb=_check_argb("border_top.color_argb", style.border_top.color_argb),
+            border_bottom_color_argb=_check_argb("border_bottom.color_argb", style.border_bottom.color_argb),
+            border_diagonal_color_argb=_check_argb("border_diagonal.color_argb", style.border_diagonal.color_argb),
             font_name_ptr=ctypes.cast(name_buf, ctypes.POINTER(ctypes.c_ubyte)),
             font_name_len=len(name_bytes),
             num_fmt_ptr=ctypes.cast(num_fmt_buf, ctypes.POINTER(ctypes.c_ubyte)),
