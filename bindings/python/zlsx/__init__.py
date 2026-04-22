@@ -493,6 +493,11 @@ def _sheet_set_column_width(self: "SheetWriter", col_idx: int, width: float) -> 
             "loaded libzlsx does not expose sheet layout features "
             "(requires 0.2.4+); upgrade libzlsx"
         )
+    # Bound-check signed Python ints before ctypes wraps them into
+    # u32 — a bare `ctypes.c_uint32(-1)` becomes UINT32_MAX, which
+    # then overflows `col_idx + 1` inside the Zig writer.
+    if col_idx < 0:
+        raise ValueError(f"col_idx must be >= 0, got {col_idx}")
     rc = _ffi.lib.zlsx_sheet_writer_set_column_width(
         self._handle, int(col_idx), float(width), self._err, _ERR_BUF_LEN
     )
@@ -509,6 +514,10 @@ def _sheet_freeze_panes(self: "SheetWriter", rows: int = 0, cols: int = 0) -> No
         raise RuntimeError(
             "loaded libzlsx does not expose freeze_panes (requires 0.2.4+); "
             "upgrade libzlsx"
+        )
+    if rows < 0 or cols < 0:
+        raise ValueError(
+            f"freeze_panes rows/cols must be >= 0, got rows={rows} cols={cols}"
         )
     _ffi.lib.zlsx_sheet_writer_freeze_panes(
         self._handle, int(rows), int(cols)

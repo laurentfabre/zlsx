@@ -451,6 +451,38 @@ def test_writer_stage5_invalid_inputs(tmp_path):
             sheet.set_auto_filter("")
 
 
+def test_writer_rejects_unknown_style_id(tmp_path):
+    """writeRowStyled must range-check style ids against the registered
+    styles — referencing id 1 before any addStyle() call would otherwise
+    produce a workbook with `s="1"` but no matching <xf> record."""
+    with zlsx.write(tmp_path / "bad.xlsx") as w:
+        sheet = w.add_sheet("S")
+        # No styles registered yet — id 1 is out of range.
+        with pytest.raises(zlsx.ZlsxError, match="UnknownStyleId"):
+            sheet.write_row(["x"], styles=[1])
+        # Register one style → id 1 is now valid.
+        sid = w.add_style(zlsx.Style(font_bold=True))
+        assert sid == 1
+        sheet.write_row(["ok"], styles=[sid])
+        # id 2 is still out of range.
+        with pytest.raises(zlsx.ZlsxError, match="UnknownStyleId"):
+            sheet.write_row(["x"], styles=[2])
+
+
+def test_writer_sheet_features_reject_negative_ints(tmp_path):
+    """Python's signed ints would silently wrap to UINT32_MAX inside
+    ctypes and then overflow inside Zig. Validate upfront with a
+    clear ValueError."""
+    with zlsx.write(tmp_path / "bad.xlsx") as w:
+        sheet = w.add_sheet("S")
+        with pytest.raises(ValueError, match="col_idx"):
+            sheet.set_column_width(-1, 10)
+        with pytest.raises(ValueError, match="rows/cols"):
+            sheet.freeze_panes(rows=-1)
+        with pytest.raises(ValueError, match="rows/cols"):
+            sheet.freeze_panes(cols=-1)
+
+
 def test_writer_no_styles_xml_when_unused(tmp_path):
     """A writer that never calls add_style must produce a byte-identical
     output to v0.2.3 — no styles.xml entry in the archive. This is

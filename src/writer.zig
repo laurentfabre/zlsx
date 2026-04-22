@@ -636,12 +636,24 @@ pub const SheetWriter = struct {
     /// `cells.len`; use `0` (the default no-style slot) for cells that
     /// should inherit the default formatting. Style indices come from
     /// `Writer.addStyle` / `zlsx_writer_add_style`.
+    ///
+    /// Each non-zero style id is range-checked against the parent
+    /// Writer's registered-style count — out-of-range ids fail fast with
+    /// `error.UnknownStyleId` rather than producing a workbook that
+    /// references a missing `<xf>` record (which Excel would silently
+    /// repair or reject). Invariant: after a successful `writeRowStyled`
+    /// every emitted `s="N"` attribute corresponds to an existing entry
+    /// in the (eventual) `xl/styles.xml` `<cellXfs>` list.
     pub fn writeRowStyled(
         self: *SheetWriter,
         cells: []const xlsx.Cell,
         styles: []const u32,
     ) !void {
         if (styles.len != cells.len) return error.StyleCountMismatch;
+        const max_style_id: u32 = @intCast(self.parent.styles.items.len);
+        for (styles) |sid| {
+            if (sid > max_style_id) return error.UnknownStyleId;
+        }
         return self.writeRowImpl(cells, styles);
     }
 
@@ -1273,6 +1285,30 @@ test "Writer: xml entities in strings are escaped" {
     defer rows.deinit();
     const r = (try rows.next()).?;
     try std.testing.expectEqualStrings("a<b & c>d \"e\" 'f'", r[0].string);
+}
+
+test "Writer: writeRowStyled rejects out-of-range style id" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    var sheet = try w.addSheet("S");
+
+    // No styles registered — id 1 out of range.
+    try std.testing.expectError(error.UnknownStyleId, sheet.writeRowStyled(
+        &.{.{ .string = "x" }},
+        &.{1},
+    ));
+
+    const bold = try w.addStyle(.{ .font_bold = true });
+    try std.testing.expectEqual(@as(u32, 1), bold);
+
+    // id 1 now valid.
+    try sheet.writeRowStyled(&.{.{ .string = "ok" }}, &.{1});
+
+    // id 2 still out of range.
+    try std.testing.expectError(error.UnknownStyleId, sheet.writeRowStyled(
+        &.{.{ .string = "x" }},
+        &.{2},
+    ));
 }
 
 test "Writer: stage-5 number format registers + emits numFmts" {
