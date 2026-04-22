@@ -336,6 +336,55 @@ def test_writer_stage3_unknown_pattern_raises():
             w.add_style(zlsx.Style(fill_pattern="not-a-pattern"))
 
 
+def test_writer_stage4_borders(tmp_path):
+    import zipfile
+
+    out = tmp_path / "borders.xlsx"
+    with zlsx.write(out) as w:
+        box = w.add_style(zlsx.Style(
+            border_left=zlsx.BorderSide(style="thin", color_argb=0xFF000000),
+            border_right=zlsx.BorderSide(style="thin", color_argb=0xFF000000),
+            border_top=zlsx.BorderSide(style="thin", color_argb=0xFF000000),
+            border_bottom=zlsx.BorderSide(style="thin", color_argb=0xFF000000),
+        ))
+        fancy = w.add_style(zlsx.Style(
+            border_bottom=zlsx.BorderSide(style="thick", color_argb=0xFFFF0000),
+            border_diagonal=zlsx.BorderSide(style="dashed"),
+            diagonal_up=True,
+        ))
+        # Dedup.
+        box_again = w.add_style(zlsx.Style(
+            border_left=zlsx.BorderSide(style="thin", color_argb=0xFF000000),
+            border_right=zlsx.BorderSide(style="thin", color_argb=0xFF000000),
+            border_top=zlsx.BorderSide(style="thin", color_argb=0xFF000000),
+            border_bottom=zlsx.BorderSide(style="thin", color_argb=0xFF000000),
+        ))
+        assert box == box_again
+        assert fancy != box
+
+        sheet = w.add_sheet("S")
+        sheet.write_row(["a", "b"], styles=[box, fancy])
+
+    with zipfile.ZipFile(out) as z:
+        styles = z.read("xl/styles.xml").decode("utf-8")
+
+    assert '<borders count="3">' in styles
+    assert '<left style="thin"' in styles
+    assert '<bottom style="thick"' in styles
+    assert '<color rgb="FFFF0000"/>' in styles
+    assert 'diagonalUp="1"' in styles
+    assert '<diagonal style="dashed"' in styles
+    assert 'applyBorder="1"' in styles
+
+
+def test_writer_stage4_unknown_border_style_raises():
+    with zlsx.write() as w:
+        with pytest.raises(ValueError, match="border style"):
+            w.add_style(zlsx.Style(
+                border_left=zlsx.BorderSide(style="not-a-style"),
+            ))
+
+
 def test_writer_no_styles_xml_when_unused(tmp_path):
     """A writer that never calls add_style must produce a byte-identical
     output to v0.2.3 — no styles.xml entry in the archive. This is

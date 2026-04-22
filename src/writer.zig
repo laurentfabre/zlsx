@@ -112,6 +112,33 @@ const STYLES_TAIL: []const u8 = "</styleSheet>";
 
 // ─── Writer public API ───────────────────────────────────────────────
 
+/// OOXML border-side style enum. `.none` is the default (no side
+/// emitted); numeric tag values are part of the C ABI — append
+/// new entries, never reorder.
+pub const BorderStyle = enum(u8) {
+    none = 0,
+    thin = 1,
+    medium = 2,
+    dashed = 3,
+    dotted = 4,
+    thick = 5,
+    double = 6,
+    hair = 7,
+    medium_dashed = 8,
+    dash_dot = 9,
+    medium_dash_dot = 10,
+    dash_dot_dot = 11,
+    medium_dash_dot_dot = 12,
+    slant_dash_dot = 13,
+};
+
+/// One side of a cell border (left / right / top / bottom / diagonal).
+pub const BorderSide = struct {
+    style: BorderStyle = .none,
+    /// ARGB colour for the border line. Null = OOXML default (auto).
+    color_argb: ?u32 = null,
+};
+
 /// OOXML `<patternFill patternType="…"/>` values. `.none` is the
 /// default (no fill); numeric tag values are part of the C ABI —
 /// append new entries, never reorder.
@@ -187,7 +214,32 @@ pub const Style = struct {
     fill_fg_argb: ?u32 = null,
     /// Background (pattern backdrop) colour, ARGB packed 0xAARRGGBB. Null = OOXML default.
     fill_bg_argb: ?u32 = null,
+    /// Cell border sides. Defaults emit no side — set any of these
+    /// `style` fields to get a border. A style that touches any
+    /// border field (sides or diagonal flags) gets its own
+    /// `<border>` entry in xl/styles.xml.
+    border_left: BorderSide = .{},
+    border_right: BorderSide = .{},
+    border_top: BorderSide = .{},
+    border_bottom: BorderSide = .{},
+    border_diagonal: BorderSide = .{},
+    /// Draw the diagonal from the lower-left corner upward to the
+    /// upper-right. Requires `border_diagonal.style != .none` to
+    /// render.
+    diagonal_up: bool = false,
+    /// Draw the diagonal from the upper-left corner downward to the
+    /// lower-right. Same `border_diagonal.style` gates rendering.
+    diagonal_down: bool = false,
 };
+
+fn hasBorder(s: Style) bool {
+    return s.border_left.style != .none or
+        s.border_right.style != .none or
+        s.border_top.style != .none or
+        s.border_bottom.style != .none or
+        s.border_diagonal.style != .none or
+        s.diagonal_up or s.diagonal_down;
+}
 
 pub const Writer = struct {
     allocator: Allocator,
@@ -550,6 +602,13 @@ fn stylesEqual(a: Style, b: Style) bool {
     if (a.fill_pattern != b.fill_pattern) return false;
     if (a.fill_fg_argb != b.fill_fg_argb) return false;
     if (a.fill_bg_argb != b.fill_bg_argb) return false;
+    if (!std.meta.eql(a.border_left, b.border_left)) return false;
+    if (!std.meta.eql(a.border_right, b.border_right)) return false;
+    if (!std.meta.eql(a.border_top, b.border_top)) return false;
+    if (!std.meta.eql(a.border_bottom, b.border_bottom)) return false;
+    if (!std.meta.eql(a.border_diagonal, b.border_diagonal)) return false;
+    if (a.diagonal_up != b.diagonal_up) return false;
+    if (a.diagonal_down != b.diagonal_down) return false;
     // Content-compare font_name.
     if ((a.font_name == null) != (b.font_name == null)) return false;
     if (a.font_name) |an| {
@@ -636,7 +695,36 @@ fn emitStylesXml(
     }
     try buf.appendSlice(alloc, "</fills>");
 
-    try buf.appendSlice(alloc, STYLES_BORDERS);
+    // <borders>: default empty border at index 0, then one per style
+    // that touches any border field. Styles without borders keep
+    // borderId=0.
+    var border_ids = try alloc.alloc(u32, styles.len);
+    defer alloc.free(border_ids);
+    var next_user_border_id: u32 = 1;
+    for (styles, 0..) |s, i| {
+        if (hasBorder(s)) {
+            border_ids[i] = next_user_border_id;
+            next_user_border_id += 1;
+        } else {
+            border_ids[i] = 0;
+        }
+    }
+    try buf.print(alloc, "<borders count=\"{d}\">", .{next_user_border_id});
+    try buf.appendSlice(alloc, "<border><left/><right/><top/><bottom/><diagonal/></border>");
+    for (styles) |s| {
+        if (!hasBorder(s)) continue;
+        try buf.appendSlice(alloc, "<border");
+        if (s.diagonal_up) try buf.appendSlice(alloc, " diagonalUp=\"1\"");
+        if (s.diagonal_down) try buf.appendSlice(alloc, " diagonalDown=\"1\"");
+        try buf.appendSlice(alloc, ">");
+        try emitBorderSide(alloc, &buf, "left", s.border_left);
+        try emitBorderSide(alloc, &buf, "right", s.border_right);
+        try emitBorderSide(alloc, &buf, "top", s.border_top);
+        try emitBorderSide(alloc, &buf, "bottom", s.border_bottom);
+        try emitBorderSide(alloc, &buf, "diagonal", s.border_diagonal);
+        try buf.appendSlice(alloc, "</border>");
+    }
+    try buf.appendSlice(alloc, "</borders>");
     try buf.appendSlice(alloc, STYLES_CELL_STYLE_XFS);
 
     // <cellXfs>: default at index 0 + one per user style.
@@ -645,12 +733,14 @@ fn emitStylesXml(
     for (styles, 0..) |s, i| {
         const has_alignment = s.alignment_horizontal != .general or s.wrap_text;
         const fill_id = fill_ids[i];
+        const border_id = border_ids[i];
         try buf.print(
             alloc,
-            "<xf numFmtId=\"0\" fontId=\"{d}\" fillId=\"{d}\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"",
-            .{ i + 1, fill_id },
+            "<xf numFmtId=\"0\" fontId=\"{d}\" fillId=\"{d}\" borderId=\"{d}\" xfId=\"0\" applyFont=\"1\"",
+            .{ i + 1, fill_id, border_id },
         );
         if (fill_id != 0) try buf.appendSlice(alloc, " applyFill=\"1\"");
+        if (border_id != 0) try buf.appendSlice(alloc, " applyBorder=\"1\"");
         if (has_alignment) {
             try buf.appendSlice(alloc, " applyAlignment=\"1\"><alignment");
             if (s.alignment_horizontal != .general) {
@@ -681,6 +771,47 @@ fn hAlignName(a: HAlign) []const u8 {
         .center_continuous => "centerContinuous",
         .distributed => "distributed",
     };
+}
+
+fn borderStyleName(b: BorderStyle) []const u8 {
+    return switch (b) {
+        .none => "none",
+        .thin => "thin",
+        .medium => "medium",
+        .dashed => "dashed",
+        .dotted => "dotted",
+        .thick => "thick",
+        .double => "double",
+        .hair => "hair",
+        .medium_dashed => "mediumDashed",
+        .dash_dot => "dashDot",
+        .medium_dash_dot => "mediumDashDot",
+        .dash_dot_dot => "dashDotDot",
+        .medium_dash_dot_dot => "mediumDashDotDot",
+        .slant_dash_dot => "slantDashDot",
+    };
+}
+
+fn emitBorderSide(
+    alloc: Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    tag: []const u8,
+    side: BorderSide,
+) !void {
+    if (side.style == .none and side.color_argb == null) {
+        // Empty side — OOXML wants the element present but attribute-less.
+        try buf.print(alloc, "<{s}/>", .{tag});
+        return;
+    }
+    try buf.print(alloc, "<{s}", .{tag});
+    if (side.style != .none) {
+        try buf.print(alloc, " style=\"{s}\"", .{borderStyleName(side.style)});
+    }
+    if (side.color_argb) |c| {
+        try buf.print(alloc, "><color rgb=\"{X:0>8}\"/></{s}>", .{ c, tag });
+    } else {
+        try buf.appendSlice(alloc, "/>");
+    }
 }
 
 fn patternTypeName(p: PatternType) []const u8 {
@@ -971,6 +1102,77 @@ test "Writer: xml entities in strings are escaped" {
     defer rows.deinit();
     const r = (try rows.next()).?;
     try std.testing.expectEqualStrings("a<b & c>d \"e\" 'f'", r[0].string);
+}
+
+test "Writer: stage-4 border sides emit into styles.xml" {
+    const tmp_path = "/tmp/zlsx_writer_styles_borders.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+
+        // Thin black box on all 4 sides — the bread-and-butter table outline.
+        const box = try w.addStyle(.{
+            .border_left = .{ .style = .thin, .color_argb = 0xFF000000 },
+            .border_right = .{ .style = .thin, .color_argb = 0xFF000000 },
+            .border_top = .{ .style = .thin, .color_argb = 0xFF000000 },
+            .border_bottom = .{ .style = .thin, .color_argb = 0xFF000000 },
+        });
+        // Bottom-only thick red + diagonal up.
+        const fancy = try w.addStyle(.{
+            .border_bottom = .{ .style = .thick, .color_argb = 0xFFFF0000 },
+            .border_diagonal = .{ .style = .dashed },
+            .diagonal_up = true,
+        });
+        const plain = try w.addStyle(.{ .font_bold = true });
+        // Dedup.
+        const box_again = try w.addStyle(.{
+            .border_left = .{ .style = .thin, .color_argb = 0xFF000000 },
+            .border_right = .{ .style = .thin, .color_argb = 0xFF000000 },
+            .border_top = .{ .style = .thin, .color_argb = 0xFF000000 },
+            .border_bottom = .{ .style = .thin, .color_argb = 0xFF000000 },
+        });
+        try std.testing.expectEqual(box, box_again);
+        try std.testing.expect(fancy != box);
+        try std.testing.expect(plain != box);
+
+        var sheet = try w.addSheet("S");
+        try sheet.writeRowStyled(
+            &.{ .{ .string = "boxed" }, .{ .string = "fancy" }, .{ .string = "plain" } },
+            &.{ box, fancy, plain },
+        );
+        try w.save(tmp_path);
+    }
+
+    const styles_xml = blk: {
+        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        var fbuf: [4096]u8 = undefined;
+        var fr = file.reader(&fbuf);
+        var iter = try std.zip.Iterator.init(&fr);
+        var filename_buf: [64]u8 = undefined;
+        while (try iter.next()) |entry| {
+            if (entry.filename_len > filename_buf.len) continue;
+            try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            const filename = filename_buf[0..entry.filename_len];
+            try fr.interface.readSliceAll(filename);
+            if (std.mem.eql(u8, filename, "xl/styles.xml")) {
+                break :blk try extractEntryForTest(std.testing.allocator, entry, &fr);
+            }
+        }
+        return error.StylesXmlNotFound;
+    };
+    defer std.testing.allocator.free(styles_xml);
+
+    // Default border at 0 + 2 user borders (plain has none).
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "<borders count=\"3\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "<left style=\"thin\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "<bottom style=\"thick\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "<color rgb=\"FFFF0000\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "diagonalUp=\"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "<diagonal style=\"dashed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "applyBorder=\"1\"") != null);
 }
 
 test "Writer: stage-3 fill fields emit into styles.xml" {

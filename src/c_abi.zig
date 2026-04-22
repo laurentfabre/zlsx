@@ -680,25 +680,47 @@ export fn zlsx_writer_add_style(
     return 0;
 }
 
-/// Extended style spec passed across the C ABI. `flags` distinguishes
-/// "unset (default)" from "explicitly 0" for fields where C has no
-/// natural `Option<>` type:
-///   bit 0  — font_size set
-///   bit 1  — font_color set
-///   bit 2  — fill_fg_argb set (stage 3b-3)
-///   bit 3  — fill_bg_argb set (stage 3b-3)
+/// Extended style spec passed across the C ABI. `flags` (stage 1-3)
+/// and `flags2` (stage 4) distinguish "unset (default)" from
+/// "explicitly 0" for fields where C has no natural `Option<>`:
+///
+///   flags bit 0  — font_size set
+///   flags bit 1  — font_color set
+///   flags bit 2  — fill_fg_argb set
+///   flags bit 3  — fill_bg_argb set
+///   flags2 bit 0 — border_left_color_argb set
+///   flags2 bit 1 — border_right_color_argb set
+///   flags2 bit 2 — border_top_color_argb set
+///   flags2 bit 3 — border_bottom_color_argb set
+///   flags2 bit 4 — border_diagonal_color_argb set
 pub const CStyle = extern struct {
     font_bold: u8,
     font_italic: u8,
     alignment_horizontal: u8, // HAlign enum value 0-7
     wrap_text: u8,
     flags: u8,
-    fill_pattern: u8, // PatternType enum value 0..=18 (stage 3b-3)
-    _pad0: [2]u8,
+    fill_pattern: u8, // PatternType enum value 0..=18
+    flags2: u8, // stage 4 flag bits for border colors
+    _pad0: [1]u8,
     font_size: f32,
     font_color_argb: u32,
     fill_fg_argb: u32, // used iff flags & 0x04
     fill_bg_argb: u32, // used iff flags & 0x08
+    // Border sides (stage 4). Each side has an 8-bit BorderStyle value
+    // and an ARGB colour (used iff the corresponding flags2 bit is set).
+    border_left_style: u8,
+    border_right_style: u8,
+    border_top_style: u8,
+    border_bottom_style: u8,
+    border_diagonal_style: u8,
+    diagonal_up: u8,
+    diagonal_down: u8,
+    _pad1: [1]u8,
+    border_left_color_argb: u32,
+    border_right_color_argb: u32,
+    border_top_color_argb: u32,
+    border_bottom_color_argb: u32,
+    border_diagonal_color_argb: u32,
     font_name_ptr: [*]const u8,
     font_name_len: usize,
 };
@@ -707,6 +729,11 @@ const FONT_SIZE_SET: u8 = 1 << 0;
 const FONT_COLOR_SET: u8 = 1 << 1;
 const FILL_FG_SET: u8 = 1 << 2;
 const FILL_BG_SET: u8 = 1 << 3;
+const BORDER_LEFT_COLOR_SET: u8 = 1 << 0;
+const BORDER_RIGHT_COLOR_SET: u8 = 1 << 1;
+const BORDER_TOP_COLOR_SET: u8 = 1 << 2;
+const BORDER_BOTTOM_COLOR_SET: u8 = 1 << 3;
+const BORDER_DIAGONAL_COLOR_SET: u8 = 1 << 4;
 
 /// Register a style with all stage-2 fields. Pass a NULL/zero
 /// `font_name_*` plus cleared flag bits to opt out of any field.
@@ -751,6 +778,26 @@ export fn zlsx_writer_add_style_ex(
         return -1;
     }
     style.fill_pattern = @enumFromInt(spec.fill_pattern);
+
+    // Stage-4 border fields. Side styles map 0..=13 onto BorderStyle.
+    const sides: [5]struct { tag: u8, flag: u8, color: u32, out: *writer_mod.BorderSide } = .{
+        .{ .tag = spec.border_left_style, .flag = BORDER_LEFT_COLOR_SET, .color = spec.border_left_color_argb, .out = &style.border_left },
+        .{ .tag = spec.border_right_style, .flag = BORDER_RIGHT_COLOR_SET, .color = spec.border_right_color_argb, .out = &style.border_right },
+        .{ .tag = spec.border_top_style, .flag = BORDER_TOP_COLOR_SET, .color = spec.border_top_color_argb, .out = &style.border_top },
+        .{ .tag = spec.border_bottom_style, .flag = BORDER_BOTTOM_COLOR_SET, .color = spec.border_bottom_color_argb, .out = &style.border_bottom },
+        .{ .tag = spec.border_diagonal_style, .flag = BORDER_DIAGONAL_COLOR_SET, .color = spec.border_diagonal_color_argb, .out = &style.border_diagonal },
+    };
+    for (sides) |side| {
+        if (side.tag > 13) {
+            writeError(err_buf, err_buf_len, "BadBorderStyle");
+            return -1;
+        }
+        side.out.style = @enumFromInt(side.tag);
+        if (spec.flags2 & side.flag != 0) side.out.color_argb = side.color;
+    }
+    style.diagonal_up = spec.diagonal_up != 0;
+    style.diagonal_down = spec.diagonal_down != 0;
+
     if (spec.font_name_len > 0) {
         style.font_name = spec.font_name_ptr[0..spec.font_name_len];
     }

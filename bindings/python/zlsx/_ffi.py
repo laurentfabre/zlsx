@@ -232,11 +232,25 @@ class CStyle(ctypes.Structure):
         ("wrap_text", ctypes.c_uint8),
         ("flags", ctypes.c_uint8),
         ("fill_pattern", ctypes.c_uint8),
-        ("_pad0", ctypes.c_ubyte * 2),
+        ("flags2", ctypes.c_uint8),
+        ("_pad0", ctypes.c_ubyte * 1),
         ("font_size", ctypes.c_float),
         ("font_color_argb", ctypes.c_uint32),
         ("fill_fg_argb", ctypes.c_uint32),
         ("fill_bg_argb", ctypes.c_uint32),
+        ("border_left_style", ctypes.c_uint8),
+        ("border_right_style", ctypes.c_uint8),
+        ("border_top_style", ctypes.c_uint8),
+        ("border_bottom_style", ctypes.c_uint8),
+        ("border_diagonal_style", ctypes.c_uint8),
+        ("diagonal_up", ctypes.c_uint8),
+        ("diagonal_down", ctypes.c_uint8),
+        ("_pad1", ctypes.c_ubyte * 1),
+        ("border_left_color_argb", ctypes.c_uint32),
+        ("border_right_color_argb", ctypes.c_uint32),
+        ("border_top_color_argb", ctypes.c_uint32),
+        ("border_bottom_color_argb", ctypes.c_uint32),
+        ("border_diagonal_color_argb", ctypes.c_uint32),
         ("font_name_ptr", ctypes.POINTER(ctypes.c_ubyte)),
         ("font_name_len", ctypes.c_size_t),
     ]
@@ -246,6 +260,13 @@ FONT_SIZE_SET = 0x01
 FONT_COLOR_SET = 0x02
 FILL_FG_SET = 0x04
 FILL_BG_SET = 0x08
+
+# flags2 bits
+BORDER_LEFT_COLOR_SET = 0x01
+BORDER_RIGHT_COLOR_SET = 0x02
+BORDER_TOP_COLOR_SET = 0x04
+BORDER_BOTTOM_COLOR_SET = 0x08
+BORDER_DIAGONAL_COLOR_SET = 0x10
 
 _HAS_STYLES_EX = hasattr(lib, "zlsx_writer_add_style_ex")
 if _HAS_STYLES_EX:

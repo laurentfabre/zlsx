@@ -227,26 +227,33 @@ int32_t zlsx_writer_add_style(
     uint8_t       * err_buf,
     size_t          err_buf_len);
 
-/* Stage-2 + stage-3 style fields (added 0.2.4, ABI v1 additive).
+/* Stage 2-4 style fields (added 0.2.4, ABI v1 additive).
  *
- * `flags` bits let callers distinguish "unset (default)" from
- * explicitly-0 values for fields where C has no natural Option<> type:
- *   bit 0 — font_size
- *   bit 1 — font_color
- *   bit 2 — fill_fg_argb
- *   bit 3 — fill_bg_argb
+ * `flags` (stage 1-3) + `flags2` (stage 4) let callers distinguish
+ * "unset (default)" from explicitly-0 values for fields where C has
+ * no natural Option<> type:
+ *
+ *   flags  bit 0  — font_size
+ *   flags  bit 1  — font_color
+ *   flags  bit 2  — fill_fg_argb
+ *   flags  bit 3  — fill_bg_argb
+ *   flags2 bit 0  — border_left_color_argb
+ *   flags2 bit 1  — border_right_color_argb
+ *   flags2 bit 2  — border_top_color_argb
+ *   flags2 bit 3  — border_bottom_color_argb
+ *   flags2 bit 4  — border_diagonal_color_argb
  *
  * `alignment_horizontal` enum:
  *   0=general, 1=left, 2=center, 3=right, 4=fill, 5=justify,
  *   6=centerContinuous, 7=distributed.
- * `fill_pattern` enum (OOXML patternType):
- *   0=none, 1=solid, 2=gray125, 3=gray0625, 4=darkGray, 5=mediumGray,
- *   6=lightGray, 7=darkHorizontal, 8=darkVertical, 9=darkDown,
- *   10=darkUp, 11=darkGrid, 12=darkTrellis, 13=lightHorizontal,
- *   14=lightVertical, 15=lightDown, 16=lightUp, 17=lightGrid,
- *   18=lightTrellis.
- * Unknown enum values return -1 with err="BadAlignmentValue" or
- * "BadFillPattern". */
+ * `fill_pattern` enum: 0=none, 1=solid, 2=gray125, 3=gray0625,
+ *   4=darkGray, 5=mediumGray, 6=lightGray, 7..=12 dark*, 13..=18 light*.
+ * `border_*_style` enum: 0=none, 1=thin, 2=medium, 3=dashed, 4=dotted,
+ *   5=thick, 6=double, 7=hair, 8=mediumDashed, 9=dashDot,
+ *   10=mediumDashDot, 11=dashDotDot, 12=mediumDashDotDot,
+ *   13=slantDashDot.
+ * Unknown enum values return -1 with err="BadAlignmentValue",
+ * "BadFillPattern", or "BadBorderStyle". */
 typedef struct {
     uint8_t         font_bold;            /* 0 or 1 */
     uint8_t         font_italic;          /* 0 or 1 */
@@ -254,19 +261,38 @@ typedef struct {
     uint8_t         wrap_text;            /* 0 or 1 */
     uint8_t         flags;
     uint8_t         fill_pattern;         /* 0..=18 */
-    uint8_t         _pad0[2];
+    uint8_t         flags2;               /* stage-4 flag bits */
+    uint8_t         _pad0[1];
     float           font_size;            /* used iff flags & 0x01 */
     uint32_t        font_color_argb;      /* used iff flags & 0x02 */
     uint32_t        fill_fg_argb;         /* used iff flags & 0x04 */
     uint32_t        fill_bg_argb;         /* used iff flags & 0x08 */
+    uint8_t         border_left_style;
+    uint8_t         border_right_style;
+    uint8_t         border_top_style;
+    uint8_t         border_bottom_style;
+    uint8_t         border_diagonal_style;
+    uint8_t         diagonal_up;          /* 0 or 1 */
+    uint8_t         diagonal_down;        /* 0 or 1 */
+    uint8_t         _pad1[1];
+    uint32_t        border_left_color_argb;
+    uint32_t        border_right_color_argb;
+    uint32_t        border_top_color_argb;
+    uint32_t        border_bottom_color_argb;
+    uint32_t        border_diagonal_color_argb;
     const uint8_t * font_name_ptr;        /* NULL or unused iff font_name_len == 0 */
     size_t          font_name_len;
 } zlsx_style_t;
 
-#define ZLSX_FONT_SIZE_SET  0x01u
-#define ZLSX_FONT_COLOR_SET 0x02u
-#define ZLSX_FILL_FG_SET    0x04u
-#define ZLSX_FILL_BG_SET    0x08u
+#define ZLSX_FONT_SIZE_SET              0x01u
+#define ZLSX_FONT_COLOR_SET             0x02u
+#define ZLSX_FILL_FG_SET                0x04u
+#define ZLSX_FILL_BG_SET                0x08u
+#define ZLSX_BORDER_LEFT_COLOR_SET      0x01u /* flags2 bit 0 */
+#define ZLSX_BORDER_RIGHT_COLOR_SET     0x02u /* flags2 bit 1 */
+#define ZLSX_BORDER_TOP_COLOR_SET       0x04u /* flags2 bit 2 */
+#define ZLSX_BORDER_BOTTOM_COLOR_SET    0x08u /* flags2 bit 3 */
+#define ZLSX_BORDER_DIAGONAL_COLOR_SET  0x10u /* flags2 bit 4 */
 
 int32_t zlsx_writer_add_style_ex(
     zlsx_writer_t      * writer,

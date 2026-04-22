@@ -43,6 +43,7 @@ __all__ = [
     "Writer",
     "SheetWriter",
     "Style",
+    "BorderSide",
     "ZlsxError",
 ]
 
@@ -53,7 +54,7 @@ __all__ = [
 # fields additive — openpyxl-parity fields land in subsequent releases
 # (alignment, fills, borders, number formats, etc).
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 
@@ -66,6 +67,11 @@ PatternTypeLiteral = Literal[
     "lightGray", "darkHorizontal", "darkVertical", "darkDown", "darkUp",
     "darkGrid", "darkTrellis", "lightHorizontal", "lightVertical",
     "lightDown", "lightUp", "lightGrid", "lightTrellis",
+]
+BorderStyleLiteral = Literal[
+    "none", "thin", "medium", "dashed", "dotted", "thick", "double",
+    "hair", "mediumDashed", "dashDot", "mediumDashDot", "dashDotDot",
+    "mediumDashDotDot", "slantDashDot",
 ]
 
 _HALIGN_VALUES = {
@@ -81,6 +87,21 @@ _PATTERN_VALUES = {
     "lightHorizontal": 13, "lightVertical": 14, "lightDown": 15,
     "lightUp": 16, "lightGrid": 17, "lightTrellis": 18,
 }
+
+_BORDER_STYLE_VALUES = {
+    "none": 0, "thin": 1, "medium": 2, "dashed": 3, "dotted": 4,
+    "thick": 5, "double": 6, "hair": 7, "mediumDashed": 8, "dashDot": 9,
+    "mediumDashDot": 10, "dashDotDot": 11, "mediumDashDotDot": 12,
+    "slantDashDot": 13,
+}
+
+
+@dataclass(frozen=True)
+class BorderSide:
+    """A single edge of a cell border. ``style="none"`` means no line;
+    ``color_argb`` is optional (None = OOXML default / auto)."""
+    style: BorderStyleLiteral = "none"
+    color_argb: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +130,16 @@ class Style:
     fill_pattern: PatternTypeLiteral = "none"
     fill_fg_argb: Optional[int] = None
     fill_bg_argb: Optional[int] = None
+    # Borders — each side is a BorderSide; defaults emit nothing.
+    # ``border_diagonal`` plus ``diagonal_up`` / ``diagonal_down`` control
+    # the diagonal line (style gates rendering, the flags choose direction).
+    border_left: "BorderSide" = field(default_factory=BorderSide)
+    border_right: "BorderSide" = field(default_factory=BorderSide)
+    border_top: "BorderSide" = field(default_factory=BorderSide)
+    border_bottom: "BorderSide" = field(default_factory=BorderSide)
+    border_diagonal: "BorderSide" = field(default_factory=BorderSide)
+    diagonal_up: bool = False
+    diagonal_down: bool = False
 
 
 class ZlsxError(RuntimeError):
@@ -498,6 +529,16 @@ class Writer:
                 "(requires 0.2.4+); upgrade libzlsx"
             )
 
+        has_border = (
+            style.border_left.style != "none"
+            or style.border_right.style != "none"
+            or style.border_top.style != "none"
+            or style.border_bottom.style != "none"
+            or style.border_diagonal.style != "none"
+            or style.diagonal_up
+            or style.diagonal_down
+        )
+
         needs_ex = (
             style.font_size is not None
             or style.font_name is not None
@@ -507,6 +548,7 @@ class Writer:
             or style.fill_pattern != "none"
             or style.fill_fg_argb is not None
             or style.fill_bg_argb is not None
+            or has_border
         )
 
         out_idx = ctypes.c_uint32(0)
@@ -565,6 +607,23 @@ class Writer:
                 f"unknown fill_pattern: {style.fill_pattern!r}"
             )
 
+        def _bstyle(side: BorderSide) -> int:
+            if side.style not in _BORDER_STYLE_VALUES:
+                raise ValueError(f"unknown border style: {side.style!r}")
+            return _BORDER_STYLE_VALUES[side.style]
+
+        flags2 = 0
+        if style.border_left.color_argb is not None:
+            flags2 |= _ffi.BORDER_LEFT_COLOR_SET
+        if style.border_right.color_argb is not None:
+            flags2 |= _ffi.BORDER_RIGHT_COLOR_SET
+        if style.border_top.color_argb is not None:
+            flags2 |= _ffi.BORDER_TOP_COLOR_SET
+        if style.border_bottom.color_argb is not None:
+            flags2 |= _ffi.BORDER_BOTTOM_COLOR_SET
+        if style.border_diagonal.color_argb is not None:
+            flags2 |= _ffi.BORDER_DIAGONAL_COLOR_SET
+
         spec = _ffi.CStyle(
             font_bold=1 if style.font_bold else 0,
             font_italic=1 if style.font_italic else 0,
@@ -572,10 +631,23 @@ class Writer:
             wrap_text=1 if style.wrap_text else 0,
             flags=flags,
             fill_pattern=_PATTERN_VALUES[style.fill_pattern],
+            flags2=flags2,
             font_size=float(style.font_size or 0.0),
             font_color_argb=int(style.font_color_argb or 0),
             fill_fg_argb=int(style.fill_fg_argb or 0),
             fill_bg_argb=int(style.fill_bg_argb or 0),
+            border_left_style=_bstyle(style.border_left),
+            border_right_style=_bstyle(style.border_right),
+            border_top_style=_bstyle(style.border_top),
+            border_bottom_style=_bstyle(style.border_bottom),
+            border_diagonal_style=_bstyle(style.border_diagonal),
+            diagonal_up=1 if style.diagonal_up else 0,
+            diagonal_down=1 if style.diagonal_down else 0,
+            border_left_color_argb=int(style.border_left.color_argb or 0),
+            border_right_color_argb=int(style.border_right.color_argb or 0),
+            border_top_color_argb=int(style.border_top.color_argb or 0),
+            border_bottom_color_argb=int(style.border_bottom.color_argb or 0),
+            border_diagonal_color_argb=int(style.border_diagonal.color_argb or 0),
             font_name_ptr=ctypes.cast(name_buf, ctypes.POINTER(ctypes.c_ubyte)),
             font_name_len=len(name_bytes),
         )
