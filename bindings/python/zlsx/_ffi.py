@@ -311,6 +311,44 @@ if _HAS_STYLES_EX:
     ]
     lib.zlsx_writer_add_style_ex.restype = ctypes.c_int32
 
+
+# ─── CStyle layout guard ──────────────────────────────────────────────
+#
+# Matches Zig's `comptime` assertion in src/c_abi.zig. If either side
+# reorders a field or changes padding, one binding will silently corrupt
+# the other. Catch that at import time with a clear error that points
+# the reader at both sides.
+
+_EXPECTED_CSTYLE_SIZE_64 = 88
+_EXPECTED_CSTYLE_SIZE_32 = 68
+_actual_cstyle_size = ctypes.sizeof(CStyle)
+if _actual_cstyle_size not in (_EXPECTED_CSTYLE_SIZE_64, _EXPECTED_CSTYLE_SIZE_32):
+    raise ImportError(
+        f"CStyle layout drift: expected {_EXPECTED_CSTYLE_SIZE_64} (64-bit) or "
+        f"{_EXPECTED_CSTYLE_SIZE_32} (32-bit), got {_actual_cstyle_size}. "
+        "bindings/python/zlsx/_ffi.py's CStyle._fields_ must match "
+        "src/c_abi.zig's `extern struct CStyle` exactly."
+    )
+
+# Load-bearing field offsets — anything else the Zig comptime assertion
+# pins, we pin here too.
+for _name, _expected in [
+    ("font_size", 8),
+    ("font_color_argb", 12),
+    ("fill_fg_argb", 16),
+    ("fill_bg_argb", 20),
+    ("border_left_style", 24),
+    ("diagonal_down", 30),
+    ("border_left_color_argb", 32),
+    ("border_diagonal_color_argb", 48),
+]:
+    _got = getattr(CStyle, _name).offset
+    if _got != _expected:
+        raise ImportError(
+            f"CStyle.{_name} offset drift: expected {_expected}, got {_got}"
+        )
+del _name, _expected, _got, _actual_cstyle_size
+
 # ─── ABI version check ────────────────────────────────────────────────
 
 EXPECTED_ABI_VERSION = 1

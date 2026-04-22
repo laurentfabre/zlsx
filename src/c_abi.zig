@@ -739,6 +739,35 @@ const BORDER_TOP_COLOR_SET: u8 = 1 << 2;
 const BORDER_BOTTOM_COLOR_SET: u8 = 1 << 3;
 const BORDER_DIAGONAL_COLOR_SET: u8 = 1 << 4;
 
+// ABI layout guard — the Python binding's ctypes.Structure mirrors this
+// struct field-for-field, including Zig's implicit padding between
+// `border_diagonal_color_argb` (u32 at offset 48) and `font_name_ptr`
+// (pointer needing 8-byte alignment → padded to offset 56). A silent
+// drift (say, adding a u32 field in the middle without a matching
+// ctypes entry) would corrupt every add_style_ex call from Python.
+// Catch it at build time.
+comptime {
+    const expected_size_64: usize = 88;
+    const expected_size_32: usize = 68;
+    const actual = @sizeOf(CStyle);
+    if (actual != expected_size_64 and actual != expected_size_32) {
+        @compileError(std.fmt.comptimePrint(
+            "CStyle layout drift: expected 88 (64-bit) or 68 (32-bit), got {d} — update bindings/python/zlsx/_ffi.py's CStyle._fields_ in lockstep",
+            .{actual},
+        ));
+    }
+    // Offsets that the Python binding depends on — any re-ordering
+    // makes these fail.
+    std.debug.assert(@offsetOf(CStyle, "font_size") == 8);
+    std.debug.assert(@offsetOf(CStyle, "font_color_argb") == 12);
+    std.debug.assert(@offsetOf(CStyle, "fill_fg_argb") == 16);
+    std.debug.assert(@offsetOf(CStyle, "fill_bg_argb") == 20);
+    std.debug.assert(@offsetOf(CStyle, "border_left_style") == 24);
+    std.debug.assert(@offsetOf(CStyle, "diagonal_down") == 30);
+    std.debug.assert(@offsetOf(CStyle, "border_left_color_argb") == 32);
+    std.debug.assert(@offsetOf(CStyle, "border_diagonal_color_argb") == 48);
+}
+
 /// Register a style with all stage-2 fields. Pass a NULL/zero
 /// `font_name_*` plus cleared flag bits to opt out of any field.
 /// The ABI is additive on top of zlsx_writer_add_style — existing
