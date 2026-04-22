@@ -227,28 +227,46 @@ int32_t zlsx_writer_add_style(
     uint8_t       * err_buf,
     size_t          err_buf_len);
 
-/* Stage-2 style fields (added 0.2.4, ABI v1 compatible).
+/* Stage-2 + stage-3 style fields (added 0.2.4, ABI v1 additive).
  *
- * `flags` uses bit 0 = font_size_set, bit 1 = font_color_set so callers
- * can distinguish "unset (default)" from explicitly-0 values. Alignment
- * uses a compact enum (0 = general / 1 = left / 2 = center / 3 = right /
- * 4 = fill / 5 = justify / 6 = centerContinuous / 7 = distributed).
- * Unknown alignment values return -1 with err="BadAlignmentValue". */
+ * `flags` bits let callers distinguish "unset (default)" from
+ * explicitly-0 values for fields where C has no natural Option<> type:
+ *   bit 0 — font_size
+ *   bit 1 — font_color
+ *   bit 2 — fill_fg_argb
+ *   bit 3 — fill_bg_argb
+ *
+ * `alignment_horizontal` enum:
+ *   0=general, 1=left, 2=center, 3=right, 4=fill, 5=justify,
+ *   6=centerContinuous, 7=distributed.
+ * `fill_pattern` enum (OOXML patternType):
+ *   0=none, 1=solid, 2=gray125, 3=gray0625, 4=darkGray, 5=mediumGray,
+ *   6=lightGray, 7=darkHorizontal, 8=darkVertical, 9=darkDown,
+ *   10=darkUp, 11=darkGrid, 12=darkTrellis, 13=lightHorizontal,
+ *   14=lightVertical, 15=lightDown, 16=lightUp, 17=lightGrid,
+ *   18=lightTrellis.
+ * Unknown enum values return -1 with err="BadAlignmentValue" or
+ * "BadFillPattern". */
 typedef struct {
     uint8_t         font_bold;            /* 0 or 1 */
     uint8_t         font_italic;          /* 0 or 1 */
     uint8_t         alignment_horizontal; /* 0..7 */
     uint8_t         wrap_text;            /* 0 or 1 */
     uint8_t         flags;
-    uint8_t         _pad0[3];
+    uint8_t         fill_pattern;         /* 0..=18 */
+    uint8_t         _pad0[2];
     float           font_size;            /* used iff flags & 0x01 */
     uint32_t        font_color_argb;      /* used iff flags & 0x02 */
+    uint32_t        fill_fg_argb;         /* used iff flags & 0x04 */
+    uint32_t        fill_bg_argb;         /* used iff flags & 0x08 */
     const uint8_t * font_name_ptr;        /* NULL or unused iff font_name_len == 0 */
     size_t          font_name_len;
 } zlsx_style_t;
 
 #define ZLSX_FONT_SIZE_SET  0x01u
 #define ZLSX_FONT_COLOR_SET 0x02u
+#define ZLSX_FILL_FG_SET    0x04u
+#define ZLSX_FILL_BG_SET    0x08u
 
 int32_t zlsx_writer_add_style_ex(
     zlsx_writer_t      * writer,

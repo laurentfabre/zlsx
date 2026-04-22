@@ -293,6 +293,49 @@ def test_writer_stage2_invalid_inputs():
             w.add_style(zlsx.Style(alignment_horizontal="not-a-real-alignment"))
 
 
+def test_writer_stage3_fills(tmp_path):
+    """Stage-3 fill fields (pattern + fg/bg colors) land in styles.xml."""
+    import zipfile
+
+    out = tmp_path / "fills.xlsx"
+    with zlsx.write(out) as w:
+        yellow = w.add_style(zlsx.Style(
+            fill_pattern="solid",
+            fill_fg_argb=0xFFFFFF00,
+        ))
+        striped = w.add_style(zlsx.Style(
+            fill_pattern="darkHorizontal",
+            fill_fg_argb=0xFF0000FF,
+            fill_bg_argb=0xFFFFFFFF,
+        ))
+        # Dedup same spec.
+        again = w.add_style(zlsx.Style(
+            fill_pattern="solid",
+            fill_fg_argb=0xFFFFFF00,
+        ))
+        assert yellow == again
+        assert striped != yellow
+
+        sheet = w.add_sheet("S")
+        sheet.write_row(["a", "b"], styles=[yellow, striped])
+
+    with zipfile.ZipFile(out) as z:
+        styles = z.read("xl/styles.xml").decode("utf-8")
+
+    assert 'patternType="solid"' in styles
+    assert '<fgColor rgb="FFFFFF00"/>' in styles
+    assert 'patternType="darkHorizontal"' in styles
+    assert '<fgColor rgb="FF0000FF"/>' in styles
+    assert '<bgColor rgb="FFFFFFFF"/>' in styles
+    assert 'applyFill="1"' in styles
+
+
+def test_writer_stage3_unknown_pattern_raises():
+    with zlsx.write() as w:
+        with pytest.raises(ValueError, match="fill_pattern"):
+            w.add_style(zlsx.Style(fill_pattern="not-a-pattern"))
+
+
 def test_writer_no_styles_xml_when_unused(tmp_path):
     """A writer that never calls add_style must produce a byte-identical
     output to v0.2.3 — no styles.xml entry in the archive. This is

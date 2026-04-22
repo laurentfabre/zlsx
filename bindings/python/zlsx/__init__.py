@@ -61,10 +61,25 @@ HAlignLiteral = Literal[
     "general", "left", "center", "right", "fill",
     "justify", "centerContinuous", "distributed",
 ]
+PatternTypeLiteral = Literal[
+    "none", "solid", "gray125", "gray0625", "darkGray", "mediumGray",
+    "lightGray", "darkHorizontal", "darkVertical", "darkDown", "darkUp",
+    "darkGrid", "darkTrellis", "lightHorizontal", "lightVertical",
+    "lightDown", "lightUp", "lightGrid", "lightTrellis",
+]
 
 _HALIGN_VALUES = {
     "general": 0, "left": 1, "center": 2, "right": 3,
     "fill": 4, "justify": 5, "centerContinuous": 6, "distributed": 7,
+}
+
+_PATTERN_VALUES = {
+    "none": 0, "solid": 1, "gray125": 2, "gray0625": 3,
+    "darkGray": 4, "mediumGray": 5, "lightGray": 6,
+    "darkHorizontal": 7, "darkVertical": 8, "darkDown": 9, "darkUp": 10,
+    "darkGrid": 11, "darkTrellis": 12,
+    "lightHorizontal": 13, "lightVertical": 14, "lightDown": 15,
+    "lightUp": 16, "lightGrid": 17, "lightTrellis": 18,
 }
 
 
@@ -76,8 +91,12 @@ class Style:
 
     Fields mirror the Zig Style struct. ``None`` means "unset (OOXML
     default)"; concrete values emit the corresponding XML attributes.
-    ``font_color_argb`` is packed ARGB (0xAARRGGBB); for fully opaque
+    Colour fields (``font_color_argb``, ``fill_fg_argb``,
+    ``fill_bg_argb``) are packed ARGB (0xAARRGGBB); for fully opaque
     red use ``0xFFFF0000``.
+
+    For a solid yellow highlight: ``Style(fill_pattern="solid",
+    fill_fg_argb=0xFFFFFF00)``.
     """
 
     font_bold: bool = False
@@ -87,6 +106,9 @@ class Style:
     font_color_argb: Optional[int] = None
     alignment_horizontal: HAlignLiteral = "general"
     wrap_text: bool = False
+    fill_pattern: PatternTypeLiteral = "none"
+    fill_fg_argb: Optional[int] = None
+    fill_bg_argb: Optional[int] = None
 
 
 class ZlsxError(RuntimeError):
@@ -482,6 +504,9 @@ class Writer:
             or style.font_color_argb is not None
             or style.alignment_horizontal != "general"
             or style.wrap_text
+            or style.fill_pattern != "none"
+            or style.fill_fg_argb is not None
+            or style.fill_bg_argb is not None
         )
 
         out_idx = ctypes.c_uint32(0)
@@ -510,6 +535,10 @@ class Writer:
             flags |= _ffi.FONT_SIZE_SET
         if style.font_color_argb is not None:
             flags |= _ffi.FONT_COLOR_SET
+        if style.fill_fg_argb is not None:
+            flags |= _ffi.FILL_FG_SET
+        if style.fill_bg_argb is not None:
+            flags |= _ffi.FILL_BG_SET
 
         # Distinguish "unset" (None) from "empty string" — the latter
         # is invalid and must reach the Zig side as font_name_len=0
@@ -531,6 +560,10 @@ class Writer:
             raise ValueError(
                 f"unknown alignment_horizontal: {style.alignment_horizontal!r}"
             )
+        if style.fill_pattern not in _PATTERN_VALUES:
+            raise ValueError(
+                f"unknown fill_pattern: {style.fill_pattern!r}"
+            )
 
         spec = _ffi.CStyle(
             font_bold=1 if style.font_bold else 0,
@@ -538,8 +571,11 @@ class Writer:
             alignment_horizontal=_HALIGN_VALUES[style.alignment_horizontal],
             wrap_text=1 if style.wrap_text else 0,
             flags=flags,
+            fill_pattern=_PATTERN_VALUES[style.fill_pattern],
             font_size=float(style.font_size or 0.0),
             font_color_argb=int(style.font_color_argb or 0),
+            fill_fg_argb=int(style.fill_fg_argb or 0),
+            fill_bg_argb=int(style.fill_bg_argb or 0),
             font_name_ptr=ctypes.cast(name_buf, ctypes.POINTER(ctypes.c_ubyte)),
             font_name_len=len(name_bytes),
         )

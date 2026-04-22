@@ -112,6 +112,31 @@ const STYLES_TAIL: []const u8 = "</styleSheet>";
 
 // ─── Writer public API ───────────────────────────────────────────────
 
+/// OOXML `<patternFill patternType="…"/>` values. `.none` is the
+/// default (no fill); numeric tag values are part of the C ABI —
+/// append new entries, never reorder.
+pub const PatternType = enum(u8) {
+    none = 0,
+    solid = 1,
+    gray125 = 2,
+    gray0625 = 3,
+    dark_gray = 4,
+    medium_gray = 5,
+    light_gray = 6,
+    dark_horizontal = 7,
+    dark_vertical = 8,
+    dark_down = 9,
+    dark_up = 10,
+    dark_grid = 11,
+    dark_trellis = 12,
+    light_horizontal = 13,
+    light_vertical = 14,
+    light_down = 15,
+    light_up = 16,
+    light_grid = 17,
+    light_trellis = 18,
+};
+
 /// Horizontal alignment for a cell style. `.general` is the OOXML
 /// default (no `<alignment>` element emitted); nonzero values emit
 /// `<alignment horizontal="…"/>`. Numeric tag values are part of the
@@ -153,6 +178,15 @@ pub const Style = struct {
     font_color_argb: ?u32 = null,
     alignment_horizontal: HAlign = .general,
     wrap_text: bool = false,
+    /// `.none` emits no fill (style points at fillId=0). Any other
+    /// value emits a `<patternFill>` element. For "solid" highlights
+    /// set `.fill_pattern = .solid` plus `.fill_fg_argb` to the
+    /// desired ARGB colour.
+    fill_pattern: PatternType = .none,
+    /// Foreground (pattern) colour, ARGB packed 0xAARRGGBB. Null = OOXML default.
+    fill_fg_argb: ?u32 = null,
+    /// Background (pattern backdrop) colour, ARGB packed 0xAARRGGBB. Null = OOXML default.
+    fill_bg_argb: ?u32 = null,
 };
 
 pub const Writer = struct {
@@ -513,6 +547,9 @@ fn stylesEqual(a: Style, b: Style) bool {
     if (a.font_color_argb != b.font_color_argb) return false;
     if (a.alignment_horizontal != b.alignment_horizontal) return false;
     if (a.wrap_text != b.wrap_text) return false;
+    if (a.fill_pattern != b.fill_pattern) return false;
+    if (a.fill_fg_argb != b.fill_fg_argb) return false;
+    if (a.fill_bg_argb != b.fill_bg_argb) return false;
     // Content-compare font_name.
     if ((a.font_name == null) != (b.font_name == null)) return false;
     if (a.font_name) |an| {
@@ -564,7 +601,41 @@ fn emitStylesXml(
     }
     try buf.appendSlice(alloc, "</fonts>");
 
-    try buf.appendSlice(alloc, STYLES_FILLS);
+    // <fills>: 2 reserved slots (none, gray125 — conventional OOXML
+    // defaults), then one user fill per style that sets any fill field.
+    // Styles without a fill reference fillId=0.
+    var fill_ids = try alloc.alloc(u32, styles.len);
+    defer alloc.free(fill_ids);
+    var next_user_fill_id: u32 = 2;
+    for (styles, 0..) |s, i| {
+        if (s.fill_pattern != .none or s.fill_fg_argb != null or s.fill_bg_argb != null) {
+            fill_ids[i] = next_user_fill_id;
+            next_user_fill_id += 1;
+        } else {
+            fill_ids[i] = 0;
+        }
+    }
+    try buf.print(alloc, "<fills count=\"{d}\">", .{next_user_fill_id});
+    try buf.appendSlice(alloc, "<fill><patternFill patternType=\"none\"/></fill>");
+    try buf.appendSlice(alloc, "<fill><patternFill patternType=\"gray125\"/></fill>");
+    for (styles) |s| {
+        if (s.fill_pattern == .none and s.fill_fg_argb == null and s.fill_bg_argb == null) continue;
+        try buf.print(
+            alloc,
+            "<fill><patternFill patternType=\"{s}\"",
+            .{patternTypeName(s.fill_pattern)},
+        );
+        if (s.fill_fg_argb == null and s.fill_bg_argb == null) {
+            try buf.appendSlice(alloc, "/></fill>");
+        } else {
+            try buf.appendSlice(alloc, ">");
+            if (s.fill_fg_argb) |c| try buf.print(alloc, "<fgColor rgb=\"{X:0>8}\"/>", .{c});
+            if (s.fill_bg_argb) |c| try buf.print(alloc, "<bgColor rgb=\"{X:0>8}\"/>", .{c});
+            try buf.appendSlice(alloc, "</patternFill></fill>");
+        }
+    }
+    try buf.appendSlice(alloc, "</fills>");
+
     try buf.appendSlice(alloc, STYLES_BORDERS);
     try buf.appendSlice(alloc, STYLES_CELL_STYLE_XFS);
 
@@ -573,11 +644,13 @@ fn emitStylesXml(
     try buf.appendSlice(alloc, STYLES_DEFAULT_CELL_XF);
     for (styles, 0..) |s, i| {
         const has_alignment = s.alignment_horizontal != .general or s.wrap_text;
+        const fill_id = fill_ids[i];
         try buf.print(
             alloc,
-            "<xf numFmtId=\"0\" fontId=\"{d}\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"",
-            .{i + 1},
+            "<xf numFmtId=\"0\" fontId=\"{d}\" fillId=\"{d}\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"",
+            .{ i + 1, fill_id },
         );
+        if (fill_id != 0) try buf.appendSlice(alloc, " applyFill=\"1\"");
         if (has_alignment) {
             try buf.appendSlice(alloc, " applyAlignment=\"1\"><alignment");
             if (s.alignment_horizontal != .general) {
@@ -607,6 +680,30 @@ fn hAlignName(a: HAlign) []const u8 {
         .justify => "justify",
         .center_continuous => "centerContinuous",
         .distributed => "distributed",
+    };
+}
+
+fn patternTypeName(p: PatternType) []const u8 {
+    return switch (p) {
+        .none => "none",
+        .solid => "solid",
+        .gray125 => "gray125",
+        .gray0625 => "gray0625",
+        .dark_gray => "darkGray",
+        .medium_gray => "mediumGray",
+        .light_gray => "lightGray",
+        .dark_horizontal => "darkHorizontal",
+        .dark_vertical => "darkVertical",
+        .dark_down => "darkDown",
+        .dark_up => "darkUp",
+        .dark_grid => "darkGrid",
+        .dark_trellis => "darkTrellis",
+        .light_horizontal => "lightHorizontal",
+        .light_vertical => "lightVertical",
+        .light_down => "lightDown",
+        .light_up => "lightUp",
+        .light_grid => "lightGrid",
+        .light_trellis => "lightTrellis",
     };
 }
 
@@ -874,6 +971,82 @@ test "Writer: xml entities in strings are escaped" {
     defer rows.deinit();
     const r = (try rows.next()).?;
     try std.testing.expectEqualStrings("a<b & c>d \"e\" 'f'", r[0].string);
+}
+
+test "Writer: stage-3 fill fields emit into styles.xml" {
+    const tmp_path = "/tmp/zlsx_writer_styles_fills.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+
+        // Solid yellow highlight — the bread-and-butter fill.
+        const yellow = try w.addStyle(.{
+            .fill_pattern = .solid,
+            .fill_fg_argb = 0xFFFFFF00,
+        });
+        // Pattern fill with both fg and bg.
+        const striped = try w.addStyle(.{
+            .fill_pattern = .dark_horizontal,
+            .fill_fg_argb = 0xFF0000FF,
+            .fill_bg_argb = 0xFFFFFFFF,
+        });
+        // Pattern-only, no colours.
+        const gray = try w.addStyle(.{ .fill_pattern = .gray0625 });
+        // Style with no fill at all — fillId must remain 0.
+        const plain_bold = try w.addStyle(.{ .font_bold = true });
+
+        // Dedup across distinct calls.
+        const yellow_again = try w.addStyle(.{
+            .fill_pattern = .solid,
+            .fill_fg_argb = 0xFFFFFF00,
+        });
+        try std.testing.expectEqual(yellow, yellow_again);
+        try std.testing.expect(striped != yellow);
+        try std.testing.expect(gray != striped);
+        try std.testing.expect(plain_bold != yellow);
+
+        var sheet = try w.addSheet("S");
+        try sheet.writeRowStyled(
+            &.{ .{ .string = "hi" }, .{ .string = "lo" }, .{ .string = "mid" }, .{ .string = "b" } },
+            &.{ yellow, striped, gray, plain_bold },
+        );
+
+        try w.save(tmp_path);
+    }
+
+    // Grep the emitted styles.xml for the expected OOXML markers.
+    const styles_xml = blk: {
+        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        var fbuf: [4096]u8 = undefined;
+        var fr = file.reader(&fbuf);
+        var iter = try std.zip.Iterator.init(&fr);
+        var filename_buf: [64]u8 = undefined;
+        while (try iter.next()) |entry| {
+            if (entry.filename_len > filename_buf.len) continue;
+            try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            const filename = filename_buf[0..entry.filename_len];
+            try fr.interface.readSliceAll(filename);
+            if (std.mem.eql(u8, filename, "xl/styles.xml")) {
+                break :blk try extractEntryForTest(std.testing.allocator, entry, &fr);
+            }
+        }
+        return error.StylesXmlNotFound;
+    };
+    defer std.testing.allocator.free(styles_xml);
+
+    // <fills count> should be 2 defaults + 3 user fills (plain_bold has
+    // no fill, so it doesn't contribute).
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "<fills count=\"5\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "patternType=\"solid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "<fgColor rgb=\"FFFFFF00\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "patternType=\"darkHorizontal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "<fgColor rgb=\"FF0000FF\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "<bgColor rgb=\"FFFFFFFF\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "patternType=\"gray0625\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "applyFill=\"1\"") != null);
 }
 
 test "Writer: stage-2 style fields emit into styles.xml" {

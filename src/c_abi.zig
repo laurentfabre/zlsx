@@ -680,25 +680,33 @@ export fn zlsx_writer_add_style(
     return 0;
 }
 
-/// Extended style spec passed across the C ABI. `flags` uses bit 0
-/// for `font_size_set`, bit 1 for `font_color_set` — the Zig side
-/// distinguishes "unset (default)" from "explicitly 0" this way since
-/// C has no natural `Option<>` type.
+/// Extended style spec passed across the C ABI. `flags` distinguishes
+/// "unset (default)" from "explicitly 0" for fields where C has no
+/// natural `Option<>` type:
+///   bit 0  — font_size set
+///   bit 1  — font_color set
+///   bit 2  — fill_fg_argb set (stage 3b-3)
+///   bit 3  — fill_bg_argb set (stage 3b-3)
 pub const CStyle = extern struct {
     font_bold: u8,
     font_italic: u8,
     alignment_horizontal: u8, // HAlign enum value 0-7
     wrap_text: u8,
-    flags: u8, // bit 0 = size set, bit 1 = color set
-    _pad0: [3]u8,
+    flags: u8,
+    fill_pattern: u8, // PatternType enum value 0..=18 (stage 3b-3)
+    _pad0: [2]u8,
     font_size: f32,
     font_color_argb: u32,
+    fill_fg_argb: u32, // used iff flags & 0x04
+    fill_bg_argb: u32, // used iff flags & 0x08
     font_name_ptr: [*]const u8,
     font_name_len: usize,
 };
 
 const FONT_SIZE_SET: u8 = 1 << 0;
 const FONT_COLOR_SET: u8 = 1 << 1;
+const FILL_FG_SET: u8 = 1 << 2;
+const FILL_BG_SET: u8 = 1 << 3;
 
 /// Register a style with all stage-2 fields. Pass a NULL/zero
 /// `font_name_*` plus cleared flag bits to opt out of any field.
@@ -736,6 +744,13 @@ export fn zlsx_writer_add_style_ex(
     };
     if (spec.flags & FONT_SIZE_SET != 0) style.font_size = spec.font_size;
     if (spec.flags & FONT_COLOR_SET != 0) style.font_color_argb = spec.font_color_argb;
+    if (spec.flags & FILL_FG_SET != 0) style.fill_fg_argb = spec.fill_fg_argb;
+    if (spec.flags & FILL_BG_SET != 0) style.fill_bg_argb = spec.fill_bg_argb;
+    if (spec.fill_pattern > 18) {
+        writeError(err_buf, err_buf_len, "BadFillPattern");
+        return -1;
+    }
+    style.fill_pattern = @enumFromInt(spec.fill_pattern);
     if (spec.font_name_len > 0) {
         style.font_name = spec.font_name_ptr[0..spec.font_name_len];
     }

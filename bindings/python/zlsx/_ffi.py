@@ -231,9 +231,12 @@ class CStyle(ctypes.Structure):
         ("alignment_horizontal", ctypes.c_uint8),
         ("wrap_text", ctypes.c_uint8),
         ("flags", ctypes.c_uint8),
-        ("_pad0", ctypes.c_ubyte * 3),
+        ("fill_pattern", ctypes.c_uint8),
+        ("_pad0", ctypes.c_ubyte * 2),
         ("font_size", ctypes.c_float),
         ("font_color_argb", ctypes.c_uint32),
+        ("fill_fg_argb", ctypes.c_uint32),
+        ("fill_bg_argb", ctypes.c_uint32),
         ("font_name_ptr", ctypes.POINTER(ctypes.c_ubyte)),
         ("font_name_len", ctypes.c_size_t),
     ]
@@ -241,6 +244,8 @@ class CStyle(ctypes.Structure):
 
 FONT_SIZE_SET = 0x01
 FONT_COLOR_SET = 0x02
+FILL_FG_SET = 0x04
+FILL_BG_SET = 0x08
 
 _HAS_STYLES_EX = hasattr(lib, "zlsx_writer_add_style_ex")
 if _HAS_STYLES_EX:
