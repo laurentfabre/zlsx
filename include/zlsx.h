@@ -227,6 +227,36 @@ int32_t zlsx_writer_add_style(
     uint8_t       * err_buf,
     size_t          err_buf_len);
 
+/* Stage-2 style fields (added 0.2.4, ABI v1 compatible).
+ *
+ * `flags` uses bit 0 = font_size_set, bit 1 = font_color_set so callers
+ * can distinguish "unset (default)" from explicitly-0 values. Alignment
+ * uses a compact enum (0 = general / 1 = left / 2 = center / 3 = right /
+ * 4 = fill / 5 = justify / 6 = centerContinuous / 7 = distributed).
+ * Unknown alignment values return -1 with err="BadAlignmentValue". */
+typedef struct {
+    uint8_t         font_bold;            /* 0 or 1 */
+    uint8_t         font_italic;          /* 0 or 1 */
+    uint8_t         alignment_horizontal; /* 0..7 */
+    uint8_t         wrap_text;            /* 0 or 1 */
+    uint8_t         flags;
+    uint8_t         _pad0[3];
+    float           font_size;            /* used iff flags & 0x01 */
+    uint32_t        font_color_argb;      /* used iff flags & 0x02 */
+    const uint8_t * font_name_ptr;        /* NULL or unused iff font_name_len == 0 */
+    size_t          font_name_len;
+} zlsx_style_t;
+
+#define ZLSX_FONT_SIZE_SET  0x01u
+#define ZLSX_FONT_COLOR_SET 0x02u
+
+int32_t zlsx_writer_add_style_ex(
+    zlsx_writer_t      * writer,
+    const zlsx_style_t * spec,
+    uint32_t           * out_index,
+    uint8_t            * err_buf,
+    size_t               err_buf_len);
+
 /*
  * Write a row with per-cell style indices. `styles_ptr` must point at
  * an array of `cells_len` uint32_t values; use 0 for cells that should

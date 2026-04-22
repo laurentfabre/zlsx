@@ -243,6 +243,56 @@ def test_writer_styles_length_mismatch(tmp_path):
             sheet.write_row(["a", "b"], styles=[bold])
 
 
+def test_writer_stage2_style_fields(tmp_path):
+    """Stage-2 fields (size, name, color, alignment, wrap_text) land in
+    the emitted styles.xml."""
+    import zipfile
+
+    out = tmp_path / "stage2.xlsx"
+    with zlsx.write(out) as w:
+        fancy = w.add_style(zlsx.Style(
+            font_size=18,
+            font_name="Arial",
+            font_color_argb=0xFFFF0000,
+            alignment_horizontal="center",
+            wrap_text=True,
+        ))
+        # Dedup: same spec from a fresh Python Style object returns same id.
+        again = w.add_style(zlsx.Style(
+            font_size=18,
+            font_name="Arial",
+            font_color_argb=0xFFFF0000,
+            alignment_horizontal="center",
+            wrap_text=True,
+        ))
+        assert fancy == again
+
+        sheet = w.add_sheet("S")
+        sheet.write_row(["styled"], styles=[fancy])
+
+    with zipfile.ZipFile(out) as z:
+        styles = z.read("xl/styles.xml").decode("utf-8")
+
+    assert '<sz val="18"' in styles
+    assert '<name val="Arial"' in styles
+    assert 'rgb="FFFF0000"' in styles
+    assert 'horizontal="center"' in styles
+    assert 'wrapText="1"' in styles
+    assert 'applyAlignment="1"' in styles
+
+
+def test_writer_stage2_invalid_inputs():
+    # No path — no save on exit, so errors from add_style don't chain
+    # into a NoSheets save failure.
+    with zlsx.write() as w:
+        with pytest.raises(zlsx.ZlsxError, match="InvalidFontSize"):
+            w.add_style(zlsx.Style(font_size=0))
+        with pytest.raises(zlsx.ZlsxError, match="InvalidFontName"):
+            w.add_style(zlsx.Style(font_name=""))
+        with pytest.raises(ValueError, match="alignment_horizontal"):
+            w.add_style(zlsx.Style(alignment_horizontal="not-a-real-alignment"))
+
+
 def test_writer_no_styles_xml_when_unused(tmp_path):
     """A writer that never calls add_style must produce a byte-identical
     output to v0.2.3 — no styles.xml entry in the archive. This is

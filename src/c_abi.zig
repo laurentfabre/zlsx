@@ -680,6 +680,74 @@ export fn zlsx_writer_add_style(
     return 0;
 }
 
+/// Extended style spec passed across the C ABI. `flags` uses bit 0
+/// for `font_size_set`, bit 1 for `font_color_set` — the Zig side
+/// distinguishes "unset (default)" from "explicitly 0" this way since
+/// C has no natural `Option<>` type.
+pub const CStyle = extern struct {
+    font_bold: u8,
+    font_italic: u8,
+    alignment_horizontal: u8, // HAlign enum value 0-7
+    wrap_text: u8,
+    flags: u8, // bit 0 = size set, bit 1 = color set
+    _pad0: [3]u8,
+    font_size: f32,
+    font_color_argb: u32,
+    font_name_ptr: [*]const u8,
+    font_name_len: usize,
+};
+
+const FONT_SIZE_SET: u8 = 1 << 0;
+const FONT_COLOR_SET: u8 = 1 << 1;
+
+/// Register a style with all stage-2 fields. Pass a NULL/zero
+/// `font_name_*` plus cleared flag bits to opt out of any field.
+/// The ABI is additive on top of zlsx_writer_add_style — existing
+/// callers that only need bold/italic keep using the simpler function.
+export fn zlsx_writer_add_style_ex(
+    w: *Writer,
+    spec: *const CStyle,
+    out_index: *u32,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state: *WriterState = @ptrCast(@alignCast(w));
+
+    const halign: writer_mod.HAlign = switch (spec.alignment_horizontal) {
+        0 => .general,
+        1 => .left,
+        2 => .center,
+        3 => .right,
+        4 => .fill,
+        5 => .justify,
+        6 => .center_continuous,
+        7 => .distributed,
+        else => {
+            writeError(err_buf, err_buf_len, "BadAlignmentValue");
+            return -1;
+        },
+    };
+
+    var style: writer_mod.Style = .{
+        .font_bold = spec.font_bold != 0,
+        .font_italic = spec.font_italic != 0,
+        .alignment_horizontal = halign,
+        .wrap_text = spec.wrap_text != 0,
+    };
+    if (spec.flags & FONT_SIZE_SET != 0) style.font_size = spec.font_size;
+    if (spec.flags & FONT_COLOR_SET != 0) style.font_color_argb = spec.font_color_argb;
+    if (spec.font_name_len > 0) {
+        style.font_name = spec.font_name_ptr[0..spec.font_name_len];
+    }
+
+    const idx = state.inner.addStyle(style) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    out_index.* = idx;
+    return 0;
+}
+
 /// Write a row with per-cell style indices. `styles_ptr` must point at
 /// an array of `cells_len` u32 values — use 0 for cells that should
 /// use the default no-style slot. Returns 0 on success, -1 on failure

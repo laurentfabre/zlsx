@@ -219,6 +219,40 @@ if _HAS_STYLES:
     ]
     lib.zlsx_sheet_writer_write_row_styled.restype = ctypes.c_int32
 
+
+# ─── Stage-2 style extension (libzlsx 0.2.4+) ──────────────────────────
+
+
+class CStyle(ctypes.Structure):
+    """Mirrors zlsx_style_t in include/zlsx.h."""
+    _fields_ = [
+        ("font_bold", ctypes.c_uint8),
+        ("font_italic", ctypes.c_uint8),
+        ("alignment_horizontal", ctypes.c_uint8),
+        ("wrap_text", ctypes.c_uint8),
+        ("flags", ctypes.c_uint8),
+        ("_pad0", ctypes.c_ubyte * 3),
+        ("font_size", ctypes.c_float),
+        ("font_color_argb", ctypes.c_uint32),
+        ("font_name_ptr", ctypes.POINTER(ctypes.c_ubyte)),
+        ("font_name_len", ctypes.c_size_t),
+    ]
+
+
+FONT_SIZE_SET = 0x01
+FONT_COLOR_SET = 0x02
+
+_HAS_STYLES_EX = hasattr(lib, "zlsx_writer_add_style_ex")
+if _HAS_STYLES_EX:
+    lib.zlsx_writer_add_style_ex.argtypes = [
+        writer_handle,
+        ctypes.POINTER(CStyle),
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_writer_add_style_ex.restype = ctypes.c_int32
+
 # ─── ABI version check ────────────────────────────────────────────────
 
 EXPECTED_ABI_VERSION = 1

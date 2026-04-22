@@ -112,20 +112,47 @@ const STYLES_TAIL: []const u8 = "</styleSheet>";
 
 // ─── Writer public API ───────────────────────────────────────────────
 
-/// Cell style registered via `Writer.addStyle`. Start with the minimum
-/// surface that openpyxl users reach for and grow from here — each new
-/// field defaults to "unset" so registering `.{ .font_bold = true }`
-/// produces the same styles.xml as registering `.{}` with bold.
+/// Horizontal alignment for a cell style. `.general` is the OOXML
+/// default (no `<alignment>` element emitted); nonzero values emit
+/// `<alignment horizontal="…"/>`. Numeric tag values are part of the
+/// C ABI — append new entries, never reorder.
+pub const HAlign = enum(u8) {
+    general = 0,
+    left = 1,
+    center = 2,
+    right = 3,
+    fill = 4,
+    justify = 5,
+    center_continuous = 6,
+    distributed = 7,
+};
+
+/// Cell style registered via `Writer.addStyle`. Fields default to
+/// "unset" so `Writer.addStyle(.{ .font_bold = true })` produces
+/// the minimum-overhead styles.xml entry.
 ///
 /// Phase 3b stages:
-///   - stage 1 (this release): font bold/italic
-///   - stage 2: font name/size/color, horizontal alignment, wrap_text
+///   - stage 1: font bold/italic                         [shipped]
+///   - stage 2 (this release): font name/size/color,
+///             horizontal alignment, wrap_text
 ///   - stage 3: fills (patternType, fg/bg rgb)
 ///   - stage 4: borders (left/right/top/bottom + style + color)
 ///   - stage 5: number formats, column widths, freeze panes, auto_filter
+///
+/// `font_name` is caller-owned for the duration of the `addStyle`
+/// call; the writer dupes it into its own pool so callers can free
+/// the original immediately after.
 pub const Style = struct {
     font_bold: bool = false,
     font_italic: bool = false,
+    /// Null = default (11 pt). Must be positive and finite when set.
+    font_size: ?f32 = null,
+    /// Null = default ("Calibri"). Escaped for XML on emit.
+    font_name: ?[]const u8 = null,
+    /// Null = default (theme auto). ARGB packed: 0xAARRGGBB.
+    font_color_argb: ?u32 = null,
+    alignment_horizontal: HAlign = .general,
+    wrap_text: bool = false,
 };
 
 pub const Writer = struct {
@@ -157,19 +184,42 @@ pub const Writer = struct {
         for (self.sst_strings.items) |s| self.allocator.free(s);
         self.sst_strings.deinit(self.allocator);
         self.sst_index.deinit(self.allocator);
+        // Each style owns its font_name slice (if any) on the writer's
+        // heap; drop them here before the styles ArrayList goes.
+        for (self.styles.items) |s| {
+            if (s.font_name) |n| self.allocator.free(n);
+        }
         self.styles.deinit(self.allocator);
         self.* = undefined;
     }
 
-    /// Register a cell style and return its `s="…"` index. Dedupes —
-    /// registering the same `Style` twice returns the same index. The
-    /// returned value is 1-based (cellXfs[0] is the default no-style
-    /// record, reserved).
+    /// Register a cell style and return its `s="…"` index. Dedupes
+    /// structurally (including content-comparing `font_name`, not
+    /// just slice-header comparing). Returning value is 1-based —
+    /// cellXfs[0] is reserved for the default no-style record.
     pub fn addStyle(self: *Writer, style: Style) !u32 {
-        for (self.styles.items, 0..) |existing, i| {
-            if (std.meta.eql(existing, style)) return @intCast(i + 1);
+        // Validate stage-2 inputs up front so dedup doesn't have to
+        // handle subtly-equal-but-invalid specs.
+        if (style.font_size) |s| {
+            if (!std.math.isFinite(s) or s <= 0) return error.InvalidFontSize;
         }
-        try self.styles.append(self.allocator, style);
+        if (style.font_name) |n| {
+            if (n.len == 0) return error.InvalidFontName;
+        }
+
+        // Linear-scan dedup. Need content-equal font_name comparison
+        // (std.meta.eql on `?[]const u8` compares slice headers only).
+        for (self.styles.items, 0..) |existing, i| {
+            if (stylesEqual(existing, style)) return @intCast(i + 1);
+        }
+
+        // New entry — dupe font_name into writer-owned storage.
+        var owned_style = style;
+        if (style.font_name) |n| {
+            owned_style.font_name = try self.allocator.dupe(u8, n);
+        }
+        errdefer if (owned_style.font_name) |n| self.allocator.free(n);
+        try self.styles.append(self.allocator, owned_style);
         return @intCast(self.styles.items.len);
     }
 
@@ -452,12 +502,31 @@ fn formatCellRef(buf: *[16]u8, row: u32, col_idx: u32) ![]u8 {
     return std.fmt.bufPrint(buf, "{s}{d}", .{ letters, row });
 }
 
+/// Content-compare two styles. Necessary because std.meta.eql on
+/// `?[]const u8` compares slice headers (pointer + length) rather than
+/// the underlying bytes, so two registrations of `font_name = "Arial"`
+/// from distinct buffers would not dedup.
+fn stylesEqual(a: Style, b: Style) bool {
+    if (a.font_bold != b.font_bold) return false;
+    if (a.font_italic != b.font_italic) return false;
+    if (!std.meta.eql(a.font_size, b.font_size)) return false;
+    if (a.font_color_argb != b.font_color_argb) return false;
+    if (a.alignment_horizontal != b.alignment_horizontal) return false;
+    if (a.wrap_text != b.wrap_text) return false;
+    // Content-compare font_name.
+    if ((a.font_name == null) != (b.font_name == null)) return false;
+    if (a.font_name) |an| {
+        if (!std.mem.eql(u8, an, b.font_name.?)) return false;
+    }
+    return true;
+}
+
 /// Emit xl/styles.xml based on the registered style list. Fonts are
-/// deduped into a `<fonts>` list (default font at index 0; user styles
-/// each reference a new font entry, which is wasteful compared to
-/// deduping fonts separately from styles but is fine for the MVP scope
-/// of Phase 3b stage 1). `<cellXfs>` gets the default entry at index 0
-/// plus one entry per user style.
+/// keyed 1:1 with styles (fonts[i+1] corresponds to style i); deduping
+/// fonts independently of styles is a Phase 3b stage-3 optimisation.
+/// `<cellXfs>` gets the default entry at index 0 plus one entry per
+/// user style, with `applyAlignment="1"` when a style sets any
+/// alignment/wrap field.
 fn emitStylesXml(
     alloc: Allocator,
     zw: *ZipWriter,
@@ -475,7 +544,23 @@ fn emitStylesXml(
         try buf.appendSlice(alloc, "<font>");
         if (s.font_bold) try buf.appendSlice(alloc, "<b/>");
         if (s.font_italic) try buf.appendSlice(alloc, "<i/>");
-        try buf.appendSlice(alloc, "<sz val=\"11\"/><name val=\"Calibri\"/></font>");
+        // <sz> — configurable in stage 2; fall back to 11 when unset.
+        const size = s.font_size orelse 11.0;
+        try buf.print(alloc, "<sz val=\"{d}\"/>", .{size});
+        // <color> — only when set; theme auto is implied by omission.
+        if (s.font_color_argb) |c| try buf.print(
+            alloc,
+            "<color rgb=\"{X:0>8}\"/>",
+            .{c},
+        );
+        // <name> — configurable in stage 2; default "Calibri".
+        try buf.appendSlice(alloc, "<name val=\"");
+        if (s.font_name) |n| {
+            try appendXmlEscaped(alloc, &buf, n);
+        } else {
+            try buf.appendSlice(alloc, "Calibri");
+        }
+        try buf.appendSlice(alloc, "\"/></font>");
     }
     try buf.appendSlice(alloc, "</fonts>");
 
@@ -483,16 +568,26 @@ fn emitStylesXml(
     try buf.appendSlice(alloc, STYLES_BORDERS);
     try buf.appendSlice(alloc, STYLES_CELL_STYLE_XFS);
 
-    // <cellXfs>: default at index 0 + one per user style. Style i (1-based
-    // to callers) references font[i] so each user style gets its own font.
+    // <cellXfs>: default at index 0 + one per user style.
     try buf.print(alloc, "<cellXfs count=\"{d}\">", .{styles.len + 1});
     try buf.appendSlice(alloc, STYLES_DEFAULT_CELL_XF);
-    for (styles, 0..) |_, i| {
+    for (styles, 0..) |s, i| {
+        const has_alignment = s.alignment_horizontal != .general or s.wrap_text;
         try buf.print(
             alloc,
-            "<xf numFmtId=\"0\" fontId=\"{d}\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/>",
+            "<xf numFmtId=\"0\" fontId=\"{d}\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"",
             .{i + 1},
         );
+        if (has_alignment) {
+            try buf.appendSlice(alloc, " applyAlignment=\"1\"><alignment");
+            if (s.alignment_horizontal != .general) {
+                try buf.print(alloc, " horizontal=\"{s}\"", .{hAlignName(s.alignment_horizontal)});
+            }
+            if (s.wrap_text) try buf.appendSlice(alloc, " wrapText=\"1\"");
+            try buf.appendSlice(alloc, "/></xf>");
+        } else {
+            try buf.appendSlice(alloc, "/>");
+        }
     }
     try buf.appendSlice(alloc, "</cellXfs>");
 
@@ -500,6 +595,19 @@ fn emitStylesXml(
     try buf.appendSlice(alloc, STYLES_TAIL);
 
     try zw.addEntry("xl/styles.xml", buf.items);
+}
+
+fn hAlignName(a: HAlign) []const u8 {
+    return switch (a) {
+        .general => "general",
+        .left => "left",
+        .center => "center",
+        .right => "right",
+        .fill => "fill",
+        .justify => "justify",
+        .center_continuous => "centerContinuous",
+        .distributed => "distributed",
+    };
 }
 
 fn appendXmlEscaped(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
@@ -766,6 +874,79 @@ test "Writer: xml entities in strings are escaped" {
     defer rows.deinit();
     const r = (try rows.next()).?;
     try std.testing.expectEqualStrings("a<b & c>d \"e\" 'f'", r[0].string);
+}
+
+test "Writer: stage-2 style fields emit into styles.xml" {
+    const tmp_path = "/tmp/zlsx_writer_styles_stage2.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+
+        const big_red_arial = try w.addStyle(.{
+            .font_size = 18,
+            .font_name = "Arial",
+            .font_color_argb = 0xFFFF0000,
+            .alignment_horizontal = .center,
+            .wrap_text = true,
+        });
+        const wrap_only = try w.addStyle(.{ .wrap_text = true });
+        // Dedup: same style from distinct "Arial" buffer must coalesce.
+        var arial_copy: [5]u8 = .{ 'A', 'r', 'i', 'a', 'l' };
+        const again = try w.addStyle(.{
+            .font_size = 18,
+            .font_name = &arial_copy,
+            .font_color_argb = 0xFFFF0000,
+            .alignment_horizontal = .center,
+            .wrap_text = true,
+        });
+        try std.testing.expectEqual(big_red_arial, again);
+
+        // Invalid inputs surface typed errors, not panics.
+        try std.testing.expectError(error.InvalidFontSize, w.addStyle(.{ .font_size = 0 }));
+        try std.testing.expectError(error.InvalidFontSize, w.addStyle(.{ .font_size = -1 }));
+        try std.testing.expectError(error.InvalidFontName, w.addStyle(.{ .font_name = "" }));
+
+        var sheet = try w.addSheet("S");
+        try sheet.writeRowStyled(
+            &.{ .{ .string = "big red" }, .{ .string = "wrapped" } },
+            &.{ big_red_arial, wrap_only },
+        );
+
+        try w.save(tmp_path);
+    }
+
+    // Read the raw styles.xml bytes to verify stage-2 fields landed.
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    const styles_xml = blk: {
+        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        var fbuf: [4096]u8 = undefined;
+        var fr = file.reader(&fbuf);
+        var iter = try std.zip.Iterator.init(&fr);
+        var filename_buf: [64]u8 = undefined;
+        while (try iter.next()) |entry| {
+            if (entry.filename_len > filename_buf.len) continue;
+            try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            const filename = filename_buf[0..entry.filename_len];
+            try fr.interface.readSliceAll(filename);
+            if (std.mem.eql(u8, filename, "xl/styles.xml")) {
+                break :blk try extractEntryForTest(std.testing.allocator, entry, &fr);
+            }
+        }
+        return error.StylesXmlNotFound;
+    };
+    defer std.testing.allocator.free(styles_xml);
+
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "<sz val=\"18\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "<name val=\"Arial\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "rgb=\"FFFF0000\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "horizontal=\"center\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "wrapText=\"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "applyAlignment=\"1\"") != null);
 }
 
 test "Writer: styles — bold + italic round-trip" {
@@ -1151,20 +1332,21 @@ test "fuzz Writer.addStyle dedup on bool combos" {
     defer w.deinit();
 
     // 4 possible Style values (2 bool fields) — after the first 4 unique
-    // registrations the style count must plateau at 4.
-    var distinct = std.AutoHashMap(Style, u32).init(std.testing.allocator);
-    defer distinct.deinit();
+    // registrations the style count must plateau at 4. Track distinct
+    // (bool, bool) → idx pairs directly since Style now contains an
+    // f32/slice field that AutoHashMap can't hash.
+    var distinct_indices: [2][2]?u32 = .{ .{ null, null }, .{ null, null } };
 
     for (0..iters) |_| {
-        const style: Style = .{
-            .font_bold = rng.boolean(),
-            .font_italic = rng.boolean(),
-        };
-        const idx = try w.addStyle(style);
-        if (distinct.get(style)) |prior| {
+        const bold = rng.boolean();
+        const italic = rng.boolean();
+        const idx = try w.addStyle(.{ .font_bold = bold, .font_italic = italic });
+        const bi: usize = if (bold) 1 else 0;
+        const ii: usize = if (italic) 1 else 0;
+        if (distinct_indices[bi][ii]) |prior| {
             try std.testing.expectEqual(prior, idx);
         } else {
-            try distinct.put(style, idx);
+            distinct_indices[bi][ii] = idx;
         }
         try std.testing.expect(w.styles.items.len <= 4);
     }

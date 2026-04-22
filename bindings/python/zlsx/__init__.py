@@ -53,24 +53,40 @@ __all__ = [
 # fields additive — openpyxl-parity fields land in subsequent releases
 # (alignment, fills, borders, number formats, etc).
 
-try:
-    from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Literal, Optional
 
-    @dataclass(frozen=True)
-    class Style:
-        """A cell-style specification. Pass an instance to
-        :meth:`Writer.add_style` and use the returned index with
-        :meth:`SheetWriter.write_row`'s ``styles`` argument."""
 
-        font_bold: bool = False
-        font_italic: bool = False
+HAlignLiteral = Literal[
+    "general", "left", "center", "right", "fill",
+    "justify", "centerContinuous", "distributed",
+]
 
-except ImportError:   # pragma: no cover — dataclass is 3.7+
-    class Style:      # type: ignore[no-redef]
-        __slots__ = ("font_bold", "font_italic")
-        def __init__(self, font_bold: bool = False, font_italic: bool = False):
-            self.font_bold = font_bold
-            self.font_italic = font_italic
+_HALIGN_VALUES = {
+    "general": 0, "left": 1, "center": 2, "right": 3,
+    "fill": 4, "justify": 5, "centerContinuous": 6, "distributed": 7,
+}
+
+
+@dataclass(frozen=True)
+class Style:
+    """A cell-style specification. Pass an instance to
+    :meth:`Writer.add_style` and use the returned index with
+    :meth:`SheetWriter.write_row`'s ``styles`` argument.
+
+    Fields mirror the Zig Style struct. ``None`` means "unset (OOXML
+    default)"; concrete values emit the corresponding XML attributes.
+    ``font_color_argb`` is packed ARGB (0xAARRGGBB); for fully opaque
+    red use ``0xFFFF0000``.
+    """
+
+    font_bold: bool = False
+    font_italic: bool = False
+    font_size: Optional[float] = None
+    font_name: Optional[str] = None
+    font_color_argb: Optional[int] = None
+    alignment_horizontal: HAlignLiteral = "general"
+    wrap_text: bool = False
 
 
 class ZlsxError(RuntimeError):
@@ -447,23 +463,97 @@ class Writer:
     def add_style(self, style: "Style") -> int:
         """Register a cell style and return its 1-based index. Pass the
         returned value via ``styles=[…]`` to :meth:`SheetWriter.write_row`.
-        Duplicate registrations return the same index."""
+        Duplicate registrations return the same index.
+
+        If the Style only sets ``font_bold``/``font_italic`` we call the
+        stage-1 ``zlsx_writer_add_style`` for backward compatibility with
+        libzlsx 0.2.3. Any stage-2 field (size, name, color, alignment,
+        wrap_text) promotes the call to ``zlsx_writer_add_style_ex``
+        (libzlsx 0.2.4+)."""
         if not _ffi._HAS_STYLES:
             raise RuntimeError(
                 "loaded libzlsx does not expose zlsx_writer_add_style "
                 "(requires 0.2.4+); upgrade libzlsx"
             )
+
+        needs_ex = (
+            style.font_size is not None
+            or style.font_name is not None
+            or style.font_color_argb is not None
+            or style.alignment_horizontal != "general"
+            or style.wrap_text
+        )
+
         out_idx = ctypes.c_uint32(0)
-        rc = _ffi.lib.zlsx_writer_add_style(
+
+        if not needs_ex:
+            rc = _ffi.lib.zlsx_writer_add_style(
+                self._handle,
+                1 if style.font_bold else 0,
+                1 if style.font_italic else 0,
+                ctypes.byref(out_idx),
+                self._err,
+                _ERR_BUF_LEN,
+            )
+            if rc != 0:
+                raise ZlsxError(f"zlsx_writer_add_style: {_decode_err(self._err)}")
+            return int(out_idx.value)
+
+        if not _ffi._HAS_STYLES_EX:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_writer_add_style_ex "
+                "(requires 0.2.4+) — stage-2 style fields need the newer dylib"
+            )
+
+        flags = 0
+        if style.font_size is not None:
+            flags |= _ffi.FONT_SIZE_SET
+        if style.font_color_argb is not None:
+            flags |= _ffi.FONT_COLOR_SET
+
+        # Distinguish "unset" (None) from "empty string" — the latter
+        # is invalid and must reach the Zig side as font_name_len=0
+        # with an explicit sentinel that triggers InvalidFontName.
+        if style.font_name is None:
+            name_bytes = b""
+        elif style.font_name == "":
+            # Force Zig to see font_name = "" (len=0 with a non-null ptr
+            # via a different sentinel than the "unset" case).
+            raise ZlsxError("InvalidFontName")
+        else:
+            name_bytes = style.font_name.encode("utf-8")
+        # Keep the bytes buffer alive through the FFI call.
+        name_buf = (ctypes.c_ubyte * max(len(name_bytes), 1)).from_buffer_copy(
+            name_bytes or b"\x00"
+        )
+
+        if style.alignment_horizontal not in _HALIGN_VALUES:
+            raise ValueError(
+                f"unknown alignment_horizontal: {style.alignment_horizontal!r}"
+            )
+
+        spec = _ffi.CStyle(
+            font_bold=1 if style.font_bold else 0,
+            font_italic=1 if style.font_italic else 0,
+            alignment_horizontal=_HALIGN_VALUES[style.alignment_horizontal],
+            wrap_text=1 if style.wrap_text else 0,
+            flags=flags,
+            font_size=float(style.font_size or 0.0),
+            font_color_argb=int(style.font_color_argb or 0),
+            font_name_ptr=ctypes.cast(name_buf, ctypes.POINTER(ctypes.c_ubyte)),
+            font_name_len=len(name_bytes),
+        )
+        rc = _ffi.lib.zlsx_writer_add_style_ex(
             self._handle,
-            1 if style.font_bold else 0,
-            1 if style.font_italic else 0,
+            ctypes.byref(spec),
             ctypes.byref(out_idx),
             self._err,
             _ERR_BUF_LEN,
         )
+        # Keep name_buf alive until the call returns.
+        del name_buf
         if rc != 0:
-            raise ZlsxError(f"zlsx_writer_add_style: {_decode_err(self._err)}")
+            raise ZlsxError(f"zlsx_writer_add_style_ex: {_decode_err(self._err)}")
         return int(out_idx.value)
 
     def save(self, path: Union[str, Path, None] = None) -> None:
