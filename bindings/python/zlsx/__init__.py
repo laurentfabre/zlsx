@@ -591,10 +591,14 @@ class Writer:
     resources. The context-manager protocol wraps this: ``with
     zlsx.write("out.xlsx") as w:`` saves automatically on clean exit.
 
-    Scope reminder: this MVP writer handles strings, integers, floats,
-    booleans, and empties. Styles, merged regions, formulas, and
-    load-modify-save round-trip are not yet supported — use openpyxl
-    for those until Phase 3b/3c ship.
+    Writes strings, integers, floats, booleans, and empties; styles
+    via :meth:`add_style` (bold/italic, fonts, fills, borders,
+    alignment, wrap, number formats); per-sheet ``set_column_width``,
+    ``freeze_panes``, ``set_auto_filter``. Merged-cell authoring
+    exists on the Zig ``SheetWriter.addMergedCell`` API but is not
+    yet exposed through the C ABI or this Python wrapper; formulas
+    and load-modify-save round-trip remain out of scope until
+    Phase 3c.
     """
 
     def __init__(self, path: Union[str, Path, None] = None):

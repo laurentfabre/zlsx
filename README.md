@@ -4,7 +4,7 @@ Tiny `.xlsx` reader **and** writer for Zig. Single-file library, no third-party 
 
 **Reader**: 10.7 ms / 4.2 MB on a 261 KB / 1,008-row workbook — 1.4× faster than calamine-rust, 4× faster than python-calamine, 24× faster than openpyxl, at one tenth the memory of the Python stack. [Full benchmark table →](docs/benchmarks.md)
 
-**Writer** (Phase 3b, v0.2.4): pragmatic openpyxl-parity styles — bold/italic, font size/name/color, horizontal alignment, wrap text, 19 OOXML fill patterns, 14 border styles × 5 sides, custom number formats, column widths, freeze panes, auto-filter. Survived 1M-iter deep fuzz on every surface.
+**Writer** (Phase 3b, v0.2.4): pragmatic openpyxl-parity styles — bold/italic, font size/name/color, horizontal alignment, wrap text, 19 OOXML fill patterns, 14 border styles × 5 sides, custom number formats, column widths, freeze panes, auto-filter, merged cell ranges. Survived 1M-iter deep fuzz on every surface.
 
 ```zig
 const xlsx = @import("zlsx");
@@ -44,6 +44,7 @@ var sheet_w = try w.addSheet("Summary");
 try sheet_w.setColumnWidth(0, 24);
 sheet_w.freezePanes(1, 0);
 try sheet_w.setAutoFilter("A1:C1");
+// For merged header spans: `try sheet_w.addMergedCell("A3:C3");`
 try sheet_w.writeRowStyled(
     &.{ .{ .string = "Name" }, .{ .string = "Amount" }, .{ .string = "Active" } },
     &.{ header, header, header },
@@ -65,14 +66,14 @@ Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-ro
 
 **In**
 - **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout
-- **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, freeze panes, auto-filter
+- **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, freeze panes, auto-filter, merged cell ranges
 - XML entity decoding (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&#N;`, `&#xN;`) on read and escaping on write
 - CLI (`zlsx file.xlsx --format {jsonl,jsonl-dict,tsv,csv}`), C ABI (`libzlsx.{dylib,so,dll}` + `include/zlsx.h`), Python bindings (`pip install py-zlsx`)
 
 **Out (by design)**
 - No formula evaluation — the reader returns the cached `<v>` value, the writer never synthesises formulas
 - No date decoding — dates stay as their raw Excel serial number unless the generator pre-serialised them
-- No merged-cell authoring — the underlying cell anchors are preserved; merging is caller-interpreted
+- No merged-cell authoring on the **reader** side — the underlying cell anchors are preserved; merging is caller-interpreted. (The **writer** does emit `<mergeCells>` — call `SheetWriter.addMergedCell("A1:B2")`.)
 - No load-modify-save round-trip yet — Phase 3c queued. For now the writer only produces fresh workbooks
 - No chart / pivot / image extraction or emission
 

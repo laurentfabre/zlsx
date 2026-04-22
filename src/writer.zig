@@ -512,6 +512,19 @@ pub const Writer = struct {
                 try full.appendSlice(alloc, "\"/>");
             }
 
+            // <mergeCells> follows <autoFilter> per ECMA-376 CT_Worksheet
+            // child order. Ranges were validated on intake, but defensively
+            // xml-escape them on emit anyway.
+            if (sw.merged_cells.items.len > 0) {
+                try full.print(alloc, "<mergeCells count=\"{d}\">", .{sw.merged_cells.items.len});
+                for (sw.merged_cells.items) |range| {
+                    try full.appendSlice(alloc, "<mergeCell ref=\"");
+                    try appendXmlEscaped(alloc, &full, range);
+                    try full.appendSlice(alloc, "\"/>");
+                }
+                try full.appendSlice(alloc, "</mergeCells>");
+            }
+
             try full.appendSlice(alloc, "</worksheet>");
 
             var name_buf: [64]u8 = undefined;
@@ -579,6 +592,9 @@ pub const SheetWriter = struct {
     /// Auto-filter range (e.g., "A1:E1"). null = no filter.
     /// Owned by the SheetWriter.
     auto_filter_range: ?[]u8 = null,
+    /// Merged cell ranges (e.g., "A1:B2"). Each entry is a
+    /// SheetWriter-owned copy of a validated A1-style range.
+    merged_cells: std.ArrayListUnmanaged([]u8) = .{},
 
     fn init(parent: *Writer, name: []const u8) !SheetWriter {
         return .{
@@ -592,6 +608,8 @@ pub const SheetWriter = struct {
         self.body.deinit(self.parent.allocator);
         self.column_widths.deinit(self.parent.allocator);
         if (self.auto_filter_range) |r| self.parent.allocator.free(r);
+        for (self.merged_cells.items) |r| self.parent.allocator.free(r);
+        self.merged_cells.deinit(self.parent.allocator);
         self.* = undefined;
     }
 
@@ -623,6 +641,19 @@ pub const SheetWriter = struct {
         if (range.len == 0) return error.InvalidAutoFilterRange;
         if (self.auto_filter_range) |old| self.parent.allocator.free(old);
         self.auto_filter_range = try self.parent.allocator.dupe(u8, range);
+    }
+
+    /// Merge a rectangular cell range (e.g., "A1:B2"). The range must
+    /// be a valid multi-cell A1-style span — single-cell ranges and
+    /// inverted (bottom-right-before-top-left) ranges are rejected.
+    /// Caller-owned; the writer dupes it. Multiple merges per sheet
+    /// are allowed; callers are responsible for avoiding overlaps,
+    /// which Excel rejects at file-open time.
+    pub fn addMergedCell(self: *SheetWriter, range: []const u8) !void {
+        try validateMergeRange(range);
+        const copy = try self.parent.allocator.dupe(u8, range);
+        errdefer self.parent.allocator.free(copy);
+        try self.merged_cells.append(self.parent.allocator, copy);
     }
 
     /// Write a row of cells. Empty cells are omitted from the output
@@ -744,6 +775,44 @@ fn formatCellRef(buf: *[16]u8, row: u32, col_idx: u32) ![]u8 {
     }
     const letters = col_chars[pos..];
     return std.fmt.bufPrint(buf, "{s}{d}", .{ letters, row });
+}
+
+// Excel's hard limits: 16 384 columns (XFD) × 1 048 576 rows.
+const EXCEL_MAX_COL: u32 = 16_384;
+const EXCEL_MAX_ROW: u32 = 1_048_576;
+
+const MergeCorner = struct { col: u32, row: u32 };
+
+fn parseA1Corner(s: []const u8) !MergeCorner {
+    if (s.len == 0) return error.InvalidMergeRange;
+    var i: usize = 0;
+    var col: u32 = 0;
+    while (i < s.len and s[i] >= 'A' and s[i] <= 'Z') : (i += 1) {
+        col = col * 26 + (s[i] - 'A' + 1);
+        if (col > EXCEL_MAX_COL) return error.InvalidMergeRange;
+    }
+    // Need at least one letter and at least one digit after it.
+    if (i == 0 or i == s.len) return error.InvalidMergeRange;
+    // Leading zero (e.g., "A0", "A01") is not a valid A1 row.
+    if (s[i] == '0') return error.InvalidMergeRange;
+    var row: u32 = 0;
+    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+        row = row * 10 + (s[i] - '0');
+        if (row > EXCEL_MAX_ROW) return error.InvalidMergeRange;
+    }
+    if (i != s.len) return error.InvalidMergeRange;
+    return .{ .col = col, .row = row };
+}
+
+fn validateMergeRange(range: []const u8) !void {
+    const colon = std.mem.indexOfScalar(u8, range, ':') orelse return error.InvalidMergeRange;
+    const tl = try parseA1Corner(range[0..colon]);
+    const br = try parseA1Corner(range[colon + 1 ..]);
+    // Top-left must strictly precede or equal bottom-right on both axes.
+    if (tl.col > br.col or tl.row > br.row) return error.InvalidMergeRange;
+    // Single-cell "merge" is a no-op that Excel warns on — reject it
+    // so callers catch typos at write time rather than on file-open.
+    if (tl.col == br.col and tl.row == br.row) return error.InvalidMergeRange;
 }
 
 /// Content-compare two styles. Necessary because std.meta.eql on
@@ -1432,6 +1501,119 @@ test "Writer: stage-5 sheet-level features (cols, freeze, autoFilter)" {
     try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "width=\"20.5\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "customWidth=\"1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "ref=\"A1:D1\"") != null);
+}
+
+test "Writer: addMergedCell validates + emits <mergeCells> block" {
+    const tmp_path = "/tmp/zlsx_writer_merged_cells.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Sheet1");
+
+        // Valid — three non-overlapping rectangles + a full-width span.
+        try sheet.addMergedCell("A1:B2");
+        try sheet.addMergedCell("C5:F5");
+        try sheet.addMergedCell("A10:XFD10");
+
+        // Rejections — every rule in parseA1Corner / validateMergeRange.
+        try std.testing.expectError(error.InvalidMergeRange, sheet.addMergedCell(""));
+        try std.testing.expectError(error.InvalidMergeRange, sheet.addMergedCell("A1")); // no colon
+        try std.testing.expectError(error.InvalidMergeRange, sheet.addMergedCell("A1:")); // empty right
+        try std.testing.expectError(error.InvalidMergeRange, sheet.addMergedCell(":B2")); // empty left
+        try std.testing.expectError(error.InvalidMergeRange, sheet.addMergedCell("A1:A1")); // single cell
+        try std.testing.expectError(error.InvalidMergeRange, sheet.addMergedCell("B1:A1")); // col inverted
+        try std.testing.expectError(error.InvalidMergeRange, sheet.addMergedCell("A2:A1")); // row inverted
+        try std.testing.expectError(error.InvalidMergeRange, sheet.addMergedCell("A:B2")); // no row on left
+        try std.testing.expectError(error.InvalidMergeRange, sheet.addMergedCell("A1:B")); // no row on right
+        try std.testing.expectError(error.InvalidMergeRange, sheet.addMergedCell("1:B2")); // no col on left
+        try std.testing.expectError(error.InvalidMergeRange, sheet.addMergedCell("A0:B2")); // row 0
+        try std.testing.expectError(error.InvalidMergeRange, sheet.addMergedCell("A01:B2")); // leading zero
+        try std.testing.expectError(error.InvalidMergeRange, sheet.addMergedCell("a1:b2")); // lowercase
+        try std.testing.expectError(error.InvalidMergeRange, sheet.addMergedCell("A1:B2 ")); // trailing space
+        try std.testing.expectError(error.InvalidMergeRange, sheet.addMergedCell("XFE1:XFE2")); // col > 16384
+        try std.testing.expectError(error.InvalidMergeRange, sheet.addMergedCell("A1:A1048577")); // row > 1048576
+
+        try sheet.writeRow(&.{.{ .string = "header" }});
+        try w.save(tmp_path);
+    }
+
+    // Inspect raw sheet1.xml for the expected block + ordering.
+    const sheet_xml = blk: {
+        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        var fbuf: [4096]u8 = undefined;
+        var fr = file.reader(&fbuf);
+        var iter = try std.zip.Iterator.init(&fr);
+        var filename_buf: [64]u8 = undefined;
+        while (try iter.next()) |entry| {
+            if (entry.filename_len > filename_buf.len) continue;
+            try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            const filename = filename_buf[0..entry.filename_len];
+            try fr.interface.readSliceAll(filename);
+            if (std.mem.eql(u8, filename, "xl/worksheets/sheet1.xml")) {
+                break :blk try extractEntryForTest(std.testing.allocator, entry, &fr);
+            }
+        }
+        return error.SheetXmlNotFound;
+    };
+    defer std.testing.allocator.free(sheet_xml);
+
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<mergeCells count=\"3\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<mergeCell ref=\"A1:B2\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<mergeCell ref=\"C5:F5\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<mergeCell ref=\"A10:XFD10\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "</mergeCells>") != null);
+
+    // Ordering: </sheetData> < <mergeCells> < </worksheet>.
+    const sd_end = std.mem.indexOf(u8, sheet_xml, "</sheetData>") orelse return error.MissingSheetData;
+    const mc = std.mem.indexOf(u8, sheet_xml, "<mergeCells") orelse return error.MissingMergeCells;
+    const ws_end = std.mem.indexOf(u8, sheet_xml, "</worksheet>") orelse return error.MissingWorksheetEnd;
+    try std.testing.expect(sd_end < mc);
+    try std.testing.expect(mc < ws_end);
+
+    // Confirm the reader still walks the workbook cleanly.
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    while (try rows.next()) |_| {}
+}
+
+test "Writer: no <mergeCells> block when none registered" {
+    const tmp_path = "/tmp/zlsx_writer_no_merged.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Sheet1");
+        try sheet.writeRow(&.{.{ .string = "a" }});
+        try w.save(tmp_path);
+    }
+
+    const sheet_xml = blk: {
+        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        var fbuf: [4096]u8 = undefined;
+        var fr = file.reader(&fbuf);
+        var iter = try std.zip.Iterator.init(&fr);
+        var filename_buf: [64]u8 = undefined;
+        while (try iter.next()) |entry| {
+            if (entry.filename_len > filename_buf.len) continue;
+            try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            const filename = filename_buf[0..entry.filename_len];
+            try fr.interface.readSliceAll(filename);
+            if (std.mem.eql(u8, filename, "xl/worksheets/sheet1.xml")) {
+                break :blk try extractEntryForTest(std.testing.allocator, entry, &fr);
+            }
+        }
+        return error.SheetXmlNotFound;
+    };
+    defer std.testing.allocator.free(sheet_xml);
+
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<mergeCells") == null);
 }
 
 test "Writer: stage-4 border sides emit into styles.xml" {
@@ -2214,6 +2396,19 @@ test "fuzz SheetWriter: random stage-5 per-sheet feature combos" {
     defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
     const filter_ranges = [_][]const u8{ "A1:A1", "A1:C1", "B2:F10", "A1:Z1000" };
+    // Mix of valid + invalid merge ranges so the fuzz hits both paths.
+    // The invalid ones must surface `error.InvalidMergeRange` without
+    // corrupting `sheet.merged_cells`.
+    const merge_candidates = [_][]const u8{
+        "A1:B2", "C3:D4", "E1:E5", "A100:C200", "AA1:AB2",
+        "A1:XFD1", "", // invalid
+        "A1", // invalid: no colon
+        "A1:A1", // invalid: single cell
+        "B1:A1", // invalid: col inverted
+        "a1:b2", // invalid: lowercase
+        "XFE1:XFE2", // invalid: col > 16384
+        "A1:A1048577", // invalid: row > 1048576
+    };
 
     for (0..iters) |_| {
         var w = Writer.init(std.testing.allocator);
@@ -2238,6 +2433,17 @@ test "fuzz SheetWriter: random stage-5 per-sheet feature combos" {
         if (rng.boolean()) {
             const r = filter_ranges[rng.intRangeAtMost(usize, 0, filter_ranges.len - 1)];
             try sheet.setAutoFilter(r);
+        }
+
+        // 0-5 merge attempts; invalid ones must return a clean error
+        // without poisoning the accumulator.
+        const n_merges = rng.intRangeAtMost(usize, 0, 5);
+        for (0..n_merges) |_| {
+            const r = merge_candidates[rng.intRangeAtMost(usize, 0, merge_candidates.len - 1)];
+            sheet.addMergedCell(r) catch |err| switch (err) {
+                error.InvalidMergeRange => {},
+                else => return err,
+            };
         }
 
         try sheet.writeRow(&.{.{ .string = "x" }});
