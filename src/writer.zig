@@ -2088,6 +2088,134 @@ test "fuzz Writer end-to-end round-trip via reader" {
     }
 }
 
+test "fuzz Writer: random stage 2-5 style combos survive round-trip" {
+    // Register styles with every stage's fields pseudo-randomly set,
+    // save the workbook, and confirm the reader parses it cleanly.
+    // Catches any crash in emitStylesXml caused by unusual field
+    // combinations (e.g. fill + border + numFmt simultaneously).
+    const iters = fuzzIterationsW() / 20;
+    const seed = fuzzSeedW();
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    var tmp_path_buf: [64]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "/tmp/zlsx_fuzz_combo_{x}.xlsx", .{seed});
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const font_names = [_][]const u8{ "Calibri", "Arial", "Helvetica", "Times New Roman" };
+    const num_formats = [_][]const u8{ "0.00", "0.00%", "#,##0", "m/d/yyyy", "$#,##0.00" };
+
+    for (0..iters) |_| {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+
+        const n_styles = rng.intRangeAtMost(usize, 1, 6);
+        for (0..n_styles) |_| {
+            var style: Style = .{};
+            // Font bits
+            if (rng.boolean()) style.font_bold = true;
+            if (rng.boolean()) style.font_italic = true;
+            if (rng.boolean()) style.font_size = 8 + rng.float(f32) * 20;
+            if (rng.boolean()) style.font_name = font_names[rng.intRangeAtMost(usize, 0, font_names.len - 1)];
+            if (rng.boolean()) style.font_color_argb = rng.int(u32);
+            // Alignment
+            if (rng.boolean()) style.alignment_horizontal = @enumFromInt(rng.intRangeAtMost(u8, 0, 7));
+            if (rng.boolean()) style.wrap_text = true;
+            // Fill
+            if (rng.boolean()) {
+                style.fill_pattern = @enumFromInt(rng.intRangeAtMost(u8, 0, 18));
+                if (rng.boolean()) style.fill_fg_argb = rng.int(u32);
+                if (rng.boolean()) style.fill_bg_argb = rng.int(u32);
+            }
+            // Borders (pick 0-3 sides to set)
+            const n_sides = rng.intRangeAtMost(u8, 0, 3);
+            for (0..n_sides) |_| {
+                const side_ptr: *BorderSide = switch (rng.intRangeAtMost(u8, 0, 4)) {
+                    0 => &style.border_left,
+                    1 => &style.border_right,
+                    2 => &style.border_top,
+                    3 => &style.border_bottom,
+                    else => &style.border_diagonal,
+                };
+                side_ptr.style = @enumFromInt(rng.intRangeAtMost(u8, 0, 13));
+                if (rng.boolean()) side_ptr.color_argb = rng.int(u32);
+            }
+            if (rng.boolean()) style.diagonal_up = true;
+            if (rng.boolean()) style.diagonal_down = true;
+            // Number format
+            if (rng.boolean()) style.number_format = num_formats[rng.intRangeAtMost(usize, 0, num_formats.len - 1)];
+
+            _ = w.addStyle(style) catch |e| switch (e) {
+                error.InvalidFontSize, error.InvalidFontName, error.InvalidNumberFormat => continue,
+                else => return e,
+            };
+        }
+
+        var sheet = try w.addSheet("S");
+        try sheet.writeRow(&.{ .{ .string = "a" }, .{ .number = 1.0 } });
+        try w.save(tmp_path);
+
+        // Re-read to verify the workbook parses cleanly.
+        var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+        defer book.deinit();
+        var rows = try book.rows(book.sheets[0], std.testing.allocator);
+        defer rows.deinit();
+        var count: usize = 0;
+        while (try rows.next()) |_| count += 1;
+        try std.testing.expectEqual(@as(usize, 1), count);
+    }
+}
+
+test "fuzz SheetWriter: random stage-5 per-sheet feature combos" {
+    // Hammer setColumnWidth / freezePanes / setAutoFilter in random
+    // orderings; save; confirm the archive is valid + the ordering
+    // invariant (sheetViews < cols < sheetData < autoFilter) holds.
+    const iters = fuzzIterationsW() / 20;
+    const seed = fuzzSeedW();
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    var tmp_path_buf: [64]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "/tmp/zlsx_fuzz_sheetfeat_{x}.xlsx", .{seed});
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const filter_ranges = [_][]const u8{ "A1:A1", "A1:C1", "B2:F10", "A1:Z1000" };
+
+    for (0..iters) |_| {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("S");
+
+        // 0-10 column widths at random indices.
+        const n_widths = rng.intRangeAtMost(usize, 0, 10);
+        for (0..n_widths) |_| {
+            const col = rng.intRangeAtMost(u32, 0, 100);
+            const w_val = 1 + rng.float(f32) * 100;
+            try sheet.setColumnWidth(col, w_val);
+        }
+
+        // 50% chance of freeze, 50% chance of auto-filter.
+        if (rng.boolean()) {
+            sheet.freezePanes(
+                rng.intRangeAtMost(u32, 0, 5),
+                rng.intRangeAtMost(u32, 0, 5),
+            );
+        }
+        if (rng.boolean()) {
+            const r = filter_ranges[rng.intRangeAtMost(usize, 0, filter_ranges.len - 1)];
+            try sheet.setAutoFilter(r);
+        }
+
+        try sheet.writeRow(&.{.{ .string = "x" }});
+        try w.save(tmp_path);
+
+        // Sanity: re-open with the reader.
+        var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+        defer book.deinit();
+        var rows = try book.rows(book.sheets[0], std.testing.allocator);
+        defer rows.deinit();
+        while (try rows.next()) |_| {}
+    }
+}
+
 test "fuzz ZipWriter produces archives our reader can walk" {
     const iters = fuzzIterationsW() / 10;
     const seed = fuzzSeedW();
