@@ -483,6 +483,42 @@ def test_writer_sheet_features_reject_negative_ints(tmp_path):
             sheet.freeze_panes(cols=-1)
 
 
+def test_sheetwriter_invalidated_after_writer_close(tmp_path):
+    """After Writer.close() (automatic on exit from a `with` block),
+    cached SheetWriter references must refuse to call into the C ABI
+    — the underlying handle is NULL and would crash on field access.
+    """
+    w = zlsx.write(tmp_path / "x.xlsx").__enter__()
+    sheet = w.add_sheet("S")
+    sheet.write_row(["ok"])
+    w.__exit__(None, None, None)  # closes + invalidates sheet
+
+    # Every SheetWriter method must raise cleanly, not segfault.
+    with pytest.raises(RuntimeError, match="parent Writer was closed"):
+        sheet.write_row(["bad"])
+    with pytest.raises(RuntimeError, match="parent Writer was closed"):
+        sheet.set_column_width(0, 10)
+    with pytest.raises(RuntimeError, match="parent Writer was closed"):
+        sheet.freeze_panes(1, 0)
+    with pytest.raises(RuntimeError, match="parent Writer was closed"):
+        sheet.set_auto_filter("A1:B1")
+
+
+def test_argb_overflow_rejects_with_named_field():
+    """ctypes.c_uint32 would silently mask 0x1FFFFFFFF → 0xFFFFFFFF;
+    a user typo ships the wrong colour with no warning. Range-check
+    upfront and name the offending field."""
+    with zlsx.write() as w:
+        with pytest.raises(ValueError, match="font_color_argb"):
+            w.add_style(zlsx.Style(font_color_argb=0x1FFFFFFFF))
+        with pytest.raises(ValueError, match="fill_fg_argb"):
+            w.add_style(zlsx.Style(fill_pattern="solid", fill_fg_argb=-1))
+        with pytest.raises(ValueError, match="border_left.color_argb"):
+            w.add_style(zlsx.Style(
+                border_left=zlsx.BorderSide(style="thin", color_argb=0x1_0000_0000),
+            ))
+
+
 def test_writer_no_styles_xml_when_unused(tmp_path):
     """A writer that never calls add_style must produce a byte-identical
     output to v0.2.3 — no styles.xml entry in the archive. This is
