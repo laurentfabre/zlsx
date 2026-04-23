@@ -821,6 +821,56 @@ export fn zlsx_cell_fill(book: *Book, style_idx: u32, out: *CFill) callconv(.c) 
     return 0;
 }
 
+/// One side of a cell border. `has_color` signals whether
+/// `color_argb` is populated (theme / indexed colors leave it 0
+/// with `has_color = 0`). `style_len == 0` means "no border on this
+/// side" (e.g. a `<bottom/>` self-closing element).
+pub const CBorderSide = extern struct {
+    has_color: u8,
+    _pad: [3]u8,
+    color_argb: u32,
+    style_len: usize,
+    style_ptr: [*]const u8,
+};
+
+/// Full cell border — five sides. `_pad` on each side keeps the
+/// struct 4-byte aligned so the embedded-struct layout matches
+/// across C compilers.
+pub const CCellBorder = extern struct {
+    left: CBorderSide,
+    right: CBorderSide,
+    top: CBorderSide,
+    bottom: CBorderSide,
+    diagonal: CBorderSide,
+};
+
+fn toCBorderSide(s: xlsx.BorderSide) CBorderSide {
+    return .{
+        .has_color = if (s.color_argb != null) 1 else 0,
+        ._pad = .{ 0, 0, 0 },
+        .color_argb = s.color_argb orelse 0,
+        .style_len = s.style.len,
+        .style_ptr = if (s.style.len == 0) @ptrCast("") else s.style.ptr,
+    };
+}
+
+/// Resolve a style index to its border. Returns 0 on success, -1 on
+/// out-of-range indices or missing styles.xml. Absent sides surface
+/// with `style_len = 0` — this is the common case since most cells
+/// only border 1-2 sides.
+export fn zlsx_cell_border(book: *Book, style_idx: u32, out: *CCellBorder) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    const b = state.inner.cellBorder(style_idx) orelse return -1;
+    out.* = .{
+        .left = toCBorderSide(b.left),
+        .right = toCBorderSide(b.right),
+        .top = toCBorderSide(b.top),
+        .bottom = toCBorderSide(b.bottom),
+        .diagonal = toCBorderSide(b.diagonal),
+    };
+    return 0;
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────
 
 test "abi version" {

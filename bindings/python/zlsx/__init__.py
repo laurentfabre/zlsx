@@ -51,6 +51,7 @@ __all__ = [
     "RichRun",
     "Font",
     "Fill",
+    "Border",
     "ZlsxError",
 ]
 
@@ -351,6 +352,19 @@ class Fill:
     pattern: str = "none"
     fg_color_argb: int | None = None
     bg_color_argb: int | None = None
+
+
+@dataclass(frozen=True)
+class Border:
+    """Cell border resolved via ``Book.cell_border(style_idx)``.
+    Every side is always present; absent sides have ``style=""``.
+    Reuses the writer-side :class:`BorderSide` so read and write
+    round-trip through the same type."""
+    left: "BorderSide" = field(default_factory=lambda: BorderSide())
+    right: "BorderSide" = field(default_factory=lambda: BorderSide())
+    top: "BorderSide" = field(default_factory=lambda: BorderSide())
+    bottom: "BorderSide" = field(default_factory=lambda: BorderSide())
+    diagonal: "BorderSide" = field(default_factory=lambda: BorderSide())
 
 
 # ─── Book ─────────────────────────────────────────────────────────────
@@ -678,6 +692,42 @@ class Book:
             pattern=pattern,
             fg_color_argb=int(cf.fg_color_argb) if cf.has_fg else None,
             bg_color_argb=int(cf.bg_color_argb) if cf.has_bg else None,
+        )
+
+    def cell_border(self, style_idx: int) -> Border | None:
+        """Resolve a cell's style index to its :class:`Border`
+        (left/right/top/bottom/diagonal sides). Returns ``None`` on
+        out-of-range indices or workbooks without ``xl/styles.xml``.
+        Requires libzlsx 0.2.6+."""
+        if not self._handle:
+            raise ZlsxError("book is closed")
+        if not _ffi._HAS_CELL_BORDER:
+            raise RuntimeError(
+                "loaded libzlsx does not expose cell_border "
+                "(requires 0.2.6+); upgrade libzlsx"
+            )
+        cb = _ffi.CCellBorder()
+        rc = _ffi.lib.zlsx_cell_border(self._handle, style_idx, ctypes.byref(cb))
+        if rc != 0:
+            return None
+
+        def _side(s: _ffi.CBorderSide) -> BorderSide:
+            style = ""
+            if s.style_len > 0:
+                style = ctypes.string_at(s.style_ptr, s.style_len).decode(
+                    "utf-8", errors="replace"
+                )
+            return BorderSide(
+                style=style,
+                color_argb=int(s.color_argb) if s.has_color else None,
+            )
+
+        return Border(
+            left=_side(cb.left),
+            right=_side(cb.right),
+            top=_side(cb.top),
+            bottom=_side(cb.bottom),
+            diagonal=_side(cb.diagonal),
         )
 
     def is_date_format(self, style_idx: int) -> bool:

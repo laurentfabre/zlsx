@@ -442,6 +442,38 @@ int32_t zlsx_cell_fill(zlsx_book_t *       book,
                        uint32_t            style_idx,
                        zlsx_cell_fill_t *  out);
 
+/*
+ * One side of a cell border. `style_ptr` / `style_len` hold the OOXML
+ * style attribute ("thin", "medium", "thick", "double", "dashed", …)
+ * or an empty slice when the side has no border. `has_color` + `pad`
+ * keep the struct 4-byte aligned ahead of the u32 color.
+ */
+typedef struct {
+    uint8_t         has_color;
+    uint8_t         _pad[3];
+    uint32_t        color_argb;
+    size_t          style_len;
+    const uint8_t * style_ptr;
+} zlsx_border_side_t;
+
+/*
+ * Full cell border — five sides. Pointer lifetimes match the Book.
+ */
+typedef struct {
+    zlsx_border_side_t left;
+    zlsx_border_side_t right;
+    zlsx_border_side_t top;
+    zlsx_border_side_t bottom;
+    zlsx_border_side_t diagonal;
+} zlsx_cell_border_t;
+
+/* Resolve a style index to its border. Returns 0 on success, -1 on
+ * out-of-range indices or workbooks without styles.xml. Sides without
+ * borders surface with `style_len == 0`. */
+int32_t zlsx_cell_border(zlsx_book_t *          book,
+                         uint32_t               style_idx,
+                         zlsx_cell_border_t *   out);
+
 /* ─── Writer (ABI v1, added in 0.2.2) ─────────────────────────────── */
 
 /*

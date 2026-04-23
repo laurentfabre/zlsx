@@ -241,6 +241,28 @@ pub const RichRun = struct {
     font_name: []const u8 = "",
 };
 
+/// One side of a cell border, parsed from `<left>/<right>/<top>/
+/// <bottom>/<diagonal>` inside a `<border>` element. `style` is the
+/// OOXML `style="…"` attribute (e.g. "thin", "medium", "thick",
+/// "double", "dashed"); empty when the side has no border or the
+/// element was self-closing. `color_argb` tracks the child
+/// `<color rgb="…"/>`; theme / indexed colors aren't resolved.
+pub const BorderSide = struct {
+    style: []const u8 = "",
+    color_argb: ?u32 = null,
+};
+
+/// Cell border, parsed from `xl/styles.xml` `<borders>`. Every side
+/// is always present in the struct — absent sides have `style=""`.
+/// The writer-side OOXML borders block covers the same five slots.
+pub const Border = struct {
+    left: BorderSide = .{},
+    right: BorderSide = .{},
+    top: BorderSide = .{},
+    bottom: BorderSide = .{},
+    diagonal: BorderSide = .{},
+};
+
 /// Cell fill, parsed from `xl/styles.xml` `<fills>`. `pattern` is the
 /// OOXML `patternType` attribute (e.g. "none", "solid", "darkDown",
 /// "gray125"); borrows from `styles_xml`. `fg_color_argb` / `bg_color_argb`
@@ -347,6 +369,12 @@ pub const Book = struct {
     /// One fillId per `<xf>` under `<cellXfs>`. Use
     /// `Book.cellFill(style_idx)` for the resolved lookup.
     cell_xf_fill_ids: []u32 = &.{},
+    /// `borders` table from styles.xml — index matches `borderId`.
+    /// BorderSide.style slices borrow from `styles_xml`.
+    borders: []Border = &.{},
+    /// One borderId per `<xf>` under `<cellXfs>`. Use
+    /// `Book.cellBorder(style_idx)` for the resolved lookup.
+    cell_xf_border_ids: []u32 = &.{},
     /// Owned backing storage for every string referenced by `sheets`,
     /// sheet_data keys, and entity-decoded shared strings.
     strings: std.ArrayListUnmanaged([]u8) = .{},
@@ -536,6 +564,16 @@ pub const Book = struct {
         return self.fills[fill_id];
     }
 
+    /// Border properties for a cell, resolved via the style index.
+    /// Returns null on out-of-range indices or workbooks without
+    /// styles.xml. Sides without a border surface with `style=""`.
+    pub fn cellBorder(self: *const Book, style_idx: u32) ?Border {
+        if (style_idx >= self.cell_xf_border_ids.len) return null;
+        const border_id = self.cell_xf_border_ids[style_idx];
+        if (border_id >= self.borders.len) return null;
+        return self.borders[border_id];
+    }
+
     pub fn deinit(self: *Book) void {
         const a = self.allocator;
         if (self.shared_strings_xml) |s| a.free(s);
@@ -570,8 +608,10 @@ pub const Book = struct {
         a.free(self.cell_xf_numfmt_ids);
         a.free(self.cell_xf_font_ids);
         a.free(self.cell_xf_fill_ids);
+        a.free(self.cell_xf_border_ids);
         a.free(self.fonts);
         a.free(self.fills);
+        a.free(self.borders);
         self.custom_num_fmts.deinit(a);
         if (self.styles_xml) |s| a.free(s);
 
@@ -1586,6 +1626,45 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
         book.fills = try fills_list.toOwnedSlice(book.allocator);
     }
 
+    // borders — optional. Shape:
+    //   <borders count="N">
+    //     <border>
+    //       <left style="thin"><color rgb="FF000000"/></left>
+    //       <right/>
+    //       <top style="thin"><color rgb="FF000000"/></top>
+    //       <bottom/>
+    //       <diagonal/>
+    //     </border>
+    //   </borders>
+    if (std.mem.indexOf(u8, xml, "<borders")) |bp| {
+        const bp_end = std.mem.indexOfPos(u8, xml, bp, "</borders>") orelse xml.len;
+        const block = xml[bp..bp_end];
+        var borders_list: std.ArrayListUnmanaged(Border) = .{};
+        errdefer borders_list.deinit(book.allocator);
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, block, i, "<border")) |border_pos| {
+            if (border_pos + 7 < block.len) {
+                const after = block[border_pos + 7];
+                // Skip the outer `<borders …>` wrapper tag.
+                if (after != '>' and after != ' ' and after != '/') {
+                    i = border_pos + 7;
+                    continue;
+                }
+            }
+            const gt = std.mem.indexOfScalarPos(u8, block, border_pos, '>') orelse break;
+            if (gt > 0 and block[gt - 1] == '/') {
+                try borders_list.append(book.allocator, .{});
+                i = gt + 1;
+                continue;
+            }
+            const border_close = std.mem.indexOfPos(u8, block, gt, "</border>") orelse break;
+            const body = block[gt + 1 .. border_close];
+            try borders_list.append(book.allocator, parseBorderBody(body));
+            i = border_close + "</border>".len;
+        }
+        book.borders = try borders_list.toOwnedSlice(book.allocator);
+    }
+
     // numFmts — optional. Shape: `<numFmts count="…"><numFmt numFmtId="164" formatCode="…"/>…</numFmts>`.
     if (std.mem.indexOf(u8, xml, "<numFmts")) |nfs_pos| {
         const nfs_end = std.mem.indexOfPos(u8, xml, nfs_pos, "</numFmts>") orelse xml.len;
@@ -1620,6 +1699,8 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
     errdefer font_ids.deinit(book.allocator);
     var fill_ids: std.ArrayListUnmanaged(u32) = .{};
     errdefer fill_ids.deinit(book.allocator);
+    var border_ids: std.ArrayListUnmanaged(u32) = .{};
+    errdefer border_ids.deinit(book.allocator);
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, xfs_block, i, "<xf ")) |xp| {
         const gt = std.mem.indexOfScalarPos(u8, xfs_block, xp, '>') orelse break;
@@ -1628,10 +1709,74 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
         try ids.append(book.allocator, parseXfAttrU32(attrs, "numFmtId=\"", 0));
         try font_ids.append(book.allocator, parseXfAttrU32(attrs, "fontId=\"", 0));
         try fill_ids.append(book.allocator, parseXfAttrU32(attrs, "fillId=\"", 0));
+        try border_ids.append(book.allocator, parseXfAttrU32(attrs, "borderId=\"", 0));
     }
     book.cell_xf_numfmt_ids = try ids.toOwnedSlice(book.allocator);
     book.cell_xf_font_ids = try font_ids.toOwnedSlice(book.allocator);
     book.cell_xf_fill_ids = try fill_ids.toOwnedSlice(book.allocator);
+    book.cell_xf_border_ids = try border_ids.toOwnedSlice(book.allocator);
+}
+
+/// Parse a single `<border>` body (between `<border>` and `</border>`)
+/// into a `Border`. Handles self-closing side tags (no border) and
+/// regular `<left style="thin"><color rgb="…"/></left>` shapes.
+fn parseBorderBody(body: []const u8) Border {
+    return .{
+        .left = parseBorderSide(body, "left"),
+        .right = parseBorderSide(body, "right"),
+        .top = parseBorderSide(body, "top"),
+        .bottom = parseBorderSide(body, "bottom"),
+        .diagonal = parseBorderSide(body, "diagonal"),
+    };
+}
+
+/// Look up one side element (`<left>`, `<right>`, `<top>`, `<bottom>`,
+/// `<diagonal>`) in the border body. Returns default `BorderSide`
+/// when the side is self-closing or absent. Parses `style="…"`
+/// attribute and `<color rgb="…"/>` child. Slices borrow from the
+/// input body (which itself borrows from `styles_xml`).
+fn parseBorderSide(body: []const u8, tag: []const u8) BorderSide {
+    var open_buf: [16]u8 = undefined;
+    const open = std.fmt.bufPrint(&open_buf, "<{s}", .{tag}) catch return .{};
+    const pos = std.mem.indexOf(u8, body, open) orelse return .{};
+    const after_tag = pos + open.len;
+    if (after_tag >= body.len) return .{};
+    // The next char must be space, `>`, or `/` (self-closing); anything
+    // else means we matched a longer tag like `<topics>` that happens
+    // to share a prefix — bail out.
+    const next = body[after_tag];
+    if (next != ' ' and next != '>' and next != '/') return .{};
+
+    const gt = std.mem.indexOfScalarPos(u8, body, pos, '>') orelse return .{};
+    const tag_body = body[pos..gt];
+    var side: BorderSide = .{};
+    const style_key = "style=\"";
+    if (std.mem.indexOf(u8, tag_body, style_key)) |sp| {
+        const s = sp + style_key.len;
+        if (std.mem.indexOfScalarPos(u8, tag_body, s, '"')) |e| {
+            side.style = tag_body[s..e];
+        }
+    }
+    // Self-closing → no color child.
+    if (gt > 0 and body[gt - 1] == '/') return side;
+
+    // Otherwise look for a <color rgb="…"/> before the matching close tag.
+    var close_buf: [24]u8 = undefined;
+    const close_s = std.fmt.bufPrint(&close_buf, "</{s}>", .{tag}) catch return side;
+    const close_pos = std.mem.indexOfPos(u8, body, gt, close_s) orelse return side;
+    const inner = body[gt + 1 .. close_pos];
+    if (std.mem.indexOf(u8, inner, "<color")) |cp| {
+        const cgt = std.mem.indexOfScalarPos(u8, inner, cp, '>') orelse return side;
+        const color_tag = inner[cp..cgt];
+        const rgb_key = "rgb=\"";
+        if (std.mem.indexOf(u8, color_tag, rgb_key)) |kp| {
+            const s = kp + rgb_key.len;
+            if (std.mem.indexOfScalarPos(u8, color_tag, s, '"')) |e| {
+                side.color_argb = std.fmt.parseInt(u32, color_tag[s..e], 16) catch null;
+            }
+        }
+    }
+    return side;
 }
 
 /// Parse a `<fill>` body slice (everything between `<fill>` and
@@ -2487,6 +2632,53 @@ test "Book.cellFont: round-trips bold / color / size / name from xl/styles.xml" 
     // cellFont should still return non-null.
     const s2 = styles[2] orelse 0;
     try std.testing.expect(book.cellFont(s2) != null);
+}
+
+test "Book.cellBorder: round-trip sided styles + color through writer" {
+    const tmp_path = "/tmp/zlsx_reader_cell_border.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        const boxed = try w.addStyle(.{
+            .border_left = .{ .style = .thin, .color_argb = 0xFF000000 },
+            .border_right = .{ .style = .thin, .color_argb = 0xFF000000 },
+            .border_top = .{ .style = .medium, .color_argb = 0xFFFF0000 },
+            .border_bottom = .{ .style = .medium, .color_argb = 0xFFFF0000 },
+        });
+        var sheet = try w.addSheet("S");
+        try sheet.writeRowStyled(
+            &.{ .{ .string = "boxed" }, .{ .string = "plain" } },
+            &.{ boxed, 0 },
+        );
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    _ = try rows.next();
+    const styles = rows.styleIndices();
+
+    const s0 = styles[0] orelse return error.TestUnexpectedResult;
+    const b0 = book.cellBorder(s0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("thin", b0.left.style);
+    try std.testing.expectEqual(@as(?u32, 0xFF000000), b0.left.color_argb);
+    try std.testing.expectEqualStrings("thin", b0.right.style);
+    try std.testing.expectEqualStrings("medium", b0.top.style);
+    try std.testing.expectEqual(@as(?u32, 0xFFFF0000), b0.top.color_argb);
+    try std.testing.expectEqualStrings("medium", b0.bottom.style);
+    try std.testing.expectEqualStrings("", b0.diagonal.style);
+
+    // Default style resolves to a Border with all empty sides.
+    const s1 = styles[1] orelse 0;
+    const b1 = book.cellBorder(s1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("", b1.left.style);
+    try std.testing.expectEqualStrings("", b1.top.style);
 }
 
 test "Book.cellFill: round-trip solid fg/bg and pattern 'none' default" {

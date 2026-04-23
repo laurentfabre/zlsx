@@ -616,6 +616,36 @@ if _HAS_CELL_FILL:
     lib.zlsx_cell_fill.restype = ctypes.c_int32
 
 
+class CBorderSide(ctypes.Structure):
+    _fields_ = [
+        ("has_color", ctypes.c_uint8),
+        ("_pad", ctypes.c_uint8 * 3),
+        ("color_argb", ctypes.c_uint32),
+        ("style_len", ctypes.c_size_t),
+        ("style_ptr", ctypes.POINTER(ctypes.c_ubyte)),
+    ]
+
+
+class CCellBorder(ctypes.Structure):
+    _fields_ = [
+        ("left", CBorderSide),
+        ("right", CBorderSide),
+        ("top", CBorderSide),
+        ("bottom", CBorderSide),
+        ("diagonal", CBorderSide),
+    ]
+
+
+_HAS_CELL_BORDER = hasattr(lib, "zlsx_cell_border")
+if _HAS_CELL_BORDER:
+    lib.zlsx_cell_border.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.POINTER(CCellBorder),
+    ]
+    lib.zlsx_cell_border.restype = ctypes.c_int32
+
+
 _HAS_STYLES_EX = hasattr(lib, "zlsx_writer_add_style_ex")
 if _HAS_STYLES_EX:
     lib.zlsx_writer_add_style_ex.argtypes = [

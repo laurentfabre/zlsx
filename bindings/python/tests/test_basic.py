@@ -913,6 +913,51 @@ def test_book_cell_fill_round_trip(tmp_path):
         assert book.cell_fill(99999) is None
 
 
+def test_book_cell_border_round_trip(tmp_path):
+    """Writer emits a boxed cell; reader resolves via
+    `Book.cell_border(style_idx)`. Sides without a border come back
+    with `style=""`."""
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_CELL_BORDER:
+        pytest.skip("loaded libzlsx predates cell_border ABI (0.2.6+)")
+
+    out = tmp_path / "border.xlsx"
+    with zlsx.write(out) as w:
+        boxed = w.add_style(zlsx.Style(
+            border_left=zlsx.BorderSide(style="thin", color_argb=0xFF000000),
+            border_right=zlsx.BorderSide(style="thin", color_argb=0xFF000000),
+            border_top=zlsx.BorderSide(style="medium", color_argb=0xFFFF0000),
+            border_bottom=zlsx.BorderSide(style="medium", color_argb=0xFFFF0000),
+        ))
+        sheet = w.add_sheet("S")
+        sheet.write_row(["boxed", "plain"], styles=[boxed, 0])
+
+    with zlsx.open(out) as book:
+        with book.sheet(0).rows() as rows:
+            next(rows)
+            styles = rows.style_indices()
+            s0, s1 = styles
+
+            b0 = book.cell_border(s0)
+            assert b0 is not None
+            assert b0.left.style == "thin"
+            assert b0.left.color_argb == 0xFF000000
+            assert b0.right.style == "thin"
+            assert b0.top.style == "medium"
+            assert b0.top.color_argb == 0xFFFF0000
+            assert b0.bottom.style == "medium"
+            assert b0.diagonal.style == ""
+
+            if s1 is not None:
+                b1 = book.cell_border(s1)
+                assert b1 is not None
+                assert b1.left.style == ""
+                assert b1.top.style == ""
+
+        assert book.cell_border(99999) is None
+
+
 def test_writer_add_data_validation_rejects_invalid_inputs(tmp_path):
     """Exercise every error path on the extended writer DV APIs so the
     rejection behaviour from the Zig writer surfaces cleanly."""
