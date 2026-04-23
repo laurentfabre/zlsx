@@ -169,6 +169,49 @@ int32_t zlsx_hyperlink_at(zlsx_book_t *      book,
                           zlsx_hyperlink_t * out);
 
 /*
+ * Data-validation entry. `values_count` is the number of dropdown
+ * options for type="list" validations; other variants still surface
+ * the range with values_count=0. Values themselves are pulled via
+ * `zlsx_data_validation_value_at` since extern structs can't hold
+ * slice-of-slices.
+ */
+typedef struct {
+    uint32_t top_left_col;
+    uint32_t top_left_row;
+    uint32_t bottom_right_col;
+    uint32_t bottom_right_row;
+    size_t   values_count;
+} zlsx_data_validation_t;
+
+/*
+ * Number of data validations on sheet `sheet_idx`. Returns 0 if the
+ * index is out of range or the sheet has none.
+ */
+size_t zlsx_data_validation_count(zlsx_book_t * book, uint32_t sheet_idx);
+
+/*
+ * Copy data validation `dv_idx` into `out`. Returns 0 on success or
+ * -1 if either index is out of range.
+ */
+int32_t zlsx_data_validation_at(zlsx_book_t *            book,
+                                uint32_t                 sheet_idx,
+                                size_t                   dv_idx,
+                                zlsx_data_validation_t * out);
+
+/*
+ * Copy dropdown value `value_idx` of validation `dv_idx` on sheet
+ * `sheet_idx` into `*out_ptr` / `*out_len`. The pointer is into the
+ * Book's internal buffers and is valid until `zlsx_book_close`.
+ * Returns 0 on success or -1 if any index is out of range.
+ */
+int32_t zlsx_data_validation_value_at(zlsx_book_t *     book,
+                                      uint32_t          sheet_idx,
+                                      size_t            dv_idx,
+                                      size_t            value_idx,
+                                      const uint8_t * * out_ptr,
+                                      size_t *          out_len);
+
+/*
  * Open a row iterator for sheet `sheet_idx`. On failure returns NULL
  * and writes a diagnostic into err_buf as per zlsx_book_open().
  *

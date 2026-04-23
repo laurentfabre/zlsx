@@ -47,6 +47,7 @@ __all__ = [
     "CellRef",
     "MergeRange",
     "Hyperlink",
+    "DataValidation",
     "ZlsxError",
 ]
 
@@ -232,6 +233,18 @@ class Hyperlink:
     url: str
 
 
+@dataclass(frozen=True)
+class DataValidation:
+    """A list-type (dropdown) data validation on a cell or range.
+    ``values`` is empty when the source validation isn't a literal
+    list — callers still see the range so every validation is
+    enumerable. String values are entity-decoded (``R&D`` not
+    ``R&amp;D``)."""
+    top_left: CellRef
+    bottom_right: CellRef
+    values: tuple[str, ...]
+
+
 # ─── Book ─────────────────────────────────────────────────────────────
 
 
@@ -334,6 +347,47 @@ class Book:
                 top_left=CellRef(col=hl.top_left_col, row=hl.top_left_row),
                 bottom_right=CellRef(col=hl.bottom_right_col, row=hl.bottom_right_row),
                 url=url,
+            ))
+        return out
+
+    def data_validations(self, sheet_idx: int) -> list[DataValidation]:
+        """List-type data validations (dropdowns) on ``sheet_idx``.
+        Empty list for sheets without a ``<dataValidations>`` block.
+        Non-list variants still surface the range with an empty
+        ``values`` tuple."""
+        if not self._handle:
+            raise ZlsxError("book is closed")
+        if not _ffi._HAS_READER_DV:
+            raise RuntimeError(
+                "loaded libzlsx does not expose data_validations "
+                "(requires 0.2.5+); upgrade libzlsx"
+            )
+        count = _ffi.lib.zlsx_data_validation_count(self._handle, sheet_idx)
+        out: list[DataValidation] = []
+        dv = _ffi.CDataValidation()
+        for i in range(count):
+            rc = _ffi.lib.zlsx_data_validation_at(
+                self._handle, sheet_idx, i, ctypes.byref(dv)
+            )
+            if rc != 0:
+                continue
+            vals: list[str] = []
+            vptr = ctypes.POINTER(ctypes.c_ubyte)()
+            vlen = ctypes.c_size_t(0)
+            for vi in range(dv.values_count):
+                vrc = _ffi.lib.zlsx_data_validation_value_at(
+                    self._handle, sheet_idx, i, vi,
+                    ctypes.byref(vptr), ctypes.byref(vlen),
+                )
+                if vrc != 0:
+                    continue
+                vals.append(
+                    ctypes.string_at(vptr, vlen.value).decode("utf-8", errors="replace")
+                )
+            out.append(DataValidation(
+                top_left=CellRef(col=dv.top_left_col, row=dv.top_left_row),
+                bottom_right=CellRef(col=dv.bottom_right_col, row=dv.bottom_right_row),
+                values=tuple(vals),
             ))
         return out
 

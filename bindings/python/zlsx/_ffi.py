@@ -390,6 +390,38 @@ if _HAS_READER_META:
     lib.zlsx_hyperlink_at.restype = ctypes.c_int32
 
 
+class CDataValidation(ctypes.Structure):
+    _fields_ = [
+        ("top_left_col", ctypes.c_uint32),
+        ("top_left_row", ctypes.c_uint32),
+        ("bottom_right_col", ctypes.c_uint32),
+        ("bottom_right_row", ctypes.c_uint32),
+        ("values_count", ctypes.c_size_t),
+    ]
+
+
+_HAS_READER_DV = hasattr(lib, "zlsx_data_validation_count")
+if _HAS_READER_DV:
+    lib.zlsx_data_validation_count.argtypes = [book_handle, ctypes.c_uint32]
+    lib.zlsx_data_validation_count.restype = ctypes.c_size_t
+    lib.zlsx_data_validation_at.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.c_size_t,
+        ctypes.POINTER(CDataValidation),
+    ]
+    lib.zlsx_data_validation_at.restype = ctypes.c_int32
+    lib.zlsx_data_validation_value_at.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.zlsx_data_validation_value_at.restype = ctypes.c_int32
+
+
 _HAS_STYLES_EX = hasattr(lib, "zlsx_writer_add_style_ex")
 if _HAS_STYLES_EX:
     lib.zlsx_writer_add_style_ex.argtypes = [

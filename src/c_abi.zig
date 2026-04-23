@@ -340,6 +340,73 @@ export fn zlsx_hyperlink_at(
     return 0;
 }
 
+/// C-shape for a single data-validation entry. `values_count` is the
+/// number of dropdown options (0 for non-list validations); callers
+/// must iterate via `zlsx_data_validation_value_at` to pull each
+/// value's `ptr`/`len` since extern structs can't hold slice-of-slice.
+pub const CDataValidation = extern struct {
+    top_left_col: u32,
+    top_left_row: u32,
+    bottom_right_col: u32,
+    bottom_right_row: u32,
+    values_count: usize,
+};
+
+/// Number of data validations on sheet `idx`. Returns 0 if the index
+/// is out of range or the sheet has none.
+export fn zlsx_data_validation_count(book: *Book, idx: u32) callconv(.c) usize {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (idx >= state.inner.sheets.len) return 0;
+    return state.inner.dataValidations(state.inner.sheets[idx]).len;
+}
+
+/// Copy data validation `dv_idx` on sheet `idx` into `out`. Returns
+/// 0 on success, -1 if either index is out of range. To read the
+/// individual dropdown values use `zlsx_data_validation_value_at`.
+export fn zlsx_data_validation_at(
+    book: *Book,
+    idx: u32,
+    dv_idx: usize,
+    out: *CDataValidation,
+) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (idx >= state.inner.sheets.len) return -1;
+    const dvs = state.inner.dataValidations(state.inner.sheets[idx]);
+    if (dv_idx >= dvs.len) return -1;
+    const d = dvs[dv_idx];
+    out.* = .{
+        .top_left_col = d.top_left.col,
+        .top_left_row = d.top_left.row,
+        .bottom_right_col = d.bottom_right.col,
+        .bottom_right_row = d.bottom_right.row,
+        .values_count = d.values.len,
+    };
+    return 0;
+}
+
+/// Copy dropdown value `value_idx` of data validation `dv_idx` on
+/// sheet `idx` into `out_ptr` / `out_len` (the pointer is into the
+/// Book's internal buffers; do not free). Returns 0 on success or -1
+/// if any index is out of range.
+export fn zlsx_data_validation_value_at(
+    book: *Book,
+    idx: u32,
+    dv_idx: usize,
+    value_idx: usize,
+    out_ptr: *[*]const u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (idx >= state.inner.sheets.len) return -1;
+    const dvs = state.inner.dataValidations(state.inner.sheets[idx]);
+    if (dv_idx >= dvs.len) return -1;
+    const vs = dvs[dv_idx].values;
+    if (value_idx >= vs.len) return -1;
+    out_ptr.* = vs[value_idx].ptr;
+    out_len.* = vs[value_idx].len;
+    return 0;
+}
+
 /// Find a sheet by name. Returns the 0-based index, or -1 if not found.
 export fn zlsx_sheet_index_by_name(
     book: *Book,
@@ -1176,6 +1243,60 @@ test "writer: round-trip via reader" {
     const r2 = (try rows.next()).?;
     try std.testing.expectEqualStrings("Alice", r2[0].string);
     try std.testing.expectEqual(@as(i64, 30), r2[1].integer);
+}
+
+test "reader C ABI: data_validation getters round-trip" {
+    const tmp_path = "/tmp/zlsx_c_abi_reader_dv.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = xlsx.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("S");
+        try sheet.addDataValidationList("A2:A10", &.{ "Red", "Green", "Blue" });
+        try sheet.addDataValidationList("B2", &.{"Single"});
+        // XML-escaped chars must survive writer → reader → C ABI.
+        try sheet.addDataValidationList("C3", &.{ "R&D", "Q<A" });
+        try sheet.writeRow(&.{.{ .string = "hdr" }});
+        try w.save(tmp_path);
+    }
+
+    var err_buf: [128]u8 = undefined;
+    const book = zlsx_book_open(tmp_path, &err_buf, err_buf.len);
+    try std.testing.expect(book != null);
+    defer zlsx_book_close(book);
+
+    try std.testing.expectEqual(@as(usize, 3), zlsx_data_validation_count(book.?, 0));
+    try std.testing.expectEqual(@as(usize, 0), zlsx_data_validation_count(book.?, 99));
+
+    var dv: CDataValidation = undefined;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_data_validation_at(book.?, 0, 0, &dv));
+    try std.testing.expectEqual(@as(u32, 0), dv.top_left_col);
+    try std.testing.expectEqual(@as(u32, 2), dv.top_left_row);
+    try std.testing.expectEqual(@as(u32, 0), dv.bottom_right_col);
+    try std.testing.expectEqual(@as(u32, 10), dv.bottom_right_row);
+    try std.testing.expectEqual(@as(usize, 3), dv.values_count);
+
+    var vptr: [*]const u8 = undefined;
+    var vlen: usize = undefined;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_data_validation_value_at(book.?, 0, 0, 0, &vptr, &vlen));
+    try std.testing.expectEqualStrings("Red", vptr[0..vlen]);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_data_validation_value_at(book.?, 0, 0, 1, &vptr, &vlen));
+    try std.testing.expectEqualStrings("Green", vptr[0..vlen]);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_data_validation_value_at(book.?, 0, 0, 2, &vptr, &vlen));
+    try std.testing.expectEqualStrings("Blue", vptr[0..vlen]);
+    try std.testing.expectEqual(@as(i32, -1), zlsx_data_validation_value_at(book.?, 0, 0, 3, &vptr, &vlen));
+
+    // Entity-decoded output on the 3rd validation.
+    try std.testing.expectEqual(@as(i32, 0), zlsx_data_validation_at(book.?, 0, 2, &dv));
+    try std.testing.expectEqual(@as(usize, 2), dv.values_count);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_data_validation_value_at(book.?, 0, 2, 0, &vptr, &vlen));
+    try std.testing.expectEqualStrings("R&D", vptr[0..vlen]);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_data_validation_value_at(book.?, 0, 2, 1, &vptr, &vlen));
+    try std.testing.expectEqualStrings("Q<A", vptr[0..vlen]);
+
+    try std.testing.expectEqual(@as(i32, -1), zlsx_data_validation_at(book.?, 0, 3, &dv));
+    try std.testing.expectEqual(@as(i32, -1), zlsx_data_validation_at(book.?, 99, 0, &dv));
 }
 
 test "reader C ABI: merged_range + hyperlink getters round-trip" {
