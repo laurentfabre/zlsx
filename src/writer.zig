@@ -561,14 +561,22 @@ pub const Writer = struct {
             }
 
             // <hyperlinks> follows <mergeCells> per ECMA-376 ordering.
-            // The r:id values reference entries in the per-sheet
-            // _rels file written below.
-            if (sw.hyperlinks.items.len > 0) {
+            // External entries get r:id references into the per-sheet
+            // _rels file written below; internal entries use
+            // `location="…"` with no rels coupling.
+            if (sw.hyperlinks.items.len > 0 or sw.internal_hyperlinks.items.len > 0) {
                 try full.appendSlice(alloc, "<hyperlinks>");
                 for (sw.hyperlinks.items, 0..) |h, idx| {
                     try full.appendSlice(alloc, "<hyperlink ref=\"");
                     try appendXmlEscaped(alloc, &full, h.range);
                     try full.print(alloc, "\" r:id=\"rId{d}\"/>", .{idx + 1});
+                }
+                for (sw.internal_hyperlinks.items) |h| {
+                    try full.appendSlice(alloc, "<hyperlink ref=\"");
+                    try appendXmlEscaped(alloc, &full, h.range);
+                    try full.appendSlice(alloc, "\" location=\"");
+                    try appendXmlEscaped(alloc, &full, h.location);
+                    try full.appendSlice(alloc, "\"/>");
                 }
                 try full.appendSlice(alloc, "</hyperlinks>");
             }
@@ -643,6 +651,14 @@ pub const Hyperlink = struct {
     url: []u8,
 };
 
+/// Internal-target hyperlink — jumps to another cell or range within
+/// the same workbook. Emitted as `<hyperlink ref="…" location="…"/>`
+/// (no r:id, no rels entry). Both fields SheetWriter-owned.
+pub const InternalHyperlink = struct {
+    range: []u8,
+    location: []u8,
+};
+
 /// List-type data validation (dropdown) bound to a cell or range.
 /// `values` are the literal dropdown options — Excel joins them with
 /// commas inside a quoted formula1 string. All fields SheetWriter-owned.
@@ -670,6 +686,13 @@ pub const SheetWriter = struct {
     next_row: u32 = 1,
     // Stage 5: per-sheet layout features.
     column_widths: std.ArrayListUnmanaged(ColumnWidth) = .{},
+    /// Row-height overrides keyed by 0-based row index (0 = row 1).
+    /// Height is in Excel point units (default 15.0). Emitted on the
+    /// matching `<row>` as `ht="…" customHeight="1"`. Rows emit
+    /// sequentially inside `writeRow`, so callers must set the
+    /// override BEFORE the corresponding row is written — later calls
+    /// on an already-emitted row are silently ignored.
+    row_heights: std.AutoHashMapUnmanaged(u32, f32) = .{},
     /// Number of rows frozen at the top (1 = freeze row 1). 0 = none.
     freeze_rows: u32 = 0,
     /// Number of columns frozen at the left (1 = freeze column A). 0 = none.
@@ -684,6 +707,10 @@ pub const SheetWriter = struct {
     /// Each entry gets an rId in `xl/worksheets/_rels/sheetN.xml.rels`
     /// whose position in this list is its 1-based rId index.
     hyperlinks: std.ArrayListUnmanaged(Hyperlink) = .{},
+    /// Internal (same-workbook) hyperlinks. No rels entry — emitted
+    /// alongside external hyperlinks inside the `<hyperlinks>` block
+    /// using `location="…"` instead of `r:id`.
+    internal_hyperlinks: std.ArrayListUnmanaged(InternalHyperlink) = .{},
     /// List-type data validations (dropdowns). Emitted as a single
     /// `<dataValidations>` block with one `<dataValidation>` per entry.
     data_validations: std.ArrayListUnmanaged(DataValidationList) = .{},
@@ -699,6 +726,7 @@ pub const SheetWriter = struct {
         self.parent.allocator.free(self.name);
         self.body.deinit(self.parent.allocator);
         self.column_widths.deinit(self.parent.allocator);
+        self.row_heights.deinit(self.parent.allocator);
         if (self.auto_filter_range) |r| self.parent.allocator.free(r);
         for (self.merged_cells.items) |r| self.parent.allocator.free(r);
         self.merged_cells.deinit(self.parent.allocator);
@@ -707,6 +735,11 @@ pub const SheetWriter = struct {
             self.parent.allocator.free(h.url);
         }
         self.hyperlinks.deinit(self.parent.allocator);
+        for (self.internal_hyperlinks.items) |h| {
+            self.parent.allocator.free(h.range);
+            self.parent.allocator.free(h.location);
+        }
+        self.internal_hyperlinks.deinit(self.parent.allocator);
         for (self.data_validations.items) |dv| {
             self.parent.allocator.free(dv.range);
             for (dv.values) |v| self.parent.allocator.free(v);
@@ -733,6 +766,18 @@ pub const SheetWriter = struct {
     /// Freeze the top `rows` rows and left `cols` columns. Pass 0 to
     /// disable one axis (e.g., `freezePanes(1, 0)` freezes only row 1).
     /// Calling again overrides the previous setting.
+    /// Set `row_idx`'s height in Excel point units (default row
+    /// height is ~15 pt). `row_idx` is 0-based (0 = row 1). Must be
+    /// called before the matching `writeRow` / `writeRowStyled` — the
+    /// row is emitted inline at that time, and a post-hoc call on an
+    /// already-emitted row is silently ignored (no retroactive XML
+    /// rewrite). Later calls on the same row_idx override earlier
+    /// ones as long as the row hasn't been written yet.
+    pub fn setRowHeight(self: *SheetWriter, row_idx: u32, height: f32) !void {
+        if (!std.math.isFinite(height) or height <= 0) return error.InvalidRowHeight;
+        try self.row_heights.put(self.parent.allocator, row_idx, height);
+    }
+
     pub fn freezePanes(self: *SheetWriter, rows: u32, cols: u32) void {
         self.freeze_rows = rows;
         self.freeze_cols = cols;
@@ -821,11 +866,31 @@ pub const SheetWriter = struct {
         });
     }
 
+    /// Attach an internal hyperlink that jumps to another cell or
+    /// range within the same workbook. `location` is an OOXML
+    /// workbook-scoped reference like `Sheet2!A1`, `'My Sheet'!B2:C3`,
+    /// or a named range. Emitted as `<hyperlink ref="…" location="…"/>`
+    /// without an r:id — no `_rels` entry needed. `range` validation
+    /// matches `addHyperlink` (single-cell or rectangle A1-style);
+    /// empty `location` strings are rejected.
+    pub fn addInternalHyperlink(self: *SheetWriter, range: []const u8, location: []const u8) !void {
+        try validateHyperlinkRange(range);
+        if (location.len == 0) return error.InvalidHyperlinkLocation;
+        const range_copy = try self.parent.allocator.dupe(u8, range);
+        errdefer self.parent.allocator.free(range_copy);
+        const loc_copy = try self.parent.allocator.dupe(u8, location);
+        errdefer self.parent.allocator.free(loc_copy);
+        try self.internal_hyperlinks.append(self.parent.allocator, .{
+            .range = range_copy,
+            .location = loc_copy,
+        });
+    }
+
     /// Write a row of cells. Empty cells are omitted from the output
     /// (OOXML treats missing cells as empty). Strings are interned into
     /// the parent's SST.
     pub fn writeRow(self: *SheetWriter, cells: []const xlsx.Cell) !void {
-        return self.writeRowImpl(cells, null);
+        return self.writeRowImpl(cells, null, null);
     }
 
     /// Write a row with per-cell style indices. `styles.len` must equal
@@ -850,13 +915,31 @@ pub const SheetWriter = struct {
         for (styles) |sid| {
             if (sid > max_style_id) return error.UnknownStyleId;
         }
-        return self.writeRowImpl(cells, styles);
+        return self.writeRowImpl(cells, styles, null);
+    }
+
+    /// Write a row where some cells carry formulas. `formulas.len`
+    /// must equal `cells.len`. Non-null `formulas[i]` attaches the
+    /// formula text (without leading `=`) to that cell — the
+    /// accompanying `cells[i]` value is emitted as the `<v>` cached
+    /// result Excel displays until the sheet is recalculated. Pass
+    /// `.empty` for a formula cell with no cached value (Excel will
+    /// show 0 initially). Pass `null` in slot `i` for a regular
+    /// value cell.
+    pub fn writeRowWithFormulas(
+        self: *SheetWriter,
+        cells: []const xlsx.Cell,
+        formulas: []const ?[]const u8,
+    ) !void {
+        if (formulas.len != cells.len) return error.FormulaCountMismatch;
+        return self.writeRowImpl(cells, null, formulas);
     }
 
     fn writeRowImpl(
         self: *SheetWriter,
         cells: []const xlsx.Cell,
         styles: ?[]const u32,
+        formulas: ?[]const ?[]const u8,
     ) !void {
         // Pre-validate integers BEFORE mutating `self.body`. This keeps
         // writeRow atomic on IntegerExceedsExcelPrecision so the caller
@@ -868,56 +951,69 @@ pub const SheetWriter = struct {
         };
 
         const alloc = self.parent.allocator;
-        try self.body.print(alloc, "<row r=\"{d}\">", .{self.next_row});
+        // Row index is 0-based inside the height map; next_row is
+        // 1-based per xlsx convention, so subtract 1 on lookup.
+        if (self.row_heights.get(self.next_row - 1)) |h| {
+            try self.body.print(alloc, "<row r=\"{d}\" ht=\"{d}\" customHeight=\"1\">", .{ self.next_row, h });
+        } else {
+            try self.body.print(alloc, "<row r=\"{d}\">", .{self.next_row});
+        }
 
         for (cells, 0..) |cell, col_idx| {
             const style_id: u32 = if (styles) |s| s[col_idx] else 0;
+            const formula: ?[]const u8 = if (formulas) |fs| fs[col_idx] else null;
+
             // `<c>` elements for empty cells are only emitted when a
-            // non-default style is applied — otherwise OOXML's
-            // "missing cell = empty" rule keeps the sheet smaller.
-            if (cell == .empty and style_id == 0) continue;
+            // non-default style is applied OR a formula is attached —
+            // otherwise OOXML's "missing cell = empty" rule keeps the
+            // sheet smaller.
+            if (cell == .empty and style_id == 0 and formula == null) continue;
 
             var ref_buf: [16]u8 = undefined;
             const ref = try formatCellRef(&ref_buf, self.next_row, @intCast(col_idx));
 
+            // Self-closing fast path: styled but empty, no formula.
+            // Preserves byte-for-byte output with the pre-formula
+            // revision so existing round-trip tests stay valid.
+            if (cell == .empty and formula == null) {
+                try self.body.print(alloc, "<c r=\"{s}\" s=\"{d}\"/>", .{ ref, style_id });
+                continue;
+            }
+
+            // Fall-through emission pattern:
+            //   <c r="…"[ s="N"][ t="s|b"]>[<f>formula</f>][<v>value</v>]</c>
+            // The non-formula paths match the pre-refactor byte output
+            // so the grep-style test assertions stay stable.
+            const type_attr: []const u8 = switch (cell) {
+                .string => " t=\"s\"",
+                .boolean => " t=\"b\"",
+                else => "",
+            };
+            if (style_id == 0) {
+                try self.body.print(alloc, "<c r=\"{s}\"{s}>", .{ ref, type_attr });
+            } else {
+                try self.body.print(alloc, "<c r=\"{s}\" s=\"{d}\"{s}>", .{ ref, style_id, type_attr });
+            }
+
+            if (formula) |f| {
+                try self.body.appendSlice(alloc, "<f>");
+                try appendXmlEscaped(alloc, &self.body, f);
+                try self.body.appendSlice(alloc, "</f>");
+            }
+
             switch (cell) {
-                .empty => {
-                    // Styled-but-empty cell: emit just `<c r="…" s="N"/>`.
-                    try self.body.print(alloc, "<c r=\"{s}\" s=\"{d}\"/>", .{ ref, style_id });
-                },
+                .empty => {}, // formula-only cell: no cached value
                 .string => |s| {
                     const idx = try self.parent.sstIntern(s);
                     self.parent.sst_count += 1;
-                    if (style_id == 0) {
-                        try self.body.print(alloc, "<c r=\"{s}\" t=\"s\"><v>{d}</v></c>", .{ ref, idx });
-                    } else {
-                        try self.body.print(alloc, "<c r=\"{s}\" s=\"{d}\" t=\"s\"><v>{d}</v></c>", .{ ref, style_id, idx });
-                    }
+                    try self.body.print(alloc, "<v>{d}</v>", .{idx});
                 },
-                .integer => |n| {
-                    if (style_id == 0) {
-                        try self.body.print(alloc, "<c r=\"{s}\"><v>{d}</v></c>", .{ ref, n });
-                    } else {
-                        try self.body.print(alloc, "<c r=\"{s}\" s=\"{d}\"><v>{d}</v></c>", .{ ref, style_id, n });
-                    }
-                },
-                .number => |f| {
-                    // {d} renders the shortest round-trip decimal; Excel
-                    // accepts decimal or scientific notation in <v>.
-                    if (style_id == 0) {
-                        try self.body.print(alloc, "<c r=\"{s}\"><v>{d}</v></c>", .{ ref, f });
-                    } else {
-                        try self.body.print(alloc, "<c r=\"{s}\" s=\"{d}\"><v>{d}</v></c>", .{ ref, style_id, f });
-                    }
-                },
-                .boolean => |b| {
-                    if (style_id == 0) {
-                        try self.body.print(alloc, "<c r=\"{s}\" t=\"b\"><v>{d}</v></c>", .{ ref, @intFromBool(b) });
-                    } else {
-                        try self.body.print(alloc, "<c r=\"{s}\" s=\"{d}\" t=\"b\"><v>{d}</v></c>", .{ ref, style_id, @intFromBool(b) });
-                    }
-                },
+                .integer => |n| try self.body.print(alloc, "<v>{d}</v>", .{n}),
+                .number => |f| try self.body.print(alloc, "<v>{d}</v>", .{f}),
+                .boolean => |b| try self.body.print(alloc, "<v>{d}</v>", .{@intFromBool(b)}),
             }
+
+            try self.body.appendSlice(alloc, "</c>");
         }
 
         try self.body.appendSlice(alloc, "</row>");
@@ -2198,6 +2294,153 @@ test "Writer: stage-5 number format registers + emits numFmts" {
     try std.testing.expect(std.mem.indexOf(u8, styles_xml, "formatCode=\"$#,##0.00\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, styles_xml, "formatCode=\"0.00%\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, styles_xml, "applyNumberFormat=\"1\"") != null);
+}
+
+test "Writer: writeRowWithFormulas emits <f> + cached <v> correctly" {
+    const tmp_path = "/tmp/zlsx_writer_formulas.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Calc");
+
+        // Header row — plain values.
+        try sheet.writeRow(&.{ .{ .string = "A" }, .{ .string = "B" }, .{ .string = "Sum" } });
+        // Data row — plain.
+        try sheet.writeRow(&.{ .{ .integer = 10 }, .{ .integer = 20 }, .empty });
+        // Formula row — col 2 is =A2+B2 with cached value 30; no formula in 0/1.
+        try sheet.writeRowWithFormulas(
+            &.{ .{ .integer = 100 }, .{ .integer = 200 }, .{ .integer = 300 } },
+            &.{ null, null, "A2+B2" },
+        );
+        // Formula cell with no cached value (Excel shows 0 until recalc).
+        try sheet.writeRowWithFormulas(
+            &.{ .empty, .empty, .empty },
+            &.{ null, null, "NOW()" },
+        );
+        // XML-special char inside formula must be escaped.
+        try sheet.writeRowWithFormulas(
+            &.{ .{ .string = "foo" }, .empty, .empty },
+            &.{ null, null, "IF(A5>5,\"big\",\"small\")" },
+        );
+
+        // Rejection — length mismatch.
+        try std.testing.expectError(
+            error.FormulaCountMismatch,
+            sheet.writeRowWithFormulas(&.{ .empty, .empty }, &.{null}),
+        );
+
+        try w.save(tmp_path);
+    }
+
+    const sheet_xml = blk: {
+        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        var fbuf: [4096]u8 = undefined;
+        var fr = file.reader(&fbuf);
+        var iter = try std.zip.Iterator.init(&fr);
+        var name_buf: [64]u8 = undefined;
+        while (try iter.next()) |entry| {
+            if (entry.filename_len > name_buf.len) continue;
+            try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            const fn_slice = name_buf[0..entry.filename_len];
+            try fr.interface.readSliceAll(fn_slice);
+            if (std.mem.eql(u8, fn_slice, "xl/worksheets/sheet1.xml")) {
+                break :blk try extractEntryForTest(std.testing.allocator, entry, &fr);
+            }
+        }
+        return error.SheetXmlNotFound;
+    };
+    defer std.testing.allocator.free(sheet_xml);
+
+    // Row 3: formula with cached integer 300.
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<c r=\"C3\"><f>A2+B2</f><v>300</v></c>") != null);
+    // Row 4: formula with no cached value → no <v>.
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<c r=\"C4\"><f>NOW()</f></c>") != null);
+    // Row 5: formula with XML-special chars in body — `>` and `"`
+    // must be entity-escaped (`>` is optional but our escape path
+    // emits `&gt;`; `"` becomes `&quot;`).
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<f>IF(A5&gt;5,&quot;big&quot;,&quot;small&quot;)</f>") != null);
+
+    // Round-trip through the reader — the cached values are what
+    // `Cell.number` / `.integer` will surface since the reader
+    // only reads the `<v>` cached result, not the formula text.
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    _ = (try rows.next()).?; // header
+    _ = (try rows.next()).?; // data
+    const r3 = (try rows.next()).?;
+    try std.testing.expectEqual(@as(i64, 300), r3[2].integer);
+}
+
+test "Writer: setRowHeight emits ht + customHeight, only on marked rows" {
+    const tmp_path = "/tmp/zlsx_writer_row_heights.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Sheet1");
+
+        // Tall header + normal body row + taller footer.
+        try sheet.setRowHeight(0, 30.0); // row 1
+        try sheet.setRowHeight(2, 42.5); // row 3
+
+        try sheet.writeRow(&.{.{ .string = "header" }});
+        try sheet.writeRow(&.{.{ .string = "body" }});
+        try sheet.writeRow(&.{.{ .string = "footer" }});
+
+        // Rejections — non-finite / non-positive.
+        try std.testing.expectError(error.InvalidRowHeight, sheet.setRowHeight(5, 0));
+        try std.testing.expectError(error.InvalidRowHeight, sheet.setRowHeight(5, -1));
+        try std.testing.expectError(error.InvalidRowHeight, sheet.setRowHeight(5, std.math.nan(f32)));
+        try std.testing.expectError(error.InvalidRowHeight, sheet.setRowHeight(5, std.math.inf(f32)));
+
+        // Post-emit call on row 1 is silently ignored (XML was
+        // already flushed to self.body); documented behaviour.
+        try sheet.setRowHeight(0, 99.0);
+
+        try w.save(tmp_path);
+    }
+
+    const sheet_xml = blk: {
+        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        var fbuf: [4096]u8 = undefined;
+        var fr = file.reader(&fbuf);
+        var iter = try std.zip.Iterator.init(&fr);
+        var name_buf: [64]u8 = undefined;
+        while (try iter.next()) |entry| {
+            if (entry.filename_len > name_buf.len) continue;
+            try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            const fn_slice = name_buf[0..entry.filename_len];
+            try fr.interface.readSliceAll(fn_slice);
+            if (std.mem.eql(u8, fn_slice, "xl/worksheets/sheet1.xml")) {
+                break :blk try extractEntryForTest(std.testing.allocator, entry, &fr);
+            }
+        }
+        return error.SheetXmlNotFound;
+    };
+    defer std.testing.allocator.free(sheet_xml);
+
+    // Row 1 with height 30, row 3 with height 42.5, row 2 plain.
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<row r=\"1\" ht=\"30\" customHeight=\"1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<row r=\"2\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<row r=\"3\" ht=\"42.5\" customHeight=\"1\">") != null);
+    // Post-emit override of row 0 MUST NOT have rewritten the XML.
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "ht=\"99\"") == null);
+
+    // Reader still walks the workbook.
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    var n: usize = 0;
+    while (try rows.next()) |_| n += 1;
+    try std.testing.expectEqual(@as(usize, 3), n);
 }
 
 test "Writer: stage-5 sheet-level features (cols, freeze, autoFilter)" {

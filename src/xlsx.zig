@@ -136,16 +136,23 @@ pub const MergeRange = struct {
     bottom_right: CellRef,
 };
 
-/// An external-URL hyperlink attached to a cell or cell range,
-/// resolved through the sheet's `_rels/sheet{N}.xml.rels` file. Range
-/// corners follow the same normalisation rules as `MergeRange`;
-/// `top_left == bottom_right` for single-cell hyperlinks.
+/// A hyperlink attached to a cell or cell range. Two flavours:
+///   - **External**: `url` holds the resolved `Target` from the
+///     sheet's `_rels/sheet{N}.xml.rels` file; `location` is empty.
+///   - **Internal**: `location` holds the raw `location` attribute
+///     (e.g. `Sheet2!A1`); `url` is empty.
+/// Exactly one of the two is non-empty per entry. Range corners
+/// follow `MergeRange` normalisation; `top_left == bottom_right`
+/// for single-cell hyperlinks.
 pub const Hyperlink = struct {
     top_left: CellRef,
     bottom_right: CellRef,
-    /// URL target. Slice into the sheet's rels XML buffer — valid
-    /// for the Book's lifetime.
+    /// External URL target. Slice into the sheet's rels XML buffer —
+    /// valid for the Book's lifetime. Empty for internal hyperlinks.
     url: []const u8,
+    /// Internal (same-workbook) target, e.g. `Sheet2!A1`. Slice into
+    /// the sheet XML buffer. Empty for external hyperlinks.
+    location: []const u8,
 };
 
 /// A list-type data validation (dropdown) parsed from a sheet's
@@ -924,7 +931,11 @@ fn parseHyperlinksForSheet(book: *Book, sheet_path: []const u8, xml: []const u8)
     const hl_end = std.mem.indexOfPos(u8, xml, hl_start, "</hyperlinks>") orelse return;
     const block = xml[hl_start..hl_end];
 
-    const rels_xml = book.sheet_rels_data.get(sheet_path) orelse return;
+    // A sheet may carry both external (r:id → rels → Target) and
+    // internal (location="…") hyperlinks; the rels file is only
+    // required for the former. Fall through with `null` when the
+    // sheet has no per-sheet rels — internal entries still parse.
+    const rels_xml: ?[]const u8 = book.sheet_rels_data.get(sheet_path);
 
     var entries: std.ArrayListUnmanaged(Hyperlink) = .{};
     errdefer entries.deinit(book.allocator);
@@ -941,19 +952,36 @@ fn parseHyperlinksForSheet(book: *Book, sheet_path: []const u8, xml: []const u8)
         const ref_close = std.mem.indexOfScalarPos(u8, attrs, ref_start, '"') orelse continue;
         const ref = attrs[ref_start..ref_close];
 
-        const rid_key = "r:id=\"";
-        const rid_pos = std.mem.indexOf(u8, attrs, rid_key) orelse continue;
-        const rid_start = rid_pos + rid_key.len;
-        const rid_close = std.mem.indexOfScalarPos(u8, attrs, rid_start, '"') orelse continue;
-        const rid = attrs[rid_start..rid_close];
-
-        const target = findRelTarget(rels_xml, rid) orelse continue;
-
         const range = parseA1Range(ref) catch continue;
+
+        // Prefer external (r:id) when both are present — a valid OOXML
+        // entry has one or the other, but defensive ordering keeps us
+        // working on workbooks that generate both by mistake.
+        var url: []const u8 = "";
+        var location: []const u8 = "";
+        if (std.mem.indexOf(u8, attrs, "r:id=\"")) |rid_pos| {
+            const rid_start = rid_pos + "r:id=\"".len;
+            const rid_close = std.mem.indexOfScalarPos(u8, attrs, rid_start, '"') orelse continue;
+            const rid = attrs[rid_start..rid_close];
+            if (rels_xml) |rx| {
+                url = findRelTarget(rx, rid) orelse continue;
+            } else {
+                continue;
+            }
+        } else if (std.mem.indexOf(u8, attrs, "location=\"")) |loc_pos| {
+            const loc_start = loc_pos + "location=\"".len;
+            const loc_close = std.mem.indexOfScalarPos(u8, attrs, loc_start, '"') orelse continue;
+            location = attrs[loc_start..loc_close];
+        } else {
+            // Neither r:id nor location — malformed, skip.
+            continue;
+        }
+
         try entries.append(book.allocator, .{
             .top_left = range.top_left,
             .bottom_right = range.bottom_right,
-            .url = target,
+            .url = url,
+            .location = location,
         });
     }
 
@@ -1522,6 +1550,75 @@ test "Book.dataValidations: empty slice for sheets without validations" {
     var book = try Book.open(std.testing.allocator, tmp_path);
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 0), book.dataValidations(book.sheets[0]).len);
+}
+
+test "Book.hyperlinks: internal hyperlinks (location) round-trip + mixed external/internal" {
+    const tmp_path = "/tmp/zlsx_reader_internal_hyperlinks.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        _ = try w.addSheet("Main");
+        var s2 = try w.addSheet("Details");
+        try s2.addInternalHyperlink("A1", "Main!A1");
+        try s2.addInternalHyperlink("B2:C2", "'Main'!B2");
+        try s2.addHyperlink("D1", "https://example.com/"); // mixed
+        try s2.writeRow(&.{.{ .string = "x" }});
+        // Rejection path.
+        try std.testing.expectError(error.InvalidHyperlinkLocation, s2.addInternalHyperlink("A3", ""));
+        try std.testing.expectError(error.InvalidHyperlinkRange, s2.addInternalHyperlink("", "Main!A1"));
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    const links = book.hyperlinks(book.sheets[1]); // "Details"
+    try std.testing.expectEqual(@as(usize, 3), links.len);
+
+    // External hyperlinks come first in our writer's emission order
+    // (r:id references emit before `location`-bearing entries), so
+    // the external one is links[0].
+    try std.testing.expectEqualStrings("https://example.com/", links[0].url);
+    try std.testing.expectEqualStrings("", links[0].location);
+
+    // Then the two internal entries.
+    try std.testing.expectEqualStrings("", links[1].url);
+    try std.testing.expectEqualStrings("Main!A1", links[1].location);
+    try std.testing.expectEqualDeep(CellRef{ .col = 0, .row = 1 }, links[1].top_left);
+
+    try std.testing.expectEqualStrings("", links[2].url);
+    // Writer xml-escapes `'` → `&apos;` on emit; reader preserves the
+    // raw attribute bytes (matches the `url` contract for external
+    // hyperlinks — decoding is the caller's choice).
+    try std.testing.expectEqualStrings("&apos;Main&apos;!B2", links[2].location);
+    try std.testing.expectEqualDeep(CellRef{ .col = 1, .row = 2 }, links[2].top_left);
+    try std.testing.expectEqualDeep(CellRef{ .col = 2, .row = 2 }, links[2].bottom_right);
+}
+
+test "Book.hyperlinks: internal-only sheet (no _rels file needed)" {
+    const tmp_path = "/tmp/zlsx_reader_internal_only.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        _ = try w.addSheet("Main");
+        var s2 = try w.addSheet("TOC");
+        try s2.addInternalHyperlink("A1", "Main!A1");
+        try s2.writeRow(&.{.{ .string = "ToC" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+    const links = book.hyperlinks(book.sheets[1]);
+    try std.testing.expectEqual(@as(usize, 1), links.len);
+    try std.testing.expectEqualStrings("Main!A1", links[0].location);
+    try std.testing.expectEqualStrings("", links[0].url);
 }
 
 test "Book.hyperlinks: empty slice for sheets without hyperlinks" {

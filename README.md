@@ -4,7 +4,7 @@ Tiny `.xlsx` reader **and** writer for Zig. Single-file library, no third-party 
 
 **Reader**: 1.9 ms on small files (alongside calamine-rust, process-startup-bound), 13.3 ms / 2.95 MB on a 67 KB workbook with 1,144 shared strings — 1.5× faster than python-calamine, 5.9× faster than openpyxl on that file, at the **smallest RSS of the four** (~6× lower than the Python stack, slightly below calamine). calamine-rust still leads on SST-heavy workloads (3.4 ms vs zlsx's 13.3 ms post single-pass rewrite); the remaining gap is stdlib-flate decompression overhead. [Full benchmark table →](docs/benchmarks.md)
 
-**Writer** (Phase 3b, v0.2.4): pragmatic openpyxl-parity styles — bold/italic, font size/name/color, horizontal alignment, wrap text, 19 OOXML fill patterns, 14 border styles × 5 sides, custom number formats, column widths, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks, list-type data validations (dropdowns). Survived 1M-iter deep fuzz on every surface.
+**Writer** (Phase 3b, v0.2.4): pragmatic openpyxl-parity styles — bold/italic, font size/name/color, horizontal alignment, wrap text, 19 OOXML fill patterns, 14 border styles × 5 sides, custom number formats, column widths, row heights, freeze panes, auto-filter, merged cell ranges, external + internal hyperlinks, list-type data validations (dropdowns), formulas with cached values. Survived 1M-iter deep fuzz on every surface.
 
 ```zig
 const xlsx = @import("zlsx");
@@ -66,12 +66,12 @@ Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-ro
 
 **In**
 - **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout, merged-cell ranges via `Book.mergedRanges(sheet)`, external-URL hyperlinks via `Book.hyperlinks(sheet)` (resolved through sheet `_rels`), list-type data validations via `Book.dataValidations(sheet)` (values entity-decoded)
-- **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks (per-sheet `_rels`), list-type data validations (dropdowns)
+- **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, row heights, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks (per-sheet `_rels`), internal hyperlinks (`location="Sheet2!A1"`), list-type data validations (dropdowns), formulas with optional cached value
 - XML entity decoding (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&#N;`, `&#xN;`) on read and escaping on write
 - CLI (`zlsx file.xlsx --format {jsonl,jsonl-dict,tsv,csv}`), C ABI (`libzlsx.{dylib,so,dll}` + `include/zlsx.h`), Python bindings (`pip install py-zlsx`)
 
 **Out (by design)**
-- No formula evaluation — the reader returns the cached `<v>` value, the writer never synthesises formulas
+- No formula evaluation — the reader returns the cached `<v>` value; the writer accepts formula text + an optional cached result via `writeRowWithFormulas` but never computes the formula itself
 - No automatic date decoding — dates surface as their raw Excel serial number via `.number`; a convenience helper `xlsx.fromExcelSerial(cell.number) -> ?DateTime` handles the 1900-03-01 through 9999-12-31 range (serials ≤ 60 return `null` because the Excel 1900 leap-year bug makes them ambiguous)
 - No load-modify-save round-trip yet — Phase 3c queued. For now the writer only produces fresh workbooks
 - No chart / pivot / image extraction or emission
@@ -118,17 +118,17 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 | Horizontal alignment / wrap text | ✓ | ✓ | ✓ |
 | Custom number formats | ✓ | ✓ | ✓ |
 | Column widths | ✓ | ✓ | ✓ |
-| Row heights | — | ✓ | ✓ |
+| Row heights | ✓ | ✓ | ✓ |
 | Freeze panes | ✓ | ✓ | ✓ |
 | Auto-filter | ✓ | ✓ | ✓ |
 | Merged cell ranges | ✓ | ✓ | ✓ |
 | External-URL hyperlinks | ✓ | ✓ | ✓ |
-| Internal (`#Sheet!A1`) hyperlinks | — | ✓ | ✓ |
+| Internal (`Sheet!A1`) hyperlinks | ✓ | ✓ | ✓ |
 | Data validations (list) | ✓ | ✓ | ✓ |
 | Data validations (number / date / custom) | — | ✓ | ✓ |
 | Conditional formatting | — | ✓ | ✓ |
 | Cell comments / notes | — | ✓ | ✓ |
-| Formulas | — | ✓ | ✓ |
+| Formulas (with cached value) | ✓ | ✓ | ✓ |
 | Rich-text runs per cell | — | ✓ | ✓ |
 | Images (PNG / JPEG embed) | — | ✓ | ~ |
 | Charts | — | ✓ | ~ |
@@ -252,7 +252,7 @@ pub fn hyperlinks(self: *const Book, sheet: Sheet) []const Hyperlink
 pub fn dataValidations(self: *const Book, sheet: Sheet) []const DataValidation
 ```
 
-`Book.sheets` is a `[]const Sheet` (name + path pairs) exposed for enumeration. Shared strings live in `Book.shared_strings: []const []const u8`. `mergedRanges(sheet)` returns a slice of `MergeRange { top_left: CellRef, bottom_right: CellRef }` where `CellRef = { col: u32, row: u32 }` — column is 0-based (A=0), row is 1-based (row1=1). `hyperlinks(sheet)` returns a slice of `Hyperlink { top_left, bottom_right, url }` resolved against the sheet's `_rels/sheet{N}.xml.rels` file; `url` is the raw `Target` attribute (XML entities like `&amp;` are preserved so the URL round-trips byte-for-byte; decode at the caller if you need a display form). Everything is owned by the `Book` until `deinit`.
+`Book.sheets` is a `[]const Sheet` (name + path pairs) exposed for enumeration. Shared strings live in `Book.shared_strings: []const []const u8`. `mergedRanges(sheet)` returns a slice of `MergeRange { top_left: CellRef, bottom_right: CellRef }` where `CellRef = { col: u32, row: u32 }` — column is 0-based (A=0), row is 1-based (row1=1). `hyperlinks(sheet)` returns a slice of `Hyperlink { top_left, bottom_right, url, location }` with exactly one of `url` / `location` non-empty per entry. External entries set `url` to the raw `Target` attribute resolved through `_rels/sheet{N}.xml.rels`; internal entries set `location` to the raw `location=` attribute (e.g. `Sheet2!A1`). XML entities are preserved in both fields so the values round-trip byte-for-byte; decode at the caller if you need a display form. Everything is owned by the `Book` until `deinit`.
 
 ### `Rows`
 
