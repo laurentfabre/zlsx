@@ -73,7 +73,7 @@ const WORKBOOK_RELS_TAIL: []const u8 = "</Relationships>";
 
 const WORKSHEET_PROLOG: []const u8 =
     \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-    \\<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+    \\<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
 ;
 
 const SST_HEAD_FMT: []const u8 =
@@ -525,11 +525,46 @@ pub const Writer = struct {
                 try full.appendSlice(alloc, "</mergeCells>");
             }
 
+            // <hyperlinks> follows <mergeCells> per ECMA-376 ordering.
+            // The r:id values reference entries in the per-sheet
+            // _rels file written below.
+            if (sw.hyperlinks.items.len > 0) {
+                try full.appendSlice(alloc, "<hyperlinks>");
+                for (sw.hyperlinks.items, 0..) |h, idx| {
+                    try full.appendSlice(alloc, "<hyperlink ref=\"");
+                    try appendXmlEscaped(alloc, &full, h.range);
+                    try full.print(alloc, "\" r:id=\"rId{d}\"/>", .{idx + 1});
+                }
+                try full.appendSlice(alloc, "</hyperlinks>");
+            }
+
             try full.appendSlice(alloc, "</worksheet>");
 
             var name_buf: [64]u8 = undefined;
             const entry_name = try std.fmt.bufPrint(&name_buf, "xl/worksheets/sheet{d}.xml", .{i + 1});
             try zw.addEntry(entry_name, full.items);
+        }
+
+        // 5a. xl/worksheets/_rels/sheetN.xml.rels (hyperlinks only)
+        //
+        // The Default Extension="rels" content-type in [Content_Types].xml
+        // covers any .rels file we add here — no extra <Override> needed.
+        for (self.sheets.items, 0..) |sw, i| {
+            if (sw.hyperlinks.items.len == 0) continue;
+
+            var rels: std.ArrayListUnmanaged(u8) = .{};
+            defer rels.deinit(alloc);
+            try rels.appendSlice(alloc, WORKBOOK_RELS_HEAD);
+            for (sw.hyperlinks.items, 0..) |h, idx| {
+                try rels.print(alloc, "<Relationship Id=\"rId{d}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"", .{idx + 1});
+                try appendXmlEscaped(alloc, &rels, h.url);
+                try rels.appendSlice(alloc, "\" TargetMode=\"External\"/>");
+            }
+            try rels.appendSlice(alloc, WORKBOOK_RELS_TAIL);
+
+            var rels_name_buf: [64]u8 = undefined;
+            const rels_name = try std.fmt.bufPrint(&rels_name_buf, "xl/worksheets/_rels/sheet{d}.xml.rels", .{i + 1});
+            try zw.addEntry(rels_name, rels.items);
         }
 
         // 6. xl/sharedStrings.xml
@@ -566,6 +601,13 @@ pub const Writer = struct {
 
 // ─── SheetWriter ─────────────────────────────────────────────────────
 
+/// External-URL hyperlink registered against a cell or range on one
+/// sheet. Both fields are SheetWriter-owned copies.
+pub const Hyperlink = struct {
+    range: []u8,
+    url: []u8,
+};
+
 /// Per-column width override. `col_min..=col_max` is the inclusive
 /// range this width applies to (xlsx indexes columns 1-based — the
 /// SheetWriter API takes 0-based indices and translates on emit).
@@ -595,6 +637,10 @@ pub const SheetWriter = struct {
     /// Merged cell ranges (e.g., "A1:B2"). Each entry is a
     /// SheetWriter-owned copy of a validated A1-style range.
     merged_cells: std.ArrayListUnmanaged([]u8) = .{},
+    /// External-URL hyperlinks registered against cells or ranges.
+    /// Each entry gets an rId in `xl/worksheets/_rels/sheetN.xml.rels`
+    /// whose position in this list is its 1-based rId index.
+    hyperlinks: std.ArrayListUnmanaged(Hyperlink) = .{},
 
     fn init(parent: *Writer, name: []const u8) !SheetWriter {
         return .{
@@ -610,6 +656,11 @@ pub const SheetWriter = struct {
         if (self.auto_filter_range) |r| self.parent.allocator.free(r);
         for (self.merged_cells.items) |r| self.parent.allocator.free(r);
         self.merged_cells.deinit(self.parent.allocator);
+        for (self.hyperlinks.items) |h| {
+            self.parent.allocator.free(h.range);
+            self.parent.allocator.free(h.url);
+        }
+        self.hyperlinks.deinit(self.parent.allocator);
         self.* = undefined;
     }
 
@@ -654,6 +705,26 @@ pub const SheetWriter = struct {
         const copy = try self.parent.allocator.dupe(u8, range);
         errdefer self.parent.allocator.free(copy);
         try self.merged_cells.append(self.parent.allocator, copy);
+    }
+
+    /// Attach a hyperlink to a cell or rectangular range. `range` is
+    /// A1-style — single cell ("A1") or span ("B2:C3"), same column/
+    /// row bounds as Excel (max XFD × 1 048 576). `url` is the
+    /// external target (http/https/mailto/file/…); it's xml-escaped
+    /// on emit, so `?q=1&x=2` style query strings are safe. Empty
+    /// URLs and malformed ranges are rejected. Caller-owned; both
+    /// args are duped.
+    pub fn addHyperlink(self: *SheetWriter, range: []const u8, url: []const u8) !void {
+        try validateHyperlinkRange(range);
+        if (url.len == 0) return error.InvalidHyperlinkUrl;
+        const range_copy = try self.parent.allocator.dupe(u8, range);
+        errdefer self.parent.allocator.free(range_copy);
+        const url_copy = try self.parent.allocator.dupe(u8, url);
+        errdefer self.parent.allocator.free(url_copy);
+        try self.hyperlinks.append(self.parent.allocator, .{
+            .range = range_copy,
+            .url = url_copy,
+        });
     }
 
     /// Write a row of cells. Empty cells are omitted from the output
@@ -813,6 +884,21 @@ fn validateMergeRange(range: []const u8) !void {
     // Single-cell "merge" is a no-op that Excel warns on — reject it
     // so callers catch typos at write time rather than on file-open.
     if (tl.col == br.col and tl.row == br.row) return error.InvalidMergeRange;
+}
+
+fn validateHyperlinkRange(range: []const u8) !void {
+    if (range.len == 0) return error.InvalidHyperlinkRange;
+    if (std.mem.indexOfScalar(u8, range, ':')) |colon| {
+        // Rectangle form — mirror the merge-range rules except that
+        // single-cell ranges ARE valid here (a 1×1 hyperlink is exactly
+        // the A1 form, just with redundant `:` sugar).
+        const tl = parseA1Corner(range[0..colon]) catch return error.InvalidHyperlinkRange;
+        const br = parseA1Corner(range[colon + 1 ..]) catch return error.InvalidHyperlinkRange;
+        if (tl.col > br.col or tl.row > br.row) return error.InvalidHyperlinkRange;
+    } else {
+        // Single-cell form — just an A1 reference.
+        _ = parseA1Corner(range) catch return error.InvalidHyperlinkRange;
+    }
 }
 
 /// Content-compare two styles. Necessary because std.meta.eql on
@@ -2105,6 +2191,135 @@ test "Writer: addMergedCell validates + emits <mergeCells> block" {
     while (try rows.next()) |_| {}
 }
 
+test "Writer: addHyperlink validates + emits <hyperlinks> + per-sheet _rels" {
+    const tmp_path = "/tmp/zlsx_writer_hyperlinks.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Sheet1");
+
+        // Valid: single cell, rectangle, + URL with XML-special char to
+        // exercise the escape path.
+        try sheet.addHyperlink("A1", "https://example.com/path?q=1&x=2");
+        try sheet.addHyperlink("B2:C3", "https://docs.example.com/");
+        try sheet.addHyperlink("D5", "mailto:foo@example.com");
+
+        // Rejections — full matrix.
+        try std.testing.expectError(error.InvalidHyperlinkRange, sheet.addHyperlink("", "http://x"));
+        try std.testing.expectError(error.InvalidHyperlinkRange, sheet.addHyperlink("a1", "http://x"));
+        try std.testing.expectError(error.InvalidHyperlinkRange, sheet.addHyperlink("B2:A1", "http://x"));
+        try std.testing.expectError(error.InvalidHyperlinkRange, sheet.addHyperlink("A0", "http://x"));
+        try std.testing.expectError(error.InvalidHyperlinkRange, sheet.addHyperlink("A1:", "http://x"));
+        try std.testing.expectError(error.InvalidHyperlinkUrl, sheet.addHyperlink("A1", ""));
+
+        try sheet.writeRow(&.{.{ .string = "link" }});
+        try w.save(tmp_path);
+    }
+
+    // Inspect xl/worksheets/sheet1.xml.
+    const sheet_xml = blk: {
+        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        var fbuf: [4096]u8 = undefined;
+        var fr = file.reader(&fbuf);
+        var iter = try std.zip.Iterator.init(&fr);
+        var filename_buf: [96]u8 = undefined;
+        while (try iter.next()) |entry| {
+            if (entry.filename_len > filename_buf.len) continue;
+            try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            const filename = filename_buf[0..entry.filename_len];
+            try fr.interface.readSliceAll(filename);
+            if (std.mem.eql(u8, filename, "xl/worksheets/sheet1.xml")) {
+                break :blk try extractEntryForTest(std.testing.allocator, entry, &fr);
+            }
+        }
+        return error.SheetXmlNotFound;
+    };
+    defer std.testing.allocator.free(sheet_xml);
+
+    // xmlns:r must be declared on the worksheet root so r:id parses.
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<hyperlinks>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<hyperlink ref=\"A1\" r:id=\"rId1\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<hyperlink ref=\"B2:C3\" r:id=\"rId2\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<hyperlink ref=\"D5\" r:id=\"rId3\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "</hyperlinks>") != null);
+
+    // Ordering: </sheetData> < <hyperlinks> < </worksheet>.
+    const sd_end = std.mem.indexOf(u8, sheet_xml, "</sheetData>") orelse return error.MissingSheetData;
+    const hl = std.mem.indexOf(u8, sheet_xml, "<hyperlinks>") orelse return error.MissingHyperlinks;
+    const ws_end = std.mem.indexOf(u8, sheet_xml, "</worksheet>") orelse return error.MissingWorksheetEnd;
+    try std.testing.expect(sd_end < hl);
+    try std.testing.expect(hl < ws_end);
+
+    // Inspect xl/worksheets/_rels/sheet1.xml.rels.
+    const rels_xml = blk: {
+        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        var fbuf: [4096]u8 = undefined;
+        var fr = file.reader(&fbuf);
+        var iter = try std.zip.Iterator.init(&fr);
+        var filename_buf: [96]u8 = undefined;
+        while (try iter.next()) |entry| {
+            if (entry.filename_len > filename_buf.len) continue;
+            try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            const filename = filename_buf[0..entry.filename_len];
+            try fr.interface.readSliceAll(filename);
+            if (std.mem.eql(u8, filename, "xl/worksheets/_rels/sheet1.xml.rels")) {
+                break :blk try extractEntryForTest(std.testing.allocator, entry, &fr);
+            }
+        }
+        return error.SheetRelsNotFound;
+    };
+    defer std.testing.allocator.free(rels_xml);
+
+    try std.testing.expect(std.mem.indexOf(u8, rels_xml, "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\"") != null);
+    // Ampersand in the URL must be escaped to &amp;.
+    try std.testing.expect(std.mem.indexOf(u8, rels_xml, "Target=\"https://example.com/path?q=1&amp;x=2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rels_xml, "Target=\"mailto:foo@example.com\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rels_xml, "TargetMode=\"External\"") != null);
+
+    // Reader still walks the workbook cleanly.
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    while (try rows.next()) |_| {}
+}
+
+test "Writer: no <hyperlinks> block or _rels entry when none registered" {
+    const tmp_path = "/tmp/zlsx_writer_no_hyperlinks.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Sheet1");
+        try sheet.writeRow(&.{.{ .string = "plain" }});
+        try w.save(tmp_path);
+    }
+
+    // Neither the sheet XML's <hyperlinks> section nor the per-sheet
+    // _rels file should exist.
+    var file = try std.fs.cwd().openFile(tmp_path, .{});
+    defer file.close();
+    var fbuf: [4096]u8 = undefined;
+    var fr = file.reader(&fbuf);
+    var iter = try std.zip.Iterator.init(&fr);
+    var filename_buf: [96]u8 = undefined;
+    var saw_rels = false;
+    while (try iter.next()) |entry| {
+        if (entry.filename_len > filename_buf.len) continue;
+        try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+        const filename = filename_buf[0..entry.filename_len];
+        try fr.interface.readSliceAll(filename);
+        if (std.mem.indexOf(u8, filename, "_rels/sheet") != null) saw_rels = true;
+    }
+    try std.testing.expect(!saw_rels);
+}
+
 test "Writer: no <mergeCells> block when none registered" {
     const tmp_path = "/tmp/zlsx_writer_no_merged.xlsx";
     defer std.fs.cwd().deleteFile(tmp_path) catch {};
@@ -2966,6 +3181,34 @@ test "fuzz SheetWriter: random stage-5 per-sheet feature combos" {
             const r = merge_candidates[rng.intRangeAtMost(usize, 0, merge_candidates.len - 1)];
             sheet.addMergedCell(r) catch |err| switch (err) {
                 error.InvalidMergeRange => {},
+                else => return err,
+            };
+        }
+
+        // 0-3 hyperlink attempts mixing valid + invalid ranges, with
+        // URLs that include XML-special chars so the escape path gets
+        // stress-tested. Invalid inputs must not corrupt sheet state —
+        // the save step below would produce a malformed rels file.
+        const hyperlink_ranges = [_][]const u8{
+            "A1", "C5", "B2:C3", "AA1:AB10",
+            "", // invalid
+            "a1", // invalid: lowercase
+            "B2:A1", // invalid: col inverted
+            "A0", // invalid: row 0
+        };
+        const hyperlink_urls = [_][]const u8{
+            "https://example.com/",
+            "https://x.example.com/path?q=1&r=2",
+            "mailto:<me>@example.com",
+            "ftp://files/dir/file.xml",
+            "", // invalid
+        };
+        const n_links = rng.intRangeAtMost(usize, 0, 3);
+        for (0..n_links) |_| {
+            const rg = hyperlink_ranges[rng.intRangeAtMost(usize, 0, hyperlink_ranges.len - 1)];
+            const u = hyperlink_urls[rng.intRangeAtMost(usize, 0, hyperlink_urls.len - 1)];
+            sheet.addHyperlink(rg, u) catch |err| switch (err) {
+                error.InvalidHyperlinkRange, error.InvalidHyperlinkUrl => {},
                 else => return err,
             };
         }

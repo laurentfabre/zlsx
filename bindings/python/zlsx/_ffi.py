@@ -314,6 +314,20 @@ if _HAS_MERGED_CELL:
     ]
     lib.zlsx_sheet_writer_add_merged_cell.restype = ctypes.c_int32
 
+# Hyperlink authoring — same import-time feature-probe pattern.
+_HAS_HYPERLINK = hasattr(lib, "zlsx_sheet_writer_add_hyperlink")
+if _HAS_HYPERLINK:
+    lib.zlsx_sheet_writer_add_hyperlink.argtypes = [
+        sheet_writer_handle,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_add_hyperlink.restype = ctypes.c_int32
+
 _HAS_STYLES_EX = hasattr(lib, "zlsx_writer_add_style_ex")
 if _HAS_STYLES_EX:
     lib.zlsx_writer_add_style_ex.argtypes = [

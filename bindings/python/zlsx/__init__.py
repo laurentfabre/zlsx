@@ -609,10 +609,52 @@ def _sheet_add_merged_cell(self: "SheetWriter", range_str: str) -> None:
         )
 
 
+def _sheet_add_hyperlink(self: "SheetWriter", range_str: str, url: str) -> None:
+    """Attach an external-URL hyperlink to a cell or rectangular range.
+
+    ``range_str`` is A1-style (``"A1"`` or ``"B2:C3"``); ``url`` is the
+    external target (``http``/``https``/``mailto``/``file``/…). Both
+    args are duped immediately; the URL is xml-escaped on emit, so
+    query strings with ``&`` are safe. Raises :class:`ZlsxError` on
+    malformed ranges (``InvalidHyperlinkRange``) or empty URLs
+    (``InvalidHyperlinkUrl``)."""
+    self._require_handle()
+    if not _ffi._HAS_HYPERLINK:
+        raise RuntimeError(
+            "loaded libzlsx does not expose add_hyperlink (requires 0.2.5+); "
+            "upgrade libzlsx"
+        )
+    range_raw = range_str.encode("utf-8")
+    url_raw = url.encode("utf-8")
+    range_buf = (ctypes.c_ubyte * max(len(range_raw), 1)).from_buffer_copy(
+        range_raw or b"\x00"
+    )
+    url_buf = (ctypes.c_ubyte * max(len(url_raw), 1)).from_buffer_copy(
+        url_raw or b"\x00"
+    )
+    rc = _ffi.lib.zlsx_sheet_writer_add_hyperlink(
+        self._handle,
+        ctypes.cast(range_buf, ctypes.POINTER(ctypes.c_ubyte)),
+        len(range_raw),
+        ctypes.cast(url_buf, ctypes.POINTER(ctypes.c_ubyte)),
+        len(url_raw),
+        self._err,
+        _ERR_BUF_LEN,
+    )
+    # Keep the ctypes arrays alive through the call.
+    del range_buf
+    del url_buf
+    if rc != 0:
+        raise ZlsxError(
+            f"zlsx_sheet_writer_add_hyperlink: {_decode_err(self._err)}"
+        )
+
+
 SheetWriter.set_column_width = _sheet_set_column_width   # type: ignore[attr-defined]
 SheetWriter.freeze_panes = _sheet_freeze_panes           # type: ignore[attr-defined]
 SheetWriter.set_auto_filter = _sheet_set_auto_filter     # type: ignore[attr-defined]
 SheetWriter.add_merged_cell = _sheet_add_merged_cell     # type: ignore[attr-defined]
+SheetWriter.add_hyperlink = _sheet_add_hyperlink         # type: ignore[attr-defined]
 
 
 class Writer:
@@ -626,9 +668,9 @@ class Writer:
     Writes strings, integers, floats, booleans, and empties; styles
     via :meth:`add_style` (bold/italic, fonts, fills, borders,
     alignment, wrap, number formats); per-sheet ``set_column_width``,
-    ``freeze_panes``, ``set_auto_filter``, ``add_merged_cell``.
-    Formulas and load-modify-save round-trip remain out of scope
-    until Phase 3c.
+    ``freeze_panes``, ``set_auto_filter``, ``add_merged_cell``,
+    ``add_hyperlink`` (external URLs). Formulas and load-modify-save
+    round-trip remain out of scope until Phase 3c.
     """
 
     def __init__(self, path: Union[str, Path, None] = None):

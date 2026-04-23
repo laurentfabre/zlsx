@@ -4,7 +4,7 @@ Tiny `.xlsx` reader **and** writer for Zig. Single-file library, no third-party 
 
 **Reader**: 10.7 ms / 4.2 MB on a 261 KB / 1,008-row workbook — 1.4× faster than calamine-rust, 4× faster than python-calamine, 24× faster than openpyxl, at one tenth the memory of the Python stack. [Full benchmark table →](docs/benchmarks.md)
 
-**Writer** (Phase 3b, v0.2.4): pragmatic openpyxl-parity styles — bold/italic, font size/name/color, horizontal alignment, wrap text, 19 OOXML fill patterns, 14 border styles × 5 sides, custom number formats, column widths, freeze panes, auto-filter, merged cell ranges. Survived 1M-iter deep fuzz on every surface.
+**Writer** (Phase 3b, v0.2.4): pragmatic openpyxl-parity styles — bold/italic, font size/name/color, horizontal alignment, wrap text, 19 OOXML fill patterns, 14 border styles × 5 sides, custom number formats, column widths, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks. Survived 1M-iter deep fuzz on every surface.
 
 ```zig
 const xlsx = @import("zlsx");
@@ -66,7 +66,7 @@ Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-ro
 
 **In**
 - **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout
-- **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, freeze panes, auto-filter, merged cell ranges
+- **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks (per-sheet `_rels`)
 - XML entity decoding (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&#N;`, `&#xN;`) on read and escaping on write
 - CLI (`zlsx file.xlsx --format {jsonl,jsonl-dict,tsv,csv}`), C ABI (`libzlsx.{dylib,so,dll}` + `include/zlsx.h`), Python bindings (`pip install py-zlsx`)
 

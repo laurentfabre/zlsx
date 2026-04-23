@@ -368,6 +368,20 @@ int32_t zlsx_sheet_writer_add_merged_cell(
     uint8_t             * err_buf,
     size_t                err_buf_len);
 
+/* Attach an external-URL hyperlink to a cell or rectangular range.
+ * `range` is A1-style (single cell "A1" or span "B2:C3"); `url` is
+ * the external target (http/https/mailto/file/...). Returns 0 or
+ * -1 with err="InvalidHyperlinkRange" / "InvalidHyperlinkUrl". URL
+ * is xml-escaped on emit so query-string `&` is safe. */
+int32_t zlsx_sheet_writer_add_hyperlink(
+    zlsx_sheet_writer_t * sw,
+    const uint8_t       * range_ptr,
+    size_t                range_len,
+    const uint8_t       * url_ptr,
+    size_t                url_len,
+    uint8_t             * err_buf,
+    size_t                err_buf_len);
+
 #ifdef __cplusplus
 }
 #endif

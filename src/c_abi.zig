@@ -975,6 +975,33 @@ export fn zlsx_sheet_writer_add_merged_cell(
     return 0;
 }
 
+/// Attach an external-URL hyperlink to a cell or rectangular range.
+/// `range` is A1-style (single cell "A1" or span "B2:C3"); `url` is
+/// the external target (http/https/mailto/file/...). The writer
+/// validates + dupes both on intake; the URL is xml-escaped on emit
+/// so query-string `&` is safe. Returns 0 on success, -1 with
+/// err="InvalidHyperlinkRange" on malformed range,
+/// "InvalidHyperlinkUrl" on empty URL, or "OutOfMemory" on alloc
+/// failure.
+export fn zlsx_sheet_writer_add_hyperlink(
+    sw: *SheetWriter,
+    range_ptr: [*]const u8,
+    range_len: usize,
+    url_ptr: [*]const u8,
+    url_len: usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+    const range = range_ptr[0..range_len];
+    const url = url_ptr[0..url_len];
+    sw_state.inner.addHyperlink(range, url) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
 // ─── Writer tests ────────────────────────────────────────────────────
 
 test "writer: round-trip via reader" {
