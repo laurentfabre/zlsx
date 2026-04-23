@@ -72,7 +72,7 @@ Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-ro
 
 **Out (by design)**
 - No formula evaluation — the reader returns the cached `<v>` value, the writer never synthesises formulas
-- No date decoding — dates stay as their raw Excel serial number unless the generator pre-serialised them
+- No automatic date decoding — dates surface as their raw Excel serial number via `.number`; a convenience helper `xlsx.fromExcelSerial(cell.number) -> ?DateTime` handles the 1900-03-01 through 9999-12-31 range (serials ≤ 60 return `null` because the Excel 1900 leap-year bug makes them ambiguous)
 - No load-modify-save round-trip yet — Phase 3c queued. For now the writer only produces fresh workbooks
 - No chart / pivot / image extraction or emission
 
@@ -201,6 +201,17 @@ pub const Cell = union(enum) {
 ```
 
 Integers are parsed first; pure integer values become `.integer` to avoid float-round-trip loss.
+
+Dates live in `.number` as Excel serial days; decode via:
+
+```zig
+if (xlsx.fromExcelSerial(cell.number)) |dt| {
+    std.debug.print("{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}\n",
+        .{ dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second });
+}
+```
+
+Returns `null` outside `1900-03-01 .. 9999-12-31` or on `NaN` / `±inf` (serials ≤ 60 hit the 1900 leap-year-bug window).
 
 ## Tests
 

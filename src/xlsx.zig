@@ -25,6 +25,86 @@ const Allocator = std.mem.Allocator;
 
 // ─── Public types ────────────────────────────────────────────────────
 
+/// A date/time decoded from an Excel serial-date number. Columns in
+/// xlsx files don't carry enough metadata on the cell value alone to
+/// distinguish a plain number from a date (the date-ness lives in the
+/// number-format applied via styling, which `Rows.next()` intentionally
+/// doesn't surface), so callers who know a column holds dates convert
+/// explicitly via `fromExcelSerial(cell.number)`.
+///
+/// Fractional seconds are rounded to the nearest second.
+pub const DateTime = struct {
+    year: u16, // 1900..=9999
+    month: u8, // 1..=12
+    day: u8, // 1..=31
+    hour: u8, // 0..=23
+    minute: u8, // 0..=59
+    second: u8, // 0..=59
+};
+
+/// Days from 1970-01-01 → Gregorian `{year, month, day}` using
+/// Howard Hinnant's civil_from_days algorithm (proleptic Gregorian,
+/// valid through year 9999). Epoch-shift to 0000-03-01 (adding 719468)
+/// keeps the arithmetic positive for all in-range Excel dates.
+fn daysSinceUnixEpochToYMD(days_since_unix: i32) struct { year: u16, month: u8, day: u8 } {
+    const z: i32 = days_since_unix + 719468;
+    const era: i32 = if (z >= 0) @divFloor(z, 146097) else @divFloor(z - 146096, 146097);
+    const doe: u32 = @intCast(z - era * 146097);
+    const yoe: u32 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const y: i32 = @as(i32, @intCast(yoe)) + era * 400;
+    const doy: u32 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const mp: u32 = (5 * doy + 2) / 153;
+    const d: u32 = doy - (153 * mp + 2) / 5 + 1;
+    const m: u32 = if (mp < 10) mp + 3 else mp - 9;
+    const year: i32 = if (m <= 2) y + 1 else y;
+    return .{
+        .year = @intCast(year),
+        .month = @intCast(m),
+        .day = @intCast(d),
+    };
+}
+
+/// Convert an Excel serial-date number (as produced by `cell.number`
+/// when the source cell was styled as a date) into a calendar
+/// `DateTime`. Returns `null` on:
+///   - non-finite input (`NaN` / `±inf`)
+///   - serials < 61 — those fall inside Excel's 1900 leap-year bug
+///     window where serials 1..=60 displayably include the fictitious
+///     1900-02-29, and the correct decoded date is ambiguous without
+///     an opt-in flag
+///   - serials > 2958465 (past 9999-12-31)
+///
+/// Serials 61..=2958465 cover 1900-03-01 through 9999-12-31 — the
+/// overwhelming majority of real-world dates — and decode against
+/// the proleptic Gregorian calendar.
+pub fn fromExcelSerial(serial: f64) ?DateTime {
+    if (!std.math.isFinite(serial)) return null;
+    if (serial < 61.0 or serial >= 2958466.0) return null;
+
+    const floored = @floor(serial);
+    // Excel serial 1 = 1900-01-01, but the 1900 leap-year bug shifts
+    // serials ≥ 60 forward by one day vs the real Gregorian calendar.
+    // Serial 25569 corresponds to 1970-01-01; subtracting it yields
+    // days-since-Unix-epoch for the Hinnant algorithm.
+    const days_since_unix: i32 = @intCast(@as(i64, @intFromFloat(floored)) - 25569);
+    const ymd = daysSinceUnixEpochToYMD(days_since_unix);
+
+    // Time of day: fractional part × 86 400 seconds, rounded.
+    // Clamp to 86399 so a rounding edge like `1.99999999` never
+    // produces hour=24 / minute=60 / second=60; we lose one second
+    // of resolution there.
+    const total_s_f: f64 = @round((serial - floored) * 86400.0);
+    const total_s: i64 = @intFromFloat(@min(total_s_f, 86399.0));
+    return .{
+        .year = ymd.year,
+        .month = ymd.month,
+        .day = ymd.day,
+        .hour = @intCast(@divFloor(total_s, 3600)),
+        .minute = @intCast(@mod(@divFloor(total_s, 60), 60)),
+        .second = @intCast(@mod(total_s, 60)),
+    };
+}
+
 pub const Cell = union(enum) {
     empty,
     /// Slice into the Book's internal buffers — not owned by Cell.
@@ -1148,6 +1228,79 @@ fn extractEntryToBuffer(
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
+
+test "fromExcelSerial: known reference dates + rejection matrix" {
+    // Reference points — all confirmed against Excel's DATEVALUE:
+    //   61      = 1900-03-01 (first serial past the leap-year bug window)
+    //   25569   = 1970-01-01 (Unix epoch)
+    //   40000   = 2009-07-06
+    //   43831   = 2020-01-01
+    //   45658   = 2025-01-01
+    //   2958465 = 9999-12-31 (max)
+    const cases = [_]struct { s: f64, y: u16, m: u8, d: u8, h: u8, mi: u8, se: u8 }{
+        .{ .s = 61.0, .y = 1900, .m = 3, .d = 1, .h = 0, .mi = 0, .se = 0 },
+        .{ .s = 25569.0, .y = 1970, .m = 1, .d = 1, .h = 0, .mi = 0, .se = 0 },
+        .{ .s = 40000.0, .y = 2009, .m = 7, .d = 6, .h = 0, .mi = 0, .se = 0 },
+        .{ .s = 43831.0, .y = 2020, .m = 1, .d = 1, .h = 0, .mi = 0, .se = 0 },
+        .{ .s = 45658.0, .y = 2025, .m = 1, .d = 1, .h = 0, .mi = 0, .se = 0 },
+        .{ .s = 2958465.0, .y = 9999, .m = 12, .d = 31, .h = 0, .mi = 0, .se = 0 },
+        // Times-of-day — noon, 3:30 PM, end-of-minute.
+        .{ .s = 45658.5, .y = 2025, .m = 1, .d = 1, .h = 12, .mi = 0, .se = 0 },
+        .{ .s = 45658.0 + (15.0 * 3600.0 + 30.0 * 60.0) / 86400.0, .y = 2025, .m = 1, .d = 1, .h = 15, .mi = 30, .se = 0 },
+        .{ .s = 45658.0 + 59.0 / 86400.0, .y = 2025, .m = 1, .d = 1, .h = 0, .mi = 0, .se = 59 },
+    };
+    for (cases) |c| {
+        const got = fromExcelSerial(c.s) orelse {
+            std.debug.print("fromExcelSerial returned null for serial {d}\n", .{c.s});
+            return error.UnexpectedNull;
+        };
+        try std.testing.expectEqual(@as(u16, c.y), got.year);
+        try std.testing.expectEqual(@as(u8, c.m), got.month);
+        try std.testing.expectEqual(@as(u8, c.d), got.day);
+        try std.testing.expectEqual(@as(u8, c.h), got.hour);
+        try std.testing.expectEqual(@as(u8, c.mi), got.minute);
+        try std.testing.expectEqual(@as(u8, c.se), got.second);
+    }
+
+    // Rejection: NaN, infinity, pre-1900-leap-bug window, past 9999.
+    try std.testing.expect(fromExcelSerial(std.math.nan(f64)) == null);
+    try std.testing.expect(fromExcelSerial(std.math.inf(f64)) == null);
+    try std.testing.expect(fromExcelSerial(-std.math.inf(f64)) == null);
+    try std.testing.expect(fromExcelSerial(-1.0) == null);
+    try std.testing.expect(fromExcelSerial(0.0) == null);
+    try std.testing.expect(fromExcelSerial(60.0) == null); // fictitious 1900-02-29
+    try std.testing.expect(fromExcelSerial(60.9999) == null);
+    try std.testing.expect(fromExcelSerial(2958466.0) == null);
+    try std.testing.expect(fromExcelSerial(1e20) == null);
+}
+
+test "fuzz fromExcelSerial: finite serials never panic + accepted range invariants" {
+    const iters = fuzz_default_iters;
+    var prng = std.Random.DefaultPrng.init(0xD4725EA1);
+    const rng = prng.random();
+    for (0..iters) |_| {
+        // Mix of in-range serials, out-of-range, and edge cases.
+        const serial: f64 = switch (rng.intRangeAtMost(u8, 0, 9)) {
+            0 => std.math.nan(f64),
+            1 => std.math.inf(f64),
+            2 => -std.math.inf(f64),
+            3 => -rng.float(f64) * 1e10,
+            4 => rng.float(f64) * 60.0, // pre-leap-bug window
+            5 => 2958466.0 + rng.float(f64) * 1e6, // past max
+            // The rest: in-range values.
+            else => 61.0 + rng.float(f64) * (2958465.0 - 61.0),
+        };
+        if (fromExcelSerial(serial)) |dt| {
+            // Invariants must hold on any accepted input.
+            try std.testing.expect(dt.year >= 1900 and dt.year <= 9999);
+            try std.testing.expect(dt.month >= 1 and dt.month <= 12);
+            try std.testing.expect(dt.day >= 1 and dt.day <= 31);
+            try std.testing.expect(dt.hour <= 23);
+            try std.testing.expect(dt.minute <= 59);
+            try std.testing.expect(dt.second <= 59);
+        }
+    }
+}
 
 test "parseA1Ref: basic A1 parsing + rejection" {
     try std.testing.expectEqualDeep(CellRef{ .col = 0, .row = 1 }, try parseA1Ref("A1"));
