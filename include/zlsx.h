@@ -114,6 +114,61 @@ int32_t zlsx_sheet_index_by_name(zlsx_book_t * book,
                                  size_t          name_len);
 
 /*
+ * Merged cell range for a sheet. Columns are 0-based (A=0),
+ * rows are 1-based (row1=1) — matches the Zig/Python API.
+ */
+typedef struct {
+    uint32_t top_left_col;
+    uint32_t top_left_row;
+    uint32_t bottom_right_col;
+    uint32_t bottom_right_row;
+} zlsx_merge_range_t;
+
+/*
+ * Number of merged cell ranges on sheet `sheet_idx`. Returns 0 if
+ * the index is out of range or the sheet has no merges.
+ */
+size_t zlsx_merged_range_count(zlsx_book_t * book, uint32_t sheet_idx);
+
+/*
+ * Copy merged range `range_idx` on sheet `sheet_idx` into `out`.
+ * Returns 0 on success, -1 if either index is out of range.
+ */
+int32_t zlsx_merged_range_at(zlsx_book_t *        book,
+                             uint32_t             sheet_idx,
+                             size_t               range_idx,
+                             zlsx_merge_range_t * out);
+
+/*
+ * Hyperlink entry. `url_ptr` points into the Book's rels XML and is
+ * valid until `zlsx_book_close`; XML entities like `&amp;` are
+ * preserved (URL round-trips byte-for-byte through save/reopen).
+ */
+typedef struct {
+    uint32_t        top_left_col;
+    uint32_t        top_left_row;
+    uint32_t        bottom_right_col;
+    uint32_t        bottom_right_row;
+    const uint8_t * url_ptr;
+    size_t          url_len;
+} zlsx_hyperlink_t;
+
+/*
+ * Number of hyperlinks on sheet `sheet_idx`. Returns 0 if the index
+ * is out of range or the sheet has none.
+ */
+size_t zlsx_hyperlink_count(zlsx_book_t * book, uint32_t sheet_idx);
+
+/*
+ * Copy hyperlink `link_idx` on sheet `sheet_idx` into `out`. Returns
+ * 0 on success, -1 if either index is out of range.
+ */
+int32_t zlsx_hyperlink_at(zlsx_book_t *      book,
+                          uint32_t           sheet_idx,
+                          size_t             link_idx,
+                          zlsx_hyperlink_t * out);
+
+/*
  * Open a row iterator for sheet `sheet_idx`. On failure returns NULL
  * and writes a diagnostic into err_buf as per zlsx_book_open().
  *

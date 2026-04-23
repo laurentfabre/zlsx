@@ -44,6 +44,9 @@ __all__ = [
     "SheetWriter",
     "Style",
     "BorderSide",
+    "CellRef",
+    "MergeRange",
+    "Hyperlink",
     "ZlsxError",
 ]
 
@@ -193,6 +196,42 @@ def _cell_to_py(cell: _ffi.Cell) -> Union[None, str, int, float, bool]:
     return None
 
 
+# ─── Reader metadata dataclasses ──────────────────────────────────────
+#
+# Mirror the Zig public types: column is 0-based (A=0), row is 1-based
+# (row1=1). Immutable because Book.merged_ranges / Book.hyperlinks
+# returns views into the library's internal buffers — any mutation
+# users do here shouldn't leak back into other callers' view.
+
+
+@dataclass(frozen=True)
+class CellRef:
+    """A1-style cell reference as `(col, row)`. ``col`` is 0-based
+    (A=0, B=1, …); ``row`` is 1-based (row 1 is the first row)."""
+    col: int
+    row: int
+
+
+@dataclass(frozen=True)
+class MergeRange:
+    """A rectangular merged cell range. ``top_left`` is component-wise
+    ≤ ``bottom_right``; both corners are inclusive."""
+    top_left: CellRef
+    bottom_right: CellRef
+
+
+@dataclass(frozen=True)
+class Hyperlink:
+    """An external-URL hyperlink attached to a cell or cell range.
+    ``url`` is the raw ``Target`` attribute from the sheet's rels
+    file — XML entities like ``&amp;`` are preserved, so the URL
+    round-trips byte-for-byte through save/reopen. Decode at the
+    caller if a display form is needed."""
+    top_left: CellRef
+    bottom_right: CellRef
+    url: str
+
+
 # ─── Book ─────────────────────────────────────────────────────────────
 
 
@@ -244,6 +283,59 @@ class Book:
         raise TypeError(
             f"sheet selector must be int or str, got {type(selector).__name__}"
         )
+
+    def merged_ranges(self, sheet_idx: int) -> list[MergeRange]:
+        """Merged cell ranges declared in sheet ``sheet_idx``'s
+        ``<mergeCells>`` block. Returns an empty list for sheets
+        without merges."""
+        if not self._handle:
+            raise ZlsxError("book is closed")
+        if not _ffi._HAS_READER_META:
+            raise RuntimeError(
+                "loaded libzlsx does not expose merged_ranges (requires 0.2.5+); "
+                "upgrade libzlsx"
+            )
+        count = _ffi.lib.zlsx_merged_range_count(self._handle, sheet_idx)
+        out: list[MergeRange] = []
+        mr = _ffi.CMergeRange()
+        for i in range(count):
+            rc = _ffi.lib.zlsx_merged_range_at(self._handle, sheet_idx, i, ctypes.byref(mr))
+            if rc != 0:
+                # Defensive: count/at-index race shouldn't happen, but skip
+                # gracefully rather than surface an internal error.
+                continue
+            out.append(MergeRange(
+                top_left=CellRef(col=mr.top_left_col, row=mr.top_left_row),
+                bottom_right=CellRef(col=mr.bottom_right_col, row=mr.bottom_right_row),
+            ))
+        return out
+
+    def hyperlinks(self, sheet_idx: int) -> list[Hyperlink]:
+        """External-URL hyperlinks declared on sheet ``sheet_idx``,
+        resolved through the sheet's ``_rels/sheet{N}.xml.rels`` file.
+        Returns an empty list for sheets without a ``<hyperlinks>``
+        block."""
+        if not self._handle:
+            raise ZlsxError("book is closed")
+        if not _ffi._HAS_READER_META:
+            raise RuntimeError(
+                "loaded libzlsx does not expose hyperlinks (requires 0.2.5+); "
+                "upgrade libzlsx"
+            )
+        count = _ffi.lib.zlsx_hyperlink_count(self._handle, sheet_idx)
+        out: list[Hyperlink] = []
+        hl = _ffi.CHyperlink()
+        for i in range(count):
+            rc = _ffi.lib.zlsx_hyperlink_at(self._handle, sheet_idx, i, ctypes.byref(hl))
+            if rc != 0:
+                continue
+            url = ctypes.string_at(hl.url_ptr, hl.url_len).decode("utf-8", errors="replace")
+            out.append(Hyperlink(
+                top_left=CellRef(col=hl.top_left_col, row=hl.top_left_row),
+                bottom_right=CellRef(col=hl.bottom_right_col, row=hl.bottom_right_row),
+                url=url,
+            ))
+        return out
 
     def close(self) -> None:
         """Drop our reference to the book. Active row iterators hold their

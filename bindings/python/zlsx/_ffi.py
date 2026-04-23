@@ -328,6 +328,53 @@ if _HAS_HYPERLINK:
     ]
     lib.zlsx_sheet_writer_add_hyperlink.restype = ctypes.c_int32
 
+
+# Reader metadata (libzlsx 0.2.5+): merged ranges + hyperlinks. Feature-
+# probed like the writer additions so py-zlsx keeps importing against
+# older dylibs.
+class CMergeRange(ctypes.Structure):
+    _fields_ = [
+        ("top_left_col", ctypes.c_uint32),
+        ("top_left_row", ctypes.c_uint32),
+        ("bottom_right_col", ctypes.c_uint32),
+        ("bottom_right_row", ctypes.c_uint32),
+    ]
+
+
+class CHyperlink(ctypes.Structure):
+    _fields_ = [
+        ("top_left_col", ctypes.c_uint32),
+        ("top_left_row", ctypes.c_uint32),
+        ("bottom_right_col", ctypes.c_uint32),
+        ("bottom_right_row", ctypes.c_uint32),
+        ("url_ptr", ctypes.POINTER(ctypes.c_ubyte)),
+        ("url_len", ctypes.c_size_t),
+    ]
+
+
+_HAS_READER_META = hasattr(lib, "zlsx_merged_range_count")
+if _HAS_READER_META:
+    lib.zlsx_merged_range_count.argtypes = [book_handle, ctypes.c_uint32]
+    lib.zlsx_merged_range_count.restype = ctypes.c_size_t
+    lib.zlsx_merged_range_at.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.c_size_t,
+        ctypes.POINTER(CMergeRange),
+    ]
+    lib.zlsx_merged_range_at.restype = ctypes.c_int32
+
+    lib.zlsx_hyperlink_count.argtypes = [book_handle, ctypes.c_uint32]
+    lib.zlsx_hyperlink_count.restype = ctypes.c_size_t
+    lib.zlsx_hyperlink_at.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.c_size_t,
+        ctypes.POINTER(CHyperlink),
+    ]
+    lib.zlsx_hyperlink_at.restype = ctypes.c_int32
+
+
 _HAS_STYLES_EX = hasattr(lib, "zlsx_writer_add_style_ex")
 if _HAS_STYLES_EX:
     lib.zlsx_writer_add_style_ex.argtypes = [

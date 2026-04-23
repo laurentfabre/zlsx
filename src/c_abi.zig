@@ -255,6 +255,91 @@ export fn zlsx_sheet_name(
     return name.len;
 }
 
+/// C-shape for a merged cell range. Column is 0-based (A=0); row is
+/// 1-based (row1=1) — matches the Zig public API.
+pub const CMergeRange = extern struct {
+    top_left_col: u32,
+    top_left_row: u32,
+    bottom_right_col: u32,
+    bottom_right_row: u32,
+};
+
+/// C-shape for a hyperlink entry. `url_ptr` / `url_len` point into
+/// the Book's rels XML — valid until `zlsx_book_close`. URL preserves
+/// XML-entity escaping (`&amp;` etc.) matching the Zig public API.
+pub const CHyperlink = extern struct {
+    top_left_col: u32,
+    top_left_row: u32,
+    bottom_right_col: u32,
+    bottom_right_row: u32,
+    url_ptr: [*]const u8,
+    url_len: usize,
+};
+
+/// Number of merged cell ranges on sheet `idx`. Returns 0 if `idx`
+/// is out of range or the sheet has no merges.
+export fn zlsx_merged_range_count(book: *Book, idx: u32) callconv(.c) usize {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (idx >= state.inner.sheets.len) return 0;
+    return state.inner.mergedRanges(state.inner.sheets[idx]).len;
+}
+
+/// Copy merged range `range_idx` on sheet `idx` into `out`. Returns
+/// 0 on success, -1 if either index is out of range.
+export fn zlsx_merged_range_at(
+    book: *Book,
+    idx: u32,
+    range_idx: usize,
+    out: *CMergeRange,
+) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (idx >= state.inner.sheets.len) return -1;
+    const ranges = state.inner.mergedRanges(state.inner.sheets[idx]);
+    if (range_idx >= ranges.len) return -1;
+    const r = ranges[range_idx];
+    out.* = .{
+        .top_left_col = r.top_left.col,
+        .top_left_row = r.top_left.row,
+        .bottom_right_col = r.bottom_right.col,
+        .bottom_right_row = r.bottom_right.row,
+    };
+    return 0;
+}
+
+/// Number of hyperlinks on sheet `idx`. Returns 0 if `idx` is out
+/// of range or the sheet has none.
+export fn zlsx_hyperlink_count(book: *Book, idx: u32) callconv(.c) usize {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (idx >= state.inner.sheets.len) return 0;
+    return state.inner.hyperlinks(state.inner.sheets[idx]).len;
+}
+
+/// Copy hyperlink `link_idx` on sheet `idx` into `out`. Returns 0 on
+/// success, -1 if either index is out of range. The `url_ptr` field
+/// points into the Book's internal buffers — do not mutate or free;
+/// the lifetime is the Book's.
+export fn zlsx_hyperlink_at(
+    book: *Book,
+    idx: u32,
+    link_idx: usize,
+    out: *CHyperlink,
+) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (idx >= state.inner.sheets.len) return -1;
+    const links = state.inner.hyperlinks(state.inner.sheets[idx]);
+    if (link_idx >= links.len) return -1;
+    const h = links[link_idx];
+    out.* = .{
+        .top_left_col = h.top_left.col,
+        .top_left_row = h.top_left.row,
+        .bottom_right_col = h.bottom_right.col,
+        .bottom_right_row = h.bottom_right.row,
+        .url_ptr = h.url.ptr,
+        .url_len = h.url.len,
+    };
+    return 0;
+}
+
 /// Find a sheet by name. Returns the 0-based index, or -1 if not found.
 export fn zlsx_sheet_index_by_name(
     book: *Book,
@@ -1051,6 +1136,68 @@ test "writer: round-trip via reader" {
     const r2 = (try rows.next()).?;
     try std.testing.expectEqualStrings("Alice", r2[0].string);
     try std.testing.expectEqual(@as(i64, 30), r2[1].integer);
+}
+
+test "reader C ABI: merged_range + hyperlink getters round-trip" {
+    const tmp_path = "/tmp/zlsx_c_abi_reader_meta.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    // Build a workbook with merges + hyperlinks through the Zig writer,
+    // then read it back through the C ABI and verify every field.
+    {
+        var w = xlsx.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("S1");
+        try sheet.addMergedCell("A1:B2");
+        try sheet.addMergedCell("D5:D7");
+        try sheet.addHyperlink("C3", "https://example.com/a");
+        try sheet.addHyperlink("E5:F5", "mailto:x@example.com");
+        try sheet.writeRow(&.{.{ .string = "x" }});
+        try w.save(tmp_path);
+    }
+
+    var err_buf: [128]u8 = undefined;
+    const book = zlsx_book_open(tmp_path, &err_buf, err_buf.len);
+    try std.testing.expect(book != null);
+    defer zlsx_book_close(book);
+
+    // Merged ranges.
+    try std.testing.expectEqual(@as(usize, 2), zlsx_merged_range_count(book.?, 0));
+    try std.testing.expectEqual(@as(usize, 0), zlsx_merged_range_count(book.?, 99)); // out of range
+
+    var mr: CMergeRange = undefined;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_merged_range_at(book.?, 0, 0, &mr));
+    try std.testing.expectEqual(@as(u32, 0), mr.top_left_col);
+    try std.testing.expectEqual(@as(u32, 1), mr.top_left_row);
+    try std.testing.expectEqual(@as(u32, 1), mr.bottom_right_col);
+    try std.testing.expectEqual(@as(u32, 2), mr.bottom_right_row);
+
+    try std.testing.expectEqual(@as(i32, 0), zlsx_merged_range_at(book.?, 0, 1, &mr));
+    try std.testing.expectEqual(@as(u32, 3), mr.top_left_col); // D
+    try std.testing.expectEqual(@as(u32, 5), mr.top_left_row);
+    try std.testing.expectEqual(@as(u32, 3), mr.bottom_right_col);
+    try std.testing.expectEqual(@as(u32, 7), mr.bottom_right_row);
+
+    try std.testing.expectEqual(@as(i32, -1), zlsx_merged_range_at(book.?, 0, 2, &mr));
+
+    // Hyperlinks.
+    try std.testing.expectEqual(@as(usize, 2), zlsx_hyperlink_count(book.?, 0));
+
+    var hl: CHyperlink = undefined;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_hyperlink_at(book.?, 0, 0, &hl));
+    try std.testing.expectEqual(@as(u32, 2), hl.top_left_col); // C
+    try std.testing.expectEqual(@as(u32, 3), hl.top_left_row);
+    try std.testing.expectEqual(@as(u32, 2), hl.bottom_right_col);
+    try std.testing.expectEqual(@as(u32, 3), hl.bottom_right_row);
+    const url1 = hl.url_ptr[0..hl.url_len];
+    try std.testing.expectEqualStrings("https://example.com/a", url1);
+
+    try std.testing.expectEqual(@as(i32, 0), zlsx_hyperlink_at(book.?, 0, 1, &hl));
+    const url2 = hl.url_ptr[0..hl.url_len];
+    try std.testing.expectEqualStrings("mailto:x@example.com", url2);
+
+    try std.testing.expectEqual(@as(i32, -1), zlsx_hyperlink_at(book.?, 0, 2, &hl));
+    try std.testing.expectEqual(@as(i32, -1), zlsx_hyperlink_at(book.?, 99, 0, &hl));
 }
 
 test "writer C ABI: add_merged_cell round-trips + rejects bad ranges" {
