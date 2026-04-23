@@ -68,6 +68,21 @@ pub const Hyperlink = struct {
     url: []const u8,
 };
 
+/// A list-type data validation (dropdown) parsed from a sheet's
+/// `<dataValidations>` block. Only the list variant is exposed on
+/// the reader today — number / date / text-length / custom variants
+/// decode as empty `values` (still surface the range so callers can
+/// enumerate them). Strings in `values` are entity-decoded and owned
+/// by the Book.
+pub const DataValidation = struct {
+    top_left: CellRef,
+    bottom_right: CellRef,
+    /// Dropdown options. Empty when the source validation isn't a
+    /// list or when `formula1` is a range reference (which we don't
+    /// expand to the referenced cells on read).
+    values: []const []const u8,
+};
+
 /// Domain errors surfaced by this module. The public API uses inferred
 /// error sets so callers get the full union of these plus whatever
 /// std.zip / std.fs / std.compress.flate decide to return.
@@ -116,6 +131,11 @@ pub const Book = struct {
     /// Keyed by the sheet path. Sheets without hyperlinks are absent;
     /// use `hyperlinks(sheet)` for the missing-sheet normalisation.
     hyperlinks_by_sheet: std.StringHashMapUnmanaged([]Hyperlink) = .{},
+    /// List-type data validations per sheet, parsed from the
+    /// `<dataValidations>` block. Same keyed-by-sheet-path shape as
+    /// `hyperlinks_by_sheet`; use `dataValidations(sheet)` for the
+    /// empty-on-missing normalisation.
+    data_validations_by_sheet: std.StringHashMapUnmanaged([]DataValidation) = .{},
     /// Owned backing storage for every string referenced by `sheets`,
     /// sheet_data keys, and entity-decoded shared strings.
     strings: std.ArrayListUnmanaged([]u8) = .{},
@@ -204,13 +224,14 @@ pub const Book = struct {
         try parseWorkbookSheets(&book, wb, rels);
         if (book.shared_strings_xml) |sst| try parseSharedStrings(&book, sst);
 
-        // Parse merged cell ranges + hyperlinks per sheet. Both are
-        // cheap — most sheets have neither, and the parsers bail on
-        // the first miss.
+        // Parse merged ranges + hyperlinks + data validations per
+        // sheet. All three are cheap — most sheets have none of them,
+        // and each parser bails on the first miss.
         var sheet_it = book.sheet_data.iterator();
         while (sheet_it.next()) |entry| {
             try parseMergedRangesForSheet(&book, entry.key_ptr.*, entry.value_ptr.*);
             try parseHyperlinksForSheet(&book, entry.key_ptr.*, entry.value_ptr.*);
+            try parseDataValidationsForSheet(&book, entry.key_ptr.*, entry.value_ptr.*);
         }
 
         return book;
@@ -233,6 +254,15 @@ pub const Book = struct {
         return self.hyperlinks_by_sheet.get(sheet.path) orelse &.{};
     }
 
+    /// List-type data validations (dropdowns) declared on this sheet.
+    /// Returns an empty slice for sheets without a `<dataValidations>`
+    /// block or with only non-list variants. The returned slice,
+    /// every inner `values` slice, and each value string are owned
+    /// by the Book and valid until `deinit`.
+    pub fn dataValidations(self: *const Book, sheet: Sheet) []const DataValidation {
+        return self.data_validations_by_sheet.get(sheet.path) orelse &.{};
+    }
+
     pub fn deinit(self: *Book) void {
         const a = self.allocator;
         if (self.shared_strings_xml) |s| a.free(s);
@@ -250,6 +280,13 @@ pub const Book = struct {
         var hit = self.hyperlinks_by_sheet.valueIterator();
         while (hit.next()) |v| a.free(v.*);
         self.hyperlinks_by_sheet.deinit(a);
+
+        var dvit = self.data_validations_by_sheet.valueIterator();
+        while (dvit.next()) |v| {
+            for (v.*) |dv| a.free(dv.values);
+            a.free(v.*);
+        }
+        self.data_validations_by_sheet.deinit(a);
 
         var it = self.sheet_data.valueIterator();
         while (it.next()) |v| a.free(v.*);
@@ -849,6 +886,132 @@ fn parseHyperlinksForSheet(book: *Book, sheet_path: []const u8, xml: []const u8)
     try book.hyperlinks_by_sheet.put(book.allocator, sheet_path, slice);
 }
 
+/// Split a list-type validation's formula1 content into dropdown
+/// values. Excel wraps the joined CSV in double-quotes (either raw
+/// `"` or XML-escaped `&quot;`). Values are entity-decoded into
+/// `book.sst_arena` so they live for the Book's lifetime. Returns
+/// a freshly allocated `[][]const u8` owned by `book.allocator` (to
+/// be stored inside `DataValidation.values`), or `null` when the
+/// formula1 isn't a literal-list form (it's a range reference or
+/// malformed).
+fn splitFormula1List(book: *Book, formula1: []const u8) !?[][]const u8 {
+    // Accept either literal-quote or XML-escaped-quote wrapping.
+    const trimmed = if (std.mem.startsWith(u8, formula1, "&quot;") and
+        std.mem.endsWith(u8, formula1, "&quot;"))
+        formula1[6 .. formula1.len - 6]
+    else if (std.mem.startsWith(u8, formula1, "\"") and
+        std.mem.endsWith(u8, formula1, "\""))
+        formula1[1 .. formula1.len - 1]
+    else
+        return null;
+    if (trimmed.len == 0) return null;
+
+    var out: std.ArrayListUnmanaged([]const u8) = .{};
+    errdefer out.deinit(book.allocator);
+
+    const arena = book.sst_arena.allocator();
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= trimmed.len) : (i += 1) {
+        const at_end = i == trimmed.len;
+        if (at_end or trimmed[i] == ',') {
+            const raw = trimmed[start..i];
+            // Entity-decode into the SST arena so callers get clean strings.
+            if (std.mem.indexOfScalar(u8, raw, '&') == null) {
+                try out.append(book.allocator, raw);
+            } else {
+                var buf: std.ArrayListUnmanaged(u8) = try .initCapacity(arena, raw.len);
+                try appendDecoded(arena, &buf, raw);
+                try out.append(book.allocator, try buf.toOwnedSlice(arena));
+            }
+            start = i + 1;
+        }
+    }
+
+    return try out.toOwnedSlice(book.allocator);
+}
+
+/// Walk a sheet XML's `<dataValidations>` section and collect
+/// list-type entries into `book.data_validations_by_sheet`.
+/// Non-list variants are skipped (surface shows the range but
+/// empty `values`) so callers still see all validations.
+fn parseDataValidationsForSheet(book: *Book, sheet_path: []const u8, xml: []const u8) !void {
+    const dv_start = std.mem.indexOf(u8, xml, "<dataValidations") orelse return;
+    const dv_end = std.mem.indexOfPos(u8, xml, dv_start, "</dataValidations>") orelse return;
+    const block = xml[dv_start..dv_end];
+
+    var entries: std.ArrayListUnmanaged(DataValidation) = .{};
+    errdefer entries.deinit(book.allocator);
+
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, block, i, "<dataValidation")) |dv| {
+        const hdr_end = std.mem.indexOfScalarPos(u8, block, dv, '>') orelse break;
+        const attrs = block[dv..hdr_end];
+        i = hdr_end + 1;
+
+        // sqref="…"
+        const sqref_key = "sqref=\"";
+        const sq_pos = std.mem.indexOf(u8, attrs, sqref_key) orelse continue;
+        const sq_start = sq_pos + sqref_key.len;
+        const sq_close = std.mem.indexOfScalarPos(u8, attrs, sq_start, '"') orelse continue;
+        const sqref = attrs[sq_start..sq_close];
+        const r = parseA1Range(sqref) catch continue;
+
+        // type="…" — only "list" has dropdown values. Other types
+        // still surface the range (with empty values) so callers can
+        // enumerate every data validation, not just dropdowns.
+        const type_key = "type=\"";
+        var is_list = false;
+        if (std.mem.indexOf(u8, attrs, type_key)) |tp| {
+            const t_start = tp + type_key.len;
+            const t_close = std.mem.indexOfScalarPos(u8, attrs, t_start, '"') orelse continue;
+            is_list = std.mem.eql(u8, attrs[t_start..t_close], "list");
+        }
+
+        var values: []const []const u8 = &.{};
+        // If self-closing `<dataValidation … />` there's no body to
+        // peek at for formula1.
+        const is_self_closing = hdr_end > 0 and block[hdr_end - 1] == '/';
+        if (is_list and !is_self_closing) {
+            const dv_close = std.mem.indexOfPos(u8, block, hdr_end, "</dataValidation>") orelse continue;
+            const body = block[hdr_end + 1 .. dv_close];
+            i = dv_close + "</dataValidation>".len;
+
+            const f1_open = "<formula1>";
+            const f1_close_tag = "</formula1>";
+            if (std.mem.indexOf(u8, body, f1_open)) |f1_pos| {
+                const f1_start = f1_pos + f1_open.len;
+                if (std.mem.indexOfPos(u8, body, f1_start, f1_close_tag)) |f1_close| {
+                    const formula1 = body[f1_start..f1_close];
+                    if (try splitFormula1List(book, formula1)) |parsed| {
+                        values = parsed;
+                    }
+                }
+            }
+        } else if (!is_self_closing) {
+            // Advance past the body for non-list entries too so the
+            // outer `<dataValidation` scan moves forward.
+            if (std.mem.indexOfPos(u8, block, hdr_end, "</dataValidation>")) |dv_close| {
+                i = dv_close + "</dataValidation>".len;
+            }
+        }
+
+        try entries.append(book.allocator, .{
+            .top_left = r.top_left,
+            .bottom_right = r.bottom_right,
+            .values = values,
+        });
+    }
+
+    if (entries.items.len == 0) {
+        entries.deinit(book.allocator);
+        return;
+    }
+    const slice = try entries.toOwnedSlice(book.allocator);
+    errdefer book.allocator.free(slice);
+    try book.data_validations_by_sheet.put(book.allocator, sheet_path, slice);
+}
+
 fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
     // Pre-size via the uniqueCount hint in the <sst> tag when present —
     // OOXML generators are reliable about this attribute, so we get a
@@ -1084,6 +1247,70 @@ test "Book.hyperlinks: round-trip through writer + reader" {
 
     try std.testing.expectEqualDeep(CellRef{ .col = 3, .row = 5 }, links[2].top_left);
     try std.testing.expectEqualStrings("https://docs.example.com/", links[2].url);
+}
+
+test "Book.dataValidations: round-trip through writer + reader" {
+    const tmp_path = "/tmp/zlsx_reader_dv_roundtrip.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Pick");
+        try sheet.addDataValidationList("A2:A10", &.{ "Red", "Green", "Blue" });
+        try sheet.addDataValidationList("C3", &.{"Single"});
+        // XML-special chars — writer escapes `R&D` → `R&amp;D`;
+        // reader must decode back on the way out.
+        try sheet.addDataValidationList("B2", &.{ "R&D", "Q<A", "x>y" });
+        try sheet.writeRow(&.{.{ .string = "hdr" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    const dvs = book.dataValidations(book.sheets[0]);
+    try std.testing.expectEqual(@as(usize, 3), dvs.len);
+
+    // 0: A2:A10 → three values.
+    try std.testing.expectEqualDeep(CellRef{ .col = 0, .row = 2 }, dvs[0].top_left);
+    try std.testing.expectEqualDeep(CellRef{ .col = 0, .row = 10 }, dvs[0].bottom_right);
+    try std.testing.expectEqual(@as(usize, 3), dvs[0].values.len);
+    try std.testing.expectEqualStrings("Red", dvs[0].values[0]);
+    try std.testing.expectEqualStrings("Green", dvs[0].values[1]);
+    try std.testing.expectEqualStrings("Blue", dvs[0].values[2]);
+
+    // 1: C3 single cell, one value.
+    try std.testing.expectEqualDeep(CellRef{ .col = 2, .row = 3 }, dvs[1].top_left);
+    try std.testing.expectEqualDeep(CellRef{ .col = 2, .row = 3 }, dvs[1].bottom_right);
+    try std.testing.expectEqual(@as(usize, 1), dvs[1].values.len);
+    try std.testing.expectEqualStrings("Single", dvs[1].values[0]);
+
+    // 2: B2 with XML-special chars, must be decoded on the way out.
+    try std.testing.expectEqualDeep(CellRef{ .col = 1, .row = 2 }, dvs[2].top_left);
+    try std.testing.expectEqual(@as(usize, 3), dvs[2].values.len);
+    try std.testing.expectEqualStrings("R&D", dvs[2].values[0]);
+    try std.testing.expectEqualStrings("Q<A", dvs[2].values[1]);
+    try std.testing.expectEqualStrings("x>y", dvs[2].values[2]);
+}
+
+test "Book.dataValidations: empty slice for sheets without validations" {
+    const tmp_path = "/tmp/zlsx_reader_no_dv.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Plain");
+        try sheet.writeRow(&.{.{ .string = "a" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 0), book.dataValidations(book.sheets[0]).len);
 }
 
 test "Book.hyperlinks: empty slice for sheets without hyperlinks" {

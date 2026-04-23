@@ -65,7 +65,7 @@ Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-ro
 ## What's in, what's out
 
 **In**
-- **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout, merged-cell ranges via `Book.mergedRanges(sheet)`, external-URL hyperlinks via `Book.hyperlinks(sheet)` (resolved through sheet `_rels`)
+- **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout, merged-cell ranges via `Book.mergedRanges(sheet)`, external-URL hyperlinks via `Book.hyperlinks(sheet)` (resolved through sheet `_rels`), list-type data validations via `Book.dataValidations(sheet)` (values entity-decoded)
 - **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks (per-sheet `_rels`), list-type data validations (dropdowns)
 - XML entity decoding (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&#N;`, `&#xN;`) on read and escaping on write
 - CLI (`zlsx file.xlsx --format {jsonl,jsonl-dict,tsv,csv}`), C ABI (`libzlsx.{dylib,so,dll}` + `include/zlsx.h`), Python bindings (`pip install py-zlsx`)
@@ -174,6 +174,7 @@ pub fn sheetByName(self: *const Book, name: []const u8) ?Sheet
 pub fn rows(self: *const Book, sheet: Sheet, allocator: Allocator) !Rows
 pub fn mergedRanges(self: *const Book, sheet: Sheet) []const MergeRange
 pub fn hyperlinks(self: *const Book, sheet: Sheet) []const Hyperlink
+pub fn dataValidations(self: *const Book, sheet: Sheet) []const DataValidation
 ```
 
 `Book.sheets` is a `[]const Sheet` (name + path pairs) exposed for enumeration. Shared strings live in `Book.shared_strings: []const []const u8`. `mergedRanges(sheet)` returns a slice of `MergeRange { top_left: CellRef, bottom_right: CellRef }` where `CellRef = { col: u32, row: u32 }` — column is 0-based (A=0), row is 1-based (row1=1). `hyperlinks(sheet)` returns a slice of `Hyperlink { top_left, bottom_right, url }` resolved against the sheet's `_rels/sheet{N}.xml.rels` file; `url` is the raw `Target` attribute (XML entities like `&amp;` are preserved so the URL round-trips byte-for-byte; decode at the caller if you need a display form). Everything is owned by the `Book` until `deinit`.
