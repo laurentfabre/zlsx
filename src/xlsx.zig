@@ -42,6 +42,20 @@ pub const Sheet = struct {
     path: []const u8, // e.g. "xl/worksheets/sheet1.xml"
 };
 
+/// A1-style cell reference broken into components. Column is 0-based
+/// (A=0, B=1, …, XFD=16383); row is 1-based to match Excel's native
+/// convention (row 1 is the first row). Matches the axis layout used
+/// by `Rows.next()`'s returned cell slices.
+pub const CellRef = struct { col: u32, row: u32 };
+
+/// A rectangular merged cell range read from the worksheet's
+/// `<mergeCells>` block. `top_left` has the smaller `(col, row)` pair;
+/// `bottom_right` has the larger. Both corners are inclusive.
+pub const MergeRange = struct {
+    top_left: CellRef,
+    bottom_right: CellRef,
+};
+
 /// Domain errors surfaced by this module. The public API uses inferred
 /// error sets so callers get the full union of these plus whatever
 /// std.zip / std.fs / std.compress.flate decide to return.
@@ -74,6 +88,12 @@ pub const Book = struct {
     sheets: []Sheet = &.{},
     /// Decompressed bytes of each sheet's XML, keyed by path.
     sheet_data: std.StringHashMapUnmanaged([]u8) = .{},
+    /// Merged cell ranges per sheet, parsed from `<mergeCells>` at
+    /// open time. Keyed by the sheet path. Sheets without merges are
+    /// absent from the map; callers should use
+    /// `mergedRanges(sheet)` which normalises the missing case to an
+    /// empty slice.
+    merged_ranges: std.StringHashMapUnmanaged([]MergeRange) = .{},
     /// Owned backing storage for every string referenced by `sheets`,
     /// sheet_data keys, and entity-decoded shared strings.
     strings: std.ArrayListUnmanaged([]u8) = .{},
@@ -146,7 +166,22 @@ pub const Book = struct {
         try parseWorkbookSheets(&book, wb, rels);
         if (book.shared_strings_xml) |sst| try parseSharedStrings(&book, sst);
 
+        // Parse merged cell ranges per sheet. Cheap — most sheets have
+        // no `<mergeCells>` block, and the parser bails on the first
+        // miss.
+        var sheet_it = book.sheet_data.iterator();
+        while (sheet_it.next()) |entry| {
+            try parseMergedRangesForSheet(&book, entry.key_ptr.*, entry.value_ptr.*);
+        }
+
         return book;
+    }
+
+    /// Merged cell ranges declared in this sheet's `<mergeCells>`
+    /// block, or an empty slice if none. The returned slice is owned
+    /// by the Book and valid until `deinit`.
+    pub fn mergedRanges(self: *const Book, sheet: Sheet) []const MergeRange {
+        return self.merged_ranges.get(sheet.path) orelse &.{};
     }
 
     pub fn deinit(self: *Book) void {
@@ -154,6 +189,10 @@ pub const Book = struct {
         if (self.shared_strings_xml) |s| a.free(s);
         a.free(self.shared_strings);
         self.sst_arena.deinit();
+
+        var mit = self.merged_ranges.valueIterator();
+        while (mit.next()) |v| a.free(v.*);
+        self.merged_ranges.deinit(a);
 
         var it = self.sheet_data.valueIterator();
         while (it.next()) |v| a.free(v.*);
@@ -583,6 +622,87 @@ fn parseWorkbookSheets(book: *Book, wb_xml: []const u8, rels_xml: []const u8) !v
 
 // ─── sharedStrings.xml parsing ───────────────────────────────────────
 
+/// Parse one corner of an A1-style reference ("B12") into `{col, row}`.
+/// Column is 0-based (A=0, B=1, …), row is 1-based (row1=1). Rejects
+/// empty input, lowercase, missing digits, and row=0.
+fn parseA1Ref(s: []const u8) !CellRef {
+    if (s.len == 0) return error.MalformedXml;
+    var i: usize = 0;
+    var col: u32 = 0;
+    while (i < s.len and s[i] >= 'A' and s[i] <= 'Z') : (i += 1) {
+        col = col * 26 + (s[i] - 'A' + 1);
+    }
+    if (i == 0 or i == s.len) return error.MalformedXml;
+    var row: u32 = 0;
+    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+        row = row * 10 + (s[i] - '0');
+    }
+    if (i != s.len or row == 0) return error.MalformedXml;
+    return .{ .col = col - 1, .row = row };
+}
+
+/// Parse an A1-style range ("A1:B2"). Top-left corner must precede or
+/// equal bottom-right on both axes; we normalise order so callers can
+/// rely on `top_left ≤ bottom_right` component-wise even if the source
+/// XML listed the corners in the other order.
+fn parseA1Range(ref: []const u8) !MergeRange {
+    const colon = std.mem.indexOfScalar(u8, ref, ':') orelse {
+        // Single-cell "range" — degenerate but legal per the reader's
+        // contract. Promote to a 1×1 rectangle.
+        const p = try parseA1Ref(ref);
+        return .{ .top_left = p, .bottom_right = p };
+    };
+    const a = try parseA1Ref(ref[0..colon]);
+    const b = try parseA1Ref(ref[colon + 1 ..]);
+    return .{
+        .top_left = .{ .col = @min(a.col, b.col), .row = @min(a.row, b.row) },
+        .bottom_right = .{ .col = @max(a.col, b.col), .row = @max(a.row, b.row) },
+    };
+}
+
+/// Walk a sheet XML's `<mergeCells>` section and collect ranges into
+/// `book.merged_ranges`. No-op when the sheet has no merges.
+fn parseMergedRangesForSheet(book: *Book, sheet_path: []const u8, xml: []const u8) !void {
+    const mc_start = std.mem.indexOf(u8, xml, "<mergeCells") orelse return;
+    const mc_end = std.mem.indexOfPos(u8, xml, mc_start, "</mergeCells>") orelse return;
+    const block = xml[mc_start..mc_end];
+
+    var ranges: std.ArrayListUnmanaged(MergeRange) = .{};
+    errdefer ranges.deinit(book.allocator);
+
+    // Honour the `count="N"` attribute when present — lets us
+    // pre-size the backing array and skip geometric grows.
+    const hint: usize = blk: {
+        const c = std.mem.indexOfPos(u8, block, 0, "count=\"") orelse break :blk 0;
+        const start = c + "count=\"".len;
+        const end = std.mem.indexOfScalarPos(u8, block, start, '"') orelse break :blk 0;
+        break :blk std.fmt.parseInt(usize, block[start..end], 10) catch 0;
+    };
+    if (hint > 0) try ranges.ensureTotalCapacity(book.allocator, hint);
+
+    const needle = "<mergeCell ref=\"";
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, block, i, needle)) |start| {
+        const ref_start = start + needle.len;
+        const ref_end = std.mem.indexOfScalarPos(u8, block, ref_start, '"') orelse break;
+        // Skip malformed ranges rather than fail the whole open —
+        // callers with partially-valid workbooks should still get the
+        // rest of their data.
+        if (parseA1Range(block[ref_start..ref_end])) |r| {
+            try ranges.append(book.allocator, r);
+        } else |_| {}
+        i = ref_end + 1;
+    }
+
+    if (ranges.items.len == 0) {
+        ranges.deinit(book.allocator);
+        return;
+    }
+    const slice = try ranges.toOwnedSlice(book.allocator);
+    errdefer book.allocator.free(slice);
+    try book.merged_ranges.put(book.allocator, sheet_path, slice);
+}
+
 fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
     // Pre-size via the uniqueCount hint in the <sst> tag when present —
     // OOXML generators are reliable about this attribute, so we get a
@@ -720,6 +840,85 @@ fn extractEntryToBuffer(
 
 // ─── Tests ───────────────────────────────────────────────────────────
 
+test "parseA1Ref: basic A1 parsing + rejection" {
+    try std.testing.expectEqualDeep(CellRef{ .col = 0, .row = 1 }, try parseA1Ref("A1"));
+    try std.testing.expectEqualDeep(CellRef{ .col = 1, .row = 2 }, try parseA1Ref("B2"));
+    try std.testing.expectEqualDeep(CellRef{ .col = 25, .row = 99 }, try parseA1Ref("Z99"));
+    try std.testing.expectEqualDeep(CellRef{ .col = 26, .row = 1 }, try parseA1Ref("AA1"));
+    try std.testing.expectEqualDeep(CellRef{ .col = 16383, .row = 1048576 }, try parseA1Ref("XFD1048576"));
+
+    try std.testing.expectError(error.MalformedXml, parseA1Ref(""));
+    try std.testing.expectError(error.MalformedXml, parseA1Ref("A0")); // row 0
+    try std.testing.expectError(error.MalformedXml, parseA1Ref("1A")); // row before col
+    try std.testing.expectError(error.MalformedXml, parseA1Ref("A")); // no row
+    try std.testing.expectError(error.MalformedXml, parseA1Ref("1")); // no col
+    try std.testing.expectError(error.MalformedXml, parseA1Ref("a1")); // lowercase
+}
+
+test "parseA1Range: rectangle parsing + corner normalisation" {
+    const r = try parseA1Range("A1:B2");
+    try std.testing.expectEqualDeep(CellRef{ .col = 0, .row = 1 }, r.top_left);
+    try std.testing.expectEqualDeep(CellRef{ .col = 1, .row = 2 }, r.bottom_right);
+
+    // Single-cell form is accepted (1×1 rectangle).
+    const s = try parseA1Range("C3");
+    try std.testing.expectEqualDeep(CellRef{ .col = 2, .row = 3 }, s.top_left);
+    try std.testing.expectEqualDeep(CellRef{ .col = 2, .row = 3 }, s.bottom_right);
+
+    // Order-swapped corners get normalised — some historical
+    // generators emit "B2:A1" where they meant "A1:B2".
+    const swapped = try parseA1Range("B2:A1");
+    try std.testing.expectEqualDeep(CellRef{ .col = 0, .row = 1 }, swapped.top_left);
+    try std.testing.expectEqualDeep(CellRef{ .col = 1, .row = 2 }, swapped.bottom_right);
+}
+
+test "Book.mergedRanges: round-trip through writer + reader" {
+    const tmp_path = "/tmp/zlsx_reader_merged_roundtrip.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Sheet1");
+        try sheet.addMergedCell("A1:C1");
+        try sheet.addMergedCell("B5:D7");
+        try sheet.addMergedCell("XFD1048575:XFD1048576");
+        try sheet.writeRow(&.{.{ .string = "hdr" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    const ranges = book.mergedRanges(book.sheets[0]);
+    try std.testing.expectEqual(@as(usize, 3), ranges.len);
+    try std.testing.expectEqualDeep(CellRef{ .col = 0, .row = 1 }, ranges[0].top_left);
+    try std.testing.expectEqualDeep(CellRef{ .col = 2, .row = 1 }, ranges[0].bottom_right);
+    try std.testing.expectEqualDeep(CellRef{ .col = 1, .row = 5 }, ranges[1].top_left);
+    try std.testing.expectEqualDeep(CellRef{ .col = 3, .row = 7 }, ranges[1].bottom_right);
+    try std.testing.expectEqualDeep(CellRef{ .col = 16383, .row = 1048575 }, ranges[2].top_left);
+    try std.testing.expectEqualDeep(CellRef{ .col = 16383, .row = 1048576 }, ranges[2].bottom_right);
+}
+
+test "Book.mergedRanges: empty slice for sheets without merges" {
+    const tmp_path = "/tmp/zlsx_reader_no_merged.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Sheet1");
+        try sheet.writeRow(&.{.{ .string = "a" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 0), book.mergedRanges(book.sheets[0]).len);
+}
+
 test "columnIndexFromRef" {
     try std.testing.expectEqual(@as(usize, 0), try columnIndexFromRef("A1"));
     try std.testing.expectEqual(@as(usize, 1), try columnIndexFromRef("B2"));
@@ -806,6 +1005,34 @@ fn randomInput(rng: std.Random, buf: []u8) []u8 {
     const len = rng.intRangeAtMost(usize, 0, buf.len);
     rng.bytes(buf[0..len]);
     return buf[0..len];
+}
+
+test "fuzz parseA1Ref + parseA1Range: adversarial bytes never panic" {
+    const iters = fuzz_default_iters;
+    var prng = std.Random.DefaultPrng.init(0x3F2A1E);
+    const rng = prng.random();
+
+    var buf: [20]u8 = undefined;
+    for (0..iters) |_| {
+        const len = rng.intRangeAtMost(usize, 0, buf.len);
+        for (0..len) |i| buf[i] = rng.int(u8);
+        const s = buf[0..len];
+
+        if (parseA1Ref(s)) |ref| {
+            // Any accepted input must map to an in-Excel-range cell.
+            try std.testing.expect(ref.col <= 16383);
+            try std.testing.expect(ref.row >= 1 and ref.row <= 1048576);
+        } else |err| {
+            try std.testing.expectEqual(error.MalformedXml, err);
+        }
+
+        if (parseA1Range(s)) |r| {
+            try std.testing.expect(r.top_left.col <= r.bottom_right.col);
+            try std.testing.expect(r.top_left.row <= r.bottom_right.row);
+        } else |err| {
+            try std.testing.expectEqual(error.MalformedXml, err);
+        }
+    }
 }
 
 test "fuzz columnIndexFromRef" {

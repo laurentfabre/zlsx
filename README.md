@@ -65,7 +65,7 @@ Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-ro
 ## What's in, what's out
 
 **In**
-- **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout
+- **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout, merged-cell ranges via `Book.mergedRanges(sheet)`
 - **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks (per-sheet `_rels`)
 - XML entity decoding (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&#N;`, `&#xN;`) on read and escaping on write
 - CLI (`zlsx file.xlsx --format {jsonl,jsonl-dict,tsv,csv}`), C ABI (`libzlsx.{dylib,so,dll}` + `include/zlsx.h`), Python bindings (`pip install py-zlsx`)
@@ -73,7 +73,6 @@ Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-ro
 **Out (by design)**
 - No formula evaluation — the reader returns the cached `<v>` value, the writer never synthesises formulas
 - No date decoding — dates stay as their raw Excel serial number unless the generator pre-serialised them
-- No merged-cell authoring on the **reader** side — the underlying cell anchors are preserved; merging is caller-interpreted. (The **writer** does emit `<mergeCells>` — call `SheetWriter.addMergedCell("A1:B2")`.)
 - No load-modify-save round-trip yet — Phase 3c queued. For now the writer only produces fresh workbooks
 - No chart / pivot / image extraction or emission
 
@@ -173,9 +172,10 @@ pub fn open(allocator: Allocator, path: []const u8) !Book
 pub fn deinit(self: *Book) void
 pub fn sheetByName(self: *const Book, name: []const u8) ?Sheet
 pub fn rows(self: *const Book, sheet: Sheet, allocator: Allocator) !Rows
+pub fn mergedRanges(self: *const Book, sheet: Sheet) []const MergeRange
 ```
 
-`Book.sheets` is a `[]const Sheet` (name + path pairs) exposed for enumeration. Shared strings live in `Book.shared_strings: []const []const u8`. Everything is owned by the `Book` until `deinit`.
+`Book.sheets` is a `[]const Sheet` (name + path pairs) exposed for enumeration. Shared strings live in `Book.shared_strings: []const []const u8`. `mergedRanges(sheet)` returns a slice of `MergeRange { top_left: CellRef, bottom_right: CellRef }` where `CellRef = { col: u32, row: u32 }` — column is 0-based (A=0), row is 1-based (row1=1). Everything is owned by the `Book` until `deinit`.
 
 ### `Rows`
 
