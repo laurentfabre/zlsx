@@ -715,6 +715,15 @@ if _HAS_PARSE_DATE:
     lib.zlsx_rows_parse_date.restype = ctypes.c_int32
 
 
+_HAS_TO_EXCEL_SERIAL = hasattr(lib, "zlsx_datetime_to_serial")
+if _HAS_TO_EXCEL_SERIAL:
+    lib.zlsx_datetime_to_serial.argtypes = [
+        ctypes.POINTER(CDateTime),
+        ctypes.POINTER(ctypes.c_double),
+    ]
+    lib.zlsx_datetime_to_serial.restype = ctypes.c_int32
+
+
 _HAS_NUM_FMT = (
     hasattr(lib, "zlsx_rows_style_at")
     and hasattr(lib, "zlsx_number_format")

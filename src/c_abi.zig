@@ -809,6 +809,33 @@ pub const CDateTime = extern struct {
     _pad: u8,
 };
 
+/// Inverse of `zlsx_rows_parse_date`: convert a `CDateTime` into
+/// the Excel serial number that callers pass as `CellTag.number`
+/// when writing a date cell. Returns 0 with `*out_serial` set on
+/// success, -1 when the DateTime is outside the round-trippable
+/// range (year < 1900, malformed fields, or date ≤ 1900-02-29 —
+/// the 1900 leap-bug exclusion).
+///
+/// Pair with a style registered via `zlsx_writer_add_style_ex`
+/// with `number_format = "yyyy-mm-dd"` (or any date pattern) to
+/// emit a date cell round-trippable via `zlsx_rows_parse_date`.
+export fn zlsx_datetime_to_serial(
+    dt: *const CDateTime,
+    out_serial: *f64,
+) callconv(.c) i32 {
+    const z_dt: xlsx.DateTime = .{
+        .year = dt.year,
+        .month = dt.month,
+        .day = dt.day,
+        .hour = dt.hour,
+        .minute = dt.minute,
+        .second = dt.second,
+    };
+    const serial = xlsx.toExcelSerial(z_dt) orelse return -1;
+    out_serial.* = serial;
+    return 0;
+}
+
 /// Convenience: parse the current-row cell at `col_idx` as a
 /// date-styled number, writing the decoded `CDateTime` into `out`.
 /// Returns 0 on success (non-null DateTime), 1 when the cell isn't

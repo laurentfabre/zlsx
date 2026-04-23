@@ -457,6 +457,19 @@ int32_t zlsx_rows_parse_date(zlsx_rows_t *     rows,
                              zlsx_datetime_t * out);
 
 /*
+ * Inverse of zlsx_rows_parse_date: DateTime → Excel serial number.
+ * Returns 0 with `*out_serial` set on success, -1 when the input
+ * is outside the round-trippable range (year<1900, invalid
+ * month/day/hour/etc., or date ≤ 1900-02-29).
+ *
+ * Pair with a style carrying `number_format="yyyy-mm-dd"` (or any
+ * date pattern) to write a date cell that Excel displays correctly
+ * and zlsx_rows_parse_date decodes cleanly.
+ */
+int32_t zlsx_datetime_to_serial(const zlsx_datetime_t * dt,
+                                double *                out_serial);
+
+/*
  * Resolve a style index to its number-format code. Returns 0 and
  * populates `*out_ptr` / `*out_len` on success; returns -1 on
  * out-of-range indices or when the workbook has no styles.xml.

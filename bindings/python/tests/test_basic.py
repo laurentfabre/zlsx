@@ -825,6 +825,46 @@ def test_rich_text_runs_color_size_font(tmp_path):
         assert runs[0].font_name == ""
 
 
+def test_to_excel_serial_round_trip_with_parse_date(tmp_path):
+    """Full date round-trip: Python datetime → to_excel_serial →
+    write as numeric cell with date style → read via parse_date →
+    Python datetime. Matches the iter46/47 intent: one-call
+    conversion at both ends."""
+    import datetime as _dt
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_TO_EXCEL_SERIAL or not ffi._HAS_PARSE_DATE:
+        pytest.skip("loaded libzlsx predates to_excel_serial ABI (0.2.6+)")
+
+    # A datetime.date and a datetime.datetime both round-trip.
+    d_plain = _dt.date(2023, 1, 1)
+    d_stamped = _dt.datetime(2024, 6, 15, 12, 34, 56)
+
+    out = tmp_path / "dates_rt.xlsx"
+    with zlsx.write(out) as w:
+        date_style = w.add_style(zlsx.Style(number_format="yyyy-mm-dd"))
+        dt_style = w.add_style(zlsx.Style(number_format="yyyy-mm-dd h:mm:ss"))
+        sheet = w.add_sheet("S")
+        sheet.write_row(
+            [zlsx.to_excel_serial(d_plain), zlsx.to_excel_serial(d_stamped)],
+            styles=[date_style, dt_style],
+        )
+
+    with zlsx.open(out) as book:
+        with book.sheet(0).rows() as rows:
+            next(rows)
+            assert rows.parse_date(0) == _dt.datetime(2023, 1, 1)
+            assert rows.parse_date(1) == _dt.datetime(2024, 6, 15, 12, 34, 56)
+
+    # Rejection paths.
+    with pytest.raises(ValueError, match="round-trippable date range"):
+        zlsx.to_excel_serial(_dt.date(1800, 1, 1))
+    with pytest.raises(ValueError, match="round-trippable date range"):
+        zlsx.to_excel_serial(_dt.date(1900, 2, 28))  # pre-leap-bug exclusion
+    with pytest.raises(TypeError, match="datetime.date or datetime.datetime"):
+        zlsx.to_excel_serial("not a date")
+
+
 def test_rows_parse_date_auto_converts_date_styled_cells(tmp_path):
     """Python callers can parse date-styled numeric cells directly
     via `Rows.parse_date(col_idx)` without manually chaining

@@ -55,6 +55,7 @@ __all__ = [
     "Comment",
     "Dxf",
     "CF_OPERATORS",
+    "to_excel_serial",
     "ZlsxError",
 ]
 
@@ -1027,6 +1028,46 @@ class Rows:
 
 
 # ─── Public entry point ───────────────────────────────────────────────
+
+
+def to_excel_serial(dt) -> float:
+    """Convert a Python ``datetime.datetime`` / ``datetime.date`` to
+    an Excel serial-date number suitable for passing as a numeric
+    cell. Combine with ``Style(number_format="yyyy-mm-dd")`` to
+    write a date cell round-trippable via ``Rows.parse_date``.
+
+    Raises ``ValueError`` when the date is outside the
+    round-trippable range (year < 1900 or > 9999, or ≤ 1900-02-29 —
+    the 1900 leap-year bug exclusion). Requires libzlsx 0.2.6+.
+    """
+    import datetime as _dt
+    if not _ffi._HAS_TO_EXCEL_SERIAL:
+        raise RuntimeError(
+            "loaded libzlsx does not expose datetime_to_serial "
+            "(requires 0.2.6+); upgrade libzlsx"
+        )
+    # datetime.date (not datetime.datetime) has no hour/minute/second
+    # — treat it as midnight.
+    if isinstance(dt, _dt.datetime):
+        h, m, s = dt.hour, dt.minute, dt.second
+    elif isinstance(dt, _dt.date):
+        h, m, s = 0, 0, 0
+    else:
+        raise TypeError(
+            f"expected datetime.date or datetime.datetime, got {type(dt).__name__}"
+        )
+    cdt = _ffi.CDateTime(
+        year=dt.year, month=dt.month, day=dt.day,
+        hour=h, minute=m, second=s, _pad=0,
+    )
+    out = ctypes.c_double(0.0)
+    rc = _ffi.lib.zlsx_datetime_to_serial(ctypes.byref(cdt), ctypes.byref(out))
+    if rc != 0:
+        raise ValueError(
+            f"{dt!r} is outside Excel's round-trippable date range "
+            "(year 1900..9999, > 1900-02-29)"
+        )
+    return float(out.value)
 
 
 def open(path: Union[str, Path]) -> Book:  # noqa: A001  (shadows builtin by design)

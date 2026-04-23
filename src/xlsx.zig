@@ -105,6 +105,68 @@ pub fn fromExcelSerial(serial: f64) ?DateTime {
     };
 }
 
+/// Gregorian `{year, month, day}` → days-since-1970-01-01 using
+/// Hinnant's days_from_civil. Inverse of `daysSinceUnixEpochToYMD`.
+/// Input must be a real calendar date (year 1..=9999, month 1..=12,
+/// day 1..=31 with the month's actual max) — `toExcelSerial` gates
+/// this upstream.
+fn ymdToDaysSinceUnixEpoch(year: i32, month: u8, day: u8) i32 {
+    const y: i32 = if (month <= 2) year - 1 else year;
+    const era: i32 = if (y >= 0) @divFloor(y, 400) else @divFloor(y - 399, 400);
+    const yoe: i32 = y - era * 400;
+    const m: i32 = @intCast(month);
+    const doy: i32 = @divFloor(153 * (if (m > 2) m - 3 else m + 9) + 2, 5) + @as(i32, @intCast(day)) - 1;
+    const doe: i32 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// Inverse of `fromExcelSerial`: convert a calendar `DateTime` into
+/// the Excel serial-date number that writes produce. Returns `null`
+/// when the input is outside the round-trippable range the reader
+/// decodes cleanly:
+///   - year < 1900 or > 9999
+///   - month / day / hour / minute / second outside their legal
+///     Gregorian ranges (1..=12 / 1..=31-per-month / 0..=23 / 0..=59)
+///   - dates on or before 1900-03-01 — fromExcelSerial rejects
+///     serials < 61 because of the 1900 leap-year bug, so this
+///     matches that exclusion and keeps write/read symmetric.
+///
+/// Pair with `Writer.addStyle(Style{.number_format="yyyy-mm-dd"})`
+/// to emit a date cell that Excel displays correctly and the reader
+/// decodes via `Rows.parseDate`.
+pub fn toExcelSerial(dt: DateTime) ?f64 {
+    if (dt.year < 1900 or dt.year > 9999) return null;
+    if (dt.month < 1 or dt.month > 12) return null;
+    if (dt.hour > 23 or dt.minute > 59 or dt.second > 59) return null;
+
+    // Day-of-month bounds vary with month + leap year.
+    const days_in_month = [_]u8{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    var max_day = days_in_month[dt.month - 1];
+    if (dt.month == 2) {
+        const is_leap =
+            (@mod(dt.year, 4) == 0 and @mod(dt.year, 100) != 0) or
+            @mod(dt.year, 400) == 0;
+        if (is_leap) max_day = 29;
+    }
+    if (dt.day < 1 or dt.day > max_day) return null;
+
+    const days_since_unix = ymdToDaysSinceUnixEpoch(@intCast(dt.year), dt.month, dt.day);
+    // Excel serial 1 = 1900-01-01, unix epoch is 1970-01-01 —
+    // offset 25569 bridges them. Matches the constant used in
+    // fromExcelSerial.
+    const excel_days = days_since_unix + 25569;
+    const time_frac: f64 =
+        (@as(f64, @floatFromInt(dt.hour)) * 3600 +
+            @as(f64, @floatFromInt(dt.minute)) * 60 +
+            @as(f64, @floatFromInt(dt.second))) / 86400.0;
+    const serial = @as(f64, @floatFromInt(excel_days)) + time_frac;
+
+    // Match fromExcelSerial's lower-bound rejection — dates that
+    // decode as null shouldn't encode back to a non-null serial.
+    if (serial < 61.0) return null;
+    return serial;
+}
+
 pub const Cell = union(enum) {
     empty,
     /// Slice into the Book's internal buffers — not owned by Cell.
@@ -2388,6 +2450,48 @@ fn extractEntryToBuffer(
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
+
+test "toExcelSerial: inverse of fromExcelSerial on round-trippable range" {
+    // Round-trip every known reference date through both helpers.
+    const cases = [_]struct {
+        y: u16,
+        m: u8,
+        d: u8,
+        want: f64,
+    }{
+        .{ .y = 1900, .m = 3, .d = 1, .want = 61.0 }, // earliest supported
+        .{ .y = 1970, .m = 1, .d = 1, .want = 25569.0 }, // unix epoch
+        .{ .y = 2000, .m = 1, .d = 1, .want = 36526.0 },
+        .{ .y = 2023, .m = 1, .d = 1, .want = 44927.0 },
+        .{ .y = 2024, .m = 2, .d = 29, .want = 45351.0 }, // leap day
+        .{ .y = 9999, .m = 12, .d = 31, .want = 2958465.0 }, // upper bound
+    };
+    for (cases) |c| {
+        const dt = DateTime{ .year = c.y, .month = c.m, .day = c.d, .hour = 0, .minute = 0, .second = 0 };
+        const got = toExcelSerial(dt) orelse {
+            std.debug.print("toExcelSerial returned null for {d}-{d}-{d}\n", .{ c.y, c.m, c.d });
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expectEqual(c.want, got);
+        // Round-trip: serial → DateTime → same fields.
+        const back = fromExcelSerial(got) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualDeep(dt, back);
+    }
+
+    // Time-of-day: 2023-06-15 12:34:56 → serial + fractional part.
+    const noon_ish = DateTime{ .year = 2023, .month = 6, .day = 15, .hour = 12, .minute = 34, .second = 56 };
+    const s = toExcelSerial(noon_ish) orelse return error.TestUnexpectedResult;
+    const back = fromExcelSerial(s) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualDeep(noon_ish, back);
+
+    // Rejection paths.
+    try std.testing.expectEqual(@as(?f64, null), toExcelSerial(.{ .year = 1899, .month = 12, .day = 31, .hour = 0, .minute = 0, .second = 0 }));
+    try std.testing.expectEqual(@as(?f64, null), toExcelSerial(.{ .year = 1900, .month = 2, .day = 28, .hour = 0, .minute = 0, .second = 0 })); // pre-leap-bug exclusion
+    try std.testing.expectEqual(@as(?f64, null), toExcelSerial(.{ .year = 2023, .month = 2, .day = 29, .hour = 0, .minute = 0, .second = 0 })); // non-leap Feb 29
+    try std.testing.expectEqual(@as(?f64, null), toExcelSerial(.{ .year = 2023, .month = 13, .day = 1, .hour = 0, .minute = 0, .second = 0 }));
+    try std.testing.expectEqual(@as(?f64, null), toExcelSerial(.{ .year = 2023, .month = 4, .day = 31, .hour = 0, .minute = 0, .second = 0 })); // April has 30 days
+    try std.testing.expectEqual(@as(?f64, null), toExcelSerial(.{ .year = 2023, .month = 1, .day = 1, .hour = 24, .minute = 0, .second = 0 })); // hour out of range
+}
 
 test "fromExcelSerial: known reference dates + rejection matrix" {
     // Reference points — all confirmed against Excel's DATEVALUE:
