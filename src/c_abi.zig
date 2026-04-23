@@ -1248,6 +1248,16 @@ export fn zlsx_sheet_writer_write_rich_row(
     if (rich_runs_lens) |lens| {
         for (0..cells_len) |i| total_runs += lens[i];
     }
+    // The extern signature treats both rich_runs_ptrs and _lens as
+    // optional so callers with zero rich cells can pass NULL for
+    // both. Guard against the invalid-but-legal-ABI case where the
+    // caller supplied non-zero counts but a null pointer table —
+    // otherwise the `.?` force-unwrap below would panic the process
+    // instead of honouring the -1/err_buf return contract.
+    if (total_runs > 0 and rich_runs_ptrs == null) {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return -1;
+    }
     var runs_all: []writer_mod.RichTextRun = &.{};
     if (total_runs > 0) {
         if (total_runs <= runs_scratch.len) {

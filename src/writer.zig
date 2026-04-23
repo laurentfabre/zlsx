@@ -960,10 +960,14 @@ pub const Writer = struct {
                 // OOXML VML x:Anchor is 8 numbers:
                 //   fromCol, fromColPx, fromRow, fromRowPx,
                 //   toCol,   toColPx,   toRow,   toRowPx
+                // Clamp the anchor "to" corner to Excel's hard grid so
+                // comments on cells near XFD/1048576 don't reference
+                // off-sheet cells. Excel tolerates it, but some strict
+                // VML parsers do not.
                 const from_col = col0 + 1;
                 const from_row = row0;
-                const to_col = col0 + 3;
-                const to_row = row0 + 4;
+                const to_col = @min(col0 + 3, EXCEL_MAX_COL - 1);
+                const to_row = @min(row0 + 4, EXCEL_MAX_ROW - 1);
                 try vml.print(
                     alloc,
                     "<v:shape id=\"_x0000_s{d}\" type=\"#_x0000_t202\" style=\"position:absolute;margin-left:60pt;margin-top:10pt;width:100pt;height:60pt;z-index:{d};visibility:hidden\" fillcolor=\"#ffffe1\" o:insetmode=\"auto\"><v:fill color2=\"#ffffe1\"/><v:shadow on=\"t\" color=\"black\" obscured=\"t\"/><v:path o:connecttype=\"none\"/><v:textbox><div style=\"text-align:left\"/></v:textbox><x:ClientData ObjectType=\"Note\"><x:MoveWithCells/><x:SizeWithCells/><x:Anchor>{d}, 15, {d}, 2, {d}, 31, {d}, 3</x:Anchor><x:AutoFill>False</x:AutoFill><x:Row>{d}</x:Row><x:Column>{d}</x:Column></x:ClientData></v:shape>",
