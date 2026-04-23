@@ -136,6 +136,18 @@ pub const BorderStyle = enum(u8) {
 };
 
 /// One side of a cell border (left / right / top / bottom / diagonal).
+/// Cell comment (note) attached via `SheetWriter.addComment`. Emits
+/// as `<comments><authors/><commentList/></comments>` under
+/// `xl/commentsN.xml`, plus a minimal VML shape under
+/// `xl/drawings/vmlDrawingN.xml` so Excel renders the note
+/// indicator. Plain-text bodies only — rich-text comment bodies
+/// can layer on without breaking this shape.
+pub const Comment = struct {
+    ref: []const u8,
+    author: []const u8,
+    text: []const u8,
+};
+
 /// Formatting run for a single piece of rich-text content. Mirrors
 /// the reader-side `xlsx.RichRun` with writer-friendly nullable
 /// optional fields. Consecutive runs inside the same cell accumulate
@@ -498,6 +510,31 @@ pub const Writer = struct {
                     "<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>",
                 );
             }
+            // Per-sheet comments + vmlDrawing overrides. A `Default
+            // Extension="vml"` line covers every vmlDrawing.vml file in
+            // one go; the comments parts need explicit Overrides
+            // because `.xml` is already claimed by the generic Default.
+            var any_comments = false;
+            for (self.sheets.items) |sw| {
+                if (sw.comments.items.len > 0) {
+                    any_comments = true;
+                    break;
+                }
+            }
+            if (any_comments) {
+                try ct.appendSlice(
+                    alloc,
+                    "<Default Extension=\"vml\" ContentType=\"application/vnd.openxmlformats-officedocument.vmlDrawing\"/>",
+                );
+                for (self.sheets.items, 0..) |sw, i| {
+                    if (sw.comments.items.len == 0) continue;
+                    try ct.print(
+                        alloc,
+                        "<Override PartName=\"/xl/comments{d}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml\"/>",
+                        .{i + 1},
+                    );
+                }
+            }
             try ct.appendSlice(alloc, CONTENT_TYPES_TAIL);
             try zw.addEntry("[Content_Types].xml", ct.items);
         }
@@ -672,6 +709,15 @@ pub const Writer = struct {
                 try full.appendSlice(alloc, "</hyperlinks>");
             }
 
+            // <legacyDrawing> links the sheet to its VML drawing part
+            // so Excel renders the yellow note indicators. The rId
+            // scheme inside the per-sheet rels is: rId1..N = external
+            // hyperlinks, next = comments, last = vmlDrawing.
+            if (sw.comments.items.len > 0) {
+                const vml_rid = sw.hyperlinks.items.len + 2;
+                try full.print(alloc, "<legacyDrawing r:id=\"rId{d}\"/>", .{vml_rid});
+            }
+
             try full.appendSlice(alloc, "</worksheet>");
 
             var name_buf: [64]u8 = undefined;
@@ -679,12 +725,14 @@ pub const Writer = struct {
             try zw.addEntry(entry_name, full.items);
         }
 
-        // 5a. xl/worksheets/_rels/sheetN.xml.rels (hyperlinks only)
+        // 5a. xl/worksheets/_rels/sheetN.xml.rels (hyperlinks + comments)
         //
         // The Default Extension="rels" content-type in [Content_Types].xml
         // covers any .rels file we add here — no extra <Override> needed.
+        // Relationship ID scheme: rId1..N = external hyperlinks, then
+        // one for comments, one for vmlDrawing (when sheet has comments).
         for (self.sheets.items, 0..) |sw, i| {
-            if (sw.hyperlinks.items.len == 0) continue;
+            if (sw.hyperlinks.items.len == 0 and sw.comments.items.len == 0) continue;
 
             var rels: std.ArrayListUnmanaged(u8) = .{};
             defer rels.deinit(alloc);
@@ -694,11 +742,107 @@ pub const Writer = struct {
                 try appendXmlEscaped(alloc, &rels, h.url);
                 try rels.appendSlice(alloc, "\" TargetMode=\"External\"/>");
             }
+            if (sw.comments.items.len > 0) {
+                const comments_rid = sw.hyperlinks.items.len + 1;
+                const vml_rid = sw.hyperlinks.items.len + 2;
+                try rels.print(
+                    alloc,
+                    "<Relationship Id=\"rId{d}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\" Target=\"../comments{d}.xml\"/>",
+                    .{ comments_rid, i + 1 },
+                );
+                try rels.print(
+                    alloc,
+                    "<Relationship Id=\"rId{d}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing\" Target=\"../drawings/vmlDrawing{d}.vml\"/>",
+                    .{ vml_rid, i + 1 },
+                );
+            }
             try rels.appendSlice(alloc, WORKBOOK_RELS_TAIL);
 
             var rels_name_buf: [64]u8 = undefined;
             const rels_name = try std.fmt.bufPrint(&rels_name_buf, "xl/worksheets/_rels/sheet{d}.xml.rels", .{i + 1});
             try zw.addEntry(rels_name, rels.items);
+        }
+
+        // 5b. xl/commentsN.xml + xl/drawings/vmlDrawingN.vml (per sheet with comments).
+        //
+        // Authors get deduped into the <authors> table so the
+        // <comment authorId=…> indirection works — the reader
+        // preserves that layout round-trip (see parseCommentsForSheet).
+        // The VML drawing is the minimal legacy shape Excel needs to
+        // render the yellow note indicator; one <v:shape> per comment.
+        for (self.sheets.items, 0..) |sw, i| {
+            if (sw.comments.items.len == 0) continue;
+
+            // Build the unique author list.
+            var authors: std.ArrayListUnmanaged([]const u8) = .{};
+            defer authors.deinit(alloc);
+            var author_ids: std.ArrayListUnmanaged(usize) = .{};
+            defer author_ids.deinit(alloc);
+            for (sw.comments.items) |c| {
+                var found: ?usize = null;
+                for (authors.items, 0..) |a, j| {
+                    if (std.mem.eql(u8, a, c.author)) {
+                        found = j;
+                        break;
+                    }
+                }
+                if (found) |j| {
+                    try author_ids.append(alloc, j);
+                } else {
+                    try author_ids.append(alloc, authors.items.len);
+                    try authors.append(alloc, c.author);
+                }
+            }
+
+            var cx: std.ArrayListUnmanaged(u8) = .{};
+            defer cx.deinit(alloc);
+            try cx.appendSlice(alloc, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+            try cx.appendSlice(alloc, "<comments xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">");
+            try cx.appendSlice(alloc, "<authors>");
+            for (authors.items) |a| {
+                try cx.appendSlice(alloc, "<author>");
+                try appendXmlEscaped(alloc, &cx, a);
+                try cx.appendSlice(alloc, "</author>");
+            }
+            try cx.appendSlice(alloc, "</authors><commentList>");
+            for (sw.comments.items, author_ids.items) |c, aid| {
+                try cx.print(alloc, "<comment ref=\"{s}\" authorId=\"{d}\"><text><r><t xml:space=\"preserve\">", .{ c.ref, aid });
+                try appendXmlEscaped(alloc, &cx, c.text);
+                try cx.appendSlice(alloc, "</t></r></text></comment>");
+            }
+            try cx.appendSlice(alloc, "</commentList></comments>");
+            var cn_buf: [64]u8 = undefined;
+            const cn = try std.fmt.bufPrint(&cn_buf, "xl/comments{d}.xml", .{i + 1});
+            try zw.addEntry(cn, cx.items);
+
+            // Minimal VML drawing — one <v:shape> per comment, with
+            // the oct-encoded Row/Column client data Excel uses to
+            // anchor the note. The shape template `_x0000_t202` and
+            // shapelayout `idmap` are boilerplate that every Excel-
+            // authored file carries.
+            var vml: std.ArrayListUnmanaged(u8) = .{};
+            defer vml.deinit(alloc);
+            try vml.appendSlice(alloc,
+                \\<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel">
+                \\<o:shapelayout v:ext="edit"><o:idmap v:ext="edit" data="1"/></o:shapelayout>
+                \\<v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype>
+            );
+            for (sw.comments.items, 0..) |c, shape_idx| {
+                // parseA1Corner returns 1-based col/row; VML's
+                // x:Row / x:Column are 0-based.
+                const rc = parseA1Corner(c.ref) catch continue;
+                const row0 = rc.row - 1;
+                const col0 = rc.col - 1;
+                try vml.print(
+                    alloc,
+                    "<v:shape id=\"_x0000_s{d}\" type=\"#_x0000_t202\" style=\"position:absolute;margin-left:60pt;margin-top:10pt;width:100pt;height:60pt;z-index:{d};visibility:hidden\" fillcolor=\"#ffffe1\" o:insetmode=\"auto\"><v:fill color2=\"#ffffe1\"/><v:shadow on=\"t\" color=\"black\" obscured=\"t\"/><v:path o:connecttype=\"none\"/><v:textbox><div style=\"text-align:left\"/></v:textbox><x:ClientData ObjectType=\"Note\"><x:MoveWithCells/><x:SizeWithCells/><x:Anchor>1, 15, 0, 2, 4, 31, 4, 3</x:Anchor><x:AutoFill>False</x:AutoFill><x:Row>{d}</x:Row><x:Column>{d}</x:Column></x:ClientData></v:shape>",
+                    .{ 1025 + shape_idx, shape_idx + 1, row0, col0 },
+                );
+            }
+            try vml.appendSlice(alloc, "</xml>");
+            var vml_buf: [64]u8 = undefined;
+            const vml_name = try std.fmt.bufPrint(&vml_buf, "xl/drawings/vmlDrawing{d}.vml", .{i + 1});
+            try zw.addEntry(vml_name, vml.items);
         }
 
         // 6. xl/sharedStrings.xml
@@ -878,6 +1022,10 @@ pub const SheetWriter = struct {
     /// alongside external hyperlinks inside the `<hyperlinks>` block
     /// using `location="…"` instead of `r:id`.
     internal_hyperlinks: std.ArrayListUnmanaged(InternalHyperlink) = .{},
+    /// Cell comments (notes) emitted via `SheetWriter.addComment`.
+    /// Each entry gets one `<comment>` under `xl/commentsN.xml`
+    /// plus one VML shape under `xl/drawings/vmlDrawingN.xml`.
+    comments: std.ArrayListUnmanaged(Comment) = .{},
     /// List-type data validations (dropdowns). Emitted as a single
     /// `<dataValidations>` block with one `<dataValidation>` per entry.
     data_validations: std.ArrayListUnmanaged(DataValidationList) = .{},
@@ -912,6 +1060,12 @@ pub const SheetWriter = struct {
             self.parent.allocator.free(h.location);
         }
         self.internal_hyperlinks.deinit(self.parent.allocator);
+        for (self.comments.items) |c| {
+            self.parent.allocator.free(c.ref);
+            self.parent.allocator.free(c.author);
+            self.parent.allocator.free(c.text);
+        }
+        self.comments.deinit(self.parent.allocator);
         for (self.data_validations.items) |dv| {
             self.parent.allocator.free(dv.range);
             for (dv.values) |v| self.parent.allocator.free(v);
@@ -1128,6 +1282,40 @@ pub const SheetWriter = struct {
         try self.internal_hyperlinks.append(self.parent.allocator, .{
             .range = range_copy,
             .location = loc_copy,
+        });
+    }
+
+    /// Attach a cell comment (note) to `ref` (a single-cell A1 ref
+    /// — ranges are rejected because Excel comments target a single
+    /// cell). `author` is shown in Excel's comment thread header;
+    /// pass empty string for anonymous. `text` is the plain-text
+    /// body; XML-special chars are escaped on emit.
+    ///
+    /// Errors: `InvalidMergeRange` on malformed ref (reused because
+    /// the validator matches the same shape), `InvalidCommentRef`
+    /// when the ref parses as a range rather than a single cell.
+    pub fn addComment(
+        self: *SheetWriter,
+        ref: []const u8,
+        author: []const u8,
+        text: []const u8,
+    ) !void {
+        // Reuse the merge-range validator — ref must be a valid A1
+        // single cell (no colon, no whitespace).
+        if (ref.len == 0) return error.InvalidCommentRef;
+        if (std.mem.indexOfScalar(u8, ref, ':') != null) return error.InvalidCommentRef;
+        try validateHyperlinkRange(ref);
+
+        const ref_copy = try self.parent.allocator.dupe(u8, ref);
+        errdefer self.parent.allocator.free(ref_copy);
+        const author_copy = try self.parent.allocator.dupe(u8, author);
+        errdefer self.parent.allocator.free(author_copy);
+        const text_copy = try self.parent.allocator.dupe(u8, text);
+        errdefer self.parent.allocator.free(text_copy);
+        try self.comments.append(self.parent.allocator, .{
+            .ref = ref_copy,
+            .author = author_copy,
+            .text = text_copy,
         });
     }
 

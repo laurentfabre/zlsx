@@ -404,6 +404,22 @@ if _HAS_HYPERLINK:
     lib.zlsx_sheet_writer_add_hyperlink.restype = ctypes.c_int32
 
 
+_HAS_COMMENT_WRITER = hasattr(lib, "zlsx_sheet_writer_add_comment")
+if _HAS_COMMENT_WRITER:
+    lib.zlsx_sheet_writer_add_comment.argtypes = [
+        sheet_writer_handle,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_add_comment.restype = ctypes.c_int32
+
+
 # Reader metadata (libzlsx 0.2.5+): merged ranges + hyperlinks. Feature-
 # probed like the writer additions so py-zlsx keeps importing against
 # older dylibs.

@@ -996,6 +996,40 @@ def test_sheet_writer_write_rich_row_round_trip(tmp_path):
         assert runs[1].font_name == "Arial"
 
 
+def test_sheet_writer_add_comment_round_trip(tmp_path):
+    """Python writer emits cell comments; reader round-trips them via
+    `Book.comments(sheet_idx)`. Matrix-flip gate for iter38."""
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_COMMENT_WRITER or not ffi._HAS_COMMENTS:
+        pytest.skip("loaded libzlsx predates comment writer ABI (0.2.6+)")
+
+    out = tmp_path / "comments_writer.xlsx"
+    with zlsx.write(out) as w:
+        sheet = w.add_sheet("S")
+        sheet.add_comment("B2", "Alice", "review this")
+        sheet.add_comment("C3", "Bob & Co", "R&D notes")
+        sheet.add_comment("D4", "Alice", "follow-up")  # author dedup
+        sheet.write_row(["hdr"])
+
+        # Rejection paths.
+        with pytest.raises(zlsx.ZlsxError, match="InvalidCommentRef"):
+            sheet.add_comment("", "a", "b")
+        with pytest.raises(zlsx.ZlsxError, match="InvalidCommentRef"):
+            sheet.add_comment("A1:B2", "a", "b")
+
+    with zlsx.open(out) as book:
+        cs = book.comments(0)
+        assert len(cs) == 3
+        assert cs[0].top_left == zlsx.CellRef(col=1, row=2)
+        assert cs[0].author == "Alice"
+        assert cs[0].text == "review this"
+        assert cs[1].author == "Bob & Co"  # entity-decoded
+        assert cs[1].text == "R&D notes"
+        assert cs[2].author == "Alice"  # same dedup'd author
+        assert cs[2].text == "follow-up"
+
+
 def test_book_comments_parses_authors_refs_text(tmp_path):
     """Build a minimal xlsx with a comments1.xml part and verify
     `Book.comments(sheet_idx)` returns the right refs, authors, and

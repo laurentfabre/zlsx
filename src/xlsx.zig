@@ -2659,6 +2659,45 @@ test "Book.dataValidations: empty slice for sheets without validations" {
     try std.testing.expectEqual(@as(usize, 0), book.dataValidations(book.sheets[0]).len);
 }
 
+test "writer.addComment: emits comments that round-trip through Book.comments" {
+    const tmp_path = "/tmp/zlsx_writer_comments_roundtrip.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("S");
+        try sheet.addComment("B2", "Alice", "review this");
+        try sheet.addComment("C3", "Bob & Co", "R&D notes");
+        try sheet.addComment("D4", "Alice", "follow-up"); // same author reused
+        try sheet.writeRow(&.{.{ .string = "hdr" }});
+        try w.save(tmp_path);
+
+        // Rejection paths — single-cell refs only, non-empty.
+        try std.testing.expectError(error.InvalidCommentRef, sheet.addComment("", "a", "b"));
+        try std.testing.expectError(error.InvalidCommentRef, sheet.addComment("A1:B2", "a", "b"));
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    const cs = book.comments(book.sheets[0]);
+    try std.testing.expectEqual(@as(usize, 3), cs.len);
+
+    try std.testing.expectEqualDeep(CellRef{ .col = 1, .row = 2 }, cs[0].top_left);
+    try std.testing.expectEqualStrings("Alice", cs[0].author);
+    try std.testing.expectEqualStrings("review this", cs[0].text);
+
+    try std.testing.expectEqualDeep(CellRef{ .col = 2, .row = 3 }, cs[1].top_left);
+    try std.testing.expectEqualStrings("Bob & Co", cs[1].author); // entity-decoded
+    try std.testing.expectEqualStrings("R&D notes", cs[1].text);
+
+    try std.testing.expectEqualDeep(CellRef{ .col = 3, .row = 4 }, cs[2].top_left);
+    try std.testing.expectEqualStrings("Alice", cs[2].author); // author table dedup
+    try std.testing.expectEqualStrings("follow-up", cs[2].text);
+}
+
 test "writer.writeRichRow: emits rich-text SST entries readable by Book.richRuns" {
     const tmp_path = "/tmp/zlsx_writer_rich_roundtrip.xlsx";
     defer std.fs.cwd().deleteFile(tmp_path) catch {};

@@ -1825,6 +1825,33 @@ export fn zlsx_sheet_writer_add_hyperlink(
     return 0;
 }
 
+/// Attach a cell comment (note). `ref` is a single-cell A1 ref
+/// ("B2"); ranges are rejected. `author` and `text` are both
+/// plain-text; XML-special chars get escaped on emit. Returns 0
+/// on success, -1 with err="InvalidCommentRef" /
+/// "InvalidHyperlinkRange" on bad ref, "OutOfMemory" on alloc.
+export fn zlsx_sheet_writer_add_comment(
+    sw: *SheetWriter,
+    ref_ptr: [*]const u8,
+    ref_len: usize,
+    author_ptr: [*]const u8,
+    author_len: usize,
+    text_ptr: [*]const u8,
+    text_len: usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+    const ref = ref_ptr[0..ref_len];
+    const author = author_ptr[0..author_len];
+    const text = text_ptr[0..text_len];
+    sw_state.inner.addComment(ref, author, text) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
 // ─── Writer tests ────────────────────────────────────────────────────
 
 test "writer: round-trip via reader" {

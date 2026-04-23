@@ -1329,6 +1329,57 @@ def _sheet_add_hyperlink(self: "SheetWriter", range_str: str, url: str) -> None:
         )
 
 
+def _sheet_add_comment(
+    self: "SheetWriter",
+    ref: str,
+    author: str,
+    text: str,
+) -> None:
+    """Attach a cell comment (note) to ``ref``.
+
+    ``ref`` is a single-cell A1 reference (``"B2"``); ranges raise
+    :class:`ZlsxError` (``InvalidCommentRef``). ``author`` shows in
+    Excel's comment thread header — pass empty for anonymous. ``text``
+    is the plain-text body; XML-special chars are escaped on emit.
+
+    Requires libzlsx 0.2.6+."""
+    self._require_handle()
+    if not _ffi._HAS_COMMENT_WRITER:
+        raise RuntimeError(
+            "loaded libzlsx does not expose add_comment "
+            "(requires 0.2.6+); upgrade libzlsx"
+        )
+    ref_raw = ref.encode("utf-8")
+    author_raw = author.encode("utf-8")
+    text_raw = text.encode("utf-8")
+    ref_buf = (ctypes.c_ubyte * max(len(ref_raw), 1)).from_buffer_copy(
+        ref_raw or b"\x00"
+    )
+    author_buf = (ctypes.c_ubyte * max(len(author_raw), 1)).from_buffer_copy(
+        author_raw or b"\x00"
+    )
+    text_buf = (ctypes.c_ubyte * max(len(text_raw), 1)).from_buffer_copy(
+        text_raw or b"\x00"
+    )
+    ptr_t = ctypes.POINTER(ctypes.c_ubyte)
+    rc = _ffi.lib.zlsx_sheet_writer_add_comment(
+        self._handle,
+        ctypes.cast(ref_buf, ptr_t),
+        len(ref_raw),
+        ctypes.cast(author_buf, ptr_t),
+        len(author_raw),
+        ctypes.cast(text_buf, ptr_t),
+        len(text_raw),
+        self._err,
+        _ERR_BUF_LEN,
+    )
+    del ref_buf, author_buf, text_buf
+    if rc != 0:
+        raise ZlsxError(
+            f"zlsx_sheet_writer_add_comment: {_decode_err(self._err)}"
+        )
+
+
 def _sheet_add_data_validation_list(
     self: "SheetWriter",
     range_str: str,
@@ -1542,6 +1593,7 @@ SheetWriter.freeze_panes = _sheet_freeze_panes           # type: ignore[attr-def
 SheetWriter.set_auto_filter = _sheet_set_auto_filter     # type: ignore[attr-defined]
 SheetWriter.add_merged_cell = _sheet_add_merged_cell     # type: ignore[attr-defined]
 SheetWriter.add_hyperlink = _sheet_add_hyperlink         # type: ignore[attr-defined]
+SheetWriter.add_comment = _sheet_add_comment             # type: ignore[attr-defined]
 SheetWriter.add_data_validation_list = _sheet_add_data_validation_list  # type: ignore[attr-defined]
 SheetWriter.add_data_validation_numeric = _sheet_add_data_validation_numeric  # type: ignore[attr-defined]
 SheetWriter.add_data_validation_custom = _sheet_add_data_validation_custom  # type: ignore[attr-defined]
