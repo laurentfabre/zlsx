@@ -65,7 +65,7 @@ Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-ro
 ## What's in, what's out
 
 **In**
-- **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout, merged-cell ranges via `Book.mergedRanges(sheet)`, external-URL hyperlinks via `Book.hyperlinks(sheet)` (resolved through sheet `_rels`), all data validations via `Book.dataValidations(sheet)` — dropdowns (values entity-decoded), plus `kind` / `op` / `formula1` / `formula2` on numeric, date, time, text-length, and custom variants, rich-text run formatting (bold / italic) via `Book.richRuns(sst_idx)` for entries that used `<r>` wrappers
+- **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout, merged-cell ranges via `Book.mergedRanges(sheet)`, external-URL hyperlinks via `Book.hyperlinks(sheet)` (resolved through sheet `_rels`), all data validations via `Book.dataValidations(sheet)` — dropdowns (values entity-decoded), plus `kind` / `op` / `formula1` / `formula2` on numeric, date, time, text-length, and custom variants, rich-text run formatting (bold / italic / color / size / font) via `Book.richRuns(sst_idx)` for entries that used `<r>` wrappers, per-cell style indices via `Rows.styleIndices()` resolving to number-format codes via `Book.numberFormat(style_idx)` (date detection via `Book.isDateFormat(style_idx)`)
 - **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, row heights, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks (per-sheet `_rels`), internal hyperlinks (`location="Sheet2!A1"`), list-type data validations (dropdowns), number / decimal / date / time / text-length / custom data validations, formulas with optional cached value
 - XML entity decoding (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&#N;`, `&#xN;`) on read and escaping on write
 - CLI (`zlsx file.xlsx --format {jsonl,jsonl-dict,tsv,csv}`), C ABI (`libzlsx.{dylib,so,dll}` + `include/zlsx.h`), Python bindings (`pip install py-zlsx`)
@@ -90,7 +90,7 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 | Numeric / integer / float split | ✓ | ~¹ | ✓ | ~¹ |
 | Boolean / error cells | ✓ | ✓ | ✓ | ✓ |
 | Formula cached value | ✓ | ✓ | ✓ | ✓ |
-| Date as `DateTime` | helper² | ✓ | ✓ | ✓ |
+| Date as `DateTime` | helper²⁴ | ✓ | ✓ | ✓ |
 | XML entity decoding | ✓ | ✓ | ✓ | ✓ |
 | Merged cell ranges | ✓ | ✓ | ✓ | ✓ |
 | External-URL hyperlinks | ✓ | ? | ✓ | ? |
@@ -105,6 +105,7 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 ¹ Returns a single `Float` type for any non-text number — callers cast to integer if needed.
 ² `xlsx.fromExcelSerial(cell.number) -> ?DateTime`; out-of-range serials (1900 leap-bug window) return `null`.
 ³ `Book.richRuns(sst_idx)` surfaces per-`<r>` bold / italic + ARGB color / size / font name. Theme colors (`<color theme="…"/>`) aren't resolved — only explicit `<color rgb="AARRGGBB"/>` populates `color_argb`.
+⁴ Combine `Rows.styleIndices()` with `Book.isDateFormat(style_idx)` + `xlsx.fromExcelSerial(cell.number)` — the reader parses `xl/styles.xml` and exposes numFmt codes so callers can detect date cells without guessing. No auto-conversion on the `Cell` enum yet (that's a follow-up — callers drive the conversion).
 
 ### Writer capability
 

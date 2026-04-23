@@ -297,6 +297,18 @@ pub const Book = struct {
     /// slices are owned by `sst_arena`; run text slices either
     /// borrow from the raw SST xml or live in `sst_arena`.
     rich_runs_by_sst_idx: std.AutoHashMapUnmanaged(usize, []RichRun) = .{},
+    /// Raw `xl/styles.xml` bytes (nullable — workbooks with no
+    /// formatting omit this file). Kept around because the parsed
+    /// tables below borrow from it for custom number-format strings.
+    styles_xml: ?[]u8 = null,
+    /// `cellXfs` table — maps a cell's `s="N"` attribute to a numFmt
+    /// id. Owned slice; index matches the xfId. Empty when the
+    /// workbook has no styles.xml.
+    cell_xf_numfmt_ids: []u32 = &.{},
+    /// Custom numFmts, keyed by numFmtId. Built-in ids (0-163) aren't
+    /// stored here — they're resolved via `builtinNumberFormat`.
+    /// Values borrow from `styles_xml`.
+    custom_num_fmts: std.AutoHashMapUnmanaged(u32, []const u8) = .{},
     /// Owned backing storage for every string referenced by `sheets`,
     /// sheet_data keys, and entity-decoded shared strings.
     strings: std.ArrayListUnmanaged([]u8) = .{},
@@ -346,6 +358,8 @@ pub const Book = struct {
 
             if (std.mem.eql(u8, filename, "xl/sharedStrings.xml")) {
                 book.shared_strings_xml = try extractEntryToBuffer(allocator, entry, &file_reader);
+            } else if (std.mem.eql(u8, filename, "xl/styles.xml")) {
+                book.styles_xml = try extractEntryToBuffer(allocator, entry, &file_reader);
             } else if (std.mem.eql(u8, filename, "xl/workbook.xml")) {
                 workbook_xml = try extractEntryToBuffer(allocator, entry, &file_reader);
             } else if (std.mem.eql(u8, filename, "xl/_rels/workbook.xml.rels")) {
@@ -384,6 +398,7 @@ pub const Book = struct {
 
         try parseWorkbookSheets(&book, wb, rels);
         if (book.shared_strings_xml) |sst| try parseSharedStrings(&book, sst);
+        if (book.styles_xml) |sx| try parseStyles(&book, sx);
 
         // Parse merged ranges + hyperlinks + data validations per
         // sheet. All three are cheap — most sheets have none of them,
@@ -433,6 +448,31 @@ pub const Book = struct {
         return self.rich_runs_by_sst_idx.get(sst_idx);
     }
 
+    /// Number-format code for a cell's style index (the value of the
+    /// `s="…"` attribute, surfaced via `Rows.styleIndices()`). Returns
+    /// null when the workbook has no styles.xml, the index is out of
+    /// range, or the resolved numFmt id has no built-in mapping and
+    /// no custom override (rare — typically means a malformed file).
+    ///
+    /// The returned slice borrows from `styles_xml` (custom formats)
+    /// or a constant string table (built-ins); valid for the Book's
+    /// lifetime either way.
+    pub fn numberFormat(self: *const Book, style_idx: u32) ?[]const u8 {
+        if (style_idx >= self.cell_xf_numfmt_ids.len) return null;
+        const fmt_id = self.cell_xf_numfmt_ids[style_idx];
+        if (self.custom_num_fmts.get(fmt_id)) |code| return code;
+        return builtinNumberFormat(fmt_id);
+    }
+
+    /// True when the resolved number-format code is a date / time /
+    /// date-time pattern. Callers can combine with
+    /// `xlsx.fromExcelSerial(cell.number)` to auto-materialise a
+    /// `DateTime` without having to interpret the pattern themselves.
+    pub fn isDateFormat(self: *const Book, style_idx: u32) bool {
+        const code = self.numberFormat(style_idx) orelse return false;
+        return isDateFormatCode(code);
+    }
+
     pub fn deinit(self: *Book) void {
         const a = self.allocator;
         if (self.shared_strings_xml) |s| a.free(s);
@@ -461,6 +501,12 @@ pub const Book = struct {
         // Rich-run slices live in sst_arena (already freed above); only
         // the hashmap spine is on the general allocator.
         self.rich_runs_by_sst_idx.deinit(a);
+
+        // Styles table — numFmt values borrow from styles_xml; only
+        // the xfIds slice + hashmap spine are owned here.
+        a.free(self.cell_xf_numfmt_ids);
+        self.custom_num_fmts.deinit(a);
+        if (self.styles_xml) |s| a.free(s);
 
         var it = self.sheet_data.valueIterator();
         while (it.next()) |v| a.free(v.*);
@@ -493,6 +539,7 @@ pub const Book = struct {
             .shared_strings = self.shared_strings,
             .allocator = allocator,
             .row_cells = .{},
+            .row_styles = .{},
             .arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
@@ -506,6 +553,11 @@ pub const Rows = struct {
     shared_strings: []const []const u8,
     allocator: Allocator,
     row_cells: std.ArrayListUnmanaged(Cell),
+    /// Parallel to `row_cells`. Each slot holds the cell's `s="N"`
+    /// attribute (the index into `Book.cell_xf_numfmt_ids`), or null
+    /// when the source `<c>` had no `s` attribute. Filled with nulls
+    /// for gap cells so positional indexing matches `row_cells`.
+    row_styles: std.ArrayListUnmanaged(?u32),
     /// Bump arena for per-row decoded strings. Reset (O(1)) at the
     /// start of each `next()` call — previous row's owned strings
     /// become invalid, which matches the documented contract. Compared
@@ -516,7 +568,16 @@ pub const Rows = struct {
     pub fn deinit(self: *Rows) void {
         self.arena.deinit();
         self.row_cells.deinit(self.allocator);
+        self.row_styles.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Style indices for the current row — one slot per `row_cells`
+    /// slot, mirroring the same gap-filled layout. `null` means the
+    /// `<c>` had no `s` attribute (i.e. the General format). Valid
+    /// until the next `next()` call, same as `row_cells`.
+    pub fn styleIndices(self: *const Rows) []const ?u32 {
+        return self.row_styles.items;
     }
 
     /// Returns the next row's cells, or null at end-of-sheet. Returned
@@ -527,6 +588,7 @@ pub const Rows = struct {
     /// call (arena reset).
     pub fn next(self: *Rows) !?[]const Cell {
         self.row_cells.clearRetainingCapacity();
+        self.row_styles.clearRetainingCapacity();
         _ = self.arena.reset(.retain_capacity);
 
         while (findTagOpen(self.xml, self.pos, "row")) |row_start| {
@@ -568,11 +630,20 @@ pub const Rows = struct {
         const r_attr = getAttr(attrs, "r") orelse return error.MalformedXml;
         const col_idx = try columnIndexFromRef(r_attr);
         const cell_type = getAttr(attrs, "t") orelse "n"; // default numeric
+        const style_attr = getAttr(attrs, "s");
+        const style_idx: ?u32 = if (style_attr) |s|
+            std.fmt.parseInt(u32, s, 10) catch null
+        else
+            null;
 
-        // Grow row_cells to cover col_idx; fill gaps with .empty.
+        // Grow row_cells + row_styles to cover col_idx; fill gaps
+        // with `.empty` / `null`. Both arrays stay in lock-step so
+        // callers can index them the same way.
         while (self.row_cells.items.len <= col_idx) {
             try self.row_cells.append(self.allocator, .empty);
+            try self.row_styles.append(self.allocator, null);
         }
+        self.row_styles.items[col_idx] = style_idx;
 
         if (is_self_closing) {
             // Empty cell; already .empty.
@@ -1353,6 +1424,132 @@ fn hasFalseVal(tag: []const u8) bool {
         std.mem.indexOf(u8, body, "val=\"false\"") != null;
 }
 
+/// Walk `xl/styles.xml` and populate:
+///   - `book.cell_xf_numfmt_ids` — one u32 numFmtId per `<xf>` under
+///     `<cellXfs>` (callers look up by the `s="N"` index on cells).
+///   - `book.custom_num_fmts` — map of numFmtId → format code for
+///     every `<numFmt numFmtId="…" formatCode="…"/>` (built-in ids
+///     don't appear here; they're resolved via `builtinNumberFormat`).
+/// Values borrow from `styles_xml` so the file stays mapped for the
+/// Book's lifetime. Malformed or missing sections degrade silently —
+/// an xlsx with no cellXfs just returns null from `numberFormat`.
+fn parseStyles(book: *Book, xml: []const u8) !void {
+    // numFmts — optional. Shape: `<numFmts count="…"><numFmt numFmtId="164" formatCode="…"/>…</numFmts>`.
+    if (std.mem.indexOf(u8, xml, "<numFmts")) |nfs_pos| {
+        const nfs_end = std.mem.indexOfPos(u8, xml, nfs_pos, "</numFmts>") orelse xml.len;
+        const block = xml[nfs_pos..nfs_end];
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, block, i, "<numFmt ")) |nf| {
+            const gt = std.mem.indexOfScalarPos(u8, block, nf, '>') orelse break;
+            const attrs = block[nf..gt];
+            i = gt + 1;
+            const id_key = "numFmtId=\"";
+            const code_key = "formatCode=\"";
+            const id_pos = std.mem.indexOf(u8, attrs, id_key) orelse continue;
+            const id_start = id_pos + id_key.len;
+            const id_end = std.mem.indexOfScalarPos(u8, attrs, id_start, '"') orelse continue;
+            const id = std.fmt.parseInt(u32, attrs[id_start..id_end], 10) catch continue;
+            const code_pos = std.mem.indexOf(u8, attrs, code_key) orelse continue;
+            const code_start = code_pos + code_key.len;
+            const code_end = std.mem.indexOfScalarPos(u8, attrs, code_start, '"') orelse continue;
+            try book.custom_num_fmts.put(book.allocator, id, attrs[code_start..code_end]);
+        }
+    }
+
+    // cellXfs — the slot callers index into via `s="N"`. Shape:
+    // `<cellXfs count="…"><xf numFmtId="0" fontId="0" fillId="0" …/>…</cellXfs>`.
+    const xfs_pos = std.mem.indexOf(u8, xml, "<cellXfs") orelse return;
+    const xfs_end = std.mem.indexOfPos(u8, xml, xfs_pos, "</cellXfs>") orelse return;
+    const xfs_block = xml[xfs_pos..xfs_end];
+
+    var ids: std.ArrayListUnmanaged(u32) = .{};
+    errdefer ids.deinit(book.allocator);
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xfs_block, i, "<xf ")) |xp| {
+        const gt = std.mem.indexOfScalarPos(u8, xfs_block, xp, '>') orelse break;
+        const attrs = xfs_block[xp..gt];
+        i = gt + 1;
+        const key = "numFmtId=\"";
+        if (std.mem.indexOf(u8, attrs, key)) |kp| {
+            const s = kp + key.len;
+            const e = std.mem.indexOfScalarPos(u8, attrs, s, '"') orelse continue;
+            const v = std.fmt.parseInt(u32, attrs[s..e], 10) catch 0;
+            try ids.append(book.allocator, v);
+        } else {
+            // Missing numFmtId — OOXML default is 0 ("General").
+            try ids.append(book.allocator, 0);
+        }
+    }
+    book.cell_xf_numfmt_ids = try ids.toOwnedSlice(book.allocator);
+}
+
+/// Resolve a built-in number-format id to its OOXML pattern. Returns
+/// null for ids that are neither built-in nor in the custom table —
+/// callers should treat that as "General" themselves. IDs 0-49 are
+/// the classical built-in set; 14-22 and 45-47 are the date/time
+/// relevant ones.
+fn builtinNumberFormat(id: u32) ?[]const u8 {
+    return switch (id) {
+        0 => "General",
+        1 => "0",
+        2 => "0.00",
+        3 => "#,##0",
+        4 => "#,##0.00",
+        9 => "0%",
+        10 => "0.00%",
+        11 => "0.00E+00",
+        12 => "# ?/?",
+        13 => "# ??/??",
+        14 => "m/d/yyyy",
+        15 => "d-mmm-yy",
+        16 => "d-mmm",
+        17 => "mmm-yy",
+        18 => "h:mm AM/PM",
+        19 => "h:mm:ss AM/PM",
+        20 => "h:mm",
+        21 => "h:mm:ss",
+        22 => "m/d/yyyy h:mm",
+        37 => "#,##0 ;(#,##0)",
+        38 => "#,##0 ;[Red](#,##0)",
+        39 => "#,##0.00;(#,##0.00)",
+        40 => "#,##0.00;[Red](#,##0.00)",
+        45 => "mm:ss",
+        46 => "[h]:mm:ss",
+        47 => "mm:ss.0",
+        48 => "##0.0E+0",
+        49 => "@",
+        else => null,
+    };
+}
+
+/// Heuristic: does the format code describe a date / time / datetime?
+/// Covers the 9 built-in date IDs and custom codes that contain an
+/// unquoted `y`, `m`, `d`, `h`, or `s` token outside brackets. Skips
+/// quoted literals (`"dd"` shouldn't trigger) and the `[Red]` / `[h]`
+/// color / duration modifiers.
+fn isDateFormatCode(code: []const u8) bool {
+    var in_quote = false;
+    var in_bracket = false;
+    for (code) |c| {
+        switch (c) {
+            '"' => in_quote = !in_quote,
+            '[' => in_bracket = true,
+            ']' => in_bracket = false,
+            'y', 'Y', 'd', 'D', 'h', 'H', 's', 'S' => {
+                if (!in_quote and !in_bracket) return true;
+            },
+            'm', 'M' => {
+                // `m` is ambiguous (month vs minute), but any presence
+                // outside quotes/brackets means the code has a
+                // date-or-time component — both are date-y enough.
+                if (!in_quote and !in_bracket) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
 fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
     // Pre-size via the uniqueCount hint in the <sst> tag when present —
     // OOXML generators are reliable about this attribute, so we get a
@@ -1981,6 +2178,59 @@ test "Book.richRuns: rich-text SST entries expose per-run bold/italic" {
     try std.testing.expectEqual(true, r4[0].italic);
 }
 
+test "Book.numberFormat + isDateFormat: built-in, custom, and per-cell style lookup" {
+    // Write a workbook with a styled column, then read it back and
+    // check that every moving part lines up: styles.xml is extracted,
+    // cellXfs is parsed, per-cell `s="N"` is tracked via
+    // Rows.styleIndices(), numberFormat() resolves built-ins + custom,
+    // and isDateFormat() gets the heuristic right.
+    const tmp_path = "/tmp/zlsx_reader_numfmt.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        const date_style = try w.addStyle(.{ .number_format = "yyyy-mm-dd" });
+        const pct_style = try w.addStyle(.{ .number_format = "0.00%" });
+        var sheet = try w.addSheet("S");
+        try sheet.writeRow(&.{.{ .string = "hdr" }});
+        try sheet.writeRowStyled(
+            &.{ .{ .number = 44927 }, .{ .number = 0.25 }, .{ .integer = 42 } },
+            &.{ date_style, pct_style, 0 },
+        );
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    // Pull the second row and check styleIndices alignment.
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    _ = try rows.next(); // hdr row
+    const cells = (try rows.next()).?;
+    const styles = rows.styleIndices();
+    try std.testing.expectEqual(@as(usize, 3), cells.len);
+    try std.testing.expectEqual(@as(usize, 3), styles.len);
+
+    // The date-style cell: number format "yyyy-mm-dd" is custom,
+    // must surface via numberFormat and register as a date.
+    const s0 = styles[0] orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("yyyy-mm-dd", book.numberFormat(s0).?);
+    try std.testing.expectEqual(true, book.isDateFormat(s0));
+
+    // Percentage cell: custom numFmt, not a date.
+    const s1 = styles[1] orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("0.00%", book.numberFormat(s1).?);
+    try std.testing.expectEqual(false, book.isDateFormat(s1));
+
+    // Plain integer cell uses the writer's default xfId 0 (General).
+    if (styles[2]) |s2| {
+        try std.testing.expectEqual(false, book.isDateFormat(s2));
+    }
+}
+
 test "Book.richRuns: color / size / font_name from <rPr>" {
     const sst_xml =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" ++
@@ -2505,6 +2755,7 @@ fn consumeAllRows(alloc: std.mem.Allocator, shared_strings: []const []const u8, 
         .shared_strings = shared_strings,
         .allocator = alloc,
         .row_cells = .{},
+        .row_styles = .{},
         .arena = std.heap.ArenaAllocator.init(alloc),
     };
     defer rows.deinit();
@@ -2640,6 +2891,7 @@ test "fuzz Rows.next on synthetic cells with out-of-range SST indices" {
             .shared_strings = &sst_entries,
             .allocator = std.testing.allocator,
             .row_cells = .{},
+            .row_styles = .{},
             .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
         };
         defer rows.deinit();
