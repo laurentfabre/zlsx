@@ -48,6 +48,7 @@ __all__ = [
     "MergeRange",
     "Hyperlink",
     "DataValidation",
+    "RichRun",
     "ZlsxError",
 ]
 
@@ -305,6 +306,19 @@ class DataValidation:
     formula2: str = ""
 
 
+@dataclass(frozen=True)
+class RichRun:
+    """A single formatting run inside a shared-string entry. Excel
+    emits rich-text via ``<si><r><rPr/>...<t/></r>...</si>`` where
+    every ``<r>`` can carry its own font properties. Only ``bold`` and
+    ``italic`` are surfaced today — colour / size / font properties
+    will join this shape in a follow-up without breaking the
+    dataclass."""
+    text: str
+    bold: bool = False
+    italic: bool = False
+
+
 # ─── Book ─────────────────────────────────────────────────────────────
 
 
@@ -474,6 +488,52 @@ class Book:
                 op=op,
                 formula1=f1,
                 formula2=f2,
+            ))
+        return out
+
+    def rich_text(self, sst_idx: int) -> list[RichRun] | None:
+        """Rich-text runs for shared-string entry ``sst_idx``. Returns
+        ``None`` for plain single-run strings (no ``<r>`` wrappers in
+        the source XML — the common case, zero overhead). Returns a
+        list of :class:`RichRun` for multi-run entries.
+
+        SST indices can be discovered via iteration over cells: when a
+        ``Cell`` is a string and you want to know if it was formatted,
+        look up the corresponding SST index. Today that mapping isn't
+        exposed — use this against arbitrary SST indices during
+        exploration or when you've tracked the index yourself. A
+        future iter will attach runs directly to string cells.
+
+        Requires libzlsx 0.2.6+."""
+        if not self._handle:
+            raise ZlsxError("book is closed")
+        if not _ffi._HAS_RICH_RUNS:
+            raise RuntimeError(
+                "loaded libzlsx does not expose rich_text "
+                "(requires 0.2.6+); upgrade libzlsx"
+            )
+        count = _ffi.lib.zlsx_rich_run_count(self._handle, sst_idx)
+        if count == 0:
+            return None
+        out: list[RichRun] = []
+        text_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        text_len = ctypes.c_size_t(0)
+        bold = ctypes.c_uint8(0)
+        italic = ctypes.c_uint8(0)
+        for i in range(count):
+            rc = _ffi.lib.zlsx_rich_run_at(
+                self._handle, sst_idx, i,
+                ctypes.byref(text_ptr),
+                ctypes.byref(text_len),
+                ctypes.byref(bold),
+                ctypes.byref(italic),
+            )
+            if rc != 0:
+                continue
+            out.append(RichRun(
+                text=ctypes.string_at(text_ptr, text_len.value).decode("utf-8", errors="replace"),
+                bold=bool(bold.value),
+                italic=bool(italic.value),
             ))
         return out
 

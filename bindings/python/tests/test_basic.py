@@ -617,6 +617,90 @@ def test_writer_add_data_validation_numeric_and_custom_round_trip(tmp_path):
     assert dvs[5].formula1 == "AND(F6>0,F6<LEN(A1))"
 
 
+def test_rich_text_runs_parse_bold_italic(tmp_path):
+    """Build a minimal xlsx with rich-text SST entries via raw zipfile
+    (the writer doesn't emit rich text today) and verify the reader
+    surfaces `<b/>` / `<i/>` correctly via `Book.rich_text(sst_idx)`.
+    Plain single-run SST entries must return None (zero-overhead path)."""
+    import zipfile
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_RICH_RUNS:
+        pytest.skip("loaded libzlsx predates rich-text ABI (0.2.6+)")
+
+    xlsx_path = tmp_path / "rich.xlsx"
+    sst_xml = (
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        b"<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"3\" uniqueCount=\"3\">"
+        b"<si><t>plain</t></si>"
+        b"<si><r><rPr><b/></rPr><t>bold</t></r><r><rPr><i/></rPr><t> italic</t></r></si>"
+        b"<si><r><rPr><b/><i/></rPr><t>R&amp;D</t></r></si>"
+        b"</sst>"
+    )
+    workbook_xml = (
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        b"<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+        b"xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+        b"<sheets><sheet name=\"S\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>"
+    )
+    workbook_rels = (
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        b"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        b"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>"
+        b"<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/>"
+        b"</Relationships>"
+    )
+    root_rels = (
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        b"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        b"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>"
+        b"</Relationships>"
+    )
+    content_types = (
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        b"<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+        b"<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+        b"<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+        b"<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>"
+        b"<Override PartName=\"/xl/sharedStrings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml\"/>"
+        b"<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+        b"</Types>"
+    )
+    sheet_xml = (
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        b"<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+        b"<sheetData><row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c></row></sheetData></worksheet>"
+    )
+
+    with zipfile.ZipFile(xlsx_path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", root_rels)
+        z.writestr("xl/workbook.xml", workbook_xml)
+        z.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        z.writestr("xl/sharedStrings.xml", sst_xml)
+        z.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+
+    with zlsx.open(xlsx_path) as book:
+        # Plain SST entry → None (zero-overhead path).
+        assert book.rich_text(0) is None
+        # Multi-run bold + italic.
+        runs = book.rich_text(1)
+        assert runs is not None
+        assert len(runs) == 2
+        assert runs[0].text == "bold"
+        assert runs[0].bold and not runs[0].italic
+        assert runs[1].text == " italic"
+        assert runs[1].italic and not runs[1].bold
+        # Entity-decoded rich text.
+        runs = book.rich_text(2)
+        assert runs is not None
+        assert len(runs) == 1
+        assert runs[0].text == "R&D"
+        assert runs[0].bold and runs[0].italic
+        # Out-of-range SST index → None (count returns 0).
+        assert book.rich_text(999) is None
+
+
 def test_writer_add_data_validation_rejects_invalid_inputs(tmp_path):
     """Exercise every error path on the extended writer DV APIs so the
     rejection behaviour from the Zig writer surfaces cleanly."""

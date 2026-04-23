@@ -65,7 +65,7 @@ Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-ro
 ## What's in, what's out
 
 **In**
-- **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout, merged-cell ranges via `Book.mergedRanges(sheet)`, external-URL hyperlinks via `Book.hyperlinks(sheet)` (resolved through sheet `_rels`), all data validations via `Book.dataValidations(sheet)` — dropdowns (values entity-decoded), plus `kind` / `op` / `formula1` / `formula2` on numeric, date, time, text-length, and custom variants
+- **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout, merged-cell ranges via `Book.mergedRanges(sheet)`, external-URL hyperlinks via `Book.hyperlinks(sheet)` (resolved through sheet `_rels`), all data validations via `Book.dataValidations(sheet)` — dropdowns (values entity-decoded), plus `kind` / `op` / `formula1` / `formula2` on numeric, date, time, text-length, and custom variants, rich-text run formatting (bold / italic) via `Book.richRuns(sst_idx)` for entries that used `<r>` wrappers
 - **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, row heights, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks (per-sheet `_rels`), internal hyperlinks (`location="Sheet2!A1"`), list-type data validations (dropdowns), number / decimal / date / time / text-length / custom data validations, formulas with optional cached value
 - XML entity decoding (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&#N;`, `&#xN;`) on read and escaping on write
 - CLI (`zlsx file.xlsx --format {jsonl,jsonl-dict,tsv,csv}`), C ABI (`libzlsx.{dylib,so,dll}` + `include/zlsx.h`), Python bindings (`pip install py-zlsx`)
@@ -96,7 +96,7 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 | External-URL hyperlinks | ✓ | ? | ✓ | ? |
 | Data validations (list / dropdown) | ✓ | — | ✓ | — |
 | Data validations (number / date / custom) | ✓ | — | ✓ | — |
-| Rich-text formatting preserved | — | ~ | ✓ | — |
+| Rich-text formatting preserved | ~³ | ~ | ✓ | — |
 | Cell styles on read (bold / colour / fill) | — | — | ✓ | — |
 | Comments / notes | — | ? | ✓ | — |
 | Chart / image / pivot access | — | — | ~ | — |
@@ -104,6 +104,7 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 
 ¹ Returns a single `Float` type for any non-text number — callers cast to integer if needed.
 ² `xlsx.fromExcelSerial(cell.number) -> ?DateTime`; out-of-range serials (1900 leap-bug window) return `null`.
+³ `Book.richRuns(sst_idx)` surfaces per-`<r>` bold / italic flags. Colour / size / font are skipped today (expanding this is a follow-up iter that won't break the existing `RichRun` shape).
 
 ### Writer capability
 

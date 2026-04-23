@@ -215,6 +215,23 @@ pub const DataValidation = struct {
 /// Domain errors surfaced by this module. The public API uses inferred
 /// error sets so callers get the full union of these plus whatever
 /// std.zip / std.fs / std.compress.flate decide to return.
+/// A single formatting run inside a shared-string entry. Excel emits
+/// rich-text via `<si><r><rPr>...</rPr><t>...</t></r>...</si>` where
+/// every `<r>` can carry its own font properties. Only entries with
+/// at least one `<r>` wrapper produce runs — plain `<si><t>...</t></si>`
+/// entries return null from `Book.richRuns`.
+///
+/// `text` borrows from `sst_arena` (decoded if entities, else a slice
+/// directly into the raw SST xml). `bold` and `italic` are the two
+/// properties this reader currently surfaces — other `<rPr>` children
+/// (color, size, font) are skipped today and will be added in a
+/// follow-up iter without breaking this shape.
+pub const RichRun = struct {
+    text: []const u8,
+    bold: bool = false,
+    italic: bool = false,
+};
+
 pub const DomainError = error{
     NotAnXlsx,
     BadZip,
@@ -265,6 +282,12 @@ pub const Book = struct {
     /// `hyperlinks_by_sheet`; use `dataValidations(sheet)` for the
     /// empty-on-missing normalisation.
     data_validations_by_sheet: std.StringHashMapUnmanaged([]DataValidation) = .{},
+    /// Rich-text runs per shared-string index, keyed by SST position.
+    /// Only populated for entries that used `<r>` wrappers (plain
+    /// `<si><t>...</t></si>` entries skip the map entirely). Run
+    /// slices are owned by `sst_arena`; run text slices either
+    /// borrow from the raw SST xml or live in `sst_arena`.
+    rich_runs_by_sst_idx: std.AutoHashMapUnmanaged(usize, []RichRun) = .{},
     /// Owned backing storage for every string referenced by `sheets`,
     /// sheet_data keys, and entity-decoded shared strings.
     strings: std.ArrayListUnmanaged([]u8) = .{},
@@ -392,6 +415,15 @@ pub const Book = struct {
         return self.data_validations_by_sheet.get(sheet.path) orelse &.{};
     }
 
+    /// Rich-text runs for a shared-string entry, or null when the
+    /// entry is a plain single-run string (the common case —
+    /// spreadsheets without inline formatting never enter the rich
+    /// path and pay zero overhead). Returned slices and text lifetimes
+    /// match the Book.
+    pub fn richRuns(self: *const Book, sst_idx: usize) ?[]const RichRun {
+        return self.rich_runs_by_sst_idx.get(sst_idx);
+    }
+
     pub fn deinit(self: *Book) void {
         const a = self.allocator;
         if (self.shared_strings_xml) |s| a.free(s);
@@ -416,6 +448,10 @@ pub const Book = struct {
             a.free(v.*);
         }
         self.data_validations_by_sheet.deinit(a);
+
+        // Rich-run slices live in sst_arena (already freed above); only
+        // the hashmap spine is on the general allocator.
+        self.rich_runs_by_sst_idx.deinit(a);
 
         var it = self.sheet_data.valueIterator();
         while (it.next()) |v| a.free(v.*);
@@ -1218,6 +1254,43 @@ fn parseDataValidationsForSheet(book: *Book, sheet_path: []const u8, xml: []cons
     try book.data_validations_by_sheet.put(book.allocator, sheet_path, slice);
 }
 
+/// Scan a slice of `<rPr>...</rPr>` content for the two font flags
+/// this reader currently surfaces (bold / italic). `<b/>` and `<i/>`
+/// are self-closing in every OOXML generator I've checked; explicit
+/// `val="false"` is rare but honoured. Returns defaults when the
+/// slice is empty or the flags are absent.
+fn parseRprFlags(rpr: []const u8) RichRun {
+    var bold = false;
+    var italic = false;
+    // Match `<b/>`, `<b ...>`, `<b val="1"/>`, etc. Skip `<b val="0"/>`.
+    if (std.mem.indexOf(u8, rpr, "<b")) |bp| {
+        if (bp + 2 < rpr.len) {
+            const next = rpr[bp + 2];
+            if (next == '/' or next == '>' or next == ' ') {
+                bold = !hasFalseVal(rpr[bp..]);
+            }
+        }
+    }
+    if (std.mem.indexOf(u8, rpr, "<i")) |ip| {
+        if (ip + 2 < rpr.len) {
+            const next = rpr[ip + 2];
+            if (next == '/' or next == '>' or next == ' ') {
+                italic = !hasFalseVal(rpr[ip..]);
+            }
+        }
+    }
+    return .{ .text = "", .bold = bold, .italic = italic };
+}
+
+/// Returns true if the tag body (up to the next `>`) contains
+/// `val="0"` or `val="false"`. OOXML treats missing val as true.
+fn hasFalseVal(tag: []const u8) bool {
+    const gt = std.mem.indexOfScalar(u8, tag, '>') orelse return false;
+    const body = tag[0..gt];
+    return std.mem.indexOf(u8, body, "val=\"0\"") != null or
+        std.mem.indexOf(u8, body, "val=\"false\"") != null;
+}
+
 fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
     // Pre-size via the uniqueCount hint in the <sst> tag when present —
     // OOXML generators are reliable about this attribute, so we get a
@@ -1283,6 +1356,16 @@ fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
         var first_has_ent = false;
         var buf: std.ArrayListUnmanaged(u8) = .empty;
 
+        // Rich-text tracking — populated only when we see a `<r>` tag.
+        // `pending_flags` holds formatting from the most recent `<rPr>`
+        // within the current `<r>` block; applied to the next `<t>`
+        // encountered. Reset at each new `<r>`.
+        var runs: std.ArrayListUnmanaged(RichRun) = .empty;
+        var saw_r = false;
+        var pending_flags: RichRun = .{ .text = "" };
+
+        const sst_idx = strings.items.len;
+
         var j: usize = si_gt + 1;
         body: while (j < xml.len) {
             const j_prev = j;
@@ -1327,7 +1410,43 @@ fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
                     }
                 }
                 t_count += 1;
+
+                // Record a rich-text run only when we've entered at
+                // least one `<r>` wrapper — otherwise this is a plain
+                // `<si><t>...</t></si>` and richRuns() returns null.
+                if (saw_r) {
+                    const run_text: []const u8 = if (span_has_ent) blk: {
+                        var rb: std.ArrayListUnmanaged(u8) = try .initCapacity(arena_alloc, span.len);
+                        try appendDecoded(arena_alloc, &rb, span);
+                        break :blk try rb.toOwnedSlice(arena_alloc);
+                    } else span;
+                    try runs.append(arena_alloc, .{
+                        .text = run_text,
+                        .bold = pending_flags.bold,
+                        .italic = pending_flags.italic,
+                    });
+                }
+
                 j = t_close + "</t>".len;
+                std.debug.assert(j > j_prev);
+            } else if (c1 == 'r' and next_lt + 2 < xml.len and
+                (xml[next_lt + 2] == '>' or xml[next_lt + 2] == ' '))
+            {
+                // `<r>` — enter a rich-text run block. Every `<r>` gets
+                // its own formatting; reset pending_flags so a run
+                // without `<rPr>` defaults to unstyled.
+                const r_gt = std.mem.indexOfScalarPos(u8, xml, next_lt + 2, '>') orelse break :body;
+                saw_r = true;
+                pending_flags = .{ .text = "" };
+                j = r_gt + 1;
+                std.debug.assert(j > j_prev);
+            } else if (c1 == 'r' and next_lt + 3 < xml.len and
+                xml[next_lt + 2] == 'P' and xml[next_lt + 3] == 'r')
+            {
+                // `<rPr>...</rPr>` — parse bold / italic, skip body.
+                const rpr_close = std.mem.indexOfPos(u8, xml, next_lt, "</rPr>") orelse break :body;
+                pending_flags = parseRprFlags(xml[next_lt .. rpr_close + "</rPr>".len]);
+                j = rpr_close + "</rPr>".len;
                 std.debug.assert(j > j_prev);
             } else if (c1 == '/' and next_lt + 5 <= xml.len and
                 xml[next_lt + 2] == 's' and xml[next_lt + 3] == 'i' and xml[next_lt + 4] == '>')
@@ -1347,14 +1466,22 @@ fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
                 } else {
                     try strings.append(book.allocator, try buf.toOwnedSlice(arena_alloc));
                 }
+
+                // Rich runs — only stash when at least one `<r>` was
+                // seen AND at least one run carried text. Keeps the
+                // common-case (no rich text) map empty.
+                if (saw_r and runs.items.len > 0) {
+                    const owned = try runs.toOwnedSlice(arena_alloc);
+                    try book.rich_runs_by_sst_idx.put(book.allocator, sst_idx, owned);
+                }
+
                 i = next_lt + 5;
                 std.debug.assert(i > i_prev);
                 continue :outer;
             } else {
-                // Skip any other tag (`<r>`, `<rPr>`, a `<t` followed
-                // by a non-space/slash/gt, etc.). indexOfScalarPos
-                // starts from `next_lt + 1` so it can't re-match the
-                // same `<`; the `j` update is strictly monotonic.
+                // Skip any other tag (unmatched `<t` patterns, etc.).
+                // indexOfScalarPos from `next_lt + 1` guarantees
+                // monotonic progress.
                 const skip_gt = std.mem.indexOfScalarPos(u8, xml, next_lt + 1, '>') orelse break :body;
                 j = skip_gt + 1;
                 std.debug.assert(j > j_prev);
@@ -1716,6 +1843,77 @@ test "Book.dataValidations: empty slice for sheets without validations" {
     var book = try Book.open(std.testing.allocator, tmp_path);
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 0), book.dataValidations(book.sheets[0]).len);
+}
+
+test "Book.richRuns: rich-text SST entries expose per-run bold/italic" {
+    // Direct parseSharedStrings drive — avoids needing the writer to
+    // emit rich text (it doesn't yet). Covers: plain `<t>` → null runs,
+    // single `<r>` with `<b/>`, multiple `<r>` with mixed flags,
+    // `val="0"` explicit-false, and entity-decoded run text.
+    const sst_xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" ++
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"5\">" ++
+        "<si><t>plain</t></si>" ++
+        "<si><r><rPr><b/></rPr><t>bold</t></r></si>" ++
+        "<si><r><rPr><b/><i/></rPr><t>bold-italic</t></r></si>" ++
+        "<si><r><rPr><b/></rPr><t>A</t></r><r><rPr><i/></rPr><t> B</t></r><r><t> C</t></r></si>" ++
+        "<si><r><rPr><b val=\"0\"/><i/></rPr><t>R&amp;D</t></r></si>" ++
+        "</sst>";
+
+    var book: Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer book.deinit();
+    const owned = try std.testing.allocator.dupe(u8, sst_xml);
+    book.shared_strings_xml = owned;
+    try parseSharedStrings(&book, owned);
+
+    try std.testing.expectEqual(@as(usize, 5), book.shared_strings.len);
+
+    // Flat strings round-trip correctly for both plain and rich paths.
+    try std.testing.expectEqualStrings("plain", book.shared_strings[0]);
+    try std.testing.expectEqualStrings("bold", book.shared_strings[1]);
+    try std.testing.expectEqualStrings("bold-italic", book.shared_strings[2]);
+    try std.testing.expectEqualStrings("A B C", book.shared_strings[3]);
+    try std.testing.expectEqualStrings("R&D", book.shared_strings[4]);
+
+    // Plain SST entries return null from richRuns — zero map overhead.
+    try std.testing.expectEqual(@as(?[]const RichRun, null), book.richRuns(0));
+
+    // Single-run bold.
+    const r1 = book.richRuns(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), r1.len);
+    try std.testing.expectEqualStrings("bold", r1[0].text);
+    try std.testing.expectEqual(true, r1[0].bold);
+    try std.testing.expectEqual(false, r1[0].italic);
+
+    // Single-run bold + italic.
+    const r2 = book.richRuns(2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), r2.len);
+    try std.testing.expectEqual(true, r2[0].bold);
+    try std.testing.expectEqual(true, r2[0].italic);
+
+    // Multi-run: bold / italic / plain.
+    const r3 = book.richRuns(3) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 3), r3.len);
+    try std.testing.expectEqualStrings("A", r3[0].text);
+    try std.testing.expectEqual(true, r3[0].bold);
+    try std.testing.expectEqual(false, r3[0].italic);
+    try std.testing.expectEqualStrings(" B", r3[1].text);
+    try std.testing.expectEqual(false, r3[1].bold);
+    try std.testing.expectEqual(true, r3[1].italic);
+    try std.testing.expectEqualStrings(" C", r3[2].text);
+    try std.testing.expectEqual(false, r3[2].bold);
+    try std.testing.expectEqual(false, r3[2].italic);
+
+    // `val="0"` on bold overrides the presence of `<b/>`; italic still true.
+    // Entity-decoded text must come through clean.
+    const r4 = book.richRuns(4) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), r4.len);
+    try std.testing.expectEqualStrings("R&D", r4[0].text);
+    try std.testing.expectEqual(false, r4[0].bold);
+    try std.testing.expectEqual(true, r4[0].italic);
 }
 
 test "Book.hyperlinks: internal hyperlinks (location) round-trip + mixed external/internal" {

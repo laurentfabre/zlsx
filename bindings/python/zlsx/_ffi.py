@@ -494,6 +494,27 @@ if _HAS_READER_DV_EXT:
     lib.zlsx_data_validation_formula2.restype = ctypes.c_int32
 
 
+# Rich-text run reading — added in 0.2.6+. Plain single-run SST entries
+# return 0 from rich_run_count so callers can skip them zero-cost.
+_HAS_RICH_RUNS = (
+    hasattr(lib, "zlsx_rich_run_count")
+    and hasattr(lib, "zlsx_rich_run_at")
+)
+if _HAS_RICH_RUNS:
+    lib.zlsx_rich_run_count.argtypes = [book_handle, ctypes.c_size_t]
+    lib.zlsx_rich_run_count.restype = ctypes.c_size_t
+    lib.zlsx_rich_run_at.argtypes = [
+        book_handle,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_uint8),
+    ]
+    lib.zlsx_rich_run_at.restype = ctypes.c_int32
+
+
 _HAS_STYLES_EX = hasattr(lib, "zlsx_writer_add_style_ex")
 if _HAS_STYLES_EX:
     lib.zlsx_writer_add_style_ex.argtypes = [

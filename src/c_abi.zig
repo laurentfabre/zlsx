@@ -516,6 +516,41 @@ export fn zlsx_data_validation_formula2(
     return 0;
 }
 
+/// Number of rich-text runs for shared-string entry `sst_idx`, or 0
+/// when that entry is a plain single-run string (no `<r>` wrappers in
+/// the source XML — the common case). Use this as a presence probe
+/// before calling `zlsx_rich_run_at`.
+export fn zlsx_rich_run_count(book: *Book, sst_idx: usize) callconv(.c) usize {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    const runs = state.inner.richRuns(sst_idx) orelse return 0;
+    return runs.len;
+}
+
+/// Copy rich-text run `run_idx` of shared-string entry `sst_idx` into
+/// `out_text_ptr` / `out_text_len` plus `out_bold` / `out_italic`.
+/// Text pointer lifetime matches the Book. Returns 0 on success, -1
+/// on out-of-range indices (including SST entries without runs —
+/// callers should check `zlsx_rich_run_count` first).
+export fn zlsx_rich_run_at(
+    book: *Book,
+    sst_idx: usize,
+    run_idx: usize,
+    out_text_ptr: *[*]const u8,
+    out_text_len: *usize,
+    out_bold: *u8,
+    out_italic: *u8,
+) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    const runs = state.inner.richRuns(sst_idx) orelse return -1;
+    if (run_idx >= runs.len) return -1;
+    const r = runs[run_idx];
+    out_text_ptr.* = r.text.ptr;
+    out_text_len.* = r.text.len;
+    out_bold.* = if (r.bold) 1 else 0;
+    out_italic.* = if (r.italic) 1 else 0;
+    return 0;
+}
+
 /// Find a sheet by name. Returns the 0-based index, or -1 if not found.
 export fn zlsx_sheet_index_by_name(
     book: *Book,

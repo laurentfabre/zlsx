@@ -285,6 +285,27 @@ int32_t zlsx_data_validation_formula2(zlsx_book_t *     book,
                                       size_t *          out_len);
 
 /*
+ * Number of rich-text runs for shared-string entry `sst_idx`, or 0
+ * when that entry is a plain single-run string. Use this as a
+ * presence probe before zlsx_rich_run_at(); SST entries without any
+ * `<r>` wrappers in the source XML return 0.
+ */
+size_t zlsx_rich_run_count(zlsx_book_t * book, size_t sst_idx);
+
+/*
+ * Copy rich-text run `run_idx` of SST entry `sst_idx` into the out
+ * pointers. Text is valid until zlsx_book_close(); bold/italic are
+ * 0 or 1. Returns 0 on success, -1 on out-of-range indices.
+ */
+int32_t zlsx_rich_run_at(zlsx_book_t *     book,
+                         size_t            sst_idx,
+                         size_t            run_idx,
+                         const uint8_t * * out_text_ptr,
+                         size_t *          out_text_len,
+                         uint8_t *         out_bold,
+                         uint8_t *         out_italic);
+
+/*
  * Open a row iterator for sheet `sheet_idx`. On failure returns NULL
  * and writes a diagnostic into err_buf as per zlsx_book_open().
  *
