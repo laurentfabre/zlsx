@@ -404,6 +404,60 @@ if _HAS_HYPERLINK:
     lib.zlsx_sheet_writer_add_hyperlink.restype = ctypes.c_int32
 
 
+class CDxf(ctypes.Structure):
+    _fields_ = [
+        ("bold", ctypes.c_uint8),
+        ("italic", ctypes.c_uint8),
+        ("has_color", ctypes.c_uint8),
+        ("has_fill", ctypes.c_uint8),
+        ("color_argb", ctypes.c_uint32),
+        ("fill_fg_argb", ctypes.c_uint32),
+    ]
+
+
+_HAS_CONDITIONAL_FORMAT = (
+    hasattr(lib, "zlsx_writer_add_dxf")
+    and hasattr(lib, "zlsx_sheet_writer_add_conditional_format_cell_is")
+    and hasattr(lib, "zlsx_sheet_writer_add_conditional_format_expression")
+)
+if _HAS_CONDITIONAL_FORMAT:
+    lib.zlsx_writer_add_dxf.argtypes = [
+        writer_handle,
+        ctypes.POINTER(CDxf),
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_writer_add_dxf.restype = ctypes.c_int32
+
+    lib.zlsx_sheet_writer_add_conditional_format_cell_is.argtypes = [
+        sheet_writer_handle,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_add_conditional_format_cell_is.restype = ctypes.c_int32
+
+    lib.zlsx_sheet_writer_add_conditional_format_expression.argtypes = [
+        sheet_writer_handle,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_add_conditional_format_expression.restype = ctypes.c_int32
+
+
 _HAS_COMMENT_WRITER = hasattr(lib, "zlsx_sheet_writer_add_comment")
 if _HAS_COMMENT_WRITER:
     lib.zlsx_sheet_writer_add_comment.argtypes = [

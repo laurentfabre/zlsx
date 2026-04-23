@@ -1825,6 +1825,115 @@ export fn zlsx_sheet_writer_add_hyperlink(
     return 0;
 }
 
+/// Differential format for conditional-formatting rules. Plain
+/// extern struct so callers can construct it inline. `has_color` /
+/// `has_fill` gate the paired ARGB fields — zero means "not set",
+/// matching the `?u32` semantics on the Zig-side Dxf.
+pub const CDxf = extern struct {
+    bold: u8,
+    italic: u8,
+    has_color: u8,
+    has_fill: u8,
+    color_argb: u32,
+    fill_fg_argb: u32,
+};
+
+/// Register a differential format on the workbook-wide `<dxfs>`
+/// table. Returns 0 on success with `*out_dxf_id` set; -1 on
+/// alloc failure. Content-dedup'd: repeat registrations with the
+/// same CDxf return the same id.
+export fn zlsx_writer_add_dxf(
+    w: *Writer,
+    dxf: *const CDxf,
+    out_dxf_id: *u32,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state: *WriterState = @ptrCast(@alignCast(w));
+    const z_dxf: writer_mod.Dxf = .{
+        .font_bold = dxf.bold != 0,
+        .font_italic = dxf.italic != 0,
+        .font_color_argb = if (dxf.has_color != 0) dxf.color_argb else null,
+        .fill_fg_argb = if (dxf.has_fill != 0) dxf.fill_fg_argb else null,
+    };
+    const id = state.inner.addDxf(z_dxf) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    out_dxf_id.* = id;
+    return 0;
+}
+
+fn cfOperatorFromCode(code: u32) ?writer_mod.CfOperator {
+    return switch (code) {
+        ZLSX_DV_OP_BETWEEN => .between,
+        ZLSX_DV_OP_NOT_BETWEEN => .not_between,
+        ZLSX_DV_OP_EQUAL => .equal,
+        ZLSX_DV_OP_NOT_EQUAL => .not_equal,
+        ZLSX_DV_OP_LESS_THAN => .less_than,
+        ZLSX_DV_OP_LESS_THAN_OR_EQUAL => .less_than_or_equal,
+        ZLSX_DV_OP_GREATER_THAN => .greater_than,
+        ZLSX_DV_OP_GREATER_THAN_OR_EQUAL => .greater_than_or_equal,
+        else => null,
+    };
+}
+
+/// Attach a cellIs-type conditional-format rule. `op_code` reuses
+/// the `ZLSX_DV_OP_*` table (shared OOXML tokens). `formula2_ptr`
+/// may be NULL with `formula2_len = 0` when the operator doesn't
+/// need a second formula. Returns 0 on success, -1 with
+/// err="InvalidDataValidation" / "InvalidHyperlinkRange" /
+/// "UnknownDxfId" on the respective validation failures.
+export fn zlsx_sheet_writer_add_conditional_format_cell_is(
+    sw: *SheetWriter,
+    range_ptr: [*]const u8,
+    range_len: usize,
+    op_code: u32,
+    formula1_ptr: [*]const u8,
+    formula1_len: usize,
+    formula2_ptr: ?[*]const u8,
+    formula2_len: usize,
+    dxf_id: u32,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+    const range = range_ptr[0..range_len];
+    const op = cfOperatorFromCode(op_code) orelse {
+        writeError(err_buf, err_buf_len, @errorName(error.InvalidDataValidation));
+        return -1;
+    };
+    const f1 = formula1_ptr[0..formula1_len];
+    const f2: ?[]const u8 = if (formula2_ptr) |p| p[0..formula2_len] else null;
+    sw_state.inner.addConditionalFormatCellIs(range, op, f1, f2, dxf_id) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
+/// Attach an expression-type conditional-format rule. Same error
+/// semantics as the cellIs export minus the operator / formula2.
+export fn zlsx_sheet_writer_add_conditional_format_expression(
+    sw: *SheetWriter,
+    range_ptr: [*]const u8,
+    range_len: usize,
+    formula_ptr: [*]const u8,
+    formula_len: usize,
+    dxf_id: u32,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+    const range = range_ptr[0..range_len];
+    const formula = formula_ptr[0..formula_len];
+    sw_state.inner.addConditionalFormatExpression(range, formula, dxf_id) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
 /// Attach a cell comment (note). `ref` is a single-cell A1 ref
 /// ("B2"); ranges are rejected. `author` and `text` are both
 /// plain-text; XML-special chars get escaped on emit. Returns 0

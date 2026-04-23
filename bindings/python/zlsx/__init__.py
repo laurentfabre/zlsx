@@ -53,6 +53,7 @@ __all__ = [
     "Fill",
     "Border",
     "Comment",
+    "Dxf",
     "ZlsxError",
 ]
 
@@ -153,6 +154,21 @@ class Style:
     # None = General. Custom formats register at numFmtId >= 164 and
     # dedup across styles.
     number_format: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class Dxf:
+    """A differential format — font / fill overrides applied when a
+    conditional-format rule matches. Register on the workbook via
+    :meth:`Writer.add_dxf` to receive a ``dxf_id`` that
+    :meth:`SheetWriter.add_conditional_format_cell_is` /
+    :meth:`…_expression` can reference. Only the subset of
+    properties real CF rules toggle (bold / italic / font color /
+    solid fill) is surfaced today."""
+    font_bold: bool = False
+    font_italic: bool = False
+    font_color_argb: Optional[int] = None
+    fill_fg_argb: Optional[int] = None
 
 
 class ZlsxError(RuntimeError):
@@ -1588,6 +1604,115 @@ def _sheet_add_data_validation_custom(
         )
 
 
+def _sheet_add_conditional_format_cell_is(
+    self: "SheetWriter",
+    range_str: str,
+    op: str,
+    formula1: str,
+    formula2: str | None,
+    dxf_id: int,
+) -> None:
+    """Attach a cellIs-type conditional-format rule. ``op`` is a
+    writer-DV-style operator string (``"between"`` / ``"equal"`` /
+    ``"greater_than"`` etc.). ``formula2`` is required for
+    ``"between"`` / ``"not_between"`` and must be None otherwise.
+    ``dxf_id`` comes from :meth:`Writer.add_dxf`.
+
+    Requires libzlsx 0.2.6+."""
+    self._require_handle()
+    if not _ffi._HAS_CONDITIONAL_FORMAT:
+        raise RuntimeError(
+            "loaded libzlsx does not expose add_conditional_format_cell_is "
+            "(requires 0.2.6+); upgrade libzlsx"
+        )
+    op_code = _DV_WRITER_OP_CODES.get(op)
+    if op_code is None:
+        raise ValueError(
+            f"unknown conditional-format operator {op!r}; expected one of "
+            f"{sorted(_DV_WRITER_OP_CODES)}"
+        )
+    range_raw = range_str.encode("utf-8")
+    range_buf = (ctypes.c_ubyte * max(len(range_raw), 1)).from_buffer_copy(
+        range_raw or b"\x00"
+    )
+    f1_raw = formula1.encode("utf-8")
+    f1_buf = (ctypes.c_ubyte * max(len(f1_raw), 1)).from_buffer_copy(
+        f1_raw or b"\x00"
+    )
+    ptr_t = ctypes.POINTER(ctypes.c_ubyte)
+    if formula2 is None:
+        f2_ptr = ptr_t()
+        f2_len = 0
+        f2_buf = None
+    else:
+        f2_raw = formula2.encode("utf-8")
+        f2_buf = (ctypes.c_ubyte * max(len(f2_raw), 1)).from_buffer_copy(
+            f2_raw or b"\x00"
+        )
+        f2_ptr = ctypes.cast(f2_buf, ptr_t)
+        f2_len = len(f2_raw)
+
+    rc = _ffi.lib.zlsx_sheet_writer_add_conditional_format_cell_is(
+        self._handle,
+        ctypes.cast(range_buf, ptr_t),
+        len(range_raw),
+        op_code,
+        ctypes.cast(f1_buf, ptr_t),
+        len(f1_raw),
+        f2_ptr,
+        f2_len,
+        dxf_id,
+        self._err,
+        _ERR_BUF_LEN,
+    )
+    del range_buf, f1_buf, f2_buf
+    if rc != 0:
+        raise ZlsxError(
+            f"zlsx_sheet_writer_add_conditional_format_cell_is: {_decode_err(self._err)}"
+        )
+
+
+def _sheet_add_conditional_format_expression(
+    self: "SheetWriter",
+    range_str: str,
+    formula: str,
+    dxf_id: int,
+) -> None:
+    """Attach an expression-type conditional-format rule. Same error
+    semantics as :meth:`add_conditional_format_cell_is` minus the
+    operator + formula2."""
+    self._require_handle()
+    if not _ffi._HAS_CONDITIONAL_FORMAT:
+        raise RuntimeError(
+            "loaded libzlsx does not expose add_conditional_format_expression "
+            "(requires 0.2.6+); upgrade libzlsx"
+        )
+    range_raw = range_str.encode("utf-8")
+    range_buf = (ctypes.c_ubyte * max(len(range_raw), 1)).from_buffer_copy(
+        range_raw or b"\x00"
+    )
+    formula_raw = formula.encode("utf-8")
+    formula_buf = (ctypes.c_ubyte * max(len(formula_raw), 1)).from_buffer_copy(
+        formula_raw or b"\x00"
+    )
+    ptr_t = ctypes.POINTER(ctypes.c_ubyte)
+    rc = _ffi.lib.zlsx_sheet_writer_add_conditional_format_expression(
+        self._handle,
+        ctypes.cast(range_buf, ptr_t),
+        len(range_raw),
+        ctypes.cast(formula_buf, ptr_t),
+        len(formula_raw),
+        dxf_id,
+        self._err,
+        _ERR_BUF_LEN,
+    )
+    del range_buf, formula_buf
+    if rc != 0:
+        raise ZlsxError(
+            f"zlsx_sheet_writer_add_conditional_format_expression: {_decode_err(self._err)}"
+        )
+
+
 SheetWriter.set_column_width = _sheet_set_column_width   # type: ignore[attr-defined]
 SheetWriter.freeze_panes = _sheet_freeze_panes           # type: ignore[attr-defined]
 SheetWriter.set_auto_filter = _sheet_set_auto_filter     # type: ignore[attr-defined]
@@ -1597,6 +1722,8 @@ SheetWriter.add_comment = _sheet_add_comment             # type: ignore[attr-def
 SheetWriter.add_data_validation_list = _sheet_add_data_validation_list  # type: ignore[attr-defined]
 SheetWriter.add_data_validation_numeric = _sheet_add_data_validation_numeric  # type: ignore[attr-defined]
 SheetWriter.add_data_validation_custom = _sheet_add_data_validation_custom  # type: ignore[attr-defined]
+SheetWriter.add_conditional_format_cell_is = _sheet_add_conditional_format_cell_is  # type: ignore[attr-defined]
+SheetWriter.add_conditional_format_expression = _sheet_add_conditional_format_expression  # type: ignore[attr-defined]
 
 
 class Writer:
@@ -1812,6 +1939,35 @@ class Writer:
         )
         if rc != 0:
             raise ZlsxError(f"zlsx_writer_save({target!r}): {_decode_err(self._err)}")
+
+    def add_dxf(self, dxf: "Dxf") -> int:
+        """Register a differential format for conditional-formatting
+        rules and return its dxf id. Content-dedup'd — same
+        :class:`Dxf` returns the same id. Requires libzlsx 0.2.6+."""
+        if not _ffi._HAS_CONDITIONAL_FORMAT:
+            raise RuntimeError(
+                "loaded libzlsx does not expose add_dxf "
+                "(requires 0.2.6+); upgrade libzlsx"
+            )
+        c = _ffi.CDxf(
+            bold=1 if dxf.font_bold else 0,
+            italic=1 if dxf.font_italic else 0,
+            has_color=1 if dxf.font_color_argb is not None else 0,
+            has_fill=1 if dxf.fill_fg_argb is not None else 0,
+            color_argb=dxf.font_color_argb or 0,
+            fill_fg_argb=dxf.fill_fg_argb or 0,
+        )
+        out_id = ctypes.c_uint32(0)
+        rc = _ffi.lib.zlsx_writer_add_dxf(
+            self._handle,
+            ctypes.byref(c),
+            ctypes.byref(out_id),
+            self._err,
+            _ERR_BUF_LEN,
+        )
+        if rc != 0:
+            raise ZlsxError(f"zlsx_writer_add_dxf: {_decode_err(self._err)}")
+        return int(out_id.value)
 
     def close(self) -> None:
         """Release all writer state. Any :class:`SheetWriter` obtained

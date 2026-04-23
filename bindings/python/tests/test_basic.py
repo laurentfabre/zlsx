@@ -996,6 +996,56 @@ def test_sheet_writer_write_rich_row_round_trip(tmp_path):
         assert runs[1].font_name == "Arial"
 
 
+def test_conditional_formatting_round_trip(tmp_path):
+    """Write cellIs + expression CF rules via Python; extract the
+    generated xlsx and verify the sheet XML + styles.xml contain
+    the expected conditionalFormatting / dxfs blocks."""
+    import zipfile
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_CONDITIONAL_FORMAT:
+        pytest.skip("loaded libzlsx predates CF ABI (0.2.6+)")
+
+    out = tmp_path / "cf.xlsx"
+    with zlsx.write(out) as w:
+        red = w.add_dxf(zlsx.Dxf(font_bold=True, font_color_argb=0xFFFF0000))
+        green = w.add_dxf(zlsx.Dxf(fill_fg_argb=0xFF00FF00))
+        # Dedup check.
+        red2 = w.add_dxf(zlsx.Dxf(font_bold=True, font_color_argb=0xFFFF0000))
+        assert red == red2
+
+        sheet = w.add_sheet("S")
+        sheet.add_conditional_format_cell_is("B2:B10", "greater_than", "100", None, red)
+        sheet.add_conditional_format_cell_is("C2:C10", "between", "0", "50", red)
+        sheet.add_conditional_format_expression("A1:Z100", "MOD(ROW(),2)=0", green)
+        sheet.write_row(["hdr"])
+
+        # Rejection paths.
+        with pytest.raises(ValueError, match="conditional-format operator"):
+            sheet.add_conditional_format_cell_is("A1", "bogus", "1", None, red)
+        with pytest.raises(zlsx.ZlsxError, match="InvalidDataValidation"):
+            sheet.add_conditional_format_cell_is("A1", "equal", "", None, red)
+        with pytest.raises(zlsx.ZlsxError, match="UnknownDxfId"):
+            sheet.add_conditional_format_expression("A1", "ROW()=1", 99)
+
+    # Extract the xlsx and verify the CF + dxfs wire up.
+    with zipfile.ZipFile(out) as z:
+        sheet_xml = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        styles_xml = z.read("xl/styles.xml").decode("utf-8")
+
+    assert '<conditionalFormatting sqref="B2:B10">' in sheet_xml
+    assert 'operator="greaterThan"' in sheet_xml
+    assert '<formula>100</formula>' in sheet_xml
+    assert '<conditionalFormatting sqref="C2:C10">' in sheet_xml
+    assert 'operator="between"' in sheet_xml
+    assert '<cfRule type="expression"' in sheet_xml
+    assert 'MOD(ROW(),2)=0' in sheet_xml
+
+    assert '<dxfs count="2">' in styles_xml
+    assert '<color rgb="FFFF0000"/>' in styles_xml
+    assert '<fgColor rgb="FF00FF00"/>' in styles_xml
+
+
 def test_sheet_writer_add_comment_round_trip(tmp_path):
     """Python writer emits cell comments; reader round-trips them via
     `Book.comments(sheet_idx)`. Matrix-flip gate for iter38."""

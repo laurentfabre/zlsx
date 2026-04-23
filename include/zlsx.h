@@ -844,6 +844,59 @@ int32_t zlsx_sheet_writer_add_comment(
     uint8_t             * err_buf,
     size_t                err_buf_len);
 
+/*
+ * Differential format for conditional formatting — font / fill
+ * overrides applied when a cfRule matches. `has_color` / `has_fill`
+ * gate the paired ARGB fields (0 means "not set").
+ */
+typedef struct {
+    uint8_t  bold;
+    uint8_t  italic;
+    uint8_t  has_color;
+    uint8_t  has_fill;
+    uint32_t color_argb;
+    uint32_t fill_fg_argb;
+} zlsx_dxf_t;
+
+/* Register a dxf on the workbook-wide `<dxfs>` table. Returns 0 on
+ * success with `*out_dxf_id` set; -1 on alloc. Content-dedup'd. */
+int32_t zlsx_writer_add_dxf(zlsx_writer_t *   w,
+                            const zlsx_dxf_t* dxf,
+                            uint32_t *        out_dxf_id,
+                            uint8_t *         err_buf,
+                            size_t            err_buf_len);
+
+/* Attach a cellIs-type conditional-format rule. `op_code` reuses
+ * the ZLSX_DV_OP_* codes (same OOXML tokens). `formula2_ptr` may
+ * be NULL with formula2_len=0 when the operator doesn't need a
+ * second formula (required for BETWEEN / NOT_BETWEEN). Returns 0
+ * or -1 with err="InvalidDataValidation" / "InvalidHyperlinkRange"
+ * / "UnknownDxfId". */
+int32_t zlsx_sheet_writer_add_conditional_format_cell_is(
+    zlsx_sheet_writer_t * sw,
+    const uint8_t       * range_ptr,
+    size_t                range_len,
+    uint32_t              op_code,
+    const uint8_t       * formula1_ptr,
+    size_t                formula1_len,
+    const uint8_t       * formula2_ptr,
+    size_t                formula2_len,
+    uint32_t              dxf_id,
+    uint8_t             * err_buf,
+    size_t                err_buf_len);
+
+/* Attach an expression-type conditional-format rule. Same error
+ * semantics as cellIs minus the operator / formula2. */
+int32_t zlsx_sheet_writer_add_conditional_format_expression(
+    zlsx_sheet_writer_t * sw,
+    const uint8_t       * range_ptr,
+    size_t                range_len,
+    const uint8_t       * formula_ptr,
+    size_t                formula_len,
+    uint32_t              dxf_id,
+    uint8_t             * err_buf,
+    size_t                err_buf_len);
+
 #ifdef __cplusplus
 }
 #endif
