@@ -753,6 +753,40 @@ export fn zlsx_is_date_format(book: *Book, style_idx: u32) callconv(.c) u8 {
     return if (state.inner.isDateFormat(style_idx)) 1 else 0;
 }
 
+/// Per-cell font properties. Layout is fixed; `has_color` and
+/// `has_size` disambiguate the optional fields. `name_ptr` / `name_len`
+/// borrow from the Book's styles.xml — lifetime matches the Book.
+pub const CFont = extern struct {
+    bold: u8,
+    italic: u8,
+    has_color: u8,
+    has_size: u8,
+    color_argb: u32,
+    size: f32,
+    name_len: usize,
+    name_ptr: [*]const u8,
+};
+
+/// Resolve a style index to its font properties. Returns 0 on success,
+/// -1 on out-of-range style idx or missing styles.xml. The `has_color`
+/// / `has_size` fields signal whether the optionals are populated;
+/// `name_len == 0` means the font had no explicit `<name val="…"/>`.
+export fn zlsx_cell_font(book: *Book, style_idx: u32, out: *CFont) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    const f = state.inner.cellFont(style_idx) orelse return -1;
+    out.* = .{
+        .bold = if (f.bold) 1 else 0,
+        .italic = if (f.italic) 1 else 0,
+        .has_color = if (f.color_argb != null) 1 else 0,
+        .has_size = if (f.size != null) 1 else 0,
+        .color_argb = f.color_argb orelse 0,
+        .size = f.size orelse 0,
+        .name_len = f.name.len,
+        .name_ptr = if (f.name.len == 0) @ptrCast("") else f.name.ptr,
+    };
+    return 0;
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────
 
 test "abi version" {

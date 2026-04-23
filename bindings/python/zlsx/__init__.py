@@ -49,6 +49,7 @@ __all__ = [
     "Hyperlink",
     "DataValidation",
     "RichRun",
+    "Font",
     "ZlsxError",
 ]
 
@@ -326,6 +327,19 @@ class RichRun:
     font_name: str = ""
 
 
+@dataclass(frozen=True)
+class Font:
+    """Cell-level font properties resolved via ``Book.cell_font(style_idx)``.
+    Shape mirrors :class:`RichRun` minus ``text``. Theme colors aren't
+    resolved — only explicit ``<color rgb="AARRGGBB"/>`` populates
+    ``color_argb``."""
+    bold: bool = False
+    italic: bool = False
+    color_argb: int | None = None
+    size: float | None = None
+    name: str = ""
+
+
 # ─── Book ─────────────────────────────────────────────────────────────
 
 
@@ -595,6 +609,35 @@ class Book:
         if rc != 0:
             return None
         return ctypes.string_at(out_ptr, out_len.value).decode("utf-8", errors="replace")
+
+    def cell_font(self, style_idx: int) -> Font | None:
+        """Resolve a cell's style index to its :class:`Font` properties
+        (bold / italic / color / size / name). Returns ``None`` on
+        out-of-range indices or workbooks without ``xl/styles.xml``.
+        Requires libzlsx 0.2.6+."""
+        if not self._handle:
+            raise ZlsxError("book is closed")
+        if not _ffi._HAS_CELL_FONT:
+            raise RuntimeError(
+                "loaded libzlsx does not expose cell_font "
+                "(requires 0.2.6+); upgrade libzlsx"
+            )
+        cf = _ffi.CCellFont()
+        rc = _ffi.lib.zlsx_cell_font(self._handle, style_idx, ctypes.byref(cf))
+        if rc != 0:
+            return None
+        name = ""
+        if cf.name_len > 0:
+            name = ctypes.string_at(cf.name_ptr, cf.name_len).decode(
+                "utf-8", errors="replace"
+            )
+        return Font(
+            bold=bool(cf.bold),
+            italic=bool(cf.italic),
+            color_argb=int(cf.color_argb) if cf.has_color else None,
+            size=float(cf.size) if cf.has_size else None,
+            name=name,
+        )
 
     def is_date_format(self, style_idx: int) -> bool:
         """True when the style index resolves to a date / time /

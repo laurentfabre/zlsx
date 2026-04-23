@@ -395,6 +395,30 @@ int32_t zlsx_number_format(zlsx_book_t *     book,
  * otherwise (including out-of-range indices). */
 uint8_t zlsx_is_date_format(zlsx_book_t * book, uint32_t style_idx);
 
+/*
+ * Per-cell font properties surfaced from xl/styles.xml `<fonts>`
+ * indirected through `<cellXfs>`. `has_color` and `has_size` are
+ * 0/1 flags — when 0, the respective field is meaningless (absent
+ * in the source file). `name_ptr` / `name_len` borrow from the
+ * Book's styles.xml; valid until zlsx_book_close().
+ */
+typedef struct {
+    uint8_t         bold;
+    uint8_t         italic;
+    uint8_t         has_color;
+    uint8_t         has_size;
+    uint32_t        color_argb;
+    float           size;
+    size_t          name_len;
+    const uint8_t * name_ptr;
+} zlsx_cell_font_t;
+
+/* Resolve a style index to its font. Returns 0 on success, -1 on
+ * out-of-range indices or workbooks without styles.xml. */
+int32_t zlsx_cell_font(zlsx_book_t *       book,
+                       uint32_t            style_idx,
+                       zlsx_cell_font_t *  out);
+
 /* ─── Writer (ABI v1, added in 0.2.2) ─────────────────────────────── */
 
 /*

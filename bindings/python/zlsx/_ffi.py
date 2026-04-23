@@ -571,6 +571,29 @@ if _HAS_NUM_FMT:
     lib.zlsx_is_date_format.restype = ctypes.c_uint8
 
 
+class CCellFont(ctypes.Structure):
+    _fields_ = [
+        ("bold", ctypes.c_uint8),
+        ("italic", ctypes.c_uint8),
+        ("has_color", ctypes.c_uint8),
+        ("has_size", ctypes.c_uint8),
+        ("color_argb", ctypes.c_uint32),
+        ("size", ctypes.c_float),
+        ("name_len", ctypes.c_size_t),
+        ("name_ptr", ctypes.POINTER(ctypes.c_ubyte)),
+    ]
+
+
+_HAS_CELL_FONT = hasattr(lib, "zlsx_cell_font")
+if _HAS_CELL_FONT:
+    lib.zlsx_cell_font.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.POINTER(CCellFont),
+    ]
+    lib.zlsx_cell_font.restype = ctypes.c_int32
+
+
 _HAS_STYLES_EX = hasattr(lib, "zlsx_writer_add_style_ex")
 if _HAS_STYLES_EX:
     lib.zlsx_writer_add_style_ex.argtypes = [

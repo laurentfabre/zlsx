@@ -241,6 +241,20 @@ pub const RichRun = struct {
     font_name: []const u8 = "",
 };
 
+/// Font properties for a cell, parsed from `xl/styles.xml` `<fonts>`.
+/// Shared with `RichRun` semantically but kept as a distinct type so
+/// callers don't have to populate a meaningless `text` field. Theme
+/// colors aren't resolved — only explicit `<color rgb="AARRGGBB"/>`
+/// populates `color_argb`. `name` is empty when the font had no
+/// `<name val="…"/>` child.
+pub const Font = struct {
+    bold: bool = false,
+    italic: bool = false,
+    color_argb: ?u32 = null,
+    size: ?f32 = null,
+    name: []const u8 = "",
+};
+
 pub const DomainError = error{
     NotAnXlsx,
     BadZip,
@@ -309,6 +323,13 @@ pub const Book = struct {
     /// stored here — they're resolved via `builtinNumberFormat`.
     /// Values borrow from `styles_xml`.
     custom_num_fmts: std.AutoHashMapUnmanaged(u32, []const u8) = .{},
+    /// `fonts` table from styles.xml — index matches `fontId`.
+    /// Values borrow from `styles_xml` for the `name` slices.
+    fonts: []Font = &.{},
+    /// One fontId per `<xf>` under `<cellXfs>`, matching
+    /// `cell_xf_numfmt_ids`. Use `Book.cellFont(style_idx)` for the
+    /// resolved lookup.
+    cell_xf_font_ids: []u32 = &.{},
     /// Owned backing storage for every string referenced by `sheets`,
     /// sheet_data keys, and entity-decoded shared strings.
     strings: std.ArrayListUnmanaged([]u8) = .{},
@@ -473,6 +494,18 @@ pub const Book = struct {
         return isDateFormatCode(code);
     }
 
+    /// Font properties for a cell, resolved via the style index
+    /// (`Rows.styleIndices()`). Returns null when the workbook has
+    /// no styles.xml, the index is out of range, or the referenced
+    /// fontId doesn't resolve (malformed file). `name` slice borrows
+    /// from `styles_xml`; lifetime matches the Book.
+    pub fn cellFont(self: *const Book, style_idx: u32) ?Font {
+        if (style_idx >= self.cell_xf_font_ids.len) return null;
+        const font_id = self.cell_xf_font_ids[style_idx];
+        if (font_id >= self.fonts.len) return null;
+        return self.fonts[font_id];
+    }
+
     pub fn deinit(self: *Book) void {
         const a = self.allocator;
         if (self.shared_strings_xml) |s| a.free(s);
@@ -505,6 +538,8 @@ pub const Book = struct {
         // Styles table — numFmt values borrow from styles_xml; only
         // the xfIds slice + hashmap spine are owned here.
         a.free(self.cell_xf_numfmt_ids);
+        a.free(self.cell_xf_font_ids);
+        a.free(self.fonts);
         self.custom_num_fmts.deinit(a);
         if (self.styles_xml) |s| a.free(s);
 
@@ -1396,9 +1431,20 @@ fn parseRprFlags(arena: Allocator, rpr: []const u8) !RichRun {
         }
     }
 
-    // `<rFont val="Calibri"/>` — dupe into arena; run.font_name slice
-    // lives for the Book's lifetime alongside SST-owned strings.
-    if (std.mem.indexOf(u8, rpr, "<rFont")) |fp| {
+    // `<rFont val="Calibri"/>` (in rich-text) or `<name val="…"/>`
+    // (inside `<font>` elements in styles.xml) — same semantics, dupe
+    // into arena. Try the rich-text form first; if absent, fall back
+    // to the styles-form. The two never co-occur.
+    const name_marker = if (std.mem.indexOf(u8, rpr, "<rFont")) |p| p else blk: {
+        if (std.mem.indexOf(u8, rpr, "<name")) |np| {
+            // Guard against a `<name>` that isn't a self-closing attribute tag
+            // (shouldn't happen in valid OOXML, but be defensive).
+            if (np + 5 < rpr.len and (rpr[np + 5] == ' ' or rpr[np + 5] == '/'))
+                break :blk np;
+        }
+        break :blk null;
+    };
+    if (name_marker) |fp| {
         const gt = std.mem.indexOfScalarPos(u8, rpr, fp, '>') orelse 0;
         if (gt > fp) {
             const tag = rpr[fp..gt];
@@ -1434,6 +1480,46 @@ fn hasFalseVal(tag: []const u8) bool {
 /// Book's lifetime. Malformed or missing sections degrade silently —
 /// an xlsx with no cellXfs just returns null from `numberFormat`.
 fn parseStyles(book: *Book, xml: []const u8) !void {
+    // fonts — optional. Shape: `<fonts count="N"><font>...</font>...</fonts>`.
+    // Each <font> has the same child shape as <rPr> inside <si>, so we
+    // reuse parseRprFlags + project its text='' variant into a Font.
+    if (std.mem.indexOf(u8, xml, "<fonts")) |fp| {
+        const fp_end = std.mem.indexOfPos(u8, xml, fp, "</fonts>") orelse xml.len;
+        const block = xml[fp..fp_end];
+        var fonts_list: std.ArrayListUnmanaged(Font) = .{};
+        errdefer fonts_list.deinit(book.allocator);
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, block, i, "<font")) |font_pos| {
+            // Skip <fonts> self-tag (already consumed via index above).
+            if (font_pos + 5 < block.len) {
+                const after = block[font_pos + 5];
+                if (after != '>' and after != ' ') {
+                    i = font_pos + 5;
+                    continue;
+                }
+            }
+            // Self-closing `<font/>` → default empty.
+            const gt = std.mem.indexOfScalarPos(u8, block, font_pos, '>') orelse break;
+            if (gt > 0 and block[gt - 1] == '/') {
+                try fonts_list.append(book.allocator, .{});
+                i = gt + 1;
+                continue;
+            }
+            const font_close = std.mem.indexOfPos(u8, block, gt, "</font>") orelse break;
+            const body = block[font_pos .. font_close + "</font>".len];
+            const rr = try parseRprFlags(book.sst_arena.allocator(), body);
+            try fonts_list.append(book.allocator, .{
+                .bold = rr.bold,
+                .italic = rr.italic,
+                .color_argb = rr.color_argb,
+                .size = rr.size,
+                .name = rr.font_name,
+            });
+            i = font_close + "</font>".len;
+        }
+        book.fonts = try fonts_list.toOwnedSlice(book.allocator);
+    }
+
     // numFmts — optional. Shape: `<numFmts count="…"><numFmt numFmtId="164" formatCode="…"/>…</numFmts>`.
     if (std.mem.indexOf(u8, xml, "<numFmts")) |nfs_pos| {
         const nfs_end = std.mem.indexOfPos(u8, xml, nfs_pos, "</numFmts>") orelse xml.len;
@@ -1464,23 +1550,29 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
 
     var ids: std.ArrayListUnmanaged(u32) = .{};
     errdefer ids.deinit(book.allocator);
+    var font_ids: std.ArrayListUnmanaged(u32) = .{};
+    errdefer font_ids.deinit(book.allocator);
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, xfs_block, i, "<xf ")) |xp| {
         const gt = std.mem.indexOfScalarPos(u8, xfs_block, xp, '>') orelse break;
         const attrs = xfs_block[xp..gt];
         i = gt + 1;
-        const key = "numFmtId=\"";
-        if (std.mem.indexOf(u8, attrs, key)) |kp| {
-            const s = kp + key.len;
-            const e = std.mem.indexOfScalarPos(u8, attrs, s, '"') orelse continue;
-            const v = std.fmt.parseInt(u32, attrs[s..e], 10) catch 0;
-            try ids.append(book.allocator, v);
-        } else {
-            // Missing numFmtId — OOXML default is 0 ("General").
-            try ids.append(book.allocator, 0);
-        }
+        try ids.append(book.allocator, parseXfAttrU32(attrs, "numFmtId=\"", 0));
+        try font_ids.append(book.allocator, parseXfAttrU32(attrs, "fontId=\"", 0));
     }
     book.cell_xf_numfmt_ids = try ids.toOwnedSlice(book.allocator);
+    book.cell_xf_font_ids = try font_ids.toOwnedSlice(book.allocator);
+}
+
+/// Parse a `key="N"` u32 attribute from an `<xf>` attrs blob, defaulting
+/// when the key is absent or malformed. OOXML's cellXfs entries are
+/// generated programmatically and have predictable shape; we don't need
+/// a full XML attr parser for a handful of integer slots.
+fn parseXfAttrU32(attrs: []const u8, key: []const u8, default: u32) u32 {
+    const kp = std.mem.indexOf(u8, attrs, key) orelse return default;
+    const s = kp + key.len;
+    const e = std.mem.indexOfScalarPos(u8, attrs, s, '"') orelse return default;
+    return std.fmt.parseInt(u32, attrs[s..e], 10) catch default;
 }
 
 /// Resolve a built-in number-format id to its OOXML pattern. Returns
@@ -2229,6 +2321,56 @@ test "Book.numberFormat + isDateFormat: built-in, custom, and per-cell style loo
     if (styles[2]) |s2| {
         try std.testing.expectEqual(false, book.isDateFormat(s2));
     }
+}
+
+test "Book.cellFont: round-trips bold / color / size / name from xl/styles.xml" {
+    const tmp_path = "/tmp/zlsx_reader_cell_font.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        const bold_style = try w.addStyle(.{
+            .font_bold = true,
+            .font_color_argb = 0xFFFF0000,
+            .font_size = 14,
+            .font_name = "Courier New",
+        });
+        const plain_style = try w.addStyle(.{ .font_italic = true });
+        var sheet = try w.addSheet("S");
+        try sheet.writeRowStyled(
+            &.{ .{ .string = "bold-red" }, .{ .string = "italic" }, .{ .string = "bare" } },
+            &.{ bold_style, plain_style, 0 },
+        );
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    _ = try rows.next();
+    const styles = rows.styleIndices();
+
+    const s0 = styles[0] orelse return error.TestUnexpectedResult;
+    const f0 = book.cellFont(s0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(true, f0.bold);
+    try std.testing.expectEqual(false, f0.italic);
+    try std.testing.expectEqual(@as(?u32, 0xFFFF0000), f0.color_argb);
+    try std.testing.expectEqual(@as(?f32, 14.0), f0.size);
+    try std.testing.expectEqualStrings("Courier New", f0.name);
+
+    const s1 = styles[1] orelse return error.TestUnexpectedResult;
+    const f1 = book.cellFont(s1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(false, f1.bold);
+    try std.testing.expectEqual(true, f1.italic);
+
+    // Default style (idx 0) resolves to the writer's default font —
+    // cellFont should still return non-null.
+    const s2 = styles[2] orelse 0;
+    try std.testing.expect(book.cellFont(s2) != null);
 }
 
 test "Book.richRuns: color / size / font_name from <rPr>" {

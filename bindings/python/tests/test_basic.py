@@ -825,6 +825,55 @@ def test_rows_style_indices_and_book_number_format(tmp_path):
         assert book.is_date_format(99999) is False
 
 
+def test_book_cell_font_round_trip(tmp_path):
+    """Writer emits bold/colored/sized/named font styles; reader
+    resolves them via `Book.cell_font(style_idx)`."""
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_CELL_FONT:
+        pytest.skip("loaded libzlsx predates cell_font ABI (0.2.6+)")
+
+    out = tmp_path / "font.xlsx"
+    with zlsx.write(out) as w:
+        bold_style = w.add_style(zlsx.Style(
+            font_bold=True,
+            font_color_argb=0xFFFF0000,
+            font_size=14,
+            font_name="Courier New",
+        ))
+        plain_style = w.add_style(zlsx.Style(font_italic=True))
+        sheet = w.add_sheet("S")
+        sheet.write_row(
+            ["bold-red", "italic", "bare"],
+            styles=[bold_style, plain_style, 0],
+        )
+
+    with zlsx.open(out) as book:
+        with book.sheet(0).rows() as rows:
+            next(rows)
+            styles = rows.style_indices()
+            assert len(styles) == 3
+            s0, s1, s2 = styles
+
+            f0 = book.cell_font(s0)
+            assert f0 is not None
+            assert f0.bold and not f0.italic
+            assert f0.color_argb == 0xFFFF0000
+            assert f0.size == 14.0
+            assert f0.name == "Courier New"
+
+            f1 = book.cell_font(s1)
+            assert f1 is not None and f1.italic and not f1.bold
+
+            # Default font (xfId 0 or whatever the writer left) still
+            # resolves to a non-None Font, even if all optionals are null.
+            if s2 is not None:
+                assert book.cell_font(s2) is not None
+
+        # Out-of-range style idx → None.
+        assert book.cell_font(99999) is None
+
+
 def test_writer_add_data_validation_rejects_invalid_inputs(tmp_path):
     """Exercise every error path on the extended writer DV APIs so the
     rejection behaviour from the Zig writer surfaces cleanly."""
