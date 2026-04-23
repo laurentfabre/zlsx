@@ -1101,16 +1101,21 @@ fn appendXmlEscaped(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), s: []con
     };
 }
 
-// ─── Deflate (LZ77 + fixed huffman) ──────────────────────────────────
+// ─── Deflate (LZ77 + dynamic huffman + lazy matching) ────────────────
 //
 // Pure in-house deflate compressor. Zig 0.15.2's stdlib
 // `std.compress.flate.Compress` cannot compile (references a missing
 // `bit_writer` field in BlockWriter + has @panic("TODO") in the token
-// emission path), so we grow our own. Uses RFC 1951 fixed-huffman
-// codes (§3.2.6) — no dynamic table to emit, which keeps the code
-// small. Compression comes from the LZ77 match finder (hash chain,
-// 32 KB window, greedy, chain-depth 32). Typical ratios: ~20-25%
-// on xlsx XML, plenty to close most of the archive-size gap.
+// emission path), so we grow our own. Two-pass layout: tokenize input
+// into literals + LZ77 matches (greedy with lazy-match-defer-one), then
+// emit a single final type-2 (dynamic huffman) block. HuffmanEncoder
+// from stdlib builds the code tables from frequency counts.
+//
+// Tuning knobs: 32 KB sliding window, hash-chain depth 32, 3-byte hash.
+// The lazy match defers one position — after finding a match at i we
+// look at i+1 and keep whichever is longer. Cuts about 5 KB off the
+// Phase 3b test workbook on top of the dynamic huffman tables that
+// already close most of the xlsxwriter/openpyxl gap.
 
 // RFC 1951 §3.2.5 — length codes 257..285 with base + extra-bit counts.
 const deflate_length_base = [_]u16{
@@ -1174,32 +1179,6 @@ fn deflateDistCode(d: u16) struct { code: u8, extra: u16, extra_bits: u8 } {
     unreachable;
 }
 
-// RFC 1951 §3.2.6 fixed huffman:
-//   0..143   → 8 bits (00110000 .. 10111111)
-//   144..255 → 9 bits (110010000 .. 111111111)
-//   256..279 → 7 bits (0000000 .. 0010111)
-//   280..287 → 8 bits (11000000 .. 11000111)
-// Codes are MSB-first; the bit writer reverses them into the
-// LSB-first output stream.
-fn fixedLitLenCode(sym: u16) struct { code: u16, len: u4 } {
-    if (sym <= 143) return .{ .code = 0b00110000 + sym, .len = 8 };
-    if (sym <= 255) return .{ .code = 0b110010000 + (sym - 144), .len = 9 };
-    if (sym <= 279) return .{ .code = sym - 256, .len = 7 };
-    return .{ .code = 0b11000000 + (sym - 280), .len = 8 };
-}
-
-// Distance codes are a flat 5-bit range (0..29). Codes 30 and 31 are
-// invalid per RFC 1951; since our distance codes are computed from
-// deflateDistCode (which caps at 29), we never reach them here.
-fn fixedDistCode(sym: u8) struct { code: u16, len: u4 } {
-    std.debug.assert(sym <= 29);
-    return .{ .code = sym, .len = 5 };
-}
-
-fn deflateReverseBits(v: u32, n: u4) u32 {
-    return @bitReverse(v) >> @as(u5, @intCast(32 - @as(u6, n)));
-}
-
 const DeflateBitWriter = struct {
     out: *std.ArrayListUnmanaged(u8),
     alloc: Allocator,
@@ -1216,9 +1195,11 @@ const DeflateBitWriter = struct {
         }
     }
 
-    fn writeCode(self: *DeflateBitWriter, code: u16, len: u4) !void {
-        const rev = deflateReverseBits(code, len);
-        try self.writeBits(@intCast(rev), @intCast(len));
+    /// Write an MSB-first huffman code (as in RFC 1951's tables) —
+    /// reversed into the LSB-first output stream.
+    fn writeMsbCode(self: *DeflateBitWriter, code: u16, len: u4) !void {
+        const rev = @bitReverse(@as(u32, code)) >> @as(u5, @intCast(32 - @as(u6, len)));
+        try self.writeBits(rev, @intCast(len));
     }
 
     fn flushByte(self: *DeflateBitWriter) !void {
@@ -1244,24 +1225,37 @@ fn deflateHash3(d0: u8, d1: u8, d2: u8) u32 {
     return (((a << 16) | (b << 8) | c) *% 2654435761) >> @as(u5, @intCast(32 - DEFLATE_HASH_BITS));
 }
 
-/// Emit `input` as a single final block using LZ77 + fixed huffman.
-/// `out` receives raw deflate bytes (no gzip/zlib wrapper — what a
-/// deflate-method zip entry expects). Compression chain is capped at
-/// 32 probes per position for predictable runtime; ratios are close
-/// to zlib's `-3` level on typical xlsx XML.
-fn deflateCompressFixed(alloc: Allocator, input: []const u8, out: *std.ArrayListUnmanaged(u8)) !void {
-    var bw = DeflateBitWriter{ .out = out, .alloc = alloc };
-    // BFINAL=1, BTYPE=01 → the 3 bits `011` MSB-first.
-    // On an LSB-first bit stream that's the low bits 1,1,0 → 0b011.
-    try bw.writeBits(0b011, 3);
+/// LZ77 token. `kind=0` → literal (byte in `val`); `kind=1` → match
+/// (raw length in `val`, distance in `dist`). Packed to 4 bytes so the
+/// token stream is cache-friendly on large inputs.
+const DeflateToken = packed struct(u32) {
+    kind: u1,
+    val: u15, // literal byte (0-255) or raw match length (3-258)
+    dist: u16, // match distance (1-32768); unused for literals
+};
 
-    if (input.len == 0) {
-        const eob = fixedLitLenCode(256);
-        try bw.writeCode(eob.code, eob.len);
-        try bw.flushByte();
-        return;
-    }
+/// Insert the 3-byte prefix at `pos` into the hash chain.
+fn deflateInsertHash(
+    input: []const u8,
+    pos: usize,
+    head: []i32,
+    prev: []i32,
+) void {
+    const h = deflateHash3(input[pos], input[pos + 1], input[pos + 2]);
+    prev[pos] = head[h];
+    head[h] = @intCast(pos);
+}
 
+/// Tokenize `input` into LZ77 literals + matches with lazy matching.
+/// "Lazy" here means single-step: at position i we find the best match,
+/// look one byte ahead to see if a longer match starts at i+1, and
+/// commit to the longer one. Costs little (one extra search per
+/// non-MAX_MATCH hit) and reliably trims 3-5 % off the stream.
+fn tokenizeLazy(
+    alloc: Allocator,
+    input: []const u8,
+    tokens: *std.ArrayListUnmanaged(DeflateToken),
+) !void {
     const head = try alloc.alloc(i32, DEFLATE_HASH_SIZE);
     defer alloc.free(head);
     @memset(head, -1);
@@ -1271,7 +1265,13 @@ fn deflateCompressFixed(alloc: Allocator, input: []const u8, out: *std.ArrayList
     @memset(prev, -1);
 
     const max_chain: u32 = 32;
+
     var i: usize = 0;
+    // One-step deferred match (the "lazy" part).
+    var prev_match_len: usize = 0;
+    var prev_match_dist: usize = 0;
+    var prev_literal: u8 = 0;
+
     while (i < input.len) {
         var match_len: usize = 0;
         var match_dist: usize = 0;
@@ -1293,40 +1293,303 @@ fn deflateCompressFixed(alloc: Allocator, input: []const u8, out: *std.ArrayList
                 }
                 candidate = prev[cand_pos];
             }
-            prev[i] = head[h];
-            head[h] = @intCast(i);
+            // Always insert the current position into the chain so
+            // later positions (including the i+1 lazy lookahead) can
+            // match against it.
+            deflateInsertHash(input, i, head, prev);
         }
 
-        if (match_len >= DEFLATE_MIN_MATCH) {
-            const lc = deflateLengthCode(@intCast(match_len));
-            const dc = deflateDistCode(@intCast(match_dist));
-            const lit = fixedLitLenCode(lc.code);
-            try bw.writeCode(lit.code, lit.len);
-            if (lc.extra_bits > 0) try bw.writeBits(lc.extra, @intCast(lc.extra_bits));
-            const dist = fixedDistCode(dc.code);
-            try bw.writeCode(dist.code, dist.len);
-            if (dc.extra_bits > 0) try bw.writeBits(dc.extra, @intCast(dc.extra_bits));
-            // Update hash chain for every byte we skip over, so later
-            // positions can still match against interior bytes of this
-            // just-emitted run.
-            var j: usize = 1;
-            while (j < match_len) : (j += 1) {
-                if (i + j + DEFLATE_MIN_MATCH <= input.len) {
-                    const h2 = deflateHash3(input[i + j], input[i + j + 1], input[i + j + 2]);
-                    prev[i + j] = head[h2];
-                    head[h2] = @intCast(i + j);
+        if (prev_match_len >= DEFLATE_MIN_MATCH) {
+            if (match_len > prev_match_len) {
+                // i+1 beats i — emit i's byte as a literal and promote
+                // the current match to the new deferred slot.
+                try tokens.append(alloc, .{ .kind = 0, .val = prev_literal, .dist = 0 });
+                prev_match_len = match_len;
+                prev_match_dist = match_dist;
+                prev_literal = input[i];
+                i += 1;
+            } else {
+                // Emit the deferred match. We're currently 1 past the
+                // deferred position; fill the hash chain for the match
+                // interior we're about to skip over, then advance.
+                try tokens.append(alloc, .{
+                    .kind = 1,
+                    .val = @intCast(prev_match_len),
+                    .dist = @intCast(prev_match_dist),
+                });
+                const skip = prev_match_len - 1;
+                var j: usize = 1;
+                while (j < skip) : (j += 1) {
+                    if (i + j + DEFLATE_MIN_MATCH <= input.len) {
+                        deflateInsertHash(input, i + j, head, prev);
+                    }
                 }
+                i += skip;
+                prev_match_len = 0;
             }
-            i += match_len;
         } else {
-            const c = fixedLitLenCode(input[i]);
-            try bw.writeCode(c.code, c.len);
-            i += 1;
+            if (match_len >= DEFLATE_MIN_MATCH) {
+                // Defer the commit to check i+1 first.
+                prev_match_len = match_len;
+                prev_match_dist = match_dist;
+                prev_literal = input[i];
+                i += 1;
+            } else {
+                try tokens.append(alloc, .{ .kind = 0, .val = input[i], .dist = 0 });
+                i += 1;
+            }
         }
     }
 
-    const eob = fixedLitLenCode(256);
-    try bw.writeCode(eob.code, eob.len);
+    // Flush any deferred match at end of input.
+    if (prev_match_len >= DEFLATE_MIN_MATCH) {
+        try tokens.append(alloc, .{
+            .kind = 1,
+            .val = @intCast(prev_match_len),
+            .dist = @intCast(prev_match_dist),
+        });
+    }
+}
+
+/// Run-length encode a combined (lit_lens ++ dist_lens) sequence into
+/// the codegen alphabet (0-18) per RFC 1951 §3.2.7. `out_syms` receives
+/// packed symbols where bits 0-4 = codegen symbol, bits 5-11 = extra
+/// payload, bits 12-15 = extra bits count.
+const CodegenSym = packed struct(u16) { sym: u5, extra: u7, extra_bits: u4 };
+
+fn rleEncodeCodeLengths(
+    alloc: Allocator,
+    lens: []const u8,
+    out: *std.ArrayListUnmanaged(CodegenSym),
+) !void {
+    var i: usize = 0;
+    while (i < lens.len) {
+        const cur = lens[i];
+        var run: usize = 1;
+        while (i + run < lens.len and lens[i + run] == cur) run += 1;
+
+        if (cur == 0) {
+            // Zero runs: symbol 17 for 3..10 zeros, 18 for 11..138.
+            while (run >= 11) {
+                const n = @min(run, 138);
+                try out.append(alloc, .{ .sym = 18, .extra = @intCast(n - 11), .extra_bits = 7 });
+                run -= n;
+                i += n;
+            }
+            if (run >= 3) {
+                try out.append(alloc, .{ .sym = 17, .extra = @intCast(run - 3), .extra_bits = 3 });
+                i += run;
+                run = 0;
+            }
+            while (run > 0) : (run -= 1) {
+                try out.append(alloc, .{ .sym = 0, .extra = 0, .extra_bits = 0 });
+                i += 1;
+            }
+        } else {
+            // Non-zero run: emit first as a literal, use symbol 16 to
+            // repeat prev 3..6 more times, stragglers as literals.
+            try out.append(alloc, .{ .sym = @intCast(cur), .extra = 0, .extra_bits = 0 });
+            i += 1;
+            run -= 1;
+            while (run >= 3) {
+                const n = @min(run, 6);
+                try out.append(alloc, .{ .sym = 16, .extra = @intCast(n - 3), .extra_bits = 2 });
+                run -= n;
+                i += n;
+            }
+            while (run > 0) : (run -= 1) {
+                try out.append(alloc, .{ .sym = @intCast(cur), .extra = 0, .extra_bits = 0 });
+                i += 1;
+            }
+        }
+    }
+}
+
+const HuffEncoder = std.compress.flate.HuffmanEncoder;
+
+/// Count byte frequencies in the token stream. Uses u32 to avoid u16
+/// overflow on large repetitive inputs (one literal can appear ≫64k
+/// times in a 300 KB sheet); we rescale to u16 at HuffmanEncoder call
+/// time since the stdlib's api takes u16 freqs.
+fn countTokenFrequencies(
+    tokens: []const DeflateToken,
+    lit_freq: *[286]u32,
+    dist_freq: *[30]u32,
+) void {
+    @memset(lit_freq, 0);
+    @memset(dist_freq, 0);
+    lit_freq[256] = 1; // EOB always appears exactly once.
+    for (tokens) |tok| {
+        if (tok.kind == 0) {
+            lit_freq[tok.val] += 1;
+        } else {
+            const lc = deflateLengthCode(tok.val);
+            lit_freq[lc.code] += 1;
+            const dc = deflateDistCode(tok.dist);
+            dist_freq[dc.code] += 1;
+        }
+    }
+}
+
+/// Scale frequencies down so the max fits in u15 — HuffmanEncoder sums
+/// them internally and needs room. Preserve relative rank: a non-zero
+/// input keeps a non-zero output (rounding up from 0).
+fn scaleFreqs(src: []const u32, dst: []u16) void {
+    var max_freq: u32 = 0;
+    for (src) |f| max_freq = @max(max_freq, f);
+    const u15_max: u32 = 32767;
+    const scale: u32 = if (max_freq > u15_max) (max_freq + u15_max - 1) / u15_max else 1;
+    for (src, 0..) |f, i| {
+        const v = f / scale;
+        dst[i] = @intCast(if (f > 0 and v == 0) 1 else v);
+    }
+}
+
+/// Emit `tokens` as a single final dynamic-huffman block. Assumes
+/// `tokens.len > 0` — empty inputs are handled upstream (stored
+/// fallback in ZipWriter.addEntry).
+fn emitDynamicBlock(
+    alloc: Allocator,
+    tokens: []const DeflateToken,
+    bw: *DeflateBitWriter,
+) !void {
+    // 1. Count frequencies and build lit/length + distance huffman tables.
+    var lit_freq_u32: [286]u32 = undefined;
+    var dist_freq_u32: [30]u32 = undefined;
+    countTokenFrequencies(tokens, &lit_freq_u32, &dist_freq_u32);
+
+    var lit_freq: [286]u16 = undefined;
+    var dist_freq: [30]u16 = undefined;
+    scaleFreqs(&lit_freq_u32, &lit_freq);
+    scaleFreqs(&dist_freq_u32, &dist_freq);
+
+    // RFC 1951 mandates at least one distance code; if the input had
+    // zero matches, zlib's convention is to define two dummy 1-bit
+    // codes so the decoder's alphabet is always well-formed.
+    var any_dist: bool = false;
+    for (dist_freq) |f| if (f > 0) {
+        any_dist = true;
+        break;
+    };
+    if (!any_dist) {
+        dist_freq[0] = 1;
+        dist_freq[1] = 1;
+    }
+
+    var lit_codes: [286]HuffEncoder.Code = undefined;
+    var lit_lns: [286]HuffEncoder.LiteralNode = undefined;
+    var lit_lfs: [286]HuffEncoder.LiteralNode = undefined;
+    var lit_enc: HuffEncoder = .{
+        .codes = &lit_codes,
+        .freq_cache = undefined,
+        .bit_count = undefined,
+        .lns = &lit_lns,
+        .lfs = &lit_lfs,
+    };
+    lit_enc.generate(&lit_freq, 15);
+
+    var dist_codes: [30]HuffEncoder.Code = undefined;
+    var dist_lns: [30]HuffEncoder.LiteralNode = undefined;
+    var dist_lfs: [30]HuffEncoder.LiteralNode = undefined;
+    var dist_enc: HuffEncoder = .{
+        .codes = &dist_codes,
+        .freq_cache = undefined,
+        .bit_count = undefined,
+        .lns = &dist_lns,
+        .lfs = &dist_lfs,
+    };
+    dist_enc.generate(&dist_freq, 15);
+
+    // 2. Trim trailing zero-length entries to compute HLIT/HDIST.
+    var num_lit: usize = 286;
+    while (num_lit > 257 and lit_codes[num_lit - 1].len == 0) num_lit -= 1;
+    var num_dist: usize = 30;
+    while (num_dist > 1 and dist_codes[num_dist - 1].len == 0) num_dist -= 1;
+
+    // 3. Concatenate lit + dist code lengths, RLE-encode with codegens.
+    var combined: [286 + 30]u8 = undefined;
+    for (0..num_lit) |k| combined[k] = @intCast(lit_codes[k].len);
+    for (0..num_dist) |k| combined[num_lit + k] = @intCast(dist_codes[k].len);
+
+    var codegen_syms: std.ArrayListUnmanaged(CodegenSym) = .{};
+    defer codegen_syms.deinit(alloc);
+    try rleEncodeCodeLengths(alloc, combined[0 .. num_lit + num_dist], &codegen_syms);
+
+    // 4. Build the codegen huffman (7-bit-limited).
+    var cg_freq: [19]u16 = .{0} ** 19;
+    for (codegen_syms.items) |s| cg_freq[s.sym] += 1;
+
+    var cg_codes: [19]HuffEncoder.Code = undefined;
+    var cg_lns: [19]HuffEncoder.LiteralNode = undefined;
+    var cg_lfs: [19]HuffEncoder.LiteralNode = undefined;
+    var cg_enc: HuffEncoder = .{
+        .codes = &cg_codes,
+        .freq_cache = undefined,
+        .bit_count = undefined,
+        .lns = &cg_lns,
+        .lfs = &cg_lfs,
+    };
+    cg_enc.generate(&cg_freq, 7);
+
+    // HCLEN is the number of codegen code lengths emitted, in the
+    // RFC 1951 permuted order. Trim trailing zeros down to minimum 4.
+    var num_cg: usize = 19;
+    while (num_cg > 4 and cg_codes[HuffEncoder.codegen_order[num_cg - 1]].len == 0) num_cg -= 1;
+
+    // 5. Emit the block.
+    // BFINAL=1 (bit 0) + BTYPE=10 (bits 1-2): value 0b101 = 5.
+    try bw.writeBits(5, 3);
+    try bw.writeBits(@intCast(num_lit - 257), 5);
+    try bw.writeBits(@intCast(num_dist - 1), 5);
+    try bw.writeBits(@intCast(num_cg - 4), 4);
+    for (0..num_cg) |k| {
+        const order_idx = HuffEncoder.codegen_order[k];
+        try bw.writeBits(@intCast(cg_codes[order_idx].len), 3);
+    }
+    // Codegen-encoded code lengths. HuffmanEncoder.generate stores
+    // codes in LSB-first form already (bit-reversed during assignment),
+    // so write them with the raw bit writer rather than writeMsbCode.
+    for (codegen_syms.items) |s| {
+        const c = cg_codes[s.sym];
+        try bw.writeBits(c.code, @intCast(c.len));
+        if (s.extra_bits > 0) try bw.writeBits(s.extra, @intCast(s.extra_bits));
+    }
+
+    // 6. Emit the token stream using the lit + dist huffman tables.
+    for (tokens) |tok| {
+        if (tok.kind == 0) {
+            const c = lit_codes[tok.val];
+            try bw.writeBits(c.code, @intCast(c.len));
+        } else {
+            const lc = deflateLengthCode(tok.val);
+            const c = lit_codes[lc.code];
+            try bw.writeBits(c.code, @intCast(c.len));
+            if (lc.extra_bits > 0) try bw.writeBits(lc.extra, @intCast(lc.extra_bits));
+            const dc = deflateDistCode(tok.dist);
+            const dc_c = dist_codes[dc.code];
+            try bw.writeBits(dc_c.code, @intCast(dc_c.len));
+            if (dc.extra_bits > 0) try bw.writeBits(dc.extra, @intCast(dc.extra_bits));
+        }
+    }
+
+    // EOB.
+    const eob_c = lit_codes[256];
+    try bw.writeBits(eob_c.code, @intCast(eob_c.len));
+}
+
+/// Compress `input` as a single final dynamic-huffman deflate stream.
+/// Caller ensures `input.len > 0` (empty inputs bypass compression
+/// upstream).
+fn deflateCompress(alloc: Allocator, input: []const u8, out: *std.ArrayListUnmanaged(u8)) !void {
+    std.debug.assert(input.len > 0);
+
+    var tokens: std.ArrayListUnmanaged(DeflateToken) = .{};
+    defer tokens.deinit(alloc);
+    try tokens.ensureTotalCapacity(alloc, input.len);
+    try tokenizeLazy(alloc, input, &tokens);
+
+    var bw = DeflateBitWriter{ .out = out, .alloc = alloc };
+    try emitDynamicBlock(alloc, tokens.items, &bw);
     try bw.flushByte();
 }
 
@@ -1370,18 +1633,26 @@ const ZipWriter = struct {
         const crc = std.hash.Crc32.hash(data);
         const offset: u32 = @intCast(self.out.items.len);
 
-        // Try deflate first. If it doesn't help (empty input, or the
-        // fixed-huffman + EOB overhead exceeds input size for very
-        // small/random payloads), fall back to stored.
+        // Sub-1 KB entries skip compression. The dynamic-huffman block
+        // header adds ~60-120 bytes of fixed overhead that rarely pays
+        // back on tiny XML fragments (Content_Types.xml, workbook rels,
+        // empty sheet templates) — and the hash-chain init is pure waste.
+        // The big entries (sheet1.xml, sharedStrings.xml, styles.xml)
+        // dominate archive size, so bypassing small ones loses negligible
+        // savings and shaves real per-entry wall time.
+        //
+        // If deflate still inflates a ≥ 1 KB payload (already-compressed
+        // or near-random content), fall back to stored.
+        const COMPRESS_MIN: usize = 1024;
         var compressed: std.ArrayListUnmanaged(u8) = .{};
         defer compressed.deinit(alloc);
 
         var method: std.zip.CompressionMethod = .deflate;
         var payload: []const u8 = undefined;
-        if (data.len > 0) {
-            try deflateCompressFixed(alloc, data, &compressed);
+        if (data.len >= COMPRESS_MIN) {
+            try deflateCompress(alloc, data, &compressed);
         }
-        if (data.len == 0 or compressed.items.len >= data.len) {
+        if (data.len < COMPRESS_MIN or compressed.items.len >= data.len) {
             method = .store;
             payload = data;
         } else {
@@ -2761,13 +3032,17 @@ test "fuzz ZipWriter produces archives our reader can walk" {
 //
 // Every Writer test already covers deflate end-to-end (save → reopen
 // via the reader, which decompresses). These two targets isolate
-// `deflateCompressFixed` so a deflate-specific regression doesn't
-// have to be debugged through the full workbook pipeline.
+// `deflateCompress` so a deflate-specific regression doesn't have
+// to be debugged through the full workbook pipeline.
 
 fn deflateRoundTrip(alloc: Allocator, input: []const u8) !bool {
+    // `deflateCompress` asserts input.len > 0 — empty inputs bypass
+    // compression at the ZipWriter layer, so special-case here.
+    if (input.len == 0) return true;
+
     var compressed: std.ArrayListUnmanaged(u8) = .{};
     defer compressed.deinit(alloc);
-    try deflateCompressFixed(alloc, input, &compressed);
+    try deflateCompress(alloc, input, &compressed);
 
     var reader = std.Io.Reader.fixed(compressed.items);
     var window: [std.compress.flate.max_window_len]u8 = undefined;
