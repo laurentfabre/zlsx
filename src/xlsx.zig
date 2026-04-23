@@ -2698,6 +2698,102 @@ test "writer.addComment: emits comments that round-trip through Book.comments" {
     try std.testing.expectEqualStrings("follow-up", cs[2].text);
 }
 
+test "writer.addComment: XML-special chars in author + text round-trip via entity-decoding" {
+    const tmp_path = "/tmp/zlsx_comments_xml_special.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("S");
+        try sheet.addComment("A1", "R&D <Lead>", "review <this> & \"that\" quickly");
+        try sheet.writeRow(&.{.{ .string = "x" }});
+        try w.save(tmp_path);
+    }
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    const cs = book.comments(book.sheets[0]);
+    try std.testing.expectEqual(@as(usize, 1), cs.len);
+    // Every XML-special survives escape-on-write + decode-on-read.
+    try std.testing.expectEqualStrings("R&D <Lead>", cs[0].author);
+    try std.testing.expectEqualStrings("review <this> & \"that\" quickly", cs[0].text);
+}
+
+test "writer.addComment: multi-sheet with comments keeps per-sheet rels independent" {
+    const tmp_path = "/tmp/zlsx_comments_multi_sheet.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s1 = try w.addSheet("S1");
+        try s1.addComment("A1", "Alice", "on S1");
+        try s1.writeRow(&.{.{ .string = "x" }});
+        // S2 has NO comments — its rels file must stay absent and the
+        // sheet XML must not carry `<legacyDrawing>`.
+        var s2 = try w.addSheet("S2");
+        try s2.writeRow(&.{.{ .string = "y" }});
+        // S3 has its own comments — both its rels and its commentsN.xml
+        // must be emitted with the correct N suffix.
+        var s3 = try w.addSheet("S3");
+        try s3.addComment("B2", "Bob", "on S3");
+        try s3.addComment("C3", "Carol", "also on S3");
+        try s3.writeRow(&.{.{ .string = "z" }});
+        try w.save(tmp_path);
+    }
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), book.comments(book.sheets[0]).len);
+    try std.testing.expectEqual(@as(usize, 0), book.comments(book.sheets[1]).len);
+    try std.testing.expectEqual(@as(usize, 2), book.comments(book.sheets[2]).len);
+
+    // Cross-check: sheet 2's "on S1" comment doesn't leak into S3.
+    const s3 = book.comments(book.sheets[2]);
+    try std.testing.expectEqualStrings("Bob", s3[0].author);
+    try std.testing.expectEqualStrings("on S3", s3[0].text);
+    try std.testing.expectEqualStrings("Carol", s3[1].author);
+}
+
+test "writer.addComment: 50 comments in one sheet stress-test authors + rels" {
+    const tmp_path = "/tmp/zlsx_comments_stress.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("S");
+        var ref_buf: [8]u8 = undefined;
+        for (0..50) |i| {
+            // Refs march down column A: A1, A2, …, A50.
+            const ref = try std.fmt.bufPrint(&ref_buf, "A{d}", .{i + 1});
+            // Two alternating authors to exercise the dedup table.
+            const author = if (i % 2 == 0) "Alice" else "Bob";
+            var text_buf: [32]u8 = undefined;
+            const text = try std.fmt.bufPrint(&text_buf, "note #{d}", .{i});
+            try sheet.addComment(ref, author, text);
+        }
+        try sheet.writeRow(&.{.{ .string = "hdr" }});
+        try w.save(tmp_path);
+    }
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+    const cs = book.comments(book.sheets[0]);
+    try std.testing.expectEqual(@as(usize, 50), cs.len);
+    // Spot-check the first, middle, and last — all must round-trip
+    // through the same authors-table indirection without drift.
+    try std.testing.expectEqualStrings("Alice", cs[0].author);
+    try std.testing.expectEqualStrings("note #0", cs[0].text);
+    try std.testing.expectEqualStrings("Bob", cs[25].author);
+    try std.testing.expectEqualStrings("note #25", cs[25].text);
+    try std.testing.expectEqualStrings("Bob", cs[49].author);
+    try std.testing.expectEqualStrings("note #49", cs[49].text);
+}
+
 test "writer.writeRichRow: emits rich-text SST entries readable by Book.richRuns" {
     const tmp_path = "/tmp/zlsx_writer_rich_roundtrip.xlsx";
     defer std.fs.cwd().deleteFile(tmp_path) catch {};
@@ -3502,6 +3598,42 @@ test "fuzz parseCommentsForSheet" {
         };
 
         parseCommentsForSheet(&book, sheet_path) catch {};
+    }
+}
+
+test "fuzz writer.addComment: adversarial author + text never crash emission" {
+    // Writer-side fuzz: random bytes fed into addComment (ref, author,
+    // text). The ref path is the interesting one — a bad ref returns
+    // InvalidCommentRef before the author/text ever reach the emit
+    // buffers. A pass ref with adversarial author/text must still
+    // emit valid XML (entity-escaped) so save() completes without
+    // a panic.
+    const iters = fuzzIterations();
+    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    const rng = prng.random();
+    var buf: [fuzz_max_input_len]u8 = undefined;
+
+    const writer = @import("writer.zig");
+    const tmp_path = "/tmp/zlsx_fuzz_addcomment.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    for (0..iters) |_| {
+        const input = randomInput(rng, &buf);
+        // Split the random bytes into ref / author / text slices.
+        const third = input.len / 3;
+        const ref = input[0..third];
+        const author = input[third .. 2 * third];
+        const text = input[2 * third ..];
+
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = w.addSheet("S") catch continue;
+        // Most refs will be rejected at validate time; when they pass
+        // (e.g. random bytes happen to spell "A1"), the emit path
+        // must tolerate any author/text content.
+        _ = sheet.addComment(ref, author, text) catch {};
+        sheet.writeRow(&.{.{ .string = "x" }}) catch continue;
+        w.save(tmp_path) catch {};
     }
 }
 
