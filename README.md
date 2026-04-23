@@ -106,7 +106,7 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 ² `xlsx.fromExcelSerial(cell.number) -> ?DateTime`; out-of-range serials (1900 leap-bug window) return `null`.
 ³ `Book.richRuns(sst_idx)` surfaces per-`<r>` bold / italic + ARGB color / size / font name. Theme colors (`<color theme="…"/>`) aren't resolved — only explicit `<color rgb="AARRGGBB"/>` populates `color_argb`.
 ⁴ Combine `Rows.styleIndices()` with `Book.isDateFormat(style_idx)` + `xlsx.fromExcelSerial(cell.number)` — the reader parses `xl/styles.xml` and exposes numFmt codes so callers can detect date cells without guessing. No auto-conversion on the `Cell` enum yet (that's a follow-up — callers drive the conversion).
-⁵ `Book.cellFont(style_idx)` surfaces bold / italic / ARGB color / size / font name from `<fonts>` + `<cellXfs>`. Fills and borders are the next slice (not yet parsed — returning `~` until they land).
+⁵ `Book.cellFont(style_idx)` surfaces bold / italic / ARGB color / size / font name; `Book.cellFill(style_idx)` surfaces `patternType` + fg / bg ARGB. Borders are the next slice (not yet parsed — returning `~` until they land). Theme / indexed colors aren't resolved; only explicit `rgb="AARRGGBB"` populates the ARGB fields.
 
 ### Writer capability
 

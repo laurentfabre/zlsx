@@ -874,6 +874,45 @@ def test_book_cell_font_round_trip(tmp_path):
         assert book.cell_font(99999) is None
 
 
+def test_book_cell_fill_round_trip(tmp_path):
+    """Writer emits a red solid fill; reader resolves via
+    `Book.cell_fill(style_idx)`. Style 0 resolves to the writer's
+    default fill (patternType="none")."""
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_CELL_FILL:
+        pytest.skip("loaded libzlsx predates cell_fill ABI (0.2.6+)")
+
+    out = tmp_path / "fill.xlsx"
+    with zlsx.write(out) as w:
+        red = w.add_style(zlsx.Style(
+            fill_pattern="solid",
+            fill_fg_argb=0xFFFF0000,
+        ))
+        sheet = w.add_sheet("S")
+        sheet.write_row(["red", "plain"], styles=[red, 0])
+
+    with zlsx.open(out) as book:
+        with book.sheet(0).rows() as rows:
+            next(rows)
+            styles = rows.style_indices()
+            s0, s1 = styles
+
+            f0 = book.cell_fill(s0)
+            assert f0 is not None
+            assert f0.pattern == "solid"
+            assert f0.fg_color_argb == 0xFFFF0000
+
+            # Default writer style resolves to patternType="none".
+            if s1 is not None:
+                f1 = book.cell_fill(s1)
+                assert f1 is not None
+                assert f1.pattern == "none"
+                assert f1.fg_color_argb is None
+
+        assert book.cell_fill(99999) is None
+
+
 def test_writer_add_data_validation_rejects_invalid_inputs(tmp_path):
     """Exercise every error path on the extended writer DV APIs so the
     rejection behaviour from the Zig writer surfaces cleanly."""

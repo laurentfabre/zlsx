@@ -50,6 +50,7 @@ __all__ = [
     "DataValidation",
     "RichRun",
     "Font",
+    "Fill",
     "ZlsxError",
 ]
 
@@ -338,6 +339,18 @@ class Font:
     color_argb: int | None = None
     size: float | None = None
     name: str = ""
+
+
+@dataclass(frozen=True)
+class Fill:
+    """Cell-level fill properties resolved via ``Book.cell_fill(style_idx)``.
+    ``pattern`` is the OOXML patternType attribute (``"none"``,
+    ``"solid"``, ``"darkDown"``, …). ``fg_color_argb`` /
+    ``bg_color_argb`` are ``None`` when the source used a theme or
+    indexed color (not resolved today)."""
+    pattern: str = "none"
+    fg_color_argb: int | None = None
+    bg_color_argb: int | None = None
 
 
 # ─── Book ─────────────────────────────────────────────────────────────
@@ -637,6 +650,34 @@ class Book:
             color_argb=int(cf.color_argb) if cf.has_color else None,
             size=float(cf.size) if cf.has_size else None,
             name=name,
+        )
+
+    def cell_fill(self, style_idx: int) -> Fill | None:
+        """Resolve a cell's style index to its :class:`Fill`
+        (pattern + fg/bg ARGB). Returns ``None`` on out-of-range
+        indices or workbooks without ``xl/styles.xml``. An all-defaults
+        fill (``pattern="none"``, no colors) is still a non-None
+        return. Requires libzlsx 0.2.6+."""
+        if not self._handle:
+            raise ZlsxError("book is closed")
+        if not _ffi._HAS_CELL_FILL:
+            raise RuntimeError(
+                "loaded libzlsx does not expose cell_fill "
+                "(requires 0.2.6+); upgrade libzlsx"
+            )
+        cf = _ffi.CCellFill()
+        rc = _ffi.lib.zlsx_cell_fill(self._handle, style_idx, ctypes.byref(cf))
+        if rc != 0:
+            return None
+        pattern = "none"
+        if cf.pattern_len > 0:
+            pattern = ctypes.string_at(cf.pattern_ptr, cf.pattern_len).decode(
+                "utf-8", errors="replace"
+            )
+        return Fill(
+            pattern=pattern,
+            fg_color_argb=int(cf.fg_color_argb) if cf.has_fg else None,
+            bg_color_argb=int(cf.bg_color_argb) if cf.has_bg else None,
         )
 
     def is_date_format(self, style_idx: int) -> bool:

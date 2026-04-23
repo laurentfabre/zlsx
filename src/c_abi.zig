@@ -787,6 +787,40 @@ export fn zlsx_cell_font(book: *Book, style_idx: u32, out: *CFont) callconv(.c) 
     return 0;
 }
 
+/// Per-cell fill. `pattern_ptr` / `pattern_len` hold the OOXML
+/// `patternType` attribute (e.g. "none", "solid", "darkDown"). The
+/// `has_fg` / `has_bg` flags signal whether the ARGB fields are
+/// populated; theme / indexed colors leave them at 0 and
+/// `has_*` = 0.
+pub const CFill = extern struct {
+    has_fg: u8,
+    has_bg: u8,
+    _pad: [2]u8,
+    fg_color_argb: u32,
+    bg_color_argb: u32,
+    pattern_len: usize,
+    pattern_ptr: [*]const u8,
+};
+
+/// Resolve a style index to its fill. Returns 0 on success, -1 on
+/// out-of-range indices or missing styles.xml. An all-defaults fill
+/// (pattern="none", no colors) is a valid success return — absence
+/// of a `<patternFill>` child means "no fill", not "no data".
+export fn zlsx_cell_fill(book: *Book, style_idx: u32, out: *CFill) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    const f = state.inner.cellFill(style_idx) orelse return -1;
+    out.* = .{
+        .has_fg = if (f.fg_color_argb != null) 1 else 0,
+        .has_bg = if (f.bg_color_argb != null) 1 else 0,
+        ._pad = .{ 0, 0 },
+        .fg_color_argb = f.fg_color_argb orelse 0,
+        .bg_color_argb = f.bg_color_argb orelse 0,
+        .pattern_len = f.pattern.len,
+        .pattern_ptr = if (f.pattern.len == 0) @ptrCast("") else f.pattern.ptr,
+    };
+    return 0;
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────
 
 test "abi version" {

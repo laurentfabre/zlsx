@@ -594,6 +594,28 @@ if _HAS_CELL_FONT:
     lib.zlsx_cell_font.restype = ctypes.c_int32
 
 
+class CCellFill(ctypes.Structure):
+    _fields_ = [
+        ("has_fg", ctypes.c_uint8),
+        ("has_bg", ctypes.c_uint8),
+        ("_pad", ctypes.c_uint8 * 2),
+        ("fg_color_argb", ctypes.c_uint32),
+        ("bg_color_argb", ctypes.c_uint32),
+        ("pattern_len", ctypes.c_size_t),
+        ("pattern_ptr", ctypes.POINTER(ctypes.c_ubyte)),
+    ]
+
+
+_HAS_CELL_FILL = hasattr(lib, "zlsx_cell_fill")
+if _HAS_CELL_FILL:
+    lib.zlsx_cell_fill.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.POINTER(CCellFill),
+    ]
+    lib.zlsx_cell_fill.restype = ctypes.c_int32
+
+
 _HAS_STYLES_EX = hasattr(lib, "zlsx_writer_add_style_ex")
 if _HAS_STYLES_EX:
     lib.zlsx_writer_add_style_ex.argtypes = [

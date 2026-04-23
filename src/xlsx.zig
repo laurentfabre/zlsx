@@ -241,6 +241,17 @@ pub const RichRun = struct {
     font_name: []const u8 = "",
 };
 
+/// Cell fill, parsed from `xl/styles.xml` `<fills>`. `pattern` is the
+/// OOXML `patternType` attribute (e.g. "none", "solid", "darkDown",
+/// "gray125"); borrows from `styles_xml`. `fg_color_argb` / `bg_color_argb`
+/// track `<fgColor rgb="…"/>` / `<bgColor rgb="…"/>` — theme and
+/// indexed colors aren't resolved (null).
+pub const Fill = struct {
+    pattern: []const u8 = "none",
+    fg_color_argb: ?u32 = null,
+    bg_color_argb: ?u32 = null,
+};
+
 /// Font properties for a cell, parsed from `xl/styles.xml` `<fonts>`.
 /// Shared with `RichRun` semantically but kept as a distinct type so
 /// callers don't have to populate a meaningless `text` field. Theme
@@ -330,6 +341,12 @@ pub const Book = struct {
     /// `cell_xf_numfmt_ids`. Use `Book.cellFont(style_idx)` for the
     /// resolved lookup.
     cell_xf_font_ids: []u32 = &.{},
+    /// `fills` table from styles.xml — index matches `fillId`. Values
+    /// borrow from `styles_xml` for `pattern` slices.
+    fills: []Fill = &.{},
+    /// One fillId per `<xf>` under `<cellXfs>`. Use
+    /// `Book.cellFill(style_idx)` for the resolved lookup.
+    cell_xf_fill_ids: []u32 = &.{},
     /// Owned backing storage for every string referenced by `sheets`,
     /// sheet_data keys, and entity-decoded shared strings.
     strings: std.ArrayListUnmanaged([]u8) = .{},
@@ -506,6 +523,19 @@ pub const Book = struct {
         return self.fonts[font_id];
     }
 
+    /// Fill properties for a cell, resolved via the style index.
+    /// Returns null when the workbook has no styles.xml, the index is
+    /// out of range, or the referenced fillId doesn't resolve. Unlike
+    /// `cellFont` the common case returns a Fill with `pattern="none"`
+    /// — absence of any `<patternFill>` colors is valid and means
+    /// "no fill" rather than "malformed".
+    pub fn cellFill(self: *const Book, style_idx: u32) ?Fill {
+        if (style_idx >= self.cell_xf_fill_ids.len) return null;
+        const fill_id = self.cell_xf_fill_ids[style_idx];
+        if (fill_id >= self.fills.len) return null;
+        return self.fills[fill_id];
+    }
+
     pub fn deinit(self: *Book) void {
         const a = self.allocator;
         if (self.shared_strings_xml) |s| a.free(s);
@@ -539,7 +569,9 @@ pub const Book = struct {
         // the xfIds slice + hashmap spine are owned here.
         a.free(self.cell_xf_numfmt_ids);
         a.free(self.cell_xf_font_ids);
+        a.free(self.cell_xf_fill_ids);
         a.free(self.fonts);
+        a.free(self.fills);
         self.custom_num_fmts.deinit(a);
         if (self.styles_xml) |s| a.free(s);
 
@@ -1520,6 +1552,40 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
         book.fonts = try fonts_list.toOwnedSlice(book.allocator);
     }
 
+    // fills — optional. Shape:
+    //   <fills count="N">
+    //     <fill><patternFill patternType="none"/></fill>
+    //     <fill><patternFill patternType="solid"><fgColor rgb="FFFF0000"/><bgColor indexed="64"/></patternFill></fill>
+    //   </fills>
+    if (std.mem.indexOf(u8, xml, "<fills")) |fp| {
+        const fp_end = std.mem.indexOfPos(u8, xml, fp, "</fills>") orelse xml.len;
+        const block = xml[fp..fp_end];
+        var fills_list: std.ArrayListUnmanaged(Fill) = .{};
+        errdefer fills_list.deinit(book.allocator);
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, block, i, "<fill")) |fill_pos| {
+            if (fill_pos + 5 < block.len) {
+                const after = block[fill_pos + 5];
+                if (after != '>' and after != ' ' and after != '/') {
+                    // `<fills ...>` — outer wrapper, skip the tag.
+                    i = fill_pos + 5;
+                    continue;
+                }
+            }
+            const gt = std.mem.indexOfScalarPos(u8, block, fill_pos, '>') orelse break;
+            if (gt > 0 and block[gt - 1] == '/') {
+                try fills_list.append(book.allocator, .{});
+                i = gt + 1;
+                continue;
+            }
+            const fill_close = std.mem.indexOfPos(u8, block, gt, "</fill>") orelse break;
+            const body = block[gt + 1 .. fill_close];
+            try fills_list.append(book.allocator, parseFillBody(body));
+            i = fill_close + "</fill>".len;
+        }
+        book.fills = try fills_list.toOwnedSlice(book.allocator);
+    }
+
     // numFmts — optional. Shape: `<numFmts count="…"><numFmt numFmtId="164" formatCode="…"/>…</numFmts>`.
     if (std.mem.indexOf(u8, xml, "<numFmts")) |nfs_pos| {
         const nfs_end = std.mem.indexOfPos(u8, xml, nfs_pos, "</numFmts>") orelse xml.len;
@@ -1552,6 +1618,8 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
     errdefer ids.deinit(book.allocator);
     var font_ids: std.ArrayListUnmanaged(u32) = .{};
     errdefer font_ids.deinit(book.allocator);
+    var fill_ids: std.ArrayListUnmanaged(u32) = .{};
+    errdefer fill_ids.deinit(book.allocator);
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, xfs_block, i, "<xf ")) |xp| {
         const gt = std.mem.indexOfScalarPos(u8, xfs_block, xp, '>') orelse break;
@@ -1559,9 +1627,57 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
         i = gt + 1;
         try ids.append(book.allocator, parseXfAttrU32(attrs, "numFmtId=\"", 0));
         try font_ids.append(book.allocator, parseXfAttrU32(attrs, "fontId=\"", 0));
+        try fill_ids.append(book.allocator, parseXfAttrU32(attrs, "fillId=\"", 0));
     }
     book.cell_xf_numfmt_ids = try ids.toOwnedSlice(book.allocator);
     book.cell_xf_font_ids = try font_ids.toOwnedSlice(book.allocator);
+    book.cell_xf_fill_ids = try fill_ids.toOwnedSlice(book.allocator);
+}
+
+/// Parse a `<fill>` body slice (everything between `<fill>` and
+/// `</fill>`). Handles the common shape `<patternFill patternType="…">
+/// <fgColor rgb="…"/><bgColor rgb="…"/></patternFill>` plus the
+/// no-op `<patternFill patternType="none"/>` variant. Unresolved
+/// theme / indexed colors leave `*_color_argb` null.
+fn parseFillBody(body: []const u8) Fill {
+    var out: Fill = .{};
+    // patternType on <patternFill>.
+    const pt_key = "patternType=\"";
+    if (std.mem.indexOf(u8, body, pt_key)) |pp| {
+        const s = pp + pt_key.len;
+        if (std.mem.indexOfScalarPos(u8, body, s, '"')) |e| {
+            out.pattern = body[s..e];
+        }
+    }
+    // <fgColor rgb="AARRGGBB"/>
+    if (std.mem.indexOf(u8, body, "<fgColor")) |fp| {
+        const gt = std.mem.indexOfScalarPos(u8, body, fp, '>') orelse 0;
+        if (gt > fp) {
+            const tag = body[fp..gt];
+            const k = "rgb=\"";
+            if (std.mem.indexOf(u8, tag, k)) |kp| {
+                const s = kp + k.len;
+                if (std.mem.indexOfScalarPos(u8, tag, s, '"')) |e| {
+                    out.fg_color_argb = std.fmt.parseInt(u32, tag[s..e], 16) catch null;
+                }
+            }
+        }
+    }
+    // <bgColor rgb="AARRGGBB"/>
+    if (std.mem.indexOf(u8, body, "<bgColor")) |bp| {
+        const gt = std.mem.indexOfScalarPos(u8, body, bp, '>') orelse 0;
+        if (gt > bp) {
+            const tag = body[bp..gt];
+            const k = "rgb=\"";
+            if (std.mem.indexOf(u8, tag, k)) |kp| {
+                const s = kp + k.len;
+                if (std.mem.indexOfScalarPos(u8, tag, s, '"')) |e| {
+                    out.bg_color_argb = std.fmt.parseInt(u32, tag[s..e], 16) catch null;
+                }
+            }
+        }
+    }
+    return out;
 }
 
 /// Parse a `key="N"` u32 attribute from an `<xf>` attrs blob, defaulting
@@ -2371,6 +2487,46 @@ test "Book.cellFont: round-trips bold / color / size / name from xl/styles.xml" 
     // cellFont should still return non-null.
     const s2 = styles[2] orelse 0;
     try std.testing.expect(book.cellFont(s2) != null);
+}
+
+test "Book.cellFill: round-trip solid fg/bg and pattern 'none' default" {
+    const tmp_path = "/tmp/zlsx_reader_cell_fill.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        const red_fill = try w.addStyle(.{
+            .fill_pattern = .solid,
+            .fill_fg_argb = 0xFFFF0000,
+        });
+        var sheet = try w.addSheet("S");
+        try sheet.writeRowStyled(
+            &.{ .{ .string = "filled" }, .{ .string = "plain" } },
+            &.{ red_fill, 0 },
+        );
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    _ = try rows.next();
+    const styles = rows.styleIndices();
+
+    const s0 = styles[0] orelse return error.TestUnexpectedResult;
+    const f0 = book.cellFill(s0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("solid", f0.pattern);
+    try std.testing.expectEqual(@as(?u32, 0xFFFF0000), f0.fg_color_argb);
+
+    // Style 0 resolves to the writer's default fill (patternType="none").
+    const s1 = styles[1] orelse 0;
+    const f1 = book.cellFill(s1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("none", f1.pattern);
+    try std.testing.expectEqual(@as(?u32, null), f1.fg_color_argb);
 }
 
 test "Book.richRuns: color / size / font_name from <rPr>" {

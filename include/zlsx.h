@@ -419,6 +419,29 @@ int32_t zlsx_cell_font(zlsx_book_t *       book,
                        uint32_t            style_idx,
                        zlsx_cell_font_t *  out);
 
+/*
+ * Per-cell fill. `pattern_ptr` / `pattern_len` hold the OOXML
+ * patternType attribute ("none", "solid", "darkDown", …). The
+ * `has_fg` / `has_bg` flags indicate whether the ARGB fields are
+ * populated; theme / indexed colors leave them at 0. Pointer lifetime
+ * matches the Book.
+ */
+typedef struct {
+    uint8_t         has_fg;
+    uint8_t         has_bg;
+    uint8_t         _pad[2];
+    uint32_t        fg_color_argb;
+    uint32_t        bg_color_argb;
+    size_t          pattern_len;
+    const uint8_t * pattern_ptr;
+} zlsx_cell_fill_t;
+
+/* Resolve a style index to its fill. Returns 0 on success, -1 on
+ * out-of-range indices or workbooks without styles.xml. */
+int32_t zlsx_cell_fill(zlsx_book_t *       book,
+                       uint32_t            style_idx,
+                       zlsx_cell_fill_t *  out);
+
 /* ─── Writer (ABI v1, added in 0.2.2) ─────────────────────────────── */
 
 /*
