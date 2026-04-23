@@ -76,6 +76,81 @@ Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-ro
 - No load-modify-save round-trip yet — Phase 3c queued. For now the writer only produces fresh workbooks
 - No chart / pivot / image extraction or emission
 
+## Feature matrix
+
+How zlsx's current surface compares against the popular xlsx libraries. `✓` = first-class API; `helper` = exposed but caller-driven; `~` = partial / limited; `—` = not implemented; `?` = I'm not confident enough to claim one way or the other — PRs / corrections welcome.
+
+### Reader capability
+
+| Capability | **zlsx** | calamine-rust 0.26 | openpyxl 3.1 | python-calamine 0.6 |
+|---|---|---|---|---|
+| Shared strings (SST) | ✓ | ✓ | ✓ | ✓ |
+| Inline strings | ✓ | ✓ | ✓ | ✓ |
+| Rich-text runs concatenated | ✓ | ✓ | ✓ | ✓ |
+| Numeric / integer / float split | ✓ | ~¹ | ✓ | ~¹ |
+| Boolean / error cells | ✓ | ✓ | ✓ | ✓ |
+| Formula cached value | ✓ | ✓ | ✓ | ✓ |
+| Date as `DateTime` | helper² | ✓ | ✓ | ✓ |
+| XML entity decoding | ✓ | ✓ | ✓ | ✓ |
+| Merged cell ranges | ✓ | ✓ | ✓ | ✓ |
+| External-URL hyperlinks | ✓ | ? | ✓ | ? |
+| Data validations (list / dropdown) | ✓ | — | ✓ | — |
+| Data validations (number / date / custom) | — | — | ✓ | — |
+| Rich-text formatting preserved | — | ~ | ✓ | — |
+| Cell styles on read (bold / colour / fill) | — | — | ✓ | — |
+| Comments / notes | — | ? | ✓ | — |
+| Chart / image / pivot access | — | — | ~ | — |
+| Load-modify-save | — | — | ✓ | — |
+
+¹ Returns a single `Float` type for any non-text number — callers cast to integer if needed.
+² `xlsx.fromExcelSerial(cell.number) -> ?DateTime`; out-of-range serials (1900 leap-bug window) return `null`.
+
+### Writer capability
+
+| Capability | **zlsx** | xlsxwriter 3.2 | openpyxl 3.1 |
+|---|---|---|---|
+| Multi-sheet | ✓ | ✓ | ✓ |
+| SST-deduped strings | ✓ | ✓ | ✓ |
+| Integer / float / bool / empty | ✓ | ✓ | ✓ |
+| Font (bold, italic, size, name, colour) | ✓ | ✓ | ✓ |
+| Fills (19 OOXML patterns) | ✓ | ✓ | ✓ |
+| Borders (14 styles × 5 sides) | ✓ | ✓ | ✓ |
+| Horizontal alignment / wrap text | ✓ | ✓ | ✓ |
+| Custom number formats | ✓ | ✓ | ✓ |
+| Column widths | ✓ | ✓ | ✓ |
+| Row heights | — | ✓ | ✓ |
+| Freeze panes | ✓ | ✓ | ✓ |
+| Auto-filter | ✓ | ✓ | ✓ |
+| Merged cell ranges | ✓ | ✓ | ✓ |
+| External-URL hyperlinks | ✓ | ✓ | ✓ |
+| Internal (`#Sheet!A1`) hyperlinks | — | ✓ | ✓ |
+| Data validations (list) | ✓ | ✓ | ✓ |
+| Data validations (number / date / custom) | — | ✓ | ✓ |
+| Conditional formatting | — | ✓ | ✓ |
+| Cell comments / notes | — | ✓ | ✓ |
+| Formulas | — | ✓ | ✓ |
+| Rich-text runs per cell | — | ✓ | ✓ |
+| Images (PNG / JPEG embed) | — | ✓ | ~ |
+| Charts | — | ✓ | ~ |
+| Deflate compression | ✓ | ✓ | ✓ |
+| Load-modify-save | — | — | ✓ |
+| Sheet-name validation (length / reserved chars / duplicates) | ✓ | ~³ | ~ |
+
+³ xlsxwriter validates length and some chars but does not reject case-insensitive duplicates up front.
+
+### Language / packaging
+
+| Axis | **zlsx** | calamine-rust | openpyxl | xlsxwriter | python-calamine |
+|---|---|---|---|---|---|
+| Native language | Zig | Rust | Python | Python | Rust (via PyO3) |
+| First-class Zig API | ✓ | — | — | — | — |
+| C ABI + header | ✓ | — | — | — | — |
+| Python bindings | ✓ (`py-zlsx`, ctypes over C ABI) | — (use python-calamine) | ✓ (native) | ✓ (native) | ✓ (native) |
+| CLI | ✓ (read-side) | — | — | — | — |
+| Third-party runtime deps | 0 (stdlib only) | ~5 Rust crates | 0 Python deps | 0 Python deps | 0 Python deps |
+| Static-link-friendly binary | ✓ | ✓ | — | — | — |
+| License | MIT | MIT / Apache-2 | MIT | BSD-3 | MIT |
+
 ## Install
 
 ### CLI binary

@@ -61,6 +61,38 @@ On small files (≤30 KB) zlsx and calamine-rust are both in the 1.5-2.5 ms rang
 
 zlsx has the smallest footprint of the four. Both native binaries sit ~6-10× below the Python stack.
 
+## Why SST parsing dominates the reader
+
+OOXML stores string cells two ways:
+
+1. **Inline**: the text lives in the cell XML itself —
+   `<c t="inlineStr"><is><t>hello</t></is></c>`.
+2. **Shared**: the cell XML carries only an index into a
+   workbook-wide table at `xl/sharedStrings.xml` —
+   `<c t="s"><v>42</v></c>` → "look up entry 42 in the SST".
+
+Generators overwhelmingly prefer shared strings because duplicated
+values appear once in the archive, cell XML is much smaller (an
+integer instead of a verbose string wrapper), and the resulting
+redundancy compresses further. Every non-trivial xlsx file has a
+populated `xl/sharedStrings.xml`.
+
+The price: any reader has to parse that table before row iteration
+can resolve a `t="s"` cell — otherwise you get raw indices
+(`0`, `1`, `2`, …) instead of `"Red"`, `"Green"`, `"Blue"`. This
+isn't a zlsx design choice; it's a structural requirement of OOXML.
+
+Every other xlsx reader does the same work:
+
+- **calamine-rust** builds `Vec<String>` via quick-xml's SIMD tokeniser.
+- **openpyxl** SAX-walks with `xml.etree.ElementTree.iterparse`.
+- **python-calamine** delegates to calamine-rust via PyO3.
+- **Apache POI / ClosedXML / SheetJS** — same story, different languages.
+
+So the 3.4 ms (calamine) → 13.3 ms (zlsx) gap on `worldbank_catalog`
+isn't about *whether* we parse the SST; it's about *how fast* we
+can. Current zlsx bottleneck breakdown is in the next section.
+
 ## Where the remaining big-SST gap against calamine comes from
 
 Iterative allocator + parser optimisations cut the worldbank number from 16.2 → 13.4 → **13.3 ms** (the last figure reflects the current public-corpus measurement; an earlier run captured 11.8 ms on a cooler machine state):
