@@ -555,6 +555,39 @@ int32_t zlsx_sheet_writer_add_data_validation_list(
     uint8_t              * err_buf,
     size_t                 err_buf_len);
 
+/* Attach a numeric / date / time / text-length data validation to a
+ * cell or rectangular range. `range` is A1-style. `kind_code` must be
+ * one of ZLSX_DV_KIND_WHOLE / DECIMAL / DATE / TIME / TEXT_LENGTH
+ * (using LIST / CUSTOM / UNKNOWN returns InvalidDataValidation —
+ * those have dedicated entry points / aren't user-facing). `op_code`
+ * must be one of ZLSX_DV_OP_* (never ZLSX_DV_OP_NONE). Pass
+ * `formula2_ptr = NULL` with `formula2_len = 0` for single-formula
+ * operators; non-NULL is required for BETWEEN / NOT_BETWEEN. */
+int32_t zlsx_sheet_writer_add_data_validation_numeric(
+    zlsx_sheet_writer_t * sw,
+    const uint8_t       * range_ptr,
+    size_t                range_len,
+    uint32_t              kind_code,
+    uint32_t              op_code,
+    const uint8_t       * formula1_ptr,
+    size_t                formula1_len,
+    const uint8_t       * formula2_ptr,
+    size_t                formula2_len,
+    uint8_t             * err_buf,
+    size_t                err_buf_len);
+
+/* Attach a custom-formula data validation. Same error semantics as
+ * zlsx_sheet_writer_add_data_validation_numeric() minus the operator
+ * / formula2 (custom has neither). */
+int32_t zlsx_sheet_writer_add_data_validation_custom(
+    zlsx_sheet_writer_t * sw,
+    const uint8_t       * range_ptr,
+    size_t                range_len,
+    const uint8_t       * formula_ptr,
+    size_t                formula_len,
+    uint8_t             * err_buf,
+    size_t                err_buf_len);
+
 /* Attach an external-URL hyperlink to a cell or rectangular range.
  * `range` is A1-style (single cell "A1" or span "B2:C3"); `url` is
  * the external target (http/https/mailto/file/...). Returns 0 or

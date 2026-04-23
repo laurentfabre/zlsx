@@ -944,12 +944,160 @@ def _sheet_add_data_validation_list(
         )
 
 
+# Writer-side kind / op code tables mirror `ZLSX_DV_KIND_*` / `OP_*`.
+# Kept separate from the reader-side `_DV_KIND_FROM_CODE` dict to make
+# intent explicit (writer rejects list / unknown / custom codes here —
+# list has its own entry point, custom uses `_sheet_add_data_validation_custom`,
+# unknown is a forward-compat marker not a user-writeable kind).
+_DV_WRITER_KIND_CODES = {
+    "whole": 1,
+    "decimal": 2,
+    "date": 3,
+    "time": 4,
+    "text_length": 5,
+}
+_DV_WRITER_OP_CODES = {
+    "between": 0,
+    "not_between": 1,
+    "equal": 2,
+    "not_equal": 3,
+    "less_than": 4,
+    "less_than_or_equal": 5,
+    "greater_than": 6,
+    "greater_than_or_equal": 7,
+}
+
+
+def _sheet_add_data_validation_numeric(
+    self: "SheetWriter",
+    range_str: str,
+    kind: str,
+    op: str,
+    formula1: str,
+    formula2: str | None = None,
+) -> None:
+    """Attach a numeric / date / time / text-length data validation.
+
+    ``kind`` is one of ``"whole"``, ``"decimal"``, ``"date"``,
+    ``"time"``, ``"text_length"``. ``op`` is one of ``"between"``,
+    ``"not_between"``, ``"equal"``, ``"not_equal"``, ``"less_than"``,
+    ``"less_than_or_equal"``, ``"greater_than"``,
+    ``"greater_than_or_equal"``. ``formula2`` is required for
+    ``between`` / ``not_between`` and must be ``None`` for the others
+    (the C side rejects mismatches with ``InvalidDataValidation``).
+
+    Raises :class:`ZlsxError` on invalid range / formula /
+    two-formula mismatch, :class:`ValueError` on unknown kind / op."""
+    self._require_handle()
+    if not _ffi._HAS_DATA_VALIDATION_EXT:
+        raise RuntimeError(
+            "loaded libzlsx does not expose add_data_validation_numeric "
+            "(requires 0.2.6+); upgrade libzlsx"
+        )
+    kind_code = _DV_WRITER_KIND_CODES.get(kind)
+    if kind_code is None:
+        raise ValueError(
+            f"unknown data validation kind {kind!r}; expected one of "
+            f"{sorted(_DV_WRITER_KIND_CODES)}"
+        )
+    op_code = _DV_WRITER_OP_CODES.get(op)
+    if op_code is None:
+        raise ValueError(
+            f"unknown data validation operator {op!r}; expected one of "
+            f"{sorted(_DV_WRITER_OP_CODES)}"
+        )
+
+    range_raw = range_str.encode("utf-8")
+    range_buf = (ctypes.c_ubyte * max(len(range_raw), 1)).from_buffer_copy(
+        range_raw or b"\x00"
+    )
+    ptr_t = ctypes.POINTER(ctypes.c_ubyte)
+
+    f1_raw = formula1.encode("utf-8")
+    f1_buf = (ctypes.c_ubyte * max(len(f1_raw), 1)).from_buffer_copy(
+        f1_raw or b"\x00"
+    )
+
+    if formula2 is None:
+        f2_ptr = ptr_t()  # NULL
+        f2_len = 0
+        f2_buf = None
+    else:
+        f2_raw = formula2.encode("utf-8")
+        f2_buf = (ctypes.c_ubyte * max(len(f2_raw), 1)).from_buffer_copy(
+            f2_raw or b"\x00"
+        )
+        f2_ptr = ctypes.cast(f2_buf, ptr_t)
+        f2_len = len(f2_raw)
+
+    rc = _ffi.lib.zlsx_sheet_writer_add_data_validation_numeric(
+        self._handle,
+        ctypes.cast(range_buf, ptr_t),
+        len(range_raw),
+        kind_code,
+        op_code,
+        ctypes.cast(f1_buf, ptr_t),
+        len(f1_raw),
+        f2_ptr,
+        f2_len,
+        self._err,
+        _ERR_BUF_LEN,
+    )
+    del range_buf, f1_buf, f2_buf
+    if rc != 0:
+        raise ZlsxError(
+            f"zlsx_sheet_writer_add_data_validation_numeric: {_decode_err(self._err)}"
+        )
+
+
+def _sheet_add_data_validation_custom(
+    self: "SheetWriter",
+    range_str: str,
+    formula: str,
+) -> None:
+    """Attach a custom-formula data validation. ``formula`` is any
+    Excel-parseable boolean expression — referenced cells get xml-
+    escaped on emit. Empty formula raises :class:`ZlsxError`
+    (``InvalidDataValidation``)."""
+    self._require_handle()
+    if not _ffi._HAS_DATA_VALIDATION_EXT:
+        raise RuntimeError(
+            "loaded libzlsx does not expose add_data_validation_custom "
+            "(requires 0.2.6+); upgrade libzlsx"
+        )
+    range_raw = range_str.encode("utf-8")
+    range_buf = (ctypes.c_ubyte * max(len(range_raw), 1)).from_buffer_copy(
+        range_raw or b"\x00"
+    )
+    formula_raw = formula.encode("utf-8")
+    formula_buf = (ctypes.c_ubyte * max(len(formula_raw), 1)).from_buffer_copy(
+        formula_raw or b"\x00"
+    )
+    ptr_t = ctypes.POINTER(ctypes.c_ubyte)
+    rc = _ffi.lib.zlsx_sheet_writer_add_data_validation_custom(
+        self._handle,
+        ctypes.cast(range_buf, ptr_t),
+        len(range_raw),
+        ctypes.cast(formula_buf, ptr_t),
+        len(formula_raw),
+        self._err,
+        _ERR_BUF_LEN,
+    )
+    del range_buf, formula_buf
+    if rc != 0:
+        raise ZlsxError(
+            f"zlsx_sheet_writer_add_data_validation_custom: {_decode_err(self._err)}"
+        )
+
+
 SheetWriter.set_column_width = _sheet_set_column_width   # type: ignore[attr-defined]
 SheetWriter.freeze_panes = _sheet_freeze_panes           # type: ignore[attr-defined]
 SheetWriter.set_auto_filter = _sheet_set_auto_filter     # type: ignore[attr-defined]
 SheetWriter.add_merged_cell = _sheet_add_merged_cell     # type: ignore[attr-defined]
 SheetWriter.add_hyperlink = _sheet_add_hyperlink         # type: ignore[attr-defined]
 SheetWriter.add_data_validation_list = _sheet_add_data_validation_list  # type: ignore[attr-defined]
+SheetWriter.add_data_validation_numeric = _sheet_add_data_validation_numeric  # type: ignore[attr-defined]
+SheetWriter.add_data_validation_custom = _sheet_add_data_validation_custom  # type: ignore[attr-defined]
 
 
 class Writer:

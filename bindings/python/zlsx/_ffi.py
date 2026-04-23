@@ -329,6 +329,37 @@ if _HAS_DATA_VALIDATION:
     ]
     lib.zlsx_sheet_writer_add_data_validation_list.restype = ctypes.c_int32
 
+# Extended writer DV (numeric / custom) added in 0.2.6+.
+_HAS_DATA_VALIDATION_EXT = (
+    hasattr(lib, "zlsx_sheet_writer_add_data_validation_numeric")
+    and hasattr(lib, "zlsx_sheet_writer_add_data_validation_custom")
+)
+if _HAS_DATA_VALIDATION_EXT:
+    lib.zlsx_sheet_writer_add_data_validation_numeric.argtypes = [
+        sheet_writer_handle,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_add_data_validation_numeric.restype = ctypes.c_int32
+    lib.zlsx_sheet_writer_add_data_validation_custom.argtypes = [
+        sheet_writer_handle,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_add_data_validation_custom.restype = ctypes.c_int32
+
 # Hyperlink authoring — same import-time feature-probe pattern.
 _HAS_HYPERLINK = hasattr(lib, "zlsx_sheet_writer_add_hyperlink")
 if _HAS_HYPERLINK:

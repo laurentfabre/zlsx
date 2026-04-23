@@ -1276,6 +1276,95 @@ export fn zlsx_sheet_writer_add_data_validation_list(
     return 0;
 }
 
+/// Attach a numeric / date / time / text-length data validation to a
+/// cell or rectangular range. `range` is A1-style; `kind_code` is one
+/// of `ZLSX_DV_KIND_WHOLE / DECIMAL / DATE / TIME / TEXT_LENGTH`;
+/// `op_code` is one of `ZLSX_DV_OP_*` (not `NONE` — numeric
+/// validations always have an operator). `formula1` and `formula2`
+/// are the comparison arguments. `formula2_ptr` may be NULL with
+/// `formula2_len = 0` for single-formula operators (pass non-NULL for
+/// `between` / `not_between`). Returns 0 on success, -1 with err set
+/// to "InvalidHyperlinkRange" on malformed range or
+/// "InvalidDataValidation" on empty formula / two-formula mismatch.
+export fn zlsx_sheet_writer_add_data_validation_numeric(
+    sw: *SheetWriter,
+    range_ptr: [*]const u8,
+    range_len: usize,
+    kind_code: u32,
+    op_code: u32,
+    formula1_ptr: [*]const u8,
+    formula1_len: usize,
+    formula2_ptr: ?[*]const u8,
+    formula2_len: usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+    const range = range_ptr[0..range_len];
+    const kind = dvKindFromCode(kind_code) orelse {
+        writeError(err_buf, err_buf_len, @errorName(error.InvalidDataValidation));
+        return -1;
+    };
+    const op = dvOpFromCode(op_code) orelse {
+        writeError(err_buf, err_buf_len, @errorName(error.InvalidDataValidation));
+        return -1;
+    };
+    const f1 = formula1_ptr[0..formula1_len];
+    const f2: ?[]const u8 = if (formula2_ptr) |p| p[0..formula2_len] else null;
+    sw_state.inner.addDataValidationNumeric(range, kind, op, f1, f2) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
+/// Attach a custom-formula data validation to a cell or range. Same
+/// error semantics as `zlsx_sheet_writer_add_data_validation_numeric`
+/// minus the operator / formula2 (custom has neither).
+export fn zlsx_sheet_writer_add_data_validation_custom(
+    sw: *SheetWriter,
+    range_ptr: [*]const u8,
+    range_len: usize,
+    formula_ptr: [*]const u8,
+    formula_len: usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+    const range = range_ptr[0..range_len];
+    const formula = formula_ptr[0..formula_len];
+    sw_state.inner.addDataValidationCustom(range, formula) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
+fn dvKindFromCode(code: u32) ?writer_mod.DataValidationNumericKind {
+    return switch (code) {
+        ZLSX_DV_KIND_WHOLE => .whole,
+        ZLSX_DV_KIND_DECIMAL => .decimal,
+        ZLSX_DV_KIND_DATE => .date,
+        ZLSX_DV_KIND_TIME => .time,
+        ZLSX_DV_KIND_TEXT_LENGTH => .text_length,
+        else => null,
+    };
+}
+
+fn dvOpFromCode(code: u32) ?writer_mod.DataValidationOp {
+    return switch (code) {
+        ZLSX_DV_OP_BETWEEN => .between,
+        ZLSX_DV_OP_NOT_BETWEEN => .not_between,
+        ZLSX_DV_OP_EQUAL => .equal,
+        ZLSX_DV_OP_NOT_EQUAL => .not_equal,
+        ZLSX_DV_OP_LESS_THAN => .less_than,
+        ZLSX_DV_OP_LESS_THAN_OR_EQUAL => .less_than_or_equal,
+        ZLSX_DV_OP_GREATER_THAN => .greater_than,
+        ZLSX_DV_OP_GREATER_THAN_OR_EQUAL => .greater_than_or_equal,
+        else => null,
+    };
+}
+
 /// Attach an external-URL hyperlink to a cell or rectangular range.
 /// `range` is A1-style (single cell "A1" or span "B2:C3"); `url` is
 /// the external target (http/https/mailto/file/...). The writer
@@ -1406,6 +1495,158 @@ test "reader C ABI: data_validation getters round-trip" {
 
     try std.testing.expectEqual(@as(i32, -1), zlsx_data_validation_at(book.?, 0, 3, &dv));
     try std.testing.expectEqual(@as(i32, -1), zlsx_data_validation_at(book.?, 99, 0, &dv));
+}
+
+test "writer C ABI: add_data_validation_numeric + custom round-trip via reader" {
+    const tmp_path = "/tmp/zlsx_c_abi_writer_dv_ext.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var err_buf: [128]u8 = undefined;
+    const w = zlsx_writer_create(&err_buf, err_buf.len);
+    try std.testing.expect(w != null);
+    defer zlsx_writer_close(w);
+
+    const name = "Num";
+    const sw = zlsx_writer_add_sheet(w.?, name.ptr, name.len, &err_buf, err_buf.len);
+    try std.testing.expect(sw != null);
+
+    // whole between 1..100 — two-formula path.
+    const r1 = "B2:B10";
+    const f1a = "1";
+    const f1b = "100";
+    try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_add_data_validation_numeric(
+        sw.?,
+        r1.ptr,
+        r1.len,
+        ZLSX_DV_KIND_WHOLE,
+        ZLSX_DV_OP_BETWEEN,
+        f1a.ptr,
+        f1a.len,
+        f1b.ptr,
+        f1b.len,
+        &err_buf,
+        err_buf.len,
+    ));
+
+    // decimal greater_than 0 — single-formula path, NULL formula2.
+    const r2 = "C3";
+    const f2 = "0";
+    try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_add_data_validation_numeric(
+        sw.?,
+        r2.ptr,
+        r2.len,
+        ZLSX_DV_KIND_DECIMAL,
+        ZLSX_DV_OP_GREATER_THAN,
+        f2.ptr,
+        f2.len,
+        null,
+        0,
+        &err_buf,
+        err_buf.len,
+    ));
+
+    // custom — no op, no formula2. XML-special `<` must round-trip.
+    const r3 = "D4";
+    const cf = "AND(D4>0,D4<LEN(A1))";
+    try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_add_data_validation_custom(
+        sw.?,
+        r3.ptr,
+        r3.len,
+        cf.ptr,
+        cf.len,
+        &err_buf,
+        err_buf.len,
+    ));
+
+    // Rejection paths: bad range, bad kind code, two-formula mismatch.
+    try std.testing.expectEqual(@as(i32, -1), zlsx_sheet_writer_add_data_validation_numeric(
+        sw.?,
+        "",
+        0,
+        ZLSX_DV_KIND_WHOLE,
+        ZLSX_DV_OP_EQUAL,
+        f2.ptr,
+        f2.len,
+        null,
+        0,
+        &err_buf,
+        err_buf.len,
+    ));
+    try std.testing.expectEqual(@as(i32, -1), zlsx_sheet_writer_add_data_validation_numeric(
+        sw.?,
+        "A1",
+        2,
+        0xDEAD,
+        ZLSX_DV_OP_EQUAL,
+        f2.ptr,
+        f2.len,
+        null,
+        0,
+        &err_buf,
+        err_buf.len,
+    ));
+    // equal with two formulas is an InvalidDataValidation.
+    try std.testing.expectEqual(@as(i32, -1), zlsx_sheet_writer_add_data_validation_numeric(
+        sw.?,
+        "A1",
+        2,
+        ZLSX_DV_KIND_WHOLE,
+        ZLSX_DV_OP_EQUAL,
+        f1a.ptr,
+        f1a.len,
+        f1b.ptr,
+        f1b.len,
+        &err_buf,
+        err_buf.len,
+    ));
+    try std.testing.expectEqual(@as(i32, -1), zlsx_sheet_writer_add_data_validation_custom(
+        sw.?,
+        "A1",
+        2,
+        "",
+        0,
+        &err_buf,
+        err_buf.len,
+    ));
+
+    // Need at least one row so the writer emits the sheet.
+    const hdr = "hdr";
+    const row = [_]CCell{
+        .{ .tag = @intFromEnum(CellTag.string), .str_len = hdr.len, .str_ptr = hdr.ptr, .i = 0, .f = 0, .b = 0, ._pad = [_]u8{0} ** 7 },
+    };
+    try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_write_row(sw.?, &row, row.len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w.?, tmp_path, tmp_path.len, &err_buf, err_buf.len));
+
+    // Read it back and verify every field via the reader C ABI.
+    const book = zlsx_book_open(tmp_path.ptr, &err_buf, err_buf.len);
+    try std.testing.expect(book != null);
+    defer zlsx_book_close(book);
+
+    try std.testing.expectEqual(@as(usize, 3), zlsx_data_validation_count(book.?, 0));
+
+    // dv 0: whole between 1..100
+    try std.testing.expectEqual(ZLSX_DV_KIND_WHOLE, zlsx_data_validation_kind(book.?, 0, 0));
+    try std.testing.expectEqual(ZLSX_DV_OP_BETWEEN, zlsx_data_validation_operator(book.?, 0, 0));
+    var fp: [*]const u8 = undefined;
+    var fl: usize = 0;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_data_validation_formula1(book.?, 0, 0, &fp, &fl));
+    try std.testing.expectEqualStrings("1", fp[0..fl]);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_data_validation_formula2(book.?, 0, 0, &fp, &fl));
+    try std.testing.expectEqualStrings("100", fp[0..fl]);
+
+    // dv 1: decimal greater_than 0
+    try std.testing.expectEqual(ZLSX_DV_KIND_DECIMAL, zlsx_data_validation_kind(book.?, 0, 1));
+    try std.testing.expectEqual(ZLSX_DV_OP_GREATER_THAN, zlsx_data_validation_operator(book.?, 0, 1));
+    try std.testing.expectEqual(@as(i32, 0), zlsx_data_validation_formula1(book.?, 0, 1, &fp, &fl));
+    try std.testing.expectEqualStrings("0", fp[0..fl]);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_data_validation_formula2(book.?, 0, 1, &fp, &fl));
+    try std.testing.expectEqual(@as(usize, 0), fl);
+
+    // dv 2: custom
+    try std.testing.expectEqual(ZLSX_DV_KIND_CUSTOM, zlsx_data_validation_kind(book.?, 0, 2));
+    try std.testing.expectEqual(ZLSX_DV_OP_NONE, zlsx_data_validation_operator(book.?, 0, 2));
+    try std.testing.expectEqual(@as(i32, 0), zlsx_data_validation_formula1(book.?, 0, 2, &fp, &fl));
+    try std.testing.expectEqualStrings("AND(D4>0,D4<LEN(A1))", fp[0..fl]);
 }
 
 test "reader C ABI: merged_range + hyperlink getters round-trip" {

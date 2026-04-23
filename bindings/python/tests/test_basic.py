@@ -562,3 +562,92 @@ def test_data_validations_extended_fields_for_list_kind(tmp_path):
     # decoded by the reader, so the outer `&quot;` becomes `"`).
     assert dvs[0].formula1 == "\"Yes,No\""
     assert dvs[0].formula2 == ""
+
+
+def test_writer_add_data_validation_numeric_and_custom_round_trip(tmp_path):
+    """Round-trip numeric / custom data validations through the
+    Python writer and read every extended field back. Guards the
+    writer-DV extended ABI (0.2.6+)."""
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_DATA_VALIDATION_EXT or not ffi._HAS_READER_DV_EXT:
+        pytest.skip("loaded libzlsx predates extended DV ABI (0.2.6+)")
+
+    out = tmp_path / "dv_ext_writer.xlsx"
+    with zlsx.write(out) as w:
+        sheet = w.add_sheet("Num")
+        sheet.add_data_validation_numeric("B2:B10", "whole", "between", "1", "100")
+        sheet.add_data_validation_numeric("C3", "decimal", "greater_than", "0")
+        sheet.add_data_validation_numeric("D4", "date", "less_than", "45658")
+        sheet.add_data_validation_numeric("E5", "text_length", "between", "3", "20")
+        # Custom — XML-special char `<` must round-trip clean.
+        sheet.add_data_validation_custom("F6", "AND(F6>0,F6<LEN(A1))")
+        sheet.add_data_validation_list("G7", ["Yes", "No"])  # mixed with list
+        sheet.write_row(["hdr"])
+
+    with zlsx.open(out) as book:
+        dvs = book.data_validations(0)
+
+    assert len(dvs) == 6
+    # List entry emits first per writer ordering.
+    assert dvs[0].kind == "list"
+    assert dvs[0].values == ("Yes", "No")
+
+    assert dvs[1].kind == "whole"
+    assert dvs[1].op == "between"
+    assert dvs[1].formula1 == "1"
+    assert dvs[1].formula2 == "100"
+
+    assert dvs[2].kind == "decimal"
+    assert dvs[2].op == "greater_than"
+    assert dvs[2].formula1 == "0"
+    assert dvs[2].formula2 == ""
+
+    assert dvs[3].kind == "date"
+    assert dvs[3].op == "less_than"
+    assert dvs[3].formula1 == "45658"
+
+    assert dvs[4].kind == "text_length"
+    assert dvs[4].op == "between"
+    assert dvs[4].formula1 == "3"
+    assert dvs[4].formula2 == "20"
+
+    assert dvs[5].kind == "custom"
+    assert dvs[5].op is None
+    assert dvs[5].formula1 == "AND(F6>0,F6<LEN(A1))"
+
+
+def test_writer_add_data_validation_rejects_invalid_inputs(tmp_path):
+    """Exercise every error path on the extended writer DV APIs so the
+    rejection behaviour from the Zig writer surfaces cleanly."""
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_DATA_VALIDATION_EXT:
+        pytest.skip("loaded libzlsx predates extended writer DV ABI (0.2.6+)")
+
+    with zlsx.write(tmp_path / "ignored.xlsx") as w:
+        sheet = w.add_sheet("S")
+        # Unknown kind / op → ValueError (Python-side validation).
+        with pytest.raises(ValueError, match="data validation kind"):
+            sheet.add_data_validation_numeric("A1", "bogus", "equal", "1")
+        with pytest.raises(ValueError, match="data validation operator"):
+            sheet.add_data_validation_numeric("A1", "whole", "bogus", "1")
+        # two-formula mismatch: equal + formula2 set → InvalidDataValidation.
+        with pytest.raises(zlsx.ZlsxError, match="InvalidDataValidation"):
+            sheet.add_data_validation_numeric("A1", "whole", "equal", "1", "2")
+        # between + missing formula2 → InvalidDataValidation.
+        with pytest.raises(zlsx.ZlsxError, match="InvalidDataValidation"):
+            sheet.add_data_validation_numeric("A1", "whole", "between", "1")
+        # empty formula → InvalidDataValidation.
+        with pytest.raises(zlsx.ZlsxError, match="InvalidDataValidation"):
+            sheet.add_data_validation_numeric("A1", "whole", "equal", "")
+        # bad range → InvalidHyperlinkRange (shared A1 validator).
+        with pytest.raises(zlsx.ZlsxError, match="InvalidHyperlinkRange"):
+            sheet.add_data_validation_numeric("", "whole", "equal", "1")
+        # Custom rejection paths.
+        with pytest.raises(zlsx.ZlsxError, match="InvalidDataValidation"):
+            sheet.add_data_validation_custom("A1", "")
+        with pytest.raises(zlsx.ZlsxError, match="InvalidHyperlinkRange"):
+            sheet.add_data_validation_custom("", "A1>0")
+        # Save something so the writer closes cleanly.
+        sheet.write_row(["x"])
