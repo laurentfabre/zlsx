@@ -2460,6 +2460,46 @@ test "Book.dataValidations: empty slice for sheets without validations" {
     try std.testing.expectEqual(@as(usize, 0), book.dataValidations(book.sheets[0]).len);
 }
 
+test "writer.writeRichRow: emits rich-text SST entries readable by Book.richRuns" {
+    const tmp_path = "/tmp/zlsx_writer_rich_roundtrip.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("S");
+        // Row mixes plain + rich + integer.
+        try sheet.writeRichRow(&.{
+            .{ .string = "label" },
+            .{ .rich = &.{
+                .{ .text = "hello ", .bold = true },
+                .{ .text = "world", .italic = true, .color_argb = 0xFFFF0000 },
+            } },
+            .{ .integer = 42 },
+        });
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    // SST ordering: plain "label" first, rich entry second.
+    try std.testing.expectEqualStrings("label", book.shared_strings[0]);
+    try std.testing.expectEqualStrings("hello world", book.shared_strings[1]);
+
+    // Plain entry has no runs; rich entry has two.
+    try std.testing.expectEqual(@as(?[]const RichRun, null), book.richRuns(0));
+    const runs = book.richRuns(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), runs.len);
+    try std.testing.expectEqualStrings("hello ", runs[0].text);
+    try std.testing.expectEqual(true, runs[0].bold);
+    try std.testing.expectEqual(false, runs[0].italic);
+    try std.testing.expectEqualStrings("world", runs[1].text);
+    try std.testing.expectEqual(true, runs[1].italic);
+    try std.testing.expectEqual(@as(?u32, 0xFFFF0000), runs[1].color_argb);
+}
+
 test "Book.richRuns: rich-text SST entries expose per-run bold/italic" {
     // Direct parseSharedStrings drive — avoids needing the writer to
     // emit rich text (it doesn't yet). Covers: plain `<t>` → null runs,

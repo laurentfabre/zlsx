@@ -136,6 +136,32 @@ pub const BorderStyle = enum(u8) {
 };
 
 /// One side of a cell border (left / right / top / bottom / diagonal).
+/// Formatting run for a single piece of rich-text content. Mirrors
+/// the reader-side `xlsx.RichRun` with writer-friendly nullable
+/// optional fields. Consecutive runs inside the same cell accumulate
+/// into one `<si>` entry in the shared-strings table.
+pub const RichTextRun = struct {
+    text: []const u8,
+    bold: bool = false,
+    italic: bool = false,
+    color_argb: ?u32 = null,
+    size: ?f32 = null,
+    font_name: ?[]const u8 = null,
+};
+
+/// Row-cell union that adds a rich-text variant alongside the plain
+/// `xlsx.Cell` shape. Used by `SheetWriter.writeRichRow`. Non-rich
+/// cells keep the exact semantics of `writeRow` — only the rich
+/// variant takes a different code path.
+pub const RichRowCell = union(enum) {
+    empty,
+    string: []const u8,
+    integer: i64,
+    number: f64,
+    boolean: bool,
+    rich: []const RichTextRun,
+};
+
 pub const BorderSide = struct {
     style: BorderStyle = .none,
     /// ARGB colour for the border line. Null = OOXML default (auto).
@@ -256,6 +282,11 @@ pub const Writer = struct {
     // Shared-string table: unique strings + lookup from content → index.
     sst_strings: std.ArrayListUnmanaged([]u8) = .{},
     sst_index: std.StringHashMapUnmanaged(u32) = .{},
+    // Parallel to `sst_strings`: true → the entry holds pre-serialized
+    // rich-text `<r>…</r>` inner body (emitted as-is between `<si>` and
+    // `</si>`); false → plain text, wrapped with `<t xml:space="preserve">`
+    // on emit. Set by `sstInternRich`; read in the SST emit loop.
+    sst_is_rich: std.ArrayListUnmanaged(bool) = .{},
     // Total number of string-typed cells written across all sheets
     // (informational — OOXML's <sst count="..."> field).
     sst_count: u64 = 0,
@@ -284,6 +315,7 @@ pub const Writer = struct {
         for (self.sst_strings.items) |s| self.allocator.free(s);
         self.sst_strings.deinit(self.allocator);
         self.sst_index.deinit(self.allocator);
+        self.sst_is_rich.deinit(self.allocator);
         // Each style owns its font_name / number_format slices (if any)
         // on the writer's heap; drop them here before the styles
         // ArrayList goes.
@@ -390,7 +422,47 @@ pub const Writer = struct {
         errdefer self.allocator.free(owned);
         const idx: u32 = @intCast(self.sst_strings.items.len);
         try self.sst_strings.append(self.allocator, owned);
+        try self.sst_is_rich.append(self.allocator, false);
         try self.sst_index.put(self.allocator, owned, idx);
+        return idx;
+    }
+
+    /// Serialise a rich-text run list into a pre-formatted `<r>…</r>`
+    /// inner body and store it as a new SST entry. Always appends
+    /// (no dedup — rich-text entries are rare and dedup would need
+    /// hashing the full formatted form, which iter33 skips).
+    /// Returns the SST index for use as `<v>{idx}</v>` in a
+    /// `<c t="s">` cell.
+    fn sstInternRich(self: *Writer, runs: []const RichTextRun) !u32 {
+        var buf: std.ArrayListUnmanaged(u8) = .{};
+        errdefer buf.deinit(self.allocator);
+        for (runs) |r| {
+            try buf.appendSlice(self.allocator, "<r>");
+            // <rPr>…</rPr> — only emit when at least one property is set.
+            const has_props = r.bold or r.italic or r.color_argb != null or
+                r.size != null or r.font_name != null;
+            if (has_props) {
+                try buf.appendSlice(self.allocator, "<rPr>");
+                if (r.bold) try buf.appendSlice(self.allocator, "<b/>");
+                if (r.italic) try buf.appendSlice(self.allocator, "<i/>");
+                if (r.size) |sz| try buf.print(self.allocator, "<sz val=\"{d}\"/>", .{sz});
+                if (r.color_argb) |c| try buf.print(self.allocator, "<color rgb=\"{X:0>8}\"/>", .{c});
+                if (r.font_name) |n| {
+                    try buf.appendSlice(self.allocator, "<rFont val=\"");
+                    try appendXmlEscaped(self.allocator, &buf, n);
+                    try buf.appendSlice(self.allocator, "\"/>");
+                }
+                try buf.appendSlice(self.allocator, "</rPr>");
+            }
+            try buf.appendSlice(self.allocator, "<t xml:space=\"preserve\">");
+            try appendXmlEscaped(self.allocator, &buf, r.text);
+            try buf.appendSlice(self.allocator, "</t></r>");
+        }
+        const owned = try buf.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(owned);
+        const idx: u32 = @intCast(self.sst_strings.items.len);
+        try self.sst_strings.append(self.allocator, owned);
+        try self.sst_is_rich.append(self.allocator, true);
         return idx;
     }
 
@@ -634,10 +706,17 @@ pub const Writer = struct {
             var sst: std.ArrayListUnmanaged(u8) = .{};
             defer sst.deinit(alloc);
             try sst.print(alloc, SST_HEAD_FMT, .{ self.sst_count, self.sst_strings.items.len });
-            for (self.sst_strings.items) |s| {
-                try sst.appendSlice(alloc, "<si><t xml:space=\"preserve\">");
-                try appendXmlEscaped(alloc, &sst, s);
-                try sst.appendSlice(alloc, "</t></si>");
+            for (self.sst_strings.items, self.sst_is_rich.items) |s, is_rich| {
+                try sst.appendSlice(alloc, "<si>");
+                if (is_rich) {
+                    // Pre-serialised `<r>…</r>` body — emit verbatim.
+                    try sst.appendSlice(alloc, s);
+                } else {
+                    try sst.appendSlice(alloc, "<t xml:space=\"preserve\">");
+                    try appendXmlEscaped(alloc, &sst, s);
+                    try sst.appendSlice(alloc, "</t>");
+                }
+                try sst.appendSlice(alloc, "</si>");
             }
             try sst.appendSlice(alloc, SST_TAIL);
             try zw.addEntry("xl/sharedStrings.xml", sst.items);
@@ -1099,6 +1178,65 @@ pub const SheetWriter = struct {
     ) !void {
         if (formulas.len != cells.len) return error.FormulaCountMismatch;
         return self.writeRowImpl(cells, null, formulas);
+    }
+
+    /// Write a row mixing plain cells with rich-text cells. Rich
+    /// cells carry an array of `RichTextRun`; each run becomes one
+    /// `<r><rPr/>…<t/></r>` inside a single `<si>` in the SST.
+    /// Non-rich cells follow the same semantics as `writeRow`.
+    ///
+    /// Rich-text entries are always appended to the SST (no dedup
+    /// in this iter — the formatted form is rarely repeated, and
+    /// hashing it would cost more than it saves).
+    pub fn writeRichRow(self: *SheetWriter, cells: []const RichRowCell) !void {
+        // Pre-validate integers BEFORE mutating `self.body`, same
+        // atomicity guarantee as `writeRowImpl`.
+        for (cells) |cell| switch (cell) {
+            .integer => |n| if (!fitsExactlyInF64(n)) return error.IntegerExceedsExcelPrecision,
+            else => {},
+        };
+
+        const alloc = self.parent.allocator;
+        if (self.row_heights.get(self.next_row - 1)) |h| {
+            try self.body.print(alloc, "<row r=\"{d}\" ht=\"{d}\" customHeight=\"1\">", .{ self.next_row, h });
+        } else {
+            try self.body.print(alloc, "<row r=\"{d}\">", .{self.next_row});
+        }
+
+        for (cells, 0..) |cell, col_idx| {
+            if (cell == .empty) continue;
+            var ref_buf: [16]u8 = undefined;
+            const ref = try formatCellRef(&ref_buf, self.next_row, @intCast(col_idx));
+
+            const type_attr: []const u8 = switch (cell) {
+                .string, .rich => " t=\"s\"",
+                .boolean => " t=\"b\"",
+                else => "",
+            };
+            try self.body.print(alloc, "<c r=\"{s}\"{s}>", .{ ref, type_attr });
+
+            switch (cell) {
+                .empty => unreachable,
+                .string => |s| {
+                    const idx = try self.parent.sstIntern(s);
+                    self.parent.sst_count += 1;
+                    try self.body.print(alloc, "<v>{d}</v>", .{idx});
+                },
+                .rich => |runs| {
+                    const idx = try self.parent.sstInternRich(runs);
+                    self.parent.sst_count += 1;
+                    try self.body.print(alloc, "<v>{d}</v>", .{idx});
+                },
+                .integer => |n| try self.body.print(alloc, "<v>{d}</v>", .{n}),
+                .number => |f| try self.body.print(alloc, "<v>{d}</v>", .{f}),
+                .boolean => |b| try self.body.print(alloc, "<v>{d}</v>", .{@intFromBool(b)}),
+            }
+
+            try self.body.appendSlice(alloc, "</c>");
+        }
+
+        try self.body.appendSlice(alloc, "</row>");
+        self.next_row += 1;
     }
 
     fn writeRowImpl(
