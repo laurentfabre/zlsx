@@ -179,6 +179,35 @@ lib.zlsx_sheet_writer_write_row.argtypes = [
 ]
 lib.zlsx_sheet_writer_write_row.restype = ctypes.c_int32
 
+
+class CRichRun(ctypes.Structure):
+    _fields_ = [
+        ("text_ptr", ctypes.POINTER(ctypes.c_ubyte)),
+        ("text_len", ctypes.c_size_t),
+        ("bold", ctypes.c_uint8),
+        ("italic", ctypes.c_uint8),
+        ("has_color", ctypes.c_uint8),
+        ("has_size", ctypes.c_uint8),
+        ("color_argb", ctypes.c_uint32),
+        ("size", ctypes.c_float),
+        ("font_name_ptr", ctypes.POINTER(ctypes.c_ubyte)),
+        ("font_name_len", ctypes.c_size_t),
+    ]
+
+
+_HAS_WRITE_RICH_ROW = hasattr(lib, "zlsx_sheet_writer_write_rich_row")
+if _HAS_WRITE_RICH_ROW:
+    lib.zlsx_sheet_writer_write_rich_row.argtypes = [
+        sheet_writer_handle,
+        cell_ptr,                                              # cells_ptr
+        ctypes.POINTER(ctypes.POINTER(CRichRun)),              # rich_runs_ptrs
+        ctypes.POINTER(ctypes.c_size_t),                       # rich_runs_lens
+        ctypes.c_size_t,                                       # cells_len
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_write_rich_row.restype = ctypes.c_int32
+
 lib.zlsx_writer_save.argtypes = [
     writer_handle,
     ctypes.c_char_p,

@@ -1177,6 +1177,138 @@ export fn zlsx_sheet_writer_write_row(
     return 0;
 }
 
+/// C-shape for a single rich-text run. `has_color` / `has_size` are
+/// 0/1 flags; `font_name_len == 0` means "no rFont". Text slice
+/// lifetime is the caller's — the writer copies the formatted form
+/// into its own SST arena before this function returns.
+pub const CRichRun = extern struct {
+    text_ptr: [*]const u8,
+    text_len: usize,
+    bold: u8,
+    italic: u8,
+    has_color: u8,
+    has_size: u8,
+    color_argb: u32,
+    size: f32,
+    font_name_ptr: [*]const u8,
+    font_name_len: usize,
+};
+
+/// Append a row that mixes plain cells with rich-text cells. For
+/// each column: if `rich_runs_lens[col] > 0`, that column is a
+/// rich-text cell with `rich_runs_lens[col]` runs pointed at by
+/// `rich_runs_ptrs[col]`; otherwise `cells[col]` is a plain
+/// value. Returns 0 on success, -1 on failure.
+///
+/// This is the C-ABI surface for `SheetWriter.writeRichRow`; the
+/// Python binding layers on top. Plain-only rows should stay on
+/// the existing `zlsx_sheet_writer_write_row` to avoid the extra
+/// parallel-array plumbing.
+export fn zlsx_sheet_writer_write_rich_row(
+    sw: *SheetWriter,
+    cells_ptr: ?[*]const CCell,
+    rich_runs_ptrs: ?[*]const [*]const CRichRun,
+    rich_runs_lens: ?[*]const usize,
+    cells_len: usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+
+    // Translate each column into a RichRowCell. Plain cells reuse
+    // the existing fromCCell conversion; rich cells build a
+    // temporary `[]RichTextRun` slice that stays alive for the
+    // duration of this call.
+    var scratch_cells: [128]writer_mod.RichRowCell = undefined;
+    var heap_cells: ?[]writer_mod.RichRowCell = null;
+    defer if (heap_cells) |h| gpa.free(h);
+
+    var cells_slice: []writer_mod.RichRowCell = &.{};
+    if (cells_len > 0) {
+        if (cells_len <= scratch_cells.len) {
+            cells_slice = scratch_cells[0..cells_len];
+        } else {
+            heap_cells = gpa.alloc(writer_mod.RichRowCell, cells_len) catch {
+                writeError(err_buf, err_buf_len, "OutOfMemory");
+                return -1;
+            };
+            cells_slice = heap_cells.?;
+        }
+    }
+
+    // Per-column runs scratch. Total runs across a row rarely exceeds
+    // a handful so a single flat arena holds everything; fall back
+    // to a heap alloc for very wide rich rows.
+    var runs_scratch: [256]writer_mod.RichTextRun = undefined;
+    var heap_runs: ?[]writer_mod.RichTextRun = null;
+    defer if (heap_runs) |h| gpa.free(h);
+
+    // First pass: count total runs so we can size the runs buffer.
+    var total_runs: usize = 0;
+    if (rich_runs_lens) |lens| {
+        for (0..cells_len) |i| total_runs += lens[i];
+    }
+    var runs_all: []writer_mod.RichTextRun = &.{};
+    if (total_runs > 0) {
+        if (total_runs <= runs_scratch.len) {
+            runs_all = runs_scratch[0..total_runs];
+        } else {
+            heap_runs = gpa.alloc(writer_mod.RichTextRun, total_runs) catch {
+                writeError(err_buf, err_buf_len, "OutOfMemory");
+                return -1;
+            };
+            runs_all = heap_runs.?;
+        }
+    }
+
+    var runs_cursor: usize = 0;
+    for (0..cells_len) |i| {
+        const runs_len: usize = if (rich_runs_lens) |lens| lens[i] else 0;
+        if (runs_len > 0) {
+            const src_runs = rich_runs_ptrs.?[i];
+            const dst = runs_all[runs_cursor .. runs_cursor + runs_len];
+            for (0..runs_len) |r| {
+                const s = src_runs[r];
+                dst[r] = .{
+                    .text = s.text_ptr[0..s.text_len],
+                    .bold = s.bold != 0,
+                    .italic = s.italic != 0,
+                    .color_argb = if (s.has_color != 0) s.color_argb else null,
+                    .size = if (s.has_size != 0) s.size else null,
+                    .font_name = if (s.font_name_len > 0)
+                        s.font_name_ptr[0..s.font_name_len]
+                    else
+                        null,
+                };
+            }
+            cells_slice[i] = .{ .rich = dst };
+            runs_cursor += runs_len;
+        } else if (cells_ptr) |cp| {
+            // Plain cell — mirror fromCCell into the RichRowCell shape.
+            const c = cp[i];
+            cells_slice[i] = switch (c.tag) {
+                @intFromEnum(CellTag.empty) => .empty,
+                @intFromEnum(CellTag.string) => .{ .string = c.str_ptr[0..c.str_len] },
+                @intFromEnum(CellTag.integer) => .{ .integer = c.i },
+                @intFromEnum(CellTag.number) => .{ .number = c.f },
+                @intFromEnum(CellTag.boolean) => .{ .boolean = c.b != 0 },
+                else => {
+                    writeError(err_buf, err_buf_len, "BadCellTag");
+                    return -1;
+                },
+            };
+        } else {
+            cells_slice[i] = .empty;
+        }
+    }
+
+    sw_state.inner.writeRichRow(cells_slice) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
 /// Serialise the workbook and write it to `path`. Returns 0 on success,
 /// -1 on failure. The writer remains usable after save() — the caller
 /// may add more rows and save again to a different path.

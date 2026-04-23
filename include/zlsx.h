@@ -549,6 +549,49 @@ int32_t zlsx_sheet_writer_write_row(
     size_t                err_buf_len);
 
 /*
+ * Rich-text run — one formatted piece of a rich-text cell.
+ * `has_color` / `has_size` are 0/1 flags; when 0 the paired
+ * `color_argb` / `size` field is ignored. `font_name_len == 0`
+ * means "no rFont override". Text lifetime is the caller's — the
+ * writer copies during zlsx_sheet_writer_write_rich_row().
+ */
+typedef struct {
+    const uint8_t * text_ptr;
+    size_t          text_len;
+    uint8_t         bold;
+    uint8_t         italic;
+    uint8_t         has_color;
+    uint8_t         has_size;
+    uint32_t        color_argb;
+    float           size;
+    const uint8_t * font_name_ptr;
+    size_t          font_name_len;
+} zlsx_rich_run_t;
+
+/*
+ * Append a row mixing plain cells with rich-text cells. For each
+ * column i in [0, cells_len):
+ *   if rich_runs_lens[i] > 0 → rich cell; rich_runs_ptrs[i] points
+ *     at rich_runs_lens[i] runs. cells_ptr[i] is ignored for that
+ *     column (pass any placeholder).
+ *   else → plain cell; cells_ptr[i] is a regular zlsx_cell_t.
+ *
+ * Either rich_runs_ptrs or rich_runs_lens may be NULL iff no
+ * column is rich — passing both NULL degenerates to
+ * zlsx_sheet_writer_write_row. Returns 0 on success, -1 on failure
+ * (err_buf populated). Atomic: on failure next_row is not
+ * advanced.
+ */
+int32_t zlsx_sheet_writer_write_rich_row(
+    zlsx_sheet_writer_t         * sw,
+    const zlsx_cell_t           * cells_ptr,
+    const zlsx_rich_run_t * const* rich_runs_ptrs,
+    const size_t                * rich_runs_lens,
+    size_t                        cells_len,
+    uint8_t                     * err_buf,
+    size_t                        err_buf_len);
+
+/*
  * Serialise the in-memory workbook and write it to `path` (the path
  * does not need to be null-terminated; `path_len` bytes are used).
  * Returns 0 on success, -1 on failure. The Writer remains usable —

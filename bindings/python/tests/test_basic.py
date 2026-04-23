@@ -958,6 +958,44 @@ def test_book_cell_border_round_trip(tmp_path):
         assert book.cell_border(99999) is None
 
 
+def test_sheet_writer_write_rich_row_round_trip(tmp_path):
+    """Python writes a row mixing plain + rich-text cells via
+    `write_rich_row`; reader round-trips the formatting through
+    `Book.rich_text(sst_idx)`. Guards the iter36 C-ABI + Python
+    binding — iter33 landed the Zig API but not the FFI surface."""
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_WRITE_RICH_ROW or not ffi._HAS_RICH_RUNS:
+        pytest.skip("loaded libzlsx predates write_rich_row ABI (0.2.6+)")
+
+    out = tmp_path / "rich_writer.xlsx"
+    with zlsx.write(out) as w:
+        sheet = w.add_sheet("S")
+        sheet.write_rich_row([
+            "plain",
+            [
+                zlsx.RichRun("hello ", bold=True),
+                zlsx.RichRun("world", italic=True, color_argb=0xFFFF0000,
+                             size=12.0, font_name="Arial"),
+            ],
+            42,
+        ])
+
+    with zlsx.open(out) as book:
+        # SST order: "plain" at 0, rich at 1.
+        assert book.rich_text(0) is None
+        runs = book.rich_text(1)
+        assert runs is not None
+        assert len(runs) == 2
+        assert runs[0].text == "hello "
+        assert runs[0].bold and not runs[0].italic
+        assert runs[1].text == "world"
+        assert runs[1].italic and not runs[1].bold
+        assert runs[1].color_argb == 0xFFFF0000
+        assert runs[1].size == 12.0
+        assert runs[1].font_name == "Arial"
+
+
 def test_book_comments_parses_authors_refs_text(tmp_path):
     """Build a minimal xlsx with a comments1.xml part and verify
     `Book.comments(sheet_idx)` returns the right refs, authors, and

@@ -1086,6 +1086,105 @@ class SheetWriter:
         # backing str buffers while the C side is still reading them.
         del keepers
 
+    def write_rich_row(self, values) -> None:
+        """Append a row mixing plain cells with rich-text cells.
+
+        Each element of ``values`` is either a plain Python value
+        (``None``, ``bool``, ``int``, ``float``, ``str``) or an
+        iterable of :class:`RichRun` for a rich-text cell. Rich
+        cells get emitted as a single ``<si>`` containing one
+        ``<r><rPr/>…<t/></r>`` per run; plain cells follow the same
+        semantics as :meth:`write_row`.
+
+        Requires libzlsx 0.2.6+."""
+        self._require_handle()
+        if not _ffi._HAS_WRITE_RICH_ROW:
+            raise RuntimeError(
+                "loaded libzlsx does not expose write_rich_row "
+                "(requires 0.2.6+); upgrade libzlsx"
+            )
+        cells_list = list(values)
+        n = len(cells_list)
+        if n == 0:
+            rc = _ffi.lib.zlsx_sheet_writer_write_row(
+                self._handle, None, 0, self._err, _ERR_BUF_LEN
+            )
+            if rc != 0:
+                raise ZlsxError(
+                    f"zlsx_sheet_writer_write_row (empty): {_decode_err(self._err)}"
+                )
+            return
+
+        cell_array = (_ffi.Cell * n)()
+        lens_array = (ctypes.c_size_t * n)()
+        ptrs_array = (ctypes.POINTER(_ffi.CRichRun) * n)()
+        keepers: list = []
+
+        for i, v in enumerate(cells_list):
+            # A rich cell is any iterable of RichRun that isn't a str.
+            if isinstance(v, (list, tuple)) and all(isinstance(r, RichRun) for r in v):
+                runs_list = list(v)
+                m = len(runs_list)
+                if m == 0:
+                    raise ValueError(
+                        f"rich cell at column {i} has zero runs — pass a non-empty "
+                        "list[RichRun] or use a plain value"
+                    )
+                run_array = (_ffi.CRichRun * m)()
+                for j, r in enumerate(runs_list):
+                    text_bytes = r.text.encode("utf-8")
+                    text_buf = (ctypes.c_ubyte * max(len(text_bytes), 1)).from_buffer_copy(
+                        text_bytes or b"\x00"
+                    )
+                    font_bytes = r.font_name.encode("utf-8") if r.font_name else b""
+                    font_buf = (ctypes.c_ubyte * max(len(font_bytes), 1)).from_buffer_copy(
+                        font_bytes or b"\x00"
+                    )
+                    run_array[j] = _ffi.CRichRun(
+                        text_ptr=ctypes.cast(text_buf, ctypes.POINTER(ctypes.c_ubyte)),
+                        text_len=len(text_bytes),
+                        bold=1 if r.bold else 0,
+                        italic=1 if r.italic else 0,
+                        has_color=1 if r.color_argb is not None else 0,
+                        has_size=1 if r.size is not None else 0,
+                        color_argb=r.color_argb or 0,
+                        size=r.size if r.size is not None else 0.0,
+                        font_name_ptr=ctypes.cast(font_buf, ctypes.POINTER(ctypes.c_ubyte)),
+                        font_name_len=len(font_bytes),
+                    )
+                    keepers.extend([text_buf, font_buf])
+                # Placeholder plain cell — the C side ignores it when
+                # rich_runs_lens[i] > 0.
+                cell, keeper = _py_value_to_cell(None)
+                cell_array[i] = cell
+                if keeper is not None:
+                    keepers.append(keeper)
+                lens_array[i] = m
+                ptrs_array[i] = ctypes.cast(run_array, ctypes.POINTER(_ffi.CRichRun))
+                keepers.append(run_array)
+            else:
+                cell, keeper = _py_value_to_cell(v)
+                cell_array[i] = cell
+                if keeper is not None:
+                    keepers.append(keeper)
+                lens_array[i] = 0
+                ptrs_array[i] = ctypes.POINTER(_ffi.CRichRun)()
+
+        rc = _ffi.lib.zlsx_sheet_writer_write_rich_row(
+            self._handle,
+            ctypes.cast(cell_array, _ffi.cell_ptr),
+            ptrs_array,
+            lens_array,
+            n,
+            self._err,
+            _ERR_BUF_LEN,
+        )
+        if rc != 0:
+            raise ZlsxError(
+                f"zlsx_sheet_writer_write_rich_row: {_decode_err(self._err)}"
+            )
+        del keepers
+
 
 # Attach the stage-5 per-sheet methods to SheetWriter.
 # ------------------------------------------------------
