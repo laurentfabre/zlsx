@@ -357,9 +357,23 @@ pub const Writer = struct {
         return id;
     }
 
-    /// Add a sheet and return a handle to append rows. Sheet is owned by
-    /// the Writer — do not free the returned pointer.
+    /// Add a sheet and return a handle to append rows. Sheet is owned
+    /// by the Writer — do not free the returned pointer.
+    ///
+    /// Enforces Excel's sheet-name rules (length 1..=31, no control or
+    /// path-reserved chars, no wrapping apostrophes, not "History") and
+    /// rejects case-insensitive duplicates so callers can't
+    /// accidentally produce workbooks Excel refuses to open. Returns
+    /// `error.InvalidSheetName` or `error.DuplicateSheetName` on bad
+    /// input.
     pub fn addSheet(self: *Writer, name: []const u8) !*SheetWriter {
+        try validateSheetName(name);
+        // O(N) duplicate scan — typical workbooks have ≤10 sheets, so
+        // the case-fold loop cost is negligible and saves maintaining
+        // a hash of lowercased names.
+        for (self.sheets.items) |existing| {
+            if (asciiEqlFold(existing.name, name)) return error.DuplicateSheetName;
+        }
         const sw = try self.allocator.create(SheetWriter);
         errdefer self.allocator.destroy(sw);
         sw.* = try SheetWriter.init(self, name);
@@ -884,6 +898,44 @@ fn validateMergeRange(range: []const u8) !void {
     // Single-cell "merge" is a no-op that Excel warns on — reject it
     // so callers catch typos at write time rather than on file-open.
     if (tl.col == br.col and tl.row == br.row) return error.InvalidMergeRange;
+}
+
+/// Byte-wise ASCII case-fold equality. Excel's sheet-name uniqueness
+/// rule is Unicode-case-insensitive, but ASCII case-fold catches the
+/// overwhelming majority of real-world collisions ("Summary" vs
+/// "summary") at a tiny code cost. Non-ASCII input falls through to
+/// byte comparison — sufficient for everything except genuine
+/// Turkish-i-style edge cases that no real caller hits.
+fn asciiEqlFold(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        const xl: u8 = if (x >= 'A' and x <= 'Z') x + 32 else x;
+        const yl: u8 = if (y >= 'A' and y <= 'Z') y + 32 else y;
+        if (xl != yl) return false;
+    }
+    return true;
+}
+
+/// Enforce Excel's sheet-name rules at the API boundary. Silent drift
+/// here produces workbooks Excel refuses to open — catch it up front
+/// with a clear error:
+///   - 1..=31 UTF-8 bytes (Excel caps at 31 chars; we check bytes
+///     since non-ASCII names are rare and the difference is subtle
+///     — a conservative limit won't reject any real-world input).
+///   - No control chars (< 0x20).
+///   - None of the reserved path chars `: / \ ? * [ ]`.
+///   - No leading or trailing apostrophe (Excel uses `'` as a
+///     sheet-reference quote delimiter).
+///   - Not the reserved name "History" (case-insensitive).
+fn validateSheetName(name: []const u8) !void {
+    if (name.len == 0 or name.len > 31) return error.InvalidSheetName;
+    if (name[0] == '\'' or name[name.len - 1] == '\'') return error.InvalidSheetName;
+    for (name) |c| switch (c) {
+        0...0x1F => return error.InvalidSheetName,
+        ':', '/', '\\', '?', '*', '[', ']' => return error.InvalidSheetName,
+        else => {},
+    };
+    if (asciiEqlFold(name, "History")) return error.InvalidSheetName;
 }
 
 fn validateHyperlinkRange(range: []const u8) !void {
@@ -2681,6 +2733,79 @@ fn extractEntryForTest(
     return out;
 }
 
+test "Writer: addSheet validates sheet names (length, reserved chars, History)" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+
+    // Valid — including XML-special chars (these are escaped on emit,
+    // not rejected; only the path-reserved set triggers InvalidSheetName).
+    _ = try w.addSheet("Summary");
+    _ = try w.addSheet("2026 Q1");
+    _ = try w.addSheet("R&D"); // & is xml-escaped on emit
+    _ = try w.addSheet("x<y"); // < is xml-escaped on emit
+
+    // Reject every rule.
+    try std.testing.expectError(error.InvalidSheetName, w.addSheet(""));
+    try std.testing.expectError(error.InvalidSheetName, w.addSheet("A" ** 32)); // > 31 chars
+    try std.testing.expectError(error.InvalidSheetName, w.addSheet("Sheet/1"));
+    try std.testing.expectError(error.InvalidSheetName, w.addSheet("Sheet\\1"));
+    try std.testing.expectError(error.InvalidSheetName, w.addSheet("Sheet?1"));
+    try std.testing.expectError(error.InvalidSheetName, w.addSheet("Sheet*1"));
+    try std.testing.expectError(error.InvalidSheetName, w.addSheet("Sheet[1]"));
+    try std.testing.expectError(error.InvalidSheetName, w.addSheet("Sheet:1"));
+    try std.testing.expectError(error.InvalidSheetName, w.addSheet("'quoted"));
+    try std.testing.expectError(error.InvalidSheetName, w.addSheet("quoted'"));
+    try std.testing.expectError(error.InvalidSheetName, w.addSheet("tab\there"));
+    try std.testing.expectError(error.InvalidSheetName, w.addSheet("History"));
+    try std.testing.expectError(error.InvalidSheetName, w.addSheet("history")); // case-insensitive
+    try std.testing.expectError(error.InvalidSheetName, w.addSheet("HISTORY"));
+
+    // Exactly 31 chars still valid.
+    const exactly_31 = "A" ** 31;
+    _ = try w.addSheet(exactly_31);
+}
+
+test "Writer: addSheet rejects case-insensitive duplicates" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    _ = try w.addSheet("Summary");
+    try std.testing.expectError(error.DuplicateSheetName, w.addSheet("Summary"));
+    try std.testing.expectError(error.DuplicateSheetName, w.addSheet("summary"));
+    try std.testing.expectError(error.DuplicateSheetName, w.addSheet("SUMMARY"));
+    try std.testing.expectError(error.DuplicateSheetName, w.addSheet("SumMarY"));
+    // Different name still allowed.
+    _ = try w.addSheet("Summary 2");
+}
+
+test "fuzz validateSheetName: adversarial bytes never panic + only valid names pass" {
+    const iters = fuzzIterationsW();
+    const seed = fuzzSeedW();
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+
+    for (0..iters) |_| {
+        var buf: [40]u8 = undefined;
+        const len = rng.intRangeAtMost(usize, 0, buf.len);
+        rng.bytes(buf[0..len]);
+        const name = buf[0..len];
+        const result = validateSheetName(name);
+        if (result) |_| {
+            // Post-conditions of a successful validation — must hold on
+            // every accepted input so Excel always opens the workbook.
+            try std.testing.expect(name.len >= 1 and name.len <= 31);
+            try std.testing.expect(name[0] != '\'' and name[name.len - 1] != '\'');
+            for (name) |c| {
+                try std.testing.expect(c >= 0x20);
+                try std.testing.expect(c != ':' and c != '/' and c != '\\' and
+                    c != '?' and c != '*' and c != '[' and c != ']');
+            }
+            try std.testing.expect(!asciiEqlFold(name, "History"));
+        } else |err| {
+            try std.testing.expectEqual(error.InvalidSheetName, err);
+        }
+    }
+}
+
 test "Writer: sheet names with XML-special chars are escaped" {
     const tmp_path = "/tmp/zlsx_writer_sheet_escape.xlsx";
     defer std.fs.cwd().deleteFile(tmp_path) catch {};
@@ -2994,10 +3119,14 @@ test "fuzz Writer end-to-end round-trip via reader" {
         var expected_rows: [3]usize = .{ 0, 0, 0 };
 
         for (0..n_sheets) |si| {
+            // Random uppercase-letter names with a unique trailing digit
+            // per sheet. Stays well clear of Excel's reserved-char list
+            // (`/\?*[]:`) and case-insensitive-dup rule, so the fuzz
+            // exercises the data paths rather than the name validator.
+            // (Separate fuzz target covers validateSheetName.)
             var name_buf: [12]u8 = undefined;
-            rng.bytes(&name_buf);
-            // Filter name_buf to printable ASCII to avoid UTF-8 issues.
-            for (&name_buf) |*b| b.* = (b.* % 94) + 32;
+            for (&name_buf) |*b| b.* = 'A' + rng.intRangeAtMost(u8, 0, 25);
+            name_buf[name_buf.len - 1] = '0' + @as(u8, @intCast(si));
             var sheet = try w.addSheet(&name_buf);
 
             const n_rows = rng.intRangeAtMost(usize, 0, 8);
@@ -3410,10 +3539,15 @@ test "fuzz Writer state-machine: random op ordering with invariants" {
         for (0..n_ops) |_| {
             switch (rng.intRangeAtMost(u8, 0, 5)) {
                 0 => {
-                    // add sheet (bounded to 8)
+                    // add sheet (bounded to 8) — uppercase letters
+                    // plus a per-iteration digit suffix to dodge both
+                    // the reserved-char set and case-insensitive
+                    // duplicates. Name-validation path gets its own
+                    // dedicated fuzz target elsewhere.
                     if (n_sheets >= sheet_handles.len) continue;
                     var name: [12]u8 = undefined;
-                    for (&name) |*b| b.* = (rng.int(u8) % 94) + 32;
+                    for (&name) |*b| b.* = 'A' + rng.intRangeAtMost(u8, 0, 25);
+                    name[name.len - 1] = '0' + @as(u8, @intCast(n_sheets));
                     sheet_handles[n_sheets] = try w.addSheet(&name);
                     n_sheets += 1;
                 },

@@ -1243,10 +1243,14 @@ test "fuzz writer via C ABI: random operations round-trip" {
             style_ids[i] = out_idx;
         }
 
-        // Add a sheet with random name (printable ASCII, 1-20 chars).
+        // Add a sheet with a random uppercase-letter name (1-20
+        // chars). Stays clear of Excel's reserved-char set
+        // (`/\?*[]:`) so the fuzz hammers the cell / row / save
+        // paths instead of the name validator — which has its own
+        // dedicated coverage in writer.zig.
         var name_buf: [20]u8 = undefined;
         const name_len = rng.intRangeAtMost(usize, 1, name_buf.len);
-        for (0..name_len) |i| name_buf[i] = (rng.int(u8) % 94) + 32;
+        for (0..name_len) |i| name_buf[i] = 'A' + rng.intRangeAtMost(u8, 0, 25);
         const name_ptr: [*]const u8 = @ptrCast(&name_buf);
         const sw = zlsx_writer_add_sheet(w.?, name_ptr, name_len, &err_buf, err_buf.len);
         try std.testing.expect(sw != null);
