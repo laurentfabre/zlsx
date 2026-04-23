@@ -578,9 +578,41 @@ def _sheet_set_auto_filter(self: "SheetWriter", range_str: str) -> None:
         )
 
 
+def _sheet_add_merged_cell(self: "SheetWriter", range_str: str) -> None:
+    """Register a rectangular merged cell range (A1-style, e.g. 'A1:B2').
+
+    Single-cell ranges, inverted corners, lowercase, and references
+    past Excel's 16 384 × 1 048 576 cap are rejected with
+    :class:`ZlsxError`. Multiple merges per sheet are allowed but
+    must not overlap — Excel rejects overlapping pairs at file-open
+    time."""
+    self._require_handle()
+    if not _ffi._HAS_MERGED_CELL:
+        raise RuntimeError(
+            "loaded libzlsx does not expose add_merged_cell (requires 0.2.5+); "
+            "upgrade libzlsx"
+        )
+    raw = range_str.encode("utf-8")
+    buf = (ctypes.c_ubyte * max(len(raw), 1)).from_buffer_copy(raw or b"\x00")
+    rc = _ffi.lib.zlsx_sheet_writer_add_merged_cell(
+        self._handle,
+        ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)),
+        len(raw),
+        self._err,
+        _ERR_BUF_LEN,
+    )
+    # Keep buf alive through the call.
+    del buf
+    if rc != 0:
+        raise ZlsxError(
+            f"zlsx_sheet_writer_add_merged_cell: {_decode_err(self._err)}"
+        )
+
+
 SheetWriter.set_column_width = _sheet_set_column_width   # type: ignore[attr-defined]
 SheetWriter.freeze_panes = _sheet_freeze_panes           # type: ignore[attr-defined]
 SheetWriter.set_auto_filter = _sheet_set_auto_filter     # type: ignore[attr-defined]
+SheetWriter.add_merged_cell = _sheet_add_merged_cell     # type: ignore[attr-defined]
 
 
 class Writer:
@@ -594,11 +626,9 @@ class Writer:
     Writes strings, integers, floats, booleans, and empties; styles
     via :meth:`add_style` (bold/italic, fonts, fills, borders,
     alignment, wrap, number formats); per-sheet ``set_column_width``,
-    ``freeze_panes``, ``set_auto_filter``. Merged-cell authoring
-    exists on the Zig ``SheetWriter.addMergedCell`` API but is not
-    yet exposed through the C ABI or this Python wrapper; formulas
-    and load-modify-save round-trip remain out of scope until
-    Phase 3c.
+    ``freeze_panes``, ``set_auto_filter``, ``add_merged_cell``.
+    Formulas and load-modify-save round-trip remain out of scope
+    until Phase 3c.
     """
 
     def __init__(self, path: Union[str, Path, None] = None):

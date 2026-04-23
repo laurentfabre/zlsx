@@ -355,6 +355,19 @@ int32_t zlsx_sheet_writer_set_auto_filter(
     uint8_t             * err_buf,
     size_t                err_buf_len);
 
+/* Register a rectangular merged cell range (A1-style, e.g. "A1:B2").
+ * Validated + duped by the writer on intake. Returns 0 on success or
+ * -1 with err="InvalidMergeRange" on empty / single-cell / inverted /
+ * out-of-Excel-range input. Multiple merges per sheet are allowed;
+ * callers must avoid overlaps (Excel rejects overlapping pairs at
+ * file-open time). */
+int32_t zlsx_sheet_writer_add_merged_cell(
+    zlsx_sheet_writer_t * sw,
+    const uint8_t       * range_ptr,
+    size_t                range_len,
+    uint8_t             * err_buf,
+    size_t                err_buf_len);
+
 #ifdef __cplusplus
 }
 #endif

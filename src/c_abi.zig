@@ -952,6 +952,29 @@ export fn zlsx_sheet_writer_set_auto_filter(
     return 0;
 }
 
+/// Register a rectangular merged cell range (A1-style, e.g. "A1:B2").
+/// The writer validates + dupes the range immediately. Returns 0 on
+/// success; -1 with err="InvalidMergeRange" on empty / single-cell /
+/// inverted / out-of-Excel-range input, or "OutOfMemory" on alloc
+/// failure. Multiple merges per sheet are allowed; callers are
+/// responsible for ensuring they don't overlap (Excel rejects
+/// overlapping pairs at file-open time).
+export fn zlsx_sheet_writer_add_merged_cell(
+    sw: *SheetWriter,
+    range_ptr: [*]const u8,
+    range_len: usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+    const range = range_ptr[0..range_len];
+    sw_state.inner.addMergedCell(range) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
 // ─── Writer tests ────────────────────────────────────────────────────
 
 test "writer: round-trip via reader" {
@@ -1001,6 +1024,62 @@ test "writer: round-trip via reader" {
     const r2 = (try rows.next()).?;
     try std.testing.expectEqualStrings("Alice", r2[0].string);
     try std.testing.expectEqual(@as(i64, 30), r2[1].integer);
+}
+
+test "writer C ABI: add_merged_cell round-trips + rejects bad ranges" {
+    const tmp_path = "/tmp/zlsx_c_abi_merged_cell.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var err_buf: [128]u8 = undefined;
+
+    const w = zlsx_writer_create(&err_buf, err_buf.len);
+    try std.testing.expect(w != null);
+    defer zlsx_writer_close(w);
+
+    const sheet_name = "S1";
+    const sw = zlsx_writer_add_sheet(w.?, sheet_name.ptr, sheet_name.len, &err_buf, err_buf.len);
+    try std.testing.expect(sw != null);
+
+    // Valid: returns 0 + empty err_buf.
+    const good1 = "A1:B2";
+    try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_add_merged_cell(sw.?, good1.ptr, good1.len, &err_buf, err_buf.len));
+    const good2 = "C3:E5";
+    try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_add_merged_cell(sw.?, good2.ptr, good2.len, &err_buf, err_buf.len));
+
+    // Invalid: each error path returns -1 with "InvalidMergeRange".
+    const bad_cases = [_][]const u8{
+        "", // empty
+        "A1", // no colon
+        "A1:A1", // single cell
+        "B1:A1", // inverted col
+        "a1:b2", // lowercase
+        "A0:B2", // row 0
+        "XFE1:XFE2", // col > 16384
+    };
+    for (bad_cases) |bad| {
+        @memset(&err_buf, 0);
+        const rc = zlsx_sheet_writer_add_merged_cell(sw.?, bad.ptr, bad.len, &err_buf, err_buf.len);
+        try std.testing.expectEqual(@as(i32, -1), rc);
+        try std.testing.expect(std.mem.indexOf(u8, &err_buf, "InvalidMergeRange") != null);
+    }
+
+    // Save + confirm the workbook still opens + walks cleanly — if the
+    // earlier error paths had poisoned `merged_cells`, save would emit
+    // a malformed <mergeCells> block and the reader would choke.
+    const one_str = "x";
+    const empty_bytes: [*]const u8 = @ptrCast("");
+    const row = [_]CCell{
+        .{ .tag = @intFromEnum(CellTag.string), .str_len = one_str.len, .str_ptr = one_str.ptr, .i = 0, .f = 0, .b = 0, ._pad = [_]u8{0} ** 7 },
+    };
+    _ = empty_bytes;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_write_row(sw.?, &row, row.len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w.?, tmp_path, tmp_path.len, &err_buf, err_buf.len));
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+    var rows_iter = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows_iter.deinit();
+    while (try rows_iter.next()) |_| {}
 }
 
 // ─── Fuzz tests ──────────────────────────────────────────────────────
@@ -1177,6 +1256,26 @@ test "fuzz writer via C ABI: random operations round-trip" {
             else
                 zlsx_sheet_writer_write_row(sw.?, &cells, n_cells, &err_buf, err_buf.len);
             if (rc == 0) expected_rows += 1;
+        }
+
+        // 0-3 merge attempts mixing valid + invalid ranges. Invalid
+        // ones must return -1 and NOT poison the writer's merged-cell
+        // accumulator (the save step below would choke on malformed XML).
+        const merge_candidates = [_][]const u8{
+            "A1:B2", "C3:D4", "E1:E5", "AA1:AB2",
+            "", // invalid
+            "A1", // invalid: no colon
+            "B1:A1", // invalid: col inverted
+            "a1:b2", // invalid: lowercase
+            "XFE1:XFE2", // invalid: col > 16384
+        };
+        const n_merges = rng.intRangeAtMost(usize, 0, 3);
+        for (0..n_merges) |_| {
+            const r = merge_candidates[rng.intRangeAtMost(usize, 0, merge_candidates.len - 1)];
+            // Don't assert on rc — both 0 and -1 are valid outcomes;
+            // the invariant we're fuzzing is "save never emits
+            // malformed XML regardless of which attempts succeeded".
+            _ = zlsx_sheet_writer_add_merged_cell(sw.?, r.ptr, r.len, &err_buf, err_buf.len);
         }
 
         const save_rc = zlsx_writer_save(w.?, @ptrCast(tmp_path.ptr), tmp_path.len, &err_buf, err_buf.len);

@@ -300,6 +300,20 @@ if _HAS_SHEET_FEATURES:
     ]
     lib.zlsx_sheet_writer_set_auto_filter.restype = ctypes.c_int32
 
+# Merged-cell authoring (libzlsx 0.2.5+ — independent of _HAS_SHEET_FEATURES
+# because we want py-zlsx to keep importing against a 0.2.4 dylib and only
+# fail when the caller actually requests the feature).
+_HAS_MERGED_CELL = hasattr(lib, "zlsx_sheet_writer_add_merged_cell")
+if _HAS_MERGED_CELL:
+    lib.zlsx_sheet_writer_add_merged_cell.argtypes = [
+        sheet_writer_handle,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_add_merged_cell.restype = ctypes.c_int32
+
 _HAS_STYLES_EX = hasattr(lib, "zlsx_writer_add_style_ex")
 if _HAS_STYLES_EX:
     lib.zlsx_writer_add_style_ex.argtypes = [
