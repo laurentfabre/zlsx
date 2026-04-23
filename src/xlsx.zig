@@ -155,19 +155,61 @@ pub const Hyperlink = struct {
     location: []const u8,
 };
 
-/// A list-type data validation (dropdown) parsed from a sheet's
-/// `<dataValidations>` block. Only the list variant is exposed on
-/// the reader today — number / date / text-length / custom variants
-/// decode as empty `values` (still surface the range so callers can
-/// enumerate them). Strings in `values` are entity-decoded and owned
-/// by the Book.
+/// Data-validation kind, mirroring OOXML `ST_DataValidationType`.
+/// `.unknown` covers any type we don't recognise (forward-compat with
+/// generators that introduce new variants) — callers can still read
+/// `formula1` / `formula2` verbatim.
+pub const DataValidationKind = enum {
+    list,
+    whole,
+    decimal,
+    date,
+    time,
+    text_length,
+    custom,
+    unknown,
+};
+
+/// Numeric comparison operator, mirroring OOXML
+/// `ST_DataValidationOperator`. Null when the source validation omits
+/// `operator=` (list / custom validations never use one).
+pub const DataValidationOperator = enum {
+    between,
+    not_between,
+    equal,
+    not_equal,
+    less_than,
+    less_than_or_equal,
+    greater_than,
+    greater_than_or_equal,
+};
+
+/// A data-validation entry parsed from a sheet's `<dataValidations>`
+/// block. All kinds surface — list callers get `values` plus a
+/// literal formula1; numeric / date / time / length / custom callers
+/// get `kind`, `op`, `formula1`, and (for between / not_between)
+/// `formula2`. Strings in `values`, `formula1`, and `formula2` are
+/// entity-decoded and owned by the Book.
 pub const DataValidation = struct {
     top_left: CellRef,
     bottom_right: CellRef,
+    kind: DataValidationKind = .list,
+    /// Null when `kind` is `.list`, `.custom`, `.unknown`, or when the
+    /// source XML omits `operator=` (Excel defaults such omissions to
+    /// `.between` but we preserve the absence so round-trips are exact).
+    op: ?DataValidationOperator = null,
+    /// First formula content, entity-decoded. For `.list` this is the
+    /// literal `"a,b,c"` wrapped CSV or a range reference
+    /// (`$A$1:$A$10`); the parsed CSV form is in `values`. Empty when
+    /// the source had no `<formula1>` element.
+    formula1: []const u8 = "",
+    /// Second formula content, entity-decoded. Empty unless the
+    /// validation uses `.between` or `.not_between`.
+    formula2: []const u8 = "",
     /// Dropdown options. Empty when the source validation isn't a
     /// list or when `formula1` is a range reference (which we don't
     /// expand to the referenced cells on read).
-    values: []const []const u8,
+    values: []const []const u8 = &.{},
 };
 
 /// Domain errors surfaced by this module. The public API uses inferred
@@ -1039,10 +1081,58 @@ fn splitFormula1List(book: *Book, formula1: []const u8) !?[][]const u8 {
     return try out.toOwnedSlice(book.allocator);
 }
 
-/// Walk a sheet XML's `<dataValidations>` section and collect
-/// list-type entries into `book.data_validations_by_sheet`.
-/// Non-list variants are skipped (surface shows the range but
-/// empty `values`) so callers still see all validations.
+fn parseDvKind(s: []const u8) DataValidationKind {
+    if (std.mem.eql(u8, s, "list")) return .list;
+    if (std.mem.eql(u8, s, "whole")) return .whole;
+    if (std.mem.eql(u8, s, "decimal")) return .decimal;
+    if (std.mem.eql(u8, s, "date")) return .date;
+    if (std.mem.eql(u8, s, "time")) return .time;
+    if (std.mem.eql(u8, s, "textLength")) return .text_length;
+    if (std.mem.eql(u8, s, "custom")) return .custom;
+    return .unknown;
+}
+
+fn parseDvOperator(s: []const u8) ?DataValidationOperator {
+    if (std.mem.eql(u8, s, "between")) return .between;
+    if (std.mem.eql(u8, s, "notBetween")) return .not_between;
+    if (std.mem.eql(u8, s, "equal")) return .equal;
+    if (std.mem.eql(u8, s, "notEqual")) return .not_equal;
+    if (std.mem.eql(u8, s, "lessThan")) return .less_than;
+    if (std.mem.eql(u8, s, "lessThanOrEqual")) return .less_than_or_equal;
+    if (std.mem.eql(u8, s, "greaterThan")) return .greater_than;
+    if (std.mem.eql(u8, s, "greaterThanOrEqual")) return .greater_than_or_equal;
+    return null;
+}
+
+/// Return the text between `<tag>` and `</tag>` inside `body`, or
+/// null when the element is absent. No decoding — raw XML text is
+/// returned so callers can decide whether to keep entity-escaped
+/// form (e.g. list parser) or decode (e.g. formula1/formula2 surface).
+fn extractElementContent(body: []const u8, tag: []const u8) ?[]const u8 {
+    var open_buf: [32]u8 = undefined;
+    var close_buf: [32]u8 = undefined;
+    const open = std.fmt.bufPrint(&open_buf, "<{s}>", .{tag}) catch return null;
+    const close = std.fmt.bufPrint(&close_buf, "</{s}>", .{tag}) catch return null;
+    const o = std.mem.indexOf(u8, body, open) orelse return null;
+    const start = o + open.len;
+    const c = std.mem.indexOfPos(u8, body, start, close) orelse return null;
+    return body[start..c];
+}
+
+/// Decode XML entities in `raw` and return a slice owned by the Book
+/// (fresh allocation in `sst_arena` when decoding is needed, otherwise
+/// a zero-copy slice into the sheet XML itself).
+fn decodeFormulaInto(book: *Book, raw: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, raw, '&') == null) return raw;
+    const arena = book.sst_arena.allocator();
+    var buf: std.ArrayListUnmanaged(u8) = try .initCapacity(arena, raw.len);
+    try appendDecoded(arena, &buf, raw);
+    return try buf.toOwnedSlice(arena);
+}
+
+/// Walk a sheet XML's `<dataValidations>` section and collect every
+/// entry into `book.data_validations_by_sheet`, surfacing kind,
+/// operator, formula1 and formula2 so non-list validations round-trip.
 fn parseDataValidationsForSheet(book: *Book, sheet_path: []const u8, xml: []const u8) !void {
     const dv_start = std.mem.indexOf(u8, xml, "<dataValidations") orelse return;
     const dv_end = std.mem.indexOfPos(u8, xml, dv_start, "</dataValidations>") orelse return;
@@ -1065,48 +1155,56 @@ fn parseDataValidationsForSheet(book: *Book, sheet_path: []const u8, xml: []cons
         const sqref = attrs[sq_start..sq_close];
         const r = parseA1Range(sqref) catch continue;
 
-        // type="…" — only "list" has dropdown values. Other types
-        // still surface the range (with empty values) so callers can
-        // enumerate every data validation, not just dropdowns.
+        // type="…" → DataValidationKind. Excel omits type for list by
+        // default in some generators, so "list" is the implicit fallback.
+        var kind: DataValidationKind = .list;
         const type_key = "type=\"";
-        var is_list = false;
         if (std.mem.indexOf(u8, attrs, type_key)) |tp| {
             const t_start = tp + type_key.len;
             const t_close = std.mem.indexOfScalarPos(u8, attrs, t_start, '"') orelse continue;
-            is_list = std.mem.eql(u8, attrs[t_start..t_close], "list");
+            kind = parseDvKind(attrs[t_start..t_close]);
+        }
+
+        // operator="…" → DataValidationOperator (null when absent).
+        var op: ?DataValidationOperator = null;
+        const op_key = "operator=\"";
+        if (std.mem.indexOf(u8, attrs, op_key)) |op_pos| {
+            const o_start = op_pos + op_key.len;
+            const o_close = std.mem.indexOfScalarPos(u8, attrs, o_start, '"') orelse continue;
+            op = parseDvOperator(attrs[o_start..o_close]);
         }
 
         var values: []const []const u8 = &.{};
-        // If self-closing `<dataValidation … />` there's no body to
-        // peek at for formula1.
+        var formula1: []const u8 = "";
+        var formula2: []const u8 = "";
+
+        // If self-closing `<dataValidation … />` there's no body.
         const is_self_closing = hdr_end > 0 and block[hdr_end - 1] == '/';
-        if (is_list and !is_self_closing) {
+        if (!is_self_closing) {
             const dv_close = std.mem.indexOfPos(u8, block, hdr_end, "</dataValidation>") orelse continue;
             const body = block[hdr_end + 1 .. dv_close];
             i = dv_close + "</dataValidation>".len;
 
-            const f1_open = "<formula1>";
-            const f1_close_tag = "</formula1>";
-            if (std.mem.indexOf(u8, body, f1_open)) |f1_pos| {
-                const f1_start = f1_pos + f1_open.len;
-                if (std.mem.indexOfPos(u8, body, f1_start, f1_close_tag)) |f1_close| {
-                    const formula1 = body[f1_start..f1_close];
-                    if (try splitFormula1List(book, formula1)) |parsed| {
+            if (extractElementContent(body, "formula1")) |raw_f1| {
+                formula1 = try decodeFormulaInto(book, raw_f1);
+                if (kind == .list) {
+                    if (try splitFormula1List(book, raw_f1)) |parsed| {
                         values = parsed;
                     }
                 }
             }
-        } else if (!is_self_closing) {
-            // Advance past the body for non-list entries too so the
-            // outer `<dataValidation` scan moves forward.
-            if (std.mem.indexOfPos(u8, block, hdr_end, "</dataValidation>")) |dv_close| {
-                i = dv_close + "</dataValidation>".len;
+            if (extractElementContent(body, "formula2")) |raw_f2| {
+                formula2 = try decodeFormulaInto(book, raw_f2);
             }
         }
 
         try entries.append(book.allocator, .{
             .top_left = r.top_left,
             .bottom_right = r.bottom_right,
+            .kind = kind,
+            .op = op,
+            .formula1 = formula1,
+            .formula2 = formula2,
             .values = values,
         });
     }
@@ -1532,6 +1630,74 @@ test "Book.dataValidations: round-trip through writer + reader" {
     try std.testing.expectEqualStrings("R&D", dvs[2].values[0]);
     try std.testing.expectEqualStrings("Q<A", dvs[2].values[1]);
     try std.testing.expectEqualStrings("x>y", dvs[2].values[2]);
+}
+
+test "Book.dataValidations: numeric + custom round-trip kind / op / formula1 / formula2" {
+    const tmp_path = "/tmp/zlsx_reader_dv_numeric_roundtrip.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Num");
+        try sheet.addDataValidationNumeric("B2:B10", .whole, .between, "1", "100");
+        try sheet.addDataValidationNumeric("C3", .decimal, .greater_than, "0", null);
+        try sheet.addDataValidationNumeric("D4", .date, .less_than, "45658", null);
+        try sheet.addDataValidationNumeric("E5", .text_length, .between, "3", "20");
+        // Custom formula uses XML-special char `<`; reader must decode it.
+        try sheet.addDataValidationCustom("F6", "AND(F6>0,F6<LEN(A1))");
+        // List still round-trips alongside the new kinds.
+        try sheet.addDataValidationList("G7", &.{ "Yes", "No" });
+        try sheet.writeRow(&.{.{ .string = "hdr" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    const dvs = book.dataValidations(book.sheets[0]);
+    // List validations emit first (iter13 path), then the numeric /
+    // custom range block (iter23 path). Writer ordering preserves this.
+    try std.testing.expectEqual(@as(usize, 6), dvs.len);
+
+    // 0: list — pre-existing iter13 path.
+    try std.testing.expectEqual(DataValidationKind.list, dvs[0].kind);
+    try std.testing.expectEqual(@as(?DataValidationOperator, null), dvs[0].op);
+    try std.testing.expectEqual(@as(usize, 2), dvs[0].values.len);
+    try std.testing.expectEqualStrings("Yes", dvs[0].values[0]);
+    try std.testing.expectEqualStrings("No", dvs[0].values[1]);
+
+    // 1: whole between 1..100
+    try std.testing.expectEqual(DataValidationKind.whole, dvs[1].kind);
+    try std.testing.expectEqual(@as(?DataValidationOperator, .between), dvs[1].op);
+    try std.testing.expectEqualStrings("1", dvs[1].formula1);
+    try std.testing.expectEqualStrings("100", dvs[1].formula2);
+    try std.testing.expectEqual(@as(usize, 0), dvs[1].values.len);
+
+    // 2: decimal greater_than 0
+    try std.testing.expectEqual(DataValidationKind.decimal, dvs[2].kind);
+    try std.testing.expectEqual(@as(?DataValidationOperator, .greater_than), dvs[2].op);
+    try std.testing.expectEqualStrings("0", dvs[2].formula1);
+    try std.testing.expectEqualStrings("", dvs[2].formula2);
+
+    // 3: date less_than 45658
+    try std.testing.expectEqual(DataValidationKind.date, dvs[3].kind);
+    try std.testing.expectEqual(@as(?DataValidationOperator, .less_than), dvs[3].op);
+    try std.testing.expectEqualStrings("45658", dvs[3].formula1);
+
+    // 4: text_length between 3..20
+    try std.testing.expectEqual(DataValidationKind.text_length, dvs[4].kind);
+    try std.testing.expectEqual(@as(?DataValidationOperator, .between), dvs[4].op);
+    try std.testing.expectEqualStrings("3", dvs[4].formula1);
+    try std.testing.expectEqualStrings("20", dvs[4].formula2);
+
+    // 5: custom — no operator, formula1 contains `<` (XML-encoded `&lt;`
+    // on disk, decoded on read).
+    try std.testing.expectEqual(DataValidationKind.custom, dvs[5].kind);
+    try std.testing.expectEqual(@as(?DataValidationOperator, null), dvs[5].op);
+    try std.testing.expectEqualStrings("AND(F6>0,F6<LEN(A1))", dvs[5].formula1);
+    try std.testing.expectEqualStrings("", dvs[5].formula2);
 }
 
 test "Book.dataValidations: empty slice for sheets without validations" {

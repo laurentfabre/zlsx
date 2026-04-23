@@ -212,6 +212,79 @@ int32_t zlsx_data_validation_value_at(zlsx_book_t *     book,
                                       size_t *          out_len);
 
 /*
+ * Data validation kind codes returned by zlsx_data_validation_kind().
+ * Stable numeric codes so callers can switch on them.
+ */
+#define ZLSX_DV_KIND_LIST         0u
+#define ZLSX_DV_KIND_WHOLE        1u
+#define ZLSX_DV_KIND_DECIMAL      2u
+#define ZLSX_DV_KIND_DATE         3u
+#define ZLSX_DV_KIND_TIME         4u
+#define ZLSX_DV_KIND_TEXT_LENGTH  5u
+#define ZLSX_DV_KIND_CUSTOM       6u
+#define ZLSX_DV_KIND_UNKNOWN      7u
+
+/*
+ * Data validation operator codes returned by
+ * zlsx_data_validation_operator(). ZLSX_DV_OP_NONE means the source
+ * had no `operator=` attribute (list / custom validations, or numeric
+ * with an omitted operator — Excel treats the latter as `between`
+ * but we preserve the absence so round-trips are exact).
+ */
+#define ZLSX_DV_OP_BETWEEN                  0u
+#define ZLSX_DV_OP_NOT_BETWEEN              1u
+#define ZLSX_DV_OP_EQUAL                    2u
+#define ZLSX_DV_OP_NOT_EQUAL                3u
+#define ZLSX_DV_OP_LESS_THAN                4u
+#define ZLSX_DV_OP_LESS_THAN_OR_EQUAL       5u
+#define ZLSX_DV_OP_GREATER_THAN             6u
+#define ZLSX_DV_OP_GREATER_THAN_OR_EQUAL    7u
+#define ZLSX_DV_OP_NONE                     0xFFFFFFFFu
+
+/*
+ * Return the kind code (see ZLSX_DV_KIND_*) for data validation
+ * `dv_idx` on sheet `sheet_idx`. Returns ZLSX_DV_KIND_UNKNOWN on
+ * out-of-range indices (callers should bounds-check via
+ * zlsx_data_validation_count() first).
+ */
+uint32_t zlsx_data_validation_kind(zlsx_book_t * book,
+                                   uint32_t      sheet_idx,
+                                   size_t        dv_idx);
+
+/*
+ * Return the operator code (see ZLSX_DV_OP_*) for data validation
+ * `dv_idx` on sheet `sheet_idx`. Returns ZLSX_DV_OP_NONE when the
+ * source had no `operator=` attribute.
+ */
+uint32_t zlsx_data_validation_operator(zlsx_book_t * book,
+                                       uint32_t      sheet_idx,
+                                       size_t        dv_idx);
+
+/*
+ * Copy formula1 of data validation `dv_idx` on sheet `sheet_idx` into
+ * `*out_ptr` / `*out_len`. The pointer is into the Book's internal
+ * buffers and is valid until `zlsx_book_close`. Returns 0 on success,
+ * -1 on out-of-range indices. An empty formula still returns 0 with
+ * `*out_len = 0`.
+ */
+int32_t zlsx_data_validation_formula1(zlsx_book_t *     book,
+                                      uint32_t          sheet_idx,
+                                      size_t            dv_idx,
+                                      const uint8_t * * out_ptr,
+                                      size_t *          out_len);
+
+/*
+ * Copy formula2 of data validation `dv_idx` on sheet `sheet_idx`.
+ * Same contract as zlsx_data_validation_formula1(); empty for
+ * operators other than `between` / `not_between`.
+ */
+int32_t zlsx_data_validation_formula2(zlsx_book_t *     book,
+                                      uint32_t          sheet_idx,
+                                      size_t            dv_idx,
+                                      const uint8_t * * out_ptr,
+                                      size_t *          out_len);
+
+/*
  * Open a row iterator for sheet `sheet_idx`. On failure returns NULL
  * and writes a diagnostic into err_buf as per zlsx_book_open().
  *

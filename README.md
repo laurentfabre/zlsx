@@ -65,7 +65,7 @@ Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-ro
 ## What's in, what's out
 
 **In**
-- **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout, merged-cell ranges via `Book.mergedRanges(sheet)`, external-URL hyperlinks via `Book.hyperlinks(sheet)` (resolved through sheet `_rels`), list-type data validations via `Book.dataValidations(sheet)` (values entity-decoded)
+- **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout, merged-cell ranges via `Book.mergedRanges(sheet)`, external-URL hyperlinks via `Book.hyperlinks(sheet)` (resolved through sheet `_rels`), all data validations via `Book.dataValidations(sheet)` — dropdowns (values entity-decoded), plus `kind` / `op` / `formula1` / `formula2` on numeric, date, time, text-length, and custom variants
 - **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, row heights, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks (per-sheet `_rels`), internal hyperlinks (`location="Sheet2!A1"`), list-type data validations (dropdowns), number / decimal / date / time / text-length / custom data validations, formulas with optional cached value
 - XML entity decoding (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&#N;`, `&#xN;`) on read and escaping on write
 - CLI (`zlsx file.xlsx --format {jsonl,jsonl-dict,tsv,csv}`), C ABI (`libzlsx.{dylib,so,dll}` + `include/zlsx.h`), Python bindings (`pip install py-zlsx`)
@@ -95,7 +95,7 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 | Merged cell ranges | ✓ | ✓ | ✓ | ✓ |
 | External-URL hyperlinks | ✓ | ? | ✓ | ? |
 | Data validations (list / dropdown) | ✓ | — | ✓ | — |
-| Data validations (number / date / custom) | — | — | ✓ | — |
+| Data validations (number / date / custom) | ✓ | — | ✓ | — |
 | Rich-text formatting preserved | — | ~ | ✓ | — |
 | Cell styles on read (bold / colour / fill) | — | — | ✓ | — |
 | Comments / notes | — | ? | ✓ | — |

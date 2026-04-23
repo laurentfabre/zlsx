@@ -422,6 +422,47 @@ if _HAS_READER_DV:
     lib.zlsx_data_validation_value_at.restype = ctypes.c_int32
 
 
+# Extended DV metadata (kind / operator / formula1 / formula2) was
+# added in 0.2.6; probe each getter independently so bindings work
+# against older libzlsx builds too.
+_HAS_READER_DV_EXT = (
+    _HAS_READER_DV
+    and hasattr(lib, "zlsx_data_validation_kind")
+    and hasattr(lib, "zlsx_data_validation_operator")
+    and hasattr(lib, "zlsx_data_validation_formula1")
+    and hasattr(lib, "zlsx_data_validation_formula2")
+)
+if _HAS_READER_DV_EXT:
+    lib.zlsx_data_validation_kind.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_data_validation_kind.restype = ctypes.c_uint32
+    lib.zlsx_data_validation_operator.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_data_validation_operator.restype = ctypes.c_uint32
+    lib.zlsx_data_validation_formula1.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.zlsx_data_validation_formula1.restype = ctypes.c_int32
+    lib.zlsx_data_validation_formula2.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.zlsx_data_validation_formula2.restype = ctypes.c_int32
+
+
 _HAS_STYLES_EX = hasattr(lib, "zlsx_writer_add_style_ex")
 if _HAS_STYLES_EX:
     lib.zlsx_writer_add_style_ex.argtypes = [

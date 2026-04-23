@@ -407,6 +407,115 @@ export fn zlsx_data_validation_value_at(
     return 0;
 }
 
+/// Kind codes mirror `xlsx.DataValidationKind`. Stable numeric codes so
+/// the C/Python surface can switch on them.
+pub const ZLSX_DV_KIND_LIST: u32 = 0;
+pub const ZLSX_DV_KIND_WHOLE: u32 = 1;
+pub const ZLSX_DV_KIND_DECIMAL: u32 = 2;
+pub const ZLSX_DV_KIND_DATE: u32 = 3;
+pub const ZLSX_DV_KIND_TIME: u32 = 4;
+pub const ZLSX_DV_KIND_TEXT_LENGTH: u32 = 5;
+pub const ZLSX_DV_KIND_CUSTOM: u32 = 6;
+pub const ZLSX_DV_KIND_UNKNOWN: u32 = 7;
+
+/// Operator codes mirror `xlsx.DataValidationOperator`. `0xFFFFFFFF`
+/// (`u32 max`) means "absent" — callers should treat it as "no
+/// operator" rather than a valid enum value.
+pub const ZLSX_DV_OP_BETWEEN: u32 = 0;
+pub const ZLSX_DV_OP_NOT_BETWEEN: u32 = 1;
+pub const ZLSX_DV_OP_EQUAL: u32 = 2;
+pub const ZLSX_DV_OP_NOT_EQUAL: u32 = 3;
+pub const ZLSX_DV_OP_LESS_THAN: u32 = 4;
+pub const ZLSX_DV_OP_LESS_THAN_OR_EQUAL: u32 = 5;
+pub const ZLSX_DV_OP_GREATER_THAN: u32 = 6;
+pub const ZLSX_DV_OP_GREATER_THAN_OR_EQUAL: u32 = 7;
+pub const ZLSX_DV_OP_NONE: u32 = 0xFFFFFFFF;
+
+/// Return the kind code (see `ZLSX_DV_KIND_*`) for data validation
+/// `dv_idx` on sheet `idx`. Returns `ZLSX_DV_KIND_UNKNOWN` on index
+/// out of range (callers should bounds-check via
+/// `zlsx_data_validation_count` first).
+export fn zlsx_data_validation_kind(book: *Book, idx: u32, dv_idx: usize) callconv(.c) u32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (idx >= state.inner.sheets.len) return ZLSX_DV_KIND_UNKNOWN;
+    const dvs = state.inner.dataValidations(state.inner.sheets[idx]);
+    if (dv_idx >= dvs.len) return ZLSX_DV_KIND_UNKNOWN;
+    return switch (dvs[dv_idx].kind) {
+        .list => ZLSX_DV_KIND_LIST,
+        .whole => ZLSX_DV_KIND_WHOLE,
+        .decimal => ZLSX_DV_KIND_DECIMAL,
+        .date => ZLSX_DV_KIND_DATE,
+        .time => ZLSX_DV_KIND_TIME,
+        .text_length => ZLSX_DV_KIND_TEXT_LENGTH,
+        .custom => ZLSX_DV_KIND_CUSTOM,
+        .unknown => ZLSX_DV_KIND_UNKNOWN,
+    };
+}
+
+/// Return the operator code (see `ZLSX_DV_OP_*`) for data validation
+/// `dv_idx` on sheet `idx`. Returns `ZLSX_DV_OP_NONE` when the source
+/// had no `operator=` attribute (list / custom validations, or omitted
+/// attribute on numeric types).
+export fn zlsx_data_validation_operator(book: *Book, idx: u32, dv_idx: usize) callconv(.c) u32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (idx >= state.inner.sheets.len) return ZLSX_DV_OP_NONE;
+    const dvs = state.inner.dataValidations(state.inner.sheets[idx]);
+    if (dv_idx >= dvs.len) return ZLSX_DV_OP_NONE;
+    const op = dvs[dv_idx].op orelse return ZLSX_DV_OP_NONE;
+    return switch (op) {
+        .between => ZLSX_DV_OP_BETWEEN,
+        .not_between => ZLSX_DV_OP_NOT_BETWEEN,
+        .equal => ZLSX_DV_OP_EQUAL,
+        .not_equal => ZLSX_DV_OP_NOT_EQUAL,
+        .less_than => ZLSX_DV_OP_LESS_THAN,
+        .less_than_or_equal => ZLSX_DV_OP_LESS_THAN_OR_EQUAL,
+        .greater_than => ZLSX_DV_OP_GREATER_THAN,
+        .greater_than_or_equal => ZLSX_DV_OP_GREATER_THAN_OR_EQUAL,
+    };
+}
+
+/// Copy formula1 of data validation `dv_idx` on sheet `idx` into
+/// `out_ptr` / `out_len`. Pointer lifetime matches the Book. Returns
+/// 0 on success, -1 on out-of-range indices. Empty formula still
+/// returns 0 with `out_len = 0`.
+export fn zlsx_data_validation_formula1(
+    book: *Book,
+    idx: u32,
+    dv_idx: usize,
+    out_ptr: *[*]const u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (idx >= state.inner.sheets.len) return -1;
+    const dvs = state.inner.dataValidations(state.inner.sheets[idx]);
+    if (dv_idx >= dvs.len) return -1;
+    const f = dvs[dv_idx].formula1;
+    out_ptr.* = f.ptr;
+    out_len.* = f.len;
+    return 0;
+}
+
+/// Copy formula2 of data validation `dv_idx` on sheet `idx` into
+/// `out_ptr` / `out_len`. Same contract as `formula1` — empty string
+/// when the source had no `<formula2>`, which is the common case for
+/// operators other than `between` / `not_between`.
+export fn zlsx_data_validation_formula2(
+    book: *Book,
+    idx: u32,
+    dv_idx: usize,
+    out_ptr: *[*]const u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (idx >= state.inner.sheets.len) return -1;
+    const dvs = state.inner.dataValidations(state.inner.sheets[idx]);
+    if (dv_idx >= dvs.len) return -1;
+    const f = dvs[dv_idx].formula2;
+    out_ptr.* = f.ptr;
+    out_len.* = f.len;
+    return 0;
+}
+
 /// Find a sheet by name. Returns the 0-based index, or -1 if not found.
 export fn zlsx_sheet_index_by_name(
     book: *Book,

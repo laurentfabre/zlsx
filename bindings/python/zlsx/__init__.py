@@ -163,6 +163,44 @@ def _decode_err(buf: ctypes.Array) -> str:
     return bytes(buf.value).decode("utf-8", errors="replace")
 
 
+# DataValidation kind / operator code tables mirror the C ABI constants
+# (see zlsx.h ZLSX_DV_KIND_* / ZLSX_DV_OP_*). Kept as plain dicts rather
+# than Enums so callers can compare against simple strings.
+_DV_KIND_FROM_CODE = {
+    0: "list",
+    1: "whole",
+    2: "decimal",
+    3: "date",
+    4: "time",
+    5: "text_length",
+    6: "custom",
+    7: "unknown",
+}
+_DV_OP_FROM_CODE = {
+    0: "between",
+    1: "not_between",
+    2: "equal",
+    3: "not_equal",
+    4: "less_than",
+    5: "less_than_or_equal",
+    6: "greater_than",
+    7: "greater_than_or_equal",
+    # 0xFFFFFFFF → None (handled by dict.get returning None)
+}
+
+
+def _read_dv_formula(fn, handle, sheet_idx: int, dv_idx: int) -> str:
+    """Call a `zlsx_data_validation_formulaN` getter and return the
+    decoded string ("" on -1 or zero length). Shared by formula1 /
+    formula2 paths."""
+    ptr = ctypes.POINTER(ctypes.c_ubyte)()
+    length = ctypes.c_size_t(0)
+    rc = fn(handle, sheet_idx, dv_idx, ctypes.byref(ptr), ctypes.byref(length))
+    if rc != 0 or length.value == 0:
+        return ""
+    return ctypes.string_at(ptr, length.value).decode("utf-8", errors="replace")
+
+
 def _check_argb(name: str, value) -> int:
     """Validate an ARGB colour is in the u32 range. ctypes.c_uint32
     would silently mask a value like 0x1FFFFFFFF into 0xFFFFFFFF — a
@@ -235,14 +273,36 @@ class Hyperlink:
 
 @dataclass(frozen=True)
 class DataValidation:
-    """A list-type (dropdown) data validation on a cell or range.
-    ``values`` is empty when the source validation isn't a literal
-    list — callers still see the range so every validation is
-    enumerable. String values are entity-decoded (``R&D`` not
-    ``R&amp;D``)."""
+    """A data validation (dropdown / numeric / date / time / text-length
+    / custom) on a cell or range.
+
+    ``kind`` is one of ``"list"``, ``"whole"``, ``"decimal"``,
+    ``"date"``, ``"time"``, ``"text_length"``, ``"custom"``, or
+    ``"unknown"`` (forward-compat with generators that introduce new
+    types).
+
+    ``op`` is one of ``"between"``, ``"not_between"``, ``"equal"``,
+    ``"not_equal"``, ``"less_than"``, ``"less_than_or_equal"``,
+    ``"greater_than"``, ``"greater_than_or_equal"``, or ``None`` when
+    the source had no ``operator=`` attribute (list / custom
+    validations, or numeric with an omitted operator).
+
+    ``values`` is populated for list-kind validations only (parsed
+    from the literal quoted CSV in ``formula1``). Range-reference
+    lists (``$A$1:$A$10``) come through as an empty tuple — callers
+    can still read ``formula1`` to resolve the range themselves.
+
+    ``formula1`` / ``formula2`` hold the entity-decoded formula
+    content for non-list validations. ``formula2`` is populated only
+    for ``between`` / ``not_between`` operators. All strings are
+    decoded (``R&D`` not ``R&amp;D``)."""
     top_left: CellRef
     bottom_right: CellRef
     values: tuple[str, ...]
+    kind: str = "list"
+    op: str | None = None
+    formula1: str = ""
+    formula2: str = ""
 
 
 # ─── Book ─────────────────────────────────────────────────────────────
@@ -351,10 +411,11 @@ class Book:
         return out
 
     def data_validations(self, sheet_idx: int) -> list[DataValidation]:
-        """List-type data validations (dropdowns) on ``sheet_idx``.
-        Empty list for sheets without a ``<dataValidations>`` block.
-        Non-list variants still surface the range with an empty
-        ``values`` tuple."""
+        """Data validations on ``sheet_idx`` (dropdowns + numeric / date
+        / time / text-length / custom). Empty list for sheets without a
+        ``<dataValidations>`` block. Extended fields (``kind``, ``op``,
+        ``formula1``, ``formula2``) require libzlsx 0.2.6+; on older
+        libraries they fall back to the list-only defaults."""
         if not self._handle:
             raise ZlsxError("book is closed")
         if not _ffi._HAS_READER_DV:
@@ -384,10 +445,35 @@ class Book:
                 vals.append(
                     ctypes.string_at(vptr, vlen.value).decode("utf-8", errors="replace")
                 )
+            kind = "list"
+            op: str | None = None
+            f1 = ""
+            f2 = ""
+            if _ffi._HAS_READER_DV_EXT:
+                kind_code = _ffi.lib.zlsx_data_validation_kind(
+                    self._handle, sheet_idx, i
+                )
+                kind = _DV_KIND_FROM_CODE.get(kind_code, "unknown")
+                op_code = _ffi.lib.zlsx_data_validation_operator(
+                    self._handle, sheet_idx, i
+                )
+                op = _DV_OP_FROM_CODE.get(op_code)
+                f1 = _read_dv_formula(
+                    _ffi.lib.zlsx_data_validation_formula1,
+                    self._handle, sheet_idx, i,
+                )
+                f2 = _read_dv_formula(
+                    _ffi.lib.zlsx_data_validation_formula2,
+                    self._handle, sheet_idx, i,
+                )
             out.append(DataValidation(
                 top_left=CellRef(col=dv.top_left_col, row=dv.top_left_row),
                 bottom_right=CellRef(col=dv.bottom_right_col, row=dv.bottom_right_row),
                 values=tuple(vals),
+                kind=kind,
+                op=op,
+                formula1=f1,
+                formula2=f2,
             ))
         return out
 

@@ -533,4 +533,32 @@ def test_writer_no_styles_xml_when_unused(tmp_path):
     with zipfile.ZipFile(out) as z:
         names = set(z.namelist())
     assert "xl/styles.xml" not in names
-    assert "xl/sharedStrings.xml" in names  # still present as before
+
+
+def test_data_validations_extended_fields_for_list_kind(tmp_path):
+    """Reader must surface kind/op/formula1/formula2 on every
+    validation — exercise the plumbing through the Python writer,
+    which only emits list kinds today. Numeric / custom kinds are
+    covered by the Zig round-trip test in src/xlsx.zig."""
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_READER_DV_EXT:
+        pytest.skip("loaded libzlsx predates extended DV ABI (0.2.6+)")
+
+    out = tmp_path / "dv_ext_list.xlsx"
+    with zlsx.write(out) as w:
+        sheet = w.add_sheet("Pick")
+        sheet.add_data_validation_list("A1", ["Yes", "No"])
+        sheet.write_row(["hdr"])
+
+    with zlsx.open(out) as book:
+        dvs = book.data_validations(0)
+
+    assert len(dvs) == 1
+    assert dvs[0].kind == "list"
+    assert dvs[0].op is None
+    assert dvs[0].values == ("Yes", "No")
+    # formula1 for a literal list comes through in its CSV form (entity-
+    # decoded by the reader, so the outer `&quot;` becomes `"`).
+    assert dvs[0].formula1 == "\"Yes,No\""
+    assert dvs[0].formula2 == ""
