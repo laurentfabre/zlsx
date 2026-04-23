@@ -1,6 +1,6 @@
 # zlsx
 
-Tiny `.xlsx` reader **and** writer for Zig. Single-file library, no third-party deps — just `std.zip` + `std.compress.flate` + a hand-rolled XML walker scoped to what spreadsheets actually need. Ships with a CLI, a C ABI, and Python bindings.
+Tiny `.xlsx` reader **and** writer for Zig. Single-file library, no third-party deps — just `std.zip` + `std.compress.flate` (for reads) + an in-house LZ77 + fixed-huffman deflate compressor (for writes, since Zig 0.15.2's `std.compress.flate.Compress` is still mid-refactor) + a hand-rolled XML walker scoped to what spreadsheets actually need. Ships with a CLI, a C ABI, and Python bindings.
 
 **Reader**: 10.7 ms / 4.2 MB on a 261 KB / 1,008-row workbook — 1.4× faster than calamine-rust, 4× faster than python-calamine, 24× faster than openpyxl, at one tenth the memory of the Python stack. [Full benchmark table →](docs/benchmarks.md)
 
@@ -152,11 +152,11 @@ Emission overhead is within 3% of the tally-only benchmark — the CLI is fast e
 
 | Library | Time | Peak RSS | Output | Speedup |
 |---|---|---|---|---|
-| **zlsx Writer** | **9.4 ms** | **4.34 MB** | 380 KB | **1.00×** |
-| xlsxwriter 3.2 (`constant_memory`) | 65.7 ms | 25.3 MB | 54 KB | 7.0× slower |
-| openpyxl 3.1 (`write_only`) | 99.4 ms | 28.8 MB | 52 KB | 10.5× slower |
+| **zlsx Writer** | **40.1 ms** | **5.09 MB** | 68 KB | **1.00×** |
+| xlsxwriter 3.2 (`constant_memory`) | 76.4 ms | 25.3 MB | 54 KB | 1.9× slower |
+| openpyxl 3.1 (`write_only`) | 115.7 ms | 28.8 MB | 52 KB | 2.9× slower |
 
-zlsx Writer emits uncompressed (stored) zip entries today — the raw XML payloads match the other libraries within 6%, but the ~7× archive-size gap is pure zip compression. Zig 0.15.2's stdlib deflate compressor is half-written (`std.compress.flate.Compress` hits `@panic("TODO")` on any non-trivial input), so zero-deps deflate isn't possible yet. See [`docs/benchmarks.md`](docs/benchmarks.md) for the full matrix + upstream-blocker notes.
+zlsx Writer ships an in-house LZ77 + fixed-huffman deflate compressor (Zig 0.15.2's stdlib `std.compress.flate.Compress` is still mid-refactor and does not compile). Output is within ~25% of xlsxwriter/openpyxl archive sizes — full match on XML payload, narrow gap on compression ratio. See [`docs/benchmarks.md`](docs/benchmarks.md) for the full matrix.
 
 ## Zig version
 
