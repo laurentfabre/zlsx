@@ -617,6 +617,52 @@ def test_writer_add_data_validation_numeric_and_custom_round_trip(tmp_path):
     assert dvs[5].formula1 == "AND(F6>0,F6<LEN(A1))"
 
 
+def test_shared_strings_enumeration_and_rich_discovery(tmp_path):
+    """The iter37 audit flagged `Book.rich_text(sst_idx)` as
+    effectively undiscoverable — Python callers couldn't enumerate
+    which SST entries carry rich-text runs. iter45 closed it with
+    `Book.shared_strings_count()` + `shared_string_at(idx)` +
+    `shared_strings()`. This test proves the round-trip: write a
+    book with one plain + one rich entry, then enumerate and
+    rediscover which is which."""
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_SST_ENUM:
+        pytest.skip("loaded libzlsx predates SST enum ABI (0.2.6+)")
+
+    out = tmp_path / "sst_enum.xlsx"
+    with zlsx.write(out) as w:
+        sheet = w.add_sheet("S")
+        sheet.write_rich_row([
+            "plain-label",
+            [
+                zlsx.RichRun("bold-part ", bold=True),
+                zlsx.RichRun("italic-part", italic=True),
+            ],
+        ])
+
+    with zlsx.open(out) as book:
+        # Count matches writer's emission order (plain first, then rich).
+        assert book.shared_strings_count() == 2
+        assert book.shared_string_at(0) == "plain-label"
+        assert book.shared_string_at(1) == "bold-part italic-part"
+
+        # shared_strings() materialises everything.
+        all_sst = book.shared_strings()
+        assert all_sst == ["plain-label", "bold-part italic-part"]
+
+        # Discoverability loop: for every entry, check whether it's rich.
+        rich_indices = []
+        for i in range(book.shared_strings_count()):
+            if book.rich_text(i) is not None:
+                rich_indices.append(i)
+        assert rich_indices == [1]
+
+        # Out-of-range raises IndexError per the documented contract.
+        with pytest.raises(IndexError, match="sst_idx .* out of range"):
+            book.shared_string_at(99)
+
+
 def test_rich_text_runs_parse_bold_italic(tmp_path):
     """Build a minimal xlsx with rich-text SST entries via raw zipfile
     (the writer doesn't emit rich text today) and verify the reader

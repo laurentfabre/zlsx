@@ -620,6 +620,25 @@ if _HAS_READER_DV_EXT:
     lib.zlsx_data_validation_formula2.restype = ctypes.c_int32
 
 
+# Shared-string enumeration — added 0.2.6+. Pairs with rich_text to let
+# Python callers discover which SST entries carry formatted runs
+# without hand-tracking indices.
+_HAS_SST_ENUM = (
+    hasattr(lib, "zlsx_shared_string_count")
+    and hasattr(lib, "zlsx_shared_string_at")
+)
+if _HAS_SST_ENUM:
+    lib.zlsx_shared_string_count.argtypes = [book_handle]
+    lib.zlsx_shared_string_count.restype = ctypes.c_size_t
+    lib.zlsx_shared_string_at.argtypes = [
+        book_handle,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.zlsx_shared_string_at.restype = ctypes.c_int32
+
+
 # Rich-text run reading — added in 0.2.6+. Plain single-run SST entries
 # return 0 from rich_run_count so callers can skip them zero-cost.
 _HAS_RICH_RUNS = (

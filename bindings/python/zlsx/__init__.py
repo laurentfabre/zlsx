@@ -606,6 +606,57 @@ class Book:
             ))
         return out
 
+    def shared_strings_count(self) -> int:
+        """Total number of shared-string entries in the workbook.
+        Returns 0 when the workbook has no ``xl/sharedStrings.xml``
+        part (small xlsx files with only inline strings).
+
+        Pair with :meth:`shared_string_at` + :meth:`rich_text` to
+        enumerate every entry and discover which indices carry
+        rich-text runs. Requires libzlsx 0.2.6+."""
+        if not self._handle:
+            raise ZlsxError("book is closed")
+        if not _ffi._HAS_SST_ENUM:
+            raise RuntimeError(
+                "loaded libzlsx does not expose shared_strings_count "
+                "(requires 0.2.6+); upgrade libzlsx"
+            )
+        return _ffi.lib.zlsx_shared_string_count(self._handle)
+
+    def shared_string_at(self, sst_idx: int) -> str:
+        """Return shared-string entry ``sst_idx`` as a decoded UTF-8
+        ``str``. Raises :class:`IndexError` on out-of-range.
+        Requires libzlsx 0.2.6+."""
+        if not self._handle:
+            raise ZlsxError("book is closed")
+        if not _ffi._HAS_SST_ENUM:
+            raise RuntimeError(
+                "loaded libzlsx does not expose shared_string_at "
+                "(requires 0.2.6+); upgrade libzlsx"
+            )
+        out_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        out_len = ctypes.c_size_t(0)
+        rc = _ffi.lib.zlsx_shared_string_at(
+            self._handle, sst_idx, ctypes.byref(out_ptr), ctypes.byref(out_len)
+        )
+        if rc != 0:
+            raise IndexError(f"sst_idx {sst_idx} out of range")
+        if out_len.value == 0:
+            return ""
+        return ctypes.string_at(out_ptr, out_len.value).decode("utf-8", errors="replace")
+
+    def shared_strings(self) -> list[str]:
+        """Materialise every shared-string entry into a Python list.
+        Each element is the entry's plain-text form (rich-text runs
+        are concatenated into the same string by the parser — pair
+        with :meth:`rich_text` to get formatting back).
+
+        Prefer :meth:`shared_string_at` + :meth:`shared_strings_count`
+        when iterating a large SST to avoid materialising the full
+        list. Requires libzlsx 0.2.6+."""
+        count = self.shared_strings_count()
+        return [self.shared_string_at(i) for i in range(count)]
+
     def rich_text(self, sst_idx: int) -> list[RichRun] | None:
         """Rich-text runs for shared-string entry ``sst_idx``. Returns
         ``None`` for plain single-run strings (no ``<r>`` wrappers in

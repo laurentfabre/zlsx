@@ -559,6 +559,34 @@ export fn zlsx_data_validation_formula2(
     return 0;
 }
 
+/// Number of shared-string entries in the workbook. Returns 0 when
+/// the workbook has no `xl/sharedStrings.xml` part (small xlsx files
+/// with only inline strings). Use with `zlsx_shared_string_at` to
+/// enumerate every entry — the pairing lets callers discover which
+/// SST indices carry rich-text runs via `zlsx_rich_run_count`
+/// without having to track the index themselves.
+export fn zlsx_shared_string_count(book: *Book) callconv(.c) usize {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    return state.inner.shared_strings.len;
+}
+
+/// Copy shared-string entry `sst_idx` into `out_ptr` / `out_len`
+/// (slice into the Book's internal buffers; do not free). Returns
+/// 0 on success, -1 if `sst_idx` is out of range.
+export fn zlsx_shared_string_at(
+    book: *Book,
+    sst_idx: usize,
+    out_ptr: *[*]const u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (sst_idx >= state.inner.shared_strings.len) return -1;
+    const s = state.inner.shared_strings[sst_idx];
+    out_ptr.* = if (s.len == 0) @ptrCast("") else s.ptr;
+    out_len.* = s.len;
+    return 0;
+}
+
 /// Number of rich-text runs for shared-string entry `sst_idx`, or 0
 /// when that entry is a plain single-run string (no `<r>` wrappers in
 /// the source XML — the common case). Use this as a presence probe

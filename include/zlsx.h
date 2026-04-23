@@ -312,6 +312,24 @@ int32_t zlsx_data_validation_formula2(zlsx_book_t *     book,
                                       size_t *          out_len);
 
 /*
+ * Total number of shared-string entries (0 when the workbook has
+ * no xl/sharedStrings.xml part). Enumerate via zlsx_shared_string_at
+ * together with zlsx_rich_run_count to discover which indices carry
+ * rich-text runs.
+ */
+size_t zlsx_shared_string_count(zlsx_book_t * book);
+
+/*
+ * Copy SST entry `sst_idx` into `*out_ptr` / `*out_len`. Slice into
+ * Book-owned storage; do not free. Returns 0 on success, -1 on
+ * out-of-range.
+ */
+int32_t zlsx_shared_string_at(zlsx_book_t *     book,
+                              size_t            sst_idx,
+                              const uint8_t * * out_ptr,
+                              size_t *          out_len);
+
+/*
  * Number of rich-text runs for shared-string entry `sst_idx`, or 0
  * when that entry is a plain single-run string. Use this as a
  * presence probe before zlsx_rich_run_at(); SST entries without any
