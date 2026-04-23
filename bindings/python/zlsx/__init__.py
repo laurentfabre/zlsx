@@ -573,6 +573,43 @@ class Book:
             ))
         return out
 
+    def number_format(self, style_idx: int) -> str | None:
+        """Resolve a cell's style index (from ``Rows.style_indices()``)
+        to its number-format code. Returns ``None`` on out-of-range
+        indices or when the workbook has no ``xl/styles.xml``. Custom
+        codes are whatever the source file declared; built-in ids
+        decode to their canonical patterns (e.g. ``14`` →
+        ``"m/d/yyyy"``). Requires libzlsx 0.2.6+."""
+        if not self._handle:
+            raise ZlsxError("book is closed")
+        if not _ffi._HAS_NUM_FMT:
+            raise RuntimeError(
+                "loaded libzlsx does not expose number_format "
+                "(requires 0.2.6+); upgrade libzlsx"
+            )
+        out_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        out_len = ctypes.c_size_t(0)
+        rc = _ffi.lib.zlsx_number_format(
+            self._handle, style_idx, ctypes.byref(out_ptr), ctypes.byref(out_len)
+        )
+        if rc != 0:
+            return None
+        return ctypes.string_at(out_ptr, out_len.value).decode("utf-8", errors="replace")
+
+    def is_date_format(self, style_idx: int) -> bool:
+        """True when the style index resolves to a date / time /
+        datetime pattern. Combine with ``xlsx.fromExcelSerial`` (or
+        the Python equivalent) to auto-convert numeric cells to
+        datetimes. Requires libzlsx 0.2.6+."""
+        if not self._handle:
+            raise ZlsxError("book is closed")
+        if not _ffi._HAS_NUM_FMT:
+            raise RuntimeError(
+                "loaded libzlsx does not expose is_date_format "
+                "(requires 0.2.6+); upgrade libzlsx"
+            )
+        return bool(_ffi.lib.zlsx_is_date_format(self._handle, style_idx))
+
     def close(self) -> None:
         """Drop our reference to the book. Active row iterators hold their
         own references, so this is safe to call before iteration finishes —
@@ -630,6 +667,12 @@ class Rows:
 
     def __init__(self, book: Book, sheet_idx: int):
         self._err = ctypes.create_string_buffer(_ERR_BUF_LEN)
+        # Hold a reference to the Python Book so callers using iter29
+        # helpers (`style_indices`, `number_format`) don't have to
+        # thread it themselves, and to extend GC lifetime of the
+        # underlying Book handle until this iterator is closed.
+        self._book = book
+        self._current_len = 0
         self._handle = _ffi.lib.zlsx_rows_open(
             book._handle, sheet_idx, self._err, _ERR_BUF_LEN
         )
@@ -654,8 +697,33 @@ class Rows:
         if rc < 0:
             raise ZlsxError(f"zlsx_rows_next: {_decode_err(self._err)}")
 
+        self._current_len = cells_len.value
         row = [_cell_to_py(cells_ptr[i]) for i in range(cells_len.value)]
         return row
+
+    def style_indices(self) -> list[int | None]:
+        """Style index for each cell in the most recently yielded row.
+        ``None`` when the source `<c>` had no ``s`` attribute (General
+        format). Layout mirrors the last row returned by ``next()`` so
+        positional indexing matches. Raises :class:`RuntimeError` if
+        the loaded libzlsx predates the 0.2.6+ numFmt ABI."""
+        if not _ffi._HAS_NUM_FMT:
+            raise RuntimeError(
+                "loaded libzlsx does not expose per-cell style indices "
+                "(requires 0.2.6+); upgrade libzlsx"
+            )
+        out: list[int | None] = []
+        sidx = ctypes.c_uint32(0)
+        for col in range(self._current_len):
+            rc = _ffi.lib.zlsx_rows_style_at(self._handle, col, ctypes.byref(sidx))
+            if rc == 0:
+                out.append(int(sidx.value))
+            elif rc == 1:
+                out.append(None)
+            else:
+                # Out of range shouldn't happen within _current_len.
+                out.append(None)
+        return out
 
     def close(self) -> None:
         if self._handle:

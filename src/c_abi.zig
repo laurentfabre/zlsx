@@ -706,6 +706,53 @@ export fn zlsx_rows_next(
     return 1;
 }
 
+/// Style index for column `col_idx` of the most recently yielded row.
+/// Valid between `zlsx_rows_next` calls (the same lifetime contract
+/// as the cells). Returns:
+///    0 → `*out_style_idx` is set to the cell's `s="…"` attribute
+///    1 → the cell had no `s` attribute (General / implicit style)
+///   -1 → `col_idx` is out of range for the current row
+export fn zlsx_rows_style_at(
+    rows: *Rows,
+    col_idx: usize,
+    out_style_idx: *u32,
+) callconv(.c) i32 {
+    const rs: *RowsState = @ptrCast(@alignCast(rows));
+    const styles = rs.inner.styleIndices();
+    if (col_idx >= styles.len) return -1;
+    const s = styles[col_idx] orelse return 1;
+    out_style_idx.* = s;
+    return 0;
+}
+
+/// Resolve a style index to its number-format code. Returns:
+///    0 → `*out_ptr` / `*out_len` point at the format string (lifetime
+///        matches the Book; borrows from styles.xml for custom
+///        codes, or a constant string for built-ins)
+///   -1 → `style_idx` is out of range or the workbook has no
+///        resolvable format for that index (malformed / missing
+///        styles.xml)
+export fn zlsx_number_format(
+    book: *Book,
+    style_idx: u32,
+    out_ptr: *[*]const u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    const code = state.inner.numberFormat(style_idx) orelse return -1;
+    out_ptr.* = code.ptr;
+    out_len.* = code.len;
+    return 0;
+}
+
+/// Returns 1 if `style_idx` resolves to a date/time pattern, 0
+/// otherwise (including out-of-range indices and workbooks without
+/// styles.xml).
+export fn zlsx_is_date_format(book: *Book, style_idx: u32) callconv(.c) u8 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    return if (state.inner.isDateFormat(style_idx)) 1 else 0;
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────
 
 test "abi version" {

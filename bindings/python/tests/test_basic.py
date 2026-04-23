@@ -779,6 +779,52 @@ def test_rich_text_runs_color_size_font(tmp_path):
         assert runs[0].font_name == ""
 
 
+def test_rows_style_indices_and_book_number_format(tmp_path):
+    """Round-trip: writer emits styled cells with custom number
+    formats, reader gets back per-cell style indices via
+    `Rows.style_indices()` + resolves them via `Book.number_format` /
+    `is_date_format`. Covers the iter29 symmetry-closer."""
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_NUM_FMT:
+        pytest.skip("loaded libzlsx predates numFmt ABI (0.2.6+)")
+
+    out = tmp_path / "numfmt.xlsx"
+    with zlsx.write(out) as w:
+        date_style = w.add_style(zlsx.Style(number_format="yyyy-mm-dd"))
+        pct_style = w.add_style(zlsx.Style(number_format="0.00%"))
+        sheet = w.add_sheet("S")
+        sheet.write_row(["hdr"])
+        sheet.write_row(
+            [44927, 0.25, 42],
+            styles=[date_style, pct_style, 0],
+        )
+
+    with zlsx.open(out) as book:
+        with book.sheet(0).rows() as rows:
+            next(rows)  # header row
+            cells = next(rows)
+            assert cells == [44927, 0.25, 42]
+            styles = rows.style_indices()
+            assert len(styles) == 3
+            s0, s1, s2 = styles
+            # Date column resolves back to custom numFmt + isDateFormat.
+            assert s0 is not None
+            assert book.number_format(s0) == "yyyy-mm-dd"
+            assert book.is_date_format(s0) is True
+            # Percentage custom code, not a date.
+            assert s1 is not None
+            assert book.number_format(s1) == "0.00%"
+            assert book.is_date_format(s1) is False
+            # Plain integer column with style 0 (default General).
+            if s2 is not None:
+                assert book.is_date_format(s2) is False
+
+        # Out-of-range style index → None.
+        assert book.number_format(99999) is None
+        assert book.is_date_format(99999) is False
+
+
 def test_writer_add_data_validation_rejects_invalid_inputs(tmp_path):
     """Exercise every error path on the extended writer DV APIs so the
     rejection behaviour from the Zig writer surfaces cleanly."""

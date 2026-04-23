@@ -369,6 +369,32 @@ int32_t zlsx_rows_next(zlsx_rows_t         * rows,
                        uint8_t            * err_buf,
                        size_t               err_buf_len);
 
+/*
+ * Style index for column `col_idx` of the most recently yielded row.
+ * Valid between zlsx_rows_next() calls. Returns 0 and writes
+ * `*out_style_idx` when the cell had an `s="…"` attribute; returns
+ * 1 when the cell had no `s` (General / implicit style); returns -1
+ * when `col_idx` is out of range for the current row.
+ */
+int32_t zlsx_rows_style_at(zlsx_rows_t * rows,
+                           size_t        col_idx,
+                           uint32_t    * out_style_idx);
+
+/*
+ * Resolve a style index to its number-format code. Returns 0 and
+ * populates `*out_ptr` / `*out_len` on success; returns -1 on
+ * out-of-range indices or when the workbook has no styles.xml.
+ * Pointer lifetime matches the Book.
+ */
+int32_t zlsx_number_format(zlsx_book_t *     book,
+                           uint32_t          style_idx,
+                           const uint8_t * * out_ptr,
+                           size_t *          out_len);
+
+/* Returns 1 if `style_idx` resolves to a date/time pattern, 0
+ * otherwise (including out-of-range indices). */
+uint8_t zlsx_is_date_format(zlsx_book_t * book, uint32_t style_idx);
+
 /* ─── Writer (ABI v1, added in 0.2.2) ─────────────────────────────── */
 
 /*

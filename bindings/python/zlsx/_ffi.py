@@ -547,6 +547,30 @@ if _HAS_RICH_RUNS_EXT:
     lib.zlsx_rich_run_font_name.restype = ctypes.c_int32
 
 
+# Number-format / per-cell style-index surface — added in 0.2.6+.
+_HAS_NUM_FMT = (
+    hasattr(lib, "zlsx_rows_style_at")
+    and hasattr(lib, "zlsx_number_format")
+    and hasattr(lib, "zlsx_is_date_format")
+)
+if _HAS_NUM_FMT:
+    lib.zlsx_rows_style_at.argtypes = [
+        rows_handle,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    lib.zlsx_rows_style_at.restype = ctypes.c_int32
+    lib.zlsx_number_format.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.zlsx_number_format.restype = ctypes.c_int32
+    lib.zlsx_is_date_format.argtypes = [book_handle, ctypes.c_uint32]
+    lib.zlsx_is_date_format.restype = ctypes.c_uint8
+
+
 _HAS_STYLES_EX = hasattr(lib, "zlsx_writer_add_style_ex")
 if _HAS_STYLES_EX:
     lib.zlsx_writer_add_style_ex.argtypes = [
