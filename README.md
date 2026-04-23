@@ -2,7 +2,7 @@
 
 Tiny `.xlsx` reader **and** writer for Zig. Single-file library, no third-party deps — just `std.zip` + `std.compress.flate` (for reads) + an in-house LZ77 + dynamic-huffman deflate compressor with lazy matching (for writes, since Zig 0.15.2's `std.compress.flate.Compress` is still mid-refactor) + a hand-rolled XML walker scoped to what spreadsheets actually need. Ships with a CLI, a C ABI, and Python bindings.
 
-**Reader**: 1.5-2.5 ms on small files (alongside calamine-rust, process-startup-bound), 13 ms / 3.4 MB on a 67 KB workbook with 1,144 shared strings — 1.4× faster than python-calamine, 5.6× faster than openpyxl on that file, at ~5× lower RSS than the Python stack. calamine-rust still leads on SST-heavy workloads (3.5 ms vs zlsx's 13 ms post-arena). [Full benchmark table →](docs/benchmarks.md)
+**Reader**: 1.5-2.5 ms on small files (alongside calamine-rust, process-startup-bound), 11.8 ms / 3.4 MB on a 67 KB workbook with 1,144 shared strings — 1.6× faster than python-calamine, 6.4× faster than openpyxl on that file, at ~5× lower RSS than the Python stack. calamine-rust still leads on SST-heavy workloads (2.3 ms vs zlsx's 11.8 ms post single-pass rewrite); the remaining gap is stdlib-flate decompression overhead. [Full benchmark table →](docs/benchmarks.md)
 
 **Writer** (Phase 3b, v0.2.4): pragmatic openpyxl-parity styles — bold/italic, font size/name/color, horizontal alignment, wrap text, 19 OOXML fill patterns, 14 border styles × 5 sides, custom number formats, column widths, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks, list-type data validations (dropdowns). Survived 1M-iter deep fuzz on every surface.
 
@@ -142,10 +142,10 @@ Emission overhead is within 3% of the tally-only benchmark — the CLI is fast e
 
 | Library | Time | Peak RSS | Speedup |
 |---|---|---|---|
-| calamine-rust 0.26 | **3.5 ms** | 3.09 MB | **1.00×** |
-| **zlsx** | 13.4 ms | 3.38 MB | 3.84× slower |
-| python-calamine 0.6 | 19.2 ms | 17.0 MB | 5.49× slower |
-| openpyxl 3.1 (read_only) | 75.1 ms | 29.9 MB | 21.46× slower |
+| calamine-rust 0.26 | **2.3 ms** | 3.09 MB | **1.00×** |
+| **zlsx** | 11.8 ms | 3.38 MB | 5.13× slower |
+| python-calamine 0.6 | 19.2 ms | 17.0 MB | 8.35× slower |
+| openpyxl 3.1 (read_only) | 75.1 ms | 29.9 MB | 32.65× slower |
 
 zlsx sits alongside calamine-rust at 1.5-2.5 ms on smaller files (≤30 KB, both startup-bound) and beats every Python option 4-40× across the whole corpus; SST-heavy reads vs calamine remain an open perf TODO (see [docs/benchmarks.md](docs/benchmarks.md) for the breakdown).
 

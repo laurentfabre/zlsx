@@ -1112,78 +1112,136 @@ fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
     try strings.ensureTotalCapacity(book.allocator, hint);
     const arena_alloc = book.sst_arena.allocator();
 
+    // Single-pass byte walker driven by `indexOfScalarPos('<')` — the
+    // SIMD-accelerated scalar scan is meaningfully faster than
+    // `indexOfPos` on 2-3 byte needles. Each `<` hit peeks 1-2 bytes
+    // to identify the tag type, then either consumes it (updating
+    // the local accumulator) or advances past it.
+    //
+    // CRITICAL — every code path must strictly advance either `i`
+    // (outer) or `j` (inner) on each iteration, including on
+    // malformed input. The earlier attempt at this rewrite lacked
+    // an `i` advance on the "inner loop exhausted body without
+    // finding </si>" path, which hung the fuzz. The explicit
+    // `i = si_gt + 1; continue :outer` below is that fix.
+    const xml = sst_xml;
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, sst_xml, i, "<si")) |si_start| {
-        const si_gt = std.mem.indexOfScalarPos(u8, sst_xml, si_start, '>') orelse break;
-        const is_self_closing = si_gt > 0 and sst_xml[si_gt - 1] == '/';
-        if (is_self_closing) {
-            try strings.append(book.allocator, "");
-            i = si_gt + 1;
+
+    outer: while (i < xml.len) {
+        const i_prev = i;
+
+        // Find next `<si` — scalar `<` scan + 2-byte peek.
+        const lt = std.mem.indexOfScalarPos(u8, xml, i, '<') orelse break;
+        if (lt + 3 > xml.len) break;
+        if (xml[lt + 1] != 's' or xml[lt + 2] != 'i') {
+            i = lt + 1;
+            std.debug.assert(i > i_prev);
             continue;
         }
-        const si_close = std.mem.indexOfPos(u8, sst_xml, si_gt, "</si>") orelse break;
-        const body = sst_xml[si_gt + 1 .. si_close];
+        // Opening `<si` tag end — `<si>` or `<si/>` or `<si attr="…">`.
+        const si_gt = std.mem.indexOfScalarPos(u8, xml, lt + 3, '>') orelse break;
+        if (si_gt > 0 and xml[si_gt - 1] == '/') {
+            try strings.append(book.allocator, "");
+            i = si_gt + 1;
+            std.debug.assert(i > i_prev);
+            continue;
+        }
 
-        // Pass 1: tally <t> tags + detect entities + remember the first
-        // span. Lets us pick the cheapest finishing path below without
-        // speculatively allocating a concat buffer that we'd then throw
-        // away on the borrow path (which is the common case for
-        // workbooks that don't use rich text / XML entities).
+        // Walk body — commit to one of three finishing paths without
+        // re-scanning:
+        //   t_count == 0  → ""
+        //   t_count == 1  → borrow (no entities) or decode-into-arena
+        //   t_count ≥ 2   → multi-run; buf collects the decoded concat
         var t_count: usize = 0;
         var first_span: []const u8 = "";
-        var has_entities = false;
-        var probe: usize = 0;
-        while (std.mem.indexOfPos(u8, body, probe, "<t")) |t_start| {
-            const gt = std.mem.indexOfScalarPos(u8, body, t_start, '>') orelse break;
-            if (body[gt - 1] == '/') {
-                probe = gt + 1;
-                continue;
-            }
-            const t_close = std.mem.indexOfPos(u8, body, gt + 1, "</t>") orelse break;
-            const span = body[gt + 1 .. t_close];
-            if (std.mem.indexOfScalar(u8, span, '&') != null) has_entities = true;
-            if (t_count == 0) first_span = span;
-            t_count += 1;
-            probe = t_close + "</t>".len;
-        }
+        var first_has_ent = false;
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
 
-        if (t_count == 0) {
-            try strings.append(book.allocator, "");
-        } else if (t_count == 1 and !has_entities) {
-            // Fast path — borrow the single `<t>` span directly. This
-            // is typically 95 %+ of SST entries for xlsx files that
-            // don't use rich-text formatting, so avoiding the
-            // allocation matters.
-            try strings.append(book.allocator, first_span);
-        } else {
-            // Slow path: concat (and maybe decode) every <t> run into
-            // the SST arena. Pre-size to `body.len` so the ArrayList
-            // never reallocates — decoded output is always ≤ body size
-            // since every entity (`&amp;`, `&#NNN;`) is strictly longer
-            // than its decoded byte(s). Saves ~7 geometric reallocs per
-            // entry on long entity-bearing strings, which is where the
-            // previous revision bled most of parseSST's runtime.
-            var buf: std.ArrayListUnmanaged(u8) = try .initCapacity(arena_alloc, body.len);
-            var j: usize = 0;
-            while (std.mem.indexOfPos(u8, body, j, "<t")) |t_start| {
-                const gt = std.mem.indexOfScalarPos(u8, body, t_start, '>') orelse break;
-                if (body[gt - 1] == '/') {
-                    j = gt + 1;
-                    continue;
+        var j: usize = si_gt + 1;
+        body: while (j < xml.len) {
+            const j_prev = j;
+            const next_lt = std.mem.indexOfScalarPos(u8, xml, j, '<') orelse break :body;
+            if (next_lt + 2 > xml.len) break :body;
+            const c1 = xml[next_lt + 1];
+
+            if (c1 == 't' and (next_lt + 2 == xml.len or
+                xml[next_lt + 2] == '>' or xml[next_lt + 2] == ' ' or xml[next_lt + 2] == '/'))
+            {
+                // `<t>`, `<t attr="…">`, or `<t/>`.
+                const t_gt = std.mem.indexOfScalarPos(u8, xml, next_lt + 2, '>') orelse break :body;
+                if (t_gt > 0 and xml[t_gt - 1] == '/') {
+                    j = t_gt + 1;
+                    std.debug.assert(j > j_prev);
+                    continue :body;
                 }
-                const t_close = std.mem.indexOfPos(u8, body, gt + 1, "</t>") orelse break;
-                const span = body[gt + 1 .. t_close];
-                if (has_entities) {
-                    try appendDecoded(arena_alloc, &buf, span);
+                const t_close = std.mem.indexOfPos(u8, xml, t_gt + 1, "</t>") orelse break :body;
+                const span = xml[t_gt + 1 .. t_close];
+                const span_has_ent = std.mem.indexOfScalar(u8, span, '&') != null;
+
+                if (t_count == 0) {
+                    first_span = span;
+                    first_has_ent = span_has_ent;
                 } else {
-                    buf.appendSliceAssumeCapacity(span);
+                    // Promote to `buf` on the 2nd <t>. Seed with the
+                    // decoded first span, then append the current span.
+                    if (buf.capacity == 0) {
+                        const cap: usize = first_span.len + span.len + 8;
+                        buf = try .initCapacity(arena_alloc, cap);
+                        if (first_has_ent) {
+                            try appendDecoded(arena_alloc, &buf, first_span);
+                        } else {
+                            buf.appendSliceAssumeCapacity(first_span);
+                        }
+                    }
+                    try buf.ensureUnusedCapacity(arena_alloc, span.len);
+                    if (span_has_ent) {
+                        try appendDecoded(arena_alloc, &buf, span);
+                    } else {
+                        buf.appendSliceAssumeCapacity(span);
+                    }
                 }
+                t_count += 1;
                 j = t_close + "</t>".len;
+                std.debug.assert(j > j_prev);
+            } else if (c1 == '/' and next_lt + 5 <= xml.len and
+                xml[next_lt + 2] == 's' and xml[next_lt + 3] == 'i' and xml[next_lt + 4] == '>')
+            {
+                // `</si>` — emit and advance past it.
+                if (t_count == 0) {
+                    try strings.append(book.allocator, "");
+                } else if (t_count == 1) {
+                    if (first_has_ent) {
+                        var b: std.ArrayListUnmanaged(u8) = try .initCapacity(arena_alloc, first_span.len);
+                        try appendDecoded(arena_alloc, &b, first_span);
+                        try strings.append(book.allocator, try b.toOwnedSlice(arena_alloc));
+                    } else {
+                        // Fast borrow path — zero allocations.
+                        try strings.append(book.allocator, first_span);
+                    }
+                } else {
+                    try strings.append(book.allocator, try buf.toOwnedSlice(arena_alloc));
+                }
+                i = next_lt + 5;
+                std.debug.assert(i > i_prev);
+                continue :outer;
+            } else {
+                // Skip any other tag (`<r>`, `<rPr>`, a `<t` followed
+                // by a non-space/slash/gt, etc.). indexOfScalarPos
+                // starts from `next_lt + 1` so it can't re-match the
+                // same `<`; the `j` update is strictly monotonic.
+                const skip_gt = std.mem.indexOfScalarPos(u8, xml, next_lt + 1, '>') orelse break :body;
+                j = skip_gt + 1;
+                std.debug.assert(j > j_prev);
             }
-            try strings.append(book.allocator, try buf.toOwnedSlice(arena_alloc));
         }
 
-        i = si_close + "</si>".len;
+        // Inner body loop fell through without finding `</si>` —
+        // malformed SST entry. Advance `i` past the opening `<si` we
+        // found so the outer loop makes monotonic progress (the iter16
+        // bug was forgetting this and re-entering the same bad `<si>`
+        // forever on fuzz-random input).
+        i = si_gt + 1;
+        std.debug.assert(i > i_prev);
     }
 
     book.shared_strings = try strings.toOwnedSlice(book.allocator);

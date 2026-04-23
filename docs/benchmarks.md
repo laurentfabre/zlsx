@@ -22,7 +22,7 @@ Shared workload: `open → iter rows → tally cells by {empty, string, integer,
 | frictionless_2sheets.xlsx | 4.9 KB | 3 × 3 | 2.4 ± 0.6 | **1.4 ± 0.2** | 16.2 ± 0.4 | 64.5 ± 0.6 |
 | openpyxl_guess_types.xlsx | 29 KB | 2 × 5 | 1.8 ± 0.3 | **1.5 ± 0.2** | 16.4 ± 0.3 | 65.5 ± 0.9 |
 | phpoi_test1.xlsx | 9.8 KB | 8 × varied | 2.0 ± 0.2 | **1.5 ± 0.1** | 16.6 ± 0.4 | 65.5 ± 1.0 |
-| worldbank_catalog.xlsx | 67 KB | 161 × 26, **1,144 SST** | 13.4 ± 0.4 | **3.5 ± 0.3** | 19.2 ± 0.4 | 75.1 ± 0.8 |
+| worldbank_catalog.xlsx | 67 KB | 161 × 26, **1,144 SST** | 11.8 ± 0.4 | **2.3 ± 0.2** | 19.2 ± 0.4 | 75.1 ± 0.8 |
 
 ## Speedup
 
@@ -31,18 +31,18 @@ On the biggest reproducible workload where parsing dominates over startup:
 ```
 worldbank_catalog.xlsx (67 KB, 161 rows × 26 cols, 1,144 shared strings)
 
-  calamine-rust   ▌         3.5 ms     1.00×
-  zlsx            ▌▌▌▌     13.4 ms     3.8× slower
-  python-calamine ▌▌▌▌▌▌   19.2 ms     5.5× slower
-  openpyxl        ▌▌…▌▌    75.1 ms    21.5× slower
+  calamine-rust   ▌         2.3 ms     1.00×
+  zlsx            ▌▌▌▌▌    11.8 ms     5.1× slower
+  python-calamine ▌▌▌▌▌▌▌  19.2 ms     8.3× slower
+  openpyxl        ▌▌…▌▌    75.1 ms    32.7× slower
 ```
 
 Throughput at that size:
 
 | Impl | MB/s (of input archive) | rows/s |
 |---|---|---|
-| calamine-rust | 19.1 | 46,000 |
-| zlsx | 5.0 | 12,010 |
+| calamine-rust | 29.1 | 70,000 |
+| zlsx | 5.7 | 13,644 |
 | python-calamine | 3.5 | 8,380 |
 | openpyxl | 0.89 | 2,140 |
 
@@ -63,11 +63,16 @@ Both native binaries sit ~5-10× below the Python stack.
 
 ## Where the remaining big-SST gap against calamine comes from
 
-Post-iter9 allocator optimisations (SST arena + per-row arena + pre-sized slow-path buffers) cut the worldbank number from 16.2 → 13.4 ms — but calamine-rust is still ~3.8× ahead on that workload. Likely remaining causes:
+Iterative allocator + parser optimisations cut the worldbank number from 16.2 → 13.4 → **11.8 ms**:
 
-1. **Parse cost per SST entry**: zlsx still does 4-5 distinct `indexOfPos` scans per `<si>` entry (`<si`, `>`, `</si>`, `<t`, `</t>`). With 1,144 entries that's ~6k scans — SWAR-accelerated and fast per call, but the cumulative cost plus allocator pressure is a few ms. A single-pass state-machine-style parser (calamine-style) would amortise better.
-2. **Row iteration allocation shape**: zlsx allocates a fresh `[]Cell` per `rows.next()` call; calamine materialises the entire sheet into one `Range` up front (higher peak allocation, but one pass through the allocator).
-3. **Decompressor overhead**: `std.compress.flate.Decompress` takes ~1.8 ms to unpack the whole archive; calamine's `zune-flate` or similar appears faster. Upstream territory.
+- iter9: SST arena + per-row arena + pre-sized slow-path buffers (16.2 → 13.4)
+- iter18: single-pass state-machine SST parser driven by `indexOfScalarPos('<')` + peek, replacing ~4-5 separate `indexOfPos` scans per `<si>` entry. parseSST-specific cost dropped from ~5.0 → ~3.4 ms — about 32 % on that phase, ~9 % overall (13.4 → 11.8).
+
+calamine-rust is still ~5× ahead. The remaining gap is now structural:
+
+1. **Decompressor overhead**: `std.compress.flate.Decompress` takes ~4-5 ms to unpack the archive (`extract` phase above). calamine's `zune-flate` is noticeably faster; closing this needs either a stdlib fix or vendoring a third-party deflate decoder.
+2. **Row iteration allocation shape**: zlsx allocates a fresh `[]Cell` per `rows.next()` call; calamine materialises the entire sheet into one `Range` up front (higher peak allocation, one pass through the allocator).
+3. **Zig stdlib `indexOf` tuning** vs `quick-xml` SIMD tokenisation: even our new state-machine loop uses stdlib scans. A hand-rolled SIMD tag scanner could close another slice.
 
 On pure-inline-string workloads (no SST), the gap closes significantly — zlsx's fast path (borrow-when-safe + dense row emit) is competitive with calamine's.
 
