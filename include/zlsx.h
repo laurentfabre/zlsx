@@ -169,6 +169,33 @@ int32_t zlsx_hyperlink_at(zlsx_book_t *      book,
                           zlsx_hyperlink_t * out);
 
 /*
+ * Cell comment parsed from xl/comments*.xml. Author / text slices
+ * point into the Book's internal arena; valid until
+ * zlsx_book_close(). Comment bodies that use rich-text runs come
+ * back as the concatenated plain text (rich-comment surface can be
+ * added in a follow-up without breaking this struct).
+ */
+typedef struct {
+    uint32_t        cell_col;
+    uint32_t        cell_row;
+    size_t          author_len;
+    const uint8_t * author_ptr;
+    size_t          text_len;
+    const uint8_t * text_ptr;
+} zlsx_comment_t;
+
+/* Number of comments on sheet `sheet_idx`. Returns 0 on out-of-range
+ * or no-comments. */
+size_t zlsx_comment_count(zlsx_book_t * book, uint32_t sheet_idx);
+
+/* Copy comment `comment_idx` on sheet `sheet_idx`. Returns 0 on
+ * success, -1 on out-of-range indices. */
+int32_t zlsx_comment_at(zlsx_book_t *    book,
+                        uint32_t         sheet_idx,
+                        size_t           comment_idx,
+                        zlsx_comment_t * out);
+
+/*
  * Data-validation entry. `values_count` is the number of dropdown
  * options for type="list" validations; other variants still surface
  * the range with values_count=0. Values themselves are pulled via

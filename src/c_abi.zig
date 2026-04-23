@@ -340,6 +340,49 @@ export fn zlsx_hyperlink_at(
     return 0;
 }
 
+/// C-shape for a single cell comment. Author / text slices point
+/// into the Book's internal arena; valid until `zlsx_book_close`.
+pub const CComment = extern struct {
+    cell_col: u32,
+    cell_row: u32,
+    author_len: usize,
+    author_ptr: [*]const u8,
+    text_len: usize,
+    text_ptr: [*]const u8,
+};
+
+/// Number of cell comments on sheet `idx`. Returns 0 if `idx` is out
+/// of range or the sheet has none.
+export fn zlsx_comment_count(book: *Book, idx: u32) callconv(.c) usize {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (idx >= state.inner.sheets.len) return 0;
+    return state.inner.comments(state.inner.sheets[idx]).len;
+}
+
+/// Copy comment `comment_idx` on sheet `idx` into `out`. Returns 0
+/// on success, -1 if either index is out of range.
+export fn zlsx_comment_at(
+    book: *Book,
+    idx: u32,
+    comment_idx: usize,
+    out: *CComment,
+) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (idx >= state.inner.sheets.len) return -1;
+    const cs = state.inner.comments(state.inner.sheets[idx]);
+    if (comment_idx >= cs.len) return -1;
+    const c = cs[comment_idx];
+    out.* = .{
+        .cell_col = c.top_left.col,
+        .cell_row = c.top_left.row,
+        .author_len = c.author.len,
+        .author_ptr = if (c.author.len == 0) @ptrCast("") else c.author.ptr,
+        .text_len = c.text.len,
+        .text_ptr = if (c.text.len == 0) @ptrCast("") else c.text.ptr,
+    };
+    return 0;
+}
+
 /// C-shape for a single data-validation entry. `values_count` is the
 /// number of dropdown options (0 for non-list validations); callers
 /// must iterate via `zlsx_data_validation_value_at` to pull each

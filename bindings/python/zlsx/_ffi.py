@@ -421,6 +421,33 @@ if _HAS_READER_META:
     lib.zlsx_hyperlink_at.restype = ctypes.c_int32
 
 
+class CComment(ctypes.Structure):
+    _fields_ = [
+        ("cell_col", ctypes.c_uint32),
+        ("cell_row", ctypes.c_uint32),
+        ("author_len", ctypes.c_size_t),
+        ("author_ptr", ctypes.POINTER(ctypes.c_ubyte)),
+        ("text_len", ctypes.c_size_t),
+        ("text_ptr", ctypes.POINTER(ctypes.c_ubyte)),
+    ]
+
+
+_HAS_COMMENTS = (
+    hasattr(lib, "zlsx_comment_count")
+    and hasattr(lib, "zlsx_comment_at")
+)
+if _HAS_COMMENTS:
+    lib.zlsx_comment_count.argtypes = [book_handle, ctypes.c_uint32]
+    lib.zlsx_comment_count.restype = ctypes.c_size_t
+    lib.zlsx_comment_at.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.c_size_t,
+        ctypes.POINTER(CComment),
+    ]
+    lib.zlsx_comment_at.restype = ctypes.c_int32
+
+
 class CDataValidation(ctypes.Structure):
     _fields_ = [
         ("top_left_col", ctypes.c_uint32),

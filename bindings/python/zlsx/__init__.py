@@ -52,6 +52,7 @@ __all__ = [
     "Font",
     "Fill",
     "Border",
+    "Comment",
     "ZlsxError",
 ]
 
@@ -355,6 +356,19 @@ class Fill:
 
 
 @dataclass(frozen=True)
+class Comment:
+    """A cell comment / note parsed from ``xl/comments*.xml``.
+    ``top_left`` points at the commented cell. ``author`` resolves
+    through the ``<authors>`` table; ``text`` is the concatenated
+    plain-text body (rich runs inside a comment are flattened — the
+    formatted form lands in a follow-up without breaking this
+    shape). All strings are entity-decoded."""
+    top_left: CellRef
+    author: str
+    text: str
+
+
+@dataclass(frozen=True)
 class Border:
     """Cell border resolved via ``Book.cell_border(style_idx)``.
     Every side is always present; absent sides have ``style=""``.
@@ -469,6 +483,42 @@ class Book:
                 top_left=CellRef(col=hl.top_left_col, row=hl.top_left_row),
                 bottom_right=CellRef(col=hl.bottom_right_col, row=hl.bottom_right_row),
                 url=url,
+            ))
+        return out
+
+    def comments(self, sheet_idx: int) -> list[Comment]:
+        """Cell comments declared on sheet ``sheet_idx`` (from
+        ``xl/comments*.xml`` discovered via the sheet's rels).
+        Returns an empty list for sheets without a comments part.
+        Requires libzlsx 0.2.6+."""
+        if not self._handle:
+            raise ZlsxError("book is closed")
+        if not _ffi._HAS_COMMENTS:
+            raise RuntimeError(
+                "loaded libzlsx does not expose comments "
+                "(requires 0.2.6+); upgrade libzlsx"
+            )
+        count = _ffi.lib.zlsx_comment_count(self._handle, sheet_idx)
+        out: list[Comment] = []
+        cc = _ffi.CComment()
+        for i in range(count):
+            rc = _ffi.lib.zlsx_comment_at(self._handle, sheet_idx, i, ctypes.byref(cc))
+            if rc != 0:
+                continue
+            author = ""
+            if cc.author_len > 0:
+                author = ctypes.string_at(cc.author_ptr, cc.author_len).decode(
+                    "utf-8", errors="replace"
+                )
+            text = ""
+            if cc.text_len > 0:
+                text = ctypes.string_at(cc.text_ptr, cc.text_len).decode(
+                    "utf-8", errors="replace"
+                )
+            out.append(Comment(
+                top_left=CellRef(col=cc.cell_col, row=cc.cell_row),
+                author=author,
+                text=text,
             ))
         return out
 

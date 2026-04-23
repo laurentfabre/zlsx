@@ -263,6 +263,18 @@ pub const Border = struct {
     diagonal: BorderSide = .{},
 };
 
+/// A cell comment / note parsed from `xl/comments*.xml`. Comments
+/// with rich-text bodies have their runs concatenated into `text`
+/// (like the flat-SST path for rich strings — callers that need the
+/// runs can look them up via the sheet-level content if it ever
+/// becomes a stored property). Strings are entity-decoded and
+/// arena-owned.
+pub const Comment = struct {
+    top_left: CellRef,
+    author: []const u8,
+    text: []const u8,
+};
+
 /// Cell fill, parsed from `xl/styles.xml` `<fills>`. `pattern` is the
 /// OOXML `patternType` attribute (e.g. "none", "solid", "darkDown",
 /// "gray125"); borrows from `styles_xml`. `fg_color_argb` / `bg_color_argb`
@@ -328,6 +340,15 @@ pub const Book = struct {
     /// to compute the rels filename themselves. Drives hyperlink
     /// URL resolution.
     sheet_rels_data: std.StringHashMapUnmanaged([]u8) = .{},
+    /// Raw comments XML parts keyed by their archive path
+    /// (`xl/comments1.xml`, `xl/comments2.xml`, …). Retained so
+    /// per-sheet rels → Target lookups can resolve to a buffer
+    /// the parser borrows from.
+    comments_data: std.StringHashMapUnmanaged([]u8) = .{},
+    /// Comments per sheet, resolved at open time by following each
+    /// sheet's rels → comments target. Keyed by sheet path; missing
+    /// sheets use the `comments(sheet)` empty-slice normalisation.
+    comments_by_sheet: std.StringHashMapUnmanaged([]Comment) = .{},
     /// Hyperlinks per sheet, resolved at open time by cross-referencing
     /// `<hyperlinks>` in the sheet XML against the matching rels file.
     /// Keyed by the sheet path. Sheets without hyperlinks are absent;
@@ -426,6 +447,14 @@ pub const Book = struct {
                 book.shared_strings_xml = try extractEntryToBuffer(allocator, entry, &file_reader);
             } else if (std.mem.eql(u8, filename, "xl/styles.xml")) {
                 book.styles_xml = try extractEntryToBuffer(allocator, entry, &file_reader);
+            } else if (std.mem.startsWith(u8, filename, "xl/comments") and
+                std.mem.endsWith(u8, filename, ".xml"))
+            {
+                const key = try allocator.dupe(u8, filename);
+                errdefer allocator.free(key);
+                try book.strings.append(allocator, key);
+                const data = try extractEntryToBuffer(allocator, entry, &file_reader);
+                try book.comments_data.put(allocator, key, data);
             } else if (std.mem.eql(u8, filename, "xl/workbook.xml")) {
                 workbook_xml = try extractEntryToBuffer(allocator, entry, &file_reader);
             } else if (std.mem.eql(u8, filename, "xl/_rels/workbook.xml.rels")) {
@@ -474,6 +503,7 @@ pub const Book = struct {
             try parseMergedRangesForSheet(&book, entry.key_ptr.*, entry.value_ptr.*);
             try parseHyperlinksForSheet(&book, entry.key_ptr.*, entry.value_ptr.*);
             try parseDataValidationsForSheet(&book, entry.key_ptr.*, entry.value_ptr.*);
+            try parseCommentsForSheet(&book, entry.key_ptr.*);
         }
 
         return book;
@@ -564,6 +594,14 @@ pub const Book = struct {
         return self.fills[fill_id];
     }
 
+    /// Cell comments attached to `sheet` (from `xl/comments*.xml`
+    /// discovered via the sheet's rels). Empty for sheets without
+    /// comments. Returned slice, comment strings, and author strings
+    /// are all owned by the Book.
+    pub fn comments(self: *const Book, sheet: Sheet) []const Comment {
+        return self.comments_by_sheet.get(sheet.path) orelse &.{};
+    }
+
     /// Border properties for a cell, resolved via the style index.
     /// Returns null on out-of-range indices or workbooks without
     /// styles.xml. Sides without a border surface with `style=""`.
@@ -587,6 +625,14 @@ pub const Book = struct {
         var srit = self.sheet_rels_data.valueIterator();
         while (srit.next()) |v| a.free(v.*);
         self.sheet_rels_data.deinit(a);
+
+        var cdit = self.comments_data.valueIterator();
+        while (cdit.next()) |v| a.free(v.*);
+        self.comments_data.deinit(a);
+
+        var cmit = self.comments_by_sheet.valueIterator();
+        while (cmit.next()) |v| a.free(v.*);
+        self.comments_by_sheet.deinit(a);
 
         var hit = self.hyperlinks_by_sheet.valueIterator();
         while (hit.next()) |v| a.free(v.*);
@@ -1356,6 +1402,143 @@ fn decodeFormulaInto(book: *Book, raw: []const u8) ![]const u8 {
 /// Walk a sheet XML's `<dataValidations>` section and collect every
 /// entry into `book.data_validations_by_sheet`, surfacing kind,
 /// operator, formula1 and formula2 so non-list validations round-trip.
+/// Resolve a sheet's `_rels` to find the `xl/comments*.xml` target
+/// (if any), parse it into a `Comment[]`, and stash under
+/// `book.comments_by_sheet`. No-op when the sheet has no rels or
+/// no comments relationship. Authors/texts are copied into
+/// `sst_arena` so they live for the Book's lifetime.
+fn parseCommentsForSheet(book: *Book, sheet_path: []const u8) !void {
+    const rels_xml = book.sheet_rels_data.get(sheet_path) orelse return;
+
+    // Scan rels for a Target whose path ends with /comments*.xml.
+    // OOXML uses a relationship Type of ".../relationships/comments"
+    // but a Target suffix match is robust enough for our needs.
+    const target_key = "Target=\"";
+    var comments_xml: ?[]const u8 = null;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, rels_xml, i, target_key)) |tp| {
+        const s = tp + target_key.len;
+        const e = std.mem.indexOfScalarPos(u8, rels_xml, s, '"') orelse break;
+        i = e + 1;
+        const target = rels_xml[s..e];
+        if (std.mem.indexOf(u8, target, "comments") == null) continue;
+        // Targets in sheet rels are typically "../comments1.xml" —
+        // normalise to "xl/comments1.xml" for the map lookup.
+        const basename = if (std.mem.lastIndexOfScalar(u8, target, '/')) |slash|
+            target[slash + 1 ..]
+        else
+            target;
+        var path_buf: [64]u8 = undefined;
+        const full = std.fmt.bufPrint(&path_buf, "xl/{s}", .{basename}) catch continue;
+        if (book.comments_data.get(full)) |data| {
+            comments_xml = data;
+            break;
+        }
+    }
+    const cxml = comments_xml orelse return;
+
+    // Parse <authors>: one per <author>…</author>.
+    var authors: std.ArrayListUnmanaged([]const u8) = .{};
+    defer authors.deinit(book.allocator);
+    const arena = book.sst_arena.allocator();
+    if (std.mem.indexOf(u8, cxml, "<authors>")) |ap| {
+        const close = std.mem.indexOfPos(u8, cxml, ap, "</authors>") orelse cxml.len;
+        const block = cxml[ap..close];
+        var j: usize = 0;
+        while (std.mem.indexOfPos(u8, block, j, "<author>")) |op| {
+            const body_start = op + "<author>".len;
+            const close_tag = std.mem.indexOfPos(u8, block, body_start, "</author>") orelse break;
+            const raw = block[body_start..close_tag];
+            j = close_tag + "</author>".len;
+            try authors.append(book.allocator, try arenaDupeDecoded(arena, raw));
+        }
+    }
+
+    // Parse <commentList>: one <comment ref="A1" authorId="N">
+    // <text>…</text></comment> per entry. Comment text may contain
+    // rich runs — concatenate all <t>…</t> contents for the flat
+    // `text` field.
+    var entries: std.ArrayListUnmanaged(Comment) = .{};
+    errdefer entries.deinit(book.allocator);
+    const cl_pos = std.mem.indexOf(u8, cxml, "<commentList>") orelse return;
+    const cl_end = std.mem.indexOfPos(u8, cxml, cl_pos, "</commentList>") orelse return;
+    const cl_block = cxml[cl_pos..cl_end];
+    var k: usize = 0;
+    while (std.mem.indexOfPos(u8, cl_block, k, "<comment ")) |cp| {
+        const hdr_end = std.mem.indexOfScalarPos(u8, cl_block, cp, '>') orelse break;
+        const attrs = cl_block[cp..hdr_end];
+        k = hdr_end + 1;
+
+        const ref_key = "ref=\"";
+        const ref_pos = std.mem.indexOf(u8, attrs, ref_key) orelse continue;
+        const rs = ref_pos + ref_key.len;
+        const re = std.mem.indexOfScalarPos(u8, attrs, rs, '"') orelse continue;
+        const ref_str = attrs[rs..re];
+        const cell_ref = parseA1Ref(ref_str) catch continue;
+
+        const aid_key = "authorId=\"";
+        var author_id: usize = 0;
+        if (std.mem.indexOf(u8, attrs, aid_key)) |ap| {
+            const as = ap + aid_key.len;
+            const ae = std.mem.indexOfScalarPos(u8, attrs, as, '"') orelse continue;
+            author_id = std.fmt.parseInt(usize, attrs[as..ae], 10) catch 0;
+        }
+        const author_str: []const u8 = if (author_id < authors.items.len)
+            authors.items[author_id]
+        else
+            "";
+
+        // Body: concat every <t>…</t> inside <text>…</text>.
+        const c_close = std.mem.indexOfPos(u8, cl_block, hdr_end, "</comment>") orelse break;
+        const body = cl_block[hdr_end + 1 .. c_close];
+        k = c_close + "</comment>".len;
+
+        var text_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer text_buf.deinit(arena);
+        var t: usize = 0;
+        while (std.mem.indexOfPos(u8, body, t, "<t")) |tp| {
+            // Guard against `<text>` — must be `<t>`, `<t `, or `<t/>`.
+            if (tp + 2 >= body.len) break;
+            const after = body[tp + 2];
+            if (after != '>' and after != ' ' and after != '/') {
+                t = tp + 2;
+                continue;
+            }
+            const tgt = std.mem.indexOfScalarPos(u8, body, tp, '>') orelse break;
+            if (tgt > 0 and body[tgt - 1] == '/') {
+                t = tgt + 1;
+                continue;
+            }
+            const tclose = std.mem.indexOfPos(u8, body, tgt + 1, "</t>") orelse break;
+            try appendDecoded(arena, &text_buf, body[tgt + 1 .. tclose]);
+            t = tclose + "</t>".len;
+        }
+
+        try entries.append(book.allocator, .{
+            .top_left = cell_ref,
+            .author = author_str,
+            .text = try text_buf.toOwnedSlice(arena),
+        });
+    }
+
+    if (entries.items.len == 0) {
+        entries.deinit(book.allocator);
+        return;
+    }
+    const slice = try entries.toOwnedSlice(book.allocator);
+    errdefer book.allocator.free(slice);
+    try book.comments_by_sheet.put(book.allocator, sheet_path, slice);
+}
+
+/// Arena-allocate a decoded copy of `raw`. If `raw` has no XML
+/// entities, dupe as-is; otherwise decode on the way in.
+fn arenaDupeDecoded(arena: Allocator, raw: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, raw, '&') == null) return try arena.dupe(u8, raw);
+    var buf: std.ArrayListUnmanaged(u8) = try .initCapacity(arena, raw.len);
+    try appendDecoded(arena, &buf, raw);
+    return try buf.toOwnedSlice(arena);
+}
+
 fn parseDataValidationsForSheet(book: *Book, sheet_path: []const u8, xml: []const u8) !void {
     const dv_start = std.mem.indexOf(u8, xml, "<dataValidations") orelse return;
     const dv_end = std.mem.indexOfPos(u8, xml, dv_start, "</dataValidations>") orelse return;

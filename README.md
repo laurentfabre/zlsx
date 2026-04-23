@@ -65,7 +65,7 @@ Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-ro
 ## What's in, what's out
 
 **In**
-- **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout, merged-cell ranges via `Book.mergedRanges(sheet)`, external-URL hyperlinks via `Book.hyperlinks(sheet)` (resolved through sheet `_rels`), all data validations via `Book.dataValidations(sheet)` — dropdowns (values entity-decoded), plus `kind` / `op` / `formula1` / `formula2` on numeric, date, time, text-length, and custom variants, rich-text run formatting (bold / italic / color / size / font) via `Book.richRuns(sst_idx)` for entries that used `<r>` wrappers, per-cell style indices via `Rows.styleIndices()` resolving to number-format codes via `Book.numberFormat(style_idx)` (date detection via `Book.isDateFormat(style_idx)`)
+- **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout, merged-cell ranges via `Book.mergedRanges(sheet)`, external-URL hyperlinks via `Book.hyperlinks(sheet)` (resolved through sheet `_rels`), all data validations via `Book.dataValidations(sheet)` — dropdowns (values entity-decoded), plus `kind` / `op` / `formula1` / `formula2` on numeric, date, time, text-length, and custom variants, rich-text run formatting (bold / italic / color / size / font) via `Book.richRuns(sst_idx)` for entries that used `<r>` wrappers, per-cell style indices via `Rows.styleIndices()` resolving to number-format codes via `Book.numberFormat(style_idx)` (date detection via `Book.isDateFormat(style_idx)`), cell comments via `Book.comments(sheet)` (author + plain-text body, decoded)
 - **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, row heights, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks (per-sheet `_rels`), internal hyperlinks (`location="Sheet2!A1"`), list-type data validations (dropdowns), number / decimal / date / time / text-length / custom data validations, formulas with optional cached value, rich-text cells (per-run bold / italic / color / size / font) via `SheetWriter.writeRichRow`
 - XML entity decoding (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&#N;`, `&#xN;`) on read and escaping on write
 - CLI (`zlsx file.xlsx --format {jsonl,jsonl-dict,tsv,csv}`), C ABI (`libzlsx.{dylib,so,dll}` + `include/zlsx.h`), Python bindings (`pip install py-zlsx`)
@@ -98,7 +98,7 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 | Data validations (number / date / custom) | ✓ | — | ✓ | — |
 | Rich-text formatting preserved | ✓³ | ~ | ✓ | — |
 | Cell styles on read (bold / colour / fill / border) | ✓⁵ | — | ✓ | — |
-| Comments / notes | — | ? | ✓ | — |
+| Comments / notes | ✓⁶ | ? | ✓ | — |
 | Chart / image / pivot access | — | — | ~ | — |
 | Load-modify-save | — | — | ✓ | — |
 
@@ -107,6 +107,7 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 ³ `Book.richRuns(sst_idx)` surfaces per-`<r>` bold / italic + ARGB color / size / font name. Theme colors (`<color theme="…"/>`) aren't resolved — only explicit `<color rgb="AARRGGBB"/>` populates `color_argb`.
 ⁴ Combine `Rows.styleIndices()` with `Book.isDateFormat(style_idx)` + `xlsx.fromExcelSerial(cell.number)` — the reader parses `xl/styles.xml` and exposes numFmt codes so callers can detect date cells without guessing. No auto-conversion on the `Cell` enum yet (that's a follow-up — callers drive the conversion).
 ⁵ `Book.cellFont(style_idx)` surfaces bold / italic / ARGB color / size / font name; `Book.cellFill(style_idx)` surfaces `patternType` + fg / bg ARGB; `Book.cellBorder(style_idx)` surfaces `style` + color per side (left / right / top / bottom / diagonal). Theme / indexed colors aren't resolved; only explicit `rgb="AARRGGBB"` populates the ARGB fields.
+⁶ `Book.comments(sheet)` returns `{top_left, author, text}` for every `<comment>` under `<commentList>`. Rich-text bodies get flattened to concatenated plain text; formatted runs inside comments aren't surfaced yet (a follow-up can add a parallel `richCommentText` without breaking the existing shape).
 
 ### Writer capability
 
