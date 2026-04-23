@@ -54,6 +54,7 @@ __all__ = [
     "Border",
     "Comment",
     "Dxf",
+    "CF_OPERATORS",
     "ZlsxError",
 ]
 
@@ -1480,6 +1481,11 @@ _DV_WRITER_OP_CODES = {
     "greater_than": 6,
     "greater_than_or_equal": 7,
 }
+
+#: Valid operator strings accepted by ``SheetWriter.add_data_validation_numeric``
+#: and ``SheetWriter.add_conditional_format_cell_is``. Exposed as a
+#: public frozenset so callers can introspect without reading tests.
+CF_OPERATORS = frozenset(_DV_WRITER_OP_CODES.keys())
 
 
 def _sheet_add_data_validation_numeric(

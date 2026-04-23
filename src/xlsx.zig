@@ -3637,6 +3637,58 @@ test "fuzz writer.addComment: adversarial author + text never crash emission" {
     }
 }
 
+test "fuzz writer.addConditionalFormat + addDxf: adversarial inputs never crash emission" {
+    // Writer-side fuzz for iter40-41 surfaces. Random bytes feed
+    // into addConditionalFormatCellIs / Expression (range / formula
+    // slots) + addDxf (argb values). Most random ranges get
+    // rejected at validate time; valid ones with adversarial
+    // formulas must still emit valid CF XML so save() completes.
+    const iters = fuzzIterations();
+    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    const rng = prng.random();
+    var buf: [fuzz_max_input_len]u8 = undefined;
+
+    const writer = @import("writer.zig");
+    const tmp_path = "/tmp/zlsx_fuzz_addcf.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const ops = [_]writer.CfOperator{
+        .less_than,          .equal,                 .greater_than,
+        .between,            .not_between,           .not_equal,
+        .less_than_or_equal, .greater_than_or_equal,
+    };
+
+    for (0..iters) |_| {
+        const input = randomInput(rng, &buf);
+        const third = input.len / 3;
+        const range = input[0..third];
+        const formula1 = input[third .. 2 * third];
+        const formula2 = input[2 * third ..];
+
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        // addDxf with adversarial ARGB-like u32: always succeeds
+        // (Dxf has no intake validation beyond u32 bounds).
+        const dxf_id = w.addDxf(.{
+            .font_bold = (input.len & 1) != 0,
+            .font_italic = (input.len & 2) != 0,
+            .font_color_argb = if (input.len > 4) std.mem.readInt(u32, input[0..4], .little) else null,
+            .fill_fg_argb = null,
+        }) catch continue;
+
+        var sheet = w.addSheet("S") catch continue;
+        const op = ops[@intCast(input.len % ops.len)];
+        // cellIs — random operator; formula2 only when the op
+        // demands two formulas (between / not_between per OOXML).
+        const needs_two = op == .between or op == .not_between;
+        const f2: ?[]const u8 = if (needs_two) formula2 else null;
+        _ = sheet.addConditionalFormatCellIs(range, op, formula1, f2, dxf_id) catch {};
+        _ = sheet.addConditionalFormatExpression(range, formula1, dxf_id) catch {};
+        sheet.writeRow(&.{.{ .string = "x" }}) catch continue;
+        w.save(tmp_path) catch {};
+    }
+}
+
 // ─── Mutation fuzzing ────────────────────────────────────────────────
 //
 // Random-byte fuzzing rarely produces inputs that advance the XML

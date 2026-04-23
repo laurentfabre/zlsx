@@ -723,7 +723,12 @@ pub const Writer = struct {
             // <dataValidations> per ECMA-376 CT_Worksheet child order.
             // One <conditionalFormatting> block per rule is simpler
             // than grouping by sqref, and Excel accepts either shape.
-            for (sw.conditional_formats.items) |cf| {
+            for (sw.conditional_formats.items, 1..) |cf, cf_priority| {
+                // Priority increments per rule so overlapping ranges
+                // produce a deterministic cascade — Excel resolves
+                // ties via document order but some validators flag
+                // duplicate priorities. Earlier-registered rules win
+                // (lower priority number → higher precedence).
                 try full.appendSlice(alloc, "<conditionalFormatting sqref=\"");
                 try appendXmlEscaped(alloc, &full, cf.range);
                 try full.appendSlice(alloc, "\">");
@@ -731,8 +736,8 @@ pub const Writer = struct {
                     .cell_is => |r| {
                         try full.print(
                             alloc,
-                            "<cfRule type=\"cellIs\" dxfId=\"{d}\" priority=\"1\" operator=\"{s}\">",
-                            .{ r.dxf_id, r.operator.toOoxml() },
+                            "<cfRule type=\"cellIs\" dxfId=\"{d}\" priority=\"{d}\" operator=\"{s}\">",
+                            .{ r.dxf_id, cf_priority, r.operator.toOoxml() },
                         );
                         try full.appendSlice(alloc, "<formula>");
                         try appendXmlEscaped(alloc, &full, r.formula1);
@@ -747,8 +752,8 @@ pub const Writer = struct {
                     .expression => |r| {
                         try full.print(
                             alloc,
-                            "<cfRule type=\"expression\" dxfId=\"{d}\" priority=\"1\">",
-                            .{r.dxf_id},
+                            "<cfRule type=\"expression\" dxfId=\"{d}\" priority=\"{d}\">",
+                            .{ r.dxf_id, cf_priority },
                         );
                         try full.appendSlice(alloc, "<formula>");
                         try appendXmlEscaped(alloc, &full, r.formula);
@@ -939,15 +944,30 @@ pub const Writer = struct {
                 \\<v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype>
             );
             for (sw.comments.items, 0..) |c, shape_idx| {
-                // parseA1Corner returns 1-based col/row; VML's
-                // x:Row / x:Column are 0-based.
-                const rc = parseA1Corner(c.ref) catch continue;
+                // `addComment` ran `validateHyperlinkRange` at intake
+                // so any ref that reaches save() is valid A1. Assert
+                // on drift — silently dropping a comment would make
+                // audit-side invariant breaks invisible.
+                const rc = try parseA1Corner(c.ref);
                 const row0 = rc.row - 1;
                 const col0 = rc.col - 1;
+                // Per-comment anchor: each note occupies a 3-col × 2-row
+                // rectangle starting one column to the right of its
+                // cell. Prior revision hardcoded `1, 15, 0, 2, 4, 31,
+                // 4, 3` for every comment which made all open notes
+                // overlap in the same region of the sheet.
+                //
+                // OOXML VML x:Anchor is 8 numbers:
+                //   fromCol, fromColPx, fromRow, fromRowPx,
+                //   toCol,   toColPx,   toRow,   toRowPx
+                const from_col = col0 + 1;
+                const from_row = row0;
+                const to_col = col0 + 3;
+                const to_row = row0 + 4;
                 try vml.print(
                     alloc,
-                    "<v:shape id=\"_x0000_s{d}\" type=\"#_x0000_t202\" style=\"position:absolute;margin-left:60pt;margin-top:10pt;width:100pt;height:60pt;z-index:{d};visibility:hidden\" fillcolor=\"#ffffe1\" o:insetmode=\"auto\"><v:fill color2=\"#ffffe1\"/><v:shadow on=\"t\" color=\"black\" obscured=\"t\"/><v:path o:connecttype=\"none\"/><v:textbox><div style=\"text-align:left\"/></v:textbox><x:ClientData ObjectType=\"Note\"><x:MoveWithCells/><x:SizeWithCells/><x:Anchor>1, 15, 0, 2, 4, 31, 4, 3</x:Anchor><x:AutoFill>False</x:AutoFill><x:Row>{d}</x:Row><x:Column>{d}</x:Column></x:ClientData></v:shape>",
-                    .{ 1025 + shape_idx, shape_idx + 1, row0, col0 },
+                    "<v:shape id=\"_x0000_s{d}\" type=\"#_x0000_t202\" style=\"position:absolute;margin-left:60pt;margin-top:10pt;width:100pt;height:60pt;z-index:{d};visibility:hidden\" fillcolor=\"#ffffe1\" o:insetmode=\"auto\"><v:fill color2=\"#ffffe1\"/><v:shadow on=\"t\" color=\"black\" obscured=\"t\"/><v:path o:connecttype=\"none\"/><v:textbox><div style=\"text-align:left\"/></v:textbox><x:ClientData ObjectType=\"Note\"><x:MoveWithCells/><x:SizeWithCells/><x:Anchor>{d}, 15, {d}, 2, {d}, 31, {d}, 3</x:Anchor><x:AutoFill>False</x:AutoFill><x:Row>{d}</x:Row><x:Column>{d}</x:Column></x:ClientData></v:shape>",
+                    .{ 1025 + shape_idx, shape_idx + 1, from_col, from_row, to_col, to_row, row0, col0 },
                 );
             }
             try vml.appendSlice(alloc, "</xml>");
@@ -3518,6 +3538,9 @@ test "Writer: conditional formatting — cellIs + expression rules + dxfs table"
     // sqrefs, operators, and dxfIds.
     try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<conditionalFormatting sqref=\"B2:B10\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<cfRule type=\"cellIs\" dxfId=\"0\" priority=\"1\" operator=\"greaterThan\">") != null);
+    // Priorities increment — second rule gets 2, third gets 3.
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "priority=\"2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "priority=\"3\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<formula>100</formula>") != null);
 
     try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<conditionalFormatting sqref=\"C2:C10\">") != null);
@@ -3525,7 +3548,7 @@ test "Writer: conditional formatting — cellIs + expression rules + dxfs table"
     try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<formula>0</formula>") != null);
     try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<formula>50</formula>") != null);
 
-    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<cfRule type=\"expression\" dxfId=\"1\" priority=\"1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<cfRule type=\"expression\" dxfId=\"1\" priority=\"3\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "MOD(ROW(),2)=0") != null);
 
     // Ordering: conditionalFormatting must come BEFORE dataValidations.
