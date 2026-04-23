@@ -56,6 +56,18 @@ pub const MergeRange = struct {
     bottom_right: CellRef,
 };
 
+/// An external-URL hyperlink attached to a cell or cell range,
+/// resolved through the sheet's `_rels/sheet{N}.xml.rels` file. Range
+/// corners follow the same normalisation rules as `MergeRange`;
+/// `top_left == bottom_right` for single-cell hyperlinks.
+pub const Hyperlink = struct {
+    top_left: CellRef,
+    bottom_right: CellRef,
+    /// URL target. Slice into the sheet's rels XML buffer — valid
+    /// for the Book's lifetime.
+    url: []const u8,
+};
+
 /// Domain errors surfaced by this module. The public API uses inferred
 /// error sets so callers get the full union of these plus whatever
 /// std.zip / std.fs / std.compress.flate decide to return.
@@ -94,6 +106,16 @@ pub const Book = struct {
     /// `mergedRanges(sheet)` which normalises the missing case to an
     /// empty slice.
     merged_ranges: std.StringHashMapUnmanaged([]MergeRange) = .{},
+    /// Decompressed per-sheet `_rels/sheet{N}.xml.rels` files, keyed
+    /// by the *sheet* path (not the rels path) so callers never have
+    /// to compute the rels filename themselves. Drives hyperlink
+    /// URL resolution.
+    sheet_rels_data: std.StringHashMapUnmanaged([]u8) = .{},
+    /// Hyperlinks per sheet, resolved at open time by cross-referencing
+    /// `<hyperlinks>` in the sheet XML against the matching rels file.
+    /// Keyed by the sheet path. Sheets without hyperlinks are absent;
+    /// use `hyperlinks(sheet)` for the missing-sheet normalisation.
+    hyperlinks_by_sheet: std.StringHashMapUnmanaged([]Hyperlink) = .{},
     /// Owned backing storage for every string referenced by `sheets`,
     /// sheet_data keys, and entity-decoded shared strings.
     strings: std.ArrayListUnmanaged([]u8) = .{},
@@ -147,6 +169,22 @@ pub const Book = struct {
                 workbook_xml = try extractEntryToBuffer(allocator, entry, &file_reader);
             } else if (std.mem.eql(u8, filename, "xl/_rels/workbook.xml.rels")) {
                 rels_xml = try extractEntryToBuffer(allocator, entry, &file_reader);
+            } else if (std.mem.startsWith(u8, filename, "xl/worksheets/_rels/") and
+                std.mem.endsWith(u8, filename, ".xml.rels"))
+            {
+                // Per-sheet rels (hyperlinks, drawings, etc.). Key the
+                // entry by the *sheet* path so the hyperlink resolver
+                // can do a direct lookup:
+                //   "xl/worksheets/_rels/sheet1.xml.rels"
+                //     → "xl/worksheets/sheet1.xml"
+                const rels_prefix = "xl/worksheets/_rels/".len;
+                const rels_suffix = ".rels".len;
+                const bare = filename[rels_prefix .. filename.len - rels_suffix];
+                const sheet_key = try std.fmt.allocPrint(allocator, "xl/worksheets/{s}", .{bare});
+                errdefer allocator.free(sheet_key);
+                try book.strings.append(allocator, sheet_key);
+                const data = try extractEntryToBuffer(allocator, entry, &file_reader);
+                try book.sheet_rels_data.put(allocator, sheet_key, data);
             } else if (std.mem.startsWith(u8, filename, "xl/worksheets/") and
                 std.mem.endsWith(u8, filename, ".xml"))
             {
@@ -166,12 +204,13 @@ pub const Book = struct {
         try parseWorkbookSheets(&book, wb, rels);
         if (book.shared_strings_xml) |sst| try parseSharedStrings(&book, sst);
 
-        // Parse merged cell ranges per sheet. Cheap — most sheets have
-        // no `<mergeCells>` block, and the parser bails on the first
-        // miss.
+        // Parse merged cell ranges + hyperlinks per sheet. Both are
+        // cheap — most sheets have neither, and the parsers bail on
+        // the first miss.
         var sheet_it = book.sheet_data.iterator();
         while (sheet_it.next()) |entry| {
             try parseMergedRangesForSheet(&book, entry.key_ptr.*, entry.value_ptr.*);
+            try parseHyperlinksForSheet(&book, entry.key_ptr.*, entry.value_ptr.*);
         }
 
         return book;
@@ -184,6 +223,16 @@ pub const Book = struct {
         return self.merged_ranges.get(sheet.path) orelse &.{};
     }
 
+    /// External-URL hyperlinks declared on this sheet, with each
+    /// `r:id` resolved through the sheet's `_rels` file. Returns an
+    /// empty slice for sheets without a `<hyperlinks>` block or
+    /// without a matching rels file. The returned slice + `url`
+    /// strings inside it are owned by the Book and valid until
+    /// `deinit`.
+    pub fn hyperlinks(self: *const Book, sheet: Sheet) []const Hyperlink {
+        return self.hyperlinks_by_sheet.get(sheet.path) orelse &.{};
+    }
+
     pub fn deinit(self: *Book) void {
         const a = self.allocator;
         if (self.shared_strings_xml) |s| a.free(s);
@@ -193,6 +242,14 @@ pub const Book = struct {
         var mit = self.merged_ranges.valueIterator();
         while (mit.next()) |v| a.free(v.*);
         self.merged_ranges.deinit(a);
+
+        var srit = self.sheet_rels_data.valueIterator();
+        while (srit.next()) |v| a.free(v.*);
+        self.sheet_rels_data.deinit(a);
+
+        var hit = self.hyperlinks_by_sheet.valueIterator();
+        while (hit.next()) |v| a.free(v.*);
+        self.hyperlinks_by_sheet.deinit(a);
 
         var it = self.sheet_data.valueIterator();
         while (it.next()) |v| a.free(v.*);
@@ -703,6 +760,95 @@ fn parseMergedRangesForSheet(book: *Book, sheet_path: []const u8, xml: []const u
     try book.merged_ranges.put(book.allocator, sheet_path, slice);
 }
 
+/// Resolve a rels id (e.g. "rId3") to its `Target` attribute in the
+/// given rels XML. Returns a slice into `rels_xml` so the caller
+/// doesn't need to copy. `null` when the id isn't present (e.g. the
+/// sheet XML references an id that the rels file omits — malformed,
+/// skip the entry).
+fn findRelTarget(rels_xml: []const u8, rid: []const u8) ?[]const u8 {
+    // Find each `<Relationship ... Id="rid" ... Target="..."/>`. We do a
+    // linear scan keyed on `Id="…"`; the rels files are tiny (few KB
+    // at most) so no smarter index is needed.
+    var probe: usize = 0;
+    while (std.mem.indexOfPos(u8, rels_xml, probe, "<Relationship")) |rel_start| {
+        const rel_end = std.mem.indexOfScalarPos(u8, rels_xml, rel_start, '>') orelse return null;
+        const attrs = rels_xml[rel_start..rel_end];
+        // Check Id="rid".
+        const id_key = "Id=\"";
+        const id_pos = std.mem.indexOf(u8, attrs, id_key) orelse {
+            probe = rel_end + 1;
+            continue;
+        };
+        const id_start = id_pos + id_key.len;
+        const id_close = std.mem.indexOfScalarPos(u8, attrs, id_start, '"') orelse {
+            probe = rel_end + 1;
+            continue;
+        };
+        if (!std.mem.eql(u8, attrs[id_start..id_close], rid)) {
+            probe = rel_end + 1;
+            continue;
+        }
+        // Matched — pull out Target="…".
+        const tgt_key = "Target=\"";
+        const tgt_pos = std.mem.indexOfPos(u8, attrs, id_close, tgt_key) orelse return null;
+        const tgt_start = tgt_pos + tgt_key.len;
+        const tgt_close = std.mem.indexOfScalarPos(u8, attrs, tgt_start, '"') orelse return null;
+        return attrs[tgt_start..tgt_close];
+    }
+    return null;
+}
+
+/// Walk a sheet XML's `<hyperlinks>` section, cross-reference each
+/// `r:id` against the sheet's rels file, and collect resolved entries
+/// into `book.hyperlinks_by_sheet`. No-op when the sheet has no
+/// hyperlinks or no rels file.
+fn parseHyperlinksForSheet(book: *Book, sheet_path: []const u8, xml: []const u8) !void {
+    const hl_start = std.mem.indexOf(u8, xml, "<hyperlinks") orelse return;
+    const hl_end = std.mem.indexOfPos(u8, xml, hl_start, "</hyperlinks>") orelse return;
+    const block = xml[hl_start..hl_end];
+
+    const rels_xml = book.sheet_rels_data.get(sheet_path) orelse return;
+
+    var entries: std.ArrayListUnmanaged(Hyperlink) = .{};
+    errdefer entries.deinit(book.allocator);
+
+    var probe: usize = 0;
+    while (std.mem.indexOfPos(u8, block, probe, "<hyperlink")) |hl| {
+        const end = std.mem.indexOfScalarPos(u8, block, hl, '>') orelse break;
+        const attrs = block[hl..end];
+        probe = end + 1;
+
+        const ref_key = "ref=\"";
+        const ref_pos = std.mem.indexOf(u8, attrs, ref_key) orelse continue;
+        const ref_start = ref_pos + ref_key.len;
+        const ref_close = std.mem.indexOfScalarPos(u8, attrs, ref_start, '"') orelse continue;
+        const ref = attrs[ref_start..ref_close];
+
+        const rid_key = "r:id=\"";
+        const rid_pos = std.mem.indexOf(u8, attrs, rid_key) orelse continue;
+        const rid_start = rid_pos + rid_key.len;
+        const rid_close = std.mem.indexOfScalarPos(u8, attrs, rid_start, '"') orelse continue;
+        const rid = attrs[rid_start..rid_close];
+
+        const target = findRelTarget(rels_xml, rid) orelse continue;
+
+        const range = parseA1Range(ref) catch continue;
+        try entries.append(book.allocator, .{
+            .top_left = range.top_left,
+            .bottom_right = range.bottom_right,
+            .url = target,
+        });
+    }
+
+    if (entries.items.len == 0) {
+        entries.deinit(book.allocator);
+        return;
+    }
+    const slice = try entries.toOwnedSlice(book.allocator);
+    errdefer book.allocator.free(slice);
+    try book.hyperlinks_by_sheet.put(book.allocator, sheet_path, slice);
+}
+
 fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
     // Pre-size via the uniqueCount hint in the <sst> tag when present —
     // OOXML generators are reliable about this attribute, so we get a
@@ -899,6 +1045,63 @@ test "Book.mergedRanges: round-trip through writer + reader" {
     try std.testing.expectEqualDeep(CellRef{ .col = 3, .row = 7 }, ranges[1].bottom_right);
     try std.testing.expectEqualDeep(CellRef{ .col = 16383, .row = 1048575 }, ranges[2].top_left);
     try std.testing.expectEqualDeep(CellRef{ .col = 16383, .row = 1048576 }, ranges[2].bottom_right);
+}
+
+test "Book.hyperlinks: round-trip through writer + reader" {
+    const tmp_path = "/tmp/zlsx_reader_hyperlinks_roundtrip.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Links");
+        try sheet.addHyperlink("A1", "https://example.com/path?q=1&x=2");
+        try sheet.addHyperlink("B2:C3", "mailto:foo@example.com");
+        try sheet.addHyperlink("D5", "https://docs.example.com/");
+        try sheet.writeRow(&.{.{ .string = "click" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    const links = book.hyperlinks(book.sheets[0]);
+    try std.testing.expectEqual(@as(usize, 3), links.len);
+
+    // rId1 → A1 single cell → top_left == bottom_right.
+    try std.testing.expectEqualDeep(CellRef{ .col = 0, .row = 1 }, links[0].top_left);
+    try std.testing.expectEqualDeep(CellRef{ .col = 0, .row = 1 }, links[0].bottom_right);
+    // Writer xml-escapes `&` to `&amp;` on emit; reader must NOT
+    // un-escape here — the contract is that `url` is the raw
+    // `Target` attribute, and entity decoding on URLs is a caller
+    // decision (they round-trip fine through every major consumer).
+    try std.testing.expectEqualStrings("https://example.com/path?q=1&amp;x=2", links[0].url);
+
+    try std.testing.expectEqualDeep(CellRef{ .col = 1, .row = 2 }, links[1].top_left);
+    try std.testing.expectEqualDeep(CellRef{ .col = 2, .row = 3 }, links[1].bottom_right);
+    try std.testing.expectEqualStrings("mailto:foo@example.com", links[1].url);
+
+    try std.testing.expectEqualDeep(CellRef{ .col = 3, .row = 5 }, links[2].top_left);
+    try std.testing.expectEqualStrings("https://docs.example.com/", links[2].url);
+}
+
+test "Book.hyperlinks: empty slice for sheets without hyperlinks" {
+    const tmp_path = "/tmp/zlsx_reader_no_hyperlinks.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Plain");
+        try sheet.writeRow(&.{.{ .string = "no-links" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 0), book.hyperlinks(book.sheets[0]).len);
 }
 
 test "Book.mergedRanges: empty slice for sheets without merges" {
