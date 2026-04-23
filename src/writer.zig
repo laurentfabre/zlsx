@@ -177,7 +177,18 @@ pub const Dxf = struct {
     font_bold: bool = false,
     font_italic: bool = false,
     font_color_argb: ?u32 = null,
+    /// Font size in points. Rare in CF rules but cheap to support —
+    /// the `<sz val="…"/>` child renders the differential font at
+    /// an explicit pt size instead of inheriting the cell style.
+    font_size: ?f32 = null,
     fill_fg_argb: ?u32 = null,
+    /// Per-side border overrides — emitted inside the dxf's
+    /// `<border>` block. Use `.none` (the default) to inherit the
+    /// cell's existing border on that side.
+    border_left: BorderSide = .{},
+    border_right: BorderSide = .{},
+    border_top: BorderSide = .{},
+    border_bottom: BorderSide = .{},
 };
 
 /// Cell comment (note) attached via `SheetWriter.addComment`. Emits
@@ -940,7 +951,26 @@ pub const Writer = struct {
             defer vml.deinit(alloc);
             try vml.appendSlice(alloc,
                 \\<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel">
-                \\<o:shapelayout v:ext="edit"><o:idmap v:ext="edit" data="1"/></o:shapelayout>
+            );
+            // Each `<o:idmap>` chunk covers 1024 shape IDs. Our shape
+            // IDs start at 1025 and increment per comment, so the
+            // first idmap (data="1") covers IDs 1024-2047 = 1023
+            // comments. Workbooks with more comments need additional
+            // idmap entries: "1,2" covers 2047 shapes, "1,2,3" for
+            // 3071, and so on. Over-provisioning by one is harmless;
+            // Excel ignores idmaps with no referenced shapes.
+            // Highest shape ID = 1024 + num_comments (shape IDs
+            // start at 1025 and run through 1024 + num_comments).
+            // floor(highest_id / 1024) is the last idmap index;
+            // +1 because idmaps are 1-indexed.
+            const num_idmaps: usize = sw.comments.items.len / 1024 + 1;
+            try vml.appendSlice(alloc, "<o:shapelayout v:ext=\"edit\"><o:idmap v:ext=\"edit\" data=\"");
+            for (0..num_idmaps) |k| {
+                if (k != 0) try vml.append(alloc, ',');
+                try vml.print(alloc, "{d}", .{k + 1});
+            }
+            try vml.appendSlice(alloc, "\"/></o:shapelayout>");
+            try vml.appendSlice(alloc,
                 \\<v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype>
             );
             for (sw.comments.items, 0..) |c, shape_idx| {
@@ -2078,13 +2108,17 @@ fn emitStylesXml(
         for (dxfs) |dxf| {
             try buf.appendSlice(alloc, "<dxf>");
             // <font> — only emitted when something differs from default.
-            const has_font = dxf.font_bold or dxf.font_italic or dxf.font_color_argb != null;
+            const has_font = dxf.font_bold or dxf.font_italic or
+                dxf.font_color_argb != null or dxf.font_size != null;
             if (has_font) {
                 try buf.appendSlice(alloc, "<font>");
                 if (dxf.font_bold) try buf.appendSlice(alloc, "<b/>");
                 if (dxf.font_italic) try buf.appendSlice(alloc, "<i/>");
                 if (dxf.font_color_argb) |c| {
                     try buf.print(alloc, "<color rgb=\"{X:0>8}\"/>", .{c});
+                }
+                if (dxf.font_size) |sz| {
+                    try buf.print(alloc, "<sz val=\"{d}\"/>", .{sz});
                 }
                 try buf.appendSlice(alloc, "</font>");
             }
@@ -2095,6 +2129,19 @@ fn emitStylesXml(
                     "<fill><patternFill patternType=\"solid\"><fgColor rgb=\"{X:0>8}\"/><bgColor rgb=\"{X:0>8}\"/></patternFill></fill>",
                     .{ fg, fg },
                 );
+            }
+            // <border> — emit when any side has a non-.none style.
+            const has_border = dxf.border_left.style != .none or
+                dxf.border_right.style != .none or
+                dxf.border_top.style != .none or
+                dxf.border_bottom.style != .none;
+            if (has_border) {
+                try buf.appendSlice(alloc, "<border>");
+                try emitDxfBorderSide(alloc, &buf, "left", dxf.border_left);
+                try emitDxfBorderSide(alloc, &buf, "right", dxf.border_right);
+                try emitDxfBorderSide(alloc, &buf, "top", dxf.border_top);
+                try emitDxfBorderSide(alloc, &buf, "bottom", dxf.border_bottom);
+                try buf.appendSlice(alloc, "</border>");
             }
             try buf.appendSlice(alloc, "</dxf>");
         }
@@ -2118,6 +2165,26 @@ fn hAlignName(a: HAlign) []const u8 {
         .center_continuous => "centerContinuous",
         .distributed => "distributed",
     };
+}
+
+/// Emit one `<left>` / `<right>` / `<top>` / `<bottom>` element
+/// for a dxf `<border>` block. Self-closing when the side is
+/// `.none`; opens with `style="…"` + nested `<color>` otherwise.
+fn emitDxfBorderSide(
+    alloc: Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    tag: []const u8,
+    side: BorderSide,
+) !void {
+    if (side.style == .none) {
+        try buf.print(alloc, "<{s}/>", .{tag});
+        return;
+    }
+    try buf.print(alloc, "<{s} style=\"{s}\">", .{ tag, borderStyleName(side.style) });
+    if (side.color_argb) |c| {
+        try buf.print(alloc, "<color rgb=\"{X:0>8}\"/>", .{c});
+    }
+    try buf.print(alloc, "</{s}>", .{tag});
 }
 
 fn borderStyleName(b: BorderStyle) []const u8 {
@@ -3453,6 +3520,89 @@ test "Writer: addDataValidationNumeric + Custom emit correct XML" {
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
     while (try rows.next()) |_| {}
+}
+
+test "Writer: VML idmap expands for >1023 comments per sheet" {
+    // iter48 — the hardcoded `<o:idmap data="1"/>` only covered
+    // shape IDs 1024..2047 = 1023 comments. Workbooks past that
+    // need additional idmap entries (one per 1024-ID range). This
+    // test emits 1025 comments and verifies the VML drawing grew
+    // a second idmap: `data="1,2"`.
+    const tmp_path = "/tmp/zlsx_writer_idmap_scale.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("S");
+        var ref_buf: [16]u8 = undefined;
+        for (0..1025) |i| {
+            // Excel refs: column-major walk across A..Z then down rows.
+            const col: u8 = @intCast((i % 26) + 1);
+            const row: u32 = @intCast((i / 26) + 1);
+            const col_letter: u8 = 'A' + col - 1;
+            const ref = try std.fmt.bufPrint(&ref_buf, "{c}{d}", .{ col_letter, row });
+            try sheet.addComment(ref, "A", "n");
+        }
+        try sheet.writeRow(&.{.{ .string = "hdr" }});
+        try w.save(tmp_path);
+    }
+
+    // Unzip xl/drawings/vmlDrawing1.vml + grep for `data="1,2"`.
+    var file = try std.fs.cwd().openFile(tmp_path, .{});
+    defer file.close();
+    var fbuf: [4096]u8 = undefined;
+    var fr = file.reader(&fbuf);
+    var iter = try std.zip.Iterator.init(&fr);
+    var filename_buf: [64]u8 = undefined;
+    var vml_xml: ?[]u8 = null;
+    defer if (vml_xml) |v| std.testing.allocator.free(v);
+    while (try iter.next()) |entry| {
+        if (entry.filename_len > filename_buf.len) continue;
+        try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+        const filename = filename_buf[0..entry.filename_len];
+        try fr.interface.readSliceAll(filename);
+        if (std.mem.eql(u8, filename, "xl/drawings/vmlDrawing1.vml")) {
+            vml_xml = try extractEntryForTest(std.testing.allocator, entry, &fr);
+            break;
+        }
+    }
+    const vml = vml_xml orelse return error.VmlNotFound;
+    try std.testing.expect(std.mem.indexOf(u8, vml, "data=\"1,2\"") != null);
+
+    // A single-comment sheet keeps the data="1" shape (regression
+    // guard: don't emit `data="1,"` trailing comma).
+    const tmp_small = "/tmp/zlsx_writer_idmap_small.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_small) catch {};
+    {
+        var w2 = Writer.init(std.testing.allocator);
+        defer w2.deinit();
+        var sheet2 = try w2.addSheet("S");
+        try sheet2.addComment("A1", "A", "n");
+        try sheet2.writeRow(&.{.{ .string = "x" }});
+        try w2.save(tmp_small);
+    }
+    var file2 = try std.fs.cwd().openFile(tmp_small, .{});
+    defer file2.close();
+    var fbuf2: [4096]u8 = undefined;
+    var fr2 = file2.reader(&fbuf2);
+    var iter2 = try std.zip.Iterator.init(&fr2);
+    var fn_buf2: [64]u8 = undefined;
+    var vml2: ?[]u8 = null;
+    defer if (vml2) |v| std.testing.allocator.free(v);
+    while (try iter2.next()) |entry| {
+        if (entry.filename_len > fn_buf2.len) continue;
+        try fr2.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+        const filename = fn_buf2[0..entry.filename_len];
+        try fr2.interface.readSliceAll(filename);
+        if (std.mem.eql(u8, filename, "xl/drawings/vmlDrawing1.vml")) {
+            vml2 = try extractEntryForTest(std.testing.allocator, entry, &fr2);
+            break;
+        }
+    }
+    const v2 = vml2 orelse return error.VmlNotFound;
+    try std.testing.expect(std.mem.indexOf(u8, v2, "data=\"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v2, "data=\"1,\"") == null);
 }
 
 test "Writer: conditional formatting — cellIs + expression rules + dxfs table" {

@@ -1121,6 +1121,50 @@ def test_sheet_writer_write_rich_row_round_trip(tmp_path):
         assert runs[1].font_name == "Arial"
 
 
+def test_dxf_extended_fields_border_size(tmp_path):
+    """iter49 extends `Dxf` with font_size + per-side borders.
+    Register a fully-populated Dxf and verify styles.xml contains
+    the expected `<sz>` + `<border>` fragments."""
+    import zipfile
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_CONDITIONAL_FORMAT:
+        pytest.skip("loaded libzlsx predates CF ABI (0.2.6+)")
+
+    out = tmp_path / "dxf_ext.xlsx"
+    with zlsx.write(out) as w:
+        rich_dxf = w.add_dxf(zlsx.Dxf(
+            font_bold=True,
+            font_color_argb=0xFFFF0000,
+            font_size=16.0,
+            fill_fg_argb=0xFFFFFF00,
+            border_left=zlsx.BorderSide(style="thin", color_argb=0xFF000000),
+            border_right=zlsx.BorderSide(style="thin", color_argb=0xFF000000),
+            border_top=zlsx.BorderSide(style="medium", color_argb=0xFFFF00FF),
+            border_bottom=zlsx.BorderSide(style="medium", color_argb=0xFFFF00FF),
+        ))
+        sheet = w.add_sheet("S")
+        sheet.add_conditional_format_cell_is(
+            "A1:A10", "greater_than", "100", None, rich_dxf
+        )
+        sheet.write_row(["hdr"])
+
+    with zipfile.ZipFile(out) as z:
+        styles_xml = z.read("xl/styles.xml").decode("utf-8")
+
+    # font_size renders as <sz val="16"/>.
+    assert '<sz val="16"/>' in styles_xml
+    # Border block present with all 4 sides.
+    assert '<border>' in styles_xml
+    assert '<left style="thin">' in styles_xml
+    assert '<right style="thin">' in styles_xml
+    assert '<top style="medium">' in styles_xml
+    assert '<bottom style="medium">' in styles_xml
+    # Border colors.
+    assert '<color rgb="FF000000"/>' in styles_xml
+    assert '<color rgb="FFFF00FF"/>' in styles_xml
+
+
 def test_conditional_formatting_round_trip(tmp_path):
     """Write cellIs + expression CF rules via Python; extract the
     generated xlsx and verify the sheet XML + styles.xml contain

@@ -404,6 +404,15 @@ if _HAS_HYPERLINK:
     lib.zlsx_sheet_writer_add_hyperlink.restype = ctypes.c_int32
 
 
+class CDxfBorderSide(ctypes.Structure):
+    _fields_ = [
+        ("style", ctypes.c_uint8),
+        ("has_color", ctypes.c_uint8),
+        ("_pad", ctypes.c_uint8 * 2),
+        ("color_argb", ctypes.c_uint32),
+    ]
+
+
 class CDxf(ctypes.Structure):
     _fields_ = [
         ("bold", ctypes.c_uint8),
@@ -412,6 +421,13 @@ class CDxf(ctypes.Structure):
         ("has_fill", ctypes.c_uint8),
         ("color_argb", ctypes.c_uint32),
         ("fill_fg_argb", ctypes.c_uint32),
+        ("has_size", ctypes.c_uint8),
+        ("_pad", ctypes.c_uint8 * 3),
+        ("size", ctypes.c_float),
+        ("border_left", CDxfBorderSide),
+        ("border_right", CDxfBorderSide),
+        ("border_top", CDxfBorderSide),
+        ("border_bottom", CDxfBorderSide),
     ]
 
 

@@ -160,17 +160,26 @@ class Style:
 
 @dataclass(frozen=True)
 class Dxf:
-    """A differential format — font / fill overrides applied when a
-    conditional-format rule matches. Register on the workbook via
-    :meth:`Writer.add_dxf` to receive a ``dxf_id`` that
+    """A differential format — font / fill / border overrides applied
+    when a conditional-format rule matches. Register on the workbook
+    via :meth:`Writer.add_dxf` to receive a ``dxf_id`` that
     :meth:`SheetWriter.add_conditional_format_cell_is` /
-    :meth:`…_expression` can reference. Only the subset of
-    properties real CF rules toggle (bold / italic / font color /
-    solid fill) is surfaced today."""
+    :meth:`…_expression` can reference.
+
+    Supported fields (iter49):
+      - bold / italic / font color / font size
+      - solid fill color
+      - per-side borders (left / right / top / bottom)
+    """
     font_bold: bool = False
     font_italic: bool = False
     font_color_argb: Optional[int] = None
+    font_size: Optional[float] = None
     fill_fg_argb: Optional[int] = None
+    border_left: "BorderSide" = field(default_factory=lambda: BorderSide())
+    border_right: "BorderSide" = field(default_factory=lambda: BorderSide())
+    border_top: "BorderSide" = field(default_factory=lambda: BorderSide())
+    border_bottom: "BorderSide" = field(default_factory=lambda: BorderSide())
 
 
 class ZlsxError(RuntimeError):
@@ -2078,6 +2087,16 @@ class Writer:
                 "loaded libzlsx does not expose add_dxf "
                 "(requires 0.2.6+); upgrade libzlsx"
             )
+
+        def _side(s: "BorderSide") -> "_ffi.CDxfBorderSide":
+            style_code = _BORDER_STYLE_VALUES.get(s.style, 0)
+            return _ffi.CDxfBorderSide(
+                style=style_code,
+                has_color=1 if s.color_argb is not None else 0,
+                _pad=(ctypes.c_uint8 * 2)(0, 0),
+                color_argb=s.color_argb or 0,
+            )
+
         c = _ffi.CDxf(
             bold=1 if dxf.font_bold else 0,
             italic=1 if dxf.font_italic else 0,
@@ -2085,6 +2104,13 @@ class Writer:
             has_fill=1 if dxf.fill_fg_argb is not None else 0,
             color_argb=dxf.font_color_argb or 0,
             fill_fg_argb=dxf.fill_fg_argb or 0,
+            has_size=1 if dxf.font_size is not None else 0,
+            _pad=(ctypes.c_uint8 * 3)(0, 0, 0),
+            size=dxf.font_size if dxf.font_size is not None else 0.0,
+            border_left=_side(dxf.border_left),
+            border_right=_side(dxf.border_right),
+            border_top=_side(dxf.border_top),
+            border_bottom=_side(dxf.border_bottom),
         )
         out_id = ctypes.c_uint32(0)
         rc = _ffi.lib.zlsx_writer_add_dxf(

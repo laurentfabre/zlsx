@@ -907,17 +907,38 @@ int32_t zlsx_sheet_writer_add_comment(
     size_t                err_buf_len);
 
 /*
- * Differential format for conditional formatting — font / fill
- * overrides applied when a cfRule matches. `has_color` / `has_fill`
- * gate the paired ARGB fields (0 means "not set").
+ * Per-border-side payload for a dxf. `style` is a BorderStyle enum
+ * byte (0 = none, 1 = thin, 2 = medium, 3 = dashed, …, 13 =
+ * slantDashDot — see writer/BorderStyle source for the full table).
+ * `has_color` + 3-byte pad align the u32 color ahead.
  */
 typedef struct {
-    uint8_t  bold;
-    uint8_t  italic;
+    uint8_t  style;
     uint8_t  has_color;
-    uint8_t  has_fill;
+    uint8_t  _pad[2];
     uint32_t color_argb;
-    uint32_t fill_fg_argb;
+} zlsx_dxf_border_side_t;
+
+/*
+ * Differential format for conditional formatting — font / fill /
+ * border overrides applied when a cfRule matches. Has-flags gate
+ * the paired optional fields (0 means "not set"). `size` is in
+ * points; borders default to .none (inherit cell style).
+ */
+typedef struct {
+    uint8_t                bold;
+    uint8_t                italic;
+    uint8_t                has_color;
+    uint8_t                has_fill;
+    uint32_t               color_argb;
+    uint32_t               fill_fg_argb;
+    uint8_t                has_size;
+    uint8_t                _pad[3];
+    float                  size;
+    zlsx_dxf_border_side_t border_left;
+    zlsx_dxf_border_side_t border_right;
+    zlsx_dxf_border_side_t border_top;
+    zlsx_dxf_border_side_t border_bottom;
 } zlsx_dxf_t;
 
 /* Register a dxf on the workbook-wide `<dxfs>` table. Returns 0 on

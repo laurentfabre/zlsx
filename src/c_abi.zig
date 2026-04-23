@@ -1941,6 +1941,20 @@ export fn zlsx_sheet_writer_add_hyperlink(
 /// extern struct so callers can construct it inline. `has_color` /
 /// `has_fill` gate the paired ARGB fields — zero means "not set",
 /// matching the `?u32` semantics on the Zig-side Dxf.
+/// Writer-side per-border-side payload for a Dxf. Distinct from the
+/// reader's `CBorderSide` (which carries `style` as a string slice
+/// from the parsed OOXML); here `style` is a byte from the
+/// `BorderStyle` enum so callers don't have to string-match.
+pub const CDxfBorderSide = extern struct {
+    /// BorderStyle enum value. 0 = none (no border), 1 = thin,
+    /// 2 = medium, 3 = dashed, … 13 = slant_dash_dot. See
+    /// `writer.BorderStyle` for the full set.
+    style: u8,
+    has_color: u8,
+    _pad: [2]u8,
+    color_argb: u32,
+};
+
 pub const CDxf = extern struct {
     bold: u8,
     italic: u8,
@@ -1948,6 +1962,13 @@ pub const CDxf = extern struct {
     has_fill: u8,
     color_argb: u32,
     fill_fg_argb: u32,
+    has_size: u8,
+    _pad: [3]u8,
+    size: f32,
+    border_left: CDxfBorderSide,
+    border_right: CDxfBorderSide,
+    border_top: CDxfBorderSide,
+    border_bottom: CDxfBorderSide,
 };
 
 /// Register a differential format on the workbook-wide `<dxfs>`
@@ -1966,7 +1987,12 @@ export fn zlsx_writer_add_dxf(
         .font_bold = dxf.bold != 0,
         .font_italic = dxf.italic != 0,
         .font_color_argb = if (dxf.has_color != 0) dxf.color_argb else null,
+        .font_size = if (dxf.has_size != 0) dxf.size else null,
         .fill_fg_argb = if (dxf.has_fill != 0) dxf.fill_fg_argb else null,
+        .border_left = cDxfBorderToZig(dxf.border_left),
+        .border_right = cDxfBorderToZig(dxf.border_right),
+        .border_top = cDxfBorderToZig(dxf.border_top),
+        .border_bottom = cDxfBorderToZig(dxf.border_bottom),
     };
     const id = state.inner.addDxf(z_dxf) catch |e| {
         writeError(err_buf, err_buf_len, @errorName(e));
@@ -1974,6 +2000,17 @@ export fn zlsx_writer_add_dxf(
     };
     out_dxf_id.* = id;
     return 0;
+}
+
+fn cDxfBorderToZig(s: CDxfBorderSide) writer_mod.BorderSide {
+    // Byte → BorderStyle enum. Out-of-range codes fall back to
+    // `.none` (safe default — a misconfigured side renders as
+    // inherit-from-cell instead of a random border shape).
+    const style: writer_mod.BorderStyle = std.meta.intToEnum(writer_mod.BorderStyle, s.style) catch .none;
+    return .{
+        .style = style,
+        .color_argb = if (s.has_color != 0) s.color_argb else null,
+    };
 }
 
 fn cfOperatorFromCode(code: u32) ?writer_mod.CfOperator {
