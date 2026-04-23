@@ -540,13 +540,13 @@ pub const Writer = struct {
             }
 
             // <dataValidations> slots between <mergeCells> and
-            // <hyperlinks> per ECMA-376 CT_Worksheet child order.
-            // Each entry is a list-type (dropdown) validation; the
-            // formula1 content wraps the comma-joined values in
-            // literal double-quotes that Excel parses back to the
-            // individual options.
-            if (sw.data_validations.items.len > 0) {
-                try full.print(alloc, "<dataValidations count=\"{d}\">", .{sw.data_validations.items.len});
+            // <hyperlinks> per ECMA-376 CT_Worksheet child order. Two
+            // emission paths share the block: iter13 list entries (dropdown)
+            // first, then iter23 numeric / custom entries.
+            const dv_list_count = sw.data_validations.items.len;
+            const dv_range_count = sw.data_validation_ranges.items.len;
+            if (dv_list_count + dv_range_count > 0) {
+                try full.print(alloc, "<dataValidations count=\"{d}\">", .{dv_list_count + dv_range_count});
                 for (sw.data_validations.items) |dv| {
                     try full.appendSlice(alloc, "<dataValidation type=\"list\" allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"");
                     try appendXmlEscaped(alloc, &full, dv.range);
@@ -556,6 +556,25 @@ pub const Writer = struct {
                         try appendXmlEscaped(alloc, &full, v);
                     }
                     try full.appendSlice(alloc, "&quot;</formula1></dataValidation>");
+                }
+                for (sw.data_validation_ranges.items) |dv| {
+                    try full.appendSlice(alloc, "<dataValidation type=\"");
+                    try full.appendSlice(alloc, dv.kind_name);
+                    try full.appendSlice(alloc, "\"");
+                    if (dv.op_name) |op| {
+                        try full.print(alloc, " operator=\"{s}\"", .{op});
+                    }
+                    try full.appendSlice(alloc, " allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"");
+                    try appendXmlEscaped(alloc, &full, dv.range);
+                    try full.appendSlice(alloc, "\"><formula1>");
+                    try appendXmlEscaped(alloc, &full, dv.formula1);
+                    try full.appendSlice(alloc, "</formula1>");
+                    if (dv.formula2) |f2| {
+                        try full.appendSlice(alloc, "<formula2>");
+                        try appendXmlEscaped(alloc, &full, f2);
+                        try full.appendSlice(alloc, "</formula2>");
+                    }
+                    try full.appendSlice(alloc, "</dataValidation>");
                 }
                 try full.appendSlice(alloc, "</dataValidations>");
             }
@@ -667,6 +686,75 @@ pub const DataValidationList = struct {
     values: [][]u8,
 };
 
+/// Numeric / date / time / text-length / custom data validation. Same
+/// `<dataValidations>` block as list validations but a different
+/// `type="…"` and a formula-based constraint. `kind_name` and
+/// `op_name` are static strings (no allocation); `range`, `formula1`,
+/// and `formula2` (when present) are SheetWriter-owned copies.
+pub const DataValidationRange = struct {
+    range: []u8,
+    /// One of "whole", "decimal", "date", "time", "textLength", "custom".
+    kind_name: []const u8,
+    /// One of "between", "notBetween", "equal", "notEqual",
+    /// "greaterThan", "lessThan", "greaterThanOrEqual",
+    /// "lessThanOrEqual". `null` for `type="custom"` which doesn't
+    /// use an operator.
+    op_name: ?[]const u8,
+    formula1: []u8,
+    /// Required iff `op_name` is "between" or "notBetween"; null otherwise.
+    formula2: ?[]u8,
+};
+
+/// Numeric-side comparison operator for `addDataValidationNumeric`.
+pub const DataValidationOp = enum {
+    between,
+    not_between,
+    equal,
+    not_equal,
+    greater_than,
+    less_than,
+    greater_than_or_equal,
+    less_than_or_equal,
+
+    fn toOoxml(self: DataValidationOp) []const u8 {
+        return switch (self) {
+            .between => "between",
+            .not_between => "notBetween",
+            .equal => "equal",
+            .not_equal => "notEqual",
+            .greater_than => "greaterThan",
+            .less_than => "lessThan",
+            .greater_than_or_equal => "greaterThanOrEqual",
+            .less_than_or_equal => "lessThanOrEqual",
+        };
+    }
+
+    fn needsSecondFormula(self: DataValidationOp) bool {
+        return self == .between or self == .not_between;
+    }
+};
+
+/// Data-validation kind for `addDataValidationNumeric`. For dropdown
+/// lists use `addDataValidationList`; for formula-driven custom
+/// checks use `addDataValidationCustom`.
+pub const DataValidationNumericKind = enum {
+    whole,
+    decimal,
+    date,
+    time,
+    text_length,
+
+    fn toOoxml(self: DataValidationNumericKind) []const u8 {
+        return switch (self) {
+            .whole => "whole",
+            .decimal => "decimal",
+            .date => "date",
+            .time => "time",
+            .text_length => "textLength",
+        };
+    }
+};
+
 /// Per-column width override. `col_min..=col_max` is the inclusive
 /// range this width applies to (xlsx indexes columns 1-based — the
 /// SheetWriter API takes 0-based indices and translates on emit).
@@ -714,6 +802,11 @@ pub const SheetWriter = struct {
     /// List-type data validations (dropdowns). Emitted as a single
     /// `<dataValidations>` block with one `<dataValidation>` per entry.
     data_validations: std.ArrayListUnmanaged(DataValidationList) = .{},
+    /// Numeric / date / time / text-length / custom data validations.
+    /// Sharing the `<dataValidations>` block with the list entries;
+    /// the two lists are kept separate so iter13 list-validation code
+    /// stays unchanged.
+    data_validation_ranges: std.ArrayListUnmanaged(DataValidationRange) = .{},
 
     fn init(parent: *Writer, name: []const u8) !SheetWriter {
         return .{
@@ -746,6 +839,12 @@ pub const SheetWriter = struct {
             self.parent.allocator.free(dv.values);
         }
         self.data_validations.deinit(self.parent.allocator);
+        for (self.data_validation_ranges.items) |dv| {
+            self.parent.allocator.free(dv.range);
+            self.parent.allocator.free(dv.formula1);
+            if (dv.formula2) |f2| self.parent.allocator.free(f2);
+        }
+        self.data_validation_ranges.deinit(self.parent.allocator);
         self.* = undefined;
     }
 
@@ -843,6 +942,73 @@ pub const SheetWriter = struct {
         try self.data_validations.append(alloc, .{
             .range = range_copy,
             .values = values_copy,
+        });
+    }
+
+    /// Attach a numeric / date / time / text-length data validation.
+    /// `range` is A1-style. `formula1` is the primary bound (number
+    /// or Excel date serial or length — passed as a string, the
+    /// writer emits it verbatim). `formula2` must be non-null iff
+    /// `op` is `.between` or `.not_between`, and must be null
+    /// otherwise — mismatches surface `error.InvalidDataValidation`.
+    /// Excel displays number-typed validations as red-circle errors
+    /// when the cell value falls outside the constraint.
+    pub fn addDataValidationNumeric(
+        self: *SheetWriter,
+        range: []const u8,
+        kind: DataValidationNumericKind,
+        op: DataValidationOp,
+        formula1: []const u8,
+        formula2: ?[]const u8,
+    ) !void {
+        try validateHyperlinkRange(range);
+        if (formula1.len == 0) return error.InvalidDataValidation;
+        const needs_two = op.needsSecondFormula();
+        if (needs_two and (formula2 == null or formula2.?.len == 0)) return error.InvalidDataValidation;
+        if (!needs_two and formula2 != null) return error.InvalidDataValidation;
+
+        const alloc = self.parent.allocator;
+        const range_copy = try alloc.dupe(u8, range);
+        errdefer alloc.free(range_copy);
+        const f1_copy = try alloc.dupe(u8, formula1);
+        errdefer alloc.free(f1_copy);
+        const f2_copy: ?[]u8 = if (formula2) |f| try alloc.dupe(u8, f) else null;
+        errdefer if (f2_copy) |f| alloc.free(f);
+
+        try self.data_validation_ranges.append(alloc, .{
+            .range = range_copy,
+            .kind_name = kind.toOoxml(),
+            .op_name = op.toOoxml(),
+            .formula1 = f1_copy,
+            .formula2 = f2_copy,
+        });
+    }
+
+    /// Attach a custom-formula data validation. `formula` is any
+    /// Excel formula that evaluates to TRUE for accepted cell
+    /// values (e.g. `LEN(A1)>3`, `AND(A1>0,A1<100)`). XML-special
+    /// characters in the formula are entity-escaped on emit.
+    /// Rejects empty formula with `error.InvalidDataValidation`.
+    pub fn addDataValidationCustom(
+        self: *SheetWriter,
+        range: []const u8,
+        formula: []const u8,
+    ) !void {
+        try validateHyperlinkRange(range);
+        if (formula.len == 0) return error.InvalidDataValidation;
+
+        const alloc = self.parent.allocator;
+        const range_copy = try alloc.dupe(u8, range);
+        errdefer alloc.free(range_copy);
+        const f_copy = try alloc.dupe(u8, formula);
+        errdefer alloc.free(f_copy);
+
+        try self.data_validation_ranges.append(alloc, .{
+            .range = range_copy,
+            .kind_name = "custom",
+            .op_name = null,
+            .formula1 = f_copy,
+            .formula2 = null,
         });
     }
 
@@ -2580,6 +2746,93 @@ test "Writer: addMergedCell validates + emits <mergeCells> block" {
     try std.testing.expect(mc < ws_end);
 
     // Confirm the reader still walks the workbook cleanly.
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    while (try rows.next()) |_| {}
+}
+
+test "Writer: addDataValidationNumeric + Custom emit correct XML" {
+    const tmp_path = "/tmp/zlsx_writer_dv_ranges.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Validations");
+
+        // Whole-number between 1..100.
+        try sheet.addDataValidationNumeric("B2:B10", .whole, .between, "1", "100");
+        // Decimal greater than 0.
+        try sheet.addDataValidationNumeric("C3", .decimal, .greater_than, "0", null);
+        // Date before 2025-01-01 (Excel serial 45658).
+        try sheet.addDataValidationNumeric("D4", .date, .less_than, "45658", null);
+        // Text length between 3 and 20 characters.
+        try sheet.addDataValidationNumeric("E5", .text_length, .between, "3", "20");
+        // Custom formula — XML-special chars must be escaped on emit.
+        try sheet.addDataValidationCustom("F6", "AND(F6>0,F6<LEN(A1))");
+
+        // Also mix with an iter13 list validation to prove both
+        // emission paths coexist.
+        try sheet.addDataValidationList("A2:A10", &.{ "Yes", "No" });
+
+        // Rejections.
+        try std.testing.expectError(error.InvalidDataValidation, sheet.addDataValidationNumeric("G1", .whole, .between, "1", null));
+        try std.testing.expectError(error.InvalidDataValidation, sheet.addDataValidationNumeric("G2", .whole, .equal, "1", "2"));
+        try std.testing.expectError(error.InvalidDataValidation, sheet.addDataValidationNumeric("G3", .whole, .equal, "", null));
+        try std.testing.expectError(error.InvalidDataValidation, sheet.addDataValidationCustom("G4", ""));
+        try std.testing.expectError(error.InvalidHyperlinkRange, sheet.addDataValidationNumeric("", .whole, .equal, "1", null));
+
+        try sheet.writeRow(&.{.{ .string = "hdr" }});
+        try w.save(tmp_path);
+    }
+
+    const sheet_xml = blk: {
+        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        var fbuf: [4096]u8 = undefined;
+        var fr = file.reader(&fbuf);
+        var iter = try std.zip.Iterator.init(&fr);
+        var name_buf: [64]u8 = undefined;
+        while (try iter.next()) |entry| {
+            if (entry.filename_len > name_buf.len) continue;
+            try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            const fn_slice = name_buf[0..entry.filename_len];
+            try fr.interface.readSliceAll(fn_slice);
+            if (std.mem.eql(u8, fn_slice, "xl/worksheets/sheet1.xml")) {
+                break :blk try extractEntryForTest(std.testing.allocator, entry, &fr);
+            }
+        }
+        return error.SheetXmlNotFound;
+    };
+    defer std.testing.allocator.free(sheet_xml);
+
+    // Count = 6 (1 list + 5 ranges).
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<dataValidations count=\"6\">") != null);
+
+    // whole/between with two formulas.
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<dataValidation type=\"whole\" operator=\"between\" allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"B2:B10\"><formula1>1</formula1><formula2>100</formula2></dataValidation>") != null);
+
+    // decimal/greaterThan with single formula.
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<dataValidation type=\"decimal\" operator=\"greaterThan\" allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"C3\"><formula1>0</formula1></dataValidation>") != null);
+
+    // date/lessThan.
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "type=\"date\" operator=\"lessThan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<formula1>45658</formula1>") != null);
+
+    // textLength/between.
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "type=\"textLength\" operator=\"between\"") != null);
+
+    // custom — no operator attribute; XML-special chars in the
+    // formula must be entity-escaped (`>` → `&gt;`, `<` → `&lt;`).
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<dataValidation type=\"custom\" allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"F6\"><formula1>AND(F6&gt;0,F6&lt;LEN(A1))</formula1></dataValidation>") != null);
+
+    // And the list entry still appears.
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<dataValidation type=\"list\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "&quot;Yes,No&quot;") != null);
+
+    // Reader round-trip still parses cleanly.
     var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);

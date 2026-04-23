@@ -4,7 +4,7 @@ Tiny `.xlsx` reader **and** writer for Zig. Single-file library, no third-party 
 
 **Reader**: 1.9 ms on small files (alongside calamine-rust, process-startup-bound), 13.3 ms / 2.95 MB on a 67 KB workbook with 1,144 shared strings — 1.5× faster than python-calamine, 5.9× faster than openpyxl on that file, at the **smallest RSS of the four** (~6× lower than the Python stack, slightly below calamine). calamine-rust still leads on SST-heavy workloads (3.4 ms vs zlsx's 13.3 ms post single-pass rewrite); the remaining gap is stdlib-flate decompression overhead. [Full benchmark table →](docs/benchmarks.md)
 
-**Writer** (Phase 3b, v0.2.4): pragmatic openpyxl-parity styles — bold/italic, font size/name/color, horizontal alignment, wrap text, 19 OOXML fill patterns, 14 border styles × 5 sides, custom number formats, column widths, row heights, freeze panes, auto-filter, merged cell ranges, external + internal hyperlinks, list-type data validations (dropdowns), formulas with cached values. Survived 1M-iter deep fuzz on every surface.
+**Writer** (Phase 3b, v0.2.4): pragmatic openpyxl-parity styles — bold/italic, font size/name/color, horizontal alignment, wrap text, 19 OOXML fill patterns, 14 border styles × 5 sides, custom number formats, column widths, row heights, freeze panes, auto-filter, merged cell ranges, external + internal hyperlinks, full data-validation family (list / whole / decimal / date / time / textLength / custom with 8 comparison operators), formulas with cached values. Survived 1M-iter deep fuzz on every surface.
 
 ```zig
 const xlsx = @import("zlsx");
@@ -66,7 +66,7 @@ Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-ro
 
 **In**
 - **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout, merged-cell ranges via `Book.mergedRanges(sheet)`, external-URL hyperlinks via `Book.hyperlinks(sheet)` (resolved through sheet `_rels`), list-type data validations via `Book.dataValidations(sheet)` (values entity-decoded)
-- **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, row heights, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks (per-sheet `_rels`), internal hyperlinks (`location="Sheet2!A1"`), list-type data validations (dropdowns), formulas with optional cached value
+- **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, row heights, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks (per-sheet `_rels`), internal hyperlinks (`location="Sheet2!A1"`), list-type data validations (dropdowns), number / decimal / date / time / text-length / custom data validations, formulas with optional cached value
 - XML entity decoding (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&#N;`, `&#xN;`) on read and escaping on write
 - CLI (`zlsx file.xlsx --format {jsonl,jsonl-dict,tsv,csv}`), C ABI (`libzlsx.{dylib,so,dll}` + `include/zlsx.h`), Python bindings (`pip install py-zlsx`)
 
@@ -125,7 +125,7 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 | External-URL hyperlinks | ✓ | ✓ | ✓ |
 | Internal (`Sheet!A1`) hyperlinks | ✓ | ✓ | ✓ |
 | Data validations (list) | ✓ | ✓ | ✓ |
-| Data validations (number / date / custom) | — | ✓ | ✓ |
+| Data validations (number / date / custom) | ✓ | ✓ | ✓ |
 | Conditional formatting | — | ✓ | ✓ |
 | Cell comments / notes | — | ✓ | ✓ |
 | Formulas (with cached value) | ✓ | ✓ | ✓ |
