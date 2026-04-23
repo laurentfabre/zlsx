@@ -1422,8 +1422,29 @@ fn tokenizeLazy(
                 const cand_pos: usize = @intCast(candidate);
                 if (i - cand_pos > DEFLATE_WINDOW_SIZE) break;
                 const limit = @min(input.len - i, DEFLATE_MAX_MATCH);
+                // Word-at-a-time match length: XOR 8 bytes of source and
+                // dest, and if they differ, @ctz(diff) / 8 is the first
+                // mismatched byte offset. Typical xlsx XML matches run
+                // 3-30 bytes, so the 8-wide compare cuts the inner loop
+                // iteration count by ~6× on average. Bounds check: the
+                // outer limit already caps us at input.len - i, and the
+                // distance invariant cand_pos < i means cand_pos + limit
+                // stays strictly inside input as well.
                 var k: usize = 0;
-                while (k < limit and input[cand_pos + k] == input[i + k]) : (k += 1) {}
+                var word_exit = false;
+                while (k + 8 <= limit) : (k += 8) {
+                    const a = std.mem.readInt(u64, input[cand_pos + k ..][0..8], .little);
+                    const b = std.mem.readInt(u64, input[i + k ..][0..8], .little);
+                    const diff = a ^ b;
+                    if (diff != 0) {
+                        k += @as(usize, @ctz(diff)) / 8;
+                        word_exit = true;
+                        break;
+                    }
+                }
+                if (!word_exit) {
+                    while (k < limit and input[cand_pos + k] == input[i + k]) : (k += 1) {}
+                }
                 if (k >= DEFLATE_MIN_MATCH and k > match_len) {
                     match_len = k;
                     match_dist = i - cand_pos;

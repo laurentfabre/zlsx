@@ -61,12 +61,15 @@ pub const Book = struct {
     /// Decompressed `xl/sharedStrings.xml` (nullable — small xlsx files
     /// with only inline strings omit this part).
     shared_strings_xml: ?[]u8 = null,
-    /// Index into `shared_strings_xml` (or backing owned strings if we
-    /// had to decode entities). Order matches the SST in the file.
+    /// Index into `shared_strings_xml` (or into `sst_arena` if we had
+    /// to decode entities / concatenate rich-text runs). Order matches
+    /// the SST in the file.
     shared_strings: [][]const u8 = &.{},
-    /// Owned decoded shared strings when entity decoding was needed.
-    /// Empty if every SST entry was verbatim.
-    shared_owned: std.ArrayListUnmanaged([]u8) = .{},
+    /// Bump arena for SST-owned strings. Bulk-freed on `deinit`.
+    /// One arena reset per parseSharedStrings call is all the cleanup
+    /// we need — saves ~1 malloc per entry vs the previous per-string
+    /// ArrayList path on workloads like worldbank_catalog (1,144 SST).
+    sst_arena: std.heap.ArenaAllocator,
     /// (name, path) for each `<sheet>` in the workbook, in declared order.
     sheets: []Sheet = &.{},
     /// Decompressed bytes of each sheet's XML, keyed by path.
@@ -79,7 +82,10 @@ pub const Book = struct {
     /// decompressed (xlsx files we target are small — ~300 KB — and
     /// streaming through std.zip is awkward).
     pub fn open(allocator: Allocator, path: []const u8) !Book {
-        var book: Book = .{ .allocator = allocator };
+        var book: Book = .{
+            .allocator = allocator,
+            .sst_arena = std.heap.ArenaAllocator.init(allocator),
+        };
         errdefer book.deinit();
 
         var file = try std.fs.cwd().openFile(path, .{});
@@ -147,8 +153,7 @@ pub const Book = struct {
         const a = self.allocator;
         if (self.shared_strings_xml) |s| a.free(s);
         a.free(self.shared_strings);
-        for (self.shared_owned.items) |s| a.free(s);
-        self.shared_owned.deinit(a);
+        self.sst_arena.deinit();
 
         var it = self.sheet_data.valueIterator();
         while (it.next()) |v| a.free(v.*);
@@ -181,7 +186,7 @@ pub const Book = struct {
             .shared_strings = self.shared_strings,
             .allocator = allocator,
             .row_cells = .{},
-            .owned = .{},
+            .arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 };
@@ -194,33 +199,28 @@ pub const Rows = struct {
     shared_strings: []const []const u8,
     allocator: Allocator,
     row_cells: std.ArrayListUnmanaged(Cell),
-    /// Per-row owned strings: any string that required entity decoding
-    /// or scanning across multiple `<t>` runs gets its own allocation
-    /// here, so `[]const u8` slices in `Cell.string` never dangle when
-    /// later cells in the same row allocate more text. Freed at the
-    /// start of each `next()` call and at `deinit`.
-    owned: std.ArrayListUnmanaged([]u8),
+    /// Bump arena for per-row decoded strings. Reset (O(1)) at the
+    /// start of each `next()` call — previous row's owned strings
+    /// become invalid, which matches the documented contract. Compared
+    /// to the older per-string malloc/free list this saves ~one free
+    /// per entity-bearing or rich-text cell per row.
+    arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *Rows) void {
-        for (self.owned.items) |s| self.allocator.free(s);
-        self.owned.deinit(self.allocator);
+        self.arena.deinit();
         self.row_cells.deinit(self.allocator);
         self.* = undefined;
-    }
-
-    fn clearOwned(self: *Rows) void {
-        for (self.owned.items) |s| self.allocator.free(s);
-        self.owned.clearRetainingCapacity();
     }
 
     /// Returns the next row's cells, or null at end-of-sheet. Returned
     /// slice is valid until the next call to `next()` (or until
     /// `deinit()`). Cell string contents are either shared-string slices
     /// (owned by the Book), xml-backed slices (stable for the Book's
-    /// lifetime), or row-owned slices that are freed on the next call.
+    /// lifetime), or row-owned slices that are invalidated on the next
+    /// call (arena reset).
     pub fn next(self: *Rows) !?[]const Cell {
         self.row_cells.clearRetainingCapacity();
-        self.clearOwned();
+        _ = self.arena.reset(.retain_capacity);
 
         while (findTagOpen(self.xml, self.pos, "row")) |row_start| {
             self.pos = row_start.after_open;
@@ -311,7 +311,7 @@ pub const Rows = struct {
 
     /// Decode a `<v>…</v>` cell body. If the raw text has no entities,
     /// return the xml-backed slice directly (no allocation). Otherwise
-    /// allocate an owned slice tracked in `self.owned`.
+    /// allocate an owned slice in the row arena.
     fn decodeVValue(self: *Rows, body: []const u8) ![]const u8 {
         const raw = extractVValue(body) orelse return "";
         return try self.internOrBorrow(raw);
@@ -319,8 +319,8 @@ pub const Rows = struct {
 
     /// Decode inline-string body `<is>(<r>)?<t>text</t>(</r>)?</is>`.
     /// Single-`<t>` bodies without entities borrow from xml. Anything
-    /// else (rich-text runs, entities) gets an owned allocation in
-    /// `self.owned`.
+    /// else (rich-text runs, entities) gets an owned allocation in the
+    /// row arena.
     fn decodeInlineString(self: *Rows, body: []const u8) ![]const u8 {
         // Count <t> runs to decide borrow vs own.
         var t_count: usize = 0;
@@ -350,9 +350,9 @@ pub const Rows = struct {
             return body[only_start..only_end];
         }
 
-        // Multi-run or entity-bearing — allocate.
+        // Multi-run or entity-bearing — allocate into the row arena.
+        const a = self.arena.allocator();
         var buf: std.ArrayListUnmanaged(u8) = .{};
-        errdefer buf.deinit(self.allocator);
         var i: usize = 0;
         while (std.mem.indexOfPos(u8, body, i, "<t")) |t_start| {
             const gt = std.mem.indexOfScalarPos(u8, body, t_start, '>') orelse return error.MalformedXml;
@@ -361,24 +361,20 @@ pub const Rows = struct {
                 continue;
             }
             const t_close = std.mem.indexOfPos(u8, body, gt + 1, "</t>") orelse return error.MalformedXml;
-            try appendDecoded(self.allocator, &buf, body[gt + 1 .. t_close]);
+            try appendDecoded(a, &buf, body[gt + 1 .. t_close]);
             i = t_close + "</t>".len;
         }
-        const owned = try buf.toOwnedSlice(self.allocator);
-        try self.owned.append(self.allocator, owned);
-        return owned;
+        return try buf.toOwnedSlice(a);
     }
 
     /// Return `raw` unchanged if it needs no decoding; otherwise allocate
-    /// an owned slice and track it in `self.owned`.
+    /// an owned slice in the row arena (invalidated at the next `next()` call).
     fn internOrBorrow(self: *Rows, raw: []const u8) ![]const u8 {
         if (std.mem.indexOfScalar(u8, raw, '&') == null) return raw;
+        const a = self.arena.allocator();
         var buf: std.ArrayListUnmanaged(u8) = .{};
-        errdefer buf.deinit(self.allocator);
-        try appendDecoded(self.allocator, &buf, raw);
-        const owned = try buf.toOwnedSlice(self.allocator);
-        try self.owned.append(self.allocator, owned);
-        return owned;
+        try appendDecoded(a, &buf, raw);
+        return try buf.toOwnedSlice(a);
     }
 };
 
@@ -588,8 +584,24 @@ fn parseWorkbookSheets(book: *Book, wb_xml: []const u8, rels_xml: []const u8) !v
 // ─── sharedStrings.xml parsing ───────────────────────────────────────
 
 fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
+    // Pre-size via the uniqueCount hint in the <sst> tag when present —
+    // OOXML generators are reliable about this attribute, so we get a
+    // right-sized backing store on the first append and skip all
+    // geometric grows. Fall back to 64 for generators that omit it.
+    const hint: usize = blk: {
+        const open = std.mem.indexOf(u8, sst_xml, "<sst") orelse break :blk 64;
+        const gt = std.mem.indexOfScalarPos(u8, sst_xml, open, '>') orelse break :blk 64;
+        const attrs = sst_xml[open..gt];
+        const u = std.mem.indexOf(u8, attrs, "uniqueCount=\"") orelse break :blk 64;
+        const start = u + "uniqueCount=\"".len;
+        const end = std.mem.indexOfScalarPos(u8, attrs, start, '"') orelse break :blk 64;
+        break :blk std.fmt.parseInt(usize, attrs[start..end], 10) catch 64;
+    };
+
     var strings: std.ArrayListUnmanaged([]const u8) = .{};
     errdefer strings.deinit(book.allocator);
+    try strings.ensureTotalCapacity(book.allocator, hint);
+    const arena_alloc = book.sst_arena.allocator();
 
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, sst_xml, i, "<si")) |si_start| {
@@ -603,58 +615,63 @@ fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
         const si_close = std.mem.indexOfPos(u8, sst_xml, si_gt, "</si>") orelse break;
         const body = sst_xml[si_gt + 1 .. si_close];
 
-        // Concatenate every <t>…</t> in the body.
-        var concat: std.ArrayListUnmanaged(u8) = .{};
-        errdefer concat.deinit(book.allocator);
-        var needs_decoding = false;
-
-        var j: usize = 0;
-        while (std.mem.indexOfPos(u8, body, j, "<t")) |t_start| {
-            const t_gt = std.mem.indexOfScalarPos(u8, body, t_start, '>') orelse break;
-            if (body[t_gt - 1] == '/') {
-                j = t_gt + 1;
+        // Pass 1: tally <t> tags + detect entities + remember the first
+        // span. Lets us pick the cheapest finishing path below without
+        // speculatively allocating a concat buffer that we'd then throw
+        // away on the borrow path (which is the common case for
+        // workbooks that don't use rich text / XML entities).
+        var t_count: usize = 0;
+        var first_span: []const u8 = "";
+        var has_entities = false;
+        var probe: usize = 0;
+        while (std.mem.indexOfPos(u8, body, probe, "<t")) |t_start| {
+            const gt = std.mem.indexOfScalarPos(u8, body, t_start, '>') orelse break;
+            if (body[gt - 1] == '/') {
+                probe = gt + 1;
                 continue;
             }
-            const t_close = std.mem.indexOfPos(u8, body, t_gt + 1, "</t>") orelse break;
-            const raw = body[t_gt + 1 .. t_close];
-            if (std.mem.indexOfScalar(u8, raw, '&') != null) needs_decoding = true;
-            try concat.appendSlice(book.allocator, raw);
-            j = t_close + "</t>".len;
+            const t_close = std.mem.indexOfPos(u8, body, gt + 1, "</t>") orelse break;
+            const span = body[gt + 1 .. t_close];
+            if (std.mem.indexOfScalar(u8, span, '&') != null) has_entities = true;
+            if (t_count == 0) first_span = span;
+            t_count += 1;
+            probe = t_close + "</t>".len;
         }
 
-        if (needs_decoding) {
-            var decoded: std.ArrayListUnmanaged(u8) = .{};
-            errdefer decoded.deinit(book.allocator);
-            try appendDecoded(book.allocator, &decoded, concat.items);
-            concat.deinit(book.allocator);
-            const owned = try decoded.toOwnedSlice(book.allocator);
-            try book.shared_owned.append(book.allocator, owned);
-            try strings.append(book.allocator, owned);
+        if (t_count == 0) {
+            try strings.append(book.allocator, "");
+        } else if (t_count == 1 and !has_entities) {
+            // Fast path — borrow the single `<t>` span directly. This
+            // is typically 95 %+ of SST entries for xlsx files that
+            // don't use rich-text formatting, so avoiding the
+            // allocation matters.
+            try strings.append(book.allocator, first_span);
         } else {
-            // Point into sst_xml directly to save an allocation.
-            // We need the slice to outlive concat — rescan the body to
-            // locate the original span. For single-<t> entries this is
-            // trivial; rich-text runs we handle via the owned path.
-            const first_t = std.mem.indexOf(u8, body, "<t") orelse {
-                concat.deinit(book.allocator);
-                try strings.append(book.allocator, "");
-                i = si_close + "</si>".len;
-                continue;
-            };
-            const t_gt = std.mem.indexOfScalarPos(u8, body, first_t, '>') orelse break;
-            const remaining = body[t_gt + 1 ..];
-            const t_close_rel = std.mem.indexOf(u8, remaining, "</t>") orelse break;
-            const span = remaining[0..t_close_rel];
-            // If concat matches the single span we're pointing at, reuse.
-            if (span.len == concat.items.len and std.mem.eql(u8, span, concat.items)) {
-                concat.deinit(book.allocator);
-                try strings.append(book.allocator, span);
-            } else {
-                // Rich-text run across multiple <t> — own the concat.
-                const owned = try concat.toOwnedSlice(book.allocator);
-                try book.shared_owned.append(book.allocator, owned);
-                try strings.append(book.allocator, owned);
+            // Slow path: concat (and maybe decode) every <t> run into
+            // the SST arena. Pre-size to `body.len` so the ArrayList
+            // never reallocates — decoded output is always ≤ body size
+            // since every entity (`&amp;`, `&#NNN;`) is strictly longer
+            // than its decoded byte(s). Saves ~7 geometric reallocs per
+            // entry on long entity-bearing strings, which is where the
+            // previous revision bled most of parseSST's runtime.
+            var buf: std.ArrayListUnmanaged(u8) = try .initCapacity(arena_alloc, body.len);
+            var j: usize = 0;
+            while (std.mem.indexOfPos(u8, body, j, "<t")) |t_start| {
+                const gt = std.mem.indexOfScalarPos(u8, body, t_start, '>') orelse break;
+                if (body[gt - 1] == '/') {
+                    j = gt + 1;
+                    continue;
+                }
+                const t_close = std.mem.indexOfPos(u8, body, gt + 1, "</t>") orelse break;
+                const span = body[gt + 1 .. t_close];
+                if (has_entities) {
+                    try appendDecoded(arena_alloc, &buf, span);
+                } else {
+                    buf.appendSliceAssumeCapacity(span);
+                }
+                j = t_close + "</t>".len;
             }
+            try strings.append(book.allocator, try buf.toOwnedSlice(arena_alloc));
         }
 
         i = si_close + "</si>".len;
@@ -873,7 +890,7 @@ test "fuzz parseSharedStrings" {
     var buf: [fuzz_max_input_len]u8 = undefined;
     for (0..iters) |_| {
         const input = randomInput(rng, &buf);
-        var book: Book = .{ .allocator = std.testing.allocator };
+        var book: Book = .{ .allocator = std.testing.allocator, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
         defer book.deinit();
         // parseSharedStrings may borrow spans from the xml buffer when
         // no entity decoding is needed; dupe it so the buffer outlives
@@ -894,7 +911,7 @@ test "fuzz parseWorkbookSheets" {
         const mid = input.len / 2;
         const wb = input[0..mid];
         const rels = input[mid..];
-        var book: Book = .{ .allocator = std.testing.allocator };
+        var book: Book = .{ .allocator = std.testing.allocator, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
         defer book.deinit();
         parseWorkbookSheets(&book, wb, rels) catch {};
     }
@@ -995,7 +1012,7 @@ test "fuzz parseSharedStrings mutations" {
     var dst: [fuzz_max_input_len]u8 = undefined;
     for (0..iters) |_| {
         const input = mutate(rng, sst_template, &dst);
-        var book: Book = .{ .allocator = std.testing.allocator };
+        var book: Book = .{ .allocator = std.testing.allocator, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
         defer book.deinit();
         const owned = std.testing.allocator.dupe(u8, input) catch continue;
         book.shared_strings_xml = owned;
@@ -1012,7 +1029,7 @@ test "fuzz parseWorkbookSheets mutations" {
     for (0..iters) |_| {
         const wb = mutate(rng, workbook_template, &wb_dst);
         const rels = mutate(rng, rels_template, &rels_dst);
-        var book: Book = .{ .allocator = std.testing.allocator };
+        var book: Book = .{ .allocator = std.testing.allocator, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
         defer book.deinit();
         parseWorkbookSheets(&book, wb, rels) catch {};
     }
@@ -1052,7 +1069,7 @@ fn consumeAllRows(alloc: std.mem.Allocator, shared_strings: []const []const u8, 
         .shared_strings = shared_strings,
         .allocator = alloc,
         .row_cells = .{},
-        .owned = .{},
+        .arena = std.heap.ArenaAllocator.init(alloc),
     };
     defer rows.deinit();
     var count: usize = 0;
@@ -1187,7 +1204,7 @@ test "fuzz Rows.next on synthetic cells with out-of-range SST indices" {
             .shared_strings = &sst_entries,
             .allocator = std.testing.allocator,
             .row_cells = .{},
-            .owned = .{},
+            .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
         };
         defer rows.deinit();
 
