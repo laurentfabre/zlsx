@@ -148,3 +148,66 @@ test "World Bank Data Catalog — heavy SST (1144 entries, 143 KB)" {
     const total = try rowCount(&book, sheet, alloc);
     try std.testing.expect(total >= 100 and total <= 500);
 }
+
+test "corpus surface: iter28-34 reader APIs round-trip on real fixtures" {
+    // The per-cell style / font / fill / border / numFmt / rich-runs /
+    // comments APIs were added in iter28-34 but their tests use
+    // synthesised fixtures. Exercise them against real-world xlsx files
+    // so a regression in the styles.xml parser (or equivalent) fails
+    // CI on the fixtures we already ship — not just on inputs I
+    // hand-crafted to match the parser's expectations.
+    const alloc = std.testing.allocator;
+
+    // openpyxl_guess_types has an xl/styles.xml part (date + numeric
+    // number formats). Every row must produce a styles slice of the
+    // same length as cells; numberFormat() + isDateFormat() must not
+    // crash on any style index the sheet references.
+    {
+        var book = try openOrSkip(alloc, "openpyxl_guess_types.xlsx");
+        defer book.deinit();
+        const sheet = book.sheets[0];
+        var rows = try book.rows(sheet, alloc);
+        defer rows.deinit();
+        while (try rows.next()) |cells| {
+            const styles = rows.styleIndices();
+            try std.testing.expectEqual(cells.len, styles.len);
+            for (styles) |maybe_idx| {
+                const s = maybe_idx orelse continue;
+                // numberFormat may return null for a corrupt / sparse
+                // styles.xml, but it must NEVER crash. isDateFormat
+                // piggybacks on it and returns false on absence.
+                _ = book.numberFormat(s);
+                _ = book.isDateFormat(s);
+                _ = book.cellFont(s);
+                _ = book.cellFill(s);
+                _ = book.cellBorder(s);
+            }
+        }
+    }
+
+    // Worldbank catalog has 1,144 SST entries. richRuns(i) must return
+    // null for every plain entry (the common case — no regression
+    // into false-positive rich-runs on files without <r> wrappers).
+    {
+        var book = try openOrSkip(alloc, "worldbank_catalog.xlsx");
+        defer book.deinit();
+        var rich_count: usize = 0;
+        for (0..book.shared_strings.len) |i| {
+            if (book.richRuns(i) != null) rich_count += 1;
+        }
+        // Plain-text SST — no runs should surface. If any do, it's a
+        // parser false-positive.
+        try std.testing.expectEqual(@as(usize, 0), rich_count);
+    }
+
+    // None of the corpus files are authored with cell comments today,
+    // but comments() must still return an empty slice (never crash /
+    // leak) for every sheet.
+    {
+        var book = try openOrSkip(alloc, "worldbank_catalog.xlsx");
+        defer book.deinit();
+        for (book.sheets) |sheet| {
+            try std.testing.expectEqual(@as(usize, 0), book.comments(sheet).len);
+        }
+    }
+}

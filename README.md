@@ -138,9 +138,9 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 | Charts | — | ✓ | ~ |
 | Deflate compression | ✓ | ✓ | ✓ |
 | Load-modify-save | — | — | ✓ |
-| Sheet-name validation (length / reserved chars / duplicates) | ✓ | ~³ | ~ |
+| Sheet-name validation (length / reserved chars / duplicates) | ✓ | ~⁷ | ~ |
 
-³ xlsxwriter validates length and some chars but does not reject case-insensitive duplicates up front.
+⁷ xlsxwriter validates length and some chars but does not reject case-insensitive duplicates up front.
 
 ### Language / packaging
 

@@ -2082,6 +2082,110 @@ test "writer C ABI: add_data_validation_numeric + custom round-trip via reader" 
     try std.testing.expectEqualStrings("AND(D4>0,D4<LEN(A1))", fp[0..fl]);
 }
 
+test "reader C ABI: cell_font + cell_fill + cell_border + styleIndices + numFmt getters round-trip" {
+    // iter28-32 added styles-surface exports — this test hits the C
+    // layer directly (separate from Python coverage in test_basic.py).
+    const tmp_path = "/tmp/zlsx_c_abi_cell_styles.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = xlsx.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        const date_style = try w.addStyle(.{ .number_format = "yyyy-mm-dd" });
+        const bold_red = try w.addStyle(.{
+            .font_bold = true,
+            .font_color_argb = 0xFFFF0000,
+            .font_size = 14,
+            .font_name = "Courier New",
+            .fill_pattern = .solid,
+            .fill_fg_argb = 0xFF00FF00,
+            .border_left = .{ .style = .thin, .color_argb = 0xFF000000 },
+            .border_top = .{ .style = .medium, .color_argb = 0xFFFF0000 },
+        });
+        var sheet = try w.addSheet("S");
+        try sheet.writeRowStyled(
+            &.{ .{ .number = 44927 }, .{ .string = "bold" }, .{ .integer = 42 } },
+            &.{ date_style, bold_red, 0 },
+        );
+        try w.save(tmp_path);
+    }
+
+    var err_buf: [128]u8 = undefined;
+    const book = zlsx_book_open(tmp_path, &err_buf, err_buf.len);
+    try std.testing.expect(book != null);
+    defer zlsx_book_close(book);
+
+    const rows = zlsx_rows_open(book.?, 0, &err_buf, err_buf.len);
+    try std.testing.expect(rows != null);
+    defer zlsx_rows_close(rows);
+
+    var cells_ptr: [*]const CCell = undefined;
+    var cells_len: usize = 0;
+    try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(
+        rows.?,
+        &cells_ptr,
+        &cells_len,
+        &err_buf,
+        err_buf.len,
+    ));
+    try std.testing.expectEqual(@as(usize, 3), cells_len);
+
+    // styleIndices — each cell returns 0 (present) or 1 (no style).
+    var s_date: u32 = undefined;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_rows_style_at(rows.?, 0, &s_date));
+    var s_bold: u32 = undefined;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_rows_style_at(rows.?, 1, &s_bold));
+    var s_plain: u32 = undefined;
+    const plain_rc = zlsx_rows_style_at(rows.?, 2, &s_plain);
+    // Plain cell may legitimately return 1 (no `s` attr); accept both.
+    try std.testing.expect(plain_rc == 0 or plain_rc == 1);
+
+    // numberFormat on the date cell resolves to "yyyy-mm-dd".
+    var nf_ptr: [*]const u8 = undefined;
+    var nf_len: usize = 0;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_number_format(book.?, s_date, &nf_ptr, &nf_len));
+    try std.testing.expectEqualStrings("yyyy-mm-dd", nf_ptr[0..nf_len]);
+    try std.testing.expectEqual(@as(u8, 1), zlsx_is_date_format(book.?, s_date));
+    try std.testing.expectEqual(@as(u8, 0), zlsx_is_date_format(book.?, s_bold));
+
+    // cellFont on the bold/red/named cell.
+    var font: CFont = undefined;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_cell_font(book.?, s_bold, &font));
+    try std.testing.expectEqual(@as(u8, 1), font.bold);
+    try std.testing.expectEqual(@as(u8, 0), font.italic);
+    try std.testing.expectEqual(@as(u8, 1), font.has_color);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), font.color_argb);
+    try std.testing.expectEqual(@as(u8, 1), font.has_size);
+    try std.testing.expectEqual(@as(f32, 14.0), font.size);
+    try std.testing.expectEqualStrings("Courier New", font.name_ptr[0..font.name_len]);
+
+    // cellFill — solid green.
+    var fill: CFill = undefined;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_cell_fill(book.?, s_bold, &fill));
+    try std.testing.expectEqualStrings("solid", fill.pattern_ptr[0..fill.pattern_len]);
+    try std.testing.expectEqual(@as(u8, 1), fill.has_fg);
+    try std.testing.expectEqual(@as(u32, 0xFF00FF00), fill.fg_color_argb);
+
+    // cellBorder — left thin black, top medium red, rest empty.
+    var border: CCellBorder = undefined;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_cell_border(book.?, s_bold, &border));
+    try std.testing.expectEqualStrings("thin", border.left.style_ptr[0..border.left.style_len]);
+    try std.testing.expectEqual(@as(u8, 1), border.left.has_color);
+    try std.testing.expectEqual(@as(u32, 0xFF000000), border.left.color_argb);
+    try std.testing.expectEqualStrings("medium", border.top.style_ptr[0..border.top.style_len]);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), border.top.color_argb);
+    try std.testing.expectEqual(@as(usize, 0), border.right.style_len);
+    try std.testing.expectEqual(@as(usize, 0), border.bottom.style_len);
+    try std.testing.expectEqual(@as(usize, 0), border.diagonal.style_len);
+
+    // Out-of-range style idx → -1 on the pointer-out getters, 0 on
+    // the predicate getters.
+    try std.testing.expectEqual(@as(i32, -1), zlsx_cell_font(book.?, 99999, &font));
+    try std.testing.expectEqual(@as(i32, -1), zlsx_cell_fill(book.?, 99999, &fill));
+    try std.testing.expectEqual(@as(i32, -1), zlsx_cell_border(book.?, 99999, &border));
+    try std.testing.expectEqual(@as(u8, 0), zlsx_is_date_format(book.?, 99999));
+}
+
 test "reader C ABI: merged_range + hyperlink getters round-trip" {
     const tmp_path = "/tmp/zlsx_c_abi_reader_meta.xlsx";
     defer std.fs.cwd().deleteFile(tmp_path) catch {};
