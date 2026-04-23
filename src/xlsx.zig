@@ -1885,7 +1885,16 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
     var border_ids: std.ArrayListUnmanaged(u32) = .{};
     errdefer border_ids.deinit(book.allocator);
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, xfs_block, i, "<xf ")) |xp| {
+    while (std.mem.indexOfPos(u8, xfs_block, i, "<xf")) |xp| {
+        // Guard against longer tags that share the `<xf` prefix
+        // (OOXML doesn't define any, but future-proof the scan the
+        // same way `<font` / `<fill` / `<border` above do).
+        if (xp + 3 >= xfs_block.len) break;
+        const after = xfs_block[xp + 3];
+        if (after != ' ' and after != '>' and after != '/') {
+            i = xp + 3;
+            continue;
+        }
         const gt = std.mem.indexOfScalarPos(u8, xfs_block, xp, '>') orelse break;
         const attrs = xfs_block[xp..gt];
         i = gt + 1;
@@ -1919,6 +1928,13 @@ fn parseBorderBody(body: []const u8) Border {
 /// attribute and `<color rgb="…"/>` child. Slices borrow from the
 /// input body (which itself borrows from `styles_xml`).
 fn parseBorderSide(body: []const u8, tag: []const u8) BorderSide {
+    // All callers pass the literal OOXML side names — longest is
+    // "diagonal" (8 bytes). Future tag additions that overflow these
+    // stack buffers would otherwise `bufPrint → error.NoSpaceLeft`
+    // and silently return an empty side. Bail early at build-time
+    // instead.
+    std.debug.assert(tag.len + 3 <= 16); // "<tag" + nul slack
+    std.debug.assert(tag.len + 4 <= 24); // "</tag>" + nul slack
     var open_buf: [16]u8 = undefined;
     const open = std.fmt.bufPrint(&open_buf, "<{s}", .{tag}) catch return .{};
     const pos = std.mem.indexOf(u8, body, open) orelse return .{};
@@ -2857,6 +2873,89 @@ test "Book.cellFont: round-trips bold / color / size / name from xl/styles.xml" 
     try std.testing.expect(book.cellFont(s2) != null);
 }
 
+test "parseCommentsForSheet: authors + refs + flattened rich-text bodies" {
+    // Drive the parser directly with pre-populated sheet_rels_data +
+    // comments_data maps so we don't need the writer (which doesn't
+    // emit comments) or a real xlsx archive on disk. Mirrors the
+    // Python end-to-end test but stays inside Zig for CI coverage
+    // even when the Python stack doesn't run.
+    var book: Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer book.deinit();
+
+    const sheet_path = "xl/worksheets/sheet1.xml";
+    const rels_xml =
+        \\<?xml version="1.0"?>
+        \\<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+        \\<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments1.xml"/>
+        \\</Relationships>
+    ;
+    const comments_xml =
+        \\<?xml version="1.0"?>
+        \\<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+        \\<authors><author>Alice</author><author>Bob &amp; Co</author></authors>
+        \\<commentList>
+        \\<comment ref="B2" authorId="0"><text><r><t>review this</t></r></text></comment>
+        \\<comment ref="C3" authorId="1"><text><r><rPr><b/></rPr><t xml:space="preserve">R&amp;D </t></r><r><t>notes</t></r></text></comment>
+        \\</commentList></comments>
+    ;
+
+    const owned_rels = try std.testing.allocator.dupe(u8, rels_xml);
+    try book.sheet_rels_data.put(std.testing.allocator, sheet_path, owned_rels);
+    const owned_comments = try std.testing.allocator.dupe(u8, comments_xml);
+    const comments_key = try std.testing.allocator.dupe(u8, "xl/comments1.xml");
+    try book.strings.append(std.testing.allocator, comments_key);
+    try book.comments_data.put(std.testing.allocator, comments_key, owned_comments);
+
+    try parseCommentsForSheet(&book, sheet_path);
+
+    const cs = book.comments_by_sheet.get(sheet_path) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), cs.len);
+    try std.testing.expectEqualDeep(CellRef{ .col = 1, .row = 2 }, cs[0].top_left);
+    try std.testing.expectEqualStrings("Alice", cs[0].author);
+    try std.testing.expectEqualStrings("review this", cs[0].text);
+    try std.testing.expectEqualDeep(CellRef{ .col = 2, .row = 3 }, cs[1].top_left);
+    try std.testing.expectEqualStrings("Bob & Co", cs[1].author);
+    try std.testing.expectEqualStrings("R&D notes", cs[1].text);
+}
+
+test "parseStyles: cellXfs handles <xf/> and <xf> variants (no attrs)" {
+    // Regression guard for an iter35 audit finding: `<xf ` (with
+    // required trailing space) silently dropped bare `<xf/>` or
+    // `<xf>` entries, shifting every subsequent style index. This
+    // fixture mixes all three shapes plus a trailing attributed
+    // entry; if the parser reverts to requiring a space, the count
+    // comes back as 1 instead of 4 and the xf at index 3 loses its
+    // fontId.
+    const styles_xml =
+        \\<?xml version="1.0"?>
+        \\<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+        \\<cellXfs count="4">
+        \\<xf/>
+        \\<xf></xf>
+        \\<xf numFmtId="0"/>
+        \\<xf numFmtId="14" fontId="2" fillId="1" borderId="0"/>
+        \\</cellXfs>
+        \\</styleSheet>
+    ;
+    var book: Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer book.deinit();
+    try parseStyles(&book, styles_xml);
+
+    try std.testing.expectEqual(@as(usize, 4), book.cell_xf_numfmt_ids.len);
+    try std.testing.expectEqual(@as(u32, 0), book.cell_xf_numfmt_ids[0]);
+    try std.testing.expectEqual(@as(u32, 0), book.cell_xf_numfmt_ids[1]);
+    try std.testing.expectEqual(@as(u32, 0), book.cell_xf_numfmt_ids[2]);
+    try std.testing.expectEqual(@as(u32, 14), book.cell_xf_numfmt_ids[3]);
+    try std.testing.expectEqual(@as(u32, 2), book.cell_xf_font_ids[3]);
+    try std.testing.expectEqual(@as(u32, 1), book.cell_xf_fill_ids[3]);
+}
+
 test "Book.cellBorder: round-trip sided styles + color through writer" {
     const tmp_path = "/tmp/zlsx_reader_cell_border.xlsx";
     defer std.fs.cwd().deleteFile(tmp_path) catch {};
@@ -3313,6 +3412,57 @@ test "fuzz parseWorkbookSheets" {
         var book: Book = .{ .allocator = std.testing.allocator, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
         defer book.deinit();
         parseWorkbookSheets(&book, wb, rels) catch {};
+    }
+}
+
+test "fuzz parseStyles" {
+    const iters = fuzzIterations();
+    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    const rng = prng.random();
+    var buf: [fuzz_max_input_len]u8 = undefined;
+    for (0..iters) |_| {
+        const input = randomInput(rng, &buf);
+        var book: Book = .{ .allocator = std.testing.allocator, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+        defer book.deinit();
+        parseStyles(&book, input) catch {};
+    }
+}
+
+test "fuzz parseCommentsForSheet" {
+    const iters = fuzzIterations();
+    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    const rng = prng.random();
+    var buf: [fuzz_max_input_len]u8 = undefined;
+    const sheet_path = "xl/worksheets/sheet1.xml";
+    for (0..iters) |_| {
+        const input = randomInput(rng, &buf);
+        const mid = input.len / 2;
+        const rels_input = input[0..mid];
+        const comments_input = input[mid..];
+        var book: Book = .{ .allocator = std.testing.allocator, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+        defer book.deinit();
+
+        const owned_rels = std.testing.allocator.dupe(u8, rels_input) catch continue;
+        book.sheet_rels_data.put(std.testing.allocator, sheet_path, owned_rels) catch {
+            std.testing.allocator.free(owned_rels);
+            continue;
+        };
+        const owned_comments = std.testing.allocator.dupe(u8, comments_input) catch continue;
+        const comments_key = std.testing.allocator.dupe(u8, "xl/comments1.xml") catch {
+            std.testing.allocator.free(owned_comments);
+            continue;
+        };
+        book.strings.append(std.testing.allocator, comments_key) catch {
+            std.testing.allocator.free(owned_comments);
+            std.testing.allocator.free(comments_key);
+            continue;
+        };
+        book.comments_data.put(std.testing.allocator, comments_key, owned_comments) catch {
+            std.testing.allocator.free(owned_comments);
+            continue;
+        };
+
+        parseCommentsForSheet(&book, sheet_path) catch {};
     }
 }
 

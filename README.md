@@ -133,7 +133,7 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 | Conditional formatting | — | ✓ | ✓ |
 | Cell comments / notes | — | ✓ | ✓ |
 | Formulas (with cached value) | ✓ | ✓ | ✓ |
-| Rich-text runs per cell | ✓ | ✓ | ✓ |
+| Rich-text runs per cell | ✓⁴ | ✓ | ✓ |
 | Images (PNG / JPEG embed) | — | ✓ | ~ |
 | Charts | — | ✓ | ~ |
 | Deflate compression | ✓ | ✓ | ✓ |
@@ -141,6 +141,7 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 | Sheet-name validation (length / reserved chars / duplicates) | ✓ | ~³ | ~ |
 
 ³ xlsxwriter validates length and some chars but does not reject case-insensitive duplicates up front.
+⁴ `SheetWriter.writeRichRow` is Zig-only today; C-ABI + Python bindings are a pending follow-up.
 
 ### Language / packaging
 
