@@ -977,6 +977,37 @@ class Rows:
                 out.append(None)
         return out
 
+    def parse_date(self, col_idx: int) -> "datetime.datetime | None":
+        """Decode the current-row cell at ``col_idx`` as a date-styled
+        number. Returns a Python ``datetime.datetime`` when the cell
+        is a number/integer AND its style resolves to a date format
+        AND the serial is in the valid Excel range (>= 61). Returns
+        ``None`` otherwise (including out-of-range col_idx, string
+        cells, and plain numbers without a date style).
+
+        Rows only surface the current row — call after ``next()``.
+        Requires libzlsx 0.2.6+."""
+        import datetime as _dt
+        if not _ffi._HAS_PARSE_DATE:
+            raise RuntimeError(
+                "loaded libzlsx does not expose rows_parse_date "
+                "(requires 0.2.6+); upgrade libzlsx"
+            )
+        dt = _ffi.CDateTime()
+        rc = _ffi.lib.zlsx_rows_parse_date(
+            self._handle, col_idx, ctypes.byref(dt)
+        )
+        if rc != 0:
+            return None
+        return _dt.datetime(
+            year=int(dt.year),
+            month=int(dt.month),
+            day=int(dt.day),
+            hour=int(dt.hour),
+            minute=int(dt.minute),
+            second=int(dt.second),
+        )
+
     def close(self) -> None:
         if self._handle:
             _ffi.lib.zlsx_rows_close(self._handle)

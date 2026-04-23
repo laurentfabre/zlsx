@@ -693,6 +693,28 @@ if _HAS_RICH_RUNS_EXT:
 
 
 # Number-format / per-cell style-index surface — added in 0.2.6+.
+class CDateTime(ctypes.Structure):
+    _fields_ = [
+        ("year", ctypes.c_uint16),
+        ("month", ctypes.c_uint8),
+        ("day", ctypes.c_uint8),
+        ("hour", ctypes.c_uint8),
+        ("minute", ctypes.c_uint8),
+        ("second", ctypes.c_uint8),
+        ("_pad", ctypes.c_uint8),
+    ]
+
+
+_HAS_PARSE_DATE = hasattr(lib, "zlsx_rows_parse_date")
+if _HAS_PARSE_DATE:
+    lib.zlsx_rows_parse_date.argtypes = [
+        rows_handle,
+        ctypes.c_size_t,
+        ctypes.POINTER(CDateTime),
+    ]
+    lib.zlsx_rows_parse_date.restype = ctypes.c_int32
+
+
 _HAS_NUM_FMT = (
     hasattr(lib, "zlsx_rows_style_at")
     and hasattr(lib, "zlsx_number_format")

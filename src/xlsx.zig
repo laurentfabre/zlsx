@@ -690,6 +690,7 @@ pub const Book = struct {
             .xml = xml,
             .pos = 0,
             .shared_strings = self.shared_strings,
+            .book = self,
             .allocator = allocator,
             .row_cells = .{},
             .row_styles = .{},
@@ -704,6 +705,14 @@ pub const Rows = struct {
     xml: []const u8,
     pos: usize,
     shared_strings: []const []const u8,
+    /// Weak reference into the Book so `parseDate` can check the
+    /// cell's style index against the workbook's numFmt table. Rows
+    /// never outlive their parent Book (constructed via
+    /// `Book.rows(sheet, alloc)`), so the pointer is always live
+    /// during iteration. Nullable only so internal fuzz helpers can
+    /// drive the state machine without a Book; public callers always
+    /// get a valid pointer from `Book.rows`.
+    book: ?*const Book = null,
     allocator: Allocator,
     row_cells: std.ArrayListUnmanaged(Cell),
     /// Parallel to `row_cells`. Each slot holds the cell's `s="N"`
@@ -731,6 +740,32 @@ pub const Rows = struct {
     /// until the next `next()` call, same as `row_cells`.
     pub fn styleIndices(self: *const Rows) []const ?u32 {
         return self.row_styles.items;
+    }
+
+    /// Parse the current-row cell at `col_idx` as a date-styled
+    /// number. Returns a `DateTime` when all three conditions hold:
+    ///   - the cell is `.number` or `.integer`
+    ///   - the cell's style index resolves to a date-like numFmt
+    ///     (per `Book.isDateFormat`)
+    ///   - the serial is in the valid Excel range (>= 61 per the
+    ///     1900 leap-year bug exclusion, < 2958466)
+    /// Otherwise returns null. Use this instead of manually chaining
+    /// `styleIndices()` + `Book.isDateFormat` + `fromExcelSerial`.
+    ///
+    /// Valid until the next `next()` call (row lifetime).
+    pub fn parseDate(self: *const Rows, col_idx: usize) ?DateTime {
+        if (col_idx >= self.row_cells.items.len) return null;
+        const cell = self.row_cells.items[col_idx];
+        const num: f64 = switch (cell) {
+            .number => |n| n,
+            .integer => |n| @floatFromInt(n),
+            else => return null,
+        };
+        if (col_idx >= self.row_styles.items.len) return null;
+        const style_idx = self.row_styles.items[col_idx] orelse return null;
+        const book = self.book orelse return null;
+        if (!book.isDateFormat(style_idx)) return null;
+        return fromExcelSerial(num);
     }
 
     /// Returns the next row's cells, or null at end-of-sheet. Returned
@@ -2903,6 +2938,60 @@ test "Book.richRuns: rich-text SST entries expose per-run bold/italic" {
     try std.testing.expectEqualStrings("R&D", r4[0].text);
     try std.testing.expectEqual(false, r4[0].bold);
     try std.testing.expectEqual(true, r4[0].italic);
+}
+
+test "Rows.parseDate: auto-convert date-styled cells through the reader" {
+    // iter46 convenience: instead of chaining styleIndices +
+    // isDateFormat + fromExcelSerial, callers just call parseDate.
+    // Must return null for non-date-styled numbers, null for
+    // string cells, and the correct DateTime for date-styled
+    // numerics.
+    const tmp_path = "/tmp/zlsx_rows_parse_date.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        const date_style = try w.addStyle(.{ .number_format = "yyyy-mm-dd" });
+        const pct_style = try w.addStyle(.{ .number_format = "0.00%" });
+        var sheet = try w.addSheet("S");
+        // Row 1 — hdr. Row 2 — date col + pct col + plain integer + text.
+        try sheet.writeRow(&.{.{ .string = "hdr" }});
+        try sheet.writeRowStyled(
+            &.{
+                .{ .number = 44927 }, // 2023-01-01
+                .{ .number = 0.25 }, // styled % — not a date
+                .{ .integer = 42 }, // no style — not a date
+                .{ .string = "txt" }, // string cell
+            },
+            &.{ date_style, pct_style, 0, 0 },
+        );
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    _ = try rows.next(); // hdr
+    _ = try rows.next(); // data row — populates row_cells + row_styles
+
+    // col 0: date-styled 44927 → 2023-01-01
+    const d0 = rows.parseDate(0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, 2023), d0.year);
+    try std.testing.expectEqual(@as(u8, 1), d0.month);
+    try std.testing.expectEqual(@as(u8, 1), d0.day);
+
+    // col 1: percentage-styled — not a date.
+    try std.testing.expectEqual(@as(?DateTime, null), rows.parseDate(1));
+    // col 2: no style — not a date.
+    try std.testing.expectEqual(@as(?DateTime, null), rows.parseDate(2));
+    // col 3: string cell — not a date.
+    try std.testing.expectEqual(@as(?DateTime, null), rows.parseDate(3));
+    // col 99: out of range — null.
+    try std.testing.expectEqual(@as(?DateTime, null), rows.parseDate(99));
 }
 
 test "Book.numberFormat + isDateFormat: built-in, custom, and per-cell style lookup" {

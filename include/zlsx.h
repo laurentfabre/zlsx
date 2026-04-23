@@ -426,6 +426,37 @@ int32_t zlsx_rows_style_at(zlsx_rows_t * rows,
                            uint32_t    * out_style_idx);
 
 /*
+ * Decoded calendar date/time from an Excel-serial cell. Fields:
+ *   year   — 1900..=9999
+ *   month  — 1..=12, day 1..=31
+ *   hour / minute / second — 0..=59 (23 for hour)
+ *   _pad   — keep struct size/alignment predictable
+ */
+typedef struct {
+    uint16_t year;
+    uint8_t  month;
+    uint8_t  day;
+    uint8_t  hour;
+    uint8_t  minute;
+    uint8_t  second;
+    uint8_t  _pad;
+} zlsx_datetime_t;
+
+/*
+ * Parse the current-row cell at `col_idx` as a date-styled number.
+ * Tri-state:
+ *    0 → `*out` populated with the decoded DateTime
+ *    1 → not a date (wrong type / non-date numFmt / out-of-range serial)
+ *   -1 → `col_idx` is past the row width
+ *
+ * Combines the existing `zlsx_rows_style_at` + `zlsx_is_date_format`
+ * + `xlsx.fromExcelSerial` chain into one call.
+ */
+int32_t zlsx_rows_parse_date(zlsx_rows_t *     rows,
+                             size_t            col_idx,
+                             zlsx_datetime_t * out);
+
+/*
  * Resolve a style index to its number-format code. Returns 0 and
  * populates `*out_ptr` / `*out_len` on success; returns -1 on
  * out-of-range indices or when the workbook has no styles.xml.

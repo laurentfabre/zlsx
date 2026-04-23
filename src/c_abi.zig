@@ -796,6 +796,53 @@ export fn zlsx_rows_style_at(
     return 0;
 }
 
+/// C-shape for `xlsx.DateTime`. All fields fit in their native
+/// widths (year 1900..=9999 fits u16; month/day/hour/minute/second
+/// fit u8). Fixed layout — no padding adjustments needed.
+pub const CDateTime = extern struct {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    _pad: u8,
+};
+
+/// Convenience: parse the current-row cell at `col_idx` as a
+/// date-styled number, writing the decoded `CDateTime` into `out`.
+/// Returns 0 on success (non-null DateTime), 1 when the cell isn't
+/// a date (wrong type / non-date numFmt / out-of-range serial), -1
+/// when `col_idx` is past the row width.
+///
+/// Callers that want both the raw number AND the DateTime should
+/// still use the cells array from `zlsx_rows_next` + this
+/// function side-by-side.
+export fn zlsx_rows_parse_date(
+    rows: *Rows,
+    col_idx: usize,
+    out: *CDateTime,
+) callconv(.c) i32 {
+    const rs: *RowsState = @ptrCast(@alignCast(rows));
+    const dt = rs.inner.parseDate(col_idx) orelse {
+        // Distinguish "col_idx out of range" from "cell isn't a date".
+        // styleIndices / row_cells share the same bounded length;
+        // anything past that is -1.
+        if (col_idx >= rs.inner.row_cells.items.len) return -1;
+        return 1;
+    };
+    out.* = .{
+        .year = dt.year,
+        .month = dt.month,
+        .day = dt.day,
+        .hour = dt.hour,
+        .minute = dt.minute,
+        .second = dt.second,
+        ._pad = 0,
+    };
+    return 0;
+}
+
 /// Resolve a style index to its number-format code. Returns:
 ///    0 → `*out_ptr` / `*out_len` point at the format string (lifetime
 ///        matches the Book; borrows from styles.xml for custom

@@ -825,6 +825,45 @@ def test_rich_text_runs_color_size_font(tmp_path):
         assert runs[0].font_name == ""
 
 
+def test_rows_parse_date_auto_converts_date_styled_cells(tmp_path):
+    """Python callers can parse date-styled numeric cells directly
+    via `Rows.parse_date(col_idx)` without manually chaining
+    style_indices + is_date_format + fromExcelSerial."""
+    import datetime as _dt
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_PARSE_DATE or not ffi._HAS_NUM_FMT:
+        pytest.skip("loaded libzlsx predates parse_date ABI (0.2.6+)")
+
+    out = tmp_path / "parse_date.xlsx"
+    with zlsx.write(out) as w:
+        date_style = w.add_style(zlsx.Style(number_format="yyyy-mm-dd"))
+        pct_style = w.add_style(zlsx.Style(number_format="0.00%"))
+        sheet = w.add_sheet("S")
+        sheet.write_row(["hdr"])
+        sheet.write_row(
+            [44927, 0.25, 42, "txt"],
+            styles=[date_style, pct_style, 0, 0],
+        )
+
+    with zlsx.open(out) as book:
+        with book.sheet(0).rows() as rows:
+            next(rows)  # header
+            next(rows)  # data
+
+            # col 0: date-styled — decodes to 2023-01-01.
+            d0 = rows.parse_date(0)
+            assert d0 == _dt.datetime(2023, 1, 1)
+            # col 1: percentage-styled — not a date.
+            assert rows.parse_date(1) is None
+            # col 2: plain integer, no style — not a date.
+            assert rows.parse_date(2) is None
+            # col 3: string cell — not a date.
+            assert rows.parse_date(3) is None
+            # col 99: out of range — None.
+            assert rows.parse_date(99) is None
+
+
 def test_rows_style_indices_and_book_number_format(tmp_path):
     """Round-trip: writer emits styled cells with custom number
     formats, reader gets back per-cell style indices via
