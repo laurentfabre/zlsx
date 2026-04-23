@@ -136,6 +136,50 @@ pub const BorderStyle = enum(u8) {
 };
 
 /// One side of a cell border (left / right / top / bottom / diagonal).
+/// Comparison operator for `cellIs` conditional-format rules.
+/// Names mirror `DataValidationOp`; the two OOXML enums share the
+/// same wire-format tokens but live in different grammar slots.
+pub const CfOperator = enum {
+    less_than,
+    less_than_or_equal,
+    equal,
+    not_equal,
+    greater_than,
+    greater_than_or_equal,
+    between,
+    not_between,
+
+    fn toOoxml(self: CfOperator) []const u8 {
+        return switch (self) {
+            .less_than => "lessThan",
+            .less_than_or_equal => "lessThanOrEqual",
+            .equal => "equal",
+            .not_equal => "notEqual",
+            .greater_than => "greaterThan",
+            .greater_than_or_equal => "greaterThanOrEqual",
+            .between => "between",
+            .not_between => "notBetween",
+        };
+    }
+
+    fn needsSecondFormula(self: CfOperator) bool {
+        return self == .between or self == .not_between;
+    }
+};
+
+/// A differential format — the font / fill overrides applied when a
+/// conditional-format rule matches. Registered once via
+/// `Writer.addDxf`, referenced by dxfId from one or more rules.
+/// Scoped to the subset of properties real conditional formats
+/// actually toggle (bold / font color / solid fill). Full differential
+/// font / border support can layer on later without breaking shape.
+pub const Dxf = struct {
+    font_bold: bool = false,
+    font_italic: bool = false,
+    font_color_argb: ?u32 = null,
+    fill_fg_argb: ?u32 = null,
+};
+
 /// Cell comment (note) attached via `SheetWriter.addComment`. Emits
 /// as `<comments><authors/><commentList/></comments>` under
 /// `xl/commentsN.xml`, plus a minimal VML shape under
@@ -307,6 +351,10 @@ pub const Writer = struct {
     // returned from `addStyle()` can be used directly as the cell's
     // `s="N"` attribute.
     styles: std.ArrayListUnmanaged(Style) = .{},
+    // Differential formats used by conditional-formatting rules.
+    // One entry per unique Dxf; rules reference them by dxfId.
+    // Emitted as `<dxfs count="N">…</dxfs>` inside styles.xml.
+    dxfs: std.ArrayListUnmanaged(Dxf) = .{},
     // Number-format pool (stage 5). Parallel arrays: `num_fmts` owns
     // the format strings (writer-allocated); `num_fmt_index` maps
     // format → numFmtId (starting at 164 — OOXML reserves 0..=49 for
@@ -336,6 +384,8 @@ pub const Writer = struct {
             if (s.number_format) |n| self.allocator.free(n);
         }
         self.styles.deinit(self.allocator);
+        // Dxfs carry no owned slices (fixed-size fields only).
+        self.dxfs.deinit(self.allocator);
         for (self.num_fmts.items) |n| self.allocator.free(n);
         self.num_fmts.deinit(self.allocator);
         self.num_fmt_index.deinit(self.allocator);
@@ -386,6 +436,24 @@ pub const Writer = struct {
         errdefer if (owned_style.number_format) |n| self.allocator.free(n);
         try self.styles.append(self.allocator, owned_style);
         return @intCast(self.styles.items.len);
+    }
+
+    /// Register a differential format (font / fill overrides applied
+    /// when a conditional-format rule matches) and return its dxfId.
+    /// Linear dedup by content equality — repeat registrations of
+    /// the same Dxf return the same id.
+    ///
+    /// The returned u32 is fed into
+    /// `SheetWriter.addConditionalFormatCellIs` /
+    /// `…Expression` as the `dxf_id` parameter. It is a *pure* dxf
+    /// id (0-based into `<dxfs>`), distinct from the style id used
+    /// by `addStyle`.
+    pub fn addDxf(self: *Writer, dxf: Dxf) !u32 {
+        for (self.dxfs.items, 0..) |existing, i| {
+            if (std.meta.eql(existing, dxf)) return @intCast(i);
+        }
+        try self.dxfs.append(self.allocator, dxf);
+        return @intCast(self.dxfs.items.len - 1);
     }
 
     /// Return the numFmtId for `fmt`, allocating a new entry at id >=
@@ -490,7 +558,10 @@ pub const Writer = struct {
 
         const alloc = self.allocator;
 
-        const have_styles = self.styles.items.len > 0;
+        // Dxfs live in styles.xml too — conditional formatting alone
+        // is enough to require the part, even when no user style was
+        // registered via addStyle.
+        const have_styles = self.styles.items.len > 0 or self.dxfs.items.len > 0;
 
         // 1. [Content_Types].xml
         {
@@ -646,6 +717,46 @@ pub const Writer = struct {
                     try full.appendSlice(alloc, "\"/>");
                 }
                 try full.appendSlice(alloc, "</mergeCells>");
+            }
+
+            // <conditionalFormatting> slots between <mergeCells> and
+            // <dataValidations> per ECMA-376 CT_Worksheet child order.
+            // One <conditionalFormatting> block per rule is simpler
+            // than grouping by sqref, and Excel accepts either shape.
+            for (sw.conditional_formats.items) |cf| {
+                try full.appendSlice(alloc, "<conditionalFormatting sqref=\"");
+                try appendXmlEscaped(alloc, &full, cf.range);
+                try full.appendSlice(alloc, "\">");
+                switch (cf.rule) {
+                    .cell_is => |r| {
+                        try full.print(
+                            alloc,
+                            "<cfRule type=\"cellIs\" dxfId=\"{d}\" priority=\"1\" operator=\"{s}\">",
+                            .{ r.dxf_id, r.operator.toOoxml() },
+                        );
+                        try full.appendSlice(alloc, "<formula>");
+                        try appendXmlEscaped(alloc, &full, r.formula1);
+                        try full.appendSlice(alloc, "</formula>");
+                        if (r.formula2) |f2| {
+                            try full.appendSlice(alloc, "<formula>");
+                            try appendXmlEscaped(alloc, &full, f2);
+                            try full.appendSlice(alloc, "</formula>");
+                        }
+                        try full.appendSlice(alloc, "</cfRule>");
+                    },
+                    .expression => |r| {
+                        try full.print(
+                            alloc,
+                            "<cfRule type=\"expression\" dxfId=\"{d}\" priority=\"1\">",
+                            .{r.dxf_id},
+                        );
+                        try full.appendSlice(alloc, "<formula>");
+                        try appendXmlEscaped(alloc, &full, r.formula);
+                        try full.appendSlice(alloc, "</formula>");
+                        try full.appendSlice(alloc, "</cfRule>");
+                    },
+                }
+                try full.appendSlice(alloc, "</conditionalFormatting>");
             }
 
             // <dataValidations> slots between <mergeCells> and
@@ -874,6 +985,7 @@ pub const Writer = struct {
             self.styles.items,
             self.num_fmts.items,
             &self.num_fmt_index,
+            self.dxfs.items,
         );
 
         try zw.finalize();
@@ -899,6 +1011,31 @@ pub const Hyperlink = struct {
 pub const InternalHyperlink = struct {
     range: []u8,
     location: []u8,
+};
+
+/// Conditional-format entry stored inside `SheetWriter.conditional_formats`.
+/// `range` is A1-style (may be a single cell or a rectangle). `rule`
+/// is the OOXML cfRule payload; `dxf_id` is an index into the
+/// workbook-wide `Writer.dxfs` table returned by `Writer.addDxf`.
+pub const ConditionalFormat = struct {
+    range: []u8,
+    rule: ConditionalFormatRule,
+};
+
+/// Union of the cfRule variants zlsx currently emits. `expression`
+/// is the fallback for anything that doesn't fit `cellIs` (e.g.
+/// row-vs-row comparisons, `MOD(ROW(),2)=0` zebra striping).
+pub const ConditionalFormatRule = union(enum) {
+    cell_is: struct {
+        operator: CfOperator,
+        formula1: []u8,
+        formula2: ?[]u8,
+        dxf_id: u32,
+    },
+    expression: struct {
+        formula: []u8,
+        dxf_id: u32,
+    },
 };
 
 /// List-type data validation (dropdown) bound to a cell or range.
@@ -1026,6 +1163,12 @@ pub const SheetWriter = struct {
     /// Each entry gets one `<comment>` under `xl/commentsN.xml`
     /// plus one VML shape under `xl/drawings/vmlDrawingN.xml`.
     comments: std.ArrayListUnmanaged(Comment) = .{},
+    /// Conditional-format rules — emitted as
+    /// `<conditionalFormatting sqref="…"><cfRule …/></conditionalFormatting>`
+    /// between `<mergeCells>` and `<dataValidations>` per
+    /// ECMA-376 CT_Worksheet ordering. Populated by
+    /// `addConditionalFormatCellIs` / `…Expression`.
+    conditional_formats: std.ArrayListUnmanaged(ConditionalFormat) = .{},
     /// List-type data validations (dropdowns). Emitted as a single
     /// `<dataValidations>` block with one `<dataValidation>` per entry.
     data_validations: std.ArrayListUnmanaged(DataValidationList) = .{},
@@ -1066,6 +1209,17 @@ pub const SheetWriter = struct {
             self.parent.allocator.free(c.text);
         }
         self.comments.deinit(self.parent.allocator);
+        for (self.conditional_formats.items) |cf| {
+            self.parent.allocator.free(cf.range);
+            switch (cf.rule) {
+                .cell_is => |r| {
+                    self.parent.allocator.free(r.formula1);
+                    if (r.formula2) |f| self.parent.allocator.free(f);
+                },
+                .expression => |r| self.parent.allocator.free(r.formula),
+            }
+        }
+        self.conditional_formats.deinit(self.parent.allocator);
         for (self.data_validations.items) |dv| {
             self.parent.allocator.free(dv.range);
             for (dv.values) |v| self.parent.allocator.free(v);
@@ -1316,6 +1470,84 @@ pub const SheetWriter = struct {
             .ref = ref_copy,
             .author = author_copy,
             .text = text_copy,
+        });
+    }
+
+    /// Attach a `cellIs`-type conditional-format rule. `range` is
+    /// A1-style (single cell or rectangle). `operator` is the
+    /// comparison (e.g. `.greater_than`, `.between`). `formula1` is
+    /// the reference value (a number like `"100"`, a cell ref like
+    /// `"$A$1"`, or any OOXML formula). `formula2` is required for
+    /// `.between` / `.not_between` and must be null otherwise.
+    /// `dxf_id` is the dxf index returned by `Writer.addDxf`.
+    /// Returns `InvalidDataValidation` on empty formula / two-formula
+    /// mismatch, `InvalidHyperlinkRange` on bad range, `UnknownDxfId`
+    /// on out-of-range dxf.
+    pub fn addConditionalFormatCellIs(
+        self: *SheetWriter,
+        range: []const u8,
+        operator: CfOperator,
+        formula1: []const u8,
+        formula2: ?[]const u8,
+        dxf_id: u32,
+    ) !void {
+        try validateHyperlinkRange(range);
+        if (formula1.len == 0) return error.InvalidDataValidation;
+        const needs_two = operator.needsSecondFormula();
+        if (needs_two and (formula2 == null or formula2.?.len == 0)) {
+            return error.InvalidDataValidation;
+        }
+        if (!needs_two and formula2 != null) return error.InvalidDataValidation;
+        if (dxf_id >= self.parent.dxfs.items.len) return error.UnknownDxfId;
+
+        const range_copy = try self.parent.allocator.dupe(u8, range);
+        errdefer self.parent.allocator.free(range_copy);
+        const f1_copy = try self.parent.allocator.dupe(u8, formula1);
+        errdefer self.parent.allocator.free(f1_copy);
+        const f2_copy: ?[]u8 = if (formula2) |f|
+            try self.parent.allocator.dupe(u8, f)
+        else
+            null;
+        errdefer if (f2_copy) |f| self.parent.allocator.free(f);
+
+        try self.conditional_formats.append(self.parent.allocator, .{
+            .range = range_copy,
+            .rule = .{ .cell_is = .{
+                .operator = operator,
+                .formula1 = f1_copy,
+                .formula2 = f2_copy,
+                .dxf_id = dxf_id,
+            } },
+        });
+    }
+
+    /// Attach an `expression`-type conditional-format rule — the
+    /// generic escape hatch for rules that aren't plain cell-vs-value
+    /// comparisons (e.g. `MOD(ROW(),2)=0` for zebra stripes,
+    /// `A2>$A$1` for row-vs-other-cell). Returns `InvalidDataValidation`
+    /// on empty formula, `InvalidHyperlinkRange` on bad range,
+    /// `UnknownDxfId` on out-of-range dxf.
+    pub fn addConditionalFormatExpression(
+        self: *SheetWriter,
+        range: []const u8,
+        formula: []const u8,
+        dxf_id: u32,
+    ) !void {
+        try validateHyperlinkRange(range);
+        if (formula.len == 0) return error.InvalidDataValidation;
+        if (dxf_id >= self.parent.dxfs.items.len) return error.UnknownDxfId;
+
+        const range_copy = try self.parent.allocator.dupe(u8, range);
+        errdefer self.parent.allocator.free(range_copy);
+        const f_copy = try self.parent.allocator.dupe(u8, formula);
+        errdefer self.parent.allocator.free(f_copy);
+
+        try self.conditional_formats.append(self.parent.allocator, .{
+            .range = range_copy,
+            .rule = .{ .expression = .{
+                .formula = f_copy,
+                .dxf_id = dxf_id,
+            } },
         });
     }
 
@@ -1667,6 +1899,7 @@ fn emitStylesXml(
     styles: []const Style,
     num_fmts: []const []const u8,
     num_fmt_index: *const std.StringHashMapUnmanaged(u32),
+    dxfs: []const Dxf,
 ) !void {
     var buf: std.ArrayListUnmanaged(u8) = .{};
     defer buf.deinit(alloc);
@@ -1811,6 +2044,38 @@ fn emitStylesXml(
         }
     }
     try buf.appendSlice(alloc, "</cellXfs>");
+
+    // <dxfs> — differential formats for conditional-formatting rules.
+    // Per the schema this block sits between <cellXfs> and
+    // <cellStyles>; we don't emit <cellStyles> so dxfs comes last
+    // before the STYLES_TAIL.
+    if (dxfs.len > 0) {
+        try buf.print(alloc, "<dxfs count=\"{d}\">", .{dxfs.len});
+        for (dxfs) |dxf| {
+            try buf.appendSlice(alloc, "<dxf>");
+            // <font> — only emitted when something differs from default.
+            const has_font = dxf.font_bold or dxf.font_italic or dxf.font_color_argb != null;
+            if (has_font) {
+                try buf.appendSlice(alloc, "<font>");
+                if (dxf.font_bold) try buf.appendSlice(alloc, "<b/>");
+                if (dxf.font_italic) try buf.appendSlice(alloc, "<i/>");
+                if (dxf.font_color_argb) |c| {
+                    try buf.print(alloc, "<color rgb=\"{X:0>8}\"/>", .{c});
+                }
+                try buf.appendSlice(alloc, "</font>");
+            }
+            // <fill> — only the fgColor variant of patternFill solid.
+            if (dxf.fill_fg_argb) |fg| {
+                try buf.print(
+                    alloc,
+                    "<fill><patternFill patternType=\"solid\"><fgColor rgb=\"{X:0>8}\"/><bgColor rgb=\"{X:0>8}\"/></patternFill></fill>",
+                    .{ fg, fg },
+                );
+            }
+            try buf.appendSlice(alloc, "</dxf>");
+        }
+        try buf.appendSlice(alloc, "</dxfs>");
+    }
 
     try buf.appendSlice(alloc, STYLES_CELL_STYLES);
     try buf.appendSlice(alloc, STYLES_TAIL);
@@ -3164,6 +3429,118 @@ test "Writer: addDataValidationNumeric + Custom emit correct XML" {
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
     while (try rows.next()) |_| {}
+}
+
+test "Writer: conditional formatting — cellIs + expression rules + dxfs table" {
+    const tmp_path = "/tmp/zlsx_writer_conditional_formatting.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+        // Two dxfs — bold-red font for high values, green fill for
+        // matching rows. Content-dedup: re-registering the same dxf
+        // must return the same id.
+        const red_bold = try w.addDxf(.{
+            .font_bold = true,
+            .font_color_argb = 0xFFFF0000,
+        });
+        const green_fill = try w.addDxf(.{ .fill_fg_argb = 0xFF00FF00 });
+        const red_bold_again = try w.addDxf(.{
+            .font_bold = true,
+            .font_color_argb = 0xFFFF0000,
+        });
+        try std.testing.expectEqual(red_bold, red_bold_again);
+
+        var sheet = try w.addSheet("S");
+        try sheet.addConditionalFormatCellIs("B2:B10", .greater_than, "100", null, red_bold);
+        try sheet.addConditionalFormatCellIs("C2:C10", .between, "0", "50", red_bold);
+        try sheet.addConditionalFormatExpression("A1:Z100", "MOD(ROW(),2)=0", green_fill);
+        try sheet.writeRow(&.{.{ .string = "hdr" }});
+
+        // Rejection paths.
+        try std.testing.expectError(
+            error.InvalidDataValidation,
+            sheet.addConditionalFormatCellIs("A1", .equal, "", null, red_bold),
+        );
+        try std.testing.expectError(
+            error.InvalidDataValidation,
+            sheet.addConditionalFormatCellIs("A1", .equal, "1", "2", red_bold),
+        );
+        try std.testing.expectError(
+            error.InvalidDataValidation,
+            sheet.addConditionalFormatCellIs("A1", .between, "1", null, red_bold),
+        );
+        try std.testing.expectError(
+            error.UnknownDxfId,
+            sheet.addConditionalFormatCellIs("A1", .equal, "1", null, 99),
+        );
+        try std.testing.expectError(
+            error.UnknownDxfId,
+            sheet.addConditionalFormatExpression("A1", "ROW()=1", 99),
+        );
+
+        try w.save(tmp_path);
+    }
+
+    // Extract sheet1.xml + styles.xml and verify both sides.
+    var sheet_xml: []u8 = undefined;
+    var styles_xml: []u8 = undefined;
+    {
+        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        var fbuf: [4096]u8 = undefined;
+        var fr = file.reader(&fbuf);
+        var iter = try std.zip.Iterator.init(&fr);
+        var filename_buf: [64]u8 = undefined;
+        var got_sheet = false;
+        var got_styles = false;
+        while (try iter.next()) |entry| {
+            if (entry.filename_len > filename_buf.len) continue;
+            try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            const filename = filename_buf[0..entry.filename_len];
+            try fr.interface.readSliceAll(filename);
+            if (std.mem.eql(u8, filename, "xl/worksheets/sheet1.xml")) {
+                sheet_xml = try extractEntryForTest(std.testing.allocator, entry, &fr);
+                got_sheet = true;
+            } else if (std.mem.eql(u8, filename, "xl/styles.xml")) {
+                styles_xml = try extractEntryForTest(std.testing.allocator, entry, &fr);
+                got_styles = true;
+            }
+        }
+        try std.testing.expect(got_sheet);
+        try std.testing.expect(got_styles);
+    }
+    defer std.testing.allocator.free(sheet_xml);
+    defer std.testing.allocator.free(styles_xml);
+
+    // Sheet XML: three conditionalFormatting blocks with the right
+    // sqrefs, operators, and dxfIds.
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<conditionalFormatting sqref=\"B2:B10\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<cfRule type=\"cellIs\" dxfId=\"0\" priority=\"1\" operator=\"greaterThan\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<formula>100</formula>") != null);
+
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<conditionalFormatting sqref=\"C2:C10\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "operator=\"between\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<formula>0</formula>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<formula>50</formula>") != null);
+
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<cfRule type=\"expression\" dxfId=\"1\" priority=\"1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "MOD(ROW(),2)=0") != null);
+
+    // Ordering: conditionalFormatting must come BEFORE dataValidations.
+    // No DVs in this test but conditionalFormatting must still sit
+    // after mergeCells / before dataValidations per the CT_Worksheet
+    // spec — the sheetData→conditionalFormatting gap is what matters.
+    const sd_end = std.mem.indexOf(u8, sheet_xml, "</sheetData>") orelse return error.MissingSheetData;
+    const cf_pos = std.mem.indexOf(u8, sheet_xml, "<conditionalFormatting") orelse return error.MissingCF;
+    try std.testing.expect(cf_pos > sd_end);
+
+    // Styles XML: two dxfs (dedup → red_bold_again is the same slot).
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "<dxfs count=\"2\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "<dxf><font><b/><color rgb=\"FFFF0000\"/></font></dxf>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "<fgColor rgb=\"FF00FF00\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles_xml, "</dxfs>") != null);
 }
 
 test "Writer: addDataValidationList validates + emits <dataValidations> block" {
