@@ -314,6 +314,21 @@ if _HAS_MERGED_CELL:
     ]
     lib.zlsx_sheet_writer_add_merged_cell.restype = ctypes.c_int32
 
+# Data-validation (list / dropdown) — same feature-probe pattern.
+_HAS_DATA_VALIDATION = hasattr(lib, "zlsx_sheet_writer_add_data_validation_list")
+if _HAS_DATA_VALIDATION:
+    lib.zlsx_sheet_writer_add_data_validation_list.argtypes = [
+        sheet_writer_handle,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_add_data_validation_list.restype = ctypes.c_int32
+
 # Hyperlink authoring — same import-time feature-probe pattern.
 _HAS_HYPERLINK = hasattr(lib, "zlsx_sheet_writer_add_hyperlink")
 if _HAS_HYPERLINK:

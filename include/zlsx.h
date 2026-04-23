@@ -423,6 +423,22 @@ int32_t zlsx_sheet_writer_add_merged_cell(
     uint8_t             * err_buf,
     size_t                err_buf_len);
 
+/* Attach a list-type data validation (dropdown) to a cell or range.
+ * `range` is A1-style. `values_ptr[i][0..lens_ptr[i]]` is value i of
+ * `values_count` dropdown options. Excel joins options with commas
+ * inside a quoted formula1 string — commas or bare `"` in values
+ * are rejected. Returns 0 or -1 with err="InvalidHyperlinkRange" /
+ * "InvalidDataValidation". Max 256 values per call. */
+int32_t zlsx_sheet_writer_add_data_validation_list(
+    zlsx_sheet_writer_t  * sw,
+    const uint8_t        * range_ptr,
+    size_t                 range_len,
+    const uint8_t * const* values_ptr,
+    const size_t         * lens_ptr,
+    size_t                 values_count,
+    uint8_t              * err_buf,
+    size_t                 err_buf_len);
+
 /* Attach an external-URL hyperlink to a cell or rectangular range.
  * `range` is A1-style (single cell "A1" or span "B2:C3"); `url` is
  * the external target (http/https/mailto/file/...). Returns 0 or

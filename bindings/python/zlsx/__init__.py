@@ -742,11 +742,74 @@ def _sheet_add_hyperlink(self: "SheetWriter", range_str: str, url: str) -> None:
         )
 
 
+def _sheet_add_data_validation_list(
+    self: "SheetWriter",
+    range_str: str,
+    values: list,
+) -> None:
+    """Attach a list-type data validation (dropdown) to a cell or
+    range. ``range_str`` is A1-style (``"A1"`` or ``"B2:B10"``);
+    ``values`` is a non-empty iterable of strings that become the
+    dropdown options. Embedded commas and bare double-quotes in
+    values are rejected (Excel's list format can't represent them);
+    XML-special chars like ``&``, ``<``, ``>`` are escaped on emit.
+    Raises :class:`ZlsxError` on ``InvalidHyperlinkRange`` or
+    ``InvalidDataValidation``."""
+    self._require_handle()
+    if not _ffi._HAS_DATA_VALIDATION:
+        raise RuntimeError(
+            "loaded libzlsx does not expose add_data_validation_list "
+            "(requires 0.2.5+); upgrade libzlsx"
+        )
+    # Materialise to list to allow iteration multiple times.
+    vals = list(values)
+    if len(vals) > 256:
+        raise ValueError(f"data validation list supports up to 256 values, got {len(vals)}")
+
+    range_raw = range_str.encode("utf-8")
+    range_buf = (ctypes.c_ubyte * max(len(range_raw), 1)).from_buffer_copy(
+        range_raw or b"\x00"
+    )
+
+    # Build parallel arrays: a `POINTER(c_ubyte)` per value + matching length.
+    # Keep the underlying `c_ubyte` arrays alive via a Python-side list so
+    # the C side sees valid memory for the whole call.
+    raw_values: list[bytes] = [v.encode("utf-8") for v in vals]
+    value_bufs = [
+        (ctypes.c_ubyte * max(len(raw), 1)).from_buffer_copy(raw or b"\x00")
+        for raw in raw_values
+    ]
+    ptr_t = ctypes.POINTER(ctypes.c_ubyte)
+    ptr_array = (ptr_t * len(vals))()
+    len_array = (ctypes.c_size_t * len(vals))()
+    for i, (b, raw) in enumerate(zip(value_bufs, raw_values)):
+        ptr_array[i] = ctypes.cast(b, ptr_t)
+        len_array[i] = len(raw)
+
+    rc = _ffi.lib.zlsx_sheet_writer_add_data_validation_list(
+        self._handle,
+        ctypes.cast(range_buf, ptr_t),
+        len(range_raw),
+        ptr_array,
+        len_array,
+        len(vals),
+        self._err,
+        _ERR_BUF_LEN,
+    )
+    # Keep buffers alive through the call.
+    del range_buf, value_bufs, ptr_array, len_array
+    if rc != 0:
+        raise ZlsxError(
+            f"zlsx_sheet_writer_add_data_validation_list: {_decode_err(self._err)}"
+        )
+
+
 SheetWriter.set_column_width = _sheet_set_column_width   # type: ignore[attr-defined]
 SheetWriter.freeze_panes = _sheet_freeze_panes           # type: ignore[attr-defined]
 SheetWriter.set_auto_filter = _sheet_set_auto_filter     # type: ignore[attr-defined]
 SheetWriter.add_merged_cell = _sheet_add_merged_cell     # type: ignore[attr-defined]
 SheetWriter.add_hyperlink = _sheet_add_hyperlink         # type: ignore[attr-defined]
+SheetWriter.add_data_validation_list = _sheet_add_data_validation_list  # type: ignore[attr-defined]
 
 
 class Writer:

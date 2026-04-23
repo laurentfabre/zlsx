@@ -539,6 +539,27 @@ pub const Writer = struct {
                 try full.appendSlice(alloc, "</mergeCells>");
             }
 
+            // <dataValidations> slots between <mergeCells> and
+            // <hyperlinks> per ECMA-376 CT_Worksheet child order.
+            // Each entry is a list-type (dropdown) validation; the
+            // formula1 content wraps the comma-joined values in
+            // literal double-quotes that Excel parses back to the
+            // individual options.
+            if (sw.data_validations.items.len > 0) {
+                try full.print(alloc, "<dataValidations count=\"{d}\">", .{sw.data_validations.items.len});
+                for (sw.data_validations.items) |dv| {
+                    try full.appendSlice(alloc, "<dataValidation type=\"list\" allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"");
+                    try appendXmlEscaped(alloc, &full, dv.range);
+                    try full.appendSlice(alloc, "\"><formula1>&quot;");
+                    for (dv.values, 0..) |v, vi| {
+                        if (vi != 0) try full.append(alloc, ',');
+                        try appendXmlEscaped(alloc, &full, v);
+                    }
+                    try full.appendSlice(alloc, "&quot;</formula1></dataValidation>");
+                }
+                try full.appendSlice(alloc, "</dataValidations>");
+            }
+
             // <hyperlinks> follows <mergeCells> per ECMA-376 ordering.
             // The r:id values reference entries in the per-sheet
             // _rels file written below.
@@ -622,6 +643,14 @@ pub const Hyperlink = struct {
     url: []u8,
 };
 
+/// List-type data validation (dropdown) bound to a cell or range.
+/// `values` are the literal dropdown options — Excel joins them with
+/// commas inside a quoted formula1 string. All fields SheetWriter-owned.
+pub const DataValidationList = struct {
+    range: []u8,
+    values: [][]u8,
+};
+
 /// Per-column width override. `col_min..=col_max` is the inclusive
 /// range this width applies to (xlsx indexes columns 1-based — the
 /// SheetWriter API takes 0-based indices and translates on emit).
@@ -655,6 +684,9 @@ pub const SheetWriter = struct {
     /// Each entry gets an rId in `xl/worksheets/_rels/sheetN.xml.rels`
     /// whose position in this list is its 1-based rId index.
     hyperlinks: std.ArrayListUnmanaged(Hyperlink) = .{},
+    /// List-type data validations (dropdowns). Emitted as a single
+    /// `<dataValidations>` block with one `<dataValidation>` per entry.
+    data_validations: std.ArrayListUnmanaged(DataValidationList) = .{},
 
     fn init(parent: *Writer, name: []const u8) !SheetWriter {
         return .{
@@ -675,6 +707,12 @@ pub const SheetWriter = struct {
             self.parent.allocator.free(h.url);
         }
         self.hyperlinks.deinit(self.parent.allocator);
+        for (self.data_validations.items) |dv| {
+            self.parent.allocator.free(dv.range);
+            for (dv.values) |v| self.parent.allocator.free(v);
+            self.parent.allocator.free(dv.values);
+        }
+        self.data_validations.deinit(self.parent.allocator);
         self.* = undefined;
     }
 
@@ -719,6 +757,48 @@ pub const SheetWriter = struct {
         const copy = try self.parent.allocator.dupe(u8, range);
         errdefer self.parent.allocator.free(copy);
         try self.merged_cells.append(self.parent.allocator, copy);
+    }
+
+    /// Attach a list-type data validation (dropdown) to a cell or
+    /// rectangular range. `range` is A1-style (single cell "A1" or
+    /// span "B2:B10"); `values` are the literal dropdown options.
+    /// Excel's in-cell list format joins values with commas inside a
+    /// quoted formula1 string, so embedded commas and bare double-
+    /// quotes in values are rejected (callers who need those should
+    /// use a range-reference validation — not yet supported). Empty
+    /// values and empty `values` slice also rejected.
+    pub fn addDataValidationList(
+        self: *SheetWriter,
+        range: []const u8,
+        values: []const []const u8,
+    ) !void {
+        try validateHyperlinkRange(range); // same A1 single-or-range shape
+        if (values.len == 0) return error.InvalidDataValidation;
+        for (values) |v| {
+            if (v.len == 0) return error.InvalidDataValidation;
+            // Comma breaks the Excel list format; bare `"` breaks the
+            // outer quoting. We xml-escape on emit, so `<>&` are safe.
+            if (std.mem.indexOfScalar(u8, v, ',') != null) return error.InvalidDataValidation;
+            if (std.mem.indexOfScalar(u8, v, '"') != null) return error.InvalidDataValidation;
+        }
+
+        const alloc = self.parent.allocator;
+        const range_copy = try alloc.dupe(u8, range);
+        errdefer alloc.free(range_copy);
+
+        const values_copy = try alloc.alloc([]u8, values.len);
+        errdefer alloc.free(values_copy);
+        var copied: usize = 0;
+        errdefer for (values_copy[0..copied]) |v| alloc.free(v);
+        for (values, 0..) |v, i| {
+            values_copy[i] = try alloc.dupe(u8, v);
+            copied = i + 1;
+        }
+
+        try self.data_validations.append(alloc, .{
+            .range = range_copy,
+            .values = values_copy,
+        });
     }
 
     /// Attach a hyperlink to a cell or rectangular range. `range` is
@@ -2264,6 +2344,110 @@ test "Writer: addMergedCell validates + emits <mergeCells> block" {
     while (try rows.next()) |_| {}
 }
 
+test "Writer: addDataValidationList validates + emits <dataValidations> block" {
+    const tmp_path = "/tmp/zlsx_writer_dv_list.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Sheet1");
+
+        // Valid.
+        try sheet.addDataValidationList("A2:A10", &.{ "Red", "Green", "Blue" });
+        try sheet.addDataValidationList("C3", &.{"Single"});
+        // Values with XML specials — must be entity-escaped on emit.
+        try sheet.addDataValidationList("B2", &.{ "R&D", "Q<A", "x>y" });
+
+        // Rejections.
+        try std.testing.expectError(error.InvalidDataValidation, sheet.addDataValidationList("D1", &.{}));
+        try std.testing.expectError(error.InvalidDataValidation, sheet.addDataValidationList("D2", &.{""}));
+        try std.testing.expectError(error.InvalidDataValidation, sheet.addDataValidationList("D3", &.{"has,comma"}));
+        try std.testing.expectError(error.InvalidDataValidation, sheet.addDataValidationList("D4", &.{"has\"quote"}));
+        try std.testing.expectError(error.InvalidHyperlinkRange, sheet.addDataValidationList("", &.{"x"}));
+        try std.testing.expectError(error.InvalidHyperlinkRange, sheet.addDataValidationList("a1", &.{"x"}));
+
+        try sheet.writeRow(&.{.{ .string = "hdr" }});
+        try w.save(tmp_path);
+    }
+
+    const sheet_xml = blk: {
+        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        var fbuf: [4096]u8 = undefined;
+        var fr = file.reader(&fbuf);
+        var iter = try std.zip.Iterator.init(&fr);
+        var filename_buf: [64]u8 = undefined;
+        while (try iter.next()) |entry| {
+            if (entry.filename_len > filename_buf.len) continue;
+            try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            const filename = filename_buf[0..entry.filename_len];
+            try fr.interface.readSliceAll(filename);
+            if (std.mem.eql(u8, filename, "xl/worksheets/sheet1.xml")) {
+                break :blk try extractEntryForTest(std.testing.allocator, entry, &fr);
+            }
+        }
+        return error.SheetXmlNotFound;
+    };
+    defer std.testing.allocator.free(sheet_xml);
+
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<dataValidations count=\"3\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "sqref=\"A2:A10\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "&quot;Red,Green,Blue&quot;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "sqref=\"C3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "&quot;Single&quot;") != null);
+    // XML-special chars in values must be entity-escaped.
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "&quot;R&amp;D,Q&lt;A,x&gt;y&quot;") != null);
+
+    // Ordering: </sheetData> < <dataValidations> < </worksheet>.
+    const sd_end = std.mem.indexOf(u8, sheet_xml, "</sheetData>") orelse return error.MissingSheetData;
+    const dv = std.mem.indexOf(u8, sheet_xml, "<dataValidations") orelse return error.MissingDataValidations;
+    const ws_end = std.mem.indexOf(u8, sheet_xml, "</worksheet>") orelse return error.MissingWorksheetEnd;
+    try std.testing.expect(sd_end < dv);
+    try std.testing.expect(dv < ws_end);
+
+    // Reader still walks the workbook cleanly.
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    while (try rows.next()) |_| {}
+}
+
+test "Writer: addDataValidationList — no block when none registered" {
+    const tmp_path = "/tmp/zlsx_writer_no_dv.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Sheet1");
+        try sheet.writeRow(&.{.{ .string = "plain" }});
+        try w.save(tmp_path);
+    }
+
+    const sheet_xml = blk: {
+        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        var fbuf: [4096]u8 = undefined;
+        var fr = file.reader(&fbuf);
+        var iter = try std.zip.Iterator.init(&fr);
+        var filename_buf: [64]u8 = undefined;
+        while (try iter.next()) |entry| {
+            if (entry.filename_len > filename_buf.len) continue;
+            try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            const filename = filename_buf[0..entry.filename_len];
+            try fr.interface.readSliceAll(filename);
+            if (std.mem.eql(u8, filename, "xl/worksheets/sheet1.xml")) {
+                break :blk try extractEntryForTest(std.testing.allocator, entry, &fr);
+            }
+        }
+        return error.SheetXmlNotFound;
+    };
+    defer std.testing.allocator.free(sheet_xml);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<dataValidations") == null);
+}
+
 test "Writer: addHyperlink validates + emits <hyperlinks> + per-sheet _rels" {
     const tmp_path = "/tmp/zlsx_writer_hyperlinks.xlsx";
     defer std.fs.cwd().deleteFile(tmp_path) catch {};
@@ -3359,6 +3543,30 @@ test "fuzz SheetWriter: random stage-5 per-sheet feature combos" {
             const u = hyperlink_urls[rng.intRangeAtMost(usize, 0, hyperlink_urls.len - 1)];
             sheet.addHyperlink(rg, u) catch |err| switch (err) {
                 error.InvalidHyperlinkRange, error.InvalidHyperlinkUrl => {},
+                else => return err,
+            };
+        }
+
+        // 0-2 data-validation lists with mixed valid/invalid inputs.
+        // Invalid ranges or values must return a clean error without
+        // corrupting the accumulator — otherwise the save below would
+        // emit a broken <dataValidations> block.
+        const dv_ranges = [_][]const u8{ "A1:A10", "B2", "C3:C5", "a1", "B2:A1", "" };
+        const dv_value_sets = [_][]const []const u8{
+            &.{ "Red", "Green", "Blue" },
+            &.{"Single"},
+            &.{ "R&D", "Q<A", "x>y" },
+            &.{"has,comma"}, // invalid
+            &.{"has\"quote"}, // invalid
+            &.{""}, // invalid
+            &.{}, // invalid (empty set)
+        };
+        const n_dv = rng.intRangeAtMost(usize, 0, 2);
+        for (0..n_dv) |_| {
+            const rg = dv_ranges[rng.intRangeAtMost(usize, 0, dv_ranges.len - 1)];
+            const vs = dv_value_sets[rng.intRangeAtMost(usize, 0, dv_value_sets.len - 1)];
+            sheet.addDataValidationList(rg, vs) catch |err| switch (err) {
+                error.InvalidHyperlinkRange, error.InvalidDataValidation => {},
                 else => return err,
             };
         }

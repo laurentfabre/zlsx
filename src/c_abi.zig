@@ -1060,6 +1060,46 @@ export fn zlsx_sheet_writer_add_merged_cell(
     return 0;
 }
 
+/// Attach a list-type data validation (dropdown) to a cell or
+/// rectangular range. `range` is A1-style; `values_ptr` / `lens_ptr`
+/// describe an array of `values_count` string slices that become the
+/// dropdown options. Excel joins them with commas inside a quoted
+/// formula1 string — embedded commas or bare double-quotes in values
+/// are rejected. Returns 0 on success, -1 with err set to
+/// "InvalidHyperlinkRange" on malformed range or
+/// "InvalidDataValidation" on empty values / bad value chars.
+export fn zlsx_sheet_writer_add_data_validation_list(
+    sw: *SheetWriter,
+    range_ptr: [*]const u8,
+    range_len: usize,
+    values_ptr: [*]const [*]const u8,
+    lens_ptr: [*]const usize,
+    values_count: usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+    const range = range_ptr[0..range_len];
+    // Re-project the parallel pointer + length arrays into a Zig
+    // slice-of-slices on a bounded scratch buffer so the Zig API
+    // (which expects []const []const u8) can consume them directly.
+    // Cap at a generous 256 values — dropdowns beyond that are rare
+    // and exceed Excel's own practical limit anyway.
+    if (values_count > 256) {
+        writeError(err_buf, err_buf_len, @errorName(error.InvalidDataValidation));
+        return -1;
+    }
+    var buf: [256][]const u8 = undefined;
+    for (0..values_count) |i| {
+        buf[i] = values_ptr[i][0..lens_ptr[i]];
+    }
+    sw_state.inner.addDataValidationList(range, buf[0..values_count]) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
 /// Attach an external-URL hyperlink to a cell or rectangular range.
 /// `range` is A1-style (single cell "A1" or span "B2:C3"); `url` is
 /// the external target (http/https/mailto/file/...). The writer

@@ -4,7 +4,7 @@ Tiny `.xlsx` reader **and** writer for Zig. Single-file library, no third-party 
 
 **Reader**: 1.5-2.5 ms on small files (alongside calamine-rust, process-startup-bound), 13 ms / 3.4 MB on a 67 KB workbook with 1,144 shared strings — 1.4× faster than python-calamine, 5.6× faster than openpyxl on that file, at ~5× lower RSS than the Python stack. calamine-rust still leads on SST-heavy workloads (3.5 ms vs zlsx's 13 ms post-arena). [Full benchmark table →](docs/benchmarks.md)
 
-**Writer** (Phase 3b, v0.2.4): pragmatic openpyxl-parity styles — bold/italic, font size/name/color, horizontal alignment, wrap text, 19 OOXML fill patterns, 14 border styles × 5 sides, custom number formats, column widths, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks. Survived 1M-iter deep fuzz on every surface.
+**Writer** (Phase 3b, v0.2.4): pragmatic openpyxl-parity styles — bold/italic, font size/name/color, horizontal alignment, wrap text, 19 OOXML fill patterns, 14 border styles × 5 sides, custom number formats, column widths, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks, list-type data validations (dropdowns). Survived 1M-iter deep fuzz on every surface.
 
 ```zig
 const xlsx = @import("zlsx");
@@ -66,7 +66,7 @@ Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-ro
 
 **In**
 - **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout, merged-cell ranges via `Book.mergedRanges(sheet)`, external-URL hyperlinks via `Book.hyperlinks(sheet)` (resolved through sheet `_rels`)
-- **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks (per-sheet `_rels`)
+- **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks (per-sheet `_rels`), list-type data validations (dropdowns)
 - XML entity decoding (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&#N;`, `&#xN;`) on read and escaping on write
 - CLI (`zlsx file.xlsx --format {jsonl,jsonl-dict,tsv,csv}`), C ABI (`libzlsx.{dylib,so,dll}` + `include/zlsx.h`), Python bindings (`pip install py-zlsx`)
 
