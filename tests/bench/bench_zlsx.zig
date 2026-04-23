@@ -1,12 +1,17 @@
 // Benchmark: open an xlsx, iterate every row of the first sheet,
 // tally cells by type. Prints one summary line at the end.
+//
+// Uses `std.heap.smp_allocator` for the same reason the writer bench
+// does (see tests/bench/bench_write_zlsx.zig) — it matches what a
+// production caller would actually plug in. `DebugAllocator` would
+// add several ms of per-alloc tracking overhead that isn't
+// representative of downstream behaviour; see docs/benchmarks.md's
+// "Methodology" section for the full rationale.
 const std = @import("std");
 const xlsx = @import("zlsx");
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+    const alloc = std.heap.smp_allocator;
 
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
