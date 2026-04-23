@@ -222,14 +222,23 @@ pub const DataValidation = struct {
 /// entries return null from `Book.richRuns`.
 ///
 /// `text` borrows from `sst_arena` (decoded if entities, else a slice
-/// directly into the raw SST xml). `bold` and `italic` are the two
-/// properties this reader currently surfaces — other `<rPr>` children
-/// (color, size, font) are skipped today and will be added in a
-/// follow-up iter without breaking this shape.
+/// directly into the raw SST xml). `font_name` likewise borrows from
+/// `sst_arena` when non-null. Theme colors (`<color theme="…"/>`) are
+/// not resolved today — we only expose explicit `rgb="AARRGGBB"`
+/// values.
 pub const RichRun = struct {
     text: []const u8,
     bold: bool = false,
     italic: bool = false,
+    /// ARGB color from `<color rgb="FFFFFFFF"/>`. Null when the run
+    /// uses a theme color (`<color theme="…"/>` — not resolved here)
+    /// or no color is declared at all.
+    color_argb: ?u32 = null,
+    /// Font size in points, from `<sz val="11"/>`. Null when absent.
+    size: ?f32 = null,
+    /// Font family name, from `<rFont val="Calibri"/>`. Empty string
+    /// when absent (distinguishes "no rFont" from "rFont val=''").
+    font_name: []const u8 = "",
 };
 
 pub const DomainError = error{
@@ -1254,20 +1263,23 @@ fn parseDataValidationsForSheet(book: *Book, sheet_path: []const u8, xml: []cons
     try book.data_validations_by_sheet.put(book.allocator, sheet_path, slice);
 }
 
-/// Scan a slice of `<rPr>...</rPr>` content for the two font flags
-/// this reader currently surfaces (bold / italic). `<b/>` and `<i/>`
-/// are self-closing in every OOXML generator I've checked; explicit
-/// `val="false"` is rare but honoured. Returns defaults when the
-/// slice is empty or the flags are absent.
-fn parseRprFlags(rpr: []const u8) RichRun {
-    var bold = false;
-    var italic = false;
+/// Scan a slice of `<rPr>...</rPr>` content for the font properties
+/// this reader surfaces: bold, italic, rgb color, size, and font
+/// name. `<b/>` / `<i/>` are self-closing in every OOXML generator
+/// I've checked; explicit `val="false"` is rare but honoured.
+/// `font_name` is duped into `arena` when present; callers get an
+/// empty string otherwise. Theme colors are deliberately not
+/// resolved — only explicit `rgb="AARRGGBB"` values set
+/// `color_argb`.
+fn parseRprFlags(arena: Allocator, rpr: []const u8) !RichRun {
+    var run: RichRun = .{ .text = "" };
+
     // Match `<b/>`, `<b ...>`, `<b val="1"/>`, etc. Skip `<b val="0"/>`.
     if (std.mem.indexOf(u8, rpr, "<b")) |bp| {
         if (bp + 2 < rpr.len) {
             const next = rpr[bp + 2];
             if (next == '/' or next == '>' or next == ' ') {
-                bold = !hasFalseVal(rpr[bp..]);
+                run.bold = !hasFalseVal(rpr[bp..]);
             }
         }
     }
@@ -1275,11 +1287,61 @@ fn parseRprFlags(rpr: []const u8) RichRun {
         if (ip + 2 < rpr.len) {
             const next = rpr[ip + 2];
             if (next == '/' or next == '>' or next == ' ') {
-                italic = !hasFalseVal(rpr[ip..]);
+                run.italic = !hasFalseVal(rpr[ip..]);
             }
         }
     }
-    return .{ .text = "", .bold = bold, .italic = italic };
+
+    // `<color rgb="AARRGGBB"/>` — parse hex into u32. `<color theme=…/>`
+    // is silently skipped (we don't own the theme resolution step).
+    if (std.mem.indexOf(u8, rpr, "<color")) |cp| {
+        const gt = std.mem.indexOfScalarPos(u8, rpr, cp, '>') orelse 0;
+        if (gt > cp) {
+            const tag = rpr[cp..gt];
+            const rgb_key = "rgb=\"";
+            if (std.mem.indexOf(u8, tag, rgb_key)) |rp| {
+                const rs = rp + rgb_key.len;
+                if (std.mem.indexOfScalarPos(u8, tag, rs, '"')) |re| {
+                    if (std.fmt.parseInt(u32, tag[rs..re], 16)) |v| {
+                        run.color_argb = v;
+                    } else |_| {}
+                }
+            }
+        }
+    }
+
+    // `<sz val="11"/>` or `<sz val="10.5"/>`.
+    if (std.mem.indexOf(u8, rpr, "<sz")) |sp| {
+        const gt = std.mem.indexOfScalarPos(u8, rpr, sp, '>') orelse 0;
+        if (gt > sp) {
+            const tag = rpr[sp..gt];
+            const val_key = "val=\"";
+            if (std.mem.indexOf(u8, tag, val_key)) |vp| {
+                const vs = vp + val_key.len;
+                if (std.mem.indexOfScalarPos(u8, tag, vs, '"')) |ve| {
+                    run.size = std.fmt.parseFloat(f32, tag[vs..ve]) catch null;
+                }
+            }
+        }
+    }
+
+    // `<rFont val="Calibri"/>` — dupe into arena; run.font_name slice
+    // lives for the Book's lifetime alongside SST-owned strings.
+    if (std.mem.indexOf(u8, rpr, "<rFont")) |fp| {
+        const gt = std.mem.indexOfScalarPos(u8, rpr, fp, '>') orelse 0;
+        if (gt > fp) {
+            const tag = rpr[fp..gt];
+            const val_key = "val=\"";
+            if (std.mem.indexOf(u8, tag, val_key)) |vp| {
+                const vs = vp + val_key.len;
+                if (std.mem.indexOfScalarPos(u8, tag, vs, '"')) |ve| {
+                    run.font_name = try arena.dupe(u8, tag[vs..ve]);
+                }
+            }
+        }
+    }
+
+    return run;
 }
 
 /// Returns true if the tag body (up to the next `>`) contains
@@ -1424,6 +1486,9 @@ fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
                         .text = run_text,
                         .bold = pending_flags.bold,
                         .italic = pending_flags.italic,
+                        .color_argb = pending_flags.color_argb,
+                        .size = pending_flags.size,
+                        .font_name = pending_flags.font_name,
                     });
                 }
 
@@ -1445,7 +1510,7 @@ fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
             {
                 // `<rPr>...</rPr>` — parse bold / italic, skip body.
                 const rpr_close = std.mem.indexOfPos(u8, xml, next_lt, "</rPr>") orelse break :body;
-                pending_flags = parseRprFlags(xml[next_lt .. rpr_close + "</rPr>".len]);
+                pending_flags = try parseRprFlags(arena_alloc, xml[next_lt .. rpr_close + "</rPr>".len]);
                 j = rpr_close + "</rPr>".len;
                 std.debug.assert(j > j_prev);
             } else if (c1 == '/' and next_lt + 5 <= xml.len and
@@ -1914,6 +1979,48 @@ test "Book.richRuns: rich-text SST entries expose per-run bold/italic" {
     try std.testing.expectEqualStrings("R&D", r4[0].text);
     try std.testing.expectEqual(false, r4[0].bold);
     try std.testing.expectEqual(true, r4[0].italic);
+}
+
+test "Book.richRuns: color / size / font_name from <rPr>" {
+    const sst_xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" ++
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"3\">" ++
+        // Full-fat rPr: bold + color + size + font
+        "<si><r><rPr><b/><sz val=\"14\"/><color rgb=\"FFFF0000\"/><rFont val=\"Arial\"/></rPr><t>styled</t></r></si>" ++
+        // Theme-only color — should NOT populate color_argb
+        "<si><r><rPr><color theme=\"1\"/><sz val=\"11.5\"/></rPr><t>themed</t></r></si>" ++
+        // No rPr children we care about
+        "<si><r><t>bare</t></r></si>" ++
+        "</sst>";
+
+    var book: Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer book.deinit();
+    const owned = try std.testing.allocator.dupe(u8, sst_xml);
+    book.shared_strings_xml = owned;
+    try parseSharedStrings(&book, owned);
+
+    // Styled: every property surfaced.
+    const r0 = book.richRuns(0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), r0.len);
+    try std.testing.expectEqual(true, r0[0].bold);
+    try std.testing.expectEqual(@as(?u32, 0xFFFF0000), r0[0].color_argb);
+    try std.testing.expectEqual(@as(?f32, 14.0), r0[0].size);
+    try std.testing.expectEqualStrings("Arial", r0[0].font_name);
+
+    // Theme color is intentionally skipped; size still parses.
+    const r1 = book.richRuns(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?u32, null), r1[0].color_argb);
+    try std.testing.expectEqual(@as(?f32, 11.5), r1[0].size);
+    try std.testing.expectEqualStrings("", r1[0].font_name);
+
+    // Bare run: all optionals null / empty.
+    const r2 = book.richRuns(2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?u32, null), r2[0].color_argb);
+    try std.testing.expectEqual(@as(?f32, null), r2[0].size);
+    try std.testing.expectEqualStrings("", r2[0].font_name);
 }
 
 test "Book.hyperlinks: internal hyperlinks (location) round-trip + mixed external/internal" {

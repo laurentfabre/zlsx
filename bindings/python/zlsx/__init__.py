@@ -310,13 +310,20 @@ class DataValidation:
 class RichRun:
     """A single formatting run inside a shared-string entry. Excel
     emits rich-text via ``<si><r><rPr/>...<t/></r>...</si>`` where
-    every ``<r>`` can carry its own font properties. Only ``bold`` and
-    ``italic`` are surfaced today — colour / size / font properties
-    will join this shape in a follow-up without breaking the
-    dataclass."""
+    every ``<r>`` can carry its own font properties.
+
+    ``color_argb`` is the ARGB color from ``<color rgb="AARRGGBB"/>``
+    or ``None`` when the run uses a theme color (not resolved today)
+    or no color at all. ``size`` is in points, ``None`` when absent.
+    ``font_name`` is ``""`` when the run had no ``<rFont val="…"/>``.
+    The color / size / font fields require libzlsx 0.2.6+ — on older
+    libraries they stay at their defaults."""
     text: str
     bold: bool = False
     italic: bool = False
+    color_argb: int | None = None
+    size: float | None = None
+    font_name: str = ""
 
 
 # ─── Book ─────────────────────────────────────────────────────────────
@@ -520,6 +527,10 @@ class Book:
         text_len = ctypes.c_size_t(0)
         bold = ctypes.c_uint8(0)
         italic = ctypes.c_uint8(0)
+        color = ctypes.c_uint32(0)
+        size = ctypes.c_float(0.0)
+        font_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        font_len = ctypes.c_size_t(0)
         for i in range(count):
             rc = _ffi.lib.zlsx_rich_run_at(
                 self._handle, sst_idx, i,
@@ -530,10 +541,35 @@ class Book:
             )
             if rc != 0:
                 continue
+            color_val: int | None = None
+            size_val: float | None = None
+            font_val = ""
+            if _ffi._HAS_RICH_RUNS_EXT:
+                crc = _ffi.lib.zlsx_rich_run_color(
+                    self._handle, sst_idx, i, ctypes.byref(color)
+                )
+                if crc == 0:
+                    color_val = int(color.value)
+                src = _ffi.lib.zlsx_rich_run_size(
+                    self._handle, sst_idx, i, ctypes.byref(size)
+                )
+                if src == 0:
+                    size_val = float(size.value)
+                frc = _ffi.lib.zlsx_rich_run_font_name(
+                    self._handle, sst_idx, i,
+                    ctypes.byref(font_ptr), ctypes.byref(font_len),
+                )
+                if frc == 0 and font_len.value > 0:
+                    font_val = ctypes.string_at(
+                        font_ptr, font_len.value
+                    ).decode("utf-8", errors="replace")
             out.append(RichRun(
                 text=ctypes.string_at(text_ptr, text_len.value).decode("utf-8", errors="replace"),
                 bold=bool(bold.value),
                 italic=bool(italic.value),
+                color_argb=color_val,
+                size=size_val,
+                font_name=font_val,
             ))
         return out
 

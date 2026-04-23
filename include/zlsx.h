@@ -306,6 +306,37 @@ int32_t zlsx_rich_run_at(zlsx_book_t *     book,
                          uint8_t *         out_italic);
 
 /*
+ * ARGB color of run `run_idx` on SST entry `sst_idx`. Returns 0 and
+ * writes `*out_color` when the run had an explicit `<color rgb=…/>`.
+ * Returns 1 when absent (no color, or a theme color we don't resolve);
+ * `*out_color` is untouched. Returns -1 on out-of-range indices.
+ */
+int32_t zlsx_rich_run_color(zlsx_book_t * book,
+                            size_t        sst_idx,
+                            size_t        run_idx,
+                            uint32_t *    out_color);
+
+/*
+ * Font size (points) of run `run_idx` on SST entry `sst_idx`. Same
+ * present/absent/error tri-state as zlsx_rich_run_color.
+ */
+int32_t zlsx_rich_run_size(zlsx_book_t * book,
+                           size_t        sst_idx,
+                           size_t        run_idx,
+                           float *       out_size);
+
+/*
+ * Font name of run `run_idx` on SST entry `sst_idx`. Pointer lifetime
+ * matches the Book; empty slice (`*out_len == 0`) when the run had no
+ * `<rFont val=…/>`. Returns 0 on success, -1 on out-of-range indices.
+ */
+int32_t zlsx_rich_run_font_name(zlsx_book_t *     book,
+                                size_t            sst_idx,
+                                size_t            run_idx,
+                                const uint8_t * * out_ptr,
+                                size_t *          out_len);
+
+/*
  * Open a row iterator for sheet `sheet_idx`. On failure returns NULL
  * and writes a diagnostic into err_buf as per zlsx_book_open().
  *

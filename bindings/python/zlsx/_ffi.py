@@ -514,6 +514,38 @@ if _HAS_RICH_RUNS:
     ]
     lib.zlsx_rich_run_at.restype = ctypes.c_int32
 
+# Rich-text extended props (color / size / font_name) — feature-probed
+# independently so a partial libzlsx still loads.
+_HAS_RICH_RUNS_EXT = (
+    _HAS_RICH_RUNS
+    and hasattr(lib, "zlsx_rich_run_color")
+    and hasattr(lib, "zlsx_rich_run_size")
+    and hasattr(lib, "zlsx_rich_run_font_name")
+)
+if _HAS_RICH_RUNS_EXT:
+    lib.zlsx_rich_run_color.argtypes = [
+        book_handle,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    lib.zlsx_rich_run_color.restype = ctypes.c_int32
+    lib.zlsx_rich_run_size.argtypes = [
+        book_handle,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.zlsx_rich_run_size.restype = ctypes.c_int32
+    lib.zlsx_rich_run_font_name.argtypes = [
+        book_handle,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.zlsx_rich_run_font_name.restype = ctypes.c_int32
+
 
 _HAS_STYLES_EX = hasattr(lib, "zlsx_writer_add_style_ex")
 if _HAS_STYLES_EX:

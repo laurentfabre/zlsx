@@ -96,7 +96,7 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 | External-URL hyperlinks | ✓ | ? | ✓ | ? |
 | Data validations (list / dropdown) | ✓ | — | ✓ | — |
 | Data validations (number / date / custom) | ✓ | — | ✓ | — |
-| Rich-text formatting preserved | ~³ | ~ | ✓ | — |
+| Rich-text formatting preserved | ✓³ | ~ | ✓ | — |
 | Cell styles on read (bold / colour / fill) | — | — | ✓ | — |
 | Comments / notes | — | ? | ✓ | — |
 | Chart / image / pivot access | — | — | ~ | — |
@@ -104,7 +104,7 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 
 ¹ Returns a single `Float` type for any non-text number — callers cast to integer if needed.
 ² `xlsx.fromExcelSerial(cell.number) -> ?DateTime`; out-of-range serials (1900 leap-bug window) return `null`.
-³ `Book.richRuns(sst_idx)` surfaces per-`<r>` bold / italic flags. Colour / size / font are skipped today (expanding this is a follow-up iter that won't break the existing `RichRun` shape).
+³ `Book.richRuns(sst_idx)` surfaces per-`<r>` bold / italic + ARGB color / size / font name. Theme colors (`<color theme="…"/>`) aren't resolved — only explicit `<color rgb="AARRGGBB"/>` populates `color_argb`.
 
 ### Writer capability
 

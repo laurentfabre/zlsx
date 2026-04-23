@@ -701,6 +701,84 @@ def test_rich_text_runs_parse_bold_italic(tmp_path):
         assert book.rich_text(999) is None
 
 
+def test_rich_text_runs_color_size_font(tmp_path):
+    """Rich-text color / size / font_name round-trip through the
+    reader. Theme colors stay None (we don't resolve theme.xml)."""
+    import zipfile
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_RICH_RUNS_EXT:
+        pytest.skip("loaded libzlsx predates rich-text ext ABI (0.2.6+)")
+
+    xlsx_path = tmp_path / "rich_ext.xlsx"
+    sst_xml = (
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        b"<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"2\">"
+        b"<si><r><rPr><b/><sz val=\"14\"/><color rgb=\"FFFF0000\"/><rFont val=\"Arial\"/></rPr><t>styled</t></r></si>"
+        b"<si><r><rPr><color theme=\"1\"/><sz val=\"11.5\"/></rPr><t>themed</t></r></si>"
+        b"</sst>"
+    )
+    workbook_xml = (
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        b"<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+        b"xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+        b"<sheets><sheet name=\"S\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>"
+    )
+    workbook_rels = (
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        b"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        b"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>"
+        b"<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/>"
+        b"</Relationships>"
+    )
+    root_rels = (
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        b"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        b"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>"
+        b"</Relationships>"
+    )
+    content_types = (
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        b"<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+        b"<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+        b"<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+        b"<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>"
+        b"<Override PartName=\"/xl/sharedStrings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml\"/>"
+        b"<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+        b"</Types>"
+    )
+    sheet_xml = (
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        b"<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+        b"<sheetData><row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c></row></sheetData></worksheet>"
+    )
+
+    with zipfile.ZipFile(xlsx_path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", root_rels)
+        z.writestr("xl/workbook.xml", workbook_xml)
+        z.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        z.writestr("xl/sharedStrings.xml", sst_xml)
+        z.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+
+    with zlsx.open(xlsx_path) as book:
+        runs = book.rich_text(0)
+        assert runs is not None
+        assert len(runs) == 1
+        assert runs[0].text == "styled"
+        assert runs[0].bold
+        assert runs[0].color_argb == 0xFFFF0000
+        assert runs[0].size == 14.0
+        assert runs[0].font_name == "Arial"
+
+        # Theme color stays None; size still parses.
+        runs = book.rich_text(1)
+        assert runs is not None
+        assert runs[0].color_argb is None
+        assert runs[0].size == 11.5
+        assert runs[0].font_name == ""
+
+
 def test_writer_add_data_validation_rejects_invalid_inputs(tmp_path):
     """Exercise every error path on the extended writer DV APIs so the
     rejection behaviour from the Zig writer surfaces cleanly."""

@@ -551,6 +551,64 @@ export fn zlsx_rich_run_at(
     return 0;
 }
 
+/// ARGB color of rich-text run `run_idx` on SST entry `sst_idx`.
+/// Writes the u32 color to `out_color` and returns 0 when the run
+/// carried an explicit `<color rgb="…"/>`. Returns 1 when the run
+/// had no color (or used a theme color, which we don't resolve) —
+/// leaves `out_color` untouched so callers can sentinel their own
+/// default. Returns -1 on out-of-range indices.
+export fn zlsx_rich_run_color(
+    book: *Book,
+    sst_idx: usize,
+    run_idx: usize,
+    out_color: *u32,
+) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    const runs = state.inner.richRuns(sst_idx) orelse return -1;
+    if (run_idx >= runs.len) return -1;
+    const c = runs[run_idx].color_argb orelse return 1;
+    out_color.* = c;
+    return 0;
+}
+
+/// Font size (points) of rich-text run `run_idx` on SST entry
+/// `sst_idx`. Writes the float to `out_size` and returns 0 when the
+/// run had `<sz val="…"/>`. Returns 1 on absence (sz omitted).
+/// Returns -1 on out-of-range indices.
+export fn zlsx_rich_run_size(
+    book: *Book,
+    sst_idx: usize,
+    run_idx: usize,
+    out_size: *f32,
+) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    const runs = state.inner.richRuns(sst_idx) orelse return -1;
+    if (run_idx >= runs.len) return -1;
+    const s = runs[run_idx].size orelse return 1;
+    out_size.* = s;
+    return 0;
+}
+
+/// Font-name pointer + length of rich-text run `run_idx` on SST entry
+/// `sst_idx`. Text lifetime matches the Book; empty (`*out_len == 0`)
+/// when the run had no `<rFont val="…"/>`. Returns 0 on success or
+/// -1 on out-of-range indices.
+export fn zlsx_rich_run_font_name(
+    book: *Book,
+    sst_idx: usize,
+    run_idx: usize,
+    out_ptr: *[*]const u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    const runs = state.inner.richRuns(sst_idx) orelse return -1;
+    if (run_idx >= runs.len) return -1;
+    const f = runs[run_idx].font_name;
+    out_ptr.* = f.ptr;
+    out_len.* = f.len;
+    return 0;
+}
+
 /// Find a sheet by name. Returns the 0-based index, or -1 if not found.
 export fn zlsx_sheet_index_by_name(
     book: *Book,
