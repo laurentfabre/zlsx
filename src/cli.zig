@@ -986,9 +986,15 @@ fn runRowsCommand(
             col_offset: u32,
             any_non_empty: bool,
         };
-        const is_envelope = format == .jsonl;
+        // Mask vs slice: the envelope's positional cells[i]==col-i
+        // contract needs the mask (full-width with .empty for out-of-
+        // range). The dict/flat paths emit by key or by compact
+        // position, so they use the narrower slice. --header toggles
+        // the envelope path from positional to dict, so it joins the
+        // slice group regardless of format.
+        const is_envelope_positional = format == .jsonl and !header;
         const view: EmitView = if (range) |r| blk: {
-            if (is_envelope) {
+            if (is_envelope_positional) {
                 var any = false;
                 masked.clearRetainingCapacity();
                 try masked.ensureTotalCapacity(alloc, cells.len);
@@ -2462,6 +2468,47 @@ test "runRowsCommand --header empty header cells fall back to col_<letter>" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"col_B\":42") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"name\":\"apple\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"qty\":3") != null);
+}
+
+test "runRowsCommand --header + --range derives keys only from in-range cols" {
+    // Header row has 4 cells across A..D ("w","x","y","z"); a --range
+    // B:C must consume only the B/C header cells and emit data dicts
+    // keyed exactly {"x","y"} — no `col_A` / `col_D` leak from the
+    // masked full-width view.
+    const tmp_path = "/tmp/zlsx_cli_header_range_iter59b3.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{ .{ .string = "w" }, .{ .string = "x" }, .{ .string = "y" }, .{ .string = "z" } });
+        try s0.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 }, .{ .integer = 4 } });
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+
+    // B:C → cols 1..2 (0-based).
+    const range: xlsx.MergeRange = .{
+        .top_left = .{ .row = 1, .col = 1 },
+        .bottom_right = .{ .row = 2, .col = 2 },
+    };
+    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, range, true);
+    const out = w.buffered();
+
+    // Only the in-range header keys should appear.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"x\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"y\":3") != null);
+    // Out-of-range headers and their `col_<letter>` fallbacks must NOT.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"w\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"z\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"col_A\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"col_D\"") == null);
 }
 
 test "runCellsCommand --skip / --take slice the emitted cell stream" {
