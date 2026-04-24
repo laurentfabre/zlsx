@@ -1,6 +1,6 @@
 # jq for Excel — streaming CLI design (v4.1)
 
-> **Status**: design **shipped** — every rollout slice iter54 → iter60c is landed on `main` and Codex-reviewed clean. Four rounds of design-level Codex review (v1 → v4.1) preceded implementation; each code slice went through its own review rounds. The CLI surface described below is now what `zlsx` actually emits — see `src/cli.zig` for the implementation and the README's "CLI" section for the user-facing reference. v4.1 notes the editorial polish that closed the design-review cycle.
+> **Status**: design **mostly shipped** — every rollout slice iter54 → iter60c is landed on `main` and Codex-reviewed clean, so the sub-command dispatch, envelope, pagination/range/header, output modes, signal handling, and inline error-record mechanism are all live. Four rounds of design-level Codex review (v1 → v4.1) preceded implementation; each code slice went through its own review rounds. See `src/cli.zig` for the implementation and the README's "CLI" section for the user-facing reference. **Not yet shipped from this doc**: cell-type completeness — the envelope's `t` field currently emits `"str"` / `"int"` / `"num"` / `"bool"` / `"blank"`; `"date"` / `"formula"` / `"error"` plus the `formula_ref` / `cached` fields are spec'd in the Record shapes sections below but await reader-surface plumbing in a future iter.
 
 ## Goal
 
