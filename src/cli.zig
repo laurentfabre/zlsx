@@ -259,6 +259,12 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     if (out.start_row) |s| if (out.end_row) |e| {
         if (s > e) return ArgError.BadArgValue;
     };
+    // The legacy --list-sheets flag takes an early return in main
+    // and emits plain sheet names — no row concept. Row bounds
+    // passed alongside it would silently no-op, hiding typos.
+    if (out.list_sheets and (out.start_row != null or out.end_row != null)) {
+        return ArgError.BadArgValue;
+    }
     return out;
 }
 
@@ -1764,6 +1770,17 @@ test "parseArgs --start-row / --end-row round-trip and rejections" {
         const a = try parseArgs(&argv);
         try std.testing.expect(a.start_row == null);
         try std.testing.expect(a.end_row == null);
+    }
+    // Legacy --list-sheets flag takes the early-return path in main
+    // and emits plain sheet names; row bounds passed alongside it
+    // would silently no-op. parseArgs must reject.
+    {
+        const argv = [_][]const u8{ "f.xlsx", "--list-sheets", "--start-row", "2" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "f.xlsx", "--list-sheets", "--end-row", "10" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
     }
 }
 
