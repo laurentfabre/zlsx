@@ -374,8 +374,79 @@ pub const DomainError = error{
 
 // ─── Book ────────────────────────────────────────────────────────────
 
+/// Owner of the open zip file handle, its reader buffer, and cached
+/// central-directory offsets for lazily-extractable parts. Heap-boxed
+/// because `std.fs.File.Reader` embeds a pointer into its own buffer:
+/// moving it by value (e.g. returning `Book` from `openLazy`) would
+/// invalidate that pointer. One indirection sidesteps the whole class
+/// of bug.
+///
+/// Slice A caches sheet / comments / vml offsets even though every
+/// matching entry is still eagerly extracted in the same pass —
+/// populating the maps now makes the slice-B swap to on-demand
+/// extraction a one-line change per part.
+const ZipArchive = struct {
+    file: std.fs.File,
+    reader_buf: [4096]u8 = undefined,
+    reader: std.fs.File.Reader,
+    sheet_offsets: std.StringHashMapUnmanaged(Entry) = .{},
+    comments_offsets: std.StringHashMapUnmanaged(Entry) = .{},
+    vml_offsets: std.StringHashMapUnmanaged(Entry) = .{},
+
+    const Entry = struct {
+        file_offset: u64,
+        uncompressed_size: u64,
+        compression_method: std.zip.CompressionMethod,
+    };
+
+    /// Open the file, walk the central directory once, populate offset
+    /// maps. On success, `self` owns the file handle; `deinit` closes
+    /// it. The file stays open for the caller's lifetime so subsequent
+    /// `extractEntry` calls can re-seek.
+    fn open(allocator: Allocator, archive_path: []const u8) !*ZipArchive {
+        const self = try allocator.create(ZipArchive);
+        errdefer allocator.destroy(self);
+
+        self.* = .{
+            .file = try std.fs.cwd().openFile(archive_path, .{}),
+            .reader = undefined,
+            .sheet_offsets = .{},
+            .comments_offsets = .{},
+            .vml_offsets = .{},
+        };
+        errdefer self.file.close();
+
+        // reader embeds a pointer into self.reader_buf — must run after
+        // the struct lives at its final heap address.
+        self.reader = self.file.reader(&self.reader_buf);
+
+        errdefer self.sheet_offsets.deinit(allocator);
+        errdefer self.comments_offsets.deinit(allocator);
+        errdefer self.vml_offsets.deinit(allocator);
+
+        return self;
+    }
+
+    fn deinit(self: *ZipArchive, allocator: Allocator) void {
+        self.sheet_offsets.deinit(allocator);
+        self.comments_offsets.deinit(allocator);
+        self.vml_offsets.deinit(allocator);
+        self.file.close();
+        allocator.destroy(self);
+    }
+
+    // extractByKey is deferred to slice B, when on-demand extraction
+    // actually runs. The offset maps are populated by `Book.openLazy`
+    // during its one-pass walk; slice B will add the extraction helper
+    // that re-seeks using a cached `Entry`.
+};
+
 pub const Book = struct {
     allocator: Allocator,
+    /// Open zip archive backing this book. Owns the file handle and
+    /// reader. Set by `openLazy`; torn down LAST in `deinit` (after
+    /// every borrowed part buffer is freed).
+    archive: ?*ZipArchive = null,
     /// Decompressed `xl/sharedStrings.xml` (nullable — small xlsx files
     /// with only inline strings omit this part).
     shared_strings_xml: ?[]u8 = null,
@@ -479,20 +550,29 @@ pub const Book = struct {
     /// Open and parse the workbook skeleton. Sheet XML is eagerly
     /// decompressed (xlsx files we target are small — ~300 KB — and
     /// streaming through std.zip is awkward).
+    ///
+    /// Two-line facade over the slice-A implementation: `openLazy`
+    /// already performs the full eager load today. Slice B will
+    /// separate the two so callers who only need `sheets`/`SST`/styles
+    /// can skip the sheet-XML extraction.
     pub fn open(allocator: Allocator, path: []const u8) !Book {
+        return try Book.openLazy(allocator, path);
+    }
+
+    /// Open the archive, walk the central directory once, and populate
+    /// every part the current `Book` surface requires. Slice A
+    /// semantics: identical to `open` — eager load happens inline via
+    /// the one-pass extract + `loadEagerParts`.
+    pub fn openLazy(allocator: Allocator, path: []const u8) !Book {
         var book: Book = .{
             .allocator = allocator,
             .sst_arena = std.heap.ArenaAllocator.init(allocator),
         };
         errdefer book.deinit();
 
-        var file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        book.archive = try ZipArchive.open(allocator, path);
 
-        var buf: [4096]u8 = undefined;
-        var file_reader = file.reader(&buf);
-
-        var iter = std.zip.Iterator.init(&file_reader) catch return error.BadZip;
+        var iter = std.zip.Iterator.init(&book.archive.?.reader) catch return error.BadZip;
 
         // We need three categories of files from the archive:
         //   xl/sharedStrings.xml     — optional
@@ -505,11 +585,9 @@ pub const Book = struct {
         var workbook_xml: ?[]u8 = null;
         defer if (workbook_xml) |w| allocator.free(w);
 
-        // Track pending sheet paths we still have to extract (collected
-        // from the CDFH walk; resolved after we've parsed workbook.xml).
-        // We just extract every xl/worksheets/*.xml we see — cheaper
-        // than a second pass.
         var filename_buf: [512]u8 = undefined;
+        const archive = book.archive.?;
+        const file_reader = &archive.reader;
 
         while (iter.next() catch return error.BadZip) |entry| {
             if (entry.filename_len == 0 or entry.filename_len > filename_buf.len) continue;
@@ -519,24 +597,31 @@ pub const Book = struct {
             const filename = filename_buf[0..entry.filename_len];
             file_reader.interface.readSliceAll(filename) catch return error.BadZip;
 
+            const cached: ZipArchive.Entry = .{
+                .file_offset = entry.file_offset,
+                .uncompressed_size = entry.uncompressed_size,
+                .compression_method = entry.compression_method,
+            };
+
             if (std.mem.eql(u8, filename, "xl/sharedStrings.xml")) {
-                book.shared_strings_xml = try extractEntryToBuffer(allocator, entry, &file_reader);
+                book.shared_strings_xml = try extractEntryToBuffer(allocator, entry, file_reader);
             } else if (std.mem.eql(u8, filename, "xl/styles.xml")) {
-                book.styles_xml = try extractEntryToBuffer(allocator, entry, &file_reader);
+                book.styles_xml = try extractEntryToBuffer(allocator, entry, file_reader);
             } else if (std.mem.eql(u8, filename, "xl/theme/theme1.xml")) {
-                book.theme_xml = try extractEntryToBuffer(allocator, entry, &file_reader);
+                book.theme_xml = try extractEntryToBuffer(allocator, entry, file_reader);
             } else if (std.mem.startsWith(u8, filename, "xl/comments") and
                 std.mem.endsWith(u8, filename, ".xml"))
             {
                 const key = try allocator.dupe(u8, filename);
                 errdefer allocator.free(key);
                 try book.strings.append(allocator, key);
-                const data = try extractEntryToBuffer(allocator, entry, &file_reader);
+                try archive.comments_offsets.put(allocator, key, cached);
+                const data = try extractEntryToBuffer(allocator, entry, file_reader);
                 try book.comments_data.put(allocator, key, data);
             } else if (std.mem.eql(u8, filename, "xl/workbook.xml")) {
-                workbook_xml = try extractEntryToBuffer(allocator, entry, &file_reader);
+                workbook_xml = try extractEntryToBuffer(allocator, entry, file_reader);
             } else if (std.mem.eql(u8, filename, "xl/_rels/workbook.xml.rels")) {
-                rels_xml = try extractEntryToBuffer(allocator, entry, &file_reader);
+                rels_xml = try extractEntryToBuffer(allocator, entry, file_reader);
             } else if (std.mem.startsWith(u8, filename, "xl/worksheets/_rels/") and
                 std.mem.endsWith(u8, filename, ".xml.rels"))
             {
@@ -551,7 +636,7 @@ pub const Book = struct {
                 const sheet_key = try std.fmt.allocPrint(allocator, "xl/worksheets/{s}", .{bare});
                 errdefer allocator.free(sheet_key);
                 try book.strings.append(allocator, sheet_key);
-                const data = try extractEntryToBuffer(allocator, entry, &file_reader);
+                const data = try extractEntryToBuffer(allocator, entry, file_reader);
                 try book.sheet_rels_data.put(allocator, sheet_key, data);
             } else if (std.mem.startsWith(u8, filename, "xl/worksheets/") and
                 std.mem.endsWith(u8, filename, ".xml"))
@@ -561,8 +646,19 @@ pub const Book = struct {
                 const key = try allocator.dupe(u8, filename);
                 errdefer allocator.free(key);
                 try book.strings.append(allocator, key);
-                const data = try extractEntryToBuffer(allocator, entry, &file_reader);
+                try archive.sheet_offsets.put(allocator, key, cached);
+                const data = try extractEntryToBuffer(allocator, entry, file_reader);
                 try book.sheet_data.put(allocator, key, data);
+            } else if (std.mem.startsWith(u8, filename, "xl/drawings/vmlDrawing") and
+                std.mem.endsWith(u8, filename, ".vml"))
+            {
+                // VML offsets are cached for slice B's lazy comments
+                // path. Today we don't load vml drawings eagerly, so
+                // just stash the offset (key owned by book.strings).
+                const key = try allocator.dupe(u8, filename);
+                errdefer allocator.free(key);
+                try book.strings.append(allocator, key);
+                try archive.vml_offsets.put(allocator, key, cached);
             }
         }
 
@@ -571,24 +667,33 @@ pub const Book = struct {
 
         try parseWorkbookSheets(&book, wb, rels);
         if (book.shared_strings_xml) |sst| try parseSharedStrings(&book, sst);
+
+        try book.loadEagerParts();
+
+        return book;
+    }
+
+    /// Populate every derived table the current public surface
+    /// assumes. Split from `openLazy` so slice B can skip this step
+    /// on the streaming path. Slice A still calls it inline from
+    /// `openLazy` — net behaviour is unchanged.
+    pub fn loadEagerParts(self: *Book) !void {
         // Theme colors MUST parse before styles.xml so the style
         // parsers can resolve `<color theme="N"/>` references via
         // `book.theme_colors`.
-        if (book.theme_xml) |tx| try parseTheme(&book, tx);
-        if (book.styles_xml) |sx| try parseStyles(&book, sx);
+        if (self.theme_xml) |tx| try parseTheme(self, tx);
+        if (self.styles_xml) |sx| try parseStyles(self, sx);
 
         // Parse merged ranges + hyperlinks + data validations per
         // sheet. All three are cheap — most sheets have none of them,
         // and each parser bails on the first miss.
-        var sheet_it = book.sheet_data.iterator();
+        var sheet_it = self.sheet_data.iterator();
         while (sheet_it.next()) |entry| {
-            try parseMergedRangesForSheet(&book, entry.key_ptr.*, entry.value_ptr.*);
-            try parseHyperlinksForSheet(&book, entry.key_ptr.*, entry.value_ptr.*);
-            try parseDataValidationsForSheet(&book, entry.key_ptr.*, entry.value_ptr.*);
-            try parseCommentsForSheet(&book, entry.key_ptr.*);
+            try parseMergedRangesForSheet(self, entry.key_ptr.*, entry.value_ptr.*);
+            try parseHyperlinksForSheet(self, entry.key_ptr.*, entry.value_ptr.*);
+            try parseDataValidationsForSheet(self, entry.key_ptr.*, entry.value_ptr.*);
+            try parseCommentsForSheet(self, entry.key_ptr.*);
         }
-
-        return book;
     }
 
     /// Merged cell ranges declared in this sheet's `<mergeCells>`
@@ -752,6 +857,16 @@ pub const Book = struct {
         a.free(self.sheets);
         for (self.strings.items) |s| a.free(s);
         self.strings.deinit(a);
+
+        // archive teardown runs LAST: its offset maps key-borrow from
+        // `self.strings` (freed above) and its file handle is irrelevant
+        // to the part buffers, but closing it before those frees is
+        // harmless — we still do it last to document the intended order
+        // and to keep slice B's lazy-extraction path trivially correct
+        // (borrowed buffers must all be freed before the file closes).
+        if (self.archive) |arch| arch.deinit(a);
+        self.archive = null;
+
         self.* = undefined;
     }
 
