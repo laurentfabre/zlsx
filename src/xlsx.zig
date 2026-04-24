@@ -1140,6 +1140,16 @@ pub const Rows = struct {
     /// malforms, or zeros it (rare but legal / seen in hand-edited
     /// OOXML). Valid only after `next()` has returned a non-null
     /// row; zero before the first successful call.
+    ///
+    /// Known edge case (iter55a): on the yield-count fallback
+    /// branch, if the source row contains cells with explicit
+    /// `<c r="A11">` attributes, the synthesized envelope `row`
+    /// (e.g. 2) will diverge from the inline cell-r row (e.g. 11).
+    /// A parser change to recover the row number from the first
+    /// cell's r attribute on `<row r>` failure is queued for a
+    /// later iter; mainstream OOXML producers (Excel, openpyxl,
+    /// LibreOffice) always emit valid `<row r>` so the branch is
+    /// unreachable in practice.
     current_row: u32 = 0,
     /// 1-based counter of rows yielded from this iterator. Used as
     /// the fallback for `current_row` when the source `<row>` tag

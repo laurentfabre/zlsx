@@ -92,8 +92,10 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\
         \\  --sheet N         0-indexed sheet to read (default: 0)
         \\  --name NAME       select sheet by name (conflicts with --sheet)
-        \\  --format FMT      jsonl | legacy-jsonl | legacy-jsonl-dict | tsv | csv
-        \\                    (default: jsonl — NDJSON row envelope; iter55a)
+        \\  --format FMT      jsonl | legacy-jsonl | legacy-jsonl-dict | jsonl-dict | tsv | csv
+        \\                    (default: jsonl — NDJSON row envelope; iter55a.
+        \\                    `jsonl-dict` is a deprecated alias for
+        \\                    `legacy-jsonl-dict` — accepted this release.)
         \\  --list-sheets     print sheet names, one per line, and exit
         \\  -h, --help        show this help
         \\
