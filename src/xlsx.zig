@@ -1135,11 +1135,17 @@ pub const Rows = struct {
     /// per entity-bearing or rich-text cell per row.
     arena: std.heap.ArenaAllocator,
     /// 1-based OOXML row number of the most recently yielded row.
-    /// Prefers the `<row r="N">` attribute when present; falls back
-    /// to a 1-based counter of yielded rows when the source omits it
-    /// (rare but legal in OOXML). Valid only after `next()` has
-    /// returned a non-null row; zero before the first successful call.
+    /// Prefers the `<row r="N">` attribute when present and valid
+    /// (>= 1); falls back to `yield_count` when the source omits,
+    /// malforms, or zeros it (rare but legal / seen in hand-edited
+    /// OOXML). Valid only after `next()` has returned a non-null
+    /// row; zero before the first successful call.
     current_row: u32 = 0,
+    /// 1-based counter of rows yielded from this iterator. Used as
+    /// the fallback for `current_row` when the source `<row>` tag
+    /// has no usable `r` attribute, so envelope consumers see
+    /// 1..N-contiguous row numbers regardless of source sparsity.
+    yield_count: u32 = 0,
 
     pub fn deinit(self: *Rows) void {
         self.arena.deinit();
@@ -1211,10 +1217,20 @@ pub const Rows = struct {
                 attrs[0 .. attrs.len - 1]
             else
                 attrs;
+            // Fallback on missing / malformed / zero `r` is the
+            // 1-based yield counter (NOT `current_row + 1`), so row
+            // numbers remain deterministic for sparse or hand-edited
+            // OOXML where `r` is mixed or missing — the envelope
+            // consumer sees 1..N contiguous regardless of source
+            // gaps. `r="0"` is invalid per spec (rows are 1-based)
+            // and would produce `A0` refs if accepted — treated as
+            // malformed.
+            self.yield_count += 1;
             if (getAttr(attrs_trimmed, "r")) |r_str| {
-                self.current_row = std.fmt.parseInt(u32, r_str, 10) catch self.current_row + 1;
+                const parsed = std.fmt.parseInt(u32, r_str, 10) catch 0;
+                self.current_row = if (parsed > 0) parsed else self.yield_count;
             } else {
-                self.current_row += 1;
+                self.current_row = self.yield_count;
             }
             self.pos = row_start.after_open;
             // Consume cells until </row>.
@@ -4845,6 +4861,40 @@ test "fuzz Rows.next on synthetic cells with out-of-range SST indices" {
         // Consume the rows — may error, must not panic.
         while (rows.next() catch null) |_| {}
     }
+}
+
+test "Rows.currentRowNumber falls back to yield count on missing/zero/bad r attr" {
+    // Mixed <row> tags: r="10", r=missing, r="bad", r="0", r="20".
+    // Expected row numbers per yield: 10, 2, 3, 4, 20.
+    // The non-contiguous fallback (1-based yield) keeps row numbers
+    // stable for iter55a's envelope consumers even when source sheets
+    // are sparse / hand-edited / malformed.
+    const xml =
+        "<sheetData>" ++
+        "<row r=\"10\"><c r=\"A10\" t=\"inlineStr\"><is><t>a</t></is></c></row>" ++
+        "<row><c r=\"A11\" t=\"inlineStr\"><is><t>b</t></is></c></row>" ++
+        "<row r=\"bad\"><c r=\"A12\" t=\"inlineStr\"><is><t>c</t></is></c></row>" ++
+        "<row r=\"0\"><c r=\"A13\" t=\"inlineStr\"><is><t>d</t></is></c></row>" ++
+        "<row r=\"20\"><c r=\"A20\" t=\"inlineStr\"><is><t>e</t></is></c></row>" ++
+        "</sheetData>";
+
+    var rows: Rows = .{
+        .xml = xml,
+        .pos = 0,
+        .shared_strings = &.{},
+        .allocator = std.testing.allocator,
+        .row_cells = .{},
+        .row_styles = .{},
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer rows.deinit();
+
+    const expected = [_]u32{ 10, 2, 3, 4, 20 };
+    for (expected) |want| {
+        _ = (try rows.next()) orelse return error.UnexpectedEndOfRows;
+        try std.testing.expectEqual(want, rows.currentRowNumber());
+    }
+    try std.testing.expectEqual(@as(?[]const Cell, null), try rows.next());
 }
 
 // ─── iter54 slice B: lazy sheet / comments extraction ───────────────

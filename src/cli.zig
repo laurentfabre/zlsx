@@ -92,15 +92,22 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\
         \\  --sheet N         0-indexed sheet to read (default: 0)
         \\  --name NAME       select sheet by name (conflicts with --sheet)
-        \\  --format FMT      jsonl | jsonl-dict | tsv | csv  (default: jsonl)
+        \\  --format FMT      jsonl | legacy-jsonl | legacy-jsonl-dict | tsv | csv
+        \\                    (default: jsonl — NDJSON row envelope; iter55a)
         \\  --list-sheets     print sheet names, one per line, and exit
         \\  -h, --help        show this help
         \\
         \\Formats
-        \\  jsonl        one JSON array per row:  [1, "foo", null, true]
-        \\  jsonl-dict   one JSON object per row: {"A": 1, "B": "foo"}
-        \\  tsv          tab-separated, \N for empty cells, control chars escaped
-        \\  csv          RFC 4180, empty string for empty cells
+        \\  jsonl              NDJSON row envelope (default, iter55a):
+        \\                     {"kind":"row","sheet":"S","sheet_idx":0,"row":1,
+        \\                      "cells":[{"ref":"A1","col":1,"t":"str","v":"x"},…]}
+        \\                     t ∈ {"str","int","num","bool"}; empty cells skipped.
+        \\  legacy-jsonl       pre-iter55a bare arrays:  [1, "foo", null, true]
+        \\  legacy-jsonl-dict  pre-iter55a bare objects: {"A": 1, "B": "foo"}
+        \\                     (alias `jsonl-dict` accepted this release for back-
+        \\                     compat; will warn in a future release)
+        \\  tsv                tab-separated, \N for empty cells, control chars escaped
+        \\  csv                RFC 4180, empty string for empty cells
         \\
         \\Exit codes
         \\  0  success
