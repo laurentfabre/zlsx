@@ -19,14 +19,27 @@ const Format = enum {
     csv,
 };
 
-/// iter56/57: first positional decides sub-command. `rows` is the
+/// iter56/57/58: first positional decides sub-command. `rows` is the
 /// legacy envelope-row emitter; `cells` is the per-cell NDJSON stream;
 /// `meta` emits a workbook record followed by per-sheet records;
-/// `list_sheets` is the lighter NDJSON variant. Bare
-/// `zlsx file.xlsx` (no sub-command token) still means `rows` so
-/// existing scripts keep working — the short-alias re-point to `cells`
-/// is an iter60+ breaking change with its own rollout.
-const Subcommand = enum { rows, cells, meta, list_sheets };
+/// `list_sheets` is the lighter NDJSON variant. iter58 adds the
+/// five-way reader-surface exposure: `comments` / `validations` /
+/// `hyperlinks` iterate every sheet (sheet-scoped records); `styles`
+/// / `sst` are workbook-wide. Bare `zlsx file.xlsx` (no sub-command
+/// token) still means `rows` so existing scripts keep working — the
+/// short-alias re-point to `cells` is an iter60+ breaking change with
+/// its own rollout.
+const Subcommand = enum {
+    rows,
+    cells,
+    meta,
+    list_sheets,
+    comments,
+    validations,
+    hyperlinks,
+    styles,
+    sst,
+};
 
 const Args = struct {
     subcommand: Subcommand = .rows,
@@ -73,6 +86,11 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
         if (std.mem.eql(u8, a, "rows")) return .rows;
         if (std.mem.eql(u8, a, "meta")) return .meta;
         if (std.mem.eql(u8, a, "list-sheets")) return .list_sheets;
+        if (std.mem.eql(u8, a, "comments")) return .comments;
+        if (std.mem.eql(u8, a, "validations")) return .validations;
+        if (std.mem.eql(u8, a, "hyperlinks")) return .hyperlinks;
+        if (std.mem.eql(u8, a, "styles")) return .styles;
+        if (std.mem.eql(u8, a, "sst")) return .sst;
         return .rows; // first positional is the file path
     }
     return .rows;
@@ -85,8 +103,21 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     // not hit a hard error. Parse them tolerantly: missing-value is
     // still an error (user typo), but a malformed value is silently
     // dropped. Non-workbook commands keep strict validation.
+    //
+    // iter58: the three sheet-scoped newcomers (`comments` /
+    // `validations` / `hyperlinks`) iterate every sheet by default,
+    // so they join this group for flag tolerance even though their
+    // records do carry `sheet` / `sheet_idx`. Narrowing via `--sheet`
+    // is deferred to iter58-follow-up.
     const workbook_scoped = switch (detected_sub) {
-        .meta, .list_sheets => true,
+        .meta,
+        .list_sheets,
+        .comments,
+        .validations,
+        .hyperlinks,
+        .styles,
+        .sst,
+        => true,
         .rows, .cells => false,
     };
 
@@ -148,7 +179,12 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
                 if (std.mem.eql(u8, a, "cells") or
                     std.mem.eql(u8, a, "rows") or
                     std.mem.eql(u8, a, "meta") or
-                    std.mem.eql(u8, a, "list-sheets"))
+                    std.mem.eql(u8, a, "list-sheets") or
+                    std.mem.eql(u8, a, "comments") or
+                    std.mem.eql(u8, a, "validations") or
+                    std.mem.eql(u8, a, "hyperlinks") or
+                    std.mem.eql(u8, a, "styles") or
+                    std.mem.eql(u8, a, "sst"))
                 {
                     continue;
                 }
@@ -197,6 +233,29 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                     one {"kind":"sheet","sheet":…,"sheet_idx":…}
         \\                     record per sheet. For the plain-text one-name-
         \\                     per-line shape, use the legacy `--list-sheets` flag.
+        \\  comments           one NDJSON record per cell comment across every
+        \\                     sheet (iter58):
+        \\                     {"kind":"comment","sheet":"S","sheet_idx":0,
+        \\                      "ref":"A1","row":1,"col":1,"author":"Alice",
+        \\                      "text":"…","runs":null}
+        \\  validations        one NDJSON record per data-validation range
+        \\                     across every sheet (iter58):
+        \\                     {"kind":"validation","sheet":"S","sheet_idx":0,
+        \\                      "range":"B2:B100","rule_type":"list","op":null,
+        \\                      "formula1":"a,b","formula2":null,
+        \\                      "values":["a","b"]}
+        \\  hyperlinks         one NDJSON record per hyperlink across every
+        \\                     sheet (iter58):
+        \\                     {"kind":"hyperlink","sheet":"S","sheet_idx":0,
+        \\                      "range":"A1","url":"https://…","location":null}
+        \\  styles             one NDJSON record per cell-XF style entry
+        \\                     (workbook-wide, iter58):
+        \\                     {"kind":"style","idx":0,"font":{…}|null,
+        \\                      "fill":{…}|null,"border":{…}|null,
+        \\                      "num_fmt":"General"|null}
+        \\  sst                one NDJSON record per shared-string entry
+        \\                     (workbook-wide, iter58):
+        \\                     {"kind":"sst","idx":0,"text":"…","runs":null}
         \\
         \\Formats (rows only)
         \\  jsonl              NDJSON row envelope (default, iter55a):
@@ -517,7 +576,9 @@ pub fn main() !u8 {
         return 0;
     }
 
-    // iter57 sub-commands — workbook-scoped, no per-sheet selection.
+    // iter57/58 sub-commands — no per-sheet selection. meta /
+    // list-sheets / styles / sst are workbook-wide; comments /
+    // validations / hyperlinks iterate every sheet internally.
     switch (args.subcommand) {
         .meta => {
             // Unix argv is raw bytes; only emit `path` as JSON when
@@ -538,6 +599,26 @@ pub fn main() !u8 {
         },
         .list_sheets => {
             try runListSheetsCommand(out, &book);
+            return 0;
+        },
+        .comments => {
+            try runCommentsCommand(out, &book);
+            return 0;
+        },
+        .validations => {
+            try runValidationsCommand(out, &book);
+            return 0;
+        },
+        .hyperlinks => {
+            try runHyperlinksCommand(out, &book);
+            return 0;
+        },
+        .styles => {
+            try runStylesCommand(out, &book);
+            return 0;
+        },
+        .sst => {
+            try runSstCommand(out, &book);
             return 0;
         },
         .rows, .cells => {},
@@ -570,7 +651,14 @@ pub fn main() !u8 {
         .rows => try runRowsCommand(out, &book, selected.sheet, selected.idx, args.format, alloc),
         .cells => try runCellsCommand(out, &book, selected.sheet, selected.idx, alloc),
         // Handled by the workbook-scoped early return above.
-        .meta, .list_sheets => unreachable,
+        .meta,
+        .list_sheets,
+        .comments,
+        .validations,
+        .hyperlinks,
+        .styles,
+        .sst,
+        => unreachable,
     }
     return 0;
 }
@@ -690,6 +778,262 @@ fn runListSheetsCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
         try out.writeAll("{\"kind\":\"sheet\",\"sheet\":");
         try writeJsonString(out, s.name);
         try out.print(",\"sheet_idx\":{d}}}\n", .{i});
+    }
+}
+
+// ─── iter58: reader-surface sub-commands ─────────────────────────────
+
+/// Emit an `"A1"`-style ref into `buf` from a reader-shape CellRef
+/// (`col` is 0-based — A→0, B→1 — and `row` is 1-based, matching
+/// `xlsx.parseA1Ref`). Panics if the generated ref exceeds 16 bytes —
+/// OOXML's max column XFD (=16 383) plus max row 1 048 576 fits in
+/// 10 bytes, so the budget has a lot of slack. Callers must not hold
+/// the returned slice past the buffer's lifetime.
+fn refFromCellRef(buf: *[16]u8, ref: xlsx.CellRef) []const u8 {
+    std.debug.assert(ref.row >= 1);
+    var letters_buf: [8]u8 = undefined;
+    const letters = colLetter(&letters_buf, ref.col);
+    return std.fmt.bufPrint(buf, "{s}{d}", .{ letters, ref.row }) catch unreachable;
+}
+
+/// Emit `{"text":…,"bold":…,…}` fields for a single RichRun. Caller
+/// wraps in the surrounding `[` / `]`. `bold`, `italic`, `color`,
+/// `size`, `font_name` are each emitted only when set (matches the
+/// design-doc "emitted only when true/non-null" shorthand).
+fn writeRichRun(w: *std.Io.Writer, run: xlsx.RichRun) !void {
+    try w.writeAll("{\"text\":");
+    try writeJsonString(w, run.text);
+    if (run.bold) try w.writeAll(",\"bold\":true");
+    if (run.italic) try w.writeAll(",\"italic\":true");
+    if (run.color_argb) |c| try w.print(",\"color\":\"{X:0>8}\"", .{c});
+    if (run.size) |s| {
+        if (std.math.isFinite(s)) try w.print(",\"size\":{d}", .{s});
+    }
+    if (run.font_name.len != 0) {
+        try w.writeAll(",\"font_name\":");
+        try writeJsonString(w, run.font_name);
+    }
+    try w.writeByte('}');
+}
+
+/// Emit `null` for plain strings, otherwise `[<run>,…]`. Shared by
+/// `comments` and `sst` which use the same runs wire-shape.
+fn writeRichRunsOrNull(w: *std.Io.Writer, runs: ?[]const xlsx.RichRun) !void {
+    const rs = runs orelse {
+        try w.writeAll("null");
+        return;
+    };
+    try w.writeByte('[');
+    for (rs, 0..) |r, i| {
+        if (i != 0) try w.writeByte(',');
+        try writeRichRun(w, r);
+    }
+    try w.writeByte(']');
+}
+
+/// Map the reader's DataValidationKind to the OOXML wire-form string
+/// the design doc pins in the `rule_type` field. `.unknown` surfaces
+/// as the literal `"unknown"` so consumers can still filter.
+fn validationKindName(kind: xlsx.DataValidationKind) []const u8 {
+    return switch (kind) {
+        .list => "list",
+        .whole => "whole",
+        .decimal => "decimal",
+        .date => "date",
+        .time => "time",
+        .text_length => "textLength",
+        .custom => "custom",
+        .unknown => "unknown",
+    };
+}
+
+/// Map DataValidationOperator to its OOXML camelCase token.
+fn validationOpName(op: xlsx.DataValidationOperator) []const u8 {
+    return switch (op) {
+        .between => "between",
+        .not_between => "notBetween",
+        .equal => "equal",
+        .not_equal => "notEqual",
+        .less_than => "lessThan",
+        .less_than_or_equal => "lessThanOrEqual",
+        .greater_than => "greaterThan",
+        .greater_than_or_equal => "greaterThanOrEqual",
+    };
+}
+
+/// Emit `"A1"` for a single-cell range or `"A1:B2"` for a rectangle
+/// into the caller-provided 32-byte buffer. Uses `refFromColRow`
+/// under the hood so both endpoints get identical formatting.
+fn rangeFromBounds(buf: *[32]u8, top_left: xlsx.CellRef, bottom_right: xlsx.CellRef) []const u8 {
+    var tl_buf: [16]u8 = undefined;
+    const tl = refFromCellRef(&tl_buf, top_left);
+    if (top_left.col == bottom_right.col and top_left.row == bottom_right.row) {
+        return std.fmt.bufPrint(buf, "{s}", .{tl}) catch unreachable;
+    }
+    var br_buf: [16]u8 = undefined;
+    const br = refFromCellRef(&br_buf, bottom_right);
+    return std.fmt.bufPrint(buf, "{s}:{s}", .{ tl, br }) catch unreachable;
+}
+
+/// Emit one NDJSON record per comment across every sheet.
+fn runCommentsCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
+    for (book.sheets, 0..) |s, sheet_idx| {
+        for (book.comments(s)) |c| {
+            var ref_buf: [16]u8 = undefined;
+            const ref = refFromCellRef(&ref_buf, c.top_left);
+
+            try out.writeAll("{\"kind\":\"comment\",\"sheet\":");
+            try writeJsonString(out, s.name);
+            try out.print(",\"sheet_idx\":{d},\"ref\":", .{sheet_idx});
+            try writeJsonString(out, ref);
+            // Reader `col` is 0-based (A=0); wire format is 1-based
+            // (A=1) for consistency with `cells` / `rows` envelopes.
+            try out.print(
+                ",\"row\":{d},\"col\":{d},\"author\":",
+                .{ c.top_left.row, c.top_left.col + 1 },
+            );
+            try writeJsonString(out, c.author);
+            try out.writeAll(",\"text\":");
+            try writeJsonString(out, c.text);
+            try out.writeAll(",\"runs\":");
+            try writeRichRunsOrNull(out, c.runs);
+            try out.writeAll("}\n");
+        }
+    }
+}
+
+/// Emit one NDJSON record per data-validation range across every sheet.
+fn runValidationsCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
+    for (book.sheets, 0..) |s, sheet_idx| {
+        for (book.dataValidations(s)) |dv| {
+            var range_buf: [32]u8 = undefined;
+            const range = rangeFromBounds(&range_buf, dv.top_left, dv.bottom_right);
+
+            try out.writeAll("{\"kind\":\"validation\",\"sheet\":");
+            try writeJsonString(out, s.name);
+            try out.print(",\"sheet_idx\":{d},\"range\":", .{sheet_idx});
+            try writeJsonString(out, range);
+            try out.print(",\"rule_type\":\"{s}\",\"op\":", .{validationKindName(dv.kind)});
+            if (dv.op) |op| try out.print("\"{s}\"", .{validationOpName(op)}) else try out.writeAll("null");
+
+            try out.writeAll(",\"formula1\":");
+            try writeJsonString(out, dv.formula1);
+            try out.writeAll(",\"formula2\":");
+            if (dv.formula2.len != 0) try writeJsonString(out, dv.formula2) else try out.writeAll("null");
+
+            try out.writeAll(",\"values\":");
+            if (dv.kind == .list and dv.values.len != 0) {
+                try out.writeByte('[');
+                for (dv.values, 0..) |v, i| {
+                    if (i != 0) try out.writeByte(',');
+                    try writeJsonString(out, v);
+                }
+                try out.writeByte(']');
+            } else {
+                try out.writeAll("null");
+            }
+            try out.writeAll("}\n");
+        }
+    }
+}
+
+/// Emit one NDJSON record per hyperlink across every sheet.
+fn runHyperlinksCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
+    for (book.sheets, 0..) |s, sheet_idx| {
+        for (book.hyperlinks(s)) |h| {
+            var range_buf: [32]u8 = undefined;
+            const range = rangeFromBounds(&range_buf, h.top_left, h.bottom_right);
+
+            try out.writeAll("{\"kind\":\"hyperlink\",\"sheet\":");
+            try writeJsonString(out, s.name);
+            try out.print(",\"sheet_idx\":{d},\"range\":", .{sheet_idx});
+            try writeJsonString(out, range);
+            try out.writeAll(",\"url\":");
+            if (h.url.len != 0) try writeJsonString(out, h.url) else try out.writeAll("null");
+            try out.writeAll(",\"location\":");
+            if (h.location.len != 0) try writeJsonString(out, h.location) else try out.writeAll("null");
+            try out.writeAll("}\n");
+        }
+    }
+}
+
+/// Emit `{…}` for a BorderSide or `null` when the side has no style.
+fn writeBorderSideOrNull(w: *std.Io.Writer, side: xlsx.BorderSide) !void {
+    if (side.style.len == 0) {
+        try w.writeAll("null");
+        return;
+    }
+    try w.writeAll("{\"style\":");
+    try writeJsonString(w, side.style);
+    try w.writeAll(",\"color\":");
+    if (side.color_argb) |c| try w.print("\"{X:0>8}\"", .{c}) else try w.writeAll("null");
+    try w.writeByte('}');
+}
+
+/// Emit one NDJSON record per cell-XF style entry. Workbook-scoped.
+/// Every nested block (`font` / `fill` / `border`) is either the
+/// resolved struct or JSON `null` when the getter returns null.
+fn runStylesCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
+    for (book.cell_xf_numfmt_ids, 0..) |_, i| {
+        const idx: u32 = @intCast(i);
+
+        try out.print("{{\"kind\":\"style\",\"idx\":{d},\"font\":", .{idx});
+        if (book.cellFont(idx)) |f| {
+            try out.writeAll("{\"bold\":");
+            try out.writeAll(if (f.bold) "true" else "false");
+            try out.writeAll(",\"italic\":");
+            try out.writeAll(if (f.italic) "true" else "false");
+            try out.writeAll(",\"color\":");
+            if (f.color_argb) |c| try out.print("\"{X:0>8}\"", .{c}) else try out.writeAll("null");
+            try out.writeAll(",\"size\":");
+            if (f.size) |s| {
+                if (std.math.isFinite(s)) try out.print("{d}", .{s}) else try out.writeAll("null");
+            } else try out.writeAll("null");
+            try out.writeAll(",\"name\":");
+            if (f.name.len != 0) try writeJsonString(out, f.name) else try out.writeAll("null");
+            try out.writeByte('}');
+        } else try out.writeAll("null");
+
+        try out.writeAll(",\"fill\":");
+        if (book.cellFill(idx)) |fl| {
+            try out.writeAll("{\"pattern\":");
+            try writeJsonString(out, fl.pattern);
+            try out.writeAll(",\"fg\":");
+            if (fl.fg_color_argb) |c| try out.print("\"{X:0>8}\"", .{c}) else try out.writeAll("null");
+            try out.writeAll(",\"bg\":");
+            if (fl.bg_color_argb) |c| try out.print("\"{X:0>8}\"", .{c}) else try out.writeAll("null");
+            try out.writeByte('}');
+        } else try out.writeAll("null");
+
+        try out.writeAll(",\"border\":");
+        if (book.cellBorder(idx)) |b| {
+            try out.writeAll("{\"left\":");
+            try writeBorderSideOrNull(out, b.left);
+            try out.writeAll(",\"right\":");
+            try writeBorderSideOrNull(out, b.right);
+            try out.writeAll(",\"top\":");
+            try writeBorderSideOrNull(out, b.top);
+            try out.writeAll(",\"bottom\":");
+            try writeBorderSideOrNull(out, b.bottom);
+            try out.writeAll(",\"diagonal\":");
+            try writeBorderSideOrNull(out, b.diagonal);
+            try out.writeByte('}');
+        } else try out.writeAll("null");
+
+        try out.writeAll(",\"num_fmt\":");
+        if (book.numberFormat(idx)) |nf| try writeJsonString(out, nf) else try out.writeAll("null");
+        try out.writeAll("}\n");
+    }
+}
+
+/// Emit one NDJSON record per shared-string entry.
+fn runSstCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
+    for (book.shared_strings, 0..) |s, i| {
+        try out.print("{{\"kind\":\"sst\",\"idx\":{d},\"text\":", .{i});
+        try writeJsonString(out, s);
+        try out.writeAll(",\"runs\":");
+        try writeRichRunsOrNull(out, book.richRuns(i));
+        try out.writeAll("}\n");
     }
 }
 
@@ -1195,6 +1539,195 @@ test "legacy --list-sheets flag still emits plain text (regression guard)" {
         try w.writeByte('\n');
     }
     try std.testing.expectEqualStrings("Data\nMore\n", w.buffered());
+}
+
+// ─── iter58 tests ────────────────────────────────────────────────────
+
+test "parseArgs routes iter58 sub-commands correctly" {
+    const names = [_][]const u8{ "comments", "validations", "hyperlinks", "styles", "sst" };
+    const expected = [_]Subcommand{ .comments, .validations, .hyperlinks, .styles, .sst };
+    for (names, expected) |n, want| {
+        const argv = [_][]const u8{ n, "file.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(want, a.subcommand);
+        try std.testing.expectEqualStrings("file.xlsx", a.file);
+    }
+    // iter58 sub-commands all join the flag-tolerance group — a bogus
+    // --sheet / --format must not error out.
+    {
+        const argv = [_][]const u8{ "comments", "f.xlsx", "--sheet", "bogus" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.comments, a.subcommand);
+    }
+    {
+        const argv = [_][]const u8{ "styles", "f.xlsx", "--format", "bogus" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.styles, a.subcommand);
+    }
+}
+
+test "runCommentsCommand emits one record per comment across every sheet" {
+    const tmp_path = "/tmp/zlsx_cli_comments_iter58.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{.{ .string = "hdr" }});
+        try s0.addComment("A1", "Alice", "needs review");
+        var s1 = try w.addSheet("Other");
+        try s1.writeRow(&.{.{ .integer = 1 }});
+        try s1.addComment("B2", "Bob", "hi");
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runCommentsCommand(&w, &book);
+
+    const out = w.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, out, "{\"kind\":\"comment\""));
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet\":\"Data\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"A1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"row\":1,\"col\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"author\":\"Alice\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"text\":\"needs review\"") != null);
+    // The writer's comment body wraps text in `<r><t>` (even for
+    // plain bodies), so the reader populates `runs` as a one-entry
+    // array of `{text:"…"}`. `runs:null` would require an `<r>`-less
+    // body, which the writer doesn't emit today — exercise the
+    // populated-runs path instead.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"runs\":[{\"text\":\"needs review\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet\":\"Other\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"B2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"row\":2,\"col\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"author\":\"Bob\"") != null);
+}
+
+test "runValidationsCommand emits list validation with values array" {
+    const tmp_path = "/tmp/zlsx_cli_validations_iter58.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{.{ .string = "fruit" }});
+        try s0.addDataValidationList("B2:B100", &.{ "apple", "banana" });
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runValidationsCommand(&w, &book);
+
+    const out = w.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, out, "{\"kind\":\"validation\""));
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet\":\"Data\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"range\":\"B2:B100\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"rule_type\":\"list\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"op\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"formula2\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"values\":[\"apple\",\"banana\"]") != null);
+}
+
+test "runHyperlinksCommand emits url set + location null for external links" {
+    const tmp_path = "/tmp/zlsx_cli_hyperlinks_iter58.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{.{ .string = "site" }});
+        try s0.addHyperlink("A2", "https://example.com/");
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runHyperlinksCommand(&w, &book);
+
+    const out = w.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, out, "{\"kind\":\"hyperlink\""));
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet\":\"Data\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"range\":\"A2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"url\":\"https://example.com/\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"location\":null") != null);
+}
+
+test "runStylesCommand emits one record per cell-XF entry" {
+    const tmp_path = "/tmp/zlsx_cli_styles_iter58.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        _ = try w.addStyle(.{ .font_bold = true });
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{.{ .string = "hdr" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runStylesCommand(&w, &book);
+
+    const out = w.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, out, "{\"kind\":\"style\""));
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"idx\":0") != null);
+    // The bold style registered at addStyle idx=1 (idx 0 is the default
+    // no-style xf slot); the record MUST surface with bold:true.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"idx\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"bold\":true") != null);
+    // Each record also pins font / fill / border / num_fmt fields.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"font\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"fill\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"border\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"num_fmt\":") != null);
+}
+
+test "runSstCommand emits one record per shared-string entry" {
+    const tmp_path = "/tmp/zlsx_cli_sst_iter58.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{ .{ .string = "header" }, .{ .string = "qty" } });
+        try s0.writeRow(&.{ .{ .string = "apple" }, .{ .integer = 3 } });
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runSstCommand(&w, &book);
+
+    const out = w.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, out, "{\"kind\":\"sst\""));
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"idx\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"text\":\"header\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"text\":\"qty\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"text\":\"apple\"") != null);
+    // Plain strings — runs must be null on every record.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"runs\":null") != null);
 }
 
 // ─── Fuzz tests ──────────────────────────────────────────────────────
