@@ -19,7 +19,15 @@ const Format = enum {
     csv,
 };
 
+/// iter56: first positional decides sub-command. `rows` is the legacy
+/// envelope-row emitter; `cells` is the new per-cell NDJSON stream.
+/// Bare `zlsx file.xlsx` (no sub-command token) still means `rows` so
+/// existing scripts keep working — the short-alias re-point to `cells`
+/// is an iter60+ breaking change with its own rollout.
+const Subcommand = enum { rows, cells };
+
 const Args = struct {
+    subcommand: Subcommand = .rows,
     file: []const u8,
     sheet_index: ?usize = null,
     sheet_name: ?[]const u8 = null,
@@ -44,6 +52,11 @@ const ArgError = error{
 
 fn parseArgs(argv: []const []const u8) ArgError!Args {
     var out: Args = .{ .file = "" };
+    // First positional may be a sub-command token. We only consume it
+    // as a sub-command when it matches exactly; anything else (including
+    // a filename that happens to be our first positional) falls through
+    // to the file-path slot and defaults the sub-command to `rows`.
+    var first_positional_seen = false;
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
@@ -86,6 +99,18 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
         } else if (a.len > 0 and a[0] == '-') {
             return ArgError.UnknownFlag;
         } else {
+            if (!first_positional_seen) {
+                first_positional_seen = true;
+                if (std.mem.eql(u8, a, "cells")) {
+                    out.subcommand = .cells;
+                    continue;
+                } else if (std.mem.eql(u8, a, "rows")) {
+                    out.subcommand = .rows;
+                    continue;
+                }
+                // Fall through: first positional is the file path,
+                // sub-command stays at its default (`rows`).
+            }
             if (out.file.len == 0) out.file = a else return ArgError.UnknownFlag;
         }
     }
@@ -95,18 +120,29 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
 
 fn writeUsage(w: *std.Io.Writer) !void {
     try w.writeAll(
-        \\usage: zlsx <file.xlsx> [options]
+        \\usage: zlsx [<subcommand>] <file.xlsx> [options]
         \\
         \\  --sheet N         0-indexed sheet to read (default: 0)
         \\  --name NAME       select sheet by name (conflicts with --sheet)
         \\  --format FMT      jsonl | legacy-jsonl | legacy-jsonl-dict | jsonl-dict | tsv | csv
         \\                    (default: jsonl — NDJSON row envelope; iter55a.
+        \\                    Applies to the `rows` sub-command only; ignored
+        \\                    by `cells`, which always emits per-cell NDJSON.
         \\                    `jsonl-dict` is a deprecated alias for
         \\                    `legacy-jsonl-dict` — accepted this release.)
         \\  --list-sheets     print sheet names, one per line, and exit
         \\  -h, --help        show this help
         \\
-        \\Formats
+        \\Sub-commands
+        \\  rows               (default) one NDJSON envelope per row — see Formats.
+        \\                     Bare `zlsx file.xlsx` is an alias for `zlsx rows file.xlsx`.
+        \\  cells              one NDJSON record per non-empty cell (iter56):
+        \\                     {"kind":"cell","sheet":"S","sheet_idx":0,"ref":"A1",
+        \\                      "row":1,"col":1,"t":"str","v":"x"}
+        \\                     t ∈ {"str","int","num","bool"}. Empty cells skipped.
+        \\                     --format is ignored; output shape is fixed.
+        \\
+        \\Formats (rows only)
         \\  jsonl              NDJSON row envelope (default, iter55a):
         \\                     {"kind":"row","sheet":"S","sheet_idx":0,"row":1,
         \\                      "cells":[{"ref":"A1","col":1,"t":"str","v":"x"},…]}
@@ -258,6 +294,35 @@ fn writeRowEnvelope(
     try writeJsonString(w, sheet_name);
     try w.print(",\"sheet_idx\":{d},\"row\":{d},\"cells\":", .{ sheet_idx, row_number });
     try writeEnvelopeCells(w, cells, row_number);
+    try w.writeAll("}\n");
+}
+
+/// iter56: emit one NDJSON record for a single cell, matching the
+/// `cells` sub-command wire format:
+/// `{"kind":"cell","sheet":…,"sheet_idx":…,"ref":…,"row":…,"col":…,"t":…,"v":…}\n`.
+/// Empty cells are a caller-skip: this function asserts out if handed
+/// one (matches envelope semantics — sparse cells are suppressed at
+/// the record level, not materialised as `v:null`).
+fn writeCell(
+    w: *std.Io.Writer,
+    sheet_name: []const u8,
+    sheet_idx: usize,
+    ref: []const u8,
+    row: u32,
+    col: u32,
+    cell: xlsx.Cell,
+) !void {
+    std.debug.assert(cell != .empty); // caller must skip empties
+    try w.writeAll("{\"kind\":\"cell\",\"sheet\":");
+    try writeJsonString(w, sheet_name);
+    try w.print(",\"sheet_idx\":{d},\"ref\":", .{sheet_idx});
+    try writeJsonString(w, ref);
+    try w.print(",\"row\":{d},\"col\":{d},\"t\":\"{s}\",\"v\":", .{
+        row,
+        col,
+        envelopeTypeTag(cell),
+    });
+    try writeJsonCell(w, cell);
     try w.writeAll("}\n");
 }
 
@@ -419,16 +484,67 @@ pub fn main() !u8 {
         break :blk .{ .sheet = book.sheets[idx], .idx = idx };
     };
 
-    var rows = try book.rows(selected.sheet, alloc);
+    switch (args.subcommand) {
+        .rows => try runRowsCommand(out, &book, selected.sheet, selected.idx, args.format, alloc),
+        .cells => try runCellsCommand(out, &book, selected.sheet, selected.idx, alloc),
+    }
+    return 0;
+}
+
+fn runRowsCommand(
+    out: *std.Io.Writer,
+    book: *xlsx.Book,
+    sheet: xlsx.Sheet,
+    sheet_idx: usize,
+    format: Format,
+    alloc: std.mem.Allocator,
+) !void {
+    var rows = try book.rows(sheet, alloc);
     defer rows.deinit();
 
     while (try rows.next()) |cells| {
-        switch (args.format) {
-            .jsonl => try writeRowEnvelope(out, selected.sheet.name, selected.idx, rows.currentRowNumber(), cells),
-            else => try writeRow(out, cells, args.format),
+        switch (format) {
+            .jsonl => try writeRowEnvelope(out, sheet.name, sheet_idx, rows.currentRowNumber(), cells),
+            else => try writeRow(out, cells, format),
         }
     }
-    return 0;
+}
+
+/// iter56: stream one NDJSON record per non-empty cell of the selected
+/// sheet. Empty cells are suppressed (matches envelope semantics on
+/// the rows path). `--format` is intentionally ignored here — the
+/// `cells` sub-command has a single fixed wire shape.
+fn runCellsCommand(
+    out: *std.Io.Writer,
+    book: *xlsx.Book,
+    sheet: xlsx.Sheet,
+    sheet_idx: usize,
+    alloc: std.mem.Allocator,
+) !void {
+    var rows = try book.rows(sheet, alloc);
+    defer rows.deinit();
+
+    while (try rows.next()) |cells| {
+        const row_number = rows.currentRowNumber();
+        for (cells, 0..) |c, i| {
+            if (c == .empty) continue;
+
+            var col_buf: [8]u8 = undefined;
+            const letters = colLetter(&col_buf, i);
+            var ref_buf: [16]u8 = undefined;
+            const ref = std.fmt.bufPrint(&ref_buf, "{s}{d}", .{ letters, row_number }) catch unreachable;
+
+            try writeCell(
+                out,
+                sheet.name,
+                sheet_idx,
+                ref,
+                row_number,
+                @intCast(i + 1),
+                c,
+            );
+        }
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
@@ -578,6 +694,128 @@ test "writeRowEnvelope non-finite number becomes null v" {
         "{\"kind\":\"row\",\"sheet\":\"S\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
             "{\"ref\":\"A1\",\"col\":1,\"t\":\"num\",\"v\":null}" ++
             "]}\n",
+        w.buffered(),
+    );
+}
+
+test "parseArgs routes 'cells' as the cells sub-command" {
+    // Bare file-path defaults to rows (back-compat).
+    {
+        const argv = [_][]const u8{"file.xlsx"};
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.rows, a.subcommand);
+        try std.testing.expectEqualStrings("file.xlsx", a.file);
+    }
+    // Explicit `rows` is parsed as rows, file-path is the next positional.
+    {
+        const argv = [_][]const u8{ "rows", "file.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.rows, a.subcommand);
+        try std.testing.expectEqualStrings("file.xlsx", a.file);
+    }
+    // `cells` flips the sub-command.
+    {
+        const argv = [_][]const u8{ "cells", "file.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.cells, a.subcommand);
+        try std.testing.expectEqualStrings("file.xlsx", a.file);
+    }
+    // `cells` with flags behind it.
+    {
+        const argv = [_][]const u8{ "cells", "file.xlsx", "--sheet", "2" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.cells, a.subcommand);
+        try std.testing.expectEqualStrings("file.xlsx", a.file);
+        try std.testing.expectEqual(@as(?usize, 2), a.sheet_index);
+    }
+    // Flags before the sub-command still work — first POSITIONAL is
+    // what decides, not the first argv slot.
+    {
+        const argv = [_][]const u8{ "--sheet", "1", "cells", "file.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.cells, a.subcommand);
+        try std.testing.expectEqualStrings("file.xlsx", a.file);
+    }
+}
+
+test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
+    var scratch: [512]u8 = undefined;
+
+    // string
+    {
+        var w = std.Io.Writer.fixed(&scratch);
+        try writeCell(&w, "Data", 0, "A1", 1, 1, .{ .string = "name" });
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"A1\",\"row\":1,\"col\":1,\"t\":\"str\",\"v\":\"name\"}\n",
+            w.buffered(),
+        );
+    }
+    // integer
+    {
+        var w = std.Io.Writer.fixed(&scratch);
+        try writeCell(&w, "Data", 0, "B2", 2, 2, .{ .integer = 3 });
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"B2\",\"row\":2,\"col\":2,\"t\":\"int\",\"v\":3}\n",
+            w.buffered(),
+        );
+    }
+    // number
+    {
+        var w = std.Io.Writer.fixed(&scratch);
+        try writeCell(&w, "Data", 0, "C3", 3, 3, .{ .number = 3.5 });
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"C3\",\"row\":3,\"col\":3,\"t\":\"num\",\"v\":3.5}\n",
+            w.buffered(),
+        );
+    }
+    // boolean
+    {
+        var w = std.Io.Writer.fixed(&scratch);
+        try writeCell(&w, "Data", 0, "D4", 4, 4, .{ .boolean = true });
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"D4\",\"row\":4,\"col\":4,\"t\":\"bool\",\"v\":true}\n",
+            w.buffered(),
+        );
+    }
+}
+
+test "writeCell escapes sheet name" {
+    var scratch: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try writeCell(&w, "She\"et\n", 2, "A1", 1, 1, .{ .integer = 7 });
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"cell\",\"sheet\":\"She\\\"et\\n\",\"sheet_idx\":2,\"ref\":\"A1\",\"row\":1,\"col\":1,\"t\":\"int\",\"v\":7}\n",
+        w.buffered(),
+    );
+}
+
+test "cells loop skips empty cells from the stream" {
+    // Mirrors runCellsCommand's inner loop: feed a mixed row, confirm
+    // only non-empty cells surface, refs are built from (col,row_number).
+    var scratch: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+
+    const cells = [_]xlsx.Cell{
+        .{ .string = "name" }, // A1
+        .empty, // B1 — must produce no output
+        .{ .integer = 42 }, // C1
+        .empty, // D1 — must produce no output
+        .{ .boolean = false }, // E1
+    };
+    const row_number: u32 = 1;
+    for (cells, 0..) |c, i| {
+        if (c == .empty) continue;
+        var col_buf: [8]u8 = undefined;
+        const letters = colLetter(&col_buf, i);
+        var ref_buf: [16]u8 = undefined;
+        const ref = std.fmt.bufPrint(&ref_buf, "{s}{d}", .{ letters, row_number }) catch unreachable;
+        try writeCell(&w, "S", 0, ref, row_number, @intCast(i + 1), c);
+    }
+
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"cell\",\"sheet\":\"S\",\"sheet_idx\":0,\"ref\":\"A1\",\"row\":1,\"col\":1,\"t\":\"str\",\"v\":\"name\"}\n" ++
+            "{\"kind\":\"cell\",\"sheet\":\"S\",\"sheet_idx\":0,\"ref\":\"C1\",\"row\":1,\"col\":3,\"t\":\"int\",\"v\":42}\n" ++
+            "{\"kind\":\"cell\",\"sheet\":\"S\",\"sheet_idx\":0,\"ref\":\"E1\",\"row\":1,\"col\":5,\"t\":\"bool\",\"v\":false}\n",
         w.buffered(),
     );
 }
