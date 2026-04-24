@@ -1688,7 +1688,16 @@ fn globMatch(pattern: []const u8, text: []const u8) bool {
         return false;
     }
     if (text.len == 0) return false;
-    if (pattern[0] == '?' or pattern[0] == text[0]) {
+    if (pattern[0] == '?') {
+        // `?` matches exactly one UTF-8 codepoint, not one byte. For
+        // non-ASCII sheet names (e.g. `表1`, `Résumé`) a byte-stride
+        // advance would land inside a multi-byte sequence and poison
+        // every subsequent literal compare.
+        const n = std.unicode.utf8ByteSequenceLength(text[0]) catch 1;
+        if (text.len < n) return false;
+        return globMatch(pattern[1..], text[n..]);
+    }
+    if (pattern[0] == text[0]) {
         return globMatch(pattern[1..], text[1..]);
     }
     return false;
@@ -4140,6 +4149,16 @@ test "globMatch literal / wildcards / edge cases" {
     // Consecutive `*` collapse
     try std.testing.expect(globMatch("**", "hello"));
     try std.testing.expect(globMatch("a***b", "axyzb"));
+    // UTF-8: `?` matches one codepoint, not one byte.
+    // "é" = 2 bytes (0xC3 0xA9); "表" = 3 bytes; "𝕊" = 4 bytes.
+    try std.testing.expect(globMatch("R?sumé", "Résumé"));
+    try std.testing.expect(globMatch("?1", "表1"));
+    try std.testing.expect(globMatch("?", "é"));
+    try std.testing.expect(globMatch("?", "表"));
+    try std.testing.expect(globMatch("?", "𝕊"));
+    // Multi-`?` + non-ASCII.
+    try std.testing.expect(globMatch("??", "éé"));
+    try std.testing.expect(!globMatch("??", "é")); // only one char
 }
 
 test "runCellsAcrossSheets --all-sheets emits every sheet with correct sheet_idx" {
