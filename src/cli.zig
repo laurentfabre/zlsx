@@ -1391,19 +1391,19 @@ fn writeErrorRecord(
     scope: []const u8,
     code: []const u8,
     message: []const u8,
-    compact: bool,
 ) !void {
+    // Error records ALWAYS carry sheet/sheet_idx when they're sheet-
+    // scoped, even under --output compact-ndjson. Rationale (iter60c
+    // P1 follow-up): a malformed sheet can fail BEFORE any per-sheet
+    // prologue is written — dropping identity would leave downstream
+    // consumers unable to tell which sheet failed. Error records are
+    // one per bad sheet, so the identity overhead is negligible.
     try w.writeAll("{\"kind\":\"error\"");
-    // Drop sheet/sheet_idx when either compact-ndjson is in effect on a
-    // sheet-scoped record (envelope contract: prologue carries identity)
-    // OR the caller is workbook-scoped (no sheet to name).
-    if (!compact) {
-        if (sheet_name) |n| {
-            try w.writeAll(",\"sheet\":");
-            try writeJsonString(w, n);
-        }
-        if (sheet_idx) |i| try w.print(",\"sheet_idx\":{d}", .{i});
+    if (sheet_name) |n| {
+        try w.writeAll(",\"sheet\":");
+        try writeJsonString(w, n);
     }
+    if (sheet_idx) |i| try w.print(",\"sheet_idx\":{d}", .{i});
     try w.writeAll(",\"scope\":");
     try writeJsonString(w, scope);
     try w.writeAll(",\"code\":");
@@ -1472,7 +1472,14 @@ fn runRowsOnSheet(
 ) !void {
     runRowsOnSheetCore(out, book, sheet, sheet_idx, format, alloc, pg, start_row, end_row, range, header, include_blanks, with_styles, compact) catch |err| switch (err) {
         error.MalformedXml => {
-            try writeErrorRecord(out, sheet.name, sheet_idx, "sheet", "MalformedXml", nonFatalErrorMessage(err), compact);
+            // iter60c-P2: error records participate in --skip / --take
+            // pagination so a later sheet failure doesn't violate the
+            // "global over concatenated stream" contract.
+            switch (pg.consume()) {
+                .drop => return,
+                .stop => return,
+                .emit => try writeErrorRecord(out, sheet.name, sheet_idx, "sheet", "MalformedXml", nonFatalErrorMessage(err)),
+            }
             return;
         },
         else => return err,
@@ -1772,7 +1779,13 @@ fn runCellsOnSheet(
 ) !void {
     runCellsOnSheetCore(out, book, sheet, sheet_idx, alloc, pg, start_row, end_row, range, include_blanks, with_styles, compact) catch |err| switch (err) {
         error.MalformedXml => {
-            try writeErrorRecord(out, sheet.name, sheet_idx, "sheet", "MalformedXml", nonFatalErrorMessage(err), compact);
+            // iter60c-P2: error records participate in --skip / --take
+            // pagination — see the matching note in runRowsOnSheet.
+            switch (pg.consume()) {
+                .drop => return,
+                .stop => return,
+                .emit => try writeErrorRecord(out, sheet.name, sheet_idx, "sheet", "MalformedXml", nonFatalErrorMessage(err)),
+            }
             return;
         },
         else => return err,
@@ -4975,19 +4988,9 @@ test "writeErrorRecord sheet-scoped + workbook-scoped shapes (iter60c)" {
     {
         var scratch: [256]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try writeErrorRecord(&w, "Data", 0, "sheet", "MalformedXml", "malformed sheet XML", false);
+        try writeErrorRecord(&w, "Data", 0, "sheet", "MalformedXml", "malformed sheet XML");
         try std.testing.expectEqualStrings(
             "{\"kind\":\"error\",\"sheet\":\"Data\",\"sheet_idx\":0,\"scope\":\"sheet\",\"code\":\"MalformedXml\",\"message\":\"malformed sheet XML\"}\n",
-            w.buffered(),
-        );
-    }
-    // Sheet-scoped, compact — sheet/sheet_idx dropped (envelope contract).
-    {
-        var scratch: [256]u8 = undefined;
-        var w = std.Io.Writer.fixed(&scratch);
-        try writeErrorRecord(&w, "Data", 0, "sheet", "MalformedXml", "malformed sheet XML", true);
-        try std.testing.expectEqualStrings(
-            "{\"kind\":\"error\",\"scope\":\"sheet\",\"code\":\"MalformedXml\",\"message\":\"malformed sheet XML\"}\n",
             w.buffered(),
         );
     }
@@ -4995,7 +4998,7 @@ test "writeErrorRecord sheet-scoped + workbook-scoped shapes (iter60c)" {
     {
         var scratch: [256]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try writeErrorRecord(&w, null, null, "workbook", "ArchiveClosed", "archive closed", false);
+        try writeErrorRecord(&w, null, null, "workbook", "ArchiveClosed", "archive closed");
         try std.testing.expectEqualStrings(
             "{\"kind\":\"error\",\"scope\":\"workbook\",\"code\":\"ArchiveClosed\",\"message\":\"archive closed\"}\n",
             w.buffered(),
@@ -5005,7 +5008,7 @@ test "writeErrorRecord sheet-scoped + workbook-scoped shapes (iter60c)" {
     {
         var scratch: [256]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try writeErrorRecord(&w, "Q\"uoted", 1, "sheet", "Code", "line\nbreak", false);
+        try writeErrorRecord(&w, "Q\"uoted", 1, "sheet", "Code", "line\nbreak");
         const out = w.buffered();
         try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet\":\"Q\\\"uoted\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "\"message\":\"line\\nbreak\"") != null);
