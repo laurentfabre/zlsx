@@ -1927,6 +1927,82 @@ SheetWriter.add_conditional_format_cell_is = _sheet_add_conditional_format_cell_
 SheetWriter.add_conditional_format_expression = _sheet_add_conditional_format_expression  # type: ignore[attr-defined]
 
 
+def _sheet_add_conditional_format_color_scale(
+    self: "SheetWriter",
+    range_str: str,
+    low_color_argb: int,
+    mid_color_argb: int | None,
+    high_color_argb: int,
+) -> None:
+    """Attach a color-scale conditional format. 3-stop gradient when
+    ``mid_color_argb`` is non-None (min → mid @ 50th percentile → max);
+    2-stop (min → max) when None. No dxf_id needed.
+
+    Requires libzlsx 0.2.6+."""
+    self._require_handle()
+    if not _ffi._HAS_CF_GRADIENT:
+        raise RuntimeError(
+            "loaded libzlsx does not expose add_conditional_format_color_scale "
+            "(requires 0.2.6+); upgrade libzlsx"
+        )
+    range_raw = range_str.encode("utf-8")
+    range_buf = (ctypes.c_ubyte * max(len(range_raw), 1)).from_buffer_copy(
+        range_raw or b"\x00"
+    )
+    rc = _ffi.lib.zlsx_sheet_writer_add_conditional_format_color_scale(
+        self._handle,
+        ctypes.cast(range_buf, ctypes.POINTER(ctypes.c_ubyte)),
+        len(range_raw),
+        int(low_color_argb),
+        1 if mid_color_argb is not None else 0,
+        int(mid_color_argb) if mid_color_argb is not None else 0,
+        int(high_color_argb),
+        self._err,
+        _ERR_BUF_LEN,
+    )
+    del range_buf
+    if rc != 0:
+        raise ZlsxError(
+            f"zlsx_sheet_writer_add_conditional_format_color_scale: {_decode_err(self._err)}"
+        )
+
+
+def _sheet_add_conditional_format_data_bar(
+    self: "SheetWriter",
+    range_str: str,
+    color_argb: int,
+) -> None:
+    """Attach a data-bar conditional format. `color_argb` is the bar
+    fill — Excel's default is ``0xFF638EC6``."""
+    self._require_handle()
+    if not _ffi._HAS_CF_GRADIENT:
+        raise RuntimeError(
+            "loaded libzlsx does not expose add_conditional_format_data_bar "
+            "(requires 0.2.6+); upgrade libzlsx"
+        )
+    range_raw = range_str.encode("utf-8")
+    range_buf = (ctypes.c_ubyte * max(len(range_raw), 1)).from_buffer_copy(
+        range_raw or b"\x00"
+    )
+    rc = _ffi.lib.zlsx_sheet_writer_add_conditional_format_data_bar(
+        self._handle,
+        ctypes.cast(range_buf, ctypes.POINTER(ctypes.c_ubyte)),
+        len(range_raw),
+        int(color_argb),
+        self._err,
+        _ERR_BUF_LEN,
+    )
+    del range_buf
+    if rc != 0:
+        raise ZlsxError(
+            f"zlsx_sheet_writer_add_conditional_format_data_bar: {_decode_err(self._err)}"
+        )
+
+
+SheetWriter.add_conditional_format_color_scale = _sheet_add_conditional_format_color_scale  # type: ignore[attr-defined]
+SheetWriter.add_conditional_format_data_bar = _sheet_add_conditional_format_data_bar  # type: ignore[attr-defined]
+
+
 class Writer:
     """A xlsx workbook under construction.
 

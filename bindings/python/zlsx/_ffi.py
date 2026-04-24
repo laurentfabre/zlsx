@@ -474,6 +474,34 @@ if _HAS_CONDITIONAL_FORMAT:
     lib.zlsx_sheet_writer_add_conditional_format_expression.restype = ctypes.c_int32
 
 
+_HAS_CF_GRADIENT = (
+    hasattr(lib, "zlsx_sheet_writer_add_conditional_format_color_scale")
+    and hasattr(lib, "zlsx_sheet_writer_add_conditional_format_data_bar")
+)
+if _HAS_CF_GRADIENT:
+    lib.zlsx_sheet_writer_add_conditional_format_color_scale.argtypes = [
+        sheet_writer_handle,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.c_uint8,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_add_conditional_format_color_scale.restype = ctypes.c_int32
+    lib.zlsx_sheet_writer_add_conditional_format_data_bar.argtypes = [
+        sheet_writer_handle,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_add_conditional_format_data_bar.restype = ctypes.c_int32
+
+
 _HAS_COMMENT_WRITER = hasattr(lib, "zlsx_sheet_writer_add_comment")
 if _HAS_COMMENT_WRITER:
     lib.zlsx_sheet_writer_add_comment.argtypes = [

@@ -980,6 +980,30 @@ int32_t zlsx_sheet_writer_add_conditional_format_expression(
     uint8_t             * err_buf,
     size_t                err_buf_len);
 
+/* Attach a color-scale conditional format. `has_mid!=0` → 3-stop
+ * gradient (min→mid→max via 50th percentile); otherwise 2-stop
+ * (min→max). ARGB values embedded per stop; no dxf_id needed. */
+int32_t zlsx_sheet_writer_add_conditional_format_color_scale(
+    zlsx_sheet_writer_t * sw,
+    const uint8_t       * range_ptr,
+    size_t                range_len,
+    uint32_t              low_color_argb,
+    uint8_t               has_mid,
+    uint32_t              mid_color_argb,
+    uint32_t              high_color_argb,
+    uint8_t             * err_buf,
+    size_t                err_buf_len);
+
+/* Attach a data-bar conditional format. `color_argb` is the bar
+ * fill (Excel's default is 0xFF638EC6). */
+int32_t zlsx_sheet_writer_add_conditional_format_data_bar(
+    zlsx_sheet_writer_t * sw,
+    const uint8_t       * range_ptr,
+    size_t                range_len,
+    uint32_t              color_argb,
+    uint8_t             * err_buf,
+    size_t                err_buf_len);
+
 #ifdef __cplusplus
 }
 #endif

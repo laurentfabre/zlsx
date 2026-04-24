@@ -141,7 +141,7 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 | Sheet-name validation (length / reserved chars / duplicates) | ✓ | ~⁷ | ~ |
 
 ⁷ xlsxwriter validates length and some chars but does not reject case-insensitive duplicates up front.
-⁸ `SheetWriter.addConditionalFormatCellIs` / `…Expression` cover the two rule types that account for the majority of real-world CF use. Other variants (colorScale / dataBar / iconSet / top10 / aboveAverage / duplicateValues) can layer on without breaking the `CfRule` union. Differential formats are registered via `Writer.addDxf` — bold / italic / font color / fill color today.
+⁸ `SheetWriter.addConditionalFormatCellIs` / `…Expression` / `…ColorScale` / `…DataBar` cover the four most-used rule types. Other variants (iconSet / top10 / aboveAverage / duplicateValues) can layer on without breaking the `CfRule` union. Differential formats (`addDxf`) support bold / italic / font size / font color / fill color / per-side borders.
 
 ### Language / packaging
 

@@ -771,6 +771,35 @@ pub const Writer = struct {
                         try full.appendSlice(alloc, "</formula>");
                         try full.appendSlice(alloc, "</cfRule>");
                     },
+                    .color_scale => |r| {
+                        try full.print(
+                            alloc,
+                            "<cfRule type=\"colorScale\" priority=\"{d}\"><colorScale>",
+                            .{cf_priority},
+                        );
+                        if (r.mid_color_argb != null) {
+                            // 3-stop: min / 50th percentile / max.
+                            try full.appendSlice(alloc, "<cfvo type=\"min\"/><cfvo type=\"percentile\" val=\"50\"/><cfvo type=\"max\"/>");
+                            try full.print(alloc, "<color rgb=\"{X:0>8}\"/>", .{r.low_color_argb});
+                            try full.print(alloc, "<color rgb=\"{X:0>8}\"/>", .{r.mid_color_argb.?});
+                            try full.print(alloc, "<color rgb=\"{X:0>8}\"/>", .{r.high_color_argb});
+                        } else {
+                            // 2-stop: min / max only.
+                            try full.appendSlice(alloc, "<cfvo type=\"min\"/><cfvo type=\"max\"/>");
+                            try full.print(alloc, "<color rgb=\"{X:0>8}\"/>", .{r.low_color_argb});
+                            try full.print(alloc, "<color rgb=\"{X:0>8}\"/>", .{r.high_color_argb});
+                        }
+                        try full.appendSlice(alloc, "</colorScale></cfRule>");
+                    },
+                    .data_bar => |r| {
+                        try full.print(
+                            alloc,
+                            "<cfRule type=\"dataBar\" priority=\"{d}\"><dataBar><cfvo type=\"min\"/><cfvo type=\"max\"/>",
+                            .{cf_priority},
+                        );
+                        try full.print(alloc, "<color rgb=\"{X:0>8}\"/>", .{r.color_argb});
+                        try full.appendSlice(alloc, "</dataBar></cfRule>");
+                    },
                 }
                 try full.appendSlice(alloc, "</conditionalFormatting>");
             }
@@ -1076,9 +1105,14 @@ pub const ConditionalFormat = struct {
     rule: ConditionalFormatRule,
 };
 
-/// Union of the cfRule variants zlsx currently emits. `expression`
-/// is the fallback for anything that doesn't fit `cellIs` (e.g.
-/// row-vs-row comparisons, `MOD(ROW(),2)=0` zebra striping).
+/// Union of the cfRule variants zlsx currently emits.
+///
+/// - `cell_is`: threshold comparison (greater_than 100, between 1..50).
+/// - `expression`: generic formula rule (zebra-stripe `MOD(ROW(),2)=0`).
+/// - `color_scale`: two- or three-stop color gradient across values.
+///   No dxf_id — colors are embedded per-stop.
+/// - `data_bar`: in-cell bar chart from min to max of the range.
+///   Single bar color; dxf_id unused.
 pub const ConditionalFormatRule = union(enum) {
     cell_is: struct {
         operator: CfOperator,
@@ -1089,6 +1123,20 @@ pub const ConditionalFormatRule = union(enum) {
     expression: struct {
         formula: []u8,
         dxf_id: u32,
+    },
+    color_scale: struct {
+        /// Low-end color (applied at the minimum value of the range).
+        low_color_argb: u32,
+        /// Optional midpoint color — when set, renders a 3-stop
+        /// gradient (min → mid → max). Null → 2-stop (min → max).
+        mid_color_argb: ?u32,
+        /// High-end color (applied at the maximum value).
+        high_color_argb: u32,
+    },
+    data_bar: struct {
+        /// Bar fill color. Excel's default is a muted blue
+        /// (`FF638EC6`); any explicit ARGB works.
+        color_argb: u32,
     },
 };
 
@@ -1271,6 +1319,9 @@ pub const SheetWriter = struct {
                     if (r.formula2) |f| self.parent.allocator.free(f);
                 },
                 .expression => |r| self.parent.allocator.free(r.formula),
+                // Color scale + data bar carry no owned slices —
+                // all fields are scalar ARGB values.
+                .color_scale, .data_bar => {},
             }
         }
         self.conditional_formats.deinit(self.parent.allocator);
@@ -1601,6 +1652,56 @@ pub const SheetWriter = struct {
             .rule = .{ .expression = .{
                 .formula = f_copy,
                 .dxf_id = dxf_id,
+            } },
+        });
+    }
+
+    /// Attach a color-scale conditional format: gradient background
+    /// from `low_color_argb` (at the range's minimum value) through
+    /// `mid_color_argb` (50th percentile, when non-null) to
+    /// `high_color_argb` (maximum value). A null mid produces a
+    /// two-stop gradient instead of three.
+    ///
+    /// Excel renders this as a heatmap — common for quickly spotting
+    /// outliers in a data column. Returns `InvalidHyperlinkRange` on
+    /// bad range.
+    pub fn addConditionalFormatColorScale(
+        self: *SheetWriter,
+        range: []const u8,
+        low_color_argb: u32,
+        mid_color_argb: ?u32,
+        high_color_argb: u32,
+    ) !void {
+        try validateHyperlinkRange(range);
+        const range_copy = try self.parent.allocator.dupe(u8, range);
+        errdefer self.parent.allocator.free(range_copy);
+        try self.conditional_formats.append(self.parent.allocator, .{
+            .range = range_copy,
+            .rule = .{ .color_scale = .{
+                .low_color_argb = low_color_argb,
+                .mid_color_argb = mid_color_argb,
+                .high_color_argb = high_color_argb,
+            } },
+        });
+    }
+
+    /// Attach a data-bar conditional format: an in-cell horizontal
+    /// bar chart where each cell's bar length is proportional to
+    /// its value relative to the range's min/max. `color_argb` is
+    /// the bar fill — Excel's default is `0xFF638EC6` (a muted
+    /// blue) but any ARGB works.
+    pub fn addConditionalFormatDataBar(
+        self: *SheetWriter,
+        range: []const u8,
+        color_argb: u32,
+    ) !void {
+        try validateHyperlinkRange(range);
+        const range_copy = try self.parent.allocator.dupe(u8, range);
+        errdefer self.parent.allocator.free(range_copy);
+        try self.conditional_formats.append(self.parent.allocator, .{
+            .range = range_copy,
+            .rule = .{ .data_bar = .{
+                .color_argb = color_argb,
             } },
         });
     }
@@ -3603,6 +3704,89 @@ test "Writer: VML idmap expands for >1023 comments per sheet" {
     const v2 = vml2 orelse return error.VmlNotFound;
     try std.testing.expect(std.mem.indexOf(u8, v2, "data=\"1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, v2, "data=\"1,\"") == null);
+}
+
+test "Writer: conditional formatting — colorScale (2+3 stop) + dataBar" {
+    const tmp_path = "/tmp/zlsx_cf_gradient.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("S");
+        // 3-stop: red → yellow → green.
+        try sheet.addConditionalFormatColorScale(
+            "A2:A100",
+            0xFFFF0000, // low
+            0xFFFFFF00, // mid
+            0xFF00FF00, // high
+        );
+        // 2-stop: white → blue.
+        try sheet.addConditionalFormatColorScale(
+            "B2:B100",
+            0xFFFFFFFF,
+            null,
+            0xFF0000FF,
+        );
+        // dataBar with Excel's default blue.
+        try sheet.addConditionalFormatDataBar("C2:C100", 0xFF638EC6);
+        try sheet.writeRow(&.{.{ .string = "hdr" }});
+
+        // Rejection: empty range.
+        try std.testing.expectError(
+            error.InvalidHyperlinkRange,
+            sheet.addConditionalFormatColorScale("", 0, null, 0),
+        );
+        try std.testing.expectError(
+            error.InvalidHyperlinkRange,
+            sheet.addConditionalFormatDataBar("", 0),
+        );
+
+        try w.save(tmp_path);
+    }
+
+    // Extract sheet1.xml and check the wire fragments.
+    const sheet_xml = blk: {
+        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        var fbuf: [4096]u8 = undefined;
+        var fr = file.reader(&fbuf);
+        var iter = try std.zip.Iterator.init(&fr);
+        var fn_buf: [64]u8 = undefined;
+        while (try iter.next()) |entry| {
+            if (entry.filename_len > fn_buf.len) continue;
+            try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            const filename = fn_buf[0..entry.filename_len];
+            try fr.interface.readSliceAll(filename);
+            if (std.mem.eql(u8, filename, "xl/worksheets/sheet1.xml")) {
+                break :blk try extractEntryForTest(std.testing.allocator, entry, &fr);
+            }
+        }
+        return error.SheetNotFound;
+    };
+    defer std.testing.allocator.free(sheet_xml);
+
+    // 3-stop color scale: red / yellow / green @ min / 50% / max.
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<cfRule type=\"colorScale\" priority=\"1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<cfvo type=\"percentile\" val=\"50\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<color rgb=\"FFFF0000\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<color rgb=\"FFFFFF00\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<color rgb=\"FF00FF00\"/>") != null);
+
+    // 2-stop skips the percentile cfvo.
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<cfRule type=\"colorScale\" priority=\"2\">") != null);
+    // Only one percentile occurrence in the whole doc (from the 3-stop block).
+    var count: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, sheet_xml, pos, "<cfvo type=\"percentile\"")) |p| {
+        count += 1;
+        pos = p + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+
+    // dataBar with Excel's default blue.
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<cfRule type=\"dataBar\" priority=\"3\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_xml, "<color rgb=\"FF638EC6\"/>") != null);
 }
 
 test "Writer: conditional formatting — cellIs + expression rules + dxfs table" {

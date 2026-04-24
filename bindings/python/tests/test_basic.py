@@ -1214,6 +1214,48 @@ def test_dxf_extended_fields_border_size(tmp_path):
     assert '<color rgb="FFFF00FF"/>' in styles_xml
 
 
+def test_conditional_formatting_color_scale_data_bar(tmp_path):
+    """iter51: colorScale (2-stop + 3-stop) and dataBar CF rules."""
+    import zipfile
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_CF_GRADIENT:
+        pytest.skip("loaded libzlsx predates colorScale/dataBar ABI (0.2.6+)")
+
+    out = tmp_path / "cf_gradient.xlsx"
+    with zlsx.write(out) as w:
+        sheet = w.add_sheet("S")
+        sheet.add_conditional_format_color_scale(
+            "A2:A100", 0xFFFF0000, 0xFFFFFF00, 0xFF00FF00,
+        )
+        sheet.add_conditional_format_color_scale(
+            "B2:B100", 0xFFFFFFFF, None, 0xFF0000FF,
+        )
+        sheet.add_conditional_format_data_bar("C2:C100", 0xFF638EC6)
+        sheet.write_row(["hdr"])
+
+        with pytest.raises(zlsx.ZlsxError, match="InvalidHyperlinkRange"):
+            sheet.add_conditional_format_color_scale("", 0, None, 0)
+        with pytest.raises(zlsx.ZlsxError, match="InvalidHyperlinkRange"):
+            sheet.add_conditional_format_data_bar("", 0)
+
+    with zipfile.ZipFile(out) as z:
+        sheet_xml = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+
+    assert '<cfRule type="colorScale" priority="1">' in sheet_xml
+    assert '<cfvo type="percentile" val="50"/>' in sheet_xml  # 3-stop
+    assert '<color rgb="FFFF0000"/>' in sheet_xml
+    assert '<color rgb="FFFFFF00"/>' in sheet_xml
+    assert '<color rgb="FF00FF00"/>' in sheet_xml
+
+    assert '<cfRule type="colorScale" priority="2">' in sheet_xml
+    # 2-stop skips percentile cfvo; total count = 1 across both rules.
+    assert sheet_xml.count('<cfvo type="percentile"') == 1
+
+    assert '<cfRule type="dataBar" priority="3">' in sheet_xml
+    assert '<color rgb="FF638EC6"/>' in sheet_xml
+
+
 def test_conditional_formatting_round_trip(tmp_path):
     """Write cellIs + expression CF rules via Python; extract the
     generated xlsx and verify the sheet XML + styles.xml contain

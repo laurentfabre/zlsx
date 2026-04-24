@@ -2083,6 +2083,51 @@ export fn zlsx_sheet_writer_add_conditional_format_expression(
     return 0;
 }
 
+/// Attach a color-scale conditional format. 3-stop when `has_mid != 0`
+/// (min → mid → max gradient via percentile 50); 2-stop otherwise
+/// (min → max). `low_color_argb` / `mid_color_argb` / `high_color_argb`
+/// are ARGB values. No dxf_id needed — colors are embedded per-stop.
+/// Returns 0 on success, -1 on bad range.
+export fn zlsx_sheet_writer_add_conditional_format_color_scale(
+    sw: *SheetWriter,
+    range_ptr: [*]const u8,
+    range_len: usize,
+    low_color_argb: u32,
+    has_mid: u8,
+    mid_color_argb: u32,
+    high_color_argb: u32,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+    const range = range_ptr[0..range_len];
+    const mid: ?u32 = if (has_mid != 0) mid_color_argb else null;
+    sw_state.inner.addConditionalFormatColorScale(range, low_color_argb, mid, high_color_argb) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
+/// Attach a data-bar conditional format. `color_argb` is the bar fill.
+/// Returns 0 on success, -1 on bad range.
+export fn zlsx_sheet_writer_add_conditional_format_data_bar(
+    sw: *SheetWriter,
+    range_ptr: [*]const u8,
+    range_len: usize,
+    color_argb: u32,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+    const range = range_ptr[0..range_len];
+    sw_state.inner.addConditionalFormatDataBar(range, color_argb) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
 /// Attach a cell comment (note). `ref` is a single-cell A1 ref
 /// ("B2"); ranges are rejected. `author` and `text` are both
 /// plain-text; XML-special chars get escaped on emit. Returns 0
