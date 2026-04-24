@@ -80,6 +80,27 @@ const Args = struct {
     /// `{…,"cells":[…]}`. Rejected for every other sub-command and
     /// every non-default format — see parseArgs for scoping rules.
     header: bool = false,
+    /// iter59b-4: on `cells` / `rows --format jsonl`, emit records for
+    /// empty cells using the `t:"blank","v":null` shape instead of
+    /// skipping them. On the `rows --header` dict path the flag is
+    /// a no-op (the dict already emits `key:null` for missing cells)
+    /// but accepted silently so scripts can set it unconditionally.
+    /// On legacy flat formats (csv / tsv / legacy-jsonl / legacy-jsonl-
+    /// dict) the flag is accepted but shape-neutral — those formats
+    /// already serialise empties per their own convention. Rejected on
+    /// every other sub-command; see parseArgs for the scoping matrix.
+    include_blanks: bool = false,
+    /// iter59b-4: on `cells` / `rows --format jsonl` (envelope only),
+    /// attach a terse per-cell `style:{…}` object when the cell's
+    /// style index resolves to an effective format (any of bold /
+    /// italic / fg / bg / non-General num_fmt / any border side).
+    /// Cells with no effective style OMIT the field entirely.
+    /// Rejected on `rows --header` (the fields dict has no place for
+    /// per-cell metadata) and on non-jsonl formats (csv/tsv/legacy
+    /// shapes don't accommodate nested records). Rejected on every
+    /// other sub-command — those have their own style exposure via
+    /// the `styles` sub-command.
+    with_styles: bool = false,
 };
 
 const ArgError = error{
@@ -163,6 +184,10 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
         } else if (std.mem.eql(u8, a, "--header")) {
             // Boolean flag — no value consumed. Scoping checked below.
             out.header = true;
+        } else if (std.mem.eql(u8, a, "--include-blanks")) {
+            out.include_blanks = true;
+        } else if (std.mem.eql(u8, a, "--with-styles")) {
+            out.with_styles = true;
         } else if (std.mem.eql(u8, a, "--sheet")) {
             if (out.sheet_name != null and !workbook_scoped) return ArgError.SheetArgConflict;
             i += 1;
@@ -319,6 +344,36 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
         if (out.format != .jsonl) return ArgError.BadArgValue;
         if (out.list_sheets) return ArgError.BadArgValue;
     }
+    // iter59b-4: --include-blanks and --with-styles both scope to the
+    // two cell-shape emitters (`cells` / `rows`) and neither makes sense
+    // on the legacy --list-sheets flag. Reject rather than silently
+    // no-op to surface user typos (same rationale as --header).
+    if (out.include_blanks) {
+        switch (detected_sub) {
+            .rows, .cells => {},
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst => {
+                return ArgError.BadArgValue;
+            },
+        }
+        if (out.list_sheets) return ArgError.BadArgValue;
+    }
+    if (out.with_styles) {
+        switch (detected_sub) {
+            .rows, .cells => {},
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst => {
+                return ArgError.BadArgValue;
+            },
+        }
+        if (out.list_sheets) return ArgError.BadArgValue;
+        // `cells` shape is fixed (ignores --format) so --with-styles is
+        // always welcome there. `rows` only has a style-shaped place on
+        // the envelope; csv/tsv/legacy-jsonl/legacy-jsonl-dict shapes
+        // don't nest, and the --header dict has no per-cell slot.
+        if (detected_sub == .rows) {
+            if (out.format != .jsonl) return ArgError.BadArgValue;
+            if (out.header) return ArgError.BadArgValue;
+        }
+    }
     return out;
 }
 
@@ -374,6 +429,25 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    has at least one in-range cell; out-of-range
         \\                    columns are masked to empty so the cells[]
         \\                    array stays column-indexed.
+        \\  --include-blanks  (iter59b-4) emit empty cells as
+        \\                    {"t":"blank","v":null} records instead of
+        \\                    skipping them. Applies to `cells` and the
+        \\                    `rows --format jsonl` envelope. No-op on
+        \\                    `rows --header` (the fields dict already
+        \\                    emits `key:null` for missing cells) and on
+        \\                    legacy flat formats. Rejected on every other
+        \\                    sub-command.
+        \\  --with-styles     (iter59b-4) attach a terse `style:{…}` field
+        \\                    to per-cell records, populated only when the
+        \\                    cell has effective formatting (bold / italic
+        \\                    / fg / bg / non-General nf / any border).
+        \\                    Unstyled cells OMIT the field entirely.
+        \\                    Terse shape: {"bold":true,"italic":true,
+        \\                      "fg":"FF…","bg":"FF…","nf":"0.00",
+        \\                      "border":{"l":{"s":"thin","c":"FF…"},…}}.
+        \\                    Valid on `cells` and `rows --format jsonl`
+        \\                    only; rejected on `rows --header` (no slot
+        \\                    in the fields dict) and flat formats.
         \\  -h, --help        show this help
         \\
         \\Sub-commands
@@ -528,18 +602,26 @@ fn envelopeTypeTag(cell: xlsx.Cell) []const u8 {
     };
 }
 
-/// Emit just the `[{ref,col,t,v},…]` array. Sparse: `.empty` slots
-/// are skipped. `row_number` is the 1-based OOXML row used to build
-/// each cell's `ref`.
+/// Emit just the `[{ref,col,t,v},…]` array. By default sparse —
+/// `.empty` slots are skipped. `row_number` is the 1-based OOXML row
+/// used to build each cell's `ref`.
+///
+/// iter59b-4: when `include_blanks` is set, every `.empty` cell is
+/// materialised as `{"ref":…,"col":…,"t":"blank","v":null}`. When
+/// `style_ctx` is non-null AND the cell's style index resolves to
+/// effective formatting, a terse `style:{…}` field is appended per
+/// the design doc.
 fn writeEnvelopeCells(
     w: *std.Io.Writer,
     cells: []const xlsx.Cell,
     row_number: u32,
+    include_blanks: bool,
+    style_ctx: ?EnvelopeStyleCtx,
 ) !void {
     try w.writeByte('[');
     var first = true;
     for (cells, 0..) |c, i| {
-        if (c == .empty) continue;
+        if (c == .empty and !include_blanks) continue;
         if (!first) try w.writeByte(',');
         first = false;
 
@@ -550,12 +632,40 @@ fn writeEnvelopeCells(
 
         try w.writeAll("{\"ref\":");
         try writeJsonString(w, ref);
-        try w.print(",\"col\":{d},\"t\":\"{s}\",\"v\":", .{ i + 1, envelopeTypeTag(c) });
-        try writeJsonCell(w, c);
+        switch (c) {
+            .empty => try w.print(",\"col\":{d},\"t\":\"blank\",\"v\":null", .{i + 1}),
+            else => {
+                try w.print(",\"col\":{d},\"t\":\"{s}\",\"v\":", .{ i + 1, envelopeTypeTag(c) });
+                try writeJsonCell(w, c);
+            },
+        }
+        if (style_ctx) |ctx| {
+            // The envelope slice may be wider (padded .empty) or narrower
+            // (range-sliced) than the row's actual styleIndices — guard.
+            const sidx_opt: ?u32 = if (i < ctx.style_indices.len)
+                ctx.style_indices[i]
+            else
+                null;
+            if (sidx_opt) |sidx| if (styleBlockEffective(ctx.book, sidx)) {
+                try w.writeAll(",\"style\":");
+                _ = try writeTerseStyleBlock(w, ctx.book, sidx);
+            };
+        }
         try w.writeByte('}');
     }
     try w.writeByte(']');
 }
+
+/// iter59b-4: style context for `writeEnvelopeCells`. `style_indices`
+/// is the row's per-column style id slice (from `Rows.styleIndices`)
+/// aligned by the same position as `cells`. When `--range` masks the
+/// cells array, the caller passes an indices slice prepared the same
+/// way (masked / sliced identically) so `cells[i]` and `style_indices[i]`
+/// agree.
+const EnvelopeStyleCtx = struct {
+    book: *const xlsx.Book,
+    style_indices: []const ?u32,
+};
 
 /// Emit one NDJSON envelope line:
 /// `{"kind":"row","sheet":…,"sheet_idx":…,"row":…,"cells":[…]}\n`.
@@ -567,11 +677,13 @@ fn writeRowEnvelope(
     sheet_idx: usize,
     row_number: u32,
     cells: []const xlsx.Cell,
+    include_blanks: bool,
+    style_ctx: ?EnvelopeStyleCtx,
 ) !void {
     try w.writeAll("{\"kind\":\"row\",\"sheet\":");
     try writeJsonString(w, sheet_name);
     try w.print(",\"sheet_idx\":{d},\"row\":{d},\"cells\":", .{ sheet_idx, row_number });
-    try writeEnvelopeCells(w, cells, row_number);
+    try writeEnvelopeCells(w, cells, row_number, include_blanks, style_ctx);
     try w.writeAll("}\n");
 }
 
@@ -609,9 +721,14 @@ fn writeRowEnvelopeDict(
 /// iter56: emit one NDJSON record for a single cell, matching the
 /// `cells` sub-command wire format:
 /// `{"kind":"cell","sheet":…,"sheet_idx":…,"ref":…,"row":…,"col":…,"t":…,"v":…}\n`.
-/// Empty cells are a caller-skip: this function asserts out if handed
-/// one (matches envelope semantics — sparse cells are suppressed at
-/// the record level, not materialised as `v:null`).
+///
+/// iter59b-4: `.empty` cells are permitted ONLY when the caller opted
+/// into `--include-blanks` and materialises them as `t:"blank","v":null`.
+/// Without the flag, the caller is still required to skip empties
+/// (sparse-by-default cell stream). `style_block` optionally appends
+/// `,"style":{…}` when the cell has effective formatting — callers
+/// pass null to omit the key entirely; a non-null book + style_idx
+/// pair triggers the lookup.
 fn writeCell(
     w: *std.Io.Writer,
     sheet_name: []const u8,
@@ -620,19 +737,83 @@ fn writeCell(
     row: u32,
     col: u32,
     cell: xlsx.Cell,
+    style_ctx: ?CellStyleCtx,
 ) !void {
-    std.debug.assert(cell != .empty); // caller must skip empties
     try w.writeAll("{\"kind\":\"cell\",\"sheet\":");
     try writeJsonString(w, sheet_name);
     try w.print(",\"sheet_idx\":{d},\"ref\":", .{sheet_idx});
     try writeJsonString(w, ref);
-    try w.print(",\"row\":{d},\"col\":{d},\"t\":\"{s}\",\"v\":", .{
-        row,
-        col,
-        envelopeTypeTag(cell),
-    });
-    try writeJsonCell(w, cell);
+    try w.print(",\"row\":{d},\"col\":{d},\"t\":", .{ row, col });
+    switch (cell) {
+        .empty => try w.writeAll("\"blank\",\"v\":null"),
+        else => {
+            try w.print("\"{s}\",\"v\":", .{envelopeTypeTag(cell)});
+            try writeJsonCell(w, cell);
+        },
+    }
+    if (style_ctx) |ctx| if (ctx.style_idx) |sidx| {
+        // `writeTerseStyleBlock` returns false when the resolved style
+        // has no effective formatting; in that case we omit the field
+        // rather than emitting `"style":{}` so consumers can test
+        // presence instead of comparing against an empty object.
+        // We speculatively write the prefix and patch by writing into
+        // a fixed staging buffer would require a second pass. Simpler:
+        // the callee emits nothing iff ineffective, so we must decide
+        // before writing the prefix. Do the effectiveness check twice
+        // (once here, once inside the callee) — cheap lookups.
+        if (styleBlockEffective(ctx.book, sidx)) {
+            try w.writeAll(",\"style\":");
+            _ = try writeTerseStyleBlock(w, ctx.book, sidx);
+        }
+    };
     try w.writeAll("}\n");
+}
+
+/// iter59b-4: context required to emit a per-cell style block. Passed
+/// by value; `book` is a const pointer so callers can't accidentally
+/// mutate workbook state mid-iteration.
+const CellStyleCtx = struct {
+    book: *const xlsx.Book,
+    /// Null when the source row had no `s=` attribute for this column.
+    /// The callee still short-circuits on an ineffective style, so
+    /// passing a non-null id for a default-styled cell is fine.
+    style_idx: ?u32,
+};
+
+/// iter59b-4: fast pre-check mirroring writeTerseStyleBlock's own
+/// effectiveness test. Lets the caller decide whether to emit the
+/// `,"style":` prefix BEFORE committing to the block — avoids writing
+/// a dangling key with nothing after it.
+fn styleBlockEffective(book: *const xlsx.Book, style_idx: u32) bool {
+    const font = book.cellFont(style_idx);
+    const fill = book.cellFill(style_idx);
+    const border = book.cellBorder(style_idx);
+    const nf = book.numberFormat(style_idx);
+
+    const fill_effective: bool = if (fill) |fl|
+        !((std.mem.eql(u8, fl.pattern, "none") or fl.pattern.len == 0) and
+            fl.fg_color_argb == null and fl.bg_color_argb == null)
+    else
+        false;
+    const side_empty = struct {
+        fn f(s: xlsx.BorderSide) bool {
+            return s.style.len == 0 and s.color_argb == null;
+        }
+    }.f;
+    const border_effective: bool = if (border) |b|
+        !(side_empty(b.left) and side_empty(b.right) and
+            side_empty(b.top) and side_empty(b.bottom) and side_empty(b.diagonal))
+    else
+        false;
+    const font_effective: bool = if (font) |f|
+        (f.bold or f.italic or f.color_argb != null)
+    else
+        false;
+    const nf_effective: bool = if (nf) |s|
+        !(std.mem.eql(u8, s, "General"))
+    else
+        false;
+    return font_effective or fill_effective or border_effective or nf_effective;
 }
 
 /// Legacy emitter — covers the four bare/flat formats. The new
@@ -861,8 +1042,8 @@ pub fn main() !u8 {
     };
 
     switch (args.subcommand) {
-        .rows => try runRowsCommand(out, &book, selected.sheet, selected.idx, args.format, alloc, args.skip, args.take, args.start_row, args.end_row, args.range, args.header),
-        .cells => try runCellsCommand(out, &book, selected.sheet, selected.idx, alloc, args.skip, args.take, args.start_row, args.end_row, args.range),
+        .rows => try runRowsCommand(out, &book, selected.sheet, selected.idx, args.format, alloc, args.skip, args.take, args.start_row, args.end_row, args.range, args.header, args.include_blanks, args.with_styles),
+        .cells => try runCellsCommand(out, &book, selected.sheet, selected.idx, alloc, args.skip, args.take, args.start_row, args.end_row, args.range, args.include_blanks, args.with_styles),
         // Handled by the workbook-scoped early return above.
         .meta,
         .list_sheets,
@@ -920,11 +1101,16 @@ fn runRowsCommand(
     end_row: ?u32,
     range: ?xlsx.MergeRange,
     header: bool,
+    include_blanks: bool,
+    with_styles: bool,
 ) !void {
     // Scoping is enforced at parse time: parseArgs rejects --header on
     // any format other than .jsonl. Reassert here so any accidental
     // future caller that bypasses parseArgs fails loudly in Debug.
     std.debug.assert(!header or format == .jsonl);
+    // iter59b-4: --with-styles is envelope-only and header-incompatible.
+    // parseArgs enforces both; reassert for offensive-programming parity.
+    std.debug.assert(!with_styles or (format == .jsonl and !header));
 
     var rows = try book.rows(sheet, alloc);
     defer rows.deinit();
@@ -964,6 +1150,12 @@ fn runRowsCommand(
     // Only allocated when --range is actually present.
     var masked: std.ArrayListUnmanaged(xlsx.Cell) = .{};
     defer masked.deinit(alloc);
+    // iter59b-4: parallel masked style indices — lives next to `masked`
+    // so `masked.items[i]` and `masked_styles.items[i]` stay paired
+    // through every view transformation below. Only populated when
+    // --range is present AND we're on the envelope-positional path.
+    var masked_styles: std.ArrayListUnmanaged(?u32) = .{};
+    defer masked_styles.deinit(alloc);
 
     var pg = Pagination.init(skip, take);
     while (try rows.next()) |cells| {
@@ -983,9 +1175,15 @@ fn runRowsCommand(
         // (`{"XFD": …}`, not `{"A": …}` for a ranged XFD1:XFD10).
         const EmitView = struct {
             cells: []const xlsx.Cell,
+            /// iter59b-4: parallel style-index slice — may be shorter
+            /// than `cells` when --with-styles is off (empty slice) or
+            /// when the row's raw styleIndices is shorter than the
+            /// masked cells width (callee guards positional reads).
+            style_indices: []const ?u32,
             col_offset: u32,
             any_non_empty: bool,
         };
+        const raw_styles = rows.styleIndices();
         // Mask vs slice: the envelope's positional cells[i]==col-i
         // contract needs the mask (full-width with .empty for out-of-
         // range). The dict/flat paths emit by key or by compact
@@ -997,18 +1195,29 @@ fn runRowsCommand(
             if (is_envelope_positional) {
                 var any = false;
                 masked.clearRetainingCapacity();
+                masked_styles.clearRetainingCapacity();
                 try masked.ensureTotalCapacity(alloc, cells.len);
+                try masked_styles.ensureTotalCapacity(alloc, cells.len);
                 for (cells, 0..) |c, i| {
                     const col: u32 = @intCast(i);
                     const in_col = col >= r.top_left.col and col <= r.bottom_right.col;
                     if (in_col) {
                         masked.appendAssumeCapacity(c);
+                        masked_styles.appendAssumeCapacity(
+                            if (i < raw_styles.len) raw_styles[i] else null,
+                        );
                         if (c != .empty) any = true;
                     } else {
                         masked.appendAssumeCapacity(.empty);
+                        masked_styles.appendAssumeCapacity(null);
                     }
                 }
-                break :blk .{ .cells = masked.items, .col_offset = 0, .any_non_empty = any };
+                break :blk .{
+                    .cells = masked.items,
+                    .style_indices = masked_styles.items,
+                    .col_offset = 0,
+                    .any_non_empty = any,
+                };
             } else {
                 // Build a fixed-width view spanning exactly the
                 // requested [tl.col..br.col] columns. Cells the row
@@ -1032,9 +1241,21 @@ fn runRowsCommand(
                         masked.appendAssumeCapacity(.empty);
                     }
                 }
-                break :blk .{ .cells = masked.items, .col_offset = r.top_left.col, .any_non_empty = any };
+                // Non-envelope-positional paths (flat formats + --header
+                // dict) don't consume style_indices — leave empty.
+                break :blk .{
+                    .cells = masked.items,
+                    .style_indices = &.{},
+                    .col_offset = r.top_left.col,
+                    .any_non_empty = any,
+                };
             }
-        } else .{ .cells = cells, .col_offset = 0, .any_non_empty = true };
+        } else .{
+            .cells = cells,
+            .style_indices = raw_styles,
+            .col_offset = 0,
+            .any_non_empty = true,
+        };
 
         if (!view.any_non_empty) continue;
 
@@ -1055,7 +1276,19 @@ fn runRowsCommand(
         if (header) {
             try writeRowEnvelopeDict(out, sheet.name, sheet_idx, row_number, header_keys.items, view.cells);
         } else switch (format) {
-            .jsonl => try writeRowEnvelope(out, sheet.name, sheet_idx, row_number, view.cells),
+            .jsonl => {
+                const style_ctx: ?EnvelopeStyleCtx = if (with_styles)
+                    .{ .book = book, .style_indices = view.style_indices }
+                else
+                    null;
+                try writeRowEnvelope(out, sheet.name, sheet_idx, row_number, view.cells, include_blanks, style_ctx);
+            },
+            // iter59b-4: flat formats are shape-neutral w.r.t. both
+            // --include-blanks (they serialise empties per their own
+            // convention) and --with-styles (no place to put metadata).
+            // parseArgs rejects --with-styles on flat formats; allow
+            // --include-blanks through as a documented no-op so scripts
+            // can set it unconditionally.
             else => try writeRow(out, view.cells, format, view.col_offset),
         }
     }
@@ -1124,6 +1357,8 @@ fn runCellsCommand(
     start_row: ?u32,
     end_row: ?u32,
     range: ?xlsx.MergeRange,
+    include_blanks: bool,
+    with_styles: bool,
 ) !void {
     var rows = try book.rows(sheet, alloc);
     defer rows.deinit();
@@ -1149,8 +1384,12 @@ fn runCellsCommand(
         const row_number = rows.currentRowNumber();
         if (row_lo) |s| if (row_number < s) continue;
         if (row_hi) |e| if (row_number > e) break;
+        const raw_styles = rows.styleIndices();
         for (cells, 0..) |c, i| {
-            if (c == .empty) continue;
+            // iter59b-4: --include-blanks flips the empty-skip into
+            // emit-as-blank. Without the flag, the old sparse-by-default
+            // behaviour holds.
+            if (c == .empty and !include_blanks) continue;
             if (range) |r| {
                 const col: u32 = @intCast(i);
                 if (col < r.top_left.col or col > r.bottom_right.col) continue;
@@ -1167,6 +1406,11 @@ fn runCellsCommand(
             var ref_buf: [16]u8 = undefined;
             const ref = std.fmt.bufPrint(&ref_buf, "{s}{d}", .{ letters, row_number }) catch unreachable;
 
+            const style_ctx: ?CellStyleCtx = if (with_styles) blk: {
+                const sidx: ?u32 = if (i < raw_styles.len) raw_styles[i] else null;
+                break :blk .{ .book = book, .style_idx = sidx };
+            } else null;
+
             try writeCell(
                 out,
                 sheet.name,
@@ -1175,6 +1419,7 @@ fn runCellsCommand(
                 row_number,
                 @intCast(i + 1),
                 c,
+                style_ctx,
             );
         }
     }
@@ -1499,6 +1744,155 @@ fn writeBorderSideOrNull(w: *std.Io.Writer, side: xlsx.BorderSide) !void {
     try w.writeByte('}');
 }
 
+/// iter59b-4: terse-shape border side for the per-cell `style.border`
+/// block: `{"s":"<style>","c":"<argb>"}` with the color field elided
+/// when absent. Returns true iff the side contributed bytes.
+fn writeTerseBorderSide(w: *std.Io.Writer, side: xlsx.BorderSide) !bool {
+    if (side.style.len == 0) return false;
+    try w.writeAll("{\"s\":");
+    try writeJsonString(w, side.style);
+    if (side.color_argb) |c| {
+        try w.print(",\"c\":\"{X:0>8}\"", .{c});
+    }
+    try w.writeByte('}');
+    return true;
+}
+
+/// iter59b-4: emit the terse `style:{…}` block for a cell when its
+/// resolved style has any effective formatting. Returns true when a
+/// block was written (so the caller's leading `,\"style\":` prefix was
+/// needed), false when the style is structurally empty and the caller
+/// must omit the field entirely.
+///
+/// Terse shape per docs/jq-for-excel.md v4.1:
+///   `{"bold":true,"italic":true,"fg":"FF…","bg":"FF…","nf":"0.00",
+///     "border":{"l":{"s":"thin","c":"FF000000"},…}}`
+/// Each key is omitted when the underlying value is the default /
+/// unset — so an unstyled cell with only a non-General numFmt emits
+/// just `{"nf":"m/d/yyyy"}`.
+fn writeTerseStyleBlock(
+    w: *std.Io.Writer,
+    book: *const xlsx.Book,
+    style_idx: u32,
+) !bool {
+    // Resolve once; each getter is a direct random-access lookup.
+    const font = book.cellFont(style_idx);
+    const fill = book.cellFill(style_idx);
+    const border = book.cellBorder(style_idx);
+    const nf = book.numberFormat(style_idx);
+
+    // Replicate the styles sub-command's null-detection so an all-
+    // default fill/border doesn't register as "has style" just because
+    // cellFill returned a zero-valued struct rather than null.
+    const fill_effective: bool = if (fill) |fl|
+        !((std.mem.eql(u8, fl.pattern, "none") or fl.pattern.len == 0) and
+            fl.fg_color_argb == null and fl.bg_color_argb == null)
+    else
+        false;
+    const side_empty = struct {
+        fn f(s: xlsx.BorderSide) bool {
+            return s.style.len == 0 and s.color_argb == null;
+        }
+    }.f;
+    const border_effective: bool = if (border) |b|
+        !(side_empty(b.left) and side_empty(b.right) and
+            side_empty(b.top) and side_empty(b.bottom) and side_empty(b.diagonal))
+    else
+        false;
+
+    const font_effective: bool = if (font) |f|
+        (f.bold or f.italic or f.color_argb != null)
+    else
+        false;
+
+    // "General" is numFmtId 0 — zlsx.numberFormat resolves built-ins so
+    // we compare the string. A null return means no styles.xml at all
+    // or no format attached; either way, nothing to emit.
+    const nf_effective: bool = if (nf) |s|
+        !(std.mem.eql(u8, s, "General"))
+    else
+        false;
+
+    if (!(font_effective or fill_effective or border_effective or nf_effective)) {
+        return false;
+    }
+
+    try w.writeByte('{');
+    var first = true;
+
+    if (font) |f| {
+        if (f.bold) {
+            if (!first) try w.writeByte(',');
+            first = false;
+            try w.writeAll("\"bold\":true");
+        }
+        if (f.italic) {
+            if (!first) try w.writeByte(',');
+            first = false;
+            try w.writeAll("\"italic\":true");
+        }
+    }
+
+    // Terse-shape colour contract (matches the design-doc example
+    // `{"bold":true,"fg":"FFFFFFFF","bg":"FF1F4E79"}`):
+    //   fg → font (text) colour when set
+    //   bg → cell background from `<fill>` (prefer `fgColor` on a
+    //         solid pattern, else `bgColor`). Fill's fgColor is a
+    //         misnomer inherited from OOXML — it's the pattern's
+    //         foreground, which for `solid` IS the visible background.
+    if (font) |f| if (f.color_argb) |c| {
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.print("\"fg\":\"{X:0>8}\"", .{c});
+    };
+    if (fill_effective) {
+        // Prefer fgColor (solid fills stash the visible colour there);
+        // fall back to bgColor for other pattern types.
+        const bg_argb: ?u32 = fill.?.fg_color_argb orelse fill.?.bg_color_argb;
+        if (bg_argb) |c| {
+            if (!first) try w.writeByte(',');
+            first = false;
+            try w.print("\"bg\":\"{X:0>8}\"", .{c});
+        }
+    }
+
+    if (nf_effective) {
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("\"nf\":");
+        try writeJsonString(w, nf.?);
+    }
+
+    if (border_effective) {
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("\"border\":{");
+        const b = border.?;
+        var border_first = true;
+        // Emit only set sides (l/r/t/b). Diagonal is intentionally
+        // excluded from the terse shape — the design doc lists l/r/t/b.
+        const sides = [_]struct { key: []const u8, side: xlsx.BorderSide }{
+            .{ .key = "l", .side = b.left },
+            .{ .key = "r", .side = b.right },
+            .{ .key = "t", .side = b.top },
+            .{ .key = "b", .side = b.bottom },
+        };
+        for (sides) |sd| {
+            if (sd.side.style.len == 0) continue;
+            if (!border_first) try w.writeByte(',');
+            border_first = false;
+            try w.writeByte('"');
+            try w.writeAll(sd.key);
+            try w.writeAll("\":");
+            _ = try writeTerseBorderSide(w, sd.side);
+        }
+        try w.writeByte('}');
+    }
+
+    try w.writeByte('}');
+    return true;
+}
+
 /// Emit one NDJSON record per cell-XF style entry. Workbook-scoped.
 /// Every nested block (`font` / `fill` / `border`) is either the
 /// resolved struct or JSON `null` when the getter returns null.
@@ -1713,7 +2107,7 @@ test "writeRowEnvelope emits kind + sheet + sheet_idx + row + sparse cells" {
         .{ .number = 3.5 },
         .{ .boolean = true },
     };
-    try writeRowEnvelope(&w, "Data", 0, 1, &cells);
+    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null);
     const expected =
         "{\"kind\":\"row\",\"sheet\":\"Data\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
         "{\"ref\":\"A1\",\"col\":1,\"t\":\"str\",\"v\":\"name\"}," ++
@@ -1728,7 +2122,7 @@ test "writeRowEnvelope all-empty row emits envelope with empty cells array" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
     const cells = [_]xlsx.Cell{ .empty, .empty, .empty };
-    try writeRowEnvelope(&w, "S", 2, 7, &cells);
+    try writeRowEnvelope(&w, "S", 2, 7, &cells, false, null);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"row\",\"sheet\":\"S\",\"sheet_idx\":2,\"row\":7,\"cells\":[]}\n",
         w.buffered(),
@@ -1739,7 +2133,7 @@ test "writeRowEnvelope escapes sheet name" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
     const cells = [_]xlsx.Cell{.{ .integer = 1 }};
-    try writeRowEnvelope(&w, "She\"et\n", 0, 1, &cells);
+    try writeRowEnvelope(&w, "She\"et\n", 0, 1, &cells, false, null);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"row\",\"sheet\":\"She\\\"et\\n\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
             "{\"ref\":\"A1\",\"col\":1,\"t\":\"int\",\"v\":1}" ++
@@ -1752,7 +2146,7 @@ test "writeRowEnvelope non-finite number becomes null v" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
     const cells = [_]xlsx.Cell{.{ .number = std.math.nan(f64) }};
-    try writeRowEnvelope(&w, "S", 0, 1, &cells);
+    try writeRowEnvelope(&w, "S", 0, 1, &cells, false, null);
     // `t` stays `"num"` for the non-finite case — the type of the
     // cell didn't change, only its JSON-serializable value did.
     // This matches the pre-iter55a behaviour of writeJsonCell.
@@ -1810,7 +2204,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
     // string
     {
         var w = std.Io.Writer.fixed(&scratch);
-        try writeCell(&w, "Data", 0, "A1", 1, 1, .{ .string = "name" });
+        try writeCell(&w, "Data", 0, "A1", 1, 1, .{ .string = "name" }, null);
         try std.testing.expectEqualStrings(
             "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"A1\",\"row\":1,\"col\":1,\"t\":\"str\",\"v\":\"name\"}\n",
             w.buffered(),
@@ -1819,7 +2213,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
     // integer
     {
         var w = std.Io.Writer.fixed(&scratch);
-        try writeCell(&w, "Data", 0, "B2", 2, 2, .{ .integer = 3 });
+        try writeCell(&w, "Data", 0, "B2", 2, 2, .{ .integer = 3 }, null);
         try std.testing.expectEqualStrings(
             "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"B2\",\"row\":2,\"col\":2,\"t\":\"int\",\"v\":3}\n",
             w.buffered(),
@@ -1828,7 +2222,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
     // number
     {
         var w = std.Io.Writer.fixed(&scratch);
-        try writeCell(&w, "Data", 0, "C3", 3, 3, .{ .number = 3.5 });
+        try writeCell(&w, "Data", 0, "C3", 3, 3, .{ .number = 3.5 }, null);
         try std.testing.expectEqualStrings(
             "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"C3\",\"row\":3,\"col\":3,\"t\":\"num\",\"v\":3.5}\n",
             w.buffered(),
@@ -1837,7 +2231,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
     // boolean
     {
         var w = std.Io.Writer.fixed(&scratch);
-        try writeCell(&w, "Data", 0, "D4", 4, 4, .{ .boolean = true });
+        try writeCell(&w, "Data", 0, "D4", 4, 4, .{ .boolean = true }, null);
         try std.testing.expectEqualStrings(
             "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"D4\",\"row\":4,\"col\":4,\"t\":\"bool\",\"v\":true}\n",
             w.buffered(),
@@ -1848,7 +2242,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
 test "writeCell escapes sheet name" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try writeCell(&w, "She\"et\n", 2, "A1", 1, 1, .{ .integer = 7 });
+    try writeCell(&w, "She\"et\n", 2, "A1", 1, 1, .{ .integer = 7 }, null);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"cell\",\"sheet\":\"She\\\"et\\n\",\"sheet_idx\":2,\"ref\":\"A1\",\"row\":1,\"col\":1,\"t\":\"int\",\"v\":7}\n",
         w.buffered(),
@@ -1875,7 +2269,7 @@ test "cells loop skips empty cells from the stream" {
         const letters = colLetter(&col_buf, i);
         var ref_buf: [16]u8 = undefined;
         const ref = std.fmt.bufPrint(&ref_buf, "{s}{d}", .{ letters, row_number }) catch unreachable;
-        try writeCell(&w, "S", 0, ref, row_number, @intCast(i + 1), c);
+        try writeCell(&w, "S", 0, ref, row_number, @intCast(i + 1), c, null);
     }
 
     try std.testing.expectEqualStrings(
@@ -2117,7 +2511,7 @@ test "runCellsCommand --start-row / --end-row bound the emitted cell stream" {
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, 2, 4, null);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, 2, 4, null, false, false);
         const out = w.buffered();
         try std.testing.expectEqual(@as(usize, 3), countLines(out));
         try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c1\"") == null);
@@ -2131,7 +2525,7 @@ test "runCellsCommand --start-row / --end-row bound the emitted cell stream" {
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 1, 1, 2, 4, null);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 1, 1, 2, 4, null, false, false);
         const out = w.buffered();
         try std.testing.expectEqual(@as(usize, 1), countLines(out));
         try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c3\"") != null);
@@ -2239,7 +2633,7 @@ test "runCellsCommand --range filters by bounding rectangle" {
             .top_left = .{ .col = 1, .row = 2 },
             .bottom_right = .{ .col = 2, .row = 3 },
         };
-        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, null, null, range);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, null, null, range, false, false);
         const out = w.buffered();
         try std.testing.expectEqual(@as(usize, 4), countLines(out));
         try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"B2\"") != null);
@@ -2263,7 +2657,7 @@ test "runCellsCommand --range filters by bounding rectangle" {
             .top_left = .{ .col = 1, .row = 2 },
             .bottom_right = .{ .col = 2, .row = 4 },
         };
-        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, 3, 5, range);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, 3, 5, range, false, false);
         const out = w.buffered();
         try std.testing.expectEqual(@as(usize, 4), countLines(out));
         try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"B3\"") != null);
@@ -2313,7 +2707,7 @@ test "runRowsCommand --range filters rows + masks out-of-range cells" {
         .top_left = .{ .col = 1, .row = 2 },
         .bottom_right = .{ .col = 2, .row = 3 },
     };
-    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, range, false);
+    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, range, false, false, false);
     const out = w.buffered();
     try std.testing.expectEqual(@as(usize, 2), countLines(out));
     try std.testing.expect(std.mem.indexOf(u8, out, "\"B2\"") != null);
@@ -2402,7 +2796,7 @@ test "runRowsCommand --header promotes first row and emits fields dict" {
 
     var scratch: [8192]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, null, true);
+    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, null, true, false, false);
     const out = w.buffered();
 
     // 3 rows in, header consumed → exactly 2 records out.
@@ -2436,7 +2830,7 @@ test "runRowsCommand --header duplicate header keys emitted verbatim" {
 
     var scratch: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, null, true);
+    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, null, true, false, false);
     const out = w.buffered();
 
     // Both duplicate "x" keys appear in the dict as-is.
@@ -2462,7 +2856,7 @@ test "runRowsCommand --header empty header cells fall back to col_<letter>" {
 
     var scratch: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, null, true);
+    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, null, true, false, false);
     const out = w.buffered();
 
     try std.testing.expect(std.mem.indexOf(u8, out, "\"col_B\":42") != null);
@@ -2498,7 +2892,7 @@ test "runRowsCommand --header + --range derives keys only from in-range cols" {
         .top_left = .{ .row = 1, .col = 1 },
         .bottom_right = .{ .row = 2, .col = 2 },
     };
-    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, range, true);
+    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, range, true, false, false);
     const out = w.buffered();
 
     // Only the in-range header keys should appear.
@@ -2509,6 +2903,224 @@ test "runRowsCommand --header + --range derives keys only from in-range cols" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"z\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"col_A\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"col_D\"") == null);
+}
+
+test "parseArgs --include-blanks scoping" {
+    // Happy: cells + default.
+    {
+        const argv = [_][]const u8{ "cells", "f.xlsx", "--include-blanks" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(a.include_blanks);
+        try std.testing.expectEqual(Subcommand.cells, a.subcommand);
+    }
+    // Happy: rows + default envelope.
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--include-blanks" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(a.include_blanks);
+    }
+    // Happy (no-op but accepted): rows + --header.
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--include-blanks", "--header" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(a.include_blanks);
+        try std.testing.expect(a.header);
+    }
+    // Happy (no-op but accepted): rows + flat formats.
+    inline for (.{ "tsv", "csv", "legacy-jsonl", "legacy-jsonl-dict" }) |fmt| {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--include-blanks", "--format", fmt };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(a.include_blanks);
+    }
+    // Reject: every non-cells/rows sub-command.
+    inline for (.{ "comments", "validations", "hyperlinks", "meta", "list-sheets", "styles", "sst" }) |cmd| {
+        const argv = [_][]const u8{ cmd, "f.xlsx", "--include-blanks" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // Reject: legacy --list-sheets flag.
+    {
+        const argv = [_][]const u8{ "f.xlsx", "--list-sheets", "--include-blanks" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // Default off.
+    {
+        const argv = [_][]const u8{ "cells", "f.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(!a.include_blanks);
+    }
+}
+
+test "parseArgs --with-styles scoping" {
+    // Happy: cells + default.
+    {
+        const argv = [_][]const u8{ "cells", "f.xlsx", "--with-styles" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(a.with_styles);
+    }
+    // Happy: rows + jsonl (no --header).
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--with-styles" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(a.with_styles);
+    }
+    // Reject: rows + flat formats (no place for nested metadata).
+    inline for (.{ "tsv", "csv", "legacy-jsonl", "legacy-jsonl-dict" }) |fmt| {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--with-styles", "--format", fmt };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // Reject: rows + --header (fields dict has no per-cell slot).
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--with-styles", "--header" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // Reject: every non-cells/rows sub-command.
+    inline for (.{ "comments", "validations", "hyperlinks", "meta", "list-sheets", "styles", "sst" }) |cmd| {
+        const argv = [_][]const u8{ cmd, "f.xlsx", "--with-styles" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // Reject: legacy --list-sheets flag.
+    {
+        const argv = [_][]const u8{ "f.xlsx", "--list-sheets", "--with-styles" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // Default off.
+    {
+        const argv = [_][]const u8{ "cells", "f.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(!a.with_styles);
+    }
+}
+
+test "runCellsCommand --include-blanks emits t:\"blank\" for empty cells" {
+    const tmp_path = "/tmp/zlsx_cli_blanks_iter59b4.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        // Row 1: A="x", B=empty, C=7 → a single sparse row with a gap.
+        try s0.writeRow(&.{ .{ .string = "x" }, .empty, .{ .integer = 7 } });
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, null, null, null, true, false);
+    const out = w.buffered();
+
+    // Non-empty cells still emit with their proper types.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"A1\",\"row\":1,\"col\":1,\"t\":\"str\",\"v\":\"x\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"C1\",\"row\":1,\"col\":3,\"t\":\"int\",\"v\":7") != null);
+    // The gap at B1 must surface as a blank record.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"B1\",\"row\":1,\"col\":2,\"t\":\"blank\",\"v\":null") != null);
+}
+
+test "runCellsCommand without --include-blanks still skips empties" {
+    // Regression guard: default behaviour preserved when the flag is off.
+    const tmp_path = "/tmp/zlsx_cli_blanks_off_iter59b4.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{ .{ .string = "x" }, .empty, .{ .integer = 7 } });
+        try w.save(tmp_path);
+    }
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, null, null, null, false, false);
+    const out = w.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"blank\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"B1\"") == null);
+}
+
+test "runCellsCommand --with-styles emits terse style block for styled cells" {
+    const tmp_path = "/tmp/zlsx_cli_with_styles_iter59b4.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        // Bold + white font on dark-blue solid fill — the canonical
+        // header-row look from the design-doc example.
+        const styled = try w.addStyle(.{
+            .font_bold = true,
+            .font_color_argb = 0xFFFFFFFF,
+            .fill_pattern = .solid,
+            .fill_fg_argb = 0xFF1F4E79,
+        });
+        var s0 = try w.addSheet("Data");
+        try s0.writeRowStyled(
+            &.{ .{ .string = "name" }, .{ .string = "qty" } },
+            &.{ styled, styled },
+        );
+        try s0.writeRow(&.{ .{ .string = "apple" }, .{ .integer = 3 } });
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, null, null, null, false, true);
+    const out = w.buffered();
+
+    // Styled header cells surface the terse block.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"style\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"bold\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"fg\":\"FFFFFFFF\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"bg\":\"FF1F4E79\"") != null);
+    // Unstyled data cells ("apple", 3) must NOT carry a style field.
+    const apple_pos = std.mem.indexOf(u8, out, "\"v\":\"apple\"").?;
+    const apple_line_end = std.mem.indexOfScalarPos(u8, out, apple_pos, '\n').?;
+    const apple_line = out[apple_pos..apple_line_end];
+    try std.testing.expect(std.mem.indexOf(u8, apple_line, "\"style\"") == null);
+}
+
+test "runRowsCommand --with-styles on envelope attaches style to per-cell records" {
+    const tmp_path = "/tmp/zlsx_cli_rows_styles_iter59b4.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        const italic = try w.addStyle(.{ .font_italic = true });
+        var s0 = try w.addSheet("Data");
+        try s0.writeRowStyled(
+            &.{ .{ .string = "a" }, .{ .string = "b" } },
+            &.{ italic, 0 },
+        );
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, null, false, false, true);
+    const out = w.buffered();
+
+    // Styled A1 gets the terse block with just italic:true.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"A1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"italic\":true") != null);
+    // Default-styled B1 has NO style field.
+    const b1_pos = std.mem.indexOf(u8, out, "\"ref\":\"B1\"").?;
+    // Scan from B1's start to end-of-object (next `}`). Cheap since
+    // each cell record is < 200 bytes in this tiny fixture.
+    const rel_close = std.mem.indexOfScalarPos(u8, out, b1_pos, '}').?;
+    const b1_record = out[b1_pos..rel_close];
+    try std.testing.expect(std.mem.indexOf(u8, b1_record, "\"style\"") == null);
 }
 
 test "runCellsCommand --skip / --take slice the emitted cell stream" {
@@ -2545,14 +3157,14 @@ test "runCellsCommand --skip / --take slice the emitted cell stream" {
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, null, null, null);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, null, null, null, false, false);
         try std.testing.expectEqual(@as(usize, 5), countLines(w.buffered()));
     }
     // --skip 2 drops the first two cells (c1, c2).
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 2, null, null, null, null);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 2, null, null, null, null, false, false);
         const out = w.buffered();
         try std.testing.expectEqual(@as(usize, 3), countLines(out));
         try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c1\"") == null);
@@ -2563,7 +3175,7 @@ test "runCellsCommand --skip / --take slice the emitted cell stream" {
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, 3, null, null, null);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, 3, null, null, null, false, false);
         const out = w.buffered();
         try std.testing.expectEqual(@as(usize, 3), countLines(out));
         try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c3\"") != null);
@@ -2573,7 +3185,7 @@ test "runCellsCommand --skip / --take slice the emitted cell stream" {
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 1, 2, null, null, null);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 1, 2, null, null, null, false, false);
         const out = w.buffered();
         try std.testing.expectEqual(@as(usize, 2), countLines(out));
         try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c1\"") == null);
