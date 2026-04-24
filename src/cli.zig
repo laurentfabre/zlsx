@@ -927,16 +927,29 @@ fn runRowsCommand(
                 }
                 break :blk .{ .cells = masked.items, .col_offset = 0, .any_non_empty = any };
             } else {
-                const lo: usize = @min(r.top_left.col, cells.len);
-                const hi_exclusive: usize = @min(@as(usize, r.bottom_right.col) + 1, cells.len);
-                if (lo >= hi_exclusive) break :blk .{ .cells = &.{}, .col_offset = 0, .any_non_empty = false };
-                const sliced = cells[lo..hi_exclusive];
+                // Build a fixed-width view spanning exactly the
+                // requested [tl.col..br.col] columns. Cells the row
+                // actually materialized land in their slot; cells
+                // beyond `cells.len` (sparse rows) + trailing columns
+                // past the row's materialized width pad with .empty.
+                // This keeps the output column count constant at
+                // `range_width` records/row, which csv/tsv consumers
+                // rely on for tabular parsing.
+                const range_width: usize = @as(usize, r.bottom_right.col) - r.top_left.col + 1;
+                masked.clearRetainingCapacity();
+                try masked.ensureTotalCapacity(alloc, range_width);
                 var any = false;
-                for (sliced) |c| if (c != .empty) {
-                    any = true;
-                    break;
-                };
-                break :blk .{ .cells = sliced, .col_offset = @intCast(lo), .any_non_empty = any };
+                var col: u32 = r.top_left.col;
+                while (col <= r.bottom_right.col) : (col += 1) {
+                    const src_idx: usize = col;
+                    if (src_idx < cells.len) {
+                        masked.appendAssumeCapacity(cells[src_idx]);
+                        if (cells[src_idx] != .empty) any = true;
+                    } else {
+                        masked.appendAssumeCapacity(.empty);
+                    }
+                }
+                break :blk .{ .cells = masked.items, .col_offset = r.top_left.col, .any_non_empty = any };
             }
         } else .{ .cells = cells, .col_offset = 0, .any_non_empty = true };
 
