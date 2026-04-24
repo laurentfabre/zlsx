@@ -74,6 +74,12 @@ const Args = struct {
     /// When paired with --start-row / --end-row, the row bounds are
     /// intersected (most restrictive wins) at the filter site.
     range: ?xlsx.MergeRange = null,
+    /// iter59b-3: promote the first emitted row to header keys on the
+    /// `rows --format jsonl` path. Header row is consumed silently;
+    /// subsequent rows emit `{…,"fields":{key:val,…}}` instead of
+    /// `{…,"cells":[…]}`. Rejected for every other sub-command and
+    /// every non-default format — see parseArgs for scoping rules.
+    header: bool = false,
 };
 
 const ArgError = error{
@@ -154,6 +160,9 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
             return ArgError.HelpRequested;
         } else if (std.mem.eql(u8, a, "--list-sheets")) {
             out.list_sheets = true;
+        } else if (std.mem.eql(u8, a, "--header")) {
+            // Boolean flag — no value consumed. Scoping checked below.
+            out.header = true;
         } else if (std.mem.eql(u8, a, "--sheet")) {
             if (out.sheet_name != null and !workbook_scoped) return ArgError.SheetArgConflict;
             i += 1;
@@ -301,6 +310,15 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     if (out.list_sheets and (out.start_row != null or out.end_row != null or out.range != null)) {
         return ArgError.BadArgValue;
     }
+    // iter59b-3: --header promotes the first row to keys. It only
+    // composes with the `rows` sub-command on the NDJSON envelope
+    // (the flat formats each have their own well-defined row shape).
+    // Silently no-op'ing on mismatch would hide user typos, so reject.
+    if (out.header) {
+        if (detected_sub != .rows) return ArgError.BadArgValue;
+        if (out.format != .jsonl) return ArgError.BadArgValue;
+        if (out.list_sheets) return ArgError.BadArgValue;
+    }
     return out;
 }
 
@@ -336,6 +354,17 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    after row R (inclusive). Same scope and
         \\                    sub-command constraints as --start-row.
         \\                    Applied BEFORE --skip / --take.
+        \\  --header          (iter59b-3) promote the first emitted row
+        \\                    to field keys on `rows --format jsonl`. The
+        \\                    header row itself is NOT emitted; subsequent
+        \\                    rows become {"kind":"row",…,"fields":{k:v,…}}.
+        \\                    Numeric/boolean header cells stringify; empty
+        \\                    header cells fall back to "col_A"/"col_B"/…
+        \\                    Duplicate keys are emitted verbatim (JSON
+        \\                    accepts them; consumer handles de-dup).
+        \\                    Rejected on every other sub-command and on
+        \\                    --format other than jsonl — those shapes
+        \\                    don't compose with the field-dict contract.
         \\  --range A1:Z100   (iter59b-2) A1-style bounding rectangle;
         \\                    valid for `rows` and `cells` only. Inverted
         \\                    corners (e.g. `Z1:A1`) are rejected. When
@@ -544,6 +573,37 @@ fn writeRowEnvelope(
     try w.print(",\"sheet_idx\":{d},\"row\":{d},\"cells\":", .{ sheet_idx, row_number });
     try writeEnvelopeCells(w, cells, row_number);
     try w.writeAll("}\n");
+}
+
+/// iter59b-3: emit one dict-shape envelope line:
+/// `{"kind":"row","sheet":…,"sheet_idx":…,"row":…,"fields":{k:v,…}}\n`.
+/// `keys` is one string per header column; `data_cells` is the row's
+/// materialised cells, positionally aligned to `keys`. Missing cells
+/// (row shorter than `keys`) or empty cells emit `"key": null`; extra
+/// cells past `keys.len` are dropped (no key for them). Duplicate keys
+/// are emitted as-is — JSON accepts them, the consumer deduplicates.
+fn writeRowEnvelopeDict(
+    w: *std.Io.Writer,
+    sheet_name: []const u8,
+    sheet_idx: usize,
+    row_number: u32,
+    keys: []const []const u8,
+    data_cells: []const xlsx.Cell,
+) !void {
+    try w.writeAll("{\"kind\":\"row\",\"sheet\":");
+    try writeJsonString(w, sheet_name);
+    try w.print(",\"sheet_idx\":{d},\"row\":{d},\"fields\":{{", .{ sheet_idx, row_number });
+    for (keys, 0..) |k, i| {
+        if (i > 0) try w.writeByte(',');
+        try writeJsonString(w, k);
+        try w.writeByte(':');
+        if (i < data_cells.len and data_cells[i] != .empty) {
+            try writeJsonCell(w, data_cells[i]);
+        } else {
+            try w.writeAll("null");
+        }
+    }
+    try w.writeAll("}}\n");
 }
 
 /// iter56: emit one NDJSON record for a single cell, matching the
@@ -801,7 +861,7 @@ pub fn main() !u8 {
     };
 
     switch (args.subcommand) {
-        .rows => try runRowsCommand(out, &book, selected.sheet, selected.idx, args.format, alloc, args.skip, args.take, args.start_row, args.end_row, args.range),
+        .rows => try runRowsCommand(out, &book, selected.sheet, selected.idx, args.format, alloc, args.skip, args.take, args.start_row, args.end_row, args.range, args.header),
         .cells => try runCellsCommand(out, &book, selected.sheet, selected.idx, alloc, args.skip, args.take, args.start_row, args.end_row, args.range),
         // Handled by the workbook-scoped early return above.
         .meta,
@@ -859,9 +919,26 @@ fn runRowsCommand(
     start_row: ?u32,
     end_row: ?u32,
     range: ?xlsx.MergeRange,
+    header: bool,
 ) !void {
+    // Scoping is enforced at parse time: parseArgs rejects --header on
+    // any format other than .jsonl. Reassert here so any accidental
+    // future caller that bypasses parseArgs fails loudly in Debug.
+    std.debug.assert(!header or format == .jsonl);
+
     var rows = try book.rows(sheet, alloc);
     defer rows.deinit();
+
+    // iter59b-3: owned key strings derived from the header row.
+    // Lifetime is this function's scope; row iteration yields fresh
+    // cell buffers per row, so we must copy header cell contents out
+    // before the next `rows.next()` call reuses the buffer.
+    var header_keys: std.ArrayListUnmanaged([]u8) = .{};
+    defer {
+        for (header_keys.items) |k| alloc.free(k);
+        header_keys.deinit(alloc);
+    }
+    var header_consumed: bool = !header; // if --header off, skip the dance
 
     // iter59b-2: --range + --start-row / --end-row take the INTERSECTION
     // on the row axis. The user said "both bounds apply"; the only
@@ -955,15 +1032,74 @@ fn runRowsCommand(
 
         if (!view.any_non_empty) continue;
 
+        // iter59b-3: the header row lives BEFORE pagination so --skip N
+        // counts N *data* records. The header cells are captured here
+        // and the row itself is swallowed (no envelope emitted).
+        if (!header_consumed) {
+            try captureHeaderKeys(&header_keys, alloc, view.cells, view.col_offset);
+            header_consumed = true;
+            continue;
+        }
+
         switch (pg.consume()) {
             .drop => continue,
             .stop => return,
             .emit => {},
         }
-        switch (format) {
+        if (header) {
+            try writeRowEnvelopeDict(out, sheet.name, sheet_idx, row_number, header_keys.items, view.cells);
+        } else switch (format) {
             .jsonl => try writeRowEnvelope(out, sheet.name, sheet_idx, row_number, view.cells),
             else => try writeRow(out, view.cells, format, view.col_offset),
         }
+    }
+}
+
+/// iter59b-3: derive one owned key string per header cell. String
+/// headers pass through verbatim; numeric/boolean headers are
+/// stringified via bufPrint; empty headers become `"col_<letter>"`
+/// so consumers can still reference the column. `col_offset` is the
+/// absolute 0-based column of cells[0] — matters when --range
+/// produced a sliced view so fallback labels reflect the true column.
+fn captureHeaderKeys(
+    keys: *std.ArrayListUnmanaged([]u8),
+    alloc: std.mem.Allocator,
+    cells: []const xlsx.Cell,
+    col_offset: u32,
+) !void {
+    // Caller owns the list; clear so re-capture in a future multi-sheet
+    // mode stays correct even though today we only ever fill once.
+    for (keys.items) |k| alloc.free(k);
+    keys.clearRetainingCapacity();
+    try keys.ensureTotalCapacity(alloc, cells.len);
+
+    var scratch: [64]u8 = undefined;
+    for (cells, 0..) |c, i| {
+        const absolute_col: u32 = col_offset + @as(u32, @intCast(i));
+        const key: []u8 = switch (c) {
+            .empty => blk: {
+                var letter_buf: [8]u8 = undefined;
+                const letters = colLetter(&letter_buf, absolute_col);
+                break :blk try std.fmt.allocPrint(alloc, "col_{s}", .{letters});
+            },
+            .string => |s| try alloc.dupe(u8, s),
+            .integer => |x| blk: {
+                const s = std.fmt.bufPrint(&scratch, "{d}", .{x}) catch unreachable;
+                break :blk try alloc.dupe(u8, s);
+            },
+            .number => |f| blk: {
+                const s = if (std.math.isFinite(f))
+                    std.fmt.bufPrint(&scratch, "{d}", .{f}) catch unreachable
+                else
+                    // Non-finite headers are a pathological input; fall
+                    // back to the column-letter placeholder rather than
+                    // emitting "nan" which collides across columns.
+                    std.fmt.bufPrint(&scratch, "col_{d}", .{absolute_col + 1}) catch unreachable;
+                break :blk try alloc.dupe(u8, s);
+            },
+            .boolean => |b| try alloc.dupe(u8, if (b) "true" else "false"),
+        };
+        keys.appendAssumeCapacity(key);
     }
 }
 
@@ -2171,7 +2307,7 @@ test "runRowsCommand --range filters rows + masks out-of-range cells" {
         .top_left = .{ .col = 1, .row = 2 },
         .bottom_right = .{ .col = 2, .row = 3 },
     };
-    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, range);
+    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, range, false);
     const out = w.buffered();
     try std.testing.expectEqual(@as(usize, 2), countLines(out));
     try std.testing.expect(std.mem.indexOf(u8, out, "\"B2\"") != null);
@@ -2190,6 +2326,142 @@ test "runRowsCommand --range filters rows + masks out-of-range cells" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"A3\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"D3\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"E3\"") == null);
+}
+
+test "parseArgs --header scoping" {
+    // Happy: `rows` + default format.
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--header" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(a.header);
+        try std.testing.expectEqual(Subcommand.rows, a.subcommand);
+        try std.testing.expectEqual(Format.jsonl, a.format);
+    }
+    // Happy: `rows` + explicit `--format jsonl`.
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--header", "--format", "jsonl" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(a.header);
+    }
+    // Reject: --header on any non-jsonl format (tsv/csv/legacy variants
+    // have their own row shapes and --header would silently no-op).
+    inline for (.{ "tsv", "csv", "legacy-jsonl", "legacy-jsonl-dict" }) |fmt| {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--header", "--format", fmt };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // Reject: --header on any other sub-command.
+    inline for (.{ "cells", "comments", "validations", "hyperlinks", "meta", "list-sheets", "styles", "sst" }) |cmd| {
+        const argv = [_][]const u8{ cmd, "f.xlsx", "--header" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // Reject: --header with the legacy plain-text --list-sheets flag.
+    {
+        const argv = [_][]const u8{ "f.xlsx", "--list-sheets", "--header" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // Default: --header off when absent.
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(!a.header);
+    }
+}
+
+test "runRowsCommand --header promotes first row and emits fields dict" {
+    const tmp_path = "/tmp/zlsx_cli_header_iter59b3.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{ .{ .string = "name" }, .{ .string = "qty" } });
+        try s0.writeRow(&.{ .{ .string = "apple" }, .{ .integer = 3 } });
+        try s0.writeRow(&.{ .{ .string = "pear" }, .{ .integer = 7 } });
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    const countLines = struct {
+        fn f(s: []const u8) usize {
+            var n: usize = 0;
+            for (s) |c| if (c == '\n') {
+                n += 1;
+            };
+            return n;
+        }
+    }.f;
+
+    var scratch: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, null, true);
+    const out = w.buffered();
+
+    // 3 rows in, header consumed → exactly 2 records out.
+    try std.testing.expectEqual(@as(usize, 2), countLines(out));
+    // Header row must NOT appear as a record.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"name\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"cells\":") == null);
+    // Data rows emit as fields dicts keyed by header cell values.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"fields\":{\"name\":\"apple\",\"qty\":3}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"fields\":{\"name\":\"pear\",\"qty\":7}") != null);
+    // Envelope scaffolding still present.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"kind\":\"row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet\":\"Data\"") != null);
+}
+
+test "runRowsCommand --header duplicate header keys emitted verbatim" {
+    const tmp_path = "/tmp/zlsx_cli_header_dup_iter59b3.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{ .{ .string = "x" }, .{ .string = "x" } });
+        try s0.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 } });
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, null, true);
+    const out = w.buffered();
+
+    // Both duplicate "x" keys appear in the dict as-is.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"fields\":{\"x\":1,\"x\":2}") != null);
+}
+
+test "runRowsCommand --header empty header cells fall back to col_<letter>" {
+    const tmp_path = "/tmp/zlsx_cli_header_empty_iter59b3.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        // Header: A="name", B=empty, C="qty" → keys "name","col_B","qty".
+        try s0.writeRow(&.{ .{ .string = "name" }, .empty, .{ .string = "qty" } });
+        try s0.writeRow(&.{ .{ .string = "apple" }, .{ .integer = 42 }, .{ .integer = 3 } });
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, null, true);
+    const out = w.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"col_B\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"name\":\"apple\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"qty\":3") != null);
 }
 
 test "runCellsCommand --skip / --take slice the emitted cell stream" {
