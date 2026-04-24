@@ -41,6 +41,23 @@ const Subcommand = enum {
     sst,
 };
 
+/// iter60b: `--output` wire-shape switch.
+/// - `ndjson` (default) — the invariant envelope NDJSON stream iter55+
+///   already emits. Every record carries its own `sheet`/`sheet_idx`.
+/// - `compact_ndjson` — per-sheet prologue record `{"kind":"sheet",…}`
+///   emitted once per sheet; subsequent per-record lines OMIT
+///   `sheet`/`sheet_idx`. Sheet-scoped sub-commands only (cells / rows /
+///   comments / validations / hyperlinks). On workbook-scoped commands
+///   it's implemented for consistency but is effectively a no-op:
+///   `meta` just drops the `sheet`/`sheet_idx` fields from its sheet
+///   records; `list-sheets` is literally identical to ndjson (it
+///   already emits sheet prologues only); `styles` / `sst` have no
+///   `sheet` field at all.
+/// - `pretty_json` — meta-only. Collapses the workbook + sheets
+///   records into one 2-space-indented JSON object. Every other
+///   sub-command rejects this mode at parse time.
+const OutputMode = enum { ndjson, compact_ndjson, pretty_json };
+
 const Args = struct {
     subcommand: Subcommand = .rows,
     file: []const u8,
@@ -111,6 +128,9 @@ const Args = struct {
     /// exclusive with `--sheet` / `--name` / `--all-sheets`. Ignored on
     /// workbook-scoped sub-commands.
     sheet_glob: ?[]const u8 = null,
+    /// iter60b: wire-shape switch. See OutputMode doc for per-mode
+    /// semantics and the sub-command scoping matrix.
+    output: OutputMode = .ndjson,
 };
 
 const ArgError = error{
@@ -141,7 +161,8 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
             std.mem.eql(u8, a, "--start-row") or
             std.mem.eql(u8, a, "--end-row") or
             std.mem.eql(u8, a, "--range") or
-            std.mem.eql(u8, a, "--sheet-glob"))
+            std.mem.eql(u8, a, "--sheet-glob") or
+            std.mem.eql(u8, a, "--output"))
         {
             i += 1; // skip paired value (bounds-checked by caller)
             continue;
@@ -300,6 +321,23 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
             const br = xlsx.parseA1Ref(raw[colon + 1 ..]) catch return ArgError.BadArgValue;
             if (tl.col > br.col or tl.row > br.row) return ArgError.BadArgValue;
             out.range = .{ .top_left = tl, .bottom_right = br };
+        } else if (std.mem.eql(u8, a, "--output")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            // Strict for every sub-command (not in the workbook_scoped
+            // tolerance group): silently dropping a typoed wire-shape
+            // value would hide a bug in consumer scripts that depend on
+            // the alternate envelope. Fail loud instead.
+            const v = argv[i];
+            if (std.mem.eql(u8, v, "ndjson")) {
+                out.output = .ndjson;
+            } else if (std.mem.eql(u8, v, "compact-ndjson")) {
+                out.output = .compact_ndjson;
+            } else if (std.mem.eql(u8, v, "pretty-json")) {
+                out.output = .pretty_json;
+            } else {
+                return ArgError.BadArgValue;
+            }
         } else if (a.len > 0 and a[0] == '-') {
             return ArgError.UnknownFlag;
         } else {
@@ -401,6 +439,13 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
             if (out.header) return ArgError.BadArgValue;
         }
     }
+    // iter60b: `pretty-json` is the meta-only collapsed-object variant
+    // (docs/jq-for-excel.md v4.1). Every other sub-command emits a
+    // streaming shape — a collapsed single-object rewrite doesn't
+    // compose. Reject at parse time rather than silently fall back.
+    if (out.output == .pretty_json and detected_sub != .meta) {
+        return ArgError.BadArgValue;
+    }
     return out;
 }
 
@@ -489,6 +534,34 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    Valid on `cells` and `rows --format jsonl`
         \\                    only; rejected on `rows --header` (no slot
         \\                    in the fields dict) and flat formats.
+        \\  --output MODE     (iter60b) wire-shape switch:
+        \\                    ndjson           (default) invariant-envelope
+        \\                                     NDJSON — every record carries
+        \\                                     `sheet`/`sheet_idx`.
+        \\                    compact-ndjson   per-sheet prologue record
+        \\                                     {"kind":"sheet","sheet":"S",
+        \\                                     "sheet_idx":N} emitted once per
+        \\                                     sheet; subsequent records OMIT
+        \\                                     `sheet`/`sheet_idx`. Applies to
+        \\                                     cells / rows / comments /
+        \\                                     validations / hyperlinks.
+        \\                                     `--skip`/`--take` still slice
+        \\                                     data records (prologues aren't
+        \\                                     counted). On `meta` the
+        \\                                     per-sheet records drop
+        \\                                     `sheet`/`sheet_idx`; on
+        \\                                     `list-sheets` / `styles` / `sst`
+        \\                                     it's effectively a no-op.
+        \\                    pretty-json      meta-only. Collapses workbook
+        \\                                     + sheets into one 2-space-
+        \\                                     indented JSON object. The
+        \\                                     scalar sheet count is
+        \\                                     `sheets_count` in this mode
+        \\                                     (to avoid the `sheets: [...]`
+        \\                                     array-field collision); NDJSON
+        \\                                     keeps the original `sheets:N`.
+        \\                                     Rejected on every other
+        \\                                     sub-command.
         \\  -h, --help        show this help
         \\
         \\Sub-commands
@@ -723,10 +796,15 @@ fn writeRowEnvelope(
     include_blanks: bool,
     style_ctx: ?EnvelopeStyleCtx,
     col_offset: u32,
+    compact: bool,
 ) !void {
-    try w.writeAll("{\"kind\":\"row\",\"sheet\":");
-    try writeJsonString(w, sheet_name);
-    try w.print(",\"sheet_idx\":{d},\"row\":{d},\"cells\":", .{ sheet_idx, row_number });
+    if (compact) {
+        try w.print("{{\"kind\":\"row\",\"row\":{d},\"cells\":", .{row_number});
+    } else {
+        try w.writeAll("{\"kind\":\"row\",\"sheet\":");
+        try writeJsonString(w, sheet_name);
+        try w.print(",\"sheet_idx\":{d},\"row\":{d},\"cells\":", .{ sheet_idx, row_number });
+    }
     try writeEnvelopeCells(w, cells, row_number, include_blanks, style_ctx, col_offset);
     try w.writeAll("}\n");
 }
@@ -745,10 +823,15 @@ fn writeRowEnvelopeDict(
     row_number: u32,
     keys: []const []const u8,
     data_cells: []const xlsx.Cell,
+    compact: bool,
 ) !void {
-    try w.writeAll("{\"kind\":\"row\",\"sheet\":");
-    try writeJsonString(w, sheet_name);
-    try w.print(",\"sheet_idx\":{d},\"row\":{d},\"fields\":{{", .{ sheet_idx, row_number });
+    if (compact) {
+        try w.print("{{\"kind\":\"row\",\"row\":{d},\"fields\":{{", .{row_number});
+    } else {
+        try w.writeAll("{\"kind\":\"row\",\"sheet\":");
+        try writeJsonString(w, sheet_name);
+        try w.print(",\"sheet_idx\":{d},\"row\":{d},\"fields\":{{", .{ sheet_idx, row_number });
+    }
     for (keys, 0..) |k, i| {
         if (i > 0) try w.writeByte(',');
         try writeJsonString(w, k);
@@ -782,12 +865,19 @@ fn writeCell(
     col: u32,
     cell: xlsx.Cell,
     style_ctx: ?CellStyleCtx,
+    compact: bool,
 ) !void {
-    try w.writeAll("{\"kind\":\"cell\",\"sheet\":");
-    try writeJsonString(w, sheet_name);
-    try w.print(",\"sheet_idx\":{d},\"ref\":", .{sheet_idx});
-    try writeJsonString(w, ref);
-    try w.print(",\"row\":{d},\"col\":{d},\"t\":", .{ row, col });
+    if (compact) {
+        try w.writeAll("{\"kind\":\"cell\",\"ref\":");
+        try writeJsonString(w, ref);
+        try w.print(",\"row\":{d},\"col\":{d},\"t\":", .{ row, col });
+    } else {
+        try w.writeAll("{\"kind\":\"cell\",\"sheet\":");
+        try writeJsonString(w, sheet_name);
+        try w.print(",\"sheet_idx\":{d},\"ref\":", .{sheet_idx});
+        try writeJsonString(w, ref);
+        try w.print(",\"row\":{d},\"col\":{d},\"t\":", .{ row, col });
+    }
     switch (cell) {
         .empty => try w.writeAll("\"blank\",\"v\":null"),
         else => {
@@ -1147,7 +1237,7 @@ fn runMain() !u8 {
                 try err.flush();
                 break :blk null;
             };
-            try runMetaCommand(out, &book, path_opt);
+            try runMetaCommand(out, &book, path_opt, args.output);
             return 0;
         },
         .list_sheets => {
@@ -1264,6 +1354,18 @@ const Pagination = struct {
     }
 };
 
+/// iter60b: emit the compact-ndjson sheet prologue. Called once per
+/// sheet, just before the sheet's first emitted data record in
+/// `compact-ndjson` mode. Callers own the "did I emit this sheet's
+/// prologue yet?" bookkeeping — typically via a `last_sheet_idx:
+/// ?usize` threaded across a cross-sheet run, so pagination can skip a
+/// sheet entirely (no prologue leaks for empty/skipped sheets).
+fn writeCompactSheetPrologue(w: *std.Io.Writer, sheet_name: []const u8, sheet_idx: usize) !void {
+    try w.writeAll("{\"kind\":\"sheet\",\"sheet\":");
+    try writeJsonString(w, sheet_name);
+    try w.print(",\"sheet_idx\":{d}}}\n", .{sheet_idx});
+}
+
 /// iter59c: single-sheet row driver. Kept for call-site compat with
 /// the existing test suite — constructs a fresh Pagination internally.
 /// Multi-sheet callers go through `runRowsAcrossSheets` so pagination
@@ -1285,7 +1387,7 @@ fn runRowsCommand(
     with_styles: bool,
 ) !void {
     var pg = Pagination.init(skip, take);
-    try runRowsOnSheet(out, book, sheet, sheet_idx, format, alloc, &pg, start_row, end_row, range, header, include_blanks, with_styles);
+    try runRowsOnSheet(out, book, sheet, sheet_idx, format, alloc, &pg, start_row, end_row, range, header, include_blanks, with_styles, false);
 }
 
 /// iter59c: per-sheet body of `rows`. Takes the Pagination by pointer
@@ -1306,7 +1408,15 @@ fn runRowsOnSheet(
     header: bool,
     include_blanks: bool,
     with_styles: bool,
+    compact: bool,
 ) !void {
+    // iter60b: compact-ndjson wire shape emits a `{"kind":"sheet",…}`
+    // prologue before the first data record of this sheet. Deferred
+    // to just-before-emit so paginated-away or all-blank sheets
+    // don't leak a stray prologue with no records behind it. Local
+    // to this call — the per-sheet prologue is independent of the
+    // cross-sheet Pagination counter.
+    var prologue_emitted = false;
     // Scoping is enforced at parse time: parseArgs rejects --header on
     // any format other than .jsonl. Reassert here so any accidental
     // future caller that bypasses parseArgs fails loudly in Debug.
@@ -1454,15 +1564,19 @@ fn runRowsOnSheet(
             .stop => return,
             .emit => {},
         }
+        if (compact and !prologue_emitted) {
+            try writeCompactSheetPrologue(out, sheet.name, sheet_idx);
+            prologue_emitted = true;
+        }
         if (header) {
-            try writeRowEnvelopeDict(out, sheet.name, sheet_idx, row_number, header_keys.items, view.cells);
+            try writeRowEnvelopeDict(out, sheet.name, sheet_idx, row_number, header_keys.items, view.cells, compact);
         } else switch (format) {
             .jsonl => {
                 const style_ctx: ?EnvelopeStyleCtx = if (with_styles)
                     .{ .book = book, .style_indices = view.style_indices }
                 else
                     null;
-                try writeRowEnvelope(out, sheet.name, sheet_idx, row_number, view.cells, include_blanks, style_ctx, view.col_offset);
+                try writeRowEnvelope(out, sheet.name, sheet_idx, row_number, view.cells, include_blanks, style_ctx, view.col_offset, compact);
             },
             // iter59b-4: flat formats are shape-neutral w.r.t. both
             // --include-blanks (they serialise empties per their own
@@ -1546,7 +1660,7 @@ fn runCellsCommand(
     with_styles: bool,
 ) !void {
     var pg = Pagination.init(skip, take);
-    try runCellsOnSheet(out, book, sheet, sheet_idx, alloc, &pg, start_row, end_row, range, include_blanks, with_styles);
+    try runCellsOnSheet(out, book, sheet, sheet_idx, alloc, &pg, start_row, end_row, range, include_blanks, with_styles, false);
 }
 
 /// iter59c: per-sheet cell emitter — takes Pagination by pointer so a
@@ -1563,7 +1677,12 @@ fn runCellsOnSheet(
     range: ?xlsx.MergeRange,
     include_blanks: bool,
     with_styles: bool,
+    compact: bool,
 ) !void {
+    // See runRowsOnSheet for rationale — deferred, local-to-this-call,
+    // prologue is never emitted unless at least one cell of this sheet
+    // passes pagination and is about to be written.
+    var prologue_emitted = false;
     var rows = try book.rows(sheet, alloc);
     defer rows.deinit();
 
@@ -1620,6 +1739,10 @@ fn runCellsOnSheet(
                 break :blk .{ .book = book, .style_idx = sidx };
             } else null;
 
+            if (compact and !prologue_emitted) {
+                try writeCompactSheetPrologue(out, sheet.name, sheet_idx);
+                prologue_emitted = true;
+            }
             try writeCell(
                 out,
                 sheet.name,
@@ -1629,6 +1752,7 @@ fn runCellsOnSheet(
                 @intCast(i + 1),
                 c,
                 style_ctx,
+                compact,
             );
             // Per docs/jq-for-excel.md v4.1: "every record is written
             // with an explicit newline + flush on stdout." The flush
@@ -1681,6 +1805,7 @@ fn runCellsAcrossSheets(
             args.range,
             args.include_blanks,
             args.with_styles,
+            args.output == .compact_ndjson,
         );
     }
     // iter60a-P1 follow-up: final explicit flush so stdout write
@@ -1720,6 +1845,7 @@ fn runRowsAcrossSheets(
             args.header,
             args.include_blanks,
             args.with_styles,
+            args.output == .compact_ndjson,
         );
     }
     try out.flush();
@@ -1734,6 +1860,7 @@ fn runMetaCommand(
     out: *std.Io.Writer,
     book: *const xlsx.Book,
     path: ?[]const u8,
+    output: OutputMode,
 ) !void {
     // Workbook-level `has_comments` is the OR across every sheet —
     // saves callers a reduce step when they only want "does this file
@@ -1744,6 +1871,57 @@ fn runMetaCommand(
             any_comments = true;
             break;
         }
+    }
+
+    if (output == .pretty_json) {
+        // iter60b: collapse workbook + per-sheet records into one
+        // 2-space-indented JSON object. The scalar sheet count is
+        // renamed from `sheets` to `sheets_count` in this mode ONLY
+        // so it doesn't collide with the `sheets: [...]` array that
+        // carries the per-sheet records. NDJSON output keeps the
+        // original `sheets:N` scalar for back-compat (see below).
+        try out.writeAll("{\n");
+        try out.writeAll("  \"kind\": \"workbook\",\n");
+        try out.writeAll("  \"path\": ");
+        if (path) |p| try writeJsonString(out, p) else try out.writeAll("null");
+        try out.print(
+            ",\n  \"sheets_count\": {d},\n",
+            .{book.sheets.len},
+        );
+        try out.print(
+            "  \"sst\": {{\"count\": {d}, \"rich\": {d}}},\n",
+            .{ book.shared_strings.len, book.rich_runs_by_sst_idx.count() },
+        );
+        try out.print(
+            "  \"has_styles\": {s},\n  \"has_theme\": {s},\n  \"has_comments\": {s},\n",
+            .{
+                if (book.styles_xml != null) "true" else "false",
+                if (book.theme_xml != null) "true" else "false",
+                if (any_comments) "true" else "false",
+            },
+        );
+        try out.writeAll("  \"sheets\": [");
+        if (book.sheets.len == 0) {
+            try out.writeAll("]\n}\n");
+            try out.flush();
+            return;
+        }
+        try out.writeByte('\n');
+        for (book.sheets, 0..) |s, i| {
+            if (signals.shouldStop()) return;
+            const sheet_has_comments = book.comments(s).len != 0;
+            try out.writeAll("    {\"kind\": \"sheet\", \"sheet\": ");
+            try writeJsonString(out, s.name);
+            try out.print(
+                ", \"sheet_idx\": {d}, \"has_comments\": {s}}}",
+                .{ i, if (sheet_has_comments) "true" else "false" },
+            );
+            if (i + 1 < book.sheets.len) try out.writeByte(',');
+            try out.writeByte('\n');
+        }
+        try out.writeAll("  ]\n}\n");
+        try out.flush();
+        return;
     }
 
     // `path` is null when the caller detected non-UTF-8 bytes in the
@@ -1764,15 +1942,27 @@ fn runMetaCommand(
         },
     );
 
+    const compact = output == .compact_ndjson;
     for (book.sheets, 0..) |s, i| {
         if (signals.shouldStop()) return;
         const sheet_has_comments = book.comments(s).len != 0;
-        try out.writeAll("{\"kind\":\"sheet\",\"sheet\":");
-        try writeJsonString(out, s.name);
-        try out.print(
-            ",\"sheet_idx\":{d},\"has_comments\":{s}}}\n",
-            .{ i, if (sheet_has_comments) "true" else "false" },
-        );
+        if (compact) {
+            // iter60b: the workbook record is the prologue, so per-sheet
+            // records shed `sheet`/`sheet_idx` and keep only
+            // `has_comments`. Order in the workbook record still pins
+            // the mapping (index = array position).
+            try out.print(
+                "{{\"kind\":\"sheet\",\"has_comments\":{s}}}\n",
+                .{if (sheet_has_comments) "true" else "false"},
+            );
+        } else {
+            try out.writeAll("{\"kind\":\"sheet\",\"sheet\":");
+            try writeJsonString(out, s.name);
+            try out.print(
+                ",\"sheet_idx\":{d},\"has_comments\":{s}}}\n",
+                .{ i, if (sheet_has_comments) "true" else "false" },
+            );
+        }
     }
     try out.flush();
 }
@@ -1979,6 +2169,14 @@ fn runCommentsCommand(
     end_row: ?u32,
 ) !void {
     var pg = Pagination.init(skip, take);
+    const compact = args.output == .compact_ndjson;
+    // iter60b: in compact mode, prologue is emitted on first
+    // to-be-emitted record of each sheet. Tracking last emitted
+    // sheet_idx rather than a per-sheet local bool lets pagination
+    // that straddles sheet boundaries still get prologues interleaved
+    // correctly (a --take that stops mid-sheet 1 emits sheet 0's
+    // prologue but never sheet 1's).
+    var last_prologue: ?usize = null;
     for (book.sheets, 0..) |s, sheet_idx| {
         if (signals.shouldStop()) return;
         if (filter) |f| {
@@ -2001,13 +2199,22 @@ fn runCommentsCommand(
                 .stop => return,
                 .emit => {},
             }
+            if (compact and (last_prologue == null or last_prologue.? != sheet_idx)) {
+                try writeCompactSheetPrologue(out, s.name, sheet_idx);
+                last_prologue = sheet_idx;
+            }
             var ref_buf: [16]u8 = undefined;
             const ref = refFromCellRef(&ref_buf, c.top_left);
 
-            try out.writeAll("{\"kind\":\"comment\",\"sheet\":");
-            try writeJsonString(out, s.name);
-            try out.print(",\"sheet_idx\":{d},\"ref\":", .{sheet_idx});
-            try writeJsonString(out, ref);
+            if (compact) {
+                try out.writeAll("{\"kind\":\"comment\",\"ref\":");
+                try writeJsonString(out, ref);
+            } else {
+                try out.writeAll("{\"kind\":\"comment\",\"sheet\":");
+                try writeJsonString(out, s.name);
+                try out.print(",\"sheet_idx\":{d},\"ref\":", .{sheet_idx});
+                try writeJsonString(out, ref);
+            }
             // Reader `col` is 0-based (A=0); wire format is 1-based
             // (A=1) for consistency with `cells` / `rows` envelopes.
             try out.print(
@@ -2036,6 +2243,8 @@ fn runValidationsCommand(
     take: ?usize,
 ) !void {
     var pg = Pagination.init(skip, take);
+    const compact = args.output == .compact_ndjson;
+    var last_prologue: ?usize = null;
     for (book.sheets, 0..) |s, sheet_idx| {
         if (signals.shouldStop()) return;
         if (filter) |f| {
@@ -2050,13 +2259,22 @@ fn runValidationsCommand(
                 .stop => return,
                 .emit => {},
             }
+            if (compact and (last_prologue == null or last_prologue.? != sheet_idx)) {
+                try writeCompactSheetPrologue(out, s.name, sheet_idx);
+                last_prologue = sheet_idx;
+            }
             var range_buf: [32]u8 = undefined;
             const range = rangeFromBounds(&range_buf, dv.top_left, dv.bottom_right);
 
-            try out.writeAll("{\"kind\":\"validation\",\"sheet\":");
-            try writeJsonString(out, s.name);
-            try out.print(",\"sheet_idx\":{d},\"range\":", .{sheet_idx});
-            try writeJsonString(out, range);
+            if (compact) {
+                try out.writeAll("{\"kind\":\"validation\",\"range\":");
+                try writeJsonString(out, range);
+            } else {
+                try out.writeAll("{\"kind\":\"validation\",\"sheet\":");
+                try writeJsonString(out, s.name);
+                try out.print(",\"sheet_idx\":{d},\"range\":", .{sheet_idx});
+                try writeJsonString(out, range);
+            }
             try out.print(",\"rule_type\":\"{s}\",\"op\":", .{validationKindName(dv.kind)});
             if (dv.op) |op| try out.print("\"{s}\"", .{validationOpName(op)}) else try out.writeAll("null");
 
@@ -2093,6 +2311,8 @@ fn runHyperlinksCommand(
     take: ?usize,
 ) !void {
     var pg = Pagination.init(skip, take);
+    const compact = args.output == .compact_ndjson;
+    var last_prologue: ?usize = null;
     for (book.sheets, 0..) |s, sheet_idx| {
         if (signals.shouldStop()) return;
         if (filter) |f| {
@@ -2107,13 +2327,22 @@ fn runHyperlinksCommand(
                 .stop => return,
                 .emit => {},
             }
+            if (compact and (last_prologue == null or last_prologue.? != sheet_idx)) {
+                try writeCompactSheetPrologue(out, s.name, sheet_idx);
+                last_prologue = sheet_idx;
+            }
             var range_buf: [32]u8 = undefined;
             const range = rangeFromBounds(&range_buf, h.top_left, h.bottom_right);
 
-            try out.writeAll("{\"kind\":\"hyperlink\",\"sheet\":");
-            try writeJsonString(out, s.name);
-            try out.print(",\"sheet_idx\":{d},\"range\":", .{sheet_idx});
-            try writeJsonString(out, range);
+            if (compact) {
+                try out.writeAll("{\"kind\":\"hyperlink\",\"range\":");
+                try writeJsonString(out, range);
+            } else {
+                try out.writeAll("{\"kind\":\"hyperlink\",\"sheet\":");
+                try writeJsonString(out, s.name);
+                try out.print(",\"sheet_idx\":{d},\"range\":", .{sheet_idx});
+                try writeJsonString(out, range);
+            }
             try out.writeAll(",\"url\":");
             if (h.url.len != 0) try writeJsonString(out, h.url) else try out.writeAll("null");
             try out.writeAll(",\"location\":");
@@ -2508,7 +2737,7 @@ test "writeRowEnvelope emits kind + sheet + sheet_idx + row + sparse cells" {
         .{ .number = 3.5 },
         .{ .boolean = true },
     };
-    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null, 0);
+    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null, 0, false);
     const expected =
         "{\"kind\":\"row\",\"sheet\":\"Data\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
         "{\"ref\":\"A1\",\"col\":1,\"t\":\"str\",\"v\":\"name\"}," ++
@@ -2523,7 +2752,7 @@ test "writeRowEnvelope all-empty row emits envelope with empty cells array" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
     const cells = [_]xlsx.Cell{ .empty, .empty, .empty };
-    try writeRowEnvelope(&w, "S", 2, 7, &cells, false, null, 0);
+    try writeRowEnvelope(&w, "S", 2, 7, &cells, false, null, 0, false);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"row\",\"sheet\":\"S\",\"sheet_idx\":2,\"row\":7,\"cells\":[]}\n",
         w.buffered(),
@@ -2534,7 +2763,7 @@ test "writeRowEnvelope escapes sheet name" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
     const cells = [_]xlsx.Cell{.{ .integer = 1 }};
-    try writeRowEnvelope(&w, "She\"et\n", 0, 1, &cells, false, null, 0);
+    try writeRowEnvelope(&w, "She\"et\n", 0, 1, &cells, false, null, 0, false);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"row\",\"sheet\":\"She\\\"et\\n\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
             "{\"ref\":\"A1\",\"col\":1,\"t\":\"int\",\"v\":1}" ++
@@ -2547,7 +2776,7 @@ test "writeRowEnvelope non-finite number becomes null v" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
     const cells = [_]xlsx.Cell{.{ .number = std.math.nan(f64) }};
-    try writeRowEnvelope(&w, "S", 0, 1, &cells, false, null, 0);
+    try writeRowEnvelope(&w, "S", 0, 1, &cells, false, null, 0, false);
     // `t` stays `"num"` for the non-finite case — the type of the
     // cell didn't change, only its JSON-serializable value did.
     // This matches the pre-iter55a behaviour of writeJsonCell.
@@ -2605,7 +2834,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
     // string
     {
         var w = std.Io.Writer.fixed(&scratch);
-        try writeCell(&w, "Data", 0, "A1", 1, 1, .{ .string = "name" }, null);
+        try writeCell(&w, "Data", 0, "A1", 1, 1, .{ .string = "name" }, null, false);
         try std.testing.expectEqualStrings(
             "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"A1\",\"row\":1,\"col\":1,\"t\":\"str\",\"v\":\"name\"}\n",
             w.buffered(),
@@ -2614,7 +2843,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
     // integer
     {
         var w = std.Io.Writer.fixed(&scratch);
-        try writeCell(&w, "Data", 0, "B2", 2, 2, .{ .integer = 3 }, null);
+        try writeCell(&w, "Data", 0, "B2", 2, 2, .{ .integer = 3 }, null, false);
         try std.testing.expectEqualStrings(
             "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"B2\",\"row\":2,\"col\":2,\"t\":\"int\",\"v\":3}\n",
             w.buffered(),
@@ -2623,7 +2852,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
     // number
     {
         var w = std.Io.Writer.fixed(&scratch);
-        try writeCell(&w, "Data", 0, "C3", 3, 3, .{ .number = 3.5 }, null);
+        try writeCell(&w, "Data", 0, "C3", 3, 3, .{ .number = 3.5 }, null, false);
         try std.testing.expectEqualStrings(
             "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"C3\",\"row\":3,\"col\":3,\"t\":\"num\",\"v\":3.5}\n",
             w.buffered(),
@@ -2632,7 +2861,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
     // boolean
     {
         var w = std.Io.Writer.fixed(&scratch);
-        try writeCell(&w, "Data", 0, "D4", 4, 4, .{ .boolean = true }, null);
+        try writeCell(&w, "Data", 0, "D4", 4, 4, .{ .boolean = true }, null, false);
         try std.testing.expectEqualStrings(
             "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"D4\",\"row\":4,\"col\":4,\"t\":\"bool\",\"v\":true}\n",
             w.buffered(),
@@ -2643,7 +2872,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
 test "writeCell escapes sheet name" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try writeCell(&w, "She\"et\n", 2, "A1", 1, 1, .{ .integer = 7 }, null);
+    try writeCell(&w, "She\"et\n", 2, "A1", 1, 1, .{ .integer = 7 }, null, false);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"cell\",\"sheet\":\"She\\\"et\\n\",\"sheet_idx\":2,\"ref\":\"A1\",\"row\":1,\"col\":1,\"t\":\"int\",\"v\":7}\n",
         w.buffered(),
@@ -2670,7 +2899,7 @@ test "cells loop skips empty cells from the stream" {
         const letters = colLetter(&col_buf, i);
         var ref_buf: [16]u8 = undefined;
         const ref = std.fmt.bufPrint(&ref_buf, "{s}{d}", .{ letters, row_number }) catch unreachable;
-        try writeCell(&w, "S", 0, ref, row_number, @intCast(i + 1), c, null);
+        try writeCell(&w, "S", 0, ref, row_number, @intCast(i + 1), c, null, false);
     }
 
     try std.testing.expectEqualStrings(
@@ -3720,7 +3949,7 @@ test "runMetaCommand emits path:null on non-UTF-8 workbook path" {
     };
     defer empty_book.deinit();
 
-    try runMetaCommand(&w, &empty_book, null);
+    try runMetaCommand(&w, &empty_book, null, .ndjson);
 
     const out = scratch[0..w.end];
     // The path field must serialize as literal `null`, not a string.
@@ -3781,7 +4010,7 @@ test "runMetaCommand emits workbook record with sst/has_* fields then sheet reco
 
     var scratch: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runMetaCommand(&w, &book, tmp_path);
+    try runMetaCommand(&w, &book, tmp_path, .ndjson);
 
     const out = w.buffered();
     // Parse NDJSON line by line and assert field presence + values.
@@ -4280,6 +4509,196 @@ test "parseArgs --sheet-glob value isn't mistaken for a sub-command token" {
     try std.testing.expectEqual(Subcommand.rows, a.subcommand);
     try std.testing.expectEqualStrings("f.xlsx", a.file);
     try std.testing.expectEqualStrings("cells", a.sheet_glob.?);
+}
+
+test "parseArgs --output parses the three valid modes" {
+    {
+        const argv = [_][]const u8{ "cells", "--output", "ndjson", "f.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(OutputMode.ndjson, a.output);
+    }
+    {
+        const argv = [_][]const u8{ "cells", "--output", "compact-ndjson", "f.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(OutputMode.compact_ndjson, a.output);
+    }
+    {
+        const argv = [_][]const u8{ "meta", "--output", "pretty-json", "f.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(OutputMode.pretty_json, a.output);
+    }
+}
+
+test "parseArgs --output rejects unknown values" {
+    const argv = [_][]const u8{ "cells", "--output", "yaml", "f.xlsx" };
+    try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+}
+
+test "parseArgs --output missing value is MissingValue" {
+    const argv = [_][]const u8{ "cells", "--output" };
+    try std.testing.expectError(ArgError.MissingValue, parseArgs(&argv));
+}
+
+test "parseArgs --output pretty-json is rejected on every sub-command other than meta" {
+    const subs = [_][]const u8{
+        "cells",       "rows",       "list-sheets", "comments",
+        "validations", "hyperlinks", "styles",      "sst",
+    };
+    for (subs) |sub| {
+        const argv = [_][]const u8{ sub, "--output", "pretty-json", "f.xlsx" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // Bare `zlsx file.xlsx` defaults to the `rows` sub-command, which
+    // also cannot accept pretty-json.
+    const argv_bare = [_][]const u8{ "--output", "pretty-json", "f.xlsx" };
+    try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv_bare));
+}
+
+test "detectSubcommand skips --output value (value that collides with a sub-command token)" {
+    // Regression guard: if detectSubcommand didn't consume --output's
+    // paired value, `--output cells` would re-route the sub-command to
+    // `.cells`. The paired-value skip list must include `--output`.
+    const argv = [_][]const u8{ "rows", "--output", "ndjson", "f.xlsx" };
+    const a = try parseArgs(&argv);
+    try std.testing.expectEqual(Subcommand.rows, a.subcommand);
+    try std.testing.expectEqualStrings("f.xlsx", a.file);
+}
+
+test "runCellsAcrossSheets compact-ndjson emits per-sheet prologue and omits sheet/sheet_idx on cell records" {
+    const tmp_path = "/tmp/zlsx_cli_compact_cells_iter60b.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{ .{ .string = "name" }, .{ .string = "qty" } });
+        try s0.writeRow(&.{ .{ .string = "a" }, .{ .integer = 1 } });
+        var s1 = try w.addSheet("Other");
+        try s1.writeRow(&.{.{ .string = "x" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const args: Args = .{
+        .file = tmp_path,
+        .subcommand = .cells,
+        .all_sheets = true,
+        .output = .compact_ndjson,
+    };
+    try runCellsAcrossSheets(&w, &book, args, std.testing.allocator);
+
+    const out = w.buffered();
+
+    // Count prologue records — one per sheet.
+    const prologue = "{\"kind\":\"sheet\",";
+    var i: usize = 0;
+    var prologues: usize = 0;
+    while (std.mem.indexOfPos(u8, out, i, prologue)) |p| {
+        prologues += 1;
+        i = p + prologue.len;
+    }
+    try std.testing.expectEqual(@as(usize, 2), prologues);
+
+    // Count cell records — 4 non-empty cells total (2 on Data row 1,
+    // 2 on Data row 2, and 1 on Other; that's 5).
+    const cell_tag = "{\"kind\":\"cell\",";
+    i = 0;
+    var cells_count: usize = 0;
+    while (std.mem.indexOfPos(u8, out, i, cell_tag)) |p| {
+        cells_count += 1;
+        i = p + cell_tag.len;
+    }
+    try std.testing.expectEqual(@as(usize, 5), cells_count);
+
+    // Every cell line must start with `{"kind":"cell","ref":` — the
+    // `sheet`/`sheet_idx` fields must be absent on cell records.
+    var line_it = std.mem.splitScalar(u8, out, '\n');
+    while (line_it.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.startsWith(u8, line, "{\"kind\":\"cell\",")) {
+            try std.testing.expect(std.mem.indexOf(u8, line, "\"sheet\":") == null);
+            try std.testing.expect(std.mem.indexOf(u8, line, "\"sheet_idx\":") == null);
+            try std.testing.expect(std.mem.startsWith(u8, line, "{\"kind\":\"cell\",\"ref\":"));
+        }
+    }
+
+    // First line is the Data prologue, since Data is sheet 0.
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        out,
+        "{\"kind\":\"sheet\",\"sheet\":\"Data\",\"sheet_idx\":0}\n",
+    ));
+}
+
+test "runMetaCommand pretty-json collapses workbook + sheets into one JSON object" {
+    const tmp_path = "/tmp/zlsx_cli_pretty_meta_iter60b.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{.{ .string = "hdr" }});
+        var s1 = try w.addSheet("Other");
+        try s1.writeRow(&.{.{ .integer = 1 }});
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try runMetaCommand(&w, &book, tmp_path, .pretty_json);
+
+    const out = w.buffered();
+
+    // std.json must accept it — that alone is the strongest structural
+    // assertion (balanced braces, valid strings/numbers, etc.).
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("workbook", root.get("kind").?.string);
+    // sheets_count scalar — see OutputMode doc for why we renamed the
+    // scalar in this mode only.
+    try std.testing.expectEqual(@as(i64, 2), root.get("sheets_count").?.integer);
+    const sheets_arr = root.get("sheets").?.array;
+    try std.testing.expectEqual(@as(usize, 2), sheets_arr.items.len);
+    try std.testing.expectEqualStrings(
+        "sheet",
+        sheets_arr.items[0].object.get("kind").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "Data",
+        sheets_arr.items[0].object.get("sheet").?.string,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 0),
+        sheets_arr.items[0].object.get("sheet_idx").?.integer,
+    );
+    try std.testing.expectEqualStrings(
+        "Other",
+        sheets_arr.items[1].object.get("sheet").?.string,
+    );
+
+    // Indentation sanity: 2-space prefix on each inner key.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\n  \"kind\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\n  \"sheets\":") != null);
+}
+
+test "parseArgs default --output is ndjson" {
+    // Regression guard: every sub-command without an explicit --output
+    // resolves to OutputMode.ndjson so the wire-shape default stays
+    // exactly what iter60a shipped.
+    const argv = [_][]const u8{ "cells", "f.xlsx" };
+    const a = try parseArgs(&argv);
+    try std.testing.expectEqual(OutputMode.ndjson, a.output);
 }
 
 test "globMatch literal / wildcards / edge cases" {
