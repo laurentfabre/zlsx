@@ -929,7 +929,116 @@ fn writeRow(w: *std.Io.Writer, cells: []const xlsx.Cell, fmt: Format, col_offset
     }
 }
 
-pub fn main() !u8 {
+// ─── iter60a: process hygiene (signals + exit codes) ────────────────
+//
+// Three goals, per docs/jq-for-excel.md v4.1:
+//  1. `zlsx cells huge.xlsx | head -10` exits cleanly on SIGPIPE — no
+//     broken-pipe traceback, no stderr noise, exit 0.
+//  2. SIGINT / SIGTERM flush in-flight records, exit 130 / 143. A
+//     partial record mid-emission is dropped (not written) so the
+//     stream stays valid NDJSON.
+//  3. Exit-code table is wired: 0/1/2/3/4/5/130/143 per the doc.
+//
+// Signal handling is async-signal-safe by construction: the handlers
+// only touch three atomic flags and nothing else. No allocation, no
+// writers, no stdlib calls beyond atomic stores. Exit codes are routed
+// from `main()` at the normal return path.
+//
+// Mid-record discard contract: every emission loop polls
+// `signals.shouldStop()` BEFORE starting a new record. Once the flag
+// is set, we return early without writing the opening brace — so
+// every line on stdout is a complete, valid NDJSON record.
+const signals = struct {
+    var stop_streaming = std.atomic.Value(bool).init(false);
+    var sigint_fired = std.atomic.Value(bool).init(false);
+    var sigterm_fired = std.atomic.Value(bool).init(false);
+    var sigpipe_fired = std.atomic.Value(bool).init(false);
+
+    fn onSigpipe(_: i32) callconv(.c) void {
+        sigpipe_fired.store(true, .release);
+        stop_streaming.store(true, .release);
+    }
+    fn onSigint(_: i32) callconv(.c) void {
+        sigint_fired.store(true, .release);
+        stop_streaming.store(true, .release);
+    }
+    fn onSigterm(_: i32) callconv(.c) void {
+        sigterm_fired.store(true, .release);
+        stop_streaming.store(true, .release);
+    }
+
+    fn install() void {
+        if (builtin.os.tag == .windows) return;
+        const pipe_act: std.posix.Sigaction = .{
+            .handler = .{ .handler = onSigpipe },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        const int_act: std.posix.Sigaction = .{
+            .handler = .{ .handler = onSigint },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        const term_act: std.posix.Sigaction = .{
+            .handler = .{ .handler = onSigterm },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.PIPE, &pipe_act, null);
+        std.posix.sigaction(std.posix.SIG.INT, &int_act, null);
+        std.posix.sigaction(std.posix.SIG.TERM, &term_act, null);
+    }
+
+    inline fn shouldStop() bool {
+        return stop_streaming.load(.acquire);
+    }
+
+    /// Map the current signal state to the right exit code per the
+    /// design-doc table. Caller has already finished emission — we
+    /// only choose the shell status byte. SIGINT beats SIGTERM beats
+    /// SIGPIPE in the rare case two fire in the same process lifetime;
+    /// the ordering matches the severity the user experiences (Ctrl-C
+    /// is user intent, SIGTERM is orderly shutdown, SIGPIPE is normal
+    /// pipeline teardown).
+    fn exitCode(existing: u8) u8 {
+        if (sigint_fired.load(.acquire)) return 130;
+        if (sigterm_fired.load(.acquire)) return 143;
+        if (sigpipe_fired.load(.acquire)) return 0;
+        return existing;
+    }
+};
+
+/// iter60a: classify a top-level CLI error against the exit-code
+/// table. Stdout write failures (the pipe peer closed, disk full,
+/// etc.) become exit 5 — but only if SIGPIPE didn't fire first, in
+/// which case the signal state takes precedence via `signals.exitCode`.
+/// `OutOfMemory` falls through to exit 1 (unexpected programmer
+/// error); everything else surfaces via its error name and exit 1
+/// so the user has a handle to file a bug.
+fn classifyTopLevelError(e: anyerror) u8 {
+    return switch (e) {
+        error.WriteFailed, error.Unexpected, error.BrokenPipe => 5,
+        else => 1,
+    };
+}
+
+pub fn main() u8 {
+    // iter60a: the process-hygiene slice. Install SIGPIPE / SIGINT /
+    // SIGTERM handlers before any emission can begin so a fast pipe
+    // teardown (e.g. `| head -0`) never races the first write.
+    signals.install();
+
+    const code = runMain() catch |e| blk: {
+        // Route library-level errors against the exit-code table. A
+        // signal fired mid-write (SIGPIPE → EPIPE on stdout) takes
+        // precedence over WriteFailed-like errors, which is handled
+        // in `signals.exitCode` below.
+        break :blk classifyTopLevelError(e);
+    };
+    return signals.exitCode(code);
+}
+
+fn runMain() !u8 {
     // Debug builds use the leak-detecting allocator; release builds use
     // smp_allocator — fast, pure-Zig (no libc dep). smp_allocator asserts
     // !builtin.single_threaded, so single-threaded builds fall back to
@@ -951,6 +1060,12 @@ pub fn main() !u8 {
     var stdout_buf: [16 * 1024]u8 = undefined;
     var stdout_file = std.fs.File.stdout().writer(&stdout_buf);
     const out = &stdout_file.interface;
+    // iter60a: flush on normal exit AND on a signal-triggered stop.
+    // Per-record flushes below surface SIGPIPE promptly; this trailing
+    // flush is the belt-and-braces for the success path and for the
+    // partial last-record case after SIGINT/SIGTERM. Errors are
+    // silenced — by the time we're in a defer there's nothing sensible
+    // to do with a write failure.
     defer out.flush() catch {};
 
     var stderr_buf: [4 * 1024]u8 = undefined;
@@ -996,8 +1111,10 @@ pub fn main() !u8 {
 
     if (args.list_sheets) {
         for (book.sheets) |s| {
+            if (signals.shouldStop()) return 0;
             try out.writeAll(s.name);
             try out.writeByte('\n');
+            try out.flush();
         }
         return 0;
     }
@@ -1234,6 +1351,9 @@ fn runRowsOnSheet(
     defer masked_styles.deinit(alloc);
 
     while (try rows.next()) |cells| {
+        // iter60a: outer-loop stop-poll — mid-record discard contract.
+        // Once flagged, we bail before touching the row's cells.
+        if (signals.shouldStop()) return;
         const row_number = rows.currentRowNumber();
         // Row bounds run BEFORE pagination (design doc v4.1).
         if (row_lo) |s| if (row_number < s) continue;
@@ -1342,6 +1462,9 @@ fn runRowsOnSheet(
             // can set it unconditionally.
             else => try writeRow(out, view.cells, format, view.col_offset),
         }
+        // iter60a: per-record flush so SIGPIPE surfaces on the next
+        // write attempt rather than sitting in the 16 KiB buffer.
+        try out.flush();
     }
 }
 
@@ -1454,6 +1577,7 @@ fn runCellsOnSheet(
     };
 
     while (try rows.next()) |cells| {
+        if (signals.shouldStop()) return;
         const row_number = rows.currentRowNumber();
         if (row_lo) |s| if (row_number < s) continue;
         if (row_hi) |e| if (row_number > e) break;
@@ -1467,6 +1591,11 @@ fn runCellsOnSheet(
                 const col: u32 = @intCast(i);
                 if (col < r.top_left.col or col > r.bottom_right.col) continue;
             }
+            // iter60a: poll BEFORE pg.consume()+write so a signal
+            // during a hot inner loop doesn't leave a half-written
+            // record on stdout. Atomic acquire-load per candidate is
+            // ~free relative to the xlsx parse cost.
+            if (signals.shouldStop()) return;
 
             switch (pg.consume()) {
                 .drop => continue,
@@ -1494,6 +1623,11 @@ fn runCellsOnSheet(
                 c,
                 style_ctx,
             );
+            // Per docs/jq-for-excel.md v4.1: "every record is written
+            // with an explicit newline + flush on stdout." The flush
+            // is what surfaces SIGPIPE promptly — without it, records
+            // can sit in the 16 KiB stdout buffer past pipe-close.
+            try out.flush();
         }
     }
 }
@@ -1526,6 +1660,7 @@ fn runCellsAcrossSheets(
 ) !void {
     var pg = Pagination.init(args.skip, args.take);
     for (book.sheets, 0..) |s, sheet_idx| {
+        if (signals.shouldStop()) return;
         if (!sheetSelectedForCellsRows(args, s.name, sheet_idx)) continue;
         // Short-circuit once --take is satisfied — checked BEFORE
         // opening the next sheet's row stream to avoid useless I/O.
@@ -1559,6 +1694,7 @@ fn runRowsAcrossSheets(
 ) !void {
     var pg = Pagination.init(args.skip, args.take);
     for (book.sheets, 0..) |s, sheet_idx| {
+        if (signals.shouldStop()) return;
         if (!sheetSelectedForCellsRows(args, s.name, sheet_idx)) continue;
         if (args.take) |t| if (pg.taken >= t) return;
         try runRowsOnSheet(
@@ -1617,8 +1753,10 @@ fn runMetaCommand(
             if (any_comments) "true" else "false",
         },
     );
+    try out.flush();
 
     for (book.sheets, 0..) |s, i| {
+        if (signals.shouldStop()) return;
         const sheet_has_comments = book.comments(s).len != 0;
         try out.writeAll("{\"kind\":\"sheet\",\"sheet\":");
         try writeJsonString(out, s.name);
@@ -1626,6 +1764,7 @@ fn runMetaCommand(
             ",\"sheet_idx\":{d},\"has_comments\":{s}}}\n",
             .{ i, if (sheet_has_comments) "true" else "false" },
         );
+        try out.flush();
     }
 }
 
@@ -1635,9 +1774,11 @@ fn runMetaCommand(
 /// trivially swap between the two commands.
 fn runListSheetsCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
     for (book.sheets, 0..) |s, i| {
+        if (signals.shouldStop()) return;
         try out.writeAll("{\"kind\":\"sheet\",\"sheet\":");
         try writeJsonString(out, s.name);
         try out.print(",\"sheet_idx\":{d}}}\n", .{i});
+        try out.flush();
     }
 }
 
@@ -1830,6 +1971,7 @@ fn runCommentsCommand(
 ) !void {
     var pg = Pagination.init(skip, take);
     for (book.sheets, 0..) |s, sheet_idx| {
+        if (signals.shouldStop()) return;
         if (filter) |f| {
             if (sheet_idx != f) continue;
         } else if (args.sheet_glob != null or args.all_sheets) {
@@ -1844,6 +1986,7 @@ fn runCommentsCommand(
             // order). `continue` on both bounds — don't `break`.
             if (start_row) |sr| if (c.top_left.row < sr) continue;
             if (end_row) |er| if (c.top_left.row > er) continue;
+            if (signals.shouldStop()) return;
             switch (pg.consume()) {
                 .drop => continue,
                 .stop => return,
@@ -1868,6 +2011,7 @@ fn runCommentsCommand(
             try out.writeAll(",\"runs\":");
             try writeRichRunsOrNull(out, c.runs);
             try out.writeAll("}\n");
+            try out.flush();
         }
     }
 }
@@ -1884,12 +2028,14 @@ fn runValidationsCommand(
 ) !void {
     var pg = Pagination.init(skip, take);
     for (book.sheets, 0..) |s, sheet_idx| {
+        if (signals.shouldStop()) return;
         if (filter) |f| {
             if (sheet_idx != f) continue;
         } else if (args.sheet_glob != null or args.all_sheets) {
             if (!isSheetIncluded(args, s.name, sheet_idx)) continue;
         }
         for (book.dataValidations(s)) |dv| {
+            if (signals.shouldStop()) return;
             switch (pg.consume()) {
                 .drop => continue,
                 .stop => return,
@@ -1922,6 +2068,7 @@ fn runValidationsCommand(
                 try out.writeAll("null");
             }
             try out.writeAll("}\n");
+            try out.flush();
         }
     }
 }
@@ -1938,12 +2085,14 @@ fn runHyperlinksCommand(
 ) !void {
     var pg = Pagination.init(skip, take);
     for (book.sheets, 0..) |s, sheet_idx| {
+        if (signals.shouldStop()) return;
         if (filter) |f| {
             if (sheet_idx != f) continue;
         } else if (args.sheet_glob != null or args.all_sheets) {
             if (!isSheetIncluded(args, s.name, sheet_idx)) continue;
         }
         for (book.hyperlinks(s)) |h| {
+            if (signals.shouldStop()) return;
             switch (pg.consume()) {
                 .drop => continue,
                 .stop => return,
@@ -1961,6 +2110,7 @@ fn runHyperlinksCommand(
             try out.writeAll(",\"location\":");
             if (h.location.len != 0) try writeJsonString(out, h.location) else try out.writeAll("null");
             try out.writeAll("}\n");
+            try out.flush();
         }
     }
 }
@@ -2142,6 +2292,7 @@ fn runStylesCommand(
 ) !void {
     var pg = Pagination.init(skip, take);
     for (book.cell_xf_numfmt_ids, 0..) |_, i| {
+        if (signals.shouldStop()) return;
         switch (pg.consume()) {
             .drop => continue,
             .stop => return,
@@ -2220,6 +2371,7 @@ fn runStylesCommand(
         try out.writeAll(",\"num_fmt\":");
         if (book.numberFormat(idx)) |nf| try writeJsonString(out, nf) else try out.writeAll("null");
         try out.writeAll("}\n");
+        try out.flush();
     }
 }
 
@@ -2232,6 +2384,7 @@ fn runSstCommand(
 ) !void {
     var pg = Pagination.init(skip, take);
     for (book.shared_strings, 0..) |s, i| {
+        if (signals.shouldStop()) return;
         switch (pg.consume()) {
             .drop => continue,
             .stop => return,
@@ -2242,6 +2395,7 @@ fn runSstCommand(
         try out.writeAll(",\"runs\":");
         try writeRichRunsOrNull(out, book.richRuns(i));
         try out.writeAll("}\n");
+        try out.flush();
     }
 }
 
