@@ -177,19 +177,19 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
         } else if (std.mem.eql(u8, a, "--skip")) {
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
-            const parsed = std.fmt.parseInt(usize, argv[i], 10) catch {
-                if (workbook_scoped) continue; // ignore bad value for meta/list-sheets/styles/sst
-                return ArgError.BadArgValue;
-            };
-            out.skip = parsed;
+            // --skip / --take are strict for EVERY sub-command
+            // (unlike --sheet / --format whose tolerance depends on
+            // workbook_scoped). Pagination is too useful on styles /
+            // sst — those commands dump huge streams and a typoed
+            // --take that silently returned everything would be a
+            // very expensive surprise. For meta / list-sheets which
+            // don't paginate, rejecting a --skip typo is also the
+            // clearer user-signal: the flag is not effective there.
+            out.skip = std.fmt.parseInt(usize, argv[i], 10) catch return ArgError.BadArgValue;
         } else if (std.mem.eql(u8, a, "--take")) {
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
-            const parsed = std.fmt.parseInt(usize, argv[i], 10) catch {
-                if (workbook_scoped) continue; // ignore bad value for meta/list-sheets/styles/sst
-                return ArgError.BadArgValue;
-            };
-            out.take = parsed;
+            out.take = std.fmt.parseInt(usize, argv[i], 10) catch return ArgError.BadArgValue;
         } else if (a.len > 0 and a[0] == '-') {
             return ArgError.UnknownFlag;
         } else {
@@ -1606,19 +1606,20 @@ test "parseArgs --skip / --take round-trip and tolerance" {
         const argv = [_][]const u8{ "cells", "f.xlsx", "--take", "nope" };
         try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
     }
-    // Workbook-scoped commands silently drop bogus pagination values,
-    // matching the --sheet / --format tolerance contract so wrappers
-    // that append pagination universally don't hit exit-1.
+    // --skip / --take are strict on every sub-command (unlike
+    // --sheet / --format whose tolerance follows the workbook_scoped
+    // group). Pagination is too useful on styles / sst — a typoed
+    // --take that silently returned the full stream would be an
+    // expensive surprise. On meta / list-sheets which don't paginate,
+    // the error is also the clearer signal than silent no-op.
     inline for (.{ "meta", "list-sheets", "styles", "sst" }) |cmd| {
         {
             const argv = [_][]const u8{ cmd, "f.xlsx", "--skip", "bogus" };
-            const a = try parseArgs(&argv);
-            try std.testing.expect(a.skip == null);
+            try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
         }
         {
             const argv = [_][]const u8{ cmd, "f.xlsx", "--take", "nope" };
-            const a = try parseArgs(&argv);
-            try std.testing.expect(a.take == null);
+            try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
         }
     }
     // --skip and --take default to null when absent — legacy callers
