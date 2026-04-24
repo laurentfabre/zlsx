@@ -1012,9 +1012,10 @@ const signals = struct {
 /// table. Stdout write failures (the pipe peer closed, disk full,
 /// etc.) become exit 5 — but only if SIGPIPE didn't fire first, in
 /// which case the signal state takes precedence via `signals.exitCode`.
-/// `OutOfMemory` falls through to exit 1 (unexpected programmer
-/// error); everything else surfaces via its error name and exit 1
-/// so the user has a handle to file a bug.
+/// Map a top-level runtime error to the design-doc exit-code table.
+/// Returns the exit code only; the caller is responsible for printing
+/// a human-readable diagnostic when the classification is "unknown"
+/// (exit 1) so field failures aren't swallowed silently.
 fn classifyTopLevelError(e: anyerror) u8 {
     return switch (e) {
         error.WriteFailed, error.Unexpected, error.BrokenPipe => 5,
@@ -1029,11 +1030,19 @@ pub fn main() u8 {
     signals.install();
 
     const code = runMain() catch |e| blk: {
-        // Route library-level errors against the exit-code table. A
-        // signal fired mid-write (SIGPIPE → EPIPE on stdout) takes
-        // precedence over WriteFailed-like errors, which is handled
-        // in `signals.exitCode` below.
-        break :blk classifyTopLevelError(e);
+        const classified = classifyTopLevelError(e);
+        // Preserve the diagnostic for unclassified errors so field
+        // users still get a handle to file a bug — exit 1 without
+        // any stderr is the runtime equivalent of "something broke,
+        // good luck figuring out what."
+        if (classified == 1) {
+            var stderr_buf: [128]u8 = undefined;
+            var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+            const err = &stderr_file.interface;
+            err.print("zlsx: {s}\n", .{@errorName(e)}) catch {};
+            err.flush() catch {};
+        }
+        break :blk classified;
     };
     return signals.exitCode(code);
 }
@@ -1114,7 +1123,6 @@ fn runMain() !u8 {
             if (signals.shouldStop()) return 0;
             try out.writeAll(s.name);
             try out.writeByte('\n');
-            try out.flush();
         }
         return 0;
     }
@@ -1462,9 +1470,6 @@ fn runRowsOnSheet(
             // can set it unconditionally.
             else => try writeRow(out, view.cells, format, view.col_offset),
         }
-        // iter60a: per-record flush so SIGPIPE surfaces on the next
-        // write attempt rather than sitting in the 16 KiB buffer.
-        try out.flush();
     }
 }
 
@@ -1625,9 +1630,6 @@ fn runCellsOnSheet(
             );
             // Per docs/jq-for-excel.md v4.1: "every record is written
             // with an explicit newline + flush on stdout." The flush
-            // is what surfaces SIGPIPE promptly — without it, records
-            // can sit in the 16 KiB stdout buffer past pipe-close.
-            try out.flush();
         }
     }
 }
@@ -1753,7 +1755,6 @@ fn runMetaCommand(
             if (any_comments) "true" else "false",
         },
     );
-    try out.flush();
 
     for (book.sheets, 0..) |s, i| {
         if (signals.shouldStop()) return;
@@ -1764,7 +1765,6 @@ fn runMetaCommand(
             ",\"sheet_idx\":{d},\"has_comments\":{s}}}\n",
             .{ i, if (sheet_has_comments) "true" else "false" },
         );
-        try out.flush();
     }
 }
 
@@ -1778,7 +1778,6 @@ fn runListSheetsCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
         try out.writeAll("{\"kind\":\"sheet\",\"sheet\":");
         try writeJsonString(out, s.name);
         try out.print(",\"sheet_idx\":{d}}}\n", .{i});
-        try out.flush();
     }
 }
 
@@ -2011,7 +2010,6 @@ fn runCommentsCommand(
             try out.writeAll(",\"runs\":");
             try writeRichRunsOrNull(out, c.runs);
             try out.writeAll("}\n");
-            try out.flush();
         }
     }
 }
@@ -2068,7 +2066,6 @@ fn runValidationsCommand(
                 try out.writeAll("null");
             }
             try out.writeAll("}\n");
-            try out.flush();
         }
     }
 }
@@ -2110,7 +2107,6 @@ fn runHyperlinksCommand(
             try out.writeAll(",\"location\":");
             if (h.location.len != 0) try writeJsonString(out, h.location) else try out.writeAll("null");
             try out.writeAll("}\n");
-            try out.flush();
         }
     }
 }
@@ -2371,7 +2367,6 @@ fn runStylesCommand(
         try out.writeAll(",\"num_fmt\":");
         if (book.numberFormat(idx)) |nf| try writeJsonString(out, nf) else try out.writeAll("null");
         try out.writeAll("}\n");
-        try out.flush();
     }
 }
 
@@ -2395,7 +2390,6 @@ fn runSstCommand(
         try out.writeAll(",\"runs\":");
         try writeRichRunsOrNull(out, book.richRuns(i));
         try out.writeAll("}\n");
-        try out.flush();
     }
 }
 
