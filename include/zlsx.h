@@ -196,6 +196,31 @@ int32_t zlsx_comment_at(zlsx_book_t *    book,
                         zlsx_comment_t * out);
 
 /*
+ * Number of rich-text runs for a comment. Returns 0 for plain-text
+ * comments (the common case — zero overhead for callers that only
+ * want `text` from zlsx_comment_at). Pair with zlsx_comment_run_at
+ * to enumerate formatted runs.
+ */
+size_t zlsx_comment_run_count(zlsx_book_t * book,
+                              uint32_t      sheet_idx,
+                              size_t        comment_idx);
+
+/*
+ * Copy run `run_idx` of comment `comment_idx`. Returns 0 on success
+ * with text + bold/italic populated; -1 on any out-of-range index
+ * (including comments with no runs). Text pointer lifetime matches
+ * the Book.
+ */
+int32_t zlsx_comment_run_at(zlsx_book_t *     book,
+                            uint32_t          sheet_idx,
+                            size_t            comment_idx,
+                            size_t            run_idx,
+                            const uint8_t * * out_text_ptr,
+                            size_t *          out_text_len,
+                            uint8_t *         out_bold,
+                            uint8_t *         out_italic);
+
+/*
  * Data-validation entry. `values_count` is the number of dropdown
  * options for type="list" validations; other variants still surface
  * the range with values_count=0. Values themselves are pulled via

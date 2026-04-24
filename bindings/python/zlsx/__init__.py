@@ -387,13 +387,15 @@ class Fill:
 class Comment:
     """A cell comment / note parsed from ``xl/comments*.xml``.
     ``top_left`` points at the commented cell. ``author`` resolves
-    through the ``<authors>`` table; ``text`` is the concatenated
-    plain-text body (rich runs inside a comment are flattened — the
-    formatted form lands in a follow-up without breaking this
-    shape). All strings are entity-decoded."""
+    through the ``<authors>`` table; ``text`` is always the
+    concatenated plain-text body. ``runs`` is populated when the
+    source body used ``<r><rPr>`` formatting (iter53); ``None`` for
+    plain-text comments — the zero-overhead common case. All
+    strings are entity-decoded."""
     top_left: CellRef
     author: str
     text: str
+    runs: "tuple[RichRun, ...] | None" = None
 
 
 @dataclass(frozen=True)
@@ -543,10 +545,41 @@ class Book:
                 text = ctypes.string_at(cc.text_ptr, cc.text_len).decode(
                     "utf-8", errors="replace"
                 )
+            # iter53: surface rich-text runs when the comment body
+            # used <r><rPr> formatting. Plain-text bodies have 0 runs
+            # → runs=None so callers don't see a misleading tuple.
+            runs_tuple: "tuple[RichRun, ...] | None" = None
+            if _ffi._HAS_COMMENT_RUNS:
+                rcount = _ffi.lib.zlsx_comment_run_count(self._handle, sheet_idx, i)
+                if rcount > 0:
+                    rlist: list[RichRun] = []
+                    text_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+                    text_len = ctypes.c_size_t(0)
+                    bold = ctypes.c_uint8(0)
+                    italic = ctypes.c_uint8(0)
+                    for r in range(rcount):
+                        rc2 = _ffi.lib.zlsx_comment_run_at(
+                            self._handle, sheet_idx, i, r,
+                            ctypes.byref(text_ptr),
+                            ctypes.byref(text_len),
+                            ctypes.byref(bold),
+                            ctypes.byref(italic),
+                        )
+                        if rc2 != 0:
+                            continue
+                        rlist.append(RichRun(
+                            text=ctypes.string_at(text_ptr, text_len.value).decode(
+                                "utf-8", errors="replace"
+                            ),
+                            bold=bool(bold.value),
+                            italic=bool(italic.value),
+                        ))
+                    runs_tuple = tuple(rlist)
             out.append(Comment(
                 top_left=CellRef(col=cc.cell_col, row=cc.cell_row),
                 author=author,
                 text=text,
+                runs=runs_tuple,
             ))
         return out
 

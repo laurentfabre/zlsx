@@ -1340,6 +1340,96 @@ def test_sheet_writer_add_comment_round_trip(tmp_path):
         assert cs[2].text == "follow-up"
 
 
+def test_book_comments_rich_text_runs_surface(tmp_path):
+    """iter53 — rich-text comment bodies populate `Comment.runs`.
+    Plain-text comments keep `runs=None` (zero-overhead path)."""
+    import zipfile
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_COMMENTS or not ffi._HAS_COMMENT_RUNS:
+        pytest.skip("loaded libzlsx predates comment-runs ABI (0.2.6+)")
+
+    xlsx_path = tmp_path / "comments_rich.xlsx"
+    sst_xml = (
+        b"<?xml version=\"1.0\"?>"
+        b"<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"0\"/>"
+    )
+    content_types = (
+        b"<?xml version=\"1.0\"?>"
+        b"<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+        b"<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+        b"<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+        b"<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>"
+        b"<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+        b"<Override PartName=\"/xl/comments1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml\"/>"
+        b"</Types>"
+    )
+    root_rels = (
+        b"<?xml version=\"1.0\"?>"
+        b"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        b"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>"
+        b"</Relationships>"
+    )
+    workbook = (
+        b"<?xml version=\"1.0\"?>"
+        b"<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+        b"xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+        b"<sheets><sheet name=\"S\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>"
+    )
+    wb_rels = (
+        b"<?xml version=\"1.0\"?>"
+        b"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        b"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>"
+        b"</Relationships>"
+    )
+    sheet1 = (
+        b"<?xml version=\"1.0\"?>"
+        b"<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+        b"<sheetData><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>x</t></is></c></row></sheetData></worksheet>"
+    )
+    sheet1_rels = (
+        b"<?xml version=\"1.0\"?>"
+        b"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        b"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\" Target=\"../comments1.xml\"/>"
+        b"</Relationships>"
+    )
+    comments1 = (
+        b"<?xml version=\"1.0\"?>"
+        b"<comments xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+        b"<authors><author>Alice</author></authors>"
+        b"<commentList>"
+        b"<comment ref=\"A1\" authorId=\"0\"><text><t>plain body</t></text></comment>"
+        b"<comment ref=\"B2\" authorId=\"0\"><text><r><rPr><b/></rPr><t>bold </t></r><r><rPr><i/></rPr><t>italic</t></r></text></comment>"
+        b"</commentList></comments>"
+    )
+
+    with zipfile.ZipFile(xlsx_path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", root_rels)
+        z.writestr("xl/workbook.xml", workbook)
+        z.writestr("xl/_rels/workbook.xml.rels", wb_rels)
+        z.writestr("xl/worksheets/sheet1.xml", sheet1)
+        z.writestr("xl/worksheets/_rels/sheet1.xml.rels", sheet1_rels)
+        z.writestr("xl/comments1.xml", comments1)
+
+    with zlsx.open(xlsx_path) as book:
+        cs = book.comments(0)
+        assert len(cs) == 2
+
+        # Plain comment: runs=None, text populated.
+        assert cs[0].text == "plain body"
+        assert cs[0].runs is None
+
+        # Rich comment: text is concat, runs tuple is populated.
+        assert cs[1].text == "bold italic"
+        assert cs[1].runs is not None
+        assert len(cs[1].runs) == 2
+        assert cs[1].runs[0].text == "bold "
+        assert cs[1].runs[0].bold and not cs[1].runs[0].italic
+        assert cs[1].runs[1].text == "italic"
+        assert cs[1].runs[1].italic and not cs[1].runs[1].bold
+
+
 def test_book_comments_parses_authors_refs_text(tmp_path):
     """Build a minimal xlsx with a comments1.xml part and verify
     `Book.comments(sheet_idx)` returns the right refs, authors, and

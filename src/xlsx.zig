@@ -325,16 +325,17 @@ pub const Border = struct {
     diagonal: BorderSide = .{},
 };
 
-/// A cell comment / note parsed from `xl/comments*.xml`. Comments
-/// with rich-text bodies have their runs concatenated into `text`
-/// (like the flat-SST path for rich strings — callers that need the
-/// runs can look them up via the sheet-level content if it ever
-/// becomes a stored property). Strings are entity-decoded and
-/// arena-owned.
+/// A cell comment / note parsed from `xl/comments*.xml`. `text` is
+/// always the concatenated plain-text form. `runs` mirrors the SST
+/// rich-text path — populated only when the source body had at least
+/// one `<r>` wrapper with formatting (non-null → multi-run rich
+/// comment; null → single-run plain text). All slices entity-decoded
+/// and arena-owned.
 pub const Comment = struct {
     top_left: CellRef,
     author: []const u8,
     text: []const u8,
+    runs: ?[]const RichRun = null,
 };
 
 /// Cell fill, parsed from `xl/styles.xml` `<fills>`. `pattern` is the
@@ -1611,31 +1612,90 @@ fn parseCommentsForSheet(book: *Book, sheet_path: []const u8) !void {
         const body = cl_block[hdr_end + 1 .. c_close];
         k = c_close + "</comment>".len;
 
+        // Walk the comment body collecting both a flat-text concat
+        // AND per-run metadata when the body is rich-text (any `<r>`).
+        // Mirrors the iter26 SST parser's structure: `<r>` toggles
+        // `saw_r`; `<rPr>` populates `pending_flags`; each `<t>`
+        // consumed inside `<r>` appends a RichRun.
         var text_buf: std.ArrayListUnmanaged(u8) = .{};
         defer text_buf.deinit(arena);
+        var runs_list: std.ArrayListUnmanaged(RichRun) = .{};
+        errdefer runs_list.deinit(arena);
+        var saw_r = false;
+        var pending_flags: RichRun = .{ .text = "" };
+
         var t: usize = 0;
-        while (std.mem.indexOfPos(u8, body, t, "<t")) |tp| {
-            // Guard against `<text>` — must be `<t>`, `<t `, or `<t/>`.
-            if (tp + 2 >= body.len) break;
-            const after = body[tp + 2];
-            if (after != '>' and after != ' ' and after != '/') {
-                t = tp + 2;
-                continue;
+        while (t < body.len) {
+            const next_lt = std.mem.indexOfScalarPos(u8, body, t, '<') orelse break;
+            if (next_lt + 2 > body.len) break;
+            const c1 = body[next_lt + 1];
+
+            if (c1 == 't' and next_lt + 2 < body.len and
+                (body[next_lt + 2] == '>' or body[next_lt + 2] == ' ' or body[next_lt + 2] == '/'))
+            {
+                // `<t>`, `<t xml:space="…">`, or `<t/>`.
+                const tgt = std.mem.indexOfScalarPos(u8, body, next_lt + 2, '>') orelse break;
+                if (tgt > 0 and body[tgt - 1] == '/') {
+                    t = tgt + 1;
+                    continue;
+                }
+                const tclose = std.mem.indexOfPos(u8, body, tgt + 1, "</t>") orelse break;
+                const span = body[tgt + 1 .. tclose];
+                const span_has_ent = std.mem.indexOfScalar(u8, span, '&') != null;
+
+                try appendDecoded(arena, &text_buf, span);
+
+                if (saw_r) {
+                    const run_text: []const u8 = if (span_has_ent) blk: {
+                        var rb: std.ArrayListUnmanaged(u8) = try .initCapacity(arena, span.len);
+                        try appendDecoded(arena, &rb, span);
+                        break :blk try rb.toOwnedSlice(arena);
+                    } else span;
+                    try runs_list.append(arena, .{
+                        .text = run_text,
+                        .bold = pending_flags.bold,
+                        .italic = pending_flags.italic,
+                        .color_argb = pending_flags.color_argb,
+                        .size = pending_flags.size,
+                        .font_name = pending_flags.font_name,
+                    });
+                }
+                t = tclose + "</t>".len;
+            } else if (c1 == 'r' and next_lt + 2 < body.len and
+                (body[next_lt + 2] == '>' or body[next_lt + 2] == ' '))
+            {
+                // `<r>` — new rich-text run; reset formatting.
+                const r_gt = std.mem.indexOfScalarPos(u8, body, next_lt + 2, '>') orelse break;
+                saw_r = true;
+                pending_flags = .{ .text = "" };
+                t = r_gt + 1;
+            } else if (c1 == 'r' and next_lt + 3 < body.len and
+                body[next_lt + 2] == 'P' and body[next_lt + 3] == 'r')
+            {
+                // `<rPr>...</rPr>` — parse formatting for the current run.
+                const rpr_close = std.mem.indexOfPos(u8, body, next_lt, "</rPr>") orelse break;
+                pending_flags = try parseRprFlags(book, arena, body[next_lt .. rpr_close + "</rPr>".len]);
+                t = rpr_close + "</rPr>".len;
+            } else {
+                // Skip any other tag (`</r>`, `<text>`, etc.) — advance
+                // past the `>` so the outer loop makes progress.
+                const skip_gt = std.mem.indexOfScalarPos(u8, body, next_lt + 1, '>') orelse break;
+                t = skip_gt + 1;
             }
-            const tgt = std.mem.indexOfScalarPos(u8, body, tp, '>') orelse break;
-            if (tgt > 0 and body[tgt - 1] == '/') {
-                t = tgt + 1;
-                continue;
-            }
-            const tclose = std.mem.indexOfPos(u8, body, tgt + 1, "</t>") orelse break;
-            try appendDecoded(arena, &text_buf, body[tgt + 1 .. tclose]);
-            t = tclose + "</t>".len;
         }
+
+        const runs_slice: ?[]RichRun = if (saw_r and runs_list.items.len > 0)
+            try runs_list.toOwnedSlice(arena)
+        else blk: {
+            runs_list.deinit(arena);
+            break :blk null;
+        };
 
         try entries.append(book.allocator, .{
             .top_left = cell_ref,
             .author = author_str,
             .text = try text_buf.toOwnedSlice(arena),
+            .runs = runs_slice,
         });
     }
 
@@ -3325,6 +3385,63 @@ test "Book.cellFont: round-trips bold / color / size / name from xl/styles.xml" 
     // cellFont should still return non-null.
     const s2 = styles[2] orelse 0;
     try std.testing.expect(book.cellFont(s2) != null);
+}
+
+test "parseCommentsForSheet: rich-text comment bodies populate Comment.runs" {
+    // iter53 — comments that use `<r><rPr>` wrappers surface the
+    // runs alongside the flat text. Plain-text bodies still produce
+    // `runs = null` (the zero-overhead path).
+    var book: Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer book.deinit();
+
+    const sheet_path = "xl/worksheets/sheet1.xml";
+    const rels_xml =
+        \\<?xml version="1.0"?>
+        \\<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+        \\<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments1.xml"/>
+        \\</Relationships>
+    ;
+    const comments_xml =
+        \\<?xml version="1.0"?>
+        \\<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+        \\<authors><author>Alice</author></authors>
+        \\<commentList>
+        \\<comment ref="A1" authorId="0"><text><t>plain body</t></text></comment>
+        \\<comment ref="B2" authorId="0"><text><r><rPr><b/><color rgb="FFFF0000"/></rPr><t>bold red </t></r><r><rPr><i/></rPr><t>italic tail</t></r></text></comment>
+        \\</commentList></comments>
+    ;
+
+    const owned_rels = try std.testing.allocator.dupe(u8, rels_xml);
+    try book.sheet_rels_data.put(std.testing.allocator, sheet_path, owned_rels);
+    const owned_comments = try std.testing.allocator.dupe(u8, comments_xml);
+    const comments_key = try std.testing.allocator.dupe(u8, "xl/comments1.xml");
+    try book.strings.append(std.testing.allocator, comments_key);
+    try book.comments_data.put(std.testing.allocator, comments_key, owned_comments);
+
+    try parseCommentsForSheet(&book, sheet_path);
+
+    const cs = book.comments_by_sheet.get(sheet_path) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), cs.len);
+
+    // Plain comment: flat text, no runs.
+    try std.testing.expectEqualStrings("plain body", cs[0].text);
+    try std.testing.expectEqual(@as(?[]const RichRun, null), cs[0].runs);
+
+    // Rich comment: flat text is concatenated runs, and `runs` is populated.
+    try std.testing.expectEqualStrings("bold red italic tail", cs[1].text);
+    const runs = cs[1].runs orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), runs.len);
+    try std.testing.expectEqualStrings("bold red ", runs[0].text);
+    try std.testing.expectEqual(true, runs[0].bold);
+    try std.testing.expectEqual(false, runs[0].italic);
+    try std.testing.expectEqual(@as(?u32, 0xFFFF0000), runs[0].color_argb);
+    try std.testing.expectEqualStrings("italic tail", runs[1].text);
+    try std.testing.expectEqual(false, runs[1].bold);
+    try std.testing.expectEqual(true, runs[1].italic);
+    try std.testing.expectEqual(@as(?u32, null), runs[1].color_argb);
 }
 
 test "parseCommentsForSheet: authors + refs + flattened rich-text bodies" {

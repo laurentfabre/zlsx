@@ -383,6 +383,55 @@ export fn zlsx_comment_at(
     return 0;
 }
 
+/// Number of rich-text runs for comment `comment_idx` on sheet `idx`.
+/// Returns 0 when the comment is a plain single-run string (null
+/// `runs`), so callers can probe with this before calling
+/// `zlsx_comment_run_at`. -1 on out-of-range indices is not
+/// distinguished from 0 — the caller should have bounds-checked via
+/// `zlsx_comment_count` first.
+export fn zlsx_comment_run_count(
+    book: *Book,
+    idx: u32,
+    comment_idx: usize,
+) callconv(.c) usize {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (idx >= state.inner.sheets.len) return 0;
+    const cs = state.inner.comments(state.inner.sheets[idx]);
+    if (comment_idx >= cs.len) return 0;
+    const runs = cs[comment_idx].runs orelse return 0;
+    return runs.len;
+}
+
+/// Copy rich-text run `run_idx` of comment `comment_idx` on sheet
+/// `idx` into the out pointers. Same tri-state return as
+/// `zlsx_rich_run_at` from iter27: 0 → text populated, bold/italic
+/// as 0/1; -1 → any index out of range (including comments that
+/// have no runs). Mirrors the SST rich-run surface so callers can
+/// reuse the same iteration idiom.
+export fn zlsx_comment_run_at(
+    book: *Book,
+    idx: u32,
+    comment_idx: usize,
+    run_idx: usize,
+    out_text_ptr: *[*]const u8,
+    out_text_len: *usize,
+    out_bold: *u8,
+    out_italic: *u8,
+) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (idx >= state.inner.sheets.len) return -1;
+    const cs = state.inner.comments(state.inner.sheets[idx]);
+    if (comment_idx >= cs.len) return -1;
+    const runs = cs[comment_idx].runs orelse return -1;
+    if (run_idx >= runs.len) return -1;
+    const r = runs[run_idx];
+    out_text_ptr.* = r.text.ptr;
+    out_text_len.* = r.text.len;
+    out_bold.* = if (r.bold) 1 else 0;
+    out_italic.* = if (r.italic) 1 else 0;
+    return 0;
+}
+
 /// C-shape for a single data-validation entry. `values_count` is the
 /// number of dropdown options (0 for non-list validations); callers
 /// must iterate via `zlsx_data_validation_value_at` to pull each

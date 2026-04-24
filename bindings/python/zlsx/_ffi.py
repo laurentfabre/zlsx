@@ -591,6 +591,30 @@ if _HAS_COMMENTS:
     lib.zlsx_comment_at.restype = ctypes.c_int32
 
 
+_HAS_COMMENT_RUNS = (
+    hasattr(lib, "zlsx_comment_run_count")
+    and hasattr(lib, "zlsx_comment_run_at")
+)
+if _HAS_COMMENT_RUNS:
+    lib.zlsx_comment_run_count.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_comment_run_count.restype = ctypes.c_size_t
+    lib.zlsx_comment_run_at.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_uint8),
+    ]
+    lib.zlsx_comment_run_at.restype = ctypes.c_int32
+
+
 class CDataValidation(ctypes.Structure):
     _fields_ = [
         ("top_left_col", ctypes.c_uint32),
