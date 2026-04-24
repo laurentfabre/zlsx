@@ -1656,7 +1656,7 @@ fn parseWorkbookSheets(book: *Book, wb_xml: []const u8, rels_xml: []const u8) !v
 /// Parse one corner of an A1-style reference ("B12") into `{col, row}`.
 /// Column is 0-based (A=0, B=1, …), row is 1-based (row1=1). Rejects
 /// empty input, lowercase, missing digits, and row=0.
-fn parseA1Ref(s: []const u8) !CellRef {
+pub fn parseA1Ref(s: []const u8) !CellRef {
     if (s.len == 0) return error.MalformedXml;
     var i: usize = 0;
     var col: u32 = 0;
@@ -1676,7 +1676,7 @@ fn parseA1Ref(s: []const u8) !CellRef {
 /// equal bottom-right on both axes; we normalise order so callers can
 /// rely on `top_left ≤ bottom_right` component-wise even if the source
 /// XML listed the corners in the other order.
-fn parseA1Range(ref: []const u8) !MergeRange {
+pub fn parseA1Range(ref: []const u8) !MergeRange {
     const colon = std.mem.indexOfScalar(u8, ref, ':') orelse {
         // Single-cell "range" — degenerate but legal per the reader's
         // contract. Promote to a 1×1 rectangle.

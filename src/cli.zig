@@ -66,6 +66,14 @@ const Args = struct {
     /// records per the jq-for-excel design doc.
     start_row: ?u32 = null,
     end_row: ?u32 = null,
+    /// iter59b-2: A1-style bounding-rectangle filter (`--range A1:Z100`).
+    /// Populated only on `rows` and `cells`; rejected elsewhere.
+    /// Stored with `top_left ≤ bottom_right` on both axes; the CLI
+    /// parser rejects inverted corners rather than silently swapping
+    /// (differs from `xlsx.parseA1Range` which normalises silently).
+    /// When paired with --start-row / --end-row, the row bounds are
+    /// intersected (most restrictive wins) at the filter site.
+    range: ?xlsx.MergeRange = null,
 };
 
 const ArgError = error{
@@ -94,7 +102,8 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
             std.mem.eql(u8, a, "--skip") or
             std.mem.eql(u8, a, "--take") or
             std.mem.eql(u8, a, "--start-row") or
-            std.mem.eql(u8, a, "--end-row"))
+            std.mem.eql(u8, a, "--end-row") or
+            std.mem.eql(u8, a, "--range"))
         {
             i += 1; // skip paired value (bounds-checked by caller)
             continue;
@@ -215,6 +224,21 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
             const v = std.fmt.parseInt(u32, argv[i], 10) catch return ArgError.BadArgValue;
             if (v == 0) return ArgError.BadArgValue;
             out.end_row = v;
+        } else if (std.mem.eql(u8, a, "--range")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            // `<topLeft>:<bottomRight>`, both A1-style. Single-cell
+            // input (no colon) is rejected — the flag's contract is a
+            // rectangle per docs/jq-for-excel.md v4.1. Inverted corners
+            // (e.g. `Z1:A1`) are also rejected rather than silently
+            // normalised: the user wrote them in that order on purpose
+            // or by mistake, and a typo-tolerant swap hides the mistake.
+            const raw = argv[i];
+            const colon = std.mem.indexOfScalar(u8, raw, ':') orelse return ArgError.BadArgValue;
+            const tl = xlsx.parseA1Ref(raw[0..colon]) catch return ArgError.BadArgValue;
+            const br = xlsx.parseA1Ref(raw[colon + 1 ..]) catch return ArgError.BadArgValue;
+            if (tl.col > br.col or tl.row > br.row) return ArgError.BadArgValue;
+            out.range = .{ .top_left = tl, .bottom_right = br };
         } else if (a.len > 0 and a[0] == '-') {
             return ArgError.UnknownFlag;
         } else {
@@ -254,6 +278,18 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
             },
         }
     }
+    // iter59b-2: --range is tighter than --start-row / --end-row — it
+    // filters by BOTH row AND column, so `comments` (which emits per
+    // cell-ref but has no col-keyed wire contract yet) is deliberately
+    // NOT included here. Only `rows` and `cells` accept --range.
+    if (out.range != null) {
+        switch (detected_sub) {
+            .rows, .cells => {},
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst => {
+                return ArgError.BadArgValue;
+            },
+        }
+    }
     // Empty emission ranges are caught at parse time — `start > end`
     // can never produce a record, which is almost certainly a typo.
     if (out.start_row) |s| if (out.end_row) |e| {
@@ -262,7 +298,7 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     // The legacy --list-sheets flag takes an early return in main
     // and emits plain sheet names — no row concept. Row bounds
     // passed alongside it would silently no-op, hiding typos.
-    if (out.list_sheets and (out.start_row != null or out.end_row != null)) {
+    if (out.list_sheets and (out.start_row != null or out.end_row != null or out.range != null)) {
         return ArgError.BadArgValue;
     }
     return out;
@@ -300,6 +336,15 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    after row R (inclusive). Same scope and
         \\                    sub-command constraints as --start-row.
         \\                    Applied BEFORE --skip / --take.
+        \\  --range A1:Z100   (iter59b-2) A1-style bounding rectangle;
+        \\                    valid for `rows` and `cells` only. Inverted
+        \\                    corners (e.g. `Z1:A1`) are rejected. When
+        \\                    combined with --start-row / --end-row the
+        \\                    row bounds are intersected (most-restrictive
+        \\                    wins). For `rows` a row is emitted iff it
+        \\                    has at least one in-range cell; out-of-range
+        \\                    columns are masked to empty so the cells[]
+        \\                    array stays column-indexed.
         \\  -h, --help        show this help
         \\
         \\Sub-commands
@@ -750,8 +795,8 @@ pub fn main() !u8 {
     };
 
     switch (args.subcommand) {
-        .rows => try runRowsCommand(out, &book, selected.sheet, selected.idx, args.format, alloc, args.skip, args.take, args.start_row, args.end_row),
-        .cells => try runCellsCommand(out, &book, selected.sheet, selected.idx, alloc, args.skip, args.take, args.start_row, args.end_row),
+        .rows => try runRowsCommand(out, &book, selected.sheet, selected.idx, args.format, alloc, args.skip, args.take, args.start_row, args.end_row, args.range),
+        .cells => try runCellsCommand(out, &book, selected.sheet, selected.idx, alloc, args.skip, args.take, args.start_row, args.end_row, args.range),
         // Handled by the workbook-scoped early return above.
         .meta,
         .list_sheets,
@@ -807,26 +852,76 @@ fn runRowsCommand(
     take: ?usize,
     start_row: ?u32,
     end_row: ?u32,
+    range: ?xlsx.MergeRange,
 ) !void {
     var rows = try book.rows(sheet, alloc);
     defer rows.deinit();
+
+    // iter59b-2: --range + --start-row / --end-row take the INTERSECTION
+    // on the row axis. The user said "both bounds apply"; the only
+    // self-consistent reading is most-restrictive-wins.
+    const row_lo: ?u32 = blk: {
+        const a = start_row;
+        const b = if (range) |r| r.top_left.row else null;
+        if (a == null) break :blk b;
+        if (b == null) break :blk a;
+        break :blk @max(a.?, b.?);
+    };
+    const row_hi: ?u32 = blk: {
+        const a = end_row;
+        const b = if (range) |r| r.bottom_right.row else null;
+        if (a == null) break :blk b;
+        if (b == null) break :blk a;
+        break :blk @min(a.?, b.?);
+    };
+
+    // Masked buffer for --range on the envelope path: positional
+    // contract (cells[i] lives in column i) requires we write `.empty`
+    // into out-of-range columns rather than compacting the slice.
+    // Only allocated when --range is actually present.
+    var masked: std.ArrayListUnmanaged(xlsx.Cell) = .{};
+    defer masked.deinit(alloc);
 
     var pg = Pagination.init(skip, take);
     while (try rows.next()) |cells| {
         const row_number = rows.currentRowNumber();
         // Row bounds run BEFORE pagination (design doc v4.1).
-        if (start_row) |s| if (row_number < s) continue;
-        // OOXML rows are monotonic — once past end_row, no more records
-        // in this sheet's stream can satisfy the bound.
-        if (end_row) |e| if (row_number > e) break;
+        if (row_lo) |s| if (row_number < s) continue;
+        // OOXML rows are monotonic — once past the upper bound, no
+        // more records in this sheet's stream can satisfy it.
+        if (row_hi) |e| if (row_number > e) break;
+
+        // Per design doc: a row is emitted iff at least one cell is
+        // inside the rectangle. Row-axis is already gated above; the
+        // col-axis check is what remains. For the `rows` envelope we
+        // also zero out out-of-range columns so the emitted `cells`
+        // array is range-scoped.
+        const emit_cells: []const xlsx.Cell = if (range) |r| blk: {
+            var any_in_col_range = false;
+            masked.clearRetainingCapacity();
+            try masked.ensureTotalCapacity(alloc, cells.len);
+            for (cells, 0..) |c, i| {
+                const col: u32 = @intCast(i);
+                const in_col = col >= r.top_left.col and col <= r.bottom_right.col;
+                if (in_col) {
+                    masked.appendAssumeCapacity(c);
+                    if (c != .empty) any_in_col_range = true;
+                } else {
+                    masked.appendAssumeCapacity(.empty);
+                }
+            }
+            if (!any_in_col_range) continue;
+            break :blk masked.items;
+        } else cells;
+
         switch (pg.consume()) {
             .drop => continue,
             .stop => return,
             .emit => {},
         }
         switch (format) {
-            .jsonl => try writeRowEnvelope(out, sheet.name, sheet_idx, row_number, cells),
-            else => try writeRow(out, cells, format),
+            .jsonl => try writeRowEnvelope(out, sheet.name, sheet_idx, row_number, emit_cells),
+            else => try writeRow(out, emit_cells, format),
         }
     }
 }
@@ -845,17 +940,38 @@ fn runCellsCommand(
     take: ?usize,
     start_row: ?u32,
     end_row: ?u32,
+    range: ?xlsx.MergeRange,
 ) !void {
     var rows = try book.rows(sheet, alloc);
     defer rows.deinit();
 
+    // iter59b-2: intersect --range row bounds with --start-row / --end-row.
+    const row_lo: ?u32 = blk: {
+        const a = start_row;
+        const b = if (range) |r| r.top_left.row else null;
+        if (a == null) break :blk b;
+        if (b == null) break :blk a;
+        break :blk @max(a.?, b.?);
+    };
+    const row_hi: ?u32 = blk: {
+        const a = end_row;
+        const b = if (range) |r| r.bottom_right.row else null;
+        if (a == null) break :blk b;
+        if (b == null) break :blk a;
+        break :blk @min(a.?, b.?);
+    };
+
     var pg = Pagination.init(skip, take);
     while (try rows.next()) |cells| {
         const row_number = rows.currentRowNumber();
-        if (start_row) |s| if (row_number < s) continue;
-        if (end_row) |e| if (row_number > e) break;
+        if (row_lo) |s| if (row_number < s) continue;
+        if (row_hi) |e| if (row_number > e) break;
         for (cells, 0..) |c, i| {
             if (c == .empty) continue;
+            if (range) |r| {
+                const col: u32 = @intCast(i);
+                if (col < r.top_left.col or col > r.bottom_right.col) continue;
+            }
 
             switch (pg.consume()) {
                 .drop => continue,
@@ -1818,7 +1934,7 @@ test "runCellsCommand --start-row / --end-row bound the emitted cell stream" {
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, 2, 4);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, 2, 4, null);
         const out = w.buffered();
         try std.testing.expectEqual(@as(usize, 3), countLines(out));
         try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c1\"") == null);
@@ -1832,11 +1948,207 @@ test "runCellsCommand --start-row / --end-row bound the emitted cell stream" {
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 1, 1, 2, 4);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 1, 1, 2, 4, null);
         const out = w.buffered();
         try std.testing.expectEqual(@as(usize, 1), countLines(out));
         try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c3\"") != null);
     }
+}
+
+test "parseArgs --range round-trip and rejections" {
+    // Happy path: `A1:C10` parses on rows / cells.
+    inline for (.{ "rows", "cells" }) |cmd| {
+        const argv = [_][]const u8{ cmd, "f.xlsx", "--range", "A1:C10" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(a.range != null);
+        try std.testing.expectEqual(@as(u32, 0), a.range.?.top_left.col);
+        try std.testing.expectEqual(@as(u32, 1), a.range.?.top_left.row);
+        try std.testing.expectEqual(@as(u32, 2), a.range.?.bottom_right.col);
+        try std.testing.expectEqual(@as(u32, 10), a.range.?.bottom_right.row);
+    }
+    // Malformed input.
+    inline for (.{ "bogus", "A1-C10", "", ":", "A1:", ":B2", "a1:b2", "A0:B2" }) |bad| {
+        const argv = [_][]const u8{ "cells", "f.xlsx", "--range", bad };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // Inverted corners are rejected (no silent normalisation).
+    {
+        const argv = [_][]const u8{ "cells", "f.xlsx", "--range", "Z1:A1" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "cells", "f.xlsx", "--range", "A10:A1" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // Missing value.
+    {
+        const argv = [_][]const u8{ "cells", "f.xlsx", "--range" };
+        try std.testing.expectError(ArgError.MissingValue, parseArgs(&argv));
+    }
+    // Sub-commands without row+col keys reject --range.
+    inline for (.{ "comments", "validations", "hyperlinks", "meta", "list-sheets", "styles", "sst" }) |cmd| {
+        const argv = [_][]const u8{ cmd, "f.xlsx", "--range", "A1:B2" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // Legacy --list-sheets flag also rejects.
+    {
+        const argv = [_][]const u8{ "f.xlsx", "--list-sheets", "--range", "A1:B2" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // Single-cell "A1" (no colon) is rejected — contract is a rectangle.
+    {
+        const argv = [_][]const u8{ "cells", "f.xlsx", "--range", "A1" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // Defaults to null when absent.
+    {
+        const argv = [_][]const u8{ "cells", "f.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(a.range == null);
+    }
+    // detectSubcommand skips the paired value: an A1 ref that looks
+    // like a positional (e.g. `A1:B2` begins with a letter) must not
+    // be mistaken for the file path.
+    {
+        const argv = [_][]const u8{ "rows", "--range", "A1:B2", "f.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqualStrings("f.xlsx", a.file);
+        try std.testing.expect(a.range != null);
+    }
+}
+
+test "runCellsCommand --range filters by bounding rectangle" {
+    const tmp_path = "/tmp/zlsx_cli_range_iter59b2.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        // 5×5 grid; ref-style values so we can assert exact inclusion.
+        // Row 1: A1..E1, row 2: A2..E2, …
+        try s0.writeRow(&.{ .{ .string = "A1" }, .{ .string = "B1" }, .{ .string = "C1" }, .{ .string = "D1" }, .{ .string = "E1" } });
+        try s0.writeRow(&.{ .{ .string = "A2" }, .{ .string = "B2" }, .{ .string = "C2" }, .{ .string = "D2" }, .{ .string = "E2" } });
+        try s0.writeRow(&.{ .{ .string = "A3" }, .{ .string = "B3" }, .{ .string = "C3" }, .{ .string = "D3" }, .{ .string = "E3" } });
+        try s0.writeRow(&.{ .{ .string = "A4" }, .{ .string = "B4" }, .{ .string = "C4" }, .{ .string = "D4" }, .{ .string = "E4" } });
+        try s0.writeRow(&.{ .{ .string = "A5" }, .{ .string = "B5" }, .{ .string = "C5" }, .{ .string = "D5" }, .{ .string = "E5" } });
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    const countLines = struct {
+        fn f(s: []const u8) usize {
+            var n: usize = 0;
+            for (s) |c| if (c == '\n') {
+                n += 1;
+            };
+            return n;
+        }
+    }.f;
+
+    // --range B2:C3 → exactly 4 cells: B2, C2, B3, C3.
+    {
+        var scratch: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        const range: xlsx.MergeRange = .{
+            .top_left = .{ .col = 1, .row = 2 },
+            .bottom_right = .{ .col = 2, .row = 3 },
+        };
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, null, null, range);
+        const out = w.buffered();
+        try std.testing.expectEqual(@as(usize, 4), countLines(out));
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"B2\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"C2\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"B3\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"C3\"") != null);
+        // Corner spot-checks outside the rect.
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"A1\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"A2\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"D2\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"B4\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"E5\"") == null);
+    }
+
+    // Intersection with --start-row / --end-row: --range B2:C4 ∩
+    // [start=3, end=5] → rows {3, 4}, cols {1, 2} → 4 cells.
+    {
+        var scratch: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        const range: xlsx.MergeRange = .{
+            .top_left = .{ .col = 1, .row = 2 },
+            .bottom_right = .{ .col = 2, .row = 4 },
+        };
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, 3, 5, range);
+        const out = w.buffered();
+        try std.testing.expectEqual(@as(usize, 4), countLines(out));
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"B3\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"C3\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"B4\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"C4\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"B2\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"B5\"") == null);
+    }
+}
+
+test "runRowsCommand --range filters rows + masks out-of-range cells" {
+    const tmp_path = "/tmp/zlsx_cli_range_rows_iter59b2.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{ .{ .string = "A1" }, .{ .string = "B1" }, .{ .string = "C1" }, .{ .string = "D1" }, .{ .string = "E1" } });
+        try s0.writeRow(&.{ .{ .string = "A2" }, .{ .string = "B2" }, .{ .string = "C2" }, .{ .string = "D2" }, .{ .string = "E2" } });
+        try s0.writeRow(&.{ .{ .string = "A3" }, .{ .string = "B3" }, .{ .string = "C3" }, .{ .string = "D3" }, .{ .string = "E3" } });
+        try s0.writeRow(&.{ .{ .string = "A4" }, .{ .string = "B4" }, .{ .string = "C4" }, .{ .string = "D4" }, .{ .string = "E4" } });
+        try s0.writeRow(&.{ .{ .string = "A5" }, .{ .string = "B5" }, .{ .string = "C5" }, .{ .string = "D5" }, .{ .string = "E5" } });
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    const countLines = struct {
+        fn f(s: []const u8) usize {
+            var n: usize = 0;
+            for (s) |c| if (c == '\n') {
+                n += 1;
+            };
+            return n;
+        }
+    }.f;
+
+    // --range B2:C3 on rows → 2 envelope lines (rows 2 and 3).
+    // Out-of-range columns are masked to empty, so only B2/C2 and B3/C3
+    // appear as quoted values.
+    var scratch: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    const range: xlsx.MergeRange = .{
+        .top_left = .{ .col = 1, .row = 2 },
+        .bottom_right = .{ .col = 2, .row = 3 },
+    };
+    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, range);
+    const out = w.buffered();
+    try std.testing.expectEqual(@as(usize, 2), countLines(out));
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"B2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"C2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"B3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"C3\"") != null);
+    // Row 1, 4, 5 entirely absent.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"A1\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"B4\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"E5\"") == null);
+    // Out-of-col cells in kept rows are masked, so A2/D2/E2/A3/D3/E3
+    // must NOT appear as quoted values in the envelope.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"A2\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"D2\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"E2\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"A3\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"D3\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"E3\"") == null);
 }
 
 test "runCellsCommand --skip / --take slice the emitted cell stream" {
@@ -1873,14 +2185,14 @@ test "runCellsCommand --skip / --take slice the emitted cell stream" {
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, null, null);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, null, null, null);
         try std.testing.expectEqual(@as(usize, 5), countLines(w.buffered()));
     }
     // --skip 2 drops the first two cells (c1, c2).
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 2, null, null, null);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 2, null, null, null, null);
         const out = w.buffered();
         try std.testing.expectEqual(@as(usize, 3), countLines(out));
         try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c1\"") == null);
@@ -1891,7 +2203,7 @@ test "runCellsCommand --skip / --take slice the emitted cell stream" {
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, 3, null, null);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, 3, null, null, null);
         const out = w.buffered();
         try std.testing.expectEqual(@as(usize, 3), countLines(out));
         try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c3\"") != null);
@@ -1901,7 +2213,7 @@ test "runCellsCommand --skip / --take slice the emitted cell stream" {
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 1, 2, null, null);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 1, 2, null, null, null);
         const out = w.buffered();
         try std.testing.expectEqual(@as(usize, 2), countLines(out));
         try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c1\"") == null);
