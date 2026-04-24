@@ -5318,3 +5318,41 @@ test "runRowsCommand envelope emits t:date inside cells array (iter61-a)" {
     try std.testing.expect(std.mem.indexOf(u8, out, "{\"ref\":\"A1\",\"col\":1,\"t\":\"int\",\"v\":7}") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "{\"ref\":\"B1\",\"col\":2,\"t\":\"date\",\"v\":\"2024-06-15T00:00:00\",\"serial\":45458}") != null);
 }
+
+test "runCellsCommand skips t:date auto-convert on 1904-epoch workbook" {
+    // iter61-a P1 follow-up: workbooks with <workbookPr date1904="1"/>
+    // shift every serial by 1462 days. Until proper 1904 decoding ships,
+    // the CLI must NOT auto-convert these cells to t:"date" — the
+    // numeric value is the authoritative signal.
+    const tmp_path = "/tmp/zlsx_cli_iter61a_date1904.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        const date_style = try w.addStyle(.{ .number_format = "yyyy-mm-dd" });
+        var s = try w.addSheet("Data");
+        // Serial 45458 = 2024-06-15 under 1900 system. We write a 1900
+        // workbook, then flip the flag post-open to simulate a 1904
+        // file (the zlsx Writer doesn't emit 1904 workbooks today).
+        try s.writeRowStyled(&.{.{ .integer = 45458 }}, &.{date_style});
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    // Simulate a 1904-epoch workbook.
+    book.uses_1904_epoch = true;
+
+    var scratch: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, null, null, null, false, false);
+    const out = w.buffered();
+
+    // MUST be t:"int", NOT t:"date" — otherwise the emitted ISO string
+    // would be off by 1462 days vs what the 1904 system actually encodes.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"t\":\"int\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":45458") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"t\":\"date\"") == null);
+}

@@ -472,6 +472,13 @@ pub const Book = struct {
     /// reader. Set by `openLazy`; torn down LAST in `deinit` (after
     /// every borrowed part buffer is freed).
     archive: ?*ZipArchive = null,
+    /// True when the source workbook declares `<workbookPr
+    /// date1904="1"/>` — the Mac Excel epoch shifts every serial by
+    /// 1462 days vs the default 1900 system. iter61-a only wires the
+    /// flag as a gate: `Rows` skips `t:"date"` auto-conversion for
+    /// 1904-epoch workbooks (the numeric value survives as `.integer`
+    /// / `.number`). Proper 1904 decoding is queued for a follow-up.
+    uses_1904_epoch: bool = false,
     /// Decompressed `xl/sharedStrings.xml` (nullable — small xlsx files
     /// with only inline strings omit this part).
     shared_strings_xml: ?[]u8 = null,
@@ -1411,7 +1418,13 @@ pub const Rows = struct {
             };
             if (num_opt) |num| {
                 if (self.book) |book| {
-                    if (book.isDateFormat(style_idx.?) and fromExcelSerial(num) != null) {
+                    // iter61-a P1 follow-up: skip auto-conversion on
+                    // 1904-epoch workbooks. fromExcelSerial assumes
+                    // 1900; a 1904 workbook would shift every date
+                    // by 1462 days. Until proper 1904 decoding
+                    // ships, leave the cell as numeric — callers
+                    // still see the raw value.
+                    if (!book.uses_1904_epoch and book.isDateFormat(style_idx.?) and fromExcelSerial(num) != null) {
                         self.row_date_types.items[col_idx] = true;
                     }
                 }
@@ -1625,6 +1638,21 @@ fn appendDecoded(
 // ─── workbook.xml + rels parsing ─────────────────────────────────────
 
 fn parseWorkbookSheets(book: *Book, wb_xml: []const u8, rels_xml: []const u8) !void {
+    // iter61-a: detect the 1904 date-epoch flag on the workbook. It's
+    // carried on <workbookPr date1904="1"/> (or "true"). Default is
+    // the 1900 system. Scan lenient: if we can't find the attribute
+    // the flag stays false and date cells decode under 1900 — the
+    // common case.
+    if (std.mem.indexOf(u8, wb_xml, "<workbookPr")) |pr_start| {
+        const pr_end = std.mem.indexOfScalarPos(u8, wb_xml, pr_start, '>') orelse wb_xml.len;
+        const attrs = wb_xml[pr_start + "<workbookPr".len .. pr_end];
+        if (getAttr(attrs, "date1904")) |v| {
+            if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true")) {
+                book.uses_1904_epoch = true;
+            }
+        }
+    }
+
     // Parse rels first into an id → target map.
     var rel_map: std.StringHashMapUnmanaged([]const u8) = .{};
     defer rel_map.deinit(book.allocator);
