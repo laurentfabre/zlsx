@@ -25,6 +25,22 @@ while (try rows.next()) |cells| {
     };
 }
 
+// Lazy open (iter54) — don't pre-decompress every sheet's XML up
+// front. Use this when streaming one sheet at a time out of a
+// large workbook, e.g. the upcoming jq-for-excel CLI. The file
+// handle stays open for the Book's lifetime; Book.open is the
+// eager facade that releases it on return.
+var lazy = try xlsx.Book.openLazy(allocator, "big.xlsx");
+defer lazy.deinit();
+// Workbook-wide state (sheets list, SST, styles, theme) is ready
+// on return. Per-sheet metadata (merged ranges, hyperlinks,
+// validations, comments) materializes on demand — call
+// streamSheet/rows or preloadSheet explicitly.
+var r = try lazy.streamSheet(0, allocator);   // by index — CLI-friendly
+defer r.deinit();
+while (try r.next()) |_| {}
+try lazy.preloadSheet(lazy.sheets[1]);        // populate metadata only
+
 // Writing — including styles, fills, borders, number formats,
 // column widths, freeze panes, auto-filter.
 var w = xlsx.Writer.init(allocator);
