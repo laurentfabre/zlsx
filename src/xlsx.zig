@@ -1640,17 +1640,27 @@ fn appendDecoded(
 fn parseWorkbookSheets(book: *Book, wb_xml: []const u8, rels_xml: []const u8) !void {
     // iter61-a: detect the 1904 date-epoch flag on the workbook. It's
     // carried on <workbookPr date1904="1"/> (or "true"). Default is
-    // the 1900 system. Scan lenient: if we can't find the attribute
-    // the flag stays false and date cells decode under 1900 — the
-    // common case.
-    if (std.mem.indexOf(u8, wb_xml, "<workbookPr")) |pr_start| {
-        const pr_end = std.mem.indexOfScalarPos(u8, wb_xml, pr_start, '>') orelse wb_xml.len;
-        const attrs = wb_xml[pr_start + "<workbookPr".len .. pr_end];
-        if (getAttr(attrs, "date1904")) |v| {
-            if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true")) {
-                book.uses_1904_epoch = true;
+    // the 1900 system. Tag-boundary check required because
+    // <workbookProtection> shares the `<workbookPr` prefix — matching
+    // the prefix alone would stop on workbookProtection and miss
+    // date1904 on the real workbookPr element. Scan lenient: if we
+    // can't find the tag the flag stays false (1900, the common case).
+    var scan: usize = 0;
+    while (std.mem.indexOfPos(u8, wb_xml, scan, "<workbookPr")) |p| {
+        const after = p + "<workbookPr".len;
+        if (after >= wb_xml.len) break;
+        const ch = wb_xml[after];
+        if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r' or ch == '/' or ch == '>') {
+            const pr_end = std.mem.indexOfScalarPos(u8, wb_xml, after, '>') orelse wb_xml.len;
+            const attrs = wb_xml[after..pr_end];
+            if (getAttr(attrs, "date1904")) |v| {
+                if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true")) {
+                    book.uses_1904_epoch = true;
+                }
             }
+            break;
         }
+        scan = p + 1;
     }
 
     // Parse rels first into an id → target map.
@@ -4535,6 +4545,62 @@ test "fuzz parseSharedStrings" {
         book.shared_strings_xml = owned;
         parseSharedStrings(&book, owned) catch {};
     }
+}
+
+test "parseWorkbookSheets sets uses_1904_epoch past a <workbookProtection> prefix" {
+    // Regression: <workbookProtection> shares the `<workbookPr` prefix.
+    // A naive prefix-match would stop on the protection tag, miss
+    // date1904 on the real workbookPr element, and silently fall back
+    // to the 1900 epoch — re-creating the 1462-day skew the iter61-a
+    // gate is meant to prevent.
+    const wb_xml =
+        \\<?xml version="1.0"?>
+        \\<workbook>
+        \\<workbookProtection workbookPassword="ABCD" lockStructure="1"/>
+        \\<workbookPr date1904="1"/>
+        \\<sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets>
+        \\</workbook>
+    ;
+    const rels_xml =
+        \\<?xml version="1.0"?>
+        \\<Relationships>
+        \\<Relationship Id="rId1" Target="worksheets/sheet1.xml"/>
+        \\</Relationships>
+    ;
+
+    var book: Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer book.deinit();
+
+    try parseWorkbookSheets(&book, wb_xml, rels_xml);
+    try std.testing.expect(book.uses_1904_epoch);
+}
+
+test "parseWorkbookSheets leaves uses_1904_epoch false for 1900 workbooks" {
+    const wb_xml =
+        \\<?xml version="1.0"?>
+        \\<workbook>
+        \\<workbookPr defaultThemeVersion="124226"/>
+        \\<sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets>
+        \\</workbook>
+    ;
+    const rels_xml =
+        \\<?xml version="1.0"?>
+        \\<Relationships>
+        \\<Relationship Id="rId1" Target="worksheets/sheet1.xml"/>
+        \\</Relationships>
+    ;
+
+    var book: Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer book.deinit();
+
+    try parseWorkbookSheets(&book, wb_xml, rels_xml);
+    try std.testing.expect(!book.uses_1904_epoch);
 }
 
 test "fuzz parseWorkbookSheets" {
