@@ -825,6 +825,55 @@ def test_rich_text_runs_color_size_font(tmp_path):
         assert runs[0].font_name == ""
 
 
+def test_sheet_read_all_and_module_read_helper(tmp_path):
+    """`Sheet.read_all()` + `zlsx.read()` materialise rows into
+    list-of-lists suitable for pandas.DataFrame / polars.DataFrame.
+    No optional dependencies on those libraries — plain Python."""
+    out = tmp_path / "readhelper.xlsx"
+    with zlsx.write(out) as w:
+        s = w.add_sheet("Data")
+        s.write_row(["name", "qty", "price"])
+        s.write_row(["apple", 3, 1.5])
+        s.write_row(["banana", 7, 0.3])
+        w.add_sheet("Other").write_row(["x"])
+
+    # Sheet.read_all(header=False): every row in one list.
+    with zlsx.open(out) as book:
+        header, rows = book.sheet(0).read_all()
+        assert header is None
+        assert rows == [
+            ["name", "qty", "price"],
+            ["apple", 3, 1.5],
+            ["banana", 7, 0.3],
+        ]
+
+    # Sheet.read_all(header=True): first row split out.
+    with zlsx.open(out) as book:
+        header, rows = book.sheet(0).read_all(header=True)
+        assert header == ["name", "qty", "price"]
+        assert rows == [
+            ["apple", 3, 1.5],
+            ["banana", 7, 0.3],
+        ]
+
+    # Module-level zlsx.read — one-shot, closes book.
+    header, rows = zlsx.read(out, header=True)
+    assert header == ["name", "qty", "price"]
+    assert len(rows) == 2
+
+    # Sheet by name.
+    header, rows = zlsx.read(out, sheet="Other")
+    assert rows == [["x"]]
+
+    # Out-of-range index → ZlsxError.
+    with pytest.raises(zlsx.ZlsxError, match="out of range"):
+        zlsx.read(out, sheet=99)
+
+    # Unknown sheet name → ZlsxError.
+    with pytest.raises(zlsx.ZlsxError, match="not found"):
+        zlsx.read(out, sheet="Missing")
+
+
 def test_to_excel_serial_round_trip_with_parse_date(tmp_path):
     """Full date round-trip: Python datetime → to_excel_serial →
     write as numeric cell with date style → read via parse_date →

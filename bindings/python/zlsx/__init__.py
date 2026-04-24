@@ -56,6 +56,7 @@ __all__ = [
     "Dxf",
     "CF_OPERATORS",
     "to_excel_serial",
+    "read",
     "ZlsxError",
 ]
 
@@ -913,6 +914,30 @@ class Sheet:
         mapping)."""
         return Rows(self._book, self.index)
 
+    def read_all(self, header: bool = False) -> "tuple[list | None, list[list]]":
+        """Materialise every row in this sheet into a ``list[list]``.
+
+        Returns ``(header_row, data_rows)``. When ``header=True`` the
+        first row is split out as the header; otherwise ``header_row``
+        is ``None`` and ``data_rows`` contains every row.
+
+        Convenience wrapper for callers who want to feed the result
+        into ``pandas.DataFrame`` or ``polars.DataFrame``:
+
+        .. code-block:: python
+
+            with zlsx.open("data.xlsx") as book:
+                headers, rows = book.sheet(0).read_all(header=True)
+            df = pandas.DataFrame(rows, columns=headers)
+
+        No optional dependency on pandas/polars — the return shape is
+        plain Python lists, so any tabular library can consume it."""
+        with self.rows() as r:
+            all_rows = list(r)
+        if not header or len(all_rows) == 0:
+            return (None, all_rows)
+        return (all_rows[0], all_rows[1:])
+
 
 # ─── Rows ─────────────────────────────────────────────────────────────
 
@@ -1086,6 +1111,44 @@ def open(path: Union[str, Path]) -> Book:  # noqa: A001  (shadows builtin by des
     xlsx archive. Raises :class:`ZlsxError` on parse failure.
     """
     return Book(path)
+
+
+def read(
+    path: Union[str, Path],
+    sheet: Union[int, str] = 0,
+    header: bool = False,
+) -> "tuple[list | None, list[list]]":
+    """Open ``path`` and materialise one sheet's rows in a single
+    call. Closes the book before returning.
+
+    ``sheet`` can be a 0-based index or a sheet name. ``header=True``
+    splits the first row as the header; otherwise the entire sheet
+    lands in the second element of the tuple.
+
+    Wraps :meth:`Book.sheet` + :meth:`Sheet.read_all` for the
+    "just-give-me-the-rows" case — typical entry point for callers
+    that feed into pandas / polars:
+
+    .. code-block:: python
+
+        headers, rows = zlsx.read("data.xlsx", header=True)
+        df = pandas.DataFrame(rows, columns=headers)
+    """
+    with open(path) as book:
+        if isinstance(sheet, str):
+            for i, name in enumerate(book.sheets):
+                if name == sheet:
+                    idx = i
+                    break
+            else:
+                raise ZlsxError(f"sheet {sheet!r} not found; have {book.sheets!r}")
+        else:
+            idx = int(sheet)
+            if idx < 0 or idx >= len(book.sheets):
+                raise ZlsxError(
+                    f"sheet index {idx} out of range (book has {len(book.sheets)} sheets)"
+                )
+        return book.sheet(idx).read_all(header=header)
 
 
 # ─── Writer ───────────────────────────────────────────────────────────
