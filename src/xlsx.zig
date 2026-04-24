@@ -1098,6 +1098,7 @@ pub const Book = struct {
             .row_cells = .{},
             .row_styles = .{},
             .row_date_types = .{},
+            .row_error_strings = .{},
             .arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
@@ -1183,6 +1184,17 @@ pub const Rows = struct {
     /// the CLI can emit `t:"date"` alongside the raw numeric serial
     /// without altering the `Cell` union shape.
     row_date_types: std.ArrayListUnmanaged(bool),
+    /// Parallel to `row_cells`. Each slot holds the literal Excel-error
+    /// string (e.g. `"#DIV/0!"`, `"#N/A"`, `"#REF!"`) for cells whose
+    /// source `<c>` carried `t="e"` and a `<v>` body, or `null`
+    /// otherwise. The string borrows from the sheet XML buffer when
+    /// the body has no entities, otherwise it is owned by the row arena
+    /// (via `decodeVValue`). Exposed via `errorStrings()` so the CLI
+    /// can emit `t:"error"` without altering the `Cell` union shape;
+    /// the cell slot itself stays a plain `.string` so consumers that
+    /// don't ask for the side channel still see the literal text. Same
+    /// lifetime as `row_cells`.
+    row_error_strings: std.ArrayListUnmanaged(?[]const u8),
     /// Bump arena for per-row decoded strings. Reset (O(1)) at the
     /// start of each `next()` call — previous row's owned strings
     /// become invalid, which matches the documented contract. Compared
@@ -1212,6 +1224,7 @@ pub const Rows = struct {
         self.row_cells.deinit(self.allocator);
         self.row_styles.deinit(self.allocator);
         self.row_date_types.deinit(self.allocator);
+        self.row_error_strings.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -1232,6 +1245,18 @@ pub const Rows = struct {
     /// numerics stay `false`. Valid until the next `next()` call.
     pub fn dateTypes(self: *const Rows) []const bool {
         return self.row_date_types.items;
+    }
+
+    /// Per-column literal Excel-error strings for the current row.
+    /// Aligned to the slice returned by `next()`; `null` means the
+    /// `<c>` was not `t="e"`. When non-null, the slot holds the literal
+    /// error text (`"#DIV/0!"`, `"#N/A"`, `"#REF!"`, `"#VALUE!"`,
+    /// `"#NUM!"`, `"#NAME?"`, `"#NULL!"`, `"#GETTING_DATA"`). Borrows
+    /// from the sheet XML buffer when entity-free, otherwise lives in
+    /// the row arena. Valid until the next `next()` call, same as
+    /// `row_cells`.
+    pub fn errorStrings(self: *const Rows) []const ?[]const u8 {
+        return self.row_error_strings.items;
     }
 
     /// Parse the current-row cell at `col_idx` as a date-styled
@@ -1279,6 +1304,7 @@ pub const Rows = struct {
         self.row_cells.clearRetainingCapacity();
         self.row_styles.clearRetainingCapacity();
         self.row_date_types.clearRetainingCapacity();
+        self.row_error_strings.clearRetainingCapacity();
         _ = self.arena.reset(.retain_capacity);
 
         while (findTagOpen(self.xml, self.pos, "row")) |row_start| {
@@ -1357,18 +1383,22 @@ pub const Rows = struct {
         else
             null;
 
-        // Grow row_cells + row_styles + row_date_types to cover col_idx;
-        // fill gaps with `.empty` / `null` / `false`. All three arrays
-        // stay in lock-step so callers can index them the same way.
+        // Grow row_cells + row_styles + row_date_types + row_error_strings
+        // to cover col_idx; fill gaps with `.empty` / `null` / `false` /
+        // `null`. All four arrays stay in lock-step so callers can index
+        // them the same way.
         while (self.row_cells.items.len <= col_idx) {
             try self.row_cells.append(self.allocator, .empty);
             try self.row_styles.append(self.allocator, null);
             try self.row_date_types.append(self.allocator, false);
+            try self.row_error_strings.append(self.allocator, null);
         }
         self.row_styles.items[col_idx] = style_idx;
         // Date-flag defaults to false; the numeric branch below flips
         // it on when the style + value qualify.
         self.row_date_types.items[col_idx] = false;
+        // Error-string defaults to null; the t="e" branch below sets it.
+        self.row_error_strings.items[col_idx] = null;
 
         if (is_self_closing) {
             // Empty cell; already .empty.
@@ -1397,10 +1427,17 @@ pub const Rows = struct {
             // than crashing on the [0] index.
             const raw = extractVValue(body) orelse "";
             break :blk .{ .boolean = raw.len > 0 and raw[0] == '1' };
-        } else if (std.mem.eql(u8, cell_type, "e"))
-            .{ .string = try self.decodeVValue(body) }
-        else
-            try parseNumericCell(extractVValue(body) orelse "");
+        } else if (std.mem.eql(u8, cell_type, "e")) blk: {
+            // iter61-c: capture the literal error string on the parallel
+            // side channel so the CLI can emit `t:"error"`. The Cell
+            // union slot stays `.string` (same as before) — consumers
+            // that don't read `errorStrings()` still see the literal
+            // text and a stable type tag, matching pre-iter61-c
+            // behaviour.
+            const literal = try self.decodeVValue(body);
+            self.row_error_strings.items[col_idx] = literal;
+            break :blk .{ .string = literal };
+        } else try parseNumericCell(extractVValue(body) orelse "");
 
         self.row_cells.items[col_idx] = cell;
 
@@ -4912,6 +4949,7 @@ fn consumeAllRows(alloc: std.mem.Allocator, shared_strings: []const []const u8, 
         .row_cells = .{},
         .row_styles = .{},
         .row_date_types = .{},
+        .row_error_strings = .{},
         .arena = std.heap.ArenaAllocator.init(alloc),
     };
     defer rows.deinit();
@@ -5049,6 +5087,7 @@ test "fuzz Rows.next on synthetic cells with out-of-range SST indices" {
             .row_cells = .{},
             .row_styles = .{},
             .row_date_types = .{},
+            .row_error_strings = .{},
             .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
         };
         defer rows.deinit();
@@ -5080,6 +5119,7 @@ test "Rows.currentRowNumber recovers from cell r attr when <row r> is absent/bad
         .row_cells = .{},
         .row_styles = .{},
         .row_date_types = .{},
+        .row_error_strings = .{},
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
@@ -5109,6 +5149,7 @@ test "Rows.currentRowNumber recovers cell-r with non-space whitespace after <c" 
         .row_cells = .{},
         .row_styles = .{},
         .row_date_types = .{},
+        .row_error_strings = .{},
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
@@ -5138,6 +5179,7 @@ test "Rows.currentRowNumber falls through to yield count when row body is empty"
         .row_cells = .{},
         .row_styles = .{},
         .row_date_types = .{},
+        .row_error_strings = .{},
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
