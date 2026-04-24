@@ -1,6 +1,6 @@
 # jq for Excel — streaming CLI design (v4.1)
 
-> **Status**: design, stable enough to implement from (four rounds of Codex review, round 4 signed off). See `src/cli.zig` for the current CLI surface (single-command, row-value jsonl/tsv/csv). v4.1 applies editorial polish on top of v4 — see the "what changed" note at the bottom. Implementation begins at iter54 per the rollout plan.
+> **Status**: design **shipped** — every rollout slice iter54 → iter60c is landed on `main` and Codex-reviewed clean. Four rounds of design-level Codex review (v1 → v4.1) preceded implementation; each code slice went through its own review rounds. The CLI surface described below is now what `zlsx` actually emits — see `src/cli.zig` for the implementation and the README's "CLI" section for the user-facing reference. v4.1 notes the editorial polish that closed the design-review cycle.
 
 ## Goal
 
@@ -241,19 +241,19 @@ zlsx <subcommand> <file> [flags]
 
 Parser is two-phase: first token picks the sub-command (or defaults to `cells` / `rows` for backward compat), then delegates.
 
-## Rollout plan (iter54+)
+## Rollout plan (iter54+) — **SHIPPED**
 
-Revised after Codex review — ship the streaming primitives and envelope BEFORE multiplying sub-commands, so nothing cements inconsistent schemas.
+Revised after Codex review — ship the streaming primitives and envelope BEFORE multiplying sub-commands, so nothing cements inconsistent schemas. Every slice landed on `main`; Codex signed off on each.
 
-1. **iter54 — `openLazy` foundation**: refactor `Book.open` into a lazy-core + eager-facade. Keep `Book` signature for existing library callers. Introduce `Book.streamSheet(idx)` that returns a `Rows` iterator without the full pre-load. ~500 LOC.
-2. **iter55 — common envelope in the CLI**: wrap every existing output (rows) with `{kind, sheet, sheet_idx, …}`. Bump the existing `--format jsonl` to the new shape; keep `--format legacy-jsonl` as an escape hatch for one release cycle.
-3. **iter56 — `cells` sub-command**: per-cell NDJSON with full envelope, `row` / `col` numerics, `t` always present. Date detection via iter46's `Rows.parseDate`. Formula support via the iter22 writer round-trip shape.
-4. **iter57 — `meta` + `list-sheets` as NDJSON**: workbook + sheet records. Trivial over existing reader APIs.
-5. **iter58 — `comments` / `validations` / `hyperlinks` / `sst` / `styles`**: thin CLI wrappers. ~50 LOC each. Ship together — one iter.
-6. **iter59 — pagination + filtering flags**: `--skip`, `--take`, `--start-row`, `--end-row`, `--range`, `--header`, `--all-sheets`, `--sheet-glob`, `--include-blanks`, `--with-styles`, `--sheet`, `--sheet-index`.
-7. **iter60 — error records + compact schema**: inline `kind:"error"` events; `--output compact-ndjson` (sheet-prologue variant) and `--output pretty-json` (single-object mode on `meta`).
+1. **iter54 — `openLazy` foundation** ✅ (A scaffolding + B lazy extraction + C `streamSheet(idx)`): `Book.openLazy` / `preloadSheet` / `streamSheet` all public on `Book`; `Book.open` preserved as the eager facade that closes the file handle on return.
+2. **iter55 — common envelope in the CLI** ✅ (55a envelope + 55b README/deprecation): `--format jsonl` is the uniform `{kind,sheet,sheet_idx,row,cells:[…]}` stream; `legacy-jsonl` / `legacy-jsonl-dict` carry the pre-iter55a shapes; `jsonl-dict` alias emits a stderr deprecation warning.
+3. **iter56 — `cells` sub-command** ✅: `zlsx cells <file>` emits per-cell NDJSON with `{kind,sheet,sheet_idx,ref,row,col,t,v}` and sparse empties. Date / formula / error cells are still basic types (`str`/`int`/`num`/`bool`) pending reader surface extensions.
+4. **iter57 — `meta` + `list-sheets` as NDJSON** ✅: workbook + per-sheet records; legacy `--list-sheets` flag preserved for plain-text callers.
+5. **iter58 — `comments` / `validations` / `hyperlinks` / `sst` / `styles`** ✅ (5 wrappers in one slice).
+6. **iter59 — pagination + filtering flags** ✅ (shipped as 59a / 59b-1..4 / 59c): `--skip`, `--take`, `--start-row`, `--end-row`, `--range`, `--header`, `--all-sheets`, `--sheet-glob` (UTF-8 `?`), `--include-blanks`, `--with-styles`. `--sheet` / `--sheet-index` covered by iter55+.
+7. **iter60 — operational guarantees + error records + compact schema** ✅ (60a signals/exit codes + 60b `--output` modes + 60c inline errors).
 
-Every iter ships independently, each under ~500 LOC, each user-observable.
+Every iter shipped independently, each user-observable. See `git log --oneline -- src/cli.zig src/xlsx.zig` for the commit chain.
 
 ## Example pipelines
 
