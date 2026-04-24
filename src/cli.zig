@@ -8,7 +8,16 @@ const std = @import("std");
 const builtin = @import("builtin");
 const xlsx = @import("xlsx.zig");
 
-const Format = enum { jsonl, jsonl_dict, tsv, csv };
+const Format = enum {
+    /// NEW default: row envelope `{kind,sheet,sheet_idx,row,cells:[…]}`.
+    jsonl,
+    /// Bare `[…]` arrays — what iter54's `jsonl` emitted.
+    legacy_jsonl,
+    /// Bare `{col:val,…}` objects — what iter54's `jsonl-dict` emitted.
+    legacy_jsonl_dict,
+    tsv,
+    csv,
+};
 
 const Args = struct {
     file: []const u8,
@@ -51,7 +60,22 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
             const v = argv[i];
-            if (std.mem.eql(u8, v, "jsonl")) out.format = .jsonl else if (std.mem.eql(u8, v, "jsonl-dict")) out.format = .jsonl_dict else if (std.mem.eql(u8, v, "tsv")) out.format = .tsv else if (std.mem.eql(u8, v, "csv")) out.format = .csv else return ArgError.BadFormat;
+            if (std.mem.eql(u8, v, "jsonl")) {
+                out.format = .jsonl;
+            } else if (std.mem.eql(u8, v, "legacy-jsonl")) {
+                out.format = .legacy_jsonl;
+            } else if (std.mem.eql(u8, v, "legacy-jsonl-dict")) {
+                out.format = .legacy_jsonl_dict;
+            } else if (std.mem.eql(u8, v, "jsonl-dict")) {
+                // Deprecated alias for `legacy-jsonl-dict`; kept silent
+                // for one release cycle (iter55b will warn). Pre-iter55a
+                // the only dict shape we shipped was the bare object.
+                out.format = .legacy_jsonl_dict;
+            } else if (std.mem.eql(u8, v, "tsv")) {
+                out.format = .tsv;
+            } else if (std.mem.eql(u8, v, "csv")) {
+                out.format = .csv;
+            } else return ArgError.BadFormat;
         } else if (a.len > 0 and a[0] == '-') {
             return ArgError.UnknownFlag;
         } else {
@@ -161,9 +185,73 @@ fn writeCsvField(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('"');
 }
 
+/// Per-cell `t` type tag for the envelope schema. Mirrors the
+/// design-doc "cells" record but limited to the four primitive
+/// types this slice emits — date/formula/error are future work.
+fn envelopeTypeTag(cell: xlsx.Cell) []const u8 {
+    return switch (cell) {
+        .empty => unreachable, // caller skips empties
+        .string => "str",
+        .integer => "int",
+        .number => "num",
+        .boolean => "bool",
+    };
+}
+
+/// Emit just the `[{ref,col,t,v},…]` array. Sparse: `.empty` slots
+/// are skipped. `row_number` is the 1-based OOXML row used to build
+/// each cell's `ref`.
+fn writeEnvelopeCells(
+    w: *std.Io.Writer,
+    cells: []const xlsx.Cell,
+    row_number: u32,
+) !void {
+    try w.writeByte('[');
+    var first = true;
+    for (cells, 0..) |c, i| {
+        if (c == .empty) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+
+        var col_buf: [8]u8 = undefined;
+        const letters = colLetter(&col_buf, i);
+        var ref_buf: [16]u8 = undefined;
+        const ref = std.fmt.bufPrint(&ref_buf, "{s}{d}", .{ letters, row_number }) catch unreachable;
+
+        try w.writeAll("{\"ref\":");
+        try writeJsonString(w, ref);
+        try w.print(",\"col\":{d},\"t\":\"{s}\",\"v\":", .{ i + 1, envelopeTypeTag(c) });
+        try writeJsonCell(w, c);
+        try w.writeByte('}');
+    }
+    try w.writeByte(']');
+}
+
+/// Emit one NDJSON envelope line:
+/// `{"kind":"row","sheet":…,"sheet_idx":…,"row":…,"cells":[…]}\n`.
+/// All-empty rows still emit the envelope with `"cells":[]` so
+/// consumers can count rows without a second pass.
+fn writeRowEnvelope(
+    w: *std.Io.Writer,
+    sheet_name: []const u8,
+    sheet_idx: usize,
+    row_number: u32,
+    cells: []const xlsx.Cell,
+) !void {
+    try w.writeAll("{\"kind\":\"row\",\"sheet\":");
+    try writeJsonString(w, sheet_name);
+    try w.print(",\"sheet_idx\":{d},\"row\":{d},\"cells\":", .{ sheet_idx, row_number });
+    try writeEnvelopeCells(w, cells, row_number);
+    try w.writeAll("}\n");
+}
+
+/// Legacy emitter — covers the four bare/flat formats. The new
+/// envelope format (`.jsonl`) goes through `writeRowEnvelope`, not
+/// this function. Calling this with `.jsonl` is a programmer error.
 fn writeRow(w: *std.Io.Writer, cells: []const xlsx.Cell, fmt: Format) !void {
     switch (fmt) {
-        .jsonl => {
+        .jsonl => unreachable, // envelope path; use writeRowEnvelope
+        .legacy_jsonl => {
             try w.writeByte('[');
             for (cells, 0..) |c, i| {
                 if (i > 0) try w.writeAll(", ");
@@ -171,7 +259,7 @@ fn writeRow(w: *std.Io.Writer, cells: []const xlsx.Cell, fmt: Format) !void {
             }
             try w.writeAll("]\n");
         },
-        .jsonl_dict => {
+        .legacy_jsonl_dict => {
             try w.writeByte('{');
             var first = true;
             for (cells, 0..) |c, i| {
@@ -285,12 +373,16 @@ pub fn main() !u8 {
         return 0;
     }
 
-    const sheet = blk: {
+    const Selected = struct { sheet: xlsx.Sheet, idx: usize };
+    const selected: Selected = blk: {
         if (args.sheet_name) |n| {
-            break :blk book.sheetByName(n) orelse {
-                try err.print("zlsx: no sheet named '{s}'\n", .{n});
-                return 3;
-            };
+            // Linear scan so we recover the 0-based index too — the
+            // envelope emitter needs it per-record.
+            for (book.sheets, 0..) |s, i| {
+                if (std.mem.eql(u8, s.name, n)) break :blk .{ .sheet = s, .idx = i };
+            }
+            try err.print("zlsx: no sheet named '{s}'\n", .{n});
+            return 3;
         }
         const idx = args.sheet_index orelse 0;
         if (book.sheets.len == 0) {
@@ -301,14 +393,17 @@ pub fn main() !u8 {
             try err.print("zlsx: sheet index {d} out of range (workbook has {d})\n", .{ idx, book.sheets.len });
             return 3;
         }
-        break :blk book.sheets[idx];
+        break :blk .{ .sheet = book.sheets[idx], .idx = idx };
     };
 
-    var rows = try book.rows(sheet, alloc);
+    var rows = try book.rows(selected.sheet, alloc);
     defer rows.deinit();
 
     while (try rows.next()) |cells| {
-        try writeRow(out, cells, args.format);
+        switch (args.format) {
+            .jsonl => try writeRowEnvelope(out, selected.sheet.name, selected.idx, rows.currentRowNumber(), cells),
+            else => try writeRow(out, cells, args.format),
+        }
     }
     return 0;
 }
@@ -369,6 +464,115 @@ test "parseArgs rejects both --sheet and --name" {
 test "parseArgs help" {
     const argv = [_][]const u8{"-h"};
     try std.testing.expectError(ArgError.HelpRequested, parseArgs(&argv));
+}
+
+test "parseArgs maps jsonl to envelope and legacy-jsonl to bare array" {
+    {
+        const argv = [_][]const u8{ "f.xlsx", "--format", "jsonl" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Format.jsonl, a.format);
+    }
+    {
+        const argv = [_][]const u8{ "f.xlsx", "--format", "legacy-jsonl" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Format.legacy_jsonl, a.format);
+    }
+    {
+        const argv = [_][]const u8{ "f.xlsx", "--format", "legacy-jsonl-dict" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Format.legacy_jsonl_dict, a.format);
+    }
+    {
+        // Deprecated alias still lands on the bare-dict path.
+        const argv = [_][]const u8{ "f.xlsx", "--format", "jsonl-dict" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Format.legacy_jsonl_dict, a.format);
+    }
+}
+
+test "writeRowEnvelope emits kind + sheet + sheet_idx + row + sparse cells" {
+    var scratch: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    const cells = [_]xlsx.Cell{
+        .{ .string = "name" },
+        .{ .integer = 42 },
+        .empty, // sparse — must be skipped in the cells array
+        .{ .number = 3.5 },
+        .{ .boolean = true },
+    };
+    try writeRowEnvelope(&w, "Data", 0, 1, &cells);
+    const expected =
+        "{\"kind\":\"row\",\"sheet\":\"Data\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
+        "{\"ref\":\"A1\",\"col\":1,\"t\":\"str\",\"v\":\"name\"}," ++
+        "{\"ref\":\"B1\",\"col\":2,\"t\":\"int\",\"v\":42}," ++
+        "{\"ref\":\"D1\",\"col\":4,\"t\":\"num\",\"v\":3.5}," ++
+        "{\"ref\":\"E1\",\"col\":5,\"t\":\"bool\",\"v\":true}" ++
+        "]}\n";
+    try std.testing.expectEqualStrings(expected, w.buffered());
+}
+
+test "writeRowEnvelope all-empty row emits envelope with empty cells array" {
+    var scratch: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    const cells = [_]xlsx.Cell{ .empty, .empty, .empty };
+    try writeRowEnvelope(&w, "S", 2, 7, &cells);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"row\",\"sheet\":\"S\",\"sheet_idx\":2,\"row\":7,\"cells\":[]}\n",
+        w.buffered(),
+    );
+}
+
+test "writeRowEnvelope escapes sheet name" {
+    var scratch: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    const cells = [_]xlsx.Cell{.{ .integer = 1 }};
+    try writeRowEnvelope(&w, "She\"et\n", 0, 1, &cells);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"row\",\"sheet\":\"She\\\"et\\n\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
+            "{\"ref\":\"A1\",\"col\":1,\"t\":\"int\",\"v\":1}" ++
+            "]}\n",
+        w.buffered(),
+    );
+}
+
+test "writeRowEnvelope non-finite number becomes null v" {
+    var scratch: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    const cells = [_]xlsx.Cell{.{ .number = std.math.nan(f64) }};
+    try writeRowEnvelope(&w, "S", 0, 1, &cells);
+    // `t` stays `"num"` for the non-finite case — the type of the
+    // cell didn't change, only its JSON-serializable value did.
+    // This matches the pre-iter55a behaviour of writeJsonCell.
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"row\",\"sheet\":\"S\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
+            "{\"ref\":\"A1\",\"col\":1,\"t\":\"num\",\"v\":null}" ++
+            "]}\n",
+        w.buffered(),
+    );
+}
+
+test "writeRow legacy-jsonl produces bare arrays (regression guard)" {
+    var scratch: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    const cells = [_]xlsx.Cell{
+        .{ .string = "x" },
+        .empty,
+        .{ .integer = 9 },
+    };
+    try writeRow(&w, &cells, .legacy_jsonl);
+    try std.testing.expectEqualStrings("[\"x\", null, 9]\n", w.buffered());
+}
+
+test "writeRow legacy-jsonl-dict produces bare objects (regression guard)" {
+    var scratch: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    const cells = [_]xlsx.Cell{
+        .{ .string = "x" },
+        .empty,
+        .{ .integer = 9 },
+    };
+    try writeRow(&w, &cells, .legacy_jsonl_dict);
+    try std.testing.expectEqualStrings("{\"A\": \"x\", \"C\": 9}\n", w.buffered());
 }
 
 // ─── Fuzz tests ──────────────────────────────────────────────────────

@@ -1134,6 +1134,12 @@ pub const Rows = struct {
     /// to the older per-string malloc/free list this saves ~one free
     /// per entity-bearing or rich-text cell per row.
     arena: std.heap.ArenaAllocator,
+    /// 1-based OOXML row number of the most recently yielded row.
+    /// Prefers the `<row r="N">` attribute when present; falls back
+    /// to a 1-based counter of yielded rows when the source omits it
+    /// (rare but legal in OOXML). Valid only after `next()` has
+    /// returned a non-null row; zero before the first successful call.
+    current_row: u32 = 0,
 
     pub fn deinit(self: *Rows) void {
         self.arena.deinit();
@@ -1176,6 +1182,15 @@ pub const Rows = struct {
         return fromExcelSerial(num);
     }
 
+    /// 1-based OOXML row number of the most recently yielded row.
+    /// Returns the `r="N"` attribute from the source `<row>` tag when
+    /// present; otherwise a 1-based fallback counter of rows yielded.
+    /// Only meaningful after `next()` has returned a non-null slice;
+    /// zero before the first successful call.
+    pub fn currentRowNumber(self: *const Rows) u32 {
+        return self.current_row;
+    }
+
     /// Returns the next row's cells, or null at end-of-sheet. Returned
     /// slice is valid until the next call to `next()` (or until
     /// `deinit()`). Cell string contents are either shared-string slices
@@ -1188,6 +1203,19 @@ pub const Rows = struct {
         _ = self.arena.reset(.retain_capacity);
 
         while (findTagOpen(self.xml, self.pos, "row")) |row_start| {
+            // The `r` attribute on <row> is optional per the OOXML
+            // spec; parse it when present, fall back to a 1-based
+            // yield counter when absent.
+            const attrs = self.xml[row_start.start + "<row".len .. row_start.after_open - 1];
+            const attrs_trimmed = if (attrs.len > 0 and attrs[attrs.len - 1] == '/')
+                attrs[0 .. attrs.len - 1]
+            else
+                attrs;
+            if (getAttr(attrs_trimmed, "r")) |r_str| {
+                self.current_row = std.fmt.parseInt(u32, r_str, 10) catch self.current_row + 1;
+            } else {
+                self.current_row += 1;
+            }
             self.pos = row_start.after_open;
             // Consume cells until </row>.
             try self.consumeRow();
