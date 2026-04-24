@@ -601,10 +601,23 @@ pub const Book = struct {
         }
     }
 
-    /// Open the archive, walk the central directory once, and populate
-    /// every part the current `Book` surface requires. Slice A
-    /// semantics: identical to `open` — eager load happens inline via
-    /// the one-pass extract + `loadEagerParts`.
+    /// Open the archive, walk the central directory, populate
+    /// **workbook-wide** state (sheets list, SST, theme, styles, per-
+    /// sheet rels), but leave **per-sheet** XML and metadata unloaded
+    /// until `rows(sheet)` / `preloadSheet(sheet)` is called. The
+    /// archive file handle stays open for the Book's lifetime; use
+    /// `Book.open` if the source file must be releasable immediately.
+    ///
+    /// Getter-contract:
+    /// - `numberFormat`, `cellFont`, `cellFill`, `cellBorder`,
+    ///   `isDateFormat`, `richRuns`, `sharedStrings` — **always**
+    ///   work, populated by `openLazy`.
+    /// - `mergedRanges(sheet)`, `hyperlinks(sheet)`,
+    ///   `dataValidations(sheet)`, `comments(sheet)` — return the
+    ///   empty slice for a sheet that has not yet been loaded. Call
+    ///   `preloadSheet(sheet)` or any `rows(sheet)` iteration first
+    ///   to populate. `Book.open` preloads everything on open, so
+    ///   non-lazy callers never see this.
     pub fn openLazy(allocator: Allocator, path: []const u8) !Book {
         var book: Book = .{
             .allocator = allocator,
@@ -713,28 +726,34 @@ pub const Book = struct {
         try parseWorkbookSheets(&book, wb, rels);
         if (book.shared_strings_xml) |sst| try parseSharedStrings(&book, sst);
 
-        // NOTE: the per-sheet eager load (`loadEagerParts`) is NOT
-        // called here. `Book.open` invokes it explicitly after
-        // `openLazy` returns; streaming / on-demand callers skip it.
+        // Workbook-wide style + theme tables MUST parse here (not in
+        // `loadEagerParts`): every `numberFormat`, `cellFont`,
+        // `cellFill`, `cellBorder`, `isDateFormat` lookup is a random-
+        // access read against these tables, independent of which sheet
+        // the caller is on. Parsing them during `openLazy` means
+        // callers who want just workbook metadata never pay for sheet
+        // extraction. Theme colors MUST parse before styles.xml so
+        // style parsers can resolve `<color theme="N"/>` references.
+        if (book.theme_xml) |tx| try parseTheme(&book, tx);
+        if (book.styles_xml) |sx| try parseStyles(&book, sx);
+
+        // NOTE: per-sheet metadata (merged ranges, hyperlinks,
+        // validations, comments) is NOT populated here. `Book.open`
+        // calls `loadEagerParts` explicitly after `openLazy` returns.
+        // Streaming / on-demand callers must call `preloadSheet(s)`
+        // or `rows(s)` to populate each sheet's side-indices.
         return book;
     }
 
-    /// Populate every derived table the current public surface
-    /// assumes. Split from `openLazy` so slice B can skip this step
-    /// on the streaming path. Slice A still calls it inline from
-    /// `openLazy` — net behaviour is unchanged.
+    /// Populate per-sheet side-indices (merged ranges, hyperlinks,
+    /// data validations, comments) for every sheet in the workbook.
+    /// Split from `openLazy` so slice B's streaming path can skip it
+    /// on per-sheet-iteration workloads.
     ///
-    /// Intentionally private: the function is not idempotent (it
-    /// would leak the previously parsed theme/styles/per-sheet
-    /// hashmaps on a second call), and there is no valid caller
-    /// other than `openLazy` itself.
+    /// Intentionally private + non-idempotent: calling twice would
+    /// leak the previously parsed per-sheet hashmaps. The only valid
+    /// caller is `Book.open`.
     fn loadEagerParts(self: *Book) !void {
-        // Theme colors MUST parse before styles.xml so the style
-        // parsers can resolve `<color theme="N"/>` references via
-        // `book.theme_colors`.
-        if (self.theme_xml) |tx| try parseTheme(self, tx);
-        if (self.styles_xml) |sx| try parseStyles(self, sx);
-
         // Iterate declared sheets rather than the (now empty) cache.
         // Each `ensureSheetLoaded` extracts the sheet XML on demand
         // and runs the merged / hyperlinks / validations / comments
@@ -743,6 +762,20 @@ pub const Book = struct {
         for (self.sheets) |sheet| {
             _ = try self.ensureSheetLoaded(sheet.path);
         }
+    }
+
+    /// Force per-sheet side-indices (merged ranges, hyperlinks,
+    /// validations, comments) for a single sheet. Intended for
+    /// `openLazy` callers that want the metadata getters
+    /// (`mergedRanges`, `hyperlinks`, `dataValidations`, `comments`)
+    /// to return populated slices for a specific sheet without having
+    /// to iterate its rows.
+    ///
+    /// Idempotent: second call on the same sheet is a hashmap hit.
+    /// After `Book.open`, every sheet has already been preloaded, so
+    /// calling this is a no-op.
+    pub fn preloadSheet(self: *Book, sheet: Sheet) !void {
+        _ = try self.ensureSheetLoaded(sheet.path);
     }
 
     /// Return the XML bytes for `sheet_path`, extracting from the
@@ -4875,4 +4908,66 @@ test "openLazy -> ensureSheetLoaded is idempotent" {
     }
     try std.testing.expectEqual(@as(usize, 1), book.sheet_data.count());
     try std.testing.expectEqual(merged_after_first, book.merged_ranges.count());
+}
+
+test "openLazy parses workbook-wide styles + theme (no sheet load required)" {
+    const tmp_path = "/tmp/zlsx_iter54_lazy_styles.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        // Any non-General number format forces a custom numFmt entry
+        // that lives in styles.xml — exactly the path openLazy must
+        // still parse so numberFormat lookups work before any sheet
+        // is loaded.
+        const s_idx = try w.addStyle(.{ .number_format = "0.00%" });
+        var s = try w.addSheet("One");
+        try s.writeRowStyled(&.{.{ .number = 0.5 }}, &.{s_idx});
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.openLazy(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    // Sheet XML must still be unloaded.
+    try std.testing.expectEqual(@as(usize, 0), book.sheet_data.count());
+
+    // Styles / theme tables must be populated — numberFormat is the
+    // workbook-wide lookup that regressed in slice B before this fix.
+    try std.testing.expect(book.cell_xf_numfmt_ids.len > 0);
+    const fmt = book.numberFormat(@intCast(book.cell_xf_numfmt_ids.len - 1));
+    try std.testing.expect(fmt != null);
+    try std.testing.expect(std.mem.indexOf(u8, fmt.?, "%") != null);
+}
+
+test "preloadSheet populates per-sheet metadata without rows() iteration" {
+    const tmp_path = "/tmp/zlsx_iter54_preload_sheet.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("One");
+        try s.addMergedCell("A1:C1");
+        try s.writeRow(&.{.{ .string = "merged" }});
+        try s.writeRow(&.{.{ .number = 1.0 }});
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.openLazy(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    // Before preload, metadata getter returns empty on the lazy path.
+    try std.testing.expectEqual(@as(usize, 0), book.mergedRanges(book.sheets[0]).len);
+
+    try book.preloadSheet(book.sheets[0]);
+
+    // Sheet XML is now cached; metadata getter returns populated.
+    try std.testing.expectEqual(@as(usize, 1), book.sheet_data.count());
+    try std.testing.expectEqual(@as(usize, 1), book.mergedRanges(book.sheets[0]).len);
+
+    // Second preload is idempotent.
+    try book.preloadSheet(book.sheets[0]);
+    try std.testing.expectEqual(@as(usize, 1), book.sheet_data.count());
 }
