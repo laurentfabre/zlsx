@@ -1942,27 +1942,21 @@ fn runMetaCommand(
         },
     );
 
-    const compact = output == .compact_ndjson;
+    // iter60b-P1: compact mode is a documented no-op for meta's
+    // per-sheet records. Stripping sheet/sheet_idx here would orphan
+    // the records — meta has no sheet-prologue mechanism to share the
+    // identifier across multiple records (unlike the sheet-scoped
+    // sub-commands whose prologue carries the context). Each per-
+    // sheet record IS the identifier.
     for (book.sheets, 0..) |s, i| {
         if (signals.shouldStop()) return;
         const sheet_has_comments = book.comments(s).len != 0;
-        if (compact) {
-            // iter60b: the workbook record is the prologue, so per-sheet
-            // records shed `sheet`/`sheet_idx` and keep only
-            // `has_comments`. Order in the workbook record still pins
-            // the mapping (index = array position).
-            try out.print(
-                "{{\"kind\":\"sheet\",\"has_comments\":{s}}}\n",
-                .{if (sheet_has_comments) "true" else "false"},
-            );
-        } else {
-            try out.writeAll("{\"kind\":\"sheet\",\"sheet\":");
-            try writeJsonString(out, s.name);
-            try out.print(
-                ",\"sheet_idx\":{d},\"has_comments\":{s}}}\n",
-                .{ i, if (sheet_has_comments) "true" else "false" },
-            );
-        }
+        try out.writeAll("{\"kind\":\"sheet\",\"sheet\":");
+        try writeJsonString(out, s.name);
+        try out.print(
+            ",\"sheet_idx\":{d},\"has_comments\":{s}}}\n",
+            .{ i, if (sheet_has_comments) "true" else "false" },
+        );
     }
     try out.flush();
 }
