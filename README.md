@@ -327,11 +327,14 @@ zlsx sst data.xlsx | jq -r '.text' | rg '@\S+\.\S+'
 
 ### Pipeline safety
 
-`zlsx cells huge.xlsx | head -10` exits 0 cleanly (no broken-pipe stderr noise). `SIGINT` → exit 130, `SIGTERM` → exit 143, both flushing in-flight records. Three classes of malformation behave differently:
+`zlsx cells huge.xlsx | head -10` exits 0 cleanly (no broken-pipe stderr noise). `SIGINT` → exit 130, `SIGTERM` → exit 143, both flushing in-flight records.
 
-- **Required-structure parts** (invalid zip, missing `workbook.xml` / `workbook.xml.rels`, malformed `sharedStrings.xml` / `styles.xml` / `theme1.xml`) → `Book.open` fails with exit 2 + stderr diagnostic. No stream, no inline records.
-- **Best-effort side parts** (malformed merged-cell ranges, hyperlinks, data validations, comments, per-sheet `.rels`) → parsers degrade silently: the workbook opens, rows stream, the corresponding metadata is just missing.
-- **Row-body malformation** inside `<row>`/`<c>` during iteration → emits an inline `{"kind":"error","scope":"sheet","code":"MalformedXml",…}` record and continues with neighbour sheets. Filter with `jq 'select(.kind!="error")'` for the data-only stream.
+Malformed input handling is part-dependent — some parsers propagate `error.MalformedXml` and abort `Book.open` with exit 2, others are lenient and degrade to empty / partial metadata. In practice:
+
+- If `Book.open` fails, the CLI exits 2 with a stderr diagnostic and no stdout stream.
+- If `Book.open` succeeds, the CLI emits as much as it can. Malformation surfacing from `Rows.next()` during per-cell iteration is caught per-sheet and emitted as an inline `{"kind":"error","scope":"sheet","code":"MalformedXml",…}` record — processing continues with neighbour sheets. Filter with `jq 'select(.kind!="error")'` for the data-only stream.
+
+Scripts that need a precise part-by-part failure map should read the reader source (`src/xlsx.zig`) — the design-doc "Operational guarantees" section tracks the intent, but current behaviour is what `parseSharedStrings` / `parseStyles` / `parseTheme` / `parseMergedRangesForSheet` / `parseHyperlinksForSheet` / `parseDataValidationsForSheet` / `parseCommentsForSheet` actually do today.
 
 ### Exit codes
 
