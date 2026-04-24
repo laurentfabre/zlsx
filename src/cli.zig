@@ -578,7 +578,13 @@ fn writeCell(
 /// Legacy emitter — covers the four bare/flat formats. The new
 /// envelope format (`.jsonl`) goes through `writeRowEnvelope`, not
 /// this function. Calling this with `.jsonl` is a programmer error.
-fn writeRow(w: *std.Io.Writer, cells: []const xlsx.Cell, fmt: Format) !void {
+///
+/// `col_offset` is the 0-based absolute column of `cells[0]`. It
+/// matters only for `legacy_jsonl_dict`, whose keys are column
+/// letters and must reflect the TRUE column (not restart from A)
+/// when the caller passes a sliced row. Callers outside --range
+/// paths pass 0.
+fn writeRow(w: *std.Io.Writer, cells: []const xlsx.Cell, fmt: Format, col_offset: u32) !void {
     switch (fmt) {
         .jsonl => unreachable, // envelope path; use writeRowEnvelope
         .legacy_jsonl => {
@@ -597,7 +603,7 @@ fn writeRow(w: *std.Io.Writer, cells: []const xlsx.Cell, fmt: Format) !void {
                 if (!first) try w.writeAll(", ");
                 first = false;
                 var col_buf: [8]u8 = undefined;
-                const col = colLetter(&col_buf, i);
+                const col = colLetter(&col_buf, col_offset + @as(u32, @intCast(i)));
                 try w.writeByte('"');
                 try w.writeAll(col);
                 try w.writeAll("\": ");
@@ -892,27 +898,49 @@ fn runRowsCommand(
         if (row_hi) |e| if (row_number > e) break;
 
         // Per design doc: a row is emitted iff at least one cell is
-        // inside the rectangle. Row-axis is already gated above; the
-        // col-axis check is what remains. For the `rows` envelope we
-        // also zero out out-of-range columns so the emitted `cells`
-        // array is range-scoped.
-        const emit_cells: []const xlsx.Cell = if (range) |r| blk: {
-            var any_in_col_range = false;
-            masked.clearRetainingCapacity();
-            try masked.ensureTotalCapacity(alloc, cells.len);
-            for (cells, 0..) |c, i| {
-                const col: u32 = @intCast(i);
-                const in_col = col >= r.top_left.col and col <= r.bottom_right.col;
-                if (in_col) {
-                    masked.appendAssumeCapacity(c);
-                    if (c != .empty) any_in_col_range = true;
-                } else {
-                    masked.appendAssumeCapacity(.empty);
+        // inside the rectangle. The envelope path masks out-of-col
+        // cells to .empty so the positional cells[i] == col-i contract
+        // holds. Flat formats (csv/tsv/legacy-jsonl/legacy-jsonl-dict)
+        // instead SLICE to the in-range column span and pass the
+        // absolute col offset so legacy-jsonl-dict keys stay truthful
+        // (`{"XFD": …}`, not `{"A": …}` for a ranged XFD1:XFD10).
+        const EmitView = struct {
+            cells: []const xlsx.Cell,
+            col_offset: u32,
+            any_non_empty: bool,
+        };
+        const is_envelope = format == .jsonl;
+        const view: EmitView = if (range) |r| blk: {
+            if (is_envelope) {
+                var any = false;
+                masked.clearRetainingCapacity();
+                try masked.ensureTotalCapacity(alloc, cells.len);
+                for (cells, 0..) |c, i| {
+                    const col: u32 = @intCast(i);
+                    const in_col = col >= r.top_left.col and col <= r.bottom_right.col;
+                    if (in_col) {
+                        masked.appendAssumeCapacity(c);
+                        if (c != .empty) any = true;
+                    } else {
+                        masked.appendAssumeCapacity(.empty);
+                    }
                 }
+                break :blk .{ .cells = masked.items, .col_offset = 0, .any_non_empty = any };
+            } else {
+                const lo: usize = @min(r.top_left.col, cells.len);
+                const hi_exclusive: usize = @min(@as(usize, r.bottom_right.col) + 1, cells.len);
+                if (lo >= hi_exclusive) break :blk .{ .cells = &.{}, .col_offset = 0, .any_non_empty = false };
+                const sliced = cells[lo..hi_exclusive];
+                var any = false;
+                for (sliced) |c| if (c != .empty) {
+                    any = true;
+                    break;
+                };
+                break :blk .{ .cells = sliced, .col_offset = @intCast(lo), .any_non_empty = any };
             }
-            if (!any_in_col_range) continue;
-            break :blk masked.items;
-        } else cells;
+        } else .{ .cells = cells, .col_offset = 0, .any_non_empty = true };
+
+        if (!view.any_non_empty) continue;
 
         switch (pg.consume()) {
             .drop => continue,
@@ -920,8 +948,8 @@ fn runRowsCommand(
             .emit => {},
         }
         switch (format) {
-            .jsonl => try writeRowEnvelope(out, sheet.name, sheet_idx, row_number, emit_cells),
-            else => try writeRow(out, emit_cells, format),
+            .jsonl => try writeRowEnvelope(out, sheet.name, sheet_idx, row_number, view.cells),
+            else => try writeRow(out, view.cells, format, view.col_offset),
         }
     }
 }
@@ -1711,7 +1739,7 @@ test "writeRow legacy-jsonl produces bare arrays (regression guard)" {
         .empty,
         .{ .integer = 9 },
     };
-    try writeRow(&w, &cells, .legacy_jsonl);
+    try writeRow(&w, &cells, .legacy_jsonl, 0);
     try std.testing.expectEqualStrings("[\"x\", null, 9]\n", w.buffered());
 }
 
@@ -1723,7 +1751,7 @@ test "writeRow legacy-jsonl-dict produces bare objects (regression guard)" {
         .empty,
         .{ .integer = 9 },
     };
-    try writeRow(&w, &cells, .legacy_jsonl_dict);
+    try writeRow(&w, &cells, .legacy_jsonl_dict, 0);
     try std.testing.expectEqualStrings("{\"A\": \"x\", \"C\": 9}\n", w.buffered());
 }
 
