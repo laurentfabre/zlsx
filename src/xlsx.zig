@@ -431,6 +431,19 @@ pub const Book = struct {
     /// formatting omit this file). Kept around because the parsed
     /// tables below borrow from it for custom number-format strings.
     styles_xml: ?[]u8 = null,
+    /// Raw `xl/theme/theme1.xml` bytes (nullable — minimal xlsx files
+    /// skip the theme part). Kept around because the parsed theme
+    /// color table below borrows from it.
+    theme_xml: ?[]u8 = null,
+    /// 12-entry theme color palette extracted from `xl/theme/theme1.xml`.
+    /// Index order mirrors OOXML's `<color theme="N"/>` semantics:
+    ///   0 = lt1, 1 = dk1, 2 = lt2, 3 = dk2,
+    ///   4..9 = accent1..accent6,
+    ///   10 = hlink, 11 = folHlink.
+    /// Empty when no theme.xml or the parser failed — callers get
+    /// `null` on `<color theme="N"/>` resolution in that case,
+    /// matching pre-iter52 behavior.
+    theme_colors: []u32 = &.{},
     /// `cellXfs` table — maps a cell's `s="N"` attribute to a numFmt
     /// id. Owned slice; index matches the xfId. Empty when the
     /// workbook has no styles.xml.
@@ -509,6 +522,8 @@ pub const Book = struct {
                 book.shared_strings_xml = try extractEntryToBuffer(allocator, entry, &file_reader);
             } else if (std.mem.eql(u8, filename, "xl/styles.xml")) {
                 book.styles_xml = try extractEntryToBuffer(allocator, entry, &file_reader);
+            } else if (std.mem.eql(u8, filename, "xl/theme/theme1.xml")) {
+                book.theme_xml = try extractEntryToBuffer(allocator, entry, &file_reader);
             } else if (std.mem.startsWith(u8, filename, "xl/comments") and
                 std.mem.endsWith(u8, filename, ".xml"))
             {
@@ -555,6 +570,10 @@ pub const Book = struct {
 
         try parseWorkbookSheets(&book, wb, rels);
         if (book.shared_strings_xml) |sst| try parseSharedStrings(&book, sst);
+        // Theme colors MUST parse before styles.xml so the style
+        // parsers can resolve `<color theme="N"/>` references via
+        // `book.theme_colors`.
+        if (book.theme_xml) |tx| try parseTheme(&book, tx);
         if (book.styles_xml) |sx| try parseStyles(&book, sx);
 
         // Parse merged ranges + hyperlinks + data validations per
@@ -722,6 +741,8 @@ pub const Book = struct {
         a.free(self.borders);
         self.custom_num_fmts.deinit(a);
         if (self.styles_xml) |s| a.free(s);
+        if (self.theme_xml) |s| a.free(s);
+        a.free(self.theme_colors);
 
         var it = self.sheet_data.valueIterator();
         while (it.next()) |v| a.free(v.*);
@@ -1729,7 +1750,7 @@ fn parseDataValidationsForSheet(book: *Book, sheet_path: []const u8, xml: []cons
 /// empty string otherwise. Theme colors are deliberately not
 /// resolved — only explicit `rgb="AARRGGBB"` values set
 /// `color_argb`.
-fn parseRprFlags(arena: Allocator, rpr: []const u8) !RichRun {
+fn parseRprFlags(book: *const Book, arena: Allocator, rpr: []const u8) !RichRun {
     var run: RichRun = .{ .text = "" };
 
     // Match `<b/>`, `<b ...>`, `<b val="1"/>`, etc. Skip `<b val="0"/>`.
@@ -1750,21 +1771,15 @@ fn parseRprFlags(arena: Allocator, rpr: []const u8) !RichRun {
         }
     }
 
-    // `<color rgb="AARRGGBB"/>` — parse hex into u32. `<color theme=…/>`
-    // is silently skipped (we don't own the theme resolution step).
+    // `<color rgb="AARRGGBB"/>` parses the direct hex form.
+    // `<color theme="N"/>` falls back to `book.theme_colors` — iter52
+    // made theme-color resolution routine. Either attribute populates
+    // `run.color_argb` when resolvable.
     if (std.mem.indexOf(u8, rpr, "<color")) |cp| {
         const gt = std.mem.indexOfScalarPos(u8, rpr, cp, '>') orelse 0;
         if (gt > cp) {
             const tag = rpr[cp..gt];
-            const rgb_key = "rgb=\"";
-            if (std.mem.indexOf(u8, tag, rgb_key)) |rp| {
-                const rs = rp + rgb_key.len;
-                if (std.mem.indexOfScalarPos(u8, tag, rs, '"')) |re| {
-                    if (std.fmt.parseInt(u32, tag[rs..re], 16)) |v| {
-                        run.color_argb = v;
-                    } else |_| {}
-                }
-            }
+            run.color_argb = parseColorAttr(book, tag);
         }
     }
 
@@ -1831,6 +1846,138 @@ fn hasFalseVal(tag: []const u8) bool {
 /// Values borrow from `styles_xml` so the file stays mapped for the
 /// Book's lifetime. Malformed or missing sections degrade silently —
 /// an xlsx with no cellXfs just returns null from `numberFormat`.
+/// Walk `xl/theme/theme1.xml` and populate `book.theme_colors` with
+/// the 12 palette entries OOXML's `<color theme="N"/>` indexes into.
+///
+/// OOXML layout: the `<a:clrScheme>` element holds the 12 palette
+/// entries in schema order:
+///   dk1, lt1, dk2, lt2, accent1..accent6, hlink, folHlink.
+/// But `<color theme="N"/>` uses a different index order (lt1 and
+/// dk1 are swapped):
+///   0 = lt1, 1 = dk1, 2 = lt2, 3 = dk2, 4..9 = accent1..6,
+///   10 = hlink, 11 = folHlink.
+/// Each entry is either `<a:srgbClr val="HEXHEX"/>` or
+/// `<a:sysClr val="…" lastClr="HEXHEX"/>` — we read the lastClr
+/// fallback for sysClr since there's no way to resolve "windowText"
+/// without the OS.
+fn parseTheme(book: *Book, xml: []const u8) !void {
+    const scheme_open = std.mem.indexOf(u8, xml, "<a:clrScheme") orelse return;
+    const scheme_close = std.mem.indexOfPos(u8, xml, scheme_open, "</a:clrScheme>") orelse return;
+    const scheme = xml[scheme_open..scheme_close];
+
+    // Read each child element of clrScheme in schema order. Expected
+    // tags: <a:dk1>, <a:lt1>, <a:dk2>, <a:lt2>, <a:accent1> .. 6,
+    // <a:hlink>, <a:folHlink>. Each wraps either srgbClr or sysClr.
+    const tags = [_][]const u8{
+        "<a:dk1>",     "<a:lt1>",
+        "<a:dk2>",     "<a:lt2>",
+        "<a:accent1>", "<a:accent2>",
+        "<a:accent3>", "<a:accent4>",
+        "<a:accent5>", "<a:accent6>",
+        "<a:hlink>",   "<a:folHlink>",
+    };
+    // `schema_colors[i]` follows the XML order above.
+    var schema_colors: [12]u32 = undefined;
+    var got: [12]bool = .{false} ** 12;
+    for (tags, 0..) |tag, i| {
+        const open = std.mem.indexOf(u8, scheme, tag) orelse continue;
+        const start = open + tag.len;
+        // Close tag mirrors the open: `<a:dk1>` → `</a:dk1>`.
+        var close_buf: [24]u8 = undefined;
+        const close_tag = std.fmt.bufPrint(&close_buf, "</{s}", .{tag[1..]}) catch continue;
+        const close = std.mem.indexOfPos(u8, scheme, start, close_tag) orelse continue;
+        const body = scheme[start..close];
+        schema_colors[i] = extractThemeColorValue(body) orelse continue;
+        got[i] = true;
+    }
+
+    // Remap schema order → `<color theme="N"/>` index order.
+    // ECMA-376: both dk/lt pairs are flipped — theme index order
+    // is lt1, dk1, lt2, dk2, accent1..6, hlink, folHlink, whereas
+    // the XML schema orders them dk1, lt1, dk2, lt2, ...
+    const swap_pairs = [_][2]usize{
+        .{ 0, 1 }, .{ 1, 0 }, // lt1 ← schema[1], dk1 ← schema[0]
+        .{ 2, 3 },   .{ 3, 2 }, // lt2 ← schema[3], dk2 ← schema[2]
+        .{ 4, 4 },   .{ 5, 5 },
+        .{ 6, 6 },   .{ 7, 7 },
+        .{ 8, 8 },   .{ 9, 9 },
+        .{ 10, 10 }, .{ 11, 11 },
+    };
+    var out: [12]u32 = undefined;
+    var out_len: usize = 0;
+    for (swap_pairs) |pair| {
+        const theme_idx = pair[0];
+        const schema_idx = pair[1];
+        if (!got[schema_idx]) break;
+        out[theme_idx] = schema_colors[schema_idx];
+        out_len = @max(out_len, theme_idx + 1);
+    }
+
+    if (out_len > 0) {
+        book.theme_colors = try book.allocator.dupe(u32, out[0..out_len]);
+    }
+}
+
+/// Pull an ARGB from a theme color element body — one of:
+///   `<a:srgbClr val="HEXHEX"/>`    → parse val
+///   `<a:sysClr val="…" lastClr="HEXHEX"/>` → parse lastClr
+/// Theme hex is RGB only (6 digits); upcast to ARGB with FF alpha.
+fn extractThemeColorValue(body: []const u8) ?u32 {
+    const Tag = struct { open: []const u8, attr: []const u8 };
+    const candidates = [_]Tag{
+        .{ .open = "<a:srgbClr", .attr = "val=\"" },
+        .{ .open = "<a:sysClr", .attr = "lastClr=\"" },
+    };
+    for (candidates) |c| {
+        if (std.mem.indexOf(u8, body, c.open)) |pos| {
+            const gt = std.mem.indexOfScalarPos(u8, body, pos, '>') orelse continue;
+            const tag = body[pos..gt];
+            if (std.mem.indexOf(u8, tag, c.attr)) |ap| {
+                const s = ap + c.attr.len;
+                const e = std.mem.indexOfScalarPos(u8, tag, s, '"') orelse continue;
+                const hex = tag[s..e];
+                if (hex.len != 6) continue;
+                const rgb = std.fmt.parseInt(u32, hex, 16) catch continue;
+                return 0xFF00_0000 | rgb; // promote to ARGB with opaque alpha
+            }
+        }
+    }
+    return null;
+}
+
+/// Look up theme color index `N` in `book.theme_colors`, returning
+/// null when out of range or when the workbook has no theme table.
+fn resolveThemeColor(book: *const Book, theme_idx: u32) ?u32 {
+    if (theme_idx >= book.theme_colors.len) return null;
+    return book.theme_colors[theme_idx];
+}
+
+/// Parse an ARGB from an OOXML color tag attribute list. Supports:
+///   rgb="AARRGGBB"   → direct hex
+///   theme="N"        → lookup via book.theme_colors
+///   indexed="N"      → legacy indexed palette (not resolved — returns null)
+/// Tint attribute is ignored (would require HSL math we don't ship).
+/// Returns null when none of the above parse successfully.
+fn parseColorAttr(book: *const Book, tag: []const u8) ?u32 {
+    const rgb_key = "rgb=\"";
+    if (std.mem.indexOf(u8, tag, rgb_key)) |rp| {
+        const rs = rp + rgb_key.len;
+        if (std.mem.indexOfScalarPos(u8, tag, rs, '"')) |re| {
+            if (std.fmt.parseInt(u32, tag[rs..re], 16)) |v| return v else |_| {}
+        }
+    }
+    const theme_key = "theme=\"";
+    if (std.mem.indexOf(u8, tag, theme_key)) |tp| {
+        const ts = tp + theme_key.len;
+        if (std.mem.indexOfScalarPos(u8, tag, ts, '"')) |te| {
+            if (std.fmt.parseInt(u32, tag[ts..te], 10)) |idx|
+                return resolveThemeColor(book, idx)
+            else |_| {}
+        }
+    }
+    return null;
+}
+
 fn parseStyles(book: *Book, xml: []const u8) !void {
     // fonts — optional. Shape: `<fonts count="N"><font>...</font>...</fonts>`.
     // Each <font> has the same child shape as <rPr> inside <si>, so we
@@ -1859,7 +2006,7 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
             }
             const font_close = std.mem.indexOfPos(u8, block, gt, "</font>") orelse break;
             const body = block[font_pos .. font_close + "</font>".len];
-            const rr = try parseRprFlags(book.sst_arena.allocator(), body);
+            const rr = try parseRprFlags(book, book.sst_arena.allocator(), body);
             try fonts_list.append(book.allocator, .{
                 .bold = rr.bold,
                 .italic = rr.italic,
@@ -1900,7 +2047,7 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
             }
             const fill_close = std.mem.indexOfPos(u8, block, gt, "</fill>") orelse break;
             const body = block[gt + 1 .. fill_close];
-            try fills_list.append(book.allocator, parseFillBody(body));
+            try fills_list.append(book.allocator, parseFillBody(book, body));
             i = fill_close + "</fill>".len;
         }
         book.fills = try fills_list.toOwnedSlice(book.allocator);
@@ -1939,7 +2086,7 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
             }
             const border_close = std.mem.indexOfPos(u8, block, gt, "</border>") orelse break;
             const body = block[gt + 1 .. border_close];
-            try borders_list.append(book.allocator, parseBorderBody(body));
+            try borders_list.append(book.allocator, parseBorderBody(book, body));
             i = border_close + "</border>".len;
         }
         book.borders = try borders_list.toOwnedSlice(book.allocator);
@@ -2009,13 +2156,13 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
 /// Parse a single `<border>` body (between `<border>` and `</border>`)
 /// into a `Border`. Handles self-closing side tags (no border) and
 /// regular `<left style="thin"><color rgb="…"/></left>` shapes.
-fn parseBorderBody(body: []const u8) Border {
+fn parseBorderBody(book: *const Book, body: []const u8) Border {
     return .{
-        .left = parseBorderSide(body, "left"),
-        .right = parseBorderSide(body, "right"),
-        .top = parseBorderSide(body, "top"),
-        .bottom = parseBorderSide(body, "bottom"),
-        .diagonal = parseBorderSide(body, "diagonal"),
+        .left = parseBorderSide(book, body, "left"),
+        .right = parseBorderSide(book, body, "right"),
+        .top = parseBorderSide(book, body, "top"),
+        .bottom = parseBorderSide(book, body, "bottom"),
+        .diagonal = parseBorderSide(book, body, "diagonal"),
     };
 }
 
@@ -2024,7 +2171,7 @@ fn parseBorderBody(body: []const u8) Border {
 /// when the side is self-closing or absent. Parses `style="…"`
 /// attribute and `<color rgb="…"/>` child. Slices borrow from the
 /// input body (which itself borrows from `styles_xml`).
-fn parseBorderSide(body: []const u8, tag: []const u8) BorderSide {
+fn parseBorderSide(book: *const Book, body: []const u8, tag: []const u8) BorderSide {
     // All callers pass the literal OOXML side names — longest is
     // "diagonal" (8 bytes). Future tag additions that overflow these
     // stack buffers would otherwise `bufPrint → error.NoSpaceLeft`
@@ -2063,14 +2210,7 @@ fn parseBorderSide(body: []const u8, tag: []const u8) BorderSide {
     const inner = body[gt + 1 .. close_pos];
     if (std.mem.indexOf(u8, inner, "<color")) |cp| {
         const cgt = std.mem.indexOfScalarPos(u8, inner, cp, '>') orelse return side;
-        const color_tag = inner[cp..cgt];
-        const rgb_key = "rgb=\"";
-        if (std.mem.indexOf(u8, color_tag, rgb_key)) |kp| {
-            const s = kp + rgb_key.len;
-            if (std.mem.indexOfScalarPos(u8, color_tag, s, '"')) |e| {
-                side.color_argb = std.fmt.parseInt(u32, color_tag[s..e], 16) catch null;
-            }
-        }
+        side.color_argb = parseColorAttr(book, inner[cp..cgt]);
     }
     return side;
 }
@@ -2080,7 +2220,7 @@ fn parseBorderSide(body: []const u8, tag: []const u8) BorderSide {
 /// <fgColor rgb="…"/><bgColor rgb="…"/></patternFill>` plus the
 /// no-op `<patternFill patternType="none"/>` variant. Unresolved
 /// theme / indexed colors leave `*_color_argb` null.
-fn parseFillBody(body: []const u8) Fill {
+fn parseFillBody(book: *const Book, body: []const u8) Fill {
     var out: Fill = .{};
     // patternType on <patternFill>.
     const pt_key = "patternType=\"";
@@ -2090,32 +2230,18 @@ fn parseFillBody(body: []const u8) Fill {
             out.pattern = body[s..e];
         }
     }
-    // <fgColor rgb="AARRGGBB"/>
+    // <fgColor rgb="AARRGGBB"/> or <fgColor theme="N"/>
     if (std.mem.indexOf(u8, body, "<fgColor")) |fp| {
         const gt = std.mem.indexOfScalarPos(u8, body, fp, '>') orelse 0;
         if (gt > fp) {
-            const tag = body[fp..gt];
-            const k = "rgb=\"";
-            if (std.mem.indexOf(u8, tag, k)) |kp| {
-                const s = kp + k.len;
-                if (std.mem.indexOfScalarPos(u8, tag, s, '"')) |e| {
-                    out.fg_color_argb = std.fmt.parseInt(u32, tag[s..e], 16) catch null;
-                }
-            }
+            out.fg_color_argb = parseColorAttr(book, body[fp..gt]);
         }
     }
-    // <bgColor rgb="AARRGGBB"/>
+    // <bgColor rgb="AARRGGBB"/> or <bgColor theme="N"/>
     if (std.mem.indexOf(u8, body, "<bgColor")) |bp| {
         const gt = std.mem.indexOfScalarPos(u8, body, bp, '>') orelse 0;
         if (gt > bp) {
-            const tag = body[bp..gt];
-            const k = "rgb=\"";
-            if (std.mem.indexOf(u8, tag, k)) |kp| {
-                const s = kp + k.len;
-                if (std.mem.indexOfScalarPos(u8, tag, s, '"')) |e| {
-                    out.bg_color_argb = std.fmt.parseInt(u32, tag[s..e], 16) catch null;
-                }
-            }
+            out.bg_color_argb = parseColorAttr(book, body[bp..gt]);
         }
     }
     return out;
@@ -2356,7 +2482,7 @@ fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
             {
                 // `<rPr>...</rPr>` — parse bold / italic, skip body.
                 const rpr_close = std.mem.indexOfPos(u8, xml, next_lt, "</rPr>") orelse break :body;
-                pending_flags = try parseRprFlags(arena_alloc, xml[next_lt .. rpr_close + "</rPr>".len]);
+                pending_flags = try parseRprFlags(book, arena_alloc, xml[next_lt .. rpr_close + "</rPr>".len]);
                 j = rpr_close + "</rPr>".len;
                 std.debug.assert(j > j_prev);
             } else if (c1 == '/' and next_lt + 5 <= xml.len and
@@ -3247,6 +3373,78 @@ test "parseCommentsForSheet: authors + refs + flattened rich-text bodies" {
     try std.testing.expectEqualDeep(CellRef{ .col = 2, .row = 3 }, cs[1].top_left);
     try std.testing.expectEqualStrings("Bob & Co", cs[1].author);
     try std.testing.expectEqualStrings("R&D notes", cs[1].text);
+}
+
+test "parseTheme: 12-entry palette + <color theme=N/> resolution in fonts/fills/borders" {
+    const theme_xml =
+        \\<?xml version="1.0"?>
+        \\<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+        \\<a:themeElements><a:clrScheme name="Office">
+        \\<a:dk1><a:sysClr val="windowText" lastClr="010101"/></a:dk1>
+        \\<a:lt1><a:sysClr val="window" lastClr="020202"/></a:lt1>
+        \\<a:dk2><a:srgbClr val="030303"/></a:dk2>
+        \\<a:lt2><a:srgbClr val="040404"/></a:lt2>
+        \\<a:accent1><a:srgbClr val="AA0000"/></a:accent1>
+        \\<a:accent2><a:srgbClr val="00AA00"/></a:accent2>
+        \\<a:accent3><a:srgbClr val="0000AA"/></a:accent3>
+        \\<a:accent4><a:srgbClr val="AAAA00"/></a:accent4>
+        \\<a:accent5><a:srgbClr val="AA00AA"/></a:accent5>
+        \\<a:accent6><a:srgbClr val="00AAAA"/></a:accent6>
+        \\<a:hlink><a:srgbClr val="0563C1"/></a:hlink>
+        \\<a:folHlink><a:srgbClr val="954F72"/></a:folHlink>
+        \\</a:clrScheme></a:themeElements></a:theme>
+    ;
+    var book: Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer book.deinit();
+    try parseTheme(&book, theme_xml);
+
+    // 12 entries, remapped to theme-index order.
+    try std.testing.expectEqual(@as(usize, 12), book.theme_colors.len);
+    // theme 0 = lt1 (from schema lt1/sysClr lastClr=020202, ARGB 0xFF020202).
+    try std.testing.expectEqual(@as(u32, 0xFF020202), book.theme_colors[0]);
+    // theme 1 = dk1 (from schema dk1/sysClr lastClr=010101).
+    try std.testing.expectEqual(@as(u32, 0xFF010101), book.theme_colors[1]);
+    // theme 2 = lt2 (from schema lt2 = 040404).
+    try std.testing.expectEqual(@as(u32, 0xFF040404), book.theme_colors[2]);
+    // theme 3 = dk2 (from schema dk2 = 030303).
+    try std.testing.expectEqual(@as(u32, 0xFF030303), book.theme_colors[3]);
+    // theme 4 = accent1 = AA0000.
+    try std.testing.expectEqual(@as(u32, 0xFFAA0000), book.theme_colors[4]);
+    // theme 11 = folHlink = 954F72.
+    try std.testing.expectEqual(@as(u32, 0xFF954F72), book.theme_colors[11]);
+
+    // Now drive parseStyles with a font that references theme color 4.
+    // Must resolve to 0xFFAA0000 (accent1) — pre-iter52 this would be null.
+    const styles_xml =
+        \\<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+        \\<fonts count="2">
+        \\<font><sz val="11"/><color theme="4"/><name val="Calibri"/></font>
+        \\<font><b/><color rgb="FFFF0000"/></font>
+        \\</fonts>
+        \\<fills count="1">
+        \\<fill><patternFill patternType="solid"><fgColor theme="6"/><bgColor theme="11"/></patternFill></fill>
+        \\</fills>
+        \\<borders count="1">
+        \\<border><left style="thin"><color theme="1"/></left></border>
+        \\</borders>
+        \\<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellXfs>
+        \\</styleSheet>
+    ;
+    try parseStyles(&book, styles_xml);
+
+    // Font 0 referenced theme=4 (accent1) → AA0000 with opaque alpha.
+    try std.testing.expectEqual(@as(?u32, 0xFFAA0000), book.fonts[0].color_argb);
+    // Font 1 kept explicit rgb.
+    try std.testing.expectEqual(@as(?u32, 0xFFFF0000), book.fonts[1].color_argb);
+    // Fill 0 fg=theme 6 → accent3 = 0000AA.
+    try std.testing.expectEqual(@as(?u32, 0xFF0000AA), book.fills[0].fg_color_argb);
+    // Fill 0 bg=theme 11 → folHlink = 954F72.
+    try std.testing.expectEqual(@as(?u32, 0xFF954F72), book.fills[0].bg_color_argb);
+    // Border left.color → theme 1 = dk1 = 010101.
+    try std.testing.expectEqual(@as(?u32, 0xFF010101), book.borders[0].left.color_argb);
 }
 
 test "parseStyles: cellXfs handles <xf/> and <xf> variants (no attrs)" {

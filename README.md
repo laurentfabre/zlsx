@@ -104,9 +104,9 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 
 ¹ Returns a single `Float` type for any non-text number — callers cast to integer if needed.
 ² `xlsx.fromExcelSerial(cell.number) -> ?DateTime`; out-of-range serials (1900 leap-bug window) return `null`.
-³ `Book.richRuns(sst_idx)` surfaces per-`<r>` bold / italic + ARGB color / size / font name. Theme colors (`<color theme="…"/>`) aren't resolved — only explicit `<color rgb="AARRGGBB"/>` populates `color_argb`.
+³ `Book.richRuns(sst_idx)` surfaces per-`<r>` bold / italic + ARGB color / size / font name. Theme colors (`<color theme="N"/>`) are resolved via the workbook's `xl/theme/theme1.xml` palette (iter52); `<color indexed="N"/>` and `tint` are still not resolved.
 ⁴ `Rows.parseDate(col_idx)` combines style-lookup + date-format detection + serial decoding into one call. Returns `?DateTime` (or `datetime.datetime | None` in Python). The low-level chain (`styleIndices()` + `isDateFormat()` + `fromExcelSerial()`) is still exposed for callers that need the individual pieces.
-⁵ `Book.cellFont(style_idx)` surfaces bold / italic / ARGB color / size / font name; `Book.cellFill(style_idx)` surfaces `patternType` + fg / bg ARGB; `Book.cellBorder(style_idx)` surfaces `style` + color per side (left / right / top / bottom / diagonal). Theme / indexed colors aren't resolved; only explicit `rgb="AARRGGBB"` populates the ARGB fields.
+⁵ `Book.cellFont(style_idx)` surfaces bold / italic / ARGB color / size / font name; `Book.cellFill(style_idx)` surfaces `patternType` + fg / bg ARGB; `Book.cellBorder(style_idx)` surfaces `style` + color per side (left / right / top / bottom / diagonal). Theme colors (`theme="N"`) are resolved via the `xl/theme/theme1.xml` palette (iter52). `indexed="N"` (legacy palette) and `tint` modifiers are still not resolved.
 ⁶ `Book.comments(sheet)` returns `{top_left, author, text}` for every `<comment>` under `<commentList>`. Rich-text bodies get flattened to concatenated plain text; formatted runs inside comments aren't surfaced yet (a follow-up can add a parallel `richCommentText` without breaking the existing shape).
 
 ### Writer capability
