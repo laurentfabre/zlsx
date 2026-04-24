@@ -1,6 +1,6 @@
-# jq for Excel — streaming CLI design (v2)
+# jq for Excel — streaming CLI design (v3)
 
-> **Status**: design, not yet implemented. See `src/cli.zig` for the current CLI surface (single-command, row-value jsonl/tsv/csv). v2 incorporates Codex's review of v1 — see the "what changed" note at the bottom.
+> **Status**: design, not yet implemented. See `src/cli.zig` for the current CLI surface (single-command, row-value jsonl/tsv/csv). v3 incorporates two rounds of Codex review — see the "what changed" note at the bottom.
 
 ## Goal
 
@@ -21,19 +21,38 @@ Turn `zlsx` into the thing you reach for when piping an xlsx into a Unix pipelin
 
 ## The common envelope
 
-Every NDJSON record from every sub-command is a JSON object with this minimum shape:
+The invariant is precise:
+
+1. **Every record has a `kind` field** that picks the schema (`"cell"`, `"row"`, `"comment"`, `"validation"`, `"hyperlink"`, `"style"`, `"sst"`, `"sheet"`, `"workbook"`, `"error"`).
+2. **Sheet-scoped records additionally have `sheet` and `sheet_idx`** (all except `workbook`, `style`, `sst` — which are workbook-wide and have no sheet).
+3. **The invariant never varies by flag.** No flag ever drops `kind`, `sheet`, or `sheet_idx` from records that carry them.
+
+Shape:
 
 ```json
-{"kind": "<record-type>", "sheet": "<name>", "sheet_idx": <int>, ...}
+{"kind": "<record-type>", "sheet": "<name>", "sheet_idx": <int>, ...}   // sheet-scoped
+{"kind": "<record-type>", ...}                                           // workbook-wide
 ```
 
-Rules:
-- `kind` is always present and picks the record schema (`"cell"`, `"row"`, `"comment"`, `"validation"`, `"hyperlink"`, `"style"`, `"sst"`, `"sheet"`, `"workbook"`, `"error"`).
-- `sheet` + `sheet_idx` are always present for sheet-scoped records — so `jq 'select(.sheet=="Data")'` works uniformly.
-- Additional fields are schema-specific (see tables below).
-- Downstream consumers can filter / group / merge multi-sheet streams without sniffing positional arrays.
+### Compact mode (opt-in, schema stays stable)
 
-Benefit: a single pipeline can consume `zlsx cells ... & zlsx comments ... & wait` and interleave; `kind` keeps records addressable.
+For very large cell streams where `"sheet":"VeryLongSheetName","sheet_idx":0` per record is a measurable token tax, callers can opt into:
+
+```
+zlsx cells data.xlsx --output compact-ndjson
+```
+
+Which emits a `"sheet"` prologue record before each sheet's cells, then sheet-local records WITHOUT `sheet`/`sheet_idx`:
+
+```jsonl
+{"kind":"sheet","sheet":"Data","sheet_idx":0}
+{"kind":"cell","ref":"A1","row":1,"col":1,"t":"str","v":"name"}
+{"kind":"cell","ref":"B1","row":1,"col":2,"t":"str","v":"qty"}
+{"kind":"sheet","sheet":"Other","sheet_idx":1}
+{"kind":"cell","ref":"A1","row":1,"col":1,"t":"str","v":"x"}
+```
+
+This is a **different schema** that consumers opt into explicitly — not a silent field-drop. Callers that don't pass `--output compact-ndjson` always see the full envelope. The default schema (`--output ndjson`, implicit) is invariant.
 
 ## Sub-command surface
 
@@ -42,7 +61,7 @@ Benefit: a single pipeline can consume `zlsx cells ... & zlsx comments ... & wai
 | `zlsx cells <file>` | `"cell"` | `sheet, sheet_idx, ref, row, col, t, v, style?, formula?, runs?` |
 | `zlsx rows <file>` | `"row"` | `sheet, sheet_idx, row, cells[]` (each cell: `{ref, col, t, v}`) |
 | `zlsx comments <file>` | `"comment"` | `sheet, sheet_idx, ref, row, col, author, text, runs?` |
-| `zlsx validations <file>` | `"validation"` | `sheet, sheet_idx, range, kind, op?, formula1, formula2?, values?` |
+| `zlsx validations <file>` | `"validation"` | `sheet, sheet_idx, range, rule_type, op?, formula1, formula2?, values?` |
 | `zlsx hyperlinks <file>` | `"hyperlink"` | `sheet, sheet_idx, range, url?, location?` |
 | `zlsx styles <file>` | `"style"` | `idx, font, fill, border, num_fmt` *(no sheet — workbook-wide)* |
 | `zlsx sst <file>` | `"sst"` | `idx, text, runs?` *(no sheet — workbook-wide)* |
@@ -120,16 +139,67 @@ Emitted inline when a non-fatal parse error hits. Fatal errors exit non-zero wit
 
 ## CLI flag conventions
 
-- `--sheet <N|NAME>` — selector accepts either 0-based index or sheet name. No `--name`.
-- `--all-sheets` — stream every sheet concatenated (default behavior when `--sheet` is absent).
+- `--sheet NAME` — select a sheet by name (string). Excel-native semantic.
+- `--sheet-index N` — select by 0-based index. Escape hatch for scripting where sheet names aren't known.
+- `--all-sheets` — stream every sheet concatenated.
 - `--sheet-glob 'Data*'` — match sheet names against a simple glob.
+- **Default (no `--sheet*` flag)**: first sheet only. Users who want all sheets pass `--all-sheets` explicitly. This mirrors Excel's "open the first sheet" default and avoids surprising large outputs.
 - `--range A1:Z100` — bounding rectangle for `cells` / `rows`. A1-style, scoped to the current sheet.
 - `--header` — on `rows`, treat row 0 as keys and emit `fields` dict per data row.
 - `--with-styles` — opt-in metadata on `cells` / `rows`. Off by default.
 - `--include-blanks` — emit `t:"blank"` records for empty-but-addressed cells. Off by default.
-- `--offset N` / `--limit N` — pagination (renamed from iter54 draft's `--seek/--take`).
-- `--pretty` — **only on `meta`** (single-object commands). Not valid on NDJSON streams; emits an error on misuse.
-- `--no-provenance` — drop `sheet` / `sheet_idx` fields for tiny single-sheet streams where the consumer doesn't need them. Default is to include.
+- `--skip N` / `--max-records N` — stream-native pagination (renamed from the DB-flavored `--offset` / `--limit`).
+- `--start-row R` / `--end-row R` — alternative row-bounded pagination on `rows` / `cells` when callers think in 1-based sheet rows.
+- `--output {ndjson|compact-ndjson|pretty-json}` — output mode. `ndjson` is the default invariant-envelope stream. `compact-ndjson` emits the sheet-prologue variant described above. `pretty-json` is only valid on `meta` (single-object) — emits an error on streaming commands.
+
+## Operational guarantees
+
+Explicit behavior for the rough edges of real workbooks and real pipelines:
+
+### Encoding & input validation
+
+- **Charset**: zlsx produces UTF-8 output only. OOXML is spec-UTF-8, but some generators emit UTF-16 or Windows-1252 despite the header claiming UTF-8. On decode failure, the offending bytes are replaced with U+FFFD and an inline `kind:"error"` record is emitted naming the offending part + byte offset; processing continues.
+- **Invalid XML characters** (control chars outside the OOXML allowlist) are passed through as UTF-8 — `jq` can handle them; downstream LLM ingest can filter if needed.
+- **Max cell text length**: capped at `2^28` bytes (256 MB per cell). Exceeds-cap cells emit a `kind:"error"` record and are skipped.
+- **Max run count per rich-text cell**: capped at `2^16` runs per SST entry. Same error-record behavior on overflow.
+
+### ZIP decompression limits
+
+- **Hard cap on any decompressed part**: `2^32` bytes (4 GB). Exceeded parts fail the whole open with a `kind:"error"` on stderr and exit code 4 (`ZipBombSuspected`).
+- **Per-entry compression ratio**: capped at 10,000:1 (matches zlib's recommendation). Exceeded entries emit an error and skip.
+- **Total decompressed size**: capped at `2^34` bytes (16 GB). Exceeded → same as single-part cap.
+
+### Backpressure & signal handling
+
+- **SIGPIPE**: `zlsx cells huge.xlsx | head -10` exits cleanly. The CLI installs a SIGPIPE handler that sets an internal "stop streaming" flag; the current sheet's remaining rows are abandoned, partial output is flushed, and `exit 0` follows. No broken-pipe traceback noise.
+- **SIGINT / SIGTERM**: in-flight records are flushed, then exit 130 / 143 respectively. If the signal arrives mid-record, the partial record is discarded (not emitted) so the stream stays valid NDJSON.
+- **Flush policy**: every record is written with an explicit newline + flush on `stdout`. Pipelines always see records in emission order, no coalescing.
+- **stderr format**: plain text lines (not JSONL) for the human reader. `stdout` inline `kind:"error"` records are for pipelines; `stderr` is the same content as free-form English for a human tail-f.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success. `kind:"error"` records may still have been emitted inline — non-fatal parse issues. |
+| 1 | Bad CLI arguments. |
+| 2 | Could not open file / not a valid xlsx archive. |
+| 3 | Sheet not found (by name / index / glob). |
+| 4 | Decompression limit exceeded (`ZipBombSuspected`). |
+| 5 | OS error (permission denied, disk full on stdout, etc.). |
+| 130 | SIGINT. |
+| 143 | SIGTERM. |
+
+### Formula and external-reference handling
+
+- **Shared formulas** (`<f t="shared" ref="…" si="…">`): the base cell carries the formula text; dependent cells get the formula pattern expanded in memory but only the base's `formula` field is emitted. Dependent cells emit `formula_ref:<base-ref>` so consumers know the base.
+- **External references** (`[1]Sheet1!A1`): emitted as literal text in `formula`. `zlsx` does not resolve across workbooks.
+- **Malformed formulas**: invalid XML inside `<f>` emits `kind:"error"` inline and the cell falls back to its cached value if one exists.
+
+### Determinism
+
+- **Record order within a sheet**: top-to-bottom, left-to-right. Matches the OOXML document order of the source `<row>` / `<c>` elements.
+- **Record order across sheets** (`--all-sheets`): workbook's declared sheet order.
+- **No implicit sorting**: `zlsx` never reorders cells or rows. Pipelines that need sort use `jq -s 'sort_by(…)'`.
 
 ## Architecture
 
@@ -195,7 +265,7 @@ zlsx comments data.xlsx | jq -r '[.sheet, .ref, .author, .text] | @tsv'
 zlsx sst data.xlsx | jq -r '.text' | rg '@\S+\.\S+'
 
 # Schema check: every list-type validation + its cell range.
-zlsx validations data.xlsx | jq 'select(.kind=="list") | {sheet, range, values}'
+zlsx validations data.xlsx | jq 'select(.rule_type=="list") | {sheet, range, values}'
 
 # Cross-join: "which cells reference a missing sheet in their formula?"
 zlsx cells data.xlsx | jq 'select(.t=="formula" and (.formula | test("[A-Z][a-z]+!")))'
@@ -225,7 +295,9 @@ Same answer as v1, still correct:
 3. The shape of our output — uniform-envelope NDJSON with `kind` discriminators — is the leverage. `jq` operates on this shape natively.
 4. If we ever want a query DSL, it goes in a separate binary (`zlsxq`?) that sits between `zlsx` and `jq`.
 
-## What changed in v2 (Codex review findings)
+## What changed across review rounds
+
+### Round 1: v1 → v2
 
 | v1 claim | v2 resolution |
 |---|---|
@@ -242,6 +314,18 @@ Same answer as v1, still correct:
 | Missing multi-sheet composition | `--all-sheets`, `--sheet-glob`, `sheet_idx` in every record |
 | `meta` as single-object JSON | Now NDJSON: workbook + sheet-per-record |
 | No error events in stream | New `kind:"error"` inline records with scope + code + message |
+
+### Round 2: v2 → v3
+
+| v2 problem | v3 resolution |
+|---|---|
+| `--no-provenance` makes the envelope schema conditional | Removed. Replaced with `--output compact-ndjson` — a different explicit schema with a sheet-prologue record. Default schema stays invariant. |
+| Invariant "every record has kind+sheet+sheet_idx" is false for workbook-wide records | Tightened wording: "every record has `kind`; sheet-scoped records additionally have `sheet` + `sheet_idx`". |
+| `validations.kind` collides with the envelope `kind` discriminator | Renamed the validation subtype field to `rule_type`. |
+| Production-gap silence (UTF-8, ZIP bombs, signals, SIGPIPE, exit codes, shared formulas) | New "Operational guarantees" section. |
+| `--offset` / `--limit` is DB language in a stream context | Renamed `--skip` / `--max-records`; added `--start-row` / `--end-row`. |
+| `--sheet` accepting both name + index is ambiguous | Split: `--sheet NAME` + `--sheet-index N`. |
+| Defaulting to `--all-sheets` surprises Excel users with huge output | Default is first sheet; `--all-sheets` is explicit opt-in. |
 
 ## Summary for the impatient
 
