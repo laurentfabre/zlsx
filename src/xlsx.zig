@@ -435,10 +435,35 @@ const ZipArchive = struct {
         allocator.destroy(self);
     }
 
-    // extractByKey is deferred to slice B, when on-demand extraction
-    // actually runs. The offset maps are populated by `Book.openLazy`
-    // during its one-pass walk; slice B will add the extraction helper
-    // that re-seeks using a cached `Entry`.
+    /// Re-extract the bytes of a previously-cached part by re-seeking
+    /// into the archive. Looks in the sheet / comments / vml maps in
+    /// that order. Returns `null` if the key isn't cached anywhere
+    /// (caller bug: every key lives in some map from the openLazy walk,
+    /// or it shouldn't have been handed to us).
+    fn extractByKey(self: *ZipArchive, allocator: Allocator, key: []const u8) !?[]u8 {
+        const cached = self.sheet_offsets.get(key) orelse
+            self.comments_offsets.get(key) orelse
+            self.vml_offsets.get(key) orelse return null;
+
+        // Fabricate a minimal `std.zip.Iterator.Entry` so the existing
+        // `extractEntryToBuffer` helper is re-usable. Only three fields
+        // are read by the extractor (file_offset, uncompressed_size,
+        // compression_method) — the rest stay zero-valued.
+        const entry = std.zip.Iterator.Entry{
+            .version_needed_to_extract = 0,
+            .flags = @bitCast(@as(u16, 0)),
+            .compression_method = cached.compression_method,
+            .last_modification_time = 0,
+            .last_modification_date = 0,
+            .header_zip_offset = 0,
+            .crc32 = 0,
+            .filename_len = 0,
+            .compressed_size = 0,
+            .uncompressed_size = cached.uncompressed_size,
+            .file_offset = cached.file_offset,
+        };
+        return try extractEntryToBuffer(allocator, entry, &self.reader);
+    }
 };
 
 pub const Book = struct {
@@ -560,6 +585,7 @@ pub const Book = struct {
     pub fn open(allocator: Allocator, path: []const u8) !Book {
         var book = try Book.openLazy(allocator, path);
         errdefer book.deinit();
+        try book.loadEagerParts();
         book.closeArchive();
         return book;
     }
@@ -628,12 +654,14 @@ pub const Book = struct {
             } else if (std.mem.startsWith(u8, filename, "xl/comments") and
                 std.mem.endsWith(u8, filename, ".xml"))
             {
+                // Cache the offset only — comments are extracted on
+                // demand by `ensureCommentsLoaded`. `Book.open`'s
+                // facade walks every sheet through `loadEagerParts`,
+                // which pulls these in via the rels resolver.
                 const key = try allocator.dupe(u8, filename);
                 errdefer allocator.free(key);
                 try book.strings.append(allocator, key);
                 try archive.comments_offsets.put(allocator, key, cached);
-                const data = try extractEntryToBuffer(allocator, entry, file_reader);
-                try book.comments_data.put(allocator, key, data);
             } else if (std.mem.eql(u8, filename, "xl/workbook.xml")) {
                 workbook_xml = try extractEntryToBuffer(allocator, entry, file_reader);
             } else if (std.mem.eql(u8, filename, "xl/_rels/workbook.xml.rels")) {
@@ -657,14 +685,15 @@ pub const Book = struct {
             } else if (std.mem.startsWith(u8, filename, "xl/worksheets/") and
                 std.mem.endsWith(u8, filename, ".xml"))
             {
-                // Own the key outright so the HashMap entry stays valid
-                // for the Book's lifetime.
+                // Cache the offset only — sheet XML is extracted by
+                // `ensureSheetLoaded` (called from `Book.rows` on the
+                // lazy path, or iterated eagerly by `loadEagerParts`
+                // on the `Book.open` facade). Own the key outright so
+                // the HashMap entry stays valid for the Book's lifetime.
                 const key = try allocator.dupe(u8, filename);
                 errdefer allocator.free(key);
                 try book.strings.append(allocator, key);
                 try archive.sheet_offsets.put(allocator, key, cached);
-                const data = try extractEntryToBuffer(allocator, entry, file_reader);
-                try book.sheet_data.put(allocator, key, data);
             } else if (std.mem.startsWith(u8, filename, "xl/drawings/vmlDrawing") and
                 std.mem.endsWith(u8, filename, ".vml"))
             {
@@ -684,8 +713,9 @@ pub const Book = struct {
         try parseWorkbookSheets(&book, wb, rels);
         if (book.shared_strings_xml) |sst| try parseSharedStrings(&book, sst);
 
-        try book.loadEagerParts();
-
+        // NOTE: the per-sheet eager load (`loadEagerParts`) is NOT
+        // called here. `Book.open` invokes it explicitly after
+        // `openLazy` returns; streaming / on-demand callers skip it.
         return book;
     }
 
@@ -705,16 +735,125 @@ pub const Book = struct {
         if (self.theme_xml) |tx| try parseTheme(self, tx);
         if (self.styles_xml) |sx| try parseStyles(self, sx);
 
-        // Parse merged ranges + hyperlinks + data validations per
-        // sheet. All three are cheap — most sheets have none of them,
-        // and each parser bails on the first miss.
-        var sheet_it = self.sheet_data.iterator();
-        while (sheet_it.next()) |entry| {
-            try parseMergedRangesForSheet(self, entry.key_ptr.*, entry.value_ptr.*);
-            try parseHyperlinksForSheet(self, entry.key_ptr.*, entry.value_ptr.*);
-            try parseDataValidationsForSheet(self, entry.key_ptr.*, entry.value_ptr.*);
-            try parseCommentsForSheet(self, entry.key_ptr.*);
+        // Iterate declared sheets rather than the (now empty) cache.
+        // Each `ensureSheetLoaded` extracts the sheet XML on demand
+        // and runs the merged / hyperlinks / validations / comments
+        // parsers once — same net work the pre-slice-B path did, just
+        // routed through the single entry point the lazy path uses.
+        for (self.sheets) |sheet| {
+            _ = try self.ensureSheetLoaded(sheet.path);
         }
+    }
+
+    /// Return the XML bytes for `sheet_path`, extracting from the
+    /// archive on first access and running the per-sheet side-index
+    /// parsers (merged ranges, hyperlinks, data validations, comments).
+    ///
+    /// Idempotent: gated on `sheet_data.contains(path)` so a second
+    /// call is a pure hashmap hit and does not re-parse the side
+    /// indices. If extraction succeeds but a downstream parser fails,
+    /// the sheet XML stays in the cache — partial side-index state
+    /// is tolerated because each parser is no-op-on-missing and a
+    /// retry via the `contains` gate short-circuits before re-entering
+    /// the parsers.
+    ///
+    /// Returns `error.ArchiveClosed` when the book was opened via
+    /// `Book.open` (which closes the archive after `loadEagerParts`)
+    /// AND the sheet wasn't cached by that prior load — impossible
+    /// in practice, but the error path exists for correctness.
+    fn ensureSheetLoaded(self: *Book, sheet_path: []const u8) ![]const u8 {
+        if (self.sheet_data.get(sheet_path)) |existing| return existing;
+
+        const archive = self.archive orelse return error.ArchiveClosed;
+        const data = (try archive.extractByKey(self.allocator, sheet_path)) orelse
+            return error.MissingSheet;
+
+        // `committed` flips once `sheet_data.put` succeeds — from that
+        // point on, ownership of `data` + `owned_key` has moved into
+        // the book and the allocation-cleanup errdefers must become
+        // no-ops. Otherwise a later parser error would free memory the
+        // book's `sheet_data` still references, causing a double-free
+        // on `deinit` via the valueIterator loop.
+        var committed = false;
+        errdefer if (!committed) self.allocator.free(data);
+
+        // The caller's `sheet_path` may be a transient slice (e.g. a
+        // fresh allocation from parseWorkbookSheets). Dupe into
+        // `self.strings` so the hashmap key lifetime matches the book
+        // instead of the caller.
+        const owned_key = try self.allocator.dupe(u8, sheet_path);
+        errdefer if (!committed) self.allocator.free(owned_key);
+        try self.strings.append(self.allocator, owned_key);
+        errdefer if (!committed) {
+            _ = self.strings.pop();
+        };
+
+        try self.sheet_data.put(self.allocator, owned_key, data);
+        committed = true;
+
+        // From here on, `sheet_data` owns `data` + `owned_key`. Partial
+        // side-index state on a later parse error is tolerated — each
+        // parser is no-op-on-missing and a retry via the `contains`
+        // gate short-circuits before re-entering them.
+        try parseMergedRangesForSheet(self, owned_key, data);
+        try parseHyperlinksForSheet(self, owned_key, data);
+        try parseDataValidationsForSheet(self, owned_key, data);
+        try self.ensureCommentsLoadedForSheet(owned_key);
+        try parseCommentsForSheet(self, owned_key);
+
+        return data;
+    }
+
+    /// Resolve this sheet's rels to a comments part (if any) and
+    /// ensure the comments XML is extracted into `comments_data`.
+    /// Idempotent: repeated calls are a hashmap hit.
+    fn ensureCommentsLoadedForSheet(self: *Book, sheet_path: []const u8) !void {
+        const rels_xml = self.sheet_rels_data.get(sheet_path) orelse return;
+
+        // Scan the rels file for a Target ending in /comments*.xml —
+        // same rule as `parseCommentsForSheet`. We only need to walk
+        // until we find the first one (a sheet carries at most one
+        // comments part).
+        const target_key = "Target=\"";
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, rels_xml, i, target_key)) |tp| {
+            const s = tp + target_key.len;
+            const e = std.mem.indexOfScalarPos(u8, rels_xml, s, '"') orelse return;
+            i = e + 1;
+            const target = rels_xml[s..e];
+            if (std.mem.indexOf(u8, target, "comments") == null) continue;
+            const basename = if (std.mem.lastIndexOfScalar(u8, target, '/')) |slash|
+                target[slash + 1 ..]
+            else
+                target;
+            var path_buf: [64]u8 = undefined;
+            const full = std.fmt.bufPrint(&path_buf, "xl/{s}", .{basename}) catch return;
+            try self.ensureCommentsLoaded(full);
+            return;
+        }
+    }
+
+    /// Extract a comments part by archive path. Idempotent.
+    fn ensureCommentsLoaded(self: *Book, comments_path: []const u8) !void {
+        if (self.comments_data.contains(comments_path)) return;
+
+        const archive = self.archive orelse return error.ArchiveClosed;
+        const data = (try archive.extractByKey(self.allocator, comments_path)) orelse return;
+        errdefer self.allocator.free(data);
+
+        // Key must outlive the caller's buffer; the openLazy walk
+        // already allocated a stable key in `self.strings`, so prefer
+        // that slice. Fall back to a fresh dupe if we somehow hit a
+        // path the walk didn't cache (shouldn't happen — extractByKey
+        // would have returned null first).
+        const stable_key: []const u8 = blk: {
+            if (archive.comments_offsets.getKey(comments_path)) |k| break :blk k;
+            const dup = try self.allocator.dupe(u8, comments_path);
+            errdefer self.allocator.free(dup);
+            try self.strings.append(self.allocator, dup);
+            break :blk dup;
+        };
+        try self.comments_data.put(self.allocator, stable_key, data);
     }
 
     /// Merged cell ranges declared in this sheet's `<mergeCells>`
@@ -904,8 +1043,12 @@ pub const Book = struct {
     /// per column present in the widest cell reference in that row, with
     /// gaps filled by `.empty`). Caller retains ownership of the
     /// internal row buffer via `Rows.deinit()`.
-    pub fn rows(self: *const Book, sheet: Sheet, allocator: Allocator) !Rows {
-        const xml = self.sheet_data.get(sheet.path) orelse return error.MissingSheet;
+    ///
+    /// Takes `*Book` (not `*const Book`) as of iter54 slice B: the
+    /// lazy path populates `sheet_data` and the per-sheet side indices
+    /// on first call. Rows itself still only borrows from the book.
+    pub fn rows(self: *Book, sheet: Sheet, allocator: Allocator) !Rows {
+        const xml = try self.ensureSheetLoaded(sheet.path);
         return .{
             .xml = xml,
             .pos = 0,
@@ -4629,4 +4772,107 @@ test "fuzz Rows.next on synthetic cells with out-of-range SST indices" {
         // Consume the rows — may error, must not panic.
         while (rows.next() catch null) |_| {}
     }
+}
+
+// ─── iter54 slice B: lazy sheet / comments extraction ───────────────
+
+test "openLazy path loads sheets lazily, yields identical state to open()" {
+    // Build a small multi-sheet workbook with merged ranges, hyperlinks,
+    // data validations, and comments so every per-sheet side-index gets
+    // a round-trip comparison.
+    const tmp_path = "/tmp/zlsx_iter54_lazy_struct.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+
+        var s1 = try w.addSheet("Alpha");
+        try s1.addMergedCell("A1:B1");
+        try s1.addHyperlink("A2", "https://example.com/a");
+        try s1.writeRow(&.{ .{ .string = "hdr1" }, .{ .string = "hdr2" } });
+        try s1.writeRow(&.{ .{ .number = 1.0 }, .{ .number = 2.0 } });
+        try s1.addComment("A1", "me", "hello");
+
+        var s2 = try w.addSheet("Beta");
+        try s2.writeRow(&.{.{ .string = "x" }});
+        try s2.writeRow(&.{.{ .number = 42.0 }});
+
+        try w.save(tmp_path);
+    }
+
+    // Eager path.
+    var eager = try Book.open(std.testing.allocator, tmp_path);
+    defer eager.deinit();
+
+    // Lazy path — right after open, sheet_data is empty.
+    var lazy = try Book.openLazy(std.testing.allocator, tmp_path);
+    defer lazy.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), lazy.sheet_data.count());
+    try std.testing.expectEqual(eager.sheets.len, eager.sheet_data.count());
+    try std.testing.expectEqual(eager.sheets.len, lazy.sheets.len);
+
+    // Iterate each sheet via lazy.rows — must match eager.rows row-for-row.
+    for (eager.sheets, lazy.sheets) |eager_sheet, lazy_sheet| {
+        try std.testing.expectEqualStrings(eager_sheet.path, lazy_sheet.path);
+        var er = try eager.rows(eager_sheet, std.testing.allocator);
+        defer er.deinit();
+        var lr = try lazy.rows(lazy_sheet, std.testing.allocator);
+        defer lr.deinit();
+        while (true) {
+            const er_row = try er.next();
+            const lr_row = try lr.next();
+            if (er_row == null and lr_row == null) break;
+            try std.testing.expect(er_row != null and lr_row != null);
+            try std.testing.expectEqual(er_row.?.len, lr_row.?.len);
+            for (er_row.?, lr_row.?) |ec, lc| {
+                try std.testing.expectEqualDeep(ec, lc);
+            }
+        }
+    }
+
+    // After iterating every sheet, lazy sheet_data matches eager.
+    try std.testing.expectEqual(lazy.sheets.len, lazy.sheet_data.count());
+    try std.testing.expectEqual(eager.merged_ranges.count(), lazy.merged_ranges.count());
+    try std.testing.expectEqual(eager.hyperlinks_by_sheet.count(), lazy.hyperlinks_by_sheet.count());
+    try std.testing.expectEqual(eager.data_validations_by_sheet.count(), lazy.data_validations_by_sheet.count());
+    try std.testing.expectEqual(eager.comments_by_sheet.count(), lazy.comments_by_sheet.count());
+}
+
+test "openLazy -> ensureSheetLoaded is idempotent" {
+    const tmp_path = "/tmp/zlsx_iter54_lazy_idempotent.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("One");
+        try s.addMergedCell("A1:A2");
+        try s.writeRow(&.{.{ .string = "x" }});
+        try s.writeRow(&.{.{ .number = 1.0 }});
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.openLazy(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), book.sheet_data.count());
+
+    {
+        var r = try book.rows(book.sheets[0], std.testing.allocator);
+        defer r.deinit();
+        while (try r.next()) |_| {}
+    }
+    try std.testing.expectEqual(@as(usize, 1), book.sheet_data.count());
+    const merged_after_first = book.merged_ranges.count();
+
+    // Second call: cache hit, no double-parse.
+    {
+        var r = try book.rows(book.sheets[0], std.testing.allocator);
+        defer r.deinit();
+        while (try r.next()) |_| {}
+    }
+    try std.testing.expectEqual(@as(usize, 1), book.sheet_data.count());
+    try std.testing.expectEqual(merged_after_first, book.merged_ranges.count());
 }

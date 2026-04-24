@@ -27,7 +27,7 @@ fn openOrSkip(alloc: std.mem.Allocator, filename: []const u8) !xlsx.Book {
     };
 }
 
-fn rowCount(book: *const xlsx.Book, sheet: xlsx.Sheet, alloc: std.mem.Allocator) !usize {
+fn rowCount(book: *xlsx.Book, sheet: xlsx.Sheet, alloc: std.mem.Allocator) !usize {
     var rows = try book.rows(sheet, alloc);
     defer rows.deinit();
     var n: usize = 0;
@@ -36,7 +36,7 @@ fn rowCount(book: *const xlsx.Book, sheet: xlsx.Sheet, alloc: std.mem.Allocator)
 }
 
 fn firstRowCells(
-    book: *const xlsx.Book,
+    book: *xlsx.Book,
     sheet: xlsx.Sheet,
     alloc: std.mem.Allocator,
     out: []xlsx.Cell,
