@@ -1117,8 +1117,23 @@ pub const Book = struct {
 fn recoverRowFromFirstCell(xml: []const u8, row_body_start: usize) ?u32 {
     const row_end_pos = std.mem.indexOfPos(u8, xml, row_body_start, "</row>") orelse return null;
     const body = xml[row_body_start..row_end_pos];
-    const c_rel = std.mem.indexOf(u8, body, "<c ") orelse return null;
-    const tag_open = c_rel + "<c ".len;
+
+    // Scan for the first `<c` tag-open. Any XML-valid whitespace
+    // or `/` or `>` after the tag name is legal; a letter would
+    // mean we matched a longer name (`<col>`, `<cellmap>`) and
+    // must keep searching.
+    var scan: usize = 0;
+    const c_start = while (std.mem.indexOfPos(u8, body, scan, "<c")) |p| {
+        const after = p + "<c".len;
+        if (after >= body.len) return null;
+        const ch = body[after];
+        if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r' or ch == '/' or ch == '>') {
+            break p;
+        }
+        scan = p + 1;
+    } else return null;
+
+    const tag_open = c_start + "<c".len;
     const tag_close = std.mem.indexOfScalarPos(u8, body, tag_open, '>') orelse return null;
     const c_attrs = body[tag_open..tag_close];
     const ref = getAttr(c_attrs, "r") orelse return null;
@@ -4931,6 +4946,30 @@ test "Rows.currentRowNumber recovers from cell r attr when <row r> is absent/bad
         try std.testing.expectEqual(want, rows.currentRowNumber());
     }
     try std.testing.expectEqual(@as(?[]const Cell, null), try rows.next());
+}
+
+test "Rows.currentRowNumber recovers cell-r with non-space whitespace after <c" {
+    // Pretty-printed / whitespace-normalized OOXML: the <c tag is
+    // followed by a newline instead of a space. consumeCell
+    // accepts this; the row-r recovery must match it too.
+    const xml =
+        "<sheetData>" ++
+        "<row>\n  <c\n    r=\"A42\"\n    t=\"inlineStr\"><is><t>x</t></is></c>\n</row>" ++
+        "</sheetData>";
+
+    var rows: Rows = .{
+        .xml = xml,
+        .pos = 0,
+        .shared_strings = &.{},
+        .allocator = std.testing.allocator,
+        .row_cells = .{},
+        .row_styles = .{},
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer rows.deinit();
+
+    _ = (try rows.next()) orelse return error.UnexpectedEndOfRows;
+    try std.testing.expectEqual(@as(u32, 42), rows.currentRowNumber());
 }
 
 test "Rows.currentRowNumber falls through to yield count when row body is empty" {
