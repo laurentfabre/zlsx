@@ -1107,6 +1107,30 @@ pub const Book = struct {
     }
 };
 
+/// When a `<row>` tag has no usable `r` attribute, try to recover
+/// the 1-based row number from the first `<c r="A11">` cell inside
+/// that row. OOXML generators typically stamp every cell with an
+/// `r` attribute even when they omit it on `<row>`, so this branch
+/// covers the realistic malformed-input cases. Returns null when
+/// the row body is truncated, the first cell has no r, or the
+/// trailing digits don't parse / resolve to zero.
+fn recoverRowFromFirstCell(xml: []const u8, row_body_start: usize) ?u32 {
+    const row_end_pos = std.mem.indexOfPos(u8, xml, row_body_start, "</row>") orelse return null;
+    const body = xml[row_body_start..row_end_pos];
+    const c_rel = std.mem.indexOf(u8, body, "<c ") orelse return null;
+    const tag_open = c_rel + "<c ".len;
+    const tag_close = std.mem.indexOfScalarPos(u8, body, tag_open, '>') orelse return null;
+    const c_attrs = body[tag_open..tag_close];
+    const ref = getAttr(c_attrs, "r") orelse return null;
+    // Split "A11" into letters + digits. Skip leading non-digits
+    // (column letters — could be 1..3 chars, `A` to `XFD`).
+    var j: usize = 0;
+    while (j < ref.len and !std.ascii.isDigit(ref[j])) : (j += 1) {}
+    if (j >= ref.len) return null;
+    const n = std.fmt.parseInt(u32, ref[j..], 10) catch return null;
+    return if (n > 0) n else null;
+}
+
 // ─── Rows iterator ───────────────────────────────────────────────────
 
 pub const Rows = struct {
@@ -1135,21 +1159,16 @@ pub const Rows = struct {
     /// per entity-bearing or rich-text cell per row.
     arena: std.heap.ArenaAllocator,
     /// 1-based OOXML row number of the most recently yielded row.
-    /// Prefers the `<row r="N">` attribute when present and valid
-    /// (>= 1); falls back to `yield_count` when the source omits,
-    /// malforms, or zeros it (rare but legal / seen in hand-edited
-    /// OOXML). Valid only after `next()` has returned a non-null
-    /// row; zero before the first successful call.
-    ///
-    /// Known edge case (iter55a): on the yield-count fallback
-    /// branch, if the source row contains cells with explicit
-    /// `<c r="A11">` attributes, the synthesized envelope `row`
-    /// (e.g. 2) will diverge from the inline cell-r row (e.g. 11).
-    /// A parser change to recover the row number from the first
-    /// cell's r attribute on `<row r>` failure is queued for a
-    /// later iter; mainstream OOXML producers (Excel, openpyxl,
-    /// LibreOffice) always emit valid `<row r>` so the branch is
-    /// unreachable in practice.
+    /// Resolution priority (highest to lowest):
+    ///   1. `<row r="N">` when present and N >= 1.
+    ///   2. First `<c r="A11">` cell's trailing digits when the
+    ///      row-level r is missing / zero / malformed — keeps the
+    ///      envelope `row` in lockstep with inline cell refs.
+    ///   3. `yield_count` (1-based count of rows yielded) as the
+    ///      last resort when neither the row nor any cell has a
+    ///      usable r.
+    /// Valid only after `next()` has returned a non-null row; zero
+    /// before the first successful call.
     current_row: u32 = 0,
     /// 1-based counter of rows yielded from this iterator. Used as
     /// the fallback for `current_row` when the source `<row>` tag
@@ -1227,20 +1246,28 @@ pub const Rows = struct {
                 attrs[0 .. attrs.len - 1]
             else
                 attrs;
-            // Fallback on missing / malformed / zero `r` is the
-            // 1-based yield counter (NOT `current_row + 1`), so row
-            // numbers remain deterministic for sparse or hand-edited
-            // OOXML where `r` is mixed or missing — the envelope
-            // consumer sees 1..N contiguous regardless of source
-            // gaps. `r="0"` is invalid per spec (rows are 1-based)
-            // and would produce `A0` refs if accepted — treated as
-            // malformed.
+            // Row number resolution (priority):
+            //   1. `<row r="N">` with N >= 1.
+            //   2. Recover from the first `<c r="A11">` inside this
+            //      row — the cell's ref is authoritative and matches
+            //      what the envelope will synthesize as `{ref}` per
+            //      cell, keeping them in lockstep.
+            //   3. `yield_count` (1-based count of rows yielded) —
+            //      last resort when neither the row nor any cell has
+            //      a usable r attribute. In that case the synthesized
+            //      envelope refs (`col_letter+yield_count`) also have
+            //      no inline source refs to diverge from.
+            //   `r="0"` is invalid per spec (rows are 1-based) and
+            //   falls through the row-r step to step 2/3.
             self.yield_count += 1;
-            if (getAttr(attrs_trimmed, "r")) |r_str| {
+            const row_r_valid: ?u32 = if (getAttr(attrs_trimmed, "r")) |r_str| blk: {
                 const parsed = std.fmt.parseInt(u32, r_str, 10) catch 0;
-                self.current_row = if (parsed > 0) parsed else self.yield_count;
+                break :blk if (parsed > 0) parsed else null;
+            } else null;
+            if (row_r_valid) |n| {
+                self.current_row = n;
             } else {
-                self.current_row = self.yield_count;
+                self.current_row = recoverRowFromFirstCell(self.xml, row_start.after_open) orelse self.yield_count;
             }
             self.pos = row_start.after_open;
             // Consume cells until </row>.
@@ -4873,12 +4900,11 @@ test "fuzz Rows.next on synthetic cells with out-of-range SST indices" {
     }
 }
 
-test "Rows.currentRowNumber falls back to yield count on missing/zero/bad r attr" {
+test "Rows.currentRowNumber recovers from cell r attr when <row r> is absent/bad" {
     // Mixed <row> tags: r="10", r=missing, r="bad", r="0", r="20".
-    // Expected row numbers per yield: 10, 2, 3, 4, 20.
-    // The non-contiguous fallback (1-based yield) keeps row numbers
-    // stable for iter55a's envelope consumers even when source sheets
-    // are sparse / hand-edited / malformed.
+    // Each row has a cell with an explicit r attr that should be
+    // used to recover the row number when <row r> is unusable. The
+    // envelope `row` thus matches the inline cell ref.
     const xml =
         "<sheetData>" ++
         "<row r=\"10\"><c r=\"A10\" t=\"inlineStr\"><is><t>a</t></is></c></row>" ++
@@ -4899,12 +4925,43 @@ test "Rows.currentRowNumber falls back to yield count on missing/zero/bad r attr
     };
     defer rows.deinit();
 
-    const expected = [_]u32{ 10, 2, 3, 4, 20 };
+    const expected = [_]u32{ 10, 11, 12, 13, 20 };
     for (expected) |want| {
         _ = (try rows.next()) orelse return error.UnexpectedEndOfRows;
         try std.testing.expectEqual(want, rows.currentRowNumber());
     }
     try std.testing.expectEqual(@as(?[]const Cell, null), try rows.next());
+}
+
+test "Rows.currentRowNumber falls through to yield count when row body is empty" {
+    // Rows without r attrs and without any cells — no cell-r to
+    // recover from. The fallback is the 1-based yield counter.
+    // (In practice the zlsx cell parser requires every `<c>` to
+    // carry an r attr, so this branch is only reachable when
+    // `<row>` is truly empty or self-closing.)
+    const xml =
+        "<sheetData>" ++
+        "<row></row>" ++
+        "<row></row>" ++
+        "<row></row>" ++
+        "</sheetData>";
+
+    var rows: Rows = .{
+        .xml = xml,
+        .pos = 0,
+        .shared_strings = &.{},
+        .allocator = std.testing.allocator,
+        .row_cells = .{},
+        .row_styles = .{},
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer rows.deinit();
+
+    const expected = [_]u32{ 1, 2, 3 };
+    for (expected) |want| {
+        _ = (try rows.next()) orelse return error.UnexpectedEndOfRows;
+        try std.testing.expectEqual(want, rows.currentRowNumber());
+    }
 }
 
 // ─── iter54 slice B: lazy sheet / comments extraction ───────────────
