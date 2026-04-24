@@ -327,7 +327,7 @@ zlsx sst data.xlsx | jq -r '.text' | rg '@\S+\.\S+'
 
 ### Pipeline safety
 
-`zlsx cells huge.xlsx | head -10` exits 0 cleanly (no broken-pipe stderr noise). `SIGINT` → exit 130, `SIGTERM` → exit 143, both flushing in-flight records. Non-fatal `MalformedXml` surfacing during row iteration (post-open) emits an inline `{"kind":"error",…}` record and continues emitting neighbour sheets instead of aborting the pipeline — filter with `jq 'select(.kind!="error")'` for the data-only stream. Note: workbooks that fail at `Book.open` (invalid zip / missing workbook / malformed non-sheet parts) still exit 2 with a stderr diagnostic, since there is no stream to inject error records into yet.
+`zlsx cells huge.xlsx | head -10` exits 0 cleanly (no broken-pipe stderr noise). `SIGINT` → exit 130, `SIGTERM` → exit 143, both flushing in-flight records. Non-fatal `MalformedXml` surfacing during row iteration (strictly inside the per-cell walk, after `Book.open` has returned) emits an inline `{"kind":"error",…}` record and continues emitting neighbour sheets — filter with `jq 'select(.kind!="error")'` for the data-only stream. **Everything `Book.open` parses eagerly still fails with exit 2 + stderr** — that covers the zip structure, `workbook.xml`, `sharedStrings.xml`, `styles.xml`, `theme1.xml`, per-sheet `.rels`, merged-cell ranges, hyperlinks, data validations, and comments bodies. The inline-record path only rescues malformation inside the `<row>`/`<c>` body of a sheet that otherwise loaded cleanly.
 
 ### Exit codes
 
