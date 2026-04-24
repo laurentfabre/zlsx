@@ -1090,6 +1090,7 @@ pub const Book = struct {
             .allocator = allocator,
             .row_cells = .{},
             .row_styles = .{},
+            .row_date_types = .{},
             .arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
@@ -1167,6 +1168,14 @@ pub const Rows = struct {
     /// when the source `<c>` had no `s` attribute. Filled with nulls
     /// for gap cells so positional indexing matches `row_cells`.
     row_styles: std.ArrayListUnmanaged(?u32),
+    /// Parallel to `row_cells`. Each slot is `true` iff the cell is a
+    /// numeric value (`.integer` or `.number`) whose style resolves to
+    /// a date-like numFmt (`Book.isDateFormat`) AND whose value lies in
+    /// the round-trippable Excel-serial range (`fromExcelSerial` returns
+    /// non-null). Gap cells stay `false`. Exposed via `dateTypes()` so
+    /// the CLI can emit `t:"date"` alongside the raw numeric serial
+    /// without altering the `Cell` union shape.
+    row_date_types: std.ArrayListUnmanaged(bool),
     /// Bump arena for per-row decoded strings. Reset (O(1)) at the
     /// start of each `next()` call — previous row's owned strings
     /// become invalid, which matches the documented contract. Compared
@@ -1195,6 +1204,7 @@ pub const Rows = struct {
         self.arena.deinit();
         self.row_cells.deinit(self.allocator);
         self.row_styles.deinit(self.allocator);
+        self.row_date_types.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -1204,6 +1214,17 @@ pub const Rows = struct {
     /// until the next `next()` call, same as `row_cells`.
     pub fn styleIndices(self: *const Rows) []const ?u32 {
         return self.row_styles.items;
+    }
+
+    /// Per-column "this cell is a date-styled numeric serial" flags for
+    /// the current row. Parallel to the slice returned by `next()`;
+    /// length matches `row_cells.len`. `true` only when the cell is
+    /// `.integer`/`.number`, its style resolves to a date format
+    /// (`Book.isDateFormat`), and its value is inside
+    /// `fromExcelSerial`'s accepted range. Gap cells and non-date
+    /// numerics stay `false`. Valid until the next `next()` call.
+    pub fn dateTypes(self: *const Rows) []const bool {
+        return self.row_date_types.items;
     }
 
     /// Parse the current-row cell at `col_idx` as a date-styled
@@ -1250,6 +1271,7 @@ pub const Rows = struct {
     pub fn next(self: *Rows) !?[]const Cell {
         self.row_cells.clearRetainingCapacity();
         self.row_styles.clearRetainingCapacity();
+        self.row_date_types.clearRetainingCapacity();
         _ = self.arena.reset(.retain_capacity);
 
         while (findTagOpen(self.xml, self.pos, "row")) |row_start| {
@@ -1328,14 +1350,18 @@ pub const Rows = struct {
         else
             null;
 
-        // Grow row_cells + row_styles to cover col_idx; fill gaps
-        // with `.empty` / `null`. Both arrays stay in lock-step so
-        // callers can index them the same way.
+        // Grow row_cells + row_styles + row_date_types to cover col_idx;
+        // fill gaps with `.empty` / `null` / `false`. All three arrays
+        // stay in lock-step so callers can index them the same way.
         while (self.row_cells.items.len <= col_idx) {
             try self.row_cells.append(self.allocator, .empty);
             try self.row_styles.append(self.allocator, null);
+            try self.row_date_types.append(self.allocator, false);
         }
         self.row_styles.items[col_idx] = style_idx;
+        // Date-flag defaults to false; the numeric branch below flips
+        // it on when the style + value qualify.
+        self.row_date_types.items[col_idx] = false;
 
         if (is_self_closing) {
             // Empty cell; already .empty.
@@ -1370,6 +1396,27 @@ pub const Rows = struct {
             try parseNumericCell(extractVValue(body) orelse "");
 
         self.row_cells.items[col_idx] = cell;
+
+        // Date-type side channel: flip the flag when the cell is a
+        // numeric serial under a date-styled numFmt and the serial is
+        // inside fromExcelSerial's round-trippable window. Mirrors the
+        // three-condition check in `parseDate` but without materialising
+        // the DateTime — cheaper for the common case where callers want
+        // just the tag and will re-derive the DateTime on demand.
+        if (style_idx != null) {
+            const num_opt: ?f64 = switch (cell) {
+                .number => |n| n,
+                .integer => |n| @floatFromInt(n),
+                else => null,
+            };
+            if (num_opt) |num| {
+                if (self.book) |book| {
+                    if (book.isDateFormat(style_idx.?) and fromExcelSerial(num) != null) {
+                        self.row_date_types.items[col_idx] = true;
+                    }
+                }
+            }
+        }
     }
 
     fn resolveSharedString(self: *Rows, body: []const u8) !Cell {
@@ -4770,6 +4817,7 @@ fn consumeAllRows(alloc: std.mem.Allocator, shared_strings: []const []const u8, 
         .allocator = alloc,
         .row_cells = .{},
         .row_styles = .{},
+        .row_date_types = .{},
         .arena = std.heap.ArenaAllocator.init(alloc),
     };
     defer rows.deinit();
@@ -4906,6 +4954,7 @@ test "fuzz Rows.next on synthetic cells with out-of-range SST indices" {
             .allocator = std.testing.allocator,
             .row_cells = .{},
             .row_styles = .{},
+            .row_date_types = .{},
             .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
         };
         defer rows.deinit();
@@ -4936,6 +4985,7 @@ test "Rows.currentRowNumber recovers from cell r attr when <row r> is absent/bad
         .allocator = std.testing.allocator,
         .row_cells = .{},
         .row_styles = .{},
+        .row_date_types = .{},
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
@@ -4964,6 +5014,7 @@ test "Rows.currentRowNumber recovers cell-r with non-space whitespace after <c" 
         .allocator = std.testing.allocator,
         .row_cells = .{},
         .row_styles = .{},
+        .row_date_types = .{},
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
@@ -4992,6 +5043,7 @@ test "Rows.currentRowNumber falls through to yield count when row body is empty"
         .allocator = std.testing.allocator,
         .row_cells = .{},
         .row_styles = .{},
+        .row_date_types = .{},
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
