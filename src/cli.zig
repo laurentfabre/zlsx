@@ -620,6 +620,15 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\  tsv                tab-separated, \N for empty cells, control chars escaped
         \\  csv                RFC 4180, empty string for empty cells
         \\
+        \\Error records (iter60c)
+        \\  Non-fatal parse errors (e.g. a single corrupt sheet inside an
+        \\  otherwise-valid workbook) are emitted inline as
+        \\  {"kind":"error","sheet":"…","sheet_idx":N,"scope":"sheet",
+        \\   "code":"MalformedXml","message":"…"}
+        \\  records and the run still exits 0. Pipelines may strip them
+        \\  via `jq 'select(.kind!="error")'`. Workbook-level open
+        \\  failures stay fatal (exit 2 / 5 — see Exit codes).
+        \\
         \\Exit codes
         \\  0  success
         \\  1  bad arguments
@@ -1366,6 +1375,54 @@ fn writeCompactSheetPrologue(w: *std.Io.Writer, sheet_name: []const u8, sheet_id
     try w.print(",\"sheet_idx\":{d}}}\n", .{sheet_idx});
 }
 
+/// iter60c: emit one inline `{"kind":"error",…}` NDJSON record for a
+/// non-fatal parse error. `sheet`/`sheet_idx` are optional so workbook-
+/// scoped errors can omit them; under compact-ndjson they're dropped
+/// from sheet-scoped records too — matching the per-record envelope
+/// rules of the surrounding stream. Callers own the decision of which
+/// errors to surface vs propagate; this helper is shape-only.
+///
+/// Per docs/jq-for-excel.md v4.1: pipelines may strip these via
+/// `jq 'select(.kind!="error")'` and a run that emits them still exits 0.
+fn writeErrorRecord(
+    w: *std.Io.Writer,
+    sheet_name: ?[]const u8,
+    sheet_idx: ?usize,
+    scope: []const u8,
+    code: []const u8,
+    message: []const u8,
+    compact: bool,
+) !void {
+    try w.writeAll("{\"kind\":\"error\"");
+    // Drop sheet/sheet_idx when either compact-ndjson is in effect on a
+    // sheet-scoped record (envelope contract: prologue carries identity)
+    // OR the caller is workbook-scoped (no sheet to name).
+    if (!compact) {
+        if (sheet_name) |n| {
+            try w.writeAll(",\"sheet\":");
+            try writeJsonString(w, n);
+        }
+        if (sheet_idx) |i| try w.print(",\"sheet_idx\":{d}", .{i});
+    }
+    try w.writeAll(",\"scope\":");
+    try writeJsonString(w, scope);
+    try w.writeAll(",\"code\":");
+    try writeJsonString(w, code);
+    try w.writeAll(",\"message\":");
+    try writeJsonString(w, message);
+    try w.writeAll("}\n");
+}
+
+/// iter60c: per-error human-readable description. Kept tight by design
+/// — byte-offset plumbing lives behind a future reader API change. The
+/// returned slice is a static literal; safe to embed verbatim in JSON.
+fn nonFatalErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.MalformedXml => "malformed sheet XML",
+        else => @errorName(err),
+    };
+}
+
 /// iter59c: single-sheet row driver. Kept for call-site compat with
 /// the existing test suite — constructs a fresh Pagination internally.
 /// Multi-sheet callers go through `runRowsAcrossSheets` so pagination
@@ -1394,7 +1451,35 @@ fn runRowsCommand(
 /// so cross-sheet drivers can thread one counter through every sheet —
 /// `--skip N --take M` slices the concatenated stream, not per sheet.
 /// Header state is local to this call (per-sheet reset by design).
+///
+/// iter60c: wraps `runRowsOnSheetCore`. Same non-fatal-error contract
+/// as `runCellsOnSheet` — see there.
 fn runRowsOnSheet(
+    out: *std.Io.Writer,
+    book: *xlsx.Book,
+    sheet: xlsx.Sheet,
+    sheet_idx: usize,
+    format: Format,
+    alloc: std.mem.Allocator,
+    pg: *Pagination,
+    start_row: ?u32,
+    end_row: ?u32,
+    range: ?xlsx.MergeRange,
+    header: bool,
+    include_blanks: bool,
+    with_styles: bool,
+    compact: bool,
+) !void {
+    runRowsOnSheetCore(out, book, sheet, sheet_idx, format, alloc, pg, start_row, end_row, range, header, include_blanks, with_styles, compact) catch |err| switch (err) {
+        error.MalformedXml => {
+            try writeErrorRecord(out, sheet.name, sheet_idx, "sheet", "MalformedXml", nonFatalErrorMessage(err), compact);
+            return;
+        },
+        else => return err,
+    };
+}
+
+fn runRowsOnSheetCore(
     out: *std.Io.Writer,
     book: *xlsx.Book,
     sheet: xlsx.Sheet,
@@ -1665,7 +1750,36 @@ fn runCellsCommand(
 
 /// iter59c: per-sheet cell emitter — takes Pagination by pointer so a
 /// cross-sheet driver can thread the same counter across every sheet.
+///
+/// iter60c: wraps `runCellsOnSheetCore`. Non-fatal parse errors (today:
+/// `error.MalformedXml`) are caught at sheet boundary and surfaced as
+/// an inline `{"kind":"error",…}` record per docs/jq-for-excel.md v4.1.
+/// Other errors propagate unchanged so resource / I/O failures stay
+/// fatal.
 fn runCellsOnSheet(
+    out: *std.Io.Writer,
+    book: *xlsx.Book,
+    sheet: xlsx.Sheet,
+    sheet_idx: usize,
+    alloc: std.mem.Allocator,
+    pg: *Pagination,
+    start_row: ?u32,
+    end_row: ?u32,
+    range: ?xlsx.MergeRange,
+    include_blanks: bool,
+    with_styles: bool,
+    compact: bool,
+) !void {
+    runCellsOnSheetCore(out, book, sheet, sheet_idx, alloc, pg, start_row, end_row, range, include_blanks, with_styles, compact) catch |err| switch (err) {
+        error.MalformedXml => {
+            try writeErrorRecord(out, sheet.name, sheet_idx, "sheet", "MalformedXml", nonFatalErrorMessage(err), compact);
+            return;
+        },
+        else => return err,
+    };
+}
+
+fn runCellsOnSheetCore(
     out: *std.Io.Writer,
     book: *xlsx.Book,
     sheet: xlsx.Sheet,
@@ -4854,4 +4968,144 @@ test "runCellsAcrossSheets --all-sheets --skip --take slices the cross-sheet str
     // Cross-sheet: both sheets must contribute at least one record.
     try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet\":\"A\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet\":\"B\"") != null);
+}
+
+test "writeErrorRecord sheet-scoped + workbook-scoped shapes (iter60c)" {
+    // Sheet-scoped, ndjson — every identity field present.
+    {
+        var scratch: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        try writeErrorRecord(&w, "Data", 0, "sheet", "MalformedXml", "malformed sheet XML", false);
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"error\",\"sheet\":\"Data\",\"sheet_idx\":0,\"scope\":\"sheet\",\"code\":\"MalformedXml\",\"message\":\"malformed sheet XML\"}\n",
+            w.buffered(),
+        );
+    }
+    // Sheet-scoped, compact — sheet/sheet_idx dropped (envelope contract).
+    {
+        var scratch: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        try writeErrorRecord(&w, "Data", 0, "sheet", "MalformedXml", "malformed sheet XML", true);
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"error\",\"scope\":\"sheet\",\"code\":\"MalformedXml\",\"message\":\"malformed sheet XML\"}\n",
+            w.buffered(),
+        );
+    }
+    // Workbook-scoped — null sheet/sheet_idx, both omitted.
+    {
+        var scratch: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        try writeErrorRecord(&w, null, null, "workbook", "ArchiveClosed", "archive closed", false);
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"error\",\"scope\":\"workbook\",\"code\":\"ArchiveClosed\",\"message\":\"archive closed\"}\n",
+            w.buffered(),
+        );
+    }
+    // String fields containing JSON-special chars are escaped.
+    {
+        var scratch: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        try writeErrorRecord(&w, "Q\"uoted", 1, "sheet", "Code", "line\nbreak", false);
+        const out = w.buffered();
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet\":\"Q\\\"uoted\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"message\":\"line\\nbreak\"") != null);
+    }
+}
+
+test "runCellsAcrossSheets emits inline kind:error for a malformed sheet and continues (iter60c)" {
+    // Two-sheet workbook: sheet 0 valid, sheet 1's loaded XML is
+    // hot-replaced after open with bytes that trip
+    // `consumeRow → indexOfScalarPos('<') == null → error.MalformedXml`.
+    // The CLI must emit one inline `kind:"error"` record at sheet
+    // boundary, keep going, and exit cleanly (no propagation).
+    const tmp_path = "/tmp/zlsx_cli_iter60c_malformed.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Good");
+        try s0.writeRow(&.{ .{ .string = "g1" }, .{ .string = "g2" } });
+        var s1 = try w.addSheet("Bad");
+        try s1.writeRow(&.{.{ .string = "b1" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    // Replace sheet 1's loaded XML with a payload that opens a `<row>`
+    // but never closes it / emits no further `<` — `consumeRow` fails on
+    // the missing close-tag scan. The replacement uses `book.allocator`
+    // so `book.deinit` frees it through the same path as the original.
+    const bad_path = book.sheets[1].path;
+    const corrupt =
+        "<?xml version=\"1.0\"?>" ++
+        "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+        "<sheetData><row r=\"1\">no-close-tag-here";
+    const dup = try book.allocator.dupe(u8, corrupt);
+    if (book.sheet_data.getEntry(bad_path)) |entry| {
+        book.allocator.free(entry.value_ptr.*);
+        entry.value_ptr.* = dup;
+    } else {
+        book.allocator.free(dup);
+        return error.SheetDataMissing;
+    }
+
+    var scratch: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    const args: Args = .{ .file = "", .subcommand = .cells, .all_sheets = true };
+    try runCellsAcrossSheets(&w, &book, args, std.testing.allocator);
+    const out = w.buffered();
+
+    // Good sheet's two cells survive.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"g1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"g2\"") != null);
+    // Bad sheet emits exactly one error record carrying its identity.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"kind\":\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet\":\"Bad\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet_idx\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"scope\":\"sheet\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"code\":\"MalformedXml\"") != null);
+}
+
+test "runCellsCommand single-sheet malformed sheet emits one error record without propagating (iter60c)" {
+    const tmp_path = "/tmp/zlsx_cli_iter60c_single.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Only");
+        try s0.writeRow(&.{.{ .string = "x" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    const bad_path = book.sheets[0].path;
+    const corrupt =
+        "<?xml version=\"1.0\"?>" ++
+        "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+        "<sheetData><row r=\"1\">unterminated";
+    const dup = try book.allocator.dupe(u8, corrupt);
+    if (book.sheet_data.getEntry(bad_path)) |entry| {
+        book.allocator.free(entry.value_ptr.*);
+        entry.value_ptr.* = dup;
+    } else {
+        book.allocator.free(dup);
+        return error.SheetDataMissing;
+    }
+
+    var scratch: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    // Must NOT propagate — this is the "non-fatal" contract the design
+    // doc describes for a corrupt sheet inside an otherwise-open book.
+    try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, null, null, null, false, false);
+
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"kind\":\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet\":\"Only\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"code\":\"MalformedXml\"") != null);
 }
