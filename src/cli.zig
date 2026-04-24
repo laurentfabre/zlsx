@@ -25,6 +25,11 @@ const Args = struct {
     sheet_name: ?[]const u8 = null,
     format: Format = .jsonl,
     list_sheets: bool = false,
+    /// Set when the user passed the deprecated `--format jsonl-dict`
+    /// spelling. `main` emits a one-line stderr deprecation warning
+    /// so existing scripts keep working while their authors learn
+    /// about the rename.
+    deprecated_jsonl_dict: bool = false,
 };
 
 const ArgError = error{
@@ -67,10 +72,12 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
             } else if (std.mem.eql(u8, v, "legacy-jsonl-dict")) {
                 out.format = .legacy_jsonl_dict;
             } else if (std.mem.eql(u8, v, "jsonl-dict")) {
-                // Deprecated alias for `legacy-jsonl-dict`; kept silent
-                // for one release cycle (iter55b will warn). Pre-iter55a
-                // the only dict shape we shipped was the bare object.
+                // Deprecated alias for `legacy-jsonl-dict` — routed
+                // through the deprecation flag so `main` emits one
+                // stderr warning. Pre-iter55a the only dict shape we
+                // shipped was the bare object, so the intent is clear.
                 out.format = .legacy_jsonl_dict;
+                out.deprecated_jsonl_dict = true;
             } else if (std.mem.eql(u8, v, "tsv")) {
                 out.format = .tsv;
             } else if (std.mem.eql(u8, v, "csv")) {
@@ -368,6 +375,13 @@ pub fn main() !u8 {
         },
     };
 
+    if (args.deprecated_jsonl_dict) {
+        try err.writeAll(
+            "zlsx: --format jsonl-dict is deprecated, use --format legacy-jsonl-dict (this alias will be removed in a future release)\n",
+        );
+        try err.flush();
+    }
+
     var book = xlsx.Book.open(alloc, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         return 2;
@@ -492,10 +506,18 @@ test "parseArgs maps jsonl to envelope and legacy-jsonl to bare array" {
         try std.testing.expectEqual(Format.legacy_jsonl_dict, a.format);
     }
     {
-        // Deprecated alias still lands on the bare-dict path.
+        // Deprecated alias still lands on the bare-dict path AND
+        // flips the deprecation flag for main's stderr warning.
         const argv = [_][]const u8{ "f.xlsx", "--format", "jsonl-dict" };
         const a = try parseArgs(&argv);
         try std.testing.expectEqual(Format.legacy_jsonl_dict, a.format);
+        try std.testing.expect(a.deprecated_jsonl_dict);
+    }
+    {
+        // Canonical `legacy-jsonl-dict` must NOT trip the warning.
+        const argv = [_][]const u8{ "f.xlsx", "--format", "legacy-jsonl-dict" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(!a.deprecated_jsonl_dict);
     }
 }
 

@@ -84,7 +84,7 @@ Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-ro
 - **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout, merged-cell ranges via `Book.mergedRanges(sheet)`, external-URL hyperlinks via `Book.hyperlinks(sheet)` (resolved through sheet `_rels`), all data validations via `Book.dataValidations(sheet)` — dropdowns (values entity-decoded), plus `kind` / `op` / `formula1` / `formula2` on numeric, date, time, text-length, and custom variants, rich-text run formatting (bold / italic / color / size / font) via `Book.richRuns(sst_idx)` for entries that used `<r>` wrappers, per-cell style indices via `Rows.styleIndices()` resolving to number-format codes via `Book.numberFormat(style_idx)` (date detection via `Book.isDateFormat(style_idx)`), cell comments via `Book.comments(sheet)` (author + plain-text body, decoded)
 - **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, row heights, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks (per-sheet `_rels`), internal hyperlinks (`location="Sheet2!A1"`), list-type data validations (dropdowns), number / decimal / date / time / text-length / custom data validations, formulas with optional cached value, rich-text cells (per-run bold / italic / color / size / font) via `SheetWriter.writeRichRow`, cell comments (notes) via `SheetWriter.addComment` (emits the full `xl/comments{N}.xml` + `vmlDrawing{N}.vml` + rels stack so Excel renders the yellow indicator), conditional formatting via `SheetWriter.addConditionalFormatCellIs` / `…Expression` (two core cfRule types) referencing differential formats registered via `Writer.addDxf`
 - XML entity decoding (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&#N;`, `&#xN;`) on read and escaping on write
-- CLI (`zlsx file.xlsx --format {jsonl,jsonl-dict,tsv,csv}`), C ABI (`libzlsx.{dylib,so,dll}` + `include/zlsx.h`), Python bindings (`pip install py-zlsx`)
+- CLI (`zlsx file.xlsx --format {jsonl|legacy-jsonl|legacy-jsonl-dict|tsv|csv}`; default `jsonl` is the NDJSON row envelope from iter55a — see "CLI" section below), C ABI (`libzlsx.{dylib,so,dll}` + `include/zlsx.h`), Python bindings (`pip install py-zlsx`)
 
 **Out (by design)**
 - No formula evaluation — the reader returns the cached `<v>` value; the writer accepts formula text + an optional cached result via `writeRowWithFormulas` but never computes the formula itself
@@ -221,14 +221,28 @@ A thin binary `zlsx` ships with this repo. It streams rows of the selected sheet
 
 ```bash
 zig build -Doptimize=ReleaseFast
-./zig-out/bin/zlsx file.xlsx                          # JSONL (default)
+./zig-out/bin/zlsx file.xlsx                          # NDJSON row envelope (default)
+./zig-out/bin/zlsx file.xlsx --format legacy-jsonl    # pre-iter55a bare arrays
+./zig-out/bin/zlsx file.xlsx --format legacy-jsonl-dict  # pre-iter55a bare objects
 ./zig-out/bin/zlsx file.xlsx --format tsv             # TSV with \N for empty
 ./zig-out/bin/zlsx file.xlsx --format csv             # RFC 4180 CSV
-./zig-out/bin/zlsx file.xlsx --format jsonl-dict      # {"A": val, "B": val, …}
 ./zig-out/bin/zlsx file.xlsx --sheet 2                # 0-indexed
 ./zig-out/bin/zlsx file.xlsx --name "Summary"         # by name
 ./zig-out/bin/zlsx file.xlsx --list-sheets            # one name per line
 ```
+
+### NDJSON row envelope (default `--format jsonl`, iter55a)
+
+As of iter55a, the default `jsonl` format emits one uniform envelope per row — `{kind, sheet, sheet_idx, row, cells:[{ref, col, t, v}]}` — so downstream pipelines (`jq`, LLM ingest, `duckdb read_ndjson`) can compose multi-sheet streams without re-parsing A1 refs:
+
+```jsonl
+{"kind":"row","sheet":"Data","sheet_idx":0,"row":1,"cells":[{"ref":"A1","col":1,"t":"str","v":"name"},{"ref":"B1","col":2,"t":"str","v":"qty"}]}
+{"kind":"row","sheet":"Data","sheet_idx":0,"row":2,"cells":[{"ref":"A2","col":1,"t":"str","v":"apple"},{"ref":"B2","col":2,"t":"int","v":3}]}
+```
+
+`t` is `"str"` | `"int"` | `"num"` | `"bool"`; empty cells are skipped from the `cells` array. Future iters will extend this shape to `"date"` / `"formula"` / `"error"` + add the `cells` / `meta` / `comments` sub-commands per [`docs/jq-for-excel.md`](docs/jq-for-excel.md).
+
+Callers that still need the pre-iter55a output shape pass `--format legacy-jsonl` (bare arrays) or `--format legacy-jsonl-dict` (bare objects). The old `--format jsonl-dict` spelling still works as a silent alias this release; the next release will print a stderr deprecation warning.
 
 Emission overhead is within 3% of the tally-only benchmark — the CLI is fast enough that `zlsx big.xlsx | jq` beats any Python-based xlsx reader by 4×+.
 
