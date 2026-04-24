@@ -1228,11 +1228,15 @@ fn runRowsCommand(
             .any_non_empty = true,
         };
 
-        // Skip all-blank rows by default, but preserve them when
-        // --include-blanks is set — the whole point of that flag is
-        // to let consumers see blank cells, including rows whose
-        // in-range portion is entirely empty.
-        if (!view.any_non_empty and !include_blanks) continue;
+        // Skip all-blank rows by default. --include-blanks preserves
+        // them, but ONLY on the envelope path — on --header the blank
+        // row would poison the key set with `col_*` placeholders, and
+        // on flat formats --include-blanks is a documented no-op so a
+        // preserved blank row would leak extra empty lines. The
+        // envelope path is the only shape where blank rows carry
+        // useful `t:"blank"` cell records.
+        const preserve_blank = include_blanks and format == .jsonl and !header;
+        if (!view.any_non_empty and !preserve_blank) continue;
 
         // iter59b-3: the header row lives BEFORE pagination so --skip N
         // counts N *data* records. The header cells are captured here
@@ -2882,6 +2886,41 @@ test "runRowsCommand --header + --range derives keys only from in-range cols" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"z\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"col_A\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"col_D\"") == null);
+}
+
+test "runRowsCommand --include-blanks on csv/header is a no-op for blank rows" {
+    // Tight contract per iter59b-4 P2 follow-up: --include-blanks
+    // preserves all-blank rows ONLY on the envelope (.jsonl) path.
+    // On csv / tsv / legacy-jsonl / legacy-jsonl-dict the flag is a
+    // documented no-op and must NOT inject extra blank output lines.
+    // On --header the flag is also a no-op — a blank row must not
+    // promote to a `col_*`-keyed header.
+    const tmp_path = "/tmp/zlsx_cli_blanks_flat_iter59b4.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        // Row 1: A only; B/C blank. Row 2: C only; A/B blank.
+        try s0.writeRow(&.{ .{ .string = "x" }, .empty, .empty });
+        try s0.writeRow(&.{ .empty, .empty, .{ .string = "y" } });
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    // csv + --range B:B + --include-blanks — range is all-empty
+    // for both rows. Must emit nothing.
+    var scratch: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    const range_b_only: xlsx.MergeRange = .{
+        .top_left = .{ .row = 1, .col = 1 },
+        .bottom_right = .{ .row = 2, .col = 1 },
+    };
+    try runRowsCommand(&w, &book, book.sheets[0], 0, .csv, std.testing.allocator, null, null, null, null, range_b_only, false, true, false);
+    try std.testing.expectEqual(@as(usize, 0), w.buffered().len);
 }
 
 test "runRowsCommand --range + --include-blanks keeps blank-only ranged rows" {
