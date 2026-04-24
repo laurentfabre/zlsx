@@ -1470,7 +1470,14 @@ fn runRowsOnSheet(
     with_styles: bool,
     compact: bool,
 ) !void {
-    runRowsOnSheetCore(out, book, sheet, sheet_idx, format, alloc, pg, start_row, end_row, range, header, include_blanks, with_styles, compact) catch |err| switch (err) {
+    // Track whether the compact-mode sheet prologue has been written
+    // by the Core. On an error catch below we need to know this so
+    // we can emit the prologue FIRST (if not yet written), then the
+    // error record without identity — preserves the
+    // prologue-carries-identity envelope contract even when a sheet
+    // fails before any data record.
+    var prologue_emitted: bool = false;
+    runRowsOnSheetCore(out, book, sheet, sheet_idx, format, alloc, pg, start_row, end_row, range, header, include_blanks, with_styles, compact, &prologue_emitted) catch |err| switch (err) {
         error.MalformedXml => {
             // iter60c-P2: error records participate in --skip / --take
             // pagination so a later sheet failure doesn't violate the
@@ -1478,7 +1485,19 @@ fn runRowsOnSheet(
             switch (pg.consume()) {
                 .drop => return,
                 .stop => return,
-                .emit => try writeErrorRecord(out, sheet.name, sheet_idx, "sheet", "MalformedXml", nonFatalErrorMessage(err)),
+                .emit => {
+                    if (compact and !prologue_emitted) {
+                        try writeCompactSheetPrologue(out, sheet.name, sheet_idx);
+                        prologue_emitted = true;
+                    }
+                    // In compact mode the prologue carries identity —
+                    // drop sheet/sheet_idx from the error record to
+                    // match the data-record envelope contract. In
+                    // ndjson mode keep them (no prologue mechanism).
+                    const err_sheet: ?[]const u8 = if (compact) null else sheet.name;
+                    const err_idx: ?usize = if (compact) null else sheet_idx;
+                    try writeErrorRecord(out, err_sheet, err_idx, "sheet", "MalformedXml", nonFatalErrorMessage(err));
+                },
             }
             return;
         },
@@ -1501,14 +1520,15 @@ fn runRowsOnSheetCore(
     include_blanks: bool,
     with_styles: bool,
     compact: bool,
+    prologue_emitted_out: *bool,
 ) !void {
     // iter60b: compact-ndjson wire shape emits a `{"kind":"sheet",…}`
     // prologue before the first data record of this sheet. Deferred
     // to just-before-emit so paginated-away or all-blank sheets
-    // don't leak a stray prologue with no records behind it. Local
-    // to this call — the per-sheet prologue is independent of the
-    // cross-sheet Pagination counter.
-    var prologue_emitted = false;
+    // don't leak a stray prologue with no records behind it. The
+    // flag lives in the WRAPPER's stack (iter60c-P2 follow-up) so
+    // the catch block can detect an early failure and emit the
+    // prologue before the error record.
     // Scoping is enforced at parse time: parseArgs rejects --header on
     // any format other than .jsonl. Reassert here so any accidental
     // future caller that bypasses parseArgs fails loudly in Debug.
@@ -1656,9 +1676,9 @@ fn runRowsOnSheetCore(
             .stop => return,
             .emit => {},
         }
-        if (compact and !prologue_emitted) {
+        if (compact and !prologue_emitted_out.*) {
             try writeCompactSheetPrologue(out, sheet.name, sheet_idx);
-            prologue_emitted = true;
+            prologue_emitted_out.* = true;
         }
         if (header) {
             try writeRowEnvelopeDict(out, sheet.name, sheet_idx, row_number, header_keys.items, view.cells, compact);
@@ -1777,14 +1797,25 @@ fn runCellsOnSheet(
     with_styles: bool,
     compact: bool,
 ) !void {
-    runCellsOnSheetCore(out, book, sheet, sheet_idx, alloc, pg, start_row, end_row, range, include_blanks, with_styles, compact) catch |err| switch (err) {
+    var prologue_emitted: bool = false;
+    runCellsOnSheetCore(out, book, sheet, sheet_idx, alloc, pg, start_row, end_row, range, include_blanks, with_styles, compact, &prologue_emitted) catch |err| switch (err) {
         error.MalformedXml => {
-            // iter60c-P2: error records participate in --skip / --take
-            // pagination — see the matching note in runRowsOnSheet.
+            // iter60c-P2 follow-up: error records participate in
+            // --skip / --take AND preserve compact-ndjson's
+            // prologue-carries-identity envelope. See the matching
+            // note in runRowsOnSheet.
             switch (pg.consume()) {
                 .drop => return,
                 .stop => return,
-                .emit => try writeErrorRecord(out, sheet.name, sheet_idx, "sheet", "MalformedXml", nonFatalErrorMessage(err)),
+                .emit => {
+                    if (compact and !prologue_emitted) {
+                        try writeCompactSheetPrologue(out, sheet.name, sheet_idx);
+                        prologue_emitted = true;
+                    }
+                    const err_sheet: ?[]const u8 = if (compact) null else sheet.name;
+                    const err_idx: ?usize = if (compact) null else sheet_idx;
+                    try writeErrorRecord(out, err_sheet, err_idx, "sheet", "MalformedXml", nonFatalErrorMessage(err));
+                },
             }
             return;
         },
@@ -1805,11 +1836,11 @@ fn runCellsOnSheetCore(
     include_blanks: bool,
     with_styles: bool,
     compact: bool,
+    prologue_emitted_out: *bool,
 ) !void {
-    // See runRowsOnSheet for rationale — deferred, local-to-this-call,
-    // prologue is never emitted unless at least one cell of this sheet
-    // passes pagination and is about to be written.
-    var prologue_emitted = false;
+    // See runCellsOnSheet for why the flag lives in the wrapper's
+    // stack — the catch block needs to detect an early failure and
+    // emit the prologue itself (iter60c-P2 follow-up).
     var rows = try book.rows(sheet, alloc);
     defer rows.deinit();
 
@@ -1866,9 +1897,9 @@ fn runCellsOnSheetCore(
                 break :blk .{ .book = book, .style_idx = sidx };
             } else null;
 
-            if (compact and !prologue_emitted) {
+            if (compact and !prologue_emitted_out.*) {
                 try writeCompactSheetPrologue(out, sheet.name, sheet_idx);
-                prologue_emitted = true;
+                prologue_emitted_out.* = true;
             }
             try writeCell(
                 out,
