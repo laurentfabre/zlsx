@@ -53,6 +53,11 @@ const Args = struct {
     /// so existing scripts keep working while their authors learn
     /// about the rename.
     deprecated_jsonl_dict: bool = false,
+    /// iter59a: stream-native pagination over the emitted-record
+    /// stream (rows / cells / comments / validations / hyperlinks /
+    /// styles / sst). Both are applied GLOBALLY after sheet selection.
+    skip: ?usize = null,
+    take: ?usize = null,
 };
 
 const ArgError = error{
@@ -62,6 +67,7 @@ const ArgError = error{
     MissingValue,
     BadFormat,
     BadSheetIndex,
+    BadArgValue,
     SheetArgConflict,
 };
 
@@ -76,7 +82,9 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
         const a = argv[i];
         if (std.mem.eql(u8, a, "--sheet") or
             std.mem.eql(u8, a, "--name") or
-            std.mem.eql(u8, a, "--format"))
+            std.mem.eql(u8, a, "--format") or
+            std.mem.eql(u8, a, "--skip") or
+            std.mem.eql(u8, a, "--take"))
         {
             i += 1; // skip paired value (bounds-checked by caller)
             continue;
@@ -166,6 +174,22 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
                 if (workbook_scoped) continue; // ignore unknown format for meta/list-sheets
                 return ArgError.BadFormat;
             }
+        } else if (std.mem.eql(u8, a, "--skip")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            const parsed = std.fmt.parseInt(usize, argv[i], 10) catch {
+                if (workbook_scoped) continue; // ignore bad value for meta/list-sheets/styles/sst
+                return ArgError.BadArgValue;
+            };
+            out.skip = parsed;
+        } else if (std.mem.eql(u8, a, "--take")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            const parsed = std.fmt.parseInt(usize, argv[i], 10) catch {
+                if (workbook_scoped) continue; // ignore bad value for meta/list-sheets/styles/sst
+                return ArgError.BadArgValue;
+            };
+            out.take = parsed;
         } else if (a.len > 0 and a[0] == '-') {
             return ArgError.UnknownFlag;
         } else {
@@ -208,6 +232,13 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\  --list-sheets     print sheet names, one per line, and exit
         \\                    (legacy plain-text flag — still works.
         \\                    The `list-sheets` sub-command emits NDJSON.)
+        \\  --skip N          drop the first N emitted records (iter59a).
+        \\                    Applies globally to the record stream of
+        \\                    rows / cells / comments / validations /
+        \\                    hyperlinks / styles / sst. Ignored by meta
+        \\                    and list-sheets.
+        \\  --take N          stop after N emitted records. Same scope
+        \\                    as --skip; combine for middle-slice paging.
         \\  -h, --help        show this help
         \\
         \\Sub-commands
@@ -544,6 +575,7 @@ pub fn main() !u8 {
         ArgError.MissingValue,
         ArgError.BadFormat,
         ArgError.BadSheetIndex,
+        ArgError.BadArgValue,
         ArgError.SheetArgConflict,
         => {
             try err.print("zlsx: bad arguments ({s})\n\n", .{@errorName(e)});
@@ -603,7 +635,7 @@ pub fn main() !u8 {
                 try err.writeAll("zlsx: sheet not found\n");
                 return 3;
             };
-            try runCommentsCommand(out, &book, filter);
+            try runCommentsCommand(out, &book, filter, args.skip, args.take);
             return 0;
         },
         .validations => {
@@ -611,7 +643,7 @@ pub fn main() !u8 {
                 try err.writeAll("zlsx: sheet not found\n");
                 return 3;
             };
-            try runValidationsCommand(out, &book, filter);
+            try runValidationsCommand(out, &book, filter, args.skip, args.take);
             return 0;
         },
         .hyperlinks => {
@@ -619,15 +651,15 @@ pub fn main() !u8 {
                 try err.writeAll("zlsx: sheet not found\n");
                 return 3;
             };
-            try runHyperlinksCommand(out, &book, filter);
+            try runHyperlinksCommand(out, &book, filter, args.skip, args.take);
             return 0;
         },
         .styles => {
-            try runStylesCommand(out, &book);
+            try runStylesCommand(out, &book, args.skip, args.take);
             return 0;
         },
         .sst => {
-            try runSstCommand(out, &book);
+            try runSstCommand(out, &book, args.skip, args.take);
             return 0;
         },
         .rows, .cells => {},
@@ -657,8 +689,8 @@ pub fn main() !u8 {
     };
 
     switch (args.subcommand) {
-        .rows => try runRowsCommand(out, &book, selected.sheet, selected.idx, args.format, alloc),
-        .cells => try runCellsCommand(out, &book, selected.sheet, selected.idx, alloc),
+        .rows => try runRowsCommand(out, &book, selected.sheet, selected.idx, args.format, alloc, args.skip, args.take),
+        .cells => try runCellsCommand(out, &book, selected.sheet, selected.idx, alloc, args.skip, args.take),
         // Handled by the workbook-scoped early return above.
         .meta,
         .list_sheets,
@@ -672,6 +704,37 @@ pub fn main() !u8 {
     return 0;
 }
 
+/// iter59a: stream-native pagination. `consume()` returns one of
+/// three verdicts per candidate record. The counters apply GLOBALLY
+/// over the emitted-record stream of a single sub-command run, per
+/// the jq-for-excel CLI conventions in docs/jq-for-excel.md.
+const Pagination = struct {
+    skip: ?usize,
+    take: ?usize,
+    skipped: usize = 0,
+    taken: usize = 0,
+
+    const Verdict = enum { drop, emit, stop };
+
+    fn init(skip: ?usize, take: ?usize) Pagination {
+        return .{ .skip = skip, .take = take };
+    }
+
+    /// Call once per candidate record before emitting. `.drop` means
+    /// advance past this record; `.emit` means emit then mark taken;
+    /// `.stop` means --take already satisfied — return early without
+    /// emitting anything further.
+    fn consume(self: *Pagination) Verdict {
+        if (self.take) |t| if (self.taken >= t) return .stop;
+        if (self.skip) |s| if (self.skipped < s) {
+            self.skipped += 1;
+            return .drop;
+        };
+        self.taken += 1;
+        return .emit;
+    }
+};
+
 fn runRowsCommand(
     out: *std.Io.Writer,
     book: *xlsx.Book,
@@ -679,11 +742,19 @@ fn runRowsCommand(
     sheet_idx: usize,
     format: Format,
     alloc: std.mem.Allocator,
+    skip: ?usize,
+    take: ?usize,
 ) !void {
     var rows = try book.rows(sheet, alloc);
     defer rows.deinit();
 
+    var pg = Pagination.init(skip, take);
     while (try rows.next()) |cells| {
+        switch (pg.consume()) {
+            .drop => continue,
+            .stop => return,
+            .emit => {},
+        }
         switch (format) {
             .jsonl => try writeRowEnvelope(out, sheet.name, sheet_idx, rows.currentRowNumber(), cells),
             else => try writeRow(out, cells, format),
@@ -701,14 +772,23 @@ fn runCellsCommand(
     sheet: xlsx.Sheet,
     sheet_idx: usize,
     alloc: std.mem.Allocator,
+    skip: ?usize,
+    take: ?usize,
 ) !void {
     var rows = try book.rows(sheet, alloc);
     defer rows.deinit();
 
+    var pg = Pagination.init(skip, take);
     while (try rows.next()) |cells| {
         const row_number = rows.currentRowNumber();
         for (cells, 0..) |c, i| {
             if (c == .empty) continue;
+
+            switch (pg.consume()) {
+                .drop => continue,
+                .stop => return,
+                .emit => {},
+            }
 
             var col_buf: [8]u8 = undefined;
             const letters = colLetter(&col_buf, i);
@@ -905,10 +985,22 @@ fn rangeFromBounds(buf: *[32]u8, top_left: xlsx.CellRef, bottom_right: xlsx.Cell
 
 /// Emit one NDJSON record per comment. When `filter` is set, only
 /// the matching sheet contributes; otherwise every sheet iterates.
-fn runCommentsCommand(out: *std.Io.Writer, book: *const xlsx.Book, filter: ?usize) !void {
+fn runCommentsCommand(
+    out: *std.Io.Writer,
+    book: *const xlsx.Book,
+    filter: ?usize,
+    skip: ?usize,
+    take: ?usize,
+) !void {
+    var pg = Pagination.init(skip, take);
     for (book.sheets, 0..) |s, sheet_idx| {
         if (filter) |f| if (sheet_idx != f) continue;
         for (book.comments(s)) |c| {
+            switch (pg.consume()) {
+                .drop => continue,
+                .stop => return,
+                .emit => {},
+            }
             var ref_buf: [16]u8 = undefined;
             const ref = refFromCellRef(&ref_buf, c.top_left);
 
@@ -934,10 +1026,22 @@ fn runCommentsCommand(out: *std.Io.Writer, book: *const xlsx.Book, filter: ?usiz
 
 /// Emit one NDJSON record per data-validation range. When `filter`
 /// is set, only the matching sheet contributes.
-fn runValidationsCommand(out: *std.Io.Writer, book: *const xlsx.Book, filter: ?usize) !void {
+fn runValidationsCommand(
+    out: *std.Io.Writer,
+    book: *const xlsx.Book,
+    filter: ?usize,
+    skip: ?usize,
+    take: ?usize,
+) !void {
+    var pg = Pagination.init(skip, take);
     for (book.sheets, 0..) |s, sheet_idx| {
         if (filter) |f| if (sheet_idx != f) continue;
         for (book.dataValidations(s)) |dv| {
+            switch (pg.consume()) {
+                .drop => continue,
+                .stop => return,
+                .emit => {},
+            }
             var range_buf: [32]u8 = undefined;
             const range = rangeFromBounds(&range_buf, dv.top_left, dv.bottom_right);
 
@@ -971,10 +1075,22 @@ fn runValidationsCommand(out: *std.Io.Writer, book: *const xlsx.Book, filter: ?u
 
 /// Emit one NDJSON record per hyperlink. When `filter` is set, only
 /// the matching sheet contributes.
-fn runHyperlinksCommand(out: *std.Io.Writer, book: *const xlsx.Book, filter: ?usize) !void {
+fn runHyperlinksCommand(
+    out: *std.Io.Writer,
+    book: *const xlsx.Book,
+    filter: ?usize,
+    skip: ?usize,
+    take: ?usize,
+) !void {
+    var pg = Pagination.init(skip, take);
     for (book.sheets, 0..) |s, sheet_idx| {
         if (filter) |f| if (sheet_idx != f) continue;
         for (book.hyperlinks(s)) |h| {
+            switch (pg.consume()) {
+                .drop => continue,
+                .stop => return,
+                .emit => {},
+            }
             var range_buf: [32]u8 = undefined;
             const range = rangeFromBounds(&range_buf, h.top_left, h.bottom_right);
 
@@ -1007,8 +1123,19 @@ fn writeBorderSideOrNull(w: *std.Io.Writer, side: xlsx.BorderSide) !void {
 /// Emit one NDJSON record per cell-XF style entry. Workbook-scoped.
 /// Every nested block (`font` / `fill` / `border`) is either the
 /// resolved struct or JSON `null` when the getter returns null.
-fn runStylesCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
+fn runStylesCommand(
+    out: *std.Io.Writer,
+    book: *const xlsx.Book,
+    skip: ?usize,
+    take: ?usize,
+) !void {
+    var pg = Pagination.init(skip, take);
     for (book.cell_xf_numfmt_ids, 0..) |_, i| {
+        switch (pg.consume()) {
+            .drop => continue,
+            .stop => return,
+            .emit => {},
+        }
         const idx: u32 = @intCast(i);
 
         try out.print("{{\"kind\":\"style\",\"idx\":{d},\"font\":", .{idx});
@@ -1086,8 +1213,19 @@ fn runStylesCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
 }
 
 /// Emit one NDJSON record per shared-string entry.
-fn runSstCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
+fn runSstCommand(
+    out: *std.Io.Writer,
+    book: *const xlsx.Book,
+    skip: ?usize,
+    take: ?usize,
+) !void {
+    var pg = Pagination.init(skip, take);
     for (book.shared_strings, 0..) |s, i| {
+        switch (pg.consume()) {
+            .drop => continue,
+            .stop => return,
+            .emit => {},
+        }
         try out.print("{{\"kind\":\"sst\",\"idx\":{d},\"text\":", .{i});
         try writeJsonString(out, s);
         try out.writeAll(",\"runs\":");
@@ -1451,6 +1589,120 @@ test "parseArgs tolerates bogus --sheet / --format values on workbook-scoped sub
     }
 }
 
+test "parseArgs --skip / --take round-trip and tolerance" {
+    // Both flags parse as usize and live on Args.
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--skip", "5", "--take", "10" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(@as(?usize, 5), a.skip);
+        try std.testing.expectEqual(@as(?usize, 10), a.take);
+    }
+    // Bogus --skip / --take are hard errors on record-scoped commands.
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--skip", "bogus" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "cells", "f.xlsx", "--take", "nope" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // Workbook-scoped commands silently drop bogus pagination values,
+    // matching the --sheet / --format tolerance contract so wrappers
+    // that append pagination universally don't hit exit-1.
+    inline for (.{ "meta", "list-sheets", "styles", "sst" }) |cmd| {
+        {
+            const argv = [_][]const u8{ cmd, "f.xlsx", "--skip", "bogus" };
+            const a = try parseArgs(&argv);
+            try std.testing.expect(a.skip == null);
+        }
+        {
+            const argv = [_][]const u8{ cmd, "f.xlsx", "--take", "nope" };
+            const a = try parseArgs(&argv);
+            try std.testing.expect(a.take == null);
+        }
+    }
+    // --skip and --take default to null when absent — legacy callers
+    // must see identical behavior to pre-iter59a.
+    {
+        const argv = [_][]const u8{ "cells", "f.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(a.skip == null);
+        try std.testing.expect(a.take == null);
+    }
+}
+
+test "runCellsCommand --skip / --take slice the emitted cell stream" {
+    const tmp_path = "/tmp/zlsx_cli_pagination_iter59a.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        // 5 rows × 1 cell each → 5 candidate cells in emit order.
+        try s0.writeRow(&.{.{ .string = "c1" }});
+        try s0.writeRow(&.{.{ .string = "c2" }});
+        try s0.writeRow(&.{.{ .string = "c3" }});
+        try s0.writeRow(&.{.{ .string = "c4" }});
+        try s0.writeRow(&.{.{ .string = "c5" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    const countLines = struct {
+        fn f(s: []const u8) usize {
+            var n: usize = 0;
+            for (s) |c| if (c == '\n') {
+                n += 1;
+            };
+            return n;
+        }
+    }.f;
+
+    // Baseline — no pagination.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null);
+        try std.testing.expectEqual(@as(usize, 5), countLines(w.buffered()));
+    }
+    // --skip 2 drops the first two cells (c1, c2).
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 2, null);
+        const out = w.buffered();
+        try std.testing.expectEqual(@as(usize, 3), countLines(out));
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c1\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c2\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c3\"") != null);
+    }
+    // --take 3 keeps exactly the first three.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, 3);
+        const out = w.buffered();
+        try std.testing.expectEqual(@as(usize, 3), countLines(out));
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c3\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c4\"") == null);
+    }
+    // --skip 1 --take 2 yields the exact middle slice: c2, c3.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 1, 2);
+        const out = w.buffered();
+        try std.testing.expectEqual(@as(usize, 2), countLines(out));
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c1\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c2\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c3\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c4\"") == null);
+    }
+}
+
 test "runMetaCommand emits path:null on non-UTF-8 workbook path" {
     var scratch: [512]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
@@ -1663,7 +1915,7 @@ test "runCommentsCommand emits one record per comment across every sheet" {
 
     var scratch: [2048]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runCommentsCommand(&w, &book, null);
+    try runCommentsCommand(&w, &book, null, null, null);
 
     const out = w.buffered();
     try std.testing.expect(std.mem.startsWith(u8, out, "{\"kind\":\"comment\""));
@@ -1702,7 +1954,7 @@ test "runValidationsCommand emits list validation with values array" {
 
     var scratch: [2048]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runValidationsCommand(&w, &book, null);
+    try runValidationsCommand(&w, &book, null, null, null);
 
     const out = w.buffered();
     try std.testing.expect(std.mem.startsWith(u8, out, "{\"kind\":\"validation\""));
@@ -1732,7 +1984,7 @@ test "runHyperlinksCommand emits url set + location null for external links" {
 
     var scratch: [2048]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runHyperlinksCommand(&w, &book, null);
+    try runHyperlinksCommand(&w, &book, null, null, null);
 
     const out = w.buffered();
     try std.testing.expect(std.mem.startsWith(u8, out, "{\"kind\":\"hyperlink\""));
@@ -1760,7 +2012,7 @@ test "runStylesCommand emits one record per cell-XF entry" {
 
     var scratch: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runStylesCommand(&w, &book);
+    try runStylesCommand(&w, &book, null, null);
 
     const out = w.buffered();
     try std.testing.expect(std.mem.startsWith(u8, out, "{\"kind\":\"style\""));
@@ -1794,7 +2046,7 @@ test "runSstCommand emits one record per shared-string entry" {
 
     var scratch: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runSstCommand(&w, &book);
+    try runSstCommand(&w, &book, null, null);
 
     const out = w.buffered();
     try std.testing.expect(std.mem.startsWith(u8, out, "{\"kind\":\"sst\""));
