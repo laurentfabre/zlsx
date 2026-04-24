@@ -617,6 +617,7 @@ fn writeEnvelopeCells(
     row_number: u32,
     include_blanks: bool,
     style_ctx: ?EnvelopeStyleCtx,
+    col_offset: u32,
 ) !void {
     try w.writeByte('[');
     var first = true;
@@ -625,17 +626,18 @@ fn writeEnvelopeCells(
         if (!first) try w.writeByte(',');
         first = false;
 
+        const absolute_col: u32 = col_offset + @as(u32, @intCast(i));
         var col_buf: [8]u8 = undefined;
-        const letters = colLetter(&col_buf, i);
+        const letters = colLetter(&col_buf, absolute_col);
         var ref_buf: [16]u8 = undefined;
         const ref = std.fmt.bufPrint(&ref_buf, "{s}{d}", .{ letters, row_number }) catch unreachable;
 
         try w.writeAll("{\"ref\":");
         try writeJsonString(w, ref);
         switch (c) {
-            .empty => try w.print(",\"col\":{d},\"t\":\"blank\",\"v\":null", .{i + 1}),
+            .empty => try w.print(",\"col\":{d},\"t\":\"blank\",\"v\":null", .{absolute_col + 1}),
             else => {
-                try w.print(",\"col\":{d},\"t\":\"{s}\",\"v\":", .{ i + 1, envelopeTypeTag(c) });
+                try w.print(",\"col\":{d},\"t\":\"{s}\",\"v\":", .{ absolute_col + 1, envelopeTypeTag(c) });
                 try writeJsonCell(w, c);
             },
         }
@@ -679,11 +681,12 @@ fn writeRowEnvelope(
     cells: []const xlsx.Cell,
     include_blanks: bool,
     style_ctx: ?EnvelopeStyleCtx,
+    col_offset: u32,
 ) !void {
     try w.writeAll("{\"kind\":\"row\",\"sheet\":");
     try writeJsonString(w, sheet_name);
     try w.print(",\"sheet_idx\":{d},\"row\":{d},\"cells\":", .{ sheet_idx, row_number });
-    try writeEnvelopeCells(w, cells, row_number, include_blanks, style_ctx);
+    try writeEnvelopeCells(w, cells, row_number, include_blanks, style_ctx, col_offset);
     try w.writeAll("}\n");
 }
 
@@ -1184,72 +1187,40 @@ fn runRowsCommand(
             any_non_empty: bool,
         };
         const raw_styles = rows.styleIndices();
-        // Mask vs slice: the envelope's positional cells[i]==col-i
-        // contract needs the mask (full-width with .empty for out-of-
-        // range). The dict/flat paths emit by key or by compact
-        // position, so they use the narrower slice. --header toggles
-        // the envelope path from positional to dict, so it joins the
-        // slice group regardless of format.
-        const is_envelope_positional = format == .jsonl and !header;
+        // Unified slice view for --range: span exactly [tl.col..br.col]
+        // with padded empties on sparse rows. writeRowEnvelope now
+        // takes col_offset and each cell record carries absolute col
+        // explicitly, so the envelope doesn't need positional
+        // cells[i]==col-i alignment anymore. style_indices slices in
+        // parallel so --with-styles still reaches the right per-cell
+        // metadata.
         const view: EmitView = if (range) |r| blk: {
-            if (is_envelope_positional) {
-                var any = false;
-                masked.clearRetainingCapacity();
-                masked_styles.clearRetainingCapacity();
-                try masked.ensureTotalCapacity(alloc, cells.len);
-                try masked_styles.ensureTotalCapacity(alloc, cells.len);
-                for (cells, 0..) |c, i| {
-                    const col: u32 = @intCast(i);
-                    const in_col = col >= r.top_left.col and col <= r.bottom_right.col;
-                    if (in_col) {
-                        masked.appendAssumeCapacity(c);
-                        masked_styles.appendAssumeCapacity(
-                            if (i < raw_styles.len) raw_styles[i] else null,
-                        );
-                        if (c != .empty) any = true;
-                    } else {
-                        masked.appendAssumeCapacity(.empty);
-                        masked_styles.appendAssumeCapacity(null);
-                    }
+            const range_width: usize = @as(usize, r.bottom_right.col) - r.top_left.col + 1;
+            masked.clearRetainingCapacity();
+            masked_styles.clearRetainingCapacity();
+            try masked.ensureTotalCapacity(alloc, range_width);
+            try masked_styles.ensureTotalCapacity(alloc, range_width);
+            var any = false;
+            var col: u32 = r.top_left.col;
+            while (col <= r.bottom_right.col) : (col += 1) {
+                const src_idx: usize = col;
+                if (src_idx < cells.len) {
+                    masked.appendAssumeCapacity(cells[src_idx]);
+                    masked_styles.appendAssumeCapacity(
+                        if (src_idx < raw_styles.len) raw_styles[src_idx] else null,
+                    );
+                    if (cells[src_idx] != .empty) any = true;
+                } else {
+                    masked.appendAssumeCapacity(.empty);
+                    masked_styles.appendAssumeCapacity(null);
                 }
-                break :blk .{
-                    .cells = masked.items,
-                    .style_indices = masked_styles.items,
-                    .col_offset = 0,
-                    .any_non_empty = any,
-                };
-            } else {
-                // Build a fixed-width view spanning exactly the
-                // requested [tl.col..br.col] columns. Cells the row
-                // actually materialized land in their slot; cells
-                // beyond `cells.len` (sparse rows) + trailing columns
-                // past the row's materialized width pad with .empty.
-                // This keeps the output column count constant at
-                // `range_width` records/row, which csv/tsv consumers
-                // rely on for tabular parsing.
-                const range_width: usize = @as(usize, r.bottom_right.col) - r.top_left.col + 1;
-                masked.clearRetainingCapacity();
-                try masked.ensureTotalCapacity(alloc, range_width);
-                var any = false;
-                var col: u32 = r.top_left.col;
-                while (col <= r.bottom_right.col) : (col += 1) {
-                    const src_idx: usize = col;
-                    if (src_idx < cells.len) {
-                        masked.appendAssumeCapacity(cells[src_idx]);
-                        if (cells[src_idx] != .empty) any = true;
-                    } else {
-                        masked.appendAssumeCapacity(.empty);
-                    }
-                }
-                // Non-envelope-positional paths (flat formats + --header
-                // dict) don't consume style_indices — leave empty.
-                break :blk .{
-                    .cells = masked.items,
-                    .style_indices = &.{},
-                    .col_offset = r.top_left.col,
-                    .any_non_empty = any,
-                };
             }
+            break :blk .{
+                .cells = masked.items,
+                .style_indices = masked_styles.items,
+                .col_offset = r.top_left.col,
+                .any_non_empty = any,
+            };
         } else .{
             .cells = cells,
             .style_indices = raw_styles,
@@ -1257,7 +1228,11 @@ fn runRowsCommand(
             .any_non_empty = true,
         };
 
-        if (!view.any_non_empty) continue;
+        // Skip all-blank rows by default, but preserve them when
+        // --include-blanks is set — the whole point of that flag is
+        // to let consumers see blank cells, including rows whose
+        // in-range portion is entirely empty.
+        if (!view.any_non_empty and !include_blanks) continue;
 
         // iter59b-3: the header row lives BEFORE pagination so --skip N
         // counts N *data* records. The header cells are captured here
@@ -1281,7 +1256,7 @@ fn runRowsCommand(
                     .{ .book = book, .style_indices = view.style_indices }
                 else
                     null;
-                try writeRowEnvelope(out, sheet.name, sheet_idx, row_number, view.cells, include_blanks, style_ctx);
+                try writeRowEnvelope(out, sheet.name, sheet_idx, row_number, view.cells, include_blanks, style_ctx, view.col_offset);
             },
             // iter59b-4: flat formats are shape-neutral w.r.t. both
             // --include-blanks (they serialise empties per their own
@@ -1794,9 +1769,13 @@ fn writeTerseStyleBlock(
             return s.style.len == 0 and s.color_argb == null;
         }
     }.f;
+    // Terse block emits only l/r/t/b — diagonal is intentionally
+    // omitted per the design doc. Exclude diagonal from the
+    // effectiveness check so a diagonal-only cell doesn't produce
+    // an empty `"border":{}` block.
     const border_effective: bool = if (border) |b|
         !(side_empty(b.left) and side_empty(b.right) and
-            side_empty(b.top) and side_empty(b.bottom) and side_empty(b.diagonal))
+            side_empty(b.top) and side_empty(b.bottom))
     else
         false;
 
@@ -2107,7 +2086,7 @@ test "writeRowEnvelope emits kind + sheet + sheet_idx + row + sparse cells" {
         .{ .number = 3.5 },
         .{ .boolean = true },
     };
-    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null);
+    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null, 0);
     const expected =
         "{\"kind\":\"row\",\"sheet\":\"Data\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
         "{\"ref\":\"A1\",\"col\":1,\"t\":\"str\",\"v\":\"name\"}," ++
@@ -2122,7 +2101,7 @@ test "writeRowEnvelope all-empty row emits envelope with empty cells array" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
     const cells = [_]xlsx.Cell{ .empty, .empty, .empty };
-    try writeRowEnvelope(&w, "S", 2, 7, &cells, false, null);
+    try writeRowEnvelope(&w, "S", 2, 7, &cells, false, null, 0);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"row\",\"sheet\":\"S\",\"sheet_idx\":2,\"row\":7,\"cells\":[]}\n",
         w.buffered(),
@@ -2133,7 +2112,7 @@ test "writeRowEnvelope escapes sheet name" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
     const cells = [_]xlsx.Cell{.{ .integer = 1 }};
-    try writeRowEnvelope(&w, "She\"et\n", 0, 1, &cells, false, null);
+    try writeRowEnvelope(&w, "She\"et\n", 0, 1, &cells, false, null, 0);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"row\",\"sheet\":\"She\\\"et\\n\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
             "{\"ref\":\"A1\",\"col\":1,\"t\":\"int\",\"v\":1}" ++
@@ -2146,7 +2125,7 @@ test "writeRowEnvelope non-finite number becomes null v" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
     const cells = [_]xlsx.Cell{.{ .number = std.math.nan(f64) }};
-    try writeRowEnvelope(&w, "S", 0, 1, &cells, false, null);
+    try writeRowEnvelope(&w, "S", 0, 1, &cells, false, null, 0);
     // `t` stays `"num"` for the non-finite case — the type of the
     // cell didn't change, only its JSON-serializable value did.
     // This matches the pre-iter55a behaviour of writeJsonCell.
@@ -2903,6 +2882,82 @@ test "runRowsCommand --header + --range derives keys only from in-range cols" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"z\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"col_A\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"col_D\"") == null);
+}
+
+test "runRowsCommand --range + --include-blanks keeps blank-only ranged rows" {
+    // A row with data only in A/D (both outside the B:C range) and
+    // --include-blanks must still emit with two t:"blank" cells —
+    // the whole point of --include-blanks is to surface empties.
+    const tmp_path = "/tmp/zlsx_cli_range_blank_iter59b4.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        // Row 1: "x" in A, "y" in D. Nothing in B/C.
+        try s0.writeRow(&.{ .{ .string = "x" }, .empty, .empty, .{ .string = "y" } });
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+
+    // B:C → cols 1..2 (0-based).
+    const range: xlsx.MergeRange = .{
+        .top_left = .{ .row = 1, .col = 1 },
+        .bottom_right = .{ .row = 1, .col = 2 },
+    };
+    try runRowsCommand(&w, &book, book.sheets[0], 0, .jsonl, std.testing.allocator, null, null, null, null, range, false, true, false);
+    const out = w.buffered();
+
+    // The row must appear with two t:"blank" cells.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"kind\":\"row\"") != null);
+    // Count t:"blank" occurrences — should be 2 (B and C).
+    var count: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, out, i, "\"t\":\"blank\"")) |pos| : (i = pos + 1) count += 1;
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "writeTerseStyleBlock doesn't leak empty border for diagonal-only sides" {
+    // Codex P2: a cell whose border has ONLY the diagonal side set
+    // must not serialize `"border":{}` — the terse emitter omits
+    // diagonal entirely, so emitting an empty border object would
+    // be a shape leak. A style block may still appear because the
+    // Zig writer attaches a default font to every styled cell
+    // (which may have a color), but the "border" key must never
+    // appear with an empty object.
+    const tmp_path = "/tmp/zlsx_cli_diag_only_iter59b4.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        const diag_style = try w.addStyle(.{
+            .border_diagonal = .{ .style = .thin, .color_argb = 0xFF000000 },
+        });
+        var s0 = try w.addSheet("Data");
+        try s0.writeRowStyled(&.{.{ .string = "x" }}, &.{diag_style});
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, null, null, null, false, true);
+    const out = w.buffered();
+
+    // Cell must appear.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"x\"") != null);
+    // `"border"` must not appear AT ALL — no `"border":{…}` for the
+    // diagonal-only case because the terse block excludes diagonal.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"border\"") == null);
 }
 
 test "parseArgs --include-blanks scoping" {
