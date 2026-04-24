@@ -327,20 +327,21 @@ zlsx sst data.xlsx | jq -r '.text' | rg '@\S+\.\S+'
 
 ### Pipeline safety
 
-`zlsx cells huge.xlsx | head -10` exits 0 cleanly (no broken-pipe stderr noise). `SIGINT` → exit 130, `SIGTERM` → exit 143, both flushing in-flight records. Non-fatal parse errors (corrupt sheet in an otherwise-valid workbook) surface as inline `{"kind":"error",…}` records instead of aborting the pipeline — filter with `jq 'select(.kind!="error")'` if you want the data-only stream.
+`zlsx cells huge.xlsx | head -10` exits 0 cleanly (no broken-pipe stderr noise). `SIGINT` → exit 130, `SIGTERM` → exit 143, both flushing in-flight records. Non-fatal `MalformedXml` surfacing during row iteration (post-open) emits an inline `{"kind":"error",…}` record and continues emitting neighbour sheets instead of aborting the pipeline — filter with `jq 'select(.kind!="error")'` for the data-only stream. Note: workbooks that fail at `Book.open` (invalid zip / missing workbook / malformed non-sheet parts) still exit 2 with a stderr diagnostic, since there is no stream to inject error records into yet.
 
 ### Exit codes
 
 | Code | Meaning |
 |---|---|
-| 0 | Success (inline `error` records may still have been emitted) |
+| 0 | Success (inline `error` records may still have been emitted for recoverable sheet-level MalformedXml) |
 | 1 | Bad CLI arguments |
-| 2 | Could not open file / not a valid xlsx archive |
+| 2 | Could not open file / not a valid xlsx archive / malformed parts at open time |
 | 3 | Sheet not found (by name / index / glob) |
-| 4 | Decompression limit exceeded (`ZipBombSuspected`, reserved) |
 | 5 | OS error (permission denied, disk full on stdout, etc.) |
 | 130 | SIGINT |
 | 143 | SIGTERM |
+
+Exit code `4` (`ZipBombSuspected`) is reserved for when the reader enforces decompression limits — not currently emitted; scripts should not branch on it yet.
 
 Emission overhead is within 3% of the tally-only benchmark — `zlsx big.xlsx | jq` beats any Python-based xlsx reader by 4×+.
 
