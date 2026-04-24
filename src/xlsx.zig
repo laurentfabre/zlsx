@@ -551,12 +551,28 @@ pub const Book = struct {
     /// decompressed (xlsx files we target are small — ~300 KB — and
     /// streaming through std.zip is awkward).
     ///
-    /// Two-line facade over the slice-A implementation: `openLazy`
-    /// already performs the full eager load today. Slice B will
-    /// separate the two so callers who only need `sheets`/`SST`/styles
-    /// can skip the sheet-XML extraction.
+    /// Facade over `openLazy` that releases the source file handle
+    /// before returning, so callers retain today's behavior of being
+    /// able to rename / overwrite / delete the source xlsx while the
+    /// Book is in use (matters on Windows file locks; harmless
+    /// elsewhere). Slice B will split `loadEagerParts` out of
+    /// `openLazy` so only the `open` facade pays for it.
     pub fn open(allocator: Allocator, path: []const u8) !Book {
-        return try Book.openLazy(allocator, path);
+        var book = try Book.openLazy(allocator, path);
+        errdefer book.deinit();
+        book.closeArchive();
+        return book;
+    }
+
+    /// Close the backing archive early. Slice A's `open` facade calls
+    /// this after eager loading so the source file doesn't stay locked
+    /// for the Book's lifetime. Slice B's streaming path keeps the
+    /// archive alive by not calling this.
+    fn closeArchive(self: *Book) void {
+        if (self.archive) |arch| {
+            arch.deinit(self.allocator);
+            self.archive = null;
+        }
     }
 
     /// Open the archive, walk the central directory once, and populate
@@ -677,7 +693,12 @@ pub const Book = struct {
     /// assumes. Split from `openLazy` so slice B can skip this step
     /// on the streaming path. Slice A still calls it inline from
     /// `openLazy` — net behaviour is unchanged.
-    pub fn loadEagerParts(self: *Book) !void {
+    ///
+    /// Intentionally private: the function is not idempotent (it
+    /// would leak the previously parsed theme/styles/per-sheet
+    /// hashmaps on a second call), and there is no valid caller
+    /// other than `openLazy` itself.
+    fn loadEagerParts(self: *Book) !void {
         // Theme colors MUST parse before styles.xml so the style
         // parsers can resolve `<color theme="N"/>` references via
         // `book.theme_colors`.
