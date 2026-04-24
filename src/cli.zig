@@ -52,12 +52,45 @@ const ArgError = error{
     SheetArgConflict,
 };
 
+/// First-pass scan: identify the sub-command without validating
+/// flag values. Lets the main pass relax --sheet / --name / --format
+/// validation for workbook-scoped sub-commands that wrappers may
+/// append those flags to universally. Skips `--sheet` / `--name` /
+/// `--format` pairs so their values aren't mistaken for positionals.
+fn detectSubcommand(argv: []const []const u8) Subcommand {
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const a = argv[i];
+        if (std.mem.eql(u8, a, "--sheet") or
+            std.mem.eql(u8, a, "--name") or
+            std.mem.eql(u8, a, "--format"))
+        {
+            i += 1; // skip paired value (bounds-checked by caller)
+            continue;
+        }
+        if (a.len > 0 and a[0] == '-') continue; // flag with no value
+        if (std.mem.eql(u8, a, "cells")) return .cells;
+        if (std.mem.eql(u8, a, "rows")) return .rows;
+        if (std.mem.eql(u8, a, "meta")) return .meta;
+        if (std.mem.eql(u8, a, "list-sheets")) return .list_sheets;
+        return .rows; // first positional is the file path
+    }
+    return .rows;
+}
+
 fn parseArgs(argv: []const []const u8) ArgError!Args {
-    var out: Args = .{ .file = "" };
-    // First positional may be a sub-command token. We only consume it
-    // as a sub-command when it matches exactly; anything else (including
-    // a filename that happens to be our first positional) falls through
-    // to the file-path slot and defaults the sub-command to `rows`.
+    const detected_sub = detectSubcommand(argv);
+    // Workbook-scoped commands don't consume --sheet / --name /
+    // --format, so wrappers that always append those flags should
+    // not hit a hard error. Parse them tolerantly: missing-value is
+    // still an error (user typo), but a malformed value is silently
+    // dropped. Non-workbook commands keep strict validation.
+    const workbook_scoped = switch (detected_sub) {
+        .meta, .list_sheets => true,
+        .rows, .cells => false,
+    };
+
+    var out: Args = .{ .file = "", .subcommand = detected_sub };
     var first_positional_seen = false;
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -67,12 +100,16 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
         } else if (std.mem.eql(u8, a, "--list-sheets")) {
             out.list_sheets = true;
         } else if (std.mem.eql(u8, a, "--sheet")) {
-            if (out.sheet_name != null) return ArgError.SheetArgConflict;
+            if (out.sheet_name != null and !workbook_scoped) return ArgError.SheetArgConflict;
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
-            out.sheet_index = std.fmt.parseInt(usize, argv[i], 10) catch return ArgError.BadSheetIndex;
+            const parsed = std.fmt.parseInt(usize, argv[i], 10) catch {
+                if (workbook_scoped) continue; // ignore bad value for meta/list-sheets
+                return ArgError.BadSheetIndex;
+            };
+            out.sheet_index = parsed;
         } else if (std.mem.eql(u8, a, "--name")) {
-            if (out.sheet_index != null) return ArgError.SheetArgConflict;
+            if (out.sheet_index != null and !workbook_scoped) return ArgError.SheetArgConflict;
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
             out.sheet_name = argv[i];
@@ -97,27 +134,24 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
                 out.format = .tsv;
             } else if (std.mem.eql(u8, v, "csv")) {
                 out.format = .csv;
-            } else return ArgError.BadFormat;
+            } else {
+                if (workbook_scoped) continue; // ignore unknown format for meta/list-sheets
+                return ArgError.BadFormat;
+            }
         } else if (a.len > 0 and a[0] == '-') {
             return ArgError.UnknownFlag;
         } else {
             if (!first_positional_seen) {
                 first_positional_seen = true;
-                if (std.mem.eql(u8, a, "cells")) {
-                    out.subcommand = .cells;
-                    continue;
-                } else if (std.mem.eql(u8, a, "rows")) {
-                    out.subcommand = .rows;
-                    continue;
-                } else if (std.mem.eql(u8, a, "meta")) {
-                    out.subcommand = .meta;
-                    continue;
-                } else if (std.mem.eql(u8, a, "list-sheets")) {
-                    out.subcommand = .list_sheets;
+                // Sub-command token already handled by detectSubcommand.
+                // Skip it here so it isn't mistaken for the file path.
+                if (std.mem.eql(u8, a, "cells") or
+                    std.mem.eql(u8, a, "rows") or
+                    std.mem.eql(u8, a, "meta") or
+                    std.mem.eql(u8, a, "list-sheets"))
+                {
                     continue;
                 }
-                // Fall through: first positional is the file path,
-                // sub-command stays at its default (`rows`).
             }
             if (out.file.len == 0) out.file = a else return ArgError.UnknownFlag;
         }
@@ -486,7 +520,20 @@ pub fn main() !u8 {
     // iter57 sub-commands — workbook-scoped, no per-sheet selection.
     switch (args.subcommand) {
         .meta => {
-            try runMetaCommand(out, &book, args.file);
+            // Unix argv is raw bytes; only emit `path` as JSON when
+            // valid UTF-8 so the NDJSON line stays parseable. Invalid
+            // bytes → JSON null + stderr warning.
+            const path_opt: ?[]const u8 = if (std.unicode.utf8ValidateSlice(args.file))
+                args.file
+            else blk: {
+                try err.print(
+                    "zlsx: workbook path contains non-UTF-8 bytes; emitting \"path\":null in meta output\n",
+                    .{},
+                );
+                try err.flush();
+                break :blk null;
+            };
+            try runMetaCommand(out, &book, path_opt);
             return 0;
         },
         .list_sheets => {
@@ -592,7 +639,7 @@ fn runCellsCommand(
 fn runMetaCommand(
     out: *std.Io.Writer,
     book: *const xlsx.Book,
-    path: []const u8,
+    path: ?[]const u8,
 ) !void {
     // Workbook-level `has_comments` is the OR across every sheet —
     // saves callers a reduce step when they only want "does this file
@@ -605,8 +652,11 @@ fn runMetaCommand(
         }
     }
 
+    // `path` is null when the caller detected non-UTF-8 bytes in the
+    // original argv — emit JSON `null` so the NDJSON line stays
+    // parseable. main() has already logged the reason to stderr.
     try out.writeAll("{\"kind\":\"workbook\",\"path\":");
-    try writeJsonString(out, path);
+    if (path) |p| try writeJsonString(out, p) else try out.writeAll("null");
     try out.print(
         ",\"sheets\":{d},\"sst\":{{\"count\":{d},\"rich\":{d}}}",
         .{ book.sheets.len, book.shared_strings.len, book.rich_runs_by_sst_idx.count() },
@@ -969,6 +1019,54 @@ test "parseArgs routes 'meta' and 'list-sheets' correctly" {
         try std.testing.expect(a.list_sheets);
         try std.testing.expectEqual(Subcommand.rows, a.subcommand);
     }
+}
+
+test "parseArgs tolerates bogus --sheet / --format values on workbook-scoped sub-commands" {
+    // Wrappers that append --sheet/--format universally must still
+    // reach `meta` / `list-sheets` without an exit-1. Values are
+    // silently dropped on those sub-commands, not validated.
+    {
+        const argv = [_][]const u8{ "meta", "f.xlsx", "--sheet", "nope" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.meta, a.subcommand);
+        try std.testing.expect(a.sheet_index == null);
+    }
+    {
+        const argv = [_][]const u8{ "list-sheets", "f.xlsx", "--format", "bogus" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.list_sheets, a.subcommand);
+    }
+    // Non-workbook-scoped commands stay strict — bogus --sheet still
+    // errors on `rows` / `cells`.
+    {
+        const argv = [_][]const u8{ "cells", "f.xlsx", "--sheet", "nope" };
+        try std.testing.expectError(ArgError.BadSheetIndex, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--format", "bogus" };
+        try std.testing.expectError(ArgError.BadFormat, parseArgs(&argv));
+    }
+}
+
+test "runMetaCommand emits path:null on non-UTF-8 workbook path" {
+    var scratch: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+
+    // Build a minimal Book-shaped view without actually opening a
+    // file — runMetaCommand only dereferences book.sheets / sst /
+    // styles_xml / theme_xml / rich_runs_by_sst_idx / comments.
+    var empty_book: xlsx.Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer empty_book.deinit();
+
+    try runMetaCommand(&w, &empty_book, null);
+
+    const out = scratch[0..w.end];
+    // The path field must serialize as literal `null`, not a string.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"path\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"kind\":\"workbook\"") != null);
 }
 
 test "runListSheetsCommand emits one sheet record per sheet" {
