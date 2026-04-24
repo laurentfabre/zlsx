@@ -1,12 +1,12 @@
-# jq for Excel — streaming CLI design (v4)
+# jq for Excel — streaming CLI design (v4.1)
 
-> **Status**: design, not yet implemented. See `src/cli.zig` for the current CLI surface (single-command, row-value jsonl/tsv/csv). v4 incorporates three rounds of Codex review — see the "what changed" note at the bottom.
+> **Status**: design, stable enough to implement from (four rounds of Codex review, round 4 signed off). See `src/cli.zig` for the current CLI surface (single-command, row-value jsonl/tsv/csv). v4.1 applies editorial polish on top of v4 — see the "what changed" note at the bottom. Implementation begins at iter54 per the rollout plan.
 
 ## Goal
 
 Turn `zlsx` into the thing you reach for when piping an xlsx into a Unix pipeline or an LLM harness. Same ergonomics as `jq`:
 
-- Every sub-command emits **uniform-envelope NDJSON** — one record per line, every record carries `kind` + `sheet` + `sheet_idx` so multi-source streams compose cleanly.
+- Every sub-command emits **uniform-envelope NDJSON** — one record per line, every record carries `kind`; sheet-scoped records additionally carry `sheet` + `sheet_idx`, so multi-source streams compose cleanly.
 - No built-in query DSL. Compose with `jq`, `rg`, `awk`, `duckdb` — the existing CLI toolkit is already excellent.
 - Streaming as the **default**, not the fast path. Memory should be a function of SST size, not file size.
 - LLM-optimized metadata: every cell carries explicit type + stable numeric row/col, so downstream never re-parses A1.
@@ -58,7 +58,7 @@ This is a **different schema** that consumers opt into explicitly — not a sile
 
 | Command | Record `kind` | Per-line fields |
 |---|---|---|
-| `zlsx cells <file>` | `"cell"` | `sheet, sheet_idx, ref, row, col, t, v, style?, formula?, runs?` |
+| `zlsx cells <file>` | `"cell"` | `sheet, sheet_idx, ref, row, col, t, v, serial?, formula?, formula_ref?, cached?, style?, runs?` |
 | `zlsx rows <file>` | `"row"` | `sheet, sheet_idx, row, cells[]` (each cell: `{ref, col, t, v}`) |
 | `zlsx comments <file>` | `"comment"` | `sheet, sheet_idx, ref, row, col, author, text, runs?` |
 | `zlsx validations <file>` | `"validation"` | `sheet, sheet_idx, range, rule_type, op?, formula1, formula2?, values?` |
@@ -148,8 +148,8 @@ Emitted inline when a non-fatal parse error hits. Fatal errors exit non-zero wit
 - `--header` — on `rows`, treat the first row (1-based `row:1`) as keys and emit `fields` dict per data row. Consistent with `row:1` / `--start-row` elsewhere; no 0-based row addressing exists in the surface.
 - `--with-styles` — opt-in metadata on `cells` / `rows`. Off by default.
 - `--include-blanks` — emit `t:"blank"` records for empty-but-addressed cells. Off by default.
-- `--skip N` / `--take N` — stream-native pagination (symmetric, `jq`-native phrasing; replaces the DB-flavored `--offset` / `--limit`).
-- `--start-row R` / `--end-row R` — alternative row-bounded pagination on `rows` / `cells` when callers think in 1-based sheet rows.
+- `--skip N` / `--take N` — stream-native pagination (symmetric, `jq`-native phrasing; replaces the DB-flavored `--offset` / `--limit`). Scoping: `--skip` / `--take` apply **globally over the concatenated output stream**, AFTER sheet selection (`--sheet`, `--sheet-index`, `--sheet-glob`, `--all-sheets`) and any `--range` / `--start-row` / `--end-row` filters. Under `--all-sheets`, `--skip 1000 --take 500` takes records 1001–1500 across the full cross-sheet stream, not per sheet. This matches `head`/`tail`/`jq` stream semantics; callers wanting per-sheet windows run one process per sheet.
+- `--start-row R` / `--end-row R` — alternative row-bounded pagination on `rows` / `cells` when callers think in 1-based sheet rows. Applied **per sheet** (each sheet's own rows), unlike `--skip` / `--take` which are global.
 - `--output {ndjson|compact-ndjson|pretty-json}` — output mode.
   - `ndjson` (default) — invariant-envelope NDJSON stream.
   - `compact-ndjson` — sheet-prologue variant described above.
@@ -289,7 +289,7 @@ zlsx cells financials.xlsx --sheet-glob '2024-*' | ./my-model
 ## Open design questions
 
 1. **Formula cached values**: `t:"formula"` always has `formula`; `cached` field is present only when Excel stored a cached result. Should we auto-recalculate? **Proposal: no** — zlsx is a reader, not a spreadsheet engine. Callers that need the computed value can shell out to libreoffice / excel.
-2. ~~**`--all-sheets` as default?**~~ **Resolved in v3**: default is first sheet only; `--all-sheets` is explicit opt-in. The `jq`-style "operate on all input" argument was outweighed by Excel-user surprise on multi-sheet workbooks where the first sheet is typically the "main" sheet and the rest is support/scratch. The short alias `zlsx <file>` still expands to `cells --all-sheets` for parity with the current CLI.
+2. ~~**`--all-sheets` as default?**~~ **Resolved in v3**: default is first sheet only; `--all-sheets` is explicit opt-in. The `jq`-style "operate on all input" argument was outweighed by Excel-user surprise on multi-sheet workbooks where the first sheet is typically the "main" sheet and the rest is support/scratch. (The short alias `zlsx <file>` was re-pointed in v4 to match — see the CLI section.)
 3. **Error record placement**: inline in stdout or only stderr? **Proposal: both** — emit to stdout (callers can filter via `jq`) AND to stderr (scripts that care about failure can grep). The stderr copy drops sheet/sheet_idx provenance since stderr is unordered.
 4. **Styles identity**: do cells carry `style:{bold:…}` (inlined) or `style_idx:42` with a separate `zlsx styles` stream for the lookup table? **Proposal: inline** — keeps each cell record self-contained, avoids pipeline composition order. Callers who care about style dedup can do it in jq.
 5. **Large SST in memory**: for 500 MB workbooks with 10M SST entries, the SST pre-load blows RAM. **Proposal: acceptable for iter54-60**; mitigate in a later iter by streaming SST + building an on-disk mmap index.
@@ -332,7 +332,7 @@ Same answer as v1, still correct:
 | Invariant "every record has kind+sheet+sheet_idx" is false for workbook-wide records | Tightened wording: "every record has `kind`; sheet-scoped records additionally have `sheet` + `sheet_idx`". |
 | `validations.kind` collides with the envelope `kind` discriminator | Renamed the validation subtype field to `rule_type`. |
 | Production-gap silence (UTF-8, ZIP bombs, signals, SIGPIPE, exit codes, shared formulas) | New "Operational guarantees" section. |
-| `--offset` / `--limit` is DB language in a stream context | Renamed `--skip` / `--max-records`; added `--start-row` / `--end-row`. |
+| `--offset` / `--limit` is DB language in a stream context | Renamed `--skip` / `--max-records` *(v3 intermediate — renamed again to `--take` in v4 for symmetry, see round-3 table)*; added `--start-row` / `--end-row`. |
 | `--sheet` accepting both name + index is ambiguous | Split: `--sheet NAME` + `--sheet-index N`. |
 | Defaulting to `--all-sheets` surprises Excel users with huge output | Default is first sheet; `--all-sheets` is explicit opt-in. |
 
