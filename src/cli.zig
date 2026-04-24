@@ -58,6 +58,14 @@ const Args = struct {
     /// styles / sst). Both are applied GLOBALLY after sheet selection.
     skip: ?usize = null,
     take: ?usize = null,
+    /// iter59b-1: per-sheet row-bounded filtering on the three
+    /// sub-commands that emit row-keyed records (rows / cells /
+    /// comments). Both endpoints are 1-based OOXML row numbers and
+    /// inclusive: `start_row=3, end_row=5` emits rows 3, 4, 5.
+    /// Applied BEFORE --skip/--take, so --skip counts post-row-filter
+    /// records per the jq-for-excel design doc.
+    start_row: ?u32 = null,
+    end_row: ?u32 = null,
 };
 
 const ArgError = error{
@@ -84,7 +92,9 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
             std.mem.eql(u8, a, "--name") or
             std.mem.eql(u8, a, "--format") or
             std.mem.eql(u8, a, "--skip") or
-            std.mem.eql(u8, a, "--take"))
+            std.mem.eql(u8, a, "--take") or
+            std.mem.eql(u8, a, "--start-row") or
+            std.mem.eql(u8, a, "--end-row"))
         {
             i += 1; // skip paired value (bounds-checked by caller)
             continue;
@@ -190,6 +200,21 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
             out.take = std.fmt.parseInt(usize, argv[i], 10) catch return ArgError.BadArgValue;
+        } else if (std.mem.eql(u8, a, "--start-row")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            // Strict on every sub-command (same rationale as --skip/--take):
+            // silently dropping a typoed row bound is an expensive surprise.
+            // OOXML rows are 1-based; 0 is a user error and we reject it.
+            const v = std.fmt.parseInt(u32, argv[i], 10) catch return ArgError.BadArgValue;
+            if (v == 0) return ArgError.BadArgValue;
+            out.start_row = v;
+        } else if (std.mem.eql(u8, a, "--end-row")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            const v = std.fmt.parseInt(u32, argv[i], 10) catch return ArgError.BadArgValue;
+            if (v == 0) return ArgError.BadArgValue;
+            out.end_row = v;
         } else if (a.len > 0 and a[0] == '-') {
             return ArgError.UnknownFlag;
         } else {
@@ -214,6 +239,26 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
         }
     }
     if (out.file.len == 0) return ArgError.NoFile;
+
+    // iter59b-1: --start-row / --end-row only map to sub-commands
+    // that emit row-keyed records (rows / cells / comments). The
+    // range-keyed commands (validations / hyperlinks) and the
+    // workbook-scoped commands (meta / list-sheets / styles / sst)
+    // have no per-record row number — reject the flag rather than
+    // silently ignoring it.
+    if (out.start_row != null or out.end_row != null) {
+        switch (detected_sub) {
+            .rows, .cells, .comments => {},
+            .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst => {
+                return ArgError.BadArgValue;
+            },
+        }
+    }
+    // Empty emission ranges are caught at parse time — `start > end`
+    // can never produce a record, which is almost certainly a typo.
+    if (out.start_row) |s| if (out.end_row) |e| {
+        if (s > e) return ArgError.BadArgValue;
+    };
     return out;
 }
 
@@ -239,6 +284,16 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    and list-sheets.
         \\  --take N          stop after N emitted records. Same scope
         \\                    as --skip; combine for middle-slice paging.
+        \\  --start-row R     (iter59b) 1-based OOXML row; drop records
+        \\                    whose row < R. Per-sheet scope (each
+        \\                    sheet's own rows, unlike --skip which is
+        \\                    global). Valid for rows / cells / comments
+        \\                    only; rejected on validations / hyperlinks
+        \\                    / meta / list-sheets / styles / sst.
+        \\  --end-row R       (iter59b) 1-based OOXML row; stop emitting
+        \\                    after row R (inclusive). Same scope and
+        \\                    sub-command constraints as --start-row.
+        \\                    Applied BEFORE --skip / --take.
         \\  -h, --help        show this help
         \\
         \\Sub-commands
@@ -635,7 +690,7 @@ pub fn main() !u8 {
                 try err.writeAll("zlsx: sheet not found\n");
                 return 3;
             };
-            try runCommentsCommand(out, &book, filter, args.skip, args.take);
+            try runCommentsCommand(out, &book, filter, args.skip, args.take, args.start_row, args.end_row);
             return 0;
         },
         .validations => {
@@ -689,8 +744,8 @@ pub fn main() !u8 {
     };
 
     switch (args.subcommand) {
-        .rows => try runRowsCommand(out, &book, selected.sheet, selected.idx, args.format, alloc, args.skip, args.take),
-        .cells => try runCellsCommand(out, &book, selected.sheet, selected.idx, alloc, args.skip, args.take),
+        .rows => try runRowsCommand(out, &book, selected.sheet, selected.idx, args.format, alloc, args.skip, args.take, args.start_row, args.end_row),
+        .cells => try runCellsCommand(out, &book, selected.sheet, selected.idx, alloc, args.skip, args.take, args.start_row, args.end_row),
         // Handled by the workbook-scoped early return above.
         .meta,
         .list_sheets,
@@ -744,19 +799,27 @@ fn runRowsCommand(
     alloc: std.mem.Allocator,
     skip: ?usize,
     take: ?usize,
+    start_row: ?u32,
+    end_row: ?u32,
 ) !void {
     var rows = try book.rows(sheet, alloc);
     defer rows.deinit();
 
     var pg = Pagination.init(skip, take);
     while (try rows.next()) |cells| {
+        const row_number = rows.currentRowNumber();
+        // Row bounds run BEFORE pagination (design doc v4.1).
+        if (start_row) |s| if (row_number < s) continue;
+        // OOXML rows are monotonic — once past end_row, no more records
+        // in this sheet's stream can satisfy the bound.
+        if (end_row) |e| if (row_number > e) break;
         switch (pg.consume()) {
             .drop => continue,
             .stop => return,
             .emit => {},
         }
         switch (format) {
-            .jsonl => try writeRowEnvelope(out, sheet.name, sheet_idx, rows.currentRowNumber(), cells),
+            .jsonl => try writeRowEnvelope(out, sheet.name, sheet_idx, row_number, cells),
             else => try writeRow(out, cells, format),
         }
     }
@@ -774,6 +837,8 @@ fn runCellsCommand(
     alloc: std.mem.Allocator,
     skip: ?usize,
     take: ?usize,
+    start_row: ?u32,
+    end_row: ?u32,
 ) !void {
     var rows = try book.rows(sheet, alloc);
     defer rows.deinit();
@@ -781,6 +846,8 @@ fn runCellsCommand(
     var pg = Pagination.init(skip, take);
     while (try rows.next()) |cells| {
         const row_number = rows.currentRowNumber();
+        if (start_row) |s| if (row_number < s) continue;
+        if (end_row) |e| if (row_number > e) break;
         for (cells, 0..) |c, i| {
             if (c == .empty) continue;
 
@@ -991,11 +1058,18 @@ fn runCommentsCommand(
     filter: ?usize,
     skip: ?usize,
     take: ?usize,
+    start_row: ?u32,
+    end_row: ?u32,
 ) !void {
     var pg = Pagination.init(skip, take);
     for (book.sheets, 0..) |s, sheet_idx| {
         if (filter) |f| if (sheet_idx != f) continue;
         for (book.comments(s)) |c| {
+            // Comments are not guaranteed monotonic by row across a
+            // sheet's comment list (OOXML preserves author/insertion
+            // order). `continue` on both bounds — don't `break`.
+            if (start_row) |sr| if (c.top_left.row < sr) continue;
+            if (end_row) |er| if (c.top_left.row > er) continue;
             switch (pg.consume()) {
                 .drop => continue,
                 .stop => return,
@@ -1632,6 +1706,122 @@ test "parseArgs --skip / --take round-trip and tolerance" {
     }
 }
 
+test "parseArgs --start-row / --end-row round-trip and rejections" {
+    // Happy path: both parse as u32 and live on Args.
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--start-row", "5", "--end-row", "10" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(@as(?u32, 5), a.start_row);
+        try std.testing.expectEqual(@as(?u32, 10), a.end_row);
+    }
+    // Bogus values error (strict on every sub-command).
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--start-row", "bogus" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "cells", "f.xlsx", "--end-row", "nope" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // 0 is a user error: OOXML rows are 1-based.
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--start-row", "0" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // start_row > end_row is an empty emission range — caught at parse.
+    {
+        const argv = [_][]const u8{ "cells", "f.xlsx", "--start-row", "10", "--end-row", "5" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // start_row == end_row is a valid single-row slice.
+    {
+        const argv = [_][]const u8{ "cells", "f.xlsx", "--start-row", "7", "--end-row", "7" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(@as(?u32, 7), a.start_row);
+        try std.testing.expectEqual(@as(?u32, 7), a.end_row);
+    }
+    // Sub-commands without a row key reject --start-row / --end-row.
+    inline for (.{ "validations", "hyperlinks", "meta", "list-sheets", "styles", "sst" }) |cmd| {
+        {
+            const argv = [_][]const u8{ cmd, "f.xlsx", "--start-row", "2" };
+            try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+        }
+        {
+            const argv = [_][]const u8{ cmd, "f.xlsx", "--end-row", "5" };
+            try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+        }
+    }
+    // Explicitly allowed on the three row-keyed sub-commands.
+    inline for (.{ "rows", "cells", "comments" }) |cmd| {
+        const argv = [_][]const u8{ cmd, "f.xlsx", "--start-row", "2", "--end-row", "4" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(@as(?u32, 2), a.start_row);
+        try std.testing.expectEqual(@as(?u32, 4), a.end_row);
+    }
+    // Defaults to null when absent.
+    {
+        const argv = [_][]const u8{ "cells", "f.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(a.start_row == null);
+        try std.testing.expect(a.end_row == null);
+    }
+}
+
+test "runCellsCommand --start-row / --end-row bound the emitted cell stream" {
+    const tmp_path = "/tmp/zlsx_cli_rowbounds_iter59b.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        // 5 rows × 1 cell each → rows 1..5 in the OOXML sense.
+        try s0.writeRow(&.{.{ .string = "c1" }});
+        try s0.writeRow(&.{.{ .string = "c2" }});
+        try s0.writeRow(&.{.{ .string = "c3" }});
+        try s0.writeRow(&.{.{ .string = "c4" }});
+        try s0.writeRow(&.{.{ .string = "c5" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    const countLines = struct {
+        fn f(s: []const u8) usize {
+            var n: usize = 0;
+            for (s) |c| if (c == '\n') {
+                n += 1;
+            };
+            return n;
+        }
+    }.f;
+
+    // --start-row 2 --end-row 4 → rows 2, 3, 4.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, 2, 4);
+        const out = w.buffered();
+        try std.testing.expectEqual(@as(usize, 3), countLines(out));
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c1\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c2\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c3\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c4\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c5\"") == null);
+    }
+    // Row bounds run BEFORE --skip/--take. Of rows 2/3/4, --skip 1
+    // drops c2 and --take 1 keeps exactly c3.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 1, 1, 2, 4);
+        const out = w.buffered();
+        try std.testing.expectEqual(@as(usize, 1), countLines(out));
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c3\"") != null);
+    }
+}
+
 test "runCellsCommand --skip / --take slice the emitted cell stream" {
     const tmp_path = "/tmp/zlsx_cli_pagination_iter59a.xlsx";
     defer std.fs.cwd().deleteFile(tmp_path) catch {};
@@ -1666,14 +1856,14 @@ test "runCellsCommand --skip / --take slice the emitted cell stream" {
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, null, null);
         try std.testing.expectEqual(@as(usize, 5), countLines(w.buffered()));
     }
     // --skip 2 drops the first two cells (c1, c2).
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 2, null);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 2, null, null, null);
         const out = w.buffered();
         try std.testing.expectEqual(@as(usize, 3), countLines(out));
         try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c1\"") == null);
@@ -1684,7 +1874,7 @@ test "runCellsCommand --skip / --take slice the emitted cell stream" {
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, 3);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, 3, null, null);
         const out = w.buffered();
         try std.testing.expectEqual(@as(usize, 3), countLines(out));
         try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c3\"") != null);
@@ -1694,7 +1884,7 @@ test "runCellsCommand --skip / --take slice the emitted cell stream" {
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 1, 2);
+        try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, 1, 2, null, null);
         const out = w.buffered();
         try std.testing.expectEqual(@as(usize, 2), countLines(out));
         try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c1\"") == null);
@@ -1916,7 +2106,7 @@ test "runCommentsCommand emits one record per comment across every sheet" {
 
     var scratch: [2048]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runCommentsCommand(&w, &book, null, null, null);
+    try runCommentsCommand(&w, &book, null, null, null, null, null);
 
     const out = w.buffered();
     try std.testing.expect(std.mem.startsWith(u8, out, "{\"kind\":\"comment\""));
