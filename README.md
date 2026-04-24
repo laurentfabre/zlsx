@@ -84,7 +84,7 @@ Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-ro
 - **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout, merged-cell ranges via `Book.mergedRanges(sheet)`, external-URL hyperlinks via `Book.hyperlinks(sheet)` (resolved through sheet `_rels`), all data validations via `Book.dataValidations(sheet)` — dropdowns (values entity-decoded), plus `kind` / `op` / `formula1` / `formula2` on numeric, date, time, text-length, and custom variants, rich-text run formatting (bold / italic / color / size / font) via `Book.richRuns(sst_idx)` for entries that used `<r>` wrappers, per-cell style indices via `Rows.styleIndices()` resolving to number-format codes via `Book.numberFormat(style_idx)` (date detection via `Book.isDateFormat(style_idx)`), cell comments via `Book.comments(sheet)` (author + plain-text body, decoded)
 - **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, row heights, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks (per-sheet `_rels`), internal hyperlinks (`location="Sheet2!A1"`), list-type data validations (dropdowns), number / decimal / date / time / text-length / custom data validations, formulas with optional cached value, rich-text cells (per-run bold / italic / color / size / font) via `SheetWriter.writeRichRow`, cell comments (notes) via `SheetWriter.addComment` (emits the full `xl/comments{N}.xml` + `vmlDrawing{N}.vml` + rels stack so Excel renders the yellow indicator), conditional formatting via `SheetWriter.addConditionalFormatCellIs` / `…Expression` (two core cfRule types) referencing differential formats registered via `Writer.addDxf`
 - XML entity decoding (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&#N;`, `&#xN;`) on read and escaping on write
-- CLI (`zlsx file.xlsx --format {jsonl|legacy-jsonl|legacy-jsonl-dict|tsv|csv}`; default `jsonl` is the NDJSON row envelope from iter55a — see "CLI" section below), C ABI (`libzlsx.{dylib,so,dll}` + `include/zlsx.h`), Python bindings (`pip install py-zlsx`)
+- CLI (`zlsx {rows|cells|meta|list-sheets|comments|validations|hyperlinks|styles|sst} <file>`) emitting uniform NDJSON envelopes, with row/range/header/skip-take/all-sheets/sheet-glob/include-blanks/with-styles/output-mode flags and SIGPIPE-clean pipelines — see "CLI" below and [`docs/jq-for-excel.md`](docs/jq-for-excel.md)); C ABI (`libzlsx.{dylib,so,dll}` + `include/zlsx.h`); Python bindings (`pip install py-zlsx`)
 
 **Out (by design)**
 - No formula evaluation — the reader returns the cached `<v>` value; the writer accepts formula text + an optional cached result via `writeRowWithFormulas` but never computes the formula itself
@@ -217,34 +217,132 @@ Or, for local development, clone the repo next to your project and use a path de
 
 ## CLI
 
-A thin binary `zlsx` ships with this repo. It streams rows of the selected sheet to stdout — useful as an openpyxl replacement for shell / pipeline use:
+A thin binary `zlsx` ships with this repo — shell-friendly, pipeable, openpyxl-replacement speed, no Python interpreter floor. "jq for Excel": every sub-command emits a uniform NDJSON envelope that composes cleanly with `jq`, `rg`, `awk`, `duckdb read_ndjson`, or an LLM ingest harness. Full design in [`docs/jq-for-excel.md`](docs/jq-for-excel.md).
 
 ```bash
 zig build -Doptimize=ReleaseFast
-./zig-out/bin/zlsx file.xlsx                          # NDJSON row envelope (default)
-./zig-out/bin/zlsx file.xlsx --format legacy-jsonl    # pre-iter55a bare arrays
-./zig-out/bin/zlsx file.xlsx --format legacy-jsonl-dict  # pre-iter55a bare objects
-./zig-out/bin/zlsx file.xlsx --format tsv             # TSV with \N for empty
-./zig-out/bin/zlsx file.xlsx --format csv             # RFC 4180 CSV
-./zig-out/bin/zlsx file.xlsx --sheet 2                # 0-indexed
-./zig-out/bin/zlsx file.xlsx --name "Summary"         # by name
-./zig-out/bin/zlsx file.xlsx --list-sheets            # one name per line
+./zig-out/bin/zlsx file.xlsx                          # default: rows sub-command
+./zig-out/bin/zlsx rows file.xlsx                     # explicit alias
+./zig-out/bin/zlsx cells file.xlsx                    # per-cell NDJSON
+./zig-out/bin/zlsx meta file.xlsx                     # workbook + sheet metadata
+./zig-out/bin/zlsx list-sheets file.xlsx              # NDJSON sheet list
+./zig-out/bin/zlsx comments file.xlsx                 # cell comments
+./zig-out/bin/zlsx validations file.xlsx              # data validations
+./zig-out/bin/zlsx hyperlinks file.xlsx               # external + internal hyperlinks
+./zig-out/bin/zlsx styles file.xlsx                   # cell-XF style table
+./zig-out/bin/zlsx sst file.xlsx                      # shared-strings table
 ```
 
-### NDJSON row envelope (default `--format jsonl`, iter55a)
+### Sub-commands
 
-As of iter55a, the default `jsonl` format emits one uniform envelope per row — `{kind, sheet, sheet_idx, row, cells:[{ref, col, t, v}]}` — so downstream pipelines (`jq`, LLM ingest, `duckdb read_ndjson`) can compose multi-sheet streams without re-parsing A1 refs:
+| Command | `kind` | Per-line fields |
+|---|---|---|
+| `zlsx rows <file>` | `"row"` | `sheet, sheet_idx, row, cells[]` (each `{ref, col, t, v}`) |
+| `zlsx cells <file>` | `"cell"` | `sheet, sheet_idx, ref, row, col, t, v, style?` |
+| `zlsx comments <file>` | `"comment"` | `sheet, sheet_idx, ref, row, col, author, text, runs?` |
+| `zlsx validations <file>` | `"validation"` | `sheet, sheet_idx, range, rule_type, op?, formula1, formula2?, values?` |
+| `zlsx hyperlinks <file>` | `"hyperlink"` | `sheet, sheet_idx, range, url?, location?` |
+| `zlsx styles <file>` | `"style"` | `idx, font, fill, border, num_fmt` (workbook-wide) |
+| `zlsx sst <file>` | `"sst"` | `idx, text, runs?` (workbook-wide) |
+| `zlsx meta <file>` | `"workbook"` + `"sheet"` | workbook record first, then per-sheet records |
+| `zlsx list-sheets <file>` | `"sheet"` | `sheet, sheet_idx` — lighter-weight than `meta` |
+
+### Default NDJSON row envelope
 
 ```jsonl
 {"kind":"row","sheet":"Data","sheet_idx":0,"row":1,"cells":[{"ref":"A1","col":1,"t":"str","v":"name"},{"ref":"B1","col":2,"t":"str","v":"qty"}]}
 {"kind":"row","sheet":"Data","sheet_idx":0,"row":2,"cells":[{"ref":"A2","col":1,"t":"str","v":"apple"},{"ref":"B2","col":2,"t":"int","v":3}]}
 ```
 
-`t` is `"str"` | `"int"` | `"num"` | `"bool"`; empty cells are skipped from the `cells` array. Future iters will extend this shape to `"date"` / `"formula"` / `"error"` + add the `cells` / `meta` / `comments` sub-commands per [`docs/jq-for-excel.md`](docs/jq-for-excel.md).
+`t` ∈ `"str"` | `"int"` | `"num"` | `"bool"`; empty cells skipped from the `cells` array.
 
-Callers that still need the pre-iter55a output shape pass `--format legacy-jsonl` (bare arrays) or `--format legacy-jsonl-dict` (bare objects). The old `--format jsonl-dict` spelling still works as a silent alias this release; the next release will print a stderr deprecation warning.
+### Flags
 
-Emission overhead is within 3% of the tally-only benchmark — the CLI is fast enough that `zlsx big.xlsx | jq` beats any Python-based xlsx reader by 4×+.
+**Sheet selection** — mutually exclusive:
+
+```bash
+--sheet N                     # 0-indexed
+--name "Summary"              # by name
+--all-sheets                  # every sheet concatenated
+--sheet-glob 'Data*'          # glob on sheet name (UTF-8 `?` matches one codepoint)
+```
+
+**Row / cell bounds** (rows / cells / comments):
+
+```bash
+--start-row 2 --end-row 100   # 1-based inclusive, per sheet
+--range B2:Z100               # A1 bounding rectangle (rows + cells only)
+--header                      # rows only: promote first row to keys, emit `fields` dict
+```
+
+**Stream pagination** — applies globally across the concatenated output:
+
+```bash
+--skip N --take M
+```
+
+**Cell metadata opt-ins** (cells / rows):
+
+```bash
+--include-blanks              # emit t:"blank" records for empty cells
+--with-styles                 # attach terse style: {bold?, italic?, fg?, bg?, nf?, border?}
+```
+
+**Output modes**:
+
+```bash
+--output ndjson               # default: invariant-envelope stream
+--output compact-ndjson       # sheet-prologue variant (drops sheet/sheet_idx on data records)
+--output pretty-json          # valid only on `meta`: single pretty-printed JSON object
+```
+
+**Row format (rows sub-command only)** — legacy escape hatches:
+
+```bash
+--format jsonl                # default: envelope
+--format legacy-jsonl         # pre-iter55a bare arrays
+--format legacy-jsonl-dict    # pre-iter55a bare objects (old `--format jsonl-dict` is a deprecated alias)
+--format tsv                  # tab-separated, \N for empty
+--format csv                  # RFC 4180
+```
+
+### Example pipelines
+
+```bash
+# All string cells across every sheet.
+zlsx cells data.xlsx --all-sheets | jq 'select(.t=="str") | {sheet, ref, v}'
+
+# Sum a column from the CLI without loading everything.
+zlsx cells data.xlsx --range B2:B1000 | jq -r 'select(.t=="int" or .t=="num") | .v' | awk '{s+=$1} END {print s}'
+
+# Every comment across every sheet, as TSV.
+zlsx comments data.xlsx --all-sheets | jq -r '[.sheet, .ref, .author, .text] | @tsv'
+
+# Schema check: every list-type validation + its range.
+zlsx validations data.xlsx | jq 'select(.rule_type=="list") | {sheet, range, values}'
+
+# Grep SST for emails.
+zlsx sst data.xlsx | jq -r '.text' | rg '@\S+\.\S+'
+```
+
+### Pipeline safety
+
+`zlsx cells huge.xlsx | head -10` exits 0 cleanly (no broken-pipe stderr noise). `SIGINT` → exit 130, `SIGTERM` → exit 143, both flushing in-flight records. Non-fatal parse errors (corrupt sheet in an otherwise-valid workbook) surface as inline `{"kind":"error",…}` records instead of aborting the pipeline — filter with `jq 'select(.kind!="error")'` if you want the data-only stream.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success (inline `error` records may still have been emitted) |
+| 1 | Bad CLI arguments |
+| 2 | Could not open file / not a valid xlsx archive |
+| 3 | Sheet not found (by name / index / glob) |
+| 4 | Decompression limit exceeded (`ZipBombSuspected`, reserved) |
+| 5 | OS error (permission denied, disk full on stdout, etc.) |
+| 130 | SIGINT |
+| 143 | SIGTERM |
+
+Emission overhead is within 3% of the tally-only benchmark — `zlsx big.xlsx | jq` beats any Python-based xlsx reader by 4×+.
 
 ## Performance
 
