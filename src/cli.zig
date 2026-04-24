@@ -112,13 +112,10 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     const workbook_scoped = switch (detected_sub) {
         .meta,
         .list_sheets,
-        .comments,
-        .validations,
-        .hyperlinks,
         .styles,
         .sst,
         => true,
-        .rows, .cells => false,
+        .rows, .cells, .comments, .validations, .hyperlinks => false,
     };
 
     var out: Args = .{ .file = "", .subcommand = detected_sub };
@@ -602,15 +599,27 @@ pub fn main() !u8 {
             return 0;
         },
         .comments => {
-            try runCommentsCommand(out, &book);
+            const filter = resolveSheetFilter(&book, args) catch {
+                try err.writeAll("zlsx: sheet not found\n");
+                return 3;
+            };
+            try runCommentsCommand(out, &book, filter);
             return 0;
         },
         .validations => {
-            try runValidationsCommand(out, &book);
+            const filter = resolveSheetFilter(&book, args) catch {
+                try err.writeAll("zlsx: sheet not found\n");
+                return 3;
+            };
+            try runValidationsCommand(out, &book, filter);
             return 0;
         },
         .hyperlinks => {
-            try runHyperlinksCommand(out, &book);
+            const filter = resolveSheetFilter(&book, args) catch {
+                try err.writeAll("zlsx: sheet not found\n");
+                return 3;
+            };
+            try runHyperlinksCommand(out, &book, filter);
             return 0;
         },
         .styles => {
@@ -783,6 +792,25 @@ fn runListSheetsCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
 
 // ─── iter58: reader-surface sub-commands ─────────────────────────────
 
+/// Resolve the sheet-selector flags (--sheet index / --name) to an
+/// optional sheet filter. Null means "iterate every sheet" (the
+/// default for sheet-scoped-but-multi-sheet commands like comments /
+/// validations / hyperlinks). Returns error.SheetNotFound when a
+/// concrete selector was given but doesn't match the workbook.
+fn resolveSheetFilter(book: *const xlsx.Book, args: Args) !?usize {
+    if (args.sheet_index) |idx| {
+        if (idx >= book.sheets.len) return error.SheetNotFound;
+        return idx;
+    }
+    if (args.sheet_name) |name| {
+        for (book.sheets, 0..) |s, i| {
+            if (std.mem.eql(u8, s.name, name)) return i;
+        }
+        return error.SheetNotFound;
+    }
+    return null;
+}
+
 /// Emit an `"A1"`-style ref into `buf` from a reader-shape CellRef
 /// (`col` is 0-based — A→0, B→1 — and `row` is 1-based, matching
 /// `xlsx.parseA1Ref`). Panics if the generated ref exceeds 16 bytes —
@@ -875,9 +903,11 @@ fn rangeFromBounds(buf: *[32]u8, top_left: xlsx.CellRef, bottom_right: xlsx.Cell
     return std.fmt.bufPrint(buf, "{s}:{s}", .{ tl, br }) catch unreachable;
 }
 
-/// Emit one NDJSON record per comment across every sheet.
-fn runCommentsCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
+/// Emit one NDJSON record per comment. When `filter` is set, only
+/// the matching sheet contributes; otherwise every sheet iterates.
+fn runCommentsCommand(out: *std.Io.Writer, book: *const xlsx.Book, filter: ?usize) !void {
     for (book.sheets, 0..) |s, sheet_idx| {
+        if (filter) |f| if (sheet_idx != f) continue;
         for (book.comments(s)) |c| {
             var ref_buf: [16]u8 = undefined;
             const ref = refFromCellRef(&ref_buf, c.top_left);
@@ -902,9 +932,11 @@ fn runCommentsCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
     }
 }
 
-/// Emit one NDJSON record per data-validation range across every sheet.
-fn runValidationsCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
+/// Emit one NDJSON record per data-validation range. When `filter`
+/// is set, only the matching sheet contributes.
+fn runValidationsCommand(out: *std.Io.Writer, book: *const xlsx.Book, filter: ?usize) !void {
     for (book.sheets, 0..) |s, sheet_idx| {
+        if (filter) |f| if (sheet_idx != f) continue;
         for (book.dataValidations(s)) |dv| {
             var range_buf: [32]u8 = undefined;
             const range = rangeFromBounds(&range_buf, dv.top_left, dv.bottom_right);
@@ -937,9 +969,11 @@ fn runValidationsCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
     }
 }
 
-/// Emit one NDJSON record per hyperlink across every sheet.
-fn runHyperlinksCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
+/// Emit one NDJSON record per hyperlink. When `filter` is set, only
+/// the matching sheet contributes.
+fn runHyperlinksCommand(out: *std.Io.Writer, book: *const xlsx.Book, filter: ?usize) !void {
     for (book.sheets, 0..) |s, sheet_idx| {
+        if (filter) |f| if (sheet_idx != f) continue;
         for (book.hyperlinks(s)) |h| {
             var range_buf: [32]u8 = undefined;
             const range = rangeFromBounds(&range_buf, h.top_left, h.bottom_right);
@@ -996,28 +1030,53 @@ fn runStylesCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
 
         try out.writeAll(",\"fill\":");
         if (book.cellFill(idx)) |fl| {
-            try out.writeAll("{\"pattern\":");
-            try writeJsonString(out, fl.pattern);
-            try out.writeAll(",\"fg\":");
-            if (fl.fg_color_argb) |c| try out.print("\"{X:0>8}\"", .{c}) else try out.writeAll("null");
-            try out.writeAll(",\"bg\":");
-            if (fl.bg_color_argb) |c| try out.print("\"{X:0>8}\"", .{c}) else try out.writeAll("null");
-            try out.writeByte('}');
+            // Treat the default zlsx Fill (pattern="none", both
+            // colors null) as "no fill" on the wire, same as when
+            // cellFill returned null. Consumers can then trust
+            // `fill != null` to mean "the style actually defines
+            // a fill."
+            const no_fill = (std.mem.eql(u8, fl.pattern, "none") or fl.pattern.len == 0) and
+                fl.fg_color_argb == null and fl.bg_color_argb == null;
+            if (no_fill) {
+                try out.writeAll("null");
+            } else {
+                try out.writeAll("{\"pattern\":");
+                try writeJsonString(out, fl.pattern);
+                try out.writeAll(",\"fg\":");
+                if (fl.fg_color_argb) |c| try out.print("\"{X:0>8}\"", .{c}) else try out.writeAll("null");
+                try out.writeAll(",\"bg\":");
+                if (fl.bg_color_argb) |c| try out.print("\"{X:0>8}\"", .{c}) else try out.writeAll("null");
+                try out.writeByte('}');
+            }
         } else try out.writeAll("null");
 
         try out.writeAll(",\"border\":");
         if (book.cellBorder(idx)) |b| {
-            try out.writeAll("{\"left\":");
-            try writeBorderSideOrNull(out, b.left);
-            try out.writeAll(",\"right\":");
-            try writeBorderSideOrNull(out, b.right);
-            try out.writeAll(",\"top\":");
-            try writeBorderSideOrNull(out, b.top);
-            try out.writeAll(",\"bottom\":");
-            try writeBorderSideOrNull(out, b.bottom);
-            try out.writeAll(",\"diagonal\":");
-            try writeBorderSideOrNull(out, b.diagonal);
-            try out.writeByte('}');
+            // Same contract: if every side is the zero BorderSide
+            // (empty style + null color), emit `null` so unstyled
+            // XFs read as "no border" on the wire.
+            const side_empty = struct {
+                fn f(s: xlsx.BorderSide) bool {
+                    return s.style.len == 0 and s.color_argb == null;
+                }
+            }.f;
+            const no_border = side_empty(b.left) and side_empty(b.right) and
+                side_empty(b.top) and side_empty(b.bottom) and side_empty(b.diagonal);
+            if (no_border) {
+                try out.writeAll("null");
+            } else {
+                try out.writeAll("{\"left\":");
+                try writeBorderSideOrNull(out, b.left);
+                try out.writeAll(",\"right\":");
+                try writeBorderSideOrNull(out, b.right);
+                try out.writeAll(",\"top\":");
+                try writeBorderSideOrNull(out, b.top);
+                try out.writeAll(",\"bottom\":");
+                try writeBorderSideOrNull(out, b.bottom);
+                try out.writeAll(",\"diagonal\":");
+                try writeBorderSideOrNull(out, b.diagonal);
+                try out.writeByte('}');
+            }
         } else try out.writeAll("null");
 
         try out.writeAll(",\"num_fmt\":");
@@ -1552,17 +1611,34 @@ test "parseArgs routes iter58 sub-commands correctly" {
         try std.testing.expectEqual(want, a.subcommand);
         try std.testing.expectEqualStrings("file.xlsx", a.file);
     }
-    // iter58 sub-commands all join the flag-tolerance group — a bogus
-    // --sheet / --format must not error out.
-    {
-        const argv = [_][]const u8{ "comments", "f.xlsx", "--sheet", "bogus" };
-        const a = try parseArgs(&argv);
-        try std.testing.expectEqual(Subcommand.comments, a.subcommand);
-    }
+    // Styles / sst are workbook-scoped — bogus --sheet / --format
+    // must be tolerated (per iter57's P2 fix).
     {
         const argv = [_][]const u8{ "styles", "f.xlsx", "--format", "bogus" };
         const a = try parseArgs(&argv);
         try std.testing.expectEqual(Subcommand.styles, a.subcommand);
+    }
+    {
+        const argv = [_][]const u8{ "sst", "f.xlsx", "--sheet", "bogus" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.sst, a.subcommand);
+    }
+    // Comments / validations / hyperlinks ARE sheet-scoped as of
+    // iter58-P2 follow-up — bogus --sheet / --format must error so
+    // callers don't get silently-misrouted output.
+    {
+        const argv = [_][]const u8{ "comments", "f.xlsx", "--sheet", "bogus" };
+        try std.testing.expectError(ArgError.BadSheetIndex, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "hyperlinks", "f.xlsx", "--format", "bogus" };
+        try std.testing.expectError(ArgError.BadFormat, parseArgs(&argv));
+    }
+    // Valid --sheet narrows the filter on sheet-scoped sub-commands.
+    {
+        const argv = [_][]const u8{ "comments", "f.xlsx", "--sheet", "1" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(@as(?usize, 1), a.sheet_index);
     }
 }
 
@@ -1587,7 +1663,7 @@ test "runCommentsCommand emits one record per comment across every sheet" {
 
     var scratch: [2048]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runCommentsCommand(&w, &book);
+    try runCommentsCommand(&w, &book, null);
 
     const out = w.buffered();
     try std.testing.expect(std.mem.startsWith(u8, out, "{\"kind\":\"comment\""));
@@ -1626,7 +1702,7 @@ test "runValidationsCommand emits list validation with values array" {
 
     var scratch: [2048]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runValidationsCommand(&w, &book);
+    try runValidationsCommand(&w, &book, null);
 
     const out = w.buffered();
     try std.testing.expect(std.mem.startsWith(u8, out, "{\"kind\":\"validation\""));
@@ -1656,7 +1732,7 @@ test "runHyperlinksCommand emits url set + location null for external links" {
 
     var scratch: [2048]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runHyperlinksCommand(&w, &book);
+    try runHyperlinksCommand(&w, &book, null);
 
     const out = w.buffered();
     try std.testing.expect(std.mem.startsWith(u8, out, "{\"kind\":\"hyperlink\""));
