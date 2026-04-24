@@ -1093,6 +1093,18 @@ pub const Book = struct {
             .arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
+
+    /// Index-based streaming entry point for the upcoming jq-for-excel
+    /// CLI: `zlsx cells file.xlsx --sheet-index 2` resolves directly to
+    /// `book.streamSheet(2, alloc)`. Semantically identical to
+    /// `book.rows(book.sheets[idx], alloc)` — both go through
+    /// `ensureSheetLoaded` on the lazy path and hit the cache on the
+    /// eager path. Returns `error.SheetIndexOutOfRange` when `idx` is
+    /// not a valid sheet.
+    pub fn streamSheet(self: *Book, idx: usize, allocator: Allocator) !Rows {
+        if (idx >= self.sheets.len) return error.SheetIndexOutOfRange;
+        return self.rows(self.sheets[idx], allocator);
+    }
 };
 
 // ─── Rows iterator ───────────────────────────────────────────────────
@@ -4939,6 +4951,69 @@ test "openLazy parses workbook-wide styles + theme (no sheet load required)" {
     const fmt = book.numberFormat(@intCast(book.cell_xf_numfmt_ids.len - 1));
     try std.testing.expect(fmt != null);
     try std.testing.expect(std.mem.indexOf(u8, fmt.?, "%") != null);
+}
+
+test "streamSheet: out-of-range index errors, valid index hits cache on Book.open" {
+    const tmp_path = "/tmp/zlsx_iter54_stream_sheet.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Alpha");
+        try s0.writeRow(&.{.{ .string = "a" }});
+        var s1 = try w.addSheet("Beta");
+        try s1.writeRow(&.{.{ .number = 1.0 }});
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    try std.testing.expectError(
+        error.SheetIndexOutOfRange,
+        book.streamSheet(99, std.testing.allocator),
+    );
+
+    // After Book.open, every sheet is preloaded: streamSheet hits the
+    // cache and doesn't grow sheet_data.
+    const before = book.sheet_data.count();
+    {
+        var r = try book.streamSheet(1, std.testing.allocator);
+        defer r.deinit();
+        while (try r.next()) |_| {}
+    }
+    try std.testing.expectEqual(before, book.sheet_data.count());
+}
+
+test "streamSheet: lazily materializes a single sheet on openLazy" {
+    const tmp_path = "/tmp/zlsx_iter54_stream_lazy.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Alpha");
+        try s0.writeRow(&.{.{ .string = "a" }});
+        var s1 = try w.addSheet("Beta");
+        try s1.writeRow(&.{.{ .string = "b" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.openLazy(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), book.sheet_data.count());
+
+    // Stream only sheet 1; sheet 0 must stay unloaded.
+    {
+        var r = try book.streamSheet(1, std.testing.allocator);
+        defer r.deinit();
+        while (try r.next()) |_| {}
+    }
+    try std.testing.expectEqual(@as(usize, 1), book.sheet_data.count());
+    try std.testing.expect(book.sheet_data.get(book.sheets[1].path) != null);
+    try std.testing.expect(book.sheet_data.get(book.sheets[0].path) == null);
 }
 
 test "preloadSheet populates per-sheet metadata without rows() iteration" {
