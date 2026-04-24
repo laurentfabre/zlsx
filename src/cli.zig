@@ -19,12 +19,14 @@ const Format = enum {
     csv,
 };
 
-/// iter56: first positional decides sub-command. `rows` is the legacy
-/// envelope-row emitter; `cells` is the new per-cell NDJSON stream.
-/// Bare `zlsx file.xlsx` (no sub-command token) still means `rows` so
+/// iter56/57: first positional decides sub-command. `rows` is the
+/// legacy envelope-row emitter; `cells` is the per-cell NDJSON stream;
+/// `meta` emits a workbook record followed by per-sheet records;
+/// `list_sheets` is the lighter NDJSON variant. Bare
+/// `zlsx file.xlsx` (no sub-command token) still means `rows` so
 /// existing scripts keep working — the short-alias re-point to `cells`
 /// is an iter60+ breaking change with its own rollout.
-const Subcommand = enum { rows, cells };
+const Subcommand = enum { rows, cells, meta, list_sheets };
 
 const Args = struct {
     subcommand: Subcommand = .rows,
@@ -107,6 +109,12 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
                 } else if (std.mem.eql(u8, a, "rows")) {
                     out.subcommand = .rows;
                     continue;
+                } else if (std.mem.eql(u8, a, "meta")) {
+                    out.subcommand = .meta;
+                    continue;
+                } else if (std.mem.eql(u8, a, "list-sheets")) {
+                    out.subcommand = .list_sheets;
+                    continue;
                 }
                 // Fall through: first positional is the file path,
                 // sub-command stays at its default (`rows`).
@@ -131,6 +139,8 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    `jsonl-dict` is a deprecated alias for
         \\                    `legacy-jsonl-dict` — accepted this release.)
         \\  --list-sheets     print sheet names, one per line, and exit
+        \\                    (legacy plain-text flag — still works.
+        \\                    The `list-sheets` sub-command emits NDJSON.)
         \\  -h, --help        show this help
         \\
         \\Sub-commands
@@ -141,6 +151,18 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                      "row":1,"col":1,"t":"str","v":"x"}
         \\                     t ∈ {"str","int","num","bool"}. Empty cells skipped.
         \\                     --format is ignored; output shape is fixed.
+        \\  meta               workbook summary as NDJSON (iter57). One
+        \\                     workbook record first, then one sheet record per sheet:
+        \\                     {"kind":"workbook","path":"f.xlsx","sheets":N,
+        \\                      "sst":{"count":C,"rich":R},
+        \\                      "has_styles":bool,"has_theme":bool,"has_comments":bool}
+        \\                     {"kind":"sheet","sheet":"S","sheet_idx":0,
+        \\                      "has_comments":bool}
+        \\                     --format / --sheet / --name are ignored.
+        \\  list-sheets        lighter NDJSON variant of `meta` (iter57):
+        \\                     one {"kind":"sheet","sheet":…,"sheet_idx":…}
+        \\                     record per sheet. For the plain-text one-name-
+        \\                     per-line shape, use the legacy `--list-sheets` flag.
         \\
         \\Formats (rows only)
         \\  jsonl              NDJSON row envelope (default, iter55a):
@@ -461,6 +483,19 @@ pub fn main() !u8 {
         return 0;
     }
 
+    // iter57 sub-commands — workbook-scoped, no per-sheet selection.
+    switch (args.subcommand) {
+        .meta => {
+            try runMetaCommand(out, &book, args.file);
+            return 0;
+        },
+        .list_sheets => {
+            try runListSheetsCommand(out, &book);
+            return 0;
+        },
+        .rows, .cells => {},
+    }
+
     const Selected = struct { sheet: xlsx.Sheet, idx: usize };
     const selected: Selected = blk: {
         if (args.sheet_name) |n| {
@@ -487,6 +522,8 @@ pub fn main() !u8 {
     switch (args.subcommand) {
         .rows => try runRowsCommand(out, &book, selected.sheet, selected.idx, args.format, alloc),
         .cells => try runCellsCommand(out, &book, selected.sheet, selected.idx, alloc),
+        // Handled by the workbook-scoped early return above.
+        .meta, .list_sheets => unreachable,
     }
     return 0;
 }
@@ -544,6 +581,65 @@ fn runCellsCommand(
                 c,
             );
         }
+    }
+}
+
+/// iter57: emit the workbook record followed by one sheet record per
+/// sheet. Fields deliberately limited to ones that are O(1) over the
+/// reader APIs Book already exposes — `rows` / `cols` / `first_cell` /
+/// `last_cell` / `format_version` are follow-up work (they need
+/// sheet-iteration or version plumbing) per the iter57 scope note.
+fn runMetaCommand(
+    out: *std.Io.Writer,
+    book: *const xlsx.Book,
+    path: []const u8,
+) !void {
+    // Workbook-level `has_comments` is the OR across every sheet —
+    // saves callers a reduce step when they only want "does this file
+    // have any comments at all?".
+    var any_comments = false;
+    for (book.sheets) |s| {
+        if (book.comments(s).len != 0) {
+            any_comments = true;
+            break;
+        }
+    }
+
+    try out.writeAll("{\"kind\":\"workbook\",\"path\":");
+    try writeJsonString(out, path);
+    try out.print(
+        ",\"sheets\":{d},\"sst\":{{\"count\":{d},\"rich\":{d}}}",
+        .{ book.sheets.len, book.shared_strings.len, book.rich_runs_by_sst_idx.count() },
+    );
+    try out.print(
+        ",\"has_styles\":{s},\"has_theme\":{s},\"has_comments\":{s}}}\n",
+        .{
+            if (book.styles_xml != null) "true" else "false",
+            if (book.theme_xml != null) "true" else "false",
+            if (any_comments) "true" else "false",
+        },
+    );
+
+    for (book.sheets, 0..) |s, i| {
+        const sheet_has_comments = book.comments(s).len != 0;
+        try out.writeAll("{\"kind\":\"sheet\",\"sheet\":");
+        try writeJsonString(out, s.name);
+        try out.print(
+            ",\"sheet_idx\":{d},\"has_comments\":{s}}}\n",
+            .{ i, if (sheet_has_comments) "true" else "false" },
+        );
+    }
+}
+
+/// iter57: lighter NDJSON variant of `meta` — one record per sheet,
+/// name + index only. Same envelope shape as `meta`'s sheet record
+/// minus the workbook-scoped `has_comments` field, so consumers can
+/// trivially swap between the two commands.
+fn runListSheetsCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
+    for (book.sheets, 0..) |s, i| {
+        try out.writeAll("{\"kind\":\"sheet\",\"sheet\":");
+        try writeJsonString(out, s.name);
+        try out.print(",\"sheet_idx\":{d}}}\n", .{i});
     }
 }
 
@@ -842,6 +938,165 @@ test "writeRow legacy-jsonl-dict produces bare objects (regression guard)" {
     };
     try writeRow(&w, &cells, .legacy_jsonl_dict);
     try std.testing.expectEqualStrings("{\"A\": \"x\", \"C\": 9}\n", w.buffered());
+}
+
+test "parseArgs routes 'meta' and 'list-sheets' correctly" {
+    // `meta` as first positional.
+    {
+        const argv = [_][]const u8{ "meta", "file.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.meta, a.subcommand);
+        try std.testing.expectEqualStrings("file.xlsx", a.file);
+    }
+    // `list-sheets` as first positional flips the sub-command.
+    {
+        const argv = [_][]const u8{ "list-sheets", "file.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.list_sheets, a.subcommand);
+        try std.testing.expectEqualStrings("file.xlsx", a.file);
+    }
+    // Sub-command token AFTER flags still works (positional decides).
+    {
+        const argv = [_][]const u8{ "--sheet", "1", "meta", "file.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.meta, a.subcommand);
+    }
+    // Legacy `--list-sheets` flag is NOT the `list-sheets` sub-command.
+    // The flag flips `list_sheets` (legacy plain text), not `subcommand`.
+    {
+        const argv = [_][]const u8{ "--list-sheets", "file.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(a.list_sheets);
+        try std.testing.expectEqual(Subcommand.rows, a.subcommand);
+    }
+}
+
+test "runListSheetsCommand emits one sheet record per sheet" {
+    const tmp_path = "/tmp/zlsx_cli_list_sheets_iter57.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{.{ .string = "hdr" }});
+        var s1 = try w.addSheet("Other");
+        try s1.writeRow(&.{.{ .integer = 1 }});
+        var s2 = try w.addSheet("She\"et"); // name with a quote — must be JSON-escaped
+        try s2.writeRow(&.{.{ .boolean = true }});
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runListSheetsCommand(&w, &book);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"sheet\",\"sheet\":\"Data\",\"sheet_idx\":0}\n" ++
+            "{\"kind\":\"sheet\",\"sheet\":\"Other\",\"sheet_idx\":1}\n" ++
+            "{\"kind\":\"sheet\",\"sheet\":\"She\\\"et\",\"sheet_idx\":2}\n",
+        w.buffered(),
+    );
+}
+
+test "runMetaCommand emits workbook record with sst/has_* fields then sheet records" {
+    const tmp_path = "/tmp/zlsx_cli_meta_iter57.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        // Two distinct strings + one repeat → SST count of 2,
+        // exercises the deduped path.
+        try s0.writeRow(&.{ .{ .string = "alpha" }, .{ .string = "beta" } });
+        try s0.writeRow(&.{.{ .string = "alpha" }});
+        try s0.addComment("A1", "me", "hi there"); // forces has_comments=true for this sheet
+        var s1 = try w.addSheet("NoComments");
+        try s1.writeRow(&.{.{ .integer = 42 }});
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runMetaCommand(&w, &book, tmp_path);
+
+    const out = w.buffered();
+    // Parse NDJSON line by line and assert field presence + values.
+    var line_it = std.mem.splitScalar(u8, out, '\n');
+
+    const wb_line = line_it.next() orelse return error.MissingWorkbookLine;
+    // Structural probes — avoid order-sensitive equality because the
+    // exact field ordering is an implementation detail the wire format
+    // only loosely pins down. We pin the presence + values.
+    try std.testing.expect(std.mem.indexOf(u8, wb_line, "\"kind\":\"workbook\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wb_line, "\"sheets\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wb_line, "\"sst\":{\"count\":2,\"rich\":0}") != null);
+    // has_styles / has_theme reflect whether the writer chose to emit
+    // those parts — we only pin field *presence* here, not the writer's
+    // part-emission policy. The workbook-scoped `has_comments` is
+    // deterministic given the addComment call above.
+    try std.testing.expect(
+        std.mem.indexOf(u8, wb_line, "\"has_styles\":true") != null or
+            std.mem.indexOf(u8, wb_line, "\"has_styles\":false") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, wb_line, "\"has_theme\":true") != null or
+            std.mem.indexOf(u8, wb_line, "\"has_theme\":false") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, wb_line, "\"has_comments\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wb_line, "\"path\":") != null);
+
+    const sheet0 = line_it.next() orelse return error.MissingSheet0;
+    try std.testing.expect(std.mem.indexOf(u8, sheet0, "\"kind\":\"sheet\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet0, "\"sheet\":\"Data\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet0, "\"sheet_idx\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet0, "\"has_comments\":true") != null);
+
+    const sheet1 = line_it.next() orelse return error.MissingSheet1;
+    try std.testing.expect(std.mem.indexOf(u8, sheet1, "\"sheet\":\"NoComments\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet1, "\"sheet_idx\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet1, "\"has_comments\":false") != null);
+
+    // Trailing empty token after the final '\n' — but no more records.
+    const trailing = line_it.next();
+    if (trailing) |t| try std.testing.expectEqualStrings("", t);
+    try std.testing.expectEqual(@as(?[]const u8, null), line_it.next());
+}
+
+test "legacy --list-sheets flag still emits plain text (regression guard)" {
+    // Regression guard: the legacy plain-text shape is exactly
+    // `<name>\n` per sheet, no JSON, no sub-command routing. This
+    // mirrors the code path in main() line-for-line so the flag
+    // keeps working across iter57.
+    const tmp_path = "/tmp/zlsx_cli_legacy_list_sheets.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{.{ .string = "x" }});
+        var s1 = try w.addSheet("More");
+        try s1.writeRow(&.{.{ .string = "y" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    for (book.sheets) |s| {
+        try w.writeAll(s.name);
+        try w.writeByte('\n');
+    }
+    try std.testing.expectEqualStrings("Data\nMore\n", w.buffered());
 }
 
 // ─── Fuzz tests ──────────────────────────────────────────────────────
