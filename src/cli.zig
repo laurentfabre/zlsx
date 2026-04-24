@@ -101,6 +101,16 @@ const Args = struct {
     /// other sub-command — those have their own style exposure via
     /// the `styles` sub-command.
     with_styles: bool = false,
+    /// iter59c: expand sheet selection to every sheet in the workbook.
+    /// Mutually exclusive with `--sheet` / `--name` / `--sheet-glob`.
+    /// Ignored on workbook-scoped sub-commands (same tolerance group
+    /// as the other sheet-selector flags).
+    all_sheets: bool = false,
+    /// iter59c: simple-glob pattern (`*` any run, `?` single char,
+    /// case-sensitive). Selects every sheet whose name matches. Mutually
+    /// exclusive with `--sheet` / `--name` / `--all-sheets`. Ignored on
+    /// workbook-scoped sub-commands.
+    sheet_glob: ?[]const u8 = null,
 };
 
 const ArgError = error{
@@ -130,7 +140,8 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
             std.mem.eql(u8, a, "--take") or
             std.mem.eql(u8, a, "--start-row") or
             std.mem.eql(u8, a, "--end-row") or
-            std.mem.eql(u8, a, "--range"))
+            std.mem.eql(u8, a, "--range") or
+            std.mem.eql(u8, a, "--sheet-glob"))
         {
             i += 1; // skip paired value (bounds-checked by caller)
             continue;
@@ -189,7 +200,8 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
         } else if (std.mem.eql(u8, a, "--with-styles")) {
             out.with_styles = true;
         } else if (std.mem.eql(u8, a, "--sheet")) {
-            if (out.sheet_name != null and !workbook_scoped) return ArgError.SheetArgConflict;
+            if (!workbook_scoped and (out.sheet_name != null or out.all_sheets or out.sheet_glob != null))
+                return ArgError.SheetArgConflict;
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
             const parsed = std.fmt.parseInt(usize, argv[i], 10) catch {
@@ -198,10 +210,25 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
             };
             out.sheet_index = parsed;
         } else if (std.mem.eql(u8, a, "--name")) {
-            if (out.sheet_index != null and !workbook_scoped) return ArgError.SheetArgConflict;
+            if (!workbook_scoped and (out.sheet_index != null or out.all_sheets or out.sheet_glob != null))
+                return ArgError.SheetArgConflict;
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
             out.sheet_name = argv[i];
+        } else if (std.mem.eql(u8, a, "--all-sheets")) {
+            // iter59c: no value; expands selection to every sheet.
+            // On workbook-scoped sub-commands silently accept (same
+            // tolerance group as --sheet/--name) so wrappers can set
+            // it universally without an exit-1.
+            if (!workbook_scoped and (out.sheet_index != null or out.sheet_name != null or out.sheet_glob != null))
+                return ArgError.SheetArgConflict;
+            out.all_sheets = true;
+        } else if (std.mem.eql(u8, a, "--sheet-glob")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            if (!workbook_scoped and (out.sheet_index != null or out.sheet_name != null or out.all_sheets))
+                return ArgError.SheetArgConflict;
+            out.sheet_glob = argv[i];
         } else if (std.mem.eql(u8, a, "--format")) {
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
@@ -383,6 +410,20 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\
         \\  --sheet N         0-indexed sheet to read (default: 0)
         \\  --name NAME       select sheet by name (conflicts with --sheet)
+        \\  --all-sheets      (iter59c) iterate every sheet. Mutually
+        \\                    exclusive with --sheet / --name / --sheet-glob.
+        \\                    On `cells` / `rows`, --skip / --take apply
+        \\                    GLOBALLY across the concatenated cross-sheet
+        \\                    stream (not per sheet). --header / --start-row
+        \\                    / --end-row / --range are PER-SHEET — each
+        \\                    sheet independently resolves its first-row
+        \\                    keys and row bounds. Silently accepted (and
+        \\                    ignored) on workbook-scoped sub-commands.
+        \\  --sheet-glob PAT  (iter59c) simple-glob over sheet names:
+        \\                    `*` matches any run, `?` one char; case-
+        \\                    sensitive. Mutually exclusive with --sheet /
+        \\                    --name / --all-sheets. Scope and per-sheet
+        \\                    vs global interactions match --all-sheets.
         \\  --format FMT      jsonl | legacy-jsonl | legacy-jsonl-dict | jsonl-dict | tsv | csv
         \\                    (default: jsonl — NDJSON row envelope; iter55a.
         \\                    Applies to the `rows` sub-command only; ignored
@@ -991,7 +1032,7 @@ pub fn main() !u8 {
                 try err.writeAll("zlsx: sheet not found\n");
                 return 3;
             };
-            try runCommentsCommand(out, &book, filter, args.skip, args.take, args.start_row, args.end_row);
+            try runCommentsCommand(out, &book, filter, args, args.skip, args.take, args.start_row, args.end_row);
             return 0;
         },
         .validations => {
@@ -999,7 +1040,7 @@ pub fn main() !u8 {
                 try err.writeAll("zlsx: sheet not found\n");
                 return 3;
             };
-            try runValidationsCommand(out, &book, filter, args.skip, args.take);
+            try runValidationsCommand(out, &book, filter, args, args.skip, args.take);
             return 0;
         },
         .hyperlinks => {
@@ -1007,7 +1048,7 @@ pub fn main() !u8 {
                 try err.writeAll("zlsx: sheet not found\n");
                 return 3;
             };
-            try runHyperlinksCommand(out, &book, filter, args.skip, args.take);
+            try runHyperlinksCommand(out, &book, filter, args, args.skip, args.take);
             return 0;
         },
         .styles => {
@@ -1021,32 +1062,37 @@ pub fn main() !u8 {
         .rows, .cells => {},
     }
 
-    const Selected = struct { sheet: xlsx.Sheet, idx: usize };
-    const selected: Selected = blk: {
-        if (args.sheet_name) |n| {
-            // Linear scan so we recover the 0-based index too — the
-            // envelope emitter needs it per-record.
-            for (book.sheets, 0..) |s, i| {
-                if (std.mem.eql(u8, s.name, n)) break :blk .{ .sheet = s, .idx = i };
+    // iter59c: resolve the sheet selection up-front. --all-sheets /
+    // --sheet-glob expand to every matching sheet; --sheet / --name
+    // narrow to one; default is still sheet 0. Errors stay on the same
+    // exit paths as before.
+    if (book.sheets.len == 0) {
+        try err.writeAll("zlsx: workbook has no sheets\n");
+        return 3;
+    }
+    if (args.sheet_name) |n| {
+        var found: bool = false;
+        for (book.sheets) |s| {
+            if (std.mem.eql(u8, s.name, n)) {
+                found = true;
+                break;
             }
+        }
+        if (!found) {
             try err.print("zlsx: no sheet named '{s}'\n", .{n});
             return 3;
         }
-        const idx = args.sheet_index orelse 0;
-        if (book.sheets.len == 0) {
-            try err.writeAll("zlsx: workbook has no sheets\n");
-            return 3;
-        }
+    }
+    if (args.sheet_index) |idx| {
         if (idx >= book.sheets.len) {
             try err.print("zlsx: sheet index {d} out of range (workbook has {d})\n", .{ idx, book.sheets.len });
             return 3;
         }
-        break :blk .{ .sheet = book.sheets[idx], .idx = idx };
-    };
+    }
 
     switch (args.subcommand) {
-        .rows => try runRowsCommand(out, &book, selected.sheet, selected.idx, args.format, alloc, args.skip, args.take, args.start_row, args.end_row, args.range, args.header, args.include_blanks, args.with_styles),
-        .cells => try runCellsCommand(out, &book, selected.sheet, selected.idx, alloc, args.skip, args.take, args.start_row, args.end_row, args.range, args.include_blanks, args.with_styles),
+        .rows => try runRowsAcrossSheets(out, &book, args, alloc),
+        .cells => try runCellsAcrossSheets(out, &book, args, alloc),
         // Handled by the workbook-scoped early return above.
         .meta,
         .list_sheets,
@@ -1091,6 +1137,10 @@ const Pagination = struct {
     }
 };
 
+/// iter59c: single-sheet row driver. Kept for call-site compat with
+/// the existing test suite — constructs a fresh Pagination internally.
+/// Multi-sheet callers go through `runRowsAcrossSheets` so pagination
+/// persists across sheets per the design-doc global-stream semantics.
 fn runRowsCommand(
     out: *std.Io.Writer,
     book: *xlsx.Book,
@@ -1100,6 +1150,29 @@ fn runRowsCommand(
     alloc: std.mem.Allocator,
     skip: ?usize,
     take: ?usize,
+    start_row: ?u32,
+    end_row: ?u32,
+    range: ?xlsx.MergeRange,
+    header: bool,
+    include_blanks: bool,
+    with_styles: bool,
+) !void {
+    var pg = Pagination.init(skip, take);
+    try runRowsOnSheet(out, book, sheet, sheet_idx, format, alloc, &pg, start_row, end_row, range, header, include_blanks, with_styles);
+}
+
+/// iter59c: per-sheet body of `rows`. Takes the Pagination by pointer
+/// so cross-sheet drivers can thread one counter through every sheet —
+/// `--skip N --take M` slices the concatenated stream, not per sheet.
+/// Header state is local to this call (per-sheet reset by design).
+fn runRowsOnSheet(
+    out: *std.Io.Writer,
+    book: *xlsx.Book,
+    sheet: xlsx.Sheet,
+    sheet_idx: usize,
+    format: Format,
+    alloc: std.mem.Allocator,
+    pg: *Pagination,
     start_row: ?u32,
     end_row: ?u32,
     range: ?xlsx.MergeRange,
@@ -1160,7 +1233,6 @@ fn runRowsCommand(
     var masked_styles: std.ArrayListUnmanaged(?u32) = .{};
     defer masked_styles.deinit(alloc);
 
-    var pg = Pagination.init(skip, take);
     while (try rows.next()) |cells| {
         const row_number = rows.currentRowNumber();
         // Row bounds run BEFORE pagination (design doc v4.1).
@@ -1325,6 +1397,10 @@ fn captureHeaderKeys(
 /// sheet. Empty cells are suppressed (matches envelope semantics on
 /// the rows path). `--format` is intentionally ignored here — the
 /// `cells` sub-command has a single fixed wire shape.
+///
+/// iter59c: single-sheet entry kept for test-call compat. Multi-sheet
+/// drivers use `runCellsOnSheet` directly so Pagination persists across
+/// sheets (cross-sheet --skip / --take slice the concatenated stream).
 fn runCellsCommand(
     out: *std.Io.Writer,
     book: *xlsx.Book,
@@ -1333,6 +1409,25 @@ fn runCellsCommand(
     alloc: std.mem.Allocator,
     skip: ?usize,
     take: ?usize,
+    start_row: ?u32,
+    end_row: ?u32,
+    range: ?xlsx.MergeRange,
+    include_blanks: bool,
+    with_styles: bool,
+) !void {
+    var pg = Pagination.init(skip, take);
+    try runCellsOnSheet(out, book, sheet, sheet_idx, alloc, &pg, start_row, end_row, range, include_blanks, with_styles);
+}
+
+/// iter59c: per-sheet cell emitter — takes Pagination by pointer so a
+/// cross-sheet driver can thread the same counter across every sheet.
+fn runCellsOnSheet(
+    out: *std.Io.Writer,
+    book: *xlsx.Book,
+    sheet: xlsx.Sheet,
+    sheet_idx: usize,
+    alloc: std.mem.Allocator,
+    pg: *Pagination,
     start_row: ?u32,
     end_row: ?u32,
     range: ?xlsx.MergeRange,
@@ -1358,7 +1453,6 @@ fn runCellsCommand(
         break :blk @min(a.?, b.?);
     };
 
-    var pg = Pagination.init(skip, take);
     while (try rows.next()) |cells| {
         const row_number = rows.currentRowNumber();
         if (row_lo) |s| if (row_number < s) continue;
@@ -1401,6 +1495,87 @@ fn runCellsCommand(
                 style_ctx,
             );
         }
+    }
+}
+
+/// iter59c: cross-sheet predicate for `cells` / `rows`. Centralises
+/// the 4-way selection matrix (--sheet / --name / --all-sheets /
+/// --sheet-glob / default=first) so both drivers stay in lockstep.
+/// Returns true iff the sheet at (name, idx) is in the selection.
+/// Assumes parseArgs already rejected mutually-exclusive combinations
+/// and main() already bounds-checked --sheet / --name against the book.
+fn sheetSelectedForCellsRows(args: Args, sheet_name: []const u8, sheet_idx: usize) bool {
+    if (args.sheet_index) |idx| return sheet_idx == idx;
+    if (args.sheet_name) |n| return std.mem.eql(u8, sheet_name, n);
+    if (args.sheet_glob) |pat| return globMatch(pat, sheet_name);
+    if (args.all_sheets) return true;
+    return sheet_idx == 0;
+}
+
+/// iter59c: multi-sheet driver for the `cells` sub-command. Walks the
+/// workbook once, emitting through `runCellsOnSheet` for every sheet
+/// that matches the selector. Pagination lives HERE (not per sheet) so
+/// `--skip N --take M` slices the concatenated cross-sheet stream per
+/// docs/jq-for-excel.md v4.1: "--skip 1000 --take 500 takes records
+/// 1001-1500 across the full cross-sheet stream, not per sheet."
+fn runCellsAcrossSheets(
+    out: *std.Io.Writer,
+    book: *xlsx.Book,
+    args: Args,
+    alloc: std.mem.Allocator,
+) !void {
+    var pg = Pagination.init(args.skip, args.take);
+    for (book.sheets, 0..) |s, sheet_idx| {
+        if (!sheetSelectedForCellsRows(args, s.name, sheet_idx)) continue;
+        // Short-circuit once --take is satisfied — checked BEFORE
+        // opening the next sheet's row stream to avoid useless I/O.
+        if (args.take) |t| if (pg.taken >= t) return;
+        try runCellsOnSheet(
+            out,
+            book,
+            s,
+            sheet_idx,
+            alloc,
+            &pg,
+            args.start_row,
+            args.end_row,
+            args.range,
+            args.include_blanks,
+            args.with_styles,
+        );
+    }
+}
+
+/// iter59c: multi-sheet driver for `rows`. Same cross-sheet pagination
+/// contract as `runCellsAcrossSheets`. `--header` is per-sheet by
+/// design (each sheet's first in-bounds row becomes that sheet's keys)
+/// — the header state lives inside `runRowsOnSheet`, so calling it
+/// once per sheet naturally resets keys between sheets.
+fn runRowsAcrossSheets(
+    out: *std.Io.Writer,
+    book: *xlsx.Book,
+    args: Args,
+    alloc: std.mem.Allocator,
+) !void {
+    var pg = Pagination.init(args.skip, args.take);
+    for (book.sheets, 0..) |s, sheet_idx| {
+        if (!sheetSelectedForCellsRows(args, s.name, sheet_idx)) continue;
+        if (args.take) |t| if (pg.taken >= t) return;
+        try runRowsOnSheet(
+            out,
+            book,
+            s,
+            sheet_idx,
+            args.format,
+            alloc,
+            &pg,
+            args.start_row,
+            args.end_row,
+            args.range,
+            args.header,
+            args.include_blanks,
+            args.with_styles,
+        );
     }
 }
 
@@ -1473,7 +1648,15 @@ fn runListSheetsCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
 /// default for sheet-scoped-but-multi-sheet commands like comments /
 /// validations / hyperlinks). Returns error.SheetNotFound when a
 /// concrete selector was given but doesn't match the workbook.
+///
+/// iter59c: --all-sheets / --sheet-glob also collapse to null here so
+/// the existing comments/validations/hyperlinks loop iterates every
+/// sheet; per-sheet inclusion is then decided by `isSheetIncluded`.
 fn resolveSheetFilter(book: *const xlsx.Book, args: Args) !?usize {
+    // iter59c: --all-sheets / --sheet-glob both mean "visit every
+    // sheet and let isSheetIncluded decide". Return null so the caller
+    // takes the multi-sheet branch.
+    if (args.all_sheets or args.sheet_glob != null) return null;
     if (args.sheet_index) |idx| {
         if (idx >= book.sheets.len) return error.SheetNotFound;
         return idx;
@@ -1485,6 +1668,44 @@ fn resolveSheetFilter(book: *const xlsx.Book, args: Args) !?usize {
         return error.SheetNotFound;
     }
     return null;
+}
+
+/// iter59c: simple-glob matcher. `*` matches any run (including empty),
+/// `?` matches exactly one char. Case-sensitive, no escapes. Recursive
+/// — pattern depth is bounded by `*` count, and user-supplied patterns
+/// are tiny in practice (sheet-name glob, not path glob).
+fn globMatch(pattern: []const u8, text: []const u8) bool {
+    if (pattern.len == 0) return text.len == 0;
+    if (pattern[0] == '*') {
+        // Skip consecutive stars to keep the recursion shallow.
+        var p_rest = pattern[1..];
+        while (p_rest.len > 0 and p_rest[0] == '*') p_rest = p_rest[1..];
+        if (p_rest.len == 0) return true; // trailing star matches the rest
+        var i: usize = 0;
+        while (i <= text.len) : (i += 1) {
+            if (globMatch(p_rest, text[i..])) return true;
+        }
+        return false;
+    }
+    if (text.len == 0) return false;
+    if (pattern[0] == '?' or pattern[0] == text[0]) {
+        return globMatch(pattern[1..], text[1..]);
+    }
+    return false;
+}
+
+/// iter59c: per-sheet inclusion test used inside the multi-sheet loops
+/// of comments / validations / hyperlinks / rows / cells. When the
+/// caller already narrowed to a concrete index via `resolveSheetFilter`
+/// → Some(idx), it only defers to that. Otherwise:
+/// - --sheet-glob matches sheet name against the pattern;
+/// - --all-sheets accepts every sheet;
+/// - default (none set) accepts only sheet 0.
+fn isSheetIncluded(args: Args, sheet_name: []const u8, sheet_idx: usize) bool {
+    if (args.sheet_glob) |pat| return globMatch(pat, sheet_name);
+    if (args.all_sheets) return true;
+    // iter55a default: first sheet only.
+    return sheet_idx == 0;
 }
 
 /// Emit an `"A1"`-style ref into `buf` from a reader-shape CellRef
@@ -1579,12 +1800,20 @@ fn rangeFromBounds(buf: *[32]u8, top_left: xlsx.CellRef, bottom_right: xlsx.Cell
     return std.fmt.bufPrint(buf, "{s}:{s}", .{ tl, br }) catch unreachable;
 }
 
-/// Emit one NDJSON record per comment. When `filter` is set, only
-/// the matching sheet contributes; otherwise every sheet iterates.
+/// Emit one NDJSON record per comment. Sheet selection follows the
+/// unified iter59c rules:
+///  - `filter = Some(idx)` → only that sheet (--sheet / --name);
+///  - `filter = null` → fall back to `isSheetIncluded(args, …)` —
+///    `--all-sheets` / `--sheet-glob` gate, else every sheet (legacy
+///    default for this sub-command, preserved for back-compat).
+///
+/// Pagination persists across sheets so `--skip` / `--take` slice the
+/// concatenated cross-sheet stream (per docs/jq-for-excel.md v4.1).
 fn runCommentsCommand(
     out: *std.Io.Writer,
     book: *const xlsx.Book,
     filter: ?usize,
+    args: Args,
     skip: ?usize,
     take: ?usize,
     start_row: ?u32,
@@ -1592,7 +1821,14 @@ fn runCommentsCommand(
 ) !void {
     var pg = Pagination.init(skip, take);
     for (book.sheets, 0..) |s, sheet_idx| {
-        if (filter) |f| if (sheet_idx != f) continue;
+        if (filter) |f| {
+            if (sheet_idx != f) continue;
+        } else if (args.sheet_glob != null or args.all_sheets) {
+            // iter59c: honour the glob/--all-sheets pair. When neither
+            // is set, the legacy "iterate every sheet" default is kept
+            // (this sub-command has no natural `sheet 0 only` anchor).
+            if (!isSheetIncluded(args, s.name, sheet_idx)) continue;
+        }
         for (book.comments(s)) |c| {
             // Comments are not guaranteed monotonic by row across a
             // sheet's comment list (OOXML preserves author/insertion
@@ -1627,18 +1863,23 @@ fn runCommentsCommand(
     }
 }
 
-/// Emit one NDJSON record per data-validation range. When `filter`
-/// is set, only the matching sheet contributes.
+/// Emit one NDJSON record per data-validation range. Sheet selection
+/// follows the same iter59c rules as runCommentsCommand — see there.
 fn runValidationsCommand(
     out: *std.Io.Writer,
     book: *const xlsx.Book,
     filter: ?usize,
+    args: Args,
     skip: ?usize,
     take: ?usize,
 ) !void {
     var pg = Pagination.init(skip, take);
     for (book.sheets, 0..) |s, sheet_idx| {
-        if (filter) |f| if (sheet_idx != f) continue;
+        if (filter) |f| {
+            if (sheet_idx != f) continue;
+        } else if (args.sheet_glob != null or args.all_sheets) {
+            if (!isSheetIncluded(args, s.name, sheet_idx)) continue;
+        }
         for (book.dataValidations(s)) |dv| {
             switch (pg.consume()) {
                 .drop => continue,
@@ -1676,18 +1917,23 @@ fn runValidationsCommand(
     }
 }
 
-/// Emit one NDJSON record per hyperlink. When `filter` is set, only
-/// the matching sheet contributes.
+/// Emit one NDJSON record per hyperlink. Sheet selection follows the
+/// same iter59c rules as runCommentsCommand — see there.
 fn runHyperlinksCommand(
     out: *std.Io.Writer,
     book: *const xlsx.Book,
     filter: ?usize,
+    args: Args,
     skip: ?usize,
     take: ?usize,
 ) !void {
     var pg = Pagination.init(skip, take);
     for (book.sheets, 0..) |s, sheet_idx| {
-        if (filter) |f| if (sheet_idx != f) continue;
+        if (filter) |f| {
+            if (sheet_idx != f) continue;
+        } else if (args.sheet_glob != null or args.all_sheets) {
+            if (!isSheetIncluded(args, s.name, sheet_idx)) continue;
+        }
         for (book.hyperlinks(s)) |h| {
             switch (pg.consume()) {
                 .drop => continue,
@@ -3501,7 +3747,10 @@ test "runCommentsCommand emits one record per comment across every sheet" {
 
     var scratch: [2048]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runCommentsCommand(&w, &book, null, null, null, null, null);
+    // Args carries default flags; filter=null + no --all-sheets/--glob
+    // preserves the legacy "iterate every sheet" default for this sub-cmd.
+    const default_args: Args = .{ .file = "", .subcommand = .comments };
+    try runCommentsCommand(&w, &book, null, default_args, null, null, null, null);
 
     const out = w.buffered();
     try std.testing.expect(std.mem.startsWith(u8, out, "{\"kind\":\"comment\""));
@@ -3540,7 +3789,8 @@ test "runValidationsCommand emits list validation with values array" {
 
     var scratch: [2048]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runValidationsCommand(&w, &book, null, null, null);
+    const default_args: Args = .{ .file = "", .subcommand = .validations };
+    try runValidationsCommand(&w, &book, null, default_args, null, null);
 
     const out = w.buffered();
     try std.testing.expect(std.mem.startsWith(u8, out, "{\"kind\":\"validation\""));
@@ -3570,7 +3820,8 @@ test "runHyperlinksCommand emits url set + location null for external links" {
 
     var scratch: [2048]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runHyperlinksCommand(&w, &book, null, null, null);
+    const default_args: Args = .{ .file = "", .subcommand = .hyperlinks };
+    try runHyperlinksCommand(&w, &book, null, default_args, null, null);
 
     const out = w.buffered();
     try std.testing.expect(std.mem.startsWith(u8, out, "{\"kind\":\"hyperlink\""));
@@ -3788,4 +4039,224 @@ test "fuzz writeCsvField: balanced quotes + no bare quote outside them" {
             }
         }
     }
+}
+
+// ─── iter59c: --all-sheets / --sheet-glob ──────────────────────────
+
+test "parseArgs --all-sheets alone sets the flag" {
+    const argv = [_][]const u8{ "cells", "f.xlsx", "--all-sheets" };
+    const a = try parseArgs(&argv);
+    try std.testing.expect(a.all_sheets);
+    try std.testing.expect(a.sheet_glob == null);
+    try std.testing.expect(a.sheet_index == null);
+    try std.testing.expect(a.sheet_name == null);
+}
+
+test "parseArgs --sheet-glob alone stores the pattern" {
+    const argv = [_][]const u8{ "cells", "f.xlsx", "--sheet-glob", "Data*" };
+    const a = try parseArgs(&argv);
+    try std.testing.expect(!a.all_sheets);
+    try std.testing.expectEqualStrings("Data*", a.sheet_glob.?);
+}
+
+test "parseArgs rejects --all-sheets combined with --sheet" {
+    {
+        const argv = [_][]const u8{ "cells", "f.xlsx", "--all-sheets", "--sheet", "0" };
+        try std.testing.expectError(ArgError.SheetArgConflict, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "cells", "f.xlsx", "--sheet", "0", "--all-sheets" };
+        try std.testing.expectError(ArgError.SheetArgConflict, parseArgs(&argv));
+    }
+}
+
+test "parseArgs rejects --sheet-glob combined with --name" {
+    const argv = [_][]const u8{ "cells", "f.xlsx", "--name", "Sheet1", "--sheet-glob", "S*" };
+    try std.testing.expectError(ArgError.SheetArgConflict, parseArgs(&argv));
+}
+
+test "parseArgs rejects --all-sheets combined with --sheet-glob" {
+    const argv = [_][]const u8{ "cells", "f.xlsx", "--all-sheets", "--sheet-glob", "S*" };
+    try std.testing.expectError(ArgError.SheetArgConflict, parseArgs(&argv));
+}
+
+test "parseArgs tolerates --all-sheets / --sheet-glob on workbook-scoped sub-commands" {
+    // Wrappers that set these flags universally must still reach
+    // meta / list-sheets / styles / sst without exit-1 (same tolerance
+    // group as --sheet / --name per the iter58 design).
+    inline for (.{ "meta", "list-sheets", "styles", "sst" }) |cmd| {
+        {
+            const argv = [_][]const u8{ cmd, "f.xlsx", "--all-sheets" };
+            const a = try parseArgs(&argv);
+            try std.testing.expect(a.all_sheets);
+        }
+        {
+            const argv = [_][]const u8{ cmd, "f.xlsx", "--sheet-glob", "*" };
+            const a = try parseArgs(&argv);
+            try std.testing.expect(a.sheet_glob != null);
+        }
+    }
+}
+
+test "parseArgs --sheet-glob value isn't mistaken for a sub-command token" {
+    // detectSubcommand must skip the value of --sheet-glob so a pattern
+    // that happens to equal a sub-command name ("cells", "rows", …)
+    // doesn't re-route the subcommand decision. Regression guard for
+    // detectSubcommand's skip-pair list.
+    const argv = [_][]const u8{ "rows", "--sheet-glob", "cells", "f.xlsx" };
+    const a = try parseArgs(&argv);
+    try std.testing.expectEqual(Subcommand.rows, a.subcommand);
+    try std.testing.expectEqualStrings("f.xlsx", a.file);
+    try std.testing.expectEqualStrings("cells", a.sheet_glob.?);
+}
+
+test "globMatch literal / wildcards / edge cases" {
+    // Literal
+    try std.testing.expect(globMatch("Sheet1", "Sheet1"));
+    try std.testing.expect(!globMatch("Sheet1", "Sheet2"));
+    // `*` runs
+    try std.testing.expect(globMatch("*", ""));
+    try std.testing.expect(globMatch("*", "anything"));
+    try std.testing.expect(globMatch("Data*", "Data"));
+    try std.testing.expect(globMatch("Data*", "Data123"));
+    try std.testing.expect(!globMatch("Data*", "NoData"));
+    try std.testing.expect(globMatch("*Data", "XData"));
+    try std.testing.expect(globMatch("*Data*", "XDataY"));
+    try std.testing.expect(globMatch("a*b*c", "abc"));
+    try std.testing.expect(globMatch("a*b*c", "a123b456c"));
+    try std.testing.expect(!globMatch("a*b*c", "a123b456"));
+    // `?` exact single char
+    try std.testing.expect(globMatch("S?2", "Sh2"));
+    try std.testing.expect(!globMatch("S?2", "S2"));
+    try std.testing.expect(!globMatch("S?2", "Sh22"));
+    // Empty pattern vs empty text
+    try std.testing.expect(globMatch("", ""));
+    try std.testing.expect(!globMatch("", "x"));
+    try std.testing.expect(!globMatch("x", ""));
+    // Pattern longer than input
+    try std.testing.expect(!globMatch("abcd", "abc"));
+    // Case-sensitive
+    try std.testing.expect(!globMatch("sheet", "Sheet"));
+    // Consecutive `*` collapse
+    try std.testing.expect(globMatch("**", "hello"));
+    try std.testing.expect(globMatch("a***b", "axyzb"));
+}
+
+test "runCellsAcrossSheets --all-sheets emits every sheet with correct sheet_idx" {
+    const tmp_path = "/tmp/zlsx_cli_all_sheets_iter59c.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Alpha");
+        try s0.writeRow(&.{.{ .string = "A1_alpha" }});
+        var s1 = try w.addSheet("Beta");
+        try s1.writeRow(&.{.{ .string = "A1_beta" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    const args: Args = .{ .file = "", .subcommand = .cells, .all_sheets = true };
+    try runCellsAcrossSheets(&w, &book, args, std.testing.allocator);
+    const out = w.buffered();
+
+    // Alpha record first, Beta second — sheet_idx monotonic.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet\":\"Alpha\",\"sheet_idx\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet\":\"Beta\",\"sheet_idx\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"A1_alpha\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"A1_beta\"") != null);
+}
+
+test "runCellsAcrossSheets --sheet-glob selects only matching sheets" {
+    const tmp_path = "/tmp/zlsx_cli_glob_iter59c.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Sheet1");
+        try s0.writeRow(&.{.{ .string = "v1" }});
+        var s1 = try w.addSheet("Sheet2");
+        try s1.writeRow(&.{.{ .string = "v2" }});
+        var s2 = try w.addSheet("Data3");
+        try s2.writeRow(&.{.{ .string = "v3" }});
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    // `S*2` matches "Sheet2" only.
+    const args: Args = .{ .file = "", .subcommand = .cells, .sheet_glob = "S*2" };
+    try runCellsAcrossSheets(&w, &book, args, std.testing.allocator);
+    const out = w.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"v2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"v1\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"v3\"") == null);
+    // `sheet_idx` for Sheet2 is 1, not 0 — the emitter uses the real
+    // book position, not a filtered-stream ordinal.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet_idx\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet_idx\":0") == null);
+}
+
+test "runCellsAcrossSheets --all-sheets --skip --take slices the cross-sheet stream" {
+    const tmp_path = "/tmp/zlsx_cli_cross_pag_iter59c.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("A");
+        // 3 cells on sheet 0 → a, b, c.
+        try s0.writeRow(&.{ .{ .string = "a" }, .{ .string = "b" }, .{ .string = "c" } });
+        var s1 = try w.addSheet("B");
+        // 3 cells on sheet 1 → d, e, f.
+        try s1.writeRow(&.{ .{ .string = "d" }, .{ .string = "e" }, .{ .string = "f" } });
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var scratch: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    // Concatenated stream: a, b, c, d, e, f. --skip 2 --take 3 → c, d, e.
+    const args: Args = .{
+        .file = "",
+        .subcommand = .cells,
+        .all_sheets = true,
+        .skip = 2,
+        .take = 3,
+    };
+    try runCellsAcrossSheets(&w, &book, args, std.testing.allocator);
+    const out = w.buffered();
+
+    const countLines = struct {
+        fn f(s: []const u8) usize {
+            var n: usize = 0;
+            for (s) |c| if (c == '\n') {
+                n += 1;
+            };
+            return n;
+        }
+    }.f;
+
+    try std.testing.expectEqual(@as(usize, 3), countLines(out));
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"a\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"b\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"c\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"d\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"e\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"f\"") == null);
+    // Cross-sheet: both sheets must contribute at least one record.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet\":\"A\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet\":\"B\"") != null);
 }
