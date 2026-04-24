@@ -1085,6 +1085,7 @@ fn runMain() !u8 {
     const args = parseArgs(raw_args[1..]) catch |e| switch (e) {
         ArgError.HelpRequested => {
             try writeUsage(out);
+            try out.flush();
             return 0;
         },
         ArgError.NoFile => {
@@ -1124,6 +1125,7 @@ fn runMain() !u8 {
             try out.writeAll(s.name);
             try out.writeByte('\n');
         }
+        try out.flush();
         return 0;
     }
 
@@ -1681,6 +1683,11 @@ fn runCellsAcrossSheets(
             args.with_styles,
         );
     }
+    // iter60a-P1 follow-up: final explicit flush so stdout write
+    // failures (ENOSPC, closed pipe on completion, etc.) surface as
+    // error.WriteFailed → classifyTopLevelError → exit 5 instead of
+    // being silently swallowed by the defer-catch-swallow in runMain.
+    try out.flush();
 }
 
 /// iter59c: multi-sheet driver for `rows`. Same cross-sheet pagination
@@ -1715,6 +1722,7 @@ fn runRowsAcrossSheets(
             args.with_styles,
         );
     }
+    try out.flush();
 }
 
 /// iter57: emit the workbook record followed by one sheet record per
@@ -1766,6 +1774,7 @@ fn runMetaCommand(
             .{ i, if (sheet_has_comments) "true" else "false" },
         );
     }
+    try out.flush();
 }
 
 /// iter57: lighter NDJSON variant of `meta` — one record per sheet,
@@ -1779,6 +1788,7 @@ fn runListSheetsCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
         try writeJsonString(out, s.name);
         try out.print(",\"sheet_idx\":{d}}}\n", .{i});
     }
+    try out.flush();
 }
 
 // ─── iter58: reader-surface sub-commands ─────────────────────────────
@@ -2012,6 +2022,7 @@ fn runCommentsCommand(
             try out.writeAll("}\n");
         }
     }
+    try out.flush();
 }
 
 /// Emit one NDJSON record per data-validation range. Sheet selection
@@ -2068,6 +2079,7 @@ fn runValidationsCommand(
             try out.writeAll("}\n");
         }
     }
+    try out.flush();
 }
 
 /// Emit one NDJSON record per hyperlink. Sheet selection follows the
@@ -2109,6 +2121,7 @@ fn runHyperlinksCommand(
             try out.writeAll("}\n");
         }
     }
+    try out.flush();
 }
 
 /// Emit `{…}` for a BorderSide or `null` when the side has no style.
@@ -2368,6 +2381,7 @@ fn runStylesCommand(
         if (book.numberFormat(idx)) |nf| try writeJsonString(out, nf) else try out.writeAll("null");
         try out.writeAll("}\n");
     }
+    try out.flush();
 }
 
 /// Emit one NDJSON record per shared-string entry.
@@ -2391,6 +2405,7 @@ fn runSstCommand(
         try writeRichRunsOrNull(out, book.richRuns(i));
         try out.writeAll("}\n");
     }
+    try out.flush();
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
