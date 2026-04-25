@@ -446,6 +446,16 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     if (out.output == .pretty_json and detected_sub != .meta) {
         return ArgError.BadArgValue;
     }
+    // `--format` shapes only `rows` output. On sheet-scoped sub-commands
+    // (cells / comments / validations / hyperlinks) the emitter ignores
+    // it, so reject anything but the implicit `jsonl` default rather than
+    // silently producing the wrong shape. Workbook-scoped sub-commands
+    // (meta / list-sheets / styles / sst) keep their existing tolerance —
+    // wrappers append `--format` universally and we don't want to break
+    // them.
+    if (!workbook_scoped and detected_sub != .rows and out.format != .jsonl) {
+        return ArgError.BadFormat;
+    }
     return out;
 }
 
