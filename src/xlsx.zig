@@ -1094,6 +1094,23 @@ pub const Book = struct {
         self.* = undefined;
     }
 
+    /// Resolved shared string at `idx`. Errors with `MalformedXml`
+    /// when `idx` is past the end of the SST. Eager-backend accessor;
+    /// the streaming-SST plan (docs/plans/streaming-sst.md) introduces
+    /// a lazy variant in iter-sst-3 — this iter-sst-1 accessor
+    /// centralises the lookup so future migration touches one site.
+    pub fn sharedStringAt(self: *const Book, idx: usize) ![]const u8 {
+        if (idx >= self.shared_strings.len) return error.MalformedXml;
+        return self.shared_strings[idx];
+    }
+
+    /// Total entries in the SST. Equivalent to `shared_strings.len`
+    /// today; iter-sst-3's lazy backend keeps this O(1) without
+    /// materialising any entry.
+    pub fn sharedStringsCount(self: *const Book) usize {
+        return self.shared_strings.len;
+    }
+
     /// Find the sheet by display name (case-sensitive). Returns null if
     /// the workbook doesn't have it.
     pub fn sheetByName(self: *const Book, name: []const u8) ?Sheet {
@@ -1840,6 +1857,14 @@ pub const Rows = struct {
     fn resolveSharedString(self: *Rows, body: []const u8) !Cell {
         const idx_text = extractVValue(body) orelse return error.MalformedXml;
         const idx = std.fmt.parseInt(u32, idx_text, 10) catch return error.MalformedXml;
+        // Production path: route through Book.sharedStringAt so iter-sst-3's
+        // lazy backend can flip storage without touching the cell hot path.
+        // Test scaffolding sometimes constructs Rows with `book = null` and
+        // a direct `shared_strings` snapshot — fall through to the snapshot
+        // in that case.
+        if (self.book) |book| {
+            return .{ .string = try book.sharedStringAt(idx) };
+        }
         if (idx >= self.shared_strings.len) return error.MalformedXml;
         return .{ .string = self.shared_strings[idx] };
     }
