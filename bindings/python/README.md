@@ -157,7 +157,8 @@ with zlsx.write("out.xlsx") as w:
 **Out** (by design, or queued)
 
 - `.xls` / `.xlsb` / `.ods` — never
-- Formula evaluation — never (reader returns cached values, writer emits no cached results)
+- Formula evaluation — never (the reader returns the cached `<v>` value Excel stored; zlsx never runs a formula engine)
+- Formula cells on write — Python binding doesn't expose `write_row_with_formulas` yet (the Zig writer ships it; binding is queued)
 - Load → modify → save round-trip — Phase 3c queued
 - Pictures / charts / pivots — out of scope
 
