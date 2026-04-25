@@ -68,7 +68,7 @@ This is a **different schema** that consumers opt into explicitly — not a sile
 | `zlsx meta <file>` | `"workbook"` + `"sheet"` | workbook record first, then one per sheet |
 | `zlsx list-sheets <file>` | `"sheet"` | `name, sheet_idx, rows` — lighter-weight than `meta` |
 
-Short `zlsx <file>` stays as an alias for `zlsx cells <file>` — which, per the v3-revised default, streams **the first sheet only**. Users who want every sheet pass `--all-sheets` explicitly (on either form). The existing `--format {jsonl,jsonl-dict,tsv,csv}` on `rows` stays for backward compat; the default output on new commands is pure NDJSON with no format selector.
+Short `zlsx <file>` is an alias for `zlsx rows <file>` — which streams **the first sheet only** by default. Users who want every sheet pass `--all-sheets` explicitly (on either form). The existing `--format {jsonl,jsonl-dict,tsv,csv}` on `rows` stays for backward compat; the default output on new commands is pure NDJSON with no format selector.
 
 ## Record shapes
 
@@ -289,7 +289,7 @@ zlsx cells financials.xlsx --sheet-glob '2024-*' | ./my-model
 ## Open design questions
 
 1. **Formula cached values**: `t:"formula"` always has `formula`; `cached` field is present only when Excel stored a cached result. Should we auto-recalculate? **Proposal: no** — zlsx is a reader, not a spreadsheet engine. Callers that need the computed value can shell out to libreoffice / excel.
-2. ~~**`--all-sheets` as default?**~~ **Resolved in v3**: default is first sheet only; `--all-sheets` is explicit opt-in. The `jq`-style "operate on all input" argument was outweighed by Excel-user surprise on multi-sheet workbooks where the first sheet is typically the "main" sheet and the rest is support/scratch. (The short alias `zlsx <file>` was re-pointed in v4 to match — see the CLI section.)
+2. ~~**`--all-sheets` as default?**~~ **Resolved in v3**: default is first sheet only; `--all-sheets` is explicit opt-in. The `jq`-style "operate on all input" argument was outweighed by Excel-user surprise on multi-sheet workbooks where the first sheet is typically the "main" sheet and the rest is support/scratch. (The short alias `zlsx <file>` is `rows <file>` — also first-sheet-only by default. See the CLI section.)
 3. **Error record placement**: inline in stdout or only stderr? **Proposal: both** — emit to stdout (callers can filter via `jq`) AND to stderr (scripts that care about failure can grep). The stderr copy drops sheet/sheet_idx provenance since stderr is unordered.
 4. **Styles identity**: do cells carry `style:{bold:…}` (inlined) or `style_idx:42` with a separate `zlsx styles` stream for the lookup table? **Proposal: inline** — keeps each cell record self-contained, avoids pipeline composition order. Callers who care about style dedup can do it in jq.
 5. **Large SST in memory**: for 500 MB workbooks with 10M SST entries, the SST pre-load blows RAM. **Proposal: acceptable for iter54-60**; mitigate in a later iter by streaming SST + building an on-disk mmap index.
@@ -340,7 +340,7 @@ Same answer as v1, still correct:
 
 | v3 problem | v4 resolution |
 |---|---|
-| "Open design question #2" still proposed `--all-sheets` as default — directly contradicted the v3 CLI section | Resolved in-place (first sheet only); question now records the decision + why. Short `zlsx <file>` alias re-pointed to `cells <file>` (was `cells --all-sheets`). |
+| "Open design question #2" still proposed `--all-sheets` as default — directly contradicted the v3 CLI section | Resolved in-place (first sheet only); question now records the decision + why. Short `zlsx <file>` alias kept pointing at `rows <file>` (the long-standing default) rather than re-pointing to `cells`. |
 | Rollout iter59 still listed `--offset` / `--limit` | Replaced with `--skip` / `--take` / `--start-row` / `--end-row` / `--sheet` / `--sheet-index`. |
 | Rollout iter60 still mentioned `--no-provenance` | Replaced with `--output compact-ndjson` (sheet-prologue) and `--output pretty-json` (meta single-object). |
 | Op-guarantees "invalid XML chars passed through as UTF-8" was unsafe — could emit raw control bytes and break downstream JSON parsers | Tightened: U+0000..U+001F and U+007F are always JSON-escaped (`\u00XX`); U+FFFE/U+FFFF replaced with U+FFFD. No pass-through mode. |
