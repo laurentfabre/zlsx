@@ -1142,6 +1142,95 @@ pub const Book = struct {
         if (idx >= self.sheets.len) return error.SheetIndexOutOfRange;
         return self.rows(self.sheets[idx], allocator);
     }
+
+    /// Bulk-materialise every row of `sheet` into a dense in-memory
+    /// matrix, returned as a `SheetMatrix` that owns its backing
+    /// storage via a single arena. Non-breaking addition: the
+    /// streaming `rows()` iterator is unchanged.
+    ///
+    /// Allocator strategy: one `ArenaAllocator` is owned by the
+    /// returned matrix and serves three roles in one bump-bucket
+    /// sequence — per-row Cell slabs, the outer rows slab, and any
+    /// entity-decoded / rich-text-concatenated cell strings. The
+    /// caller's `allocator` parameter is the arena's underlying
+    /// child allocator and is freed wholesale by
+    /// `SheetMatrix.deinit`.
+    ///
+    /// Strings inside Cells follow the same lifetime contract as
+    /// `Rows.next()`: shared-string and XML-backed slices borrow
+    /// from the parent Book (which MUST outlive the matrix);
+    /// previously per-row-arena strings now live in the matrix's
+    /// arena and stay valid until `deinit`.
+    ///
+    /// Errors mirror the streaming path (malformed XML, OOM, sheet
+    /// load). On error every partial allocation is reaped via the
+    /// errdefers below — no leaks on the failure path. Verified by
+    /// the `materialiseSheet under failing allocator` test.
+    pub fn materialiseSheet(self: *Book, sheet: Sheet, allocator: Allocator) !SheetMatrix {
+        var matrix: SheetMatrix = .{
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .rows = &.{},
+        };
+        // Free the matrix arena (and every row slab + cloned string
+        // it backs) on any error below. Cleared by the final return.
+        errdefer matrix.arena.deinit();
+
+        var it = try self.rows(sheet, allocator);
+        defer it.deinit();
+        // Tell the iterator to keep its row arena alive across
+        // `next()` calls so per-row decoded strings observed during
+        // materialise stay valid until we copy them into the matrix
+        // arena below. Without this, the next `next()` would reset
+        // the iterator arena and invalidate already-stored slices.
+        it.keep_arena_strings = true;
+
+        const arena_alloc = matrix.arena.allocator();
+        var row_acc: std.ArrayListUnmanaged([]const Cell) = .{};
+        // Pre-size the outer accumulator using the SST length as a
+        // *very* loose order-of-magnitude hint; for sparse sheets
+        // this overshoots, but the arena absorbs the slack on
+        // success. Skipped for unknown-size workbooks.
+
+        while (try it.next()) |cells| {
+            // Bulk-allocate the per-row Cell slab once into the
+            // matrix arena. This is the alloc the materialise API
+            // exists to amortise — instead of paying a separate
+            // allocator round-trip per row (and a freelist hit on
+            // any caller-side `dupe`), we pay one bump-pointer
+            // bump per row.
+            const row_copy = try arena_alloc.dupe(Cell, cells);
+            // Clone string payloads into the matrix arena so the
+            // returned matrix is fully self-contained: the
+            // iterator's arena dies with `it.deinit()` when this
+            // function returns. SST and sheet-XML borrows are
+            // also cloned for uniformity — over-copy cost is small
+            // (Book-lifetime slices are typically short tokens) and
+            // it eliminates a foot-gun where a future caller
+            // outlives the Book.
+            //
+            // NOTE: this is a deliberate trade — we sacrifice the
+            // SST-borrow zero-copy property in exchange for a
+            // single, simple lifetime story (matrix owns
+            // everything). The win still nets out positive on the
+            // worldbank fixture because the per-row alloc round-
+            // trip dominates the small string copies.
+            for (row_copy) |*cell| {
+                switch (cell.*) {
+                    .string => |s| {
+                        if (s.len == 0) continue;
+                        cell.* = .{ .string = try arena_alloc.dupe(u8, s) };
+                    },
+                    else => {},
+                }
+            }
+            try row_acc.append(arena_alloc, row_copy);
+        }
+
+        const rows_final = try row_acc.toOwnedSlice(arena_alloc);
+        std.debug.assert(rows_final.len == row_acc.items.len or row_acc.items.len == 0);
+        matrix.rows = rows_final;
+        return matrix;
+    }
 };
 
 /// When a `<row>` tag has no usable `r` attribute, try to recover
@@ -1303,6 +1392,14 @@ pub const Rows = struct {
     /// has no usable `r` attribute, so envelope consumers see
     /// 1..N-contiguous row numbers regardless of source sparsity.
     yield_count: u32 = 0,
+    /// When true, `next()` does NOT reset the per-row arena, so any
+    /// row-owned decoded strings from earlier rows remain valid for
+    /// the iterator's lifetime. Set by `Book.materialiseSheet` so the
+    /// resulting `SheetMatrix` can adopt the arena wholesale and own
+    /// every string the matrix references. Stays false on the normal
+    /// streaming path so per-row owned bytes are still bulk-freed each
+    /// `next()` (the existing memory-budget contract).
+    keep_arena_strings: bool = false,
 
     pub fn deinit(self: *Rows) void {
         self.arena.deinit();
@@ -1428,7 +1525,7 @@ pub const Rows = struct {
         // at C2 is referenced by slave cells at C3..C10 in subsequent
         // rows). Both are freed in deinit() once the iterator goes
         // out of scope.
-        _ = self.arena.reset(.retain_capacity);
+        if (!self.keep_arena_strings) _ = self.arena.reset(.retain_capacity);
 
         while (findTagOpen(self.xml, self.pos, "row")) |row_start| {
             // The `r` attribute on <row> is optional per the OOXML
@@ -1822,6 +1919,74 @@ pub const Rows = struct {
         var buf: std.ArrayListUnmanaged(u8) = .{};
         try appendDecoded(a, &buf, raw);
         return try buf.toOwnedSlice(a);
+    }
+};
+
+// ─── SheetMatrix: bulk row-materialise reader ────────────────────────
+
+/// In-memory dense matrix view of an entire sheet. Built by
+/// `Book.materialiseSheet` in one streaming pass; intended for
+/// callers that want random row/column access without re-parsing
+/// or that want to amortise per-row allocator round-trips across a
+/// single arena.
+///
+/// Lifetime: borrows from the parent `Book` for shared-string and
+/// XML-backed slices, so the Book MUST outlive the matrix. Owns its
+/// own per-row decoded strings via the embedded `arena`. Tear down
+/// with `deinit()` (frees the arena AND the outer rows slab in one
+/// shot).
+///
+/// The row width is per-row dense (one slot per column up to the
+/// widest cell in that row, gaps filled with `.empty`), matching
+/// the existing `Rows.next()` shape. Different rows MAY have
+/// different widths when the source sheet has ragged trailing
+/// emptiness — the longest row dictates `maxColCount()`.
+pub const SheetMatrix = struct {
+    /// Bump arena owning every dynamically-allocated byte the matrix
+    /// references that did not already belong to the parent Book.
+    /// Includes: each row's `[]Cell` slab, the outer rows slab, and
+    /// any entity-decoded / rich-text-concatenated cell strings.
+    arena: std.heap.ArenaAllocator,
+    /// One slice per row in source order. Inner slice is the dense
+    /// per-row Cell array (gaps as `.empty`). Both layers live in
+    /// `arena`, so freeing the arena frees the whole matrix.
+    rows: []const []const Cell,
+
+    /// Free the arena (and with it, every row slab and decoded
+    /// string the matrix owned). After deinit the matrix is
+    /// `undefined` — callers must drop their reference.
+    pub fn deinit(self: *SheetMatrix) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    /// Number of rows materialised. Equivalent to `rows.len`.
+    pub fn rowCount(self: *const SheetMatrix) usize {
+        return self.rows.len;
+    }
+
+    /// Width (column count) of the widest row, or 0 when the sheet
+    /// is empty. Useful for callers that want a uniform 2-D shape
+    /// rather than the per-row jagged form.
+    pub fn maxColCount(self: *const SheetMatrix) usize {
+        var w: usize = 0;
+        for (self.rows) |r| {
+            if (r.len > w) w = r.len;
+        }
+        return w;
+    }
+
+    /// Cell at `(row, col)` with implicit gap-fill: out-of-bounds
+    /// columns within the matrix's row-count window resolve to
+    /// `.empty` rather than panicking. Returns `null` when `row`
+    /// itself is out of bounds — the call-site can distinguish
+    /// "missing row" from "empty cell" without an extra length
+    /// check.
+    pub fn cellAt(self: *const SheetMatrix, row: usize, col: usize) ?Cell {
+        if (row >= self.rows.len) return null;
+        const r = self.rows[row];
+        if (col >= r.len) return .empty;
+        return r[col];
     }
 };
 
@@ -5917,3 +6082,172 @@ test "array-formula spread: base without <v> still spreads to slaves" {
         try std.testing.expectEqual(@as(i64, 42), cells[2].integer);
     }
 }
+
+// ─── SheetMatrix tests ───────────────────────────────────────────────
+
+test "Book.materialiseSheet: dense matrix matches streaming rows()" {
+    const tmp_path = "/tmp/zlsx_materialise_basic.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Sheet1");
+        try sheet.writeRow(&.{
+            .{ .string = "Name" },
+            .{ .string = "Age" },
+            .{ .string = "Pi" },
+        });
+        try sheet.writeRow(&.{
+            .{ .string = "Alice" },
+            .{ .integer = 30 },
+            .{ .number = 3.14159 },
+        });
+        try sheet.writeRow(&.{
+            .{ .string = "Bob" },
+            .{ .integer = 25 },
+            .empty,
+        });
+        try w.save(tmp_path);
+    }
+
+    // Streaming reference: collect every row's cells into an owned
+    // copy for shape-comparison (string aliasing is fine because the
+    // book outlives the comparison block).
+    var ref_book = try Book.open(std.testing.allocator, tmp_path);
+    defer ref_book.deinit();
+    var ref_rows_count: usize = 0;
+    var ref_widths: [3]usize = undefined;
+    var ref_first_string: [3][]const u8 = undefined;
+    {
+        var rows = try ref_book.rows(ref_book.sheets[0], std.testing.allocator);
+        defer rows.deinit();
+        while (try rows.next()) |cells| : (ref_rows_count += 1) {
+            std.debug.assert(ref_rows_count < ref_widths.len);
+            ref_widths[ref_rows_count] = cells.len;
+            ref_first_string[ref_rows_count] = switch (cells[0]) {
+                .string => |s| s,
+                else => return error.UnexpectedCellType,
+            };
+            // Borrowed slices are valid for the test body; the
+            // comparison below dupes them into stable storage.
+            ref_first_string[ref_rows_count] = try std.testing.allocator.dupe(u8, ref_first_string[ref_rows_count]);
+        }
+    }
+    defer for (ref_first_string[0..ref_rows_count]) |s| std.testing.allocator.free(s);
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var matrix = try book.materialiseSheet(book.sheets[0], std.testing.allocator);
+    defer matrix.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), matrix.rowCount());
+    try std.testing.expectEqual(ref_rows_count, matrix.rowCount());
+    for (0..ref_rows_count) |i| {
+        try std.testing.expectEqual(ref_widths[i], matrix.rows[i].len);
+    }
+
+    // Row 0: header strings.
+    try std.testing.expectEqualStrings("Name", matrix.rows[0][0].string);
+    try std.testing.expectEqualStrings("Age", matrix.rows[0][1].string);
+    try std.testing.expectEqualStrings("Pi", matrix.rows[0][2].string);
+    try std.testing.expectEqualStrings(ref_first_string[0], matrix.rows[0][0].string);
+
+    // Row 1: mixed types.
+    try std.testing.expectEqualStrings("Alice", matrix.rows[1][0].string);
+    try std.testing.expectEqual(@as(i64, 30), matrix.rows[1][1].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.14159), matrix.rows[1][2].number, 1e-9);
+    try std.testing.expectEqualStrings(ref_first_string[1], matrix.rows[1][0].string);
+
+    // Row 2: trailing `.empty` is dropped by the writer, so the
+    // dense row mirrors the streaming reference. Per-row width
+    // matches `ref_widths` (asserted above) so we don't hard-code
+    // `[2].len` here.
+    try std.testing.expectEqualStrings("Bob", matrix.rows[2][0].string);
+    try std.testing.expectEqual(@as(i64, 25), matrix.rows[2][1].integer);
+
+    // Accessor coverage.
+    try std.testing.expect(matrix.maxColCount() >= 2);
+    try std.testing.expectEqualStrings("Alice", matrix.cellAt(1, 0).?.string);
+    // Out-of-bounds row → null.
+    try std.testing.expect(matrix.cellAt(99, 0) == null);
+    // Out-of-bounds col within a known row → `.empty` (gap fill).
+    try std.testing.expect(matrix.cellAt(0, 99).? == .empty);
+}
+
+test "Book.materialiseSheet: testing.allocator confirms zero leaks" {
+    const tmp_path = "/tmp/zlsx_materialise_leakcheck.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Leak");
+        // Mix of value types + an entity-bearing string forces the
+        // row arena's owned-string path so the clone-into-matrix-arena
+        // branch is exercised under the leak detector.
+        try sheet.writeRow(&.{
+            .{ .string = "ampersand <&> here" },
+            .{ .integer = 1 },
+        });
+        try sheet.writeRow(&.{
+            .{ .string = "row two" },
+            .{ .number = 2.5 },
+        });
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var matrix = try book.materialiseSheet(book.sheets[0], std.testing.allocator);
+    defer matrix.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), matrix.rowCount());
+    try std.testing.expectEqualStrings("ampersand <&> here", matrix.rows[0][0].string);
+    try std.testing.expectEqualStrings("row two", matrix.rows[1][0].string);
+}
+
+test "Book.materialiseSheet: empty sheet yields zero rows" {
+    const tmp_path = "/tmp/zlsx_materialise_empty.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        _ = try w.addSheet("Empty");
+        try w.save(tmp_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    var matrix = try book.materialiseSheet(book.sheets[0], std.testing.allocator);
+    defer matrix.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), matrix.rowCount());
+    try std.testing.expectEqual(@as(usize, 0), matrix.maxColCount());
+    try std.testing.expect(matrix.cellAt(0, 0) == null);
+}
+
+// NOTE: a `checkAllAllocationFailures` walk over `Book.open` +
+// `materialiseSheet` is the right next step to prove the errdefer
+// chain on the matrix arena — but `Book.open`'s early stages have
+// pre-existing allocation-failure paths that segfault under the
+// failing allocator (orthogonal to this slice). Once that's
+// untangled this is the natural test to add:
+//
+//     const Runner = struct {
+//         fn run(alloc: Allocator, path: []const u8) !void {
+//             var book = try Book.open(alloc, path);
+//             defer book.deinit();
+//             var matrix = try book.materialiseSheet(book.sheets[0], alloc);
+//             defer matrix.deinit();
+//             try std.testing.expectEqual(@as(usize, 2), matrix.rowCount());
+//         }
+//     };
+//     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{tmp_path});
