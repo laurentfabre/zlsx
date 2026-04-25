@@ -639,7 +639,7 @@ export fn zlsx_data_validation_formula2(
 /// without having to track the index themselves.
 export fn zlsx_shared_string_count(book: *Book) callconv(.c) usize {
     const state: *BookState = @ptrCast(@alignCast(book));
-    return state.inner.shared_strings.len;
+    return state.inner.sharedStringsCount();
 }
 
 /// Copy shared-string entry `sst_idx` into `out_ptr` / `out_len`
@@ -652,8 +652,7 @@ export fn zlsx_shared_string_at(
     out_len: *usize,
 ) callconv(.c) i32 {
     const state: *BookState = @ptrCast(@alignCast(book));
-    if (sst_idx >= state.inner.shared_strings.len) return -1;
-    const s = state.inner.shared_strings[sst_idx];
+    const s = state.inner.sharedStringAt(sst_idx) catch return -1;
     out_ptr.* = if (s.len == 0) @ptrCast("") else s.ptr;
     out_len.* = s.len;
     return 0;

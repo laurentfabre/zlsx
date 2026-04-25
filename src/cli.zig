@@ -2382,7 +2382,7 @@ fn runMetaCommand(
         );
         try out.print(
             "  \"sst\": {{\"count\": {d}, \"rich\": {d}}},\n",
-            .{ book.shared_strings.len, book.rich_runs_by_sst_idx.count() },
+            .{ book.sharedStringsCount(), book.rich_runs_by_sst_idx.count() },
         );
         try out.print(
             "  \"has_styles\": {s},\n  \"has_theme\": {s},\n  \"has_comments\": {s},\n",
@@ -2423,7 +2423,7 @@ fn runMetaCommand(
     if (path) |p| try writeJsonString(out, p) else try out.writeAll("null");
     try out.print(
         ",\"sheets\":{d},\"sst\":{{\"count\":{d},\"rich\":{d}}}",
-        .{ book.sheets.len, book.shared_strings.len, book.rich_runs_by_sst_idx.count() },
+        .{ book.sheets.len, book.sharedStringsCount(), book.rich_runs_by_sst_idx.count() },
     );
     try out.print(
         ",\"has_styles\":{s},\"has_theme\":{s},\"has_comments\":{s}}}\n",
@@ -3107,13 +3107,16 @@ fn runSstCommand(
     take: ?usize,
 ) !void {
     var pg = Pagination.init(skip, take);
-    for (book.shared_strings, 0..) |s, i| {
+    const sst_count = book.sharedStringsCount();
+    var i: usize = 0;
+    while (i < sst_count) : (i += 1) {
         if (signals.shouldStop()) return;
         switch (pg.consume()) {
             .drop => continue,
             .stop => return,
             .emit => {},
         }
+        const s = try book.sharedStringAt(i);
         try out.print("{{\"kind\":\"sst\",\"idx\":{d},\"text\":", .{i});
         try writeJsonString(out, s);
         try out.writeAll(",\"runs\":");
