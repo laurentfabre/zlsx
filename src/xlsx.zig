@@ -2211,22 +2211,34 @@ fn parseWorkbookSheets(book: *Book, wb_xml: []const u8, rels_xml: []const u8) !v
 
 // ─── sharedStrings.xml parsing ───────────────────────────────────────
 
+/// Maximum column index in an Excel sheet (XFD, 1-based 16384).
+pub const max_col_1based: u32 = 16384;
+/// Maximum row index in an Excel sheet (1-based).
+pub const max_row: u32 = 1_048_576;
+
 /// Parse one corner of an A1-style reference ("B12") into `{col, row}`.
 /// Column is 0-based (A=0, B=1, …), row is 1-based (row1=1). Rejects
-/// empty input, lowercase, missing digits, and row=0.
+/// empty input, lowercase, missing digits, row=0, and refs beyond
+/// Excel's XFD/1048576 sheet bounds.
 pub fn parseA1Ref(s: []const u8) !CellRef {
     if (s.len == 0) return error.MalformedXml;
     var i: usize = 0;
     var col: u32 = 0;
     while (i < s.len and s[i] >= 'A' and s[i] <= 'Z') : (i += 1) {
         col = col * 26 + (s[i] - 'A' + 1);
+        // Saturate past the Excel limit so a pathologically long
+        // all-letter prefix can't overflow u32 before the bound
+        // check rejects.
+        if (col > max_col_1based) col = max_col_1based + 1;
     }
     if (i == 0 or i == s.len) return error.MalformedXml;
     var row: u32 = 0;
     while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
         row = row * 10 + (s[i] - '0');
+        if (row > max_row) row = max_row + 1;
     }
     if (i != s.len or row == 0) return error.MalformedXml;
+    if (col > max_col_1based or row > max_row) return error.MalformedXml;
     return .{ .col = col - 1, .row = row };
 }
 
@@ -3743,6 +3755,15 @@ test "parseA1Ref: basic A1 parsing + rejection" {
     try std.testing.expectError(error.MalformedXml, parseA1Ref("A")); // no row
     try std.testing.expectError(error.MalformedXml, parseA1Ref("1")); // no col
     try std.testing.expectError(error.MalformedXml, parseA1Ref("a1")); // lowercase
+
+    // Excel sheet bounds: cols A..XFD, rows 1..1048576. Refs past
+    // those limits are syntactically well-formed but cannot exist
+    // in any sheet, so reject at parse time rather than silently
+    // accept and produce empty output.
+    try std.testing.expectError(error.MalformedXml, parseA1Ref("XFE1")); // col past XFD
+    try std.testing.expectError(error.MalformedXml, parseA1Ref("A1048577")); // row past max
+    try std.testing.expectError(error.MalformedXml, parseA1Ref("ZZZZZZZ1")); // pathological col
+    try std.testing.expectError(error.MalformedXml, parseA1Ref("A99999999999")); // pathological row
 }
 
 test "parseA1Range: rectangle parsing + corner normalisation" {
