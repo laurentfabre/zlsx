@@ -105,6 +105,18 @@ pub fn fromExcelSerial(serial: f64) ?DateTime {
     };
 }
 
+/// Convert a Mac Excel 1904-epoch serial into a calendar `DateTime`.
+/// The 1904 system shifts every serial by 1462 days vs the 1900
+/// default — so this is just `fromExcelSerial(serial + 1462)`. Has
+/// the side-benefit of dodging the 1900 leap-year-bug window: every
+/// real 1904 date lands at 1900-system serial >= 1463, well past the
+/// `< 61` rejection. Books opened with `<workbookPr date1904="1"/>`
+/// (`Book.uses_1904_epoch`) decode through this function.
+pub fn fromExcelSerial1904(serial: f64) ?DateTime {
+    if (!std.math.isFinite(serial)) return null;
+    return fromExcelSerial(serial + 1462.0);
+}
+
 /// Gregorian `{year, month, day}` → days-since-1970-01-01 using
 /// Hinnant's days_from_civil. Inverse of `daysSinceUnixEpochToYMD`.
 /// Input must be a real calendar date (year 1..=9999, month 1..=12,
@@ -1347,7 +1359,7 @@ pub const Rows = struct {
         const style_idx = self.row_styles.items[col_idx] orelse return null;
         const book = self.book orelse return null;
         if (!book.isDateFormat(style_idx)) return null;
-        return fromExcelSerial(num);
+        return if (book.uses_1904_epoch) fromExcelSerial1904(num) else fromExcelSerial(num);
     }
 
     /// 1-based OOXML row number of the most recently yielded row.
@@ -1554,13 +1566,13 @@ pub const Rows = struct {
             };
             if (num_opt) |num| {
                 if (self.book) |book| {
-                    // iter61-a P1 follow-up: skip auto-conversion on
-                    // 1904-epoch workbooks. fromExcelSerial assumes
-                    // 1900; a 1904 workbook would shift every date
-                    // by 1462 days. Until proper 1904 decoding
-                    // ships, leave the cell as numeric — callers
-                    // still see the raw value.
-                    if (!book.uses_1904_epoch and book.isDateFormat(style_idx.?) and fromExcelSerial(num) != null) {
+                    // Pick the decoder for the workbook's epoch.
+                    // 1904-epoch books shift every serial by 1462 days;
+                    // fromExcelSerial1904 just adds 1462 and delegates.
+                    // (iter61-a originally skipped 1904 entirely; this
+                    // iter ships the proper decoder.)
+                    const decoded = if (book.uses_1904_epoch) fromExcelSerial1904(num) else fromExcelSerial(num);
+                    if (book.isDateFormat(style_idx.?) and decoded != null) {
                         self.row_date_types.items[col_idx] = true;
                     }
                 }

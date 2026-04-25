@@ -744,13 +744,19 @@ fn writeIsoDateTime(w: *std.Io.Writer, dt: xlsx.DateTime) !void {
 /// in lockstep. Caller guarantees the serial is inside
 /// `fromExcelSerial`'s accepted range (the `.date` side channel on
 /// `Rows` already filtered it).
-fn writeDateValueAndSerial(w: *std.Io.Writer, serial: f64) !void {
-    const dt = xlsx.fromExcelSerial(serial) orelse unreachable; // caller's invariant
+fn writeDateValueAndSerial(w: *std.Io.Writer, serial: f64, uses_1904: bool) !void {
+    // Pick the epoch's decoder: 1904 books shift every serial by
+    // 1462 days. The Rows date side-channel set its flag using the
+    // same decoder, so the caller's invariant still holds either way.
+    const dt = (if (uses_1904) xlsx.fromExcelSerial1904(serial) else xlsx.fromExcelSerial(serial)) orelse unreachable;
     try w.writeByte('"');
     try writeIsoDateTime(w, dt);
     try w.writeByte('"');
     // Serial prints as an integer when it has no fractional part (the
-    // date-only case — majority). {d} already does this for f64.
+    // date-only case — majority). {d} already does this for f64. The
+    // raw value is what's stored in the source — emit it unchanged
+    // so callers know which epoch the serial is on (consumers can
+    // cross-check by re-reading the source if epoch matters).
     try w.print(",\"serial\":{d}", .{serial});
 }
 
@@ -825,6 +831,7 @@ fn writeEnvelopeCells(
     error_strings: []const ?[]const u8,
     formula_strings: []const ?[]const u8,
     formula_refs: []const ?xlsx.CellRef,
+    uses_1904: bool,
 ) !void {
     try w.writeByte('[');
     var first = true;
@@ -898,7 +905,7 @@ fn writeEnvelopeCells(
                     try writeJsonString(w, literal);
                 } else if (is_date) {
                     try w.print(",\"col\":{d},\"t\":\"date\",\"v\":", .{absolute_col + 1});
-                    try writeDateValueAndSerial(w, cellToSerial(c));
+                    try writeDateValueAndSerial(w, cellToSerial(c), uses_1904);
                 } else {
                     try w.print(",\"col\":{d},\"t\":\"{s}\",\"v\":", .{ absolute_col + 1, envelopeTypeTag(c) });
                     try writeJsonCell(w, c);
@@ -951,6 +958,7 @@ fn writeRowEnvelope(
     error_strings: []const ?[]const u8,
     formula_strings: []const ?[]const u8,
     formula_refs: []const ?xlsx.CellRef,
+    uses_1904: bool,
 ) !void {
     if (compact) {
         try w.print("{{\"kind\":\"row\",\"row\":{d},\"cells\":", .{row_number});
@@ -970,6 +978,7 @@ fn writeRowEnvelope(
         error_strings,
         formula_strings,
         formula_refs,
+        uses_1904,
     );
     try w.writeAll("}\n");
 }
@@ -1035,6 +1044,7 @@ fn writeCell(
     error_string: ?[]const u8,
     formula_string: ?[]const u8,
     formula_ref: ?xlsx.CellRef,
+    uses_1904: bool,
 ) !void {
     if (compact) {
         try w.writeAll("{\"kind\":\"cell\",\"ref\":");
@@ -1070,7 +1080,7 @@ fn writeCell(
                 try writeJsonString(w, literal);
             } else if (date_type) {
                 try w.writeAll("\"date\",\"v\":");
-                try writeDateValueAndSerial(w, cellToSerial(cell));
+                try writeDateValueAndSerial(w, cellToSerial(cell), uses_1904);
             } else {
                 try w.print("\"{s}\",\"v\":", .{envelopeTypeTag(cell)});
                 try writeJsonCell(w, cell);
@@ -1975,6 +1985,7 @@ fn runRowsOnSheetCore(
                     view.error_strings,
                     view.formula_strings,
                     view.formula_refs,
+                    book.uses_1904_epoch,
                 );
             },
             // iter59b-4: flat formats are shape-neutral w.r.t. both
@@ -2223,6 +2234,7 @@ fn runCellsOnSheetCore(
                 err_str,
                 fmla_str,
                 fmla_ref,
+                book.uses_1904_epoch,
             );
             // Per docs/jq-for-excel.md v4.1: "every record is written
             // with an explicit newline + flush on stdout." The flush
@@ -3201,7 +3213,7 @@ test "writeRowEnvelope emits kind + sheet + sheet_idx + row + sparse cells" {
         .{ .number = 3.5 },
         .{ .boolean = true },
     };
-    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null, 0, false, &.{}, &.{}, &.{}, &.{});
+    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null, 0, false, &.{}, &.{}, &.{}, &.{}, false);
     const expected =
         "{\"kind\":\"row\",\"sheet\":\"Data\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
         "{\"ref\":\"A1\",\"col\":1,\"t\":\"str\",\"v\":\"name\"}," ++
@@ -3216,7 +3228,7 @@ test "writeRowEnvelope all-empty row emits envelope with empty cells array" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
     const cells = [_]xlsx.Cell{ .empty, .empty, .empty };
-    try writeRowEnvelope(&w, "S", 2, 7, &cells, false, null, 0, false, &.{}, &.{}, &.{}, &.{});
+    try writeRowEnvelope(&w, "S", 2, 7, &cells, false, null, 0, false, &.{}, &.{}, &.{}, &.{}, false);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"row\",\"sheet\":\"S\",\"sheet_idx\":2,\"row\":7,\"cells\":[]}\n",
         w.buffered(),
@@ -3227,7 +3239,7 @@ test "writeRowEnvelope escapes sheet name" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
     const cells = [_]xlsx.Cell{.{ .integer = 1 }};
-    try writeRowEnvelope(&w, "She\"et\n", 0, 1, &cells, false, null, 0, false, &.{}, &.{}, &.{}, &.{});
+    try writeRowEnvelope(&w, "She\"et\n", 0, 1, &cells, false, null, 0, false, &.{}, &.{}, &.{}, &.{}, false);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"row\",\"sheet\":\"She\\\"et\\n\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
             "{\"ref\":\"A1\",\"col\":1,\"t\":\"int\",\"v\":1}" ++
@@ -3240,7 +3252,7 @@ test "writeRowEnvelope non-finite number becomes null v" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
     const cells = [_]xlsx.Cell{.{ .number = std.math.nan(f64) }};
-    try writeRowEnvelope(&w, "S", 0, 1, &cells, false, null, 0, false, &.{}, &.{}, &.{}, &.{});
+    try writeRowEnvelope(&w, "S", 0, 1, &cells, false, null, 0, false, &.{}, &.{}, &.{}, &.{}, false);
     // `t` stays `"num"` for the non-finite case — the type of the
     // cell didn't change, only its JSON-serializable value did.
     // This matches the pre-iter55a behaviour of writeJsonCell.
@@ -3298,7 +3310,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
     // string
     {
         var w = std.Io.Writer.fixed(&scratch);
-        try writeCell(&w, "Data", 0, "A1", 1, 1, .{ .string = "name" }, null, false, false, null, null, null);
+        try writeCell(&w, "Data", 0, "A1", 1, 1, .{ .string = "name" }, null, false, false, null, null, null, false);
         try std.testing.expectEqualStrings(
             "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"A1\",\"row\":1,\"col\":1,\"t\":\"str\",\"v\":\"name\"}\n",
             w.buffered(),
@@ -3307,7 +3319,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
     // integer
     {
         var w = std.Io.Writer.fixed(&scratch);
-        try writeCell(&w, "Data", 0, "B2", 2, 2, .{ .integer = 3 }, null, false, false, null, null, null);
+        try writeCell(&w, "Data", 0, "B2", 2, 2, .{ .integer = 3 }, null, false, false, null, null, null, false);
         try std.testing.expectEqualStrings(
             "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"B2\",\"row\":2,\"col\":2,\"t\":\"int\",\"v\":3}\n",
             w.buffered(),
@@ -3316,7 +3328,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
     // number
     {
         var w = std.Io.Writer.fixed(&scratch);
-        try writeCell(&w, "Data", 0, "C3", 3, 3, .{ .number = 3.5 }, null, false, false, null, null, null);
+        try writeCell(&w, "Data", 0, "C3", 3, 3, .{ .number = 3.5 }, null, false, false, null, null, null, false);
         try std.testing.expectEqualStrings(
             "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"C3\",\"row\":3,\"col\":3,\"t\":\"num\",\"v\":3.5}\n",
             w.buffered(),
@@ -3325,7 +3337,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
     // boolean
     {
         var w = std.Io.Writer.fixed(&scratch);
-        try writeCell(&w, "Data", 0, "D4", 4, 4, .{ .boolean = true }, null, false, false, null, null, null);
+        try writeCell(&w, "Data", 0, "D4", 4, 4, .{ .boolean = true }, null, false, false, null, null, null, false);
         try std.testing.expectEqualStrings(
             "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"D4\",\"row\":4,\"col\":4,\"t\":\"bool\",\"v\":true}\n",
             w.buffered(),
@@ -3336,7 +3348,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
 test "writeCell escapes sheet name" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try writeCell(&w, "She\"et\n", 2, "A1", 1, 1, .{ .integer = 7 }, null, false, false, null, null, null);
+    try writeCell(&w, "She\"et\n", 2, "A1", 1, 1, .{ .integer = 7 }, null, false, false, null, null, null, false);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"cell\",\"sheet\":\"She\\\"et\\n\",\"sheet_idx\":2,\"ref\":\"A1\",\"row\":1,\"col\":1,\"t\":\"int\",\"v\":7}\n",
         w.buffered(),
@@ -3363,7 +3375,7 @@ test "cells loop skips empty cells from the stream" {
         const letters = colLetter(&col_buf, i);
         var ref_buf: [16]u8 = undefined;
         const ref = std.fmt.bufPrint(&ref_buf, "{s}{d}", .{ letters, row_number }) catch unreachable;
-        try writeCell(&w, "S", 0, ref, row_number, @intCast(i + 1), c, null, false, false, null, null, null);
+        try writeCell(&w, "S", 0, ref, row_number, @intCast(i + 1), c, null, false, false, null, null, null, false);
     }
 
     try std.testing.expectEqualStrings(
@@ -5461,7 +5473,7 @@ test "writeCell emits t:date with ISO v and raw serial" {
     var w = std.Io.Writer.fixed(&scratch);
     // Excel serial 45458 = 2024-06-15 (date-only, so the fractional
     // part is 0 and {d} prints as `45458`).
-    try writeCell(&w, "Data", 0, "B3", 3, 2, .{ .integer = 45458 }, null, false, true, null, null, null);
+    try writeCell(&w, "Data", 0, "B3", 3, 2, .{ .integer = 45458 }, null, false, true, null, null, null, false);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"B3\",\"row\":3,\"col\":2,\"t\":\"date\",\"v\":\"2024-06-15T00:00:00\",\"serial\":45458}\n",
         w.buffered(),
@@ -5476,7 +5488,7 @@ test "writeRowEnvelope emits t:date inside cells array" {
         .{ .integer = 45458 }, // B1, date-styled
     };
     const dates = [_]bool{ false, true };
-    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null, 0, false, &dates, &.{}, &.{}, &.{});
+    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null, 0, false, &dates, &.{}, &.{}, &.{}, false);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"row\",\"sheet\":\"Data\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
             "{\"ref\":\"A1\",\"col\":1,\"t\":\"str\",\"v\":\"name\"}," ++
@@ -5582,11 +5594,13 @@ test "runCellsCommand skips t:date auto-convert on 1904-epoch workbook" {
     try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, null, null, null, false, false);
     const out = w.buffered();
 
-    // MUST be t:"int", NOT t:"date" — otherwise the emitted ISO string
-    // would be off by 1462 days vs what the 1904 system actually encodes.
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"t\":\"int\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":45458") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"t\":\"date\"") == null);
+    // 1904-epoch decoding now ships: serial 45458 in the 1904 system
+    // shifts by +1462 days to a 1900-system serial of 46920, which
+    // decodes to 2028-06-16T00:00:00. The raw serial is preserved
+    // so consumers can re-decode under their own epoch if they want.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"t\":\"date\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"v\":\"2028-06-16T00:00:00\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"serial\":45458") != null);
 }
 
 test "writeCell emits t:error with the literal v (iter61-c)" {
@@ -5609,6 +5623,7 @@ test "writeCell emits t:error with the literal v (iter61-c)" {
         "#DIV/0!",
         null,
         null,
+        false,
     );
     try std.testing.expectEqualStrings(
         "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"D2\",\"row\":2,\"col\":4,\"t\":\"error\",\"v\":\"#DIV/0!\"}\n",
@@ -5625,7 +5640,7 @@ test "writeRowEnvelope emits t:error inside cells array (iter61-c)" {
     };
     const dates = [_]bool{ false, false };
     const errors = [_]?[]const u8{ null, "#N/A" };
-    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null, 0, false, &dates, &errors, &.{}, &.{});
+    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null, 0, false, &dates, &errors, &.{}, &.{}, false);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"row\",\"sheet\":\"Data\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
             "{\"ref\":\"A1\",\"col\":1,\"t\":\"str\",\"v\":\"name\"}," ++
@@ -5759,6 +5774,7 @@ test "writeCell emits t:formula with formula text + cached value (iter61-b)" {
         null,
         "A2+B2",
         null,
+        false,
     );
     try std.testing.expectEqualStrings(
         "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"C2\",\"row\":2,\"col\":3,\"t\":\"formula\",\"formula\":\"A2+B2\",\"cached\":30}\n",
@@ -5787,6 +5803,7 @@ test "writeCell emits t:formula with formula_ref + cached value (iter61-b)" {
         null,
         null,
         .{ .col = 2, .row = 2 }, // C2
+        false,
     );
     try std.testing.expectEqualStrings(
         "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"C3\",\"row\":3,\"col\":3,\"t\":\"formula\",\"formula_ref\":\"C2\",\"cached\":47}\n",
@@ -5806,7 +5823,7 @@ test "writeRowEnvelope emits formula records inside cells array (iter61-b)" {
     const errors = [_]?[]const u8{ null, null, null };
     const formulas = [_]?[]const u8{ null, "A2+B2", null };
     const formula_refs = [_]?xlsx.CellRef{ null, null, .{ .col = 1, .row = 1 } }; // → B1
-    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null, 0, false, &dates, &errors, &formulas, &formula_refs);
+    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null, 0, false, &dates, &errors, &formulas, &formula_refs, false);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"row\",\"sheet\":\"Data\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
             "{\"ref\":\"A1\",\"col\":1,\"t\":\"int\",\"v\":1}," ++
@@ -5848,6 +5865,7 @@ test "writeEnvelopeCells emits formula-only cells when Cell is .empty (iter61-b 
         &error_strings,
         &formula_strings,
         &formula_refs,
+        false, // uses_1904
     );
 
     const out = w.buffered();
