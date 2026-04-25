@@ -1,18 +1,37 @@
-//! xlsx writer — fresh-file emission (Phase 3a MVP).
+//! xlsx writer — fresh-file emission.
 //!
-//! Scope
-//! -----
-//! * Single-call `create → addSheet → writeRow → save` flow.
-//! * Multiple sheets.
-//! * Cell types: empty, string (shared + deduped), integer, number, boolean.
-//! * Output: OOXML with zip-store (no deflate on write). Excel, LibreOffice,
-//!   and zlsx's own reader all accept stored zip xlsx.
+//! Flow
+//! ----
+//! `Writer.init → addStyle? → addSheet → writeRow* → save`. Each
+//! sheet's `SheetWriter` exposes per-row writers and per-region
+//! attachments (merges, hyperlinks, comments, validations,
+//! conditional formats); the top-level `Writer` owns the style
+//! table, dxf table, and shared-string pool, and serialises the
+//! archive on `save`.
 //!
-//! Out of scope (later phases)
-//! ---------------------------
-//! * Styles, fonts, fills, borders — Phase 3b (openpyxl-parity).
-//! * Load + edit + save round-trip — Phase 3c.
-//! * Formulas, merged regions, rich text, inline strings on write.
+//! Surface
+//! -------
+//! * Cell types: empty, string (shared + deduped), integer, number,
+//!   boolean. Numerics rejected if not exactly representable in f64.
+//! * `addStyle` + `writeRowStyled` — fonts, fills, borders,
+//!   alignment, wrap, number formats.
+//! * `addDxf` + conditional formatting (`addConditionalFormatCellIs`,
+//!   `…Expression`, `…ColorScale`, `…DataBar`).
+//! * `addMergedCell`, `addHyperlink`, `addInternalHyperlink`,
+//!   `addComment`.
+//! * `addDataValidationList`, `…Numeric`, `…Custom`.
+//! * `writeRowWithFormulas`, `writeRichRow`.
+//! * `setColumnWidth`, `setRowHeight`, `freezePanes`, `setAutoFilter`.
+//! * Output: OOXML zip with deflate compression (in-house deflate
+//!   encoder; entries `>= 1024` bytes that fail to compress fall
+//!   back to store). Excel, LibreOffice, and zlsx's own reader all
+//!   accept the produced files.
+//!
+//! Out of scope
+//! ------------
+//! * Load + edit + save round-trip — readers and writers don't
+//!   share an in-memory document model yet.
+//! * Pivot tables, charts, drawings.
 
 const std = @import("std");
 const xlsx = @import("xlsx.zig");
