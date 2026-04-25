@@ -64,7 +64,7 @@ test "frictionless sample-2-sheets — small SST, multi-sheet" {
     try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
     try std.testing.expectEqualStrings("Sheet1", book.sheets[0].name);
     try std.testing.expectEqualStrings("Sheet2", book.sheets[1].name);
-    try std.testing.expectEqual(@as(usize, 18), book.shared_strings.len);
+    try std.testing.expectEqual(@as(usize, 18), book.sharedStringsCount());
 
     const sheet = book.sheetByName("Sheet1") orelse return error.SheetMissing;
 
@@ -126,7 +126,7 @@ test "World Bank Data Catalog — heavy SST (1144 entries, 143 KB)" {
     // test to the file version currently committed — if WB ships an update
     // and the count drifts, this is the signal to re-pin. Pin a lower
     // bound instead of equality to tolerate small catalog updates.
-    try std.testing.expect(book.shared_strings.len >= 1000);
+    try std.testing.expect(book.sharedStringsCount() >= 1000);
 
     const sheet = book.sheetByName("World Bank Data Catalog") orelse return error.SheetMissing;
 
@@ -192,7 +192,7 @@ test "corpus surface: iter28-34 reader APIs round-trip on real fixtures" {
         var book = try openOrSkip(alloc, "worldbank_catalog.xlsx");
         defer book.deinit();
         var rich_count: usize = 0;
-        for (0..book.shared_strings.len) |i| {
+        for (0..book.sharedStringsCount()) |i| {
             if (book.richRuns(i) != null) rich_count += 1;
         }
         // Plain-text SST — no runs should surface. If any do, it's a

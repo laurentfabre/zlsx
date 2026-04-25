@@ -3160,7 +3160,7 @@ test "Writer: multi-sheet round-trip + SST dedup" {
     try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
     try std.testing.expectEqualStrings("Alpha", book.sheets[0].name);
     try std.testing.expectEqualStrings("Beta", book.sheets[1].name);
-    try std.testing.expectEqual(@as(usize, 3), book.shared_strings.len);
+    try std.testing.expectEqual(@as(usize, 3), book.sharedStringsCount());
 }
 
 test "Writer: xml entities in strings are escaped" {

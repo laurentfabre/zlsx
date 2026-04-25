@@ -490,6 +490,28 @@ const ZipArchive = struct {
     }
 };
 
+/// Internal SST storage backend. Eager mode (the default, populated
+/// by `Book.open`) holds every decoded entry as a contiguous slice;
+/// lazy mode (populated by `Book.openSstLazy` — iter-sst-3b) holds an
+/// offset/length index into `shared_strings_xml` and a sparse map of
+/// already-resolved entries. The cell hot path branches on the union
+/// tag exactly once per access, then falls into a per-variant fast
+/// path. See docs/plans/streaming-sst.md for the full design.
+pub const SstBackend = union(enum) {
+    /// Pre-decoded entries; valid for the Book's lifetime.
+    eager: [][]const u8,
+    /// Offset table + sparse resolution cache; entries are decoded
+    /// into `Book.sst_arena` on first `sharedStringAt(idx)` access.
+    /// Reserved for iter-sst-3b — not constructed yet by any
+    /// production path; the variant exists at iter-sst-3a so the
+    /// accessor switch covers both arms exhaustively.
+    lazy: struct {
+        offsets: []u32,
+        lengths: []u32,
+        resolved: std.AutoHashMapUnmanaged(u32, []const u8),
+    },
+};
+
 pub const Book = struct {
     allocator: Allocator,
     /// Open zip archive backing this book. Owns the file handle and
@@ -506,10 +528,13 @@ pub const Book = struct {
     /// Decompressed `xl/sharedStrings.xml` (nullable — small xlsx files
     /// with only inline strings omit this part).
     shared_strings_xml: ?[]u8 = null,
-    /// Index into `shared_strings_xml` (or into `sst_arena` if we had
-    /// to decode entities / concatenate rich-text runs). Order matches
-    /// the SST in the file.
-    shared_strings: [][]const u8 = &.{},
+    /// SST storage backend (eager today; lazy variant arrives in
+    /// iter-sst-3b). Production callers use the
+    /// `Book.sharedStringAt(idx)` / `Book.sharedStringsCount()`
+    /// accessors which dispatch on the union tag; tests and
+    /// fuzz scaffolding may reach into `sst.eager` directly when they
+    /// already know the backend.
+    sst: SstBackend = .{ .eager = &.{} },
     /// Bump arena for SST-owned strings. Bulk-freed on `deinit`.
     /// One arena reset per parseSharedStrings call is all the cleanup
     /// we need — saves ~1 malloc per entry vs the previous per-string
@@ -1026,7 +1051,14 @@ pub const Book = struct {
     pub fn deinit(self: *Book) void {
         const a = self.allocator;
         if (self.shared_strings_xml) |s| a.free(s);
-        a.free(self.shared_strings);
+        switch (self.sst) {
+            .eager => |entries| a.free(entries),
+            .lazy => |*lazy| {
+                a.free(lazy.offsets);
+                a.free(lazy.lengths);
+                lazy.resolved.deinit(a);
+            },
+        }
         self.sst_arena.deinit();
 
         var mit = self.merged_ranges.valueIterator();
@@ -1100,15 +1132,26 @@ pub const Book = struct {
     /// a lazy variant in iter-sst-3 — this iter-sst-1 accessor
     /// centralises the lookup so future migration touches one site.
     pub fn sharedStringAt(self: *const Book, idx: usize) ![]const u8 {
-        if (idx >= self.shared_strings.len) return error.MalformedXml;
-        return self.shared_strings[idx];
+        switch (self.sst) {
+            .eager => |entries| {
+                if (idx >= entries.len) return error.MalformedXml;
+                return entries[idx];
+            },
+            .lazy => unreachable, // iter-sst-3a: no entrypoint
+            // constructs the lazy variant. iter-sst-3b adds
+            // `Book.openSstLazy` and replaces this branch with the
+            // first-touch materialisation path.
+        }
     }
 
-    /// Total entries in the SST. Equivalent to `shared_strings.len`
-    /// today; iter-sst-3's lazy backend keeps this O(1) without
+    /// Total entries in the SST. Equivalent to the old
+    /// `shared_strings.len`; both backends know this O(1) without
     /// materialising any entry.
     pub fn sharedStringsCount(self: *const Book) usize {
-        return self.shared_strings.len;
+        return switch (self.sst) {
+            .eager => |entries| entries.len,
+            .lazy => |lazy| lazy.offsets.len,
+        };
     }
 
     /// Find the sheet by display name (case-sensitive). Returns null if
@@ -1133,7 +1176,17 @@ pub const Book = struct {
         return .{
             .xml = xml,
             .pos = 0,
-            .shared_strings = self.shared_strings,
+            // Rows.shared_strings is the test-scaffolding fallback (used
+            // only when book is null in resolveSharedString). Production
+            // routes through self.book.?.sharedStringAt — the snapshot
+            // is dead weight on hot rows. iter-sst-3a populates it from
+            // the eager backend when available so existing tests that
+            // poke at the snapshot keep working; lazy books leave it
+            // empty.
+            .shared_strings = switch (self.sst) {
+                .eager => |entries| entries,
+                .lazy => &.{},
+            },
             .book = self,
             .allocator = allocator,
             .row_cells = .{},
@@ -3620,7 +3673,7 @@ fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
         std.debug.assert(i > i_prev);
     }
 
-    book.shared_strings = try strings.toOwnedSlice(book.allocator);
+    book.sst = .{ .eager = try strings.toOwnedSlice(book.allocator) };
 }
 
 // ─── zip → buffer ────────────────────────────────────────────────────
@@ -4179,8 +4232,8 @@ test "writer.writeRichRow: emits rich-text SST entries readable by Book.richRuns
     defer book.deinit();
 
     // SST ordering: plain "label" first, rich entry second.
-    try std.testing.expectEqualStrings("label", book.shared_strings[0]);
-    try std.testing.expectEqualStrings("hello world", book.shared_strings[1]);
+    try std.testing.expectEqualStrings("label", book.sst.eager[0]);
+    try std.testing.expectEqualStrings("hello world", book.sst.eager[1]);
 
     // Plain entry has no runs; rich entry has two.
     try std.testing.expectEqual(@as(?[]const RichRun, null), book.richRuns(0));
@@ -4218,14 +4271,14 @@ test "Book.richRuns: rich-text SST entries expose per-run bold/italic" {
     book.shared_strings_xml = owned;
     try parseSharedStrings(&book, owned);
 
-    try std.testing.expectEqual(@as(usize, 5), book.shared_strings.len);
+    try std.testing.expectEqual(@as(usize, 5), book.sharedStringsCount());
 
     // Flat strings round-trip correctly for both plain and rich paths.
-    try std.testing.expectEqualStrings("plain", book.shared_strings[0]);
-    try std.testing.expectEqualStrings("bold", book.shared_strings[1]);
-    try std.testing.expectEqualStrings("bold-italic", book.shared_strings[2]);
-    try std.testing.expectEqualStrings("A B C", book.shared_strings[3]);
-    try std.testing.expectEqualStrings("R&D", book.shared_strings[4]);
+    try std.testing.expectEqualStrings("plain", book.sst.eager[0]);
+    try std.testing.expectEqualStrings("bold", book.sst.eager[1]);
+    try std.testing.expectEqualStrings("bold-italic", book.sst.eager[2]);
+    try std.testing.expectEqualStrings("A B C", book.sst.eager[3]);
+    try std.testing.expectEqualStrings("R&D", book.sst.eager[4]);
 
     // Plain SST entries return null from richRuns — zero map overhead.
     try std.testing.expectEqual(@as(?[]const RichRun, null), book.richRuns(0));
@@ -4286,9 +4339,9 @@ test "parseSharedStrings: hostile uniqueCount is capped against XML size" {
     book.shared_strings_xml = owned;
     try parseSharedStrings(&book, owned);
 
-    try std.testing.expectEqual(@as(usize, 2), book.shared_strings.len);
-    try std.testing.expectEqualStrings("a", book.shared_strings[0]);
-    try std.testing.expectEqualStrings("b", book.shared_strings[1]);
+    try std.testing.expectEqual(@as(usize, 2), book.sharedStringsCount());
+    try std.testing.expectEqualStrings("a", book.sst.eager[0]);
+    try std.testing.expectEqualStrings("b", book.sst.eager[1]);
 }
 
 test "Rows.parseDate: auto-convert date-styled cells through the reader" {
