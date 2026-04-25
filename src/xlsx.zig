@@ -2272,12 +2272,17 @@ fn parseMergedRangesForSheet(book: *Book, sheet_path: []const u8, xml: []const u
     errdefer ranges.deinit(book.allocator);
 
     // Honour the `count="N"` attribute when present — lets us
-    // pre-size the backing array and skip geometric grows.
+    // pre-size the backing array and skip geometric grows. Capped
+    // against the block size so a malformed workbook can't claim
+    // billions of merge cells and force a huge upfront alloc. The
+    // parser only matches `<mergeCell ref="…"/>`, whose shortest
+    // valid spelling is 21 bytes (`<mergeCell ref="A1"/>`).
     const hint: usize = blk: {
         const c = std.mem.indexOfPos(u8, block, 0, "count=\"") orelse break :blk 0;
         const start = c + "count=\"".len;
         const end = std.mem.indexOfScalarPos(u8, block, start, '"') orelse break :blk 0;
-        break :blk std.fmt.parseInt(usize, block[start..end], 10) catch 0;
+        const claimed = std.fmt.parseInt(usize, block[start..end], 10) catch 0;
+        break :blk @min(claimed, block.len / 21);
     };
     if (hint > 0) try ranges.ensureTotalCapacity(book.allocator, hint);
 
@@ -3380,6 +3385,11 @@ fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
     // OOXML generators are reliable about this attribute, so we get a
     // right-sized backing store on the first append and skip all
     // geometric grows. Fall back to 64 for generators that omit it.
+    // The hint is capped against the XML size: a malformed or hostile
+    // workbook can advertise an absurd uniqueCount to force a huge
+    // upfront alloc. The smallest possible `<si/>` self-close is 5
+    // bytes, so the buffer can't really hold more than xml.len/5
+    // entries — anything past that is a lie.
     const hint: usize = blk: {
         const open = std.mem.indexOf(u8, sst_xml, "<sst") orelse break :blk 64;
         const gt = std.mem.indexOfScalarPos(u8, sst_xml, open, '>') orelse break :blk 64;
@@ -3387,7 +3397,8 @@ fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
         const u = std.mem.indexOf(u8, attrs, "uniqueCount=\"") orelse break :blk 64;
         const start = u + "uniqueCount=\"".len;
         const end = std.mem.indexOfScalarPos(u8, attrs, start, '"') orelse break :blk 64;
-        break :blk std.fmt.parseInt(usize, attrs[start..end], 10) catch 64;
+        const claimed = std.fmt.parseInt(usize, attrs[start..end], 10) catch 64;
+        break :blk @min(claimed, sst_xml.len / 5);
     };
 
     var strings: std.ArrayListUnmanaged([]const u8) = .{};
@@ -4227,6 +4238,32 @@ test "Book.richRuns: rich-text SST entries expose per-run bold/italic" {
     try std.testing.expectEqualStrings("R&D", r4[0].text);
     try std.testing.expectEqual(false, r4[0].bold);
     try std.testing.expectEqual(true, r4[0].italic);
+}
+
+test "parseSharedStrings: hostile uniqueCount is capped against XML size" {
+    // A malformed or hostile workbook can claim an absurd uniqueCount
+    // to force a multi-GB pre-allocation. The hint is capped against
+    // the XML size, so this short SST parses cleanly under the test
+    // allocator (which traps OOM) instead of attempting a billion-slot
+    // allocation.
+    const sst_xml =
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"2\" uniqueCount=\"999999999999\">" ++
+        "<si><t>a</t></si>" ++
+        "<si><t>b</t></si>" ++
+        "</sst>";
+
+    var book: Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer book.deinit();
+    const owned = try std.testing.allocator.dupe(u8, sst_xml);
+    book.shared_strings_xml = owned;
+    try parseSharedStrings(&book, owned);
+
+    try std.testing.expectEqual(@as(usize, 2), book.shared_strings.len);
+    try std.testing.expectEqualStrings("a", book.shared_strings[0]);
+    try std.testing.expectEqualStrings("b", book.shared_strings[1]);
 }
 
 test "Rows.parseDate: auto-convert date-styled cells through the reader" {
