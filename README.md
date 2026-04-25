@@ -254,7 +254,7 @@ zig build -Doptimize=ReleaseFast
 {"kind":"row","sheet":"Data","sheet_idx":0,"row":2,"cells":[{"ref":"A2","col":1,"t":"str","v":"apple"},{"ref":"B2","col":2,"t":"int","v":3}]}
 ```
 
-`t` ∈ `"str"` | `"int"` | `"num"` | `"bool"`; empty cells skipped from the `cells` array.
+`t` ∈ `"str"` | `"int"` | `"num"` | `"bool"` | `"blank"` | `"date"` | `"error"` | `"formula"`; empty cells skipped from the `cells` array unless `--include-blanks` is set. Date cells (iter61-a) carry an extra `serial` field with the raw Excel serial alongside the ISO `v`. Formula cells (iter61-b) carry `formula` (own text) or `formula_ref` (shared-formula base ref) plus an optional `cached` value instead of `v`. Error cells (iter61-c) carry the literal Excel error string in `v` (`"#DIV/0!"`, `"#N/A"`, etc.). 1904-epoch workbooks (`<workbookPr date1904="1"/>`) skip the `t:"date"` auto-conversion and emit the date-styled cell as `t:"int"` / `t:"num"` until proper 1904 decoding ships.
 
 ### Flags
 
