@@ -66,7 +66,7 @@ This is a **different schema** that consumers opt into explicitly — not a sile
 | `zlsx styles <file>` | `"style"` | `idx, font, fill, border, num_fmt` *(no sheet — workbook-wide)* |
 | `zlsx sst <file>` | `"sst"` | `idx, text, runs?` *(no sheet — workbook-wide)* |
 | `zlsx meta <file>` | `"workbook"` + `"sheet"` | workbook record first, then one per sheet |
-| `zlsx list-sheets <file>` | `"sheet"` | `name, sheet_idx, rows` — lighter-weight than `meta` |
+| `zlsx list-sheets <file>` | `"sheet"` | `sheet, sheet_idx` — lighter-weight than `meta` |
 
 Short `zlsx <file>` is an alias for `zlsx rows <file>` — which streams **the first sheet only** by default. Users who want every sheet pass `--all-sheets` explicitly (on either form). The existing `--format {jsonl,jsonl-dict,tsv,csv}` on `rows` stays for backward compat; the default output on new commands is pure NDJSON with no format selector.
 
