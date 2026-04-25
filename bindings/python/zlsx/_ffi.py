@@ -419,6 +419,22 @@ if _HAS_HYPERLINK:
     ]
     lib.zlsx_sheet_writer_add_hyperlink.restype = ctypes.c_int32
 
+# Internal-hyperlink authoring (libzlsx 0.2.7+). Same shape as
+# `add_hyperlink` but the second string is the workbook-internal
+# `location` (e.g. "Sheet2!A1") instead of an external URL.
+_HAS_INTERNAL_HYPERLINK = hasattr(lib, "zlsx_sheet_writer_add_internal_hyperlink")
+if _HAS_INTERNAL_HYPERLINK:
+    lib.zlsx_sheet_writer_add_internal_hyperlink.argtypes = [
+        sheet_writer_handle,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_add_internal_hyperlink.restype = ctypes.c_int32
+
 
 class CDxfBorderSide(ctypes.Structure):
     _fields_ = [

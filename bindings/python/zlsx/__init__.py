@@ -30,7 +30,7 @@ from typing import Iterator, Union
 
 from . import _ffi
 
-__version__ = "0.2.4"
+__version__ = "0.2.7"
 """Python-package version. Tracks the Zig library's major+minor; the patch
 level may drift when the binding ships a Python-only fix."""
 
@@ -1688,6 +1688,46 @@ def _sheet_add_hyperlink(self: "SheetWriter", range_str: str, url: str) -> None:
         )
 
 
+def _sheet_add_internal_hyperlink(self: "SheetWriter", range_str: str, location: str) -> None:
+    """Attach an internal (same-workbook) hyperlink.
+
+    ``range_str`` is A1-style (``"A1"`` / ``"B2:C3"``). ``location``
+    is the target reference Excel writes verbatim into
+    ``<hyperlink location="…"/>``, e.g. ``"Sheet2!A1"`` or
+    ``"'Sheet With Spaces'!B2"``. Raises :class:`ZlsxError` on
+    malformed ranges (``InvalidHyperlinkRange``) or empty location
+    (``InvalidHyperlinkLocation``). Requires libzlsx 0.2.7+."""
+    self._require_handle()
+    if not _ffi._HAS_INTERNAL_HYPERLINK:
+        raise RuntimeError(
+            "loaded libzlsx does not expose add_internal_hyperlink "
+            "(requires 0.2.7+); upgrade libzlsx"
+        )
+    range_raw = range_str.encode("utf-8")
+    loc_raw = location.encode("utf-8")
+    range_buf = (ctypes.c_ubyte * max(len(range_raw), 1)).from_buffer_copy(
+        range_raw or b"\x00"
+    )
+    loc_buf = (ctypes.c_ubyte * max(len(loc_raw), 1)).from_buffer_copy(
+        loc_raw or b"\x00"
+    )
+    rc = _ffi.lib.zlsx_sheet_writer_add_internal_hyperlink(
+        self._handle,
+        ctypes.cast(range_buf, ctypes.POINTER(ctypes.c_ubyte)),
+        len(range_raw),
+        ctypes.cast(loc_buf, ctypes.POINTER(ctypes.c_ubyte)),
+        len(loc_raw),
+        self._err,
+        _ERR_BUF_LEN,
+    )
+    del range_buf
+    del loc_buf
+    if rc != 0:
+        raise ZlsxError(
+            f"zlsx_sheet_writer_add_internal_hyperlink: {_decode_err(self._err)}"
+        )
+
+
 def _sheet_add_comment(
     self: "SheetWriter",
     ref: str,
@@ -2066,6 +2106,7 @@ SheetWriter.freeze_panes = _sheet_freeze_panes           # type: ignore[attr-def
 SheetWriter.set_auto_filter = _sheet_set_auto_filter     # type: ignore[attr-defined]
 SheetWriter.add_merged_cell = _sheet_add_merged_cell     # type: ignore[attr-defined]
 SheetWriter.add_hyperlink = _sheet_add_hyperlink         # type: ignore[attr-defined]
+SheetWriter.add_internal_hyperlink = _sheet_add_internal_hyperlink  # type: ignore[attr-defined]
 SheetWriter.add_comment = _sheet_add_comment             # type: ignore[attr-defined]
 SheetWriter.add_data_validation_list = _sheet_add_data_validation_list  # type: ignore[attr-defined]
 SheetWriter.add_data_validation_numeric = _sheet_add_data_validation_numeric  # type: ignore[attr-defined]
@@ -2164,6 +2205,7 @@ class Writer:
     :meth:`add_dxf`. Per-sheet attachments include
     ``set_column_width``, ``freeze_panes``, ``set_auto_filter``,
     ``add_merged_cell``, ``add_hyperlink`` (external URLs),
+    ``add_internal_hyperlink`` (workbook-internal targets),
     ``add_comment``, ``add_data_validation_{list,numeric,custom}``,
     ``add_conditional_format_{cell_is,expression,color_scale,data_bar}``,
     ``write_rich_row`` for inline rich-text runs, and

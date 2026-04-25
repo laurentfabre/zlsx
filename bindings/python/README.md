@@ -149,7 +149,7 @@ with zlsx.write("out.xlsx") as w:
 - Write fresh workbooks with multiple sheets, typed cells, SST dedup, XML escaping
 - Cell styles: fonts (bold / italic / size / name / color), horizontal alignment, wrap text, fills (19 patternTypes, fg + bg colors), borders (5 sides × 14 styles + diagonal up/down), number formats
 - Per-sheet layout: column widths, freeze panes, auto-filter
-- Merged cells, hyperlinks, comments
+- Merged cells, external + internal hyperlinks, comments
 - Rich-text runs on write (`write_rich_row`)
 - Formula cells on write (`write_row_with_formulas`) — emits `<f>` + cached `<v>`; Excel recalculates on open
 - Data validation (list / numeric / custom) and conditional formatting (cellIs / expression / colorScale / dataBar)

@@ -2099,6 +2099,33 @@ export fn zlsx_sheet_writer_add_hyperlink(
     return 0;
 }
 
+/// Attach an internal (same-workbook) hyperlink to a cell or range.
+/// `location` is the target reference Excel writes verbatim into
+/// `<hyperlink location="…"/>` — typically `Sheet2!A1` or
+/// `'Sheet With Spaces'!B2`. Equivalent of the Zig writer's
+/// `addInternalHyperlink`; mirrors `add_hyperlink` for external URLs.
+/// Returns 0 on success, -1 with `err="InvalidHyperlinkRange"` on
+/// malformed range, `"InvalidHyperlinkLocation"` on empty location,
+/// or `"OutOfMemory"` on alloc failure.
+export fn zlsx_sheet_writer_add_internal_hyperlink(
+    sw: *SheetWriter,
+    range_ptr: [*]const u8,
+    range_len: usize,
+    location_ptr: [*]const u8,
+    location_len: usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+    const range = range_ptr[0..range_len];
+    const location = location_ptr[0..location_len];
+    sw_state.inner.addInternalHyperlink(range, location) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
 /// Differential format for conditional-formatting rules. Plain
 /// extern struct so callers can construct it inline. `has_color` /
 /// `has_fill` gate the paired ARGB fields — zero means "not set",
@@ -2922,6 +2949,78 @@ test "writer C ABI: write_row_with_formulas round-trips through reader" {
     );
     try std.testing.expectEqual(@as(i32, -1), rc2);
     try std.testing.expect(std.mem.indexOf(u8, &err_buf, "InvalidInput") != null);
+}
+
+test "writer C ABI: add_hyperlink + add_internal_hyperlink round-trip" {
+    const tmp_path = "/tmp/zlsx_c_abi_hyperlink_writer.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var err_buf: [128]u8 = undefined;
+    const w = zlsx_writer_create(&err_buf, err_buf.len);
+    try std.testing.expect(w != null);
+    defer zlsx_writer_close(w);
+
+    const sheet_name = "Main";
+    const sw = zlsx_writer_add_sheet(w.?, sheet_name.ptr, sheet_name.len, &err_buf, err_buf.len);
+    try std.testing.expect(sw != null);
+
+    // External + internal hyperlinks via the C ABI.
+    const r1 = "A1";
+    const url1 = "https://example.com/a";
+    try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_add_hyperlink(
+        sw.?,
+        r1.ptr,
+        r1.len,
+        url1.ptr,
+        url1.len,
+        &err_buf,
+        err_buf.len,
+    ));
+    const r2 = "B2";
+    const loc2 = "Main!A1";
+    try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_add_internal_hyperlink(
+        sw.?,
+        r2.ptr,
+        r2.len,
+        loc2.ptr,
+        loc2.len,
+        &err_buf,
+        err_buf.len,
+    ));
+    const x = "x";
+    const row = [_]CCell{
+        .{ .tag = @intFromEnum(CellTag.string), .str_len = x.len, .str_ptr = x.ptr, .i = 0, .f = 0, .b = 0, ._pad = [_]u8{0} ** 7 },
+    };
+    try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_write_row(sw.?, &row, row.len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w.?, tmp_path, tmp_path.len, &err_buf, err_buf.len));
+
+    // Read back through the Zig reader, confirm both hyperlinks survived.
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+    const links = book.hyperlinks(book.sheets[0]);
+    try std.testing.expectEqual(@as(usize, 2), links.len);
+
+    // External link: url populated, location empty.
+    try std.testing.expectEqualStrings("https://example.com/a", links[0].url);
+    try std.testing.expectEqual(@as(usize, 0), links[0].location.len);
+    // Internal link: location populated, url empty.
+    try std.testing.expectEqual(@as(usize, 0), links[1].url.len);
+    try std.testing.expectEqualStrings("Main!A1", links[1].location);
+
+    // Empty location is rejected as InvalidHyperlinkLocation.
+    @memset(&err_buf, 0);
+    const empty_loc: []const u8 = "";
+    const rc = zlsx_sheet_writer_add_internal_hyperlink(
+        sw.?,
+        r2.ptr,
+        r2.len,
+        empty_loc.ptr,
+        empty_loc.len,
+        &err_buf,
+        err_buf.len,
+    );
+    try std.testing.expectEqual(@as(i32, -1), rc);
+    try std.testing.expect(std.mem.indexOf(u8, &err_buf, "InvalidHyperlinkLocation") != null);
 }
 
 test "fuzz fromCCell: random tags never panic" {

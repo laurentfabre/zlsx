@@ -953,6 +953,20 @@ int32_t zlsx_sheet_writer_add_hyperlink(
     uint8_t             * err_buf,
     size_t                err_buf_len);
 
+/* Attach an internal (same-workbook) hyperlink to a cell or range.
+ * `location` is the target ref Excel writes verbatim into
+ * <hyperlink location="…"/>, e.g. "Sheet2!A1" or "'Sheet With
+ * Spaces'!B2". Returns 0 or -1 with err="InvalidHyperlinkRange" /
+ * "InvalidHyperlinkLocation". */
+int32_t zlsx_sheet_writer_add_internal_hyperlink(
+    zlsx_sheet_writer_t * sw,
+    const uint8_t       * range_ptr,
+    size_t                range_len,
+    const uint8_t       * location_ptr,
+    size_t                location_len,
+    uint8_t             * err_buf,
+    size_t                err_buf_len);
+
 /* Attach a cell comment (note). `ref` is a single-cell A1 ref
  * ("B2"); ranges are rejected. `author` + `text` are plain text,
  * xml-escaped on emit. Returns 0 or -1 with err="InvalidCommentRef"
