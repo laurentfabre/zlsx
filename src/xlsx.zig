@@ -1177,13 +1177,12 @@ pub const Book = struct {
 
         var it = try self.rows(sheet, allocator);
         defer it.deinit();
-        // Tell the iterator to keep its row arena alive across
-        // `next()` calls so per-row decoded strings observed during
-        // materialise stay valid until we copy them into the matrix
-        // arena below. Without this, the next `next()` would reset
-        // the iterator arena and invalidate already-stored slices.
-        it.keep_arena_strings = true;
-
+        // Note: we do NOT set it.keep_arena_strings here (Codex P2
+        // follow-up). Each row body is fully cloned into matrix.arena
+        // below before the next `next()` call fires, so the iterator's
+        // own arena is free to reset between rows. Keeping it alive
+        // wholesale doubled peak memory on entity-heavy workbooks for
+        // no benefit.
         const arena_alloc = matrix.arena.allocator();
         var row_acc: std.ArrayListUnmanaged([]const Cell) = .{};
         // Pre-size the outer accumulator using the SST length as a
@@ -1392,14 +1391,6 @@ pub const Rows = struct {
     /// has no usable `r` attribute, so envelope consumers see
     /// 1..N-contiguous row numbers regardless of source sparsity.
     yield_count: u32 = 0,
-    /// When true, `next()` does NOT reset the per-row arena, so any
-    /// row-owned decoded strings from earlier rows remain valid for
-    /// the iterator's lifetime. Set by `Book.materialiseSheet` so the
-    /// resulting `SheetMatrix` can adopt the arena wholesale and own
-    /// every string the matrix references. Stays false on the normal
-    /// streaming path so per-row owned bytes are still bulk-freed each
-    /// `next()` (the existing memory-budget contract).
-    keep_arena_strings: bool = false,
 
     pub fn deinit(self: *Rows) void {
         self.arena.deinit();
@@ -1525,7 +1516,7 @@ pub const Rows = struct {
         // at C2 is referenced by slave cells at C3..C10 in subsequent
         // rows). Both are freed in deinit() once the iterator goes
         // out of scope.
-        if (!self.keep_arena_strings) _ = self.arena.reset(.retain_capacity);
+        _ = self.arena.reset(.retain_capacity);
 
         while (findTagOpen(self.xml, self.pos, "row")) |row_start| {
             // The `r` attribute on <row> is optional per the OOXML
