@@ -2066,10 +2066,15 @@ class Writer:
 
     Writes strings, integers, floats, booleans, and empties; styles
     via :meth:`add_style` (bold/italic, fonts, fills, borders,
-    alignment, wrap, number formats); per-sheet ``set_column_width``,
-    ``freeze_panes``, ``set_auto_filter``, ``add_merged_cell``,
-    ``add_hyperlink`` (external URLs). Formulas and load-modify-save
-    round-trip remain out of scope until Phase 3c.
+    alignment, wrap, number formats) and conditional-format dxfs via
+    :meth:`add_dxf`. Per-sheet attachments include
+    ``set_column_width``, ``freeze_panes``, ``set_auto_filter``,
+    ``add_merged_cell``, ``add_hyperlink`` (external URLs),
+    ``add_comment``, ``add_data_validation_{list,numeric,custom}``,
+    ``add_conditional_format_{cell_is,expression,color_scale,data_bar}``,
+    and ``write_rich_row`` for inline rich-text runs. Formula cells
+    on write and load-modify-save round-trip remain out of scope
+    until Phase 3c.
     """
 
     def __init__(self, path: Union[str, Path, None] = None):
