@@ -5903,6 +5903,7 @@ test "Rows.formulaStrings returns entity-decoded text (iter61-b P2)" {
         .row_formula_strings = .{},
         .row_formula_refs = .{},
         .shared_si_to_base_ref = .{},
+        .array_ranges = .{},
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
@@ -5993,4 +5994,62 @@ test "runCellsCommand emits t:formula for stand-alone, shared-base, shared-slave
     // Row 3 — C3 stand-alone, D3 shared-formula slave (formula_ref=D2):
     try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"C3\",\"row\":3,\"col\":3,\"t\":\"formula\",\"formula\":\"A3+B3\",\"cached\":30") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"D3\",\"row\":3,\"col\":4,\"t\":\"formula\",\"formula_ref\":\"D2\",\"cached\":200") != null);
+}
+
+test "runCellsCommand emits t:formula with formula_ref for array-formula slaves" {
+    // Same post-injection trick: write a workbook then replace the
+    // sheet body. C2 is the array base (=A2:A4*B2:B4 with ref=C2:C4);
+    // C3 + C4 carry only cached <v> bodies. Reader must spread the
+    // array formula context to the slaves so all three rows surface
+    // as t:"formula" records.
+    const tmp_path = "/tmp/zlsx_cli_array_spread.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Data");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    const sheet_path = book.sheets[0].path;
+    const injected =
+        "<?xml version=\"1.0\"?>" ++
+        "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+        "<sheetData>" ++
+        "<row r=\"2\">" ++
+        "<c r=\"C2\"><f t=\"array\" ref=\"C2:C4\">A2:A4*B2:B4</f><v>10</v></c>" ++
+        "</row>" ++
+        "<row r=\"3\">" ++
+        "<c r=\"C3\"><v>20</v></c>" ++
+        "</row>" ++
+        "<row r=\"4\">" ++
+        "<c r=\"C4\"><v>30</v></c>" ++
+        "</row>" ++
+        "</sheetData>" ++
+        "</worksheet>";
+    const dup = try book.allocator.dupe(u8, injected);
+    if (book.sheet_data.getEntry(sheet_path)) |entry| {
+        book.allocator.free(entry.value_ptr.*);
+        entry.value_ptr.* = dup;
+    } else {
+        book.allocator.free(dup);
+        return error.SheetDataMissing;
+    }
+
+    var scratch: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, null, null, null, false, false);
+
+    const out = w.buffered();
+    // Base C2: own formula text + cached.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"C2\",\"row\":2,\"col\":3,\"t\":\"formula\",\"formula\":\"A2:A4*B2:B4\",\"cached\":10") != null);
+    // Slave C3: formula_ref to C2 + cached.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"C3\",\"row\":3,\"col\":3,\"t\":\"formula\",\"formula_ref\":\"C2\",\"cached\":20") != null);
+    // Slave C4: formula_ref to C2 + cached.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"C4\",\"row\":4,\"col\":3,\"t\":\"formula\",\"formula_ref\":\"C2\",\"cached\":30") != null);
 }

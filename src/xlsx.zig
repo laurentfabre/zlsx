@@ -210,6 +210,18 @@ pub const MergeRange = struct {
     bottom_right: CellRef,
 };
 
+/// Array-formula spread rectangle from `<f t="array" ref="X:Y">…</f>`.
+/// `tl` and `br` are the inclusive corners (component-wise normalised
+/// like `MergeRange`); `base` is the cell that carried the `<f>`
+/// element — by OOXML convention always the top-left of the rectangle,
+/// recorded explicitly so the slave→base linkage is unambiguous if a
+/// future generator drops the convention.
+pub const ArrayRange = struct {
+    tl: CellRef,
+    br: CellRef,
+    base: CellRef,
+};
+
 /// A hyperlink attached to a cell or cell range. Two flavours:
 ///   - **External**: `url` holds the resolved `Target` from the
 ///     sheet's `_rels/sheet{N}.xml.rels` file; `location` is empty.
@@ -1114,6 +1126,7 @@ pub const Book = struct {
             .row_formula_strings = .{},
             .row_formula_refs = .{},
             .shared_si_to_base_ref = .{},
+            .array_ranges = .{},
             .arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
@@ -1223,11 +1236,19 @@ pub const Rows = struct {
     /// see the cached value. Same lifetime as `row_cells`.
     row_formula_strings: std.ArrayListUnmanaged(?[]const u8),
     /// Parallel to `row_cells`. Each slot holds the base cell's A1
-    /// reference for shared-formula slaves — cells whose source `<c>`
-    /// carried `<f t="shared" si="N"/>` with no body. The ref is
-    /// looked up from `shared_si_to_base_ref`. Null otherwise. The
-    /// CellRef itself is by-value (no allocation), so this list owns
-    /// the slot directly. Exposed via `formulaRefs()`.
+    /// reference for formula slaves — cells that participate in a
+    /// formula spread without carrying their own `<f>` body. Two
+    /// kinds populate this slot:
+    ///   - **Shared-formula slaves**: source `<c>` carried
+    ///     `<f t="shared" si="N"/>` with no body; the ref is looked
+    ///     up from `shared_si_to_base_ref`.
+    ///   - **Array-formula slaves**: source `<c>` had no `<f>` at
+    ///     all, but its (col,row) sits inside a previously seen
+    ///     `<f t="array" ref="X:Y">` rectangle; the ref is the array
+    ///     base (top-left of that rectangle). Recorded in
+    ///     `array_ranges` and resolved by linear scan in `consumeCell`.
+    /// Null otherwise. The CellRef itself is by-value (no allocation),
+    /// so this list owns the slot directly. Exposed via `formulaRefs()`.
     row_formula_refs: std.ArrayListUnmanaged(?CellRef),
     /// Map from a shared-formula `si` index (the integer in
     /// `<f t="shared" si="N"…>`) to the base cell's A1 ref (the
@@ -1242,6 +1263,23 @@ pub const Rows = struct {
     /// mapping before slave cells are reached. Cleared / freed only
     /// in `deinit()`.
     shared_si_to_base_ref: std.AutoHashMapUnmanaged(u32, CellRef),
+    /// Array-formula spread ranges seen so far in this iterator. Each
+    /// entry records a base cell (`<f t="array" ref="X:Y">body</f>`,
+    /// the top-left of the rectangle) plus the rectangle's corners.
+    /// Slave cells inside the rectangle (e.g. C3..C10 for an array
+    /// base at C2 with `ref="C2:C10"`) carry only a cached `<v>` and
+    /// no `<f>` of their own; the linear scan in `consumeCell` finds
+    /// the matching range and surfaces them as `formula_ref`-bearing
+    /// formula records, mirroring the shared-formula slave shape.
+    ///
+    /// Lifetime is the **iterator's lifetime**, NOT the row's: array
+    /// formulas span multiple rows by design (the whole point of
+    /// `<f t="array" ref="C2:C10">` is that C3..C10 are dependents),
+    /// so clearing this on `next()` would lose the linkage before the
+    /// slave rows are reached. Cleared / freed only in `deinit()`.
+    /// Typically tiny (a handful of entries per workbook), so a
+    /// linear scan per cell is fine.
+    array_ranges: std.ArrayListUnmanaged(ArrayRange),
     /// Bump arena for per-row decoded strings. Reset (O(1)) at the
     /// start of each `next()` call — previous row's owned strings
     /// become invalid, which matches the documented contract. Compared
@@ -1275,6 +1313,7 @@ pub const Rows = struct {
         self.row_formula_strings.deinit(self.allocator);
         self.row_formula_refs.deinit(self.allocator);
         self.shared_si_to_base_ref.deinit(self.allocator);
+        self.array_ranges.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -1384,10 +1423,11 @@ pub const Rows = struct {
         self.row_error_strings.clearRetainingCapacity();
         self.row_formula_strings.clearRetainingCapacity();
         self.row_formula_refs.clearRetainingCapacity();
-        // NOTE: shared_si_to_base_ref is NOT cleared here — shared
-        // formulas span rows (the base cell at C2 is referenced by
-        // slave cells at C3..C10 in subsequent rows). The map is
-        // freed in deinit() once the iterator goes out of scope.
+        // NOTE: shared_si_to_base_ref and array_ranges are NOT cleared
+        // here — both kinds of formula spread span rows (the base cell
+        // at C2 is referenced by slave cells at C3..C10 in subsequent
+        // rows). Both are freed in deinit() once the iterator goes
+        // out of scope.
         _ = self.arena.reset(.retain_capacity);
 
         while (findTagOpen(self.xml, self.pos, "row")) |row_start| {
@@ -1514,8 +1554,8 @@ pub const Rows = struct {
         //   - `<f>body</f>` (no t=)        → stand-alone formula:    formula_strings[col] = body
         //   - `<f t="shared" ref="X:Y" si="N">body</f>` → base cell:  formula_strings[col] = body, map[N] = top-left(X:Y)
         //   - `<f t="shared" si="N"/>`     → slave:                  formula_refs[col] = map.get(N)
-        //   - `<f t="array" ref="X:Y">body</f>` → array base:        formula_strings[col] = body
-        //                                                            (range-spread aspect not surfaced — out of scope)
+        //   - `<f t="array" ref="X:Y">body</f>` → array base:        formula_strings[col] = body, array_ranges += {tl,br,base=tl}
+        //   - cell inside an array range with no `<f>` (slave):       formula_refs[col] = base (set after value parse)
         try self.parseFormulaElement(body, col_idx);
 
         const cell: Cell = if (std.mem.eql(u8, cell_type, "inlineStr"))
@@ -1542,6 +1582,29 @@ pub const Rows = struct {
         } else try parseNumericCell(extractVValue(body) orelse "");
 
         self.row_cells.items[col_idx] = cell;
+
+        // Array-formula slave detection: a cell inside a previously
+        // registered `<f t="array" ref="X:Y">` rectangle that has no
+        // `<f>` of its own gets its `formula_ref` set to the base.
+        // Runs AFTER parseFormulaElement so a cell that carries its
+        // own formula (rare overlap case) keeps it; the existing
+        // formula slots win because we gate on both being null. The
+        // base cell itself is excluded so its own `formula_strings`
+        // entry is preserved untouched.
+        if (self.row_formula_strings.items[col_idx] == null and
+            self.row_formula_refs.items[col_idx] == null)
+        {
+            const here = CellRef{ .col = @intCast(col_idx), .row = self.current_row };
+            for (self.array_ranges.items) |ar| {
+                if (here.row >= ar.tl.row and here.row <= ar.br.row and
+                    here.col >= ar.tl.col and here.col <= ar.br.col and
+                    !(here.row == ar.base.row and here.col == ar.base.col))
+                {
+                    self.row_formula_refs.items[col_idx] = ar.base;
+                    break;
+                }
+            }
+        }
 
         // Date-type side channel: flip the flag when the cell is a
         // numeric serial under a date-styled numFmt and the serial is
@@ -1658,11 +1721,23 @@ pub const Rows = struct {
             // bottom_right`, which is still the correct base.
             try self.shared_si_to_base_ref.put(self.allocator, si, range.top_left);
         }
-        // Array formulas (`t="array"`): we surface the formula text
-        // on the top-left cell only, which already happened above.
-        // The range-spread aspect (`ref="C2:C10"`) is intentionally
-        // not propagated to the dependent cells — out of scope per
-        // iter61-b. Document deviation in jq-for-excel.md if needed.
+        // Array formulas (`t="array"` with body+ref): the base cell
+        // already has its formula text set above. Register the spread
+        // rectangle so dependent cells inside the range — which carry
+        // only a cached `<v>` and no `<f>` of their own — can be
+        // resolved to this base by the linear scan in `consumeCell`.
+        // Tolerate a missing/malformed ref the same way the
+        // shared-formula branch does: the base cell still surfaces
+        // its own formula text; only the cross-cell linkage is lost.
+        if (f_type != null and std.mem.eql(u8, f_type.?, "array") and ref_attr != null) {
+            const range = parseA1Range(ref_attr.?) catch return;
+            const base = CellRef{ .col = @intCast(col_idx), .row = self.current_row };
+            try self.array_ranges.append(self.allocator, .{
+                .tl = range.top_left,
+                .br = range.bottom_right,
+                .base = base,
+            });
+        }
     }
 
     fn resolveSharedString(self: *Rows, body: []const u8) !Cell {
@@ -5149,6 +5224,7 @@ fn consumeAllRows(alloc: std.mem.Allocator, shared_strings: []const []const u8, 
         .row_formula_strings = .{},
         .row_formula_refs = .{},
         .shared_si_to_base_ref = .{},
+        .array_ranges = .{},
         .arena = std.heap.ArenaAllocator.init(alloc),
     };
     defer rows.deinit();
@@ -5290,6 +5366,7 @@ test "fuzz Rows.next on synthetic cells with out-of-range SST indices" {
             .row_formula_strings = .{},
             .row_formula_refs = .{},
             .shared_si_to_base_ref = .{},
+            .array_ranges = .{},
             .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
         };
         defer rows.deinit();
@@ -5325,6 +5402,7 @@ test "Rows.currentRowNumber recovers from cell r attr when <row r> is absent/bad
         .row_formula_strings = .{},
         .row_formula_refs = .{},
         .shared_si_to_base_ref = .{},
+        .array_ranges = .{},
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
@@ -5358,6 +5436,7 @@ test "Rows.currentRowNumber recovers cell-r with non-space whitespace after <c" 
         .row_formula_strings = .{},
         .row_formula_refs = .{},
         .shared_si_to_base_ref = .{},
+        .array_ranges = .{},
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
@@ -5391,6 +5470,7 @@ test "Rows.currentRowNumber falls through to yield count when row body is empty"
         .row_formula_strings = .{},
         .row_formula_refs = .{},
         .shared_si_to_base_ref = .{},
+        .array_ranges = .{},
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
@@ -5628,4 +5708,157 @@ test "preloadSheet populates per-sheet metadata without rows() iteration" {
     // Second preload is idempotent.
     try book.preloadSheet(book.sheets[0]);
     try std.testing.expectEqual(@as(usize, 1), book.sheet_data.count());
+}
+
+test "array-formula spread: base + slaves resolve via formula_refs" {
+    // Synthetic two-row sheet: C2 is the array base for C2:C4 (=A2:A4*B2:B4),
+    // C3 + C4 carry only cached <v> bodies. Reader must surface C2 via
+    // formula_strings + the cell's cached value, and C3/C4 via
+    // formula_refs pointing at C2 with the cached values intact.
+    const xml =
+        "<sheetData>" ++
+        "<row r=\"2\">" ++
+        "<c r=\"C2\"><f t=\"array\" ref=\"C2:C4\">A2:A4*B2:B4</f><v>10</v></c>" ++
+        "</row>" ++
+        "<row r=\"3\">" ++
+        "<c r=\"C3\"><v>20</v></c>" ++
+        "</row>" ++
+        "<row r=\"4\">" ++
+        "<c r=\"C4\"><v>30</v></c>" ++
+        "</row>" ++
+        "</sheetData>";
+
+    var rows: Rows = .{
+        .xml = xml,
+        .pos = 0,
+        .shared_strings = &.{},
+        .allocator = std.testing.allocator,
+        .row_cells = .{},
+        .row_styles = .{},
+        .row_date_types = .{},
+        .row_error_strings = .{},
+        .row_formula_strings = .{},
+        .row_formula_refs = .{},
+        .shared_si_to_base_ref = .{},
+        .array_ranges = .{},
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer rows.deinit();
+
+    // Row 2 — base cell at C2 (col 2, 0-based).
+    {
+        const cells = (try rows.next()) orelse return error.UnexpectedEndOfRows;
+        try std.testing.expect(cells.len > 2);
+        const fs = rows.formulaStrings();
+        const fr = rows.formulaRefs();
+        try std.testing.expectEqualStrings("A2:A4*B2:B4", fs[2].?);
+        try std.testing.expect(fr[2] == null);
+        try std.testing.expectEqual(@as(i64, 10), cells[2].integer);
+    }
+
+    // Row 3 — slave at C3, no <f>, must resolve to C2.
+    {
+        const cells = (try rows.next()) orelse return error.UnexpectedEndOfRows;
+        const fs = rows.formulaStrings();
+        const fr = rows.formulaRefs();
+        try std.testing.expect(fs[2] == null);
+        try std.testing.expectEqualDeep(CellRef{ .col = 2, .row = 2 }, fr[2].?);
+        try std.testing.expectEqual(@as(i64, 20), cells[2].integer);
+    }
+
+    // Row 4 — slave at C4 → also C2.
+    {
+        const cells = (try rows.next()) orelse return error.UnexpectedEndOfRows;
+        const fs = rows.formulaStrings();
+        const fr = rows.formulaRefs();
+        try std.testing.expect(fs[2] == null);
+        try std.testing.expectEqualDeep(CellRef{ .col = 2, .row = 2 }, fr[2].?);
+        try std.testing.expectEqual(@as(i64, 30), cells[2].integer);
+    }
+}
+
+test "array-formula spread: own <f> on a cell inside the range wins" {
+    // Defensive ordering: a cell inside a registered array range that
+    // ALSO carries its own <f> keeps its own formula text. Surfaces as
+    // formula_strings (not formula_refs).
+    const xml =
+        "<sheetData>" ++
+        "<row r=\"2\">" ++
+        "<c r=\"C2\"><f t=\"array\" ref=\"C2:C4\">A2:A4*B2:B4</f><v>10</v></c>" ++
+        "</row>" ++
+        "<row r=\"3\">" ++
+        "<c r=\"C3\"><f>SUM(1,2)</f><v>3</v></c>" ++
+        "</row>" ++
+        "</sheetData>";
+
+    var rows: Rows = .{
+        .xml = xml,
+        .pos = 0,
+        .shared_strings = &.{},
+        .allocator = std.testing.allocator,
+        .row_cells = .{},
+        .row_styles = .{},
+        .row_date_types = .{},
+        .row_error_strings = .{},
+        .row_formula_strings = .{},
+        .row_formula_refs = .{},
+        .shared_si_to_base_ref = .{},
+        .array_ranges = .{},
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer rows.deinit();
+
+    _ = (try rows.next()) orelse return error.UnexpectedEndOfRows; // row 2 (base)
+
+    const cells = (try rows.next()) orelse return error.UnexpectedEndOfRows;
+    const fs = rows.formulaStrings();
+    const fr = rows.formulaRefs();
+    try std.testing.expectEqualStrings("SUM(1,2)", fs[2].?);
+    try std.testing.expect(fr[2] == null);
+    try std.testing.expectEqual(@as(i64, 3), cells[2].integer);
+}
+
+test "array-formula spread: base without <v> still spreads to slaves" {
+    // Edge case: an array base whose source has no cached <v>. The
+    // base still surfaces its formula text; slaves still get
+    // formula_ref. The base cell value is .empty.
+    const xml =
+        "<sheetData>" ++
+        "<row r=\"2\">" ++
+        "<c r=\"C2\"><f t=\"array\" ref=\"C2:C3\">A2:A3*B2:B3</f></c>" ++
+        "</row>" ++
+        "<row r=\"3\">" ++
+        "<c r=\"C3\"><v>42</v></c>" ++
+        "</row>" ++
+        "</sheetData>";
+
+    var rows: Rows = .{
+        .xml = xml,
+        .pos = 0,
+        .shared_strings = &.{},
+        .allocator = std.testing.allocator,
+        .row_cells = .{},
+        .row_styles = .{},
+        .row_date_types = .{},
+        .row_error_strings = .{},
+        .row_formula_strings = .{},
+        .row_formula_refs = .{},
+        .shared_si_to_base_ref = .{},
+        .array_ranges = .{},
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer rows.deinit();
+
+    {
+        const cells = (try rows.next()) orelse return error.UnexpectedEndOfRows;
+        const fs = rows.formulaStrings();
+        try std.testing.expectEqualStrings("A2:A3*B2:B3", fs[2].?);
+        try std.testing.expect(cells[2] == .empty);
+    }
+    {
+        const cells = (try rows.next()) orelse return error.UnexpectedEndOfRows;
+        const fr = rows.formulaRefs();
+        try std.testing.expectEqualDeep(CellRef{ .col = 2, .row = 2 }, fr[2].?);
+        try std.testing.expectEqual(@as(i64, 42), cells[2].integer);
+    }
 }
