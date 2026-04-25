@@ -829,7 +829,15 @@ fn writeEnvelopeCells(
     try w.writeByte('[');
     var first = true;
     for (cells, 0..) |c, i| {
-        if (c == .empty and !include_blanks) continue;
+        // iter61-b P2 follow-up: a formula cell whose source XML has
+        // no cached <v> element comes through as Cell.empty with the
+        // formula text in row_formula_strings (or a ref in
+        // row_formula_refs). Pre-checking here so the .empty skip
+        // doesn't drop those records — runCellsOnSheetCore already
+        // does the same for the cells sub-command.
+        const has_formula_here = (i < formula_strings.len and formula_strings[i] != null) or
+            (i < formula_refs.len and formula_refs[i] != null);
+        if (c == .empty and !include_blanks and !has_formula_here) continue;
         if (!first) try w.writeByte(',');
         first = false;
 
@@ -5807,6 +5815,86 @@ test "writeRowEnvelope emits formula records inside cells array (iter61-b)" {
             "]}\n",
         w.buffered(),
     );
+}
+
+test "writeEnvelopeCells emits formula-only cells when Cell is .empty (iter61-b P2)" {
+    // Codex P2 follow-up: a formula cell whose source had no cached
+    // <v> element comes through as Cell.empty with formula text in
+    // row_formula_strings. The row-envelope path must not skip those
+    // records via the .empty short-circuit.
+    var scratch: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    const cells = [_]xlsx.Cell{
+        .{ .integer = 1 },
+        .empty, // formula cell with no <v> body
+        .empty, // shared-formula slave with no <v>
+    };
+    const date_types = [_]bool{ false, false, false };
+    const error_strings = [_]?[]const u8{ null, null, null };
+    const formula_strings = [_]?[]const u8{ null, "A2+B2", null };
+    const formula_refs = [_]?xlsx.CellRef{ null, null, .{ .row = 1, .col = 1 } };
+
+    try writeRowEnvelope(
+        &w,
+        "Data",
+        0,
+        7,
+        &cells,
+        false, // include_blanks
+        null, // style_ctx
+        0, // col_offset
+        false, // compact
+        &date_types,
+        &error_strings,
+        &formula_strings,
+        &formula_refs,
+    );
+
+    const out = w.buffered();
+    // Cell A (.integer) emits as int.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"t\":\"int\",\"v\":1") != null);
+    // Cell B is .empty + has formula → must emit as t:"formula" with NO cached.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"col\":2,\"t\":\"formula\",\"formula\":\"A2+B2\"}") != null);
+    // Cell C is .empty + has formula_ref → must emit as t:"formula" with formula_ref.
+    // CellRef{row=1, col=1} renders as "B1" (col 0-based → 'B', row 1-based stays 1).
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"col\":3,\"t\":\"formula\",\"formula_ref\":\"B1\"}") != null);
+}
+
+test "Rows.formulaStrings returns entity-decoded text (iter61-b P2)" {
+    // Codex round-2 P2 #2 claim: formula text emitted XML-escaped.
+    // Counter-claim verified here: internOrBorrow runs appendDecoded
+    // when the body contains '&', so &lt;/&gt;/&amp;/&quot;/&apos;
+    // are decoded to their literal characters before reaching the
+    // CLI emitter or any Rows.formulaStrings() consumer.
+    const xml =
+        "<sheetData>" ++
+        "<row r=\"1\">" ++
+        "<c r=\"A1\"><f>IF(A1&lt;B1,&quot;x&quot;,A1&amp;B1)</f><v>0</v></c>" ++
+        "</row>" ++
+        "</sheetData>";
+
+    var rows: xlsx.Rows = .{
+        .xml = xml,
+        .pos = 0,
+        .shared_strings = &.{},
+        .allocator = std.testing.allocator,
+        .row_cells = .{},
+        .row_styles = .{},
+        .row_date_types = .{},
+        .row_error_strings = .{},
+        .row_formula_strings = .{},
+        .row_formula_refs = .{},
+        .shared_si_to_base_ref = .{},
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer rows.deinit();
+
+    _ = (try rows.next()) orelse return error.UnexpectedEndOfRows;
+    const formulas = rows.formulaStrings();
+    try std.testing.expect(formulas.len >= 1);
+    const f = formulas[0] orelse return error.MissingFormula;
+    // Decoded: < " & all expanded.
+    try std.testing.expectEqualStrings("IF(A1<B1,\"x\",A1&B1)", f);
 }
 
 test "runCellsCommand emits t:formula for stand-alone, shared-base, shared-slave (iter61-b)" {
