@@ -15,14 +15,14 @@ Shared workload: `open → iter rows → tally cells by {empty, string, integer,
 
 ## Wall-time results
 
-`hyperfine -N --warmup 5 --runs 30` on each (mean ± σ, ms). Lower is better. Refreshed after iters 46-49 (date auto-convert, VML idmap scaling, Dxf extended) landed on main. `-N` skips the shell wrapper so sub-5ms timings are accurate. The zlsx bench uses `std.heap.smp_allocator` — see the methodology note below for why and how to reproduce.
+`hyperfine -N --warmup 5 --runs 30` on each (mean ± σ, ms). Lower is better. Last refreshed 2026-04-25 (after the parseA1Ref bounds-check + parser-preallocation-cap commits). `-N` skips the shell wrapper so sub-5ms timings are accurate. The zlsx bench uses `std.heap.smp_allocator` — see the methodology note below for why and how to reproduce.
 
 | File | Size | Rows × Cols | zlsx | calamine-rust 0.26 | python-calamine 0.6 | openpyxl 3.1 |
 |---|---|---|---|---|---|---|
-| frictionless_2sheets.xlsx | 4.9 KB | 3 × 3 | 2.0 ± 0.2 | **1.8 ± 0.2** | 22.6 ± 1.9 | 128.0 ± 6.6 |
-| openpyxl_guess_types.xlsx | 29 KB | 2 × 5 | **1.9 ± 0.2** | 2.1 ± 0.2 | 22.4 ± 1.2 | 124.5 ± 8.1 |
-| phpoi_test1.xlsx | 9.8 KB | 8 × varied | **1.6 ± 0.1** | 1.6 ± 0.2 | 20.9 ± 1.3 | 124.3 ± 6.0 |
-| worldbank_catalog.xlsx | 67 KB | 161 × 26, **1,144 SST** | **3.2 ± 0.2** | 3.9 ± 0.2 | 24.3 ± 1.2 | 134.5 ± 4.6 |
+| frictionless_2sheets.xlsx | 4.9 KB | 3 × 3 | 1.9 ± 0.1 | **1.7 ± 0.1** | 20.5 ± 0.9 | 120.5 ± 3.6 |
+| openpyxl_guess_types.xlsx | 29 KB | 2 × 5 | **1.9 ± 0.1** | 2.0 ± 0.2 | 21.0 ± 0.5 | 124.5 ± 3.2 |
+| phpoi_test1.xlsx | 9.8 KB | 8 × varied | 1.9 ± 0.2 | **1.9 ± 0.1** | 18.9 ± 0.7 | 112.9 ± 1.5 |
+| worldbank_catalog.xlsx | 67 KB | 161 × 26, **1,144 SST** | **3.3 ± 0.2** | 3.6 ± 0.2 | 21.0 ± 0.6 | 121.8 ± 3.2 |
 
 ## Speedup
 
@@ -31,20 +31,20 @@ On the biggest reproducible workload where parsing dominates over startup:
 ```
 worldbank_catalog.xlsx (67 KB, 161 rows × 26 cols, 1,144 shared strings)
 
-  zlsx            ▌         3.2 ms     1.00×
-  calamine-rust   ▌▌        3.9 ms     1.20× slower
-  python-calamine ▌▌▌▌▌▌   24.3 ms     7.5×  slower
-  openpyxl        ▌▌…▌▌   134.5 ms    41.5×  slower
+  zlsx            ▌         3.3 ms     1.00×
+  calamine-rust   ▌▌        3.6 ms     1.11× slower
+  python-calamine ▌▌▌▌▌▌   21.0 ms     6.4×  slower
+  openpyxl        ▌▌…▌▌   121.8 ms    36.9×  slower
 ```
 
 Throughput at that size:
 
 | Impl | MB/s (of input archive) | rows/s |
 |---|---|---|
-| **zlsx** | **20.9** | **50,300** |
-| calamine-rust | 17.2 | 41,280 |
-| python-calamine | 2.76 | 6,625 |
-| openpyxl | 0.50 | 1,197 |
+| **zlsx** | **20.3** | **48,790** |
+| calamine-rust | 18.6 | 44,720 |
+| python-calamine | 3.19 | 7,670 |
+| openpyxl | 0.55 | 1,322 |
 
 On small files (≤30 KB) zlsx ties or edges calamine-rust within measurement noise; the process startup floor (~1.5 ms) dominates both native binaries at that size. Python libraries stay 10-75× slower across the whole corpus.
 
@@ -54,10 +54,10 @@ On small files (≤30 KB) zlsx ties or edges calamine-rust within measurement no
 
 | Impl | RSS (MB) | Relative |
 |---|---|---|
-| **zlsx** | **2.27** | **1.00×** |
-| calamine-rust | 3.12 | 1.37× |
-| python-calamine | 17.06 | 7.52× |
-| openpyxl | 42.56 | 18.76× |
+| **zlsx** | **2.37** | **1.00×** |
+| calamine-rust | 3.09 | 1.30× |
+| python-calamine | 17.00 | 7.17× |
+| openpyxl | 42.46 | 17.91× |
 
 zlsx has the smallest footprint of the four. Both native binaries sit ~7-19× below the Python stack.
 
@@ -134,27 +134,27 @@ All four libraries read identical content from the file. The counter differences
 
 Same workload across all three implementations: 1,001 rows × 10 cols (one header row + 1,000 data rows). The header row has per-cell styles (bold white-on-blue fill, centre-aligned). Body rows mix strings, integers, floats, booleans, with the numeric columns referencing one of two shared number-format styles (`$#,##0.00` / `0.00%`). Sheet gets `column_width[0]=20` + `freeze_panes(row=1)`.
 
-20-run `hyperfine -N` median (refreshed after iter46-49 landed: dates / VML idmap scaling / Dxf extended). zlsx bench uses `smp_allocator` + in-house LZ77 + dynamic-huffman deflate with lazy matching + word-size SIMD match-length compare — see methodology notes below:
+20-run `hyperfine -N` median, last refreshed 2026-04-25. zlsx bench uses `smp_allocator` + in-house LZ77 + dynamic-huffman deflate with lazy matching + word-size SIMD match-length compare — see methodology notes below:
 
 | Impl | Time | Peak RSS | Output size | Speedup (wall) |
 |---|---|---|---|---|
-| **zlsx Writer** | **7.2 ms ± 0.2** | **4.40 MB** | 54.9 KB | **1.00×** |
-| xlsxwriter 3.2 (`constant_memory`) | 70.3 ms ± 0.6 | 25.41 MB | 55.2 KB | 9.82× slower |
-| openpyxl 3.1 (`write_only`) | 155.7 ms ± 3.7 | 42.05 MB | 52.8 KB | 21.74× slower |
+| **zlsx Writer** | **6.7 ms ± 0.3** | **4.44 MB** | 54.9 KB | **1.00×** |
+| xlsxwriter 3.2 (`constant_memory`) | 66.4 ms ± 1.0 | 25.61 MB | 55.2 KB | 9.93× slower |
+| openpyxl 3.1 (`write_only`) | 151.9 ms ± 6.4 | 41.65 MB | 52.8 KB | 22.74× slower |
 
 ```
-  zlsx Writer    ▌              7.2 ms    1.00×
-  xlsxwriter     ▌▌▌▌▌▌▌▌       70.3 ms    9.82× slower
-  openpyxl       ▌▌…▌▌         155.7 ms   21.74× slower
+  zlsx Writer    ▌              6.7 ms    1.00×
+  xlsxwriter     ▌▌▌▌▌▌▌▌       66.4 ms    9.93× slower
+  openpyxl       ▌▌…▌▌         151.9 ms   22.74× slower
 ```
 
 Throughput at that size (rows/sec):
 
 | Impl | Styled rows/sec |
 |---|---|
-| **zlsx Writer** | **~139,000** |
-| xlsxwriter | ~14,240 |
-| openpyxl | ~6,430 |
+| **zlsx Writer** | **~149,000** |
+| xlsxwriter | ~15,070 |
+| openpyxl | ~6,590 |
 
 ### Methodology — allocator choice matters
 
@@ -215,6 +215,6 @@ Source for all four benches (~30 lines each) is in `tests/bench/` if you want to
 
 ## Summary
 
-**On the read side**: zlsx ties or edges calamine-rust on every corpus file — clear wins on SST-heavy workloads (worldbank_catalog: zlsx 3.2 ms vs calamine 3.9 ms, **1.20× faster**). Python libraries trail 7-80×. **Smallest RSS of the four (2.27 MB)** — half of calamine-rust, 7.5× below python-calamine, 19× below openpyxl. Single-file droppable into a Zig build; no third-party runtime deps.
+**On the read side**: zlsx ties or edges calamine-rust on every corpus file — clear wins on SST-heavy workloads (worldbank_catalog: zlsx 3.3 ms vs calamine 3.6 ms, **1.11× faster**). Python libraries trail 6-37×. **Smallest RSS of the four (2.37 MB)** — ~1.3× below calamine-rust, 7× below python-calamine, 18× below openpyxl. Single-file droppable into a Zig build; no third-party runtime deps.
 
-**On the write side**: zlsx Writer is **9.82× faster than xlsxwriter and 21.74× faster than openpyxl** for a 1,001-row styled workbook — at ~6× lower RSS than xlsxwriter and ~10× below openpyxl. Archive size matches xlsxwriter within 0.5 % (zlsx 54.9 KB vs xlsxwriter 55.2 KB). The in-house LZ77 + dynamic-huffman deflate compressor (with lazy matching + word-size SIMD match compare) does what zlib-at-level-6 does, but tuned for the xlsx-XML workload.
+**On the write side**: zlsx Writer is **9.93× faster than xlsxwriter and 22.74× faster than openpyxl** for a 1,001-row styled workbook — at ~6× lower RSS than xlsxwriter and ~9× below openpyxl. Archive size matches xlsxwriter within 0.5 % (zlsx 54.9 KB vs xlsxwriter 55.2 KB). The in-house LZ77 + dynamic-huffman deflate compressor (with lazy matching + word-size SIMD match compare) does what zlib-at-level-6 does, but tuned for the xlsx-XML workload.
