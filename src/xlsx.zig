@@ -1462,6 +1462,22 @@ pub const Rows = struct {
             } else {
                 self.current_row = recoverRowFromFirstCell(self.xml, row_start.after_open) orelse self.yield_count;
             }
+            // Prune array ranges whose bottom-right row has passed —
+            // they can't match any cell in this or later rows.
+            // swapRemove is O(1) per drop and order doesn't matter
+            // for the membership check downstream. Bounds: rows are
+            // monotonic (consumeRow only advances). Without this,
+            // large sheets with many array formulas degrade to
+            // O(total_cells × total_array_formulas_seen) per
+            // Codex's perf review.
+            var i: usize = 0;
+            while (i < self.array_ranges.items.len) {
+                if (self.array_ranges.items[i].br.row < self.current_row) {
+                    _ = self.array_ranges.swapRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
             self.pos = row_start.after_open;
             // Consume cells until </row>.
             try self.consumeRow();
