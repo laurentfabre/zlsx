@@ -139,8 +139,8 @@ Emitted inline when a non-fatal parse error hits. Fatal errors exit non-zero wit
 
 ## CLI flag conventions
 
-- `--sheet NAME` — select a sheet by name (string). Excel-native semantic.
-- `--sheet-index N` — select by 0-based index. Escape hatch for scripting where sheet names aren't known.
+- `--name NAME` — select a sheet by name (string). Excel-native semantic.
+- `--sheet N` — select by 0-based index. Escape hatch for scripting where sheet names aren't known.
 - `--all-sheets` — stream every sheet concatenated.
 - `--sheet-glob 'Data*'` — match sheet names against a simple glob.
 - **Default (no `--sheet*` flag)**: first sheet only. Users who want all sheets pass `--all-sheets` explicitly. This mirrors Excel's "open the first sheet" default and avoids surprising large outputs.
@@ -148,7 +148,7 @@ Emitted inline when a non-fatal parse error hits. Fatal errors exit non-zero wit
 - `--header` — on `rows`, treat the first row (1-based `row:1`) as keys and emit `fields` dict per data row. Consistent with `row:1` / `--start-row` elsewhere; no 0-based row addressing exists in the surface.
 - `--with-styles` — opt-in metadata on `cells` / `rows`. Off by default.
 - `--include-blanks` — emit `t:"blank"` records for empty-but-addressed cells. Off by default.
-- `--skip N` / `--take N` — stream-native pagination (symmetric, `jq`-native phrasing; replaces the DB-flavored `--offset` / `--limit`). Scoping: `--skip` / `--take` apply **globally over the concatenated output stream**, AFTER sheet selection (`--sheet`, `--sheet-index`, `--sheet-glob`, `--all-sheets`) and any `--range` / `--start-row` / `--end-row` filters. Under `--all-sheets`, `--skip 1000 --take 500` takes records 1001–1500 across the full cross-sheet stream, not per sheet. This matches `head`/`tail`/`jq` stream semantics; callers wanting per-sheet windows run one process per sheet.
+- `--skip N` / `--take N` — stream-native pagination (symmetric, `jq`-native phrasing; replaces the DB-flavored `--offset` / `--limit`). Scoping: `--skip` / `--take` apply **globally over the concatenated output stream**, AFTER sheet selection (`--sheet`, `--name`, `--sheet-glob`, `--all-sheets`) and any `--range` / `--start-row` / `--end-row` filters. Under `--all-sheets`, `--skip 1000 --take 500` takes records 1001–1500 across the full cross-sheet stream, not per sheet. This matches `head`/`tail`/`jq` stream semantics; callers wanting per-sheet windows run one process per sheet.
 - `--start-row R` / `--end-row R` — alternative row-bounded pagination on `rows` / `cells` when callers think in 1-based sheet rows. Applied **per sheet** (each sheet's own rows), unlike `--skip` / `--take` which are global.
 - `--output {ndjson|compact-ndjson|pretty-json}` — output mode.
   - `ndjson` (default) — invariant-envelope NDJSON stream.
@@ -250,7 +250,7 @@ Revised after Codex review — ship the streaming primitives and envelope BEFORE
 3. **iter56 — `cells` sub-command** ✅: `zlsx cells <file>` emits per-cell NDJSON with `{kind,sheet,sheet_idx,ref,row,col,t,v}` and sparse empties. Date / formula / error cells are still basic types (`str`/`int`/`num`/`bool`) pending reader surface extensions.
 4. **iter57 — `meta` + `list-sheets` as NDJSON** ✅: workbook + per-sheet records; legacy `--list-sheets` flag preserved for plain-text callers.
 5. **iter58 — `comments` / `validations` / `hyperlinks` / `sst` / `styles`** ✅ (5 wrappers in one slice).
-6. **iter59 — pagination + filtering flags** ✅ (shipped as 59a / 59b-1..4 / 59c): `--skip`, `--take`, `--start-row`, `--end-row`, `--range`, `--header`, `--all-sheets`, `--sheet-glob` (UTF-8 `?`), `--include-blanks`, `--with-styles`. `--sheet` / `--sheet-index` covered by iter55+.
+6. **iter59 — pagination + filtering flags** ✅ (shipped as 59a / 59b-1..4 / 59c): `--skip`, `--take`, `--start-row`, `--end-row`, `--range`, `--header`, `--all-sheets`, `--sheet-glob` (UTF-8 `?`), `--include-blanks`, `--with-styles`. `--sheet` (numeric) / `--name` (by name) covered by iter55+.
 7. **iter60 — operational guarantees + error records + compact schema** ✅ (60a signals/exit codes + 60b `--output` modes + 60c inline errors).
 
 Every iter shipped independently, each user-observable. See `git log --oneline -- src/cli.zig src/xlsx.zig` for the commit chain.
@@ -333,7 +333,7 @@ Same answer as v1, still correct:
 | `validations.kind` collides with the envelope `kind` discriminator | Renamed the validation subtype field to `rule_type`. |
 | Production-gap silence (UTF-8, ZIP bombs, signals, SIGPIPE, exit codes, shared formulas) | New "Operational guarantees" section. |
 | `--offset` / `--limit` is DB language in a stream context | Renamed `--skip` / `--max-records` *(v3 intermediate — renamed again to `--take` in v4 for symmetry, see round-3 table)*; added `--start-row` / `--end-row`. |
-| `--sheet` accepting both name + index is ambiguous | Split: `--sheet NAME` + `--sheet-index N`. |
+| `--sheet` accepting both name + index is ambiguous | Split: `--name NAME` (by name) + `--sheet N` (0-based index). |
 | Defaulting to `--all-sheets` surprises Excel users with huge output | Default is first sheet; `--all-sheets` is explicit opt-in. |
 
 ### Round 3: v3 → v4
@@ -341,7 +341,7 @@ Same answer as v1, still correct:
 | v3 problem | v4 resolution |
 |---|---|
 | "Open design question #2" still proposed `--all-sheets` as default — directly contradicted the v3 CLI section | Resolved in-place (first sheet only); question now records the decision + why. Short `zlsx <file>` alias kept pointing at `rows <file>` (the long-standing default) rather than re-pointing to `cells`. |
-| Rollout iter59 still listed `--offset` / `--limit` | Replaced with `--skip` / `--take` / `--start-row` / `--end-row` / `--sheet` / `--sheet-index`. |
+| Rollout iter59 still listed `--offset` / `--limit` | Replaced with `--skip` / `--take` / `--start-row` / `--end-row` / `--sheet` (numeric) / `--name` (by name). |
 | Rollout iter60 still mentioned `--no-provenance` | Replaced with `--output compact-ndjson` (sheet-prologue) and `--output pretty-json` (meta single-object). |
 | Op-guarantees "invalid XML chars passed through as UTF-8" was unsafe — could emit raw control bytes and break downstream JSON parsers | Tightened: U+0000..U+001F and U+007F are always JSON-escaped (`\u00XX`); U+FFFE/U+FFFF replaced with U+FFFD. No pass-through mode. |
 | ZIP-bomb thresholds inconsistent: oversized part was fatal but per-entry ratio was "skip" — weakens the guarantee | All three thresholds (part-size, per-entry ratio, total decompressed size) are now uniformly fatal with exit 4. |
