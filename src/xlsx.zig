@@ -1462,22 +1462,15 @@ pub const Rows = struct {
             } else {
                 self.current_row = recoverRowFromFirstCell(self.xml, row_start.after_open) orelse self.yield_count;
             }
-            // Prune array ranges whose bottom-right row has passed —
-            // they can't match any cell in this or later rows.
-            // swapRemove is O(1) per drop and order doesn't matter
-            // for the membership check downstream. Bounds: rows are
-            // monotonic (consumeRow only advances). Without this,
-            // large sheets with many array formulas degrade to
-            // O(total_cells × total_array_formulas_seen) per
-            // Codex's perf review.
-            var i: usize = 0;
-            while (i < self.array_ranges.items.len) {
-                if (self.array_ranges.items[i].br.row < self.current_row) {
-                    _ = self.array_ranges.swapRemove(i);
-                } else {
-                    i += 1;
-                }
-            }
+            // Note: array_ranges is NOT pruned here, even though
+            // rows are usually monotonic. The earlier "swapRemove
+            // ranges with br.row < current_row" optimization had a
+            // correctness gap on out-of-order rows: the guard fires
+            // AFTER the bad prune already happened. Real workbooks
+            // rarely have more than a handful of array formulas, so
+            // the linear-scan-per-cell is dominated by parsing cost.
+            // If a future workload measurably suffers, build a
+            // sorted-input precondition by iterating once first.
             self.pos = row_start.after_open;
             // Consume cells until </row>.
             try self.consumeRow();
@@ -5791,6 +5784,52 @@ test "array-formula spread: base + slaves resolve via formula_refs" {
         try std.testing.expectEqualDeep(CellRef{ .col = 2, .row = 2 }, fr[2].?);
         try std.testing.expectEqual(@as(i64, 30), cells[2].integer);
     }
+}
+
+test "array-formula spread: out-of-order rows still resolve slaves" {
+    // No pruning of array_ranges per row — see comment in
+    // `Rows.next`. This test enforces that contract: row 10
+    // registers C10:C11 array, row 12 advances current_row past
+    // the range's br.row, row 11 (out of order) must still find
+    // C10:C11 alive in array_ranges and resolve C11's formula_ref
+    // to C10.
+    const xml =
+        "<sheetData>" ++
+        "<row r=\"10\">" ++
+        "<c r=\"C10\"><f t=\"array\" ref=\"C10:C11\">A10:A11*B10:B11</f><v>5</v></c>" ++
+        "</row>" ++
+        "<row r=\"12\">" ++
+        "<c r=\"A12\"><v>1</v></c>" ++
+        "</row>" ++
+        "<row r=\"11\">" ++
+        "<c r=\"C11\"><v>10</v></c>" ++
+        "</row>" ++
+        "</sheetData>";
+
+    var rows: Rows = .{
+        .xml = xml,
+        .pos = 0,
+        .shared_strings = &.{},
+        .allocator = std.testing.allocator,
+        .row_cells = .{},
+        .row_styles = .{},
+        .row_date_types = .{},
+        .row_error_strings = .{},
+        .row_formula_strings = .{},
+        .row_formula_refs = .{},
+        .shared_si_to_base_ref = .{},
+        .array_ranges = .{},
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer rows.deinit();
+
+    _ = (try rows.next()) orelse return error.UnexpectedEndOfRows; // row 10 base
+    _ = (try rows.next()) orelse return error.UnexpectedEndOfRows; // row 12 sibling
+    _ = (try rows.next()) orelse return error.UnexpectedEndOfRows; // row 11 slave (out of order)
+
+    const fr = rows.formulaRefs();
+    try std.testing.expect(fr.len > 2);
+    try std.testing.expectEqualDeep(CellRef{ .col = 2, .row = 10 }, fr[2].?);
 }
 
 test "array-formula spread: own <f> on a cell inside the range wins" {
