@@ -1493,6 +1493,96 @@ export fn zlsx_sheet_writer_write_rich_row(
     return 0;
 }
 
+/// Append a row that mixes plain value cells with formula cells.
+/// For each column: if `formula_lens[i] > 0`, that column is a
+/// formula cell — `formula_ptrs[i][0..formula_lens[i]]` is the
+/// formula text and `cells[i]` is the cached `<v>` value Excel
+/// shows until recalc. `formula_lens[i] == 0` means a regular
+/// value cell (formula_ptrs[i] is ignored). Pass NULL for both
+/// formula arrays if no column carries a formula — that's
+/// equivalent to `zlsx_sheet_writer_write_row`.
+///
+/// C-ABI surface for `SheetWriter.writeRowWithFormulas`. Returns
+/// 0 on success, -1 on failure (writes the error name into
+/// `err_buf`). `FormulaCountMismatch` is the typical error from
+/// the underlying writer when array lengths disagree.
+export fn zlsx_sheet_writer_write_row_with_formulas(
+    sw: *SheetWriter,
+    cells_ptr: ?[*]const CCell,
+    // Inner element is optional so a per-element NULL from the C side
+    // surfaces as InvalidInput rather than slicing from a null pointer.
+    formula_ptrs: ?[*]const ?[*]const u8,
+    formula_lens: ?[*]const usize,
+    cells_len: usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+
+    // Cells: same scratch / heap pattern as `zlsx_sheet_writer_write_row`.
+    var scratch_cells: [128]xlsx.Cell = undefined;
+    var heap_cells: ?[]xlsx.Cell = null;
+    defer if (heap_cells) |h| gpa.free(h);
+    var cells_slice: []xlsx.Cell = &.{};
+
+    // Formulas: parallel `?[]const u8` slice. We size it to cells_len
+    // even when no column carries a formula so writeRowWithFormulas
+    // sees a length-matched array (its first check is len equality).
+    var scratch_formulas: [128]?[]const u8 = undefined;
+    var heap_formulas: ?[]?[]const u8 = null;
+    defer if (heap_formulas) |h| gpa.free(h);
+    var formulas_slice: []?[]const u8 = &.{};
+
+    if (cells_len > 0) {
+        if (cells_ptr == null) {
+            writeError(err_buf, err_buf_len, "InvalidInput");
+            return -1;
+        }
+        if (cells_len <= scratch_cells.len) {
+            cells_slice = scratch_cells[0..cells_len];
+            formulas_slice = scratch_formulas[0..cells_len];
+        } else {
+            heap_cells = gpa.alloc(xlsx.Cell, cells_len) catch {
+                writeError(err_buf, err_buf_len, "OutOfMemory");
+                return -1;
+            };
+            cells_slice = heap_cells.?;
+            heap_formulas = gpa.alloc(?[]const u8, cells_len) catch {
+                writeError(err_buf, err_buf_len, "OutOfMemory");
+                return -1;
+            };
+            formulas_slice = heap_formulas.?;
+        }
+        const cp = cells_ptr.?;
+        for (0..cells_len) |i| {
+            cells_slice[i] = fromCCell(cp[i]) catch |e| {
+                writeError(err_buf, err_buf_len, @errorName(e));
+                return -1;
+            };
+            const flen: usize = if (formula_lens) |lens| lens[i] else 0;
+            if (flen > 0) {
+                if (formula_ptrs == null) {
+                    writeError(err_buf, err_buf_len, "InvalidInput");
+                    return -1;
+                }
+                const fp = formula_ptrs.?[i] orelse {
+                    writeError(err_buf, err_buf_len, "InvalidInput");
+                    return -1;
+                };
+                formulas_slice[i] = fp[0..flen];
+            } else {
+                formulas_slice[i] = null;
+            }
+        }
+    }
+
+    sw_state.inner.writeRowWithFormulas(cells_slice, formulas_slice) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
 /// Serialise the workbook and write it to `path`. Returns 0 on success,
 /// -1 on failure. The writer remains usable after save() — the caller
 /// may add more rows and save again to a different path.
@@ -2744,6 +2834,94 @@ fn fuzzSeedCabi() u64 {
     } else |_| {
         return @bitCast(std.time.milliTimestamp());
     }
+}
+
+test "writer C ABI: write_row_with_formulas round-trips through reader" {
+    const tmp_path = "/tmp/zlsx_c_abi_write_formulas.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var err_buf: [128]u8 = undefined;
+    const w = zlsx_writer_create(&err_buf, err_buf.len);
+    try std.testing.expect(w != null);
+    defer zlsx_writer_close(w);
+
+    const sheet_name = "S1";
+    const sw = zlsx_writer_add_sheet(w.?, sheet_name.ptr, sheet_name.len, &err_buf, err_buf.len);
+    try std.testing.expect(sw != null);
+
+    // Row 1: A1=2, B1=3, C1=A1+B1 (cached as 5).
+    const row = [_]CCell{
+        .{ .tag = @intFromEnum(CellTag.integer), .str_len = 0, .str_ptr = @ptrCast(""), .i = 2, .f = 0, .b = 0, ._pad = [_]u8{0} ** 7 },
+        .{ .tag = @intFromEnum(CellTag.integer), .str_len = 0, .str_ptr = @ptrCast(""), .i = 3, .f = 0, .b = 0, ._pad = [_]u8{0} ** 7 },
+        .{ .tag = @intFromEnum(CellTag.integer), .str_len = 0, .str_ptr = @ptrCast(""), .i = 5, .f = 0, .b = 0, ._pad = [_]u8{0} ** 7 },
+    };
+    const formula_c1 = "A1+B1";
+    const formula_ptrs = [_][*]const u8{ @ptrCast(""), @ptrCast(""), formula_c1.ptr };
+    const formula_lens = [_]usize{ 0, 0, formula_c1.len };
+
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        zlsx_sheet_writer_write_row_with_formulas(
+            sw.?,
+            &row,
+            &formula_ptrs,
+            &formula_lens,
+            row.len,
+            &err_buf,
+            err_buf.len,
+        ),
+    );
+    try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w.?, tmp_path, tmp_path.len, &err_buf, err_buf.len));
+
+    // Read back through the Zig reader, confirm formula text + cached value.
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    const cells = (try rows.next()) orelse return error.UnexpectedEndOfRows;
+    try std.testing.expectEqual(@as(usize, 3), cells.len);
+    try std.testing.expectEqual(@as(i64, 2), cells[0].integer);
+    try std.testing.expectEqual(@as(i64, 3), cells[1].integer);
+    try std.testing.expectEqual(@as(i64, 5), cells[2].integer); // cached value
+    const fstrings = rows.formulaStrings();
+    try std.testing.expectEqual(@as(usize, 3), fstrings.len);
+    try std.testing.expect(fstrings[0] == null);
+    try std.testing.expect(fstrings[1] == null);
+    try std.testing.expectEqualStrings("A1+B1", fstrings[2].?);
+
+    // Non-zero formula_lens entry with NULL formula_ptrs (whole table)
+    // is caller bug — surface as InvalidInput rather than dereferencing
+    // null.
+    @memset(&err_buf, 0);
+    const lens_with_one = [_]usize{ 0, 0, 5 };
+    const rc = zlsx_sheet_writer_write_row_with_formulas(
+        sw.?,
+        &row,
+        null, // formula_ptrs intentionally NULL
+        &lens_with_one,
+        row.len,
+        &err_buf,
+        err_buf.len,
+    );
+    try std.testing.expectEqual(@as(i32, -1), rc);
+    try std.testing.expect(std.mem.indexOf(u8, &err_buf, "InvalidInput") != null);
+
+    // Per-element NULL formula_ptrs[i] with formula_lens[i] > 0 is the
+    // narrower caller bug — same InvalidInput contract, no slice from
+    // a null pointer.
+    @memset(&err_buf, 0);
+    const elem_null_ptrs = [_]?[*]const u8{ null, null, null };
+    const rc2 = zlsx_sheet_writer_write_row_with_formulas(
+        sw.?,
+        &row,
+        &elem_null_ptrs,
+        &lens_with_one,
+        row.len,
+        &err_buf,
+        err_buf.len,
+    );
+    try std.testing.expectEqual(@as(i32, -1), rc2);
+    try std.testing.expect(std.mem.indexOf(u8, &err_buf, "InvalidInput") != null);
 }
 
 test "fuzz fromCCell: random tags never panic" {

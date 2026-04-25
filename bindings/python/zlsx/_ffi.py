@@ -208,6 +208,22 @@ if _HAS_WRITE_RICH_ROW:
     ]
     lib.zlsx_sheet_writer_write_rich_row.restype = ctypes.c_int32
 
+# Formula authoring (libzlsx 0.2.7+). Probed independently — older
+# dylibs that ship the rest of the writer surface but not this symbol
+# fall back through `_HAS_WRITE_ROW_WITH_FORMULAS = False`.
+_HAS_WRITE_ROW_WITH_FORMULAS = hasattr(lib, "zlsx_sheet_writer_write_row_with_formulas")
+if _HAS_WRITE_ROW_WITH_FORMULAS:
+    lib.zlsx_sheet_writer_write_row_with_formulas.argtypes = [
+        sheet_writer_handle,
+        cell_ptr,                                              # cells_ptr
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),        # formula_ptrs
+        ctypes.POINTER(ctypes.c_size_t),                       # formula_lens
+        ctypes.c_size_t,                                       # cells_len
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_write_row_with_formulas.restype = ctypes.c_int32
+
 lib.zlsx_writer_save.argtypes = [
     writer_handle,
     ctypes.c_char_p,

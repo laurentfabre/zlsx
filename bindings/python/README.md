@@ -151,6 +151,7 @@ with zlsx.write("out.xlsx") as w:
 - Per-sheet layout: column widths, freeze panes, auto-filter
 - Merged cells, hyperlinks, comments
 - Rich-text runs on write (`write_rich_row`)
+- Formula cells on write (`write_row_with_formulas`) — emits `<f>` + cached `<v>`; Excel recalculates on open
 - Data validation (list / numeric / custom) and conditional formatting (cellIs / expression / colorScale / dataBar)
 - Refcounted handles — close the book while rows are still being consumed, the C ABI keeps the state alive until the last reference drops
 
@@ -158,7 +159,6 @@ with zlsx.write("out.xlsx") as w:
 
 - `.xls` / `.xlsb` / `.ods` — never
 - Formula evaluation — never (the reader returns the cached `<v>` value Excel stored; zlsx never runs a formula engine)
-- Formula cells on write — Python binding doesn't expose `write_row_with_formulas` yet (the Zig writer ships it; binding is queued)
 - Load → modify → save round-trip — Phase 3c queued
 - Pictures / charts / pivots — out of scope
 

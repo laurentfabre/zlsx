@@ -1351,6 +1351,100 @@ class SheetWriter:
         # backing str buffers while the C side is still reading them.
         del keepers
 
+    def write_row_with_formulas(self, values, formulas) -> None:
+        """Append a row mixing plain value cells with formula cells.
+
+        ``values`` is the same iterable accepted by :meth:`write_row` —
+        for formula cells it carries the cached ``<v>`` value Excel
+        shows until the sheet is recalculated (pass ``None`` for "no
+        cached value").
+
+        ``formulas`` must be an iterable of the same length: each
+        element is either ``None`` (regular value cell) or a ``str``
+        with the formula text (e.g. ``"A1+B1"``, no leading ``=``).
+
+        Requires libzlsx 0.2.7+. Raises :class:`RuntimeError` against
+        an older dylib that doesn't ship the symbol.
+        """
+        self._require_handle()
+        if not _ffi._HAS_WRITE_ROW_WITH_FORMULAS:
+            raise RuntimeError(
+                "loaded libzlsx does not expose write_row_with_formulas "
+                "(requires 0.2.7+); upgrade libzlsx"
+            )
+
+        values_list = list(values)
+        formulas_list = list(formulas)
+        n = len(values_list)
+        if len(formulas_list) != n:
+            raise ValueError(
+                f"formulas length {len(formulas_list)} must match values length {n}"
+            )
+
+        if n == 0:
+            rc = _ffi.lib.zlsx_sheet_writer_write_row_with_formulas(
+                self._handle, None, None, None, 0, self._err, _ERR_BUF_LEN
+            )
+            if rc != 0:
+                raise ZlsxError(
+                    f"zlsx_sheet_writer_write_row_with_formulas (empty): {_decode_err(self._err)}"
+                )
+            return
+
+        cell_array = (_ffi.Cell * n)()
+        formula_ptr_array = (ctypes.POINTER(ctypes.c_ubyte) * n)()
+        formula_len_array = (ctypes.c_size_t * n)()
+        # Hold all str buffers (cells + formulas) alive across the C call.
+        keepers = []
+        for i, v in enumerate(values_list):
+            cell, keeper = _py_value_to_cell(v)
+            cell_array[i] = cell
+            if keeper is not None:
+                keepers.append(keeper)
+
+            f = formulas_list[i]
+            if f is None:
+                formula_ptr_array[i] = ctypes.cast(None, ctypes.POINTER(ctypes.c_ubyte))
+                formula_len_array[i] = 0
+            else:
+                if not isinstance(f, str):
+                    raise TypeError(
+                        f"formulas[{i}] must be None or str, got {type(f).__name__}"
+                    )
+                if f == "":
+                    # Empty string would round-trip to formula_len == 0,
+                    # which the C ABI reads as "no formula on this column"
+                    # — silently dropping the caller's intent. Reject up
+                    # front instead. Pass None for "regular value cell".
+                    raise ValueError(
+                        f"formulas[{i}] is the empty string; pass None for a "
+                        "regular value cell or a non-empty formula like 'A1+B1'"
+                    )
+                fbytes = f.encode("utf-8")
+                # ctypes.c_char_p keeps `fbytes` referenced; cast to ubyte*
+                # for the pointer array's element type.
+                buf = ctypes.create_string_buffer(fbytes, len(fbytes))
+                keepers.append(buf)
+                formula_ptr_array[i] = ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte))
+                formula_len_array[i] = len(fbytes)
+
+        rc = _ffi.lib.zlsx_sheet_writer_write_row_with_formulas(
+            self._handle,
+            ctypes.cast(cell_array, _ffi.cell_ptr),
+            formula_ptr_array,
+            formula_len_array,
+            n,
+            self._err,
+            _ERR_BUF_LEN,
+        )
+        if rc != 0:
+            raise ZlsxError(
+                f"zlsx_sheet_writer_write_row_with_formulas: {_decode_err(self._err)}"
+            )
+
+        # Keep the buffers alive until after the C call returns.
+        del keepers
+
     def write_rich_row(self, values) -> None:
         """Append a row mixing plain cells with rich-text cells.
 
@@ -2072,9 +2166,10 @@ class Writer:
     ``add_merged_cell``, ``add_hyperlink`` (external URLs),
     ``add_comment``, ``add_data_validation_{list,numeric,custom}``,
     ``add_conditional_format_{cell_is,expression,color_scale,data_bar}``,
-    and ``write_rich_row`` for inline rich-text runs. Formula cells
-    on write and load-modify-save round-trip remain out of scope
-    until Phase 3c.
+    ``write_rich_row`` for inline rich-text runs, and
+    ``write_row_with_formulas`` for formula cells with cached values.
+    Load → modify → save round-trip remains out of scope until
+    Phase 3c.
     """
 
     def __init__(self, path: Union[str, Path, None] = None):

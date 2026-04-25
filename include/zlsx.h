@@ -692,6 +692,30 @@ int32_t zlsx_sheet_writer_write_rich_row(
     size_t                        err_buf_len);
 
 /*
+ * Append a row that mixes plain value cells with formula cells. For
+ * each column i in [0, cells_len):
+ *   if formula_lens[i] > 0 → formula cell; formula_ptrs[i] points at
+ *     formula_lens[i] bytes of formula text (e.g. "A1+B1"); cells_ptr[i]
+ *     supplies the cached <v> value Excel shows until recalc (use the
+ *     `empty` tag for "no cached value").
+ *   else → plain value cell; cells_ptr[i] is the regular zlsx_cell_t.
+ *
+ * Both formula_ptrs and formula_lens may be NULL iff no column is a
+ * formula — passing both NULL degenerates to zlsx_sheet_writer_write_row.
+ * Returns 0 on success, -1 on failure (err_buf populated; "InvalidInput"
+ * for caller-bug shapes like a non-zero formula_lens entry with NULL
+ * formula_ptrs).
+ */
+int32_t zlsx_sheet_writer_write_row_with_formulas(
+    zlsx_sheet_writer_t  * sw,
+    const zlsx_cell_t    * cells_ptr,
+    const uint8_t * const* formula_ptrs,
+    const size_t         * formula_lens,
+    size_t                 cells_len,
+    uint8_t              * err_buf,
+    size_t                 err_buf_len);
+
+/*
  * Serialise the in-memory workbook and write it to `path` (the path
  * does not need to be null-terminated; `path_len` bytes are used).
  * Returns 0 on success, -1 on failure. The Writer remains usable —
