@@ -80,6 +80,9 @@ try w.save("out.xlsx");
 - **[docs/xlsx_test_corpus.md](docs/xlsx_test_corpus.md)** — public xlsx test corpus.
 - **[bindings/python/README.md](bindings/python/README.md)** — `py-zlsx` Python package: install, examples, scope, lifetime gotchas.
 - **[include/zlsx.h](include/zlsx.h)** — C ABI header. Embeddable from any FFI-capable language.
+- **[docs/plans/](docs/plans/)** — design plans for queued architectural work:
+  - **[streaming-sst.md](docs/plans/streaming-sst.md)** — lazy SST resolution for million-entry workbooks (Q5 mitigation).
+  - **[load-modify-save.md](docs/plans/load-modify-save.md)** — `Editor` type for append-only round-trip (Phase 3c).
 
 ## Why
 
