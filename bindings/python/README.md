@@ -149,14 +149,17 @@ with zlsx.write("out.xlsx") as w:
 - Write fresh workbooks with multiple sheets, typed cells, SST dedup, XML escaping
 - Cell styles: fonts (bold / italic / size / name / color), horizontal alignment, wrap text, fills (19 patternTypes, fg + bg colors), borders (5 sides × 14 styles + diagonal up/down), number formats
 - Per-sheet layout: column widths, freeze panes, auto-filter
+- Merged cells, hyperlinks, comments
+- Rich-text runs on write (`write_rich_row`)
+- Data validation (list / numeric / custom) and conditional formatting (cellIs / expression / colorScale / dataBar)
 - Refcounted handles — close the book while rows are still being consumed, the C ABI keeps the state alive until the last reference drops
 
 **Out** (by design, or queued)
 
 - `.xls` / `.xlsb` / `.ods` — never
-- Formula evaluation — never (reader returns cached values, writer emits no `<f>`)
+- Formula evaluation — never (reader returns cached values, writer emits no cached results)
 - Load → modify → save round-trip — Phase 3c queued
-- Merged cells on write, rich-text runs on write, pictures / charts / pivots — out of scope
+- Pictures / charts / pivots — out of scope
 
 ## Thread safety
 
