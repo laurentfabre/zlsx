@@ -765,6 +765,46 @@ fn cellToSerial(cell: xlsx.Cell) f64 {
     };
 }
 
+/// iter61-b: emit a formula record's cached-value tail. The wire
+/// shape is `,"cached":<JSON>` for `.integer` / `.number` / `.string`
+/// / `.boolean`, or NOTHING for `.empty` (the `cached` field is
+/// omitted entirely, per the design doc — a formula with no cached
+/// value carries no `cached` key).
+///
+/// Note: this writes the leading comma; callers must NOT have written
+/// one. Mirrors the convention `writeJsonCell` uses on its own.
+fn writeFormulaCached(w: *std.Io.Writer, cell: xlsx.Cell) !void {
+    switch (cell) {
+        .empty => {}, // omit the cached field entirely
+        .integer => |x| try w.print(",\"cached\":{d}", .{x}),
+        .number => |f| {
+            if (std.math.isFinite(f)) {
+                try w.print(",\"cached\":{d}", .{f});
+            } else {
+                // JSON has no NaN/Inf — match writeJsonCell and emit null.
+                try w.writeAll(",\"cached\":null");
+            }
+        },
+        .boolean => |b| try w.writeAll(if (b) ",\"cached\":true" else ",\"cached\":false"),
+        .string => |s| {
+            try w.writeAll(",\"cached\":");
+            try writeJsonString(w, s);
+        },
+    }
+}
+
+/// iter61-b: emit an A1-style ref from a `CellRef`. Uses `colLetter`
+/// to render the column. The cell ref is the slave's base cell (per
+/// `Rows.formulaRefs()`), so by construction `row >= 1` and
+/// `col < 16384`.
+fn writeFormulaRef(w: *std.Io.Writer, ref: xlsx.CellRef) !void {
+    var col_buf: [8]u8 = undefined;
+    const letters = colLetter(&col_buf, @intCast(ref.col));
+    try w.writeAll("\"formula_ref\":\"");
+    try w.print("{s}{d}", .{ letters, ref.row });
+    try w.writeByte('"');
+}
+
 /// Emit just the `[{ref,col,t,v},…]` array. By default sparse —
 /// `.empty` slots are skipped. `row_number` is the 1-based OOXML row
 /// used to build each cell's `ref`.
@@ -783,6 +823,8 @@ fn writeEnvelopeCells(
     col_offset: u32,
     date_types: []const bool,
     error_strings: []const ?[]const u8,
+    formula_strings: []const ?[]const u8,
+    formula_refs: []const ?xlsx.CellRef,
 ) !void {
     try w.writeByte('[');
     var first = true;
@@ -797,21 +839,53 @@ fn writeEnvelopeCells(
         var ref_buf: [16]u8 = undefined;
         const ref = std.fmt.bufPrint(&ref_buf, "{s}{d}", .{ letters, row_number }) catch unreachable;
 
-        // date_types / error_strings may be shorter than cells when the
-        // caller passes an empty slice (e.g. default-opt-out paths);
-        // treat the tail as false / null. Error wins over date — an
-        // error cell is not numeric, so the date side channel is
-        // already false on that slot, but the explicit ordering keeps
-        // the rule local.
-        const err_str: ?[]const u8 = if (i < error_strings.len) error_strings[i] else null;
-        const is_date: bool = err_str == null and i < date_types.len and date_types[i];
+        // date_types / error_strings / formula_strings / formula_refs
+        // may be shorter than `cells` when the caller passes an empty
+        // slice (e.g. default-opt-out paths); treat the tail as false /
+        // null. Tag precedence (most-specific wins): formula > error >
+        // date > primitive. The reader's consumeCell already enforces
+        // mutual exclusion (a formula cell never has the error side
+        // channel set; a numeric formula never has the date flag set),
+        // so this ordering is purely defensive — but keeps the rule
+        // local and readable.
+        const fmla_str: ?[]const u8 = if (i < formula_strings.len) formula_strings[i] else null;
+        const fmla_ref: ?xlsx.CellRef = if (i < formula_refs.len) formula_refs[i] else null;
+        const err_str: ?[]const u8 =
+            if (fmla_str == null and fmla_ref == null and i < error_strings.len) error_strings[i] else null;
+        const is_date: bool =
+            fmla_str == null and fmla_ref == null and err_str == null and
+            i < date_types.len and date_types[i];
 
         try w.writeAll("{\"ref\":");
         try writeJsonString(w, ref);
         switch (c) {
-            .empty => try w.print(",\"col\":{d},\"t\":\"blank\",\"v\":null", .{absolute_col + 1}),
+            .empty => {
+                // iter61-b: a formula cell with NO cached `<v>` is
+                // legal — `<c r="C2"><f>A2+B2</f></c>` (formula-only).
+                // We still surface it as `t:"formula"` rather than
+                // collapsing to `t:"blank"`, matching the design doc:
+                // the wire record carries `formula:<text>` (or
+                // `formula_ref:<A1>`) and omits `cached` entirely.
+                if (fmla_str) |text| {
+                    try w.print(",\"col\":{d},\"t\":\"formula\",\"formula\":", .{absolute_col + 1});
+                    try writeJsonString(w, text);
+                } else if (fmla_ref) |base| {
+                    try w.print(",\"col\":{d},\"t\":\"formula\",", .{absolute_col + 1});
+                    try writeFormulaRef(w, base);
+                } else {
+                    try w.print(",\"col\":{d},\"t\":\"blank\",\"v\":null", .{absolute_col + 1});
+                }
+            },
             else => {
-                if (err_str) |literal| {
+                if (fmla_str) |text| {
+                    try w.print(",\"col\":{d},\"t\":\"formula\",\"formula\":", .{absolute_col + 1});
+                    try writeJsonString(w, text);
+                    try writeFormulaCached(w, c);
+                } else if (fmla_ref) |base| {
+                    try w.print(",\"col\":{d},\"t\":\"formula\",", .{absolute_col + 1});
+                    try writeFormulaRef(w, base);
+                    try writeFormulaCached(w, c);
+                } else if (err_str) |literal| {
                     try w.print(",\"col\":{d},\"t\":\"error\",\"v\":", .{absolute_col + 1});
                     try writeJsonString(w, literal);
                 } else if (is_date) {
@@ -867,6 +941,8 @@ fn writeRowEnvelope(
     compact: bool,
     date_types: []const bool,
     error_strings: []const ?[]const u8,
+    formula_strings: []const ?[]const u8,
+    formula_refs: []const ?xlsx.CellRef,
 ) !void {
     if (compact) {
         try w.print("{{\"kind\":\"row\",\"row\":{d},\"cells\":", .{row_number});
@@ -875,7 +951,18 @@ fn writeRowEnvelope(
         try writeJsonString(w, sheet_name);
         try w.print(",\"sheet_idx\":{d},\"row\":{d},\"cells\":", .{ sheet_idx, row_number });
     }
-    try writeEnvelopeCells(w, cells, row_number, include_blanks, style_ctx, col_offset, date_types, error_strings);
+    try writeEnvelopeCells(
+        w,
+        cells,
+        row_number,
+        include_blanks,
+        style_ctx,
+        col_offset,
+        date_types,
+        error_strings,
+        formula_strings,
+        formula_refs,
+    );
     try w.writeAll("}\n");
 }
 
@@ -938,6 +1025,8 @@ fn writeCell(
     compact: bool,
     date_type: bool,
     error_string: ?[]const u8,
+    formula_string: ?[]const u8,
+    formula_ref: ?xlsx.CellRef,
 ) !void {
     if (compact) {
         try w.writeAll("{\"kind\":\"cell\",\"ref\":");
@@ -950,13 +1039,24 @@ fn writeCell(
         try writeJsonString(w, ref);
         try w.print(",\"row\":{d},\"col\":{d},\"t\":", .{ row, col });
     }
-    switch (cell) {
+    // iter61-b: tag precedence — formula > error > date > primitive.
+    // The reader already enforces mutual exclusion (consumeCell
+    // clears the error slot when a formula is present, and the date
+    // gate skips formula cells), so this ordering is defensive but
+    // keeps the rule local. Formula cells emit `formula` /
+    // `formula_ref` + optional `cached`; non-formula cells fall
+    // through to the existing error / date / primitive paths.
+    if (formula_string) |text| {
+        try w.writeAll("\"formula\",\"formula\":");
+        try writeJsonString(w, text);
+        try writeFormulaCached(w, cell);
+    } else if (formula_ref) |base| {
+        try w.writeAll("\"formula\",");
+        try writeFormulaRef(w, base);
+        try writeFormulaCached(w, cell);
+    } else switch (cell) {
         .empty => try w.writeAll("\"blank\",\"v\":null"),
         else => {
-            // iter61-c: error wins over date — both side channels
-            // can't be set simultaneously (errors are non-numeric so
-            // the date gate already filters them out), but the
-            // explicit ordering keeps the rule readable.
             if (error_string) |literal| {
                 try w.writeAll("\"error\",\"v\":");
                 try writeJsonString(w, literal);
@@ -1667,6 +1767,16 @@ fn runRowsOnSheetCore(
     // `t:"error"` for cells whose source `<c>` was `t="e"`.
     var masked_errors: std.ArrayListUnmanaged(?[]const u8) = .{};
     defer masked_errors.deinit(alloc);
+    // iter61-b: parallel masked formula-string + formula-ref slices.
+    // Same lockstep invariant — wired through `writeRowEnvelope` so
+    // the sliced envelope still surfaces `t:"formula"` records for
+    // cells whose source `<c>` carried `<f>`. The two are mutually
+    // exclusive per cell (a cell either has its own formula text or
+    // is a shared-formula slave referencing one).
+    var masked_formulas: std.ArrayListUnmanaged(?[]const u8) = .{};
+    defer masked_formulas.deinit(alloc);
+    var masked_formula_refs: std.ArrayListUnmanaged(?xlsx.CellRef) = .{};
+    defer masked_formula_refs.deinit(alloc);
 
     while (try rows.next()) |cells| {
         // iter60a: outer-loop stop-poll — mid-record discard contract.
@@ -1705,12 +1815,29 @@ fn runRowsOnSheetCore(
             /// literal string as `v`. Empty when the row has no error
             /// cells.
             error_strings: []const ?[]const u8,
+            /// iter61-b: parallel formula-text slice. Aligned to
+            /// `cells`; a non-null slot means the cell carried its
+            /// own `<f>` body (stand-alone formula, shared-formula
+            /// base, or array-formula base) and should be emitted
+            /// as `t:"formula"` with `formula:<text>` + optional
+            /// `cached:<v>`. Empty when the row has no formula
+            /// bases.
+            formula_strings: []const ?[]const u8,
+            /// iter61-b: parallel shared-formula base-ref slice.
+            /// Aligned to `cells`; a non-null slot means the cell
+            /// is a shared-formula slave (`<f t="shared" si="N"/>`)
+            /// and should be emitted as `t:"formula"` with
+            /// `formula_ref:"<A1>"` + optional `cached:<v>`. Empty
+            /// when the row has no slave cells.
+            formula_refs: []const ?xlsx.CellRef,
             col_offset: u32,
             any_non_empty: bool,
         };
         const raw_styles = rows.styleIndices();
         const raw_dates = rows.dateTypes();
         const raw_errors = rows.errorStrings();
+        const raw_formulas = rows.formulaStrings();
+        const raw_formula_refs = rows.formulaRefs();
         // Unified slice view for --range: span exactly [tl.col..br.col]
         // with padded empties on sparse rows. writeRowEnvelope now
         // takes col_offset and each cell record carries absolute col
@@ -1724,10 +1851,14 @@ fn runRowsOnSheetCore(
             masked_styles.clearRetainingCapacity();
             masked_dates.clearRetainingCapacity();
             masked_errors.clearRetainingCapacity();
+            masked_formulas.clearRetainingCapacity();
+            masked_formula_refs.clearRetainingCapacity();
             try masked.ensureTotalCapacity(alloc, range_width);
             try masked_styles.ensureTotalCapacity(alloc, range_width);
             try masked_dates.ensureTotalCapacity(alloc, range_width);
             try masked_errors.ensureTotalCapacity(alloc, range_width);
+            try masked_formulas.ensureTotalCapacity(alloc, range_width);
+            try masked_formula_refs.ensureTotalCapacity(alloc, range_width);
             var any = false;
             var col: u32 = r.top_left.col;
             while (col <= r.bottom_right.col) : (col += 1) {
@@ -1743,12 +1874,26 @@ fn runRowsOnSheetCore(
                     masked_errors.appendAssumeCapacity(
                         if (src_idx < raw_errors.len) raw_errors[src_idx] else null,
                     );
-                    if (cells[src_idx] != .empty) any = true;
+                    masked_formulas.appendAssumeCapacity(
+                        if (src_idx < raw_formulas.len) raw_formulas[src_idx] else null,
+                    );
+                    masked_formula_refs.appendAssumeCapacity(
+                        if (src_idx < raw_formula_refs.len) raw_formula_refs[src_idx] else null,
+                    );
+                    // iter61-b: a formula cell with cached `.empty`
+                    // (formula-only, no <v>) still warrants emission
+                    // — it's not a structural blank. Keep it counted
+                    // as non-empty so the sliced row isn't dropped.
+                    const has_formula = (src_idx < raw_formulas.len and raw_formulas[src_idx] != null) or
+                        (src_idx < raw_formula_refs.len and raw_formula_refs[src_idx] != null);
+                    if (cells[src_idx] != .empty or has_formula) any = true;
                 } else {
                     masked.appendAssumeCapacity(.empty);
                     masked_styles.appendAssumeCapacity(null);
                     masked_dates.appendAssumeCapacity(false);
                     masked_errors.appendAssumeCapacity(null);
+                    masked_formulas.appendAssumeCapacity(null);
+                    masked_formula_refs.appendAssumeCapacity(null);
                 }
             }
             break :blk .{
@@ -1756,6 +1901,8 @@ fn runRowsOnSheetCore(
                 .style_indices = masked_styles.items,
                 .date_types = masked_dates.items,
                 .error_strings = masked_errors.items,
+                .formula_strings = masked_formulas.items,
+                .formula_refs = masked_formula_refs.items,
                 .col_offset = r.top_left.col,
                 .any_non_empty = any,
             };
@@ -1764,6 +1911,8 @@ fn runRowsOnSheetCore(
             .style_indices = raw_styles,
             .date_types = raw_dates,
             .error_strings = raw_errors,
+            .formula_strings = raw_formulas,
+            .formula_refs = raw_formula_refs,
             .col_offset = 0,
             .any_non_empty = true,
         };
@@ -1804,7 +1953,21 @@ fn runRowsOnSheetCore(
                     .{ .book = book, .style_indices = view.style_indices }
                 else
                     null;
-                try writeRowEnvelope(out, sheet.name, sheet_idx, row_number, view.cells, include_blanks, style_ctx, view.col_offset, compact, view.date_types, view.error_strings);
+                try writeRowEnvelope(
+                    out,
+                    sheet.name,
+                    sheet_idx,
+                    row_number,
+                    view.cells,
+                    include_blanks,
+                    style_ctx,
+                    view.col_offset,
+                    compact,
+                    view.date_types,
+                    view.error_strings,
+                    view.formula_strings,
+                    view.formula_refs,
+                );
             },
             // iter59b-4: flat formats are shape-neutral w.r.t. both
             // --include-blanks (they serialise empties per their own
@@ -1984,11 +2147,19 @@ fn runCellsOnSheetCore(
         const raw_styles = rows.styleIndices();
         const raw_dates = rows.dateTypes();
         const raw_errors = rows.errorStrings();
+        const raw_formulas = rows.formulaStrings();
+        const raw_formula_refs = rows.formulaRefs();
         for (cells, 0..) |c, i| {
+            // iter61-b: a formula cell with cached `.empty` is still
+            // a formula record and must not be skipped — `<c><f>…</f></c>`
+            // (no <v>) lives between empty and primitive. Bypass the
+            // skip-empty rule when either formula side channel is set.
+            const has_formula = (i < raw_formulas.len and raw_formulas[i] != null) or
+                (i < raw_formula_refs.len and raw_formula_refs[i] != null);
             // iter59b-4: --include-blanks flips the empty-skip into
             // emit-as-blank. Without the flag, the old sparse-by-default
             // behaviour holds.
-            if (c == .empty and !include_blanks) continue;
+            if (c == .empty and !include_blanks and !has_formula) continue;
             if (range) |r| {
                 const col: u32 = @intCast(i);
                 if (col < r.top_left.col or col > r.bottom_right.col) continue;
@@ -2019,8 +2190,17 @@ fn runCellsOnSheetCore(
                 try writeCompactSheetPrologue(out, sheet.name, sheet_idx);
                 prologue_emitted_out.* = true;
             }
-            const err_str: ?[]const u8 = if (i < raw_errors.len) raw_errors[i] else null;
-            const is_date: bool = err_str == null and i < raw_dates.len and raw_dates[i];
+            // iter61-b: same precedence ordering as writeCell —
+            // formula > error > date. The raw side channels enforce
+            // mutual exclusion at the reader, so this is defensive
+            // bookkeeping for callers that pass arbitrary slices.
+            const fmla_str: ?[]const u8 = if (i < raw_formulas.len) raw_formulas[i] else null;
+            const fmla_ref: ?xlsx.CellRef = if (i < raw_formula_refs.len) raw_formula_refs[i] else null;
+            const err_str: ?[]const u8 =
+                if (fmla_str == null and fmla_ref == null and i < raw_errors.len) raw_errors[i] else null;
+            const is_date: bool =
+                fmla_str == null and fmla_ref == null and err_str == null and
+                i < raw_dates.len and raw_dates[i];
             try writeCell(
                 out,
                 sheet.name,
@@ -2033,6 +2213,8 @@ fn runCellsOnSheetCore(
                 compact,
                 is_date,
                 err_str,
+                fmla_str,
+                fmla_ref,
             );
             // Per docs/jq-for-excel.md v4.1: "every record is written
             // with an explicit newline + flush on stdout." The flush
@@ -3011,7 +3193,7 @@ test "writeRowEnvelope emits kind + sheet + sheet_idx + row + sparse cells" {
         .{ .number = 3.5 },
         .{ .boolean = true },
     };
-    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null, 0, false, &.{}, &.{});
+    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null, 0, false, &.{}, &.{}, &.{}, &.{});
     const expected =
         "{\"kind\":\"row\",\"sheet\":\"Data\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
         "{\"ref\":\"A1\",\"col\":1,\"t\":\"str\",\"v\":\"name\"}," ++
@@ -3026,7 +3208,7 @@ test "writeRowEnvelope all-empty row emits envelope with empty cells array" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
     const cells = [_]xlsx.Cell{ .empty, .empty, .empty };
-    try writeRowEnvelope(&w, "S", 2, 7, &cells, false, null, 0, false, &.{}, &.{});
+    try writeRowEnvelope(&w, "S", 2, 7, &cells, false, null, 0, false, &.{}, &.{}, &.{}, &.{});
     try std.testing.expectEqualStrings(
         "{\"kind\":\"row\",\"sheet\":\"S\",\"sheet_idx\":2,\"row\":7,\"cells\":[]}\n",
         w.buffered(),
@@ -3037,7 +3219,7 @@ test "writeRowEnvelope escapes sheet name" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
     const cells = [_]xlsx.Cell{.{ .integer = 1 }};
-    try writeRowEnvelope(&w, "She\"et\n", 0, 1, &cells, false, null, 0, false, &.{}, &.{});
+    try writeRowEnvelope(&w, "She\"et\n", 0, 1, &cells, false, null, 0, false, &.{}, &.{}, &.{}, &.{});
     try std.testing.expectEqualStrings(
         "{\"kind\":\"row\",\"sheet\":\"She\\\"et\\n\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
             "{\"ref\":\"A1\",\"col\":1,\"t\":\"int\",\"v\":1}" ++
@@ -3050,7 +3232,7 @@ test "writeRowEnvelope non-finite number becomes null v" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
     const cells = [_]xlsx.Cell{.{ .number = std.math.nan(f64) }};
-    try writeRowEnvelope(&w, "S", 0, 1, &cells, false, null, 0, false, &.{}, &.{});
+    try writeRowEnvelope(&w, "S", 0, 1, &cells, false, null, 0, false, &.{}, &.{}, &.{}, &.{});
     // `t` stays `"num"` for the non-finite case — the type of the
     // cell didn't change, only its JSON-serializable value did.
     // This matches the pre-iter55a behaviour of writeJsonCell.
@@ -3108,7 +3290,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
     // string
     {
         var w = std.Io.Writer.fixed(&scratch);
-        try writeCell(&w, "Data", 0, "A1", 1, 1, .{ .string = "name" }, null, false, false, null);
+        try writeCell(&w, "Data", 0, "A1", 1, 1, .{ .string = "name" }, null, false, false, null, null, null);
         try std.testing.expectEqualStrings(
             "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"A1\",\"row\":1,\"col\":1,\"t\":\"str\",\"v\":\"name\"}\n",
             w.buffered(),
@@ -3117,7 +3299,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
     // integer
     {
         var w = std.Io.Writer.fixed(&scratch);
-        try writeCell(&w, "Data", 0, "B2", 2, 2, .{ .integer = 3 }, null, false, false, null);
+        try writeCell(&w, "Data", 0, "B2", 2, 2, .{ .integer = 3 }, null, false, false, null, null, null);
         try std.testing.expectEqualStrings(
             "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"B2\",\"row\":2,\"col\":2,\"t\":\"int\",\"v\":3}\n",
             w.buffered(),
@@ -3126,7 +3308,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
     // number
     {
         var w = std.Io.Writer.fixed(&scratch);
-        try writeCell(&w, "Data", 0, "C3", 3, 3, .{ .number = 3.5 }, null, false, false, null);
+        try writeCell(&w, "Data", 0, "C3", 3, 3, .{ .number = 3.5 }, null, false, false, null, null, null);
         try std.testing.expectEqualStrings(
             "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"C3\",\"row\":3,\"col\":3,\"t\":\"num\",\"v\":3.5}\n",
             w.buffered(),
@@ -3135,7 +3317,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
     // boolean
     {
         var w = std.Io.Writer.fixed(&scratch);
-        try writeCell(&w, "Data", 0, "D4", 4, 4, .{ .boolean = true }, null, false, false, null);
+        try writeCell(&w, "Data", 0, "D4", 4, 4, .{ .boolean = true }, null, false, false, null, null, null);
         try std.testing.expectEqualStrings(
             "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"D4\",\"row\":4,\"col\":4,\"t\":\"bool\",\"v\":true}\n",
             w.buffered(),
@@ -3146,7 +3328,7 @@ test "writeCell emits kind + sheet + sheet_idx + ref + row + col + t + v" {
 test "writeCell escapes sheet name" {
     var scratch: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try writeCell(&w, "She\"et\n", 2, "A1", 1, 1, .{ .integer = 7 }, null, false, false, null);
+    try writeCell(&w, "She\"et\n", 2, "A1", 1, 1, .{ .integer = 7 }, null, false, false, null, null, null);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"cell\",\"sheet\":\"She\\\"et\\n\",\"sheet_idx\":2,\"ref\":\"A1\",\"row\":1,\"col\":1,\"t\":\"int\",\"v\":7}\n",
         w.buffered(),
@@ -3173,7 +3355,7 @@ test "cells loop skips empty cells from the stream" {
         const letters = colLetter(&col_buf, i);
         var ref_buf: [16]u8 = undefined;
         const ref = std.fmt.bufPrint(&ref_buf, "{s}{d}", .{ letters, row_number }) catch unreachable;
-        try writeCell(&w, "S", 0, ref, row_number, @intCast(i + 1), c, null, false, false, null);
+        try writeCell(&w, "S", 0, ref, row_number, @intCast(i + 1), c, null, false, false, null, null, null);
     }
 
     try std.testing.expectEqualStrings(
@@ -5271,7 +5453,7 @@ test "writeCell emits t:date with ISO v and raw serial" {
     var w = std.Io.Writer.fixed(&scratch);
     // Excel serial 45458 = 2024-06-15 (date-only, so the fractional
     // part is 0 and {d} prints as `45458`).
-    try writeCell(&w, "Data", 0, "B3", 3, 2, .{ .integer = 45458 }, null, false, true, null);
+    try writeCell(&w, "Data", 0, "B3", 3, 2, .{ .integer = 45458 }, null, false, true, null, null, null);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"B3\",\"row\":3,\"col\":2,\"t\":\"date\",\"v\":\"2024-06-15T00:00:00\",\"serial\":45458}\n",
         w.buffered(),
@@ -5286,7 +5468,7 @@ test "writeRowEnvelope emits t:date inside cells array" {
         .{ .integer = 45458 }, // B1, date-styled
     };
     const dates = [_]bool{ false, true };
-    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null, 0, false, &dates, &.{});
+    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null, 0, false, &dates, &.{}, &.{}, &.{});
     try std.testing.expectEqualStrings(
         "{\"kind\":\"row\",\"sheet\":\"Data\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
             "{\"ref\":\"A1\",\"col\":1,\"t\":\"str\",\"v\":\"name\"}," ++
@@ -5417,6 +5599,8 @@ test "writeCell emits t:error with the literal v (iter61-c)" {
         false,
         false,
         "#DIV/0!",
+        null,
+        null,
     );
     try std.testing.expectEqualStrings(
         "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"D2\",\"row\":2,\"col\":4,\"t\":\"error\",\"v\":\"#DIV/0!\"}\n",
@@ -5433,7 +5617,7 @@ test "writeRowEnvelope emits t:error inside cells array (iter61-c)" {
     };
     const dates = [_]bool{ false, false };
     const errors = [_]?[]const u8{ null, "#N/A" };
-    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null, 0, false, &dates, &errors);
+    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null, 0, false, &dates, &errors, &.{}, &.{});
     try std.testing.expectEqualStrings(
         "{\"kind\":\"row\",\"sheet\":\"Data\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
             "{\"ref\":\"A1\",\"col\":1,\"t\":\"str\",\"v\":\"name\"}," ++
@@ -5542,4 +5726,165 @@ test "runRowsCommand envelope emits t:error inside cells array (iter61-c)" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"kind\":\"row\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "{\"ref\":\"A1\",\"col\":1,\"t\":\"int\",\"v\":1}") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "{\"ref\":\"B1\",\"col\":2,\"t\":\"error\",\"v\":\"#DIV/0!\"}") != null);
+}
+
+// ─── iter61-b: t:"formula" cells end-to-end ─────────────────────────
+
+test "writeCell emits t:formula with formula text + cached value (iter61-b)" {
+    var scratch: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    // Stand-alone formula: <c r="C2"><f>A2+B2</f><v>30</v></c>. The
+    // CLI emits the design-doc shape: t:"formula", formula:<text>,
+    // cached:<value>. The Cell slot carries the cached numeric, the
+    // formula side channel carries the expression.
+    try writeCell(
+        &w,
+        "Data",
+        0,
+        "C2",
+        2,
+        3,
+        .{ .integer = 30 },
+        null,
+        false,
+        false,
+        null,
+        "A2+B2",
+        null,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"C2\",\"row\":2,\"col\":3,\"t\":\"formula\",\"formula\":\"A2+B2\",\"cached\":30}\n",
+        w.buffered(),
+    );
+}
+
+test "writeCell emits t:formula with formula_ref + cached value (iter61-b)" {
+    var scratch: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    // Shared-formula slave: <c r="C3"><f t="shared" si="0"/><v>47</v></c>.
+    // The base cell at C2 already exposed `A2+B2`; this slave just
+    // points back at it via formula_ref. The cached integer comes
+    // from the slave's <v>.
+    try writeCell(
+        &w,
+        "Data",
+        0,
+        "C3",
+        3,
+        3,
+        .{ .integer = 47 },
+        null,
+        false,
+        false,
+        null,
+        null,
+        .{ .col = 2, .row = 2 }, // C2
+    );
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"cell\",\"sheet\":\"Data\",\"sheet_idx\":0,\"ref\":\"C3\",\"row\":3,\"col\":3,\"t\":\"formula\",\"formula_ref\":\"C2\",\"cached\":47}\n",
+        w.buffered(),
+    );
+}
+
+test "writeRowEnvelope emits formula records inside cells array (iter61-b)" {
+    var scratch: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    const cells = [_]xlsx.Cell{
+        .{ .integer = 1 }, // A1 — plain int, not a formula
+        .{ .integer = 30 }, // B1 — stand-alone formula, cached 30
+        .{ .integer = 47 }, // C1 — shared-formula slave, cached 47
+    };
+    const dates = [_]bool{ false, false, false };
+    const errors = [_]?[]const u8{ null, null, null };
+    const formulas = [_]?[]const u8{ null, "A2+B2", null };
+    const formula_refs = [_]?xlsx.CellRef{ null, null, .{ .col = 1, .row = 1 } }; // → B1
+    try writeRowEnvelope(&w, "Data", 0, 1, &cells, false, null, 0, false, &dates, &errors, &formulas, &formula_refs);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"row\",\"sheet\":\"Data\",\"sheet_idx\":0,\"row\":1,\"cells\":[" ++
+            "{\"ref\":\"A1\",\"col\":1,\"t\":\"int\",\"v\":1}," ++
+            "{\"ref\":\"B1\",\"col\":2,\"t\":\"formula\",\"formula\":\"A2+B2\",\"cached\":30}," ++
+            "{\"ref\":\"C1\",\"col\":3,\"t\":\"formula\",\"formula_ref\":\"B1\",\"cached\":47}" ++
+            "]}\n",
+        w.buffered(),
+    );
+}
+
+test "runCellsCommand emits t:formula for stand-alone, shared-base, shared-slave (iter61-b)" {
+    // Mirror the iter60c / iter61-c post-injection trick: write a valid
+    // workbook, then replace sheet1.xml with a hand-crafted blob that
+    // exercises all three formula shapes in one row.
+    const tmp_path = "/tmp/zlsx_cli_iter61b_formula.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Data");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    const sheet_path = book.sheets[0].path;
+    // Row 1: A=1, B=2 (data inputs).
+    // Row 2: C2 stand-alone formula (=A2+B2 → 3); D2 shared-base
+    //        formula (=A2*B2 → 2) with si=0 ref="D2:D3"; E2 array
+    //        formula (=A2-B2 → -1) ref="E2:E3" — surfaces top-left
+    //        cell as a formula record.
+    // Row 3: A=10, B=20.
+    //        C3 stand-alone (=A3+B3 → 30); D3 shared-formula slave
+    //        (si=0, no body) → resolves to D2; E3 has no <c> for it
+    //        (we elide because the array-spread for E2 doesn't surface).
+    const injected =
+        "<?xml version=\"1.0\"?>" ++
+        "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+        "<sheetData>" ++
+        "<row r=\"1\">" ++
+        "<c r=\"A1\"><v>1</v></c>" ++
+        "<c r=\"B1\"><v>2</v></c>" ++
+        "</row>" ++
+        "<row r=\"2\">" ++
+        "<c r=\"A2\"><v>1</v></c>" ++
+        "<c r=\"B2\"><v>2</v></c>" ++
+        "<c r=\"C2\"><f>A2+B2</f><v>3</v></c>" ++
+        "<c r=\"D2\"><f t=\"shared\" ref=\"D2:D3\" si=\"0\">A2*B2</f><v>2</v></c>" ++
+        "<c r=\"E2\"><f t=\"array\" ref=\"E2:E3\">A2-B2</f><v>-1</v></c>" ++
+        "</row>" ++
+        "<row r=\"3\">" ++
+        "<c r=\"A3\"><v>10</v></c>" ++
+        "<c r=\"B3\"><v>20</v></c>" ++
+        "<c r=\"C3\"><f>A3+B3</f><v>30</v></c>" ++
+        "<c r=\"D3\"><f t=\"shared\" si=\"0\"/><v>200</v></c>" ++
+        "</row>" ++
+        "</sheetData>" ++
+        "</worksheet>";
+    const dup = try book.allocator.dupe(u8, injected);
+    if (book.sheet_data.getEntry(sheet_path)) |entry| {
+        book.allocator.free(entry.value_ptr.*);
+        entry.value_ptr.* = dup;
+    } else {
+        book.allocator.free(dup);
+        return error.SheetDataMissing;
+    }
+
+    var scratch: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runCellsCommand(&w, &book, book.sheets[0], 0, std.testing.allocator, null, null, null, null, null, false, false);
+
+    const out = w.buffered();
+    // Row 1 — plain integers, no formula records.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"A1\",\"row\":1,\"col\":1,\"t\":\"int\",\"v\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"B1\",\"row\":1,\"col\":2,\"t\":\"int\",\"v\":2") != null);
+    // Row 2 — three formula records:
+    //   C2: stand-alone — formula text + cached.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"C2\",\"row\":2,\"col\":3,\"t\":\"formula\",\"formula\":\"A2+B2\",\"cached\":3") != null);
+    //   D2: shared-formula base — formula text + cached.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"D2\",\"row\":2,\"col\":4,\"t\":\"formula\",\"formula\":\"A2*B2\",\"cached\":2") != null);
+    //   E2: array-formula base — formula text + cached (top-left only).
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"E2\",\"row\":2,\"col\":5,\"t\":\"formula\",\"formula\":\"A2-B2\",\"cached\":-1") != null);
+    // Row 3 — C3 stand-alone, D3 shared-formula slave (formula_ref=D2):
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"C3\",\"row\":3,\"col\":3,\"t\":\"formula\",\"formula\":\"A3+B3\",\"cached\":30") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"D3\",\"row\":3,\"col\":4,\"t\":\"formula\",\"formula_ref\":\"D2\",\"cached\":200") != null);
 }

@@ -1099,6 +1099,9 @@ pub const Book = struct {
             .row_styles = .{},
             .row_date_types = .{},
             .row_error_strings = .{},
+            .row_formula_strings = .{},
+            .row_formula_refs = .{},
+            .shared_si_to_base_ref = .{},
             .arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
@@ -1195,6 +1198,38 @@ pub const Rows = struct {
     /// don't ask for the side channel still see the literal text. Same
     /// lifetime as `row_cells`.
     row_error_strings: std.ArrayListUnmanaged(?[]const u8),
+    /// Parallel to `row_cells`. Each slot holds the cell's own formula
+    /// text — non-null when the source `<c>` carried an `<f>` body
+    /// (stand-alone formula, shared-formula base, or array-formula
+    /// base). Borrows from the sheet XML buffer when entity-free,
+    /// otherwise lives in the row arena (via `decodeFormulaBody`).
+    /// Exposed via `formulaStrings()` so the CLI can emit
+    /// `t:"formula"` + `formula:<text>` without altering the `Cell`
+    /// union shape; the cell slot continues to carry the cached `<v>`
+    /// value (`.integer` / `.number` / `.string` / `.boolean` /
+    /// `.empty`) so consumers that don't read the side channel still
+    /// see the cached value. Same lifetime as `row_cells`.
+    row_formula_strings: std.ArrayListUnmanaged(?[]const u8),
+    /// Parallel to `row_cells`. Each slot holds the base cell's A1
+    /// reference for shared-formula slaves — cells whose source `<c>`
+    /// carried `<f t="shared" si="N"/>` with no body. The ref is
+    /// looked up from `shared_si_to_base_ref`. Null otherwise. The
+    /// CellRef itself is by-value (no allocation), so this list owns
+    /// the slot directly. Exposed via `formulaRefs()`.
+    row_formula_refs: std.ArrayListUnmanaged(?CellRef),
+    /// Map from a shared-formula `si` index (the integer in
+    /// `<f t="shared" si="N"…>`) to the base cell's A1 ref (the
+    /// top-left of the shared range, parsed from the base cell's
+    /// `ref="X:Y"` attribute). Populated as base cells are consumed;
+    /// queried by slave cells later in the same OR a later row.
+    ///
+    /// Lifetime is the **iterator's lifetime**, NOT the row's: shared
+    /// formulas span multiple rows by design (the whole point of
+    /// `<f t="shared" ref="C2:C10">` is that C3..C10 reference C2's
+    /// formula text), so clearing this on `next()` would lose the
+    /// mapping before slave cells are reached. Cleared / freed only
+    /// in `deinit()`.
+    shared_si_to_base_ref: std.AutoHashMapUnmanaged(u32, CellRef),
     /// Bump arena for per-row decoded strings. Reset (O(1)) at the
     /// start of each `next()` call — previous row's owned strings
     /// become invalid, which matches the documented contract. Compared
@@ -1225,6 +1260,9 @@ pub const Rows = struct {
         self.row_styles.deinit(self.allocator);
         self.row_date_types.deinit(self.allocator);
         self.row_error_strings.deinit(self.allocator);
+        self.row_formula_strings.deinit(self.allocator);
+        self.row_formula_refs.deinit(self.allocator);
+        self.shared_si_to_base_ref.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -1257,6 +1295,33 @@ pub const Rows = struct {
     /// `row_cells`.
     pub fn errorStrings(self: *const Rows) []const ?[]const u8 {
         return self.row_error_strings.items;
+    }
+
+    /// Per-column own-formula text for the current row. Aligned to the
+    /// slice returned by `next()`; `null` means the `<c>` had no `<f>`
+    /// of its own (i.e. it's a non-formula cell OR a shared-formula
+    /// slave — slaves carry a `formula_ref` instead). Non-null slots
+    /// hold the formula expression text verbatim from `<f>…body…</f>`:
+    /// stand-alone, shared-formula bases, and array-formula bases all
+    /// land here. Borrows from the sheet XML buffer when entity-free,
+    /// otherwise lives in the row arena. Valid until the next `next()`
+    /// call.
+    pub fn formulaStrings(self: *const Rows) []const ?[]const u8 {
+        return self.row_formula_strings.items;
+    }
+
+    /// Per-column shared-formula base references for the current row.
+    /// Aligned to the slice returned by `next()`; `null` means the
+    /// cell is not a shared-formula slave. Non-null slots hold the
+    /// base cell's `{col, row}` (i.e. the top-left of the shared
+    /// range, e.g. `C2` for a slave at `C5` whose base declared
+    /// `<f t="shared" ref="C2:C10" si="0">`). The reverse of this
+    /// invariant: `formulaStrings()[i]` is non-null iff the cell
+    /// carries its own `<f>` body, in which case `formulaRefs()[i]`
+    /// MUST be null (a single cell can't be both a base/standalone
+    /// and a slave). Valid until the next `next()` call.
+    pub fn formulaRefs(self: *const Rows) []const ?CellRef {
+        return self.row_formula_refs.items;
     }
 
     /// Parse the current-row cell at `col_idx` as a date-styled
@@ -1305,6 +1370,12 @@ pub const Rows = struct {
         self.row_styles.clearRetainingCapacity();
         self.row_date_types.clearRetainingCapacity();
         self.row_error_strings.clearRetainingCapacity();
+        self.row_formula_strings.clearRetainingCapacity();
+        self.row_formula_refs.clearRetainingCapacity();
+        // NOTE: shared_si_to_base_ref is NOT cleared here — shared
+        // formulas span rows (the base cell at C2 is referenced by
+        // slave cells at C3..C10 in subsequent rows). The map is
+        // freed in deinit() once the iterator goes out of scope.
         _ = self.arena.reset(.retain_capacity);
 
         while (findTagOpen(self.xml, self.pos, "row")) |row_start| {
@@ -1384,14 +1455,17 @@ pub const Rows = struct {
             null;
 
         // Grow row_cells + row_styles + row_date_types + row_error_strings
-        // to cover col_idx; fill gaps with `.empty` / `null` / `false` /
-        // `null`. All four arrays stay in lock-step so callers can index
+        // + row_formula_strings + row_formula_refs to cover col_idx;
+        // fill gaps with `.empty` / `null` / `false` / `null` / `null` /
+        // `null`. All six arrays stay in lock-step so callers can index
         // them the same way.
         while (self.row_cells.items.len <= col_idx) {
             try self.row_cells.append(self.allocator, .empty);
             try self.row_styles.append(self.allocator, null);
             try self.row_date_types.append(self.allocator, false);
             try self.row_error_strings.append(self.allocator, null);
+            try self.row_formula_strings.append(self.allocator, null);
+            try self.row_formula_refs.append(self.allocator, null);
         }
         self.row_styles.items[col_idx] = style_idx;
         // Date-flag defaults to false; the numeric branch below flips
@@ -1399,6 +1473,10 @@ pub const Rows = struct {
         self.row_date_types.items[col_idx] = false;
         // Error-string defaults to null; the t="e" branch below sets it.
         self.row_error_strings.items[col_idx] = null;
+        // Formula side channels default to null; the <f>-parse step
+        // below sets one (and only one) of them.
+        self.row_formula_strings.items[col_idx] = null;
+        self.row_formula_refs.items[col_idx] = null;
 
         if (is_self_closing) {
             // Empty cell; already .empty.
@@ -1409,12 +1487,24 @@ pub const Rows = struct {
 
         // Parse body until </c>.
         // For t="inlineStr" the body is <is><t>text</t></is>; otherwise
-        // it's <v>text</v> (maybe preceded by <f>formula</f>, which we
-        // ignore).
+        // it's <v>text</v>, optionally preceded by an <f> element. The
+        // <f> element is parsed by `parseFormulaElement` (iter61-b) and
+        // populates `row_formula_strings` / `row_formula_refs`; the <v>
+        // body still drives the cached value into the `Cell` slot below.
         const cell_close = "</c>";
         const body_end = std.mem.indexOfPos(u8, self.xml, self.pos, cell_close) orelse return error.MalformedXml;
         const body = self.xml[self.pos..body_end];
         self.pos = body_end + cell_close.len;
+
+        // iter61-b: extract the `<f>` element (if any) BEFORE we touch
+        // the cell value. Sets exactly one of `row_formula_strings` /
+        // `row_formula_refs` per the OOXML rules:
+        //   - `<f>body</f>` (no t=)        → stand-alone formula:    formula_strings[col] = body
+        //   - `<f t="shared" ref="X:Y" si="N">body</f>` → base cell:  formula_strings[col] = body, map[N] = top-left(X:Y)
+        //   - `<f t="shared" si="N"/>`     → slave:                  formula_refs[col] = map.get(N)
+        //   - `<f t="array" ref="X:Y">body</f>` → array base:        formula_strings[col] = body
+        //                                                            (range-spread aspect not surfaced — out of scope)
+        try self.parseFormulaElement(body, col_idx);
 
         const cell: Cell = if (std.mem.eql(u8, cell_type, "inlineStr"))
             .{ .string = try self.decodeInlineString(body) }
@@ -1447,7 +1537,16 @@ pub const Rows = struct {
         // three-condition check in `parseDate` but without materialising
         // the DateTime — cheaper for the common case where callers want
         // just the tag and will re-derive the DateTime on demand.
-        if (style_idx != null) {
+        //
+        // iter61-b: a formula cell ALWAYS wins over date — per the
+        // design doc, `t:"formula"` is the surface tag even when the
+        // cached value is a date-styled numeric. The CLI surfaces
+        // `cached:<n>` (raw serial) on the formula record; consumers
+        // who want the ISO string can decode it themselves.
+        const is_formula =
+            self.row_formula_strings.items[col_idx] != null or
+            self.row_formula_refs.items[col_idx] != null;
+        if (style_idx != null and !is_formula) {
             const num_opt: ?f64 = switch (cell) {
                 .number => |n| n,
                 .integer => |n| @floatFromInt(n),
@@ -1467,6 +1566,91 @@ pub const Rows = struct {
                 }
             }
         }
+        // iter61-b: same mutual-exclusion guard for the error side
+        // channel. The OOXML t="e" branch above already wrote into
+        // row_error_strings; if the same cell ALSO carried an `<f>`
+        // (rare but legal — a formula whose cached value is an
+        // error literal), formula wins. Clear the error slot so
+        // writeCell's tag-precedence rule (formula > error > date >
+        // primitive) lands on `t:"formula"`.
+        if (is_formula) {
+            self.row_error_strings.items[col_idx] = null;
+        }
+    }
+
+    /// Parse the optional `<f>` element inside a cell body and update
+    /// the formula side channels for `col_idx`. Idempotent: if no `<f>`
+    /// is present, leaves both slots null. Tolerates malformed `<f>`
+    /// fragments by treating them as absent — the cell still surfaces
+    /// its cached value via the `<v>` extraction in `consumeCell`.
+    fn parseFormulaElement(self: *Rows, body: []const u8, col_idx: usize) !void {
+        // Locate `<f` followed by either whitespace, `/`, or `>`.
+        // Anything else (e.g. a hypothetical `<finalize>`) means we
+        // matched a longer name and must keep searching.
+        var scan: usize = 0;
+        const f_start = while (std.mem.indexOfPos(u8, body, scan, "<f")) |p| {
+            const after = p + "<f".len;
+            if (after >= body.len) return; // truncated — no real <f>
+            const ch = body[after];
+            if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r' or ch == '/' or ch == '>') {
+                break p;
+            }
+            scan = p + 1;
+        } else return; // no <f> in this cell body — non-formula
+
+        const tag_open = f_start + "<f".len;
+        const tag_gt = std.mem.indexOfScalarPos(u8, body, tag_open, '>') orelse return;
+        const is_self_closing = tag_gt > tag_open and body[tag_gt - 1] == '/';
+        const attrs = body[tag_open..if (is_self_closing) tag_gt - 1 else tag_gt];
+
+        const f_type = getAttr(attrs, "t"); // null / "shared" / "array" / "dataTable"
+        const ref_attr = getAttr(attrs, "ref");
+        const si_attr = getAttr(attrs, "si");
+
+        // Slave: `<f t="shared" si="N"/>` (no body, no ref). Look up
+        // the base ref in the iterator's shared map. If the lookup
+        // misses (malformed input — slave before its base), leave
+        // both side channels null. Defensive: never propagate a
+        // missing-base into a phantom formula record.
+        if (is_self_closing and f_type != null and std.mem.eql(u8, f_type.?, "shared") and ref_attr == null) {
+            const si_str = si_attr orelse return;
+            const si = std.fmt.parseInt(u32, si_str, 10) catch return;
+            if (self.shared_si_to_base_ref.get(si)) |base_ref| {
+                self.row_formula_refs.items[col_idx] = base_ref;
+            }
+            return;
+        }
+
+        // Anything else with a body: extract `<f …>BODY</f>`.
+        if (is_self_closing) return; // self-closing without t="shared" — nothing to surface
+        const f_close = std.mem.indexOfPos(u8, body, tag_gt + 1, "</f>") orelse return;
+        const f_body = body[tag_gt + 1 .. f_close];
+        const formula_text = try self.internOrBorrow(f_body);
+        self.row_formula_strings.items[col_idx] = formula_text;
+
+        // Shared-formula base: register `si → top-left(ref)` so
+        // subsequent slaves can resolve. Tolerate parse failures
+        // (malformed ref / si): the base cell still surfaces its
+        // own formula text; only the cross-cell linkage is lost.
+        if (f_type != null and std.mem.eql(u8, f_type.?, "shared") and ref_attr != null and si_attr != null) {
+            const si = std.fmt.parseInt(u32, si_attr.?, 10) catch return;
+            const range = parseA1Range(ref_attr.?) catch {
+                // ref might be a single cell ("C2") rather than a
+                // range — parseA1Range already handles that path.
+                // Any other failure means malformed XML; skip
+                // registration but keep the formula string above.
+                return;
+            };
+            // Top-left of the shared range is the base cell. For a
+            // single-cell shared formula (degenerate), `top_left ==
+            // bottom_right`, which is still the correct base.
+            try self.shared_si_to_base_ref.put(self.allocator, si, range.top_left);
+        }
+        // Array formulas (`t="array"`): we surface the formula text
+        // on the top-left cell only, which already happened above.
+        // The range-spread aspect (`ref="C2:C10"`) is intentionally
+        // not propagated to the dependent cells — out of scope per
+        // iter61-b. Document deviation in jq-for-excel.md if needed.
     }
 
     fn resolveSharedString(self: *Rows, body: []const u8) !Cell {
@@ -4950,6 +5134,9 @@ fn consumeAllRows(alloc: std.mem.Allocator, shared_strings: []const []const u8, 
         .row_styles = .{},
         .row_date_types = .{},
         .row_error_strings = .{},
+        .row_formula_strings = .{},
+        .row_formula_refs = .{},
+        .shared_si_to_base_ref = .{},
         .arena = std.heap.ArenaAllocator.init(alloc),
     };
     defer rows.deinit();
@@ -5088,6 +5275,9 @@ test "fuzz Rows.next on synthetic cells with out-of-range SST indices" {
             .row_styles = .{},
             .row_date_types = .{},
             .row_error_strings = .{},
+            .row_formula_strings = .{},
+            .row_formula_refs = .{},
+            .shared_si_to_base_ref = .{},
             .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
         };
         defer rows.deinit();
@@ -5120,6 +5310,9 @@ test "Rows.currentRowNumber recovers from cell r attr when <row r> is absent/bad
         .row_styles = .{},
         .row_date_types = .{},
         .row_error_strings = .{},
+        .row_formula_strings = .{},
+        .row_formula_refs = .{},
+        .shared_si_to_base_ref = .{},
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
@@ -5150,6 +5343,9 @@ test "Rows.currentRowNumber recovers cell-r with non-space whitespace after <c" 
         .row_styles = .{},
         .row_date_types = .{},
         .row_error_strings = .{},
+        .row_formula_strings = .{},
+        .row_formula_refs = .{},
+        .shared_si_to_base_ref = .{},
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
@@ -5180,6 +5376,9 @@ test "Rows.currentRowNumber falls through to yield count when row body is empty"
         .row_styles = .{},
         .row_date_types = .{},
         .row_error_strings = .{},
+        .row_formula_strings = .{},
+        .row_formula_refs = .{},
+        .shared_si_to_base_ref = .{},
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
