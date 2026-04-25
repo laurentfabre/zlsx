@@ -169,6 +169,19 @@ int32_t zlsx_hyperlink_at(zlsx_book_t *      book,
                           zlsx_hyperlink_t * out);
 
 /*
+ * Copy the internal `location` (e.g. "Sheet2!A1") of hyperlink
+ * `link_idx` on sheet `sheet_idx` into `out_ptr` / `out_len`. Pointer
+ * lifetime matches the Book. External hyperlinks return 0 with
+ * `*out_len = 0`. Returns -1 on out-of-range indices. Surfaces the
+ * destination that `zlsx_hyperlink_at` discards for internal links.
+ */
+int32_t zlsx_hyperlink_location_at(zlsx_book_t *           book,
+                                   uint32_t                sheet_idx,
+                                   size_t                  link_idx,
+                                   const unsigned char * * out_ptr,
+                                   size_t *                out_len);
+
+/*
  * Cell comment parsed from xl/comments*.xml. Author / text slices
  * point into the Book's internal arena; valid until
  * zlsx_book_close(). Comment bodies that use rich-text runs come

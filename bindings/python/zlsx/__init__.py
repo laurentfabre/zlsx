@@ -294,14 +294,20 @@ class MergeRange:
 
 @dataclass(frozen=True)
 class Hyperlink:
-    """An external-URL hyperlink attached to a cell or cell range.
-    ``url`` is the raw ``Target`` attribute from the sheet's rels
-    file — XML entities like ``&amp;`` are preserved, so the URL
-    round-trips byte-for-byte through save/reopen. Decode at the
-    caller if a display form is needed."""
+    """An external-URL or internal-target hyperlink attached to a
+    cell or cell range. ``url`` is the raw ``Target`` attribute from
+    the sheet's rels file — XML entities like ``&amp;`` are
+    preserved, so the URL round-trips byte-for-byte through
+    save/reopen. ``location`` carries the internal target (e.g.
+    ``"Sheet2!A1"``) for `<hyperlink location="…"/>` entries; it is
+    empty for external links. Exactly one of ``url`` / ``location``
+    is non-empty for any well-formed source. Requires libzlsx
+    0.2.7+ to populate ``location`` — older dylibs leave it
+    empty."""
     top_left: CellRef
     bottom_right: CellRef
     url: str
+    location: str = ""
 
 
 @dataclass(frozen=True)
@@ -490,10 +496,13 @@ class Book:
         return out
 
     def hyperlinks(self, sheet_idx: int) -> list[Hyperlink]:
-        """External-URL hyperlinks declared on sheet ``sheet_idx``,
-        resolved through the sheet's ``_rels/sheet{N}.xml.rels`` file.
-        Returns an empty list for sheets without a ``<hyperlinks>``
-        block."""
+        """Hyperlinks declared on sheet ``sheet_idx``, resolved through
+        the sheet's ``_rels/sheet{N}.xml.rels`` file. Both external
+        (``url``) and internal (``location``) targets are returned;
+        for any well-formed source exactly one is non-empty. Returns
+        an empty list for sheets without a ``<hyperlinks>`` block.
+        Requires libzlsx 0.2.7+ to populate ``location``; older dylibs
+        return ``location=""`` for every entry."""
         if not self._handle:
             raise ZlsxError("book is closed")
         if not _ffi._HAS_READER_META:
@@ -504,15 +513,26 @@ class Book:
         count = _ffi.lib.zlsx_hyperlink_count(self._handle, sheet_idx)
         out: list[Hyperlink] = []
         hl = _ffi.CHyperlink()
+        loc_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        loc_len = ctypes.c_size_t(0)
         for i in range(count):
             rc = _ffi.lib.zlsx_hyperlink_at(self._handle, sheet_idx, i, ctypes.byref(hl))
             if rc != 0:
                 continue
             url = ctypes.string_at(hl.url_ptr, hl.url_len).decode("utf-8", errors="replace")
+            location = ""
+            if _ffi._HAS_HYPERLINK_LOCATION:
+                rc_loc = _ffi.lib.zlsx_hyperlink_location_at(
+                    self._handle, sheet_idx, i,
+                    ctypes.byref(loc_ptr), ctypes.byref(loc_len),
+                )
+                if rc_loc == 0 and loc_len.value > 0:
+                    location = ctypes.string_at(loc_ptr, loc_len.value).decode("utf-8", errors="replace")
             out.append(Hyperlink(
                 top_left=CellRef(col=hl.top_left_col, row=hl.top_left_row),
                 bottom_right=CellRef(col=hl.bottom_right_col, row=hl.bottom_right_row),
                 url=url,
+                location=location,
             ))
         return out
 

@@ -340,6 +340,29 @@ export fn zlsx_hyperlink_at(
     return 0;
 }
 
+/// Copy the `location` (internal target, e.g. `Sheet2!A1`) of
+/// hyperlink `link_idx` on sheet `idx` into `out_ptr` / `out_len`.
+/// Pointer lifetime matches the Book. Returns 0 on success, -1 on
+/// out-of-range indices. External hyperlinks return 0 with
+/// `out_len = 0`. Added to surface the internal-link destination
+/// that `zlsx_hyperlink_at` discards.
+export fn zlsx_hyperlink_location_at(
+    book: *Book,
+    idx: u32,
+    link_idx: usize,
+    out_ptr: *[*]const u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (idx >= state.inner.sheets.len) return -1;
+    const links = state.inner.hyperlinks(state.inner.sheets[idx]);
+    if (link_idx >= links.len) return -1;
+    const loc = links[link_idx].location;
+    out_ptr.* = loc.ptr;
+    out_len.* = loc.len;
+    return 0;
+}
+
 /// C-shape for a single cell comment. Author / text slices point
 /// into the Book's internal arena; valid until `zlsx_book_close`.
 pub const CComment = extern struct {
@@ -2579,6 +2602,7 @@ test "reader C ABI: merged_range + hyperlink getters round-trip" {
         try sheet.addMergedCell("D5:D7");
         try sheet.addHyperlink("C3", "https://example.com/a");
         try sheet.addHyperlink("E5:F5", "mailto:x@example.com");
+        try sheet.addInternalHyperlink("G7", "S1!A1");
         try sheet.writeRow(&.{.{ .string = "x" }});
         try w.save(tmp_path);
     }
@@ -2608,9 +2632,12 @@ test "reader C ABI: merged_range + hyperlink getters round-trip" {
     try std.testing.expectEqual(@as(i32, -1), zlsx_merged_range_at(book.?, 0, 2, &mr));
 
     // Hyperlinks.
-    try std.testing.expectEqual(@as(usize, 2), zlsx_hyperlink_count(book.?, 0));
+    try std.testing.expectEqual(@as(usize, 3), zlsx_hyperlink_count(book.?, 0));
 
     var hl: CHyperlink = undefined;
+    var loc_ptr: [*]const u8 = undefined;
+    var loc_len: usize = 0;
+
     try std.testing.expectEqual(@as(i32, 0), zlsx_hyperlink_at(book.?, 0, 0, &hl));
     try std.testing.expectEqual(@as(u32, 2), hl.top_left_col); // C
     try std.testing.expectEqual(@as(u32, 3), hl.top_left_row);
@@ -2618,13 +2645,24 @@ test "reader C ABI: merged_range + hyperlink getters round-trip" {
     try std.testing.expectEqual(@as(u32, 3), hl.bottom_right_row);
     const url1 = hl.url_ptr[0..hl.url_len];
     try std.testing.expectEqualStrings("https://example.com/a", url1);
+    // External hyperlinks have an empty location.
+    try std.testing.expectEqual(@as(i32, 0), zlsx_hyperlink_location_at(book.?, 0, 0, &loc_ptr, &loc_len));
+    try std.testing.expectEqual(@as(usize, 0), loc_len);
 
     try std.testing.expectEqual(@as(i32, 0), zlsx_hyperlink_at(book.?, 0, 1, &hl));
     const url2 = hl.url_ptr[0..hl.url_len];
     try std.testing.expectEqualStrings("mailto:x@example.com", url2);
 
-    try std.testing.expectEqual(@as(i32, -1), zlsx_hyperlink_at(book.?, 0, 2, &hl));
+    // Internal hyperlink: empty url, location populated.
+    try std.testing.expectEqual(@as(i32, 0), zlsx_hyperlink_at(book.?, 0, 2, &hl));
+    try std.testing.expectEqual(@as(usize, 0), hl.url_len);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_hyperlink_location_at(book.?, 0, 2, &loc_ptr, &loc_len));
+    try std.testing.expectEqualStrings("S1!A1", loc_ptr[0..loc_len]);
+
+    try std.testing.expectEqual(@as(i32, -1), zlsx_hyperlink_at(book.?, 0, 3, &hl));
     try std.testing.expectEqual(@as(i32, -1), zlsx_hyperlink_at(book.?, 99, 0, &hl));
+    try std.testing.expectEqual(@as(i32, -1), zlsx_hyperlink_location_at(book.?, 0, 3, &loc_ptr, &loc_len));
+    try std.testing.expectEqual(@as(i32, -1), zlsx_hyperlink_location_at(book.?, 99, 0, &loc_ptr, &loc_len));
 }
 
 test "writer C ABI: add_merged_cell round-trips + rejects bad ranges" {

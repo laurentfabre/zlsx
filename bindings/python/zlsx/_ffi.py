@@ -563,6 +563,21 @@ if _HAS_READER_META:
     ]
     lib.zlsx_hyperlink_at.restype = ctypes.c_int32
 
+# Internal-hyperlink `location` getter (libzlsx 0.2.7+). Probed
+# independently because callers loading an older dylib that exposes
+# `zlsx_hyperlink_at` but not the location accessor still get the
+# external-URL surface.
+_HAS_HYPERLINK_LOCATION = hasattr(lib, "zlsx_hyperlink_location_at")
+if _HAS_HYPERLINK_LOCATION:
+    lib.zlsx_hyperlink_location_at.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.zlsx_hyperlink_location_at.restype = ctypes.c_int32
+
 
 class CComment(ctypes.Structure):
     _fields_ = [
