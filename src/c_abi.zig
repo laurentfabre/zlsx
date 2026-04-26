@@ -111,7 +111,11 @@ const RowsState = struct {
 
 const MatrixState = struct {
     book: *BookState,
-    inner: xlsx.SheetMatrix,
+    // Owns string bytes duped from the per-row iterator (whose arena
+    // resets on each `next()` call). Cell slices in `flat_cells`
+    // pointing at SST / sheet-XML buffers stay live for the Book's
+    // lifetime, so we only dupe row-arena slices.
+    string_arena: std.heap.ArenaAllocator,
     // Flattened CCell buffer; row r runs cells[offsets[r]..offsets[r+1]].
     // Built once at open, alive until close.
     flat_cells: std.ArrayListUnmanaged(CCell),
@@ -1123,8 +1127,13 @@ export fn zlsx_cell_border(book: *Book, style_idx: u32, out: *CCellBorder) callc
 // the matrix's life either way).
 
 /// Materialise an entire sheet into a heap-resident matrix.
-/// `*out_n_rows` reflects the row count on success. NULL on error
-/// with `err_buf` populated.
+/// Walks the per-row iterator once, building a flat `CCell[]` buffer
+/// + row-offsets. String slices that point at row-arena memory
+/// (the iterator resets it per `next()` call) are duped into the
+/// matrix's own arena; SST + sheet-XML borrows stay live for the
+/// Book's lifetime so we don't over-copy them.
+///
+/// NULL on error with `err_buf` populated.
 export fn zlsx_matrix_open(
     book: *Book,
     sheet_idx: u32,
@@ -1140,46 +1149,69 @@ export fn zlsx_matrix_open(
     errdefer state.unref();
 
     const sheet = state.inner.sheets[sheet_idx];
-    const matrix = state.inner.materialiseSheet(sheet, gpa) catch |e| {
+    var iter = state.inner.rows(sheet, gpa) catch |e| {
         writeError(err_buf, err_buf_len, @errorName(e));
         state.unref();
         return null;
     };
+    errdefer iter.deinit();
 
     const ms = gpa.create(MatrixState) catch {
-        var m_mut = matrix;
-        m_mut.deinit();
+        iter.deinit();
         writeError(err_buf, err_buf_len, "OutOfMemory");
         state.unref();
         return null;
     };
-    ms.* = .{ .book = state, .inner = matrix, .flat_cells = .{}, .offsets = .{} };
+    errdefer gpa.destroy(ms);
+    ms.* = .{
+        .book = state,
+        .string_arena = std.heap.ArenaAllocator.init(gpa),
+        .flat_cells = .{},
+        .offsets = .{},
+    };
+    errdefer ms.string_arena.deinit();
+    errdefer ms.flat_cells.deinit(gpa);
+    errdefer ms.offsets.deinit(gpa);
 
-    // Pre-size: total cell count = sum of row lengths; offsets = n_rows + 1.
-    var total: usize = 0;
-    for (matrix.rows) |r| total += r.len;
-    ms.flat_cells.ensureTotalCapacity(gpa, total) catch {
-        ms.inner.deinit();
-        gpa.destroy(ms);
+    const string_alloc = ms.string_arena.allocator();
+    ms.offsets.append(gpa, 0) catch {
         writeError(err_buf, err_buf_len, "OutOfMemory");
-        state.unref();
-        return null;
-    };
-    ms.offsets.ensureTotalCapacity(gpa, matrix.rows.len + 1) catch {
-        ms.flat_cells.deinit(gpa);
-        ms.inner.deinit();
-        gpa.destroy(ms);
-        writeError(err_buf, err_buf_len, "OutOfMemory");
-        state.unref();
         return null;
     };
 
-    ms.offsets.appendAssumeCapacity(0);
-    for (matrix.rows) |row| {
-        for (row) |c| ms.flat_cells.appendAssumeCapacity(toCCell(c));
-        ms.offsets.appendAssumeCapacity(ms.flat_cells.items.len);
+    while (iter.next() catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return null;
+    }) |row| {
+        ms.flat_cells.ensureUnusedCapacity(gpa, row.len) catch {
+            writeError(err_buf, err_buf_len, "OutOfMemory");
+            return null;
+        };
+        for (row) |c| {
+            // Strings may borrow row-arena memory that resets on the
+            // next iter.next(); dupe defensively into matrix-owned
+            // storage. Over-copies SST/sheet-XML borrows but the cost
+            // is bounded and avoids leaking ownership concerns
+            // through the FFI layer.
+            const out_c = switch (c) {
+                .string => |s| blk: {
+                    const owned = string_alloc.dupe(u8, s) catch {
+                        writeError(err_buf, err_buf_len, "OutOfMemory");
+                        return null;
+                    };
+                    break :blk toCCell(.{ .string = owned });
+                },
+                else => toCCell(c),
+            };
+            ms.flat_cells.appendAssumeCapacity(out_c);
+        }
+        ms.offsets.append(gpa, ms.flat_cells.items.len) catch {
+            writeError(err_buf, err_buf_len, "OutOfMemory");
+            return null;
+        };
     }
 
+    iter.deinit();
     return @ptrCast(ms);
 }
 
@@ -1191,7 +1223,7 @@ export fn zlsx_matrix_close(matrix: ?*Matrix) callconv(.c) void {
         const ms: *MatrixState = @ptrCast(@alignCast(m));
         ms.flat_cells.deinit(gpa);
         ms.offsets.deinit(gpa);
-        ms.inner.deinit();
+        ms.string_arena.deinit();
         const book = ms.book;
         gpa.destroy(ms);
         book.unref();
@@ -1212,7 +1244,8 @@ export fn zlsx_matrix_data(
     const ms: *MatrixState = @ptrCast(@alignCast(matrix));
     out_cells.* = ms.flat_cells.items.ptr;
     out_offsets.* = ms.offsets.items.ptr;
-    out_n_rows.* = ms.inner.rows.len;
+    // offsets layout is (n_rows + 1) entries — first 0, last total.
+    out_n_rows.* = ms.offsets.items.len - 1;
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────

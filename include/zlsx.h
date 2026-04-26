@@ -41,6 +41,7 @@ extern "C" {
 /* Opaque handles. Never dereference the struct contents directly. */
 typedef struct zlsx_book_t zlsx_book_t;
 typedef struct zlsx_rows_t zlsx_rows_t;
+typedef struct zlsx_matrix_t zlsx_matrix_t;
 typedef struct zlsx_writer_t zlsx_writer_t;
 typedef struct zlsx_sheet_writer_t zlsx_sheet_writer_t;
 typedef struct zlsx_editor_t zlsx_editor_t;
@@ -463,6 +464,38 @@ int32_t zlsx_rows_next(zlsx_rows_t         * rows,
 int32_t zlsx_rows_style_at(zlsx_rows_t * rows,
                            size_t        col_idx,
                            uint32_t    * out_style_idx);
+
+/*
+ * Bulk-FFI matrix surface (v0.2.8+). One zlsx_matrix_open() drains the
+ * entire sheet into a flat zlsx_cell_t buffer + row-offsets array,
+ * letting FFI consumers iterate the buffer in their own language with
+ * zero further calls back into the C library. Intended for Python /
+ * Node / etc. callers that pay per-call dispatch overhead on the
+ * per-row zlsx_rows_next() loop at MB scale.
+ *
+ * Lifetime: out_cells / out_offsets buffers from zlsx_matrix_data()
+ * stay valid until zlsx_matrix_close(). String slices inside cells
+ * are duped into matrix-owned storage and have the same lifetime.
+ */
+zlsx_matrix_t * zlsx_matrix_open(zlsx_book_t * book,
+                                 uint32_t      sheet_idx,
+                                 uint8_t     * err_buf,
+                                 size_t        err_buf_len);
+
+void zlsx_matrix_close(zlsx_matrix_t * matrix);
+
+/*
+ * Read the matrix's flattened layout. After this call:
+ *   *out_cells   points to the packed zlsx_cell_t buffer
+ *   *out_offsets points to row-start offsets (length *out_n_rows + 1):
+ *                row r runs cells[offsets[r] .. offsets[r+1]]
+ *   *out_n_rows  is the row count
+ * All three buffers stay valid until zlsx_matrix_close().
+ */
+void zlsx_matrix_data(zlsx_matrix_t      * matrix,
+                      const zlsx_cell_t ** out_cells,
+                      const size_t      ** out_offsets,
+                      size_t             * out_n_rows);
 
 /*
  * Decoded calendar date/time from an Excel-serial cell. Fields:
