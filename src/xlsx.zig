@@ -3972,16 +3972,52 @@ fn materialiseSstEntry(book: *Book, idx: usize) ![]const u8 {
 /// Read an existing xlsx, mutate, save. Phase 3c append-only v1 per
 /// docs/plans/load-modify-save.md.
 ///
-/// **iter-lms-1**: scaffolding + byte-identical passthrough only —
-/// `Editor.save(out)` produces a file with identical SHA256 to the
-/// source. Future iters add the raw-ZIP scanner (iter-lms-1b) and
-/// `appendRows` (iter-lms-2/3).
+/// Walks the source archive at `open` time to capture per-entry byte
+/// spans (LFH + payload + central-directory record + EOCD comment).
+/// `save` re-emits using those spans so unmodified entries round-trip
+/// byte-identically; future iters (iter-lms-2+) replace specific
+/// entries with mutated copies.
 ///
-/// Lifetime: the source buffer is held resident; `deinit` frees it.
-/// Single-threaded per Editor instance, matching the rest of zlsx.
+/// Lifetime: the source buffer + entry table are held resident;
+/// `deinit` frees both. Single-threaded per Editor instance, matching
+/// the rest of zlsx.
 pub const Editor = struct {
     allocator: Allocator,
     src_buf: []u8,
+    entries: []const ZipEntry,
+    /// Offset of central directory inside `src_buf` (from EOCD).
+    cd_offset: u32,
+    /// Length of the central directory in bytes.
+    cd_size: u32,
+    /// Offset of EOCD record inside `src_buf`.
+    eocd_offset: u32,
+    /// Verbatim trailing-comment bytes from the EOCD record (may be
+    /// empty). Points into `src_buf`.
+    eocd_comment: []const u8,
+
+    /// Per-entry spans captured by the iter-lms-1b raw-ZIP scanner.
+    /// All offsets/lengths are relative to `src_buf`.
+    pub const ZipEntry = struct {
+        /// Filename slice into `src_buf` (the CDFH-side filename;
+        /// must match the LFH's).
+        name: []const u8,
+        /// Local-file-header offset.
+        lfh_offset: u32,
+        /// Length of LFH (header + filename + extras). Payload starts
+        /// at `lfh_offset + lfh_total_len`.
+        lfh_total_len: u32,
+        /// Compressed payload bytes.
+        payload_len: u32,
+        /// CDFH offset (start of the central-directory file header
+        /// for this entry).
+        cdfh_offset: u32,
+        /// CDFH total length (header + filename + extras + comment).
+        cdfh_total_len: u32,
+        /// CompressionMethod value.
+        compression_method: u16,
+        /// General-purpose bit flag from CDFH.
+        gp_flags_raw: u16,
+    };
 
     pub fn open(allocator: Allocator, path: []const u8) !Editor {
         const file = try std.fs.cwd().openFile(path, .{});
@@ -3994,11 +4030,157 @@ pub const Editor = struct {
         errdefer allocator.free(buf);
         const n = try file.readAll(buf);
         if (n != buf.len) return error.UnexpectedEof;
-        return .{ .allocator = allocator, .src_buf = buf };
+
+        // Scan the source ZIP and capture verbatim spans.
+        //
+        // EOCD search must respect the trailing-comment field: a ZIP
+        // comment may legally contain the byte sequence `PK\x05\x06`,
+        // so the right scan is "look for a candidate whose declared
+        // comment_len consumes the rest of the file exactly". Bound
+        // the search to the last 65535 + sizeof(EndRecord) bytes
+        // (the max comment is u16-bounded). Stdlib's
+        // `EndRecord.findBuffer` does the right thing in spirit but
+        // has an error-set bug in Zig 0.15.2.
+        const max_comment: usize = std.math.maxInt(u16);
+        const eocd_size: usize = @sizeOf(std.zip.EndRecord);
+        if (buf.len < eocd_size) return error.BadZip;
+        const search_start: usize = if (buf.len > max_comment + eocd_size)
+            buf.len - max_comment - eocd_size
+        else
+            0;
+        var eocd_pos: usize = buf.len - eocd_size;
+        var eocd: std.zip.EndRecord = undefined;
+        var found = false;
+        while (true) : (eocd_pos -= 1) {
+            if (std.mem.eql(u8, buf[eocd_pos .. eocd_pos + 4], &std.zip.end_record_sig)) {
+                eocd = std.mem.bytesToValue(
+                    std.zip.EndRecord,
+                    buf[eocd_pos..][0..eocd_size],
+                );
+                if (@import("builtin").cpu.arch.endian() != .little)
+                    std.mem.byteSwapAllFields(std.zip.EndRecord, &eocd);
+                if (eocd_pos + eocd_size + eocd.comment_len == buf.len) {
+                    found = true;
+                    break;
+                }
+            }
+            if (eocd_pos == search_start) break;
+        }
+        if (!found) return error.BadZip;
+        if (eocd.need_zip64()) return error.Zip64NotSupported;
+        // Refuse multi-disk archives — `local_file_header_offset` on
+        // each CDFH would be relative to another segment, not
+        // `src_buf`. xlsx files are single-segment in practice.
+        if (eocd.disk_number != 0 or eocd.central_directory_disk_number != 0 or
+            eocd.record_count_disk != eocd.record_count_total)
+            return error.ZipSplitNotSupported;
+        const cd_offset = eocd.central_directory_offset;
+        const cd_size = eocd.central_directory_size;
+        if (@as(u64, cd_offset) + cd_size > buf.len) return error.BadZip;
+        const comment_off = eocd_pos + @sizeOf(std.zip.EndRecord);
+        if (comment_off + eocd.comment_len > buf.len) return error.BadZip;
+        const eocd_comment = buf[comment_off .. comment_off + eocd.comment_len];
+
+        var entries: std.ArrayListUnmanaged(ZipEntry) = .{};
+        errdefer entries.deinit(allocator);
+        try entries.ensureTotalCapacity(allocator, eocd.record_count_total);
+
+        var p: usize = cd_offset;
+        const cd_end: usize = @as(usize, cd_offset) + cd_size;
+        while (p + @sizeOf(std.zip.CentralDirectoryFileHeader) <= cd_end) {
+            // Parse CDFH (little-endian, packed). bytesToValue copies
+            // bytes into a local without requiring the source to be
+            // naturally aligned for the struct.
+            const cdfh_size = @sizeOf(std.zip.CentralDirectoryFileHeader);
+            var cdfh_local = std.mem.bytesToValue(
+                std.zip.CentralDirectoryFileHeader,
+                buf[p..][0..cdfh_size],
+            );
+            if (!std.mem.eql(u8, &cdfh_local.signature, &std.zip.central_file_header_sig))
+                return error.BadZip;
+            if (@import("builtin").cpu.arch.endian() != .little)
+                std.mem.byteSwapAllFields(std.zip.CentralDirectoryFileHeader, &cdfh_local);
+            const cdfh_ptr = &cdfh_local;
+            // Reject ZIP64 / data-descriptor / encrypted entries up
+            // front; v1 supports plain Excel-shaped archives only.
+            if (cdfh_ptr.compressed_size == std.math.maxInt(u32) or
+                cdfh_ptr.uncompressed_size == std.math.maxInt(u32) or
+                cdfh_ptr.local_file_header_offset == std.math.maxInt(u32))
+                return error.Zip64NotSupported;
+            const flags_word: u16 = @bitCast(cdfh_ptr.flags);
+            if ((flags_word & 0x0008) != 0) return error.ZipDataDescriptorNotSupported;
+            if ((flags_word & 0x0001) != 0) return error.ZipEncryptedNotSupported;
+            if (cdfh_ptr.disk_number != 0) return error.ZipSplitNotSupported;
+
+            const filename_len = cdfh_ptr.filename_len;
+            const extra_len = cdfh_ptr.extra_len;
+            const comment_len_cdfh = cdfh_ptr.comment_len;
+            const cdfh_total: usize = @sizeOf(std.zip.CentralDirectoryFileHeader) +
+                filename_len + extra_len + comment_len_cdfh;
+            if (p + cdfh_total > cd_end) return error.BadZip;
+            const name_off = p + @sizeOf(std.zip.CentralDirectoryFileHeader);
+            const name = buf[name_off .. name_off + filename_len];
+
+            const lfh_offset: usize = cdfh_ptr.local_file_header_offset;
+            const lfh_size = @sizeOf(std.zip.LocalFileHeader);
+            if (lfh_offset + lfh_size > buf.len) return error.BadZip;
+            var lfh_local = std.mem.bytesToValue(
+                std.zip.LocalFileHeader,
+                buf[lfh_offset..][0..lfh_size],
+            );
+            if (!std.mem.eql(u8, &lfh_local.signature, &std.zip.local_file_header_sig))
+                return error.BadZip;
+            if (@import("builtin").cpu.arch.endian() != .little)
+                std.mem.byteSwapAllFields(std.zip.LocalFileHeader, &lfh_local);
+            const lfh_ptr = &lfh_local;
+            const lfh_total: usize = @sizeOf(std.zip.LocalFileHeader) +
+                lfh_ptr.filename_len + lfh_ptr.extra_len;
+            // Validate the LFH filename matches the CDFH's. Some
+            // malformed archives have divergent names; trusting the
+            // CDFH alone would associate one entry's name with
+            // another's payload span on save-mutate.
+            if (lfh_ptr.filename_len != filename_len) return error.BadZip;
+            const lfh_name_off = lfh_offset + @sizeOf(std.zip.LocalFileHeader);
+            if (lfh_name_off + filename_len > buf.len) return error.BadZip;
+            if (!std.mem.eql(u8, name, buf[lfh_name_off .. lfh_name_off + filename_len]))
+                return error.BadZip;
+            const payload_len: usize = cdfh_ptr.compressed_size;
+            if (lfh_offset + lfh_total + payload_len > buf.len) return error.BadZip;
+
+            try entries.append(allocator, .{
+                .name = name,
+                .lfh_offset = @intCast(lfh_offset),
+                .lfh_total_len = @intCast(lfh_total),
+                .payload_len = @intCast(payload_len),
+                .cdfh_offset = @intCast(p),
+                .cdfh_total_len = @intCast(cdfh_total),
+                .compression_method = @intFromEnum(cdfh_ptr.compression_method),
+                .gp_flags_raw = flags_word,
+            });
+
+            p += cdfh_total;
+        }
+
+        // EOCD's claimed record count must match what we walked.
+        // A short central directory yields fewer entries than the
+        // EOCD advertises; trusting the EOCD count would skip valid
+        // entries on save-mutate.
+        if (entries.items.len != eocd.record_count_total) return error.BadZip;
+
+        return .{
+            .allocator = allocator,
+            .src_buf = buf,
+            .entries = try entries.toOwnedSlice(allocator),
+            .cd_offset = cd_offset,
+            .cd_size = cd_size,
+            .eocd_offset = @intCast(eocd_pos),
+            .eocd_comment = eocd_comment,
+        };
     }
 
     pub fn deinit(self: *Editor) void {
         self.allocator.free(self.src_buf);
+        self.allocator.free(self.entries);
         self.* = undefined;
     }
 
@@ -4855,6 +5037,48 @@ test "Editor: byte-identical passthrough (iter-lms-1)" {
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
     try std.testing.expectEqualStrings("Data", book.sheets[0].name);
+}
+
+test "Editor: raw-ZIP scanner builds entry table (iter-lms-1b)" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_editor_scan.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Sheet1");
+        try s.writeRow(&.{ .{ .string = "a" }, .{ .integer = 1 } });
+        try w.save(src_path);
+    }
+
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+
+    // Every Excel-shape archive has at least these parts: the rels
+    // dir, content types, workbook.xml, the worksheet, and styles.xml
+    // (zlsx writer always emits a default styles part).
+    try std.testing.expect(ed.entries.len >= 5);
+
+    // Spot-check that we found workbook.xml and the worksheet.
+    var saw_workbook = false;
+    var saw_sheet = false;
+    for (ed.entries) |e| {
+        if (std.mem.eql(u8, e.name, "xl/workbook.xml")) saw_workbook = true;
+        if (std.mem.startsWith(u8, e.name, "xl/worksheets/")) saw_sheet = true;
+
+        // Each entry's recorded LFH + payload must point inside src_buf.
+        try std.testing.expect(e.lfh_offset + e.lfh_total_len + e.payload_len <= ed.src_buf.len);
+        // CDFH spans must point inside the central directory range.
+        try std.testing.expect(e.cdfh_offset >= ed.cd_offset);
+        try std.testing.expect(e.cdfh_offset + e.cdfh_total_len <= ed.cd_offset + ed.cd_size);
+    }
+    try std.testing.expect(saw_workbook);
+    try std.testing.expect(saw_sheet);
+
+    // EOCD-comment is empty for zlsx-written files (the writer
+    // doesn't set a comment).
+    try std.testing.expectEqual(@as(usize, 0), ed.eocd_comment.len);
 }
 
 test "Rows.parseDate: auto-convert date-styled cells through the reader" {
