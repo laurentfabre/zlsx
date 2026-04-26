@@ -4230,19 +4230,29 @@ pub const Editor = struct {
         self.allocator.free(self.sheet_paths);
         var it = self.pending_appends.valueIterator();
         while (it.next()) |buf| {
-            for (buf.rows.items) |row| self.allocator.free(row);
+            for (buf.rows.items) |row| {
+                for (row) |c| switch (c) {
+                    .string => |s| self.allocator.free(s),
+                    else => {},
+                };
+                self.allocator.free(row);
+            }
             buf.rows.deinit(self.allocator);
         }
         self.pending_appends.deinit(self.allocator);
         self.* = undefined;
     }
 
-    /// Append rows to an existing sheet. iter-lms-2 accepts only
-    /// numeric / integer / boolean / empty cells; string cells
-    /// require SST extension which lands in iter-lms-3 and surface
-    /// as `error.SstAppendNotYetSupported` here. Rows go after the
-    /// source's highest used row in that sheet (computed at save
-    /// time, not now).
+    /// Append rows to an existing sheet. Accepts numeric / integer /
+    /// boolean / empty / string cells. String appends extend the
+    /// workbook's SST — iter-lms-3 always allocates a new SST entry
+    /// per appended string (no plain-text equality reuse) so a
+    /// rich-text entry in the source SST that happens to share text
+    /// with an appended string can't silently inherit formatting.
+    /// Rows go after the source's highest used row in that sheet
+    /// (computed at save time, not now). String appends require the
+    /// source workbook to already carry an `xl/sharedStrings.xml`
+    /// entry — `error.NoSstInSource` otherwise.
     pub fn appendRows(self: *Editor, sheet_idx: u32, rows: []const []const Cell) !void {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
         // Empty append is a documented no-op — recording it as a
@@ -4258,7 +4268,7 @@ pub const Editor = struct {
         }
         const writer_mod = @import("writer.zig");
         for (rows) |row| for (row) |c| switch (c) {
-            .empty, .number, .boolean => {},
+            .empty, .number, .boolean, .string => {},
             .integer => |n| {
                 // Match writer.zig's contract: integers must round-
                 // trip exactly through f64 (Excel stores all numerics
@@ -4266,14 +4276,34 @@ pub const Editor = struct {
                 // silently rounding on open.
                 if (!writer_mod.fitsExactlyInF64(n)) return error.IntegerExceedsExcelPrecision;
             },
-            .string => return error.SstAppendNotYetSupported,
         };
         const gop = try self.pending_appends.getOrPut(self.allocator, sheet_idx);
         if (!gop.found_existing) gop.value_ptr.* = .{};
         for (rows) |row| {
             const owned = try self.allocator.alloc(Cell, row.len);
-            @memcpy(owned, row);
             errdefer self.allocator.free(owned);
+            // Track how many string buffers we duped successfully so
+            // a mid-loop OOM doesn't leak the prefix.
+            var duped: usize = 0;
+            errdefer {
+                for (owned[0..duped]) |c| switch (c) {
+                    .string => |s| self.allocator.free(s),
+                    else => {},
+                };
+            }
+            for (row, 0..) |c, i| {
+                switch (c) {
+                    // String cells need their byte contents duped
+                    // because the caller may have passed a temporary
+                    // slice; the editor holds onto pending appends
+                    // until save and beyond.
+                    .string => |s| {
+                        owned[i] = .{ .string = try self.allocator.dupe(u8, s) };
+                    },
+                    else => owned[i] = c,
+                }
+                duped = i + 1;
+            }
             try gop.value_ptr.rows.append(self.allocator, owned);
         }
     }
@@ -4302,9 +4332,50 @@ pub const Editor = struct {
             return;
         }
 
-        // Build substituted entries for each modified sheet. Each
-        // substitution contains the new LFH bytes (header + filename)
-        // and the new compressed payload. Indexed by entry-array idx.
+        // Detect whether any pending append carries a string cell;
+        // if so, the SST entry must be substituted alongside the
+        // sheets so the new t="s" indices resolve.
+        var has_strings = false;
+        var pa_check = self.pending_appends.iterator();
+        outer: while (pa_check.next()) |kv| {
+            for (kv.value_ptr.rows.items) |row| {
+                for (row) |c| if (c == .string) {
+                    has_strings = true;
+                    break :outer;
+                };
+            }
+        }
+
+        // Locate sharedStrings.xml entry + count source SST entries
+        // when string cells are pending. iter-lms-3: workbooks with
+        // no SST entry are refused — creating a new sharedStrings.xml
+        // (with rels + content-types updates) is its own iter.
+        var sst_entry_idx: ?usize = null;
+        var source_sst_count: u32 = 0;
+        var sst_xml_owned: ?[]u8 = null;
+        defer if (sst_xml_owned) |x| self.allocator.free(x);
+        if (has_strings) {
+            sst_entry_idx = findEntryByName(self.entries, "xl/sharedStrings.xml") orelse
+                return error.NoSstInSource;
+            const sst_entry = self.entries[sst_entry_idx.?];
+            const sst_payload = self.src_buf[sst_entry.lfh_offset + sst_entry.lfh_total_len ..][0..sst_entry.payload_len];
+            sst_xml_owned = try decompressZipPayload(
+                self.allocator,
+                sst_payload,
+                sst_entry.compression_method,
+                sst_entry.uncompressed_size,
+            );
+            source_sst_count = countSiInSst(sst_xml_owned.?);
+        }
+
+        var sst_appender: SstAppender = .{
+            .allocator = self.allocator,
+            .next_idx = source_sst_count,
+        };
+        defer sst_appender.deinit();
+        const sst_ptr: ?*SstAppender = if (has_strings) &sst_appender else null;
+
+        // Build substituted entries for each modified sheet.
         const subs = try self.allocator.alloc(?SubstitutedEntry, self.entries.len);
         defer {
             for (subs) |maybe_sub| if (maybe_sub) |s| {
@@ -4328,6 +4399,21 @@ pub const Editor = struct {
                 self.entries[entry_idx],
                 self.src_buf,
                 buf.rows.items,
+                sst_ptr,
+            );
+        }
+
+        // If string cells were appended, substitute sharedStrings.xml
+        // with a new XML that has the appended `<si><t>…</t></si>`
+        // entries.
+        if (has_strings and sst_appender.new_strings.items.len > 0) {
+            const sst_idx = sst_entry_idx.?;
+            subs[sst_idx] = try buildSubstitutedSst(
+                self.allocator,
+                self.entries[sst_idx],
+                sst_xml_owned.?,
+                sst_appender.new_strings.items,
+                source_sst_count,
             );
         }
 
@@ -4435,11 +4521,37 @@ fn findEntryByName(entries: []const Editor.ZipEntry, name: []const u8) ?usize {
 /// `</sheetData>`, injects new `<row>...</row>` blocks, recompresses
 /// (or falls back to store if deflate inflates), then emits canonical
 /// LFH/CDFH bytes.
+/// SST extension state shared across sheet substitutions in a
+/// single `Editor.save` pass. iter-lms-3: every appended string cell
+/// allocates a fresh SST index (no plain-text equality reuse — the
+/// source SST may carry rich-text entries whose plain text shadows
+/// an appended string, and reuse would silently inherit formatting).
+const SstAppender = struct {
+    allocator: Allocator,
+    next_idx: u32,
+    /// Borrowed slices into editor-owned cell strings. Valid for the
+    /// duration of `save()`; new SST XML copies them out when the
+    /// sharedStrings.xml entry is rebuilt.
+    new_strings: std.ArrayListUnmanaged([]const u8) = .{},
+
+    pub fn add(self: *SstAppender, str: []const u8) !u32 {
+        const idx = self.next_idx;
+        try self.new_strings.append(self.allocator, str);
+        self.next_idx += 1;
+        return idx;
+    }
+
+    pub fn deinit(self: *SstAppender) void {
+        self.new_strings.deinit(self.allocator);
+    }
+};
+
 fn buildSubstitutedSheet(
     allocator: Allocator,
     entry: Editor.ZipEntry,
     src_buf: []u8,
     appended_rows: []const []Cell,
+    sst: ?*SstAppender,
 ) !SubstitutedEntry {
     // Decompress source payload.
     const payload = src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
@@ -4465,8 +4577,8 @@ fn buildSubstitutedSheet(
         decompressed,
         appended_rows,
         start_row,
+        sst,
     );
-    defer allocator.free(injected);
 
     // Update `<dimension ref="A1:Z<row>"/>` to extend the row bound
     // when the appended rows pushed past the source's declared
@@ -4476,17 +4588,212 @@ fn buildSubstitutedSheet(
     // save so staleness on those is tolerable.
     const new_max_row: u32 = start_row +
         @as(u32, @intCast(appended_rows.len)) - 1;
-    const new_xml = (try updateDimensionRow(allocator, injected, new_max_row)) orelse
-        try allocator.dupe(u8, injected);
+    const new_xml = blk: {
+        if (try updateDimensionRow(allocator, injected, new_max_row)) |patched| {
+            allocator.free(injected);
+            break :blk patched;
+        } else {
+            break :blk injected;
+        }
+    };
+
+    return try buildSubstitutedEntryFromXml(allocator, entry, new_xml);
+}
+
+/// Count `<si>` openings in a sharedStrings.xml body. Cheap one-pass
+/// scan — used once at save() to know how many indices the source
+/// SST already occupies before assigning indices to appended strings.
+fn countSiInSst(xml: []const u8) u32 {
+    var count: u32 = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, i, "<si")) |pos| {
+        if (pos + "<si".len < xml.len) {
+            const c = xml[pos + "<si".len];
+            if (c == ' ' or c == '/' or c == '>') {
+                count += 1;
+                i = pos + "<si".len + 1;
+                continue;
+            }
+        }
+        i = pos + 1;
+    }
+    return count;
+}
+
+/// Append `<si><t>…</t></si>` blocks (one per new string,
+/// XML-escaped) to a copy of the source SST XML and patch the
+/// `count` / `uniqueCount` attributes on the `<sst>` opening tag.
+/// Handles both `<sst …>…</sst>` and `<sst …/>` forms. Returns the
+/// substituted entry (LFH + new compressed payload + CDFH).
+fn buildSubstitutedSst(
+    allocator: Allocator,
+    entry: Editor.ZipEntry,
+    src_xml: []const u8,
+    new_strings: []const []const u8,
+    source_count: u32,
+) !SubstitutedEntry {
+    // Render new SST entries into a buffer.
+    var entries_buf: std.ArrayListUnmanaged(u8) = .{};
+    defer entries_buf.deinit(allocator);
+    for (new_strings) |s| {
+        try entries_buf.appendSlice(allocator, "<si><t");
+        if (sstNeedsXmlSpacePreserve(s)) {
+            try entries_buf.appendSlice(allocator, " xml:space=\"preserve\"");
+        }
+        try entries_buf.appendSlice(allocator, ">");
+        try appendXmlEscaped(allocator, &entries_buf, s);
+        try entries_buf.appendSlice(allocator, "</t></si>");
+    }
+
+    // Splice into source XML — handle open/close form first, then
+    // self-closing. Per the SpreadsheetML schema, `<extLst>` is the
+    // terminal child of `<sst>`, so injection has to land BEFORE
+    // any `<extLst>` block when present, not just before `</sst>`.
+    var spliced: std.ArrayListUnmanaged(u8) = .{};
+    defer spliced.deinit(allocator);
+    if (std.mem.indexOf(u8, src_xml, "</sst>")) |close_pos| {
+        // Prefer an inject point right before `<extLst>` if the
+        // source declares one; otherwise inject right before
+        // `</sst>`. The substring scan is intentionally narrow —
+        // matches `<extLst>` and `<extLst …>` but not text content.
+        var inject_pos: usize = close_pos;
+        if (std.mem.indexOf(u8, src_xml, "<extLst")) |ext_pos| {
+            if (ext_pos < close_pos) inject_pos = ext_pos;
+        }
+        try spliced.appendSlice(allocator, src_xml[0..inject_pos]);
+        try spliced.appendSlice(allocator, entries_buf.items);
+        try spliced.appendSlice(allocator, src_xml[inject_pos..]);
+    } else if (std.mem.indexOf(u8, src_xml, "<sst")) |sst_open| {
+        const tag_close = std.mem.indexOfScalarPos(u8, src_xml, sst_open, '>') orelse
+            return error.MalformedXml;
+        if (tag_close == 0 or src_xml[tag_close - 1] != '/') return error.MalformedXml;
+        const attrs_end = tag_close - 1;
+        const attrs = src_xml[sst_open + "<sst".len .. attrs_end];
+        try spliced.appendSlice(allocator, src_xml[0..sst_open]);
+        try spliced.appendSlice(allocator, "<sst");
+        try spliced.appendSlice(allocator, attrs);
+        try spliced.append(allocator, '>');
+        try spliced.appendSlice(allocator, entries_buf.items);
+        try spliced.appendSlice(allocator, "</sst>");
+        try spliced.appendSlice(allocator, src_xml[tag_close + 1 ..]);
+    } else {
+        return error.MalformedXml;
+    }
+
+    // Patch count / uniqueCount on the <sst> opening tag. They have
+    // different semantics: `count` tracks total string-cell
+    // references (can exceed unique entries when the workbook
+    // reuses shared strings), `uniqueCount` tracks `<si>` entries.
+    // Each appended string cell adds 1 reference AND 1 unique entry,
+    // so both bump by `new_strings.len` — but starting from the
+    // source's declared values, not from `source_count`.
+    const inc: u32 = @intCast(new_strings.len);
+    const src_count = readSstAttrU32(src_xml, "count") orelse source_count;
+    const src_unique = readSstAttrU32(src_xml, "uniqueCount") orelse source_count;
+    const new_count = src_count + inc;
+    const new_unique = src_unique + inc;
+    const after_count = try patchSstAttr(allocator, spliced.items, "count", new_count);
+    spliced.deinit(allocator);
+    spliced = .{};
+    const after_unique = try patchSstAttr(allocator, after_count, "uniqueCount", new_unique);
+    allocator.free(after_count);
+
+    return try buildSubstitutedEntryFromXml(
+        allocator,
+        entry,
+        after_unique,
+    );
+}
+
+/// Read a numeric attribute from the `<sst …>` opening tag. Returns
+/// null if the attribute is absent or unparseable.
+fn readSstAttrU32(xml: []const u8, name: []const u8) ?u32 {
+    const sst_open = std.mem.indexOf(u8, xml, "<sst") orelse return null;
+    const tag_close = std.mem.indexOfScalarPos(u8, xml, sst_open, '>') orelse return null;
+    const tag = xml[sst_open..tag_close];
+    var name_buf: [32]u8 = undefined;
+    if (1 + name.len + 2 > name_buf.len) return null;
+    name_buf[0] = ' ';
+    @memcpy(name_buf[1 .. 1 + name.len], name);
+    @memcpy(name_buf[1 + name.len .. 1 + name.len + 2], "=\"");
+    const needle = name_buf[0 .. 1 + name.len + 2];
+    const attr_pos = std.mem.indexOf(u8, tag, needle) orelse return null;
+    const val_start_in_tag = attr_pos + needle.len;
+    if (val_start_in_tag >= tag.len) return null;
+    var val_end = val_start_in_tag;
+    while (val_end < tag.len and tag[val_end] != '"') : (val_end += 1) {}
+    if (val_end == val_start_in_tag) return null;
+    return std.fmt.parseInt(u32, tag[val_start_in_tag..val_end], 10) catch null;
+}
+
+/// Patch a numeric attribute (`count` or `uniqueCount`) on the
+/// `<sst …>` opening tag. Falls back to leaving the XML unchanged
+/// if the attribute isn't present (rare — readers tolerate omitted
+/// counts). Returns an owned slice.
+fn patchSstAttr(allocator: Allocator, xml: []const u8, name: []const u8, new_value: u32) ![]u8 {
+    const sst_open = std.mem.indexOf(u8, xml, "<sst") orelse return try allocator.dupe(u8, xml);
+    const tag_close = std.mem.indexOfScalarPos(u8, xml, sst_open, '>') orelse
+        return try allocator.dupe(u8, xml);
+    const tag = xml[sst_open..tag_close];
+    // Find ` name="…"` inside the tag span.
+    var name_buf: [32]u8 = undefined;
+    if (1 + name.len + 2 > name_buf.len) return try allocator.dupe(u8, xml);
+    name_buf[0] = ' ';
+    @memcpy(name_buf[1 .. 1 + name.len], name);
+    @memcpy(name_buf[1 + name.len .. 1 + name.len + 2], "=\"");
+    const needle = name_buf[0 .. 1 + name.len + 2];
+    const attr_pos = std.mem.indexOf(u8, tag, needle) orelse return try allocator.dupe(u8, xml);
+    const val_start = sst_open + attr_pos + needle.len;
+    const val_end = std.mem.indexOfScalarPos(u8, xml, val_start, '"') orelse
+        return try allocator.dupe(u8, xml);
+
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, xml[0..val_start]);
+    try std.fmt.format(out.writer(allocator), "{d}", .{new_value});
+    try out.appendSlice(allocator, xml[val_end..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// True when the string would normally need `xml:space="preserve"`
+/// to round-trip — i.e. it has leading/trailing whitespace OOXML
+/// would otherwise strip on parse.
+fn sstNeedsXmlSpacePreserve(s: []const u8) bool {
+    if (s.len == 0) return false;
+    const lead = s[0];
+    const trail = s[s.len - 1];
+    return lead == ' ' or lead == '\t' or lead == '\n' or lead == '\r' or
+        trail == ' ' or trail == '\t' or trail == '\n' or trail == '\r';
+}
+
+/// Append `s` to `out` with the OOXML-required entity escaping
+/// (`&`, `<`, `>`). Suffices for `<t>` content; quote chars don't
+/// appear in element bodies.
+fn appendXmlEscaped(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '&' => try out.appendSlice(allocator, "&amp;"),
+            '<' => try out.appendSlice(allocator, "&lt;"),
+            '>' => try out.appendSlice(allocator, "&gt;"),
+            else => try out.append(allocator, c),
+        }
+    }
+}
+
+/// Compress `new_xml`, build a fresh LFH+CDFH, and return the
+/// substituted entry. Shared between the sheet-substitution path
+/// and the SST-substitution path. The caller owns `new_xml`.
+fn buildSubstitutedEntryFromXml(
+    allocator: Allocator,
+    entry: Editor.ZipEntry,
+    new_xml: []const u8,
+) !SubstitutedEntry {
     defer allocator.free(new_xml);
 
-    // Compress new XML. Fall back to store when deflate inflates.
     var compressed: std.ArrayListUnmanaged(u8) = .{};
     defer compressed.deinit(allocator);
-    var compression_method: u16 = 8; // deflate
+    var compression_method: u16 = 8;
     if (new_xml.len < 1024) {
-        // Match writer.zig's policy: tiny payloads bypass compression
-        // because the dynamic-block header overhead doesn't pay off.
         compression_method = 0;
         try compressed.appendSlice(allocator, new_xml);
     } else {
@@ -4500,8 +4807,6 @@ fn buildSubstitutedSheet(
     }
 
     const crc = std.hash.Crc32.hash(new_xml);
-
-    // Build LFH (header + filename, no extras).
     const filename = entry.name;
     const lfh_size = @sizeOf(std.zip.LocalFileHeader);
     const lfh_total = lfh_size + filename.len;
@@ -4513,7 +4818,7 @@ fn buildSubstitutedSheet(
         .flags = .{ .encrypted = false, ._ = 0 },
         .compression_method = @enumFromInt(compression_method),
         .last_modification_time = 0,
-        .last_modification_date = 0x21, // 1980-01-01, minimum valid
+        .last_modification_date = 0x21,
         .crc32 = crc,
         .compressed_size = @intCast(compressed.items.len),
         .uncompressed_size = @intCast(new_xml.len),
@@ -4525,7 +4830,6 @@ fn buildSubstitutedSheet(
     @memcpy(lfh[0..lfh_size], std.mem.asBytes(&lfh_struct));
     @memcpy(lfh[lfh_size..], filename);
 
-    // Build CDFH (header + filename, no extras, no comment).
     const cdfh_size = @sizeOf(std.zip.CentralDirectoryFileHeader);
     const cdfh_total = cdfh_size + filename.len;
     const cdfh = try allocator.alloc(u8, cdfh_total);
@@ -4547,7 +4851,7 @@ fn buildSubstitutedSheet(
         .disk_number = 0,
         .internal_file_attributes = 0,
         .external_file_attributes = 0,
-        .local_file_header_offset = 0, // patched by save() walker
+        .local_file_header_offset = 0,
     };
     if (@import("builtin").cpu.arch.endian() != .little)
         std.mem.byteSwapAllFields(std.zip.CentralDirectoryFileHeader, &cdfh_struct);
@@ -4696,6 +5000,7 @@ fn injectAppendedRows(
     src_xml: []const u8,
     appended: []const []Cell,
     start_row: u32,
+    sst: ?*SstAppender,
 ) ![]u8 {
     // Render appended rows once.
     var rows_buf: std.ArrayListUnmanaged(u8) = .{};
@@ -4706,7 +5011,7 @@ fn injectAppendedRows(
         try std.fmt.format(rows_buf.writer(allocator), "{d}", .{row_idx});
         try rows_buf.appendSlice(allocator, "\">");
         for (row, 0..) |cell, ci| {
-            try renderCellOoxml(allocator, &rows_buf, cell, row_idx, @intCast(ci));
+            try renderCellOoxml(allocator, &rows_buf, cell, row_idx, @intCast(ci), sst);
         }
         try rows_buf.appendSlice(allocator, "</row>");
     }
@@ -4794,41 +5099,59 @@ fn renderCellOoxml(
     cell: Cell,
     row_idx: u32,
     col_idx: u32,
+    sst: ?*SstAppender,
 ) !void {
     switch (cell) {
         .empty => return, // skip — empty cells emit nothing
         .integer => |x| {
-            var col_buf: [8]u8 = undefined;
-            const col = colLetterEditor(&col_buf, col_idx);
-            try out.appendSlice(allocator, "<c r=\"");
-            try out.appendSlice(allocator, col);
-            try std.fmt.format(out.writer(allocator), "{d}", .{row_idx});
-            try out.appendSlice(allocator, "\"><v>");
+            try writeCellOpen(allocator, out, col_idx, row_idx, null);
+            try out.appendSlice(allocator, "<v>");
             try std.fmt.format(out.writer(allocator), "{d}", .{x});
             try out.appendSlice(allocator, "</v></c>");
         },
         .number => |f| {
-            var col_buf: [8]u8 = undefined;
-            const col = colLetterEditor(&col_buf, col_idx);
-            try out.appendSlice(allocator, "<c r=\"");
-            try out.appendSlice(allocator, col);
-            try std.fmt.format(out.writer(allocator), "{d}", .{row_idx});
-            try out.appendSlice(allocator, "\"><v>");
+            try writeCellOpen(allocator, out, col_idx, row_idx, null);
+            try out.appendSlice(allocator, "<v>");
             try std.fmt.format(out.writer(allocator), "{d}", .{f});
             try out.appendSlice(allocator, "</v></c>");
         },
         .boolean => |b| {
-            var col_buf: [8]u8 = undefined;
-            const col = colLetterEditor(&col_buf, col_idx);
-            try out.appendSlice(allocator, "<c r=\"");
-            try out.appendSlice(allocator, col);
-            try std.fmt.format(out.writer(allocator), "{d}", .{row_idx});
-            try out.appendSlice(allocator, "\" t=\"b\"><v>");
+            try writeCellOpen(allocator, out, col_idx, row_idx, "b");
+            try out.appendSlice(allocator, "<v>");
             try out.appendSlice(allocator, if (b) "1" else "0");
             try out.appendSlice(allocator, "</v></c>");
         },
-        .string => unreachable, // appendRows rejects strings in iter-lms-2
+        .string => |s| {
+            // String cells go through the SST appender, which assigns
+            // a fresh index per cell (no plain-text reuse — see the
+            // SstAppender doc).
+            const appender = sst orelse return error.SstAppenderRequired;
+            const idx = try appender.add(s);
+            try writeCellOpen(allocator, out, col_idx, row_idx, "s");
+            try out.appendSlice(allocator, "<v>");
+            try std.fmt.format(out.writer(allocator), "{d}", .{idx});
+            try out.appendSlice(allocator, "</v></c>");
+        },
     }
+}
+
+fn writeCellOpen(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    col_idx: u32,
+    row_idx: u32,
+    t_attr: ?[]const u8,
+) !void {
+    var col_buf: [8]u8 = undefined;
+    const col = colLetterEditor(&col_buf, col_idx);
+    try out.appendSlice(allocator, "<c r=\"");
+    try out.appendSlice(allocator, col);
+    try std.fmt.format(out.writer(allocator), "{d}", .{row_idx});
+    if (t_attr) |t| {
+        try out.appendSlice(allocator, "\" t=\"");
+        try out.appendSlice(allocator, t);
+    }
+    try out.appendSlice(allocator, "\">");
 }
 
 /// Render `col_idx` (0-based) as A, B, ..., Z, AA, AB, ... into `buf`.
@@ -5781,7 +6104,7 @@ test "Editor: appendRows + save round-trips through reader (iter-lms-2)" {
     try std.testing.expectEqual(@as(?[]const Cell, null), try rows.next());
 }
 
-test "Editor: appendRows rejects string cells in iter-lms-2" {
+test "Editor: appendRows rejects out-of-range sheet idx + lossy ints" {
     const writer_mod = @import("writer.zig");
     const src_path = "/tmp/zlsx_editor_append_reject.xlsx";
     defer std.fs.cwd().deleteFile(src_path) catch {};
@@ -5797,9 +6120,74 @@ test "Editor: appendRows rejects string cells in iter-lms-2" {
     var ed = try Editor.open(std.testing.allocator, src_path);
     defer ed.deinit();
 
-    const bad_rows = [_][]const Cell{&.{ .{ .integer = 2 }, .{ .string = "hello" } }};
-    try std.testing.expectError(error.SstAppendNotYetSupported, ed.appendRows(0, &bad_rows));
-    try std.testing.expectError(error.SheetIndexOutOfRange, ed.appendRows(99, &bad_rows));
+    const ok_rows = [_][]const Cell{&.{.{ .integer = 2 }}};
+    try std.testing.expectError(error.SheetIndexOutOfRange, ed.appendRows(99, &ok_rows));
+
+    // Lossy integer (>2^53 + 1) is refused for the same reason the
+    // writer refuses it.
+    const lossy_rows = [_][]const Cell{&.{.{ .integer = 9007199254740993 }}};
+    try std.testing.expectError(error.IntegerExceedsExcelPrecision, ed.appendRows(0, &lossy_rows));
+}
+
+test "Editor: appendRows with string cells extends SST (iter-lms-3)" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_editor_append_str_src.xlsx";
+    const dst_path = "/tmp/zlsx_editor_append_str_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+
+    // Source workbook with one string row so the SST exists.
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Data");
+        try s.writeRow(&.{ .{ .string = "alpha" }, .{ .integer = 1 } });
+        try w.save(src_path);
+    }
+
+    // Append a row that mixes string + integer + boolean.
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        const append_rows = [_][]const Cell{
+            &.{ .{ .string = "beta" }, .{ .integer = 2 } },
+            &.{ .{ .string = "gamma" }, .{ .boolean = true } },
+            // Same plain-text as an existing entry — must NOT alias
+            // (always-new SST index per the iter-lms-3 contract).
+            &.{ .{ .string = "alpha" }, .{ .integer = 3 } },
+        };
+        try ed.appendRows(0, &append_rows);
+        try ed.save(dst_path);
+    }
+
+    // Read back through Book — every appended string resolves to the
+    // expected content.
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+
+    const r1 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("alpha", r1[0].string);
+    try std.testing.expectEqual(@as(i64, 1), r1[1].integer);
+
+    const r2 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("beta", r2[0].string);
+    try std.testing.expectEqual(@as(i64, 2), r2[1].integer);
+
+    const r3 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("gamma", r3[0].string);
+    try std.testing.expectEqual(true, r3[1].boolean);
+
+    const r4 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("alpha", r4[0].string);
+    try std.testing.expectEqual(@as(i64, 3), r4[1].integer);
+
+    try std.testing.expectEqual(@as(?[]const Cell, null), try rows.next());
+
+    // SST must have grown — original 1 entry + 3 appended strings
+    // (no reuse, even though "alpha" repeats).
+    try std.testing.expectEqual(@as(usize, 4), book.sharedStringsCount());
 }
 
 test "Rows.parseDate: auto-convert date-styled cells through the reader" {
