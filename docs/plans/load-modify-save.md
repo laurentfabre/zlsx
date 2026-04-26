@@ -1,8 +1,20 @@
-# Load-modify-save plan (v3)
+# Load-modify-save plan (v3 — append-only path shipped)
 
 > Phase 3c per the design-doc roadmap. Today's writer is fresh-file
 > only — `Writer.init → addSheet → writeRow* → save`. No path to
 > read an existing xlsx, mutate it, and save the result.
+
+## Status
+
+- iter-lms-1 (Editor scaffold + byte-identical passthrough) — ✅ shipped
+- iter-lms-1b (raw-ZIP scanner + entry table) — ✅ shipped
+- iter-lms-2 (numeric/bool/blank append + sheet substitute) — ✅ shipped
+- iter-lms-3 (string append + SST extension) — ✅ shipped
+- iter-lms-4 (CLI sub-command + Python binding + docs) — 🚧 queued
+
+`Editor.open(allocator, path) / appendRows / save` is callable from
+Zig today against any single-disk, non-ZIP64, non-encrypted xlsx
+that already has an `xl/sharedStrings.xml` part.
 
 ## Problem
 
