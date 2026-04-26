@@ -3994,6 +3994,23 @@ pub const Editor = struct {
     /// Verbatim trailing-comment bytes from the EOCD record (may be
     /// empty). Points into `src_buf`.
     eocd_comment: []const u8,
+    /// Sheet path for each declared sheet, in declared order. Owned
+    /// `dupe` of the path string from the source's workbook.xml.rels
+    /// (resolved via `Book.open` at editor-construction time so the
+    /// editor doesn't need to re-parse rels itself).
+    sheet_paths: []const []const u8,
+    /// Pending appended rows per sheet. Empty when no mutation has
+    /// been requested — `save` then flows through the byte-identical
+    /// passthrough path. Each `AppendBuffer.rows` slice + every
+    /// inner row slice is allocator-owned.
+    pending_appends: std.AutoHashMapUnmanaged(u32, AppendBuffer),
+
+    /// Buffered appended rows for one sheet. iter-lms-2 accepts
+    /// numeric / integer / boolean / empty cells only — string cells
+    /// require SST extension which lands in iter-lms-3.
+    pub const AppendBuffer = struct {
+        rows: std.ArrayListUnmanaged([]Cell) = .{},
+    };
 
     /// Per-entry spans captured by the iter-lms-1b raw-ZIP scanner.
     /// All offsets/lengths are relative to `src_buf`.
@@ -4008,6 +4025,11 @@ pub const Editor = struct {
         lfh_total_len: u32,
         /// Compressed payload bytes.
         payload_len: u32,
+        /// Uncompressed payload size declared in the CDFH. Used as a
+        /// hard cap during decompression so a maliciously crafted
+        /// deflate stream can't expand past the declared size and
+        /// inflate memory usage on `save`.
+        uncompressed_size: u32,
         /// CDFH offset (start of the central-directory file header
         /// for this entry).
         cdfh_offset: u32,
@@ -4152,6 +4174,7 @@ pub const Editor = struct {
                 .lfh_offset = @intCast(lfh_offset),
                 .lfh_total_len = @intCast(lfh_total),
                 .payload_len = @intCast(payload_len),
+                .uncompressed_size = cdfh_ptr.uncompressed_size,
                 .cdfh_offset = @intCast(p),
                 .cdfh_total_len = @intCast(cdfh_total),
                 .compression_method = @intFromEnum(cdfh_ptr.compression_method),
@@ -4167,6 +4190,26 @@ pub const Editor = struct {
         // entries on save-mutate.
         if (entries.items.len != eocd.record_count_total) return error.BadZip;
 
+        // Resolve the sheet_idx → path mapping by opening the source
+        // through Book.open (which parses workbook.xml.rels). The
+        // editor needs this to find which entry in the ZIP table
+        // corresponds to a given sheet on appendRows. Paths are
+        // dup'd into editor-owned storage so Book.deinit doesn't
+        // dangle them.
+        const sheet_paths_owned = blk: {
+            var b = try Book.open(allocator, path);
+            defer b.deinit();
+            const out_paths = try allocator.alloc([]const u8, b.sheets.len);
+            errdefer {
+                for (out_paths) |p_owned| allocator.free(p_owned);
+                allocator.free(out_paths);
+            }
+            for (b.sheets, 0..) |s, i| {
+                out_paths[i] = try allocator.dupe(u8, s.path);
+            }
+            break :blk out_paths;
+        };
+
         return .{
             .allocator = allocator,
             .src_buf = buf,
@@ -4175,31 +4218,633 @@ pub const Editor = struct {
             .cd_size = cd_size,
             .eocd_offset = @intCast(eocd_pos),
             .eocd_comment = eocd_comment,
+            .sheet_paths = sheet_paths_owned,
+            .pending_appends = .{},
         };
     }
 
     pub fn deinit(self: *Editor) void {
         self.allocator.free(self.src_buf);
         self.allocator.free(self.entries);
+        for (self.sheet_paths) |p| self.allocator.free(p);
+        self.allocator.free(self.sheet_paths);
+        var it = self.pending_appends.valueIterator();
+        while (it.next()) |buf| {
+            for (buf.rows.items) |row| self.allocator.free(row);
+            buf.rows.deinit(self.allocator);
+        }
+        self.pending_appends.deinit(self.allocator);
         self.* = undefined;
     }
 
-    /// Write the (currently unmodified) workbook to `out_path`.
-    /// iter-lms-1 just streams `src_buf` verbatim — byte-identical
-    /// SHA256 round-trip is the contract this iter establishes.
-    /// Uses `std.fs.Dir.atomicFile` so the temp file is created with
-    /// a stdlib-managed random suffix (refuses to follow a planted
-    /// symlink), is closed before the rename (Windows-portable), and
-    /// is auto-cleaned by `deinit` on any error path.
-    pub fn save(self: *const Editor, out_path: []const u8) !void {
+    /// Append rows to an existing sheet. iter-lms-2 accepts only
+    /// numeric / integer / boolean / empty cells; string cells
+    /// require SST extension which lands in iter-lms-3 and surface
+    /// as `error.SstAppendNotYetSupported` here. Rows go after the
+    /// source's highest used row in that sheet (computed at save
+    /// time, not now).
+    pub fn appendRows(self: *Editor, sheet_idx: u32, rows: []const []const Cell) !void {
+        if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
+        // Empty append is a documented no-op — recording it as a
+        // pending mutation would underflow the row-index math in
+        // `buildSubstitutedSheet` (start_row + 0 - 1 = u32.max).
+        if (rows.len == 0) return;
+        // Refuse rows wider than Excel's max column (XFD = 16384).
+        // The actual final row count check (start_row + len <=
+        // 1048576) happens in buildSubstitutedSheet once the source's
+        // highest row is known.
+        for (rows) |row| {
+            if (row.len > max_col_1based) return error.ColumnIndexOutOfRange;
+        }
+        const writer_mod = @import("writer.zig");
+        for (rows) |row| for (row) |c| switch (c) {
+            .empty, .number, .boolean => {},
+            .integer => |n| {
+                // Match writer.zig's contract: integers must round-
+                // trip exactly through f64 (Excel stores all numerics
+                // as IEEE-754 doubles). Reject up front rather than
+                // silently rounding on open.
+                if (!writer_mod.fitsExactlyInF64(n)) return error.IntegerExceedsExcelPrecision;
+            },
+            .string => return error.SstAppendNotYetSupported,
+        };
+        const gop = try self.pending_appends.getOrPut(self.allocator, sheet_idx);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        for (rows) |row| {
+            const owned = try self.allocator.alloc(Cell, row.len);
+            @memcpy(owned, row);
+            errdefer self.allocator.free(owned);
+            try gop.value_ptr.rows.append(self.allocator, owned);
+        }
+    }
+
+    /// Write the workbook (with any pending appends applied) to
+    /// `out_path`. Atomic via `std.fs.Dir.atomicFile`.
+    ///
+    /// **No-op save**: when no `appendRows` calls have been made,
+    /// streams `src_buf` verbatim — preserves SHA256 round-trip for
+    /// any well-formed source archive (canonical or not).
+    ///
+    /// **Mutated save**: walks the entry table, substitutes each
+    /// modified sheet entry with a freshly-emitted LFH+payload (new
+    /// CRC32 / sizes), and re-emits the central directory + EOCD
+    /// with patched offsets. Sheets that weren't touched flow through
+    /// verbatim; the source's preserved EOCD comment is kept.
+    pub fn save(self: *Editor, out_path: []const u8) !void {
         var write_buf: [4096]u8 = undefined;
         var atomic_file = try std.fs.cwd().atomicFile(out_path, .{ .write_buffer = &write_buf });
         defer atomic_file.deinit();
-        const writer = &atomic_file.file_writer.interface;
-        try writer.writeAll(self.src_buf);
+        const w = &atomic_file.file_writer.interface;
+
+        if (self.pending_appends.count() == 0) {
+            try w.writeAll(self.src_buf);
+            try atomic_file.finish();
+            return;
+        }
+
+        // Build substituted entries for each modified sheet. Each
+        // substitution contains the new LFH bytes (header + filename)
+        // and the new compressed payload. Indexed by entry-array idx.
+        const subs = try self.allocator.alloc(?SubstitutedEntry, self.entries.len);
+        defer {
+            for (subs) |maybe_sub| if (maybe_sub) |s| {
+                self.allocator.free(s.lfh);
+                self.allocator.free(s.payload);
+                self.allocator.free(s.cdfh);
+            };
+            self.allocator.free(subs);
+        }
+        for (subs) |*slot| slot.* = null;
+
+        var pa_iter = self.pending_appends.iterator();
+        while (pa_iter.next()) |kv| {
+            const sheet_idx = kv.key_ptr.*;
+            const buf = kv.value_ptr.*;
+            const path = self.sheet_paths[sheet_idx];
+            const entry_idx = findEntryByName(self.entries, path) orelse
+                return error.SheetEntryNotFound;
+            subs[entry_idx] = try buildSubstitutedSheet(
+                self.allocator,
+                self.entries[entry_idx],
+                self.src_buf,
+                buf.rows.items,
+            );
+        }
+
+        // Emit LFHs in LFH-offset order. Each substituted entry's LFH
+        // / payload are freshly built; others copy from src_buf.
+        const new_lfh_offsets = try self.allocator.alloc(u32, self.entries.len);
+        defer self.allocator.free(new_lfh_offsets);
+        const lfh_sorted = try self.allocator.alloc(usize, self.entries.len);
+        defer self.allocator.free(lfh_sorted);
+        for (lfh_sorted, 0..) |*slot, i| slot.* = i;
+        std.mem.sort(usize, lfh_sorted, self.entries, struct {
+            fn lessThan(es: []const ZipEntry, a: usize, b: usize) bool {
+                return es[a].lfh_offset < es[b].lfh_offset;
+            }
+        }.lessThan);
+
+        var written: u32 = 0;
+        for (lfh_sorted) |i| {
+            new_lfh_offsets[i] = written;
+            if (subs[i]) |s| {
+                try w.writeAll(s.lfh);
+                try w.writeAll(s.payload);
+                written += @intCast(s.lfh.len + s.payload.len);
+            } else {
+                const e = self.entries[i];
+                const lfh_bytes = self.src_buf[e.lfh_offset .. e.lfh_offset + e.lfh_total_len];
+                try w.writeAll(lfh_bytes);
+                const payload_bytes = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
+                try w.writeAll(payload_bytes);
+                written += e.lfh_total_len + e.payload_len;
+            }
+        }
+
+        const new_cd_offset: u32 = written;
+        for (self.entries, 0..) |entry, i| {
+            if (subs[i]) |s| {
+                // Substituted: emit a fresh CDFH (header + filename
+                // only — no extras/comment). Patch local_file_header
+                // offset in place after copy.
+                var cdfh_copy = try self.allocator.dupe(u8, s.cdfh);
+                defer self.allocator.free(cdfh_copy);
+                const lfh_field_pos = @sizeOf(std.zip.CentralDirectoryFileHeader) - 4;
+                std.mem.writeInt(u32, cdfh_copy[lfh_field_pos..][0..4], new_lfh_offsets[i], .little);
+                try w.writeAll(cdfh_copy);
+                written += @intCast(cdfh_copy.len);
+            } else {
+                // Pass-through: copy CDFH from src_buf, patch the LFH
+                // offset (final u32 of the fixed-size header).
+                var cdfh_bytes: [@sizeOf(std.zip.CentralDirectoryFileHeader)]u8 = undefined;
+                const src_cdfh = self.src_buf[entry.cdfh_offset .. entry.cdfh_offset + cdfh_bytes.len];
+                @memcpy(&cdfh_bytes, src_cdfh);
+                const lfh_field_pos = cdfh_bytes.len - 4;
+                std.mem.writeInt(u32, cdfh_bytes[lfh_field_pos..][0..4], new_lfh_offsets[i], .little);
+                try w.writeAll(&cdfh_bytes);
+                const var_off = entry.cdfh_offset + cdfh_bytes.len;
+                const var_len = entry.cdfh_total_len - cdfh_bytes.len;
+                try w.writeAll(self.src_buf[var_off .. var_off + var_len]);
+                written += entry.cdfh_total_len;
+            }
+        }
+        const new_cd_size: u32 = written - new_cd_offset;
+
+        var eocd_out: std.zip.EndRecord = .{
+            .signature = std.zip.end_record_sig,
+            .disk_number = 0,
+            .central_directory_disk_number = 0,
+            .record_count_disk = @intCast(self.entries.len),
+            .record_count_total = @intCast(self.entries.len),
+            .central_directory_size = new_cd_size,
+            .central_directory_offset = new_cd_offset,
+            .comment_len = @intCast(self.eocd_comment.len),
+        };
+        if (@import("builtin").cpu.arch.endian() != .little)
+            std.mem.byteSwapAllFields(std.zip.EndRecord, &eocd_out);
+        try w.writeAll(std.mem.asBytes(&eocd_out));
+        try w.writeAll(self.eocd_comment);
+
         try atomic_file.finish();
     }
 };
+
+/// New LFH + payload + CDFH bytes for a sheet entry that's been
+/// modified by `appendRows`. Owned by the caller; freed on
+/// `Editor.save` exit.
+const SubstitutedEntry = struct {
+    lfh: []u8,
+    payload: []u8,
+    cdfh: []u8,
+    crc32: u32,
+    uncompressed_size: u32,
+    compression_method: u16,
+};
+
+/// Linear scan: small N (entries per xlsx is ~10-20) makes a hashmap
+/// overkill. Returns the first matching index.
+fn findEntryByName(entries: []const Editor.ZipEntry, name: []const u8) ?usize {
+    for (entries, 0..) |e, i| {
+        if (std.mem.eql(u8, e.name, name)) return i;
+    }
+    return null;
+}
+
+/// Build the substituted LFH + payload + CDFH for a sheet that has
+/// pending appended rows. Decompresses the source sheet XML, finds
+/// `</sheetData>`, injects new `<row>...</row>` blocks, recompresses
+/// (or falls back to store if deflate inflates), then emits canonical
+/// LFH/CDFH bytes.
+fn buildSubstitutedSheet(
+    allocator: Allocator,
+    entry: Editor.ZipEntry,
+    src_buf: []u8,
+    appended_rows: []const []Cell,
+) !SubstitutedEntry {
+    // Decompress source payload.
+    const payload = src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
+    const decompressed = try decompressZipPayload(
+        allocator,
+        payload,
+        entry.compression_method,
+        entry.uncompressed_size,
+    );
+    defer allocator.free(decompressed);
+
+    // Find the first row index for the appends — one past the
+    // highest used row in the source.
+    const highest_row = findHighestRowInSheetXml(decompressed);
+    const start_row: u32 = highest_row + 1;
+    // Refuse appends that push past Excel's max row (1,048,576).
+    const final_row: u64 = @as(u64, start_row) + @as(u64, appended_rows.len) - 1;
+    if (final_row > max_row) return error.RowIndexOutOfRange;
+
+    // Inject `<row r="N">…</row>` blocks before `</sheetData>`.
+    const injected = try injectAppendedRows(
+        allocator,
+        decompressed,
+        appended_rows,
+        start_row,
+    );
+    defer allocator.free(injected);
+
+    // Update `<dimension ref="A1:Z<row>"/>` to extend the row bound
+    // when the appended rows pushed past the source's declared
+    // dimension. Only the canonical self-closing form is touched;
+    // other shapes (no dimension / open-tag form / column-only ref)
+    // are left alone — Excel recomputes the dimension on its next
+    // save so staleness on those is tolerable.
+    const new_max_row: u32 = start_row +
+        @as(u32, @intCast(appended_rows.len)) - 1;
+    const new_xml = (try updateDimensionRow(allocator, injected, new_max_row)) orelse
+        try allocator.dupe(u8, injected);
+    defer allocator.free(new_xml);
+
+    // Compress new XML. Fall back to store when deflate inflates.
+    var compressed: std.ArrayListUnmanaged(u8) = .{};
+    defer compressed.deinit(allocator);
+    var compression_method: u16 = 8; // deflate
+    if (new_xml.len < 1024) {
+        // Match writer.zig's policy: tiny payloads bypass compression
+        // because the dynamic-block header overhead doesn't pay off.
+        compression_method = 0;
+        try compressed.appendSlice(allocator, new_xml);
+    } else {
+        const writer_mod = @import("writer.zig");
+        try writer_mod.deflateCompress(allocator, new_xml, &compressed);
+        if (compressed.items.len >= new_xml.len) {
+            compression_method = 0;
+            compressed.clearRetainingCapacity();
+            try compressed.appendSlice(allocator, new_xml);
+        }
+    }
+
+    const crc = std.hash.Crc32.hash(new_xml);
+
+    // Build LFH (header + filename, no extras).
+    const filename = entry.name;
+    const lfh_size = @sizeOf(std.zip.LocalFileHeader);
+    const lfh_total = lfh_size + filename.len;
+    const lfh = try allocator.alloc(u8, lfh_total);
+    errdefer allocator.free(lfh);
+    var lfh_struct: std.zip.LocalFileHeader = .{
+        .signature = std.zip.local_file_header_sig,
+        .version_needed_to_extract = 20,
+        .flags = .{ .encrypted = false, ._ = 0 },
+        .compression_method = @enumFromInt(compression_method),
+        .last_modification_time = 0,
+        .last_modification_date = 0x21, // 1980-01-01, minimum valid
+        .crc32 = crc,
+        .compressed_size = @intCast(compressed.items.len),
+        .uncompressed_size = @intCast(new_xml.len),
+        .filename_len = @intCast(filename.len),
+        .extra_len = 0,
+    };
+    if (@import("builtin").cpu.arch.endian() != .little)
+        std.mem.byteSwapAllFields(std.zip.LocalFileHeader, &lfh_struct);
+    @memcpy(lfh[0..lfh_size], std.mem.asBytes(&lfh_struct));
+    @memcpy(lfh[lfh_size..], filename);
+
+    // Build CDFH (header + filename, no extras, no comment).
+    const cdfh_size = @sizeOf(std.zip.CentralDirectoryFileHeader);
+    const cdfh_total = cdfh_size + filename.len;
+    const cdfh = try allocator.alloc(u8, cdfh_total);
+    errdefer allocator.free(cdfh);
+    var cdfh_struct: std.zip.CentralDirectoryFileHeader = .{
+        .signature = std.zip.central_file_header_sig,
+        .version_made_by = 20,
+        .version_needed_to_extract = 20,
+        .flags = .{ .encrypted = false, ._ = 0 },
+        .compression_method = @enumFromInt(compression_method),
+        .last_modification_time = 0,
+        .last_modification_date = 0x21,
+        .crc32 = crc,
+        .compressed_size = @intCast(compressed.items.len),
+        .uncompressed_size = @intCast(new_xml.len),
+        .filename_len = @intCast(filename.len),
+        .extra_len = 0,
+        .comment_len = 0,
+        .disk_number = 0,
+        .internal_file_attributes = 0,
+        .external_file_attributes = 0,
+        .local_file_header_offset = 0, // patched by save() walker
+    };
+    if (@import("builtin").cpu.arch.endian() != .little)
+        std.mem.byteSwapAllFields(std.zip.CentralDirectoryFileHeader, &cdfh_struct);
+    @memcpy(cdfh[0..cdfh_size], std.mem.asBytes(&cdfh_struct));
+    @memcpy(cdfh[cdfh_size..], filename);
+
+    const payload_owned = try compressed.toOwnedSlice(allocator);
+    return .{
+        .lfh = lfh,
+        .payload = payload_owned,
+        .cdfh = cdfh,
+        .crc32 = crc,
+        .uncompressed_size = @intCast(new_xml.len),
+        .compression_method = compression_method,
+    };
+}
+
+fn decompressZipPayload(
+    allocator: Allocator,
+    payload: []const u8,
+    method: u16,
+    declared_uncompressed: u32,
+) ![]u8 {
+    if (method == 0) {
+        if (payload.len != declared_uncompressed) return error.BadZip;
+        return try allocator.dupe(u8, payload);
+    } else if (method == 8) {
+        // streamExact64 caps the inflated output at the declared
+        // size, defending against zip bombs / oversize-inflation
+        // attacks. The CDFH-side uncompressed_size is what the
+        // archive promises; refuse to allocate more than that.
+        var src_reader = std.Io.Reader.fixed(payload);
+        var flate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+        var dec = std.compress.flate.Decompress.init(&src_reader, .raw, &flate_buffer);
+        const out = try allocator.alloc(u8, declared_uncompressed);
+        errdefer allocator.free(out);
+        var out_writer = std.Io.Writer.fixed(out);
+        dec.reader.streamExact64(&out_writer, declared_uncompressed) catch return error.BadZip;
+        return out;
+    }
+    return error.UnsupportedCompression;
+}
+
+/// Return the largest cell-row index in the sheet XML. Walks both
+/// `<row>` and `<c>` opening tags and looks for `r="…"` anywhere in
+/// each tag's attribute span — OOXML doesn't constrain attribute
+/// order, so `<c s="1" r="A42">` and `<row spans="1:4" r="12">` are
+/// both legal. Cell refs are preferred because OOXML allows `<row>`
+/// to omit `r=` entirely (the row index then infers from the first
+/// cell), but explicit-row scans are also covered for empty
+/// `<row r="N"/>` openings without children.
+fn findHighestRowInSheetXml(xml: []const u8) u32 {
+    var highest: u32 = 0;
+
+    // Pass 1: `<c ...>` tags — extract the row component from r="A1".
+    {
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, xml, i, "<c")) |tag_start| {
+            const after = tag_start + "<c".len;
+            if (after >= xml.len) break;
+            const c = xml[after];
+            // Filter out `<col`, `<conditionalFormatting`, etc.
+            if (c != ' ' and c != '\t' and c != '\n' and c != '\r' and c != '/' and c != '>') {
+                i = tag_start + 1;
+                continue;
+            }
+            const tag_end = std.mem.indexOfScalarPos(u8, xml, tag_start, '>') orelse break;
+            if (findAttrRowFromCellRef(xml[tag_start..tag_end])) |n| {
+                if (n > highest) highest = n;
+            }
+            i = tag_end + 1;
+        }
+    }
+    // Pass 2: `<row ...>` tags — explicit r="N".
+    {
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, xml, i, "<row")) |tag_start| {
+            const after = tag_start + "<row".len;
+            if (after >= xml.len) break;
+            const c = xml[after];
+            if (c != ' ' and c != '\t' and c != '\n' and c != '\r' and c != '/' and c != '>') {
+                i = tag_start + 1;
+                continue;
+            }
+            const tag_end = std.mem.indexOfScalarPos(u8, xml, tag_start, '>') orelse break;
+            if (findAttrRowExplicit(xml[tag_start..tag_end])) |n| {
+                if (n > highest) highest = n;
+            }
+            i = tag_end + 1;
+        }
+    }
+    return highest;
+}
+
+/// Locate ` r="…"` within an opening-tag span and parse the row
+/// component of an A1-style cell ref ("A1", "B12", "AAA9999").
+/// Returns null on no match or unparseable digits.
+fn findAttrRowFromCellRef(tag: []const u8) ?u32 {
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, tag, search_from, "r=\"")) |r_pos| {
+        const prev = if (r_pos > 0) tag[r_pos - 1] else 0;
+        if (prev == ' ' or prev == '\t' or prev == '\n' or prev == '\r') {
+            const ref_start = r_pos + "r=\"".len;
+            var col_end = ref_start;
+            while (col_end < tag.len and tag[col_end] >= 'A' and tag[col_end] <= 'Z') : (col_end += 1) {}
+            var num_end = col_end;
+            while (num_end < tag.len and tag[num_end] >= '0' and tag[num_end] <= '9') : (num_end += 1) {}
+            if (num_end > col_end) {
+                return std.fmt.parseInt(u32, tag[col_end..num_end], 10) catch null;
+            }
+            return null;
+        }
+        search_from = r_pos + 1;
+    }
+    return null;
+}
+
+/// Locate ` r="N"` within a `<row …>` span and parse N as a u32.
+fn findAttrRowExplicit(tag: []const u8) ?u32 {
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, tag, search_from, "r=\"")) |r_pos| {
+        const prev = if (r_pos > 0) tag[r_pos - 1] else 0;
+        if (prev == ' ' or prev == '\t' or prev == '\n' or prev == '\r') {
+            const num_start = r_pos + "r=\"".len;
+            var num_end = num_start;
+            while (num_end < tag.len and tag[num_end] >= '0' and tag[num_end] <= '9') : (num_end += 1) {}
+            if (num_end > num_start) {
+                return std.fmt.parseInt(u32, tag[num_start..num_end], 10) catch null;
+            }
+            return null;
+        }
+        search_from = r_pos + 1;
+    }
+    return null;
+}
+
+/// Build a new sheet XML with appended rows. Handles two source
+/// shapes:
+///   - `<sheetData>...</sheetData>` — inject rows before the close.
+///   - `<sheetData/>` — replace with `<sheetData>…</sheetData>` so
+///     empty sheets become well-formed once they have rows.
+/// Returns `error.SheetMissingSheetData` if neither shape is found
+/// (defensive — every well-formed OOXML sheet has one).
+fn injectAppendedRows(
+    allocator: Allocator,
+    src_xml: []const u8,
+    appended: []const []Cell,
+    start_row: u32,
+) ![]u8 {
+    // Render appended rows once.
+    var rows_buf: std.ArrayListUnmanaged(u8) = .{};
+    defer rows_buf.deinit(allocator);
+    for (appended, 0..) |row, ri| {
+        const row_idx: u32 = start_row + @as(u32, @intCast(ri));
+        try rows_buf.appendSlice(allocator, "<row r=\"");
+        try std.fmt.format(rows_buf.writer(allocator), "{d}", .{row_idx});
+        try rows_buf.appendSlice(allocator, "\">");
+        for (row, 0..) |cell, ci| {
+            try renderCellOoxml(allocator, &rows_buf, cell, row_idx, @intCast(ci));
+        }
+        try rows_buf.appendSlice(allocator, "</row>");
+    }
+
+    // Prefer the open/close form. Fall back to self-closing if no
+    // close is found.
+    if (std.mem.indexOf(u8, src_xml, "</sheetData>")) |inject_pos| {
+        const out_len = src_xml.len + rows_buf.items.len;
+        const out = try allocator.alloc(u8, out_len);
+        errdefer allocator.free(out);
+        @memcpy(out[0..inject_pos], src_xml[0..inject_pos]);
+        @memcpy(out[inject_pos..][0..rows_buf.items.len], rows_buf.items);
+        @memcpy(out[inject_pos + rows_buf.items.len ..], src_xml[inject_pos..]);
+        return out;
+    }
+
+    // Self-closing form: `<sheetData/>` (sometimes with attributes).
+    // Locate `<sheetData` then advance to the closing `>`. If the
+    // tag ends with `/>`, replace the whole tag with
+    // `<sheetData …>` + rows + `</sheetData>` — preserving any
+    // attributes (rare but legal).
+    const sd_open = std.mem.indexOf(u8, src_xml, "<sheetData") orelse
+        return error.SheetMissingSheetData;
+    const sd_close = std.mem.indexOfScalarPos(u8, src_xml, sd_open, '>') orelse
+        return error.SheetMissingSheetData;
+    if (sd_close == 0 or src_xml[sd_close - 1] != '/')
+        return error.SheetMissingSheetData;
+    // Tag attributes (if any) live between `<sheetData` and `/>`.
+    const attrs_end = sd_close - 1;
+    const attrs = src_xml[sd_open + "<sheetData".len .. attrs_end];
+
+    var spliced: std.ArrayListUnmanaged(u8) = .{};
+    defer spliced.deinit(allocator);
+    try spliced.appendSlice(allocator, src_xml[0..sd_open]);
+    try spliced.appendSlice(allocator, "<sheetData");
+    try spliced.appendSlice(allocator, attrs);
+    try spliced.append(allocator, '>');
+    try spliced.appendSlice(allocator, rows_buf.items);
+    try spliced.appendSlice(allocator, "</sheetData>");
+    try spliced.appendSlice(allocator, src_xml[sd_close + 1 ..]);
+    return try spliced.toOwnedSlice(allocator);
+}
+
+/// Patch the row component of a canonical-form `<dimension
+/// ref="A1:Z<row>"/>` to `new_max_row` when the appended rows
+/// extend the declared range. Returns null when no patch is needed
+/// or the dimension isn't in canonical form (best-effort per the
+/// LMS plan v3 — single-cell refs and column-bound widening are
+/// out of scope; spreadsheet consumers rescan `<sheetData>` on open
+/// and Excel rewrites the dimension on its next save). Returns an
+/// owned new slice on success.
+fn updateDimensionRow(allocator: Allocator, xml: []const u8, new_max_row: u32) !?[]u8 {
+    const dim_open = "<dimension ref=\"";
+    const dim_pos = std.mem.indexOf(u8, xml, dim_open) orelse return null;
+    const ref_start = dim_pos + dim_open.len;
+    const ref_end = std.mem.indexOfScalarPos(u8, xml, ref_start, '"') orelse return null;
+    const ref = xml[ref_start..ref_end];
+    const colon = std.mem.indexOfScalar(u8, ref, ':') orelse return null;
+    const br = ref[colon + 1 ..];
+    if (br.len == 0) return null;
+    // br is the bottom-right corner like "Z100". Find the digit
+    // suffix (where the row number lives).
+    var digit_start: usize = br.len;
+    while (digit_start > 0 and br[digit_start - 1] >= '0' and br[digit_start - 1] <= '9') {
+        digit_start -= 1;
+    }
+    if (digit_start == br.len or digit_start == 0) return null;
+    const old_row = std.fmt.parseInt(u32, br[digit_start..], 10) catch return null;
+    if (new_max_row <= old_row) return null;
+
+    // Splice in the new row digits.
+    const digits_abs_start = ref_start + colon + 1 + digit_start;
+    const digits_abs_end = ref_end;
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, xml[0..digits_abs_start]);
+    try std.fmt.format(out.writer(allocator), "{d}", .{new_max_row});
+    try out.appendSlice(allocator, xml[digits_abs_end..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+fn renderCellOoxml(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    cell: Cell,
+    row_idx: u32,
+    col_idx: u32,
+) !void {
+    switch (cell) {
+        .empty => return, // skip — empty cells emit nothing
+        .integer => |x| {
+            var col_buf: [8]u8 = undefined;
+            const col = colLetterEditor(&col_buf, col_idx);
+            try out.appendSlice(allocator, "<c r=\"");
+            try out.appendSlice(allocator, col);
+            try std.fmt.format(out.writer(allocator), "{d}", .{row_idx});
+            try out.appendSlice(allocator, "\"><v>");
+            try std.fmt.format(out.writer(allocator), "{d}", .{x});
+            try out.appendSlice(allocator, "</v></c>");
+        },
+        .number => |f| {
+            var col_buf: [8]u8 = undefined;
+            const col = colLetterEditor(&col_buf, col_idx);
+            try out.appendSlice(allocator, "<c r=\"");
+            try out.appendSlice(allocator, col);
+            try std.fmt.format(out.writer(allocator), "{d}", .{row_idx});
+            try out.appendSlice(allocator, "\"><v>");
+            try std.fmt.format(out.writer(allocator), "{d}", .{f});
+            try out.appendSlice(allocator, "</v></c>");
+        },
+        .boolean => |b| {
+            var col_buf: [8]u8 = undefined;
+            const col = colLetterEditor(&col_buf, col_idx);
+            try out.appendSlice(allocator, "<c r=\"");
+            try out.appendSlice(allocator, col);
+            try std.fmt.format(out.writer(allocator), "{d}", .{row_idx});
+            try out.appendSlice(allocator, "\" t=\"b\"><v>");
+            try out.appendSlice(allocator, if (b) "1" else "0");
+            try out.appendSlice(allocator, "</v></c>");
+        },
+        .string => unreachable, // appendRows rejects strings in iter-lms-2
+    }
+}
+
+/// Render `col_idx` (0-based) as A, B, ..., Z, AA, AB, ... into `buf`.
+/// Capacity 8 is more than enough (Excel max is XFD = 3 letters).
+fn colLetterEditor(buf: []u8, col_idx: u32) []u8 {
+    var n: u32 = col_idx + 1;
+    var i: usize = 0;
+    while (n > 0) {
+        const r = (n - 1) % 26;
+        buf[i] = 'A' + @as(u8, @intCast(r));
+        i += 1;
+        n = (n - 1) / 26;
+    }
+    std.mem.reverse(u8, buf[0..i]);
+    return buf[0..i];
+}
 
 // ─── zip → buffer ────────────────────────────────────────────────────
 
@@ -5079,6 +5724,82 @@ test "Editor: raw-ZIP scanner builds entry table (iter-lms-1b)" {
     // EOCD-comment is empty for zlsx-written files (the writer
     // doesn't set a comment).
     try std.testing.expectEqual(@as(usize, 0), ed.eocd_comment.len);
+}
+
+test "Editor: appendRows + save round-trips through reader (iter-lms-2)" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_editor_append_src.xlsx";
+    const dst_path = "/tmp/zlsx_editor_append_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+
+    // Source workbook: 2 rows.
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Data");
+        try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 10 } });
+        try s.writeRow(&.{ .{ .integer = 2 }, .{ .integer = 20 } });
+        try w.save(src_path);
+    }
+
+    // Append two more rows via Editor.
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        const append_rows = [_][]const Cell{
+            &.{ .{ .integer = 3 }, .{ .integer = 30 } },
+            &.{ .{ .integer = 4 }, .{ .integer = 40 } },
+        };
+        try ed.appendRows(0, &append_rows);
+        try ed.save(dst_path);
+    }
+
+    // Read back via Book — confirm 4 rows total, original cells intact,
+    // new cells at the expected indices.
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+
+    const r1 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 1), r1[0].integer);
+    try std.testing.expectEqual(@as(i64, 10), r1[1].integer);
+
+    const r2 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 2), r2[0].integer);
+    try std.testing.expectEqual(@as(i64, 20), r2[1].integer);
+
+    const r3 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 3), r3[0].integer);
+    try std.testing.expectEqual(@as(i64, 30), r3[1].integer);
+
+    const r4 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 4), r4[0].integer);
+    try std.testing.expectEqual(@as(i64, 40), r4[1].integer);
+
+    try std.testing.expectEqual(@as(?[]const Cell, null), try rows.next());
+}
+
+test "Editor: appendRows rejects string cells in iter-lms-2" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_editor_append_reject.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+
+    const bad_rows = [_][]const Cell{&.{ .{ .integer = 2 }, .{ .string = "hello" } }};
+    try std.testing.expectError(error.SstAppendNotYetSupported, ed.appendRows(0, &bad_rows));
+    try std.testing.expectError(error.SheetIndexOutOfRange, ed.appendRows(99, &bad_rows));
 }
 
 test "Rows.parseDate: auto-convert date-styled cells through the reader" {

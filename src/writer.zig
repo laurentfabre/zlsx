@@ -48,7 +48,7 @@ const Allocator = std.mem.Allocator;
 /// * `2^53 + 1` does not (54 significant bits).
 /// * `2^54`, `3 * 2^52`, `2^62`, etc. all fit — magnitude is irrelevant,
 ///   only the count of bits after stripping trailing zeros matters.
-fn fitsExactlyInF64(n: i64) bool {
+pub fn fitsExactlyInF64(n: i64) bool {
     if (n == 0) return true;
     // Take absolute value as u64 so std.math.minInt(i64) = -2^63 is
     // representable (it flips to 2^63 which fits in u64 unchanged).
@@ -2882,8 +2882,9 @@ fn emitDynamicBlock(
 
 /// Compress `input` as a single final dynamic-huffman deflate stream.
 /// Caller ensures `input.len > 0` (empty inputs bypass compression
-/// upstream).
-fn deflateCompress(alloc: Allocator, input: []const u8, out: *std.ArrayListUnmanaged(u8)) !void {
+/// upstream). Exposed publicly so `xlsx.Editor` can recompress
+/// substituted entries.
+pub fn deflateCompress(alloc: Allocator, input: []const u8, out: *std.ArrayListUnmanaged(u8)) !void {
     std.debug.assert(input.len > 0);
 
     var tokens: std.ArrayListUnmanaged(DeflateToken) = .{};
