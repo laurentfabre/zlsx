@@ -39,6 +39,10 @@ const Subcommand = enum {
     hyperlinks,
     styles,
     sst,
+    /// iter-lms-4 follow-up: append rows from stdin (NDJSON, one
+    /// JSON array per row) to a sheet of an existing xlsx and save
+    /// to `--out`. Requires `--sheet N` and `--out PATH`.
+    append_rows,
 };
 
 /// iter60b: `--output` wire-shape switch.
@@ -131,6 +135,10 @@ const Args = struct {
     /// iter60b: wire-shape switch. See OutputMode doc for per-mode
     /// semantics and the sub-command scoping matrix.
     output: OutputMode = .ndjson,
+    /// iter-lms-4 follow-up: target file for the `append-rows`
+    /// sub-command. Required for `append-rows`, ignored / rejected
+    /// elsewhere. Set via `--out PATH`.
+    out_path: ?[]const u8 = null,
     /// iter-sst-4: opt into the lazy SST backend (`Book.openSstLazy`).
     /// Workbooks with millions of unique strings skip the eager
     /// decode arena; resolution happens on first cell access. See
@@ -171,7 +179,8 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
             std.mem.eql(u8, a, "--end-row") or
             std.mem.eql(u8, a, "--range") or
             std.mem.eql(u8, a, "--sheet-glob") or
-            std.mem.eql(u8, a, "--output"))
+            std.mem.eql(u8, a, "--output") or
+            std.mem.eql(u8, a, "--out"))
         {
             i += 1; // skip paired value (bounds-checked by caller)
             continue;
@@ -179,6 +188,7 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
         if (a.len > 0 and a[0] == '-') continue; // flag with no value
         if (std.mem.eql(u8, a, "cells")) return .cells;
         if (std.mem.eql(u8, a, "rows")) return .rows;
+        if (std.mem.eql(u8, a, "append-rows")) return .append_rows;
         if (std.mem.eql(u8, a, "meta")) return .meta;
         if (std.mem.eql(u8, a, "list-sheets")) return .list_sheets;
         if (std.mem.eql(u8, a, "comments")) return .comments;
@@ -210,7 +220,7 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
         .styles,
         .sst,
         => true,
-        .rows, .cells, .comments, .validations, .hyperlinks => false,
+        .rows, .cells, .comments, .validations, .hyperlinks, .append_rows => false,
     };
 
     var out: Args = .{ .file = "", .subcommand = detected_sub };
@@ -231,6 +241,10 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
             out.with_styles = true;
         } else if (std.mem.eql(u8, a, "--sst-lazy")) {
             out.sst_lazy = true;
+        } else if (std.mem.eql(u8, a, "--out")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            out.out_path = argv[i];
         } else if (std.mem.eql(u8, a, "--sheet")) {
             if (!workbook_scoped and (out.sheet_name != null or out.all_sheets or out.sheet_glob != null))
                 return ArgError.SheetArgConflict;
@@ -364,7 +378,8 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
                     std.mem.eql(u8, a, "validations") or
                     std.mem.eql(u8, a, "hyperlinks") or
                     std.mem.eql(u8, a, "styles") or
-                    std.mem.eql(u8, a, "sst"))
+                    std.mem.eql(u8, a, "sst") or
+                    std.mem.eql(u8, a, "append-rows"))
                 {
                     continue;
                 }
@@ -383,7 +398,7 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     if (out.start_row != null or out.end_row != null) {
         switch (detected_sub) {
             .rows, .cells, .comments => {},
-            .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst => {
+            .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows => {
                 return ArgError.BadArgValue;
             },
         }
@@ -395,7 +410,7 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     if (out.range != null) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst => {
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows => {
                 return ArgError.BadArgValue;
             },
         }
@@ -427,7 +442,7 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     if (out.include_blanks) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst => {
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows => {
                 return ArgError.BadArgValue;
             },
         }
@@ -436,7 +451,7 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     if (out.with_styles) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst => {
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows => {
                 return ArgError.BadArgValue;
             },
         }
@@ -1426,6 +1441,13 @@ fn runMain() !u8 {
         try err.flush();
     }
 
+    // iter-lms-4 follow-up: append-rows uses Editor (mutates the
+    // archive) instead of Book (read-only), so dispatch BEFORE the
+    // Book open. Returns its own exit code.
+    if (args.subcommand == .append_rows) {
+        return try runAppendRowsCommand(alloc, args, err);
+    }
+
     // iter-sst-4: dispatch on --sst-lazy.
     var book = if (args.sst_lazy)
         xlsx.Book.openSstLazy(alloc, args.file) catch |e| {
@@ -1506,6 +1528,7 @@ fn runMain() !u8 {
             try runSstCommand(out, &book, args.skip, args.take);
             return 0;
         },
+        .append_rows => unreachable, // dispatched before the Book open
         .rows, .cells => {},
     }
 
@@ -1548,6 +1571,7 @@ fn runMain() !u8 {
         .hyperlinks,
         .styles,
         .sst,
+        .append_rows,
         => unreachable,
     }
     return 0;
@@ -3142,6 +3166,126 @@ fn runSstCommand(
         try out.writeAll("}\n");
     }
     try out.flush();
+}
+
+// ─── append-rows (load-modify-save CLI surface, iter-lms-4 follow-up) ──
+
+/// Read NDJSON rows from stdin, append to a sheet of `args.file`,
+/// save to `args.out_path`. Each line is a JSON array; each cell is
+/// `null` (empty), `true`/`false` (bool), a number (int / float), or
+/// a string. Empty lines are skipped. Returns 0 on success, 1 on
+/// argument error, 2 on Editor open failure, 3 on per-line parse
+/// errors, 5 on save failure.
+fn runAppendRowsCommand(
+    alloc: std.mem.Allocator,
+    args: Args,
+    err: *std.Io.Writer,
+) !u8 {
+    const out_path = args.out_path orelse {
+        try err.writeAll("zlsx: append-rows requires --out PATH\n");
+        try err.flush();
+        return 1;
+    };
+    const sheet_idx_opt = args.sheet_index;
+    if (sheet_idx_opt == null) {
+        try err.writeAll("zlsx: append-rows requires --sheet N (0-based)\n");
+        try err.flush();
+        return 1;
+    }
+    const sheet_idx: u32 = @intCast(sheet_idx_opt.?);
+
+    var ed = xlsx.Editor.open(alloc, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    defer ed.deinit();
+
+    // Slurp stdin once. NDJSON volumes for append are typically
+    // bounded (audit logs, ETL deltas); refuse > 256 MiB to keep
+    // pathological inputs from OOM-ing the process.
+    const stdin = std.fs.File.stdin();
+    var stdin_buf: [8192]u8 = undefined;
+    var stdin_reader = stdin.reader(&stdin_buf);
+    const all_input = stdin_reader.interface.allocRemaining(alloc, .limited(256 * 1024 * 1024)) catch |e| {
+        try err.print("zlsx: failed to read stdin: {s}\n", .{@errorName(e)});
+        try err.flush();
+        return 1;
+    };
+    defer alloc.free(all_input);
+
+    var line_no: usize = 0;
+    var i: usize = 0;
+    while (i < all_input.len) {
+        line_no += 1;
+        const nl = std.mem.indexOfScalarPos(u8, all_input, i, '\n') orelse all_input.len;
+        var line = all_input[i..nl];
+        // Trim trailing CR (Windows line endings).
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        i = nl + 1;
+        if (line.len == 0) continue;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch |e| {
+            try err.print("zlsx: line {d}: invalid JSON: {s}\n", .{ line_no, @errorName(e) });
+            try err.flush();
+            return 3;
+        };
+        defer parsed.deinit();
+        const root = parsed.value;
+        if (root != .array) {
+            try err.print("zlsx: line {d}: expected JSON array\n", .{line_no});
+            try err.flush();
+            return 3;
+        }
+
+        const cells = try alloc.alloc(xlsx.Cell, root.array.items.len);
+        defer alloc.free(cells);
+        for (root.array.items, 0..) |v, ci| {
+            cells[ci] = jsonValueToCell(v) catch |e| {
+                try err.print(
+                    "zlsx: line {d}, cell {d}: {s}\n",
+                    .{ line_no, ci + 1, @errorName(e) },
+                );
+                try err.flush();
+                return 3;
+            };
+        }
+        const single_row: [1][]const xlsx.Cell = .{cells};
+        ed.appendRows(sheet_idx, &single_row) catch |e| {
+            try err.print("zlsx: line {d}: appendRows: {s}\n", .{ line_no, @errorName(e) });
+            try err.flush();
+            return 3;
+        };
+    }
+
+    ed.save(out_path) catch |e| {
+        try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
+        try err.flush();
+        return 5;
+    };
+    return 0;
+}
+
+fn jsonValueToCell(v: std.json.Value) !xlsx.Cell {
+    return switch (v) {
+        .null => .{ .empty = {} },
+        .bool => |b| .{ .boolean = b },
+        .integer => |n| .{ .integer = n },
+        .float => |f| .{ .number = f },
+        .number_string => |s| blk: {
+            // std.json hands integers > i64 as `number_string`. Try
+            // parseInt first (so "9007199254740993" still routes to
+            // the precision check), fall back to f64.
+            if (std.fmt.parseInt(i64, s, 10)) |n| {
+                break :blk .{ .integer = n };
+            } else |_| {
+                const f = std.fmt.parseFloat(f64, s) catch return error.UnsupportedJsonNumber;
+                break :blk .{ .number = f };
+            }
+        },
+        .string => |s| .{ .string = s },
+        .array, .object => return error.UnsupportedJsonType,
+    };
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
