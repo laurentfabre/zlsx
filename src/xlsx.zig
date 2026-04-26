@@ -5051,10 +5051,13 @@ fn buildEntryFromXml(
 ) !SubstitutedEntry {
     defer allocator.free(new_xml);
 
-    // `>=` rather than `>`: 0xFFFFFFFF / 0xFFFF are ZIP32 sentinel
-    // values that the reader treats as ZIP64-extension markers.
+    // `>=` for size fields: 0xFFFFFFFF is the ZIP64 sentinel that
+    // Book.open interprets as "look at extras", so emitting it
+    // would produce a self-incompatible archive. The filename
+    // length field is a plain u16 with no sentinel meaning, so
+    // 0xFFFF is a legal maximum there.
     if (new_xml.len >= std.math.maxInt(u32)) return error.Zip64NotSupported;
-    if (filename.len >= std.math.maxInt(u16)) return error.FilenameTooLong;
+    if (filename.len > std.math.maxInt(u16)) return error.FilenameTooLong;
 
     var compressed: std.ArrayListUnmanaged(u8) = .{};
     defer compressed.deinit(allocator);
