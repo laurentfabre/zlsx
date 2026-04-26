@@ -149,6 +149,217 @@ test "World Bank Data Catalog — heavy SST (1144 entries, 143 KB)" {
     try std.testing.expect(total >= 100 and total <= 500);
 }
 
+// ─── Large fixtures (group 2) — fetched, not committed ────────────
+// Tests skip cleanly when the file is missing. Each one targets a
+// specific stress dimension the small base corpus can't reach.
+
+test "WDI Excel — 401k rows × 6 sheets, r-less <c> cells" {
+    // The World Bank's WDI exporter emits `<row><c t="s"><v>N</v></c>…`
+    // with no `r=` on either tag. This is spec-legal but unusual; before
+    // the implicit-column fix, every cell tripped MalformedXml. Pin the
+    // row count + sheet count so a regression in the fallback path
+    // re-fails the suite.
+    const alloc = std.testing.allocator;
+    var book = try openOrSkip(alloc, "wdi_excel.xlsx");
+    defer book.deinit();
+
+    try std.testing.expect(book.sheets.len >= 6);
+    try std.testing.expect(book.sharedStringsCount() >= 200_000);
+
+    const sheet = book.sheets[0];
+    const n = try rowCount(&book, sheet, alloc);
+    // Sheet1 declares dimension A1:BQ401395; tolerate updates.
+    try std.testing.expect(n >= 100_000);
+}
+
+test "ECDC COVID — 49k single-sheet rows, modest SST" {
+    const alloc = std.testing.allocator;
+    var book = try openOrSkip(alloc, "ecdc_covid.xlsx");
+    defer book.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
+    const sheet = book.sheets[0];
+    const n = try rowCount(&book, sheet, alloc);
+    try std.testing.expect(n >= 40_000);
+}
+
+test "ONS CPI detailed — 41-sheet workbook" {
+    const alloc = std.testing.allocator;
+    var book = try openOrSkip(alloc, "ons_cpi_detailed.xlsx");
+    defer book.deinit();
+    // 1 contents + 40 numbered tables; tolerate ±2 around the publication.
+    try std.testing.expect(book.sheets.len >= 35 and book.sheets.len <= 45);
+}
+
+test "POI 57893 many-merges — 50k mergeCells" {
+    const alloc = std.testing.allocator;
+    var book = try openOrSkip(alloc, "poi_57893_many_merges.xlsx");
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
+    const merged = book.mergedRanges(book.sheets[0]);
+    try std.testing.expect(merged.len >= 50_000);
+}
+
+test "POI 58325_db — self-closing <row/> elements" {
+    // Sheet1 has 4 rows, three of which are `<row r="N" ht="..."/>`
+    // (style/height-only, no cells). Before the self-closing fix the
+    // row iterator went off the rails on the first such row.
+    const alloc = std.testing.allocator;
+    var book = try openOrSkip(alloc, "poi_58325_db.xlsx");
+    defer book.deinit();
+    const n = try rowCount(&book, book.sheets[0], alloc);
+    try std.testing.expectEqual(@as(usize, 4), n);
+}
+
+test "openxlsx loadExample — 4 sheets including pivot/slicer" {
+    const alloc = std.testing.allocator;
+    var book = try openOrSkip(alloc, "openxlsx_loadExample.xlsx");
+    defer book.deinit();
+    try std.testing.expect(book.sheets.len >= 4);
+}
+
+// ─── Adversarial fixtures (group 3) — fetched + locally derived ───
+// Each test captures the *current* zlsx behavior. "Cleanly errored"
+// = typed error returned, no panic, no hang. "Permissively read"
+// = open succeeds, downstream API returns sane values (no OOM, no
+// false-positive parse).
+
+test "adversarial: truncated ZIPs error cleanly" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        "derived_truncated_pre_eocd.xlsx",
+        "derived_truncated_mid_payload.xlsx",
+        "derived_truncated_signature.xlsx",
+        "poi_crash_274d6342.xlsx",
+        "poi_crash_9bf3cd4b.xlsx",
+        "poi_xlsx_corrupted.xlsx", // permissive open ok
+    };
+    for (cases) |name| {
+        var path_buf: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}{s}", .{ corpus_dir, name });
+        if (std.fs.cwd().access(path, .{})) |_| {} else |_| continue;
+        // Whether open returns an error or succeeds is fixture-dependent;
+        // the contract is "no crash / no hang / no UB". We only assert
+        // we get *some* result back without panicking.
+        if (xlsx.Book.open(alloc, path)) |book_const| {
+            var book = book_const;
+            defer book.deinit();
+        } else |_| {}
+    }
+}
+
+test "adversarial: bare ZIPs (not xlsx) error with a typed reason" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        "ziprs_invalid_offset.zip",
+        "ziprs_invalid_cde_files_greater.zip",
+        "ziprs_aes_archive.zip",
+        "ziprs_data_descriptor.zip",
+        "ziprs_comment_garbage.zip",
+        "ziprs_extended_timestamp_bad.zip",
+        "ziprs_misaligned_comment.zip",
+        "wdi_excel.zip",
+    };
+    for (cases) |name| {
+        var path_buf: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}{s}", .{ corpus_dir, name });
+        if (std.fs.cwd().access(path, .{})) |_| {} else |_| continue;
+        // Bare ZIPs must NOT parse as xlsx. They either fail at the ZIP
+        // layer (BadZip) or at the missing-workbook step
+        // (MissingWorkbook). Anything else means the reader silently
+        // accepted a non-xlsx archive, which is a real defect.
+        const result = xlsx.Book.open(alloc, path);
+        if (result) |book_const| {
+            var book = book_const;
+            defer book.deinit();
+            std.debug.print("\n  [unexpected] {s} opened as xlsx — expected error\n", .{name});
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+}
+
+test "adversarial: MalformedSSTCount — declared count clamped to actual" {
+    // The SST is declared as `count="8876876876876"` but contains 8
+    // entries. zlsx must NOT trust the attribute (would over-allocate
+    // and crash); it must walk the actual <si> elements. Real count = 8.
+    const alloc = std.testing.allocator;
+    var book = try openOrSkip(alloc, "poi_MalformedSSTCount.xlsx");
+    defer book.deinit();
+    try std.testing.expect(book.sharedStringsCount() < 100);
+}
+
+test "adversarial: shared-strings amplification PoC opens without OOM" {
+    // POI's poc-shared-strings.xlsx is a billion-laughs-style PoC with
+    // a single huge <si> blob. Opening must complete in bounded memory
+    // (no exponential expansion) and the row iterator must not fault.
+    const alloc = std.testing.allocator;
+    var book = try openOrSkip(alloc, "poi_poc_shared_strings.xlsx");
+    defer book.deinit();
+    // 1 SST entry (the giant one); 4000 rows referencing it.
+    try std.testing.expect(book.sharedStringsCount() < 1000);
+    const n = try rowCount(&book, book.sheets[0], alloc);
+    try std.testing.expect(n >= 1000);
+}
+
+test "adversarial: encrypted xlsx — opens permissively, no crash" {
+    // POI's workbookProtection-workbook_password-2013.xlsx is encrypted
+    // at the OLE-CFB layer. zlsx isn't an OLE reader, so it'll read
+    // whatever ZIP happens to be inside (typically a small placeholder
+    // workbook). Goal: no panic, no UB. v1 doesn't surface a typed
+    // "encrypted" error — that's a follow-up.
+    const alloc = std.testing.allocator;
+    var book = try openOrSkip(alloc, "poi_workbook_password_2013.xlsx");
+    defer book.deinit();
+}
+
+test "adversarial: trash entry inside otherwise-valid xlsx" {
+    // POI's Excel_file_with_trash_item.xlsx has an extra ZIP entry
+    // unrelated to the OOXML structure. zlsx ignores unknown entries
+    // and reads the workbook normally.
+    const alloc = std.testing.allocator;
+    var book = try openOrSkip(alloc, "poi_excel_with_trash_item.xlsx");
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
+    const n = try rowCount(&book, book.sheets[0], alloc);
+    try std.testing.expect(n >= 100);
+}
+
+test "adversarial: XXE in [Content_Types].xml — no external fetch" {
+    // POI's xxe_in_schema.xlsx attempts XML external-entity injection.
+    // zlsx must parse with no external resolution (we never call out
+    // to a network or filesystem path). Goal: no panic, no hang.
+    const alloc = std.testing.allocator;
+    var book = try openOrSkip(alloc, "poi_xxe_in_schema.xlsx");
+    defer book.deinit();
+}
+
+test "adversarial: clusterfuzz minimised XSSF input" {
+    const alloc = std.testing.allocator;
+    var book = try openOrSkip(alloc, "poi_clusterfuzz_xssf.xlsx");
+    defer book.deinit();
+    // Whatever the minimised input parses to, opening must not panic.
+}
+
+test "adversarial: calamine fixtures (encoded entities, empty SI, etc.)" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { name: []const u8, min_rows: usize }{
+        .{ .name = "calamine_encoded_entities.xlsx", .min_rows = 1 },
+        .{ .name = "calamine_empty_shared_string.xlsx", .min_rows = 1 },
+        .{ .name = "calamine_empty_s_attribute.xlsx", .min_rows = 1 },
+        .{ .name = "calamine_non_monotonic_si.xlsx", .min_rows = 1 },
+    };
+    for (cases) |c| {
+        var path_buf: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}{s}", .{ corpus_dir, c.name });
+        if (std.fs.cwd().access(path, .{})) |_| {} else |_| continue;
+        var book = try xlsx.Book.open(alloc, path);
+        defer book.deinit();
+        try std.testing.expect(book.sheets.len >= 1);
+        const n = try rowCount(&book, book.sheets[0], alloc);
+        try std.testing.expect(n >= c.min_rows);
+    }
+}
+
 test "corpus surface: iter28-34 reader APIs round-trip on real fixtures" {
     // The per-cell style / font / fill / border / numFmt / rich-runs /
     // comments APIs were added in iter28-34 but their tests use

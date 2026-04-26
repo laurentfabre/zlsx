@@ -1508,6 +1508,14 @@ pub const Rows = struct {
     /// has no usable `r` attribute, so envelope consumers see
     /// 1..N-contiguous row numbers regardless of source sparsity.
     yield_count: u32 = 0,
+    /// Next 0-based column index for a `<c>` element that lacks
+    /// the (spec-optional) `r=` attribute. Reset to 0 at the start
+    /// of every row; on a `<c r="ABC123">` it jumps to that cell's
+    /// column + 1 so subsequent r-less cells continue from there.
+    /// Some Excel exporters (e.g. World Bank's WDI) omit `r=` on
+    /// every cell to save bytes — without this fallback the parser
+    /// would `error.MalformedXml` on the first cell.
+    next_implicit_col: u32 = 0,
 
     pub fn deinit(self: *Rows) void {
         self.arena.deinit();
@@ -1628,6 +1636,7 @@ pub const Rows = struct {
         self.row_error_strings.clearRetainingCapacity();
         self.row_formula_strings.clearRetainingCapacity();
         self.row_formula_refs.clearRetainingCapacity();
+        self.next_implicit_col = 0;
         // NOTE: shared_si_to_base_ref and array_ranges are NOT cleared
         // here — both kinds of formula spread span rows (the base cell
         // at C2 is referenced by slave cells at C3..C10 in subsequent
@@ -1677,6 +1686,12 @@ pub const Rows = struct {
             // If a future workload measurably suffers, build a
             // sorted-input precondition by iterating once first.
             self.pos = row_start.after_open;
+            // Self-closing `<row .../>` (no cells; common in files
+            // with style/height-only rows like POI's 58325_db).
+            // Yield as an empty row — matches what a populated row
+            // with all `.empty` cells would look like.
+            const is_self_closing_row = attrs.len > 0 and attrs[attrs.len - 1] == '/';
+            if (is_self_closing_row) return self.row_cells.items;
             // Consume cells until </row>.
             try self.consumeRow();
             return self.row_cells.items;
@@ -1711,8 +1726,15 @@ pub const Rows = struct {
         const is_self_closing = gt > 0 and self.xml[gt - 1] == '/';
         const attrs = self.xml[self.pos + 2 .. if (is_self_closing) gt - 1 else gt];
 
-        const r_attr = getAttr(attrs, "r") orelse return error.MalformedXml;
-        const col_idx = try columnIndexFromRef(r_attr);
+        // The `r` attribute on `<c>` is optional per the OOXML
+        // spec — absent means "next implicit column" relative to
+        // the row's last referenced cell. Tight-packed exporters
+        // (e.g. World Bank's WDI) omit it on every cell.
+        const col_idx: usize = if (getAttr(attrs, "r")) |r_attr|
+            try columnIndexFromRef(r_attr)
+        else
+            self.next_implicit_col;
+        self.next_implicit_col = std.math.cast(u32, col_idx + 1) orelse return error.MalformedXml;
         const cell_type = getAttr(attrs, "t") orelse "n"; // default numeric
         const style_attr = getAttr(attrs, "s");
         const style_idx: ?u32 = if (style_attr) |s|
