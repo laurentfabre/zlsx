@@ -693,6 +693,13 @@ pub const Book = struct {
     /// `rich_runs_by_sst_idx`, so `Book.richRuns(idx)` returns the
     /// same slice as the eager backend with the same lifetime
     /// contract.
+    ///
+    /// Trade-off: lazy mode defers per-entry plain-text decoding,
+    /// so a malformed `<t>` body inside an `<si>` won't surface at
+    /// `openSstLazy` time — it'll surface as `MalformedXml` from
+    /// `sharedStringAt(idx)` (or, transitively, from a `Rows.next()`
+    /// cell read that resolves to that idx). Callers that need
+    /// "open fails fast on bad SST" should use `Book.open` instead.
     /// Single-threaded contract — the lazy backend mutates internal
     /// state on first-touch. Multi-threaded SST access requires the
     /// caller to serialise externally or to call `Book.open` instead.

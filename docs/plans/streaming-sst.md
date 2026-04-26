@@ -1,8 +1,18 @@
-# Streaming SST plan (v6)
+# Streaming SST plan (v6 — shipped)
 
 > Mitigation for design-doc question Q5: SST in memory for very large
 > workbooks (e.g., 500 MB archives with millions of unique strings)
-> blows RAM on `Book.open`. v0.2.x ships eager-only SST resolution.
+> blows RAM on `Book.open`. v0.2.7 ships the lazy backend behind
+> `Book.openSstLazy(...)` and the CLI's `--sst-lazy` flag.
+
+## Status
+
+- iter-sst-1 (sharedStringAt accessor) — ✅ shipped
+- iter-sst-2 (CLI/C ABI migration to accessor) — ✅ shipped
+- iter-sst-3a (SstBackend tagged-union storage) — ✅ shipped
+- iter-sst-3b (openSstLazy + first-touch materialise) — ✅ shipped
+- iter-sst-4 (CLI `--sst-lazy` flag + docs) — ✅ shipped
+
 
 ## Problem
 

@@ -131,6 +131,15 @@ const Args = struct {
     /// iter60b: wire-shape switch. See OutputMode doc for per-mode
     /// semantics and the sub-command scoping matrix.
     output: OutputMode = .ndjson,
+    /// iter-sst-4: opt into the lazy SST backend (`Book.openSstLazy`).
+    /// Workbooks with millions of unique strings skip the eager
+    /// decode arena; resolution happens on first cell access. See
+    /// docs/plans/streaming-sst.md for the trade-off (sparse access
+    /// wins; full sweeps cost slightly more than eager). Accepted on
+    /// every sub-command for wrapper-friendly setting; ignored by
+    /// `meta` / `list-sheets` / `styles` / `sst` (those are
+    /// workbook-scoped and don't benefit from per-cell laziness).
+    sst_lazy: bool = false,
 };
 
 const ArgError = error{
@@ -220,6 +229,8 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
             out.include_blanks = true;
         } else if (std.mem.eql(u8, a, "--with-styles")) {
             out.with_styles = true;
+        } else if (std.mem.eql(u8, a, "--sst-lazy")) {
+            out.sst_lazy = true;
         } else if (std.mem.eql(u8, a, "--sheet")) {
             if (!workbook_scoped and (out.sheet_name != null or out.all_sheets or out.sheet_glob != null))
                 return ArgError.SheetArgConflict;
@@ -1415,10 +1426,17 @@ fn runMain() !u8 {
         try err.flush();
     }
 
-    var book = xlsx.Book.open(alloc, args.file) catch |e| {
-        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
-        return 2;
-    };
+    // iter-sst-4: dispatch on --sst-lazy.
+    var book = if (args.sst_lazy)
+        xlsx.Book.openSstLazy(alloc, args.file) catch |e| {
+            try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+            return 2;
+        }
+    else
+        xlsx.Book.open(alloc, args.file) catch |e| {
+            try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+            return 2;
+        };
     defer book.deinit();
 
     if (args.list_sheets) {

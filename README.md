@@ -298,6 +298,10 @@ zig build -Doptimize=ReleaseFast
 ```bash
 --include-blanks              # emit t:"blank" records for empty cells
 --with-styles                 # attach terse style: {bold?, italic?, fg?, bg?, nf?, border?}
+--sst-lazy                    # open with Book.openSstLazy — defer SST decode until first cell access
+                              # (huge-workbook RAM mitigation; sparse access wins, full sweeps cost a bit more)
+                              # Trade-off: malformed <t> in the SST surfaces on first access, not at open;
+                              # callers who need open-time validation should drop the flag.
 ```
 
 **Output modes**:
