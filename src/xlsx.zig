@@ -4483,20 +4483,62 @@ pub const Editor = struct {
             }
         }.lessThan);
 
-        var written: u32 = 0;
+        // Pre-validate that the rewritten archive stays within ZIP32
+        // bounds. Source size is already <= 4 GiB (Editor.open caps),
+        // but substitutions + appendix entries can push the total over.
+        // Without this guard the `@intCast(u32, ...)` writes below
+        // would trap (safe builds) or silently truncate offsets
+        // (release builds), producing an unreadable archive.
+        // Bail with a clear `Zip64NotSupported` instead.
+        const max_u32: u64 = std.math.maxInt(u32);
+        var planned_total: u64 = 0;
         for (lfh_sorted) |i| {
-            new_lfh_offsets[i] = written;
+            if (subs[i]) |s| {
+                planned_total += @as(u64, s.lfh.len) + @as(u64, s.payload.len);
+            } else {
+                const e = self.entries[i];
+                planned_total += @as(u64, e.lfh_total_len) + @as(u64, e.payload_len);
+            }
+        }
+        for (extra_entries.items) |e| {
+            planned_total += @as(u64, e.lfh.len) + @as(u64, e.payload.len);
+        }
+        const planned_cd_offset = planned_total;
+        for (self.entries, 0..) |entry, i| {
+            if (subs[i]) |s| {
+                planned_total += @as(u64, s.cdfh.len);
+            } else {
+                planned_total += @as(u64, entry.cdfh_total_len);
+            }
+        }
+        for (extra_entries.items) |e| planned_total += @as(u64, e.cdfh.len);
+        const planned_cd_size = planned_total - planned_cd_offset;
+        const planned_archive_size = planned_total +
+            @as(u64, @sizeOf(std.zip.EndRecord)) +
+            @as(u64, self.eocd_comment.len);
+        const planned_entries = self.entries.len + extra_entries.items.len;
+        if (planned_cd_offset > max_u32 or
+            planned_cd_size > max_u32 or
+            planned_archive_size > max_u32 or
+            planned_entries > std.math.maxInt(u16))
+        {
+            return error.Zip64NotSupported;
+        }
+
+        var written: u64 = 0;
+        for (lfh_sorted) |i| {
+            new_lfh_offsets[i] = @intCast(written);
             if (subs[i]) |s| {
                 try w.writeAll(s.lfh);
                 try w.writeAll(s.payload);
-                written += @intCast(s.lfh.len + s.payload.len);
+                written += @as(u64, s.lfh.len) + @as(u64, s.payload.len);
             } else {
                 const e = self.entries[i];
                 const lfh_bytes = self.src_buf[e.lfh_offset .. e.lfh_offset + e.lfh_total_len];
                 try w.writeAll(lfh_bytes);
                 const payload_bytes = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
                 try w.writeAll(payload_bytes);
-                written += e.lfh_total_len + e.payload_len;
+                written += @as(u64, e.lfh_total_len) + @as(u64, e.payload_len);
             }
         }
 
@@ -4505,13 +4547,13 @@ pub const Editor = struct {
         const extra_lfh_offsets = try self.allocator.alloc(u32, extra_entries.items.len);
         defer self.allocator.free(extra_lfh_offsets);
         for (extra_entries.items, 0..) |e, ei| {
-            extra_lfh_offsets[ei] = written;
+            extra_lfh_offsets[ei] = @intCast(written);
             try w.writeAll(e.lfh);
             try w.writeAll(e.payload);
-            written += @intCast(e.lfh.len + e.payload.len);
+            written += @as(u64, e.lfh.len) + @as(u64, e.payload.len);
         }
 
-        const new_cd_offset: u32 = written;
+        const new_cd_offset: u32 = @intCast(written);
         for (self.entries, 0..) |entry, i| {
             if (subs[i]) |s| {
                 // Substituted: emit a fresh CDFH (header + filename
@@ -4522,7 +4564,7 @@ pub const Editor = struct {
                 const lfh_field_pos = @sizeOf(std.zip.CentralDirectoryFileHeader) - 4;
                 std.mem.writeInt(u32, cdfh_copy[lfh_field_pos..][0..4], new_lfh_offsets[i], .little);
                 try w.writeAll(cdfh_copy);
-                written += @intCast(cdfh_copy.len);
+                written += @as(u64, cdfh_copy.len);
             } else {
                 // Pass-through: copy CDFH from src_buf, patch the LFH
                 // offset (final u32 of the fixed-size header).
@@ -4535,7 +4577,7 @@ pub const Editor = struct {
                 const var_off = entry.cdfh_offset + cdfh_bytes.len;
                 const var_len = entry.cdfh_total_len - cdfh_bytes.len;
                 try w.writeAll(self.src_buf[var_off .. var_off + var_len]);
-                written += entry.cdfh_total_len;
+                written += @as(u64, entry.cdfh_total_len);
             }
         }
         // Emit appendix CDFHs after the source-entry CDFHs.
@@ -4545,9 +4587,9 @@ pub const Editor = struct {
             const lfh_field_pos = @sizeOf(std.zip.CentralDirectoryFileHeader) - 4;
             std.mem.writeInt(u32, cdfh_copy[lfh_field_pos..][0..4], extra_lfh_offsets[ei], .little);
             try w.writeAll(cdfh_copy);
-            written += @intCast(cdfh_copy.len);
+            written += @as(u64, cdfh_copy.len);
         }
-        const new_cd_size: u32 = written - new_cd_offset;
+        const new_cd_size: u32 = @intCast(written - new_cd_offset);
 
         const total_entries = self.entries.len + extra_entries.items.len;
         var eocd_out: std.zip.EndRecord = .{
@@ -4971,6 +5013,9 @@ fn buildEntryFromXml(
 ) !SubstitutedEntry {
     defer allocator.free(new_xml);
 
+    if (new_xml.len > std.math.maxInt(u32)) return error.Zip64NotSupported;
+    if (filename.len > std.math.maxInt(u16)) return error.FilenameTooLong;
+
     var compressed: std.ArrayListUnmanaged(u8) = .{};
     defer compressed.deinit(allocator);
     var compression_method: u16 = 8;
@@ -4986,6 +5031,7 @@ fn buildEntryFromXml(
             try compressed.appendSlice(allocator, new_xml);
         }
     }
+    if (compressed.items.len > std.math.maxInt(u32)) return error.Zip64NotSupported;
 
     const crc = std.hash.Crc32.hash(new_xml);
     // `filename` is now the function parameter; no need to read

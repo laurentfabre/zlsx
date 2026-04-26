@@ -255,8 +255,13 @@ doesn't compose with passthrough-existing-zip.
   - **Data descriptors** (GP flag bit 3): captured in the
     raw scanner. Test corpus must include an Excel-written
     file (Excel sometimes uses these).
-  - **ZIP64**: archives > 4 GB. Out of scope for v1; document
-    the limit and refuse with a clear error.
+  - **ZIP64**: archives > 4 GB. Out of scope for v1.
+    `Editor.open` rejects oversized source files with
+    `error.ZipTooLarge`. `Editor.save` also pre-validates the
+    *rewritten* archive — appended rows + a fresh SST can in
+    principle push a near-4 GiB source over the line; we bail
+    with `error.Zip64NotSupported` instead of silently
+    truncating offsets into a corrupt output.
   - **Encrypted entries**: refuse to open.
   - **Non-canonical EOCD**: archive-level comment is preserved
     verbatim. Spans validated with the central-directory
