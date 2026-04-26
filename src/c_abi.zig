@@ -1145,23 +1145,28 @@ export fn zlsx_matrix_open(
         writeError(err_buf, err_buf_len, "SheetIndexOutOfRange");
         return null;
     }
+    // matrixOpenInner returns ![*]u8 instead of `?*Matrix` so its
+    // own errdefers actually fire. The C ABI wrapper translates the
+    // error into a NULL return + writeError. (errdefer never fires
+    // on a `?T null` return path, only on `!T` error paths — Codex
+    // round-2 correctly flagged that the previous shape leaked the
+    // BookState refcount and per-iter resources on partial failure.)
+    const ms = matrixOpenInner(state, sheet_idx) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return null;
+    };
+    return @ptrCast(ms);
+}
+
+fn matrixOpenInner(state: *BookState, sheet_idx: u32) !*MatrixState {
     _ = state.refcount.fetchAdd(1, .acq_rel);
     errdefer state.unref();
 
     const sheet = state.inner.sheets[sheet_idx];
-    var iter = state.inner.rows(sheet, gpa) catch |e| {
-        writeError(err_buf, err_buf_len, @errorName(e));
-        state.unref();
-        return null;
-    };
+    var iter = try state.inner.rows(sheet, gpa);
     errdefer iter.deinit();
 
-    const ms = gpa.create(MatrixState) catch {
-        iter.deinit();
-        writeError(err_buf, err_buf_len, "OutOfMemory");
-        state.unref();
-        return null;
-    };
+    const ms = try gpa.create(MatrixState);
     errdefer gpa.destroy(ms);
     ms.* = .{
         .book = state,
@@ -1174,19 +1179,10 @@ export fn zlsx_matrix_open(
     errdefer ms.offsets.deinit(gpa);
 
     const string_alloc = ms.string_arena.allocator();
-    ms.offsets.append(gpa, 0) catch {
-        writeError(err_buf, err_buf_len, "OutOfMemory");
-        return null;
-    };
+    try ms.offsets.append(gpa, 0);
 
-    while (iter.next() catch |e| {
-        writeError(err_buf, err_buf_len, @errorName(e));
-        return null;
-    }) |row| {
-        ms.flat_cells.ensureUnusedCapacity(gpa, row.len) catch {
-            writeError(err_buf, err_buf_len, "OutOfMemory");
-            return null;
-        };
+    while (try iter.next()) |row| {
+        try ms.flat_cells.ensureUnusedCapacity(gpa, row.len);
         for (row) |c| {
             // Strings may borrow row-arena memory that resets on the
             // next iter.next(); dupe defensively into matrix-owned
@@ -1194,25 +1190,16 @@ export fn zlsx_matrix_open(
             // is bounded and avoids leaking ownership concerns
             // through the FFI layer.
             const out_c = switch (c) {
-                .string => |s| blk: {
-                    const owned = string_alloc.dupe(u8, s) catch {
-                        writeError(err_buf, err_buf_len, "OutOfMemory");
-                        return null;
-                    };
-                    break :blk toCCell(.{ .string = owned });
-                },
+                .string => |s| toCCell(.{ .string = try string_alloc.dupe(u8, s) }),
                 else => toCCell(c),
             };
             ms.flat_cells.appendAssumeCapacity(out_c);
         }
-        ms.offsets.append(gpa, ms.flat_cells.items.len) catch {
-            writeError(err_buf, err_buf_len, "OutOfMemory");
-            return null;
-        };
+        try ms.offsets.append(gpa, ms.flat_cells.items.len);
     }
 
     iter.deinit();
-    return @ptrCast(ms);
+    return ms;
 }
 
 /// Close and free a Matrix handle. Drops the reference on the
