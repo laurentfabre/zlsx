@@ -94,6 +94,7 @@ CELL_BOOLEAN = 4
 cell_ptr = ctypes.POINTER(Cell)
 book_handle = ctypes.c_void_p
 rows_handle = ctypes.c_void_p
+matrix_handle = ctypes.c_void_p
 writer_handle = ctypes.c_void_p
 sheet_writer_handle = ctypes.c_void_p
 editor_handle = ctypes.c_void_p
@@ -153,6 +154,29 @@ lib.zlsx_rows_next.argtypes = [
     ctypes.c_size_t,
 ]
 lib.zlsx_rows_next.restype = ctypes.c_int32
+
+# ─── Matrix exports (v0.2.8+, bulk-FFI for sheet-at-a-time reads) ─────
+
+_HAS_MATRIX = hasattr(lib, "zlsx_matrix_open")
+if _HAS_MATRIX:
+    lib.zlsx_matrix_open.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_matrix_open.restype = matrix_handle
+
+    lib.zlsx_matrix_close.argtypes = [matrix_handle]
+    lib.zlsx_matrix_close.restype = None
+
+    lib.zlsx_matrix_data.argtypes = [
+        matrix_handle,
+        ctypes.POINTER(cell_ptr),
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_size_t)),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.zlsx_matrix_data.restype = None
 
 # ─── Writer exports (v0.2.2+) ─────────────────────────────────────────
 

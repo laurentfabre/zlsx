@@ -68,6 +68,14 @@ pub const Book = extern struct { _opaque: u8 };
 
 pub const Rows = extern struct { _opaque: u8 };
 
+/// Opaque matrix handle — bulk-materialised view of one sheet, intended
+/// for FFI consumers (Python, Node, etc.) that pay per-call dispatch
+/// cost on the per-row `zlsx_rows_next` loop. One `zlsx_matrix_open`
+/// drains the whole sheet into a packed `CCell[]` plus a row-offsets
+/// array; the consumer iterates the buffer in-language with zero
+/// further FFI calls until `zlsx_matrix_close`.
+pub const Matrix = extern struct { _opaque: u8 };
+
 /// Opaque editor handle. Created by `zlsx_editor_open`, freed by
 /// `zlsx_editor_close`. Backed by an `xlsx.Editor` plus the heap
 /// allocation that owns its source buffer + entry table.
@@ -99,6 +107,15 @@ const RowsState = struct {
     // Per-row C-cell scratch, translated from the Zig cell list on each
     // `next()` call. Lives until the next call (or close).
     c_cells: std.ArrayListUnmanaged(CCell),
+};
+
+const MatrixState = struct {
+    book: *BookState,
+    inner: xlsx.SheetMatrix,
+    // Flattened CCell buffer; row r runs cells[offsets[r]..offsets[r+1]].
+    // Built once at open, alive until close.
+    flat_cells: std.ArrayListUnmanaged(CCell),
+    offsets: std.ArrayListUnmanaged(usize),
 };
 
 // ─── Cell representation ─────────────────────────────────────────────
@@ -1090,6 +1107,112 @@ export fn zlsx_cell_border(book: *Book, style_idx: u32, out: *CCellBorder) callc
         .diagonal = toCBorderSide(b.diagonal),
     };
     return 0;
+}
+
+// ─── Bulk row materialisation (Phase 3d, FFI-friendly) ───────────────
+//
+// Per-row `zlsx_rows_next` pays one FFI call per row. At MB scale
+// (e.g. ECDC: 49k rows) the per-call dispatch overhead dominates
+// total Python wall time. `zlsx_matrix_open` drains the whole sheet
+// into one packed buffer in a single FFI call — the consumer then
+// iterates in its own language with zero further FFI roundtrips.
+//
+// Lifetime: `out_cells` and `out_offsets` from `zlsx_matrix_data`
+// stay valid until `zlsx_matrix_close`. Cell string slices point
+// into the matrix arena (Book-lifetime SST slices stay valid for
+// the matrix's life either way).
+
+/// Materialise an entire sheet into a heap-resident matrix.
+/// `*out_n_rows` reflects the row count on success. NULL on error
+/// with `err_buf` populated.
+export fn zlsx_matrix_open(
+    book: *Book,
+    sheet_idx: u32,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) ?*Matrix {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (sheet_idx >= state.inner.sheets.len) {
+        writeError(err_buf, err_buf_len, "SheetIndexOutOfRange");
+        return null;
+    }
+    _ = state.refcount.fetchAdd(1, .acq_rel);
+    errdefer state.unref();
+
+    const sheet = state.inner.sheets[sheet_idx];
+    const matrix = state.inner.materialiseSheet(sheet, gpa) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        state.unref();
+        return null;
+    };
+
+    const ms = gpa.create(MatrixState) catch {
+        var m_mut = matrix;
+        m_mut.deinit();
+        writeError(err_buf, err_buf_len, "OutOfMemory");
+        state.unref();
+        return null;
+    };
+    ms.* = .{ .book = state, .inner = matrix, .flat_cells = .{}, .offsets = .{} };
+
+    // Pre-size: total cell count = sum of row lengths; offsets = n_rows + 1.
+    var total: usize = 0;
+    for (matrix.rows) |r| total += r.len;
+    ms.flat_cells.ensureTotalCapacity(gpa, total) catch {
+        ms.inner.deinit();
+        gpa.destroy(ms);
+        writeError(err_buf, err_buf_len, "OutOfMemory");
+        state.unref();
+        return null;
+    };
+    ms.offsets.ensureTotalCapacity(gpa, matrix.rows.len + 1) catch {
+        ms.flat_cells.deinit(gpa);
+        ms.inner.deinit();
+        gpa.destroy(ms);
+        writeError(err_buf, err_buf_len, "OutOfMemory");
+        state.unref();
+        return null;
+    };
+
+    ms.offsets.appendAssumeCapacity(0);
+    for (matrix.rows) |row| {
+        for (row) |c| ms.flat_cells.appendAssumeCapacity(toCCell(c));
+        ms.offsets.appendAssumeCapacity(ms.flat_cells.items.len);
+    }
+
+    return @ptrCast(ms);
+}
+
+/// Close and free a Matrix handle. Drops the reference on the
+/// underlying Book; if this was the last handle, the Book is freed
+/// too. NULL-safe.
+export fn zlsx_matrix_close(matrix: ?*Matrix) callconv(.c) void {
+    if (matrix) |m| {
+        const ms: *MatrixState = @ptrCast(@alignCast(m));
+        ms.flat_cells.deinit(gpa);
+        ms.offsets.deinit(gpa);
+        ms.inner.deinit();
+        const book = ms.book;
+        gpa.destroy(ms);
+        book.unref();
+    }
+}
+
+/// Read the matrix's flattened layout. After this call:
+///   `*out_cells` points to the packed `CCell` buffer
+///   `*out_offsets` points to the row-start offsets (length n_rows + 1)
+///   `*out_n_rows` is the row count
+/// All three buffers stay valid until `zlsx_matrix_close`.
+export fn zlsx_matrix_data(
+    matrix: *Matrix,
+    out_cells: *[*]const CCell,
+    out_offsets: *[*]const usize,
+    out_n_rows: *usize,
+) callconv(.c) void {
+    const ms: *MatrixState = @ptrCast(@alignCast(matrix));
+    out_cells.* = ms.flat_cells.items.ptr;
+    out_offsets.* = ms.offsets.items.ptr;
+    out_n_rows.* = ms.inner.rows.len;
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────

@@ -986,10 +986,74 @@ class Sheet:
             df = pandas.DataFrame(rows, columns=headers)
 
         No optional dependency on pandas/polars — the return shape is
-        plain Python lists, so any tabular library can consume it."""
-        with self.rows() as r:
-            all_rows = list(r)
-        if not header or len(all_rows) == 0:
+        plain Python lists, so any tabular library can consume it.
+
+        Uses the bulk-FFI ``zlsx_matrix_open`` path when libzlsx 0.2.8+
+        is loaded — one FFI call drains every row into a packed buffer,
+        avoiding per-row dispatch overhead. Falls back to the per-row
+        iterator on older libraries; result is identical."""
+        if not _ffi._HAS_MATRIX:
+            with self.rows() as r:
+                all_rows = list(r)
+            if not header or len(all_rows) == 0:
+                return (None, all_rows)
+            return (all_rows[0], all_rows[1:])
+
+        err = ctypes.create_string_buffer(_ERR_BUF_LEN)
+        handle = _ffi.lib.zlsx_matrix_open(
+            self._book._handle, self.index, err, _ERR_BUF_LEN
+        )
+        if not handle:
+            raise ZlsxError(f"zlsx_matrix_open: {_decode_err(err)}")
+        try:
+            cells_ptr = _ffi.cell_ptr()
+            offsets_ptr = ctypes.POINTER(ctypes.c_size_t)()
+            n_rows = ctypes.c_size_t()
+            _ffi.lib.zlsx_matrix_data(
+                handle,
+                ctypes.byref(cells_ptr),
+                ctypes.byref(offsets_ptr),
+                ctypes.byref(n_rows),
+            )
+            n = n_rows.value
+            all_rows = [None] * n
+            # Inline cell decoding into the hot loop — saves the
+            # Python function-call overhead × cell-count. On ECDC
+            # (~441k cells) that's measurable.
+            CE = _ffi.CELL_EMPTY
+            CS = _ffi.CELL_STRING
+            CI = _ffi.CELL_INTEGER
+            CN = _ffi.CELL_NUMBER
+            CB = _ffi.CELL_BOOLEAN
+            string_at = ctypes.string_at
+            for r_idx in range(n):
+                start = offsets_ptr[r_idx]
+                end = offsets_ptr[r_idx + 1]
+                row = [None] * (end - start)
+                ridx = 0
+                for c in range(start, end):
+                    cell = cells_ptr[c]
+                    tag = cell.tag
+                    if tag == CE:
+                        v = None
+                    elif tag == CS:
+                        slen = cell.str_len
+                        v = "" if slen == 0 else string_at(cell.str_ptr, slen).decode("utf-8", "replace")
+                    elif tag == CI:
+                        v = cell.i
+                    elif tag == CN:
+                        v = cell.f
+                    elif tag == CB:
+                        v = bool(cell.b)
+                    else:
+                        v = None
+                    row[ridx] = v
+                    ridx += 1
+                all_rows[r_idx] = row
+        finally:
+            _ffi.lib.zlsx_matrix_close(handle)
+
+        if not header or n == 0:
             return (None, all_rows)
         return (all_rows[0], all_rows[1:])
 

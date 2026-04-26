@@ -643,6 +643,14 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\  sst                one NDJSON record per shared-string entry
         \\                     (workbook-wide, iter58):
         \\                     {"kind":"sst","idx":0,"text":"…","runs":null}
+        \\  append-rows        load-modify-save: append rows to an existing
+        \\                     sheet, atomic-rename to --out. Reads NDJSON
+        \\                     row arrays from stdin (one JSON array per
+        \\                     line). Cell types: null→empty, true/false→
+        \\                     bool, integer→int, number→float, string→str.
+        \\                     Required: --out PATH and --sheet N.
+        \\                     `cat rows.ndjson | zlsx append-rows in.xlsx
+        \\                       --sheet 0 --out out.xlsx`
         \\
         \\Formats (rows only)
         \\  jsonl              NDJSON row envelope (default, iter55a):
