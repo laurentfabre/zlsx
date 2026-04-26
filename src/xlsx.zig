@@ -1671,8 +1671,18 @@ pub const Rows = struct {
                 const parsed = std.fmt.parseInt(u32, r_str, 10) catch 0;
                 break :blk if (parsed > 0) parsed else null;
             } else null;
+            // Detect self-closing `<row .../>` early so the no-r
+            // branch below doesn't fall into recoverRowFromFirstCell —
+            // that helper scans forward for `</row>` and would happily
+            // grab the *next* row's first cell ref, mis-numbering this
+            // empty row.
+            const attrs_no_ws = std.mem.trimRight(u8, attrs, " \t\r\n");
+            const is_self_closing_row = attrs_no_ws.len > 0 and
+                attrs_no_ws[attrs_no_ws.len - 1] == '/';
             if (row_r_valid) |n| {
                 self.current_row = n;
+            } else if (is_self_closing_row) {
+                self.current_row = self.yield_count;
             } else {
                 self.current_row = recoverRowFromFirstCell(self.xml, row_start.after_open) orelse self.yield_count;
             }
@@ -1690,11 +1700,6 @@ pub const Rows = struct {
             // with style/height-only rows like POI's 58325_db).
             // Yield as an empty row — matches what a populated row
             // with all `.empty` cells would look like.
-            // XML permits whitespace before `/>` (`<row r="7" />`),
-            // so trim it before sniffing for the trailing slash.
-            const attrs_no_ws = std.mem.trimRight(u8, attrs, " \t\r\n");
-            const is_self_closing_row = attrs_no_ws.len > 0 and
-                attrs_no_ws[attrs_no_ws.len - 1] == '/';
             if (is_self_closing_row) return self.row_cells.items;
             // Consume cells until </row>.
             try self.consumeRow();
