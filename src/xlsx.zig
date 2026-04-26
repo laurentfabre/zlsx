@@ -3967,6 +3967,58 @@ fn materialiseSstEntry(book: *Book, idx: usize) ![]const u8 {
     return decoded;
 }
 
+// ─── Editor (load-modify-save, Phase 3c) ────────────────────────────
+
+/// Read an existing xlsx, mutate, save. Phase 3c append-only v1 per
+/// docs/plans/load-modify-save.md.
+///
+/// **iter-lms-1**: scaffolding + byte-identical passthrough only —
+/// `Editor.save(out)` produces a file with identical SHA256 to the
+/// source. Future iters add the raw-ZIP scanner (iter-lms-1b) and
+/// `appendRows` (iter-lms-2/3).
+///
+/// Lifetime: the source buffer is held resident; `deinit` frees it.
+/// Single-threaded per Editor instance, matching the rest of zlsx.
+pub const Editor = struct {
+    allocator: Allocator,
+    src_buf: []u8,
+
+    pub fn open(allocator: Allocator, path: []const u8) !Editor {
+        const file = try std.fs.cwd().openFile(path, .{});
+        defer file.close();
+        const stat = try file.stat();
+        // Refuse files > 4 GiB up front (ZIP64 isn't supported by v1
+        // per the plan; documented limit).
+        if (stat.size > std.math.maxInt(u32)) return error.ZipTooLarge;
+        const buf = try allocator.alloc(u8, @intCast(stat.size));
+        errdefer allocator.free(buf);
+        const n = try file.readAll(buf);
+        if (n != buf.len) return error.UnexpectedEof;
+        return .{ .allocator = allocator, .src_buf = buf };
+    }
+
+    pub fn deinit(self: *Editor) void {
+        self.allocator.free(self.src_buf);
+        self.* = undefined;
+    }
+
+    /// Write the (currently unmodified) workbook to `out_path`.
+    /// iter-lms-1 just streams `src_buf` verbatim — byte-identical
+    /// SHA256 round-trip is the contract this iter establishes.
+    /// Uses `std.fs.Dir.atomicFile` so the temp file is created with
+    /// a stdlib-managed random suffix (refuses to follow a planted
+    /// symlink), is closed before the rename (Windows-portable), and
+    /// is auto-cleaned by `deinit` on any error path.
+    pub fn save(self: *const Editor, out_path: []const u8) !void {
+        var write_buf: [4096]u8 = undefined;
+        var atomic_file = try std.fs.cwd().atomicFile(out_path, .{ .write_buffer = &write_buf });
+        defer atomic_file.deinit();
+        const writer = &atomic_file.file_writer.interface;
+        try writer.writeAll(self.src_buf);
+        try atomic_file.finish();
+    }
+};
+
 // ─── zip → buffer ────────────────────────────────────────────────────
 
 fn extractEntryToBuffer(
@@ -4745,6 +4797,64 @@ test "openSstLazy: rich-runs eagerly captured on lazy backend (iter-sst-3b)" {
     try std.testing.expectEqualStrings("plain", try book.sharedStringAt(0));
     try std.testing.expectEqualStrings("bold", try book.sharedStringAt(1));
     try std.testing.expectEqualStrings("italic", try book.sharedStringAt(2));
+}
+
+test "Editor: byte-identical passthrough (iter-lms-1)" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_editor_src.xlsx";
+    const dst_path = "/tmp/zlsx_editor_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+
+    // Build a non-trivial workbook so the round-trip exercises real
+    // ZIP shape (multiple entries: workbook.xml, worksheets, SST,
+    // styles, content types, rels).
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Data");
+        try s.writeRow(&.{ .{ .string = "header" }, .{ .integer = 42 } });
+        try s.writeRow(&.{ .{ .string = "row1" }, .{ .number = 3.14 } });
+        try w.save(src_path);
+    }
+
+    // SHA256 of source.
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var src_hash: [Sha256.digest_length]u8 = undefined;
+    {
+        const f = try std.fs.cwd().openFile(src_path, .{});
+        defer f.close();
+        const buf = try std.testing.allocator.alloc(u8, @intCast((try f.stat()).size));
+        defer std.testing.allocator.free(buf);
+        _ = try f.readAll(buf);
+        Sha256.hash(buf, &src_hash, .{});
+    }
+
+    // Round-trip through Editor.
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.save(dst_path);
+    }
+
+    // SHA256 of destination must match.
+    var dst_hash: [Sha256.digest_length]u8 = undefined;
+    {
+        const f = try std.fs.cwd().openFile(dst_path, .{});
+        defer f.close();
+        const buf = try std.testing.allocator.alloc(u8, @intCast((try f.stat()).size));
+        defer std.testing.allocator.free(buf);
+        _ = try f.readAll(buf);
+        Sha256.hash(buf, &dst_hash, .{});
+    }
+    try std.testing.expectEqualSlices(u8, &src_hash, &dst_hash);
+
+    // The destination must still open as a valid workbook through
+    // the reader — confirms we didn't corrupt anything.
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
+    try std.testing.expectEqualStrings("Data", book.sheets[0].name);
 }
 
 test "Rows.parseDate: auto-convert date-styled cells through the reader" {
