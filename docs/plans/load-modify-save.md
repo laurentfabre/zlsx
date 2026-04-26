@@ -10,9 +10,11 @@
 - iter-lms-1b (raw-ZIP scanner + entry table) — ✅ shipped
 - iter-lms-2 (numeric/bool/blank append + sheet substitute) — ✅ shipped
 - iter-lms-3 (string append + SST extension) — ✅ shipped
-- iter-lms-4 (C ABI + Python binding + docs) — ✅ shipped (CLI
-  sub-command deferred to a follow-up — `zlsx.edit(path)` from
-  Python and direct C ABI consumers cover the immediate need)
+- iter-lms-4 (C ABI + Python binding + docs) — ✅ shipped
+- CLI sub-command (`zlsx append-rows … --out … < ndjson`) — ✅ shipped
+- SST-less workbook string append — ✅ shipped (creates
+  `xl/sharedStrings.xml` on demand; patches rels + Content_Types)
+- Dimension column-bound widening on append — ✅ shipped
 
 `Editor.open(allocator, path) / appendRows / save` is callable from
 Zig today against any single-disk, non-ZIP64, non-encrypted xlsx
