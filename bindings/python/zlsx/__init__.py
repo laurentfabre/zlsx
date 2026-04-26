@@ -2538,33 +2538,34 @@ class Editor:
         """Buffer ``rows`` for append on ``sheet_idx``. Each row is
         an iterable of ``None | bool | int | float | str``. Rows
         are applied at :meth:`save` time, not now; multiple
-        ``append_rows`` calls accumulate in order."""
+        ``append_rows`` calls accumulate in order.
+
+        Rows are streamed through the underlying editor one at a
+        time, so a generator / DB cursor / CSV iterator can be
+        passed without first materialising into a list. Mid-batch
+        failure (a Python type error on row N+1, or an FFI rejection
+        like ``IntegerExceedsExcelPrecision``) leaves any already-
+        buffered rows in the editor — there's no rollback. Save
+        only after the whole batch succeeded if you need
+        all-or-nothing semantics."""
         if not self._handle:
             raise ZlsxError("editor is closed")
-        # Pre-build every row before touching the FFI so a Python
-        # type error in row N+1 doesn't leave row 1..N already
-        # buffered in the native editor. (FFI-level failures past
-        # this point still leak partial state — the editor has no
-        # rollback transaction; that's an irreducible limit.)
-        rows_list = list(rows)
-        pre_built = []
-        for row in rows_list:
+        for row in rows:
             cells_list = list(row)
             n = len(cells_list)
-            cell_array = (_ffi.Cell * n)() if n > 0 else None
+            cells_arg = None
             keepers = []
-            for i, v in enumerate(cells_list):
-                cell, keeper = _py_value_to_cell(v)
-                cell_array[i] = cell
-                if keeper is not None:
-                    keepers.append(keeper)
-            pre_built.append((cell_array, n, keepers))
-
-        # Empty rows are forwarded — they emit `<row r="N"></row>`
-        # in the saved sheet XML, which callers use as visual gaps
-        # between blocks.
-        for cell_array, n, keepers in pre_built:
-            cells_arg = ctypes.cast(cell_array, _ffi.cell_ptr) if cell_array is not None else None
+            if n > 0:
+                cell_array = (_ffi.Cell * n)()
+                for i, v in enumerate(cells_list):
+                    cell, keeper = _py_value_to_cell(v)
+                    cell_array[i] = cell
+                    if keeper is not None:
+                        keepers.append(keeper)
+                cells_arg = ctypes.cast(cell_array, _ffi.cell_ptr)
+            # Empty rows (n == 0) are forwarded — the native editor
+            # emits `<row r="N"></row>` for them, which callers use
+            # as visual gaps between data blocks.
             rc = _ffi.lib.zlsx_editor_append_row(
                 self._handle,
                 int(sheet_idx),
