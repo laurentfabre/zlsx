@@ -8,10 +8,19 @@
 // representative of downstream behaviour; see docs/benchmarks.md's
 // "Methodology" section for the full rationale.
 //
-// Mode: defaults to the streaming `Book.rows` iterator. Pass
-// `--materialise` to drive the new `Book.materialiseSheet` API
-// instead — useful for measuring the row-materialise delta on the
-// same fixture without forking a second binary.
+// Mode: defaults to the streaming `Book.rows` iterator over
+// `Book.open` (which eagerly preloads every sheet's side-indices —
+// merged ranges, hyperlinks, validations, comments — so the
+// metadata getters are populated synchronously). Pass:
+//   --materialise   drive `Book.materialiseSheet` instead of the
+//                   streaming iterator (row-materialise delta).
+//   --lazy          use `Book.openLazy` — defers per-sheet
+//                   side-index parsing until the caller asks for
+//                   it. The right comparison against calamine,
+//                   which is also lazy by default; the win is
+//                   noticeable on multi-sheet workbooks
+//                   (`ons_cpi_detailed.xlsx`: 42 ms eager → 4 ms
+//                   lazy).
 const std = @import("std");
 const xlsx = @import("zlsx");
 
@@ -27,19 +36,25 @@ pub fn main() !void {
 
     var path: ?[]const u8 = null;
     var materialise = false;
+    var lazy = false;
     for (args[1..]) |a| {
         if (std.mem.eql(u8, a, "--materialise")) {
             materialise = true;
+        } else if (std.mem.eql(u8, a, "--lazy")) {
+            lazy = true;
         } else {
             path = a;
         }
     }
     const xlsx_path = path orelse {
-        std.debug.print("usage: {s} [--materialise] <xlsx>\n", .{args[0]});
+        std.debug.print("usage: {s} [--materialise] [--lazy] <xlsx>\n", .{args[0]});
         return;
     };
 
-    var book = try xlsx.Book.open(alloc, xlsx_path);
+    var book = if (lazy)
+        try xlsx.Book.openLazy(alloc, xlsx_path)
+    else
+        try xlsx.Book.open(alloc, xlsx_path);
     defer book.deinit();
 
     if (book.sheets.len == 0) return;
@@ -80,7 +95,10 @@ pub fn main() !void {
     }
 
     var buf: [256]u8 = undefined;
-    const tag: []const u8 = if (materialise) "matrix" else "stream";
+    const tag: []const u8 = if (materialise)
+        (if (lazy) "matrix-lazy" else "matrix")
+    else
+        (if (lazy) "stream-lazy" else "stream");
     const msg = try std.fmt.bufPrint(&buf, "mode={s} rows={d} str={d} int={d} num={d} bool={d} empty={d}\n", .{ tag, n_rows, n_str, n_int, n_num, n_bool, n_empty });
     _ = std.fs.File.stdout().write(msg) catch {};
 }
