@@ -6408,12 +6408,7 @@ test "Editor: SST-less workbook gets fresh sharedStrings.xml on string append" {
     defer std.fs.cwd().deleteFile(src_path) catch {};
     defer std.fs.cwd().deleteFile(dst_path) catch {};
 
-    // Numeric-only source — the writer always emits sharedStrings
-    // because of how the SST is initialised, so build a workbook
-    // and then strip the sharedStrings part by hand. Simpler: just
-    // confirm the path works regardless of source, by appending
-    // strings to a workbook that may or may not have a source SST,
-    // then verifying the appended strings are readable.
+    // Build a workbook (the Zig writer always emits sharedStrings.xml).
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -6422,12 +6417,29 @@ test "Editor: SST-less workbook gets fresh sharedStrings.xml on string append" {
         try w.save(src_path);
     }
 
-    // Append strings — exercises the create-new-SST path on
-    // SST-less sources, falls back to substitute-existing-SST
-    // when the writer happens to emit one.
+    // Force the create-new-sst path: open the editor, then strip the
+    // sharedStrings.xml entry from `ed.entries` before appending.
+    // The Zig writer emits an SST regardless of cell types, so
+    // without this the test would fall back to the substitute-
+    // existing-SST path and never exercise the new branch.
     {
         var ed = try Editor.open(std.testing.allocator, src_path);
         defer ed.deinit();
+
+        var filtered: std.ArrayListUnmanaged(Editor.ZipEntry) = .{};
+        defer filtered.deinit(std.testing.allocator);
+        var saw_sst = false;
+        for (ed.entries) |e| {
+            if (std.mem.eql(u8, e.name, "xl/sharedStrings.xml")) {
+                saw_sst = true;
+                continue;
+            }
+            try filtered.append(std.testing.allocator, e);
+        }
+        try std.testing.expect(saw_sst); // sanity check: source had an SST
+        std.testing.allocator.free(ed.entries);
+        ed.entries = try filtered.toOwnedSlice(std.testing.allocator);
+
         const append_rows = [_][]const Cell{
             &.{ .{ .string = "alpha" }, .{ .integer = 10 } },
             &.{ .{ .string = "beta" }, .{ .integer = 20 } },
@@ -6454,6 +6466,12 @@ test "Editor: SST-less workbook gets fresh sharedStrings.xml on string append" {
     try std.testing.expectEqual(@as(i64, 20), r3[1].integer);
 
     try std.testing.expectEqual(@as(?[]const Cell, null), try rows.next());
+    // Confirm the create-new-sst path produced an SST with exactly
+    // the appended strings — `book.sharedStringsCount() == 2` would
+    // be inflated if the test had silently fallen back to the
+    // substitute-existing path (which would have surfaced the
+    // source's SST entries first).
+    try std.testing.expectEqual(@as(usize, 2), book.sharedStringsCount());
 }
 
 test "buildFreshSstXml round-trips through the reader's parser" {
