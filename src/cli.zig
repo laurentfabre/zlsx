@@ -3192,6 +3192,14 @@ fn runAppendRowsCommand(
         try err.flush();
         return 1;
     }
+    // The Editor accepts u32; refuse here so a usize that overflows
+    // the cast (--sheet 5000000000 on 64-bit) returns the documented
+    // exit-1 path instead of trapping mid-cast.
+    if (sheet_idx_opt.? > std.math.maxInt(u32)) {
+        try err.writeAll("zlsx: --sheet value too large (must fit in u32)\n");
+        try err.flush();
+        return 1;
+    }
     const sheet_idx: u32 = @intCast(sheet_idx_opt.?);
 
     var ed = xlsx.Editor.open(alloc, args.file) catch |e| {
@@ -3275,10 +3283,20 @@ fn jsonValueToCell(v: std.json.Value) !xlsx.Cell {
         .number_string => |s| blk: {
             // std.json hands integers > i64 as `number_string`. Try
             // parseInt first (so "9007199254740993" still routes to
-            // the precision check), fall back to f64.
+            // the precision check the Editor enforces). If parseInt
+            // overflows AND the JSON token is a pure integer literal,
+            // refuse rather than silently routing through f64 and
+            // rounding — Excel can't represent it exactly either.
+            // Pure floats / scientific notation route to .number as
+            // expected.
             if (std.fmt.parseInt(i64, s, 10)) |n| {
                 break :blk .{ .integer = n };
             } else |_| {
+                const looks_like_integer =
+                    std.mem.indexOfScalar(u8, s, '.') == null and
+                    std.mem.indexOfScalar(u8, s, 'e') == null and
+                    std.mem.indexOfScalar(u8, s, 'E') == null;
+                if (looks_like_integer) return error.IntegerExceedsI64;
                 const f = std.fmt.parseFloat(f64, s) catch return error.UnsupportedJsonNumber;
                 break :blk .{ .number = f };
             }
