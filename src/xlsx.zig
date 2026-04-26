@@ -1690,7 +1690,11 @@ pub const Rows = struct {
             // with style/height-only rows like POI's 58325_db).
             // Yield as an empty row — matches what a populated row
             // with all `.empty` cells would look like.
-            const is_self_closing_row = attrs.len > 0 and attrs[attrs.len - 1] == '/';
+            // XML permits whitespace before `/>` (`<row r="7" />`),
+            // so trim it before sniffing for the trailing slash.
+            const attrs_no_ws = std.mem.trimRight(u8, attrs, " \t\r\n");
+            const is_self_closing_row = attrs_no_ws.len > 0 and
+                attrs_no_ws[attrs_no_ws.len - 1] == '/';
             if (is_self_closing_row) return self.row_cells.items;
             // Consume cells until </row>.
             try self.consumeRow();
