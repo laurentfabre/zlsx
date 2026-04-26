@@ -490,6 +490,12 @@ const ZipArchive = struct {
     }
 };
 
+/// SST strategy passed to `Book.openLazyWithSst`. The public surface
+/// uses three named entrypoints (`open`, `openLazy`, `openSstLazy`)
+/// that each pick a strategy internally; this enum exists so the
+/// shared lazy-archive walker can dispatch without code duplication.
+pub const SstStrategy = enum { eager, lazy };
+
 /// Internal SST storage backend. Eager mode (the default, populated
 /// by `Book.open`) holds every decoded entry as a contiguous slice;
 /// lazy mode (populated by `Book.openSstLazy` — iter-sst-3b) holds an
@@ -506,8 +512,8 @@ pub const SstBackend = union(enum) {
     /// production path; the variant exists at iter-sst-3a so the
     /// accessor switch covers both arms exhaustively.
     lazy: struct {
-        offsets: []u32,
-        lengths: []u32,
+        offsets: []usize,
+        lengths: []usize,
         resolved: std.AutoHashMapUnmanaged(u32, []const u8),
     },
 };
@@ -674,7 +680,35 @@ pub const Book = struct {
     ///   `preloadSheet(sheet)` or any `rows(sheet)` iteration first
     ///   to populate. `Book.open` preloads everything on open, so
     ///   non-lazy callers never see this.
+    /// Eager sheets, lazy SST. Companion to `open` (eager everything)
+    /// and `openLazy` (lazy sheets, eager SST). Mitigates the SST RAM
+    /// blow-up on workbooks with millions of unique strings: at open
+    /// time the SST is walked once to build a per-entry offset/length
+    /// index, but plain text is not decoded until `sharedStringAt` is
+    /// called for that index. See docs/plans/streaming-sst.md for the
+    /// full design.
+    ///
+    /// Rich-text runs are eagerly captured on the lazy backend too:
+    /// the per-entry walk that records offsets also populates
+    /// `rich_runs_by_sst_idx`, so `Book.richRuns(idx)` returns the
+    /// same slice as the eager backend with the same lifetime
+    /// contract.
+    /// Single-threaded contract — the lazy backend mutates internal
+    /// state on first-touch. Multi-threaded SST access requires the
+    /// caller to serialise externally or to call `Book.open` instead.
+    pub fn openSstLazy(allocator: Allocator, path: []const u8) !Book {
+        var book = try Book.openLazyWithSst(allocator, path, .lazy);
+        errdefer book.deinit();
+        try book.loadEagerParts();
+        book.closeArchive();
+        return book;
+    }
+
     pub fn openLazy(allocator: Allocator, path: []const u8) !Book {
+        return Book.openLazyWithSst(allocator, path, .eager);
+    }
+
+    fn openLazyWithSst(allocator: Allocator, path: []const u8, sst_strategy: SstStrategy) !Book {
         var book: Book = .{
             .allocator = allocator,
             .sst_arena = std.heap.ArenaAllocator.init(allocator),
@@ -780,7 +814,10 @@ pub const Book = struct {
         const rels = rels_xml orelse return error.MissingWorkbook;
 
         try parseWorkbookSheets(&book, wb, rels);
-        if (book.shared_strings_xml) |sst| try parseSharedStrings(&book, sst);
+        if (book.shared_strings_xml) |sst| switch (sst_strategy) {
+            .eager => try parseSharedStrings(&book, sst),
+            .lazy => try parseSharedStringsLazy(&book, sst),
+        };
 
         // Workbook-wide style + theme tables MUST parse here (not in
         // `loadEagerParts`): every `numberFormat`, `cellFont`,
@@ -1131,16 +1168,19 @@ pub const Book = struct {
     /// the streaming-SST plan (docs/plans/streaming-sst.md) introduces
     /// a lazy variant in iter-sst-3 — this iter-sst-1 accessor
     /// centralises the lookup so future migration touches one site.
-    pub fn sharedStringAt(self: *const Book, idx: usize) ![]const u8 {
+    pub fn sharedStringAt(self: *Book, idx: usize) ![]const u8 {
         switch (self.sst) {
             .eager => |entries| {
                 if (idx >= entries.len) return error.MalformedXml;
                 return entries[idx];
             },
-            .lazy => unreachable, // iter-sst-3a: no entrypoint
-            // constructs the lazy variant. iter-sst-3b adds
-            // `Book.openSstLazy` and replaces this branch with the
-            // first-touch materialisation path.
+            .lazy => |*lazy| {
+                if (idx >= lazy.offsets.len) return error.MalformedXml;
+                if (lazy.resolved.get(@intCast(idx))) |s| return s;
+                // First-touch decode into `sst_arena`. Caches the
+                // result so subsequent accesses are O(1) hashmap hits.
+                return try materialiseSstEntry(self, idx);
+            },
         }
     }
 
@@ -1354,7 +1394,7 @@ pub const Rows = struct {
     /// during iteration. Nullable only so internal fuzz helpers can
     /// drive the state machine without a Book; public callers always
     /// get a valid pointer from `Book.rows`.
-    book: ?*const Book = null,
+    book: ?*Book = null,
     allocator: Allocator,
     row_cells: std.ArrayListUnmanaged(Cell),
     /// Parallel to `row_cells`. Each slot holds the cell's `s="N"`
@@ -3676,6 +3716,250 @@ fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
     book.sst = .{ .eager = try strings.toOwnedSlice(book.allocator) };
 }
 
+/// Lazy SST builder (iter-sst-3b). Walks the SST once recording the
+/// byte span of each `<si>...</si>` body, but does NOT decode plain
+/// text. `Book.sharedStringAt` materialises individual entries into
+/// `sst_arena` on first access. Rich-text runs are not eagerly
+/// captured by the lazy backend yet (deferred to a follow-up iter);
+/// `Book.richRuns(idx)` returns null on lazy-opened books.
+fn parseSharedStringsLazy(book: *Book, sst_xml: []u8) !void {
+    const hint: usize = blk: {
+        const open = std.mem.indexOf(u8, sst_xml, "<sst") orelse break :blk 64;
+        const gt = std.mem.indexOfScalarPos(u8, sst_xml, open, '>') orelse break :blk 64;
+        const attrs = sst_xml[open..gt];
+        const u = std.mem.indexOf(u8, attrs, "uniqueCount=\"") orelse break :blk 64;
+        const start = u + "uniqueCount=\"".len;
+        const end = std.mem.indexOfScalarPos(u8, attrs, start, '"') orelse break :blk 64;
+        const claimed = std.fmt.parseInt(usize, attrs[start..end], 10) catch 64;
+        break :blk @min(claimed, sst_xml.len / 5);
+    };
+
+    var offsets: std.ArrayListUnmanaged(usize) = .{};
+    var lengths: std.ArrayListUnmanaged(usize) = .{};
+    errdefer offsets.deinit(book.allocator);
+    errdefer lengths.deinit(book.allocator);
+    try offsets.ensureTotalCapacity(book.allocator, hint);
+    try lengths.ensureTotalCapacity(book.allocator, hint);
+
+    const xml = sst_xml;
+    var i: usize = 0;
+
+    outer: while (i < xml.len) {
+        const i_prev = i;
+        const lt = std.mem.indexOfScalarPos(u8, xml, i, '<') orelse break;
+        if (lt + 3 > xml.len) break;
+        if (xml[lt + 1] != 's' or xml[lt + 2] != 'i') {
+            i = lt + 1;
+            std.debug.assert(i > i_prev);
+            continue;
+        }
+        const si_gt = std.mem.indexOfScalarPos(u8, xml, lt + 3, '>') orelse break;
+        // Self-closing `<si/>` — empty entry.
+        if (si_gt > 0 and xml[si_gt - 1] == '/') {
+            try offsets.append(book.allocator, si_gt);
+            try lengths.append(book.allocator, 0);
+            i = si_gt + 1;
+            std.debug.assert(i > i_prev);
+            continue;
+        }
+        // Find the matching `</si>`. Body span is everything between
+        // `>` and `</`. Match the eager parser's recovery: a missing
+        // `</si>` on one entry only skips THAT entry — we advance past
+        // the opening `<si>` and keep scanning subsequent entries.
+        const si_close = std.mem.indexOfPos(u8, xml, si_gt + 1, "</si>") orelse {
+            i = si_gt + 1;
+            std.debug.assert(i > i_prev);
+            continue :outer;
+        };
+        const body_start: usize = si_gt + 1;
+        const body_end: usize = si_close;
+        const sst_idx = offsets.items.len;
+        try offsets.append(book.allocator, body_start);
+        try lengths.append(book.allocator, body_end - body_start);
+
+        // Eagerly capture rich-text runs so Book.richRuns() works on
+        // lazy books. Plain entries no-op out of the inner walker; the
+        // common-case rich-density is <1% of typical SSTs so the
+        // amortised cost is small.
+        try parseSstRichRunsForBody(book, xml[body_start..body_end], sst_idx);
+
+        i = si_close + "</si>".len;
+        std.debug.assert(i > i_prev);
+        continue :outer;
+    }
+
+    // Stage both owned slices in locals before assigning the union so
+    // a failure on the second `toOwnedSlice` doesn't leak the first.
+    const offsets_owned = try offsets.toOwnedSlice(book.allocator);
+    errdefer book.allocator.free(offsets_owned);
+    const lengths_owned = try lengths.toOwnedSlice(book.allocator);
+    errdefer book.allocator.free(lengths_owned);
+    book.sst = .{ .lazy = .{
+        .offsets = offsets_owned,
+        .lengths = lengths_owned,
+        .resolved = .{},
+    } };
+}
+
+/// Walk one `<si>` body for rich-text runs and, if any are present,
+/// commit them into `book.rich_runs_by_sst_idx[sst_idx]`. No-op when
+/// the body has no `<r>` blocks (the common case). Used by
+/// `parseSharedStringsLazy` so `Book.richRuns()` works on lazy
+/// books with the same lifetime contract as the eager backend.
+fn parseSstRichRunsForBody(book: *Book, body: []const u8, sst_idx: usize) !void {
+    const arena = book.sst_arena.allocator();
+    var runs: std.ArrayListUnmanaged(RichRun) = .empty;
+    var saw_r = false;
+    var pending_flags: RichRun = .{ .text = "" };
+
+    var j: usize = 0;
+    while (j < body.len) {
+        const j_prev = j;
+        const next_lt = std.mem.indexOfScalarPos(u8, body, j, '<') orelse break;
+        if (next_lt + 2 > body.len) break;
+        const c1 = body[next_lt + 1];
+
+        if (c1 == 'r' and next_lt + 2 < body.len and
+            (body[next_lt + 2] == '>' or body[next_lt + 2] == ' '))
+        {
+            // `<r>` — enter a rich-text run block. Each `<r>` resets
+            // pending_flags so a run without `<rPr>` is unstyled.
+            const r_gt = std.mem.indexOfScalarPos(u8, body, next_lt + 2, '>') orelse break;
+            saw_r = true;
+            pending_flags = .{ .text = "" };
+            j = r_gt + 1;
+        } else if (c1 == 'r' and next_lt + 3 < body.len and
+            body[next_lt + 2] == 'P' and body[next_lt + 3] == 'r')
+        {
+            const rpr_close = std.mem.indexOfPos(u8, body, next_lt, "</rPr>") orelse break;
+            pending_flags = try parseRprFlags(book, arena, body[next_lt .. rpr_close + "</rPr>".len]);
+            j = rpr_close + "</rPr>".len;
+        } else if (c1 == 't' and (next_lt + 2 == body.len or
+            body[next_lt + 2] == '>' or body[next_lt + 2] == ' ' or body[next_lt + 2] == '/'))
+        {
+            const t_gt = std.mem.indexOfScalarPos(u8, body, next_lt + 2, '>') orelse break;
+            if (t_gt > 0 and body[t_gt - 1] == '/') {
+                j = t_gt + 1;
+                std.debug.assert(j > j_prev);
+                continue;
+            }
+            const t_close = std.mem.indexOfPos(u8, body, t_gt + 1, "</t>") orelse break;
+            const span = body[t_gt + 1 .. t_close];
+
+            if (saw_r) {
+                const span_has_ent = std.mem.indexOfScalar(u8, span, '&') != null;
+                const run_text: []const u8 = if (span_has_ent) blk: {
+                    var rb: std.ArrayListUnmanaged(u8) = try .initCapacity(arena, span.len);
+                    try appendDecoded(arena, &rb, span);
+                    break :blk try rb.toOwnedSlice(arena);
+                } else span;
+                try runs.append(arena, .{
+                    .text = run_text,
+                    .bold = pending_flags.bold,
+                    .italic = pending_flags.italic,
+                    .color_argb = pending_flags.color_argb,
+                    .size = pending_flags.size,
+                    .font_name = pending_flags.font_name,
+                });
+            }
+            j = t_close + "</t>".len;
+        } else {
+            j = next_lt + 1;
+        }
+        std.debug.assert(j > j_prev);
+    }
+
+    if (runs.items.len > 0) {
+        const owned = try runs.toOwnedSlice(arena);
+        try book.rich_runs_by_sst_idx.put(book.allocator, sst_idx, owned);
+    }
+}
+
+/// Decode a single SST entry's body span into the Book's `sst_arena`.
+/// Used by the lazy backend on first `sharedStringAt(idx)` access; the
+/// returned slice is cached in `lazy.resolved` so subsequent accesses
+/// are O(1) hashmap hits. Errors with `MalformedXml` if the offset
+/// table is corrupted (defensive — should never fire on a sanely
+/// parsed SST).
+fn materialiseSstEntry(book: *Book, idx: usize) ![]const u8 {
+    const lazy = switch (book.sst) {
+        .lazy => |*l| l,
+        .eager => unreachable,
+    };
+    if (idx >= lazy.offsets.len) return error.MalformedXml;
+    const xml = book.shared_strings_xml orelse return error.MalformedXml;
+    const start = lazy.offsets[idx];
+    const len = lazy.lengths[idx];
+    if (start + len > xml.len) return error.MalformedXml;
+    const body = xml[start .. start + len];
+
+    // Concat every `<t>...</t>` body in this entry, decoding entities.
+    // Mirrors the eager parser's plain-text path but only runs on the
+    // single requested entry.
+    const arena = book.sst_arena.allocator();
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var t_count: usize = 0;
+    var first_span: []const u8 = "";
+    var first_has_ent = false;
+    var j: usize = 0;
+    while (j < body.len) {
+        const next_lt = std.mem.indexOfScalarPos(u8, body, j, '<') orelse break;
+        if (next_lt + 2 > body.len) break;
+        const c1 = body[next_lt + 1];
+        if (c1 == 't' and (next_lt + 2 == body.len or
+            body[next_lt + 2] == '>' or body[next_lt + 2] == ' ' or body[next_lt + 2] == '/'))
+        {
+            const t_gt = std.mem.indexOfScalarPos(u8, body, next_lt + 2, '>') orelse break;
+            if (t_gt > 0 and body[t_gt - 1] == '/') {
+                j = t_gt + 1;
+                continue;
+            }
+            const t_close = std.mem.indexOfPos(u8, body, t_gt + 1, "</t>") orelse break;
+            const span = body[t_gt + 1 .. t_close];
+            const span_has_ent = std.mem.indexOfScalar(u8, span, '&') != null;
+            if (t_count == 0) {
+                first_span = span;
+                first_has_ent = span_has_ent;
+            } else {
+                if (buf.capacity == 0) {
+                    const cap: usize = first_span.len + span.len + 8;
+                    buf = try .initCapacity(arena, cap);
+                    if (first_has_ent) {
+                        try appendDecoded(arena, &buf, first_span);
+                    } else {
+                        buf.appendSliceAssumeCapacity(first_span);
+                    }
+                }
+                try buf.ensureUnusedCapacity(arena, span.len);
+                if (span_has_ent) {
+                    try appendDecoded(arena, &buf, span);
+                } else {
+                    buf.appendSliceAssumeCapacity(span);
+                }
+            }
+            t_count += 1;
+            j = t_close + "</t>".len;
+        } else {
+            j = next_lt + 1;
+        }
+    }
+
+    const decoded: []const u8 = if (t_count == 0) "" else if (t_count == 1) blk: {
+        if (first_has_ent) {
+            var b: std.ArrayListUnmanaged(u8) = try .initCapacity(arena, first_span.len);
+            try appendDecoded(arena, &b, first_span);
+            break :blk try b.toOwnedSlice(arena);
+        } else {
+            // Borrow span directly — lifetime matches sst_xml which
+            // lives for the Book's lifetime.
+            break :blk first_span;
+        }
+    } else try buf.toOwnedSlice(arena);
+
+    try lazy.resolved.put(book.allocator, @intCast(idx), decoded);
+    return decoded;
+}
+
 // ─── zip → buffer ────────────────────────────────────────────────────
 
 fn extractEntryToBuffer(
@@ -4342,6 +4626,118 @@ test "parseSharedStrings: hostile uniqueCount is capped against XML size" {
     try std.testing.expectEqual(@as(usize, 2), book.sharedStringsCount());
     try std.testing.expectEqualStrings("a", book.sst.eager[0]);
     try std.testing.expectEqualStrings("b", book.sst.eager[1]);
+}
+
+test "openSstLazy: lazy SST resolves on demand and matches eager (iter-sst-3b)" {
+    const writer_mod = @import("writer.zig");
+    const tmp_path = "/tmp/zlsx_open_sst_lazy.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    // Build a workbook with a handful of distinct shared strings so
+    // both backends have non-trivial work to do.
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{
+            .{ .string = "alpha" },
+            .{ .string = "beta" },
+            .{ .string = "gamma" },
+        });
+        try s.writeRow(&.{
+            .{ .string = "delta" },
+            .{ .string = "alpha" }, // dedup'd in SST
+            .{ .string = "epsilon" },
+        });
+        try w.save(tmp_path);
+    }
+
+    // Eager open: every entry pre-decoded.
+    {
+        var book = try Book.open(std.testing.allocator, tmp_path);
+        defer book.deinit();
+        try std.testing.expectEqual(@as(usize, 5), book.sharedStringsCount());
+        try std.testing.expectEqualStrings("alpha", try book.sharedStringAt(0));
+        try std.testing.expectEqualStrings("beta", try book.sharedStringAt(1));
+        try std.testing.expectEqualStrings("gamma", try book.sharedStringAt(2));
+        try std.testing.expectEqualStrings("delta", try book.sharedStringAt(3));
+        try std.testing.expectEqualStrings("epsilon", try book.sharedStringAt(4));
+    }
+
+    // Lazy open: same external behaviour, different internal storage.
+    {
+        var book = try Book.openSstLazy(std.testing.allocator, tmp_path);
+        defer book.deinit();
+        try std.testing.expectEqual(@as(usize, 5), book.sharedStringsCount());
+        // Confirm we landed on the lazy backend.
+        try std.testing.expect(std.meta.activeTag(book.sst) == .lazy);
+        // Resolved cache empty before any access.
+        try std.testing.expectEqual(@as(u32, 0), book.sst.lazy.resolved.count());
+
+        // Sparse access: materialise a few entries.
+        try std.testing.expectEqualStrings("beta", try book.sharedStringAt(1));
+        try std.testing.expectEqualStrings("delta", try book.sharedStringAt(3));
+        try std.testing.expectEqual(@as(u32, 2), book.sst.lazy.resolved.count());
+
+        // Re-access does not re-materialise (cache hit).
+        _ = try book.sharedStringAt(1);
+        try std.testing.expectEqual(@as(u32, 2), book.sst.lazy.resolved.count());
+
+        // Full sweep matches eager.
+        try std.testing.expectEqualStrings("alpha", try book.sharedStringAt(0));
+        try std.testing.expectEqualStrings("gamma", try book.sharedStringAt(2));
+        try std.testing.expectEqualStrings("epsilon", try book.sharedStringAt(4));
+        try std.testing.expectEqual(@as(u32, 5), book.sst.lazy.resolved.count());
+
+        // Out-of-range still reports MalformedXml on the lazy backend.
+        try std.testing.expectError(error.MalformedXml, book.sharedStringAt(99));
+    }
+}
+
+test "openSstLazy: rich-runs eagerly captured on lazy backend (iter-sst-3b)" {
+    // Direct parseSharedStringsLazy drive against a known SST XML —
+    // covers the contract that lazy-opened books still expose
+    // `Book.richRuns(idx)` with the same shape as eager.
+    const sst_xml =
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"3\" uniqueCount=\"3\">" ++
+        "<si><t>plain</t></si>" ++
+        "<si><r><rPr><b/></rPr><t>bold</t></r></si>" ++
+        "<si><r><rPr><i/></rPr><t>italic</t></r></si>" ++
+        "</sst>";
+
+    var book: Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer book.deinit();
+    const owned = try std.testing.allocator.dupe(u8, sst_xml);
+    book.shared_strings_xml = owned;
+    try parseSharedStringsLazy(&book, owned);
+
+    try std.testing.expectEqual(@as(usize, 3), book.sharedStringsCount());
+    try std.testing.expect(std.meta.activeTag(book.sst) == .lazy);
+
+    // Plain entry: no rich runs.
+    try std.testing.expectEqual(@as(?[]const RichRun, null), book.richRuns(0));
+
+    // Bold entry: one run, bold flag set.
+    const r1 = book.richRuns(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), r1.len);
+    try std.testing.expectEqualStrings("bold", r1[0].text);
+    try std.testing.expectEqual(true, r1[0].bold);
+    try std.testing.expectEqual(false, r1[0].italic);
+
+    // Italic entry: one run, italic flag set.
+    const r2 = book.richRuns(2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), r2.len);
+    try std.testing.expectEqualStrings("italic", r2[0].text);
+    try std.testing.expectEqual(false, r2[0].bold);
+    try std.testing.expectEqual(true, r2[0].italic);
+
+    // Plain text still resolves through sharedStringAt.
+    try std.testing.expectEqualStrings("plain", try book.sharedStringAt(0));
+    try std.testing.expectEqualStrings("bold", try book.sharedStringAt(1));
+    try std.testing.expectEqualStrings("italic", try book.sharedStringAt(2));
 }
 
 test "Rows.parseDate: auto-convert date-styled cells through the reader" {

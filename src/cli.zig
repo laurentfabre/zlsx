@@ -3102,7 +3102,7 @@ fn runStylesCommand(
 /// Emit one NDJSON record per shared-string entry.
 fn runSstCommand(
     out: *std.Io.Writer,
-    book: *const xlsx.Book,
+    book: *xlsx.Book,
     skip: ?usize,
     take: ?usize,
 ) !void {
