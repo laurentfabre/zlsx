@@ -4521,7 +4521,14 @@ pub const Editor = struct {
         // would trap (safe builds) or silently truncate offsets
         // (release builds), producing an unreadable archive.
         // Bail with a clear `Zip64NotSupported` instead.
+        // Use `>= maxInt(u32)` rather than `>` so ZIP32 sentinel
+        // values (`0xFFFFFFFF` for offsets/sizes, `0xFFFF` for
+        // entry counts) are also rejected. Book.open treats those
+        // exact values as ZIP64 markers, so emitting them on the
+        // save side would produce a self-incompatible archive
+        // that our own reader refuses with `Zip64NotSupported`.
         const max_u32: u64 = std.math.maxInt(u32);
+        const max_u16: usize = std.math.maxInt(u16);
         var planned_total: u64 = 0;
         for (lfh_sorted) |i| {
             if (subs[i]) |s| {
@@ -4548,10 +4555,10 @@ pub const Editor = struct {
             @as(u64, @sizeOf(std.zip.EndRecord)) +
             @as(u64, self.eocd_comment.len);
         const planned_entries = self.entries.len + extra_entries.items.len;
-        if (planned_cd_offset > max_u32 or
-            planned_cd_size > max_u32 or
-            planned_archive_size > max_u32 or
-            planned_entries > std.math.maxInt(u16))
+        if (planned_cd_offset >= max_u32 or
+            planned_cd_size >= max_u32 or
+            planned_archive_size >= max_u32 or
+            planned_entries >= max_u16)
         {
             return error.Zip64NotSupported;
         }
@@ -5044,8 +5051,10 @@ fn buildEntryFromXml(
 ) !SubstitutedEntry {
     defer allocator.free(new_xml);
 
-    if (new_xml.len > std.math.maxInt(u32)) return error.Zip64NotSupported;
-    if (filename.len > std.math.maxInt(u16)) return error.FilenameTooLong;
+    // `>=` rather than `>`: 0xFFFFFFFF / 0xFFFF are ZIP32 sentinel
+    // values that the reader treats as ZIP64-extension markers.
+    if (new_xml.len >= std.math.maxInt(u32)) return error.Zip64NotSupported;
+    if (filename.len >= std.math.maxInt(u16)) return error.FilenameTooLong;
 
     var compressed: std.ArrayListUnmanaged(u8) = .{};
     defer compressed.deinit(allocator);
@@ -5062,7 +5071,7 @@ fn buildEntryFromXml(
             try compressed.appendSlice(allocator, new_xml);
         }
     }
-    if (compressed.items.len > std.math.maxInt(u32)) return error.Zip64NotSupported;
+    if (compressed.items.len >= std.math.maxInt(u32)) return error.Zip64NotSupported;
 
     const crc = std.hash.Crc32.hash(new_xml);
     // `filename` is now the function parameter; no need to read
