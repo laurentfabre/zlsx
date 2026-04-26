@@ -151,6 +151,9 @@ with zlsx.write("out.xlsx") as w:
 - Per-sheet layout: column widths, freeze panes, auto-filter
 - Merged cells, external + internal hyperlinks, comments
 - Rich-text runs on write (`write_rich_row`)
+- Append-only load-modify-save via `zlsx.edit(path)` — append rows
+  to existing sheets (numeric / int / float / bool / str cells)
+  with atomic save
 - Formula cells on write (`write_row_with_formulas`) — emits `<f>` + cached `<v>`; Excel recalculates on open
 - Data validation (list / numeric / custom) and conditional formatting (cellIs / expression / colorScale / dataBar)
 - Refcounted handles — close the book while rows are still being consumed, the C ABI keeps the state alive until the last reference drops
@@ -159,7 +162,7 @@ with zlsx.write("out.xlsx") as w:
 
 - `.xls` / `.xlsb` / `.ods` — never
 - Formula evaluation — never (the reader returns the cached `<v>` value Excel stored; zlsx never runs a formula engine)
-- Load → modify → save round-trip — Phase 3c queued
+- Cell mutate / structural edits (insert column, delete row, etc.) on existing workbooks — append-only is shipped via `zlsx.edit(path)`; full round-trip is its own follow-up plan
 - Pictures / charts / pivots — out of scope
 
 ## Thread safety

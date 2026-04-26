@@ -43,6 +43,7 @@ typedef struct zlsx_book_t zlsx_book_t;
 typedef struct zlsx_rows_t zlsx_rows_t;
 typedef struct zlsx_writer_t zlsx_writer_t;
 typedef struct zlsx_sheet_writer_t zlsx_sheet_writer_t;
+typedef struct zlsx_editor_t zlsx_editor_t;
 
 /* Cell tag discriminator. */
 typedef enum {
@@ -1079,6 +1080,51 @@ int32_t zlsx_sheet_writer_add_conditional_format_data_bar(
     uint32_t              color_argb,
     uint8_t             * err_buf,
     size_t                err_buf_len);
+
+/* ── Editor (load-modify-save) ──────────────────────────────────────
+ * Open an existing xlsx, append rows, save. Append-only v1: numeric /
+ * integer / boolean / empty / string cells supported; the source must
+ * already carry an `xl/sharedStrings.xml` part for string appends to
+ * work. Refuses ZIP64 / multi-disk / encrypted / data-descriptor
+ * archives up front. See docs/plans/load-modify-save.md.
+ */
+
+/* Open an xlsx for editing. Returns NULL on failure with `err_buf`
+ * populated. Path is null-terminated UTF-8.
+ */
+zlsx_editor_t * zlsx_editor_open(
+    const char * path,
+    uint8_t    * err_buf,
+    size_t       err_buf_len);
+
+/* Drop the editor handle. Safe with NULL. */
+void zlsx_editor_close(zlsx_editor_t * ed);
+
+/* Append a single row to the sheet at `sheet_idx`. Cells are
+ * borrowed for the duration of this call; the editor dupes string
+ * contents internally so callers can reuse / free their buffers
+ * after this returns. Returns 0 on success, -1 on failure with
+ * `err_buf` populated (e.g. `IntegerExceedsExcelPrecision`,
+ * `RowIndexOutOfRange`, `SheetIndexOutOfRange`, `NoSstInSource`).
+ */
+int32_t zlsx_editor_append_row(
+    zlsx_editor_t     * ed,
+    uint32_t            sheet_idx,
+    const zlsx_cell_t * cells_ptr,
+    size_t              cells_len,
+    uint8_t           * err_buf,
+    size_t              err_buf_len);
+
+/* Save the workbook (with any pending appends applied) atomically
+ * to `out_path` (`out_path_len` bytes; not null-terminated). Returns
+ * 0 on success, -1 on failure with `err_buf` populated.
+ */
+int32_t zlsx_editor_save(
+    zlsx_editor_t * ed,
+    const char    * out_path,
+    size_t          out_path_len,
+    uint8_t       * err_buf,
+    size_t          err_buf_len);
 
 #ifdef __cplusplus
 }

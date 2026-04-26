@@ -68,6 +68,11 @@ pub const Book = extern struct { _opaque: u8 };
 
 pub const Rows = extern struct { _opaque: u8 };
 
+/// Opaque editor handle. Created by `zlsx_editor_open`, freed by
+/// `zlsx_editor_close`. Backed by an `xlsx.Editor` plus the heap
+/// allocation that owns its source buffer + entry table.
+pub const Editor = extern struct { _opaque: u8 };
+
 // Internal state behind the opaque handles.
 //
 // BookState is refcounted: `zlsx_book_open` creates it with refcount=1,
@@ -2853,6 +2858,118 @@ fn fuzzItersCabi() usize {
     return std.fmt.parseInt(usize, digits[0..di], 10) catch 1_000;
 }
 
+// ─── Editor (load-modify-save) ───────────────────────────────────────
+
+const EditorState = struct {
+    inner: xlsx.Editor,
+};
+
+/// Open an existing xlsx for append-only mutation. Returns an Editor
+/// handle on success, NULL on failure (`err_buf` populated).
+export fn zlsx_editor_open(
+    path_ptr: [*:0]const u8,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) ?*Editor {
+    const path = std.mem.span(path_ptr);
+    const inner = xlsx.Editor.open(gpa, path) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return null;
+    };
+    const state = gpa.create(EditorState) catch {
+        var mutable = inner;
+        mutable.deinit();
+        writeError(err_buf, err_buf_len, "OutOfMemory");
+        return null;
+    };
+    state.* = .{ .inner = inner };
+    return @ptrCast(state);
+}
+
+/// Drop the editor handle. Safe with NULL (no-op).
+export fn zlsx_editor_close(ed: ?*Editor) callconv(.c) void {
+    if (ed) |e| {
+        const state: *EditorState = @ptrCast(@alignCast(e));
+        state.inner.deinit();
+        gpa.destroy(state);
+    }
+}
+
+/// Append a single row to the sheet at `sheet_idx`. Cell types
+/// (numeric / integer / boolean / empty / string) follow the Zig
+/// `appendRows` contract: lossy integers + out-of-bounds rows
+/// surface as `IntegerExceedsExcelPrecision` /
+/// `RowIndexOutOfRange` etc. on this call. Returns 0 on success,
+/// -1 on failure with `err_buf` populated.
+export fn zlsx_editor_append_row(
+    ed: *Editor,
+    sheet_idx: u32,
+    cells_ptr: ?[*]const CCell,
+    cells_len: usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state: *EditorState = @ptrCast(@alignCast(ed));
+
+    var scratch: [128]xlsx.Cell = undefined;
+    var heap_owned: ?[]xlsx.Cell = null;
+    defer if (heap_owned) |h| gpa.free(h);
+    var cells_slice: []xlsx.Cell = &.{};
+
+    if (cells_len > 0) {
+        if (cells_ptr == null) {
+            writeError(err_buf, err_buf_len, "InvalidInput");
+            return -1;
+        }
+        if (cells_len <= scratch.len) {
+            cells_slice = scratch[0..cells_len];
+        } else {
+            heap_owned = gpa.alloc(xlsx.Cell, cells_len) catch {
+                writeError(err_buf, err_buf_len, "OutOfMemory");
+                return -1;
+            };
+            cells_slice = heap_owned.?;
+        }
+        const src = cells_ptr.?;
+        for (0..cells_len) |i| {
+            cells_slice[i] = fromCCell(src[i]) catch |e| {
+                writeError(err_buf, err_buf_len, @errorName(e));
+                return -1;
+            };
+        }
+    }
+
+    // The Editor.appendRows API takes `[]const []const Cell` — wrap
+    // the single row in a length-1 outer slice. The editor dupes
+    // string contents so the borrowed CCell strings can be freed
+    // after this call returns.
+    const single_row: [1][]const xlsx.Cell = .{cells_slice};
+    state.inner.appendRows(sheet_idx, &single_row) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
+/// Save the workbook (with any pending appends applied) atomically
+/// to `out_path` (`out_path_len` bytes; not null-terminated).
+/// Returns 0 on success, -1 on failure with `err_buf` populated.
+export fn zlsx_editor_save(
+    ed: *Editor,
+    out_path_ptr: [*]const u8,
+    out_path_len: usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state: *EditorState = @ptrCast(@alignCast(ed));
+    const out_path = out_path_ptr[0..out_path_len];
+    state.inner.save(out_path) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
 fn fuzzSeedCabi() u64 {
     if (std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_SEED")) |s| {
         defer std.heap.page_allocator.free(s);
@@ -3020,6 +3137,57 @@ test "writer C ABI: add_hyperlink + add_internal_hyperlink round-trip" {
     );
     try std.testing.expectEqual(@as(i32, -1), rc);
     try std.testing.expect(std.mem.indexOf(u8, &err_buf, "InvalidHyperlinkLocation") != null);
+}
+
+test "editor C ABI: open + append_row + save round-trip" {
+    const src_path = "/tmp/zlsx_c_abi_editor_src.xlsx";
+    const dst_path = "/tmp/zlsx_c_abi_editor_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+
+    // Build a source workbook through the writer.
+    {
+        var w = xlsx.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("D");
+        try s.writeRow(&.{ .{ .string = "alpha" }, .{ .integer = 1 } });
+        try w.save(src_path);
+    }
+
+    var err_buf: [128]u8 = undefined;
+    const path_z = try std.testing.allocator.dupeZ(u8, src_path);
+    defer std.testing.allocator.free(path_z);
+    const ed = zlsx_editor_open(path_z.ptr, &err_buf, err_buf.len);
+    try std.testing.expect(ed != null);
+    defer zlsx_editor_close(ed);
+
+    // Append a row via the C ABI: ["beta", 42, true].
+    const beta_str = "beta";
+    const empty_bytes: [*]const u8 = @ptrCast("");
+    const row = [_]CCell{
+        .{ .tag = @intFromEnum(CellTag.string), .str_len = beta_str.len, .str_ptr = beta_str.ptr, .i = 0, .f = 0, .b = 0, ._pad = [_]u8{0} ** 7 },
+        .{ .tag = @intFromEnum(CellTag.integer), .str_len = 0, .str_ptr = empty_bytes, .i = 42, .f = 0, .b = 0, ._pad = [_]u8{0} ** 7 },
+        .{ .tag = @intFromEnum(CellTag.boolean), .str_len = 0, .str_ptr = empty_bytes, .i = 0, .f = 0, .b = 1, ._pad = [_]u8{0} ** 7 },
+    };
+    const rc = zlsx_editor_append_row(ed.?, 0, &row, row.len, &err_buf, err_buf.len);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+
+    const rc_save = zlsx_editor_save(ed.?, dst_path.ptr, dst_path.len, &err_buf, err_buf.len);
+    try std.testing.expectEqual(@as(i32, 0), rc_save);
+
+    // Verify via the reader.
+    var book = try xlsx.Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    const r1 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("alpha", r1[0].string);
+    try std.testing.expectEqual(@as(i64, 1), r1[1].integer);
+    const r2 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("beta", r2[0].string);
+    try std.testing.expectEqual(@as(i64, 42), r2[1].integer);
+    try std.testing.expectEqual(true, r2[2].boolean);
+    try std.testing.expectEqual(@as(?[]const xlsx.Cell, null), try rows.next());
 }
 
 test "fuzz fromCCell: random tags never panic" {

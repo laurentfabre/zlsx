@@ -58,6 +58,8 @@ __all__ = [
     "to_excel_serial",
     "read",
     "ZlsxError",
+    "Editor",
+    "edit",
 ]
 
 
@@ -2498,3 +2500,105 @@ def write(path: Union[str, Path, None] = None) -> Writer:
             sheet.write_row(["Alice", 42])
     """
     return Writer(path)
+
+
+class Editor:
+    """Open an existing xlsx, append rows, save.
+
+    Append-only v1: cell types are ``None`` / ``bool`` / ``int`` /
+    ``float`` / ``str``. Rows are buffered in memory and applied
+    atomically on :meth:`save`. The source workbook must already
+    carry an ``xl/sharedStrings.xml`` part for string appends —
+    workbooks with only inline strings raise ``NoSstInSource``.
+
+    Use as a context manager so the underlying handle is dropped
+    deterministically::
+
+        with zlsx.edit("report.xlsx") as ed:
+            ed.append_rows(0, [["Carol", 9.5], ["Dave", 7.0]])
+            ed.save("report.xlsx")          # overwrite in place
+
+    Single-disk archives only; ZIP64 / multi-disk / encrypted /
+    data-descriptor archives are refused at open. Requires
+    libzlsx 0.2.7+."""
+
+    def __init__(self, path: Union[str, Path]):
+        if not _ffi._HAS_EDITOR:
+            raise RuntimeError(
+                "loaded libzlsx does not expose Editor (requires 0.2.7+); "
+                "upgrade libzlsx"
+            )
+        self._err = ctypes.create_string_buffer(_ERR_BUF_LEN)
+        encoded_path = str(path).encode("utf-8")
+        self._handle = _ffi.lib.zlsx_editor_open(encoded_path, self._err, _ERR_BUF_LEN)
+        if not self._handle:
+            raise ZlsxError(f"zlsx_editor_open: {_decode_err(self._err)}")
+
+    def append_rows(self, sheet_idx: int, rows) -> None:
+        """Buffer ``rows`` for append on ``sheet_idx``. Each row is
+        an iterable of ``None | bool | int | float | str``. Rows
+        are applied at :meth:`save` time, not now; multiple
+        ``append_rows`` calls accumulate in order."""
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        for row in rows:
+            cells_list = list(row)
+            n = len(cells_list)
+            if n == 0:
+                # Skip empty rows — Editor.appendRows would no-op
+                # them per its contract; passing 0-cell row through
+                # the FFI is wasteful.
+                continue
+            cell_array = (_ffi.Cell * n)()
+            keepers = []
+            for i, v in enumerate(cells_list):
+                cell, keeper = _py_value_to_cell(v)
+                cell_array[i] = cell
+                if keeper is not None:
+                    keepers.append(keeper)
+            rc = _ffi.lib.zlsx_editor_append_row(
+                self._handle,
+                int(sheet_idx),
+                ctypes.cast(cell_array, _ffi.cell_ptr),
+                n,
+                self._err,
+                _ERR_BUF_LEN,
+            )
+            del keepers
+            if rc != 0:
+                raise ZlsxError(
+                    f"zlsx_editor_append_row: {_decode_err(self._err)}"
+                )
+
+    def save(self, out_path: Union[str, Path]) -> None:
+        """Write the (mutated) workbook atomically to ``out_path``.
+        Pass the same path as the source to overwrite in place."""
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        encoded = str(out_path).encode("utf-8")
+        rc = _ffi.lib.zlsx_editor_save(
+            self._handle,
+            encoded,
+            len(encoded),
+            self._err,
+            _ERR_BUF_LEN,
+        )
+        if rc != 0:
+            raise ZlsxError(f"zlsx_editor_save: {_decode_err(self._err)}")
+
+    def close(self) -> None:
+        if self._handle:
+            _ffi.lib.zlsx_editor_close(self._handle)
+            self._handle = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
+def edit(path: Union[str, Path]) -> Editor:
+    """Open an existing xlsx for append-only mutation. See
+    :class:`Editor` for the full contract."""
+    return Editor(path)

@@ -96,6 +96,7 @@ book_handle = ctypes.c_void_p
 rows_handle = ctypes.c_void_p
 writer_handle = ctypes.c_void_p
 sheet_writer_handle = ctypes.c_void_p
+editor_handle = ctypes.c_void_p
 
 # ─── Function signatures ──────────────────────────────────────────────
 
@@ -995,3 +996,37 @@ if _found_abi != EXPECTED_ABI_VERSION:
         f"libzlsx ABI mismatch: py-zlsx expects v{EXPECTED_ABI_VERSION}, "
         f"loaded library reports v{_found_abi}. Upgrade one of them."
     )
+
+# Editor (libzlsx 0.2.7+): load-modify-save append path. Probed
+# independently so older dylibs that ship the rest of the surface
+# without `zlsx_editor_open` keep importing.
+_HAS_EDITOR = hasattr(lib, "zlsx_editor_open")
+if _HAS_EDITOR:
+    lib.zlsx_editor_open.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_open.restype = editor_handle
+
+    lib.zlsx_editor_close.argtypes = [editor_handle]
+    lib.zlsx_editor_close.restype = None
+
+    lib.zlsx_editor_append_row.argtypes = [
+        editor_handle,
+        ctypes.c_uint32,
+        cell_ptr,
+        ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_append_row.restype = ctypes.c_int32
+
+    lib.zlsx_editor_save.argtypes = [
+        editor_handle,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_save.restype = ctypes.c_int32
