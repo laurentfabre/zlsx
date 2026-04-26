@@ -4580,16 +4580,20 @@ fn buildSubstitutedSheet(
         sst,
     );
 
-    // Update `<dimension ref="A1:Z<row>"/>` to extend the row bound
-    // when the appended rows pushed past the source's declared
-    // dimension. Only the canonical self-closing form is touched;
-    // other shapes (no dimension / open-tag form / column-only ref)
-    // are left alone — Excel recomputes the dimension on its next
-    // save so staleness on those is tolerable.
+    // Update the canonical-form `<dimension ref="A1:Z<row>"/>` to
+    // extend both row AND column bounds when the appended rows
+    // pushed past the source's declared dimension. Other shapes
+    // (no dimension / open-tag form / single-cell ref) are left
+    // alone — Excel recomputes the dimension on its next save so
+    // staleness on those is tolerable.
     const new_max_row: u32 = start_row +
         @as(u32, @intCast(appended_rows.len)) - 1;
+    var new_max_col_1based: u32 = 0;
+    for (appended_rows) |row| {
+        if (row.len > new_max_col_1based) new_max_col_1based = @intCast(row.len);
+    }
     const new_xml = blk: {
-        if (try updateDimensionRow(allocator, injected, new_max_row)) |patched| {
+        if (try updateDimension(allocator, injected, new_max_row, new_max_col_1based)) |patched| {
             allocator.free(injected);
             break :blk patched;
         } else {
@@ -5055,15 +5059,21 @@ fn injectAppendedRows(
     return try spliced.toOwnedSlice(allocator);
 }
 
-/// Patch the row component of a canonical-form `<dimension
-/// ref="A1:Z<row>"/>` to `new_max_row` when the appended rows
-/// extend the declared range. Returns null when no patch is needed
-/// or the dimension isn't in canonical form (best-effort per the
-/// LMS plan v3 — single-cell refs and column-bound widening are
-/// out of scope; spreadsheet consumers rescan `<sheetData>` on open
-/// and Excel rewrites the dimension on its next save). Returns an
-/// owned new slice on success.
-fn updateDimensionRow(allocator: Allocator, xml: []const u8, new_max_row: u32) !?[]u8 {
+/// Patch a canonical-form `<dimension ref="TL:BR"/>` so the
+/// bottom-right corner's row component reaches `new_max_row` and
+/// its column component reaches `new_max_col_1based`. Returns null
+/// when no patch is needed or the dimension isn't in canonical
+/// range form (single-cell refs / open-tag form / namespaced attr
+/// remain best-effort per the LMS plan — Excel rescans
+/// `<sheetData>` on open and rewrites the dimension on its next
+/// save, so staleness on those is tolerable). Returns an owned new
+/// slice on success.
+fn updateDimension(
+    allocator: Allocator,
+    xml: []const u8,
+    new_max_row: u32,
+    new_max_col_1based: u32,
+) !?[]u8 {
     const dim_open = "<dimension ref=\"";
     const dim_pos = std.mem.indexOf(u8, xml, dim_open) orelse return null;
     const ref_start = dim_pos + dim_open.len;
@@ -5072,25 +5082,48 @@ fn updateDimensionRow(allocator: Allocator, xml: []const u8, new_max_row: u32) !
     const colon = std.mem.indexOfScalar(u8, ref, ':') orelse return null;
     const br = ref[colon + 1 ..];
     if (br.len == 0) return null;
-    // br is the bottom-right corner like "Z100". Find the digit
-    // suffix (where the row number lives).
+    // br is the bottom-right corner like "Z100". Split into letter
+    // prefix + digit suffix.
     var digit_start: usize = br.len;
     while (digit_start > 0 and br[digit_start - 1] >= '0' and br[digit_start - 1] <= '9') {
         digit_start -= 1;
     }
     if (digit_start == br.len or digit_start == 0) return null;
+    // Validate letter prefix is uppercase A-Z only.
+    for (br[0..digit_start]) |c| if (c < 'A' or c > 'Z') return null;
     const old_row = std.fmt.parseInt(u32, br[digit_start..], 10) catch return null;
-    if (new_max_row <= old_row) return null;
+    const old_col_1based = parseColLetters(br[0..digit_start]) orelse return null;
 
-    // Splice in the new row digits.
-    const digits_abs_start = ref_start + colon + 1 + digit_start;
-    const digits_abs_end = ref_end;
+    const final_row: u32 = @max(old_row, new_max_row);
+    const final_col_1based: u32 = @max(old_col_1based, new_max_col_1based);
+    if (final_row == old_row and final_col_1based == old_col_1based) return null;
+
+    // Splice the new bottom-right corner.
+    const br_abs_start = ref_start + colon + 1;
+    const br_abs_end = ref_end;
     var out: std.ArrayListUnmanaged(u8) = .{};
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, xml[0..digits_abs_start]);
-    try std.fmt.format(out.writer(allocator), "{d}", .{new_max_row});
-    try out.appendSlice(allocator, xml[digits_abs_end..]);
+    try out.appendSlice(allocator, xml[0..br_abs_start]);
+    var letter_buf: [8]u8 = undefined;
+    const letters = colLetterEditor(&letter_buf, final_col_1based - 1);
+    try out.appendSlice(allocator, letters);
+    try std.fmt.format(out.writer(allocator), "{d}", .{final_row});
+    try out.appendSlice(allocator, xml[br_abs_end..]);
     return try out.toOwnedSlice(allocator);
+}
+
+/// Parse uppercase A-Z letters as a 1-based Excel column index
+/// (A=1, B=2, ..., Z=26, AA=27, ..., XFD=16384). Returns null on
+/// empty input or anything past `max_col_1based`.
+fn parseColLetters(s: []const u8) ?u32 {
+    if (s.len == 0) return null;
+    var n: u32 = 0;
+    for (s) |c| {
+        if (c < 'A' or c > 'Z') return null;
+        n = n * 26 + (c - 'A' + 1);
+        if (n > max_col_1based) return null;
+    }
+    return n;
 }
 
 fn renderCellOoxml(
@@ -6188,6 +6221,39 @@ test "Editor: appendRows with string cells extends SST (iter-lms-3)" {
     // SST must have grown — original 1 entry + 3 appended strings
     // (no reuse, even though "alpha" repeats).
     try std.testing.expectEqual(@as(usize, 4), book.sharedStringsCount());
+}
+
+test "updateDimension widens row + column bounds together" {
+    const a = std.testing.allocator;
+    // Source dimension is A1:B2; append a 4-wide row past row 2 →
+    // expect A1:D5 (max row = 5, max col 1-based = 4 = D).
+    const xml = "<dimension ref=\"A1:B2\"/><sheetData/>";
+    const out = (try updateDimension(a, xml, 5, 4)) orelse return error.TestUnexpectedResult;
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<dimension ref=\"A1:D5\"/>") != null);
+
+    // Row-only widening (col already covers).
+    const xml2 = "<dimension ref=\"A1:Z9\"/>";
+    const out2 = (try updateDimension(a, xml2, 50, 5)) orelse return error.TestUnexpectedResult;
+    defer a.free(out2);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "<dimension ref=\"A1:Z50\"/>") != null);
+
+    // Col-only widening (row already covers).
+    const xml3 = "<dimension ref=\"A1:B100\"/>";
+    const out3 = (try updateDimension(a, xml3, 50, 27)) orelse return error.TestUnexpectedResult;
+    defer a.free(out3);
+    try std.testing.expect(std.mem.indexOf(u8, out3, "<dimension ref=\"A1:AA100\"/>") != null);
+
+    // No-op when both bounds already cover.
+    const xml4 = "<dimension ref=\"A1:Z100\"/>";
+    try std.testing.expectEqual(@as(?[]u8, null), try updateDimension(a, xml4, 50, 5));
+
+    // Single-cell refs and missing dimension stay null per the
+    // best-effort contract.
+    const xml5 = "<dimension ref=\"A1\"/>";
+    try std.testing.expectEqual(@as(?[]u8, null), try updateDimension(a, xml5, 99, 99));
+    const xml6 = "<sheetData/>";
+    try std.testing.expectEqual(@as(?[]u8, null), try updateDimension(a, xml6, 99, 99));
 }
 
 test "Rows.parseDate: auto-convert date-styled cells through the reader" {
