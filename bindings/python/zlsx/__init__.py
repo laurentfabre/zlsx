@@ -2541,25 +2541,34 @@ class Editor:
         ``append_rows`` calls accumulate in order."""
         if not self._handle:
             raise ZlsxError("editor is closed")
-        for row in rows:
+        # Pre-build every row before touching the FFI so a Python
+        # type error in row N+1 doesn't leave row 1..N already
+        # buffered in the native editor. (FFI-level failures past
+        # this point still leak partial state — the editor has no
+        # rollback transaction; that's an irreducible limit.)
+        rows_list = list(rows)
+        pre_built = []
+        for row in rows_list:
             cells_list = list(row)
             n = len(cells_list)
-            if n == 0:
-                # Skip empty rows — Editor.appendRows would no-op
-                # them per its contract; passing 0-cell row through
-                # the FFI is wasteful.
-                continue
-            cell_array = (_ffi.Cell * n)()
+            cell_array = (_ffi.Cell * n)() if n > 0 else None
             keepers = []
             for i, v in enumerate(cells_list):
                 cell, keeper = _py_value_to_cell(v)
                 cell_array[i] = cell
                 if keeper is not None:
                     keepers.append(keeper)
+            pre_built.append((cell_array, n, keepers))
+
+        # Empty rows are forwarded — they emit `<row r="N"></row>`
+        # in the saved sheet XML, which callers use as visual gaps
+        # between blocks.
+        for cell_array, n, keepers in pre_built:
+            cells_arg = ctypes.cast(cell_array, _ffi.cell_ptr) if cell_array is not None else None
             rc = _ffi.lib.zlsx_editor_append_row(
                 self._handle,
                 int(sheet_idx),
-                ctypes.cast(cell_array, _ffi.cell_ptr),
+                cells_arg,
                 n,
                 self._err,
                 _ERR_BUF_LEN,
@@ -2596,6 +2605,17 @@ class Editor:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+    def __del__(self):
+        # Match Book/Writer: the underlying allocation (full source
+        # buffer + entry table + buffered appends) can be sizeable.
+        # Best-effort finalize — the C ABI is reentrant-safe and
+        # null-tolerant, so a partially-initialized handle (e.g.
+        # init raised after _handle was set) still cleans up.
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def edit(path: Union[str, Path]) -> Editor:
