@@ -95,10 +95,14 @@ echo
 echo "(2) large fixtures —"
 for entry in "${large_files[@]}"; do fetch "$entry"; done
 
-# WDI ships as a zip-of-xlsx; extract idempotently.
+# WDI ships as a zip-of-xlsx; extract idempotently. Write to .tmp
+# first so a failed `unzip` (e.g. if the zip's internal layout
+# changes upstream) doesn't leave a half-baked file that future
+# runs treat as cached.
 if [[ -f "$dir/wdi_excel.zip" && ! -f "$dir/wdi_excel.xlsx" ]]; then
   printf '  ↻ %-44s (extracting from wdi_excel.zip)\n' "wdi_excel.xlsx"
-  unzip -p "$dir/wdi_excel.zip" WDIEXCEL.xlsx > "$dir/wdi_excel.xlsx"
+  unzip -p "$dir/wdi_excel.zip" WDIEXCEL.xlsx > "$dir/wdi_excel.xlsx.tmp"
+  mv "$dir/wdi_excel.xlsx.tmp" "$dir/wdi_excel.xlsx"
 fi
 
 echo
