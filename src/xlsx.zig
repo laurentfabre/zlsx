@@ -4112,6 +4112,19 @@ pub const Editor = struct {
     /// sheet become `#REF!` until the iter-col-1 formula tokenizer
     /// ships.
     pending_deletes: std.ArrayListUnmanaged(SheetDelete),
+    /// Pending row insertions (Phase 3e iter-row-2). Each entry
+    /// shifts every row at `before_row..` down by 1 in the named
+    /// sheet's worksheet XML at save time. v1 limitations: only
+    /// `<row r=>` + `<c r=>` row component + `<mergeCells>` ref +
+    /// `<dimension>` are rewritten; data validations, hyperlinks,
+    /// conditional formatting, defined names, formulas, drawings
+    /// and pivots are left unchanged. Refuse if any of those
+    /// elements exist (conservative guard).
+    pending_row_inserts: std.ArrayListUnmanaged(RowEdit),
+    /// Pending row deletions (Phase 3e iter-row-3). Same shape as
+    /// inserts: shifts every row > deleted_row up by 1. Same v1
+    /// limitations.
+    pending_row_deletes: std.ArrayListUnmanaged(RowEdit),
 
     /// Pending in-place cell mutations per sheet (Phase 3d / iter-cm-2).
     /// Each entry holds the decompressed-and-mutated worksheet XML
@@ -4141,6 +4154,13 @@ pub const Editor = struct {
             self.xml.deinit(allocator);
             self.spans.deinit(allocator);
         }
+    };
+
+    /// State for one Phase 3e (iter-row-2/3) row insert/delete.
+    pub const RowEdit = struct {
+        sheet_idx: u32,
+        row: u32, // 1-based; for insert this is `before_row`,
+        // for delete this is the row to remove.
     };
 
     /// State for one Phase 3e (iter-sheet-3) sheet deletion.
@@ -4403,6 +4423,8 @@ pub const Editor = struct {
             .pending_new_sheets = .{},
             .pending_renames = .{},
             .pending_deletes = .{},
+            .pending_row_inserts = .{},
+            .pending_row_deletes = .{},
         };
     }
 
@@ -4432,6 +4454,8 @@ pub const Editor = struct {
         self.pending_renames.deinit(self.allocator);
         for (self.pending_deletes.items) |*d| d.deinit(self.allocator);
         self.pending_deletes.deinit(self.allocator);
+        self.pending_row_inserts.deinit(self.allocator);
+        self.pending_row_deletes.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -4529,7 +4553,9 @@ pub const Editor = struct {
             self.pending_mutations.count() == 0 and
             self.pending_new_sheets.items.len == 0 and
             self.pending_renames.items.len == 0 and
-            self.pending_deletes.items.len == 0)
+            self.pending_deletes.items.len == 0 and
+            self.pending_row_inserts.items.len == 0 and
+            self.pending_row_deletes.items.len == 0)
         {
             try w.writeAll(self.src_buf);
             try atomic_file.finish();
@@ -4587,6 +4613,7 @@ pub const Editor = struct {
 
         // Build substituted entries for each modified sheet.
         const subs = try self.allocator.alloc(?SubstitutedEntry, self.entries.len);
+        for (subs) |*slot| slot.* = null;
         defer {
             for (subs) |maybe_sub| if (maybe_sub) |s| {
                 self.allocator.free(s.lfh);
@@ -4595,7 +4622,33 @@ pub const Editor = struct {
             };
             self.allocator.free(subs);
         }
-        for (subs) |*slot| slot.* = null;
+
+        // Phase 3e iter-row-2/3: apply row inserts + deletes by
+        // building a substituted sheet entry per affected sheet.
+        // Each sheet has at most one pending row edit (recordRowEdit
+        // enforces that), so order doesn't matter.
+        for (self.pending_row_inserts.items) |edit| {
+            const path = self.sheet_paths[edit.sheet_idx];
+            const entry_idx = findEntryByName(self.entries, path) orelse
+                return error.SheetEntryNotFound;
+            const entry = self.entries[entry_idx];
+            const payload_bytes = self.src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
+            const src_xml = try decompressZipPayload(self.allocator, payload_bytes, entry.compression_method, entry.uncompressed_size);
+            defer self.allocator.free(src_xml);
+            const new_xml = try applyRowEditToWorksheet(self.allocator, src_xml, edit.row, .insert);
+            subs[entry_idx] = try buildEntryFromXml(self.allocator, path, new_xml);
+        }
+        for (self.pending_row_deletes.items) |edit| {
+            const path = self.sheet_paths[edit.sheet_idx];
+            const entry_idx = findEntryByName(self.entries, path) orelse
+                return error.SheetEntryNotFound;
+            const entry = self.entries[entry_idx];
+            const payload_bytes = self.src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
+            const src_xml = try decompressZipPayload(self.allocator, payload_bytes, entry.compression_method, entry.uncompressed_size);
+            defer self.allocator.free(src_xml);
+            const new_xml = try applyRowEditToWorksheet(self.allocator, src_xml, edit.row, .delete);
+            subs[entry_idx] = try buildEntryFromXml(self.allocator, path, new_xml);
+        }
 
         var pa_iter = self.pending_appends.iterator();
         while (pa_iter.next()) |kv| {
@@ -5535,6 +5588,86 @@ pub const Editor = struct {
         self.allocator.free(old_paths[sheet_idx]);
         self.sheet_paths = new_paths;
         self.allocator.free(old_paths);
+    }
+
+    /// Insert a blank row at position `before_row` in sheet
+    /// `sheet_idx` (Phase 3e, iter-row-2). Every existing row at
+    /// or below `before_row` shifts down by 1. v1 limitations:
+    ///   - Worksheet XML rewrites: <row r="N"> renumber, <c r="A1">
+    ///     row component, <mergeCells> rect bounds, <dimension>.
+    ///   - Refuses if the worksheet contains <hyperlinks>,
+    ///     <dataValidations>, <conditionalFormatting>, <f>
+    ///     formulas, or any <drawing>/<picture> reference — those
+    ///     can carry row indices we don't yet rewrite.
+    ///   - The sheet must not have other pending mutations
+    ///     (setCell / appendRows / row inserts/deletes); save
+    ///     first to apply those.
+    pub fn insertRow(self: *Editor, sheet_idx: u32, before_row: u32) !void {
+        try self.recordRowEdit(sheet_idx, before_row, &self.pending_row_inserts, true);
+    }
+
+    /// Delete row `row` in sheet `sheet_idx` (Phase 3e, iter-row-3).
+    /// Every row > `row` shifts up by 1. Same v1 limitations as
+    /// `insertRow`.
+    pub fn deleteRow(self: *Editor, sheet_idx: u32, row: u32) !void {
+        try self.recordRowEdit(sheet_idx, row, &self.pending_row_deletes, false);
+    }
+
+    fn recordRowEdit(
+        self: *Editor,
+        sheet_idx: u32,
+        row: u32,
+        list: *std.ArrayListUnmanaged(RowEdit),
+        is_insert: bool,
+    ) !void {
+        _ = is_insert;
+        if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
+        if (row == 0 or row > max_row) return error.RowIndexOutOfRange;
+        // Conservative: refuse when other mutations target this
+        // sheet (would need cross-pending state shifts we don't
+        // model in v1).
+        if (self.pending_appends.contains(sheet_idx) or
+            self.pending_mutations.contains(sheet_idx))
+        {
+            return error.RowEditRequiresCleanSheet;
+        }
+        for (self.pending_row_inserts.items) |e| {
+            if (e.sheet_idx == sheet_idx) return error.RowEditRequiresCleanSheet;
+        }
+        for (self.pending_row_deletes.items) |e| {
+            if (e.sheet_idx == sheet_idx) return error.RowEditRequiresCleanSheet;
+        }
+
+        // Conservative content guard: scan the worksheet XML for
+        // elements that v1 doesn't rewrite. If any are present,
+        // refuse rather than silently corrupt the workbook.
+        const path = self.sheet_paths[sheet_idx];
+        if (self.findPendingNewSheet(path)) |_| {
+            // New sheet: empty body, no risky elements.
+        } else if (findEntryByName(self.entries, path)) |entry_idx| {
+            const e = self.entries[entry_idx];
+            const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
+            const xml = try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
+            defer self.allocator.free(xml);
+            const guards = [_][]const u8{
+                "<hyperlinks",
+                "<dataValidations",
+                "<conditionalFormatting",
+                "<f>",
+                "<f ",
+                "<f/",
+                "<drawing",
+                "<legacyDrawing",
+                "<picture",
+            };
+            for (guards) |g| {
+                if (std.mem.indexOf(u8, xml, g) != null) {
+                    return error.RowEditUnsafeForSheet;
+                }
+            }
+        } else return error.SheetEntryNotFound;
+
+        try list.append(self.allocator, .{ .sheet_idx = sheet_idx, .row = row });
     }
 
     /// True when some sheet has an effective name matching
@@ -6622,6 +6755,342 @@ fn patchContentTypesForNewSheets(
     }
     try out.appendSlice(allocator, xml[close..]);
     return try out.toOwnedSlice(allocator);
+}
+
+/// Apply one row edit (insert or delete at `row`) to a worksheet
+/// XML buffer. iter-row-2/3 v1: rewrites `<row r=>` (renumber or
+/// drop), `<c r="A1">` row component, `<mergeCells>` rect bounds,
+/// and `<dimension>`. Other elements pass through verbatim — the
+/// caller's recordRowEdit guard refuses sheets that contain
+/// formulas / hyperlinks / validations / cond-formats / drawings,
+/// so we don't have to handle those here.
+const RowEditKind = enum { insert, delete };
+
+fn applyRowEditToWorksheet(
+    allocator: Allocator,
+    src: []const u8,
+    row: u32,
+    kind: RowEditKind,
+) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < src.len) {
+        // Find the next interesting tag opening.
+        const next_lt = std.mem.indexOfScalarPos(u8, src, i, '<') orelse {
+            try out.appendSlice(allocator, src[i..]);
+            return try out.toOwnedSlice(allocator);
+        };
+        try out.appendSlice(allocator, src[i..next_lt]);
+        i = next_lt;
+
+        // Identify which tag we're at.
+        if (matchTagAt(src, i, "row")) |t| {
+            try processRowTag(allocator, &out, src, t, row, kind, &i);
+        } else if (matchTagAt(src, i, "c")) |t| {
+            try processCellTag(allocator, &out, src, t, row, kind);
+            i = t.after_open;
+        } else if (matchTagAt(src, i, "mergeCell")) |t| {
+            try processMergeCellTag(allocator, &out, src, t, row, kind);
+            i = t.after_open;
+        } else if (matchTagAt(src, i, "dimension")) |t| {
+            try processDimensionTag(allocator, &out, src, t, row, kind);
+            i = t.after_open;
+        } else {
+            // Some other tag; emit `<` and continue past it.
+            try out.append(allocator, '<');
+            i += 1;
+        }
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn matchTagAt(src: []const u8, i: usize, tag: []const u8) ?TagOpen {
+    if (i >= src.len or src[i] != '<') return null;
+    const after = i + 1 + tag.len;
+    if (after > src.len) return null;
+    if (!std.mem.eql(u8, src[i + 1 .. i + 1 + tag.len], tag)) return null;
+    const c = src[after];
+    if (c != ' ' and c != '\t' and c != '\n' and c != '\r' and c != '/' and c != '>') return null;
+    const gt = std.mem.indexOfScalarPos(u8, src, i, '>') orelse return null;
+    return .{ .start = i, .after_open = gt + 1 };
+}
+
+fn processRowTag(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    row: u32,
+    kind: RowEditKind,
+    i: *usize,
+) !void {
+    const attrs = src[t.start + "<row".len .. t.after_open - 1];
+    const trimmed = std.mem.trimRight(u8, attrs, " \t\r\n");
+    const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
+    const attrs_for_lookup = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
+    const r_attr = getAttr(attrs_for_lookup, "r");
+    const old_r: ?u32 = if (r_attr) |s| (std.fmt.parseInt(u32, s, 10) catch null) else null;
+
+    // Decide: drop entirely (delete-match), shift, or pass-through.
+    var drop = false;
+    var new_r: ?u32 = null;
+    if (old_r) |r_val| {
+        switch (kind) {
+            .insert => if (r_val >= row) {
+                new_r = r_val + 1;
+            },
+            .delete => if (r_val == row) {
+                drop = true;
+            } else if (r_val > row) {
+                new_r = r_val - 1;
+            },
+        }
+    }
+
+    if (drop) {
+        // Skip the entire <row>...</row> block. For self-closing
+        // form, just skip the opener.
+        if (is_self_closing) {
+            i.* = t.after_open;
+        } else {
+            const close = std.mem.indexOfPos(u8, src, t.after_open, "</row>") orelse t.after_open;
+            i.* = if (close + "</row>".len <= src.len) close + "</row>".len else t.after_open;
+        }
+        return;
+    }
+
+    // Emit the row open with possibly-rewritten r=.
+    if (new_r == null and old_r != null) {
+        // Same row number — emit verbatim.
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        i.* = t.after_open;
+        // If body form, also recursively process inner tags via
+        // the outer loop (they include <c> tags whose row will
+        // be rewritten on subsequent iterations).
+        return;
+    }
+    if (new_r == null) {
+        // No r= attribute at all — pass through.
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        i.* = t.after_open;
+        return;
+    }
+    // Rewrite r="..." to the new value.
+    try writeWithReplacedRowAttr(allocator, out, src, t, "<row".len, new_r.?);
+    i.* = t.after_open;
+}
+
+fn processCellTag(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    row: u32,
+    kind: RowEditKind,
+) !void {
+    const attrs = src[t.start + "<c".len .. t.after_open - 1];
+    const trimmed = std.mem.trimRight(u8, attrs, " \t\r\n");
+    const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
+    const attrs_for_lookup = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
+    const r_attr = getAttr(attrs_for_lookup, "r");
+    if (r_attr == null) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    }
+    const ref = r_attr.?;
+    var letters_end: usize = 0;
+    while (letters_end < ref.len and ref[letters_end] >= 'A' and ref[letters_end] <= 'Z') letters_end += 1;
+    if (letters_end == 0 or letters_end == ref.len) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    }
+    const old_row = std.fmt.parseInt(u32, ref[letters_end..], 10) catch {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    };
+    var new_row: u32 = old_row;
+    switch (kind) {
+        .insert => if (old_row >= row) {
+            new_row = old_row + 1;
+        },
+        .delete => if (old_row > row) {
+            new_row = old_row - 1;
+        }, // (a cell at the deleted row is dropped along with the <row> block)
+    }
+    if (new_row == old_row) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    }
+    // Rewrite the r= attribute, preserving column letters.
+    var new_ref_buf: [16]u8 = undefined;
+    const new_ref = try std.fmt.bufPrint(&new_ref_buf, "{s}{d}", .{ ref[0..letters_end], new_row });
+    try writeWithReplacedAttr(allocator, out, src, t, "<c".len, "r", new_ref);
+}
+
+fn processMergeCellTag(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    row: u32,
+    kind: RowEditKind,
+) !void {
+    const attrs = src[t.start + "<mergeCell".len .. t.after_open - 1];
+    const r_attr = getAttr(attrs, "ref");
+    if (r_attr == null) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    }
+    const ref = r_attr.?;
+    const colon = std.mem.indexOfScalar(u8, ref, ':') orelse {
+        // Single-cell merge — same logic as <c> ref.
+        var new_ref_buf: [16]u8 = undefined;
+        const new_ref = shiftSingleA1(ref, row, kind, &new_ref_buf) catch {
+            try out.appendSlice(allocator, src[t.start..t.after_open]);
+            return;
+        };
+        if (std.mem.eql(u8, ref, new_ref)) {
+            try out.appendSlice(allocator, src[t.start..t.after_open]);
+            return;
+        }
+        try writeWithReplacedAttr(allocator, out, src, t, "<mergeCell".len, "ref", new_ref);
+        return;
+    };
+    var tl_buf: [16]u8 = undefined;
+    var br_buf: [16]u8 = undefined;
+    const tl_new = shiftSingleA1(ref[0..colon], row, kind, &tl_buf) catch {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    };
+    const br_new = shiftSingleA1(ref[colon + 1 ..], row, kind, &br_buf) catch {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    };
+    var new_ref_buf: [40]u8 = undefined;
+    const new_ref = try std.fmt.bufPrint(&new_ref_buf, "{s}:{s}", .{ tl_new, br_new });
+    if (std.mem.eql(u8, ref, new_ref)) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    }
+    try writeWithReplacedAttr(allocator, out, src, t, "<mergeCell".len, "ref", new_ref);
+}
+
+fn processDimensionTag(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    row: u32,
+    kind: RowEditKind,
+) !void {
+    // Reuse mergeCell logic — same `ref="A1:Z100"` / `ref="A1"` shape.
+    const attrs = src[t.start + "<dimension".len .. t.after_open - 1];
+    const r_attr = getAttr(attrs, "ref");
+    if (r_attr == null) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    }
+    const ref = r_attr.?;
+    const colon = std.mem.indexOfScalar(u8, ref, ':') orelse {
+        var b: [16]u8 = undefined;
+        const new_ref = shiftSingleA1(ref, row, kind, &b) catch {
+            try out.appendSlice(allocator, src[t.start..t.after_open]);
+            return;
+        };
+        if (std.mem.eql(u8, ref, new_ref)) {
+            try out.appendSlice(allocator, src[t.start..t.after_open]);
+            return;
+        }
+        try writeWithReplacedAttr(allocator, out, src, t, "<dimension".len, "ref", new_ref);
+        return;
+    };
+    var tl_buf: [16]u8 = undefined;
+    var br_buf: [16]u8 = undefined;
+    const tl_new = shiftSingleA1(ref[0..colon], row, kind, &tl_buf) catch {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    };
+    const br_new = shiftSingleA1(ref[colon + 1 ..], row, kind, &br_buf) catch {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    };
+    var new_ref_buf: [40]u8 = undefined;
+    const new_ref = try std.fmt.bufPrint(&new_ref_buf, "{s}:{s}", .{ tl_new, br_new });
+    if (std.mem.eql(u8, ref, new_ref)) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    }
+    try writeWithReplacedAttr(allocator, out, src, t, "<dimension".len, "ref", new_ref);
+}
+
+fn shiftSingleA1(ref: []const u8, row: u32, kind: RowEditKind, buf: *[16]u8) ![]const u8 {
+    var letters_end: usize = 0;
+    while (letters_end < ref.len and ref[letters_end] >= 'A' and ref[letters_end] <= 'Z') letters_end += 1;
+    if (letters_end == 0 or letters_end == ref.len) return error.MalformedXml;
+    const old_row = std.fmt.parseInt(u32, ref[letters_end..], 10) catch return error.MalformedXml;
+    var new_row: u32 = old_row;
+    switch (kind) {
+        .insert => if (old_row >= row) {
+            new_row = old_row + 1;
+        },
+        .delete => if (old_row > row) {
+            new_row = old_row - 1;
+        },
+    }
+    if (new_row == old_row) {
+        @memcpy(buf[0..ref.len], ref);
+        return buf[0..ref.len];
+    }
+    return try std.fmt.bufPrint(buf, "{s}{d}", .{ ref[0..letters_end], new_row });
+}
+
+/// Emit the original `<tag attrs>` with `attr_name="..."` value
+/// replaced by `new_value`. `tag_name_len` is the length of the
+/// tag name including the leading `<` (e.g. `"<c".len` = 2).
+fn writeWithReplacedAttr(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    tag_name_len: usize,
+    attr_name: []const u8,
+    new_value: []const u8,
+) !void {
+    const attrs_full_start = t.start + tag_name_len;
+    const attrs_full_end = t.after_open - 1;
+    const attrs = src[attrs_full_start..attrs_full_end];
+    // Find the `name="..."` occurrence inside attrs.
+    var pat_buf: [32]u8 = undefined;
+    const pat = try std.fmt.bufPrint(&pat_buf, "{s}=\"", .{attr_name});
+    const pat_off = std.mem.indexOf(u8, attrs, pat) orelse {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    };
+    const val_start_in_src = attrs_full_start + pat_off + pat.len;
+    const val_end_in_src = std.mem.indexOfScalarPos(u8, src, val_start_in_src, '"') orelse {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    };
+    try out.appendSlice(allocator, src[t.start..val_start_in_src]);
+    try out.appendSlice(allocator, new_value);
+    try out.appendSlice(allocator, src[val_end_in_src..t.after_open]);
+}
+
+/// Rewrite the row attribute on `<row r="…">`. Just delegates to
+/// writeWithReplacedAttr formatted as a number.
+fn writeWithReplacedRowAttr(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    tag_name_len: usize,
+    new_row: u32,
+) !void {
+    var buf: [16]u8 = undefined;
+    const s = try std.fmt.bufPrint(&buf, "{d}", .{new_row});
+    try writeWithReplacedAttr(allocator, out, src, t, tag_name_len, "r", s);
 }
 
 /// Drop the calcChain `<Relationship/>` (Type ends with
@@ -9420,6 +9889,111 @@ test "Editor: addSheet escapes quotes in name attribute" {
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
     try std.testing.expectEqualStrings("He said \"Hi\"", book.sheets[1].name);
+}
+
+test "applyRowEditToWorksheet: delete drops the row's <row> block" {
+    const src =
+        "<worksheet><dimension ref=\"A1:A3\"/><sheetData>" ++
+        "<row r=\"1\"><c r=\"A1\"><v>10</v></c></row>" ++
+        "<row r=\"2\"><c r=\"A2\"><v>20</v></c></row>" ++
+        "<row r=\"3\"><c r=\"A3\"><v>30</v></c></row>" ++
+        "</sheetData></worksheet>";
+    const out = try applyRowEditToWorksheet(std.testing.allocator, src, 2, .delete);
+    defer std.testing.allocator.free(out);
+    // Should not contain `<v>20</v>` anymore.
+    try std.testing.expect(std.mem.indexOf(u8, out, "<v>20</v>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<v>10</v>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<v>30</v>") != null);
+    // Row 3 should have been renumbered to row 2.
+    try std.testing.expect(std.mem.indexOf(u8, out, "<row r=\"2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<row r=\"3\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "r=\"A2\"") != null);
+}
+
+test "Editor: insertRow shifts existing rows down (iter-row-2)" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_insertrow_src.xlsx";
+    const dst_path = "/tmp/zlsx_insertrow_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try s.writeRow(&.{.{ .integer = 2 }});
+        try s.writeRow(&.{.{ .integer = 3 }});
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertRow(0, 2); // insert blank row before row 2
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    // Three populated rows yield (the inserted row 2 has no <row>
+    // element, so the iterator skips it). Original row numbers
+    // 1, 2, 3 now live at rows 1, 3, 4.
+    const r1 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 1), r1[0].integer);
+    const r2 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 2), r2[0].integer);
+    const r3 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 3), r3[0].integer);
+    try std.testing.expectEqual(@as(?[]const Cell, null), try rows.next());
+}
+
+test "Editor: deleteRow removes a row + shifts everything below up" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_deleterow_src.xlsx";
+    const dst_path = "/tmp/zlsx_deleterow_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .integer = 10 }});
+        try s.writeRow(&.{.{ .integer = 20 }});
+        try s.writeRow(&.{.{ .integer = 30 }});
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.deleteRow(0, 2);
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    const r1 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 10), r1[0].integer);
+    const r2 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 30), r2[0].integer);
+    try std.testing.expectEqual(@as(?[]const Cell, null), try rows.next());
+}
+
+test "Editor: insertRow rejects sheets with formulas/hyperlinks" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_row_unsafe.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRowWithFormulas(&.{.{ .integer = 0 }}, &.{"SUM(A1:A1)"});
+        try w.save(src_path);
+    }
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 1));
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 1));
 }
 
 test "Editor: deleteSheet drops a source sheet (iter-sheet-3)" {
