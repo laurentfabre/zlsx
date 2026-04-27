@@ -4099,6 +4099,13 @@ pub const Editor = struct {
     /// `setCell` / `scanWorksheet` calls can target the new sheet
     /// by its returned index.
     pending_new_sheets: std.ArrayListUnmanaged(NewSheet),
+    /// Pending sheet renames (Phase 3e iter-sheet-2). Each entry
+    /// patches the matching `<sheet name="OLD"…>` line in
+    /// `xl/workbook.xml` to use the new name. v1 limitation:
+    /// formulas in OTHER sheets that reference the renamed sheet
+    /// by name (`'OLD'!A1`) are NOT rewritten — that requires a
+    /// formula tokenizer (iter-col-1).
+    pending_renames: std.ArrayListUnmanaged(SheetRename),
 
     /// Pending in-place cell mutations per sheet (Phase 3d / iter-cm-2).
     /// Each entry holds the decompressed-and-mutated worksheet XML
@@ -4127,6 +4134,18 @@ pub const Editor = struct {
         pub fn deinit(self: *MutatedSheet, allocator: Allocator) void {
             self.xml.deinit(allocator);
             self.spans.deinit(allocator);
+        }
+    };
+
+    /// State for one Phase 3e (iter-sheet-2) sheet rename.
+    pub const SheetRename = struct {
+        sheet_idx: u32,
+        old_name: []u8,
+        new_name: []u8,
+
+        pub fn deinit(self: *SheetRename, alloc: Allocator) void {
+            alloc.free(self.old_name);
+            alloc.free(self.new_name);
         }
     };
 
@@ -4358,6 +4377,7 @@ pub const Editor = struct {
             .pending_appends = .{},
             .pending_mutations = .{},
             .pending_new_sheets = .{},
+            .pending_renames = .{},
         };
     }
 
@@ -4383,6 +4403,8 @@ pub const Editor = struct {
         self.pending_mutations.deinit(self.allocator);
         for (self.pending_new_sheets.items) |*s| s.deinit(self.allocator);
         self.pending_new_sheets.deinit(self.allocator);
+        for (self.pending_renames.items) |*r| r.deinit(self.allocator);
+        self.pending_renames.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -4478,7 +4500,8 @@ pub const Editor = struct {
 
         if (self.pending_appends.count() == 0 and
             self.pending_mutations.count() == 0 and
-            self.pending_new_sheets.items.len == 0)
+            self.pending_new_sheets.items.len == 0 and
+            self.pending_renames.items.len == 0)
         {
             try w.writeAll(self.src_buf);
             try atomic_file.finish();
@@ -4739,6 +4762,22 @@ pub const Editor = struct {
                 "[Content_Types].xml",
                 self.pending_new_sheets.items,
                 patchContentTypesForNewSheets,
+            );
+        }
+
+        // Phase 3e iter-sheet-2: pending sheet renames. Composes
+        // through patchEntryForRenames's re-substitution path, so
+        // it stacks correctly on top of any prior workbook.xml
+        // modification (addSheet's <sheets> patch).
+        if (self.pending_renames.items.len > 0) {
+            try patchEntryForRenames(
+                self.allocator,
+                self.entries,
+                self.src_buf,
+                subs,
+                "xl/workbook.xml",
+                self.pending_renames.items,
+                patchWorkbookXmlForRenames,
             );
         }
 
@@ -5236,6 +5275,151 @@ pub const Editor = struct {
         self.allocator.free(old_paths); // inner strings still owned by their original allocs
 
         return @intCast(old_paths.len);
+    }
+
+    /// Rename a sheet (Phase 3e, iter-sheet-2). v1 patches only
+    /// `xl/workbook.xml` — formulas in other sheets that reference
+    /// this sheet by name (`'OLD'!A1`) are NOT rewritten. A real
+    /// formula tokenizer (iter-col-1) will close that gap. The
+    /// caller-visible contract: rename succeeds even when cross-
+    /// sheet refs exist; those refs become `#REF!` in Excel until
+    /// the next iter ships.
+    pub fn renameSheet(self: *Editor, sheet_idx: u32, new_name: []const u8) !void {
+        if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
+        const writer_mod = @import("writer.zig");
+        try writer_mod.validateSheetName(new_name);
+
+        // Resolve current name. For a source sheet, look it up via
+        // workbook.xml; for a pending-new-sheet, use the NewSheet
+        // entry's name field.
+        const path = self.sheet_paths[sheet_idx];
+        var current_name: []u8 = undefined;
+        var current_owned = false;
+        if (self.findPendingNewSheet(path)) |ns_idx| {
+            current_name = self.pending_new_sheets.items[ns_idx].name;
+        } else {
+            current_name = try self.sheetNameAtPath(path) orelse return error.SheetEntryNotFound;
+            current_owned = true;
+        }
+        defer if (current_owned) self.allocator.free(current_name);
+
+        // No-op (case-insensitive same name).
+        if (writer_mod.asciiEqlFold(current_name, new_name)) return;
+
+        // Reject duplicates against EVERY other sheet name (source +
+        // pending new + pending renames' new_name).
+        if (try self.sheetNameExists(new_name)) {
+            // sheetNameExists matches against the current source name
+            // too — a rename's new_name might equal the OLD name of
+            // another rename, which is fine. Cheapest fix: only
+            // reject if the matched sheet isn't the one we're renaming.
+            if (!writer_mod.asciiEqlFold(current_name, new_name)) {
+                // We already short-circuited the "rename to same"
+                // case above, so this branch always fires.
+                return error.DuplicateSheetName;
+            }
+        }
+        for (self.pending_new_sheets.items) |s| {
+            if (writer_mod.asciiEqlFold(s.name, new_name)) return error.DuplicateSheetName;
+        }
+        for (self.pending_renames.items) |r| {
+            if (r.sheet_idx == sheet_idx) continue;
+            if (writer_mod.asciiEqlFold(r.new_name, new_name)) return error.DuplicateSheetName;
+        }
+
+        // Pending-new-sheet path: mutate the NewSheet's name in
+        // place, no workbook.xml patch needed (the sheet doesn't
+        // exist there yet).
+        if (self.findPendingNewSheet(path)) |ns_idx| {
+            const ns = &self.pending_new_sheets.items[ns_idx];
+            const new_owned = try self.allocator.dupe(u8, new_name);
+            self.allocator.free(ns.name);
+            ns.name = new_owned;
+            return;
+        }
+
+        // Source sheet path: record the rename for save-time
+        // workbook.xml patch. If a previous rename targeted the
+        // same sheet, replace its new_name (don't accumulate).
+        for (self.pending_renames.items) |*r| {
+            if (r.sheet_idx == sheet_idx) {
+                const replaced = try self.allocator.dupe(u8, new_name);
+                self.allocator.free(r.new_name);
+                r.new_name = replaced;
+                return;
+            }
+        }
+        const old_dup = try self.allocator.dupe(u8, current_name);
+        errdefer self.allocator.free(old_dup);
+        const new_dup = try self.allocator.dupe(u8, new_name);
+        errdefer self.allocator.free(new_dup);
+        try self.pending_renames.append(self.allocator, .{
+            .sheet_idx = sheet_idx,
+            .old_name = old_dup,
+            .new_name = new_dup,
+        });
+    }
+
+    /// Look up the source workbook's sheet name for a given path.
+    /// Returns an owned dupe of the (entity-decoded) name, or null
+    /// when no source `<sheet …r:id…>` references this path.
+    fn sheetNameAtPath(self: *Editor, target_path: []const u8) !?[]u8 {
+        const wb = try self.readEntry("xl/workbook.xml");
+        defer self.allocator.free(wb);
+        const rels = try self.readEntry("xl/_rels/workbook.xml.rels");
+        defer self.allocator.free(rels);
+
+        // For each <sheet …/> in workbook.xml, get its r:id, look
+        // up the rels Target, compare to `target_path`. Match on
+        // either "xl/" + Target OR Target alone.
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, wb, i, "<sheet ")) |sh_pos| {
+            const sh_end = std.mem.indexOfScalarPos(u8, wb, sh_pos, '>') orelse break;
+            const sh_attrs = wb[sh_pos + "<sheet ".len .. sh_end];
+            const rid = getAttr(sh_attrs, "r:id") orelse {
+                i = sh_end + 1;
+                continue;
+            };
+            const name_raw = getAttr(sh_attrs, "name") orelse {
+                i = sh_end + 1;
+                continue;
+            };
+            // Find the rels Target for this rId.
+            var rels_i: usize = 0;
+            while (std.mem.indexOfPos(u8, rels, rels_i, "<Relationship")) |rel_pos| {
+                const rel_end = std.mem.indexOfScalarPos(u8, rels, rel_pos, '>') orelse break;
+                const rel_attrs = rels[rel_pos + "<Relationship".len .. rel_end];
+                const id = getAttr(rel_attrs, "Id") orelse {
+                    rels_i = rel_end + 1;
+                    continue;
+                };
+                if (!std.mem.eql(u8, id, rid)) {
+                    rels_i = rel_end + 1;
+                    continue;
+                }
+                const target = getAttr(rel_attrs, "Target") orelse {
+                    rels_i = rel_end + 1;
+                    continue;
+                };
+                // Resolve relative to xl/.
+                var matches = std.mem.eql(u8, target, target_path);
+                if (!matches) {
+                    var prefixed_buf: [256]u8 = undefined;
+                    const prefixed = std.fmt.bufPrint(&prefixed_buf, "xl/{s}", .{target}) catch break;
+                    matches = std.mem.eql(u8, prefixed, target_path);
+                }
+                if (matches) {
+                    // Decode entities and return owned dupe.
+                    var decoded: std.ArrayListUnmanaged(u8) = .{};
+                    errdefer decoded.deinit(self.allocator);
+                    try decodeXmlAttrInto(self.allocator, &decoded, name_raw);
+                    return try decoded.toOwnedSlice(self.allocator);
+                }
+                rels_i = rel_end + 1;
+            }
+            i = sh_end + 1;
+        }
+        return null;
     }
 
     /// True when `xl/workbook.xml` already declares a `<sheet>` with
@@ -6041,6 +6225,105 @@ fn nextMaxSheetPathNum(entries: []const Editor.ZipEntry) u32 {
     return max_n;
 }
 
+/// Rewrite `xl/workbook.xml`'s `<sheet name="OLD"…/>` to use the
+/// new name for each pending rename. Iter-sheet-2. Old name match
+/// is via XML-escaped form so producers that store
+/// `name="R&amp;D"` for the user-facing `R&D` are correctly hit.
+fn patchWorkbookXmlForRenames(
+    allocator: Allocator,
+    xml: []const u8,
+    renames: []const Editor.SheetRename,
+) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, i, "<sheet ")) |sh_pos| {
+        // Copy bytes up to (and including) the `<sheet ` opener.
+        try out.appendSlice(allocator, xml[i .. sh_pos + "<sheet ".len]);
+        const sh_end = std.mem.indexOfScalarPos(u8, xml, sh_pos, '>') orelse {
+            // Malformed — emit the rest verbatim.
+            try out.appendSlice(allocator, xml[sh_pos + "<sheet ".len ..]);
+            return try out.toOwnedSlice(allocator);
+        };
+        const attrs = xml[sh_pos + "<sheet ".len .. sh_end];
+
+        // Decode current name and check against each rename's old.
+        var matched_new: ?[]const u8 = null;
+        if (getAttr(attrs, "name")) |raw| {
+            var decoded: std.ArrayListUnmanaged(u8) = .{};
+            defer decoded.deinit(allocator);
+            try decodeXmlAttrInto(allocator, &decoded, raw);
+            for (renames) |r| {
+                const writer_mod = @import("writer.zig");
+                if (writer_mod.asciiEqlFold(decoded.items, r.old_name)) {
+                    matched_new = r.new_name;
+                    break;
+                }
+            }
+        }
+
+        if (matched_new) |new_name| {
+            // Rewrite the `name="..."` attribute. Walk attrs and
+            // emit verbatim except the name field, which we
+            // replace with the escaped new value.
+            var ai: usize = 0;
+            while (ai < attrs.len) {
+                // Skip whitespace.
+                while (ai < attrs.len and (attrs[ai] == ' ' or
+                    attrs[ai] == '\t' or attrs[ai] == '\n' or
+                    attrs[ai] == '\r')) : (ai += 1)
+                {
+                    try out.append(allocator, attrs[ai]);
+                }
+                if (ai >= attrs.len) break;
+                // Read attribute name.
+                const name_start = ai;
+                while (ai < attrs.len and attrs[ai] != '=' and
+                    attrs[ai] != ' ' and attrs[ai] != '\t' and
+                    attrs[ai] != '\n' and attrs[ai] != '\r') ai += 1;
+                const attr_name = attrs[name_start..ai];
+                // Skip = and the quote.
+                while (ai < attrs.len and attrs[ai] != '=') ai += 1;
+                if (ai >= attrs.len) {
+                    try out.appendSlice(allocator, attrs[name_start..]);
+                    break;
+                }
+                ai += 1;
+                if (ai >= attrs.len) {
+                    try out.appendSlice(allocator, attrs[name_start..]);
+                    break;
+                }
+                const quote = attrs[ai];
+                ai += 1;
+                const val_start = ai;
+                while (ai < attrs.len and attrs[ai] != quote) ai += 1;
+                const val = attrs[val_start..ai];
+                if (ai < attrs.len) ai += 1; // step past closing quote
+
+                if (std.mem.eql(u8, attr_name, "name")) {
+                    try out.appendSlice(allocator, "name=\"");
+                    try appendXmlAttrEscaped(allocator, &out, new_name);
+                    try out.append(allocator, '"');
+                } else {
+                    // Verbatim: name=quote+value+quote.
+                    try out.appendSlice(allocator, attr_name);
+                    try out.append(allocator, '=');
+                    try out.append(allocator, quote);
+                    try out.appendSlice(allocator, val);
+                    try out.append(allocator, quote);
+                }
+            }
+        } else {
+            try out.appendSlice(allocator, attrs);
+        }
+
+        i = sh_end;
+    }
+    try out.appendSlice(allocator, xml[i..]);
+    return try out.toOwnedSlice(allocator);
+}
+
 /// Splice the new-sheet `<sheet …/>` lines into `xl/workbook.xml`'s
 /// `<sheets>…</sheets>` block. iter-sheet-1.
 fn patchWorkbookXmlForNewSheets(
@@ -6108,6 +6391,46 @@ fn patchContentTypesForNewSheets(
     }
     try out.appendSlice(allocator, xml[close..]);
     return try out.toOwnedSlice(allocator);
+}
+
+/// Twin of `patchEntryForNewSheets` for sheet renames. Same
+/// re-substitution semantics — composes with new-sheet patches
+/// already in subs[entry_idx].
+fn patchEntryForRenames(
+    allocator: Allocator,
+    entries: []const Editor.ZipEntry,
+    src_buf: []u8,
+    subs: []?SubstitutedEntry,
+    entry_name: []const u8,
+    renames: []const Editor.SheetRename,
+    patcher: *const fn (Allocator, []const u8, []const Editor.SheetRename) anyerror![]u8,
+) !void {
+    const entry_idx = findEntryByName(entries, entry_name) orelse
+        return error.MissingEntry;
+    var src_xml: []u8 = undefined;
+    var src_xml_owned = false;
+    if (subs[entry_idx]) |s| {
+        src_xml = try decompressZipPayload(
+            allocator,
+            s.payload,
+            s.compression_method,
+            s.uncompressed_size,
+        );
+        src_xml_owned = true;
+        allocator.free(s.lfh);
+        allocator.free(s.payload);
+        allocator.free(s.cdfh);
+        subs[entry_idx] = null;
+    } else {
+        const e = entries[entry_idx];
+        const payload = src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
+        src_xml = try decompressZipPayload(allocator, payload, e.compression_method, e.uncompressed_size);
+        src_xml_owned = true;
+    }
+    defer if (src_xml_owned) allocator.free(src_xml);
+
+    const new_xml = try patcher(allocator, src_xml, renames);
+    subs[entry_idx] = try buildEntryFromXml(allocator, entry_name, new_xml);
 }
 
 /// Variant of `patchEntryXml` that threads a NewSheet slice through
@@ -8475,6 +8798,84 @@ test "Editor: addSheet escapes quotes in name attribute" {
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
     try std.testing.expectEqualStrings("He said \"Hi\"", book.sheets[1].name);
+}
+
+test "Editor: renameSheet renames an existing sheet (iter-sheet-2)" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_rename_src.xlsx";
+    const dst_path = "/tmp/zlsx_rename_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("OldName");
+        try s.writeRow(&.{.{ .integer = 42 }});
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.renameSheet(0, "NewName");
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    try std.testing.expectEqualStrings("NewName", book.sheets[0].name);
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    const r = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 42), r[0].integer);
+}
+
+test "Editor: renameSheet rejects duplicates and invalid names" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_rename_reject.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        _ = try w.addSheet("First");
+        _ = try w.addSheet("Second");
+        try w.save(src_path);
+    }
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    // Same name (case-insensitive) is a no-op, not an error.
+    try ed.renameSheet(0, "FIRST");
+    // Invalid name.
+    try std.testing.expectError(error.InvalidSheetName, ed.renameSheet(0, "a:b"));
+    // Duplicate against another existing sheet.
+    try std.testing.expectError(error.DuplicateSheetName, ed.renameSheet(0, "Second"));
+    try std.testing.expectError(error.DuplicateSheetName, ed.renameSheet(0, "second"));
+    // Out-of-range.
+    try std.testing.expectError(error.SheetIndexOutOfRange, ed.renameSheet(99, "Foo"));
+}
+
+test "Editor: renameSheet on a pending-new sheet mutates in place" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_rename_new.xlsx";
+    const dst_path = "/tmp/zlsx_rename_new_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Source");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        const idx = try ed.addSheet("Tmp");
+        try ed.renameSheet(idx, "Final");
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
+    try std.testing.expectEqualStrings("Final", book.sheets[1].name);
 }
 
 test "Editor: appendRows works on freshly-added sheets" {
