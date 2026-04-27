@@ -5657,6 +5657,7 @@ pub const Editor = struct {
                 "<dataValidations",
                 "<conditionalFormatting",
                 "<autoFilter",
+                "<tableParts",
                 "<f>",
                 "<f ",
                 "<f/",
@@ -6957,7 +6958,7 @@ fn processMergeCellTag(
             if (tl_row == row) return; // drop tag entirely
         }
         var new_ref_buf: [16]u8 = undefined;
-        const new_ref = shiftSingleA1(ref, row, kind, &new_ref_buf) catch {
+        const new_ref = shiftSingleA1(ref, row, kind, &new_ref_buf, false) catch {
             try out.appendSlice(allocator, src[t.start..t.after_open]);
             return;
         };
@@ -6978,11 +6979,11 @@ fn processMergeCellTag(
     }
     var tl_buf: [16]u8 = undefined;
     var br_buf: [16]u8 = undefined;
-    const tl_new = shiftSingleA1(ref[0..colon], row, kind, &tl_buf) catch {
+    const tl_new = shiftSingleA1(ref[0..colon], row, kind, &tl_buf, false) catch {
         try out.appendSlice(allocator, src[t.start..t.after_open]);
         return;
     };
-    const br_new = shiftSingleA1(ref[colon + 1 ..], row, kind, &br_buf) catch {
+    const br_new = shiftSingleA1(ref[colon + 1 ..], row, kind, &br_buf, true) catch {
         try out.appendSlice(allocator, src[t.start..t.after_open]);
         return;
     };
@@ -7022,7 +7023,7 @@ fn processDimensionTag(
     const ref = r_attr.?;
     const colon = std.mem.indexOfScalar(u8, ref, ':') orelse {
         var b: [16]u8 = undefined;
-        const new_ref = shiftSingleA1(ref, row, kind, &b) catch {
+        const new_ref = shiftSingleA1(ref, row, kind, &b, false) catch {
             try out.appendSlice(allocator, src[t.start..t.after_open]);
             return;
         };
@@ -7035,11 +7036,11 @@ fn processDimensionTag(
     };
     var tl_buf: [16]u8 = undefined;
     var br_buf: [16]u8 = undefined;
-    const tl_new = shiftSingleA1(ref[0..colon], row, kind, &tl_buf) catch {
+    const tl_new = shiftSingleA1(ref[0..colon], row, kind, &tl_buf, false) catch {
         try out.appendSlice(allocator, src[t.start..t.after_open]);
         return;
     };
-    const br_new = shiftSingleA1(ref[colon + 1 ..], row, kind, &br_buf) catch {
+    const br_new = shiftSingleA1(ref[colon + 1 ..], row, kind, &br_buf, true) catch {
         try out.appendSlice(allocator, src[t.start..t.after_open]);
         return;
     };
@@ -7052,7 +7053,11 @@ fn processDimensionTag(
     try writeWithReplacedAttr(allocator, out, src, t, "<dimension".len, "ref", new_ref);
 }
 
-fn shiftSingleA1(ref: []const u8, row: u32, kind: RowEditKind, buf: *[16]u8) ![]const u8 {
+/// Shift the row component of an A1-style ref. `is_br_corner`
+/// says "this is the bottom-right of a rectangular range" — on a
+/// delete-match (old_row == row), BR corners shrink by 1 so the
+/// range collapses to the row above the deleted one.
+fn shiftSingleA1(ref: []const u8, row: u32, kind: RowEditKind, buf: *[16]u8, is_br_corner: bool) ![]const u8 {
     var letters_end: usize = 0;
     while (letters_end < ref.len and ref[letters_end] >= 'A' and ref[letters_end] <= 'Z') letters_end += 1;
     if (letters_end == 0 or letters_end == ref.len) return error.MalformedXml;
@@ -7063,6 +7068,8 @@ fn shiftSingleA1(ref: []const u8, row: u32, kind: RowEditKind, buf: *[16]u8) ![]
             new_row = old_row + 1;
         },
         .delete => if (old_row > row) {
+            new_row = old_row - 1;
+        } else if (old_row == row and is_br_corner and old_row > 0) {
             new_row = old_row - 1;
         },
     }
