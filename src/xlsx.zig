@@ -5772,6 +5772,16 @@ pub const Editor = struct {
                 "<drawing",
                 "<legacyDrawing",
                 "<picture",
+                // <pane xSplit=..|ySplit=..|topLeftCell=..> carries
+                // column/row coordinates that aren't rewritten by
+                // the row/col edit path. Refuse rather than save a
+                // workbook with frozen panes pointing at the wrong
+                // boundary.
+                "<pane ",
+                "<pane/",
+                "<pane\t",
+                "<pane\n",
+                "<pane\r",
             };
             for (guards) |g| {
                 if (std.mem.indexOf(u8, xml, g) != null) {
@@ -5852,6 +5862,16 @@ pub const Editor = struct {
                 "<drawing",
                 "<legacyDrawing",
                 "<picture",
+                // <pane xSplit=..|ySplit=..|topLeftCell=..> carries
+                // column/row coordinates that aren't rewritten by
+                // the row/col edit path. Refuse rather than save a
+                // workbook with frozen panes pointing at the wrong
+                // boundary.
+                "<pane ",
+                "<pane/",
+                "<pane\t",
+                "<pane\n",
+                "<pane\r",
             };
             for (guards) |g| {
                 if (std.mem.indexOf(u8, xml, g) != null) {
@@ -10784,6 +10804,27 @@ test "Editor: insertRow rejects sheets carrying formulas globally" {
     defer ed.deinit();
     try std.testing.expectError(error.RowEditWithFormulasNotSupported, ed.insertRow(0, 1));
     try std.testing.expectError(error.RowEditWithFormulasNotSupported, ed.deleteRow(0, 1));
+}
+
+test "Editor: row/col edits refuse on sheets with frozen panes" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_pane_unsafe.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try s.writeRow(&.{.{ .integer = 2 }});
+        s.freezePanes(1, 2);
+        try w.save(src_path);
+    }
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 1));
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 1));
+    try std.testing.expectError(error.ColEditUnsafeForSheet, ed.insertColumn(0, 1));
+    try std.testing.expectError(error.ColEditUnsafeForSheet, ed.deleteColumn(0, 1));
 }
 
 test "Editor: deleteSheet refuses while column edits are queued" {
