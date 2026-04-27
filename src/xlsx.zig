@@ -7116,6 +7116,12 @@ fn processColTag(
                 if (old_min >= col_1based) new_min = old_min + 1;
                 if (old_max >= col_1based) new_max = old_max + 1;
             }
+            // Insert that pushes a <col> range past XFD (16384)
+            // would emit max="16385", which Excel rejects as out
+            // of range. Mirror the cell-reference path's error.
+            if (new_max > max_col_1based or new_min > max_col_1based) {
+                return error.ColEditExceedsMaxCol;
+            }
         },
         .delete => {
             if (old_min == col_1based and old_max == col_1based) {
@@ -10660,6 +10666,15 @@ test "applyRowEditToWorksheet: delete drops the row's <row> block" {
     try std.testing.expect(std.mem.indexOf(u8, out, "<row r=\"2\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "<row r=\"3\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "r=\"A2\"") != null);
+}
+
+test "applyColEditToWorksheet refuses insert that pushes <col> past XFD" {
+    const src =
+        "<worksheet><dimension ref=\"A1\"/>" ++
+        "<cols><col min=\"16384\" max=\"16384\" width=\"12\" customWidth=\"1\"/></cols>" ++
+        "<sheetData/></worksheet>";
+    const got = applyColEditToWorksheet(std.testing.allocator, src, 1, .insert);
+    try std.testing.expectError(error.ColEditExceedsMaxCol, got);
 }
 
 test "applyRowEditToWorksheet collapses single-cell dimension on row delete" {
