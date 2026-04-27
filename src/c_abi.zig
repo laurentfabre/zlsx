@@ -143,7 +143,13 @@ pub const CellTag = enum(u32) {
 pub const CCell = extern struct {
     tag: u32,
     str_len: u32,
-    str_ptr: [*]const u8,
+    // [*c] is the C-ABI pointer type that explicitly allows null —
+    // matches the `const char *` shape on the C side and lets us
+    // accept the common `{ str_ptr = NULL, str_len = 0 }` empty-
+    // string pattern without invoking UB in `fromCCell`. ABI-
+    // identical to `[*]const u8` in an extern struct (one machine
+    // pointer either way).
+    str_ptr: [*c]const u8,
     i: i64,
     f: f64,
     b: u8,
@@ -1384,7 +1390,19 @@ const SheetWriterState = struct {
 fn fromCCell(c: CCell) !xlsx.Cell {
     return switch (c.tag) {
         @intFromEnum(CellTag.empty) => .empty,
-        @intFromEnum(CellTag.string) => .{ .string = c.str_ptr[0..c.str_len] },
+        @intFromEnum(CellTag.string) => blk: {
+            // FFI callers commonly model an empty string as
+            // `{ str_ptr = NULL, str_len = 0 }`. Slicing a null
+            // many-pointer is UB, so normalise that shape to the
+            // empty-string sentinel before slicing. str_ptr=NULL
+            // with non-zero len is genuinely malformed — reject.
+            const ptr_addr = @intFromPtr(c.str_ptr);
+            if (c.str_len == 0 or ptr_addr == 0) {
+                if (ptr_addr == 0 and c.str_len != 0) break :blk error.BadCellTag;
+                break :blk xlsx.Cell{ .string = "" };
+            }
+            break :blk xlsx.Cell{ .string = c.str_ptr[0..c.str_len] };
+        },
         @intFromEnum(CellTag.integer) => .{ .integer = c.i },
         @intFromEnum(CellTag.number) => .{ .number = c.f },
         @intFromEnum(CellTag.boolean) => .{ .boolean = c.b != 0 },
@@ -3364,6 +3382,35 @@ test "editor C ABI: open + append_row + save round-trip" {
     try std.testing.expectEqual(@as(i64, 42), r2[1].integer);
     try std.testing.expectEqual(true, r2[2].boolean);
     try std.testing.expectEqual(@as(?[]const xlsx.Cell, null), try rows.next());
+}
+
+test "fromCCell: null str_ptr with str_len=0 normalises to empty string" {
+    // Common FFI shape for an empty string. Slicing a null many-pointer
+    // would be UB; we should return the empty-string sentinel cleanly.
+    const c: CCell = .{
+        .tag = @intFromEnum(CellTag.string),
+        .str_len = 0,
+        .str_ptr = @ptrFromInt(0),
+        .i = 0,
+        .f = 0,
+        .b = 0,
+        ._pad = [_]u8{0} ** 7,
+    };
+    const got = try fromCCell(c);
+    try std.testing.expectEqualStrings("", got.string);
+}
+
+test "fromCCell: null str_ptr with str_len>0 is rejected" {
+    const c: CCell = .{
+        .tag = @intFromEnum(CellTag.string),
+        .str_len = 4,
+        .str_ptr = @ptrFromInt(0),
+        .i = 0,
+        .f = 0,
+        .b = 0,
+        ._pad = [_]u8{0} ** 7,
+    };
+    try std.testing.expectError(error.BadCellTag, fromCCell(c));
 }
 
 test "fuzz fromCCell: random tags never panic" {

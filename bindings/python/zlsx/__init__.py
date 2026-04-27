@@ -454,6 +454,8 @@ class Book:
 
     def sheet(self, selector: Union[int, str]) -> "Sheet":
         """Select a sheet by 0-based index or by name."""
+        if not self._handle:
+            raise ZlsxError("Book is closed")
         if isinstance(selector, int):
             if selector < 0 or selector >= len(self.sheets):
                 raise IndexError(
@@ -968,6 +970,8 @@ class Sheet:
         """Return a row iterator. Each iteration yields a ``list`` whose
         elements are Python values (see module docstring for the type
         mapping)."""
+        if not self._book._handle:
+            raise ZlsxError("Book is closed")
         return Rows(self._book, self.index)
 
     def read_all(self, header: bool = False) -> "tuple[list | None, list[list]]":
@@ -993,6 +997,8 @@ class Sheet:
         is loaded — one FFI call drains every row into a packed buffer,
         avoiding per-row dispatch overhead. Falls back to the per-row
         iterator on older libraries; result is identical."""
+        if not self._book._handle:
+            raise ZlsxError("Book is closed")
         if not _ffi._HAS_MATRIX:
             with self.rows() as r:
                 all_rows = list(r)
@@ -1090,6 +1096,8 @@ class Rows:
         return self
 
     def __next__(self) -> list:
+        if not self._handle:
+            raise ZlsxError("Rows iterator is closed")
         cells_ptr = _ffi.cell_ptr()
         cells_len = ctypes.c_size_t()
         rc = _ffi.lib.zlsx_rows_next(
@@ -1114,6 +1122,8 @@ class Rows:
         format). Layout mirrors the last row returned by ``next()`` so
         positional indexing matches. Raises :class:`RuntimeError` if
         the loaded libzlsx predates the 0.2.6+ numFmt ABI."""
+        if not self._handle:
+            raise ZlsxError("Rows iterator is closed")
         if not _ffi._HAS_NUM_FMT:
             raise RuntimeError(
                 "loaded libzlsx does not expose per-cell style indices "
@@ -1143,6 +1153,8 @@ class Rows:
         Rows only surface the current row — call after ``next()``.
         Requires libzlsx 0.2.6+."""
         import datetime as _dt
+        if not self._handle:
+            raise ZlsxError("Rows iterator is closed")
         if not _ffi._HAS_PARSE_DATE:
             raise RuntimeError(
                 "loaded libzlsx does not expose rows_parse_date "

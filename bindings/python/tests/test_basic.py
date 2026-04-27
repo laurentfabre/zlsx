@@ -100,6 +100,49 @@ def test_cell_type_mapping_guess_types():
                 assert cell is None or isinstance(cell, (str, int, float, bool))
 
 
+def test_book_methods_after_close_raise():
+    """Calling Book methods after close() must raise ZlsxError, not
+    segfault. Regression for the NULL-handle crash path."""
+    path = _skip_if_missing("frictionless_2sheets.xlsx")
+
+    book = zlsx.open(path)
+    book.close()
+
+    with pytest.raises(zlsx.ZlsxError):
+        book.sheet(0)
+    with pytest.raises(zlsx.ZlsxError):
+        book.sheet("Sheet1")
+
+
+def test_sheet_methods_after_book_close_raise():
+    """Sheet handles outlive close() but their methods that re-enter
+    the C ABI through book._handle must surface a clean error."""
+    path = _skip_if_missing("frictionless_2sheets.xlsx")
+
+    book = zlsx.open(path)
+    sheet = book.sheet(0)
+    book.close()
+
+    with pytest.raises(zlsx.ZlsxError):
+        sheet.rows()
+    with pytest.raises(zlsx.ZlsxError):
+        sheet.read_all()
+
+
+def test_rows_methods_after_close_raise():
+    """Rows.close() drops the C handle. Subsequent next/style/parse
+    calls must raise ZlsxError rather than crash."""
+    path = _skip_if_missing("frictionless_2sheets.xlsx")
+
+    with zlsx.open(path) as book:
+        rows = book.sheet(0).rows()
+        next(rows)  # populate _current_len for style_indices
+        rows.close()
+
+        with pytest.raises(zlsx.ZlsxError):
+            next(rows)
+
+
 def test_close_book_while_rows_live():
     """Refcount keeps the underlying state alive — we can drop the Book
     handle and keep iterating rows without crashing."""
