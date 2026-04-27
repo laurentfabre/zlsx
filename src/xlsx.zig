@@ -4816,8 +4816,15 @@ fn scanWorksheetXml(allocator: Allocator, xml: []const u8) ![]CellSpan {
             const c_start = cur;
             const gt = std.mem.indexOfScalarPos(u8, xml, cur, '>') orelse
                 return error.MalformedXml;
-            const is_self_closing = gt > 0 and xml[gt - 1] == '/';
-            const attrs = xml[c_start + 2 .. if (is_self_closing) gt - 1 else gt];
+            // Trim trailing whitespace before sniffing the self-
+            // closing slash. Defensive against XML producers that
+            // emit `<c r="A1" / >` (slash separated from `>` by
+            // whitespace). Mirrors the same trim on the <row .../>
+            // path.
+            const candidate_attrs = xml[c_start + 2 .. gt];
+            const trimmed = std.mem.trimRight(u8, candidate_attrs, " \t\r\n");
+            const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
+            const attrs = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else candidate_attrs;
 
             const col: u32 = blk: {
                 if (getAttr(attrs, "r")) |r_attr| {
