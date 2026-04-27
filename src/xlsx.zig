@@ -5696,14 +5696,17 @@ pub const Editor = struct {
         return false;
     }
 
-    /// Scan every existing worksheet (NOT pending-new sheets, which
-    /// always have empty bodies) for any `<f...>` formula tag.
-    /// Returns true on the first hit. Row/column edits use this to
-    /// refuse globally when any sheet carries a formula — the
-    /// formula tokenizer that would let us safely rewrite
-    /// cross-sheet refs (e.g. `=Sheet1!B:B`) hasn't shipped yet
-    /// (iter-col-1).
-    fn anySheetContainsFormulas(self: *Editor) !bool {
+    /// Cross-sheet reference carriers: tags whose body or attrs can
+    /// hold an `OtherSheet!Ref` pointer. If any sheet in the workbook
+    /// has one of these, a row/column edit on a *different* sheet
+    /// can still leave a stale reference pointing at the edited
+    /// sheet's old layout. Until the formula tokenizer (iter-col-1)
+    /// rewrites them, refuse globally.
+    ///   - `<f>` / `<f ` / `<f/`     — formula bodies (=Sheet1!B:B)
+    ///   - `<hyperlinks`             — `location="Sheet1!C5"` etc.
+    ///   - `<dataValidations`        — formula1/formula2 may cross
+    ///   - `<conditionalFormatting`  — cfRule formulas may cross
+    fn anySheetCrossSheetCarrier(self: *Editor) !struct { found: bool, kind: enum { none, formula, hyperlink, data_validation, cond_format } } {
         for (self.sheet_paths) |path| {
             if (self.findPendingNewSheet(path) != null) continue;
             const entry_idx = findEntryByName(self.entries, path) orelse continue;
@@ -5711,11 +5714,18 @@ pub const Editor = struct {
             const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
             const xml = try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
             defer self.allocator.free(xml);
-            if (std.mem.indexOf(u8, xml, "<f>") != null) return true;
-            if (std.mem.indexOf(u8, xml, "<f ") != null) return true;
-            if (std.mem.indexOf(u8, xml, "<f/") != null) return true;
+            if (std.mem.indexOf(u8, xml, "<f>") != null or
+                std.mem.indexOf(u8, xml, "<f ") != null or
+                std.mem.indexOf(u8, xml, "<f/") != null)
+                return .{ .found = true, .kind = .formula };
+            if (std.mem.indexOf(u8, xml, "<hyperlinks") != null)
+                return .{ .found = true, .kind = .hyperlink };
+            if (std.mem.indexOf(u8, xml, "<dataValidations") != null)
+                return .{ .found = true, .kind = .data_validation };
+            if (std.mem.indexOf(u8, xml, "<conditionalFormatting") != null)
+                return .{ .found = true, .kind = .cond_format };
         }
-        return false;
+        return .{ .found = false, .kind = .none };
     }
 
     fn recordColEdit(
@@ -5752,21 +5762,30 @@ pub const Editor = struct {
         if (std.mem.indexOf(u8, wb_check, "<definedName") != null)
             return error.ColEditWithDefinedNamesNotSupported;
 
-        // Cross-sheet formulas (e.g. `=Sheet1!B:B`) reference into
-        // the edited sheet but live in *other* sheet bodies. Without
-        // a tokenizer we can't rewrite them, so refuse globally if
-        // any sheet has a formula.
-        if (try self.anySheetContainsFormulas()) return error.ColEditWithFormulasNotSupported;
+        // Cross-sheet reference carriers (formulas, hyperlinks,
+        // data validations, conditional formatting) live in *any*
+        // sheet body but can point at the edited sheet's columns.
+        // Without a tokenizer we can't rewrite them, so refuse
+        // globally if any sheet carries one. Picks the most
+        // specific error code based on which carrier we hit first.
+        const xref = try self.anySheetCrossSheetCarrier();
+        if (xref.found) {
+            return switch (xref.kind) {
+                .formula => error.ColEditWithFormulasNotSupported,
+                .hyperlink, .data_validation, .cond_format => error.ColEditUnsafeForSheet,
+                .none => unreachable,
+            };
+        }
 
         if (findEntryByName(self.entries, path)) |entry_idx| {
             const e = self.entries[entry_idx];
             const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
             const xml = try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
             defer self.allocator.free(xml);
+            // Local-only structures we don't yet rewrite — the
+            // cross-sheet carriers above are already checked
+            // workbook-wide.
             const guards = [_][]const u8{
-                "<hyperlinks",
-                "<dataValidations",
-                "<conditionalFormatting",
                 "<autoFilter",
                 "<tableParts",
                 "<drawing",
@@ -5839,24 +5858,29 @@ pub const Editor = struct {
         if (std.mem.indexOf(u8, wb_check, "<definedName") != null)
             return error.RowEditWithDefinedNamesNotSupported;
 
-        // Cross-sheet formulas (e.g. `=Sheet1!1:1`) reference into
-        // the edited sheet but live in *other* sheet bodies. Without
-        // a tokenizer we can't rewrite them, so refuse globally if
-        // any sheet has a formula.
-        if (try self.anySheetContainsFormulas()) return error.RowEditWithFormulasNotSupported;
+        // Cross-sheet reference carriers (formulas, hyperlinks,
+        // data validations, conditional formatting) live in *any*
+        // sheet body but can point at the edited sheet's rows.
+        // Without a tokenizer we can't rewrite them, so refuse
+        // globally if any sheet carries one.
+        const xref = try self.anySheetCrossSheetCarrier();
+        if (xref.found) {
+            return switch (xref.kind) {
+                .formula => error.RowEditWithFormulasNotSupported,
+                .hyperlink, .data_validation, .cond_format => error.RowEditUnsafeForSheet,
+                .none => unreachable,
+            };
+        }
 
         // Conservative content guard: scan the worksheet XML for
-        // elements that v1 doesn't rewrite. If any are present,
-        // refuse rather than silently corrupt the workbook.
+        // local-only elements that v1 doesn't rewrite. If any are
+        // present, refuse rather than silently corrupt the workbook.
         if (findEntryByName(self.entries, path)) |entry_idx| {
             const e = self.entries[entry_idx];
             const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
             const xml = try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
             defer self.allocator.free(xml);
             const guards = [_][]const u8{
-                "<hyperlinks",
-                "<dataValidations",
-                "<conditionalFormatting",
                 "<autoFilter",
                 "<tableParts",
                 "<drawing",
@@ -10804,6 +10828,32 @@ test "Editor: insertRow rejects sheets carrying formulas globally" {
     defer ed.deinit();
     try std.testing.expectError(error.RowEditWithFormulasNotSupported, ed.insertRow(0, 1));
     try std.testing.expectError(error.RowEditWithFormulasNotSupported, ed.deleteRow(0, 1));
+}
+
+test "Editor: row/col edits refuse when another sheet has a cross-sheet hyperlink" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_xref_hyperlink.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s1 = try w.addSheet("Plain");
+        try s1.writeRow(&.{.{ .integer = 1 }});
+        try s1.writeRow(&.{.{ .integer = 2 }});
+        var s2 = try w.addSheet("WithLink");
+        try s2.writeRow(&.{.{ .string = "click" }});
+        // Internal hyperlink pointing back into the first sheet —
+        // exactly the cross-sheet case the row/col rewriter can't
+        // tokenize. Sheet1's own body is clean.
+        try s2.addInternalHyperlink("A1", "Plain!C5");
+        try w.save(src_path);
+    }
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 1));
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 1));
+    try std.testing.expectError(error.ColEditUnsafeForSheet, ed.insertColumn(0, 1));
+    try std.testing.expectError(error.ColEditUnsafeForSheet, ed.deleteColumn(0, 1));
 }
 
 test "Editor: row/col edits refuse on sheets with frozen panes" {
