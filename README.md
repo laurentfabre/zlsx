@@ -4,7 +4,9 @@ Tiny `.xlsx` reader **and** writer for Zig. Single-file library, no third-party 
 
 **Reader**: 1.7-2.0 ms on small files, **3.3 ms / 2.37 MB** on a 67 KB workbook with 1,144 shared strings — **1.11× faster than calamine-rust**, 6.4× faster than python-calamine, 37× faster than openpyxl on that file, at the **smallest RSS of the four** (~7-18× lower than the Python stack, ~1.3× lower than calamine). Native-speed tier on every corpus file. [Full benchmark table →](docs/benchmarks.md)
 
-**Writer** (Phase 3b, v0.2.4): pragmatic openpyxl-parity styles — bold/italic, font size/name/color, horizontal alignment, wrap text, 19 OOXML fill patterns, 14 border styles × 5 sides, custom number formats, column widths, row heights, freeze panes, auto-filter, merged cell ranges, external + internal hyperlinks, full data-validation family (list / whole / decimal / date / time / textLength / custom with 8 comparison operators), formulas with cached values. Survived 1M-iter deep fuzz on every surface.
+**Writer** (v0.2.9): pragmatic openpyxl-parity styles — bold/italic, font size/name/color, horizontal alignment, wrap text, 19 OOXML fill patterns, 14 border styles × 5 sides, custom number formats, column widths, row heights, freeze panes, auto-filter, merged cell ranges, external + internal hyperlinks, full data-validation family (list / whole / decimal / date / time / textLength / custom with 8 comparison operators), formulas with cached values. Survived 1M-iter deep fuzz on every surface.
+
+**Editor** (load-modify-save, v0.2.9): open an existing workbook and round-trip changes through `Editor` — append rows, rewrite individual cells via `setCell`/`setCells`, insert/delete rows, insert/delete columns (with span-shifting across cell refs, `<col>` formatting ranges, merged ranges, and `<dimension>`), add/rename/delete sheets. ZIP-substitution architecture: untouched entries pass through verbatim, only the patched parts re-deflate, so a 67 KB workbook round-trips in ~5 ms. Conservative guards refuse sheets that carry constructs the rewriter doesn't yet handle (formulas, hyperlinks, data validations, conditional formatting, frozen panes, drawings, tables) so a successful save is byte-safe.
 
 ```zig
 const xlsx = @import("zlsx");
@@ -70,6 +72,22 @@ try sheet_w.writeRowStyled(
     &.{ 0, money, 0 },
 );
 try w.save("out.xlsx");
+
+// Editing — round-trip an existing workbook in place. Untouched
+// ZIP entries are copied verbatim; only the patched parts
+// re-deflate, so most edits land in single-digit ms.
+var ed = try xlsx.Editor.open(allocator, "in.xlsx");
+defer ed.deinit();
+try ed.appendRows(0, &.{
+    &.{ .{ .string = "Bob" }, .{ .number = 4321.10 }, .{ .boolean = false } },
+});
+try ed.setCell(0, 2, 1, .{ .number = 9999.99 });   // (sheet, row, col)
+try ed.insertRow(0, 1);                             // shift everything down
+try ed.deleteColumn(0, 3);                          // drop column C
+const new_idx = try ed.addSheet("Imported");
+try ed.appendRows(new_idx, &.{ &.{ .{ .integer = 1 } } });
+try ed.renameSheet(0, "Summary 2026");
+try ed.save("out.xlsx");
 ```
 
 ## Documentation
@@ -82,7 +100,9 @@ try w.save("out.xlsx");
 - **[include/zlsx.h](include/zlsx.h)** — C ABI header. Embeddable from any FFI-capable language.
 - **[docs/plans/](docs/plans/)** — design plans for queued architectural work:
   - **[streaming-sst.md](docs/plans/streaming-sst.md)** — lazy SST resolution for million-entry workbooks (Q5 mitigation).
-  - **[load-modify-save.md](docs/plans/load-modify-save.md)** — `Editor` type for append-only round-trip (Phase 3c).
+  - **[load-modify-save.md](docs/plans/load-modify-save.md)** — `Editor` type, append + cell-mutate flows (shipped through Phase 3d).
+  - **[structural-edits.md](docs/plans/structural-edits.md)** — row / column / sheet structural edits (shipped iter-row, iter-col, iter-sheet 1-3).
+  - **[cell-mutate.md](docs/plans/cell-mutate.md)** — span-preserving `setCell`/`setCells` (Phase 3d, shipped).
 
 ## Why
 
@@ -95,13 +115,14 @@ Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-ro
 **In**
 - **Read** workbooks — shared strings (with rich-text runs + XML entities), inline strings, numeric / boolean / error / formula-cached cells, UTF-8 throughout, merged-cell ranges via `Book.mergedRanges(sheet)`, external-URL hyperlinks via `Book.hyperlinks(sheet)` (resolved through sheet `_rels`), all data validations via `Book.dataValidations(sheet)` — dropdowns (values entity-decoded), plus `kind` / `op` / `formula1` / `formula2` on numeric, date, time, text-length, and custom variants, rich-text run formatting (bold / italic / color / size / font) via `Book.richRuns(sst_idx)` for entries that used `<r>` wrappers, per-cell style indices via `Rows.styleIndices()` resolving to number-format codes via `Book.numberFormat(style_idx)` (date detection via `Book.isDateFormat(style_idx)`), cell comments via `Book.comments(sheet)` (author + plain-text body, decoded)
 - **Write** workbooks — strings (SST-deduped), integers, numbers, booleans, empties, multi-sheet; cell styles with fonts, fills, borders, alignment, wrap, number formats; per-sheet column widths, row heights, freeze panes, auto-filter, merged cell ranges, external-URL hyperlinks (per-sheet `_rels`), internal hyperlinks (`location="Sheet2!A1"`), list-type data validations (dropdowns), number / decimal / date / time / text-length / custom data validations, formulas with optional cached value, rich-text cells (per-run bold / italic / color / size / font) via `SheetWriter.writeRichRow`, cell comments (notes) via `SheetWriter.addComment` (emits the full `xl/comments{N}.xml` + `vmlDrawing{N}.vml` + rels stack so Excel renders the yellow indicator), conditional formatting via `SheetWriter.addConditionalFormatCellIs` / `…Expression` (two core cfRule types) referencing differential formats registered via `Writer.addDxf`
+- **Edit** existing workbooks via `Editor.open` / `Editor.save` — `appendRows` (rows added at the bottom), `setCell` / `setCells` (in-place cell mutation, span-preserving), `insertRow` / `deleteRow`, `insertColumn` / `deleteColumn` (shifts cell refs, `<col>` ranges, merged ranges, `<dimension>`), `addSheet` / `renameSheet` / `deleteSheet`. Untouched ZIP entries pass through verbatim — only the patched parts re-deflate
 - XML entity decoding (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&#N;`, `&#xN;`) on read and escaping on write
 - CLI (`zlsx {rows|cells|meta|list-sheets|comments|validations|hyperlinks|styles|sst} <file>`) emitting uniform NDJSON envelopes, with row/range/header/skip-take/all-sheets/sheet-glob/include-blanks/with-styles/output-mode flags and SIGPIPE-clean pipelines — see "CLI" below and [`docs/jq-for-excel.md`](docs/jq-for-excel.md)); C ABI (`libzlsx.{dylib,so,dll}` + `include/zlsx.h`); Python bindings (`pip install py-zlsx`)
 
 **Out (by design)**
 - No formula evaluation — the reader returns the cached `<v>` value; the writer accepts formula text + an optional cached result via `writeRowWithFormulas` but never computes the formula itself
 - No automatic date decoding — dates surface as their raw Excel serial number via `.number`; a convenience helper `xlsx.fromExcelSerial(cell.number) -> ?DateTime` handles the 1900-03-01 through 9999-12-31 range (serials ≤ 60 return `null` because the Excel 1900 leap-year bug makes them ambiguous)
-- No load-modify-save round-trip yet — Phase 3c queued. For now the writer only produces fresh workbooks
+- No formula-aware edits — `Editor.insertRow` / `deleteRow` / `insertColumn` / `deleteColumn` refuse globally if any sheet contains a formula or `<definedName>` (cross-sheet references can't be safely rewritten without a formula tokenizer; on the queue as iter-col-1)
 - No chart / pivot / image extraction or emission
 
 ## Feature matrix
@@ -191,11 +212,12 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 Prebuilt binaries for macOS (ARM64, Intel), Linux (x86_64, ARM64 — static musl), and Windows (x86_64) ship with every tagged release:
 
 ```bash
-# macOS (Apple Silicon)
-curl -fsSL -o zlsx.tar.gz "https://github.com/laurentfabre/zlsx/releases/latest/download/zlsx-0.2.4-aarch64-apple-darwin.tar.gz"
-tar -xzf zlsx.tar.gz && sudo mv zlsx-*/bin/zlsx /usr/local/bin/
+# macOS (Apple Silicon) — pulls the latest tagged release
+VER=$(curl -fsSL https://api.github.com/repos/laurentfabre/zlsx/releases/latest | grep tag_name | head -1 | cut -d'"' -f4 | sed 's/^v//')
+curl -fsSL -o zlsx.tar.gz "https://github.com/laurentfabre/zlsx/releases/download/v${VER}/zlsx-${VER}-aarch64-apple-darwin.tar.gz"
+tar -xzf zlsx.tar.gz && sudo mv "zlsx-${VER}-aarch64-apple-darwin/bin/zlsx" /usr/local/bin/
 
-# Via Homebrew (once the tap is published)
+# Via Homebrew (recommended — auto-updates with the tap)
 brew tap laurentfabre/zlsx
 brew install zlsx
 ```
