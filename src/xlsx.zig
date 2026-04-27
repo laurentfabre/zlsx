@@ -4763,13 +4763,23 @@ pub const Editor = struct {
     /// independent (no caching yet) — repeated calls re-decompress.
     pub fn scanWorksheet(self: *Editor, sheet_idx: u32) !WorksheetSpans {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
-        // The scanner reads from `src_buf` directly — it does NOT
-        // see rows queued in `pending_appends`. Reject sheets with
-        // unsaved appends rather than silently returning a stale
-        // span set; iter-cm-2's setCell has the same constraint
-        // and a follow-up iter can merge pending state into the
-        // scanned XML if a use case appears.
+        // The scanner does NOT see rows queued in `pending_appends`
+        // (those are deltas applied at save time). Reject rather
+        // than return a stale span set.
         if (self.pending_appends.contains(sheet_idx)) return error.SheetHasUnsavedAppends;
+
+        // If a previous `setCell` populated `pending_mutations` for
+        // this sheet, surface THAT XML (and its in-sync spans) so
+        // the caller sees a consistent view. Without this branch a
+        // setCell-then-scan workflow would silently return spans
+        // from the pre-mutation source bytes.
+        if (self.pending_mutations.get(sheet_idx)) |ms| {
+            const xml_copy = try self.allocator.dupe(u8, ms.xml.items);
+            errdefer self.allocator.free(xml_copy);
+            const spans_copy = try self.allocator.dupe(CellSpan, ms.spans.items);
+            return .{ .allocator = self.allocator, .xml = xml_copy, .cells = spans_copy };
+        }
+
         const path = self.sheet_paths[sheet_idx];
         const entry_idx = findEntryByName(self.entries, path) orelse
             return error.SheetEntryNotFound;
@@ -7225,6 +7235,39 @@ test "Editor: appendRows rejects sheets with pending setCell mutations" {
         error.SheetHasUnsavedMutations,
         ed.appendRows(0, &.{&.{.{ .integer = 99 }}}),
     );
+}
+
+test "Editor: scanWorksheet sees setCell mutations (no stale read)" {
+    // Codex caught: pre-fix, scanWorksheet decompressed from
+    // src_buf and ignored pending_mutations. A setCell-then-scan
+    // workflow got pre-mutation spans.
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_setcell_then_scan.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 } });
+        try w.save(src_path);
+    }
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+
+    // Capture the byte length of the pre-mutation XML.
+    var pre = try ed.scanWorksheet(0);
+    const pre_len = pre.xml.len;
+    pre.deinit();
+
+    // Mutate B1 to a much larger number — should grow the cell's
+    // byte span and therefore the worksheet XML.
+    try ed.setCell(0, 1, 1, .{ .integer = 999_999_999 });
+
+    var post = try ed.scanWorksheet(0);
+    defer post.deinit();
+    try std.testing.expect(post.xml.len > pre_len);
+    // Confirm the new value is in the post-mutation XML.
+    try std.testing.expect(std.mem.indexOf(u8, post.xml, "999999999") != null);
 }
 
 test "Editor: scanWorksheet rejects sheets with unsaved appendRows" {
