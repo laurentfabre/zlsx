@@ -4847,15 +4847,73 @@ pub const Editor = struct {
             }
         };
 
-        // Locate the existing span. v1 doesn't insert.
+        // Locate the existing span if present, plus the in-row
+        // neighbours we'd need for an insert.
         var idx: ?usize = null;
+        var insert_before_idx: ?usize = null; // first span in same row with col > target
+        var last_in_row_idx: ?usize = null; // last span in same row (any col)
         for (ms.spans.items, 0..) |s, i| {
-            if (s.row == row and s.col == col) {
+            if (s.row != row) continue;
+            if (s.col == col) {
                 idx = i;
                 break;
             }
+            last_in_row_idx = i;
+            if (s.col > col and insert_before_idx == null) insert_before_idx = i;
         }
-        const span_idx = idx orelse return error.SetCellMissingTarget;
+        if (idx == null) {
+            const row_has_anchor = last_in_row_idx != null or insert_before_idx != null;
+            if (!row_has_anchor) {
+                // iter-cm-2d: row missing entirely. Build a new
+                // `<row r="N"><c r="REF">…</c></row>` block and
+                // splice it into sheetData at the right
+                // lexicographic position.
+                try insertMissingRow(self.allocator, ms, row, col, cell);
+                return;
+            }
+            // iter-cm-2c: cell missing in an existing row. Insert
+            // at the lexicographic position inside the row.
+            var new_buf: std.ArrayListUnmanaged(u8) = .{};
+            defer new_buf.deinit(self.allocator);
+            try emitCellXml(self.allocator, &new_buf, row, col, cell);
+
+            // Insertion offset: just before the first higher-col
+            // span, or just after the last lower-col span if the
+            // new cell is going at the end of the row.
+            const insert_at: usize = if (insert_before_idx) |i|
+                ms.spans.items[i].start
+            else
+                ms.spans.items[last_in_row_idx.?].end;
+
+            try ms.xml.insertSlice(self.allocator, insert_at, new_buf.items);
+            const new_len = new_buf.items.len;
+
+            // Shift every later span. Use signed delta — positive
+            // here since insert always grows.
+            for (ms.spans.items) |*s| {
+                if (s.start >= insert_at) {
+                    s.start += new_len;
+                    s.end += new_len;
+                    s.body_start += new_len;
+                }
+            }
+            // Compute body_start of the new cell.
+            const opening_gt = std.mem.indexOfScalar(u8, new_buf.items, '>') orelse unreachable;
+            const new_span: CellSpan = .{
+                .start = insert_at,
+                .end = insert_at + new_len,
+                .body_start = insert_at + opening_gt + 1,
+                .row = row,
+                .col = col,
+            };
+            // Insert into spans at the right position (keep source
+            // order). When insert_before_idx exists, that's where
+            // the new span goes; else append after last_in_row.
+            const span_pos: usize = insert_before_idx orelse (last_in_row_idx.? + 1);
+            try ms.spans.insert(self.allocator, span_pos, new_span);
+            return;
+        }
+        const span_idx = idx.?;
         const old = ms.spans.items[span_idx];
 
         // Build the replacement bytes.
@@ -4948,6 +5006,90 @@ pub const Editor = struct {
         return gop.value_ptr;
     }
 };
+
+/// Insert a new `<row r="N"><c …>…</c></row>` block into the
+/// MutatedSheet at the lexicographic position for `row`. iter-cm-2d.
+fn insertMissingRow(
+    allocator: Allocator,
+    ms: *Editor.MutatedSheet,
+    row: u32,
+    col: u32,
+    cell: Cell,
+) !void {
+    // Find insertion offset:
+    //   - just before the next-higher row's `<row` opening, OR
+    //   - just before `</sheetData>` if no higher row exists.
+    var insert_at: usize = 0;
+    var anchored = false;
+    for (ms.spans.items) |s| {
+        if (s.row > row) {
+            // Search backward for the `<row` that opens this span's row.
+            // (lastIndexOf is bounded to xml[0..s.start].)
+            if (std.mem.lastIndexOf(u8, ms.xml.items[0..s.start], "<row")) |row_open| {
+                insert_at = row_open;
+                anchored = true;
+                break;
+            }
+        }
+    }
+    if (!anchored) {
+        // No higher row — append before `</sheetData>`. Self-closing
+        // `<sheetData/>` is a rare malformed/empty-sheet shape; reject
+        // for now rather than synthesise a sheetData body.
+        if (std.mem.indexOf(u8, ms.xml.items, "</sheetData>")) |end| {
+            insert_at = end;
+        } else if (std.mem.indexOf(u8, ms.xml.items, "<sheetData/>") != null) {
+            return error.SetCellEmptySheetDataNotSupported;
+        } else {
+            return error.MalformedXml;
+        }
+    }
+
+    // Build the new row block.
+    var new_buf: std.ArrayListUnmanaged(u8) = .{};
+    defer new_buf.deinit(allocator);
+    try new_buf.writer(allocator).print("<row r=\"{d}\">", .{row});
+    const cell_start_in_buf = new_buf.items.len;
+    try emitCellXml(allocator, &new_buf, row, col, cell);
+    try new_buf.appendSlice(allocator, "</row>");
+
+    try ms.xml.insertSlice(allocator, insert_at, new_buf.items);
+    const new_len = new_buf.items.len;
+
+    // Shift every later span by new_len.
+    for (ms.spans.items) |*s| {
+        if (s.start >= insert_at) {
+            s.start += new_len;
+            s.end += new_len;
+            s.body_start += new_len;
+        }
+    }
+
+    // Compute the new cell's span. Inside new_buf, the cell starts
+    // at `cell_start_in_buf` and ends at `new_buf.len - "</row>".len`.
+    const cell_abs_start = insert_at + cell_start_in_buf;
+    const cell_abs_end = insert_at + new_buf.items.len - "</row>".len;
+    // body_start = position of '>' within the cell's opening tag.
+    const cell_bytes = new_buf.items[cell_start_in_buf .. new_buf.items.len - "</row>".len];
+    const opening_gt_off = std.mem.indexOfScalar(u8, cell_bytes, '>') orelse unreachable;
+    const new_cell_span: CellSpan = .{
+        .start = cell_abs_start,
+        .end = cell_abs_end,
+        .body_start = cell_abs_start + opening_gt_off + 1,
+        .row = row,
+        .col = col,
+    };
+
+    // Find the right insertion index in spans (source order).
+    var span_pos: usize = ms.spans.items.len;
+    for (ms.spans.items, 0..) |s, i| {
+        if (s.start >= cell_abs_end) {
+            span_pos = i;
+            break;
+        }
+    }
+    try ms.spans.insert(allocator, span_pos, new_cell_span);
+}
 
 /// Emit a fresh `<c r="REF"…>…</c>` for one cell. Output is canonical
 /// (no formula, no inline-string body, no preserved source attrs)
@@ -7215,6 +7357,84 @@ test "Editor: setCell with strings emits inline-string cells (iter-cm-2b)" {
     try std.testing.expectEqualStrings(" trim me ", r1[1].string);
 }
 
+test "Editor: setCell inserts a missing cell into an existing row (iter-cm-2c)" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_setcell_insert.xlsx";
+    const dst_path = "/tmp/zlsx_setcell_insert_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        // Row 1 has cells at A, C — gap at B. Row 2 has only A.
+        try s.writeRow(&.{ .{ .integer = 1 }, .{ .empty = {} }, .{ .integer = 3 } });
+        try s.writeRow(&.{.{ .integer = 4 }});
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        // Insert into the gap at row 1 col 1.
+        try ed.setCell(0, 1, 1, .{ .integer = 99 });
+        // Insert at end-of-row in row 2: row has A only; append B.
+        try ed.setCell(0, 2, 1, .{ .string = "appended" });
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    const r1 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 1), r1[0].integer);
+    try std.testing.expectEqual(@as(i64, 99), r1[1].integer);
+    try std.testing.expectEqual(@as(i64, 3), r1[2].integer);
+    const r2 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 4), r2[0].integer);
+    try std.testing.expectEqualStrings("appended", r2[1].string);
+}
+
+test "Editor: setCell inserts a missing row at the right position (iter-cm-2d)" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_setcell_row_insert.xlsx";
+    const dst_path = "/tmp/zlsx_setcell_row_insert_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .integer = 1 }}); // row 1
+        try s.writeRow(&.{.{ .integer = 5 }}); // row 2
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        // Insert a row beyond the source (row 5 — fresh).
+        try ed.setCell(0, 5, 0, .{ .string = "row5" });
+        // Insert a row in the middle (between rows 2 and 5 — call
+        // it row 3).
+        try ed.setCell(0, 3, 0, .{ .integer = 33 });
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    var seen: u32 = 0;
+    while (try rows.next()) |row| : (seen += 1) {
+        switch (seen) {
+            0 => try std.testing.expectEqual(@as(i64, 1), row[0].integer),
+            1 => try std.testing.expectEqual(@as(i64, 5), row[0].integer),
+            2 => try std.testing.expectEqual(@as(i64, 33), row[0].integer),
+            3 => try std.testing.expectEqualStrings("row5", row[0].string),
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 4), seen);
+}
+
 test "Editor: setCells applies a batch in source order (iter-cm-3)" {
     const writer_mod = @import("writer.zig");
     const src_path = "/tmp/zlsx_setcells_batch.xlsx";
@@ -7318,8 +7538,6 @@ test "Editor: setCell rejects unsupported cases (iter-cm-2a)" {
     try std.testing.expectError(error.RowIndexOutOfRange, ed.setCell(0, 0, 0, .{ .integer = 1 }));
     // Lossy integer
     try std.testing.expectError(error.IntegerExceedsExcelPrecision, ed.setCell(0, 1, 0, .{ .integer = 9007199254740993 }));
-    // Missing target
-    try std.testing.expectError(error.SetCellMissingTarget, ed.setCell(0, 5, 5, .{ .integer = 1 }));
     // Mix with appendRows on same sheet — both directions.
     try ed.appendRows(0, &.{&.{.{ .integer = 99 }}});
     try std.testing.expectError(error.SheetHasUnsavedAppends, ed.setCell(0, 1, 0, .{ .integer = 2 }));
