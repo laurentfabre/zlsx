@@ -6921,8 +6921,7 @@ fn applyColEditToWorksheet(
         i = next_lt;
 
         if (matchTagAt(src, i, "c")) |t| {
-            try processCellTagCol(allocator, &out, src, t, col_1based, kind);
-            i = t.after_open;
+            try processCellTagCol(allocator, &out, src, t, col_1based, kind, &i);
         } else if (matchTagAt(src, i, "col")) |t| {
             try processColTag(allocator, &out, src, t, col_1based, kind);
             i = t.after_open;
@@ -6947,6 +6946,7 @@ fn processCellTagCol(
     t: TagOpen,
     col_1based: u32,
     kind: RowEditKind,
+    i: *usize,
 ) !void {
     const attrs = src[t.start + "<c".len .. t.after_open - 1];
     const trimmed = std.mem.trimRight(u8, attrs, " \t\r\n");
@@ -6955,6 +6955,7 @@ fn processCellTagCol(
     const r_attr = getAttr(attrs_for_lookup, "r");
     if (r_attr == null) {
         try out.appendSlice(allocator, src[t.start..t.after_open]);
+        i.* = t.after_open;
         return;
     }
     const ref = r_attr.?;
@@ -6962,53 +6963,23 @@ fn processCellTagCol(
     while (letters_end < ref.len and ref[letters_end] >= 'A' and ref[letters_end] <= 'Z') letters_end += 1;
     if (letters_end == 0 or letters_end == ref.len) {
         try out.appendSlice(allocator, src[t.start..t.after_open]);
+        i.* = t.after_open;
         return;
     }
     const old_col = parseColLetters(ref[0..letters_end]) orelse {
         try out.appendSlice(allocator, src[t.start..t.after_open]);
+        i.* = t.after_open;
         return;
     };
 
-    // For delete-match: the cell sits inside the deleted column.
-    // Drop the entire <c> element (similar to how row-delete drops
-    // a `<row>` block).
+    // Delete-match: drop the entire <c> element (open + body + close).
     if (kind == .delete and old_col == col_1based) {
-        // For self-closing form, it's just <c .../>; for body form,
-        // skip to </c>.
-        // Caller (outer loop) advances i past t.after_open. For body
-        // form we need to also skip the body. But the outer loop
-        // doesn't know — it'll re-enter and process the body's <v>
-        // tags as if they were standalone, which is fine since they
-        // emit verbatim. We just need to ensure the body's bytes
-        // get emitted (they will, byte-by-byte through the else
-        // branch). Then we hit </c>. That stays in output.
-        //
-        // But the OPEN <c> got skipped (we returned without
-        // emitting). So we'd have orphan </c> + body content. That
-        // would corrupt XML.
-        //
-        // Cleaner: skip the entire <c>...</c> block. Since the outer
-        // loop drives `i`, we need to update it externally. Easier:
-        // emit nothing and have the caller skip past </c>.
-        if (is_self_closing) return;
-        // Body form — the outer loop will advance i to t.after_open
-        // already. We need to skip past </c>. The simplest thing
-        // is to also emit the body bytes verbatim, but then we'd
-        // get an orphan </c>. Actually no: just emit </c> and let
-        // the outer loop skip the body content (which is just
-        // <v>...</v> at most). Wait — the body content + </c>
-        // would emit and we'd have a `<v>...</v></c>` orphan. Bad.
-        //
-        // Safest: emit a minimal self-closing <c r="REF"/> here so
-        // the surrounding XML stays well-formed; the body content
-        // and </c> then emit verbatim through the outer loop and
-        // become orphans... still bad.
-        //
-        // OK, the right approach: let the caller (outer loop)
-        // know to skip past </c> in this case. Since we don't have
-        // a clean mechanism, write a self-closing placeholder and
-        // accept the orphan body for v1. Document the limitation.
-        try out.appendSlice(allocator, "<c/>"); // placeholder
+        if (is_self_closing) {
+            i.* = t.after_open;
+        } else {
+            const close = std.mem.indexOfPos(u8, src, t.after_open, "</c>") orelse t.after_open;
+            i.* = if (close + "</c>".len <= src.len) close + "</c>".len else t.after_open;
+        }
         return;
     }
 
@@ -7024,16 +6995,19 @@ fn processCellTagCol(
     }
     if (new_col == old_col) {
         try out.appendSlice(allocator, src[t.start..t.after_open]);
+        i.* = t.after_open;
         return;
     }
     var letters_buf: [8]u8 = undefined;
     const new_letters = formatColLetters(&letters_buf, new_col - 1) catch {
         try out.appendSlice(allocator, src[t.start..t.after_open]);
+        i.* = t.after_open;
         return;
     };
     var new_ref_buf: [16]u8 = undefined;
     const new_ref = try std.fmt.bufPrint(&new_ref_buf, "{s}{s}", .{ new_letters, ref[letters_end..] });
     try writeWithReplacedAttr(allocator, out, src, t, "<c".len, "r", new_ref);
+    i.* = t.after_open;
 }
 
 fn processColTag(
@@ -7070,10 +7044,23 @@ fn processColTag(
     var new_min = old_min;
     var new_max = old_max;
     var drop = false;
+    var split_emit_first_max: ?u32 = null;
     switch (kind) {
         .insert => {
-            if (old_min >= col_1based) new_min = old_min + 1;
-            if (old_max >= col_1based) new_max = old_max + 1;
+            // Insert point strictly INSIDE the existing range:
+            // split into two `<col>` entries, leaving the inserted
+            // column with default formatting. e.g. <col min=2 max=4>
+            // + insertColumn(3) → <col min=2 max=2/> +
+            // <col min=4 max=5/>; col 3 (the inserted one) gets no
+            // formatting entry.
+            if (old_min < col_1based and col_1based <= old_max) {
+                split_emit_first_max = col_1based - 1;
+                new_min = col_1based + 1;
+                new_max = old_max + 1;
+            } else {
+                if (old_min >= col_1based) new_min = old_min + 1;
+                if (old_max >= col_1based) new_max = old_max + 1;
+            }
         },
         .delete => {
             if (old_min == col_1based and old_max == col_1based) {
@@ -7086,18 +7073,35 @@ fn processColTag(
         },
     }
     if (drop) return;
-    if (new_min == old_min and new_max == old_max) {
+    if (split_emit_first_max == null and new_min == old_min and new_max == old_max) {
         try out.appendSlice(allocator, src[t.start..t.after_open]);
         return;
     }
-    // Rewrite both attrs in place.
+    if (split_emit_first_max) |first_max| {
+        // Emit two <col> entries: one for the unchanged head, one
+        // for the shifted tail.
+        try emitColEntry(allocator, out, attrs, src, t, old_min, first_max);
+        try emitColEntry(allocator, out, attrs, src, t, new_min, new_max);
+    } else {
+        try emitColEntry(allocator, out, attrs, src, t, new_min, new_max);
+    }
+}
+
+/// Emit a `<col>` tag with its attrs preserved verbatim except
+/// `min` and `max`, which take the supplied values.
+fn emitColEntry(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    attrs: []const u8,
+    src: []const u8,
+    t: TagOpen,
+    new_min: u32,
+    new_max: u32,
+) !void {
     var min_buf: [12]u8 = undefined;
     var max_buf: [12]u8 = undefined;
     const min_s = try std.fmt.bufPrint(&min_buf, "{d}", .{new_min});
     const max_s = try std.fmt.bufPrint(&max_buf, "{d}", .{new_max});
-    // Two-step replace: min, then max. writeWithReplacedAttr emits
-    // the entire tag, so we'd double-emit. Build a fresh tag from
-    // attrs by emitting `<col ` + walking attrs and rewriting min/max.
     try out.appendSlice(allocator, "<col");
     var ai: usize = 0;
     while (ai < attrs.len) {
@@ -7134,7 +7138,6 @@ fn processColTag(
         }
         try out.append(allocator, quote);
     }
-    // Emit closing `>` (or `/>` for self-closing).
     try out.appendSlice(allocator, src[t.after_open - 1 .. t.after_open]);
 }
 
