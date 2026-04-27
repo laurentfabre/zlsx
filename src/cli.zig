@@ -43,6 +43,12 @@ const Subcommand = enum {
     /// JSON array per row) to a sheet of an existing xlsx and save
     /// to `--out`. Requires `--sheet N` and `--out PATH`.
     append_rows,
+    /// iter-cm-4: rewrite a single cell in place via `Editor.setCell`
+    /// and save to `--out`. Requires `--sheet N`, `--ref A1`, and
+    /// `--value <JSON>`. Value is a single JSON token (string, int,
+    /// float, bool, null) — same shape as one slot of an
+    /// `append-rows` row.
+    set_cell,
 };
 
 /// iter60b: `--output` wire-shape switch.
@@ -139,6 +145,13 @@ const Args = struct {
     /// sub-command. Required for `append-rows`, ignored / rejected
     /// elsewhere. Set via `--out PATH`.
     out_path: ?[]const u8 = null,
+    /// iter-cm-4: A1-style cell ref for the `set-cell` sub-command.
+    /// Set via `--ref A1`.
+    cell_ref: ?[]const u8 = null,
+    /// iter-cm-4: JSON-encoded scalar value for `set-cell`. Same
+    /// shape as one cell in an `append-rows` row. Set via
+    /// `--value <JSON>`.
+    cell_value_json: ?[]const u8 = null,
     /// iter-sst-4: opt into the lazy SST backend (`Book.openSstLazy`).
     /// Workbooks with millions of unique strings skip the eager
     /// decode arena; resolution happens on first cell access. See
@@ -180,7 +193,9 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
             std.mem.eql(u8, a, "--range") or
             std.mem.eql(u8, a, "--sheet-glob") or
             std.mem.eql(u8, a, "--output") or
-            std.mem.eql(u8, a, "--out"))
+            std.mem.eql(u8, a, "--out") or
+            std.mem.eql(u8, a, "--ref") or
+            std.mem.eql(u8, a, "--value"))
         {
             i += 1; // skip paired value (bounds-checked by caller)
             continue;
@@ -189,6 +204,7 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
         if (std.mem.eql(u8, a, "cells")) return .cells;
         if (std.mem.eql(u8, a, "rows")) return .rows;
         if (std.mem.eql(u8, a, "append-rows")) return .append_rows;
+        if (std.mem.eql(u8, a, "set-cell")) return .set_cell;
         if (std.mem.eql(u8, a, "meta")) return .meta;
         if (std.mem.eql(u8, a, "list-sheets")) return .list_sheets;
         if (std.mem.eql(u8, a, "comments")) return .comments;
@@ -220,7 +236,7 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
         .styles,
         .sst,
         => true,
-        .rows, .cells, .comments, .validations, .hyperlinks, .append_rows => false,
+        .rows, .cells, .comments, .validations, .hyperlinks, .append_rows, .set_cell => false,
     };
 
     var out: Args = .{ .file = "", .subcommand = detected_sub };
@@ -245,6 +261,14 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
             out.out_path = argv[i];
+        } else if (std.mem.eql(u8, a, "--ref")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            out.cell_ref = argv[i];
+        } else if (std.mem.eql(u8, a, "--value")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            out.cell_value_json = argv[i];
         } else if (std.mem.eql(u8, a, "--sheet")) {
             if (!workbook_scoped and (out.sheet_name != null or out.all_sheets or out.sheet_glob != null))
                 return ArgError.SheetArgConflict;
@@ -398,7 +422,7 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     if (out.start_row != null or out.end_row != null) {
         switch (detected_sub) {
             .rows, .cells, .comments => {},
-            .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows => {
+            .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell => {
                 return ArgError.BadArgValue;
             },
         }
@@ -410,7 +434,7 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     if (out.range != null) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows => {
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell => {
                 return ArgError.BadArgValue;
             },
         }
@@ -442,7 +466,7 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     if (out.include_blanks) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows => {
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell => {
                 return ArgError.BadArgValue;
             },
         }
@@ -451,7 +475,7 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     if (out.with_styles) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows => {
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell => {
                 return ArgError.BadArgValue;
             },
         }
@@ -651,6 +675,14 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                     Required: --out PATH and --sheet N.
         \\                     `cat rows.ndjson | zlsx append-rows in.xlsx
         \\                       --sheet 0 --out out.xlsx`
+        \\  set-cell           load-modify-save: rewrite a single cell in
+        \\                     place. Required: --out PATH, --sheet N,
+        \\                     --ref A1, --value <JSON>. Value is one
+        \\                     JSON token (string, integer, float, true,
+        \\                     false, null) — same type-mapping as
+        \\                     append-rows. Insert / empty-row paths handled.
+        \\                     `zlsx set-cell in.xlsx --sheet 0 --ref C5
+        \\                       --value '"hello"' --out out.xlsx`
         \\
         \\Formats (rows only)
         \\  jsonl              NDJSON row envelope (default, iter55a):
@@ -1455,6 +1487,10 @@ fn runMain() !u8 {
     if (args.subcommand == .append_rows) {
         return try runAppendRowsCommand(alloc, args, err);
     }
+    // iter-cm-4: same dispatch pattern for set-cell — Editor route.
+    if (args.subcommand == .set_cell) {
+        return try runSetCellCommand(alloc, args, err);
+    }
 
     // iter-sst-4: dispatch on --sst-lazy.
     var book = if (args.sst_lazy)
@@ -1580,6 +1616,7 @@ fn runMain() !u8 {
         .styles,
         .sst,
         .append_rows,
+        .set_cell,
         => unreachable,
     }
     return 0;
@@ -3282,6 +3319,93 @@ fn runAppendRowsCommand(
     return 0;
 }
 
+/// iter-cm-4: rewrite a single cell of an existing workbook in place
+/// and save to `--out`. Required flags: `--sheet N`, `--ref A1`,
+/// `--value <JSON>`. Value parsing reuses jsonValueToCell so the
+/// accepted types match `append-rows` exactly.
+fn runSetCellCommand(
+    alloc: std.mem.Allocator,
+    args: Args,
+    err: *std.Io.Writer,
+) !u8 {
+    const out_path = args.out_path orelse {
+        try err.writeAll("zlsx: set-cell requires --out PATH\n");
+        try err.flush();
+        return 1;
+    };
+    if (args.sheet_index == null) {
+        try err.writeAll("zlsx: set-cell requires --sheet N (0-based)\n");
+        try err.flush();
+        return 1;
+    }
+    if (args.sheet_index.? > std.math.maxInt(u32)) {
+        try err.writeAll("zlsx: --sheet value too large (must fit in u32)\n");
+        try err.flush();
+        return 1;
+    }
+    const sheet_idx: u32 = @intCast(args.sheet_index.?);
+
+    const ref = args.cell_ref orelse {
+        try err.writeAll("zlsx: set-cell requires --ref A1\n");
+        try err.flush();
+        return 1;
+    };
+    const value_json = args.cell_value_json orelse {
+        try err.writeAll("zlsx: set-cell requires --value <JSON>\n");
+        try err.flush();
+        return 1;
+    };
+
+    // Parse "A1" → (row, col0). Reuse parseA1Range over a single ref;
+    // a bare "A1" parses as a 1-cell rectangle, which is exactly what
+    // we want.
+    const range = xlsx.parseA1Range(ref) catch {
+        try err.print("zlsx: invalid --ref '{s}' (expected A1-style)\n", .{ref});
+        try err.flush();
+        return 1;
+    };
+    if (range.top_left.row != range.bottom_right.row or range.top_left.col != range.bottom_right.col) {
+        try err.print("zlsx: --ref must be a single cell (got '{s}')\n", .{ref});
+        try err.flush();
+        return 1;
+    }
+    // parseA1Ref returns row 1-based, col 0-based — match setCell's
+    // signature directly (sheet, row_1based, col_0based, cell).
+    const row_1based: u32 = @intCast(range.top_left.row);
+    const col_0based: u32 = @intCast(range.top_left.col);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch |e| {
+        try err.print("zlsx: --value invalid JSON: {s}\n", .{@errorName(e)});
+        try err.flush();
+        return 3;
+    };
+    defer parsed.deinit();
+    const cell = jsonValueToCell(parsed.value) catch |e| {
+        try err.print("zlsx: --value: {s}\n", .{@errorName(e)});
+        try err.flush();
+        return 3;
+    };
+
+    var ed = xlsx.Editor.open(alloc, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    defer ed.deinit();
+
+    ed.setCell(sheet_idx, row_1based, col_0based, cell) catch |e| {
+        try err.print("zlsx: setCell {s}: {s}\n", .{ ref, @errorName(e) });
+        try err.flush();
+        return 3;
+    };
+    ed.save(out_path) catch |e| {
+        try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
+        try err.flush();
+        return 5;
+    };
+    return 0;
+}
+
 fn jsonValueToCell(v: std.json.Value) !xlsx.Cell {
     return switch (v) {
         .null => .{ .empty = {} },
@@ -3351,6 +3475,76 @@ test "writeCsvField quoting" {
         var w = std.Io.Writer.fixed(&scratch);
         try writeCsvField(&w, "has\"quote");
         try std.testing.expectEqualStrings("\"has\"\"quote\"", w.buffered());
+    }
+}
+
+test "runSetCellCommand rewrites a single cell and saves to --out" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_cli_set_cell_src.xlsx";
+    const dst_path = "/tmp/zlsx_cli_set_cell_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 } });
+        try s.writeRow(&.{ .{ .integer = 3 }, .{ .integer = 4 } });
+        try w.save(src_path);
+    }
+    var err_buf: [1024]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const args: Args = .{
+        .file = src_path,
+        .subcommand = .set_cell,
+        .sheet_index = 0,
+        .out_path = dst_path,
+        .cell_ref = "B1",
+        .cell_value_json = "\"hello\"",
+    };
+    const rc = try runSetCellCommand(std.testing.allocator, args, &err_w);
+    try std.testing.expectEqual(@as(u8, 0), rc);
+
+    // Verify by re-opening the saved file: B1 must be "hello", A1
+    // unchanged, A2 unchanged.
+    var book = try xlsx.Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    const r1 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 1), r1[0].integer);
+    try std.testing.expectEqualStrings("hello", r1[1].string);
+    const r2 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 3), r2[0].integer);
+    try std.testing.expectEqual(@as(i64, 4), r2[1].integer);
+}
+
+test "runSetCellCommand rejects missing --ref / --value / --out" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_cli_set_cell_missing.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    var err_buf: [1024]u8 = undefined;
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const a: Args = .{ .file = src_path, .subcommand = .set_cell, .sheet_index = 0, .cell_ref = "A1", .cell_value_json = "1" };
+        try std.testing.expectEqual(@as(u8, 1), try runSetCellCommand(std.testing.allocator, a, &err_w));
+    }
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const a: Args = .{ .file = src_path, .subcommand = .set_cell, .sheet_index = 0, .out_path = "/tmp/x.xlsx", .cell_value_json = "1" };
+        try std.testing.expectEqual(@as(u8, 1), try runSetCellCommand(std.testing.allocator, a, &err_w));
+    }
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const a: Args = .{ .file = src_path, .subcommand = .set_cell, .sheet_index = 0, .out_path = "/tmp/x.xlsx", .cell_ref = "A1" };
+        try std.testing.expectEqual(@as(u8, 1), try runSetCellCommand(std.testing.allocator, a, &err_w));
     }
 }
 
