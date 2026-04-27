@@ -49,6 +49,16 @@ const Subcommand = enum {
     /// float, bool, null) — same shape as one slot of an
     /// `append-rows` row.
     set_cell,
+    /// iter-row-4 / iter-col-5 / iter-sheet-5 — structural-edit
+    /// CLI sub-commands. Each opens via Editor, applies one
+    /// structural mutation, and saves to `--out`.
+    insert_row,
+    delete_row,
+    insert_column,
+    delete_column,
+    add_sheet,
+    rename_sheet,
+    delete_sheet,
 };
 
 /// iter60b: `--output` wire-shape switch.
@@ -152,6 +162,18 @@ const Args = struct {
     /// shape as one cell in an `append-rows` row. Set via
     /// `--value <JSON>`.
     cell_value_json: ?[]const u8 = null,
+    /// iter-row-4 / iter-col-5: 1-based row index for `insert-row` /
+    /// `delete-row`. Set via `--row N`.
+    row_1based: ?u32 = null,
+    /// iter-col-5: column letter (A, B, …, XFD) for `insert-column` /
+    /// `delete-column`. Set via `--col LETTER`. Decoded into a 1-based
+    /// column index at runtime.
+    col_letter: ?[]const u8 = null,
+    /// iter-sheet-4 / iter-sheet-5: target sheet name for
+    /// `add-sheet` / `rename-sheet`. Set via `--name NAME`.
+    /// Distinct from `sheet_name` (the sheet selector) — name conflict
+    /// is resolved at runtime per-subcommand.
+    new_sheet_name: ?[]const u8 = null,
     /// iter-sst-4: opt into the lazy SST backend (`Book.openSstLazy`).
     /// Workbooks with millions of unique strings skip the eager
     /// decode arena; resolution happens on first cell access. See
@@ -195,7 +217,10 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
             std.mem.eql(u8, a, "--output") or
             std.mem.eql(u8, a, "--out") or
             std.mem.eql(u8, a, "--ref") or
-            std.mem.eql(u8, a, "--value"))
+            std.mem.eql(u8, a, "--value") or
+            std.mem.eql(u8, a, "--row") or
+            std.mem.eql(u8, a, "--col") or
+            std.mem.eql(u8, a, "--new-name"))
         {
             i += 1; // skip paired value (bounds-checked by caller)
             continue;
@@ -205,6 +230,13 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
         if (std.mem.eql(u8, a, "rows")) return .rows;
         if (std.mem.eql(u8, a, "append-rows")) return .append_rows;
         if (std.mem.eql(u8, a, "set-cell")) return .set_cell;
+        if (std.mem.eql(u8, a, "insert-row")) return .insert_row;
+        if (std.mem.eql(u8, a, "delete-row")) return .delete_row;
+        if (std.mem.eql(u8, a, "insert-column")) return .insert_column;
+        if (std.mem.eql(u8, a, "delete-column")) return .delete_column;
+        if (std.mem.eql(u8, a, "add-sheet")) return .add_sheet;
+        if (std.mem.eql(u8, a, "rename-sheet")) return .rename_sheet;
+        if (std.mem.eql(u8, a, "delete-sheet")) return .delete_sheet;
         if (std.mem.eql(u8, a, "meta")) return .meta;
         if (std.mem.eql(u8, a, "list-sheets")) return .list_sheets;
         if (std.mem.eql(u8, a, "comments")) return .comments;
@@ -236,7 +268,7 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
         .styles,
         .sst,
         => true,
-        .rows, .cells, .comments, .validations, .hyperlinks, .append_rows, .set_cell => false,
+        .rows, .cells, .comments, .validations, .hyperlinks, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet => false,
     };
 
     var out: Args = .{ .file = "", .subcommand = detected_sub };
@@ -269,6 +301,18 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
             out.cell_value_json = argv[i];
+        } else if (std.mem.eql(u8, a, "--row")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            out.row_1based = std.fmt.parseInt(u32, argv[i], 10) catch return ArgError.BadArgValue;
+        } else if (std.mem.eql(u8, a, "--col")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            out.col_letter = argv[i];
+        } else if (std.mem.eql(u8, a, "--new-name")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            out.new_sheet_name = argv[i];
         } else if (std.mem.eql(u8, a, "--sheet")) {
             if (!workbook_scoped and (out.sheet_name != null or out.all_sheets or out.sheet_glob != null))
                 return ArgError.SheetArgConflict;
@@ -404,7 +448,14 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
                     std.mem.eql(u8, a, "styles") or
                     std.mem.eql(u8, a, "sst") or
                     std.mem.eql(u8, a, "append-rows") or
-                    std.mem.eql(u8, a, "set-cell"))
+                    std.mem.eql(u8, a, "set-cell") or
+                    std.mem.eql(u8, a, "insert-row") or
+                    std.mem.eql(u8, a, "delete-row") or
+                    std.mem.eql(u8, a, "insert-column") or
+                    std.mem.eql(u8, a, "delete-column") or
+                    std.mem.eql(u8, a, "add-sheet") or
+                    std.mem.eql(u8, a, "rename-sheet") or
+                    std.mem.eql(u8, a, "delete-sheet"))
                 {
                     continue;
                 }
@@ -423,7 +474,7 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     if (out.start_row != null or out.end_row != null) {
         switch (detected_sub) {
             .rows, .cells, .comments => {},
-            .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell => {
+            .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet => {
                 return ArgError.BadArgValue;
             },
         }
@@ -435,7 +486,7 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     if (out.range != null) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell => {
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet => {
                 return ArgError.BadArgValue;
             },
         }
@@ -467,7 +518,7 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     if (out.include_blanks) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell => {
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet => {
                 return ArgError.BadArgValue;
             },
         }
@@ -476,7 +527,7 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     if (out.with_styles) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell => {
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet => {
                 return ArgError.BadArgValue;
             },
         }
@@ -684,6 +735,22 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                     append-rows. Insert / empty-row paths handled.
         \\                     `zlsx set-cell in.xlsx --sheet 0 --ref C5
         \\                       --value '"hello"' --out out.xlsx`
+        \\  insert-row /       structural row edit. Required: --out PATH,
+        \\  delete-row         --sheet N, --row N (1-based). Refuses on
+        \\                     sheets carrying formulas, hyperlinks, data
+        \\                     validations, conditional formatting, frozen
+        \\                     panes, or other constructs the rewriter
+        \\                     doesn't yet shift.
+        \\  insert-column /    structural column edit. Required: --out PATH,
+        \\  delete-column      --sheet N, --col LETTER (A..XFD). Same
+        \\                     refusal contract as the row edits.
+        \\  add-sheet          load-modify-save: append a new (empty)
+        \\                     sheet. Required: --out PATH, --new-name NAME.
+        \\  rename-sheet       load-modify-save: rename a sheet. Required:
+        \\                     --out PATH, --sheet N, --new-name NAME.
+        \\  delete-sheet       load-modify-save: drop a sheet (cannot drop
+        \\                     the last remaining sheet). Required:
+        \\                     --out PATH, --sheet N.
         \\
         \\Formats (rows only)
         \\  jsonl              NDJSON row envelope (default, iter55a):
@@ -1492,6 +1559,16 @@ fn runMain() !u8 {
     if (args.subcommand == .set_cell) {
         return try runSetCellCommand(alloc, args, err);
     }
+    // iter-row-4 / iter-col-5 / iter-sheet-5: structural-edit
+    // sub-commands also route through Editor.
+    switch (args.subcommand) {
+        .insert_row, .delete_row => return try runRowEditCommand(alloc, args, err),
+        .insert_column, .delete_column => return try runColEditCommand(alloc, args, err),
+        .add_sheet => return try runAddSheetCommand(alloc, args, err),
+        .rename_sheet => return try runRenameSheetCommand(alloc, args, err),
+        .delete_sheet => return try runDeleteSheetCommand(alloc, args, err),
+        else => {},
+    }
 
     // iter-sst-4: dispatch on --sst-lazy.
     var book = if (args.sst_lazy)
@@ -1618,6 +1695,13 @@ fn runMain() !u8 {
         .sst,
         .append_rows,
         .set_cell,
+        .insert_row,
+        .delete_row,
+        .insert_column,
+        .delete_column,
+        .add_sheet,
+        .rename_sheet,
+        .delete_sheet,
         => unreachable,
     }
     return 0;
@@ -3407,6 +3491,243 @@ fn runSetCellCommand(
     return 0;
 }
 
+/// Decode an A1 column letter run ("A"…"XFD") into the 1-based
+/// column index Editor.{insert,delete}Column expect. Mirrors the
+/// reader's `parseA1Ref` letter loop. Returns null on malformed
+/// input.
+fn parseColLettersToOneBased(s: []const u8) ?u32 {
+    if (s.len == 0 or s.len > 3) return null;
+    var idx: u32 = 0;
+    for (s) |c| {
+        if (c < 'A' or c > 'Z') return null;
+        idx = idx * 26 + (@as(u32, c) - 'A' + 1);
+    }
+    if (idx == 0 or idx > 16384) return null;
+    return idx;
+}
+
+fn requireSheetIdxU32(args: Args, err: *std.Io.Writer, who: []const u8) !u32 {
+    if (args.sheet_index == null) {
+        try err.print("zlsx: {s} requires --sheet N (0-based)\n", .{who});
+        try err.flush();
+        return error.SheetIndexMissing;
+    }
+    if (args.sheet_index.? > std.math.maxInt(u32)) {
+        try err.writeAll("zlsx: --sheet value too large (must fit in u32)\n");
+        try err.flush();
+        return error.SheetIndexTooLarge;
+    }
+    return @intCast(args.sheet_index.?);
+}
+
+fn runRowEditCommand(
+    alloc: std.mem.Allocator,
+    args: Args,
+    err: *std.Io.Writer,
+) !u8 {
+    const out_path = args.out_path orelse {
+        try err.writeAll("zlsx: row-edit requires --out PATH\n");
+        try err.flush();
+        return 1;
+    };
+    const sheet_idx = requireSheetIdxU32(args, err, switch (args.subcommand) {
+        .insert_row => "insert-row",
+        .delete_row => "delete-row",
+        else => unreachable,
+    }) catch return 1;
+    const row = args.row_1based orelse {
+        try err.writeAll("zlsx: row-edit requires --row N (1-based)\n");
+        try err.flush();
+        return 1;
+    };
+
+    var ed = xlsx.Editor.open(alloc, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    defer ed.deinit();
+
+    switch (args.subcommand) {
+        .insert_row => ed.insertRow(sheet_idx, row) catch |e| {
+            try err.print("zlsx: insertRow {d}: {s}\n", .{ row, @errorName(e) });
+            try err.flush();
+            return 3;
+        },
+        .delete_row => ed.deleteRow(sheet_idx, row) catch |e| {
+            try err.print("zlsx: deleteRow {d}: {s}\n", .{ row, @errorName(e) });
+            try err.flush();
+            return 3;
+        },
+        else => unreachable,
+    }
+    ed.save(out_path) catch |e| {
+        try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
+        try err.flush();
+        return 5;
+    };
+    return 0;
+}
+
+fn runColEditCommand(
+    alloc: std.mem.Allocator,
+    args: Args,
+    err: *std.Io.Writer,
+) !u8 {
+    const out_path = args.out_path orelse {
+        try err.writeAll("zlsx: col-edit requires --out PATH\n");
+        try err.flush();
+        return 1;
+    };
+    const sheet_idx = requireSheetIdxU32(args, err, switch (args.subcommand) {
+        .insert_column => "insert-column",
+        .delete_column => "delete-column",
+        else => unreachable,
+    }) catch return 1;
+    const col_letter = args.col_letter orelse {
+        try err.writeAll("zlsx: col-edit requires --col LETTER (A..XFD)\n");
+        try err.flush();
+        return 1;
+    };
+    const col_1based = parseColLettersToOneBased(col_letter) orelse {
+        try err.print("zlsx: invalid --col '{s}' (expected A..XFD)\n", .{col_letter});
+        try err.flush();
+        return 1;
+    };
+
+    var ed = xlsx.Editor.open(alloc, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    defer ed.deinit();
+
+    switch (args.subcommand) {
+        .insert_column => ed.insertColumn(sheet_idx, col_1based) catch |e| {
+            try err.print("zlsx: insertColumn {s}: {s}\n", .{ col_letter, @errorName(e) });
+            try err.flush();
+            return 3;
+        },
+        .delete_column => ed.deleteColumn(sheet_idx, col_1based) catch |e| {
+            try err.print("zlsx: deleteColumn {s}: {s}\n", .{ col_letter, @errorName(e) });
+            try err.flush();
+            return 3;
+        },
+        else => unreachable,
+    }
+    ed.save(out_path) catch |e| {
+        try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
+        try err.flush();
+        return 5;
+    };
+    return 0;
+}
+
+fn runAddSheetCommand(
+    alloc: std.mem.Allocator,
+    args: Args,
+    err: *std.Io.Writer,
+) !u8 {
+    const out_path = args.out_path orelse {
+        try err.writeAll("zlsx: add-sheet requires --out PATH\n");
+        try err.flush();
+        return 1;
+    };
+    const name = args.new_sheet_name orelse {
+        try err.writeAll("zlsx: add-sheet requires --new-name NAME\n");
+        try err.flush();
+        return 1;
+    };
+
+    var ed = xlsx.Editor.open(alloc, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    defer ed.deinit();
+
+    _ = ed.addSheet(name) catch |e| {
+        try err.print("zlsx: addSheet '{s}': {s}\n", .{ name, @errorName(e) });
+        try err.flush();
+        return 3;
+    };
+    ed.save(out_path) catch |e| {
+        try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
+        try err.flush();
+        return 5;
+    };
+    return 0;
+}
+
+fn runRenameSheetCommand(
+    alloc: std.mem.Allocator,
+    args: Args,
+    err: *std.Io.Writer,
+) !u8 {
+    const out_path = args.out_path orelse {
+        try err.writeAll("zlsx: rename-sheet requires --out PATH\n");
+        try err.flush();
+        return 1;
+    };
+    const sheet_idx = requireSheetIdxU32(args, err, "rename-sheet") catch return 1;
+    const new_name = args.new_sheet_name orelse {
+        try err.writeAll("zlsx: rename-sheet requires --new-name NAME\n");
+        try err.flush();
+        return 1;
+    };
+
+    var ed = xlsx.Editor.open(alloc, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    defer ed.deinit();
+
+    ed.renameSheet(sheet_idx, new_name) catch |e| {
+        try err.print("zlsx: renameSheet {d} -> '{s}': {s}\n", .{ sheet_idx, new_name, @errorName(e) });
+        try err.flush();
+        return 3;
+    };
+    ed.save(out_path) catch |e| {
+        try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
+        try err.flush();
+        return 5;
+    };
+    return 0;
+}
+
+fn runDeleteSheetCommand(
+    alloc: std.mem.Allocator,
+    args: Args,
+    err: *std.Io.Writer,
+) !u8 {
+    const out_path = args.out_path orelse {
+        try err.writeAll("zlsx: delete-sheet requires --out PATH\n");
+        try err.flush();
+        return 1;
+    };
+    const sheet_idx = requireSheetIdxU32(args, err, "delete-sheet") catch return 1;
+
+    var ed = xlsx.Editor.open(alloc, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    defer ed.deinit();
+
+    ed.deleteSheet(sheet_idx) catch |e| {
+        try err.print("zlsx: deleteSheet {d}: {s}\n", .{ sheet_idx, @errorName(e) });
+        try err.flush();
+        return 3;
+    };
+    ed.save(out_path) catch |e| {
+        try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
+        try err.flush();
+        return 5;
+    };
+    return 0;
+}
+
 fn jsonValueToCell(v: std.json.Value) !xlsx.Cell {
     return switch (v) {
         .null => .{ .empty = {} },
@@ -3559,6 +3880,135 @@ test "runSetCellCommand rejects missing --ref / --value / --out" {
         var err_w = std.Io.Writer.fixed(&err_buf);
         const a: Args = .{ .file = src_path, .subcommand = .set_cell, .sheet_index = 0, .out_path = "/tmp/x.xlsx", .cell_ref = "A1" };
         try std.testing.expectEqual(@as(u8, 1), try runSetCellCommand(std.testing.allocator, a, &err_w));
+    }
+}
+
+test "parseColLettersToOneBased: A=1, Z=26, AA=27, XFD=16384, XFE rejected" {
+    try std.testing.expectEqual(@as(?u32, 1), parseColLettersToOneBased("A"));
+    try std.testing.expectEqual(@as(?u32, 26), parseColLettersToOneBased("Z"));
+    try std.testing.expectEqual(@as(?u32, 27), parseColLettersToOneBased("AA"));
+    try std.testing.expectEqual(@as(?u32, 16384), parseColLettersToOneBased("XFD"));
+    try std.testing.expectEqual(@as(?u32, null), parseColLettersToOneBased("XFE"));
+    try std.testing.expectEqual(@as(?u32, null), parseColLettersToOneBased(""));
+    try std.testing.expectEqual(@as(?u32, null), parseColLettersToOneBased("a"));
+    try std.testing.expectEqual(@as(?u32, null), parseColLettersToOneBased("ABCD"));
+}
+
+test "runRowEditCommand insert-row + delete-row round-trip" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_cli_row_edit_src.xlsx";
+    const dst_path = "/tmp/zlsx_cli_row_edit_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try s.writeRow(&.{.{ .integer = 2 }});
+        try s.writeRow(&.{.{ .integer = 3 }});
+        try w.save(src_path);
+    }
+    var err_buf: [1024]u8 = undefined;
+
+    // insert-row 2 → expect [1, empty, 2, 3]
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const a: Args = .{
+            .file = src_path,
+            .subcommand = .insert_row,
+            .sheet_index = 0,
+            .out_path = dst_path,
+            .row_1based = 2,
+        };
+        try std.testing.expectEqual(@as(u8, 0), try runRowEditCommand(std.testing.allocator, a, &err_w));
+    }
+    {
+        var book = try xlsx.Book.open(std.testing.allocator, dst_path);
+        defer book.deinit();
+        var rows = try book.rows(book.sheets[0], std.testing.allocator);
+        defer rows.deinit();
+        const r1 = (try rows.next()).?;
+        try std.testing.expectEqual(@as(i64, 1), r1[0].integer);
+        // The inserted row may surface as a blank row entirely — the
+        // reader's iteration contract skips empty rows, so the next
+        // emitted row should be the original "2".
+        const r2 = (try rows.next()).?;
+        try std.testing.expectEqual(@as(i64, 2), r2[0].integer);
+    }
+}
+
+test "runAddSheetCommand + runRenameSheetCommand + runDeleteSheetCommand round-trip" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_cli_sheet_ops_src.xlsx";
+    const after_add = "/tmp/zlsx_cli_sheet_ops_add.xlsx";
+    const after_rename = "/tmp/zlsx_cli_sheet_ops_rename.xlsx";
+    const after_delete = "/tmp/zlsx_cli_sheet_ops_delete.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(after_add) catch {};
+    defer std.fs.cwd().deleteFile(after_rename) catch {};
+    defer std.fs.cwd().deleteFile(after_delete) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("First");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    var err_buf: [1024]u8 = undefined;
+
+    // add-sheet "Second"
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const a: Args = .{
+            .file = src_path,
+            .subcommand = .add_sheet,
+            .out_path = after_add,
+            .new_sheet_name = "Second",
+        };
+        try std.testing.expectEqual(@as(u8, 0), try runAddSheetCommand(std.testing.allocator, a, &err_w));
+    }
+    {
+        var book = try xlsx.Book.open(std.testing.allocator, after_add);
+        defer book.deinit();
+        try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
+        try std.testing.expectEqualStrings("Second", book.sheets[1].name);
+    }
+
+    // rename-sheet 0 -> "Renamed"
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const a: Args = .{
+            .file = after_add,
+            .subcommand = .rename_sheet,
+            .sheet_index = 0,
+            .out_path = after_rename,
+            .new_sheet_name = "Renamed",
+        };
+        try std.testing.expectEqual(@as(u8, 0), try runRenameSheetCommand(std.testing.allocator, a, &err_w));
+    }
+    {
+        var book = try xlsx.Book.open(std.testing.allocator, after_rename);
+        defer book.deinit();
+        try std.testing.expectEqualStrings("Renamed", book.sheets[0].name);
+    }
+
+    // delete-sheet 1 (drops "Second")
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const a: Args = .{
+            .file = after_rename,
+            .subcommand = .delete_sheet,
+            .sheet_index = 1,
+            .out_path = after_delete,
+        };
+        try std.testing.expectEqual(@as(u8, 0), try runDeleteSheetCommand(std.testing.allocator, a, &err_w));
+    }
+    {
+        var book = try xlsx.Book.open(std.testing.allocator, after_delete);
+        defer book.deinit();
+        try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
+        try std.testing.expectEqualStrings("Renamed", book.sheets[0].name);
     }
 }
 
