@@ -4548,18 +4548,25 @@ pub const Editor = struct {
             // pass through and Excel recomputes on its next save.
             // Skip cleanly when the spans index is empty (no real
             // mutations on this sheet) — leaves dimension as-is.
+            var pm_min_row: u32 = std.math.maxInt(u32);
             var pm_max_row: u32 = 0;
-            var pm_max_col: u32 = 0; // 1-based
+            var pm_min_col1: u32 = std.math.maxInt(u32);
+            var pm_max_col1: u32 = 0;
             for (kv.value_ptr.spans.items) |s| {
+                if (s.row < pm_min_row) pm_min_row = s.row;
                 if (s.row > pm_max_row) pm_max_row = s.row;
-                if (s.col + 1 > pm_max_col) pm_max_col = s.col + 1;
+                const c1 = s.col + 1;
+                if (c1 < pm_min_col1) pm_min_col1 = c1;
+                if (c1 > pm_max_col1) pm_max_col1 = c1;
             }
             const xml_to_use = if (pm_max_row > 0)
-                (try updateDimension(
+                (try updateDimensionRange(
                     self.allocator,
                     kv.value_ptr.xml.items,
+                    pm_min_row,
                     pm_max_row,
-                    pm_max_col,
+                    pm_min_col1,
+                    pm_max_col1,
                 )) orelse try self.allocator.dupe(u8, kv.value_ptr.xml.items)
             else
                 try self.allocator.dupe(u8, kv.value_ptr.xml.items);
@@ -5984,6 +5991,47 @@ fn injectAppendedRows(
     try spliced.appendSlice(allocator, "</sheetData>");
     try spliced.appendSlice(allocator, src_xml[sd_close + 1 ..]);
     return try spliced.toOwnedSlice(allocator);
+}
+
+/// Patch BOTH corners of a canonical-form `<dimension ref="TL:BR"/>`
+/// to span `[min_row..=max_row]` × `[min_col_1based..=max_col_1based]`.
+/// Used by the cell-mutate save path where edits can land outside
+/// the existing range (e.g. `setCell(A1, ...)` on a sheet whose
+/// dimension was `C5:D7`). Same canonical-form contract as
+/// `updateDimension`: non-canonical refs pass through.
+fn updateDimensionRange(
+    allocator: Allocator,
+    xml: []const u8,
+    new_min_row: u32,
+    new_max_row: u32,
+    new_min_col_1based: u32,
+    new_max_col_1based: u32,
+) !?[]u8 {
+    if (new_min_row == 0 or new_max_row == 0 or new_min_col_1based == 0 or new_max_col_1based == 0)
+        return null;
+    const dim_open = "<dimension ref=\"";
+    const dim_pos = std.mem.indexOf(u8, xml, dim_open) orelse return null;
+    const ref_start = dim_pos + dim_open.len;
+    const ref_end = std.mem.indexOfScalarPos(u8, xml, ref_start, '"') orelse return null;
+    const ref = xml[ref_start..ref_end];
+    if (std.mem.indexOfScalar(u8, ref, ':') == null) return null;
+
+    // Build the new "MINTL:MAXBR" string. formatCellRef takes a
+    // 0-based col_idx so subtract 1 from the 1-based input.
+    const writer_mod = @import("writer.zig");
+    var tl_buf: [16]u8 = undefined;
+    var br_buf: [16]u8 = undefined;
+    const tl = try writer_mod.formatCellRef(&tl_buf, new_min_row, new_min_col_1based - 1);
+    const br = try writer_mod.formatCellRef(&br_buf, new_max_row, new_max_col_1based - 1);
+
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, xml[0..ref_start]);
+    try out.appendSlice(allocator, tl);
+    try out.append(allocator, ':');
+    try out.appendSlice(allocator, br);
+    try out.appendSlice(allocator, xml[ref_end..]);
+    return try out.toOwnedSlice(allocator);
 }
 
 /// Patch a canonical-form `<dimension ref="TL:BR"/>` so the
