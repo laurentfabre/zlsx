@@ -86,15 +86,20 @@ pub fn fromExcelSerial(serial: f64) ?DateTime {
     // serials ≥ 60 forward by one day vs the real Gregorian calendar.
     // Serial 25569 corresponds to 1970-01-01; subtracting it yields
     // days-since-Unix-epoch for the Hinnant algorithm.
-    const days_since_unix: i32 = @intCast(@as(i64, @intFromFloat(floored)) - 25569);
-    const ymd = daysSinceUnixEpochToYMD(days_since_unix);
+    var days_since_unix: i32 = @intCast(@as(i64, @intFromFloat(floored)) - 25569);
 
-    // Time of day: fractional part × 86 400 seconds, rounded.
-    // Clamp to 86399 so a rounding edge like `1.99999999` never
-    // produces hour=24 / minute=60 / second=60; we lose one second
-    // of resolution there.
+    // Time of day: fractional part × 86 400 seconds, rounded. When
+    // the rounded value equals 86400 (e.g. serial 1.9999999999 →
+    // 86400.0), the result is the next day at 00:00:00 — carry the
+    // day forward instead of clamping back to 23:59:59 like prior
+    // versions did.
     const total_s_f: f64 = @round((serial - floored) * 86400.0);
-    const total_s: i64 = @intFromFloat(@min(total_s_f, 86399.0));
+    var total_s: i64 = @intFromFloat(total_s_f);
+    if (total_s >= 86400) {
+        total_s -= 86400;
+        days_since_unix += 1;
+    }
+    const ymd = daysSinceUnixEpochToYMD(days_since_unix);
     return .{
         .year = ymd.year,
         .month = ymd.month,
@@ -2315,8 +2320,10 @@ fn parseWorkbookSheets(book: *Book, wb_xml: []const u8, rels_xml: []const u8) !v
     i = 0;
     while (std.mem.indexOfPos(u8, wb_xml, i, "<sheet")) |sh_start| {
         // Must be a standalone `<sheet` tag — `<sheets>` also matches.
+        // Accept any whitespace (incl. \n / \r for pretty-printed
+        // workbook.xml) plus `/` (self-closing) after `<sheet`.
         const next_c = if (sh_start + "<sheet".len < wb_xml.len) wb_xml[sh_start + "<sheet".len] else break;
-        if (next_c != ' ' and next_c != '\t' and next_c != '/') {
+        if (next_c != ' ' and next_c != '\t' and next_c != '\n' and next_c != '\r' and next_c != '/') {
             i = sh_start + 1;
             continue;
         }
@@ -3275,7 +3282,13 @@ fn parseColorAttr(book: *const Book, tag: []const u8) ?u32 {
     if (std.mem.indexOf(u8, tag, rgb_key)) |rp| {
         const rs = rp + rgb_key.len;
         if (std.mem.indexOfScalarPos(u8, tag, rs, '"')) |re| {
-            if (std.fmt.parseInt(u32, tag[rs..re], 16)) |v| return v else |_| {}
+            // OOXML rgb is canonical AARRGGBB — exactly 8 hex digits.
+            // Anything shorter (e.g. malformed `rgb="FF"`) would have
+            // surfaced as a bogus near-black color via parseInt; reject
+            // those rather than leak garbage into Book.richRuns / styles.
+            if (re - rs == 8) {
+                if (std.fmt.parseInt(u32, tag[rs..re], 16)) |v| return v else |_| {}
+            }
         }
     }
     const theme_key = "theme=\"";
@@ -12463,6 +12476,77 @@ test "parseStyles: cellXfs handles <xf/> and <xf> variants (no attrs)" {
     try std.testing.expectEqual(@as(u32, 14), book.cell_xf_numfmt_ids[3]);
     try std.testing.expectEqual(@as(u32, 2), book.cell_xf_font_ids[3]);
     try std.testing.expectEqual(@as(u32, 1), book.cell_xf_fill_ids[3]);
+}
+
+test "parseWorkbookSheets: pretty-printed <sheet\\n ...> is recognised" {
+    const wb_xml =
+        \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        \\<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        \\          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+        \\  <sheets>
+        \\    <sheet
+        \\      name="Pretty"
+        \\      sheetId="1"
+        \\      r:id="rId1"/>
+        \\  </sheets>
+        \\</workbook>
+    ;
+    const rels_xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>" ++
+        "</Relationships>";
+
+    var book: Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer book.deinit();
+    try parseWorkbookSheets(&book, wb_xml, rels_xml);
+    try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
+    try std.testing.expectEqualStrings("Pretty", book.sheets[0].name);
+}
+
+test "parseColorAttr requires exactly 8 hex digits for rgb=" {
+    var book: Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer book.deinit();
+    // Canonical AARRGGBB.
+    try std.testing.expectEqual(@as(?u32, 0xFF112233), parseColorAttr(&book, "<color rgb=\"FF112233\"/>"));
+    // Non-8-digit forms must reject (return null), not silently
+    // surface a near-black 0x000000FF.
+    try std.testing.expectEqual(@as(?u32, null), parseColorAttr(&book, "<color rgb=\"FF\"/>"));
+    try std.testing.expectEqual(@as(?u32, null), parseColorAttr(&book, "<color rgb=\"112233\"/>"));
+    try std.testing.expectEqual(@as(?u32, null), parseColorAttr(&book, "<color rgb=\"FFAABBCCDD\"/>"));
+}
+
+test "fromExcelSerial: 86400-second rounding carries to next day" {
+    // Serials < 61 are rejected by design (1900 leap-year ambiguity),
+    // so test the midnight-rounding edge at a valid serial. A
+    // fractional that rounds to 86400 must advance the date instead
+    // of clamping back to 23:59:59 on the previous day.
+    const day_a = fromExcelSerial(61.0).?; // 1900-03-01 00:00:00
+    try std.testing.expectEqual(@as(u8, 0), day_a.hour);
+    try std.testing.expectEqual(@as(u8, 0), day_a.minute);
+    try std.testing.expectEqual(@as(u8, 0), day_a.second);
+
+    // Round up to 86400: 60.99999999... — should land on 1900-03-01,
+    // not 1900-02-28 23:59:59 (and 1900-02-28 isn't legal anyway).
+    // Use serial 61.99999999... to check that 62.0 worth of fractional
+    // input lands on the boundary day cleanly.
+    const carry = fromExcelSerial(61.0 + 0.99999999999).?;
+    try std.testing.expectEqual(@as(u8, 0), carry.hour);
+    try std.testing.expectEqual(@as(u8, 0), carry.minute);
+    try std.testing.expectEqual(@as(u8, 0), carry.second);
+    try std.testing.expectEqual(@as(u8, 2), carry.day);
+
+    // Just-under boundary stays on the same day.
+    const just_before = fromExcelSerial(61.0 + 23.0 / 24.0 + 59.0 / 1440.0 + 59.0 / 86400.0).?;
+    try std.testing.expectEqual(@as(u8, 23), just_before.hour);
+    try std.testing.expectEqual(@as(u8, 59), just_before.minute);
+    try std.testing.expectEqual(@as(u8, 59), just_before.second);
 }
 
 test "parseStyles: custom numFmt formatCode is XML-entity decoded" {
