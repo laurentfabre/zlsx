@@ -5458,10 +5458,12 @@ pub const Editor = struct {
 
         if (self.findPendingNewSheet(path)) |ns_idx| {
             // Pending-new sheet: remove from pending_new_sheets.
-            // NewSheet.path borrows from sheet_paths; deinit only
-            // frees name/rid/body. The path bytes are freed below
-            // when we rebuild sheet_paths.
-            var ns = self.pending_new_sheets.swapRemove(ns_idx);
+            // orderedRemove (NOT swapRemove) so the remaining new
+            // sheets keep their original order — save-time loops
+            // rely on `source_count + i` indexing matching
+            // sheet_paths' tail. NewSheet.path borrows from
+            // sheet_paths; deinit frees name/rid/body only.
+            var ns = self.pending_new_sheets.orderedRemove(ns_idx);
             ns.deinit(self.allocator);
         } else {
             const meta = (try self.sheetMetaAtPath(path)) orelse return error.SheetEntryNotFound;
@@ -5524,6 +5526,19 @@ pub const Editor = struct {
                 i = t.after_open;
                 continue;
             };
+            // Skip sheets queued for deletion — their names are
+            // freed for reuse on save.
+            var was_deleted = false;
+            for (self.pending_deletes.items) |d| {
+                if (std.mem.eql(u8, d.rid, rid)) {
+                    was_deleted = true;
+                    break;
+                }
+            }
+            if (was_deleted) {
+                i = t.after_open;
+                continue;
+            }
             // Effective name: pending-rename's new_name if any
             // matches this rId; else the raw (decoded) name.
             var rename_hit: ?[]const u8 = null;
@@ -9171,6 +9186,67 @@ test "Editor: deleteSheet drops a pending-new sheet" {
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
     try std.testing.expectEqualStrings("Original", book.sheets[0].name);
+}
+
+test "Editor: deleteSheet preserves order of other pending-new sheets" {
+    // Codex P1: swapRemove reordered remaining new sheets. orderedRemove
+    // keeps them aligned with sheet_paths' tail.
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_delete_order.xlsx";
+    const dst_path = "/tmp/zlsx_delete_order_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        _ = try w.addSheet("Source");
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        const a = try ed.addSheet("A"); // idx 1
+        _ = try ed.addSheet("B"); // idx 2
+        _ = try ed.addSheet("C"); // idx 3
+        try ed.deleteSheet(a); // remove A; B,C should stay in order
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 3), book.sheets.len);
+    try std.testing.expectEqualStrings("Source", book.sheets[0].name);
+    try std.testing.expectEqualStrings("B", book.sheets[1].name);
+    try std.testing.expectEqualStrings("C", book.sheets[2].name);
+}
+
+test "Editor: deleteSheet frees name for reuse via addSheet" {
+    // Codex P2: pre-fix, addSheet rejected reuse of a deleted
+    // source sheet's name as DuplicateSheetName.
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_delete_reuse.xlsx";
+    const dst_path = "/tmp/zlsx_delete_reuse_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        _ = try w.addSheet("Keep");
+        _ = try w.addSheet("Drop");
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.deleteSheet(1);
+        // Reuse the deleted name.
+        _ = try ed.addSheet("Drop");
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
+    try std.testing.expectEqualStrings("Keep", book.sheets[0].name);
+    try std.testing.expectEqualStrings("Drop", book.sheets[1].name);
 }
 
 test "Editor: deleteSheet rejects last-sheet" {
