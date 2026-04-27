@@ -5106,26 +5106,38 @@ fn sourceCellHasMetadata(xml: []const u8, span: CellSpan) bool {
         i += 1;
     }
 
-    // Check body. Reject only when a `<f>` (formula) is present —
-    // that's the case where setCell would silently drop semantic
-    // state. `<is>` (inline-string body), `<v>` (value), and empty
-    // bodies are all fine: the replacement overwrites the value
-    // either way. Match any `<f` followed by whitespace / `>` /
-    // `/` so we catch open-tag forms (`<f>`, `<f t="shared">`),
-    // self-closing forms (`<f t="shared" si="0"/>`), and shared-
-    // formula followers — all of which carry semantic state.
+    // Check body. Reject any tag that isn't part of the canonical
+    // value envelope (`<v>`, `<is>`, `<t>` and their closes —
+    // empty `<is>`/`<t>`/`<v>` self-closing forms accepted too).
+    // Anything else — `<f>` formulas, `<rPh>` phonetic hints,
+    // `<phoneticPr>`, `<extLst>` extensions — carries semantic
+    // state setCell would silently drop. iter-cm-2e relaxes this
+    // to a preserve-and-merge model.
     if (span.end < span.body_start + "</c>".len) return false;
     const body_end = span.end - "</c>".len;
     if (body_end <= span.body_start) return false;
     const body = xml[span.body_start..body_end];
-    var search_pos: usize = 0;
-    while (std.mem.indexOfPos(u8, body, search_pos, "<f")) |hit| {
-        const after = hit + 2;
-        if (after >= body.len) return true; // truncated; assume metadata
-        const c = body[after];
-        if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '/' or c == '>')
-            return true;
-        search_pos = hit + 1;
+
+    var bi: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, body, bi, '<')) |lt| {
+        const after = lt + 1;
+        if (after >= body.len) return true;
+        // Step over `/` for closing tags; same allow-list applies.
+        const name_start = if (body[after] == '/') after + 1 else after;
+        if (name_start >= body.len) return true;
+        // Find tag-name terminator (whitespace, `/`, `>`).
+        var ne = name_start;
+        while (ne < body.len and body[ne] != ' ' and body[ne] != '\t' and
+            body[ne] != '\n' and body[ne] != '\r' and
+            body[ne] != '/' and body[ne] != '>') ne += 1;
+        const name = body[name_start..ne];
+        const allowed = std.mem.eql(u8, name, "v") or
+            std.mem.eql(u8, name, "is") or
+            std.mem.eql(u8, name, "t");
+        if (!allowed) return true;
+        // Advance past the tag's `>`.
+        const gt = std.mem.indexOfScalarPos(u8, body, ne, '>') orelse return true;
+        bi = gt + 1;
     }
     return false;
 }
