@@ -4551,6 +4551,10 @@ pub const Editor = struct {
             const sheet_idx = kv.key_ptr.*;
             const buf = kv.value_ptr.*;
             const path = self.sheet_paths[sheet_idx];
+            // Phase 3e: appendRows on a new sheet is handled by the
+            // pending_new_sheets branch below — no source entry to
+            // substitute here.
+            if (self.findPendingNewSheet(path) != null) continue;
             const entry_idx = findEntryByName(self.entries, path) orelse
                 return error.SheetEntryNotFound;
             subs[entry_idx] = try buildSubstitutedSheet(
@@ -4625,6 +4629,39 @@ pub const Editor = struct {
             extra_entries.deinit(self.allocator);
         }
 
+        // Phase 3e iter-sheet-1: emit each new sheet's body BEFORE
+        // the SST commit so any string cells injected here extend
+        // sst_appender in time. Metadata patches (workbook.xml,
+        // rels, Content_Types) come after — they don't touch the
+        // SST.
+        if (self.pending_new_sheets.items.len > 0) {
+            const source_count: u32 = @intCast(self.sheet_paths.len - self.pending_new_sheets.items.len);
+            for (self.pending_new_sheets.items, 0..) |new_sheet, i| {
+                const sheet_idx_for_new: u32 = source_count + @as(u32, @intCast(i));
+                const body_owned: []u8 = blk: {
+                    if (self.pending_mutations.get(sheet_idx_for_new)) |ms|
+                        break :blk try self.allocator.dupe(u8, ms.xml.items);
+                    if (self.pending_appends.get(sheet_idx_for_new)) |buf| {
+                        // New sheet starts empty, so appended rows
+                        // begin at row 1. Pass sst_ptr so any
+                        // string cells extend the SST in time for
+                        // the commit below.
+                        break :blk try injectAppendedRows(
+                            self.allocator,
+                            new_sheet.body_xml,
+                            buf.rows.items,
+                            1,
+                            sst_ptr,
+                        );
+                    }
+                    break :blk try self.allocator.dupe(u8, new_sheet.body_xml);
+                };
+                // buildEntryFromXml takes ownership of body_owned.
+                const new_entry = try buildEntryFromXml(self.allocator, new_sheet.path, body_owned);
+                try extra_entries.append(self.allocator, new_entry);
+            }
+        }
+
         if (has_strings and sst_appender.new_strings.items.len > 0) {
             if (create_new_sst) {
                 // SST-less source workbook — build a fresh
@@ -4670,24 +4707,12 @@ pub const Editor = struct {
             }
         }
 
-        // Phase 3e iter-sheet-1: pending sheet additions. Emit each
-        // new sheet as an appendix entry + patch workbook.xml,
-        // workbook.xml.rels, and [Content_Types].xml in place.
+        // Phase 3e iter-sheet-1 (continued): metadata patches for
+        // the new sheets — these must run AFTER the SST patches
+        // above so a workbook that ALSO got a fresh SST has all
+        // its workbook.xml-rels updates applied through the same
+        // patchEntryForNewSheets re-substitution flow.
         if (self.pending_new_sheets.items.len > 0) {
-            // Compute new-sheet sheet_idx range = [source_count..total).
-            // Pending mutations on a new sheet supply its body in
-            // place of the empty template.
-            const source_count: u32 = @intCast(self.sheet_paths.len - self.pending_new_sheets.items.len);
-            for (self.pending_new_sheets.items, 0..) |new_sheet, i| {
-                const sheet_idx_for_new: u32 = source_count + @as(u32, @intCast(i));
-                const body_src: []const u8 = if (self.pending_mutations.get(sheet_idx_for_new)) |ms|
-                    ms.xml.items
-                else
-                    new_sheet.body_xml;
-                const body_dupe = try self.allocator.dupe(u8, body_src);
-                const new_entry = try buildEntryFromXml(self.allocator, new_sheet.path, body_dupe);
-                try extra_entries.append(self.allocator, new_entry);
-            }
             try patchEntryForNewSheets(
                 self.allocator,
                 self.entries,
@@ -8407,6 +8432,46 @@ test "Editor: addSheet appends a new sheet and round-trips through reader (iter-
     const r = (try rows.next()) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("hello", r[0].string);
     try std.testing.expectEqual(@as(i64, 99), r[1].integer);
+}
+
+test "Editor: appendRows works on freshly-added sheets" {
+    // Codex P1: pre-fix, save() failed with SheetEntryNotFound when
+    // appendRows targeted a sheet created via addSheet, because the
+    // pending_appends loop assumed every sheet had a source entry.
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_addsheet_append.xlsx";
+    const dst_path = "/tmp/zlsx_addsheet_append_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Original");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        const new_idx = try ed.addSheet("Fresh");
+        try ed.appendRows(new_idx, &.{
+            &.{ .{ .string = "alpha" }, .{ .integer = 10 } },
+            &.{ .{ .string = "beta" }, .{ .integer = 20 } },
+        });
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
+    try std.testing.expectEqualStrings("Fresh", book.sheets[1].name);
+    var rows = try book.rows(book.sheets[1], std.testing.allocator);
+    defer rows.deinit();
+    const r1 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("alpha", r1[0].string);
+    try std.testing.expectEqual(@as(i64, 10), r1[1].integer);
+    const r2 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("beta", r2[0].string);
+    try std.testing.expectEqual(@as(i64, 20), r2[1].integer);
 }
 
 test "Editor: scanWorksheet works on freshly-added sheets (iter-sheet-1)" {
