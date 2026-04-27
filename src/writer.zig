@@ -1042,8 +1042,14 @@ pub const Writer = struct {
                 // comments on cells near XFD/1048576 don't reference
                 // off-sheet cells. Excel tolerates it, but some strict
                 // VML parsers do not.
-                const from_col = col0 + 1;
-                const from_row = row0;
+                // Clamp BOTH endpoints to the hard XFD/1048576 grid.
+                // For a comment on the rightmost column (col0 ==
+                // EXCEL_MAX_COL - 1), the unclamped from_col would
+                // be EXCEL_MAX_COL while to_col clamps back to
+                // EXCEL_MAX_COL - 1, producing an inverted anchor.
+                // Same shape on the bottom row.
+                const from_col = @min(col0 + 1, EXCEL_MAX_COL - 1);
+                const from_row = @min(row0, EXCEL_MAX_ROW - 1);
                 const to_col = @min(col0 + 3, EXCEL_MAX_COL - 1);
                 const to_row = @min(row0 + 4, EXCEL_MAX_ROW - 1);
                 try vml.print(
@@ -3039,7 +3045,14 @@ const ZipWriter = struct {
 };
 
 fn appendStruct(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), comptime T: type, value: T) !void {
-    const bytes = std.mem.asBytes(&value);
+    // ZIP headers are defined little-endian on disk. On a big-endian
+    // host, dumping the native struct bytes would emit byte-swapped
+    // signatures/sizes/offsets and produce archives that Excel and
+    // std.zip can't open. Mirrors the editor save path's pattern.
+    var v = value;
+    if (@import("builtin").cpu.arch.endian() != .little)
+        std.mem.byteSwapAllFields(T, &v);
+    const bytes = std.mem.asBytes(&v);
     try out.appendSlice(alloc, bytes);
 }
 
@@ -3724,6 +3737,54 @@ test "Writer: VML idmap expands for >1023 comments per sheet" {
     const v2 = vml2 orelse return error.VmlNotFound;
     try std.testing.expect(std.mem.indexOf(u8, v2, "data=\"1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, v2, "data=\"1,\"") == null);
+}
+
+test "Writer: comment on XFD column emits non-inverted VML anchor" {
+    const tmp_path = "/tmp/zlsx_writer_comment_xfd.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("S");
+        // XFD = column 16384 (1-based); col 16383 (0-based).
+        try sheet.addComment("XFD1", "A", "edge");
+        try sheet.writeRow(&.{.{ .string = "x" }});
+        try w.save(tmp_path);
+    }
+    var file = try std.fs.cwd().openFile(tmp_path, .{});
+    defer file.close();
+    var fbuf: [4096]u8 = undefined;
+    var fr = file.reader(&fbuf);
+    var iter = try std.zip.Iterator.init(&fr);
+    var fn_buf: [64]u8 = undefined;
+    var vml: ?[]u8 = null;
+    defer if (vml) |v| std.testing.allocator.free(v);
+    while (try iter.next()) |entry| {
+        if (entry.filename_len > fn_buf.len) continue;
+        try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+        const fname = fn_buf[0..entry.filename_len];
+        try fr.interface.readSliceAll(fname);
+        if (std.mem.eql(u8, fname, "xl/drawings/vmlDrawing1.vml")) {
+            vml = try extractEntryForTest(std.testing.allocator, entry, &fr);
+            break;
+        }
+    }
+    const v = vml orelse return error.VmlNotFound;
+    // Anchor: <x:Anchor>FROM_COL, 15, FROM_ROW, 2, TO_COL, 31, TO_ROW, 3</x:Anchor>
+    // Both FROM_COL and TO_COL must be ≤ 16383 (EXCEL_MAX_COL - 1)
+    // — and FROM_COL must not exceed TO_COL.
+    const start = std.mem.indexOf(u8, v, "<x:Anchor>") orelse return error.AnchorMissing;
+    const end = std.mem.indexOfPos(u8, v, start, "</x:Anchor>") orelse return error.AnchorEnd;
+    const anchor = v[start + "<x:Anchor>".len .. end];
+    var it = std.mem.splitScalar(u8, anchor, ',');
+    const fc = std.fmt.parseInt(u32, std.mem.trim(u8, it.next().?, " "), 10) catch return error.AnchorParse;
+    _ = it.next(); // 15
+    _ = it.next(); // FROM_ROW
+    _ = it.next(); // 2
+    const tc = std.fmt.parseInt(u32, std.mem.trim(u8, it.next().?, " "), 10) catch return error.AnchorParse;
+    try std.testing.expect(fc <= 16383);
+    try std.testing.expect(tc <= 16383);
+    try std.testing.expect(fc <= tc);
 }
 
 test "Writer: conditional formatting — colorScale (2+3 stop) + dataBar" {
