@@ -4828,8 +4828,7 @@ pub const Editor = struct {
                 const writer_mod = @import("writer.zig");
                 if (!writer_mod.fitsExactlyInF64(n)) return error.IntegerExceedsExcelPrecision;
             },
-            .string => return error.SetCellStringNotImplementedYet,
-            .number, .boolean, .empty => {},
+            .string, .number, .boolean, .empty => {},
         }
 
         // Track whether we created the MutatedSheet entry on this
@@ -4902,6 +4901,25 @@ pub const Editor = struct {
         };
     }
 
+    /// Bulk variant of `setCell` (Phase 3d, iter-cm-3). Same
+    /// per-cell rules as `setCell`; the only win is amortising the
+    /// "open the MutatedSheet for this sheet" lookup across N edits
+    /// for callers that can batch them. Each `Edit` is applied in
+    /// source order — later edits see the byte offsets produced by
+    /// earlier ones, same as calling `setCell` N times.
+    pub const Edit = struct {
+        row: u32,
+        col: u32,
+        cell: Cell,
+    };
+    pub fn setCells(
+        self: *Editor,
+        sheet_idx: u32,
+        edits: []const Edit,
+    ) !void {
+        for (edits) |e| try self.setCell(sheet_idx, e.row, e.col, e.cell);
+    }
+
     fn getOrInitMutatedSheet(self: *Editor, sheet_idx: u32) !*MutatedSheet {
         const gop = try self.pending_mutations.getOrPut(self.allocator, sheet_idx);
         if (!gop.found_existing) {
@@ -4953,12 +4971,31 @@ fn emitCellXml(
 
     const type_attr: []const u8 = switch (cell) {
         .boolean => " t=\"b\"",
+        // iter-cm-2b: emit strings as `t="inlineStr"` rather than
+        // patching the SST. Valid OOXML, smaller surface area, no
+        // cross-cell coordination needed. Trade-off: repeated
+        // strings are no longer deduped by setCell — callers who
+        // care can normalise upstream or fall back to a writer.
+        .string => " t=\"inlineStr\"",
         else => "",
     };
     try out.writer(allocator).print("<c r=\"{s}\"{s}>", .{ ref, type_attr });
     switch (cell) {
         .empty => unreachable,
-        .string => unreachable, // gated above
+        .string => |s| {
+            try out.appendSlice(allocator, "<is><t");
+            // Honour OOXML's xml:space="preserve" semantics for
+            // strings whose first/last byte is whitespace —
+            // matches the writer's existing rule.
+            const needs_preserve = s.len > 0 and
+                (s[0] == ' ' or s[0] == '\t' or s[0] == '\n' or s[0] == '\r' or
+                    s[s.len - 1] == ' ' or s[s.len - 1] == '\t' or
+                    s[s.len - 1] == '\n' or s[s.len - 1] == '\r');
+            if (needs_preserve) try out.appendSlice(allocator, " xml:space=\"preserve\"");
+            try out.append(allocator, '>');
+            try appendXmlEscaped(allocator, out, s);
+            try out.appendSlice(allocator, "</t></is>");
+        },
         .integer => |n| try out.writer(allocator).print("<v>{d}</v>", .{n}),
         .number => |f| try out.writer(allocator).print("<v>{d}</v>", .{f}),
         .boolean => |b| try out.writer(allocator).print("<v>{d}</v>", .{@intFromBool(b)}),
@@ -7143,6 +7180,79 @@ test "Editor: setCell replaces a numeric cell in place (iter-cm-2a)" {
     try std.testing.expectEqual(@as(i64, 4), r2[1].integer);
 }
 
+test "Editor: setCell with strings emits inline-string cells (iter-cm-2b)" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_setcell_str_src.xlsx";
+    const dst_path = "/tmp/zlsx_setcell_str_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{ .{ .string = "a" }, .{ .string = "b" } });
+        try w.save(src_path);
+    }
+
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        // Replace shared-string cells with inline strings — including
+        // entity-needing chars and leading/trailing whitespace.
+        try ed.setCell(0, 1, 0, .{ .string = "Done & dusted" });
+        try ed.setCell(0, 1, 1, .{ .string = " trim me " });
+        try ed.save(dst_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+
+    const r1 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Done & dusted", r1[0].string);
+    try std.testing.expectEqualStrings(" trim me ", r1[1].string);
+}
+
+test "Editor: setCells applies a batch in source order (iter-cm-3)" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_setcells_batch.xlsx";
+    const dst_path = "/tmp/zlsx_setcells_batch_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 } });
+        try s.writeRow(&.{ .{ .integer = 4 }, .{ .integer = 5 }, .{ .integer = 6 } });
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.setCells(0, &.{
+            .{ .row = 1, .col = 0, .cell = .{ .integer = 100 } },
+            .{ .row = 1, .col = 2, .cell = .{ .number = 3.14 } },
+            .{ .row = 2, .col = 1, .cell = .{ .string = "x" } },
+        });
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    const r1 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 100), r1[0].integer);
+    try std.testing.expectEqual(@as(i64, 2), r1[1].integer);
+    try std.testing.expectEqual(@as(f64, 3.14), r1[2].number);
+    const r2 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 4), r2[0].integer);
+    try std.testing.expectEqualStrings("x", r2[1].string);
+    try std.testing.expectEqual(@as(i64, 6), r2[2].integer);
+}
+
 test "Editor: setCell amortises decompress across many calls (iter-cm-2a)" {
     // Lazy-init the MutatedSheet on first call; subsequent calls
     // mutate the cached buffer.
@@ -7206,8 +7316,6 @@ test "Editor: setCell rejects unsupported cases (iter-cm-2a)" {
     try std.testing.expectError(error.SheetIndexOutOfRange, ed.setCell(99, 1, 0, .{ .integer = 1 }));
     // Row 0 is invalid (1-based)
     try std.testing.expectError(error.RowIndexOutOfRange, ed.setCell(0, 0, 0, .{ .integer = 1 }));
-    // String cells deferred to iter-cm-2b
-    try std.testing.expectError(error.SetCellStringNotImplementedYet, ed.setCell(0, 1, 0, .{ .string = "x" }));
     // Lossy integer
     try std.testing.expectError(error.IntegerExceedsExcelPrecision, ed.setCell(0, 1, 0, .{ .integer = 9007199254740993 }));
     // Missing target
