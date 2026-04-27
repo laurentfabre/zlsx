@@ -2148,9 +2148,14 @@ fn findTagOpen(xml: []const u8, from: usize, tag: []const u8) ?TagOpen {
     while (std.mem.indexOfPos(u8, xml, i, "<")) |lt| {
         const after_lt = lt + 1;
         if (after_lt + tag.len <= xml.len and std.mem.eql(u8, xml[after_lt .. after_lt + tag.len], tag)) {
-            // Must be followed by `/`, `>`, space, or `/>` — i.e. a whole tag, not a prefix.
+            // Must be followed by whitespace, `/`, or `>` — i.e. a
+            // whole tag, not a prefix. Pretty-printed OOXML wraps
+            // attrs onto the next line (`<row\n r="7">`), so accept
+            // `\n` and `\r` alongside space and tab.
             const next_c = if (after_lt + tag.len < xml.len) xml[after_lt + tag.len] else return null;
-            if (next_c == ' ' or next_c == '\t' or next_c == '>' or next_c == '/') {
+            if (next_c == ' ' or next_c == '\t' or next_c == '\n' or
+                next_c == '\r' or next_c == '>' or next_c == '/')
+            {
                 const gt = std.mem.indexOfScalarPos(u8, xml, lt, '>') orelse return null;
                 return .{ .start = lt, .after_open = gt + 1 };
             }
@@ -4710,6 +4715,13 @@ pub const Editor = struct {
     /// independent (no caching yet) — repeated calls re-decompress.
     pub fn scanWorksheet(self: *Editor, sheet_idx: u32) !WorksheetSpans {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
+        // The scanner reads from `src_buf` directly — it does NOT
+        // see rows queued in `pending_appends`. Reject sheets with
+        // unsaved appends rather than silently returning a stale
+        // span set; iter-cm-2's setCell has the same constraint
+        // and a follow-up iter can merge pending state into the
+        // scanned XML if a use case appears.
+        if (self.pending_appends.contains(sheet_idx)) return error.SheetHasUnsavedAppends;
         const path = self.sheet_paths[sheet_idx];
         const entry_idx = findEntryByName(self.entries, path) orelse
             return error.SheetEntryNotFound;
@@ -6857,6 +6869,33 @@ test "scanWorksheetXml: pretty-printed cells (newline after <c) + r-less rows" {
     try std.testing.expectEqual(@as(u32, 1), cells[1].col);
     try std.testing.expectEqual(@as(u32, 12), cells[2].row);
     try std.testing.expectEqual(@as(u32, 0), cells[2].col);
+}
+
+test "Editor: scanWorksheet rejects sheets with unsaved appendRows" {
+    // The scanner reads from src_buf and would silently miss rows
+    // queued in pending_appends. Contract: reject so callers can't
+    // act on a stale span set.
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_scan_pending.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    // Scan works on a clean Editor.
+    {
+        var spans = try ed.scanWorksheet(0);
+        defer spans.deinit();
+        try std.testing.expectEqual(@as(usize, 1), spans.cells.len);
+    }
+    // After appendRows, scanning the same sheet must error cleanly.
+    try ed.appendRows(0, &.{&.{.{ .integer = 2 }}});
+    try std.testing.expectError(error.SheetHasUnsavedAppends, ed.scanWorksheet(0));
 }
 
 test "Editor: scanWorksheet rejects out-of-range sheet idx" {
