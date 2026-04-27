@@ -5454,17 +5454,18 @@ pub const Editor = struct {
             return error.SheetDeleteRequiresCleanState;
         }
 
-        // Conservative guard: refuse delete when the workbook has
-        // any `<definedName>` entries. iter-col-1's formula
-        // tokenizer is needed to safely rewrite print areas / named
-        // ranges with `localSheetId` indices that shift after
-        // delete, or formula bodies referencing the deleted sheet.
-        // Until that ships, it's safer to refuse than to silently
-        // produce a workbook strict readers reject.
-        const wb_check = try self.readEntry("xl/workbook.xml");
-        defer self.allocator.free(wb_check);
-        if (std.mem.indexOf(u8, wb_check, "<definedName") != null)
-            return error.SheetDeleteWithDefinedNamesNotSupported;
+        // Conservative guard: refuse SOURCE-sheet deletes when the
+        // workbook has any `<definedName>` entries. Pending-new
+        // sheet deletes don't shift any existing localSheetId or
+        // formula reference (the new sheet was never saved), so
+        // they're safe regardless.
+        const path_check = self.sheet_paths[sheet_idx];
+        if (self.findPendingNewSheet(path_check) == null) {
+            const wb_check = try self.readEntry("xl/workbook.xml");
+            defer self.allocator.free(wb_check);
+            if (std.mem.indexOf(u8, wb_check, "<definedName") != null)
+                return error.SheetDeleteWithDefinedNamesNotSupported;
+        }
 
         const path = self.sheet_paths[sheet_idx];
 
@@ -6592,6 +6593,87 @@ fn patchContentTypesForNewSheets(
     return try out.toOwnedSlice(allocator);
 }
 
+/// Walk `<workbookView>` attributes and rewrite `activeTab=` and
+/// `firstSheet=` values to account for deleted sheets. Other attrs
+/// pass through verbatim.
+fn patchViewAttrs(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    attrs: []const u8,
+    dropped_positions: []const u32,
+    live_count: u32,
+) !void {
+    var i: usize = 0;
+    while (i < attrs.len) {
+        // Skip whitespace (preserve verbatim).
+        const ws_start = i;
+        while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
+            attrs[i] == '\n' or attrs[i] == '\r')) i += 1;
+        try out.appendSlice(allocator, attrs[ws_start..i]);
+        if (i >= attrs.len) break;
+
+        // Read attribute name.
+        const name_start = i;
+        while (i < attrs.len and attrs[i] != '=' and attrs[i] != ' ' and
+            attrs[i] != '\t' and attrs[i] != '\n' and attrs[i] != '\r') i += 1;
+        const attr_name = attrs[name_start..i];
+
+        // Skip optional whitespace + `=`.
+        while (i < attrs.len and attrs[i] != '=') i += 1;
+        if (i >= attrs.len) {
+            try out.appendSlice(allocator, attrs[name_start..]);
+            return;
+        }
+        // From here we have `name=` and a quoted value.
+        i += 1; // past `=`
+        if (i >= attrs.len or (attrs[i] != '"' and attrs[i] != '\'')) {
+            try out.appendSlice(allocator, attrs[name_start..]);
+            return;
+        }
+        const quote = attrs[i];
+        i += 1;
+        const val_start = i;
+        while (i < attrs.len and attrs[i] != quote) i += 1;
+        const val = attrs[val_start..i];
+        if (i < attrs.len) i += 1; // past closing quote
+
+        const is_active = std.mem.eql(u8, attr_name, "activeTab");
+        const is_first = std.mem.eql(u8, attr_name, "firstSheet");
+        if (is_active or is_first) {
+            const old_n = std.fmt.parseInt(u32, val, 10) catch live_count;
+            var new_n: u32 = 0;
+            if (live_count > 0) {
+                var was_dropped = false;
+                var shift: u32 = 0;
+                for (dropped_positions) |dp| {
+                    if (dp == old_n) was_dropped = true;
+                    if (dp < old_n) shift += 1;
+                }
+                if (was_dropped) {
+                    new_n = 0;
+                } else if (old_n >= shift) {
+                    new_n = old_n - shift;
+                } else {
+                    new_n = 0;
+                }
+                if (new_n >= live_count) new_n = live_count - 1;
+            }
+            try out.appendSlice(allocator, attr_name);
+            try out.append(allocator, '=');
+            try out.append(allocator, quote);
+            try out.writer(allocator).print("{d}", .{new_n});
+            try out.append(allocator, quote);
+        } else {
+            // Verbatim: name + `=` + quote + value + quote.
+            try out.appendSlice(allocator, attr_name);
+            try out.append(allocator, '=');
+            try out.append(allocator, quote);
+            try out.appendSlice(allocator, val);
+            try out.append(allocator, quote);
+        }
+    }
+}
+
 /// Drop the `<sheet r:id="rIdN"/>` line from `xl/workbook.xml`
 /// for each pending delete (matched by r:id). Two passes:
 ///   1. First walk computes which raw `<sheet>` positions are
@@ -6676,43 +6758,24 @@ fn patchWorkbookXmlForDeletes(
             i = t.after_open;
         } else {
             const t = next_view.?;
-            const attrs = xml[t.start + "<workbookView".len .. t.after_open - 1];
             try out.appendSlice(allocator, xml[i..t.start]);
-            const tag_body_start = t.start;
-            // Default: emit verbatim.
-            var emitted: bool = false;
-            if (getAttr(attrs, "activeTab")) |at_str| {
-                const old_at = std.fmt.parseInt(u32, at_str, 10) catch live_count;
-                var new_at: u32 = 0;
-                if (live_count > 0) {
-                    var was_dropped = false;
-                    var shift: u32 = 0;
-                    for (dropped_positions.items) |dp| {
-                        if (dp == old_at) was_dropped = true;
-                        if (dp < old_at) shift += 1;
-                    }
-                    if (was_dropped) {
-                        new_at = 0;
-                    } else if (old_at >= shift) {
-                        new_at = old_at - shift;
-                    } else {
-                        new_at = 0;
-                    }
-                    if (new_at >= live_count) new_at = live_count - 1;
-                }
-                if (new_at != old_at) {
-                    const at_pat = "activeTab=\"";
-                    if (std.mem.indexOf(u8, attrs, at_pat)) |off| {
-                        const val_start = (t.start + "<workbookView".len) + off + at_pat.len;
-                        const val_end = std.mem.indexOfScalarPos(u8, xml, val_start, '"') orelse t.after_open - 1;
-                        try out.appendSlice(allocator, xml[tag_body_start..val_start]);
-                        try out.writer(allocator).print("{d}", .{new_at});
-                        try out.appendSlice(allocator, xml[val_end..t.after_open]);
-                        emitted = true;
-                    }
-                }
-            }
-            if (!emitted) try out.appendSlice(allocator, xml[t.start..t.after_open]);
+            // Rewrite both activeTab + firstSheet attributes inside
+            // <workbookView>, in source order, so each adjustment
+            // composes cleanly. Both attributes get the same
+            // shift/clamp treatment.
+            const view_attrs_start = t.start + "<workbookView".len;
+            const view_attrs_end = t.after_open - 1;
+            try out.append(allocator, '<');
+            try out.appendSlice(allocator, "workbookView");
+            try patchViewAttrs(
+                allocator,
+                &out,
+                xml[view_attrs_start..view_attrs_end],
+                dropped_positions.items,
+                live_count,
+            );
+            // Emit the closing `>` (or `/>` for self-closing).
+            try out.appendSlice(allocator, xml[view_attrs_end..t.after_open]);
             i = t.after_open;
         }
     }
