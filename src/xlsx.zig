@@ -4848,7 +4848,7 @@ pub const Editor = struct {
     ) !void {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
         if (self.pending_appends.contains(sheet_idx)) return error.SheetHasUnsavedAppends;
-        if (row == 0) return error.RowIndexOutOfRange;
+        if (row == 0 or row > max_row) return error.RowIndexOutOfRange;
         if (col >= max_col_1based) return error.ColumnIndexOutOfRange;
 
         switch (cell) {
@@ -8044,6 +8044,10 @@ test "Editor: setCell rejects unsupported cases (iter-cm-2a)" {
     try std.testing.expectError(error.SheetIndexOutOfRange, ed.setCell(99, 1, 0, .{ .integer = 1 }));
     // Row 0 is invalid (1-based)
     try std.testing.expectError(error.RowIndexOutOfRange, ed.setCell(0, 0, 0, .{ .integer = 1 }));
+    // Row > Excel's max (1_048_576) is invalid; in Python a caller
+    // can pass `row=-1` which arrives via ctypes as u32::MAX.
+    try std.testing.expectError(error.RowIndexOutOfRange, ed.setCell(0, 1_048_577, 0, .{ .integer = 1 }));
+    try std.testing.expectError(error.RowIndexOutOfRange, ed.setCell(0, std.math.maxInt(u32), 0, .{ .integer = 1 }));
     // Lossy integer
     try std.testing.expectError(error.IntegerExceedsExcelPrecision, ed.setCell(0, 1, 0, .{ .integer = 9007199254740993 }));
     // Mix with appendRows on same sheet — both directions.
