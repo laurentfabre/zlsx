@@ -7138,7 +7138,16 @@ fn emitColEntry(
         }
         try out.append(allocator, quote);
     }
-    try out.appendSlice(allocator, src[t.after_open - 1 .. t.after_open]);
+    // OOXML <col/> is always an empty element. Detect the original
+    // self-closing form (last non-ws byte of attrs is `/`) and
+    // emit `/>` accordingly, so we don't leave open `<col>` tags.
+    const trimmed_attrs = std.mem.trimRight(u8, attrs, " \t\r\n");
+    const was_self_closing = trimmed_attrs.len > 0 and trimmed_attrs[trimmed_attrs.len - 1] == '/';
+    if (was_self_closing) {
+        try out.appendSlice(allocator, "/>");
+    } else {
+        try out.appendSlice(allocator, src[t.after_open - 1 .. t.after_open]);
+    }
 }
 
 fn processMergeCellTagCol(
@@ -7226,6 +7235,18 @@ fn processDimensionTagCol(
         try writeWithReplacedAttr(allocator, out, src, t, "<dimension".len, "ref", new_ref);
         return;
     };
+    // Detect "entire range is the deleted col" up front: both
+    // corners at col_1based on a delete. Fall back to a safe
+    // sentinel "A1" so the dimension stays valid (Excel
+    // recomputes on open).
+    if (kind == .delete) {
+        const tl_col = parseColFromA1(ref[0..colon]) orelse 0;
+        const br_col = parseColFromA1(ref[colon + 1 ..]) orelse 0;
+        if (tl_col == col_1based and br_col == col_1based) {
+            try writeWithReplacedAttr(allocator, out, src, t, "<dimension".len, "ref", "A1");
+            return;
+        }
+    }
     var tl_buf: [16]u8 = undefined;
     var br_buf: [16]u8 = undefined;
     const tl_new = shiftSingleA1Col(ref[0..colon], col_1based, kind, &tl_buf, false) catch {
