@@ -6014,15 +6014,36 @@ fn updateDimensionRange(
     const ref_start = dim_pos + dim_open.len;
     const ref_end = std.mem.indexOfScalarPos(u8, xml, ref_start, '"') orelse return null;
     const ref = xml[ref_start..ref_end];
-    if (std.mem.indexOfScalar(u8, ref, ':') == null) return null;
+    const colon = std.mem.indexOfScalar(u8, ref, ':') orelse return null;
+    const tl_part = ref[0..colon];
+    const br_part = ref[colon + 1 ..];
 
-    // Build the new "MINTL:MAXBR" string. formatCellRef takes a
-    // 0-based col_idx so subtract 1 from the 1-based input.
+    // Canonical-form gate: both halves must be plain
+    // `[A-Z]+[0-9]+` (no `$`, no namespace, no expressions like
+    // `'Sheet1'!A1`). Anything else passes through — Excel
+    // recomputes the dimension on its next save.
+    const tl_parsed = parseA1Plain(tl_part) orelse return null;
+    const br_parsed = parseA1Plain(br_part) orelse return null;
+
+    // Only WIDEN — never shrink. The source's existing dimension
+    // may already cover more than the cells the scanner saw (e.g.
+    // a producer that left the dimension at A1:Z100 after clearing
+    // rows). Take the union with the new edits' bounds.
+    const u_min_row = @min(tl_parsed.row, new_min_row);
+    const u_max_row = @max(br_parsed.row, new_max_row);
+    const u_min_col1 = @min(tl_parsed.col_1based, new_min_col_1based);
+    const u_max_col1 = @max(br_parsed.col_1based, new_max_col_1based);
+
+    // No-op when the union doesn't extend the existing range.
+    if (u_min_row == tl_parsed.row and u_max_row == br_parsed.row and
+        u_min_col1 == tl_parsed.col_1based and u_max_col1 == br_parsed.col_1based)
+        return null;
+
     const writer_mod = @import("writer.zig");
     var tl_buf: [16]u8 = undefined;
     var br_buf: [16]u8 = undefined;
-    const tl = try writer_mod.formatCellRef(&tl_buf, new_min_row, new_min_col_1based - 1);
-    const br = try writer_mod.formatCellRef(&br_buf, new_max_row, new_max_col_1based - 1);
+    const tl = try writer_mod.formatCellRef(&tl_buf, u_min_row, u_min_col1 - 1);
+    const br = try writer_mod.formatCellRef(&br_buf, u_max_row, u_max_col1 - 1);
 
     var out: std.ArrayListUnmanaged(u8) = .{};
     defer out.deinit(allocator);
@@ -6032,6 +6053,20 @@ fn updateDimensionRange(
     try out.appendSlice(allocator, br);
     try out.appendSlice(allocator, xml[ref_end..]);
     return try out.toOwnedSlice(allocator);
+}
+
+/// Parse a plain A1-style ref (`[A-Z]+[0-9]+`, no `$`, no sheet
+/// prefix). Returns null on any other shape so callers can pass
+/// through non-canonical inputs.
+fn parseA1Plain(s: []const u8) ?struct { row: u32, col_1based: u32 } {
+    if (s.len == 0) return null;
+    var i: usize = 0;
+    while (i < s.len and s[i] >= 'A' and s[i] <= 'Z') i += 1;
+    if (i == 0 or i == s.len) return null;
+    const col_1based = parseColLetters(s[0..i]) orelse return null;
+    const row = std.fmt.parseInt(u32, s[i..], 10) catch return null;
+    if (row == 0) return null;
+    return .{ .row = row, .col_1based = col_1based };
 }
 
 /// Patch a canonical-form `<dimension ref="TL:BR"/>` so the
