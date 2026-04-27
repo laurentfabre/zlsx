@@ -4866,6 +4866,37 @@ pub const Editor = struct {
         for (self.pending_deletes.items) |d| {
             if (findEntryByName(self.entries, d.path)) |di| deleted_mask[di] = true;
         }
+        // Drop xl/calcChain.xml when any sheet is being deleted —
+        // it's a recompute cache, Excel rebuilds it on open. The
+        // structural-edits plan calls this out as standard cleanup
+        // for destructive edits. Also drop the rels entry that
+        // points at it via `<Relationship Type=".../calcChain"/>`
+        // to avoid a dangling relationship.
+        if (self.pending_deletes.items.len > 0) {
+            if (findEntryByName(self.entries, "xl/calcChain.xml")) |ci| {
+                deleted_mask[ci] = true;
+                // Patch rels to drop the calcChain Relationship.
+                try patchEntryForDeletes(
+                    self.allocator,
+                    self.entries,
+                    self.src_buf,
+                    subs,
+                    "xl/_rels/workbook.xml.rels",
+                    self.pending_deletes.items,
+                    patchWorkbookRelsForCalcChainDrop,
+                );
+                // Patch [Content_Types] to drop calcChain Override.
+                try patchEntryForDeletes(
+                    self.allocator,
+                    self.entries,
+                    self.src_buf,
+                    subs,
+                    "[Content_Types].xml",
+                    self.pending_deletes.items,
+                    patchContentTypesForCalcChainDrop,
+                );
+            }
+        }
 
         // Pre-validate that the rewritten archive stays within ZIP32
         // bounds. Source size is already <= 4 GiB (Editor.open caps),
@@ -6590,6 +6621,79 @@ fn patchContentTypesForNewSheets(
         );
     }
     try out.appendSlice(allocator, xml[close..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Drop the calcChain `<Relationship/>` (Type ends with
+/// `/relationships/calcChain`) from the workbook rels file. Used
+/// alongside the calcChain ZIP-entry drop on delete.
+fn patchWorkbookRelsForCalcChainDrop(
+    allocator: Allocator,
+    xml: []const u8,
+    deletes: []const Editor.SheetDelete,
+) ![]u8 {
+    _ = deletes;
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, i, "<Relationship")) |rel_pos| {
+        const rel_end = std.mem.indexOfScalarPos(u8, xml, rel_pos, '>') orelse {
+            try out.appendSlice(allocator, xml[i..]);
+            return try out.toOwnedSlice(allocator);
+        };
+        const rel_attrs = xml[rel_pos + "<Relationship".len .. rel_end];
+        var dropped = false;
+        if (getAttr(rel_attrs, "Type")) |ty| {
+            if (std.mem.endsWith(u8, ty, "/calcChain")) dropped = true;
+        }
+        if (!dropped) {
+            if (getAttr(rel_attrs, "Target")) |tg| {
+                if (std.mem.endsWith(u8, tg, "calcChain.xml")) dropped = true;
+            }
+        }
+        if (dropped) {
+            try out.appendSlice(allocator, xml[i..rel_pos]);
+            i = rel_end + 1;
+        } else {
+            try out.appendSlice(allocator, xml[i .. rel_end + 1]);
+            i = rel_end + 1;
+        }
+    }
+    try out.appendSlice(allocator, xml[i..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Drop `<Override PartName="/xl/calcChain.xml" .../>` from
+/// [Content_Types].xml.
+fn patchContentTypesForCalcChainDrop(
+    allocator: Allocator,
+    xml: []const u8,
+    deletes: []const Editor.SheetDelete,
+) ![]u8 {
+    _ = deletes;
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, i, "<Override")) |o_pos| {
+        const o_end = std.mem.indexOfScalarPos(u8, xml, o_pos, '>') orelse {
+            try out.appendSlice(allocator, xml[i..]);
+            return try out.toOwnedSlice(allocator);
+        };
+        const o_attrs = xml[o_pos + "<Override".len .. o_end];
+        var dropped = false;
+        if (getAttr(o_attrs, "PartName")) |part| {
+            const part_norm = if (part.len > 0 and part[0] == '/') part[1..] else part;
+            if (std.mem.eql(u8, part_norm, "xl/calcChain.xml")) dropped = true;
+        }
+        if (dropped) {
+            try out.appendSlice(allocator, xml[i..o_pos]);
+            i = o_end + 1;
+        } else {
+            try out.appendSlice(allocator, xml[i .. o_end + 1]);
+            i = o_end + 1;
+        }
+    }
+    try out.appendSlice(allocator, xml[i..]);
     return try out.toOwnedSlice(allocator);
 }
 
