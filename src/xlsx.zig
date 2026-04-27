@@ -5253,18 +5253,41 @@ fn insertMissingRow(
     // Find insertion offset:
     //   - just before the next-higher row's `<row` opening, OR
     //   - just before `</sheetData>` if no higher row exists.
+    //
+    // Walk EVERY `<row>` tag (not just rows that produced spans) so
+    // cellless rows like `<row r="5"/>` or `<row r="5"></row>`
+    // anchor the position correctly. Going only by spans would
+    // misorder a `setCell(row=3, …)` on a sheet with row 5 empty +
+    // row 10 populated (would produce XML order 5,3,10). Use the
+    // same explicit-r → first-cell → implicit-counter cascade
+    // Rows.next uses.
     var insert_at: usize = 0;
     var anchored = false;
-    for (ms.spans.items) |s| {
-        if (s.row > row) {
-            // Search backward for the `<row` that opens this span's row.
-            // (lastIndexOf is bounded to xml[0..s.start].)
-            if (std.mem.lastIndexOf(u8, ms.xml.items[0..s.start], "<row")) |row_open| {
-                insert_at = row_open;
-                anchored = true;
-                break;
+    var pos_walk: usize = 0;
+    var implicit_row_walk: u32 = 0;
+    while (findTagOpen(ms.xml.items, pos_walk, "row")) |t| {
+        implicit_row_walk += 1;
+        const attrs_full = ms.xml.items[t.start + "<row".len .. t.after_open - 1];
+        const trimmed = std.mem.trimRight(u8, attrs_full, " \t\r\n");
+        const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
+        const attrs = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
+        const effective_row: u32 = blk: {
+            if (getAttr(attrs, "r")) |r_attr| {
+                const parsed = std.fmt.parseInt(u32, r_attr, 10) catch 0;
+                if (parsed > 0) break :blk parsed;
             }
+            if (!is_self_closing) {
+                if (recoverRowFromFirstCell(ms.xml.items, t.after_open)) |n|
+                    break :blk n;
+            }
+            break :blk implicit_row_walk;
+        };
+        if (effective_row > row) {
+            insert_at = t.start;
+            anchored = true;
+            break;
         }
+        pos_walk = t.after_open;
     }
     if (!anchored) {
         // No higher row — append before `</sheetData>`. If the
