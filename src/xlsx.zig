@@ -4923,6 +4923,11 @@ pub const Editor = struct {
             else
                 ms.spans.items[last_in_row_idx.?].end;
 
+            // Transactional: reserve the spans-array capacity for
+            // the new entry BEFORE mutating ms.xml. If the insert
+            // OOMs after we've already shifted bytes + offsets,
+            // ms is left inconsistent for any later save/scan.
+            try ms.spans.ensureUnusedCapacity(self.allocator, 1);
             try ms.xml.insertSlice(self.allocator, insert_at, new_buf.items);
             const new_len = new_buf.items.len;
 
@@ -4944,11 +4949,8 @@ pub const Editor = struct {
                 .row = row,
                 .col = col,
             };
-            // Insert into spans at the right position (keep source
-            // order). When insert_before_idx exists, that's where
-            // the new span goes; else append after last_in_row.
             const span_pos: usize = insert_before_idx orelse (last_in_row_idx.? + 1);
-            try ms.spans.insert(self.allocator, span_pos, new_span);
+            ms.spans.insertAssumeCapacity(span_pos, new_span);
             return;
         }
         const span_idx = idx.?;
@@ -5172,7 +5174,10 @@ fn insertCellIntoEmptyRow(
             continue;
         }
 
-        // Found the row. Build the cell bytes once.
+        // Found the row. Reserve span capacity up front so the
+        // final insert can't OOM after we've already mutated xml.
+        try ms.spans.ensureUnusedCapacity(allocator, 1);
+        // Build the cell bytes once.
         var cell_buf: std.ArrayListUnmanaged(u8) = .{};
         defer cell_buf.deinit(allocator);
         try emitCellXml(allocator, &cell_buf, row, col, cell);
@@ -5216,7 +5221,7 @@ fn insertCellIntoEmptyRow(
                     break;
                 }
             }
-            try ms.spans.insert(allocator, span_pos, new_span);
+            ms.spans.insertAssumeCapacity(span_pos, new_span);
             return true;
         }
 
@@ -5245,7 +5250,7 @@ fn insertCellIntoEmptyRow(
                 break;
             }
         }
-        try ms.spans.insert(allocator, span_pos, new_span);
+        ms.spans.insertAssumeCapacity(span_pos, new_span);
         return true;
     }
     return false;
@@ -5260,6 +5265,9 @@ fn insertMissingRow(
     col: u32,
     cell: Cell,
 ) !void {
+    // Reserve span capacity up front so the final insert can't OOM
+    // after we've already shifted bytes + offsets.
+    try ms.spans.ensureUnusedCapacity(allocator, 1);
     // Find insertion offset:
     //   - just before the next-higher row's `<row` opening, OR
     //   - just before `</sheetData>` if no higher row exists.
@@ -5377,7 +5385,7 @@ fn insertMissingRow(
             break;
         }
     }
-    try ms.spans.insert(allocator, span_pos, new_cell_span);
+    ms.spans.insertAssumeCapacity(span_pos, new_cell_span);
 }
 
 /// Emit a fresh `<c r="REF"…>…</c>` for one cell. Output is canonical
