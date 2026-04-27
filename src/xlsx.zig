@@ -2558,7 +2558,18 @@ fn rels_targetForComments(rels_xml: []const u8) ?[]const u8 {
 /// path into `out`. Returns the slice of `out` actually written, or
 /// null if the path doesn't fit. `base_dir` MUST end in '/' for the
 /// segment math to work.
+///
+/// Absolute (package-rooted) targets like `/xl/comments1.xml` are
+/// returned with the leading `/` stripped, NOT joined to `base_dir`
+/// — that's how `parseWorkbookSheets` already treats them.
 fn resolveRelArchivePath(base_dir: []const u8, target: []const u8, out: []u8) ?[]const u8 {
+    if (target.len > 0 and target[0] == '/') {
+        const stripped = target[1..];
+        if (stripped.len > out.len) return null;
+        @memcpy(out[0..stripped.len], stripped);
+        return out[0..stripped.len];
+    }
+
     var written: usize = 0;
     if (base_dir.len > out.len) return null;
     @memcpy(out[0..base_dir.len], base_dir);
@@ -10862,6 +10873,13 @@ test "resolveRelArchivePath joins + normalises ../ segments" {
     try std.testing.expectEqualStrings(
         "comments1.xml",
         resolveRelArchivePath("xl/worksheets/", "../../comments1.xml", &buf).?,
+    );
+
+    // Absolute (package-rooted) target: strip leading '/' and skip
+    // base-dir join. parseWorkbookSheets accepts the same form.
+    try std.testing.expectEqualStrings(
+        "xl/comments1.xml",
+        resolveRelArchivePath("xl/worksheets/", "/xl/comments1.xml", &buf).?,
     );
 }
 
