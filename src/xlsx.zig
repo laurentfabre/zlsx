@@ -92,10 +92,13 @@ pub fn fromExcelSerial(serial: f64) ?DateTime {
     // the rounded value equals 86400 (e.g. serial 1.9999999999 →
     // 86400.0), the result is the next day at 00:00:00 — carry the
     // day forward instead of clamping back to 23:59:59 like prior
-    // versions did.
+    // versions did. If the carry would push the date past the
+    // documented upper bound (serial >= 2958466.0 → 9999-12-31),
+    // return null rather than emitting a year-10000 DateTime.
     const total_s_f: f64 = @round((serial - floored) * 86400.0);
     var total_s: i64 = @intFromFloat(total_s_f);
     if (total_s >= 86400) {
+        if (floored + 1.0 >= 2958466.0) return null;
         total_s -= 86400;
         days_since_unix += 1;
     }
@@ -12547,6 +12550,10 @@ test "fromExcelSerial: 86400-second rounding carries to next day" {
     try std.testing.expectEqual(@as(u8, 23), just_before.hour);
     try std.testing.expectEqual(@as(u8, 59), just_before.minute);
     try std.testing.expectEqual(@as(u8, 59), just_before.second);
+
+    // Carry past the upper bound must reject — 2958465.9999... rounds
+    // to the next day = 2958466 which is past 9999-12-31.
+    try std.testing.expectEqual(@as(?DateTime, null), fromExcelSerial(2958465.9999999999));
 }
 
 test "parseStyles: custom numFmt formatCode is XML-entity decoded" {
