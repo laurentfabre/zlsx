@@ -5217,7 +5217,7 @@ pub const Editor = struct {
         // already-extracted Book (Editor's open path used Book.open
         // for sheet path resolution but didn't keep the names).
         // Cheapest: read workbook.xml once and scan for `name="…"`.
-        if (try self.isSheetNameTaken(name, null)) return error.DuplicateSheetName;
+        if (try self.isSheetNameTaken(name, null, null)) return error.DuplicateSheetName;
 
         // Pick the next sheet_id, sheet path number, and rId by
         // scanning the workbook.xml + rels for the highest existing,
@@ -5317,8 +5317,9 @@ pub const Editor = struct {
         // Reject duplicates against every OTHER sheet's effective
         // name. "Effective" lets `A->C` then `B->A` work because
         // sheet 0's effective name after the first rename is `C`,
-        // freeing `A` for sheet 1.
-        if (try self.isSheetNameTaken(new_name, sheet_idx)) return error.DuplicateSheetName;
+        // freeing `A` for sheet 1. Skip-by-rId lets the renamed
+        // source sheet itself drop out of the candidate set.
+        if (try self.isSheetNameTaken(new_name, sheet_idx, current_rid)) return error.DuplicateSheetName;
 
         // Pending-new-sheet path: mutate the NewSheet's name in
         // place, no workbook.xml patch needed (the sheet doesn't
@@ -5358,33 +5359,65 @@ pub const Editor = struct {
         });
     }
 
-    /// Effective name of `sheet_idx` taking pending renames + new
-    /// sheets into account. Caller owns the returned slice.
-    fn effectiveSheetName(self: *Editor, sheet_idx: u32) ![]u8 {
-        for (self.pending_renames.items) |r| {
-            if (r.sheet_idx == sheet_idx) return try self.allocator.dupe(u8, r.new_name);
-        }
-        const path = self.sheet_paths[sheet_idx];
-        if (self.findPendingNewSheet(path)) |ns_idx| {
-            return try self.allocator.dupe(u8, self.pending_new_sheets.items[ns_idx].name);
-        }
-        return (try self.sheetNameAtPath(path)) orelse error.SheetEntryNotFound;
-    }
-
-    /// True when some sheet (other than `except_sheet_idx` if set)
-    /// has an effective name matching `candidate` case-insensitively.
-    /// "Effective" = pending-rename's new_name takes precedence over
-    /// the source workbook.xml name; pending-new-sheets contribute
-    /// their NewSheet.name. Closes the rotate-rename / freed-name
-    /// gap that two prior Codex passes flagged.
-    fn isSheetNameTaken(self: *Editor, candidate: []const u8, except_sheet_idx: ?u32) !bool {
+    /// True when some sheet has an effective name matching
+    /// `candidate` case-insensitively, EXCLUDING the sheet at
+    /// `except_sheet_idx` (if non-null) and the source `<sheet>`
+    /// entry whose r:id matches `except_rid` (if non-null).
+    ///
+    /// "Effective" means: pending-rename's new_name takes precedence
+    /// over the raw workbook.xml name; pending-new-sheets contribute
+    /// their NewSheet.name. Walks raw workbook.xml directly so
+    /// entries `parseWorkbookSheets` skipped (broken rels) still
+    /// participate in dup detection.
+    fn isSheetNameTaken(
+        self: *Editor,
+        candidate: []const u8,
+        except_sheet_idx: ?u32,
+        except_rid: ?[]const u8,
+    ) !bool {
         const writer_mod = @import("writer.zig");
-        var i: u32 = 0;
-        while (i < self.sheet_paths.len) : (i += 1) {
-            if (except_sheet_idx) |ei| if (i == ei) continue;
-            const eff = try self.effectiveSheetName(i);
-            defer self.allocator.free(eff);
-            if (writer_mod.asciiEqlFold(eff, candidate)) return true;
+
+        // 1. Raw <sheet> entries from workbook.xml. Apply pending
+        //    renames as we walk to compute effective names.
+        const wb = try self.readEntry("xl/workbook.xml");
+        defer self.allocator.free(wb);
+        var i: usize = 0;
+        while (findTagOpen(wb, i, "sheet")) |t| {
+            const attrs = wb[t.start + "<sheet".len .. t.after_open - 1];
+            const rid = getAttr(attrs, "r:id") orelse {
+                i = t.after_open;
+                continue;
+            };
+            if (except_rid) |skip_rid| if (std.mem.eql(u8, rid, skip_rid)) {
+                i = t.after_open;
+                continue;
+            };
+            // Effective name: pending-rename's new_name if any
+            // matches this rId; else the raw (decoded) name.
+            var rename_hit: ?[]const u8 = null;
+            for (self.pending_renames.items) |r| {
+                if (std.mem.eql(u8, r.rid, rid)) {
+                    rename_hit = r.new_name;
+                    break;
+                }
+            }
+            if (rename_hit) |nm| {
+                if (writer_mod.asciiEqlFold(nm, candidate)) return true;
+            } else if (getAttr(attrs, "name")) |raw| {
+                var decoded: std.ArrayListUnmanaged(u8) = .{};
+                defer decoded.deinit(self.allocator);
+                try decodeXmlAttrInto(self.allocator, &decoded, raw);
+                if (writer_mod.asciiEqlFold(decoded.items, candidate)) return true;
+            }
+            i = t.after_open;
+        }
+
+        // 2. Pending new sheets. Indexed by sheet_idx for the skip.
+        const source_count: u32 = @intCast(self.sheet_paths.len - self.pending_new_sheets.items.len);
+        for (self.pending_new_sheets.items, 0..) |s, ns_idx| {
+            const my_idx: u32 = source_count + @as(u32, @intCast(ns_idx));
+            if (except_sheet_idx) |ei| if (my_idx == ei) continue;
+            if (writer_mod.asciiEqlFold(s.name, candidate)) return true;
         }
         return false;
     }
@@ -5401,15 +5434,14 @@ pub const Editor = struct {
         defer self.allocator.free(rels);
 
         var i: usize = 0;
-        while (std.mem.indexOfPos(u8, wb, i, "<sheet ")) |sh_pos| {
-            const sh_end = std.mem.indexOfScalarPos(u8, wb, sh_pos, '>') orelse break;
-            const sh_attrs = wb[sh_pos + "<sheet ".len .. sh_end];
+        while (findTagOpen(wb, i, "sheet")) |t| {
+            const sh_attrs = wb[t.start + "<sheet".len .. t.after_open - 1];
             const rid = getAttr(sh_attrs, "r:id") orelse {
-                i = sh_end + 1;
+                i = t.after_open;
                 continue;
             };
             const name_raw = getAttr(sh_attrs, "name") orelse {
-                i = sh_end + 1;
+                i = t.after_open;
                 continue;
             };
             var rels_i: usize = 0;
@@ -5445,95 +5477,9 @@ pub const Editor = struct {
                 }
                 rels_i = rel_end + 1;
             }
-            i = sh_end + 1;
+            i = t.after_open;
         }
         return null;
-    }
-
-    /// Look up the source workbook's sheet name for a given path.
-    /// Returns an owned dupe of the (entity-decoded) name, or null
-    /// when no source `<sheet …r:id…>` references this path.
-    fn sheetNameAtPath(self: *Editor, target_path: []const u8) !?[]u8 {
-        const wb = try self.readEntry("xl/workbook.xml");
-        defer self.allocator.free(wb);
-        const rels = try self.readEntry("xl/_rels/workbook.xml.rels");
-        defer self.allocator.free(rels);
-
-        // For each <sheet …/> in workbook.xml, get its r:id, look
-        // up the rels Target, compare to `target_path`. Match on
-        // either "xl/" + Target OR Target alone.
-        var i: usize = 0;
-        while (std.mem.indexOfPos(u8, wb, i, "<sheet ")) |sh_pos| {
-            const sh_end = std.mem.indexOfScalarPos(u8, wb, sh_pos, '>') orelse break;
-            const sh_attrs = wb[sh_pos + "<sheet ".len .. sh_end];
-            const rid = getAttr(sh_attrs, "r:id") orelse {
-                i = sh_end + 1;
-                continue;
-            };
-            const name_raw = getAttr(sh_attrs, "name") orelse {
-                i = sh_end + 1;
-                continue;
-            };
-            // Find the rels Target for this rId.
-            var rels_i: usize = 0;
-            while (std.mem.indexOfPos(u8, rels, rels_i, "<Relationship")) |rel_pos| {
-                const rel_end = std.mem.indexOfScalarPos(u8, rels, rel_pos, '>') orelse break;
-                const rel_attrs = rels[rel_pos + "<Relationship".len .. rel_end];
-                const id = getAttr(rel_attrs, "Id") orelse {
-                    rels_i = rel_end + 1;
-                    continue;
-                };
-                if (!std.mem.eql(u8, id, rid)) {
-                    rels_i = rel_end + 1;
-                    continue;
-                }
-                const target = getAttr(rel_attrs, "Target") orelse {
-                    rels_i = rel_end + 1;
-                    continue;
-                };
-                // Resolve relative to xl/.
-                var matches = std.mem.eql(u8, target, target_path);
-                if (!matches) {
-                    var prefixed_buf: [256]u8 = undefined;
-                    const prefixed = std.fmt.bufPrint(&prefixed_buf, "xl/{s}", .{target}) catch break;
-                    matches = std.mem.eql(u8, prefixed, target_path);
-                }
-                if (matches) {
-                    // Decode entities and return owned dupe.
-                    var decoded: std.ArrayListUnmanaged(u8) = .{};
-                    errdefer decoded.deinit(self.allocator);
-                    try decodeXmlAttrInto(self.allocator, &decoded, name_raw);
-                    return try decoded.toOwnedSlice(self.allocator);
-                }
-                rels_i = rel_end + 1;
-            }
-            i = sh_end + 1;
-        }
-        return null;
-    }
-
-    /// True when `xl/workbook.xml` already declares a `<sheet>` with
-    /// this name. Helper for addSheet's duplicate guard. The raw
-    /// `name="..."` attribute can carry XML escapes (e.g. `R&amp;D`
-    /// for the user-visible name `R&D`); decode those before
-    /// comparing case-insensitively.
-    fn sheetNameExists(self: *Editor, name: []const u8) !bool {
-        const wb = try self.readEntry("xl/workbook.xml");
-        defer self.allocator.free(wb);
-        var i: usize = 0;
-        while (std.mem.indexOfPos(u8, wb, i, "<sheet ")) |sh_pos| {
-            const sh_end = std.mem.indexOfScalarPos(u8, wb, sh_pos, '>') orelse break;
-            const sh_attrs = wb[sh_pos + "<sheet ".len .. sh_end];
-            if (getAttr(sh_attrs, "name")) |raw| {
-                var decoded: std.ArrayListUnmanaged(u8) = .{};
-                defer decoded.deinit(self.allocator);
-                try decodeXmlAttrInto(self.allocator, &decoded, raw);
-                const writer_mod = @import("writer.zig");
-                if (writer_mod.asciiEqlFold(decoded.items, name)) return true;
-            }
-            i = sh_end + 1;
-        }
-        return false;
     }
 
     /// Decompress an entry by name. Caller owns the returned slice.
@@ -6332,13 +6278,10 @@ fn patchWorkbookXmlForRenames(
     errdefer out.deinit(allocator);
 
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, xml, i, "<sheet ")) |sh_pos| {
-        try out.appendSlice(allocator, xml[i .. sh_pos + "<sheet ".len]);
-        const sh_end = std.mem.indexOfScalarPos(u8, xml, sh_pos, '>') orelse {
-            try out.appendSlice(allocator, xml[sh_pos + "<sheet ".len ..]);
-            return try out.toOwnedSlice(allocator);
-        };
-        const attrs = xml[sh_pos + "<sheet ".len .. sh_end];
+    while (findTagOpen(xml, i, "sheet")) |t| {
+        try out.appendSlice(allocator, xml[i .. t.start + "<sheet".len]);
+        const attrs = xml[t.start + "<sheet".len .. t.after_open - 1];
+        const sh_end = t.after_open - 1; // position of `>`
 
         // Match by `r:id` (captured at renameSheet time). Position-
         // based match would target the wrong line on workbooks where
