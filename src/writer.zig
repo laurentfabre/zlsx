@@ -2001,7 +2001,7 @@ fn asciiEqlFold(a: []const u8, b: []const u8) bool {
 ///   - No leading or trailing apostrophe (Excel uses `'` as a
 ///     sheet-reference quote delimiter).
 ///   - Not the reserved name "History" (case-insensitive).
-fn validateSheetName(name: []const u8) !void {
+pub fn validateSheetName(name: []const u8) !void {
     if (name.len == 0 or name.len > 31) return error.InvalidSheetName;
     if (name[0] == '\'' or name[name.len - 1] == '\'') return error.InvalidSheetName;
     for (name) |c| switch (c) {

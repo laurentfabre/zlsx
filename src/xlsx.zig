@@ -4092,6 +4092,14 @@ pub const Editor = struct {
     /// passthrough path. Each `AppendBuffer.rows` slice + every
     /// inner row slice is allocator-owned.
     pending_appends: std.AutoHashMapUnmanaged(u32, AppendBuffer),
+    /// Pending sheet additions (Phase 3e / iter-sheet-1). Each entry
+    /// produces a new ZIP entry at save time + patches workbook.xml,
+    /// rels, and [Content_Types].xml. The Editor's `sheet_paths`
+    /// slice is grown synchronously on `addSheet` so subsequent
+    /// `setCell` / `scanWorksheet` calls can target the new sheet
+    /// by its returned index.
+    pending_new_sheets: std.ArrayListUnmanaged(NewSheet),
+
     /// Pending in-place cell mutations per sheet (Phase 3d / iter-cm-2).
     /// Each entry holds the decompressed-and-mutated worksheet XML
     /// plus an in-sync span index. Populated lazily by `setCell` on
@@ -4119,6 +4127,24 @@ pub const Editor = struct {
         pub fn deinit(self: *MutatedSheet, allocator: Allocator) void {
             self.xml.deinit(allocator);
             self.spans.deinit(allocator);
+        }
+    };
+
+    /// State for one Phase 3e (iter-sheet-1) sheet addition. `path`
+    /// is a BORROWED slice into the editor's `sheet_paths` array
+    /// (the addSheet helper grows that array and stores the owned
+    /// path bytes there); `deinit` does NOT free it.
+    pub const NewSheet = struct {
+        name: []u8, // owned dupe of caller's name
+        path: []const u8, // borrowed from Editor.sheet_paths
+        rid: []u8, // owned, "rIdN"
+        sheet_id: u32,
+        body_xml: []u8, // owned, empty worksheet template
+
+        pub fn deinit(self: *NewSheet, alloc: Allocator) void {
+            alloc.free(self.name);
+            alloc.free(self.rid);
+            alloc.free(self.body_xml);
         }
     };
 
@@ -4331,6 +4357,7 @@ pub const Editor = struct {
             .sheet_paths = sheet_paths_owned,
             .pending_appends = .{},
             .pending_mutations = .{},
+            .pending_new_sheets = .{},
         };
     }
 
@@ -4354,6 +4381,8 @@ pub const Editor = struct {
         var mit = self.pending_mutations.valueIterator();
         while (mit.next()) |m| m.deinit(self.allocator);
         self.pending_mutations.deinit(self.allocator);
+        for (self.pending_new_sheets.items) |*s| s.deinit(self.allocator);
+        self.pending_new_sheets.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -4447,7 +4476,10 @@ pub const Editor = struct {
         defer atomic_file.deinit();
         const w = &atomic_file.file_writer.interface;
 
-        if (self.pending_appends.count() == 0 and self.pending_mutations.count() == 0) {
+        if (self.pending_appends.count() == 0 and
+            self.pending_mutations.count() == 0 and
+            self.pending_new_sheets.items.len == 0)
+        {
             try w.writeAll(self.src_buf);
             try atomic_file.finish();
             return;
@@ -4539,6 +4571,10 @@ pub const Editor = struct {
         while (pm_iter.next()) |kv| {
             const sheet_idx = kv.key_ptr.*;
             const path = self.sheet_paths[sheet_idx];
+            // Phase 3e: pending mutations on a NEW sheet are handled
+            // by the pending_new_sheets branch below — no source
+            // entry to substitute.
+            if (self.findPendingNewSheet(path) != null) continue;
             const entry_idx = findEntryByName(self.entries, path) orelse
                 return error.SheetEntryNotFound;
 
@@ -4632,6 +4668,53 @@ pub const Editor = struct {
                     source_sst_count,
                 );
             }
+        }
+
+        // Phase 3e iter-sheet-1: pending sheet additions. Emit each
+        // new sheet as an appendix entry + patch workbook.xml,
+        // workbook.xml.rels, and [Content_Types].xml in place.
+        if (self.pending_new_sheets.items.len > 0) {
+            // Compute new-sheet sheet_idx range = [source_count..total).
+            // Pending mutations on a new sheet supply its body in
+            // place of the empty template.
+            const source_count: u32 = @intCast(self.sheet_paths.len - self.pending_new_sheets.items.len);
+            for (self.pending_new_sheets.items, 0..) |new_sheet, i| {
+                const sheet_idx_for_new: u32 = source_count + @as(u32, @intCast(i));
+                const body_src: []const u8 = if (self.pending_mutations.get(sheet_idx_for_new)) |ms|
+                    ms.xml.items
+                else
+                    new_sheet.body_xml;
+                const body_dupe = try self.allocator.dupe(u8, body_src);
+                const new_entry = try buildEntryFromXml(self.allocator, new_sheet.path, body_dupe);
+                try extra_entries.append(self.allocator, new_entry);
+            }
+            try patchEntryForNewSheets(
+                self.allocator,
+                self.entries,
+                self.src_buf,
+                subs,
+                "xl/workbook.xml",
+                self.pending_new_sheets.items,
+                patchWorkbookXmlForNewSheets,
+            );
+            try patchEntryForNewSheets(
+                self.allocator,
+                self.entries,
+                self.src_buf,
+                subs,
+                "xl/_rels/workbook.xml.rels",
+                self.pending_new_sheets.items,
+                patchWorkbookRelsForNewSheets,
+            );
+            try patchEntryForNewSheets(
+                self.allocator,
+                self.entries,
+                self.src_buf,
+                subs,
+                "[Content_Types].xml",
+                self.pending_new_sheets.items,
+                patchContentTypesForNewSheets,
+            );
         }
 
         // Emit LFHs in LFH-offset order. Each substituted entry's LFH
@@ -5026,6 +5109,107 @@ pub const Editor = struct {
         for (edits) |e| try self.setCell(sheet_idx, e.row, e.col, e.cell);
     }
 
+    /// Append a new sheet to the workbook (Phase 3e, iter-sheet-1).
+    /// Returns the new sheet's 0-based index, ready for use with
+    /// `setCell` / `scanWorksheet` / `appendRows`. The sheet is
+    /// empty (`<sheetData></sheetData>`) until the caller writes
+    /// content via the existing mutation APIs.
+    ///
+    /// At save time the workbook gets:
+    ///   - a new ZIP entry at `xl/worksheets/sheetN.xml`
+    ///   - a new `<sheet …/>` line inside `<sheets>` in
+    ///     `xl/workbook.xml`
+    ///   - a new `<Relationship/>` in `xl/_rels/workbook.xml.rels`
+    ///   - a new `<Override/>` in `[Content_Types].xml`
+    ///
+    /// Errors: `error.InvalidSheetName` (empty / >31 chars / banned
+    /// characters), `error.DuplicateSheetName`, plus any propagated
+    /// allocator errors.
+    pub fn addSheet(self: *Editor, name: []const u8) !u32 {
+        const writer_mod = @import("writer.zig");
+        try writer_mod.validateSheetName(name);
+
+        // Reject duplicates against existing source sheets and any
+        // pending additions. Source sheet names live in the source's
+        // workbook.xml; rather than re-parse it here, query the
+        // already-extracted Book (Editor's open path used Book.open
+        // for sheet path resolution but didn't keep the names).
+        // Cheapest: read workbook.xml once and scan for `name="…"`.
+        if (try self.sheetNameExists(name)) return error.DuplicateSheetName;
+        for (self.pending_new_sheets.items) |s| {
+            if (std.mem.eql(u8, s.name, name)) return error.DuplicateSheetName;
+        }
+
+        // Pick the next sheet_id, sheet path number, and rId by
+        // scanning the workbook.xml + rels for the highest existing.
+        // Conservative: start at max(seen) + 1, never reuse.
+        const wb_xml = try self.readEntry("xl/workbook.xml");
+        defer self.allocator.free(wb_xml);
+        const rels_xml = try self.readEntry("xl/_rels/workbook.xml.rels");
+        defer self.allocator.free(rels_xml);
+
+        const next_sheet_id = nextMaxAttr(wb_xml, "sheetId=\"") + 1;
+        const next_rid_num = nextMaxRId(rels_xml) + 1;
+        const next_path_num = nextMaxSheetPathNum(self.entries) + 1;
+
+        // Build the new entries. Free everything on error so the
+        // editor stays in a clean state.
+        var ns: NewSheet = .{
+            .name = try self.allocator.dupe(u8, name),
+            .path = try std.fmt.allocPrint(self.allocator, "xl/worksheets/sheet{d}.xml", .{next_path_num}),
+            .rid = try std.fmt.allocPrint(self.allocator, "rId{d}", .{next_rid_num}),
+            .sheet_id = next_sheet_id,
+            .body_xml = try self.allocator.dupe(u8, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+                "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+                "<sheetData></sheetData></worksheet>"),
+        };
+        errdefer ns.deinit(self.allocator);
+
+        // Grow sheet_paths so subsequent setCell etc. resolve the
+        // new index. sheet_paths is currently `[]const []const u8`;
+        // rebuild a fresh slice with the new tail.
+        const old_paths = self.sheet_paths;
+        const new_paths = try self.allocator.alloc([]const u8, old_paths.len + 1);
+        errdefer self.allocator.free(new_paths);
+        @memcpy(new_paths[0..old_paths.len], old_paths);
+        new_paths[old_paths.len] = ns.path; // borrow; freed via NewSheet.deinit
+
+        try self.pending_new_sheets.append(self.allocator, ns);
+        self.sheet_paths = new_paths;
+        self.allocator.free(old_paths); // inner strings still owned by their original allocs
+
+        return @intCast(old_paths.len);
+    }
+
+    /// True when `xl/workbook.xml` already declares a `<sheet>` with
+    /// this name. Helper for addSheet's duplicate guard.
+    fn sheetNameExists(self: *Editor, name: []const u8) !bool {
+        const wb = try self.readEntry("xl/workbook.xml");
+        defer self.allocator.free(wb);
+        // Scan for `name="…"` attributes inside `<sheet …/>` lines.
+        // Simple substring match — workbook.xml never contains other
+        // tags with `name="…"` outside the <sheets> block.
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, wb, i, "<sheet ")) |sh_pos| {
+            const sh_end = std.mem.indexOfScalarPos(u8, wb, sh_pos, '>') orelse break;
+            const sh_attrs = wb[sh_pos + "<sheet ".len .. sh_end];
+            if (getAttr(sh_attrs, "name")) |nm| {
+                if (std.mem.eql(u8, nm, name)) return true;
+            }
+            i = sh_end + 1;
+        }
+        return false;
+    }
+
+    /// Decompress an entry by name. Caller owns the returned slice.
+    fn readEntry(self: *Editor, entry_name: []const u8) ![]u8 {
+        const idx = findEntryByName(self.entries, entry_name) orelse
+            return error.MissingEntry;
+        const e = self.entries[idx];
+        const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
+        return try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
+    }
+
     fn getOrInitMutatedSheet(self: *Editor, sheet_idx: u32) !*MutatedSheet {
         const gop = try self.pending_mutations.getOrPut(self.allocator, sheet_idx);
         if (!gop.found_existing) {
@@ -5035,23 +5219,40 @@ pub const Editor = struct {
                 _ = self.pending_mutations.remove(sheet_idx);
             }
             const path = self.sheet_paths[sheet_idx];
-            const entry_idx = findEntryByName(self.entries, path) orelse
-                return error.SheetEntryNotFound;
-            const entry = self.entries[entry_idx];
-            const payload = self.src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
-            const xml = try decompressZipPayload(
-                self.allocator,
-                payload,
-                entry.compression_method,
-                entry.uncompressed_size,
-            );
-            defer self.allocator.free(xml);
-            try gop.value_ptr.xml.appendSlice(self.allocator, xml);
+            // First try the source ZIP entry. If absent, this is a
+            // pending-new-sheet (Phase 3e iter-sheet-1) — seed the
+            // mutation buffer from its empty body template.
+            if (findEntryByName(self.entries, path)) |entry_idx| {
+                const entry = self.entries[entry_idx];
+                const payload = self.src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
+                const xml = try decompressZipPayload(
+                    self.allocator,
+                    payload,
+                    entry.compression_method,
+                    entry.uncompressed_size,
+                );
+                defer self.allocator.free(xml);
+                try gop.value_ptr.xml.appendSlice(self.allocator, xml);
+            } else {
+                const ns_idx = self.findPendingNewSheet(path) orelse
+                    return error.SheetEntryNotFound;
+                try gop.value_ptr.xml.appendSlice(
+                    self.allocator,
+                    self.pending_new_sheets.items[ns_idx].body_xml,
+                );
+            }
             const spans = try scanWorksheetXml(self.allocator, gop.value_ptr.xml.items);
             defer self.allocator.free(spans);
             try gop.value_ptr.spans.appendSlice(self.allocator, spans);
         }
         return gop.value_ptr;
+    }
+
+    fn findPendingNewSheet(self: *Editor, path: []const u8) ?usize {
+        for (self.pending_new_sheets.items, 0..) |s, i| {
+            if (std.mem.eql(u8, s.path, path)) return i;
+        }
+        return null;
     }
 };
 
@@ -5736,6 +5937,168 @@ fn buildFreshSstXml(allocator: Allocator, strings: []const []const u8) ![]u8 {
 /// Splice an `Override` into `[Content_Types].xml` so readers
 /// recognise the freshly-created `xl/sharedStrings.xml` part.
 /// No-op (returns null) when the override is already present.
+/// Scan `xml` for the largest `attr="N"` numeric value (e.g.
+/// `sheetId="3"`). Returns 0 when no match is found. Used by
+/// `Editor.addSheet` to pick non-colliding ids.
+fn nextMaxAttr(xml: []const u8, attr_prefix: []const u8) u32 {
+    var max_id: u32 = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, i, attr_prefix)) |pos| {
+        const num_start = pos + attr_prefix.len;
+        var num_end = num_start;
+        while (num_end < xml.len and xml[num_end] >= '0' and xml[num_end] <= '9') : (num_end += 1) {}
+        if (num_end > num_start) {
+            if (std.fmt.parseInt(u32, xml[num_start..num_end], 10)) |n| {
+                if (n > max_id) max_id = n;
+            } else |_| {}
+        }
+        i = num_end + 1;
+    }
+    return max_id;
+}
+
+/// Largest existing `rIdN` numeric suffix in the rels XML.
+fn nextMaxRId(xml: []const u8) u32 {
+    return nextMaxAttr(xml, "Id=\"rId");
+}
+
+/// Highest `sheetN.xml` number seen in the entry table. Returns
+/// 0 when no `xl/worksheets/sheet*.xml` entry exists.
+fn nextMaxSheetPathNum(entries: []const Editor.ZipEntry) u32 {
+    const prefix = "xl/worksheets/sheet";
+    const suffix = ".xml";
+    var max_n: u32 = 0;
+    for (entries) |e| {
+        if (!std.mem.startsWith(u8, e.name, prefix)) continue;
+        if (!std.mem.endsWith(u8, e.name, suffix)) continue;
+        const num_str = e.name[prefix.len .. e.name.len - suffix.len];
+        if (num_str.len == 0) continue;
+        if (std.fmt.parseInt(u32, num_str, 10)) |n| {
+            if (n > max_n) max_n = n;
+        } else |_| {}
+    }
+    return max_n;
+}
+
+/// Splice the new-sheet `<sheet …/>` lines into `xl/workbook.xml`'s
+/// `<sheets>…</sheets>` block. iter-sheet-1.
+fn patchWorkbookXmlForNewSheets(
+    allocator: Allocator,
+    xml: []const u8,
+    new_sheets: []const Editor.NewSheet,
+) ![]u8 {
+    const close = std.mem.indexOf(u8, xml, "</sheets>") orelse return error.MalformedXml;
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, xml[0..close]);
+    for (new_sheets) |s| {
+        try out.appendSlice(allocator, "<sheet name=\"");
+        try appendXmlEscaped(allocator, &out, s.name);
+        try out.writer(allocator).print(
+            "\" sheetId=\"{d}\" r:id=\"{s}\"/>",
+            .{ s.sheet_id, s.rid },
+        );
+    }
+    try out.appendSlice(allocator, xml[close..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Splice `<Relationship/>` entries for the new sheets into the
+/// workbook rels file. iter-sheet-1.
+fn patchWorkbookRelsForNewSheets(
+    allocator: Allocator,
+    xml: []const u8,
+    new_sheets: []const Editor.NewSheet,
+) ![]u8 {
+    const close = std.mem.indexOf(u8, xml, "</Relationships>") orelse return error.MalformedXml;
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, xml[0..close]);
+    for (new_sheets) |s| {
+        // Target is relative to xl/_rels/, so strip the "xl/" prefix
+        // from the sheet path. e.g. "xl/worksheets/sheet5.xml" →
+        // "worksheets/sheet5.xml".
+        const target = if (std.mem.startsWith(u8, s.path, "xl/")) s.path[3..] else s.path;
+        try out.writer(allocator).print(
+            "<Relationship Id=\"{s}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"{s}\"/>",
+            .{ s.rid, target },
+        );
+    }
+    try out.appendSlice(allocator, xml[close..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Splice `<Override PartName="/xl/worksheets/…" ContentType="…"/>`
+/// entries for the new sheets into `[Content_Types].xml`. iter-sheet-1.
+fn patchContentTypesForNewSheets(
+    allocator: Allocator,
+    xml: []const u8,
+    new_sheets: []const Editor.NewSheet,
+) ![]u8 {
+    const close = std.mem.indexOf(u8, xml, "</Types>") orelse return error.MalformedXml;
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, xml[0..close]);
+    for (new_sheets) |s| {
+        try out.writer(allocator).print(
+            "<Override PartName=\"/{s}\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>",
+            .{s.path},
+        );
+    }
+    try out.appendSlice(allocator, xml[close..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Variant of `patchEntryXml` that threads a NewSheet slice through
+/// to the patcher. Decompresses the named entry, hands it to
+/// `patcher`, wraps the result back into a fresh SubstitutedEntry
+/// stored at `subs[entry_idx]`. Errors when the entry is missing
+/// — unlike the SST path, the workbook + rels + Content_Types
+/// MUST exist for `addSheet` to be meaningful.
+fn patchEntryForNewSheets(
+    allocator: Allocator,
+    entries: []const Editor.ZipEntry,
+    src_buf: []u8,
+    subs: []?SubstitutedEntry,
+    entry_name: []const u8,
+    new_sheets: []const Editor.NewSheet,
+    patcher: *const fn (Allocator, []const u8, []const Editor.NewSheet) anyerror![]u8,
+) !void {
+    const entry_idx = findEntryByName(entries, entry_name) orelse
+        return error.MissingEntry;
+    // If a previous pass already substituted this entry (e.g. SST
+    // creation patched workbook rels), patch the already-substituted
+    // bytes instead of re-decompressing the source.
+    var src_xml: []u8 = undefined;
+    var src_xml_owned = false;
+    if (subs[entry_idx]) |s| {
+        // The substituted entry's payload is compressed bytes;
+        // decompress to get the XML again.
+        src_xml = try decompressZipPayload(
+            allocator,
+            s.payload,
+            s.compression_method,
+            s.uncompressed_size,
+        );
+        src_xml_owned = true;
+        // Drop the old substituted entry — we're rebuilding it.
+        allocator.free(s.lfh);
+        allocator.free(s.payload);
+        allocator.free(s.cdfh);
+        subs[entry_idx] = null;
+    } else {
+        const e = entries[entry_idx];
+        const payload = src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
+        src_xml = try decompressZipPayload(allocator, payload, e.compression_method, e.uncompressed_size);
+        src_xml_owned = true;
+    }
+    defer if (src_xml_owned) allocator.free(src_xml);
+
+    const new_xml = try patcher(allocator, src_xml, new_sheets);
+    // buildEntryFromXml takes ownership of new_xml.
+    subs[entry_idx] = try buildEntryFromXml(allocator, entry_name, new_xml);
+}
+
 fn addSstContentTypeOverride(allocator: Allocator, xml: []const u8) !?[]u8 {
     const inserted = "<Override PartName=\"/xl/sharedStrings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml\"/>";
     if (std.mem.indexOf(u8, xml, "PartName=\"/xl/sharedStrings.xml\"") != null) return null;
@@ -7941,6 +8304,61 @@ test "Editor: setCell populates an empty <sheetData/> worksheet" {
     defer rows.deinit();
     const r1 = (try rows.next()) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(i64, 42), r1[0].integer);
+}
+
+test "Editor: addSheet appends a new sheet and round-trips through reader (iter-sheet-1)" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_addsheet_src.xlsx";
+    const dst_path = "/tmp/zlsx_addsheet_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Original");
+        try s.writeRow(&.{.{ .integer = 42 }});
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        const new_idx = try ed.addSheet("Added");
+        try std.testing.expectEqual(@as(u32, 1), new_idx);
+        // The new sheet should be addressable via setCell.
+        try ed.setCell(new_idx, 1, 0, .{ .string = "hello" });
+        try ed.setCell(new_idx, 1, 1, .{ .integer = 99 });
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
+    try std.testing.expectEqualStrings("Original", book.sheets[0].name);
+    try std.testing.expectEqualStrings("Added", book.sheets[1].name);
+    var rows = try book.rows(book.sheets[1], std.testing.allocator);
+    defer rows.deinit();
+    const r = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("hello", r[0].string);
+    try std.testing.expectEqual(@as(i64, 99), r[1].integer);
+}
+
+test "Editor: addSheet rejects invalid + duplicate names" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_addsheet_reject.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Existing");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    try std.testing.expectError(error.InvalidSheetName, ed.addSheet(""));
+    try std.testing.expectError(error.InvalidSheetName, ed.addSheet("a:b"));
+    try std.testing.expectError(error.DuplicateSheetName, ed.addSheet("Existing"));
+    _ = try ed.addSheet("Fresh");
+    try std.testing.expectError(error.DuplicateSheetName, ed.addSheet("Fresh"));
 }
 
 test "Editor: setCells applies a batch in source order (iter-cm-3)" {
