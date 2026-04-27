@@ -6728,8 +6728,11 @@ fn patchViewAttrs(
             try out.appendSlice(allocator, attrs[name_start..]);
             return;
         }
-        // From here we have `name=` and a quoted value.
         i += 1; // past `=`
+        // Tolerate whitespace between `=` and the opening quote
+        // (legal XML; some generators emit it).
+        while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
+            attrs[i] == '\n' or attrs[i] == '\r')) i += 1;
         if (i >= attrs.len or (attrs[i] != '"' and attrs[i] != '\'')) {
             try out.appendSlice(allocator, attrs[name_start..]);
             return;
