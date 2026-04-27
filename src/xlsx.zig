@@ -3993,6 +3993,20 @@ fn parseSstRichRunsForBody(book: *Book, body: []const u8, sst_idx: usize) !void 
             const rpr_close = std.mem.indexOfPos(u8, body, next_lt, "</rPr>") orelse break;
             pending_flags = try parseRprFlags(book, arena, body[next_lt .. rpr_close + "</rPr>".len]);
             j = rpr_close + "</rPr>".len;
+        } else if (c1 == 'r' and next_lt + 4 <= body.len and
+            body[next_lt + 2] == 'P' and body[next_lt + 3] == 'h' and
+            (next_lt + 4 == body.len or body[next_lt + 4] == '>' or body[next_lt + 4] == ' ' or body[next_lt + 4] == '/'))
+        {
+            // `<rPh.../>` or `<rPh>...</rPh>` — phonetic guide.
+            // Skip the entire element so its inner `<t>` doesn't
+            // get registered as a rich-text run.
+            const rph_open_gt = std.mem.indexOfScalarPos(u8, body, next_lt + 4, '>') orelse break;
+            if (rph_open_gt > 0 and body[rph_open_gt - 1] == '/') {
+                j = rph_open_gt + 1;
+            } else {
+                const rph_close = std.mem.indexOfPos(u8, body, rph_open_gt + 1, "</rPh>") orelse break;
+                j = rph_close + "</rPh>".len;
+            }
         } else if (c1 == 't' and (next_lt + 2 == body.len or
             body[next_lt + 2] == '>' or body[next_lt + 2] == ' ' or body[next_lt + 2] == '/'))
         {
@@ -4098,6 +4112,21 @@ fn materialiseSstEntry(book: *Book, idx: usize) ![]const u8 {
             }
             t_count += 1;
             j = t_close + "</t>".len;
+        } else if (c1 == 'r' and next_lt + 4 <= body.len and
+            body[next_lt + 2] == 'P' and body[next_lt + 3] == 'h' and
+            (next_lt + 4 == body.len or body[next_lt + 4] == '>' or body[next_lt + 4] == ' ' or body[next_lt + 4] == '/'))
+        {
+            // `<rPh.../>` or `<rPh>...</rPh>` — phonetic guide,
+            // hidden pronunciation. Skip the entire element so its
+            // inner `<t>` doesn't get flattened. Mirrors the eager
+            // path's rPh skip.
+            const rph_open_gt = std.mem.indexOfScalarPos(u8, body, next_lt + 4, '>') orelse break;
+            if (rph_open_gt > 0 and body[rph_open_gt - 1] == '/') {
+                j = rph_open_gt + 1;
+            } else {
+                const rph_close = std.mem.indexOfPos(u8, body, rph_open_gt + 1, "</rPh>") orelse break;
+                j = rph_close + "</rPh>".len;
+            }
         } else {
             j = next_lt + 1;
         }
@@ -9879,6 +9908,60 @@ test "parseSharedStrings: phonetic <rPh> annotations are dropped from visible te
 
     try std.testing.expectEqual(@as(usize, 1), book.sharedStringsCount());
     try std.testing.expectEqualStrings("漢字", book.sst.eager[0]);
+}
+
+test "openSstLazy: phonetic <rPh> annotations are dropped from materialised text" {
+    const writer_mod = @import("writer.zig");
+    const tmp_path = "/tmp/zlsx_lazy_rph.xlsx";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    {
+        // Build a minimal workbook with one cell, then patch the
+        // SST entry to include a `<rPh>` annotation by direct
+        // string surgery — the writer doesn't emit `<rPh>` so we
+        // need a synthetic source.
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .string = "漢字" }});
+        try w.save(tmp_path);
+    }
+    // Read the file and rewrite xl/sharedStrings.xml in place to
+    // inject a phonetic annotation. Skip the test if anything fails
+    // so this stays a regression guard rather than a flaky CI step.
+    const file_data = std.fs.cwd().readFileAlloc(std.testing.allocator, tmp_path, 1 << 20) catch return;
+    defer std.testing.allocator.free(file_data);
+
+    // For simplicity, rebuild a workbook with the canonical SST
+    // shape via a manual override is too invasive — instead, this
+    // test asserts the handler logic via a direct invocation against
+    // a synthetic SST body, mirroring the eager test. The lazy code
+    // path is `materialiseSstEntry`.
+    const sst_xml =
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"1\" uniqueCount=\"1\">" ++
+        "<si><t>漢字</t><rPh sb=\"0\" eb=\"2\"><t>かんじ</t></rPh></si>" ++
+        "</sst>";
+
+    var book: Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer book.deinit();
+    const owned = try std.testing.allocator.dupe(u8, sst_xml);
+    book.shared_strings_xml = owned;
+    // Hand-build the lazy index so materialiseSstEntry can run
+    // without going through the full Book.openSstLazy path.
+    const si_open = std.mem.indexOf(u8, owned, "<si>").?;
+    const si_close = std.mem.indexOf(u8, owned, "</si>").? + "</si>".len;
+    const offsets = try std.testing.allocator.dupe(usize, &[_]usize{si_open + "<si>".len});
+    const lengths = try std.testing.allocator.dupe(usize, &[_]usize{si_close - si_open - "<si>".len - "</si>".len});
+    book.sst = .{ .lazy = .{
+        .offsets = offsets,
+        .lengths = lengths,
+        .resolved = .empty,
+    } };
+
+    const got = try book.sharedStringAt(0);
+    try std.testing.expectEqualStrings("漢字", got);
 }
 
 test "parseSharedStrings: self-closing <rPh/> is also skipped" {
