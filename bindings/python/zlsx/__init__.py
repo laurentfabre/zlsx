@@ -2644,6 +2644,62 @@ class Editor:
                     f"zlsx_editor_append_row: {_decode_err(self._err)}"
                 )
 
+    def set_cell(self, sheet_idx: int, row: int, col: int, value) -> None:
+        """Replace or insert a single cell on ``sheet_idx`` at
+        (``row``, ``col``). ``row`` is 1-based; ``col`` is 0-based
+        (A=0, B=1, …). ``value`` follows the same Python → cell
+        type mapping as :meth:`append_rows`:
+
+        * ``None`` → empty
+        * ``True``/``False`` → boolean
+        * ``int`` (within ±2⁵³) → integer
+        * ``float`` → number
+        * ``str`` → inline-string (no SST dedup; iter-cm-2b)
+
+        Errors propagate as :class:`ZlsxError`. Notable typed errors
+        bubble up by name:
+
+        * ``SetCellSourceCellHasMetadata`` — the source cell carries
+          ``s="N"`` styles or non-canonical body (formulas,
+          phonetic hints, extension blocks). The replacement is
+          canonical; preserve-and-merge is iter-cm-2e.
+        * ``SheetHasUnsavedAppends`` — :meth:`append_rows` was
+          called on the same sheet first; mixing append and
+          mutate isn't supported.
+        """
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_EDITOR_SET_CELL:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_editor_set_cell "
+                "(requires 0.2.9+); upgrade libzlsx"
+            )
+        cell, keeper = _py_value_to_cell(value)
+        cell_ref = _ffi.Cell.from_buffer_copy(bytes(cell))
+        rc = _ffi.lib.zlsx_editor_set_cell(
+            self._handle,
+            int(sheet_idx),
+            int(row),
+            int(col),
+            ctypes.byref(cell_ref),
+            self._err,
+            _ERR_BUF_LEN,
+        )
+        del keeper  # keep alive until after the FFI call
+        if rc != 0:
+            raise ZlsxError(f"zlsx_editor_set_cell: {_decode_err(self._err)}")
+
+    def set_cells(self, sheet_idx: int, edits) -> None:
+        """Bulk variant of :meth:`set_cell`. ``edits`` is an
+        iterable of ``(row, col, value)`` tuples. Applied in source
+        order; later edits see the byte offsets produced by earlier
+        ones, same as calling :meth:`set_cell` N times. Mid-batch
+        failure leaves the editor with the successful prefix
+        applied — there's no rollback."""
+        for edit in edits:
+            row, col, value = edit
+            self.set_cell(sheet_idx, row, col, value)
+
     def save(self, out_path: Union[str, Path]) -> None:
         """Write the (mutated) workbook atomically to ``out_path``.
         Pass the same path as the source to overwrite in place."""

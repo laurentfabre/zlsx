@@ -3094,6 +3094,39 @@ export fn zlsx_editor_append_row(
     return 0;
 }
 
+/// In-place cell mutation (Phase 3d, iter-cm-2). Replaces or
+/// inserts a single cell on `sheet_idx`. `row` is 1-based;
+/// `col` is 0-based. Cell types follow the same `CCell.tag`
+/// encoding as the row API. Returns 0 on success, -1 on failure
+/// with `err_buf` populated. Documented errors include
+/// SetCellSourceCellHasMetadata (source carries `s=` styles or
+/// non-canonical body — preserve-and-merge isn't shipped yet),
+/// SheetHasUnsavedAppends, and SheetIndexOutOfRange.
+export fn zlsx_editor_set_cell(
+    ed: *Editor,
+    sheet_idx: u32,
+    row: u32,
+    col: u32,
+    cell_ptr: ?*const CCell,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    if (cell_ptr == null) {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return -1;
+    }
+    const state: *EditorState = @ptrCast(@alignCast(ed));
+    const cell = fromCCell(cell_ptr.?.*) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    state.inner.setCell(sheet_idx, row, col, cell) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
 /// Save the workbook (with any pending appends applied) atomically
 /// to `out_path` (`out_path_len` bytes; not null-terminated).
 /// Returns 0 on success, -1 on failure with `err_buf` populated.

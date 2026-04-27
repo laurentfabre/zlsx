@@ -1054,3 +1054,16 @@ if _HAS_EDITOR:
         ctypes.c_size_t,
     ]
     lib.zlsx_editor_save.restype = ctypes.c_int32
+
+_HAS_EDITOR_SET_CELL = hasattr(lib, "zlsx_editor_set_cell")
+if _HAS_EDITOR_SET_CELL:
+    lib.zlsx_editor_set_cell.argtypes = [
+        editor_handle,
+        ctypes.c_uint32,           # sheet_idx
+        ctypes.c_uint32,           # row (1-based)
+        ctypes.c_uint32,           # col (0-based)
+        ctypes.POINTER(Cell),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_set_cell.restype = ctypes.c_int32
