@@ -4892,19 +4892,30 @@ pub const Editor = struct {
         }
 
         const path = self.sheet_paths[sheet_idx];
-        const entry_idx = findEntryByName(self.entries, path) orelse
-            return error.SheetEntryNotFound;
-        const entry = self.entries[entry_idx];
-        const payload = self.src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
-        const xml = try decompressZipPayload(
-            self.allocator,
-            payload,
-            entry.compression_method,
-            entry.uncompressed_size,
-        );
-        errdefer self.allocator.free(xml);
-        const cells = try scanWorksheetXml(self.allocator, xml);
-        return .{ .allocator = self.allocator, .xml = xml, .cells = cells };
+        // Source ZIP entry first; if absent, this is a freshly-
+        // added sheet (Phase 3e iter-sheet-1) — return its empty
+        // body template so callers can scan an untouched new sheet.
+        if (findEntryByName(self.entries, path)) |entry_idx| {
+            const entry = self.entries[entry_idx];
+            const payload = self.src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
+            const xml = try decompressZipPayload(
+                self.allocator,
+                payload,
+                entry.compression_method,
+                entry.uncompressed_size,
+            );
+            errdefer self.allocator.free(xml);
+            const cells = try scanWorksheetXml(self.allocator, xml);
+            return .{ .allocator = self.allocator, .xml = xml, .cells = cells };
+        }
+        if (self.findPendingNewSheet(path)) |ns_idx| {
+            const ns = self.pending_new_sheets.items[ns_idx];
+            const xml = try self.allocator.dupe(u8, ns.body_xml);
+            errdefer self.allocator.free(xml);
+            const cells = try scanWorksheetXml(self.allocator, xml);
+            return .{ .allocator = self.allocator, .xml = xml, .cells = cells };
+        }
+        return error.SheetEntryNotFound;
     }
 
     /// Replace one cell's value in place (Phase 3d, iter-cm-2a).
@@ -5203,20 +5214,23 @@ pub const Editor = struct {
     }
 
     /// True when `xl/workbook.xml` already declares a `<sheet>` with
-    /// this name. Helper for addSheet's duplicate guard.
+    /// this name. Helper for addSheet's duplicate guard. The raw
+    /// `name="..."` attribute can carry XML escapes (e.g. `R&amp;D`
+    /// for the user-visible name `R&D`); decode those before
+    /// comparing case-insensitively.
     fn sheetNameExists(self: *Editor, name: []const u8) !bool {
         const wb = try self.readEntry("xl/workbook.xml");
         defer self.allocator.free(wb);
-        // Scan for `name="…"` attributes inside `<sheet …/>` lines.
-        // Simple substring match — workbook.xml never contains other
-        // tags with `name="…"` outside the <sheets> block.
         var i: usize = 0;
         while (std.mem.indexOfPos(u8, wb, i, "<sheet ")) |sh_pos| {
             const sh_end = std.mem.indexOfScalarPos(u8, wb, sh_pos, '>') orelse break;
             const sh_attrs = wb[sh_pos + "<sheet ".len .. sh_end];
-            if (getAttr(sh_attrs, "name")) |nm| {
+            if (getAttr(sh_attrs, "name")) |raw| {
+                var decoded: std.ArrayListUnmanaged(u8) = .{};
+                defer decoded.deinit(self.allocator);
+                try decodeXmlAttrInto(self.allocator, &decoded, raw);
                 const writer_mod = @import("writer.zig");
-                if (writer_mod.asciiEqlFold(nm, name)) return true;
+                if (writer_mod.asciiEqlFold(decoded.items, name)) return true;
             }
             i = sh_end + 1;
         }
@@ -6346,6 +6360,38 @@ fn appendXmlEscaped(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), s: [
             '<' => try out.appendSlice(allocator, "&lt;"),
             '>' => try out.appendSlice(allocator, "&gt;"),
             else => try out.append(allocator, c),
+        }
+    }
+}
+
+/// Decode the named-entity-only XML attribute reverse: `&amp;`/
+/// `&lt;`/`&gt;`/`&quot;`/`&apos;` → their literal char. Numeric
+/// character references (`&#NN;` / `&#xHH;`) are passed through
+/// verbatim — sheet names don't carry them in practice. Unknown
+/// entities are left intact too.
+fn decodeXmlAttrInto(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '&') {
+            const semi = std.mem.indexOfScalarPos(u8, s, i, ';') orelse {
+                try out.append(allocator, s[i]);
+                i += 1;
+                continue;
+            };
+            const ent = s[i + 1 .. semi];
+            const replaced: ?u8 =
+                if (std.mem.eql(u8, ent, "amp")) @as(u8, '&') else if (std.mem.eql(u8, ent, "lt")) @as(u8, '<') else if (std.mem.eql(u8, ent, "gt")) @as(u8, '>') else if (std.mem.eql(u8, ent, "quot")) @as(u8, '"') else if (std.mem.eql(u8, ent, "apos")) @as(u8, '\'') else null;
+            if (replaced) |c| {
+                try out.append(allocator, c);
+                i = semi + 1;
+            } else {
+                // Unknown entity — pass through verbatim.
+                try out.appendSlice(allocator, s[i .. semi + 1]);
+                i = semi + 1;
+            }
+        } else {
+            try out.append(allocator, s[i]);
+            i += 1;
         }
     }
 }
@@ -8361,6 +8407,48 @@ test "Editor: addSheet appends a new sheet and round-trips through reader (iter-
     const r = (try rows.next()) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("hello", r[0].string);
     try std.testing.expectEqual(@as(i64, 99), r[1].integer);
+}
+
+test "Editor: scanWorksheet works on freshly-added sheets (iter-sheet-1)" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_scan_new_sheet.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Original");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    const new_idx = try ed.addSheet("Empty");
+    // scanWorksheet on the brand-new untouched sheet must not error
+    // — it should return a zero-cell span set.
+    var spans = try ed.scanWorksheet(new_idx);
+    defer spans.deinit();
+    try std.testing.expectEqual(@as(usize, 0), spans.cells.len);
+}
+
+test "Editor: addSheet handles XML-escaped duplicate names (R&D)" {
+    // The source workbook stores `R&D` as `name="R&amp;D"` in
+    // workbook.xml. Pre-fix, sheetNameExists compared raw bytes
+    // and accepted the duplicate. Now decode entities first.
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_addsheet_amp.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("R&D");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    try std.testing.expectError(error.DuplicateSheetName, ed.addSheet("R&D"));
+    // Case-insensitive too.
+    try std.testing.expectError(error.DuplicateSheetName, ed.addSheet("r&d"));
 }
 
 test "Editor: addSheet allocates non-colliding ids across multiple calls" {
