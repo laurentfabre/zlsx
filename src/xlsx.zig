@@ -3417,7 +3417,14 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
             const code_pos = std.mem.indexOf(u8, attrs, code_key) orelse continue;
             const code_start = code_pos + code_key.len;
             const code_end = std.mem.indexOfScalarPos(u8, attrs, code_start, '"') orelse continue;
-            try book.custom_num_fmts.put(book.allocator, id, attrs[code_start..code_end]);
+            // OOXML escapes quoted literals inside formatCode as
+            // entities, e.g. `0.00" months"` becomes
+            // `0.00&quot; months&quot;` in styles.xml. Decode here so
+            // (a) callers see the real format string and (b) the
+            // is-date-format scanner doesn't mis-classify literal
+            // text inside a quoted run as date tokens.
+            const code = try decodeFormulaInto(book, attrs[code_start..code_end]);
+            try book.custom_num_fmts.put(book.allocator, id, code);
         }
     }
 
@@ -3797,6 +3804,24 @@ fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
                 const rpr_close = std.mem.indexOfPos(u8, xml, next_lt, "</rPr>") orelse break :body;
                 pending_flags = try parseRprFlags(book, arena_alloc, xml[next_lt .. rpr_close + "</rPr>".len]);
                 j = rpr_close + "</rPr>".len;
+                std.debug.assert(j > j_prev);
+            } else if (c1 == 'r' and next_lt + 4 <= xml.len and
+                xml[next_lt + 2] == 'P' and xml[next_lt + 3] == 'h' and
+                (next_lt + 4 == xml.len or xml[next_lt + 4] == '>' or xml[next_lt + 4] == ' ' or xml[next_lt + 4] == '/'))
+            {
+                // `<rPh>...</rPh>` (or `<rPh.../>`) — phonetic guide /
+                // furigana annotation. The text inside is hidden
+                // pronunciation, not visible cell content. Skip the
+                // entire element so its inner `<t>` doesn't get
+                // flattened into the SST string. Self-closing form
+                // (`<rPh .../>`) just skips past the opening tag.
+                const rph_open_gt = std.mem.indexOfScalarPos(u8, xml, next_lt + 4, '>') orelse break :body;
+                if (rph_open_gt > 0 and xml[rph_open_gt - 1] == '/') {
+                    j = rph_open_gt + 1;
+                } else {
+                    const rph_close = std.mem.indexOfPos(u8, xml, rph_open_gt + 1, "</rPh>") orelse break :body;
+                    j = rph_close + "</rPh>".len;
+                }
                 std.debug.assert(j > j_prev);
             } else if (c1 == '/' and next_lt + 5 <= xml.len and
                 xml[next_lt + 2] == 's' and xml[next_lt + 3] == 'i' and xml[next_lt + 4] == '>')
@@ -9828,6 +9853,55 @@ test "Book.richRuns: rich-text SST entries expose per-run bold/italic" {
     try std.testing.expectEqual(true, r4[0].italic);
 }
 
+test "parseSharedStrings: phonetic <rPh> annotations are dropped from visible text" {
+    // A typical East-Asian SST entry: visible Kanji text with a
+    // phonetic-guide (furigana) <rPh> wrapping the reading. The
+    // visible cell content is the OUTER <t>; the <rPh><t> inner is
+    // hidden. Old parser would flatten both into a single string
+    // ("漢字かんじ" instead of "漢字").
+    const sst_xml =
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"1\" uniqueCount=\"1\">" ++
+        "<si>" ++
+        "<t>漢字</t>" ++
+        "<rPh sb=\"0\" eb=\"2\"><t>かんじ</t></rPh>" ++
+        "<phoneticPr fontId=\"1\"/>" ++
+        "</si>" ++
+        "</sst>";
+
+    var book: Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer book.deinit();
+    const owned = try std.testing.allocator.dupe(u8, sst_xml);
+    book.shared_strings_xml = owned;
+    try parseSharedStrings(&book, owned);
+
+    try std.testing.expectEqual(@as(usize, 1), book.sharedStringsCount());
+    try std.testing.expectEqualStrings("漢字", book.sst.eager[0]);
+}
+
+test "parseSharedStrings: self-closing <rPh/> is also skipped" {
+    // Defensive: producers occasionally emit empty/self-closing <rPh/>.
+    // The parser must skip past it without recursing.
+    const sst_xml =
+        "<sst count=\"1\" uniqueCount=\"1\">" ++
+        "<si><t>plain</t><rPh sb=\"0\" eb=\"0\"/></si>" ++
+        "</sst>";
+
+    var book: Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer book.deinit();
+    const owned = try std.testing.allocator.dupe(u8, sst_xml);
+    book.shared_strings_xml = owned;
+    try parseSharedStrings(&book, owned);
+
+    try std.testing.expectEqual(@as(usize, 1), book.sharedStringsCount());
+    try std.testing.expectEqualStrings("plain", book.sst.eager[0]);
+}
+
 test "parseSharedStrings: hostile uniqueCount is capped against XML size" {
     // A malformed or hostile workbook can claim an absurd uniqueCount
     // to force a multi-GB pre-allocation. The hint is capped against
@@ -12301,6 +12375,33 @@ test "parseStyles: cellXfs handles <xf/> and <xf> variants (no attrs)" {
     try std.testing.expectEqual(@as(u32, 14), book.cell_xf_numfmt_ids[3]);
     try std.testing.expectEqual(@as(u32, 2), book.cell_xf_font_ids[3]);
     try std.testing.expectEqual(@as(u32, 1), book.cell_xf_fill_ids[3]);
+}
+
+test "parseStyles: custom numFmt formatCode is XML-entity decoded" {
+    // OOXML escapes quotes inside formatCode as `&quot;`. The reader
+    // must decode so callers see the real format string and the
+    // is-date-format scanner doesn't misclassify literal text as date
+    // tokens.
+    const styles_xml =
+        "<?xml version=\"1.0\"?>" ++
+        "<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+        "<numFmts count=\"1\"><numFmt numFmtId=\"164\" formatCode=\"0.00&quot; months&quot;\"/></numFmts>" ++
+        "<cellXfs count=\"1\"><xf numFmtId=\"164\"/></cellXfs>" ++
+        "</styleSheet>";
+
+    var book: Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer book.deinit();
+    try parseStyles(&book, styles_xml);
+
+    const code = book.numberFormat(0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("0.00\" months\"", code);
+    // The literal-text suffix carries `m` ("months") which the date
+    // scanner would otherwise treat as a month token. The decoded
+    // form keeps the suffix inside quotes — must not be a date.
+    try std.testing.expect(!book.isDateFormat(0));
 }
 
 test "Book.cellBorder: round-trip sided styles + color through writer" {

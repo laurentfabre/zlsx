@@ -981,9 +981,16 @@ pub const Writer = struct {
             }
             try cx.appendSlice(alloc, "</authors><commentList>");
             for (sw.comments.items, author_ids.items) |c, aid| {
-                try cx.print(alloc, "<comment ref=\"{s}\" authorId=\"{d}\"><text><r><t xml:space=\"preserve\">", .{ c.ref, aid });
+                // addComment only takes a plain-text body, so emit
+                // `<text><t .../>` directly — no synthetic `<r>` run
+                // wrapper. With the wrapper the reader treats every
+                // writer-produced comment as rich text and surfaces
+                // a single-run `Comment.runs`, contradicting the
+                // plain/rich distinction the reader's contract draws
+                // (`runs == null` means plain).
+                try cx.print(alloc, "<comment ref=\"{s}\" authorId=\"{d}\"><text><t xml:space=\"preserve\">", .{ c.ref, aid });
                 try appendXmlEscaped(alloc, &cx, c.text);
-                try cx.appendSlice(alloc, "</t></r></text></comment>");
+                try cx.appendSlice(alloc, "</t></text></comment>");
             }
             try cx.appendSlice(alloc, "</commentList></comments>");
             var cn_buf: [64]u8 = undefined;

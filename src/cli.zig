@@ -5547,12 +5547,10 @@ test "runCommentsCommand emits one record per comment across every sheet" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"row\":1,\"col\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"author\":\"Alice\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"text\":\"needs review\"") != null);
-    // The writer's comment body wraps text in `<r><t>` (even for
-    // plain bodies), so the reader populates `runs` as a one-entry
-    // array of `{text:"…"}`. `runs:null` would require an `<r>`-less
-    // body, which the writer doesn't emit today — exercise the
-    // populated-runs path instead.
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"runs\":[{\"text\":\"needs review\"}]") != null);
+    // Plain comments emit a bare `<text><t>...</t></text>` body
+    // (no synthetic `<r>` run wrapper), so the reader surfaces
+    // `runs:null` per the plain/rich distinction.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"runs\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"sheet\":\"Other\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"B2\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"row\":2,\"col\":2") != null);
