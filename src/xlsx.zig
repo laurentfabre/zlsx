@@ -5210,12 +5210,7 @@ pub const Editor = struct {
         // already-extracted Book (Editor's open path used Book.open
         // for sheet path resolution but didn't keep the names).
         // Cheapest: read workbook.xml once and scan for `name="…"`.
-        if (try self.sheetNameExists(name)) return error.DuplicateSheetName;
-        for (self.pending_new_sheets.items) |s| {
-            // Case-insensitive: Excel treats sheet names that
-            // differ only in ASCII case as duplicates.
-            if (writer_mod.asciiEqlFold(s.name, name)) return error.DuplicateSheetName;
-        }
+        if (try self.isSheetNameTaken(name, null)) return error.DuplicateSheetName;
 
         // Pick the next sheet_id, sheet path number, and rId by
         // scanning the workbook.xml + rels for the highest existing,
@@ -5306,26 +5301,11 @@ pub const Editor = struct {
         // No-op (case-insensitive same name).
         if (writer_mod.asciiEqlFold(current_name, new_name)) return;
 
-        // Reject duplicates against EVERY other sheet name (source +
-        // pending new + pending renames' new_name).
-        if (try self.sheetNameExists(new_name)) {
-            // sheetNameExists matches against the current source name
-            // too — a rename's new_name might equal the OLD name of
-            // another rename, which is fine. Cheapest fix: only
-            // reject if the matched sheet isn't the one we're renaming.
-            if (!writer_mod.asciiEqlFold(current_name, new_name)) {
-                // We already short-circuited the "rename to same"
-                // case above, so this branch always fires.
-                return error.DuplicateSheetName;
-            }
-        }
-        for (self.pending_new_sheets.items) |s| {
-            if (writer_mod.asciiEqlFold(s.name, new_name)) return error.DuplicateSheetName;
-        }
-        for (self.pending_renames.items) |r| {
-            if (r.sheet_idx == sheet_idx) continue;
-            if (writer_mod.asciiEqlFold(r.new_name, new_name)) return error.DuplicateSheetName;
-        }
+        // Reject duplicates against every OTHER sheet's effective
+        // name. "Effective" lets `A->C` then `B->A` work because
+        // sheet 0's effective name after the first rename is `C`,
+        // freeing `A` for sheet 1.
+        if (try self.isSheetNameTaken(new_name, sheet_idx)) return error.DuplicateSheetName;
 
         // Pending-new-sheet path: mutate the NewSheet's name in
         // place, no workbook.xml patch needed (the sheet doesn't
@@ -5358,6 +5338,37 @@ pub const Editor = struct {
             .old_name = old_dup,
             .new_name = new_dup,
         });
+    }
+
+    /// Effective name of `sheet_idx` taking pending renames + new
+    /// sheets into account. Caller owns the returned slice.
+    fn effectiveSheetName(self: *Editor, sheet_idx: u32) ![]u8 {
+        for (self.pending_renames.items) |r| {
+            if (r.sheet_idx == sheet_idx) return try self.allocator.dupe(u8, r.new_name);
+        }
+        const path = self.sheet_paths[sheet_idx];
+        if (self.findPendingNewSheet(path)) |ns_idx| {
+            return try self.allocator.dupe(u8, self.pending_new_sheets.items[ns_idx].name);
+        }
+        return (try self.sheetNameAtPath(path)) orelse error.SheetEntryNotFound;
+    }
+
+    /// True when some sheet (other than `except_sheet_idx` if set)
+    /// has an effective name matching `candidate` case-insensitively.
+    /// "Effective" = pending-rename's new_name takes precedence over
+    /// the source workbook.xml name; pending-new-sheets contribute
+    /// their NewSheet.name. Closes the rotate-rename / freed-name
+    /// gap that two prior Codex passes flagged.
+    fn isSheetNameTaken(self: *Editor, candidate: []const u8, except_sheet_idx: ?u32) !bool {
+        const writer_mod = @import("writer.zig");
+        var i: u32 = 0;
+        while (i < self.sheet_paths.len) : (i += 1) {
+            if (except_sheet_idx) |ei| if (i == ei) continue;
+            const eff = try self.effectiveSheetName(i);
+            defer self.allocator.free(eff);
+            if (writer_mod.asciiEqlFold(eff, candidate)) return true;
+        }
+        return false;
     }
 
     /// Look up the source workbook's sheet name for a given path.
@@ -6225,10 +6236,14 @@ fn nextMaxSheetPathNum(entries: []const Editor.ZipEntry) u32 {
     return max_n;
 }
 
-/// Rewrite `xl/workbook.xml`'s `<sheet name="OLD"…/>` to use the
-/// new name for each pending rename. Iter-sheet-2. Old name match
-/// is via XML-escaped form so producers that store
-/// `name="R&amp;D"` for the user-facing `R&D` are correctly hit.
+/// Rewrite `xl/workbook.xml`'s `<sheet>` line at position
+/// `r.sheet_idx` (0-based among `<sheet>` elements in source
+/// order) for each pending rename. Iter-sheet-2.
+///
+/// Match is by POSITION, not by name — addSheet's patcher may have
+/// already appended new `<sheet>` lines, and a freshly-added sheet
+/// with the same name as a pre-rename old name would otherwise be
+/// hit by accident.
 fn patchWorkbookXmlForRenames(
     allocator: Allocator,
     xml: []const u8,
@@ -6238,28 +6253,24 @@ fn patchWorkbookXmlForRenames(
     errdefer out.deinit(allocator);
 
     var i: usize = 0;
+    var sheet_pos_counter: u32 = 0;
     while (std.mem.indexOfPos(u8, xml, i, "<sheet ")) |sh_pos| {
         // Copy bytes up to (and including) the `<sheet ` opener.
         try out.appendSlice(allocator, xml[i .. sh_pos + "<sheet ".len]);
         const sh_end = std.mem.indexOfScalarPos(u8, xml, sh_pos, '>') orelse {
-            // Malformed — emit the rest verbatim.
             try out.appendSlice(allocator, xml[sh_pos + "<sheet ".len ..]);
             return try out.toOwnedSlice(allocator);
         };
         const attrs = xml[sh_pos + "<sheet ".len .. sh_end];
+        const my_pos = sheet_pos_counter;
+        sheet_pos_counter += 1;
 
-        // Decode current name and check against each rename's old.
+        // Find a rename targeting THIS position.
         var matched_new: ?[]const u8 = null;
-        if (getAttr(attrs, "name")) |raw| {
-            var decoded: std.ArrayListUnmanaged(u8) = .{};
-            defer decoded.deinit(allocator);
-            try decodeXmlAttrInto(allocator, &decoded, raw);
-            for (renames) |r| {
-                const writer_mod = @import("writer.zig");
-                if (writer_mod.asciiEqlFold(decoded.items, r.old_name)) {
-                    matched_new = r.new_name;
-                    break;
-                }
+        for (renames) |r| {
+            if (r.sheet_idx == my_pos) {
+                matched_new = r.new_name;
+                break;
             }
         }
 
@@ -8850,6 +8861,40 @@ test "Editor: renameSheet rejects duplicates and invalid names" {
     try std.testing.expectError(error.DuplicateSheetName, ed.renameSheet(0, "second"));
     // Out-of-range.
     try std.testing.expectError(error.SheetIndexOutOfRange, ed.renameSheet(99, "Foo"));
+}
+
+test "Editor: rename + add reuses names freed by earlier renames" {
+    // Codex P2: pre-fix, rotate / swap rename workflows were
+    // rejected because the dup check only saw raw source names.
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_rename_rotate.xlsx";
+    const dst_path = "/tmp/zlsx_rename_rotate_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        _ = try w.addSheet("A");
+        _ = try w.addSheet("B");
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        // A -> C, then B -> A (rotate).
+        try ed.renameSheet(0, "C");
+        try ed.renameSheet(1, "A");
+        // addSheet can also reuse a freed name: rename A->B's
+        // earlier old-name was "B", but sheet 1 is now "A". Adding
+        // "B" should succeed.
+        _ = try ed.addSheet("B");
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    try std.testing.expectEqualStrings("C", book.sheets[0].name);
+    try std.testing.expectEqualStrings("A", book.sheets[1].name);
+    try std.testing.expectEqualStrings("B", book.sheets[2].name);
 }
 
 test "Editor: renameSheet on a pending-new sheet mutates in place" {
