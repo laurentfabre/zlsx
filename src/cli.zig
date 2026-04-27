@@ -403,7 +403,8 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
                     std.mem.eql(u8, a, "hyperlinks") or
                     std.mem.eql(u8, a, "styles") or
                     std.mem.eql(u8, a, "sst") or
-                    std.mem.eql(u8, a, "append-rows"))
+                    std.mem.eql(u8, a, "append-rows") or
+                    std.mem.eql(u8, a, "set-cell"))
                 {
                     continue;
                 }
@@ -3476,6 +3477,19 @@ test "writeCsvField quoting" {
         try writeCsvField(&w, "has\"quote");
         try std.testing.expectEqualStrings("\"has\"\"quote\"", w.buffered());
     }
+}
+
+test "parseArgs: set-cell subcommand token is skipped, --ref / --value parse" {
+    const argv = [_][]const u8{
+        "set-cell", "in.xlsx", "--sheet", "0", "--ref", "B1", "--value", "\"hello\"", "--out", "out.xlsx",
+    };
+    const a = try parseArgs(&argv);
+    try std.testing.expectEqual(Subcommand.set_cell, a.subcommand);
+    try std.testing.expectEqualStrings("in.xlsx", a.file);
+    try std.testing.expectEqual(@as(?usize, 0), a.sheet_index);
+    try std.testing.expectEqualStrings("B1", a.cell_ref.?);
+    try std.testing.expectEqualStrings("\"hello\"", a.cell_value_json.?);
+    try std.testing.expectEqualStrings("out.xlsx", a.out_path.?);
 }
 
 test "runSetCellCommand rewrites a single cell and saves to --out" {
