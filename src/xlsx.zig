@@ -6845,6 +6845,7 @@ fn patchWorkbookXmlForDeletes(
         if (pick_sheet) {
             const t = next_sheet.?;
             const attrs = xml[t.start + "<sheet".len .. t.after_open - 1];
+            const is_self_closing = attrs.len > 0 and attrs[attrs.len - 1] == '/';
             var dropped = false;
             if (getAttr(attrs, "r:id")) |rid| {
                 for (deletes) |d| {
@@ -6855,11 +6856,25 @@ fn patchWorkbookXmlForDeletes(
                 }
             }
             if (dropped) {
+                // Drop the entire `<sheet>` element. For self-closing
+                // form `<sheet ... />`, after_open is past the `>`.
+                // For body form `<sheet ...></sheet>`, also skip
+                // past the matching `</sheet>` close so we don't
+                // leave a dangling close tag.
                 try out.appendSlice(allocator, xml[i..t.start]);
+                if (is_self_closing) {
+                    i = t.after_open;
+                } else {
+                    if (std.mem.indexOfPos(u8, xml, t.after_open, "</sheet>")) |close_pos| {
+                        i = close_pos + "</sheet>".len;
+                    } else {
+                        i = t.after_open;
+                    }
+                }
             } else {
                 try out.appendSlice(allocator, xml[i..t.after_open]);
+                i = t.after_open;
             }
-            i = t.after_open;
         } else {
             const t = next_view.?;
             try out.appendSlice(allocator, xml[i..t.start]);
