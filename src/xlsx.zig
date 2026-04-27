@@ -5669,6 +5669,28 @@ pub const Editor = struct {
         try self.recordColEdit(sheet_idx, col_1based, &self.pending_col_deletes);
     }
 
+    /// Scan every existing worksheet (NOT pending-new sheets, which
+    /// always have empty bodies) for any `<f...>` formula tag.
+    /// Returns true on the first hit. Row/column edits use this to
+    /// refuse globally when any sheet carries a formula — the
+    /// formula tokenizer that would let us safely rewrite
+    /// cross-sheet refs (e.g. `=Sheet1!B:B`) hasn't shipped yet
+    /// (iter-col-1).
+    fn anySheetContainsFormulas(self: *Editor) !bool {
+        for (self.sheet_paths) |path| {
+            if (self.findPendingNewSheet(path) != null) continue;
+            const entry_idx = findEntryByName(self.entries, path) orelse continue;
+            const e = self.entries[entry_idx];
+            const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
+            const xml = try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
+            defer self.allocator.free(xml);
+            if (std.mem.indexOf(u8, xml, "<f>") != null) return true;
+            if (std.mem.indexOf(u8, xml, "<f ") != null) return true;
+            if (std.mem.indexOf(u8, xml, "<f/") != null) return true;
+        }
+        return false;
+    }
+
     fn recordColEdit(
         self: *Editor,
         sheet_idx: u32,
@@ -5703,6 +5725,12 @@ pub const Editor = struct {
         if (std.mem.indexOf(u8, wb_check, "<definedName") != null)
             return error.ColEditWithDefinedNamesNotSupported;
 
+        // Cross-sheet formulas (e.g. `=Sheet1!B:B`) reference into
+        // the edited sheet but live in *other* sheet bodies. Without
+        // a tokenizer we can't rewrite them, so refuse globally if
+        // any sheet has a formula.
+        if (try self.anySheetContainsFormulas()) return error.ColEditWithFormulasNotSupported;
+
         if (findEntryByName(self.entries, path)) |entry_idx| {
             const e = self.entries[entry_idx];
             const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
@@ -5714,9 +5742,6 @@ pub const Editor = struct {
                 "<conditionalFormatting",
                 "<autoFilter",
                 "<tableParts",
-                "<f>",
-                "<f ",
-                "<f/",
                 "<drawing",
                 "<legacyDrawing",
                 "<picture",
@@ -5777,6 +5802,12 @@ pub const Editor = struct {
         if (std.mem.indexOf(u8, wb_check, "<definedName") != null)
             return error.RowEditWithDefinedNamesNotSupported;
 
+        // Cross-sheet formulas (e.g. `=Sheet1!1:1`) reference into
+        // the edited sheet but live in *other* sheet bodies. Without
+        // a tokenizer we can't rewrite them, so refuse globally if
+        // any sheet has a formula.
+        if (try self.anySheetContainsFormulas()) return error.RowEditWithFormulasNotSupported;
+
         // Conservative content guard: scan the worksheet XML for
         // elements that v1 doesn't rewrite. If any are present,
         // refuse rather than silently corrupt the workbook.
@@ -5791,9 +5822,6 @@ pub const Editor = struct {
                 "<conditionalFormatting",
                 "<autoFilter",
                 "<tableParts",
-                "<f>",
-                "<f ",
-                "<f/",
                 "<drawing",
                 "<legacyDrawing",
                 "<picture",
@@ -7223,6 +7251,17 @@ fn processDimensionTagCol(
     }
     const ref = r_attr.?;
     const colon = std.mem.indexOfScalar(u8, ref, ':') orelse {
+        // Single-cell dimension. On a delete-match (the only used
+        // column == col_1based) the cell is gone; fall back to "A1"
+        // so the dimension stays valid (Excel recomputes on open).
+        if (kind == .delete) {
+            if (parseColFromA1(ref)) |c| {
+                if (c == col_1based) {
+                    try writeWithReplacedAttr(allocator, out, src, t, "<dimension".len, "ref", "A1");
+                    return;
+                }
+            }
+        }
         var b: [16]u8 = undefined;
         const new_ref = shiftSingleA1Col(ref, col_1based, kind, &b, false) catch {
             try out.appendSlice(allocator, src[t.start..t.after_open]);
@@ -7582,6 +7621,17 @@ fn processDimensionTag(
     }
     const ref = r_attr.?;
     const colon = std.mem.indexOfScalar(u8, ref, ':') orelse {
+        // Single-cell dimension. On a delete-match (the only used
+        // row == deleted row) the cell is gone; fall back to "A1"
+        // so the dimension stays valid (Excel recomputes on open).
+        if (kind == .delete) {
+            if (parseRowFromA1(ref)) |r| {
+                if (r == row) {
+                    try writeWithReplacedAttr(allocator, out, src, t, "<dimension".len, "ref", "A1");
+                    return;
+                }
+            }
+        }
         var b: [16]u8 = undefined;
         const new_ref = shiftSingleA1(ref, row, kind, &b, false) catch {
             try out.appendSlice(allocator, src[t.start..t.after_open]);
@@ -7594,6 +7644,18 @@ fn processDimensionTag(
         try writeWithReplacedAttr(allocator, out, src, t, "<dimension".len, "ref", new_ref);
         return;
     };
+    // Detect "entire range is the deleted row" up front: both
+    // corners at the deleted row on a delete. Fall back to a safe
+    // sentinel "A1" so the dimension stays valid (Excel recomputes
+    // on open).
+    if (kind == .delete) {
+        const tl_row = parseRowFromA1(ref[0..colon]) orelse 0;
+        const br_row = parseRowFromA1(ref[colon + 1 ..]) orelse 0;
+        if (tl_row == row and br_row == row) {
+            try writeWithReplacedAttr(allocator, out, src, t, "<dimension".len, "ref", "A1");
+            return;
+        }
+    }
     var tl_buf: [16]u8 = undefined;
     var br_buf: [16]u8 = undefined;
     const tl_new = shiftSingleA1(ref[0..colon], row, kind, &tl_buf, false) catch {
@@ -10573,6 +10635,29 @@ test "applyRowEditToWorksheet: delete drops the row's <row> block" {
     try std.testing.expect(std.mem.indexOf(u8, out, "r=\"A2\"") != null);
 }
 
+test "applyRowEditToWorksheet collapses single-cell dimension on row delete" {
+    const src =
+        "<worksheet><dimension ref=\"B2\"/><sheetData>" ++
+        "<row r=\"2\"><c r=\"B2\"><v>9</v></c></row>" ++
+        "</sheetData></worksheet>";
+    const out = try applyRowEditToWorksheet(std.testing.allocator, src, 2, .delete);
+    defer std.testing.allocator.free(out);
+    // Stale `B2` dimension would be wrong now; expect the safe sentinel.
+    try std.testing.expect(std.mem.indexOf(u8, out, "ref=\"A1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ref=\"B2\"") == null);
+}
+
+test "applyColEditToWorksheet collapses single-cell dimension on col delete" {
+    const src =
+        "<worksheet><dimension ref=\"B2\"/><sheetData>" ++
+        "<row r=\"2\"><c r=\"B2\"><v>9</v></c></row>" ++
+        "</sheetData></worksheet>";
+    const out = try applyColEditToWorksheet(std.testing.allocator, src, 2, .delete);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ref=\"A1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ref=\"B2\"") == null);
+}
+
 test "Editor: insertRow shifts existing rows down (iter-row-2)" {
     const writer_mod = @import("writer.zig");
     const src_path = "/tmp/zlsx_insertrow_src.xlsx";
@@ -10642,7 +10727,7 @@ test "Editor: deleteRow removes a row + shifts everything below up" {
     try std.testing.expectEqual(@as(?[]const Cell, null), try rows.next());
 }
 
-test "Editor: insertRow rejects sheets with formulas/hyperlinks" {
+test "Editor: insertRow rejects sheets carrying formulas globally" {
     const writer_mod = @import("writer.zig");
     const src_path = "/tmp/zlsx_row_unsafe.xlsx";
     defer std.fs.cwd().deleteFile(src_path) catch {};
@@ -10655,8 +10740,32 @@ test "Editor: insertRow rejects sheets with formulas/hyperlinks" {
     }
     var ed = try Editor.open(std.testing.allocator, src_path);
     defer ed.deinit();
-    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 1));
-    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 1));
+    try std.testing.expectError(error.RowEditWithFormulasNotSupported, ed.insertRow(0, 1));
+    try std.testing.expectError(error.RowEditWithFormulasNotSupported, ed.deleteRow(0, 1));
+}
+
+test "Editor: row edits refuse when ANY sheet has a formula (cross-sheet)" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_row_xsheet_formula.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s1 = try w.addSheet("Plain");
+        try s1.writeRow(&.{.{ .integer = 1 }});
+        try s1.writeRow(&.{.{ .integer = 2 }});
+        var s2 = try w.addSheet("HasFormula");
+        try s2.writeRowWithFormulas(&.{.{ .integer = 0 }}, &.{"Plain!A1+Plain!A2"});
+        try w.save(src_path);
+    }
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    // Editing the *clean* sheet must still refuse, because Sheet2's
+    // formula references back into it and we have no tokenizer.
+    try std.testing.expectError(error.RowEditWithFormulasNotSupported, ed.insertRow(0, 1));
+    try std.testing.expectError(error.RowEditWithFormulasNotSupported, ed.deleteRow(0, 1));
+    try std.testing.expectError(error.ColEditWithFormulasNotSupported, ed.insertColumn(0, 1));
+    try std.testing.expectError(error.ColEditWithFormulasNotSupported, ed.deleteColumn(0, 1));
 }
 
 test "Editor: deleteSheet drops a source sheet (iter-sheet-3)" {
