@@ -5471,10 +5471,16 @@ pub const Editor = struct {
                     rels_i = rel_end + 1;
                     continue;
                 };
-                var matches = std.mem.eql(u8, target, target_path);
+                // Three legal forms for the same path:
+                //   - "worksheets/sheet1.xml" (relative; needs xl/)
+                //   - "xl/worksheets/sheet1.xml" (already prefixed)
+                //   - "/xl/worksheets/sheet1.xml" (absolute) —
+                //     parseWorkbookSheets accepts this; we must too.
+                const t_norm = if (target.len > 0 and target[0] == '/') target[1..] else target;
+                var matches = std.mem.eql(u8, t_norm, target_path);
                 if (!matches) {
                     var prefixed_buf: [256]u8 = undefined;
-                    const prefixed = std.fmt.bufPrint(&prefixed_buf, "xl/{s}", .{target}) catch break;
+                    const prefixed = std.fmt.bufPrint(&prefixed_buf, "xl/{s}", .{t_norm}) catch break;
                     matches = std.mem.eql(u8, prefixed, target_path);
                 }
                 if (matches) {
