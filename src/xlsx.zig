@@ -5533,7 +5533,9 @@ pub const Editor = struct {
         if (self.sheet_paths.len <= 1) return error.CannotDeleteLastSheet;
         if (self.pending_appends.count() > 0 or
             self.pending_mutations.count() > 0 or
-            self.pending_renames.items.len > 0)
+            self.pending_renames.items.len > 0 or
+            self.pending_row_inserts.items.len > 0 or
+            self.pending_row_deletes.items.len > 0)
         {
             return error.SheetDeleteRequiresCleanState;
         }
@@ -5643,6 +5645,15 @@ pub const Editor = struct {
         // a non-existent source ZIP entry. Reject up front.
         const path = self.sheet_paths[sheet_idx];
         if (self.findPendingNewSheet(path) != null) return error.RowEditOnNewSheetUnsupported;
+
+        // Workbook-scoped <definedName> entries can carry row
+        // references in formula text (named ranges, print areas,
+        // print titles). Until iter-col-1's formula tokenizer
+        // ships, refuse rather than save stale references.
+        const wb_check = try self.readEntry("xl/workbook.xml");
+        defer self.allocator.free(wb_check);
+        if (std.mem.indexOf(u8, wb_check, "<definedName") != null)
+            return error.RowEditWithDefinedNamesNotSupported;
 
         // Conservative content guard: scan the worksheet XML for
         // elements that v1 doesn't rewrite. If any are present,
