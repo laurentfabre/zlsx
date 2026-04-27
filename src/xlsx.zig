@@ -4754,6 +4754,16 @@ fn scanWorksheetXml(allocator: Allocator, xml: []const u8) ![]CellSpan {
                 const parsed = std.fmt.parseInt(u32, r_str, 10) catch 0;
                 if (parsed > 0) break :blk parsed;
             }
+            // Mirror Rows.next semantics: when <row r> is absent or
+            // unusable, recover from the first <c r="A11">-style ref
+            // BEFORE falling back to the implicit row counter. Without
+            // this, scanWorksheet would diverge from Book.rows on the
+            // same fixture and any future setCell built on it would
+            // target the wrong row.
+            if (!is_self_closing_row) {
+                if (recoverRowFromFirstCell(xml, row_tag.after_open)) |n|
+                    break :blk n;
+            }
             break :blk implicit_row;
         };
 
@@ -4772,13 +4782,17 @@ fn scanWorksheetXml(allocator: Allocator, xml: []const u8) ![]CellSpan {
                 cur += "</row>".len;
                 break;
             }
-            // Match `<c` only when followed by space, `/`, or `>` —
+            // Match `<c` only when followed by whitespace, `/`, or `>` —
             // otherwise we'd match `<col>` / `<choose>` / etc.
+            // Pretty-printed OOXML can wrap attrs onto the next line
+            // (`<c\n r="A1">…</c>`), so accept newline + carriage
+            // return too. Matches what Rows.next tolerates.
             const after_c = cur + 2;
             const is_c_open = cur + 2 <= xml.len and
                 xml[cur + 1] == 'c' and
                 after_c < xml.len and
                 (xml[after_c] == ' ' or xml[after_c] == '\t' or
+                    xml[after_c] == '\n' or xml[after_c] == '\r' or
                     xml[after_c] == '/' or xml[after_c] == '>');
             if (!is_c_open) {
                 const gt = std.mem.indexOfScalarPos(u8, xml, cur, '>') orelse
@@ -6818,6 +6832,31 @@ test "Editor: scanWorksheet (row,col) matches Book.rows on every cell" {
             try std.testing.expect(found != null);
         }
     }
+}
+
+test "scanWorksheetXml: pretty-printed cells (newline after <c) + r-less rows" {
+    // Two regressions captured here:
+    //   1. `<c\n r="A1">` — pretty-printed XML where attrs wrap to
+    //      the next line. Earlier scanner gated on space/tab/slash/
+    //      gt only and dropped these cells.
+    //   2. `<row>` with no r= AND r-less cells — scanner had to
+    //      fall back to recoverRowFromFirstCell when present, not
+    //      blindly increment a sequential counter.
+    const xml =
+        \\<sheetData><row r="7"><c
+        \\  r="A7" t="s"><v>0</v></c><c
+        \\  r="B7"><v>3.14</v></c></row><row><c r="A12"><v>1</v></c></row></sheetData>
+    ;
+    const cells = try scanWorksheetXml(std.testing.allocator, xml);
+    defer std.testing.allocator.free(cells);
+    try std.testing.expectEqual(@as(usize, 3), cells.len);
+    // Row 7 cells via <row r=>; row 12 recovered from <c r="A12">.
+    try std.testing.expectEqual(@as(u32, 7), cells[0].row);
+    try std.testing.expectEqual(@as(u32, 0), cells[0].col);
+    try std.testing.expectEqual(@as(u32, 7), cells[1].row);
+    try std.testing.expectEqual(@as(u32, 1), cells[1].col);
+    try std.testing.expectEqual(@as(u32, 12), cells[2].row);
+    try std.testing.expectEqual(@as(u32, 0), cells[2].col);
 }
 
 test "Editor: scanWorksheet rejects out-of-range sheet idx" {
