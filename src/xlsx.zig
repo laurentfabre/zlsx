@@ -942,9 +942,13 @@ pub const Book = struct {
     /// Idempotent: repeated calls are a hashmap hit.
     fn ensureCommentsLoadedForSheet(self: *Book, sheet_path: []const u8) !void {
         const rels_xml = self.sheet_rels_data.get(sheet_path) orelse return;
-        if (rels_targetForComments(rels_xml)) |basename| {
-            var path_buf: [64]u8 = undefined;
-            const full = std.fmt.bufPrint(&path_buf, "xl/{s}", .{basename}) catch return;
+        if (rels_targetForComments(rels_xml)) |target| {
+            // Sheet rels live at `xl/worksheets/_rels/sheetN.xml.rels`
+            // and `Target` is relative to the worksheet itself
+            // (`xl/worksheets/sheetN.xml`), so the base dir is
+            // `xl/worksheets/`.
+            var path_buf: [256]u8 = undefined;
+            const full = resolveRelArchivePath("xl/worksheets/", target, &path_buf) orelse return;
             try self.ensureCommentsLoaded(full);
         }
     }
@@ -2492,8 +2496,13 @@ fn findRelTarget(rels_xml: []const u8, rid: []const u8) ?[]const u8 {
 }
 
 /// Find the comments part referenced by a sheet's rels XML. Returns
-/// the basename of the first `Relationship` whose `Type` ends in
-/// `/comments` OR whose `Target` basename matches `comments[N].xml`.
+/// the raw `Target` attribute of the first `Relationship` whose
+/// `Type` ends in `/comments` OR whose `Target` basename matches
+/// `comments[N].xml`. Caller is responsible for resolving the
+/// returned target against the rels file's base directory (sheet
+/// rels live at `xl/worksheets/_rels/sheetN.xml.rels`, so
+/// `../comments1.xml` resolves to `xl/comments1.xml`).
+///
 /// Both criteria are robust against accidentally matching a stray
 /// `Target` like `https://host/comments` or `commentsShape1.vml`,
 /// which the previous substring scan would happily accept.
@@ -2538,9 +2547,46 @@ fn rels_targetForComments(rels_xml: []const u8) ?[]const u8 {
             break :blk true;
         };
 
-        if (type_matches or basename_matches) return basename;
+        if (type_matches or basename_matches) return target;
     }
     return null;
+}
+
+/// Resolve a rels-XML `Target` against `base_dir` (the rels file's
+/// referencing-document directory, e.g. `xl/worksheets/`). Handles
+/// leading `..` segments and writes the joined, normalised archive
+/// path into `out`. Returns the slice of `out` actually written, or
+/// null if the path doesn't fit. `base_dir` MUST end in '/' for the
+/// segment math to work.
+fn resolveRelArchivePath(base_dir: []const u8, target: []const u8, out: []u8) ?[]const u8 {
+    var written: usize = 0;
+    if (base_dir.len > out.len) return null;
+    @memcpy(out[0..base_dir.len], base_dir);
+    written = base_dir.len;
+
+    var iter = std.mem.splitScalar(u8, target, '/');
+    while (iter.next()) |seg| {
+        if (seg.len == 0) continue; // collapsed `//`
+        if (std.mem.eql(u8, seg, ".")) continue;
+        if (std.mem.eql(u8, seg, "..")) {
+            // Pop one trailing segment off `out`. base_dir must end
+            // in '/'; trim the trailing '/' first, then trim back to
+            // (and drop) the previous '/'.
+            if (written == 0) return null;
+            written -= 1; // drop trailing '/'
+            while (written > 0 and out[written - 1] != '/') written -= 1;
+            continue;
+        }
+        if (written + seg.len > out.len) return null;
+        @memcpy(out[written..][0..seg.len], seg);
+        written += seg.len;
+        if (written == out.len) return null;
+        out[written] = '/';
+        written += 1;
+    }
+    // Trim trailing '/' that we just appended for the final segment.
+    if (written > 0 and out[written - 1] == '/') written -= 1;
+    return out[0..written];
 }
 
 /// Walk a sheet XML's `<hyperlinks>` section, cross-reference each
@@ -2730,11 +2776,14 @@ fn parseCommentsForSheet(book: *Book, sheet_path: []const u8) !void {
     // the relationship Type ending in `/comments` *or* a basename
     // matching `comments[N].xml` — avoids picking up
     // `…/drawings/commentsShape1.vml` or any URL containing the
-    // substring "comments" by accident.
+    // substring "comments" by accident. The returned target is
+    // resolved against `xl/worksheets/` so non-canonical layouts
+    // (e.g. `Target="../threadedComments/comments1.xml"`) keep
+    // their subdir in the archive lookup.
     var comments_xml: ?[]const u8 = null;
-    if (rels_targetForComments(rels_xml)) |basename| {
-        var path_buf: [64]u8 = undefined;
-        const full = std.fmt.bufPrint(&path_buf, "xl/{s}", .{basename}) catch return;
+    if (rels_targetForComments(rels_xml)) |target| {
+        var path_buf: [256]u8 = undefined;
+        const full = resolveRelArchivePath("xl/worksheets/", target, &path_buf) orelse return;
         if (book.comments_data.get(full)) |data| comments_xml = data;
     }
     const cxml = comments_xml orelse return;
@@ -10743,21 +10792,22 @@ test "rels_targetForComments matches by Type or basename, not substring" {
         "<Relationships>" ++
         "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\" Target=\"../comments1.xml\"/>" ++
         "</Relationships>";
-    try std.testing.expectEqualStrings("comments1.xml", rels_targetForComments(ok).?);
+    try std.testing.expectEqualStrings("../comments1.xml", rels_targetForComments(ok).?);
 
-    // Type matches even with a non-canonical basename.
+    // Type matches even with a non-canonical basename — non-basename
+    // path must come back intact so the resolver can keep the subdir.
     const type_only =
         "<Relationships>" ++
-        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\" Target=\"../foo/bar.xml\"/>" ++
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\" Target=\"../threadedComments/comments1.xml\"/>" ++
         "</Relationships>";
-    try std.testing.expectEqualStrings("bar.xml", rels_targetForComments(type_only).?);
+    try std.testing.expectEqualStrings("../threadedComments/comments1.xml", rels_targetForComments(type_only).?);
 
     // Basename matches even if Type is missing/odd.
     const basename_only =
         "<Relationships>" ++
         "<Relationship Id=\"rId1\" Type=\"http://example.com/x\" Target=\"../comments7.xml\"/>" ++
         "</Relationships>";
-    try std.testing.expectEqualStrings("comments7.xml", rels_targetForComments(basename_only).?);
+    try std.testing.expectEqualStrings("../comments7.xml", rels_targetForComments(basename_only).?);
 
     // The substring trap: a hyperlink target containing the literal
     // string "comments" must NOT match. Old logic returned this one.
@@ -10782,7 +10832,37 @@ test "rels_targetForComments matches by Type or basename, not substring" {
         "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"https://example.com/comments\" TargetMode=\"External\"/>" ++
         "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\" Target=\"../comments1.xml\"/>" ++
         "</Relationships>";
-    try std.testing.expectEqualStrings("comments1.xml", rels_targetForComments(trap_then_real).?);
+    try std.testing.expectEqualStrings("../comments1.xml", rels_targetForComments(trap_then_real).?);
+}
+
+test "resolveRelArchivePath joins + normalises ../ segments" {
+    var buf: [256]u8 = undefined;
+
+    // Canonical sheet-rels case: "../comments1.xml" off "xl/worksheets/".
+    try std.testing.expectEqualStrings(
+        "xl/comments1.xml",
+        resolveRelArchivePath("xl/worksheets/", "../comments1.xml", &buf).?,
+    );
+
+    // Non-canonical layout that the broken substring matcher would
+    // have skipped. Now keeps the subdir.
+    try std.testing.expectEqualStrings(
+        "xl/threadedComments/comments1.xml",
+        resolveRelArchivePath("xl/worksheets/", "../threadedComments/comments1.xml", &buf).?,
+    );
+
+    // No leading ../ — Target is taken relative to the worksheet's
+    // own directory.
+    try std.testing.expectEqualStrings(
+        "xl/worksheets/comments1.xml",
+        resolveRelArchivePath("xl/worksheets/", "comments1.xml", &buf).?,
+    );
+
+    // Multiple ../ segments collapse correctly.
+    try std.testing.expectEqualStrings(
+        "comments1.xml",
+        resolveRelArchivePath("xl/worksheets/", "../../comments1.xml", &buf).?,
+    );
 }
 
 test "applyColEditToWorksheet refuses insert that pushes <col> past XFD" {
