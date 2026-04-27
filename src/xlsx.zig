@@ -4496,6 +4496,11 @@ pub const Editor = struct {
         // (delta vs full-buffer); merging them safely needs design
         // work that hasn't shipped. Symmetric guard on `setCell`.
         if (self.pending_mutations.contains(sheet_idx)) return error.SheetHasUnsavedMutations;
+        // Also refuse when a row/col edit is queued for this sheet:
+        // save() runs the row/col substitution first, then the append
+        // pass would overwrite that substituted entry with XML built
+        // from the pre-edit source — silently dropping the edit.
+        if (self.sheetHasPendingRowOrColEdit(sheet_idx)) return error.SheetHasUnsavedRowOrColEdit;
         // Empty append is a documented no-op — recording it as a
         // pending mutation would underflow the row-index math in
         // `buildSubstitutedSheet` (start_row + 0 - 1 = u32.max).
@@ -5200,6 +5205,9 @@ pub const Editor = struct {
     ) !void {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
         if (self.pending_appends.contains(sheet_idx)) return error.SheetHasUnsavedAppends;
+        // Refuse when a row/col edit is queued for this sheet — same
+        // save-order race that affects appendRows.
+        if (self.sheetHasPendingRowOrColEdit(sheet_idx)) return error.SheetHasUnsavedRowOrColEdit;
         if (row == 0 or row > max_row) return error.RowIndexOutOfRange;
         if (col >= max_col_1based) return error.ColumnIndexOutOfRange;
 
@@ -5575,8 +5583,13 @@ pub const Editor = struct {
             self.pending_mutations.count() > 0 or
             self.pending_renames.items.len > 0 or
             self.pending_row_inserts.items.len > 0 or
-            self.pending_row_deletes.items.len > 0)
+            self.pending_row_deletes.items.len > 0 or
+            self.pending_col_inserts.items.len > 0 or
+            self.pending_col_deletes.items.len > 0)
         {
+            // deleteSheet rebuilds sheet_paths; queued row/col edits
+            // hold raw indices into it and would silently point at
+            // the wrong sheet (or out-of-bounds) after the rebuild.
             return error.SheetDeleteRequiresCleanState;
         }
 
@@ -5667,6 +5680,20 @@ pub const Editor = struct {
     /// Phase 3e iter-col-4.
     pub fn deleteColumn(self: *Editor, sheet_idx: u32, col_1based: u32) !void {
         try self.recordColEdit(sheet_idx, col_1based, &self.pending_col_deletes);
+    }
+
+    /// True when `sheet_idx` already has a queued insertRow,
+    /// deleteRow, insertColumn, or deleteColumn. Used by
+    /// appendRows/setCell to refuse mixing with a row/col edit on
+    /// the same sheet — save() applies row/col edits before
+    /// appends/mutations and the latter would otherwise overwrite
+    /// the row/col-substituted entry from pre-edit source XML.
+    fn sheetHasPendingRowOrColEdit(self: *Editor, sheet_idx: u32) bool {
+        for (self.pending_row_inserts.items) |e| if (e.sheet_idx == sheet_idx) return true;
+        for (self.pending_row_deletes.items) |e| if (e.sheet_idx == sheet_idx) return true;
+        for (self.pending_col_inserts.items) |e| if (e.sheet_idx == sheet_idx) return true;
+        for (self.pending_col_deletes.items) |e| if (e.sheet_idx == sheet_idx) return true;
+        return false;
     }
 
     /// Scan every existing worksheet (NOT pending-new sheets, which
@@ -10742,6 +10769,84 @@ test "Editor: insertRow rejects sheets carrying formulas globally" {
     defer ed.deinit();
     try std.testing.expectError(error.RowEditWithFormulasNotSupported, ed.insertRow(0, 1));
     try std.testing.expectError(error.RowEditWithFormulasNotSupported, ed.deleteRow(0, 1));
+}
+
+test "Editor: deleteSheet refuses while column edits are queued" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_delsheet_after_col.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s1 = try w.addSheet("A");
+        try s1.writeRow(&.{.{ .integer = 1 }});
+        var s2 = try w.addSheet("B");
+        try s2.writeRow(&.{.{ .integer = 2 }});
+        try w.save(src_path);
+    }
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    try ed.insertColumn(0, 1);
+    try std.testing.expectError(error.SheetDeleteRequiresCleanState, ed.deleteSheet(1));
+}
+
+test "Editor: deleteSheet refuses while row edits are queued" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_delsheet_after_row.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s1 = try w.addSheet("A");
+        try s1.writeRow(&.{.{ .integer = 1 }});
+        try s1.writeRow(&.{.{ .integer = 2 }});
+        var s2 = try w.addSheet("B");
+        try s2.writeRow(&.{.{ .integer = 3 }});
+        try w.save(src_path);
+    }
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    try ed.insertRow(0, 1);
+    try std.testing.expectError(error.SheetDeleteRequiresCleanState, ed.deleteSheet(1));
+}
+
+test "Editor: appendRows + setCell refuse after queued row/col edit" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_append_after_coledit.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertColumn(0, 1);
+        try std.testing.expectError(
+            error.SheetHasUnsavedRowOrColEdit,
+            ed.appendRows(0, &.{&.{.{ .integer = 99 }}}),
+        );
+        try std.testing.expectError(
+            error.SheetHasUnsavedRowOrColEdit,
+            ed.setCell(0, 5, 0, .{ .integer = 99 }),
+        );
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.deleteRow(0, 1);
+        try std.testing.expectError(
+            error.SheetHasUnsavedRowOrColEdit,
+            ed.appendRows(0, &.{&.{.{ .integer = 99 }}}),
+        );
+        try std.testing.expectError(
+            error.SheetHasUnsavedRowOrColEdit,
+            ed.setCell(0, 5, 0, .{ .integer = 99 }),
+        );
+    }
 }
 
 test "Editor: row edits refuse when ANY sheet has a formula (cross-sheet)" {
