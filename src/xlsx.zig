@@ -5638,13 +5638,16 @@ pub const Editor = struct {
             if (e.sheet_idx == sheet_idx) return error.RowEditRequiresCleanSheet;
         }
 
+        // Pending-new sheets have empty bodies — insertRow/deleteRow
+        // on them is meaningless and the save path can't substitute
+        // a non-existent source ZIP entry. Reject up front.
+        const path = self.sheet_paths[sheet_idx];
+        if (self.findPendingNewSheet(path) != null) return error.RowEditOnNewSheetUnsupported;
+
         // Conservative content guard: scan the worksheet XML for
         // elements that v1 doesn't rewrite. If any are present,
         // refuse rather than silently corrupt the workbook.
-        const path = self.sheet_paths[sheet_idx];
-        if (self.findPendingNewSheet(path)) |_| {
-            // New sheet: empty body, no risky elements.
-        } else if (findEntryByName(self.entries, path)) |entry_idx| {
+        if (findEntryByName(self.entries, path)) |entry_idx| {
             const e = self.entries[entry_idx];
             const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
             const xml = try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
@@ -5653,6 +5656,7 @@ pub const Editor = struct {
                 "<hyperlinks",
                 "<dataValidations",
                 "<conditionalFormatting",
+                "<autoFilter",
                 "<f>",
                 "<f ",
                 "<f/",
@@ -6945,7 +6949,13 @@ fn processMergeCellTag(
     }
     const ref = r_attr.?;
     const colon = std.mem.indexOfScalar(u8, ref, ':') orelse {
-        // Single-cell merge — same logic as <c> ref.
+        // Single-cell merge. On delete-match, drop the entire tag
+        // so it doesn't transfer onto whatever shifts into the
+        // deleted row.
+        if (kind == .delete) {
+            const tl_row = parseRowFromA1(ref) orelse 0;
+            if (tl_row == row) return; // drop tag entirely
+        }
         var new_ref_buf: [16]u8 = undefined;
         const new_ref = shiftSingleA1(ref, row, kind, &new_ref_buf) catch {
             try out.appendSlice(allocator, src[t.start..t.after_open]);
@@ -6958,6 +6968,14 @@ fn processMergeCellTag(
         try writeWithReplacedAttr(allocator, out, src, t, "<mergeCell".len, "ref", new_ref);
         return;
     };
+    // Rectangle merge. On delete, if BOTH the top-left and
+    // bottom-right rows equal the deleted row, the entire merge
+    // is on the dead row — drop the tag.
+    if (kind == .delete) {
+        const tl_row = parseRowFromA1(ref[0..colon]) orelse 0;
+        const br_row = parseRowFromA1(ref[colon + 1 ..]) orelse 0;
+        if (tl_row == row and br_row == row) return;
+    }
     var tl_buf: [16]u8 = undefined;
     var br_buf: [16]u8 = undefined;
     const tl_new = shiftSingleA1(ref[0..colon], row, kind, &tl_buf) catch {
@@ -6975,6 +6993,15 @@ fn processMergeCellTag(
         return;
     }
     try writeWithReplacedAttr(allocator, out, src, t, "<mergeCell".len, "ref", new_ref);
+}
+
+/// Parse the row component (digits) from an A1-style ref. Returns
+/// null on malformed input.
+fn parseRowFromA1(ref: []const u8) ?u32 {
+    var letters_end: usize = 0;
+    while (letters_end < ref.len and ref[letters_end] >= 'A' and ref[letters_end] <= 'Z') letters_end += 1;
+    if (letters_end == 0 or letters_end == ref.len) return null;
+    return std.fmt.parseInt(u32, ref[letters_end..], 10) catch null;
 }
 
 fn processDimensionTag(
