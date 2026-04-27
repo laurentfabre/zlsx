@@ -4009,6 +4009,58 @@ fn materialiseSstEntry(book: *Book, idx: usize) ![]const u8 {
 /// byte-identically; future iters (iter-lms-2+) replace specific
 /// entries with mutated copies.
 ///
+/// Byte span of a `<c>` element in a worksheet's decompressed XML.
+/// Produced by `Editor.scanWorksheet` (Phase 3d, iter-cm-1) — the
+/// foundation for cell-mutate. iter-cm-2's `setCell` will use these
+/// to splice replacement bytes in place without disturbing
+/// surrounding `<f>` formulas, `<is>` inline strings, phonetic
+/// hints, or unknown attributes/children.
+pub const CellSpan = struct {
+    /// Byte offset of `<` opening the `<c` tag (in the parent
+    /// `WorksheetSpans.xml` slice).
+    start: usize,
+    /// Byte offset just past `</c>` for body cells, or just past
+    /// `/>` for self-closing cells.
+    end: usize,
+    /// Byte offset just past `>` of the opening tag (== `end` for
+    /// self-closing cells). The slice `xml[body_start..close]` is
+    /// the body content (`<v>...</v>`, `<f>...</f><v>...</v>`,
+    /// `<is>...</is>`, etc.) where `close = end - 4` for `</c>`
+    /// or `end` for self-closing.
+    body_start: usize,
+    /// 1-based row number resolved from `<row r="N">` (with
+    /// implicit-row fallback) AND from `<c r="A1">` (with
+    /// implicit-column fallback per iter-impl-col).
+    row: u32,
+    /// 0-based column index (A=0).
+    col: u32,
+};
+
+/// Read-only span index over a worksheet's `<c>` elements. The
+/// decompressed sheet XML and the cells slice are both owned;
+/// `deinit` frees both.
+pub const WorksheetSpans = struct {
+    allocator: Allocator,
+    /// Decompressed sheet XML. Owned — freed by `deinit`.
+    xml: []const u8,
+    /// Every `<c>` span, in source order. Owned.
+    cells: []const CellSpan,
+
+    pub fn deinit(self: *WorksheetSpans) void {
+        self.allocator.free(self.xml);
+        self.allocator.free(self.cells);
+        self.* = undefined;
+    }
+
+    /// Find the span for `(row, col)`. Linear scan — fine for
+    /// iter-cm-1's read-only use. iter-cm-2 will add a row-index
+    /// hashmap when bulk mutation needs O(log N) lookups.
+    pub fn find(self: *const WorksheetSpans, row: u32, col: u32) ?CellSpan {
+        for (self.cells) |s| if (s.row == row and s.col == col) return s;
+        return null;
+    }
+};
+
 /// Lifetime: the source buffer + entry table are held resident;
 /// `deinit` frees both. Single-threaded per Editor instance, matching
 /// the rest of zlsx.
@@ -4647,7 +4699,133 @@ pub const Editor = struct {
 
         try atomic_file.finish();
     }
+
+    /// Decompress sheet `sheet_idx` and walk its `<c>` elements,
+    /// returning a `WorksheetSpans` index over every cell. The
+    /// foundation for Phase 3d cell-mutate (iter-cm-1) — read-only
+    /// today; iter-cm-2 builds `setCell` on top.
+    ///
+    /// The returned `xml` + `cells` borrow the same allocation;
+    /// caller frees both via `WorksheetSpans.deinit`. Scans are
+    /// independent (no caching yet) — repeated calls re-decompress.
+    pub fn scanWorksheet(self: *Editor, sheet_idx: u32) !WorksheetSpans {
+        if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
+        const path = self.sheet_paths[sheet_idx];
+        const entry_idx = findEntryByName(self.entries, path) orelse
+            return error.SheetEntryNotFound;
+        const entry = self.entries[entry_idx];
+        const payload = self.src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
+        const xml = try decompressZipPayload(
+            self.allocator,
+            payload,
+            entry.compression_method,
+            entry.uncompressed_size,
+        );
+        errdefer self.allocator.free(xml);
+        const cells = try scanWorksheetXml(self.allocator, xml);
+        return .{ .allocator = self.allocator, .xml = xml, .cells = cells };
+    }
 };
+
+/// Walk worksheet XML and emit a span per `<c>` element. Pure
+/// function — no allocator state beyond the returned slice. Mirrors
+/// the row/cell parser in `Rows.next` but records byte offsets
+/// instead of decoding values.
+fn scanWorksheetXml(allocator: Allocator, xml: []const u8) ![]CellSpan {
+    var out: std.ArrayListUnmanaged(CellSpan) = .{};
+    errdefer out.deinit(allocator);
+
+    var pos: usize = 0;
+    var implicit_row: u32 = 0;
+
+    while (findTagOpen(xml, pos, "row")) |row_tag| {
+        const row_attrs = xml[row_tag.start + "<row".len .. row_tag.after_open - 1];
+        const row_attrs_trim = std.mem.trimRight(u8, row_attrs, " \t\r\n");
+        const is_self_closing_row = row_attrs_trim.len > 0 and
+            row_attrs_trim[row_attrs_trim.len - 1] == '/';
+        const row_attrs_for_lookup = if (is_self_closing_row)
+            row_attrs_trim[0 .. row_attrs_trim.len - 1]
+        else
+            row_attrs_trim;
+
+        implicit_row += 1;
+        const row_num: u32 = blk: {
+            if (getAttr(row_attrs_for_lookup, "r")) |r_str| {
+                const parsed = std.fmt.parseInt(u32, r_str, 10) catch 0;
+                if (parsed > 0) break :blk parsed;
+            }
+            break :blk implicit_row;
+        };
+
+        if (is_self_closing_row) {
+            pos = row_tag.after_open;
+            continue;
+        }
+
+        var implicit_col: u32 = 0;
+        var cur = row_tag.after_open;
+        while (true) {
+            const next_lt = std.mem.indexOfScalarPos(u8, xml, cur, '<') orelse
+                return error.MalformedXml;
+            cur = next_lt;
+            if (std.mem.startsWith(u8, xml[cur..], "</row>")) {
+                cur += "</row>".len;
+                break;
+            }
+            // Match `<c` only when followed by space, `/`, or `>` —
+            // otherwise we'd match `<col>` / `<choose>` / etc.
+            const after_c = cur + 2;
+            const is_c_open = cur + 2 <= xml.len and
+                xml[cur + 1] == 'c' and
+                after_c < xml.len and
+                (xml[after_c] == ' ' or xml[after_c] == '\t' or
+                    xml[after_c] == '/' or xml[after_c] == '>');
+            if (!is_c_open) {
+                const gt = std.mem.indexOfScalarPos(u8, xml, cur, '>') orelse
+                    return error.MalformedXml;
+                cur = gt + 1;
+                continue;
+            }
+
+            const c_start = cur;
+            const gt = std.mem.indexOfScalarPos(u8, xml, cur, '>') orelse
+                return error.MalformedXml;
+            const is_self_closing = gt > 0 and xml[gt - 1] == '/';
+            const attrs = xml[c_start + 2 .. if (is_self_closing) gt - 1 else gt];
+
+            const col: u32 = blk: {
+                if (getAttr(attrs, "r")) |r_attr| {
+                    const c_idx = columnIndexFromRef(r_attr) catch
+                        return error.MalformedXml;
+                    break :blk std.math.cast(u32, c_idx) orelse
+                        return error.MalformedXml;
+                }
+                break :blk implicit_col;
+            };
+            implicit_col = std.math.cast(u32, @as(u64, col) + 1) orelse
+                return error.MalformedXml;
+
+            const c_end = if (is_self_closing) gt + 1 else blk: {
+                const close_pos = std.mem.indexOfPos(u8, xml, gt + 1, "</c>") orelse
+                    return error.MalformedXml;
+                break :blk close_pos + "</c>".len;
+            };
+
+            try out.append(allocator, .{
+                .start = c_start,
+                .end = c_end,
+                .body_start = gt + 1,
+                .row = row_num,
+                .col = col,
+            });
+
+            cur = c_end;
+        }
+        pos = cur;
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
 
 /// New LFH + payload + CDFH bytes for a sheet entry that's been
 /// modified by `appendRows`. Owned by the caller; freed on
@@ -6561,6 +6739,101 @@ test "Editor: SST-less workbook gets fresh sharedStrings.xml on string append" {
     // substitute-existing path (which would have surfaced the
     // source's SST entries first).
     try std.testing.expectEqual(@as(usize, 2), book.sharedStringsCount());
+}
+
+test "Editor: scanWorksheet returns one span per <c> element (iter-cm-1)" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_scan_basic.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{ .{ .string = "h1" }, .{ .string = "h2" }, .{ .string = "h3" } });
+        try s.writeRow(&.{ .{ .integer = 1 }, .{ .number = 2.5 }, .{ .boolean = true } });
+        try s.writeRow(&.{ .{ .string = "x" }, .{ .empty = {} }, .{ .integer = 99 } });
+        try w.save(src_path);
+    }
+
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+
+    var spans = try ed.scanWorksheet(0);
+    defer spans.deinit();
+
+    // Empty cells aren't emitted as `<c>` by the writer, so row 3
+    // contributes 2 spans (col A + col C); rows 1 and 2 contribute
+    // 3 each. 3 + 3 + 2 = 8.
+    try std.testing.expectEqual(@as(usize, 8), spans.cells.len);
+
+    // Spot-check a few (row, col) pairs and the body-vs-end invariant.
+    const a1 = spans.find(1, 0) orelse return error.A1Missing;
+    const c3 = spans.find(3, 2) orelse return error.C3Missing;
+    try std.testing.expect(a1.start < a1.body_start);
+    try std.testing.expect(a1.body_start <= a1.end);
+    try std.testing.expect(c3.row == 3 and c3.col == 2);
+
+    // The byte slice xml[start..end] must be a valid `<c …>…</c>`
+    // (or self-closing `<c …/>`) substring.
+    for (spans.cells) |s| {
+        try std.testing.expect(std.mem.startsWith(u8, spans.xml[s.start..], "<c"));
+        try std.testing.expect(s.end <= spans.xml.len);
+    }
+}
+
+test "Editor: scanWorksheet (row,col) matches Book.rows on every cell" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_scan_roundtrip.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{ .{ .string = "name" }, .{ .string = "qty" }, .{ .string = "ok" } });
+        try s.writeRow(&.{ .{ .string = "alpha" }, .{ .integer = 10 }, .{ .boolean = true } });
+        try s.writeRow(&.{ .{ .string = "beta" }, .{ .integer = 20 }, .{ .boolean = false } });
+        try s.writeRow(&.{ .{ .string = "gamma" }, .{ .empty = {} }, .{ .boolean = true } });
+        try w.save(src_path);
+    }
+
+    // Read the source via the Editor scanner.
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    var spans = try ed.scanWorksheet(0);
+    defer spans.deinit();
+
+    // Read the same file through Book.rows; every non-empty cell
+    // must have a matching span at the same (row, col).
+    var book = try Book.open(std.testing.allocator, src_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    var row_idx: u32 = 1;
+    while (try rows.next()) |row| : (row_idx += 1) {
+        for (row, 0..) |cell, col| {
+            if (cell == .empty) continue;
+            const found = spans.find(row_idx, @intCast(col));
+            try std.testing.expect(found != null);
+        }
+    }
+}
+
+test "Editor: scanWorksheet rejects out-of-range sheet idx" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_scan_oor.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    try std.testing.expectError(error.SheetIndexOutOfRange, ed.scanWorksheet(99));
 }
 
 test "buildFreshSstXml round-trips through the reader's parser" {

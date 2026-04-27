@@ -360,6 +360,38 @@ test "adversarial: calamine fixtures (encoded entities, empty SI, etc.)" {
     }
 }
 
+test "Editor.scanWorksheet (iter-cm-1): every Book.rows cell has a matching span" {
+    // Phase 3d foundation. Walk worldbank_catalog through the new
+    // span scanner; every non-empty cell that Book.rows surfaces
+    // must have a matching CellSpan at the same (row, col).
+    const alloc = std.testing.allocator;
+    const path = corpus_dir ++ "worldbank_catalog.xlsx";
+    var ed = try xlsx.Editor.open(alloc, path);
+    defer ed.deinit();
+    var spans = try ed.scanWorksheet(0);
+    defer spans.deinit();
+
+    var book = try xlsx.Book.open(alloc, path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], alloc);
+    defer rows.deinit();
+
+    var row_idx: u32 = 1;
+    var checked: usize = 0;
+    while (try rows.next()) |row| : (row_idx += 1) {
+        for (row, 0..) |cell, col| {
+            if (cell == .empty) continue;
+            const found = spans.find(row_idx, @intCast(col));
+            try std.testing.expect(found != null);
+            checked += 1;
+        }
+    }
+    // The fixture has 161 rows × 26 cols with sparse blanks; we
+    // should be checking thousands of cells. If this drops to a
+    // suspiciously small number, the row iterator changed shape.
+    try std.testing.expect(checked >= 2000);
+}
+
 test "corpus surface: iter28-34 reader APIs round-trip on real fixtures" {
     // The per-cell style / font / fill / border / numFmt / rich-runs /
     // comments APIs were added in iter28-34 but their tests use
