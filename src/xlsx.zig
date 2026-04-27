@@ -942,27 +942,10 @@ pub const Book = struct {
     /// Idempotent: repeated calls are a hashmap hit.
     fn ensureCommentsLoadedForSheet(self: *Book, sheet_path: []const u8) !void {
         const rels_xml = self.sheet_rels_data.get(sheet_path) orelse return;
-
-        // Scan the rels file for a Target ending in /comments*.xml —
-        // same rule as `parseCommentsForSheet`. We only need to walk
-        // until we find the first one (a sheet carries at most one
-        // comments part).
-        const target_key = "Target=\"";
-        var i: usize = 0;
-        while (std.mem.indexOfPos(u8, rels_xml, i, target_key)) |tp| {
-            const s = tp + target_key.len;
-            const e = std.mem.indexOfScalarPos(u8, rels_xml, s, '"') orelse return;
-            i = e + 1;
-            const target = rels_xml[s..e];
-            if (std.mem.indexOf(u8, target, "comments") == null) continue;
-            const basename = if (std.mem.lastIndexOfScalar(u8, target, '/')) |slash|
-                target[slash + 1 ..]
-            else
-                target;
+        if (rels_targetForComments(rels_xml)) |basename| {
             var path_buf: [64]u8 = undefined;
             const full = std.fmt.bufPrint(&path_buf, "xl/{s}", .{basename}) catch return;
             try self.ensureCommentsLoaded(full);
-            return;
         }
     }
 
@@ -2508,6 +2491,58 @@ fn findRelTarget(rels_xml: []const u8, rid: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Find the comments part referenced by a sheet's rels XML. Returns
+/// the basename of the first `Relationship` whose `Type` ends in
+/// `/comments` OR whose `Target` basename matches `comments[N].xml`.
+/// Both criteria are robust against accidentally matching a stray
+/// `Target` like `https://host/comments` or `commentsShape1.vml`,
+/// which the previous substring scan would happily accept.
+fn rels_targetForComments(rels_xml: []const u8) ?[]const u8 {
+    var probe: usize = 0;
+    while (std.mem.indexOfPos(u8, rels_xml, probe, "<Relationship")) |start| {
+        const end = std.mem.indexOfScalarPos(u8, rels_xml, start, '>') orelse return null;
+        const attrs = rels_xml[start..end];
+        probe = end + 1;
+
+        const tgt_key = "Target=\"";
+        const tgt_pos = std.mem.indexOf(u8, attrs, tgt_key) orelse continue;
+        const tgt_start = tgt_pos + tgt_key.len;
+        const tgt_close = std.mem.indexOfScalarPos(u8, attrs, tgt_start, '"') orelse continue;
+        const target = attrs[tgt_start..tgt_close];
+
+        const type_key = "Type=\"";
+        const type_attr: ?[]const u8 = blk: {
+            const tp = std.mem.indexOf(u8, attrs, type_key) orelse break :blk null;
+            const ts = tp + type_key.len;
+            const tc = std.mem.indexOfScalarPos(u8, attrs, ts, '"') orelse break :blk null;
+            break :blk attrs[ts..tc];
+        };
+
+        const type_matches = if (type_attr) |t|
+            std.mem.endsWith(u8, t, "/comments") or std.mem.endsWith(u8, t, "/relationships/comments")
+        else
+            false;
+
+        const basename = if (std.mem.lastIndexOfScalar(u8, target, '/')) |slash|
+            target[slash + 1 ..]
+        else
+            target;
+
+        // Basename test: starts with "comments" + [digits] + ".xml".
+        const basename_matches = blk: {
+            if (!std.mem.startsWith(u8, basename, "comments")) break :blk false;
+            if (!std.mem.endsWith(u8, basename, ".xml")) break :blk false;
+            const middle = basename["comments".len .. basename.len - ".xml".len];
+            if (middle.len == 0) break :blk true;
+            for (middle) |c| if (c < '0' or c > '9') break :blk false;
+            break :blk true;
+        };
+
+        if (type_matches or basename_matches) return basename;
+    }
+    return null;
+}
+
 /// Walk a sheet XML's `<hyperlinks>` section, cross-reference each
 /// `r:id` against the sheet's rels file, and collect resolved entries
 /// into `book.hyperlinks_by_sheet`. No-op when the sheet has no
@@ -2543,6 +2578,11 @@ fn parseHyperlinksForSheet(book: *Book, sheet_path: []const u8, xml: []const u8)
         // Prefer external (r:id) when both are present — a valid OOXML
         // entry has one or the other, but defensive ordering keeps us
         // working on workbooks that generate both by mistake.
+        // URLs and locations may carry XML entities (`&amp;`, `&apos;`,
+        // …); decode them through `decodeFormulaInto` so callers get
+        // the real target. The helper returns a zero-copy slice when
+        // there are no entities and an arena-owned decoded copy when
+        // there are.
         var url: []const u8 = "";
         var location: []const u8 = "";
         if (std.mem.indexOf(u8, attrs, "r:id=\"")) |rid_pos| {
@@ -2550,14 +2590,15 @@ fn parseHyperlinksForSheet(book: *Book, sheet_path: []const u8, xml: []const u8)
             const rid_close = std.mem.indexOfScalarPos(u8, attrs, rid_start, '"') orelse continue;
             const rid = attrs[rid_start..rid_close];
             if (rels_xml) |rx| {
-                url = findRelTarget(rx, rid) orelse continue;
+                const raw = findRelTarget(rx, rid) orelse continue;
+                url = try decodeFormulaInto(book, raw);
             } else {
                 continue;
             }
         } else if (std.mem.indexOf(u8, attrs, "location=\"")) |loc_pos| {
             const loc_start = loc_pos + "location=\"".len;
             const loc_close = std.mem.indexOfScalarPos(u8, attrs, loc_start, '"') orelse continue;
-            location = attrs[loc_start..loc_close];
+            location = try decodeFormulaInto(book, attrs[loc_start..loc_close]);
         } else {
             // Neither r:id nor location — malformed, skip.
             continue;
@@ -2685,30 +2726,16 @@ fn decodeFormulaInto(book: *Book, raw: []const u8) ![]const u8 {
 fn parseCommentsForSheet(book: *Book, sheet_path: []const u8) !void {
     const rels_xml = book.sheet_rels_data.get(sheet_path) orelse return;
 
-    // Scan rels for a Target whose path ends with /comments*.xml.
-    // OOXML uses a relationship Type of ".../relationships/comments"
-    // but a Target suffix match is robust enough for our needs.
-    const target_key = "Target=\"";
+    // Resolve via the shared rels-target helper, which only matches
+    // the relationship Type ending in `/comments` *or* a basename
+    // matching `comments[N].xml` — avoids picking up
+    // `…/drawings/commentsShape1.vml` or any URL containing the
+    // substring "comments" by accident.
     var comments_xml: ?[]const u8 = null;
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, rels_xml, i, target_key)) |tp| {
-        const s = tp + target_key.len;
-        const e = std.mem.indexOfScalarPos(u8, rels_xml, s, '"') orelse break;
-        i = e + 1;
-        const target = rels_xml[s..e];
-        if (std.mem.indexOf(u8, target, "comments") == null) continue;
-        // Targets in sheet rels are typically "../comments1.xml" —
-        // normalise to "xl/comments1.xml" for the map lookup.
-        const basename = if (std.mem.lastIndexOfScalar(u8, target, '/')) |slash|
-            target[slash + 1 ..]
-        else
-            target;
+    if (rels_targetForComments(rels_xml)) |basename| {
         var path_buf: [64]u8 = undefined;
-        const full = std.fmt.bufPrint(&path_buf, "xl/{s}", .{basename}) catch continue;
-        if (book.comments_data.get(full)) |data| {
-            comments_xml = data;
-            break;
-        }
+        const full = std.fmt.bufPrint(&path_buf, "xl/{s}", .{basename}) catch return;
+        if (book.comments_data.get(full)) |data| comments_xml = data;
     }
     const cxml = comments_xml orelse return;
 
@@ -9347,11 +9374,9 @@ test "Book.hyperlinks: round-trip through writer + reader" {
     // rId1 → A1 single cell → top_left == bottom_right.
     try std.testing.expectEqualDeep(CellRef{ .col = 0, .row = 1 }, links[0].top_left);
     try std.testing.expectEqualDeep(CellRef{ .col = 0, .row = 1 }, links[0].bottom_right);
-    // Writer xml-escapes `&` to `&amp;` on emit; reader must NOT
-    // un-escape here — the contract is that `url` is the raw
-    // `Target` attribute, and entity decoding on URLs is a caller
-    // decision (they round-trip fine through every major consumer).
-    try std.testing.expectEqualStrings("https://example.com/path?q=1&amp;x=2", links[0].url);
+    // Writer xml-escapes `&` to `&amp;` on emit; reader decodes it
+    // back so callers can use the URL as-is without re-decoding.
+    try std.testing.expectEqualStrings("https://example.com/path?q=1&x=2", links[0].url);
 
     try std.testing.expectEqualDeep(CellRef{ .col = 1, .row = 2 }, links[1].top_left);
     try std.testing.expectEqualDeep(CellRef{ .col = 2, .row = 3 }, links[1].bottom_right);
@@ -10710,6 +10735,54 @@ test "applyRowEditToWorksheet: delete drops the row's <row> block" {
     try std.testing.expect(std.mem.indexOf(u8, out, "<row r=\"2\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "<row r=\"3\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "r=\"A2\"") != null);
+}
+
+test "rels_targetForComments matches by Type or basename, not substring" {
+    // Real comments rel — should be picked up.
+    const ok =
+        "<Relationships>" ++
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\" Target=\"../comments1.xml\"/>" ++
+        "</Relationships>";
+    try std.testing.expectEqualStrings("comments1.xml", rels_targetForComments(ok).?);
+
+    // Type matches even with a non-canonical basename.
+    const type_only =
+        "<Relationships>" ++
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\" Target=\"../foo/bar.xml\"/>" ++
+        "</Relationships>";
+    try std.testing.expectEqualStrings("bar.xml", rels_targetForComments(type_only).?);
+
+    // Basename matches even if Type is missing/odd.
+    const basename_only =
+        "<Relationships>" ++
+        "<Relationship Id=\"rId1\" Type=\"http://example.com/x\" Target=\"../comments7.xml\"/>" ++
+        "</Relationships>";
+    try std.testing.expectEqualStrings("comments7.xml", rels_targetForComments(basename_only).?);
+
+    // The substring trap: a hyperlink target containing the literal
+    // string "comments" must NOT match. Old logic returned this one.
+    const trap =
+        "<Relationships>" ++
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"https://example.com/comments\" TargetMode=\"External\"/>" ++
+        "</Relationships>";
+    try std.testing.expect(rels_targetForComments(trap) == null);
+
+    // VML drawing whose basename happens to start with "comments"
+    // but isn't .xml — also must not match.
+    const drawing_trap =
+        "<Relationships>" ++
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing\" Target=\"../drawings/commentsShape1.vml\"/>" ++
+        "</Relationships>";
+    try std.testing.expect(rels_targetForComments(drawing_trap) == null);
+
+    // Real comments rel sitting AFTER a substring trap — must be
+    // picked up despite the trap appearing first.
+    const trap_then_real =
+        "<Relationships>" ++
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"https://example.com/comments\" TargetMode=\"External\"/>" ++
+        "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\" Target=\"../comments1.xml\"/>" ++
+        "</Relationships>";
+    try std.testing.expectEqualStrings("comments1.xml", rels_targetForComments(trap_then_real).?);
 }
 
 test "applyColEditToWorksheet refuses insert that pushes <col> past XFD" {
@@ -12289,10 +12362,10 @@ test "Book.hyperlinks: internal hyperlinks (location) round-trip + mixed externa
     try std.testing.expectEqualDeep(CellRef{ .col = 0, .row = 1 }, links[1].top_left);
 
     try std.testing.expectEqualStrings("", links[2].url);
-    // Writer xml-escapes `'` → `&apos;` on emit; reader preserves the
-    // raw attribute bytes (matches the `url` contract for external
-    // hyperlinks — decoding is the caller's choice).
-    try std.testing.expectEqualStrings("&apos;Main&apos;!B2", links[2].location);
+    // Writer xml-escapes `'` → `&apos;` on emit; reader decodes it
+    // back so callers see the real target. Same contract for url +
+    // location now.
+    try std.testing.expectEqualStrings("'Main'!B2", links[2].location);
     try std.testing.expectEqualDeep(CellRef{ .col = 1, .row = 2 }, links[2].top_left);
     try std.testing.expectEqualDeep(CellRef{ .col = 2, .row = 2 }, links[2].bottom_right);
 }

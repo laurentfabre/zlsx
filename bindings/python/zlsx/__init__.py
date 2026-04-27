@@ -297,15 +297,16 @@ class MergeRange:
 @dataclass(frozen=True)
 class Hyperlink:
     """An external-URL or internal-target hyperlink attached to a
-    cell or cell range. ``url`` is the raw ``Target`` attribute from
-    the sheet's rels file — XML entities like ``&amp;`` are
-    preserved, so the URL round-trips byte-for-byte through
-    save/reopen. ``location`` carries the internal target (e.g.
-    ``"Sheet2!A1"``) for `<hyperlink location="…"/>` entries; it is
+    cell or cell range. ``url`` is the resolved ``Target`` from the
+    sheet's rels file with XML entities decoded (``&amp;`` → ``&``,
+    ``&apos;`` → ``'``, etc.) — ready to use as-is. ``location``
+    carries the internal target (e.g. ``"Sheet2!A1"``) for
+    ``<hyperlink location="…"/>`` entries (also decoded); it is
     empty for external links. Exactly one of ``url`` / ``location``
     is non-empty for any well-formed source. Requires libzlsx
     0.2.7+ to populate ``location`` — older dylibs leave it
-    empty."""
+    empty; libzlsx 0.2.10+ decodes XML entities (older dylibs
+    surfaced the raw escaped form)."""
     top_left: CellRef
     bottom_right: CellRef
     url: str
