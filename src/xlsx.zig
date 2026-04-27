@@ -5311,8 +5311,19 @@ pub const Editor = struct {
             current_rid_owned = true;
         }
 
-        // No-op (case-insensitive same name).
-        if (writer_mod.asciiEqlFold(current_name, new_name)) return;
+        // No-op short-circuit: only when the EFFECTIVE current name
+        // (taking pending renames into account) equals the new name
+        // BYTE-EXACT. asciiEqlFold here would silently drop legit
+        // case-only renames; loading current_name from workbook.xml
+        // would silently drop a same-session "rename back to
+        // original" (`A->B` then `B->A`).
+        const eff_current: []const u8 = blk: {
+            for (self.pending_renames.items) |r| {
+                if (r.sheet_idx == sheet_idx) break :blk r.new_name;
+            }
+            break :blk current_name;
+        };
+        if (std.mem.eql(u8, eff_current, new_name)) return;
 
         // Reject duplicates against every OTHER sheet's effective
         // name. "Effective" lets `A->C` then `B->A` work because
@@ -8884,6 +8895,59 @@ test "Editor: renameSheet rejects duplicates and invalid names" {
     try std.testing.expectError(error.DuplicateSheetName, ed.renameSheet(0, "second"));
     // Out-of-range.
     try std.testing.expectError(error.SheetIndexOutOfRange, ed.renameSheet(99, "Foo"));
+}
+
+test "Editor: renameSheet supports undo (rename A->B then B->A)" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_rename_undo.xlsx";
+    const dst_path = "/tmp/zlsx_rename_undo_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Original");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.renameSheet(0, "Renamed");
+        // Now revert. Pre-fix this was silently dropped.
+        try ed.renameSheet(0, "Original");
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    try std.testing.expectEqualStrings("Original", book.sheets[0].name);
+}
+
+test "Editor: renameSheet persists case-only changes" {
+    // Excel uniqueness is case-insensitive but the displayed
+    // casing matters. asciiEqlFold short-circuit dropped legit
+    // case-only renames pre-fix.
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_rename_case.xlsx";
+    const dst_path = "/tmp/zlsx_rename_case_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("sheet1");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.renameSheet(0, "Sheet1");
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    try std.testing.expectEqualStrings("Sheet1", book.sheets[0].name);
 }
 
 test "Editor: rename + add reuses names freed by earlier renames" {
