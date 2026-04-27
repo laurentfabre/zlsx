@@ -6855,6 +6855,7 @@ fn processRowTag(
     if (old_r) |r_val| {
         switch (kind) {
             .insert => if (r_val >= row) {
+                if (r_val >= max_row) return error.RowEditExceedsMaxRow;
                 new_r = r_val + 1;
             },
             .delete => if (r_val == row) {
@@ -6929,6 +6930,7 @@ fn processCellTag(
     var new_row: u32 = old_row;
     switch (kind) {
         .insert => if (old_row >= row) {
+            if (old_row >= max_row) return error.RowEditExceedsMaxRow;
             new_row = old_row + 1;
         },
         .delete => if (old_row > row) {
@@ -7076,11 +7078,20 @@ fn shiftSingleA1(ref: []const u8, row: u32, kind: RowEditKind, buf: *[16]u8, is_
     var new_row: u32 = old_row;
     switch (kind) {
         .insert => if (old_row >= row) {
+            // Cap at Excel's max row (1_048_576). If a shift would
+            // overflow, refuse the entire edit — saving an invalid
+            // workbook is worse than a typed error at the call
+            // site (recordRowEdit catches the propagation).
+            if (old_row >= max_row) return error.RowEditExceedsMaxRow;
             new_row = old_row + 1;
         },
         .delete => if (old_row > row) {
             new_row = old_row - 1;
-        } else if (old_row == row and is_br_corner and old_row > 0) {
+        } else if (old_row == row and is_br_corner and old_row > 1) {
+            // BR shrink: don't go below row 1. If the entire range
+            // collapses to row 0 we'd produce invalid XML; leaving
+            // it at row 1 keeps the dimension valid (Excel will
+            // recompute on next save anyway).
             new_row = old_row - 1;
         },
     }
