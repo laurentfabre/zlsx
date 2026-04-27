@@ -2563,19 +2563,23 @@ fn rels_targetForComments(rels_xml: []const u8) ?[]const u8 {
 /// returned with the leading `/` stripped, NOT joined to `base_dir`
 /// — that's how `parseWorkbookSheets` already treats them.
 fn resolveRelArchivePath(base_dir: []const u8, target: []const u8, out: []u8) ?[]const u8 {
+    // Absolute (package-rooted) targets use no base. They still flow
+    // through the segment normalisation loop so dot segments inside
+    // an absolute path collapse correctly (e.g.
+    // `/xl/worksheets/../comments1.xml` → `xl/comments1.xml`).
+    var effective_base: []const u8 = base_dir;
+    var effective_target: []const u8 = target;
     if (target.len > 0 and target[0] == '/') {
-        const stripped = target[1..];
-        if (stripped.len > out.len) return null;
-        @memcpy(out[0..stripped.len], stripped);
-        return out[0..stripped.len];
+        effective_base = "";
+        effective_target = target[1..];
     }
 
     var written: usize = 0;
-    if (base_dir.len > out.len) return null;
-    @memcpy(out[0..base_dir.len], base_dir);
-    written = base_dir.len;
+    if (effective_base.len > out.len) return null;
+    @memcpy(out[0..effective_base.len], effective_base);
+    written = effective_base.len;
 
-    var iter = std.mem.splitScalar(u8, target, '/');
+    var iter = std.mem.splitScalar(u8, effective_target, '/');
     while (iter.next()) |seg| {
         if (seg.len == 0) continue; // collapsed `//`
         if (std.mem.eql(u8, seg, ".")) continue;
@@ -10880,6 +10884,12 @@ test "resolveRelArchivePath joins + normalises ../ segments" {
     try std.testing.expectEqualStrings(
         "xl/comments1.xml",
         resolveRelArchivePath("xl/worksheets/", "/xl/comments1.xml", &buf).?,
+    );
+
+    // Absolute target with dot segments must still normalise.
+    try std.testing.expectEqualStrings(
+        "xl/comments1.xml",
+        resolveRelArchivePath("xl/worksheets/", "/xl/worksheets/../comments1.xml", &buf).?,
     );
 }
 
