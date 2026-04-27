@@ -4106,6 +4106,12 @@ pub const Editor = struct {
     /// by name (`'OLD'!A1`) are NOT rewritten — that requires a
     /// formula tokenizer (iter-col-1).
     pending_renames: std.ArrayListUnmanaged(SheetRename),
+    /// Pending sheet deletions (Phase 3e iter-sheet-3). Each entry
+    /// drops the matching ZIP entry at save + patches workbook.xml,
+    /// rels, Content_Types. Cross-sheet formula refs to the deleted
+    /// sheet become `#REF!` until the iter-col-1 formula tokenizer
+    /// ships.
+    pending_deletes: std.ArrayListUnmanaged(SheetDelete),
 
     /// Pending in-place cell mutations per sheet (Phase 3d / iter-cm-2).
     /// Each entry holds the decompressed-and-mutated worksheet XML
@@ -4134,6 +4140,17 @@ pub const Editor = struct {
         pub fn deinit(self: *MutatedSheet, allocator: Allocator) void {
             self.xml.deinit(allocator);
             self.spans.deinit(allocator);
+        }
+    };
+
+    /// State for one Phase 3e (iter-sheet-3) sheet deletion.
+    pub const SheetDelete = struct {
+        path: []u8, // owned
+        rid: []u8, // owned
+
+        pub fn deinit(self: *SheetDelete, alloc: Allocator) void {
+            alloc.free(self.path);
+            alloc.free(self.rid);
         }
     };
 
@@ -4385,6 +4402,7 @@ pub const Editor = struct {
             .pending_mutations = .{},
             .pending_new_sheets = .{},
             .pending_renames = .{},
+            .pending_deletes = .{},
         };
     }
 
@@ -4412,6 +4430,8 @@ pub const Editor = struct {
         self.pending_new_sheets.deinit(self.allocator);
         for (self.pending_renames.items) |*r| r.deinit(self.allocator);
         self.pending_renames.deinit(self.allocator);
+        for (self.pending_deletes.items) |*d| d.deinit(self.allocator);
+        self.pending_deletes.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -4508,7 +4528,8 @@ pub const Editor = struct {
         if (self.pending_appends.count() == 0 and
             self.pending_mutations.count() == 0 and
             self.pending_new_sheets.items.len == 0 and
-            self.pending_renames.items.len == 0)
+            self.pending_renames.items.len == 0 and
+            self.pending_deletes.items.len == 0)
         {
             try w.writeAll(self.src_buf);
             try atomic_file.finish();
@@ -4772,6 +4793,41 @@ pub const Editor = struct {
             );
         }
 
+        // Phase 3e iter-sheet-3: pending sheet deletions. Patch
+        // workbook.xml (drop the <sheet> line), rels (drop the
+        // Relationship), Content_Types (drop the Override). The
+        // entry-skipping in the LFH-emit loop further down drops
+        // the sheet's worksheet-XML ZIP entry itself.
+        if (self.pending_deletes.items.len > 0) {
+            try patchEntryForDeletes(
+                self.allocator,
+                self.entries,
+                self.src_buf,
+                subs,
+                "xl/workbook.xml",
+                self.pending_deletes.items,
+                patchWorkbookXmlForDeletes,
+            );
+            try patchEntryForDeletes(
+                self.allocator,
+                self.entries,
+                self.src_buf,
+                subs,
+                "xl/_rels/workbook.xml.rels",
+                self.pending_deletes.items,
+                patchWorkbookRelsForDeletes,
+            );
+            try patchEntryForDeletes(
+                self.allocator,
+                self.entries,
+                self.src_buf,
+                subs,
+                "[Content_Types].xml",
+                self.pending_deletes.items,
+                patchContentTypesForDeletes,
+            );
+        }
+
         // Phase 3e iter-sheet-2: pending sheet renames. Composes
         // through patchEntryForRenames's re-substitution path, so
         // it stacks correctly on top of any prior workbook.xml
@@ -4801,23 +4857,32 @@ pub const Editor = struct {
             }
         }.lessThan);
 
+        // Phase 3e iter-sheet-3: mask of entries to drop entirely
+        // (the deleted sheets' worksheet XML). The size validation
+        // and emission loops skip these.
+        const deleted_mask = try self.allocator.alloc(bool, self.entries.len);
+        defer self.allocator.free(deleted_mask);
+        @memset(deleted_mask, false);
+        for (self.pending_deletes.items) |d| {
+            if (findEntryByName(self.entries, d.path)) |di| deleted_mask[di] = true;
+        }
+
         // Pre-validate that the rewritten archive stays within ZIP32
         // bounds. Source size is already <= 4 GiB (Editor.open caps),
         // but substitutions + appendix entries can push the total over.
         // Without this guard the `@intCast(u32, ...)` writes below
         // would trap (safe builds) or silently truncate offsets
         // (release builds), producing an unreadable archive.
-        // Bail with a clear `Zip64NotSupported` instead.
         // Use `>= maxInt(u32)` rather than `>` so ZIP32 sentinel
         // values (`0xFFFFFFFF` for offsets/sizes, `0xFFFF` for
-        // entry counts) are also rejected. Book.open treats those
-        // exact values as ZIP64 markers, so emitting them on the
-        // save side would produce a self-incompatible archive
-        // that our own reader refuses with `Zip64NotSupported`.
+        // entry counts) are also rejected.
         const max_u32: u64 = std.math.maxInt(u32);
         const max_u16: usize = std.math.maxInt(u16);
         var planned_total: u64 = 0;
+        var live_entry_count: usize = 0;
         for (lfh_sorted) |i| {
+            if (deleted_mask[i]) continue;
+            live_entry_count += 1;
             if (subs[i]) |s| {
                 planned_total += @as(u64, s.lfh.len) + @as(u64, s.payload.len);
             } else {
@@ -4830,6 +4895,7 @@ pub const Editor = struct {
         }
         const planned_cd_offset = planned_total;
         for (self.entries, 0..) |entry, i| {
+            if (deleted_mask[i]) continue;
             if (subs[i]) |s| {
                 planned_total += @as(u64, s.cdfh.len);
             } else {
@@ -4841,7 +4907,7 @@ pub const Editor = struct {
         const planned_archive_size = planned_total +
             @as(u64, @sizeOf(std.zip.EndRecord)) +
             @as(u64, self.eocd_comment.len);
-        const planned_entries = self.entries.len + extra_entries.items.len;
+        const planned_entries = live_entry_count + extra_entries.items.len;
         if (planned_cd_offset >= max_u32 or
             planned_cd_size >= max_u32 or
             planned_archive_size >= max_u32 or
@@ -4852,6 +4918,7 @@ pub const Editor = struct {
 
         var written: u64 = 0;
         for (lfh_sorted) |i| {
+            if (deleted_mask[i]) continue;
             new_lfh_offsets[i] = @intCast(written);
             if (subs[i]) |s| {
                 try w.writeAll(s.lfh);
@@ -4880,10 +4947,8 @@ pub const Editor = struct {
 
         const new_cd_offset: u32 = @intCast(written);
         for (self.entries, 0..) |entry, i| {
+            if (deleted_mask[i]) continue;
             if (subs[i]) |s| {
-                // Substituted: emit a fresh CDFH (header + filename
-                // only — no extras/comment). Patch local_file_header
-                // offset in place after copy.
                 var cdfh_copy = try self.allocator.dupe(u8, s.cdfh);
                 defer self.allocator.free(cdfh_copy);
                 const lfh_field_pos = @sizeOf(std.zip.CentralDirectoryFileHeader) - 4;
@@ -4891,8 +4956,6 @@ pub const Editor = struct {
                 try w.writeAll(cdfh_copy);
                 written += @as(u64, cdfh_copy.len);
             } else {
-                // Pass-through: copy CDFH from src_buf, patch the LFH
-                // offset (final u32 of the fixed-size header).
                 var cdfh_bytes: [@sizeOf(std.zip.CentralDirectoryFileHeader)]u8 = undefined;
                 const src_cdfh = self.src_buf[entry.cdfh_offset .. entry.cdfh_offset + cdfh_bytes.len];
                 @memcpy(&cdfh_bytes, src_cdfh);
@@ -4916,7 +4979,7 @@ pub const Editor = struct {
         }
         const new_cd_size: u32 = @intCast(written - new_cd_offset);
 
-        const total_entries = self.entries.len + extra_entries.items.len;
+        const total_entries = live_entry_count + extra_entries.items.len;
         var eocd_out: std.zip.EndRecord = .{
             .signature = std.zip.end_record_sig,
             .disk_number = 0,
@@ -5368,6 +5431,64 @@ pub const Editor = struct {
             .old_name = old_dup,
             .new_name = new_dup,
         });
+    }
+
+    /// Delete a sheet (Phase 3e, iter-sheet-3). v1 contract:
+    ///   - Refuses if it's the only remaining sheet.
+    ///   - Refuses if there's pending mutation/append/rename state
+    ///     on ANY sheet (caller must `save` first then re-open).
+    ///   - Pending-new-sheet path: removes from `pending_new_sheets`.
+    ///   - Source sheet path: records the delete + drops the path
+    ///     from `sheet_paths`.
+    ///   - Cross-sheet formula refs to the deleted sheet become
+    ///     `#REF!` (deferred to iter-col-1's formula tokenizer).
+    /// Sheet indices SHIFT after a delete: the call invalidates
+    /// every sheet_idx > deleted_idx.
+    pub fn deleteSheet(self: *Editor, sheet_idx: u32) !void {
+        if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
+        if (self.sheet_paths.len <= 1) return error.CannotDeleteLastSheet;
+        if (self.pending_appends.count() > 0 or
+            self.pending_mutations.count() > 0 or
+            self.pending_renames.items.len > 0)
+        {
+            return error.SheetDeleteRequiresCleanState;
+        }
+
+        const path = self.sheet_paths[sheet_idx];
+
+        if (self.findPendingNewSheet(path)) |ns_idx| {
+            // Pending-new sheet: remove from pending_new_sheets.
+            // NewSheet.path borrows from sheet_paths; deinit only
+            // frees name/rid/body. The path bytes are freed below
+            // when we rebuild sheet_paths.
+            var ns = self.pending_new_sheets.swapRemove(ns_idx);
+            ns.deinit(self.allocator);
+        } else {
+            const meta = (try self.sheetMetaAtPath(path)) orelse return error.SheetEntryNotFound;
+            self.allocator.free(meta.name); // not needed for delete
+            const path_dup = try self.allocator.dupe(u8, path);
+            errdefer self.allocator.free(path_dup);
+            errdefer self.allocator.free(meta.rid);
+            try self.pending_deletes.append(self.allocator, .{
+                .path = path_dup,
+                .rid = meta.rid,
+            });
+        }
+
+        // Rebuild sheet_paths without the deleted entry. Free the
+        // deleted entry's path bytes; other entries are still
+        // referenced by new_paths so they live on.
+        const new_paths = try self.allocator.alloc([]const u8, self.sheet_paths.len - 1);
+        var dst: usize = 0;
+        for (self.sheet_paths, 0..) |p, i| {
+            if (i == sheet_idx) continue;
+            new_paths[dst] = p;
+            dst += 1;
+        }
+        const old_paths = self.sheet_paths;
+        self.allocator.free(old_paths[sheet_idx]);
+        self.sheet_paths = new_paths;
+        self.allocator.free(old_paths);
     }
 
     /// True when some sheet has an effective name matching
@@ -6442,6 +6563,152 @@ fn patchContentTypesForNewSheets(
     }
     try out.appendSlice(allocator, xml[close..]);
     return try out.toOwnedSlice(allocator);
+}
+
+/// Drop the `<sheet r:id="rIdN"/>` line from `xl/workbook.xml`
+/// for each pending delete (matched by r:id). iter-sheet-3.
+fn patchWorkbookXmlForDeletes(
+    allocator: Allocator,
+    xml: []const u8,
+    deletes: []const Editor.SheetDelete,
+) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (findTagOpen(xml, i, "sheet")) |t| {
+        const attrs = xml[t.start + "<sheet".len .. t.after_open - 1];
+        var dropped = false;
+        if (getAttr(attrs, "r:id")) |rid| {
+            for (deletes) |d| {
+                if (std.mem.eql(u8, d.rid, rid)) {
+                    dropped = true;
+                    break;
+                }
+            }
+        }
+        if (dropped) {
+            // Skip the `<sheet …/>` line entirely. Emit bytes from
+            // `i` up to `t.start`, then jump past the closing `>`.
+            try out.appendSlice(allocator, xml[i..t.start]);
+            i = t.after_open;
+        } else {
+            // Keep this `<sheet>` line + skip past its `>`.
+            try out.appendSlice(allocator, xml[i..t.after_open]);
+            i = t.after_open;
+        }
+    }
+    try out.appendSlice(allocator, xml[i..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Drop `<Relationship Id="rIdN" .../>` lines from
+/// `xl/_rels/workbook.xml.rels` for each pending delete.
+fn patchWorkbookRelsForDeletes(
+    allocator: Allocator,
+    xml: []const u8,
+    deletes: []const Editor.SheetDelete,
+) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, i, "<Relationship")) |rel_pos| {
+        const rel_end = std.mem.indexOfScalarPos(u8, xml, rel_pos, '>') orelse {
+            try out.appendSlice(allocator, xml[i..]);
+            return try out.toOwnedSlice(allocator);
+        };
+        const rel_attrs = xml[rel_pos + "<Relationship".len .. rel_end];
+        var dropped = false;
+        if (getAttr(rel_attrs, "Id")) |id| {
+            for (deletes) |d| {
+                if (std.mem.eql(u8, d.rid, id)) {
+                    dropped = true;
+                    break;
+                }
+            }
+        }
+        if (dropped) {
+            try out.appendSlice(allocator, xml[i..rel_pos]);
+            i = rel_end + 1;
+        } else {
+            try out.appendSlice(allocator, xml[i .. rel_end + 1]);
+            i = rel_end + 1;
+        }
+    }
+    try out.appendSlice(allocator, xml[i..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Drop `<Override PartName="/xl/worksheets/sheetN.xml" …/>`
+/// entries for each pending delete.
+fn patchContentTypesForDeletes(
+    allocator: Allocator,
+    xml: []const u8,
+    deletes: []const Editor.SheetDelete,
+) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, i, "<Override")) |o_pos| {
+        const o_end = std.mem.indexOfScalarPos(u8, xml, o_pos, '>') orelse {
+            try out.appendSlice(allocator, xml[i..]);
+            return try out.toOwnedSlice(allocator);
+        };
+        const o_attrs = xml[o_pos + "<Override".len .. o_end];
+        var dropped = false;
+        if (getAttr(o_attrs, "PartName")) |part| {
+            // Strip leading `/` before comparing: PartName values
+            // are absolute (`/xl/worksheets/sheetN.xml`).
+            const part_norm = if (part.len > 0 and part[0] == '/') part[1..] else part;
+            for (deletes) |d| {
+                if (std.mem.eql(u8, d.path, part_norm)) {
+                    dropped = true;
+                    break;
+                }
+            }
+        }
+        if (dropped) {
+            try out.appendSlice(allocator, xml[i..o_pos]);
+            i = o_end + 1;
+        } else {
+            try out.appendSlice(allocator, xml[i .. o_end + 1]);
+            i = o_end + 1;
+        }
+    }
+    try out.appendSlice(allocator, xml[i..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Twin of `patchEntryForNewSheets` for sheet deletes.
+fn patchEntryForDeletes(
+    allocator: Allocator,
+    entries: []const Editor.ZipEntry,
+    src_buf: []u8,
+    subs: []?SubstitutedEntry,
+    entry_name: []const u8,
+    deletes: []const Editor.SheetDelete,
+    patcher: *const fn (Allocator, []const u8, []const Editor.SheetDelete) anyerror![]u8,
+) !void {
+    const entry_idx = findEntryByName(entries, entry_name) orelse
+        return error.MissingEntry;
+    var src_xml: []u8 = undefined;
+    var src_xml_owned = false;
+    if (subs[entry_idx]) |s| {
+        src_xml = try decompressZipPayload(allocator, s.payload, s.compression_method, s.uncompressed_size);
+        src_xml_owned = true;
+        allocator.free(s.lfh);
+        allocator.free(s.payload);
+        allocator.free(s.cdfh);
+        subs[entry_idx] = null;
+    } else {
+        const e = entries[entry_idx];
+        const payload = src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
+        src_xml = try decompressZipPayload(allocator, payload, e.compression_method, e.uncompressed_size);
+        src_xml_owned = true;
+    }
+    defer if (src_xml_owned) allocator.free(src_xml);
+
+    const new_xml = try patcher(allocator, src_xml, deletes);
+    subs[entry_idx] = try buildEntryFromXml(allocator, entry_name, new_xml);
 }
 
 /// Twin of `patchEntryForNewSheets` for sheet renames. Same
@@ -8849,6 +9116,94 @@ test "Editor: addSheet escapes quotes in name attribute" {
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
     try std.testing.expectEqualStrings("He said \"Hi\"", book.sheets[1].name);
+}
+
+test "Editor: deleteSheet drops a source sheet (iter-sheet-3)" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_delete_src.xlsx";
+    const dst_path = "/tmp/zlsx_delete_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s1 = try w.addSheet("Keep");
+        try s1.writeRow(&.{.{ .integer = 1 }});
+        var s2 = try w.addSheet("Drop");
+        try s2.writeRow(&.{.{ .integer = 2 }});
+        var s3 = try w.addSheet("AlsoKeep");
+        try s3.writeRow(&.{.{ .integer = 3 }});
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.deleteSheet(1);
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
+    try std.testing.expectEqualStrings("Keep", book.sheets[0].name);
+    try std.testing.expectEqualStrings("AlsoKeep", book.sheets[1].name);
+}
+
+test "Editor: deleteSheet drops a pending-new sheet" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_delete_new.xlsx";
+    const dst_path = "/tmp/zlsx_delete_new_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        _ = try w.addSheet("Original");
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        const new_idx = try ed.addSheet("Tmp");
+        try ed.deleteSheet(new_idx);
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
+    try std.testing.expectEqualStrings("Original", book.sheets[0].name);
+}
+
+test "Editor: deleteSheet rejects last-sheet" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_delete_last.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        _ = try w.addSheet("Solo");
+        try w.save(src_path);
+    }
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    try std.testing.expectError(error.CannotDeleteLastSheet, ed.deleteSheet(0));
+    try std.testing.expectError(error.SheetIndexOutOfRange, ed.deleteSheet(99));
+}
+
+test "Editor: deleteSheet rejects dirty state" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_delete_dirty.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        _ = try w.addSheet("S1");
+        _ = try w.addSheet("S2");
+        try w.save(src_path);
+    }
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    try ed.appendRows(0, &.{&.{.{ .integer = 5 }}});
+    try std.testing.expectError(error.SheetDeleteRequiresCleanState, ed.deleteSheet(1));
 }
 
 test "Editor: renameSheet renames an existing sheet (iter-sheet-2)" {
