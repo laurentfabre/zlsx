@@ -1980,7 +1980,7 @@ fn validateMergeRange(range: []const u8) !void {
 /// "summary") at a tiny code cost. Non-ASCII input falls through to
 /// byte comparison — sufficient for everything except genuine
 /// Turkish-i-style edge cases that no real caller hits.
-fn asciiEqlFold(a: []const u8, b: []const u8) bool {
+pub fn asciiEqlFold(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| {
         const xl: u8 = if (x >= 'A' and x <= 'Z') x + 32 else x;

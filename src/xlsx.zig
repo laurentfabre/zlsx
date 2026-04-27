@@ -5137,20 +5137,41 @@ pub const Editor = struct {
         // Cheapest: read workbook.xml once and scan for `name="…"`.
         if (try self.sheetNameExists(name)) return error.DuplicateSheetName;
         for (self.pending_new_sheets.items) |s| {
-            if (std.mem.eql(u8, s.name, name)) return error.DuplicateSheetName;
+            // Case-insensitive: Excel treats sheet names that
+            // differ only in ASCII case as duplicates.
+            if (writer_mod.asciiEqlFold(s.name, name)) return error.DuplicateSheetName;
         }
 
         // Pick the next sheet_id, sheet path number, and rId by
-        // scanning the workbook.xml + rels for the highest existing.
-        // Conservative: start at max(seen) + 1, never reuse.
+        // scanning the workbook.xml + rels for the highest existing,
+        // AND every pending_new_sheets entry (otherwise repeated
+        // addSheet calls collide on the same rId / sheetId / path).
         const wb_xml = try self.readEntry("xl/workbook.xml");
         defer self.allocator.free(wb_xml);
         const rels_xml = try self.readEntry("xl/_rels/workbook.xml.rels");
         defer self.allocator.free(rels_xml);
 
-        const next_sheet_id = nextMaxAttr(wb_xml, "sheetId=\"") + 1;
-        const next_rid_num = nextMaxRId(rels_xml) + 1;
-        const next_path_num = nextMaxSheetPathNum(self.entries) + 1;
+        var next_sheet_id = nextMaxAttr(wb_xml, "sheetId=\"") + 1;
+        var next_rid_num = nextMaxRId(rels_xml) + 1;
+        var next_path_num = nextMaxSheetPathNum(self.entries) + 1;
+        for (self.pending_new_sheets.items) |s| {
+            if (s.sheet_id >= next_sheet_id) next_sheet_id = s.sheet_id + 1;
+            // s.rid is "rIdN"; strip the "rId" prefix.
+            if (std.mem.startsWith(u8, s.rid, "rId")) {
+                if (std.fmt.parseInt(u32, s.rid["rId".len..], 10)) |n| {
+                    if (n >= next_rid_num) next_rid_num = n + 1;
+                } else |_| {}
+            }
+            // s.path is "xl/worksheets/sheetN.xml".
+            const prefix = "xl/worksheets/sheet";
+            const suffix = ".xml";
+            if (std.mem.startsWith(u8, s.path, prefix) and std.mem.endsWith(u8, s.path, suffix)) {
+                const num_str = s.path[prefix.len .. s.path.len - suffix.len];
+                if (std.fmt.parseInt(u32, num_str, 10)) |n| {
+                    if (n >= next_path_num) next_path_num = n + 1;
+                } else |_| {}
+            }
+        }
 
         // Build the new entries. Free everything on error so the
         // editor stays in a clean state.
@@ -5194,7 +5215,8 @@ pub const Editor = struct {
             const sh_end = std.mem.indexOfScalarPos(u8, wb, sh_pos, '>') orelse break;
             const sh_attrs = wb[sh_pos + "<sheet ".len .. sh_end];
             if (getAttr(sh_attrs, "name")) |nm| {
-                if (std.mem.eql(u8, nm, name)) return true;
+                const writer_mod = @import("writer.zig");
+                if (writer_mod.asciiEqlFold(nm, name)) return true;
             }
             i = sh_end + 1;
         }
@@ -8339,6 +8361,74 @@ test "Editor: addSheet appends a new sheet and round-trips through reader (iter-
     const r = (try rows.next()) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("hello", r[0].string);
     try std.testing.expectEqual(@as(i64, 99), r[1].integer);
+}
+
+test "Editor: addSheet allocates non-colliding ids across multiple calls" {
+    // Codex caught: pre-fix, two addSheet calls in one session
+    // produced duplicate rIds / sheetIds / sheet paths because the
+    // max scan only looked at the source.
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_addsheet_seq_src.xlsx";
+    const dst_path = "/tmp/zlsx_addsheet_seq_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Original");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        const a = try ed.addSheet("A");
+        const b = try ed.addSheet("B");
+        const c = try ed.addSheet("C");
+        try ed.setCell(a, 1, 0, .{ .string = "in_a" });
+        try ed.setCell(b, 1, 0, .{ .string = "in_b" });
+        try ed.setCell(c, 1, 0, .{ .string = "in_c" });
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 4), book.sheets.len);
+    try std.testing.expectEqualStrings("Original", book.sheets[0].name);
+    try std.testing.expectEqualStrings("A", book.sheets[1].name);
+    try std.testing.expectEqualStrings("B", book.sheets[2].name);
+    try std.testing.expectEqualStrings("C", book.sheets[3].name);
+    inline for ([_]struct { idx: usize, want: []const u8 }{
+        .{ .idx = 1, .want = "in_a" },
+        .{ .idx = 2, .want = "in_b" },
+        .{ .idx = 3, .want = "in_c" },
+    }) |c| {
+        var rows = try book.rows(book.sheets[c.idx], std.testing.allocator);
+        defer rows.deinit();
+        const r = (try rows.next()) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(c.want, r[0].string);
+    }
+}
+
+test "Editor: addSheet duplicate names are case-insensitive" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_addsheet_case.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Existing");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    // Existing source sheet — case-insensitive collision.
+    try std.testing.expectError(error.DuplicateSheetName, ed.addSheet("EXISTING"));
+    try std.testing.expectError(error.DuplicateSheetName, ed.addSheet("existing"));
+    // Pending-new-sheets — also case-insensitive.
+    _ = try ed.addSheet("Fresh");
+    try std.testing.expectError(error.DuplicateSheetName, ed.addSheet("FRESH"));
+    try std.testing.expectError(error.DuplicateSheetName, ed.addSheet("fresh"));
 }
 
 test "Editor: addSheet rejects invalid + duplicate names" {
