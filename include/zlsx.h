@@ -1148,6 +1148,28 @@ int32_t zlsx_editor_append_row(
     uint8_t           * err_buf,
     size_t              err_buf_len);
 
+/* In-place cell mutation (Phase 3d, iter-cm-2). Replaces or inserts a
+ * single cell on `sheet_idx` at (`row`, `col`). `row` is 1-based;
+ * `col` is 0-based (A=0, B=1, …). The cell is borrowed for the
+ * duration of this call; the editor dupes string contents internally
+ * so callers can reuse / free their buffers after this returns.
+ *
+ * Returns 0 on success, -1 on failure with `err_buf` populated.
+ * Notable typed errors include `SetCellSourceCellHasMetadata` (the
+ * source cell carries `s="N"` styles or non-canonical body —
+ * preserve-and-merge is iter-cm-2e, not yet shipped),
+ * `SheetHasUnsavedAppends`, `SheetIndexOutOfRange`, and
+ * `RowIndexOutOfRange`.
+ */
+int32_t zlsx_editor_set_cell(
+    zlsx_editor_t     * ed,
+    uint32_t            sheet_idx,
+    uint32_t            row,
+    uint32_t            col,
+    const zlsx_cell_t * cell,
+    uint8_t           * err_buf,
+    size_t              err_buf_len);
+
 /* Save the workbook (with any pending appends applied) atomically
  * to `out_path` (`out_path_len` bytes; not null-terminated). Returns
  * 0 on success, -1 on failure with `err_buf` populated.
