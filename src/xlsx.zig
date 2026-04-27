@@ -2200,11 +2200,15 @@ fn parseNumericCell(text: []const u8) !Cell {
 }
 
 /// "A1" → 0, "B3" → 1, "AA10" → 26, "AB10" → 27.
+/// Refs past Excel's XFD column (16384, 1-based) are rejected as
+/// MalformedXml so adversarial XML can't drive `consumeCell`'s row-
+/// growth loop into a multi-MB allocation.
 fn columnIndexFromRef(ref: []const u8) !usize {
     var idx: usize = 0;
     var i: usize = 0;
     while (i < ref.len and ref[i] >= 'A' and ref[i] <= 'Z') : (i += 1) {
         idx = idx * 26 + (ref[i] - 'A' + 1);
+        if (idx > max_col_1based) return error.MalformedXml;
     }
     if (i == 0) return error.MalformedXml;
     return idx - 1;
@@ -2373,17 +2377,18 @@ pub fn parseA1Ref(s: []const u8) !CellRef {
     var i: usize = 0;
     var col: u32 = 0;
     while (i < s.len and s[i] >= 'A' and s[i] <= 'Z') : (i += 1) {
+        // Bail as soon as the running column exceeds the Excel max.
+        // The previous "saturate" approach risked u32 overflow on
+        // pathologically long all-letter prefixes since the
+        // multiplication ran before the bound check fired.
+        if (col > max_col_1based) return error.MalformedXml;
         col = col * 26 + (s[i] - 'A' + 1);
-        // Saturate past the Excel limit so a pathologically long
-        // all-letter prefix can't overflow u32 before the bound
-        // check rejects.
-        if (col > max_col_1based) col = max_col_1based + 1;
     }
     if (i == 0 or i == s.len) return error.MalformedXml;
     var row: u32 = 0;
     while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+        if (row > max_row) return error.MalformedXml;
         row = row * 10 + (s[i] - '0');
-        if (row > max_row) row = max_row + 1;
     }
     if (i != s.len or row == 0) return error.MalformedXml;
     if (col > max_col_1based or row > max_row) return error.MalformedXml;
@@ -12729,6 +12734,26 @@ test "columnIndexFromRef" {
     try std.testing.expectEqual(@as(usize, 27), try columnIndexFromRef("AB1"));
     try std.testing.expectEqual(@as(usize, 51), try columnIndexFromRef("AZ1"));
     try std.testing.expectEqual(@as(usize, 52), try columnIndexFromRef("BA1"));
+    // XFD = 16384 = max valid 1-based.
+    try std.testing.expectEqual(@as(usize, 16383), try columnIndexFromRef("XFD1"));
+    // Refs past XFD must reject — guards consumeCell's row-growth loop.
+    try std.testing.expectError(error.MalformedXml, columnIndexFromRef("XFE1"));
+    try std.testing.expectError(error.MalformedXml, columnIndexFromRef("ZZZZZZ1"));
+    try std.testing.expectError(error.MalformedXml, columnIndexFromRef("ZZZZZZZZZZZZZZZZZZZZZZ1"));
+}
+
+test "parseA1Ref bounds long letter / digit runs without u32 overflow" {
+    // Letter run past XFD must reject before u32 multiplication can
+    // overflow on safe builds.
+    try std.testing.expectError(error.MalformedXml, parseA1Ref("XFE1"));
+    try std.testing.expectError(error.MalformedXml, parseA1Ref("ZZZZZZZZZ1"));
+    // Digit run past 1048576 must reject likewise.
+    try std.testing.expectError(error.MalformedXml, parseA1Ref("A1048577"));
+    try std.testing.expectError(error.MalformedXml, parseA1Ref("A99999999999"));
+    // Boundary still works.
+    const max = try parseA1Ref("XFD1048576");
+    try std.testing.expectEqual(@as(u32, 16383), max.col);
+    try std.testing.expectEqual(@as(u32, 1048576), max.row);
 }
 
 test "getAttr" {
