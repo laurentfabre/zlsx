@@ -4138,12 +4138,19 @@ pub const Editor = struct {
     };
 
     /// State for one Phase 3e (iter-sheet-2) sheet rename.
+    /// `rid` is the source workbook's `r:id="rIdN"` for this sheet,
+    /// captured at renameSheet time. The save-time patcher matches
+    /// `<sheet r:id="…">` by this rId — Book.sheets indexing might
+    /// drop entries with broken rels, so a positional walk over the
+    /// raw workbook.xml order would target the wrong line.
     pub const SheetRename = struct {
         sheet_idx: u32,
+        rid: []u8,
         old_name: []u8,
         new_name: []u8,
 
         pub fn deinit(self: *SheetRename, alloc: Allocator) void {
+            alloc.free(self.rid);
             alloc.free(self.old_name);
             alloc.free(self.new_name);
         }
@@ -5284,19 +5291,25 @@ pub const Editor = struct {
         const writer_mod = @import("writer.zig");
         try writer_mod.validateSheetName(new_name);
 
-        // Resolve current name. For a source sheet, look it up via
-        // workbook.xml; for a pending-new-sheet, use the NewSheet
-        // entry's name field.
+        // Resolve current name + rId. For a source sheet, look up
+        // via workbook.xml + rels; for a pending-new-sheet, use the
+        // NewSheet entry's name + rid fields.
         const path = self.sheet_paths[sheet_idx];
         var current_name: []u8 = undefined;
-        var current_owned = false;
+        var current_rid: ?[]u8 = null;
+        var current_name_owned = false;
+        var current_rid_owned = false;
+        defer if (current_name_owned) self.allocator.free(current_name);
+        defer if (current_rid_owned) if (current_rid) |r| self.allocator.free(r);
         if (self.findPendingNewSheet(path)) |ns_idx| {
             current_name = self.pending_new_sheets.items[ns_idx].name;
         } else {
-            current_name = try self.sheetNameAtPath(path) orelse return error.SheetEntryNotFound;
-            current_owned = true;
+            const meta = (try self.sheetMetaAtPath(path)) orelse return error.SheetEntryNotFound;
+            current_name = meta.name;
+            current_name_owned = true;
+            current_rid = meta.rid;
+            current_rid_owned = true;
         }
-        defer if (current_owned) self.allocator.free(current_name);
 
         // No-op (case-insensitive same name).
         if (writer_mod.asciiEqlFold(current_name, new_name)) return;
@@ -5333,8 +5346,13 @@ pub const Editor = struct {
         errdefer self.allocator.free(old_dup);
         const new_dup = try self.allocator.dupe(u8, new_name);
         errdefer self.allocator.free(new_dup);
+        // Take ownership of the rId (sheetMetaAtPath returned an
+        // owned dupe). Disable the deferred free above.
+        const rid_owned = current_rid.?;
+        current_rid_owned = false;
         try self.pending_renames.append(self.allocator, .{
             .sheet_idx = sheet_idx,
+            .rid = rid_owned,
             .old_name = old_dup,
             .new_name = new_dup,
         });
@@ -5369,6 +5387,67 @@ pub const Editor = struct {
             if (writer_mod.asciiEqlFold(eff, candidate)) return true;
         }
         return false;
+    }
+
+    /// Look up the source workbook's `<sheet>` row whose r:id
+    /// resolves (via rels) to `target_path`. Returns owned dupes of
+    /// the (entity-decoded) name AND the rId, or null when no
+    /// match. Caller frees both. iter-sheet-2 needs the rId to
+    /// match `<sheet>` lines by-id rather than by-position.
+    fn sheetMetaAtPath(self: *Editor, target_path: []const u8) !?struct { name: []u8, rid: []u8 } {
+        const wb = try self.readEntry("xl/workbook.xml");
+        defer self.allocator.free(wb);
+        const rels = try self.readEntry("xl/_rels/workbook.xml.rels");
+        defer self.allocator.free(rels);
+
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, wb, i, "<sheet ")) |sh_pos| {
+            const sh_end = std.mem.indexOfScalarPos(u8, wb, sh_pos, '>') orelse break;
+            const sh_attrs = wb[sh_pos + "<sheet ".len .. sh_end];
+            const rid = getAttr(sh_attrs, "r:id") orelse {
+                i = sh_end + 1;
+                continue;
+            };
+            const name_raw = getAttr(sh_attrs, "name") orelse {
+                i = sh_end + 1;
+                continue;
+            };
+            var rels_i: usize = 0;
+            while (std.mem.indexOfPos(u8, rels, rels_i, "<Relationship")) |rel_pos| {
+                const rel_end = std.mem.indexOfScalarPos(u8, rels, rel_pos, '>') orelse break;
+                const rel_attrs = rels[rel_pos + "<Relationship".len .. rel_end];
+                const id = getAttr(rel_attrs, "Id") orelse {
+                    rels_i = rel_end + 1;
+                    continue;
+                };
+                if (!std.mem.eql(u8, id, rid)) {
+                    rels_i = rel_end + 1;
+                    continue;
+                }
+                const target = getAttr(rel_attrs, "Target") orelse {
+                    rels_i = rel_end + 1;
+                    continue;
+                };
+                var matches = std.mem.eql(u8, target, target_path);
+                if (!matches) {
+                    var prefixed_buf: [256]u8 = undefined;
+                    const prefixed = std.fmt.bufPrint(&prefixed_buf, "xl/{s}", .{target}) catch break;
+                    matches = std.mem.eql(u8, prefixed, target_path);
+                }
+                if (matches) {
+                    var decoded: std.ArrayListUnmanaged(u8) = .{};
+                    errdefer decoded.deinit(self.allocator);
+                    try decodeXmlAttrInto(self.allocator, &decoded, name_raw);
+                    const name_owned = try decoded.toOwnedSlice(self.allocator);
+                    errdefer self.allocator.free(name_owned);
+                    const rid_owned = try self.allocator.dupe(u8, rid);
+                    return .{ .name = name_owned, .rid = rid_owned };
+                }
+                rels_i = rel_end + 1;
+            }
+            i = sh_end + 1;
+        }
+        return null;
     }
 
     /// Look up the source workbook's sheet name for a given path.
@@ -6253,24 +6332,25 @@ fn patchWorkbookXmlForRenames(
     errdefer out.deinit(allocator);
 
     var i: usize = 0;
-    var sheet_pos_counter: u32 = 0;
     while (std.mem.indexOfPos(u8, xml, i, "<sheet ")) |sh_pos| {
-        // Copy bytes up to (and including) the `<sheet ` opener.
         try out.appendSlice(allocator, xml[i .. sh_pos + "<sheet ".len]);
         const sh_end = std.mem.indexOfScalarPos(u8, xml, sh_pos, '>') orelse {
             try out.appendSlice(allocator, xml[sh_pos + "<sheet ".len ..]);
             return try out.toOwnedSlice(allocator);
         };
         const attrs = xml[sh_pos + "<sheet ".len .. sh_end];
-        const my_pos = sheet_pos_counter;
-        sheet_pos_counter += 1;
 
-        // Find a rename targeting THIS position.
+        // Match by `r:id` (captured at renameSheet time). Position-
+        // based match would target the wrong line on workbooks where
+        // Book.sheets indexing diverges from raw <sheet> order
+        // (e.g. broken rels entries skipped by parseWorkbookSheets).
         var matched_new: ?[]const u8 = null;
-        for (renames) |r| {
-            if (r.sheet_idx == my_pos) {
-                matched_new = r.new_name;
-                break;
+        if (getAttr(attrs, "r:id")) |rid| {
+            for (renames) |r| {
+                if (std.mem.eql(u8, r.rid, rid)) {
+                    matched_new = r.new_name;
+                    break;
+                }
             }
         }
 
