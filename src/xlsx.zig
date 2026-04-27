@@ -6054,7 +6054,7 @@ fn patchWorkbookXmlForNewSheets(
     try out.appendSlice(allocator, xml[0..close]);
     for (new_sheets) |s| {
         try out.appendSlice(allocator, "<sheet name=\"");
-        try appendXmlEscaped(allocator, &out, s.name);
+        try appendXmlAttrEscaped(allocator, &out, s.name);
         try out.writer(allocator).print(
             "\" sheetId=\"{d}\" r:id=\"{s}\"/>",
             .{ s.sheet_id, s.rid },
@@ -6384,6 +6384,20 @@ fn appendXmlEscaped(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), s: [
             '&' => try out.appendSlice(allocator, "&amp;"),
             '<' => try out.appendSlice(allocator, "&lt;"),
             '>' => try out.appendSlice(allocator, "&gt;"),
+            else => try out.append(allocator, c),
+        }
+    }
+}
+
+/// Like `appendXmlEscaped` but also escapes `"` → `&quot;`. Use
+/// when emitting into a double-quoted attribute value (`name="…"`).
+fn appendXmlAttrEscaped(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '&' => try out.appendSlice(allocator, "&amp;"),
+            '<' => try out.appendSlice(allocator, "&lt;"),
+            '>' => try out.appendSlice(allocator, "&gt;"),
+            '"' => try out.appendSlice(allocator, "&quot;"),
             else => try out.append(allocator, c),
         }
     }
@@ -8432,6 +8446,35 @@ test "Editor: addSheet appends a new sheet and round-trips through reader (iter-
     const r = (try rows.next()) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("hello", r[0].string);
     try std.testing.expectEqual(@as(i64, 99), r[1].integer);
+}
+
+test "Editor: addSheet escapes quotes in name attribute" {
+    // Codex P1: pre-fix, names with `"` produced malformed
+    // workbook.xml (`name="He said "Hi""`). Use attr-escape that
+    // covers `"` → `&quot;`.
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_addsheet_quote.xlsx";
+    const dst_path = "/tmp/zlsx_addsheet_quote_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Original");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        // validateSheetName accepts `"` so we must round-trip it.
+        _ = try ed.addSheet("He said \"Hi\"");
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
+    try std.testing.expectEqualStrings("He said \"Hi\"", book.sheets[1].name);
 }
 
 test "Editor: appendRows works on freshly-added sheets" {
