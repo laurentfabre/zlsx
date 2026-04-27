@@ -304,7 +304,11 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
         } else if (std.mem.eql(u8, a, "--row")) {
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
-            out.row_1based = std.fmt.parseInt(u32, argv[i], 10) catch return ArgError.BadArgValue;
+            const v = std.fmt.parseInt(u32, argv[i], 10) catch return ArgError.BadArgValue;
+            // 1-based per the structural-edit contract; mirror
+            // --start-row / --end-row's parse-time zero rejection.
+            if (v == 0) return ArgError.BadArgValue;
+            out.row_1based = v;
         } else if (std.mem.eql(u8, a, "--col")) {
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
@@ -557,6 +561,26 @@ fn parseArgs(argv: []const []const u8) ArgError!Args {
     // them.
     if (!workbook_scoped and detected_sub != .rows and out.format != .jsonl) {
         return ArgError.BadFormat;
+    }
+
+    // Structural-edit-only flags are rejected on every other sub-
+    // command. Mirrors the strictness of --header / --include-blanks
+    // / --start-row so user typos surface as exit-1 BadArgValue
+    // rather than silently no-op'ing the requested edit.
+    if (out.row_1based != null and !(detected_sub == .insert_row or detected_sub == .delete_row)) {
+        return ArgError.BadArgValue;
+    }
+    if (out.col_letter != null and !(detected_sub == .insert_column or detected_sub == .delete_column)) {
+        return ArgError.BadArgValue;
+    }
+    if (out.new_sheet_name != null and !(detected_sub == .add_sheet or detected_sub == .rename_sheet)) {
+        return ArgError.BadArgValue;
+    }
+    if (out.cell_ref != null and detected_sub != .set_cell) {
+        return ArgError.BadArgValue;
+    }
+    if (out.cell_value_json != null and detected_sub != .set_cell) {
+        return ArgError.BadArgValue;
     }
     return out;
 }
@@ -3880,6 +3904,34 @@ test "runSetCellCommand rejects missing --ref / --value / --out" {
         var err_w = std.Io.Writer.fixed(&err_buf);
         const a: Args = .{ .file = src_path, .subcommand = .set_cell, .sheet_index = 0, .out_path = "/tmp/x.xlsx", .cell_ref = "A1" };
         try std.testing.expectEqual(@as(u8, 1), try runSetCellCommand(std.testing.allocator, a, &err_w));
+    }
+}
+
+test "parseArgs rejects --row 0 (1-based contract)" {
+    const argv = [_][]const u8{ "insert-row", "in.xlsx", "--sheet", "0", "--row", "0", "--out", "x.xlsx" };
+    try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+}
+
+test "parseArgs rejects structural flags on read-only commands" {
+    {
+        const argv = [_][]const u8{ "rows", "in.xlsx", "--row", "2" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "cells", "in.xlsx", "--col", "B" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "meta", "in.xlsx", "--new-name", "Foo" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "rows", "in.xlsx", "--ref", "A1" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "rows", "in.xlsx", "--value", "1" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
     }
 }
 
