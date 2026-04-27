@@ -5108,13 +5108,23 @@ fn sourceCellHasMetadata(xml: []const u8, span: CellSpan) bool {
     // that's the case where setCell would silently drop semantic
     // state. `<is>` (inline-string body), `<v>` (value), and empty
     // bodies are all fine: the replacement overwrites the value
-    // either way.
+    // either way. Match any `<f` followed by whitespace / `>` /
+    // `/` so we catch open-tag forms (`<f>`, `<f t="shared">`),
+    // self-closing forms (`<f t="shared" si="0"/>`), and shared-
+    // formula followers — all of which carry semantic state.
     if (span.end < span.body_start + "</c>".len) return false;
     const body_end = span.end - "</c>".len;
     if (body_end <= span.body_start) return false;
     const body = xml[span.body_start..body_end];
-    if (std.mem.indexOf(u8, body, "<f>") != null) return true;
-    if (std.mem.indexOf(u8, body, "<f ") != null) return true;
+    var search_pos: usize = 0;
+    while (std.mem.indexOfPos(u8, body, search_pos, "<f")) |hit| {
+        const after = hit + 2;
+        if (after >= body.len) return true; // truncated; assume metadata
+        const c = body[after];
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '/' or c == '>')
+            return true;
+        search_pos = hit + 1;
+    }
     return false;
 }
 
