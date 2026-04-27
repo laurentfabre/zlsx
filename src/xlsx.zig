@@ -6581,15 +6581,100 @@ fn patchContentTypesForNewSheets(
 }
 
 /// Drop the `<sheet r:id="rIdN"/>` line from `xl/workbook.xml`
-/// for each pending delete (matched by r:id). iter-sheet-3.
+/// for each pending delete (matched by r:id). Two passes:
+///   1. First walk computes which raw `<sheet>` positions are
+///      being deleted so we can later shift `activeTab`.
+///   2. Second pass emits the result, dropping deleted lines and
+///      patching `<workbookView activeTab="N"/>` so it never
+///      points past the new last sheet.
+///
+/// Limitation called out in the iter-sheet-3 plan: `<definedName>`
+/// entries tied to deleted sheets via `localSheetId` are NOT
+/// rewritten — that needs the formula tokenizer (iter-col-1).
+/// Print areas / named ranges referencing the deleted sheet may
+/// fail repair in strict readers.
 fn patchWorkbookXmlForDeletes(
     allocator: Allocator,
     xml: []const u8,
     deletes: []const Editor.SheetDelete,
 ) ![]u8 {
+    // Pass 1: build a sorted list of raw sheet positions being
+    // dropped. parseWorkbookSheets order matches workbook.xml's
+    // raw `<sheet>` order in the absence of broken-rels skips.
+    var dropped_positions: std.ArrayListUnmanaged(u32) = .{};
+    defer dropped_positions.deinit(allocator);
+    var live_count: u32 = 0;
+    {
+        var pos: u32 = 0;
+        var i: usize = 0;
+        while (findTagOpen(xml, i, "sheet")) |t| {
+            const attrs = xml[t.start + "<sheet".len .. t.after_open - 1];
+            var is_dropped = false;
+            if (getAttr(attrs, "r:id")) |rid| {
+                for (deletes) |d| {
+                    if (std.mem.eql(u8, d.rid, rid)) {
+                        is_dropped = true;
+                        break;
+                    }
+                }
+            }
+            if (is_dropped) try dropped_positions.append(allocator, pos) else live_count += 1;
+            pos += 1;
+            i = t.after_open;
+        }
+    }
+
     var out: std.ArrayListUnmanaged(u8) = .{};
     errdefer out.deinit(allocator);
     var i: usize = 0;
+
+    // Patch <workbookView activeTab="N"/> first if present. Walk
+    // before the <sheet> rewriting since activeTab usually appears
+    // before <sheets> in workbook.xml; if it's after, we just
+    // process them in a second pass.
+    if (findTagOpen(xml, 0, "workbookView")) |t_view| {
+        const attrs = xml[t_view.start + "<workbookView".len .. t_view.after_open - 1];
+        if (getAttr(attrs, "activeTab")) |at_str| {
+            const old_at = std.fmt.parseInt(u32, at_str, 10) catch live_count;
+            // Compute new active tab: shift by -1 for each dropped
+            // position before old_at; clamp into range; if old_at
+            // itself is being dropped, fall back to 0.
+            var new_at: u32 = 0;
+            if (live_count > 0) {
+                var was_dropped = false;
+                var shift: u32 = 0;
+                for (dropped_positions.items) |dp| {
+                    if (dp == old_at) was_dropped = true;
+                    if (dp < old_at) shift += 1;
+                }
+                if (was_dropped) {
+                    new_at = 0;
+                } else if (old_at >= shift) {
+                    new_at = old_at - shift;
+                } else {
+                    new_at = 0;
+                }
+                if (new_at >= live_count) new_at = live_count - 1;
+            }
+            if (new_at != old_at) {
+                // Splice the activeTab attribute value. Find it
+                // exactly within the workbookView attrs.
+                const at_pat = "activeTab=\"";
+                if (std.mem.indexOf(u8, attrs, at_pat)) |off| {
+                    const val_start = (t_view.start + "<workbookView".len) + off + at_pat.len;
+                    const val_end = std.mem.indexOfScalarPos(u8, xml, val_start, '"') orelse {
+                        try out.appendSlice(allocator, xml[i..]);
+                        return try out.toOwnedSlice(allocator);
+                    };
+                    try out.appendSlice(allocator, xml[i..val_start]);
+                    try out.writer(allocator).print("{d}", .{new_at});
+                    i = val_end;
+                }
+            }
+        }
+    }
+
+    // Pass 2: emit the result, dropping deleted <sheet> lines.
     while (findTagOpen(xml, i, "sheet")) |t| {
         const attrs = xml[t.start + "<sheet".len .. t.after_open - 1];
         var dropped = false;
@@ -6602,15 +6687,11 @@ fn patchWorkbookXmlForDeletes(
             }
         }
         if (dropped) {
-            // Skip the `<sheet …/>` line entirely. Emit bytes from
-            // `i` up to `t.start`, then jump past the closing `>`.
             try out.appendSlice(allocator, xml[i..t.start]);
-            i = t.after_open;
         } else {
-            // Keep this `<sheet>` line + skip past its `>`.
             try out.appendSlice(allocator, xml[i..t.after_open]);
-            i = t.after_open;
         }
+        i = t.after_open;
     }
     try out.appendSlice(allocator, xml[i..]);
     return try out.toOwnedSlice(allocator);
