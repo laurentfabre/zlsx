@@ -5130,24 +5130,34 @@ fn insertCellIntoEmptyRow(
     col: u32,
     cell: Cell,
 ) !bool {
-    // Search for `<row r="N">` with N == row. Walk every row
-    // opening — the existing `findTagOpen` helper plus an r=
-    // attribute parse handles both self-closing and body forms.
+    // Walk every `<row>` opening matching either an explicit
+    // `r="N"` attribute OR the implicit row counter (1-based count
+    // of rows seen). OOXML allows r= to be omitted and
+    // scanWorksheetXml already supports it; this helper must match
+    // that semantics or it will misclassify cellless implicit-row
+    // rows as missing and duplicate them.
     var pos: usize = 0;
+    var implicit_row: u32 = 0;
     while (findTagOpen(ms.xml.items, pos, "row")) |t| {
+        implicit_row += 1;
         const attrs_full = ms.xml.items[t.start + "<row".len .. t.after_open - 1];
         const trimmed = std.mem.trimRight(u8, attrs_full, " \t\r\n");
         const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
         const attrs = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
-        const r_attr = getAttr(attrs, "r") orelse {
-            pos = t.after_open;
-            continue;
+        const effective_row: u32 = blk: {
+            if (getAttr(attrs, "r")) |r_attr| {
+                const parsed = std.fmt.parseInt(u32, r_attr, 10) catch 0;
+                if (parsed > 0) break :blk parsed;
+            }
+            // Same recovery cascade Rows.next uses: try the body's
+            // first cell ref, fall back to the implicit counter.
+            if (!is_self_closing) {
+                if (recoverRowFromFirstCell(ms.xml.items, t.after_open)) |n|
+                    break :blk n;
+            }
+            break :blk implicit_row;
         };
-        const r_val = std.fmt.parseInt(u32, r_attr, 10) catch {
-            pos = t.after_open;
-            continue;
-        };
-        if (r_val != row) {
+        if (effective_row != row) {
             pos = t.after_open;
             continue;
         }
