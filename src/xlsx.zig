@@ -4092,12 +4092,34 @@ pub const Editor = struct {
     /// passthrough path. Each `AppendBuffer.rows` slice + every
     /// inner row slice is allocator-owned.
     pending_appends: std.AutoHashMapUnmanaged(u32, AppendBuffer),
+    /// Pending in-place cell mutations per sheet (Phase 3d / iter-cm-2).
+    /// Each entry holds the decompressed-and-mutated worksheet XML
+    /// plus an in-sync span index. Populated lazily by `setCell` on
+    /// first call; consumed at `save`. Cannot coexist with
+    /// `pending_appends` for the same sheet — refused with
+    /// `error.SheetHasUnsavedAppends` (or the symmetric
+    /// `error.SheetHasUnsavedMutations` from `appendRows`).
+    pending_mutations: std.AutoHashMapUnmanaged(u32, MutatedSheet),
 
     /// Buffered appended rows for one sheet. iter-lms-2 accepts
     /// numeric / integer / boolean / empty cells only — string cells
     /// require SST extension which lands in iter-lms-3.
     pub const AppendBuffer = struct {
         rows: std.ArrayListUnmanaged([]Cell) = .{},
+    };
+
+    /// Decompressed worksheet XML kept resident so successive
+    /// `setCell` calls amortise the decompress + tokenize cost.
+    /// `spans` is kept in source-order and in sync with `xml` —
+    /// every splice updates both.
+    pub const MutatedSheet = struct {
+        xml: std.ArrayListUnmanaged(u8) = .{},
+        spans: std.ArrayListUnmanaged(CellSpan) = .{},
+
+        pub fn deinit(self: *MutatedSheet, allocator: Allocator) void {
+            self.xml.deinit(allocator);
+            self.spans.deinit(allocator);
+        }
     };
 
     /// Per-entry spans captured by the iter-lms-1b raw-ZIP scanner.
@@ -4308,6 +4330,7 @@ pub const Editor = struct {
             .eocd_comment = eocd_comment,
             .sheet_paths = sheet_paths_owned,
             .pending_appends = .{},
+            .pending_mutations = .{},
         };
     }
 
@@ -4328,6 +4351,9 @@ pub const Editor = struct {
             buf.rows.deinit(self.allocator);
         }
         self.pending_appends.deinit(self.allocator);
+        var mit = self.pending_mutations.valueIterator();
+        while (mit.next()) |m| m.deinit(self.allocator);
+        self.pending_mutations.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -4345,6 +4371,11 @@ pub const Editor = struct {
     /// readers recognise it.
     pub fn appendRows(self: *Editor, sheet_idx: u32, rows: []const []const Cell) !void {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
+        // Refuse to mix appends with `setCell` mutations on the same
+        // sheet. The two paths build the modified XML differently
+        // (delta vs full-buffer); merging them safely needs design
+        // work that hasn't shipped. Symmetric guard on `setCell`.
+        if (self.pending_mutations.contains(sheet_idx)) return error.SheetHasUnsavedMutations;
         // Empty append is a documented no-op — recording it as a
         // pending mutation would underflow the row-index math in
         // `buildSubstitutedSheet` (start_row + 0 - 1 = u32.max).
@@ -4416,7 +4447,7 @@ pub const Editor = struct {
         defer atomic_file.deinit();
         const w = &atomic_file.file_writer.interface;
 
-        if (self.pending_appends.count() == 0) {
+        if (self.pending_appends.count() == 0 and self.pending_mutations.count() == 0) {
             try w.writeAll(self.src_buf);
             try atomic_file.finish();
             return;
@@ -4497,6 +4528,23 @@ pub const Editor = struct {
                 buf.rows.items,
                 sst_ptr,
             );
+        }
+
+        // iter-cm-2a: pending in-place cell mutations. The mutated
+        // XML buffer is already complete — just pipe it through
+        // `buildEntryFromXml` to get a fresh LFH/CDFH + payload.
+        // appendRows + setCell on the same sheet is rejected at
+        // mutation time so there's no merge step here.
+        var pm_iter = self.pending_mutations.iterator();
+        while (pm_iter.next()) |kv| {
+            const sheet_idx = kv.key_ptr.*;
+            const path = self.sheet_paths[sheet_idx];
+            const entry_idx = findEntryByName(self.entries, path) orelse
+                return error.SheetEntryNotFound;
+            const new_xml = try self.allocator.dupe(u8, kv.value_ptr.xml.items);
+            // buildEntryFromXml takes ownership of `new_xml` and
+            // frees it on its own — no errdefer needed here.
+            subs[entry_idx] = try buildEntryFromXml(self.allocator, path, new_xml);
         }
 
         // Appendix entries: brand-new ZIP entries that don't exist
@@ -4737,7 +4785,176 @@ pub const Editor = struct {
         const cells = try scanWorksheetXml(self.allocator, xml);
         return .{ .allocator = self.allocator, .xml = xml, .cells = cells };
     }
+
+    /// Replace one cell's value in place (Phase 3d, iter-cm-2a).
+    /// First call on a sheet decompresses + scans it into
+    /// `pending_mutations`; subsequent calls splice the cached XML
+    /// directly. v1 limitations:
+    ///   - cell type: numeric / integer / boolean / empty only;
+    ///     string cells return `error.SetCellStringNotImplementedYet`
+    ///     until iter-cm-2b ships SST integration.
+    ///   - target: the (row, col) must already exist in the sheet;
+    ///     missing cells return `error.SetCellMissingTarget`,
+    ///     missing rows the same. iter-cm-2c/d add the insert paths.
+    ///   - source attrs: the replacement is a fresh canonical
+    ///     `<c r="REF"…>` — formulas / inline strings / phonetic
+    ///     hints / unknown attrs on the source span are NOT
+    ///     preserved. iter-cm-2b documents the preservation
+    ///     contract; reject for now.
+    pub fn setCell(
+        self: *Editor,
+        sheet_idx: u32,
+        row: u32,
+        col: u32,
+        cell: Cell,
+    ) !void {
+        if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
+        if (self.pending_appends.contains(sheet_idx)) return error.SheetHasUnsavedAppends;
+        if (row == 0) return error.RowIndexOutOfRange;
+        if (col >= max_col_1based) return error.ColumnIndexOutOfRange;
+
+        switch (cell) {
+            .integer => |n| {
+                const writer_mod = @import("writer.zig");
+                if (!writer_mod.fitsExactlyInF64(n)) return error.IntegerExceedsExcelPrecision;
+            },
+            .string => return error.SetCellStringNotImplementedYet,
+            .number, .boolean, .empty => {},
+        }
+
+        // Track whether we created the MutatedSheet entry on this
+        // call. If we did AND the rest of setCell errors out,
+        // remove the empty/uncommitted entry — leaving it would
+        // wrongly poison subsequent appendRows on the same sheet
+        // with `error.SheetHasUnsavedMutations`. If a prior
+        // successful setCell already populated the entry, leave
+        // it alone.
+        const ms_existed_before = self.pending_mutations.contains(sheet_idx);
+        const ms = try self.getOrInitMutatedSheet(sheet_idx);
+        errdefer if (!ms_existed_before) {
+            if (self.pending_mutations.fetchRemove(sheet_idx)) |kv| {
+                var v = kv.value;
+                v.deinit(self.allocator);
+            }
+        };
+
+        // Locate the existing span. v1 doesn't insert.
+        var idx: ?usize = null;
+        for (ms.spans.items, 0..) |s, i| {
+            if (s.row == row and s.col == col) {
+                idx = i;
+                break;
+            }
+        }
+        const span_idx = idx orelse return error.SetCellMissingTarget;
+        const old = ms.spans.items[span_idx];
+
+        // Build the replacement bytes.
+        var new_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer new_buf.deinit(self.allocator);
+        try emitCellXml(self.allocator, &new_buf, row, col, cell);
+
+        // Splice xml[old.start..old.end] = new_buf.
+        const old_len = old.end - old.start;
+        const new_len = new_buf.items.len;
+        try ms.xml.replaceRange(self.allocator, old.start, old_len, new_buf.items);
+
+        // Shift later spans by the byte delta. Spans whose start
+        // is BEFORE old.start are unchanged. Spans starting AT or
+        // AFTER old.end shift by `new_len - old_len`.
+        const old_end = old.end;
+        for (ms.spans.items, 0..) |*s, i| {
+            if (i == span_idx) continue;
+            if (s.start >= old_end) {
+                // Use signed arithmetic to handle shrink/grow uniformly.
+                const start_signed: isize = @as(isize, @intCast(s.start)) +
+                    @as(isize, @intCast(new_len)) - @as(isize, @intCast(old_len));
+                const end_signed: isize = @as(isize, @intCast(s.end)) +
+                    @as(isize, @intCast(new_len)) - @as(isize, @intCast(old_len));
+                const body_signed: isize = @as(isize, @intCast(s.body_start)) +
+                    @as(isize, @intCast(new_len)) - @as(isize, @intCast(old_len));
+                s.start = @intCast(start_signed);
+                s.end = @intCast(end_signed);
+                s.body_start = @intCast(body_signed);
+            }
+        }
+        // Update the targeted span. The replacement always emits
+        // `<c r="REF" …>…</c>` (or `<c r="REF"/>` for empty), so
+        // body_start = position of '>' just past the opening tag.
+        const opening_gt = std.mem.indexOfScalar(u8, new_buf.items, '>') orelse
+            unreachable;
+        ms.spans.items[span_idx] = .{
+            .start = old.start,
+            .end = old.start + new_len,
+            .body_start = old.start + opening_gt + 1,
+            .row = row,
+            .col = col,
+        };
+    }
+
+    fn getOrInitMutatedSheet(self: *Editor, sheet_idx: u32) !*MutatedSheet {
+        const gop = try self.pending_mutations.getOrPut(self.allocator, sheet_idx);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+            errdefer {
+                gop.value_ptr.deinit(self.allocator);
+                _ = self.pending_mutations.remove(sheet_idx);
+            }
+            const path = self.sheet_paths[sheet_idx];
+            const entry_idx = findEntryByName(self.entries, path) orelse
+                return error.SheetEntryNotFound;
+            const entry = self.entries[entry_idx];
+            const payload = self.src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
+            const xml = try decompressZipPayload(
+                self.allocator,
+                payload,
+                entry.compression_method,
+                entry.uncompressed_size,
+            );
+            defer self.allocator.free(xml);
+            try gop.value_ptr.xml.appendSlice(self.allocator, xml);
+            const spans = try scanWorksheetXml(self.allocator, gop.value_ptr.xml.items);
+            defer self.allocator.free(spans);
+            try gop.value_ptr.spans.appendSlice(self.allocator, spans);
+        }
+        return gop.value_ptr;
+    }
 };
+
+/// Emit a fresh `<c r="REF"…>…</c>` for one cell. Output is canonical
+/// (no formula, no inline-string body, no preserved source attrs)
+/// — iter-cm-2a contract. Caller owns `out`'s buffer.
+fn emitCellXml(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    row: u32,
+    col: u32,
+    cell: Cell,
+) !void {
+    const writer_mod = @import("writer.zig");
+    var ref_buf: [16]u8 = undefined;
+    const ref = try writer_mod.formatCellRef(&ref_buf, row, @intCast(col));
+
+    // Empty cells get a self-closing form to match what writers emit.
+    if (cell == .empty) {
+        try out.writer(allocator).print("<c r=\"{s}\"/>", .{ref});
+        return;
+    }
+
+    const type_attr: []const u8 = switch (cell) {
+        .boolean => " t=\"b\"",
+        else => "",
+    };
+    try out.writer(allocator).print("<c r=\"{s}\"{s}>", .{ ref, type_attr });
+    switch (cell) {
+        .empty => unreachable,
+        .string => unreachable, // gated above
+        .integer => |n| try out.writer(allocator).print("<v>{d}</v>", .{n}),
+        .number => |f| try out.writer(allocator).print("<v>{d}</v>", .{f}),
+        .boolean => |b| try out.writer(allocator).print("<v>{d}</v>", .{@intFromBool(b)}),
+    }
+    try out.appendSlice(allocator, "</c>");
+}
 
 /// Walk worksheet XML and emit a span per `<c>` element. Pure
 /// function — no allocator state beyond the returned slice. Mirrors
@@ -6876,6 +7093,138 @@ test "scanWorksheetXml: pretty-printed cells (newline after <c) + r-less rows" {
     try std.testing.expectEqual(@as(u32, 1), cells[1].col);
     try std.testing.expectEqual(@as(u32, 12), cells[2].row);
     try std.testing.expectEqual(@as(u32, 0), cells[2].col);
+}
+
+test "Editor: setCell replaces a numeric cell in place (iter-cm-2a)" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_setcell_basic_src.xlsx";
+    const dst_path = "/tmp/zlsx_setcell_basic_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 } });
+        try s.writeRow(&.{ .{ .integer = 3 }, .{ .integer = 4 } });
+        try w.save(src_path);
+    }
+
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.setCell(0, 1, 1, .{ .integer = 99 }); // B1: 2 -> 99
+        try ed.setCell(0, 2, 0, .{ .number = 3.5 }); // A2: 3 -> 3.5
+        try ed.save(dst_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+
+    const r1 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 1), r1[0].integer);
+    try std.testing.expectEqual(@as(i64, 99), r1[1].integer);
+
+    const r2 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(f64, 3.5), r2[0].number);
+    try std.testing.expectEqual(@as(i64, 4), r2[1].integer);
+}
+
+test "Editor: setCell amortises decompress across many calls (iter-cm-2a)" {
+    // Lazy-init the MutatedSheet on first call; subsequent calls
+    // mutate the cached buffer.
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_setcell_many.xlsx";
+    const dst_path = "/tmp/zlsx_setcell_many_dst.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        var i: u32 = 0;
+        while (i < 10) : (i += 1) {
+            try s.writeRow(&.{ .{ .integer = i }, .{ .integer = i * 2 }, .{ .integer = i * 3 } });
+        }
+        try w.save(src_path);
+    }
+
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        // Set every cell to 999. After this only the (row, col) -> 999
+        // mapping should hold.
+        var r: u32 = 1;
+        while (r <= 10) : (r += 1) {
+            var c: u32 = 0;
+            while (c < 3) : (c += 1) {
+                try ed.setCell(0, r, c, .{ .integer = 999 });
+            }
+        }
+        try ed.save(dst_path);
+    }
+
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    while (try rows.next()) |row| {
+        for (row) |cell| {
+            try std.testing.expectEqual(@as(i64, 999), cell.integer);
+        }
+    }
+}
+
+test "Editor: setCell rejects unsupported cases (iter-cm-2a)" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_setcell_reject.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    // Out-of-range sheet
+    try std.testing.expectError(error.SheetIndexOutOfRange, ed.setCell(99, 1, 0, .{ .integer = 1 }));
+    // Row 0 is invalid (1-based)
+    try std.testing.expectError(error.RowIndexOutOfRange, ed.setCell(0, 0, 0, .{ .integer = 1 }));
+    // String cells deferred to iter-cm-2b
+    try std.testing.expectError(error.SetCellStringNotImplementedYet, ed.setCell(0, 1, 0, .{ .string = "x" }));
+    // Lossy integer
+    try std.testing.expectError(error.IntegerExceedsExcelPrecision, ed.setCell(0, 1, 0, .{ .integer = 9007199254740993 }));
+    // Missing target
+    try std.testing.expectError(error.SetCellMissingTarget, ed.setCell(0, 5, 5, .{ .integer = 1 }));
+    // Mix with appendRows on same sheet — both directions.
+    try ed.appendRows(0, &.{&.{.{ .integer = 99 }}});
+    try std.testing.expectError(error.SheetHasUnsavedAppends, ed.setCell(0, 1, 0, .{ .integer = 2 }));
+}
+
+test "Editor: appendRows rejects sheets with pending setCell mutations" {
+    const writer_mod = @import("writer.zig");
+    const src_path = "/tmp/zlsx_setcell_then_append.xlsx";
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    try ed.setCell(0, 1, 0, .{ .integer = 2 });
+    try std.testing.expectError(
+        error.SheetHasUnsavedMutations,
+        ed.appendRows(0, &.{&.{.{ .integer = 99 }}}),
+    );
 }
 
 test "Editor: scanWorksheet rejects sheets with unsaved appendRows" {

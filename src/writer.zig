@@ -1921,7 +1921,7 @@ pub const SheetWriter = struct {
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
-fn formatCellRef(buf: *[16]u8, row: u32, col_idx: u32) ![]u8 {
+pub fn formatCellRef(buf: *[16]u8, row: u32, col_idx: u32) ![]u8 {
     // Column letter (1-based in xlsx: A=1, Z=26, AA=27 …).
     var col_chars: [8]u8 = undefined;
     var pos: usize = col_chars.len;
