@@ -49,8 +49,15 @@ jobs:
       - name: Compile fuzz binary
         # Build the test binary with -ffuzz instrumentation but DON'T
         # run it yet — separate compile + run so a compile failure
-        # surfaces clearly distinct from a fuzz crash.
-        run: zig build fuzz --summary all -ftime-report || true
+        # surfaces clearly distinct from a fuzz crash. Note: there's
+        # no clean way to compile-only without running in Zig 0.15.2
+        # (`addRunArtifact` isn't separable from the test invocation
+        # at the build-step level). Run with a tiny corpus-only
+        # exposure so this finishes in seconds; a true compile-error
+        # would surface here as a non-zero exit, while the long
+        # fuzz session in the next step is what actually exercises
+        # the runner.
+        run: zig build fuzz --summary all
 
       - name: Run fuzz session
         env:
