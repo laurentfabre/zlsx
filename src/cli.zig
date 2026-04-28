@@ -267,6 +267,17 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         "--list-sheets", "--header",     "--include-blanks", "--with-styles",
         "--sst-lazy",    "--all-sheets", "--help",
     };
+    // Value-bearing flags. `--key=value` is split into [--key, value]
+    // ONLY when key is one of these — otherwise the token is left
+    // verbatim, so an arbitrary `--Q=1` value passed via the
+    // two-token form (`--name --Q=1`) is consumed as a literal value
+    // by the preceding flag rather than misparsed as a new flag.
+    const value_flags = [_][]const u8{
+        "--sheet",      "--name",      "--format",  "--skip",
+        "--take",       "--start-row", "--end-row", "--range",
+        "--sheet-glob", "--output",    "--out",     "--ref",
+        "--value",      "--row",       "--col",     "--new-name",
+    };
     for (raw_argv) |raw| {
         if (raw.len >= 2 and raw[0] == '-' and raw[1] == '-') {
             if (std.mem.indexOfScalar(u8, raw, '=')) |eq| {
@@ -274,11 +285,25 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
                 for (boolean_flags) |bf| {
                     if (std.mem.eql(u8, key, bf)) return ArgError.BadArgValue;
                 }
-                if (split_count + 2 > split_buf.len) return ArgError.TooManyArgs;
-                split_buf[split_count] = key;
-                split_buf[split_count + 1] = raw[eq + 1 ..];
-                split_count += 2;
-                continue;
+                var is_value_flag = false;
+                for (value_flags) |vf| {
+                    if (std.mem.eql(u8, key, vf)) {
+                        is_value_flag = true;
+                        break;
+                    }
+                }
+                if (is_value_flag) {
+                    if (split_count + 2 > split_buf.len) return ArgError.TooManyArgs;
+                    split_buf[split_count] = key;
+                    split_buf[split_count + 1] = raw[eq + 1 ..];
+                    split_count += 2;
+                    continue;
+                }
+                // Unknown `--key=…` token — leave verbatim so it
+                // either survives as a literal value for the
+                // preceding flag (e.g. a `--name --foo=bar` where
+                // `--foo=bar` is the literal sheet name) or surfaces
+                // as UnknownFlag in the main parser.
             }
         }
         if (split_count >= split_buf.len) return ArgError.TooManyArgs;
@@ -4180,6 +4205,16 @@ test "parseArgs --key= with empty value is accepted as empty string" {
     const argv = [_][]const u8{ "file.xlsx", "--out=" };
     const a = try parseArgs(&argv);
     try std.testing.expectEqualStrings("", a.out_path.?);
+}
+
+test "parseArgs preserves unknown --foo=bar as literal value" {
+    // `--name --Q=1` should set the sheet name to literally "--Q=1",
+    // NOT split "--Q" as a flag (which would steal the literal from
+    // --name and leave 1 dangling as a positional). Only known
+    // value-flags get the `=` split.
+    const argv = [_][]const u8{ "rows", "f.xlsx", "--name", "--Q=1" };
+    const a = try parseArgs(&argv);
+    try std.testing.expectEqualStrings("--Q=1", a.sheet_name.?);
 }
 
 test "parseArgs rejects =value on boolean flags" {
