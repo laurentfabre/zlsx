@@ -26,6 +26,16 @@
 //! `absoluteAnchor` (pixel-pos) is detected but skipped — its `<xdr:pos>`
 //! shape doesn't fit the cell-grid contract; callers needing it can
 //! reach for the raw drawing XML via PartStore.part().
+//!
+//! ⚠️ Namespace-prefix assumption: this v1 parser hard-codes the
+//! `xdr:` prefix for the spreadsheetDrawing namespace and `a:` for
+//! drawingml. Every Microsoft Excel + LibreOffice + xlsxwriter +
+//! openpyxl + python-calamine fixture in the project's corpus uses
+//! these prefixes, but OOXML producers are technically free to pick
+//! any prefix. Workbooks with non-standard prefixes will surface
+//! zero anchors instead of erroring. A namespace-aware parser is
+//! queued as a future iter; until then the assumption is documented
+//! here as a known limitation.
 
 const std = @import("std");
 const store_mod = @import("store.zig");
