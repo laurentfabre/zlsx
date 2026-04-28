@@ -87,12 +87,18 @@ pub fn build(b: *std.Build) void {
     const unicode_tests = b.addTest(.{ .root_module = unicode_mod });
     test_step.dependOn(&b.addRunArtifact(unicode_tests).step);
 
-    // PartStore — read-only OOXML package layer (B0 milestone 1).
+    // PartStore — read-only OOXML package layer (B0 milestone 1) +
+    // byte-preserving save / replacePart (B0 milestone 2).
     const package_mod = b.createModule(.{
         .root_source_file = b.path("src/package/store.zig"),
         .target = target,
         .optimize = optimize,
     });
+    // M2.5: PartStore reuses writer.zig's deflateCompress for
+    // override compression. The writer module is otherwise self-
+    // contained (its only outbound dep is xlsx.zig, which is a
+    // public re-export namespace).
+    package_mod.addImport("writer", writer_mod);
     const package_tests = b.addTest(.{ .root_module = package_mod });
     test_step.dependOn(&b.addRunArtifact(package_tests).step);
 

@@ -174,18 +174,32 @@ pub const PartStore = struct {
 
         if (bytes.len > std.math.maxInt(u32)) return Error.Zip64NotSupported;
 
-        // M2 ships STORED-only overrides: each replaced part is
-        // emitted with compression method 0 (no deflate). This keeps
-        // the package layer free of a deflate-compressor dependency
-        // (the writer's deflateCompress lives in a separate module
-        // tree). Untouched parts still keep their original deflate
-        // payloads byte-for-byte, so file size only grows for the
-        // parts the caller actually replaces. Deflate-encoding for
-        // overrides is queued for B0 M2.5.
-        const owned = try ar_alloc.dupe(u8, bytes);
+        // Mirror Editor's compression policy:
+        //   - Sub-1 KiB inputs: STORED. Deflate's dynamic-block
+        //     header overhead dominates the gain on tiny XML.
+        //   - Larger inputs: deflate. Fall back to STORED if deflate
+        //     didn't actually shrink the payload.
+        var compressed: std.ArrayListUnmanaged(u8) = .{};
+        defer compressed.deinit(ar_alloc);
+        var method: u16 = 8;
+        if (bytes.len < 1024 or bytes.len == 0) {
+            method = 0;
+            try compressed.appendSlice(ar_alloc, bytes);
+        } else {
+            const writer_mod = @import("writer");
+            try writer_mod.deflateCompress(ar_alloc, bytes, &compressed);
+            if (compressed.items.len >= bytes.len) {
+                method = 0;
+                compressed.clearRetainingCapacity();
+                try compressed.appendSlice(ar_alloc, bytes);
+            }
+        }
+        if (compressed.items.len > std.math.maxInt(u32)) return Error.Zip64NotSupported;
+
+        const owned_payload = try compressed.toOwnedSlice(ar_alloc);
         self.overrides[idx] = .{
-            .payload = owned,
-            .compression_method = 0,
+            .payload = owned_payload,
+            .compression_method = method,
             .crc32 = std.hash.Crc32.hash(bytes),
             .uncompressed_size = @intCast(bytes.len),
         };
@@ -979,6 +993,43 @@ test "PartStore.replacePart + save: replaced part has new bytes; others untouche
         const d = dst.part("xl/sharedStrings.xml") orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualSlices(u8, s.bytes, d.bytes);
     }
+}
+
+test "PartStore.replacePart: large input round-trips through deflate" {
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "deflate_round_trip.xlsx" });
+    defer std.testing.allocator.free(out_path);
+
+    // Build a large, highly-compressible payload (10 KiB of repeated
+    // ASCII). M2.5 routes inputs >= 1 KiB through deflate and falls
+    // back to STORED only if deflate doesn't shrink — this should
+    // hit the deflate path.
+    var buf: [10 * 1024]u8 = undefined;
+    @memset(&buf, 'A');
+    const replacement: []const u8 = &buf;
+
+    {
+        var store = try PartStore.open(std.testing.allocator, fixture);
+        defer store.deinit();
+        try store.replacePart("xl/workbook.xml", replacement);
+        // Compression must shrink the payload — 10 KiB of one byte
+        // is the trivial deflate case.
+        const ov = store.overrides[store.findIndex("xl/workbook.xml").?].?;
+        try std.testing.expectEqual(@as(u16, 8), ov.compression_method);
+        try std.testing.expect(ov.payload.len < replacement.len);
+        try store.save(out_path);
+    }
+
+    var dst = try PartStore.open(std.testing.allocator, out_path);
+    defer dst.deinit();
+    const wb = dst.part("xl/workbook.xml") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, replacement, wb.bytes);
 }
 
 test "PartStore.replacePart: unknown part name returns PartNotFound" {
