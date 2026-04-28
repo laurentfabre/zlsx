@@ -66,6 +66,13 @@ pub fn build(b: *std.Build) void {
     const corpus_step = b.step("test-corpus", "Run integration tests against tests/corpus/*.xlsx");
     corpus_step.dependOn(&b.addRunArtifact(corpus_tests).step);
 
+    // Package-layer corpus sweep: walks every fixture through
+    // PartStore + imageAnchors + chartAnchors. Wired into both the
+    // dedicated `test-corpus` step and the default `test` step so
+    // the package layer's robustness is exercised on every CI run.
+    // The module itself is created further down once `package_mod`
+    // exists; the wiring is appended there.
+
     // CLI: `zlsx` binary, streams xlsx rows to stdout in JSONL / TSV / CSV.
     // `zig build` (default step) installs it at zig-out/bin/zlsx.
     const cli_mod = b.createModule(.{
@@ -172,6 +179,21 @@ pub fn build(b: *std.Build) void {
     package_drawings_tests_mod.addImport("writer", writer_mod);
     const package_drawings_tests = b.addTest(.{ .root_module = package_drawings_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_drawings_tests).step);
+
+    // tests/package_corpus.zig — corpus-level integration test for
+    // the package layer. Imports `zlsx_pkg` and walks every fixture
+    // through PartStore.open + partNames + imageAnchors +
+    // chartAnchors, asserting valid fixtures open clean and
+    // adversarial fixtures error typed instead of crashing.
+    const package_corpus_mod = b.createModule(.{
+        .root_source_file = b.path("tests/package_corpus.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    package_corpus_mod.addImport("zlsx_pkg", package_mod);
+    const package_corpus_tests = b.addTest(.{ .root_module = package_corpus_mod });
+    corpus_step.dependOn(&b.addRunArtifact(package_corpus_tests).step);
+    test_step.dependOn(&b.addRunArtifact(package_corpus_tests).step);
 
     // C ABI — both a shared library (for Python / cffi bindings) and a
     // static library (for language toolchains that prefer linking in).
