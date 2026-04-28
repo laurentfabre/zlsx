@@ -27,12 +27,18 @@ def _skip_if_missing(name: str) -> Path:
 
 
 def test_version_string_matches_package():
+    import zlsx
     import zlsx._ffi as ffi
 
     lib_version = ffi.lib.zlsx_version_string().decode("utf-8")
-    # Package version tracks the library's major.minor; patch may drift.
-    assert lib_version.startswith("0.2."), (
-        f"unexpected library version: {lib_version}"
+    # Package version tracks the library's major.minor; patch may
+    # drift. Derive the expected prefix from zlsx.__version__ so this
+    # test stays in sync with version bumps automatically rather than
+    # going stale every release.
+    expected_prefix = ".".join(zlsx.__version__.split(".")[:2]) + "."
+    assert lib_version.startswith(expected_prefix), (
+        f"library version {lib_version!r} does not match package "
+        f"major.minor prefix {expected_prefix!r}"
     )
 
 
