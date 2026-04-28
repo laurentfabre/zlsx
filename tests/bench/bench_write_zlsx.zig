@@ -35,7 +35,7 @@ pub fn main() !void {
 
     var sheet = try w.addSheet("Bench");
     try sheet.setColumnWidth(0, 20);
-    sheet.freezePanes(1, 0);
+    try sheet.freezePanes(1, 0);
 
     const header_cells = [_]xlsx.Cell{
         .{ .string = "Name" }, .{ .string = "Amount" }, .{ .string = "Share" },
