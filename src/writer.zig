@@ -3059,7 +3059,10 @@ const ZipWriter = struct {
         if (self.entries.items.len > std.math.maxInt(u16)) {
             return error.TooManyZipEntries;
         }
-        if (self.out.items.len > std.math.maxInt(u32)) {
+        // 0xFFFFFFFF is the Zip64 sentinel — readers (including
+        // zlsx's own) treat it as "look for Zip64 extra fields".
+        // We don't emit Zip64, so reject `>= 0xFFFFFFFF` strictly.
+        if (self.out.items.len >= std.math.maxInt(u32)) {
             return error.ZipArchiveTooLarge;
         }
         const cd_start: u32 = @intCast(self.out.items.len);
@@ -3093,7 +3096,9 @@ const ZipWriter = struct {
         // writing the CD so a workbook whose payloads fit in u32 but
         // whose CD pushes the archive past 4 GiB is rejected
         // explicitly rather than trapping in @intCast(cd_end) below.
-        if (self.out.items.len > std.math.maxInt(u32)) {
+        // Use `>=` to keep 0xFFFFFFFF (the Zip64 sentinel) out of
+        // the wire form.
+        if (self.out.items.len >= std.math.maxInt(u32)) {
             return error.ZipArchiveTooLarge;
         }
         const cd_end: u32 = @intCast(self.out.items.len);

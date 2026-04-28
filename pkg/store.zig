@@ -249,7 +249,10 @@ pub const PartStore = struct {
                 @as(u64, e.cdfh_total_len);
             projected += lfh_total + cdfh_total;
         }
-        if (projected > std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
+        // Strict `>=` keeps 0xFFFFFFFF out of the wire form — that
+        // value is the Zip64 sentinel; readers treat it as "look for
+        // Zip64 extras" and the archive is malformed for ZIP32.
+        if (projected >= std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
 
         var write_buf: [4096]u8 = undefined;
         var atomic_file = try std.fs.cwd().atomicFile(path, .{ .write_buffer = &write_buf });
