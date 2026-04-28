@@ -162,12 +162,19 @@ fn isSheetPart(part: store_mod.Part) bool {
         if (std.mem.endsWith(u8, ct, ".worksheet+xml")) return true;
         if (std.mem.eql(u8, ct, ct_worksheet_transitional)) return true;
     }
-    // Fallback to filename for content-type-less producers.
+    // Fallback to filename for content-type-less producers. The
+    // entire substring between `sheet` and `.xml` must be digits;
+    // a partial-digit prefix would let `sheet1_backup.xml` /
+    // `sheet1custom.xml` slip through and be walked as a worksheet.
     const prefix = "xl/worksheets/sheet";
+    const suffix = ".xml";
     if (!std.mem.startsWith(u8, part.name, prefix)) return false;
-    if (!std.mem.endsWith(u8, part.name, ".xml")) return false;
-    if (part.name.len <= prefix.len) return false;
-    return std.ascii.isDigit(part.name[prefix.len]);
+    if (!std.mem.endsWith(u8, part.name, suffix)) return false;
+    if (part.name.len <= prefix.len + suffix.len) return false;
+    const num_part = part.name[prefix.len .. part.name.len - suffix.len];
+    if (num_part.len == 0) return false;
+    for (num_part) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
 }
 
 fn collectFromSheet(
