@@ -1484,14 +1484,16 @@ export fn zlsx_writer_add_sheet(
         writeError(err_buf, err_buf_len, "OutOfMemory");
         return null;
     };
-    errdefer gpa.destroy(sw_state);
     sw_state.* = .{ .inner = inner };
     // Track the wrapper so writer_close() can free it. Previously
     // each wrapper was leaked "until process exit" — a long-lived
     // host (Python server, daemon) opening + closing many writers
     // would balloon RSS by sizeof(SheetWriterState) per sheet, per
-    // closed writer.
+    // closed writer. Note: this fn returns an optional, not an
+    // error union, so `errdefer` would not fire on the OOM path —
+    // free explicitly to avoid reintroducing the leak we just fixed.
     state.sheet_wrappers.append(gpa, sw_state) catch {
+        gpa.destroy(sw_state);
         writeError(err_buf, err_buf_len, "OutOfMemory");
         return null;
     };
