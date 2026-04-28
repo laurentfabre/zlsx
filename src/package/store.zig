@@ -342,7 +342,10 @@ pub const PartStore = struct {
     /// `drawings()` parser.
     ///
     /// Allocated inside the store's arena; valid until `deinit`.
-    pub fn imageParts(self: *const PartStore) []Part {
+    /// Returned as `[]const Part` because the slice is a read-only
+    /// filtered view; callers should treat the contents as immutable
+    /// borrows from the store.
+    pub fn imageParts(self: *const PartStore) []const Part {
         const ar_alloc = @constCast(&self.arena).allocator();
         var out: std.ArrayListUnmanaged(Part) = .empty;
         for (self.parts) |p| {
