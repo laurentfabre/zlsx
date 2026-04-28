@@ -35,6 +35,25 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run zlsx unit + fuzz-smoke tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
+    // B-fuzz: coverage-guided fuzz step. Runs the same test binary
+    // as `zig build test` but with -ffuzz instrumentation, so any
+    // test that calls `std.testing.fuzz(...)` becomes a
+    // coverage-guided target. Linux x64 is the production platform
+    // per the roadmap; macOS/Windows are gated on Zig upstream
+    // fixes. Use `zig build fuzz` to launch.
+    const unit_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/xlsx.zig"),
+        .target = target,
+        .optimize = optimize,
+        // The `fuzz: ?bool` flag on Module flips the compile to
+        // emit -ffuzz instrumentation. `addTest` doesn't expose
+        // this directly in Zig 0.15.2 — set it on the module.
+        .fuzz = true,
+    });
+    const unit_fuzz_tests = b.addTest(.{ .root_module = unit_fuzz_mod });
+    const fuzz_step = b.step("fuzz", "Run coverage-guided fuzz targets (Linux x64; macOS/Windows broken upstream)");
+    fuzz_step.dependOn(&b.addRunArtifact(unit_fuzz_tests).step);
+
     // Integration tests: tests/xlsx_corpus.zig, fed by
     // scripts/fetch_test_corpus.sh into tests/corpus/.
     const corpus_mod = b.createModule(.{

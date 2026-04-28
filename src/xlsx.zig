@@ -13198,6 +13198,85 @@ test "fuzz extractVValue" {
     }
 }
 
+// ─── B-fuzz: coverage-guided fuzz targets ─────────────────────────────
+//
+// These call std.testing.fuzz() so they benefit from `-ffuzz`
+// instrumentation when a Linux fuzz workflow runs `zig build fuzz`.
+// Without the flag they run their corpus once each as a deterministic
+// regression test (also useful in CI).
+//
+// Seed corpora live in tests/fuzz/corpus/<target>/, embedded via
+// @embedFile so the test binary stays self-contained — no runtime
+// filesystem access required.
+
+fn fuzzParseSharedStringsTarget(_: void, input: []const u8) anyerror!void {
+    var book: Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer book.deinit();
+    // parseSharedStrings may borrow spans from the xml buffer; dupe
+    // so the buffer outlives the book regardless of the borrowing
+    // choice the parser made.
+    const owned = std.testing.allocator.dupe(u8, input) catch return;
+    book.shared_strings_xml = owned;
+    parseSharedStrings(&book, owned) catch {};
+}
+
+test "fuzz parseSharedStrings — coverage-guided" {
+    // Seeds intentionally inlined as comptime strings rather than
+    // @embedFile'd from tests/fuzz/corpus/: the unit-test module's
+    // package boundary doesn't include the tests/ tree, so embeds
+    // would fail. Expanding via build.zig anonymous imports is
+    // possible but adds wiring noise; inlining stays compact while
+    // documenting the canonical seed shapes. The corpus files at
+    // tests/fuzz/corpus/parse_shared_strings/ stay around as the
+    // canonical reference + mirror for an external fuzz harness.
+    const empty = "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"0\" uniqueCount=\"0\"/>";
+    const single = "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"1\" uniqueCount=\"1\"><si><t>hello</t></si></sst>";
+    const rich = "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"1\" uniqueCount=\"1\"><si><r><rPr><b/></rPr><t>bold</t></r><r><t> normal</t></r></si></sst>";
+    const phonetic = "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"1\" uniqueCount=\"1\"><si><t>\xE6\xBC\xA2\xE5\xAD\x97</t><rPh sb=\"0\" eb=\"2\"><t>\xE3\x81\x8B\xE3\x82\x93\xE3\x81\x98</t></rPh></si></sst>";
+    try std.testing.fuzz({}, fuzzParseSharedStringsTarget, .{
+        .corpus = &.{ empty, single, rich, phonetic },
+    });
+}
+
+fn fuzzParseWorkbookSheetsTarget(_: void, input: []const u8) anyerror!void {
+    // The workbook parser also wants a rels XML alongside the
+    // workbook bytes. Use a fixed minimal rels so the fuzzer can
+    // mutate the workbook side without losing coverage on the rels
+    // path (which has its own fuzz target).
+    const rels_xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>" ++
+        "</Relationships>";
+    var book: Book = .{
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer book.deinit();
+    parseWorkbookSheets(&book, input, rels_xml) catch {};
+}
+
+test "fuzz parseWorkbookSheets — coverage-guided" {
+    const minimal =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+        "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">" ++
+        "<sheets><sheet name=\"Sheet1\" sheetId=\"1\" r:id=\"rId1\"/></sheets>" ++
+        "</workbook>";
+    const multi =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+        "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">" ++
+        "<workbookPr date1904=\"0\"/><bookViews><workbookView activeTab=\"0\"/></bookViews>" ++
+        "<sheets><sheet name=\"Sheet1\" sheetId=\"1\" r:id=\"rId1\"/><sheet name=\"R&amp;D\" sheetId=\"2\" r:id=\"rId2\"/></sheets>" ++
+        "<definedNames><definedName name=\"MyRange\">Sheet1!$A$1:$B$2</definedName></definedNames>" ++
+        "</workbook>";
+    try std.testing.fuzz({}, fuzzParseWorkbookSheetsTarget, .{
+        .corpus = &.{ minimal, multi },
+    });
+}
+
 test "fuzz parseSharedStrings" {
     const iters = fuzzIterations();
     var prng = std.Random.DefaultPrng.init(fuzzSeed());
