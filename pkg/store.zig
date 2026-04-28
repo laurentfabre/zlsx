@@ -270,10 +270,20 @@ pub const PartStore = struct {
             .uncompressed_size = @intCast(bytes.len),
         };
 
-        // Grow the parallel arrays — last fallible step.
-        const grown_entries = try ar_alloc.realloc(self.entries, self.entries.len + 1);
-        const grown_parts = try ar_alloc.realloc(self.parts, self.parts.len + 1);
-        const grown_overrides = try ar_alloc.realloc(self.overrides, self.overrides.len + 1);
+        // Grow the parallel arrays via alloc+copy rather than
+        // realloc. realloc invalidates the source slice on
+        // relocation, so a successful realloc on entries followed
+        // by a failed realloc on parts would leave self.entries
+        // pointing into freed memory. With alloc+copy the old
+        // slices stay valid (the arena holds their backing storage
+        // until deinit), so a later allocation failure leaves the
+        // store fully unchanged.
+        const grown_entries = try ar_alloc.alloc(ZipEntry, self.entries.len + 1);
+        @memcpy(grown_entries[0..self.entries.len], self.entries);
+        const grown_parts = try ar_alloc.alloc(Part, self.parts.len + 1);
+        @memcpy(grown_parts[0..self.parts.len], self.parts);
+        const grown_overrides = try ar_alloc.alloc(?Override, self.overrides.len + 1);
+        @memcpy(grown_overrides[0..self.overrides.len], self.overrides);
 
         // ─── Commit point: every step from here on is infallible ──
         grown_entries[grown_entries.len - 1] = new_entry;
