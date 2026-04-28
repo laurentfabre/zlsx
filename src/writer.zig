@@ -3097,15 +3097,20 @@ const ZipWriter = struct {
 
         // What matters for ZIP32 sentinel-safety is the SERIALIZED
         // cd_size field — NOT the cd_end position (which isn't on
-        // wire). Compute cd_size in u64 to avoid casting cd_end,
-        // which would falsely reject archives whose total length
-        // straddles 4 GiB but whose cd_offset + cd_size both stay
-        // below the sentinel.
+        // wire). Compute cd_size in u64 to avoid casting cd_end.
         const cd_size_u64 = self.out.items.len - cd_start;
         if (cd_size_u64 >= std.math.maxInt(u32)) {
             return error.ZipArchiveTooLarge;
         }
         const cd_size: u32 = @intCast(cd_size_u64);
+        // Round-trip guard: zlsx's reader rejects files whose
+        // stat.size > maxInt(u32) (we don't support Zip64). Also
+        // reject when the total written-so-far + EOCD would push
+        // past 4 GiB, so we don't generate archives we can't open.
+        // EndRecord is fixed-size; we use a generous overhead.
+        if (self.out.items.len + 22 > std.math.maxInt(u32)) {
+            return error.ZipArchiveTooLarge;
+        }
 
         const end: std.zip.EndRecord = .{
             .signature = std.zip.end_record_sig,

@@ -259,6 +259,13 @@ pub const PartStore = struct {
         }
         if (lfh_phase_total >= std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
         if (cdfh_phase_total >= std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
+        // Round-trip guard: zlsx's own reader rejects any file
+        // whose stat.size exceeds u32 (we don't support Zip64).
+        // Producing an archive larger than that would be unreadable
+        // by ourselves, so cap total length too.
+        const total_projected = lfh_phase_total + cdfh_phase_total +
+            @as(u64, eocd_min_size) + @as(u64, self.eocd_comment.len);
+        if (total_projected > std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
 
         var write_buf: [4096]u8 = undefined;
         var atomic_file = try std.fs.cwd().atomicFile(path, .{ .write_buffer = &write_buf });
