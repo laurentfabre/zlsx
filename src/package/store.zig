@@ -231,8 +231,13 @@ pub const PartStore = struct {
                 written += @as(u64, lfh_bytes.len) + @as(u64, e.name.len) + @as(u64, ov.payload.len);
             } else {
                 // Untouched: copy LFH + payload bytes byte-for-byte.
+                // For entries with a data descriptor (flag 0x0008),
+                // ALSO copy the trailing 12/16-byte descriptor — the
+                // CDFH still advertises that flag, so a reader will
+                // expect those bytes after the payload.
                 const lfh = self.src_buf[e.lfh_offset .. e.lfh_offset + e.lfh_total_len];
-                const payload = self.src_buf[e.payload_offset .. e.payload_offset + e.compressed_size];
+                const payload_end = e.payload_offset + e.compressed_size + e.data_descriptor_len;
+                const payload = self.src_buf[e.payload_offset..payload_end];
                 try w.writeAll(lfh);
                 try w.writeAll(payload);
                 written += @as(u64, lfh.len) + @as(u64, payload.len);
@@ -409,6 +414,12 @@ const ZipEntry = struct {
     uncompressed_size: u32,
     compression_method: u16,
     crc32: u32,
+    /// Length of the data descriptor that follows the payload, in
+    /// bytes. 0 when the data-descriptor flag (0x0008) is clear; 12
+    /// or 16 when set (16 if the optional 0x08074b50 signature is
+    /// present, 12 otherwise). save() copies these bytes verbatim
+    /// for untouched entries so the archive stays valid.
+    data_descriptor_len: usize,
 };
 
 /// Override = caller-supplied replacement bytes for an existing part.
@@ -489,6 +500,19 @@ fn scanCentralDirectory(arena: std.mem.Allocator, buf: []const u8) ![]ZipEntry {
 
         const cdfh_total = 46 + @as(usize, filename_len) + @as(usize, extra_len) + @as(usize, comment_len);
 
+        // Data-descriptor detection. When flag 0x0008 is set, the
+        // payload is followed by 12 or 16 bytes (16 if the optional
+        // 0x08074b50 signature is present). Peek to distinguish.
+        var dd_len: usize = 0;
+        if (flags & 0x0008 != 0) {
+            const after = payload_offset + compressed_size;
+            if (after + 4 > buf.len) return Error.BadZip;
+            const peek = std.mem.readInt(u32, buf[after..][0..4], .little);
+            const dd_signature: u32 = 0x08074b50;
+            dd_len = if (peek == dd_signature) 16 else 12;
+            if (after + dd_len > buf.len) return Error.BadZip;
+        }
+
         try out.append(arena, .{
             .name = try arena.dupe(u8, name),
             .lfh_offset = lfh_offset,
@@ -500,6 +524,7 @@ fn scanCentralDirectory(arena: std.mem.Allocator, buf: []const u8) ![]ZipEntry {
             .uncompressed_size = uncompressed_size,
             .compression_method = compression_method,
             .crc32 = crc32,
+            .data_descriptor_len = dd_len,
         });
 
         cur = name_start + filename_len + extra_len + comment_len;
@@ -831,6 +856,24 @@ test "PartStore.resolve: relative + absolute targets" {
     // Absolute: "/xl/workbook.xml" → "xl/workbook.xml".
     const r3 = (try store.resolve("anywhere", "/xl/workbook.xml")).?;
     try std.testing.expectEqualStrings("xl/workbook.xml", r3);
+}
+
+test "PartStore: data descriptors detected in fixtures with flag 0x0008" {
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+
+    var store = try PartStore.open(std.testing.allocator, fixture);
+    defer store.deinit();
+
+    // frictionless_2sheets.xlsx has data-descriptor flag set on every
+    // entry (verified via Python's zipfile module). Confirm the
+    // scanner detects + records the descriptor length so save()
+    // copies those bytes.
+    var with_dd: usize = 0;
+    for (store.entries) |e| {
+        if (e.data_descriptor_len > 0) with_dd += 1;
+    }
+    try std.testing.expect(with_dd > 0);
 }
 
 test "PartStore.save: byte-preserving round-trip with no mutations" {
