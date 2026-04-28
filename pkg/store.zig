@@ -559,18 +559,23 @@ fn scanCentralDirectory(arena: std.mem.Allocator, buf: []const u8) ![]ZipEntry {
     const cd_offset = std.mem.readInt(u32, buf[eocd_off + 16 ..][0..4], .little);
 
     if (cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF) return Error.Zip64NotSupported;
-    // Saturating add (`+|`) keeps the check correct on 32-bit targets
-    // where usize is u32 and `cd_offset + cd_size` could wrap. Same
-    // pattern is reused below for every attacker-controlled offset.
-    if (cd_offset +| cd_size > buf.len) return Error.BadZip;
+    // Widen to usize BEFORE the saturating add. Both fields are u32,
+    // so `cd_offset +| cd_size` would otherwise saturate at u32::max
+    // (0xFFFFFFFF), and a genuine 4 GiB+1 sum on a 64-bit build with
+    // a >4 GiB buf would compare equal to buf.len = 4 GiB and slip
+    // through. Casting first lets the saturation operate at usize
+    // width — correct on both 32-bit and 64-bit targets.
+    const cd_off_us: usize = cd_offset;
+    const cd_size_us: usize = cd_size;
+    if (cd_off_us +| cd_size_us > buf.len) return Error.BadZip;
 
     var out: std.ArrayListUnmanaged(ZipEntry) = .empty;
     try out.ensureTotalCapacity(arena, total_records);
 
-    var cur: usize = cd_offset;
-    // Safe: `cd_offset +| cd_size > buf.len` was just rejected, so
-    // the non-saturating add fits both `usize` and `buf.len`.
-    const cd_end = cd_offset + cd_size;
+    var cur: usize = cd_off_us;
+    // Safe: `cd_off_us +| cd_size_us > buf.len` was just rejected,
+    // so the non-saturating sum fits usize.
+    const cd_end = cd_off_us + cd_size_us;
     var idx: usize = 0;
     while (cur + 46 <= cd_end and idx < total_records) : (idx += 1) {
         const sig = std.mem.readInt(u32, buf[cur..][0..4], .little);
@@ -605,7 +610,8 @@ fn scanCentralDirectory(arena: std.mem.Allocator, buf: []const u8) ![]ZipEntry {
 
         // Compute payload offset by reading the LFH (its filename +
         // extra fields can differ from the CDFH copy).
-        if (lfh_offset +| 30 > buf.len) return Error.BadZip;
+        const lfh_off_us: usize = lfh_offset; // widen for the bounds math
+        if (lfh_off_us +| 30 > buf.len) return Error.BadZip;
         const lfh_sig = std.mem.readInt(u32, buf[lfh_offset..][0..4], .little);
         if (lfh_sig != lfh_signature) return Error.BadZip;
         const lfh_name_len = std.mem.readInt(u16, buf[lfh_offset + 26 ..][0..2], .little);
@@ -613,9 +619,10 @@ fn scanCentralDirectory(arena: std.mem.Allocator, buf: []const u8) ![]ZipEntry {
         // 30 + 2×u16 ≤ 30 + 131070 — fits both u32 and usize without
         // overflow concerns. lfh_total_len is bounded by definition.
         const lfh_total_len = 30 + @as(usize, lfh_name_len) + @as(usize, lfh_extra_len);
-        const payload_offset = lfh_offset +| lfh_total_len;
+        const payload_offset = lfh_off_us +| lfh_total_len;
         if (payload_offset > buf.len) return Error.BadZip;
-        if (payload_offset +| compressed_size > buf.len) return Error.BadZip;
+        const compressed_us: usize = compressed_size;
+        if (payload_offset +| compressed_us > buf.len) return Error.BadZip;
 
         const cdfh_total = 46 + @as(usize, filename_len) + @as(usize, extra_len) + @as(usize, comment_len);
 
