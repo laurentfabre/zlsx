@@ -75,9 +75,11 @@ jobs:
           cp scripts/bench_ci.sh /tmp/bench-helpers/
           chmod +x /tmp/bench-helpers/bench_ci.sh
           # Always restore HEAD on exit so subsequent steps see the
-          # PR tree, regardless of whether the bench succeeded.
-          trap 'git checkout "$HEAD_SHA" -- 2>/dev/null || true' EXIT
-          git checkout "$BASE_SHA" --
+          # PR tree, regardless of whether the bench succeeded. Use
+          # `git switch --detach` (no trailing `--`) so the syntax is
+          # unambiguously a tree-switch and not a pathspec checkout.
+          trap 'git switch --detach "$HEAD_SHA" 2>/dev/null || true' EXIT
+          git switch --detach "$BASE_SHA"
           # Run from the snapshot path; the script reads src/ and
           # tests/corpus/ relative to $PWD, both of which are now
           # the base tree (which is what we want to bench).
