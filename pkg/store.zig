@@ -991,13 +991,20 @@ fn parseRelationships(arena: std.mem.Allocator, xml: []const u8) ![]Relationship
             .internal;
 
         try out.append(arena, .{
-            .id = try decodeXmlEntities(arena, id),
-            .type = try decodeXmlEntities(arena, rtype),
-            // Target gets the same treatment — `Target="../media/logo&amp;1.png"`
-            // must resolve to the ZIP part `xl/media/logo&1.png`, not
-            // the literal `&amp;` form. Without this, `store.resolve`
-            // silently misses any image / chart whose archive name
-            // contains `&` / `<` / `>` / `"` / `'`.
+            // Id and Type are kept raw because they're cross-
+            // referenced verbatim from other OOXML parts (sheet
+            // <drawing r:id=…> looks up Id via raw string compare;
+            // Type is a URI that's compared by exact string).
+            // Decoding here without decoding the referring side
+            // would silently break lookups for IDs / Types that
+            // contain entities (rare but valid). Target is the
+            // only field that flows into part-name resolution, so
+            // it's the only one where decoding actually helps.
+            .id = try arena.dupe(u8, id),
+            .type = try arena.dupe(u8, rtype),
+            // Target: `Target="../media/logo&amp;1.png"` must
+            // resolve to the ZIP part `xl/media/logo&1.png`, not
+            // the literal `&amp;` form.
             .target = try decodeXmlEntities(arena, target),
             .target_mode = target_mode,
         });
