@@ -3059,9 +3059,13 @@ const ZipWriter = struct {
         if (self.entries.items.len > std.math.maxInt(u16)) {
             return error.TooManyZipEntries;
         }
-        // 0xFFFFFFFF is the Zip64 sentinel — readers (including
-        // zlsx's own) treat it as "look for Zip64 extra fields".
-        // We don't emit Zip64, so reject `>= 0xFFFFFFFF` strictly.
+        // cd_start IS written to the EOCD as u32, so 0xFFFFFFFF is
+        // the Zip64 sentinel — readers (including zlsx's own) treat
+        // it as "look for Zip64 extra fields". We don't emit Zip64,
+        // so reject `>= 0xFFFFFFFF` strictly. (Total file length is
+        // not on-wire, so a final byte count of 0xFFFFFFFF with a
+        // smaller cd_start is fine — only the serialized field
+        // matters.)
         if (self.out.items.len >= std.math.maxInt(u32)) {
             return error.ZipArchiveTooLarge;
         }
@@ -3091,18 +3095,21 @@ const ZipWriter = struct {
             try self.out.appendSlice(alloc, e.name);
         }
 
-        // The CD itself adds 46 + name_len per entry. The pre-loop
-        // size check covered local file data only; recheck after
-        // writing the CD so a workbook whose payloads fit in u32 but
-        // whose CD pushes the archive past 4 GiB is rejected
-        // explicitly rather than trapping in @intCast(cd_end) below.
-        // Use `>=` to keep 0xFFFFFFFF (the Zip64 sentinel) out of
-        // the wire form.
-        if (self.out.items.len >= std.math.maxInt(u32)) {
+        // The CD itself adds 46 + name_len per entry. After writing
+        // the CD, the position fits a u32 by inductive argument
+        // (cd_start < 0xFFFFFFFF, max CD size < 4 GiB given the
+        // 65535-entry cap). What matters for ZIP32 sentinel-safety
+        // is the SERIALIZED cd_size field — not the cd_end position.
+        // Compute cd_size first, then reject if it would write the
+        // Zip64 sentinel.
+        if (self.out.items.len > std.math.maxInt(u32)) {
             return error.ZipArchiveTooLarge;
         }
         const cd_end: u32 = @intCast(self.out.items.len);
         const cd_size = cd_end - cd_start;
+        if (cd_size >= std.math.maxInt(u32)) {
+            return error.ZipArchiveTooLarge;
+        }
 
         const end: std.zip.EndRecord = .{
             .signature = std.zip.end_record_sig,

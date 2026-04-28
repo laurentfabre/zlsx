@@ -249,10 +249,16 @@ pub const PartStore = struct {
                 @as(u64, e.cdfh_total_len);
             projected += lfh_total + cdfh_total;
         }
-        // Strict `>=` keeps 0xFFFFFFFF out of the wire form — that
-        // value is the Zip64 sentinel; readers treat it as "look for
-        // Zip64 extras" and the archive is malformed for ZIP32.
-        if (projected >= std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
+        // The wire-format ZIP32 fields that need to stay strictly
+        // below 0xFFFFFFFF (the Zip64 sentinel) are cd_offset,
+        // cd_size, and each entry's compressed/uncompressed/offset
+        // fields — NOT the total file length. The latter is not
+        // serialized, so a projected total of exactly 0xFFFFFFFF is
+        // fine as long as the per-field checks below hold. Cap the
+        // total at maxInt(u32) (the @intCast(written) wraparound
+        // bound) and let the field-level checks during the write
+        // loop catch the sentinel cases.
+        if (projected > std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
 
         var write_buf: [4096]u8 = undefined;
         var atomic_file = try std.fs.cwd().atomicFile(path, .{ .write_buffer = &write_buf });
@@ -301,6 +307,9 @@ pub const PartStore = struct {
             }
         }
 
+        // Sentinel-safety: 0xFFFFFFFF in the EOCD's cd_offset field
+        // means "look for Zip64 extras", which we don't emit.
+        if (written >= std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
         const new_cd_offset: u32 = @intCast(written);
         for (self.entries, 0..) |e, i| {
             if (self.overrides[i]) |ov| {
@@ -336,7 +345,10 @@ pub const PartStore = struct {
                 written += @as(u64, cdfh.len);
             }
         }
-        const new_cd_size: u32 = @intCast(written - new_cd_offset);
+        // Sentinel-safety: same Zip64 reservation applies to cd_size.
+        const cd_size_u64 = written - new_cd_offset;
+        if (cd_size_u64 >= std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
+        const new_cd_size: u32 = @intCast(cd_size_u64);
 
         // EOCD.
         var eocd_bytes: [eocd_min_size]u8 = undefined;
