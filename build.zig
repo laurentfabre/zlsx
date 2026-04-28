@@ -77,6 +77,16 @@ pub fn build(b: *std.Build) void {
     const writer_tests = b.addTest(.{ .root_module = writer_mod });
     test_step.dependOn(&b.addRunArtifact(writer_tests).step);
 
+    // Unicode case-fold module tests (A1 phase 1: scaffold for sheet-
+    // name dedup; not yet wired into writer/editor).
+    const unicode_mod = b.createModule(.{
+        .root_source_file = b.path("src/unicode/casefold.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const unicode_tests = b.addTest(.{ .root_module = unicode_mod });
+    test_step.dependOn(&b.addRunArtifact(unicode_tests).step);
+
     // C ABI — both a shared library (for Python / cffi bindings) and a
     // static library (for language toolchains that prefer linking in).
     const c_abi_mod = b.createModule(.{
