@@ -3088,6 +3088,14 @@ const ZipWriter = struct {
             try self.out.appendSlice(alloc, e.name);
         }
 
+        // The CD itself adds 46 + name_len per entry. The pre-loop
+        // size check covered local file data only; recheck after
+        // writing the CD so a workbook whose payloads fit in u32 but
+        // whose CD pushes the archive past 4 GiB is rejected
+        // explicitly rather than trapping in @intCast(cd_end) below.
+        if (self.out.items.len > std.math.maxInt(u32)) {
+            return error.ZipArchiveTooLarge;
+        }
         const cd_end: u32 = @intCast(self.out.items.len);
         const cd_size = cd_end - cd_start;
 
