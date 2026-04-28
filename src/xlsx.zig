@@ -5578,13 +5578,13 @@ pub const Editor = struct {
         const writer_mod = @import("writer.zig");
         try writer_mod.validateSheetName(name);
 
-        // Excel hard cap: a workbook can carry up to 255 sheets in
-        // the same file. self.sheet_paths already grows to include
-        // every prior pending sheet (each addSheet appends ns.path
-        // to it), so the projected count after this call is just
-        // `sheet_paths.len + 1` — counting pending separately would
-        // double-count and reject around 128 sheets.
-        if (self.sheet_paths.len + 1 > 255) return error.TooManySheets;
+        // Defensive bound to keep `@intCast(old_paths.len)` to u32
+        // at the function tail safe on 64-bit targets. OOXML / Excel
+        // 2007+ has no documented sheet limit (Excel is effectively
+        // memory-bounded; the legacy XLS 255-sheet cap doesn't apply
+        // to .xlsx), so set the cap at the type bound rather than a
+        // legacy ceiling that would reject workbooks Excel accepts.
+        if (self.sheet_paths.len >= std.math.maxInt(u32)) return error.TooManySheets;
 
         // Reject duplicates against existing source sheets and any
         // pending additions. Source sheet names live in the source's
