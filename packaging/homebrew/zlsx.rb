@@ -43,7 +43,11 @@ class Zlsx < Formula
   end
 
   def install
-    bin.install "bin/zlsx"
+    # 0.3.0+ tarballs ship two binaries: the main `zlsx` CLI and
+    # `zlsx-extract-images` (standalone OOXML image extractor that
+    # uses the new zlsx_pkg package layer). `bin.install Dir["bin/*"]`
+    # picks up both regardless of platform suffix.
+    bin.install Dir["bin/*"]
     lib.install Dir["lib/*"]
     include.install "include/zlsx.h"
     doc.install "README.md"
@@ -52,5 +56,9 @@ class Zlsx < Formula
   test do
     # Basic sanity: --help prints usage.
     assert_match "usage: zlsx", shell_output("#{bin}/zlsx --help")
+    # extract-images binary is present (0.3.0+) and prints its usage
+    # banner on stderr when invoked with no args. Exit code 1 is the
+    # documented bad-usage signal.
+    assert_match "usage:", shell_output("#{bin}/zlsx-extract-images 2>&1", 1)
   end
 end
