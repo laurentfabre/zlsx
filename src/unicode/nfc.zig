@@ -173,10 +173,18 @@ fn composeInPlace(scalars: *std.ArrayListUnmanaged(u21)) void {
         // Try composing with the current starter.
         if (starter_idx) |si| {
             const starter = scalars.items[si];
-            // Blocking rule (UAX #15): if last_class == ccc != 0,
-            // OR if last_class > ccc, this combiner is BLOCKED from
-            // composing with the starter — skip the lookup.
-            const blocked = (ccc != 0 and ccc <= last_class);
+            // Blocking rule (UAX #15): a character is blocked from
+            // composing with the starter when there's a non-starter
+            // between them whose CCC is >= this character's CCC.
+            //
+            // last_class > 0 means we've already crossed a
+            // non-starter since the starter. In that case:
+            //   - ccc == 0  → this is itself a new starter, so it
+            //     can't compose with the prior starter across the
+            //     intervening combiner: BLOCKED.
+            //   - ccc != 0  → blocked iff ccc <= last_class
+            //     (per UAX #15 D102).
+            const blocked = (last_class > 0 and ccc <= last_class);
             if (!blocked) {
                 if (composePair(starter, cp)) |composed| {
                     scalars.items[si] = composed;
@@ -327,6 +335,30 @@ test "Reorder: combining marks sort by CCC" {
     const round_trip = try normalize(std.testing.allocator, out);
     defer std.testing.allocator.free(round_trip);
     try std.testing.expectEqualStrings(out, round_trip);
+}
+
+test "Blocking: U+1100 U+0301 U+1161 does NOT compose Hangul across the acute" {
+    // Regression for the canonical-composition blocking rule. Without
+    // it, the L+V Hangul algorithm composes across the intervening
+    // U+0301 acute, producing a wrong NFC and breaking sheet-name
+    // dedup for adversarial inputs.
+    const input = "\u{1100}\u{0301}\u{1161}";
+    const out = try normalize(std.testing.allocator, input);
+    defer std.testing.allocator.free(out);
+    // Correct NFC: U+1100, U+0301, U+1161 unchanged (no composition
+    // possible with a non-starter between).
+    try std.testing.expectEqualStrings(input, out);
+}
+
+test "Blocking: e + acute + acute keeps second acute decomposed" {
+    // Two same-class non-starters can't both compose into the
+    // starter (per the ccc <= last_class rule).
+    const input = "e\u{0301}\u{0301}";
+    const out = try normalize(std.testing.allocator, input);
+    defer std.testing.allocator.free(out);
+    // First acute composes with e to é (U+00E9); second acute stays
+    // as a combining mark.
+    try std.testing.expectEqualStrings("\u{00E9}\u{0301}", out);
 }
 
 test "Invalid UTF-8 is rejected" {
