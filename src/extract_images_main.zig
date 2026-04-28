@@ -47,6 +47,19 @@ pub fn main() !u8 {
     const in_path = args[1];
     const out_dir = args[2];
 
+    // Reject empty path strings up front. Without this, an unset
+    // shell variable (`zlsx-extract-images "$tmp" "$out"`) would
+    // bottom out in std.fs with a cryptic `BadPathName`. Better to
+    // tell the caller what's actually wrong.
+    if (in_path.len == 0) {
+        try err.writeAll("error: <in.xlsx> path is empty (unset shell variable?)\n");
+        return 1;
+    }
+    if (out_dir.len == 0) {
+        try err.writeAll("error: <out-dir> path is empty (unset shell variable?)\n");
+        return 1;
+    }
+
     var store = pkg.PartStore.open(alloc, in_path) catch |e| {
         try err.print("cannot open '{s}': {s}\n", .{ in_path, @errorName(e) });
         return 2;
