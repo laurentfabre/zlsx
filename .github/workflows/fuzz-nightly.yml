@@ -37,7 +37,12 @@ jobs:
     # in an instrumentation pathology before it eats the day's
     # quota.
     timeout-minutes: 90
-    continue-on-error: true
+    # Do NOT mark continue-on-error: a fuzz crash is exactly the
+    # signal this workflow exists to surface. The "Run fuzz session"
+    # step already maps exit codes 124/143 (timeout-killed) to
+    # success internally, so non-crash runs still pass cleanly. Real
+    # fuzz crashes must turn the job red; the artefact-upload step
+    # uses `if: always()` so crash files are still collected.
     steps:
       - uses: actions/checkout@v4
 
