@@ -56,6 +56,10 @@ pub const Error = error{
     SplitArchiveNotSupported,
     DataDescriptorNotSupported,
     DuplicateContentType,
+    PartNotFound,
+    PartAlreadyExists,
+    MissingContentTypes,
+    MalformedContentTypes,
     /// save() rejects archives whose total saved size would exceed
     /// 4 GiB (ZIP32 offset limit) or whose entry count would exceed
     /// 65 535 (EOCD u16 record-count field). Surfaced before any
@@ -181,6 +185,128 @@ pub const PartStore = struct {
     ///
     /// `bytes` is duped into the arena; caller can free its own
     /// buffer right after the call.
+    /// Add a new part to the package. The part name must NOT already
+    /// exist (use `replacePart` for that case). Updates
+    /// `[Content_Types].xml` to declare the new part's content type
+    /// via an `<Override>` entry, since most consumer tooling won't
+    /// open a workbook whose parts aren't declared.
+    ///
+    /// The new part is held entirely in arena-owned memory; nothing
+    /// is written to disk until the next `save()`.
+    pub fn addPart(
+        self: *PartStore,
+        name: []const u8,
+        content_type: []const u8,
+        bytes: []const u8,
+    ) !void {
+        if (self.findIndex(name) != null) return error.PartAlreadyExists;
+        if (bytes.len > std.math.maxInt(u32)) return Error.Zip64NotSupported;
+        if (name.len > std.math.maxInt(u16)) return Error.ZipArchiveTooLarge;
+
+        // Step 1: register the new part's content type in
+        // [Content_Types].xml BEFORE growing the parts arrays. If the
+        // CT update fails we leave the package as-is.
+        try self.registerContentTypeOverride(name, content_type);
+
+        const ar_alloc = self.arena.allocator();
+        const owned_name = try ar_alloc.dupe(u8, name);
+        const owned_ct = try ar_alloc.dupe(u8, content_type);
+        const owned_user_bytes = try ar_alloc.dupe(u8, bytes);
+
+        // Same compression policy as replacePart.
+        var compressed: std.ArrayListUnmanaged(u8) = .{};
+        defer compressed.deinit(ar_alloc);
+        var method: u16 = 8;
+        if (bytes.len < 1024 or bytes.len == 0) {
+            method = 0;
+            try compressed.appendSlice(ar_alloc, bytes);
+        } else {
+            const writer_mod = @import("writer");
+            try writer_mod.deflateCompress(ar_alloc, bytes, &compressed);
+            if (compressed.items.len >= bytes.len) {
+                method = 0;
+                compressed.clearRetainingCapacity();
+                try compressed.appendSlice(ar_alloc, bytes);
+            }
+        }
+        if (compressed.items.len > std.math.maxInt(u32)) return Error.Zip64NotSupported;
+        const owned_payload = try compressed.toOwnedSlice(ar_alloc);
+
+        // Synthetic ZipEntry — save() rebuilds LFH/CDFH from the
+        // override for this slot, so the source-offset fields are
+        // unused. We only need a valid `name` + sizes/method/CRC
+        // for the matching CDFH the save path emits.
+        const new_entry: ZipEntry = .{
+            .name = owned_name,
+            .lfh_offset = 0,
+            .lfh_total_len = 0,
+            .cdfh_offset = 0,
+            .cdfh_total_len = 0,
+            .payload_offset = 0,
+            .compressed_size = @intCast(owned_payload.len),
+            .uncompressed_size = @intCast(bytes.len),
+            .compression_method = method,
+            .crc32 = std.hash.Crc32.hash(bytes),
+            .data_descriptor_len = 0,
+            .has_data_descriptor = false,
+        };
+
+        // Grow the three parallel arrays. Reallocate via the arena —
+        // the previous slices are tracked there too, so on success
+        // they're replaced and on failure they remain valid.
+        const grown_entries = try ar_alloc.realloc(self.entries, self.entries.len + 1);
+        grown_entries[grown_entries.len - 1] = new_entry;
+        self.entries = grown_entries;
+
+        const grown_parts = try ar_alloc.realloc(self.parts, self.parts.len + 1);
+        grown_parts[grown_parts.len - 1] = .{
+            .name = owned_name,
+            .content_type = owned_ct,
+            .bytes = owned_user_bytes,
+            .compression_method = method,
+        };
+        self.parts = grown_parts;
+
+        const grown_overrides = try ar_alloc.realloc(self.overrides, self.overrides.len + 1);
+        grown_overrides[grown_overrides.len - 1] = .{
+            .payload = owned_payload,
+            .compression_method = method,
+            .crc32 = std.hash.Crc32.hash(bytes),
+            .uncompressed_size = @intCast(bytes.len),
+        };
+        self.overrides = grown_overrides;
+    }
+
+    /// Splice a new `<Override>` element into `[Content_Types].xml`
+    /// and reinstall the result as a replacePart override of that
+    /// part. OOXML consumers rely on the content-types map; adding
+    /// a part without registering it produces a workbook Excel
+    /// rejects on open.
+    fn registerContentTypeOverride(
+        self: *PartStore,
+        part_name: []const u8,
+        content_type: []const u8,
+    ) !void {
+        const ct_part = self.part("[Content_Types].xml") orelse
+            return error.MissingContentTypes;
+        const old_xml = ct_part.bytes;
+        const close_tag = "</Types>";
+        const close_pos = std.mem.lastIndexOf(u8, old_xml, close_tag) orelse
+            return error.MalformedContentTypes;
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        try buf.appendSlice(self.allocator, old_xml[0..close_pos]);
+        try buf.appendSlice(self.allocator, "<Override ContentType=\"");
+        try buf.appendSlice(self.allocator, content_type);
+        try buf.appendSlice(self.allocator, "\" PartName=\"/");
+        try buf.appendSlice(self.allocator, part_name);
+        try buf.appendSlice(self.allocator, "\"/>");
+        try buf.appendSlice(self.allocator, old_xml[close_pos..]);
+
+        try self.replacePart("[Content_Types].xml", buf.items);
+    }
+
     pub fn replacePart(self: *PartStore, name: []const u8, bytes: []const u8) !void {
         const idx = self.findIndex(name) orelse return error.PartNotFound;
         const ar_alloc = self.arena.allocator();
@@ -1553,4 +1679,77 @@ test "decompressPayload: rejects ZIP-bomb declared sizes" {
         Error.BadZip,
         decompressPayload(a, tiny, 0, max_part_size + 1),
     );
+}
+
+test "PartStore.addPart + save: new part survives round-trip with content type" {
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "added.xlsx" });
+    defer std.testing.allocator.free(out_path);
+
+    const new_part_name = "xl/customData.xml";
+    const new_part_ct = "application/xml";
+    const new_part_bytes = "<?xml version=\"1.0\"?><custom>added</custom>";
+
+    {
+        var store = try PartStore.open(std.testing.allocator, fixture);
+        defer store.deinit();
+        try store.addPart(new_part_name, new_part_ct, new_part_bytes);
+        try store.save(out_path);
+    }
+
+    var dst = try PartStore.open(std.testing.allocator, out_path);
+    defer dst.deinit();
+
+    const part_in_dst = dst.part(new_part_name) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, new_part_bytes, part_in_dst.bytes);
+    try std.testing.expectEqualStrings(new_part_ct, part_in_dst.content_type.?);
+}
+
+test "PartStore.addPart: rejects duplicate part name" {
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+
+    var store = try PartStore.open(std.testing.allocator, fixture);
+    defer store.deinit();
+
+    try std.testing.expectError(
+        error.PartAlreadyExists,
+        store.addPart("xl/workbook.xml", "application/xml", "irrelevant"),
+    );
+}
+
+test "PartStore.addPart: large input round-trips through deflate" {
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "added_large.xlsx" });
+    defer std.testing.allocator.free(out_path);
+
+    // 16 KiB highly-redundant payload — well above the 1 KiB
+    // STORED-vs-DEFLATE threshold, so the deflate path is exercised.
+    const big_bytes = try std.testing.allocator.alloc(u8, 16 * 1024);
+    defer std.testing.allocator.free(big_bytes);
+    @memset(big_bytes, 'A');
+
+    {
+        var store = try PartStore.open(std.testing.allocator, fixture);
+        defer store.deinit();
+        try store.addPart("xl/extra.bin", "application/octet-stream", big_bytes);
+        try store.save(out_path);
+    }
+
+    var dst = try PartStore.open(std.testing.allocator, out_path);
+    defer dst.deinit();
+    const got = dst.part("xl/extra.bin") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, big_bytes, got.bytes);
 }
