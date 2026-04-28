@@ -5574,13 +5574,12 @@ pub const Editor = struct {
         try writer_mod.validateSheetName(name);
 
         // Excel hard cap: a workbook can carry up to 255 sheets in
-        // the same file. Reject explicitly so a runaway addSheet
-        // loop can't grow self.sheet_paths past `@intCast(usize→u32)`
-        // panic territory and to surface the limit upfront rather
-        // than at save() time when a partial archive would be
-        // already half-written.
-        const total_after = self.sheet_paths.len + self.pending_new_sheets.items.len + 1;
-        if (total_after > 255) return error.TooManySheets;
+        // the same file. self.sheet_paths already grows to include
+        // every prior pending sheet (each addSheet appends ns.path
+        // to it), so the projected count after this call is just
+        // `sheet_paths.len + 1` — counting pending separately would
+        // double-count and reject around 128 sheets.
+        if (self.sheet_paths.len + 1 > 255) return error.TooManySheets;
 
         // Reject duplicates against existing source sheets and any
         // pending additions. Source sheet names live in the source's
