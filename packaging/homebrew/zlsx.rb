@@ -19,7 +19,12 @@
 class Zlsx < Formula
   desc "Tiny, read-only .xlsx parser + CLI (Zig, no third-party deps)"
   homepage "https://github.com/laurentfabre/zlsx"
-  version "0.2.0"
+  # Keep version synced with build.zig.zon — the smoke `test do` block
+  # exercises both `zlsx` and `zlsx-extract-images`, and the latter
+  # only ships in 0.3.0+ tarballs. If you cherry-pick this template
+  # into a tap pinned to an older release, also drop the
+  # zlsx-extract-images line from the test block.
+  version "0.3.0"
   license "MIT"
 
   on_macos do
