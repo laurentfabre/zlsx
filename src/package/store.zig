@@ -418,8 +418,14 @@ const ZipEntry = struct {
     /// bytes. 0 when the data-descriptor flag (0x0008) is clear; 12
     /// or 16 when set (16 if the optional 0x08074b50 signature is
     /// present, 12 otherwise). save() copies these bytes verbatim
-    /// for untouched entries so the archive stays valid.
+    /// for untouched entries so the archive stays valid. Disambiguation
+    /// uses the gap to the next entry's LFH, not a signature peek
+    /// (which would mis-classify 1-in-2^32 inputs where CRC ==
+    /// 0x08074b50).
     data_descriptor_len: usize,
+    /// True iff the source CDFH had the 0x0008 general-purpose flag.
+    /// Used during the second-pass `data_descriptor_len` computation.
+    has_data_descriptor: bool,
 };
 
 /// Override = caller-supplied replacement bytes for an existing part.
@@ -500,19 +506,6 @@ fn scanCentralDirectory(arena: std.mem.Allocator, buf: []const u8) ![]ZipEntry {
 
         const cdfh_total = 46 + @as(usize, filename_len) + @as(usize, extra_len) + @as(usize, comment_len);
 
-        // Data-descriptor detection. When flag 0x0008 is set, the
-        // payload is followed by 12 or 16 bytes (16 if the optional
-        // 0x08074b50 signature is present). Peek to distinguish.
-        var dd_len: usize = 0;
-        if (flags & 0x0008 != 0) {
-            const after = payload_offset + compressed_size;
-            if (after + 4 > buf.len) return Error.BadZip;
-            const peek = std.mem.readInt(u32, buf[after..][0..4], .little);
-            const dd_signature: u32 = 0x08074b50;
-            dd_len = if (peek == dd_signature) 16 else 12;
-            if (after + dd_len > buf.len) return Error.BadZip;
-        }
-
         try out.append(arena, .{
             .name = try arena.dupe(u8, name),
             .lfh_offset = lfh_offset,
@@ -524,13 +517,48 @@ fn scanCentralDirectory(arena: std.mem.Allocator, buf: []const u8) ![]ZipEntry {
             .uncompressed_size = uncompressed_size,
             .compression_method = compression_method,
             .crc32 = crc32,
-            .data_descriptor_len = dd_len,
+            .data_descriptor_len = 0, // patched below
+            .has_data_descriptor = (flags & 0x0008) != 0,
         });
 
         cur = name_start + filename_len + extra_len + comment_len;
     }
 
     if (idx != total_records) return Error.BadZip;
+
+    // Second pass: compute data_descriptor_len for every DDF entry.
+    // The descriptor sits immediately after the payload and is
+    // either 12 or 16 bytes; disambiguate by measuring the gap to
+    // the next entry's LFH (or to the central-directory start for
+    // the last entry). This is exact — peeking at the first 4 bytes
+    // would mis-classify the rare case where the CRC happens to
+    // equal the descriptor signature 0x08074b50.
+    const slice = out.items;
+    // Sort entries by lfh_offset to compute gaps. Sort indices, not
+    // the items themselves, because central-directory order is
+    // semantic and must be preserved.
+    const order = try arena.alloc(usize, slice.len);
+    defer arena.free(order);
+    for (order, 0..) |*o, i| o.* = i;
+    const Ctx = struct {
+        items: []ZipEntry,
+        pub fn lessThan(self: *@This(), a: usize, b: usize) bool {
+            return self.items[a].lfh_offset < self.items[b].lfh_offset;
+        }
+    };
+    var ctx = Ctx{ .items = slice };
+    std.sort.pdq(usize, order, &ctx, Ctx.lessThan);
+    for (order, 0..) |idx2, k| {
+        const e = &slice[idx2];
+        if (!e.has_data_descriptor) continue;
+        const payload_end = e.payload_offset + e.compressed_size;
+        const next_off: usize = if (k + 1 < order.len) slice[order[k + 1]].lfh_offset else cd_offset;
+        if (next_off < payload_end) return Error.BadZip;
+        const gap = next_off - payload_end;
+        if (gap != 12 and gap != 16) return Error.BadZip;
+        e.data_descriptor_len = gap;
+    }
+
     return out.toOwnedSlice(arena);
 }
 
