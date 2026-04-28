@@ -102,6 +102,17 @@ pub fn build(b: *std.Build) void {
     const package_tests = b.addTest(.{ .root_module = package_mod });
     test_step.dependOn(&b.addRunArtifact(package_tests).step);
 
+    // C2a drawings parser — per-sheet image-anchor extraction. Sits
+    // on top of PartStore and shares its module wiring.
+    const drawings_mod = b.createModule(.{
+        .root_source_file = b.path("src/package/drawings.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    drawings_mod.addImport("writer", writer_mod);
+    const drawings_tests = b.addTest(.{ .root_module = drawings_mod });
+    test_step.dependOn(&b.addRunArtifact(drawings_tests).step);
+
     // C ABI — both a shared library (for Python / cffi bindings) and a
     // static library (for language toolchains that prefer linking in).
     const c_abi_mod = b.createModule(.{
