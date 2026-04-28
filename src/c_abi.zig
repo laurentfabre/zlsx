@@ -1391,6 +1391,13 @@ pub const SheetWriter = extern struct { _opaque: u8 };
 
 const WriterState = struct {
     inner: writer_mod.Writer,
+    /// SheetWriterStates we hand out via `zlsx_writer_add_sheet`.
+    /// They're per-writer wrappers around inner-writer pointers, so
+    /// their lifetime ends with the parent writer. Track them here
+    /// so `zlsx_writer_close` can free each one — the previous
+    /// "leak each, freed at process exit" MVP shape ballooned RSS
+    /// for long-lived hosts (Python servers etc.).
+    sheet_wrappers: std.ArrayListUnmanaged(*SheetWriterState) = .empty,
 };
 
 // Zig's writer.SheetWriter pointer is stable for the writer's lifetime
@@ -1438,7 +1445,10 @@ export fn zlsx_writer_create(
         writeError(err_buf, err_buf_len, "OutOfMemory");
         return null;
     };
-    state.* = .{ .inner = writer_mod.Writer.init(gpa) };
+    state.* = .{
+        .inner = writer_mod.Writer.init(gpa),
+        .sheet_wrappers = .empty,
+    };
     return @ptrCast(state);
 }
 
@@ -1447,6 +1457,8 @@ export fn zlsx_writer_create(
 export fn zlsx_writer_close(w: ?*Writer) callconv(.c) void {
     if (w) |p| {
         const state: *WriterState = @ptrCast(@alignCast(p));
+        for (state.sheet_wrappers.items) |sw| gpa.destroy(sw);
+        state.sheet_wrappers.deinit(gpa);
         state.inner.deinit();
         gpa.destroy(state);
     }
@@ -1472,20 +1484,17 @@ export fn zlsx_writer_add_sheet(
         writeError(err_buf, err_buf_len, "OutOfMemory");
         return null;
     };
+    errdefer gpa.destroy(sw_state);
     sw_state.* = .{ .inner = inner };
-    // SheetWriterState lifetime is tied to the parent Writer — we leak
-    // it into a per-writer list. Simpler: chain onto the inner writer's
-    // sheet list via their existing allocator. For MVP, just leak here
-    // and collect in writer_close. Store the Zig-side pointer in a
-    // static map... actually the inner Zig SheetWriter is already in
-    // state.inner.sheets. Our SheetWriterState wraps that borrow. We
-    // free the SheetWriterState wrapper itself in writer_close by
-    // tracking it in a side list.
-    //
-    // For simplicity in MVP: leak the SheetWriterState (few bytes per
-    // sheet, freed when process exits). Acceptable for Alfred-scale
-    // use; revisit if anyone creates many Writers in a long-running
-    // process.
+    // Track the wrapper so writer_close() can free it. Previously
+    // each wrapper was leaked "until process exit" — a long-lived
+    // host (Python server, daemon) opening + closing many writers
+    // would balloon RSS by sizeof(SheetWriterState) per sheet, per
+    // closed writer.
+    state.sheet_wrappers.append(gpa, sw_state) catch {
+        writeError(err_buf, err_buf_len, "OutOfMemory");
+        return null;
+    };
     return @ptrCast(sw_state);
 }
 
@@ -2092,6 +2101,14 @@ export fn zlsx_sheet_writer_freeze_panes(
     const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
     const clamped_rows = @min(rows, 1_048_575);
     const clamped_cols = @min(cols, 16_383);
+    // Pair-assert the clamp invariant. freezePanes only fails when
+    // rows >= EXCEL_MAX_ROW (1_048_576) or cols >= EXCEL_MAX_COL
+    // (16_384), both ruled out by the @min above. If anyone ever
+    // tightens those limits without updating this clamp, this assert
+    // turns the resulting wrong-precondition into a Debug-build
+    // tripwire instead of an opaque release-build host abort.
+    std.debug.assert(clamped_rows < 1_048_576);
+    std.debug.assert(clamped_cols < 16_384);
     sw_state.inner.freezePanes(clamped_rows, clamped_cols) catch unreachable;
 }
 
@@ -2168,7 +2185,23 @@ export fn zlsx_sheet_writer_add_data_validation_list(
     }
     var buf: [256][]const u8 = undefined;
     for (0..values_count) |i| {
-        buf[i] = values_ptr[i][0..lens_ptr[i]];
+        const len = lens_ptr[i];
+        const ptr = values_ptr[i];
+        // Inner NULL guard: a caller can pass a values_ptr array
+        // where one entry's pointer is NULL. With non-zero len that
+        // would UB-slice; with zero len, slicing the null many-pointer
+        // is also UB. Normalise NULL+0 to "" and reject NULL with
+        // non-zero len as malformed.
+        const ptr_addr = @intFromPtr(ptr);
+        if (ptr_addr == 0) {
+            if (len != 0) {
+                writeError(err_buf, err_buf_len, "NullStringInDataValidation");
+                return -1;
+            }
+            buf[i] = "";
+        } else {
+            buf[i] = ptr[0..len];
+        }
     }
     sw_state.inner.addDataValidationList(range, buf[0..values_count]) catch |e| {
         writeError(err_buf, err_buf_len, @errorName(e));
