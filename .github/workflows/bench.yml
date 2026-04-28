@@ -1,0 +1,104 @@
+name: Bench Regression
+
+# A3 (post-0.2.9 roadmap): bench-regression CI — REPORT-ONLY.
+#
+# Runs hyperfine on a small fixed corpus, compares HEAD against
+# the PR base (or skips comparison on push-to-main), and posts
+# a Markdown summary as a PR comment. Never fails CI.
+#
+# A blocking gate is gated on:
+#   1. ≥ 20 main-branch samples showing per-fixture variance < 7%.
+#   2. Pinned runner class.
+#   3. Manual override (PR label / commit-trailer).
+# See docs/plans/post-0.2.9-roadmap.md, A3 walk-away gate.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  bench:
+    runs-on: ubuntu-22.04
+    # Job-level continue-on-error keeps it green even if hyperfine
+    # crashes or fixtures fail to fetch — we'd rather see partial
+    # signal than block PRs on the report-only path.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache corpus
+        uses: actions/cache@v4
+        with:
+          path: tests/corpus
+          key: zlsx-corpus-v1-${{ runner.os }}-${{ hashFiles('scripts/fetch_test_corpus.sh') }}
+          restore-keys: zlsx-corpus-v1-${{ runner.os }}-
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install hyperfine
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y hyperfine
+
+      - name: Fetch corpus (cache miss only)
+        run: bash scripts/fetch_test_corpus.sh
+
+      - name: Bench current
+        run: bash scripts/bench_ci.sh bench-out/current
+
+      - name: Bench base (PR only)
+        if: github.event_name == 'pull_request' && github.event.pull_request.base.sha != ''
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          git checkout ${{ github.event.pull_request.base.sha }} --
+          bash scripts/bench_ci.sh bench-out/base
+          # Restore HEAD so the next steps see the actual PR tree.
+          git checkout ${{ github.event.pull_request.head.sha }} --
+
+      - name: Compare base vs current
+        if: github.event_name == 'pull_request' && hashFiles('bench-out/base/bench.json') != ''
+        continue-on-error: true
+        run: |
+          python3 scripts/compare_bench.py \
+            bench-out/base/bench.json \
+            bench-out/current/bench.json \
+            --markdown bench-out/bench-comment.md
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' && hashFiles('bench-out/bench-comment.md') != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('bench-out/bench-comment.md', 'utf8');
+            const marker = '<!-- zlsx-bench-ci -->';
+            const {owner, repo} = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.rest.issues.listComments({owner, repo, issue_number});
+            const existing = comments.data.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({owner, repo, comment_id: existing.id, body});
+            } else {
+              await github.rest.issues.createComment({owner, repo, issue_number, body});
+            }
+
+      - name: Upload bench artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ github.sha }}
+          path: bench-out/
+          retention-days: 30
