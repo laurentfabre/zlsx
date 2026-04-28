@@ -147,18 +147,27 @@ pub fn chartAnchors(store: *PartStore, allocator: std.mem.Allocator) ![]ChartAnc
     return out.toOwnedSlice(allocator);
 }
 
-/// OOXML worksheet content type (with and without the strict
-/// suffix variant). Detection by content type is authoritative —
-/// non-Microsoft producers can name their worksheet parts anything
-/// they declare in workbook.xml.rels, so the legacy
-/// `xl/worksheets/sheet<N>.xml` filename heuristic misses those.
-const ct_worksheet = "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml";
+/// OOXML Transitional worksheet content type. Strict OOXML
+/// (ECMA-376 second edition + later) ships variants of this with
+/// different MIME prefixes, so detection accepts any content type
+/// whose tail is `.worksheet+xml`. As a defensive belt-and-braces
+/// fallback, the legacy filename heuristic (`xl/worksheets/sheet<N>.xml`)
+/// is also accepted so workbooks that fail to declare a content
+/// type still get their drawings walked — the union of the two
+/// detection paths catches every workbook we've ever seen.
+const ct_worksheet_transitional = "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml";
 
 fn isSheetPart(part: store_mod.Part) bool {
     if (part.content_type) |ct| {
-        if (std.mem.eql(u8, ct, ct_worksheet)) return true;
+        if (std.mem.endsWith(u8, ct, ".worksheet+xml")) return true;
+        if (std.mem.eql(u8, ct, ct_worksheet_transitional)) return true;
     }
-    return false;
+    // Fallback to filename for content-type-less producers.
+    const prefix = "xl/worksheets/sheet";
+    if (!std.mem.startsWith(u8, part.name, prefix)) return false;
+    if (!std.mem.endsWith(u8, part.name, ".xml")) return false;
+    if (part.name.len <= prefix.len) return false;
+    return std.ascii.isDigit(part.name[prefix.len]);
 }
 
 fn collectFromSheet(
