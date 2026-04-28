@@ -401,10 +401,68 @@ fn findBlipEmbed(pic_xml: []const u8) ?[]const u8 {
 }
 
 fn relTargetForId(rels: []const store_mod.Relationship, id: []const u8) ?[]const u8 {
+    // Decode the lookup id into a stack buffer so the comparison
+    // matches the decoded Relationship.id stored by parseRelationships.
+    // OOXML rIds in practice are short ASCII tokens (`rId1`, `rId12`),
+    // so 64 bytes is generous. On overflow OR fast-path (no `&`), fall
+    // back to raw compare against the source `id` slice.
+    if (std.mem.indexOfScalar(u8, id, '&') == null) {
+        for (rels) |r| {
+            if (std.mem.eql(u8, r.id, id)) return r.target;
+        }
+        return null;
+    }
+    var buf: [64]u8 = undefined;
+    const decoded = decodeIdInto(&buf, id) orelse {
+        // Pathologically long encoded id — fall back to raw match.
+        for (rels) |r| {
+            if (std.mem.eql(u8, r.id, id)) return r.target;
+        }
+        return null;
+    };
     for (rels) |r| {
-        if (std.mem.eql(u8, r.id, id)) return r.target;
+        if (std.mem.eql(u8, r.id, decoded)) return r.target;
     }
     return null;
+}
+
+/// Decode the same five named entities + numeric refs into `buf`.
+/// Returns null if the decoded form would exceed buf.len. This is
+/// the lookup-key counterpart to store.zig's decodeXmlEntities — same
+/// rules, no allocation. Code-point UTF-8 is at most 4 bytes per
+/// reference, well-bounded for short rId tokens.
+fn decodeIdInto(buf: []u8, src: []const u8) ?[]const u8 {
+    var out_len: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) {
+        if (src[i] == '&') {
+            const remain = src[i..];
+            const named = struct {
+                fn match(s: []const u8) ?struct { repl: u8, len: usize } {
+                    if (std.mem.startsWith(u8, s, "&amp;")) return .{ .repl = '&', .len = 5 };
+                    if (std.mem.startsWith(u8, s, "&lt;")) return .{ .repl = '<', .len = 4 };
+                    if (std.mem.startsWith(u8, s, "&gt;")) return .{ .repl = '>', .len = 4 };
+                    if (std.mem.startsWith(u8, s, "&quot;")) return .{ .repl = '"', .len = 6 };
+                    if (std.mem.startsWith(u8, s, "&apos;")) return .{ .repl = '\'', .len = 6 };
+                    return null;
+                }
+            }.match(remain);
+            if (named) |n| {
+                if (out_len >= buf.len) return null;
+                buf[out_len] = n.repl;
+                out_len += 1;
+                i += n.len;
+                continue;
+            }
+            // Numeric refs are uncommon in IDs; pass `&` through and
+            // let the raw-compare fallback handle it via the caller.
+        }
+        if (out_len >= buf.len) return null;
+        buf[out_len] = src[i];
+        out_len += 1;
+        i += 1;
+    }
+    return buf[0..out_len];
 }
 
 /// Parse `<xdr:from>...</xdr:from>` (or `<xdr:to>...</xdr:to>`) into
