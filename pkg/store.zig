@@ -540,9 +540,21 @@ fn scanCentralDirectory(arena: std.mem.Allocator, buf: []const u8) ![]ZipEntry {
     if (buf.len < eocd_min_size) return Error.NotPkzip;
     const eocd_off = try findEocd(buf);
 
+    // Reject split / multi-disk archives. For single-disk ZIPs all
+    // four disk-related fields are zero and the per-disk record
+    // count equals the total. Otherwise CDFH/LFH offsets are
+    // disk-relative and treating them as buffer offsets would
+    // either error inscrutably or read unrelated bytes.
+    const this_disk = std.mem.readInt(u16, buf[eocd_off + 4 ..][0..2], .little);
+    const cd_disk = std.mem.readInt(u16, buf[eocd_off + 6 ..][0..2], .little);
+    const records_on_disk = std.mem.readInt(u16, buf[eocd_off + 8 ..][0..2], .little);
+    const total_records = std.mem.readInt(u16, buf[eocd_off + 10 ..][0..2], .little);
+    if (this_disk != 0 or cd_disk != 0 or records_on_disk != total_records) {
+        return Error.SplitArchiveNotSupported;
+    }
+
     const cd_size = std.mem.readInt(u32, buf[eocd_off + 12 ..][0..4], .little);
     const cd_offset = std.mem.readInt(u32, buf[eocd_off + 16 ..][0..4], .little);
-    const total_records = std.mem.readInt(u16, buf[eocd_off + 10 ..][0..2], .little);
 
     if (cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF) return Error.Zip64NotSupported;
     if (cd_offset + cd_size > buf.len) return Error.BadZip;
@@ -1197,6 +1209,30 @@ test "PartStore.open: rejects non-PK file" {
     defer std.testing.allocator.free(path);
 
     try std.testing.expectError(Error.NotPkzip, PartStore.open(std.testing.allocator, path));
+}
+
+test "PartStore.open: rejects split-disk EOCD" {
+    // Build a minimal 22-byte EOCD with this_disk=1 (split). No CD
+    // entries needed — the disk check fires before the CD walk.
+    var eocd: [22]u8 = undefined;
+    @memset(&eocd, 0);
+    std.mem.writeInt(u32, eocd[0..4], 0x06054b50, .little); // EOCD signature
+    std.mem.writeInt(u16, eocd[4..6], 1, .little); // this_disk = 1 (split)
+    // cd_disk, records_on_disk, total_records, cd_size, cd_offset, comment_len
+    // all zero — only the non-zero this_disk should trip the check.
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "split.xlsx", .data = &eocd });
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "split.xlsx" });
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expectError(
+        Error.SplitArchiveNotSupported,
+        PartStore.open(std.testing.allocator, path),
+    );
 }
 
 test "looksExternal classifies URL / UNC / drive-letter targets" {
