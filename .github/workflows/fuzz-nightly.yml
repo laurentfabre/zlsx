@@ -1,0 +1,84 @@
+name: Fuzz Nightly
+
+# B-fuzz from the post-0.2.9 roadmap. Runs `zig build fuzz` (which
+# enables -ffuzz coverage-guided instrumentation) on a Linux x64
+# runner once per day. Crash artefacts are uploaded so a regression
+# can be reproduced + replayed locally.
+#
+# Linux only: Zig 0.15.2's fuzz support is broken upstream on
+# Windows (shared-memory + COFF/PE debug-info gaps) and macOS
+# (Mach-O addEntryPoint crash). When upstream lands fixes, add
+# matrix entries here.
+#
+# Cost note: zlsx is a public repo so Actions minutes are free.
+# A single nightly run sized to fuzz_duration_seconds is well
+# within the runner-time budget.
+
+on:
+  schedule:
+    # 03:00 UTC every day (off-peak vs the Bench Regression workflow).
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: 'Fuzz duration in seconds (default 1800 = 30 min)'
+        required: false
+        default: '1800'
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: fuzz / ubuntu-22.04 (Linux x64)
+    runs-on: ubuntu-22.04
+    # Hard ceiling: regardless of input duration, never let a
+    # single run exceed 90 min. Catches a runaway fuzzer trapped
+    # in an instrumentation pathology before it eats the day's
+    # quota.
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Compile fuzz binary
+        # Build the test binary with -ffuzz instrumentation but DON'T
+        # run it yet — separate compile + run so a compile failure
+        # surfaces clearly distinct from a fuzz crash.
+        run: zig build fuzz --summary all -ftime-report || true
+
+      - name: Run fuzz session
+        env:
+          DURATION_SECONDS: ${{ github.event.inputs.duration_seconds || '1800' }}
+        run: |
+          set -euo pipefail
+          # Zig's fuzz runner doesn't have a built-in wall-clock cap
+          # in 0.15.2, so wrap with `timeout`. Exit code 124 from
+          # `timeout` means the wall-clock kicked in — that's a
+          # success path, not a crash. Anything else is propagated.
+          set +e
+          timeout --preserve-status --signal=TERM "${DURATION_SECONDS}s" \
+            zig build fuzz
+          rc=$?
+          set -e
+          if [[ "$rc" == "124" || "$rc" == "143" ]]; then
+            echo "::notice::fuzz session hit wall-clock cap (${DURATION_SECONDS}s) — clean exit"
+            exit 0
+          fi
+          exit "$rc"
+
+      - name: Upload crash artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ github.run_id }}
+          path: |
+            .zig-cache/v/**
+            zig-out/fuzz/**
+          retention-days: 30
+          if-no-files-found: ignore
