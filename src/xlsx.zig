@@ -21,6 +21,7 @@
 //! shared strings + integer/float/boolean cells).
 
 const std = @import("std");
+const casefold = @import("unicode/casefold.zig");
 const Allocator = std.mem.Allocator;
 
 // ─── Public types ────────────────────────────────────────────────────
@@ -6089,7 +6090,6 @@ pub const Editor = struct {
         except_sheet_idx: ?u32,
         except_rid: ?[]const u8,
     ) !bool {
-        const writer_mod = @import("writer.zig");
 
         // 1. Raw <sheet> entries from workbook.xml. Apply pending
         //    renames as we walk to compute effective names.
@@ -6129,12 +6129,12 @@ pub const Editor = struct {
                 }
             }
             if (rename_hit) |nm| {
-                if (writer_mod.asciiEqlFold(nm, candidate)) return true;
+                if (casefold.excelSheetNameEql(nm, candidate)) return true;
             } else if (getAttr(attrs, "name")) |raw| {
                 var decoded: std.ArrayListUnmanaged(u8) = .{};
                 defer decoded.deinit(self.allocator);
                 try decodeXmlAttrInto(self.allocator, &decoded, raw);
-                if (writer_mod.asciiEqlFold(decoded.items, candidate)) return true;
+                if (casefold.excelSheetNameEql(decoded.items, candidate)) return true;
             }
             i = t.after_open;
         }
@@ -6144,7 +6144,7 @@ pub const Editor = struct {
         for (self.pending_new_sheets.items, 0..) |s, ns_idx| {
             const my_idx: u32 = source_count + @as(u32, @intCast(ns_idx));
             if (except_sheet_idx) |ei| if (my_idx == ei) continue;
-            if (writer_mod.asciiEqlFold(s.name, candidate)) return true;
+            if (casefold.excelSheetNameEql(s.name, candidate)) return true;
         }
         return false;
     }

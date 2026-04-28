@@ -35,6 +35,7 @@
 
 const std = @import("std");
 const xlsx = @import("xlsx.zig");
+const casefold = @import("unicode/casefold.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -512,9 +513,10 @@ pub const Writer = struct {
         try validateSheetName(name);
         // O(N) duplicate scan — typical workbooks have ≤10 sheets, so
         // the case-fold loop cost is negligible and saves maintaining
-        // a hash of lowercased names.
+        // a hash of lowercased names. Uses non-Turkic full Unicode
+        // case fold so e.g. café/CAFÉ and ß/SS collapse correctly.
         for (self.sheets.items) |existing| {
-            if (asciiEqlFold(existing.name, name)) return error.DuplicateSheetName;
+            if (casefold.excelSheetNameEql(existing.name, name)) return error.DuplicateSheetName;
         }
         const sw = try self.allocator.create(SheetWriter);
         errdefer self.allocator.destroy(sw);
@@ -2015,14 +2017,25 @@ pub fn asciiEqlFold(a: []const u8, b: []const u8) bool {
 ///     sheet-reference quote delimiter).
 ///   - Not the reserved name "History" (case-insensitive).
 pub fn validateSheetName(name: []const u8) !void {
-    if (name.len == 0 or name.len > 31) return error.InvalidSheetName;
+    // Excel's 31-character limit is in Unicode SCALARS, not bytes —
+    // the previous byte-cap was too tight for legal multi-byte names.
+    if (name.len == 0) return error.InvalidSheetName;
+    // Generous byte upper bound first (31 scalars × 4 bytes UTF-8 max).
+    if (name.len > 124) return error.InvalidSheetName;
+    const scalar_count = casefold.excelSheetNameLength(name) catch
+        return error.InvalidSheetName;
+    if (scalar_count == 0 or scalar_count > 31) return error.InvalidSheetName;
+
     if (name[0] == '\'' or name[name.len - 1] == '\'') return error.InvalidSheetName;
     for (name) |c| switch (c) {
         0...0x1F => return error.InvalidSheetName,
         ':', '/', '\\', '?', '*', '[', ']' => return error.InvalidSheetName,
         else => {},
     };
-    if (asciiEqlFold(name, "History")) return error.InvalidSheetName;
+    // Excel reserves the sheet name "History" case-insensitively.
+    // Use Unicode-aware comparison so e.g. "history" / "HISTORY" /
+    // "HiStOrY" are all rejected; non-ASCII inputs fall through.
+    if (casefold.excelSheetNameEql(name, "History")) return error.InvalidSheetName;
 }
 
 fn validateHyperlinkRange(range: []const u8) !void {
@@ -4702,6 +4715,54 @@ test "Writer: addSheet rejects case-insensitive duplicates" {
     try std.testing.expectError(error.DuplicateSheetName, w.addSheet("SumMarY"));
     // Different name still allowed.
     _ = try w.addSheet("Summary 2");
+}
+
+test "Writer: addSheet rejects Unicode-fold-equivalent duplicates (A1)" {
+    // Empirical Excel matrix from the A1 spec — names that fold to
+    // the same canonical form must be detected as duplicates.
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    _ = try w.addSheet("café");
+    try std.testing.expectError(error.DuplicateSheetName, w.addSheet("CAFÉ"));
+    try std.testing.expectError(error.DuplicateSheetName, w.addSheet("cafÉ"));
+
+    var w2 = Writer.init(std.testing.allocator);
+    defer w2.deinit();
+    _ = try w2.addSheet("Straße");
+    try std.testing.expectError(error.DuplicateSheetName, w2.addSheet("STRASSE"));
+    try std.testing.expectError(error.DuplicateSheetName, w2.addSheet("Strasse"));
+
+    var w3 = Writer.init(std.testing.allocator);
+    defer w3.deinit();
+    _ = try w3.addSheet("ΣΤΟΧΟΣ");
+    try std.testing.expectError(error.DuplicateSheetName, w3.addSheet("στοχοσ"));
+    // Final-sigma form also folds to plain σ.
+    try std.testing.expectError(error.DuplicateSheetName, w3.addSheet("στοχος"));
+}
+
+test "Writer: addSheet validates Unicode scalar count (not bytes) for 31-char limit (A1)" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+
+    // 31 multi-byte scalars (62 bytes) — was rejected by the byte
+    // check, now accepted.
+    var buf31: [62]u8 = undefined;
+    for (0..31) |i| {
+        buf31[i * 2] = 0xC3;
+        buf31[i * 2 + 1] = 0xA9; // é
+    }
+    _ = try w.addSheet(&buf31);
+
+    // 32 scalars (64 bytes) — over the limit.
+    var buf32: [64]u8 = undefined;
+    for (0..32) |i| {
+        buf32[i * 2] = 0xC3;
+        buf32[i * 2 + 1] = 0xA9;
+    }
+    try std.testing.expectError(error.InvalidSheetName, w.addSheet(&buf32));
+
+    // Malformed UTF-8 still rejected.
+    try std.testing.expectError(error.InvalidSheetName, w.addSheet("ab\xFFc"));
 }
 
 test "fuzz validateSheetName: adversarial bytes never panic + only valid names pass" {

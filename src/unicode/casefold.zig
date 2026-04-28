@@ -57,6 +57,38 @@ pub fn eqlFolded(allocator: std.mem.Allocator, a: []const u8, b: []const u8) !bo
     return std.mem.eql(u8, fa, fb);
 }
 
+// ─── Excel sheet-name API (no allocator required) ────────────────────
+
+/// Stack-bounded equality check for Excel sheet names. Excel caps
+/// sheet names at 31 scalars, so worst-case input + folded scratch
+/// fits comfortably in 1 KiB. Returns false on any allocation /
+/// UTF-8 / scratch-overflow error — the only legitimate use is
+/// dedup, where "I can't fold this safely" should mean "treat as
+/// distinct" rather than fail-loud.
+pub fn excelSheetNameEql(a: []const u8, b: []const u8) bool {
+    var buf: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    return eqlFolded(fba.allocator(), a, b) catch false;
+}
+
+/// Count Unicode scalar values in a UTF-8 string. Used to enforce
+/// Excel's 31-character (NOT 31-byte) sheet-name limit.
+/// `error.InvalidUtf8` on malformed input.
+pub fn excelSheetNameLength(name: []const u8) !usize {
+    var i: usize = 0;
+    var count: usize = 0;
+    while (i < name.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(name[i]) catch
+            return error.InvalidUtf8;
+        if (i + seq_len > name.len) return error.InvalidUtf8;
+        _ = std.unicode.utf8Decode(name[i .. i + seq_len]) catch
+            return error.InvalidUtf8;
+        i += seq_len;
+        count += 1;
+    }
+    return count;
+}
+
 // ─── ASCII fast path ──────────────────────────────────────────────────
 
 inline fn isAscii(s: []const u8) bool {
@@ -242,4 +274,37 @@ test "Unicode version pinned" {
     // Cheap drift detector — bump when generation script is re-run
     // against a newer UCD.
     try std.testing.expectEqualStrings("17.0.0", tables.unicode_version);
+}
+
+test "excelSheetNameEql: ASCII + Unicode duplicate matrix" {
+    // ASCII path
+    try std.testing.expect(excelSheetNameEql("Sheet1", "SHEET1"));
+    try std.testing.expect(!excelSheetNameEql("Sheet1", "Sheet2"));
+    // Unicode path
+    try std.testing.expect(excelSheetNameEql("café", "CAFÉ"));
+    try std.testing.expect(excelSheetNameEql("ß", "SS"));
+    try std.testing.expect(excelSheetNameEql("Straße", "STRASSE"));
+    try std.testing.expect(excelSheetNameEql("\u{212A}", "k"));
+    try std.testing.expect(!excelSheetNameEql("café", "cafe"));
+}
+
+test "excelSheetNameLength: counts Unicode scalars not bytes" {
+    try std.testing.expectEqual(@as(usize, 6), try excelSheetNameLength("Sheet1"));
+    // "café" is 4 scalars (5 bytes — é = 2 bytes UTF-8).
+    try std.testing.expectEqual(@as(usize, 4), try excelSheetNameLength("café"));
+    // "Straße" is 6 scalars (7 bytes).
+    try std.testing.expectEqual(@as(usize, 6), try excelSheetNameLength("Straße"));
+    // 31 scalars × 2 bytes each = 62-byte string at exactly the
+    // sheet-name length cap.
+    var buf: [62]u8 = undefined;
+    for (0..31) |i| {
+        buf[i * 2] = 0xC3;
+        buf[i * 2 + 1] = 0xA9; // é
+    }
+    try std.testing.expectEqual(@as(usize, 31), try excelSheetNameLength(&buf));
+}
+
+test "excelSheetNameLength: rejects malformed UTF-8" {
+    try std.testing.expectError(error.InvalidUtf8, excelSheetNameLength("ab\xFFc"));
+    try std.testing.expectError(error.InvalidUtf8, excelSheetNameLength("\xC3"));
 }
