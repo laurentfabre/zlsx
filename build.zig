@@ -119,7 +119,7 @@ pub fn build(b: *std.Build) void {
 
     // ─── Package layer (B0 + C2a) ───────────────────────────────
     //
-    // Public root: src/package/root.zig re-exports PartStore /
+    // Public root: pkg/root.zig re-exports PartStore /
     // ImageAnchor / etc. Downstream consumers add this to their
     // build.zig.zon as `zlsx_pkg` and `@import("zlsx_pkg").PartStore`.
     // Lives alongside the existing `zlsx` module rather than under
@@ -127,16 +127,36 @@ pub fn build(b: *std.Build) void {
     // WITHOUT pulling the full reader/writer surface (e.g. for
     // image-extraction tools that just want raw bytes).
     const package_mod = b.addModule("zlsx_pkg", .{
-        .root_source_file = b.path("src/package/root.zig"),
+        .root_source_file = b.path("pkg/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     package_mod.addImport("writer", writer_mod);
 
+    // C2a: standalone `zlsx-extract-images` binary that drives the
+    // package layer (PartStore + imageParts) without going through
+    // Editor / Book. Shipped as a separate exe rather than a CLI
+    // subcommand because cli_mod + zlsx_pkg + writer can't coexist
+    // in one compilation under Zig 0.15.2 (every file that
+    // `@import("writer")`s ends up claimed by both writer's tree
+    // and zlsx_pkg's tree). The standalone binary's module sees
+    // zlsx_pkg + writer in isolation, so no collision.
+    const extract_images_mod = b.createModule(.{
+        .root_source_file = b.path("src/extract_images_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    extract_images_mod.addImport("zlsx_pkg", package_mod);
+    const extract_images_exe = b.addExecutable(.{
+        .name = "zlsx-extract-images",
+        .root_module = extract_images_mod,
+    });
+    b.installArtifact(extract_images_exe);
+
     // Per-source-file test targets so each module gets its own test
     // binary (matches the rest of build.zig's pattern).
     const package_store_tests_mod = b.createModule(.{
-        .root_source_file = b.path("src/package/store.zig"),
+        .root_source_file = b.path("pkg/store.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -145,7 +165,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(package_store_tests).step);
 
     const package_drawings_tests_mod = b.createModule(.{
-        .root_source_file = b.path("src/package/drawings.zig"),
+        .root_source_file = b.path("pkg/drawings.zig"),
         .target = target,
         .optimize = optimize,
     });
