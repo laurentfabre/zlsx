@@ -1065,13 +1065,13 @@ fn decodeXmlEntities(arena: std.mem.Allocator, s: []const u8) ![]u8 {
     return out.toOwnedSlice(arena);
 }
 
-const NumericRef = struct {
+pub const NumericRef = struct {
     utf8: [4]u8,
     utf8_len: u3,
     consumed: usize,
 };
 
-fn decodeNumericRef(s: []const u8) ?NumericRef {
+pub fn decodeNumericRef(s: []const u8) ?NumericRef {
     // s starts with "&#". Find the closing ';' and the digit run.
     if (s.len < 4) return null; // need at least "&#0;"
     var digit_start: usize = 2;

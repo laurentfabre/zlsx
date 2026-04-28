@@ -428,34 +428,66 @@ fn relTargetForId(rels: []const store_mod.Relationship, id: []const u8) ?[]const
 
 /// Decode the same five named entities + numeric refs into `buf`.
 /// Returns null if the decoded form would exceed buf.len. This is
-/// the lookup-key counterpart to store.zig's decodeXmlEntities — same
-/// rules, no allocation. Code-point UTF-8 is at most 4 bytes per
-/// reference, well-bounded for short rId tokens.
+/// the lookup-key counterpart to store.zig's decodeXmlEntities —
+/// same rules, no allocation, code-point UTF-8 ≤ 4 bytes per
+/// reference. Symmetric handling means a relTargetForId lookup
+/// matches whether the referring side uses named entities, numeric
+/// refs, or literal characters.
 fn decodeIdInto(buf: []u8, src: []const u8) ?[]const u8 {
     var out_len: usize = 0;
     var i: usize = 0;
     while (i < src.len) {
         if (src[i] == '&') {
             const remain = src[i..];
-            const named = struct {
-                fn match(s: []const u8) ?struct { repl: u8, len: usize } {
-                    if (std.mem.startsWith(u8, s, "&amp;")) return .{ .repl = '&', .len = 5 };
-                    if (std.mem.startsWith(u8, s, "&lt;")) return .{ .repl = '<', .len = 4 };
-                    if (std.mem.startsWith(u8, s, "&gt;")) return .{ .repl = '>', .len = 4 };
-                    if (std.mem.startsWith(u8, s, "&quot;")) return .{ .repl = '"', .len = 6 };
-                    if (std.mem.startsWith(u8, s, "&apos;")) return .{ .repl = '\'', .len = 6 };
-                    return null;
-                }
-            }.match(remain);
-            if (named) |n| {
+            // Named entities.
+            if (std.mem.startsWith(u8, remain, "&amp;")) {
                 if (out_len >= buf.len) return null;
-                buf[out_len] = n.repl;
+                buf[out_len] = '&';
                 out_len += 1;
-                i += n.len;
+                i += 5;
                 continue;
             }
-            // Numeric refs are uncommon in IDs; pass `&` through and
-            // let the raw-compare fallback handle it via the caller.
+            if (std.mem.startsWith(u8, remain, "&lt;")) {
+                if (out_len >= buf.len) return null;
+                buf[out_len] = '<';
+                out_len += 1;
+                i += 4;
+                continue;
+            }
+            if (std.mem.startsWith(u8, remain, "&gt;")) {
+                if (out_len >= buf.len) return null;
+                buf[out_len] = '>';
+                out_len += 1;
+                i += 4;
+                continue;
+            }
+            if (std.mem.startsWith(u8, remain, "&quot;")) {
+                if (out_len >= buf.len) return null;
+                buf[out_len] = '"';
+                out_len += 6;
+                i += 6;
+                continue;
+            }
+            if (std.mem.startsWith(u8, remain, "&apos;")) {
+                if (out_len >= buf.len) return null;
+                buf[out_len] = '\'';
+                out_len += 1;
+                i += 6;
+                continue;
+            }
+            // Numeric character references via the same parser as
+            // the storage-side decoder, so both sides agree on what
+            // counts as a valid ref vs. a literal `&`.
+            if (std.mem.startsWith(u8, remain, "&#")) {
+                if (store_mod.decodeNumericRef(remain)) |info| {
+                    const utf8 = info.utf8[0..info.utf8_len];
+                    if (out_len + utf8.len > buf.len) return null;
+                    @memcpy(buf[out_len..][0..utf8.len], utf8);
+                    out_len += utf8.len;
+                    i += info.consumed;
+                    continue;
+                }
+            }
         }
         if (out_len >= buf.len) return null;
         buf[out_len] = src[i];
