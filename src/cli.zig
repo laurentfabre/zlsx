@@ -278,7 +278,22 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         "--sheet-glob", "--output",    "--out",     "--ref",
         "--value",      "--row",       "--col",     "--new-name",
     };
+    // Context-aware splitter: the token IMMEDIATELY following a
+    // value-bearing flag is its literal value and must pass through
+    // verbatim, even if it textually matches `--known-flag=value`.
+    // Without this, `zlsx rows f.xlsx --name --format=csv` would
+    // split the literal sheet name into a separate flag-token pair.
+    var prev_was_value_flag: bool = false;
     for (raw_argv) |raw| {
+        if (prev_was_value_flag) {
+            // This token is a value for the previous flag — pass
+            // verbatim regardless of shape.
+            if (split_count >= split_buf.len) return ArgError.TooManyArgs;
+            split_buf[split_count] = raw;
+            split_count += 1;
+            prev_was_value_flag = false;
+            continue;
+        }
         if (raw.len >= 2 and raw[0] == '-' and raw[1] == '-') {
             if (std.mem.indexOfScalar(u8, raw, '=')) |eq| {
                 const key = raw[0..eq];
@@ -297,13 +312,20 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
                     split_buf[split_count] = key;
                     split_buf[split_count + 1] = raw[eq + 1 ..];
                     split_count += 2;
+                    // The split form already supplied the value for
+                    // this flag; the next token is unrelated.
+                    prev_was_value_flag = false;
                     continue;
                 }
-                // Unknown `--key=…` token — leave verbatim so it
-                // either survives as a literal value for the
-                // preceding flag (e.g. a `--name --foo=bar` where
-                // `--foo=bar` is the literal sheet name) or surfaces
-                // as UnknownFlag in the main parser.
+                // Unknown `--key=…` token — fall through to verbatim.
+            }
+            // Bare `--flag` form: if it's value-bearing, the next
+            // token is its literal value.
+            for (value_flags) |vf| {
+                if (std.mem.eql(u8, raw, vf)) {
+                    prev_was_value_flag = true;
+                    break;
+                }
             }
         }
         if (split_count >= split_buf.len) return ArgError.TooManyArgs;
@@ -4215,6 +4237,26 @@ test "parseArgs preserves unknown --foo=bar as literal value" {
     const argv = [_][]const u8{ "rows", "f.xlsx", "--name", "--Q=1" };
     const a = try parseArgs(&argv);
     try std.testing.expectEqualStrings("--Q=1", a.sheet_name.?);
+}
+
+test "parseArgs preserves --known-flag=value as literal value when used after value-flag" {
+    // `--name --format=csv` should set sheet name to literally
+    // "--format=csv" (rare but valid xlsx sheet name), NOT split
+    // --format=csv into [--format, csv]. The context-aware splitter
+    // must see "the previous token is a value-bearing flag" and
+    // leave THIS token verbatim regardless of shape.
+    const argv = [_][]const u8{ "rows", "f.xlsx", "--name", "--format=csv" };
+    const a = try parseArgs(&argv);
+    try std.testing.expectEqualStrings("--format=csv", a.sheet_name.?);
+}
+
+test "parseArgs preserves --bool=value as literal when used after value-flag" {
+    // Same context rule: `--name --header=1` is a literal sheet name
+    // even though `--header=1` would otherwise trigger BadArgValue
+    // (since --header is a boolean flag).
+    const argv = [_][]const u8{ "rows", "f.xlsx", "--name", "--header=1" };
+    const a = try parseArgs(&argv);
+    try std.testing.expectEqualStrings("--header=1", a.sheet_name.?);
 }
 
 test "parseArgs rejects =value on boolean flags" {
