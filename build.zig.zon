@@ -8,6 +8,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "pkg",
         "tests",
         "scripts",
         "docs",
