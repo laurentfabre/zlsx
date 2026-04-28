@@ -37,7 +37,8 @@ defer store.deinit();
 | Symbol | Notes |
 |---|---|
 | `replacePart(name, bytes)` | Queues an override. Sub-1 KiB inputs ship STORED; larger inputs go through deflate (with a fall-back to STORED if compression doesn't shrink). |
-| `save(path)` | Atomic write. Untouched parts copy LFH + payload bytes byte-for-byte from the source. Replaced parts get fresh LFH + CDFH. EOCD comment preserved. Data-descriptor bytes (flag 0x0008) preserved verbatim. |
+| `addPart(name, content_type, bytes)` | Append a new part. Updates `[Content_Types].xml` to declare the part via an `<Override>` so consumers (Excel, openpyxl) accept the saved package. Same compression policy as `replacePart`. Returns `error.PartAlreadyExists` if the name is already in use. |
+| `save(path)` | Atomic write. Untouched parts copy LFH + payload bytes byte-for-byte from the source. Replaced / added parts get fresh LFH + CDFH. EOCD comment preserved. Data-descriptor bytes (flag 0x0008) preserved verbatim. |
 
 ### Drawing helpers (C2a)
 
@@ -126,8 +127,12 @@ with `in.xlsx` byte-for-byte; only `xl/workbook.xml` re-deflates.
   surface zero anchors.
 - **Pivot tables** — detected, opaque-byte preserved, never
   materialised as a typed object.
-- **Adding a brand-new part** — `addPart` is the next public
-  surface to grow; today only `replacePart` is shipped.
+- **Per-part inferred metadata refresh** — `replacePart` /
+  `addPart` install fresh bytes for the touched part(s), but
+  metadata derived from `[Content_Types].xml` or `_rels/*.rels`
+  on OTHER parts is NOT re-inferred until the next `open()`.
+  Saved archives carry the new state correctly; in-process reads
+  of derived state may be stale.
 
 ## Stability
 
