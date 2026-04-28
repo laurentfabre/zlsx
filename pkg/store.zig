@@ -114,6 +114,13 @@ pub const PartStore = struct {
                 e.compression_method,
                 e.uncompressed_size,
             );
+            // Verify the CDFH CRC32 against the decompressed bytes.
+            // Eager decompression means we'd otherwise hand corrupted
+            // payloads to callers (imageParts, drawing walkers,
+            // zlsx-extract-images writing damaged files to disk).
+            // Surfacing BadZip here is the contract every consumer
+            // already handles — see derived_bad_crc32.xlsx fixture.
+            if (std.hash.Crc32.hash(bytes) != e.crc32) return Error.BadZip;
             parts[i] = .{
                 .name = e.name,
                 .content_type = null, // resolved next pass

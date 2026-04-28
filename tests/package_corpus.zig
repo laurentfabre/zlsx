@@ -61,12 +61,12 @@ const fixture_list = [_]struct { name: []const u8, verdict: Verdict }{
     //
     // Probed empirically once and pinned here so a regression that
     // flips the boundary surfaces immediately.
-    .{ .name = "derived_bad_crc32.xlsx", .verdict = .must_open_with_lazy_corruption },
+    .{ .name = "derived_bad_crc32.xlsx", .verdict = .must_error_typed }, // CRC32 verified eagerly
     .{ .name = "derived_truncated_mid_payload.xlsx", .verdict = .must_error_typed },
     .{ .name = "derived_truncated_pre_eocd.xlsx", .verdict = .must_error_typed },
     .{ .name = "derived_truncated_signature.xlsx", .verdict = .must_error_typed },
     .{ .name = "poi_MalformedSSTCount.xlsx", .verdict = .must_open_clean }, // structural ZIP is valid
-    .{ .name = "poi_clusterfuzz_xssf.xlsx", .verdict = .must_open_clean },
+    .{ .name = "poi_clusterfuzz_xssf.xlsx", .verdict = .must_error_typed }, // CRC mismatch surfaced by eager check
     .{ .name = "poi_crash_274d6342.xlsx", .verdict = .must_error_typed }, // BadZip — broken CDFH
     .{ .name = "poi_crash_9bf3cd4b.xlsx", .verdict = .must_error_typed }, // NotPkzip — no EOCD
     .{ .name = "poi_workbook_password_2013.xlsx", .verdict = .must_open_with_lazy_corruption }, // encrypted CFB inside valid ZIP

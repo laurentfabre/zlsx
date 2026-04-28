@@ -116,9 +116,24 @@ echo "(4) locally-derived adversarial variants —"
 src="$dir/worldbank_catalog.xlsx"
 if [[ -f "$src" ]] && command -v python3 >/dev/null 2>&1; then
   python3 - "$src" "$dir" <<'PY'
-import os, sys
+import os, struct, sys
 src_path, out_dir = sys.argv[1], sys.argv[2]
 src = open(src_path, "rb").read()
+
+def flip_first_cdfh_crc(blob):
+    # Locate the EOCD by walking back from end (no trailing comment in
+    # our source fixture). Read cd_offset from the EOCD, then flip a
+    # byte at CDFH+16 (= CRC32 LSB of the first central-directory
+    # entry). PartStore.open verifies decompressed bytes against the
+    # CDFH CRC32 eagerly, so flipping it surfaces as BadZip.
+    eocd_sig = b"PK\x05\x06"
+    eocd_off = blob.rfind(eocd_sig)
+    if eocd_off < 0:
+        raise SystemExit("source fixture has no EOCD")
+    cd_offset = struct.unpack_from("<I", blob, eocd_off + 16)[0]
+    out = bytearray(blob)
+    out[cd_offset + 16] ^= 0xFF
+    return bytes(out)
 
 variants = {
     # Cut last 22 bytes — removes the EOCD record entirely. Reader
@@ -129,8 +144,9 @@ variants = {
     "derived_truncated_mid_payload.xlsx": src[:50],
     # Cut at byte 4 — incomplete LFH signature.
     "derived_truncated_signature.xlsx": src[:4],
-    # Flip a CRC byte in the first LFH (offset 14 = sig+ver+flags+method+mtime+mdate).
-    "derived_bad_crc32.xlsx": bytes(b ^ 0xff if i == 14 else b for i, b in enumerate(src)),
+    # Flip the CRC byte in the first central-directory entry. See
+    # flip_first_cdfh_crc above for why CDFH and not LFH.
+    "derived_bad_crc32.xlsx": flip_first_cdfh_crc(src),
 }
 for name, data in variants.items():
     dest = os.path.join(out_dir, name)
