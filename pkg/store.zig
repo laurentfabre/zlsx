@@ -232,7 +232,14 @@ pub const PartStore = struct {
         // file's tmp slot.
         if (self.entries.len > std.math.maxInt(u16)) return Error.ZipArchiveTooLarge;
         if (self.eocd_comment.len > std.math.maxInt(u16)) return Error.ZipArchiveTooLarge;
-        var projected: u64 = @as(u64, eocd_min_size) + @as(u64, self.eocd_comment.len);
+        // Compute the serialized ZIP32 fields up front (cd_offset and
+        // cd_size) and reject if either would write the Zip64
+        // sentinel. cd_offset = total LFH phase bytes; cd_size =
+        // total CDFH phase bytes. Total file size is NOT a
+        // serialized field, so we don't reject on it — only on the
+        // values that actually go on wire.
+        var lfh_phase_total: u64 = 0;
+        var cdfh_phase_total: u64 = 0;
         for (self.entries, 0..) |e, i| {
             if (e.name.len > std.math.maxInt(u16)) return Error.ZipArchiveTooLarge;
             const lfh_total: u64 = if (self.overrides[i]) |ov| blk: {
@@ -247,18 +254,11 @@ pub const PartStore = struct {
                 46 + @as(u64, e.name.len)
             else
                 @as(u64, e.cdfh_total_len);
-            projected += lfh_total + cdfh_total;
+            lfh_phase_total += lfh_total;
+            cdfh_phase_total += cdfh_total;
         }
-        // The wire-format ZIP32 fields that need to stay strictly
-        // below 0xFFFFFFFF (the Zip64 sentinel) are cd_offset,
-        // cd_size, and each entry's compressed/uncompressed/offset
-        // fields — NOT the total file length. The latter is not
-        // serialized, so a projected total of exactly 0xFFFFFFFF is
-        // fine as long as the per-field checks below hold. Cap the
-        // total at maxInt(u32) (the @intCast(written) wraparound
-        // bound) and let the field-level checks during the write
-        // loop catch the sentinel cases.
-        if (projected > std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
+        if (lfh_phase_total >= std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
+        if (cdfh_phase_total >= std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
 
         var write_buf: [4096]u8 = undefined;
         var atomic_file = try std.fs.cwd().atomicFile(path, .{ .write_buffer = &write_buf });

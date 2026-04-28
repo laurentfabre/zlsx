@@ -3095,21 +3095,17 @@ const ZipWriter = struct {
             try self.out.appendSlice(alloc, e.name);
         }
 
-        // The CD itself adds 46 + name_len per entry. After writing
-        // the CD, the position fits a u32 by inductive argument
-        // (cd_start < 0xFFFFFFFF, max CD size < 4 GiB given the
-        // 65535-entry cap). What matters for ZIP32 sentinel-safety
-        // is the SERIALIZED cd_size field — not the cd_end position.
-        // Compute cd_size first, then reject if it would write the
-        // Zip64 sentinel.
-        if (self.out.items.len > std.math.maxInt(u32)) {
+        // What matters for ZIP32 sentinel-safety is the SERIALIZED
+        // cd_size field — NOT the cd_end position (which isn't on
+        // wire). Compute cd_size in u64 to avoid casting cd_end,
+        // which would falsely reject archives whose total length
+        // straddles 4 GiB but whose cd_offset + cd_size both stay
+        // below the sentinel.
+        const cd_size_u64 = self.out.items.len - cd_start;
+        if (cd_size_u64 >= std.math.maxInt(u32)) {
             return error.ZipArchiveTooLarge;
         }
-        const cd_end: u32 = @intCast(self.out.items.len);
-        const cd_size = cd_end - cd_start;
-        if (cd_size >= std.math.maxInt(u32)) {
-            return error.ZipArchiveTooLarge;
-        }
+        const cd_size: u32 = @intCast(cd_size_u64);
 
         const end: std.zip.EndRecord = .{
             .signature = std.zip.end_record_sig,
