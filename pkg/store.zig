@@ -342,6 +342,14 @@ pub const PartStore = struct {
             .crc32 = std.hash.Crc32.hash(bytes),
             .uncompressed_size = @intCast(bytes.len),
         };
+        // Mirror the override into parts[idx].bytes so subsequent
+        // part() lookups see the updated content. Without this,
+        // multiple replacePart / addPart calls on the same part
+        // (e.g. addPart inserting two new content-type Overrides)
+        // would each rebuild from the stale original bytes and
+        // lose prior edits.
+        self.parts[idx].bytes = try ar_alloc.dupe(u8, bytes);
+        self.parts[idx].compression_method = method;
     }
 
     /// Atomic write of the package to `path`. Untouched parts are
@@ -1709,6 +1717,40 @@ test "PartStore.addPart + save: new part survives round-trip with content type" 
     const part_in_dst = dst.part(new_part_name) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, new_part_bytes, part_in_dst.bytes);
     try std.testing.expectEqualStrings(new_part_ct, part_in_dst.content_type.?);
+}
+
+test "PartStore.addPart: multiple parts in one session all register content types" {
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "added_two.xlsx" });
+    defer std.testing.allocator.free(out_path);
+
+    {
+        var store = try PartStore.open(std.testing.allocator, fixture);
+        defer store.deinit();
+        try store.addPart("xl/customA.xml", "application/xml", "<a/>");
+        try store.addPart("xl/customB.xml", "application/xml", "<b/>");
+        try store.save(out_path);
+    }
+
+    var dst = try PartStore.open(std.testing.allocator, out_path);
+    defer dst.deinit();
+
+    // Both parts present.
+    const a = dst.part("xl/customA.xml") orelse return error.TestUnexpectedResult;
+    const b = dst.part("xl/customB.xml") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, "<a/>", a.bytes);
+    try std.testing.expectEqualSlices(u8, "<b/>", b.bytes);
+    // Both content types registered (the bug Codex caught was that
+    // the second addPart's content-type rebuild lost the first
+    // addPart's <Override>, leaving customA.xml undeclared).
+    try std.testing.expectEqualStrings("application/xml", a.content_type.?);
+    try std.testing.expectEqualStrings("application/xml", b.content_type.?);
 }
 
 test "PartStore.addPart: rejects duplicate part name" {
