@@ -68,6 +68,36 @@ pub const ImageAnchor = struct {
     bytes: []const u8,
 };
 
+pub const ChartType = enum {
+    bar,
+    line,
+    pie,
+    scatter,
+    area,
+    bubble,
+    radar,
+    /// Any other / unrecognised chart-XML element. The raw_xml is
+    /// always available so callers can interrogate further.
+    other,
+};
+
+pub const ChartAnchor = struct {
+    /// Archive name of the chart part, e.g. `xl/charts/chart1.xml`.
+    chart_part_name: []const u8,
+    /// Archive name of the sheet whose drawing references this chart.
+    sheet_part_name: []const u8,
+    /// Top-left anchor cell.
+    from: CellAnchor,
+    /// Bottom-right anchor cell. `null` for `oneCellAnchor`.
+    to: ?CellAnchor,
+    /// Detected chart-type element (`<c:barChart>`, `<c:lineChart>`,
+    /// etc.). `.other` covers unrecognised or compound charts; the
+    /// raw_xml is always available for callers needing more detail.
+    chart_type: ChartType,
+    /// Raw chart-part XML bytes. Borrowed from the PartStore.
+    raw_xml: []const u8,
+};
+
 /// Walk every worksheet's `<drawing r:id=...>`, resolve to a drawing
 /// part, parse anchored `<xdr:pic>` entries, and return the resulting
 /// list of ImageAnchors.
@@ -85,6 +115,23 @@ pub fn imageAnchors(store: *PartStore, allocator: std.mem.Allocator) ![]ImageAnc
         try collectFromSheet(store, allocator, sheet_part, &out);
     }
 
+    return out.toOwnedSlice(allocator);
+}
+
+/// Same walk shape as `imageAnchors` but surfaces every embedded
+/// chart (`<xdr:graphicFrame>` containing `<c:chart r:id=...>`).
+/// Each ChartAnchor exposes the chart part's archive name + raw
+/// XML bytes; the chart_type field is best-effort detected from
+/// the chart-XML root element (barChart / lineChart / etc.) and
+/// callers wanting series refs can interrogate raw_xml directly
+/// for now.
+pub fn chartAnchors(store: *PartStore, allocator: std.mem.Allocator) ![]ChartAnchor {
+    var out: std.ArrayListUnmanaged(ChartAnchor) = .empty;
+    errdefer out.deinit(allocator);
+    for (store.parts) |sheet_part| {
+        if (!isSheetPart(sheet_part.name)) continue;
+        try collectChartsFromSheet(store, allocator, sheet_part, &out);
+    }
     return out.toOwnedSlice(allocator);
 }
 
@@ -153,6 +200,94 @@ fn collectFromSheet(
             .bytes = image_part.bytes,
         });
     }
+}
+
+fn collectChartsFromSheet(
+    store: *PartStore,
+    allocator: std.mem.Allocator,
+    sheet_part: store_mod.Part,
+    out: *std.ArrayListUnmanaged(ChartAnchor),
+) !void {
+    const rid = findDrawingRid(sheet_part.bytes) orelse return;
+    const sheet_rels = store.rels(sheet_part.name);
+    const drawing_target = relTargetForId(sheet_rels, rid) orelse return;
+    const drawing_part_name = (try store.resolve(sheet_part.name, drawing_target)) orelse return;
+    const drawing_part = store.part(drawing_part_name) orelse return;
+
+    const drawing_rels = store.rels(drawing_part_name);
+
+    var i: usize = 0;
+    while (i < drawing_part.bytes.len) {
+        const next = std.mem.indexOfPos(u8, drawing_part.bytes, i, "<xdr:") orelse break;
+        i = next;
+        const is_two = std.mem.startsWith(u8, drawing_part.bytes[i..], "<xdr:twoCellAnchor");
+        const is_one = std.mem.startsWith(u8, drawing_part.bytes[i..], "<xdr:oneCellAnchor");
+        if (!is_two and !is_one) {
+            i += "<xdr:".len;
+            continue;
+        }
+        const close_marker = if (is_two) "</xdr:twoCellAnchor>" else "</xdr:oneCellAnchor>";
+        const close = std.mem.indexOfPos(u8, drawing_part.bytes, i, close_marker) orelse break;
+        const block = drawing_part.bytes[i .. close + close_marker.len];
+        i = close + close_marker.len;
+
+        // Charts live inside <xdr:graphicFrame>...<c:chart r:id=...
+        const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame") orelse continue;
+        const chart_idx = std.mem.indexOfPos(u8, block, gf_idx, "<c:chart") orelse continue;
+        const chart_end = std.mem.indexOfScalarPos(u8, block, chart_idx, '>') orelse continue;
+        const chart_attrs = block[chart_idx .. chart_end + 1];
+        const embed_rid = attrValue(chart_attrs, "r:id") orelse continue;
+
+        const chart_target = relTargetForId(drawing_rels, embed_rid) orelse continue;
+        const chart_part_name = (try store.resolve(drawing_part_name, chart_target)) orelse continue;
+        const chart_part = store.part(chart_part_name) orelse continue;
+
+        const from = parseCellAnchor(block, "<xdr:from>", "</xdr:from>") orelse continue;
+        const to_anchor: ?CellAnchor = if (is_two)
+            parseCellAnchor(block, "<xdr:to>", "</xdr:to>")
+        else
+            null;
+
+        try out.append(allocator, .{
+            .chart_part_name = chart_part.name,
+            .sheet_part_name = sheet_part.name,
+            .from = from,
+            .to = to_anchor,
+            .chart_type = detectChartType(chart_part.bytes),
+            .raw_xml = chart_part.bytes,
+        });
+    }
+}
+
+/// Best-effort chart-type detection from the chart-part XML. Looks
+/// for the canonical `<c:Xchart>` element name. Compound charts
+/// (multiple plot types overlaid) collapse to whichever is found
+/// first; callers needing the full picture can walk raw_xml
+/// directly.
+fn detectChartType(chart_xml: []const u8) ChartType {
+    if (std.mem.indexOf(u8, chart_xml, "<c:barChart") != null) return .bar;
+    if (std.mem.indexOf(u8, chart_xml, "<c:lineChart") != null) return .line;
+    if (std.mem.indexOf(u8, chart_xml, "<c:pieChart") != null) return .pie;
+    if (std.mem.indexOf(u8, chart_xml, "<c:scatterChart") != null) return .scatter;
+    if (std.mem.indexOf(u8, chart_xml, "<c:areaChart") != null) return .area;
+    if (std.mem.indexOf(u8, chart_xml, "<c:bubbleChart") != null) return .bubble;
+    if (std.mem.indexOf(u8, chart_xml, "<c:radarChart") != null) return .radar;
+    return .other;
+}
+
+/// Generic attribute value extractor: find `key="value"` inside an
+/// already-narrowed tag-attributes slice. Returns null if absent.
+fn attrValue(attrs: []const u8, key: []const u8) ?[]const u8 {
+    var search_buf: [32]u8 = undefined;
+    if (key.len + 2 > search_buf.len) return null;
+    @memcpy(search_buf[0..key.len], key);
+    search_buf[key.len] = '=';
+    search_buf[key.len + 1] = '"';
+    const needle = search_buf[0 .. key.len + 2];
+    const found = std.mem.indexOf(u8, attrs, needle) orelse return null;
+    const start = found + needle.len;
+    const end = std.mem.indexOfScalarPos(u8, attrs, start, '"') orelse return null;
+    return attrs[start..end];
 }
 
 /// Find the value of `r:id` on the sheet's `<drawing>` element. The
@@ -288,6 +423,56 @@ test "imageAnchors: workbook with no drawings returns empty slice" {
     defer std.testing.allocator.free(anchors);
 
     try std.testing.expectEqual(@as(usize, 0), anchors.len);
+}
+
+test "chartAnchors: openxlsx_loadExample.xlsx surfaces embedded charts" {
+    const fixture = "tests/corpus/openxlsx_loadExample.xlsx";
+    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+
+    var s = try PartStore.open(std.testing.allocator, fixture);
+    defer s.deinit();
+
+    const charts = try chartAnchors(&s, std.testing.allocator);
+    defer std.testing.allocator.free(charts);
+
+    // openxlsx_loadExample has at least one embedded chart.
+    try std.testing.expect(charts.len > 0);
+    for (charts) |c| {
+        try std.testing.expect(std.mem.startsWith(u8, c.chart_part_name, "xl/charts/chart"));
+        try std.testing.expect(std.mem.startsWith(u8, c.sheet_part_name, "xl/worksheets/sheet"));
+        try std.testing.expect(c.raw_xml.len > 0);
+        // Detected chart type should be one of the known enum
+        // values (.other is acceptable for compound / unrecognised
+        // forms but every fixture in the corpus today is bar/line/
+        // pie/scatter).
+        switch (c.chart_type) {
+            .bar, .line, .pie, .scatter, .area, .bubble, .radar, .other => {},
+        }
+    }
+}
+
+test "chartAnchors: workbook with no charts returns empty slice" {
+    const fixture = "tests/corpus/worldbank_catalog.xlsx";
+    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+
+    var s = try PartStore.open(std.testing.allocator, fixture);
+    defer s.deinit();
+
+    const charts = try chartAnchors(&s, std.testing.allocator);
+    defer std.testing.allocator.free(charts);
+
+    try std.testing.expectEqual(@as(usize, 0), charts.len);
+}
+
+test "detectChartType: covers all canonical OOXML chart elements" {
+    try std.testing.expectEqual(ChartType.bar, detectChartType("<c:chartSpace><c:barChart/>"));
+    try std.testing.expectEqual(ChartType.line, detectChartType("<c:chartSpace><c:lineChart/>"));
+    try std.testing.expectEqual(ChartType.pie, detectChartType("<c:chartSpace><c:pieChart/>"));
+    try std.testing.expectEqual(ChartType.scatter, detectChartType("<c:chartSpace><c:scatterChart/>"));
+    try std.testing.expectEqual(ChartType.area, detectChartType("<c:chartSpace><c:areaChart/>"));
+    try std.testing.expectEqual(ChartType.bubble, detectChartType("<c:chartSpace><c:bubbleChart/>"));
+    try std.testing.expectEqual(ChartType.radar, detectChartType("<c:chartSpace><c:radarChart/>"));
+    try std.testing.expectEqual(ChartType.other, detectChartType("<c:chartSpace><c:doughnutChart/>"));
 }
 
 test "parseCellAnchor unit test" {
