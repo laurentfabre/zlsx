@@ -739,17 +739,26 @@ fn resolveContentTypes(parts: []Part) !void {
 }
 
 fn attrAtSlice(attrs: []const u8, key: []const u8) ?[]const u8 {
-    // Match `<key>="<value>"`. Tolerate single-quote variant too for
-    // adversarial XML, but OOXML always emits double quotes.
+    // Match `key="value"` or `key='value'`. Both quote styles are
+    // valid XML; some non-Microsoft OOXML producers (libreoffice,
+    // hand-edited .rels files) emit single quotes, and missing them
+    // would silently leave content types unresolved and relationships
+    // unparsed, causing imageParts / rels / drawing walkers to miss
+    // parts on otherwise well-formed packages.
+    return attrAtSliceWithQuote(attrs, key, '"') orelse
+        attrAtSliceWithQuote(attrs, key, '\'');
+}
+
+fn attrAtSliceWithQuote(attrs: []const u8, key: []const u8, quote: u8) ?[]const u8 {
     var search_buf: [64]u8 = undefined;
     if (key.len + 2 > search_buf.len) return null;
     @memcpy(search_buf[0..key.len], key);
     search_buf[key.len] = '=';
-    search_buf[key.len + 1] = '"';
+    search_buf[key.len + 1] = quote;
     const needle = search_buf[0 .. key.len + 2];
     const found = std.mem.indexOf(u8, attrs, needle) orelse return null;
     const start = found + needle.len;
-    const close = std.mem.indexOfScalarPos(u8, attrs, start, '"') orelse return null;
+    const close = std.mem.indexOfScalarPos(u8, attrs, start, quote) orelse return null;
     return attrs[start..close];
 }
 
@@ -1139,6 +1148,25 @@ test "PartStore.open: rejects non-PK file" {
     defer std.testing.allocator.free(path);
 
     try std.testing.expectError(Error.NotPkzip, PartStore.open(std.testing.allocator, path));
+}
+
+test "attrAtSlice tolerates single-quoted XML attributes" {
+    // Content_Types.xml and .rels from non-Microsoft producers
+    // (libreoffice, pandoc, hand-edits) sometimes single-quote
+    // attributes. Missing them silently dropped content-type
+    // resolution and relationship parsing.
+    try std.testing.expectEqualStrings(
+        "image/png",
+        attrAtSlice("Extension=\"png\" ContentType=\"image/png\"", "ContentType").?,
+    );
+    try std.testing.expectEqualStrings(
+        "image/png",
+        attrAtSlice("Extension='png' ContentType='image/png'", "ContentType").?,
+    );
+    try std.testing.expectEqualStrings(
+        "rId1",
+        attrAtSlice("Id='rId1' Type='foo' Target='bar'", "Id").?,
+    );
 }
 
 test "decompressPayload: rejects ZIP-bomb declared sizes" {

@@ -301,18 +301,26 @@ fn detectChartType(chart_xml: []const u8) ChartType {
     return .other;
 }
 
-/// Generic attribute value extractor: find `key="value"` inside an
-/// already-narrowed tag-attributes slice. Returns null if absent.
+/// Generic attribute value extractor: find `key="value"` or
+/// `key='value'` inside an already-narrowed tag-attributes slice.
+/// Both quote styles are valid XML; non-Microsoft producers
+/// (libreoffice, hand-edited drawings) sometimes emit single
+/// quotes, and skipping them silently dropped image/chart anchors.
 fn attrValue(attrs: []const u8, key: []const u8) ?[]const u8 {
+    return attrValueWithQuote(attrs, key, '"') orelse
+        attrValueWithQuote(attrs, key, '\'');
+}
+
+fn attrValueWithQuote(attrs: []const u8, key: []const u8, quote: u8) ?[]const u8 {
     var search_buf: [32]u8 = undefined;
     if (key.len + 2 > search_buf.len) return null;
     @memcpy(search_buf[0..key.len], key);
     search_buf[key.len] = '=';
-    search_buf[key.len + 1] = '"';
+    search_buf[key.len + 1] = quote;
     const needle = search_buf[0 .. key.len + 2];
     const found = std.mem.indexOf(u8, attrs, needle) orelse return null;
     const start = found + needle.len;
-    const end = std.mem.indexOfScalarPos(u8, attrs, start, '"') orelse return null;
+    const end = std.mem.indexOfScalarPos(u8, attrs, start, quote) orelse return null;
     return attrs[start..end];
 }
 
@@ -322,12 +330,7 @@ fn attrValue(attrs: []const u8, key: []const u8) ?[]const u8 {
 fn findDrawingRid(sheet_xml: []const u8) ?[]const u8 {
     const tag = std.mem.indexOf(u8, sheet_xml, "<drawing ") orelse return null;
     const tag_end = std.mem.indexOfScalarPos(u8, sheet_xml, tag, '>') orelse return null;
-    const attrs = sheet_xml[tag .. tag_end + 1];
-    const key = "r:id=\"";
-    const ks = std.mem.indexOf(u8, attrs, key) orelse return null;
-    const start = ks + key.len;
-    const end = std.mem.indexOfScalarPos(u8, attrs, start, '"') orelse return null;
-    return attrs[start..end];
+    return attrValue(sheet_xml[tag .. tag_end + 1], "r:id");
 }
 
 /// Find the value of `r:embed` on the `<a:blip r:embed="rIdN" ...>`
@@ -337,12 +340,7 @@ fn findDrawingRid(sheet_xml: []const u8) ?[]const u8 {
 fn findBlipEmbed(pic_xml: []const u8) ?[]const u8 {
     const blip = std.mem.indexOf(u8, pic_xml, "<a:blip") orelse return null;
     const blip_end = std.mem.indexOfScalarPos(u8, pic_xml, blip, '>') orelse return null;
-    const attrs = pic_xml[blip .. blip_end + 1];
-    const key = "r:embed=\"";
-    const ks = std.mem.indexOf(u8, attrs, key) orelse return null;
-    const start = ks + key.len;
-    const end = std.mem.indexOfScalarPos(u8, attrs, start, '"') orelse return null;
-    return attrs[start..end];
+    return attrValue(pic_xml[blip .. blip_end + 1], "r:embed");
 }
 
 fn relTargetForId(rels: []const store_mod.Relationship, id: []const u8) ?[]const u8 {
@@ -530,4 +528,29 @@ test "parseCellAnchor unit test" {
     try std.testing.expectEqual(@as(i64, 16119), a.col_off);
     try std.testing.expectEqual(@as(u32, 1), a.row);
     try std.testing.expectEqual(@as(i64, 47624), a.row_off);
+}
+
+test "attrValue tolerates single-quoted XML attributes" {
+    // Both quote styles are valid XML (W3C XML 1.0 §3.1). Valid
+    // OOXML packages from libreoffice / pandoc / hand-edited drawings
+    // use either, so the helper must accept both.
+    try std.testing.expectEqualStrings("rId7", attrValue("foo=\"bar\" r:id=\"rId7\"", "r:id").?);
+    try std.testing.expectEqualStrings("rId7", attrValue("foo='bar' r:id='rId7'", "r:id").?);
+    try std.testing.expectEqualStrings("rId7", attrValue("r:id='rId7'", "r:id").?);
+    try std.testing.expectEqualStrings("rId7", attrValue("r:id=\"rId7\"", "r:id").?);
+    // Mixed quote styles in the same tag are legal XML.
+    try std.testing.expectEqualStrings("X", attrValue("a=\"y\" b='X'", "b").?);
+    // Missing key returns null regardless.
+    try std.testing.expectEqual(@as(?[]const u8, null), attrValue("foo='bar'", "missing"));
+}
+
+test "findDrawingRid + findBlipEmbed tolerate single quotes" {
+    try std.testing.expectEqualStrings(
+        "rId3",
+        findDrawingRid("<sheet><drawing r:id='rId3'/></sheet>").?,
+    );
+    try std.testing.expectEqualStrings(
+        "rId9",
+        findBlipEmbed("<xdr:pic><a:blip r:embed='rId9'/></xdr:pic>").?,
+    );
 }
