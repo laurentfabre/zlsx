@@ -1006,12 +1006,13 @@ fn parseRelationships(arena: std.mem.Allocator, xml: []const u8) ![]Relationship
     return out.toOwnedSlice(arena);
 }
 
-/// Decode the five canonical XML entities (`&amp; &lt; &gt; &quot;
-/// &apos;`) into their literal forms, returning a fresh arena-owned
-/// slice. Numeric character references (`&#N;` / `&#xN;`) and other
-/// named entities are passed through verbatim — not used in OOXML
-/// rels in practice, and surfacing them as-is matches what the
-/// reader does on the .xml.rels side.
+/// Decode the five canonical XML named entities (`&amp; &lt; &gt;
+/// &quot; &apos;`) plus numeric character references (`&#N;` and
+/// `&#xN;`) into their literal forms, returning a fresh arena-owned
+/// slice. Code points are UTF-8 encoded. Unknown named entities pass
+/// through verbatim. Malformed numeric refs (no closing `;`, empty
+/// digit run, out-of-range code point) also pass through verbatim,
+/// matching the lenient behaviour of OOXML readers.
 fn decodeXmlEntities(arena: std.mem.Allocator, s: []const u8) ![]u8 {
     if (std.mem.indexOfScalar(u8, s, '&') == null) return arena.dupe(u8, s);
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -1022,35 +1023,74 @@ fn decodeXmlEntities(arena: std.mem.Allocator, s: []const u8) ![]u8 {
         if (s[i] == '&') {
             const remain = s[i..];
             if (std.mem.startsWith(u8, remain, "&amp;")) {
-                out.appendAssumeCapacity('&');
+                try out.append(arena, '&');
                 i += 5;
                 continue;
             }
             if (std.mem.startsWith(u8, remain, "&lt;")) {
-                out.appendAssumeCapacity('<');
+                try out.append(arena, '<');
                 i += 4;
                 continue;
             }
             if (std.mem.startsWith(u8, remain, "&gt;")) {
-                out.appendAssumeCapacity('>');
+                try out.append(arena, '>');
                 i += 4;
                 continue;
             }
             if (std.mem.startsWith(u8, remain, "&quot;")) {
-                out.appendAssumeCapacity('"');
+                try out.append(arena, '"');
                 i += 6;
                 continue;
             }
             if (std.mem.startsWith(u8, remain, "&apos;")) {
-                out.appendAssumeCapacity('\'');
+                try out.append(arena, '\'');
                 i += 6;
                 continue;
             }
+            // Numeric character reference: `&#N;` (decimal) or
+            // `&#xN;` (hex). Decode the code point and append its
+            // UTF-8 representation. Any malformation falls through
+            // to the literal-`&` append below.
+            if (std.mem.startsWith(u8, remain, "&#")) {
+                if (decodeNumericRef(remain)) |info| {
+                    try out.appendSlice(arena, info.utf8[0..info.utf8_len]);
+                    i += info.consumed;
+                    continue;
+                }
+            }
         }
-        out.appendAssumeCapacity(s[i]);
+        try out.append(arena, s[i]);
         i += 1;
     }
     return out.toOwnedSlice(arena);
+}
+
+const NumericRef = struct {
+    utf8: [4]u8,
+    utf8_len: u3,
+    consumed: usize,
+};
+
+fn decodeNumericRef(s: []const u8) ?NumericRef {
+    // s starts with "&#". Find the closing ';' and the digit run.
+    if (s.len < 4) return null; // need at least "&#0;"
+    var digit_start: usize = 2;
+    var base: u8 = 10;
+    if (s[2] == 'x' or s[2] == 'X') {
+        digit_start = 3;
+        base = 16;
+    }
+    const semi = std.mem.indexOfScalarPos(u8, s, digit_start, ';') orelse return null;
+    if (semi == digit_start) return null; // empty digit run
+    const code = std.fmt.parseInt(u32, s[digit_start..semi], base) catch return null;
+    if (code > 0x10FFFF) return null;
+    // XML 1.0 forbids most C0 controls; skip them rather than
+    // emitting invalid UTF-8 / non-XML content. Allow tab / LF / CR.
+    if (code < 0x20 and code != 0x09 and code != 0x0A and code != 0x0D) return null;
+    var ref: NumericRef = .{ .utf8 = undefined, .utf8_len = 0, .consumed = semi + 1 };
+    const len = std.unicode.utf8Encode(@intCast(code), &ref.utf8) catch return null;
+    ref.utf8_len = @intCast(len);
+    return ref;
 }
 
 fn parentDir(name: []const u8) []const u8 {
@@ -1392,6 +1432,25 @@ test "decodeXmlEntities decodes the five canonical entities" {
 
     // Unknown entity passes through verbatim.
     try std.testing.expectEqualStrings("&unknown;", try decodeXmlEntities(a, "&unknown;"));
+
+    // Numeric character references (decimal + hex).
+    try std.testing.expectEqualStrings("&", try decodeXmlEntities(a, "&#38;"));
+    try std.testing.expectEqualStrings("&", try decodeXmlEntities(a, "&#x26;"));
+    try std.testing.expectEqualStrings("*", try decodeXmlEntities(a, "&#x2A;"));
+    // Multi-byte UTF-8 (€ = U+20AC).
+    try std.testing.expectEqualStrings("\u{20AC}", try decodeXmlEntities(a, "&#x20AC;"));
+    try std.testing.expectEqualStrings("\u{20AC}", try decodeXmlEntities(a, "&#8364;"));
+    // Real-world rels target with numeric ref for `&`.
+    try std.testing.expectEqualStrings(
+        "../media/logo&1.png",
+        try decodeXmlEntities(a, "../media/logo&#38;1.png"),
+    );
+
+    // Malformed numeric refs pass through verbatim.
+    try std.testing.expectEqualStrings("&#;", try decodeXmlEntities(a, "&#;"));
+    try std.testing.expectEqualStrings("&#xZ;", try decodeXmlEntities(a, "&#xZ;"));
+    // Out-of-range code point passes through.
+    try std.testing.expectEqualStrings("&#1114112;", try decodeXmlEntities(a, "&#1114112;"));
 }
 
 test "looksExternal classifies URL / UNC / drive-letter targets" {
