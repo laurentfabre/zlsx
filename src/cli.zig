@@ -259,11 +259,23 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     // error instead of an OOB write.
     var split_buf: [256][]const u8 = undefined;
     var split_count: usize = 0;
+    // Boolean flags that don't consume a value. `--bool=anything`
+    // is invalid syntax and must be rejected — silently splitting
+    // it would let the value leak into the positional slot and
+    // pick the wrong file path.
+    const boolean_flags = [_][]const u8{
+        "--list-sheets", "--header",     "--include-blanks", "--with-styles",
+        "--sst-lazy",    "--all-sheets", "--help",
+    };
     for (raw_argv) |raw| {
         if (raw.len >= 2 and raw[0] == '-' and raw[1] == '-') {
             if (std.mem.indexOfScalar(u8, raw, '=')) |eq| {
+                const key = raw[0..eq];
+                for (boolean_flags) |bf| {
+                    if (std.mem.eql(u8, key, bf)) return ArgError.BadArgValue;
+                }
                 if (split_count + 2 > split_buf.len) return ArgError.TooManyArgs;
-                split_buf[split_count] = raw[0..eq];
+                split_buf[split_count] = key;
                 split_buf[split_count + 1] = raw[eq + 1 ..];
                 split_count += 2;
                 continue;
@@ -4168,6 +4180,26 @@ test "parseArgs --key= with empty value is accepted as empty string" {
     const argv = [_][]const u8{ "file.xlsx", "--out=" };
     const a = try parseArgs(&argv);
     try std.testing.expectEqualStrings("", a.out_path.?);
+}
+
+test "parseArgs rejects =value on boolean flags" {
+    // `--list-sheets=false` is invalid syntax — the value would
+    // otherwise leak into the positional file slot and pick the
+    // wrong workbook.
+    {
+        const argv = [_][]const u8{ "file.xlsx", "--list-sheets=false" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "file.xlsx", "--header=1" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // Bare `--list-sheets` without `=` still works (boolean flag).
+    {
+        const argv = [_][]const u8{ "file.xlsx", "--list-sheets" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(a.list_sheets);
+    }
 }
 
 test "parseArgs rejects both --sheet and --name" {
