@@ -1913,6 +1913,50 @@ test "PartStore.addPart: rejects duplicate part name" {
     );
 }
 
+// Fuzz targets for attacker-controlled parsers. These run as plain
+// smoke tests on `zig build test` (a few iterations on the seed-only
+// corpus) and become coverage-guided under `zig build fuzz` once
+// the package-layer test target is wired into the fuzz module.
+// Contract: the parser must not panic / deadlock / OOB-read on
+// any input — typed errors are fine.
+
+fn fuzzDecodeXmlEntitiesTarget(_: void, input: []const u8) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const decoded = decodeXmlEntities(arena.allocator(), input) catch return;
+    // Output must be valid UTF-8 — numeric refs go through
+    // utf8Encode which rejects invalid code points.
+    _ = std.unicode.utf8ValidateSlice(decoded);
+}
+
+test "fuzz: decodeXmlEntities never crashes on adversarial input" {
+    try std.testing.fuzz({}, fuzzDecodeXmlEntitiesTarget, .{
+        .corpus = &[_][]const u8{
+            "&amp;",                     "&lt;",       "&#38;",      "&#x26;",
+            "&unknown;",                 "&#",         "&#;",        "&#xZ;",
+            "&#9999999999999;",          "&#x10FFFF;", "&#x110000;", "&#0;",
+            "&amp;&lt;&gt;&quot;&apos;", "a&b",        "&&&&",
+            "\xC0\x80", "\xFF\xFE", // invalid UTF-8 inputs — must not crash
+        },
+    });
+}
+
+fn fuzzLooksExternalTarget(_: void, input: []const u8) anyerror!void {
+    _ = looksExternal(input);
+}
+
+test "fuzz: looksExternal never crashes on adversarial input" {
+    try std.testing.fuzz({}, fuzzLooksExternalTarget, .{
+        .corpus = &[_][]const u8{
+            "",                                      "a",                      "/",
+            "https://example.com",                   "C:\\foo",                "\\\\unc",
+            ":colon-only",                           "scheme:",                "xmlns:foo",
+            "12scheme:",                             "+:",                     "scheme++:",
+            "verylongschemenamethatexceedssixteen:", "../../../../etc/passwd", "a:/b",
+        },
+    });
+}
+
 test "PartStore.addPart: large input round-trips through deflate" {
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
     std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
