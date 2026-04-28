@@ -25,6 +25,7 @@ jobs:
             triple: aarch64-apple-darwin
             archive_format: tar.gz
             cli_name: zlsx
+            extract_images_name: zlsx-extract-images
             dylib_name: libzlsx.dylib
             dylib_dir: lib
             staticlib_name: libzlsx.a
@@ -32,6 +33,7 @@ jobs:
             triple: x86_64-apple-darwin
             archive_format: tar.gz
             cli_name: zlsx
+            extract_images_name: zlsx-extract-images
             dylib_name: libzlsx.dylib
             dylib_dir: lib
             staticlib_name: libzlsx.a
@@ -39,6 +41,7 @@ jobs:
             triple: x86_64-linux-musl
             archive_format: tar.gz
             cli_name: zlsx
+            extract_images_name: zlsx-extract-images
             dylib_name: libzlsx.so
             dylib_dir: lib
             staticlib_name: libzlsx.a
@@ -46,6 +49,7 @@ jobs:
             triple: aarch64-linux-musl
             archive_format: tar.gz
             cli_name: zlsx
+            extract_images_name: zlsx-extract-images
             dylib_name: libzlsx.so
             dylib_dir: lib
             staticlib_name: libzlsx.a
@@ -53,6 +57,7 @@ jobs:
             triple: x86_64-windows-gnu
             archive_format: zip
             cli_name: zlsx.exe
+            extract_images_name: zlsx-extract-images.exe
             dylib_name: zlsx.dll
             dylib_dir: bin
             staticlib_name: zlsx_static.lib
@@ -78,6 +83,8 @@ jobs:
           STAGE="zlsx-${{ steps.ver.outputs.version }}-${{ matrix.triple }}"
           mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/include"
           cp "zig-out/bin/${{ matrix.cli_name }}" "$STAGE/bin/"
+          # C2a: bundle the standalone image-extraction binary too.
+          cp "zig-out/bin/${{ matrix.extract_images_name }}" "$STAGE/bin/"
           # Zig installs the shared library in `bin/` on Windows (DLLs are
           # runtime artefacts) and in `lib/` elsewhere. The import lib
           # (.lib) stays in `lib/` on Windows.
