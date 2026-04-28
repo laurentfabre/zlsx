@@ -756,7 +756,17 @@ fn relsOwner(arena: std.mem.Allocator, name: []const u8) !?[]const u8 {
     if (prefix.len == 0) {
         return try arena.dupe(u8, filename);
     }
-    return try std.fs.path.join(arena, &.{ prefix, filename });
+    // OPC part names always use '/' regardless of host OS. Concatenate
+    // explicitly rather than via std.fs.path.join, which switches to
+    // '\' on Windows and would silently break relationship lookup
+    // (every callsite — store.rels, drawing walkers — keys on '/').
+    // `prefix` is `name[0..marker_pos]` where marker is "_rels/", so
+    // it already ends with the trailing '/' — no extra separator.
+    std.debug.assert(prefix[prefix.len - 1] == '/');
+    const out = try arena.alloc(u8, prefix.len + filename.len);
+    @memcpy(out[0..prefix.len], prefix);
+    @memcpy(out[prefix.len..], filename);
+    return out;
 }
 
 fn parseRelationships(arena: std.mem.Allocator, xml: []const u8) ![]Relationship {
