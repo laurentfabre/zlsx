@@ -56,6 +56,12 @@ pub const Error = error{
     SplitArchiveNotSupported,
     DataDescriptorNotSupported,
     DuplicateContentType,
+    /// save() rejects archives whose total saved size would exceed
+    /// 4 GiB (ZIP32 offset limit) or whose entry count would exceed
+    /// 65 535 (EOCD u16 record-count field). Surfaced before any
+    /// bytes are written so the atomic-file output is never left in
+    /// a partial state.
+    ZipArchiveTooLarge,
 } || std.fs.File.OpenError || std.mem.Allocator.Error || std.fs.File.ReadError || std.fs.File.SeekError;
 
 pub const PartStore = struct {
@@ -218,6 +224,33 @@ pub const PartStore = struct {
     /// fresh LFH + payload but reuse the source CDFH (with patched
     /// fields). EOCD comment is preserved.
     pub fn save(self: *PartStore, path: []const u8) !void {
+        // Preflight ZIP32 limits BEFORE opening the output file. Every
+        // offset / size field on the wire is u32 (offsets, CD size,
+        // payload sizes) or u16 (name length, comment length, entry
+        // count). Compute the projected total saved size and reject
+        // upfront so we never leave a partial archive in the atomic-
+        // file's tmp slot.
+        if (self.entries.len > std.math.maxInt(u16)) return Error.ZipArchiveTooLarge;
+        if (self.eocd_comment.len > std.math.maxInt(u16)) return Error.ZipArchiveTooLarge;
+        var projected: u64 = @as(u64, eocd_min_size) + @as(u64, self.eocd_comment.len);
+        for (self.entries, 0..) |e, i| {
+            if (e.name.len > std.math.maxInt(u16)) return Error.ZipArchiveTooLarge;
+            const lfh_total: u64 = if (self.overrides[i]) |ov| blk: {
+                if (ov.payload.len > std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
+                break :blk 30 + @as(u64, e.name.len) + @as(u64, ov.payload.len);
+            } else blk: {
+                break :blk @as(u64, e.lfh_total_len) +
+                    @as(u64, e.compressed_size) +
+                    @as(u64, e.data_descriptor_len);
+            };
+            const cdfh_total: u64 = if (self.overrides[i] != null)
+                46 + @as(u64, e.name.len)
+            else
+                @as(u64, e.cdfh_total_len);
+            projected += lfh_total + cdfh_total;
+        }
+        if (projected > std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
+
         var write_buf: [4096]u8 = undefined;
         var atomic_file = try std.fs.cwd().atomicFile(path, .{ .write_buffer = &write_buf });
         defer atomic_file.deinit();
