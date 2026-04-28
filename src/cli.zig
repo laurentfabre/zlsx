@@ -1674,7 +1674,17 @@ fn runMain() !u8 {
             try runSstCommand(out, &book, args.skip, args.take);
             return 0;
         },
-        .append_rows => unreachable, // dispatched before the Book open
+        // Editor-route subcommands all dispatched before the Book open.
+        .append_rows,
+        .set_cell,
+        .insert_row,
+        .delete_row,
+        .insert_column,
+        .delete_column,
+        .add_sheet,
+        .rename_sheet,
+        .delete_sheet,
+        => unreachable,
         .rows, .cells => {},
     }
 
