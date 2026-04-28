@@ -1,0 +1,453 @@
+# zlsx post-0.2.9 roadmap
+
+Synthesises three rounds of Codex deep-research and two rounds of
+Codex critique on the seven weaknesses surfaced in the project
+assessment. Material changes through revisions: A1 reclassified as
+medium-effort (Unicode subsystem), B-tier split into four sub-tiers
+(B0–B3), C2 split into C2a (extract/replace) + C2b (addImage) and
+pulled forward of formula work, chart emit demoted to Tier D,
+walk-away gates tightened (grammar-class instead of corpus-percentage,
+report-only bench CI).
+
+## TL;DR
+
+Three quick wins (A1 Unicode + char-length, A2 Windows tests, A3 bench
+CI report-only) ship inside a quarter. Foundational work is a 4–6+
+month effort organised as a Package store → Workbook overlay → Editor
+rebase → Writer rebase chain. Formula core (tokenizer + rewriter, no
+evaluator) and image extraction ride parallel after the part store
+exists. Pivot creation, chart creation, and a formula evaluator are
+all explicitly out of scope until production proves the prior tier.
+
+## Sequencing graph
+
+```
+                 Tier A (parallel quick wins)
+                 ├── A1 Unicode dedup + char length     [2–4 w]
+                 ├── A2 Windows runtime tests           [1 w]
+                 └── A3 Bench-regression CI (report-only) [1 w MVP]
+
+                 Tier B (foundation, sequential after A)
+                 ├── B0 PartStore + rel resolver + content-types   [4–6 w]   ← unblocks B1, C2-extract
+                 ├── B1 Workbook typed overlay (cells/sheets)      [6–10 w]  ← depends on B0
+                 ├── B2 Editor rebase onto Workbook                [4–6 w]   ← depends on B1
+                 └── B3 Writer rebase onto Workbook                [4–6 w]   ← depends on B2
+
+                 Tier B-side (parallel to B)
+                 └── B-fuzz Coverage-guided fuzzing (Linux nightly) [3–4 w]
+
+                 Tier C (foundation+, depends on B0)
+                 ├── C2a Object extract / list / replace opaque bytes [3–5 w]
+                 │   (depends on B0 only; does NOT need formula core)
+                 ├── C2b addImage (image creation)                   [2–3 w]
+                 │   (depends on C2a + B1)
+                 └── C1 Formula Core: tokenizer + rewriter           [10–14 w]
+                     (depends on B1)
+
+                 C2a ships before C1 because it only needs B0; C1
+                 requires the typed Worksheet model from B1.
+
+                 Tier D (long-tail, optional)
+                 ├── D1 Formula evaluator (minimal)
+                 ├── D2 Typed chart emit (line/bar/scatter)
+                 └── (pivot creation explicitly out)
+```
+
+Total foundational path B0 → B1 → B2 → B3: **4–6+ months**, dominated
+by single-file complexity of `xlsx.zig` and `writer.zig`.
+
+## Tier A — Quick wins
+
+### A1. Unicode sheet-name dedup + char-length validation (2–4 weeks)
+
+**Problem (expanded):**
+- `asciiEqlFold` in `src/writer.zig` only handles 7-bit ASCII; `café` /
+  `CAFÉ` and `ß` / `SS` come out as distinct.
+- The 31-char limit at `src/writer.zig:2006` measures **bytes** not
+  characters, so legal multi-byte Excel names get rejected.
+
+**Approach:** non-Turkic full Unicode case fold + NFC canonicalisation;
+fix char-length to count Unicode scalar values; ASCII fast path stays.
+
+**API delta:**
+```zig
+pub fn excelSheetNameKey(allocator, name) ![]u8     // canonical NFC(casefold) bytes
+pub fn excelSheetNameEql(a, b) !bool                 // semantic equal
+```
+Replace `asciiEqlFold` callers and the byte-length check.
+
+**Implementation:**
+- Vendor generated tables from `CaseFolding.txt` + minimal NFC tables
+  (zero third-party-runtime contract preserved; no `utf8proc` linkage).
+- Cap generated table size; one-page review policy on the generation
+  script before each Unicode version bump.
+- Empirical Excel matrix as the source of truth, encoded as test
+  fixtures: `café/CAFÉ`, composed/decomposed `é`, `ß/SS`, Greek sigma,
+  Turkish dotted I, Kelvin sign, fullwidth ASCII.
+
+**Walk-away gate (tightened):** an empirical Excel duplicate matrix is
+recorded; tests encode expected behaviour; equivalences NOT supported by
+the v1 fold (e.g. Turkish locale variants, NFKC compatibility) are
+**explicitly rejected** with a documented error rather than silently
+passing through. No "ship NFC and document" hand-wave.
+
+**Risks:** generated tables can bloat compile time; Excel's actual
+semantics may not equal Unicode default casefold + NFC; char length
+fix affects existing test fixtures.
+
+### A2. Windows runtime tests (1 week)
+
+**Problem:** release pipeline cross-compiles a Windows binary but never
+runs the test suite, C ABI tests, or Python wheel smoke on Windows.
+
+**Approach:** add a `windows-latest` job to `.github/workflows/ci.yml`
+matrix running `zig fmt --check`, `zig build test`,
+`scripts/fetch_test_corpus.sh` via Git Bash, `zig build test-corpus`,
+2–3 CLI fixture smoke tests. Plus a `windows-smoke` job in
+`release.yml` that exercises the released zip.
+
+**Tightened gate (per critique):**
+- Windows job MUST run the C ABI test target.
+- Windows job MUST exercise at least one Python wheel
+  import/load-fixture smoke test.
+- Both pass on `windows-latest` for two consecutive PRs and add
+  ≤ 10 min runtime.
+
+**Likely friction (concrete):**
+- Hard-coded `/tmp` paths in writer tests around `src/writer.zig:3288`
+  and elsewhere — Windows lacks `/tmp`.
+- Git Bash may hide problems native PowerShell users hit; add a
+  PowerShell-only smoke step too.
+- `src/cli.zig` already branches on Windows for signal handling;
+  exercise that branch.
+
+**Walk-away:** no-go only if the path/temp-dir refactor balloons past
+two PRs of churn.
+
+### A3. Benchmark-regression CI — report-only (1 week MVP)
+
+**Problem:** no CI catches performance regressions across commits.
+
+**Approach:** custom hyperfine-based pipeline. MVP is report-only —
+emits warning + Markdown summary as a PR comment but does not block
+merges. A blocking gate may be introduced only after the variance
+and baseline gates below pass.
+
+**Pipeline:**
+1. `scripts/bench_ci.sh` builds ReleaseFast, runs `hyperfine -N --warmup 5 --runs 20 --export-json` on a small fixed fixture set (worldbank_catalog, ons_cpi_detailed). Cache corpus fetch to remove that variance.
+2. PRs check out base SHA, build + run same fixtures into `bench-base.json`. Pin runner class to one image to control variance.
+3. `scripts/compare_bench.py` emits a Markdown table + warning comment when current is slower by > 10% AND > 3σ on two consecutive runs. Never sets the job to red.
+4. Upload artefacts; on `main`, retain for trend history.
+
+**Walk-away gate (tightened):**
+- Stay report-only until ≥ 20 main-branch samples show per-fixture
+  variance < 7%.
+- Blocking gate requires historical baseline, runner class pinning,
+  AND a manual override knob (e.g. PR label or commit-trailer to
+  acknowledge intentional regression).
+
+**Risks (added):** GitHub Actions runner variance; PR base-checkout
+doubles runtime; corpus fetch can dominate variance unless cached.
+
+## Tier B — Foundation
+
+### B0. Package store + rel resolver + content-types model (4–6 weeks)
+
+**Why split:** the v1 plan folded this into B1 ("Workbook"), but the
+PartStore is an independently shippable layer that:
+- preserves macros / drawings / charts / images / custom parts byte-for-byte;
+- gives C2 image extraction an immediate data structure to work on;
+- makes B1 + B2 + B3 a typed overlay rather than parallel parsers.
+
+**API delta:**
+```zig
+pub const PartStore = struct {
+    pub fn open(allocator, path) !PartStore;            // mmap or file-backed
+    pub fn save(self, path) !void;                       // byte-preserve untouched
+    pub fn part(self, name) ?Part;                       // resolved relative path
+    pub fn rel(self, owner: []const u8) ![]Relationship; // owner = part name
+    pub fn replacePart(self, name, bytes) !void;         // typed overlay path
+    pub fn addPart(self, name, content_type, bytes) !void;
+};
+```
+Public so C2 image extraction can hang directly off it.
+
+**Milestones:**
+1. Read-side: enumerate parts, parse `[Content_Types].xml`, parse
+   every `_rels/*.rels`, expose resolver.
+2. Write-side: emit unchanged parts byte-for-byte (same compressed
+   payload, name, length); emit dirty parts via fresh deflate.
+3. Typed-overlay handle for known parts (workbook.xml, sheet, sst,
+   styles, theme).
+
+**Walk-away gate (revised per critique):**
+- Untouched ZIP entries' compressed payload bytes AND names AND order
+  preserved.
+- Relationship graph equivalent to source.
+- Excel opens the round-trip output without prompting "repair?".
+
+(NOT byte-identical whole-file round-trip — central directory metadata
+re-emission would otherwise eat weeks for no functional gain.)
+
+### B1. Workbook typed overlay (6–10 weeks, depends on B0)
+
+**API delta:**
+```zig
+pub const Workbook = struct {
+    pub fn open(allocator, path) !Workbook;          // = PartStore.open + lazy overlay
+    pub fn openLazy(allocator, path) !Workbook;
+    pub fn create(allocator) Workbook;
+    pub fn save(self, path) !void;
+    pub fn sheet(self, idx) !*Worksheet;
+    // …
+};
+pub const Worksheet = struct {
+    pub fn rows(self) !Rows;
+    pub fn cell(self, ref) ?CellValue;
+    pub fn setCell(self, ref, CellValue) !void;
+    // …
+};
+
+// Compat facades for one minor line:
+Book.toWorkbook(options)        // existing reader → Workbook
+Editor.openWorkbook(path)       // = Workbook.open
+```
+
+**Milestones:**
+1. Lazy `WorksheetModel` — sparse cells, styles, merges, hyperlinks,
+   validations, comments, conditional formats. Backed by existing
+   `ensureSheetLoaded` + row parser.
+2. Workbook-level state: SST view, styles view, defined names view.
+3. Compat layer: `Book.toWorkbook` adapts existing reader output.
+
+**Walk-away gate:** a 100k-row × 10-sheet workbook needs ≤ 2× current
+`Book.openLazy` RSS before any sheet is touched.
+
+**Risks (added per critique):** the existing `Book` is a large
+all-in-one reader state with many maps (`src/xlsx.zig:529`). Mutating
+it into a shared model risks destabilising the reader. Mitigate by
+adapter-only path first; rebase reader internals last.
+
+### B2. Editor rebase onto Workbook (4–6 weeks, depends on B1)
+
+**Per critique:** **editor rebase precedes writer rebase**. The editor
+already needs preservation + structural safety; the writer can stay a
+fast fresh-file emitter longer.
+
+The current editor lives at `src/xlsx.zig:4240` with many conservative
+pending-operation interactions. Rebase onto Workbook mutations,
+retaining ZIP substitution for untouched parts.
+
+**Walk-away gate:** Editor round-trip parity (current corpus tests
+green on the new path); ≤ 1.5× current ~5 ms ZIP-substitution
+latency on small workbooks.
+
+### B3. Writer rebase onto Workbook (4–6 weeks, depends on B2)
+
+`Writer.save` emits from a `Workbook` populated by the fluent builder.
+Unifies SST / styles between fresh-file and load-modify-save paths.
+Last because it's the mature path; touching it without B0–B2
+production bake-time risks regressions in the fastest production code.
+
+### B-fuzz. Coverage-guided fuzzing — Linux nightly (3–4 weeks, parallel to B)
+
+**Problem:** current fuzz harnesses are PRNG-driven; CI runs
+fuzz-smoke only.
+
+**Approach:** Zig 0.15.2 built-in fuzzing on Linux x64 first.
+
+**Status of Zig fuzz:**
+- `zig test --help` exposes `-ffuzz`; `std.testing.fuzz(context, testOne, .{ .corpus = ... })` exists.
+- Zig source: not implemented on Windows (shared-memory + COFF/PE debug).
+- macOS Mach-O `addEntryPoint` crash documented in this repo.
+- Instrumentation = inline counters + trace-cmp; not AFL `trace_pc_guard`.
+
+**Milestones:**
+1. Convert 3–5 reader targets to `input → target` form:
+   `parseSharedStrings`, `parseWorkbookSheets`, `Rows.next`, `Book.open`.
+2. Seed corpora at `tests/fuzz/corpus/{shared_strings,workbook_sheets,rows,book_open}`.
+3. Nightly `ubuntu-22.04` workflow: 15–30 min per target; uploads
+   crash artefacts; deterministic replay first.
+4. **macOS fuzz job allow-failure** (per critique): runs the same
+   targets but expects to fail with a clear "blocked on Zig upstream
+   issue/link" message. Surfaces upstream-status.
+
+**Risks (added):** Zig fuzz API may shift under us; ZIP-parsing fuzz
+hits archive code more than worksheet semantics — write targets that
+bypass archive parsing where worksheet correctness is the goal.
+
+**Walk-away (go/no-go):** go if `zig build test --fuzz` runs 30 min on
+ubuntu-22.04 and finds + replays at least one entry. No-go for
+macOS/Windows fuzz until Zig upstream verified.
+
+## Tier C — Foundation+
+
+### C1. Formula Core: tokenizer + rewriter (10–14 weeks, depends on B1)
+
+**Problem:** `anySheetCrossSheetCarrier` at `src/xlsx.zig:5865` and
+related guards refuse formulas, hyperlinks, validations, conditional
+formats, defined names, drawings, panes, tables, autofilters. Per
+critique: tokenising formulas alone does NOT liberate structural edits
+— each guard category has its own ref-rewrite story.
+
+**Approach (tightened):** tokenizer + rewriter handles formulas FIRST,
+then in successive iters expands to data-validation formulas,
+conditional-format formulas, defined names, internal hyperlink
+locations. Each iter shrinks the refusal set. Evaluator stays deferred
+to Tier D.
+
+**API delta:**
+```zig
+Formula.parse(allocator, text) !FormulaAst
+Formula.rewriteRefs(ast_or_text, RewriteContext) ![]u8
+Workbook.rewriteReferences(edit: StructuralEdit) !void
+Writer.setRecalcOnOpen(bool)
+```
+
+**Milestones:**
+1. **Tokenizer + loss-preserving printer** — A1 refs, sheet-qualified
+   refs, ranges, named ranges, string literals, functions, operators,
+   array constants. Public parse/format utility.
+2. **A1 cell-formula rewriter** — row/col/sheet rename/delete on
+   `<f>` bodies. Liberates the formula-only branch of structural-edit
+   refusal.
+3. **DV / CF formula rewriter** — same axis, new owners. Liberates
+   `<dataValidation>` and `<conditionalFormatting>` formulas.
+4. **Defined-names rewriter** — workbook-scope refs.
+5. **Internal hyperlink `location`** — same axis.
+6. **Shared / array formula support** — base + dependent ranges.
+
+**Walk-away gate (replaced "95% corpus coverage"):** grammar-class
+gates. The rewriter must handle, with golden round-trip tests:
+- A1 refs, absolute / mixed / relative
+- Quoted-sheet refs (`'My Sheet'!A1`)
+- Range refs
+- Defined names (workbook + sheet scope)
+- Shared formula bases + dependents
+- Array formula bases + spread ranges
+- DV / CF / hyperlink-location refs
+
+If any class fails, that class's owners stay on the refusal list; do
+NOT silently downgrade.
+
+**Risks:** Excel grammar is large (structured refs, 3D refs, external
+workbooks, dynamic arrays, locale separators). Rewriter bugs silently
+corrupt files — golden round-trips catch this only for known classes.
+
+### C2a. Object extract / list / replace opaque bytes (3–5 weeks, depends on B0 only)
+
+**Per critique:** image extraction + opaque-replace lives off the
+relationship graph (B0), NOT formulas. C2a ships ahead of C1 because
+it has no formula-rewriter dependency.
+
+**Scope:** v1 is **read-side + opaque-replace only**. Discover, list,
+and surface drawings/charts/pivots/images as typed objects with raw
+payloads attached; let callers replace those payloads byte-for-byte.
+No image *creation*, no chart creation. (See C2b for image creation.)
+
+**API delta:**
+```zig
+Workbook.drawings(sheet) []DrawingObject
+DrawingObject = union(enum) {
+    image: { path, content_type, anchor, bytes },
+    chart: { chart_path, chart_type, series: []SeriesRef, anchor, raw_xml },
+    pivot: { table_path, cache_id, source_ref, raw_xml },
+}
+Workbook.replaceOpaquePart(path, bytes) !void
+```
+
+**OOXML structures handled:**
+- Sheet `<drawing r:id>`, `xl/worksheets/_rels/sheetN.xml.rels`
+- `xl/drawings/drawingN.xml` + `_rels`
+- `xl/charts/chartN.xml` (series via `c:barChart` / `c:lineChart` /
+  `c:scatterChart` / `c:ser` / `c:f`)
+- `xl/media/imageN.{png,jpeg,gif}`
+- `xl/pivotTables/*` + `xl/pivotCache/*` (detect + preserve only)
+- workbook `<pivotCaches>`, `[Content_Types].xml`
+
+**Milestones:**
+1. Drawing parser → anchors + opaque chart/pivot/image objects.
+2. Lazy raw-bytes extraction API.
+3. Opaque-replace API (`replaceOpaquePart`) — same compressed-payload
+   contract as B0's untouched-part round-trip.
+
+**Walk-away gate:** stop before image creation, chart creation, chart
+**rendering**, chart-style editing, slicers, SmartArt, OLE, VBA,
+pivot-cache recalc, or any "edit row/col on a drawing-bearing sheet"
+work. Per critique: chart **emit** is D2; image **emit** is C2b.
+
+**Risks:** anchors are non-trivial; row/col edits on drawing-bearing
+sheets stay refused (the existing guard stands until C2b lifts it).
+
+### C2b. Image creation — `addImage` (2–3 weeks, depends on C2a + B1)
+
+**Scope:** add a brand-new image to an existing workbook with a typed
+anchor. Depends on B1 because the anchor sits inside the typed
+Worksheet model; depends on C2a because it reuses the drawing-part
+emission shape.
+
+**API delta:**
+```zig
+Workbook.addImage(sheet, anchor, bytes, mime) !void
+```
+
+**Milestones:**
+1. Drawing/media/relationship/content-types stack emission for a
+   single new image.
+2. Anchor math: cell-anchor (one A1 ref) + range-anchor (A1:B5).
+3. Refusal lifted for row/col edits on sheets where ALL drawings are
+   `addImage`-emitted (we own the anchors).
+
+**Walk-away gate:** if anchor math turns out to require pixel/EMU
+coordinate computations beyond cell-anchor + range-anchor, defer to
+D-tier and keep `addImage` cell-anchor-only.
+
+## Tier D — Long-tail, optional
+
+### D1. Formula evaluator — minimal (deferred indefinitely)
+
+After C1 has at least one quarter of production bake. Covers literals,
+arithmetic / comparison, cell+range refs, `SUM`, `MIN`, `MAX`,
+`AVERAGE`, `IF`, boolean ops, errors. Writes updated cached `<v>` for
+supported formulas; otherwise marks recalc-on-open.
+
+**Per critique:** an evaluator will consume the project if allowed.
+Stay optional indefinitely; only build if a concrete user demand
+appears.
+
+### D2. Typed chart emit (deferred)
+
+After C2 ships and image creation is exercised in production. Typed
+`addChart` for line/bar/scatter; styles minimal. Chart **style editing**,
+slicers, pivot creation are explicitly out of scope forever.
+
+## Cross-cutting principles (unchanged from v1)
+
+1. **Zero third-party runtime deps stays inviolable** — Unicode tables
+   vendored; no `utf8proc` linkage.
+2. **Conservative refusal posture preserved** — Editor never silently
+   corrupts a workbook.
+3. **One minor line of compat facades** — Book / Writer / Editor stay
+   functional after Workbook ships, with deprecation notes.
+4. **Walk-away criteria are real** — each tier's gate is measurable;
+   per critique gates are tighter than v1.
+5. **Tests precede CI gates** — bench-regression CI stays report-only
+   until variance proves controlled; fuzz CI stays nightly.
+
+## Estimation summary (revised per critique)
+
+| Tier | v1 estimate | v2 estimate (per Codex critique) |
+|---|---|---|
+| A1 Unicode dedup | 1–2 w | 2–4 w |
+| A2 Windows tests | 1 w | 1 w |
+| A3 Bench CI MVP | 2–3 w | 1 w (report-only) |
+| B0 PartStore | (folded) | 4–6 w |
+| B1 Workbook overlay | 2–3 mo (whole tier) | 6–10 w |
+| B2 Editor rebase | (folded) | 4–6 w |
+| B3 Writer rebase | (folded) | 4–6 w |
+| B-fuzz nightly | 3–4 w | 3–4 w |
+| C1 Formula rewriter | 2–3 mo | 10–14 w |
+| C2a Object extract / opaque-replace | 1–2 mo | 3–5 w |
+| C2b addImage | (folded) | 2–3 w |
+
+Tier B end-to-end: **4–6+ months** of focused work.
