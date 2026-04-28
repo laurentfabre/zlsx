@@ -6524,6 +6524,21 @@ fn insertMissingRow(
     // Reserve span capacity up front so the final insert can't OOM
     // after we've already shifted bytes + offsets.
     try ms.spans.ensureUnusedCapacity(allocator, 1);
+
+    // Build the new row block + run the cell-opening invariant check
+    // BEFORE any ms.xml mutation. The walk below may expand a
+    // self-closing `<sheetData/>` to `<sheetData></sheetData>`; if
+    // emitCellXml ever produced bytes without '>', surfacing the
+    // typed error here keeps ms.xml unchanged on the failure path.
+    var new_buf: std.ArrayListUnmanaged(u8) = .{};
+    defer new_buf.deinit(allocator);
+    try new_buf.writer(allocator).print("<row r=\"{d}\">", .{row});
+    const cell_start_in_buf = new_buf.items.len;
+    try emitCellXml(allocator, &new_buf, row, col, cell);
+    try new_buf.appendSlice(allocator, "</row>");
+    const cell_bytes = new_buf.items[cell_start_in_buf .. new_buf.items.len - "</row>".len];
+    const opening_gt_off = std.mem.indexOfScalar(u8, cell_bytes, '>') orelse return error.InternalInvariantBroken;
+
     // Find insertion offset:
     //   - just before the next-higher row's `<row` opening, OR
     //   - just before `</sheetData>` if no higher row exists.
@@ -6597,21 +6612,6 @@ fn insertMissingRow(
             return error.MalformedXml;
         }
     }
-
-    // Build the new row block.
-    var new_buf: std.ArrayListUnmanaged(u8) = .{};
-    defer new_buf.deinit(allocator);
-    try new_buf.writer(allocator).print("<row r=\"{d}\">", .{row});
-    const cell_start_in_buf = new_buf.items.len;
-    try emitCellXml(allocator, &new_buf, row, col, cell);
-    try new_buf.appendSlice(allocator, "</row>");
-
-    // Compute the cell's body-start offset BEFORE mutating ms.xml.
-    // Otherwise an InternalInvariantBroken (which today can't fire —
-    // emitCellXml always writes a '>'-bearing opening) would leave
-    // ms.xml spliced but spans un-updated.
-    const cell_bytes = new_buf.items[cell_start_in_buf .. new_buf.items.len - "</row>".len];
-    const opening_gt_off = std.mem.indexOfScalar(u8, cell_bytes, '>') orelse return error.InternalInvariantBroken;
 
     try ms.xml.insertSlice(allocator, insert_at, new_buf.items);
     const new_len = new_buf.items.len;
