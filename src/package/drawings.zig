@@ -94,6 +94,11 @@ pub const ChartAnchor = struct {
     /// etc.). `.other` covers unrecognised or compound charts; the
     /// raw_xml is always available for callers needing more detail.
     chart_type: ChartType,
+    /// All `<c:f>` formula refs surfaced from the chart (series
+    /// names, categories, values, labels — flattened in document
+    /// order). Strings borrow from raw_xml; do not free.
+    /// Empty when the chart uses inline literal data only.
+    series_refs: []const []const u8,
     /// Raw chart-part XML bytes. Borrowed from the PartStore.
     raw_xml: []const u8,
 };
@@ -248,15 +253,36 @@ fn collectChartsFromSheet(
         else
             null;
 
+        const refs = try extractSeriesRefs(allocator, chart_part.bytes);
         try out.append(allocator, .{
             .chart_part_name = chart_part.name,
             .sheet_part_name = sheet_part.name,
             .from = from,
             .to = to_anchor,
             .chart_type = detectChartType(chart_part.bytes),
+            .series_refs = refs,
             .raw_xml = chart_part.bytes,
         });
     }
+}
+
+/// Walk every `<c:f>...</c:f>` in the chart XML in document order and
+/// return the formula strings as borrowed slices into `xml`. Series
+/// names, categories, and values all flow through `<c:f>`, so the
+/// flattened list captures every workbook reference the chart pulls
+/// from.
+fn extractSeriesRefs(allocator: std.mem.Allocator, xml: []const u8) ![]const []const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, i, "<c:f>")) |open| {
+        const start = open + "<c:f>".len;
+        const close = std.mem.indexOfPos(u8, xml, start, "</c:f>") orelse break;
+        try out.append(allocator, xml[start..close]);
+        i = close + "</c:f>".len;
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// Best-effort chart-type detection from the chart-part XML. Looks
@@ -433,10 +459,16 @@ test "chartAnchors: openxlsx_loadExample.xlsx surfaces embedded charts" {
     defer s.deinit();
 
     const charts = try chartAnchors(&s, std.testing.allocator);
-    defer std.testing.allocator.free(charts);
+    defer {
+        // Each ChartAnchor owns its series_refs slice (allocator-
+        // allocated; inner strings borrow from raw_xml). Walk + free.
+        for (charts) |c| std.testing.allocator.free(c.series_refs);
+        std.testing.allocator.free(charts);
+    }
 
     // openxlsx_loadExample has at least one embedded chart.
     try std.testing.expect(charts.len > 0);
+    var any_with_refs = false;
     for (charts) |c| {
         try std.testing.expect(std.mem.startsWith(u8, c.chart_part_name, "xl/charts/chart"));
         try std.testing.expect(std.mem.startsWith(u8, c.sheet_part_name, "xl/worksheets/sheet"));
@@ -448,7 +480,18 @@ test "chartAnchors: openxlsx_loadExample.xlsx surfaces embedded charts" {
         switch (c.chart_type) {
             .bar, .line, .pie, .scatter, .area, .bubble, .radar, .other => {},
         }
+        if (c.series_refs.len > 0) any_with_refs = true;
+        // Every series ref borrowed from raw_xml; sanity check that
+        // each ref is a non-empty substring containing a sheet
+        // separator `!` (canonical SpreadsheetML reference shape).
+        for (c.series_refs) |r| {
+            try std.testing.expect(r.len > 0);
+            try std.testing.expect(std.mem.indexOf(u8, r, "!") != null);
+        }
     }
+    // At least one chart in the fixture must have series refs;
+    // chart3.xml in openxlsx_loadExample has them per-confirmed.
+    try std.testing.expect(any_with_refs);
 }
 
 test "chartAnchors: workbook with no charts returns empty slice" {
@@ -459,7 +502,10 @@ test "chartAnchors: workbook with no charts returns empty slice" {
     defer s.deinit();
 
     const charts = try chartAnchors(&s, std.testing.allocator);
-    defer std.testing.allocator.free(charts);
+    defer {
+        for (charts) |c| std.testing.allocator.free(c.series_refs);
+        std.testing.allocator.free(charts);
+    }
 
     try std.testing.expectEqual(@as(usize, 0), charts.len);
 }
