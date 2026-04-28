@@ -326,12 +326,14 @@ pub const PartStore = struct {
         return null;
     }
 
-    pub fn partNames(self: *const PartStore) []const []const u8 {
+    pub fn partNames(self: *const PartStore) ![]const []const u8 {
         // Build a names-only view on demand. Cheap because parts.len
         // is small; alternative is to cache a separate slice up-front.
-        // For M1 keep the data structures minimal.
+        // For M1 keep the data structures minimal. Returns an error
+        // on arena alloc failure so callers can surface OOM rather
+        // than silently see an empty list.
         const ar_alloc = @constCast(&self.arena).allocator();
-        const out = ar_alloc.alloc([]const u8, self.parts.len) catch return &.{};
+        const out = try ar_alloc.alloc([]const u8, self.parts.len);
         for (self.parts, 0..) |p, i| out[i] = p.name;
         return out;
     }
@@ -352,16 +354,16 @@ pub const PartStore = struct {
     /// Returned as `[]const Part` because the slice is a read-only
     /// filtered view; callers should treat the contents as immutable
     /// borrows from the store.
-    pub fn imageParts(self: *const PartStore) []const Part {
+    pub fn imageParts(self: *const PartStore) ![]const Part {
         const ar_alloc = @constCast(&self.arena).allocator();
         var out: std.ArrayListUnmanaged(Part) = .empty;
         for (self.parts) |p| {
             const ct = p.content_type orelse continue;
             if (std.mem.startsWith(u8, ct, "image/")) {
-                out.append(ar_alloc, p) catch return &.{};
+                try out.append(ar_alloc, p);
             }
         }
-        return out.toOwnedSlice(ar_alloc) catch &.{};
+        return try out.toOwnedSlice(ar_alloc);
     }
 
     pub fn rels(self: *const PartStore, owner_part_name: []const u8) []const Relationship {
@@ -557,12 +559,17 @@ fn scanCentralDirectory(arena: std.mem.Allocator, buf: []const u8) ![]ZipEntry {
     const cd_offset = std.mem.readInt(u32, buf[eocd_off + 16 ..][0..4], .little);
 
     if (cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF) return Error.Zip64NotSupported;
-    if (cd_offset + cd_size > buf.len) return Error.BadZip;
+    // Saturating add (`+|`) keeps the check correct on 32-bit targets
+    // where usize is u32 and `cd_offset + cd_size` could wrap. Same
+    // pattern is reused below for every attacker-controlled offset.
+    if (cd_offset +| cd_size > buf.len) return Error.BadZip;
 
     var out: std.ArrayListUnmanaged(ZipEntry) = .empty;
     try out.ensureTotalCapacity(arena, total_records);
 
     var cur: usize = cd_offset;
+    // Safe: `cd_offset +| cd_size > buf.len` was just rejected, so
+    // the non-saturating add fits both `usize` and `buf.len`.
     const cd_end = cd_offset + cd_size;
     var idx: usize = 0;
     while (cur + 46 <= cd_end and idx < total_records) : (idx += 1) {
@@ -593,19 +600,22 @@ fn scanCentralDirectory(arena: std.mem.Allocator, buf: []const u8) ![]ZipEntry {
         }
 
         const name_start = cur + 46;
-        if (name_start + filename_len > cd_end) return Error.BadZip;
+        if (name_start +| filename_len > cd_end) return Error.BadZip;
         const name = buf[name_start .. name_start + filename_len];
 
         // Compute payload offset by reading the LFH (its filename +
         // extra fields can differ from the CDFH copy).
-        if (lfh_offset + 30 > buf.len) return Error.BadZip;
+        if (lfh_offset +| 30 > buf.len) return Error.BadZip;
         const lfh_sig = std.mem.readInt(u32, buf[lfh_offset..][0..4], .little);
         if (lfh_sig != lfh_signature) return Error.BadZip;
         const lfh_name_len = std.mem.readInt(u16, buf[lfh_offset + 26 ..][0..2], .little);
         const lfh_extra_len = std.mem.readInt(u16, buf[lfh_offset + 28 ..][0..2], .little);
+        // 30 + 2×u16 ≤ 30 + 131070 — fits both u32 and usize without
+        // overflow concerns. lfh_total_len is bounded by definition.
         const lfh_total_len = 30 + @as(usize, lfh_name_len) + @as(usize, lfh_extra_len);
-        const payload_offset = lfh_offset + lfh_total_len;
-        if (payload_offset + compressed_size > buf.len) return Error.BadZip;
+        const payload_offset = lfh_offset +| lfh_total_len;
+        if (payload_offset > buf.len) return Error.BadZip;
+        if (payload_offset +| compressed_size > buf.len) return Error.BadZip;
 
         const cdfh_total = 46 + @as(usize, filename_len) + @as(usize, extra_len) + @as(usize, comment_len);
 
@@ -624,7 +634,12 @@ fn scanCentralDirectory(arena: std.mem.Allocator, buf: []const u8) ![]ZipEntry {
             .has_data_descriptor = (flags & 0x0008) != 0,
         });
 
-        cur = name_start + filename_len + extra_len + comment_len;
+        // Advance past this CDFH. The components are u16/usize sums
+        // bounded by the per-entry limits already checked above; use
+        // saturating so a pathological tail length doesn't wrap on
+        // 32-bit. The next-iteration loop guard re-validates against
+        // cd_end.
+        cur = name_start +| filename_len +| extra_len +| comment_len;
     }
 
     if (idx != total_records) return Error.BadZip;
@@ -669,6 +684,11 @@ fn findEocd(buf: []const u8) !usize {
     // Scan back from the end of buf looking for the EOCD signature.
     // ZIP allows up to 65535 bytes of comment after EOCD, so the
     // scan window is bounded; longer would mean a malformed archive.
+    // Local invariant: the signature is 4 bytes, so we need at least
+    // 4 bytes to read it. Callers in this file enforce ≥ eocd_min_size
+    // (22) transitively, but `findEocd` is also exported via the
+    // save() round-trip path, so guard locally.
+    if (buf.len < 4) return Error.NotPkzip;
     const max_back = @min(eocd_scan_window, buf.len);
     var i: usize = buf.len - 4;
     const lo = if (buf.len >= max_back) buf.len - max_back else 0;
@@ -933,7 +953,7 @@ test "PartStore.open: enumerates parts of frictionless_2sheets.xlsx" {
     var store = try PartStore.open(std.testing.allocator, fixture);
     defer store.deinit();
 
-    const names = store.partNames();
+    const names = try store.partNames();
     try std.testing.expect(names.len > 0);
 
     // Required OOXML parts must always be present.
@@ -1043,7 +1063,7 @@ test "PartStore.imageParts: extract embedded images (C2a MVP)" {
     var store = try PartStore.open(std.testing.allocator, fixture);
     defer store.deinit();
 
-    const images = store.imageParts();
+    const images = try store.imageParts();
     // poi_58325_db.xlsx ships 4 image parts under xl/media/. Confirm
     // imageParts surfaces them as bytes-bearing Parts (no XML parse,
     // no per-sheet anchor attribution — that's the future drawings()

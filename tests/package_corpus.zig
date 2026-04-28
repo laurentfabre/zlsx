@@ -92,8 +92,8 @@ test "PartStore corpus sweep — open + walk every fixture without crash" {
                 };
                 defer store.deinit();
                 // Walks must not crash; results may be empty.
-                _ = store.partNames();
-                _ = store.imageParts();
+                _ = try store.partNames();
+                _ = try store.imageParts();
                 const images = try pkg.imageAnchors(&store, alloc);
                 defer alloc.free(images);
                 const charts = try pkg.chartAnchors(&store, alloc);
@@ -130,8 +130,8 @@ test "PartStore corpus sweep — open + walk every fixture without crash" {
                     return err;
                 };
                 defer store.deinit();
-                _ = store.partNames();
-                _ = store.imageParts();
+                _ = try store.partNames();
+                _ = try store.imageParts();
                 // Drawing walks are payload-driven; skip on lazy-corruption
                 // fixtures since decompression is allowed to fail.
             },

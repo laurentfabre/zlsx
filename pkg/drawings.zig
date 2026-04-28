@@ -132,7 +132,14 @@ pub fn imageAnchors(store: *PartStore, allocator: std.mem.Allocator) ![]ImageAnc
 /// for now.
 pub fn chartAnchors(store: *PartStore, allocator: std.mem.Allocator) ![]ChartAnchor {
     var out: std.ArrayListUnmanaged(ChartAnchor) = .empty;
-    errdefer out.deinit(allocator);
+    // Each appended ChartAnchor owns an allocator-allocated
+    // series_refs slice; on partial failure (e.g. OOM during a
+    // later sheet) `out.deinit` alone leaks every prior chart's
+    // refs. Walk and free each before the outer array.
+    errdefer {
+        for (out.items) |c| allocator.free(c.series_refs);
+        out.deinit(allocator);
+    }
     for (store.parts) |sheet_part| {
         if (!isSheetPart(sheet_part.name)) continue;
         try collectChartsFromSheet(store, allocator, sheet_part, &out);
@@ -141,8 +148,15 @@ pub fn chartAnchors(store: *PartStore, allocator: std.mem.Allocator) ![]ChartAnc
 }
 
 fn isSheetPart(name: []const u8) bool {
-    return std.mem.startsWith(u8, name, "xl/worksheets/sheet") and
-        std.mem.endsWith(u8, name, ".xml");
+    // Match `xl/worksheets/sheet<digit>...xml`. The trailing-digit
+    // requirement filters out `xl/worksheets/sheetMetadata.xml`
+    // (Excel 2013+ value-metadata) and any future `sheet<word>.xml`
+    // sibling that lives in the same directory but isn't a sheet.
+    const prefix = "xl/worksheets/sheet";
+    if (!std.mem.startsWith(u8, name, prefix)) return false;
+    if (!std.mem.endsWith(u8, name, ".xml")) return false;
+    if (name.len <= prefix.len) return false;
+    return std.ascii.isDigit(name[prefix.len]);
 }
 
 fn collectFromSheet(
@@ -254,6 +268,10 @@ fn collectChartsFromSheet(
             null;
 
         const refs = try extractSeriesRefs(allocator, chart_part.bytes);
+        // If `out.append` OOMs after we just allocated `refs`, the
+        // caller's outer errdefer frees the rest but `refs` itself
+        // hasn't been transferred yet — free it on the failing path.
+        errdefer allocator.free(refs);
         try out.append(allocator, .{
             .chart_part_name = chart_part.name,
             .sheet_part_name = sheet_part.name,

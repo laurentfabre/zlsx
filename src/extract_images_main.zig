@@ -82,7 +82,11 @@ pub fn main() !u8 {
     defer out.flush() catch {};
 
     var written: usize = 0;
-    for (store.imageParts()) |p| {
+    const images = store.imageParts() catch |e| {
+        try err.print("imageParts: {s}\n", .{@errorName(e)});
+        return 5;
+    };
+    for (images) |p| {
         const basename = std.fs.path.basename(p.name);
         dir.writeFile(.{ .sub_path = basename, .data = p.bytes }) catch |e| {
             try err.print("write '{s}': {s}\n", .{ basename, @errorName(e) });

@@ -70,7 +70,7 @@ pub fn main() !u8 {
     var dir = try std.fs.cwd().makeOpenPath("out", .{});
     defer dir.close();
 
-    for (store.imageParts()) |p| {
+    for (try store.imageParts()) |p| {
         const basename = std.fs.path.basename(p.name);
         try dir.writeFile(.{ .sub_path = basename, .data = p.bytes });
     }
