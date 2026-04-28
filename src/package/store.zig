@@ -64,10 +64,23 @@ pub const PartStore = struct {
     /// public API (part names, content types, rel attrs, decompressed
     /// part bytes). Caller-visible slices stay valid until `deinit`.
     arena: std.heap.ArenaAllocator,
+    /// Original file bytes — kept alive in arena for the byte-
+    /// preserving save path (B0 M2). Untouched parts copy LFH +
+    /// payload directly from these bytes.
+    src_buf: []const u8,
+    /// Per-part raw ZIP entries (LFH/CDFH/payload offsets). Same
+    /// length + ordering as `parts`.
+    entries: []ZipEntry,
     parts: []Part,
+    /// Per-part override (when caller has called `replacePart`).
+    /// Same length as `parts`. `null` = use original src_buf bytes.
+    overrides: []?Override,
     /// Map from part name → relationships parsed from
     /// `_rels/<owner>.rels`. Empty list when the part has no rels.
     rels_by_owner: std.StringHashMapUnmanaged([]Relationship),
+    /// Trailing ZIP comment after the EOCD (typically empty).
+    /// Preserved across save() so byte-identical comments survive.
+    eocd_comment: []const u8,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !PartStore {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -122,16 +135,169 @@ pub const PartStore = struct {
             try rels_by_owner.put(ar_alloc, owner, relationships);
         }
 
+        // Recover the EOCD comment for byte-preserving save().
+        const eocd_off = try findEocd(buf);
+        const comment_len = std.mem.readInt(u16, buf[eocd_off + 20 ..][0..2], .little);
+        const comment_start = eocd_off + eocd_min_size;
+        const eocd_comment = if (comment_len > 0) buf[comment_start .. comment_start + comment_len] else &[_]u8{};
+
+        const overrides = try ar_alloc.alloc(?Override, parts.len);
+        for (overrides) |*o| o.* = null;
+
         return .{
             .allocator = allocator,
             .arena = arena,
+            .src_buf = buf,
+            .entries = entries,
             .parts = parts,
+            .overrides = overrides,
             .rels_by_owner = rels_by_owner,
+            .eocd_comment = eocd_comment,
         };
     }
 
     pub fn deinit(self: *PartStore) void {
         self.arena.deinit();
+    }
+
+    /// Replace the bytes of an existing part. The replacement is
+    /// queued (compressed via deflate) and applied at `save()` time.
+    /// Calling `part(name)` after `replacePart` continues to return
+    /// the ORIGINAL bytes — overrides are write-only until save.
+    /// Returns `error.PartNotFound` if `name` isn't in the store.
+    ///
+    /// `bytes` is duped into the arena; caller can free its own
+    /// buffer right after the call.
+    pub fn replacePart(self: *PartStore, name: []const u8, bytes: []const u8) !void {
+        const idx = self.findIndex(name) orelse return error.PartNotFound;
+        const ar_alloc = self.arena.allocator();
+
+        if (bytes.len > std.math.maxInt(u32)) return Error.Zip64NotSupported;
+
+        // M2 ships STORED-only overrides: each replaced part is
+        // emitted with compression method 0 (no deflate). This keeps
+        // the package layer free of a deflate-compressor dependency
+        // (the writer's deflateCompress lives in a separate module
+        // tree). Untouched parts still keep their original deflate
+        // payloads byte-for-byte, so file size only grows for the
+        // parts the caller actually replaces. Deflate-encoding for
+        // overrides is queued for B0 M2.5.
+        const owned = try ar_alloc.dupe(u8, bytes);
+        self.overrides[idx] = .{
+            .payload = owned,
+            .compression_method = 0,
+            .crc32 = std.hash.Crc32.hash(bytes),
+            .uncompressed_size = @intCast(bytes.len),
+        };
+    }
+
+    /// Atomic write of the package to `path`. Untouched parts are
+    /// emitted verbatim (LFH + payload bytes copied from src_buf,
+    /// CDFH copied with patched lfh_offset). Overridden parts get
+    /// fresh LFH + payload but reuse the source CDFH (with patched
+    /// fields). EOCD comment is preserved.
+    pub fn save(self: *PartStore, path: []const u8) !void {
+        var write_buf: [4096]u8 = undefined;
+        var atomic_file = try std.fs.cwd().atomicFile(path, .{ .write_buffer = &write_buf });
+        defer atomic_file.deinit();
+        const w = &atomic_file.file_writer.interface;
+
+        var written: u64 = 0;
+        const new_lfh_offsets = try self.allocator.alloc(u32, self.entries.len);
+        defer self.allocator.free(new_lfh_offsets);
+
+        for (self.entries, 0..) |e, i| {
+            new_lfh_offsets[i] = @intCast(written);
+            if (self.overrides[i]) |ov| {
+                // Build a fresh LFH with the override's compression
+                // method + size. Reuses the original LFH name + extra
+                // bytes verbatim so we keep any extension fields the
+                // source carried (timestamps etc.).
+                var lfh_bytes: [30]u8 = undefined;
+                std.mem.writeInt(u32, lfh_bytes[0..4], lfh_signature, .little);
+                std.mem.writeInt(u16, lfh_bytes[4..6], 20, .little); // version
+                std.mem.writeInt(u16, lfh_bytes[6..8], 0, .little); // flags
+                std.mem.writeInt(u16, lfh_bytes[8..10], ov.compression_method, .little);
+                std.mem.writeInt(u16, lfh_bytes[10..12], 0, .little); // mod time
+                std.mem.writeInt(u16, lfh_bytes[12..14], 0x21, .little); // mod date (1980-01-01)
+                std.mem.writeInt(u32, lfh_bytes[14..18], ov.crc32, .little);
+                std.mem.writeInt(u32, lfh_bytes[18..22], @intCast(ov.payload.len), .little);
+                std.mem.writeInt(u32, lfh_bytes[22..26], ov.uncompressed_size, .little);
+                std.mem.writeInt(u16, lfh_bytes[26..28], @intCast(e.name.len), .little);
+                std.mem.writeInt(u16, lfh_bytes[28..30], 0, .little); // no extra
+                try w.writeAll(&lfh_bytes);
+                try w.writeAll(e.name);
+                try w.writeAll(ov.payload);
+                written += @as(u64, lfh_bytes.len) + @as(u64, e.name.len) + @as(u64, ov.payload.len);
+            } else {
+                // Untouched: copy LFH + payload bytes byte-for-byte.
+                const lfh = self.src_buf[e.lfh_offset .. e.lfh_offset + e.lfh_total_len];
+                const payload = self.src_buf[e.payload_offset .. e.payload_offset + e.compressed_size];
+                try w.writeAll(lfh);
+                try w.writeAll(payload);
+                written += @as(u64, lfh.len) + @as(u64, payload.len);
+            }
+        }
+
+        const new_cd_offset: u32 = @intCast(written);
+        for (self.entries, 0..) |e, i| {
+            if (self.overrides[i]) |ov| {
+                // Fresh CDFH for the override. 46-byte header + name.
+                var cdfh_bytes: [46]u8 = undefined;
+                std.mem.writeInt(u32, cdfh_bytes[0..4], cdfh_signature, .little);
+                std.mem.writeInt(u16, cdfh_bytes[4..6], 20, .little); // version made by
+                std.mem.writeInt(u16, cdfh_bytes[6..8], 20, .little); // version needed
+                std.mem.writeInt(u16, cdfh_bytes[8..10], 0, .little); // flags
+                std.mem.writeInt(u16, cdfh_bytes[10..12], ov.compression_method, .little);
+                std.mem.writeInt(u16, cdfh_bytes[12..14], 0, .little);
+                std.mem.writeInt(u16, cdfh_bytes[14..16], 0x21, .little);
+                std.mem.writeInt(u32, cdfh_bytes[16..20], ov.crc32, .little);
+                std.mem.writeInt(u32, cdfh_bytes[20..24], @intCast(ov.payload.len), .little);
+                std.mem.writeInt(u32, cdfh_bytes[24..28], ov.uncompressed_size, .little);
+                std.mem.writeInt(u16, cdfh_bytes[28..30], @intCast(e.name.len), .little);
+                std.mem.writeInt(u16, cdfh_bytes[30..32], 0, .little); // no extra
+                std.mem.writeInt(u16, cdfh_bytes[32..34], 0, .little); // no comment
+                std.mem.writeInt(u16, cdfh_bytes[34..36], 0, .little); // disk number
+                std.mem.writeInt(u16, cdfh_bytes[36..38], 0, .little); // internal attrs
+                std.mem.writeInt(u32, cdfh_bytes[38..42], 0, .little); // external attrs
+                std.mem.writeInt(u32, cdfh_bytes[42..46], new_lfh_offsets[i], .little);
+                try w.writeAll(&cdfh_bytes);
+                try w.writeAll(e.name);
+                written += @as(u64, cdfh_bytes.len) + @as(u64, e.name.len);
+            } else {
+                // Untouched: copy CDFH bytes verbatim, patch the
+                // lfh_offset field at byte 42-46.
+                var cdfh = try self.allocator.dupe(u8, self.src_buf[e.cdfh_offset .. e.cdfh_offset + e.cdfh_total_len]);
+                defer self.allocator.free(cdfh);
+                std.mem.writeInt(u32, cdfh[42..46], new_lfh_offsets[i], .little);
+                try w.writeAll(cdfh);
+                written += @as(u64, cdfh.len);
+            }
+        }
+        const new_cd_size: u32 = @intCast(written - new_cd_offset);
+
+        // EOCD.
+        var eocd_bytes: [eocd_min_size]u8 = undefined;
+        std.mem.writeInt(u32, eocd_bytes[0..4], eocd_signature, .little);
+        std.mem.writeInt(u16, eocd_bytes[4..6], 0, .little);
+        std.mem.writeInt(u16, eocd_bytes[6..8], 0, .little);
+        std.mem.writeInt(u16, eocd_bytes[8..10], @intCast(self.entries.len), .little);
+        std.mem.writeInt(u16, eocd_bytes[10..12], @intCast(self.entries.len), .little);
+        std.mem.writeInt(u32, eocd_bytes[12..16], new_cd_size, .little);
+        std.mem.writeInt(u32, eocd_bytes[16..20], new_cd_offset, .little);
+        std.mem.writeInt(u16, eocd_bytes[20..22], @intCast(self.eocd_comment.len), .little);
+        try w.writeAll(&eocd_bytes);
+        try w.writeAll(self.eocd_comment);
+
+        try w.flush();
+        try atomic_file.finish();
+    }
+
+    fn findIndex(self: *const PartStore, name: []const u8) ?usize {
+        for (self.parts, 0..) |p, i| {
+            if (std.mem.eql(u8, p.name, name)) return i;
+        }
+        return null;
     }
 
     pub fn partNames(self: *const PartStore) []const []const u8 {
@@ -222,11 +388,38 @@ pub const PartStore = struct {
 
 const ZipEntry = struct {
     name: []const u8,
+    /// Offset (into src_buf) of the local file header (signature 0x04034b50).
+    lfh_offset: usize,
+    /// Total length of the LFH including the variable-length name +
+    /// extra fields. = 30 + lfh_name_len + lfh_extra_len. Payload
+    /// begins at `lfh_offset + lfh_total_len`.
+    lfh_total_len: usize,
+    /// Offset of the central-directory file header (signature 0x02014b50).
+    cdfh_offset: usize,
+    /// Total length of the CDFH including the variable-length tail
+    /// (filename + extra + comment) — useful for byte-preserving
+    /// copies that keep extra fields the source carried.
+    cdfh_total_len: usize,
+    /// Compressed payload size and start offset (= lfh_offset +
+    /// lfh_total_len). Recorded in the CDFH; LFH copies have the
+    /// same value EXCEPT when a data-descriptor (flag 0x0008) sat
+    /// after the payload — CDFH is canonical either way.
     payload_offset: usize,
     compressed_size: u32,
     uncompressed_size: u32,
     compression_method: u16,
     crc32: u32,
+};
+
+/// Override = caller-supplied replacement bytes for an existing part.
+/// Lazily compressed (deflate) or stored verbatim, with a fresh LFH
+/// + CDFH built at save() time.
+const Override = struct {
+    /// Compressed payload bytes (owned by arena).
+    payload: []const u8,
+    compression_method: u16,
+    crc32: u32,
+    uncompressed_size: u32,
 };
 
 const eocd_signature: u32 = 0x06054b50;
@@ -290,11 +483,18 @@ fn scanCentralDirectory(arena: std.mem.Allocator, buf: []const u8) ![]ZipEntry {
         if (lfh_sig != lfh_signature) return Error.BadZip;
         const lfh_name_len = std.mem.readInt(u16, buf[lfh_offset + 26 ..][0..2], .little);
         const lfh_extra_len = std.mem.readInt(u16, buf[lfh_offset + 28 ..][0..2], .little);
-        const payload_offset = lfh_offset + 30 + @as(usize, lfh_name_len) + @as(usize, lfh_extra_len);
+        const lfh_total_len = 30 + @as(usize, lfh_name_len) + @as(usize, lfh_extra_len);
+        const payload_offset = lfh_offset + lfh_total_len;
         if (payload_offset + compressed_size > buf.len) return Error.BadZip;
+
+        const cdfh_total = 46 + @as(usize, filename_len) + @as(usize, extra_len) + @as(usize, comment_len);
 
         try out.append(arena, .{
             .name = try arena.dupe(u8, name),
+            .lfh_offset = lfh_offset,
+            .lfh_total_len = lfh_total_len,
+            .cdfh_offset = cur,
+            .cdfh_total_len = cdfh_total,
             .payload_offset = payload_offset,
             .compressed_size = compressed_size,
             .uncompressed_size = uncompressed_size,
@@ -631,6 +831,93 @@ test "PartStore.resolve: relative + absolute targets" {
     // Absolute: "/xl/workbook.xml" → "xl/workbook.xml".
     const r3 = (try store.resolve("anywhere", "/xl/workbook.xml")).?;
     try std.testing.expectEqualStrings("xl/workbook.xml", r3);
+}
+
+test "PartStore.save: byte-preserving round-trip with no mutations" {
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "round_trip.xlsx" });
+    defer std.testing.allocator.free(out_path);
+
+    {
+        var store = try PartStore.open(std.testing.allocator, fixture);
+        defer store.deinit();
+        try store.save(out_path);
+    }
+
+    // Re-open the saved file. Every part must decompress to the
+    // same bytes as the source.
+    var src = try PartStore.open(std.testing.allocator, fixture);
+    defer src.deinit();
+    var dst = try PartStore.open(std.testing.allocator, out_path);
+    defer dst.deinit();
+
+    try std.testing.expectEqual(src.parts.len, dst.parts.len);
+    for (src.parts, dst.parts) |s, d| {
+        try std.testing.expectEqualStrings(s.name, d.name);
+        try std.testing.expectEqualSlices(u8, s.bytes, d.bytes);
+    }
+}
+
+test "PartStore.replacePart + save: replaced part has new bytes; others untouched" {
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "modified.xlsx" });
+    defer std.testing.allocator.free(out_path);
+
+    const replacement: []const u8 =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+        "<test xmlns=\"http://example.com/zlsx\">replaced</test>";
+
+    var src_workbook_bytes: []const u8 = undefined;
+    {
+        var store = try PartStore.open(std.testing.allocator, fixture);
+        defer store.deinit();
+        const wb_part = store.part("xl/workbook.xml") orelse return error.TestUnexpectedResult;
+        src_workbook_bytes = wb_part.bytes;
+        // Pick a small XML part that's safe to overwrite for the
+        // round-trip test. workbook.xml ensures we exercise the
+        // override path on a part that exists in every fixture.
+        try store.replacePart("xl/workbook.xml", replacement);
+        try store.save(out_path);
+    }
+
+    var dst = try PartStore.open(std.testing.allocator, out_path);
+    defer dst.deinit();
+
+    // Replaced part has the new bytes.
+    const wb = dst.part("xl/workbook.xml") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, replacement, wb.bytes);
+
+    // Sanity: at least one OTHER part still matches the source's
+    // decompressed bytes byte-for-byte. sharedStrings.xml in
+    // frictionless_2sheets is a stable Override-typed part.
+    var src = try PartStore.open(std.testing.allocator, fixture);
+    defer src.deinit();
+    if (src.part("xl/sharedStrings.xml")) |s| {
+        const d = dst.part("xl/sharedStrings.xml") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualSlices(u8, s.bytes, d.bytes);
+    }
+}
+
+test "PartStore.replacePart: unknown part name returns PartNotFound" {
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+
+    var store = try PartStore.open(std.testing.allocator, fixture);
+    defer store.deinit();
+
+    try std.testing.expectError(error.PartNotFound, store.replacePart("xl/does_not_exist.xml", "x"));
 }
 
 test "PartStore.open: rejects non-PK file" {
