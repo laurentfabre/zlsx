@@ -1652,18 +1652,22 @@ export fn zlsx_sheet_writer_write_rich_row(
             cells_slice[i] = .{ .rich = dst };
             runs_cursor += runs_len;
         } else if (cells_ptr) |cp| {
-            // Plain cell — mirror fromCCell into the RichRowCell shape.
-            const c = cp[i];
-            cells_slice[i] = switch (c.tag) {
-                @intFromEnum(CellTag.empty) => .empty,
-                @intFromEnum(CellTag.string) => .{ .string = c.str_ptr[0..c.str_len] },
-                @intFromEnum(CellTag.integer) => .{ .integer = c.i },
-                @intFromEnum(CellTag.number) => .{ .number = c.f },
-                @intFromEnum(CellTag.boolean) => .{ .boolean = c.b != 0 },
-                else => {
-                    writeError(err_buf, err_buf_len, "BadCellTag");
-                    return -1;
-                },
+            // Plain cell — route through fromCCell so the same
+            // null-pointer + empty-string contract that
+            // zlsx_sheet_writer_write_row honours applies here too.
+            // Without this, a caller using the documented
+            // `{ str_ptr = NULL, str_len = 0 }` empty-string shape
+            // crashed with a null-pointer slice on rich rows.
+            const cell = fromCCell(cp[i]) catch |e| {
+                writeError(err_buf, err_buf_len, @errorName(e));
+                return -1;
+            };
+            cells_slice[i] = switch (cell) {
+                .empty => .empty,
+                .string => |s| .{ .string = s },
+                .integer => |n| .{ .integer = n },
+                .number => |x| .{ .number = x },
+                .boolean => |b| .{ .boolean = b },
             };
         } else {
             cells_slice[i] = .empty;
