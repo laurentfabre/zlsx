@@ -464,7 +464,7 @@ fn decodeIdInto(buf: []u8, src: []const u8) ?[]const u8 {
             if (std.mem.startsWith(u8, remain, "&quot;")) {
                 if (out_len >= buf.len) return null;
                 buf[out_len] = '"';
-                out_len += 6;
+                out_len += 1;
                 i += 6;
                 continue;
             }
