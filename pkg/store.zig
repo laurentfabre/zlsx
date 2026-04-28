@@ -200,7 +200,10 @@ pub const PartStore = struct {
         bytes: []const u8,
     ) !void {
         if (self.findIndex(name) != null) return error.PartAlreadyExists;
-        if (bytes.len > std.math.maxInt(u32)) return Error.Zip64NotSupported;
+        // Strict `>=`: 0xFFFFFFFF is the Zip64 sentinel — emitting that
+        // in compressed_size or uncompressed_size produces an archive
+        // the reader treats as Zip64 and rejects.
+        if (bytes.len >= std.math.maxInt(u32)) return Error.Zip64NotSupported;
         if (name.len > std.math.maxInt(u16)) return Error.ZipArchiveTooLarge;
 
         const ar_alloc = self.arena.allocator();
@@ -229,7 +232,7 @@ pub const PartStore = struct {
                 try compressed.appendSlice(ar_alloc, bytes);
             }
         }
-        if (compressed.items.len > std.math.maxInt(u32)) return Error.Zip64NotSupported;
+        if (compressed.items.len >= std.math.maxInt(u32)) return Error.Zip64NotSupported;
         const owned_payload = try compressed.toOwnedSlice(ar_alloc);
 
         // Stage the [Content_Types].xml update WITHOUT calling
@@ -350,7 +353,7 @@ pub const PartStore = struct {
                 try ct_compressed.appendSlice(ar_alloc, new_xml);
             }
         }
-        if (ct_compressed.items.len > std.math.maxInt(u32)) return Error.Zip64NotSupported;
+        if (ct_compressed.items.len >= std.math.maxInt(u32)) return Error.Zip64NotSupported;
         const ct_payload = try ct_compressed.toOwnedSlice(ar_alloc);
 
         return .{
@@ -388,7 +391,10 @@ pub const PartStore = struct {
         const idx = self.findIndex(name) orelse return error.PartNotFound;
         const ar_alloc = self.arena.allocator();
 
-        if (bytes.len > std.math.maxInt(u32)) return Error.Zip64NotSupported;
+        // Strict `>=`: 0xFFFFFFFF is the Zip64 sentinel — emitting that
+        // in compressed_size or uncompressed_size produces an archive
+        // the reader treats as Zip64 and rejects.
+        if (bytes.len >= std.math.maxInt(u32)) return Error.Zip64NotSupported;
 
         // Mirror Editor's compression policy:
         //   - Sub-1 KiB inputs: STORED. Deflate's dynamic-block
@@ -410,7 +416,7 @@ pub const PartStore = struct {
                 try compressed.appendSlice(ar_alloc, bytes);
             }
         }
-        if (compressed.items.len > std.math.maxInt(u32)) return Error.Zip64NotSupported;
+        if (compressed.items.len >= std.math.maxInt(u32)) return Error.Zip64NotSupported;
 
         // Build all the new arena-owned values BEFORE installing
         // any of them so a mid-allocation OOM leaves the store
@@ -461,7 +467,7 @@ pub const PartStore = struct {
         for (self.entries, 0..) |e, i| {
             if (e.name.len > std.math.maxInt(u16)) return Error.ZipArchiveTooLarge;
             const lfh_total: u64 = if (self.overrides[i]) |ov| blk: {
-                if (ov.payload.len > std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
+                if (ov.payload.len >= std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
                 break :blk 30 + @as(u64, e.name.len) + @as(u64, ov.payload.len);
             } else blk: {
                 break :blk @as(u64, e.lfh_total_len) +
