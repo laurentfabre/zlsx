@@ -5573,6 +5573,15 @@ pub const Editor = struct {
         const writer_mod = @import("writer.zig");
         try writer_mod.validateSheetName(name);
 
+        // Excel hard cap: a workbook can carry up to 255 sheets in
+        // the same file. Reject explicitly so a runaway addSheet
+        // loop can't grow self.sheet_paths past `@intCast(usize→u32)`
+        // panic territory and to surface the limit upfront rather
+        // than at save() time when a partial archive would be
+        // already half-written.
+        const total_after = self.sheet_paths.len + self.pending_new_sheets.items.len + 1;
+        if (total_after > 255) return error.TooManySheets;
+
         // Reject duplicates against existing source sheets and any
         // pending additions. Source sheet names live in the source's
         // workbook.xml; rather than re-parse it here, query the
@@ -5595,35 +5604,49 @@ pub const Editor = struct {
         var next_path_num = nextMaxSheetPathNum(self.entries) + 1;
         for (self.pending_new_sheets.items) |s| {
             if (s.sheet_id >= next_sheet_id) next_sheet_id = s.sheet_id + 1;
-            // s.rid is "rIdN"; strip the "rId" prefix.
+            // s.rid is "rIdN"; strip the "rId" prefix. The pending
+            // entries were produced by addSheet itself, so a parseInt
+            // failure here is a real internal-invariant break — assert
+            // it instead of silently dropping (which would yield a
+            // duplicate rId on the next addSheet call).
             if (std.mem.startsWith(u8, s.rid, "rId")) {
-                if (std.fmt.parseInt(u32, s.rid["rId".len..], 10)) |n| {
-                    if (n >= next_rid_num) next_rid_num = n + 1;
-                } else |_| {}
+                const n = std.fmt.parseInt(u32, s.rid["rId".len..], 10) catch unreachable;
+                if (n >= next_rid_num) next_rid_num = n + 1;
             }
-            // s.path is "xl/worksheets/sheetN.xml".
+            // s.path is "xl/worksheets/sheetN.xml". Same internal-
+            // invariant applies to the path number.
             const prefix = "xl/worksheets/sheet";
             const suffix = ".xml";
             if (std.mem.startsWith(u8, s.path, prefix) and std.mem.endsWith(u8, s.path, suffix)) {
                 const num_str = s.path[prefix.len .. s.path.len - suffix.len];
-                if (std.fmt.parseInt(u32, num_str, 10)) |n| {
-                    if (n >= next_path_num) next_path_num = n + 1;
-                } else |_| {}
+                const n = std.fmt.parseInt(u32, num_str, 10) catch unreachable;
+                if (n >= next_path_num) next_path_num = n + 1;
             }
         }
 
-        // Build the new entries. Free everything on error so the
-        // editor stays in a clean state.
-        var ns: NewSheet = .{
-            .name = try self.allocator.dupe(u8, name),
-            .path = try std.fmt.allocPrint(self.allocator, "xl/worksheets/sheet{d}.xml", .{next_path_num}),
-            .rid = try std.fmt.allocPrint(self.allocator, "rId{d}", .{next_rid_num}),
+        // Build the new entries. Each field gets its own errdefer
+        // so a mid-init OOM frees only the slices we've already
+        // produced — the previous struct-init form deferred all
+        // cleanup behind one `errdefer ns.deinit(...)` that fires
+        // only after the struct is fully built, leaking earlier
+        // allocs if a later one failed.
+        const ns_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(ns_name);
+        const ns_path = try std.fmt.allocPrint(self.allocator, "xl/worksheets/sheet{d}.xml", .{next_path_num});
+        errdefer self.allocator.free(ns_path);
+        const ns_rid = try std.fmt.allocPrint(self.allocator, "rId{d}", .{next_rid_num});
+        errdefer self.allocator.free(ns_rid);
+        const ns_body = try self.allocator.dupe(u8, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+            "<sheetData></sheetData></worksheet>");
+        errdefer self.allocator.free(ns_body);
+        const ns: NewSheet = .{
+            .name = ns_name,
+            .path = ns_path,
+            .rid = ns_rid,
             .sheet_id = next_sheet_id,
-            .body_xml = try self.allocator.dupe(u8, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
-                "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
-                "<sheetData></sheetData></worksheet>"),
+            .body_xml = ns_body,
         };
-        errdefer ns.deinit(self.allocator);
 
         // Grow sheet_paths so subsequent setCell etc. resolve the
         // new index. sheet_paths is currently `[]const []const u8`;
@@ -8858,12 +8881,23 @@ fn buildEntryFromXml(
     };
 }
 
+// ZIP-bomb defenses for `decompressZipPayload`. Mirror the caps in
+// pkg/store.zig: per-part 512 MiB hard cap + 4096:1 ratio. Both
+// checks fire BEFORE any allocation so a crafted CDFH declaring
+// multi-GB uncompressed size can't OOM the reader.
+const max_reader_part_size: usize = 512 * 1024 * 1024;
+const max_reader_deflate_ratio: usize = 4096;
+
 fn decompressZipPayload(
     allocator: Allocator,
     payload: []const u8,
     method: u16,
     declared_uncompressed: u32,
 ) ![]u8 {
+    if (declared_uncompressed > max_reader_part_size) return error.BadZip;
+    const ratio_cap = std.math.mul(usize, payload.len, max_reader_deflate_ratio) catch std.math.maxInt(usize);
+    if (declared_uncompressed > ratio_cap) return error.BadZip;
+
     if (method == 0) {
         if (payload.len != declared_uncompressed) return error.BadZip;
         return try allocator.dupe(u8, payload);
