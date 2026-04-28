@@ -336,6 +336,24 @@ pub const PartStore = struct {
         return null;
     }
 
+    /// Filtered view of parts whose content type starts with
+    /// `image/` (PNG, JPEG, GIF, etc.). Caller-friendly C2a
+    /// MVP — anchor / per-sheet attribution lives in the future
+    /// `drawings()` parser.
+    ///
+    /// Allocated inside the store's arena; valid until `deinit`.
+    pub fn imageParts(self: *const PartStore) []Part {
+        const ar_alloc = @constCast(&self.arena).allocator();
+        var out: std.ArrayListUnmanaged(Part) = .empty;
+        for (self.parts) |p| {
+            const ct = p.content_type orelse continue;
+            if (std.mem.startsWith(u8, ct, "image/")) {
+                out.append(ar_alloc, p) catch return &.{};
+            }
+        }
+        return out.toOwnedSlice(ar_alloc) catch &.{};
+    }
+
     pub fn rels(self: *const PartStore, owner_part_name: []const u8) []const Relationship {
         return self.rels_by_owner.get(owner_part_name) orelse &.{};
     }
@@ -898,6 +916,27 @@ test "PartStore.resolve: relative + absolute targets" {
     // Absolute: "/xl/workbook.xml" → "xl/workbook.xml".
     const r3 = (try store.resolve("anywhere", "/xl/workbook.xml")).?;
     try std.testing.expectEqualStrings("xl/workbook.xml", r3);
+}
+
+test "PartStore.imageParts: extract embedded images (C2a MVP)" {
+    const fixture = "tests/corpus/poi_58325_db.xlsx";
+    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+
+    var store = try PartStore.open(std.testing.allocator, fixture);
+    defer store.deinit();
+
+    const images = store.imageParts();
+    // poi_58325_db.xlsx ships 4 image parts under xl/media/. Confirm
+    // imageParts surfaces them as bytes-bearing Parts (no XML parse,
+    // no per-sheet anchor attribution — that's the future drawings()
+    // parser's job).
+    try std.testing.expect(images.len > 0);
+    for (images) |p| {
+        try std.testing.expect(std.mem.startsWith(u8, p.name, "xl/media/"));
+        try std.testing.expect(p.bytes.len > 0);
+        const ct = p.content_type orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.startsWith(u8, ct, "image/"));
+    }
 }
 
 test "PartStore: data descriptors detected in fixtures with flag 0x0008" {
