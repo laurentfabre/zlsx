@@ -3410,6 +3410,21 @@ fn runAppendRowsCommand(
             return 3;
         }
 
+        // Cap per-row cell count at Excel's hard column limit
+        // (16384 = XFD). Without this, a malicious / buggy caller
+        // submitting `[null, null, ...]` arrays of millions of
+        // slots per line can balloon the per-row alloc; the row
+        // would later fail at the writer anyway, but rejecting up
+        // front avoids the wasted allocation and gives a clearer
+        // error.
+        if (root.array.items.len > 16_384) {
+            try err.print(
+                "zlsx: line {d}: row has {d} cells; Excel maximum is 16384\n",
+                .{ line_no, root.array.items.len },
+            );
+            try err.flush();
+            return 3;
+        }
         const cells = try alloc.alloc(xlsx.Cell, root.array.items.len);
         defer alloc.free(cells);
         for (root.array.items, 0..) |v, ci| {
