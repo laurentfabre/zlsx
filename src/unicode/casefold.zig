@@ -186,9 +186,12 @@ test "Unicode: ς (final sigma) → σ" {
     try std.testing.expectEqualStrings("σ", out);
 }
 
-test "Unicode: Kelvin sign K → k" {
-    // U+212A KELVIN SIGN is one of the well-known case-fold pitfalls.
-    const out = try foldString(std.testing.allocator, "K");
+test "Unicode: Kelvin sign U+212A → k" {
+    // U+212A KELVIN SIGN folds to plain ASCII "k". The previous
+    // version of this test used ASCII 'K' (U+004B), which would
+    // pass via the ASCII fast path and never exercise the table
+    // entry for U+212A.
+    const out = try foldString(std.testing.allocator, "\u{212A}");
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("k", out);
 }
