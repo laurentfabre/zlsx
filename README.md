@@ -94,6 +94,7 @@ try ed.save("out.xlsx");
 
 - **[docs/benchmarks.md](docs/benchmarks.md)** — full perf matrix (read + write), RSS, methodology, reproduction.
 - **[docs/jq-for-excel.md](docs/jq-for-excel.md)** — CLI design doc: NDJSON envelope, sub-commands, flag conventions, operational guarantees.
+- **[docs/package-layer.md](docs/package-layer.md)** — `zlsx_pkg` Zig module: read-only OOXML package access (PartStore + drawings), byte-preserving save/replacePart, image + chart anchor extraction. Reach for this when you want raw OOXML access without the full reader/writer.
 - **[docs/vs_calamine.md](docs/vs_calamine.md)** — feature gap vs `calamine` (Rust). Pick the right tool consciously.
 - **[docs/xlsx_test_corpus.md](docs/xlsx_test_corpus.md)** — public xlsx test corpus.
 - **[bindings/python/README.md](bindings/python/README.md)** — `py-zlsx` Python package: install, examples, scope, lifetime gotchas.
