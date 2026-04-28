@@ -3084,10 +3084,10 @@ const TestTmp = struct {
     pub fn deinit(self: *TestTmp) void {
         self.dir.cleanup();
     }
-    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, name: []const u8) ![]u8 {
+    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
         const dir = try self.dir.dir.realpathAlloc(alloc, ".");
         defer alloc.free(dir);
-        return std.fs.path.join(alloc, &.{ dir, name });
+        return std.fs.path.joinZ(alloc, &.{ dir, name });
     }
 };
 
@@ -3219,8 +3219,10 @@ test "Writer: multi-sheet round-trip + SST dedup" {
 }
 
 test "Writer: xml entities in strings are escaped" {
-    const tmp_path = "/tmp/zlsx_writer_entities.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_entities.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -3263,8 +3265,10 @@ test "Writer: writeRowStyled rejects out-of-range style id" {
 }
 
 test "Writer: stage-5 number format registers + emits numFmts" {
-    const tmp_path = "/tmp/zlsx_writer_numfmt.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_numfmt.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -3320,8 +3324,10 @@ test "Writer: stage-5 number format registers + emits numFmts" {
 }
 
 test "Writer: writeRowWithFormulas emits <f> + cached <v> correctly" {
-    const tmp_path = "/tmp/zlsx_writer_formulas.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_formulas.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -3400,8 +3406,10 @@ test "Writer: writeRowWithFormulas emits <f> + cached <v> correctly" {
 }
 
 test "Writer: setRowHeight emits ht + customHeight, only on marked rows" {
-    const tmp_path = "/tmp/zlsx_writer_row_heights.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_row_heights.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -3467,8 +3475,10 @@ test "Writer: setRowHeight emits ht + customHeight, only on marked rows" {
 }
 
 test "Writer: stage-5 sheet-level features (cols, freeze, autoFilter)" {
-    const tmp_path = "/tmp/zlsx_writer_sheet_features.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_sheet_features.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -3533,8 +3543,10 @@ test "Writer: stage-5 sheet-level features (cols, freeze, autoFilter)" {
 }
 
 test "Writer: addMergedCell validates + emits <mergeCells> block" {
-    const tmp_path = "/tmp/zlsx_writer_merged_cells.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_merged_cells.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -3611,8 +3623,10 @@ test "Writer: addMergedCell validates + emits <mergeCells> block" {
 }
 
 test "Writer: addDataValidationNumeric + Custom emit correct XML" {
-    const tmp_path = "/tmp/zlsx_writer_dv_ranges.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_dv_ranges.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -3698,13 +3712,15 @@ test "Writer: addDataValidationNumeric + Custom emit correct XML" {
 }
 
 test "Writer: VML idmap expands for >1023 comments per sheet" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // iter48 — the hardcoded `<o:idmap data="1"/>` only covered
     // shape IDs 1024..2047 = 1023 comments. Workbooks past that
     // need additional idmap entries (one per 1024-ID range). This
     // test emits 1025 comments and verifies the VML drawing grew
     // a second idmap: `data="1,2"`.
-    const tmp_path = "/tmp/zlsx_writer_idmap_scale.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "writer_idmap_scale.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -3747,8 +3763,8 @@ test "Writer: VML idmap expands for >1023 comments per sheet" {
 
     // A single-comment sheet keeps the data="1" shape (regression
     // guard: don't emit `data="1,"` trailing comma).
-    const tmp_small = "/tmp/zlsx_writer_idmap_small.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_small) catch {};
+    const tmp_small = try tt.path(std.testing.allocator, "writer_idmap_small.xlsx");
+    defer std.testing.allocator.free(tmp_small);
     {
         var w2 = Writer.init(std.testing.allocator);
         defer w2.deinit();
@@ -3781,8 +3797,10 @@ test "Writer: VML idmap expands for >1023 comments per sheet" {
 }
 
 test "Writer: comment on XFD column emits non-inverted VML anchor" {
-    const tmp_path = "/tmp/zlsx_writer_comment_xfd.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_comment_xfd.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         var w = Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -3829,8 +3847,10 @@ test "Writer: comment on XFD column emits non-inverted VML anchor" {
 }
 
 test "Writer: conditional formatting — colorScale (2+3 stop) + dataBar" {
-    const tmp_path = "/tmp/zlsx_cf_gradient.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cf_gradient.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -3912,8 +3932,10 @@ test "Writer: conditional formatting — colorScale (2+3 stop) + dataBar" {
 }
 
 test "Writer: conditional formatting — cellIs + expression rules + dxfs table" {
-    const tmp_path = "/tmp/zlsx_writer_conditional_formatting.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_conditional_formatting.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -4027,8 +4049,10 @@ test "Writer: conditional formatting — cellIs + expression rules + dxfs table"
 }
 
 test "Writer: addDataValidationList validates + emits <dataValidations> block" {
-    const tmp_path = "/tmp/zlsx_writer_dv_list.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_dv_list.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -4097,8 +4121,10 @@ test "Writer: addDataValidationList validates + emits <dataValidations> block" {
 }
 
 test "Writer: addDataValidationList — no block when none registered" {
-    const tmp_path = "/tmp/zlsx_writer_no_dv.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_no_dv.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -4131,8 +4157,10 @@ test "Writer: addDataValidationList — no block when none registered" {
 }
 
 test "Writer: addHyperlink validates + emits <hyperlinks> + per-sheet _rels" {
-    const tmp_path = "/tmp/zlsx_writer_hyperlinks.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_hyperlinks.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -4229,8 +4257,10 @@ test "Writer: addHyperlink validates + emits <hyperlinks> + per-sheet _rels" {
 }
 
 test "Writer: no <hyperlinks> block or _rels entry when none registered" {
-    const tmp_path = "/tmp/zlsx_writer_no_hyperlinks.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_no_hyperlinks.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -4260,8 +4290,10 @@ test "Writer: no <hyperlinks> block or _rels entry when none registered" {
 }
 
 test "Writer: no <mergeCells> block when none registered" {
-    const tmp_path = "/tmp/zlsx_writer_no_merged.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_no_merged.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -4295,8 +4327,10 @@ test "Writer: no <mergeCells> block when none registered" {
 }
 
 test "Writer: stage-4 border sides emit into styles.xml" {
-    const tmp_path = "/tmp/zlsx_writer_styles_borders.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_styles_borders.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -4366,8 +4400,10 @@ test "Writer: stage-4 border sides emit into styles.xml" {
 }
 
 test "Writer: stage-3 fill fields emit into styles.xml" {
-    const tmp_path = "/tmp/zlsx_writer_styles_fills.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_styles_fills.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -4442,8 +4478,10 @@ test "Writer: stage-3 fill fields emit into styles.xml" {
 }
 
 test "Writer: stage-2 style fields emit into styles.xml" {
-    const tmp_path = "/tmp/zlsx_writer_styles_stage2.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_styles_stage2.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -4515,8 +4553,10 @@ test "Writer: stage-2 style fields emit into styles.xml" {
 }
 
 test "Writer: styles — bold + italic round-trip" {
-    const tmp_path = "/tmp/zlsx_writer_styles_bold.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_styles_bold.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     var registered_bold: u32 = 0;
     var registered_italic: u32 = 0;
@@ -4694,8 +4734,10 @@ test "fuzz validateSheetName: adversarial bytes never panic + only valid names p
 }
 
 test "Writer: sheet names with XML-special chars are escaped" {
-    const tmp_path = "/tmp/zlsx_writer_sheet_escape.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_sheet_escape.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -4746,8 +4788,10 @@ test "Writer: reject only integers that round on IEEE-754 conversion" {
 }
 
 test "Writer: writeRow is atomic on IntegerExceedsExcelPrecision" {
-    const tmp_path = "/tmp/zlsx_writer_atomic.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_atomic.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     var w = Writer.init(std.testing.allocator);
     defer w.deinit();
@@ -4995,9 +5039,12 @@ test "fuzz Writer end-to-end round-trip via reader" {
     const seed = fuzzSeedW();
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
-    var tmp_path_buf: [64]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "/tmp/zlsx_fuzz_writer_{x}.xlsx", .{seed});
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var tmp_name_buf: [64]u8 = undefined;
+    const tmp_name = std.fmt.bufPrint(&tmp_name_buf, "fuzz_writer_{x}.xlsx", .{seed}) catch unreachable;
+    const tmp_path = try tt.path(std.testing.allocator, tmp_name);
+    defer std.testing.allocator.free(tmp_path);
 
     for (0..iters) |_| {
         var w = Writer.init(std.testing.allocator);
@@ -5071,8 +5118,11 @@ test "fuzz Writer: random stage 2-5 style combos survive round-trip" {
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var tmp_path_buf: [64]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "/tmp/zlsx_fuzz_combo_{x}.xlsx", .{seed});
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_name = std.fmt.bufPrint(&tmp_path_buf, "fuzz_combo_{x}.xlsx", .{seed}) catch unreachable;
+    const tmp_path = try tt.path(std.testing.allocator, tmp_name);
+    defer std.testing.allocator.free(tmp_path);
 
     const font_names = [_][]const u8{ "Calibri", "Arial", "Helvetica", "Times New Roman" };
     const num_formats = [_][]const u8{ "0.00", "0.00%", "#,##0", "m/d/yyyy", "$#,##0.00" };
@@ -5147,9 +5197,15 @@ test "fuzz SheetWriter: random stage-5 per-sheet feature combos" {
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var tmp_path_buf: [64]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "/tmp/zlsx_fuzz_sheetfeat_{x}.xlsx", .{seed});
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
 
+    defer tt.deinit();
+
+    const _fuzz_name = std.fmt.bufPrint(&tmp_path_buf, "fuzz_sheetfeat_{x}.xlsx", .{seed}) catch unreachable;
+
+    const tmp_path = try tt.path(std.testing.allocator, _fuzz_name);
+
+    defer std.testing.allocator.free(tmp_path);
     const filter_ranges = [_][]const u8{ "A1:A1", "A1:C1", "B2:F10", "A1:Z1000" };
     // Mix of valid + invalid merge ranges so the fuzz hits both paths.
     // The invalid ones must surface `error.InvalidMergeRange` without
@@ -5271,9 +5327,15 @@ test "fuzz ZipWriter produces archives our reader can walk" {
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var tmp_path_buf: [64]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "/tmp/zlsx_fuzz_zipwriter_{x}.zip", .{seed});
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
 
+    defer tt.deinit();
+
+    const _fuzz_name = std.fmt.bufPrint(&tmp_path_buf, "fuzz_zipwriter_{x}.zip", .{seed}) catch unreachable;
+
+    const tmp_path = try tt.path(std.testing.allocator, _fuzz_name);
+
+    defer std.testing.allocator.free(tmp_path);
     for (0..iters) |_| {
         var zip_buf: std.ArrayListUnmanaged(u8) = .{};
         defer zip_buf.deinit(std.testing.allocator);
@@ -5434,9 +5496,15 @@ test "fuzz Writer state-machine: random op ordering with invariants" {
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var tmp_path_buf: [64]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "/tmp/zlsx_fuzz_state_{x}.xlsx", .{seed});
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
 
+    defer tt.deinit();
+
+    const _fuzz_name = std.fmt.bufPrint(&tmp_path_buf, "fuzz_state_{x}.xlsx", .{seed}) catch unreachable;
+
+    const tmp_path = try tt.path(std.testing.allocator, _fuzz_name);
+
+    defer std.testing.allocator.free(tmp_path);
     for (0..iters) |_| {
         var w = Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -5542,9 +5610,15 @@ test "fuzz Writer: multi-save preserves all prior rows" {
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var tmp_path_buf: [64]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "/tmp/zlsx_fuzz_multisave_{x}.xlsx", .{seed});
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
 
+    defer tt.deinit();
+
+    const _fuzz_name = std.fmt.bufPrint(&tmp_path_buf, "fuzz_multisave_{x}.xlsx", .{seed}) catch unreachable;
+
+    const tmp_path = try tt.path(std.testing.allocator, _fuzz_name);
+
+    defer std.testing.allocator.free(tmp_path);
     for (0..iters) |_| {
         var w = Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -5583,9 +5657,15 @@ test "fuzz Writer: boundary numeric values survive round-trip" {
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var tmp_path_buf: [64]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "/tmp/zlsx_fuzz_bounds_{x}.xlsx", .{seed});
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
 
+    defer tt.deinit();
+
+    const _fuzz_name = std.fmt.bufPrint(&tmp_path_buf, "fuzz_bounds_{x}.xlsx", .{seed}) catch unreachable;
+
+    const tmp_path = try tt.path(std.testing.allocator, _fuzz_name);
+
+    defer std.testing.allocator.free(tmp_path);
     const int_boundaries = [_]i64{
         0,                    1,                       -1,
         (1 << 53) - 1,        1 << 53,                 -(1 << 53),
@@ -5670,9 +5750,15 @@ test "fuzz ZipWriter: adversarial entry names" {
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var tmp_path_buf: [64]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "/tmp/zlsx_fuzz_advnames_{x}.zip", .{seed});
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
 
+    defer tt.deinit();
+
+    const _fuzz_name = std.fmt.bufPrint(&tmp_path_buf, "fuzz_advnames_{x}.zip", .{seed}) catch unreachable;
+
+    const tmp_path = try tt.path(std.testing.allocator, _fuzz_name);
+
+    defer std.testing.allocator.free(tmp_path);
     const names = [_][]const u8{
         "a",
         "/leading-slash",

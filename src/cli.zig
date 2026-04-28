@@ -3786,6 +3786,25 @@ fn jsonValueToCell(v: std.json.Value) !xlsx.Cell {
 
 // ─── Tests ───────────────────────────────────────────────────────────
 
+/// Per-test temporary file helper. Same shape as the helpers in
+/// src/writer.zig and src/xlsx.zig — replaces hard-coded /tmp paths
+/// so the suite is portable to Windows. Caller frees the returned
+/// slice; `defer tt.deinit()` cleans up the directory.
+const TestTmp = struct {
+    dir: std.testing.TmpDir,
+    pub fn init() TestTmp {
+        return .{ .dir = std.testing.tmpDir(.{}) };
+    }
+    pub fn deinit(self: *TestTmp) void {
+        self.dir.cleanup();
+    }
+    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
+        const d = try self.dir.dir.realpathAlloc(alloc, ".");
+        defer alloc.free(d);
+        return std.fs.path.joinZ(alloc, &.{ d, name });
+    }
+};
+
 test "colLetter A,B,Z,AA,AZ,BA,ZZ,AAA" {
     var buf: [8]u8 = undefined;
     try std.testing.expectEqualStrings("A", colLetter(&buf, 0));
@@ -3838,11 +3857,13 @@ test "parseArgs: set-cell subcommand token is skipped, --ref / --value parse" {
 }
 
 test "runSetCellCommand rewrites a single cell and saves to --out" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_cli_set_cell_src.xlsx";
-    const dst_path = "/tmp/zlsx_cli_set_cell_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "cli_set_cell_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "cli_set_cell_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -3879,9 +3900,11 @@ test "runSetCellCommand rewrites a single cell and saves to --out" {
 }
 
 test "runSetCellCommand rejects missing --ref / --value / --out" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_cli_set_cell_missing.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "cli_set_cell_missing.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -3897,12 +3920,14 @@ test "runSetCellCommand rejects missing --ref / --value / --out" {
     }
     {
         var err_w = std.Io.Writer.fixed(&err_buf);
-        const a: Args = .{ .file = src_path, .subcommand = .set_cell, .sheet_index = 0, .out_path = "/tmp/x.xlsx", .cell_value_json = "1" };
+        // Dummy out path — set-cell rejects on missing --ref before
+        // ever attempting to write, so this never hits the filesystem.
+        const a: Args = .{ .file = src_path, .subcommand = .set_cell, .sheet_index = 0, .out_path = "unused.xlsx", .cell_value_json = "1" };
         try std.testing.expectEqual(@as(u8, 1), try runSetCellCommand(std.testing.allocator, a, &err_w));
     }
     {
         var err_w = std.Io.Writer.fixed(&err_buf);
-        const a: Args = .{ .file = src_path, .subcommand = .set_cell, .sheet_index = 0, .out_path = "/tmp/x.xlsx", .cell_ref = "A1" };
+        const a: Args = .{ .file = src_path, .subcommand = .set_cell, .sheet_index = 0, .out_path = "unused.xlsx", .cell_ref = "A1" };
         try std.testing.expectEqual(@as(u8, 1), try runSetCellCommand(std.testing.allocator, a, &err_w));
     }
 }
@@ -3947,11 +3972,13 @@ test "parseColLettersToOneBased: A=1, Z=26, AA=27, XFD=16384, XFE rejected" {
 }
 
 test "runRowEditCommand insert-row + delete-row round-trip" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_cli_row_edit_src.xlsx";
-    const dst_path = "/tmp/zlsx_cli_row_edit_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "cli_row_edit_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "cli_row_edit_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -3991,15 +4018,17 @@ test "runRowEditCommand insert-row + delete-row round-trip" {
 }
 
 test "runAddSheetCommand + runRenameSheetCommand + runDeleteSheetCommand round-trip" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_cli_sheet_ops_src.xlsx";
-    const after_add = "/tmp/zlsx_cli_sheet_ops_add.xlsx";
-    const after_rename = "/tmp/zlsx_cli_sheet_ops_rename.xlsx";
-    const after_delete = "/tmp/zlsx_cli_sheet_ops_delete.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(after_add) catch {};
-    defer std.fs.cwd().deleteFile(after_rename) catch {};
-    defer std.fs.cwd().deleteFile(after_delete) catch {};
+    const src_path = try tt.path(std.testing.allocator, "cli_sheet_ops_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const after_add = try tt.path(std.testing.allocator, "cli_sheet_ops_add.xlsx");
+    defer std.testing.allocator.free(after_add);
+    const after_rename = try tt.path(std.testing.allocator, "cli_sheet_ops_rename.xlsx");
+    defer std.testing.allocator.free(after_rename);
+    const after_delete = try tt.path(std.testing.allocator, "cli_sheet_ops_delete.xlsx");
+    defer std.testing.allocator.free(after_delete);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -4495,8 +4524,10 @@ test "parseArgs --start-row / --end-row round-trip and rejections" {
 }
 
 test "runCellsCommand --start-row / --end-row bound the emitted cell stream" {
-    const tmp_path = "/tmp/zlsx_cli_rowbounds_iter59b.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_rowbounds_iter59b.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -4612,8 +4643,10 @@ test "parseArgs --range round-trip and rejections" {
 }
 
 test "runCellsCommand --range filters by bounding rectangle" {
-    const tmp_path = "/tmp/zlsx_cli_range_iter59b2.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_range_iter59b2.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -4687,8 +4720,10 @@ test "runCellsCommand --range filters by bounding rectangle" {
 }
 
 test "runRowsCommand --range filters rows + masks out-of-range cells" {
-    const tmp_path = "/tmp/zlsx_cli_range_rows_iter59b2.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_range_rows_iter59b2.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -4785,8 +4820,10 @@ test "parseArgs --header scoping" {
 }
 
 test "runRowsCommand --header promotes first row and emits fields dict" {
-    const tmp_path = "/tmp/zlsx_cli_header_iter59b3.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_header_iter59b3.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -4830,8 +4867,10 @@ test "runRowsCommand --header promotes first row and emits fields dict" {
 }
 
 test "runRowsCommand --header duplicate header keys emitted verbatim" {
-    const tmp_path = "/tmp/zlsx_cli_header_dup_iter59b3.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_header_dup_iter59b3.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -4855,8 +4894,10 @@ test "runRowsCommand --header duplicate header keys emitted verbatim" {
 }
 
 test "runRowsCommand --header empty header cells fall back to col_<letter>" {
-    const tmp_path = "/tmp/zlsx_cli_header_empty_iter59b3.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_header_empty_iter59b3.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -4882,12 +4923,14 @@ test "runRowsCommand --header empty header cells fall back to col_<letter>" {
 }
 
 test "runRowsCommand --header + --range derives keys only from in-range cols" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Header row has 4 cells across A..D ("w","x","y","z"); a --range
     // B:C must consume only the B/C header cells and emit data dicts
     // keyed exactly {"x","y"} — no `col_A` / `col_D` leak from the
     // masked full-width view.
-    const tmp_path = "/tmp/zlsx_cli_header_range_iter59b3.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "cli_header_range_iter59b3.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -4923,14 +4966,16 @@ test "runRowsCommand --header + --range derives keys only from in-range cols" {
 }
 
 test "runRowsCommand --include-blanks on csv/header is a no-op for blank rows" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Tight contract per iter59b-4 P2 follow-up: --include-blanks
     // preserves all-blank rows ONLY on the envelope (.jsonl) path.
     // On csv / tsv / legacy-jsonl / legacy-jsonl-dict the flag is a
     // documented no-op and must NOT inject extra blank output lines.
     // On --header the flag is also a no-op — a blank row must not
     // promote to a `col_*`-keyed header.
-    const tmp_path = "/tmp/zlsx_cli_blanks_flat_iter59b4.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "cli_blanks_flat_iter59b4.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -4958,11 +5003,13 @@ test "runRowsCommand --include-blanks on csv/header is a no-op for blank rows" {
 }
 
 test "runRowsCommand --range + --include-blanks keeps blank-only ranged rows" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // A row with data only in A/D (both outside the B:C range) and
     // --include-blanks must still emit with two t:"blank" cells —
     // the whole point of --include-blanks is to surface empties.
-    const tmp_path = "/tmp/zlsx_cli_range_blank_iter59b4.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "cli_range_blank_iter59b4.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -4997,6 +5044,8 @@ test "runRowsCommand --range + --include-blanks keeps blank-only ranged rows" {
 }
 
 test "writeTerseStyleBlock doesn't leak empty border for diagonal-only sides" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Codex P2: a cell whose border has ONLY the diagonal side set
     // must not serialize `"border":{}` — the terse emitter omits
     // diagonal entirely, so emitting an empty border object would
@@ -5004,8 +5053,8 @@ test "writeTerseStyleBlock doesn't leak empty border for diagonal-only sides" {
     // Zig writer attaches a default font to every styled cell
     // (which may have a color), but the "border" key must never
     // appear with an empty object.
-    const tmp_path = "/tmp/zlsx_cli_diag_only_iter59b4.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "cli_diag_only_iter59b4.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -5120,8 +5169,10 @@ test "parseArgs --with-styles scoping" {
 }
 
 test "runCellsCommand --include-blanks emits t:\"blank\" for empty cells" {
-    const tmp_path = "/tmp/zlsx_cli_blanks_iter59b4.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_blanks_iter59b4.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -5148,9 +5199,11 @@ test "runCellsCommand --include-blanks emits t:\"blank\" for empty cells" {
 }
 
 test "runCellsCommand without --include-blanks still skips empties" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Regression guard: default behaviour preserved when the flag is off.
-    const tmp_path = "/tmp/zlsx_cli_blanks_off_iter59b4.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "cli_blanks_off_iter59b4.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -5172,8 +5225,10 @@ test "runCellsCommand without --include-blanks still skips empties" {
 }
 
 test "runCellsCommand --with-styles emits terse style block for styled cells" {
-    const tmp_path = "/tmp/zlsx_cli_with_styles_iter59b4.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_with_styles_iter59b4.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -5216,8 +5271,10 @@ test "runCellsCommand --with-styles emits terse style block for styled cells" {
 }
 
 test "runRowsCommand --with-styles on envelope attaches style to per-cell records" {
-    const tmp_path = "/tmp/zlsx_cli_rows_styles_iter59b4.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_rows_styles_iter59b4.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -5252,8 +5309,10 @@ test "runRowsCommand --with-styles on envelope attaches style to per-cell record
 }
 
 test "runCellsCommand --skip / --take slice the emitted cell stream" {
-    const tmp_path = "/tmp/zlsx_cli_pagination_iter59a.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_pagination_iter59a.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -5345,8 +5404,10 @@ test "runMetaCommand emits path:null on non-UTF-8 workbook path" {
 }
 
 test "runListSheetsCommand emits one sheet record per sheet" {
-    const tmp_path = "/tmp/zlsx_cli_list_sheets_iter57.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_list_sheets_iter57.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -5375,8 +5436,10 @@ test "runListSheetsCommand emits one sheet record per sheet" {
 }
 
 test "runMetaCommand emits workbook record with sst/has_* fields then sheet records" {
-    const tmp_path = "/tmp/zlsx_cli_meta_iter57.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_meta_iter57.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -5443,12 +5506,14 @@ test "runMetaCommand emits workbook record with sst/has_* fields then sheet reco
 }
 
 test "legacy --list-sheets flag still emits plain text (regression guard)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Regression guard: the legacy plain-text shape is exactly
     // `<name>\n` per sheet, no JSON, no sub-command routing. This
     // mirrors the code path in main() line-for-line so the flag
     // keeps working across iter57.
-    const tmp_path = "/tmp/zlsx_cli_legacy_list_sheets.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "cli_legacy_list_sheets.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -5515,8 +5580,10 @@ test "parseArgs routes iter58 sub-commands correctly" {
 }
 
 test "runCommentsCommand emits one record per comment across every sheet" {
-    const tmp_path = "/tmp/zlsx_cli_comments_iter58.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_comments_iter58.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -5558,8 +5625,10 @@ test "runCommentsCommand emits one record per comment across every sheet" {
 }
 
 test "runValidationsCommand emits list validation with values array" {
-    const tmp_path = "/tmp/zlsx_cli_validations_iter58.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_validations_iter58.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -5589,8 +5658,10 @@ test "runValidationsCommand emits list validation with values array" {
 }
 
 test "runHyperlinksCommand emits url set + location null for external links" {
-    const tmp_path = "/tmp/zlsx_cli_hyperlinks_iter58.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_hyperlinks_iter58.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -5618,8 +5689,10 @@ test "runHyperlinksCommand emits url set + location null for external links" {
 }
 
 test "runStylesCommand emits one record per cell-XF entry" {
-    const tmp_path = "/tmp/zlsx_cli_styles_iter58.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_styles_iter58.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -5652,8 +5725,10 @@ test "runStylesCommand emits one record per cell-XF entry" {
 }
 
 test "runSstCommand emits one record per shared-string entry" {
-    const tmp_path = "/tmp/zlsx_cli_sst_iter58.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_sst_iter58.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -5950,8 +6025,10 @@ test "detectSubcommand skips --output value (value that collides with a sub-comm
 }
 
 test "runCellsAcrossSheets compact-ndjson emits per-sheet prologue and omits sheet/sheet_idx on cell records" {
-    const tmp_path = "/tmp/zlsx_cli_compact_cells_iter60b.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_compact_cells_iter60b.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -6021,8 +6098,10 @@ test "runCellsAcrossSheets compact-ndjson emits per-sheet prologue and omits she
 }
 
 test "runMetaCommand pretty-json collapses workbook + sheets into one JSON object" {
-    const tmp_path = "/tmp/zlsx_cli_pretty_meta_iter60b.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_pretty_meta_iter60b.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -6129,8 +6208,10 @@ test "globMatch literal / wildcards / edge cases" {
 }
 
 test "runCellsAcrossSheets --all-sheets emits every sheet with correct sheet_idx" {
-    const tmp_path = "/tmp/zlsx_cli_all_sheets_iter59c.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_all_sheets_iter59c.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -6159,8 +6240,10 @@ test "runCellsAcrossSheets --all-sheets emits every sheet with correct sheet_idx
 }
 
 test "runCellsAcrossSheets --sheet-glob selects only matching sheets" {
-    const tmp_path = "/tmp/zlsx_cli_glob_iter59c.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_glob_iter59c.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -6194,8 +6277,10 @@ test "runCellsAcrossSheets --sheet-glob selects only matching sheets" {
 }
 
 test "runCellsAcrossSheets --all-sheets --skip --take slices the cross-sheet stream" {
-    const tmp_path = "/tmp/zlsx_cli_cross_pag_iter59c.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_cross_pag_iter59c.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -6280,13 +6365,15 @@ test "writeErrorRecord sheet-scoped + workbook-scoped shapes (iter60c)" {
 }
 
 test "runCellsAcrossSheets emits inline kind:error for a malformed sheet and continues (iter60c)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Two-sheet workbook: sheet 0 valid, sheet 1's loaded XML is
     // hot-replaced after open with bytes that trip
     // `consumeRow → indexOfScalarPos('<') == null → error.MalformedXml`.
     // The CLI must emit one inline `kind:"error"` record at sheet
     // boundary, keep going, and exit cleanly (no propagation).
-    const tmp_path = "/tmp/zlsx_cli_iter60c_malformed.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "cli_iter60c_malformed.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -6337,8 +6424,10 @@ test "runCellsAcrossSheets emits inline kind:error for a malformed sheet and con
 }
 
 test "runCellsCommand single-sheet malformed sheet emits one error record without propagating (iter60c)" {
-    const tmp_path = "/tmp/zlsx_cli_iter60c_single.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_iter60c_single.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -6408,8 +6497,10 @@ test "writeRowEnvelope emits t:date inside cells array" {
 }
 
 test "runCellsCommand emits t:date for a date-styled numeric cell (iter61-a)" {
-    const tmp_path = "/tmp/zlsx_cli_iter61a_cells.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_iter61a_cells.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -6441,8 +6532,10 @@ test "runCellsCommand emits t:date for a date-styled numeric cell (iter61-a)" {
 }
 
 test "runRowsCommand envelope emits t:date inside cells array (iter61-a)" {
-    const tmp_path = "/tmp/zlsx_cli_iter61a_rows.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_iter61a_rows.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -6473,12 +6566,14 @@ test "runRowsCommand envelope emits t:date inside cells array (iter61-a)" {
 }
 
 test "runCellsCommand skips t:date auto-convert on 1904-epoch workbook" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // iter61-a P1 follow-up: workbooks with <workbookPr date1904="1"/>
     // shift every serial by 1462 days. Until proper 1904 decoding ships,
     // the CLI must NOT auto-convert these cells to t:"date" — the
     // numeric value is the authoritative signal.
-    const tmp_path = "/tmp/zlsx_cli_iter61a_date1904.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "cli_iter61a_date1904.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -6565,8 +6660,10 @@ test "runCellsCommand emits t:error for a t=\"e\" cell (iter61-c)" {
     // then post-inject a sheet1.xml carrying `<c t="e"><v>#DIV/0!</v></c>`
     // through `book.sheet_data`. The same allocator handles free on
     // deinit.
-    const tmp_path = "/tmp/zlsx_cli_iter61c_error.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_iter61c_error.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -6614,8 +6711,10 @@ test "runCellsCommand emits t:error for a t=\"e\" cell (iter61-c)" {
 }
 
 test "runRowsCommand envelope emits t:error inside cells array (iter61-c)" {
-    const tmp_path = "/tmp/zlsx_cli_iter61c_error_rows.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "cli_iter61c_error_rows.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -6826,11 +6925,13 @@ test "Rows.formulaStrings returns entity-decoded text (iter61-b P2)" {
 }
 
 test "runCellsCommand emits t:formula for stand-alone, shared-base, shared-slave (iter61-b)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Mirror the iter60c / iter61-c post-injection trick: write a valid
     // workbook, then replace sheet1.xml with a hand-crafted blob that
     // exercises all three formula shapes in one row.
-    const tmp_path = "/tmp/zlsx_cli_iter61b_formula.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "cli_iter61b_formula.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -6906,13 +7007,15 @@ test "runCellsCommand emits t:formula for stand-alone, shared-base, shared-slave
 }
 
 test "runCellsCommand emits t:formula with formula_ref for array-formula slaves" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Same post-injection trick: write a workbook then replace the
     // sheet body. C2 is the array base (=A2:A4*B2:B4 with ref=C2:C4);
     // C3 + C4 carry only cached <v> bodies. Reader must spread the
     // array formula context to the slaves so all three rows surface
     // as t:"formula" records.
-    const tmp_path = "/tmp/zlsx_cli_array_spread.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "cli_array_spread.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);

@@ -9318,10 +9318,10 @@ const TestTmp = struct {
     pub fn deinit(self: *TestTmp) void {
         self.dir.cleanup();
     }
-    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, name: []const u8) ![]u8 {
+    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
         const d = try self.dir.dir.realpathAlloc(alloc, ".");
         defer alloc.free(d);
-        return std.fs.path.join(alloc, &.{ d, name });
+        return std.fs.path.joinZ(alloc, &.{ d, name });
     }
 };
 
@@ -9552,8 +9552,10 @@ test "Book.hyperlinks: round-trip through writer + reader" {
 }
 
 test "Book.dataValidations: round-trip through writer + reader" {
-    const tmp_path = "/tmp/zlsx_reader_dv_roundtrip.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "reader_dv_roundtrip.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -9598,8 +9600,10 @@ test "Book.dataValidations: round-trip through writer + reader" {
 }
 
 test "Book.dataValidations: numeric + custom round-trip kind / op / formula1 / formula2" {
-    const tmp_path = "/tmp/zlsx_reader_dv_numeric_roundtrip.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "reader_dv_numeric_roundtrip.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -9666,8 +9670,10 @@ test "Book.dataValidations: numeric + custom round-trip kind / op / formula1 / f
 }
 
 test "Book.dataValidations: empty slice for sheets without validations" {
-    const tmp_path = "/tmp/zlsx_reader_no_dv.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "reader_no_dv.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -9684,8 +9690,10 @@ test "Book.dataValidations: empty slice for sheets without validations" {
 }
 
 test "writer.addComment: emits comments that round-trip through Book.comments" {
-    const tmp_path = "/tmp/zlsx_writer_comments_roundtrip.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_comments_roundtrip.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -9723,8 +9731,10 @@ test "writer.addComment: emits comments that round-trip through Book.comments" {
 }
 
 test "writer.addComment: XML-special chars in author + text round-trip via entity-decoding" {
-    const tmp_path = "/tmp/zlsx_comments_xml_special.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "comments_xml_special.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -9746,8 +9756,10 @@ test "writer.addComment: XML-special chars in author + text round-trip via entit
 }
 
 test "writer.addComment: multi-sheet with comments keeps per-sheet rels independent" {
-    const tmp_path = "/tmp/zlsx_comments_multi_sheet.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "comments_multi_sheet.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -9783,8 +9795,10 @@ test "writer.addComment: multi-sheet with comments keeps per-sheet rels independ
 }
 
 test "writer.addComment: 50 comments in one sheet stress-test authors + rels" {
-    const tmp_path = "/tmp/zlsx_comments_stress.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "comments_stress.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -9819,8 +9833,10 @@ test "writer.addComment: 50 comments in one sheet stress-test authors + rels" {
 }
 
 test "writer.writeRichRow: emits rich-text SST entries readable by Book.richRuns" {
-    const tmp_path = "/tmp/zlsx_writer_rich_roundtrip.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_rich_roundtrip.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -9958,9 +9974,11 @@ test "parseSharedStrings: phonetic <rPh> annotations are dropped from visible te
 }
 
 test "openSstLazy: phonetic <rPh> annotations are dropped from materialised text" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const tmp_path = "/tmp/zlsx_lazy_rph.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "lazy_rph.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         // Build a minimal workbook with one cell, then patch the
         // SST entry to include a `<rPh>` annotation by direct
@@ -10059,9 +10077,11 @@ test "parseSharedStrings: hostile uniqueCount is capped against XML size" {
 }
 
 test "openSstLazy: lazy SST resolves on demand and matches eager (iter-sst-3b)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const tmp_path = "/tmp/zlsx_open_sst_lazy.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "open_sst_lazy.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     // Build a workbook with a handful of distinct shared strings so
     // both backends have non-trivial work to do.
@@ -10171,11 +10191,13 @@ test "openSstLazy: rich-runs eagerly captured on lazy backend (iter-sst-3b)" {
 }
 
 test "Editor: byte-identical passthrough (iter-lms-1)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_editor_src.xlsx";
-    const dst_path = "/tmp/zlsx_editor_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "editor_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "editor_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
 
     // Build a non-trivial workbook so the round-trip exercises real
     // ZIP shape (multiple entries: workbook.xml, worksheets, SST,
@@ -10229,9 +10251,11 @@ test "Editor: byte-identical passthrough (iter-lms-1)" {
 }
 
 test "Editor: raw-ZIP scanner builds entry table (iter-lms-1b)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_editor_scan.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "editor_scan.xlsx");
+    defer std.testing.allocator.free(src_path);
 
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -10271,11 +10295,13 @@ test "Editor: raw-ZIP scanner builds entry table (iter-lms-1b)" {
 }
 
 test "Editor: appendRows + save round-trips through reader (iter-lms-2)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_editor_append_src.xlsx";
-    const dst_path = "/tmp/zlsx_editor_append_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "editor_append_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "editor_append_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
 
     // Source workbook: 2 rows.
     {
@@ -10326,9 +10352,11 @@ test "Editor: appendRows + save round-trips through reader (iter-lms-2)" {
 }
 
 test "Editor: appendRows rejects out-of-range sheet idx + lossy ints" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_editor_append_reject.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "editor_append_reject.xlsx");
+    defer std.testing.allocator.free(src_path);
 
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -10351,11 +10379,13 @@ test "Editor: appendRows rejects out-of-range sheet idx + lossy ints" {
 }
 
 test "Editor: appendRows with string cells extends SST (iter-lms-3)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_editor_append_str_src.xlsx";
-    const dst_path = "/tmp/zlsx_editor_append_str_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "editor_append_str_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "editor_append_str_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
 
     // Source workbook with one string row so the SST exists.
     {
@@ -10412,11 +10442,13 @@ test "Editor: appendRows with string cells extends SST (iter-lms-3)" {
 }
 
 test "Editor: SST-less workbook gets fresh sharedStrings.xml on string append" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_editor_sstless_src.xlsx";
-    const dst_path = "/tmp/zlsx_editor_sstless_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "editor_sstless_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "editor_sstless_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
 
     // Build a workbook (the Zig writer always emits sharedStrings.xml).
     {
@@ -10485,9 +10517,11 @@ test "Editor: SST-less workbook gets fresh sharedStrings.xml on string append" {
 }
 
 test "Editor: scanWorksheet returns one span per <c> element (iter-cm-1)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_scan_basic.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "scan_basic.xlsx");
+    defer std.testing.allocator.free(src_path);
 
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -10526,9 +10560,11 @@ test "Editor: scanWorksheet returns one span per <c> element (iter-cm-1)" {
 }
 
 test "Editor: scanWorksheet (row,col) matches Book.rows on every cell" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_scan_roundtrip.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "scan_roundtrip.xlsx");
+    defer std.testing.allocator.free(src_path);
 
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -10589,11 +10625,13 @@ test "scanWorksheetXml: pretty-printed cells (newline after <c) + r-less rows" {
 }
 
 test "Editor: setCell replaces a numeric cell in place (iter-cm-2a)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_setcell_basic_src.xlsx";
-    const dst_path = "/tmp/zlsx_setcell_basic_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "setcell_basic_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "setcell_basic_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
 
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -10627,11 +10665,13 @@ test "Editor: setCell replaces a numeric cell in place (iter-cm-2a)" {
 }
 
 test "Editor: setCell with strings emits inline-string cells (iter-cm-2b)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_setcell_str_src.xlsx";
-    const dst_path = "/tmp/zlsx_setcell_str_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "setcell_str_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "setcell_str_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
 
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -10662,11 +10702,13 @@ test "Editor: setCell with strings emits inline-string cells (iter-cm-2b)" {
 }
 
 test "Editor: setCell inserts a missing cell into an existing row (iter-cm-2c)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_setcell_insert.xlsx";
-    const dst_path = "/tmp/zlsx_setcell_insert_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "setcell_insert.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "setcell_insert_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -10699,11 +10741,13 @@ test "Editor: setCell inserts a missing cell into an existing row (iter-cm-2c)" 
 }
 
 test "Editor: setCell inserts a missing row at the right position (iter-cm-2d)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_setcell_row_insert.xlsx";
-    const dst_path = "/tmp/zlsx_setcell_row_insert_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "setcell_row_insert.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "setcell_row_insert_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -10740,13 +10784,15 @@ test "Editor: setCell inserts a missing row at the right position (iter-cm-2d)" 
 }
 
 test "Editor: setCell rejects when source has style or formula metadata" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Codex caught: pre-fix, setCell rewrote a styled or formula
     // cell as a canonical <c>, silently dropping s="N"/<f> state.
     // Now reject up front so callers know they need a future
     // attr-preserving variant.
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_setcell_metadata_src.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "setcell_metadata_src.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -10781,6 +10827,8 @@ test "Editor: setCell rejects when source has style or formula metadata" {
 }
 
 test "Editor: setCell handles empty <row r=N/> rows without duplicating" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Build a sheet with a self-closing row in the middle. The
     // writer doesn't emit those, so synthesise via XML rewrite of
     // a save (write a normal sheet, then test the helper directly
@@ -10788,10 +10836,10 @@ test "Editor: setCell handles empty <row r=N/> rows without duplicating" {
     // round-trip a writer-emitted body row through Editor + verify
     // setCell on a row-with-cells doesn't duplicate.
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_setcell_empty_row.xlsx";
-    const dst_path = "/tmp/zlsx_setcell_empty_row_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "setcell_empty_row.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "setcell_empty_row_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -10826,14 +10874,16 @@ test "Editor: setCell handles empty <row r=N/> rows without duplicating" {
 }
 
 test "Editor: setCell populates an empty <sheetData/> worksheet" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Write a workbook with only header cells, no body — produces
     // <sheetData/> in some readers' canonical form. Assert setCell
     // expands it to <sheetData></sheetData> form transparently.
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_setcell_empty_sd.xlsx";
-    const dst_path = "/tmp/zlsx_setcell_empty_sd_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "setcell_empty_sd.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "setcell_empty_sd_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
 
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -10863,11 +10913,13 @@ test "Editor: setCell populates an empty <sheetData/> worksheet" {
 }
 
 test "Editor: addSheet appends a new sheet and round-trips through reader (iter-sheet-1)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_addsheet_src.xlsx";
-    const dst_path = "/tmp/zlsx_addsheet_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "addsheet_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "addsheet_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -10898,14 +10950,16 @@ test "Editor: addSheet appends a new sheet and round-trips through reader (iter-
 }
 
 test "Editor: addSheet escapes quotes in name attribute" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Codex P1: pre-fix, names with `"` produced malformed
     // workbook.xml (`name="He said "Hi""`). Use attr-escape that
     // covers `"` → `&quot;`.
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_addsheet_quote.xlsx";
-    const dst_path = "/tmp/zlsx_addsheet_quote_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "addsheet_quote.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "addsheet_quote_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -10927,11 +10981,13 @@ test "Editor: addSheet escapes quotes in name attribute" {
 }
 
 test "Editor: insertColumn shifts existing cells right (iter-col-3)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_insertcol_src.xlsx";
-    const dst_path = "/tmp/zlsx_insertcol_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "insertcol_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "insertcol_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -10958,11 +11014,13 @@ test "Editor: insertColumn shifts existing cells right (iter-col-3)" {
 }
 
 test "Editor: deleteColumn drops a column + shifts everything right of it left" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_deletecol_src.xlsx";
-    const dst_path = "/tmp/zlsx_deletecol_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "deletecol_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "deletecol_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11130,11 +11188,13 @@ test "applyColEditToWorksheet collapses single-cell dimension on col delete" {
 }
 
 test "Editor: insertRow shifts existing rows down (iter-row-2)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_insertrow_src.xlsx";
-    const dst_path = "/tmp/zlsx_insertrow_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "insertrow_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "insertrow_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11167,11 +11227,13 @@ test "Editor: insertRow shifts existing rows down (iter-row-2)" {
 }
 
 test "Editor: deleteRow removes a row + shifts everything below up" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_deleterow_src.xlsx";
-    const dst_path = "/tmp/zlsx_deleterow_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "deleterow_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "deleterow_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11199,9 +11261,11 @@ test "Editor: deleteRow removes a row + shifts everything below up" {
 }
 
 test "Editor: insertRow rejects sheets carrying formulas globally" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_row_unsafe.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "row_unsafe.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11216,9 +11280,11 @@ test "Editor: insertRow rejects sheets carrying formulas globally" {
 }
 
 test "Editor: row/col edits refuse when another sheet has a cross-sheet hyperlink" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_xref_hyperlink.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "xref_hyperlink.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11242,9 +11308,11 @@ test "Editor: row/col edits refuse when another sheet has a cross-sheet hyperlin
 }
 
 test "Editor: row/col edits refuse on sheets with frozen panes" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_pane_unsafe.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "pane_unsafe.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11263,9 +11331,11 @@ test "Editor: row/col edits refuse on sheets with frozen panes" {
 }
 
 test "Editor: deleteSheet refuses while column edits are queued" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_delsheet_after_col.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "delsheet_after_col.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11282,9 +11352,11 @@ test "Editor: deleteSheet refuses while column edits are queued" {
 }
 
 test "Editor: deleteSheet refuses while row edits are queued" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_delsheet_after_row.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "delsheet_after_row.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11302,9 +11374,11 @@ test "Editor: deleteSheet refuses while row edits are queued" {
 }
 
 test "Editor: appendRows + setCell refuse after queued row/col edit" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_append_after_coledit.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "append_after_coledit.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11341,9 +11415,11 @@ test "Editor: appendRows + setCell refuse after queued row/col edit" {
 }
 
 test "Editor: row edits refuse when ANY sheet has a formula (cross-sheet)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_row_xsheet_formula.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "row_xsheet_formula.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11365,11 +11441,13 @@ test "Editor: row edits refuse when ANY sheet has a formula (cross-sheet)" {
 }
 
 test "Editor: deleteSheet drops a source sheet (iter-sheet-3)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_delete_src.xlsx";
-    const dst_path = "/tmp/zlsx_delete_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "delete_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "delete_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11395,11 +11473,13 @@ test "Editor: deleteSheet drops a source sheet (iter-sheet-3)" {
 }
 
 test "Editor: deleteSheet drops a pending-new sheet" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_delete_new.xlsx";
-    const dst_path = "/tmp/zlsx_delete_new_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "delete_new.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "delete_new_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11420,13 +11500,15 @@ test "Editor: deleteSheet drops a pending-new sheet" {
 }
 
 test "Editor: deleteSheet preserves order of other pending-new sheets" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Codex P1: swapRemove reordered remaining new sheets. orderedRemove
     // keeps them aligned with sheet_paths' tail.
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_delete_order.xlsx";
-    const dst_path = "/tmp/zlsx_delete_order_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "delete_order.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "delete_order_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11451,13 +11533,15 @@ test "Editor: deleteSheet preserves order of other pending-new sheets" {
 }
 
 test "Editor: deleteSheet frees name for reuse via addSheet" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Codex P2: pre-fix, addSheet rejected reuse of a deleted
     // source sheet's name as DuplicateSheetName.
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_delete_reuse.xlsx";
-    const dst_path = "/tmp/zlsx_delete_reuse_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "delete_reuse.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "delete_reuse_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11481,9 +11565,11 @@ test "Editor: deleteSheet frees name for reuse via addSheet" {
 }
 
 test "Editor: deleteSheet rejects last-sheet" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_delete_last.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "delete_last.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11497,9 +11583,11 @@ test "Editor: deleteSheet rejects last-sheet" {
 }
 
 test "Editor: deleteSheet rejects dirty state" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_delete_dirty.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "delete_dirty.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11514,11 +11602,13 @@ test "Editor: deleteSheet rejects dirty state" {
 }
 
 test "Editor: renameSheet renames an existing sheet (iter-sheet-2)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_rename_src.xlsx";
-    const dst_path = "/tmp/zlsx_rename_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "rename_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "rename_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11542,9 +11632,11 @@ test "Editor: renameSheet renames an existing sheet (iter-sheet-2)" {
 }
 
 test "Editor: renameSheet rejects duplicates and invalid names" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_rename_reject.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "rename_reject.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11566,11 +11658,13 @@ test "Editor: renameSheet rejects duplicates and invalid names" {
 }
 
 test "Editor: renameSheet supports undo (rename A->B then B->A)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_rename_undo.xlsx";
-    const dst_path = "/tmp/zlsx_rename_undo_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "rename_undo.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "rename_undo_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11592,14 +11686,16 @@ test "Editor: renameSheet supports undo (rename A->B then B->A)" {
 }
 
 test "Editor: renameSheet persists case-only changes" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Excel uniqueness is case-insensitive but the displayed
     // casing matters. asciiEqlFold short-circuit dropped legit
     // case-only renames pre-fix.
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_rename_case.xlsx";
-    const dst_path = "/tmp/zlsx_rename_case_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "rename_case.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "rename_case_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11619,13 +11715,15 @@ test "Editor: renameSheet persists case-only changes" {
 }
 
 test "Editor: rename + add reuses names freed by earlier renames" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Codex P2: pre-fix, rotate / swap rename workflows were
     // rejected because the dup check only saw raw source names.
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_rename_rotate.xlsx";
-    const dst_path = "/tmp/zlsx_rename_rotate_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "rename_rotate.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "rename_rotate_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11653,11 +11751,13 @@ test "Editor: rename + add reuses names freed by earlier renames" {
 }
 
 test "Editor: renameSheet on a pending-new sheet mutates in place" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_rename_new.xlsx";
-    const dst_path = "/tmp/zlsx_rename_new_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "rename_new.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "rename_new_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11679,14 +11779,16 @@ test "Editor: renameSheet on a pending-new sheet mutates in place" {
 }
 
 test "Editor: appendRows works on freshly-added sheets" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Codex P1: pre-fix, save() failed with SheetEntryNotFound when
     // appendRows targeted a sheet created via addSheet, because the
     // pending_appends loop assumed every sheet had a source entry.
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_addsheet_append.xlsx";
-    const dst_path = "/tmp/zlsx_addsheet_append_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "addsheet_append.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "addsheet_append_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11719,9 +11821,11 @@ test "Editor: appendRows works on freshly-added sheets" {
 }
 
 test "Editor: scanWorksheet works on freshly-added sheets (iter-sheet-1)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_scan_new_sheet.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "scan_new_sheet.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11740,12 +11844,14 @@ test "Editor: scanWorksheet works on freshly-added sheets (iter-sheet-1)" {
 }
 
 test "Editor: addSheet handles XML-escaped duplicate names (R&D)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // The source workbook stores `R&D` as `name="R&amp;D"` in
     // workbook.xml. Pre-fix, sheetNameExists compared raw bytes
     // and accepted the duplicate. Now decode entities first.
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_addsheet_amp.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "addsheet_amp.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11761,14 +11867,16 @@ test "Editor: addSheet handles XML-escaped duplicate names (R&D)" {
 }
 
 test "Editor: addSheet allocates non-colliding ids across multiple calls" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Codex caught: pre-fix, two addSheet calls in one session
     // produced duplicate rIds / sheetIds / sheet paths because the
     // max scan only looked at the source.
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_addsheet_seq_src.xlsx";
-    const dst_path = "/tmp/zlsx_addsheet_seq_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "addsheet_seq_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "addsheet_seq_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11807,9 +11915,11 @@ test "Editor: addSheet allocates non-colliding ids across multiple calls" {
 }
 
 test "Editor: addSheet duplicate names are case-insensitive" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_addsheet_case.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "addsheet_case.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11829,9 +11939,11 @@ test "Editor: addSheet duplicate names are case-insensitive" {
 }
 
 test "Editor: addSheet rejects invalid + duplicate names" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_addsheet_reject.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "addsheet_reject.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11849,11 +11961,13 @@ test "Editor: addSheet rejects invalid + duplicate names" {
 }
 
 test "Editor: setCells applies a batch in source order (iter-cm-3)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_setcells_batch.xlsx";
-    const dst_path = "/tmp/zlsx_setcells_batch_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "setcells_batch.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "setcells_batch_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11887,13 +12001,15 @@ test "Editor: setCells applies a batch in source order (iter-cm-3)" {
 }
 
 test "Editor: setCell amortises decompress across many calls (iter-cm-2a)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Lazy-init the MutatedSheet on first call; subsequent calls
     // mutate the cached buffer.
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_setcell_many.xlsx";
-    const dst_path = "/tmp/zlsx_setcell_many_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "setcell_many.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "setcell_many_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
 
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -11933,9 +12049,11 @@ test "Editor: setCell amortises decompress across many calls (iter-cm-2a)" {
 }
 
 test "Editor: setCell rejects unsupported cases (iter-cm-2a)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_setcell_reject.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "setcell_reject.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11961,9 +12079,11 @@ test "Editor: setCell rejects unsupported cases (iter-cm-2a)" {
 }
 
 test "Editor: appendRows rejects sheets with pending setCell mutations" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_setcell_then_append.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "setcell_then_append.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -11981,12 +12101,14 @@ test "Editor: appendRows rejects sheets with pending setCell mutations" {
 }
 
 test "Editor: scanWorksheet sees setCell mutations (no stale read)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Codex caught: pre-fix, scanWorksheet decompressed from
     // src_buf and ignored pending_mutations. A setCell-then-scan
     // workflow got pre-mutation spans.
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_setcell_then_scan.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "setcell_then_scan.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -12014,12 +12136,14 @@ test "Editor: scanWorksheet sees setCell mutations (no stale read)" {
 }
 
 test "Editor: scanWorksheet rejects sheets with unsaved appendRows" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // The scanner reads from src_buf and would silently miss rows
     // queued in pending_appends. Contract: reject so callers can't
     // act on a stale span set.
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_scan_pending.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "scan_pending.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -12041,9 +12165,11 @@ test "Editor: scanWorksheet rejects sheets with unsaved appendRows" {
 }
 
 test "Editor: scanWorksheet rejects out-of-range sheet idx" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const src_path = "/tmp/zlsx_scan_oor.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
+    const src_path = try tt.path(std.testing.allocator, "scan_oor.xlsx");
+    defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
@@ -12139,13 +12265,15 @@ test "updateDimension widens row + column bounds together" {
 }
 
 test "Rows.parseDate: auto-convert date-styled cells through the reader" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // iter46 convenience: instead of chaining styleIndices +
     // isDateFormat + fromExcelSerial, callers just call parseDate.
     // Must return null for non-date-styled numbers, null for
     // string cells, and the correct DateTime for date-styled
     // numerics.
-    const tmp_path = "/tmp/zlsx_rows_parse_date.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "rows_parse_date.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -12193,13 +12321,15 @@ test "Rows.parseDate: auto-convert date-styled cells through the reader" {
 }
 
 test "Book.numberFormat + isDateFormat: built-in, custom, and per-cell style lookup" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Write a workbook with a styled column, then read it back and
     // check that every moving part lines up: styles.xml is extracted,
     // cellXfs is parsed, per-cell `s="N"` is tracked via
     // Rows.styleIndices(), numberFormat() resolves built-ins + custom,
     // and isDateFormat() gets the heuristic right.
-    const tmp_path = "/tmp/zlsx_reader_numfmt.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "reader_numfmt.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -12246,8 +12376,10 @@ test "Book.numberFormat + isDateFormat: built-in, custom, and per-cell style loo
 }
 
 test "Book.cellFont: round-trips bold / color / size / name from xl/styles.xml" {
-    const tmp_path = "/tmp/zlsx_reader_cell_font.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "reader_cell_font.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -12610,8 +12742,10 @@ test "parseStyles: custom numFmt formatCode is XML-entity decoded" {
 }
 
 test "Book.cellBorder: round-trip sided styles + color through writer" {
-    const tmp_path = "/tmp/zlsx_reader_cell_border.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "reader_cell_border.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -12657,8 +12791,10 @@ test "Book.cellBorder: round-trip sided styles + color through writer" {
 }
 
 test "Book.cellFill: round-trip solid fg/bg and pattern 'none' default" {
-    const tmp_path = "/tmp/zlsx_reader_cell_fill.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "reader_cell_fill.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -12739,8 +12875,10 @@ test "Book.richRuns: color / size / font_name from <rPr>" {
 }
 
 test "Book.hyperlinks: internal hyperlinks (location) round-trip + mixed external/internal" {
-    const tmp_path = "/tmp/zlsx_reader_internal_hyperlinks.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "reader_internal_hyperlinks.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -12785,8 +12923,10 @@ test "Book.hyperlinks: internal hyperlinks (location) round-trip + mixed externa
 }
 
 test "Book.hyperlinks: internal-only sheet (no _rels file needed)" {
-    const tmp_path = "/tmp/zlsx_reader_internal_only.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "reader_internal_only.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -12808,8 +12948,10 @@ test "Book.hyperlinks: internal-only sheet (no _rels file needed)" {
 }
 
 test "Book.hyperlinks: empty slice for sheets without hyperlinks" {
-    const tmp_path = "/tmp/zlsx_reader_no_hyperlinks.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "reader_no_hyperlinks.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -12826,8 +12968,10 @@ test "Book.hyperlinks: empty slice for sheets without hyperlinks" {
 }
 
 test "Book.mergedRanges: empty slice for sheets without merges" {
-    const tmp_path = "/tmp/zlsx_reader_no_merged.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "reader_no_merged.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -13196,6 +13340,8 @@ test "fuzz parseCommentsForSheet" {
 }
 
 test "fuzz writer.addComment: adversarial author + text never crash emission" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Writer-side fuzz: random bytes fed into addComment (ref, author,
     // text). The ref path is the interesting one — a bad ref returns
     // InvalidCommentRef before the author/text ever reach the emit
@@ -13208,8 +13354,8 @@ test "fuzz writer.addComment: adversarial author + text never crash emission" {
     var buf: [fuzz_max_input_len]u8 = undefined;
 
     const writer = @import("writer.zig");
-    const tmp_path = "/tmp/zlsx_fuzz_addcomment.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "fuzz_addcomment.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     for (0..iters) |_| {
         const input = randomInput(rng, &buf);
@@ -13232,6 +13378,8 @@ test "fuzz writer.addComment: adversarial author + text never crash emission" {
 }
 
 test "fuzz writer.addConditionalFormat + addDxf: adversarial inputs never crash emission" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Writer-side fuzz for iter40-41 surfaces. Random bytes feed
     // into addConditionalFormatCellIs / Expression (range / formula
     // slots) + addDxf (argb values). Most random ranges get
@@ -13243,8 +13391,8 @@ test "fuzz writer.addConditionalFormat + addDxf: adversarial inputs never crash 
     var buf: [fuzz_max_input_len]u8 = undefined;
 
     const writer = @import("writer.zig");
-    const tmp_path = "/tmp/zlsx_fuzz_addcf.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "fuzz_addcf.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     const ops = [_]writer.CfOperator{
         .less_than,          .equal,                 .greater_than,
@@ -13702,11 +13850,13 @@ test "Rows.currentRowNumber falls through to yield count when row body is empty"
 // ─── iter54 slice B: lazy sheet / comments extraction ───────────────
 
 test "openLazy path loads sheets lazily, yields identical state to open()" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // Build a small multi-sheet workbook with merged ranges, hyperlinks,
     // data validations, and comments so every per-sheet side-index gets
     // a round-trip comparison.
-    const tmp_path = "/tmp/zlsx_iter54_lazy_struct.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "iter54_lazy_struct.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -13766,8 +13916,10 @@ test "openLazy path loads sheets lazily, yields identical state to open()" {
 }
 
 test "openLazy -> ensureSheetLoaded is idempotent" {
-    const tmp_path = "/tmp/zlsx_iter54_lazy_idempotent.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "iter54_lazy_idempotent.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -13803,8 +13955,10 @@ test "openLazy -> ensureSheetLoaded is idempotent" {
 }
 
 test "openLazy parses workbook-wide styles + theme (no sheet load required)" {
-    const tmp_path = "/tmp/zlsx_iter54_lazy_styles.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "iter54_lazy_styles.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -13834,8 +13988,10 @@ test "openLazy parses workbook-wide styles + theme (no sheet load required)" {
 }
 
 test "streamSheet: out-of-range index errors, valid index hits cache on Book.open" {
-    const tmp_path = "/tmp/zlsx_iter54_stream_sheet.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "iter54_stream_sheet.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -13867,8 +14023,10 @@ test "streamSheet: out-of-range index errors, valid index hits cache on Book.ope
 }
 
 test "streamSheet: lazily materializes a single sheet on openLazy" {
-    const tmp_path = "/tmp/zlsx_iter54_stream_lazy.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "iter54_stream_lazy.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -13897,8 +14055,10 @@ test "streamSheet: lazily materializes a single sheet on openLazy" {
 }
 
 test "preloadSheet populates per-sheet metadata without rows() iteration" {
-    const tmp_path = "/tmp/zlsx_iter54_preload_sheet.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "iter54_preload_sheet.xlsx");
+    defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
         var w = writer.Writer.init(std.testing.allocator);
@@ -14129,8 +14289,10 @@ test "array-formula spread: base without <v> still spreads to slaves" {
 // ─── SheetMatrix tests ───────────────────────────────────────────────
 
 test "Book.materialiseSheet: dense matrix matches streaming rows()" {
-    const tmp_path = "/tmp/zlsx_materialise_basic.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "materialise_basic.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -14221,8 +14383,10 @@ test "Book.materialiseSheet: dense matrix matches streaming rows()" {
 }
 
 test "Book.materialiseSheet: testing.allocator confirms zero leaks" {
-    const tmp_path = "/tmp/zlsx_materialise_leakcheck.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "materialise_leakcheck.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -14255,8 +14419,10 @@ test "Book.materialiseSheet: testing.allocator confirms zero leaks" {
 }
 
 test "Book.materialiseSheet: empty sheet yields zero rows" {
-    const tmp_path = "/tmp/zlsx_materialise_empty.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "materialise_empty.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");

@@ -1243,6 +1243,25 @@ export fn zlsx_matrix_data(
 
 // ─── Tests ───────────────────────────────────────────────────────────
 
+/// Per-test temporary file helper. Same shape as the helpers in
+/// src/writer.zig / xlsx.zig / cli.zig — replaces hard-coded /tmp
+/// paths so the suite is portable to Windows. Caller frees the
+/// returned slice; `defer tt.deinit()` cleans up the directory.
+const TestTmp = struct {
+    dir: std.testing.TmpDir,
+    pub fn init() TestTmp {
+        return .{ .dir = std.testing.tmpDir(.{}) };
+    }
+    pub fn deinit(self: *TestTmp) void {
+        self.dir.cleanup();
+    }
+    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
+        const d = try self.dir.dir.realpathAlloc(alloc, ".");
+        defer alloc.free(d);
+        return std.fs.path.joinZ(alloc, &.{ d, name });
+    }
+};
+
 test "abi version" {
     try std.testing.expectEqual(@as(u32, 1), zlsx_abi_version());
 }
@@ -2512,8 +2531,10 @@ export fn zlsx_sheet_writer_add_comment(
 // ─── Writer tests ────────────────────────────────────────────────────
 
 test "writer: round-trip via reader" {
-    const tmp_path = "/tmp/zlsx_c_abi_writer_roundtrip.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "c_abi_writer_roundtrip.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     var err_buf: [128]u8 = undefined;
 
@@ -2544,7 +2565,7 @@ test "writer: round-trip via reader" {
     try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_write_row(sw.?, &row2, row2.len, &err_buf, err_buf.len));
 
     // Save.
-    try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w.?, tmp_path, tmp_path.len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w.?, tmp_path.ptr, tmp_path.len, &err_buf, err_buf.len));
 
     // Read it back through the public API.
     var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
@@ -2561,8 +2582,10 @@ test "writer: round-trip via reader" {
 }
 
 test "reader C ABI: data_validation getters round-trip" {
-    const tmp_path = "/tmp/zlsx_c_abi_reader_dv.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "c_abi_reader_dv.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = xlsx.Writer.init(std.testing.allocator);
@@ -2615,8 +2638,10 @@ test "reader C ABI: data_validation getters round-trip" {
 }
 
 test "writer C ABI: add_data_validation_numeric + custom round-trip via reader" {
-    const tmp_path = "/tmp/zlsx_c_abi_writer_dv_ext.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "c_abi_writer_dv_ext.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     var err_buf: [128]u8 = undefined;
     const w = zlsx_writer_create(&err_buf, err_buf.len);
@@ -2732,7 +2757,7 @@ test "writer C ABI: add_data_validation_numeric + custom round-trip via reader" 
         .{ .tag = @intFromEnum(CellTag.string), .str_len = hdr.len, .str_ptr = hdr.ptr, .i = 0, .f = 0, .b = 0, ._pad = [_]u8{0} ** 7 },
     };
     try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_write_row(sw.?, &row, row.len, &err_buf, err_buf.len));
-    try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w.?, tmp_path, tmp_path.len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w.?, tmp_path.ptr, tmp_path.len, &err_buf, err_buf.len));
 
     // Read it back and verify every field via the reader C ABI.
     const book = zlsx_book_open(tmp_path.ptr, &err_buf, err_buf.len);
@@ -2767,10 +2792,12 @@ test "writer C ABI: add_data_validation_numeric + custom round-trip via reader" 
 }
 
 test "reader C ABI: cell_font + cell_fill + cell_border + styleIndices + numFmt getters round-trip" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
     // iter28-32 added styles-surface exports — this test hits the C
     // layer directly (separate from Python coverage in test_basic.py).
-    const tmp_path = "/tmp/zlsx_c_abi_cell_styles.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const tmp_path = try tt.path(std.testing.allocator, "c_abi_cell_styles.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = xlsx.Writer.init(std.testing.allocator);
@@ -2871,8 +2898,10 @@ test "reader C ABI: cell_font + cell_fill + cell_border + styleIndices + numFmt 
 }
 
 test "reader C ABI: merged_range + hyperlink getters round-trip" {
-    const tmp_path = "/tmp/zlsx_c_abi_reader_meta.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "c_abi_reader_meta.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     // Build a workbook with merges + hyperlinks through the Zig writer,
     // then read it back through the C ABI and verify every field.
@@ -2948,8 +2977,10 @@ test "reader C ABI: merged_range + hyperlink getters round-trip" {
 }
 
 test "writer C ABI: add_merged_cell round-trips + rejects bad ranges" {
-    const tmp_path = "/tmp/zlsx_c_abi_merged_cell.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "c_abi_merged_cell.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     var err_buf: [128]u8 = undefined;
 
@@ -2994,7 +3025,7 @@ test "writer C ABI: add_merged_cell round-trips + rejects bad ranges" {
     };
     _ = empty_bytes;
     try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_write_row(sw.?, &row, row.len, &err_buf, err_buf.len));
-    try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w.?, tmp_path, tmp_path.len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w.?, tmp_path.ptr, tmp_path.len, &err_buf, err_buf.len));
 
     var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
     defer book.deinit();
@@ -3174,8 +3205,10 @@ fn fuzzSeedCabi() u64 {
 }
 
 test "writer C ABI: write_row_with_formulas round-trips through reader" {
-    const tmp_path = "/tmp/zlsx_c_abi_write_formulas.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "c_abi_write_formulas.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     var err_buf: [128]u8 = undefined;
     const w = zlsx_writer_create(&err_buf, err_buf.len);
@@ -3208,7 +3241,7 @@ test "writer C ABI: write_row_with_formulas round-trips through reader" {
             err_buf.len,
         ),
     );
-    try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w.?, tmp_path, tmp_path.len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w.?, tmp_path.ptr, tmp_path.len, &err_buf, err_buf.len));
 
     // Read back through the Zig reader, confirm formula text + cached value.
     var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
@@ -3262,8 +3295,10 @@ test "writer C ABI: write_row_with_formulas round-trips through reader" {
 }
 
 test "writer C ABI: add_hyperlink + add_internal_hyperlink round-trip" {
-    const tmp_path = "/tmp/zlsx_c_abi_hyperlink_writer.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "c_abi_hyperlink_writer.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     var err_buf: [128]u8 = undefined;
     const w = zlsx_writer_create(&err_buf, err_buf.len);
@@ -3302,7 +3337,7 @@ test "writer C ABI: add_hyperlink + add_internal_hyperlink round-trip" {
         .{ .tag = @intFromEnum(CellTag.string), .str_len = x.len, .str_ptr = x.ptr, .i = 0, .f = 0, .b = 0, ._pad = [_]u8{0} ** 7 },
     };
     try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_write_row(sw.?, &row, row.len, &err_buf, err_buf.len));
-    try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w.?, tmp_path, tmp_path.len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w.?, tmp_path.ptr, tmp_path.len, &err_buf, err_buf.len));
 
     // Read back through the Zig reader, confirm both hyperlinks survived.
     var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
@@ -3334,10 +3369,12 @@ test "writer C ABI: add_hyperlink + add_internal_hyperlink round-trip" {
 }
 
 test "editor C ABI: open + append_row + save round-trip" {
-    const src_path = "/tmp/zlsx_c_abi_editor_src.xlsx";
-    const dst_path = "/tmp/zlsx_c_abi_editor_dst.xlsx";
-    defer std.fs.cwd().deleteFile(src_path) catch {};
-    defer std.fs.cwd().deleteFile(dst_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "c_abi_editor_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "c_abi_editor_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
 
     // Build a source workbook through the writer.
     {
@@ -3495,9 +3532,15 @@ test "fuzz writer via C ABI: random operations round-trip" {
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var tmp_path_buf: [64]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "/tmp/zlsx_fuzz_cabi_{x}.xlsx", .{seed});
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
 
+    defer tt.deinit();
+
+    const _fuzz_name = std.fmt.bufPrint(&tmp_path_buf, "fuzz_cabi_{x}.xlsx", .{seed}) catch unreachable;
+
+    const tmp_path = try tt.path(std.testing.allocator, _fuzz_name);
+
+    defer std.testing.allocator.free(tmp_path);
     var err_buf: [128]u8 = undefined;
 
     for (0..iters) |_| {
@@ -3705,9 +3748,15 @@ test "fuzz C ABI writer: NULL err_buf + zero-cell rows" {
 
     const seed = fuzzSeedCabi();
     var tmp_buf: [64]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(&tmp_buf, "/tmp/zlsx_fuzz_cabi_nullbuf_{x}.xlsx", .{seed});
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
 
+    defer tt.deinit();
+
+    const _fuzz_name = std.fmt.bufPrint(&tmp_buf, "fuzz_cabi_nullbuf_{x}.xlsx", .{seed}) catch unreachable;
+
+    const tmp_path = try tt.path(std.testing.allocator, _fuzz_name);
+
+    defer std.testing.allocator.free(tmp_path);
     for (0..iters / 50) |_| {
         const w = zlsx_writer_create(null, 0);
         try std.testing.expect(w != null);
