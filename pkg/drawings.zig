@@ -116,7 +116,7 @@ pub fn imageAnchors(store: *PartStore, allocator: std.mem.Allocator) ![]ImageAnc
 
     // Walk every sheet part.
     for (store.parts) |sheet_part| {
-        if (!isSheetPart(sheet_part.name)) continue;
+        if (!isSheetPart(sheet_part)) continue;
         try collectFromSheet(store, allocator, sheet_part, &out);
     }
 
@@ -141,22 +141,24 @@ pub fn chartAnchors(store: *PartStore, allocator: std.mem.Allocator) ![]ChartAnc
         out.deinit(allocator);
     }
     for (store.parts) |sheet_part| {
-        if (!isSheetPart(sheet_part.name)) continue;
+        if (!isSheetPart(sheet_part)) continue;
         try collectChartsFromSheet(store, allocator, sheet_part, &out);
     }
     return out.toOwnedSlice(allocator);
 }
 
-fn isSheetPart(name: []const u8) bool {
-    // Match `xl/worksheets/sheet<digit>...xml`. The trailing-digit
-    // requirement filters out `xl/worksheets/sheetMetadata.xml`
-    // (Excel 2013+ value-metadata) and any future `sheet<word>.xml`
-    // sibling that lives in the same directory but isn't a sheet.
-    const prefix = "xl/worksheets/sheet";
-    if (!std.mem.startsWith(u8, name, prefix)) return false;
-    if (!std.mem.endsWith(u8, name, ".xml")) return false;
-    if (name.len <= prefix.len) return false;
-    return std.ascii.isDigit(name[prefix.len]);
+/// OOXML worksheet content type (with and without the strict
+/// suffix variant). Detection by content type is authoritative —
+/// non-Microsoft producers can name their worksheet parts anything
+/// they declare in workbook.xml.rels, so the legacy
+/// `xl/worksheets/sheet<N>.xml` filename heuristic misses those.
+const ct_worksheet = "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml";
+
+fn isSheetPart(part: store_mod.Part) bool {
+    if (part.content_type) |ct| {
+        if (std.mem.eql(u8, ct, ct_worksheet)) return true;
+    }
+    return false;
 }
 
 fn collectFromSheet(
@@ -346,9 +348,30 @@ fn attrValueWithQuote(attrs: []const u8, key: []const u8, quote: u8) ?[]const u8
 /// element is always self-closing in OOXML and lives at sheet scope
 /// (one per sheet at most).
 fn findDrawingRid(sheet_xml: []const u8) ?[]const u8 {
-    const tag = std.mem.indexOf(u8, sheet_xml, "<drawing ") orelse return null;
+    const tag = findOpeningTag(sheet_xml, "drawing") orelse return null;
     const tag_end = std.mem.indexOfScalarPos(u8, sheet_xml, tag, '>') orelse return null;
     return attrValue(sheet_xml[tag .. tag_end + 1], "r:id");
+}
+
+/// Find the start of an opening tag named `name` in `xml`, tolerating
+/// XML whitespace (space / tab / LF / CR) or `/`/`>` after the name.
+/// `<drawing\nr:id="rId1"/>` is valid XML; the previous literal
+/// "<drawing " search missed it and silently dropped anchors on
+/// well-formed workbooks emitted by non-Microsoft producers.
+fn findOpeningTag(xml: []const u8, name: []const u8) ?usize {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, i, "<")) |lt| {
+        const after_name = lt + 1 + name.len;
+        if (after_name >= xml.len) return null;
+        if (std.mem.eql(u8, xml[lt + 1 .. after_name], name)) {
+            const c = xml[after_name];
+            if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '/' or c == '>') {
+                return lt;
+            }
+        }
+        i = lt + 1;
+    }
+    return null;
 }
 
 /// Find the value of `r:embed` on the `<a:blip r:embed="rIdN" ...>`
@@ -570,5 +593,22 @@ test "findDrawingRid + findBlipEmbed tolerate single quotes" {
     try std.testing.expectEqualStrings(
         "rId9",
         findBlipEmbed("<xdr:pic><a:blip r:embed='rId9'/></xdr:pic>").?,
+    );
+}
+
+test "findDrawingRid tolerates XML whitespace after tag name" {
+    // `<drawing\n r:id=...>` and `<drawing\tr:id=...>` are valid XML.
+    try std.testing.expectEqualStrings(
+        "rId7",
+        findDrawingRid("<sheet><drawing\nr:id=\"rId7\"/></sheet>").?,
+    );
+    try std.testing.expectEqualStrings(
+        "rId8",
+        findDrawingRid("<sheet><drawing\tr:id=\"rId8\"/></sheet>").?,
+    );
+    // <drawingthing ...> is NOT a drawing tag — must not match.
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        findDrawingRid("<sheet><drawingthing r:id=\"rIdX\"/></sheet>"),
     );
 }
