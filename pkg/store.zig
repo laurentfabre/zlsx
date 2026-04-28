@@ -991,12 +991,64 @@ fn parseRelationships(arena: std.mem.Allocator, xml: []const u8) ![]Relationship
             .internal;
 
         try out.append(arena, .{
-            .id = try arena.dupe(u8, id),
-            .type = try arena.dupe(u8, rtype),
-            .target = try arena.dupe(u8, target),
+            .id = try decodeXmlEntities(arena, id),
+            .type = try decodeXmlEntities(arena, rtype),
+            // Target gets the same treatment — `Target="../media/logo&amp;1.png"`
+            // must resolve to the ZIP part `xl/media/logo&1.png`, not
+            // the literal `&amp;` form. Without this, `store.resolve`
+            // silently misses any image / chart whose archive name
+            // contains `&` / `<` / `>` / `"` / `'`.
+            .target = try decodeXmlEntities(arena, target),
             .target_mode = target_mode,
         });
         i = end + 1;
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Decode the five canonical XML entities (`&amp; &lt; &gt; &quot;
+/// &apos;`) into their literal forms, returning a fresh arena-owned
+/// slice. Numeric character references (`&#N;` / `&#xN;`) and other
+/// named entities are passed through verbatim — not used in OOXML
+/// rels in practice, and surfacing them as-is matches what the
+/// reader does on the .xml.rels side.
+fn decodeXmlEntities(arena: std.mem.Allocator, s: []const u8) ![]u8 {
+    if (std.mem.indexOfScalar(u8, s, '&') == null) return arena.dupe(u8, s);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(arena);
+    try out.ensureTotalCapacity(arena, s.len);
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '&') {
+            const remain = s[i..];
+            if (std.mem.startsWith(u8, remain, "&amp;")) {
+                out.appendAssumeCapacity('&');
+                i += 5;
+                continue;
+            }
+            if (std.mem.startsWith(u8, remain, "&lt;")) {
+                out.appendAssumeCapacity('<');
+                i += 4;
+                continue;
+            }
+            if (std.mem.startsWith(u8, remain, "&gt;")) {
+                out.appendAssumeCapacity('>');
+                i += 4;
+                continue;
+            }
+            if (std.mem.startsWith(u8, remain, "&quot;")) {
+                out.appendAssumeCapacity('"');
+                i += 6;
+                continue;
+            }
+            if (std.mem.startsWith(u8, remain, "&apos;")) {
+                out.appendAssumeCapacity('\'');
+                i += 6;
+                continue;
+            }
+        }
+        out.appendAssumeCapacity(s[i]);
+        i += 1;
     }
     return out.toOwnedSlice(arena);
 }
@@ -1315,6 +1367,31 @@ test "PartStore.open: rejects split-disk EOCD" {
         Error.SplitArchiveNotSupported,
         PartStore.open(std.testing.allocator, path),
     );
+}
+
+test "decodeXmlEntities decodes the five canonical entities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Fast path: no entity → verbatim copy.
+    try std.testing.expectEqualStrings("hello", try decodeXmlEntities(a, "hello"));
+
+    // The five canonical entities.
+    try std.testing.expectEqualStrings("a&b", try decodeXmlEntities(a, "a&amp;b"));
+    try std.testing.expectEqualStrings("<", try decodeXmlEntities(a, "&lt;"));
+    try std.testing.expectEqualStrings(">", try decodeXmlEntities(a, "&gt;"));
+    try std.testing.expectEqualStrings("\"", try decodeXmlEntities(a, "&quot;"));
+    try std.testing.expectEqualStrings("'", try decodeXmlEntities(a, "&apos;"));
+
+    // Real-world OOXML rels target with embedded `&`.
+    try std.testing.expectEqualStrings(
+        "../media/logo&1.png",
+        try decodeXmlEntities(a, "../media/logo&amp;1.png"),
+    );
+
+    // Unknown entity passes through verbatim.
+    try std.testing.expectEqualStrings("&unknown;", try decodeXmlEntities(a, "&unknown;"));
 }
 
 test "looksExternal classifies URL / UNC / drive-letter targets" {
