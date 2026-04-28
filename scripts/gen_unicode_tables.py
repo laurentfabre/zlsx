@@ -2,30 +2,38 @@
 """
 A1 (post-0.2.9 roadmap): Unicode table generator.
 
-Reads `CaseFolding.txt` from the Unicode Character Database and
-emits a vendored Zig data file that powers `src/unicode/casefold.zig`.
+Two operating modes:
 
-Policy: **non-Turkic full case fold**. Includes status `C` (common /
-simple) and `F` (full); excludes `S` (simple-only alternative) and
-`T` (Turkic).
+  --mode casefold:
+    Reads `CaseFolding.txt` and emits a vendored Zig data file
+    powering `src/unicode/casefold.zig`. Policy: non-Turkic full
+    case fold (statuses C + F).
+
+  --mode nfc:
+    Reads `UnicodeData.txt` + `CompositionExclusions.txt` and emits
+    a vendored Zig data file powering `src/unicode/nfc.zig`.
+    Includes:
+      - canonical decomposition mappings (UnicodeData col 5,
+        excluding `<compat>` prefixed entries);
+      - canonical combining class (UnicodeData col 3);
+      - composition pairs (inverted decomposition map minus
+        Composition_Exclusions).
+
+    Hangul (U+AC00..U+D7A3) is handled algorithmically by the
+    runtime — its 11172 codepoints stay out of the table.
 
 Usage:
-    scripts/gen_unicode_tables.py \\
+    scripts/gen_unicode_tables.py --mode casefold \\
         --input /path/to/CaseFolding.txt \\
         --output src/unicode/tables/casefold_data.zig
 
-Output schema (target file):
-    pub const unicode_version = "17.0.0";
-    pub const FoldEntry = struct { from: u21, len: u8, offset: u32 };
-    pub const fold_entries: []const FoldEntry = &.{...};   // sorted by `.from`
-    pub const fold_scalars: []const u21 = &.{...};         // pool
+    scripts/gen_unicode_tables.py --mode nfc \\
+        --input /path/to/UnicodeData.txt \\
+        --excl /path/to/CompositionExclusions.txt \\
+        --output src/unicode/tables/nfc_data.zig
 
-Each `FoldEntry` says: codepoint `from` folds to the slice
-`fold_scalars[offset..offset+len]`. Entries are sorted by `from` so
-runtime lookup is binary-search O(log N).
-
-Tests + build: emit alongside a .zon manifest with the source URL
-and SHA-256 of the input so the generation is reproducible.
+Each generated file pins the Unicode version + SHA-256 of every
+input in its header so re-generation is reproducible.
 """
 from __future__ import annotations
 
@@ -127,16 +135,195 @@ def emit_zig(
     print(f"gen_unicode_tables: {len(entries)} entries, {len(pool)} pool scalars → {out_path}")
 
 
+UNICODE_DATA_LINE = re.compile(
+    r"^(?P<code>[0-9A-F]+);"
+    r"(?P<name>[^;]*);"
+    r"(?P<gc>[^;]*);"
+    r"(?P<ccc>[0-9]+);"
+    r"(?P<bidi>[^;]*);"
+    r"(?P<decomp>[^;]*);"
+)
+
+
+def parse_unicode_data(path: Path) -> tuple[
+    list[tuple[int, list[int]]],   # canonical decompositions
+    dict[int, int],                # ccc map
+]:
+    """Extract canonical decomposition mappings + canonical combining
+    class from `UnicodeData.txt`. Skips compatibility decompositions
+    (those whose mapping starts with `<...>`)."""
+    decomps: list[tuple[int, list[int]]] = []
+    ccc: dict[int, int] = {}
+    with path.open() as f:
+        for line in f:
+            m = UNICODE_DATA_LINE.match(line)
+            if not m:
+                continue
+            cp = int(m.group("code"), 16)
+            ccc_val = int(m.group("ccc"))
+            if ccc_val != 0:
+                ccc[cp] = ccc_val
+            decomp_field = m.group("decomp").strip()
+            if not decomp_field or decomp_field.startswith("<"):
+                # Empty or compatibility — skip.
+                continue
+            mapping = [int(c, 16) for c in decomp_field.split()]
+            decomps.append((cp, mapping))
+    return decomps, ccc
+
+
+def parse_composition_exclusions(path: Path) -> set[int]:
+    """Read `CompositionExclusions.txt` — each line lists a codepoint
+    whose canonical decomposition must NOT be re-composed by NFC."""
+    out: set[int] = set()
+    with path.open() as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            # Range or single?
+            if ".." in line:
+                lo, hi = line.split("..")
+                for cp in range(int(lo, 16), int(hi, 16) + 1):
+                    out.add(cp)
+            else:
+                out.add(int(line, 16))
+    return out
+
+
+def emit_nfc_zig(
+    out_path: Path,
+    version: str,
+    decomps: list[tuple[int, list[int]]],
+    ccc: dict[int, int],
+    exclusions: set[int],
+    digests: dict[str, str],
+) -> None:
+    """Render `nfc_data.zig` with three tables:
+      - decomp_entries: canonical decomposition lookup (sorted by `from`)
+      - ccc_entries: combining class lookup (sorted by `cp`)
+      - compose_entries: pair → composed codepoint (sorted by `(starter, combining)`)
+    """
+    # Sort decompositions by source codepoint.
+    decomps.sort(key=lambda e: e[0])
+    decomp_pool: list[int] = []
+    decomp_records: list[tuple[int, int, int]] = []  # (from, len, offset)
+    for cp, mapping in decomps:
+        offset = len(decomp_pool)
+        decomp_pool.extend(mapping)
+        decomp_records.append((cp, len(mapping), offset))
+
+    # CCC entries sorted by codepoint.
+    ccc_records = sorted(ccc.items())
+
+    # Build composition pairs from canonical decompositions, except:
+    #  - skip if codepoint is in CompositionExclusions;
+    #  - skip non-pair decompositions (only `pair` decomps compose);
+    #  - skip if first codepoint has non-zero CCC (must be a starter).
+    compose_pairs: list[tuple[int, int, int]] = []  # (starter, combining, composed)
+    for cp, mapping in decomps:
+        if cp in exclusions:
+            continue
+        if len(mapping) != 2:
+            continue
+        starter, combining = mapping
+        if ccc.get(starter, 0) != 0:
+            continue
+        compose_pairs.append((starter, combining, cp))
+    compose_pairs.sort(key=lambda e: (e[0], e[1]))
+
+    lines = [
+        "// AUTO-GENERATED by scripts/gen_unicode_tables.py — DO NOT EDIT",
+        "// Source files (UCD):",
+        "//   https://www.unicode.org/Public/UCD/latest/ucd/UnicodeData.txt",
+        "//   https://www.unicode.org/Public/UCD/latest/ucd/CompositionExclusions.txt",
+    ]
+    for k, v in digests.items():
+        lines.append(f"// SHA-256 of {k}: {v}")
+    lines.extend([
+        f"// Unicode version: {version}",
+        "",
+        f'pub const unicode_version: []const u8 = "{version}";',
+        "",
+        "/// Hangul algorithmic ranges — handled at runtime, not via tables.",
+        "pub const hangul_syllable_base: u21 = 0xAC00;",
+        "pub const hangul_syllable_count: u21 = 11172;",
+        "pub const hangul_l_base: u21 = 0x1100;",
+        "pub const hangul_v_base: u21 = 0x1161;",
+        "pub const hangul_t_base: u21 = 0x11A7;",
+        "pub const hangul_l_count: u21 = 19;",
+        "pub const hangul_v_count: u21 = 21;",
+        "pub const hangul_t_count: u21 = 28;",
+        "",
+        "pub const DecompEntry = struct { from: u21, len: u8, offset: u32 };",
+        "pub const decomp_entries: []const DecompEntry = &.{",
+    ])
+    for cp, length, offset in decomp_records:
+        lines.append(f"    .{{ .from = 0x{cp:04X}, .len = {length}, .offset = {offset} }},")
+    lines.append("};")
+    lines.append("")
+    lines.append("pub const decomp_scalars: []const u21 = &.{")
+    for i in range(0, len(decomp_pool), 8):
+        chunk = ", ".join(f"0x{c:04X}" for c in decomp_pool[i : i + 8])
+        lines.append(f"    {chunk},")
+    lines.append("};")
+    lines.append("")
+    lines.append("pub const CccEntry = struct { cp: u21, ccc: u8 };")
+    lines.append("pub const ccc_entries: []const CccEntry = &.{")
+    for cp, c in ccc_records:
+        lines.append(f"    .{{ .cp = 0x{cp:04X}, .ccc = {c} }},")
+    lines.append("};")
+    lines.append("")
+    lines.append("pub const ComposeEntry = struct { starter: u21, combining: u21, composed: u21 };")
+    lines.append("pub const compose_entries: []const ComposeEntry = &.{")
+    for s, c, comp in compose_pairs:
+        lines.append(f"    .{{ .starter = 0x{s:04X}, .combining = 0x{c:04X}, .composed = 0x{comp:04X} }},")
+    lines.append("};")
+    lines.append("")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines))
+    print(
+        f"gen_unicode_tables(nfc): {len(decomp_records)} decomp, "
+        f"{len(ccc_records)} ccc, {len(compose_pairs)} compose pairs → {out_path}"
+    )
+
+
+def parse_unicode_version_from_data(path: Path) -> str:
+    """UnicodeData.txt has no version header. Use the path's
+    sibling Derived files or just hard-code current. Better: read
+    UCD's ReadMe.txt, but for now derive from CaseFolding.txt's
+    version pin since the generator is run alongside it."""
+    return "17.0.0"
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--input", type=Path, required=True, help="Path to CaseFolding.txt")
-    p.add_argument("--output", type=Path, required=True, help="Path to generated .zig file")
+    p.add_argument("--mode", choices=["casefold", "nfc"], default="casefold")
+    p.add_argument("--input", type=Path, required=True)
+    p.add_argument("--excl", type=Path, default=None, help="CompositionExclusions.txt (NFC only)")
+    p.add_argument("--output", type=Path, required=True)
     args = p.parse_args()
 
-    raw = args.input.read_bytes()
-    digest = hashlib.sha256(raw).hexdigest()
-    version, entries = parse_input(args.input)
-    emit_zig(args.output, version, entries, digest)
+    if args.mode == "casefold":
+        raw = args.input.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        version, entries = parse_input(args.input)
+        emit_zig(args.output, version, entries, digest)
+        return 0
+
+    # NFC mode.
+    if args.excl is None:
+        print("gen_unicode_tables: --mode nfc requires --excl", file=sys.stderr)
+        return 2
+    decomps, ccc = parse_unicode_data(args.input)
+    exclusions = parse_composition_exclusions(args.excl)
+    version = parse_unicode_version_from_data(args.input)
+    digests = {
+        args.input.name: hashlib.sha256(args.input.read_bytes()).hexdigest(),
+        args.excl.name: hashlib.sha256(args.excl.read_bytes()).hexdigest(),
+    }
+    emit_nfc_zig(args.output, version, decomps, ccc, exclusions, digests)
     return 0
 
 

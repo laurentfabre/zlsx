@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const tables = @import("tables/casefold_data.zig");
+const nfc = @import("nfc.zig");
 
 /// Fully fold a UTF-8 string using non-Turkic full case folding.
 /// Returns owned bytes — caller frees.
@@ -60,15 +61,33 @@ pub fn eqlFolded(allocator: std.mem.Allocator, a: []const u8, b: []const u8) !bo
 // ─── Excel sheet-name API (no allocator required) ────────────────────
 
 /// Stack-bounded equality check for Excel sheet names. Excel caps
-/// sheet names at 31 scalars, so worst-case input + folded scratch
-/// fits comfortably in 1 KiB. Returns false on any allocation /
-/// UTF-8 / scratch-overflow error — the only legitimate use is
-/// dedup, where "I can't fold this safely" should mean "treat as
-/// distinct" rather than fail-loud.
+/// sheet names at 31 scalars, so worst-case input + folded + NFC'd
+/// scratch fits comfortably in 2 KiB. Returns false on any
+/// allocation / UTF-8 / scratch-overflow error — the only
+/// legitimate use is dedup, where "I can't fold this safely"
+/// should mean "treat as distinct" rather than fail-loud.
+///
+/// Pipeline: `NFC(casefold(name))`. NFC handles composed-vs-
+/// decomposed equivalents (e.g. `café` precomposed vs
+/// `cafe + combining-acute`); casefold handles case-insensitivity.
+/// Pure ASCII fast-paths through both layers.
 pub fn excelSheetNameEql(a: []const u8, b: []const u8) bool {
-    var buf: [1024]u8 = undefined;
+    // ASCII fast path: skip both folds entirely.
+    if (isAscii(a) and isAscii(b)) {
+        if (a.len != b.len) return false;
+        for (a, b) |ca, cb| {
+            if (asciiLower(ca) != asciiLower(cb)) return false;
+        }
+        return true;
+    }
+    var buf: [2048]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
-    return eqlFolded(fba.allocator(), a, b) catch false;
+    const alloc = fba.allocator();
+    const fa = foldString(alloc, a) catch return false;
+    const fb = foldString(alloc, b) catch return false;
+    const na = nfc.normalize(alloc, fa) catch return false;
+    const nb = nfc.normalize(alloc, fb) catch return false;
+    return std.mem.eql(u8, na, nb);
 }
 
 /// Count Unicode scalar values in a UTF-8 string. Used to enforce

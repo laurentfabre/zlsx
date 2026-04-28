@@ -96,8 +96,8 @@ pub fn build(b: *std.Build) void {
     const writer_tests = b.addTest(.{ .root_module = writer_mod });
     test_step.dependOn(&b.addRunArtifact(writer_tests).step);
 
-    // Unicode case-fold module tests (A1: Excel sheet-name dedup
-    // helpers, wired into validateSheetName + Editor.isSheetNameTaken).
+    // Unicode case-fold + NFC module tests (A1: Excel sheet-name
+    // dedup, wired into validateSheetName + Editor.isSheetNameTaken).
     const unicode_mod = b.createModule(.{
         .root_source_file = b.path("src/unicode/casefold.zig"),
         .target = target,
@@ -105,6 +105,17 @@ pub fn build(b: *std.Build) void {
     });
     const unicode_tests = b.addTest(.{ .root_module = unicode_mod });
     test_step.dependOn(&b.addRunArtifact(unicode_tests).step);
+
+    // A1 phase 3: standalone NFC tests (the casefold module imports
+    // nfc.zig but has its own tests; this catches NFC bugs that
+    // wouldn't surface through the casefold compositional path).
+    const nfc_mod = b.createModule(.{
+        .root_source_file = b.path("src/unicode/nfc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const nfc_tests = b.addTest(.{ .root_module = nfc_mod });
+    test_step.dependOn(&b.addRunArtifact(nfc_tests).step);
 
     // ─── Package layer (B0 + C2a) ───────────────────────────────
     //

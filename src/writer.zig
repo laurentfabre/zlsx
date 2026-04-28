@@ -4740,6 +4740,25 @@ test "Writer: addSheet rejects Unicode-fold-equivalent duplicates (A1)" {
     try std.testing.expectError(error.DuplicateSheetName, w3.addSheet("στοχος"));
 }
 
+test "Writer: addSheet treats composed/decomposed Unicode as duplicate (A1 phase 3 NFC)" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    // Add the precomposed form first.
+    _ = try w.addSheet("café"); // U+0063 U+0061 U+0066 U+00E9
+    // The decomposed form (e + combining acute) must be treated
+    // as a duplicate after NFC normalisation.
+    try std.testing.expectError(
+        error.DuplicateSheetName,
+        w.addSheet("cafe\u{0301}"),
+    );
+    // Reverse direction: opening with decomposed, then trying
+    // precomposed.
+    var w2 = Writer.init(std.testing.allocator);
+    defer w2.deinit();
+    _ = try w2.addSheet("cafe\u{0301}");
+    try std.testing.expectError(error.DuplicateSheetName, w2.addSheet("café"));
+}
+
 test "Writer: addSheet validates Unicode scalar count (not bytes) for 31-char limit (A1)" {
     var w = Writer.init(std.testing.allocator);
     defer w.deinit();
