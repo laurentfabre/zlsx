@@ -60,7 +60,7 @@ const money = try w.addStyle(.{ .number_format = "$#,##0.00" });
 
 var sheet_w = try w.addSheet("Summary");
 try sheet_w.setColumnWidth(0, 24);
-sheet_w.freezePanes(1, 0);
+try sheet_w.freezePanes(1, 0);
 try sheet_w.setAutoFilter("A1:C1");
 // For merged header spans: `try sheet_w.addMergedCell("A3:C3");`
 try sheet_w.writeRowStyled(
