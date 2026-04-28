@@ -141,7 +141,7 @@ pub const PartStore = struct {
 
         // Resolve content types from `[Content_Types].xml`. Default
         // by extension, Override by part name (Override wins).
-        try resolveContentTypes(parts);
+        try resolveContentTypes(ar_alloc, parts);
 
         // Parse each `_rels/*.rels`. The result is keyed by the
         // owner part name (the document the rels file describes).
@@ -984,7 +984,7 @@ fn decompressPayload(
 
 // ─── Content types ─ [Content_Types].xml ─────────────────────────────
 
-fn resolveContentTypes(parts: []Part) !void {
+fn resolveContentTypes(arena: std.mem.Allocator, parts: []Part) !void {
     const ct_part = blk: {
         for (parts) |p| {
             if (std.mem.eql(u8, p.name, "[Content_Types].xml")) break :blk p;
@@ -1002,14 +1002,16 @@ fn resolveContentTypes(parts: []Part) !void {
     while (std.mem.indexOfPos(u8, xml, i, "<Default")) |pos| {
         const end = std.mem.indexOfScalarPos(u8, xml, pos, '>') orelse break;
         const attrs = xml[pos..end];
-        const ext = attrAtSlice(attrs, "Extension") orelse {
+        const ext_raw = attrAtSlice(attrs, "Extension") orelse {
             i = end + 1;
             continue;
         };
-        const ct = attrAtSlice(attrs, "ContentType") orelse {
+        const ct_raw = attrAtSlice(attrs, "ContentType") orelse {
             i = end + 1;
             continue;
         };
+        const ext = try decodeXmlEntities(arena, ext_raw);
+        const ct = try decodeXmlEntities(arena, ct_raw);
         // Apply default to every part with that extension.
         for (parts) |*p| {
             if (p.content_type != null) continue; // Override may set later
@@ -1021,14 +1023,22 @@ fn resolveContentTypes(parts: []Part) !void {
     while (std.mem.indexOfPos(u8, xml, i, "<Override")) |pos| {
         const end = std.mem.indexOfScalarPos(u8, xml, pos, '>') orelse break;
         const attrs = xml[pos..end];
-        const part_name = attrAtSlice(attrs, "PartName") orelse {
+        const part_name_raw = attrAtSlice(attrs, "PartName") orelse {
             i = end + 1;
             continue;
         };
-        const ct = attrAtSlice(attrs, "ContentType") orelse {
+        const ct_raw = attrAtSlice(attrs, "ContentType") orelse {
             i = end + 1;
             continue;
         };
+        // PartName / ContentType are XML attribute values: a `/`
+        // in a name appears literal but `&`, `<`, `>` etc must be
+        // escaped on wire. Decode before comparing against ZIP
+        // entry names (which carry the literal bytes), otherwise a
+        // part named `xl/a&b.xml` (escaped as `xl/a&amp;b.xml`)
+        // never matches and gets a null content_type.
+        const part_name = try decodeXmlEntities(arena, part_name_raw);
+        const ct = try decodeXmlEntities(arena, ct_raw);
         // PartName starts with `/`; strip to match part.name.
         const stripped = if (part_name.len > 0 and part_name[0] == '/') part_name[1..] else part_name;
         for (parts) |*p| {
@@ -1813,6 +1823,10 @@ test "PartStore.addPart: XML-escapes part name + content type into Content_Types
     // ...and must NOT contain the raw `&` in an attribute (otherwise
     // the XML is malformed).
     try std.testing.expect(std.mem.indexOf(u8, ct.bytes, "PartName=\"/xl/a&b.xml\"") == null);
+    // Round-trip: the part's content_type field must resolve too —
+    // resolveContentTypes decodes the escaped PartName back to the
+    // raw form so the lookup against the ZIP entry name succeeds.
+    try std.testing.expectEqualStrings("application/xml", got.content_type.?);
 }
 
 test "PartStore.addPart: rejects duplicate part name" {
