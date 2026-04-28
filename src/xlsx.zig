@@ -5468,7 +5468,7 @@ pub const Editor = struct {
                 }
             }
             // Compute body_start of the new cell.
-            const opening_gt = std.mem.indexOfScalar(u8, new_buf.items, '>') orelse unreachable;
+            const opening_gt = std.mem.indexOfScalar(u8, new_buf.items, '>') orelse return error.InternalInvariantBroken;
             const new_span: CellSpan = .{
                 .start = insert_at,
                 .end = insert_at + new_len,
@@ -6454,7 +6454,7 @@ fn insertCellIntoEmptyRow(
             }
             // The new cell starts where the old `/>` ended (replaced).
             const cell_abs_start = slash_pos + 1;
-            const opening_gt = std.mem.indexOfScalar(u8, cell_buf.items, '>') orelse unreachable;
+            const opening_gt = std.mem.indexOfScalar(u8, cell_buf.items, '>') orelse return error.InternalInvariantBroken;
             const new_span: CellSpan = .{
                 .start = cell_abs_start,
                 .end = cell_abs_start + cell_buf.items.len,
@@ -6484,7 +6484,7 @@ fn insertCellIntoEmptyRow(
                 s.body_start += cell_buf.items.len;
             }
         }
-        const opening_gt = std.mem.indexOfScalar(u8, cell_buf.items, '>') orelse unreachable;
+        const opening_gt = std.mem.indexOfScalar(u8, cell_buf.items, '>') orelse return error.InternalInvariantBroken;
         const new_span: CellSpan = .{
             .start = t.after_open,
             .end = t.after_open + cell_buf.items.len,
@@ -6617,7 +6617,7 @@ fn insertMissingRow(
     const cell_abs_end = insert_at + new_buf.items.len - "</row>".len;
     // body_start = position of '>' within the cell's opening tag.
     const cell_bytes = new_buf.items[cell_start_in_buf .. new_buf.items.len - "</row>".len];
-    const opening_gt_off = std.mem.indexOfScalar(u8, cell_bytes, '>') orelse unreachable;
+    const opening_gt_off = std.mem.indexOfScalar(u8, cell_bytes, '>') orelse return error.InternalInvariantBroken;
     const new_cell_span: CellSpan = .{
         .start = cell_abs_start,
         .end = cell_abs_end,
