@@ -54,6 +54,10 @@ pub fn build(b: *std.Build) void {
     const fuzz_step = b.step("fuzz", "Run coverage-guided fuzz targets (Linux x64; macOS/Windows broken upstream)");
     fuzz_step.dependOn(&b.addRunArtifact(unit_fuzz_tests).step);
 
+    // Package-layer fuzz module is wired further down, after
+    // writer_mod is created — see the `package_fuzz_mod` block
+    // near the package_mod / package_drawings_tests_mod section.
+
     // Integration tests: tests/xlsx_corpus.zig, fed by
     // scripts/fetch_test_corpus.sh into tests/corpus/.
     const corpus_mod = b.createModule(.{
@@ -179,6 +183,20 @@ pub fn build(b: *std.Build) void {
     package_drawings_tests_mod.addImport("writer", writer_mod);
     const package_drawings_tests = b.addTest(.{ .root_module = package_drawings_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_drawings_tests).step);
+
+    // Package-layer fuzz module: pkg/store.zig hosts fuzz targets
+    // for decodeXmlEntities + looksExternal. Same fuzz=true flag
+    // as src/xlsx.zig's unit_fuzz_mod, separate binary because
+    // the writer import + arena profile differs from the reader.
+    const package_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/store.zig"),
+        .target = target,
+        .optimize = optimize,
+        .fuzz = true,
+    });
+    package_fuzz_mod.addImport("writer", writer_mod);
+    const package_fuzz_tests = b.addTest(.{ .root_module = package_fuzz_mod });
+    fuzz_step.dependOn(&b.addRunArtifact(package_fuzz_tests).step);
 
     // tests/package_corpus.zig — corpus-level integration test for
     // the package layer. Imports `zlsx_pkg` and walks every fixture
