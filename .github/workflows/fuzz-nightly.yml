@@ -47,17 +47,27 @@ jobs:
           version: 0.15.2
 
       - name: Compile fuzz binary
-        # Build the test binary with -ffuzz instrumentation but DON'T
-        # run it yet — separate compile + run so a compile failure
-        # surfaces clearly distinct from a fuzz crash. Note: there's
+        # Build the test binary with -ffuzz instrumentation. There's
         # no clean way to compile-only without running in Zig 0.15.2
         # (`addRunArtifact` isn't separable from the test invocation
-        # at the build-step level). Run with a tiny corpus-only
-        # exposure so this finishes in seconds; a true compile-error
-        # would surface here as a non-zero exit, while the long
-        # fuzz session in the next step is what actually exercises
-        # the runner.
-        run: zig build fuzz --summary all
+        # at the build-step level), so wrap with `timeout` to bound
+        # the smoke-run that follows compilation. We just want a
+        # compile-error to surface here distinct from a fuzz crash —
+        # 60s is plenty for compilation; if the fuzzer is still
+        # running after compile, time out cleanly. Exit codes 124
+        # (TERM-on-timeout) and 143 (SIGTERM-killed) both indicate
+        # the wall-clock cap fired and the binary is healthy.
+        run: |
+          set +e
+          timeout --preserve-status --signal=TERM 60s zig build fuzz --summary all
+          rc=$?
+          set -e
+          if [[ "$rc" == "124" || "$rc" == "143" || "$rc" == "0" ]]; then
+            echo "::notice::fuzz binary compiled (smoke run rc=$rc)"
+            exit 0
+          fi
+          # Any other non-zero exit is a real compile or test failure.
+          exit "$rc"
 
       - name: Run fuzz session
         env:

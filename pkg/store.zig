@@ -623,12 +623,40 @@ fn findEocd(buf: []const u8) !usize {
     return Error.NotPkzip;
 }
 
+// ZIP-bomb defenses for `decompressPayload`. Both checks fire BEFORE
+// the upfront `arena.alloc(declared_uncompressed)` so a crafted CDFH
+// declaring multi-GB uncompressed size can't OOM the process.
+//
+//  - max_part_size: per-part hard cap. 512 MiB is ~4× larger than the
+//    biggest legitimate part observed in our corpus (~120 MiB SST in
+//    a 76 MiB workbook). xlsx files exceeding this almost certainly
+//    aren't legitimate single-file workbooks.
+//
+//  - max_deflate_ratio: sanity cap on declared_uncompressed /
+//    compressed. Real-world deflate hits ~1000:1 only on highly
+//    redundant payloads (long runs of zeros). 4096:1 is a generous
+//    margin that still blocks classic ZIP bombs (10MB compressed
+//    declaring 4GB uncompressed = 400:1 — far below the cap, so
+//    intentionally narrower bombs that fit within 4096:1 just have
+//    to actually contain ~250KB of plausible compressed data per
+//    1GB declared, at which point they're already being rate-limited
+//    by the LFH/CDFH signature and decompression cost themselves).
+const max_part_size: usize = 512 * 1024 * 1024;
+const max_deflate_ratio: usize = 4096;
+
 fn decompressPayload(
     arena: std.mem.Allocator,
     payload: []const u8,
     method: u16,
     declared_uncompressed: u32,
 ) ![]u8 {
+    if (declared_uncompressed > max_part_size) return Error.BadZip;
+    // Saturating multiply guards against `payload.len * ratio`
+    // overflow on pathological inputs. usize @ 64-bit can't reach
+    // saturation in practice, but this stays correct on 32-bit too.
+    const ratio_cap = std.math.mul(usize, payload.len, max_deflate_ratio) catch std.math.maxInt(usize);
+    if (declared_uncompressed > ratio_cap) return Error.BadZip;
+
     if (method == 0) {
         if (payload.len != declared_uncompressed) return Error.BadZip;
         return try arena.dupe(u8, payload);
@@ -1104,4 +1132,31 @@ test "PartStore.open: rejects non-PK file" {
     defer std.testing.allocator.free(path);
 
     try std.testing.expectError(Error.NotPkzip, PartStore.open(std.testing.allocator, path));
+}
+
+test "decompressPayload: rejects ZIP-bomb declared sizes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Tiny payload, declared > 512 MiB hard cap → BadZip.
+    const tiny = "x";
+    try std.testing.expectError(
+        Error.BadZip,
+        decompressPayload(a, tiny, 8, max_part_size + 1),
+    );
+
+    // Tiny payload, declared within hard cap but ratio > 4096:1 → BadZip.
+    // tiny is 1 byte so the ratio cap is 4096; declared = 8192 trips it.
+    try std.testing.expectError(
+        Error.BadZip,
+        decompressPayload(a, tiny, 8, 8192),
+    );
+
+    // Stored (method 0) entries are still validated against the cap so
+    // a CDFH claiming 4 GiB stored can't allocate it.
+    try std.testing.expectError(
+        Error.BadZip,
+        decompressPayload(a, tiny, 0, max_part_size + 1),
+    );
 }
