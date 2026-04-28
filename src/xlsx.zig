@@ -5442,6 +5442,13 @@ pub const Editor = struct {
             defer new_buf.deinit(self.allocator);
             try emitCellXml(self.allocator, &new_buf, row, col, cell);
 
+            // Compute body_start offset BEFORE mutating ms.xml so
+            // that an InternalInvariantBroken (which today provably
+            // can't fire — emitCellXml always writes a complete
+            // `<c …>` opening) doesn't leave ms.xml spliced but
+            // spans un-updated.
+            const opening_gt = std.mem.indexOfScalar(u8, new_buf.items, '>') orelse return error.InternalInvariantBroken;
+
             // Insertion offset: just before the first higher-col
             // span, or just after the last lower-col span if the
             // new cell is going at the end of the row.
@@ -5467,8 +5474,6 @@ pub const Editor = struct {
                     s.body_start += new_len;
                 }
             }
-            // Compute body_start of the new cell.
-            const opening_gt = std.mem.indexOfScalar(u8, new_buf.items, '>') orelse return error.InternalInvariantBroken;
             const new_span: CellSpan = .{
                 .start = insert_at,
                 .end = insert_at + new_len,
@@ -6430,6 +6435,10 @@ fn insertCellIntoEmptyRow(
         var cell_buf: std.ArrayListUnmanaged(u8) = .{};
         defer cell_buf.deinit(allocator);
         try emitCellXml(allocator, &cell_buf, row, col, cell);
+        // Body-start offset is constant across both branches below;
+        // compute now so any InternalInvariantBroken surfaces BEFORE
+        // ms.xml is mutated, keeping setCell atomic on that error.
+        const cell_opening_gt = std.mem.indexOfScalar(u8, cell_buf.items, '>') orelse return error.InternalInvariantBroken;
 
         if (is_self_closing) {
             // Expand `<row …/>` to `<row …><c …>…</c></row>`.
@@ -6454,11 +6463,10 @@ fn insertCellIntoEmptyRow(
             }
             // The new cell starts where the old `/>` ended (replaced).
             const cell_abs_start = slash_pos + 1;
-            const opening_gt = std.mem.indexOfScalar(u8, cell_buf.items, '>') orelse return error.InternalInvariantBroken;
             const new_span: CellSpan = .{
                 .start = cell_abs_start,
                 .end = cell_abs_start + cell_buf.items.len,
-                .body_start = cell_abs_start + opening_gt + 1,
+                .body_start = cell_abs_start + cell_opening_gt + 1,
                 .row = row,
                 .col = col,
             };
@@ -6484,11 +6492,10 @@ fn insertCellIntoEmptyRow(
                 s.body_start += cell_buf.items.len;
             }
         }
-        const opening_gt = std.mem.indexOfScalar(u8, cell_buf.items, '>') orelse return error.InternalInvariantBroken;
         const new_span: CellSpan = .{
             .start = t.after_open,
             .end = t.after_open + cell_buf.items.len,
-            .body_start = t.after_open + opening_gt + 1,
+            .body_start = t.after_open + cell_opening_gt + 1,
             .row = row,
             .col = col,
         };
@@ -6599,6 +6606,13 @@ fn insertMissingRow(
     try emitCellXml(allocator, &new_buf, row, col, cell);
     try new_buf.appendSlice(allocator, "</row>");
 
+    // Compute the cell's body-start offset BEFORE mutating ms.xml.
+    // Otherwise an InternalInvariantBroken (which today can't fire —
+    // emitCellXml always writes a '>'-bearing opening) would leave
+    // ms.xml spliced but spans un-updated.
+    const cell_bytes = new_buf.items[cell_start_in_buf .. new_buf.items.len - "</row>".len];
+    const opening_gt_off = std.mem.indexOfScalar(u8, cell_bytes, '>') orelse return error.InternalInvariantBroken;
+
     try ms.xml.insertSlice(allocator, insert_at, new_buf.items);
     const new_len = new_buf.items.len;
 
@@ -6615,9 +6629,6 @@ fn insertMissingRow(
     // at `cell_start_in_buf` and ends at `new_buf.len - "</row>".len`.
     const cell_abs_start = insert_at + cell_start_in_buf;
     const cell_abs_end = insert_at + new_buf.items.len - "</row>".len;
-    // body_start = position of '>' within the cell's opening tag.
-    const cell_bytes = new_buf.items[cell_start_in_buf .. new_buf.items.len - "</row>".len];
-    const opening_gt_off = std.mem.indexOfScalar(u8, cell_bytes, '>') orelse return error.InternalInvariantBroken;
     const new_cell_span: CellSpan = .{
         .start = cell_abs_start,
         .end = cell_abs_end,
