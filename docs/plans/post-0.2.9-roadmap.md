@@ -9,6 +9,38 @@ pulled forward of formula work, chart emit demoted to Tier D,
 walk-away gates tightened (grammar-class instead of corpus-percentage,
 report-only bench CI).
 
+## Status (as of 2026-04-28)
+
+Tier-A and the Tier-B keystone (B0) are shipped; C2a is partially
+landed via the public `zlsx_pkg` module.
+
+| Item | Status |
+|---|---|
+| **A1** Unicode sheet-name dedup (case-fold + NFC + char-length) | ✅ shipped |
+| **A2** Windows runtime tests | ✅ shipped (continue-on-error pending green-streak gate) |
+| **A3** Benchmark-regression CI (report-only) | ✅ shipped |
+| **B0 M1** PartStore read-side | ✅ shipped |
+| **B0 M2** PartStore byte-preserving save + replacePart | ✅ shipped (incl. data-descriptor preservation) |
+| **B0 M2.5** replacePart deflate-encoded overrides | ✅ shipped |
+| **B0 M3** Typed overlays for known parts | ⏳ pending — likely consolidated into B1 |
+| **B1** Workbook typed overlay | ⏳ pending (~6–10 weeks) |
+| **B2** Editor rebase onto Workbook | ⏳ pending |
+| **B3** Writer rebase onto Workbook | ⏳ pending |
+| **B-fuzz** Coverage-guided fuzz nightly | ✅ shipped (Zig targets + ubuntu-22.04 nightly workflow) |
+| **C2a** Object extraction (images / charts / opaque) | 🟡 image + chart anchors + series refs shipped; namespace-prefix tolerance + absolute-pixel anchors pending |
+| **C2b** addImage | ⏳ pending (depends on B1) |
+| **C1** Formula tokenizer + rewriter | ⏳ pending (single biggest remaining user-value item) |
+| **D1** Formula evaluator | deferred indefinitely |
+| **D2** Typed chart emit | deferred |
+
+Public surface added by this batch:
+- New module `zlsx_pkg` (root: `src/package/root.zig`) re-exports
+  `PartStore`, `Part`, `Relationship`, `imageAnchors`,
+  `ChartAnchor`, `chartAnchors`. Consumable independently of the
+  reader/writer surface.
+- `src/unicode/casefold.zig` + `src/unicode/nfc.zig` for the
+  sheet-name dedup pipeline.
+
 ## TL;DR
 
 Three quick wins (A1 Unicode + char-length, A2 Windows tests, A3 bench
