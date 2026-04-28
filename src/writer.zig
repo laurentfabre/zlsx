@@ -1406,11 +1406,16 @@ pub const SheetWriter = struct {
     }
 
     pub fn freezePanes(self: *SheetWriter, rows: u32, cols: u32) error{ RowOutOfRange, ColumnOutOfRange }!void {
-        // Reject splits beyond Excel limits — `formatCellRef` later
-        // operates on `freeze_rows + 1` and `freeze_cols`, so a
-        // u32::max here would have wrapped at the +1 site.
-        if (rows > EXCEL_MAX_ROW) return error.RowOutOfRange;
-        if (cols > EXCEL_MAX_COL) return error.ColumnOutOfRange;
+        // Reject splits that would leave NO visible pane below /
+        // right of the freeze. save() later computes the top-left
+        // visible cell as `formatCellRef(freeze_rows + 1, freeze_cols)`,
+        // which requires:
+        //   freeze_rows + 1 ≤ EXCEL_MAX_ROW  ↔  freeze_rows < EXCEL_MAX_ROW
+        //   freeze_cols     <  EXCEL_MAX_COL
+        // Strict inequality matters: freeze_rows == EXCEL_MAX_ROW
+        // would push the visible row past Excel's last row.
+        if (rows >= EXCEL_MAX_ROW) return error.RowOutOfRange;
+        if (cols >= EXCEL_MAX_COL) return error.ColumnOutOfRange;
         self.freeze_rows = rows;
         self.freeze_cols = cols;
     }
