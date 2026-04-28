@@ -194,6 +194,7 @@ const ArgError = error{
     BadSheetIndex,
     BadArgValue,
     SheetArgConflict,
+    TooManyArgs,
 };
 
 /// First-pass scan: identify the sub-command without validating
@@ -249,7 +250,31 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
     return .rows;
 }
 
-fn parseArgs(argv: []const []const u8) ArgError!Args {
+fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
+    // Pre-normalize `--key=value` to `[--key, value]` token pairs so
+    // the rest of the parser can use its existing two-token form
+    // uniformly. The buffer is stack-allocated with a generous
+    // bound (256 tokens — real invocations are well under 50);
+    // overflow returns TooManyArgs so the caller sees a typed
+    // error instead of an OOB write.
+    var split_buf: [256][]const u8 = undefined;
+    var split_count: usize = 0;
+    for (raw_argv) |raw| {
+        if (raw.len >= 2 and raw[0] == '-' and raw[1] == '-') {
+            if (std.mem.indexOfScalar(u8, raw, '=')) |eq| {
+                if (split_count + 2 > split_buf.len) return ArgError.TooManyArgs;
+                split_buf[split_count] = raw[0..eq];
+                split_buf[split_count + 1] = raw[eq + 1 ..];
+                split_count += 2;
+                continue;
+            }
+        }
+        if (split_count >= split_buf.len) return ArgError.TooManyArgs;
+        split_buf[split_count] = raw;
+        split_count += 1;
+    }
+    const argv = split_buf[0..split_count];
+
     const detected_sub = detectSubcommand(argv);
     // Workbook-scoped commands don't consume --sheet / --name /
     // --format, so wrappers that always append those flags should
@@ -1559,6 +1584,7 @@ fn runMain() !u8 {
         ArgError.BadSheetIndex,
         ArgError.BadArgValue,
         ArgError.SheetArgConflict,
+        ArgError.TooManyArgs,
         => {
             try err.print("zlsx: bad arguments ({s})\n\n", .{@errorName(e)});
             try writeUsage(err);
@@ -4124,6 +4150,24 @@ test "parseArgs basics" {
     try std.testing.expectEqualStrings("file.xlsx", a.file);
     try std.testing.expectEqual(@as(?usize, 2), a.sheet_index);
     try std.testing.expectEqual(Format.csv, a.format);
+}
+
+test "parseArgs accepts --key=value syntax" {
+    // GNU-style --key=value should work uniformly with --key value.
+    const argv = [_][]const u8{ "file.xlsx", "--sheet=2", "--format=csv", "--take=10" };
+    const a = try parseArgs(&argv);
+    try std.testing.expectEqualStrings("file.xlsx", a.file);
+    try std.testing.expectEqual(@as(?usize, 2), a.sheet_index);
+    try std.testing.expectEqual(Format.csv, a.format);
+    try std.testing.expectEqual(@as(?usize, 10), a.take);
+}
+
+test "parseArgs --key= with empty value is accepted as empty string" {
+    // `--out=` produces an empty string value — let the downstream
+    // path-handling reject empties, not the parser.
+    const argv = [_][]const u8{ "file.xlsx", "--out=" };
+    const a = try parseArgs(&argv);
+    try std.testing.expectEqualStrings("", a.out_path.?);
 }
 
 test "parseArgs rejects both --sheet and --name" {
