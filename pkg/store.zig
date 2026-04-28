@@ -1082,7 +1082,19 @@ fn decodeNumericRef(s: []const u8) ?NumericRef {
     }
     const semi = std.mem.indexOfScalarPos(u8, s, digit_start, ';') orelse return null;
     if (semi == digit_start) return null; // empty digit run
-    const code = std.fmt.parseInt(u32, s[digit_start..semi], base) catch return null;
+    // XML 1.0 §4.1 restricts numeric refs to digit chars only —
+    // no `+`, `-`, `_`, or whitespace. parseInt accepts `+` and
+    // `_` which would smuggle malformed refs into the decoder, so
+    // validate the digit run first.
+    const digits = s[digit_start..semi];
+    for (digits) |c| {
+        const ok = if (base == 10)
+            (c >= '0' and c <= '9')
+        else
+            ((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F'));
+        if (!ok) return null;
+    }
+    const code = std.fmt.parseInt(u32, digits, base) catch return null;
     if (code > 0x10FFFF) return null;
     // XML 1.0 forbids most C0 controls; skip them rather than
     // emitting invalid UTF-8 / non-XML content. Allow tab / LF / CR.
@@ -1451,6 +1463,13 @@ test "decodeXmlEntities decodes the five canonical entities" {
     try std.testing.expectEqualStrings("&#xZ;", try decodeXmlEntities(a, "&#xZ;"));
     // Out-of-range code point passes through.
     try std.testing.expectEqualStrings("&#1114112;", try decodeXmlEntities(a, "&#1114112;"));
+
+    // XML 1.0 §4.1 forbids non-digit chars in numeric refs.
+    // parseInt would otherwise accept `+` / `_`, which is not what
+    // the spec allows.
+    try std.testing.expectEqualStrings("&#+38;", try decodeXmlEntities(a, "&#+38;"));
+    try std.testing.expectEqualStrings("&#3_8;", try decodeXmlEntities(a, "&#3_8;"));
+    try std.testing.expectEqualStrings("&#x2_6;", try decodeXmlEntities(a, "&#x2_6;"));
 }
 
 test "looksExternal classifies URL / UNC / drive-letter targets" {
