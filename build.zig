@@ -77,8 +77,8 @@ pub fn build(b: *std.Build) void {
     const writer_tests = b.addTest(.{ .root_module = writer_mod });
     test_step.dependOn(&b.addRunArtifact(writer_tests).step);
 
-    // Unicode case-fold module tests (A1 phase 1: scaffold for sheet-
-    // name dedup; not yet wired into writer/editor).
+    // Unicode case-fold module tests (A1: Excel sheet-name dedup
+    // helpers, wired into validateSheetName + Editor.isSheetNameTaken).
     const unicode_mod = b.createModule(.{
         .root_source_file = b.path("src/unicode/casefold.zig"),
         .target = target,
@@ -86,6 +86,15 @@ pub fn build(b: *std.Build) void {
     });
     const unicode_tests = b.addTest(.{ .root_module = unicode_mod });
     test_step.dependOn(&b.addRunArtifact(unicode_tests).step);
+
+    // PartStore — read-only OOXML package layer (B0 milestone 1).
+    const package_mod = b.createModule(.{
+        .root_source_file = b.path("src/package/store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const package_tests = b.addTest(.{ .root_module = package_mod });
+    test_step.dependOn(&b.addRunArtifact(package_tests).step);
 
     // C ABI — both a shared library (for Python / cffi bindings) and a
     // static library (for language toolchains that prefer linking in).
