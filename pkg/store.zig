@@ -337,6 +337,13 @@ pub const PartStore = struct {
         try buf.appendSlice(ar_alloc, old_xml[close_pos..]);
         const new_xml = try buf.toOwnedSlice(ar_alloc);
 
+        // Bound the uncompressed-size field too. The compressed
+        // check below would catch anything that didn't shrink, but
+        // a payload that compresses smaller while its uncompressed
+        // size lands at exactly 0xFFFFFFFF would still write the
+        // Zip64 sentinel into the LFH/CDFH uncompressed_size field.
+        if (new_xml.len >= std.math.maxInt(u32)) return Error.Zip64NotSupported;
+
         // Compress the new CT XML — same policy as replacePart.
         var ct_compressed: std.ArrayListUnmanaged(u8) = .{};
         defer ct_compressed.deinit(ar_alloc);
