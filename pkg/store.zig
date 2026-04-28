@@ -203,17 +203,17 @@ pub const PartStore = struct {
         if (bytes.len > std.math.maxInt(u32)) return Error.Zip64NotSupported;
         if (name.len > std.math.maxInt(u16)) return Error.ZipArchiveTooLarge;
 
-        // Step 1: register the new part's content type in
-        // [Content_Types].xml BEFORE growing the parts arrays. If the
-        // CT update fails we leave the package as-is.
-        try self.registerContentTypeOverride(name, content_type);
-
         const ar_alloc = self.arena.allocator();
+
+        // Atomicity: do every fallible allocation up front BEFORE
+        // committing any field mutation. If any allocation fails,
+        // the store stays unchanged (arena cleans the leftovers
+        // up later). Only the final assignment block is infallible.
         const owned_name = try ar_alloc.dupe(u8, name);
         const owned_ct = try ar_alloc.dupe(u8, content_type);
         const owned_user_bytes = try ar_alloc.dupe(u8, bytes);
 
-        // Same compression policy as replacePart.
+        // Compress user payload via the same policy as replacePart.
         var compressed: std.ArrayListUnmanaged(u8) = .{};
         defer compressed.deinit(ar_alloc);
         var method: u16 = 8;
@@ -232,10 +232,17 @@ pub const PartStore = struct {
         if (compressed.items.len > std.math.maxInt(u32)) return Error.Zip64NotSupported;
         const owned_payload = try compressed.toOwnedSlice(ar_alloc);
 
-        // Synthetic ZipEntry — save() rebuilds LFH/CDFH from the
-        // override for this slot, so the source-offset fields are
-        // unused. We only need a valid `name` + sizes/method/CRC
-        // for the matching CDFH the save path emits.
+        // Stage the [Content_Types].xml update WITHOUT calling
+        // replacePart — we don't want to commit that mutation until
+        // we know the array reallocs below also succeed.
+        const ct_staging = try self.stageContentTypeOverride(name, content_type);
+        const ct_idx = ct_staging.idx;
+        const ct_new_part_bytes = ct_staging.new_part_bytes;
+        const ct_new_override = ct_staging.new_override;
+
+        // Synthetic ZipEntry for the new part — save() rebuilds
+        // LFH/CDFH from the override slot, so source-offset fields
+        // are unused.
         const new_entry: ZipEntry = .{
             .name = owned_name,
             .lfh_offset = 0,
@@ -250,61 +257,102 @@ pub const PartStore = struct {
             .data_descriptor_len = 0,
             .has_data_descriptor = false,
         };
-
-        // Grow the three parallel arrays. Reallocate via the arena —
-        // the previous slices are tracked there too, so on success
-        // they're replaced and on failure they remain valid.
-        const grown_entries = try ar_alloc.realloc(self.entries, self.entries.len + 1);
-        grown_entries[grown_entries.len - 1] = new_entry;
-        self.entries = grown_entries;
-
-        const grown_parts = try ar_alloc.realloc(self.parts, self.parts.len + 1);
-        grown_parts[grown_parts.len - 1] = .{
+        const new_part: Part = .{
             .name = owned_name,
             .content_type = owned_ct,
             .bytes = owned_user_bytes,
             .compression_method = method,
         };
-        self.parts = grown_parts;
-
-        const grown_overrides = try ar_alloc.realloc(self.overrides, self.overrides.len + 1);
-        grown_overrides[grown_overrides.len - 1] = .{
+        const new_override: Override = .{
             .payload = owned_payload,
             .compression_method = method,
             .crc32 = std.hash.Crc32.hash(bytes),
             .uncompressed_size = @intCast(bytes.len),
         };
+
+        // Grow the parallel arrays — last fallible step.
+        const grown_entries = try ar_alloc.realloc(self.entries, self.entries.len + 1);
+        const grown_parts = try ar_alloc.realloc(self.parts, self.parts.len + 1);
+        const grown_overrides = try ar_alloc.realloc(self.overrides, self.overrides.len + 1);
+
+        // ─── Commit point: every step from here on is infallible ──
+        grown_entries[grown_entries.len - 1] = new_entry;
+        grown_parts[grown_parts.len - 1] = new_part;
+        grown_overrides[grown_overrides.len - 1] = new_override;
+        self.entries = grown_entries;
+        self.parts = grown_parts;
         self.overrides = grown_overrides;
+        // Apply the staged content-types update.
+        self.overrides[ct_idx] = ct_new_override;
+        self.parts[ct_idx].bytes = ct_new_part_bytes;
+        self.parts[ct_idx].compression_method = ct_new_override.compression_method;
     }
 
-    /// Splice a new `<Override>` element into `[Content_Types].xml`
-    /// and reinstall the result as a replacePart override of that
-    /// part. OOXML consumers rely on the content-types map; adding
-    /// a part without registering it produces a workbook Excel
-    /// rejects on open.
-    fn registerContentTypeOverride(
+    const StagedContentTypeUpdate = struct {
+        idx: usize,
+        new_part_bytes: []u8,
+        new_override: Override,
+    };
+
+    /// Build the new [Content_Types].xml with the requested
+    /// `<Override>` element appended. Does not mutate the store —
+    /// caller commits via `self.overrides[idx] = new_override; ...`
+    /// only after every other addPart allocation has succeeded.
+    fn stageContentTypeOverride(
         self: *PartStore,
         part_name: []const u8,
         content_type: []const u8,
-    ) !void {
-        const ct_part = self.part("[Content_Types].xml") orelse
+    ) !StagedContentTypeUpdate {
+        const ct_idx = self.findIndex("[Content_Types].xml") orelse
             return error.MissingContentTypes;
+        const ct_part = self.parts[ct_idx];
         const old_xml = ct_part.bytes;
         const close_tag = "</Types>";
         const close_pos = std.mem.lastIndexOf(u8, old_xml, close_tag) orelse
             return error.MalformedContentTypes;
 
+        const ar_alloc = self.arena.allocator();
         var buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer buf.deinit(self.allocator);
-        try buf.appendSlice(self.allocator, old_xml[0..close_pos]);
-        try buf.appendSlice(self.allocator, "<Override ContentType=\"");
-        try appendXmlEscaped(self.allocator, &buf, content_type);
-        try buf.appendSlice(self.allocator, "\" PartName=\"/");
-        try appendXmlEscaped(self.allocator, &buf, part_name);
-        try buf.appendSlice(self.allocator, "\"/>");
-        try buf.appendSlice(self.allocator, old_xml[close_pos..]);
+        // No defer-deinit: on success the bytes are kept (referenced
+        // from the staged result); on error the arena cleans up.
+        try buf.appendSlice(ar_alloc, old_xml[0..close_pos]);
+        try buf.appendSlice(ar_alloc, "<Override ContentType=\"");
+        try appendXmlEscaped(ar_alloc, &buf, content_type);
+        try buf.appendSlice(ar_alloc, "\" PartName=\"/");
+        try appendXmlEscaped(ar_alloc, &buf, part_name);
+        try buf.appendSlice(ar_alloc, "\"/>");
+        try buf.appendSlice(ar_alloc, old_xml[close_pos..]);
+        const new_xml = try buf.toOwnedSlice(ar_alloc);
 
-        try self.replacePart("[Content_Types].xml", buf.items);
+        // Compress the new CT XML — same policy as replacePart.
+        var ct_compressed: std.ArrayListUnmanaged(u8) = .{};
+        defer ct_compressed.deinit(ar_alloc);
+        var ct_method: u16 = 8;
+        if (new_xml.len < 1024 or new_xml.len == 0) {
+            ct_method = 0;
+            try ct_compressed.appendSlice(ar_alloc, new_xml);
+        } else {
+            const writer_mod = @import("writer");
+            try writer_mod.deflateCompress(ar_alloc, new_xml, &ct_compressed);
+            if (ct_compressed.items.len >= new_xml.len) {
+                ct_method = 0;
+                ct_compressed.clearRetainingCapacity();
+                try ct_compressed.appendSlice(ar_alloc, new_xml);
+            }
+        }
+        if (ct_compressed.items.len > std.math.maxInt(u32)) return Error.Zip64NotSupported;
+        const ct_payload = try ct_compressed.toOwnedSlice(ar_alloc);
+
+        return .{
+            .idx = ct_idx,
+            .new_part_bytes = new_xml,
+            .new_override = .{
+                .payload = ct_payload,
+                .compression_method = ct_method,
+                .crc32 = std.hash.Crc32.hash(new_xml),
+                .uncompressed_size = @intCast(new_xml.len),
+            },
+        };
     }
 
     /// Append `s` to `buf` with XML attribute-value escaping. Covers
