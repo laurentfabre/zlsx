@@ -1476,27 +1476,31 @@ export fn zlsx_writer_add_sheet(
 ) callconv(.c) ?*SheetWriter {
     const state: *WriterState = @ptrCast(@alignCast(w));
     const name = name_ptr[0..name_len];
-    const inner = state.inner.addSheet(name) catch |e| {
-        writeError(err_buf, err_buf_len, @errorName(e));
+
+    // Reserve wrapper-list capacity AND allocate the wrapper struct
+    // BEFORE calling inner.addSheet. The previous order let
+    // gpa.create or sheet_wrappers.append fail AFTER the inner
+    // writer had already gained a new sheet — leaving the writer
+    // with an extra orphan sheet a recovering caller would still
+    // see in saved output. Doing both allocations first means the
+    // only remaining failure point after addSheet is appendAssumeCapacity,
+    // which is infallible by construction.
+    state.sheet_wrappers.ensureUnusedCapacity(gpa, 1) catch {
+        writeError(err_buf, err_buf_len, "OutOfMemory");
         return null;
     };
     const sw_state = gpa.create(SheetWriterState) catch {
         writeError(err_buf, err_buf_len, "OutOfMemory");
         return null;
     };
-    sw_state.* = .{ .inner = inner };
-    // Track the wrapper so writer_close() can free it. Previously
-    // each wrapper was leaked "until process exit" — a long-lived
-    // host (Python server, daemon) opening + closing many writers
-    // would balloon RSS by sizeof(SheetWriterState) per sheet, per
-    // closed writer. Note: this fn returns an optional, not an
-    // error union, so `errdefer` would not fire on the OOM path —
-    // free explicitly to avoid reintroducing the leak we just fixed.
-    state.sheet_wrappers.append(gpa, sw_state) catch {
+    const inner = state.inner.addSheet(name) catch |e| {
         gpa.destroy(sw_state);
-        writeError(err_buf, err_buf_len, "OutOfMemory");
+        writeError(err_buf, err_buf_len, @errorName(e));
         return null;
     };
+    sw_state.* = .{ .inner = inner };
+    // Infallible: capacity reserved above.
+    state.sheet_wrappers.appendAssumeCapacity(sw_state);
     return @ptrCast(sw_state);
 }
 
