@@ -298,13 +298,32 @@ pub const PartStore = struct {
         defer buf.deinit(self.allocator);
         try buf.appendSlice(self.allocator, old_xml[0..close_pos]);
         try buf.appendSlice(self.allocator, "<Override ContentType=\"");
-        try buf.appendSlice(self.allocator, content_type);
+        try appendXmlEscaped(self.allocator, &buf, content_type);
         try buf.appendSlice(self.allocator, "\" PartName=\"/");
-        try buf.appendSlice(self.allocator, part_name);
+        try appendXmlEscaped(self.allocator, &buf, part_name);
         try buf.appendSlice(self.allocator, "\"/>");
         try buf.appendSlice(self.allocator, old_xml[close_pos..]);
 
         try self.replacePart("[Content_Types].xml", buf.items);
+    }
+
+    /// Append `s` to `buf` with XML attribute-value escaping. Covers
+    /// the five XML-significant characters; sufficient for emitting
+    /// caller-provided part names + content types into the
+    /// [Content_Types].xml override entries.
+    fn appendXmlEscaped(
+        alloc: std.mem.Allocator,
+        buf: *std.ArrayListUnmanaged(u8),
+        s: []const u8,
+    ) !void {
+        for (s) |c| switch (c) {
+            '&' => try buf.appendSlice(alloc, "&amp;"),
+            '<' => try buf.appendSlice(alloc, "&lt;"),
+            '>' => try buf.appendSlice(alloc, "&gt;"),
+            '"' => try buf.appendSlice(alloc, "&quot;"),
+            '\'' => try buf.appendSlice(alloc, "&apos;"),
+            else => try buf.append(alloc, c),
+        };
     }
 
     pub fn replacePart(self: *PartStore, name: []const u8, bytes: []const u8) !void {
@@ -1758,6 +1777,42 @@ test "PartStore.addPart: multiple parts in one session all register content type
     // addPart's <Override>, leaving customA.xml undeclared).
     try std.testing.expectEqualStrings("application/xml", a.content_type.?);
     try std.testing.expectEqualStrings("application/xml", b.content_type.?);
+}
+
+test "PartStore.addPart: XML-escapes part name + content type into Content_Types" {
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "added_meta.xlsx" });
+    defer std.testing.allocator.free(out_path);
+
+    // ZIP names CAN contain `&` (rare but legal). The on-disk part
+    // name is the raw `&`, but the [Content_Types].xml entry must
+    // serialise it as `&amp;` to keep the XML well-formed.
+    const tricky_name = "xl/a&b.xml";
+    {
+        var store = try PartStore.open(std.testing.allocator, fixture);
+        defer store.deinit();
+        try store.addPart(tricky_name, "application/xml", "<x/>");
+        try store.save(out_path);
+    }
+
+    var dst = try PartStore.open(std.testing.allocator, out_path);
+    defer dst.deinit();
+    // Reopened part is found under its raw name (the .rels parser
+    // decodes entities to recover the literal).
+    const got = dst.part(tricky_name) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, "<x/>", got.bytes);
+    // Content_Types.xml must contain the escaped form, not the raw `&`.
+    const ct = dst.part("[Content_Types].xml") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, ct.bytes, "PartName=\"/xl/a&amp;b.xml\"") != null);
+    // ...and must NOT contain the raw `&` in an attribute (otherwise
+    // the XML is malformed).
+    try std.testing.expect(std.mem.indexOf(u8, ct.bytes, "PartName=\"/xl/a&b.xml\"") == null);
 }
 
 test "PartStore.addPart: rejects duplicate part name" {
