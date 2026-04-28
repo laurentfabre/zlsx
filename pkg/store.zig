@@ -335,7 +335,12 @@ pub const PartStore = struct {
         }
         if (compressed.items.len > std.math.maxInt(u32)) return Error.Zip64NotSupported;
 
+        // Build all the new arena-owned values BEFORE installing
+        // any of them so a mid-allocation OOM leaves the store
+        // unchanged (no partial-mutation observable to a caller
+        // that recovers from the error).
         const owned_payload = try compressed.toOwnedSlice(ar_alloc);
+        const dupe_bytes = try ar_alloc.dupe(u8, bytes);
         self.overrides[idx] = .{
             .payload = owned_payload,
             .compression_method = method,
@@ -343,12 +348,14 @@ pub const PartStore = struct {
             .uncompressed_size = @intCast(bytes.len),
         };
         // Mirror the override into parts[idx].bytes so subsequent
-        // part() lookups see the updated content. Without this,
-        // multiple replacePart / addPart calls on the same part
-        // (e.g. addPart inserting two new content-type Overrides)
-        // would each rebuild from the stale original bytes and
-        // lose prior edits.
-        self.parts[idx].bytes = try ar_alloc.dupe(u8, bytes);
+        // part() lookups see the updated content. NOTE: derived
+        // metadata (content_type entries in OTHER parts inferred
+        // from a replaced [Content_Types].xml, rels in OTHER parts
+        // inferred from a replaced .rels, etc.) is NOT refreshed
+        // until the next open(). The current contract is: the
+        // replaced part's bytes are visible via part(name); other
+        // parts' inferred metadata stays as it was at open-time.
+        self.parts[idx].bytes = dupe_bytes;
         self.parts[idx].compression_method = method;
     }
 
