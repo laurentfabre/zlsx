@@ -73,3 +73,76 @@ jobs:
           echo "$PWD/zig-x86_64-linux-0.15.2" >> "$GITHUB_PATH"
       - name: Cross-compile
         run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+
+  windows-runtime:
+    name: windows-runtime / native test + cli + wheel smoke
+    runs-on: windows-latest
+    # Tier-A2 lands the Windows job in continue-on-error first so we
+    # get visibility into what fails on Windows without blocking main.
+    # Once the /tmp/-path migration in src/writer.zig + src/xlsx.zig
+    # is complete and the suite passes natively, flip this to false.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: zig fmt --check
+        run: zig fmt --check src/ tests/ build.zig
+
+      - name: Build (Debug)
+        run: zig build
+
+      - name: Build (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Unit + fuzz-smoke tests
+        run: zig build test
+
+      - name: Fetch corpus
+        shell: bash
+        run: bash scripts/fetch_test_corpus.sh
+
+      - name: Corpus integration tests
+        run: zig build test-corpus
+
+      - name: CLI smoke — list-sheets / meta / cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./zig-out/bin/zlsx.exe list-sheets tests/corpus/frictionless_2sheets.xlsx
+          ./zig-out/bin/zlsx.exe meta tests/corpus/frictionless_2sheets.xlsx
+          ./zig-out/bin/zlsx.exe cells tests/corpus/frictionless_2sheets.xlsx --take 3
+
+      - name: Stage zlsx.dll into Python binding for wheel smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp zig-out/bin/zlsx.dll bindings/python/zlsx/zlsx.dll
+
+      - name: Python wheel install + import + reader smoke
+        shell: bash
+        working-directory: bindings/python
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e .[test]
+          python -c "import zlsx; b = zlsx.open('../../tests/corpus/frictionless_2sheets.xlsx'); print('sheets:', b.sheets); b.close()"
+
+      - name: Pytest binding suite (best-effort)
+        shell: bash
+        working-directory: bindings/python
+        # /tmp paths in some pytest fixtures may also break here;
+        # surface the failure but do not gate the whole job on it
+        # until the migration completes.
+        continue-on-error: true
+        run: |
+          python -m pytest tests/ -q

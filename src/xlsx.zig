@@ -9303,6 +9303,28 @@ fn extractEntryToBuffer(
 
 // ─── Tests ───────────────────────────────────────────────────────────
 
+/// Per-test temporary file helper. Replaces the older `/tmp/zlsx_*.xlsx`
+/// hard-coded paths so the suite is portable across Linux / macOS /
+/// Windows. Each call creates a fresh isolated `std.testing.TmpDir`
+/// (auto-cleaned). Caller frees the returned slice. Mirror of the
+/// helper in src/writer.zig — kept in-file so the two test sections
+/// don't depend on a shared utility module yet (introducing one is
+/// part of B0 PartStore).
+const TestTmp = struct {
+    dir: std.testing.TmpDir,
+    pub fn init() TestTmp {
+        return .{ .dir = std.testing.tmpDir(.{}) };
+    }
+    pub fn deinit(self: *TestTmp) void {
+        self.dir.cleanup();
+    }
+    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, name: []const u8) ![]u8 {
+        const d = try self.dir.dir.realpathAlloc(alloc, ".");
+        defer alloc.free(d);
+        return std.fs.path.join(alloc, &.{ d, name });
+    }
+};
+
 test "toExcelSerial: inverse of fromExcelSerial on round-trippable range" {
     // Round-trip every known reference date through both helpers.
     const cases = [_]struct {
@@ -9460,8 +9482,10 @@ test "parseA1Range: rectangle parsing + corner normalisation" {
 }
 
 test "Book.mergedRanges: round-trip through writer + reader" {
-    const tmp_path = "/tmp/zlsx_reader_merged_roundtrip.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "reader_merged_roundtrip.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");
@@ -9489,8 +9513,10 @@ test "Book.mergedRanges: round-trip through writer + reader" {
 }
 
 test "Book.hyperlinks: round-trip through writer + reader" {
-    const tmp_path = "/tmp/zlsx_reader_hyperlinks_roundtrip.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "reader_hyperlinks_roundtrip.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         const writer = @import("writer.zig");

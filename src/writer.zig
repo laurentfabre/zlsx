@@ -3065,6 +3065,32 @@ fn appendStruct(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), comptime T: 
 
 // ─── Tests ───────────────────────────────────────────────────────────
 
+/// Per-test temporary file helper. Replaces the older `/tmp/zlsx_*.xlsx`
+/// hard-coded paths so the suite is portable across Linux / macOS /
+/// Windows (Windows has no `/tmp`). Each call creates a fresh isolated
+/// `std.testing.TmpDir` (auto-cleaned) and returns an owned absolute
+/// path inside it. Caller frees the returned slice.
+///
+/// Usage:
+///   var tt = TestTmp.init();
+///   defer tt.deinit();
+///   const src_path = try tt.path(std.testing.allocator, "src.xlsx");
+///   defer std.testing.allocator.free(src_path);
+const TestTmp = struct {
+    dir: std.testing.TmpDir,
+    pub fn init() TestTmp {
+        return .{ .dir = std.testing.tmpDir(.{}) };
+    }
+    pub fn deinit(self: *TestTmp) void {
+        self.dir.cleanup();
+    }
+    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, name: []const u8) ![]u8 {
+        const dir = try self.dir.dir.realpathAlloc(alloc, ".");
+        defer alloc.free(dir);
+        return std.fs.path.join(alloc, &.{ dir, name });
+    }
+};
+
 test "formatCellRef: A1, B2, Z1, AA1, AAA1" {
     var buf: [16]u8 = undefined;
     try std.testing.expectEqualStrings("A1", try formatCellRef(&buf, 1, 0));
@@ -3082,14 +3108,20 @@ test "appendXmlEscaped covers all 5 entities" {
 }
 
 test "Writer: empty workbook fails with NoSheets" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, "empty.xlsx");
+    defer std.testing.allocator.free(path);
     var w = Writer.init(std.testing.allocator);
     defer w.deinit();
-    try std.testing.expectError(error.NoSheets, w.save("/tmp/zlsx_empty.xlsx"));
+    try std.testing.expectError(error.NoSheets, w.save(path));
 }
 
 test "Writer: single-sheet round-trip via zlsx reader" {
-    const tmp_path = "/tmp/zlsx_writer_test.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_test.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
@@ -3152,8 +3184,10 @@ test "Writer: single-sheet round-trip via zlsx reader" {
 }
 
 test "Writer: multi-sheet round-trip + SST dedup" {
-    const tmp_path = "/tmp/zlsx_writer_multisheet.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "writer_multisheet.xlsx");
+    defer std.testing.allocator.free(tmp_path);
 
     {
         var w = Writer.init(std.testing.allocator);
