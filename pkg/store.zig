@@ -456,11 +456,14 @@ fn looksExternal(target: []const u8) bool {
     {
         return true;
     }
-    // URL scheme: a sequence of ALPHA / DIGIT / '+' / '-' / '.' followed
-    // by ':'. Bound the search so we don't scan giant in-package paths.
+    // URL scheme per RFC 3986 §3.1:
+    //   scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+    // Walk the target until we hit a colon (URL scheme found) or any
+    // non-scheme char (definitely not a URL — it's a path segment).
+    // No fixed length cap — schemes are unbounded by spec, and the
+    // first non-scheme char terminates the walk regardless of length.
     var i: usize = 0;
-    const max = @min(target.len, 16);
-    while (i < max) : (i += 1) {
+    while (i < target.len) : (i += 1) {
         const c = target[i];
         if (c == ':') {
             // First char must be a letter (RFC 3986 §3.1).
@@ -1206,6 +1209,11 @@ test "looksExternal classifies URL / UNC / drive-letter targets" {
     try std.testing.expect(looksExternal("C:\\foo\\bar.png"));
     try std.testing.expect(looksExternal("C:/foo/bar.png"));
     try std.testing.expect(looksExternal("z:/foo")); // lowercase drive
+
+    // Long custom scheme — RFC 3986 doesn't bound scheme length;
+    // the heuristic must not either.
+    try std.testing.expect(looksExternal("verylongcustomscheme:https://host/file.png"));
+    try std.testing.expect(looksExternal("ms-officeapp.test+v1:https://example.com"));
 
     // In-package targets — must NOT trip the heuristic.
     try std.testing.expect(!looksExternal("worksheets/sheet1.xml"));
