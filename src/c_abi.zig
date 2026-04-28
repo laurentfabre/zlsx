@@ -2079,14 +2079,19 @@ export fn zlsx_sheet_writer_set_column_width(
 
 /// Freeze the top `rows` rows and left `cols` columns. Pass 0 on an
 /// axis to leave it unfrozen. Overrides any previous freeze on this
-/// sheet. Never fails.
+/// sheet. Never fails — out-of-range row/col counts are clamped to
+/// Excel's hard limits (1_048_576 rows, 16_384 columns) rather than
+/// surfaced as an error, preserving the void return signature for
+/// ABI back-compat.
 export fn zlsx_sheet_writer_freeze_panes(
     sw: *SheetWriter,
     rows: u32,
     cols: u32,
 ) callconv(.c) void {
     const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
-    sw_state.inner.freezePanes(rows, cols);
+    const clamped_rows = @min(rows, 1_048_576);
+    const clamped_cols = @min(cols, 16_384);
+    sw_state.inner.freezePanes(clamped_rows, clamped_cols) catch unreachable;
 }
 
 /// Apply an auto-filter over an A1-style range (e.g. "A1:E1"). The

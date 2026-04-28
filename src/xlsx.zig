@@ -11319,7 +11319,7 @@ test "Editor: row/col edits refuse on sheets with frozen panes" {
         var s = try w.addSheet("S");
         try s.writeRow(&.{.{ .integer = 1 }});
         try s.writeRow(&.{.{ .integer = 2 }});
-        s.freezePanes(1, 2);
+        try s.freezePanes(1, 2);
         try w.save(src_path);
     }
     var ed = try Editor.open(std.testing.allocator, src_path);

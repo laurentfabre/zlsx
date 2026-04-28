@@ -1380,6 +1380,7 @@ pub const SheetWriter = struct {
     /// in order, so a later call wins on overlap in Excel.
     pub fn setColumnWidth(self: *SheetWriter, col_idx: u32, width: f32) !void {
         if (!std.math.isFinite(width) or width <= 0) return error.InvalidColumnWidth;
+        if (col_idx >= EXCEL_MAX_COL) return error.ColumnOutOfRange;
         const col_1based = col_idx + 1;
         try self.column_widths.append(self.parent.allocator, .{
             .col_min = col_1based,
@@ -1400,10 +1401,16 @@ pub const SheetWriter = struct {
     /// ones as long as the row hasn't been written yet.
     pub fn setRowHeight(self: *SheetWriter, row_idx: u32, height: f32) !void {
         if (!std.math.isFinite(height) or height <= 0) return error.InvalidRowHeight;
+        if (row_idx >= EXCEL_MAX_ROW) return error.RowOutOfRange;
         try self.row_heights.put(self.parent.allocator, row_idx, height);
     }
 
-    pub fn freezePanes(self: *SheetWriter, rows: u32, cols: u32) void {
+    pub fn freezePanes(self: *SheetWriter, rows: u32, cols: u32) error{ RowOutOfRange, ColumnOutOfRange }!void {
+        // Reject splits beyond Excel limits — `formatCellRef` later
+        // operates on `freeze_rows + 1` and `freeze_cols`, so a
+        // u32::max here would have wrapped at the +1 site.
+        if (rows > EXCEL_MAX_ROW) return error.RowOutOfRange;
+        if (cols > EXCEL_MAX_COL) return error.ColumnOutOfRange;
         self.freeze_rows = rows;
         self.freeze_cols = cols;
     }
@@ -1798,10 +1805,13 @@ pub const SheetWriter = struct {
     /// in this iter — the formatted form is rarely repeated, and
     /// hashing it would cost more than it saves).
     pub fn writeRichRow(self: *SheetWriter, cells: []const RichRowCell) !void {
-        // Pre-validate integers BEFORE mutating `self.body`, same
-        // atomicity guarantee as `writeRowImpl`.
+        // Pre-validate the entire row BEFORE mutating `self.body`,
+        // same atomicity + Excel-limit contract as `writeRowImpl`.
+        if (self.next_row > EXCEL_MAX_ROW) return error.RowOutOfRange;
+        if (cells.len > EXCEL_MAX_COL) return error.ColumnOutOfRange;
         for (cells) |cell| switch (cell) {
             .integer => |n| if (!fitsExactlyInF64(n)) return error.IntegerExceedsExcelPrecision,
+            .number => |f| if (!std.math.isFinite(f)) return error.NonFiniteNumeric,
             else => {},
         };
 
@@ -1854,12 +1864,21 @@ pub const SheetWriter = struct {
         styles: ?[]const u32,
         formulas: ?[]const ?[]const u8,
     ) !void {
-        // Pre-validate integers BEFORE mutating `self.body`. This keeps
-        // writeRow atomic on IntegerExceedsExcelPrecision so the caller
-        // can catch the error and retry / skip that row without ending
-        // up with a half-emitted <row> in the sheet body.
+        // Pre-validate the entire row BEFORE mutating `self.body`. This
+        // keeps writeRow atomic — caller can catch the error and retry
+        // / skip the row without ending up with a half-emitted <row>.
+        // Excel's hard limits are enforced here so a future caller
+        // can't smuggle a u32 past us into formatCellRef or the
+        // <row r="N"> emission and produce a workbook Excel rejects.
+        if (self.next_row > EXCEL_MAX_ROW) return error.RowOutOfRange;
+        if (cells.len > EXCEL_MAX_COL) return error.ColumnOutOfRange;
         for (cells) |cell| switch (cell) {
             .integer => |n| if (!fitsExactlyInF64(n)) return error.IntegerExceedsExcelPrecision,
+            // Reject NaN / +Inf / -Inf — Excel's <v>NaN</v> /
+            // <v>inf</v> would render as #NUM! at best and corrupt
+            // the workbook at worst. Mirrors the isFinite check on
+            // setColumnWidth / setRowHeight.
+            .number => |f| if (!std.math.isFinite(f)) return error.NonFiniteNumeric,
             else => {},
         };
 
@@ -1937,6 +1956,12 @@ pub const SheetWriter = struct {
 // ─── Helpers ─────────────────────────────────────────────────────────
 
 pub fn formatCellRef(buf: *[16]u8, row: u32, col_idx: u32) ![]u8 {
+    // Excel hard limit: 1 ≤ row ≤ 1_048_576, 0 ≤ col_idx < 16_384
+    // (column XFD). Reject above that — formats above the cap may
+    // technically fit `col_chars[8]u8` but Excel rejects the
+    // workbook silently and produces an undiagnosable failure.
+    if (row == 0 or row > EXCEL_MAX_ROW) return error.RowOutOfRange;
+    if (col_idx >= EXCEL_MAX_COL) return error.ColumnOutOfRange;
     // Column letter (1-based in xlsx: A=1, Z=26, AA=27 …).
     var col_chars: [8]u8 = undefined;
     var pos: usize = col_chars.len;
@@ -3021,6 +3046,17 @@ const ZipWriter = struct {
 
     fn finalize(self: *ZipWriter) !void {
         const alloc = self.allocator;
+        // ZIP32 EOCD records the per-disk + total entry counts in u16
+        // fields. >65535 entries needs Zip64 (which we don't emit).
+        // Without this guard the @intCast at the EndRecord build trapped
+        // in safe builds and silently truncated in ReleaseFast — both
+        // produce a workbook Excel rejects.
+        if (self.entries.items.len > std.math.maxInt(u16)) {
+            return error.TooManyZipEntries;
+        }
+        if (self.out.items.len > std.math.maxInt(u32)) {
+            return error.ZipArchiveTooLarge;
+        }
         const cd_start: u32 = @intCast(self.out.items.len);
 
         for (self.entries.items) |e| {
@@ -3499,7 +3535,7 @@ test "Writer: stage-5 sheet-level features (cols, freeze, autoFilter)" {
         var sheet = try w.addSheet("Sheet1");
         try sheet.setColumnWidth(0, 20.5);
         try sheet.setColumnWidth(3, 12);
-        sheet.freezePanes(1, 2);
+        try sheet.freezePanes(1, 2);
         try sheet.setAutoFilter("A1:D1");
 
         try std.testing.expectError(
@@ -5316,7 +5352,7 @@ test "fuzz SheetWriter: random stage-5 per-sheet feature combos" {
 
         // 50% chance of freeze, 50% chance of auto-filter.
         if (rng.boolean()) {
-            sheet.freezePanes(
+            try sheet.freezePanes(
                 rng.intRangeAtMost(u32, 0, 5),
                 rng.intRangeAtMost(u32, 0, 5),
             );
