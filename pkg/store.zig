@@ -372,13 +372,23 @@ pub const PartStore = struct {
     /// to `owner_part_name`'s parent directory) into a normalised
     /// absolute part name. Returns `null` for external targets and
     /// for paths that escape the package root.
+    ///
+    /// External detection is heuristic on the target string itself
+    /// because this method takes a raw target rather than a full
+    /// Relationship. It catches URL schemes (`https://`, `mailto:`,
+    /// `file://`), UNC paths (`\\server\share`), and Windows drive
+    /// letters (`C:\foo`) — the shapes that external relationships
+    /// actually take in real workbooks. Callers that already have a
+    /// Relationship and want to be exact should branch on
+    /// `Relationship.target_mode == .external` upstream.
     pub fn resolve(
         self: *const PartStore,
         owner_part_name: []const u8,
         target: []const u8,
     ) !?[]const u8 {
-        // Absolute target (rare): "/xl/foo.xml" → "xl/foo.xml".
         if (target.len == 0) return null;
+        if (looksExternal(target)) return null;
+        // Absolute target (rare): "/xl/foo.xml" → "xl/foo.xml".
         if (target[0] == '/') {
             return try self.dupeArena(target[1..]);
         }
@@ -430,6 +440,42 @@ pub const PartStore = struct {
         return ar_alloc.dupe(u8, s);
     }
 };
+
+/// Detect targets that are external to the package and must NOT be
+/// joined with a part-name parent directory. The shapes covered are:
+///   - URL schemes:    `https://...`, `mailto:...`, `file:///...`
+///   - UNC paths:      `\\server\share\...`
+///   - Drive letters:  `C:\foo` or `C:/foo`
+/// Anything else is treated as a relative or absolute package path
+/// (the `/`-rooted branch in `resolve`).
+fn looksExternal(target: []const u8) bool {
+    if (target.len < 2) return false;
+    if (target[0] == '\\' and target[1] == '\\') return true;
+    if (target.len >= 3 and isAsciiAlpha(target[0]) and target[1] == ':' and
+        (target[2] == '\\' or target[2] == '/'))
+    {
+        return true;
+    }
+    // URL scheme: a sequence of ALPHA / DIGIT / '+' / '-' / '.' followed
+    // by ':'. Bound the search so we don't scan giant in-package paths.
+    var i: usize = 0;
+    const max = @min(target.len, 16);
+    while (i < max) : (i += 1) {
+        const c = target[i];
+        if (c == ':') {
+            // First char must be a letter (RFC 3986 §3.1).
+            return i > 0 and isAsciiAlpha(target[0]);
+        }
+        if (!(isAsciiAlpha(c) or std.ascii.isDigit(c) or c == '+' or c == '-' or c == '.')) {
+            return false;
+        }
+    }
+    return false;
+}
+
+fn isAsciiAlpha(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
+}
 
 // ─── ZIP scanner ──────────────────────────────────────────────────────
 
@@ -1148,6 +1194,38 @@ test "PartStore.open: rejects non-PK file" {
     defer std.testing.allocator.free(path);
 
     try std.testing.expectError(Error.NotPkzip, PartStore.open(std.testing.allocator, path));
+}
+
+test "looksExternal classifies URL / UNC / drive-letter targets" {
+    // Real OOXML external relationship targets.
+    try std.testing.expect(looksExternal("https://example.com/a.png"));
+    try std.testing.expect(looksExternal("http://example.com"));
+    try std.testing.expect(looksExternal("mailto:foo@bar.com"));
+    try std.testing.expect(looksExternal("file:///etc/hosts"));
+    try std.testing.expect(looksExternal("\\\\server\\share\\foo.png"));
+    try std.testing.expect(looksExternal("C:\\foo\\bar.png"));
+    try std.testing.expect(looksExternal("C:/foo/bar.png"));
+    try std.testing.expect(looksExternal("z:/foo")); // lowercase drive
+
+    // In-package targets — must NOT trip the heuristic.
+    try std.testing.expect(!looksExternal("worksheets/sheet1.xml"));
+    try std.testing.expect(!looksExternal("../sharedStrings.xml"));
+    try std.testing.expect(!looksExternal("/xl/workbook.xml"));
+    try std.testing.expect(!looksExternal("xl/media/image1.png"));
+    try std.testing.expect(!looksExternal("foo.xml"));
+    try std.testing.expect(!looksExternal(""));
+    try std.testing.expect(!looksExternal("a"));
+}
+
+test "PartStore.resolve: external targets return null" {
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    var store = try PartStore.open(std.testing.allocator, fixture);
+    defer store.deinit();
+
+    try std.testing.expectEqual(@as(?[]const u8, null), try store.resolve("xl/worksheets/sheet1.xml", "https://example.com/a.png"));
+    try std.testing.expectEqual(@as(?[]const u8, null), try store.resolve("xl/worksheets/sheet1.xml", "mailto:foo@bar.com"));
+    try std.testing.expectEqual(@as(?[]const u8, null), try store.resolve("xl/worksheets/sheet1.xml", "C:\\foo.xlsx"));
 }
 
 test "attrAtSlice tolerates single-quoted XML attributes" {
