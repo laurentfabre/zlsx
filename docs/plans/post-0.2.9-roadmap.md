@@ -41,6 +41,39 @@ Public surface added by this batch:
 - `src/unicode/casefold.zig` + `src/unicode/nfc.zig` for the
   sheet-name dedup pipeline.
 
+### Known module-graph constraint (Zig 0.15.2)
+
+A `zlsx extract-images` CLI subcommand was attempted as part of
+this batch but reverted. The Zig 0.15 module-graph computation
+treats every file under a module's package directory as part of
+that module's tree, even files the root file doesn't transitively
+import. With:
+
+- `cli_mod` rooted at `src/cli.zig` (package dir = `src/`).
+- `package_mod` rooted at `src/package/root.zig` (package dir =
+  `src/package/`).
+- `writer_mod` rooted at `src/writer.zig` (package dir = `src/`).
+
+When `cli_mod` adds both `zlsx_pkg` and `writer` as imports, Zig
+sees `src/package/store.zig` reachable from both `zlsx_pkg`'s tree
+(via `root.zig`) AND `writer`'s tree (because `src/package/` lives
+under `src/`, writer's package dir). It rejects with:
+
+    error: file exists in modules 'root' and 'writer'
+
+Workarounds for the next attempt:
+1. Move `src/package/` to a sibling directory (`pkg/` or
+   `subpkg/package/`) so it isn't under writer's package dir.
+2. Ship `extract-images` as a separate executable that links only
+   the package layer — no Editor / Writer.
+3. Use direct path imports in `store.zig` (`@import("../writer.zig")`)
+   so no named-module mechanism is needed; trade-off is a tighter
+   coupling that pulls writer into every consumer.
+
+Until one of those lands, callers wanting to extract images
+programmatically can use `zlsx_pkg` directly from a Zig program.
+The CLI surface stays as it was before this attempt.
+
 ## TL;DR
 
 Three quick wins (A1 Unicode + char-length, A2 Windows tests, A3 bench
