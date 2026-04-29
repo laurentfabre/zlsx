@@ -385,41 +385,12 @@ fn scanChartsWithTags(
 
         // Charts live inside <xdr:graphicFrame>...<c:chart r:id=...
         const gf_idx = std.mem.indexOf(u8, block, tags.open_graphic_frame) orelse continue;
-        // The chart-namespace prefix can be declared LOCALLY on the
-        // <*:chart> element rather than on the drawing root (valid
-        // OOXML scoping pattern). Try BOTH the block-local prefix
-        // and the drawing-root prefix — XML allows redundant local
-        // declarations whose prefixes aren't the one actually used
-        // by the chart element, so picking the first match anywhere
-        // in the block could miss valid root-scoped charts.
-        var block_chart_buf: [128]u8 = undefined;
-        // Block-level: scan the full block, not capped at 4 KiB.
-        // The drawing-root scan is bounded; per-anchor blocks need
-        // unbounded scope so locally declared chart-namespace
-        // bindings past 4 KiB into the block are still reachable.
-        const block_chart_prefix_t = findLocalNamespacePrefix(block, ns_c_transitional);
-        const block_chart_prefix_s = findLocalNamespacePrefix(block, ns_c_strict);
-        const root_open_chart = tags.open_chart;
-        const chart_idx = blk: {
-            // Try every plausible prefix for the chart namespace —
-            // local Transitional, local Strict, and the drawing-
-            // root resolved prefix. Whichever matches the actual
-            // `<*:chart` element in the block wins. This covers
-            // mixed-conformance blocks that declare both URIs.
-            const candidates = [_]?[]const u8{
-                block_chart_prefix_t,
-                block_chart_prefix_s,
-                prefixes.c_alt, // drawing-root alternate-class binding
-            };
-            for (candidates) |maybe_p| {
-                const p = maybe_p orelse continue;
-                const local_open = std.fmt.bufPrint(&block_chart_buf, "<{s}:chart", .{p}) catch continue;
-                if (std.mem.indexOfPos(u8, block, gf_idx, local_open)) |idx| break :blk idx;
-            }
-            // Fall back to the drawing-root primary prefix.
-            if (std.mem.indexOfPos(u8, block, gf_idx, root_open_chart)) |idx| break :blk idx;
-            continue;
-        };
+        // Scan for any `<*:chart` element whose prefix is bound to
+        // either chart URI (block-local OR drawing-root). Walking by
+        // tag rather than by prefix avoids the "multiple local
+        // bindings to the same chart URI" failure mode where
+        // collect-first-prefix would pick an unused declaration.
+        const chart_idx = findLocalChartElement(block, gf_idx, prefixes) orelse continue;
         const chart_end = std.mem.indexOfScalarPos(u8, block, chart_idx, '>') orelse continue;
         const chart_attrs = block[chart_idx .. chart_end + 1];
         const embed_rid = attrValue(chart_attrs, "r:id") orelse continue;
@@ -840,6 +811,113 @@ const max_prefix_len: usize = 100;
 
 fn findNamespacePrefix(xml: []const u8, target_uri: []const u8) ?[]const u8 {
     return findNamespacePrefixExcept(xml, target_uri, "");
+}
+
+/// Walk `block` from `start` for any `<*:chart` opener whose
+/// prefix is bound to either chart URI in the block (or matches
+/// the drawing-root primary / alternate prefix). Returns the index
+/// of the `<` on hit. Verifying the prefix per-tag means redundant
+/// xmlns declarations that aren't actually used by `<c:chart>`
+/// can't shadow the binding that IS used — the previous
+/// "collect first prefix bound to URI" approach failed when an
+/// unused declaration appeared first.
+fn findLocalChartElement(block: []const u8, start: usize, prefixes: DrawingPrefixes) ?usize {
+    var i = start;
+    while (std.mem.indexOfPos(u8, block, i, ":chart")) |colon| {
+        // The byte immediately after `:chart` must end the tag name
+        // (space, `>`, or `/`); otherwise this is a longer name
+        // that happens to contain ":chart" (e.g. `:chartSpace`).
+        const after = colon + ":chart".len;
+        if (after >= block.len) {
+            i = colon + 1;
+            continue;
+        }
+        const ch_after = block[after];
+        if (ch_after != ' ' and ch_after != '\t' and ch_after != '\n' and
+            ch_after != '\r' and ch_after != '>' and ch_after != '/')
+        {
+            i = colon + 1;
+            continue;
+        }
+        // Walk back from `colon` to the start of the prefix; the
+        // byte immediately before the prefix must be `<`.
+        var p_start = colon;
+        while (p_start > 0) : (p_start -= 1) {
+            const c = block[p_start - 1];
+            if (c == '<') break;
+            if (!isPrefixByte(c)) {
+                p_start = colon; // sentinel: no valid prefix
+                break;
+            }
+        }
+        if (p_start == colon or p_start == 0 or block[p_start - 1] != '<') {
+            i = colon + 1;
+            continue;
+        }
+        const prefix = block[p_start..colon];
+        // Verify the prefix is bound to a chart URI — try block-
+        // local first, then fall back to the drawing-root
+        // resolution.
+        const uri_local = uriOfPrefixLocal(block, prefix);
+        const matches_local = if (uri_local) |u|
+            std.mem.eql(u8, u, ns_c_transitional) or std.mem.eql(u8, u, ns_c_strict)
+        else
+            false;
+        const matches_root_primary = std.mem.eql(u8, prefix, prefixes.c);
+        const matches_root_alt = if (prefixes.c_alt) |alt|
+            std.mem.eql(u8, prefix, alt)
+        else
+            false;
+        if (matches_local or matches_root_primary or matches_root_alt) {
+            return p_start - 1; // index of `<`
+        }
+        i = colon + 1;
+    }
+    return null;
+}
+
+inline fn isPrefixByte(c: u8) bool {
+    return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or
+        (c >= '0' and c <= '9') or c == '_' or c == '.' or c == '-';
+}
+
+/// Same as `uriOfPrefix` but scans the FULL block instead of
+/// capping at 4 KiB. Used by `findLocalChartElement` when verifying
+/// a tag-derived prefix that may be declared late in the block.
+fn uriOfPrefixLocal(xml: []const u8, prefix: []const u8) ?[]const u8 {
+    if (prefix.len == 0) return null;
+    const limit = xml.len;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml[0..limit], i, "xmlns:")) |start| {
+        const after = start + "xmlns:".len;
+        if (after >= limit) return null;
+        var name_end = after;
+        while (name_end < limit) : (name_end += 1) {
+            const c = xml[name_end];
+            if (c == '=' or c == ' ' or c == '\t' or c == '\n' or c == '\r') break;
+        }
+        if (name_end >= limit) return null;
+        const name = xml[after..name_end];
+        var p = name_end;
+        while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
+        if (p >= limit or xml[p] != '=') {
+            i = after;
+            continue;
+        }
+        p += 1;
+        while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
+        if (p >= limit) return null;
+        const quote = xml[p];
+        if (quote != '"' and quote != '\'') {
+            i = p;
+            continue;
+        }
+        const val_start = p + 1;
+        const val_end = std.mem.indexOfScalarPos(u8, xml[0..limit], val_start, quote) orelse return null;
+        if (std.mem.eql(u8, name, prefix)) return xml[val_start..val_end];
+        i = val_end + 1;
+    }
+    return null;
 }
 
 /// Same as `findNamespacePrefix` but scans the FULL `xml` input
@@ -1589,6 +1667,34 @@ test "parseAbsoluteAnchor unit test" {
         @as(?AbsoluteAnchor, null),
         parseAbsoluteAnchor("<xdr:absoluteAnchor></xdr:absoluteAnchor>", "<xdr:pos", "<xdr:ext"),
     );
+}
+
+test "findLocalChartElement matches the actually-used prefix among multiple bindings" {
+    // A block with two prefixes bound to the chart URI: the first
+    // (`u`) is unused, the second (`c2`) is on the actual chart
+    // element. The previous "collect first prefix bound to URI"
+    // approach picked `u` and missed the chart; scanning by tag
+    // verifies per-element so `c2` is found.
+    const block =
+        "<xdr:graphicFrame>" ++
+        "<some xmlns:u=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"/>" ++
+        "<c2:chart xmlns:c2=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"rId1\"/>" ++
+        "</xdr:graphicFrame>";
+    const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame").?;
+    const found = findLocalChartElement(block, gf_idx, .{});
+    try std.testing.expect(found != null);
+    // `<c2:chart` should be at the position the helper returns.
+    try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<c2:chart"));
+}
+
+test "findLocalChartElement skips ':chartSpace' false matches" {
+    // `<c:chartSpace>` is NOT `<c:chart>` — the byte after `:chart`
+    // determines whether it's the chart element or a different one.
+    const block = "<xdr:graphicFrame><c:chartSpace/></xdr:graphicFrame>";
+    const gf_idx = 0;
+    var prefixes: DrawingPrefixes = .{};
+    prefixes.c = "c";
+    try std.testing.expectEqual(@as(?usize, null), findLocalChartElement(block, gf_idx, prefixes));
 }
 
 test "findLocalNamespacePrefix walks past 4 KiB inside a block" {
