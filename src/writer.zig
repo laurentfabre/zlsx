@@ -2702,11 +2702,12 @@ fn assertNoForbiddenXmlBytes(s: []const u8) !void {
 }
 
 inline fn isForbiddenXmlByte(c: u8) bool {
-    // Allow tab (0x09), LF (0x0A), CR (0x0D); reject everything
-    // else < 0x20, plus DEL (0x7F).
+    // XML 1.0 `Char` production: #x9 | #xA | #xD | [#x20-#xD7FF] ...
+    // Legal byte-level chars are tab (0x09), LF (0x0A), CR (0x0D),
+    // and anything ≥ 0x20. Everything else < 0x20 must be rejected.
+    // DEL (0x7F) IS valid — it falls inside `[#x20-#xD7FF]`.
     if (c == 0x09 or c == 0x0A or c == 0x0D) return false;
     if (c < 0x20) return true;
-    if (c == 0x7F) return true;
     return false;
 }
 
@@ -5381,7 +5382,6 @@ test "appendXmlEscaped rejects forbidden XML 1.0 control bytes" {
         "tab\x0Bvtab", // vertical tab
         "ff\x0C", // form feed
         "esc\x1B", // escape
-        "\x7F", // DEL
     };
     for (cases) |c| {
         out.clearRetainingCapacity();
@@ -5390,8 +5390,8 @@ test "appendXmlEscaped rejects forbidden XML 1.0 control bytes" {
             appendXmlEscaped(std.testing.allocator, &out, c),
         );
     }
-    // Allowed control bytes pass through.
-    const allowed = [_][]const u8{ "tab\there", "lf\nhere", "cr\rhere" };
+    // Allowed: tab, LF, CR, and DEL (0x7F is in XML 1.0 `Char`).
+    const allowed = [_][]const u8{ "tab\there", "lf\nhere", "cr\rhere", "del\x7Fhere" };
     for (allowed) |c| {
         out.clearRetainingCapacity();
         try appendXmlEscaped(std.testing.allocator, &out, c);
