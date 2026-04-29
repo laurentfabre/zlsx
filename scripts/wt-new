@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# wt-new — create a sibling worktree with an isolated build cache.
+#
+# Usage:  scripts/wt-new <branch-name> [base-ref]
+#
+# Each worktree gets its own filesystem checkout under
+# ../<repo>-<branch>/, with its own .zig-cache/. This keeps parallel
+# agent sessions from thrashing a shared build cache and lets you
+# review one branch while a build runs against another.
+#
+# This is a convention-only helper — no enforcement, no gate. See
+# docs/enforcement-plan.md Phase 3 for context.
+
+set -euo pipefail
+
+if [ "$#" -lt 1 ]; then
+  cat >&2 <<EOF
+Usage: scripts/wt-new <branch-name> [base-ref]
+
+  branch-name   Name of the new branch to create.
+  base-ref      Branch or ref to anchor against. Default: main.
+
+Example:
+  scripts/wt-new feat/streaming-sst
+  scripts/wt-new fix/header-padding origin/release-0.3
+EOF
+  exit 1
+fi
+
+branch="$1"
+base="${2:-main}"
+
+repo_root=$(git rev-parse --show-toplevel)
+parent_dir=$(dirname "$repo_root")
+target_name="$(basename "$repo_root")-${branch//\//-}"
+target_dir="$parent_dir/$target_name"
+
+if [ -e "$target_dir" ]; then
+  echo "wt-new: $target_dir already exists" >&2
+  exit 1
+fi
+
+# Anchor on the latest base from origin so the worktree starts from
+# what reviewers will compare against, not stale local state.
+git fetch origin "$base" --quiet
+git worktree add -b "$branch" "$target_dir" "origin/$base"
+
+cat <<EOF
+
+Worktree ready.
+
+  path:    $target_dir
+  branch:  $branch  (from origin/$base)
+
+Next steps:
+  cd "$target_dir"
+  # ... edits + commits ...
+  git push -u origin "$branch"
+  gh pr create --fill
+
+Each worktree owns its own .zig-cache/, so parallel sessions never
+race on builds. Tear down with:  git worktree remove "$target_dir"
+EOF
