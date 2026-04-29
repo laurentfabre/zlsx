@@ -556,38 +556,26 @@ const DrawingPrefixes = struct {
 /// parts only declare the chart namespace inline on `<c:chart>`).
 fn resolveDrawingPrefixes(xml: []const u8) DrawingPrefixes {
     var p: DrawingPrefixes = .{};
-    // Both Transitional and Strict declarations may appear in the
-    // same root element — picking either order arbitrarily breaks
-    // documents that bind the unused conformance class to a stray
-    // prefix. Disambiguate by anchoring on the ROOT ELEMENT's
-    // prefix: whichever URI it's bound to is the "active" xdr
-    // namespace; the same-URI binding for `a`/`c` follows.
+    // The xdr / a / c namespaces are independently scoped: a
+    // document can bind one to its Strict URI and another to its
+    // Transitional URI under different prefixes. Anchor xdr on
+    // the root element when possible (so a stray binding doesn't
+    // override the prefix actually used by `<*:wsDr>`), but
+    // resolve `a` and `c` independently across both URIs.
     const root_xdr = rootElementPrefix(xml);
     if (root_xdr) |pref| {
         p.xdr = pref;
-        const root_uri = uriOfPrefix(xml, pref);
-        if (root_uri == .strict) {
-            if (findNamespacePrefix(xml, ns_a_strict)) |pref2| p.a = pref2;
-            if (findNamespacePrefix(xml, ns_c_strict)) |pref2| p.c = pref2;
-        } else {
-            // Transitional or unknown — use Transitional URIs.
-            if (findNamespacePrefix(xml, ns_a_transitional)) |pref2| p.a = pref2;
-            if (findNamespacePrefix(xml, ns_c_transitional)) |pref2| p.c = pref2;
-        }
-    } else {
-        // No identifiable root prefix — fall back to either URI
-        // for each namespace independently.
-        if (findNamespacePrefix(xml, ns_xdr_transitional) orelse
-            findNamespacePrefix(xml, ns_xdr_strict)) |pref| p.xdr = pref;
-        if (findNamespacePrefix(xml, ns_a_transitional) orelse
-            findNamespacePrefix(xml, ns_a_strict)) |pref| p.a = pref;
-        if (findNamespacePrefix(xml, ns_c_transitional) orelse
-            findNamespacePrefix(xml, ns_c_strict)) |pref| p.c = pref;
+    } else if (findNamespacePrefix(xml, ns_xdr_transitional) orelse
+        findNamespacePrefix(xml, ns_xdr_strict)) |pref|
+    {
+        p.xdr = pref;
     }
+    if (findNamespacePrefix(xml, ns_a_transitional) orelse
+        findNamespacePrefix(xml, ns_a_strict)) |pref| p.a = pref;
+    if (findNamespacePrefix(xml, ns_c_transitional) orelse
+        findNamespacePrefix(xml, ns_c_strict)) |pref| p.c = pref;
     return p;
 }
-
-const NamespaceVariant = enum { transitional, strict, unknown };
 
 /// Find the prefix on the root XML element. Skips the XML
 /// declaration (`<?xml ... ?>`) and any leading whitespace, then
@@ -628,55 +616,6 @@ fn rootElementPrefix(xml: []const u8) ?[]const u8 {
         return null;
     }
     return null;
-}
-
-/// Given a prefix declared somewhere in `xml`'s root element, return
-/// which OOXML conformance class its xmlns binding belongs to.
-/// Walks every xmlns:* declaration so a partial-match like
-/// "xmlns:xdr" doesn't satisfy a lookup for prefix "x".
-fn uriOfPrefix(xml: []const u8, prefix: []const u8) NamespaceVariant {
-    const limit = @min(xml.len, 4096);
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, xml[0..limit], i, "xmlns:")) |start| {
-        const after = start + "xmlns:".len;
-        if (after + prefix.len > limit) return .unknown;
-        // Require an exact match: the prefix must equal `prefix` and
-        // be followed by whitespace or `=`.
-        if (std.mem.eql(u8, xml[after .. after + prefix.len], prefix)) {
-            const sep_pos = after + prefix.len;
-            if (sep_pos < limit) {
-                const sep = xml[sep_pos];
-                if (sep == '=' or sep == ' ' or sep == '\t' or sep == '\n' or sep == '\r') {
-                    var p = sep_pos;
-                    while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
-                    if (p >= limit or xml[p] != '=') {
-                        i = sep_pos;
-                        continue;
-                    }
-                    p += 1;
-                    while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
-                    if (p >= limit) return .unknown;
-                    const quote = xml[p];
-                    if (quote != '"' and quote != '\'') {
-                        i = p;
-                        continue;
-                    }
-                    const val_start = p + 1;
-                    const val_end = std.mem.indexOfScalarPos(u8, xml[0..limit], val_start, quote) orelse return .unknown;
-                    const uri = xml[val_start..val_end];
-                    if (std.mem.eql(u8, uri, ns_xdr_strict) or
-                        std.mem.eql(u8, uri, ns_a_strict) or
-                        std.mem.eql(u8, uri, ns_c_strict)) return .strict;
-                    if (std.mem.eql(u8, uri, ns_xdr_transitional) or
-                        std.mem.eql(u8, uri, ns_a_transitional) or
-                        std.mem.eql(u8, uri, ns_c_transitional)) return .transitional;
-                    return .unknown;
-                }
-            }
-        }
-        i = after;
-    }
-    return .unknown;
 }
 
 /// Walk the first 4 KiB of `xml` looking for `xmlns:NAME="URI"`.
