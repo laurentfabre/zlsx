@@ -9,7 +9,7 @@ Status as of 2026-04-30. Single-author public repo (`laurentfabre/zlsx`), Zig 0.
 | 1 | Free wins: branch protection, repo merge settings, CODEOWNERS, PR template | **Done (2026-04-30)** |
 | 2 | TDD CI gates: test-presence, C-ABI 3-file-transaction, monotonic test count | **Done (2026-04-30, advisory)** |
 | 3 | Worktree + subagent conventions: helper script, commit-msg trailer, PR template fields | **Done (2026-04-30)** |
-| 4 | Agent-as-reviewer CI job (codex-review-on-PR) | Not started |
+| 4 | Agent-as-reviewer CI job (codex-review-on-PR) | **Done (2026-04-30, requires `OPENAI_API_KEY` secret)** |
 | 5 | Optional: coverage gate, TDAD map, mutation testing | Deferred |
 
 ---
@@ -211,6 +211,34 @@ BASE_SHA=$(git merge-base origin/main HEAD) HEAD_SHA=HEAD LABELS='["abi-no-3file
 - Hooks are wired via `core.hooksPath = scripts/githooks` (set by `scripts/install-hooks.sh`). Adding a new hook is just dropping the file in `scripts/githooks/` with executable bit set.
 - The `commit-msg` hook intentionally never blocks. If the convention sticks (i.e. trailers appear consistently), promote to a hard fail later.
 - `wt-new` slug-escapes `/` in branch names (`feat/streaming-sst` → `zlsx-feat-streaming-sst/`) to avoid filesystem nesting surprises.
+
+## Phase 4 — implementation log
+
+- [x] `.github/workflows/codex-review.yml` created (2026-04-30)
+- [x] `codex-review` PR label created on GitHub (forces a review run; also re-runs on draft PRs).
+- [ ] **Pending user action**: add `OPENAI_API_KEY` as a repository secret under Settings → Secrets → Actions. Until set, the workflow gracefully no-ops with a CI warning.
+
+### Workflow shape
+
+- Triggers on `pull_request` (opened / synchronize / reopened / ready_for_review / labeled).
+- Skips draft PRs unless they carry the `codex-review` label.
+- Pins reasoning effort to `low`, hides agent-reasoning trace, disables MCP servers, and excludes secret-shaped env vars from any spawned shells.
+- Posts the review as a single comment per PR — re-runs **update** that comment in place (via a hidden `<!-- codex-review-on-pr -->` marker) instead of stacking.
+- Capped at 600 s (codex `timeout`) and 15 min (job).
+- Truncates output above 60 KB to stay under GitHub's comment size cap; full review remains in the action log.
+
+### Costs and trade-offs
+
+- Every non-draft PR triggers one codex run. With `low` reasoning effort and `service_tier="fast"`, expect ~30-90 s per run.
+- Review is **advisory** — not in `required_status_checks`. Promote later if the signal-to-noise ratio justifies it.
+- Forgeable: a determined contributor could push code that exploits prompt-injection in comments / fixtures. Treat the review as "second opinion", not authoritative.
+- The model still sees whatever it reads from files. Keep `.env`, real fixtures with secrets, and any sensitive content out of the diff.
+
+### Tuning knobs
+
+- Bump reasoning effort to `medium` if reviews miss obvious issues.
+- Pin a specific codex CLI version (`@openai/codex@<version>`) once a stable release is known to work in CI; the current `@latest` is a moving target.
+- Switch to `xhigh` reasoning effort for security-critical paths via a per-path matrix; current single-job design is intentionally simple.
 
 ## Phase 1 — operational note
 

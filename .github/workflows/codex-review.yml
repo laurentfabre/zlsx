@@ -1,0 +1,142 @@
+name: Codex review
+
+# Phase-4 enforcement: auto-runs `codex review` on every PR diff and
+# posts findings as an updating PR comment. Report-only — not in
+# required_status_checks. See docs/enforcement-plan.md.
+#
+# Setup required (one-time):
+#   1. Add an `OPENAI_API_KEY` repository secret in GitHub Settings.
+#      Until set, the job no-ops with a warning.
+#   2. Optionally tune the codex install / invocation in the steps below.
+#
+# Manual trigger: add the `codex-review` label to a PR to force a re-run.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  codex-review:
+    name: Codex review
+    runs-on: ubuntu-22.04
+    # Skip drafts unless they explicitly opt in via the label.
+    if: |
+      github.event.pull_request.draft == false ||
+      contains(github.event.pull_request.labels.*.name, 'codex-review')
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gate on OPENAI_API_KEY secret
+        id: gate
+        env:
+          HAS_KEY: ${{ secrets.OPENAI_API_KEY != '' }}
+        run: |
+          if [ "$HAS_KEY" = "true" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::OPENAI_API_KEY secret not set — skipping codex review."
+            echo "::warning::Add it under Settings → Secrets → Actions to enable."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Node 20
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install codex CLI
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          # Pin a known release; bump deliberately. The published npm
+          # package wraps the rust binary for that platform.
+          npm install -g @openai/codex@latest
+          codex --version
+
+      - name: Run codex review
+        id: review
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BASE_REF: origin/${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/codex
+          # Profile-style flags inline (the runner has no ~/.codex/config.toml).
+          # `low` reasoning effort: review is recall-bound, xhigh is wasted.
+          # `mcp_servers={}`: no MCP server boot in CI.
+          # `shell_environment_policy.exclude`: strip secret-shaped env vars
+          # from any shells codex spawns. Note: the model still sees
+          # whatever it reads from files — keep `.env` etc. out of the diff.
+          timeout 600 codex \
+            --sandbox read-only \
+            -a never \
+            -c 'model_reasoning_effort="low"' \
+            -c 'service_tier="fast"' \
+            -c 'mcp_servers={}' \
+            -c 'hide_agent_reasoning=true' \
+            -c 'shell_environment_policy.exclude=["AWS_*","AZURE_*","GCP_*","OPENAI_*","ANTHROPIC_*","DATABASE_URL","REDIS_URL","PGPASSWORD","*_PASSWORD","*_PASSWD","*_SECRET","*_TOKEN","*_KEY","*_CREDENTIALS","GOOGLE_APPLICATION_CREDENTIALS"]' \
+            review --base "$BASE_REF" \
+            > /tmp/codex/review.md 2> /tmp/codex/codex.err || echo "codex exited non-zero — proceeding to post whatever was captured"
+
+          echo "=== first 40 lines of review ==="
+          head -40 /tmp/codex/review.md || true
+
+      - name: Post / update PR review comment
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body;
+            try {
+              body = fs.readFileSync('/tmp/codex/review.md', 'utf8');
+            } catch (e) {
+              core.warning('codex review output missing — nothing to post');
+              return;
+            }
+            if (!body.trim()) {
+              core.warning('codex review output empty — nothing to post');
+              return;
+            }
+            // GitHub comment body cap is ~65 KB; leave headroom.
+            const maxLen = 60000;
+            const truncated = body.length > maxLen
+              ? body.slice(0, maxLen) + '\n\n_(truncated — full review in the action log)_'
+              : body;
+            // Magic marker so re-runs update the same comment in place.
+            const marker = '<!-- codex-review-on-pr -->';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            const newBody = `${marker}\n## 🤖 Codex review (advisory)\n\n${truncated}`;
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: newBody,
+              });
+              core.info(`Updated comment ${existing.id}`);
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: newBody,
+              });
+              core.info('Created new review comment');
+            }
