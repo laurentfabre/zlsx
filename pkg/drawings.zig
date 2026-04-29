@@ -1050,6 +1050,9 @@ inline fn isNameTerminator(c: u8) bool {
 /// finds the real tag-closing `>`.
 fn isInsideOpeningTag(xml: []const u8, pos: usize) bool {
     if (pos == 0) return false;
+    // Reject if `pos` is inside an XML comment or CDATA section —
+    // markup-shaped text inside those isn't real markup.
+    if (isInsideCommentOrCdata(xml, pos)) return false;
     var lt = pos;
     while (lt > 0 and xml[lt] != '<') : (lt -= 1) {}
     if (xml[lt] != '<') return false;
@@ -1060,6 +1063,25 @@ fn isInsideOpeningTag(xml: []const u8, pos: usize) bool {
     // before the tag-closing `>`. If yes, pos is inside the tag.
     const tag_end = findUnquotedTagEnd(xml, lt + 1) orelse return false;
     return pos < tag_end;
+}
+
+/// True if `pos` is inside an XML comment (`<!-- ... -->`) or
+/// CDATA section (`<![CDATA[ ... ]]>`). Markup-shaped text inside
+/// those isn't markup the parser should respect.
+fn isInsideCommentOrCdata(xml: []const u8, pos: usize) bool {
+    if (pos == 0) return false;
+    const head = xml[0..pos];
+    // Comment: latest `<!--` after the latest `-->`.
+    if (std.mem.lastIndexOf(u8, head, "<!--")) |open| {
+        const close_opt = std.mem.lastIndexOf(u8, head, "-->");
+        if (close_opt == null or close_opt.? < open) return true;
+    }
+    // CDATA: latest `<![CDATA[` after the latest `]]>`.
+    if (std.mem.lastIndexOf(u8, head, "<![CDATA[")) |open| {
+        const close_opt = std.mem.lastIndexOf(u8, head, "]]>");
+        if (close_opt == null or close_opt.? < open) return true;
+    }
+    return false;
 }
 
 /// Walk `xml` from `start` looking for the `>` that ends a tag,
@@ -1927,6 +1949,23 @@ test "findLocalChartElement: xmlns after a quoted `>` in same tag is honored" {
     const found = findLocalChartElement(block, gf_idx, prefixes);
     try std.testing.expect(found != null);
     try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<p:chart"));
+}
+
+test "findLocalChartElement: fake markup with xmlns inside a comment is ignored" {
+    // A comment contains FAKE markup that includes a real-looking
+    // opening tag with a quoted `>` and an xmlns binding. The
+    // namespace scope scan must walk past the entire comment and
+    // not be tricked by the inner `<x>` opener.
+    const block =
+        "<xdr:graphicFrame>" ++
+        "<!-- <x descr=\"a > b\" xmlns:c=\"http://example.com/bad\"> -->" ++
+        "<c:chart r:id=\"rId1\"/>" ++
+        "</xdr:graphicFrame>";
+    const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame").?;
+    const prefixes: DrawingPrefixes = .{};
+    const found = findLocalChartElement(block, gf_idx, prefixes);
+    try std.testing.expect(found != null);
+    try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<c:chart"));
 }
 
 test "findLocalChartElement: xmlns-looking text in XML comment is ignored" {
