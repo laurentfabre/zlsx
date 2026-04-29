@@ -517,28 +517,38 @@ fn detectChartTypeWithAlt(
 /// (libreoffice, hand-edited drawings) sometimes emit single
 /// quotes, and skipping them silently dropped image/chart anchors.
 fn attrValue(attrs: []const u8, key: []const u8) ?[]const u8 {
-    // Walk attrs scanning for `key`-followed-by-(whitespace-or-=)`,
-    // then optional whitespace, then `=`, optional whitespace,
-    // then quote-delimited value. XML 1.0 §3.1 permits whitespace
-    // around `=`; the previous fixed-byte needle only matched
-    // `key="value"` / `key='value'` and dropped attributes
-    // emitted with whitespace.
+    // Walk attrs as a tag-attribute slice, tracking quoted regions
+    // so a substring inside one attribute's VALUE can't masquerade
+    // as another attribute name. At each unquoted, word-boundary
+    // position try to match: key, optional whitespace, `=`,
+    // optional whitespace, quote-delimited value.
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, attrs, i, key)) |start| {
-        // Require word boundary before key (start of slice or
-        // whitespace), so a substring match like "ny" inside
-        // "any" doesn't satisfy a lookup for "ny".
-        if (start > 0) {
-            const prev = attrs[start - 1];
-            if (prev != ' ' and prev != '\t' and prev != '\n' and prev != '\r') {
-                i = start + 1;
-                continue;
-            }
+    while (i < attrs.len) {
+        const c = attrs[i];
+        // Skip over quoted runs entirely.
+        if (c == '"' or c == '\'') {
+            const close = std.mem.indexOfScalarPos(u8, attrs, i + 1, c) orelse return null;
+            i = close + 1;
+            continue;
         }
-        var p = start + key.len;
+        // Word boundary: only consider candidate keys at slice
+        // start or after XML whitespace.
+        const at_word_boundary = i == 0 or
+            attrs[i - 1] == ' ' or attrs[i - 1] == '\t' or
+            attrs[i - 1] == '\n' or attrs[i - 1] == '\r';
+        if (!at_word_boundary) {
+            i += 1;
+            continue;
+        }
+        if (i + key.len > attrs.len) return null;
+        if (!std.mem.eql(u8, attrs[i .. i + key.len], key)) {
+            i += 1;
+            continue;
+        }
+        var p = i + key.len;
         while (p < attrs.len and (attrs[p] == ' ' or attrs[p] == '\t' or attrs[p] == '\n' or attrs[p] == '\r')) p += 1;
         if (p >= attrs.len or attrs[p] != '=') {
-            i = start + 1;
+            i += 1;
             continue;
         }
         p += 1;
@@ -546,7 +556,7 @@ fn attrValue(attrs: []const u8, key: []const u8) ?[]const u8 {
         if (p >= attrs.len) return null;
         const quote = attrs[p];
         if (quote != '"' and quote != '\'') {
-            i = p;
+            i += 1;
             continue;
         }
         const val_start = p + 1;
@@ -1254,6 +1264,13 @@ test "attrValue tolerates whitespace around =" {
     try std.testing.expectEqual(
         @as(?[]const u8, null),
         attrValue("any=\"v\"", "ny"),
+    );
+    // Substring inside a quoted VALUE must NOT match (quote-aware
+    // walking). A descr value containing `x = 'fake'` shouldn't
+    // satisfy a lookup for `x`.
+    try std.testing.expectEqualStrings(
+        "real",
+        attrValue("descr=\"foo x = 'fake'\" x=\"real\"", "x").?,
     );
 }
 
