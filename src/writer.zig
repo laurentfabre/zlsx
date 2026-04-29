@@ -6461,3 +6461,56 @@ test "writeRowWithFormulas atomicity: forbidden byte in formula bails before any
     );
     try std.testing.expectEqual(body_before, sw.body.items.len);
 }
+
+test "Style round-trip: font_name with XML specials, alignment, wrap, diagonals" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, "style_roundtrip.xlsx");
+    defer std.testing.allocator.free(tmp_path);
+
+    {
+        var w = Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Sheet1");
+        // Style 1: font name carries `&`, `<`, `"` — XML-escaped on
+        // emit; reader must entity-decode on readback.
+        const sid_font = try w.addStyle(.{
+            .font_name = "A&B<\"co\">",
+            .font_size = .{ 12.5, 0 }[0],
+        });
+        // Style 2: alignment + wrap_text — nested <alignment> child.
+        const sid_align = try w.addStyle(.{
+            .alignment_horizontal = .center,
+            .wrap_text = true,
+        });
+        // Style 3: diagonal direction flags — attributes on <border>.
+        const sid_diag = try w.addStyle(.{
+            .border_diagonal = .{ .style = .thin, .color_argb = 0xFF000000 },
+            .diagonal_up = true,
+            .diagonal_down = true,
+        });
+        try sheet.writeRowStyled(
+            &.{ .{ .string = "x" }, .{ .string = "y" }, .{ .string = "z" } },
+            &.{ sid_font, sid_align, sid_diag },
+        );
+        try w.save(tmp_path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    defer book.deinit();
+
+    // Style 1 → font_name decoded.
+    const font = book.cellFont(1) orelse return error.MissingStyle1;
+    try std.testing.expectEqualStrings("A&B<\"co\">", font.name);
+
+    // Style 2 → alignment.horizontal == "center", wrap_text == true.
+    const align_rec = book.cellAlignment(2) orelse return error.MissingStyle2;
+    try std.testing.expect(align_rec.horizontal != null);
+    try std.testing.expectEqualStrings("center", align_rec.horizontal.?);
+    try std.testing.expectEqual(true, align_rec.wrap_text);
+
+    // Style 3 → diagonal_up + diagonal_down.
+    const border = book.cellBorder(3) orelse return error.MissingStyle3;
+    try std.testing.expectEqual(true, border.diagonal_up);
+    try std.testing.expectEqual(true, border.diagonal_down);
+}

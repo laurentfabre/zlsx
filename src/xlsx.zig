@@ -356,6 +356,11 @@ pub const Border = struct {
     top: BorderSide = .{},
     bottom: BorderSide = .{},
     diagonal: BorderSide = .{},
+    /// Direction flag from `<border diagonalUp="1">`. Only renders
+    /// when `diagonal.style != .none`.
+    diagonal_up: bool = false,
+    /// Direction flag from `<border diagonalDown="1">`.
+    diagonal_down: bool = false,
 };
 
 /// A cell comment / note parsed from `xl/comments*.xml`. `text` is
@@ -394,6 +399,18 @@ pub const Font = struct {
     color_argb: ?u32 = null,
     size: ?f32 = null,
     name: []const u8 = "",
+};
+
+/// Alignment + wrap state extracted from the `<alignment>` child of a
+/// `<cellXfs>` `<xf>` element. Allows writer-emitted styles to round-
+/// trip through the reader without losing their alignment.
+pub const Alignment = struct {
+    /// OOXML `horizontal` enum value (e.g. "left", "center", "right",
+    /// "fill", "justify", "centerContinuous", "distributed", or null
+    /// for the default "general" — which OOXML omits).
+    horizontal: ?[]const u8 = null,
+    /// `wrapText="1"` was set on the `<alignment>` child.
+    wrap_text: bool = false,
 };
 
 pub const DomainError = error{
@@ -636,6 +653,9 @@ pub const Book = struct {
     /// `borders` table from styles.xml — index matches `borderId`.
     /// BorderSide.style slices borrow from `styles_xml`.
     borders: []Border = &.{},
+    /// One alignment record per `<xf>` under `<cellXfs>`. Default
+    /// `Alignment{}` for entries without an `<alignment>` child.
+    cell_xf_alignments: []Alignment = &.{},
     /// One borderId per `<xf>` under `<cellXfs>`. Use
     /// `Book.cellBorder(style_idx)` for the resolved lookup.
     cell_xf_border_ids: []u32 = &.{},
@@ -1088,6 +1108,15 @@ pub const Book = struct {
         return self.borders[border_id];
     }
 
+    /// Resolve `style_idx` (a cell's `s="N"`) to its alignment +
+    /// wrap state. Returns null when the index is out of range; the
+    /// default `Alignment{}` is returned for cells without an
+    /// `<alignment>` child on their `<xf>`.
+    pub fn cellAlignment(self: *const Book, style_idx: u32) ?Alignment {
+        if (style_idx >= self.cell_xf_alignments.len) return null;
+        return self.cell_xf_alignments[style_idx];
+    }
+
     pub fn deinit(self: *Book) void {
         const a = self.allocator;
         if (self.shared_strings_xml) |s| a.free(s);
@@ -1138,6 +1167,7 @@ pub const Book = struct {
         a.free(self.cell_xf_font_ids);
         a.free(self.cell_xf_fill_ids);
         a.free(self.cell_xf_border_ids);
+        a.free(self.cell_xf_alignments);
         a.free(self.fonts);
         a.free(self.fills);
         a.free(self.borders);
@@ -3142,7 +3172,17 @@ fn parseRprFlags(book: *const Book, arena: Allocator, rpr: []const u8) !RichRun 
             if (std.mem.indexOf(u8, tag, val_key)) |vp| {
                 const vs = vp + val_key.len;
                 if (std.mem.indexOfScalarPos(u8, tag, vs, '"')) |ve| {
-                    run.font_name = try arena.dupe(u8, tag[vs..ve]);
+                    // Font names with XML-special chars (e.g., `A&B`,
+                    // `x<y`) are entity-encoded in the attribute. Decode
+                    // before storing so callers see the original name.
+                    const raw = tag[vs..ve];
+                    if (std.mem.indexOfScalar(u8, raw, '&') == null) {
+                        run.font_name = try arena.dupe(u8, raw);
+                    } else {
+                        var dec: std.ArrayListUnmanaged(u8) = try .initCapacity(arena, raw.len);
+                        try appendDecoded(arena, &dec, raw);
+                        run.font_name = try dec.toOwnedSlice(arena);
+                    }
                 }
             }
         }
@@ -3408,14 +3448,27 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
                 }
             }
             const gt = std.mem.indexOfScalarPos(u8, block, border_pos, '>') orelse break;
+            // The opening `<border …>` tag carries the diagonalUp /
+            // diagonalDown direction flags as attributes; the body
+            // alone (the slice between `>` and `</border>`) doesn't
+            // see them. Capture both before recursing into the body.
+            const open_attrs = block[border_pos..gt];
+            const diag_up = std.mem.indexOf(u8, open_attrs, "diagonalUp=\"1\"") != null;
+            const diag_down = std.mem.indexOf(u8, open_attrs, "diagonalDown=\"1\"") != null;
             if (gt > 0 and block[gt - 1] == '/') {
-                try borders_list.append(book.allocator, .{});
+                try borders_list.append(book.allocator, .{
+                    .diagonal_up = diag_up,
+                    .diagonal_down = diag_down,
+                });
                 i = gt + 1;
                 continue;
             }
             const border_close = std.mem.indexOfPos(u8, block, gt, "</border>") orelse break;
             const body = block[gt + 1 .. border_close];
-            try borders_list.append(book.allocator, parseBorderBody(book, body));
+            var b = parseBorderBody(book, body);
+            b.diagonal_up = diag_up;
+            b.diagonal_down = diag_down;
+            try borders_list.append(book.allocator, b);
             i = border_close + "</border>".len;
         }
         book.borders = try borders_list.toOwnedSlice(book.allocator);
@@ -3464,6 +3517,8 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
     errdefer fill_ids.deinit(book.allocator);
     var border_ids: std.ArrayListUnmanaged(u32) = .{};
     errdefer border_ids.deinit(book.allocator);
+    var alignments: std.ArrayListUnmanaged(Alignment) = .{};
+    errdefer alignments.deinit(book.allocator);
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, xfs_block, i, "<xf")) |xp| {
         // Guard against longer tags that share the `<xf` prefix
@@ -3477,16 +3532,53 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
         }
         const gt = std.mem.indexOfScalarPos(u8, xfs_block, xp, '>') orelse break;
         const attrs = xfs_block[xp..gt];
-        i = gt + 1;
         try ids.append(book.allocator, parseXfAttrU32(attrs, "numFmtId=\"", 0));
         try font_ids.append(book.allocator, parseXfAttrU32(attrs, "fontId=\"", 0));
         try fill_ids.append(book.allocator, parseXfAttrU32(attrs, "fillId=\"", 0));
         try border_ids.append(book.allocator, parseXfAttrU32(attrs, "borderId=\"", 0));
+
+        // Alignment + wrap_text live on a nested `<alignment .../>`
+        // child — only present when applyAlignment="1" was set. A
+        // self-closing `<xf .../>` has no body and stays default.
+        var align_record: Alignment = .{};
+        const self_closing = gt > xp and xfs_block[gt - 1] == '/';
+        if (!self_closing) {
+            const body_end = std.mem.indexOfPos(u8, xfs_block, gt, "</xf>") orelse {
+                i = gt + 1;
+                try alignments.append(book.allocator, align_record);
+                continue;
+            };
+            const body = xfs_block[gt + 1 .. body_end];
+            if (std.mem.indexOf(u8, body, "<alignment")) |ap| {
+                const ap_gt = std.mem.indexOfScalarPos(u8, body, ap, '>') orelse 0;
+                if (ap_gt > ap) {
+                    const align_attrs = body[ap..ap_gt];
+                    align_record.horizontal = parseAlignmentHorizontal(align_attrs);
+                    align_record.wrap_text = std.mem.indexOf(u8, align_attrs, "wrapText=\"1\"") != null;
+                }
+            }
+            i = body_end + "</xf>".len;
+        } else {
+            i = gt + 1;
+        }
+        try alignments.append(book.allocator, align_record);
     }
     book.cell_xf_numfmt_ids = try ids.toOwnedSlice(book.allocator);
     book.cell_xf_font_ids = try font_ids.toOwnedSlice(book.allocator);
     book.cell_xf_fill_ids = try fill_ids.toOwnedSlice(book.allocator);
     book.cell_xf_border_ids = try border_ids.toOwnedSlice(book.allocator);
+    book.cell_xf_alignments = try alignments.toOwnedSlice(book.allocator);
+}
+
+/// Extract the value of `horizontal="…"` from an `<alignment>` tag's
+/// attribute slice. Returns null when absent (OOXML treats absent as
+/// "general"). Slice borrows from the input.
+fn parseAlignmentHorizontal(attrs: []const u8) ?[]const u8 {
+    const key = "horizontal=\"";
+    const kp = std.mem.indexOf(u8, attrs, key) orelse return null;
+    const vs = kp + key.len;
+    const ve = std.mem.indexOfScalarPos(u8, attrs, vs, '"') orelse return null;
+    return attrs[vs..ve];
 }
 
 /// Parse a single `<border>` body (between `<border>` and `</border>`)
