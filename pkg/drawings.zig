@@ -235,9 +235,34 @@ fn collectFromSheet(
     // namespace prefixes have no upper bound in the spec — Codex
     // flagged the previous 512 B buffer as a hard-fail surface for
     // valid-but-long custom prefixes.
-    var tags_buf: [4096]u8 = undefined;
-    const tags = try DrawingTags.build(&tags_buf, prefixes);
+    var primary_buf: [4096]u8 = undefined;
+    const primary_tags = try DrawingTags.build(&primary_buf, prefixes);
+    try scanImagesWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, prefixes, primary_tags, out);
 
+    // Mixed-prefix bindings: a descendant anchor may use a second
+    // prefix bound to the same spreadsheetDrawing URI. Replay the
+    // scan with the alt prefix; primary-prefixed anchors won't
+    // match, so no duplicates surface.
+    if (prefixes.xdr_alt) |alt| {
+        var alt_prefixes = prefixes;
+        alt_prefixes.xdr = alt;
+        var alt_buf: [4096]u8 = undefined;
+        const alt_tags = try DrawingTags.build(&alt_buf, alt_prefixes);
+        try scanImagesWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, alt_prefixes, alt_tags, out);
+    }
+}
+
+fn scanImagesWithTags(
+    store: *PartStore,
+    allocator: std.mem.Allocator,
+    drawing_part: store_mod.Part,
+    drawing_part_name: []const u8,
+    drawing_rels: []const store_mod.Relationship,
+    sheet_part: store_mod.Part,
+    prefixes: DrawingPrefixes,
+    tags: DrawingTags,
+    out: *std.ArrayListUnmanaged(ImageAnchor),
+) !void {
     var i: usize = 0;
     while (i < drawing_part.bytes.len) {
         const next = std.mem.indexOfPos(u8, drawing_part.bytes, i, tags.xdr_prefix_open) orelse break;
@@ -313,9 +338,30 @@ fn collectChartsFromSheet(
     // namespace prefixes have no upper bound in the spec — Codex
     // flagged the previous 512 B buffer as a hard-fail surface for
     // valid-but-long custom prefixes.
-    var tags_buf: [4096]u8 = undefined;
-    const tags = try DrawingTags.build(&tags_buf, prefixes);
+    var primary_buf: [4096]u8 = undefined;
+    const primary_tags = try DrawingTags.build(&primary_buf, prefixes);
+    try scanChartsWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, prefixes, primary_tags, out);
 
+    if (prefixes.xdr_alt) |alt| {
+        var alt_prefixes = prefixes;
+        alt_prefixes.xdr = alt;
+        var alt_buf: [4096]u8 = undefined;
+        const alt_tags = try DrawingTags.build(&alt_buf, alt_prefixes);
+        try scanChartsWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, alt_prefixes, alt_tags, out);
+    }
+}
+
+fn scanChartsWithTags(
+    store: *PartStore,
+    allocator: std.mem.Allocator,
+    drawing_part: store_mod.Part,
+    drawing_part_name: []const u8,
+    drawing_rels: []const store_mod.Relationship,
+    sheet_part: store_mod.Part,
+    prefixes: DrawingPrefixes,
+    tags: DrawingTags,
+    out: *std.ArrayListUnmanaged(ChartAnchor),
+) !void {
     var i: usize = 0;
     while (i < drawing_part.bytes.len) {
         const next = std.mem.indexOfPos(u8, drawing_part.bytes, i, tags.xdr_prefix_open) orelse break;
@@ -657,6 +703,11 @@ const DrawingPrefixes = struct {
     c: []const u8 = "c",
     a_alt: ?[]const u8 = null,
     c_alt: ?[]const u8 = null,
+    /// A second prefix bound to either xdr URI in the same document.
+    /// Set when descendant anchors use a different prefix from the
+    /// root `<*:wsDr>` element — both resolve to the same namespace
+    /// but the substring scan must walk both.
+    xdr_alt: ?[]const u8 = null,
 };
 
 /// Scan the root element's xmlns:* declarations and return the
@@ -679,6 +730,13 @@ fn resolveDrawingPrefixes(xml: []const u8) DrawingPrefixes {
     {
         p.xdr = pref;
     }
+    // A document can bind the spreadsheetDrawing namespace under
+    // two different prefixes (e.g. one on the root, another on a
+    // descendant anchor). The scanner pre-formats needles per
+    // prefix, so we track an alternate prefix bound to either
+    // xdr URI and walk anchors with it as a second pass.
+    p.xdr_alt = findNamespacePrefixExcept(xml, ns_xdr_transitional, p.xdr) orelse
+        findNamespacePrefixExcept(xml, ns_xdr_strict, p.xdr);
     const a_t = findNamespacePrefix(xml, ns_a_transitional);
     const a_s = findNamespacePrefix(xml, ns_a_strict);
     if (a_t orelse a_s) |pref| p.a = pref;
@@ -749,6 +807,19 @@ fn rootElementPrefix(xml: []const u8) ?[]const u8 {
 const max_prefix_len: usize = 100;
 
 fn findNamespacePrefix(xml: []const u8, target_uri: []const u8) ?[]const u8 {
+    return findNamespacePrefixExcept(xml, target_uri, "");
+}
+
+/// Same as `findNamespacePrefix` but skips any binding whose name
+/// equals `skip`. Lets callers locate a SECOND prefix bound to the
+/// same URI when one was already chosen as primary. `skip = ""`
+/// behaves identically to `findNamespacePrefix` (no exclusion —
+/// xmlns: declarations always have a non-empty name).
+fn findNamespacePrefixExcept(
+    xml: []const u8,
+    target_uri: []const u8,
+    skip: []const u8,
+) ?[]const u8 {
     const limit = @min(xml.len, 4096);
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, xml[0..limit], i, "xmlns:")) |start| {
@@ -783,7 +854,9 @@ fn findNamespacePrefix(xml: []const u8, target_uri: []const u8) ?[]const u8 {
         }
         const val_start = p + 1;
         const val_end = std.mem.indexOfScalarPos(u8, xml[0..limit], val_start, quote) orelse return null;
-        if (std.mem.eql(u8, xml[val_start..val_end], target_uri)) {
+        if (std.mem.eql(u8, xml[val_start..val_end], target_uri) and
+            !std.mem.eql(u8, name, skip))
+        {
             // Cap pathologically long prefixes — they'd overflow
             // the per-needle scratch buffers downstream. Skip
             // (rather than abort the whole lookup) so a workbook
@@ -1400,6 +1473,39 @@ test "resolveDrawingPrefixes maps canonical + custom prefixes" {
             "<wsDr xmlns:dr\n\t=\n\t\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\"/>";
         const p = resolveDrawingPrefixes(xml);
         try std.testing.expectEqualStrings("dr", p.xdr);
+    }
+    // Two prefixes bound to the same spreadsheetDrawing URI: root
+    // uses one, descendant anchors may use the other. Both must be
+    // tracked so the scanner can replay with the alt prefix.
+    {
+        const xml =
+            \\<?xml version="1.0"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:dr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>
+        ;
+        const p = resolveDrawingPrefixes(xml);
+        try std.testing.expectEqualStrings("xdr", p.xdr);
+        try std.testing.expect(p.xdr_alt != null);
+        try std.testing.expectEqualStrings("dr", p.xdr_alt.?);
+    }
+    // Mixed conformance: Transitional URI on one prefix, Strict URI
+    // on another. Primary picks one, alt tracks the other.
+    {
+        const xml =
+            \\<?xml version="1.0"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:xs="http://purl.oclc.org/ooxml/drawingml/spreadsheetDrawing"/>
+        ;
+        const p = resolveDrawingPrefixes(xml);
+        try std.testing.expectEqualStrings("xdr", p.xdr);
+        try std.testing.expect(p.xdr_alt != null);
+        try std.testing.expectEqualStrings("xs", p.xdr_alt.?);
+    }
+    // Single binding — alt must stay null so the scanner doesn't
+    // double-walk an identical needle set.
+    {
+        const xml =
+            \\<?xml version="1.0"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>
+        ;
+        const p = resolveDrawingPrefixes(xml);
+        try std.testing.expectEqualStrings("xdr", p.xdr);
+        try std.testing.expectEqual(@as(?[]const u8, null), p.xdr_alt);
     }
 }
 
