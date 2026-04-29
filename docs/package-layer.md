@@ -44,8 +44,14 @@ defer store.deinit();
 
 | Symbol | Notes |
 |---|---|
-| `imageAnchors(store, alloc)` | Walks every sheet's `<drawing r:id=...>` chain and returns `[]ImageAnchor` with `image_part_name` + `sheet_part_name` + cell-grid `from`/`to` anchors + image bytes. |
-| `chartAnchors(store, alloc)` | Same shape for `<xdr:graphicFrame>` containing `<c:chart>`. Each anchor exposes `chart_type` (`bar` / `line` / `pie` / `scatter` / `area` / `bubble` / `radar` / `other`) + `series_refs` (every `<c:f>` formula ref flattened in document order) + `raw_xml`. |
+| `imageAnchors(store, alloc)` | Walks every sheet's `<drawing r:id=...>` chain and returns `[]ImageAnchor` with `image_part_name` + `sheet_part_name` + cell-grid `from`/`to` anchors + image bytes. Surfaces `<xdr:absoluteAnchor>` images via the optional `absolute: ?AbsoluteAnchor` field (pixel-coordinate `x` / `y` / `cx` / `cy` in EMUs). |
+| `chartAnchors(store, alloc)` | Same shape for `<xdr:graphicFrame>` containing `<c:chart>`. Each anchor exposes `chart_type` (`bar` / `line` / `pie` / `scatter` / `area` / `bubble` / `radar` / `other`) + `series_refs` (every `<c:f>` formula ref flattened in document order, across both Transitional and Strict chart-prefix bindings) + `raw_xml`. Also carries `absolute: ?AbsoluteAnchor` for pixel-anchored charts. |
+
+OOXML namespace handling:
+- Both Transitional URIs (`http://schemas.openxmlformats.org/...`) and Strict URIs (`http://purl.oclc.org/ooxml/...`) are accepted.
+- Non-canonical prefixes (`dr:` / `dml:` / `chrt:` etc.) are resolved from the document's xmlns declarations, with whitespace tolerance around `=` and prefix lengths up to 100 chars.
+- Mixed-conformance documents that declare both URIs are disambiguated by the root element's prefix; alternate-conformance prefixes are tracked and probed at lookup time.
+- Quoted attribute values can contain XML metacharacters (`x = 'fake'` inside a `descr=...` value) without confusing the attribute scanner.
 
 Caller-side lifetime contract for `chartAnchors`:
 - Outer slice + each anchor's `series_refs` slice are **caller-allocated** — free both.

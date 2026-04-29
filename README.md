@@ -126,7 +126,7 @@ Designed for a real use case: Alfred's hotel-concierge pipeline reads a 1,008-ro
 - No formula evaluation — the reader returns the cached `<v>` value; the writer accepts formula text + an optional cached result via `writeRowWithFormulas` but never computes the formula itself
 - No automatic date decoding — dates surface as their raw Excel serial number via `.number`; a convenience helper `xlsx.fromExcelSerial(cell.number) -> ?DateTime` handles the 1900-03-01 through 9999-12-31 range (serials ≤ 60 return `null` because the Excel 1900 leap-year bug makes them ambiguous)
 - No formula-aware edits — `Editor.insertRow` / `deleteRow` / `insertColumn` / `deleteColumn` refuse globally if any sheet contains a formula or `<definedName>` (cross-sheet references can't be safely rewritten without a formula tokenizer; tokenizer is queued as roadmap item C1)
-- No image/chart **emission** yet — extraction lands via `zlsx_pkg.imageAnchors` / `chartAnchors`; creation (`addImage`, typed chart emit) is queued as C2b and D2 in the roadmap
+- No image/chart **emission** yet — extraction lands via `zlsx_pkg.imageAnchors` / `chartAnchors` (Strict + Transitional OOXML, non-canonical XML namespace prefixes, both `<xdr:twoCellAnchor>` and `<xdr:absoluteAnchor>`); part injection ships via `PartStore.addPart`, but the typed `addImage` glue (drawing rels + sheet rels + anchor XML construction) is queued as C2b and D2 in the roadmap
 - No pivot table creation — pivots are detected and round-trip preserved via `Editor` / `PartStore` but never materialised as a typed object
 
 ## Feature matrix
