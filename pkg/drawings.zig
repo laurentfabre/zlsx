@@ -52,17 +52,38 @@ pub const CellAnchor = struct {
     row_off: i64,
 };
 
+/// Pixel-coordinate anchor for `<xdr:absoluteAnchor>`. Used when a
+/// drawing isn't tied to specific cells but instead pinned to a
+/// fixed position on the sheet (rare in practice; some legacy
+/// charts and AlternateContent fallbacks emit this shape).
+pub const AbsoluteAnchor = struct {
+    /// X offset from the sheet origin in EMUs (1 EMU = 1/914400 inch).
+    x: i64,
+    /// Y offset from the sheet origin in EMUs.
+    y: i64,
+    /// Width in EMUs (extent's `cx` attribute).
+    cx: i64,
+    /// Height in EMUs (extent's `cy` attribute).
+    cy: i64,
+};
+
 pub const ImageAnchor = struct {
     /// Archive name of the image part, e.g. `xl/media/image1.png`.
     image_part_name: []const u8,
     /// Archive name of the sheet whose drawing references this image,
     /// e.g. `xl/worksheets/sheet1.xml`.
     sheet_part_name: []const u8,
-    /// Top-left anchor cell.
+    /// Top-left anchor cell. For `<xdr:absoluteAnchor>` images this
+    /// is a zero sentinel — check `.absolute != null` first to
+    /// distinguish.
     from: CellAnchor,
     /// Bottom-right anchor cell. `null` for `oneCellAnchor` (image
-    /// sized via `<xdr:ext>` in EMUs, which we don't expose here).
+    /// sized via `<xdr:ext>` in EMUs) or `absoluteAnchor`.
     to: ?CellAnchor,
+    /// Pixel-coordinate placement when the source used
+    /// `<xdr:absoluteAnchor>`. Mutually exclusive with cell-anchor
+    /// fields above (which become a zero sentinel in that case).
+    absolute: ?AbsoluteAnchor = null,
     /// Decompressed image bytes (PNG/JPEG/etc.). Borrowed from the
     /// PartStore — caller must not free.
     bytes: []const u8,
@@ -86,10 +107,17 @@ pub const ChartAnchor = struct {
     chart_part_name: []const u8,
     /// Archive name of the sheet whose drawing references this chart.
     sheet_part_name: []const u8,
-    /// Top-left anchor cell.
+    /// Top-left anchor cell. For `<xdr:absoluteAnchor>` charts this
+    /// is a zero sentinel — check `.absolute != null` first to
+    /// distinguish.
     from: CellAnchor,
-    /// Bottom-right anchor cell. `null` for `oneCellAnchor`.
+    /// Bottom-right anchor cell. `null` for `oneCellAnchor` or
+    /// `absoluteAnchor`.
     to: ?CellAnchor,
+    /// Pixel-coordinate placement when the source used
+    /// `<xdr:absoluteAnchor>`. Mutually exclusive with cell-anchor
+    /// fields above (which become a zero sentinel in that case).
+    absolute: ?AbsoluteAnchor = null,
     /// Detected chart-type element (`<c:barChart>`, `<c:lineChart>`,
     /// etc.). `.other` covers unrecognised or compound charts; the
     /// raw_xml is always available for callers needing more detail.
@@ -217,12 +245,18 @@ fn collectFromSheet(
         // Identify anchor opener.
         const is_two = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_two);
         const is_one = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_one);
-        if (!is_two and !is_one) {
+        const is_absolute = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_absolute);
+        if (!is_two and !is_one and !is_absolute) {
             i += tags.xdr_prefix_open.len;
             continue;
         }
         // Find close tag.
-        const close_marker = if (is_two) tags.close_two else tags.close_one;
+        const close_marker = if (is_two)
+            tags.close_two
+        else if (is_one)
+            tags.close_one
+        else
+            tags.close_absolute;
         const close = std.mem.indexOfPos(u8, drawing_part.bytes, i, close_marker) orelse break;
         const block = drawing_part.bytes[i .. close + close_marker.len];
         i = close + close_marker.len;
@@ -237,17 +271,24 @@ fn collectFromSheet(
         const image_part_name = (try store.resolve(drawing_part_name, image_target)) orelse continue;
         const image_part = store.part(image_part_name) orelse continue;
 
-        const from = parseCellAnchor(block, tags.open_from, tags.close_from, prefixes.xdr) orelse continue;
-        const to_anchor: ?CellAnchor = if (is_two)
-            parseCellAnchor(block, tags.open_to, tags.close_to, prefixes.xdr)
-        else
-            null;
+        var from: CellAnchor = .{ .col = 0, .col_off = 0, .row = 0, .row_off = 0 };
+        var to_anchor: ?CellAnchor = null;
+        var absolute: ?AbsoluteAnchor = null;
+        if (is_absolute) {
+            absolute = parseAbsoluteAnchor(block, tags.open_pos, tags.open_ext) orelse continue;
+        } else {
+            from = parseCellAnchor(block, tags.open_from, tags.close_from, prefixes.xdr) orelse continue;
+            if (is_two) {
+                to_anchor = parseCellAnchor(block, tags.open_to, tags.close_to, prefixes.xdr);
+            }
+        }
 
         try out.append(allocator, .{
             .image_part_name = image_part.name,
             .sheet_part_name = sheet_part.name,
             .from = from,
             .to = to_anchor,
+            .absolute = absolute,
             .bytes = image_part.bytes,
         });
     }
@@ -281,11 +322,17 @@ fn collectChartsFromSheet(
         i = next;
         const is_two = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_two);
         const is_one = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_one);
-        if (!is_two and !is_one) {
+        const is_absolute = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_absolute);
+        if (!is_two and !is_one and !is_absolute) {
             i += tags.xdr_prefix_open.len;
             continue;
         }
-        const close_marker = if (is_two) tags.close_two else tags.close_one;
+        const close_marker = if (is_two)
+            tags.close_two
+        else if (is_one)
+            tags.close_one
+        else
+            tags.close_absolute;
         const close = std.mem.indexOfPos(u8, drawing_part.bytes, i, close_marker) orelse break;
         const block = drawing_part.bytes[i .. close + close_marker.len];
         i = close + close_marker.len;
@@ -320,11 +367,17 @@ fn collectChartsFromSheet(
         const chart_part_name = (try store.resolve(drawing_part_name, chart_target)) orelse continue;
         const chart_part = store.part(chart_part_name) orelse continue;
 
-        const from = parseCellAnchor(block, tags.open_from, tags.close_from, prefixes.xdr) orelse continue;
-        const to_anchor: ?CellAnchor = if (is_two)
-            parseCellAnchor(block, tags.open_to, tags.close_to, prefixes.xdr)
-        else
-            null;
+        var from: CellAnchor = .{ .col = 0, .col_off = 0, .row = 0, .row_off = 0 };
+        var to_anchor: ?CellAnchor = null;
+        var absolute: ?AbsoluteAnchor = null;
+        if (is_absolute) {
+            absolute = parseAbsoluteAnchor(block, tags.open_pos, tags.open_ext) orelse continue;
+        } else {
+            from = parseCellAnchor(block, tags.open_from, tags.close_from, prefixes.xdr) orelse continue;
+            if (is_two) {
+                to_anchor = parseCellAnchor(block, tags.open_to, tags.close_to, prefixes.xdr);
+            }
+        }
 
         // Each chart's own XML may declare a different `c:` prefix
         // — resolve per-chart to be safe.
@@ -339,6 +392,7 @@ fn collectChartsFromSheet(
             .sheet_part_name = sheet_part.name,
             .from = from,
             .to = to_anchor,
+            .absolute = absolute,
             .chart_type = detectChartType(chart_part.bytes, chart_prefixes.c),
             .series_refs = refs,
             .raw_xml = chart_part.bytes,
@@ -546,12 +600,16 @@ const DrawingTags = struct {
     close_two: []const u8, // "</xdr:twoCellAnchor>"
     open_one: []const u8, // "<xdr:oneCellAnchor"
     close_one: []const u8, // "</xdr:oneCellAnchor>"
+    open_absolute: []const u8, // "<xdr:absoluteAnchor"
+    close_absolute: []const u8, // "</xdr:absoluteAnchor>"
     open_pic: []const u8, // "<xdr:pic>"
     close_pic: []const u8, // "</xdr:pic>"
     open_from: []const u8, // "<xdr:from>"
     close_from: []const u8, // "</xdr:from>"
     open_to: []const u8, // "<xdr:to>"
     close_to: []const u8, // "</xdr:to>"
+    open_pos: []const u8, // "<xdr:pos"
+    open_ext: []const u8, // "<xdr:ext"
     open_graphic_frame: []const u8, // "<xdr:graphicFrame"
     open_chart: []const u8, // "<c:chart"
 
@@ -562,12 +620,16 @@ const DrawingTags = struct {
         const close_two = try writeAndAdvance(&w, "</{s}:twoCellAnchor>", .{p.xdr});
         const open_one = try writeAndAdvance(&w, "<{s}:oneCellAnchor", .{p.xdr});
         const close_one = try writeAndAdvance(&w, "</{s}:oneCellAnchor>", .{p.xdr});
+        const open_absolute = try writeAndAdvance(&w, "<{s}:absoluteAnchor", .{p.xdr});
+        const close_absolute = try writeAndAdvance(&w, "</{s}:absoluteAnchor>", .{p.xdr});
         const open_pic = try writeAndAdvance(&w, "<{s}:pic>", .{p.xdr});
         const close_pic = try writeAndAdvance(&w, "</{s}:pic>", .{p.xdr});
         const open_from = try writeAndAdvance(&w, "<{s}:from>", .{p.xdr});
         const close_from = try writeAndAdvance(&w, "</{s}:from>", .{p.xdr});
         const open_to = try writeAndAdvance(&w, "<{s}:to>", .{p.xdr});
         const close_to = try writeAndAdvance(&w, "</{s}:to>", .{p.xdr});
+        const open_pos = try writeAndAdvance(&w, "<{s}:pos", .{p.xdr});
+        const open_ext = try writeAndAdvance(&w, "<{s}:ext", .{p.xdr});
         const open_graphic_frame = try writeAndAdvance(&w, "<{s}:graphicFrame", .{p.xdr});
         const open_chart = try writeAndAdvance(&w, "<{s}:chart", .{p.c});
         return .{
@@ -576,12 +638,16 @@ const DrawingTags = struct {
             .close_two = close_two,
             .open_one = open_one,
             .close_one = close_one,
+            .open_absolute = open_absolute,
+            .close_absolute = close_absolute,
             .open_pic = open_pic,
             .close_pic = close_pic,
             .open_from = open_from,
             .close_from = close_from,
             .open_to = open_to,
             .close_to = close_to,
+            .open_pos = open_pos,
+            .open_ext = open_ext,
             .open_graphic_frame = open_graphic_frame,
             .open_chart = open_chart,
         };
@@ -741,6 +807,30 @@ fn decodeIdInto(buf: []u8, src: []const u8) ?[]const u8 {
 ///   <{xdr}:colOff>N</{xdr}:colOff>
 ///   <{xdr}:row>N</{xdr}:row>
 ///   <{xdr}:rowOff>N</{xdr}:rowOff>
+/// Parse the `<{xdr}:pos x="N" y="N"/>` and `<{xdr}:ext cx="N"
+/// cy="N"/>` self-closing children of an `<{xdr}:absoluteAnchor>`.
+/// Both are required for a valid absoluteAnchor — returning null
+/// causes the caller to skip the anchor as malformed.
+fn parseAbsoluteAnchor(xml: []const u8, open_pos: []const u8, open_ext: []const u8) ?AbsoluteAnchor {
+    const pos_idx = std.mem.indexOf(u8, xml, open_pos) orelse return null;
+    const pos_end = std.mem.indexOfScalarPos(u8, xml, pos_idx, '>') orelse return null;
+    const pos_attrs = xml[pos_idx .. pos_end + 1];
+    const x_str = attrValue(pos_attrs, "x") orelse return null;
+    const y_str = attrValue(pos_attrs, "y") orelse return null;
+    const x = std.fmt.parseInt(i64, x_str, 10) catch return null;
+    const y = std.fmt.parseInt(i64, y_str, 10) catch return null;
+
+    const ext_idx = std.mem.indexOfPos(u8, xml, pos_end, open_ext) orelse return null;
+    const ext_end = std.mem.indexOfScalarPos(u8, xml, ext_idx, '>') orelse return null;
+    const ext_attrs = xml[ext_idx .. ext_end + 1];
+    const cx_str = attrValue(ext_attrs, "cx") orelse return null;
+    const cy_str = attrValue(ext_attrs, "cy") orelse return null;
+    const cx = std.fmt.parseInt(i64, cx_str, 10) catch return null;
+    const cy = std.fmt.parseInt(i64, cy_str, 10) catch return null;
+
+    return .{ .x = x, .y = y, .cx = cx, .cy = cy };
+}
+
 fn parseCellAnchor(
     xml: []const u8,
     open: []const u8,
@@ -979,6 +1069,37 @@ test "findDrawingRid + findBlipEmbed tolerate single quotes" {
     try std.testing.expectEqualStrings(
         "rId9",
         findBlipEmbed("<xdr:pic><dml:blip r:embed='rId9'/></xdr:pic>", "dml").?,
+    );
+}
+
+test "parseAbsoluteAnchor unit test" {
+    const xml =
+        \\<xdr:absoluteAnchor>
+        \\  <xdr:pos x="914400" y="685800"/>
+        \\  <xdr:ext cx="3657600" cy="2743200"/>
+        \\</xdr:absoluteAnchor>
+    ;
+    const a = parseAbsoluteAnchor(xml, "<xdr:pos", "<xdr:ext").?;
+    try std.testing.expectEqual(@as(i64, 914400), a.x);
+    try std.testing.expectEqual(@as(i64, 685800), a.y);
+    try std.testing.expectEqual(@as(i64, 3657600), a.cx);
+    try std.testing.expectEqual(@as(i64, 2743200), a.cy);
+
+    // Same shape with non-canonical drawing prefix.
+    const xml2 =
+        \\<dr:absoluteAnchor>
+        \\  <dr:pos x="100" y="200"/>
+        \\  <dr:ext cx="300" cy="400"/>
+        \\</dr:absoluteAnchor>
+    ;
+    const b = parseAbsoluteAnchor(xml2, "<dr:pos", "<dr:ext").?;
+    try std.testing.expectEqual(@as(i64, 100), b.x);
+    try std.testing.expectEqual(@as(i64, 400), b.cy);
+
+    // Missing pos/ext returns null.
+    try std.testing.expectEqual(
+        @as(?AbsoluteAnchor, null),
+        parseAbsoluteAnchor("<xdr:absoluteAnchor></xdr:absoluteAnchor>", "<xdr:pos", "<xdr:ext"),
     );
 }
 
