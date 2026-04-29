@@ -128,6 +128,17 @@ pub fn build(b: *std.Build) void {
     const nfc_tests = b.addTest(.{ .root_module = nfc_mod });
     test_step.dependOn(&b.addRunArtifact(nfc_tests).step);
 
+    // C1 milestone 1: formula tokenizer + loss-preserving printer.
+    // Independent module (no cross-deps yet) — the rewriter that
+    // depends on this lands in later C1 iterations.
+    const formula_tokenizer_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/tokenizer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const formula_tokenizer_tests = b.addTest(.{ .root_module = formula_tokenizer_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_tokenizer_tests).step);
+
     // ─── Package layer (B0 + C2a) ───────────────────────────────
     //
     // Public root: pkg/root.zig re-exports PartStore /
