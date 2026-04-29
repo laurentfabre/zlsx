@@ -62,11 +62,13 @@ pub fn fitsExactlyInF64(n: i64) bool {
 
 // ─── OOXML skeleton strings ──────────────────────────────────────────
 
-const CONTENT_TYPES_HEAD: []const u8 =
+const CONTENT_TYPES_DEFAULTS: []const u8 =
     \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
     \\<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
     \\<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
     \\<Default Extension="xml" ContentType="application/xml"/>
+;
+const CONTENT_TYPES_FIXED_OVERRIDES: []const u8 =
     \\<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
     \\<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
 ;
@@ -679,15 +681,21 @@ pub const Writer = struct {
         // 1. [Content_Types].xml
         //
         // OPC schema requires every <Default> element BEFORE any
-        // <Override> elements. CONTENT_TYPES_HEAD already opens the
-        // root + emits the canonical Defaults (rels, xml); the
-        // optional Default for vmlDrawing must slot in here, then
-        // every Override follows.
+        // <Override> element. The flow is:
+        //   1. CONTENT_TYPES_DEFAULTS — opens <Types> + canonical
+        //      `rels`/`xml` Defaults.
+        //   2. Optional `vml` Default for comment-bearing
+        //      workbooks (must precede ALL Overrides).
+        //   3. CONTENT_TYPES_FIXED_OVERRIDES — workbook +
+        //      sharedStrings.
+        //   4. Per-sheet, optional styles + per-comments
+        //      Overrides.
+        //   5. CONTENT_TYPES_TAIL — closes </Types>.
         {
             var ct: std.ArrayListUnmanaged(u8) = .{};
             defer ct.deinit(alloc);
-            try ct.appendSlice(alloc, CONTENT_TYPES_HEAD);
-            // ─── Defaults ───────────────────────────────────────
+            // ─── Phase 1: Defaults ──────────────────────────────
+            try ct.appendSlice(alloc, CONTENT_TYPES_DEFAULTS);
             var any_comments = false;
             for (self.sheets.items) |sw| {
                 if (sw.comments.items.len > 0) {
@@ -701,7 +709,8 @@ pub const Writer = struct {
                     "<Default Extension=\"vml\" ContentType=\"application/vnd.openxmlformats-officedocument.vmlDrawing\"/>",
                 );
             }
-            // ─── Overrides ──────────────────────────────────────
+            // ─── Phase 2: Overrides ─────────────────────────────
+            try ct.appendSlice(alloc, CONTENT_TYPES_FIXED_OVERRIDES);
             for (self.sheets.items, 0..) |_, i| {
                 try ct.print(
                     alloc,
@@ -2215,10 +2224,10 @@ pub fn validateSheetName(name: []const u8) !void {
     if (casefold.excelSheetNameEql(name, "History")) return error.InvalidSheetName;
 }
 
-/// Excel defined-name rules (paraphrased from MS docs):
+/// Excel defined-name rules (per MS docs):
 /// - 1..255 bytes
 /// - First char: letter, `_`, or `\`
-/// - Rest: letters, digits, `_`, `.`, `\`, `?`
+/// - Rest: letters, digits, `_`, `.` (NO `\`, NO `?`)
 /// - Must NOT exactly match an A1 cell reference shape (column
 ///   [A, XFD] + row [1, 1048576] in any case combination)
 /// - Must NOT be the single letter `R` or `C` (case-insensitive)
@@ -2230,9 +2239,7 @@ fn validateDefinedName(name: []const u8) !void {
     const first = name[0];
     if (!isAsciiLetter(first) and first != '_' and first != '\\') return error.InvalidDefinedName;
     for (name[1..]) |c| {
-        if (!isAsciiLetter(c) and !isAsciiDigit(c) and
-            c != '_' and c != '.' and c != '\\' and c != '?')
-        {
+        if (!isAsciiLetter(c) and !isAsciiDigit(c) and c != '_' and c != '.') {
             return error.InvalidDefinedName;
         }
     }
@@ -6365,6 +6372,17 @@ test "Writer.addDefinedName: rejects case-insensitive duplicates per scope" {
     // Same name in another sheet's scope — also accepted.
     try w.addDefinedName("Rate", "Sheet2!$B$1", .{ .local_sheet_id = 1 });
     try std.testing.expectEqual(@as(usize, 3), w.defined_names.items.len);
+}
+
+test "validateDefinedName: rejects ? and \\ in trailing chars" {
+    // First char `\` is allowed; subsequent `\` or `?` are not.
+    try std.testing.expectError(error.InvalidDefinedName, validateDefinedName("Foo?bar"));
+    try std.testing.expectError(error.InvalidDefinedName, validateDefinedName("Foo\\bar"));
+    try std.testing.expectError(error.InvalidDefinedName, validateDefinedName("Foo?"));
+    try std.testing.expectError(error.InvalidDefinedName, validateDefinedName("Foo\\"));
+    // First char as `\` still works.
+    try validateDefinedName("\\Foo");
+    try validateDefinedName("\\Foo_bar.baz");
 }
 
 test "validateDefinedName: rejects R1C1-shaped references" {
