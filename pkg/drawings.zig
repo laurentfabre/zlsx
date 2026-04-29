@@ -856,9 +856,12 @@ fn findLocalChartElement(block: []const u8, start: usize, prefixes: DrawingPrefi
         }
         // Skip candidates that sit inside a comment, CDATA, or
         // processing instruction. A `<c:chart>` inside a comment
-        // is markup-shaped text, not a real element.
-        if (isInsideCommentOrCdata(block, p_start)) {
-            i = colon + 1;
+        // is markup-shaped text, not a real element. Advance past
+        // the END of the containing skip region so adversarial
+        // inputs with many `:chart` substrings inside one large
+        // comment don't re-trigger the (linear) scan per match.
+        if (skipRegionContaining(block, p_start)) |skip_end| {
+            i = skip_end;
             continue;
         }
         const prefix = block[p_start..colon];
@@ -1115,6 +1118,40 @@ fn isInsideOpeningTag(xml: []const u8, pos: usize) bool {
         if (c == '>') return pos < i;
     }
     return false;
+}
+
+/// If `pos` is inside an XML comment / CDATA / PI region, return
+/// the byte index just past the region's close. Otherwise null.
+/// Lets callers advance their scan past the entire skipped region
+/// in one step instead of byte-by-byte.
+fn skipRegionContaining(xml: []const u8, pos: usize) ?usize {
+    var i: usize = 0;
+    while (i < xml.len) {
+        if (i + 4 <= xml.len and std.mem.startsWith(u8, xml[i..], "<!--")) {
+            const close = std.mem.indexOfPos(u8, xml, i + 4, "-->") orelse xml.len - 3;
+            const end = close + 3;
+            if (pos >= i and pos < end) return end;
+            i = end;
+            continue;
+        }
+        if (i + 9 <= xml.len and std.mem.startsWith(u8, xml[i..], "<![CDATA[")) {
+            const close = std.mem.indexOfPos(u8, xml, i + 9, "]]>") orelse xml.len - 3;
+            const end = close + 3;
+            if (pos >= i and pos < end) return end;
+            i = end;
+            continue;
+        }
+        if (i + 2 <= xml.len and std.mem.startsWith(u8, xml[i..], "<?")) {
+            const close = std.mem.indexOfPos(u8, xml, i + 2, "?>") orelse xml.len - 2;
+            const end = close + 2;
+            if (pos >= i and pos < end) return end;
+            i = end;
+            continue;
+        }
+        if (i > pos) return null;
+        i += 1;
+    }
+    return null;
 }
 
 /// True if `pos` is inside an XML comment (`<!-- ... -->`),
