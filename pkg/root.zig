@@ -29,6 +29,7 @@ pub const Error = store_mod.Error;
 
 pub const ImageAnchor = drawings_mod.ImageAnchor;
 pub const CellAnchor = drawings_mod.CellAnchor;
+pub const AbsoluteAnchor = drawings_mod.AbsoluteAnchor;
 pub const imageAnchors = drawings_mod.imageAnchors;
 pub const ChartAnchor = drawings_mod.ChartAnchor;
 pub const ChartType = drawings_mod.ChartType;
