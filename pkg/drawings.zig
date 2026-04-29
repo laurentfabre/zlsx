@@ -189,7 +189,7 @@ fn collectFromSheet(
 
     // Resolve rid → drawing part name via sheet's rels.
     const sheet_rels = store.rels(sheet_part.name);
-    const drawing_target = relTargetForId(sheet_rels, rid) orelse return;
+    const drawing_target = relTargetForId(allocator, sheet_rels, rid) orelse return;
     const drawing_part_name = (try store.resolve(sheet_part.name, drawing_target)) orelse return;
     const drawing_part = store.part(drawing_part_name) orelse return;
 
@@ -219,7 +219,7 @@ fn collectFromSheet(
         const pic_block = block[pic_idx .. pic_close + "</xdr:pic>".len];
 
         const embed_rid = findBlipEmbed(pic_block) orelse continue;
-        const image_target = relTargetForId(drawing_rels, embed_rid) orelse continue;
+        const image_target = relTargetForId(allocator, drawing_rels, embed_rid) orelse continue;
         const image_part_name = (try store.resolve(drawing_part_name, image_target)) orelse continue;
         const image_part = store.part(image_part_name) orelse continue;
 
@@ -247,7 +247,7 @@ fn collectChartsFromSheet(
 ) !void {
     const rid = findDrawingRid(sheet_part.bytes) orelse return;
     const sheet_rels = store.rels(sheet_part.name);
-    const drawing_target = relTargetForId(sheet_rels, rid) orelse return;
+    const drawing_target = relTargetForId(allocator, sheet_rels, rid) orelse return;
     const drawing_part_name = (try store.resolve(sheet_part.name, drawing_target)) orelse return;
     const drawing_part = store.part(drawing_part_name) orelse return;
 
@@ -275,7 +275,7 @@ fn collectChartsFromSheet(
         const chart_attrs = block[chart_idx .. chart_end + 1];
         const embed_rid = attrValue(chart_attrs, "r:id") orelse continue;
 
-        const chart_target = relTargetForId(drawing_rels, embed_rid) orelse continue;
+        const chart_target = relTargetForId(allocator, drawing_rels, embed_rid) orelse continue;
         const chart_part_name = (try store.resolve(drawing_part_name, chart_target)) orelse continue;
         const chart_part = store.part(chart_part_name) orelse continue;
 
@@ -400,12 +400,18 @@ fn findBlipEmbed(pic_xml: []const u8) ?[]const u8 {
     return attrValue(pic_xml[blip .. blip_end + 1], "r:embed");
 }
 
-fn relForId(rels: []const store_mod.Relationship, id: []const u8) ?store_mod.Relationship {
-    // Decode the lookup id into a stack buffer so the comparison
-    // matches the decoded Relationship.id stored by parseRelationships.
-    // OOXML rIds in practice are short ASCII tokens (`rId1`, `rId12`),
-    // so 64 bytes is generous. On overflow OR fast-path (no `&`), fall
-    // back to raw compare against the source `id` slice.
+fn relForId(
+    allocator: std.mem.Allocator,
+    rels: []const store_mod.Relationship,
+    id: []const u8,
+) ?store_mod.Relationship {
+    // Decode the lookup id so the comparison matches the decoded
+    // Relationship.id stored by parseRelationships. OOXML rIds in
+    // practice are short ASCII tokens (`rId1`, `rId12`), so the
+    // 64-byte stack buffer fast path covers everything realistic.
+    // Pathological encoded IDs that decode beyond 64 bytes fall
+    // through to a heap-allocated decode so we still match
+    // correctly instead of silently dropping the relationship.
     if (std.mem.indexOfScalar(u8, id, '&') == null) {
         for (rels) |r| {
             if (std.mem.eql(u8, r.id, id)) return r;
@@ -413,8 +419,27 @@ fn relForId(rels: []const store_mod.Relationship, id: []const u8) ?store_mod.Rel
         return null;
     }
     var buf: [64]u8 = undefined;
-    const decoded = decodeIdInto(&buf, id) orelse {
-        // Pathologically long encoded id — fall back to raw match.
+    if (decodeIdInto(&buf, id)) |decoded| {
+        for (rels) |r| {
+            if (std.mem.eql(u8, r.id, decoded)) return r;
+        }
+        return null;
+    }
+    // Stack buffer overflow — heap-allocate a buffer large enough
+    // to hold the worst-case decoded length (≤ id.len since each
+    // entity decodes to at most as many bytes as its escaped form).
+    const heap_buf = allocator.alloc(u8, id.len) catch {
+        // OOM during a non-critical relationship lookup — last
+        // resort, raw-compare. We still try in case the encoded
+        // form happens to match (it won't, since stored IDs are
+        // decoded, but the alternative is silent miss).
+        for (rels) |r| {
+            if (std.mem.eql(u8, r.id, id)) return r;
+        }
+        return null;
+    };
+    defer allocator.free(heap_buf);
+    const decoded = decodeIdInto(heap_buf, id) orelse {
         for (rels) |r| {
             if (std.mem.eql(u8, r.id, id)) return r;
         }
@@ -432,8 +457,12 @@ fn relForId(rels: []const store_mod.Relationship, id: []const u8) ?store_mod.Rel
 /// package doesn't carry the bytes for, and resolving them as
 /// internal would (mis)attribute external links to package parts
 /// that happen to share the relative path.
-fn relTargetForId(rels: []const store_mod.Relationship, id: []const u8) ?[]const u8 {
-    const r = relForId(rels, id) orelse return null;
+fn relTargetForId(
+    allocator: std.mem.Allocator,
+    rels: []const store_mod.Relationship,
+    id: []const u8,
+) ?[]const u8 {
+    const r = relForId(allocator, rels, id) orelse return null;
     if (r.target_mode == .external) return null;
     return r.target;
 }
