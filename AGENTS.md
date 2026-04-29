@@ -269,6 +269,31 @@ URL deps fail with `error: hash mismatch` when their tarball changes; replace `.
 
 ---
 
+## Workflow conventions
+
+### Worktrees, one per concurrent PR
+
+`main` is PR-only. For any branch you'd run an agent against, prefer a sibling worktree with its own build cache:
+
+```sh
+scripts/wt-new feat/streaming-sst                # creates ../zlsx-feat-streaming-sst/
+scripts/wt-new fix/header-pad origin/release-0.3 # custom base ref
+```
+
+Each worktree owns its own `.zig-cache/`, so parallel agent sessions never thrash the shared cache. Tear down with `git worktree remove <path>`. Convention only — no enforcement.
+
+### Commit `Agent:` trailer
+
+Append a soft trailer naming the agent that authored the commit:
+
+```
+Agent: human
+Agent: claude-opus-4-7
+Agent: codex-gpt-5
+```
+
+Installed as a `commit-msg` hook (run `scripts/install-hooks.sh` once after clone). Soft-check only — missing trailer warns but does not block.
+
 ## Process when making changes
 
 1. **Confirm the toolchain**: `zig version` should print `0.15.2`. If not, fix that before anything else.

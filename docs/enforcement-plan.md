@@ -8,7 +8,7 @@ Status as of 2026-04-30. Single-author public repo (`laurentfabre/zlsx`), Zig 0.
 |---|---|---|
 | 1 | Free wins: branch protection, repo merge settings, CODEOWNERS, PR template | **Done (2026-04-30)** |
 | 2 | TDD CI gates: test-presence, C-ABI 3-file-transaction, monotonic test count | **Done (2026-04-30, advisory)** |
-| 3 | Worktree + subagent conventions: helper script, commit-msg trailer, PR template fields | Not started |
+| 3 | Worktree + subagent conventions: helper script, commit-msg trailer, PR template fields | **Done (2026-04-30)** |
 | 4 | Agent-as-reviewer CI job (codex-review-on-PR) | Not started |
 | 5 | Optional: coverage gate, TDAD map, mutation testing | Deferred |
 
@@ -198,6 +198,19 @@ BASE_SHA=$(git merge-base origin/main HEAD) HEAD_SHA=HEAD LABELS='["abi-no-3file
 - **Test-presence**: heuristic "non-trivial change" filter strips blank lines and `// ...` comments only. Multi-line `///` doc-comments still count as significant; tolerable since the escape label exists.
 - **ABI gate**: only triggers when `src/c_abi.zig` is in the changed-file list. An ABI-affecting change made elsewhere (e.g., changing an extern struct's layout via a `pub const` in another file imported by `c_abi.zig`) won't be caught.
 - **Monotonic**: counts `^test "` exactly — moving a test from `test "foo"` to `test "renamed"` is a no-op (count preserved), but reformatting a test header onto a multi-line form would silently drop it.
+
+## Phase 3 — implementation log
+
+- [x] `scripts/wt-new <branch> [base]` — creates a sibling worktree at `../<repo>-<branch>/` from `origin/<base>` (default `main`). Convention only; no enforcement.
+- [x] `scripts/githooks/commit-msg` — soft-checks for an `Agent: <name>` trailer. Skips merge / squash / cherry-pick / fixup messages. Soft-warn only — commit proceeds.
+- [x] PR template `Author agent` / `Reviewer agent` fields — already shipped in Phase 1 (`.github/pull_request_template.md`).
+- [x] `AGENTS.md` updated with a "Workflow conventions" section documenting both.
+
+### Notes
+
+- Hooks are wired via `core.hooksPath = scripts/githooks` (set by `scripts/install-hooks.sh`). Adding a new hook is just dropping the file in `scripts/githooks/` with executable bit set.
+- The `commit-msg` hook intentionally never blocks. If the convention sticks (i.e. trailers appear consistently), promote to a hard fail later.
+- `wt-new` slug-escapes `/` in branch names (`feat/streaming-sst` → `zlsx-feat-streaming-sst/`) to avoid filesystem nesting surprises.
 
 ## Phase 1 — operational note
 

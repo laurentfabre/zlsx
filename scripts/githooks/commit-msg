@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# commit-msg — soft-check for an `Agent:` trailer.
+#
+# Convention: every author commit names the agent that authored it
+# (or `human`). This makes review and attribution trivial without
+# scraping git config / signed-commit metadata.
+#
+# Acceptable values (free-form, but stay terse):
+#   Agent: human
+#   Agent: claude-opus-4-7
+#   Agent: claude-sonnet-4-6
+#   Agent: codex-gpt-5
+#   Agent: <model-id> | <vendor>/<model>
+#
+# This is a SOFT check — missing trailer prints a hint, commit
+# proceeds. Promote to hard-fail later if convention sticks.
+#
+# Skipped automatically for merge / squash / cherry-pick / fixup /
+# revert messages where the trailer wouldn't add information.
+#
+# Bypass entirely: git commit --no-verify
+
+set -euo pipefail
+
+msg_file="$1"
+gitdir=$(git rev-parse --git-dir)
+
+# Skip mechanical commits — fixup, squash, merge, cherry-pick, revert.
+if [ -e "$gitdir/MERGE_MSG" ] \
+   || [ -e "$gitdir/SQUASH_MSG" ] \
+   || [ -e "$gitdir/CHERRY_PICK_HEAD" ]; then
+  exit 0
+fi
+
+first_line=$(head -1 "$msg_file" 2>/dev/null || echo "")
+case "$first_line" in
+  fixup!*|squash!*|amend!*|"Revert "*) exit 0 ;;
+esac
+
+if grep -qE '^Agent:[[:space:]]+' "$msg_file"; then
+  exit 0
+fi
+
+cat >&2 <<'EOF'
+commit-msg: no `Agent:` trailer found.
+
+Convention: append a trailer naming the author agent. Examples:
+    Agent: human
+    Agent: claude-opus-4-7
+    Agent: codex-gpt-5
+
+Soft-check only — commit will proceed. Bypass entirely with --no-verify.
+EOF
+
+exit 0
