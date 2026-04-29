@@ -623,32 +623,50 @@ fn rootElementPrefix(xml: []const u8) ?[]const u8 {
 
 /// Given a prefix declared somewhere in `xml`'s root element, return
 /// which OOXML conformance class its xmlns binding belongs to.
+/// Walks every xmlns:* declaration so a partial-match like
+/// "xmlns:xdr" doesn't satisfy a lookup for prefix "x".
 fn uriOfPrefix(xml: []const u8, prefix: []const u8) NamespaceVariant {
     const limit = @min(xml.len, 4096);
-    var search_buf: [128]u8 = undefined;
-    if (prefix.len + "xmlns:".len + 1 > search_buf.len) return .unknown;
-    @memcpy(search_buf[0.."xmlns:".len], "xmlns:");
-    @memcpy(search_buf["xmlns:".len..][0..prefix.len], prefix);
-    const needle = search_buf[0 .. "xmlns:".len + prefix.len];
-    const start = std.mem.indexOf(u8, xml[0..limit], needle) orelse return .unknown;
-    var p = start + needle.len;
-    // Skip optional whitespace + `=` + whitespace + quote.
-    while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
-    if (p >= limit or xml[p] != '=') return .unknown;
-    p += 1;
-    while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
-    if (p >= limit) return .unknown;
-    const quote = xml[p];
-    if (quote != '"' and quote != '\'') return .unknown;
-    const val_start = p + 1;
-    const val_end = std.mem.indexOfScalarPos(u8, xml[0..limit], val_start, quote) orelse return .unknown;
-    const uri = xml[val_start..val_end];
-    if (std.mem.eql(u8, uri, ns_xdr_strict) or
-        std.mem.eql(u8, uri, ns_a_strict) or
-        std.mem.eql(u8, uri, ns_c_strict)) return .strict;
-    if (std.mem.eql(u8, uri, ns_xdr_transitional) or
-        std.mem.eql(u8, uri, ns_a_transitional) or
-        std.mem.eql(u8, uri, ns_c_transitional)) return .transitional;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml[0..limit], i, "xmlns:")) |start| {
+        const after = start + "xmlns:".len;
+        if (after + prefix.len > limit) return .unknown;
+        // Require an exact match: the prefix must equal `prefix` and
+        // be followed by whitespace or `=`.
+        if (std.mem.eql(u8, xml[after .. after + prefix.len], prefix)) {
+            const sep_pos = after + prefix.len;
+            if (sep_pos < limit) {
+                const sep = xml[sep_pos];
+                if (sep == '=' or sep == ' ' or sep == '\t' or sep == '\n' or sep == '\r') {
+                    var p = sep_pos;
+                    while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
+                    if (p >= limit or xml[p] != '=') {
+                        i = sep_pos;
+                        continue;
+                    }
+                    p += 1;
+                    while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
+                    if (p >= limit) return .unknown;
+                    const quote = xml[p];
+                    if (quote != '"' and quote != '\'') {
+                        i = p;
+                        continue;
+                    }
+                    const val_start = p + 1;
+                    const val_end = std.mem.indexOfScalarPos(u8, xml[0..limit], val_start, quote) orelse return .unknown;
+                    const uri = xml[val_start..val_end];
+                    if (std.mem.eql(u8, uri, ns_xdr_strict) or
+                        std.mem.eql(u8, uri, ns_a_strict) or
+                        std.mem.eql(u8, uri, ns_c_strict)) return .strict;
+                    if (std.mem.eql(u8, uri, ns_xdr_transitional) or
+                        std.mem.eql(u8, uri, ns_a_transitional) or
+                        std.mem.eql(u8, uri, ns_c_transitional)) return .transitional;
+                    return .unknown;
+                }
+            }
+        }
+        i = after;
+    }
     return .unknown;
 }
 
