@@ -426,9 +426,14 @@ fn extractSeriesRefs(
     var out: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer out.deinit(allocator);
 
+    // Scan BOTH prefixes (primary + alternate-conformance) so a
+    // chart that mixes <c:f> and <c2:f> refs surfaces every entry.
+    // Order isn't strictly document-order across prefixes, but
+    // refs within each prefix retain their relative order — good
+    // enough for callers that just want the flattened list.
     try extractSeriesRefsForPrefix(allocator, xml, c_prefix, &out);
-    if (out.items.len == 0) {
-        if (c_prefix_alt) |alt| {
+    if (c_prefix_alt) |alt| {
+        if (!std.mem.eql(u8, alt, c_prefix)) {
             try extractSeriesRefsForPrefix(allocator, xml, alt, &out);
         }
     }
