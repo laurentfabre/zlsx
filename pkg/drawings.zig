@@ -283,13 +283,14 @@ fn collectChartsFromSheet(
         // Charts live inside <xdr:graphicFrame>...<c:chart r:id=...
         const gf_idx = std.mem.indexOf(u8, block, tags.open_graphic_frame) orelse continue;
         // The chart-namespace prefix can be declared LOCALLY on the
-        // <*:chart> element itself rather than on the drawing root
-        // (valid OOXML scoping pattern). Re-resolve prefixes from
-        // the block before searching, so a per-block prefix
-        // override beats the drawing-wide default.
-        const block_prefixes = resolveDrawingPrefixes(block);
+        // <*:chart> element rather than on the drawing root (valid
+        // OOXML scoping pattern). Look up xmlns:* in this block
+        // FIRST; only fall back to the drawing-root prefix if the
+        // block didn't redefine. Pure-block resolution would lose
+        // root-scoped declarations the block inherits.
         var block_chart_buf: [32]u8 = undefined;
-        const block_open_chart = std.fmt.bufPrint(&block_chart_buf, "<{s}:chart", .{block_prefixes.c}) catch tags.open_chart;
+        const block_chart_prefix = findNamespacePrefix(block, ns_c) orelse prefixes.c;
+        const block_open_chart = std.fmt.bufPrint(&block_chart_buf, "<{s}:chart", .{block_chart_prefix}) catch tags.open_chart;
         const chart_idx = std.mem.indexOfPos(u8, block, gf_idx, block_open_chart) orelse continue;
         const chart_end = std.mem.indexOfScalarPos(u8, block, chart_idx, '>') orelse continue;
         const chart_attrs = block[chart_idx .. chart_end + 1];
