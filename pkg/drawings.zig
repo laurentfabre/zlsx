@@ -867,16 +867,27 @@ fn findLocalChartElement(block: []const u8, start: usize, prefixes: DrawingPrefi
             continue;
         };
         const uri_local = uriOfPrefixAtPosition(block, prefix, tag_end);
-        const matches_local = if (uri_local) |u|
-            std.mem.eql(u8, u, ns_c_transitional) or std.mem.eql(u8, u, ns_c_strict)
-        else
-            false;
+        // A local in-scope binding is authoritative — if the
+        // prefix has been redeclared, the root-primary fallback
+        // must NOT override it. Only fall through to root prefix
+        // matching when the prefix has no local declaration in
+        // scope at this tag. Otherwise the lookup would accept a
+        // `<c:chart xmlns:c="not-a-chart-uri"/>` element solely
+        // because `c` matches the drawing root, dropping the real
+        // chart later in the same graphic frame.
+        if (uri_local) |u| {
+            if (std.mem.eql(u8, u, ns_c_transitional) or std.mem.eql(u8, u, ns_c_strict)) {
+                return p_start - 1; // index of `<`
+            }
+            i = colon + 1;
+            continue;
+        }
         const matches_root_primary = std.mem.eql(u8, prefix, prefixes.c);
         const matches_root_alt = if (prefixes.c_alt) |alt|
             std.mem.eql(u8, prefix, alt)
         else
             false;
-        if (matches_local or matches_root_primary or matches_root_alt) {
+        if (matches_root_primary or matches_root_alt) {
             return p_start - 1; // index of `<`
         }
         i = colon + 1;
@@ -1760,6 +1771,25 @@ test "findLocalChartElement: chart-element self-redeclare wins over earlier non-
     // Override the root primary so it can't match `p` as a fallback.
     var prefixes: DrawingPrefixes = .{};
     prefixes.c = "c-not-p";
+    const found = findLocalChartElement(block, gf_idx, prefixes);
+    try std.testing.expect(found != null);
+    try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<p:chart"));
+}
+
+test "findLocalChartElement: local non-chart redeclare blocks root-prefix match" {
+    // The first `<c:chart>` redeclares xmlns:c locally to a
+    // NON-chart URI. The root primary is `c`, so before the fix
+    // the scanner would accept this (wrong) element via
+    // matches_root_primary and drop the REAL `<p:chart>` later.
+    // With the fix, an in-scope local binding is authoritative —
+    // root fallback only applies when no local binding exists.
+    const block =
+        "<xdr:graphicFrame>" ++
+        "<c:chart xmlns:c=\"http://example.com/not-a-chart\" r:id=\"rIdWrong\"/>" ++
+        "<p:chart xmlns:p=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"rIdReal\"/>" ++
+        "</xdr:graphicFrame>";
+    const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame").?;
+    const prefixes: DrawingPrefixes = .{}; // .c = "c" by default
     const found = findLocalChartElement(block, gf_idx, prefixes);
     try std.testing.expect(found != null);
     try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<p:chart"));
