@@ -78,6 +78,24 @@ fn decomposeAppend(
     out: *std.ArrayListUnmanaged(u21),
     cp: u21,
 ) !void {
+    return decomposeAppendDepth(allocator, out, cp, 0);
+}
+
+/// UCD canonical decomposition chains are bounded by the data —
+/// the deepest legitimate chain is around 4 levels (e.g. NFD of
+/// U+1F82). Cap recursion at 32 to defend against a future table
+/// regression that introduces a self-referential entry, which
+/// would otherwise stack-overflow on attacker-controlled input.
+const max_decompose_depth: u8 = 32;
+
+fn decomposeAppendDepth(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u21),
+    cp: u21,
+    depth: u8,
+) !void {
+    if (depth >= max_decompose_depth) return error.DecompositionTooDeep;
+
     // Hangul syllable algorithmic decomposition.
     if (cp >= tables.hangul_syllable_base and
         cp < tables.hangul_syllable_base + tables.hangul_syllable_count)
@@ -94,7 +112,7 @@ fn decomposeAppend(
     if (lookupDecomp(cp)) |mapping| {
         // Recurse — decompositions can chain (e.g. U+1E0A decomposes
         // to U+0044 + U+0307).
-        for (mapping) |child| try decomposeAppend(allocator, out, child);
+        for (mapping) |child| try decomposeAppendDepth(allocator, out, child, depth + 1);
         return;
     }
     try out.append(allocator, cp);

@@ -80,7 +80,17 @@ pub fn excelSheetNameEql(a: []const u8, b: []const u8) bool {
         }
         return true;
     }
-    var buf: [2048]u8 = undefined;
+    // 4 KiB scratch covers the worst-case for two 31-scalar Excel
+    // sheet names: each scalar ≤4 bytes UTF-8, full-fold can expand
+    // up to ~3× (e.g. ﬃ U+FB03 → "ffi" at 3:1, plus several
+    // case-folds with 2-3 byte expansions), and NFC adds a parallel
+    // u21 buffer. Worst-case proof: 31 scalars × 4 bytes input ×
+    // 3× fold-expansion × 2 (NFC) ≈ 750 B per side; two sides plus
+    // u21 ArrayLists (~500 B each) ≈ 2.5 KiB. The previous 2 KiB
+    // bound was too tight on max-length adversarial inputs and
+    // would silently break the dedup-distinct invariant via the
+    // `catch return false` swallow above.
+    var buf: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const alloc = fba.allocator();
     const fa = foldString(alloc, a) catch return false;
@@ -157,8 +167,11 @@ fn foldUtf8(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-/// Encode a codepoint as UTF-8 and append to `out`. Caller has
-/// ensured capacity for at least 4 bytes.
+/// Encode a codepoint as UTF-8 and append to `out`. `out` may
+/// grow via the allocator — the previous comment claimed callers
+/// pre-reserved 4 bytes, but in fact the appendSlice below handles
+/// growth itself. The 4-byte stack buffer is the per-call scratch,
+/// not a precondition on `out`.
 fn appendCodepoint(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), cp: u21) !void {
     var buf: [4]u8 = undefined;
     const n = std.unicode.utf8Encode(cp, &buf) catch return error.InvalidUtf8;
