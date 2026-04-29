@@ -1,0 +1,5 @@
+# Default owner for everything in this repo.
+# When a second maintainer joins, split by path:
+#   /src/c_abi.zig          @laurentfabre @other
+#   /bindings/python/       @laurentfabre @other
+*       @laurentfabre
