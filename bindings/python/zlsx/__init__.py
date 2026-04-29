@@ -2418,6 +2418,8 @@ class Writer:
         ``InvalidDefinedNameRefersTo``, or ``DuplicateDefinedName``
         (case-insensitive duplicate within the same scope).
         """
+        if self._handle is None:
+            raise ZlsxError("Writer is closed")
         if not _ffi._HAS_DEFINED_NAME:
             raise RuntimeError(
                 "loaded libzlsx does not expose add_defined_name "

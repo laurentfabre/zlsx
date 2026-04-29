@@ -1598,6 +1598,16 @@ def test_writer_add_data_validation_rejects_invalid_inputs(tmp_path):
         sheet.write_row(["x"])
 
 
+def test_writer_add_defined_name_after_close_raises(tmp_path):
+    """Calling add_defined_name on a closed Writer must raise rather
+    than segfault into the C ABI with a null handle."""
+    out = str(tmp_path / "closed.xlsx")
+    w = zlsx.Writer(out)
+    w.close()
+    with pytest.raises(zlsx.ZlsxError, match="Writer is closed"):
+        w.add_defined_name("Foo", "Sheet1!$A$1")
+
+
 def test_writer_add_defined_name_round_trip(tmp_path):
     """Workbook + sheet-scoped defined names ship through to xl/workbook.xml
     and round-trip through the same Writer's save path."""
