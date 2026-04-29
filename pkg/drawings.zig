@@ -1004,7 +1004,7 @@ fn elementExtentEnd(xml: []const u8, inside_pos: usize) ?usize {
     var depth: i64 = 1;
     var search_at: usize = tag_end + 1;
     while (search_at < xml.len) {
-        // Advance past any comment / CDATA section starting here.
+        // Advance past any comment / CDATA / PI section here.
         if (search_at + 4 <= xml.len and std.mem.startsWith(u8, xml[search_at..], "<!--")) {
             const close = std.mem.indexOfPos(u8, xml, search_at + 4, "-->") orelse return xml.len - 1;
             search_at = close + 3;
@@ -1015,15 +1015,24 @@ fn elementExtentEnd(xml: []const u8, inside_pos: usize) ?usize {
             search_at = close + 3;
             continue;
         }
+        if (search_at + 2 <= xml.len and std.mem.startsWith(u8, xml[search_at..], "<?")) {
+            const close = std.mem.indexOfPos(u8, xml, search_at + 2, "?>") orelse return xml.len - 1;
+            search_at = close + 2;
+            continue;
+        }
         const next_lt = std.mem.indexOfScalarPos(u8, xml, search_at, '<') orelse return xml.len - 1;
         if (next_lt + 1 >= xml.len) return xml.len - 1;
-        // If next_lt opens a comment / CDATA, loop around so the
-        // top-of-loop skip handles it.
+        // If next_lt opens a comment / CDATA / PI, loop around so
+        // the top-of-loop skip handles it.
         if (next_lt + 4 <= xml.len and std.mem.startsWith(u8, xml[next_lt..], "<!--")) {
             search_at = next_lt;
             continue;
         }
         if (next_lt + 9 <= xml.len and std.mem.startsWith(u8, xml[next_lt..], "<![CDATA[")) {
+            search_at = next_lt;
+            continue;
+        }
+        if (next_lt + 2 <= xml.len and std.mem.startsWith(u8, xml[next_lt..], "<?")) {
             search_at = next_lt;
             continue;
         }
@@ -2037,6 +2046,29 @@ test "findLocalChartElement: fake nested markup in comment doesn't unbalance dep
     const found = findLocalChartElement(block, gf_idx, prefixes);
     try std.testing.expect(found != null);
     try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<c:chart"));
+}
+
+test "findLocalChartElement: PI body with fake </name> doesn't unbalance extent" {
+    // An ancestor that declares a chart-prefix binding contains a
+    // processing instruction whose body has fake `</foo>` text.
+    // elementExtentEnd's depth counter must skip PI bodies — if it
+    // counted that as a real close tag, depth would go to 0 too
+    // early, the binding's extent would shrink, and a real chart
+    // declared after the ancestor's true close would still see
+    // the ancestor's binding.
+    const block =
+        "<xdr:graphicFrame>" ++
+        "<foo xmlns:p=\"http://schemas.openxmlformats.org/drawingml/2006/chart\">" ++
+        "<?someProc </foo> ?>" ++
+        "<p:chart r:id=\"rId1\"/>" ++
+        "</foo>" ++
+        "</xdr:graphicFrame>";
+    const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame").?;
+    var prefixes: DrawingPrefixes = .{};
+    prefixes.c = "c-not-p"; // disable root fallback so test depends on local lookup
+    const found = findLocalChartElement(block, gf_idx, prefixes);
+    try std.testing.expect(found != null);
+    try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<p:chart"));
 }
 
 test "findLocalChartElement: comment-delimiter-text inside a PI doesn't open a fake comment" {
