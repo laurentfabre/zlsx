@@ -547,12 +547,17 @@ const DrawingPrefixes = struct {
 /// parts only declare the chart namespace inline on `<c:chart>`).
 fn resolveDrawingPrefixes(xml: []const u8) DrawingPrefixes {
     var p: DrawingPrefixes = .{};
-    if (findNamespacePrefix(xml, ns_xdr_transitional)) |pref| p.xdr = pref;
-    if (findNamespacePrefix(xml, ns_xdr_strict)) |pref| p.xdr = pref;
-    if (findNamespacePrefix(xml, ns_a_transitional)) |pref| p.a = pref;
-    if (findNamespacePrefix(xml, ns_a_strict)) |pref| p.a = pref;
-    if (findNamespacePrefix(xml, ns_c_transitional)) |pref| p.c = pref;
-    if (findNamespacePrefix(xml, ns_c_strict)) |pref| p.c = pref;
+    // Try Transitional first; only fall back to Strict if not found.
+    // A workbook that declares BOTH URIs (e.g. carrying a Strict
+    // alternate namespace as a stray declaration) keeps the
+    // Transitional binding active — overwriting with Strict would
+    // pick a prefix that's never actually used by the document.
+    if (findNamespacePrefix(xml, ns_xdr_transitional) orelse
+        findNamespacePrefix(xml, ns_xdr_strict)) |pref| p.xdr = pref;
+    if (findNamespacePrefix(xml, ns_a_transitional) orelse
+        findNamespacePrefix(xml, ns_a_strict)) |pref| p.a = pref;
+    if (findNamespacePrefix(xml, ns_c_transitional) orelse
+        findNamespacePrefix(xml, ns_c_strict)) |pref| p.c = pref;
     return p;
 }
 
