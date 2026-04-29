@@ -266,7 +266,7 @@ fn collectFromSheet(
         const pic_close = std.mem.indexOfPos(u8, block, pic_idx, tags.close_pic) orelse continue;
         const pic_block = block[pic_idx .. pic_close + tags.close_pic.len];
 
-        const embed_rid = findBlipEmbed(pic_block, prefixes.a) orelse continue;
+        const embed_rid = findBlipEmbedWithAlt(pic_block, prefixes.a, prefixes.a_alt) orelse continue;
         const image_target = relTargetForId(allocator, drawing_rels, embed_rid) orelse continue;
         const image_part_name = (try store.resolve(drawing_part_name, image_target)) orelse continue;
         const image_part = store.part(image_part_name) orelse continue;
@@ -359,13 +359,14 @@ fn collectChartsFromSheet(
             const candidates = [_]?[]const u8{
                 block_chart_prefix_t,
                 block_chart_prefix_s,
+                prefixes.c_alt, // drawing-root alternate-class binding
             };
             for (candidates) |maybe_p| {
                 const p = maybe_p orelse continue;
                 const local_open = std.fmt.bufPrint(&block_chart_buf, "<{s}:chart", .{p}) catch continue;
                 if (std.mem.indexOfPos(u8, block, gf_idx, local_open)) |idx| break :blk idx;
             }
-            // Fall back to the drawing-root prefix.
+            // Fall back to the drawing-root primary prefix.
             if (std.mem.indexOfPos(u8, block, gf_idx, root_open_chart)) |idx| break :blk idx;
             continue;
         };
@@ -522,11 +523,30 @@ fn findOpeningTag(xml: []const u8, name: []const u8) ?usize {
 /// file and have no part in the package. `a_prefix` is the
 /// document's actual DrawingML-main prefix (canonically "a").
 fn findBlipEmbed(pic_xml: []const u8, a_prefix: []const u8) ?[]const u8 {
+    return findBlipEmbedWithAlt(pic_xml, a_prefix, null);
+}
+
+fn findBlipEmbedWithAlt(
+    pic_xml: []const u8,
+    a_prefix: []const u8,
+    a_prefix_alt: ?[]const u8,
+) ?[]const u8 {
     var blip_open_buf: [128]u8 = undefined;
-    const blip_open = std.fmt.bufPrint(&blip_open_buf, "<{s}:blip", .{a_prefix}) catch return null;
-    const blip = std.mem.indexOf(u8, pic_xml, blip_open) orelse return null;
-    const blip_end = std.mem.indexOfScalarPos(u8, pic_xml, blip, '>') orelse return null;
-    return attrValue(pic_xml[blip .. blip_end + 1], "r:embed");
+    {
+        const blip_open = std.fmt.bufPrint(&blip_open_buf, "<{s}:blip", .{a_prefix}) catch return null;
+        if (std.mem.indexOf(u8, pic_xml, blip_open)) |blip| {
+            const blip_end = std.mem.indexOfScalarPos(u8, pic_xml, blip, '>') orelse return null;
+            return attrValue(pic_xml[blip .. blip_end + 1], "r:embed");
+        }
+    }
+    if (a_prefix_alt) |alt| {
+        const blip_open = std.fmt.bufPrint(&blip_open_buf, "<{s}:blip", .{alt}) catch return null;
+        if (std.mem.indexOf(u8, pic_xml, blip_open)) |blip| {
+            const blip_end = std.mem.indexOfScalarPos(u8, pic_xml, blip, '>') orelse return null;
+            return attrValue(pic_xml[blip .. blip_end + 1], "r:embed");
+        }
+    }
+    return null;
 }
 
 /// OOXML namespace URIs for the three prefixes the drawing parser
@@ -543,11 +563,16 @@ const ns_c_transitional = "http://schemas.openxmlformats.org/drawingml/2006/char
 const ns_c_strict = "http://purl.oclc.org/ooxml/drawingml/chart";
 
 /// Resolved namespace prefixes for one drawing or chart part.
-/// Defaults are the canonical Microsoft prefixes.
+/// Defaults are the canonical Microsoft prefixes; secondary
+/// fields hold the alternate-conformance binding when both
+/// Transitional and Strict URIs are declared so downstream
+/// lookups can probe either prefix.
 const DrawingPrefixes = struct {
     xdr: []const u8 = "xdr",
     a: []const u8 = "a",
     c: []const u8 = "c",
+    a_alt: ?[]const u8 = null,
+    c_alt: ?[]const u8 = null,
 };
 
 /// Scan the root element's xmlns:* declarations and return the
@@ -570,10 +595,14 @@ fn resolveDrawingPrefixes(xml: []const u8) DrawingPrefixes {
     {
         p.xdr = pref;
     }
-    if (findNamespacePrefix(xml, ns_a_transitional) orelse
-        findNamespacePrefix(xml, ns_a_strict)) |pref| p.a = pref;
-    if (findNamespacePrefix(xml, ns_c_transitional) orelse
-        findNamespacePrefix(xml, ns_c_strict)) |pref| p.c = pref;
+    const a_t = findNamespacePrefix(xml, ns_a_transitional);
+    const a_s = findNamespacePrefix(xml, ns_a_strict);
+    if (a_t orelse a_s) |pref| p.a = pref;
+    if (a_t != null and a_s != null) p.a_alt = a_s;
+    const c_t = findNamespacePrefix(xml, ns_c_transitional);
+    const c_s = findNamespacePrefix(xml, ns_c_strict);
+    if (c_t orelse c_s) |pref| p.c = pref;
+    if (c_t != null and c_s != null) p.c_alt = c_s;
     return p;
 }
 
