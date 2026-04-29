@@ -547,18 +547,109 @@ const DrawingPrefixes = struct {
 /// parts only declare the chart namespace inline on `<c:chart>`).
 fn resolveDrawingPrefixes(xml: []const u8) DrawingPrefixes {
     var p: DrawingPrefixes = .{};
-    // Try Transitional first; only fall back to Strict if not found.
-    // A workbook that declares BOTH URIs (e.g. carrying a Strict
-    // alternate namespace as a stray declaration) keeps the
-    // Transitional binding active — overwriting with Strict would
-    // pick a prefix that's never actually used by the document.
-    if (findNamespacePrefix(xml, ns_xdr_transitional) orelse
-        findNamespacePrefix(xml, ns_xdr_strict)) |pref| p.xdr = pref;
-    if (findNamespacePrefix(xml, ns_a_transitional) orelse
-        findNamespacePrefix(xml, ns_a_strict)) |pref| p.a = pref;
-    if (findNamespacePrefix(xml, ns_c_transitional) orelse
-        findNamespacePrefix(xml, ns_c_strict)) |pref| p.c = pref;
+    // Both Transitional and Strict declarations may appear in the
+    // same root element — picking either order arbitrarily breaks
+    // documents that bind the unused conformance class to a stray
+    // prefix. Disambiguate by anchoring on the ROOT ELEMENT's
+    // prefix: whichever URI it's bound to is the "active" xdr
+    // namespace; the same-URI binding for `a`/`c` follows.
+    const root_xdr = rootElementPrefix(xml);
+    if (root_xdr) |pref| {
+        p.xdr = pref;
+        const root_uri = uriOfPrefix(xml, pref);
+        if (root_uri == .strict) {
+            if (findNamespacePrefix(xml, ns_a_strict)) |pref2| p.a = pref2;
+            if (findNamespacePrefix(xml, ns_c_strict)) |pref2| p.c = pref2;
+        } else {
+            // Transitional or unknown — use Transitional URIs.
+            if (findNamespacePrefix(xml, ns_a_transitional)) |pref2| p.a = pref2;
+            if (findNamespacePrefix(xml, ns_c_transitional)) |pref2| p.c = pref2;
+        }
+    } else {
+        // No identifiable root prefix — fall back to either URI
+        // for each namespace independently.
+        if (findNamespacePrefix(xml, ns_xdr_transitional) orelse
+            findNamespacePrefix(xml, ns_xdr_strict)) |pref| p.xdr = pref;
+        if (findNamespacePrefix(xml, ns_a_transitional) orelse
+            findNamespacePrefix(xml, ns_a_strict)) |pref| p.a = pref;
+        if (findNamespacePrefix(xml, ns_c_transitional) orelse
+            findNamespacePrefix(xml, ns_c_strict)) |pref| p.c = pref;
+    }
     return p;
+}
+
+const NamespaceVariant = enum { transitional, strict, unknown };
+
+/// Find the prefix on the root XML element. Skips the XML
+/// declaration (`<?xml ... ?>`) and any leading whitespace, then
+/// reads the first `<NAME:` token's NAME. Returns null if the
+/// root element is unprefixed or absent. Bounded scan (4 KiB).
+fn rootElementPrefix(xml: []const u8) ?[]const u8 {
+    const limit = @min(xml.len, 4096);
+    var i: usize = 0;
+    // Skip the optional XML declaration.
+    while (i < limit) {
+        const lt = std.mem.indexOfScalarPos(u8, xml[0..limit], i, '<') orelse return null;
+        if (lt + 1 >= limit) return null;
+        const after = xml[lt + 1];
+        if (after == '?') {
+            // Skip until '?>'
+            const close = std.mem.indexOfPos(u8, xml[0..limit], lt, "?>") orelse return null;
+            i = close + 2;
+            continue;
+        }
+        if (after == '!') {
+            // Skip DOCTYPE / comment / CDATA until '>'
+            const close = std.mem.indexOfScalarPos(u8, xml[0..limit], lt, '>') orelse return null;
+            i = close + 1;
+            continue;
+        }
+        // Real element. Read NAME[:LOCAL].
+        var j = lt + 1;
+        while (j < limit) : (j += 1) {
+            const c = xml[j];
+            if (c == ':') {
+                if (j - (lt + 1) > max_prefix_len) return null;
+                return xml[lt + 1 .. j];
+            }
+            if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '/' or c == '>') {
+                return null; // unprefixed
+            }
+        }
+        return null;
+    }
+    return null;
+}
+
+/// Given a prefix declared somewhere in `xml`'s root element, return
+/// which OOXML conformance class its xmlns binding belongs to.
+fn uriOfPrefix(xml: []const u8, prefix: []const u8) NamespaceVariant {
+    const limit = @min(xml.len, 4096);
+    var search_buf: [128]u8 = undefined;
+    if (prefix.len + "xmlns:".len + 1 > search_buf.len) return .unknown;
+    @memcpy(search_buf[0.."xmlns:".len], "xmlns:");
+    @memcpy(search_buf["xmlns:".len..][0..prefix.len], prefix);
+    const needle = search_buf[0 .. "xmlns:".len + prefix.len];
+    const start = std.mem.indexOf(u8, xml[0..limit], needle) orelse return .unknown;
+    var p = start + needle.len;
+    // Skip optional whitespace + `=` + whitespace + quote.
+    while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
+    if (p >= limit or xml[p] != '=') return .unknown;
+    p += 1;
+    while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
+    if (p >= limit) return .unknown;
+    const quote = xml[p];
+    if (quote != '"' and quote != '\'') return .unknown;
+    const val_start = p + 1;
+    const val_end = std.mem.indexOfScalarPos(u8, xml[0..limit], val_start, quote) orelse return .unknown;
+    const uri = xml[val_start..val_end];
+    if (std.mem.eql(u8, uri, ns_xdr_strict) or
+        std.mem.eql(u8, uri, ns_a_strict) or
+        std.mem.eql(u8, uri, ns_c_strict)) return .strict;
+    if (std.mem.eql(u8, uri, ns_xdr_transitional) or
+        std.mem.eql(u8, uri, ns_a_transitional) or
+        std.mem.eql(u8, uri, ns_c_transitional)) return .transitional;
+    return .unknown;
 }
 
 /// Walk the first 4 KiB of `xml` looking for `xmlns:NAME="URI"`.
