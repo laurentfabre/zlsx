@@ -1742,20 +1742,27 @@ test "findLocalChartElement matches the actually-used prefix among multiple bind
 }
 
 test "findLocalChartElement: chart-element self-redeclare wins over earlier non-chart binding" {
-    // An earlier element declares xmlns:c bound to a NON-chart URI;
-    // the chart element redeclares xmlns:c bound to the chart URI.
+    // An earlier element declares xmlns:p bound to a NON-chart URI;
+    // the chart element redeclares xmlns:p bound to the chart URI.
     // XML scoping says the chart element's own declaration applies
     // to that element. The "nearest before tag end" lookup must
     // pick the chart's own redeclare, not the earlier sibling.
+    //
+    // Uses prefix `p` (NOT the default root `c`) so the test result
+    // depends on the local-binding lookup, not the
+    // `matches_root_primary` fallback.
     const block =
         "<xdr:graphicFrame>" ++
-        "<other xmlns:c=\"http://example.com/not-a-chart\"/>" ++
-        "<c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"rId1\"/>" ++
+        "<other xmlns:p=\"http://example.com/not-a-chart\"/>" ++
+        "<p:chart xmlns:p=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"rId1\"/>" ++
         "</xdr:graphicFrame>";
     const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame").?;
-    const found = findLocalChartElement(block, gf_idx, .{});
+    // Override the root primary so it can't match `p` as a fallback.
+    var prefixes: DrawingPrefixes = .{};
+    prefixes.c = "c-not-p";
+    const found = findLocalChartElement(block, gf_idx, prefixes);
     try std.testing.expect(found != null);
-    try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<c:chart"));
+    try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<p:chart"));
 }
 
 test "findLocalChartElement skips ':chartSpace' false matches" {
