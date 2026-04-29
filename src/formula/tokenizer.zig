@@ -119,11 +119,23 @@ pub fn tokenize(allocator: std.mem.Allocator, input: []const u8) Error![]Token {
                 i += 1;
                 break :blk .{ .kind = .unknown, .text = input[start..i] };
             },
-            '$', 'A'...'Z', 'a'...'z', '_' => blk: {
+            '$', 'A'...'Z', 'a'...'z', '_', '\\' => blk: {
                 i = scanIdent(input, start);
                 const lex = input[start..i];
-                if (isCellRef(lex)) break :blk .{ .kind = .cell_ref, .text = lex };
                 if (isBoolLit(lex)) break :blk .{ .kind = .bool_lit, .text = lex };
+                if (isCellRef(lex)) {
+                    // Disambiguate: an A1-shaped lexeme is a `.name`
+                    // when it's the head of a function call (`LOG10(`)
+                    // or a sheet qualifier (`Q1!A1`); only standalone
+                    // refs collapse to `.cell_ref`. Without this, a
+                    // future rewriter would corrupt function names
+                    // and bare sheet refs that happen to match the
+                    // A1 grid shape.
+                    if (i < input.len and (input[i] == '(' or input[i] == '!')) {
+                        break :blk .{ .kind = .name, .text = lex };
+                    }
+                    break :blk .{ .kind = .cell_ref, .text = lex };
+                }
                 break :blk .{ .kind = .name, .text = lex };
             },
             '+' => blk: {
@@ -615,6 +627,27 @@ test "named ranges and function calls share the .name kind" {
     try expectKinds("MyRange", &.{.name});
     try expectKinds("SUM", &.{.name});
     try expectKinds("My_Range.v2", &.{.name});
+}
+
+test "A1-shaped function names + sheet refs classify as .name not .cell_ref" {
+    // `LOG10` matches the A1 shape (column LOG = 8509, row 10) but
+    // is a built-in function. The trailing `(` flips it to `.name`.
+    try expectKinds("LOG10(A1)", &.{
+        .name, .paren_open, .cell_ref, .paren_close,
+    });
+    // `Q1` is a valid A1 ref AND a common sheet name. Trailing `!`
+    // means it's the sheet qualifier — `.name`, not `.cell_ref`.
+    try expectKinds("Q1!A1", &.{ .name, .bang, .cell_ref });
+    // Without the trailing delimiter, `Q1` stays a cell ref.
+    try expectKinds("Q1", &.{.cell_ref});
+    try expectKinds("Q1+B2", &.{ .cell_ref, .op_plus, .cell_ref });
+}
+
+test "backslash-started defined names" {
+    // Excel allows `\` as a name starter. openpyxl tokenizes
+    // `\Foo` as a RANGE (defined name); we should match.
+    try expectKinds("\\Foo", &.{.name});
+    try expectRoundTrip("\\Foo+1");
 }
 
 test "mixed bag round-trip" {
