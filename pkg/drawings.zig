@@ -550,12 +550,17 @@ fn resolveDrawingPrefixes(xml: []const u8) DrawingPrefixes {
 /// xmlns declarations are always on the root element; well past
 /// 4 KiB the search would cost more than it saves on adversarial
 /// input.
-/// Reject prefixes longer than this — the per-needle scratch in
-/// DrawingTags + leaf helpers is sized for prefixes up to ~110
-/// chars per needle, but a 100-char prefix is already pathological
-/// (real OOXML uses 1-8 char prefixes). Fall back to the canonical
-/// default if a workbook declares something longer.
-const max_prefix_len: usize = 64;
+/// Reject prefixes longer than the smallest per-needle scratch
+/// buffer can format. The buf-fixed Writer in DrawingTags.build
+/// handles 4 KiB of needles total (12+ needles), and the per-
+/// helper scratch buffers (parseCellAnchor, findBlipEmbed,
+/// detectChartType) are 128 bytes each. The longest formatted
+/// needle is `</PREFIX:rowOff>` = prefix.len + 12, so a 110-char
+/// prefix exactly fills the 128-byte buffer with no room for the
+/// fixed pattern. 100 leaves a comfortable margin and still
+/// covers any conceivable real-world prefix (OOXML uses 1-8 char
+/// prefixes; 100 is already absurd).
+const max_prefix_len: usize = 100;
 
 fn findNamespacePrefix(xml: []const u8, target_uri: []const u8) ?[]const u8 {
     const limit = @min(xml.len, 4096);
