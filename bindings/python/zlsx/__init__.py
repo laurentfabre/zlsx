@@ -2436,10 +2436,19 @@ class Writer:
         ptr_t = ctypes.POINTER(ctypes.c_ubyte)
         # Negative sheet id signals workbook scope to the C ABI.
         lsi: int = -1 if local_sheet_id is None else int(local_sheet_id)
-        if local_sheet_id is not None and local_sheet_id < 0:
-            raise ValueError(
-                f"local_sheet_id must be >= 0 or None, got {local_sheet_id}"
-            )
+        if local_sheet_id is not None:
+            if local_sheet_id < 0:
+                raise ValueError(
+                    f"local_sheet_id must be >= 0 or None, got {local_sheet_id}"
+                )
+            # The C ABI uses a signed int32 with negative = workbook
+            # scope. Values >= 2**31 wrap to negative through ctypes
+            # and would silently turn a sheet-scoped name into a
+            # workbook-scoped one. Reject above the int32 cap.
+            if local_sheet_id > 0x7FFFFFFF:
+                raise ValueError(
+                    f"local_sheet_id must be <= INT32_MAX, got {local_sheet_id}"
+                )
         rc = _ffi.lib.zlsx_writer_add_defined_name(
             self._handle,
             ctypes.cast(name_buf, ptr_t),

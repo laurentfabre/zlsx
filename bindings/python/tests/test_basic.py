@@ -1611,6 +1611,22 @@ def test_writer_add_defined_name_after_close_raises(tmp_path):
         w.add_defined_name("Foo", "Sheet1!$A$1")
 
 
+def test_writer_add_defined_name_rejects_huge_local_sheet_id(tmp_path):
+    """local_sheet_id > INT32_MAX would silently wrap through ctypes
+    to a negative value, which the C ABI treats as workbook scope.
+    The Python wrapper rejects up-front."""
+    import zlsx._ffi as ffi
+    if not ffi._HAS_DEFINED_NAME:
+        pytest.skip("loaded libzlsx predates add_defined_name ABI (post-0.3.0)")
+    out = str(tmp_path / "huge_lsi.xlsx")
+    with zlsx.Writer(out) as w:
+        w.add_sheet("S")
+        with pytest.raises(ValueError, match="INT32_MAX"):
+            w.add_defined_name("Foo", "S!$A$1", local_sheet_id=2**31)
+        with pytest.raises(ValueError, match=">= 0"):
+            w.add_defined_name("Foo", "S!$A$1", local_sheet_id=-1)
+
+
 def test_writer_add_defined_name_round_trip(tmp_path):
     """Workbook + sheet-scoped defined names ship through to xl/workbook.xml
     and round-trip through the same Writer's save path."""
