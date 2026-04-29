@@ -550,6 +550,13 @@ fn resolveDrawingPrefixes(xml: []const u8) DrawingPrefixes {
 /// xmlns declarations are always on the root element; well past
 /// 4 KiB the search would cost more than it saves on adversarial
 /// input.
+/// Reject prefixes longer than this — the per-needle scratch in
+/// DrawingTags + leaf helpers is sized for prefixes up to ~110
+/// chars per needle, but a 100-char prefix is already pathological
+/// (real OOXML uses 1-8 char prefixes). Fall back to the canonical
+/// default if a workbook declares something longer.
+const max_prefix_len: usize = 64;
+
 fn findNamespacePrefix(xml: []const u8, target_uri: []const u8) ?[]const u8 {
     const limit = @min(xml.len, 4096);
     var i: usize = 0;
@@ -585,7 +592,14 @@ fn findNamespacePrefix(xml: []const u8, target_uri: []const u8) ?[]const u8 {
         }
         const val_start = p + 1;
         const val_end = std.mem.indexOfScalarPos(u8, xml[0..limit], val_start, quote) orelse return null;
-        if (std.mem.eql(u8, xml[val_start..val_end], target_uri)) return name;
+        if (std.mem.eql(u8, xml[val_start..val_end], target_uri)) {
+            // Cap pathologically long prefixes — they'd overflow
+            // the per-needle scratch buffers downstream and turn a
+            // valid workbook into a hard error. 64 chars is well
+            // beyond anything real (OOXML uses 1-8 char prefixes).
+            if (name.len > max_prefix_len) return null;
+            return name;
+        }
         i = val_end + 1;
     }
     return null;
