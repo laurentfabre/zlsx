@@ -584,6 +584,16 @@ pub const Writer = struct {
     ) !void {
         try validateDefinedName(name);
         if (refers_to.len == 0) return error.InvalidDefinedNameRefersTo;
+        // Excel defined names are case-insensitive and unique
+        // within each scope (workbook-scope or per-sheet). A
+        // duplicate would be repaired or dropped on open, so
+        // reject up-front.
+        for (self.defined_names.items) |existing| {
+            if (existing.local_sheet_id != opts.local_sheet_id) continue;
+            if (std.ascii.eqlIgnoreCase(existing.name, name)) {
+                return error.DuplicateDefinedName;
+            }
+        }
         const name_copy = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(name_copy);
         const refers_copy = try self.allocator.dupe(u8, refers_to);
@@ -6328,6 +6338,31 @@ test "Writer.addDefinedName: rejects invalid name + empty refers_to" {
         error.InvalidDefinedNameRefersTo,
         w.addDefinedName("Foo", "", .{}),
     );
+}
+
+test "Writer.addDefinedName: rejects case-insensitive duplicates per scope" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    try w.addDefinedName("Rate", "Sheet1!$A$1", .{});
+    // Same name, same scope — duplicate.
+    try std.testing.expectError(
+        error.DuplicateDefinedName,
+        w.addDefinedName("Rate", "Sheet1!$A$2", .{}),
+    );
+    // Case-only variant — still duplicate.
+    try std.testing.expectError(
+        error.DuplicateDefinedName,
+        w.addDefinedName("RATE", "Sheet1!$A$3", .{}),
+    );
+    try std.testing.expectError(
+        error.DuplicateDefinedName,
+        w.addDefinedName("rate", "Sheet1!$A$4", .{}),
+    );
+    // Different scope (sheet-scoped) — accepted.
+    try w.addDefinedName("Rate", "Sheet1!$B$1", .{ .local_sheet_id = 0 });
+    // Same name in another sheet's scope — also accepted.
+    try w.addDefinedName("Rate", "Sheet2!$B$1", .{ .local_sheet_id = 1 });
+    try std.testing.expectEqual(@as(usize, 3), w.defined_names.items.len);
 }
 
 test "validateDefinedName: rejects R1C1-shaped references" {
