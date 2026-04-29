@@ -835,7 +835,10 @@ fn findNamespacePrefix(xml: []const u8, target_uri: []const u8) ?[]const u8 {
 /// consistent across helpers.
 fn uriOfPrefix(xml: []const u8, prefix: []const u8) ?[]const u8 {
     if (prefix.len == 0) return null;
-    const limit = @min(xml.len, 4096);
+    // Same scope as findNamespacePrefixExcept: walk the whole
+    // document so locally declared bindings on descendant
+    // elements are reachable.
+    const limit = xml.len;
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, xml[0..limit], i, "xmlns:")) |start| {
         const after = start + "xmlns:".len;
@@ -879,7 +882,13 @@ fn findNamespacePrefixExcept(
     target_uri: []const u8,
     skip: []const u8,
 ) ?[]const u8 {
-    const limit = @min(xml.len, 4096);
+    // Walk the whole document. XML 1.0 + Namespaces 1.0 allow
+    // xmlns:* declarations on any element, not only the root —
+    // a deep `<dr:twoCellAnchor xmlns:dr=...>` is valid OOXML.
+    // The earlier 4 KiB cap silently dropped anchors using
+    // late-declared prefixes. Adversarial-size defense lives at
+    // the package boundary (per-part 512 MiB cap in store.zig).
+    const limit = xml.len;
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, xml[0..limit], i, "xmlns:")) |start| {
         const after = start + "xmlns:".len;
@@ -1588,6 +1597,31 @@ test "resolveDrawingPrefixes maps canonical + custom prefixes" {
             \\<?xml version="1.0"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:xs="http://purl.oclc.org/ooxml/drawingml/spreadsheetDrawing" xmlns:dr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>
         ;
         const p = resolveDrawingPrefixes(xml);
+        try std.testing.expectEqualStrings("xdr", p.xdr);
+        try std.testing.expect(p.xdr_alt != null);
+        try std.testing.expectEqualStrings("dr", p.xdr_alt.?);
+    }
+    // Late-declared xmlns past the previous 4 KiB scan window:
+    // XML 1.0 + Namespaces 1.0 allow xmlns:* on any element. Pad
+    // the document past 4 KiB before declaring the alt prefix so
+    // we exercise the unbounded scan path.
+    {
+        var pad_buf: [5000]u8 = undefined;
+        @memset(&pad_buf, ' ');
+        const head =
+            \\<?xml version="1.0"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing">
+        ;
+        const tail =
+            \\<dr:twoCellAnchor xmlns:dr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/></xdr:wsDr>
+        ;
+        var doc_buf: [8192]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&doc_buf);
+        const w = fbs.writer();
+        try w.writeAll(head);
+        try w.writeAll(&pad_buf);
+        try w.writeAll(tail);
+        const doc = fbs.getWritten();
+        const p = resolveDrawingPrefixes(doc);
         try std.testing.expectEqualStrings("xdr", p.xdr);
         try std.testing.expect(p.xdr_alt != null);
         try std.testing.expectEqualStrings("dr", p.xdr_alt.?);
