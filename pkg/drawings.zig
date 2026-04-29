@@ -347,7 +347,8 @@ fn collectChartsFromSheet(
         // by the chart element, so picking the first match anywhere
         // in the block could miss valid root-scoped charts.
         var block_chart_buf: [128]u8 = undefined;
-        const block_chart_prefix = findNamespacePrefix(block, ns_c);
+        const block_chart_prefix = findNamespacePrefix(block, ns_c_transitional) orelse
+            findNamespacePrefix(block, ns_c_strict);
         const root_open_chart = tags.open_chart;
         const chart_idx = blk: {
             if (block_chart_prefix) |p| {
@@ -519,11 +520,18 @@ fn findBlipEmbed(pic_xml: []const u8, a_prefix: []const u8) ?[]const u8 {
     return attrValue(pic_xml[blip .. blip_end + 1], "r:embed");
 }
 
-/// Canonical OOXML namespace URIs for the three prefixes the
-/// drawing parser needs. ECMA-376 / OPC fixed.
-const ns_xdr = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing";
-const ns_a = "http://schemas.openxmlformats.org/drawingml/2006/main";
-const ns_c = "http://schemas.openxmlformats.org/drawingml/2006/chart";
+/// OOXML namespace URIs for the three prefixes the drawing parser
+/// needs. Both Transitional (ECMA-376 first edition,
+/// http://schemas.openxmlformats.org/...) and Strict (second
+/// edition, http://purl.oclc.org/ooxml/...) URIs are accepted —
+/// Strict-conformance workbooks declare the same logical types
+/// under the purl.oclc.org variants.
+const ns_xdr_transitional = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing";
+const ns_xdr_strict = "http://purl.oclc.org/ooxml/drawingml/spreadsheetDrawing";
+const ns_a_transitional = "http://schemas.openxmlformats.org/drawingml/2006/main";
+const ns_a_strict = "http://purl.oclc.org/ooxml/drawingml/main";
+const ns_c_transitional = "http://schemas.openxmlformats.org/drawingml/2006/chart";
+const ns_c_strict = "http://purl.oclc.org/ooxml/drawingml/chart";
 
 /// Resolved namespace prefixes for one drawing or chart part.
 /// Defaults are the canonical Microsoft prefixes.
@@ -539,9 +547,12 @@ const DrawingPrefixes = struct {
 /// parts only declare the chart namespace inline on `<c:chart>`).
 fn resolveDrawingPrefixes(xml: []const u8) DrawingPrefixes {
     var p: DrawingPrefixes = .{};
-    if (findNamespacePrefix(xml, ns_xdr)) |pref| p.xdr = pref;
-    if (findNamespacePrefix(xml, ns_a)) |pref| p.a = pref;
-    if (findNamespacePrefix(xml, ns_c)) |pref| p.c = pref;
+    if (findNamespacePrefix(xml, ns_xdr_transitional)) |pref| p.xdr = pref;
+    if (findNamespacePrefix(xml, ns_xdr_strict)) |pref| p.xdr = pref;
+    if (findNamespacePrefix(xml, ns_a_transitional)) |pref| p.a = pref;
+    if (findNamespacePrefix(xml, ns_a_strict)) |pref| p.a = pref;
+    if (findNamespacePrefix(xml, ns_c_transitional)) |pref| p.c = pref;
+    if (findNamespacePrefix(xml, ns_c_strict)) |pref| p.c = pref;
     return p;
 }
 
@@ -1159,6 +1170,25 @@ test "resolveDrawingPrefixes maps canonical + custom prefixes" {
         try std.testing.expectEqualStrings("xdr", p.xdr);
         try std.testing.expectEqualStrings("a", p.a);
         try std.testing.expectEqualStrings("c", p.c);
+    }
+    // Strict OOXML namespace URIs — http://purl.oclc.org/ooxml/...
+    {
+        const xml =
+            \\<?xml version="1.0"?><xdr:wsDr xmlns:xdr="http://purl.oclc.org/ooxml/drawingml/spreadsheetDrawing" xmlns:a="http://purl.oclc.org/ooxml/drawingml/main" xmlns:c="http://purl.oclc.org/ooxml/drawingml/chart"/>
+        ;
+        const p = resolveDrawingPrefixes(xml);
+        try std.testing.expectEqualStrings("xdr", p.xdr);
+        try std.testing.expectEqualStrings("a", p.a);
+        try std.testing.expectEqualStrings("c", p.c);
+    }
+    // Strict-namespace URIs with non-canonical prefix names.
+    {
+        const xml =
+            \\<?xml version="1.0"?><dr:wsDr xmlns:dr="http://purl.oclc.org/ooxml/drawingml/spreadsheetDrawing" xmlns:dml="http://purl.oclc.org/ooxml/drawingml/main"/>
+        ;
+        const p = resolveDrawingPrefixes(xml);
+        try std.testing.expectEqualStrings("dr", p.xdr);
+        try std.testing.expectEqualStrings("dml", p.a);
     }
     // Whitespace around `=` is valid XML — must be tolerated.
     {
