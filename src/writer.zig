@@ -596,10 +596,31 @@ pub const Writer = struct {
         const have_styles = self.styles.items.len > 0 or self.dxfs.items.len > 0;
 
         // 1. [Content_Types].xml
+        //
+        // OPC schema requires every <Default> element BEFORE any
+        // <Override> elements. CONTENT_TYPES_HEAD already opens the
+        // root + emits the canonical Defaults (rels, xml); the
+        // optional Default for vmlDrawing must slot in here, then
+        // every Override follows.
         {
             var ct: std.ArrayListUnmanaged(u8) = .{};
             defer ct.deinit(alloc);
             try ct.appendSlice(alloc, CONTENT_TYPES_HEAD);
+            // ─── Defaults ───────────────────────────────────────
+            var any_comments = false;
+            for (self.sheets.items) |sw| {
+                if (sw.comments.items.len > 0) {
+                    any_comments = true;
+                    break;
+                }
+            }
+            if (any_comments) {
+                try ct.appendSlice(
+                    alloc,
+                    "<Default Extension=\"vml\" ContentType=\"application/vnd.openxmlformats-officedocument.vmlDrawing\"/>",
+                );
+            }
+            // ─── Overrides ──────────────────────────────────────
             for (self.sheets.items, 0..) |_, i| {
                 try ct.print(
                     alloc,
@@ -613,22 +634,7 @@ pub const Writer = struct {
                     "<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>",
                 );
             }
-            // Per-sheet comments + vmlDrawing overrides. A `Default
-            // Extension="vml"` line covers every vmlDrawing.vml file in
-            // one go; the comments parts need explicit Overrides
-            // because `.xml` is already claimed by the generic Default.
-            var any_comments = false;
-            for (self.sheets.items) |sw| {
-                if (sw.comments.items.len > 0) {
-                    any_comments = true;
-                    break;
-                }
-            }
             if (any_comments) {
-                try ct.appendSlice(
-                    alloc,
-                    "<Default Extension=\"vml\" ContentType=\"application/vnd.openxmlformats-officedocument.vmlDrawing\"/>",
-                );
                 for (self.sheets.items, 0..) |sw, i| {
                     if (sw.comments.items.len == 0) continue;
                     try ct.print(
@@ -1918,11 +1924,17 @@ pub const SheetWriter = struct {
             }
 
             // Fall-through emission pattern:
-            //   <c r="…"[ s="N"][ t="s|b"]>[<f>formula</f>][<v>value</v>]</c>
-            // The non-formula paths match the pre-refactor byte output
-            // so the grep-style test assertions stay stable.
+            //   <c r="…"[ s="N"][ t="s|str|b"]>[<f>formula</f>][<v>value</v>]</c>
+            //
+            // String formula caches use t="str" (inline string in <v>)
+            // rather than t="s" (SST index). Excel and other readers
+            // expect the cached result of a formula returning text to
+            // be the literal text — an SST index there confuses
+            // recalc and triggers a "repaired" prompt. The non-
+            // formula `.string` path stays on the SST.
+            const string_is_formula_cache = cell == .string and formula != null;
             const type_attr: []const u8 = switch (cell) {
-                .string => " t=\"s\"",
+                .string => if (string_is_formula_cache) " t=\"str\"" else " t=\"s\"",
                 .boolean => " t=\"b\"",
                 else => "",
             };
@@ -1941,9 +1953,15 @@ pub const SheetWriter = struct {
             switch (cell) {
                 .empty => {}, // formula-only cell: no cached value
                 .string => |s| {
-                    const idx = try self.parent.sstIntern(s);
-                    self.parent.sst_count += 1;
-                    try self.body.print(alloc, "<v>{d}</v>", .{idx});
+                    if (string_is_formula_cache) {
+                        try self.body.appendSlice(alloc, "<v>");
+                        try appendXmlEscaped(alloc, &self.body, s);
+                        try self.body.appendSlice(alloc, "</v>");
+                    } else {
+                        const idx = try self.parent.sstIntern(s);
+                        self.parent.sst_count += 1;
+                        try self.body.print(alloc, "<v>{d}</v>", .{idx});
+                    }
                 },
                 .integer => |n| try self.body.print(alloc, "<v>{d}</v>", .{n}),
                 .number => |f| try self.body.print(alloc, "<v>{d}</v>", .{f}),
@@ -2275,10 +2293,15 @@ fn emitStylesXml(
     }
     try buf.appendSlice(alloc, "</cellXfs>");
 
+    // <cellStyles> sits between <cellXfs> and <dxfs> per the OOXML
+    // stylesheet element-order schema. We emit the canonical
+    // single-entry "Normal" record so consumers (Excel, LibreOffice,
+    // openpyxl) accept the file in strict-validation mode — the
+    // previous "skip cellStyles when no dxfs" trick worked only
+    // because dxfs was absent.
+    try buf.appendSlice(alloc, STYLES_CELL_STYLES);
+
     // <dxfs> — differential formats for conditional-formatting rules.
-    // Per the schema this block sits between <cellXfs> and
-    // <cellStyles>; we don't emit <cellStyles> so dxfs comes last
-    // before the STYLES_TAIL.
     if (dxfs.len > 0) {
         try buf.print(alloc, "<dxfs count=\"{d}\">", .{dxfs.len});
         for (dxfs) |dxf| {
