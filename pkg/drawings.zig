@@ -1101,11 +1101,11 @@ fn isInsideOpeningTag(xml: []const u8, pos: usize) bool {
     return false;
 }
 
-/// True if `pos` is inside an XML comment (`<!-- ... -->`) or
-/// CDATA section (`<![CDATA[ ... ]]>`). Walks forward from the
-/// start of `xml` so closed comment/CDATA regions don't bleed
-/// their delimiter text into adjacent state — a `<!--` literal
-/// inside `<![CDATA[ ... ]]>` is content, not a comment open.
+/// True if `pos` is inside an XML comment (`<!-- ... -->`),
+/// CDATA section (`<![CDATA[ ... ]]>`), or processing instruction
+/// (`<?...?>`). Walks forward so closed regions don't bleed their
+/// delimiter text into adjacent state — a `<!--` literal inside
+/// `<?xml-stylesheet ... ?>` is PI content, not a comment open.
 fn isInsideCommentOrCdata(xml: []const u8, pos: usize) bool {
     if (pos == 0) return false;
     const limit = @min(xml.len, pos + 1);
@@ -1123,6 +1123,13 @@ fn isInsideCommentOrCdata(xml: []const u8, pos: usize) bool {
             const close = std.mem.indexOfPos(u8, xml, i + 9, "]]>") orelse return true;
             if (pos < close + 3) return true;
             i = close + 3;
+            continue;
+        }
+        if (i + 2 <= xml.len and std.mem.startsWith(u8, xml[i..], "<?")) {
+            if (i + 2 > pos) return true;
+            const close = std.mem.indexOfPos(u8, xml, i + 2, "?>") orelse return true;
+            if (pos < close + 2) return true;
+            i = close + 2;
             continue;
         }
         i += 1;
@@ -2030,6 +2037,26 @@ test "findLocalChartElement: fake nested markup in comment doesn't unbalance dep
     const found = findLocalChartElement(block, gf_idx, prefixes);
     try std.testing.expect(found != null);
     try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<c:chart"));
+}
+
+test "findLocalChartElement: comment-delimiter-text inside a PI doesn't open a fake comment" {
+    // A processing instruction whose body contains the literal
+    // text `<!--`. The forward scanner must skip past `?>` and
+    // not treat the PI content as an unclosed comment, otherwise
+    // later real xmlns bindings get classified as in-comment.
+    const block =
+        "<xdr:graphicFrame>" ++
+        "<?someProcessing <!-- ?>" ++
+        "<foo xmlns:p=\"http://schemas.openxmlformats.org/drawingml/2006/chart\">" ++
+        "<p:chart r:id=\"rId1\"/>" ++
+        "</foo>" ++
+        "</xdr:graphicFrame>";
+    const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame").?;
+    var prefixes: DrawingPrefixes = .{};
+    prefixes.c = "c-not-p"; // disable root fallback so test depends on local lookup
+    const found = findLocalChartElement(block, gf_idx, prefixes);
+    try std.testing.expect(found != null);
+    try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<p:chart"));
 }
 
 test "findLocalChartElement: comment-delimiter-text inside CDATA doesn't open a fake comment" {
