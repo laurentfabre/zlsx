@@ -400,7 +400,7 @@ fn findBlipEmbed(pic_xml: []const u8) ?[]const u8 {
     return attrValue(pic_xml[blip .. blip_end + 1], "r:embed");
 }
 
-fn relTargetForId(rels: []const store_mod.Relationship, id: []const u8) ?[]const u8 {
+fn relForId(rels: []const store_mod.Relationship, id: []const u8) ?store_mod.Relationship {
     // Decode the lookup id into a stack buffer so the comparison
     // matches the decoded Relationship.id stored by parseRelationships.
     // OOXML rIds in practice are short ASCII tokens (`rId1`, `rId12`),
@@ -408,7 +408,7 @@ fn relTargetForId(rels: []const store_mod.Relationship, id: []const u8) ?[]const
     // back to raw compare against the source `id` slice.
     if (std.mem.indexOfScalar(u8, id, '&') == null) {
         for (rels) |r| {
-            if (std.mem.eql(u8, r.id, id)) return r.target;
+            if (std.mem.eql(u8, r.id, id)) return r;
         }
         return null;
     }
@@ -416,14 +416,26 @@ fn relTargetForId(rels: []const store_mod.Relationship, id: []const u8) ?[]const
     const decoded = decodeIdInto(&buf, id) orelse {
         // Pathologically long encoded id — fall back to raw match.
         for (rels) |r| {
-            if (std.mem.eql(u8, r.id, id)) return r.target;
+            if (std.mem.eql(u8, r.id, id)) return r;
         }
         return null;
     };
     for (rels) |r| {
-        if (std.mem.eql(u8, r.id, decoded)) return r.target;
+        if (std.mem.eql(u8, r.id, decoded)) return r;
     }
     return null;
+}
+
+/// Look up an internal-mode relationship target. External-mode
+/// rels (TargetMode="External") return null even when their target
+/// looks relative — those are linked-from-elsewhere references the
+/// package doesn't carry the bytes for, and resolving them as
+/// internal would (mis)attribute external links to package parts
+/// that happen to share the relative path.
+fn relTargetForId(rels: []const store_mod.Relationship, id: []const u8) ?[]const u8 {
+    const r = relForId(rels, id) orelse return null;
+    if (r.target_mode == .external) return null;
+    return r.target;
 }
 
 /// Decode the same five named entities + numeric refs into `buf`.
