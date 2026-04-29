@@ -393,7 +393,7 @@ fn collectChartsFromSheet(
         // Each chart's own XML may declare a different `c:` prefix
         // — resolve per-chart to be safe.
         const chart_prefixes = resolveDrawingPrefixes(chart_part.bytes);
-        const refs = try extractSeriesRefs(allocator, chart_part.bytes, chart_prefixes.c);
+        const refs = try extractSeriesRefs(allocator, chart_part.bytes, chart_prefixes.c, chart_prefixes.c_alt);
         // If `out.append` OOMs after we just allocated `refs`, the
         // caller's outer errdefer frees the rest but `refs` itself
         // hasn't been transferred yet — free it on the failing path.
@@ -404,7 +404,7 @@ fn collectChartsFromSheet(
             .from = from,
             .to = to_anchor,
             .absolute = absolute,
-            .chart_type = detectChartType(chart_part.bytes, chart_prefixes.c),
+            .chart_type = detectChartTypeWithAlt(chart_part.bytes, chart_prefixes.c, chart_prefixes.c_alt),
             .series_refs = refs,
             .raw_xml = chart_part.bytes,
         });
@@ -421,14 +421,30 @@ fn extractSeriesRefs(
     allocator: std.mem.Allocator,
     xml: []const u8,
     c_prefix: []const u8,
+    c_prefix_alt: ?[]const u8,
 ) ![]const []const u8 {
     var out: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer out.deinit(allocator);
 
+    try extractSeriesRefsForPrefix(allocator, xml, c_prefix, &out);
+    if (out.items.len == 0) {
+        if (c_prefix_alt) |alt| {
+            try extractSeriesRefsForPrefix(allocator, xml, alt, &out);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn extractSeriesRefsForPrefix(
+    allocator: std.mem.Allocator,
+    xml: []const u8,
+    c_prefix: []const u8,
+    out: *std.ArrayListUnmanaged([]const u8),
+) !void {
     var open_buf: [128]u8 = undefined;
     var close_buf: [128]u8 = undefined;
-    const open = try std.fmt.bufPrint(&open_buf, "<{s}:f>", .{c_prefix});
-    const close_tag = try std.fmt.bufPrint(&close_buf, "</{s}:f>", .{c_prefix});
+    const open = std.fmt.bufPrint(&open_buf, "<{s}:f>", .{c_prefix}) catch return;
+    const close_tag = std.fmt.bufPrint(&close_buf, "</{s}:f>", .{c_prefix}) catch return;
 
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, xml, i, open)) |o| {
@@ -437,7 +453,6 @@ fn extractSeriesRefs(
         try out.append(allocator, xml[start..close_off]);
         i = close_off + close_tag.len;
     }
-    return out.toOwnedSlice(allocator);
 }
 
 /// Best-effort chart-type detection from the chart-part XML. Looks
@@ -447,6 +462,14 @@ fn extractSeriesRefs(
 /// directly. `c_prefix` is the document's actual chart-namespace
 /// prefix (canonically "c").
 fn detectChartType(chart_xml: []const u8, c_prefix: []const u8) ChartType {
+    return detectChartTypeWithAlt(chart_xml, c_prefix, null);
+}
+
+fn detectChartTypeWithAlt(
+    chart_xml: []const u8,
+    c_prefix: []const u8,
+    c_prefix_alt: ?[]const u8,
+) ChartType {
     var buf: [128]u8 = undefined;
     const candidates = [_]struct { suffix: []const u8, kind: ChartType }{
         .{ .suffix = "barChart", .kind = .bar },
@@ -457,9 +480,13 @@ fn detectChartType(chart_xml: []const u8, c_prefix: []const u8) ChartType {
         .{ .suffix = "bubbleChart", .kind = .bubble },
         .{ .suffix = "radarChart", .kind = .radar },
     };
-    for (candidates) |c| {
-        const needle = std.fmt.bufPrint(&buf, "<{s}:{s}", .{ c_prefix, c.suffix }) catch continue;
-        if (std.mem.indexOf(u8, chart_xml, needle) != null) return c.kind;
+    const prefixes = [_]?[]const u8{ c_prefix, c_prefix_alt };
+    for (prefixes) |maybe_p| {
+        const p = maybe_p orelse continue;
+        for (candidates) |c| {
+            const needle = std.fmt.bufPrint(&buf, "<{s}:{s}", .{ p, c.suffix }) catch continue;
+            if (std.mem.indexOf(u8, chart_xml, needle) != null) return c.kind;
+        }
     }
     return .other;
 }
