@@ -532,19 +532,24 @@ fn findBlipEmbedWithAlt(
     a_prefix_alt: ?[]const u8,
 ) ?[]const u8 {
     var blip_open_buf: [128]u8 = undefined;
-    {
-        const blip_open = std.fmt.bufPrint(&blip_open_buf, "<{s}:blip", .{a_prefix}) catch return null;
-        if (std.mem.indexOf(u8, pic_xml, blip_open)) |blip| {
-            const blip_end = std.mem.indexOfScalarPos(u8, pic_xml, blip, '>') orelse return null;
-            return attrValue(pic_xml[blip .. blip_end + 1], "r:embed");
-        }
-    }
+    // Probe each candidate prefix in turn. A `<*:blip>` element
+    // with no `r:embed` (e.g. a linked-only blip) shouldn't end
+    // the search — try the alternate prefix's blip too in case
+    // the embedded one lives under that conformance class.
+    if (tryBlipEmbedAt(pic_xml, &blip_open_buf, a_prefix)) |rid| return rid;
     if (a_prefix_alt) |alt| {
-        const blip_open = std.fmt.bufPrint(&blip_open_buf, "<{s}:blip", .{alt}) catch return null;
-        if (std.mem.indexOf(u8, pic_xml, blip_open)) |blip| {
-            const blip_end = std.mem.indexOfScalarPos(u8, pic_xml, blip, '>') orelse return null;
-            return attrValue(pic_xml[blip .. blip_end + 1], "r:embed");
-        }
+        if (tryBlipEmbedAt(pic_xml, &blip_open_buf, alt)) |rid| return rid;
+    }
+    return null;
+}
+
+fn tryBlipEmbedAt(pic_xml: []const u8, buf: []u8, prefix: []const u8) ?[]const u8 {
+    const blip_open = std.fmt.bufPrint(buf, "<{s}:blip", .{prefix}) catch return null;
+    var search_at: usize = 0;
+    while (std.mem.indexOfPos(u8, pic_xml, search_at, blip_open)) |blip| {
+        const blip_end = std.mem.indexOfScalarPos(u8, pic_xml, blip, '>') orelse return null;
+        if (attrValue(pic_xml[blip .. blip_end + 1], "r:embed")) |rid| return rid;
+        search_at = blip_end + 1;
     }
     return null;
 }
