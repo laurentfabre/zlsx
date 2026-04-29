@@ -298,7 +298,7 @@ fn collectChartsFromSheet(
         // FIRST; only fall back to the drawing-root prefix if the
         // block didn't redefine. Pure-block resolution would lose
         // root-scoped declarations the block inherits.
-        var block_chart_buf: [32]u8 = undefined;
+        var block_chart_buf: [128]u8 = undefined;
         const block_chart_prefix = findNamespacePrefix(block, ns_c) orelse prefixes.c;
         const block_open_chart = std.fmt.bufPrint(&block_chart_buf, "<{s}:chart", .{block_chart_prefix}) catch tags.open_chart;
         const chart_idx = std.mem.indexOfPos(u8, block, gf_idx, block_open_chart) orelse continue;
@@ -350,8 +350,8 @@ fn extractSeriesRefs(
     var out: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer out.deinit(allocator);
 
-    var open_buf: [32]u8 = undefined;
-    var close_buf: [32]u8 = undefined;
+    var open_buf: [128]u8 = undefined;
+    var close_buf: [128]u8 = undefined;
     const open = try std.fmt.bufPrint(&open_buf, "<{s}:f>", .{c_prefix});
     const close_tag = try std.fmt.bufPrint(&close_buf, "</{s}:f>", .{c_prefix});
 
@@ -372,7 +372,7 @@ fn extractSeriesRefs(
 /// directly. `c_prefix` is the document's actual chart-namespace
 /// prefix (canonically "c").
 fn detectChartType(chart_xml: []const u8, c_prefix: []const u8) ChartType {
-    var buf: [48]u8 = undefined;
+    var buf: [128]u8 = undefined;
     const candidates = [_]struct { suffix: []const u8, kind: ChartType }{
         .{ .suffix = "barChart", .kind = .bar },
         .{ .suffix = "lineChart", .kind = .line },
@@ -448,7 +448,7 @@ fn findOpeningTag(xml: []const u8, name: []const u8) ?usize {
 /// file and have no part in the package. `a_prefix` is the
 /// document's actual DrawingML-main prefix (canonically "a").
 fn findBlipEmbed(pic_xml: []const u8, a_prefix: []const u8) ?[]const u8 {
-    var blip_open_buf: [32]u8 = undefined;
+    var blip_open_buf: [128]u8 = undefined;
     const blip_open = std.fmt.bufPrint(&blip_open_buf, "<{s}:blip", .{a_prefix}) catch return null;
     const blip = std.mem.indexOf(u8, pic_xml, blip_open) orelse return null;
     const blip_end = std.mem.indexOfScalarPos(u8, pic_xml, blip, '>') orelse return null;
@@ -741,14 +741,18 @@ fn parseCellAnchor(
     const c = std.mem.indexOfPos(u8, xml, o, close) orelse return null;
     const inner = xml[o + open.len .. c];
 
-    var col_open_buf: [32]u8 = undefined;
-    var col_close_buf: [32]u8 = undefined;
-    var col_off_open_buf: [32]u8 = undefined;
-    var col_off_close_buf: [32]u8 = undefined;
-    var row_open_buf: [32]u8 = undefined;
-    var row_close_buf: [32]u8 = undefined;
-    var row_off_open_buf: [32]u8 = undefined;
-    var row_off_close_buf: [32]u8 = undefined;
+    // 128-byte scratch per needle covers prefixes up to ~110 chars
+    // (`</PREFIX:rowOff>` ≈ prefix.len + 11), well past anything
+    // realistic. The previous 32-byte budget bottomed out at
+    // ~20-char prefixes.
+    var col_open_buf: [128]u8 = undefined;
+    var col_close_buf: [128]u8 = undefined;
+    var col_off_open_buf: [128]u8 = undefined;
+    var col_off_close_buf: [128]u8 = undefined;
+    var row_open_buf: [128]u8 = undefined;
+    var row_close_buf: [128]u8 = undefined;
+    var row_off_open_buf: [128]u8 = undefined;
+    var row_off_close_buf: [128]u8 = undefined;
     const col_open = std.fmt.bufPrint(&col_open_buf, "<{s}:col>", .{xdr_prefix}) catch return null;
     const col_close = std.fmt.bufPrint(&col_close_buf, "</{s}:col>", .{xdr_prefix}) catch return null;
     const col_off_open = std.fmt.bufPrint(&col_off_open_buf, "<{s}:colOff>", .{xdr_prefix}) catch return null;
