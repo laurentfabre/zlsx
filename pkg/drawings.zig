@@ -1066,20 +1066,30 @@ fn isInsideOpeningTag(xml: []const u8, pos: usize) bool {
 }
 
 /// True if `pos` is inside an XML comment (`<!-- ... -->`) or
-/// CDATA section (`<![CDATA[ ... ]]>`). Markup-shaped text inside
-/// those isn't markup the parser should respect.
+/// CDATA section (`<![CDATA[ ... ]]>`). Walks forward from the
+/// start of `xml` so closed comment/CDATA regions don't bleed
+/// their delimiter text into adjacent state — a `<!--` literal
+/// inside `<![CDATA[ ... ]]>` is content, not a comment open.
 fn isInsideCommentOrCdata(xml: []const u8, pos: usize) bool {
     if (pos == 0) return false;
-    const head = xml[0..pos];
-    // Comment: latest `<!--` after the latest `-->`.
-    if (std.mem.lastIndexOf(u8, head, "<!--")) |open| {
-        const close_opt = std.mem.lastIndexOf(u8, head, "-->");
-        if (close_opt == null or close_opt.? < open) return true;
-    }
-    // CDATA: latest `<![CDATA[` after the latest `]]>`.
-    if (std.mem.lastIndexOf(u8, head, "<![CDATA[")) |open| {
-        const close_opt = std.mem.lastIndexOf(u8, head, "]]>");
-        if (close_opt == null or close_opt.? < open) return true;
+    const limit = @min(xml.len, pos + 1);
+    var i: usize = 0;
+    while (i < limit) {
+        if (i + 4 <= xml.len and std.mem.startsWith(u8, xml[i..], "<!--")) {
+            if (i + 4 > pos) return true;
+            const close = std.mem.indexOfPos(u8, xml, i + 4, "-->") orelse return true;
+            if (pos < close + 3) return true;
+            i = close + 3;
+            continue;
+        }
+        if (i + 9 <= xml.len and std.mem.startsWith(u8, xml[i..], "<![CDATA[")) {
+            if (i + 9 > pos) return true;
+            const close = std.mem.indexOfPos(u8, xml, i + 9, "]]>") orelse return true;
+            if (pos < close + 3) return true;
+            i = close + 3;
+            continue;
+        }
+        i += 1;
     }
     return false;
 }
@@ -1946,6 +1956,27 @@ test "findLocalChartElement: xmlns after a quoted `>` in same tag is honored" {
     const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame").?;
     var prefixes: DrawingPrefixes = .{};
     prefixes.c = "c-not-p"; // disable root-prefix fallback
+    const found = findLocalChartElement(block, gf_idx, prefixes);
+    try std.testing.expect(found != null);
+    try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<p:chart"));
+}
+
+test "findLocalChartElement: comment-delimiter-text inside CDATA doesn't open a fake comment" {
+    // `<![CDATA[<!--]]>` — a CDATA section whose CONTENT is the
+    // literal text `<!--`. The closed CDATA must restore "outside
+    // markup" state; a naive "latest <!-- vs latest -->" heuristic
+    // would treat the CDATA-internal text as an unclosed comment
+    // and reject the real xmlns:p that follows.
+    const block =
+        "<xdr:graphicFrame>" ++
+        "<![CDATA[<!--]]>" ++
+        "<foo xmlns:p=\"http://schemas.openxmlformats.org/drawingml/2006/chart\">" ++
+        "<p:chart r:id=\"rId1\"/>" ++
+        "</foo>" ++
+        "</xdr:graphicFrame>";
+    const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame").?;
+    var prefixes: DrawingPrefixes = .{};
+    prefixes.c = "c-not-p"; // disable root fallback so test depends on local lookup
     const found = findLocalChartElement(block, gf_idx, prefixes);
     try std.testing.expect(found != null);
     try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<p:chart"));
