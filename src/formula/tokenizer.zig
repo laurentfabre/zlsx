@@ -96,8 +96,16 @@ pub fn tokenize(allocator: std.mem.Allocator, input: []const u8) Error![]Token {
                 break :blk .{ .kind = .sheet_name, .text = input[start..i] };
             },
             '#' => blk: {
-                i = scanError(input, start);
-                break :blk .{ .kind = .error_lit, .text = input[start..i] };
+                if (matchKnownError(input, start)) |end| {
+                    i = end;
+                    break :blk .{ .kind = .error_lit, .text = input[start..end] };
+                }
+                // Anything else starting with `#` (the dynamic-array
+                // spill operator `A1#`, an unrecognized error name)
+                // is treated as `.unknown` so the rewriter knows
+                // not to touch it. Round-trip is still preserved.
+                i += 1;
+                break :blk .{ .kind = .unknown, .text = input[start..i] };
             },
             '0'...'9' => blk: {
                 i = scanNumber(input, start);
@@ -277,27 +285,37 @@ fn scanQuotedSheet(input: []const u8, start: usize) usize {
     return input.len;
 }
 
-/// `#` followed by error-name characters until `!`, `?`, or end of
-/// recognizable error pattern. Conservative: read up to the
-/// terminator (`!` / `?`) inclusive, or stop at the first byte that
-/// can't appear in an Excel error literal. `#N/A` ends without a
-/// terminator and is the special case.
-fn scanError(input: []const u8, start: usize) usize {
-    // #N/A is the one error literal without a `!` or `?` terminator.
-    if (start + 4 <= input.len and std.mem.eql(u8, input[start .. start + 4], "#N/A")) {
-        return start + 4;
+/// Match a known Excel error literal at `start` (where `input[start]`
+/// is `#`). Returns the index past the literal on hit, null on miss.
+/// Strict whitelist — anything else starting with `#` (the dynamic-
+/// array spill operator `A1#`, future operators, malformed bytes)
+/// is left to the caller to classify as `.unknown`.
+///
+/// The recognised set is the seven canonical errors plus the four
+/// dynamic-array errors Excel 365 introduced. Listed in length-
+/// descending order so the longest match wins (e.g. `#GETTING_DATA`
+/// before any single-letter prefix).
+fn matchKnownError(input: []const u8, start: usize) ?usize {
+    const literals = [_][]const u8{
+        "#GETTING_DATA",
+        "#DIV/0!",
+        "#VALUE!",
+        "#NAME?",
+        "#NULL!",
+        "#SPILL!",
+        "#CALC!",
+        "#REF!",
+        "#NUM!",
+        "#N/A",
+    };
+    inline for (literals) |lit| {
+        if (start + lit.len <= input.len and
+            std.mem.eql(u8, input[start .. start + lit.len], lit))
+        {
+            return start + lit.len;
+        }
     }
-    var i = start + 1;
-    while (i < input.len) : (i += 1) {
-        const c = input[i];
-        if (c == '!' or c == '?') return i + 1;
-        if (isAsciiAlpha(c) or isDigit(c) or c == '/' or c == '_') continue;
-        // Any other byte ends the literal — a malformed error like
-        // `#FOO` (no terminator) becomes the slice we've read so
-        // far, leaving the rest of the input to the next iteration.
-        return i;
-    }
-    return input.len;
+    return null;
 }
 
 /// Excel number grammar: `[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?` or
@@ -359,16 +377,17 @@ fn scanIdent(input: []const u8, start: usize) usize {
 }
 
 /// True if `s` is a syntactically valid A1-style cell ref:
-/// `\$?[A-Z]+\$?[0-9]+` with column letters in [A, XFD] and row
-/// number in [1, 1048576]. Lowercase letters are NOT accepted in
-/// the reference itself — Excel canonicalises to uppercase, and a
-/// lowercase identifier with the same shape is treated as a name.
+/// `\$?[A-Za-z]+\$?[0-9]+` with column letters (case-insensitive)
+/// in [A, XFD] and row in [1, 1048576]. Excel treats `a1` and `A1`
+/// as the same reference; openpyxl-authored formulas occasionally
+/// emit lowercase, so we accept both to spare callers a normalize
+/// step the future rewriter would otherwise need.
 fn isCellRef(s: []const u8) bool {
     if (s.len == 0) return false;
     var i: usize = 0;
     if (s[i] == '$') i += 1;
     const col_start = i;
-    while (i < s.len and s[i] >= 'A' and s[i] <= 'Z') : (i += 1) {}
+    while (i < s.len and isAsciiAlpha(s[i])) : (i += 1) {}
     const col_len = i - col_start;
     if (col_len == 0 or col_len > 3) return false;
     if (i < s.len and s[i] == '$') i += 1;
@@ -382,10 +401,11 @@ fn isCellRef(s: []const u8) bool {
 }
 
 fn columnInRange(letters: []const u8) bool {
-    // Convert A=1, AA=27, ... up to XFD=16384. Reject above.
+    // Convert A=1, AA=27, ... up to XFD=16384. Case-insensitive.
     var v: u32 = 0;
     for (letters) |c| {
-        v = v * 26 + @as(u32, c - 'A' + 1);
+        const upper: u8 = if (c >= 'a' and c <= 'z') c - ('a' - 'A') else c;
+        v = v * 26 + @as(u32, upper - 'A' + 1);
     }
     return v >= 1 and v <= 16384;
 }
@@ -445,8 +465,16 @@ test "identifiers that look like cell refs but aren't" {
     try expectKinds("XFE1", &.{.name});
     // Row out of range (1048577 > 1048576).
     try expectKinds("A1048577", &.{.name});
-    // Lowercase letters never form a cell ref.
-    try expectKinds("a1", &.{.name});
+}
+
+test "lowercase + mixed-case A1 refs classify as cell_ref" {
+    // Excel cell refs are case-insensitive; openpyxl-authored
+    // formulas occasionally emit lowercase. The tokenizer accepts
+    // both so the rewriter doesn't need a normalize pass.
+    try expectKinds("a1", &.{.cell_ref});
+    try expectKinds("$b$2", &.{.cell_ref});
+    try expectKinds("Aa10", &.{.cell_ref});
+    try expectKinds("xfd1048576", &.{.cell_ref});
 }
 
 test "ranges" {
@@ -499,7 +527,8 @@ test "boolean literals" {
     try expectKinds("false", &.{.bool_lit});
 }
 
-test "error literals" {
+test "error literals — strict whitelist" {
+    // Canonical seven.
     try expectKinds("#N/A", &.{.error_lit});
     try expectKinds("#REF!", &.{.error_lit});
     try expectKinds("#DIV/0!", &.{.error_lit});
@@ -507,6 +536,23 @@ test "error literals" {
     try expectKinds("#NUM!", &.{.error_lit});
     try expectKinds("#VALUE!", &.{.error_lit});
     try expectKinds("#NULL!", &.{.error_lit});
+    // Excel 365 dynamic-array errors.
+    try expectKinds("#SPILL!", &.{.error_lit});
+    try expectKinds("#CALC!", &.{.error_lit});
+    try expectKinds("#GETTING_DATA", &.{.error_lit});
+}
+
+test "non-error # falls back to .unknown" {
+    // Dynamic-array spill operator `A1#` is out of scope for
+    // milestone 1; the `#` must classify as `.unknown` so the
+    // rewriter can refuse to touch the formula. (Round-trip
+    // still preserves the bytes verbatim.)
+    try expectKinds("A1#", &.{ .cell_ref, .unknown });
+    try expectRoundTrip("A1#");
+    // Unknown error name `#FOO` — same treatment: just `#` as
+    // unknown, then `FOO` as a name.
+    try expectKinds("#FOO", &.{ .unknown, .name });
+    try expectRoundTrip("#FOO");
 }
 
 test "operators" {
