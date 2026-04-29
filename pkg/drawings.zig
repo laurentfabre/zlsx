@@ -922,6 +922,15 @@ fn uriOfPrefixAtPosition(xml: []const u8, prefix: []const u8, before: usize) ?[]
     var last_uri: ?[]const u8 = null;
     while (std.mem.indexOfPos(u8, xml[0..limit], i, "xmlns:")) |start| {
         if (start > before) break;
+        // Ignore `xmlns:` text that's inside an XML comment, CDATA
+        // section, or general text content — only attribute-shaped
+        // hits in an opening tag count. Walk back to the most
+        // recent `<`; if the bytes after it are `!--`, `![`, `?`,
+        // or `/`, this isn't an opening tag.
+        if (!isInsideOpeningTag(xml, start)) {
+            i = start + "xmlns:".len;
+            continue;
+        }
         const after = start + "xmlns:".len;
         if (after >= limit) break;
         var name_end = after;
@@ -1027,6 +1036,25 @@ fn elementExtentEnd(xml: []const u8, inside_pos: usize) ?usize {
 
 inline fn isNameTerminator(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '>' or c == '/';
+}
+
+/// True if `pos` is inside an opening tag — i.e. the most recent
+/// `<` before it opens an element (not a comment `<!--`, CDATA
+/// `<![`, processing instruction `<?`, or close tag `</`), and
+/// no intervening `>` has closed that tag. Used to filter out
+/// xmlns-looking text in comments / CDATA / text content from
+/// the namespace scope scan.
+fn isInsideOpeningTag(xml: []const u8, pos: usize) bool {
+    if (pos == 0) return false;
+    var lt = pos;
+    while (lt > 0) : (lt -= 1) {
+        if (xml[lt] == '<') break;
+        if (xml[lt] == '>') return false;
+    }
+    if (xml[lt] != '<') return false;
+    if (lt + 1 >= xml.len) return false;
+    const next = xml[lt + 1];
+    return next != '!' and next != '?' and next != '/';
 }
 
 /// Walk `xml` from `start` looking for the `>` that ends a tag,
@@ -1875,6 +1903,23 @@ test "findLocalChartElement: chart-element self-redeclare wins over earlier non-
     const found = findLocalChartElement(block, gf_idx, prefixes);
     try std.testing.expect(found != null);
     try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<p:chart"));
+}
+
+test "findLocalChartElement: xmlns-looking text in XML comment is ignored" {
+    // A comment before the chart contains text that looks like an
+    // xmlns declaration. The scope-resolver must NOT treat that
+    // as a real binding; otherwise the chart's `c` resolves to
+    // the bogus comment URI and the chart is dropped.
+    const block =
+        "<xdr:graphicFrame>" ++
+        "<!-- xmlns:c=\"http://example.com/in-a-comment\" -->" ++
+        "<c:chart r:id=\"rId1\"/>" ++
+        "</xdr:graphicFrame>";
+    const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame").?;
+    const prefixes: DrawingPrefixes = .{};
+    const found = findLocalChartElement(block, gf_idx, prefixes);
+    try std.testing.expect(found != null);
+    try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<c:chart"));
 }
 
 test "findLocalChartElement: quoted `>` in attribute doesn't fool tag-end scan" {
