@@ -735,8 +735,27 @@ fn resolveDrawingPrefixes(xml: []const u8) DrawingPrefixes {
     // descendant anchor). The scanner pre-formats needles per
     // prefix, so we track an alternate prefix bound to either
     // xdr URI and walk anchors with it as a second pass.
-    p.xdr_alt = findNamespacePrefixExcept(xml, ns_xdr_transitional, p.xdr) orelse
-        findNamespacePrefixExcept(xml, ns_xdr_strict, p.xdr);
+    //
+    // Prefer alts on the SAME URI as the primary binding: a
+    // Strict-rooted document with an unused Transitional prefix
+    // declaration would otherwise pick the unused prefix and miss
+    // the actual descendant binding on the Strict URI.
+    const primary_uri = uriOfPrefix(xml, p.xdr);
+    if (primary_uri) |uri| {
+        if (std.mem.eql(u8, uri, ns_xdr_strict)) {
+            p.xdr_alt = findNamespacePrefixExcept(xml, ns_xdr_strict, p.xdr) orelse
+                findNamespacePrefixExcept(xml, ns_xdr_transitional, p.xdr);
+        } else if (std.mem.eql(u8, uri, ns_xdr_transitional)) {
+            p.xdr_alt = findNamespacePrefixExcept(xml, ns_xdr_transitional, p.xdr) orelse
+                findNamespacePrefixExcept(xml, ns_xdr_strict, p.xdr);
+        } else {
+            p.xdr_alt = findNamespacePrefixExcept(xml, ns_xdr_transitional, p.xdr) orelse
+                findNamespacePrefixExcept(xml, ns_xdr_strict, p.xdr);
+        }
+    } else {
+        p.xdr_alt = findNamespacePrefixExcept(xml, ns_xdr_transitional, p.xdr) orelse
+            findNamespacePrefixExcept(xml, ns_xdr_strict, p.xdr);
+    }
     const a_t = findNamespacePrefix(xml, ns_a_transitional);
     const a_s = findNamespacePrefix(xml, ns_a_strict);
     if (a_t orelse a_s) |pref| p.a = pref;
@@ -808,6 +827,46 @@ const max_prefix_len: usize = 100;
 
 fn findNamespacePrefix(xml: []const u8, target_uri: []const u8) ?[]const u8 {
     return findNamespacePrefixExcept(xml, target_uri, "");
+}
+
+/// Inverse lookup: given a prefix, return the URI it's bound to,
+/// or null if the prefix isn't declared. Bounded scan; matches the
+/// 4 KiB ceiling used elsewhere in this module so behaviour stays
+/// consistent across helpers.
+fn uriOfPrefix(xml: []const u8, prefix: []const u8) ?[]const u8 {
+    if (prefix.len == 0) return null;
+    const limit = @min(xml.len, 4096);
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml[0..limit], i, "xmlns:")) |start| {
+        const after = start + "xmlns:".len;
+        if (after >= limit) return null;
+        var name_end = after;
+        while (name_end < limit) : (name_end += 1) {
+            const c = xml[name_end];
+            if (c == '=' or c == ' ' or c == '\t' or c == '\n' or c == '\r') break;
+        }
+        if (name_end >= limit) return null;
+        const name = xml[after..name_end];
+        var p = name_end;
+        while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
+        if (p >= limit or xml[p] != '=') {
+            i = after;
+            continue;
+        }
+        p += 1;
+        while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
+        if (p >= limit) return null;
+        const quote = xml[p];
+        if (quote != '"' and quote != '\'') {
+            i = p;
+            continue;
+        }
+        const val_start = p + 1;
+        const val_end = std.mem.indexOfScalarPos(u8, xml[0..limit], val_start, quote) orelse return null;
+        if (std.mem.eql(u8, name, prefix)) return xml[val_start..val_end];
+        i = val_end + 1;
+    }
+    return null;
 }
 
 /// Same as `findNamespacePrefix` but skips any binding whose name
@@ -1506,6 +1565,32 @@ test "resolveDrawingPrefixes maps canonical + custom prefixes" {
         const p = resolveDrawingPrefixes(xml);
         try std.testing.expectEqualStrings("xdr", p.xdr);
         try std.testing.expectEqual(@as(?[]const u8, null), p.xdr_alt);
+    }
+    // Strict-rooted with unused Transitional declaration: the
+    // descendant alt prefix is on the Strict URI. The resolver
+    // must prefer same-URI alts over the unused other-conformance
+    // declaration.
+    {
+        const xml =
+            \\<?xml version="1.0"?><xs:wsDr xmlns:xs="http://purl.oclc.org/ooxml/drawingml/spreadsheetDrawing" xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:dr="http://purl.oclc.org/ooxml/drawingml/spreadsheetDrawing"/>
+        ;
+        const p = resolveDrawingPrefixes(xml);
+        try std.testing.expectEqualStrings("xs", p.xdr);
+        try std.testing.expect(p.xdr_alt != null);
+        // Same-URI (Strict) binding wins over the unused
+        // Transitional declaration.
+        try std.testing.expectEqualStrings("dr", p.xdr_alt.?);
+    }
+    // Mirror case: Transitional-rooted with unused Strict
+    // declaration. Same-URI alt must still win.
+    {
+        const xml =
+            \\<?xml version="1.0"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:xs="http://purl.oclc.org/ooxml/drawingml/spreadsheetDrawing" xmlns:dr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>
+        ;
+        const p = resolveDrawingPrefixes(xml);
+        try std.testing.expectEqualStrings("xdr", p.xdr);
+        try std.testing.expect(p.xdr_alt != null);
+        try std.testing.expectEqualStrings("dr", p.xdr_alt.?);
     }
 }
 
