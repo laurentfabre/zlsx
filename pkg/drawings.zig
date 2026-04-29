@@ -426,38 +426,43 @@ fn extractSeriesRefs(
     var out: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer out.deinit(allocator);
 
-    // Scan BOTH prefixes (primary + alternate-conformance) so a
-    // chart that mixes <c:f> and <c2:f> refs surfaces every entry.
-    // Order isn't strictly document-order across prefixes, but
-    // refs within each prefix retain their relative order — good
-    // enough for callers that just want the flattened list.
-    try extractSeriesRefsForPrefix(allocator, xml, c_prefix, &out);
+    var primary_open_buf: [128]u8 = undefined;
+    var primary_close_buf: [128]u8 = undefined;
+    const primary_open = std.fmt.bufPrint(&primary_open_buf, "<{s}:f>", .{c_prefix}) catch return out.toOwnedSlice(allocator);
+    const primary_close = std.fmt.bufPrint(&primary_close_buf, "</{s}:f>", .{c_prefix}) catch return out.toOwnedSlice(allocator);
+
+    var alt_open_buf: [128]u8 = undefined;
+    var alt_close_buf: [128]u8 = undefined;
+    var alt_open: ?[]const u8 = null;
+    var alt_close: ?[]const u8 = null;
     if (c_prefix_alt) |alt| {
         if (!std.mem.eql(u8, alt, c_prefix)) {
-            try extractSeriesRefsForPrefix(allocator, xml, alt, &out);
+            alt_open = std.fmt.bufPrint(&alt_open_buf, "<{s}:f>", .{alt}) catch null;
+            alt_close = std.fmt.bufPrint(&alt_close_buf, "</{s}:f>", .{alt}) catch null;
         }
     }
-    return out.toOwnedSlice(allocator);
-}
 
-fn extractSeriesRefsForPrefix(
-    allocator: std.mem.Allocator,
-    xml: []const u8,
-    c_prefix: []const u8,
-    out: *std.ArrayListUnmanaged([]const u8),
-) !void {
-    var open_buf: [128]u8 = undefined;
-    var close_buf: [128]u8 = undefined;
-    const open = std.fmt.bufPrint(&open_buf, "<{s}:f>", .{c_prefix}) catch return;
-    const close_tag = std.fmt.bufPrint(&close_buf, "</{s}:f>", .{c_prefix}) catch return;
-
+    // Single document-order pass: at each position, find the
+    // EARLIER of the next primary-prefix match and the next
+    // alt-prefix match; consume that one and advance. Preserves
+    // the documented "flattened in document order" contract even
+    // for mixed-prefix charts.
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, xml, i, open)) |o| {
-        const start = o + open.len;
+    while (true) {
+        const p_pos = std.mem.indexOfPos(u8, xml, i, primary_open);
+        const a_pos = if (alt_open) |o| std.mem.indexOfPos(u8, xml, i, o) else null;
+        const winner: enum { primary, alt } = if (p_pos != null and a_pos != null)
+            (if (p_pos.? < a_pos.?) .primary else .alt)
+        else if (p_pos != null) .primary else if (a_pos != null) .alt else break;
+        const open_offset = if (winner == .primary) p_pos.? else a_pos.?;
+        const open_tag = if (winner == .primary) primary_open else alt_open.?;
+        const close_tag = if (winner == .primary) primary_close else alt_close.?;
+        const start = open_offset + open_tag.len;
         const close_off = std.mem.indexOfPos(u8, xml, start, close_tag) orelse break;
         try out.append(allocator, xml[start..close_off]);
         i = close_off + close_tag.len;
     }
+    return out.toOwnedSlice(allocator);
 }
 
 /// Best-effort chart-type detection from the chart-part XML. Looks
