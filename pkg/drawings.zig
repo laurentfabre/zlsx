@@ -437,8 +437,18 @@ fn extractSeriesRefs(
     var alt_close: ?[]const u8 = null;
     if (c_prefix_alt) |alt| {
         if (!std.mem.eql(u8, alt, c_prefix)) {
-            alt_open = std.fmt.bufPrint(&alt_open_buf, "<{s}:f>", .{alt}) catch null;
-            alt_close = std.fmt.bufPrint(&alt_close_buf, "</{s}:f>", .{alt}) catch null;
+            // Build both needles atomically — if either fails to
+            // format (e.g. a prefix that fits "<alt:f>" but not
+            // "</alt:f>" within the 128-byte buffer), disable the
+            // alt scan entirely. Splitting the assignment risked
+            // alt_open != null with alt_close == null and a later
+            // unwrap would panic.
+            if (std.fmt.bufPrint(&alt_open_buf, "<{s}:f>", .{alt})) |o| {
+                if (std.fmt.bufPrint(&alt_close_buf, "</{s}:f>", .{alt})) |c| {
+                    alt_open = o;
+                    alt_close = c;
+                } else |_| {}
+            } else |_| {}
         }
     }
 
