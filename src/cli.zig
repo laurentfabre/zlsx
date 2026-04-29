@@ -666,6 +666,24 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.cell_value_json != null and detected_sub != .set_cell) {
         return ArgError.BadArgValue;
     }
+    // --out is required by every edit command and silently ignored
+    // on read-only paths if we don't reject. Without this guard,
+    // `zlsx rows in.xlsx --out out.jsonl` exits 0 but never writes
+    // the file — surprising and quietly destructive when the user
+    // expects out.jsonl to land.
+    if (out.out_path != null) switch (detected_sub) {
+        .append_rows,
+        .set_cell,
+        .insert_row,
+        .delete_row,
+        .insert_column,
+        .delete_column,
+        .add_sheet,
+        .rename_sheet,
+        .delete_sheet,
+        => {},
+        else => return ArgError.BadArgValue,
+    };
     return out;
 }
 
@@ -4223,8 +4241,10 @@ test "parseArgs accepts --key=value syntax" {
 
 test "parseArgs --key= with empty value is accepted as empty string" {
     // `--out=` produces an empty string value — let the downstream
-    // path-handling reject empties, not the parser.
-    const argv = [_][]const u8{ "file.xlsx", "--out=" };
+    // path-handling reject empties, not the parser. Use a sub-
+    // command that actually accepts --out (post-iter65 the parser
+    // rejects --out on read-only commands).
+    const argv = [_][]const u8{ "set-cell", "in.xlsx", "--sheet", "0", "--ref", "B1", "--value", "1", "--out=" };
     const a = try parseArgs(&argv);
     try std.testing.expectEqualStrings("", a.out_path.?);
 }
@@ -4257,6 +4277,26 @@ test "parseArgs preserves --bool=value as literal when used after value-flag" {
     const argv = [_][]const u8{ "rows", "f.xlsx", "--name", "--header=1" };
     const a = try parseArgs(&argv);
     try std.testing.expectEqualStrings("--header=1", a.sheet_name.?);
+}
+
+test "parseArgs rejects --out on read-only commands" {
+    // `zlsx rows in.xlsx --out out.jsonl` would silently swallow
+    // --out and exit 0 without writing the file. Reject as
+    // BadArgValue so the user sees the typo / mis-use.
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--out", "out.jsonl" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "meta", "f.xlsx", "--out", "out.jsonl" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // Edit commands continue to accept --out.
+    {
+        const argv = [_][]const u8{ "set-cell", "in.xlsx", "--sheet", "0", "--ref", "B1", "--value", "1", "--out", "out.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqualStrings("out.xlsx", a.out_path.?);
+    }
 }
 
 test "parseArgs rejects =value on boolean flags" {
