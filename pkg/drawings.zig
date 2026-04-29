@@ -901,20 +901,22 @@ inline fn isPrefixByte(c: u8) bool {
 }
 
 /// Resolve the URI bound to `prefix` in the scope of position
-/// `before` — i.e. the most recent `xmlns:<prefix>=...` declaration
-/// at or before `before`. Approximates XML namespace scoping for
-/// the shapes OOXML drawings actually take: a local declaration on
-/// the candidate element itself, or on an enclosing ancestor, wins
-/// over earlier-sibling bindings (the strict scope-stack rule that
-/// only ancestors apply isn't fully modelled — sibling redeclares
-/// followed by a closed sibling are pathological enough to defer
-/// until a real-world fixture surfaces them).
+/// `before` — the most recent `xmlns:<prefix>=...` declaration
+/// at or before `before`, EXCLUDING self-closing siblings whose
+/// element ended before `before`. XML namespace scoping says a
+/// declaration on `<foo xmlns:p="..."/>` only applies inside
+/// `foo`, so once that element closes the binding is out of
+/// scope. We model self-closing siblings here; non-self-closing
+/// container scope (where the binding ends at `</NAME>`) isn't
+/// fully tracked — a real-world fixture exhibiting that shape
+/// would need a proper element-stack parser.
 fn uriOfPrefixAtPosition(xml: []const u8, prefix: []const u8, before: usize) ?[]const u8 {
     if (prefix.len == 0) return null;
-    const limit = @min(xml.len, before + 1);
+    const limit = @min(xml.len, xml.len);
     var i: usize = 0;
     var last_uri: ?[]const u8 = null;
     while (std.mem.indexOfPos(u8, xml[0..limit], i, "xmlns:")) |start| {
+        if (start > before) break;
         const after = start + "xmlns:".len;
         if (after >= limit) break;
         var name_end = after;
@@ -940,7 +942,24 @@ fn uriOfPrefixAtPosition(xml: []const u8, prefix: []const u8, before: usize) ?[]
         }
         const val_start = p + 1;
         const val_end = std.mem.indexOfScalarPos(u8, xml[0..limit], val_start, quote) orelse break;
-        if (std.mem.eql(u8, name, prefix)) last_uri = xml[val_start..val_end];
+        if (std.mem.eql(u8, name, prefix)) {
+            // Find the end of the tag this declaration sits in.
+            const tag_end = std.mem.indexOfScalarPos(u8, xml[0..limit], val_end, '>') orelse {
+                i = val_end + 1;
+                continue;
+            };
+            // Self-closing: element ends at this tag's `>`. If
+            // `before` is past `tag_end`, the binding has gone
+            // out of scope — skip it. Non-self-closing tags have
+            // children that stay in scope through `</NAME>`; we
+            // accept those (best-effort approximation).
+            const self_closing = tag_end > 0 and xml[tag_end - 1] == '/';
+            if (!self_closing or before <= tag_end) {
+                last_uri = xml[val_start..val_end];
+            }
+            i = val_end + 1;
+            continue;
+        }
         i = val_end + 1;
     }
     return last_uri;
@@ -1774,6 +1793,26 @@ test "findLocalChartElement: chart-element self-redeclare wins over earlier non-
     const found = findLocalChartElement(block, gf_idx, prefixes);
     try std.testing.expect(found != null);
     try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<p:chart"));
+}
+
+test "findLocalChartElement: closed sibling's redeclare doesn't shadow root binding" {
+    // A self-closing earlier sibling declares xmlns:c bound to a
+    // NON-chart URI. Per XML scoping, that binding ends at the
+    // sibling's `/>`, so when `<c:chart>` later in the same block
+    // uses prefix `c`, the root primary should match. Without the
+    // self-closing scope check, the sibling's xmlns:c would still
+    // be visible via uriOfPrefixAtPosition and the chart would be
+    // wrongly skipped.
+    const block =
+        "<xdr:graphicFrame>" ++
+        "<other xmlns:c=\"http://example.com/closed-sibling\"/>" ++
+        "<c:chart r:id=\"rId1\"/>" ++
+        "</xdr:graphicFrame>";
+    const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame").?;
+    const prefixes: DrawingPrefixes = .{}; // .c = "c" by default
+    const found = findLocalChartElement(block, gf_idx, prefixes);
+    try std.testing.expect(found != null);
+    try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<c:chart"));
 }
 
 test "findLocalChartElement: local non-chart redeclare blocks root-prefix match" {
