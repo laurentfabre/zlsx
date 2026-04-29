@@ -855,10 +855,18 @@ fn findLocalChartElement(block: []const u8, start: usize, prefixes: DrawingPrefi
             continue;
         }
         const prefix = block[p_start..colon];
-        // Verify the prefix is bound to a chart URI — try block-
-        // local first, then fall back to the drawing-root
-        // resolution.
-        const uri_local = uriOfPrefixLocal(block, prefix);
+        // Verify the prefix is bound to a chart URI. Use the
+        // declaration nearest to (but inside) the chart tag — the
+        // chart element's own attributes can carry an xmlns:<p>
+        // that redeclares the prefix locally, and that
+        // declaration IS in scope for the chart element itself.
+        // Find the closing `>` of the candidate tag so the
+        // self-declaration is included in the scan window.
+        const tag_end = std.mem.indexOfScalarPos(u8, block, colon, '>') orelse {
+            i = colon + 1;
+            continue;
+        };
+        const uri_local = uriOfPrefixAtPosition(block, prefix, tag_end);
         const matches_local = if (uri_local) |u|
             std.mem.eql(u8, u, ns_c_transitional) or std.mem.eql(u8, u, ns_c_strict)
         else
@@ -879,6 +887,52 @@ fn findLocalChartElement(block: []const u8, start: usize, prefixes: DrawingPrefi
 inline fn isPrefixByte(c: u8) bool {
     return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or
         (c >= '0' and c <= '9') or c == '_' or c == '.' or c == '-';
+}
+
+/// Resolve the URI bound to `prefix` in the scope of position
+/// `before` — i.e. the most recent `xmlns:<prefix>=...` declaration
+/// at or before `before`. Approximates XML namespace scoping for
+/// the shapes OOXML drawings actually take: a local declaration on
+/// the candidate element itself, or on an enclosing ancestor, wins
+/// over earlier-sibling bindings (the strict scope-stack rule that
+/// only ancestors apply isn't fully modelled — sibling redeclares
+/// followed by a closed sibling are pathological enough to defer
+/// until a real-world fixture surfaces them).
+fn uriOfPrefixAtPosition(xml: []const u8, prefix: []const u8, before: usize) ?[]const u8 {
+    if (prefix.len == 0) return null;
+    const limit = @min(xml.len, before + 1);
+    var i: usize = 0;
+    var last_uri: ?[]const u8 = null;
+    while (std.mem.indexOfPos(u8, xml[0..limit], i, "xmlns:")) |start| {
+        const after = start + "xmlns:".len;
+        if (after >= limit) break;
+        var name_end = after;
+        while (name_end < limit) : (name_end += 1) {
+            const c = xml[name_end];
+            if (c == '=' or c == ' ' or c == '\t' or c == '\n' or c == '\r') break;
+        }
+        if (name_end >= limit) break;
+        const name = xml[after..name_end];
+        var p = name_end;
+        while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
+        if (p >= limit or xml[p] != '=') {
+            i = after;
+            continue;
+        }
+        p += 1;
+        while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
+        if (p >= limit) break;
+        const quote = xml[p];
+        if (quote != '"' and quote != '\'') {
+            i = p;
+            continue;
+        }
+        const val_start = p + 1;
+        const val_end = std.mem.indexOfScalarPos(u8, xml[0..limit], val_start, quote) orelse break;
+        if (std.mem.eql(u8, name, prefix)) last_uri = xml[val_start..val_end];
+        i = val_end + 1;
+    }
+    return last_uri;
 }
 
 /// Same as `uriOfPrefix` but scans the FULL block instead of
@@ -1685,6 +1739,23 @@ test "findLocalChartElement matches the actually-used prefix among multiple bind
     try std.testing.expect(found != null);
     // `<c2:chart` should be at the position the helper returns.
     try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<c2:chart"));
+}
+
+test "findLocalChartElement: chart-element self-redeclare wins over earlier non-chart binding" {
+    // An earlier element declares xmlns:c bound to a NON-chart URI;
+    // the chart element redeclares xmlns:c bound to the chart URI.
+    // XML scoping says the chart element's own declaration applies
+    // to that element. The "nearest before tag end" lookup must
+    // pick the chart's own redeclare, not the earlier sibling.
+    const block =
+        "<xdr:graphicFrame>" ++
+        "<other xmlns:c=\"http://example.com/not-a-chart\"/>" ++
+        "<c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"rId1\"/>" ++
+        "</xdr:graphicFrame>";
+    const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame").?;
+    const found = findLocalChartElement(block, gf_idx, .{});
+    try std.testing.expect(found != null);
+    try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<c:chart"));
 }
 
 test "findLocalChartElement skips ':chartSpace' false matches" {
