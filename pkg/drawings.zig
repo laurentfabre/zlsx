@@ -902,17 +902,22 @@ inline fn isPrefixByte(c: u8) bool {
 
 /// Resolve the URI bound to `prefix` in the scope of position
 /// `before` — the most recent `xmlns:<prefix>=...` declaration
-/// at or before `before`, EXCLUDING self-closing siblings whose
-/// element ended before `before`. XML namespace scoping says a
-/// declaration on `<foo xmlns:p="..."/>` only applies inside
-/// `foo`, so once that element closes the binding is out of
-/// scope. We model self-closing siblings here; non-self-closing
-/// container scope (where the binding ends at `</NAME>`) isn't
-/// fully tracked — a real-world fixture exhibiting that shape
-/// would need a proper element-stack parser.
+/// whose element extent contains `before`. XML namespace scoping:
+/// a binding on `<foo xmlns:p="..."/>` is in scope inside foo;
+/// once foo closes (self-closing `/>` or matching `</foo>`), the
+/// binding ends. Bindings on closed siblings are out of scope.
+///
+/// For each xmlns declaration found, we compute:
+///   - the opening tag's `>` position
+///   - the element extent (tag end if self-closing, else position
+///     of the matching `</NAME>`)
+/// and skip the binding if `before` is past the extent.
+///
+/// Nested same-name elements are handled with a depth counter
+/// (each `<NAME` increments, each `</NAME>` decrements).
 fn uriOfPrefixAtPosition(xml: []const u8, prefix: []const u8, before: usize) ?[]const u8 {
     if (prefix.len == 0) return null;
-    const limit = @min(xml.len, xml.len);
+    const limit = xml.len;
     var i: usize = 0;
     var last_uri: ?[]const u8 = null;
     while (std.mem.indexOfPos(u8, xml[0..limit], i, "xmlns:")) |start| {
@@ -943,18 +948,11 @@ fn uriOfPrefixAtPosition(xml: []const u8, prefix: []const u8, before: usize) ?[]
         const val_start = p + 1;
         const val_end = std.mem.indexOfScalarPos(u8, xml[0..limit], val_start, quote) orelse break;
         if (std.mem.eql(u8, name, prefix)) {
-            // Find the end of the tag this declaration sits in.
-            const tag_end = std.mem.indexOfScalarPos(u8, xml[0..limit], val_end, '>') orelse {
+            const extent_end = elementExtentEnd(xml, start) orelse {
                 i = val_end + 1;
                 continue;
             };
-            // Self-closing: element ends at this tag's `>`. If
-            // `before` is past `tag_end`, the binding has gone
-            // out of scope — skip it. Non-self-closing tags have
-            // children that stay in scope through `</NAME>`; we
-            // accept those (best-effort approximation).
-            const self_closing = tag_end > 0 and xml[tag_end - 1] == '/';
-            if (!self_closing or before <= tag_end) {
+            if (before <= extent_end) {
                 last_uri = xml[val_start..val_end];
             }
             i = val_end + 1;
@@ -963,6 +961,70 @@ fn uriOfPrefixAtPosition(xml: []const u8, prefix: []const u8, before: usize) ?[]
         i = val_end + 1;
     }
     return last_uri;
+}
+
+/// Given a position inside an element's opening tag, return the
+/// index of the byte that closes the element's extent: either the
+/// tag's own `>` (self-closing `/>`) or the position of `>` on
+/// the matching `</NAME>` close tag. Returns null if the opening
+/// tag is malformed or unterminated.
+fn elementExtentEnd(xml: []const u8, inside_pos: usize) ?usize {
+    // Walk back to find the `<` that opens the element.
+    var lt = inside_pos;
+    while (lt > 0 and xml[lt] != '<') : (lt -= 1) {}
+    if (xml[lt] != '<') return null;
+    if (lt + 1 >= xml.len) return null;
+    // Read the element name: bytes after `<` until whitespace/`>`/`/`.
+    var name_end = lt + 1;
+    while (name_end < xml.len) : (name_end += 1) {
+        const c = xml[name_end];
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '>' or c == '/') break;
+    }
+    if (name_end == lt + 1) return null;
+    const elem_name = xml[lt + 1 .. name_end];
+    // Find the opening tag's `>`.
+    const tag_end = std.mem.indexOfScalarPos(u8, xml, name_end, '>') orelse return null;
+    // Self-closing: extent ends at tag_end.
+    if (tag_end > 0 and xml[tag_end - 1] == '/') return tag_end;
+    // Otherwise walk forward looking for the matching `</NAME>`,
+    // accounting for nested same-name elements via a depth counter.
+    var depth: i64 = 1;
+    var search_at: usize = tag_end + 1;
+    while (search_at < xml.len) {
+        const next_lt = std.mem.indexOfScalarPos(u8, xml, search_at, '<') orelse return xml.len - 1;
+        if (next_lt + 1 >= xml.len) return xml.len - 1;
+        const is_close = xml[next_lt + 1] == '/';
+        const candidate_name_start = if (is_close) next_lt + 2 else next_lt + 1;
+        if (candidate_name_start + elem_name.len > xml.len) return xml.len - 1;
+        const matches_name =
+            std.mem.eql(u8, xml[candidate_name_start .. candidate_name_start + elem_name.len], elem_name) and
+            (candidate_name_start + elem_name.len < xml.len) and
+            isNameTerminator(xml[candidate_name_start + elem_name.len]);
+        if (matches_name) {
+            if (is_close) {
+                depth -= 1;
+                if (depth == 0) {
+                    return std.mem.indexOfScalarPos(u8, xml, candidate_name_start, '>') orelse xml.len - 1;
+                }
+            } else {
+                // Open tag; check if it's self-closing (no depth
+                // bump) or container (bump).
+                const open_end = std.mem.indexOfScalarPos(u8, xml, candidate_name_start, '>') orelse return xml.len - 1;
+                if (!(open_end > 0 and xml[open_end - 1] == '/')) {
+                    depth += 1;
+                }
+                search_at = open_end + 1;
+                continue;
+            }
+        }
+        // Advance past this `<` and keep scanning.
+        search_at = next_lt + 1;
+    }
+    return xml.len - 1;
+}
+
+inline fn isNameTerminator(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '>' or c == '/';
 }
 
 /// Same as `uriOfPrefix` but scans the FULL block instead of
@@ -1793,6 +1855,23 @@ test "findLocalChartElement: chart-element self-redeclare wins over earlier non-
     const found = findLocalChartElement(block, gf_idx, prefixes);
     try std.testing.expect(found != null);
     try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<p:chart"));
+}
+
+test "findLocalChartElement: container sibling's redeclare doesn't shadow after close" {
+    // Non-self-closing earlier sibling (`<other ...>...</other>`)
+    // declares xmlns:c bound to a NON-chart URI. Per XML scoping,
+    // that binding ends at `</other>`. The later `<c:chart>` must
+    // resolve `c` via the root primary, not the closed sibling.
+    const block =
+        "<xdr:graphicFrame>" ++
+        "<other xmlns:c=\"http://example.com/closed-container\">stuff</other>" ++
+        "<c:chart r:id=\"rId1\"/>" ++
+        "</xdr:graphicFrame>";
+    const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame").?;
+    const prefixes: DrawingPrefixes = .{}; // .c = "c" by default
+    const found = findLocalChartElement(block, gf_idx, prefixes);
+    try std.testing.expect(found != null);
+    try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<c:chart"));
 }
 
 test "findLocalChartElement: closed sibling's redeclare doesn't shadow root binding" {
