@@ -1719,6 +1719,10 @@ def _sheet_set_row_height(self: "SheetWriter", row_idx: int, height: float) -> N
         )
     if row_idx < 0:
         raise ValueError(f"row_idx must be >= 0, got {row_idx}")
+    if row_idx > 0xFFFFFFFF:
+        # ctypes c_uint32 narrowing would wrap mod 2^32 before the
+        # C ABI can reject; bound-check up-front.
+        raise ValueError(f"row_idx must be <= UINT32_MAX, got {row_idx}")
     rc = _ffi.lib.zlsx_sheet_writer_set_row_height(
         self._handle, int(row_idx), float(height), self._err, _ERR_BUF_LEN
     )
@@ -1742,6 +1746,13 @@ def _sheet_freeze_panes_checked(self: "SheetWriter", rows: int = 0, cols: int = 
     if rows < 0 or cols < 0:
         raise ValueError(
             f"freeze_panes_checked rows/cols must be >= 0, got rows={rows} cols={cols}"
+        )
+    if rows > 0xFFFFFFFF or cols > 0xFFFFFFFF:
+        # ctypes c_uint32 narrowing wraps mod 2^32; the checked
+        # variant's typed-error promise relies on bound-checking
+        # before the FFI sees the value.
+        raise ValueError(
+            f"freeze_panes_checked rows/cols must be <= UINT32_MAX, got rows={rows} cols={cols}"
         )
     rc = _ffi.lib.zlsx_sheet_writer_freeze_panes_checked(
         self._handle, int(rows), int(cols), self._err, _ERR_BUF_LEN

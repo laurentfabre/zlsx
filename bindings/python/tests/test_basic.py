@@ -1678,6 +1678,34 @@ def test_sheet_writer_set_row_height_validates(tmp_path):
             sheet.set_row_height(2, 410.0)
 
 
+def test_sheet_writer_set_row_height_rejects_huge_row_idx(tmp_path):
+    """row_idx > UINT32_MAX would wrap through ctypes; reject before FFI."""
+    import zlsx._ffi as ffi
+    if not ffi._HAS_SET_ROW_HEIGHT:
+        pytest.skip("loaded libzlsx predates set_row_height ABI (post-0.3.0)")
+    out = str(tmp_path / "huge_rowidx.xlsx")
+    with zlsx.Writer(out) as w:
+        sheet = w.add_sheet("S")
+        sheet.write_row(["x"])
+        with pytest.raises(ValueError, match="UINT32_MAX"):
+            sheet.set_row_height(2**32 + 1, 24.0)
+
+
+def test_sheet_writer_freeze_panes_checked_rejects_huge_counts(tmp_path):
+    """rows/cols > UINT32_MAX would wrap through ctypes; reject before FFI."""
+    import zlsx._ffi as ffi
+    if not ffi._HAS_FREEZE_PANES_CHECKED:
+        pytest.skip("loaded libzlsx predates freeze_panes_checked ABI (post-0.3.0)")
+    out = str(tmp_path / "huge_freeze.xlsx")
+    with zlsx.Writer(out) as w:
+        sheet = w.add_sheet("S")
+        sheet.write_row(["x"])
+        with pytest.raises(ValueError, match="UINT32_MAX"):
+            sheet.freeze_panes_checked(rows=2**32, cols=0)
+        with pytest.raises(ValueError, match="UINT32_MAX"):
+            sheet.freeze_panes_checked(rows=0, cols=2**32)
+
+
 def test_sheet_writer_freeze_panes_checked_propagates_errors(tmp_path):
     """The checked variant raises ZlsxError on out-of-range counts
     instead of clamping silently."""
