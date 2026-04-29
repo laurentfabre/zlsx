@@ -2018,3 +2018,50 @@ test "PartStore.addPart: large input round-trips through deflate" {
     const got = dst.part("xl/extra.bin") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, big_bytes, got.bytes);
 }
+
+test "PartStore.addPart: atomic on every allocation-failure step" {
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+
+    // Drive addPart through std.testing.checkAllAllocationFailures
+    // so every single fallible allocation along the way takes a
+    // turn returning OOM. The contract: on any error, the store's
+    // observable state (parts.len, the [Content_Types].xml bytes
+    // a fresh part() call returns) is unchanged from before the
+    // call. The atomicity rebuild — alloc-then-commit, parallel
+    // arrays grown by alloc+copy not realloc, staged CT update —
+    // is exactly what this verifies.
+    const Closure = struct {
+        fn run(alloc: std.mem.Allocator, src_fixture: []const u8) !void {
+            // The store itself is opened under the failing
+            // allocator too — checkAllAllocationFailures has its
+            // own contract: every OOM either propagates as-is or
+            // is converted to a different error. open() failing
+            // is fine; we just need to propagate it.
+            var store = try PartStore.open(alloc, src_fixture);
+            defer store.deinit();
+
+            const before_count = store.parts.len;
+            const ct_before = store.part("[Content_Types].xml") orelse
+                return error.MissingContentTypes;
+            const ct_before_bytes = ct_before.bytes;
+
+            // The actual call we're stressing.
+            store.addPart("xl/extra.xml", "application/xml", "<x/>") catch |e| {
+                // On failure, store state must be unchanged.
+                try std.testing.expectEqual(before_count, store.parts.len);
+                const ct_after = store.part("[Content_Types].xml") orelse return e;
+                try std.testing.expect(ct_after.bytes.ptr == ct_before_bytes.ptr);
+                return e;
+            };
+            // On success the store grew by exactly one part.
+            try std.testing.expectEqual(before_count + 1, store.parts.len);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        Closure.run,
+        .{fixture},
+    );
+}
