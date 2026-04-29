@@ -1601,6 +1601,9 @@ def test_writer_add_data_validation_rejects_invalid_inputs(tmp_path):
 def test_writer_add_defined_name_after_close_raises(tmp_path):
     """Calling add_defined_name on a closed Writer must raise rather
     than segfault into the C ABI with a null handle."""
+    import zlsx._ffi as ffi
+    if not ffi._HAS_DEFINED_NAME:
+        pytest.skip("loaded libzlsx predates add_defined_name ABI (post-0.3.0)")
     out = str(tmp_path / "closed.xlsx")
     w = zlsx.Writer(out)
     w.close()
@@ -1611,6 +1614,9 @@ def test_writer_add_defined_name_after_close_raises(tmp_path):
 def test_writer_add_defined_name_round_trip(tmp_path):
     """Workbook + sheet-scoped defined names ship through to xl/workbook.xml
     and round-trip through the same Writer's save path."""
+    import zlsx._ffi as ffi
+    if not ffi._HAS_DEFINED_NAME:
+        pytest.skip("loaded libzlsx predates add_defined_name ABI (post-0.3.0)")
     out = str(tmp_path / "defined_names.xlsx")
     with zlsx.Writer(out) as w:
         sheet = w.add_sheet("Sheet1")
@@ -1637,6 +1643,9 @@ def test_writer_add_defined_name_round_trip(tmp_path):
 
 def test_sheet_writer_set_row_height_validates(tmp_path):
     """set_row_height accepts (0, 409.5] and rejects everything else."""
+    import zlsx._ffi as ffi
+    if not ffi._HAS_SET_ROW_HEIGHT:
+        pytest.skip("loaded libzlsx predates set_row_height ABI (post-0.3.0)")
     out = str(tmp_path / "row_height.xlsx")
     with zlsx.Writer(out) as w:
         sheet = w.add_sheet("Sheet1")
@@ -1656,6 +1665,9 @@ def test_sheet_writer_set_row_height_validates(tmp_path):
 def test_sheet_writer_freeze_panes_checked_propagates_errors(tmp_path):
     """The checked variant raises ZlsxError on out-of-range counts
     instead of clamping silently."""
+    import zlsx._ffi as ffi
+    if not ffi._HAS_FREEZE_PANES_CHECKED:
+        pytest.skip("loaded libzlsx predates freeze_panes_checked ABI (post-0.3.0)")
     out = str(tmp_path / "freeze_checked.xlsx")
     with zlsx.Writer(out) as w:
         sheet = w.add_sheet("Sheet1")
@@ -1672,6 +1684,9 @@ def test_sheet_writer_freeze_panes_checked_propagates_errors(tmp_path):
 def test_book_cell_alignment_round_trip(tmp_path):
     """A writer-emitted style with horizontal=center + wrap_text=True
     reads back through Book.cell_alignment."""
+    import zlsx._ffi as ffi
+    if not ffi._HAS_CELL_ALIGNMENT:
+        pytest.skip("loaded libzlsx predates cell_alignment ABI (post-0.3.0)")
     out = str(tmp_path / "alignment.xlsx")
     with zlsx.Writer(out) as w:
         sheet = w.add_sheet("Sheet1")
