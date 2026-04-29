@@ -1041,20 +1041,25 @@ inline fn isNameTerminator(c: u8) bool {
 /// True if `pos` is inside an opening tag — i.e. the most recent
 /// `<` before it opens an element (not a comment `<!--`, CDATA
 /// `<![`, processing instruction `<?`, or close tag `</`), and
-/// no intervening `>` has closed that tag. Used to filter out
-/// xmlns-looking text in comments / CDATA / text content from
-/// the namespace scope scan.
+/// no intervening `>` has closed that tag.
+///
+/// The "no intervening `>`" check is quote-aware: a `>` inside a
+/// quoted attribute value (`<foo descr="a > b" xmlns:p="...">`)
+/// must not be mistaken for the tag end. Walks back to the most
+/// recent `<` first, then scans forward quote-aware until it
+/// finds the real tag-closing `>`.
 fn isInsideOpeningTag(xml: []const u8, pos: usize) bool {
     if (pos == 0) return false;
     var lt = pos;
-    while (lt > 0) : (lt -= 1) {
-        if (xml[lt] == '<') break;
-        if (xml[lt] == '>') return false;
-    }
+    while (lt > 0 and xml[lt] != '<') : (lt -= 1) {}
     if (xml[lt] != '<') return false;
     if (lt + 1 >= xml.len) return false;
     const next = xml[lt + 1];
-    return next != '!' and next != '?' and next != '/';
+    if (next == '!' or next == '?' or next == '/') return false;
+    // Walk forward quote-aware from `<` checking if `pos` falls
+    // before the tag-closing `>`. If yes, pos is inside the tag.
+    const tag_end = findUnquotedTagEnd(xml, lt + 1) orelse return false;
+    return pos < tag_end;
 }
 
 /// Walk `xml` from `start` looking for the `>` that ends a tag,
@@ -1900,6 +1905,25 @@ test "findLocalChartElement: chart-element self-redeclare wins over earlier non-
     // Override the root primary so it can't match `p` as a fallback.
     var prefixes: DrawingPrefixes = .{};
     prefixes.c = "c-not-p";
+    const found = findLocalChartElement(block, gf_idx, prefixes);
+    try std.testing.expect(found != null);
+    try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<p:chart"));
+}
+
+test "findLocalChartElement: xmlns after a quoted `>` in same tag is honored" {
+    // The `<foo>` opening tag has `descr="a > b"` BEFORE an
+    // xmlns:p declaration. The opening-tag detection must walk
+    // forward quote-aware so the in-quotes `>` doesn't cause
+    // isInsideOpeningTag to reject the real xmlns binding.
+    const block =
+        "<xdr:graphicFrame>" ++
+        "<foo descr=\"a > b\" xmlns:p=\"http://schemas.openxmlformats.org/drawingml/2006/chart\">" ++
+        "<p:chart r:id=\"rId1\"/>" ++
+        "</foo>" ++
+        "</xdr:graphicFrame>";
+    const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame").?;
+    var prefixes: DrawingPrefixes = .{};
+    prefixes.c = "c-not-p"; // disable root-prefix fallback
     const found = findLocalChartElement(block, gf_idx, prefixes);
     try std.testing.expect(found != null);
     try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<p:chart"));
