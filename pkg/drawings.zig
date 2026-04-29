@@ -294,14 +294,24 @@ fn collectChartsFromSheet(
         const gf_idx = std.mem.indexOf(u8, block, tags.open_graphic_frame) orelse continue;
         // The chart-namespace prefix can be declared LOCALLY on the
         // <*:chart> element rather than on the drawing root (valid
-        // OOXML scoping pattern). Look up xmlns:* in this block
-        // FIRST; only fall back to the drawing-root prefix if the
-        // block didn't redefine. Pure-block resolution would lose
-        // root-scoped declarations the block inherits.
+        // OOXML scoping pattern). Try BOTH the block-local prefix
+        // and the drawing-root prefix — XML allows redundant local
+        // declarations whose prefixes aren't the one actually used
+        // by the chart element, so picking the first match anywhere
+        // in the block could miss valid root-scoped charts.
         var block_chart_buf: [128]u8 = undefined;
-        const block_chart_prefix = findNamespacePrefix(block, ns_c) orelse prefixes.c;
-        const block_open_chart = std.fmt.bufPrint(&block_chart_buf, "<{s}:chart", .{block_chart_prefix}) catch tags.open_chart;
-        const chart_idx = std.mem.indexOfPos(u8, block, gf_idx, block_open_chart) orelse continue;
+        const block_chart_prefix = findNamespacePrefix(block, ns_c);
+        const root_open_chart = tags.open_chart;
+        const chart_idx = blk: {
+            if (block_chart_prefix) |p| {
+                const local_open = std.fmt.bufPrint(&block_chart_buf, "<{s}:chart", .{p}) catch root_open_chart;
+                if (std.mem.indexOfPos(u8, block, gf_idx, local_open)) |idx| break :blk idx;
+            }
+            // Either no local declaration, or the local prefix
+            // didn't match — try the drawing-root prefix.
+            if (std.mem.indexOfPos(u8, block, gf_idx, root_open_chart)) |idx| break :blk idx;
+            continue;
+        };
         const chart_end = std.mem.indexOfScalarPos(u8, block, chart_idx, '>') orelse continue;
         const chart_attrs = block[chart_idx .. chart_end + 1];
         const embed_rid = attrValue(chart_attrs, "r:id") orelse continue;
