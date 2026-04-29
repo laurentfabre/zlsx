@@ -599,11 +599,11 @@ fn findNamespacePrefix(xml: []const u8, target_uri: []const u8) ?[]const u8 {
         const val_end = std.mem.indexOfScalarPos(u8, xml[0..limit], val_start, quote) orelse return null;
         if (std.mem.eql(u8, xml[val_start..val_end], target_uri)) {
             // Cap pathologically long prefixes — they'd overflow
-            // the per-needle scratch buffers downstream and turn a
-            // valid workbook into a hard error. 64 chars is well
-            // beyond anything real (OOXML uses 1-8 char prefixes).
-            if (name.len > max_prefix_len) return null;
-            return name;
+            // the per-needle scratch buffers downstream. Skip
+            // (rather than abort the whole lookup) so a workbook
+            // that declares multiple prefixes for the same URI
+            // can still match a usable one further along.
+            if (name.len <= max_prefix_len) return name;
         }
         i = val_end + 1;
     }
