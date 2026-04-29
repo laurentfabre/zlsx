@@ -2577,7 +2577,9 @@ fn emitStylesXml(
         try buf.appendSlice(alloc, "</dxfs>");
     }
 
-    try buf.appendSlice(alloc, STYLES_CELL_STYLES);
+    // <cellStyles> was already emitted before <dxfs> (schema-
+    // required order). The previous trailing append produced a
+    // duplicate block — removed.
     try buf.appendSlice(alloc, STYLES_TAIL);
 
     try zw.addEntry("xl/styles.xml", buf.items);
