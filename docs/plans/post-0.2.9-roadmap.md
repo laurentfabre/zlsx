@@ -31,7 +31,8 @@ modulo two pending deferrals; addPart shipped.
 | **B-fuzz** Coverage-guided fuzz nightly | ✅ shipped (reader + package layer fuzz binaries on ubuntu-22.04 nightly) |
 | **C2a** Object extraction (images / charts / opaque) | ✅ shipped: image + chart anchors + series refs + Strict OOXML content-type detection + XML-whitespace tolerance + non-canonical namespace-prefix tolerance (per-block + drawing-root prefix resolution, XML-attribute whitespace, scratch buffers sized for arbitrary prefix lengths) + `<xdr:absoluteAnchor>` pixel-coordinate parsing surfaced via the optional `absolute: ?AbsoluteAnchor` field on ImageAnchor / ChartAnchor |
 | **C2b** addImage | ⏳ pending (depends on B1; addPart unblocks the part-injection half) |
-| **C1** Formula tokenizer + rewriter | ⏳ pending (single biggest remaining user-value item) |
+| **C1 M1** Formula tokenizer + loss-preserving printer | ✅ shipped (`src/formula/tokenizer.zig` — A1 refs incl. case-insensitive, sheet qualifiers, ranges, names, function-call disambiguation, number/string/bool/error literals, every operator, array constants, whitespace preserved, external-wb refs as `.unknown`) |
+| **C1 M2+** Formula rewriter (cells/DV/CF/names/hyperlinks) | ⏳ pending |
 | **D1** Formula evaluator | deferred indefinitely |
 | **D2** Typed chart emit | deferred |
 
