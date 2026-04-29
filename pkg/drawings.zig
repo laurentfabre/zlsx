@@ -239,11 +239,11 @@ fn collectFromSheet(
     const primary_tags = try DrawingTags.build(&primary_buf, prefixes);
     try scanImagesWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, prefixes, primary_tags, out);
 
-    // Mixed-prefix bindings: a descendant anchor may use a second
+    // Mixed-prefix bindings: descendant anchors may use a different
     // prefix bound to the same spreadsheetDrawing URI. Replay the
-    // scan with the alt prefix; primary-prefixed anchors won't
+    // scan once per alt prefix; primary-prefixed anchors won't
     // match, so no duplicates surface.
-    if (prefixes.xdr_alt) |alt| {
+    for (prefixes.xdr_alts()) |alt| {
         var alt_prefixes = prefixes;
         alt_prefixes.xdr = alt;
         var alt_buf: [4096]u8 = undefined;
@@ -342,7 +342,7 @@ fn collectChartsFromSheet(
     const primary_tags = try DrawingTags.build(&primary_buf, prefixes);
     try scanChartsWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, prefixes, primary_tags, out);
 
-    if (prefixes.xdr_alt) |alt| {
+    for (prefixes.xdr_alts()) |alt| {
         var alt_prefixes = prefixes;
         alt_prefixes.xdr = alt;
         var alt_buf: [4096]u8 = undefined;
@@ -697,17 +697,27 @@ const ns_c_strict = "http://purl.oclc.org/ooxml/drawingml/chart";
 /// fields hold the alternate-conformance binding when both
 /// Transitional and Strict URIs are declared so downstream
 /// lookups can probe either prefix.
+const max_xdr_alts: usize = 8;
+
 const DrawingPrefixes = struct {
     xdr: []const u8 = "xdr",
     a: []const u8 = "a",
     c: []const u8 = "c",
     a_alt: ?[]const u8 = null,
     c_alt: ?[]const u8 = null,
-    /// A second prefix bound to either xdr URI in the same document.
-    /// Set when descendant anchors use a different prefix from the
-    /// root `<*:wsDr>` element — both resolve to the same namespace
-    /// but the substring scan must walk both.
-    xdr_alt: ?[]const u8 = null,
+    /// All prefixes (other than `xdr`) bound to either xdr URI in
+    /// the same document. The scanner replays once per prefix so
+    /// anchors using ANY bound prefix are surfaced. Capped at
+    /// `max_xdr_alts` — real OOXML producers declare 1-2; more is
+    /// pathological. Tracked as fixed-array + count rather than a
+    /// stdlib bounded helper because Zig 0.15 dropped
+    /// `std.BoundedArray`.
+    xdr_alts_buf: [max_xdr_alts][]const u8 = undefined,
+    xdr_alts_len: usize = 0,
+
+    fn xdr_alts(self: *const DrawingPrefixes) []const []const u8 {
+        return self.xdr_alts_buf[0..self.xdr_alts_len];
+    }
 };
 
 /// Scan the root element's xmlns:* declarations and return the
@@ -731,30 +741,29 @@ fn resolveDrawingPrefixes(xml: []const u8) DrawingPrefixes {
         p.xdr = pref;
     }
     // A document can bind the spreadsheetDrawing namespace under
-    // two different prefixes (e.g. one on the root, another on a
-    // descendant anchor). The scanner pre-formats needles per
-    // prefix, so we track an alternate prefix bound to either
-    // xdr URI and walk anchors with it as a second pass.
+    // multiple prefixes (one on the root, others on descendant
+    // anchors). Codex flagged scenarios where unused declarations
+    // appear before the actually-used alt — picking only the FIRST
+    // alt would silently drop anchors. Collect ALL alternate
+    // bindings (capped at 8) so the scanner replays per-prefix.
     //
-    // Prefer alts on the SAME URI as the primary binding: a
-    // Strict-rooted document with an unused Transitional prefix
-    // declaration would otherwise pick the unused prefix and miss
-    // the actual descendant binding on the Strict URI.
+    // Prefer alts on the SAME URI as the primary binding so the
+    // most-likely-used candidate is processed first.
     const primary_uri = uriOfPrefix(xml, p.xdr);
     if (primary_uri) |uri| {
         if (std.mem.eql(u8, uri, ns_xdr_strict)) {
-            p.xdr_alt = findNamespacePrefixExcept(xml, ns_xdr_strict, p.xdr) orelse
-                findNamespacePrefixExcept(xml, ns_xdr_transitional, p.xdr);
+            collectAllNamespacePrefixes(xml, ns_xdr_strict, p.xdr, &p);
+            collectAllNamespacePrefixes(xml, ns_xdr_transitional, p.xdr, &p);
         } else if (std.mem.eql(u8, uri, ns_xdr_transitional)) {
-            p.xdr_alt = findNamespacePrefixExcept(xml, ns_xdr_transitional, p.xdr) orelse
-                findNamespacePrefixExcept(xml, ns_xdr_strict, p.xdr);
+            collectAllNamespacePrefixes(xml, ns_xdr_transitional, p.xdr, &p);
+            collectAllNamespacePrefixes(xml, ns_xdr_strict, p.xdr, &p);
         } else {
-            p.xdr_alt = findNamespacePrefixExcept(xml, ns_xdr_transitional, p.xdr) orelse
-                findNamespacePrefixExcept(xml, ns_xdr_strict, p.xdr);
+            collectAllNamespacePrefixes(xml, ns_xdr_transitional, p.xdr, &p);
+            collectAllNamespacePrefixes(xml, ns_xdr_strict, p.xdr, &p);
         }
     } else {
-        p.xdr_alt = findNamespacePrefixExcept(xml, ns_xdr_transitional, p.xdr) orelse
-            findNamespacePrefixExcept(xml, ns_xdr_strict, p.xdr);
+        collectAllNamespacePrefixes(xml, ns_xdr_transitional, p.xdr, &p);
+        collectAllNamespacePrefixes(xml, ns_xdr_strict, p.xdr, &p);
     }
     const a_t = findNamespacePrefix(xml, ns_a_transitional);
     const a_s = findNamespacePrefix(xml, ns_a_strict);
@@ -827,6 +836,68 @@ const max_prefix_len: usize = 100;
 
 fn findNamespacePrefix(xml: []const u8, target_uri: []const u8) ?[]const u8 {
     return findNamespacePrefixExcept(xml, target_uri, "");
+}
+
+/// Append every prefix bound to `target_uri` (other than `skip`
+/// and any prefix already in `out`) to the bounded array. Used
+/// to collect ALL alternate xdr prefixes for replay scanning —
+/// finding the FIRST alt isn't enough when an unused declaration
+/// precedes the actually-used one.
+fn collectAllNamespacePrefixes(
+    xml: []const u8,
+    target_uri: []const u8,
+    skip: []const u8,
+    out: *DrawingPrefixes,
+) void {
+    const limit = xml.len;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml[0..limit], i, "xmlns:")) |start| {
+        const after = start + "xmlns:".len;
+        if (after >= limit) return;
+        var name_end = after;
+        while (name_end < limit) : (name_end += 1) {
+            const c = xml[name_end];
+            if (c == '=' or c == ' ' or c == '\t' or c == '\n' or c == '\r') break;
+        }
+        if (name_end >= limit) return;
+        const name = xml[after..name_end];
+        var p = name_end;
+        while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
+        if (p >= limit or xml[p] != '=') {
+            i = after;
+            continue;
+        }
+        p += 1;
+        while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
+        if (p >= limit) return;
+        const quote = xml[p];
+        if (quote != '"' and quote != '\'') {
+            i = p;
+            continue;
+        }
+        const val_start = p + 1;
+        const val_end = std.mem.indexOfScalarPos(u8, xml[0..limit], val_start, quote) orelse return;
+        if (std.mem.eql(u8, xml[val_start..val_end], target_uri) and
+            !std.mem.eql(u8, name, skip) and
+            name.len <= max_prefix_len)
+        {
+            // Dedup: don't append the same prefix twice (would
+            // happen when same prefix is declared on two elements
+            // with the same URI).
+            var already_in = false;
+            for (out.xdr_alts()) |existing| {
+                if (std.mem.eql(u8, existing, name)) {
+                    already_in = true;
+                    break;
+                }
+            }
+            if (!already_in and out.xdr_alts_len < max_xdr_alts) {
+                out.xdr_alts_buf[out.xdr_alts_len] = name;
+                out.xdr_alts_len += 1;
+            }
+        }
+        i = val_end + 1;
+    }
 }
 
 /// Inverse lookup: given a prefix, return the URI it's bound to,
@@ -1551,8 +1622,8 @@ test "resolveDrawingPrefixes maps canonical + custom prefixes" {
         ;
         const p = resolveDrawingPrefixes(xml);
         try std.testing.expectEqualStrings("xdr", p.xdr);
-        try std.testing.expect(p.xdr_alt != null);
-        try std.testing.expectEqualStrings("dr", p.xdr_alt.?);
+        try std.testing.expectEqual(@as(usize, 1), p.xdr_alts_len);
+        try std.testing.expectEqualStrings("dr", p.xdr_alts()[0]);
     }
     // Mixed conformance: Transitional URI on one prefix, Strict URI
     // on another. Primary picks one, alt tracks the other.
@@ -1562,8 +1633,8 @@ test "resolveDrawingPrefixes maps canonical + custom prefixes" {
         ;
         const p = resolveDrawingPrefixes(xml);
         try std.testing.expectEqualStrings("xdr", p.xdr);
-        try std.testing.expect(p.xdr_alt != null);
-        try std.testing.expectEqualStrings("xs", p.xdr_alt.?);
+        try std.testing.expectEqual(@as(usize, 1), p.xdr_alts_len);
+        try std.testing.expectEqualStrings("xs", p.xdr_alts()[0]);
     }
     // Single binding — alt must stay null so the scanner doesn't
     // double-walk an identical needle set.
@@ -1573,7 +1644,7 @@ test "resolveDrawingPrefixes maps canonical + custom prefixes" {
         ;
         const p = resolveDrawingPrefixes(xml);
         try std.testing.expectEqualStrings("xdr", p.xdr);
-        try std.testing.expectEqual(@as(?[]const u8, null), p.xdr_alt);
+        try std.testing.expectEqual(@as(usize, 0), p.xdr_alts_len);
     }
     // Strict-rooted with unused Transitional declaration: the
     // descendant alt prefix is on the Strict URI. The resolver
@@ -1585,21 +1656,25 @@ test "resolveDrawingPrefixes maps canonical + custom prefixes" {
         ;
         const p = resolveDrawingPrefixes(xml);
         try std.testing.expectEqualStrings("xs", p.xdr);
-        try std.testing.expect(p.xdr_alt != null);
-        // Same-URI (Strict) binding wins over the unused
-        // Transitional declaration.
-        try std.testing.expectEqualStrings("dr", p.xdr_alt.?);
+        try std.testing.expectEqual(@as(usize, 2), p.xdr_alts_len);
+        // Same-URI (Strict) alt is enumerated FIRST.
+        try std.testing.expectEqualStrings("dr", p.xdr_alts()[0]);
+        // Other-conformance (Transitional) alt comes second so the
+        // scanner still walks it, picking up any anchors that use
+        // it (rare, but valid OOXML).
+        try std.testing.expectEqualStrings("xdr", p.xdr_alts()[1]);
     }
     // Mirror case: Transitional-rooted with unused Strict
-    // declaration. Same-URI alt must still win.
+    // declaration. Same-URI alt must still win, both alts tracked.
     {
         const xml =
             \\<?xml version="1.0"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:xs="http://purl.oclc.org/ooxml/drawingml/spreadsheetDrawing" xmlns:dr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>
         ;
         const p = resolveDrawingPrefixes(xml);
         try std.testing.expectEqualStrings("xdr", p.xdr);
-        try std.testing.expect(p.xdr_alt != null);
-        try std.testing.expectEqualStrings("dr", p.xdr_alt.?);
+        try std.testing.expectEqual(@as(usize, 2), p.xdr_alts_len);
+        try std.testing.expectEqualStrings("dr", p.xdr_alts()[0]);
+        try std.testing.expectEqualStrings("xs", p.xdr_alts()[1]);
     }
     // Late-declared xmlns past the previous 4 KiB scan window:
     // XML 1.0 + Namespaces 1.0 allow xmlns:* on any element. Pad
@@ -1623,8 +1698,22 @@ test "resolveDrawingPrefixes maps canonical + custom prefixes" {
         const doc = fbs.getWritten();
         const p = resolveDrawingPrefixes(doc);
         try std.testing.expectEqualStrings("xdr", p.xdr);
-        try std.testing.expect(p.xdr_alt != null);
-        try std.testing.expectEqualStrings("dr", p.xdr_alt.?);
+        try std.testing.expectEqual(@as(usize, 1), p.xdr_alts_len);
+        try std.testing.expectEqualStrings("dr", p.xdr_alts()[0]);
+    }
+    // Multiple alts on the same URI: an unused declaration
+    // appears before the actually-used alt. Both must be tracked
+    // so the scanner replays with each, even if the first alt is
+    // unused — the loop short-circuits on no-match.
+    {
+        const xml =
+            \\<?xml version="1.0"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:u="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:dr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>
+        ;
+        const p = resolveDrawingPrefixes(xml);
+        try std.testing.expectEqualStrings("xdr", p.xdr);
+        try std.testing.expectEqual(@as(usize, 2), p.xdr_alts_len);
+        try std.testing.expectEqualStrings("u", p.xdr_alts()[0]);
+        try std.testing.expectEqualStrings("dr", p.xdr_alts()[1]);
     }
 }
 
