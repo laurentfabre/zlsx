@@ -1929,7 +1929,10 @@ pub const SheetWriter = struct {
             // the row's `<row>` opener has been appended.
             .string => |s| try assertNoForbiddenXmlBytes(s),
             .rich => |runs| {
-                for (runs) |run| try assertNoForbiddenXmlBytes(run.text);
+                for (runs) |run| {
+                    try assertNoForbiddenXmlBytes(run.text);
+                    if (run.font_name) |fn_name| try assertNoForbiddenXmlBytes(fn_name);
+                }
             },
             else => {},
         };
@@ -6356,6 +6359,19 @@ test "writeRow atomicity: forbidden-XML-byte string leaves no half-written row" 
     // Then a valid row writes fine.
     try sw.writeRow(&.{ .{ .string = "good" }, .{ .integer = 42 } });
     try std.testing.expect(sw.body.items.len > body_before);
+}
+
+test "writeRichRow atomicity: forbidden byte in rich-run font_name bails too" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    var sw = try w.addSheet("Sheet1");
+    const body_before = sw.body.items.len;
+    const runs = [_]RichTextRun{
+        .{ .text = "ok", .font_name = "Bad\x01Font" },
+    };
+    const cells = [_]RichRowCell{.{ .rich = &runs }};
+    try std.testing.expectError(error.InvalidXmlByte, sw.writeRichRow(&cells));
+    try std.testing.expectEqual(body_before, sw.body.items.len);
 }
 
 test "writeRichRow atomicity: forbidden byte in rich-run text leaves no half-written row" {
