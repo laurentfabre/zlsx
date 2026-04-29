@@ -517,21 +517,43 @@ fn detectChartTypeWithAlt(
 /// (libreoffice, hand-edited drawings) sometimes emit single
 /// quotes, and skipping them silently dropped image/chart anchors.
 fn attrValue(attrs: []const u8, key: []const u8) ?[]const u8 {
-    return attrValueWithQuote(attrs, key, '"') orelse
-        attrValueWithQuote(attrs, key, '\'');
-}
-
-fn attrValueWithQuote(attrs: []const u8, key: []const u8, quote: u8) ?[]const u8 {
-    var search_buf: [32]u8 = undefined;
-    if (key.len + 2 > search_buf.len) return null;
-    @memcpy(search_buf[0..key.len], key);
-    search_buf[key.len] = '=';
-    search_buf[key.len + 1] = quote;
-    const needle = search_buf[0 .. key.len + 2];
-    const found = std.mem.indexOf(u8, attrs, needle) orelse return null;
-    const start = found + needle.len;
-    const end = std.mem.indexOfScalarPos(u8, attrs, start, quote) orelse return null;
-    return attrs[start..end];
+    // Walk attrs scanning for `key`-followed-by-(whitespace-or-=)`,
+    // then optional whitespace, then `=`, optional whitespace,
+    // then quote-delimited value. XML 1.0 §3.1 permits whitespace
+    // around `=`; the previous fixed-byte needle only matched
+    // `key="value"` / `key='value'` and dropped attributes
+    // emitted with whitespace.
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, attrs, i, key)) |start| {
+        // Require word boundary before key (start of slice or
+        // whitespace), so a substring match like "ny" inside
+        // "any" doesn't satisfy a lookup for "ny".
+        if (start > 0) {
+            const prev = attrs[start - 1];
+            if (prev != ' ' and prev != '\t' and prev != '\n' and prev != '\r') {
+                i = start + 1;
+                continue;
+            }
+        }
+        var p = start + key.len;
+        while (p < attrs.len and (attrs[p] == ' ' or attrs[p] == '\t' or attrs[p] == '\n' or attrs[p] == '\r')) p += 1;
+        if (p >= attrs.len or attrs[p] != '=') {
+            i = start + 1;
+            continue;
+        }
+        p += 1;
+        while (p < attrs.len and (attrs[p] == ' ' or attrs[p] == '\t' or attrs[p] == '\n' or attrs[p] == '\r')) p += 1;
+        if (p >= attrs.len) return null;
+        const quote = attrs[p];
+        if (quote != '"' and quote != '\'') {
+            i = p;
+            continue;
+        }
+        const val_start = p + 1;
+        const val_end = std.mem.indexOfScalarPos(u8, attrs, val_start, quote) orelse return null;
+        return attrs[val_start..val_end];
+    }
+    return null;
 }
 
 /// Find the value of `r:id` on the sheet's `<drawing>` element. The
@@ -1213,6 +1235,26 @@ test "parseCellAnchor unit test" {
     const b = parseCellAnchor(xml2, "<dr:from>", "</dr:from>", "dr").?;
     try std.testing.expectEqual(@as(u32, 3), b.col);
     try std.testing.expectEqual(@as(u32, 1), b.row);
+}
+
+test "attrValue tolerates whitespace around =" {
+    // XML 1.0 §3.1 allows whitespace around `=` in attribute syntax.
+    try std.testing.expectEqualStrings("914400", attrValue(
+        \\x = "914400" y = "0"
+    , "x").?);
+    try std.testing.expectEqualStrings("0", attrValue(
+        \\x = "914400" y = "0"
+    , "y").?);
+    // Tabs / newlines too.
+    try std.testing.expectEqualStrings(
+        "rId1",
+        attrValue("r:id\n=\t\"rId1\"", "r:id").?,
+    );
+    // Substring-of-other-key must NOT match (word-boundary).
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        attrValue("any=\"v\"", "ny"),
+    );
 }
 
 test "attrValue tolerates single-quoted XML attributes" {
