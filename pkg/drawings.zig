@@ -347,16 +347,25 @@ fn collectChartsFromSheet(
         // by the chart element, so picking the first match anywhere
         // in the block could miss valid root-scoped charts.
         var block_chart_buf: [128]u8 = undefined;
-        const block_chart_prefix = findNamespacePrefix(block, ns_c_transitional) orelse
-            findNamespacePrefix(block, ns_c_strict);
+        const block_chart_prefix_t = findNamespacePrefix(block, ns_c_transitional);
+        const block_chart_prefix_s = findNamespacePrefix(block, ns_c_strict);
         const root_open_chart = tags.open_chart;
         const chart_idx = blk: {
-            if (block_chart_prefix) |p| {
-                const local_open = std.fmt.bufPrint(&block_chart_buf, "<{s}:chart", .{p}) catch root_open_chart;
+            // Try every plausible prefix for the chart namespace —
+            // local Transitional, local Strict, and the drawing-
+            // root resolved prefix. Whichever matches the actual
+            // `<*:chart` element in the block wins. This covers
+            // mixed-conformance blocks that declare both URIs.
+            const candidates = [_]?[]const u8{
+                block_chart_prefix_t,
+                block_chart_prefix_s,
+            };
+            for (candidates) |maybe_p| {
+                const p = maybe_p orelse continue;
+                const local_open = std.fmt.bufPrint(&block_chart_buf, "<{s}:chart", .{p}) catch continue;
                 if (std.mem.indexOfPos(u8, block, gf_idx, local_open)) |idx| break :blk idx;
             }
-            // Either no local declaration, or the local prefix
-            // didn't match — try the drawing-root prefix.
+            // Fall back to the drawing-root prefix.
             if (std.mem.indexOfPos(u8, block, gf_idx, root_open_chart)) |idx| break :blk idx;
             continue;
         };
