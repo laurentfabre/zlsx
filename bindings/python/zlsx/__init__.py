@@ -52,6 +52,7 @@ __all__ = [
     "Font",
     "Fill",
     "Border",
+    "Alignment",
     "Comment",
     "Dxf",
     "CF_OPERATORS",
