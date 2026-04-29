@@ -87,6 +87,12 @@ pub fn main() !u8 {
         return 5;
     };
     for (images) |p| {
+        // Filter to xl/media/ — that's the canonical home for
+        // sheet-embedded images. Other image-content-type parts
+        // exist (docProps/thumbnail.jpeg, custom workbook resources)
+        // but they aren't anchored to a worksheet and the CLI's
+        // documented contract is "mirror unzip xl/media/* -d out".
+        if (!std.mem.startsWith(u8, p.name, "xl/media/")) continue;
         const basename = std.fs.path.basename(p.name);
         dir.writeFile(.{ .sub_path = basename, .data = p.bytes }) catch |e| {
             try err.print("write '{s}': {s}\n", .{ basename, @errorName(e) });
