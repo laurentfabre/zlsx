@@ -1427,9 +1427,14 @@ pub const SheetWriter = struct {
     }
 
     /// Apply an auto-filter over the given A1-style range (e.g.,
-    /// "A1:E1"). Caller-owned; the writer dupes it.
+    /// "A1:E1"). Caller-owned; the writer dupes it. The range must
+    /// resolve to valid A1 corners (column [A, XFD], row [1,
+    /// 1048576]) and the bottom-right corner must not be above or
+    /// to the left of the top-left — Excel rejects malformed
+    /// `<autoFilter ref=...>` at file-open with a "repaired"
+    /// prompt, so we surface it as `InvalidAutoFilterRange`.
     pub fn setAutoFilter(self: *SheetWriter, range: []const u8) !void {
-        if (range.len == 0) return error.InvalidAutoFilterRange;
+        try validateAutoFilterRange(range);
         if (self.auto_filter_range) |old| self.parent.allocator.free(old);
         self.auto_filter_range = try self.parent.allocator.dupe(u8, range);
     }
@@ -2086,6 +2091,17 @@ pub fn validateSheetName(name: []const u8) !void {
     if (casefold.excelSheetNameEql(name, "History")) return error.InvalidSheetName;
 }
 
+fn validateAutoFilterRange(range: []const u8) !void {
+    if (range.len == 0) return error.InvalidAutoFilterRange;
+    if (std.mem.indexOfScalar(u8, range, ':')) |colon| {
+        const tl = parseA1Corner(range[0..colon]) catch return error.InvalidAutoFilterRange;
+        const br = parseA1Corner(range[colon + 1 ..]) catch return error.InvalidAutoFilterRange;
+        if (tl.col > br.col or tl.row > br.row) return error.InvalidAutoFilterRange;
+    } else {
+        _ = parseA1Corner(range) catch return error.InvalidAutoFilterRange;
+    }
+}
+
 fn validateHyperlinkRange(range: []const u8) !void {
     if (range.len == 0) return error.InvalidHyperlinkRange;
     if (std.mem.indexOfScalar(u8, range, ':')) |colon| {
@@ -2451,15 +2467,35 @@ fn patternTypeName(p: PatternType) []const u8 {
     };
 }
 
+/// XML 1.0 forbids most C0 control bytes in document content.
+/// Allowed: 0x09 (tab), 0x0A (LF), 0x0D (CR). Forbidden:
+/// 0x00–0x08, 0x0B, 0x0C, 0x0E–0x1F, plus 0x7F (DEL — XML 1.0
+/// production [2] disallows it in element/attribute text). A
+/// cell string, comment, URL, formula, or rich-text run carrying
+/// any of these would emit a workbook that consumers reject as
+/// "not well-formed", so reject at write time with a typed error
+/// instead of silently producing a broken file.
 fn appendXmlEscaped(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
-    for (s) |ch| switch (ch) {
-        '<' => try out.appendSlice(alloc, "&lt;"),
-        '>' => try out.appendSlice(alloc, "&gt;"),
-        '&' => try out.appendSlice(alloc, "&amp;"),
-        '"' => try out.appendSlice(alloc, "&quot;"),
-        '\'' => try out.appendSlice(alloc, "&apos;"),
-        else => try out.append(alloc, ch),
-    };
+    for (s) |ch| {
+        if (isForbiddenXmlByte(ch)) return error.InvalidXmlByte;
+        switch (ch) {
+            '<' => try out.appendSlice(alloc, "&lt;"),
+            '>' => try out.appendSlice(alloc, "&gt;"),
+            '&' => try out.appendSlice(alloc, "&amp;"),
+            '"' => try out.appendSlice(alloc, "&quot;"),
+            '\'' => try out.appendSlice(alloc, "&apos;"),
+            else => try out.append(alloc, ch),
+        }
+    }
+}
+
+inline fn isForbiddenXmlByte(c: u8) bool {
+    // Allow tab (0x09), LF (0x0A), CR (0x0D); reject everything
+    // else < 0x20, plus DEL (0x7F).
+    if (c == 0x09 or c == 0x0A or c == 0x0D) return false;
+    if (c < 0x20) return true;
+    if (c == 0x7F) return true;
+    return false;
 }
 
 // ─── Deflate (LZ77 + dynamic huffman + lazy matching) ────────────────
@@ -5089,6 +5125,15 @@ test "fuzz appendXmlEscaped: no raw XML specials in output" {
     for (0..iters) |_| {
         const len = rng.intRangeAtMost(usize, 0, input_buf.len);
         rng.bytes(input_buf[0..len]);
+        // Sanitise: replace forbidden XML 1.0 bytes with `?` so the
+        // call succeeds — the appendXmlEscaped contract is now to
+        // ERROR on forbidden bytes (NUL, most C0 controls, DEL).
+        // The invariant we want to verify here is the entity-
+        // escaping correctness on valid input; a separate test
+        // exercises the error path.
+        for (input_buf[0..len]) |*p| {
+            if (isForbiddenXmlByte(p.*)) p.* = '?';
+        }
         out.clearRetainingCapacity();
         try appendXmlEscaped(std.testing.allocator, &out, input_buf[0..len]);
 
@@ -5111,6 +5156,33 @@ test "fuzz appendXmlEscaped: no raw XML specials in output" {
                 std.mem.startsWith(u8, rest, "apos;");
             try std.testing.expect(ok);
         }
+    }
+}
+
+test "appendXmlEscaped rejects forbidden XML 1.0 control bytes" {
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(std.testing.allocator);
+    // Each of these should error — none are legal in XML 1.0 text.
+    const cases = [_][]const u8{
+        "\x00", // NUL
+        "hello\x01world",
+        "tab\x0Bvtab", // vertical tab
+        "ff\x0C", // form feed
+        "esc\x1B", // escape
+        "\x7F", // DEL
+    };
+    for (cases) |c| {
+        out.clearRetainingCapacity();
+        try std.testing.expectError(
+            error.InvalidXmlByte,
+            appendXmlEscaped(std.testing.allocator, &out, c),
+        );
+    }
+    // Allowed control bytes pass through.
+    const allowed = [_][]const u8{ "tab\there", "lf\nhere", "cr\rhere" };
+    for (allowed) |c| {
+        out.clearRetainingCapacity();
+        try appendXmlEscaped(std.testing.allocator, &out, c);
     }
 }
 
