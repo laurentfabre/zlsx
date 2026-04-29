@@ -3453,8 +3453,8 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
             // alone (the slice between `>` and `</border>`) doesn't
             // see them. Capture both before recursing into the body.
             const open_attrs = block[border_pos..gt];
-            const diag_up = std.mem.indexOf(u8, open_attrs, "diagonalUp=\"1\"") != null;
-            const diag_down = std.mem.indexOf(u8, open_attrs, "diagonalDown=\"1\"") != null;
+            const diag_up = xsdBoolAttrTrue(open_attrs, "diagonalUp");
+            const diag_down = xsdBoolAttrTrue(open_attrs, "diagonalDown");
             if (gt > 0 and block[gt - 1] == '/') {
                 try borders_list.append(book.allocator, .{
                     .diagonal_up = diag_up,
@@ -3554,7 +3554,7 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
                 if (ap_gt > ap) {
                     const align_attrs = body[ap..ap_gt];
                     align_record.horizontal = parseAlignmentHorizontal(align_attrs);
-                    align_record.wrap_text = std.mem.indexOf(u8, align_attrs, "wrapText=\"1\"") != null;
+                    align_record.wrap_text = xsdBoolAttrTrue(align_attrs, "wrapText");
                 }
             }
             i = body_end + "</xf>".len;
@@ -3579,6 +3579,35 @@ fn parseAlignmentHorizontal(attrs: []const u8) ?[]const u8 {
     const vs = kp + key.len;
     const ve = std.mem.indexOfScalarPos(u8, attrs, vs, '"') orelse return null;
     return attrs[vs..ve];
+}
+
+test "xsdBoolAttrTrue accepts both `1` and `true` lexical forms" {
+    // OOXML xsd:boolean — the bool flag attributes (diagonalUp,
+    // diagonalDown, wrapText, etc.) can serialise as either form.
+    try std.testing.expect(xsdBoolAttrTrue("foo=\"1\"", "foo"));
+    try std.testing.expect(xsdBoolAttrTrue("foo=\"true\"", "foo"));
+    try std.testing.expect(xsdBoolAttrTrue("foo=\"True\"", "foo"));
+    try std.testing.expect(xsdBoolAttrTrue("foo=\"TRUE\"", "foo"));
+    try std.testing.expect(!xsdBoolAttrTrue("foo=\"0\"", "foo"));
+    try std.testing.expect(!xsdBoolAttrTrue("foo=\"false\"", "foo"));
+    try std.testing.expect(!xsdBoolAttrTrue("foo=\"\"", "foo"));
+    // Missing attribute.
+    try std.testing.expect(!xsdBoolAttrTrue("bar=\"1\"", "foo"));
+}
+
+/// True if `attrs` carries `key="1"` or `key="true"`. xsd:boolean
+/// allows both lexical forms; xlsxwriter / openpyxl emit `"1"` but
+/// some producers (LibreOffice, hand-edited fixtures) emit `"true"`.
+/// Used for diagonalUp / diagonalDown / wrapText flags.
+fn xsdBoolAttrTrue(attrs: []const u8, key: []const u8) bool {
+    var key_buf: [32]u8 = undefined;
+    if (key.len + 2 > key_buf.len) return false;
+    const needle1 = std.fmt.bufPrint(&key_buf, "{s}=\"", .{key}) catch return false;
+    const kp = std.mem.indexOf(u8, attrs, needle1) orelse return false;
+    const vs = kp + needle1.len;
+    const ve = std.mem.indexOfScalarPos(u8, attrs, vs, '"') orelse return false;
+    const val = attrs[vs..ve];
+    return std.mem.eql(u8, val, "1") or std.ascii.eqlIgnoreCase(val, "true");
 }
 
 /// Parse a single `<border>` body (between `<border>` and `</border>`)
