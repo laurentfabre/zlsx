@@ -854,6 +854,13 @@ fn findLocalChartElement(block: []const u8, start: usize, prefixes: DrawingPrefi
             i = colon + 1;
             continue;
         }
+        // Skip candidates that sit inside a comment, CDATA, or
+        // processing instruction. A `<c:chart>` inside a comment
+        // is markup-shaped text, not a real element.
+        if (isInsideCommentOrCdata(block, p_start)) {
+            i = colon + 1;
+            continue;
+        }
         const prefix = block[p_start..colon];
         // Verify the prefix is bound to a chart URI. Use the
         // declaration nearest to (but inside) the chart tag — the
@@ -2046,6 +2053,26 @@ test "findLocalChartElement: fake nested markup in comment doesn't unbalance dep
     const found = findLocalChartElement(block, gf_idx, prefixes);
     try std.testing.expect(found != null);
     try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<c:chart"));
+}
+
+test "findLocalChartElement: fake `<c:chart>` inside a comment is ignored" {
+    // The graphicFrame contains a fake `<c:chart>` tag inside a
+    // comment, then the real chart afterwards. The scanner must
+    // skip the commented candidate (markup-shaped text isn't real
+    // markup) and pick the real one.
+    const block =
+        "<xdr:graphicFrame>" ++
+        "<!-- <c:chart xmlns:c=\"http://example.com/bad\" r:id=\"rIdFake\"/> -->" ++
+        "<c:chart r:id=\"rIdReal\"/>" ++
+        "</xdr:graphicFrame>";
+    const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame").?;
+    const prefixes: DrawingPrefixes = .{};
+    const found = findLocalChartElement(block, gf_idx, prefixes);
+    try std.testing.expect(found != null);
+    // The found `<` is for the REAL chart with rIdReal, not the
+    // commented one with rIdFake.
+    const tail_after = block[found.?..];
+    try std.testing.expect(std.mem.startsWith(u8, tail_after, "<c:chart r:id=\"rIdReal\""));
 }
 
 test "findLocalChartElement: PI body with fake </name> doesn't unbalance extent" {
