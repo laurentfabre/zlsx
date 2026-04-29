@@ -59,14 +59,33 @@ with zlsx.write("out.xlsx") as w:
     sheet = w.add_sheet("Summary")
     sheet.set_column_width(0, 24)    # 0-based column index
     sheet.set_column_width(1, 14)
-    sheet.freeze_panes(rows=1, cols=0)
+    sheet.set_row_height(0, 24)      # header row, in points (0, 409.5]
+    sheet.freeze_panes(rows=1, cols=0)              # legacy — clamps silently
+    # sheet.freeze_panes_checked(rows=1, cols=0)    # raises on out-of-range
     sheet.set_auto_filter("A1:C1")
 
     sheet.write_row(["Name", "Amount", "Share"], styles=[header, header, header])
     sheet.write_row(["Alice", 12345.67, 0.42], styles=[0, money, pct])
     sheet.write_row(["Bob",    9876.54, 0.33], styles=[0, money, pct])
+
+    # Workbook-level + sheet-scoped defined names (named ranges,
+    # print areas, validation sources, etc.). Excel name rules
+    # enforced up-front — A1-shaped, R1C1-shaped, length>255, and
+    # case-insensitive duplicates per scope all raise ZlsxError.
+    w.add_defined_name("Totals", "Summary!$B$2:$B$3")
+    w.add_defined_name(
+        "_xlnm.Print_Area",
+        "Summary!$A$1:$C$3",
+        local_sheet_id=0,
+        hidden=True,
+    )
 # save happens automatically on clean exit; exception → no save
 ```
+
+For round-trip verification through the same library, every `Style` field
+emitted via `Writer.add_style` reads back through `Book.cell_font`,
+`Book.cell_fill`, `Book.cell_border`, and `Book.cell_alignment` (alignment +
+wrap_text + diagonal direction flags + entity-encoded font names all preserved).
 
 ### Style cheat sheet
 

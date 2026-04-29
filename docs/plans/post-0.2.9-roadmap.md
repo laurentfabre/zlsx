@@ -9,7 +9,7 @@ pulled forward of formula work, chart emit demoted to Tier D,
 walk-away gates tightened (grammar-class instead of corpus-percentage,
 report-only bench CI).
 
-## Status (as of 2026-04-29)
+## Status (as of 2026-04-30)
 
 Tier-A and the Tier-B keystone (B0) are shipped. C2a is fully
 shipped (including absolute-pixel anchors and a namespace-aware
@@ -18,6 +18,26 @@ for closed siblings, comment / CDATA / PI awareness, quote-aware
 attribute scanning, O(n) flat under adversarial input). addPart
 shipped on PartStore. C1 milestone 1 (formula tokenizer +
 loss-preserving printer) shipped.
+
+Greenfield writer surface is feature-complete for non-image
+workbooks: cells, formulas, styles, validations, conditional
+formats, comments, hyperlinks, defined names (workbook + sheet-
+scoped via `Writer.addDefinedName` with full Excel name-rule
+validation incl. R1C1 / A1-shape / case-insensitive duplicate
+rejection), freeze panes (legacy clamp + checked typed-error
+variant), merged cells, auto-filter (A1-validated), column
+widths, row heights (validated against the (0, 409.5] cap).
+OOXML schema-correct on emit (Defaults-before-Overrides in
+[Content_Types].xml, `<cellStyles>` between `<cellXfs>` and
+`<dxfs>`, string-cached formulas use `t="str"`), atomic on error
+(no half-written `<row>`), XML-1.0-forbidden bytes rejected at
+every user-text channel (cells, formulas, comments, URLs, rich
+runs, font names). Reader round-trips every Style field zlsx's
+own writer emits — `Book.cellAlignment`, diagonal direction
+flags, entity-decoded font names, and `xsd:boolean "true"` form
+all land. C ABI + Python bindings expose the full surface with
+typed errors and FFI-narrowing bounds checks (no silent uint32
+wraparound).
 
 | Item | Status |
 |---|---|
