@@ -823,7 +823,35 @@ fn findNamespacePrefix(xml: []const u8, target_uri: []const u8) ?[]const u8 {
 /// unused declaration appeared first.
 fn findLocalChartElement(block: []const u8, start: usize, prefixes: DrawingPrefixes) ?usize {
     var i = start;
-    while (std.mem.indexOfPos(u8, block, i, ":chart")) |colon| {
+    while (i < block.len) {
+        // Eat any comment/CDATA/PI section starting at `i`. Done
+        // up-front each iteration so we never call indexOfPos for
+        // `:chart` inside a skip region — the search stays O(n)
+        // even when adversarial input packs many fake `:chart`
+        // substrings into many skip regions.
+        if (i + 4 <= block.len and std.mem.startsWith(u8, block[i..], "<!--")) {
+            const close = std.mem.indexOfPos(u8, block, i + 4, "-->") orelse return null;
+            i = close + 3;
+            continue;
+        }
+        if (i + 9 <= block.len and std.mem.startsWith(u8, block[i..], "<![CDATA[")) {
+            const close = std.mem.indexOfPos(u8, block, i + 9, "]]>") orelse return null;
+            i = close + 3;
+            continue;
+        }
+        if (i + 2 <= block.len and std.mem.startsWith(u8, block[i..], "<?")) {
+            const close = std.mem.indexOfPos(u8, block, i + 2, "?>") orelse return null;
+            i = close + 2;
+            continue;
+        }
+        const colon = std.mem.indexOfPos(u8, block, i, ":chart") orelse return null;
+        // If a skip region opens between `i` and `colon`, jump to
+        // that opener so the section-eat branch above consumes it.
+        // This keeps `:chart` lookups limited to non-skipped bytes.
+        if (nextSkipOpenBefore(block, i, colon)) |skip_open| {
+            i = skip_open;
+            continue;
+        }
         // The byte immediately after `:chart` must end the tag name
         // (space, `>`, or `/`); otherwise this is a longer name
         // that happens to contain ":chart" (e.g. `:chartSpace`).
@@ -854,16 +882,9 @@ fn findLocalChartElement(block: []const u8, start: usize, prefixes: DrawingPrefi
             i = colon + 1;
             continue;
         }
-        // Skip candidates that sit inside a comment, CDATA, or
-        // processing instruction. A `<c:chart>` inside a comment
-        // is markup-shaped text, not a real element. Advance past
-        // the END of the containing skip region so adversarial
-        // inputs with many `:chart` substrings inside one large
-        // comment don't re-trigger the (linear) scan per match.
-        if (skipRegionContaining(block, p_start)) |skip_end| {
-            i = skip_end;
-            continue;
-        }
+        // (The outer loop already eats comment/CDATA/PI regions
+        // before looking for `:chart`, so this candidate is
+        // guaranteed to be in normal-state markup.)
         const prefix = block[p_start..colon];
         // Verify the prefix is bound to a chart URI. Use the
         // declaration nearest to (but inside) the chart tag — the
@@ -1118,6 +1139,25 @@ fn isInsideOpeningTag(xml: []const u8, pos: usize) bool {
         if (c == '>') return pos < i;
     }
     return false;
+}
+
+/// Find the earliest skip-region opener (`<!--`, `<![CDATA[`, or
+/// `<?`) starting at or after `from` and strictly before `limit`.
+/// Returns the opener's start index or null if none. Used by the
+/// chart-element scanner to jump past skip regions inline.
+fn nextSkipOpenBefore(xml: []const u8, from: usize, limit: usize) ?usize {
+    const c1 = std.mem.indexOfPos(u8, xml, from, "<!--");
+    const c2 = std.mem.indexOfPos(u8, xml, from, "<![CDATA[");
+    const c3 = std.mem.indexOfPos(u8, xml, from, "<?");
+    var best: ?usize = null;
+    inline for (.{ c1, c2, c3 }) |maybe_p| {
+        if (maybe_p) |p| {
+            if (p < limit) {
+                best = if (best) |b| @min(b, p) else p;
+            }
+        }
+    }
+    return best;
 }
 
 /// If `pos` is inside an XML comment / CDATA / PI region, return
