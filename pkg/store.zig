@@ -911,6 +911,13 @@ fn scanCentralDirectory(arena: std.mem.Allocator, buf: []const u8) ![]ZipEntry {
         if (payload_offset +| compressed_us > buf.len) return Error.BadZip;
 
         const cdfh_total = 46 + @as(usize, filename_len) + @as(usize, extra_len) + @as(usize, comment_len);
+        // Reject when the CDFH's full tail (filename + extra +
+        // comment) would overrun cd_end. Without this, a malformed
+        // ZIP whose extra/comment lengths point past cd_end is
+        // accepted, and save() later copies src_buf[cdfh_offset ..
+        // cdfh_offset + cdfh_total_len] verbatim — pulling in EOCD
+        // / comment bytes as if they were CDFH data.
+        if (cur +| cdfh_total > cd_end) return Error.BadZip;
 
         try out.append(arena, .{
             .name = try arena.dupe(u8, name),
