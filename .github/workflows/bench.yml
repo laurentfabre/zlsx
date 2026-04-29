@@ -47,10 +47,21 @@ jobs:
           version: 0.15.2
 
       - name: Install hyperfine
+        # Pin to a release that supports `-N` / `--shell=none`. Ubuntu
+        # 22.04's apt repo ships hyperfine 1.12, which predates that
+        # flag (added in 1.13); scripts/bench_ci.sh uses it on the
+        # hyperfine command line, so the apt-installed binary fails
+        # with `error: Found argument '-N' which wasn't expected`.
+        # The upstream `.deb` is a couple-MB download from GitHub
+        # Releases — cheaper than `cargo install` and version-pinned.
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y hyperfine
+          HYPERFINE_VERSION=1.18.0
+          curl -fsSL \
+            "https://github.com/sharkdp/hyperfine/releases/download/v${HYPERFINE_VERSION}/hyperfine_${HYPERFINE_VERSION}_amd64.deb" \
+            -o /tmp/hyperfine.deb
+          sudo dpkg -i /tmp/hyperfine.deb
+          hyperfine --version
 
       - name: Fetch corpus (cache miss only)
         run: bash scripts/fetch_test_corpus.sh
