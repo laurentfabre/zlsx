@@ -202,7 +202,12 @@ fn collectFromSheet(
     // element so non-Microsoft producers (libreoffice, custom
     // tooling) don't silently surface zero anchors.
     const prefixes = resolveDrawingPrefixes(drawing_part.bytes);
-    var tags_buf: [512]u8 = undefined;
+    // 4 KiB tag-needle scratch covers prefixes up to ~250 chars
+    // per needle (12 needles × ~max-prefix-len ≈ 4 KiB total). XML
+    // namespace prefixes have no upper bound in the spec — Codex
+    // flagged the previous 512 B buffer as a hard-fail surface for
+    // valid-but-long custom prefixes.
+    var tags_buf: [4096]u8 = undefined;
     const tags = try DrawingTags.build(&tags_buf, prefixes);
 
     var i: usize = 0;
@@ -262,7 +267,12 @@ fn collectChartsFromSheet(
 
     const drawing_rels = store.rels(drawing_part_name);
     const prefixes = resolveDrawingPrefixes(drawing_part.bytes);
-    var tags_buf: [512]u8 = undefined;
+    // 4 KiB tag-needle scratch covers prefixes up to ~250 chars
+    // per needle (12 needles × ~max-prefix-len ≈ 4 KiB total). XML
+    // namespace prefixes have no upper bound in the spec — Codex
+    // flagged the previous 512 B buffer as a hard-fail surface for
+    // valid-but-long custom prefixes.
+    var tags_buf: [4096]u8 = undefined;
     const tags = try DrawingTags.build(&tags_buf, prefixes);
 
     var i: usize = 0;
