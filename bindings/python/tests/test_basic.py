@@ -1725,6 +1725,26 @@ def test_sheet_writer_freeze_panes_checked_propagates_errors(tmp_path):
             sheet.freeze_panes_checked(rows=0, cols=16_384)
 
 
+def test_book_cell_alignment_out_of_range_returns_none(tmp_path):
+    """Out-of-range style_idx returns None, including values that
+    would wrap through ctypes c_uint32."""
+    import zlsx._ffi as ffi
+    if not ffi._HAS_CELL_ALIGNMENT:
+        pytest.skip("loaded libzlsx predates cell_alignment ABI (post-0.3.0)")
+    out = str(tmp_path / "align_oor.xlsx")
+    with zlsx.Writer(out) as w:
+        w.add_sheet("S").write_row(["x"])
+
+    with zlsx.open(out) as book:
+        # Past the end of the cell-xfs table.
+        assert book.cell_alignment(99999) is None
+        # Negative.
+        assert book.cell_alignment(-1) is None
+        # Past UINT32_MAX (would wrap to 0 and return the default).
+        assert book.cell_alignment(2**32) is None
+        assert book.cell_alignment(2**40) is None
+
+
 def test_book_cell_alignment_round_trip(tmp_path):
     """A writer-emitted style with horizontal=center + wrap_text=True
     reads back through Book.cell_alignment."""

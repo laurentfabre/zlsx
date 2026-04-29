@@ -943,6 +943,12 @@ class Book:
                 "loaded libzlsx does not expose cell_alignment "
                 "(requires post-0.3.0 libzlsx); upgrade libzlsx"
             )
+        # Bound-check before ctypes narrows to c_uint32. A Python int
+        # outside [0, UINT32_MAX] would silently wrap and return
+        # metadata for the wrong style; mirror the C ABI's "out of
+        # range → None" contract.
+        if style_idx < 0 or style_idx > 0xFFFFFFFF:
+            return None
         ca = _ffi.CellAlignment()
         rc = _ffi.lib.zlsx_cell_alignment(self._handle, style_idx, ctypes.byref(ca))
         if rc != 0:
