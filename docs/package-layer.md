@@ -50,8 +50,13 @@ defer store.deinit();
 OOXML namespace handling:
 - Both Transitional URIs (`http://schemas.openxmlformats.org/...`) and Strict URIs (`http://purl.oclc.org/ooxml/...`) are accepted.
 - Non-canonical prefixes (`dr:` / `dml:` / `chrt:` etc.) are resolved from the document's xmlns declarations, with whitespace tolerance around `=` and prefix lengths up to 100 chars.
-- Mixed-conformance documents that declare both URIs are disambiguated by the root element's prefix; alternate-conformance prefixes are tracked and probed at lookup time.
-- Quoted attribute values can contain XML metacharacters (`x = 'fake'` inside a `descr=...` value) without confusing the attribute scanner.
+- Multiple prefixes bound to the same xdr URI are all tracked (capped at 8); the scanner replays per prefix so anchors using ANY bound prefix are surfaced. Same-URI alts win over unused other-conformance declarations.
+- xdr alt-prefix lookup walks the whole drawing (not just the first 4 KiB), so descendant-element xmlns declarations are reachable. The narrower 4 KiB scope is preserved for `a` / `c` lookups so a stray mid-document `xmlns:dml=...` can't shadow the canonical fallback.
+- Chart elements are located by tag (`<*:chart`) rather than by pre-formatted needle, with the prefix verified per match against an in-scope binding lookup. An in-scope local binding is authoritative — a `<c:chart xmlns:c="non-chart"/>` is rejected even when `c` matches the drawing-root primary.
+- XML namespace scoping is approximated via element-extent tracking: a binding on `<foo xmlns:p=".../>` ends at the matching `/>`, and a binding on `<foo xmlns:p="...">…</foo>` ends at the matching `</foo>` (with a depth counter for same-name nesting). Closed siblings don't leak their bindings into adjacent state.
+- Comments (`<!-- ... -->`), CDATA (`<![CDATA[ ... ]]>`), and processing instructions (`<?...?>`) are skipped throughout — `xmlns:` text inside them isn't treated as a real binding, fake `<*:chart>` markup inside them isn't picked up as a candidate, fake `</foo>` text inside a PI doesn't unbalance the extent depth counter, and the forward state machine handles delimiter-shaped content nested inside another section type (`<![CDATA[<!--]]>`) without false transitions.
+- Tag-end and xmlns scans are quote-aware: a literal `>` inside `descr="a > b"` doesn't end the tag prematurely, and an `xmlns:`-shaped substring inside a quoted attribute value is rejected as a real binding.
+- The chart-element scan is O(n) flat: skip regions are eaten inline so adversarial inputs with many fake `:chart` substrings inside many comment/CDATA/PI sections don't trigger quadratic re-scans.
 
 Caller-side lifetime contract for `chartAnchors`:
 - Outer slice + each anchor's `series_refs` slice are **caller-allocated** — free both.
@@ -122,15 +127,9 @@ with `in.xlsx` byte-for-byte; only `xl/workbook.xml` re-deflates.
 - **Linked images** (`r:link` instead of `r:embed`) — these point at
   external files and aren't carried in the package; the drawing
   walker silently skips them.
-- **Absolute-pixel anchors** (`<xdr:absoluteAnchor>`) — uncommon
-  enough that no corpus fixture exercises them today; tracker note
-  in the roadmap.
-- **Namespace-prefix tolerance** — the parser hard-codes `xdr:` and
-  `a:`. Every Microsoft Excel + LibreOffice + xlsxwriter +
-  openpyxl + python-calamine fixture in the repo's corpus uses
-  these prefixes, but OOXML producers can technically pick any
-  prefix. Workbooks with non-standard prefixes will silently
-  surface zero anchors.
+- **External-workbook chart series refs** (`[Book.xlsx]Sheet1!A1`
+  patterns inside `<c:f>`) — surfaced verbatim in `series_refs`;
+  no path-resolution or external-part fetching.
 - **Pivot tables** — detected, opaque-byte preserved, never
   materialised as a typed object.
 - **Per-part inferred metadata refresh** — `replacePart` /

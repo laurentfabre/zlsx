@@ -11,8 +11,13 @@ report-only bench CI).
 
 ## Status (as of 2026-04-29)
 
-Tier-A and the Tier-B keystone (B0) are shipped; C2a is shipped
-modulo two pending deferrals; addPart shipped.
+Tier-A and the Tier-B keystone (B0) are shipped. C2a is fully
+shipped (including absolute-pixel anchors and a namespace-aware
+drawing parser — multi-prefix bindings, full XML scope tracking
+for closed siblings, comment / CDATA / PI awareness, quote-aware
+attribute scanning, O(n) flat under adversarial input). addPart
+shipped on PartStore. C1 milestone 1 (formula tokenizer +
+loss-preserving printer) shipped.
 
 | Item | Status |
 |---|---|
@@ -29,7 +34,7 @@ modulo two pending deferrals; addPart shipped.
 | **B2** Editor rebase onto Workbook | ⏳ pending |
 | **B3** Writer rebase onto Workbook | ⏳ pending |
 | **B-fuzz** Coverage-guided fuzz nightly | ✅ shipped (reader + package layer fuzz binaries on ubuntu-22.04 nightly) |
-| **C2a** Object extraction (images / charts / opaque) | ✅ shipped: image + chart anchors + series refs + Strict OOXML content-type detection + XML-whitespace tolerance + non-canonical namespace-prefix tolerance (per-block + drawing-root prefix resolution, XML-attribute whitespace, scratch buffers sized for arbitrary prefix lengths) + `<xdr:absoluteAnchor>` pixel-coordinate parsing surfaced via the optional `absolute: ?AbsoluteAnchor` field on ImageAnchor / ChartAnchor |
+| **C2a** Object extraction (images / charts / opaque) | ✅ shipped: image + chart anchors + series refs + Strict OOXML content-type detection + `<xdr:absoluteAnchor>` pixel-coordinate parsing (`absolute: ?AbsoluteAnchor`). Namespace handling is comprehensive: multi-prefix tracking (xdr_alts list, same-URI preference, late-declared bindings via full-document scan), proper XML scope (closed self-closing AND container siblings don't leak bindings, depth counter for nesting), in-scope local-binding authority (root fallback only when no local), per-tag chart-element verification (no false matches from unused declarations), comment/CDATA/PI awareness everywhere (forward state machine, fake-markup filtering, quote-aware tag-end + attribute-value scanning, candidate filtering at source), O(n) flat under adversarial input. |
 | **C2b** addImage | ⏳ pending (depends on B1; addPart unblocks the part-injection half) |
 | **C1 M1** Formula tokenizer + loss-preserving printer | ✅ shipped (`src/formula/tokenizer.zig` — A1 refs incl. case-insensitive, sheet qualifiers, ranges, names, function-call disambiguation, number/string/bool/error literals, every operator, array constants, whitespace preserved, external-wb refs as `.unknown`) |
 | **C1 M2+** Formula rewriter (cells/DV/CF/names/hyperlinks) | ⏳ pending |
