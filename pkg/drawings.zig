@@ -906,10 +906,10 @@ fn collectAllNamespacePrefixes(
 /// consistent across helpers.
 fn uriOfPrefix(xml: []const u8, prefix: []const u8) ?[]const u8 {
     if (prefix.len == 0) return null;
-    // Same scope as findNamespacePrefixExcept: walk the whole
-    // document so locally declared bindings on descendant
-    // elements are reachable.
-    const limit = xml.len;
+    // Bounded scan: this is only used to look up the URI of the
+    // ROOT element's prefix, which by definition is declared on
+    // the root and therefore in the first 4 KiB.
+    const limit = @min(xml.len, 4096);
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, xml[0..limit], i, "xmlns:")) |start| {
         const after = start + "xmlns:".len;
@@ -953,13 +953,15 @@ fn findNamespacePrefixExcept(
     target_uri: []const u8,
     skip: []const u8,
 ) ?[]const u8 {
-    // Walk the whole document. XML 1.0 + Namespaces 1.0 allow
-    // xmlns:* declarations on any element, not only the root —
-    // a deep `<dr:twoCellAnchor xmlns:dr=...>` is valid OOXML.
-    // The earlier 4 KiB cap silently dropped anchors using
-    // late-declared prefixes. Adversarial-size defense lives at
-    // the package boundary (per-part 512 MiB cap in store.zig).
-    const limit = xml.len;
+    // Bounded to the first 4 KiB. Used for `a` and `c` prefix
+    // resolution where ROOT-only scoping is what we want — picking
+    // up a local mid-document declaration for these would shadow
+    // the canonical-fallback path and silently drop anchors that
+    // use the canonical prefix locally. xdr alt collection has
+    // its own `collectAllNamespacePrefixes` which scans the full
+    // document because anchor-tag prefixes are intentionally
+    // late-bindable.
+    const limit = @min(xml.len, 4096);
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, xml[0..limit], i, "xmlns:")) |start| {
         const after = start + "xmlns:".len;
@@ -1714,6 +1716,33 @@ test "resolveDrawingPrefixes maps canonical + custom prefixes" {
         try std.testing.expectEqual(@as(usize, 2), p.xdr_alts_len);
         try std.testing.expectEqualStrings("u", p.xdr_alts()[0]);
         try std.testing.expectEqualStrings("dr", p.xdr_alts()[1]);
+    }
+    // Scope-isolation regression: a/c prefixes resolve from the
+    // ROOT element only — picking up a late-declared dml prefix
+    // would shadow the canonical fallback, dropping anchors that
+    // use the canonical `<a:blip>` locally. Pad past 4 KiB before
+    // declaring xmlns:dml so the scan would have to walk the full
+    // document to find it; the cap on findNamespacePrefix keeps
+    // p.a anchored on the canonical default.
+    {
+        var pad_buf: [5000]u8 = undefined;
+        @memset(&pad_buf, ' ');
+        const head =
+            \\<?xml version="1.0"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing">
+        ;
+        const tail =
+            \\<other xmlns:dml="http://schemas.openxmlformats.org/drawingml/2006/main"/></xdr:wsDr>
+        ;
+        var doc_buf: [8192]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&doc_buf);
+        const w = fbs.writer();
+        try w.writeAll(head);
+        try w.writeAll(&pad_buf);
+        try w.writeAll(tail);
+        const doc = fbs.getWritten();
+        const p = resolveDrawingPrefixes(doc);
+        // Canonical fallback wins — late dml binding is invisible.
+        try std.testing.expectEqualStrings("a", p.a);
     }
 }
 
