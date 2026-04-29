@@ -1952,6 +1952,31 @@ fn fuzzLooksExternalTarget(_: void, input: []const u8) anyerror!void {
     _ = looksExternal(input);
 }
 
+fn fuzzParseRelationshipsTarget(_: void, input: []const u8) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    _ = parseRelationships(arena.allocator(), input) catch {};
+}
+
+test "fuzz: parseRelationships never crashes on adversarial XML" {
+    try std.testing.fuzz({}, fuzzParseRelationshipsTarget, .{
+        .corpus = &[_][]const u8{
+            "",
+            "<?xml version=\"1.0\"?><Relationships/>",
+            "<Relationships><Relationship Id='rId1' Type='img' Target='x.png'/></Relationships>",
+            "<Relationship Id=\"a\" Target=\"&amp;\"/>",
+            "<Relationship Id=\"a\" Target=\"&\"/>", // unclosed entity
+            "<Relationship Id=\"a\" Target=\"&#1114112;\"/>", // out-of-range numeric
+            "<Relationship Id=\"a\" Target=\"\"/>",
+            "<Relationship Id=\"a\" TargetMode=\"External\" Target=\"https://example.com\"/>",
+            "<Relationship", // truncated
+            "<Relationship>", // no attrs
+            "<<<<<<<<<<<<<<<<<<<<<<<<", // pathological
+            "<Relationship Id='\xC0\x80'/>", // overlong UTF-8
+        },
+    });
+}
+
 test "fuzz: looksExternal never crashes on adversarial input" {
     try std.testing.fuzz({}, fuzzLooksExternalTarget, .{
         .corpus = &[_][]const u8{
