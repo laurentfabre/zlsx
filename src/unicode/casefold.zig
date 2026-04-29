@@ -102,20 +102,11 @@ pub fn excelSheetNameEql(a: []const u8, b: []const u8) bool {
 
 /// Count Unicode scalar values in a UTF-8 string. Used to enforce
 /// Excel's 31-character (NOT 31-byte) sheet-name limit.
-/// `error.InvalidUtf8` on malformed input.
+/// `error.InvalidUtf8` on malformed input. Delegates to std.unicode
+/// — the previous hand-rolled walker did the same byte-sequence-len
+/// + decode validation but with 12 lines of code.
 pub fn excelSheetNameLength(name: []const u8) !usize {
-    var i: usize = 0;
-    var count: usize = 0;
-    while (i < name.len) {
-        const seq_len = std.unicode.utf8ByteSequenceLength(name[i]) catch
-            return error.InvalidUtf8;
-        if (i + seq_len > name.len) return error.InvalidUtf8;
-        _ = std.unicode.utf8Decode(name[i .. i + seq_len]) catch
-            return error.InvalidUtf8;
-        i += seq_len;
-        count += 1;
-    }
-    return count;
+    return std.unicode.utf8CountCodepoints(name) catch error.InvalidUtf8;
 }
 
 // ─── ASCII fast path ──────────────────────────────────────────────────
