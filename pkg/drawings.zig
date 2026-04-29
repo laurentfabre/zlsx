@@ -473,15 +473,34 @@ fn findNamespacePrefix(xml: []const u8, target_uri: []const u8) ?[]const u8 {
     while (std.mem.indexOfPos(u8, xml[0..limit], i, "xmlns:")) |start| {
         const after = start + "xmlns:".len;
         if (after >= limit) return null;
-        const eq = std.mem.indexOfScalarPos(u8, xml[0..limit], after, '=') orelse return null;
-        const name = xml[after..eq];
-        if (eq + 1 >= limit) return null;
-        const quote = xml[eq + 1];
-        if (quote != '"' and quote != '\'') {
-            i = eq + 1;
+        // Walk forward to the first XML whitespace OR `=` to pin
+        // the prefix end. XML 1.0 allows arbitrary whitespace
+        // around the `=` between attribute name and value, so
+        // `xmlns:dr = "uri"` must be tolerated.
+        var name_end = after;
+        while (name_end < limit) : (name_end += 1) {
+            const c = xml[name_end];
+            if (c == '=' or c == ' ' or c == '\t' or c == '\n' or c == '\r') break;
+        }
+        if (name_end >= limit) return null;
+        const name = xml[after..name_end];
+        // Skip whitespace before `=`, then expect `=`.
+        var p = name_end;
+        while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
+        if (p >= limit or xml[p] != '=') {
+            i = after;
             continue;
         }
-        const val_start = eq + 2;
+        p += 1;
+        // Skip whitespace after `=`, then expect a quote.
+        while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
+        if (p >= limit) return null;
+        const quote = xml[p];
+        if (quote != '"' and quote != '\'') {
+            i = p;
+            continue;
+        }
+        const val_start = p + 1;
         const val_end = std.mem.indexOfScalarPos(u8, xml[0..limit], val_start, quote) orelse return null;
         if (std.mem.eql(u8, xml[val_start..val_end], target_uri)) return name;
         i = val_end + 1;
@@ -967,6 +986,21 @@ test "resolveDrawingPrefixes maps canonical + custom prefixes" {
         try std.testing.expectEqualStrings("xdr", p.xdr);
         try std.testing.expectEqualStrings("a", p.a);
         try std.testing.expectEqualStrings("c", p.c);
+    }
+    // Whitespace around `=` is valid XML — must be tolerated.
+    {
+        const xml =
+            \\<wsDr xmlns:dr = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>
+        ;
+        const p = resolveDrawingPrefixes(xml);
+        try std.testing.expectEqualStrings("dr", p.xdr);
+    }
+    // Newlines + tabs around `=` (some pretty-printers).
+    {
+        const xml =
+            "<wsDr xmlns:dr\n\t=\n\t\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\"/>";
+        const p = resolveDrawingPrefixes(xml);
+        try std.testing.expectEqualStrings("dr", p.xdr);
     }
 }
 
