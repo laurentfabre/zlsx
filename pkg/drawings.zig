@@ -982,8 +982,10 @@ fn elementExtentEnd(xml: []const u8, inside_pos: usize) ?usize {
     }
     if (name_end == lt + 1) return null;
     const elem_name = xml[lt + 1 .. name_end];
-    // Find the opening tag's `>`.
-    const tag_end = std.mem.indexOfScalarPos(u8, xml, name_end, '>') orelse return null;
+    // Find the opening tag's `>`, skipping over quoted attribute
+    // values so a literal `>` inside `descr="a > b"` doesn't end
+    // the tag prematurely.
+    const tag_end = findUnquotedTagEnd(xml, name_end) orelse return null;
     // Self-closing: extent ends at tag_end.
     if (tag_end > 0 and xml[tag_end - 1] == '/') return tag_end;
     // Otherwise walk forward looking for the matching `</NAME>`,
@@ -1004,12 +1006,12 @@ fn elementExtentEnd(xml: []const u8, inside_pos: usize) ?usize {
             if (is_close) {
                 depth -= 1;
                 if (depth == 0) {
-                    return std.mem.indexOfScalarPos(u8, xml, candidate_name_start, '>') orelse xml.len - 1;
+                    return findUnquotedTagEnd(xml, candidate_name_start) orelse xml.len - 1;
                 }
             } else {
                 // Open tag; check if it's self-closing (no depth
                 // bump) or container (bump).
-                const open_end = std.mem.indexOfScalarPos(u8, xml, candidate_name_start, '>') orelse return xml.len - 1;
+                const open_end = findUnquotedTagEnd(xml, candidate_name_start) orelse return xml.len - 1;
                 if (!(open_end > 0 and xml[open_end - 1] == '/')) {
                     depth += 1;
                 }
@@ -1025,6 +1027,24 @@ fn elementExtentEnd(xml: []const u8, inside_pos: usize) ?usize {
 
 inline fn isNameTerminator(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '>' or c == '/';
+}
+
+/// Walk `xml` from `start` looking for the `>` that ends a tag,
+/// skipping over `"..."` and `'...'` quoted attribute regions so a
+/// literal `>` inside a quoted value doesn't end the scan early.
+/// Returns the `>` position or null on EOF.
+fn findUnquotedTagEnd(xml: []const u8, start: usize) ?usize {
+    var i = start;
+    while (i < xml.len) : (i += 1) {
+        const c = xml[i];
+        if (c == '"' or c == '\'') {
+            const close = std.mem.indexOfScalarPos(u8, xml, i + 1, c) orelse return null;
+            i = close;
+            continue;
+        }
+        if (c == '>') return i;
+    }
+    return null;
 }
 
 /// Same as `uriOfPrefix` but scans the FULL block instead of
@@ -1855,6 +1875,25 @@ test "findLocalChartElement: chart-element self-redeclare wins over earlier non-
     const found = findLocalChartElement(block, gf_idx, prefixes);
     try std.testing.expect(found != null);
     try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<p:chart"));
+}
+
+test "findLocalChartElement: quoted `>` in attribute doesn't fool tag-end scan" {
+    // A self-closing earlier sibling with an attribute that
+    // contains a literal `>` inside its quoted value. The tag-end
+    // scanner must skip over quoted regions so the `/>` is found
+    // at the actual end of the tag, not at the in-attribute `>`.
+    // Without quote-awareness, the sibling looks non-self-closing,
+    // its xmlns:c stays "in scope", and `<c:chart>` is dropped.
+    const block =
+        "<xdr:graphicFrame>" ++
+        "<other descr=\"a > b\" xmlns:c=\"http://example.com/closed-sibling\"/>" ++
+        "<c:chart r:id=\"rId1\"/>" ++
+        "</xdr:graphicFrame>";
+    const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame").?;
+    const prefixes: DrawingPrefixes = .{};
+    const found = findLocalChartElement(block, gf_idx, prefixes);
+    try std.testing.expect(found != null);
+    try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<c:chart"));
 }
 
 test "findLocalChartElement: container sibling's redeclare doesn't shadow after close" {
