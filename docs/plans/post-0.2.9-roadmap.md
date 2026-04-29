@@ -9,10 +9,10 @@ pulled forward of formula work, chart emit demoted to Tier D,
 walk-away gates tightened (grammar-class instead of corpus-percentage,
 report-only bench CI).
 
-## Status (as of 2026-04-28)
+## Status (as of 2026-04-29)
 
-Tier-A and the Tier-B keystone (B0) are shipped; C2a is partially
-landed via the public `zlsx_pkg` module.
+Tier-A and the Tier-B keystone (B0) are shipped; C2a is shipped
+modulo two pending deferrals; addPart shipped.
 
 | Item | Status |
 |---|---|
@@ -22,13 +22,15 @@ landed via the public `zlsx_pkg` module.
 | **B0 M1** PartStore read-side | ✅ shipped |
 | **B0 M2** PartStore byte-preserving save + replacePart | ✅ shipped (incl. data-descriptor preservation) |
 | **B0 M2.5** replacePart deflate-encoded overrides | ✅ shipped |
+| **B0 addPart** Append a new part with content-type registration | ✅ shipped (atomic on allocation failure, XML-escapes attribute values, stays sentinel-safe) |
 | **B0 M3** Typed overlays for known parts | ⏳ pending — likely consolidated into B1 |
+| **B0 hardening** ZIP32 sentinel safety, eager CRC32, CDFH bounds, ZIP-bomb caps, split-archive rejection, XML-entity round-trip in [Content_Types] + .rels (named + numeric), external-rel filter | ✅ shipped |
 | **B1** Workbook typed overlay | ⏳ pending (~6–10 weeks) |
 | **B2** Editor rebase onto Workbook | ⏳ pending |
 | **B3** Writer rebase onto Workbook | ⏳ pending |
-| **B-fuzz** Coverage-guided fuzz nightly | ✅ shipped (Zig targets + ubuntu-22.04 nightly workflow) |
-| **C2a** Object extraction (images / charts / opaque) | 🟡 image + chart anchors + series refs shipped; namespace-prefix tolerance + absolute-pixel anchors pending |
-| **C2b** addImage | ⏳ pending (depends on B1) |
+| **B-fuzz** Coverage-guided fuzz nightly | ✅ shipped (reader + package layer fuzz binaries on ubuntu-22.04 nightly) |
+| **C2a** Object extraction (images / charts / opaque) | 🟡 image + chart anchors + series refs shipped; Strict OOXML content-type detection + XML-whitespace tolerance shipped; namespace-prefix tolerance + absolute-pixel anchors pending |
+| **C2b** addImage | ⏳ pending (depends on B1; addPart unblocks the part-injection half) |
 | **C1** Formula tokenizer + rewriter | ⏳ pending (single biggest remaining user-value item) |
 | **D1** Formula evaluator | deferred indefinitely |
 | **D2** Typed chart emit | deferred |
