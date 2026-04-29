@@ -83,7 +83,8 @@ const WORKBOOK_HEAD: []const u8 =
     \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
     \\<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>
 ;
-const WORKBOOK_TAIL: []const u8 = "</sheets></workbook>";
+const WORKBOOK_SHEETS_CLOSE: []const u8 = "</sheets>";
+const WORKBOOK_END: []const u8 = "</workbook>";
 
 const WORKBOOK_RELS_HEAD: []const u8 =
     \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -362,6 +363,31 @@ fn hasBorder(s: Style) bool {
         s.diagonal_up or s.diagonal_down;
 }
 
+/// A workbook-level defined name (named range, print area,
+/// validation source, etc.). Emitted in xl/workbook.xml as
+/// `<definedName name="..." [localSheetId="N"] [hidden="1"]>...</definedName>`.
+pub const DefinedName = struct {
+    /// Owned by the writer (heap-duped on add).
+    name: []u8,
+    /// Owned by the writer. Formula text — typically a sheet-
+    /// qualified range like `Sheet1!$A$1:$A$10` or a constant
+    /// like `42`. Not validated here; caller is responsible for
+    /// emitting a valid Excel expression.
+    refers_to: []u8,
+    /// null → workbook-scope; otherwise the 0-based sheet index
+    /// (must be < self.sheets.items.len at save() time).
+    local_sheet_id: ?u32 = null,
+    /// Hidden names don't appear in Excel's Name Manager UI but
+    /// still resolve in formulas (used for print areas under the
+    /// `_xlnm.Print_Area` convention).
+    hidden: bool = false,
+};
+
+pub const DefinedNameOptions = struct {
+    local_sheet_id: ?u32 = null,
+    hidden: bool = false,
+};
+
 pub const Writer = struct {
     allocator: Allocator,
     // Accumulated sheet writers (owned).
@@ -392,6 +418,11 @@ pub const Writer = struct {
     // built-ins). All values are unique.
     num_fmts: std.ArrayListUnmanaged([]u8) = .{},
     num_fmt_index: std.StringHashMapUnmanaged(u32) = .{},
+    // Workbook-level defined names — emitted as `<definedNames>` in
+    // xl/workbook.xml between `</sheets>` and `</workbook>`. Both
+    // workbook-scoped (no localSheetId) and sheet-scoped names are
+    // supported via the optional `local_sheet_id`.
+    defined_names: std.ArrayListUnmanaged(DefinedName) = .{},
 
     pub fn init(allocator: Allocator) Writer {
         return .{ .allocator = allocator };
@@ -420,6 +451,11 @@ pub const Writer = struct {
         for (self.num_fmts.items) |n| self.allocator.free(n);
         self.num_fmts.deinit(self.allocator);
         self.num_fmt_index.deinit(self.allocator);
+        for (self.defined_names.items) |dn| {
+            self.allocator.free(dn.name);
+            self.allocator.free(dn.refers_to);
+        }
+        self.defined_names.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -523,6 +559,41 @@ pub const Writer = struct {
         sw.* = try SheetWriter.init(self, name);
         try self.sheets.append(self.allocator, sw);
         return sw;
+    }
+
+    /// Register a workbook-level defined name. The name + refers_to
+    /// strings are duped into the writer's heap; the caller can free
+    /// or reuse their buffers immediately. Validates the name shape
+    /// against Excel's rules (starts with letter / `_` / `\`,
+    /// contains only `[A-Za-z0-9_.\\?]`, max 255 bytes, not the
+    /// shape of an A1 cell ref); refers_to is not parsed beyond a
+    /// non-empty check — the formula tokenizer at
+    /// `src/formula/tokenizer.zig` is the canonical surface for
+    /// callers wanting structural validation.
+    ///
+    /// `opts.local_sheet_id` (0-based) makes the name sheet-scoped
+    /// — caller must ensure the index resolves at save() time.
+    /// `opts.hidden = true` is the convention for `_xlnm.Print_Area`
+    /// and similar built-in-shaped names that shouldn't surface in
+    /// Excel's Name Manager UI.
+    pub fn addDefinedName(
+        self: *Writer,
+        name: []const u8,
+        refers_to: []const u8,
+        opts: DefinedNameOptions,
+    ) !void {
+        try validateDefinedName(name);
+        if (refers_to.len == 0) return error.InvalidDefinedNameRefersTo;
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+        const refers_copy = try self.allocator.dupe(u8, refers_to);
+        errdefer self.allocator.free(refers_copy);
+        try self.defined_names.append(self.allocator, .{
+            .name = name_copy,
+            .refers_to = refers_copy,
+            .local_sheet_id = opts.local_sheet_id,
+            .hidden = opts.hidden,
+        });
     }
 
     /// Return the 0-based SST index for `s`. Dedups; copies the string
@@ -663,7 +734,31 @@ pub const Writer = struct {
                 try appendXmlEscaped(alloc, &wb, sw.name);
                 try wb.print(alloc, "\" sheetId=\"{d}\" r:id=\"rId{d}\"/>", .{ i + 1, i + 1 });
             }
-            try wb.appendSlice(alloc, WORKBOOK_TAIL);
+            try wb.appendSlice(alloc, WORKBOOK_SHEETS_CLOSE);
+            // <definedNames> sits between </sheets> and </workbook>
+            // per the OOXML schema. Emit only if non-empty so the
+            // pre-API byte output stays unchanged for workbooks that
+            // don't register any names.
+            if (self.defined_names.items.len > 0) {
+                try wb.appendSlice(alloc, "<definedNames>");
+                for (self.defined_names.items) |dn| {
+                    if (dn.local_sheet_id) |sid| {
+                        if (sid >= self.sheets.items.len) return error.InvalidDefinedNameLocalSheetId;
+                    }
+                    try wb.appendSlice(alloc, "<definedName name=\"");
+                    try appendXmlEscaped(alloc, &wb, dn.name);
+                    try wb.appendSlice(alloc, "\"");
+                    if (dn.local_sheet_id) |sid| {
+                        try wb.print(alloc, " localSheetId=\"{d}\"", .{sid});
+                    }
+                    if (dn.hidden) try wb.appendSlice(alloc, " hidden=\"1\"");
+                    try wb.appendSlice(alloc, ">");
+                    try appendXmlEscaped(alloc, &wb, dn.refers_to);
+                    try wb.appendSlice(alloc, "</definedName>");
+                }
+                try wb.appendSlice(alloc, "</definedNames>");
+            }
+            try wb.appendSlice(alloc, WORKBOOK_END);
             try zw.addEntry("xl/workbook.xml", wb.items);
         }
 
@@ -2089,6 +2184,72 @@ pub fn validateSheetName(name: []const u8) !void {
     // Use Unicode-aware comparison so e.g. "history" / "HISTORY" /
     // "HiStOrY" are all rejected; non-ASCII inputs fall through.
     if (casefold.excelSheetNameEql(name, "History")) return error.InvalidSheetName;
+}
+
+/// Excel defined-name rules (paraphrased from MS docs):
+/// - 1..255 bytes
+/// - First char: letter, `_`, or `\`
+/// - Rest: letters, digits, `_`, `.`, `\`, `?`
+/// - Must NOT exactly match an A1 cell reference shape (column
+///   [A, XFD] + row [1, 1048576] in any case combination)
+/// - Must NOT be the single letter `R` or `C` (case-insensitive)
+///   — Excel reserves these for R1C1 row/column references
+/// We don't enforce the "not equal to a built-in name" rule
+/// because the `_xlnm.Print_Area` family is intentionally usable.
+fn validateDefinedName(name: []const u8) !void {
+    if (name.len == 0 or name.len > 255) return error.InvalidDefinedName;
+    const first = name[0];
+    if (!isAsciiLetter(first) and first != '_' and first != '\\') return error.InvalidDefinedName;
+    for (name[1..]) |c| {
+        if (!isAsciiLetter(c) and !isAsciiDigit(c) and
+            c != '_' and c != '.' and c != '\\' and c != '?')
+        {
+            return error.InvalidDefinedName;
+        }
+    }
+    if (name.len == 1 and (first == 'R' or first == 'r' or first == 'C' or first == 'c')) {
+        return error.InvalidDefinedName;
+    }
+    if (looksLikeCellRef(name)) return error.InvalidDefinedName;
+}
+
+inline fn isAsciiLetter(c: u8) bool {
+    return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z');
+}
+
+inline fn isAsciiDigit(c: u8) bool {
+    return c >= '0' and c <= '9';
+}
+
+/// True if `s` matches the A1 cell-ref shape (case-insensitive
+/// column letters in [A, XFD], row in [1, 1048576]). Used by the
+/// defined-name validator to reject names that would be parsed as
+/// cell refs.
+fn looksLikeCellRef(s: []const u8) bool {
+    if (s.len < 2 or s.len > 10) return false;
+    var i: usize = 0;
+    var col_v: u32 = 0;
+    var col_n: usize = 0;
+    while (i < s.len and isAsciiLetter(s[i])) : (i += 1) {
+        // Bail at the first letter past the 3-char cap — names
+        // longer than that aren't cell-ref shaped, and continuing
+        // the multiply-by-26 would overflow `col_v`.
+        col_n += 1;
+        if (col_n > 3) return false;
+        const upper: u8 = if (s[i] >= 'a' and s[i] <= 'z') s[i] - ('a' - 'A') else s[i];
+        const offset_one_based: u32 = @as(u32, upper) - @as(u32, 'A') + 1;
+        col_v = col_v * 26 + offset_one_based;
+    }
+    if (col_n == 0 or col_n > 3 or col_v == 0 or col_v > 16384) return false;
+    var row_v: u64 = 0;
+    var row_n: usize = 0;
+    while (i < s.len and isAsciiDigit(s[i])) : (i += 1) {
+        row_v = row_v * 10 + @as(u64, s[i] - '0');
+        if (row_v > 1_048_576) return false;
+        row_n += 1;
+    }
+    if (row_n == 0) return false;
+    return i == s.len and row_v >= 1;
 }
 
 fn validateAutoFilterRange(range: []const u8) !void {
@@ -6058,3 +6219,62 @@ test "fuzz ZipWriter: adversarial entry names" {
 // that target here tripped a panic when the testing allocator
 // caught a cleanup bug in the reader's partial-parse path — tracked
 // separately, not part of Phase 3b.
+
+test "validateDefinedName: accepts valid names" {
+    try validateDefinedName("MyName");
+    try validateDefinedName("_private");
+    try validateDefinedName("foo.bar.baz");
+    try validateDefinedName("\\Backslashed");
+    try validateDefinedName("a1_b2");
+    try validateDefinedName("_xlnm.Print_Area");
+}
+
+test "validateDefinedName: rejects invalid names" {
+    try std.testing.expectError(error.InvalidDefinedName, validateDefinedName(""));
+    // Starts with a digit.
+    try std.testing.expectError(error.InvalidDefinedName, validateDefinedName("1Name"));
+    // A1-shaped (case-insensitive grid match).
+    try std.testing.expectError(error.InvalidDefinedName, validateDefinedName("A1"));
+    try std.testing.expectError(error.InvalidDefinedName, validateDefinedName("a1"));
+    try std.testing.expectError(error.InvalidDefinedName, validateDefinedName("XFD1048576"));
+    // Single R / C reserved for R1C1.
+    try std.testing.expectError(error.InvalidDefinedName, validateDefinedName("R"));
+    try std.testing.expectError(error.InvalidDefinedName, validateDefinedName("c"));
+    // Disallowed character (`!` not in the allowed set).
+    try std.testing.expectError(error.InvalidDefinedName, validateDefinedName("Bad!Name"));
+    // 256-byte name fails the 255 cap.
+    var too_long: [256]u8 = undefined;
+    @memset(&too_long, 'X');
+    try std.testing.expectError(error.InvalidDefinedName, validateDefinedName(&too_long));
+}
+
+test "Writer.addDefinedName: stores name + refers_to with options" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    try w.addDefinedName("MyRange", "Sheet1!$A$1:$B$1", .{});
+    try w.addDefinedName(
+        "_xlnm.Print_Area",
+        "Sheet1!$A$1:$B$1",
+        .{ .local_sheet_id = 0, .hidden = true },
+    );
+    try std.testing.expectEqual(@as(usize, 2), w.defined_names.items.len);
+    try std.testing.expectEqualStrings("MyRange", w.defined_names.items[0].name);
+    try std.testing.expectEqualStrings("Sheet1!$A$1:$B$1", w.defined_names.items[0].refers_to);
+    try std.testing.expectEqual(@as(?u32, null), w.defined_names.items[0].local_sheet_id);
+    try std.testing.expectEqual(false, w.defined_names.items[0].hidden);
+    try std.testing.expectEqual(@as(?u32, 0), w.defined_names.items[1].local_sheet_id);
+    try std.testing.expectEqual(true, w.defined_names.items[1].hidden);
+}
+
+test "Writer.addDefinedName: rejects invalid name + empty refers_to" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    try std.testing.expectError(
+        error.InvalidDefinedName,
+        w.addDefinedName("A1", "Sheet1!$A$1", .{}),
+    );
+    try std.testing.expectError(
+        error.InvalidDefinedNameRefersTo,
+        w.addDefinedName("Foo", "", .{}),
+    );
+}
