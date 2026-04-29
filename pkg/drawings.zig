@@ -393,8 +393,12 @@ fn scanChartsWithTags(
         // by the chart element, so picking the first match anywhere
         // in the block could miss valid root-scoped charts.
         var block_chart_buf: [128]u8 = undefined;
-        const block_chart_prefix_t = findNamespacePrefix(block, ns_c_transitional);
-        const block_chart_prefix_s = findNamespacePrefix(block, ns_c_strict);
+        // Block-level: scan the full block, not capped at 4 KiB.
+        // The drawing-root scan is bounded; per-anchor blocks need
+        // unbounded scope so locally declared chart-namespace
+        // bindings past 4 KiB into the block are still reachable.
+        const block_chart_prefix_t = findLocalNamespacePrefix(block, ns_c_transitional);
+        const block_chart_prefix_s = findLocalNamespacePrefix(block, ns_c_strict);
         const root_open_chart = tags.open_chart;
         const chart_idx = blk: {
             // Try every plausible prefix for the chart namespace —
@@ -836,6 +840,50 @@ const max_prefix_len: usize = 100;
 
 fn findNamespacePrefix(xml: []const u8, target_uri: []const u8) ?[]const u8 {
     return findNamespacePrefixExcept(xml, target_uri, "");
+}
+
+/// Same as `findNamespacePrefix` but scans the FULL `xml` input
+/// instead of capping at 4 KiB. Use this when the input is a
+/// per-anchor block whose interior declarations should be reachable
+/// even if they're past 4 KiB into the block. Avoid for whole-
+/// document root-prefix resolution — that path's bounded form
+/// guards against late mid-document declarations shadowing the
+/// canonical fallback.
+fn findLocalNamespacePrefix(xml: []const u8, target_uri: []const u8) ?[]const u8 {
+    const limit = xml.len;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml[0..limit], i, "xmlns:")) |start| {
+        const after = start + "xmlns:".len;
+        if (after >= limit) return null;
+        var name_end = after;
+        while (name_end < limit) : (name_end += 1) {
+            const c = xml[name_end];
+            if (c == '=' or c == ' ' or c == '\t' or c == '\n' or c == '\r') break;
+        }
+        if (name_end >= limit) return null;
+        const name = xml[after..name_end];
+        var p = name_end;
+        while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
+        if (p >= limit or xml[p] != '=') {
+            i = after;
+            continue;
+        }
+        p += 1;
+        while (p < limit and (xml[p] == ' ' or xml[p] == '\t' or xml[p] == '\n' or xml[p] == '\r')) p += 1;
+        if (p >= limit) return null;
+        const quote = xml[p];
+        if (quote != '"' and quote != '\'') {
+            i = p;
+            continue;
+        }
+        const val_start = p + 1;
+        const val_end = std.mem.indexOfScalarPos(u8, xml[0..limit], val_start, quote) orelse return null;
+        if (std.mem.eql(u8, xml[val_start..val_end], target_uri) and name.len <= max_prefix_len) {
+            return name;
+        }
+        i = val_end + 1;
+    }
+    return null;
 }
 
 /// Append every prefix bound to `target_uri` (other than `skip`
@@ -1541,6 +1589,37 @@ test "parseAbsoluteAnchor unit test" {
         @as(?AbsoluteAnchor, null),
         parseAbsoluteAnchor("<xdr:absoluteAnchor></xdr:absoluteAnchor>", "<xdr:pos", "<xdr:ext"),
     );
+}
+
+test "findLocalNamespacePrefix walks past 4 KiB inside a block" {
+    // collectChartsFromSheet uses findLocalNamespacePrefix to probe
+    // for a chart-namespace prefix declared LOCALLY on `<*:chart>`.
+    // If the anchor block is large enough that the local xmlns:c
+    // sits past 4 KiB, the bounded findNamespacePrefix would miss
+    // it; the local helper must walk the whole block.
+    var pad_buf: [5000]u8 = undefined;
+    @memset(&pad_buf, ' ');
+    const head = "<chart-prefix-late>";
+    const tail =
+        \\<c2:chart xmlns:c2="http://schemas.openxmlformats.org/drawingml/2006/chart"/></chart-prefix-late>
+    ;
+    var doc_buf: [8192]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&doc_buf);
+    const w = fbs.writer();
+    try w.writeAll(head);
+    try w.writeAll(&pad_buf);
+    try w.writeAll(tail);
+    const block = fbs.getWritten();
+
+    // Bounded helper: misses the late binding (cap at 4 KiB).
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        findNamespacePrefix(block, "http://schemas.openxmlformats.org/drawingml/2006/chart"),
+    );
+    // Unbounded local helper: still finds it.
+    const found = findLocalNamespacePrefix(block, "http://schemas.openxmlformats.org/drawingml/2006/chart");
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("c2", found.?);
 }
 
 test "resolveDrawingPrefixes maps canonical + custom prefixes" {
