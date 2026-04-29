@@ -4096,6 +4096,13 @@ test "zlsx_sheet_writer_set_row_height + freeze_panes_checked propagate errors" 
     @memset(&err_buf, 0);
     try std.testing.expectEqual(@as(i32, -1), zlsx_sheet_writer_set_row_height(sw, 0, 0.0, &err_buf, err_buf.len));
     try std.testing.expect(std.mem.indexOf(u8, &err_buf, "InvalidRowHeight") != null);
+    // Above Excel's 409.5 cap.
+    @memset(&err_buf, 0);
+    try std.testing.expectEqual(@as(i32, -1), zlsx_sheet_writer_set_row_height(sw, 0, 410.0, &err_buf, err_buf.len));
+    try std.testing.expect(std.mem.indexOf(u8, &err_buf, "InvalidRowHeight") != null);
+    // At the cap (boundary).
+    @memset(&err_buf, 0);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_set_row_height(sw, 1, 409.5, &err_buf, err_buf.len));
 
     // freeze_panes_checked: valid.
     @memset(&err_buf, 0);

@@ -1520,7 +1520,12 @@ pub const SheetWriter = struct {
     /// rewrite). Later calls on the same row_idx override earlier
     /// ones as long as the row hasn't been written yet.
     pub fn setRowHeight(self: *SheetWriter, row_idx: u32, height: f32) !void {
-        if (!std.math.isFinite(height) or height <= 0) return error.InvalidRowHeight;
+        // Excel rejects rows above 409.5 points (the UI cap). Heights
+        // outside the (0, 409.5] range produce a workbook the consumer
+        // repairs on open, so reject up-front with InvalidRowHeight.
+        if (!std.math.isFinite(height) or height <= 0 or height > 409.5) {
+            return error.InvalidRowHeight;
+        }
         if (row_idx >= EXCEL_MAX_ROW) return error.RowOutOfRange;
         try self.row_heights.put(self.parent.allocator, row_idx, height);
     }

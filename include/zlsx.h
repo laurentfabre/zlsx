@@ -635,6 +635,28 @@ int32_t zlsx_cell_border(zlsx_book_t *          book,
                          uint32_t               style_idx,
                          zlsx_cell_border_t *   out);
 
+/*
+ * Cell alignment record. `horizontal_len == 0` means the alignment
+ * is the OOXML default ("general", which the emitter omits).
+ * `wrap_text == 1` when `wrapText="1"` was set on the <alignment>
+ * child of the cell's <xf>. Pointer borrows from styles.xml; valid
+ * for the lifetime of the Book.
+ */
+typedef struct {
+    size_t          horizontal_len;
+    const uint8_t * horizontal_ptr;
+    uint8_t         wrap_text;
+    uint8_t         _pad[7];
+} zlsx_cell_alignment_t;
+
+/* Resolve a style index to its alignment + wrap_text record.
+ * Returns 0 on success, -1 on out-of-range index. Cells without a
+ * nested <alignment> child surface as horizontal_len = 0,
+ * wrap_text = 0. */
+int32_t zlsx_cell_alignment(zlsx_book_t *           book,
+                            uint32_t                style_idx,
+                            zlsx_cell_alignment_t * out);
+
 /* ─── Writer (ABI v1, added in 0.2.2) ─────────────────────────────── */
 
 /*
@@ -759,6 +781,24 @@ int32_t zlsx_writer_save(
     zlsx_writer_t * writer,
     const uint8_t * path_ptr,
     size_t          path_len,
+    uint8_t       * err_buf,
+    size_t          err_buf_len);
+
+/* Register a workbook-level (or sheet-scoped) defined name.
+ * `local_sheet_id_neg` < 0 means workbook-scope; >= 0 means
+ * 0-based sheet index (must resolve at save() time).
+ * `hidden_flag != 0` emits hidden="1". Returns 0 on success, -1
+ * with err in {InvalidDefinedName, InvalidDefinedNameRefersTo,
+ * DuplicateDefinedName, InvalidDefinedNameLocalSheetId,
+ * OutOfMemory}. */
+int32_t zlsx_writer_add_defined_name(
+    zlsx_writer_t * writer,
+    const uint8_t * name_ptr,
+    size_t          name_len,
+    const uint8_t * refers_to_ptr,
+    size_t          refers_to_len,
+    int32_t         local_sheet_id_neg,
+    uint8_t         hidden_flag,
     uint8_t       * err_buf,
     size_t          err_buf_len);
 
@@ -893,13 +933,35 @@ int32_t zlsx_sheet_writer_set_column_width(
     uint8_t             * err_buf,
     size_t                err_buf_len);
 
+/* Set the height of row `row_idx` (0-based) in points. Excel
+ * accepts heights in (0, 409.5]. Returns 0 on success or -1 with
+ * err="InvalidRowHeight" / "RowOutOfRange". */
+int32_t zlsx_sheet_writer_set_row_height(
+    zlsx_sheet_writer_t * sw,
+    uint32_t              row_idx,
+    float                 height,
+    uint8_t             * err_buf,
+    size_t                err_buf_len);
+
 /* Freeze the top `rows` rows and left `cols` columns on the sheet.
  * Pass 0 on an axis to leave it unfrozen. Overrides any previous
- * freeze on this sheet. Never fails. */
+ * freeze on this sheet. Never fails — out-of-range counts are
+ * clamped silently. Legacy entry point; new callers should prefer
+ * zlsx_sheet_writer_freeze_panes_checked for typed errors. */
 void zlsx_sheet_writer_freeze_panes(
     zlsx_sheet_writer_t * sw,
     uint32_t              rows,
     uint32_t              cols);
+
+/* Checked freeze-panes: returns -1 with err="RowOutOfRange" /
+ * "ColumnOutOfRange" instead of clamping. Newer FFI consumers
+ * should prefer this over the legacy clamping form. */
+int32_t zlsx_sheet_writer_freeze_panes_checked(
+    zlsx_sheet_writer_t * sw,
+    uint32_t              rows,
+    uint32_t              cols,
+    uint8_t             * err_buf,
+    size_t                err_buf_len);
 
 /* Apply an auto-filter over an A1-style range (e.g. "A1:E1"). The
  * writer dupes the range string immediately. Returns 0 on success or
