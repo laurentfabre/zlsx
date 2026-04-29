@@ -7,7 +7,7 @@ Status as of 2026-04-30. Single-author public repo (`laurentfabre/zlsx`), Zig 0.
 | Phase | Description | Status |
 |---|---|---|
 | 1 | Free wins: branch protection, repo merge settings, CODEOWNERS, PR template | **Done (2026-04-30)** |
-| 2 | TDD CI gates: test-presence, C-ABI 3-file-transaction, monotonic test count | Not started |
+| 2 | TDD CI gates: test-presence, C-ABI 3-file-transaction, monotonic test count | **Done (2026-04-30, advisory)** |
 | 3 | Worktree + subagent conventions: helper script, commit-msg trailer, PR template fields | Not started |
 | 4 | Agent-as-reviewer CI job (codex-review-on-PR) | Not started |
 | 5 | Optional: coverage gate, TDAD map, mutation testing | Deferred |
@@ -169,6 +169,35 @@ Plus repo-level: disable merge-commit style, enable auto-delete on merge.
   - `allow_merge_commit: false`, `allow_squash_merge: true`, `allow_rebase_merge: true`, `delete_branch_on_merge: true`
 - [x] `.github/CODEOWNERS` created — `* @laurentfabre`
 - [x] `.github/pull_request_template.md` created — summary, scope, test plan, C ABI 3-file checklist, roadmap link, agent attribution
+
+## Phase 2 — implementation log
+
+- [x] `.github/workflows/pr-gates.yml` created (2026-04-30)
+- [x] `scripts/ci/test-presence-check.sh` (Gate 5)
+- [x] `scripts/ci/abi-3file-check.sh` (Gate 6)
+- [x] `scripts/ci/monotonic-test-count.sh` (Gate 7)
+- [x] Escape labels created on GitHub: `no-test-needed`, `abi-no-3file`, `delete-tests-ok`
+- [x] Local smoke-tested against historical commits:
+  - ABI gate fails correctly on `ab2c1a2` (c_abi.zig only) — would have caught real historical lapse in `001af88` (c_abi.zig + header but no `_ffi.py`).
+  - Test-presence passes on `ab2c1a2` because the commit added inline `test "..."` blocks to c_abi.zig (correct).
+  - Monotonic gate fails correctly on a synthetic 480→0 fixture, passes with `delete-tests-ok` label.
+- [ ] **Pending**: promote gates to `required_status_checks` after a few green PR runs. Three contexts to add: `Test-presence check`, `C ABI 3-file transaction`, `Monotonic test count`. Keep them advisory until at least one PR exercises each escape label so we know the escape actually works.
+
+### Local invocation (debugging a gate)
+
+```sh
+BASE_SHA=$(git merge-base origin/main HEAD) HEAD_SHA=HEAD LABELS='[]' \
+  bash scripts/ci/test-presence-check.sh
+
+BASE_SHA=$(git merge-base origin/main HEAD) HEAD_SHA=HEAD LABELS='["abi-no-3file"]' \
+  bash scripts/ci/abi-3file-check.sh
+```
+
+### Known limitations
+
+- **Test-presence**: heuristic "non-trivial change" filter strips blank lines and `// ...` comments only. Multi-line `///` doc-comments still count as significant; tolerable since the escape label exists.
+- **ABI gate**: only triggers when `src/c_abi.zig` is in the changed-file list. An ABI-affecting change made elsewhere (e.g., changing an extern struct's layout via a `pub const` in another file imported by `c_abi.zig`) won't be caught.
+- **Monotonic**: counts `^test "` exactly — moving a test from `test "foo"` to `test "renamed"` is a no-op (count preserved), but reformatting a test header onto a multi-line form would silently drop it.
 
 ## Phase 1 — operational note
 
