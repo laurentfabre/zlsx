@@ -999,11 +999,34 @@ fn elementExtentEnd(xml: []const u8, inside_pos: usize) ?usize {
     if (tag_end > 0 and xml[tag_end - 1] == '/') return tag_end;
     // Otherwise walk forward looking for the matching `</NAME>`,
     // accounting for nested same-name elements via a depth counter.
+    // Skip over comments and CDATA: fake markup inside them
+    // (`<!-- <foo> -->`, `<![CDATA[</foo>]]>`) must NOT bump depth.
     var depth: i64 = 1;
     var search_at: usize = tag_end + 1;
     while (search_at < xml.len) {
+        // Advance past any comment / CDATA section starting here.
+        if (search_at + 4 <= xml.len and std.mem.startsWith(u8, xml[search_at..], "<!--")) {
+            const close = std.mem.indexOfPos(u8, xml, search_at + 4, "-->") orelse return xml.len - 1;
+            search_at = close + 3;
+            continue;
+        }
+        if (search_at + 9 <= xml.len and std.mem.startsWith(u8, xml[search_at..], "<![CDATA[")) {
+            const close = std.mem.indexOfPos(u8, xml, search_at + 9, "]]>") orelse return xml.len - 1;
+            search_at = close + 3;
+            continue;
+        }
         const next_lt = std.mem.indexOfScalarPos(u8, xml, search_at, '<') orelse return xml.len - 1;
         if (next_lt + 1 >= xml.len) return xml.len - 1;
+        // If next_lt opens a comment / CDATA, loop around so the
+        // top-of-loop skip handles it.
+        if (next_lt + 4 <= xml.len and std.mem.startsWith(u8, xml[next_lt..], "<!--")) {
+            search_at = next_lt;
+            continue;
+        }
+        if (next_lt + 9 <= xml.len and std.mem.startsWith(u8, xml[next_lt..], "<![CDATA[")) {
+            search_at = next_lt;
+            continue;
+        }
         const is_close = xml[next_lt + 1] == '/';
         const candidate_name_start = if (is_close) next_lt + 2 else next_lt + 1;
         if (candidate_name_start + elem_name.len > xml.len) return xml.len - 1;
@@ -1060,9 +1083,22 @@ fn isInsideOpeningTag(xml: []const u8, pos: usize) bool {
     const next = xml[lt + 1];
     if (next == '!' or next == '?' or next == '/') return false;
     // Walk forward quote-aware from `<` checking if `pos` falls
-    // before the tag-closing `>`. If yes, pos is inside the tag.
-    const tag_end = findUnquotedTagEnd(xml, lt + 1) orelse return false;
-    return pos < tag_end;
+    // BEFORE the tag-closing `>` AND outside any attribute value.
+    // An xmlns-looking string inside `macro="xmlns:c='bad'"` is
+    // attribute content, not a real namespace declaration.
+    var i = lt + 1;
+    while (i < xml.len) : (i += 1) {
+        const c = xml[i];
+        if (c == '"' or c == '\'') {
+            const close = std.mem.indexOfScalarPos(u8, xml, i + 1, c) orelse return false;
+            // pos inside this quoted region → reject.
+            if (pos > i and pos < close) return false;
+            i = close;
+            continue;
+        }
+        if (c == '>') return pos < i;
+    }
+    return false;
 }
 
 /// True if `pos` is inside an XML comment (`<!-- ... -->`) or
@@ -1959,6 +1995,41 @@ test "findLocalChartElement: xmlns after a quoted `>` in same tag is honored" {
     const found = findLocalChartElement(block, gf_idx, prefixes);
     try std.testing.expect(found != null);
     try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<p:chart"));
+}
+
+test "findLocalChartElement: xmlns inside an attribute value isn't a real binding" {
+    // `<foo macro="xmlns:c='bad'">` — the xmlns text lives inside
+    // a quoted attribute VALUE of an opening tag, not as an
+    // attribute on its own. Quote-aware opening-tag detection
+    // must reject it so the chart still resolves via root.
+    const block =
+        "<xdr:graphicFrame>" ++
+        "<foo macro=\"xmlns:c='http://example.com/bad'\"></foo>" ++
+        "<c:chart r:id=\"rId1\"/>" ++
+        "</xdr:graphicFrame>";
+    const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame").?;
+    const prefixes: DrawingPrefixes = .{};
+    const found = findLocalChartElement(block, gf_idx, prefixes);
+    try std.testing.expect(found != null);
+    try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<c:chart"));
+}
+
+test "findLocalChartElement: fake nested markup in comment doesn't unbalance depth" {
+    // `<foo xmlns:c="bad"><!-- <foo> --></foo>` — the comment
+    // contains a fake `<foo>` nested-open. elementExtentEnd's
+    // depth counter must NOT increment on it; otherwise the
+    // matching `</foo>` won't bring depth back to 0 and the bad
+    // binding leaks past the close into the chart's scope.
+    const block =
+        "<xdr:graphicFrame>" ++
+        "<foo xmlns:c=\"http://example.com/bad\"><!-- <foo> --></foo>" ++
+        "<c:chart r:id=\"rId1\"/>" ++
+        "</xdr:graphicFrame>";
+    const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame").?;
+    const prefixes: DrawingPrefixes = .{};
+    const found = findLocalChartElement(block, gf_idx, prefixes);
+    try std.testing.expect(found != null);
+    try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<c:chart"));
 }
 
 test "findLocalChartElement: comment-delimiter-text inside CDATA doesn't open a fake comment" {
