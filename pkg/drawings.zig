@@ -823,6 +823,12 @@ fn findNamespacePrefix(xml: []const u8, target_uri: []const u8) ?[]const u8 {
 /// unused declaration appeared first.
 fn findLocalChartElement(block: []const u8, start: usize, prefixes: DrawingPrefixes) ?usize {
     var i = start;
+    // If `start` itself sits inside a skip region (caller's
+    // graphicFrame index can land in a commented-out fake), jump
+    // past the region's close before searching.
+    if (skipRegionContaining(block, start)) |skip_end| {
+        i = skip_end;
+    }
     while (i < block.len) {
         // Eat any comment/CDATA/PI section starting at `i`. Done
         // up-front each iteration so we never call indexOfPos for
@@ -1146,15 +1152,20 @@ fn isInsideOpeningTag(xml: []const u8, pos: usize) bool {
 /// Returns the opener's start index or null if none. Used by the
 /// chart-element scanner to jump past skip regions inline.
 fn nextSkipOpenBefore(xml: []const u8, from: usize, limit: usize) ?usize {
-    const c1 = std.mem.indexOfPos(u8, xml, from, "<!--");
-    const c2 = std.mem.indexOfPos(u8, xml, from, "<![CDATA[");
-    const c3 = std.mem.indexOfPos(u8, xml, from, "<?");
+    if (limit <= from) return null;
+    // Bound the substring scans to `xml[from..limit]` so a
+    // candidate match deep in the document doesn't cost us a
+    // full-block scan per iteration. Each search returns indices
+    // relative to the slice; rebase to absolute positions.
+    const slice = xml[from..limit];
+    const c1 = std.mem.indexOfPos(u8, slice, 0, "<!--");
+    const c2 = std.mem.indexOfPos(u8, slice, 0, "<![CDATA[");
+    const c3 = std.mem.indexOfPos(u8, slice, 0, "<?");
     var best: ?usize = null;
     inline for (.{ c1, c2, c3 }) |maybe_p| {
         if (maybe_p) |p| {
-            if (p < limit) {
-                best = if (best) |b| @min(b, p) else p;
-            }
+            const abs = from + p;
+            best = if (best) |b| @min(b, abs) else abs;
         }
     }
     return best;
@@ -2130,6 +2141,28 @@ test "findLocalChartElement: fake nested markup in comment doesn't unbalance dep
     const found = findLocalChartElement(block, gf_idx, prefixes);
     try std.testing.expect(found != null);
     try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<c:chart"));
+}
+
+test "findLocalChartElement: start inside a skip region jumps past it" {
+    // `start` (the graphicFrame index) lands inside a commented
+    // fake `<xdr:graphicFrame>` containing a fake `<c:chart>`.
+    // The scanner must jump past the comment's close before
+    // looking for `:chart`, otherwise it'd return the bogus
+    // commented chart.
+    const block =
+        "<wrapper>" ++
+        "<!-- <xdr:graphicFrame><c:chart r:id=\"rIdFake\"/></xdr:graphicFrame> -->" ++
+        "<xdr:graphicFrame>" ++
+        "<c:chart r:id=\"rIdReal\"/>" ++
+        "</xdr:graphicFrame>" ++
+        "</wrapper>";
+    // Caller's plain indexOf(`<xdr:graphicFrame`) will land on
+    // the commented one's `<` (inside the comment).
+    const fake_gf = std.mem.indexOf(u8, block, "<xdr:graphicFrame").?;
+    const prefixes: DrawingPrefixes = .{};
+    const found = findLocalChartElement(block, fake_gf, prefixes);
+    try std.testing.expect(found != null);
+    try std.testing.expect(std.mem.startsWith(u8, block[found.?..], "<c:chart r:id=\"rIdReal\""));
 }
 
 test "findLocalChartElement: fake `<c:chart>` inside a comment is ignored" {
