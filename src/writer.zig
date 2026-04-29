@@ -1990,8 +1990,16 @@ pub const SheetWriter = struct {
             // the workbook at worst. Mirrors the isFinite check on
             // setColumnWidth / setRowHeight.
             .number => |f| if (!std.math.isFinite(f)) return error.NonFiniteNumeric,
+            // Strings / formulas funnel into appendXmlEscaped on
+            // emit; XML 1.0 forbidden bytes there would error
+            // mid-row and leave a half-written <row> in self.body.
+            // Detect up-front so the row stays atomic.
+            .string => |s| try assertNoForbiddenXmlBytes(s),
             else => {},
         };
+        if (formulas) |fs| {
+            for (fs) |maybe_f| if (maybe_f) |f| try assertNoForbiddenXmlBytes(f);
+        }
 
         const alloc = self.parent.allocator;
         // Row index is 0-based inside the height map; next_row is
@@ -2211,6 +2219,30 @@ fn validateDefinedName(name: []const u8) !void {
         return error.InvalidDefinedName;
     }
     if (looksLikeCellRef(name)) return error.InvalidDefinedName;
+    // Excel also reserves R1C1-shaped names (`R[<digits>]C[<digits>]`,
+    // case-insensitive). Bare `R` / `C` were already rejected above.
+    if (looksLikeR1C1Ref(name)) return error.InvalidDefinedName;
+}
+
+/// True if `s` matches the case-insensitive R1C1 reference shape:
+/// `R<digits>C<digits>`, `R<digits>C`, `RC<digits>`, or `RC`. The
+/// digits may be absent (relative reference) or present (absolute).
+/// Used to keep R1C1-shaped names out of the workbook's
+/// definedNames pool — Excel treats them as actual references.
+fn looksLikeR1C1Ref(s: []const u8) bool {
+    if (s.len < 2) return false;
+    const first = s[0];
+    if (first != 'R' and first != 'r') return false;
+    var i: usize = 1;
+    // Optional digits after R.
+    while (i < s.len and isAsciiDigit(s[i])) : (i += 1) {}
+    if (i >= s.len) return false;
+    const c = s[i];
+    if (c != 'C' and c != 'c') return false;
+    i += 1;
+    // Optional digits after C.
+    while (i < s.len and isAsciiDigit(s[i])) : (i += 1) {}
+    return i == s.len;
 }
 
 inline fn isAsciiLetter(c: u8) bool {
@@ -2648,6 +2680,14 @@ fn appendXmlEscaped(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), s: []con
             else => try out.append(alloc, ch),
         }
     }
+}
+
+/// Pre-validate a user string for XML 1.0 forbidden bytes. Exposes
+/// the same `error.InvalidXmlByte` as appendXmlEscaped so callers
+/// can detect the failure up-front and keep mutation paths atomic
+/// (avoiding half-written rows / partial XML output).
+fn assertNoForbiddenXmlBytes(s: []const u8) !void {
+    for (s) |c| if (isForbiddenXmlByte(c)) return error.InvalidXmlByte;
 }
 
 inline fn isForbiddenXmlByte(c: u8) bool {
@@ -6277,4 +6317,49 @@ test "Writer.addDefinedName: rejects invalid name + empty refers_to" {
         error.InvalidDefinedNameRefersTo,
         w.addDefinedName("Foo", "", .{}),
     );
+}
+
+test "validateDefinedName: rejects R1C1-shaped references" {
+    // Bare R / C already covered by the single-letter-reservation
+    // check; these cover the multi-segment R1C1 forms.
+    try std.testing.expectError(error.InvalidDefinedName, validateDefinedName("R1C1"));
+    try std.testing.expectError(error.InvalidDefinedName, validateDefinedName("r10c5"));
+    try std.testing.expectError(error.InvalidDefinedName, validateDefinedName("RC"));
+    try std.testing.expectError(error.InvalidDefinedName, validateDefinedName("R5C"));
+    try std.testing.expectError(error.InvalidDefinedName, validateDefinedName("RC10"));
+    // Names that START with R/C but aren't R1C1 shapes are accepted.
+    try validateDefinedName("Range1");
+    try validateDefinedName("Customer");
+    try validateDefinedName("R_total");
+}
+
+test "writeRow atomicity: forbidden-XML-byte string leaves no half-written row" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    var sw = try w.addSheet("Sheet1");
+    // Snapshot body length, attempt the bad row, verify body is unchanged.
+    const body_before = sw.body.items.len;
+    try std.testing.expectError(
+        error.InvalidXmlByte,
+        sw.writeRow(&.{ .{ .string = "ok" }, .{ .string = "bad\x00here" } }),
+    );
+    try std.testing.expectEqual(body_before, sw.body.items.len);
+
+    // Then a valid row writes fine.
+    try sw.writeRow(&.{ .{ .string = "good" }, .{ .integer = 42 } });
+    try std.testing.expect(sw.body.items.len > body_before);
+}
+
+test "writeRowWithFormulas atomicity: forbidden byte in formula bails before any append" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    var sw = try w.addSheet("Sheet1");
+    const body_before = sw.body.items.len;
+    const cells = [_]xlsx.Cell{.{ .integer = 1 }};
+    const fs = [_]?[]const u8{"SUM(A1\x00:A2)"};
+    try std.testing.expectError(
+        error.InvalidXmlByte,
+        sw.writeRowWithFormulas(&cells, &fs),
+    );
+    try std.testing.expectEqual(body_before, sw.body.items.len);
 }
