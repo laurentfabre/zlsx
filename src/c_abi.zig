@@ -1119,6 +1119,35 @@ export fn zlsx_cell_border(book: *Book, style_idx: u32, out: *CCellBorder) callc
     return 0;
 }
 
+/// Cell alignment record for the FFI surface. `horizontal_len = 0`
+/// means the alignment is the OOXML default ("general", which the
+/// emitter omits). `wrap_text` is `1` when `wrapText="1"` was set.
+pub const CCellAlignment = extern struct {
+    horizontal_len: usize,
+    horizontal_ptr: [*]const u8,
+    wrap_text: u8,
+    _pad: [7]u8,
+};
+
+/// Resolve a style index to its alignment + wrap_text record.
+/// Returns 0 on success, -1 on out-of-range index. Cells without a
+/// nested `<alignment>` child surface as `horizontal_len = 0,
+/// wrap_text = 0`.
+export fn zlsx_cell_alignment(book: *Book, style_idx: u32, out: *CCellAlignment) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    const a = state.inner.cellAlignment(style_idx) orelse return -1;
+    out.* = .{
+        .horizontal_len = if (a.horizontal) |h| h.len else 0,
+        .horizontal_ptr = if (a.horizontal) |h|
+            (if (h.len == 0) @ptrCast("") else h.ptr)
+        else
+            @ptrCast(""),
+        .wrap_text = if (a.wrap_text) 1 else 0,
+        ._pad = .{ 0, 0, 0, 0, 0, 0, 0 },
+    };
+    return 0;
+}
+
 // ─── Bulk row materialisation (Phase 3d, FFI-friendly) ───────────────
 //
 // Per-row `zlsx_rows_next` pays one FFI call per row. At MB scale
@@ -2092,6 +2121,25 @@ export fn zlsx_sheet_writer_set_column_width(
     return 0;
 }
 
+/// Set the row height (in points) for `row_idx` (0-based). Excel
+/// hard-rejects heights outside (0, 409.5]. Returns 0 on success,
+/// -1 on `InvalidRowHeight` / `RowOutOfRange` (error name written
+/// into `err_buf`).
+export fn zlsx_sheet_writer_set_row_height(
+    sw: *SheetWriter,
+    row_idx: u32,
+    height: f32,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+    sw_state.inner.setRowHeight(row_idx, height) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
 /// Freeze the top `rows` rows and left `cols` columns. Pass 0 on an
 /// axis to leave it unfrozen. Overrides any previous freeze on this
 /// sheet. Never fails — out-of-range counts are clamped to one less
@@ -2116,6 +2164,57 @@ export fn zlsx_sheet_writer_freeze_panes(
     std.debug.assert(clamped_rows < 1_048_576);
     std.debug.assert(clamped_cols < 16_384);
     sw_state.inner.freezePanes(clamped_rows, clamped_cols) catch unreachable;
+}
+
+/// Checked variant of freeze_panes: returns -1 with the typed error
+/// name on out-of-range inputs (RowOutOfRange / ColumnOutOfRange)
+/// instead of clamping silently. Newer FFI consumers should prefer
+/// this; the legacy `zlsx_sheet_writer_freeze_panes` stays in place
+/// for ABI back-compat.
+export fn zlsx_sheet_writer_freeze_panes_checked(
+    sw: *SheetWriter,
+    rows: u32,
+    cols: u32,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw));
+    sw_state.inner.freezePanes(rows, cols) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}
+
+/// Register a workbook-level (or sheet-scoped) defined name.
+/// `local_sheet_id_neg` < 0 → workbook scope; ≥ 0 → 0-based sheet
+/// index (must resolve at save() time). `hidden_flag != 0` →
+/// `hidden="1"` attribute. Returns 0 on success, -1 on
+/// `InvalidDefinedName` / `InvalidDefinedNameRefersTo` /
+/// `DuplicateDefinedName` (error name written into `err_buf`).
+export fn zlsx_writer_add_defined_name(
+    w: *Writer,
+    name_ptr: [*]const u8,
+    name_len: usize,
+    refers_to_ptr: [*]const u8,
+    refers_to_len: usize,
+    local_sheet_id_neg: i32,
+    hidden_flag: u8,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const w_state: *WriterState = @ptrCast(@alignCast(w));
+    const name = name_ptr[0..name_len];
+    const refers_to = refers_to_ptr[0..refers_to_len];
+    const lsi: ?u32 = if (local_sheet_id_neg < 0) null else @intCast(local_sheet_id_neg);
+    w_state.inner.addDefinedName(name, refers_to, .{
+        .local_sheet_id = lsi,
+        .hidden = hidden_flag != 0,
+    }) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
 }
 
 /// Apply an auto-filter over an A1-style range (e.g. "A1:E1"). The
@@ -3885,4 +3984,127 @@ test "fuzz C ABI: random u32 tag in CCell never panics through full row" {
         // BadCellTag / IntegerExceedsExcelPrecision), never panic.
         _ = zlsx_sheet_writer_write_row(sw.?, &cells, cells.len, &err_buf, err_buf.len);
     }
+}
+
+test "zlsx_writer_add_defined_name: surfaces typed errors over FFI" {
+    var open_err: [128]u8 = undefined;
+    @memset(&open_err, 0);
+    const w = zlsx_writer_create(&open_err, open_err.len);
+    defer zlsx_writer_close(w);
+    try std.testing.expect(w != null);
+    var err_buf: [128]u8 = undefined;
+    @memset(&err_buf, 0);
+
+    // Need at least one sheet so save() is plausible (and so a
+    // sheet-scoped name with localSheetId=0 resolves later).
+    var sw_err: [128]u8 = undefined;
+    @memset(&sw_err, 0);
+    const sw = zlsx_writer_add_sheet(w.?, "Sheet1".ptr, "Sheet1".len, &sw_err, sw_err.len);
+    try std.testing.expect(sw != null);
+    // Sheet writers are owned by the parent Writer; freed on
+    // zlsx_writer_close. No explicit close needed.
+
+    // Valid: workbook-scope.
+    @memset(&err_buf, 0);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_writer_add_defined_name(
+        w.?,
+        "MyRange".ptr,
+        "MyRange".len,
+        "Sheet1!$A$1:$B$1".ptr,
+        "Sheet1!$A$1:$B$1".len,
+        -1, // workbook scope
+        0,
+        &err_buf,
+        err_buf.len,
+    ));
+
+    // Valid: sheet-scoped + hidden.
+    @memset(&err_buf, 0);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_writer_add_defined_name(
+        w.?,
+        "_xlnm.Print_Area".ptr,
+        "_xlnm.Print_Area".len,
+        "Sheet1!$A$1:$B$1".ptr,
+        "Sheet1!$A$1:$B$1".len,
+        0, // local_sheet_id=0
+        1, // hidden
+        &err_buf,
+        err_buf.len,
+    ));
+
+    // Invalid: A1-shaped name.
+    @memset(&err_buf, 0);
+    try std.testing.expectEqual(@as(i32, -1), zlsx_writer_add_defined_name(
+        w.?,
+        "A1".ptr,
+        "A1".len,
+        "Sheet1!$A$1".ptr,
+        "Sheet1!$A$1".len,
+        -1,
+        0,
+        &err_buf,
+        err_buf.len,
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, &err_buf, "InvalidDefinedName") != null);
+
+    // Invalid: empty refers_to.
+    @memset(&err_buf, 0);
+    try std.testing.expectEqual(@as(i32, -1), zlsx_writer_add_defined_name(
+        w.?,
+        "Foo".ptr,
+        "Foo".len,
+        "".ptr,
+        0,
+        -1,
+        0,
+        &err_buf,
+        err_buf.len,
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, &err_buf, "InvalidDefinedNameRefersTo") != null);
+
+    // Duplicate (case-insensitive, same scope).
+    @memset(&err_buf, 0);
+    try std.testing.expectEqual(@as(i32, -1), zlsx_writer_add_defined_name(
+        w.?,
+        "myrange".ptr,
+        "myrange".len,
+        "Sheet1!$A$2".ptr,
+        "Sheet1!$A$2".len,
+        -1,
+        0,
+        &err_buf,
+        err_buf.len,
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, &err_buf, "DuplicateDefinedName") != null);
+}
+
+test "zlsx_sheet_writer_set_row_height + freeze_panes_checked propagate errors" {
+    var open_err: [128]u8 = undefined;
+    @memset(&open_err, 0);
+    const w = zlsx_writer_create(&open_err, open_err.len);
+    defer zlsx_writer_close(w);
+    try std.testing.expect(w != null);
+    var sw_err: [128]u8 = undefined;
+    @memset(&sw_err, 0);
+    const sw = zlsx_writer_add_sheet(w.?, "S".ptr, "S".len, &sw_err, sw_err.len) orelse return error.AddSheetFailed;
+
+    var err_buf: [128]u8 = undefined;
+
+    // setRowHeight: valid + invalid.
+    @memset(&err_buf, 0);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_set_row_height(sw, 0, 24.0, &err_buf, err_buf.len));
+    @memset(&err_buf, 0);
+    try std.testing.expectEqual(@as(i32, -1), zlsx_sheet_writer_set_row_height(sw, 0, 0.0, &err_buf, err_buf.len));
+    try std.testing.expect(std.mem.indexOf(u8, &err_buf, "InvalidRowHeight") != null);
+
+    // freeze_panes_checked: valid.
+    @memset(&err_buf, 0);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_freeze_panes_checked(sw, 1, 1, &err_buf, err_buf.len));
+    // freeze_panes_checked: out-of-range surfaces typed error.
+    @memset(&err_buf, 0);
+    try std.testing.expectEqual(@as(i32, -1), zlsx_sheet_writer_freeze_panes_checked(sw, 1_048_576, 0, &err_buf, err_buf.len));
+    try std.testing.expect(std.mem.indexOf(u8, &err_buf, "RowOutOfRange") != null);
+    @memset(&err_buf, 0);
+    try std.testing.expectEqual(@as(i32, -1), zlsx_sheet_writer_freeze_panes_checked(sw, 0, 16_384, &err_buf, err_buf.len));
+    try std.testing.expect(std.mem.indexOf(u8, &err_buf, "ColumnOutOfRange") != null);
 }
