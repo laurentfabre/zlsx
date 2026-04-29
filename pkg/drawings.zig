@@ -196,36 +196,45 @@ fn collectFromSheet(
     // Walk the drawing's twoCellAnchor / oneCellAnchor blocks.
     const drawing_rels = store.rels(drawing_part_name);
 
+    // Resolve namespace prefixes once per drawing part. Microsoft
+    // canonically uses "xdr" / "a" / "c" but OOXML allows any
+    // prefix. Look up the actual prefix declared on the root
+    // element so non-Microsoft producers (libreoffice, custom
+    // tooling) don't silently surface zero anchors.
+    const prefixes = resolveDrawingPrefixes(drawing_part.bytes);
+    var tags_buf: [512]u8 = undefined;
+    const tags = try DrawingTags.build(&tags_buf, prefixes);
+
     var i: usize = 0;
     while (i < drawing_part.bytes.len) {
-        const next = std.mem.indexOfPos(u8, drawing_part.bytes, i, "<xdr:") orelse break;
+        const next = std.mem.indexOfPos(u8, drawing_part.bytes, i, tags.xdr_prefix_open) orelse break;
         i = next;
         // Identify anchor opener.
-        const is_two = std.mem.startsWith(u8, drawing_part.bytes[i..], "<xdr:twoCellAnchor");
-        const is_one = std.mem.startsWith(u8, drawing_part.bytes[i..], "<xdr:oneCellAnchor");
+        const is_two = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_two);
+        const is_one = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_one);
         if (!is_two and !is_one) {
-            i += "<xdr:".len;
+            i += tags.xdr_prefix_open.len;
             continue;
         }
         // Find close tag.
-        const close_marker = if (is_two) "</xdr:twoCellAnchor>" else "</xdr:oneCellAnchor>";
+        const close_marker = if (is_two) tags.close_two else tags.close_one;
         const close = std.mem.indexOfPos(u8, drawing_part.bytes, i, close_marker) orelse break;
         const block = drawing_part.bytes[i .. close + close_marker.len];
         i = close + close_marker.len;
 
         // Only image-bearing anchors are surfaced in v1.
-        const pic_idx = std.mem.indexOf(u8, block, "<xdr:pic>") orelse continue;
-        const pic_close = std.mem.indexOfPos(u8, block, pic_idx, "</xdr:pic>") orelse continue;
-        const pic_block = block[pic_idx .. pic_close + "</xdr:pic>".len];
+        const pic_idx = std.mem.indexOf(u8, block, tags.open_pic) orelse continue;
+        const pic_close = std.mem.indexOfPos(u8, block, pic_idx, tags.close_pic) orelse continue;
+        const pic_block = block[pic_idx .. pic_close + tags.close_pic.len];
 
-        const embed_rid = findBlipEmbed(pic_block) orelse continue;
+        const embed_rid = findBlipEmbed(pic_block, prefixes.a) orelse continue;
         const image_target = relTargetForId(allocator, drawing_rels, embed_rid) orelse continue;
         const image_part_name = (try store.resolve(drawing_part_name, image_target)) orelse continue;
         const image_part = store.part(image_part_name) orelse continue;
 
-        const from = parseCellAnchor(block, "<xdr:from>", "</xdr:from>") orelse continue;
+        const from = parseCellAnchor(block, tags.open_from, tags.close_from, prefixes.xdr) orelse continue;
         const to_anchor: ?CellAnchor = if (is_two)
-            parseCellAnchor(block, "<xdr:to>", "</xdr:to>")
+            parseCellAnchor(block, tags.open_to, tags.close_to, prefixes.xdr)
         else
             null;
 
@@ -252,25 +261,28 @@ fn collectChartsFromSheet(
     const drawing_part = store.part(drawing_part_name) orelse return;
 
     const drawing_rels = store.rels(drawing_part_name);
+    const prefixes = resolveDrawingPrefixes(drawing_part.bytes);
+    var tags_buf: [512]u8 = undefined;
+    const tags = try DrawingTags.build(&tags_buf, prefixes);
 
     var i: usize = 0;
     while (i < drawing_part.bytes.len) {
-        const next = std.mem.indexOfPos(u8, drawing_part.bytes, i, "<xdr:") orelse break;
+        const next = std.mem.indexOfPos(u8, drawing_part.bytes, i, tags.xdr_prefix_open) orelse break;
         i = next;
-        const is_two = std.mem.startsWith(u8, drawing_part.bytes[i..], "<xdr:twoCellAnchor");
-        const is_one = std.mem.startsWith(u8, drawing_part.bytes[i..], "<xdr:oneCellAnchor");
+        const is_two = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_two);
+        const is_one = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_one);
         if (!is_two and !is_one) {
-            i += "<xdr:".len;
+            i += tags.xdr_prefix_open.len;
             continue;
         }
-        const close_marker = if (is_two) "</xdr:twoCellAnchor>" else "</xdr:oneCellAnchor>";
+        const close_marker = if (is_two) tags.close_two else tags.close_one;
         const close = std.mem.indexOfPos(u8, drawing_part.bytes, i, close_marker) orelse break;
         const block = drawing_part.bytes[i .. close + close_marker.len];
         i = close + close_marker.len;
 
         // Charts live inside <xdr:graphicFrame>...<c:chart r:id=...
-        const gf_idx = std.mem.indexOf(u8, block, "<xdr:graphicFrame") orelse continue;
-        const chart_idx = std.mem.indexOfPos(u8, block, gf_idx, "<c:chart") orelse continue;
+        const gf_idx = std.mem.indexOf(u8, block, tags.open_graphic_frame) orelse continue;
+        const chart_idx = std.mem.indexOfPos(u8, block, gf_idx, tags.open_chart) orelse continue;
         const chart_end = std.mem.indexOfScalarPos(u8, block, chart_idx, '>') orelse continue;
         const chart_attrs = block[chart_idx .. chart_end + 1];
         const embed_rid = attrValue(chart_attrs, "r:id") orelse continue;
@@ -279,13 +291,16 @@ fn collectChartsFromSheet(
         const chart_part_name = (try store.resolve(drawing_part_name, chart_target)) orelse continue;
         const chart_part = store.part(chart_part_name) orelse continue;
 
-        const from = parseCellAnchor(block, "<xdr:from>", "</xdr:from>") orelse continue;
+        const from = parseCellAnchor(block, tags.open_from, tags.close_from, prefixes.xdr) orelse continue;
         const to_anchor: ?CellAnchor = if (is_two)
-            parseCellAnchor(block, "<xdr:to>", "</xdr:to>")
+            parseCellAnchor(block, tags.open_to, tags.close_to, prefixes.xdr)
         else
             null;
 
-        const refs = try extractSeriesRefs(allocator, chart_part.bytes);
+        // Each chart's own XML may declare a different `c:` prefix
+        // — resolve per-chart to be safe.
+        const chart_prefixes = resolveDrawingPrefixes(chart_part.bytes);
+        const refs = try extractSeriesRefs(allocator, chart_part.bytes, chart_prefixes.c);
         // If `out.append` OOMs after we just allocated `refs`, the
         // caller's outer errdefer frees the rest but `refs` itself
         // hasn't been transferred yet — free it on the failing path.
@@ -295,45 +310,63 @@ fn collectChartsFromSheet(
             .sheet_part_name = sheet_part.name,
             .from = from,
             .to = to_anchor,
-            .chart_type = detectChartType(chart_part.bytes),
+            .chart_type = detectChartType(chart_part.bytes, chart_prefixes.c),
             .series_refs = refs,
             .raw_xml = chart_part.bytes,
         });
     }
 }
 
-/// Walk every `<c:f>...</c:f>` in the chart XML in document order and
-/// return the formula strings as borrowed slices into `xml`. Series
-/// names, categories, and values all flow through `<c:f>`, so the
-/// flattened list captures every workbook reference the chart pulls
-/// from.
-fn extractSeriesRefs(allocator: std.mem.Allocator, xml: []const u8) ![]const []const u8 {
+/// Walk every `<{c}:f>...</{c}:f>` in the chart XML in document
+/// order and return the formula strings as borrowed slices into
+/// `xml`. Series names, categories, and values all flow through
+/// `<{c}:f>`, so the flattened list captures every workbook
+/// reference the chart pulls from. `c_prefix` is the document's
+/// actual chart-namespace prefix (canonically "c").
+fn extractSeriesRefs(
+    allocator: std.mem.Allocator,
+    xml: []const u8,
+    c_prefix: []const u8,
+) ![]const []const u8 {
     var out: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer out.deinit(allocator);
 
+    var open_buf: [32]u8 = undefined;
+    var close_buf: [32]u8 = undefined;
+    const open = try std.fmt.bufPrint(&open_buf, "<{s}:f>", .{c_prefix});
+    const close_tag = try std.fmt.bufPrint(&close_buf, "</{s}:f>", .{c_prefix});
+
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, xml, i, "<c:f>")) |open| {
-        const start = open + "<c:f>".len;
-        const close = std.mem.indexOfPos(u8, xml, start, "</c:f>") orelse break;
-        try out.append(allocator, xml[start..close]);
-        i = close + "</c:f>".len;
+    while (std.mem.indexOfPos(u8, xml, i, open)) |o| {
+        const start = o + open.len;
+        const close_off = std.mem.indexOfPos(u8, xml, start, close_tag) orelse break;
+        try out.append(allocator, xml[start..close_off]);
+        i = close_off + close_tag.len;
     }
     return out.toOwnedSlice(allocator);
 }
 
 /// Best-effort chart-type detection from the chart-part XML. Looks
-/// for the canonical `<c:Xchart>` element name. Compound charts
+/// for the canonical `<{c}:Xchart>` element name. Compound charts
 /// (multiple plot types overlaid) collapse to whichever is found
 /// first; callers needing the full picture can walk raw_xml
-/// directly.
-fn detectChartType(chart_xml: []const u8) ChartType {
-    if (std.mem.indexOf(u8, chart_xml, "<c:barChart") != null) return .bar;
-    if (std.mem.indexOf(u8, chart_xml, "<c:lineChart") != null) return .line;
-    if (std.mem.indexOf(u8, chart_xml, "<c:pieChart") != null) return .pie;
-    if (std.mem.indexOf(u8, chart_xml, "<c:scatterChart") != null) return .scatter;
-    if (std.mem.indexOf(u8, chart_xml, "<c:areaChart") != null) return .area;
-    if (std.mem.indexOf(u8, chart_xml, "<c:bubbleChart") != null) return .bubble;
-    if (std.mem.indexOf(u8, chart_xml, "<c:radarChart") != null) return .radar;
+/// directly. `c_prefix` is the document's actual chart-namespace
+/// prefix (canonically "c").
+fn detectChartType(chart_xml: []const u8, c_prefix: []const u8) ChartType {
+    var buf: [48]u8 = undefined;
+    const candidates = [_]struct { suffix: []const u8, kind: ChartType }{
+        .{ .suffix = "barChart", .kind = .bar },
+        .{ .suffix = "lineChart", .kind = .line },
+        .{ .suffix = "pieChart", .kind = .pie },
+        .{ .suffix = "scatterChart", .kind = .scatter },
+        .{ .suffix = "areaChart", .kind = .area },
+        .{ .suffix = "bubbleChart", .kind = .bubble },
+        .{ .suffix = "radarChart", .kind = .radar },
+    };
+    for (candidates) |c| {
+        const needle = std.fmt.bufPrint(&buf, "<{s}:{s}", .{ c_prefix, c.suffix }) catch continue;
+        if (std.mem.indexOf(u8, chart_xml, needle) != null) return c.kind;
+    }
     return .other;
 }
 
@@ -390,14 +423,130 @@ fn findOpeningTag(xml: []const u8, name: []const u8) ?usize {
     return null;
 }
 
-/// Find the value of `r:embed` on the `<a:blip r:embed="rIdN" ...>`
-/// inside an `<xdr:pic>` block. Linked-only blips (`r:link` instead
-/// of `r:embed`) return null — those reference an external file and
-/// have no part in the package.
-fn findBlipEmbed(pic_xml: []const u8) ?[]const u8 {
-    const blip = std.mem.indexOf(u8, pic_xml, "<a:blip") orelse return null;
+/// Find the value of `r:embed` on the `<{a}:blip r:embed="rIdN" ...>`
+/// inside a `<{xdr}:pic>` block. Linked-only blips (`r:link`
+/// instead of `r:embed`) return null — those reference an external
+/// file and have no part in the package. `a_prefix` is the
+/// document's actual DrawingML-main prefix (canonically "a").
+fn findBlipEmbed(pic_xml: []const u8, a_prefix: []const u8) ?[]const u8 {
+    var blip_open_buf: [32]u8 = undefined;
+    const blip_open = std.fmt.bufPrint(&blip_open_buf, "<{s}:blip", .{a_prefix}) catch return null;
+    const blip = std.mem.indexOf(u8, pic_xml, blip_open) orelse return null;
     const blip_end = std.mem.indexOfScalarPos(u8, pic_xml, blip, '>') orelse return null;
     return attrValue(pic_xml[blip .. blip_end + 1], "r:embed");
+}
+
+/// Canonical OOXML namespace URIs for the three prefixes the
+/// drawing parser needs. ECMA-376 / OPC fixed.
+const ns_xdr = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing";
+const ns_a = "http://schemas.openxmlformats.org/drawingml/2006/main";
+const ns_c = "http://schemas.openxmlformats.org/drawingml/2006/chart";
+
+/// Resolved namespace prefixes for one drawing or chart part.
+/// Defaults are the canonical Microsoft prefixes.
+const DrawingPrefixes = struct {
+    xdr: []const u8 = "xdr",
+    a: []const u8 = "a",
+    c: []const u8 = "c",
+};
+
+/// Scan the root element's xmlns:* declarations and return the
+/// prefix for each canonical OOXML namespace. Falls back to the
+/// canonical prefix when a namespace isn't declared (some chart
+/// parts only declare the chart namespace inline on `<c:chart>`).
+fn resolveDrawingPrefixes(xml: []const u8) DrawingPrefixes {
+    var p: DrawingPrefixes = .{};
+    if (findNamespacePrefix(xml, ns_xdr)) |pref| p.xdr = pref;
+    if (findNamespacePrefix(xml, ns_a)) |pref| p.a = pref;
+    if (findNamespacePrefix(xml, ns_c)) |pref| p.c = pref;
+    return p;
+}
+
+/// Walk the first 4 KiB of `xml` looking for `xmlns:NAME="URI"`.
+/// Returns NAME if URI matches `target_uri`. Bounded scan because
+/// xmlns declarations are always on the root element; well past
+/// 4 KiB the search would cost more than it saves on adversarial
+/// input.
+fn findNamespacePrefix(xml: []const u8, target_uri: []const u8) ?[]const u8 {
+    const limit = @min(xml.len, 4096);
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml[0..limit], i, "xmlns:")) |start| {
+        const after = start + "xmlns:".len;
+        if (after >= limit) return null;
+        const eq = std.mem.indexOfScalarPos(u8, xml[0..limit], after, '=') orelse return null;
+        const name = xml[after..eq];
+        if (eq + 1 >= limit) return null;
+        const quote = xml[eq + 1];
+        if (quote != '"' and quote != '\'') {
+            i = eq + 1;
+            continue;
+        }
+        const val_start = eq + 2;
+        const val_end = std.mem.indexOfScalarPos(u8, xml[0..limit], val_start, quote) orelse return null;
+        if (std.mem.eql(u8, xml[val_start..val_end], target_uri)) return name;
+        i = val_end + 1;
+    }
+    return null;
+}
+
+/// Pre-built tag needles keyed off the resolved prefixes. Built
+/// into a single caller-supplied buffer so the per-part lookup
+/// loop doesn't re-format on every iteration.
+const DrawingTags = struct {
+    xdr_prefix_open: []const u8, // "<xdr:"
+    open_two: []const u8, // "<xdr:twoCellAnchor"
+    close_two: []const u8, // "</xdr:twoCellAnchor>"
+    open_one: []const u8, // "<xdr:oneCellAnchor"
+    close_one: []const u8, // "</xdr:oneCellAnchor>"
+    open_pic: []const u8, // "<xdr:pic>"
+    close_pic: []const u8, // "</xdr:pic>"
+    open_from: []const u8, // "<xdr:from>"
+    close_from: []const u8, // "</xdr:from>"
+    open_to: []const u8, // "<xdr:to>"
+    close_to: []const u8, // "</xdr:to>"
+    open_graphic_frame: []const u8, // "<xdr:graphicFrame"
+    open_chart: []const u8, // "<c:chart"
+
+    fn build(buf: []u8, p: DrawingPrefixes) !DrawingTags {
+        var w = std.Io.Writer.fixed(buf);
+        const xdr_prefix_open = try writeAndAdvance(&w, "<{s}:", .{p.xdr});
+        const open_two = try writeAndAdvance(&w, "<{s}:twoCellAnchor", .{p.xdr});
+        const close_two = try writeAndAdvance(&w, "</{s}:twoCellAnchor>", .{p.xdr});
+        const open_one = try writeAndAdvance(&w, "<{s}:oneCellAnchor", .{p.xdr});
+        const close_one = try writeAndAdvance(&w, "</{s}:oneCellAnchor>", .{p.xdr});
+        const open_pic = try writeAndAdvance(&w, "<{s}:pic>", .{p.xdr});
+        const close_pic = try writeAndAdvance(&w, "</{s}:pic>", .{p.xdr});
+        const open_from = try writeAndAdvance(&w, "<{s}:from>", .{p.xdr});
+        const close_from = try writeAndAdvance(&w, "</{s}:from>", .{p.xdr});
+        const open_to = try writeAndAdvance(&w, "<{s}:to>", .{p.xdr});
+        const close_to = try writeAndAdvance(&w, "</{s}:to>", .{p.xdr});
+        const open_graphic_frame = try writeAndAdvance(&w, "<{s}:graphicFrame", .{p.xdr});
+        const open_chart = try writeAndAdvance(&w, "<{s}:chart", .{p.c});
+        return .{
+            .xdr_prefix_open = xdr_prefix_open,
+            .open_two = open_two,
+            .close_two = close_two,
+            .open_one = open_one,
+            .close_one = close_one,
+            .open_pic = open_pic,
+            .close_pic = close_pic,
+            .open_from = open_from,
+            .close_from = close_from,
+            .open_to = open_to,
+            .close_to = close_to,
+            .open_graphic_frame = open_graphic_frame,
+            .open_chart = open_chart,
+        };
+    }
+};
+
+/// Format `fmt` into the writer-fixed buffer and return the slice
+/// of bytes that were just written (offset into the underlying
+/// buffer, fixed for the writer's lifetime).
+fn writeAndAdvance(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype) ![]const u8 {
+    const before = w.end;
+    try w.print(fmt, args);
+    return w.buffer[before..w.end];
 }
 
 fn relForId(
@@ -540,20 +689,42 @@ fn decodeIdInto(buf: []u8, src: []const u8) ?[]const u8 {
 
 /// Parse `<xdr:from>...</xdr:from>` (or `<xdr:to>...</xdr:to>`) into
 /// a CellAnchor. Each contains exactly four scalar children:
-///   <xdr:col>N</xdr:col>
-///   <xdr:colOff>N</xdr:colOff>
-///   <xdr:row>N</xdr:row>
-///   <xdr:rowOff>N</xdr:rowOff>
-fn parseCellAnchor(xml: []const u8, open: []const u8, close: []const u8) ?CellAnchor {
+///   <{xdr}:col>N</{xdr}:col>
+///   <{xdr}:colOff>N</{xdr}:colOff>
+///   <{xdr}:row>N</{xdr}:row>
+///   <{xdr}:rowOff>N</{xdr}:rowOff>
+fn parseCellAnchor(
+    xml: []const u8,
+    open: []const u8,
+    close: []const u8,
+    xdr_prefix: []const u8,
+) ?CellAnchor {
     const o = std.mem.indexOf(u8, xml, open) orelse return null;
     const c = std.mem.indexOfPos(u8, xml, o, close) orelse return null;
     const inner = xml[o + open.len .. c];
 
+    var col_open_buf: [32]u8 = undefined;
+    var col_close_buf: [32]u8 = undefined;
+    var col_off_open_buf: [32]u8 = undefined;
+    var col_off_close_buf: [32]u8 = undefined;
+    var row_open_buf: [32]u8 = undefined;
+    var row_close_buf: [32]u8 = undefined;
+    var row_off_open_buf: [32]u8 = undefined;
+    var row_off_close_buf: [32]u8 = undefined;
+    const col_open = std.fmt.bufPrint(&col_open_buf, "<{s}:col>", .{xdr_prefix}) catch return null;
+    const col_close = std.fmt.bufPrint(&col_close_buf, "</{s}:col>", .{xdr_prefix}) catch return null;
+    const col_off_open = std.fmt.bufPrint(&col_off_open_buf, "<{s}:colOff>", .{xdr_prefix}) catch return null;
+    const col_off_close = std.fmt.bufPrint(&col_off_close_buf, "</{s}:colOff>", .{xdr_prefix}) catch return null;
+    const row_open = std.fmt.bufPrint(&row_open_buf, "<{s}:row>", .{xdr_prefix}) catch return null;
+    const row_close = std.fmt.bufPrint(&row_close_buf, "</{s}:row>", .{xdr_prefix}) catch return null;
+    const row_off_open = std.fmt.bufPrint(&row_off_open_buf, "<{s}:rowOff>", .{xdr_prefix}) catch return null;
+    const row_off_close = std.fmt.bufPrint(&row_off_close_buf, "</{s}:rowOff>", .{xdr_prefix}) catch return null;
+
     return .{
-        .col = parseElementU32(inner, "<xdr:col>", "</xdr:col>") orelse return null,
-        .col_off = parseElementI64(inner, "<xdr:colOff>", "</xdr:colOff>") orelse return null,
-        .row = parseElementU32(inner, "<xdr:row>", "</xdr:row>") orelse return null,
-        .row_off = parseElementI64(inner, "<xdr:rowOff>", "</xdr:rowOff>") orelse return null,
+        .col = parseElementU32(inner, col_open, col_close) orelse return null,
+        .col_off = parseElementI64(inner, col_off_open, col_off_close) orelse return null,
+        .row = parseElementU32(inner, row_open, row_close) orelse return null,
+        .row_off = parseElementI64(inner, row_off_open, row_off_close) orelse return null,
     };
 }
 
@@ -697,25 +868,36 @@ test "chartAnchors: workbook with no charts returns empty slice" {
 }
 
 test "detectChartType: covers all canonical OOXML chart elements" {
-    try std.testing.expectEqual(ChartType.bar, detectChartType("<c:chartSpace><c:barChart/>"));
-    try std.testing.expectEqual(ChartType.line, detectChartType("<c:chartSpace><c:lineChart/>"));
-    try std.testing.expectEqual(ChartType.pie, detectChartType("<c:chartSpace><c:pieChart/>"));
-    try std.testing.expectEqual(ChartType.scatter, detectChartType("<c:chartSpace><c:scatterChart/>"));
-    try std.testing.expectEqual(ChartType.area, detectChartType("<c:chartSpace><c:areaChart/>"));
-    try std.testing.expectEqual(ChartType.bubble, detectChartType("<c:chartSpace><c:bubbleChart/>"));
-    try std.testing.expectEqual(ChartType.radar, detectChartType("<c:chartSpace><c:radarChart/>"));
-    try std.testing.expectEqual(ChartType.other, detectChartType("<c:chartSpace><c:doughnutChart/>"));
+    try std.testing.expectEqual(ChartType.bar, detectChartType("<c:chartSpace><c:barChart/>", "c"));
+    try std.testing.expectEqual(ChartType.line, detectChartType("<c:chartSpace><c:lineChart/>", "c"));
+    try std.testing.expectEqual(ChartType.pie, detectChartType("<c:chartSpace><c:pieChart/>", "c"));
+    try std.testing.expectEqual(ChartType.scatter, detectChartType("<c:chartSpace><c:scatterChart/>", "c"));
+    try std.testing.expectEqual(ChartType.area, detectChartType("<c:chartSpace><c:areaChart/>", "c"));
+    try std.testing.expectEqual(ChartType.bubble, detectChartType("<c:chartSpace><c:bubbleChart/>", "c"));
+    try std.testing.expectEqual(ChartType.radar, detectChartType("<c:chartSpace><c:radarChart/>", "c"));
+    try std.testing.expectEqual(ChartType.other, detectChartType("<c:chartSpace><c:doughnutChart/>", "c"));
+    // Non-canonical prefix: same XML with a different chart-namespace
+    // prefix should still detect the chart type.
+    try std.testing.expectEqual(ChartType.bar, detectChartType("<chrt:chartSpace><chrt:barChart/>", "chrt"));
 }
 
 test "parseCellAnchor unit test" {
     const xml =
         \\<xdr:from><xdr:col>3</xdr:col><xdr:colOff>16119</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>47624</xdr:rowOff></xdr:from>
     ;
-    const a = parseCellAnchor(xml, "<xdr:from>", "</xdr:from>").?;
+    const a = parseCellAnchor(xml, "<xdr:from>", "</xdr:from>", "xdr").?;
     try std.testing.expectEqual(@as(u32, 3), a.col);
     try std.testing.expectEqual(@as(i64, 16119), a.col_off);
     try std.testing.expectEqual(@as(u32, 1), a.row);
     try std.testing.expectEqual(@as(i64, 47624), a.row_off);
+    // Non-canonical drawing prefix: identical structure with `dr:`
+    // instead of `xdr:` — same parser run with a different prefix.
+    const xml2 =
+        \\<dr:from><dr:col>3</dr:col><dr:colOff>0</dr:colOff><dr:row>1</dr:row><dr:rowOff>0</dr:rowOff></dr:from>
+    ;
+    const b = parseCellAnchor(xml2, "<dr:from>", "</dr:from>", "dr").?;
+    try std.testing.expectEqual(@as(u32, 3), b.col);
+    try std.testing.expectEqual(@as(u32, 1), b.row);
 }
 
 test "attrValue tolerates single-quoted XML attributes" {
@@ -739,8 +921,53 @@ test "findDrawingRid + findBlipEmbed tolerate single quotes" {
     );
     try std.testing.expectEqualStrings(
         "rId9",
-        findBlipEmbed("<xdr:pic><a:blip r:embed='rId9'/></xdr:pic>").?,
+        findBlipEmbed("<xdr:pic><a:blip r:embed='rId9'/></xdr:pic>", "a").?,
     );
+    // Non-canonical DrawingML-main prefix.
+    try std.testing.expectEqualStrings(
+        "rId9",
+        findBlipEmbed("<xdr:pic><dml:blip r:embed='rId9'/></xdr:pic>", "dml").?,
+    );
+}
+
+test "resolveDrawingPrefixes maps canonical + custom prefixes" {
+    // Canonical prefixes — round-trip.
+    {
+        const xml =
+            \\<?xml version="1.0"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"/>
+        ;
+        const p = resolveDrawingPrefixes(xml);
+        try std.testing.expectEqualStrings("xdr", p.xdr);
+        try std.testing.expectEqualStrings("a", p.a);
+        try std.testing.expectEqualStrings("c", p.c);
+    }
+    // Custom prefixes — different short names mapped to same URIs.
+    {
+        const xml =
+            \\<?xml version="1.0"?><dr:wsDr xmlns:dr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:dml="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:chrt="http://schemas.openxmlformats.org/drawingml/2006/chart"/>
+        ;
+        const p = resolveDrawingPrefixes(xml);
+        try std.testing.expectEqualStrings("dr", p.xdr);
+        try std.testing.expectEqualStrings("dml", p.a);
+        try std.testing.expectEqualStrings("chrt", p.c);
+    }
+    // Single-quoted attribute values — also valid XML.
+    {
+        const xml =
+            \\<?xml version='1.0'?><x:wsDr xmlns:x='http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing'/>
+        ;
+        const p = resolveDrawingPrefixes(xml);
+        try std.testing.expectEqualStrings("x", p.xdr);
+        // Undeclared namespaces fall back to canonical defaults.
+        try std.testing.expectEqualStrings("a", p.a);
+    }
+    // No declarations at all — defaults.
+    {
+        const p = resolveDrawingPrefixes("<wsDr/>");
+        try std.testing.expectEqualStrings("xdr", p.xdr);
+        try std.testing.expectEqualStrings("a", p.a);
+        try std.testing.expectEqualStrings("c", p.c);
+    }
 }
 
 test "findDrawingRid tolerates XML whitespace after tag name" {
