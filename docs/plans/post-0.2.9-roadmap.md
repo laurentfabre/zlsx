@@ -29,7 +29,7 @@ modulo two pending deferrals; addPart shipped.
 | **B2** Editor rebase onto Workbook | ⏳ pending |
 | **B3** Writer rebase onto Workbook | ⏳ pending |
 | **B-fuzz** Coverage-guided fuzz nightly | ✅ shipped (reader + package layer fuzz binaries on ubuntu-22.04 nightly) |
-| **C2a** Object extraction (images / charts / opaque) | 🟡 image + chart anchors + series refs shipped; Strict OOXML content-type detection + XML-whitespace tolerance shipped; namespace-prefix tolerance + absolute-pixel anchors pending |
+| **C2a** Object extraction (images / charts / opaque) | 🟡 image + chart anchors + series refs shipped; Strict OOXML content-type detection + XML-whitespace tolerance + non-canonical namespace-prefix tolerance shipped (per-block + drawing-root prefix resolution, XML-attribute whitespace, scratch buffers sized for arbitrary prefix lengths); absolute-pixel anchors still pending (no fixtures) |
 | **C2b** addImage | ⏳ pending (depends on B1; addPart unblocks the part-injection half) |
 | **C1** Formula tokenizer + rewriter | ⏳ pending (single biggest remaining user-value item) |
 | **D1** Formula evaluator | deferred indefinitely |
