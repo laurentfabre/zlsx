@@ -1596,3 +1596,90 @@ def test_writer_add_data_validation_rejects_invalid_inputs(tmp_path):
             sheet.add_data_validation_custom("", "A1>0")
         # Save something so the writer closes cleanly.
         sheet.write_row(["x"])
+
+
+def test_writer_add_defined_name_round_trip(tmp_path):
+    """Workbook + sheet-scoped defined names ship through to xl/workbook.xml
+    and round-trip through the same Writer's save path."""
+    out = str(tmp_path / "defined_names.xlsx")
+    with zlsx.Writer(out) as w:
+        sheet = w.add_sheet("Sheet1")
+        sheet.write_row([1, 2, 3])
+        # Workbook scope.
+        w.add_defined_name("MyRange", "Sheet1!$A$1:$C$1")
+        # Sheet-scope + hidden.
+        w.add_defined_name(
+            "_xlnm.Print_Area",
+            "Sheet1!$A$1:$C$1",
+            local_sheet_id=0,
+            hidden=True,
+        )
+
+        # Validation surface.
+        with pytest.raises(zlsx.ZlsxError, match="InvalidDefinedName"):
+            w.add_defined_name("A1", "Sheet1!$A$1")
+        with pytest.raises(zlsx.ZlsxError, match="InvalidDefinedNameRefersTo"):
+            w.add_defined_name("Foo", "")
+        # Case-insensitive duplicate within scope.
+        with pytest.raises(zlsx.ZlsxError, match="DuplicateDefinedName"):
+            w.add_defined_name("myrange", "Sheet1!$B$1")
+
+
+def test_sheet_writer_set_row_height_validates(tmp_path):
+    """set_row_height accepts (0, 409.5] and rejects everything else."""
+    out = str(tmp_path / "row_height.xlsx")
+    with zlsx.Writer(out) as w:
+        sheet = w.add_sheet("Sheet1")
+        sheet.write_row(["x"])
+        # Valid.
+        sheet.set_row_height(0, 24.0)
+        sheet.set_row_height(1, 409.5)  # at the cap
+        # Invalid: zero, negative, above cap.
+        with pytest.raises(zlsx.ZlsxError, match="InvalidRowHeight"):
+            sheet.set_row_height(2, 0.0)
+        with pytest.raises(zlsx.ZlsxError, match="InvalidRowHeight"):
+            sheet.set_row_height(2, -1.0)
+        with pytest.raises(zlsx.ZlsxError, match="InvalidRowHeight"):
+            sheet.set_row_height(2, 410.0)
+
+
+def test_sheet_writer_freeze_panes_checked_propagates_errors(tmp_path):
+    """The checked variant raises ZlsxError on out-of-range counts
+    instead of clamping silently."""
+    out = str(tmp_path / "freeze_checked.xlsx")
+    with zlsx.Writer(out) as w:
+        sheet = w.add_sheet("Sheet1")
+        sheet.write_row(["x"])
+        # Valid.
+        sheet.freeze_panes_checked(rows=1, cols=1)
+        # Out-of-range.
+        with pytest.raises(zlsx.ZlsxError, match="RowOutOfRange"):
+            sheet.freeze_panes_checked(rows=1_048_576, cols=0)
+        with pytest.raises(zlsx.ZlsxError, match="ColumnOutOfRange"):
+            sheet.freeze_panes_checked(rows=0, cols=16_384)
+
+
+def test_book_cell_alignment_round_trip(tmp_path):
+    """A writer-emitted style with horizontal=center + wrap_text=True
+    reads back through Book.cell_alignment."""
+    out = str(tmp_path / "alignment.xlsx")
+    with zlsx.Writer(out) as w:
+        sheet = w.add_sheet("Sheet1")
+        sid = w.add_style(zlsx.Style(
+            alignment_horizontal="center",
+            wrap_text=True,
+        ))
+        sheet.write_row(["x"], styles=[sid])
+
+    with zlsx.open(out) as book:
+        align = book.cell_alignment(sid)
+        assert align is not None
+        assert align.horizontal == "center"
+        assert align.wrap_text is True
+
+        # Index 0 (default no-style) must surface as horizontal="",
+        # wrap_text=False — the OOXML default.
+        align0 = book.cell_alignment(0)
+        assert align0 is not None
+        assert align0.horizontal == ""
+        assert align0.wrap_text is False

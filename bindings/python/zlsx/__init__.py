@@ -420,6 +420,19 @@ class Border:
     diagonal: "BorderSide" = field(default_factory=lambda: BorderSide())
 
 
+@dataclass(frozen=True)
+class Alignment:
+    """Cell alignment resolved via ``Book.cell_alignment(style_idx)``.
+
+    ``horizontal`` mirrors the OOXML ``<alignment horizontal="…">``
+    enum value (``"left"``, ``"center"``, ``"right"``, etc.). When
+    the cell uses the default ``"general"`` alignment (which the
+    OOXML emitter omits), ``horizontal`` is the empty string.
+    """
+    horizontal: str = ""
+    wrap_text: bool = False
+
+
 # ─── Book ─────────────────────────────────────────────────────────────
 
 
@@ -916,6 +929,30 @@ class Book:
             bottom=_side(cb.bottom),
             diagonal=_side(cb.diagonal),
         )
+
+    def cell_alignment(self, style_idx: int) -> Alignment | None:
+        """Resolve a cell's style index to its :class:`Alignment`
+        (horizontal + wrap_text). Returns ``None`` on out-of-range
+        indices. Cells without a nested ``<alignment>`` child surface
+        as ``Alignment(horizontal="", wrap_text=False)`` — the OOXML
+        default that the writer omits."""
+        if not self._handle:
+            raise ZlsxError("book is closed")
+        if not _ffi._HAS_CELL_ALIGNMENT:
+            raise RuntimeError(
+                "loaded libzlsx does not expose cell_alignment "
+                "(requires post-0.3.0 libzlsx); upgrade libzlsx"
+            )
+        ca = _ffi.CellAlignment()
+        rc = _ffi.lib.zlsx_cell_alignment(self._handle, style_idx, ctypes.byref(ca))
+        if rc != 0:
+            return None
+        horizontal = ""
+        if ca.horizontal_len > 0:
+            horizontal = ctypes.string_at(ca.horizontal_ptr, ca.horizontal_len).decode(
+                "utf-8", errors="replace"
+            )
+        return Alignment(horizontal=horizontal, wrap_text=bool(ca.wrap_text))
 
     def is_date_format(self, style_idx: int) -> bool:
         """True when the style index resolves to a date / time /
@@ -1670,6 +1707,51 @@ def _sheet_freeze_panes(self: "SheetWriter", rows: int = 0, cols: int = 0) -> No
     )
 
 
+def _sheet_set_row_height(self: "SheetWriter", row_idx: int, height: float) -> None:
+    """Set the display height of row ``row_idx`` (0-based) in points.
+    Excel accepts heights in (0, 409.5]. Raises :class:`ZlsxError`
+    on ``InvalidRowHeight`` or ``RowOutOfRange``."""
+    self._require_handle()
+    if not _ffi._HAS_SET_ROW_HEIGHT:
+        raise RuntimeError(
+            "loaded libzlsx does not expose set_row_height "
+            "(requires post-0.3.0 libzlsx); upgrade libzlsx"
+        )
+    if row_idx < 0:
+        raise ValueError(f"row_idx must be >= 0, got {row_idx}")
+    rc = _ffi.lib.zlsx_sheet_writer_set_row_height(
+        self._handle, int(row_idx), float(height), self._err, _ERR_BUF_LEN
+    )
+    if rc != 0:
+        raise ZlsxError(
+            f"zlsx_sheet_writer_set_row_height: {_decode_err(self._err)}"
+        )
+
+
+def _sheet_freeze_panes_checked(self: "SheetWriter", rows: int = 0, cols: int = 0) -> None:
+    """Like :py:meth:`freeze_panes` but raises :class:`ZlsxError`
+    on ``RowOutOfRange`` / ``ColumnOutOfRange`` instead of clamping
+    silently. Prefer this over the legacy clamping form when callers
+    want to catch out-of-range inputs."""
+    self._require_handle()
+    if not _ffi._HAS_FREEZE_PANES_CHECKED:
+        raise RuntimeError(
+            "loaded libzlsx does not expose freeze_panes_checked "
+            "(requires post-0.3.0 libzlsx); upgrade libzlsx"
+        )
+    if rows < 0 or cols < 0:
+        raise ValueError(
+            f"freeze_panes_checked rows/cols must be >= 0, got rows={rows} cols={cols}"
+        )
+    rc = _ffi.lib.zlsx_sheet_writer_freeze_panes_checked(
+        self._handle, int(rows), int(cols), self._err, _ERR_BUF_LEN
+    )
+    if rc != 0:
+        raise ZlsxError(
+            f"zlsx_sheet_writer_freeze_panes_checked: {_decode_err(self._err)}"
+        )
+
+
 def _sheet_set_auto_filter(self: "SheetWriter", range_str: str) -> None:
     """Apply an auto-filter over ``range_str`` (A1-style, e.g. 'A1:E1')."""
     self._require_handle()
@@ -2181,7 +2263,9 @@ def _sheet_add_conditional_format_expression(
 
 
 SheetWriter.set_column_width = _sheet_set_column_width   # type: ignore[attr-defined]
+SheetWriter.set_row_height = _sheet_set_row_height       # type: ignore[attr-defined]
 SheetWriter.freeze_panes = _sheet_freeze_panes           # type: ignore[attr-defined]
+SheetWriter.freeze_panes_checked = _sheet_freeze_panes_checked  # type: ignore[attr-defined]
 SheetWriter.set_auto_filter = _sheet_set_auto_filter     # type: ignore[attr-defined]
 SheetWriter.add_merged_cell = _sheet_add_merged_cell     # type: ignore[attr-defined]
 SheetWriter.add_hyperlink = _sheet_add_hyperlink         # type: ignore[attr-defined]
@@ -2315,6 +2399,61 @@ class Writer:
         sw = SheetWriter(self, sw_handle)
         self._sheets.append(sw)
         return sw
+
+    def add_defined_name(
+        self,
+        name: str,
+        refers_to: str,
+        local_sheet_id: int | None = None,
+        hidden: bool = False,
+    ) -> None:
+        """Register a workbook-level (or sheet-scoped) defined name.
+
+        ``local_sheet_id`` ``None`` means workbook-scope; an integer
+        ≥ 0 means a 0-based sheet index (must resolve at :meth:`save`
+        time). ``hidden=True`` emits ``hidden="1"`` (the convention
+        for ``_xlnm.Print_Area`` and similar built-in names).
+
+        Raises :class:`ZlsxError` on ``InvalidDefinedName``,
+        ``InvalidDefinedNameRefersTo``, or ``DuplicateDefinedName``
+        (case-insensitive duplicate within the same scope).
+        """
+        if not _ffi._HAS_DEFINED_NAME:
+            raise RuntimeError(
+                "loaded libzlsx does not expose add_defined_name "
+                "(requires post-0.3.0 libzlsx); upgrade libzlsx"
+            )
+        name_raw = name.encode("utf-8")
+        refers_raw = refers_to.encode("utf-8")
+        name_buf = (ctypes.c_ubyte * max(len(name_raw), 1)).from_buffer_copy(
+            name_raw or b"\x00"
+        )
+        refers_buf = (ctypes.c_ubyte * max(len(refers_raw), 1)).from_buffer_copy(
+            refers_raw or b"\x00"
+        )
+        ptr_t = ctypes.POINTER(ctypes.c_ubyte)
+        # Negative sheet id signals workbook scope to the C ABI.
+        lsi: int = -1 if local_sheet_id is None else int(local_sheet_id)
+        if local_sheet_id is not None and local_sheet_id < 0:
+            raise ValueError(
+                f"local_sheet_id must be >= 0 or None, got {local_sheet_id}"
+            )
+        rc = _ffi.lib.zlsx_writer_add_defined_name(
+            self._handle,
+            ctypes.cast(name_buf, ptr_t),
+            len(name_raw),
+            ctypes.cast(refers_buf, ptr_t),
+            len(refers_raw),
+            lsi,
+            1 if hidden else 0,
+            self._err,
+            _ERR_BUF_LEN,
+        )
+        del name_buf, refers_buf
+        if rc != 0:
+            raise ZlsxError(
+                f"zlsx_writer_add_defined_name({name!r}): {_decode_err(self._err)}"
+            )
 
     def add_style(self, style: "Style") -> int:
         """Register a cell style and return its 1-based index. Pass the

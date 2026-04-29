@@ -1067,3 +1067,66 @@ if _HAS_EDITOR_SET_CELL:
         ctypes.c_size_t,
     ]
     lib.zlsx_editor_set_cell.restype = ctypes.c_int32
+
+# ─── New writer/reader exports added in this iteration ───────────────
+
+_HAS_DEFINED_NAME = hasattr(lib, "zlsx_writer_add_defined_name")
+if _HAS_DEFINED_NAME:
+    lib.zlsx_writer_add_defined_name.argtypes = [
+        writer_handle,
+        ctypes.POINTER(ctypes.c_ubyte),    # name_ptr
+        ctypes.c_size_t,                   # name_len
+        ctypes.POINTER(ctypes.c_ubyte),    # refers_to_ptr
+        ctypes.c_size_t,                   # refers_to_len
+        ctypes.c_int32,                    # local_sheet_id_neg (negative=workbook scope)
+        ctypes.c_uint8,                    # hidden_flag
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_writer_add_defined_name.restype = ctypes.c_int32
+
+_HAS_SET_ROW_HEIGHT = hasattr(lib, "zlsx_sheet_writer_set_row_height")
+if _HAS_SET_ROW_HEIGHT:
+    lib.zlsx_sheet_writer_set_row_height.argtypes = [
+        sheet_writer_handle,
+        ctypes.c_uint32,                   # row_idx (0-based)
+        ctypes.c_float,                    # height
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_set_row_height.restype = ctypes.c_int32
+
+_HAS_FREEZE_PANES_CHECKED = hasattr(lib, "zlsx_sheet_writer_freeze_panes_checked")
+if _HAS_FREEZE_PANES_CHECKED:
+    lib.zlsx_sheet_writer_freeze_panes_checked.argtypes = [
+        sheet_writer_handle,
+        ctypes.c_uint32,                   # rows
+        ctypes.c_uint32,                   # cols
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_freeze_panes_checked.restype = ctypes.c_int32
+
+
+class CellAlignment(ctypes.Structure):
+    """Mirror of `zlsx_cell_alignment_t` from include/zlsx.h.
+
+    `horizontal_len == 0` means the alignment is the OOXML default
+    ("general", which the emitter omits). `wrap_text == 1` when the
+    cell's `<alignment wrapText="1"/>` was set.
+    """
+    _fields_ = [
+        ("horizontal_len", ctypes.c_size_t),
+        ("horizontal_ptr", ctypes.POINTER(ctypes.c_ubyte)),
+        ("wrap_text", ctypes.c_uint8),
+        ("_pad", ctypes.c_uint8 * 7),
+    ]
+
+_HAS_CELL_ALIGNMENT = hasattr(lib, "zlsx_cell_alignment")
+if _HAS_CELL_ALIGNMENT:
+    lib.zlsx_cell_alignment.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.POINTER(CellAlignment),
+    ]
+    lib.zlsx_cell_alignment.restype = ctypes.c_int32
