@@ -93,7 +93,16 @@ pub fn tokenize(allocator: std.mem.Allocator, input: []const u8) Error![]Token {
             },
             '\'' => blk: {
                 i = scanQuotedSheet(input, start);
-                break :blk .{ .kind = .sheet_name, .text = input[start..i] };
+                const lex = input[start..i];
+                // External-workbook refs (`'[Book.xlsx]Sheet1'!A1`)
+                // are out of scope; classify the quoted lexeme as
+                // `.unknown` so the future rewriter knows not to
+                // touch the sheet/range. Detection: any `[` inside
+                // the quoted region.
+                if (std.mem.indexOfScalar(u8, lex, '[') != null) {
+                    break :blk .{ .kind = .unknown, .text = lex };
+                }
+                break :blk .{ .kind = .sheet_name, .text = lex };
             },
             '#' => blk: {
                 if (matchKnownError(input, start)) |end| {
@@ -122,20 +131,20 @@ pub fn tokenize(allocator: std.mem.Allocator, input: []const u8) Error![]Token {
             '$', 'A'...'Z', 'a'...'z', '_', '\\' => blk: {
                 i = scanIdent(input, start);
                 const lex = input[start..i];
-                if (isBoolLit(lex)) break :blk .{ .kind = .bool_lit, .text = lex };
-                if (isCellRef(lex)) {
-                    // Disambiguate: an A1-shaped lexeme is a `.name`
-                    // when it's the head of a function call (`LOG10(`)
-                    // or a sheet qualifier (`Q1!A1`); only standalone
-                    // refs collapse to `.cell_ref`. Without this, a
-                    // future rewriter would corrupt function names
-                    // and bare sheet refs that happen to match the
-                    // A1 grid shape.
-                    if (i < input.len and (input[i] == '(' or input[i] == '!')) {
-                        break :blk .{ .kind = .name, .text = lex };
-                    }
-                    break :blk .{ .kind = .cell_ref, .text = lex };
+                // A name-shaped lexeme followed by `(` is always a
+                // function call: that flips `TRUE(` from a literal
+                // into the zero-argument TRUE function, and `LOG10(`
+                // from an A1 ref into the LOG10 function. `!`
+                // similarly means a sheet qualifier — both flavours
+                // route through the function-call lookahead before
+                // we try literal/cell-ref classification.
+                const followed_by_call = i < input.len and input[i] == '(';
+                const followed_by_qual = i < input.len and input[i] == '!';
+                if (followed_by_call or followed_by_qual) {
+                    break :blk .{ .kind = .name, .text = lex };
                 }
+                if (isBoolLit(lex)) break :blk .{ .kind = .bool_lit, .text = lex };
+                if (isCellRef(lex)) break :blk .{ .kind = .cell_ref, .text = lex };
                 break :blk .{ .kind = .name, .text = lex };
             },
             '+' => blk: {
@@ -648,6 +657,26 @@ test "backslash-started defined names" {
     // `\Foo` as a RANGE (defined name); we should match.
     try expectKinds("\\Foo", &.{.name});
     try expectRoundTrip("\\Foo+1");
+}
+
+test "external-workbook refs flag as .unknown" {
+    // `'[Book.xlsx]Sheet1'!A1` is an external reference; out of
+    // scope for milestone 1. The bracket inside the quoted lexeme
+    // forces `.unknown` so the rewriter refuses to touch it.
+    try expectKinds("'[Book.xlsx]Sheet1'!A1", &.{ .unknown, .bang, .cell_ref });
+    try expectRoundTrip("'[Book.xlsx]Sheet1'!A1+1");
+    // Plain quoted sheet without `[` stays `.sheet_name`.
+    try expectKinds("'My Sheet'!A1", &.{ .sheet_name, .bang, .cell_ref });
+}
+
+test "TRUE()/FALSE() are function calls, not literals" {
+    // Zero-argument TRUE() and FALSE() are valid Excel functions.
+    // The trailing `(` flips them from `.bool_lit` to `.name`.
+    try expectKinds("TRUE()", &.{ .name, .paren_open, .paren_close });
+    try expectKinds("FALSE()", &.{ .name, .paren_open, .paren_close });
+    // No trailing `(` — back to literal classification.
+    try expectKinds("TRUE", &.{.bool_lit});
+    try expectKinds("FALSE", &.{.bool_lit});
 }
 
 test "mixed bag round-trip" {
