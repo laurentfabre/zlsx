@@ -44,6 +44,8 @@ pub const Error = error{
     MissingRelationship,
     SheetIndexOutOfRange,
     SheetNotFound,
+    SstIndexOutOfRange,
+    SstEntryIsRich,
 } || workbook_xml_mod.Error || sheet_xml_mod.ParseError || sst_xml_mod.Error || styles_xml_mod.Error || store_mod.Error;
 
 pub const Workbook = struct {
@@ -157,9 +159,47 @@ pub const Workbook = struct {
         return self.workbook.defined_names;
     }
 
+    /// Defined names with no `localSheetId` attribute — workbook-scope
+    /// names visible from every sheet. Allocator-owned (caller frees).
+    pub fn definedNamesGlobal(self: *const Workbook, allocator: Allocator) Error![]workbook_xml_mod.DefinedName {
+        var out: std.ArrayList(workbook_xml_mod.DefinedName) = .empty;
+        errdefer out.deinit(allocator);
+        for (self.workbook.defined_names) |dn| {
+            if (dn.local_sheet_id == null) try out.append(allocator, dn);
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    /// Defined names scoped to a specific sheet (via `localSheetId`).
+    /// Caller frees the returned slice.
+    pub fn definedNamesForSheet(self: *const Workbook, allocator: Allocator, sheet_idx: u32) Error![]workbook_xml_mod.DefinedName {
+        if (sheet_idx >= self.workbook.sheets.len) return Error.SheetIndexOutOfRange;
+        var out: std.ArrayList(workbook_xml_mod.DefinedName) = .empty;
+        errdefer out.deinit(allocator);
+        for (self.workbook.defined_names) |dn| {
+            if (dn.local_sheet_id) |sid| {
+                if (sid == sheet_idx) try out.append(allocator, dn);
+            }
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
     /// Calc properties from `xl/workbook.xml`.
     pub fn calcProperties(self: *const Workbook) workbook_xml_mod.CalcProperties {
         return self.workbook.calc;
+    }
+
+    /// Convenience: SST entry `idx` as plain text. Errors on rich-run
+    /// entries (caller must use `sst()` and walk `RichRun[]` directly).
+    /// Returns the raw, undecoded slice — call `sst_xml.decodeText` to
+    /// resolve `&amp;` etc.
+    pub fn sstText(self: *Workbook, idx: u32) Error!?[]const u8 {
+        const view = (try self.sst()) orelse return null;
+        if (idx >= view.entries.len) return Error.SstIndexOutOfRange;
+        switch (view.entries[idx]) {
+            .plain => |s| return s,
+            .rich => return Error.SstEntryIsRich,
+        }
     }
 
     /// Lazily-parsed `xl/sharedStrings.xml`. Returns `null` if the
@@ -280,7 +320,40 @@ pub const Worksheet = struct {
         const view = try self.ensureParsed();
         return view.freeze;
     }
+
+    /// Find a cell by its A1 reference (e.g. "A1", "B7"). Linear scan
+    /// over the parsed rows/cells — sufficient for v1 read-only use.
+    /// Match is case-insensitive on the column letters; row part is
+    /// strict decimal. Returns `null` when no cell matches.
+    ///
+    /// Matched cells are returned by-value (small struct of borrowed
+    /// slices); the underlying SheetXml owns the storage, so the
+    /// returned Cell is valid for the Workbook's lifetime.
+    pub fn cellByRef(self: *Worksheet, ref: []const u8) Error!?sheet_xml_mod.Cell {
+        assert(ref.len > 0);
+        const view = try self.ensureParsed();
+        for (view.rows) |row| {
+            for (row.cells) |c| {
+                if (eqlAsciiIgnoreCase(c.ref, ref)) return c;
+            }
+        }
+        return null;
+    }
 };
+
+/// ASCII-case-insensitive equality. OOXML cell refs are ASCII letters
+/// + decimal digits, so a Unicode-aware fold is unnecessary here.
+fn eqlAsciiIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        if (toAsciiLower(ca) != toAsciiLower(cb)) return false;
+    }
+    return true;
+}
+
+fn toAsciiLower(c: u8) u8 {
+    return if (c >= 'A' and c <= 'Z') c + 32 else c;
+}
 
 // ─── Tests ────────────────────────────────────────────────────────────
 
@@ -374,4 +447,63 @@ test "Workbook.definedNames: surfaces empty list on fixture without names" {
     // surface as an empty slice without erroring.
     const names = wb.definedNames();
     try std.testing.expectEqual(@as(usize, 0), names.len);
+}
+
+test "Workbook.definedNamesGlobal / definedNamesForSheet: split by scope" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+
+    const global = try wb.definedNamesGlobal(std.testing.allocator);
+    defer std.testing.allocator.free(global);
+    try std.testing.expectEqual(@as(usize, 0), global.len);
+
+    const for_s0 = try wb.definedNamesForSheet(std.testing.allocator, 0);
+    defer std.testing.allocator.free(for_s0);
+    try std.testing.expectEqual(@as(usize, 0), for_s0.len);
+
+    const out_of_range = wb.definedNamesForSheet(std.testing.allocator, 9);
+    try std.testing.expectError(Error.SheetIndexOutOfRange, out_of_range);
+}
+
+test "Workbook.sstText: plain entry returns the raw slice; rich errors" {
+    const path = "tests/corpus/worldbank_catalog.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+
+    // The corpus fixture's first SST entry should be plain text.
+    const first = try wb.sstText(0);
+    try std.testing.expect(first != null);
+    try std.testing.expect(first.?.len > 0);
+
+    const sst_view = (try wb.sst()).?;
+    const oor = wb.sstText(@intCast(sst_view.entries.len));
+    try std.testing.expectError(Error.SstIndexOutOfRange, oor);
+}
+
+test "Worksheet.cellByRef: A1-ref lookup matches case-insensitively" {
+    const path = "tests/corpus/openpyxl_guess_types.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+
+    const s0 = try wb.sheet(0);
+
+    // First row of openpyxl_guess_types has a cell at A1.
+    const cell_a1 = try s0.cellByRef("A1");
+    try std.testing.expect(cell_a1 != null);
+
+    // Lowercase ref hits the same cell.
+    const cell_lower = try s0.cellByRef("a1");
+    try std.testing.expect(cell_lower != null);
+    try std.testing.expectEqualStrings(cell_a1.?.ref, cell_lower.?.ref);
+
+    // Out-of-range ref returns null.
+    const cell_zz = try s0.cellByRef("ZZ9999");
+    try std.testing.expect(cell_zz == null);
 }
