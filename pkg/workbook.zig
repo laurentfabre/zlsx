@@ -46,7 +46,89 @@ pub const Error = error{
     SheetNotFound,
     SstIndexOutOfRange,
     SstEntryIsRich,
-} || workbook_xml_mod.Error || sheet_xml_mod.ParseError || sst_xml_mod.Error || styles_xml_mod.Error || store_mod.Error;
+    InvalidCellRef,
+    NoSheetData,
+    UnsupportedCellValue,
+    WriteFailed,
+} || workbook_xml_mod.Error || sheet_xml_mod.ParseError || sst_xml_mod.Error || styles_xml_mod.Error || store_mod.Error ||
+    std.fs.File.WriteError || std.fs.File.OpenError || std.fs.Dir.RenameError || std.fs.Dir.StatFileError;
+
+/// Mutation primitive (B1 iter-wb-4 milestone-1). Strings + formulas
+/// land in milestone-2 (need SST extension via SstAppender plumbing).
+pub const CellValue = union(enum) {
+    blank: void,
+    number: f64,
+    boolean: bool,
+};
+
+/// 1-based (row, col) — matches OOXML A1 conventions.
+pub const CellRef = struct {
+    row: u32,
+    col: u32,
+
+    pub fn eql(a: CellRef, b: CellRef) bool {
+        return a.row == b.row and a.col == b.col;
+    }
+};
+
+/// Parse an A1-style ref ("A1", "AA10") into a numeric CellRef.
+/// Letters are case-insensitive. Returns `error.InvalidCellRef` for
+/// any malformed input (no letters, no digits, leading-zero row,
+/// out-of-range col [> Excel's 16384 limit] / row [> 1048576]).
+pub fn parseA1Ref(ref: []const u8) Error!CellRef {
+    if (ref.len < 2) return error.InvalidCellRef;
+    var i: usize = 0;
+    var col: u32 = 0;
+    while (i < ref.len) : (i += 1) {
+        const c = ref[i];
+        const upper: u8 = if (c >= 'a' and c <= 'z') c - 32 else c;
+        if (upper < 'A' or upper > 'Z') break;
+        // col := col*26 + (upper - 'A' + 1); trapping arithmetic
+        // catches overflow on absurd inputs ("AAAAAAAAAA").
+        const inc: u32 = @as(u32, upper - 'A') + 1;
+        col = std.math.mul(u32, col, 26) catch return error.InvalidCellRef;
+        col = std.math.add(u32, col, inc) catch return error.InvalidCellRef;
+    }
+    if (i == 0) return error.InvalidCellRef; // no letters
+    if (col > 16384) return error.InvalidCellRef; // Excel max column
+    if (i == ref.len) return error.InvalidCellRef; // no digits
+    if (ref[i] == '0') return error.InvalidCellRef; // leading zero forbidden
+    var row: u32 = 0;
+    while (i < ref.len) : (i += 1) {
+        const c = ref[i];
+        if (c < '0' or c > '9') return error.InvalidCellRef;
+        const dig: u32 = c - '0';
+        row = std.math.mul(u32, row, 10) catch return error.InvalidCellRef;
+        row = std.math.add(u32, row, dig) catch return error.InvalidCellRef;
+    }
+    if (row == 0 or row > 1048576) return error.InvalidCellRef;
+    return .{ .row = row, .col = col };
+}
+
+/// Format a CellRef as A1 ("A1", "AA10") into `buf`. Returns the
+/// written slice. `buf.len >= 16` is sufficient for any in-range ref.
+pub fn formatA1Ref(buf: []u8, ref: CellRef) []u8 {
+    assert(ref.row >= 1 and ref.row <= 1048576);
+    assert(ref.col >= 1 and ref.col <= 16384);
+    assert(buf.len >= 16);
+
+    // Letters: convert col (1-based) to base-26 with A=1..Z=26.
+    var letters: [4]u8 = undefined;
+    var n: usize = 0;
+    var c: u32 = ref.col;
+    while (c > 0) : (n += 1) {
+        const r: u32 = (c - 1) % 26;
+        letters[n] = @intCast(@as(u32, 'A') + r);
+        c = (c - 1) / 26;
+    }
+    // Reverse letters into buf[0..n].
+    var i: usize = 0;
+    while (i < n) : (i += 1) buf[i] = letters[n - 1 - i];
+
+    // Row digits — itoa.
+    const row_str = std.fmt.bufPrint(buf[n..], "{d}", .{ref.row}) catch unreachable;
+    return buf[0 .. n + row_str.len];
+}
 
 pub const Workbook = struct {
     allocator: Allocator,
@@ -218,7 +300,255 @@ pub const Workbook = struct {
         self.styles_view = try styles_xml_mod.parse(self.allocator, part.bytes);
         return &self.styles_view.?;
     }
+
+    /// Persist all pending mutations to `path`. For each Worksheet
+    /// with a non-empty delta map: regenerate the sheet's `<sheetData>`
+    /// block from the typed view + deltas, splice into the source
+    /// XML byte-preserving everything outside `<sheetData>`, push
+    /// through PartStore.replacePart, then write the whole archive
+    /// via PartStore.save.
+    ///
+    /// On success: every Worksheet's delta map is empty and any
+    /// previously-cached `SheetXml` view is invalidated (next access
+    /// re-parses from the new bytes).
+    ///
+    /// iter-wb-4 m1 limits: numeric / boolean / blank values only.
+    /// Strings + formulas + new-row-insertion-with-original-cell-
+    /// preservation come in m2.
+    pub fn save(self: *Workbook, path: []const u8) Error!void {
+        for (self.worksheets) |*ws| {
+            if (ws.deltas.count() == 0) continue;
+            _ = try ws.ensureParsed();
+            const part_name = ws.resolved_part_name.?;
+            const view = &ws.parsed.?;
+            const source = blk: {
+                const p = self.store.part(part_name) orelse return error.MissingSheetPart;
+                break :blk p.bytes;
+            };
+
+            const new_xml = try emitSheetWithDeltas(self.allocator, source, view, &ws.deltas);
+            defer self.allocator.free(new_xml);
+            try self.store.replacePart(part_name, new_xml);
+
+            ws.deltas.clearAndFree(self.allocator);
+            // Invalidate the parsed view — its leaves borrowed from
+            // the prior source bytes, which the caller may still see
+            // as live (PartStore arena retains them) but the part's
+            // logical content has changed.
+            var stale = ws.parsed.?;
+            stale.deinit(self.allocator);
+            ws.parsed = null;
+        }
+        try self.store.save(path);
+    }
 };
+
+// ─── Emit helpers (iter-wb-4 m1) ─────────────────────────────────────
+
+/// Splice a regenerated `<sheetData>...</sheetData>` block into the
+/// source sheet XML. Everything outside `<sheetData>` is copied
+/// byte-for-byte. Returns a fresh allocator-owned slice.
+fn emitSheetWithDeltas(
+    allocator: Allocator,
+    source: []const u8,
+    view: *const sheet_xml_mod.SheetXml,
+    deltas: *const std.AutoHashMapUnmanaged(CellRef, CellValue),
+) Error![]u8 {
+    assert(source.len > 0);
+
+    const sd_idx = std.mem.indexOf(u8, source, "<sheetData") orelse
+        return error.NoSheetData;
+    const open_gt = std.mem.indexOfScalarPos(u8, source, sd_idx, '>') orelse
+        return error.NoSheetData;
+    const is_self_closing = open_gt > 0 and source[open_gt - 1] == '/';
+
+    var prefix_end: usize = undefined;
+    var suffix_start: usize = undefined;
+    if (is_self_closing) {
+        prefix_end = sd_idx; // we re-emit `<sheetData>` ourselves
+        suffix_start = open_gt + 1;
+    } else {
+        prefix_end = open_gt + 1;
+        suffix_start = std.mem.indexOfPos(u8, source, prefix_end, "</sheetData>") orelse
+            return error.NoSheetData;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, source.len + 1024);
+
+    try out.appendSlice(allocator, source[0..prefix_end]);
+    if (is_self_closing) try out.appendSlice(allocator, "<sheetData>");
+
+    try emitSheetData(allocator, &out, view, deltas);
+
+    if (is_self_closing) try out.appendSlice(allocator, "</sheetData>");
+    try out.appendSlice(allocator, source[suffix_start..]);
+
+    return try out.toOwnedSlice(allocator);
+}
+
+const MergedCell = struct {
+    ref: CellRef,
+    style_idx: ?u32,
+    payload: union(enum) {
+        original: struct {
+            cell_type: sheet_xml_mod.CellType,
+            raw_value: ?[]const u8,
+            formula: ?[]const u8,
+        },
+        delta: CellValue,
+    },
+};
+
+fn mergedLessThan(_: void, a: MergedCell, b: MergedCell) bool {
+    if (a.ref.row != b.ref.row) return a.ref.row < b.ref.row;
+    return a.ref.col < b.ref.col;
+}
+
+fn emitSheetData(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    view: *const sheet_xml_mod.SheetXml,
+    deltas: *const std.AutoHashMapUnmanaged(CellRef, CellValue),
+) Error!void {
+    // 1. Collect existing cells (override with delta if matching).
+    var merged: std.ArrayList(MergedCell) = .empty;
+    defer merged.deinit(allocator);
+
+    var seen: std.AutoHashMapUnmanaged(CellRef, void) = .{};
+    defer seen.deinit(allocator);
+
+    for (view.rows) |row| {
+        for (row.cells) |c| {
+            const cr = parseA1Ref(c.ref) catch continue;
+            const overlay = deltas.get(cr);
+            const mc: MergedCell = if (overlay) |dv| .{
+                .ref = cr,
+                .style_idx = c.style_idx,
+                .payload = .{ .delta = dv },
+            } else .{
+                .ref = cr,
+                .style_idx = c.style_idx,
+                .payload = .{ .original = .{
+                    .cell_type = c.cell_type,
+                    .raw_value = c.raw_value,
+                    .formula = c.formula,
+                } },
+            };
+            try merged.append(allocator, mc);
+            try seen.put(allocator, cr, {});
+        }
+    }
+
+    // 2. Append delta-only cells (not matched to any existing cell).
+    var dit = deltas.iterator();
+    while (dit.next()) |entry| {
+        if (seen.contains(entry.key_ptr.*)) continue;
+        try merged.append(allocator, .{
+            .ref = entry.key_ptr.*,
+            .style_idx = null,
+            .payload = .{ .delta = entry.value_ptr.* },
+        });
+    }
+
+    // 3. Sort by (row, col) and group emit.
+    std.sort.pdq(MergedCell, merged.items, {}, mergedLessThan);
+
+    var i: usize = 0;
+    var num_buf: [32]u8 = undefined;
+    while (i < merged.items.len) {
+        const row_idx = merged.items[i].ref.row;
+        var j = i;
+        while (j < merged.items.len and merged.items[j].ref.row == row_idx) : (j += 1) {}
+
+        // <row r="N">
+        try out.appendSlice(allocator, "<row r=\"");
+        try out.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{row_idx}));
+        try out.appendSlice(allocator, "\">");
+
+        for (merged.items[i..j]) |mc| try emitCell(allocator, out, mc);
+
+        try out.appendSlice(allocator, "</row>");
+        i = j;
+    }
+}
+
+fn emitCell(allocator: Allocator, out: *std.ArrayList(u8), mc: MergedCell) Error!void {
+    var ref_buf: [16]u8 = undefined;
+    const ref_str = formatA1Ref(&ref_buf, mc.ref);
+
+    try out.appendSlice(allocator, "<c r=\"");
+    try out.appendSlice(allocator, ref_str);
+    try out.appendSlice(allocator, "\"");
+
+    if (mc.style_idx) |s| {
+        var s_buf: [16]u8 = undefined;
+        try out.appendSlice(allocator, " s=\"");
+        try out.appendSlice(allocator, try std.fmt.bufPrint(&s_buf, "{d}", .{s}));
+        try out.appendSlice(allocator, "\"");
+    }
+
+    switch (mc.payload) {
+        .original => |orig| {
+            if (cellTypeAttr(orig.cell_type)) |t_attr| {
+                try out.appendSlice(allocator, " t=\"");
+                try out.appendSlice(allocator, t_attr);
+                try out.appendSlice(allocator, "\"");
+            }
+            if (orig.raw_value == null and orig.formula == null) {
+                try out.appendSlice(allocator, "/>");
+                return;
+            }
+            try out.appendSlice(allocator, ">");
+            if (orig.formula) |f| {
+                try out.appendSlice(allocator, "<f>");
+                try out.appendSlice(allocator, f);
+                try out.appendSlice(allocator, "</f>");
+            }
+            if (orig.raw_value) |v| {
+                if (orig.cell_type == .inline_string) {
+                    try out.appendSlice(allocator, "<is><t>");
+                    try out.appendSlice(allocator, v);
+                    try out.appendSlice(allocator, "</t></is>");
+                } else {
+                    try out.appendSlice(allocator, "<v>");
+                    try out.appendSlice(allocator, v);
+                    try out.appendSlice(allocator, "</v>");
+                }
+            }
+            try out.appendSlice(allocator, "</c>");
+        },
+        .delta => |dv| switch (dv) {
+            .blank => {
+                try out.appendSlice(allocator, "/>");
+            },
+            .number => |n| {
+                try out.appendSlice(allocator, "><v>");
+                var nbuf: [64]u8 = undefined;
+                try out.appendSlice(allocator, try std.fmt.bufPrint(&nbuf, "{d}", .{n}));
+                try out.appendSlice(allocator, "</v></c>");
+            },
+            .boolean => |b| {
+                try out.appendSlice(allocator, " t=\"b\"><v>");
+                try out.appendSlice(allocator, if (b) "1" else "0");
+                try out.appendSlice(allocator, "</v></c>");
+            },
+        },
+    }
+}
+
+fn cellTypeAttr(t: sheet_xml_mod.CellType) ?[]const u8 {
+    return switch (t) {
+        .number => null, // OOXML default; omit attribute
+        .shared_string => "s",
+        .boolean => "b",
+        .formula_string => "str",
+        .inline_string => "inlineStr",
+        .error_value => "e",
+        .date => "d",
+    };
+}
 
 pub const Worksheet = struct {
     /// Back-pointer set lazily by `Workbook.sheet(idx)` (the slot table
@@ -232,12 +562,17 @@ pub const Worksheet = struct {
     /// Cached resolved part name (e.g. "xl/worksheets/sheet1.xml").
     resolved_part_name: ?[]const u8,
 
+    /// Pending mutations (B1 iter-wb-4 m1). Keyed by `CellRef`; the
+    /// last `setCell` for a given ref wins. Empty after `Workbook.save`.
+    deltas: std.AutoHashMapUnmanaged(CellRef, CellValue) = .{},
+
     pub fn deinit(self: *Worksheet, allocator: Allocator) void {
         if (self.parsed) |*p| {
             var view = p.*;
             view.deinit(allocator);
         }
         if (self.resolved_part_name) |part_name| allocator.free(part_name);
+        self.deltas.deinit(allocator);
     }
 
     /// Sheet name from the workbook's sheets list. Borrowed.
@@ -338,6 +673,16 @@ pub const Worksheet = struct {
             }
         }
         return null;
+    }
+
+    /// Stage a mutation for cell at A1 ref `ref`. Persisted by
+    /// `Workbook.save`. The last `setCell` call for a given ref wins.
+    /// Strings + formulas land in iter-wb-4 m2; this milestone covers
+    /// numeric, boolean, and blank values only.
+    pub fn setCell(self: *Worksheet, ref: []const u8, value: CellValue) Error!void {
+        assert(ref.len > 0);
+        const cr = try parseA1Ref(ref);
+        try self.deltas.put(self.workbook.allocator, cr, value);
     }
 };
 
@@ -506,4 +851,122 @@ test "Worksheet.cellByRef: A1-ref lookup matches case-insensitively" {
     // Out-of-range ref returns null.
     const cell_zz = try s0.cellByRef("ZZ9999");
     try std.testing.expect(cell_zz == null);
+}
+
+test "parseA1Ref: well-formed refs map to (row, col)" {
+    try std.testing.expectEqual(CellRef{ .row = 1, .col = 1 }, try parseA1Ref("A1"));
+    try std.testing.expectEqual(CellRef{ .row = 10, .col = 2 }, try parseA1Ref("B10"));
+    try std.testing.expectEqual(CellRef{ .row = 1, .col = 27 }, try parseA1Ref("AA1"));
+    try std.testing.expectEqual(CellRef{ .row = 1048576, .col = 16384 }, try parseA1Ref("XFD1048576"));
+    // Lowercase OK
+    try std.testing.expectEqual(CellRef{ .row = 7, .col = 4 }, try parseA1Ref("d7"));
+}
+
+test "parseA1Ref: malformed input rejected" {
+    try std.testing.expectError(Error.InvalidCellRef, parseA1Ref(""));
+    try std.testing.expectError(Error.InvalidCellRef, parseA1Ref("A"));
+    try std.testing.expectError(Error.InvalidCellRef, parseA1Ref("1"));
+    try std.testing.expectError(Error.InvalidCellRef, parseA1Ref("A0"));
+    try std.testing.expectError(Error.InvalidCellRef, parseA1Ref("A09"));
+    try std.testing.expectError(Error.InvalidCellRef, parseA1Ref("XFE1")); // col > 16384
+    try std.testing.expectError(Error.InvalidCellRef, parseA1Ref("A1048577")); // row > 1048576
+    try std.testing.expectError(Error.InvalidCellRef, parseA1Ref("A1B"));
+}
+
+test "formatA1Ref: round-trips" {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("A1", formatA1Ref(&buf, .{ .row = 1, .col = 1 }));
+    try std.testing.expectEqualStrings("Z99", formatA1Ref(&buf, .{ .row = 99, .col = 26 }));
+    try std.testing.expectEqualStrings("AA1", formatA1Ref(&buf, .{ .row = 1, .col = 27 }));
+    try std.testing.expectEqualStrings("XFD1048576", formatA1Ref(&buf, .{ .row = 1048576, .col = 16384 }));
+}
+
+test "Workbook.setCell + save: round-trip a number through PartStore" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    // Stage a temp output path under .zig-cache (always writable in
+    // CI). Random suffix so parallel test binaries don't collide.
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-setcell-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        const s0 = try wb.sheet(0);
+        try s0.setCell("A1", .{ .number = 42 });
+        try s0.setCell("B2", .{ .number = -3.14 });
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    // Re-open and verify the cells round-tripped.
+    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb2.deinit();
+    const s0 = try wb2.sheet(0);
+    const a1 = try s0.cellByRef("A1");
+    try std.testing.expect(a1 != null);
+    try std.testing.expect(a1.?.cell_type == .number);
+    try std.testing.expect(a1.?.raw_value != null);
+    try std.testing.expectEqualStrings("42", a1.?.raw_value.?);
+
+    const b2 = try s0.cellByRef("B2");
+    try std.testing.expect(b2 != null);
+    try std.testing.expect(b2.?.cell_type == .number);
+    try std.testing.expect(b2.?.raw_value != null);
+    // Zig's "{d}" on -3.14 emits "-3.14"; checking exact bytes.
+    try std.testing.expectEqualStrings("-3.14", b2.?.raw_value.?);
+}
+
+test "Workbook.setCell + save: boolean and blank land typed correctly" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-bool-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        const s0 = try wb.sheet(0);
+        try s0.setCell("A1", .{ .boolean = true });
+        try s0.setCell("B1", .{ .boolean = false });
+        try s0.setCell("C1", .blank);
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb2.deinit();
+    const s0 = try wb2.sheet(0);
+
+    const a1 = try s0.cellByRef("A1");
+    try std.testing.expect(a1 != null);
+    try std.testing.expect(a1.?.cell_type == .boolean);
+    try std.testing.expectEqualStrings("1", a1.?.raw_value.?);
+
+    const b1 = try s0.cellByRef("B1");
+    try std.testing.expect(b1 != null);
+    try std.testing.expect(b1.?.cell_type == .boolean);
+    try std.testing.expectEqualStrings("0", b1.?.raw_value.?);
+
+    const c1 = try s0.cellByRef("C1");
+    // A blank cell (`<c r="C1"/>`) is still scanned by sheet_xml's
+    // parser; raw_value is null and cell_type stays at the default.
+    try std.testing.expect(c1 != null);
+    try std.testing.expect(c1.?.raw_value == null);
+}
+
+test "Workbook.setCell: invalid ref errors before saving" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+    const s0 = try wb.sheet(0);
+
+    try std.testing.expectError(Error.InvalidCellRef, s0.setCell("A0", .{ .number = 1 }));
+    try std.testing.expectError(Error.InvalidCellRef, s0.setCell("XFE1", .{ .number = 1 }));
 }
