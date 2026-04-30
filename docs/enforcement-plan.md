@@ -10,7 +10,7 @@ Status as of 2026-04-30. Single-author public repo (`laurentfabre/zlsx`), Zig 0.
 | 2 | TDD CI gates: test-presence, C-ABI 3-file-transaction, monotonic test count | **Done (2026-04-30, advisory)** |
 | 3 | Worktree + subagent conventions: helper script, commit-msg trailer, PR template fields | **Done (2026-04-30)** |
 | 4 | Agent-as-reviewer CI job (codex-review-on-PR) | **Done (2026-04-30, requires `OPENAI_API_KEY` secret)** |
-| 5 | Optional: coverage gate, TDAD map, mutation testing | Deferred |
+| 5 | Optional: coverage gate (deferred), TDAD map (**done 2026-04-30**), mutation testing (deferred) | **Partial** |
 
 ---
 
@@ -241,6 +241,26 @@ BASE_SHA=$(git merge-base origin/main HEAD) HEAD_SHA=HEAD LABELS='["abi-no-3file
 - Pin a specific codex CLI version (`@openai/codex@<version>`) once a stable release is known to work in CI; the current `@latest` is a moving target.
 - Switch to `xhigh` reasoning effort for security-critical paths via a per-path matrix; current single-job design is intentionally simple.
 
+## Phase 5 — implementation log (partial)
+
+### Item 13: TDAD map — Done (2026-04-30)
+
+- [x] `scripts/ci/tdad-map.sh` — generates a Markdown TDAD map from a PR diff: per-changed-file inline `test "..."` blocks, related corpus / fuzz / binding surfaces, diff summary.
+- [x] `tdad-map` job in `.github/workflows/pr-gates.yml` — runs the script and posts the result as an in-place-updating PR comment (marker: `<!-- tdad-map -->`).
+- [x] Smoke-tested locally against historical commits (`ab2c1a2` → 24 inline tests in `c_abi.zig`; `a49070c` → 14 inline tests in `xlsx.zig` plus corpus + fuzz surfaces).
+
+### Items 12 + 14 — still deferred
+
+- **Coverage gate**: Zig 0.15.2's `zig test --test-coverage` works via kcov on Linux but is flaky on macOS / Windows. zlsx already has 480+ tests + corpus integration + 2 fuzz binaries; a coverage gate would mostly tell us what we already know.
+- **Mutation testing**: no Zig mutation framework. Building one is multi-week. Defer indefinitely.
+
+### How TDAD reads in the wild
+
+- Information-only: never gates a PR, never fails. Comment is updated in place across re-runs.
+- Truncates at 60 KB to stay under GitHub's comment size cap.
+- Heuristic fallback when nothing matches: prints "_No inline `test "..."` blocks in the changed files._"
+- Empty .zig diff: one-line note "_No `.zig` files changed — TDAD map empty._"
+
 ## Pending items (live state)
 
 | Item | Status | Notes |
@@ -254,7 +274,9 @@ BASE_SHA=$(git merge-base origin/main HEAD) HEAD_SHA=HEAD LABELS='["abi-no-3file
 | `bench` regression CI — pre-existing apt-hyperfine failure | **Fixed (2026-04-30, PR #5)** | Pinned hyperfine 1.18.0 via release `.deb`. |
 | `OPENAI_API_KEY` repo secret | **Deferred (2026-04-30)** | Workflow no-ops with a CI warning until set. |
 | `Codex review` → `required_status_checks` | **Deferred (2026-04-30)** | Comment-posting flow gives the reviewer signal without merge friction. |
-| Phase 5 (coverage / TDAD / mutation) | **Deferred indefinitely** | Tooling rough or absent in Zig ecosystem. |
+| Phase 5 — TDAD map | **Done (2026-04-30)** | `scripts/ci/tdad-map.sh` + `tdad-map` job in pr-gates.yml. Posts an inline-tests + related-surfaces comment on every PR. Information-only, never gates. |
+| Phase 5 — Coverage gate | Deferred | Zig 0.15.2 `--test-coverage` + kcov tooling rough on macOS / Windows; signal-to-noise poor for the effort at zlsx's scale. |
+| Phase 5 — Mutation testing | Deferred indefinitely | No Zig mutation framework exists. |
 
 ## Phase 1 — operational note
 

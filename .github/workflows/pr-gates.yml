@@ -55,3 +55,73 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: bash scripts/ci/monotonic-test-count.sh
+
+  tdad-map:
+    name: TDAD map
+    # Phase 5 / Item 13: surfaces inline tests + related corpus / fuzz
+    # / binding test surfaces affected by the PR. Posted as a comment,
+    # updated in place across re-runs. Information-only — never gates.
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Generate TDAD map
+        id: gen
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          bash scripts/ci/tdad-map.sh > /tmp/tdad.md
+          echo "=== first 40 lines of TDAD map ==="
+          head -40 /tmp/tdad.md
+      - name: Post / update PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body;
+            try {
+              body = fs.readFileSync('/tmp/tdad.md', 'utf8');
+            } catch (e) {
+              core.warning('TDAD map missing — nothing to post');
+              return;
+            }
+            if (!body.trim()) {
+              core.warning('TDAD map empty — nothing to post');
+              return;
+            }
+            const maxLen = 60000;
+            const truncated = body.length > maxLen
+              ? body.slice(0, maxLen) + '\n\n_(truncated — full map in the action log)_'
+              : body;
+            const marker = '<!-- tdad-map -->';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            const newBody = `${marker}\n${truncated}`;
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: newBody,
+              });
+              core.info(`Updated TDAD comment ${existing.id}`);
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: newBody,
+              });
+              core.info('Created new TDAD comment');
+            }
