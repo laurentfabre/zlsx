@@ -207,6 +207,21 @@ pub fn build(b: *std.Build) void {
     const package_typed_parts_tests = b.addTest(.{ .root_module = package_typed_parts_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_typed_parts_tests).step);
 
+    // pkg/workbook.zig — Workbook + Worksheet typed-overlay roots
+    // (B1 iter-wb-2). Composes PartStore + typed_parts into a single
+    // model surface; read-only in this iter, mutation lands iter-wb-4.
+    // Inline tests open small fixtures directly, so this module needs
+    // tests/corpus/* to exist at runtime — the corpus_step covers
+    // missing-fixture skipping per scripts/fetch_test_corpus.sh.
+    const package_workbook_tests_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/workbook.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    package_workbook_tests_mod.addImport("writer", writer_mod);
+    const package_workbook_tests = b.addTest(.{ .root_module = package_workbook_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(package_workbook_tests).step);
+
     // Package-layer fuzz module: pkg/store.zig hosts fuzz targets
     // for decodeXmlEntities + looksExternal. Same fuzz=true flag
     // as src/xlsx.zig's unit_fuzz_mod, separate binary because
@@ -248,6 +263,20 @@ pub fn build(b: *std.Build) void {
     const typed_parts_corpus_tests = b.addTest(.{ .root_module = typed_parts_corpus_mod });
     corpus_step.dependOn(&b.addRunArtifact(typed_parts_corpus_tests).step);
     test_step.dependOn(&b.addRunArtifact(typed_parts_corpus_tests).step);
+
+    // tests/workbook_corpus.zig — corpus parity sweep for B1 iter-wb-2:
+    // every fixture opens as Workbook, every Worksheet materialises
+    // through the typed-overlay composition (PartStore → typed_parts
+    // → Workbook → Worksheet).
+    const workbook_corpus_mod = b.createModule(.{
+        .root_source_file = b.path("tests/workbook_corpus.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    workbook_corpus_mod.addImport("zlsx_pkg", package_mod);
+    const workbook_corpus_tests = b.addTest(.{ .root_module = workbook_corpus_mod });
+    corpus_step.dependOn(&b.addRunArtifact(workbook_corpus_tests).step);
+    test_step.dependOn(&b.addRunArtifact(workbook_corpus_tests).step);
 
     // C ABI — both a shared library (for Python / cffi bindings) and a
     // static library (for language toolchains that prefer linking in).
