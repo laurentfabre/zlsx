@@ -59,7 +59,7 @@ test "typed_parts corpus sweep — every well-known part parses without leak" {
         defer store.deinit();
 
         // workbook.xml — every well-formed OOXML package has exactly one.
-        if (store.part("xl/workbook.xml")) |p| {
+        if (try store.part("xl/workbook.xml")) |p| {
             var view = pkg.typed_parts.workbook_xml.parse(alloc, p.bytes) catch |err| {
                 std.debug.print("\n  [workbook.xml parse failed] {s} -> {s}\n", .{ name, @errorName(err) });
                 return err;
@@ -70,7 +70,7 @@ test "typed_parts corpus sweep — every well-known part parses without leak" {
         }
 
         // sharedStrings.xml — optional.
-        if (store.part("xl/sharedStrings.xml")) |p| {
+        if (try store.part("xl/sharedStrings.xml")) |p| {
             var view = pkg.typed_parts.sst_xml.parse(alloc, p.bytes) catch |err| {
                 std.debug.print("\n  [sharedStrings.xml parse failed] {s} -> {s}\n", .{ name, @errorName(err) });
                 return err;
@@ -80,7 +80,7 @@ test "typed_parts corpus sweep — every well-known part parses without leak" {
         }
 
         // styles.xml — optional but present on every fixture this corpus carries.
-        if (store.part("xl/styles.xml")) |p| {
+        if (try store.part("xl/styles.xml")) |p| {
             var view = pkg.typed_parts.styles_xml.parse(alloc, p.bytes) catch |err| {
                 std.debug.print("\n  [styles.xml parse failed] {s} -> {s}\n", .{ name, @errorName(err) });
                 return err;
@@ -94,7 +94,7 @@ test "typed_parts corpus sweep — every well-known part parses without leak" {
         const part_names = try store.partNames();
         for (part_names) |pn| {
             if (std.mem.startsWith(u8, pn, "xl/theme/") and std.mem.endsWith(u8, pn, ".xml")) {
-                if (store.part(pn)) |p| {
+                if (try store.part(pn)) |p| {
                     var view = pkg.typed_parts.theme_xml.parse(alloc, p.bytes) catch |err| {
                         std.debug.print("\n  [{s} parse failed] {s} -> {s}\n", .{ pn, name, @errorName(err) });
                         return err;
@@ -109,7 +109,7 @@ test "typed_parts corpus sweep — every well-known part parses without leak" {
         // First sheet found by part name — sufficient for parity sweep.
         for (part_names) |pn| {
             if (std.mem.startsWith(u8, pn, "xl/worksheets/sheet") and std.mem.endsWith(u8, pn, ".xml")) {
-                if (store.part(pn)) |p| {
+                if (try store.part(pn)) |p| {
                     var view = pkg.typed_parts.sheet_xml.parse(alloc, p.bytes) catch |err| {
                         std.debug.print("\n  [{s} parse failed] {s} -> {s}\n", .{ pn, name, @errorName(err) });
                         return err;

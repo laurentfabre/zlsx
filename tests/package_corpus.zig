@@ -103,7 +103,7 @@ test "PartStore corpus sweep — open + walk every fixture without crash" {
                 }
                 // At least the [Content_Types].xml part must be present
                 // in any well-formed OOXML package.
-                try std.testing.expect(store.part("[Content_Types].xml") != null);
+                try std.testing.expect((try store.part("[Content_Types].xml")) != null);
             },
             .must_error_typed => {
                 if (open_result) |*s| {

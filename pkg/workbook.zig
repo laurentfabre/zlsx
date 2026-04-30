@@ -217,7 +217,7 @@ pub const Workbook = struct {
         var s = store;
         errdefer s.deinit();
 
-        const wb_part = s.part("xl/workbook.xml") orelse
+        const wb_part = try s.part("xl/workbook.xml") orelse
             return Error.MissingWorkbookPart;
 
         var workbook_view = try workbook_xml_mod.parse(allocator, wb_part.bytes);
@@ -363,7 +363,7 @@ pub const Workbook = struct {
     /// workbook has no SST. Subsequent calls return the cached view.
     pub fn sst(self: *Workbook) Error!?*const sst_xml_mod.SstXml {
         if (self.sst_view != null) return &self.sst_view.?;
-        const part = self.store.part("xl/sharedStrings.xml") orelse return null;
+        const part = try self.store.part("xl/sharedStrings.xml") orelse return null;
         self.sst_view = try sst_xml_mod.parse(self.allocator, part.bytes);
         return &self.sst_view.?;
     }
@@ -371,7 +371,7 @@ pub const Workbook = struct {
     /// Lazily-parsed `xl/styles.xml`. Returns `null` if absent.
     pub fn styles(self: *Workbook) Error!?*const styles_xml_mod.StylesXml {
         if (self.styles_view != null) return &self.styles_view.?;
-        const part = self.store.part("xl/styles.xml") orelse return null;
+        const part = try self.store.part("xl/styles.xml") orelse return null;
         self.styles_view = try styles_xml_mod.parse(self.allocator, part.bytes);
         return &self.styles_view.?;
     }
@@ -408,7 +408,7 @@ pub const Workbook = struct {
             const part_name = ws.resolved_part_name.?;
             const view = &ws.parsed.?;
             const source = blk: {
-                const p = self.store.part(part_name) orelse return error.MissingSheetPart;
+                const p = try self.store.part(part_name) orelse return error.MissingSheetPart;
                 break :blk p.bytes;
             };
 
@@ -976,7 +976,7 @@ fn applySstExtensionPlan(wb: *Workbook, plan: *const SstExtensionPlan) Error!voi
     if (plan.sst_part_exists) {
         // Re-emit the SST part with the existing entries preserved
         // verbatim and the new strings appended.
-        const existing_part = wb.store.part("xl/sharedStrings.xml") orelse
+        const existing_part = try wb.store.part("xl/sharedStrings.xml") orelse
             return Error.MissingWorkbookPart; // sst_part_exists invariant violated
         const new_xml = try emitSstXmlForExtension(
             wb.allocator,
@@ -1001,7 +1001,7 @@ fn applySstExtensionPlan(wb: *Workbook, plan: *const SstExtensionPlan) Error!voi
     );
 
     // Splice a `<Relationship>` into `xl/_rels/workbook.xml.rels`.
-    const rels_part = wb.store.part("xl/_rels/workbook.xml.rels") orelse
+    const rels_part = try wb.store.part("xl/_rels/workbook.xml.rels") orelse
         return Error.MissingWorkbookRels;
     const new_rels = try injectSstRelationship(wb.allocator, rels_part.bytes);
     defer wb.allocator.free(new_rels);
@@ -1400,7 +1400,7 @@ pub const Worksheet = struct {
         errdefer wb.allocator.free(owned);
         self.resolved_part_name = owned;
 
-        const part = wb.store.part(part_name) orelse return Error.MissingSheetPart;
+        const part = try wb.store.part(part_name) orelse return Error.MissingSheetPart;
         self.parsed = try sheet_xml_mod.parse(wb.allocator, part.bytes);
         return &self.parsed.?;
     }

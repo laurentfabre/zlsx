@@ -31,11 +31,28 @@ pub const Part = struct {
     content_type: ?[]const u8,
     /// Decompressed part bytes. Owned by the PartStore arena;
     /// borrowed by the caller for the PartStore's lifetime.
+    ///
+    /// **Lazy materialization (since iter-wb-6 ratio gate fix):**
+    /// `bytes.len` is 0 for parts with `uncompressed_size > 0` that
+    /// haven't been accessed yet. `PartStore.part(name)` decompresses
+    /// + caches on first call. Inherently-empty parts (size == 0)
+    /// stay empty across the boundary.
+    /// Always-materialized parts: `[Content_Types].xml` and every
+    /// `_rels/*.rels` (needed at open() for content-type / relationship
+    /// resolution).
     bytes: []const u8,
     /// ZIP compression method as recorded in the central directory
     /// (0 = stored, 8 = deflate). Useful for callers that want to
     /// re-emit byte-for-byte later.
     compression_method: u16,
+
+    // ─── Lazy-materialization metadata ────────────────────────────────
+    // These fields let `PartStore.part()` decompress + verify on first
+    // access. Internal-only for callers (read for resilience only).
+    payload_offset: u32 = 0,
+    compressed_size: u32 = 0,
+    uncompressed_size: u32 = 0,
+    crc32: u32 = 0,
 };
 
 pub const TargetMode = enum { internal, external };
@@ -112,30 +129,42 @@ pub const PartStore = struct {
 
         const entries = try scanCentralDirectory(ar_alloc, buf);
 
-        // Decompress each entry eagerly. M1 chose eager because it
-        // makes content-types / rels parsing trivial and keeps the
-        // public API allocator-free.
+        // Lazy decompression (iter-wb-6 ratio gate fix): only the
+        // structural parts ([Content_Types].xml + every _rels/*.rels)
+        // are decompressed at open() — they're needed inline for
+        // content-type / relationship resolution. Everything else
+        // stays compressed in `src_buf` until `PartStore.part()` first
+        // surfaces them. CRC32 verification moves to first-access for
+        // deferred parts (eager parts are still verified here).
         const parts = try ar_alloc.alloc(Part, entries.len);
         for (entries, 0..) |e, i| {
-            const compressed = buf[e.payload_offset .. e.payload_offset + e.compressed_size];
-            const bytes = try decompressPayload(
-                ar_alloc,
-                compressed,
-                e.compression_method,
-                e.uncompressed_size,
-            );
-            // Verify the CDFH CRC32 against the decompressed bytes.
-            // Eager decompression means we'd otherwise hand corrupted
-            // payloads to callers (imageParts, drawing walkers,
-            // zlsx-extract-images writing damaged files to disk).
-            // Surfacing BadZip here is the contract every consumer
-            // already handles — see derived_bad_crc32.xlsx fixture.
-            if (std.hash.Crc32.hash(bytes) != e.crc32) return Error.BadZip;
+            const eager = isStructuralPart(e.name) or e.uncompressed_size == 0;
+            var bytes: []const u8 = &.{};
+            if (eager) {
+                const compressed = buf[e.payload_offset .. e.payload_offset + e.compressed_size];
+                bytes = try decompressPayload(
+                    ar_alloc,
+                    compressed,
+                    e.compression_method,
+                    e.uncompressed_size,
+                );
+                // Verify CDFH CRC32 against decompressed bytes for
+                // structural parts. Deferred parts get the same
+                // verification on first access in `part()`.
+                if (std.hash.Crc32.hash(bytes) != e.crc32) return Error.BadZip;
+            }
             parts[i] = .{
                 .name = e.name,
                 .content_type = null, // resolved next pass
                 .bytes = bytes,
                 .compression_method = e.compression_method,
+                // ZipEntry.payload_offset is `usize`; Zip32 caps it
+                // at u32, and `open()` rejected stat.size > u32 above
+                // (line 107). `@intCast` is safe under that invariant.
+                .payload_offset = @intCast(e.payload_offset),
+                .compressed_size = e.compressed_size,
+                .uncompressed_size = e.uncompressed_size,
+                .crc32 = e.crc32,
             };
         }
 
@@ -624,11 +653,39 @@ pub const PartStore = struct {
         return out;
     }
 
-    pub fn part(self: *const PartStore, name: []const u8) ?Part {
-        for (self.parts) |p| {
-            if (std.mem.eql(u8, p.name, name)) return p;
-        }
-        return null;
+    pub fn part(self: *const PartStore, name: []const u8) Error!?Part {
+        const idx = self.findIndex(name) orelse return null;
+        try materializeAt(self, idx);
+        return self.parts[idx];
+    }
+
+    /// Materialize the part at `idx` if it hasn't been already. The
+    /// `@constCast` here is safe because the cache fill is morally
+    /// mutable — every reader that asks for the same bytes gets the
+    /// same answer; we just compute it once. Inherently-empty parts
+    /// (uncompressed_size == 0) skip the decompress entirely.
+    fn materializeAt(self: *const PartStore, idx: usize) Error!void {
+        const p = &@constCast(self).parts[idx];
+        if (p.bytes.len > 0 or p.uncompressed_size == 0) return;
+        const ar_alloc = @constCast(&self.arena).allocator();
+        const compressed = self.src_buf[p.payload_offset .. p.payload_offset + p.compressed_size];
+        const bytes = try decompressPayload(
+            ar_alloc,
+            compressed,
+            p.compression_method,
+            p.uncompressed_size,
+        );
+        if (std.hash.Crc32.hash(bytes) != p.crc32) return Error.BadZip;
+        p.bytes = bytes;
+    }
+
+    /// Structural parts are decompressed eagerly at `open()` because
+    /// content-type / relationship resolution needs their bytes
+    /// inline. Everything else defers to first-access via `part()`.
+    fn isStructuralPart(name: []const u8) bool {
+        if (std.mem.eql(u8, name, "[Content_Types].xml")) return true;
+        if (std.mem.endsWith(u8, name, ".rels")) return true;
+        return false;
     }
 
     /// Filtered view of parts whose content type starts with
@@ -643,10 +700,16 @@ pub const PartStore = struct {
     pub fn imageParts(self: *const PartStore) ![]const Part {
         const ar_alloc = @constCast(&self.arena).allocator();
         var out: std.ArrayListUnmanaged(Part) = .empty;
-        for (self.parts) |p| {
+        for (self.parts, 0..) |p, idx| {
             const ct = p.content_type orelse continue;
             if (std.mem.startsWith(u8, ct, "image/")) {
-                try out.append(ar_alloc, p);
+                // Materialize bytes before exposing — image-walking
+                // callers (drawing parser, zlsx-extract-images) need
+                // the decompressed payload to write the image to disk
+                // or compute its size. Lazy mode means this is a
+                // no-op the second time around.
+                try materializeAt(self, idx);
+                try out.append(ar_alloc, self.parts[idx]);
             }
         }
         return try out.toOwnedSlice(ar_alloc);
@@ -1388,7 +1451,7 @@ test "PartStore.part: workbook.xml has a workbook content type" {
     var store = try PartStore.open(std.testing.allocator, fixture);
     defer store.deinit();
 
-    const wb = store.part("xl/workbook.xml") orelse return error.TestUnexpectedResult;
+    const wb = try store.part("xl/workbook.xml") orelse return error.TestUnexpectedResult;
     const ct = wb.content_type orelse return error.TestUnexpectedResult;
     // OOXML ContentType for the workbook part. The canonical
     // workbook content-type is `…spreadsheetml.sheet.main+xml`
@@ -1559,7 +1622,7 @@ test "PartStore.replacePart + save: replaced part has new bytes; others untouche
     {
         var store = try PartStore.open(std.testing.allocator, fixture);
         defer store.deinit();
-        const wb_part = store.part("xl/workbook.xml") orelse return error.TestUnexpectedResult;
+        const wb_part = try store.part("xl/workbook.xml") orelse return error.TestUnexpectedResult;
         src_workbook_bytes = wb_part.bytes;
         // Pick a small XML part that's safe to overwrite for the
         // round-trip test. workbook.xml ensures we exercise the
@@ -1572,7 +1635,7 @@ test "PartStore.replacePart + save: replaced part has new bytes; others untouche
     defer dst.deinit();
 
     // Replaced part has the new bytes.
-    const wb = dst.part("xl/workbook.xml") orelse return error.TestUnexpectedResult;
+    const wb = try dst.part("xl/workbook.xml") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, replacement, wb.bytes);
 
     // Sanity: at least one OTHER part still matches the source's
@@ -1580,8 +1643,8 @@ test "PartStore.replacePart + save: replaced part has new bytes; others untouche
     // frictionless_2sheets is a stable Override-typed part.
     var src = try PartStore.open(std.testing.allocator, fixture);
     defer src.deinit();
-    if (src.part("xl/sharedStrings.xml")) |s| {
-        const d = dst.part("xl/sharedStrings.xml") orelse return error.TestUnexpectedResult;
+    if (try src.part("xl/sharedStrings.xml")) |s| {
+        const d = try dst.part("xl/sharedStrings.xml") orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualSlices(u8, s.bytes, d.bytes);
     }
 }
@@ -1619,7 +1682,7 @@ test "PartStore.replacePart: large input round-trips through deflate" {
 
     var dst = try PartStore.open(std.testing.allocator, out_path);
     defer dst.deinit();
-    const wb = dst.part("xl/workbook.xml") orelse return error.TestUnexpectedResult;
+    const wb = try dst.part("xl/workbook.xml") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, replacement, wb.bytes);
 }
 
@@ -1828,7 +1891,7 @@ test "PartStore.addPart + save: new part survives round-trip with content type" 
     var dst = try PartStore.open(std.testing.allocator, out_path);
     defer dst.deinit();
 
-    const part_in_dst = dst.part(new_part_name) orelse return error.TestUnexpectedResult;
+    const part_in_dst = try dst.part(new_part_name) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, new_part_bytes, part_in_dst.bytes);
     try std.testing.expectEqualStrings(new_part_ct, part_in_dst.content_type.?);
 }
@@ -1856,8 +1919,8 @@ test "PartStore.addPart: multiple parts in one session all register content type
     defer dst.deinit();
 
     // Both parts present.
-    const a = dst.part("xl/customA.xml") orelse return error.TestUnexpectedResult;
-    const b = dst.part("xl/customB.xml") orelse return error.TestUnexpectedResult;
+    const a = try dst.part("xl/customA.xml") orelse return error.TestUnexpectedResult;
+    const b = try dst.part("xl/customB.xml") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, "<a/>", a.bytes);
     try std.testing.expectEqualSlices(u8, "<b/>", b.bytes);
     // Both content types registered (the bug Codex caught was that
@@ -1893,10 +1956,10 @@ test "PartStore.addPart: XML-escapes part name + content type into Content_Types
     defer dst.deinit();
     // Reopened part is found under its raw name (the .rels parser
     // decodes entities to recover the literal).
-    const got = dst.part(tricky_name) orelse return error.TestUnexpectedResult;
+    const got = try dst.part(tricky_name) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, "<x/>", got.bytes);
     // Content_Types.xml must contain the escaped form, not the raw `&`.
-    const ct = dst.part("[Content_Types].xml") orelse return error.TestUnexpectedResult;
+    const ct = try dst.part("[Content_Types].xml") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, ct.bytes, "PartName=\"/xl/a&amp;b.xml\"") != null);
     // ...and must NOT contain the raw `&` in an attribute (otherwise
     // the XML is malformed).
@@ -2015,7 +2078,7 @@ test "PartStore.addPart: large input round-trips through deflate" {
 
     var dst = try PartStore.open(std.testing.allocator, out_path);
     defer dst.deinit();
-    const got = dst.part("xl/extra.bin") orelse return error.TestUnexpectedResult;
+    const got = try dst.part("xl/extra.bin") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, big_bytes, got.bytes);
 }
 
@@ -2042,7 +2105,7 @@ test "PartStore.addPart: atomic on every allocation-failure step" {
             defer store.deinit();
 
             const before_count = store.parts.len;
-            const ct_before = store.part("[Content_Types].xml") orelse
+            const ct_before = try store.part("[Content_Types].xml") orelse
                 return error.MissingContentTypes;
             const ct_before_bytes = ct_before.bytes;
 
@@ -2050,7 +2113,7 @@ test "PartStore.addPart: atomic on every allocation-failure step" {
             store.addPart("xl/extra.xml", "application/xml", "<x/>") catch |e| {
                 // On failure, store state must be unchanged.
                 try std.testing.expectEqual(before_count, store.parts.len);
-                const ct_after = store.part("[Content_Types].xml") orelse return e;
+                const ct_after = try store.part("[Content_Types].xml") orelse return e;
                 try std.testing.expect(ct_after.bytes.ptr == ct_before_bytes.ptr);
                 return e;
             };
