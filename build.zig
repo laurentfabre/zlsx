@@ -153,7 +153,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    package_mod.addImport("writer", writer_mod);
+    package_mod.addImport("zlsx", zlsx_mod);
 
     // C2a: standalone `zlsx-extract-images` binary that drives the
     // package layer (PartStore + imageParts) without going through
@@ -182,7 +182,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    package_store_tests_mod.addImport("writer", writer_mod);
+    package_store_tests_mod.addImport("zlsx", zlsx_mod);
     const package_store_tests = b.addTest(.{ .root_module = package_store_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_store_tests).step);
 
@@ -191,7 +191,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    package_drawings_tests_mod.addImport("writer", writer_mod);
+    package_drawings_tests_mod.addImport("zlsx", zlsx_mod);
     const package_drawings_tests = b.addTest(.{ .root_module = package_drawings_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_drawings_tests).step);
 
@@ -218,7 +218,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    package_workbook_tests_mod.addImport("writer", writer_mod);
+    package_workbook_tests_mod.addImport("zlsx", zlsx_mod);
     const package_workbook_tests = b.addTest(.{ .root_module = package_workbook_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_workbook_tests).step);
 
@@ -232,7 +232,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .fuzz = true,
     });
-    package_fuzz_mod.addImport("writer", writer_mod);
+    package_fuzz_mod.addImport("zlsx", zlsx_mod);
     const package_fuzz_tests = b.addTest(.{ .root_module = package_fuzz_mod });
     fuzz_step.dependOn(&b.addRunArtifact(package_fuzz_tests).step);
 
