@@ -133,10 +133,16 @@ pub const ParseError = error{
 
 /// Parse one `xl/worksheets/sheet*.xml` part into a typed overlay.
 ///
-/// The returned `SheetXml` borrows every textual field from `xml`.
-/// `xml` must outlive the returned value. The `SheetXml` owns one
-/// arena (the slice spines); call `deinit` on success or error to
-/// reclaim it.
+/// The returned `SheetXml` borrows every textual field from an
+/// arena-owned, comment/CDATA/PI-stripped copy of `xml`. The caller
+/// does NOT need to keep the original `xml` alive after `parse`
+/// returns. The `SheetXml` owns one arena (the sanitized buffer +
+/// slice spines); call `deinit` on success or error to reclaim it.
+///
+/// The one-time sanitizer pass is a perf bound: per-tag in-comment
+/// checks were O(N²) on large worksheets (1+ GiB sheet bodies on
+/// real-world fixtures hung CI for >1h). The sanitizer is O(N), and
+/// the rest of the parser sees no comment markers.
 pub fn parse(allocator: std.mem.Allocator, xml: []const u8) ParseError!SheetXml {
     assert(xml.len < (1 << 31)); // OOXML sheet parts are bounded; refuse 2 GiB+.
     assert(@TypeOf(allocator) == std.mem.Allocator);
@@ -145,20 +151,26 @@ pub fn parse(allocator: std.mem.Allocator, xml: []const u8) ParseError!SheetXml 
     errdefer arena.deinit();
     const a = arena.allocator();
 
+    // Strip comments / CDATA / PI once, up front. Every downstream
+    // scan operates on the sanitized buffer; no per-tag comment check
+    // is needed (and `insideComment` was the O(N²) hot-path on real
+    // worksheets — see doc-comment above).
+    const sanitized = try sanitizeXml(a, xml);
+
     // Quick well-formedness gate: a worksheet part must contain a
     // `<worksheet` root tag. Anything else is rejected up front so
     // callers don't get an empty struct from a styles or sst part
     // wired into the wrong slot.
-    if (std.mem.indexOf(u8, xml, "<worksheet") == null) return error.MalformedXml;
+    if (std.mem.indexOf(u8, sanitized, "<worksheet") == null) return error.MalformedXml;
 
-    const dim = parseDimension(xml);
-    const freeze = parseFreezePane(xml);
+    const dim = parseDimension(sanitized);
+    const freeze = parseFreezePane(sanitized);
 
-    const rows = try parseRows(a, xml);
-    const merges = try parseMerges(a, xml);
-    const hyperlinks = try parseHyperlinks(a, xml);
-    const validations = try parseValidations(a, xml);
-    const cfs = try parseConditionalFormats(a, xml);
+    const rows = try parseRows(a, sanitized);
+    const merges = try parseMerges(a, sanitized);
+    const hyperlinks = try parseHyperlinks(a, sanitized);
+    const validations = try parseValidations(a, sanitized);
+    const cfs = try parseConditionalFormats(a, sanitized);
 
     return .{
         .dimension = dim,
@@ -170,6 +182,56 @@ pub fn parse(allocator: std.mem.Allocator, xml: []const u8) ParseError!SheetXml 
         .freeze = freeze,
         .arena = arena,
     };
+}
+
+/// Produces a copy of `xml` with comments (`<!-- ... -->`), CDATA
+/// (`<![CDATA[ ... ]]>`), and processing instructions (`<? ... ?>`)
+/// elided. CDATA contents are kept literally so a `<![CDATA[<row/>]]>`
+/// payload can never be misread as a real element. Returns a fresh
+/// allocator-owned slice; caller owns the memory.
+///
+/// This is the perf-critical pre-pass: it converts every downstream
+/// scan from "comment-aware" to "comment-free", eliminating the
+/// O(N²) repeated `lastIndexOf("<!--")` over each tag-match.
+fn sanitizeXml(allocator: std.mem.Allocator, xml: []const u8) ParseError![]const u8 {
+    assert(xml.len < (1 << 31));
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, xml.len);
+
+    var i: usize = 0;
+    while (i < xml.len) {
+        const c = xml[i];
+        if (c != '<') {
+            try out.append(allocator, c);
+            i += 1;
+            continue;
+        }
+        if (i + 4 <= xml.len and std.mem.eql(u8, xml[i .. i + 4], "<!--")) {
+            const close = std.mem.indexOfPos(u8, xml, i + 4, "-->") orelse return error.MalformedXml;
+            i = close + 3;
+            continue;
+        }
+        if (i + 9 <= xml.len and std.mem.eql(u8, xml[i .. i + 9], "<![CDATA[")) {
+            const close = std.mem.indexOfPos(u8, xml, i + 9, "]]>") orelse return error.MalformedXml;
+            try out.appendSlice(allocator, xml[i + 9 .. close]);
+            i = close + 3;
+            continue;
+        }
+        if (i + 2 <= xml.len and xml[i + 1] == '?') {
+            const close = std.mem.indexOfPos(u8, xml, i + 2, "?>") orelse return error.MalformedXml;
+            i = close + 2;
+            continue;
+        }
+        // Plain tag — copy through to the matching `>`, respecting
+        // quoted attribute values (`>` inside `attr="..."` is data).
+        const end = findTagEnd(xml, i) orelse return error.MalformedXml;
+        try out.appendSlice(allocator, xml[i .. end + 1]);
+        i = end + 1;
+    }
+
+    return try out.toOwnedSlice(allocator);
 }
 
 // ─── XML scanner primitives ──────────────────────────────────────────
@@ -227,34 +289,14 @@ fn findTagEnd(xml: []const u8, tag_open: usize) ?usize {
 }
 
 /// Locate the substring `needle` inside `hay`, starting at `from`,
-/// but only return a match position whose immediate predecessor is
-/// NOT inside a comment / CDATA / PI block. Cheap pre-filter: most
-/// sheet bodies don't contain comments at all.
+/// Returns the next position of `needle` in `hay` at or after `from`.
+/// Operates on sanitized input (comments / CDATA / PI already stripped
+/// by `sanitizeXml`), so no per-tag in-comment check is needed —
+/// previously the bottleneck on large real-world sheets.
 fn indexOfTag(hay: []const u8, from: usize, needle: []const u8) ?usize {
     assert(needle.len > 0);
     assert(from <= hay.len);
-    var probe = from;
-    while (std.mem.indexOfPos(u8, hay, probe, needle)) |hit| {
-        // Reject hits that fall inside a comment block. Walk back
-        // from `hit` looking for an unmatched `<!--`. Cheap because
-        // sheet XML rarely contains comments; the loop short-circuits
-        // on the very first `<!--` / `-->` it sees.
-        if (insideComment(hay, hit)) {
-            probe = hit + 1;
-            continue;
-        }
-        return hit;
-    }
-    return null;
-}
-
-fn insideComment(hay: []const u8, pos: usize) bool {
-    // `pos` is inside a comment iff the most recent comment opener
-    // before it has no matching closer also before it.
-    const last_open = std.mem.lastIndexOf(u8, hay[0..pos], "<!--") orelse return false;
-    const last_close = std.mem.lastIndexOf(u8, hay[0..pos], "-->");
-    if (last_close) |lc| return lc < last_open;
-    return true;
+    return std.mem.indexOfPos(u8, hay, from, needle);
 }
 
 /// Match `key="value"` or `key='value'` inside an attribute slice.
