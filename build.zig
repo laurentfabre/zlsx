@@ -317,4 +317,111 @@ pub fn build(b: *std.Build) void {
     // and a corpus-gated end-to-end lifecycle smoke test).
     const c_abi_tests = b.addTest(.{ .root_module = c_abi_mod });
     test_step.dependOn(&b.addRunArtifact(c_abi_tests).step);
+
+    // ─── B1 iter-wb-6: RSS gate ─────────────────────────────────
+    //
+    // Off the default `test` step. The 100k × 10 fixture takes
+    // 1-3 minutes to synthesise on first invocation (cached
+    // afterwards), and RSS measurement is order-sensitive enough
+    // that we don't want it co-resident with other tests in the
+    // same binary. Run with `zig build bench-workbook-rss`.
+    //
+    // The orchestrator test (`tests/bench/workbook_rss.zig`) and
+    // its three child probes are split into separate compilations
+    // because `zlsx` and `zlsx_pkg` cannot coexist in one binary
+    // (the same `pkg/store.zig` ends up claimed by both — see
+    // `AGENTS.md` "Three-module collision"). The test spawns each
+    // probe as a subprocess; each probe measures its own RSS delta
+    // in isolation. The gate compares the two deltas as a ratio.
+    //
+    // ReleaseSafe: keeps reader / writer overflow checks active so
+    // we measure code paths a production caller actually runs.
+    const bench_optimize: std.builtin.OptimizeMode = .ReleaseSafe;
+
+    // Shared rss + synth modules — created once, imported by each
+    // probe that needs them.
+    const bench_rss_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/rss.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    const bench_synth_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/synth_100k_x_10.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    bench_synth_mod.addImport("zlsx", zlsx_mod);
+
+    // Probe 1 — synth. Pulls `zlsx` (writer) only; no pkg.
+    const probe_synth_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/rss_probe_synth.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    probe_synth_mod.addImport("synth", bench_synth_mod);
+    const probe_synth_exe = b.addExecutable(.{
+        .name = "zlsx-bench-rss-synth",
+        .root_module = probe_synth_mod,
+    });
+    const probe_synth_install = b.addInstallArtifact(probe_synth_exe, .{});
+
+    // Probe 2 — book. Pulls `zlsx` only; no pkg.
+    const probe_book_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/rss_probe_book.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    probe_book_mod.addImport("zlsx", zlsx_mod);
+    probe_book_mod.addImport("rss", bench_rss_mod);
+    const probe_book_exe = b.addExecutable(.{
+        .name = "zlsx-bench-rss-book",
+        .root_module = probe_book_mod,
+    });
+    const probe_book_install = b.addInstallArtifact(probe_book_exe, .{});
+
+    // Probe 3 — workbook. Pulls `zlsx_pkg` only; no zlsx (the
+    // collision avoidance is the whole reason this is a separate
+    // binary).
+    const probe_wb_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/rss_probe_workbook.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    probe_wb_mod.addImport("zlsx_pkg", package_mod);
+    probe_wb_mod.addImport("rss", bench_rss_mod);
+    const probe_wb_exe = b.addExecutable(.{
+        .name = "zlsx-bench-rss-workbook",
+        .root_module = probe_wb_mod,
+    });
+    const probe_wb_install = b.addInstallArtifact(probe_wb_exe, .{});
+
+    // Orchestrator test. No dependency on `zlsx` or `zlsx_pkg` —
+    // it spawns the probes as subprocesses.
+    const bench_workbook_rss_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/workbook_rss.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    bench_workbook_rss_mod.addImport("rss", bench_rss_mod);
+    const bench_workbook_rss_tests = b.addTest(.{ .root_module = bench_workbook_rss_mod });
+    const bench_workbook_rss_run = b.addRunArtifact(bench_workbook_rss_tests);
+    bench_workbook_rss_run.has_side_effects = true;
+    bench_workbook_rss_run.step.dependOn(&probe_synth_install.step);
+    bench_workbook_rss_run.step.dependOn(&probe_book_install.step);
+    bench_workbook_rss_run.step.dependOn(&probe_wb_install.step);
+
+    const bench_workbook_rss_step = b.step(
+        "bench-workbook-rss",
+        "B1 iter-wb-6 RSS gate: Workbook.openLazy ≤ 2× Book.openLazy on a 100k × 10 fixture (off the default test path)",
+    );
+    bench_workbook_rss_step.dependOn(&bench_workbook_rss_run.step);
+
+    // Per-module unit tests for the bench helpers (rss + synth).
+    // These DO go on the default `test` step — they're cheap and
+    // exercise the platform-specific code paths.
+    const bench_rss_tests = b.addTest(.{ .root_module = bench_rss_mod });
+    test_step.dependOn(&b.addRunArtifact(bench_rss_tests).step);
+
+    const bench_synth_tests = b.addTest(.{ .root_module = bench_synth_mod });
+    test_step.dependOn(&b.addRunArtifact(bench_synth_tests).step);
 }
