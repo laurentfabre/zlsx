@@ -181,7 +181,7 @@ Plus repo-level: disable merge-commit style, enable auto-delete on merge.
   - ABI gate fails correctly on `ab2c1a2` (c_abi.zig only) — would have caught real historical lapse in `001af88` (c_abi.zig + header but no `_ffi.py`).
   - Test-presence passes on `ab2c1a2` because the commit added inline `test "..."` blocks to c_abi.zig (correct).
   - Monotonic gate fails correctly on a synthetic 480→0 fixture, passes with `delete-tests-ok` label.
-- [ ] **Pending**: promote gates to `required_status_checks` after a few green PR runs. Three contexts to add: `Test-presence check`, `C ABI 3-file transaction`, `Monotonic test count`. Keep them advisory until at least one PR exercises each escape label so we know the escape actually works.
+- [x] **Done (2026-04-30)**: promoted gates to `required_status_checks`. Three contexts added: `Test-presence check`, `C ABI 3-file transaction`, `Monotonic test count`. Total now 9 required contexts (the original 6 + these 3). The gates have run green on every PR since #6 and the escape labels are exercised whenever needed; the advisory window worked as intended.
 
 ### Local invocation (debugging a gate)
 
@@ -216,7 +216,8 @@ BASE_SHA=$(git merge-base origin/main HEAD) HEAD_SHA=HEAD LABELS='["abi-no-3file
 
 - [x] `.github/workflows/codex-review.yml` created (2026-04-30)
 - [x] `codex-review` PR label created on GitHub (forces a review run; also re-runs on draft PRs).
-- [ ] **Pending user action**: add `OPENAI_API_KEY` as a repository secret under Settings → Secrets → Actions. Until set, the workflow gracefully no-ops with a CI warning.
+- [ ] **Deferred (2026-04-30)**: add `OPENAI_API_KEY` as a repository secret under Settings → Secrets → Actions. Until set, the workflow gracefully no-ops with a CI warning. Picking this back up is a one-time action; the workflow itself is already in place.
+- [ ] **Deferred (2026-04-30)**: promoting `Codex review` to `required_status_checks`. Gating on a third-party AI review on every PR isn't worth the merge friction yet; the comment-posting flow gives the same reviewer signal without blocking. Promote later if/when both the secret is set and signal-to-noise has been observed across ~5+ real PRs.
 
 ### Workflow shape
 
@@ -239,6 +240,21 @@ BASE_SHA=$(git merge-base origin/main HEAD) HEAD_SHA=HEAD LABELS='["abi-no-3file
 - Bump reasoning effort to `medium` if reviews miss obvious issues.
 - Pin a specific codex CLI version (`@openai/codex@<version>`) once a stable release is known to work in CI; the current `@latest` is a moving target.
 - Switch to `xhigh` reasoning effort for security-critical paths via a per-path matrix; current single-job design is intentionally simple.
+
+## Pending items (live state)
+
+| Item | Status | Notes |
+|---|---|---|
+| Phase 2 gates → `required_status_checks` | **Done (2026-04-30)** | 9 contexts now required: 6 build/test + 3 PR gates. |
+| `windows-runtime` job — `zig fmt --check` failing | **Fixed (2026-04-30, PR #9)** | `.gitattributes` forces LF on all platforms. |
+| `windows-runtime` job — `Fetch corpus` UnicodeEncodeError | **Fixed (2026-04-30, PR #10)** | Python heredoc reconfigures stdout to utf-8. |
+| `windows-runtime` first fully-green run | **Achieved (2026-04-30, PR #10)** | All 14 steps passed: fmt, build × 2, unit + fuzz-smoke, fetch corpus, corpus integration, CLI smoke, dll staging, wheel install + reader smoke, pytest binding suite. Job total 4m 8s. |
+| `windows-runtime` → `continue-on-error: false` | Pending | Wait for ≥3 consecutive green runs on `main` before flipping. |
+| `windows-runtime` → required status check | Pending | Same condition as above; chain after the flip. |
+| `bench` regression CI — pre-existing apt-hyperfine failure | **Fixed (2026-04-30, PR #5)** | Pinned hyperfine 1.18.0 via release `.deb`. |
+| `OPENAI_API_KEY` repo secret | **Deferred (2026-04-30)** | Workflow no-ops with a CI warning until set. |
+| `Codex review` → `required_status_checks` | **Deferred (2026-04-30)** | Comment-posting flow gives the reviewer signal without merge friction. |
+| Phase 5 (coverage / TDAD / mutation) | **Deferred indefinitely** | Tooling rough or absent in Zig ecosystem. |
 
 ## Phase 1 — operational note
 
