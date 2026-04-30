@@ -193,6 +193,17 @@ pub const Workbook = struct {
         return try fromStore(allocator, store);
     }
 
+    /// Lazy-open variant. Same shape as `open` for v1 — sheets are
+    /// already lazy-materialised on first `Worksheet.ensureParsed()`,
+    /// so there's no behavioural difference yet. The split exists so
+    /// callers (and the iter-wb-6 RSS gate) can pin to the future-
+    /// correct symbol; later iters may add an SST-lazy / drawings-lazy
+    /// strategy here without changing call sites.
+    pub fn openLazy(allocator: Allocator, path: []const u8) Error!Workbook {
+        assert(path.len > 0);
+        return Workbook.open(allocator, path);
+    }
+
     /// Construct a `Workbook` from an already-opened `PartStore`.
     /// Takes ownership of the store; `deinit` will tear it down.
     pub fn fromStore(allocator: Allocator, store: PartStore) Error!Workbook {
