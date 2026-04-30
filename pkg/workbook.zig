@@ -53,12 +53,17 @@ pub const Error = error{
 } || workbook_xml_mod.Error || sheet_xml_mod.ParseError || sst_xml_mod.Error || styles_xml_mod.Error || store_mod.Error ||
     std.fs.File.WriteError || std.fs.File.OpenError || std.fs.Dir.RenameError || std.fs.Dir.StatFileError;
 
-/// Mutation primitive (B1 iter-wb-4 milestone-1). Strings + formulas
-/// land in milestone-2 (need SST extension via SstAppender plumbing).
+/// Mutation primitive (B1 iter-wb-4). Strings emit as `inlineStr`
+/// — cell-local text, no SST extension required. Formulas land in m3.
+///
+/// `string` slices borrow for `setCell`'s call only. The delta map
+/// duplicates bytes into the Workbook allocator before returning, so
+/// the caller can free / reuse the buffer as soon as `setCell` returns.
 pub const CellValue = union(enum) {
     blank: void,
     number: f64,
     boolean: bool,
+    string: []const u8,
 };
 
 /// 1-based (row, col) — matches OOXML A1 conventions.
@@ -330,6 +335,7 @@ pub const Workbook = struct {
             defer self.allocator.free(new_xml);
             try self.store.replacePart(part_name, new_xml);
 
+            freeDeltaStrings(self.allocator, &ws.deltas);
             ws.deltas.clearAndFree(self.allocator);
             // Invalidate the parsed view — its leaves borrowed from
             // the prior source bytes, which the caller may still see
@@ -534,6 +540,16 @@ fn emitCell(allocator: Allocator, out: *std.ArrayList(u8), mc: MergedCell) Error
                 try out.appendSlice(allocator, if (b) "1" else "0");
                 try out.appendSlice(allocator, "</v></c>");
             },
+            .string => |s| {
+                try out.appendSlice(allocator, " t=\"inlineStr\"><is><t");
+                // Preserve leading/trailing whitespace per OOXML.
+                if (s.len > 0 and (s[0] == ' ' or s[s.len - 1] == ' ')) {
+                    try out.appendSlice(allocator, " xml:space=\"preserve\"");
+                }
+                try out.appendSlice(allocator, ">");
+                try appendXmlEscapedText(allocator, out, s);
+                try out.appendSlice(allocator, "</t></is></c>");
+            },
         },
     }
 }
@@ -572,6 +588,7 @@ pub const Worksheet = struct {
             view.deinit(allocator);
         }
         if (self.resolved_part_name) |part_name| allocator.free(part_name);
+        freeDeltaStrings(allocator, &self.deltas);
         self.deltas.deinit(allocator);
     }
 
@@ -677,14 +694,78 @@ pub const Worksheet = struct {
 
     /// Stage a mutation for cell at A1 ref `ref`. Persisted by
     /// `Workbook.save`. The last `setCell` call for a given ref wins.
-    /// Strings + formulas land in iter-wb-4 m2; this milestone covers
-    /// numeric, boolean, and blank values only.
+    /// Numeric / boolean / blank values pass through by-value. String
+    /// values are duped into the Workbook allocator (caller can free
+    /// the input slice as soon as `setCell` returns). Formulas land
+    /// in m3.
+    ///
+    /// String inputs are validated against XML 1.0 — control bytes
+    /// other than \t, \n, \r are rejected with `error.MalformedXml`
+    /// to prevent emitting unparseable XML downstream.
     pub fn setCell(self: *Worksheet, ref: []const u8, value: CellValue) Error!void {
         assert(ref.len > 0);
         const cr = try parseA1Ref(ref);
-        try self.deltas.put(self.workbook.allocator, cr, value);
+        const a = self.workbook.allocator;
+
+        // Free any previous string allocation for this ref so a
+        // string→string overwrite doesn't leak.
+        if (self.deltas.get(cr)) |prev| {
+            switch (prev) {
+                .string => |s| a.free(s),
+                else => {},
+            }
+        }
+
+        const stored: CellValue = switch (value) {
+            .string => |s| blk: {
+                if (!isXmlSafeText(s)) return error.MalformedXml;
+                break :blk .{ .string = try a.dupe(u8, s) };
+            },
+            else => value,
+        };
+        errdefer if (stored == .string) a.free(stored.string);
+
+        try self.deltas.put(a, cr, stored);
     }
 };
+
+/// XML 1.0 §2.2: Char ::= #x9 | #xA | #xD | [#x20-#xD7FF] | …
+/// Reject ASCII control bytes outside the allowed three. Bytes ≥ 0x80
+/// pass through without interpretation — the input must already be
+/// well-formed UTF-8.
+fn isXmlSafeText(s: []const u8) bool {
+    for (s) |b| {
+        if (b < 0x20 and b != 0x09 and b != 0x0A and b != 0x0D) return false;
+    }
+    return true;
+}
+
+/// Free any string allocations stashed in `deltas`. Called both before
+/// `clearAndFree` (post-save) and `deinit` (Worksheet teardown).
+fn freeDeltaStrings(allocator: Allocator, deltas: *std.AutoHashMapUnmanaged(CellRef, CellValue)) void {
+    var it = deltas.valueIterator();
+    while (it.next()) |v| {
+        switch (v.*) {
+            .string => |s| allocator.free(s),
+            else => {},
+        }
+    }
+}
+
+/// Escape XML text content (`<`, `>`, `&`) into `out`. Quote chars
+/// pass through — this helper is for ELEMENT-content escaping, not
+/// attribute-value escaping. Caller pre-validates that bytes are
+/// XML-1.0-safe via `isXmlSafeText`.
+fn appendXmlEscapedText(allocator: Allocator, out: *std.ArrayList(u8), text: []const u8) Error!void {
+    for (text) |b| {
+        switch (b) {
+            '<' => try out.appendSlice(allocator, "&lt;"),
+            '>' => try out.appendSlice(allocator, "&gt;"),
+            '&' => try out.appendSlice(allocator, "&amp;"),
+            else => try out.append(allocator, b),
+        }
+    }
+}
 
 /// ASCII-case-insensitive equality. OOXML cell refs are ASCII letters
 /// + decimal digits, so a Unicode-aware fold is unnecessary here.
@@ -969,4 +1050,87 @@ test "Workbook.setCell: invalid ref errors before saving" {
 
     try std.testing.expectError(Error.InvalidCellRef, s0.setCell("A0", .{ .number = 1 }));
     try std.testing.expectError(Error.InvalidCellRef, s0.setCell("XFE1", .{ .number = 1 }));
+}
+
+test "Workbook.setCell: string round-trips via inlineStr" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-string-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        const s0 = try wb.sheet(0);
+        // Simple string
+        try s0.setCell("A1", .{ .string = "Hello, world!" });
+        // String with XML-special chars — must escape
+        try s0.setCell("B1", .{ .string = "<a> & \"foo\"" });
+        // Whitespace-bracketed string — must emit xml:space="preserve"
+        try s0.setCell("C1", .{ .string = "  spaced  " });
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb2.deinit();
+    const s0 = try wb2.sheet(0);
+
+    const a1 = try s0.cellByRef("A1");
+    try std.testing.expect(a1 != null);
+    try std.testing.expect(a1.?.cell_type == .inline_string);
+    try std.testing.expectEqualStrings("Hello, world!", a1.?.raw_value.?);
+
+    const b1 = try s0.cellByRef("B1");
+    try std.testing.expect(b1 != null);
+    try std.testing.expect(b1.?.cell_type == .inline_string);
+    // raw_value carries the escaped form — `<` → `&lt;` etc. Accept
+    // either; sheet_xml.parse doesn't decode entities, so what we
+    // emitted is what we read back.
+    try std.testing.expectEqualStrings("&lt;a&gt; &amp; \"foo\"", b1.?.raw_value.?);
+
+    const c1 = try s0.cellByRef("C1");
+    try std.testing.expect(c1 != null);
+    try std.testing.expect(c1.?.cell_type == .inline_string);
+    try std.testing.expectEqualStrings("  spaced  ", c1.?.raw_value.?);
+}
+
+test "Workbook.setCell: control bytes in string rejected before save" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+    const s0 = try wb.sheet(0);
+
+    // \x00, \x01, \x1F all forbidden by XML 1.0
+    try std.testing.expectError(error.MalformedXml, s0.setCell("A1", .{ .string = "bad\x00null" }));
+    try std.testing.expectError(error.MalformedXml, s0.setCell("A2", .{ .string = "ctrl\x01here" }));
+    try std.testing.expectError(error.MalformedXml, s0.setCell("A3", .{ .string = "esc\x1Fhere" }));
+
+    // \t \n \r are explicitly allowed
+    try s0.setCell("B1", .{ .string = "tab\there" });
+    try s0.setCell("B2", .{ .string = "lf\nhere" });
+    try s0.setCell("B3", .{ .string = "cr\rhere" });
+
+    // Bytes ≥ 0x80 (UTF-8 continuation) pass through unchecked.
+    try s0.setCell("C1", .{ .string = "café" });
+}
+
+test "Workbook.setCell: string overwrite frees prior allocation" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+    const s0 = try wb.sheet(0);
+
+    // String → string, twice, then drop without saving. If the
+    // overwrite path leaks, std.testing.allocator catches it at
+    // wb.deinit.
+    try s0.setCell("A1", .{ .string = "first" });
+    try s0.setCell("A1", .{ .string = "second" });
+    try s0.setCell("A1", .{ .string = "third" });
 }
