@@ -142,9 +142,13 @@ pub fn imageAnchors(store: *PartStore, allocator: std.mem.Allocator) ![]ImageAnc
     var out: std.ArrayListUnmanaged(ImageAnchor) = .empty;
     errdefer out.deinit(allocator);
 
-    // Walk every sheet part.
-    for (store.parts) |sheet_part| {
-        if (!isSheetPart(sheet_part)) continue;
+    // Walk every sheet part. After the deferred-decompress refactor
+    // (PartStore lazy materialization), `store.parts[i].bytes` is
+    // empty until we go through `store.part(name)` — fetch by name
+    // here so the sheet XML is materialized before we scan it.
+    for (store.parts) |sheet_part_meta| {
+        if (!isSheetPart(sheet_part_meta)) continue;
+        const sheet_part = (try store.part(sheet_part_meta.name)) orelse continue;
         try collectFromSheet(store, allocator, sheet_part, &out);
     }
 
@@ -168,8 +172,9 @@ pub fn chartAnchors(store: *PartStore, allocator: std.mem.Allocator) ![]ChartAnc
         for (out.items) |c| allocator.free(c.series_refs);
         out.deinit(allocator);
     }
-    for (store.parts) |sheet_part| {
-        if (!isSheetPart(sheet_part)) continue;
+    for (store.parts) |sheet_part_meta| {
+        if (!isSheetPart(sheet_part_meta)) continue;
+        const sheet_part = (try store.part(sheet_part_meta.name)) orelse continue;
         try collectChartsFromSheet(store, allocator, sheet_part, &out);
     }
     return out.toOwnedSlice(allocator);
@@ -219,7 +224,7 @@ fn collectFromSheet(
     const sheet_rels = store.rels(sheet_part.name);
     const drawing_target = (try relTargetForId(allocator, sheet_rels, rid)) orelse return;
     const drawing_part_name = (try store.resolve(sheet_part.name, drawing_target)) orelse return;
-    const drawing_part = store.part(drawing_part_name) orelse return;
+    const drawing_part = try store.part(drawing_part_name) orelse return;
 
     // Walk the drawing's twoCellAnchor / oneCellAnchor blocks.
     const drawing_rels = store.rels(drawing_part_name);
@@ -294,7 +299,7 @@ fn scanImagesWithTags(
         const embed_rid = findBlipEmbedWithAlt(pic_block, prefixes.a, prefixes.a_alt) orelse continue;
         const image_target = (try relTargetForId(allocator, drawing_rels, embed_rid)) orelse continue;
         const image_part_name = (try store.resolve(drawing_part_name, image_target)) orelse continue;
-        const image_part = store.part(image_part_name) orelse continue;
+        const image_part = try store.part(image_part_name) orelse continue;
 
         var from: CellAnchor = .{ .col = 0, .col_off = 0, .row = 0, .row_off = 0 };
         var to_anchor: ?CellAnchor = null;
@@ -329,7 +334,7 @@ fn collectChartsFromSheet(
     const sheet_rels = store.rels(sheet_part.name);
     const drawing_target = (try relTargetForId(allocator, sheet_rels, rid)) orelse return;
     const drawing_part_name = (try store.resolve(sheet_part.name, drawing_target)) orelse return;
-    const drawing_part = store.part(drawing_part_name) orelse return;
+    const drawing_part = try store.part(drawing_part_name) orelse return;
 
     const drawing_rels = store.rels(drawing_part_name);
     const prefixes = resolveDrawingPrefixes(drawing_part.bytes);
@@ -397,7 +402,7 @@ fn scanChartsWithTags(
 
         const chart_target = (try relTargetForId(allocator, drawing_rels, embed_rid)) orelse continue;
         const chart_part_name = (try store.resolve(drawing_part_name, chart_target)) orelse continue;
-        const chart_part = store.part(chart_part_name) orelse continue;
+        const chart_part = try store.part(chart_part_name) orelse continue;
 
         var from: CellAnchor = .{ .col = 0, .col_off = 0, .row = 0, .row_off = 0 };
         var to_anchor: ?CellAnchor = null;

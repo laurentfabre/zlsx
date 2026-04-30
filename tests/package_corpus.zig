@@ -61,12 +61,19 @@ const fixture_list = [_]struct { name: []const u8, verdict: Verdict }{
     //
     // Probed empirically once and pinned here so a regression that
     // flips the boundary surfaces immediately.
-    .{ .name = "derived_bad_crc32.xlsx", .verdict = .must_error_typed }, // CRC32 verified eagerly
+    // Since the deferred-decompress refactor, CRC32 mismatch no
+    // longer surfaces at open() for the BULK of parts — only at
+    // first `part(name)` access. The structural eager-decompress
+    // path (`[Content_Types].xml` and every `_rels/*.rels`) still
+    // CRC-checks at open(), so a bad CRC on those parts errors at
+    // open(); a bad CRC on a worksheet / image / other deferred
+    // part errors only on materialization.
+    .{ .name = "derived_bad_crc32.xlsx", .verdict = .must_error_typed }, // bad CRC on a STRUCTURAL part — eager check still fires at open()
     .{ .name = "derived_truncated_mid_payload.xlsx", .verdict = .must_error_typed },
     .{ .name = "derived_truncated_pre_eocd.xlsx", .verdict = .must_error_typed },
     .{ .name = "derived_truncated_signature.xlsx", .verdict = .must_error_typed },
     .{ .name = "poi_MalformedSSTCount.xlsx", .verdict = .must_open_clean }, // structural ZIP is valid
-    .{ .name = "poi_clusterfuzz_xssf.xlsx", .verdict = .must_error_typed }, // CRC mismatch surfaced by eager check
+    .{ .name = "poi_clusterfuzz_xssf.xlsx", .verdict = .must_open_with_lazy_corruption }, // bad CRC on a deferred (worksheet) part — surfaces only on materialize
     .{ .name = "poi_crash_274d6342.xlsx", .verdict = .must_error_typed }, // BadZip — broken CDFH
     .{ .name = "poi_crash_9bf3cd4b.xlsx", .verdict = .must_error_typed }, // NotPkzip — no EOCD
     .{ .name = "poi_workbook_password_2013.xlsx", .verdict = .must_open_with_lazy_corruption }, // encrypted CFB inside valid ZIP
@@ -103,7 +110,7 @@ test "PartStore corpus sweep — open + walk every fixture without crash" {
                 }
                 // At least the [Content_Types].xml part must be present
                 // in any well-formed OOXML package.
-                try std.testing.expect(store.part("[Content_Types].xml") != null);
+                try std.testing.expect((try store.part("[Content_Types].xml")) != null);
             },
             .must_error_typed => {
                 if (open_result) |*s| {
@@ -131,7 +138,17 @@ test "PartStore corpus sweep — open + walk every fixture without crash" {
                 };
                 defer store.deinit();
                 _ = try store.partNames();
-                _ = try store.imageParts();
+                // imageParts() materializes each image's payload to
+                // expose decompressed bytes — that's where lazy
+                // corruption (bad CRC etc.) surfaces. Either outcome
+                // is acceptable on the lazy-corruption arm: a typed
+                // error is the contract for damaged payloads, and a
+                // clean return is the contract for fixtures whose
+                // corruption sits in non-image parts.
+                _ = store.imageParts() catch |err| switch (err) {
+                    error.BadZip, error.UnsupportedCompression, error.OutOfMemory => {},
+                    else => return err,
+                };
                 // Drawing walks are payload-driven; skip on lazy-corruption
                 // fixtures since decompression is allowed to fail.
             },
