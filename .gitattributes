@@ -1,0 +1,33 @@
+# Force LF line endings on text files in the working tree, regardless of
+# platform. Without this, git-for-windows defaults to `autocrlf=true` and
+# converts LF→CRLF on checkout; `zig fmt --check` then flags every .zig
+# file as needing reformatting on the windows-runtime CI job.
+
+* text=auto eol=lf
+
+# Explicit binaries — never converted.
+*.xlsx     binary
+*.xlsm     binary
+*.xlsb     binary
+*.zlsx     binary
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.gif      binary
+*.ico      binary
+*.zip      binary
+*.gz       binary
+*.tar      binary
+*.xz       binary
+*.deb      binary
+*.dylib    binary
+*.so       binary
+*.dll      binary
+*.a        binary
+*.lib      binary
+*.exe      binary
+
+# Windows-specific scripts must keep CRLF.
+*.bat      text eol=crlf
+*.cmd      text eol=crlf
+*.ps1      text eol=crlf
