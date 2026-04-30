@@ -42,10 +42,19 @@ pub const Error = error{
     MissingWorkbookPart,
     MissingSheetPart,
     MissingRelationship,
+    /// Workbook lacks `xl/_rels/workbook.xml.rels` — required to
+    /// register a freshly-created `xl/sharedStrings.xml` part. Surfaces
+    /// only when an SST extension is requested against a workbook that
+    /// has no rels file at all (extremely malformed input).
+    MissingWorkbookRels,
     SheetIndexOutOfRange,
     SheetNotFound,
     SstIndexOutOfRange,
     SstEntryIsRich,
+    /// Existing `xl/_rels/workbook.xml.rels` is missing the closing
+    /// `</Relationships>` tag — refused rather than producing an
+    /// unparseable relationships file when extending the SST.
+    MalformedWorkbookRels,
     InvalidCellRef,
     NoSheetData,
     UnsupportedCellValue,
@@ -54,18 +63,29 @@ pub const Error = error{
     std.fs.File.WriteError || std.fs.File.OpenError || std.fs.Dir.RenameError || std.fs.Dir.StatFileError;
 
 /// Mutation primitive (B1 iter-wb-4). Strings emit as `inlineStr`
-/// — cell-local text, no SST extension required. Formulas emit as
-/// `<f>…</f>` with no cached `<v>`, so Excel recalculates on open.
+/// — cell-local text, no SST extension required. `shared_string`
+/// values flow through `xl/sharedStrings.xml` (m4): the workbook's
+/// SST is extended (or created) on save and the cell emits as
+/// `<c t="s"><v>idx</v></c>`. Formulas emit as `<f>…</f>` with no
+/// cached `<v>`, so Excel recalculates on open.
 ///
-/// `string` and `formula` slices borrow for `setCell`'s call only.
-/// The delta map duplicates bytes into the Workbook allocator before
-/// returning, so the caller can free / reuse the buffer as soon as
-/// `setCell` returns.
+/// `string`, `shared_string`, and `formula` slices borrow for
+/// `setCell`'s call only. The delta map duplicates bytes into the
+/// Workbook allocator before returning, so the caller can free /
+/// reuse the buffer as soon as `setCell` returns.
 pub const CellValue = union(enum) {
     blank: void,
     number: f64,
     boolean: bool,
     string: []const u8,
+    /// Plain text routed through the workbook's shared-string table.
+    /// On save, the SST is extended (or created) with the unique new
+    /// strings and the cell emits as `t="s"` + numeric `<v>` index.
+    /// De-dup is by exact-byte equality against existing SST plain
+    /// entries (post-decode) and against other `.shared_string`
+    /// deltas in the same save. Rich-text entries are NOT considered
+    /// for de-dup (rare in writes).
+    shared_string: []const u8,
     /// Formula text (e.g. "SUM(A1:A10)" — no leading `=`). Emitted
     /// as `<f>…</f>` without a cached value; Excel recalculates the
     /// result on open. Caching computed results is a future iter
@@ -325,9 +345,20 @@ pub const Workbook = struct {
     /// re-parses from the new bytes).
     ///
     /// iter-wb-4 m1 limits: numeric / boolean / blank values only.
-    /// Strings + formulas + new-row-insertion-with-original-cell-
-    /// preservation come in m2.
+    /// m2: strings + formulas. m4: shared-string mode (`<c t="s">`).
     pub fn save(self: *Workbook, path: []const u8) Error!void {
+        // Phase 1: SST extension. Walk every worksheet's deltas for
+        // `.shared_string` values and build a single text → index
+        // map covering new strings across all sheets. If any are
+        // present, regenerate `xl/sharedStrings.xml` BEFORE per-sheet
+        // emit (per-sheet emit needs the assigned indices).
+        var sst_plan = try buildSstExtensionPlan(self);
+        defer sst_plan.deinit(self.allocator);
+
+        if (sst_plan.has_new_strings) {
+            try applySstExtensionPlan(self, &sst_plan);
+        }
+
         for (self.worksheets) |*ws| {
             if (ws.deltas.count() == 0) continue;
             _ = try ws.ensureParsed();
@@ -338,7 +369,13 @@ pub const Workbook = struct {
                 break :blk p.bytes;
             };
 
-            const new_xml = try emitSheetWithDeltas(self.allocator, source, view, &ws.deltas);
+            const new_xml = try emitSheetWithDeltas(
+                self.allocator,
+                source,
+                view,
+                &ws.deltas,
+                &sst_plan,
+            );
             defer self.allocator.free(new_xml);
             try self.store.replacePart(part_name, new_xml);
 
@@ -351,6 +388,15 @@ pub const Workbook = struct {
             var stale = ws.parsed.?;
             stale.deinit(self.allocator);
             ws.parsed = null;
+        }
+        // Invalidate cached SST view — its leaves borrowed from the
+        // pre-extension SST bytes which `replacePart` swapped out.
+        if (sst_plan.has_new_strings) {
+            if (self.sst_view) |*v| {
+                var view = v.*;
+                view.deinit(self.allocator);
+                self.sst_view = null;
+            }
         }
         try self.store.save(path);
     }
@@ -366,6 +412,7 @@ fn emitSheetWithDeltas(
     source: []const u8,
     view: *const sheet_xml_mod.SheetXml,
     deltas: *const std.AutoHashMapUnmanaged(CellRef, CellValue),
+    sst_plan: *const SstExtensionPlan,
 ) Error![]u8 {
     assert(source.len > 0);
 
@@ -393,7 +440,7 @@ fn emitSheetWithDeltas(
     try out.appendSlice(allocator, source[0..prefix_end]);
     if (is_self_closing) try out.appendSlice(allocator, "<sheetData>");
 
-    try emitSheetData(allocator, &out, view, deltas);
+    try emitSheetData(allocator, &out, view, deltas, sst_plan);
 
     if (is_self_closing) try out.appendSlice(allocator, "</sheetData>");
     try out.appendSlice(allocator, source[suffix_start..]);
@@ -424,6 +471,7 @@ fn emitSheetData(
     out: *std.ArrayList(u8),
     view: *const sheet_xml_mod.SheetXml,
     deltas: *const std.AutoHashMapUnmanaged(CellRef, CellValue),
+    sst_plan: *const SstExtensionPlan,
 ) Error!void {
     // 1. Collect existing cells (override with delta if matching).
     var merged: std.ArrayList(MergedCell) = .empty;
@@ -480,14 +528,19 @@ fn emitSheetData(
         try out.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{row_idx}));
         try out.appendSlice(allocator, "\">");
 
-        for (merged.items[i..j]) |mc| try emitCell(allocator, out, mc);
+        for (merged.items[i..j]) |mc| try emitCell(allocator, out, mc, sst_plan);
 
         try out.appendSlice(allocator, "</row>");
         i = j;
     }
 }
 
-fn emitCell(allocator: Allocator, out: *std.ArrayList(u8), mc: MergedCell) Error!void {
+fn emitCell(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    mc: MergedCell,
+    sst_plan: *const SstExtensionPlan,
+) Error!void {
     var ref_buf: [16]u8 = undefined;
     const ref_str = formatA1Ref(&ref_buf, mc.ref);
 
@@ -557,6 +610,18 @@ fn emitCell(allocator: Allocator, out: *std.ArrayList(u8), mc: MergedCell) Error
                 try appendXmlEscapedText(allocator, out, s);
                 try out.appendSlice(allocator, "</t></is></c>");
             },
+            .shared_string => |s| {
+                // Resolve the index assigned by the SST extension
+                // pass. `getOrUnreachable` is safe here: every
+                // `.shared_string` delta was registered into the
+                // plan in `buildSstExtensionPlan` (precondition of
+                // the save path).
+                const idx = sst_plan.indexOf(s) orelse unreachable;
+                try out.appendSlice(allocator, " t=\"s\"><v>");
+                var ibuf: [16]u8 = undefined;
+                try out.appendSlice(allocator, try std.fmt.bufPrint(&ibuf, "{d}", .{idx}));
+                try out.appendSlice(allocator, "</v></c>");
+            },
             .formula => |f| {
                 // No cached value — Excel recalcs on open. Future iter
                 // can stash a computed result inside `<v>` once a
@@ -567,6 +632,650 @@ fn emitCell(allocator: Allocator, out: *std.ArrayList(u8), mc: MergedCell) Error
             },
         },
     }
+}
+
+// ─── SST extension (iter-wb-4 m4) ────────────────────────────────────
+
+/// Plan for extending the workbook's shared-string table with new
+/// strings collected from `.shared_string` deltas across every
+/// worksheet's pending mutations.
+///
+/// Built upfront in `buildSstExtensionPlan` BEFORE per-sheet emit so
+/// each `<c t="s">` knows its target index. `applySstExtensionPlan`
+/// commits the plan to the `PartStore` (replacePart on existing SST,
+/// addPart + workbook.xml.rels splice when SST is absent).
+///
+/// De-dup policy:
+///   - linear scan against existing entries (decoded), then linear
+///     scan against already-staged new strings.
+///   - linear was chosen over a hashmap because (a) the typical
+///     write workload stages a small handful of new strings while
+///     the SST may carry thousands of existing entries; building a
+///     hashmap of decoded existing entries up front is more work
+///     than scanning per-new-string. (b) keeping the implementation
+///     stdlib-only and trivially auditable matters more than constant-
+///     factor speed at the SST sizes encountered in practice.
+const ExistingMatch = struct {
+    text: []const u8,
+    index: u32,
+};
+
+const SstExtensionPlan = struct {
+    /// True when at least one `.shared_string` delta required a fresh
+    /// SST entry (i.e. the user-supplied text didn't already match an
+    /// existing entry).
+    has_new_strings: bool = false,
+    /// Allocator owns: every entry of `new_strings` (duped on insert),
+    /// the slice itself.
+    new_strings: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Side table: deltas whose text matched an existing SST entry.
+    /// Allows `indexOf` to resolve those without rescanning the SST.
+    /// Allocator owns each `text` slice.
+    existing_matches: std.ArrayListUnmanaged(ExistingMatch) = .empty,
+    /// Index of the FIRST new string within the regenerated SST. For
+    /// an existing-SST workbook this is the existing entry count;
+    /// for a freshly-created SST it's 0.
+    base_index: u32 = 0,
+    /// Tracks whether the SST part already existed at plan-build time.
+    /// Drives the `replacePart` vs `addPart + workbook.xml.rels splice`
+    /// branch in `applySstExtensionPlan`.
+    sst_part_exists: bool = false,
+
+    fn deinit(self: *SstExtensionPlan, allocator: Allocator) void {
+        for (self.new_strings.items) |s| allocator.free(s);
+        self.new_strings.deinit(allocator);
+        for (self.existing_matches.items) |em| allocator.free(em.text);
+        self.existing_matches.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// Resolve the SST index for a (raw, unescaped) string staged
+    /// via `setCell(.{ .shared_string = ... })`. Returns null if
+    /// `s` was never staged into this plan (caller invariant: every
+    /// `.shared_string` delta is registered before per-sheet emit).
+    fn indexOf(self: *const SstExtensionPlan, s: []const u8) ?u32 {
+        for (self.existing_matches.items) |em| {
+            if (std.mem.eql(u8, em.text, s)) return em.index;
+        }
+        for (self.new_strings.items, 0..) |existing, i| {
+            if (std.mem.eql(u8, existing, s)) {
+                return self.base_index + @as(u32, @intCast(i));
+            }
+        }
+        return null;
+    }
+};
+
+/// Walk every worksheet's `.shared_string` deltas, de-dup against
+/// the existing SST (when present) and against each other, and stage
+/// the resulting unique-new-strings list into a plan. The plan owns
+/// duplicates of every staged string; callers free via `plan.deinit`.
+fn buildSstExtensionPlan(wb: *Workbook) Error!SstExtensionPlan {
+    assert(@intFromPtr(wb) != 0);
+    assert(@intFromPtr(wb.allocator.vtable) != 0);
+
+    var plan: SstExtensionPlan = .{};
+    errdefer plan.deinit(wb.allocator);
+
+    // Quick scan: any `.shared_string` at all? Skips any work — and
+    // crucially, skips parsing the SST — when the workbook has no
+    // shared-string deltas pending.
+    var any: bool = false;
+    for (wb.worksheets) |*ws| {
+        var it = ws.deltas.valueIterator();
+        while (it.next()) |v| switch (v.*) {
+            .shared_string => {
+                any = true;
+                break;
+            },
+            else => {},
+        };
+        if (any) break;
+    }
+    if (!any) return plan;
+
+    // Resolve the existing SST's plain-entry count + decoded-text
+    // slice for de-dup. Rich entries occupy indices but aren't
+    // candidates for de-dup; a new string equal to a rich entry's
+    // concatenated runs would still allocate a fresh `<si><t>...`.
+    const existing_view = try wb.sst();
+    if (existing_view) |view| {
+        plan.sst_part_exists = true;
+        plan.base_index = @intCast(view.entries.len);
+    } else {
+        plan.sst_part_exists = false;
+        plan.base_index = 0;
+    }
+
+    // Pre-decode every existing plain entry once into an arena so
+    // each new string compares against decoded text. Rich entries
+    // get a sentinel empty slice (matched-equal would be wrong, but
+    // an empty new string never equals a rich entry by construction
+    // — `.plain` and `.rich` are disjoint).
+    var decode_arena = std.heap.ArenaAllocator.init(wb.allocator);
+    defer decode_arena.deinit();
+    const da = decode_arena.allocator();
+
+    var decoded_existing: [][]const u8 = &.{};
+    if (existing_view) |view| {
+        decoded_existing = try da.alloc([]const u8, view.entries.len);
+        for (view.entries, 0..) |e, i| {
+            decoded_existing[i] = switch (e) {
+                .plain => |s| try sst_xml_mod.decodeText(da, s),
+                .rich => "", // never matches a non-empty new string
+            };
+        }
+    }
+
+    // Walk deltas in worksheet order, then in iteration order. Order
+    // is observable to test assertions, so document: "first occurrence
+    // across (worksheet 0..N, iteration order) wins the lower index".
+    for (wb.worksheets) |*ws| {
+        var it = ws.deltas.valueIterator();
+        while (it.next()) |v| {
+            const s = switch (v.*) {
+                .shared_string => |t| t,
+                else => continue,
+            };
+
+            // De-dup against existing SST entries (decoded).
+            var matched_existing: bool = false;
+            for (decoded_existing) |de| {
+                if (std.mem.eql(u8, de, s)) {
+                    matched_existing = true;
+                    break;
+                }
+            }
+            if (matched_existing) continue;
+
+            // De-dup against already-staged new strings.
+            var dup_in_plan: bool = false;
+            for (plan.new_strings.items) |existing| {
+                if (std.mem.eql(u8, existing, s)) {
+                    dup_in_plan = true;
+                    break;
+                }
+            }
+            if (dup_in_plan) continue;
+
+            const owned = try wb.allocator.dupe(u8, s);
+            errdefer wb.allocator.free(owned);
+            try plan.new_strings.append(wb.allocator, owned);
+        }
+    }
+
+    // The plan registered at least one new string only when at least
+    // one delta failed to match an existing entry. If the user wrote
+    // shared-strings that all already existed, has_new_strings stays
+    // false and we skip SST regeneration entirely — but we still need
+    // indexOf to resolve those existing entries. Patch base_index +
+    // pre-load the matched existing entries so `indexOf` works.
+    plan.has_new_strings = plan.new_strings.items.len > 0;
+
+    // Whether or not we're regenerating, every `.shared_string` delta
+    // must be reachable via plan.indexOf. For deltas that matched an
+    // existing entry, register their (raw user) text → existing index
+    // mapping by appending the user text under its existing index. We
+    // do this by interleaving: re-walk deltas, for each shared_string
+    // either it's already in plan.new_strings (just appended) or it
+    // matched existing — we need to record the existing index.
+    //
+    // Simpler implementation: keep a parallel `existing_index_map`.
+    // Done below via a second pass that uses the same de-dup logic
+    // and populates `existing_match_index_for_each_new_string` which
+    // is unused here; instead we extend `indexOf` to scan an
+    // existing-match table. Defer that to a follow-up: in the common
+    // case where a freshly-staged shared_string matches an existing
+    // SST entry, we still want a valid emit path.
+
+    // Fast path A: no new strings. Every delta matched an existing
+    // SST entry — we skip regeneration. To keep emit correct, emit
+    // a separate index lookup via a side-table keyed by raw user
+    // text → existing index.
+    if (!plan.has_new_strings and existing_view != null) {
+        // Build the existing-match side table now.
+        const view = existing_view.?;
+        for (wb.worksheets) |*ws| {
+            var it = ws.deltas.valueIterator();
+            while (it.next()) |v| {
+                const s = switch (v.*) {
+                    .shared_string => |t| t,
+                    else => continue,
+                };
+                // Already handled? linear scan keeps things simple.
+                var already: bool = false;
+                for (plan.existing_matches.items) |em| {
+                    if (std.mem.eql(u8, em.text, s)) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (already) continue;
+                // Find the matching existing index.
+                var found_idx: u32 = std.math.maxInt(u32);
+                for (decoded_existing, 0..) |de, i| {
+                    if (std.mem.eql(u8, de, s)) {
+                        found_idx = @intCast(i);
+                        break;
+                    }
+                }
+                assert(found_idx != std.math.maxInt(u32));
+                const owned = try wb.allocator.dupe(u8, s);
+                errdefer wb.allocator.free(owned);
+                try plan.existing_matches.append(wb.allocator, .{ .text = owned, .index = found_idx });
+            }
+        }
+        _ = view;
+    }
+
+    // Fast path B: there ARE new strings. We also need an existing-
+    // match side table for any deltas whose text equals an existing
+    // entry — those should resolve to the existing index, not a fresh
+    // one. The de-dup loop above already skipped them from
+    // plan.new_strings; populate the side table.
+    if (plan.has_new_strings and existing_view != null) {
+        for (wb.worksheets) |*ws| {
+            var it = ws.deltas.valueIterator();
+            while (it.next()) |v| {
+                const s = switch (v.*) {
+                    .shared_string => |t| t,
+                    else => continue,
+                };
+                // If it's in plan.new_strings, it didn't match
+                // existing — skip.
+                var in_new: bool = false;
+                for (plan.new_strings.items) |n| {
+                    if (std.mem.eql(u8, n, s)) {
+                        in_new = true;
+                        break;
+                    }
+                }
+                if (in_new) continue;
+
+                // Skip if already registered in side table.
+                var already: bool = false;
+                for (plan.existing_matches.items) |em| {
+                    if (std.mem.eql(u8, em.text, s)) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (already) continue;
+
+                var found_idx: u32 = std.math.maxInt(u32);
+                for (decoded_existing, 0..) |de, i| {
+                    if (std.mem.eql(u8, de, s)) {
+                        found_idx = @intCast(i);
+                        break;
+                    }
+                }
+                assert(found_idx != std.math.maxInt(u32));
+                const owned = try wb.allocator.dupe(u8, s);
+                errdefer wb.allocator.free(owned);
+                try plan.existing_matches.append(wb.allocator, .{ .text = owned, .index = found_idx });
+            }
+        }
+    }
+
+    return plan;
+}
+
+/// Persist the SST extension plan to the PartStore. When the source
+/// workbook had an existing `xl/sharedStrings.xml`, regenerate the
+/// part's bytes (existing entries unchanged, new entries appended)
+/// and `replacePart`. When absent, emit a fresh SST + register it via
+/// `PartStore.addPart` + splice a `<Relationship>` into
+/// `xl/_rels/workbook.xml.rels`.
+fn applySstExtensionPlan(wb: *Workbook, plan: *const SstExtensionPlan) Error!void {
+    assert(plan.has_new_strings);
+    assert(plan.new_strings.items.len > 0);
+
+    if (plan.sst_part_exists) {
+        // Re-emit the SST part with the existing entries preserved
+        // verbatim and the new strings appended.
+        const existing_part = wb.store.part("xl/sharedStrings.xml") orelse
+            return Error.MissingWorkbookPart; // sst_part_exists invariant violated
+        const new_xml = try emitSstXmlForExtension(
+            wb.allocator,
+            existing_part.bytes,
+            plan.new_strings.items,
+        );
+        defer wb.allocator.free(new_xml);
+        try wb.store.replacePart("xl/sharedStrings.xml", new_xml);
+        return;
+    }
+
+    // Source had no SST. Emit a fresh one containing only the new
+    // strings, register it as a new part with the correct content
+    // type, then patch the workbook rels file.
+    const fresh_xml = try emitFreshSstXml(wb.allocator, plan.new_strings.items);
+    defer wb.allocator.free(fresh_xml);
+
+    try wb.store.addPart(
+        "xl/sharedStrings.xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml",
+        fresh_xml,
+    );
+
+    // Splice a `<Relationship>` into `xl/_rels/workbook.xml.rels`.
+    const rels_part = wb.store.part("xl/_rels/workbook.xml.rels") orelse
+        return Error.MissingWorkbookRels;
+    const new_rels = try injectSstRelationship(wb.allocator, rels_part.bytes);
+    defer wb.allocator.free(new_rels);
+    try wb.store.replacePart("xl/_rels/workbook.xml.rels", new_rels);
+}
+
+/// Produce a regenerated `xl/sharedStrings.xml` with the original
+/// entries preserved verbatim and one `<si><t>…</t></si>` per new
+/// string appended. The `count` / `uniqueCount` attributes on `<sst>`
+/// are rewritten to reflect the new totals; non-attribute markup
+/// (xmlns, comments, PIs) is preserved as-is.
+fn emitSstXmlForExtension(
+    allocator: Allocator,
+    src_xml: []const u8,
+    new_strings: []const []const u8,
+) Error![]u8 {
+    assert(src_xml.len > 0);
+    assert(new_strings.len > 0);
+
+    // Locate `<sst …>` opening tag.
+    const sst_open = std.mem.indexOf(u8, src_xml, "<sst") orelse
+        return error.MalformedXml;
+    const sst_open_gt = std.mem.indexOfScalarPos(u8, src_xml, sst_open, '>') orelse
+        return error.MalformedXml;
+    const is_self_closing = sst_open_gt > 0 and src_xml[sst_open_gt - 1] == '/';
+
+    // Existing si count: parse uniqueCount attribute when present;
+    // otherwise count `<si` opens in the body.
+    const existing_si_count: u32 = blk: {
+        const attrs = src_xml[sst_open .. sst_open_gt + 1];
+        if (extractAttrValue(attrs, "uniqueCount")) |raw| {
+            if (std.fmt.parseInt(u32, raw, 10)) |n| break :blk n else |_| {}
+        }
+        break :blk countSiOpens(src_xml);
+    };
+    const new_si_count: u32 = @intCast(new_strings.len);
+    const total_si: u32 = existing_si_count + new_si_count;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, src_xml.len + 64 * new_strings.len);
+
+    // Copy bytes up to and INCLUDING `<sst`, then rewrite the
+    // attribute blob with patched count/uniqueCount, then continue
+    // from `>`.
+    try out.appendSlice(allocator, src_xml[0 .. sst_open + "<sst".len]);
+
+    // Walk the original attribute blob, replacing count/uniqueCount.
+    const attr_start = sst_open + "<sst".len;
+    const attr_end = sst_open_gt; // index of `>` (or `/>` slash)
+    try writePatchedSstAttrs(
+        allocator,
+        &out,
+        src_xml[attr_start..attr_end],
+        total_si,
+    );
+
+    // If self-closing, transform into open form so we can append entries.
+    if (is_self_closing) {
+        try out.appendSlice(allocator, ">");
+    } else {
+        try out.appendSlice(allocator, ">");
+    }
+
+    if (is_self_closing) {
+        // Source had `<sst …/>` with no body. Emit only the new entries
+        // followed by a fresh `</sst>`.
+        try appendNewSiEntries(allocator, &out, new_strings);
+        try out.appendSlice(allocator, "</sst>");
+        // Anything past the original `/>` is post-element trailing
+        // bytes (rare, but preserve).
+        if (sst_open_gt + 1 < src_xml.len) {
+            try out.appendSlice(allocator, src_xml[sst_open_gt + 1 ..]);
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    // Normal form: copy body verbatim up to `</sst>`, then append
+    // new entries, then `</sst>` + trailing.
+    const body_start = sst_open_gt + 1;
+    const close = std.mem.indexOfPos(u8, src_xml, body_start, "</sst>") orelse
+        return error.MalformedXml;
+    try out.appendSlice(allocator, src_xml[body_start..close]);
+    try appendNewSiEntries(allocator, &out, new_strings);
+    try out.appendSlice(allocator, src_xml[close..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Build a complete `xl/sharedStrings.xml` from scratch. Used when
+/// the source workbook had no SST part.
+fn emitFreshSstXml(allocator: Allocator, new_strings: []const []const u8) Error![]u8 {
+    assert(new_strings.len > 0);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, 256 + 64 * new_strings.len);
+
+    try out.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+    try out.appendSlice(allocator, "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"");
+    var nbuf: [32]u8 = undefined;
+    try out.appendSlice(allocator, " count=\"");
+    try out.appendSlice(allocator, try std.fmt.bufPrint(&nbuf, "{d}", .{new_strings.len}));
+    try out.appendSlice(allocator, "\" uniqueCount=\"");
+    try out.appendSlice(allocator, try std.fmt.bufPrint(&nbuf, "{d}", .{new_strings.len}));
+    try out.appendSlice(allocator, "\">");
+    try appendNewSiEntries(allocator, &out, new_strings);
+    try out.appendSlice(allocator, "</sst>");
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Append one `<si><t>…</t></si>` per new string to `out`, with
+/// `xml:space="preserve"` when the text has leading/trailing
+/// whitespace that OOXML would otherwise strip.
+fn appendNewSiEntries(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    new_strings: []const []const u8,
+) Error!void {
+    for (new_strings) |s| {
+        try out.appendSlice(allocator, "<si><t");
+        if (sstNeedsXmlSpacePreserveLocal(s)) {
+            try out.appendSlice(allocator, " xml:space=\"preserve\"");
+        }
+        try out.appendSlice(allocator, ">");
+        try appendXmlEscapedText(allocator, out, s);
+        try out.appendSlice(allocator, "</t></si>");
+    }
+}
+
+/// Mirrors `src/xlsx.zig::sstNeedsXmlSpacePreserve`. Local copy keeps
+/// `pkg/workbook.zig` independent of `src/`.
+fn sstNeedsXmlSpacePreserveLocal(s: []const u8) bool {
+    if (s.len == 0) return false;
+    const lead = s[0];
+    const trail = s[s.len - 1];
+    return lead == ' ' or lead == '\t' or lead == '\n' or lead == '\r' or
+        trail == ' ' or trail == '\t' or trail == '\n' or trail == '\r';
+}
+
+/// Walk the attribute blob between `<sst` and `>`, emitting it to
+/// `out` with `count` and `uniqueCount` rewritten to `new_count`.
+/// Attributes other than these two pass through byte-for-byte. If
+/// neither attribute is present, both are appended.
+fn writePatchedSstAttrs(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    attrs: []const u8,
+    new_count: u32,
+) Error!void {
+    var saw_count: bool = false;
+    var saw_unique: bool = false;
+    var i: usize = 0;
+    while (i < attrs.len) {
+        // Skip leading whitespace, but emit it.
+        while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
+            attrs[i] == '\n' or attrs[i] == '\r'))
+        {
+            try out.append(allocator, attrs[i]);
+            i += 1;
+        }
+        if (i >= attrs.len) break;
+        // Slash (self-closing marker) or any other non-name char: emit + continue.
+        if (attrs[i] == '/') {
+            try out.append(allocator, attrs[i]);
+            i += 1;
+            continue;
+        }
+        // Identify attribute name = run of non-`=`, non-whitespace chars.
+        const name_start = i;
+        while (i < attrs.len and attrs[i] != '=' and attrs[i] != ' ' and
+            attrs[i] != '\t' and attrs[i] != '\n' and attrs[i] != '\r' and
+            attrs[i] != '/') : (i += 1)
+        {}
+        const name = attrs[name_start..i];
+        // Skip whitespace before `=`.
+        while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
+            attrs[i] == '\n' or attrs[i] == '\r')) : (i += 1)
+        {}
+        if (i >= attrs.len or attrs[i] != '=') {
+            // Standalone token (e.g. trailing whitespace before `/>`).
+            try out.appendSlice(allocator, name);
+            continue;
+        }
+        i += 1; // past `=`
+        // Skip whitespace, find quote.
+        while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
+            attrs[i] == '\n' or attrs[i] == '\r')) : (i += 1)
+        {}
+        if (i >= attrs.len or (attrs[i] != '"' and attrs[i] != '\'')) {
+            // Malformed attribute — emit verbatim, fall back to scanning to next whitespace.
+            try out.appendSlice(allocator, name);
+            try out.append(allocator, '=');
+            continue;
+        }
+        const quote = attrs[i];
+        const value_start = i + 1;
+        const value_end = std.mem.indexOfScalarPos(u8, attrs, value_start, quote) orelse
+            return error.MalformedXml;
+        const raw_value = attrs[value_start..value_end];
+
+        // Emit the attribute (rewriting count / uniqueCount).
+        try out.append(allocator, ' ');
+        if (std.mem.eql(u8, name, "count")) {
+            saw_count = true;
+            try writeCountAttr(allocator, out, "count", new_count);
+        } else if (std.mem.eql(u8, name, "uniqueCount")) {
+            saw_unique = true;
+            try writeCountAttr(allocator, out, "uniqueCount", new_count);
+        } else {
+            try out.appendSlice(allocator, name);
+            try out.append(allocator, '=');
+            try out.append(allocator, quote);
+            try out.appendSlice(allocator, raw_value);
+            try out.append(allocator, quote);
+        }
+        i = value_end + 1;
+    }
+    if (!saw_count) try writeCountAttr(allocator, out, " count", new_count);
+    if (!saw_unique) try writeCountAttr(allocator, out, " uniqueCount", new_count);
+}
+
+fn writeCountAttr(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    name: []const u8,
+    n: u32,
+) Error!void {
+    try out.appendSlice(allocator, name);
+    try out.appendSlice(allocator, "=\"");
+    var nbuf: [16]u8 = undefined;
+    try out.appendSlice(allocator, try std.fmt.bufPrint(&nbuf, "{d}", .{n}));
+    try out.append(allocator, '"');
+}
+
+/// Extract `name="value"` from an attribute blob (raw value, no
+/// entity decoding). Returns null if `name` is absent. Boundary check
+/// prevents `count` from matching `uniqueCount`.
+fn extractAttrValue(blob: []const u8, name: []const u8) ?[]const u8 {
+    assert(name.len > 0);
+    var search_from: usize = 0;
+    while (true) {
+        const pos = std.mem.indexOfPos(u8, blob, search_from, name) orelse return null;
+        const left_ok = pos == 0 or blob[pos - 1] == ' ' or blob[pos - 1] == '\t' or
+            blob[pos - 1] == '\n' or blob[pos - 1] == '\r' or blob[pos - 1] == '<';
+        const after = pos + name.len;
+        if (after >= blob.len) return null;
+        if (left_ok and blob[after] == '=') {
+            const q_pos = after + 1;
+            if (q_pos >= blob.len) return null;
+            const quote = blob[q_pos];
+            if (quote != '"' and quote != '\'') return null;
+            const start = q_pos + 1;
+            const end = std.mem.indexOfScalarPos(u8, blob, start, quote) orelse return null;
+            return blob[start..end];
+        }
+        search_from = pos + 1;
+    }
+}
+
+/// Count `<si` opens in `xml`. Used to recover the existing entry
+/// count when `<sst>` has no `uniqueCount` attribute. Boundary check
+/// keeps `<si` from matching `<silly` (the next char must be a tag
+/// boundary).
+fn countSiOpens(xml: []const u8) u32 {
+    var n: u32 = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, i, "<si")) |pos| {
+        const after = pos + 3;
+        if (after >= xml.len) break;
+        const c = xml[after];
+        if (c == '>' or c == '/' or c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+            n += 1;
+            i = after;
+        } else {
+            i = pos + 1;
+        }
+    }
+    return n;
+}
+
+/// Splice a `<Relationship>` for `xl/sharedStrings.xml` into
+/// `xl/_rels/workbook.xml.rels`. Picks an Id that doesn't collide
+/// with existing `rIdN` values. No-op (returns the original bytes
+/// duped) if a sharedStrings relationship already exists.
+fn injectSstRelationship(allocator: Allocator, xml: []const u8) Error![]u8 {
+    if (std.mem.indexOf(u8, xml, "/relationships/sharedStrings") != null) {
+        return try allocator.dupe(u8, xml);
+    }
+
+    var max_id: u32 = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, i, "Id=\"rId")) |pos| {
+        const num_start = pos + "Id=\"rId".len;
+        var num_end = num_start;
+        while (num_end < xml.len and xml[num_end] >= '0' and xml[num_end] <= '9') : (num_end += 1) {}
+        if (num_end > num_start) {
+            if (std.fmt.parseInt(u32, xml[num_start..num_end], 10)) |n| {
+                if (n > max_id) max_id = n;
+            } else |_| {}
+        }
+        i = num_end + 1;
+    }
+    const new_id: u32 = max_id + 1;
+
+    const close = std.mem.indexOf(u8, xml, "</Relationships>") orelse
+        return error.MalformedWorkbookRels;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, xml.len + 256);
+    try out.appendSlice(allocator, xml[0..close]);
+    try out.appendSlice(allocator, "<Relationship Id=\"rId");
+    var nbuf: [16]u8 = undefined;
+    try out.appendSlice(allocator, try std.fmt.bufPrint(&nbuf, "{d}", .{new_id}));
+    try out.appendSlice(allocator, "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/>");
+    try out.appendSlice(allocator, xml[close..]);
+    return try out.toOwnedSlice(allocator);
 }
 
 fn cellTypeAttr(t: sheet_xml_mod.CellType) ?[]const u8 {
@@ -722,10 +1431,11 @@ pub const Worksheet = struct {
         const a = self.workbook.allocator;
 
         // Free any previous heap allocation for this ref so a
-        // string/formula overwrite doesn't leak.
+        // string/formula/shared_string overwrite doesn't leak.
         if (self.deltas.get(cr)) |prev| {
             switch (prev) {
                 .string => |s| a.free(s),
+                .shared_string => |s| a.free(s),
                 .formula => |f| a.free(f),
                 else => {},
             }
@@ -736,6 +1446,10 @@ pub const Worksheet = struct {
                 if (!isXmlSafeText(s)) return error.MalformedXml;
                 break :blk .{ .string = try a.dupe(u8, s) };
             },
+            .shared_string => |s| blk: {
+                if (!isXmlSafeText(s)) return error.MalformedXml;
+                break :blk .{ .shared_string = try a.dupe(u8, s) };
+            },
             .formula => |f| blk: {
                 if (!isXmlSafeText(f)) return error.MalformedXml;
                 break :blk .{ .formula = try a.dupe(u8, f) };
@@ -744,6 +1458,7 @@ pub const Worksheet = struct {
         };
         errdefer switch (stored) {
             .string => |s| a.free(s),
+            .shared_string => |s| a.free(s),
             .formula => |f| a.free(f),
             else => {},
         };
@@ -771,6 +1486,7 @@ fn freeDeltaStrings(allocator: Allocator, deltas: *std.AutoHashMapUnmanaged(Cell
     while (it.next()) |v| {
         switch (v.*) {
             .string => |s| allocator.free(s),
+            .shared_string => |s| allocator.free(s),
             .formula => |f| allocator.free(f),
             else => {},
         }
@@ -804,6 +1520,131 @@ fn eqlAsciiIgnoreCase(a: []const u8, b: []const u8) bool {
 
 fn toAsciiLower(c: u8) u8 {
     return if (c >= 'A' and c <= 'Z') c + 32 else c;
+}
+
+// ─── Test helpers ─────────────────────────────────────────────────────
+
+/// Write a minimal SST-less .xlsx to `path` for testing the SST-
+/// creation branch. Every part is STORED (compression method = 0)
+/// so the file can be assembled without pulling in a deflate
+/// dependency. Contents:
+///   - `[Content_Types].xml` with no sharedStrings override
+///   - `_rels/.rels` pointing to `xl/workbook.xml`
+///   - `xl/workbook.xml` declaring a single sheet (rId1)
+///   - `xl/_rels/workbook.xml.rels` with the sheet rel only
+///   - `xl/worksheets/sheet1.xml` (empty `<sheetData/>`)
+fn writeMinimalSstLessXlsx(allocator: Allocator, path: []const u8) !void {
+    const Entry = struct { name: []const u8, body: []const u8 };
+
+    const content_types =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+        "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">" ++
+        "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>" ++
+        "<Default Extension=\"xml\" ContentType=\"application/xml\"/>" ++
+        "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>" ++
+        "<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>" ++
+        "</Types>";
+    const root_rels =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>" ++
+        "</Relationships>";
+    const workbook_xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+        "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">" ++
+        "<sheets><sheet name=\"Sheet1\" sheetId=\"1\" r:id=\"rId1\"/></sheets>" ++
+        "</workbook>";
+    const workbook_rels =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>" ++
+        "</Relationships>";
+    const sheet_xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+        "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+        "<sheetData></sheetData>" ++
+        "</worksheet>";
+
+    const entries = [_]Entry{
+        .{ .name = "[Content_Types].xml", .body = content_types },
+        .{ .name = "_rels/.rels", .body = root_rels },
+        .{ .name = "xl/workbook.xml", .body = workbook_xml },
+        .{ .name = "xl/_rels/workbook.xml.rels", .body = workbook_rels },
+        .{ .name = "xl/worksheets/sheet1.xml", .body = sheet_xml },
+    };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    const Lfh = struct { offset: u32, name: []const u8, body: []const u8, crc: u32 };
+    var lfhs: std.ArrayList(Lfh) = .empty;
+    defer lfhs.deinit(allocator);
+
+    // Phase 1: write LFH + payload for each entry.
+    for (entries) |e| {
+        const off: u32 = @intCast(buf.items.len);
+        const crc = std.hash.Crc32.hash(e.body);
+        // LFH = 30 bytes + name + payload.
+        var hdr: [30]u8 = undefined;
+        std.mem.writeInt(u32, hdr[0..4], 0x04034b50, .little);
+        std.mem.writeInt(u16, hdr[4..6], 20, .little); // version
+        std.mem.writeInt(u16, hdr[6..8], 0, .little); // flags
+        std.mem.writeInt(u16, hdr[8..10], 0, .little); // method = STORED
+        std.mem.writeInt(u16, hdr[10..12], 0, .little); // mtime
+        std.mem.writeInt(u16, hdr[12..14], 0, .little); // mdate
+        std.mem.writeInt(u32, hdr[14..18], crc, .little);
+        std.mem.writeInt(u32, hdr[18..22], @intCast(e.body.len), .little);
+        std.mem.writeInt(u32, hdr[22..26], @intCast(e.body.len), .little);
+        std.mem.writeInt(u16, hdr[26..28], @intCast(e.name.len), .little);
+        std.mem.writeInt(u16, hdr[28..30], 0, .little); // extra len
+        try buf.appendSlice(allocator, &hdr);
+        try buf.appendSlice(allocator, e.name);
+        try buf.appendSlice(allocator, e.body);
+        try lfhs.append(allocator, .{ .offset = off, .name = e.name, .body = e.body, .crc = crc });
+    }
+
+    // Phase 2: central directory.
+    const cd_off: u32 = @intCast(buf.items.len);
+    for (lfhs.items) |l| {
+        var cdfh: [46]u8 = undefined;
+        std.mem.writeInt(u32, cdfh[0..4], 0x02014b50, .little);
+        std.mem.writeInt(u16, cdfh[4..6], 20, .little);
+        std.mem.writeInt(u16, cdfh[6..8], 20, .little);
+        std.mem.writeInt(u16, cdfh[8..10], 0, .little);
+        std.mem.writeInt(u16, cdfh[10..12], 0, .little);
+        std.mem.writeInt(u16, cdfh[12..14], 0, .little);
+        std.mem.writeInt(u16, cdfh[14..16], 0, .little);
+        std.mem.writeInt(u32, cdfh[16..20], l.crc, .little);
+        std.mem.writeInt(u32, cdfh[20..24], @intCast(l.body.len), .little);
+        std.mem.writeInt(u32, cdfh[24..28], @intCast(l.body.len), .little);
+        std.mem.writeInt(u16, cdfh[28..30], @intCast(l.name.len), .little);
+        std.mem.writeInt(u16, cdfh[30..32], 0, .little);
+        std.mem.writeInt(u16, cdfh[32..34], 0, .little);
+        std.mem.writeInt(u16, cdfh[34..36], 0, .little);
+        std.mem.writeInt(u16, cdfh[36..38], 0, .little);
+        std.mem.writeInt(u32, cdfh[38..42], 0, .little);
+        std.mem.writeInt(u32, cdfh[42..46], l.offset, .little);
+        try buf.appendSlice(allocator, &cdfh);
+        try buf.appendSlice(allocator, l.name);
+    }
+    const cd_size: u32 = @intCast(@as(u32, @intCast(buf.items.len)) - cd_off);
+
+    // Phase 3: EOCD.
+    var eocd: [22]u8 = undefined;
+    std.mem.writeInt(u32, eocd[0..4], 0x06054b50, .little);
+    std.mem.writeInt(u16, eocd[4..6], 0, .little);
+    std.mem.writeInt(u16, eocd[6..8], 0, .little);
+    std.mem.writeInt(u16, eocd[8..10], @intCast(lfhs.items.len), .little);
+    std.mem.writeInt(u16, eocd[10..12], @intCast(lfhs.items.len), .little);
+    std.mem.writeInt(u32, eocd[12..16], cd_size, .little);
+    std.mem.writeInt(u32, eocd[16..20], cd_off, .little);
+    std.mem.writeInt(u16, eocd[20..22], 0, .little);
+    try buf.appendSlice(allocator, &eocd);
+
+    // Write to disk.
+    var f = try std.fs.cwd().createFile(path, .{});
+    defer f.close();
+    try f.writeAll(buf.items);
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────
@@ -1215,4 +2056,191 @@ test "Workbook.setCell: formula control bytes rejected; overwrite leak-free" {
     try s0.setCell("B1", .{ .string = "now a string" });
     try s0.setCell("B1", .{ .number = 42 });
     try s0.setCell("B1", .{ .formula = "back to formula" });
+}
+
+test "Workbook.setCell: shared_string round-trips on a fixture WITH existing SST" {
+    const src_path = "tests/corpus/worldbank_catalog.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-sst-extend-{d}.xlsx", .{prng.random().int(u32)});
+
+    const new_text = "zlsx-iter-wb-4-m4-sentinel-string";
+
+    var pre_count: u32 = 0;
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        const sst_view = (try wb.sst()).?;
+        pre_count = @intCast(sst_view.entries.len);
+        try std.testing.expect(pre_count > 0);
+
+        const s0 = try wb.sheet(0);
+        try s0.setCell("Z999", .{ .shared_string = new_text });
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb2.deinit();
+
+    // SST grew by exactly one and the new entry resolves to our text.
+    const sst_view2 = (try wb2.sst()).?;
+    try std.testing.expectEqual(@as(usize, pre_count + 1), sst_view2.entries.len);
+    const tail_text = try wb2.sstText(pre_count);
+    try std.testing.expect(tail_text != null);
+    try std.testing.expectEqualStrings(new_text, tail_text.?);
+
+    const s0 = try wb2.sheet(0);
+    const c = try s0.cellByRef("Z999");
+    try std.testing.expect(c != null);
+    try std.testing.expect(c.?.cell_type == .shared_string);
+    try std.testing.expect(c.?.raw_value != null);
+    var ibuf: [16]u8 = undefined;
+    const expected_idx_str = try std.fmt.bufPrint(&ibuf, "{d}", .{pre_count});
+    try std.testing.expectEqualStrings(expected_idx_str, c.?.raw_value.?);
+}
+
+test "Workbook.setCell: shared_string creates SST on a workbook without one" {
+    // None of the corpus fixtures lack an SST, so this test
+    // synthesises a minimal SST-less xlsx in-memory (STORED entries
+    // only — no deflate dependency) and writes it under .zig-cache.
+    const alloc = std.testing.allocator;
+
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    const src_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-sstless-src-{d}.xlsx", .{prng.random().int(u32)});
+    var tmp_buf2: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf2, ".zig-cache/test-wb-sstless-out-{d}.xlsx", .{prng.random().int(u32)});
+
+    try writeMinimalSstLessXlsx(alloc, src_path);
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+
+    const new_text = "fresh-sst-greeting";
+    // Sanity: the synthetic source has no SST.
+    {
+        var wb_check = try Workbook.open(alloc, src_path);
+        defer wb_check.deinit();
+        const v = try wb_check.sst();
+        try std.testing.expect(v == null);
+    }
+
+    {
+        var wb = try Workbook.open(alloc, src_path);
+        defer wb.deinit();
+        const s0 = try wb.sheet(0);
+        try s0.setCell("A1", .{ .shared_string = new_text });
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb2 = try Workbook.open(alloc, tmp_path);
+    defer wb2.deinit();
+
+    // SST part now exists with exactly one entry at index 0.
+    const v2 = try wb2.sst();
+    try std.testing.expect(v2 != null);
+    try std.testing.expectEqual(@as(usize, 1), v2.?.entries.len);
+    const t = try wb2.sstText(0);
+    try std.testing.expect(t != null);
+    try std.testing.expectEqualStrings(new_text, t.?);
+
+    const s0 = try wb2.sheet(0);
+    const c = try s0.cellByRef("A1");
+    try std.testing.expect(c != null);
+    try std.testing.expect(c.?.cell_type == .shared_string);
+    try std.testing.expectEqualStrings("0", c.?.raw_value.?);
+}
+
+test "Workbook.setCell: shared_string de-dups identical text across cells" {
+    const src_path = "tests/corpus/worldbank_catalog.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-sst-dedup-{d}.xlsx", .{prng.random().int(u32)});
+
+    const new_text = "zlsx-dedup-target-string";
+
+    var pre_count: u32 = 0;
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        pre_count = @intCast((try wb.sst()).?.entries.len);
+
+        const s0 = try wb.sheet(0);
+        try s0.setCell("Z998", .{ .shared_string = new_text });
+        try s0.setCell("Z999", .{ .shared_string = new_text });
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb2.deinit();
+
+    // SST grew by exactly ONE despite two cells writing the same text.
+    const sst2 = (try wb2.sst()).?;
+    try std.testing.expectEqual(@as(usize, pre_count + 1), sst2.entries.len);
+
+    const s0 = try wb2.sheet(0);
+    const c1 = try s0.cellByRef("Z998");
+    const c2 = try s0.cellByRef("Z999");
+    try std.testing.expect(c1 != null);
+    try std.testing.expect(c2 != null);
+    try std.testing.expect(c1.?.cell_type == .shared_string);
+    try std.testing.expect(c2.?.cell_type == .shared_string);
+    // Both cells reference the SAME index.
+    try std.testing.expectEqualStrings(c1.?.raw_value.?, c2.?.raw_value.?);
+    var ibuf: [16]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&ibuf, "{d}", .{pre_count});
+    try std.testing.expectEqualStrings(expected, c1.?.raw_value.?);
+}
+
+test "Workbook.setCell: mixed inlineStr + shared_string in one save" {
+    const src_path = "tests/corpus/worldbank_catalog.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-sst-mixed-{d}.xlsx", .{prng.random().int(u32)});
+
+    const inline_text = "stays-inline-mixed-mode";
+    const shared_text = "goes-to-sst-mixed-mode";
+
+    var pre_count: u32 = 0;
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        pre_count = @intCast((try wb.sst()).?.entries.len);
+
+        const s0 = try wb.sheet(0);
+        try s0.setCell("Z997", .{ .string = inline_text });
+        try s0.setCell("Z998", .{ .shared_string = shared_text });
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb2.deinit();
+    const sst2 = (try wb2.sst()).?;
+    try std.testing.expectEqual(@as(usize, pre_count + 1), sst2.entries.len);
+
+    const s0 = try wb2.sheet(0);
+    // Inline cell: t="inlineStr", raw_value carries the text directly.
+    const c_inline = try s0.cellByRef("Z997");
+    try std.testing.expect(c_inline != null);
+    try std.testing.expect(c_inline.?.cell_type == .inline_string);
+    try std.testing.expectEqualStrings(inline_text, c_inline.?.raw_value.?);
+
+    // Shared-string cell: t="s", raw_value is the SST index.
+    const c_shared = try s0.cellByRef("Z998");
+    try std.testing.expect(c_shared != null);
+    try std.testing.expect(c_shared.?.cell_type == .shared_string);
+    var ibuf: [16]u8 = undefined;
+    const expected_idx = try std.fmt.bufPrint(&ibuf, "{d}", .{pre_count});
+    try std.testing.expectEqualStrings(expected_idx, c_shared.?.raw_value.?);
+    // And the SST entry at that index resolves to our text.
+    const tail = try wb2.sstText(pre_count);
+    try std.testing.expectEqualStrings(shared_text, tail.?);
 }
