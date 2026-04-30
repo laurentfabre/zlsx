@@ -1,0 +1,18 @@
+version: 2
+updates:
+  # Track GitHub Actions version drift. Workflows pin via @v4 / @v5
+  # major-version refs; dependabot opens a weekly PR when an action
+  # has a newer major or notable patch.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "Europe/Paris"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
