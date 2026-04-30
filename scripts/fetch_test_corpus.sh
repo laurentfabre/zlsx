@@ -117,6 +117,12 @@ src="$dir/worldbank_catalog.xlsx"
 if [[ -f "$src" ]] && command -v python3 >/dev/null 2>&1; then
   python3 - "$src" "$dir" <<'PY'
 import os, struct, sys
+# Windows default cp1252 stdout can't encode the `✎` glyph used below;
+# force UTF-8 so the script runs identically across platforms.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, OSError):
+    pass
 src_path, out_dir = sys.argv[1], sys.argv[2]
 src = open(src_path, "rb").read()
 
