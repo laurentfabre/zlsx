@@ -30,6 +30,7 @@ const assert = std.debug.assert;
 
 const store_mod = @import("store.zig");
 const typed_parts = @import("typed_parts/root.zig");
+const zlsx = @import("zlsx");
 
 const PartStore = store_mod.PartStore;
 
@@ -58,6 +59,12 @@ pub const Error = error{
     InvalidCellRef,
     NoSheetData,
     UnsupportedCellValue,
+    /// `Workbook.fromBook(book, path)` opened `path` but the resulting
+    /// sheet count disagreed with `book.sheets.len`. Typically a path-
+    /// drift bug in the caller (wrong path passed, file renamed,
+    /// etc.). v1 of `fromBook` is a re-open + sanity-check shim;
+    /// future iters may share bytes via PartStore-from-bytes.
+    SheetCountMismatch,
     WriteFailed,
 } || workbook_xml_mod.Error || sheet_xml_mod.ParseError || sst_xml_mod.Error || styles_xml_mod.Error || store_mod.Error ||
     std.fs.File.WriteError || std.fs.File.OpenError || std.fs.Dir.RenameError || std.fs.Dir.StatFileError;
@@ -233,6 +240,31 @@ pub const Workbook = struct {
             .workbook = workbook_view,
             .worksheets = slots,
         };
+    }
+
+    /// Promote an already-opened `zlsx.Book` to a `Workbook`. Caller
+    /// passes the path that was originally used to open `book`.
+    ///
+    /// **v1 contract — re-reads the file.** Today this is a thin
+    /// wrapper around `Workbook.open(alloc, path)` plus a sanity check
+    /// that the resulting sheet count matches `book.sheets.len`. The
+    /// "without re-reading the file" promise from the workbook-overlay
+    /// plan needs a `PartStore`-from-bytes constructor (or PartStore /
+    /// Book sharing the underlying mmap) — out of scope for this iter.
+    /// Use `book` for the migration-time consistency check; it is
+    /// borrowed and the caller retains ownership.
+    ///
+    /// Errors `SheetCountMismatch` if `book` and the freshly-opened
+    /// Workbook disagree on sheet count — typically a sign of a path
+    /// drift bug in the caller (passed the wrong path, file was
+    /// renamed, etc.).
+    pub fn fromBook(allocator: Allocator, book: *const zlsx.Book, path: []const u8) Error!Workbook {
+        assert(path.len > 0);
+        var wb = try Workbook.open(allocator, path);
+        errdefer wb.deinit();
+
+        if (wb.sheetCount() != book.sheets.len) return error.SheetCountMismatch;
+        return wb;
     }
 
     pub fn deinit(self: *Workbook) void {
@@ -2254,4 +2286,52 @@ test "Workbook.setCell: mixed inlineStr + shared_string in one save" {
     // And the SST entry at that index resolves to our text.
     const tail = try wb2.sstText(pre_count);
     try std.testing.expectEqualStrings(shared_text, tail.?);
+}
+
+test "Workbook.fromBook: round-trip parity with Book.open on same path" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+
+    var book = try zlsx.Book.open(std.testing.allocator, path);
+    defer book.deinit();
+
+    var wb = try Workbook.fromBook(std.testing.allocator, &book, path);
+    defer wb.deinit();
+
+    try std.testing.expectEqual(@as(usize, book.sheets.len), wb.sheetCount());
+    var i: u32 = 0;
+    while (i < wb.sheetCount()) : (i += 1) {
+        const ws = try wb.sheet(i);
+        try std.testing.expectEqualStrings(book.sheets[i].name, ws.name());
+    }
+}
+
+test "Workbook.fromBook: independent lifetime — wb deinits before book" {
+    const path = "tests/corpus/openpyxl_guess_types.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+
+    var book = try zlsx.Book.open(std.testing.allocator, path);
+    defer book.deinit();
+
+    var wb = try Workbook.fromBook(std.testing.allocator, &book, path);
+    // Tear down Workbook FIRST while book is still alive — must be
+    // independent. std.testing.allocator catches any leak from a
+    // mistaken shared-arena assumption.
+    wb.deinit();
+}
+
+test "Workbook.fromBook: mismatched path errors SheetCountMismatch or opens cleanly" {
+    const path_a = "tests/corpus/frictionless_2sheets.xlsx"; // 2 sheets
+    const path_b = "tests/corpus/openpyxl_guess_types.xlsx"; // 1 sheet
+    std.fs.cwd().access(path_a, .{}) catch return error.SkipZigTest;
+    std.fs.cwd().access(path_b, .{}) catch return error.SkipZigTest;
+
+    var book = try zlsx.Book.open(std.testing.allocator, path_a);
+    defer book.deinit();
+
+    // Pass `book` opened from path_a, but path_b — sheet counts differ
+    // (2 vs 1) so fromBook surfaces the drift cleanly rather than
+    // returning an inconsistent Workbook.
+    const result = Workbook.fromBook(std.testing.allocator, &book, path_b);
+    try std.testing.expectError(Error.SheetCountMismatch, result);
 }

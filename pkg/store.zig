@@ -224,8 +224,8 @@ pub const PartStore = struct {
             method = 0;
             try compressed.appendSlice(ar_alloc, bytes);
         } else {
-            const writer_mod = @import("writer");
-            try writer_mod.deflateCompress(ar_alloc, bytes, &compressed);
+            const zlsx = @import("zlsx");
+            try zlsx.deflateCompress(ar_alloc, bytes, &compressed);
             if (compressed.items.len >= bytes.len) {
                 method = 0;
                 compressed.clearRetainingCapacity();
@@ -352,8 +352,8 @@ pub const PartStore = struct {
             ct_method = 0;
             try ct_compressed.appendSlice(ar_alloc, new_xml);
         } else {
-            const writer_mod = @import("writer");
-            try writer_mod.deflateCompress(ar_alloc, new_xml, &ct_compressed);
+            const zlsx = @import("zlsx");
+            try zlsx.deflateCompress(ar_alloc, new_xml, &ct_compressed);
             if (ct_compressed.items.len >= new_xml.len) {
                 ct_method = 0;
                 ct_compressed.clearRetainingCapacity();
@@ -415,8 +415,8 @@ pub const PartStore = struct {
             method = 0;
             try compressed.appendSlice(ar_alloc, bytes);
         } else {
-            const writer_mod = @import("writer");
-            try writer_mod.deflateCompress(ar_alloc, bytes, &compressed);
+            const zlsx = @import("zlsx");
+            try zlsx.deflateCompress(ar_alloc, bytes, &compressed);
             if (compressed.items.len >= bytes.len) {
                 method = 0;
                 compressed.clearRetainingCapacity();
