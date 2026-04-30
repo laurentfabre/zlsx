@@ -142,9 +142,13 @@ pub fn imageAnchors(store: *PartStore, allocator: std.mem.Allocator) ![]ImageAnc
     var out: std.ArrayListUnmanaged(ImageAnchor) = .empty;
     errdefer out.deinit(allocator);
 
-    // Walk every sheet part.
-    for (store.parts) |sheet_part| {
-        if (!isSheetPart(sheet_part)) continue;
+    // Walk every sheet part. After the deferred-decompress refactor
+    // (PartStore lazy materialization), `store.parts[i].bytes` is
+    // empty until we go through `store.part(name)` — fetch by name
+    // here so the sheet XML is materialized before we scan it.
+    for (store.parts) |sheet_part_meta| {
+        if (!isSheetPart(sheet_part_meta)) continue;
+        const sheet_part = (try store.part(sheet_part_meta.name)) orelse continue;
         try collectFromSheet(store, allocator, sheet_part, &out);
     }
 
@@ -168,8 +172,9 @@ pub fn chartAnchors(store: *PartStore, allocator: std.mem.Allocator) ![]ChartAnc
         for (out.items) |c| allocator.free(c.series_refs);
         out.deinit(allocator);
     }
-    for (store.parts) |sheet_part| {
-        if (!isSheetPart(sheet_part)) continue;
+    for (store.parts) |sheet_part_meta| {
+        if (!isSheetPart(sheet_part_meta)) continue;
+        const sheet_part = (try store.part(sheet_part_meta.name)) orelse continue;
         try collectChartsFromSheet(store, allocator, sheet_part, &out);
     }
     return out.toOwnedSlice(allocator);
