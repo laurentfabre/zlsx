@@ -195,6 +195,18 @@ pub fn build(b: *std.Build) void {
     const package_drawings_tests = b.addTest(.{ .root_module = package_drawings_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_drawings_tests).step);
 
+    // pkg/typed_parts/* — typed-overlay parsers for known OOXML parts
+    // (B1 iter-wb-1). One test binary covers all five children via
+    // `pkg/typed_parts/root.zig` re-exports. Stdlib-only, no writer
+    // import (typed-overlay parsers don't need it).
+    const package_typed_parts_tests_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/typed_parts/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const package_typed_parts_tests = b.addTest(.{ .root_module = package_typed_parts_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(package_typed_parts_tests).step);
+
     // Package-layer fuzz module: pkg/store.zig hosts fuzz targets
     // for decodeXmlEntities + looksExternal. Same fuzz=true flag
     // as src/xlsx.zig's unit_fuzz_mod, separate binary because
@@ -223,6 +235,19 @@ pub fn build(b: *std.Build) void {
     const package_corpus_tests = b.addTest(.{ .root_module = package_corpus_mod });
     corpus_step.dependOn(&b.addRunArtifact(package_corpus_tests).step);
     test_step.dependOn(&b.addRunArtifact(package_corpus_tests).step);
+
+    // tests/typed_parts_corpus.zig — corpus parity sweep for B1
+    // iter-wb-1: every fixture's workbook.xml / sst / styles / theme
+    // / first sheet runs through the matching pkg.typed_parts parser.
+    const typed_parts_corpus_mod = b.createModule(.{
+        .root_source_file = b.path("tests/typed_parts_corpus.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    typed_parts_corpus_mod.addImport("zlsx_pkg", package_mod);
+    const typed_parts_corpus_tests = b.addTest(.{ .root_module = typed_parts_corpus_mod });
+    corpus_step.dependOn(&b.addRunArtifact(typed_parts_corpus_tests).step);
+    test_step.dependOn(&b.addRunArtifact(typed_parts_corpus_tests).step);
 
     // C ABI — both a shared library (for Python / cffi bindings) and a
     // static library (for language toolchains that prefer linking in).
