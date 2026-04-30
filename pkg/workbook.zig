@@ -54,16 +54,23 @@ pub const Error = error{
     std.fs.File.WriteError || std.fs.File.OpenError || std.fs.Dir.RenameError || std.fs.Dir.StatFileError;
 
 /// Mutation primitive (B1 iter-wb-4). Strings emit as `inlineStr`
-/// — cell-local text, no SST extension required. Formulas land in m3.
+/// — cell-local text, no SST extension required. Formulas emit as
+/// `<f>…</f>` with no cached `<v>`, so Excel recalculates on open.
 ///
-/// `string` slices borrow for `setCell`'s call only. The delta map
-/// duplicates bytes into the Workbook allocator before returning, so
-/// the caller can free / reuse the buffer as soon as `setCell` returns.
+/// `string` and `formula` slices borrow for `setCell`'s call only.
+/// The delta map duplicates bytes into the Workbook allocator before
+/// returning, so the caller can free / reuse the buffer as soon as
+/// `setCell` returns.
 pub const CellValue = union(enum) {
     blank: void,
     number: f64,
     boolean: bool,
     string: []const u8,
+    /// Formula text (e.g. "SUM(A1:A10)" — no leading `=`). Emitted
+    /// as `<f>…</f>` without a cached value; Excel recalculates the
+    /// result on open. Caching computed results is a future iter
+    /// (depends on D1 evaluator).
+    formula: []const u8,
 };
 
 /// 1-based (row, col) — matches OOXML A1 conventions.
@@ -550,6 +557,14 @@ fn emitCell(allocator: Allocator, out: *std.ArrayList(u8), mc: MergedCell) Error
                 try appendXmlEscapedText(allocator, out, s);
                 try out.appendSlice(allocator, "</t></is></c>");
             },
+            .formula => |f| {
+                // No cached value — Excel recalcs on open. Future iter
+                // can stash a computed result inside `<v>` once a
+                // formula evaluator (Tier D1) lands.
+                try out.appendSlice(allocator, "><f>");
+                try appendXmlEscapedText(allocator, out, f);
+                try out.appendSlice(allocator, "</f></c>");
+            },
         },
     }
 }
@@ -695,23 +710,23 @@ pub const Worksheet = struct {
     /// Stage a mutation for cell at A1 ref `ref`. Persisted by
     /// `Workbook.save`. The last `setCell` call for a given ref wins.
     /// Numeric / boolean / blank values pass through by-value. String
-    /// values are duped into the Workbook allocator (caller can free
-    /// the input slice as soon as `setCell` returns). Formulas land
-    /// in m3.
+    /// and formula values are duped into the Workbook allocator
+    /// (caller can free the input slice as soon as `setCell` returns).
     ///
-    /// String inputs are validated against XML 1.0 — control bytes
-    /// other than \t, \n, \r are rejected with `error.MalformedXml`
-    /// to prevent emitting unparseable XML downstream.
+    /// String + formula inputs are validated against XML 1.0 —
+    /// control bytes other than \t, \n, \r are rejected with
+    /// `error.MalformedXml` to prevent emitting unparseable XML.
     pub fn setCell(self: *Worksheet, ref: []const u8, value: CellValue) Error!void {
         assert(ref.len > 0);
         const cr = try parseA1Ref(ref);
         const a = self.workbook.allocator;
 
-        // Free any previous string allocation for this ref so a
-        // string→string overwrite doesn't leak.
+        // Free any previous heap allocation for this ref so a
+        // string/formula overwrite doesn't leak.
         if (self.deltas.get(cr)) |prev| {
             switch (prev) {
                 .string => |s| a.free(s),
+                .formula => |f| a.free(f),
                 else => {},
             }
         }
@@ -721,9 +736,17 @@ pub const Worksheet = struct {
                 if (!isXmlSafeText(s)) return error.MalformedXml;
                 break :blk .{ .string = try a.dupe(u8, s) };
             },
+            .formula => |f| blk: {
+                if (!isXmlSafeText(f)) return error.MalformedXml;
+                break :blk .{ .formula = try a.dupe(u8, f) };
+            },
             else => value,
         };
-        errdefer if (stored == .string) a.free(stored.string);
+        errdefer switch (stored) {
+            .string => |s| a.free(s),
+            .formula => |f| a.free(f),
+            else => {},
+        };
 
         try self.deltas.put(a, cr, stored);
     }
@@ -740,13 +763,15 @@ fn isXmlSafeText(s: []const u8) bool {
     return true;
 }
 
-/// Free any string allocations stashed in `deltas`. Called both before
-/// `clearAndFree` (post-save) and `deinit` (Worksheet teardown).
+/// Free any string / formula allocations stashed in `deltas`. Called
+/// both before `clearAndFree` (post-save) and `deinit` (Worksheet
+/// teardown).
 fn freeDeltaStrings(allocator: Allocator, deltas: *std.AutoHashMapUnmanaged(CellRef, CellValue)) void {
     var it = deltas.valueIterator();
     while (it.next()) |v| {
         switch (v.*) {
             .string => |s| allocator.free(s),
+            .formula => |f| allocator.free(f),
             else => {},
         }
     }
@@ -1133,4 +1158,61 @@ test "Workbook.setCell: string overwrite frees prior allocation" {
     try s0.setCell("A1", .{ .string = "first" });
     try s0.setCell("A1", .{ .string = "second" });
     try s0.setCell("A1", .{ .string = "third" });
+}
+
+test "Workbook.setCell: formula round-trips with no cached value" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-formula-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        const s0 = try wb.sheet(0);
+        try s0.setCell("A1", .{ .formula = "SUM(B1:B10)" });
+        // Formula with XML-special chars (e.g. comparison operators)
+        try s0.setCell("A2", .{ .formula = "IF(B1<C1, \"low\", \"high\")" });
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb2.deinit();
+    const s0 = try wb2.sheet(0);
+
+    const a1 = try s0.cellByRef("A1");
+    try std.testing.expect(a1 != null);
+    try std.testing.expect(a1.?.formula != null);
+    try std.testing.expectEqualStrings("SUM(B1:B10)", a1.?.formula.?);
+    // No cached value — Excel recalcs on open.
+    try std.testing.expect(a1.?.raw_value == null);
+
+    const a2 = try s0.cellByRef("A2");
+    try std.testing.expect(a2 != null);
+    try std.testing.expect(a2.?.formula != null);
+    // The `<` was XML-escaped on emit; raw form is what we read back.
+    try std.testing.expectEqualStrings("IF(B1&lt;C1, \"low\", \"high\")", a2.?.formula.?);
+}
+
+test "Workbook.setCell: formula control bytes rejected; overwrite leak-free" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+    const s0 = try wb.sheet(0);
+
+    try std.testing.expectError(error.MalformedXml, s0.setCell("A1", .{ .formula = "BAD\x00FN()" }));
+
+    // Formula → formula → string → number overwrites: the heap-owned
+    // variants must release on transition. std.testing.allocator
+    // catches any leak at wb.deinit.
+    try s0.setCell("B1", .{ .formula = "1+1" });
+    try s0.setCell("B1", .{ .formula = "2+2" });
+    try s0.setCell("B1", .{ .string = "now a string" });
+    try s0.setCell("B1", .{ .number = 42 });
+    try s0.setCell("B1", .{ .formula = "back to formula" });
 }
