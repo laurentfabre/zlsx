@@ -187,6 +187,27 @@ pub fn formatA1Ref(buf: []u8, ref: CellRef) []u8 {
     return buf[0 .. n + row_str.len];
 }
 
+/// Composite read-only view of a cell's resolved style. Each field
+/// borrows from the workbook's `StylesXml` arena and is valid for as
+/// long as the parent `Workbook` lives.
+///
+/// v1 simplification: when an `apply_*` flag on the underlying CellXf
+/// is false, the corresponding field surfaces as `null`. OOXML's full
+/// semantics inherit from `cellStyleXfs[xf.xfId]` in that case; we
+/// defer that walk until callers explicitly request it.
+///
+/// `number_format_code` is `null` when `num_fmt_id` falls in the
+/// built-in range (0..163, ECMA-376 §18.8.30) — those codes are
+/// implicit and not stored in `<numFmts>`. Callers that need a
+/// rendered string for a built-in id must map it themselves.
+pub const ResolvedStyle = struct {
+    font: ?styles_xml_mod.Font,
+    fill: ?styles_xml_mod.Fill,
+    border: ?styles_xml_mod.Border,
+    alignment: ?styles_xml_mod.Alignment,
+    number_format_code: ?[]const u8,
+};
+
 pub const Workbook = struct {
     allocator: Allocator,
     store: PartStore,
@@ -1834,6 +1855,81 @@ pub const Worksheet = struct {
         return null;
     }
 
+    /// Resolve the cell at `ref` to a composite `ResolvedStyle` view
+    /// by walking `SheetXml.Cell.style_idx` → `StylesXml.cell_xfs[idx]`
+    /// → the per-attribute fonts/fills/borders/numFmts tables.
+    ///
+    /// Returns `null` when:
+    ///   - the cell does not exist on this sheet,
+    ///   - the cell carries no `s="…"` attribute (`style_idx == null`),
+    ///   - the workbook has no `xl/styles.xml`, or
+    ///   - `style_idx` is out of range for the workbook's `cell_xfs`.
+    ///
+    /// Per-field semantics: each `apply_*` flag on the matched CellXf
+    /// gates whether the corresponding sub-style is surfaced. When the
+    /// flag is false, the field is `null` — see `ResolvedStyle` doc-
+    /// comment for the v1 cellStyleXfs-inheritance simplification.
+    /// Out-of-range sub-ids (font_id ≥ fonts.len, etc.) likewise
+    /// surface as `null` rather than erroring; that lets the typed
+    /// overlay tolerate workbooks where producers under-count their
+    /// `<fonts count="…">` headers.
+    ///
+    /// `number_format_code` is `null` for built-in numFmt ids (0..163,
+    /// ECMA-376 §18.8.30) — those codes are implicit and absent from
+    /// `<numFmts>`. Custom ids (≥ 164) resolve via linear scan.
+    pub fn cellStyle(self: *Worksheet, ref: []const u8) Error!?ResolvedStyle {
+        assert(ref.len > 0);
+
+        const cell = (try self.cellByRef(ref)) orelse return null;
+        const sidx = cell.style_idx orelse return null;
+        const styles = (try self.workbook.styles()) orelse return null;
+        if (sidx >= styles.cell_xfs.len) return null;
+        const xf = styles.cell_xfs[sidx];
+
+        const font: ?styles_xml_mod.Font = blk: {
+            if (!xf.apply_font) break :blk null;
+            const fid = xf.font_id orelse break :blk null;
+            if (fid >= styles.fonts.len) break :blk null;
+            break :blk styles.fonts[fid];
+        };
+
+        const fill: ?styles_xml_mod.Fill = blk: {
+            if (!xf.apply_fill) break :blk null;
+            const fid = xf.fill_id orelse break :blk null;
+            if (fid >= styles.fills.len) break :blk null;
+            break :blk styles.fills[fid];
+        };
+
+        const border: ?styles_xml_mod.Border = blk: {
+            if (!xf.apply_border) break :blk null;
+            const bid = xf.border_id orelse break :blk null;
+            if (bid >= styles.borders.len) break :blk null;
+            break :blk styles.borders[bid];
+        };
+
+        const alignment: ?styles_xml_mod.Alignment =
+            if (xf.apply_alignment) xf.alignment else null;
+
+        const number_format_code: ?[]const u8 = blk: {
+            if (!xf.apply_number_format) break :blk null;
+            const nfid = xf.num_fmt_id orelse break :blk null;
+            // Built-in codes (0..163) are implicit; not stored in numFmts.
+            if (nfid <= 163) break :blk null;
+            for (styles.number_formats) |nf| {
+                if (nf.fmt_id == nfid) break :blk nf.code;
+            }
+            break :blk null;
+        };
+
+        return ResolvedStyle{
+            .font = font,
+            .fill = fill,
+            .border = border,
+            .alignment = alignment,
+            .number_format_code = number_format_code,
+        };
+    }
+
     /// Stage a mutation for cell at A1 ref `ref`. Persisted by
     /// `Workbook.save`. The last `setCell` call for a given ref wins.
     /// Numeric / boolean / blank values pass through by-value. String
@@ -2907,4 +3003,70 @@ test "Workbook.renameSheet: no-op when new_name equals current name" {
     defer std.testing.allocator.free(before);
     try wb.renameSheet(0, before);
     try std.testing.expectEqualStrings(before, (try wb.sheet(0)).name());
+}
+
+test "Worksheet.cellStyle: cell with no style attribute returns null" {
+    // phpoi_test1 cell A1 has no `s="…"` — `style_idx` is null, so
+    // cellStyle short-circuits before consulting StylesXml.
+    const path = "tests/corpus/phpoi_test1.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+
+    const s0 = try wb.sheet(0);
+    const resolved = try s0.cellStyle("A1");
+    try std.testing.expectEqual(@as(?ResolvedStyle, null), resolved);
+
+    // Out-of-range ref (no matching cell) also returns null.
+    const missing = try s0.cellStyle("ZZ9999");
+    try std.testing.expectEqual(@as(?ResolvedStyle, null), missing);
+}
+
+test "Worksheet.cellStyle: applyFont surfaces the bold font on phpoi B2" {
+    // phpoi_test1: cellXfs[1] = { fontId=1, applyFont=1 } → fonts[1]
+    // is the bold Calibri 11. Other apply_* flags are off, so fill /
+    // border / alignment / number_format_code stay null.
+    const path = "tests/corpus/phpoi_test1.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+
+    const s0 = try wb.sheet(0);
+    const resolved = (try s0.cellStyle("B2")) orelse return error.TestUnexpectedNull;
+
+    try std.testing.expect(resolved.font != null);
+    try std.testing.expect(resolved.font.?.bold);
+    try std.testing.expectEqualStrings("Calibri", resolved.font.?.name.?);
+    try std.testing.expectEqual(@as(?styles_xml_mod.Fill, null), resolved.fill);
+    try std.testing.expectEqual(@as(?styles_xml_mod.Border, null), resolved.border);
+    try std.testing.expectEqual(@as(?styles_xml_mod.Alignment, null), resolved.alignment);
+    try std.testing.expectEqual(@as(?[]const u8, null), resolved.number_format_code);
+}
+
+test "Worksheet.cellStyle: applyAlignment surfaces wrap_text; built-in numFmt id has null code" {
+    // phpoi_test1: C3 has style_idx=2 → applyAlignment=1, alignment
+    // body has wrapText=1. D4 has style_idx=3 → applyNumberFormat=1,
+    // numFmtId=2 which is built-in (≤163), so number_format_code is
+    // null (the code is implicit, not stored in <numFmts>).
+    const path = "tests/corpus/phpoi_test1.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+
+    const s0 = try wb.sheet(0);
+
+    const c3 = (try s0.cellStyle("C3")) orelse return error.TestUnexpectedNull;
+    try std.testing.expect(c3.alignment != null);
+    try std.testing.expect(c3.alignment.?.wrap_text);
+    try std.testing.expectEqual(@as(?styles_xml_mod.Font, null), c3.font);
+
+    const d4 = (try s0.cellStyle("D4")) orelse return error.TestUnexpectedNull;
+    // Built-in numFmtId=2 (`0.00`) — overlay does not synthesize codes
+    // for built-ins; field stays null.
+    try std.testing.expectEqual(@as(?[]const u8, null), d4.number_format_code);
+    try std.testing.expectEqual(@as(?styles_xml_mod.Font, null), d4.font);
+    try std.testing.expectEqual(@as(?styles_xml_mod.Alignment, null), d4.alignment);
 }
