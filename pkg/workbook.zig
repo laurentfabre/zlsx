@@ -59,6 +59,23 @@ pub const Error = error{
     InvalidCellRef,
     NoSheetData,
     UnsupportedCellValue,
+    /// `Workbook.renameSheet` rejected `new_name`: empty, exceeds the
+    /// length cap, or contains a forbidden character (`: \ / ? * [ ]`),
+    /// or is the case-insensitive reserved name "history".
+    InvalidSheetName,
+    /// `Workbook.renameSheet` rejected `new_name`: an existing sheet
+    /// (other than `sheet_idx` itself) already uses that name (case-
+    /// insensitive ASCII compare; see method docstring for the
+    /// Unicode-fold caveat).
+    SheetNameInUse,
+    /// Internal invariant: the existing sheet name in `WorkbookXml`
+    /// exceeds 128 bytes. OOXML-conformant inputs cannot trip this —
+    /// surfaces only on hand-crafted / corrupted workbook.xml.
+    InternalSheetNameTooLong,
+    /// `Workbook.renameSheet` could not locate the target `<sheet>`
+    /// element in the source `xl/workbook.xml` bytes. Surfaces only
+    /// if the file mutated under us between parse and patch.
+    SheetElementNotFound,
     /// `Workbook.fromBook(book, path)` opened `path` but the resulting
     /// sheet count disagreed with `book.sheets.len`. Typically a path-
     /// drift bug in the caller (wrong path passed, file renamed,
@@ -511,7 +528,291 @@ pub const Workbook = struct {
         }
         return count;
     }
+
+    /// Rename sheet at `sheet_idx` to `new_name`. Composes three steps
+    /// atomically (in error semantics — partial work is left only on
+    /// post-rewrite failures, see below):
+    ///
+    /// 1. Validate `new_name` per Excel rules (length, forbidden chars,
+    ///    "history" reserved, no duplicate of any other sheet name).
+    /// 2. Rewrite every formula in every sheet via
+    ///    `rewriteAllFormulas(.{ .rename_sheet = ... })`. Cross-sheet
+    ///    references targeting `old_name` get retargeted to `new_name`.
+    /// 3. Patch `xl/workbook.xml` so the `<sheet name="OLD" .../>`
+    ///    element for `sheet_idx` carries the new (XML-escaped) name.
+    /// 4. Re-parse the in-memory `WorkbookXml` view from the freshly-
+    ///    patched bytes so subsequent `wb.sheet(i).name()` returns the
+    ///    new value without a `deinit + open` round-trip.
+    ///
+    /// **Lifecycle.** Step 2 stages formula deltas; they're persisted
+    /// only by `Workbook.save`. The rewritten formulas live in each
+    /// Worksheet's `deltas` map, NOT in its cached `parsed` view, so
+    /// no `parsed = null` invalidation is required here. Caller still
+    /// must call `save` to commit to disk.
+    ///
+    /// **Length cap.** v1 enforces a UTF-8 byte length of 1..127. Excel
+    /// proper limits sheet names to 31 *characters* (Unicode codepoints,
+    /// not bytes). For ASCII inputs the two coincide; for Unicode the
+    /// byte cap is conservative — a follow-up iter can wire in
+    /// `src/unicode/casefold.zig` for full character-count semantics.
+    ///
+    /// **Case folding.** Duplicate-name detection uses ASCII case-fold
+    /// (a..z ↔ A..Z) only; "Sheet1" and "ŠHEET1" with non-ASCII letters
+    /// fold differently than Excel does. Same follow-up iter applies.
+    ///
+    /// **Defined names.** Sheet-qualified `<definedName>` formulas
+    /// (`Sheet2!$A$1` etc.) are NOT rewritten by this iter — only
+    /// per-cell formulas via `rewriteAllFormulas`. Hyperlink targets
+    /// pointing at the renamed sheet are likewise unaltered. A future
+    /// iter (`m3-defnames-hyperlinks`) covers both.
+    pub fn renameSheet(self: *Workbook, sheet_idx: u32, new_name: []const u8) Error!void {
+        if (sheet_idx >= self.sheetCount()) return error.SheetIndexOutOfRange;
+        try validateSheetName(new_name);
+        try self.assertSheetNameAvailable(sheet_idx, new_name);
+
+        // Capture old name into a stack copy: step 4 re-parses the
+        // workbook view, freeing the arena that backs `sheets[i].name`.
+        // We need the old bytes alive across step 2 (rewriter) and step
+        // 3 (XML patch — the patch reads from the source bytes still
+        // holding the old name).
+        const old_name = self.workbook.sheets[sheet_idx].name;
+        if (old_name.len == 0) return error.InternalSheetNameTooLong; // OOXML invariant
+        if (old_name.len > 128) return error.InternalSheetNameTooLong;
+        var old_buf: [128]u8 = undefined;
+        @memcpy(old_buf[0..old_name.len], old_name);
+        const old_name_owned = old_buf[0..old_name.len];
+
+        // No-op rename: identical bytes. Skip rewriter (would error
+        // .InvalidEdit on `old == new` is fine, but the cleaner contract
+        // is "asking to rename to the current name is a successful
+        // no-op").
+        if (std.mem.eql(u8, old_name_owned, new_name)) return;
+
+        _ = try self.rewriteAllFormulas(.{
+            .rename_sheet = .{ .old = old_name_owned, .new = new_name },
+        });
+
+        try patchWorkbookXmlSheetName(self, sheet_idx, old_name_owned, new_name);
+        try refreshWorkbookXmlView(self);
+
+        // Postcondition: the in-memory view now reports the new name.
+        assert(sheet_idx < self.workbook.sheets.len);
+        assert(std.mem.eql(u8, self.workbook.sheets[sheet_idx].name, new_name));
+    }
+
+    /// Case-insensitive ASCII duplicate check. Skips the slot at
+    /// `sheet_idx` itself so renaming a sheet to its own current name
+    /// (modulo case) is permitted at this layer; a true no-op (exact
+    /// byte match) short-circuits earlier in `renameSheet`.
+    fn assertSheetNameAvailable(self: *const Workbook, sheet_idx: u32, new_name: []const u8) Error!void {
+        assert(sheet_idx < self.workbook.sheets.len);
+        assert(new_name.len > 0);
+        for (self.workbook.sheets, 0..) |s, i| {
+            if (i == sheet_idx) continue;
+            if (asciiCaseInsensitiveEql(s.name, new_name)) return error.SheetNameInUse;
+        }
+    }
 };
+
+/// Validate a candidate sheet name per Excel's rules. v1 contract
+/// (see `Workbook.renameSheet` docstring for the rationale):
+///   - 1..127 bytes (UTF-8 byte length, NOT Unicode codepoints)
+///   - none of `: \ / ? * [ ]`
+///   - case-insensitive ASCII compare not equal to "history"
+fn validateSheetName(name: []const u8) Error!void {
+    if (name.len == 0) return error.InvalidSheetName;
+    if (name.len > 127) return error.InvalidSheetName;
+    for (name) |c| switch (c) {
+        ':', '\\', '/', '?', '*', '[', ']' => return error.InvalidSheetName,
+        else => {},
+    };
+    // Sheet-name reserved word. Excel rejects this case-insensitively.
+    if (asciiCaseInsensitiveEql(name, "history")) return error.InvalidSheetName;
+}
+
+/// Lowercase-ASCII byte-equality. Non-ASCII bytes compare verbatim.
+/// Documented limitation in `Workbook.renameSheet`.
+fn asciiCaseInsensitiveEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        const xl: u8 = if (x >= 'A' and x <= 'Z') x + 32 else x;
+        const yl: u8 = if (y >= 'A' and y <= 'Z') y + 32 else y;
+        if (xl != yl) return false;
+    }
+    return true;
+}
+
+/// Walk the source `xl/workbook.xml` bytes, find the Nth `<sheet>`
+/// element (1-based N == `sheet_idx + 1` since OOXML emits sheets in
+/// document order), and rewrite its `name="..."` attribute to the
+/// XML-escaped `new_name`. Re-emits the part via `store.replacePart`.
+///
+/// We match the specific element by index AND verify that its current
+/// `name=` attribute equals `expected_old` — this is the pair
+/// assertion: independent of whether `xl/workbook.xml` was emitted by
+/// an external tool with surprising attribute ordering, we refuse to
+/// rewrite an element whose old name doesn't match what we believe it
+/// should be (`SheetElementNotFound`).
+fn patchWorkbookXmlSheetName(
+    self: *Workbook,
+    sheet_idx: u32,
+    expected_old: []const u8,
+    new_name: []const u8,
+) Error!void {
+    assert(expected_old.len > 0);
+    assert(new_name.len > 0);
+    assert(sheet_idx < self.workbook.sheets.len);
+
+    const part = try self.store.part("xl/workbook.xml") orelse return error.MissingWorkbookPart;
+    const src = part.bytes;
+    assert(src.len > 0);
+
+    // Find the Nth `<sheet ` (note the trailing space — distinguishes
+    // from `<sheets>`, `<sheetData>`, etc.) Also accept `<sheet/>`-
+    // style self-close as a defensive fallback. We require an
+    // attribute-bearing form for a name to be present, so primarily
+    // match `<sheet ` and `<sheet\t` / `<sheet\n`.
+    var search_from: usize = 0;
+    var seen: u32 = 0;
+    var elem_attrs_start: usize = 0;
+    var elem_attrs_end: usize = 0;
+    while (true) {
+        const open = std.mem.indexOfPos(u8, src, search_from, "<sheet") orelse
+            return error.SheetElementNotFound;
+        const after = open + "<sheet".len;
+        if (after >= src.len) return error.SheetElementNotFound;
+        const boundary = src[after];
+        // Distinguish `<sheet[ /\t\r\n]` from `<sheets`, `<sheetData`,
+        // `<sheetView`, `<sheetFormatPr`, `<sheetPr`, `<sheetCalcPr`,
+        // `<sheetProtection` and friends.
+        const is_sheet_elem = switch (boundary) {
+            ' ', '\t', '\r', '\n', '/' => true,
+            else => false,
+        };
+        if (!is_sheet_elem) {
+            search_from = after;
+            continue;
+        }
+        // Find the closing `>` that terminates this open tag. Sheet
+        // elements are leaves (`<sheet ... />` or `<sheet ...></sheet>`
+        // with empty body); we just need the first `>` past `after`.
+        const gt = std.mem.indexOfScalarPos(u8, src, after, '>') orelse
+            return error.SheetElementNotFound;
+        if (seen == sheet_idx) {
+            elem_attrs_start = after;
+            elem_attrs_end = if (gt > 0 and src[gt - 1] == '/') gt - 1 else gt;
+            break;
+        }
+        seen += 1;
+        search_from = gt + 1;
+    }
+    assert(elem_attrs_end >= elem_attrs_start);
+
+    // Find `name="..."` (or `name='...'`) inside this element's
+    // attribute span. Must be a real attribute, not a substring of
+    // another attribute's value: we anchor on a preceding whitespace
+    // OR the start of the attribute span.
+    const attrs = src[elem_attrs_start..elem_attrs_end];
+    const NameAttr = struct { value_start: usize, value_end: usize };
+    const found: NameAttr = blk: {
+        var i: usize = 0;
+        while (i < attrs.len) {
+            // Skip leading whitespace.
+            while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
+                attrs[i] == '\r' or attrs[i] == '\n')) : (i += 1)
+            {}
+            if (i >= attrs.len) break;
+            const key_start = i;
+            while (i < attrs.len and attrs[i] != '=' and attrs[i] != ' ' and
+                attrs[i] != '\t' and attrs[i] != '\r' and attrs[i] != '\n') : (i += 1)
+            {}
+            const key_end = i;
+            // Skip = and any padding.
+            while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
+                attrs[i] == '\r' or attrs[i] == '\n')) : (i += 1)
+            {}
+            if (i >= attrs.len or attrs[i] != '=') return error.SheetElementNotFound;
+            i += 1;
+            while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
+                attrs[i] == '\r' or attrs[i] == '\n')) : (i += 1)
+            {}
+            if (i >= attrs.len) return error.SheetElementNotFound;
+            const quote = attrs[i];
+            if (quote != '"' and quote != '\'') return error.SheetElementNotFound;
+            i += 1;
+            const val_start = i;
+            while (i < attrs.len and attrs[i] != quote) : (i += 1) {}
+            if (i >= attrs.len) return error.SheetElementNotFound;
+            const val_end = i;
+            i += 1; // past closing quote
+
+            const key = attrs[key_start..key_end];
+            if (std.mem.eql(u8, key, "name")) {
+                break :blk .{
+                    .value_start = elem_attrs_start + val_start,
+                    .value_end = elem_attrs_start + val_end,
+                };
+            }
+        }
+        return error.SheetElementNotFound;
+    };
+
+    // Pair assertion: the element we found really IS the one we
+    // intend to rewrite. The current name (still XML-escaped on the
+    // wire — but for unescaped ASCII names like "Sheet1" the byte
+    // comparison is correct) must match `expected_old`.
+    if (!std.mem.eql(u8, src[found.value_start..found.value_end], expected_old)) {
+        // Tolerate XML-escaped equivalents: if a name contains `&` or
+        // `<` we'd see entities here; for ASCII-clean names this is
+        // straight equality. If the wire form differs, it's not the
+        // element we expected to rewrite.
+        return error.SheetElementNotFound;
+    }
+
+    // Build the patched part: prefix + escaped new name + suffix.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(self.allocator);
+    try out.ensureTotalCapacity(self.allocator, src.len + new_name.len + 16);
+    try out.appendSlice(self.allocator, src[0..found.value_start]);
+    try appendXmlEscaped(self.allocator, &out, new_name);
+    try out.appendSlice(self.allocator, src[found.value_end..]);
+
+    try self.store.replacePart("xl/workbook.xml", out.items);
+}
+
+/// Append `s` to `out`, XML-escaping the five canonical entities
+/// (`<`, `>`, `&`, `"`, `'`). Other bytes (including UTF-8
+/// continuation bytes for non-ASCII characters) pass through verbatim.
+fn appendXmlEscaped(allocator: Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    for (s) |c| switch (c) {
+        '<' => try out.appendSlice(allocator, "&lt;"),
+        '>' => try out.appendSlice(allocator, "&gt;"),
+        '&' => try out.appendSlice(allocator, "&amp;"),
+        '"' => try out.appendSlice(allocator, "&quot;"),
+        '\'' => try out.appendSlice(allocator, "&apos;"),
+        else => try out.append(allocator, c),
+    };
+}
+
+/// Re-parse `xl/workbook.xml` from the (now-patched) PartStore bytes
+/// and swap the typed view in place. The old view's arena is freed —
+/// any external borrows of `wb.workbook.sheets[i].name` from before
+/// `renameSheet` are invalidated. The contract says callers don't
+/// hold those slices across mutation; this is the enforcement point.
+fn refreshWorkbookXmlView(self: *Workbook) Error!void {
+    const part = try self.store.part("xl/workbook.xml") orelse return error.MissingWorkbookPart;
+    var fresh = try workbook_xml_mod.parse(self.allocator, part.bytes);
+    errdefer fresh.deinit(self.allocator);
+
+    // Length invariant: re-parse must agree on sheet count, otherwise
+    // the slot table (worksheets[]) and the workbook view would drift.
+    if (fresh.sheets.len != self.workbook.sheets.len) {
+        return error.SheetCountMismatch;
+    }
+
+    self.workbook.deinit(self.allocator);
+    self.workbook = fresh;
+}
 
 // ─── Emit helpers (iter-wb-4 m1) ─────────────────────────────────────
 
@@ -2501,4 +2802,103 @@ test "Workbook.rewriteAllFormulas: rename_sheet rewrites quoted sheet qualifiers
     const a1 = (try (try wb2.sheet(0)).cellByRef("A1")).?;
     // Bare cross-sheet name re-emits as bare.
     try std.testing.expectEqualStrings("Renamed!A1+1", a1.formula.?);
+}
+
+test "Workbook.renameSheet: happy path renames sheet and rewrites cross-sheet formula" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-rename-in-{d}.xlsx", .{prng.random().int(u32)});
+
+    // Stage a cross-sheet formula referencing "Sheet2", save fresh copy.
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        const s0 = try wb.sheet(0);
+        try s0.setCell("A1", .{ .formula = "Sheet2!A1+1" });
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    // Re-open, renameSheet(1, "Renamed"), save, re-open, verify.
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-wb-rename-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, tmp_path);
+        defer wb.deinit();
+        try wb.renameSheet(1, "Renamed");
+
+        // In-memory view must reflect the rename immediately.
+        try std.testing.expectEqualStrings("Renamed", (try wb.sheet(1)).name());
+
+        try wb.save(tmp2_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, tmp2_path);
+    defer wb2.deinit();
+    try std.testing.expectEqualStrings("Renamed", (try wb2.sheet(1)).name());
+    const a1 = (try (try wb2.sheet(0)).cellByRef("A1")).?;
+    try std.testing.expectEqualStrings("Renamed!A1+1", a1.formula.?);
+}
+
+test "Workbook.renameSheet: rejects forbidden character with InvalidSheetName" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+    try std.testing.expectError(error.InvalidSheetName, wb.renameSheet(0, "Has:Colon"));
+    // Other forbidden characters round out the negative space.
+    try std.testing.expectError(error.InvalidSheetName, wb.renameSheet(0, "back\\slash"));
+    try std.testing.expectError(error.InvalidSheetName, wb.renameSheet(0, "fwd/slash"));
+    try std.testing.expectError(error.InvalidSheetName, wb.renameSheet(0, "ques?tion"));
+    try std.testing.expectError(error.InvalidSheetName, wb.renameSheet(0, "as*terisk"));
+    try std.testing.expectError(error.InvalidSheetName, wb.renameSheet(0, "[bracket"));
+    try std.testing.expectError(error.InvalidSheetName, wb.renameSheet(0, "bracket]"));
+    try std.testing.expectError(error.InvalidSheetName, wb.renameSheet(0, ""));
+    try std.testing.expectError(error.InvalidSheetName, wb.renameSheet(0, "history"));
+    try std.testing.expectError(error.InvalidSheetName, wb.renameSheet(0, "HISTORY"));
+    try std.testing.expectError(error.InvalidSheetName, wb.renameSheet(0, "History"));
+}
+
+test "Workbook.renameSheet: duplicate name errors SheetNameInUse" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+    const s0_name_owned = try std.testing.allocator.dupe(u8, (try wb.sheet(0)).name());
+    defer std.testing.allocator.free(s0_name_owned);
+    // Renaming sheet 1 to sheet 0's exact name → conflict.
+    try std.testing.expectError(error.SheetNameInUse, wb.renameSheet(1, s0_name_owned));
+    // Case-insensitive: lowercase variant also conflicts.
+    var lower_buf: [128]u8 = undefined;
+    @memcpy(lower_buf[0..s0_name_owned.len], s0_name_owned);
+    for (lower_buf[0..s0_name_owned.len]) |*c| {
+        if (c.* >= 'A' and c.* <= 'Z') c.* += 32;
+    }
+    try std.testing.expectError(error.SheetNameInUse, wb.renameSheet(1, lower_buf[0..s0_name_owned.len]));
+}
+
+test "Workbook.renameSheet: out-of-range index errors SheetIndexOutOfRange" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+    try std.testing.expectError(error.SheetIndexOutOfRange, wb.renameSheet(99, "X"));
+    // Boundary: exact sheetCount() is also out-of-range (0-based index).
+    try std.testing.expectError(error.SheetIndexOutOfRange, wb.renameSheet(wb.sheetCount(), "X"));
+}
+
+test "Workbook.renameSheet: no-op when new_name equals current name" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+    const before = try std.testing.allocator.dupe(u8, (try wb.sheet(0)).name());
+    defer std.testing.allocator.free(before);
+    try wb.renameSheet(0, before);
+    try std.testing.expectEqualStrings(before, (try wb.sheet(0)).name());
 }
