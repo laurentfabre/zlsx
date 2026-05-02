@@ -692,7 +692,22 @@ pub const Workbook = struct {
             else => return err,
         };
 
-        try refreshWorkbookXmlView(self);
+        // Re-parse the workbook view in place. We can't use
+        // `refreshWorkbookXmlView` here because that helper asserts
+        // sheet-count invariance (correct for renameSheet, wrong
+        // for delete which expects count - 1).
+        {
+            const fresh_part = try self.store.part("xl/workbook.xml") orelse
+                return error.MissingWorkbookPart;
+            var fresh = try workbook_xml_mod.parse(self.allocator, fresh_part.bytes);
+            errdefer fresh.deinit(self.allocator);
+            // Sanity: the post-delete view must be exactly one shorter.
+            if (fresh.sheets.len + 1 != self.workbook.sheets.len) {
+                return error.SheetCountMismatch;
+            }
+            self.workbook.deinit(self.allocator);
+            self.workbook = fresh;
+        }
 
         // Shrink the slot table. Order matters:
         //   1. Take ownership of the doomed Worksheet's resources by
