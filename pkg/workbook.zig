@@ -511,7 +511,104 @@ pub const Workbook = struct {
         }
         return count;
     }
+
+    /// Apply a structural-edit rewrite to every formula body embedded
+    /// in DataValidation (`formula1`, `formula2`) and ConditionalFormat
+    /// (`formula`) records across every sheet. Returns the count of
+    /// formula bodies whose rewritten text differs from the source.
+    ///
+    /// **Scope: in-memory typed view only.** This iter mutates the
+    /// parsed `SheetXml` overlay (the `validations` / `conditional_formats`
+    /// slices) so subsequent reads via `Worksheet.validations()` /
+    /// `Worksheet.conditionalFormats()` observe the rewritten formulas.
+    /// `Workbook.save()` does NOT yet persist these changes — DV / CF
+    /// blocks are byte-preserved from the source XML on save, so the
+    /// rewritten formulas are lost when the workbook round-trips
+    /// through disk. Persistence (re-emitting `<dataValidations>` and
+    /// `<conditionalFormatting>` blocks) is a follow-up iter; the
+    /// splice is non-trivial because `<conditionalFormatting>` groups
+    /// multiple `<cfRule>` records by `sqref` while the typed view
+    /// flattens them per-rule.
+    ///
+    /// Verification path for callers that need to see the effect of
+    /// this call: re-read `ws.validations()` / `ws.conditionalFormats()`
+    /// after invoking — the slices' `formula1` / `formula2` / `formula`
+    /// fields will point at the rewritten text. Do NOT save+re-open.
+    ///
+    /// Allocates the rewritten formula text into the SheetXml's own
+    /// arena, so the new slices have the same lifetime as the original
+    /// borrowed text (alive until the SheetXml is invalidated, e.g.
+    /// by a subsequent `save`). Caller does not free.
+    pub fn rewriteAllValidationsAndConditionalFormats(
+        self: *Workbook,
+        edit: zlsx.formula_rewriter.RewriteEdit,
+    ) Error!u32 {
+        var count: u32 = 0;
+        const a = self.allocator;
+        var sheet_idx: u32 = 0;
+        while (sheet_idx < self.sheetCount()) : (sheet_idx += 1) {
+            const ws = try self.sheet(sheet_idx);
+            // Force-parse so `ws.parsed` is populated. We then mutate
+            // the parsed view's slices in place.
+            _ = try ws.ensureParsed();
+            const ws_name = ws.name();
+
+            assert(ws.parsed != null);
+            var view = &ws.parsed.?;
+            // The view's arena owns every borrowed slice in
+            // `validations` / `conditional_formats`. Allocate
+            // replacement formula bytes into the same arena so the
+            // rewritten field shares the original lifetime.
+            assert(view.arena != null);
+            const arena_alloc = (&view.arena.?).allocator();
+
+            const ctx = zlsx.formula_rewriter.RewriteContext{
+                .on_sheet = ws_name,
+                .target_sheet = null,
+                .edit = edit,
+            };
+
+            for (view.validations) |*dv| {
+                if (try rewriteOptionalFormula(a, arena_alloc, &dv.formula1, ctx)) count += 1;
+                if (try rewriteOptionalFormula(a, arena_alloc, &dv.formula2, ctx)) count += 1;
+            }
+            for (view.conditional_formats) |*cf| {
+                if (try rewriteOptionalFormula(a, arena_alloc, &cf.formula, ctx)) count += 1;
+            }
+        }
+        return count;
+    }
 };
+
+/// Rewrite a single optional formula slot, replacing it on success.
+/// Returns true iff the rewritten text differs from the input.
+///
+/// `scratch` allocates the rewriter's working bytes (freed before
+/// return). `dest` allocates the surviving rewritten slice (lives
+/// for the parent SheetXml arena's lifetime).
+fn rewriteOptionalFormula(
+    scratch: Allocator,
+    dest: Allocator,
+    slot: *?[]const u8,
+    ctx: zlsx.formula_rewriter.RewriteContext,
+) Error!bool {
+    const original = slot.* orelse return false;
+    if (original.len == 0) return false;
+
+    const rewritten = try zlsx.formula_rewriter.rewriteFormula(scratch, original, ctx);
+    defer scratch.free(rewritten);
+    if (std.mem.eql(u8, rewritten, original)) return false;
+
+    // Survivor lives in the SheetXml arena. Note: the prior `slot.*`
+    // also points into that arena (or into the sanitized source bytes
+    // also owned by the arena). We can't free it individually — the
+    // arena reclaims wholesale on view.deinit. Worst case is a small
+    // amount of arena retention until the next save/reparse cycle,
+    // which is acceptable for an in-memory rewrite step.
+    const owned = try dest.dupe(u8, rewritten);
+    slot.* = owned;
+    return true;
+}
 
 // ─── Emit helpers (iter-wb-4 m1) ─────────────────────────────────────
 
@@ -2501,4 +2598,112 @@ test "Workbook.rewriteAllFormulas: rename_sheet rewrites quoted sheet qualifiers
     const a1 = (try (try wb2.sheet(0)).cellByRef("A1")).?;
     // Bare cross-sheet name re-emits as bare.
     try std.testing.expectEqualStrings("Renamed!A1+1", a1.formula.?);
+}
+
+/// Inject `<dataValidations>` and/or `<conditionalFormatting>` blocks
+/// into the first worksheet of `wb` by splicing the raw sheet XML
+/// before `</worksheet>` and pushing it through `PartStore.replacePart`.
+/// Test-only helper — workbooks built by `setCell` + save lack DV/CF
+/// because the typed-view writer doesn't emit them yet.
+fn injectDvAndCfIntoSheet1(wb: *Workbook, dv_block: []const u8, cf_block: []const u8) !void {
+    const ws = try wb.sheet(0);
+    _ = try ws.ensureParsed();
+    const part_name = ws.resolved_part_name.?;
+    const original = blk: {
+        const p = try wb.store.part(part_name) orelse return error.MissingSheetPart;
+        break :blk p.bytes;
+    };
+    // Splice `dv_block ++ cf_block` immediately before `</worksheet>`.
+    const close_tag = "</worksheet>";
+    const close_idx = std.mem.lastIndexOf(u8, original, close_tag) orelse
+        return error.MalformedXml;
+
+    var patched: std.ArrayList(u8) = .empty;
+    defer patched.deinit(wb.allocator);
+    try patched.appendSlice(wb.allocator, original[0..close_idx]);
+    try patched.appendSlice(wb.allocator, dv_block);
+    try patched.appendSlice(wb.allocator, cf_block);
+    try patched.appendSlice(wb.allocator, original[close_idx..]);
+
+    try wb.store.replacePart(part_name, patched.items);
+    // Drop the cached parsed view — its leaves point into the prior
+    // raw bytes which `replacePart` has now superseded.
+    if (ws.parsed) |*p| {
+        var stale = p.*;
+        stale.deinit(wb.allocator);
+        ws.parsed = null;
+    }
+}
+
+test "Workbook.rewriteAllValidationsAndConditionalFormats: insert_rows shifts DV formula1/formula2" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+
+    // Two DVs: a 'between' one with formula1 + formula2 (numeric refs
+    // that should both shift), and a 'list' one whose formula1 is a
+    // sheet-qualified range that should also shift.
+    const dv_block =
+        \\<dataValidations count="2">
+        \\<dataValidation type="whole" operator="between" sqref="A1"><formula1>B5</formula1><formula2>B10</formula2></dataValidation>
+        \\<dataValidation type="list" sqref="C1"><formula1>Sheet1!$A$5:$A$10</formula1></dataValidation>
+        \\</dataValidations>
+    ;
+    try injectDvAndCfIntoSheet1(&wb, dv_block, "");
+
+    const count = try wb.rewriteAllValidationsAndConditionalFormats(.{
+        .insert_rows = .{ .at = 4, .count = 1 },
+    });
+    // formula1 (B5 → B6), formula2 (B10 → B11), formula1 of dv2 (range, both endpoints shift) = 3
+    try std.testing.expectEqual(@as(u32, 3), count);
+
+    // Verify in-memory view shows the rewrites.
+    const ws = try wb.sheet(0);
+    const dvs = try ws.validations();
+    try std.testing.expectEqual(@as(usize, 2), dvs.len);
+    try std.testing.expectEqualStrings("B6", dvs[0].formula1.?);
+    try std.testing.expectEqualStrings("B11", dvs[0].formula2.?);
+    try std.testing.expectEqualStrings("Sheet1!$A$6:$A$11", dvs[1].formula1.?);
+}
+
+test "Workbook.rewriteAllValidationsAndConditionalFormats: insert_cols shifts CF formula" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+
+    // One CF block with two cfRules — each carries a `<formula>`.
+    const cf_block =
+        \\<conditionalFormatting sqref="A1:Z1"><cfRule type="cellIs" dxfId="0" priority="1" operator="greaterThan"><formula>$C$1</formula></cfRule><cfRule type="expression" dxfId="0" priority="2"><formula>D1+E1</formula></cfRule></conditionalFormatting>
+    ;
+    try injectDvAndCfIntoSheet1(&wb, "", cf_block);
+
+    const count = try wb.rewriteAllValidationsAndConditionalFormats(.{
+        .insert_cols = .{ .at = 2, .count = 1 },
+    });
+    // $C$1 → $D$1 (1), D1+E1 → E1+F1 (2 ref shifts in one formula = 1 body change) = 2
+    try std.testing.expectEqual(@as(u32, 2), count);
+
+    const ws = try wb.sheet(0);
+    const cfs = try ws.conditionalFormats();
+    try std.testing.expectEqual(@as(usize, 2), cfs.len);
+    try std.testing.expectEqualStrings("$D$1", cfs[0].formula.?);
+    try std.testing.expectEqualStrings("E1+F1", cfs[1].formula.?);
+}
+
+test "Workbook.rewriteAllValidationsAndConditionalFormats: no-op count == 0 on workbook without DV/CF" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+
+    // Pristine fixture has no DVs and no CFs — nothing to rewrite.
+    const count = try wb.rewriteAllValidationsAndConditionalFormats(.{
+        .insert_rows = .{ .at = 1, .count = 1 },
+    });
+    try std.testing.expectEqual(@as(u32, 0), count);
 }
