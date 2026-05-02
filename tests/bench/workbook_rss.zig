@@ -29,17 +29,18 @@ const rss = @import("rss");
 
 const FIXTURE_PATH = ".zig-cache/bench-100k-x-10.xlsx";
 
-/// Acceptable Workbook-vs-Book RSS ratio after the iter-wb-6 gate
-/// closure work. The roadmap's eventual target is ≤ 2.0× — but
-/// closing that requires a file-streaming `PartStore` (the current
-/// implementation slurps the whole compressed file into the arena
-/// at `open()`, which alone can saturate the gap on small fixtures).
+/// Workbook-vs-Book RSS ratio ceiling. Roadmap target was ≤ 2.0×.
+/// Reality after the file-streaming PartStore: the Workbook overlay
+/// uses LESS RSS than `Book.openLazy` because PartStore no longer
+/// slurps the file (only EOCD + CD + structural parts come into
+/// memory at open; everything else streams from disk on demand via
+/// seek + readAll). Locally the ratio is ~0.78× on the 10k×10
+/// fixture.
 ///
-/// Today's intermediate ceiling is 6.0× — a regression-detector that
-/// locks in the deferred-decompress win (44× → ~5× on a 1.85 MB
-/// fixture; ratio is dominated by the file-slurp baseline). Tighten
-/// to 2.0 once `PartStore` switches to seek-and-read or mmap.
-const RATIO_CEILING: f64 = 6.0;
+/// 1.5× locks in the win as a regression detector — any future
+/// change that re-introduces a file slurp or eager decompress will
+/// trip this immediately. Tighten further if headroom shrinks.
+const RATIO_CEILING: f64 = 1.5;
 
 fn currentRss() !u64 {
     return rss.rssBytes() catch |err| switch (err) {
