@@ -13925,6 +13925,13 @@ test "fuzz Book.open against arbitrary bytes" {
 
 pub const Writer = @import("writer.zig").Writer;
 pub const SheetWriter = @import("writer.zig").SheetWriter;
+/// Internal helper re-exported for `zlsx_pkg` (PartStore.replacePart /
+/// addPart use it for deflate-encoding part bytes). Public so the
+/// package layer can reach it through `@import("zlsx").deflateCompress`
+/// without needing to import `writer` separately — the latter would
+/// trigger a Zig 0.15.2 module-graph collision (`cli_mod + zlsx_pkg
+/// + writer cannot coexist`, documented in build.zig).
+pub const deflateCompress = @import("writer.zig").deflateCompress;
 
 // ─── Deep reader fuzz: SST index pointing past the SST table ────────
 //

@@ -34,3 +34,14 @@ pub const imageAnchors = drawings_mod.imageAnchors;
 pub const ChartAnchor = drawings_mod.ChartAnchor;
 pub const ChartType = drawings_mod.ChartType;
 pub const chartAnchors = drawings_mod.chartAnchors;
+
+/// Typed-overlay parsers for well-known OOXML parts (B1 iter-wb-1).
+/// See `pkg/typed_parts/root.zig` for the per-part API.
+pub const typed_parts = @import("typed_parts/root.zig");
+
+/// Workbook + Worksheet typed-overlay roots (B1 iter-wb-2).
+/// Read-only in this iter; mutation lands in iter-wb-4.
+const workbook_mod = @import("workbook.zig");
+pub const Workbook = workbook_mod.Workbook;
+pub const Worksheet = workbook_mod.Worksheet;
+pub const WorkbookError = workbook_mod.Error;

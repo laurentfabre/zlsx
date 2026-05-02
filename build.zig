@@ -153,7 +153,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    package_mod.addImport("writer", writer_mod);
+    package_mod.addImport("zlsx", zlsx_mod);
 
     // C2a: standalone `zlsx-extract-images` binary that drives the
     // package layer (PartStore + imageParts) without going through
@@ -182,7 +182,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    package_store_tests_mod.addImport("writer", writer_mod);
+    package_store_tests_mod.addImport("zlsx", zlsx_mod);
     const package_store_tests = b.addTest(.{ .root_module = package_store_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_store_tests).step);
 
@@ -191,9 +191,36 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    package_drawings_tests_mod.addImport("writer", writer_mod);
+    package_drawings_tests_mod.addImport("zlsx", zlsx_mod);
     const package_drawings_tests = b.addTest(.{ .root_module = package_drawings_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_drawings_tests).step);
+
+    // pkg/typed_parts/* — typed-overlay parsers for known OOXML parts
+    // (B1 iter-wb-1). One test binary covers all five children via
+    // `pkg/typed_parts/root.zig` re-exports. Stdlib-only, no writer
+    // import (typed-overlay parsers don't need it).
+    const package_typed_parts_tests_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/typed_parts/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const package_typed_parts_tests = b.addTest(.{ .root_module = package_typed_parts_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(package_typed_parts_tests).step);
+
+    // pkg/workbook.zig — Workbook + Worksheet typed-overlay roots
+    // (B1 iter-wb-2). Composes PartStore + typed_parts into a single
+    // model surface; read-only in this iter, mutation lands iter-wb-4.
+    // Inline tests open small fixtures directly, so this module needs
+    // tests/corpus/* to exist at runtime — the corpus_step covers
+    // missing-fixture skipping per scripts/fetch_test_corpus.sh.
+    const package_workbook_tests_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/workbook.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    package_workbook_tests_mod.addImport("zlsx", zlsx_mod);
+    const package_workbook_tests = b.addTest(.{ .root_module = package_workbook_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(package_workbook_tests).step);
 
     // Package-layer fuzz module: pkg/store.zig hosts fuzz targets
     // for decodeXmlEntities + looksExternal. Same fuzz=true flag
@@ -205,7 +232,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .fuzz = true,
     });
-    package_fuzz_mod.addImport("writer", writer_mod);
+    package_fuzz_mod.addImport("zlsx", zlsx_mod);
     const package_fuzz_tests = b.addTest(.{ .root_module = package_fuzz_mod });
     fuzz_step.dependOn(&b.addRunArtifact(package_fuzz_tests).step);
 
@@ -223,6 +250,33 @@ pub fn build(b: *std.Build) void {
     const package_corpus_tests = b.addTest(.{ .root_module = package_corpus_mod });
     corpus_step.dependOn(&b.addRunArtifact(package_corpus_tests).step);
     test_step.dependOn(&b.addRunArtifact(package_corpus_tests).step);
+
+    // tests/typed_parts_corpus.zig — corpus parity sweep for B1
+    // iter-wb-1: every fixture's workbook.xml / sst / styles / theme
+    // / first sheet runs through the matching pkg.typed_parts parser.
+    const typed_parts_corpus_mod = b.createModule(.{
+        .root_source_file = b.path("tests/typed_parts_corpus.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    typed_parts_corpus_mod.addImport("zlsx_pkg", package_mod);
+    const typed_parts_corpus_tests = b.addTest(.{ .root_module = typed_parts_corpus_mod });
+    corpus_step.dependOn(&b.addRunArtifact(typed_parts_corpus_tests).step);
+    test_step.dependOn(&b.addRunArtifact(typed_parts_corpus_tests).step);
+
+    // tests/workbook_corpus.zig — corpus parity sweep for B1 iter-wb-2:
+    // every fixture opens as Workbook, every Worksheet materialises
+    // through the typed-overlay composition (PartStore → typed_parts
+    // → Workbook → Worksheet).
+    const workbook_corpus_mod = b.createModule(.{
+        .root_source_file = b.path("tests/workbook_corpus.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    workbook_corpus_mod.addImport("zlsx_pkg", package_mod);
+    const workbook_corpus_tests = b.addTest(.{ .root_module = workbook_corpus_mod });
+    corpus_step.dependOn(&b.addRunArtifact(workbook_corpus_tests).step);
+    test_step.dependOn(&b.addRunArtifact(workbook_corpus_tests).step);
 
     // C ABI — both a shared library (for Python / cffi bindings) and a
     // static library (for language toolchains that prefer linking in).
@@ -263,4 +317,111 @@ pub fn build(b: *std.Build) void {
     // and a corpus-gated end-to-end lifecycle smoke test).
     const c_abi_tests = b.addTest(.{ .root_module = c_abi_mod });
     test_step.dependOn(&b.addRunArtifact(c_abi_tests).step);
+
+    // ─── B1 iter-wb-6: RSS gate ─────────────────────────────────
+    //
+    // Off the default `test` step. The 100k × 10 fixture takes
+    // 1-3 minutes to synthesise on first invocation (cached
+    // afterwards), and RSS measurement is order-sensitive enough
+    // that we don't want it co-resident with other tests in the
+    // same binary. Run with `zig build bench-workbook-rss`.
+    //
+    // The orchestrator test (`tests/bench/workbook_rss.zig`) and
+    // its three child probes are split into separate compilations
+    // because `zlsx` and `zlsx_pkg` cannot coexist in one binary
+    // (the same `pkg/store.zig` ends up claimed by both — see
+    // `AGENTS.md` "Three-module collision"). The test spawns each
+    // probe as a subprocess; each probe measures its own RSS delta
+    // in isolation. The gate compares the two deltas as a ratio.
+    //
+    // ReleaseSafe: keeps reader / writer overflow checks active so
+    // we measure code paths a production caller actually runs.
+    const bench_optimize: std.builtin.OptimizeMode = .ReleaseSafe;
+
+    // Shared rss + synth modules — created once, imported by each
+    // probe that needs them.
+    const bench_rss_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/rss.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    const bench_synth_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/synth_100k_x_10.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    bench_synth_mod.addImport("zlsx", zlsx_mod);
+
+    // Probe 1 — synth. Pulls `zlsx` (writer) only; no pkg.
+    const probe_synth_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/rss_probe_synth.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    probe_synth_mod.addImport("synth", bench_synth_mod);
+    const probe_synth_exe = b.addExecutable(.{
+        .name = "zlsx-bench-rss-synth",
+        .root_module = probe_synth_mod,
+    });
+    const probe_synth_install = b.addInstallArtifact(probe_synth_exe, .{});
+
+    // Probe 2 — book. Pulls `zlsx` only; no pkg.
+    const probe_book_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/rss_probe_book.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    probe_book_mod.addImport("zlsx", zlsx_mod);
+    probe_book_mod.addImport("rss", bench_rss_mod);
+    const probe_book_exe = b.addExecutable(.{
+        .name = "zlsx-bench-rss-book",
+        .root_module = probe_book_mod,
+    });
+    const probe_book_install = b.addInstallArtifact(probe_book_exe, .{});
+
+    // Probe 3 — workbook. Pulls `zlsx_pkg` only; no zlsx (the
+    // collision avoidance is the whole reason this is a separate
+    // binary).
+    const probe_wb_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/rss_probe_workbook.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    probe_wb_mod.addImport("zlsx_pkg", package_mod);
+    probe_wb_mod.addImport("rss", bench_rss_mod);
+    const probe_wb_exe = b.addExecutable(.{
+        .name = "zlsx-bench-rss-workbook",
+        .root_module = probe_wb_mod,
+    });
+    const probe_wb_install = b.addInstallArtifact(probe_wb_exe, .{});
+
+    // Orchestrator test. No dependency on `zlsx` or `zlsx_pkg` —
+    // it spawns the probes as subprocesses.
+    const bench_workbook_rss_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/workbook_rss.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    bench_workbook_rss_mod.addImport("rss", bench_rss_mod);
+    const bench_workbook_rss_tests = b.addTest(.{ .root_module = bench_workbook_rss_mod });
+    const bench_workbook_rss_run = b.addRunArtifact(bench_workbook_rss_tests);
+    bench_workbook_rss_run.has_side_effects = true;
+    bench_workbook_rss_run.step.dependOn(&probe_synth_install.step);
+    bench_workbook_rss_run.step.dependOn(&probe_book_install.step);
+    bench_workbook_rss_run.step.dependOn(&probe_wb_install.step);
+
+    const bench_workbook_rss_step = b.step(
+        "bench-workbook-rss",
+        "B1 iter-wb-6 RSS gate: Workbook.openLazy ≤ 2× Book.openLazy on a 100k × 10 fixture (off the default test path)",
+    );
+    bench_workbook_rss_step.dependOn(&bench_workbook_rss_run.step);
+
+    // Per-module unit tests for the bench helpers (rss + synth).
+    // These DO go on the default `test` step — they're cheap and
+    // exercise the platform-specific code paths.
+    const bench_rss_tests = b.addTest(.{ .root_module = bench_rss_mod });
+    test_step.dependOn(&b.addRunArtifact(bench_rss_tests).step);
+
+    const bench_synth_tests = b.addTest(.{ .root_module = bench_synth_mod });
+    test_step.dependOn(&b.addRunArtifact(bench_synth_tests).step);
 }
