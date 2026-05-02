@@ -1847,6 +1847,11 @@ pub const Worksheet = struct {
         // but explicit ownership is clearer).
         const owned = try wb.allocator.dupe(u8, part_name);
         errdefer wb.allocator.free(owned);
+        // Free the old part-name dupe if this Worksheet was previously
+        // parsed-then-invalidated. Same fix as PR #36 — caught by
+        // std.testing.allocator on tests that splice part bytes via
+        // PartStore.replacePart and re-enter ensureParsed.
+        if (self.resolved_part_name) |prev| wb.allocator.free(prev);
         self.resolved_part_name = owned;
 
         const part = try wb.store.part(part_name) orelse return Error.MissingSheetPart;
