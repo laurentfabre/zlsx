@@ -80,7 +80,7 @@ jobs:
           echo "=== first 40 lines of TDAD map ==="
           head -40 /tmp/tdad.md
       - name: Post / update PR comment
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
