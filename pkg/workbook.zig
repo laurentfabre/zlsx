@@ -67,6 +67,7 @@ pub const Error = error{
     SheetCountMismatch,
     WriteFailed,
 } || workbook_xml_mod.Error || sheet_xml_mod.ParseError || sst_xml_mod.Error || styles_xml_mod.Error || store_mod.Error ||
+    zlsx.formula_rewriter.Error ||
     std.fs.File.WriteError || std.fs.File.OpenError || std.fs.Dir.RenameError || std.fs.Dir.StatFileError;
 
 /// Mutation primitive (B1 iter-wb-4). Strings emit as `inlineStr`
