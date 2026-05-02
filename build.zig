@@ -139,6 +139,20 @@ pub fn build(b: *std.Build) void {
     const formula_tokenizer_tests = b.addTest(.{ .root_module = formula_tokenizer_mod });
     test_step.dependOn(&b.addRunArtifact(formula_tokenizer_tests).step);
 
+    // C1 milestone 2 (iter 1): pure-function A1 cell-formula
+    // rewriter. Imports the M1 tokenizer via a relative path inside
+    // src/formula/, so this module's package dir matches the
+    // tokenizer's. Sibling of formula_tokenizer_mod with its own
+    // test target — the rewriter has no other cross-deps yet
+    // (Workbook.rewriteReferences wiring lands in a later iter).
+    const formula_rewriter_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/rewriter.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const formula_rewriter_tests = b.addTest(.{ .root_module = formula_rewriter_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_rewriter_tests).step);
+
     // ─── Package layer (B0 + C2a) ───────────────────────────────
     //
     // Public root: pkg/root.zig re-exports PartStore /
