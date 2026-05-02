@@ -9,7 +9,7 @@ pulled forward of formula work, chart emit demoted to Tier D,
 walk-away gates tightened (grammar-class instead of corpus-percentage,
 report-only bench CI).
 
-## Status (as of 2026-05-02)
+## Status (as of 2026-05-03)
 
 Tier-A, the Tier-B keystone (B0), and **B1 Workbook overlay are
 fully shipped** — every iter (wb-1 typed parsers, wb-2 read-only
@@ -25,10 +25,23 @@ drawing parser — multi-prefix bindings, full XML scope tracking
 for closed siblings, comment / CDATA / PI awareness, quote-aware
 attribute scanning, O(n) flat under adversarial input). addPart
 shipped on PartStore. C1 M1 (formula tokenizer + loss-preserving
-printer) shipped; **C1 M2 milestone 1 (A1 cell-formula rewriter)
-shipped 2026-05-02 in PR #32** as a pure-function `rewriteFormula`
-on `src/formula/rewriter.zig` — `Workbook.rewriteReferences(edit)`
-wiring still pending.
+printer) shipped. **C1 M2 milestone 1 shipped** (PR #32 — pure
+`rewriteFormula`) plus its **m1.5 Workbook wiring** (PR #34 —
+`Workbook.rewriteAllFormulas(edit)`) and a **`Workbook.renameSheet`
+convenience** (PR #35 — combines `rename_sheet` rewrite + patches
+`xl/workbook.xml`'s `<sheet name=>` attr + refreshes the typed
+view).
+
+C1 M2 m2 (DV / CF rewriter) and m3 (defined-names + hyperlinks
+rewriter) were attempted via parallel subagents 2026-05-02 but
+both were closed for redo: m2 hit a structural rebase conflict
+post-#35 and the in-memory-only persistence trade-off; m3 had a
+target_sheet API design issue + a sheet-scope test panic that
+needs careful debugging with a working local toolchain. Both
+remain pending in the table below. The `resolved_part_name` leak
+fix from m2's debugging IS shipped here as a standalone bug fix
+(every `parsed=null → ensureParsed` cycle previously leaked the
+prior part-name dupe).
 
 Greenfield writer surface is feature-complete for non-image
 workbooks: cells, formulas, styles, validations, conditional
@@ -70,7 +83,10 @@ wraparound).
 | **C2b** addImage | ⏳ pending (B1 dependency now satisfied; subagent attempt 2026-05-02 stalled on OOXML emit complexity, deferred for a focused future iter) |
 | **C1 M1** Formula tokenizer + loss-preserving printer | ✅ shipped (`src/formula/tokenizer.zig` — A1 refs incl. case-insensitive, sheet qualifiers, ranges, names, function-call disambiguation, number/string/bool/error literals, every operator, array constants, whitespace preserved, external-wb refs as `.unknown`) |
 | **C1 M2 m1** A1 cell-formula rewriter (`rewriteFormula`) | ✅ shipped (PR #32 — `src/formula/rewriter.zig`; insert/delete rows/cols + `rename_sheet`; absolute-marker preservation; `target_sheet`-scoped bare refs; range collapse to `#REF!`; 20 inline tests + `checkAllAllocationFailures`) |
-| **C1 M2 m2+** DV / CF / defined-names / hyperlink rewriters + Workbook.rewriteReferences wiring | ⏳ pending |
+| **C1 M2 m1.5** Workbook wiring (`rewriteAllFormulas`) | ✅ shipped (PR #34 — walks every sheet, every formula cell; stages rewritten text via `setCell`; counts rewrites; byte-identical no-ops skipped) |
+| **C1 M2 m1.6** `Workbook.renameSheet` convenience | ✅ shipped (PR #35 — validates new name (length, forbidden chars, "history" reserved, case-insensitive duplicate detection); rewrites cross-sheet qualifiers via `rewriteAllFormulas`; patches `xl/workbook.xml`'s `<sheet name=>` attr; refreshes the typed view via re-parse so `wb.sheet(idx).name()` reflects the new value immediately) |
+| **C1 M2 m2** DV / CF formula rewriter | ⏳ pending (subagent attempt 2026-05-02 closed for redo — needs persistence design (in-memory vs sheet-XML splice) and rebase resolution) |
+| **C1 M2 m3** Defined-names + internal hyperlink rewriter | ⏳ pending (subagent attempt 2026-05-02 closed for redo — needs `target_sheet` API parameter and a sheet-scope test panic to be debugged with a working local toolchain) |
 | **D1** Formula evaluator | deferred indefinitely |
 | **D2** Typed chart emit | deferred |
 
