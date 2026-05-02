@@ -116,6 +116,14 @@ pub const CellValue = union(enum) {
     /// result on open. Caching computed results is a future iter
     /// (depends on D1 evaluator).
     formula: []const u8,
+    /// Fully remove the cell from `<sheetData>`. Distinct from
+    /// `.blank` (which emits an empty `<c r="REF"/>` — cell present,
+    /// no value): a `.deleted` delta elides the cell entirely from
+    /// the regenerated sheet XML, so post-save `cellByRef(ref)`
+    /// returns `null`. Staging a `.deleted` delta against a ref that
+    /// isn't present in the source sheet is a no-op (delta carries
+    /// nothing to elide).
+    deleted: void,
 };
 
 /// 1-based (row, col) — matches OOXML A1 conventions.
@@ -1052,6 +1060,13 @@ fn emitSheetData(
         for (row.cells) |c| {
             const cr = parseA1Ref(c.ref) catch continue;
             const overlay = deltas.get(cr);
+            // `.deleted` overrides the original — emit nothing for
+            // this ref. Still mark `seen` so the delta-only pass
+            // below doesn't re-introduce it.
+            if (overlay) |dv| if (dv == .deleted) {
+                try seen.put(allocator, cr, {});
+                continue;
+            };
             const mc: MergedCell = if (overlay) |dv| .{
                 .ref = cr,
                 .style_idx = c.style_idx,
@@ -1071,9 +1086,12 @@ fn emitSheetData(
     }
 
     // 2. Append delta-only cells (not matched to any existing cell).
+    // `.deleted` deltas with no matching original are a no-op — there
+    // is nothing to elide, so we skip rather than emit a phantom cell.
     var dit = deltas.iterator();
     while (dit.next()) |entry| {
         if (seen.contains(entry.key_ptr.*)) continue;
+        if (entry.value_ptr.* == .deleted) continue;
         try merged.append(allocator, .{
             .ref = entry.key_ptr.*,
             .style_idx = null,
@@ -1198,6 +1216,10 @@ fn emitCell(
                 try appendXmlEscapedText(allocator, out, f);
                 try out.appendSlice(allocator, "</f></c>");
             },
+            // `.deleted` deltas are filtered out in `emitSheetData`
+            // before they ever reach a `MergedCell` — reaching here
+            // would mean the filter regressed.
+            .deleted => unreachable,
         },
     }
 }
@@ -2113,6 +2135,20 @@ pub const Worksheet = struct {
         };
 
         try self.deltas.put(a, cr, stored);
+    }
+
+    /// Stage a deletion for cell `ref`. After `Workbook.save`, the
+    /// cell is fully absent from `<sheetData>` (no `<c>` element at
+    /// all) and `cellByRef(ref)` returns `null`. Distinct from
+    /// `setCell(ref, .blank)`, which keeps the cell present as an
+    /// empty `<c r="REF"/>`.
+    ///
+    /// Staging a deletion against a ref that doesn't exist in the
+    /// source sheet is not an error — the delta just elides nothing.
+    /// Last `setCell`/`deleteCell` for a given ref wins.
+    pub fn deleteCell(self: *Worksheet, ref: []const u8) Error!void {
+        assert(ref.len > 0);
+        return self.setCell(ref, .deleted);
     }
 };
 
@@ -3640,4 +3676,108 @@ test "Worksheet.cellStyle: applyAlignment surfaces wrap_text; built-in numFmt id
     try std.testing.expectEqual(@as(?[]const u8, null), d4.number_format_code);
     try std.testing.expectEqual(@as(?styles_xml_mod.Font, null), d4.font);
     try std.testing.expectEqual(@as(?styles_xml_mod.Alignment, null), d4.alignment);
+}
+
+test "Workbook.deleteCell: removes existing cell from saved sheet" {
+    const src_path = "tests/corpus/openpyxl_guess_types.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-delete-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        const s0 = try wb.sheet(0);
+        // Sanity: A1 exists before delete.
+        const before = try s0.cellByRef("A1");
+        try std.testing.expect(before != null);
+
+        try s0.deleteCell("A1");
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb2.deinit();
+    const s0 = try wb2.sheet(0);
+
+    const a1 = try s0.cellByRef("A1");
+    try std.testing.expect(a1 == null);
+}
+
+test "Workbook.deleteCell vs setCell(.blank): elision vs empty cell" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-delete-vs-blank-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        const s0 = try wb.sheet(0);
+        // Stage two side-by-side cells so both refs land in the same
+        // <sheetData>; one is fully removed, the other left empty.
+        try s0.setCell("Z1", .{ .number = 7 });
+        try s0.setCell("Z2", .{ .number = 8 });
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    // Re-open and stage delete on Z1, blank on Z2; save again.
+    {
+        var wb = try Workbook.open(std.testing.allocator, tmp_path);
+        defer wb.deinit();
+        const s0 = try wb.sheet(0);
+        try s0.deleteCell("Z1");
+        try s0.setCell("Z2", .blank);
+        try wb.save(tmp_path);
+    }
+
+    // Inspect the regenerated sheet bytes directly: Z1 must be absent,
+    // Z2 must be present as a self-closing empty <c>.
+    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb2.deinit();
+    const s0 = try wb2.sheet(0);
+    _ = try s0.ensureParsed(); // populates resolved_part_name
+    const part_name = s0.resolved_part_name.?;
+    const part = (try wb2.store.part(part_name)) orelse return error.MissingSheetPart;
+    const xml = part.bytes;
+
+    try std.testing.expect(std.mem.indexOf(u8, xml, "r=\"Z1\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<c r=\"Z2\"/>") != null);
+
+    // Reader-level invariant: cellByRef agrees.
+    try std.testing.expect((try s0.cellByRef("Z1")) == null);
+    const z2 = try s0.cellByRef("Z2");
+    try std.testing.expect(z2 != null);
+    try std.testing.expect(z2.?.raw_value == null);
+}
+
+test "Workbook.deleteCell: non-existent ref is a no-op" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-delete-noop-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        const s0 = try wb.sheet(0);
+        // A ref guaranteed not to exist in the source corpus.
+        try s0.deleteCell("ZZ9999");
+        // Save must succeed; the .deleted delta has no original to elide.
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb2.deinit();
+    const s0 = try wb2.sheet(0);
+    try std.testing.expect((try s0.cellByRef("ZZ9999")) == null);
 }
