@@ -91,10 +91,14 @@ pub const PartStore = struct {
     /// public API (part names, content types, rel attrs, decompressed
     /// part bytes). Caller-visible slices stay valid until `deinit`.
     arena: std.heap.ArenaAllocator,
-    /// Original file bytes — kept alive in arena for the byte-
-    /// preserving save path (B0 M2). Untouched parts copy LFH +
-    /// payload directly from these bytes.
-    src_buf: []const u8,
+    /// Source file kept open for the lifetime of the PartStore. The
+    /// previous design slurped the entire file into `src_buf` at
+    /// open(); now we read CD + EOCD + structural parts at open()
+    /// then close-the-buffer-but-keep-the-handle so RSS doesn't
+    /// retain compressed bytes for parts callers never touch.
+    /// `materializeAt` and the byte-preserving `save()` path both
+    /// re-read from this handle by `seekTo` + `readAll`.
+    file: std.fs.File,
     /// Per-part raw ZIP entries (LFH/CDFH/payload offsets). Same
     /// length + ordering as `parts`.
     entries: []ZipEntry,
@@ -114,43 +118,45 @@ pub const PartStore = struct {
         errdefer arena.deinit();
         const ar_alloc = arena.allocator();
 
-        // Slurp the file into owned memory. Mirrors Editor's lifetime
-        // story: we want to stay alive even after the source file is
-        // closed, and we want a contiguous span for the central-
-        // directory scan.
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        var file = try std.fs.cwd().openFile(path, .{});
+        errdefer file.close();
         const stat = try file.stat();
         if (stat.size > std.math.maxInt(u32)) return Error.Zip64NotSupported;
         const size: usize = @intCast(stat.size);
-        const buf = try ar_alloc.alloc(u8, size);
-        const n = try file.readAll(buf);
+
+        // Read the whole file into a SCRATCH buffer (page-allocator,
+        // not arena). scanCentralDirectory needs random access to
+        // every CDFH + each LFH header to compute payload offsets;
+        // doing that without a contiguous buffer would require
+        // hundreds of small disk reads. We free the scratch buffer
+        // at the end of `open()` so RSS doesn't retain it. Pages are
+        // mmap'd by `page_allocator`, so `free` returns them via
+        // munmap rather than holding them inside the process arena.
+        const scratch = try std.heap.page_allocator.alloc(u8, size);
+        defer std.heap.page_allocator.free(scratch);
+        const n = try file.readAll(scratch);
         if (n != size) return Error.BadZip;
 
-        const entries = try scanCentralDirectory(ar_alloc, buf);
+        const entries = try scanCentralDirectory(ar_alloc, scratch);
 
         // Lazy decompression (iter-wb-6 ratio gate fix): only the
         // structural parts ([Content_Types].xml + every _rels/*.rels)
         // are decompressed at open() — they're needed inline for
         // content-type / relationship resolution. Everything else
-        // stays compressed in `src_buf` until `PartStore.part()` first
-        // surfaces them. CRC32 verification moves to first-access for
-        // deferred parts (eager parts are still verified here).
+        // stays compressed-on-disk until `PartStore.part()` first
+        // surfaces them via `materializeAt` (seek + readAll).
         const parts = try ar_alloc.alloc(Part, entries.len);
         for (entries, 0..) |e, i| {
             const eager = isStructuralPart(e.name) or e.uncompressed_size == 0;
             var bytes: []const u8 = &.{};
             if (eager) {
-                const compressed = buf[e.payload_offset .. e.payload_offset + e.compressed_size];
+                const compressed = scratch[e.payload_offset .. e.payload_offset + e.compressed_size];
                 bytes = try decompressPayload(
                     ar_alloc,
                     compressed,
                     e.compression_method,
                     e.uncompressed_size,
                 );
-                // Verify CDFH CRC32 against decompressed bytes for
-                // structural parts. Deferred parts get the same
-                // verification on first access in `part()`.
                 if (std.hash.Crc32.hash(bytes) != e.crc32) return Error.BadZip;
             }
             parts[i] = .{
@@ -158,9 +164,6 @@ pub const PartStore = struct {
                 .content_type = null, // resolved next pass
                 .bytes = bytes,
                 .compression_method = e.compression_method,
-                // ZipEntry.payload_offset is `usize`; Zip32 caps it
-                // at u32, and `open()` rejected stat.size > u32 above
-                // (line 107). `@intCast` is safe under that invariant.
                 .payload_offset = @intCast(e.payload_offset),
                 .compressed_size = e.compressed_size,
                 .uncompressed_size = e.uncompressed_size,
@@ -168,12 +171,8 @@ pub const PartStore = struct {
             };
         }
 
-        // Resolve content types from `[Content_Types].xml`. Default
-        // by extension, Override by part name (Override wins).
         try resolveContentTypes(ar_alloc, parts);
 
-        // Parse each `_rels/*.rels`. The result is keyed by the
-        // owner part name (the document the rels file describes).
         var rels_by_owner: std.StringHashMapUnmanaged([]Relationship) = .empty;
         for (parts) |p| {
             const owner = (try relsOwner(ar_alloc, p.name)) orelse continue;
@@ -181,11 +180,16 @@ pub const PartStore = struct {
             try rels_by_owner.put(ar_alloc, owner, relationships);
         }
 
-        // Recover the EOCD comment for byte-preserving save().
-        const eocd_off = try findEocd(buf);
-        const comment_len = std.mem.readInt(u16, buf[eocd_off + 20 ..][0..2], .little);
+        // Recover the EOCD comment for byte-preserving save(). DUPE
+        // into arena because the source bytes (scratch) are about to
+        // be freed.
+        const eocd_off = try findEocd(scratch);
+        const comment_len = std.mem.readInt(u16, scratch[eocd_off + 20 ..][0..2], .little);
         const comment_start = eocd_off + eocd_min_size;
-        const eocd_comment = if (comment_len > 0) buf[comment_start .. comment_start + comment_len] else &[_]u8{};
+        const eocd_comment: []const u8 = if (comment_len > 0)
+            try ar_alloc.dupe(u8, scratch[comment_start .. comment_start + comment_len])
+        else
+            &[_]u8{};
 
         const overrides = try ar_alloc.alloc(?Override, parts.len);
         for (overrides) |*o| o.* = null;
@@ -193,7 +197,7 @@ pub const PartStore = struct {
         return .{
             .allocator = allocator,
             .arena = arena,
-            .src_buf = buf,
+            .file = file,
             .entries = entries,
             .parts = parts,
             .overrides = overrides,
@@ -203,6 +207,7 @@ pub const PartStore = struct {
     }
 
     pub fn deinit(self: *PartStore) void {
+        self.file.close();
         self.arena.deinit();
     }
 
@@ -560,17 +565,20 @@ pub const PartStore = struct {
                 try w.writeAll(ov.payload);
                 written += @as(u64, lfh_bytes.len) + @as(u64, e.name.len) + @as(u64, ov.payload.len);
             } else {
-                // Untouched: copy LFH + payload bytes byte-for-byte.
-                // For entries with a data descriptor (flag 0x0008),
-                // ALSO copy the trailing 12/16-byte descriptor — the
-                // CDFH still advertises that flag, so a reader will
-                // expect those bytes after the payload.
-                const lfh = self.src_buf[e.lfh_offset .. e.lfh_offset + e.lfh_total_len];
-                const payload_end = e.payload_offset + e.compressed_size + e.data_descriptor_len;
-                const payload = self.src_buf[e.payload_offset..payload_end];
-                try w.writeAll(lfh);
-                try w.writeAll(payload);
-                written += @as(u64, lfh.len) + @as(u64, payload.len);
+                // Untouched: stream LFH + payload from the source
+                // file byte-for-byte. For entries with a data
+                // descriptor (flag 0x0008), ALSO copy the trailing
+                // 12/16-byte descriptor — the CDFH still advertises
+                // that flag, so a reader will expect those bytes
+                // after the payload.
+                const total = e.lfh_total_len + e.compressed_size + e.data_descriptor_len;
+                const region = try std.heap.page_allocator.alloc(u8, total);
+                defer std.heap.page_allocator.free(region);
+                try self.file.seekTo(e.lfh_offset);
+                const r = try self.file.readAll(region);
+                if (r != total) return Error.BadZip;
+                try w.writeAll(region);
+                written += @as(u64, region.len);
             }
         }
 
@@ -603,10 +611,13 @@ pub const PartStore = struct {
                 try w.writeAll(e.name);
                 written += @as(u64, cdfh_bytes.len) + @as(u64, e.name.len);
             } else {
-                // Untouched: copy CDFH bytes verbatim, patch the
-                // lfh_offset field at byte 42-46.
-                var cdfh = try self.allocator.dupe(u8, self.src_buf[e.cdfh_offset .. e.cdfh_offset + e.cdfh_total_len]);
+                // Untouched: read CDFH bytes from the source file,
+                // patch the lfh_offset field at byte 42-46.
+                const cdfh = try self.allocator.alloc(u8, e.cdfh_total_len);
                 defer self.allocator.free(cdfh);
+                try self.file.seekTo(e.cdfh_offset);
+                const r = try self.file.readAll(cdfh);
+                if (r != e.cdfh_total_len) return Error.BadZip;
                 std.mem.writeInt(u32, cdfh[42..46], new_lfh_offsets[i], .little);
                 try w.writeAll(cdfh);
                 written += @as(u64, cdfh.len);
@@ -664,11 +675,22 @@ pub const PartStore = struct {
     /// mutable — every reader that asks for the same bytes gets the
     /// same answer; we just compute it once. Inherently-empty parts
     /// (uncompressed_size == 0) skip the decompress entirely.
+    ///
+    /// Reads the compressed payload from `self.file` via `seekTo` +
+    /// `readAll` into a scratch buffer (page-allocator), decompresses
+    /// into the arena, frees the scratch. Decompressed bytes are
+    /// cached on `Part.bytes` for the rest of the store's lifetime.
     fn materializeAt(self: *const PartStore, idx: usize) Error!void {
         const p = &@constCast(self).parts[idx];
         if (p.bytes.len > 0 or p.uncompressed_size == 0) return;
         const ar_alloc = @constCast(&self.arena).allocator();
-        const compressed = self.src_buf[p.payload_offset .. p.payload_offset + p.compressed_size];
+
+        const compressed = try std.heap.page_allocator.alloc(u8, p.compressed_size);
+        defer std.heap.page_allocator.free(compressed);
+        try self.file.seekTo(p.payload_offset);
+        const n = try self.file.readAll(compressed);
+        if (n != p.compressed_size) return Error.BadZip;
+
         const bytes = try decompressPayload(
             ar_alloc,
             compressed,
