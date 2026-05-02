@@ -48,9 +48,9 @@ wraparound).
 | **B0 M2** PartStore byte-preserving save + replacePart | ✅ shipped (incl. data-descriptor preservation) |
 | **B0 M2.5** replacePart deflate-encoded overrides | ✅ shipped |
 | **B0 addPart** Append a new part with content-type registration | ✅ shipped (atomic on allocation failure, XML-escapes attribute values, stays sentinel-safe) |
-| **B0 M3** Typed overlays for known parts | ⏳ pending — likely consolidated into B1 |
+| **B0 M3** Typed overlays for known parts | ⏳ pending — consolidated into B1 iter-wb-1 ([plan](workbook-overlay.md)) |
 | **B0 hardening** ZIP32 sentinel safety, eager CRC32, CDFH bounds, ZIP-bomb caps, split-archive rejection, XML-entity round-trip in [Content_Types] + .rels (named + numeric), external-rel filter | ✅ shipped |
-| **B1** Workbook typed overlay | ⏳ pending (~6–10 weeks) |
+| **B1** Workbook typed overlay | ⏳ pending (~6–10 weeks) — [plan drafted](workbook-overlay.md) |
 | **B2** Editor rebase onto Workbook | ⏳ pending |
 | **B3** Writer rebase onto Workbook | ⏳ pending |
 | **B-fuzz** Coverage-guided fuzz nightly | ✅ shipped (reader + package layer fuzz binaries on ubuntu-22.04 nightly) |

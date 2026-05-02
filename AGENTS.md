@@ -294,6 +294,10 @@ Agent: codex-gpt-5
 
 Installed as a `commit-msg` hook (run `scripts/install-hooks.sh` once after clone). Soft-check only — missing trailer warns but does not block.
 
+### CI gates and branch protection
+
+`main` is PR-only with 9 required status checks (`test/macos-14`, `test/ubuntu-22.04`, 4 `cross/*` targets, plus 3 PR gates: `Test-presence check`, `C ABI 3-file transaction`, `Monotonic test count`). Linear history, no force-push, no deletions, dismiss-stale-approvals on. The `tdad-map` job posts an updated-in-place comment on every PR listing inline tests + related corpus / fuzz / binding surfaces affected by the change. Rationale and per-gate trade-offs live in `docs/enforcement-plan.md`.
+
 ## Process when making changes
 
 1. **Confirm the toolchain**: `zig version` should print `0.15.2`. If not, fix that before anything else.
