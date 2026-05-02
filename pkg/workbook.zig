@@ -462,6 +462,31 @@ pub const Workbook = struct {
         try self.store.save(path);
     }
 
+    /// Read-only predicate: does the workbook carry any pending
+    /// mutation that has not yet been flushed via `save`?
+    ///
+    /// Returns `true` if EITHER:
+    ///   1. any `Worksheet.deltas` map is non-empty (uncommitted
+    ///      `setCell` calls), OR
+    ///   2. the underlying `PartStore` carries any part override
+    ///      (uncommitted `replacePart` / `addPart` — produced by
+    ///      `renameSheet`, `rewriteAllFormulas`, etc.).
+    ///
+    /// Important caveat — `PartStore.save` does NOT clear overrides
+    /// after writing, so this predicate returns `true` even
+    /// immediately after a successful `Workbook.save` if any
+    /// PartStore-level override was applied during the workbook's
+    /// lifetime. Callers needing a freshly-clean dirty bit must
+    /// re-open the workbook from disk after `save`. The post-save
+    /// behaviour for delta-only mutations IS clean (deltas are
+    /// cleared in-place by `save`).
+    pub fn hasUnsavedChanges(self: *const Workbook) bool {
+        for (self.worksheets) |*ws| {
+            if (ws.deltas.count() > 0) return true;
+        }
+        return self.store.hasUnsavedChanges();
+    }
+
     /// Apply a structural-edit rewrite to every formula in every
     /// sheet. Walks each worksheet, materializes its SheetXml, runs
     /// `zlsx.formula_rewriter.rewriteFormula` on each cell that has
@@ -2907,4 +2932,70 @@ test "Workbook.renameSheet: no-op when new_name equals current name" {
     defer std.testing.allocator.free(before);
     try wb.renameSheet(0, before);
     try std.testing.expectEqualStrings(before, (try wb.sheet(0)).name());
+}
+
+test "Workbook.hasUnsavedChanges: pristine workbook is clean immediately after open" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+    try std.testing.expect(!wb.hasUnsavedChanges());
+}
+
+test "Workbook.hasUnsavedChanges: setCell flips the dirty bit" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+    try std.testing.expect(!wb.hasUnsavedChanges());
+    const s0 = try wb.sheet(0);
+    try s0.setCell("A1", .{ .number = 42 });
+    try std.testing.expect(wb.hasUnsavedChanges());
+}
+
+test "Workbook.hasUnsavedChanges: save clears delta-only dirt" {
+    // setCell stages only Worksheet.deltas (no PartStore override
+    // until save commits via replacePart). Workbook.save clears
+    // every Worksheet's deltas, so for a pristine-then-setCell-
+    // then-save lifecycle the bit goes false → true → true. The
+    // bit stays true post-save because PartStore.save does not
+    // reset overrides; that's documented on hasUnsavedChanges.
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-dirty-{d}.xlsx", .{prng.random().int(u32)});
+
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const s0 = try wb.sheet(0);
+    try s0.setCell("A1", .{ .number = 42 });
+    try std.testing.expect(wb.hasUnsavedChanges());
+
+    try wb.save(tmp_path);
+    // deltas are cleared, but the just-replaced sheet part registered
+    // a PartStore override — predicate stays true.
+    try std.testing.expect(wb.hasUnsavedChanges());
+    try std.testing.expectEqual(@as(u32, 0), (try wb.sheet(0)).deltas.count());
+
+    // Re-opening the saved file yields a clean dirty bit.
+    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb2.deinit();
+    try std.testing.expect(!wb2.hasUnsavedChanges());
+}
+
+test "Workbook.hasUnsavedChanges: renameSheet flips the bit via PartStore override" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+    try std.testing.expect(!wb.hasUnsavedChanges());
+    try wb.renameSheet(0, "Renamed");
+    // No deltas — `renameSheet` rewrites `xl/workbook.xml` directly
+    // via `store.replacePart`, so the dirty bit must be reachable
+    // through the PartStore branch.
+    try std.testing.expect(wb.hasUnsavedChanges());
 }

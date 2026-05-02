@@ -645,6 +645,24 @@ pub const PartStore = struct {
         try atomic_file.finish();
     }
 
+    /// Read-only predicate: does the store carry any pending part
+    /// override (from `replacePart` / `addPart`) that hasn't yet been
+    /// flushed to disk?
+    ///
+    /// Note on `save()` semantics: `PartStore.save` writes the merged
+    /// archive to `path` but does NOT reset `overrides[*]` afterwards
+    /// — the in-memory store remains "dirty" relative to its source
+    /// file even after a successful save. This predicate therefore
+    /// reports the cumulative-since-open state, not "since last save".
+    /// Callers that need a clean dirty-bit must re-open the store
+    /// from `path`.
+    pub fn hasUnsavedChanges(self: *const PartStore) bool {
+        for (self.overrides) |o| {
+            if (o != null) return true;
+        }
+        return false;
+    }
+
     fn findIndex(self: *const PartStore, name: []const u8) ?usize {
         for (self.parts, 0..) |p, i| {
             if (std.mem.eql(u8, p.name, name)) return i;
@@ -2149,4 +2167,50 @@ test "PartStore.addPart: atomic on every allocation-failure step" {
         Closure.run,
         .{fixture},
     );
+}
+
+test "PartStore.hasUnsavedChanges: pristine store reports clean" {
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    var store = try PartStore.open(std.testing.allocator, fixture);
+    defer store.deinit();
+    try std.testing.expect(!store.hasUnsavedChanges());
+}
+
+test "PartStore.hasUnsavedChanges: replacePart flips bit and survives save" {
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    const out_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-store-dirty-{d}.xlsx", .{prng.random().int(u32)});
+    defer std.fs.cwd().deleteFile(out_path) catch {};
+
+    var store = try PartStore.open(std.testing.allocator, fixture);
+    defer store.deinit();
+    try std.testing.expect(!store.hasUnsavedChanges());
+
+    try store.replacePart("xl/workbook.xml", "<workbook/>");
+    try std.testing.expect(store.hasUnsavedChanges());
+
+    // Documented behaviour: save() does NOT clear overrides, so the
+    // predicate stays true post-save until the store is re-opened.
+    try store.save(out_path);
+    try std.testing.expect(store.hasUnsavedChanges());
+
+    var fresh = try PartStore.open(std.testing.allocator, out_path);
+    defer fresh.deinit();
+    try std.testing.expect(!fresh.hasUnsavedChanges());
+}
+
+test "PartStore.hasUnsavedChanges: addPart flips bit" {
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+
+    var store = try PartStore.open(std.testing.allocator, fixture);
+    defer store.deinit();
+    try std.testing.expect(!store.hasUnsavedChanges());
+
+    try store.addPart("xl/extra.xml", "application/xml", "<x/>");
+    try std.testing.expect(store.hasUnsavedChanges());
 }
