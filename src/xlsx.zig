@@ -13933,6 +13933,14 @@ pub const SheetWriter = @import("writer.zig").SheetWriter;
 /// + writer cannot coexist`, documented in build.zig).
 pub const deflateCompress = @import("writer.zig").deflateCompress;
 
+/// C1 M2 m1 — pure-function A1 cell-formula rewriter. Re-exported
+/// for `zlsx_pkg` so `Workbook.rewriteAllFormulas(edit)` can apply
+/// row/col/sheet edits to every cell formula via
+/// `@import("zlsx").formula_rewriter`. Same module-graph rationale
+/// as `deflateCompress` above — avoids a separate `formula_rewriter`
+/// addImport on package_mod.
+pub const formula_rewriter = @import("formula/rewriter.zig");
+
 // ─── Deep reader fuzz: SST index pointing past the SST table ────────
 //
 // A malicious xlsx could reference a shared-string index that's beyond
