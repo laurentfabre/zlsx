@@ -9,15 +9,26 @@ pulled forward of formula work, chart emit demoted to Tier D,
 walk-away gates tightened (grammar-class instead of corpus-percentage,
 report-only bench CI).
 
-## Status (as of 2026-04-30)
+## Status (as of 2026-05-02)
 
-Tier-A and the Tier-B keystone (B0) are shipped. C2a is fully
-shipped (including absolute-pixel anchors and a namespace-aware
+Tier-A, the Tier-B keystone (B0), and **B1 Workbook overlay are
+fully shipped** — every iter (wb-1 typed parsers, wb-2 read-only
+roots, wb-3 `Workbook.fromBook`, wb-4 setCell over 5 CellValue
+variants + Workbook.save, wb-5 view ergonomics, wb-6 RSS gate)
+landed across PRs #21-#31. iter-wb-6's RSS ratio went from 44× →
+0.78× (Workbook now uses LESS resident memory than `Book.openLazy`)
+via two perf passes: PR #30 deferred decompression, PR #31 dropped
+the file slurp in favour of seek+readAll on demand.
+
+C2a is fully shipped (image + chart anchors + namespace-aware
 drawing parser — multi-prefix bindings, full XML scope tracking
 for closed siblings, comment / CDATA / PI awareness, quote-aware
 attribute scanning, O(n) flat under adversarial input). addPart
-shipped on PartStore. C1 milestone 1 (formula tokenizer +
-loss-preserving printer) shipped.
+shipped on PartStore. C1 M1 (formula tokenizer + loss-preserving
+printer) shipped; **C1 M2 milestone 1 (A1 cell-formula rewriter)
+shipped 2026-05-02 in PR #32** as a pure-function `rewriteFormula`
+on `src/formula/rewriter.zig` — `Workbook.rewriteReferences(edit)`
+wiring still pending.
 
 Greenfield writer surface is feature-complete for non-image
 workbooks: cells, formulas, styles, validations, conditional
@@ -48,16 +59,18 @@ wraparound).
 | **B0 M2** PartStore byte-preserving save + replacePart | ✅ shipped (incl. data-descriptor preservation) |
 | **B0 M2.5** replacePart deflate-encoded overrides | ✅ shipped |
 | **B0 addPart** Append a new part with content-type registration | ✅ shipped (atomic on allocation failure, XML-escapes attribute values, stays sentinel-safe) |
-| **B0 M3** Typed overlays for known parts | ⏳ pending — consolidated into B1 iter-wb-1 ([plan](workbook-overlay.md)) |
+| **B0 M3** Typed overlays for known parts | ✅ shipped — consolidated into B1 iter-wb-1 (PR #21) |
 | **B0 hardening** ZIP32 sentinel safety, eager CRC32, CDFH bounds, ZIP-bomb caps, split-archive rejection, XML-entity round-trip in [Content_Types] + .rels (named + numeric), external-rel filter | ✅ shipped |
-| **B1** Workbook typed overlay | ⏳ pending (~6–10 weeks) — [plan drafted](workbook-overlay.md) |
+| **B0 perf** Lazy decompress + file-streaming | ✅ shipped (PRs #30 + #31 — `PartStore.open` no longer slurps the file or eagerly decompresses; payloads stream from disk via seek + readAll on first `part(name)` access) |
+| **B1** Workbook typed overlay | ✅ shipped — [plan](workbook-overlay.md), PRs #21–#28, #30, #31. RSS gate green at 0.78× (ceiling 1.5×). |
 | **B2** Editor rebase onto Workbook | ⏳ pending |
 | **B3** Writer rebase onto Workbook | ⏳ pending |
 | **B-fuzz** Coverage-guided fuzz nightly | ✅ shipped (reader + package layer fuzz binaries on ubuntu-22.04 nightly) |
 | **C2a** Object extraction (images / charts / opaque) | ✅ shipped: image + chart anchors + series refs + Strict OOXML content-type detection + `<xdr:absoluteAnchor>` pixel-coordinate parsing (`absolute: ?AbsoluteAnchor`). Namespace handling is comprehensive: multi-prefix tracking (xdr_alts list, same-URI preference, late-declared bindings via full-document scan), proper XML scope (closed self-closing AND container siblings don't leak bindings, depth counter for nesting), in-scope local-binding authority (root fallback only when no local), per-tag chart-element verification (no false matches from unused declarations), comment/CDATA/PI awareness everywhere (forward state machine, fake-markup filtering, quote-aware tag-end + attribute-value scanning, candidate filtering at source), O(n) flat under adversarial input. |
-| **C2b** addImage | ⏳ pending (depends on B1; addPart unblocks the part-injection half) |
+| **C2b** addImage | ⏳ pending (B1 dependency now satisfied; subagent attempt 2026-05-02 stalled on OOXML emit complexity, deferred for a focused future iter) |
 | **C1 M1** Formula tokenizer + loss-preserving printer | ✅ shipped (`src/formula/tokenizer.zig` — A1 refs incl. case-insensitive, sheet qualifiers, ranges, names, function-call disambiguation, number/string/bool/error literals, every operator, array constants, whitespace preserved, external-wb refs as `.unknown`) |
-| **C1 M2+** Formula rewriter (cells/DV/CF/names/hyperlinks) | ⏳ pending |
+| **C1 M2 m1** A1 cell-formula rewriter (`rewriteFormula`) | ✅ shipped (PR #32 — `src/formula/rewriter.zig`; insert/delete rows/cols + `rename_sheet`; absolute-marker preservation; `target_sheet`-scoped bare refs; range collapse to `#REF!`; 20 inline tests + `checkAllAllocationFailures`) |
+| **C1 M2 m2+** DV / CF / defined-names / hyperlink rewriters + Workbook.rewriteReferences wiring | ⏳ pending |
 | **D1** Formula evaluator | deferred indefinitely |
 | **D2** Typed chart emit | deferred |
 

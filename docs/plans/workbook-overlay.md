@@ -8,14 +8,14 @@
 > B2 (Editor rebase) and B3 (Writer rebase) follow once this layer
 > is bedded down.
 
-## Status
+## Status (as of 2026-05-02 — tier complete)
 
-- iter-wb-1 (typed-overlay handles on PartStore) — ⏳ pending
-- iter-wb-2 (Workbook + Worksheet root types, read-only) — ⏳ pending
-- iter-wb-3 (`Book.toWorkbook(options)` adapter) — ⏳ pending
-- iter-wb-4 (Worksheet mutation surface + delta-emit save) — ⏳ pending
-- iter-wb-5 (workbook-level state views — SST / styles / defined names) — ⏳ pending
-- iter-wb-6 (RSS gate + corpus parity sweep) — ⏳ pending
+- iter-wb-1 (typed-overlay handles on PartStore) — ✅ shipped (PR #21, 5 typed parsers + 44 inline tests + corpus sweep, ~4181 LOC)
+- iter-wb-2 (Workbook + Worksheet root types, read-only) — ✅ shipped (PR #22)
+- iter-wb-3 (`Workbook.fromBook(book, path)` adapter — Book-side `toWorkbook` shim skipped to avoid a circular module dep) — ✅ shipped (PR #29)
+- iter-wb-4 (Worksheet mutation surface + delta-emit save) — ✅ shipped across m1+m2+m3+m4 (PRs #24-#27): `setCell` for blank / number / boolean / string (inlineStr) / formula / shared_string + `Workbook.save` byte-preserving outside `<sheetData>` + SST extension (creates `xl/sharedStrings.xml` when absent)
+- iter-wb-5 (workbook-level state views — defined-names scope, sstText, cellByRef) — ✅ shipped (PR #23)
+- iter-wb-6 (RSS gate + corpus parity sweep) — ✅ shipped (PR #28 measurement infra; gate closed at 0.78× via PRs #30 deferred-decompress + #31 file-streaming PartStore)
 
 ## Problem
 
