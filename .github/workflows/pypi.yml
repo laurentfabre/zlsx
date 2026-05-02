@@ -59,7 +59,7 @@ jobs:
           curl -fsSL "https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz" | tar -xJ
           echo "$PWD/zig-x86_64-linux-0.15.2" >> "$GITHUB_PATH"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -87,7 +87,7 @@ jobs:
 
       - name: Upload wheel to the GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: bindings/python/dist/*.whl
           fail_on_unmatched_files: true
