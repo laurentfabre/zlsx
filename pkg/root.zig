@@ -45,3 +45,10 @@ const workbook_mod = @import("workbook.zig");
 pub const Workbook = workbook_mod.Workbook;
 pub const Worksheet = workbook_mod.Worksheet;
 pub const WorkbookError = workbook_mod.Error;
+
+/// Greenfield drawing-emit surface (B1 iter-wb-c2b). Re-exported so
+/// callers can spell `pkg.ImageMime`, `pkg.ImageCellAnchor` without
+/// reaching into `drawing_emit` directly.
+const drawing_emit_mod = @import("drawing_emit.zig");
+pub const ImageMime = drawing_emit_mod.ImageMime;
+pub const ImageCellAnchor = drawing_emit_mod.ImageCellAnchor;

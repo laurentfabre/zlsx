@@ -31,6 +31,7 @@ const assert = std.debug.assert;
 const store_mod = @import("store.zig");
 const typed_parts = @import("typed_parts/root.zig");
 const zlsx = @import("zlsx");
+const drawing_emit = @import("drawing_emit.zig");
 
 const PartStore = store_mod.PartStore;
 
@@ -83,6 +84,23 @@ pub const Error = error{
     /// future iters may share bytes via PartStore-from-bytes.
     SheetCountMismatch,
     WriteFailed,
+    /// `Workbook.addImage` v1 rejects sheets that already carry a
+    /// `<drawing>` element. Multi-image / drawing-extension lands in
+    /// a follow-up iter.
+    SheetHasExistingDrawing,
+    /// Image bytes' magic header didn't match the declared `mime`.
+    MimeMagicMismatch,
+    /// Image anchor had a 0 row or 0 col (OOXML is 1-based).
+    InvalidAnchor,
+    /// Empty image buffer.
+    EmptyImage,
+    /// `xl/worksheets/_rels/sheetN.xml.rels` exists but lacks the
+    /// closing `</Relationships>` tag — refused rather than producing
+    /// an unparseable rels part.
+    MalformedSheetRels,
+    /// Sheet XML is missing its closing `</worksheet>` tag — refused
+    /// rather than producing an unparseable sheet part.
+    MalformedSheetXml,
 } || workbook_xml_mod.Error || sheet_xml_mod.ParseError || sst_xml_mod.Error || styles_xml_mod.Error || store_mod.Error ||
     zlsx.formula_rewriter.Error ||
     std.fs.File.WriteError || std.fs.File.OpenError || std.fs.Dir.RenameError || std.fs.Dir.StatFileError;
@@ -598,6 +616,176 @@ pub const Workbook = struct {
         // Postcondition: the in-memory view now reports the new name.
         assert(sheet_idx < self.workbook.sheets.len);
         assert(std.mem.eql(u8, self.workbook.sheets[sheet_idx].name, new_name));
+    }
+
+    /// Embed `bytes` (PNG/JPEG/GIF, declared via `mime`) as an image
+    /// pinned to `cell_anchor` on the sheet at `sheet_idx`. v1 ships a
+    /// MINIMAL surface:
+    ///   - one image per call
+    ///   - `oneCellAnchor` only (top-left pinned at zero pixel offset)
+    ///   - fixed 1-inch × 1-inch extent (914 400 × 914 400 EMU)
+    ///   - `cell_anchor` is 1-based `(col, row)` — col first matches
+    ///     OOXML drawing wire format
+    ///
+    /// Sheets that already carry a `<drawing>` element are rejected
+    /// with `error.SheetHasExistingDrawing`. Range-anchor, pixel
+    /// offsets, and native-size extent ship in follow-up iters.
+    ///
+    /// The mutation commits to the in-memory PartStore immediately
+    /// (image bytes, drawing part, drawing rels, sheet XML splice,
+    /// sheet rels). `Workbook.save` writes the archive to disk.
+    pub fn addImage(
+        self: *Workbook,
+        sheet_idx: u32,
+        cell_anchor: drawing_emit.ImageCellAnchor,
+        bytes: []const u8,
+        mime: drawing_emit.ImageMime,
+    ) Error!void {
+        if (sheet_idx >= self.sheetCount()) return error.SheetIndexOutOfRange;
+        if (cell_anchor.col == 0 or cell_anchor.row == 0) return error.InvalidAnchor;
+
+        // Reject mime/byte mismatch up front. Costs O(8) bytes; saves
+        // a "broken image" round-trip in Office.
+        try drawing_emit.validateMagic(mime, bytes);
+
+        const ws = try self.sheet(sheet_idx);
+        // ensureParsed populates resolved_part_name, which we need to
+        // derive the sheet rels file path. (Side effect: parses sheet
+        // XML once; subsequent reads of the source bytes go through
+        // `store.part(part_name)` which returns the underlying ZIP
+        // payload — so the splice below sees pre-mutation bytes.)
+        _ = try ws.ensureParsed();
+        const sheet_part_name = ws.resolved_part_name.?;
+        assert(std.mem.startsWith(u8, sheet_part_name, "xl/worksheets/"));
+        assert(std.mem.endsWith(u8, sheet_part_name, ".xml"));
+
+        // Reject sheets that already have a drawing. Substring check
+        // is good-enough as a pre-filter: a `<drawing` token only
+        // appears at the worksheet level on a sheet that's already
+        // wired one up. (Cell content is XML-escaped; the only place
+        // the literal substring could land is in a comment, which
+        // OOXML producers don't emit at the worksheet level.)
+        const sheet_part = (try self.store.part(sheet_part_name)) orelse
+            return error.MissingSheetPart;
+        if (std.mem.indexOf(u8, sheet_part.bytes, "<drawing ") != null or
+            std.mem.indexOf(u8, sheet_part.bytes, "<drawing/>") != null or
+            std.mem.indexOf(u8, sheet_part.bytes, "<drawing>") != null)
+        {
+            return error.SheetHasExistingDrawing;
+        }
+
+        const a = self.allocator;
+
+        // Derive part-name slots. We don't gap-fill: bumping past the
+        // highest seen N keeps the result stable across saves.
+        const image_n = drawing_emit.nextFreeNumber(&self.store, "xl/media/image", "");
+        const drawing_n = drawing_emit.nextFreeNumber(&self.store, "xl/drawings/drawing", ".xml");
+
+        const ext = mime.extension();
+        // Compose part names. Free at function-exit; addPart dupes
+        // its arguments into PartStore's arena.
+        const image_basename = try std.fmt.allocPrint(a, "image{d}.{s}", .{ image_n, ext });
+        defer a.free(image_basename);
+        const image_part_name = try std.fmt.allocPrint(a, "xl/media/{s}", .{image_basename});
+        defer a.free(image_part_name);
+
+        const drawing_basename = try std.fmt.allocPrint(a, "drawing{d}.xml", .{drawing_n});
+        defer a.free(drawing_basename);
+        const drawing_part_name = try std.fmt.allocPrint(a, "xl/drawings/{s}", .{drawing_basename});
+        defer a.free(drawing_part_name);
+
+        const drawing_rels_part_name = try std.fmt.allocPrint(
+            a,
+            "xl/drawings/_rels/drawing{d}.xml.rels",
+            .{drawing_n},
+        );
+        defer a.free(drawing_rels_part_name);
+
+        // Sheet rels file path = `xl/worksheets/_rels/<basename>.rels`.
+        const sheet_basename = sheet_part_name["xl/worksheets/".len..];
+        const sheet_rels_part_name = try std.fmt.allocPrint(
+            a,
+            "xl/worksheets/_rels/{s}.rels",
+            .{sheet_basename},
+        );
+        defer a.free(sheet_rels_part_name);
+
+        // Build the drawing artifacts.
+        const drawing_xml = try drawing_emit.buildDrawingXml(a, cell_anchor);
+        defer a.free(drawing_xml);
+
+        const drawing_rels_xml = try drawing_emit.buildDrawingRels(a, image_basename);
+        defer a.free(drawing_rels_xml);
+
+        // Pick `rId` for the sheet's drawing rel. New rels file → rId1;
+        // existing → next free.
+        const sheet_rels_existing = self.store.rels(sheet_part_name);
+        const rid_n = drawing_emit.nextFreeRelId(sheet_rels_existing);
+        var rid_buf: [16]u8 = undefined;
+        const rid = try std.fmt.bufPrint(&rid_buf, "rId{d}", .{rid_n});
+
+        // Build the sheet rels (fresh or appended). Doing this BEFORE
+        // any addPart/replacePart so a later addPart failure (OOM, Zip
+        // size cap) leaves the store unchanged.
+        const sheet_rels_part = try self.store.part(sheet_rels_part_name);
+        const new_sheet_rels_xml: []u8 = if (sheet_rels_part) |p|
+            try drawing_emit.appendRelationship(a, p.bytes, drawing_basename, rid)
+        else
+            try drawing_emit.buildFreshSheetRels(a, drawing_basename, rid);
+        defer a.free(new_sheet_rels_xml);
+
+        // Build the patched sheet XML (appends `<drawing r:id=...>`).
+        const new_sheet_xml = try drawing_emit.appendDrawingElementToSheet(
+            a,
+            sheet_part.bytes,
+            rid,
+        );
+        defer a.free(new_sheet_xml);
+
+        // ─── Mutate the PartStore. ──────────────────────────────────
+        // Order:
+        //   1. addPart image bytes
+        //   2. addPart drawing XML
+        //   3. addPart drawing rels
+        //   4. replace/add sheet rels
+        //   5. replacePart sheet XML
+        // We can't be perfectly atomic across these — each call
+        // mutates store state — but ordering image+drawing+rels first
+        // keeps the workbook consistent right up to step 5: until
+        // the sheet XML references the drawing, no consumer sees the
+        // partial wiring.
+        try self.store.addPart(image_part_name, mime.contentType(), bytes);
+        try self.store.addPart(
+            drawing_part_name,
+            "application/vnd.openxmlformats-officedocument.drawing+xml",
+            drawing_xml,
+        );
+        try self.store.addPart(
+            drawing_rels_part_name,
+            "application/vnd.openxmlformats-package.relationships+xml",
+            drawing_rels_xml,
+        );
+        if (sheet_rels_part != null) {
+            try self.store.replacePart(sheet_rels_part_name, new_sheet_rels_xml);
+        } else {
+            try self.store.addPart(
+                sheet_rels_part_name,
+                "application/vnd.openxmlformats-package.relationships+xml",
+                new_sheet_rels_xml,
+            );
+        }
+        try self.store.replacePart(sheet_part_name, new_sheet_xml);
+
+        // The cached SheetXml view borrowed from the now-stale source
+        // bytes. Invalidate so subsequent reads re-parse from the
+        // patched XML. (The PartStore arena retains the prior bytes,
+        // so the borrowed slices in `parsed` would still be readable
+        // — but logically they're stale, so we drop them.)
+        if (ws.parsed) |*v| {
+            var view = v.*;
+            view.deinit(self.allocator);
+            ws.parsed = null;
+        }
     }
 
     /// Case-insensitive ASCII duplicate check. Skips the slot at
@@ -2907,4 +3095,159 @@ test "Workbook.renameSheet: no-op when new_name equals current name" {
     defer std.testing.allocator.free(before);
     try wb.renameSheet(0, before);
     try std.testing.expectEqualStrings(before, (try wb.sheet(0)).name());
+}
+
+// ─── addImage tests ───────────────────────────────────────────────────
+
+/// Canonical 1×1 transparent PNG (~70 bytes). Sufficient for round-
+/// trip testing — Office's image decoders accept the minimal IHDR /
+/// IDAT / IEND envelope.
+const tiny_png_1x1 = [_]u8{
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+    0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x00, 0x00, 0x00, 0x00, 0x3A, 0x7E, 0x9B,
+    0x55, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41,
+    0x54, 0x78, 0x9C, 0x63, 0x00, 0x00, 0x00, 0x02,
+    0x00, 0x01, 0xE2, 0x21, 0xBC, 0x33, 0x00, 0x00,
+    0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
+    0x60, 0x82,
+};
+
+test "Workbook.addImage: round-trips PNG into a drawing-less workbook" {
+    const allocator = std.testing.allocator;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var src_buf: [128]u8 = undefined;
+    const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-addimg-src-{d}.xlsx", .{prng.random().int(u32)});
+    try writeMinimalSstLessXlsx(allocator, src_path);
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+
+    var dst_buf: [128]u8 = undefined;
+    const dst_path = try std.fmt.bufPrint(&dst_buf, ".zig-cache/test-addimg-dst-{d}.xlsx", .{prng.random().int(u32)});
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+
+    {
+        var wb = try Workbook.open(allocator, src_path);
+        defer wb.deinit();
+        try wb.addImage(0, .{ .col = 1, .row = 1 }, &tiny_png_1x1, .png);
+        try wb.save(dst_path);
+    }
+
+    // Re-open the saved file via PartStore directly and verify wiring.
+    var store = try PartStore.open(allocator, dst_path);
+    defer store.deinit();
+
+    const image_part = try store.part("xl/media/image1.png");
+    try std.testing.expect(image_part != null);
+    try std.testing.expectEqualSlices(u8, &tiny_png_1x1, image_part.?.bytes);
+
+    const drawing_part = try store.part("xl/drawings/drawing1.xml");
+    try std.testing.expect(drawing_part != null);
+    try std.testing.expect(std.mem.indexOf(u8, drawing_part.?.bytes, "<xdr:oneCellAnchor>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, drawing_part.?.bytes, "<xdr:col>0</xdr:col>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, drawing_part.?.bytes, "<xdr:row>0</xdr:row>") != null);
+
+    const drawing_rels_part = try store.part("xl/drawings/_rels/drawing1.xml.rels");
+    try std.testing.expect(drawing_rels_part != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        drawing_rels_part.?.bytes,
+        "Target=\"../media/image1.png\"",
+    ) != null);
+
+    const sheet_rels_part = try store.part("xl/worksheets/_rels/sheet1.xml.rels");
+    try std.testing.expect(sheet_rels_part != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        sheet_rels_part.?.bytes,
+        "Target=\"../drawings/drawing1.xml\"",
+    ) != null);
+
+    const sheet_part = try store.part("xl/worksheets/sheet1.xml");
+    try std.testing.expect(sheet_part != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_part.?.bytes, "<drawing r:id=") != null);
+
+    const ct_part = try store.part("[Content_Types].xml");
+    try std.testing.expect(ct_part != null);
+    try std.testing.expect(std.mem.indexOf(u8, ct_part.?.bytes, "image/png") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        ct_part.?.bytes,
+        "application/vnd.openxmlformats-officedocument.drawing+xml",
+    ) != null);
+}
+
+test "Workbook.addImage: PNG declared but JPEG bytes errors MimeMagicMismatch" {
+    const allocator = std.testing.allocator;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var src_buf: [128]u8 = undefined;
+    const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-addimg-mime-{d}.xlsx", .{prng.random().int(u32)});
+    try writeMinimalSstLessXlsx(allocator, src_path);
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+
+    var wb = try Workbook.open(allocator, src_path);
+    defer wb.deinit();
+
+    const fake_jpeg = [_]u8{ 0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10 };
+    try std.testing.expectError(
+        error.MimeMagicMismatch,
+        wb.addImage(0, .{ .col = 1, .row = 1 }, &fake_jpeg, .png),
+    );
+}
+
+test "Workbook.addImage: rejects sheet that already has a drawing" {
+    const allocator = std.testing.allocator;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var src_buf: [128]u8 = undefined;
+    const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-addimg-existing-{d}.xlsx", .{prng.random().int(u32)});
+    try writeMinimalSstLessXlsx(allocator, src_path);
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+
+    var dst_buf: [128]u8 = undefined;
+    const dst_path = try std.fmt.bufPrint(&dst_buf, ".zig-cache/test-addimg-existing-dst-{d}.xlsx", .{prng.random().int(u32)});
+    defer std.fs.cwd().deleteFile(dst_path) catch {};
+
+    // Stage 1: add an image and save.
+    {
+        var wb = try Workbook.open(allocator, src_path);
+        defer wb.deinit();
+        try wb.addImage(0, .{ .col = 1, .row = 1 }, &tiny_png_1x1, .png);
+        try wb.save(dst_path);
+    }
+
+    // Stage 2: re-open and try to add a second image to the same
+    // sheet — must fail with SheetHasExistingDrawing.
+    {
+        var wb2 = try Workbook.open(allocator, dst_path);
+        defer wb2.deinit();
+        try std.testing.expectError(
+            error.SheetHasExistingDrawing,
+            wb2.addImage(0, .{ .col = 2, .row = 2 }, &tiny_png_1x1, .png),
+        );
+    }
+}
+
+test "Workbook.addImage: rejects 0-based anchor with InvalidAnchor" {
+    const allocator = std.testing.allocator;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var src_buf: [128]u8 = undefined;
+    const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-addimg-anchor-{d}.xlsx", .{prng.random().int(u32)});
+    try writeMinimalSstLessXlsx(allocator, src_path);
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+
+    var wb = try Workbook.open(allocator, src_path);
+    defer wb.deinit();
+
+    try std.testing.expectError(
+        error.InvalidAnchor,
+        wb.addImage(0, .{ .col = 0, .row = 1 }, &tiny_png_1x1, .png),
+    );
+    try std.testing.expectError(
+        error.InvalidAnchor,
+        wb.addImage(0, .{ .col = 1, .row = 0 }, &tiny_png_1x1, .png),
+    );
 }
