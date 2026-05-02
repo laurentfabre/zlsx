@@ -462,6 +462,141 @@ pub const Workbook = struct {
         try self.store.save(path);
     }
 
+    /// Apply a structural-edit rewrite to every `<dataValidation>`
+    /// formula1/formula2 and every `<cfRule>` formula across every
+    /// sheet, persisting the result in-place via `store.replacePart`.
+    /// Returns the count of formula *bodies* whose rewrite produced
+    /// different bytes (so a DV with both formula1 and formula2
+    /// changed counts as 2; an unchanged body — including a no-op
+    /// shift — counts 0).
+    ///
+    /// `target_sheet` scopes the edit the same way as
+    /// `RewriteContext.target_sheet`: when non-null, only refs that
+    /// resolve to that sheet (bare refs on a matching `on_sheet`, or
+    /// sheet-qualified refs naming `target_sheet`) shift. `null`
+    /// means "apply everywhere".
+    ///
+    /// **Persistence model.** This emits patched sheet XML bytes
+    /// *immediately* via `PartStore.replacePart`. It does NOT use the
+    /// `Workbook.save`-deltas pipeline (DV/CF aren't cell mutations).
+    /// Run this BEFORE `Workbook.save` if a save also has pending
+    /// `setCell` deltas — `save` re-fetches part bytes per sheet, so
+    /// it sees the patched DV/CF blocks and preserves them in its
+    /// own splice. The cached `SheetXml` view is invalidated
+    /// (`parsed = null`) for any sheet rewritten here, matching the
+    /// invalidation contract used by `save`.
+    ///
+    /// **Splice strategy.** Patches the formula inner text in place,
+    /// byte-for-byte, inside each `<formula1>`, `<formula2>`, and
+    /// CF `<formula>` element whose body the rewriter changed. Every
+    /// surrounding attribute (`errorTitle`, `error`, `prompt`,
+    /// `xr:uid`, `dxf_id`, `priority`, `operator`, etc.) is preserved
+    /// verbatim — we never regenerate the DV/CF block from the typed
+    /// view, which would lose any trivia the parser doesn't expose.
+    ///
+    /// **Body counting.** Each formula body that produces different
+    /// bytes counts once. So a CF `D1+E1` rewritten to `E1+F1` (one
+    /// body, two refs shifted) is one rewrite, not two.
+    pub fn rewriteAllValidationsAndConditionalFormats(
+        self: *Workbook,
+        edit: zlsx.formula_rewriter.RewriteEdit,
+        target_sheet: ?[]const u8,
+    ) Error!u32 {
+        var count: u32 = 0;
+        const a = self.allocator;
+
+        var sheet_idx: u32 = 0;
+        while (sheet_idx < self.sheetCount()) : (sheet_idx += 1) {
+            const ws = try self.sheet(sheet_idx);
+            const view = try ws.ensureParsed();
+            const ws_name = ws.name();
+            const part_name = ws.resolved_part_name.?;
+
+            // Two phases. Phase A: rewrite each DV/CF formula body
+            // against the typed view, building an indexed plan
+            // (DV index, CF index) keyed by the *position in the
+            // view* — NOT source-byte offsets, since typed view
+            // slices borrow from the parser's sanitized buffer, not
+            // from `source`. Phase B walks the source XML and re-
+            // locates each `<formula1>` / `<formula2>` / `<formula>`
+            // body in lockstep with the view, splicing where the plan
+            // says so.
+            var dv_f1_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};
+            var dv_f2_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};
+            var cf_f_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};
+            defer {
+                var it1 = dv_f1_new.iterator();
+                while (it1.next()) |e| a.free(e.value_ptr.*);
+                dv_f1_new.deinit(a);
+                var it2 = dv_f2_new.iterator();
+                while (it2.next()) |e| a.free(e.value_ptr.*);
+                dv_f2_new.deinit(a);
+                var it3 = cf_f_new.iterator();
+                while (it3.next()) |e| a.free(e.value_ptr.*);
+                cf_f_new.deinit(a);
+            }
+
+            for (view.validations, 0..) |dv, i| {
+                if (dv.formula1) |f| {
+                    if (try maybeRewrite(a, f, ws_name, target_sheet, edit)) |new| {
+                        errdefer a.free(new);
+                        try dv_f1_new.put(a, i, new);
+                    }
+                }
+                if (dv.formula2) |f| {
+                    if (try maybeRewrite(a, f, ws_name, target_sheet, edit)) |new| {
+                        errdefer a.free(new);
+                        try dv_f2_new.put(a, i, new);
+                    }
+                }
+            }
+            for (view.conditional_formats, 0..) |cf, j| {
+                if (cf.formula) |f| {
+                    if (try maybeRewrite(a, f, ws_name, target_sheet, edit)) |new| {
+                        errdefer a.free(new);
+                        try cf_f_new.put(a, j, new);
+                    }
+                }
+            }
+
+            const total = dv_f1_new.count() + dv_f2_new.count() + cf_f_new.count();
+            if (total == 0) continue;
+
+            // Phase B: walk source XML, build patch list of source-
+            // byte spans (start, end, replacement). Then linear-splice.
+            const source = blk: {
+                const p = try self.store.part(part_name) orelse return error.MissingSheetPart;
+                break :blk p.bytes;
+            };
+            assert(source.len > 0);
+
+            var patches: std.ArrayList(SourcePatch) = .empty;
+            defer patches.deinit(a);
+            try collectDvCfPatches(a, source, &patches, &dv_f1_new, &dv_f2_new, &cf_f_new);
+
+            // Sanity: every queued rewrite should have located a
+            // splice site in the source (typed view and source share
+            // document order; a missing site means the source was
+            // mutated under us, which is a `replacePart`-ordering bug).
+            assert(patches.items.len == total);
+
+            const new_xml = try spliceFormulas(a, source, patches.items);
+            defer a.free(new_xml);
+
+            try self.store.replacePart(part_name, new_xml);
+            count += @intCast(total);
+
+            // Invalidate the cached parsed view: its leaves borrowed
+            // from the old part bytes which `replacePart` swapped.
+            // Mirrors the invalidation pattern in `Workbook.save`.
+            var stale = ws.parsed.?;
+            stale.deinit(self.allocator);
+            ws.parsed = null;
+        }
+
+        return count;
+    }
+
     /// Apply a structural-edit rewrite to every formula in every
     /// sheet. Walks each worksheet, materializes its SheetXml, runs
     /// `zlsx.formula_rewriter.rewriteFormula` on each cell that has
@@ -1926,6 +2061,266 @@ fn appendXmlEscapedText(allocator: Allocator, out: *std.ArrayList(u8), text: []c
     }
 }
 
+/// Run the formula rewriter; return the rewritten bytes only when
+/// they differ from the original. Caller owns the returned buffer
+/// (allocator.free). On byte-identical output we free internally and
+/// return null — the splice loop skips it. Helper for
+/// `Workbook.rewriteAllValidationsAndConditionalFormats`.
+fn maybeRewrite(
+    a: Allocator,
+    body: []const u8,
+    on_sheet: ?[]const u8,
+    target_sheet: ?[]const u8,
+    edit: zlsx.formula_rewriter.RewriteEdit,
+) Error!?[]u8 {
+    if (body.len == 0) return null;
+    const ctx = zlsx.formula_rewriter.RewriteContext{
+        .on_sheet = on_sheet,
+        .target_sheet = target_sheet,
+        .edit = edit,
+    };
+    const rewritten = try zlsx.formula_rewriter.rewriteFormula(a, body, ctx);
+    if (std.mem.eql(u8, rewritten, body)) {
+        a.free(rewritten);
+        return null;
+    }
+    return rewritten;
+}
+
+/// Per-formula splice patch in source-byte space. `[start..end]` is
+/// the inner-text span of a `<formula1>` / `<formula2>` / `<formula>`
+/// element inside the source sheet XML; `new` replaces those bytes.
+const SourcePatch = struct { start: usize, end: usize, new: []const u8 };
+
+/// Walk the source sheet XML in document order and locate each
+/// formula body whose typed-view counterpart was rewritten. Appends
+/// one `SourcePatch` per planned splice. Document order is the
+/// invariant linking typed-view indices to source occurrences:
+/// `parseValidations` and `parseConditionalFormats` iterate the
+/// source linearly without re-ordering, so the Nth `<formula1>`
+/// inside `<dataValidations>` corresponds to `view.validations[N]`'s
+/// `formula1`, etc.
+///
+/// Helper used only by
+/// `Workbook.rewriteAllValidationsAndConditionalFormats`.
+fn collectDvCfPatches(
+    a: Allocator,
+    source: []const u8,
+    out: *std.ArrayList(SourcePatch),
+    dv_f1_new: *const std.AutoHashMapUnmanaged(usize, []u8),
+    dv_f2_new: *const std.AutoHashMapUnmanaged(usize, []u8),
+    cf_f_new: *const std.AutoHashMapUnmanaged(usize, []u8),
+) Error!void {
+    assert(source.len > 0);
+
+    // ─── DV walk ────────────────────────────────────────────────────
+    if (dv_f1_new.count() + dv_f2_new.count() > 0) {
+        if (std.mem.indexOf(u8, source, "<dataValidations")) |dv_open| {
+            const dv_open_gt = std.mem.indexOfScalarPos(u8, source, dv_open, '>') orelse
+                return error.NoSheetData;
+            const self_closing = dv_open_gt > 0 and source[dv_open_gt - 1] == '/';
+            if (!self_closing) {
+                const dv_close = std.mem.indexOfPos(u8, source, dv_open_gt, "</dataValidations>") orelse
+                    return error.NoSheetData;
+                const block_lo = dv_open_gt + 1;
+                const block_hi = dv_close;
+                var probe: usize = block_lo;
+                var dv_idx: usize = 0;
+                while (probe < block_hi) {
+                    const e_open = std.mem.indexOfPos(u8, source, probe, "<dataValidation") orelse break;
+                    if (e_open >= block_hi) break;
+                    const after = e_open + "<dataValidation".len;
+                    if (after >= source.len) break;
+                    const sep = source[after];
+                    if (sep != ' ' and sep != '\t' and sep != '\n' and sep != '\r' and sep != '/' and sep != '>') {
+                        probe = after;
+                        continue;
+                    }
+                    const e_open_gt = std.mem.indexOfScalarPos(u8, source, e_open, '>') orelse
+                        return error.NoSheetData;
+                    const e_self_closing = e_open_gt > 0 and source[e_open_gt - 1] == '/';
+                    var elem_hi: usize = undefined;
+                    if (e_self_closing) {
+                        elem_hi = e_open_gt + 1;
+                        probe = elem_hi;
+                    } else {
+                        const e_close = std.mem.indexOfPos(u8, source, e_open_gt, "</dataValidation>") orelse
+                            return error.NoSheetData;
+                        elem_hi = e_close;
+                        probe = e_close + "</dataValidation>".len;
+
+                        const body_lo = e_open_gt + 1;
+                        const body_hi = elem_hi;
+                        if (dv_f1_new.get(dv_idx)) |new1| {
+                            if (findInnerSpan(source, body_lo, body_hi, "<formula1", "</formula1>")) |span| {
+                                try out.append(a, .{ .start = span[0], .end = span[1], .new = new1 });
+                            }
+                        }
+                        if (dv_f2_new.get(dv_idx)) |new2| {
+                            if (findInnerSpan(source, body_lo, body_hi, "<formula2", "</formula2>")) |span| {
+                                try out.append(a, .{ .start = span[0], .end = span[1], .new = new2 });
+                            }
+                        }
+                    }
+                    dv_idx += 1;
+                }
+            }
+        }
+    }
+
+    // ─── CF walk ────────────────────────────────────────────────────
+    if (cf_f_new.count() > 0) {
+        var probe: usize = 0;
+        var cf_idx: usize = 0;
+        while (std.mem.indexOfPos(u8, source, probe, "<conditionalFormatting")) |cf_open| {
+            const after = cf_open + "<conditionalFormatting".len;
+            if (after >= source.len) break;
+            const sep = source[after];
+            if (sep != ' ' and sep != '\t' and sep != '\n' and sep != '\r' and sep != '/' and sep != '>') {
+                probe = after;
+                continue;
+            }
+            const cf_open_gt = std.mem.indexOfScalarPos(u8, source, cf_open, '>') orelse
+                return error.NoSheetData;
+            const cf_self_closing = cf_open_gt > 0 and source[cf_open_gt - 1] == '/';
+            if (cf_self_closing) {
+                probe = cf_open_gt + 1;
+                continue;
+            }
+            const cf_close = std.mem.indexOfPos(u8, source, cf_open_gt, "</conditionalFormatting>") orelse
+                return error.NoSheetData;
+            const cf_body_lo = cf_open_gt + 1;
+            const cf_body_hi = cf_close;
+            probe = cf_close + "</conditionalFormatting>".len;
+
+            // Walk each <cfRule> in this group. Each rule advances
+            // cf_idx by one, matching parseConditionalFormats's order.
+            var r_probe: usize = cf_body_lo;
+            while (r_probe < cf_body_hi) {
+                const r_open = std.mem.indexOfPos(u8, source, r_probe, "<cfRule") orelse break;
+                if (r_open >= cf_body_hi) break;
+                const r_after = r_open + "<cfRule".len;
+                if (r_after >= source.len) break;
+                const r_sep = source[r_after];
+                if (r_sep != ' ' and r_sep != '\t' and r_sep != '\n' and r_sep != '\r' and r_sep != '/' and r_sep != '>') {
+                    r_probe = r_after;
+                    continue;
+                }
+                const r_open_gt = std.mem.indexOfScalarPos(u8, source, r_open, '>') orelse
+                    return error.NoSheetData;
+                const r_self_closing = r_open_gt > 0 and source[r_open_gt - 1] == '/';
+                if (r_self_closing) {
+                    // No body — no formula to splice. Still advance idx.
+                    cf_idx += 1;
+                    r_probe = r_open_gt + 1;
+                    continue;
+                }
+                const r_close = std.mem.indexOfPos(u8, source, r_open_gt, "</cfRule>") orelse
+                    return error.NoSheetData;
+                const r_body_lo = r_open_gt + 1;
+                const r_body_hi = r_close;
+                r_probe = r_close + "</cfRule>".len;
+
+                if (cf_f_new.get(cf_idx)) |new_f| {
+                    if (findInnerSpan(source, r_body_lo, r_body_hi, "<formula", "</formula>")) |span| {
+                        try out.append(a, .{ .start = span[0], .end = span[1], .new = new_f });
+                    }
+                }
+                cf_idx += 1;
+            }
+        }
+    }
+}
+
+/// Locate the inner-text span of `<tag …>BODY</close>` within
+/// `source[lo..hi]`. Returns `[body_lo, body_hi]` (the BODY span),
+/// or null if either tag is missing in that range. `open_prefix` is
+/// the opening-tag prefix without `>` (e.g. "<formula1") so we match
+/// both `<formula1>` and `<formula1 attr="…">`. The `<formula` /
+/// `<formula1` disambiguation is handled by the caller's choice of
+/// `open_prefix` (the search anchors on the literal prefix string).
+fn findInnerSpan(
+    source: []const u8,
+    lo: usize,
+    hi: usize,
+    open_prefix: []const u8,
+    close_tag: []const u8,
+) ?[2]usize {
+    if (lo >= hi or hi > source.len) return null;
+    const slice = source[lo..hi];
+    const o_rel = std.mem.indexOf(u8, slice, open_prefix) orelse return null;
+    const o_abs = lo + o_rel;
+    const o_after = o_abs + open_prefix.len;
+    if (o_after >= source.len) return null;
+    // `open_prefix` is "<formula" or "<formula1"/"<formula2". The
+    // boundary char must be `>`, whitespace, or `/` — otherwise we
+    // hit a longer-named element ("<formula1" matched on
+    // "<formula12" — guard against this).
+    const sep = source[o_after];
+    const is_boundary = switch (sep) {
+        ' ', '\t', '\r', '\n', '/', '>' => true,
+        else => false,
+    };
+    if (!is_boundary) return null;
+    const o_gt = std.mem.indexOfScalarPos(u8, source, o_after, '>') orelse return null;
+    if (o_gt >= hi) return null;
+    if (o_gt > 0 and source[o_gt - 1] == '/') return null; // self-closing — no body
+    const c_rel = std.mem.indexOfPos(u8, source, o_gt + 1, close_tag) orelse return null;
+    if (c_rel >= hi) return null;
+    return .{ o_gt + 1, c_rel };
+}
+
+/// Linear splice of `source` against `patches`. Each patch's
+/// `[start..end]` source span is replaced with `new`. Patches arrive
+/// in collector-emission order which is NOT guaranteed source-order
+/// (OOXML CT_Worksheet places `<conditionalFormatting>` before
+/// `<dataValidations>`, but this collector walks DV first). We sort
+/// in place by `.start` and assert disjointness.
+fn spliceFormulas(
+    a: Allocator,
+    source: []const u8,
+    patches: []SourcePatch,
+) Error![]u8 {
+    assert(source.len > 0);
+    assert(patches.len > 0);
+
+    const lessThan = struct {
+        fn lt(_: void, x: SourcePatch, y: SourcePatch) bool {
+            return x.start < y.start;
+        }
+    }.lt;
+    std.sort.pdq(SourcePatch, patches, {}, lessThan);
+
+    // Disjointness invariant. A violation implies the collector
+    // visited overlapping spans (parser bug or a `formula1`
+    // body containing a literal `</formula1>` payload, which OOXML
+    // forbids).
+    var i: usize = 1;
+    while (i < patches.len) : (i += 1) {
+        assert(patches[i].start >= patches[i - 1].end);
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.ensureTotalCapacity(a, source.len + 256);
+
+    var cursor: usize = 0;
+    for (patches) |p| {
+        assert(p.end <= source.len);
+        try out.appendSlice(a, source[cursor..p.start]);
+        // The rewriter emits already-formed formula text. It does
+        // NOT produce raw `<` / `>` / `&` (the tokenizer prints A1
+        // refs and operators only). We still XML-escape on emit so a
+        // future rewriter feature that DOES produce one of those
+        // bytes can't corrupt the surrounding XML.
+        try appendXmlEscapedText(a, &out, p.new);
+        cursor = p.end;
+    }
+    try out.appendSlice(a, source[cursor..]);
+
+    return try out.toOwnedSlice(a);
+}
+
 /// ASCII-case-insensitive equality. OOXML cell refs are ASCII letters
 /// + decimal digits, so a Unicode-aware fold is unnecessary here.
 fn eqlAsciiIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -2808,6 +3203,182 @@ test "Workbook.rewriteAllFormulas: rename_sheet rewrites quoted sheet qualifiers
     const a1 = (try (try wb2.sheet(0)).cellByRef("A1")).?;
     // Bare cross-sheet name re-emits as bare.
     try std.testing.expectEqualStrings("Renamed!A1+1", a1.formula.?);
+}
+
+// ─── DV / CF rewriter tests (C1 M2 m2) ───────────────────────────────
+
+/// Splice synthetic `<dataValidations>` and `<conditionalFormatting>`
+/// blocks into the source sheet XML for `wb.sheet(sheet_idx)` and
+/// push the patched bytes via `wb.store.replacePart`. The corpus
+/// fixtures lack DV/CF natively, so DV/CF tests build them this way.
+/// The injected blocks live just before `</worksheet>`. Caller MUST
+/// invalidate any cached `parsed` view on the touched sheet
+/// afterwards (set `ws.parsed = null` after a manual `view.deinit`).
+fn injectDvAndCfIntoSheet(
+    a: Allocator,
+    wb: *Workbook,
+    sheet_idx: u32,
+    dv_block: []const u8,
+    cf_block: []const u8,
+) Error!void {
+    const ws = try wb.sheet(sheet_idx);
+    _ = try ws.ensureParsed();
+    const part_name = ws.resolved_part_name.?;
+    const part = try wb.store.part(part_name) orelse return error.MissingSheetPart;
+    const src = part.bytes;
+
+    const close_idx = std.mem.lastIndexOf(u8, src, "</worksheet>") orelse
+        return error.NoSheetData;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try out.ensureTotalCapacity(a, src.len + dv_block.len + cf_block.len + 16);
+
+    try out.appendSlice(a, src[0..close_idx]);
+    // Order matters: CF before DV per OOXML CT_Worksheet schema.
+    if (cf_block.len > 0) try out.appendSlice(a, cf_block);
+    if (dv_block.len > 0) try out.appendSlice(a, dv_block);
+    try out.appendSlice(a, src[close_idx..]);
+
+    try wb.store.replacePart(part_name, out.items);
+
+    // Drop the stale parsed view: it borrowed from the pre-splice
+    // bytes. Next access re-parses the patched part.
+    var stale = ws.parsed.?;
+    stale.deinit(a);
+    ws.parsed = null;
+}
+
+test "Workbook.rewriteAllValidationsAndConditionalFormats: insert_rows shifts DV formulas, persists round-trip" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-rows-{d}.xlsx", .{prng.random().int(u32)});
+
+    // Stage: open fixture, inject DV block on sheet 0, save.
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+
+        // Two DVs: one with formula1 only, one with both formulas +
+        // an `errorTitle` attr we want to confirm is preserved across
+        // the splice.
+        const dv =
+            \\<dataValidations count="2"><dataValidation type="list" allowBlank="1" sqref="A1:A10"><formula1>B5:B10</formula1></dataValidation><dataValidation type="whole" operator="between" errorTitle="Bad" sqref="C1:C10"><formula1>B5</formula1><formula2>B7+1</formula2></dataValidation></dataValidations>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, dv, "");
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    // Re-open, rewrite. target_sheet null = "apply everywhere".
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-rows-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, tmp_path);
+        defer wb.deinit();
+
+        const count = try wb.rewriteAllValidationsAndConditionalFormats(
+            .{ .insert_rows = .{ .at = 4, .count = 1 } },
+            null,
+        );
+        // formula1 "B5:B10" → "B6:B11" (1)
+        // formula1 "B5" → "B6" (1)
+        // formula2 "B7+1" → "B8+1" (1)
+        try std.testing.expectEqual(@as(u32, 3), count);
+
+        try wb.save(tmp2_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp2_path) catch {};
+
+    // Round-trip: re-open, re-parse, verify shifted formulas.
+    var wb2 = try Workbook.open(std.testing.allocator, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const dvs = try ws.validations();
+    try std.testing.expectEqual(@as(usize, 2), dvs.len);
+    try std.testing.expectEqualStrings("B6:B11", dvs[0].formula1.?);
+    try std.testing.expectEqualStrings("B6", dvs[1].formula1.?);
+    try std.testing.expectEqualStrings("B8+1", dvs[1].formula2.?);
+    // errorTitle attribute survived the splice (preservation
+    // contract — we never regenerate the DV element from the
+    // typed view, which would drop it).
+    const part = (try wb2.store.part(ws.resolved_part_name.?)).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "errorTitle=\"Bad\"") != null);
+}
+
+test "Workbook.rewriteAllValidationsAndConditionalFormats: insert_cols shifts CF formula, persists round-trip" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-cols-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+
+        // CF block with two cfRules (one with `dxfId` we expect to
+        // survive, one self-closing without a body).
+        const cf =
+            \\<conditionalFormatting sqref="D1:D10"><cfRule type="expression" dxfId="0" priority="1"><formula>D1+E1</formula></cfRule><cfRule type="containsBlanks" priority="2"/></conditionalFormatting>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, "", cf);
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-cols-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, tmp_path);
+        defer wb.deinit();
+        const ws_name_owned = try std.testing.allocator.dupe(u8, (try wb.sheet(0)).name());
+        defer std.testing.allocator.free(ws_name_owned);
+
+        // target_sheet = sheet 0 — bare refs `D1`, `E1` are scoped
+        // to sheet 0, so they shift on insert_cols at col D (=4).
+        const count = try wb.rewriteAllValidationsAndConditionalFormats(
+            .{ .insert_cols = .{ .at = 4, .count = 1 } },
+            ws_name_owned,
+        );
+        // CF formula "D1+E1" → "E1+F1" (1 body, 2 refs shifted = 1 rewrite)
+        try std.testing.expectEqual(@as(u32, 1), count);
+
+        try wb.save(tmp2_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const cfs = try ws.conditionalFormats();
+    // Two cfRules — only the first has a formula (second was self-
+    // closing). Both survive the splice with their attrs.
+    try std.testing.expectEqual(@as(usize, 2), cfs.len);
+    try std.testing.expectEqualStrings("E1+F1", cfs[0].formula.?);
+    // dxfId on rule 0 preserved (attribute-byte preservation contract).
+    try std.testing.expectEqual(@as(?u32, 0), cfs[0].dxf_id);
+    try std.testing.expectEqual(@as(?u32, 1), cfs[0].priority);
+    try std.testing.expectEqual(@as(?u32, 2), cfs[1].priority);
+}
+
+test "Workbook.rewriteAllValidationsAndConditionalFormats: no-op count == 0 on workbook without DV/CF" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+
+    // Pristine fixture — no <dataValidations>, no <conditionalFormatting>.
+    const count = try wb.rewriteAllValidationsAndConditionalFormats(
+        .{ .insert_rows = .{ .at = 1, .count = 1 } },
+        null,
+    );
+    try std.testing.expectEqual(@as(u32, 0), count);
 }
 
 test "Workbook.renameSheet: happy path renames sheet and rewrites cross-sheet formula" {
