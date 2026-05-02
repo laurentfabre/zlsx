@@ -612,6 +612,472 @@ pub const Workbook = struct {
             if (asciiCaseInsensitiveEql(s.name, new_name)) return error.SheetNameInUse;
         }
     }
+
+    /// Apply `edit` to every `<definedName>` formula in `xl/workbook.xml`.
+    /// `target_sheet` plumbs into `RewriteContext.target_sheet`: caller's
+    /// statement of which sheet's row/col edit applies. `null` means
+    /// "apply everywhere" per the rewriter's permissive default.
+    ///
+    /// Each defined name's `RewriteContext.on_sheet` is set to:
+    ///   - workbook-scope (`local_sheet_id == null`): `null`
+    ///   - sheet-scope (`local_sheet_id` set): the name of the sheet
+    ///     the `localSheetId` index resolves to
+    ///
+    /// Returns the number of defined-name formulas whose rewritten
+    /// output differs from the input (byte-identical rewrites are not
+    /// counted).
+    ///
+    /// **Splice contract.** Three shapes for `<definedNames>` are
+    /// handled in `xl/workbook.xml`:
+    ///   - Paired `<definedNames>...</definedNames>` — classical splice
+    ///   - Self-closing `<definedNames/>` — upgraded to paired form
+    ///   - Block absent — insert fresh paired block before `<calcPr` (or
+    ///     before `</workbook>` if no calcPr)
+    ///
+    /// **Bug-fix vs prior iter (PR #37).** The earlier draft re-parsed
+    /// `self.workbook` mid-iteration over `defined_names`, leaving the
+    /// loop reading freed memory on the sheet-scope branch. This impl
+    /// collects ALL rewrites into a parallel allocator-owned array
+    /// FIRST, then performs the splice + `replacePart` + re-parse in a
+    /// single transactional step.
+    pub fn rewriteAllDefinedNames(
+        self: *Workbook,
+        edit: zlsx.formula_rewriter.RewriteEdit,
+        target_sheet: ?[]const u8,
+    ) Error!u32 {
+        const a = self.allocator;
+
+        // No defined names → nothing to do. Fast-path before any
+        // allocation. Note: even this path validates the edit (an
+        // invalid edit is a programming error regardless of input).
+        if (self.workbook.defined_names.len == 0) return 0;
+
+        // Owned strings for every defined name we plan to emit. Either
+        // the rewritten formula (mutated) or a duplicated copy of the
+        // original (unchanged). Owning every entry uniformly simplifies
+        // the splice loop's lifetime story.
+        var owned_formulas: std.ArrayList([]u8) = .empty;
+        defer {
+            for (owned_formulas.items) |s| a.free(s);
+            owned_formulas.deinit(a);
+        }
+        // Parallel arrays: name / local_sheet_id / hidden, dup'd so
+        // they survive the upcoming `refreshWorkbookXmlView` call which
+        // frees the source `defined_names` arena.
+        var owned_names: std.ArrayList([]u8) = .empty;
+        defer {
+            for (owned_names.items) |s| a.free(s);
+            owned_names.deinit(a);
+        }
+        var local_ids: std.ArrayList(?u32) = .empty;
+        defer local_ids.deinit(a);
+        var hiddens: std.ArrayList(bool) = .empty;
+        defer hiddens.deinit(a);
+
+        var changed: u32 = 0;
+        for (self.workbook.defined_names) |dn| {
+            // Resolve `on_sheet`: null for workbook-scope, sheet name
+            // for sheet-scope (via local_sheet_id index lookup).
+            const on_sheet: ?[]const u8 = blk: {
+                if (dn.local_sheet_id) |sid| {
+                    if (sid < self.workbook.sheets.len) {
+                        break :blk self.workbook.sheets[sid].name;
+                    }
+                    // Out-of-range localSheetId in source XML — treat
+                    // as workbook-scope rather than crashing. This is a
+                    // malformed-input tolerance, not a happy path.
+                    break :blk null;
+                }
+                break :blk null;
+            };
+            const ctx = zlsx.formula_rewriter.RewriteContext{
+                .on_sheet = on_sheet,
+                .target_sheet = target_sheet,
+                .edit = edit,
+            };
+
+            const rewritten = try zlsx.formula_rewriter.rewriteFormula(a, dn.formula, ctx);
+            errdefer a.free(rewritten);
+
+            const name_dup = try a.dupe(u8, dn.name);
+            errdefer a.free(name_dup);
+
+            if (!std.mem.eql(u8, rewritten, dn.formula)) changed += 1;
+
+            try owned_formulas.append(a, rewritten);
+            try owned_names.append(a, name_dup);
+            try local_ids.append(a, dn.local_sheet_id);
+            try hiddens.append(a, dn.hidden);
+        }
+
+        // Pair-assertion: parallel arrays agree in length AND match the
+        // source slice's length. If any of these triggers, the loop
+        // above bailed mid-way without cleaning up — the defers cover
+        // the leak, but the splice would emit a partial block.
+        assert(owned_formulas.items.len == self.workbook.defined_names.len);
+        assert(owned_names.items.len == self.workbook.defined_names.len);
+        assert(local_ids.items.len == self.workbook.defined_names.len);
+        assert(hiddens.items.len == self.workbook.defined_names.len);
+
+        // No formula changed AND the block already exists in source: a
+        // re-emit would still be byte-identical for well-behaved inputs,
+        // but we conservatively skip the splice to keep `replacePart`
+        // off the hot path when nothing is actually different.
+        if (changed == 0) return 0;
+
+        try self.spliceDefinedNamesBlock(
+            owned_names.items,
+            owned_formulas.items,
+            local_ids.items,
+            hiddens.items,
+        );
+
+        // Re-parse so subsequent reads of `self.workbook.defined_names`
+        // see the new bytes. Source slice borrows from the OLD bytes
+        // we just replaced; `refresh` swaps both arena and slice.
+        try refreshWorkbookXmlView(self);
+
+        return changed;
+    }
+
+    /// Apply `edit` to every internal `<hyperlink location="…">` on
+    /// every sheet. External hyperlinks (those with `r:id != null`)
+    /// are skipped — their target is a relationship, not an A1 ref.
+    ///
+    /// `target_sheet` plumbs into `RewriteContext.target_sheet`.
+    /// `RewriteContext.on_sheet` is the name of the sheet the
+    /// hyperlink lives on (so unqualified locations are scoped
+    /// correctly during shift).
+    ///
+    /// Returns the number of hyperlink locations whose rewrite
+    /// produced different bytes.
+    pub fn rewriteAllHyperlinkLocations(
+        self: *Workbook,
+        edit: zlsx.formula_rewriter.RewriteEdit,
+        target_sheet: ?[]const u8,
+    ) Error!u32 {
+        const a = self.allocator;
+        var total_changed: u32 = 0;
+
+        var sheet_idx: u32 = 0;
+        while (sheet_idx < self.sheetCount()) : (sheet_idx += 1) {
+            const ws = try self.sheet(sheet_idx);
+            const view = try ws.ensureParsed();
+            if (view.hyperlinks.len == 0) continue;
+
+            const ws_name = ws.name();
+
+            // Per-sheet pending list: every hyperlink (preserved
+            // verbatim) plus the rewritten location, owned. Empty
+            // means nothing to emit — leave the sheet untouched.
+            const Pending = struct {
+                ref: []u8,
+                location: []u8,
+                display: ?[]u8,
+                tooltip: ?[]u8,
+                r_id: ?[]u8,
+            };
+            var pending: std.ArrayList(Pending) = .empty;
+            defer {
+                for (pending.items) |p| {
+                    a.free(p.ref);
+                    a.free(p.location);
+                    if (p.display) |s| a.free(s);
+                    if (p.tooltip) |s| a.free(s);
+                    if (p.r_id) |s| a.free(s);
+                }
+                pending.deinit(a);
+            }
+
+            var sheet_changed: u32 = 0;
+            for (view.hyperlinks) |h| {
+                // External hyperlinks: r_id present → location is a
+                // relationship target, not an A1 ref. Preserve verbatim.
+                // Internal-only entries (r_id == null AND location set)
+                // are the rewrite candidates.
+                const loc_in = h.location orelse {
+                    // Hyperlink with neither r_id nor location is
+                    // malformed; preserve verbatim so we don't drop it.
+                    try appendPendingHyperlink(a, &pending, h, null);
+                    continue;
+                };
+                if (h.r_id != null) {
+                    try appendPendingHyperlink(a, &pending, h, null);
+                    continue;
+                }
+
+                const ctx = zlsx.formula_rewriter.RewriteContext{
+                    .on_sheet = ws_name,
+                    .target_sheet = target_sheet,
+                    .edit = edit,
+                };
+                const rewritten = try zlsx.formula_rewriter.rewriteFormula(a, loc_in, ctx);
+                errdefer a.free(rewritten);
+
+                if (!std.mem.eql(u8, rewritten, loc_in)) sheet_changed += 1;
+                try appendPendingHyperlink(a, &pending, h, rewritten);
+            }
+
+            // Pair assertion: every parsed hyperlink produced exactly
+            // one pending entry. Mismatch would emit a partial block.
+            assert(pending.items.len == view.hyperlinks.len);
+
+            if (sheet_changed == 0) continue;
+
+            try self.spliceHyperlinksBlock(sheet_idx, pending.items);
+
+            // Invalidate the parsed view: the source bytes for
+            // `hyperlinks[].location` borrow from the OLD part bytes
+            // that `replacePart` just swapped out.
+            if (ws.parsed) |*p| {
+                var view_mut = p.*;
+                view_mut.deinit(self.allocator);
+                ws.parsed = null;
+            }
+
+            total_changed += sheet_changed;
+        }
+
+        return total_changed;
+    }
+
+    /// Helper for `rewriteAllHyperlinkLocations`. Duplicates `h`'s
+    /// borrowed slices into pending-list-owned allocations, optionally
+    /// substituting `loc_override` for `h.location` (used when the
+    /// rewriter produced new bytes). Pending-list type is local to
+    /// the caller; we mirror its struct shape via anytype to avoid
+    /// hoisting a private struct to file scope just for this helper.
+    fn appendPendingHyperlink(
+        allocator: Allocator,
+        pending: anytype,
+        h: sheet_xml_mod.Hyperlink,
+        loc_override: ?[]u8,
+    ) Error!void {
+        const ref_dup = try allocator.dupe(u8, h.ref);
+        errdefer allocator.free(ref_dup);
+
+        const loc_dup: []u8 = if (loc_override) |lo|
+            lo // takes ownership — caller's `errdefer free(rewritten)` is cancelled by successful append
+        else
+            try allocator.dupe(u8, h.location orelse "");
+        errdefer if (loc_override == null) allocator.free(loc_dup);
+
+        const display_dup: ?[]u8 = if (h.display) |s| try allocator.dupe(u8, s) else null;
+        errdefer if (display_dup) |s| allocator.free(s);
+
+        const tooltip_dup: ?[]u8 = if (h.tooltip) |s| try allocator.dupe(u8, s) else null;
+        errdefer if (tooltip_dup) |s| allocator.free(s);
+
+        const r_id_dup: ?[]u8 = if (h.r_id) |s| try allocator.dupe(u8, s) else null;
+        errdefer if (r_id_dup) |s| allocator.free(s);
+
+        try pending.append(allocator, .{
+            .ref = ref_dup,
+            .location = loc_dup,
+            .display = display_dup,
+            .tooltip = tooltip_dup,
+            .r_id = r_id_dup,
+        });
+    }
+
+    /// Re-emit `xl/workbook.xml` with a fresh `<definedNames>` block
+    /// built from the parallel arrays (names / formulas / local_ids /
+    /// hiddens — same length, same index ↔ same defined name).
+    fn spliceDefinedNamesBlock(
+        self: *Workbook,
+        names: []const []u8,
+        formulas: []const []u8,
+        local_ids: []const ?u32,
+        hiddens: []const bool,
+    ) Error!void {
+        assert(names.len == formulas.len);
+        assert(names.len == local_ids.len);
+        assert(names.len == hiddens.len);
+
+        const a = self.allocator;
+        const part = try self.store.part("xl/workbook.xml") orelse return error.MissingWorkbookPart;
+        const src = part.bytes;
+        assert(src.len > 0);
+
+        // Build the new `<definedNames>...</definedNames>` block once
+        // — emitted whether the source had a paired block, a self-
+        // closing tag, or no block at all. Empty `names` would emit a
+        // bare `<definedNames></definedNames>` pair; callers gate on
+        // `changed == 0` and skip this path entirely if no rewrite
+        // happened, so we never emit empty.
+        var block: std.ArrayList(u8) = .empty;
+        defer block.deinit(a);
+        try block.appendSlice(a, "<definedNames>");
+        for (names, formulas, local_ids, hiddens) |n, f, lid, hid| {
+            try block.appendSlice(a, "<definedName name=\"");
+            try appendXmlEscaped(a, &block, n);
+            try block.appendSlice(a, "\"");
+            if (lid) |sid| {
+                var buf: [16]u8 = undefined;
+                const s = try std.fmt.bufPrint(&buf, "{d}", .{sid});
+                try block.appendSlice(a, " localSheetId=\"");
+                try block.appendSlice(a, s);
+                try block.appendSlice(a, "\"");
+            }
+            if (hid) try block.appendSlice(a, " hidden=\"1\"");
+            try block.appendSlice(a, ">");
+            try appendXmlEscapedText(a, &block, f);
+            try block.appendSlice(a, "</definedName>");
+        }
+        try block.appendSlice(a, "</definedNames>");
+
+        // Locate the source `<definedNames` open tag (if any). Decision
+        // tree:
+        //   present + paired      → splice over the whole block
+        //   present + self-close  → splice over the self-close tag
+        //   absent                → insert before <calcPr or </workbook>
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try out.ensureTotalCapacity(a, src.len + block.items.len + 64);
+
+        if (std.mem.indexOf(u8, src, "<definedNames")) |dn_open| {
+            // Boundary check: ensure the tag is real, not a substring
+            // of `<definedNamesEx>` or similar (no such Excel tag, but
+            // defensive: require the next byte to be space/tab/newline,
+            // `>`, or `/`).
+            const after_name = dn_open + "<definedNames".len;
+            if (after_name >= src.len) return error.MalformedXml;
+            const boundary = src[after_name];
+            const is_real = switch (boundary) {
+                ' ', '\t', '\r', '\n', '>', '/' => true,
+                else => false,
+            };
+            if (!is_real) return error.MalformedXml;
+
+            const open_gt = std.mem.indexOfScalarPos(u8, src, after_name, '>') orelse
+                return error.MalformedXml;
+            const is_self_closing = open_gt > 0 and src[open_gt - 1] == '/';
+
+            if (is_self_closing) {
+                // Replace `<definedNames/>` with the new paired block.
+                try out.appendSlice(a, src[0..dn_open]);
+                try out.appendSlice(a, block.items);
+                try out.appendSlice(a, src[open_gt + 1 ..]);
+            } else {
+                // Find `</definedNames>` and replace the whole span.
+                const close = std.mem.indexOfPos(u8, src, open_gt + 1, "</definedNames>") orelse
+                    return error.MalformedXml;
+                const close_end = close + "</definedNames>".len;
+                try out.appendSlice(a, src[0..dn_open]);
+                try out.appendSlice(a, block.items);
+                try out.appendSlice(a, src[close_end..]);
+            }
+        } else {
+            // No `<definedNames>` block: insert before `<calcPr`, or
+            // before `</workbook>` if calcPr is absent. This places the
+            // block at OOXML's expected position in the schema sequence.
+            const insert_at: usize = blk: {
+                if (std.mem.indexOf(u8, src, "<calcPr")) |i| break :blk i;
+                if (std.mem.indexOf(u8, src, "</workbook>")) |i| break :blk i;
+                return error.MalformedXml;
+            };
+            try out.appendSlice(a, src[0..insert_at]);
+            try out.appendSlice(a, block.items);
+            try out.appendSlice(a, src[insert_at..]);
+        }
+
+        try self.store.replacePart("xl/workbook.xml", out.items);
+    }
+
+    /// Re-emit the sheet at `sheet_idx`'s XML with a fresh
+    /// `<hyperlinks>` block. `pending` contents own their byte slices.
+    fn spliceHyperlinksBlock(
+        self: *Workbook,
+        sheet_idx: u32,
+        pending: anytype,
+    ) Error!void {
+        const a = self.allocator;
+        const ws = try self.sheet(sheet_idx);
+        // ensureParsed has been called by the time we get here, so
+        // resolved_part_name is non-null.
+        const part_name = ws.resolved_part_name orelse return error.MissingSheetPart;
+        const part = try self.store.part(part_name) orelse return error.MissingSheetPart;
+        const src = part.bytes;
+        assert(src.len > 0);
+
+        // Build the new block. We emit ALL hyperlinks (including the
+        // r_id-bearing ones we passed through) so the splice replaces
+        // the entire `<hyperlinks>` block as a unit.
+        var block: std.ArrayList(u8) = .empty;
+        defer block.deinit(a);
+        try block.appendSlice(a, "<hyperlinks>");
+        for (pending) |p| {
+            try block.appendSlice(a, "<hyperlink ref=\"");
+            try appendXmlEscaped(a, &block, p.ref);
+            try block.appendSlice(a, "\"");
+            if (p.r_id) |rid| {
+                try block.appendSlice(a, " r:id=\"");
+                try appendXmlEscaped(a, &block, rid);
+                try block.appendSlice(a, "\"");
+            }
+            // Emit `location` only when non-empty AND `r_id` is null;
+            // otherwise the relationship target supersedes.
+            if (p.r_id == null and p.location.len > 0) {
+                try block.appendSlice(a, " location=\"");
+                try appendXmlEscaped(a, &block, p.location);
+                try block.appendSlice(a, "\"");
+            }
+            if (p.display) |d| {
+                try block.appendSlice(a, " display=\"");
+                try appendXmlEscaped(a, &block, d);
+                try block.appendSlice(a, "\"");
+            }
+            if (p.tooltip) |t| {
+                try block.appendSlice(a, " tooltip=\"");
+                try appendXmlEscaped(a, &block, t);
+                try block.appendSlice(a, "\"");
+            }
+            try block.appendSlice(a, "/>");
+        }
+        try block.appendSlice(a, "</hyperlinks>");
+
+        // Same three-shape splice as definedNames.
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try out.ensureTotalCapacity(a, src.len + block.items.len + 64);
+
+        if (std.mem.indexOf(u8, src, "<hyperlinks")) |hl_open| {
+            const after_name = hl_open + "<hyperlinks".len;
+            if (after_name >= src.len) return error.MalformedXml;
+            const boundary = src[after_name];
+            const is_real = switch (boundary) {
+                ' ', '\t', '\r', '\n', '>', '/' => true,
+                else => false,
+            };
+            if (!is_real) return error.MalformedXml;
+
+            const open_gt = std.mem.indexOfScalarPos(u8, src, after_name, '>') orelse
+                return error.MalformedXml;
+            const is_self_closing = open_gt > 0 and src[open_gt - 1] == '/';
+
+            if (is_self_closing) {
+                try out.appendSlice(a, src[0..hl_open]);
+                try out.appendSlice(a, block.items);
+                try out.appendSlice(a, src[open_gt + 1 ..]);
+            } else {
+                const close = std.mem.indexOfPos(u8, src, open_gt + 1, "</hyperlinks>") orelse
+                    return error.MalformedXml;
+                const close_end = close + "</hyperlinks>".len;
+                try out.appendSlice(a, src[0..hl_open]);
+                try out.appendSlice(a, block.items);
+                try out.appendSlice(a, src[close_end..]);
+            }
+        } else {
+            // No `<hyperlinks>` in source — should be unreachable when
+            // `pending.len > 0` because pending was built from the
+            // parsed view, and the parser only populates hyperlinks
+            // when the block exists. Return a clean error rather than
+            // silently inserting at a guessed position.
+            return error.MalformedXml;
+        }
+
+        try self.store.replacePart(part_name, out.items);
+    }
 };
 
 /// Validate a candidate sheet name per Excel's rules. v1 contract
@@ -2907,4 +3373,292 @@ test "Workbook.renameSheet: no-op when new_name equals current name" {
     defer std.testing.allocator.free(before);
     try wb.renameSheet(0, before);
     try std.testing.expectEqualStrings(before, (try wb.sheet(0)).name());
+}
+
+// ─── C1 M2 m3: defined-names + hyperlinks rewriter tests ─────────────
+
+/// Splice a synthetic `<definedNames>` block into `wb`'s
+/// `xl/workbook.xml` then save to `out_path`. Used by the m3 tests
+/// since the corpus fixture has no defined names of its own. Returns
+/// after `save`, so callers re-open from `out_path` to exercise the
+/// rewriter against persisted bytes.
+fn testInjectDefinedNames(
+    wb: *Workbook,
+    block_inner: []const u8,
+    out_path: []const u8,
+) !void {
+    const a = wb.allocator;
+    const part = (try wb.store.part("xl/workbook.xml")) orelse return error.MissingWorkbookPart;
+    const src = part.bytes;
+    // Insert before `<sheets` so the schema order is workbook → fileVersion
+    // → workbookPr → bookViews → sheets → definedNames → calcPr. Most
+    // fixtures put `<sheets>` ahead of `<definedNames>`; insert AFTER
+    // the `</sheets>` close tag to avoid landing inside the sheets list.
+    const sheets_close = std.mem.indexOf(u8, src, "</sheets>") orelse return error.MalformedXml;
+    const insert_at = sheets_close + "</sheets>".len;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try out.appendSlice(a, src[0..insert_at]);
+    try out.appendSlice(a, "<definedNames>");
+    try out.appendSlice(a, block_inner);
+    try out.appendSlice(a, "</definedNames>");
+    try out.appendSlice(a, src[insert_at..]);
+
+    try wb.store.replacePart("xl/workbook.xml", out.items);
+    try wb.save(out_path);
+}
+
+test "Workbook.rewriteAllDefinedNames: workbook-scope insert_rows shifts and persists" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-defnames-in-{d}.xlsx", .{prng.random().int(u32)});
+
+    // Build a fixture with a workbook-scope defined name pointing at
+    // `Sheet1!A1+B1`. Saved to tmp_path; subsequent open reads it back.
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        try testInjectDefinedNames(
+            &wb,
+            "<definedName name=\"MyName\">Sheet1!A1+B1</definedName>",
+            tmp_path,
+        );
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb.deinit();
+
+    // Sanity: the synthetic name is visible.
+    try std.testing.expectEqual(@as(usize, 1), wb.definedNames().len);
+    try std.testing.expectEqualStrings("Sheet1!A1+B1", wb.definedNames()[0].formula);
+
+    const count = try wb.rewriteAllDefinedNames(.{
+        .insert_rows = .{ .at = 1, .count = 1 },
+    }, "Sheet1");
+    try std.testing.expectEqual(@as(u32, 1), count);
+
+    // In-memory view must reflect the rewrite immediately (no
+    // save/re-open needed).
+    try std.testing.expectEqual(@as(usize, 1), wb.definedNames().len);
+    try std.testing.expectEqualStrings("Sheet1!A2+B2", wb.definedNames()[0].formula);
+
+    // Persistence: save + re-open the rewritten workbook.
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-defnames-out-{d}.xlsx", .{prng.random().int(u32)});
+    try wb.save(tmp2_path);
+    defer std.fs.cwd().deleteFile(tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, tmp2_path);
+    defer wb2.deinit();
+    try std.testing.expectEqual(@as(usize, 1), wb2.definedNames().len);
+    try std.testing.expectEqualStrings("Sheet1!A2+B2", wb2.definedNames()[0].formula);
+    try std.testing.expectEqualStrings("MyName", wb2.definedNames()[0].name);
+    try std.testing.expectEqual(@as(?u32, null), wb2.definedNames()[0].local_sheet_id);
+}
+
+test "Workbook.rewriteAllDefinedNames: sheet-scope localSheetId preserved across rewrite" {
+    // PR #37 panicked here (signal 6 / abort). Root cause: the rewriter
+    // re-parsed the workbook view mid-iteration over `defined_names`,
+    // leaving the loop reading freed memory on the sheet-scope branch
+    // (`local_sheet_id` resolves to a sheet name borrowed from the
+    // about-to-be-freed arena). The fix: collect ALL pending rewrites
+    // FIRST into allocator-owned arrays, THEN splice + re-parse once.
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-defnames-local-in-{d}.xlsx", .{prng.random().int(u32)});
+
+    // Sheet-scope: localSheetId="0" binds the name to the first sheet.
+    // Formula `B5` (no qualifier) — bare A1 ref. With on_sheet="Sheet1"
+    // (resolved from local_sheet_id=0) and target_sheet=null OR "Sheet1",
+    // an insert_rows at row=4 count=2 should shift B5 → B7.
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        try testInjectDefinedNames(
+            &wb,
+            "<definedName name=\"LocalRef\" localSheetId=\"0\">B5</definedName>",
+            tmp_path,
+        );
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb.deinit();
+
+    // Sanity: the sheet-scope name was parsed correctly.
+    try std.testing.expectEqual(@as(usize, 1), wb.definedNames().len);
+    try std.testing.expectEqual(@as(?u32, 0), wb.definedNames()[0].local_sheet_id);
+    try std.testing.expectEqualStrings("B5", wb.definedNames()[0].formula);
+
+    // target_sheet=null → "apply everywhere," matching the rewriter's
+    // permissive default. The bare B5 ref is scoped to on_sheet
+    // ("Sheet1" via local_sheet_id=0); rewriter shifts row 5 by +2.
+    const count = try wb.rewriteAllDefinedNames(.{
+        .insert_rows = .{ .at = 4, .count = 2 },
+    }, null);
+    try std.testing.expectEqual(@as(u32, 1), count);
+
+    // Pair assertion: localSheetId AND name preserved across the
+    // splice. Formula now reflects the +2 shift.
+    try std.testing.expectEqual(@as(usize, 1), wb.definedNames().len);
+    try std.testing.expectEqual(@as(?u32, 0), wb.definedNames()[0].local_sheet_id);
+    try std.testing.expectEqualStrings("LocalRef", wb.definedNames()[0].name);
+    try std.testing.expectEqualStrings("B7", wb.definedNames()[0].formula);
+
+    // Persistence round-trip — confirms the splice survived save +
+    // re-open AND the workbook XML is well-formed (re-parse would
+    // error otherwise).
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-defnames-local-out-{d}.xlsx", .{prng.random().int(u32)});
+    try wb.save(tmp2_path);
+    defer std.fs.cwd().deleteFile(tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, tmp2_path);
+    defer wb2.deinit();
+    try std.testing.expectEqual(@as(?u32, 0), wb2.definedNames()[0].local_sheet_id);
+    try std.testing.expectEqualStrings("B7", wb2.definedNames()[0].formula);
+}
+
+/// Splice a `<hyperlinks>` block into the first sheet's XML and
+/// save to `out_path`. Mirror of `testInjectDefinedNames` for the
+/// hyperlinks tests.
+fn testInjectHyperlinks(
+    wb: *Workbook,
+    block_inner: []const u8,
+    out_path: []const u8,
+) !void {
+    const a = wb.allocator;
+    const ws = try wb.sheet(0);
+    _ = try ws.ensureParsed(); // populates resolved_part_name
+    const part_name = ws.resolved_part_name.?;
+    const part = (try wb.store.part(part_name)) orelse return error.MissingSheetPart;
+    const src = part.bytes;
+
+    // Place `<hyperlinks>` after `</sheetData>` per OOXML schema order.
+    const sd_close = std.mem.indexOf(u8, src, "</sheetData>") orelse return error.MalformedXml;
+    const insert_at = sd_close + "</sheetData>".len;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try out.appendSlice(a, src[0..insert_at]);
+    try out.appendSlice(a, "<hyperlinks>");
+    try out.appendSlice(a, block_inner);
+    try out.appendSlice(a, "</hyperlinks>");
+    try out.appendSlice(a, src[insert_at..]);
+
+    try wb.store.replacePart(part_name, out.items);
+    // Invalidate parsed view so subsequent reads pick up the splice.
+    if (ws.parsed) |*p| {
+        var view = p.*;
+        view.deinit(wb.allocator);
+        ws.parsed = null;
+    }
+    try wb.save(out_path);
+}
+
+test "Workbook.rewriteAllHyperlinkLocations: internal hyperlink shifts when target_sheet matches" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-hl-in-{d}.xlsx", .{prng.random().int(u32)});
+
+    // Internal hyperlink (no r:id) with location=A5. on_sheet for this
+    // hyperlink resolves to "Sheet1" (sheet 0); a row insert at 1 with
+    // count=4 shifts row 5 → row 9 → location should become A9.
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        try testInjectHyperlinks(
+            &wb,
+            "<hyperlink ref=\"C3\" location=\"A5\" display=\"jump\"/>",
+            tmp_path,
+        );
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb.deinit();
+
+    {
+        const ws = try wb.sheet(0);
+        const hls = try ws.hyperlinks();
+        try std.testing.expectEqual(@as(usize, 1), hls.len);
+        try std.testing.expectEqual(@as(?[]const u8, null), hls[0].r_id);
+        try std.testing.expectEqualStrings("A5", hls[0].location.?);
+    }
+
+    const count = try wb.rewriteAllHyperlinkLocations(.{
+        .insert_rows = .{ .at = 1, .count = 4 },
+    }, "Sheet1");
+    try std.testing.expectEqual(@as(u32, 1), count);
+
+    // Re-read parsed view post-rewrite (the rewriter invalidates it).
+    {
+        const ws = try wb.sheet(0);
+        const hls = try ws.hyperlinks();
+        try std.testing.expectEqual(@as(usize, 1), hls.len);
+        try std.testing.expectEqualStrings("A9", hls[0].location.?);
+        try std.testing.expectEqualStrings("C3", hls[0].ref);
+        try std.testing.expectEqualStrings("jump", hls[0].display.?);
+    }
+}
+
+test "Workbook.rewriteAllHyperlinkLocations: external (r_id != null) hyperlink skipped" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-hl-ext-in-{d}.xlsx", .{prng.random().int(u32)});
+
+    // External hyperlink — r:id present, no location. The rewriter
+    // must skip it (count == 0), leaving the entry untouched.
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        try testInjectHyperlinks(
+            &wb,
+            "<hyperlink ref=\"D4\" r:id=\"rIdFake\" display=\"external\"/>",
+            tmp_path,
+        );
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb.deinit();
+
+    {
+        const ws = try wb.sheet(0);
+        const hls = try ws.hyperlinks();
+        try std.testing.expectEqual(@as(usize, 1), hls.len);
+        try std.testing.expect(hls[0].r_id != null);
+    }
+
+    const count = try wb.rewriteAllHyperlinkLocations(.{
+        .insert_rows = .{ .at = 1, .count = 4 },
+    }, "Sheet1");
+    try std.testing.expectEqual(@as(u32, 0), count);
+
+    // External entry untouched.
+    {
+        const ws = try wb.sheet(0);
+        const hls = try ws.hyperlinks();
+        try std.testing.expectEqual(@as(usize, 1), hls.len);
+        try std.testing.expect(hls[0].r_id != null);
+        try std.testing.expectEqualStrings("rIdFake", hls[0].r_id.?);
+    }
 }
