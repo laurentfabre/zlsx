@@ -443,6 +443,73 @@ pub const Workbook = struct {
         }
         try self.store.save(path);
     }
+
+    /// Apply a structural-edit rewrite to every formula in every
+    /// sheet. Walks each worksheet, materializes its SheetXml, runs
+    /// `zlsx.formula_rewriter.rewriteFormula` on each cell that has
+    /// `formula != null`, then stages the rewritten text via
+    /// `Worksheet.setCell(ref, .{ .formula = new })`. Returns the
+    /// number of cells rewritten (cells whose rewrite produced
+    /// byte-identical output are NOT counted and don't grow the
+    /// delta map).
+    ///
+    /// **This rewrites formulas only.** Row/col edits applied here
+    /// shift formula references but do NOT structurally move cells —
+    /// that's a follow-up iter (`Workbook.insertRow` etc.). For
+    /// `rename_sheet` the workflow is coherent: pair this call with
+    /// a manual `xl/workbook.xml` `<sheet name=>` rewrite. (A
+    /// `Workbook.renameSheet` convenience is a future iter.)
+    pub fn rewriteAllFormulas(
+        self: *Workbook,
+        edit: zlsx.formula_rewriter.RewriteEdit,
+    ) Error!u32 {
+        var count: u32 = 0;
+        const a = self.allocator;
+        var sheet_idx: u32 = 0;
+        while (sheet_idx < self.sheetCount()) : (sheet_idx += 1) {
+            const ws = try self.sheet(sheet_idx);
+            const view = try ws.ensureParsed();
+            const ws_name = ws.name();
+
+            // Collect (ref, new_text) pairs first so we don't mutate
+            // the Worksheet's delta map while iterating its parsed
+            // view's row/cell slices.
+            const Pending = struct { ref: []const u8, text: []u8 };
+            var pending: std.ArrayList(Pending) = .empty;
+            defer {
+                for (pending.items) |p| a.free(p.text);
+                pending.deinit(a);
+            }
+
+            for (view.rows) |row| {
+                for (row.cells) |c| {
+                    const f = c.formula orelse continue;
+                    if (f.len == 0) continue;
+                    const ctx = zlsx.formula_rewriter.RewriteContext{
+                        .on_sheet = ws_name,
+                        .target_sheet = null,
+                        .edit = edit,
+                    };
+                    const rewritten = try zlsx.formula_rewriter.rewriteFormula(a, f, ctx);
+                    if (std.mem.eql(u8, rewritten, f)) {
+                        a.free(rewritten);
+                        continue;
+                    }
+                    errdefer a.free(rewritten);
+                    try pending.append(a, .{ .ref = c.ref, .text = rewritten });
+                }
+            }
+
+            // Stage the deltas. `setCell` dupes the formula text
+            // into its own allocation, so freeing `pending.items[i].text`
+            // in the defer above is correct.
+            for (pending.items) |p| {
+                try ws.setCell(p.ref, .{ .formula = p.text });
+                count += 1;
+            }
+        }
+        return count;
+    }
 };
 
 // ─── Emit helpers (iter-wb-4 m1) ─────────────────────────────────────
@@ -2334,4 +2401,103 @@ test "Workbook.fromBook: mismatched path errors SheetCountMismatch or opens clea
     // returning an inconsistent Workbook.
     const result = Workbook.fromBook(std.testing.allocator, &book, path_b);
     try std.testing.expectError(Error.SheetCountMismatch, result);
+}
+
+test "Workbook.rewriteAllFormulas: insert_rows shifts every formula's row refs in place" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-rewrite-all-{d}.xlsx", .{prng.random().int(u32)});
+
+    // Stage some formulas first, save, then re-open and rewrite.
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        const s0 = try wb.sheet(0);
+        try s0.setCell("A1", .{ .formula = "SUM(B5:B10)" });
+        try s0.setCell("B2", .{ .formula = "B7+1" });
+        try s0.setCell("C3", .{ .formula = "B2*B5" }); // already-rewritten ref + a target ref
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb.deinit();
+
+    // Insert 1 row at row 4 — every ref to row >= 4 shifts +1.
+    const count = try wb.rewriteAllFormulas(.{
+        .insert_rows = .{ .at = 4, .count = 1 },
+    });
+    // A1's SUM(B5:B10) → SUM(B6:B11) — 1 rewrite
+    // B2's B7+1 → B8+1 — 1 rewrite
+    // C3's B2*B5 → B2*B6 (B2 unchanged, B5 → B6) — 1 rewrite
+    try std.testing.expectEqual(@as(u32, 3), count);
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-rewrite-all-out-{d}.xlsx", .{prng.random().int(u32)});
+    try wb.save(tmp2_path);
+    defer std.fs.cwd().deleteFile(tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, tmp2_path);
+    defer wb2.deinit();
+    const s0 = try wb2.sheet(0);
+    const a1 = (try s0.cellByRef("A1")).?;
+    try std.testing.expectEqualStrings("SUM(B6:B11)", a1.formula.?);
+    const b2 = (try s0.cellByRef("B2")).?;
+    try std.testing.expectEqualStrings("B8+1", b2.formula.?);
+    const c3 = (try s0.cellByRef("C3")).?;
+    try std.testing.expectEqualStrings("B2*B6", c3.formula.?);
+}
+
+test "Workbook.rewriteAllFormulas: no-op count == 0 on a workbook without formulas" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+
+    // Pristine fixture has no <f> cells — nothing to rewrite.
+    const count = try wb.rewriteAllFormulas(.{
+        .insert_rows = .{ .at = 1, .count = 1 },
+    });
+    try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+test "Workbook.rewriteAllFormulas: rename_sheet rewrites quoted sheet qualifiers" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-rewrite-rename-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        const s0 = try wb.sheet(0);
+        // Cross-sheet ref using the source's actual sheet name "Sheet2".
+        try s0.setCell("A1", .{ .formula = "Sheet2!A1+1" });
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb.deinit();
+    const count = try wb.rewriteAllFormulas(.{
+        .rename_sheet = .{ .old = "Sheet2", .new = "Renamed" },
+    });
+    try std.testing.expectEqual(@as(u32, 1), count);
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-rewrite-rename-out-{d}.xlsx", .{prng.random().int(u32)});
+    try wb.save(tmp2_path);
+    defer std.fs.cwd().deleteFile(tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, tmp2_path);
+    defer wb2.deinit();
+    const a1 = (try (try wb2.sheet(0)).cellByRef("A1")).?;
+    // Bare cross-sheet name re-emits as bare.
+    try std.testing.expectEqualStrings("Renamed!A1+1", a1.formula.?);
 }
