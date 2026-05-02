@@ -1563,6 +1563,12 @@ pub const Worksheet = struct {
         // but explicit ownership is clearer).
         const owned = try wb.allocator.dupe(u8, part_name);
         errdefer wb.allocator.free(owned);
+        // Free the old part-name dupe if this Worksheet was previously
+        // parsed-then-invalidated (e.g. by Workbook.save or a test
+        // helper that splices part bytes and sets `parsed = null`).
+        // Without this, every invalidate→re-parse cycle leaks the
+        // prior dupe — caught on PR #36 by std.testing.allocator.
+        if (self.resolved_part_name) |prev| wb.allocator.free(prev);
         self.resolved_part_name = owned;
 
         const part = try wb.store.part(part_name) orelse return Error.MissingSheetPart;
