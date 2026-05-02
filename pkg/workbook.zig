@@ -756,6 +756,139 @@ pub const Workbook = struct {
         assert(std.mem.eql(u8, self.workbook.sheets[sheet_idx].name, new_name));
     }
 
+    /// Remove the sheet at `sheet_idx` from the workbook. Patches three
+    /// XML parts and refreshes the in-memory view; subsequent
+    /// `Workbook.save` writes a workbook whose `<sheets>` list, rels
+    /// table, and `[Content_Types].xml` Overrides no longer reference
+    /// the removed sheet.
+    ///
+    /// **Orphan-part trade-off (v1).** `PartStore` has no `removePart`
+    /// API today, so the deleted sheet's `xl/worksheets/sheetN.xml`
+    /// (and its sidecar `xl/worksheets/_rels/sheetN.xml.rels` when
+    /// present) remain physically inside the archive after `save`,
+    /// just unreferenced from any rels / Content_Types entries. Excel,
+    /// LibreOffice, and openpyxl all tolerate orphan parts (the OPC
+    /// reader resolves parts via `[Content_Types].xml` Overrides + rels
+    /// graphs; unreferenced parts are dead weight). A true cleanup
+    /// requires `PartStore.removePart`; that's a future iter.
+    ///
+    /// **Cross-references not rewritten (v1).** `<definedName>` slots
+    /// with `localSheetId == sheet_idx` (sheet-scoped names), formulas
+    /// referencing the deleted sheet, and hyperlink targets pointing at
+    /// it remain on the wire and will produce `#REF!` or
+    /// `Reference is not valid` in Excel after open. Same scope
+    /// boundary as `renameSheet`'s `m3-defnames-hyperlinks` follow-up.
+    ///
+    /// **Errors:**
+    ///   - `SheetIndexOutOfRange` — `sheet_idx >= sheetCount()`.
+    ///   - `LastSheetUndeletable` — `sheetCount() == 1`.
+    ///   - `MissingWorkbookPart` / `MissingWorkbookRels` — corrupt
+    ///     archive lacks the parts we'd patch.
+    ///   - `SheetElementNotFound` / `RelationshipElementNotFound` —
+    ///     the on-wire bytes don't match the parsed view (file
+    ///     mutated under us between parse and patch).
+    pub fn deleteSheet(self: *Workbook, sheet_idx: u32) Error!void {
+        if (sheet_idx >= self.sheetCount()) return error.SheetIndexOutOfRange;
+        if (self.sheetCount() == 1) return error.LastSheetUndeletable;
+        // Pre-condition: the slot table and the parsed view agree on
+        // length (the same invariant `sheetCount` asserts on read).
+        assert(self.worksheets.len == self.workbook.sheets.len);
+        assert(self.worksheets.len >= 2);
+
+        // Capture r_id BEFORE patches: step 4 re-parses workbook.xml
+        // and frees the arena that backs `sheets[idx].r_id`. We need
+        // the bytes alive for the rels patch.
+        const r_id_src = self.workbook.sheets[sheet_idx].r_id;
+        if (r_id_src.len == 0) return error.MissingRelationship;
+        if (r_id_src.len > 64) return error.MissingRelationship; // OOXML rId cap is well below this
+        var r_id_buf: [64]u8 = undefined;
+        @memcpy(r_id_buf[0..r_id_src.len], r_id_src);
+        const r_id_owned = r_id_buf[0..r_id_src.len];
+
+        // Resolve the part name (e.g. "xl/worksheets/sheet2.xml") via
+        // ensureParsed — caches `resolved_part_name` on the Worksheet.
+        // We dupe the resolved name into a stack buffer so step 6
+        // (which deinits the Worksheet) can't free it from under us.
+        const ws = try self.sheet(sheet_idx);
+        _ = try ws.ensureParsed();
+        const part_name_src = ws.resolved_part_name orelse return error.MissingSheetPart;
+        if (part_name_src.len == 0) return error.MissingSheetPart;
+        if (part_name_src.len > 256) return error.MissingSheetPart;
+        var part_name_buf: [256]u8 = undefined;
+        @memcpy(part_name_buf[0..part_name_src.len], part_name_src);
+        const part_name_owned = part_name_buf[0..part_name_src.len];
+
+        try patchWorkbookXmlRemoveSheet(self, sheet_idx);
+        try patchWorkbookRelsRemoveRelationship(self, r_id_owned);
+        // Content_Types Override removal is best-effort — some
+        // tooling omits per-sheet Overrides and relies on Default
+        // entries instead. Treat "not found" as success rather than
+        // failing the whole delete.
+        patchContentTypesRemoveOverride(self, part_name_owned) catch |err| switch (err) {
+            error.ContentTypesOverrideNotFound => {},
+            else => return err,
+        };
+
+        // Re-parse the workbook view in place. We can't use
+        // `refreshWorkbookXmlView` here because that helper asserts
+        // sheet-count invariance (correct for renameSheet, wrong
+        // for delete which expects count - 1).
+        {
+            const fresh_part = try self.store.part("xl/workbook.xml") orelse
+                return error.MissingWorkbookPart;
+            var fresh = try workbook_xml_mod.parse(self.allocator, fresh_part.bytes);
+            errdefer fresh.deinit(self.allocator);
+            // Sanity: the post-delete view must be exactly one shorter.
+            if (fresh.sheets.len + 1 != self.workbook.sheets.len) {
+                return error.SheetCountMismatch;
+            }
+            self.workbook.deinit(self.allocator);
+            self.workbook = fresh;
+        }
+
+        // Shrink the slot table. Order matters:
+        //   1. Take ownership of the doomed Worksheet's resources by
+        //      calling deinit BEFORE we copy slots around — copying
+        //      first and then freeing would deinit the wrong slot.
+        //   2. Allocate the new (n-1)-sized slot array.
+        //   3. Copy [0..idx] and [idx+1..] across.
+        //   4. Free the old array.
+        // Each surviving Worksheet keeps its `parsed`, `deltas`, and
+        // `resolved_part_name` allocations — they're just memcpy'd by
+        // value. The back-pointer (`workbook`) still points at `self`.
+        const old_slots = self.worksheets;
+        const old_len = old_slots.len;
+        assert(sheet_idx < old_len);
+
+        old_slots[sheet_idx].deinit(self.allocator);
+
+        const new_slots = try self.allocator.alloc(Worksheet, old_len - 1);
+        errdefer self.allocator.free(new_slots);
+
+        // Copy survivors. `i` is the OLD index; `j` is the NEW index.
+        var i: u32 = 0;
+        var j: u32 = 0;
+        while (i < old_len) : (i += 1) {
+            if (i == sheet_idx) continue;
+            new_slots[j] = old_slots[i];
+            // Renumber: the surviving Worksheet's `sheet_idx` must
+            // line up with its new slot position (post-delete the
+            // workbook view has been re-parsed in `<sheets>` order).
+            new_slots[j].sheet_idx = j;
+            j += 1;
+        }
+        assert(j == old_len - 1);
+
+        self.allocator.free(old_slots);
+        self.worksheets = new_slots;
+
+        // Post-conditions: the slot table and the re-parsed view agree
+        // on length, and the sheet at `sheet_idx` (if it still exists)
+        // has the next surviving sheet's name.
+        assert(self.worksheets.len == self.workbook.sheets.len);
+        assert(self.worksheets.len == old_len - 1);
+    }
+
     /// Case-insensitive ASCII duplicate check. Skips the slot at
     /// `sheet_idx` itself so renaming a sheet to its own current name
     /// (modulo case) is permitted at this layer; a true no-op (exact
