@@ -511,7 +511,388 @@ pub const Workbook = struct {
         }
         return count;
     }
+
+    /// Apply a structural-edit rewrite to every `<definedName>` formula
+    /// in `xl/workbook.xml`. Walks both workbook-scope (`localSheetId`
+    /// absent) and sheet-scope (`localSheetId` present) names. Returns
+    /// the number of names whose formula was rewritten to non-byte-
+    /// identical text (no-op rewrites are NOT counted).
+    ///
+    /// Persistence: when at least one name changes, the workbook part
+    /// is patched via `PartStore.replacePart` with a regenerated
+    /// `<definedNames>...</definedNames>` block spliced in place of the
+    /// existing one. Self-closing `<definedNames/>` is upgraded to
+    /// paired form on first delta. Everything outside the block is
+    /// byte-preserved.
+    ///
+    /// **Entity round-trip caveat (v1):** `DefinedName.formula` is
+    /// borrowed from `xl/workbook.xml` verbatim — i.e. still XML-
+    /// escaped (e.g. `&amp;`). The rewriter operates on raw formula
+    /// text, so a name whose formula contains `&amp;` / `&lt;` / `&gt;`
+    /// would be mis-tokenized. Today's emit also doesn't re-encode the
+    /// rewriter output back to XML-element form for the `<f>...</f>`
+    /// body. TODO: round-trip via `pkg/store.zig:decodeXmlEntities`
+    /// before rewrite + re-encode after. Production formulas in defined
+    /// names rarely use these characters; we accept the gap for v1.
+    pub fn rewriteAllDefinedNames(
+        self: *Workbook,
+        edit: zlsx.formula_rewriter.RewriteEdit,
+    ) Error!u32 {
+        const a = self.allocator;
+        const dns = self.workbook.defined_names;
+        if (dns.len == 0) return 0;
+
+        // Phase 1: compute rewrites in parallel arrays. Allocator-owned
+        // text is freed under errdefer/defer; on success it's consumed
+        // by the emit step (which copies into its output buffer).
+        const new_formulas = try a.alloc(?[]u8, dns.len);
+        defer {
+            for (new_formulas) |maybe| if (maybe) |s| a.free(s);
+            a.free(new_formulas);
+        }
+        for (new_formulas) |*slot| slot.* = null;
+
+        var count: u32 = 0;
+        for (dns, 0..) |dn, i| {
+            const on_sheet: ?[]const u8 = if (dn.local_sheet_id) |lsid| blk: {
+                // Sheet-scope: localSheetId is a 0-based index into the
+                // workbook's `<sheets>` order. Defensive bound check —
+                // a malformed input could carry a stale id.
+                if (lsid >= self.workbook.sheets.len) break :blk null;
+                break :blk self.workbook.sheets[lsid].name;
+            } else null;
+
+            const ctx = zlsx.formula_rewriter.RewriteContext{
+                .on_sheet = on_sheet,
+                .target_sheet = null,
+                .edit = edit,
+            };
+            const rewritten = try zlsx.formula_rewriter.rewriteFormula(a, dn.formula, ctx);
+            if (std.mem.eql(u8, rewritten, dn.formula)) {
+                a.free(rewritten);
+                continue;
+            }
+            new_formulas[i] = rewritten;
+            count += 1;
+        }
+        if (count == 0) return 0;
+
+        // Phase 2: splice a regenerated <definedNames> block into the
+        // workbook part. Source bytes are byte-preserved outside the
+        // block.
+        const wb_part = try self.store.part("xl/workbook.xml") orelse
+            return Error.MissingWorkbookPart;
+        const new_xml = try emitWorkbookWithDefinedNames(a, wb_part.bytes, dns, new_formulas);
+        defer a.free(new_xml);
+        try self.store.replacePart("xl/workbook.xml", new_xml);
+
+        // Phase 3: re-parse the typed view so subsequent reads of
+        // `self.workbook.defined_names` reflect the patched bytes. The
+        // old view's leaves borrowed from the prior part bytes which
+        // PartStore's arena retains, so the in-flight `dns` slice we
+        // iterated above is still live for the duration of this call.
+        const fresh_part = try self.store.part("xl/workbook.xml") orelse
+            return Error.MissingWorkbookPart;
+        var fresh = try workbook_xml_mod.parse(a, fresh_part.bytes);
+        errdefer fresh.deinit(a);
+        self.workbook.deinit(a);
+        self.workbook = fresh;
+
+        return count;
+    }
+
+    /// Apply a structural-edit rewrite to every internal hyperlink's
+    /// `location=` attribute on every sheet. External hyperlinks
+    /// (those with a non-null `r:id` pointing into a per-sheet rels
+    /// file — i.e. `http://...`, `mailto:...`, etc.) are skipped.
+    /// Returns the number of `location=` values rewritten to non-byte-
+    /// identical text.
+    ///
+    /// Persistence: per-sheet `<hyperlinks>...</hyperlinks>` block is
+    /// regenerated and spliced into the sheet XML via
+    /// `PartStore.replacePart` for each sheet that has at least one
+    /// changed hyperlink. Self-closing `<hyperlinks/>` upgrades to
+    /// paired form on first delta. Everything outside the block is
+    /// byte-preserved.
+    ///
+    /// **Entity round-trip caveat (v1):** `Hyperlink.location` is
+    /// borrowed from the sheet XML verbatim — still XML-escaped. The
+    /// rewriter operates on raw text, so a location containing
+    /// `&amp;` would be mis-tokenized. TODO: decode before / re-encode
+    /// after. Production internal hyperlinks (`Sheet1!A1`, `MyName`)
+    /// don't use these characters; we accept the gap for v1.
+    pub fn rewriteAllHyperlinkLocations(
+        self: *Workbook,
+        edit: zlsx.formula_rewriter.RewriteEdit,
+    ) Error!u32 {
+        const a = self.allocator;
+        var total: u32 = 0;
+        var sheet_idx: u32 = 0;
+        while (sheet_idx < self.sheetCount()) : (sheet_idx += 1) {
+            const ws = try self.sheet(sheet_idx);
+            const view = try ws.ensureParsed();
+            const hls = view.hyperlinks;
+            if (hls.len == 0) continue;
+            const ws_name = ws.name();
+
+            // Per-sheet new-text array. `null` = unchanged, leave the
+            // location attribute alone (or absent) on emit.
+            const new_locations = try a.alloc(?[]u8, hls.len);
+            defer {
+                for (new_locations) |maybe| if (maybe) |s| a.free(s);
+                a.free(new_locations);
+            }
+            for (new_locations) |*slot| slot.* = null;
+
+            var changed: u32 = 0;
+            for (hls, 0..) |hl, i| {
+                // External hyperlinks (URL / mailto / file) live in the
+                // per-sheet rels via `r:id`. Skip them — there's nothing
+                // to rewrite at the formula-grammar level.
+                if (hl.r_id != null) continue;
+                const loc = hl.location orelse continue;
+                if (loc.len == 0) continue;
+
+                const ctx = zlsx.formula_rewriter.RewriteContext{
+                    .on_sheet = ws_name,
+                    .target_sheet = null,
+                    .edit = edit,
+                };
+                const rewritten = try zlsx.formula_rewriter.rewriteFormula(a, loc, ctx);
+                if (std.mem.eql(u8, rewritten, loc)) {
+                    a.free(rewritten);
+                    continue;
+                }
+                new_locations[i] = rewritten;
+                changed += 1;
+            }
+            if (changed == 0) continue;
+
+            const part_name = ws.resolved_part_name.?;
+            const source = blk: {
+                const p = try self.store.part(part_name) orelse return Error.MissingSheetPart;
+                break :blk p.bytes;
+            };
+            const new_xml = try emitSheetWithHyperlinks(a, source, hls, new_locations);
+            defer a.free(new_xml);
+            try self.store.replacePart(part_name, new_xml);
+
+            // Invalidate the cached parsed view so subsequent reads see
+            // the patched bytes. The old view's leaves borrowed from
+            // the prior part bytes which PartStore's arena still holds,
+            // so the in-flight `hls` we just iterated remains live for
+            // this call's lifetime.
+            var stale = ws.parsed.?;
+            stale.deinit(a);
+            ws.parsed = null;
+
+            total += changed;
+        }
+        return total;
+    }
 };
+
+// ─── Emit helpers (C1 M2 milestone-3): defined names + hyperlinks ──
+
+/// Splice a regenerated `<definedNames>...</definedNames>` block into
+/// the source `xl/workbook.xml`. Everything outside the block is
+/// byte-preserved. `new_formulas[i] != null` substitutes the rewritten
+/// formula for `dns[i].formula`; `null` keeps the original.
+///
+/// Three source shapes:
+///   1. paired `<definedNames>...</definedNames>` — splice in place.
+///   2. self-closing `<definedNames/>` — upgrade to paired form. (No
+///      delta would land here since the typed parser sees zero entries
+///      from a self-closing block, but we handle the shape defensively
+///      so a future caller that pre-populates entries doesn't crash.)
+///   3. block absent — insert a fresh paired block in spec position
+///      (after `</sheets>`, before `<calcPr` if present, else before
+///      `</workbook>`).
+fn emitWorkbookWithDefinedNames(
+    allocator: Allocator,
+    source: []const u8,
+    dns: []const workbook_xml_mod.DefinedName,
+    new_formulas: []const ?[]u8,
+) Error![]u8 {
+    assert(source.len > 0);
+    assert(dns.len == new_formulas.len);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, source.len + 256);
+
+    if (std.mem.indexOf(u8, source, "<definedNames")) |dn_idx| {
+        const open_gt = std.mem.indexOfScalarPos(u8, source, dn_idx, '>') orelse
+            return Error.MalformedXml;
+        const is_self_closing = open_gt > 0 and source[open_gt - 1] == '/';
+
+        var prefix_end: usize = undefined;
+        var suffix_start: usize = undefined;
+        if (is_self_closing) {
+            prefix_end = dn_idx;
+            suffix_start = open_gt + 1;
+        } else {
+            prefix_end = open_gt + 1;
+            suffix_start = std.mem.indexOfPos(u8, source, prefix_end, "</definedNames>") orelse
+                return Error.MalformedXml;
+        }
+
+        try out.appendSlice(allocator, source[0..prefix_end]);
+        if (is_self_closing) try out.appendSlice(allocator, "<definedNames>");
+        try emitDefinedNamesBody(allocator, &out, dns, new_formulas);
+        if (is_self_closing) try out.appendSlice(allocator, "</definedNames>");
+        try out.appendSlice(allocator, source[suffix_start..]);
+        return try out.toOwnedSlice(allocator);
+    }
+
+    // No existing block — insert a fresh paired block. Spec order:
+    // sheets → functionGroups → externalReferences → definedNames →
+    // calcPr → ... For our purposes: prefer just before `<calcPr`; if
+    // absent, just before `</workbook>`; if neither (malformed), error.
+    const insert_at: usize = if (std.mem.indexOf(u8, source, "<calcPr")) |i|
+        i
+    else if (std.mem.indexOf(u8, source, "</workbook>")) |i|
+        i
+    else
+        return Error.MalformedXml;
+
+    try out.appendSlice(allocator, source[0..insert_at]);
+    try out.appendSlice(allocator, "<definedNames>");
+    try emitDefinedNamesBody(allocator, &out, dns, new_formulas);
+    try out.appendSlice(allocator, "</definedNames>");
+    try out.appendSlice(allocator, source[insert_at..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+fn emitDefinedNamesBody(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    dns: []const workbook_xml_mod.DefinedName,
+    new_formulas: []const ?[]u8,
+) Error!void {
+    assert(dns.len == new_formulas.len);
+    for (dns, new_formulas) |dn, maybe_new| {
+        try out.appendSlice(allocator, "<definedName name=\"");
+        // `dn.name` is borrowed verbatim — already XML-escaped per the
+        // typed-parts contract. Pass through.
+        try out.appendSlice(allocator, dn.name);
+        try out.append(allocator, '"');
+        if (dn.local_sheet_id) |lsid| {
+            try out.appendSlice(allocator, " localSheetId=\"");
+            var lsid_buf: [16]u8 = undefined;
+            try out.appendSlice(allocator, try std.fmt.bufPrint(&lsid_buf, "{d}", .{lsid}));
+            try out.append(allocator, '"');
+        }
+        if (dn.hidden) {
+            try out.appendSlice(allocator, " hidden=\"1\"");
+        }
+        try out.append(allocator, '>');
+        // Element body. Original `dn.formula` is verbatim XML-escaped
+        // bytes; pass through unchanged. Rewritten formula is raw text;
+        // escape `<`, `>`, `&` for XML element content.
+        if (maybe_new) |new_text| {
+            try appendXmlEscapedText(allocator, out, new_text);
+        } else {
+            try out.appendSlice(allocator, dn.formula);
+        }
+        try out.appendSlice(allocator, "</definedName>");
+    }
+}
+
+/// Splice a regenerated `<hyperlinks>...</hyperlinks>` block into the
+/// source sheet XML. Everything outside the block is byte-preserved.
+/// `new_locations[i] != null` substitutes the rewritten location for
+/// `hls[i].location`; `null` keeps the source attribute (or absence)
+/// intact.
+fn emitSheetWithHyperlinks(
+    allocator: Allocator,
+    source: []const u8,
+    hls: []const sheet_xml_mod.Hyperlink,
+    new_locations: []const ?[]u8,
+) Error![]u8 {
+    assert(source.len > 0);
+    assert(hls.len == new_locations.len);
+
+    const hl_idx = std.mem.indexOf(u8, source, "<hyperlinks") orelse
+        return Error.MalformedXml;
+    const open_gt = std.mem.indexOfScalarPos(u8, source, hl_idx, '>') orelse
+        return Error.MalformedXml;
+    const is_self_closing = open_gt > 0 and source[open_gt - 1] == '/';
+
+    var prefix_end: usize = undefined;
+    var suffix_start: usize = undefined;
+    if (is_self_closing) {
+        prefix_end = hl_idx;
+        suffix_start = open_gt + 1;
+    } else {
+        prefix_end = open_gt + 1;
+        suffix_start = std.mem.indexOfPos(u8, source, prefix_end, "</hyperlinks>") orelse
+            return Error.MalformedXml;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, source.len + 128);
+
+    try out.appendSlice(allocator, source[0..prefix_end]);
+    if (is_self_closing) try out.appendSlice(allocator, "<hyperlinks>");
+
+    for (hls, new_locations) |hl, maybe_new| {
+        try out.appendSlice(allocator, "<hyperlink ref=\"");
+        try out.appendSlice(allocator, hl.ref);
+        try out.append(allocator, '"');
+        if (hl.r_id) |rid| {
+            try out.appendSlice(allocator, " r:id=\"");
+            try out.appendSlice(allocator, rid);
+            try out.append(allocator, '"');
+        }
+        const loc_to_emit: ?[]const u8 = if (maybe_new) |s| s else hl.location;
+        if (loc_to_emit) |loc| {
+            try out.appendSlice(allocator, " location=\"");
+            // Source-borrowed locations are verbatim XML-escaped; pass
+            // through. Rewriter output is raw — escape for attribute
+            // context (same set as element content for our target chars,
+            // plus `"` which can't appear inside a quoted attr value).
+            if (maybe_new != null) {
+                try appendXmlEscapedAttr(allocator, &out, loc);
+            } else {
+                try out.appendSlice(allocator, loc);
+            }
+            try out.append(allocator, '"');
+        }
+        if (hl.display) |d| {
+            try out.appendSlice(allocator, " display=\"");
+            try out.appendSlice(allocator, d);
+            try out.append(allocator, '"');
+        }
+        if (hl.tooltip) |t| {
+            try out.appendSlice(allocator, " tooltip=\"");
+            try out.appendSlice(allocator, t);
+            try out.append(allocator, '"');
+        }
+        try out.appendSlice(allocator, "/>");
+    }
+
+    if (is_self_closing) try out.appendSlice(allocator, "</hyperlinks>");
+    try out.appendSlice(allocator, source[suffix_start..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Escape XML attribute-value content (`<`, `>`, `&`, `"`). The
+/// rewriter never emits raw `"` (strings are tokenizer-rejected) but
+/// we encode it for safety so a future relaxation doesn't silently
+/// produce unparseable XML.
+fn appendXmlEscapedAttr(allocator: Allocator, out: *std.ArrayList(u8), text: []const u8) Error!void {
+    for (text) |b| {
+        switch (b) {
+            '<' => try out.appendSlice(allocator, "&lt;"),
+            '>' => try out.appendSlice(allocator, "&gt;"),
+            '&' => try out.appendSlice(allocator, "&amp;"),
+            '"' => try out.appendSlice(allocator, "&quot;"),
+            else => try out.append(allocator, b),
+        }
+    }
+}
 
 // ─── Emit helpers (iter-wb-4 m1) ─────────────────────────────────────
 
@@ -2501,4 +2882,216 @@ test "Workbook.rewriteAllFormulas: rename_sheet rewrites quoted sheet qualifiers
     const a1 = (try (try wb2.sheet(0)).cellByRef("A1")).?;
     // Bare cross-sheet name re-emits as bare.
     try std.testing.expectEqualStrings("Renamed!A1+1", a1.formula.?);
+}
+
+// ─── C1 M2 milestone-3 tests: defined names + hyperlinks ─────────────
+
+/// Splice the substring `inject` into `source` immediately before the
+/// first occurrence of `marker`, returning a fresh allocator-owned
+/// slice. Used by the milestone-3 tests to graft `<definedNames>` /
+/// `<hyperlinks>` blocks into corpus parts that lack them. Returns
+/// `error.MalformedXml` when `marker` is absent.
+fn spliceBefore(
+    allocator: Allocator,
+    source: []const u8,
+    marker: []const u8,
+    inject: []const u8,
+) ![]u8 {
+    const at = std.mem.indexOf(u8, source, marker) orelse return error.MalformedXml;
+    var out = try allocator.alloc(u8, source.len + inject.len);
+    @memcpy(out[0..at], source[0..at]);
+    @memcpy(out[at .. at + inject.len], inject);
+    @memcpy(out[at + inject.len ..], source[at..]);
+    return out;
+}
+
+test "Workbook.rewriteAllDefinedNames: insert_rows shifts workbook-scope formula" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-rewrite-defnames-{d}.xlsx", .{prng.random().int(u32)});
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    // Stage: graft a workbook-scope <definedNames> block into the
+    // corpus's xl/workbook.xml. The rewriter only walks the typed view,
+    // so we need at least one entry to observe.
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        const wb_part = (try wb.store.part("xl/workbook.xml")).?;
+        const inject = "<definedNames><definedName name=\"MyTotal\">Sheet1!A1+B1</definedName></definedNames>";
+        const patched = try spliceBefore(std.testing.allocator, wb_part.bytes, "</workbook>", inject);
+        defer std.testing.allocator.free(patched);
+        try wb.store.replacePart("xl/workbook.xml", patched);
+        try wb.save(tmp_path);
+    }
+
+    var wb = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb.deinit();
+
+    // Sanity: the typed view sees the injected entry.
+    try std.testing.expectEqual(@as(usize, 1), wb.workbook.defined_names.len);
+    try std.testing.expectEqualStrings("MyTotal", wb.workbook.defined_names[0].name);
+    try std.testing.expectEqualStrings("Sheet1!A1+B1", wb.workbook.defined_names[0].formula);
+
+    // Insert 1 row at row 1 — every ref to row >= 1 shifts +1.
+    const count = try wb.rewriteAllDefinedNames(.{
+        .insert_rows = .{ .at = 1, .count = 1 },
+    });
+    try std.testing.expectEqual(@as(u32, 1), count);
+    try std.testing.expectEqualStrings("Sheet1!A2+B2", wb.workbook.defined_names[0].formula);
+
+    // Persistence round-trip.
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-rewrite-defnames-out-{d}.xlsx", .{prng.random().int(u32)});
+    defer std.fs.cwd().deleteFile(tmp2_path) catch {};
+    try wb.save(tmp2_path);
+
+    var wb2 = try Workbook.open(std.testing.allocator, tmp2_path);
+    defer wb2.deinit();
+    try std.testing.expectEqual(@as(usize, 1), wb2.workbook.defined_names.len);
+    try std.testing.expectEqualStrings("Sheet1!A2+B2", wb2.workbook.defined_names[0].formula);
+    try std.testing.expectEqual(@as(?u32, null), wb2.workbook.defined_names[0].local_sheet_id);
+}
+
+test "Workbook.rewriteAllDefinedNames: sheet-scope localSheetId preserved" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-rewrite-defnames-scope-{d}.xlsx", .{prng.random().int(u32)});
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        const wb_part = (try wb.store.part("xl/workbook.xml")).?;
+        // localSheetId="0" → scoped to the first sheet ("Sheet1" in
+        // this fixture). The bare ref `B5` resolves against on_sheet.
+        const inject = "<definedNames><definedName name=\"LocalRange\" localSheetId=\"0\">B5</definedName></definedNames>";
+        const patched = try spliceBefore(std.testing.allocator, wb_part.bytes, "</workbook>", inject);
+        defer std.testing.allocator.free(patched);
+        try wb.store.replacePart("xl/workbook.xml", patched);
+        try wb.save(tmp_path);
+    }
+
+    var wb = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb.deinit();
+    try std.testing.expectEqual(@as(?u32, 0), wb.workbook.defined_names[0].local_sheet_id);
+
+    const count = try wb.rewriteAllDefinedNames(.{
+        .insert_rows = .{ .at = 1, .count = 2 },
+    });
+    try std.testing.expectEqual(@as(u32, 1), count);
+    try std.testing.expectEqualStrings("B7", wb.workbook.defined_names[0].formula);
+    // localSheetId must round-trip through the splice.
+    try std.testing.expectEqual(@as(?u32, 0), wb.workbook.defined_names[0].local_sheet_id);
+}
+
+test "Workbook.rewriteAllHyperlinkLocations: internal hyperlink shifts" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-rewrite-hl-{d}.xlsx", .{prng.random().int(u32)});
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    // Stage: inject a <hyperlinks> block into sheet1.xml.
+    var sheet_part_name: []const u8 = undefined;
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        const ws = try wb.sheet(0);
+        _ = try ws.ensureParsed();
+        const part_name = ws.resolved_part_name.?;
+        sheet_part_name = try std.testing.allocator.dupe(u8, part_name);
+        const sheet_part = (try wb.store.part(part_name)).?;
+        // <hyperlinks> belongs after <sheetData> per ECMA-376; splice
+        // before </worksheet> as a structurally-valid fallback (the
+        // typed parser locates by tag, not position).
+        const inject = "<hyperlinks><hyperlink ref=\"A1\" location=\"Sheet1!B5\"/></hyperlinks>";
+        const patched = try spliceBefore(std.testing.allocator, sheet_part.bytes, "</worksheet>", inject);
+        defer std.testing.allocator.free(patched);
+        try wb.store.replacePart(part_name, patched);
+        try wb.save(tmp_path);
+    }
+    defer std.testing.allocator.free(sheet_part_name);
+
+    var wb = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb.deinit();
+
+    // Sanity: typed view sees the injected entry as internal-only.
+    {
+        const ws = try wb.sheet(0);
+        const hls = try ws.hyperlinks();
+        try std.testing.expectEqual(@as(usize, 1), hls.len);
+        try std.testing.expect(hls[0].r_id == null);
+        try std.testing.expectEqualStrings("Sheet1!B5", hls[0].location.?);
+    }
+
+    const count = try wb.rewriteAllHyperlinkLocations(.{
+        .insert_rows = .{ .at = 1, .count = 1 },
+    });
+    try std.testing.expectEqual(@as(u32, 1), count);
+
+    // Persistence round-trip.
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-rewrite-hl-out-{d}.xlsx", .{prng.random().int(u32)});
+    defer std.fs.cwd().deleteFile(tmp2_path) catch {};
+    try wb.save(tmp2_path);
+
+    var wb2 = try Workbook.open(std.testing.allocator, tmp2_path);
+    defer wb2.deinit();
+    const ws2 = try wb2.sheet(0);
+    const hls2 = try ws2.hyperlinks();
+    try std.testing.expectEqual(@as(usize, 1), hls2.len);
+    try std.testing.expectEqualStrings("Sheet1!B6", hls2[0].location.?);
+}
+
+test "Workbook.rewriteAllHyperlinkLocations: external r_id hyperlink skipped" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-rewrite-hl-ext-{d}.xlsx", .{prng.random().int(u32)});
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        const ws = try wb.sheet(0);
+        _ = try ws.ensureParsed();
+        const part_name = ws.resolved_part_name.?;
+        const sheet_part = (try wb.store.part(part_name)).?;
+        // External hyperlink: r:id present, no location. The display
+        // attribute matches the typical Excel emit shape.
+        const inject = "<hyperlinks><hyperlink ref=\"A2\" r:id=\"rIdNoSuch\" display=\"https://example.com\"/></hyperlinks>";
+        const patched = try spliceBefore(std.testing.allocator, sheet_part.bytes, "</worksheet>", inject);
+        defer std.testing.allocator.free(patched);
+        try wb.store.replacePart(part_name, patched);
+        try wb.save(tmp_path);
+    }
+
+    var wb = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb.deinit();
+
+    // Sanity: typed view sees the injected entry as external.
+    {
+        const ws = try wb.sheet(0);
+        const hls = try ws.hyperlinks();
+        try std.testing.expectEqual(@as(usize, 1), hls.len);
+        try std.testing.expect(hls[0].r_id != null);
+        try std.testing.expect(hls[0].location == null);
+    }
+
+    // External hyperlinks aren't candidates for rewrite — count == 0.
+    const count = try wb.rewriteAllHyperlinkLocations(.{
+        .insert_rows = .{ .at = 1, .count = 1 },
+    });
+    try std.testing.expectEqual(@as(u32, 0), count);
 }
