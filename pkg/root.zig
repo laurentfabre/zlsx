@@ -46,3 +46,4 @@ pub const Workbook = workbook_mod.Workbook;
 pub const Worksheet = workbook_mod.Worksheet;
 pub const ResolvedStyle = workbook_mod.ResolvedStyle;
 pub const WorkbookError = workbook_mod.Error;
+pub const NumberFormatInfo = workbook_mod.NumberFormatInfo;
