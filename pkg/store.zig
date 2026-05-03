@@ -741,6 +741,21 @@ pub const PartStore = struct {
         return self.rels_by_owner.get(owner_part_name) orelse &.{};
     }
 
+    /// Read-only predicate: does the store have at least one part
+    /// override (from `replacePart` or `addPart`) that hasn't been
+    /// flushed to disk yet?
+    ///
+    /// Note: `PartStore.save` does NOT clear overrides post-save —
+    /// they persist across save calls. So this predicate reflects
+    /// "diff vs the original on-disk archive opened by `open()`",
+    /// not "uncommitted-since-last-save". Most callers want the
+    /// former (e.g. for "do I need to save before exit?" — the
+    /// answer should remain true even after a previous save).
+    pub fn hasUnsavedChanges(self: *const PartStore) bool {
+        for (self.overrides) |o| if (o != null) return true;
+        return false;
+    }
+
     /// Resolve a relationship `target` (which is interpreted relative
     /// to `owner_part_name`'s parent directory) into a normalised
     /// absolute part name. Returns `null` for external targets and
