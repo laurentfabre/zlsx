@@ -76,7 +76,7 @@ wraparound).
 | **B0 hardening** ZIP32 sentinel safety, eager CRC32, CDFH bounds, ZIP-bomb caps, split-archive rejection, XML-entity round-trip in [Content_Types] + .rels (named + numeric), external-rel filter | ✅ shipped |
 | **B0 perf** Lazy decompress + file-streaming | ✅ shipped (PRs #30 + #31 — `PartStore.open` no longer slurps the file or eagerly decompresses; payloads stream from disk via seek + readAll on first `part(name)` access) |
 | **B1** Workbook typed overlay | ✅ shipped — [plan](workbook-overlay.md), PRs #21–#28, #30, #31. RSS gate green at 0.78× (ceiling 1.5×). |
-| **B2** Editor rebase onto Workbook | ⏳ pending |
+| **B2** Editor rebase onto Workbook | ⏳ pending — [plan](editor-rebase.md) |
 | **B3** Writer rebase onto Workbook | ⏳ pending |
 | **B-fuzz** Coverage-guided fuzz nightly | ✅ shipped (reader + package layer fuzz binaries on ubuntu-22.04 nightly) |
 | **C2a** Object extraction (images / charts / opaque) | ✅ shipped: image + chart anchors + series refs + Strict OOXML content-type detection + `<xdr:absoluteAnchor>` pixel-coordinate parsing (`absolute: ?AbsoluteAnchor`). Namespace handling is comprehensive: multi-prefix tracking (xdr_alts list, same-URI preference, late-declared bindings via full-document scan), proper XML scope (closed self-closing AND container siblings don't leak bindings, depth counter for nesting), in-scope local-binding authority (root fallback only when no local), per-tag chart-element verification (no false matches from unused declarations), comment/CDATA/PI awareness everywhere (forward state machine, fake-markup filtering, quote-aware tag-end + attribute-value scanning, candidate filtering at source), O(n) flat under adversarial input. |
