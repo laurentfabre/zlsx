@@ -82,6 +82,25 @@ pub const Error = error{
     /// etc.). v1 of `fromBook` is a re-open + sanity-check shim;
     /// future iters may share bytes via PartStore-from-bytes.
     SheetCountMismatch,
+    /// `Workbook.deleteSheet` refused to remove the sole remaining
+    /// sheet. OOXML / Excel require ≥1 sheet per workbook; opening a
+    /// zero-sheet `.xlsx` is a hard error in every consumer we know
+    /// about. The check is at the API boundary, not in the on-wire
+    /// patch helpers, so callers get a typed error before any state
+    /// mutation occurs.
+    LastSheetUndeletable,
+    /// `Workbook.deleteSheet` could not locate the target
+    /// `<Relationship Id="rId…">` element in
+    /// `xl/_rels/workbook.xml.rels`. Surfaces only when
+    /// `WorkbookXml.sheets[idx].r_id` references an Id that doesn't
+    /// exist on the wire (corrupted rels file).
+    RelationshipElementNotFound,
+    /// `Workbook.deleteSheet` could not locate the target
+    /// `<Override PartName="/xl/worksheets/sheetN.xml" .../>` element
+    /// in `[Content_Types].xml`. Soft: deleteSheet proceeds without
+    /// the override removal in this case (some tooling omits per-sheet
+    /// Overrides), but the typed error is exposed for future use.
+    ContentTypesOverrideNotFound,
     WriteFailed,
 } || workbook_xml_mod.Error || sheet_xml_mod.ParseError || sst_xml_mod.Error || styles_xml_mod.Error || store_mod.Error ||
     zlsx.formula_rewriter.Error ||
@@ -866,6 +885,129 @@ pub const Workbook = struct {
         }
     }
 
+    /// Remove the sheet at `sheet_idx` from the workbook. Patches three
+    /// XML parts and refreshes the in-memory view; subsequent
+    /// `Workbook.save` writes a workbook whose `<sheets>` list, rels
+    /// table, and `[Content_Types].xml` Overrides no longer reference
+    /// the removed sheet.
+    ///
+    /// **Orphan-part trade-off (v1).** `PartStore` has no `removePart`
+    /// API today, so the deleted sheet's `xl/worksheets/sheetN.xml`
+    /// (and its sidecar `xl/worksheets/_rels/sheetN.xml.rels` when
+    /// present) remain physically inside the archive after `save`,
+    /// just unreferenced from any rels / Content_Types entries. Excel,
+    /// LibreOffice, and openpyxl all tolerate orphan parts (the OPC
+    /// reader resolves parts via `[Content_Types].xml` Overrides + rels
+    /// graphs; unreferenced parts are dead weight). A true cleanup
+    /// requires `PartStore.removePart`; that's a future iter.
+    ///
+    /// **Cross-references not rewritten (v1).** `<definedName>` slots
+    /// with `localSheetId == sheet_idx` (sheet-scoped names), formulas
+    /// referencing the deleted sheet, and hyperlink targets pointing at
+    /// it remain on the wire and will produce `#REF!` or
+    /// `Reference is not valid` in Excel after open. Same scope
+    /// boundary as `renameSheet`'s `m3-defnames-hyperlinks` follow-up.
+    ///
+    /// **Errors:**
+    ///   - `SheetIndexOutOfRange` — `sheet_idx >= sheetCount()`.
+    ///   - `LastSheetUndeletable` — `sheetCount() == 1`.
+    ///   - `MissingWorkbookPart` / `MissingWorkbookRels` — corrupt
+    ///     archive lacks the parts to be patched.
+    ///   - `SheetElementNotFound` / `RelationshipElementNotFound` —
+    ///     the on-wire bytes don't match the parsed view (file
+    ///     mutated under us between parse and patch).
+    pub fn deleteSheet(self: *Workbook, sheet_idx: u32) Error!void {
+        if (sheet_idx >= self.sheetCount()) return error.SheetIndexOutOfRange;
+        if (self.sheetCount() == 1) return error.LastSheetUndeletable;
+        // Pre-condition: the slot table and the parsed view agree on
+        // length (the same invariant `sheetCount` asserts on read).
+        assert(self.worksheets.len == self.workbook.sheets.len);
+        assert(self.worksheets.len >= 2);
+
+        // Capture r_id BEFORE patches: the post-patch re-parse frees the
+        // arena that backs `sheets[idx].r_id`, but the rels patch needs
+        // the bytes alive.
+        const r_id_src = self.workbook.sheets[sheet_idx].r_id;
+        if (r_id_src.len == 0) return error.MissingRelationship;
+        if (r_id_src.len > 64) return error.MissingRelationship;
+        var r_id_buf: [64]u8 = undefined;
+        @memcpy(r_id_buf[0..r_id_src.len], r_id_src);
+        const r_id_owned = r_id_buf[0..r_id_src.len];
+
+        // Resolve the part name (e.g. "xl/worksheets/sheet2.xml") via
+        // ensureParsed — caches `resolved_part_name` on the Worksheet.
+        // Dupe into a stack buffer so the slot deinit below can't free
+        // it from under the Content_Types patch.
+        const ws = try self.sheet(sheet_idx);
+        _ = try ws.ensureParsed();
+        const part_name_src = ws.resolved_part_name orelse return error.MissingSheetPart;
+        if (part_name_src.len == 0) return error.MissingSheetPart;
+        if (part_name_src.len > 256) return error.MissingSheetPart;
+        var part_name_buf: [256]u8 = undefined;
+        @memcpy(part_name_buf[0..part_name_src.len], part_name_src);
+        const part_name_owned = part_name_buf[0..part_name_src.len];
+
+        try patchWorkbookXmlRemoveSheet(self, sheet_idx);
+        try patchWorkbookRelsRemoveRelationship(self, r_id_owned);
+        // Content_Types Override removal is best-effort — some
+        // tooling omits per-sheet Overrides and relies on Default
+        // entries instead.
+        patchContentTypesRemoveOverride(self, part_name_owned) catch |err| switch (err) {
+            error.ContentTypesOverrideNotFound => {},
+            else => return err,
+        };
+
+        // Re-parse the workbook view in place. Can't use
+        // `refreshWorkbookXmlView` here because that helper asserts
+        // sheet-count invariance (correct for renameSheet, wrong
+        // for delete which expects count - 1).
+        {
+            const fresh_part = try self.store.part("xl/workbook.xml") orelse
+                return error.MissingWorkbookPart;
+            var fresh = try workbook_xml_mod.parse(self.allocator, fresh_part.bytes);
+            errdefer fresh.deinit(self.allocator);
+            if (fresh.sheets.len + 1 != self.workbook.sheets.len) {
+                return error.SheetCountMismatch;
+            }
+            self.workbook.deinit(self.allocator);
+            self.workbook = fresh;
+        }
+
+        // Shrink the slot table. Order matters:
+        //   1. deinit the doomed Worksheet BEFORE copying slots —
+        //      copying first then freeing would deinit the wrong slot.
+        //   2. allocate the new (n-1)-sized slot array.
+        //   3. copy [0..idx] and [idx+1..] across.
+        //   4. free the old array.
+        const old_slots = self.worksheets;
+        const old_len = old_slots.len;
+        assert(sheet_idx < old_len);
+
+        old_slots[sheet_idx].deinit(self.allocator);
+
+        const new_slots = try self.allocator.alloc(Worksheet, old_len - 1);
+        errdefer self.allocator.free(new_slots);
+
+        var i: u32 = 0;
+        var j: u32 = 0;
+        while (i < old_len) : (i += 1) {
+            if (i == sheet_idx) continue;
+            new_slots[j] = old_slots[i];
+            // Renumber: surviving Worksheet's `sheet_idx` must line up
+            // with its new slot position (the re-parsed view holds
+            // sheets in document order).
+            new_slots[j].sheet_idx = j;
+            j += 1;
+        }
+        assert(j == old_len - 1);
+
+        self.allocator.free(old_slots);
+        self.worksheets = new_slots;
+
+        assert(self.worksheets.len == self.workbook.sheets.len);
+        assert(self.worksheets.len == old_len - 1);
+    }
+
     /// Read-only predicate: does the workbook carry any pending
     /// mutation that has not yet been flushed via `save`?
     ///
@@ -1088,6 +1230,261 @@ fn refreshWorkbookXmlView(self: *Workbook) Error!void {
 
     self.workbook.deinit(self.allocator);
     self.workbook = fresh;
+}
+
+// ─── deleteSheet patch helpers ────────────────────────────────────────
+
+/// Walk the source `xl/workbook.xml` bytes, find the Nth `<sheet>`
+/// element (1-based N == `sheet_idx + 1`), and splice it out — along
+/// with any leading whitespace inside `<sheets>` so the result
+/// remains visually stable. Re-emits the part via `replacePart`.
+fn patchWorkbookXmlRemoveSheet(self: *Workbook, sheet_idx: u32) Error!void {
+    assert(sheet_idx < self.workbook.sheets.len);
+
+    const part = try self.store.part("xl/workbook.xml") orelse return error.MissingWorkbookPart;
+    const src = part.bytes;
+    assert(src.len > 0);
+
+    var search_from: usize = 0;
+    var seen: u32 = 0;
+    var elem_open: usize = 0;
+    var elem_close: usize = 0;
+    while (true) {
+        const open = std.mem.indexOfPos(u8, src, search_from, "<sheet") orelse
+            return error.SheetElementNotFound;
+        const after = open + "<sheet".len;
+        if (after >= src.len) return error.SheetElementNotFound;
+        const boundary = src[after];
+        const is_sheet_elem = switch (boundary) {
+            ' ', '\t', '\r', '\n', '/' => true,
+            else => false,
+        };
+        if (!is_sheet_elem) {
+            search_from = after;
+            continue;
+        }
+        const gt = std.mem.indexOfScalarPos(u8, src, after, '>') orelse
+            return error.SheetElementNotFound;
+        if (seen == sheet_idx) {
+            elem_open = open;
+            // Self-closing form ends at `/>`; otherwise consume the
+            // matching `</sheet>`. OOXML emits `<sheet/>` in practice
+            // but tolerate the long form.
+            if (gt > 0 and src[gt - 1] == '/') {
+                elem_close = gt + 1;
+            } else {
+                const end_tag = std.mem.indexOfPos(u8, src, gt + 1, "</sheet>") orelse
+                    return error.SheetElementNotFound;
+                elem_close = end_tag + "</sheet>".len;
+            }
+            break;
+        }
+        seen += 1;
+        search_from = gt + 1;
+    }
+    assert(elem_close > elem_open);
+
+    var trim_start = elem_open;
+    while (trim_start > 0) {
+        const c = src[trim_start - 1];
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            trim_start -= 1;
+        } else break;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(self.allocator);
+    try out.ensureTotalCapacity(self.allocator, src.len);
+    try out.appendSlice(self.allocator, src[0..trim_start]);
+    try out.appendSlice(self.allocator, src[elem_close..]);
+
+    try self.store.replacePart("xl/workbook.xml", out.items);
+}
+
+/// Walk `xl/_rels/workbook.xml.rels` and elide the
+/// `<Relationship Id="rIdN" .../>` whose `Id` matches `r_id`.
+fn patchWorkbookRelsRemoveRelationship(self: *Workbook, r_id: []const u8) Error!void {
+    assert(r_id.len > 0);
+
+    const part = try self.store.part("xl/_rels/workbook.xml.rels") orelse
+        return error.MissingWorkbookRels;
+    const src = part.bytes;
+    assert(src.len > 0);
+
+    var search_from: usize = 0;
+    var elem_open: usize = 0;
+    var elem_close: usize = 0;
+    var found: bool = false;
+    while (true) {
+        const open = std.mem.indexOfPos(u8, src, search_from, "<Relationship") orelse break;
+        const after = open + "<Relationship".len;
+        if (after >= src.len) break;
+        const boundary = src[after];
+        const is_rel_elem = switch (boundary) {
+            ' ', '\t', '\r', '\n', '/' => true,
+            else => false,
+        };
+        if (!is_rel_elem) {
+            // `<Relationships>` (the wrapper) is the only collision.
+            search_from = after;
+            continue;
+        }
+        const gt = std.mem.indexOfScalarPos(u8, src, after, '>') orelse break;
+        const this_close = blk: {
+            if (gt > 0 and src[gt - 1] == '/') break :blk gt + 1;
+            const end_tag = std.mem.indexOfPos(u8, src, gt + 1, "</Relationship>") orelse
+                return error.RelationshipElementNotFound;
+            break :blk end_tag + "</Relationship>".len;
+        };
+
+        const attrs_end = if (gt > 0 and src[gt - 1] == '/') gt - 1 else gt;
+        const attrs = src[after..attrs_end];
+        if (attrIdEquals(attrs, r_id)) {
+            elem_open = open;
+            elem_close = this_close;
+            found = true;
+            break;
+        }
+        search_from = this_close;
+    }
+    if (!found) return error.RelationshipElementNotFound;
+    assert(elem_close > elem_open);
+
+    var trim_start = elem_open;
+    while (trim_start > 0) {
+        const c = src[trim_start - 1];
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            trim_start -= 1;
+        } else break;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(self.allocator);
+    try out.ensureTotalCapacity(self.allocator, src.len);
+    try out.appendSlice(self.allocator, src[0..trim_start]);
+    try out.appendSlice(self.allocator, src[elem_close..]);
+
+    try self.store.replacePart("xl/_rels/workbook.xml.rels", out.items);
+}
+
+/// Walk `[Content_Types].xml` and elide the
+/// `<Override PartName="/<part_name>" .../>` whose PartName matches
+/// `/<part_name>` (OOXML stores PartNames with a leading slash).
+/// Returns `error.ContentTypesOverrideNotFound` when no matching
+/// Override exists; the caller (deleteSheet) treats that as soft-OK.
+fn patchContentTypesRemoveOverride(self: *Workbook, part_name: []const u8) Error!void {
+    assert(part_name.len > 0);
+
+    const part = try self.store.part("[Content_Types].xml") orelse
+        return error.ContentTypesOverrideNotFound;
+    const src = part.bytes;
+    assert(src.len > 0);
+
+    if (part_name.len > 255) return error.ContentTypesOverrideNotFound;
+    var pn_buf: [256]u8 = undefined;
+    pn_buf[0] = '/';
+    @memcpy(pn_buf[1 .. 1 + part_name.len], part_name);
+    const target = pn_buf[0 .. 1 + part_name.len];
+
+    var search_from: usize = 0;
+    var elem_open: usize = 0;
+    var elem_close: usize = 0;
+    var found: bool = false;
+    while (true) {
+        const open = std.mem.indexOfPos(u8, src, search_from, "<Override") orelse break;
+        const after = open + "<Override".len;
+        if (after >= src.len) break;
+        const boundary = src[after];
+        const is_override_elem = switch (boundary) {
+            ' ', '\t', '\r', '\n', '/' => true,
+            else => false,
+        };
+        if (!is_override_elem) {
+            search_from = after;
+            continue;
+        }
+        const gt = std.mem.indexOfScalarPos(u8, src, after, '>') orelse break;
+        const this_close = gt + 1;
+
+        const attrs_end = if (gt > 0 and src[gt - 1] == '/') gt - 1 else gt;
+        const attrs = src[after..attrs_end];
+        if (attrPartNameEquals(attrs, target)) {
+            elem_open = open;
+            elem_close = this_close;
+            found = true;
+            break;
+        }
+        search_from = this_close;
+    }
+    if (!found) return error.ContentTypesOverrideNotFound;
+    assert(elem_close > elem_open);
+
+    var trim_start = elem_open;
+    while (trim_start > 0) {
+        const c = src[trim_start - 1];
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            trim_start -= 1;
+        } else break;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(self.allocator);
+    try out.ensureTotalCapacity(self.allocator, src.len);
+    try out.appendSlice(self.allocator, src[0..trim_start]);
+    try out.appendSlice(self.allocator, src[elem_close..]);
+
+    try self.store.replacePart("[Content_Types].xml", out.items);
+}
+
+fn attrIdEquals(attrs: []const u8, value: []const u8) bool {
+    return attrEquals(attrs, "Id", value);
+}
+
+fn attrPartNameEquals(attrs: []const u8, value: []const u8) bool {
+    return attrEquals(attrs, "PartName", value);
+}
+
+/// Generic attribute byte-compare. Walks `attrs` token-by-token (same
+/// shape as `patchWorkbookXmlSheetName`'s inline parser) and returns
+/// `true` iff some attribute named `key` has a quoted value byte-
+/// equal to `value`.
+fn attrEquals(attrs: []const u8, key: []const u8, value: []const u8) bool {
+    var i: usize = 0;
+    while (i < attrs.len) {
+        while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
+            attrs[i] == '\r' or attrs[i] == '\n')) : (i += 1)
+        {}
+        if (i >= attrs.len) return false;
+        const key_start = i;
+        while (i < attrs.len and attrs[i] != '=' and attrs[i] != ' ' and
+            attrs[i] != '\t' and attrs[i] != '\r' and attrs[i] != '\n') : (i += 1)
+        {}
+        const key_end = i;
+        while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
+            attrs[i] == '\r' or attrs[i] == '\n')) : (i += 1)
+        {}
+        if (i >= attrs.len or attrs[i] != '=') return false;
+        i += 1;
+        while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
+            attrs[i] == '\r' or attrs[i] == '\n')) : (i += 1)
+        {}
+        if (i >= attrs.len) return false;
+        const quote = attrs[i];
+        if (quote != '"' and quote != '\'') return false;
+        i += 1;
+        const val_start = i;
+        while (i < attrs.len and attrs[i] != quote) : (i += 1) {}
+        if (i >= attrs.len) return false;
+        const val_end = i;
+        i += 1;
+
+        if (std.mem.eql(u8, attrs[key_start..key_end], key) and
+            std.mem.eql(u8, attrs[val_start..val_end], value))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ─── Emit helpers (iter-wb-4 m1) ─────────────────────────────────────
@@ -4058,4 +4455,86 @@ test "Workbook.hasUnsavedChanges: renameSheet flips via PartStore override" {
     defer wb.deinit();
     try wb.renameSheet(1, "Renamed");
     try std.testing.expect(wb.hasUnsavedChanges());
+}
+
+test "Workbook.deleteSheet: happy path drops second sheet, byte-stable round-trip" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-delete-out-{d}.xlsx", .{prng.random().int(u32)});
+
+    // Capture sheet 0's name before delete so we can assert the
+    // survivor is the right sheet (not just "any one sheet").
+    var s0_name_buf: [128]u8 = undefined;
+    var s0_name_len: usize = 0;
+    {
+        var wb = try Workbook.open(std.testing.allocator, src_path);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 2), wb.sheetCount());
+
+        const s0 = try wb.sheet(0);
+        const name = s0.name();
+        try std.testing.expect(name.len <= s0_name_buf.len);
+        @memcpy(s0_name_buf[0..name.len], name);
+        s0_name_len = name.len;
+
+        try wb.deleteSheet(1);
+
+        try std.testing.expectEqual(@as(u32, 1), wb.sheetCount());
+        try std.testing.expectEqualStrings(s0_name_buf[0..s0_name_len], (try wb.sheet(0)).name());
+
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb2.deinit();
+    try std.testing.expectEqual(@as(u32, 1), wb2.sheetCount());
+    try std.testing.expectEqualStrings(s0_name_buf[0..s0_name_len], (try wb2.sheet(0)).name());
+
+    // workbook.xml's `<sheets>` list reflects the removal: only one
+    // `<sheet ` element (boundary-checked against `<sheets>`,
+    // `<sheetData>`, `<sheetView>`, etc.).
+    const wb_part = (try wb2.store.part("xl/workbook.xml")).?;
+    var i: usize = 0;
+    var sheet_count: u32 = 0;
+    while (std.mem.indexOfPos(u8, wb_part.bytes, i, "<sheet")) |pos| {
+        const after = pos + "<sheet".len;
+        if (after < wb_part.bytes.len) {
+            const b = wb_part.bytes[after];
+            if (b == ' ' or b == '\t' or b == '\r' or b == '\n' or b == '/') {
+                sheet_count += 1;
+            }
+        }
+        i = after;
+    }
+    try std.testing.expectEqual(@as(u32, 1), sheet_count);
+}
+
+test "Workbook.deleteSheet: refuses to remove the sole remaining sheet" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+
+    try wb.deleteSheet(1);
+    try std.testing.expectEqual(@as(u32, 1), wb.sheetCount());
+    try std.testing.expectError(error.LastSheetUndeletable, wb.deleteSheet(0));
+    // Still one sheet — no partial mutation slipped through.
+    try std.testing.expectEqual(@as(u32, 1), wb.sheetCount());
+}
+
+test "Workbook.deleteSheet: out-of-range index errors SheetIndexOutOfRange" {
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, src_path);
+    defer wb.deinit();
+    try std.testing.expectError(error.SheetIndexOutOfRange, wb.deleteSheet(99));
+    // Boundary: exact sheetCount() is also out-of-range (0-based).
+    try std.testing.expectError(error.SheetIndexOutOfRange, wb.deleteSheet(wb.sheetCount()));
+    // No mutation occurred.
+    try std.testing.expectEqual(@as(u32, 2), wb.sheetCount());
 }
