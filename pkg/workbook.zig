@@ -865,6 +865,29 @@ pub const Workbook = struct {
             if (asciiCaseInsensitiveEql(s.name, new_name)) return error.SheetNameInUse;
         }
     }
+
+    /// Read-only predicate: does the workbook carry any pending
+    /// mutation that has not yet been flushed via `save`?
+    ///
+    /// Returns `true` if EITHER:
+    ///   1. any `Worksheet.deltas` map is non-empty (uncommitted
+    ///      `setCell` mutations), OR
+    ///   2. the underlying `PartStore` has any override (uncommitted
+    ///      `replacePart` / `addPart` from e.g. `renameSheet`,
+    ///      `rewriteAllFormulas`, the SST extension path).
+    ///
+    /// Note: `PartStore.save` does NOT clear overrides post-save —
+    /// they persist across save calls. So this predicate reflects
+    /// "diff vs the original on-disk archive opened by `Workbook.open`",
+    /// not "uncommitted-since-last-save". Most callers want the
+    /// former (e.g. for "do I need to save before exit?" — the
+    /// answer should remain true even after a previous save).
+    pub fn hasUnsavedChanges(self: *const Workbook) bool {
+        for (self.worksheets) |ws| {
+            if (ws.deltas.count() > 0) return true;
+        }
+        return self.store.hasUnsavedChanges();
+    }
 };
 
 /// Validate a candidate sheet name per Excel's rules. v1 contract
@@ -3982,4 +4005,57 @@ test "Workbook.deleteCell: non-existent ref is a no-op" {
     defer wb2.deinit();
     const s0 = try wb2.sheet(0);
     try std.testing.expect((try s0.cellByRef("ZZ9999")) == null);
+}
+
+test "Workbook.hasUnsavedChanges: pristine workbook is clean" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+    try std.testing.expect(!wb.hasUnsavedChanges());
+}
+
+test "Workbook.hasUnsavedChanges: setCell flips the bit" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+    const s0 = try wb.sheet(0);
+    try s0.setCell("A1", .{ .number = 42 });
+    try std.testing.expect(wb.hasUnsavedChanges());
+}
+
+test "Workbook.hasUnsavedChanges: save clears delta-only dirt; PartStore overrides persist post-save" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-dirty-{d}.xlsx", .{prng.random().int(u32)});
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+    const s0 = try wb.sheet(0);
+    try s0.setCell("A1", .{ .number = 42 });
+    try std.testing.expect(wb.hasUnsavedChanges());
+    try wb.save(tmp_path);
+    // deltas are cleared by save, but PartStore overrides (set by
+    // save's replacePart calls) persist — predicate stays true.
+    // This documents the "diff vs original" semantics.
+    try std.testing.expect(wb.hasUnsavedChanges());
+
+    // Re-open from disk: clean again.
+    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    defer wb2.deinit();
+    try std.testing.expect(!wb2.hasUnsavedChanges());
+}
+
+test "Workbook.hasUnsavedChanges: renameSheet flips via PartStore override" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+    try wb.renameSheet(1, "Renamed");
+    try std.testing.expect(wb.hasUnsavedChanges());
 }
