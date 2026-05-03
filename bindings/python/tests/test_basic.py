@@ -1772,3 +1772,148 @@ def test_book_cell_alignment_round_trip(tmp_path):
         assert align0 is not None
         assert align0.horizontal == ""
         assert align0.wrap_text is False
+
+
+# ─── Editor.set_cell + save round-trip (iter-cm-2) ─────────────────────
+#
+# The C ABI exposes the Editor as `zlsx_editor_open` / `zlsx_editor_set_cell`
+# / `zlsx_editor_save` (added in libzlsx 0.2.7 / 0.2.9). The user-facing
+# request mentions a "Workbook overlay" with `Workbook.open / setCell /
+# save` — that surface is **not** a separate ABI; it's the Editor under
+# its production name. The Python wrapper exposes it as `zlsx.edit()`
+# returning a `zlsx.Editor`, with `set_cell()` and `save()` methods that
+# match the requested round-trip contract. These tests cover that
+# Workbook-overlay-equivalent path.
+#
+# Note: there is no `formula` cell tag in the C ABI — formulas are a
+# row-level construct via `zlsx_sheet_writer_write_row_with_formulas`,
+# not a per-cell `set_cell` call. The "formula" item from the user's
+# scope is therefore not addressable through `Editor.set_cell` and is
+# omitted intentionally; if a formula-mutating editor surface ships in
+# a later iter, a sibling test belongs here.
+
+
+def test_editor_set_cell_round_trip_number_int_bool_blank_string(tmp_path):
+    """Workbook.open(tmp_path) → setCell × {int, float, bool, blank,
+    string} → save → re-open → assert all values round-trip through
+    the C ABI."""
+    import zlsx._ffi as ffi
+    if not ffi._HAS_EDITOR or not ffi._HAS_EDITOR_SET_CELL:
+        pytest.skip("workbook overlay (Editor.set_cell) not exposed in loaded libzlsx")
+
+    src = tmp_path / "src.xlsx"
+    out = tmp_path / "out.xlsx"
+
+    # Seed a 2-row × 5-col grid of integers. Plain integer rows produce a
+    # canonical body with no `s=` style attr, so the editor's
+    # SetCellSourceCellHasMetadata guard is satisfied for every cell we
+    # rewrite below.
+    with zlsx.write(src) as w:
+        s = w.add_sheet("S")
+        s.write_row([1, 2, 3, 4, 5])
+        s.write_row([6, 7, 8, 9, 10])
+
+    with zlsx.edit(src) as ed:
+        # Cover every cell tag the ABI accepts via Editor.set_cell.
+        ed.set_cell(0, 1, 0, 42)              # CELL_INTEGER
+        ed.set_cell(0, 1, 1, 3.14159)         # CELL_NUMBER
+        ed.set_cell(0, 1, 2, True)            # CELL_BOOLEAN
+        ed.set_cell(0, 1, 3, None)            # CELL_EMPTY (blank)
+        ed.set_cell(0, 1, 4, "Done & dusted") # CELL_STRING (inline; XML-escaped)
+        # Also exercise set_cells bulk variant on row 2.
+        ed.set_cells(0, [
+            (2, 0, -7),
+            (2, 1, 2.5),
+            (2, 2, False),
+            (2, 3, None),
+            (2, 4, " trim me "),
+        ])
+        ed.save(out)
+
+    assert out.exists()
+
+    with zlsx.open(out) as book:
+        rows = list(book.sheet(0).rows())
+        # set_cell on col 3 with None blanks the cell — the row width may
+        # therefore shrink if the trailing cell ended up blank, but cols
+        # 0..4 all have some non-trivial content here so the iterator
+        # surfaces them.
+        assert rows[0][0] == 42
+        assert isinstance(rows[0][0], int)
+        assert abs(rows[0][1] - 3.14159) < 1e-9
+        assert isinstance(rows[0][1], float)
+        assert rows[0][2] is True
+        # Blank cell sits between two non-blank neighbours — readers
+        # surface it as None (canonical blank) when it's interior.
+        assert rows[0][3] is None
+        assert rows[0][4] == "Done & dusted"
+
+        assert rows[1][0] == -7
+        assert isinstance(rows[1][0], int)
+        assert abs(rows[1][1] - 2.5) < 1e-9
+        assert isinstance(rows[1][1], float)
+        assert rows[1][2] is False
+        assert rows[1][3] is None
+        assert rows[1][4] == " trim me "
+
+
+def test_editor_close_releases_handle_and_methods_raise(tmp_path):
+    """Editor.close releases the C handle; subsequent set_cell/save
+    must raise ZlsxError, not segfault. Mirrors the Book/Rows
+    after-close contract for lifetime safety."""
+    import zlsx._ffi as ffi
+    if not ffi._HAS_EDITOR or not ffi._HAS_EDITOR_SET_CELL:
+        pytest.skip("workbook overlay (Editor.set_cell) not exposed in loaded libzlsx")
+
+    src = tmp_path / "src.xlsx"
+    out = tmp_path / "out.xlsx"
+
+    with zlsx.write(src) as w:
+        w.add_sheet("S").write_row([1, 2])
+
+    ed = zlsx.edit(src)
+    ed.set_cell(0, 1, 0, 99)
+    ed.close()
+
+    with pytest.raises(zlsx.ZlsxError):
+        ed.set_cell(0, 1, 1, 100)
+    with pytest.raises(zlsx.ZlsxError):
+        ed.save(out)
+
+    # Double-close is a no-op (idempotent) — must not segfault.
+    ed.close()
+
+
+def test_editor_context_manager_drops_handle_on_exception(tmp_path):
+    """`with zlsx.edit(...)` must close the editor even when the body
+    raises. Verifies set_cell on the post-exit handle raises
+    ZlsxError instead of crashing."""
+    import zlsx._ffi as ffi
+    if not ffi._HAS_EDITOR or not ffi._HAS_EDITOR_SET_CELL:
+        pytest.skip("workbook overlay (Editor.set_cell) not exposed in loaded libzlsx")
+
+    src = tmp_path / "src.xlsx"
+    with zlsx.write(src) as w:
+        w.add_sheet("S").write_row([1])
+
+    captured = {}
+    with pytest.raises(RuntimeError, match="caller aborted"):
+        with zlsx.edit(src) as ed:
+            captured["ed"] = ed
+            ed.set_cell(0, 1, 0, 7)
+            raise RuntimeError("caller aborted")
+
+    ed = captured["ed"]
+    with pytest.raises(zlsx.ZlsxError):
+        ed.set_cell(0, 1, 0, 8)
+
+
+def test_editor_open_invalid_path_raises():
+    """Editor.open on a non-existent path must surface ZlsxError, not
+    return a NULL handle the caller would dereference."""
+    import zlsx._ffi as ffi
+    if not ffi._HAS_EDITOR:
+        pytest.skip("workbook overlay (Editor) not exposed in loaded libzlsx")
+
+    with pytest.raises(zlsx.ZlsxError):
+        zlsx.edit("/nonexistent/path/does/not/exist.xlsx")
