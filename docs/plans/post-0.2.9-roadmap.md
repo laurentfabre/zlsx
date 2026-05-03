@@ -25,23 +25,45 @@ drawing parser — multi-prefix bindings, full XML scope tracking
 for closed siblings, comment / CDATA / PI awareness, quote-aware
 attribute scanning, O(n) flat under adversarial input). addPart
 shipped on PartStore. C1 M1 (formula tokenizer + loss-preserving
-printer) shipped. **C1 M2 milestone 1 shipped** (PR #32 — pure
-`rewriteFormula`) plus its **m1.5 Workbook wiring** (PR #34 —
-`Workbook.rewriteAllFormulas(edit)`) and a **`Workbook.renameSheet`
-convenience** (PR #35 — combines `rename_sheet` rewrite + patches
-`xl/workbook.xml`'s `<sheet name=>` attr + refreshes the typed
-view).
+printer) shipped. **C1 M2 m1** (pure `rewriteFormula` — PR #32),
+**m1.5 Workbook wiring** (`rewriteAllFormulas` — PR #34),
+**m1.6 `Workbook.renameSheet`** (PR #35), and **m2 DV / CF
+rewriter with full splice persistence** (`rewriteAllValidationsAnd
+ConditionalFormats` with `target_sheet` parameter — PR #48) all
+landed. **m3 defined-names + hyperlinks rewriter is still pending**
+— a fresh-author attempt is recommended; the prior subagent
+attempts on 2026-05-02/03 were closed for cascading rebase
+conflicts on `pkg/workbook.zig`, but the agent's logic (target_sheet
+API + collect-then-splice fix for the sheet-scope panic) is
+referenced in the closed PRs' comments.
 
-C1 M2 m2 (DV / CF rewriter) and m3 (defined-names + hyperlinks
-rewriter) were attempted via parallel subagents 2026-05-02 but
-both were closed for redo: m2 hit a structural rebase conflict
-post-#35 and the in-memory-only persistence trade-off; m3 had a
-target_sheet API design issue + a sheet-scope test panic that
-needs careful debugging with a working local toolchain. Both
-remain pending in the table below. The `resolved_part_name` leak
-fix from m2's debugging IS shipped here as a standalone bug fix
-(every `parsed=null → ensureParsed` cycle previously leaked the
-prior part-name dupe).
+Convenience surface added in this batch:
+- `Worksheet.cellStyle(ref)` composite accessor (font / fill /
+  border / alignment / number-format-code) — PR #39
+- `Worksheet.deleteCell(ref)` via new `CellValue.deleted` arm —
+  PR #49
+- `Workbook.numberFormatFor(style_idx)` with the well-known
+  built-in numFmt table (0-4, 9-22, 37-40, 45-49) — PR #51
+- `Workbook.hasUnsavedChanges()` + `PartStore.hasUnsavedChanges()`
+  predicates — PR #56
+
+Test surface extended:
+- Python binding round-trip + lifecycle tests (`Editor` C ABI) —
+  PR #42
+
+Plans authored:
+- `docs/plans/editor-rebase.md` — B2 plan (PR #41)
+
+Closed for fresh re-authoring on stable main:
+- `Workbook.deleteSheet` (closed PR #43, #52 — agent commit
+  3b1fc3e + 8442099)
+- C2b minimal `addImage` (closed PR #47, #53 — agent commit
+  f6aa2d0)
+- C1 M2 m3 redo (closed PR #46, #54 — agent commit 3814745)
+
+The `resolved_part_name` leak in `Worksheet.ensureParsed` (every
+`parsed = null → ensureParsed` cycle leaked the prior dupe) was
+fixed in PR #38 alongside the prior doc refresh.
 
 Greenfield writer surface is feature-complete for non-image
 workbooks: cells, formulas, styles, validations, conditional
@@ -85,8 +107,14 @@ wraparound).
 | **C1 M2 m1** A1 cell-formula rewriter (`rewriteFormula`) | ✅ shipped (PR #32 — `src/formula/rewriter.zig`; insert/delete rows/cols + `rename_sheet`; absolute-marker preservation; `target_sheet`-scoped bare refs; range collapse to `#REF!`; 20 inline tests + `checkAllAllocationFailures`) |
 | **C1 M2 m1.5** Workbook wiring (`rewriteAllFormulas`) | ✅ shipped (PR #34 — walks every sheet, every formula cell; stages rewritten text via `setCell`; counts rewrites; byte-identical no-ops skipped) |
 | **C1 M2 m1.6** `Workbook.renameSheet` convenience | ✅ shipped (PR #35 — validates new name (length, forbidden chars, "history" reserved, case-insensitive duplicate detection); rewrites cross-sheet qualifiers via `rewriteAllFormulas`; patches `xl/workbook.xml`'s `<sheet name=>` attr; refreshes the typed view via re-parse so `wb.sheet(idx).name()` reflects the new value immediately) |
-| **C1 M2 m2** DV / CF formula rewriter | ⏳ pending (subagent attempt 2026-05-02 closed for redo — needs persistence design (in-memory vs sheet-XML splice) and rebase resolution) |
-| **C1 M2 m3** Defined-names + internal hyperlink rewriter | ⏳ pending (subagent attempt 2026-05-02 closed for redo — needs `target_sheet` API parameter and a sheet-scope test panic to be debugged with a working local toolchain) |
+| **C1 M2 m2** DV / CF formula rewriter | ✅ shipped (PR #48 — `rewriteAllValidationsAndConditionalFormats(edit, target_sheet)` with full splice persistence; byte-level rewrite of `<formula1>` / `<formula2>` / `<cfRule><formula>` inner-text spans, preserving every surrounding attribute (errorTitle, dxf_id, priority, etc.); 3 inline tests with synth helpers) |
+| **C1 M2 m3** Defined-names + internal hyperlink rewriter | ⏳ pending (multiple subagent attempts 2026-05-02/03 closed for cascading rebase conflicts; agent commit 3814745 has the working code with target_sheet API + collect-then-splice fix for sheet-scope panic — re-author on stable main) |
+| **Convenience: cellStyle accessor** | ✅ shipped (PR #39 — `Worksheet.cellStyle(ref)` returns composite `ResolvedStyle { font, fill, border, alignment, number_format_code }`; v1 simplifications: `apply_X` false ⇒ null sub-style; out-of-range sub-ids ⇒ null) |
+| **Convenience: Worksheet.deleteCell** | ✅ shipped (PR #49 — new `CellValue.deleted` arm; emits the cell as fully removed from `<sheetData>`, distinct from `.blank`) |
+| **Convenience: numberFormatFor** | ✅ shipped (PR #51 — `Workbook.numberFormatFor(style_idx)` with built-in numFmt table covering 0-4, 9-22, 37-40, 45-49 + custom-table fallback) |
+| **Convenience: hasUnsavedChanges** | ✅ shipped (PR #56 — `Workbook.hasUnsavedChanges()` + `PartStore.hasUnsavedChanges()`; documented quirk: `PartStore.save` does NOT clear overrides post-save, so the predicate is "diff vs original on-disk archive") |
+| **Convenience: deleteSheet** | ⏳ pending (closed PR #43/#52 — agent commits 3b1fc3e + 8442099 reference; needs fresh re-author on stable main) |
+| **Convenience: Python binding setCell+lifecycle tests** | ✅ shipped (PR #42 — Editor C ABI round-trip; documented gap: Workbook overlay surface NOT yet exposed in C ABI, so binding still uses `Editor`) |
 | **D1** Formula evaluator | deferred indefinitely |
 | **D2** Typed chart emit | deferred |
 
