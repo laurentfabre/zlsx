@@ -86,12 +86,9 @@ pub fn build(b: *std.Build) void {
         .single_threaded = single_threaded,
     });
     cli_mod.addImport("build_options", build_options_mod);
-    // After the B2 iter-er-0 Editor relocation, cli reaches Editor
-    // through zlsx_pkg and the rest of xlsx via the named `zlsx` dep
-    // (no more relative `@import("xlsx.zig")` / `@import("writer.zig")`,
-    // so the iter-wb-3 module-graph collision no longer fires).
-    cli_mod.addImport("zlsx", zlsx_mod);
-    cli_mod.addImport("zlsx_pkg", package_mod);
+    // `cli_mod.addImport("zlsx", zlsx_mod);` is wired below, after
+    // `package_mod` is declared (cli also gains a `zlsx_pkg` dep
+    // post B2 iter-er-0).
     const cli_exe = b.addExecutable(.{ .name = "zlsx", .root_module = cli_mod });
     b.installArtifact(cli_exe);
 
@@ -174,6 +171,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     package_mod.addImport("zlsx", zlsx_mod);
+
+    // After the B2 iter-er-0 Editor relocation, `cli_mod` reaches
+    // Editor through `zlsx_pkg` and xlsx via the named `zlsx` dep.
+    // Wired here (post `package_mod` declaration) instead of next to
+    // the `cli_mod` block above where `package_mod` isn't in scope yet.
+    cli_mod.addImport("zlsx", zlsx_mod);
+    cli_mod.addImport("zlsx_pkg", package_mod);
 
     // C2a: standalone `zlsx-extract-images` binary that drives the
     // package layer (PartStore + imageParts) without going through
