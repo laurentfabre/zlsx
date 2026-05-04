@@ -449,6 +449,39 @@ pub fn build(b: *std.Build) void {
     );
     bench_workbook_rss_step.dependOn(&bench_workbook_rss_run.step);
 
+    // ─── B2 iter-er-3: appendRows wall-clock baseline ──────────
+    //
+    // Off the default `test` step. Builds a 100k×5 fixture and
+    // times Editor.open + appendRows + save. Run with:
+    //   zig build bench-append-rows -- <tmpdir> [rows]
+    //
+    // iter-er-3's walk-away gate is "the rebased Editor.appendRows
+    // (route through Worksheet.appendRows on the Workbook overlay)
+    // stays within 1.10× of the legacy substring path on this
+    // fixture." Capture baseline → implement rebase → re-run →
+    // compare.
+    const bench_append_rows_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/bench_append_rows.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .single_threaded = single_threaded,
+    });
+    bench_append_rows_mod.addImport("zlsx", zlsx_mod);
+    bench_append_rows_mod.addImport("zlsx_pkg", package_mod);
+    const bench_append_rows_exe = b.addExecutable(.{
+        .name = "zlsx-bench-append-rows",
+        .root_module = bench_append_rows_mod,
+    });
+    const bench_append_rows_install = b.addInstallArtifact(bench_append_rows_exe, .{});
+    const bench_append_rows_run = b.addRunArtifact(bench_append_rows_exe);
+    if (b.args) |args| bench_append_rows_run.addArgs(args);
+    const bench_append_rows_step = b.step(
+        "bench-append-rows",
+        "B2 iter-er-3 baseline: time Editor.appendRows on a 100k×5 fixture (off the default test path)",
+    );
+    bench_append_rows_step.dependOn(&bench_append_rows_install.step);
+    bench_append_rows_step.dependOn(&bench_append_rows_run.step);
+
     // Per-module unit tests for the bench helpers (rss + synth).
     // These DO go on the default `test` step — they're cheap and
     // exercise the platform-specific code paths.
