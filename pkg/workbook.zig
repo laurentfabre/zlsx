@@ -3295,6 +3295,32 @@ pub const Worksheet = struct {
         assert(ref.len > 0);
         return self.setCell(ref, .deleted);
     }
+
+    /// Regenerate this worksheet's XML with the staged `setCell` /
+    /// `deleteCell` deltas applied. Returns allocator-owned bytes —
+    /// caller frees. The source `<sheetData>` block is regenerated
+    /// from scratch (parsed view + deltas merged in row/col order);
+    /// everything outside `<sheetData>` (sheet-level metadata,
+    /// `<mergeCells>`, `<dataValidations>`, `<conditionalFormatting>`,
+    /// `<hyperlinks>`, `<drawing>`, ...) is copied byte-for-byte from
+    /// source. B2 iter-er-2 entry-point: lets `Editor.save` route
+    /// modified-sheet emit through the workbook overlay without
+    /// invoking the full `Workbook.save` ZIP-rebuild pipeline.
+    ///
+    /// SST policy: this entry-point uses an EMPTY `SstExtensionPlan`,
+    /// so `.shared_string` deltas would resolve to `null` index and
+    /// trip the regen's invariant. The Editor pipeline maps every
+    /// `Cell.string` to `CellValue.string` (inlineStr — no SST
+    /// extension), so this is fine for iter-er-2's call sites.
+    /// Future iters that need shared-string emission from Editor
+    /// must pass a real plan.
+    pub fn emitWithDeltas(self: *Worksheet, allocator: Allocator) Error![]u8 {
+        const view = try self.ensureParsed();
+        const part_name = self.resolved_part_name orelse return error.MissingSheetPart;
+        const part = try self.workbook.store.part(part_name) orelse return error.MissingSheetPart;
+        const empty_plan: SstExtensionPlan = .{};
+        return emitSheetWithDeltas(allocator, part.bytes, view, &self.deltas, &empty_plan);
+    }
 };
 
 /// XML 1.0 §2.2: Char ::= #x9 | #xA | #xD | [#x20-#xD7FF] | …
