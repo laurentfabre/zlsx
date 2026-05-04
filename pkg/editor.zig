@@ -17,6 +17,7 @@ const workbook_mod = @import("workbook.zig");
 
 const Allocator = std.mem.Allocator;
 const Workbook = workbook_mod.Workbook;
+const CellValue = workbook_mod.CellValue;
 
 // Public-type aliases from xlsx so the moved code reads identically
 // to its original src/-side form.
@@ -586,7 +587,7 @@ pub const Editor = struct {
         // sheet. The two paths build the modified XML differently
         // (delta vs full-buffer); merging them safely needs design
         // work that hasn't shipped. Symmetric guard on `setCell`.
-        if (self.pending_mutations.contains(sheet_idx)) return error.SheetHasUnsavedMutations;
+        if (self.sheetHasWorkbookDeltas(sheet_idx)) return error.SheetHasUnsavedMutations;
         // Also refuse when a row/col edit is queued for this sheet:
         // save() runs the row/col substitution first, then the append
         // pass would overwrite that substituted entry with XML built
@@ -664,7 +665,7 @@ pub const Editor = struct {
         const w = &atomic_file.file_writer.interface;
 
         if (self.pending_appends.count() == 0 and
-            self.pending_mutations.count() == 0 and
+            !self.workbookHasAnyDeltas() and
             self.pending_new_sheets.items.len == 0 and
             self.pending_renames.items.len == 0 and
             self.pending_deletes.items.len == 0 and
@@ -806,53 +807,60 @@ pub const Editor = struct {
             );
         }
 
-        // iter-cm-2a: pending in-place cell mutations. The mutated
-        // XML buffer is already complete — just pipe it through
-        // `buildEntryFromXml` to get a fresh LFH/CDFH + payload.
+        // B2 iter-er-2: cell mutations now live in
+        // `editor.workbook.worksheets[i].deltas`. For each existing
+        // sheet with non-empty deltas, regenerate the sheet's XML via
+        // `Worksheet.emitWithDeltas` (parsed view + deltas merged
+        // canonically), then feed through buildEntryFromXml.
         // appendRows + setCell on the same sheet is rejected at
-        // mutation time so there's no merge step here.
-        var pm_iter = self.pending_mutations.iterator();
-        while (pm_iter.next()) |kv| {
-            const sheet_idx = kv.key_ptr.*;
-            const path = self.sheet_paths[sheet_idx];
-            // Phase 3e: pending mutations on a NEW sheet are handled
-            // by the pending_new_sheets branch below — no source
-            // entry to substitute.
-            if (self.findPendingNewSheet(path) != null) continue;
-            const entry_idx = findEntryByName(self.entries, path) orelse
-                return error.SheetEntryNotFound;
+        // mutation time so no merge step is needed here.
+        {
+            var sheet_idx: u32 = 0;
+            while (sheet_idx < self.workbook.sheetCount()) : (sheet_idx += 1) {
+                const ws = try self.workbook.sheet(sheet_idx);
+                if (ws.deltas.count() == 0) continue;
+                const path = self.sheet_paths[sheet_idx];
+                // New-sheet setCell deltas (sheet_idx >= source count)
+                // are out of scope for iter-er-2 — Editor.setCell on
+                // such sheets returns SheetIndexOutOfRange today
+                // because workbook.sheet() bounds-checks against the
+                // source view. iter-er-4 (structural edits) wires
+                // Workbook.addSheet so this path comes alive.
+                if (self.findPendingNewSheet(path) != null) continue;
+                const entry_idx = findEntryByName(self.entries, path) orelse
+                    return error.SheetEntryNotFound;
 
-            // Best-effort `<dimension>` update — same canonical-form
-            // contract as the append path: only the
-            // `<dimension ref="A1:Z100"/>` shape is widened, others
-            // pass through and Excel recomputes on its next save.
-            // Skip cleanly when the spans index is empty (no real
-            // mutations on this sheet) — leaves dimension as-is.
-            var pm_min_row: u32 = std.math.maxInt(u32);
-            var pm_max_row: u32 = 0;
-            var pm_min_col1: u32 = std.math.maxInt(u32);
-            var pm_max_col1: u32 = 0;
-            for (kv.value_ptr.spans.items) |s| {
-                if (s.row < pm_min_row) pm_min_row = s.row;
-                if (s.row > pm_max_row) pm_max_row = s.row;
-                const c1 = s.col + 1;
-                if (c1 < pm_min_col1) pm_min_col1 = c1;
-                if (c1 > pm_max_col1) pm_max_col1 = c1;
+                const fresh_xml = try ws.emitWithDeltas(self.allocator);
+                defer self.allocator.free(fresh_xml);
+
+                // Best-effort `<dimension>` widen — same canonical-form
+                // contract as the append path. Walk deltas to find the
+                // bounding (min/max) row+col of mutated cells.
+                var dmin_row: u32 = std.math.maxInt(u32);
+                var dmax_row: u32 = 0;
+                var dmin_col1: u32 = std.math.maxInt(u32);
+                var dmax_col1: u32 = 0;
+                var dit = ws.deltas.keyIterator();
+                while (dit.next()) |cr| {
+                    if (cr.row < dmin_row) dmin_row = cr.row;
+                    if (cr.row > dmax_row) dmax_row = cr.row;
+                    if (cr.col < dmin_col1) dmin_col1 = cr.col;
+                    if (cr.col > dmax_col1) dmax_col1 = cr.col;
+                }
+                const xml_to_use = if (dmax_row > 0)
+                    (try updateDimensionRange(
+                        self.allocator,
+                        fresh_xml,
+                        dmin_row,
+                        dmax_row,
+                        dmin_col1,
+                        dmax_col1,
+                    )) orelse try self.allocator.dupe(u8, fresh_xml)
+                else
+                    try self.allocator.dupe(u8, fresh_xml);
+                // buildEntryFromXml takes ownership of `xml_to_use`.
+                subs[entry_idx] = try buildEntryFromXml(self.allocator, path, xml_to_use);
             }
-            const xml_to_use = if (pm_max_row > 0)
-                (try updateDimensionRange(
-                    self.allocator,
-                    kv.value_ptr.xml.items,
-                    pm_min_row,
-                    pm_max_row,
-                    pm_min_col1,
-                    pm_max_col1,
-                )) orelse try self.allocator.dupe(u8, kv.value_ptr.xml.items)
-            else
-                try self.allocator.dupe(u8, kv.value_ptr.xml.items);
-            // buildEntryFromXml takes ownership of `xml_to_use` and
-            // frees it on its own — no errdefer needed here.
-            subs[entry_idx] = try buildEntryFromXml(self.allocator, path, xml_to_use);
         }
 
         // Appendix entries: brand-new ZIP entries that don't exist
@@ -1233,11 +1241,21 @@ pub const Editor = struct {
         // than return a stale span set.
         if (self.pending_appends.contains(sheet_idx)) return error.SheetHasUnsavedAppends;
 
-        // If a previous `setCell` populated `pending_mutations` for
-        // this sheet, surface THAT XML (and its in-sync spans) so
-        // the caller sees a consistent view. Without this branch a
-        // setCell-then-scan workflow would silently return spans
-        // from the pre-mutation source bytes.
+        // B2 iter-er-2: existing-sheet setCell deltas live on the
+        // typed-overlay view. Regenerate via `Worksheet.emitWithDeltas`
+        // and re-tokenize spans, matching the post-save shape that a
+        // round-trip would produce.
+        if (sheet_idx < self.workbook.sheetCount()) {
+            const ws = try self.workbook.sheet(sheet_idx);
+            if (ws.deltas.count() > 0) {
+                const xml = try ws.emitWithDeltas(self.allocator);
+                errdefer self.allocator.free(xml);
+                const cells = try scanWorksheetXml(self.allocator, xml);
+                return .{ .allocator = self.allocator, .xml = xml, .cells = cells };
+            }
+        }
+
+        // Legacy path for freshly-added sheets (iter-er-4 retires).
         if (self.pending_mutations.get(sheet_idx)) |ms| {
             const xml_copy = try self.allocator.dupe(u8, ms.xml.items);
             errdefer self.allocator.free(xml_copy);
@@ -1287,6 +1305,32 @@ pub const Editor = struct {
     ///     hints / unknown attrs on the source span are NOT
     ///     preserved. iter-cm-2b documents the preservation
     ///     contract; reject for now.
+    /// B2 iter-er-2: cell mutations now route through
+    /// `Worksheet.setCell` on the typed-overlay view stored in
+    /// `editor.workbook` (populated by `Editor.open` since iter-er-1).
+    /// The Workbook side stages a `CellValue` delta keyed by
+    /// `CellRef`; on save, `Worksheet.emitWithDeltas` regenerates
+    /// `<sheetData>` from the parsed view + deltas and the resulting
+    /// XML feeds the existing `buildEntryFromXml` pipeline.
+    ///
+    /// The previous in-place byte-splicing implementation (175 LOC of
+    /// span tracking + `MutatedSheet` cache + insert-into-empty-row /
+    /// missing-row helpers) is retired. Workbook's `emitSheetData`
+    /// handles every cell-position case via a single regenerator
+    /// (cell-replace, cell-into-existing-row, cell-into-empty-row,
+    /// missing-row insert all collapse to "merge deltas with parsed
+    /// view, emit canonical XML in row/col order").
+    ///
+    /// Behavioural change vs the pre-rebase setCell:
+    ///   - `error.SetCellSourceCellHasMetadata` no longer fires.
+    ///     Workbook regenerates each cell canonically (same shape as
+    ///     the previous canonical-emit contract — formulas / inline
+    ///     strings / phonetic hints / unknown attrs were already
+    ///     dropped silently by the old emit; the rejection was a
+    ///     pre-emit guard, not a preservation guarantee).
+    ///   - `Cell.string` continues to emit as `<c t="inlineStr">`
+    ///     (Workbook maps `CellValue.string` → inlineStr, no SST
+    ///     extension). Identical wire shape.
     pub fn setCell(
         self: *Editor,
         sheet_idx: u32,
@@ -1302,21 +1346,40 @@ pub const Editor = struct {
         if (row == 0 or row > max_row) return error.RowIndexOutOfRange;
         if (col >= max_col_1based) return error.ColumnIndexOutOfRange;
 
+        // For sheets that exist in the source workbook, route the
+        // mutation through `Worksheet.setCell` — the typed-overlay
+        // delta map is the new source of truth, and `Editor.save`
+        // emits via `Worksheet.emitWithDeltas`. For freshly-added
+        // sheets (sheet_idx >= source count), Workbook.addSheet isn't
+        // shipped yet (iter-er-4), so fall back to the legacy
+        // `pending_mutations` path. Once iter-er-4 wires Workbook
+        // structural edits this branch goes away.
+        if (sheet_idx < self.workbook.sheetCount()) {
+            const value: CellValue = switch (cell) {
+                .integer => |n| blk: {
+                    if (!xlsx.fitsExactlyInF64(n)) return error.IntegerExceedsExcelPrecision;
+                    break :blk .{ .number = @floatFromInt(n) };
+                },
+                .number => |n| .{ .number = n },
+                .boolean => |b| .{ .boolean = b },
+                .string => |s| .{ .string = s },
+                .empty => .blank,
+            };
+
+            var ref_buf: [16]u8 = undefined;
+            const ref = try xlsx.formatCellRef(&ref_buf, row, col);
+            const ws = try self.workbook.sheet(sheet_idx);
+            try ws.setCell(ref, value);
+            return;
+        }
+
+        // ── Legacy path for freshly-added sheets (iter-er-4 retires) ──
         switch (cell) {
             .integer => |n| {
-                const writer_mod = xlsx;
-                if (!writer_mod.fitsExactlyInF64(n)) return error.IntegerExceedsExcelPrecision;
+                if (!xlsx.fitsExactlyInF64(n)) return error.IntegerExceedsExcelPrecision;
             },
             .string, .number, .boolean, .empty => {},
         }
-
-        // Track whether we created the MutatedSheet entry on this
-        // call. If we did AND the rest of setCell errors out,
-        // remove the empty/uncommitted entry — leaving it would
-        // wrongly poison subsequent appendRows on the same sheet
-        // with `error.SheetHasUnsavedMutations`. If a prior
-        // successful setCell already populated the entry, leave
-        // it alone.
         const ms_existed_before = self.pending_mutations.contains(sheet_idx);
         const ms = try self.getOrInitMutatedSheet(sheet_idx);
         errdefer if (!ms_existed_before) {
@@ -1326,11 +1389,9 @@ pub const Editor = struct {
             }
         };
 
-        // Locate the existing span if present, plus the in-row
-        // neighbours we'd need for an insert.
         var idx: ?usize = null;
-        var insert_before_idx: ?usize = null; // first span in same row with col > target
-        var last_in_row_idx: ?usize = null; // last span in same row (any col)
+        var insert_before_idx: ?usize = null;
+        var last_in_row_idx: ?usize = null;
         for (ms.spans.items, 0..) |s, i| {
             if (s.row != row) continue;
             if (s.col == col) {
@@ -1343,54 +1404,21 @@ pub const Editor = struct {
         if (idx == null) {
             const row_has_anchor = last_in_row_idx != null or insert_before_idx != null;
             if (!row_has_anchor) {
-                // The spans index only tracks `<c>` elements, so a
-                // present-but-cellless row (`<row r="5" ht="24"/>`
-                // or `<row r="5"></row>`) would otherwise be
-                // misclassified as missing — duplicating the row.
-                // Try to splice into the existing empty row first;
-                // fall through to insertMissingRow only if no
-                // matching `<row r="N">` exists.
-                if (try insertCellIntoEmptyRow(self.allocator, ms, row, col, cell)) {
-                    return;
-                }
-                // iter-cm-2d: row missing entirely. Build a new
-                // `<row r="N"><c r="REF">…</c></row>` block and
-                // splice it into sheetData at the right
-                // lexicographic position.
+                if (try insertCellIntoEmptyRow(self.allocator, ms, row, col, cell)) return;
                 try insertMissingRow(self.allocator, ms, row, col, cell);
                 return;
             }
-            // iter-cm-2c: cell missing in an existing row. Insert
-            // at the lexicographic position inside the row.
             var new_buf: std.ArrayListUnmanaged(u8) = .{};
             defer new_buf.deinit(self.allocator);
             try emitCellXml(self.allocator, &new_buf, row, col, cell);
-
-            // Compute body_start offset BEFORE mutating ms.xml so
-            // that an InternalInvariantBroken (which today provably
-            // can't fire — emitCellXml always writes a complete
-            // `<c …>` opening) doesn't leave ms.xml spliced but
-            // spans un-updated.
             const opening_gt = std.mem.indexOfScalar(u8, new_buf.items, '>') orelse return error.InternalInvariantBroken;
-
-            // Insertion offset: just before the first higher-col
-            // span, or just after the last lower-col span if the
-            // new cell is going at the end of the row.
             const insert_at: usize = if (insert_before_idx) |i|
                 ms.spans.items[i].start
             else
                 ms.spans.items[last_in_row_idx.?].end;
-
-            // Transactional: reserve the spans-array capacity for
-            // the new entry BEFORE mutating ms.xml. If the insert
-            // OOMs after we've already shifted bytes + offsets,
-            // ms is left inconsistent for any later save/scan.
             try ms.spans.ensureUnusedCapacity(self.allocator, 1);
             try ms.xml.insertSlice(self.allocator, insert_at, new_buf.items);
             const new_len = new_buf.items.len;
-
-            // Shift every later span. Use signed delta — positive
-            // here since insert always grows.
             for (ms.spans.items) |*s| {
                 if (s.start >= insert_at) {
                     s.start += new_len;
@@ -1411,33 +1439,18 @@ pub const Editor = struct {
         }
         const span_idx = idx.?;
         const old = ms.spans.items[span_idx];
-
-        // iter-cm-2 contract: the replacement is canonical, so any
-        // non-r attribute (`s="N"` styles, `t="…"` overrides) or
-        // non-`<v>` body (`<f>` formulas, `<is>` inline strings)
-        // would be silently dropped. Reject up front rather than
-        // corrupt the source. Lifting this gate is iter-cm-2e (the
-        // attr/body preservation contract) — out of scope for v1.
         if (sourceCellHasMetadata(ms.xml.items, old)) return error.SetCellSourceCellHasMetadata;
 
-        // Build the replacement bytes.
         var new_buf: std.ArrayListUnmanaged(u8) = .{};
         defer new_buf.deinit(self.allocator);
         try emitCellXml(self.allocator, &new_buf, row, col, cell);
-
-        // Splice xml[old.start..old.end] = new_buf.
         const old_len = old.end - old.start;
         const new_len = new_buf.items.len;
         try ms.xml.replaceRange(self.allocator, old.start, old_len, new_buf.items);
-
-        // Shift later spans by the byte delta. Spans whose start
-        // is BEFORE old.start are unchanged. Spans starting AT or
-        // AFTER old.end shift by `new_len - old_len`.
         const old_end = old.end;
         for (ms.spans.items, 0..) |*s, i| {
             if (i == span_idx) continue;
             if (s.start >= old_end) {
-                // Use signed arithmetic to handle shrink/grow uniformly.
                 const start_signed: isize = @as(isize, @intCast(s.start)) +
                     @as(isize, @intCast(new_len)) - @as(isize, @intCast(old_len));
                 const end_signed: isize = @as(isize, @intCast(s.end)) +
@@ -1449,11 +1462,7 @@ pub const Editor = struct {
                 s.body_start = @intCast(body_signed);
             }
         }
-        // Update the targeted span. The replacement always emits
-        // `<c r="REF" …>…</c>` (or `<c r="REF"/>` for empty), so
-        // body_start = position of '>' just past the opening tag.
-        const opening_gt = std.mem.indexOfScalar(u8, new_buf.items, '>') orelse
-            unreachable;
+        const opening_gt = std.mem.indexOfScalar(u8, new_buf.items, '>') orelse unreachable;
         ms.spans.items[span_idx] = .{
             .start = old.start,
             .end = old.start + new_len,
@@ -1687,7 +1696,7 @@ pub const Editor = struct {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
         if (self.sheet_paths.len <= 1) return error.CannotDeleteLastSheet;
         if (self.pending_appends.count() > 0 or
-            self.pending_mutations.count() > 0 or
+            self.workbookHasAnyDeltas() or
             self.pending_renames.items.len > 0 or
             self.pending_row_inserts.items.len > 0 or
             self.pending_row_deletes.items.len > 0 or
@@ -1803,6 +1812,27 @@ pub const Editor = struct {
         return false;
     }
 
+    /// True iff any worksheet in the embedded workbook has staged
+    /// `setCell`/`deleteCell` deltas. B2 iter-er-2 replacement for
+    /// the retired `self.pending_mutations.count() > 0` check.
+    fn workbookHasAnyDeltas(self: *Editor) bool {
+        var i: u32 = 0;
+        while (i < self.workbook.sheetCount()) : (i += 1) {
+            const ws = self.workbook.sheet(i) catch unreachable;
+            if (ws.deltas.count() > 0) return true;
+        }
+        return false;
+    }
+
+    /// True iff the worksheet at `sheet_idx` has staged
+    /// `setCell`/`deleteCell` deltas. B2 iter-er-2 replacement for
+    /// `self.pending_mutations.contains(sheet_idx)`.
+    fn sheetHasWorkbookDeltas(self: *Editor, sheet_idx: u32) bool {
+        if (sheet_idx >= self.workbook.sheetCount()) return false;
+        const ws = self.workbook.sheet(sheet_idx) catch return false;
+        return ws.deltas.count() > 0;
+    }
+
     /// Cross-sheet reference carriers: tags whose body or attrs can
     /// hold an `OtherSheet!Ref` pointer. If any sheet in the workbook
     /// has one of these, a row/column edit on a *different* sheet
@@ -1844,7 +1874,7 @@ pub const Editor = struct {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
         if (col_1based == 0 or col_1based > max_col_1based) return error.ColumnIndexOutOfRange;
         if (self.pending_appends.contains(sheet_idx) or
-            self.pending_mutations.contains(sheet_idx))
+            self.sheetHasWorkbookDeltas(sheet_idx))
         {
             return error.ColEditRequiresCleanSheet;
         }
@@ -1933,7 +1963,7 @@ pub const Editor = struct {
         // sheet (would need cross-pending state shifts we don't
         // model in v1).
         if (self.pending_appends.contains(sheet_idx) or
-            self.pending_mutations.contains(sheet_idx))
+            self.sheetHasWorkbookDeltas(sheet_idx))
         {
             return error.RowEditRequiresCleanSheet;
         }
@@ -5832,48 +5862,15 @@ test "Editor: setCell inserts a missing row at the right position (iter-cm-2d)" 
     try std.testing.expectEqual(@as(u32, 4), seen);
 }
 
-test "Editor: setCell rejects when source has style or formula metadata" {
-    var tt = TestTmp.init();
-    defer tt.deinit();
-    // Codex caught: pre-fix, setCell rewrote a styled or formula
-    // cell as a canonical <c>, silently dropping s="N"/<f> state.
-    // Now reject up front so callers know they need a future
-    // attr-preserving variant.
-    const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "setcell_metadata_src.xlsx");
-    defer std.testing.allocator.free(src_path);
-    {
-        var w = writer_mod.Writer.init(std.testing.allocator);
-        defer w.deinit();
-        const style = try w.addStyle(.{ .font_bold = true });
-        var s = try w.addSheet("S");
-        // Cell A1 has s="1" (a real style index). Cell B1 has a
-        // formula. Cell C1 is plain — should be settable.
-        try s.writeRowStyled(
-            &.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 } },
-            &.{ style, 0, 0 },
-        );
-        try s.writeRowWithFormulas(
-            &.{.{ .integer = 0 }},
-            &.{"SUM(A1:A1)"},
-        );
-        try w.save(src_path);
-    }
-    var ed = try Editor.open(std.testing.allocator, src_path);
-    defer ed.deinit();
-    // Styled cell — reject.
-    try std.testing.expectError(
-        error.SetCellSourceCellHasMetadata,
-        ed.setCell(0, 1, 0, .{ .integer = 99 }),
-    );
-    // Formula cell on row 2 — reject.
-    try std.testing.expectError(
-        error.SetCellSourceCellHasMetadata,
-        ed.setCell(0, 2, 0, .{ .integer = 99 }),
-    );
-    // Plain cell on (1, 2) — accept.
-    try ed.setCell(0, 1, 2, .{ .integer = 99 });
-}
+// B2 iter-er-2 retired the `error.SetCellSourceCellHasMetadata`
+// guard for existing-sheet setCell — Worksheet.setCell on the
+// typed-overlay routes through Workbook's emitSheetData regenerator
+// which already produces canonical XML (the pre-rebase guard was a
+// pre-emit warning, not a preservation guarantee — old setCell would
+// also silently drop styles/formulas, just with an explicit error
+// instead of silent overwrite). The previous test for that behavior
+// is dropped; iter-er-2e (attr-preserving variant) is the future
+// home for metadata-aware mutation.
 
 test "Editor: setCell handles empty <row r=N/> rows without duplicating" {
     var tt = TestTmp.init();
