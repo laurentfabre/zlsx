@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const xlsx = @import("zlsx");
+const zlsx_pkg = @import("zlsx_pkg");
 
 const corpus_dir = "tests/corpus/";
 
@@ -366,7 +367,7 @@ test "Editor.scanWorksheet (iter-cm-1): every Book.rows cell has a matching span
     // must have a matching CellSpan at the same (row, col).
     const alloc = std.testing.allocator;
     const path = corpus_dir ++ "worldbank_catalog.xlsx";
-    var ed = try xlsx.Editor.open(alloc, path);
+    var ed = try zlsx_pkg.Editor.open(alloc, path);
     defer ed.deinit();
     var spans = try ed.scanWorksheet(0);
     defer spans.deinit();

@@ -66,6 +66,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     corpus_mod.addImport("zlsx", zlsx_mod);
+    // corpus_mod also needs `zlsx_pkg` for `Editor` post B2 iter-er-0;
+    // wired below after `package_mod` is declared.
     const corpus_tests = b.addTest(.{ .root_module = corpus_mod });
     const corpus_step = b.step("test-corpus", "Run integration tests against tests/corpus/*.xlsx");
     corpus_step.dependOn(&b.addRunArtifact(corpus_tests).step);
@@ -86,6 +88,9 @@ pub fn build(b: *std.Build) void {
         .single_threaded = single_threaded,
     });
     cli_mod.addImport("build_options", build_options_mod);
+    // `cli_mod.addImport("zlsx", zlsx_mod);` is wired below, after
+    // `package_mod` is declared (cli also gains a `zlsx_pkg` dep
+    // post B2 iter-er-0).
     const cli_exe = b.addExecutable(.{ .name = "zlsx", .root_module = cli_mod });
     b.installArtifact(cli_exe);
 
@@ -168,6 +173,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     package_mod.addImport("zlsx", zlsx_mod);
+
+    // After the B2 iter-er-0 Editor relocation, `cli_mod` reaches
+    // Editor through `zlsx_pkg` and xlsx via the named `zlsx` dep.
+    // Wired here (post `package_mod` declaration) instead of next to
+    // the `cli_mod` block above where `package_mod` isn't in scope yet.
+    cli_mod.addImport("zlsx", zlsx_mod);
+    cli_mod.addImport("zlsx_pkg", package_mod);
+    corpus_mod.addImport("zlsx_pkg", package_mod);
 
     // C2a: standalone `zlsx-extract-images` binary that drives the
     // package layer (PartStore + imageParts) without going through
@@ -301,6 +314,12 @@ pub fn build(b: *std.Build) void {
         .single_threaded = single_threaded,
     });
     c_abi_mod.addImport("build_options", build_options_mod);
+    // After the B2 iter-er-0 Editor relocation, c_abi reaches Editor
+    // through zlsx_pkg and xlsx via the named `zlsx` dep (no more
+    // relative `@import("xlsx.zig")` / `@import("writer.zig")`, so
+    // the iter-wb-3 module-graph collision no longer fires).
+    c_abi_mod.addImport("zlsx", zlsx_mod);
+    c_abi_mod.addImport("zlsx_pkg", package_mod);
     const dylib = b.addLibrary(.{
         .name = "zlsx",
         .linkage = .dynamic,
