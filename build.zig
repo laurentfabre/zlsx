@@ -66,6 +66,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     corpus_mod.addImport("zlsx", zlsx_mod);
+    // corpus_mod also needs `zlsx_pkg` for `Editor` post B2 iter-er-0;
+    // wired below after `package_mod` is declared.
     const corpus_tests = b.addTest(.{ .root_module = corpus_mod });
     const corpus_step = b.step("test-corpus", "Run integration tests against tests/corpus/*.xlsx");
     corpus_step.dependOn(&b.addRunArtifact(corpus_tests).step);
@@ -178,6 +180,7 @@ pub fn build(b: *std.Build) void {
     // the `cli_mod` block above where `package_mod` isn't in scope yet.
     cli_mod.addImport("zlsx", zlsx_mod);
     cli_mod.addImport("zlsx_pkg", package_mod);
+    corpus_mod.addImport("zlsx_pkg", package_mod);
 
     // C2a: standalone `zlsx-extract-images` binary that drives the
     // package layer (PartStore + imageParts) without going through
