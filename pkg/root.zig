@@ -54,3 +54,9 @@ pub const NumberFormatInfo = workbook_mod.NumberFormatInfo;
 const drawing_emit_mod = @import("drawing_emit.zig");
 pub const ImageMime = drawing_emit_mod.ImageMime;
 pub const ImageCellAnchor = drawing_emit_mod.ImageCellAnchor;
+
+/// Editor — load-modify-save overlay (relocated to pkg/ in B2 iter-er-0).
+const editor_mod = @import("editor.zig");
+pub const Editor = editor_mod.Editor;
+pub const CellSpan = editor_mod.CellSpan;
+pub const WorksheetSpans = editor_mod.WorksheetSpans;

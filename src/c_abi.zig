@@ -43,6 +43,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const xlsx = @import("xlsx.zig");
+const zlsx_pkg = @import("zlsx_pkg");
 const writer_mod = @import("writer.zig");
 
 pub const ZLSX_ABI_VERSION: u32 = 1;
@@ -77,7 +78,7 @@ pub const Rows = extern struct { _opaque: u8 };
 pub const Matrix = extern struct { _opaque: u8 };
 
 /// Opaque editor handle. Created by `zlsx_editor_open`, freed by
-/// `zlsx_editor_close`. Backed by an `xlsx.Editor` plus the heap
+/// `zlsx_editor_close`. Backed by an `zlsx_pkg.Editor` plus the heap
 /// allocation that owns its source buffer + entry table.
 pub const Editor = extern struct { _opaque: u8 };
 
@@ -3201,7 +3202,7 @@ fn fuzzItersCabi() usize {
 // ─── Editor (load-modify-save) ───────────────────────────────────────
 
 const EditorState = struct {
-    inner: xlsx.Editor,
+    inner: zlsx_pkg.Editor,
 };
 
 /// Open an existing xlsx for append-only mutation. Returns an Editor
@@ -3212,7 +3213,7 @@ export fn zlsx_editor_open(
     err_buf_len: usize,
 ) callconv(.c) ?*Editor {
     const path = std.mem.span(path_ptr);
-    const inner = xlsx.Editor.open(gpa, path) catch |e| {
+    const inner = zlsx_pkg.Editor.open(gpa, path) catch |e| {
         writeError(err_buf, err_buf_len, @errorName(e));
         return null;
     };

@@ -301,6 +301,9 @@ pub fn build(b: *std.Build) void {
         .single_threaded = single_threaded,
     });
     c_abi_mod.addImport("build_options", build_options_mod);
+    // c_abi reaches `Editor` (now living in pkg/editor.zig) through the
+    // package module — cross-module dep added in B2 iter-er-0.
+    c_abi_mod.addImport("zlsx_pkg", package_mod);
     const dylib = b.addLibrary(.{
         .name = "zlsx",
         .linkage = .dynamic,
