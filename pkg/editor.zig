@@ -13,8 +13,10 @@
 
 const std = @import("std");
 const xlsx = @import("zlsx");
+const workbook_mod = @import("workbook.zig");
 
 const Allocator = std.mem.Allocator;
+const Workbook = workbook_mod.Workbook;
 
 // Public-type aliases from xlsx so the moved code reads identically
 // to its original src/-side form.
@@ -305,6 +307,15 @@ pub const Editor = struct {
     /// inserts.
     pending_col_deletes: std.ArrayListUnmanaged(ColEdit),
 
+    /// B2 iter-er-1 read-side parity: `Editor.open` constructs an
+    /// internal `Workbook` view via `Workbook.fromBook` so subsequent
+    /// iters can route reads through the typed-overlay surface
+    /// without forking parsing logic. v1: read-only mirror — the
+    /// existing `Editor.scanWorksheet` / `appendRows` / `setCell`
+    /// pipeline still walks `entries` + `src_buf` directly.
+    /// `Editor.deinit` cleans up both Editor and Workbook.
+    workbook: Workbook,
+
     /// Pending in-place cell mutations per sheet (Phase 3d / iter-cm-2).
     /// Each entry holds the decompressed-and-mutated worksheet XML
     /// plus an in-sync span index. Populated lazily by `setCell` on
@@ -468,8 +479,20 @@ pub const Editor = struct {
         // editor needs this to find which entry in the ZIP table
         // corresponds to a given sheet on appendRows. Paths are
         // dup'd into editor-owned storage so Book.deinit doesn't
-        // dangle them.
-        const sheet_paths_owned = blk: {
+        // dangle them. The same Book instance is then promoted to a
+        // pkg-side `Workbook` via `Workbook.fromBook` (B2 iter-er-1)
+        // — typed-overlay parity for reads, no mutation rerouting yet.
+        var sheet_paths_alloc: ?[]const []const u8 = null;
+        errdefer if (sheet_paths_alloc) |sp| {
+            for (sp) |p_owned| allocator.free(p_owned);
+            allocator.free(sp);
+        };
+        var workbook_built: ?Workbook = null;
+        errdefer if (workbook_built) |*wb| {
+            var w = wb.*;
+            w.deinit();
+        };
+        {
             var b = try Book.open(allocator, path);
             defer b.deinit();
             const out_paths = try allocator.alloc([]const u8, b.sheets.len);
@@ -480,8 +503,14 @@ pub const Editor = struct {
             for (b.sheets, 0..) |s, i| {
                 out_paths[i] = try allocator.dupe(u8, s.path);
             }
-            break :blk out_paths;
-        };
+            sheet_paths_alloc = out_paths;
+
+            // Workbook.fromBook re-opens the file and sanity-checks
+            // sheet_count == book.sheets.len (errors SheetCountMismatch
+            // on disagreement). v1 contract — future iters may share
+            // bytes via PartStore-from-bytes.
+            workbook_built = try Workbook.fromBook(allocator, &b, path);
+        }
 
         return .{
             .allocator = allocator,
@@ -491,7 +520,8 @@ pub const Editor = struct {
             .cd_size = cd_size,
             .eocd_offset = @intCast(eocd_pos),
             .eocd_comment = eocd_comment,
-            .sheet_paths = sheet_paths_owned,
+            .sheet_paths = sheet_paths_alloc.?,
+            .workbook = workbook_built.?,
             .pending_appends = .{},
             .pending_mutations = .{},
             .pending_new_sheets = .{},
@@ -505,6 +535,7 @@ pub const Editor = struct {
     }
 
     pub fn deinit(self: *Editor) void {
+        self.workbook.deinit();
         self.allocator.free(self.src_buf);
         self.allocator.free(self.entries);
         for (self.sheet_paths) |p| self.allocator.free(p);
@@ -7188,4 +7219,80 @@ test "updateDimension widens row + column bounds together" {
     try std.testing.expectEqual(@as(?[]u8, null), try updateDimension(a, xml5, 99, 99));
     const xml6 = "<sheetData/>";
     try std.testing.expectEqual(@as(?[]u8, null), try updateDimension(a, xml6, 99, 99));
+}
+
+// ─── B2 iter-er-1: Editor read-side parity tests ─────────────────────
+
+/// Build a 2-sheet xlsx via the writer (which produces a non-DataDescriptor
+/// ZIP that Editor accepts) and return its temp path. Caller frees the
+/// returned slice and is responsible for the TestTmp lifecycle.
+fn buildIterEr1Fixture(tt: *TestTmp, alloc: std.mem.Allocator) ![:0]u8 {
+    const path = try tt.path(alloc, "iter_er_1.xlsx");
+    var w = xlsx.Writer.init(alloc);
+    defer w.deinit();
+    var s1 = try w.addSheet("Alpha");
+    try s1.writeRow(&.{ .{ .string = "h" }, .{ .integer = 1 } });
+    var s2 = try w.addSheet("Beta");
+    try s2.writeRow(&.{ .{ .string = "x" }, .{ .number = 2.5 } });
+    try w.save(path);
+    return path;
+}
+
+test "iter-er-1: Editor.open populates a Workbook view (sheet count + names match)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try buildIterEr1Fixture(&tt, std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    var ed = try Editor.open(std.testing.allocator, path);
+    defer ed.deinit();
+
+    // sheet_paths is built from Book.sheets[i].path. workbook view's
+    // sheetCount must match in lockstep — both walk
+    // xl/_rels/workbook.xml.rels off the same source archive.
+    try std.testing.expectEqual(@as(usize, ed.sheet_paths.len), @as(usize, ed.workbook.sheetCount()));
+    try std.testing.expectEqual(@as(u32, 2), ed.workbook.sheetCount());
+
+    // Sheet names from the typed-overlay view match what the writer
+    // emitted ("Alpha" / "Beta", in addSheet order).
+    const ws0 = try ed.workbook.sheet(0);
+    try std.testing.expectEqualStrings("Alpha", ws0.name());
+    const ws1 = try ed.workbook.sheet(1);
+    try std.testing.expectEqualStrings("Beta", ws1.name());
+}
+
+test "iter-er-1: Editor.deinit cleans up Workbook + everything else (no leaks)" {
+    // Editor.deinit calls self.workbook.deinit() before freeing
+    // src_buf / entries / sheet_paths. Under std.testing.allocator
+    // (which panics on leak), this test fails if any allocation
+    // outlives the editor.
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try buildIterEr1Fixture(&tt, std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    {
+        var ed = try Editor.open(std.testing.allocator, path);
+        ed.deinit();
+    }
+}
+
+test "iter-er-1: Editor.workbook.cellByRef matches Book.cell for known cells" {
+    // Cross-API parity sanity check: the Workbook view's per-cell
+    // accessor finds cells the writer emitted.
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try buildIterEr1Fixture(&tt, std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    var ed = try Editor.open(std.testing.allocator, path);
+    defer ed.deinit();
+
+    // The writer wrote integer 1 at B1 of "Alpha"; the typed-overlay
+    // view exposes it via Worksheet.cellByRef.
+    const ws0 = try ed.workbook.sheet(0);
+    const c = (try ws0.cellByRef("B1")) orelse return error.MissingCell;
+    try std.testing.expectEqualStrings("B1", c.ref);
+    try std.testing.expect(c.raw_value != null);
+    try std.testing.expectEqualStrings("1", c.raw_value.?);
 }
