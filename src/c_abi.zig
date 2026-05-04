@@ -42,9 +42,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const xlsx = @import("xlsx.zig");
+const xlsx = @import("zlsx");
 const zlsx_pkg = @import("zlsx_pkg");
-const writer_mod = @import("writer.zig");
+const writer_mod = xlsx.writer_types;
 
 pub const ZLSX_ABI_VERSION: u32 = 1;
 // Null-terminated version string derived from build.zig.zon. Using

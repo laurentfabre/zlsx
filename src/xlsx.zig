@@ -6842,6 +6842,17 @@ pub const formatCellRef = @import("writer.zig").formatCellRef;
 /// addImport on package_mod.
 pub const formula_rewriter = @import("formula/rewriter.zig");
 
+/// Whole-module re-export of `src/writer.zig`. Lets pkg/ and other
+/// consumers reach writer's input types (`Writer`, `SheetWriter`, `Style`,
+/// `BorderSide`, `BorderStyle`, `CfOperator`, `Dxf`, `HAlign`,
+/// `RichTextRun`, `RichRowCell`, `DataValidationOp`, `DataValidationNumericKind`,
+/// `validateSheetName`, `formatCellRef`, `fitsExactlyInF64`, ...) through
+/// the `zlsx` named module instead of importing writer.zig relatively —
+/// breaking the iter-wb-3 module-graph collision pattern when consumers
+/// also depend on `zlsx_pkg`. Used by `src/c_abi.zig` and `src/cli.zig`
+/// after the B2 iter-er-0 Editor relocation.
+pub const writer_types = @import("writer.zig");
+
 // ─── Deep reader fuzz: SST index pointing past the SST table ────────
 //
 // A malicious xlsx could reference a shared-string index that's beyond

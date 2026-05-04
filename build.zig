@@ -86,6 +86,12 @@ pub fn build(b: *std.Build) void {
         .single_threaded = single_threaded,
     });
     cli_mod.addImport("build_options", build_options_mod);
+    // After the B2 iter-er-0 Editor relocation, cli reaches Editor
+    // through zlsx_pkg and the rest of xlsx via the named `zlsx` dep
+    // (no more relative `@import("xlsx.zig")` / `@import("writer.zig")`,
+    // so the iter-wb-3 module-graph collision no longer fires).
+    cli_mod.addImport("zlsx", zlsx_mod);
+    cli_mod.addImport("zlsx_pkg", package_mod);
     const cli_exe = b.addExecutable(.{ .name = "zlsx", .root_module = cli_mod });
     b.installArtifact(cli_exe);
 
@@ -301,8 +307,11 @@ pub fn build(b: *std.Build) void {
         .single_threaded = single_threaded,
     });
     c_abi_mod.addImport("build_options", build_options_mod);
-    // c_abi reaches `Editor` (now living in pkg/editor.zig) through the
-    // package module — cross-module dep added in B2 iter-er-0.
+    // After the B2 iter-er-0 Editor relocation, c_abi reaches Editor
+    // through zlsx_pkg and xlsx via the named `zlsx` dep (no more
+    // relative `@import("xlsx.zig")` / `@import("writer.zig")`, so
+    // the iter-wb-3 module-graph collision no longer fires).
+    c_abi_mod.addImport("zlsx", zlsx_mod);
     c_abi_mod.addImport("zlsx_pkg", package_mod);
     const dylib = b.addLibrary(.{
         .name = "zlsx",
