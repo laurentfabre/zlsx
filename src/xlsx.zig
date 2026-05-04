@@ -4357,6 +4357,133 @@ pub const WorksheetSpans = struct {
 /// Lifetime: the source buffer + entry table are held resident;
 /// `deinit` frees both. Single-threaded per Editor instance, matching
 /// the rest of zlsx.
+// ─── Editor support types (hoisted from inside the Editor struct so
+// they can be referenced from pkg/editor.zig once Editor relocates).
+// No semantic change vs the prior `Editor.X` form.
+
+/// Buffered appended rows for one sheet. iter-lms-2 accepts
+/// numeric / integer / boolean / empty cells only — string cells
+/// require SST extension which lands in iter-lms-3.
+pub const AppendBuffer = struct {
+    rows: std.ArrayListUnmanaged([]Cell) = .{},
+};
+
+/// Decompressed worksheet XML kept resident so successive
+/// `setCell` calls amortise the decompress + tokenize cost.
+/// `spans` is kept in source-order and in sync with `xml` —
+/// every splice updates both.
+pub const MutatedSheet = struct {
+    xml: std.ArrayListUnmanaged(u8) = .{},
+    spans: std.ArrayListUnmanaged(CellSpan) = .{},
+
+    pub fn deinit(self: *MutatedSheet, allocator: Allocator) void {
+        self.xml.deinit(allocator);
+        self.spans.deinit(allocator);
+    }
+};
+
+/// State for one Phase 3e (iter-row-2/3) row insert/delete.
+pub const RowEdit = struct {
+    sheet_idx: u32,
+    row: u32, // 1-based; for insert this is `before_row`,
+    // for delete this is the row to remove.
+};
+
+/// State for one Phase 3e (iter-col-3/4) column insert/delete.
+pub const ColEdit = struct {
+    sheet_idx: u32,
+    col_1based: u32, // 1-based (A=1, B=2, …)
+};
+
+/// State for one Phase 3e (iter-sheet-3) sheet deletion.
+pub const SheetDelete = struct {
+    path: []u8, // owned
+    rid: []u8, // owned
+
+    pub fn deinit(self: *SheetDelete, alloc: Allocator) void {
+        alloc.free(self.path);
+        alloc.free(self.rid);
+    }
+};
+
+/// State for one Phase 3e (iter-sheet-2) sheet rename.
+/// `rid` is the source workbook's `r:id="rIdN"` for this sheet,
+/// captured at renameSheet time. The save-time patcher matches
+/// `<sheet r:id="…">` by this rId — Book.sheets indexing might
+/// drop entries with broken rels, so a positional walk over the
+/// raw workbook.xml order would target the wrong line.
+pub const SheetRename = struct {
+    sheet_idx: u32,
+    rid: []u8,
+    old_name: []u8,
+    new_name: []u8,
+
+    pub fn deinit(self: *SheetRename, alloc: Allocator) void {
+        alloc.free(self.rid);
+        alloc.free(self.old_name);
+        alloc.free(self.new_name);
+    }
+};
+
+/// State for one Phase 3e (iter-sheet-1) sheet addition. `path`
+/// is a BORROWED slice into the editor's `sheet_paths` array
+/// (the addSheet helper grows that array and stores the owned
+/// path bytes there); `deinit` does NOT free it.
+pub const NewSheet = struct {
+    name: []u8, // owned dupe of caller's name
+    path: []const u8, // borrowed from Editor.sheet_paths
+    rid: []u8, // owned, "rIdN"
+    sheet_id: u32,
+    body_xml: []u8, // owned, empty worksheet template
+
+    pub fn deinit(self: *NewSheet, alloc: Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.rid);
+        alloc.free(self.body_xml);
+    }
+};
+
+/// Per-entry spans captured by the iter-lms-1b raw-ZIP scanner.
+/// All offsets/lengths are relative to `src_buf`.
+pub const ZipEntry = struct {
+    /// Filename slice into `src_buf` (the CDFH-side filename;
+    /// must match the LFH's).
+    name: []const u8,
+    /// Local-file-header offset.
+    lfh_offset: u32,
+    /// Length of LFH (header + filename + extras). Payload starts
+    /// at `lfh_offset + lfh_total_len`.
+    lfh_total_len: u32,
+    /// Compressed payload bytes.
+    payload_len: u32,
+    /// Uncompressed payload size declared in the CDFH. Used as a
+    /// hard cap during decompression so a maliciously crafted
+    /// deflate stream can't expand past the declared size and
+    /// inflate memory usage on `save`.
+    uncompressed_size: u32,
+    /// CDFH offset (start of the central-directory file header
+    /// for this entry).
+    cdfh_offset: u32,
+    /// CDFH total length (header + filename + extras + comment).
+    cdfh_total_len: u32,
+    /// CompressionMethod value.
+    compression_method: u16,
+    /// General-purpose bit flag from CDFH.
+    gp_flags_raw: u16,
+};
+
+/// Bulk variant of `setCell` (Phase 3d, iter-cm-3). Same
+/// per-cell rules as `setCell`; the only win is amortising the
+/// "open the MutatedSheet for this sheet" lookup across N edits
+/// for callers that can batch them. Each `Edit` is applied in
+/// source order — later edits see the byte offsets produced by
+/// earlier ones, same as calling `setCell` N times.
+pub const Edit = struct {
+    row: u32,
+    col: u32,
+    cell: Cell,
+};
+
 pub const Editor = struct {
     allocator: Allocator,
     src_buf: []u8,
@@ -4430,117 +4557,6 @@ pub const Editor = struct {
     /// `error.SheetHasUnsavedAppends` (or the symmetric
     /// `error.SheetHasUnsavedMutations` from `appendRows`).
     pending_mutations: std.AutoHashMapUnmanaged(u32, MutatedSheet),
-
-    /// Buffered appended rows for one sheet. iter-lms-2 accepts
-    /// numeric / integer / boolean / empty cells only — string cells
-    /// require SST extension which lands in iter-lms-3.
-    pub const AppendBuffer = struct {
-        rows: std.ArrayListUnmanaged([]Cell) = .{},
-    };
-
-    /// Decompressed worksheet XML kept resident so successive
-    /// `setCell` calls amortise the decompress + tokenize cost.
-    /// `spans` is kept in source-order and in sync with `xml` —
-    /// every splice updates both.
-    pub const MutatedSheet = struct {
-        xml: std.ArrayListUnmanaged(u8) = .{},
-        spans: std.ArrayListUnmanaged(CellSpan) = .{},
-
-        pub fn deinit(self: *MutatedSheet, allocator: Allocator) void {
-            self.xml.deinit(allocator);
-            self.spans.deinit(allocator);
-        }
-    };
-
-    /// State for one Phase 3e (iter-row-2/3) row insert/delete.
-    pub const RowEdit = struct {
-        sheet_idx: u32,
-        row: u32, // 1-based; for insert this is `before_row`,
-        // for delete this is the row to remove.
-    };
-
-    /// State for one Phase 3e (iter-col-3/4) column insert/delete.
-    pub const ColEdit = struct {
-        sheet_idx: u32,
-        col_1based: u32, // 1-based (A=1, B=2, …)
-    };
-
-    /// State for one Phase 3e (iter-sheet-3) sheet deletion.
-    pub const SheetDelete = struct {
-        path: []u8, // owned
-        rid: []u8, // owned
-
-        pub fn deinit(self: *SheetDelete, alloc: Allocator) void {
-            alloc.free(self.path);
-            alloc.free(self.rid);
-        }
-    };
-
-    /// State for one Phase 3e (iter-sheet-2) sheet rename.
-    /// `rid` is the source workbook's `r:id="rIdN"` for this sheet,
-    /// captured at renameSheet time. The save-time patcher matches
-    /// `<sheet r:id="…">` by this rId — Book.sheets indexing might
-    /// drop entries with broken rels, so a positional walk over the
-    /// raw workbook.xml order would target the wrong line.
-    pub const SheetRename = struct {
-        sheet_idx: u32,
-        rid: []u8,
-        old_name: []u8,
-        new_name: []u8,
-
-        pub fn deinit(self: *SheetRename, alloc: Allocator) void {
-            alloc.free(self.rid);
-            alloc.free(self.old_name);
-            alloc.free(self.new_name);
-        }
-    };
-
-    /// State for one Phase 3e (iter-sheet-1) sheet addition. `path`
-    /// is a BORROWED slice into the editor's `sheet_paths` array
-    /// (the addSheet helper grows that array and stores the owned
-    /// path bytes there); `deinit` does NOT free it.
-    pub const NewSheet = struct {
-        name: []u8, // owned dupe of caller's name
-        path: []const u8, // borrowed from Editor.sheet_paths
-        rid: []u8, // owned, "rIdN"
-        sheet_id: u32,
-        body_xml: []u8, // owned, empty worksheet template
-
-        pub fn deinit(self: *NewSheet, alloc: Allocator) void {
-            alloc.free(self.name);
-            alloc.free(self.rid);
-            alloc.free(self.body_xml);
-        }
-    };
-
-    /// Per-entry spans captured by the iter-lms-1b raw-ZIP scanner.
-    /// All offsets/lengths are relative to `src_buf`.
-    pub const ZipEntry = struct {
-        /// Filename slice into `src_buf` (the CDFH-side filename;
-        /// must match the LFH's).
-        name: []const u8,
-        /// Local-file-header offset.
-        lfh_offset: u32,
-        /// Length of LFH (header + filename + extras). Payload starts
-        /// at `lfh_offset + lfh_total_len`.
-        lfh_total_len: u32,
-        /// Compressed payload bytes.
-        payload_len: u32,
-        /// Uncompressed payload size declared in the CDFH. Used as a
-        /// hard cap during decompression so a maliciously crafted
-        /// deflate stream can't expand past the declared size and
-        /// inflate memory usage on `save`.
-        uncompressed_size: u32,
-        /// CDFH offset (start of the central-directory file header
-        /// for this entry).
-        cdfh_offset: u32,
-        /// CDFH total length (header + filename + extras + comment).
-        cdfh_total_len: u32,
-        /// CompressionMethod value.
-        compression_method: u16,
-        /// General-purpose bit flag from CDFH.
-        gp_flags_raw: u16,
-    };
 
     pub fn open(allocator: Allocator, path: []const u8) !Editor {
         const file = try std.fs.cwd().openFile(path, .{});
@@ -5660,17 +5676,6 @@ pub const Editor = struct {
         };
     }
 
-    /// Bulk variant of `setCell` (Phase 3d, iter-cm-3). Same
-    /// per-cell rules as `setCell`; the only win is amortising the
-    /// "open the MutatedSheet for this sheet" lookup across N edits
-    /// for callers that can batch them. Each `Edit` is applied in
-    /// source order — later edits see the byte offsets produced by
-    /// earlier ones, same as calling `setCell` N times.
-    pub const Edit = struct {
-        row: u32,
-        col: u32,
-        cell: Cell,
-    };
     pub fn setCells(
         self: *Editor,
         sheet_idx: u32,
@@ -6512,7 +6517,7 @@ fn sourceCellHasMetadata(xml: []const u8, span: CellSpan) bool {
 /// through to the missing-row insert path).
 fn insertCellIntoEmptyRow(
     allocator: Allocator,
-    ms: *Editor.MutatedSheet,
+    ms: *MutatedSheet,
     row: u32,
     col: u32,
     cell: Cell,
@@ -6637,7 +6642,7 @@ fn insertCellIntoEmptyRow(
 /// MutatedSheet at the lexicographic position for `row`. iter-cm-2d.
 fn insertMissingRow(
     allocator: Allocator,
-    ms: *Editor.MutatedSheet,
+    ms: *MutatedSheet,
     row: u32,
     col: u32,
     cell: Cell,
@@ -6958,7 +6963,7 @@ const SubstitutedEntry = struct {
 
 /// Linear scan: small N (entries per xlsx is ~10-20) makes a hashmap
 /// overkill. Returns the first matching index.
-fn findEntryByName(entries: []const Editor.ZipEntry, name: []const u8) ?usize {
+fn findEntryByName(entries: []const ZipEntry, name: []const u8) ?usize {
     for (entries, 0..) |e, i| {
         if (std.mem.eql(u8, e.name, name)) return i;
     }
@@ -6997,7 +7002,7 @@ const SstAppender = struct {
 
 fn buildSubstitutedSheet(
     allocator: Allocator,
-    entry: Editor.ZipEntry,
+    entry: ZipEntry,
     src_buf: []u8,
     appended_rows: []const []Cell,
     sst: ?*SstAppender,
@@ -7132,7 +7137,7 @@ fn nextMaxRId(xml: []const u8) u32 {
 
 /// Highest `sheetN.xml` number seen in the entry table. Returns
 /// 0 when no `xl/worksheets/sheet*.xml` entry exists.
-fn nextMaxSheetPathNum(entries: []const Editor.ZipEntry) u32 {
+fn nextMaxSheetPathNum(entries: []const ZipEntry) u32 {
     const prefix = "xl/worksheets/sheet";
     const suffix = ".xml";
     var max_n: u32 = 0;
@@ -7159,7 +7164,7 @@ fn nextMaxSheetPathNum(entries: []const Editor.ZipEntry) u32 {
 fn patchWorkbookXmlForRenames(
     allocator: Allocator,
     xml: []const u8,
-    renames: []const Editor.SheetRename,
+    renames: []const SheetRename,
 ) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .{};
     errdefer out.deinit(allocator);
@@ -7250,7 +7255,7 @@ fn patchWorkbookXmlForRenames(
 fn patchWorkbookXmlForNewSheets(
     allocator: Allocator,
     xml: []const u8,
-    new_sheets: []const Editor.NewSheet,
+    new_sheets: []const NewSheet,
 ) ![]u8 {
     const close = std.mem.indexOf(u8, xml, "</sheets>") orelse return error.MalformedXml;
     var out: std.ArrayListUnmanaged(u8) = .{};
@@ -7273,7 +7278,7 @@ fn patchWorkbookXmlForNewSheets(
 fn patchWorkbookRelsForNewSheets(
     allocator: Allocator,
     xml: []const u8,
-    new_sheets: []const Editor.NewSheet,
+    new_sheets: []const NewSheet,
 ) ![]u8 {
     const close = std.mem.indexOf(u8, xml, "</Relationships>") orelse return error.MalformedXml;
     var out: std.ArrayListUnmanaged(u8) = .{};
@@ -7298,7 +7303,7 @@ fn patchWorkbookRelsForNewSheets(
 fn patchContentTypesForNewSheets(
     allocator: Allocator,
     xml: []const u8,
-    new_sheets: []const Editor.NewSheet,
+    new_sheets: []const NewSheet,
 ) ![]u8 {
     const close = std.mem.indexOf(u8, xml, "</Types>") orelse return error.MalformedXml;
     var out: std.ArrayListUnmanaged(u8) = .{};
@@ -8161,7 +8166,7 @@ fn writeWithReplacedRowAttr(
 fn patchWorkbookRelsForCalcChainDrop(
     allocator: Allocator,
     xml: []const u8,
-    deletes: []const Editor.SheetDelete,
+    deletes: []const SheetDelete,
 ) ![]u8 {
     _ = deletes;
     var out: std.ArrayListUnmanaged(u8) = .{};
@@ -8199,7 +8204,7 @@ fn patchWorkbookRelsForCalcChainDrop(
 fn patchContentTypesForCalcChainDrop(
     allocator: Allocator,
     xml: []const u8,
-    deletes: []const Editor.SheetDelete,
+    deletes: []const SheetDelete,
 ) ![]u8 {
     _ = deletes;
     var out: std.ArrayListUnmanaged(u8) = .{};
@@ -8328,7 +8333,7 @@ fn patchViewAttrs(
 fn patchWorkbookXmlForDeletes(
     allocator: Allocator,
     xml: []const u8,
-    deletes: []const Editor.SheetDelete,
+    deletes: []const SheetDelete,
 ) ![]u8 {
     // Single-pass walk: visit `<sheet>` and `<workbookView>` tags
     // in source order, regardless of which appears first in the
@@ -8441,7 +8446,7 @@ fn patchWorkbookXmlForDeletes(
 fn patchWorkbookRelsForDeletes(
     allocator: Allocator,
     xml: []const u8,
-    deletes: []const Editor.SheetDelete,
+    deletes: []const SheetDelete,
 ) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .{};
     errdefer out.deinit(allocator);
@@ -8478,7 +8483,7 @@ fn patchWorkbookRelsForDeletes(
 fn patchContentTypesForDeletes(
     allocator: Allocator,
     xml: []const u8,
-    deletes: []const Editor.SheetDelete,
+    deletes: []const SheetDelete,
 ) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .{};
     errdefer out.deinit(allocator);
@@ -8516,12 +8521,12 @@ fn patchContentTypesForDeletes(
 /// Twin of `patchEntryForNewSheets` for sheet deletes.
 fn patchEntryForDeletes(
     allocator: Allocator,
-    entries: []const Editor.ZipEntry,
+    entries: []const ZipEntry,
     src_buf: []u8,
     subs: []?SubstitutedEntry,
     entry_name: []const u8,
-    deletes: []const Editor.SheetDelete,
-    patcher: *const fn (Allocator, []const u8, []const Editor.SheetDelete) anyerror![]u8,
+    deletes: []const SheetDelete,
+    patcher: *const fn (Allocator, []const u8, []const SheetDelete) anyerror![]u8,
 ) !void {
     const entry_idx = findEntryByName(entries, entry_name) orelse
         return error.MissingEntry;
@@ -8551,12 +8556,12 @@ fn patchEntryForDeletes(
 /// already in subs[entry_idx].
 fn patchEntryForRenames(
     allocator: Allocator,
-    entries: []const Editor.ZipEntry,
+    entries: []const ZipEntry,
     src_buf: []u8,
     subs: []?SubstitutedEntry,
     entry_name: []const u8,
-    renames: []const Editor.SheetRename,
-    patcher: *const fn (Allocator, []const u8, []const Editor.SheetRename) anyerror![]u8,
+    renames: []const SheetRename,
+    patcher: *const fn (Allocator, []const u8, []const SheetRename) anyerror![]u8,
 ) !void {
     const entry_idx = findEntryByName(entries, entry_name) orelse
         return error.MissingEntry;
@@ -8594,12 +8599,12 @@ fn patchEntryForRenames(
 /// MUST exist for `addSheet` to be meaningful.
 fn patchEntryForNewSheets(
     allocator: Allocator,
-    entries: []const Editor.ZipEntry,
+    entries: []const ZipEntry,
     src_buf: []u8,
     subs: []?SubstitutedEntry,
     entry_name: []const u8,
-    new_sheets: []const Editor.NewSheet,
-    patcher: *const fn (Allocator, []const u8, []const Editor.NewSheet) anyerror![]u8,
+    new_sheets: []const NewSheet,
+    patcher: *const fn (Allocator, []const u8, []const NewSheet) anyerror![]u8,
 ) !void {
     const entry_idx = findEntryByName(entries, entry_name) orelse
         return error.MissingEntry;
@@ -8692,7 +8697,7 @@ fn addSstRelationship(allocator: Allocator, xml: []const u8) !?[]u8 {
 /// way; the rels patch is best-effort).
 fn patchEntryXml(
     allocator: Allocator,
-    entries: []const Editor.ZipEntry,
+    entries: []const ZipEntry,
     src_buf: []u8,
     subs: []?SubstitutedEntry,
     name: []const u8,
@@ -8716,7 +8721,7 @@ fn patchEntryXml(
 
 fn buildSubstitutedSst(
     allocator: Allocator,
-    entry: Editor.ZipEntry,
+    entry: ZipEntry,
     src_xml: []const u8,
     new_strings: []const []const u8,
     source_count: u32,
@@ -10633,7 +10638,7 @@ test "Editor: SST-less workbook gets fresh sharedStrings.xml on string append" {
         var ed = try Editor.open(std.testing.allocator, src_path);
         defer ed.deinit();
 
-        var filtered: std.ArrayListUnmanaged(Editor.ZipEntry) = .{};
+        var filtered: std.ArrayListUnmanaged(ZipEntry) = .{};
         defer filtered.deinit(std.testing.allocator);
         var saw_sst = false;
         for (ed.entries) |e| {
