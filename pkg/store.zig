@@ -767,6 +767,15 @@ pub const PartStore = struct {
         return false;
     }
 
+    /// Whether the part at `name` has been mutated since `open()`.
+    /// Returns `false` for parts that don't exist (use `part()` to
+    /// disambiguate). Used by `Editor.save` to know which source-
+    /// covered parts need fresh substitution from PartStore bytes.
+    pub fn isOverridden(self: *const PartStore, name: []const u8) bool {
+        const idx = self.findIndex(name) orelse return false;
+        return self.overrides[idx] != null;
+    }
+
     /// Resolve a relationship `target` (which is interpreted relative
     /// to `owner_part_name`'s parent directory) into a normalised
     /// absolute part name. Returns `null` for external targets and
