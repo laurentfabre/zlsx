@@ -3447,12 +3447,12 @@ pub const Worksheet = struct {
     /// plus the ordered list of new SST entries the caller must
     /// merge into `sharedStrings.xml`.
     ///
-    /// `new_xml` is owned by the caller's allocator. `new_strings`
-    /// is an owned slice header but its element slices BORROW from
-    /// the source `Worksheet.appended_rows` and stay valid only
-    /// until the next `clearAppendedRows` / `Worksheet.deinit`.
-    /// Callers must consume `new_strings` (typically: copy into the
-    /// SST renderer) before clearing the staging buffer.
+    /// Both `new_xml` and the contents of `new_strings` are owned
+    /// by the caller's allocator (deep-copied from
+    /// `Worksheet.appended_rows`). Element slices stay valid past
+    /// any `clearAppendedRows` / `Worksheet.deinit` — the audit
+    /// flagged the prior borrow contract as fragile against future
+    /// save-pipeline refactors that might clear mid-flight.
     ///
     /// Element ordering matches the row-major scan order used to
     /// render `<c t="s">` cells, so the SST writer can append
@@ -3464,6 +3464,7 @@ pub const Worksheet = struct {
 
         pub fn deinit(self: *AppendOutcome, allocator: Allocator) void {
             allocator.free(self.new_xml);
+            for (self.new_strings) |s| allocator.free(s);
             allocator.free(self.new_strings);
         }
     };
@@ -3526,7 +3527,13 @@ pub const Worksheet = struct {
         assert(max_col_1based <= zlsx.max_col_1based);
 
         const new_strings = try allocator.alloc([]const u8, string_count);
-        errdefer allocator.free(new_strings);
+        // Track how many element dupes we've completed so a
+        // mid-loop OOM frees only the prefix.
+        var owned_strings: u32 = 0;
+        errdefer {
+            for (new_strings[0..owned_strings]) |s| allocator.free(s);
+            allocator.free(new_strings);
+        }
 
         var rows_buf: std.ArrayList(u8) = .empty;
         defer rows_buf.deinit(allocator);
@@ -3549,11 +3556,13 @@ pub const Worksheet = struct {
                     sst_base_idx,
                     &sst_cursor,
                     new_strings,
+                    &owned_strings,
                 );
             }
             try rows_buf.appendSlice(allocator, "</row>");
         }
         assert(sst_cursor == string_count);
+        assert(owned_strings == string_count);
         assert(rows_buf.items.len > 0);
 
         const injected = try appendXmlInjectRows(allocator, src_xml, rows_buf.items);
@@ -3614,6 +3623,7 @@ fn appendCellXmlForAppend(
     sst_base_idx: u32,
     sst_cursor: *u32,
     new_strings: [][]const u8,
+    owned_strings: *u32,
 ) Error!void {
     // Pair-assertion with the per-row column-cap gate in
     // `Worksheet.appendRows`. `formatA1Ref` writes into a 16-byte
@@ -3649,8 +3659,12 @@ fn appendCellXmlForAppend(
         },
         .string => |s| {
             const idx = sst_base_idx + sst_cursor.*;
-            new_strings[sst_cursor.*] = s;
+            // Deep-copy into the caller allocator so the string
+            // outlives any future `clearAppendedRows` mid-save.
+            const dup = try allocator.dupe(u8, s);
+            new_strings[sst_cursor.*] = dup;
             sst_cursor.* += 1;
+            owned_strings.* += 1;
             try out.appendSlice(allocator, "<c r=\"");
             try out.appendSlice(allocator, ref_str);
             try out.appendSlice(allocator, "\" t=\"s\"><v>");

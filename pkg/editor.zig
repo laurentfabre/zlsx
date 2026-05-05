@@ -813,6 +813,22 @@ pub const Editor = struct {
         // SST entries to merge. New-sheet appends still flow
         // through `pending_appends` — the new-sheet block downstream
         // consumes `pending_appends.get(sheet_idx_for_new)` directly.
+        //
+        // Each outcome's `new_strings` is owned by the editor
+        // allocator (deep-copied from `Worksheet.appended_rows` so
+        // it survives any clearAppendedRows). The strings stay live
+        // until `buildSubstitutedSst` dupes them into the new SST
+        // XML — i.e., end of save(). Accumulate the headers + their
+        // owned elements in `pending_outcome_strings` and free at
+        // save end.
+        var pending_outcome_strings: std.ArrayListUnmanaged([]const []const u8) = .{};
+        defer {
+            for (pending_outcome_strings.items) |strs| {
+                for (strs) |s| self.allocator.free(s);
+                self.allocator.free(@constCast(strs));
+            }
+            pending_outcome_strings.deinit(self.allocator);
+        }
         {
             var sheet_idx: u32 = 0;
             while (sheet_idx < self.workbook.sheetCount()) : (sheet_idx += 1) {
@@ -825,16 +841,15 @@ pub const Editor = struct {
 
                 const sst_base_idx: u32 = if (sst_ptr) |p| p.next_idx else 0;
                 const outcome = try ws.emitWithAppends(self.allocator, sst_base_idx);
-                // `outcome.new_xml` is consumed by buildEntryFromXml.
-                // `outcome.new_strings` element slices borrow from
-                // ws.appended_rows; safe across save() because
-                // appended_rows lives until Editor.deinit (matching
-                // the legacy SstAppender lifetime contract).
-                // CRITICAL: never call ws.clearAppendedRows before
-                // `p.add(s)` completes — the SstAppender stores the
-                // borrowed slice and only buildSubstitutedSst dupes
-                // it into the new SST XML.
-                defer self.allocator.free(outcome.new_strings);
+                // From here, ownership of outcome's slices is split:
+                // `new_xml` → buildEntryFromXml. `new_strings` →
+                // pending_outcome_strings (free at save end). On the
+                // error path we must free both halves.
+                errdefer {
+                    self.allocator.free(outcome.new_xml);
+                    for (outcome.new_strings) |s| self.allocator.free(s);
+                    self.allocator.free(outcome.new_strings);
+                }
                 if (sst_ptr) |p| {
                     const expected_after = p.next_idx + @as(u32, @intCast(outcome.new_strings.len));
                     for (outcome.new_strings) |s| _ = try p.add(s);
@@ -845,6 +860,7 @@ pub const Editor = struct {
                     std.debug.assert(p.next_idx == expected_after);
                 }
                 subs[entry_idx] = try buildEntryFromXml(self.allocator, path, outcome.new_xml);
+                try pending_outcome_strings.append(self.allocator, outcome.new_strings);
             }
         }
 
