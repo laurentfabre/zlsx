@@ -54,6 +54,14 @@ pub const RewriteEdit = union(enum) {
     insert_cols: Span,
     delete_cols: Span,
     rename_sheet: Rename,
+    /// Delete the sheet named `delete_sheet` from the workbook.
+    /// Refs qualified to that sheet (`'Sheet1'!A1`,
+    /// `Sheet1!A1:B2`) collapse to `#REF!`. Bare refs are
+    /// unaffected — they're scoped to the formula's owning sheet,
+    /// which is necessarily some OTHER sheet (the deleted
+    /// sheet's own formulas are dropped with the sheet, not
+    /// rewritten).
+    delete_sheet: []const u8,
 };
 
 pub const RewriteContext = struct {
@@ -135,6 +143,12 @@ fn validateEdit(edit: RewriteEdit) Error!void {
             if (spec.new.len == 0) return error.InvalidEdit;
             assert(spec.old.len >= 1);
             assert(spec.new.len >= 1);
+        },
+        .delete_sheet => |name| {
+            // Empty name has no targets — refuse rather than
+            // silently no-op.
+            if (name.len == 0) return error.InvalidEdit;
+            assert(name.len >= 1);
         },
     }
 }
@@ -320,6 +334,12 @@ fn applyShift(ref: Ref, edit: RewriteEdit) ShiftOutcome {
             } };
         },
         .rename_sheet => return .unchanged,
+        // delete_sheet handling lives at the sheet-qualifier level
+        // (rewriteSheetQualifiedRefOrRange) — the per-ref shift
+        // never sees the sheet name and so can't decide. Treat as
+        // unchanged here; the caller has already collapsed the
+        // qualified ref to #REF! before applyShift runs.
+        .delete_sheet => return .unchanged,
     }
 }
 
@@ -510,11 +530,40 @@ fn rewriteSheetQualified(
         }
     }
 
+    // Sheet delete: collapse the entire qualified ref to #REF! by
+    // rewriting the sheet-qualifier token AND every ref token in
+    // the range to `.error_ref = "#REF!"`. The post-format pass
+    // squashes consecutive `.error_ref` tokens to a single
+    // `#REF!`, but doing the squash here keeps the token stream
+    // shape stable. Bare refs and refs to OTHER sheets are
+    // unaffected — they're handled by the row/col path below
+    // (or skipped via target_match).
+    if (ctx.edit == .delete_sheet) {
+        const target = ctx.edit.delete_sheet;
+        if (std.mem.eql(u8, decoded, target)) {
+            // Collapse the entire qualified-ref token sequence to a
+            // single `#REF!` by replacing the leading token's text
+            // with `#REF!` and zeroing the trailing tokens' text.
+            // The printer concatenates `.text` slices verbatim, so
+            // empty `.text` contributes nothing to the output.
+            const ref_lex = try registerOwned(allocator, owned, try allocator.dupe(u8, "#REF!"));
+            work[info.sheet_idx] = .{ .kind = .error_lit, .text = ref_lex };
+            var k: usize = info.sheet_idx + 1;
+            while (k < info.ref_end) : (k += 1) {
+                work[k] = .{ .kind = .whitespace, .text = "" };
+            }
+            return;
+        }
+        // Different sheet — nothing to do (bare-ref / row-col path
+        // is also a no-op for delete_sheet, see target_match below).
+        return;
+    }
+
     // Row/col edits apply only when the sheet matches the edit's
     // target_sheet. `target_sheet == null` means "apply everywhere."
     const target_match = blk: {
         switch (ctx.edit) {
-            .rename_sheet => break :blk false, // already handled
+            .rename_sheet, .delete_sheet => break :blk false, // already handled
             else => {},
         }
         if (ctx.target_sheet) |t| break :blk std.mem.eql(u8, current_sheet, t);
@@ -548,6 +597,12 @@ fn rewriteBareRefOrRange(
     const target_match = blk: {
         switch (ctx.edit) {
             .rename_sheet => break :blk false, // bare refs have no sheet to rename
+            // delete_sheet only collapses qualified refs. Bare refs
+            // are scoped to the formula's owning sheet, which is
+            // necessarily a sheet that's NOT being deleted (the
+            // deleted sheet's own formulas are dropped wholesale by
+            // Workbook.deleteSheet, not rewritten).
+            .delete_sheet => break :blk false,
             else => {},
         }
         if (ctx.target_sheet == null) break :blk true;
@@ -579,6 +634,11 @@ fn applyToRefRange(
     }
 
     if (edit == .rename_sheet) return;
+    // delete_sheet only collapses qualified refs (handled in
+    // rewriteSheetQualified). At this point we're processing bare
+    // or already-shifted refs, neither of which delete_sheet
+    // touches.
+    if (edit == .delete_sheet) return;
 
     const a = parseRef(work[ref_start].text) orelse return;
     const a_out = applyShift(a, edit);
@@ -778,6 +838,46 @@ test "ranges shift both endpoints" {
         "A4:A5",
         .{ .edit = .{ .delete_rows = .{ .at = 5, .count = 1 } } },
         "A4:#REF!",
+    );
+}
+
+test "delete_sheet collapses qualified refs to #REF!" {
+    // Plain qualified ref to the deleted sheet → #REF!.
+    try expectRewrite(
+        "Doomed!A1",
+        .{ .edit = .{ .delete_sheet = "Doomed" } },
+        "#REF!",
+    );
+    // Qualified ref to a DIFFERENT sheet — leave alone.
+    try expectRewrite(
+        "Survivor!A1",
+        .{ .edit = .{ .delete_sheet = "Doomed" } },
+        "Survivor!A1",
+    );
+    // Bare ref — unaffected (deleted sheet's own formulas are
+    // dropped wholesale, not rewritten).
+    try expectRewrite(
+        "A1",
+        .{ .edit = .{ .delete_sheet = "Doomed" } },
+        "A1",
+    );
+    // Range qualified to the deleted sheet → #REF!.
+    try expectRewrite(
+        "Doomed!A1:B5",
+        .{ .edit = .{ .delete_sheet = "Doomed" } },
+        "#REF!",
+    );
+    // Quoted sheet name with apostrophes.
+    try expectRewrite(
+        "'Bob''s Place'!A1",
+        .{ .edit = .{ .delete_sheet = "Bob's Place" } },
+        "#REF!",
+    );
+    // Multiple refs in one formula — only matching qualifier collapses.
+    try expectRewrite(
+        "Doomed!A1+Survivor!B2",
+        .{ .edit = .{ .delete_sheet = "Doomed" } },
+        "#REF!+Survivor!B2",
     );
 }
 

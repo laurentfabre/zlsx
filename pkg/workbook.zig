@@ -1767,6 +1767,22 @@ pub const Workbook = struct {
         @memcpy(part_name_buf[0..part_name_src.len], part_name_src);
         const part_name_owned = part_name_buf[0..part_name_src.len];
 
+        // B2 iter-er-5 lift (deleteSheet defined-names axis): rewrite
+        // every cross-sheet ref to the doomed sheet across the
+        // remaining sheets. Cell formulas, defined-name formulas,
+        // internal hyperlink locations, and DV / CF formulas all
+        // collapse to `#REF!` on the qualifier-matching path. Bare
+        // refs are unaffected (the deleted sheet's own formulas
+        // are dropped with the sheet, not rewritten).
+        const doomed_name_src = self.workbook.sheets[sheet_idx].name;
+        const doomed_name_owned = try self.allocator.dupe(u8, doomed_name_src);
+        defer self.allocator.free(doomed_name_owned);
+        const edit: zlsx.formula_rewriter.RewriteEdit = .{ .delete_sheet = doomed_name_owned };
+        _ = try self.rewriteAllFormulas(edit);
+        _ = try self.rewriteAllDefinedNames(edit, null);
+        _ = try self.rewriteAllHyperlinkLocations(edit, null);
+        _ = try self.rewriteAllValidationsAndConditionalFormats(edit, null);
+
         try patchWorkbookXmlRemoveSheet(self, sheet_idx);
         try patchWorkbookRelsRemoveRelationship(self, r_id_owned);
         // Content_Types Override removal is best-effort — some
