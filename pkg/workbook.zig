@@ -119,6 +119,23 @@ pub const Error = error{
     /// Sheet XML is missing its closing `</worksheet>` tag — refused
     /// rather than producing an unparseable sheet part.
     MalformedSheetXml,
+    /// `Worksheet.setCell` refused because the sheet already has
+    /// `appended_rows` staged — the iter-er-3 contract makes setCell
+    /// and appendRows mutually exclusive on a single Worksheet.
+    SheetHasUnsavedAppends,
+    /// `Worksheet.appendRows` refused because the sheet already has
+    /// `setCell`/`deleteCell` deltas staged — symmetric mutual-
+    /// exclusion guard. Lifting this gate is post-iter-er-2e (when
+    /// the substring fast-path can merge with delta regen).
+    SheetHasUnsavedMutations,
+    /// `Worksheet.appendRows` row width exceeds Excel's 16_384-column
+    /// cap (`xlsx.max_col_1based`).
+    ColumnIndexOutOfRange,
+    /// `Worksheet.appendRows` `.integer` value can't round-trip
+    /// exactly through f64 (i.e. `!fitsExactlyInF64(n)`). Excel
+    /// stores integers as f64 internally; values above 2^53 lose
+    /// precision silently.
+    IntegerExceedsExcelPrecision,
     WriteFailed,
 } || workbook_xml_mod.Error || sheet_xml_mod.ParseError || sst_xml_mod.Error || styles_xml_mod.Error || store_mod.Error ||
     zlsx.formula_rewriter.Error ||
@@ -3041,6 +3058,18 @@ pub const Worksheet = struct {
     /// last `setCell` for a given ref wins. Empty after `Workbook.save`.
     deltas: std.AutoHashMapUnmanaged(CellRef, CellValue) = .{},
 
+    /// B2 iter-er-3 (Phase 3a): pending appended rows. Each entry is
+    /// an owned `[]zlsx.Cell` slice with string payloads duped into
+    /// the workbook allocator. Cleared by the saver (Editor.save in
+    /// iter-er-3, eventually Workbook.save in iter-er-6) after the
+    /// substring-spliced sheet XML is emitted.
+    ///
+    /// Cannot coexist with non-empty `deltas` on the same Worksheet:
+    /// `appendRows` refuses if `deltas.count() > 0` and `setCell`
+    /// refuses if `appended_rows.items.len > 0`. Mirrors the legacy
+    /// Editor-side guards.
+    appended_rows: std.ArrayListUnmanaged([]zlsx.Cell) = .{},
+
     pub fn deinit(self: *Worksheet, allocator: Allocator) void {
         if (self.parsed) |*p| {
             var view = p.*;
@@ -3049,6 +3078,14 @@ pub const Worksheet = struct {
         if (self.resolved_part_name) |part_name| allocator.free(part_name);
         freeDeltaStrings(allocator, &self.deltas);
         self.deltas.deinit(allocator);
+        for (self.appended_rows.items) |row| {
+            for (row) |c| switch (c) {
+                .string => |s| allocator.free(s),
+                else => {},
+            };
+            allocator.free(row);
+        }
+        self.appended_rows.deinit(allocator);
     }
 
     /// Sheet name from the workbook's sheets list. Borrowed.
@@ -3243,6 +3280,10 @@ pub const Worksheet = struct {
     /// `error.MalformedXml` to prevent emitting unparseable XML.
     pub fn setCell(self: *Worksheet, ref: []const u8, value: CellValue) Error!void {
         assert(ref.len > 0);
+        // B2 iter-er-3 symmetric guard: setCell + appendRows on the
+        // same Worksheet are mutually exclusive (mirrors Editor's
+        // legacy SheetHasUnsavedAppends rejection).
+        if (self.appended_rows.items.len > 0) return error.SheetHasUnsavedAppends;
         const cr = try parseA1Ref(ref);
         const a = self.workbook.allocator;
 
@@ -3294,6 +3335,67 @@ pub const Worksheet = struct {
     pub fn deleteCell(self: *Worksheet, ref: []const u8) Error!void {
         assert(ref.len > 0);
         return self.setCell(ref, .deleted);
+    }
+
+    /// B2 iter-er-3 (Phase 3a): stage rows to append at the bottom of
+    /// the sheet. Each row is an iterable of `xlsx.Cell` variants
+    /// (`empty` / `number` / `integer` / `boolean` / `string`).
+    /// Strings are duped into the workbook allocator for owned
+    /// lifetime.
+    ///
+    /// **Refusal contract** (mirrors Editor.appendRows):
+    ///   - `error.SheetHasUnsavedMutations` if `self.deltas.count() > 0`
+    ///   - `error.ColumnIndexOutOfRange` if any row exceeds 16384 cells
+    ///   - `error.IntegerExceedsExcelPrecision` if any `.integer`
+    ///     value can't round-trip exactly through f64
+    ///
+    /// **What this method does NOT do**: emit XML, allocate SST
+    /// indices, or modify the sheet's parsed view. The actual
+    /// substring splice + SST extension happens at save time via
+    /// `emitWithAppends` (added in a follow-up commit). Until that
+    /// emit method lands, `appended_rows` is a pure staging buffer
+    /// with no observable effect — exists to let callers commit to
+    /// the new API surface ahead of the save-side wiring.
+    pub fn appendRows(
+        self: *Worksheet,
+        new_rows: []const []const zlsx.Cell,
+    ) Error!void {
+        if (self.deltas.count() > 0) return error.SheetHasUnsavedMutations;
+        if (new_rows.len == 0) return;
+        const a = self.workbook.allocator;
+        // Validation pass — fail BEFORE any allocation so a bad row
+        // doesn't half-stage cells from earlier new_rows in the same call.
+        for (new_rows) |row| {
+            if (row.len > zlsx.max_col_1based) return error.ColumnIndexOutOfRange;
+            for (row) |c| switch (c) {
+                .empty, .number, .boolean, .string => {},
+                .integer => |n| if (!zlsx.fitsExactlyInF64(n))
+                    return error.IntegerExceedsExcelPrecision,
+            };
+        }
+        // Reserve once — keeps the existing-cap path on the hot loop.
+        try self.appended_rows.ensureUnusedCapacity(a, new_rows.len);
+        for (new_rows) |row| {
+            const owned = try a.alloc(zlsx.Cell, row.len);
+            errdefer a.free(owned);
+            // Track how many cells we've duped so partial-fail
+            // cleanup frees only what we allocated.
+            var duped: usize = 0;
+            errdefer for (owned[0..duped]) |c| switch (c) {
+                .string => |s| a.free(s),
+                else => {},
+            };
+            for (row, 0..) |c, i| {
+                owned[i] = switch (c) {
+                    .string => |s| .{ .string = try a.dupe(u8, s) },
+                    else => c,
+                };
+                duped = i + 1;
+            }
+            // Capacity reserved above — appendAssumeCapacity is
+            // infallible from here.
+            self.appended_rows.appendAssumeCapacity(owned);
+        }
     }
 
     /// Regenerate this worksheet's XML with the staged `setCell` /
@@ -5640,4 +5742,82 @@ test "Workbook.addImage: rejects 0-based anchor with InvalidAnchor" {
         error.InvalidAnchor,
         wb.addImage(0, .{ .col = 1, .row = 0 }, &tiny_png_1x1, .png),
     );
+}
+
+// ─── B2 iter-er-3: Worksheet.appendRows API ──────────────────────────
+
+test "Worksheet.appendRows: stages rows into appended_rows with deep-copied strings" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+
+    const ws = try wb.sheet(0);
+    try std.testing.expectEqual(@as(usize, 0), ws.appended_rows.items.len);
+
+    var alpha = [_]u8{ 'a', 'l', 'p', 'h', 'a' };
+    const row0 = [_]zlsx.Cell{ .{ .integer = 1 }, .{ .string = &alpha } };
+    const row1 = [_]zlsx.Cell{ .{ .number = 2.5 }, .{ .boolean = true } };
+    try ws.appendRows(&.{ &row0, &row1 });
+
+    try std.testing.expectEqual(@as(usize, 2), ws.appended_rows.items.len);
+    try std.testing.expectEqual(@as(usize, 2), ws.appended_rows.items[0].len);
+
+    // Deep-copy invariant.
+    @memset(&alpha, 'X');
+    try std.testing.expectEqualStrings("alpha", ws.appended_rows.items[0][1].string);
+}
+
+test "Worksheet.appendRows: refuses when deltas are staged on the same sheet" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+
+    const ws = try wb.sheet(0);
+    try ws.setCell("A1", .{ .number = 99.0 });
+    const row = [_]zlsx.Cell{.{ .integer = 1 }};
+    try std.testing.expectError(error.SheetHasUnsavedMutations, ws.appendRows(&.{&row}));
+    try std.testing.expectEqual(@as(usize, 0), ws.appended_rows.items.len);
+}
+
+test "Worksheet.setCell: refuses when appended_rows are staged on the same sheet" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+
+    const ws = try wb.sheet(0);
+    const row = [_]zlsx.Cell{.{ .integer = 1 }};
+    try ws.appendRows(&.{&row});
+    try std.testing.expectError(error.SheetHasUnsavedAppends, ws.setCell("A1", .{ .number = 99.0 }));
+    try std.testing.expectEqual(@as(u32, 0), ws.deltas.count());
+}
+
+test "Worksheet.appendRows: rejects lossy integers before any allocation" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+
+    const ws = try wb.sheet(0);
+    const big: i64 = 9_007_199_254_740_993;
+    const ok_row = [_]zlsx.Cell{.{ .integer = 1 }};
+    const lossy_row = [_]zlsx.Cell{.{ .integer = big }};
+    try std.testing.expectError(
+        error.IntegerExceedsExcelPrecision,
+        ws.appendRows(&.{ &ok_row, &lossy_row }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), ws.appended_rows.items.len);
+}
+
+test "Worksheet.appendRows: empty rows slice is a no-op" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+
+    const ws = try wb.sheet(0);
+    try ws.appendRows(&.{});
+    try std.testing.expectEqual(@as(usize, 0), ws.appended_rows.items.len);
 }
