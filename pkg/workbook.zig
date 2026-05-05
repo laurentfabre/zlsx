@@ -1929,6 +1929,35 @@ pub const Workbook = struct {
             view.deinit(self.allocator);
             ws.parsed = null;
         }
+
+        // B2 iter-er-5 lift (row/col axes): rewrite cross-sheet
+        // refs in formulas, defined names, internal hyperlink
+        // locations, and DV/CF formulas. Each rewriter targets the
+        // edited sheet's bare-ref space so references like
+        // `=A1+B2` (no sheet qualifier) on the edited sheet shift
+        // alongside the byte-level row/col attrs above.
+        //
+        // The four rewriters write their edits as
+        // `Worksheet.setCell` deltas (formulas) or in-place splices
+        // (defined names, hyperlinks, DV/CF). Both compose with
+        // the byte transform: the parsed view we just invalidated
+        // re-parses from the shifted bytes on next access, so
+        // `emitWithDeltas` at save time merges shifted-ref text
+        // with shifted-r-attr cells.
+        const target = self.workbook.sheets[sheet_idx].name;
+        const edit: zlsx.formula_rewriter.RewriteEdit = if (spec.row) |r|
+            switch (spec.kind) {
+                .insert => .{ .insert_rows = .{ .at = r, .count = 1 } },
+                .delete => .{ .delete_rows = .{ .at = r, .count = 1 } },
+            }
+        else switch (spec.kind) {
+            .insert => .{ .insert_cols = .{ .at = spec.col.?, .count = 1 } },
+            .delete => .{ .delete_cols = .{ .at = spec.col.?, .count = 1 } },
+        };
+        _ = try self.rewriteAllFormulas(edit);
+        _ = try self.rewriteAllDefinedNames(edit, target);
+        _ = try self.rewriteAllHyperlinkLocations(edit, target);
+        _ = try self.rewriteAllValidationsAndConditionalFormats(edit, target);
     }
 };
 
