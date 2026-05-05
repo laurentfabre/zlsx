@@ -841,12 +841,23 @@ pub const Editor = struct {
 
                 const sst_base_idx: u32 = if (sst_ptr) |p| p.next_idx else 0;
                 const outcome = try ws.emitWithAppends(self.allocator, sst_base_idx);
-                // From here, ownership of outcome's slices is split:
-                // `new_xml` → buildEntryFromXml. `new_strings` →
-                // pending_outcome_strings (free at save end). On the
-                // error path we must free both halves.
+                // Reserve the stash slot up front so the
+                // `appendAssumeCapacity` below is infallible. Without
+                // this, an OOM between `buildEntryFromXml` (which
+                // unconditionally consumes new_xml via its internal
+                // defer) and the stash would either leak or
+                // double-free the strings depending on which side
+                // catches the error first.
+                try pending_outcome_strings.ensureUnusedCapacity(self.allocator, 1);
+
+                // Ownership flag: buildEntryFromXml's internal
+                // `defer allocator.free(new_xml)` consumes new_xml
+                // on every exit (success AND error), so we must NOT
+                // double-free it from our own errdefer once we've
+                // entered that call.
+                var new_xml_owned: bool = true;
+                errdefer if (new_xml_owned) self.allocator.free(outcome.new_xml);
                 errdefer {
-                    self.allocator.free(outcome.new_xml);
                     for (outcome.new_strings) |s| self.allocator.free(s);
                     self.allocator.free(outcome.new_strings);
                 }
@@ -859,8 +870,10 @@ pub const Editor = struct {
                     // bumped next_idx between capture and add.
                     std.debug.assert(p.next_idx == expected_after);
                 }
+                new_xml_owned = false;
                 subs[entry_idx] = try buildEntryFromXml(self.allocator, path, outcome.new_xml);
-                try pending_outcome_strings.append(self.allocator, outcome.new_strings);
+                // Infallible — capacity reserved at top of iteration.
+                pending_outcome_strings.appendAssumeCapacity(outcome.new_strings);
             }
         }
 
@@ -1906,10 +1919,12 @@ pub const Editor = struct {
     fn workbookHasAnyAppendedRows(self: *Editor) bool {
         var i: u32 = 0;
         while (i < self.workbook.sheetCount()) : (i += 1) {
-            // `Workbook.sheet(i)` for `i < sheetCount()` is
-            // documented infallible. Fall through on error rather
-            // than `unreachable` — UB-safe under ReleaseFast.
-            const ws = self.workbook.sheet(i) catch return false;
+            // `Workbook.sheet(i)` for `i < sheetCount()` is genuinely
+            // infallible (the body has no alloc / parse path; the
+            // broad `Error` union covers other entry points). Use
+            // `catch unreachable` — `catch return false` would silently
+            // mask a real corruption if the contract ever weakens.
+            const ws = self.workbook.sheet(i) catch unreachable;
             if (ws.appended_rows.items.len > 0) return true;
         }
         return false;
@@ -1932,7 +1947,8 @@ pub const Editor = struct {
     fn workbookHasAnyAppendedStrings(self: *Editor) bool {
         var i: u32 = 0;
         while (i < self.workbook.sheetCount()) : (i += 1) {
-            const ws = self.workbook.sheet(i) catch return false;
+            // Same infallibility argument as workbookHasAnyAppendedRows.
+            const ws = self.workbook.sheet(i) catch unreachable;
             for (ws.appended_rows.items) |row| {
                 for (row) |c| if (c == .string) return true;
             }

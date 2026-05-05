@@ -3069,6 +3069,13 @@ pub const Worksheet = struct {
     /// iter-er-3, eventually Workbook.save in iter-er-6) after the
     /// substring-spliced sheet XML is emitted.
     ///
+    /// **Write contract**: only `Worksheet.appendRows` (and its
+    /// editor-side cousin `Editor.appendRows` via the shim) is
+    /// allowed to push entries here. Direct field-level writes
+    /// bypass the column-cap and integer-precision validation in
+    /// `appendRows` and corrupt downstream emit. Reads (size,
+    /// has-strings checks) are unrestricted.
+    ///
     /// Cannot coexist with non-empty `deltas` on the same Worksheet:
     /// `appendRows` refuses if `deltas.count() > 0` and `setCell`
     /// refuses if `appended_rows.items.len > 0`. Mirrors the legacy
@@ -3368,6 +3375,15 @@ pub const Worksheet = struct {
     ///   - `error.IntegerExceedsExcelPrecision` if any `.integer`
     ///     value can't round-trip exactly through f64
     ///
+    /// **Editor-scope state not visible here**: the editor tracks
+    /// `pending_row_inserts` / `pending_row_deletes` / `pending_col_*`
+    /// at its own layer. Those edits race with appends at save time
+    /// (the editor's row/col substitution runs first, then appends
+    /// would splice into the pre-edit XML, silently dropping the
+    /// edit). Direct `Worksheet.appendRows` callers must drain those
+    /// editor-scope queues themselves; only the editor-side shim
+    /// (`Editor.appendRows`) checks `sheetHasPendingRowOrColEdit`.
+    ///
     /// **What this method does NOT do**: emit XML, allocate SST
     /// indices, or modify the sheet's parsed view. The actual
     /// substring splice + SST extension happens at save time via
@@ -3658,6 +3674,10 @@ fn appendCellXmlForAppend(
             try out.appendSlice(allocator, "</v></c>");
         },
         .string => |s| {
+            // Pair-asserts emitWithAppends's count-then-render
+            // pre-pass — the slice is sized exactly to fit
+            // `string_count` entries.
+            assert(sst_cursor.* < new_strings.len);
             const idx = sst_base_idx + sst_cursor.*;
             // Deep-copy into the caller allocator so the string
             // outlives any future `clearAppendedRows` mid-save.
@@ -3701,6 +3721,10 @@ fn appendXmlFindHighestRow(xml: []const u8) u32 {
         const open_close = std.mem.indexOfScalarPos(u8, xml, open_pos, '>') orelse return 0;
         // Self-closing `<sheetData/>` has no body — empty window.
         if (open_close > 0 and xml[open_close - 1] == '/') break :blk xml[0..0];
+        // open_close is a `>` byte found by indexOfScalarPos so it's
+        // always within bounds; `open_close + 1 <= xml.len` and
+        // indexOfPos accepts start == slice.len.
+        assert(open_close + 1 <= xml.len);
         const close_pos = std.mem.indexOfPos(u8, xml, open_close + 1, "</sheetData>") orelse
             return 0;
         break :blk xml[open_close + 1 .. close_pos];
@@ -3798,6 +3822,10 @@ fn appendXmlInjectRows(
     rendered_rows: []const u8,
 ) Error![]u8 {
     if (std.mem.indexOf(u8, src_xml, "</sheetData>")) |inject_pos| {
+        // indexOf invariant: inject_pos + tag_len <= src_xml.len.
+        // Pair-assertion turns a future indexOf-contract regression
+        // into a tripwire instead of an out-of-bounds memcpy.
+        assert(inject_pos + "</sheetData>".len <= src_xml.len);
         const out_len = src_xml.len + rendered_rows.len;
         const out = try allocator.alloc(u8, out_len);
         errdefer allocator.free(out);
