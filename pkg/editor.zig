@@ -830,9 +830,19 @@ pub const Editor = struct {
                 // ws.appended_rows; safe across save() because
                 // appended_rows lives until Editor.deinit (matching
                 // the legacy SstAppender lifetime contract).
+                // CRITICAL: never call ws.clearAppendedRows before
+                // `p.add(s)` completes — the SstAppender stores the
+                // borrowed slice and only buildSubstitutedSst dupes
+                // it into the new SST XML.
                 defer self.allocator.free(outcome.new_strings);
                 if (sst_ptr) |p| {
+                    const expected_after = p.next_idx + @as(u32, @intCast(outcome.new_strings.len));
                     for (outcome.new_strings) |s| _ = try p.add(s);
+                    // Pair-assertion: SST cursor advanced exactly
+                    // once per index emitWithAppends burned into the
+                    // XML. A mismatch means a sibling save-step
+                    // bumped next_idx between capture and add.
+                    std.debug.assert(p.next_idx == expected_after);
                 }
                 subs[entry_idx] = try buildEntryFromXml(self.allocator, path, outcome.new_xml);
             }
@@ -1880,7 +1890,10 @@ pub const Editor = struct {
     fn workbookHasAnyAppendedRows(self: *Editor) bool {
         var i: u32 = 0;
         while (i < self.workbook.sheetCount()) : (i += 1) {
-            const ws = self.workbook.sheet(i) catch unreachable;
+            // `Workbook.sheet(i)` for `i < sheetCount()` is
+            // documented infallible. Fall through on error rather
+            // than `unreachable` — UB-safe under ReleaseFast.
+            const ws = self.workbook.sheet(i) catch return false;
             if (ws.appended_rows.items.len > 0) return true;
         }
         return false;
@@ -1903,7 +1916,7 @@ pub const Editor = struct {
     fn workbookHasAnyAppendedStrings(self: *Editor) bool {
         var i: u32 = 0;
         while (i < self.workbook.sheetCount()) : (i += 1) {
-            const ws = self.workbook.sheet(i) catch unreachable;
+            const ws = self.workbook.sheet(i) catch return false;
             for (ws.appended_rows.items) |row| {
                 for (row) |c| if (c == .string) return true;
             }
