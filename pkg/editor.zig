@@ -680,6 +680,7 @@ pub const Editor = struct {
         if (self.pending_appends.count() == 0 and
             !self.workbookHasAnyDeltas() and
             !self.workbookHasAnyAppendedRows() and
+            !self.workbook.store.hasUnsavedChanges() and
             self.pending_new_sheets.items.len == 0 and
             self.pending_renames.items.len == 0 and
             self.pending_deletes.items.len == 0 and
@@ -758,6 +759,22 @@ pub const Editor = struct {
             self.allocator.free(subs);
         }
 
+        // Appendix entries: brand-new ZIP entries that don't exist
+        // in the source (a fresh sharedStrings.xml when the source
+        // had none, plus iter-er-4 sheets created via
+        // `Workbook.addSheet` whose part isn't in self.entries).
+        // Lifetime: their .lfh / .payload / .cdfh slices are owned;
+        // the deferred free runs at end-of-save.
+        var extra_entries: std.ArrayListUnmanaged(SubstitutedEntry) = .{};
+        defer {
+            for (extra_entries.items) |e| {
+                self.allocator.free(e.lfh);
+                self.allocator.free(e.payload);
+                self.allocator.free(e.cdfh);
+            }
+            extra_entries.deinit(self.allocator);
+        }
+
         // Phase 3e iter-row-2/3: apply row inserts + deletes by
         // building a substituted sheet entry per affected sheet.
         // Each sheet has at most one pending row edit (recordRowEdit
@@ -831,24 +848,33 @@ pub const Editor = struct {
         }
         {
             var sheet_idx: u32 = 0;
-            while (sheet_idx < self.workbook.sheetCount()) : (sheet_idx += 1) {
+            const ws_count: u32 = @intCast(self.workbook.sheetCount());
+            while (sheet_idx < ws_count) : (sheet_idx += 1) {
                 const ws = try self.workbook.sheet(sheet_idx);
                 if (ws.appended_rows.items.len == 0) continue;
-                const path = self.sheet_paths[sheet_idx];
+                // Resolve part name via the typed-overlay (iter-er-4
+                // direct callers of `editor.workbook.addSheet` don't
+                // grow self.sheet_paths, so we can't index it).
+                const path = try ws.resolvePartName();
                 if (self.findPendingNewSheet(path) != null) continue;
-                const entry_idx = findEntryByName(self.entries, path) orelse
-                    return error.SheetEntryNotFound;
+                // entry_idx is null for sheets created via
+                // `Workbook.addSheet` after Editor.open — those parts
+                // exist in PartStore but not in self.entries, so the
+                // emitted entry routes to extra_entries instead of
+                // subs[].
+                const entry_idx_opt = findEntryByName(self.entries, path);
 
                 const sst_base_idx: u32 = if (sst_ptr) |p| p.next_idx else 0;
                 const outcome = try ws.emitWithAppends(self.allocator, sst_base_idx);
-                // Reserve the stash slot up front so the
-                // `appendAssumeCapacity` below is infallible. Without
-                // this, an OOM between `buildEntryFromXml` (which
-                // unconditionally consumes new_xml via its internal
-                // defer) and the stash would either leak or
+                // Reserve the stash slots up front so the
+                // `appendAssumeCapacity` below are infallible.
+                // Without this, an OOM between `buildEntryFromXml`
+                // (which unconditionally consumes new_xml via its
+                // internal defer) and the stash would either leak or
                 // double-free the strings depending on which side
                 // catches the error first.
                 try pending_outcome_strings.ensureUnusedCapacity(self.allocator, 1);
+                if (entry_idx_opt == null) try extra_entries.ensureUnusedCapacity(self.allocator, 1);
 
                 // Ownership flag: buildEntryFromXml's internal
                 // `defer allocator.free(new_xml)` consumes new_xml
@@ -871,7 +897,12 @@ pub const Editor = struct {
                     std.debug.assert(p.next_idx == expected_after);
                 }
                 new_xml_owned = false;
-                subs[entry_idx] = try buildEntryFromXml(self.allocator, path, outcome.new_xml);
+                const new_entry = try buildEntryFromXml(self.allocator, path, outcome.new_xml);
+                if (entry_idx_opt) |entry_idx| {
+                    subs[entry_idx] = new_entry;
+                } else {
+                    extra_entries.appendAssumeCapacity(new_entry);
+                }
                 // Infallible — capacity reserved at top of iteration.
                 pending_outcome_strings.appendAssumeCapacity(outcome.new_strings);
             }
@@ -886,19 +917,21 @@ pub const Editor = struct {
         // mutation time so no merge step is needed here.
         {
             var sheet_idx: u32 = 0;
-            while (sheet_idx < self.workbook.sheetCount()) : (sheet_idx += 1) {
+            const ws_count: u32 = @intCast(self.workbook.sheetCount());
+            while (sheet_idx < ws_count) : (sheet_idx += 1) {
                 const ws = try self.workbook.sheet(sheet_idx);
                 if (ws.deltas.count() == 0) continue;
-                const path = self.sheet_paths[sheet_idx];
-                // New-sheet setCell deltas (sheet_idx >= source count)
-                // are out of scope for iter-er-2 — Editor.setCell on
-                // such sheets returns SheetIndexOutOfRange today
-                // because workbook.sheet() bounds-checks against the
-                // source view. iter-er-4 (structural edits) wires
-                // Workbook.addSheet so this path comes alive.
+                // Resolve part name via the typed-overlay (iter-er-4
+                // direct callers of `editor.workbook.addSheet` don't
+                // grow self.sheet_paths, so we can't index it).
+                const path = try ws.resolvePartName();
                 if (self.findPendingNewSheet(path) != null) continue;
-                const entry_idx = findEntryByName(self.entries, path) orelse
-                    return error.SheetEntryNotFound;
+                // entry_idx is null for sheets created via
+                // `Workbook.addSheet` (iter-er-4). Their parts live in
+                // PartStore but not in self.entries; the emitted entry
+                // routes to extra_entries instead of subs[].
+                const entry_idx_opt = findEntryByName(self.entries, path);
+                if (entry_idx_opt == null) try extra_entries.ensureUnusedCapacity(self.allocator, 1);
 
                 const fresh_xml = try ws.emitWithDeltas(self.allocator);
                 defer self.allocator.free(fresh_xml);
@@ -929,22 +962,69 @@ pub const Editor = struct {
                 else
                     try self.allocator.dupe(u8, fresh_xml);
                 // buildEntryFromXml takes ownership of `xml_to_use`.
-                subs[entry_idx] = try buildEntryFromXml(self.allocator, path, xml_to_use);
+                const new_entry = try buildEntryFromXml(self.allocator, path, xml_to_use);
+                if (entry_idx_opt) |entry_idx| {
+                    subs[entry_idx] = new_entry;
+                } else {
+                    extra_entries.appendAssumeCapacity(new_entry);
+                }
             }
         }
 
-        // Appendix entries: brand-new ZIP entries that don't exist
-        // in source (currently: a fresh sharedStrings.xml when the
-        // source workbook had none). Lifetime: their .lfh / .payload
-        // / .cdfh slices are owned, freed at the end of save().
-        var extra_entries: std.ArrayListUnmanaged(SubstitutedEntry) = .{};
-        defer {
-            for (extra_entries.items) |e| {
-                self.allocator.free(e.lfh);
-                self.allocator.free(e.payload);
-                self.allocator.free(e.cdfh);
+        // B2 iter-er-4 (2/N): emit any sheet that exists in the
+        // workbook view but has no source entry AND no mutations
+        // (setCell deltas / appendRows). These are sheets created
+        // via `Workbook.addSheet` whose body lives verbatim in
+        // PartStore. The two walks above only emit when there's
+        // something to render; this pass picks up the no-mutation
+        // case so the new sheet's bytes flow into the output ZIP.
+        //
+        // Resolve the part name via the typed-overlay's
+        // `Worksheet.resolvePartName` (parse-free) rather than
+        // `self.sheet_paths[idx]` — direct callers of
+        // `editor.workbook.addSheet` (bypassing the Editor.addSheet
+        // shim) don't grow `self.sheet_paths`, but the typed-overlay
+        // always knows the part name.
+        {
+            var sheet_idx: u32 = 0;
+            const ws_count: u32 = @intCast(self.workbook.sheetCount());
+            while (sheet_idx < ws_count) : (sheet_idx += 1) {
+                const ws = try self.workbook.sheet(sheet_idx);
+                if (ws.appended_rows.items.len > 0) continue;
+                if (ws.deltas.count() > 0) continue;
+                const path = try ws.resolvePartName();
+                if (self.findPendingNewSheet(path) != null) continue;
+                if (findEntryByName(self.entries, path) != null) continue;
+                // New sheet without mutations — emit verbatim from
+                // PartStore. PartStore's bytes were set by
+                // `Workbook.addSheet` to the empty-sheet template.
+                const part = (try self.workbook.store.part(path)) orelse
+                    return error.MissingSheetPart;
+                try extra_entries.ensureUnusedCapacity(self.allocator, 1);
+                const body_owned = try self.allocator.dupe(u8, part.bytes);
+                const new_entry = try buildEntryFromXml(self.allocator, path, body_owned);
+                extra_entries.appendAssumeCapacity(new_entry);
             }
-            extra_entries.deinit(self.allocator);
+        }
+
+        // B2 iter-er-4 (2/N): sync PartStore overrides for source
+        // parts that the existing walks didn't substitute. The
+        // typed-overlay path (`Workbook.addSheet`, `addImage`, and
+        // future iter-er-X mutators) patches workbook.xml,
+        // workbook.xml.rels, and `[Content_Types].xml` in-memory via
+        // PartStore — Editor.save's ZIP rebuild reads from src_buf
+        // by default and would emit stale bytes for those metadata
+        // parts. This pass copies any PartStore override that maps
+        // to an unmutated source entry into subs[], so the freshly-
+        // patched bytes flow into the output archive.
+        {
+            for (self.entries, 0..) |entry, i| {
+                if (subs[i] != null) continue;
+                if (!self.workbook.store.isOverridden(entry.name)) continue;
+                const part = (try self.workbook.store.part(entry.name)) orelse continue;
+                const body_owned = try self.allocator.dupe(u8, part.bytes);
+                subs[i] = try buildEntryFromXml(self.allocator, entry.name, body_owned);
+            }
         }
 
         // Phase 3e iter-sheet-1: emit each new sheet's body BEFORE
@@ -6081,6 +6161,78 @@ test "Editor: setCell populates an empty <sheetData/> worksheet" {
     defer rows.deinit();
     const r1 = (try rows.next()) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(i64, 42), r1[0].integer);
+}
+
+test "Editor: editor.workbook.addSheet path round-trips through Editor.save (iter-er-4)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const writer_mod = xlsx;
+    const src_path = try tt.path(std.testing.allocator, "wb_addsheet_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "wb_addsheet_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Original");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        // Bypass Editor.addSheet — go straight through the
+        // typed-overlay surface. Editor.save's verbatim-emit walk
+        // and PartStore-overrides sync should pick it up.
+        _ = try ed.workbook.addSheet("FromWorkbook");
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
+    try std.testing.expectEqualStrings("Original", book.sheets[0].name);
+    try std.testing.expectEqualStrings("FromWorkbook", book.sheets[1].name);
+}
+
+test "Editor: editor.workbook.addSheet + setCell on returned handle round-trips" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const writer_mod = xlsx;
+    const src_path = try tt.path(std.testing.allocator, "wb_addsheet_set_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "wb_addsheet_set_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Source");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        const new_ws_idx = blk: {
+            const ws = try ed.workbook.addSheet("Target");
+            const idx = ws.sheet_idx;
+            try ws.setCell("A1", .{ .number = 3.14 });
+            try ws.setCell("B1", .{ .string = "pi" });
+            break :blk idx;
+        };
+        // Re-fetch handle (per pointer-lifetime contract — fine in
+        // this test since no further structural mutations happen,
+        // but exercises the documented re-fetch pattern).
+        _ = new_ws_idx;
+        try ed.save(dst_path);
+    }
+    var book = try Book.open(std.testing.allocator, dst_path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
+    var rows = try book.rows(book.sheets[1], std.testing.allocator);
+    defer rows.deinit();
+    const r = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(f64, 3.14), r[0].number);
+    try std.testing.expectEqualStrings("pi", r[1].string);
 }
 
 test "Editor: addSheet appends a new sheet and round-trips through reader (iter-sheet-1)" {
