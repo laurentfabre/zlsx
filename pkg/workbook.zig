@@ -136,6 +136,11 @@ pub const Error = error{
     /// stores integers as f64 internally; values above 2^53 lose
     /// precision silently.
     IntegerExceedsExcelPrecision,
+    /// `Worksheet.emitWithAppends` refused because the spliced
+    /// rows would push past Excel's 1,048,576-row cap
+    /// (`xlsx.max_row`). Caller should split the append into
+    /// multiple sheets — there is no in-place recovery.
+    RowIndexOutOfRange,
     WriteFailed,
 } || workbook_xml_mod.Error || sheet_xml_mod.ParseError || sst_xml_mod.Error || styles_xml_mod.Error || store_mod.Error ||
     zlsx.formula_rewriter.Error ||
@@ -3064,6 +3069,13 @@ pub const Worksheet = struct {
     /// iter-er-3, eventually Workbook.save in iter-er-6) after the
     /// substring-spliced sheet XML is emitted.
     ///
+    /// **Write contract**: only `Worksheet.appendRows` (and its
+    /// editor-side cousin `Editor.appendRows` via the shim) is
+    /// allowed to push entries here. Direct field-level writes
+    /// bypass the column-cap and integer-precision validation in
+    /// `appendRows` and corrupt downstream emit. Reads (size,
+    /// has-strings checks) are unrestricted.
+    ///
     /// Cannot coexist with non-empty `deltas` on the same Worksheet:
     /// `appendRows` refuses if `deltas.count() > 0` and `setCell`
     /// refuses if `appended_rows.items.len > 0`. Mirrors the legacy
@@ -3102,11 +3114,24 @@ pub const Worksheet = struct {
         return self.workbook.workbook.sheets[self.sheet_idx].state;
     }
 
-    /// Resolve the part name (e.g. "xl/worksheets/sheet1.xml") and
-    /// parse the sheet XML if not already cached. Returns a const
-    /// pointer to the cached view.
-    pub fn ensureParsed(self: *Worksheet) Error!*const sheet_xml_mod.SheetXml {
-        if (self.parsed != null) return &self.parsed.?;
+    /// Resolve `r_id` → `xl/_rels/workbook.xml.rels` lookup and cache
+    /// the sheet's part name (e.g. "xl/worksheets/sheet1.xml")
+    /// without parsing the body. Idempotent — second call returns
+    /// the cached name.
+    ///
+    /// Public surface for B2 iter-er-3 fast paths (substring-splice
+    /// `emitWithAppends`) that need the sheet's part name to read
+    /// raw XML bytes from the part store WITHOUT walking
+    /// `<sheetData>` via `ensureParsed`. On a 100k-row sheet, the
+    /// parse step alone runs in the hundreds of milliseconds — too
+    /// expensive to pay when the caller will splice a few rows.
+    ///
+    /// Stability: `r_id` is set once at `Workbook.parse` and is not
+    /// re-bound by any current API (`renameSheet` mutates the
+    /// display name, not the rels target), so the cached part name
+    /// outlives every legal invalidation of `parsed`.
+    pub fn resolvePartName(self: *Worksheet) Error![]const u8 {
+        if (self.resolved_part_name) |cached| return cached;
 
         const wb = self.workbook;
         const r_id = wb.workbook.sheets[self.sheet_idx].r_id;
@@ -3122,19 +3147,20 @@ pub const Worksheet = struct {
         }
         const part_name = resolved orelse return Error.MissingRelationship;
         // Dupe so `resolved_part_name` lifetime is bound to Worksheet,
-        // not to PartStore's arena (PartStore.resolve allocates into
-        // its arena; safe to drop the dup if we trust the arena —
-        // but explicit ownership is clearer).
+        // not to PartStore's arena.
         const owned = try wb.allocator.dupe(u8, part_name);
         errdefer wb.allocator.free(owned);
-        // Free the prior part-name dupe if this Worksheet was
-        // previously parsed-then-invalidated (e.g. by `Workbook.save`,
-        // `renameSheet`, or test helpers that splice part bytes via
-        // `PartStore.replacePart` and reset `parsed = null`). Without
-        // this, every invalidate→re-parse cycle leaks the prior dupe.
-        if (self.resolved_part_name) |prev| wb.allocator.free(prev);
         self.resolved_part_name = owned;
+        return owned;
+    }
 
+    /// Resolve the part name and parse the sheet XML if not already
+    /// cached. Returns a const pointer to the cached view.
+    pub fn ensureParsed(self: *Worksheet) Error!*const sheet_xml_mod.SheetXml {
+        if (self.parsed != null) return &self.parsed.?;
+
+        const part_name = try self.resolvePartName();
+        const wb = self.workbook;
         const part = try wb.store.part(part_name) orelse return Error.MissingSheetPart;
         self.parsed = try sheet_xml_mod.parse(wb.allocator, part.bytes);
         return &self.parsed.?;
@@ -3349,6 +3375,15 @@ pub const Worksheet = struct {
     ///   - `error.IntegerExceedsExcelPrecision` if any `.integer`
     ///     value can't round-trip exactly through f64
     ///
+    /// **Editor-scope state not visible here**: the editor tracks
+    /// `pending_row_inserts` / `pending_row_deletes` / `pending_col_*`
+    /// at its own layer. Those edits race with appends at save time
+    /// (the editor's row/col substitution runs first, then appends
+    /// would splice into the pre-edit XML, silently dropping the
+    /// edit). Direct `Worksheet.appendRows` callers must drain those
+    /// editor-scope queues themselves; only the editor-side shim
+    /// (`Editor.appendRows`) checks `sheetHasPendingRowOrColEdit`.
+    ///
     /// **What this method does NOT do**: emit XML, allocate SST
     /// indices, or modify the sheet's parsed view. The actual
     /// substring splice + SST extension happens at save time via
@@ -3423,7 +3458,486 @@ pub const Worksheet = struct {
         const empty_plan: SstExtensionPlan = .{};
         return emitSheetWithDeltas(allocator, part.bytes, view, &self.deltas, &empty_plan);
     }
+
+    /// Result of `emitWithAppends`: the freshly-spliced sheet XML
+    /// plus the ordered list of new SST entries the caller must
+    /// merge into `sharedStrings.xml`.
+    ///
+    /// Both `new_xml` and the contents of `new_strings` are owned
+    /// by the caller's allocator (deep-copied from
+    /// `Worksheet.appended_rows`). Element slices stay valid past
+    /// any `clearAppendedRows` / `Worksheet.deinit` — the audit
+    /// flagged the prior borrow contract as fragile against future
+    /// save-pipeline refactors that might clear mid-flight.
+    ///
+    /// Element ordering matches the row-major scan order used to
+    /// render `<c t="s">` cells, so the SST writer can append
+    /// entries 1:1 starting at `sst_base_idx`.
+    pub const AppendOutcome = struct {
+        new_xml: []u8,
+        new_strings: [][]const u8,
+        appended_count: u32,
+
+        pub fn deinit(self: *AppendOutcome, allocator: Allocator) void {
+            allocator.free(self.new_xml);
+            for (self.new_strings) |s| allocator.free(s);
+            allocator.free(self.new_strings);
+        }
+    };
+
+    /// B2 iter-er-3 substring-splice fast-path. Reads the source
+    /// sheet XML straight from the part store (no `ensureParsed` —
+    /// see `resolvePartName` for the rationale), renders each
+    /// `appended_rows` entry as `<row r="N">…</row>`, splices the
+    /// rendered block before `</sheetData>` (or rewrites the
+    /// self-closing `<sheetData/>` form), and widens the
+    /// `<dimension>` BR corner when the appended rows push past it.
+    ///
+    /// String cells render as `<c t="s"><v>{N}</v></c>` with
+    /// `N = sst_base_idx + cursor++` so the caller can extend the
+    /// SST in lockstep.
+    ///
+    /// Caller invariant: `appended_rows.items.len > 0`. Empty
+    /// staging is rejected at `appendRows` time; reaching this
+    /// helper with no rows means a save-side bookkeeping bug.
+    pub fn emitWithAppends(
+        self: *Worksheet,
+        allocator: Allocator,
+        sst_base_idx: u32,
+    ) Error!AppendOutcome {
+        assert(self.appended_rows.items.len > 0);
+        // Negative-space guard: even though `Worksheet.appendRows`
+        // and `Editor.appendRows` already block deltas+appends on the
+        // same sheet, this entry-point is public — a third caller
+        // could stage deltas via `setCell` and then reach here,
+        // silently spliciing the original XML and dropping every
+        // delta. Refuse rather than emit truncated state.
+        if (self.deltas.count() > 0) return error.SheetHasUnsavedMutations;
+
+        const part_name = try self.resolvePartName();
+        assert(part_name.len > 0);
+        const part = try self.workbook.store.part(part_name) orelse return error.MissingSheetPart;
+        const src_xml = part.bytes;
+
+        const highest_row = appendXmlFindHighestRow(src_xml);
+        const start_row: u32 = highest_row + 1;
+        assert(start_row >= 1);
+        // Cap-check the bottom row before any allocation so a
+        // bad input doesn't half-render its preamble.
+        const final_row64: u64 = @as(u64, start_row) + self.appended_rows.items.len - 1;
+        if (final_row64 > zlsx.max_row) return error.RowIndexOutOfRange;
+        const final_row: u32 = @intCast(final_row64);
+        assert(start_row <= final_row);
+
+        // First pass: count string cells so we can size the
+        // `new_strings` slice exactly. Cheap relative to the row
+        // render that follows.
+        var string_count: u32 = 0;
+        var max_col_1based: u32 = 0;
+        for (self.appended_rows.items) |row| {
+            if (row.len > max_col_1based) max_col_1based = @intCast(row.len);
+            for (row) |c| if (c == .string) {
+                string_count += 1;
+            };
+        }
+        assert(max_col_1based <= zlsx.max_col_1based);
+
+        const new_strings = try allocator.alloc([]const u8, string_count);
+        // Track how many element dupes we've completed so a
+        // mid-loop OOM frees only the prefix.
+        var owned_strings: u32 = 0;
+        errdefer {
+            for (new_strings[0..owned_strings]) |s| allocator.free(s);
+            allocator.free(new_strings);
+        }
+
+        var rows_buf: std.ArrayList(u8) = .empty;
+        defer rows_buf.deinit(allocator);
+        try rows_buf.ensureTotalCapacity(allocator, self.appended_rows.items.len * 32);
+
+        var sst_cursor: u32 = 0;
+        for (self.appended_rows.items, 0..) |row, ri| {
+            const row_idx: u32 = start_row + @as(u32, @intCast(ri));
+            try rows_buf.appendSlice(allocator, "<row r=\"");
+            var num_buf: [16]u8 = undefined;
+            try rows_buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{row_idx}));
+            try rows_buf.appendSlice(allocator, "\">");
+            for (row, 0..) |cell, ci| {
+                const col_1based: u32 = @as(u32, @intCast(ci)) + 1;
+                try appendCellXmlForAppend(
+                    allocator,
+                    &rows_buf,
+                    cell,
+                    .{ .row = row_idx, .col = col_1based },
+                    sst_base_idx,
+                    &sst_cursor,
+                    new_strings,
+                    &owned_strings,
+                );
+            }
+            try rows_buf.appendSlice(allocator, "</row>");
+        }
+        assert(sst_cursor == string_count);
+        assert(owned_strings == string_count);
+        assert(rows_buf.items.len > 0);
+
+        const injected = try appendXmlInjectRows(allocator, src_xml, rows_buf.items);
+        errdefer allocator.free(injected);
+
+        const final_xml = blk: {
+            const widened = try appendXmlUpdateDimensionBR(
+                allocator,
+                injected,
+                final_row,
+                max_col_1based,
+            );
+            if (widened) |w| {
+                allocator.free(injected);
+                break :blk w;
+            }
+            break :blk injected;
+        };
+        // Postcondition: the splice grew the XML. `</sheetData>`
+        // presence is guaranteed by the inject-rows helper itself
+        // (both branches end at the close tag); a separate
+        // O(n)-on-final_xml check here would dominate the gate.
+        assert(final_xml.len > src_xml.len);
+
+        return .{
+            .new_xml = final_xml,
+            .new_strings = new_strings,
+            .appended_count = @intCast(self.appended_rows.items.len),
+        };
+    }
+
+    /// Free + reset `appended_rows` after `Workbook.save` (or
+    /// `Editor.save` in iter-er-3) has consumed the staged rows.
+    /// Pairs with `appendRows` — same allocator semantics.
+    pub fn clearAppendedRows(self: *Worksheet, allocator: Allocator) void {
+        for (self.appended_rows.items) |row| {
+            for (row) |c| switch (c) {
+                .string => |s| allocator.free(s),
+                else => {},
+            };
+            allocator.free(row);
+        }
+        self.appended_rows.clearAndFree(allocator);
+    }
 };
+
+/// Render a single appended-row cell into `out`. String cells are
+/// recorded in `new_strings[*sst_cursor]` and emit
+/// `<c r="REF" t="s"><v>sst_base_idx + cursor</v></c>`. Non-string
+/// cells render their value verbatim. `.empty` skips emission so
+/// trailing empties collapse to nothing — matches the editor's
+/// `renderCellOoxml` contract.
+fn appendCellXmlForAppend(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    cell: zlsx.Cell,
+    ref: CellRef,
+    sst_base_idx: u32,
+    sst_cursor: *u32,
+    new_strings: [][]const u8,
+    owned_strings: *u32,
+) Error!void {
+    // Pair-assertion with the per-row column-cap gate in
+    // `Worksheet.appendRows`. `formatA1Ref` writes into a 16-byte
+    // stack buffer assuming the col is in range; assert here so a
+    // future caller that bypasses `appendRows` surfaces the bug.
+    assert(ref.col >= 1 and ref.col <= zlsx.max_col_1based);
+    assert(ref.row >= 1 and ref.row <= zlsx.max_row);
+    var ref_buf: [16]u8 = undefined;
+    const ref_str = formatA1Ref(&ref_buf, ref);
+    var num_buf: [64]u8 = undefined;
+    switch (cell) {
+        .empty => return,
+        .integer => |x| {
+            try out.appendSlice(allocator, "<c r=\"");
+            try out.appendSlice(allocator, ref_str);
+            try out.appendSlice(allocator, "\"><v>");
+            try out.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{x}));
+            try out.appendSlice(allocator, "</v></c>");
+        },
+        .number => |f| {
+            try out.appendSlice(allocator, "<c r=\"");
+            try out.appendSlice(allocator, ref_str);
+            try out.appendSlice(allocator, "\"><v>");
+            try out.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{f}));
+            try out.appendSlice(allocator, "</v></c>");
+        },
+        .boolean => |b| {
+            try out.appendSlice(allocator, "<c r=\"");
+            try out.appendSlice(allocator, ref_str);
+            try out.appendSlice(allocator, "\" t=\"b\"><v>");
+            try out.appendSlice(allocator, if (b) "1" else "0");
+            try out.appendSlice(allocator, "</v></c>");
+        },
+        .string => |s| {
+            // Pair-asserts emitWithAppends's count-then-render
+            // pre-pass — the slice is sized exactly to fit
+            // `string_count` entries.
+            assert(sst_cursor.* < new_strings.len);
+            const idx = sst_base_idx + sst_cursor.*;
+            // Deep-copy into the caller allocator so the string
+            // outlives any future `clearAppendedRows` mid-save.
+            const dup = try allocator.dupe(u8, s);
+            new_strings[sst_cursor.*] = dup;
+            sst_cursor.* += 1;
+            owned_strings.* += 1;
+            try out.appendSlice(allocator, "<c r=\"");
+            try out.appendSlice(allocator, ref_str);
+            try out.appendSlice(allocator, "\" t=\"s\"><v>");
+            try out.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{idx}));
+            try out.appendSlice(allocator, "</v></c>");
+        },
+    }
+}
+
+/// Find the largest cell-row index in a sheet XML body. Walks both
+/// `<row …>` and `<c …>` opening tags inside the `<sheetData>` window
+/// and extracts the row component from any `r="…"` attribute (cell
+/// refs like `r="A42"` decode to row 42; explicit `<row r="12">`
+/// decodes to 12). OOXML doesn't constrain attribute order so the
+/// scan is permissive.
+///
+/// Bounded: scans only `<sheetData>…</sheetData>`. Anything outside
+/// that window — `<oddHeader>`, `<tableParts>`, `<extLst>`,
+/// `<mergeCell ref="…">`, etc. — is ignored even if its attributes
+/// happen to spell `r="A99999"`. XML comments INSIDE the window are
+/// not specifically filtered: Excel and every legitimate writer
+/// strip them, and adding O(n)-per-tag back-scanning costs ~3% on
+/// the 100k-row gate. A `<!-- r="A1048576" -->` inside `<sheetData>`
+/// could still inflate `highest_row` — accepted trade-off, fuzz
+/// corpus exercises the boundary.
+///
+/// Parse-free: pure substring walk, suitable for 100k-row sheets
+/// where the sheet_xml parse path would dominate the gate.
+fn appendXmlFindHighestRow(xml: []const u8) u32 {
+    var highest: u32 = 0;
+
+    const window: []const u8 = blk: {
+        const open_pos = std.mem.indexOf(u8, xml, "<sheetData") orelse return 0;
+        const open_close = std.mem.indexOfScalarPos(u8, xml, open_pos, '>') orelse return 0;
+        // Self-closing `<sheetData/>` has no body — empty window.
+        if (open_close > 0 and xml[open_close - 1] == '/') break :blk xml[0..0];
+        // open_close is a `>` byte found by indexOfScalarPos so it's
+        // always within bounds; `open_close + 1 <= xml.len` and
+        // indexOfPos accepts start == slice.len.
+        assert(open_close + 1 <= xml.len);
+        const close_pos = std.mem.indexOfPos(u8, xml, open_close + 1, "</sheetData>") orelse
+            return 0;
+        break :blk xml[open_close + 1 .. close_pos];
+    };
+
+    // Pass 1: `<c …>` tags — extract the row component from r="A1".
+    {
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, window, i, "<c")) |tag_start| {
+            const after = tag_start + "<c".len;
+            if (after >= window.len) break;
+            const c = window[after];
+            // Filter `<col`, `<conditionalFormatting`, etc.
+            if (c != ' ' and c != '\t' and c != '\n' and c != '\r' and c != '/' and c != '>') {
+                i = tag_start + 1;
+                continue;
+            }
+            const tag_end = std.mem.indexOfScalarPos(u8, window, tag_start, '>') orelse break;
+            if (appendXmlAttrRowFromCellRef(window[tag_start..tag_end])) |n| {
+                if (n > highest) highest = n;
+            }
+            i = tag_end + 1;
+        }
+    }
+    // Pass 2: `<row …>` tags — explicit r="N".
+    {
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, window, i, "<row")) |tag_start| {
+            const after = tag_start + "<row".len;
+            if (after >= window.len) break;
+            const c = window[after];
+            if (c != ' ' and c != '\t' and c != '\n' and c != '\r' and c != '/' and c != '>') {
+                i = tag_start + 1;
+                continue;
+            }
+            const tag_end = std.mem.indexOfScalarPos(u8, window, tag_start, '>') orelse break;
+            if (appendXmlAttrRowExplicit(window[tag_start..tag_end])) |n| {
+                if (n > highest) highest = n;
+            }
+            i = tag_end + 1;
+        }
+    }
+    return highest;
+}
+
+/// Locate `r="…"` within an opening tag's attribute span and parse
+/// the row component of an A1-style cell ref. Returns null on no
+/// match or unparseable digits.
+fn appendXmlAttrRowFromCellRef(tag: []const u8) ?u32 {
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, tag, search_from, "r=\"")) |r_pos| {
+        const prev = if (r_pos > 0) tag[r_pos - 1] else 0;
+        if (prev == ' ' or prev == '\t' or prev == '\n' or prev == '\r') {
+            const ref_start = r_pos + "r=\"".len;
+            var col_end = ref_start;
+            while (col_end < tag.len and tag[col_end] >= 'A' and tag[col_end] <= 'Z') : (col_end += 1) {}
+            var num_end = col_end;
+            while (num_end < tag.len and tag[num_end] >= '0' and tag[num_end] <= '9') : (num_end += 1) {}
+            if (num_end > col_end) {
+                return std.fmt.parseInt(u32, tag[col_end..num_end], 10) catch null;
+            }
+            return null;
+        }
+        search_from = r_pos + 1;
+    }
+    return null;
+}
+
+/// Locate `r="N"` within a `<row …>` span and parse N as a u32.
+fn appendXmlAttrRowExplicit(tag: []const u8) ?u32 {
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, tag, search_from, "r=\"")) |r_pos| {
+        const prev = if (r_pos > 0) tag[r_pos - 1] else 0;
+        if (prev == ' ' or prev == '\t' or prev == '\n' or prev == '\r') {
+            const num_start = r_pos + "r=\"".len;
+            var num_end = num_start;
+            while (num_end < tag.len and tag[num_end] >= '0' and tag[num_end] <= '9') : (num_end += 1) {}
+            if (num_end > num_start) {
+                return std.fmt.parseInt(u32, tag[num_start..num_end], 10) catch null;
+            }
+            return null;
+        }
+        search_from = r_pos + 1;
+    }
+    return null;
+}
+
+/// Splice a pre-rendered `rendered_rows` block into `src_xml` just
+/// before `</sheetData>`. Falls back to the self-closing
+/// `<sheetData/>` shape — replaces it with `<sheetData>…</sheetData>`
+/// preserving any attributes on the open tag.
+fn appendXmlInjectRows(
+    allocator: Allocator,
+    src_xml: []const u8,
+    rendered_rows: []const u8,
+) Error![]u8 {
+    if (std.mem.indexOf(u8, src_xml, "</sheetData>")) |inject_pos| {
+        // indexOf invariant: inject_pos + tag_len <= src_xml.len.
+        // Pair-assertion turns a future indexOf-contract regression
+        // into a tripwire instead of an out-of-bounds memcpy.
+        assert(inject_pos + "</sheetData>".len <= src_xml.len);
+        const out_len = src_xml.len + rendered_rows.len;
+        const out = try allocator.alloc(u8, out_len);
+        errdefer allocator.free(out);
+        @memcpy(out[0..inject_pos], src_xml[0..inject_pos]);
+        @memcpy(out[inject_pos..][0..rendered_rows.len], rendered_rows);
+        @memcpy(out[inject_pos + rendered_rows.len ..], src_xml[inject_pos..]);
+        return out;
+    }
+
+    const sd_open = std.mem.indexOf(u8, src_xml, "<sheetData") orelse
+        return error.NoSheetData;
+    const sd_close = std.mem.indexOfScalarPos(u8, src_xml, sd_open, '>') orelse
+        return error.NoSheetData;
+    if (sd_close == 0 or src_xml[sd_close - 1] != '/') return error.NoSheetData;
+    const attrs_end = sd_close - 1;
+    const attrs = src_xml[sd_open + "<sheetData".len .. attrs_end];
+
+    var spliced: std.ArrayList(u8) = .empty;
+    // `toOwnedSlice` empties the ArrayList on success, so this
+    // `errdefer` is a no-op on the happy path — kept so an early
+    // `try` failure doesn't leak the partially-built buffer.
+    errdefer spliced.deinit(allocator);
+    try spliced.ensureTotalCapacity(allocator, src_xml.len + rendered_rows.len + 32);
+    try spliced.appendSlice(allocator, src_xml[0..sd_open]);
+    try spliced.appendSlice(allocator, "<sheetData");
+    try spliced.appendSlice(allocator, attrs);
+    try spliced.append(allocator, '>');
+    try spliced.appendSlice(allocator, rendered_rows);
+    try spliced.appendSlice(allocator, "</sheetData>");
+    try spliced.appendSlice(allocator, src_xml[sd_close + 1 ..]);
+    return try spliced.toOwnedSlice(allocator);
+}
+
+/// Widen the BR corner of a canonical `<dimension ref="TL:BR"/>` so
+/// both the row component reaches `new_max_row` and the letter
+/// component reaches `new_max_col_1based`. Returns null on no-op,
+/// non-canonical shape, or missing `<dimension>` — the spec lets
+/// Excel rescan `<sheetData>` and rewrite the dimension on its
+/// next save, so staleness on those is tolerable.
+fn appendXmlUpdateDimensionBR(
+    allocator: Allocator,
+    xml: []const u8,
+    new_max_row: u32,
+    new_max_col_1based: u32,
+) Error!?[]u8 {
+    const dim_open = "<dimension ref=\"";
+    const dim_pos = std.mem.indexOf(u8, xml, dim_open) orelse return null;
+    const ref_start = dim_pos + dim_open.len;
+    const ref_end = std.mem.indexOfScalarPos(u8, xml, ref_start, '"') orelse return null;
+    const ref = xml[ref_start..ref_end];
+    const colon = std.mem.indexOfScalar(u8, ref, ':') orelse return null;
+    const br = ref[colon + 1 ..];
+    if (br.len == 0) return null;
+
+    var digit_start: usize = br.len;
+    while (digit_start > 0 and br[digit_start - 1] >= '0' and br[digit_start - 1] <= '9') {
+        digit_start -= 1;
+    }
+    if (digit_start == br.len or digit_start == 0) return null;
+    for (br[0..digit_start]) |c| if (c < 'A' or c > 'Z') return null;
+    const old_row = std.fmt.parseInt(u32, br[digit_start..], 10) catch return null;
+    const old_col_1based = appendXmlParseColLetters(br[0..digit_start]) orelse return null;
+
+    const final_row: u32 = @max(old_row, new_max_row);
+    const final_col_1based: u32 = @max(old_col_1based, new_max_col_1based);
+    if (final_row == old_row and final_col_1based == old_col_1based) return null;
+
+    const br_abs_start = ref_start + colon + 1;
+    const br_abs_end = ref_end;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, xml.len + 8);
+    try out.appendSlice(allocator, xml[0..br_abs_start]);
+    var letter_buf: [8]u8 = undefined;
+    const letters = appendXmlColLetters(&letter_buf, final_col_1based);
+    try out.appendSlice(allocator, letters);
+    var num_buf: [16]u8 = undefined;
+    try out.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{final_row}));
+    try out.appendSlice(allocator, xml[br_abs_end..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Parse uppercase A-Z letters as a 1-based Excel column index
+/// (A=1, …, XFD=16384). Returns null on empty input or anything
+/// past `max_col_1based`.
+fn appendXmlParseColLetters(s: []const u8) ?u32 {
+    if (s.len == 0) return null;
+    var n: u32 = 0;
+    for (s) |c| {
+        if (c < 'A' or c > 'Z') return null;
+        n = n * 26 + (c - 'A' + 1);
+        if (n > zlsx.max_col_1based) return null;
+    }
+    return n;
+}
+
+/// Render `col_1based` as A, B, …, Z, AA, … into `buf`. Capacity 8
+/// is more than enough (Excel max is XFD = 3 letters).
+fn appendXmlColLetters(buf: []u8, col_1based: u32) []u8 {
+    assert(buf.len >= 7);
+    assert(col_1based >= 1 and col_1based <= zlsx.max_col_1based);
+    var n: u32 = col_1based;
+    var i: usize = 0;
+    while (n > 0) {
+        const r = (n - 1) % 26;
+        buf[i] = 'A' + @as(u8, @intCast(r));
+        i += 1;
+        n = (n - 1) / 26;
+    }
+    std.mem.reverse(u8, buf[0..i]);
+    return buf[0..i];
+}
 
 /// XML 1.0 §2.2: Char ::= #x9 | #xA | #xD | [#x20-#xD7FF] | …
 /// Reject ASCII control bytes outside the allowed three. Bytes ≥ 0x80
@@ -5820,4 +6334,492 @@ test "Worksheet.appendRows: empty rows slice is a no-op" {
     const ws = try wb.sheet(0);
     try ws.appendRows(&.{});
     try std.testing.expectEqual(@as(usize, 0), ws.appended_rows.items.len);
+}
+
+test "Worksheet.resolvePartName: parse-free — does not populate self.parsed" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+
+    const ws = try wb.sheet(0);
+    try std.testing.expect(ws.parsed == null);
+    const part_name = try ws.resolvePartName();
+    try std.testing.expect(std.mem.startsWith(u8, part_name, "xl/worksheets/"));
+    try std.testing.expect(std.mem.endsWith(u8, part_name, ".xml"));
+    // Critical iter-er-3 invariant: resolvePartName must not trigger
+    // ensureParsed — `Worksheet.emitWithAppends` relies on this to
+    // skip the 100k-row sheetData walk on the legacy fast-path.
+    try std.testing.expect(ws.parsed == null);
+}
+
+test "Worksheet.resolvePartName: idempotent — returns the same cached pointer" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+
+    const ws = try wb.sheet(0);
+    const first = try ws.resolvePartName();
+    const second = try ws.resolvePartName();
+    try std.testing.expectEqual(first.ptr, second.ptr);
+    try std.testing.expectEqual(first.len, second.len);
+}
+
+test "Worksheet.resolvePartName: agrees with ensureParsed's cached part name" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+
+    const ws = try wb.sheet(0);
+    const fast = try ws.resolvePartName();
+    _ = try ws.ensureParsed();
+    try std.testing.expectEqualStrings(fast, ws.resolved_part_name.?);
+}
+
+test "Worksheet.emitWithAppends: splices rows and threads sst_base_idx" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var wb = try Workbook.open(allocator, path);
+    defer wb.deinit();
+
+    const ws = try wb.sheet(0);
+    const r0 = [_]zlsx.Cell{ .{ .integer = 7 }, .{ .string = "alpha" } };
+    const r1 = [_]zlsx.Cell{ .{ .number = 1.5 }, .{ .boolean = true } };
+    try ws.appendRows(&.{ &r0, &r1 });
+
+    var outcome = try ws.emitWithAppends(allocator, 100);
+    defer outcome.deinit(allocator);
+
+    // Critical: the parse-free path must NOT have populated the
+    // sheet_xml view — that's the whole point of iter-er-3.
+    try std.testing.expect(ws.parsed == null);
+
+    try std.testing.expectEqual(@as(u32, 2), outcome.appended_count);
+    try std.testing.expectEqual(@as(usize, 1), outcome.new_strings.len);
+    try std.testing.expectEqualStrings("alpha", outcome.new_strings[0]);
+
+    // sst_base_idx threading: only one string in the appended rows,
+    // so the rendered cell carries v=100 (sst_base_idx + 0).
+    try std.testing.expect(std.mem.indexOf(u8, outcome.new_xml, "t=\"s\"><v>100</v>") != null);
+    // Boolean cell renders with t="b".
+    try std.testing.expect(std.mem.indexOf(u8, outcome.new_xml, "t=\"b\"><v>1</v>") != null);
+    // Rows splice before </sheetData>.
+    const sd_close = std.mem.indexOf(u8, outcome.new_xml, "</sheetData>") orelse
+        return error.TestUnexpectedResult;
+    const last_row = std.mem.lastIndexOf(u8, outcome.new_xml, "</row>") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(last_row < sd_close);
+}
+
+test "Worksheet.emitWithAppends: rejects appends past max_row" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var wb = try Workbook.open(allocator, path);
+    defer wb.deinit();
+
+    const ws = try wb.sheet(0);
+    // Stage one row, then forge a highest_row close to the cap by
+    // monkey-replacing the part bytes — but the cleaner path is to
+    // verify the cap arithmetic via a direct call: append a row,
+    // then confirm `final_row64 > max_row` triggers when start_row
+    // would land past the cap. Trust the cap on a synthetic rather
+    // than fabricating 1M rows in the corpus.
+    const row = [_]zlsx.Cell{.{ .integer = 1 }};
+    try ws.appendRows(&.{&row});
+    // Replace the cached part bytes with one that has the highest
+    // row at max_row, forcing start_row to overflow.
+    const part_name = try ws.resolvePartName();
+    const synthetic = try std.fmt.allocPrint(
+        allocator,
+        "<worksheet><dimension ref=\"A1:A{d}\"/><sheetData><row r=\"{d}\"><c r=\"A{d}\"><v>1</v></c></row></sheetData></worksheet>",
+        .{ zlsx.max_row, zlsx.max_row, zlsx.max_row },
+    );
+    defer allocator.free(synthetic);
+    try wb.store.replacePart(part_name, synthetic);
+
+    try std.testing.expectError(error.RowIndexOutOfRange, ws.emitWithAppends(allocator, 0));
+}
+
+test "Worksheet.emitWithAppends: rewrites self-closing <sheetData/> to open/close form" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var wb = try Workbook.open(allocator, path);
+    defer wb.deinit();
+
+    const ws = try wb.sheet(0);
+    const row = [_]zlsx.Cell{.{ .integer = 7 }};
+    try ws.appendRows(&.{&row});
+
+    // Replace the sheet's part with a self-closing-sheetData body
+    // before calling emitWithAppends. The fast-path must rewrite
+    // `<sheetData/>` into `<sheetData>…</sheetData>` so the
+    // rendered rows have a home.
+    const part_name = try ws.resolvePartName();
+    const synthetic = try allocator.dupe(
+        u8,
+        "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+            "<dimension ref=\"A1\"/>" ++
+            "<sheetData/>" ++
+            "</worksheet>",
+    );
+    defer allocator.free(synthetic);
+    try wb.store.replacePart(part_name, synthetic);
+
+    var outcome = try ws.emitWithAppends(allocator, 0);
+    defer outcome.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, outcome.new_xml, "<sheetData>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.new_xml, "</sheetData>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.new_xml, "<sheetData/>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.new_xml, "<v>7</v>") != null);
+}
+
+test "Worksheet.emitWithAppends: refuses when deltas are staged on the same sheet" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var wb = try Workbook.open(allocator, path);
+    defer wb.deinit();
+
+    // Stage appends, THEN forge a delta directly (bypassing the
+    // editor-level guard) to exercise the emitWithAppends-side
+    // negative-space refusal.
+    const ws = try wb.sheet(0);
+    const row = [_]zlsx.Cell{.{ .integer = 1 }};
+    try ws.appendRows(&.{&row});
+    try ws.deltas.put(allocator, .{ .row = 1, .col = 1 }, .{ .number = 99.0 });
+
+    try std.testing.expectError(error.SheetHasUnsavedMutations, ws.emitWithAppends(allocator, 0));
+}
+
+test "appendXmlFindHighestRow: ignores rows outside <sheetData> window" {
+    // Adversarial: a `<mergeCell ref="A1:A99999"/>` outside
+    // sheetData used to inflate the highest_row scan. Bounded
+    // window now skips it.
+    const xml =
+        "<worksheet>" ++
+        "<dimension ref=\"A1:A1\"/>" ++
+        "<mergeCells><mergeCell ref=\"A1:A99999\"/></mergeCells>" ++
+        "<sheetData>" ++
+        "<row r=\"1\"><c r=\"A1\"><v>1</v></c></row>" ++
+        "</sheetData>" ++
+        "<oddHeader>r=\"A88888\"</oddHeader>" ++
+        "</worksheet>";
+    try std.testing.expectEqual(@as(u32, 1), appendXmlFindHighestRow(xml));
+}
+
+test "appendXmlFindHighestRow: empty sheet body returns 0" {
+    try std.testing.expectEqual(@as(u32, 0), appendXmlFindHighestRow("<sheetData/>"));
+    try std.testing.expectEqual(@as(u32, 0), appendXmlFindHighestRow("<sheetData></sheetData>"));
+    try std.testing.expectEqual(@as(u32, 0), appendXmlFindHighestRow("<worksheet/>"));
+}
+
+test "Worksheet.clearAppendedRows: deinit is safe after clear" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var wb = try Workbook.open(allocator, path);
+    defer wb.deinit();
+
+    const ws = try wb.sheet(0);
+    const r0 = [_]zlsx.Cell{ .{ .integer = 1 }, .{ .string = "x" } };
+    try ws.appendRows(&.{&r0});
+    try std.testing.expectEqual(@as(usize, 1), ws.appended_rows.items.len);
+
+    ws.clearAppendedRows(allocator);
+    try std.testing.expectEqual(@as(usize, 0), ws.appended_rows.items.len);
+
+    // setCell must succeed after the staging buffer has been
+    // cleared — the iter-er-3 symmetric guard only fires while
+    // appends are LIVE.
+    try ws.setCell("A1", .{ .number = 99.0 });
+}
+
+// ─── B2 iter-er-3 fuzz: parse-free XML helpers stay no-panic ──
+
+fn fuzzAppendXmlFindHighestRow(_: void, input: []const u8) anyerror!void {
+    _ = appendXmlFindHighestRow(input);
+}
+
+test "fuzz: appendXmlFindHighestRow never crashes on adversarial sheet XML" {
+    try std.testing.fuzz({}, fuzzAppendXmlFindHighestRow, .{
+        .corpus = &[_][]const u8{
+            "",
+            "<sheetData/>",
+            "<sheetData></sheetData>",
+            "<row r=\"1\"><c r=\"A1\"><v>1</v></c></row>",
+            "<row r=\"99999\"/>",
+            "<c r=\"A1\"/>",
+            "<col r=\"1\"/><conditionalFormatting r=\"A1\"/>",
+            "<row r=\"\"/>",                      // empty digits
+            "<row r=\"-5\"/>",                    // negative — parseInt fails, returns null
+            "<row r=\"99999999999999999999\"/>",  // overflow
+            "<c r=\"A99999999999999999999\"/>",   // overflowing cell ref
+            "<row\nr=\"5\">",                     // newline before attr
+            "<row\tr=\"5\">",                     // tab before attr
+            "<row spans=\"1:5\" r=\"7\"/>",       // attr-order swap
+            "<c s=\"1\" r=\"B12\"/>",             // attr-order swap on c
+            "<rowabc r=\"99\"/>",                 // not a real row tag
+            "<cabc r=\"A1\"/>",                   // not a real c tag
+            "<row r=\"1\" r=\"2\"/>",             // duplicate r=
+            "<row r=\"  5  \"/>",                 // padded digits
+            "<row r=\"5",                         // truncated
+            "<row r=",                            // truncated mid-attr
+            "<row",                               // truncated tag
+            "<<<<<<<",                            // pathological
+            "<row r=\"5\"><!--<row r=\"99\"/>--></row>", // comment-wrapped
+            "<row r=\"\xff\xfe\"/>",              // invalid UTF-8 in attr
+        },
+    });
+}
+
+fn fuzzAppendXmlUpdateDimensionBR(_: void, input: []const u8) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const out = appendXmlUpdateDimensionBR(arena.allocator(), input, 100, 10) catch return;
+    if (out) |s| arena.allocator().free(s);
+}
+
+test "fuzz: appendXmlUpdateDimensionBR never crashes on adversarial XML" {
+    try std.testing.fuzz({}, fuzzAppendXmlUpdateDimensionBR, .{
+        .corpus = &[_][]const u8{
+            "",
+            "<dimension ref=\"A1:Z10\"/>",
+            "<dimension ref=\"A1\"/>",                // single-cell — passthrough null
+            "<dimension ref=\"\"/>",                  // empty ref
+            "<dimension ref=\"A1:\"/>",               // missing BR
+            "<dimension ref=\":Z10\"/>",              // missing TL
+            "<dimension ref=\"$A$1:$Z$10\"/>",        // dollar-anchored
+            "<dimension ref=\"Sheet1!A1:Z10\"/>",     // sheet-prefixed
+            "<dimension ref=\"AAAA1:ZZZZ99999\"/>",   // exceeds max_col
+            "<dimension ref=\"A99999999999999:Z1\"/>",// overflow row
+            "<dimension ref=\"a1:z10\"/>",            // lowercase
+            "<dimension ref=\"A1:Z10",                // truncated quote
+            "<x:dimension ref=\"A1:Z10\"/>",          // namespace prefix
+            "<dimension>",                            // open tag, no attrs
+            "<dimension/>",                           // self-closing, no attrs
+            "<<<<<<<<<<<",                            // pathological
+        },
+    });
+}
+
+fn fuzzAppendXmlInjectRows(_: void, input: []const u8) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const rendered = "<row r=\"1\"><c r=\"A1\"><v>1</v></c></row>";
+    const out = appendXmlInjectRows(arena.allocator(), input, rendered) catch return;
+    arena.allocator().free(out);
+}
+
+test "fuzz: appendXmlInjectRows never crashes on adversarial sheet XML" {
+    try std.testing.fuzz({}, fuzzAppendXmlInjectRows, .{
+        .corpus = &[_][]const u8{
+            "",
+            "<sheetData></sheetData>",
+            "<sheetData/>",
+            "<sheetData attr=\"x\"/>",                    // attrs on self-closing
+            "<sheetData></sheetData",                     // truncated close
+            "<sheetData>",                                // unclosed open
+            "</sheetData>",                               // close before open
+            "<sheetData></sheetData></sheetData>",        // double close
+            "<sheetdata></sheetdata>",                    // wrong case
+            "<x:sheetData/>",                             // namespace prefix
+            "<!--<sheetData/>-->",                        // comment-wrapped
+            "<sheetData attr=\">\"/>",                    // `>` in quoted attr
+            "<sheetData/<sheetData/>",                    // nested malformed
+            "<sheetData",                                 // truncated open
+            "<<<<<<<<<<",                                 // pathological
+        },
+    });
+}
+
+// ─── I5 fuzz: appendCellXmlForAppend on attacker-shaped cell payloads ──
+
+fn fuzzAppendCellXmlForAppend(_: void, input: []const u8) anyerror!void {
+    if (input.len == 0) return;
+    const allocator = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    // Slot for one possible string. emitWithAppends sizes new_strings
+    // exactly; this fuzz singles the .string case to size = 1.
+    const new_strings = try allocator.alloc([]const u8, 1);
+    defer {
+        // Don't free strings[0] unless cursor advanced — caller-allocator dupe.
+        allocator.free(new_strings);
+    }
+
+    // Interpret input[0] as cell variant selector.
+    const variant = input[0] % 5;
+    const ref_row: u32 = @as(u32, input[0] >> 1) + 1;
+    const ref_col: u32 = @as(u32, if (input.len > 1) input[1] else 1) % 100 + 1;
+
+    const cell: zlsx.Cell = switch (variant) {
+        0 => .empty,
+        1 => .{ .integer = @as(i32, @bitCast(@as(u32, input[0]) | (@as(u32, if (input.len > 1) input[1] else 0) << 8))) },
+        2 => .{ .number = @as(f32, @floatFromInt(input.len)) },
+        3 => .{ .boolean = (input[0] & 1) == 1 },
+        else => blk: {
+            // Validate XML safety — appendCellXmlForAppend's caller
+            // (Worksheet.appendRows) has already done this. Skip
+            // unsafe inputs.
+            const s = input[1..];
+            if (!isXmlSafeText(s)) return;
+            break :blk .{ .string = s };
+        },
+    };
+    var sst_cursor: u32 = 0;
+    var owned_strings: u32 = 0;
+    appendCellXmlForAppend(
+        allocator,
+        &out,
+        cell,
+        .{ .row = ref_row, .col = ref_col },
+        0,
+        &sst_cursor,
+        new_strings,
+        &owned_strings,
+    ) catch {
+        // Free any string this iteration owned before bailing.
+        for (new_strings[0..owned_strings]) |dup| allocator.free(dup);
+        return;
+    };
+    // Free the dup if a string was rendered.
+    for (new_strings[0..owned_strings]) |dup| allocator.free(dup);
+}
+
+test "fuzz: appendCellXmlForAppend never crashes on attacker-shaped cells" {
+    try std.testing.fuzz({}, fuzzAppendCellXmlForAppend, .{
+        .corpus = &[_][]const u8{
+            "\x00",                  // .empty
+            "\x01\x05",              // .integer
+            "\x02hello",             // .number
+            "\x03\x01",              // .boolean
+            "\x04alpha",             // .string "alpha"
+            "\x04",                  // .string ""
+            "\x04<<<<",              // .string with XML chars
+            "\x04&amp;",             // .string already escaped
+            "\x04\x00null",          // .string with NUL — isXmlSafeText rejects
+            "\x04\x01ctrl",          // .string with control byte
+            "\x04\x09tab",           // .string with tab — XML-safe
+            "\x04\xc0\x80",          // .string with overlong UTF-8
+            "\x04" ++ ([_]u8{'A'} ** 256), // .string long text
+        },
+    });
+}
+
+// ─── I6 fuzz: appendXmlUpdateDimensionBR with mutated <dimension ref> ──
+
+fn fuzzAppendXmlUpdateDimensionBRMutated(_: void, input: []const u8) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(arena.allocator());
+    try buf.appendSlice(arena.allocator(), "<dimension ref=\"");
+    // Append the input bytes as-is into the ref attribute. Then close
+    // the attribute and tag. Adversarial inputs land directly in the
+    // parser's attention.
+    try buf.appendSlice(arena.allocator(), input);
+    try buf.appendSlice(arena.allocator(), "\"/>");
+    const out = appendXmlUpdateDimensionBR(arena.allocator(), buf.items, 100, 10) catch return;
+    if (out) |s| arena.allocator().free(s);
+}
+
+test "fuzz: appendXmlUpdateDimensionBR never crashes on mutated ref body" {
+    try std.testing.fuzz({}, fuzzAppendXmlUpdateDimensionBRMutated, .{
+        .corpus = &[_][]const u8{
+            "A1:Z10",
+            "A:Z",                          // letters only
+            "1:10",                         // digits only
+            "A1:A1:A1",                     // multiple colons
+            "A1::Z10",                      // double colon
+            "AAAA1:ZZZZZZ99999",            // letter-overflow
+            "A0:Z0",                        // zero rows
+            "A1:Z" ++ "9" ** 12,           // overflow row digits
+            ":",                            // bare colon
+            "A1:",                          // missing BR
+            ":Z10",                         // missing TL
+            "Z\"A1:Z10",                    // injection attempt
+            "A1:Z10\" />\"<dimension ref=\"X1:Y9", // double dimension
+            "A1:" ++ "Z" ** 64,             // long letter sequence
+            "AABCDEF1:XYZ9876",
+            "$A$1:$Z$10",
+            "Sheet!A1:Z10",
+            "1A:10Z",                       // letters/digits swapped
+            "A0001:Z0010",                  // leading zeros
+            "  A1:Z10  ",                   // padded
+            "A1:Z10\x00",                   // NUL terminated
+            "A1:Z10\xff\xfe",               // invalid UTF-8 trailing
+            "",                             // empty ref body
+        },
+    });
+}
+
+// ─── Structural fuzz: emitWithAppends end-to-end on synthetic parts ──
+
+fn fuzzEmitWithAppendsStructural(_: void, input: []const u8) anyerror!void {
+    if (input.len < 8) return;
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return;
+    const allocator = std.testing.allocator;
+    var wb = try Workbook.open(allocator, path);
+    defer wb.deinit();
+
+    const ws = try wb.sheet(0);
+    // Build a synthetic source part from `input`, framed in a minimal
+    // worksheet skeleton. The bytes between the `<sheetData>` markers
+    // are the fuzz payload — exercises the bounded-window scan,
+    // injectRows splice, and dimension widener under adversarial
+    // sheetData content.
+    var part: std.ArrayList(u8) = .empty;
+    defer part.deinit(allocator);
+    try part.appendSlice(allocator, "<worksheet><dimension ref=\"A1:A1\"/><sheetData>");
+    try part.appendSlice(allocator, input);
+    try part.appendSlice(allocator, "</sheetData></worksheet>");
+    const part_name = try ws.resolvePartName();
+    try wb.store.replacePart(part_name, part.items);
+
+    // Stage one row of each cell variant + a string.
+    const row = [_]zlsx.Cell{
+        .{ .integer = 1 },
+        .{ .number = 2.5 },
+        .{ .boolean = true },
+        .{ .string = "fuzz" },
+    };
+    try ws.appendRows(&.{&row});
+
+    var outcome = ws.emitWithAppends(allocator, 0) catch {
+        ws.clearAppendedRows(allocator);
+        return;
+    };
+    defer outcome.deinit(allocator);
+    ws.clearAppendedRows(allocator);
+}
+
+test "fuzz: emitWithAppends end-to-end on adversarial sheetData payload" {
+    try std.testing.fuzz({}, fuzzEmitWithAppendsStructural, .{
+        .corpus = &[_][]const u8{
+            "",
+            "<row r=\"1\"><c r=\"A1\"><v>1</v></c></row>",
+            "<row r=\"99999\"/>",
+            "<row r=\"1048575\"/>",                              // one below max
+            "<row r=\"1048576\"/>",                              // exactly max — append would overflow
+            "<row r=\"1048577\"/>",                              // already past max
+            "<!-- nested <row r=\"1048576\"/> comment -->",      // adversarial comment
+            "<row r=\"5\"><c r=\"A5\"><v></v></c></row>",
+            "<row r=\"5\"><c><v></v></c></row>",                 // <c> with no r=
+            "<row><c/></row>",                                   // explicit-row-less form
+            // 5k bytes of pseudo-row data — exercise large-input path
+            "<row r=\"100\">" ++ ([_]u8{ '<', 'c', '/', '>' } ** 1000) ++ "</row>",
+            "<col r=\"1\"/><c/><row/>",                          // mixed
+            "\x00\x00\x00\x00",                                  // NUL-only
+            "<row r=\"1\"><c r=\"&lt;&gt;\"><v>1</v></c></row>", // entity refs
+            "<row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c></row>", // sst index 0
+        },
+    });
 }

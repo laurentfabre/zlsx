@@ -584,9 +584,9 @@ pub const Editor = struct {
     pub fn appendRows(self: *Editor, sheet_idx: u32, rows: []const []const Cell) !void {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
         // Refuse to mix appends with `setCell` mutations on the same
-        // sheet. The two paths build the modified XML differently
-        // (delta vs full-buffer); merging them safely needs design
-        // work that hasn't shipped. Symmetric guard on `setCell`.
+        // sheet. Worksheet.appendRows enforces this on existing sheets
+        // too, but checking here surfaces a stable error name across
+        // both branches.
         if (self.sheetHasWorkbookDeltas(sheet_idx)) return error.SheetHasUnsavedMutations;
         // Also refuse when a row/col edit is queued for this sheet:
         // save() runs the row/col substitution first, then the append
@@ -597,14 +597,27 @@ pub const Editor = struct {
         // pending mutation would underflow the row-index math in
         // `buildSubstitutedSheet` (start_row + 0 - 1 = u32.max).
         if (rows.len == 0) return;
-        // Refuse rows wider than Excel's max column (XFD = 16384).
-        // The actual final row count check (start_row + len <=
-        // 1048576) happens in buildSubstitutedSheet once the source's
-        // highest row is known.
+
+        // B2 iter-er-3: existing sheets route through the workbook
+        // fast-path (`Worksheet.appendRows` → save-time substring
+        // splice via `Worksheet.emitWithAppends`). Worksheet enforces
+        // the column-cap + integer-precision guards pre-allocation,
+        // so editor-level validation is unnecessary on this branch.
+        const path = self.sheet_paths[sheet_idx];
+        if (self.findPendingNewSheet(path) == null and sheet_idx < self.workbook.sheetCount()) {
+            const ws = try self.workbook.sheet(sheet_idx);
+            return ws.appendRows(rows);
+        }
+
+        // Legacy `pending_appends` path: pending-new sheets — those
+        // haven't migrated through `Workbook.addSheet` yet (iter-er-4
+        // ships that, retiring this branch). New sheets emit their
+        // body XML through `injectAppendedRows` in the new-sheet
+        // save block.
+        const writer_mod = xlsx;
         for (rows) |row| {
             if (row.len > max_col_1based) return error.ColumnIndexOutOfRange;
         }
-        const writer_mod = xlsx;
         for (rows) |row| for (row) |c| switch (c) {
             .empty, .number, .boolean, .string => {},
             .integer => |n| {
@@ -666,6 +679,7 @@ pub const Editor = struct {
 
         if (self.pending_appends.count() == 0 and
             !self.workbookHasAnyDeltas() and
+            !self.workbookHasAnyAppendedRows() and
             self.pending_new_sheets.items.len == 0 and
             self.pending_renames.items.len == 0 and
             self.pending_deletes.items.len == 0 and
@@ -681,7 +695,10 @@ pub const Editor = struct {
 
         // Detect whether any pending append carries a string cell;
         // if so, the SST entry must be substituted alongside the
-        // sheets so the new t="s" indices resolve.
+        // sheets so the new t="s" indices resolve. Two staging
+        // buffers feed this check post-iter-er-3: the legacy
+        // `pending_appends` (new-sheet branch) and the per-Worksheet
+        // `appended_rows` (existing-sheet workbook fast-path).
         var has_strings = false;
         var pa_check = self.pending_appends.iterator();
         outer: while (pa_check.next()) |kv| {
@@ -692,6 +709,7 @@ pub const Editor = struct {
                 };
             }
         }
+        if (!has_strings and self.workbookHasAnyAppendedStrings()) has_strings = true;
 
         // Locate sharedStrings.xml entry + count source SST entries
         // when string cells are pending. iter-lms-3+follow-up:
@@ -787,24 +805,76 @@ pub const Editor = struct {
             subs[entry_idx] = try buildEntryFromXml(self.allocator, path, new_xml);
         }
 
-        var pa_iter = self.pending_appends.iterator();
-        while (pa_iter.next()) |kv| {
-            const sheet_idx = kv.key_ptr.*;
-            const buf = kv.value_ptr.*;
-            const path = self.sheet_paths[sheet_idx];
-            // Phase 3e: appendRows on a new sheet is handled by the
-            // pending_new_sheets branch below — no source entry to
-            // substitute here.
-            if (self.findPendingNewSheet(path) != null) continue;
-            const entry_idx = findEntryByName(self.entries, path) orelse
-                return error.SheetEntryNotFound;
-            subs[entry_idx] = try buildSubstitutedSheet(
-                self.allocator,
-                self.entries[entry_idx],
-                self.src_buf,
-                buf.rows.items,
-                sst_ptr,
-            );
+        // B2 iter-er-3: existing-sheet appends route through the
+        // workbook fast-path. `Worksheet.emitWithAppends` reads the
+        // source XML straight from the part store (no
+        // `ensureParsed`), splices appended rows before
+        // `</sheetData>`, widens `<dimension>`, and returns the new
+        // SST entries to merge. New-sheet appends still flow
+        // through `pending_appends` — the new-sheet block downstream
+        // consumes `pending_appends.get(sheet_idx_for_new)` directly.
+        //
+        // Each outcome's `new_strings` is owned by the editor
+        // allocator (deep-copied from `Worksheet.appended_rows` so
+        // it survives any clearAppendedRows). The strings stay live
+        // until `buildSubstitutedSst` dupes them into the new SST
+        // XML — i.e., end of save(). Accumulate the headers + their
+        // owned elements in `pending_outcome_strings` and free at
+        // save end.
+        var pending_outcome_strings: std.ArrayListUnmanaged([]const []const u8) = .{};
+        defer {
+            for (pending_outcome_strings.items) |strs| {
+                for (strs) |s| self.allocator.free(s);
+                self.allocator.free(@constCast(strs));
+            }
+            pending_outcome_strings.deinit(self.allocator);
+        }
+        {
+            var sheet_idx: u32 = 0;
+            while (sheet_idx < self.workbook.sheetCount()) : (sheet_idx += 1) {
+                const ws = try self.workbook.sheet(sheet_idx);
+                if (ws.appended_rows.items.len == 0) continue;
+                const path = self.sheet_paths[sheet_idx];
+                if (self.findPendingNewSheet(path) != null) continue;
+                const entry_idx = findEntryByName(self.entries, path) orelse
+                    return error.SheetEntryNotFound;
+
+                const sst_base_idx: u32 = if (sst_ptr) |p| p.next_idx else 0;
+                const outcome = try ws.emitWithAppends(self.allocator, sst_base_idx);
+                // Reserve the stash slot up front so the
+                // `appendAssumeCapacity` below is infallible. Without
+                // this, an OOM between `buildEntryFromXml` (which
+                // unconditionally consumes new_xml via its internal
+                // defer) and the stash would either leak or
+                // double-free the strings depending on which side
+                // catches the error first.
+                try pending_outcome_strings.ensureUnusedCapacity(self.allocator, 1);
+
+                // Ownership flag: buildEntryFromXml's internal
+                // `defer allocator.free(new_xml)` consumes new_xml
+                // on every exit (success AND error), so we must NOT
+                // double-free it from our own errdefer once we've
+                // entered that call.
+                var new_xml_owned: bool = true;
+                errdefer if (new_xml_owned) self.allocator.free(outcome.new_xml);
+                errdefer {
+                    for (outcome.new_strings) |s| self.allocator.free(s);
+                    self.allocator.free(outcome.new_strings);
+                }
+                if (sst_ptr) |p| {
+                    const expected_after = p.next_idx + @as(u32, @intCast(outcome.new_strings.len));
+                    for (outcome.new_strings) |s| _ = try p.add(s);
+                    // Pair-assertion: SST cursor advanced exactly
+                    // once per index emitWithAppends burned into the
+                    // XML. A mismatch means a sibling save-step
+                    // bumped next_idx between capture and add.
+                    std.debug.assert(p.next_idx == expected_after);
+                }
+                new_xml_owned = false;
+                subs[entry_idx] = try buildEntryFromXml(self.allocator, path, outcome.new_xml);
+                // Infallible — capacity reserved at top of iteration.
+                pending_outcome_strings.appendAssumeCapacity(outcome.new_strings);
+            }
         }
 
         // B2 iter-er-2: cell mutations now live in
@@ -1236,10 +1306,12 @@ pub const Editor = struct {
     /// independent (no caching yet) — repeated calls re-decompress.
     pub fn scanWorksheet(self: *Editor, sheet_idx: u32) !WorksheetSpans {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
-        // The scanner does NOT see rows queued in `pending_appends`
-        // (those are deltas applied at save time). Reject rather
-        // than return a stale span set.
+        // The scanner does NOT see staged appends — neither the
+        // legacy `pending_appends` (new sheets) nor the iter-er-3
+        // `Worksheet.appended_rows` (existing sheets) flow into
+        // the parsed view. Reject rather than return a stale span set.
         if (self.pending_appends.contains(sheet_idx)) return error.SheetHasUnsavedAppends;
+        if (self.sheetHasWorkbookAppendedRows(sheet_idx)) return error.SheetHasUnsavedAppends;
 
         // B2 iter-er-2: existing-sheet setCell deltas live on the
         // typed-overlay view. Regenerate via `Worksheet.emitWithDeltas`
@@ -1340,6 +1412,12 @@ pub const Editor = struct {
     ) !void {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
         if (self.pending_appends.contains(sheet_idx)) return error.SheetHasUnsavedAppends;
+        // B2 iter-er-3 symmetric guard: workbook-side appended_rows
+        // are mutually exclusive with setCell on the same sheet.
+        // (Worksheet.setCell enforces this internally too, but the
+        // legacy-path branch below skips Worksheet.setCell, so we
+        // need an editor-level check.)
+        if (self.sheetHasWorkbookAppendedRows(sheet_idx)) return error.SheetHasUnsavedAppends;
         // Refuse when a row/col edit is queued for this sheet — same
         // save-order race that affects appendRows.
         if (self.sheetHasPendingRowOrColEdit(sheet_idx)) return error.SheetHasUnsavedRowOrColEdit;
@@ -1697,6 +1775,7 @@ pub const Editor = struct {
         if (self.sheet_paths.len <= 1) return error.CannotDeleteLastSheet;
         if (self.pending_appends.count() > 0 or
             self.workbookHasAnyDeltas() or
+            self.workbookHasAnyAppendedRows() or
             self.pending_renames.items.len > 0 or
             self.pending_row_inserts.items.len > 0 or
             self.pending_row_deletes.items.len > 0 or
@@ -1833,6 +1912,50 @@ pub const Editor = struct {
         return ws.deltas.count() > 0;
     }
 
+    /// True iff any worksheet in the embedded workbook has staged
+    /// `appendRows` rows. B2 iter-er-3 mirror of
+    /// `workbookHasAnyDeltas` for the staging buffer that
+    /// `Worksheet.appendRows` writes to.
+    fn workbookHasAnyAppendedRows(self: *Editor) bool {
+        var i: u32 = 0;
+        while (i < self.workbook.sheetCount()) : (i += 1) {
+            // `Workbook.sheet(i)` for `i < sheetCount()` is genuinely
+            // infallible (the body has no alloc / parse path; the
+            // broad `Error` union covers other entry points). Use
+            // `catch unreachable` — `catch return false` would silently
+            // mask a real corruption if the contract ever weakens.
+            const ws = self.workbook.sheet(i) catch unreachable;
+            if (ws.appended_rows.items.len > 0) return true;
+        }
+        return false;
+    }
+
+    /// True iff the worksheet at `sheet_idx` has staged appended
+    /// rows. Mirror of `sheetHasWorkbookDeltas`. Used by
+    /// `Editor.scanWorksheet` and `Editor.setCell` to refuse
+    /// operations against a sheet whose appended rows aren't yet
+    /// flushed.
+    fn sheetHasWorkbookAppendedRows(self: *Editor, sheet_idx: u32) bool {
+        if (sheet_idx >= self.workbook.sheetCount()) return false;
+        const ws = self.workbook.sheet(sheet_idx) catch return false;
+        return ws.appended_rows.items.len > 0;
+    }
+
+    /// True iff any staged appended row in the workbook contains a
+    /// `.string` cell. Drives `has_strings` detection in save —
+    /// any such cell forces SST extension before sheet substitution.
+    fn workbookHasAnyAppendedStrings(self: *Editor) bool {
+        var i: u32 = 0;
+        while (i < self.workbook.sheetCount()) : (i += 1) {
+            // Same infallibility argument as workbookHasAnyAppendedRows.
+            const ws = self.workbook.sheet(i) catch unreachable;
+            for (ws.appended_rows.items) |row| {
+                for (row) |c| if (c == .string) return true;
+            }
+        }
+        return false;
+    }
+
     /// Cross-sheet reference carriers: tags whose body or attrs can
     /// hold an `OtherSheet!Ref` pointer. If any sheet in the workbook
     /// has one of these, a row/column edit on a *different* sheet
@@ -1874,7 +1997,8 @@ pub const Editor = struct {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
         if (col_1based == 0 or col_1based > max_col_1based) return error.ColumnIndexOutOfRange;
         if (self.pending_appends.contains(sheet_idx) or
-            self.sheetHasWorkbookDeltas(sheet_idx))
+            self.sheetHasWorkbookDeltas(sheet_idx) or
+            self.sheetHasWorkbookAppendedRows(sheet_idx))
         {
             return error.ColEditRequiresCleanSheet;
         }
@@ -1963,7 +2087,8 @@ pub const Editor = struct {
         // sheet (would need cross-pending state shifts we don't
         // model in v1).
         if (self.pending_appends.contains(sheet_idx) or
-            self.sheetHasWorkbookDeltas(sheet_idx))
+            self.sheetHasWorkbookDeltas(sheet_idx) or
+            self.sheetHasWorkbookAppendedRows(sheet_idx))
         {
             return error.RowEditRequiresCleanSheet;
         }
