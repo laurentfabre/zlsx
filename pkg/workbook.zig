@@ -32,6 +32,7 @@ const store_mod = @import("store.zig");
 const typed_parts = @import("typed_parts/root.zig");
 const zlsx = @import("zlsx");
 const drawing_emit = @import("drawing_emit.zig");
+const sheet_edit = @import("sheet_edit.zig");
 
 const PartStore = store_mod.PartStore;
 
@@ -141,6 +142,13 @@ pub const Error = error{
     /// (`xlsx.max_row`). Caller should split the append into
     /// multiple sheets — there is no in-place recovery.
     RowIndexOutOfRange,
+    /// `Workbook.insertRow` refused because shifting an existing
+    /// row would push it past Excel's 1,048,576-row cap. Surfaced
+    /// from `pkg/sheet_edit.zig`.
+    RowEditExceedsMaxRow,
+    /// `Workbook.insertColumn` refused because shifting an
+    /// existing column would push it past Excel's XFD-column cap.
+    ColEditExceedsMaxCol,
     /// `Workbook.addSheet` refused because the workbook already
     /// holds the type-system maximum (`std.math.maxInt(u32)`)
     /// number of sheets. Excel imposes no documented sheet count
@@ -1841,6 +1849,86 @@ pub const Workbook = struct {
             if (ws.deltas.count() > 0) return true;
         }
         return self.store.hasUnsavedChanges();
+    }
+
+    /// Insert a blank row at position `before_row` (1-based) in
+    /// sheet `sheet_idx`. Every existing row at or below `before_row`
+    /// shifts down by 1.  Mutates the workbook's PartStore in
+    /// place: the sheet part is re-emitted with `<row r=>` /
+    /// `<c r="…">` / `<mergeCells>` / `<dimension>` shifted by
+    /// one row.
+    ///
+    /// **Refusal contract.** Refuses with
+    /// `error.RowEditRequiresCleanSheet` if the sheet has any
+    /// staged appendRows or setCell deltas — those deltas index
+    /// into the pre-shift refs and would produce stale output.
+    ///
+    /// **Cross-sheet rewrite.** Cross-sheet formula refs / defined
+    /// names / hyperlinks / DV-CF formulas are NOT yet rewritten
+    /// for row inserts. Sheets that carry those constructs anywhere
+    /// in the workbook are refused at the editor layer
+    /// (`Editor.insertRow`); the iter-er-5 row/col-axis lifts
+    /// (blocked on this PR's typed surface, plus the
+    /// rewriter-call wiring) are tracked in
+    /// `docs/plans/refusal-audit.md`.
+    pub fn insertRow(self: *Workbook, sheet_idx: u32, before_row: u32) Error!void {
+        try self.applySheetEditTransform(sheet_idx, .{ .row = before_row, .kind = .insert });
+    }
+
+    /// Delete row `row` (1-based) in sheet `sheet_idx`. Every row
+    /// > `row` shifts up by 1; cells in the deleted row are
+    /// dropped. Same refusal contract + cross-sheet-rewrite
+    /// limitations as `insertRow`.
+    pub fn deleteRow(self: *Workbook, sheet_idx: u32, row: u32) Error!void {
+        try self.applySheetEditTransform(sheet_idx, .{ .row = row, .kind = .delete });
+    }
+
+    /// Insert a blank column at position `before_col` (1-based, A=1)
+    /// in sheet `sheet_idx`. Every existing column at or right of
+    /// `before_col` shifts right by 1. Same refusal contract as
+    /// `insertRow`; cross-sheet rewrite is the same iter-er-5
+    /// follow-up.
+    pub fn insertColumn(self: *Workbook, sheet_idx: u32, before_col_1based: u32) Error!void {
+        try self.applySheetEditTransform(sheet_idx, .{ .col = before_col_1based, .kind = .insert });
+    }
+
+    /// Delete column `col_1based` in sheet `sheet_idx`. Every
+    /// column > `col_1based` shifts left by 1.
+    pub fn deleteColumn(self: *Workbook, sheet_idx: u32, col_1based: u32) Error!void {
+        try self.applySheetEditTransform(sheet_idx, .{ .col = col_1based, .kind = .delete });
+    }
+
+    const SheetEditSpec = struct {
+        row: ?u32 = null,
+        col: ?u32 = null,
+        kind: sheet_edit.RowEditKind,
+    };
+
+    fn applySheetEditTransform(self: *Workbook, sheet_idx: u32, spec: SheetEditSpec) Error!void {
+        if (sheet_idx >= self.sheetCount()) return error.SheetIndexOutOfRange;
+        const ws = try self.sheet(sheet_idx);
+        if (ws.deltas.count() > 0) return error.SheetHasUnsavedMutations;
+        if (ws.appended_rows.items.len > 0) return error.SheetHasUnsavedAppends;
+
+        const part_name = try ws.resolvePartName();
+        const part = (try self.store.part(part_name)) orelse return error.MissingSheetPart;
+
+        const new_xml = if (spec.row) |r|
+            try sheet_edit.applyRowEditToWorksheet(self.allocator, part.bytes, r, spec.kind)
+        else
+            try sheet_edit.applyColEditToWorksheet(self.allocator, part.bytes, spec.col.?, spec.kind);
+        defer self.allocator.free(new_xml);
+        try self.store.replacePart(part_name, new_xml);
+
+        // Invalidate the cached parsed view — the row/col-shifted
+        // bytes don't match the previously-parsed structure, and
+        // any subsequent ensureParsed must re-tokenize the new
+        // body. resolved_part_name stays valid (path didn't change).
+        if (ws.parsed) |*v| {
+            var view = v.*;
+            view.deinit(self.allocator);
+            ws.parsed = null;
+        }
     }
 };
 
