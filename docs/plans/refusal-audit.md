@@ -79,16 +79,40 @@ rewrite this" — they stay forever:
 
 ## Sequencing for the lift PRs
 
-Order doesn't matter for correctness — each lift is independent of
-the others. Suggested order = smallest first:
+The five axes split by what blocks them:
 
-1. **Defined names** — single rewriter call, three call sites.
-   Smallest blast radius.
-2. **Formula** — already has parity tests in `Workbook.rewriteAllFormulas`'s
-   own suite; add Editor-side integration tests.
-3. **Hyperlink** — internal-only carriers; external URLs no-op.
-4. **Data validation + conditional format** — same rewriter call,
-   both axes lifted in one PR.
+**Lifted in `Workbook.renameSheet` (axis = `rename_sheet`)** — shipped
+post-audit. Adding the three remaining rewriter calls
+(`rewriteAllDefinedNames`, `rewriteAllHyperlinkLocations`,
+`rewriteAllValidationsAndConditionalFormats`) to
+`Workbook.renameSheet` covers cross-sheet refs from defined names,
+internal hyperlinks, and DV/CF formulas. `Editor.renameSheet`
+already routes through `Workbook.renameSheet` post iter-er-4 (2/N).
+
+**Blocked on iter-er-4 (3/N)** — the four row/col edit lifts
+(formula / defined-names / hyperlink / DV+CF) require typed-overlay
+row/col shifts before they can compose with the rewriters'
+delta-writes. Editor's `applyRowEditToWorksheet` operates on the
+sheet's source bytes; the rewriter writes new formulas to the
+workbook's delta map. The two paths emit the same cells via
+different routes — without iter-er-4 (3/N) routing row/col edits
+through the typed-overlay, lifting the row/col axis refusals
+would ship a workbook where row attrs shift but formula refs
+don't.
+
+**Blocked on `delete_sheet` rewriter variant** — the
+`deleteSheet` axis can't lift via the existing rewriters because
+the formula-rewriter's `RewriteEdit` union has no `delete_sheet`
+arm. Adding it (cross-sheet refs to the deleted sheet → `#REF!`)
+is a small extension to `src/formula/rewriter.zig` + wiring into
+`Workbook.deleteSheet`.
+
+After iter-er-4 (3/N) ships, the four row/col axis lifts become
+tractable single-PR drops (call existing rewriter, drop the
+guard).
+
+After the `delete_sheet` rewriter variant ships, the `deleteSheet`
+defined-names refusal lifts trivially.
 
 After all five ship: delete `anySheetCrossSheetCarrier` +
 `RowEditUnsafeForSheet` / `ColEditUnsafeForSheet` (the latter two

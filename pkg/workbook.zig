@@ -1363,9 +1363,23 @@ pub const Workbook = struct {
         // no-op").
         if (std.mem.eql(u8, old_name_owned, new_name)) return;
 
-        _ = try self.rewriteAllFormulas(.{
+        const edit: zlsx.formula_rewriter.RewriteEdit = .{
             .rename_sheet = .{ .old = old_name_owned, .new = new_name },
-        });
+        };
+
+        // B2 iter-er-5 lift (rename_sheet axis): walk every cross-
+        // sheet reference carrier and rewrite the renamed sheet's
+        // qualifiers in place. Until iter-er-5, only formula cells
+        // were rewritten; defined-name formulas, internal hyperlink
+        // locations, and DV/CF formulas all survived as `#REF!`
+        // until the next manual save in Excel. Each rewriter is
+        // tolerant of "no carriers in the workbook" — they short-
+        // circuit on empty workbooks rather than erroring, so
+        // calling all four unconditionally is cheap.
+        _ = try self.rewriteAllFormulas(edit);
+        _ = try self.rewriteAllDefinedNames(edit, null);
+        _ = try self.rewriteAllHyperlinkLocations(edit, null);
+        _ = try self.rewriteAllValidationsAndConditionalFormats(edit, null);
 
         try patchWorkbookXmlSheetName(self, sheet_idx, old_name_owned, new_name);
         try refreshWorkbookXmlView(self);
