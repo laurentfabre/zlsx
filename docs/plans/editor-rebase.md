@@ -10,14 +10,15 @@
 > conservative refusal posture and its public API for one minor
 > line.
 
-## Status (all iters pending)
+## Status (as of 2026-05-05)
 
-- iter-er-1 (Read-side parity — `Editor.open` constructs an internal `Workbook` via `Workbook.fromBook`) — ⏳ pending
-- iter-er-2 (`setCell` / `setCells` rebase — retire `pending_mutations`) — ⏳ pending
-- iter-er-3 (`appendRows` rebase — keep the substring fast-path under a feature gate) — ⏳ pending
-- iter-er-4 (Structural edits — `addSheet` / `renameSheet` / `deleteSheet` flow through Workbook; Workbook gains `addSheet` + `deleteSheet` if not already shipped under B1) — ⏳ pending
+- iter-er-0 ✅ (Editor relocated to `pkg/editor.zig`; nested-types hoist) — PRs #61, #65
+- iter-er-1 ✅ (Read-side parity — `Editor.open` constructs an internal `Workbook` via `Workbook.fromBook`) — PR #66
+- iter-er-2 ✅ (`setCell` / `setCells` rebase — existing-sheet routes through `Worksheet.setCell` + `emitWithDeltas`) — PRs #67, #68
+- iter-er-3 ✅ (`appendRows` rebase — `Worksheet.appendRows` API + `Worksheet.emitWithAppends` substring-splice fast-path; consumer wiring + bench gate green at 1.016× = 176.72 ms median vs 174 ms baseline, well under the 1.10× / 191.4 ms walk-away ceiling) — PRs #69 (bench harness), #70 (writer Huffman u13 cap fix), #71 (1/2 API surface), #73 (2/2 consumer + zig-defensive audit)
+- iter-er-4 (Structural edits — `addSheet` / `renameSheet` / `deleteSheet` flow through Workbook; Workbook gains `addSheet` + `deleteSheet` if not already shipped under B1) — 🚧 in flight (PR #74 ships `Workbook.addSheet` + `PartStore.replacePart` rels-cache refresh + `PartStore.isOverridden`; PR #75 stacks the editor-side migration of all four structural mutators)
 - iter-er-5 (Refusal-list audit — walk every guard, decide which lift, which stay) — ⏳ pending
-- iter-er-6 (`Editor.save` rebase to `Workbook.save` — single emit path) — ⏳ pending
+- iter-er-6 (`Editor.save` rebase to `Workbook.save` — single emit path; retires the dead `pending_*` state from iter-er-3/4) — ⏳ pending
 - iter-er-7 (Corpus parity sweep + perf bench — `≤ 1.5×` ZIP-substitution latency gate) — ⏳ pending
 
 ## Problem
