@@ -1965,25 +1965,13 @@ pub const Editor = struct {
         const path = self.sheet_paths[sheet_idx];
         if (self.findPendingNewSheet(path) != null) return error.ColEditOnNewSheetUnsupported;
 
-        const wb_check = try self.readEntry("xl/workbook.xml");
-        defer self.allocator.free(wb_check);
-        if (std.mem.indexOf(u8, wb_check, "<definedName") != null)
-            return error.ColEditWithDefinedNamesNotSupported;
-
-        // Cross-sheet reference carriers (formulas, hyperlinks,
-        // data validations, conditional formatting) live in *any*
-        // sheet body but can point at the edited sheet's columns.
-        // Without a tokenizer we can't rewrite them, so refuse
-        // globally if any sheet carries one. Picks the most
-        // specific error code based on which carrier we hit first.
-        const xref = try self.anySheetCrossSheetCarrier();
-        if (xref.found) {
-            return switch (xref.kind) {
-                .formula => error.ColEditWithFormulasNotSupported,
-                .hyperlink, .data_validation, .cond_format => error.ColEditUnsafeForSheet,
-                .none => unreachable,
-            };
-        }
+        // B2 iter-er-5 (col axes) lifted: defined names + formulas
+        // + hyperlinks + DV/CF are all rewritten by
+        // `Workbook.insertColumn` / `deleteColumn` via the four
+        // `rewriteAll*` calls. The local guards below still refuse
+        // sheets that carry constructs WITHOUT a rewriter
+        // (drawings / pivots / panes / autoFilter / tables) — see
+        // `docs/plans/refusal-audit.md` for the staying axes.
 
         if (findEntryByName(self.entries, path)) |entry_idx| {
             const e = self.entries[entry_idx];
@@ -2069,28 +2057,13 @@ pub const Editor = struct {
         const path = self.sheet_paths[sheet_idx];
         if (self.findPendingNewSheet(path) != null) return error.RowEditOnNewSheetUnsupported;
 
-        // Workbook-scoped <definedName> entries can carry row
-        // references in formula text (named ranges, print areas,
-        // print titles). Until iter-col-1's formula tokenizer
-        // ships, refuse rather than save stale references.
-        const wb_check = try self.readEntry("xl/workbook.xml");
-        defer self.allocator.free(wb_check);
-        if (std.mem.indexOf(u8, wb_check, "<definedName") != null)
-            return error.RowEditWithDefinedNamesNotSupported;
-
-        // Cross-sheet reference carriers (formulas, hyperlinks,
-        // data validations, conditional formatting) live in *any*
-        // sheet body but can point at the edited sheet's rows.
-        // Without a tokenizer we can't rewrite them, so refuse
-        // globally if any sheet carries one.
-        const xref = try self.anySheetCrossSheetCarrier();
-        if (xref.found) {
-            return switch (xref.kind) {
-                .formula => error.RowEditWithFormulasNotSupported,
-                .hyperlink, .data_validation, .cond_format => error.RowEditUnsafeForSheet,
-                .none => unreachable,
-            };
-        }
+        // B2 iter-er-5 (row axes) lifted: defined names + formulas
+        // + hyperlinks + DV/CF are all rewritten by
+        // `Workbook.insertRow` / `deleteRow` via the four
+        // `rewriteAll*` calls. The local guards below still refuse
+        // sheets that carry constructs WITHOUT a rewriter
+        // (drawings / pivots / panes / autoFilter / tables) — see
+        // `docs/plans/refusal-audit.md` for the staying axes.
 
         // Conservative content guard: scan the worksheet XML for
         // local-only elements that v1 doesn't rewrite. If any are
@@ -5504,7 +5477,11 @@ test "Editor: deleteRow removes a row + shifts everything below up" {
     try std.testing.expectEqual(@as(?[]const Cell, null), try rows.next());
 }
 
-test "Editor: insertRow rejects sheets carrying formulas globally" {
+test "Editor: insertRow on a sheet carrying formulas rewrites refs (iter-er-5 lift)" {
+    // Pre iter-er-5 lift: refused with `RowEditWithFormulasNotSupported`.
+    // Post-lift: `Workbook.insertRow` runs `rewriteAllFormulas` so
+    // cross-sheet and bare formula refs shift alongside the byte
+    // transform. The call now succeeds.
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
@@ -5517,13 +5494,25 @@ test "Editor: insertRow rejects sheets carrying formulas globally" {
         try s.writeRowWithFormulas(&.{.{ .integer = 0 }}, &.{"SUM(A1:A1)"});
         try w.save(src_path);
     }
-    var ed = try Editor.open(std.testing.allocator, src_path);
-    defer ed.deinit();
-    try std.testing.expectError(error.RowEditWithFormulasNotSupported, ed.insertRow(0, 1));
-    try std.testing.expectError(error.RowEditWithFormulasNotSupported, ed.deleteRow(0, 1));
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertRow(0, 1);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.deleteRow(0, 1);
+    }
 }
 
-test "Editor: row/col edits refuse when another sheet has a cross-sheet hyperlink" {
+test "Editor: row/col edits with cross-sheet hyperlinks rewrite locations (iter-er-5 lift)" {
+    // Pre iter-er-5 lift: refused with `RowEditUnsafeForSheet` /
+    // `ColEditUnsafeForSheet`. Post-lift: `Workbook.{insertRow,
+    // deleteRow, insertColumn, deleteColumn}` runs
+    // `rewriteAllHyperlinkLocations` so cross-sheet location
+    // qualifiers shift alongside the byte transform. The call now
+    // succeeds.
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
@@ -5537,18 +5526,29 @@ test "Editor: row/col edits refuse when another sheet has a cross-sheet hyperlin
         try s1.writeRow(&.{.{ .integer = 2 }});
         var s2 = try w.addSheet("WithLink");
         try s2.writeRow(&.{.{ .string = "click" }});
-        // Internal hyperlink pointing back into the first sheet —
-        // exactly the cross-sheet case the row/col rewriter can't
-        // tokenize. Sheet1's own body is clean.
         try s2.addInternalHyperlink("A1", "Plain!C5");
         try w.save(src_path);
     }
-    var ed = try Editor.open(std.testing.allocator, src_path);
-    defer ed.deinit();
-    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 1));
-    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 1));
-    try std.testing.expectError(error.ColEditUnsafeForSheet, ed.insertColumn(0, 1));
-    try std.testing.expectError(error.ColEditUnsafeForSheet, ed.deleteColumn(0, 1));
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertRow(0, 1);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.deleteRow(0, 1);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertColumn(0, 1);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.deleteColumn(0, 1);
+    }
 }
 
 test "Editor: row/col edits refuse on sheets with frozen panes" {
@@ -5682,7 +5682,13 @@ test "Editor: appendRows + setCell after a row/col edit compose (iter-er-4 (3/N)
     }
 }
 
-test "Editor: row edits refuse when ANY sheet has a formula (cross-sheet)" {
+test "Editor: row edits with cross-sheet formulas rewrite refs (iter-er-5 lift)" {
+    // Pre iter-er-5 lift: refused with `RowEditWithFormulasNotSupported`
+    // / `ColEditWithFormulasNotSupported` because sheet2's formula
+    // `Plain!A1+Plain!A2` references rows in the clean sheet.
+    // Post-lift: `Workbook.insertRow` / `deleteRow` /
+    // `insertColumn` / `deleteColumn` runs `rewriteAllFormulas`,
+    // which shifts the cross-sheet refs. The call now succeeds.
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
@@ -5698,14 +5704,26 @@ test "Editor: row edits refuse when ANY sheet has a formula (cross-sheet)" {
         try s2.writeRowWithFormulas(&.{.{ .integer = 0 }}, &.{"Plain!A1+Plain!A2"});
         try w.save(src_path);
     }
-    var ed = try Editor.open(std.testing.allocator, src_path);
-    defer ed.deinit();
-    // Editing the *clean* sheet must still refuse, because Sheet2's
-    // formula references back into it and we have no tokenizer.
-    try std.testing.expectError(error.RowEditWithFormulasNotSupported, ed.insertRow(0, 1));
-    try std.testing.expectError(error.RowEditWithFormulasNotSupported, ed.deleteRow(0, 1));
-    try std.testing.expectError(error.ColEditWithFormulasNotSupported, ed.insertColumn(0, 1));
-    try std.testing.expectError(error.ColEditWithFormulasNotSupported, ed.deleteColumn(0, 1));
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertRow(0, 1);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.deleteRow(0, 1);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertColumn(0, 1);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.deleteColumn(0, 1);
+    }
 }
 
 test "Editor: deleteSheet drops a source sheet (iter-sheet-3)" {
