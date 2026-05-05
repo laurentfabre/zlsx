@@ -3086,14 +3086,19 @@ fn countTokenFrequencies(
     }
 }
 
-/// Scale frequencies down so the max fits in u15 — HuffmanEncoder sums
-/// them internally and needs room. Preserve relative rank: a non-zero
-/// input keeps a non-zero output (rounding up from 0).
+/// Scale frequencies down so the max fits in u13 — HuffmanEncoder
+/// asserts an internal leaf_count invariant (`leaf_counts[max_bits]
+/// [max_bits] == n`) inside `bitCounts`, which trips on certain
+/// near-cap frequency distributions when the cap sits at u15
+/// (witness: a 100k×5-row append payload at 5000+ rows). Capping at
+/// u13 (8191) gives the stdlib's two-priority-queue level walker
+/// enough numerical headroom to converge. Preserve relative rank:
+/// a non-zero input keeps a non-zero output (rounding up from 0).
 fn scaleFreqs(src: []const u32, dst: []u16) void {
     var max_freq: u32 = 0;
     for (src) |f| max_freq = @max(max_freq, f);
-    const u15_max: u32 = 32767;
-    const scale: u32 = if (max_freq > u15_max) (max_freq + u15_max - 1) / u15_max else 1;
+    const cap: u32 = 8191; // u13_max
+    const scale: u32 = if (max_freq > cap) (max_freq + cap - 1) / cap else 1;
     for (src, 0..) |f, i| {
         const v = f / scale;
         dst[i] = @intCast(if (f > 0 and v == 0) 1 else v);
@@ -6518,4 +6523,57 @@ test "Style round-trip: font_name with XML specials, alignment, wrap, diagonals"
     const border = book.cellBorder(3) orelse return error.MissingStyle3;
     try std.testing.expectEqual(true, border.diagonal_up);
     try std.testing.expectEqual(true, border.diagonal_down);
+}
+
+test "deflateCompress: large repetitive payload doesn't trip Huffman assert" {
+    // Regression: a 100k×5 numeric `<sheetData>` payload (≈4 MB
+    // pre-compress) used to crash inside `HuffmanEncoder.bitCounts`
+    // with `assert(leaf_counts[max_bits][max_bits] == n)` because
+    // `scaleFreqs` rescaled to u15 (32767) — the stdlib's level
+    // walker mis-converged on certain near-cap distributions. The
+    // fix: tighter rescale to u13 (8191) leaves enough numerical
+    // headroom. See `scaleFreqs` docstring for the witness.
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, "huff_large.xlsx");
+    defer std.testing.allocator.free(path);
+
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    var s = try w.addSheet("Bench");
+
+    // 50_000 rows of 5 mixed numeric cells — past the previous cliff
+    // (~10_000 rows). One sheet is enough; the bug is per-block.
+    const cells = [_]xlsx.Cell{
+        .{ .integer = 1 },
+        .{ .number = 2.5 },
+        .{ .integer = 3 },
+        .{ .number = 4.75 },
+        .{ .integer = 5 },
+    };
+    var i: usize = 0;
+    while (i < 50_000) : (i += 1) {
+        try s.writeRow(&cells);
+    }
+    // The writeRow path itself doesn't deflate; deflate happens at
+    // save time. Save → reads back via Book.open → confirms the
+    // round-trip held together (any Huffman-tree corruption would
+    // surface as inflate errors here).
+    try w.save(path);
+
+    var book = try xlsx.Book.open(std.testing.allocator, path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
+
+    // Spot-check a row near the end to make sure decompression
+    // walked the whole stream.
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    var row_count: usize = 0;
+    while (try rows.next()) |row| : (row_count += 1) {
+        if (row_count == 49_999) {
+            try std.testing.expectEqual(@as(i64, 1), row[0].integer);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 50_000), row_count);
 }
