@@ -6637,3 +6637,189 @@ test "fuzz: appendXmlInjectRows never crashes on adversarial sheet XML" {
         },
     });
 }
+
+// ─── I5 fuzz: appendCellXmlForAppend on attacker-shaped cell payloads ──
+
+fn fuzzAppendCellXmlForAppend(_: void, input: []const u8) anyerror!void {
+    if (input.len == 0) return;
+    const allocator = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    // Slot for one possible string. emitWithAppends sizes new_strings
+    // exactly; this fuzz singles the .string case to size = 1.
+    const new_strings = try allocator.alloc([]const u8, 1);
+    defer {
+        // Don't free strings[0] unless cursor advanced — caller-allocator dupe.
+        allocator.free(new_strings);
+    }
+
+    // Interpret input[0] as cell variant selector.
+    const variant = input[0] % 5;
+    const ref_row: u32 = @as(u32, input[0] >> 1) + 1;
+    const ref_col: u32 = @as(u32, if (input.len > 1) input[1] else 1) % 100 + 1;
+
+    const cell: zlsx.Cell = switch (variant) {
+        0 => .empty,
+        1 => .{ .integer = @as(i32, @bitCast(@as(u32, input[0]) | (@as(u32, if (input.len > 1) input[1] else 0) << 8))) },
+        2 => .{ .number = @as(f32, @floatFromInt(input.len)) },
+        3 => .{ .boolean = (input[0] & 1) == 1 },
+        else => blk: {
+            // Validate XML safety — appendCellXmlForAppend's caller
+            // (Worksheet.appendRows) has already done this. Skip
+            // unsafe inputs.
+            const s = input[1..];
+            if (!isXmlSafeText(s)) return;
+            break :blk .{ .string = s };
+        },
+    };
+    var sst_cursor: u32 = 0;
+    var owned_strings: u32 = 0;
+    appendCellXmlForAppend(
+        allocator,
+        &out,
+        cell,
+        .{ .row = ref_row, .col = ref_col },
+        0,
+        &sst_cursor,
+        new_strings,
+        &owned_strings,
+    ) catch {
+        // Free any string this iteration owned before bailing.
+        for (new_strings[0..owned_strings]) |dup| allocator.free(dup);
+        return;
+    };
+    // Free the dup if a string was rendered.
+    for (new_strings[0..owned_strings]) |dup| allocator.free(dup);
+}
+
+test "fuzz: appendCellXmlForAppend never crashes on attacker-shaped cells" {
+    try std.testing.fuzz({}, fuzzAppendCellXmlForAppend, .{
+        .corpus = &[_][]const u8{
+            "\x00",                  // .empty
+            "\x01\x05",              // .integer
+            "\x02hello",             // .number
+            "\x03\x01",              // .boolean
+            "\x04alpha",             // .string "alpha"
+            "\x04",                  // .string ""
+            "\x04<<<<",              // .string with XML chars
+            "\x04&amp;",             // .string already escaped
+            "\x04\x00null",          // .string with NUL — isXmlSafeText rejects
+            "\x04\x01ctrl",          // .string with control byte
+            "\x04\x09tab",           // .string with tab — XML-safe
+            "\x04\xc0\x80",          // .string with overlong UTF-8
+            "\x04" ++ ([_]u8{'A'} ** 256), // .string long text
+        },
+    });
+}
+
+// ─── I6 fuzz: appendXmlUpdateDimensionBR with mutated <dimension ref> ──
+
+fn fuzzAppendXmlUpdateDimensionBRMutated(_: void, input: []const u8) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(arena.allocator());
+    try buf.appendSlice(arena.allocator(), "<dimension ref=\"");
+    // Append the input bytes as-is into the ref attribute. Then close
+    // the attribute and tag. Adversarial inputs land directly in the
+    // parser's attention.
+    try buf.appendSlice(arena.allocator(), input);
+    try buf.appendSlice(arena.allocator(), "\"/>");
+    const out = appendXmlUpdateDimensionBR(arena.allocator(), buf.items, 100, 10) catch return;
+    if (out) |s| arena.allocator().free(s);
+}
+
+test "fuzz: appendXmlUpdateDimensionBR never crashes on mutated ref body" {
+    try std.testing.fuzz({}, fuzzAppendXmlUpdateDimensionBRMutated, .{
+        .corpus = &[_][]const u8{
+            "A1:Z10",
+            "A:Z",                          // letters only
+            "1:10",                         // digits only
+            "A1:A1:A1",                     // multiple colons
+            "A1::Z10",                      // double colon
+            "AAAA1:ZZZZZZ99999",            // letter-overflow
+            "A0:Z0",                        // zero rows
+            "A1:Z" ++ "9" ** 12,           // overflow row digits
+            ":",                            // bare colon
+            "A1:",                          // missing BR
+            ":Z10",                         // missing TL
+            "Z\"A1:Z10",                    // injection attempt
+            "A1:Z10\" />\"<dimension ref=\"X1:Y9", // double dimension
+            "A1:" ++ "Z" ** 64,             // long letter sequence
+            "AABCDEF1:XYZ9876",
+            "$A$1:$Z$10",
+            "Sheet!A1:Z10",
+            "1A:10Z",                       // letters/digits swapped
+            "A0001:Z0010",                  // leading zeros
+            "  A1:Z10  ",                   // padded
+            "A1:Z10\x00",                   // NUL terminated
+            "A1:Z10\xff\xfe",               // invalid UTF-8 trailing
+            "",                             // empty ref body
+        },
+    });
+}
+
+// ─── Structural fuzz: emitWithAppends end-to-end on synthetic parts ──
+
+fn fuzzEmitWithAppendsStructural(_: void, input: []const u8) anyerror!void {
+    if (input.len < 8) return;
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return;
+    const allocator = std.testing.allocator;
+    var wb = try Workbook.open(allocator, path);
+    defer wb.deinit();
+
+    const ws = try wb.sheet(0);
+    // Build a synthetic source part from `input`, framed in a minimal
+    // worksheet skeleton. The bytes between the `<sheetData>` markers
+    // are the fuzz payload — exercises the bounded-window scan,
+    // injectRows splice, and dimension widener under adversarial
+    // sheetData content.
+    var part: std.ArrayList(u8) = .empty;
+    defer part.deinit(allocator);
+    try part.appendSlice(allocator, "<worksheet><dimension ref=\"A1:A1\"/><sheetData>");
+    try part.appendSlice(allocator, input);
+    try part.appendSlice(allocator, "</sheetData></worksheet>");
+    const part_name = try ws.resolvePartName();
+    try wb.store.replacePart(part_name, part.items);
+
+    // Stage one row of each cell variant + a string.
+    const row = [_]zlsx.Cell{
+        .{ .integer = 1 },
+        .{ .number = 2.5 },
+        .{ .boolean = true },
+        .{ .string = "fuzz" },
+    };
+    try ws.appendRows(&.{&row});
+
+    var outcome = ws.emitWithAppends(allocator, 0) catch {
+        ws.clearAppendedRows(allocator);
+        return;
+    };
+    defer outcome.deinit(allocator);
+    ws.clearAppendedRows(allocator);
+}
+
+test "fuzz: emitWithAppends end-to-end on adversarial sheetData payload" {
+    try std.testing.fuzz({}, fuzzEmitWithAppendsStructural, .{
+        .corpus = &[_][]const u8{
+            "",
+            "<row r=\"1\"><c r=\"A1\"><v>1</v></c></row>",
+            "<row r=\"99999\"/>",
+            "<row r=\"1048575\"/>",                              // one below max
+            "<row r=\"1048576\"/>",                              // exactly max — append would overflow
+            "<row r=\"1048577\"/>",                              // already past max
+            "<!-- nested <row r=\"1048576\"/> comment -->",      // adversarial comment
+            "<row r=\"5\"><c r=\"A5\"><v></v></c></row>",
+            "<row r=\"5\"><c><v></v></c></row>",                 // <c> with no r=
+            "<row><c/></row>",                                   // explicit-row-less form
+            // 5k bytes of pseudo-row data — exercise large-input path
+            "<row r=\"100\">" ++ ([_]u8{ '<', 'c', '/', '>' } ** 1000) ++ "</row>",
+            "<col r=\"1\"/><c/><row/>",                          // mixed
+            "\x00\x00\x00\x00",                                  // NUL-only
+            "<row r=\"1\"><c r=\"&lt;&gt;\"><v>1</v></c></row>", // entity refs
+            "<row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c></row>", // sst index 0
+        },
+    });
+}
