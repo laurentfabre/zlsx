@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="zlsx-logo-title zlsx-logo-desc">
+  <title id="zlsx-logo-title">zlsx</title>
+  <desc id="zlsx-logo-desc">Fast .xlsx reader and writer for Zig. A spreadsheet page with a Zig-style lightning bolt overlay above the zlsx wordmark.</desc>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Spreadsheet page with dog-eared corner -->
+    <path d="M40 28h88l28 28v100H40z" fill="#F7C843" stroke="#111827" stroke-width="8"/>
+    <path d="M128 28v28h28" stroke="#111827" stroke-width="8"/>
+    <!-- Grid: rows + columns -->
+    <path d="M58 78h84M58 104h84M58 130h84M86 78v60M114 78v60" stroke="#111827" stroke-width="6" opacity="0.72"/>
+    <!-- Zig-style lightning bolt — speed + Zig identity -->
+    <path d="M118 8 64 96h36l-24 60 70-86h-32z" fill="#F97316" stroke="#111827" stroke-width="8"/>
+  </g>
+  <!-- zlsx wordmark — monospace systems-programming aesthetic -->
+  <text x="128" y="220" text-anchor="middle"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="44" font-weight="700" fill="#111827"
+        letter-spacing="2">zlsx</text>
+</svg>
