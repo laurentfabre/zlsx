@@ -1418,8 +1418,14 @@ pub const Workbook = struct {
     pub fn addSheet(self: *Workbook, name: []const u8) Error!*Worksheet {
         try validateSheetName(name);
         if (self.worksheets.len >= std.math.maxInt(u32)) return error.TooManySheets;
+        // Workbook view stores sheet names as raw attribute bytes —
+        // a source name like `R&D` is held as `R&amp;D`. Compare
+        // against the entity-decoded form so attribute escaping
+        // doesn't bypass the duplicate check. Direct byte-equality
+        // first as a fast path; only allocate for entity decoding
+        // when the candidate contains an `&`.
         for (self.workbook.sheets) |s| {
-            if (asciiCaseInsensitiveEql(s.name, name)) return error.SheetNameInUse;
+            if (try sheetNameMatchesDecoded(self.allocator, s.name, name)) return error.SheetNameInUse;
         }
 
         const wb_part = (try self.store.part("xl/workbook.xml")) orelse
@@ -1433,7 +1439,12 @@ pub const Workbook = struct {
         // high-water marks.
         const next_sheet_id = nextMaxNumericAttr(wb_part.bytes, "sheetId=\"") + 1;
         const next_rid_num = nextMaxNumericAttr(rels_part.bytes, "Id=\"rId") + 1;
-        const next_path_num = nextMaxSheetPathNumFromRels(rels_part.bytes) + 1;
+        // Path number must avoid orphan worksheet parts too — when
+        // a sheet is deleted via `Workbook.deleteSheet`, the part
+        // remains in PartStore (orphan-part v1 trade-off). Computing
+        // the next slot purely from rels would re-collide on the
+        // orphan's path. Walk PartStore instead.
+        const next_path_num = (try nextMaxSheetPathNumFromStore(&self.store)) + 1;
 
         var path_buf: [64]u8 = undefined;
         const new_path = try std.fmt.bufPrint(&path_buf, "xl/worksheets/sheet{d}.xml", .{next_path_num});
@@ -2006,6 +2017,47 @@ fn appendXmlEscaped(allocator: Allocator, out: *std.ArrayList(u8), s: []const u8
 /// hold those slices across mutation; this is the enforcement point.
 // ─── B2 iter-er-4 addSheet helpers ────────────────────────────────────
 
+/// Case-insensitive ASCII compare with on-the-fly XML entity
+/// decoding of `view_name`. Used by `Workbook.addSheet` to detect
+/// duplicates where the workbook view holds the encoded form
+/// (`R&amp;D`) and the input is the decoded form (`R&D`). Direct
+/// byte-equality first as a fast path; only decodes when
+/// `view_name` contains an `&`.
+fn sheetNameMatchesDecoded(allocator: Allocator, view_name: []const u8, input: []const u8) Error!bool {
+    if (asciiCaseInsensitiveEql(view_name, input)) return true;
+    if (std.mem.indexOfScalar(u8, view_name, '&') == null) return false;
+
+    var decoded: std.ArrayList(u8) = .empty;
+    defer decoded.deinit(allocator);
+    try decoded.ensureTotalCapacity(allocator, view_name.len);
+    var i: usize = 0;
+    while (i < view_name.len) {
+        if (view_name[i] != '&') {
+            try decoded.append(allocator, view_name[i]);
+            i += 1;
+            continue;
+        }
+        const semi = std.mem.indexOfScalarPos(u8, view_name, i, ';') orelse {
+            try decoded.append(allocator, view_name[i]);
+            i += 1;
+            continue;
+        };
+        const ent = view_name[i + 1 .. semi];
+        const replaced: ?u8 =
+            if (std.mem.eql(u8, ent, "amp")) @as(u8, '&') else if (std.mem.eql(u8, ent, "lt")) @as(u8, '<') else if (std.mem.eql(u8, ent, "gt")) @as(u8, '>') else if (std.mem.eql(u8, ent, "quot")) @as(u8, '"') else if (std.mem.eql(u8, ent, "apos")) @as(u8, '\'') else null;
+        if (replaced) |c| {
+            try decoded.append(allocator, c);
+            i = semi + 1;
+        } else {
+            // Unknown entity — pass `&` through and keep scanning.
+            try decoded.append(allocator, view_name[i]);
+            i += 1;
+        }
+    }
+    return asciiCaseInsensitiveEql(decoded.items, input);
+}
+
+
 /// Scan `xml` for the largest `attr_prefixN"` numeric value (e.g.
 /// `sheetId="3"` or `Id="rId7"`). Returns 0 when no match is found.
 /// Used by `Workbook.addSheet` to pick non-colliding ids when
@@ -2027,11 +2079,35 @@ fn nextMaxNumericAttr(xml: []const u8, attr_prefix: []const u8) u32 {
     return max_id;
 }
 
+/// Highest `xl/worksheets/sheetN.xml` part name in the part store
+/// (including orphan parts left behind by `Workbook.deleteSheet`).
+/// Returns 0 when no such part exists. Used to pick a non-colliding
+/// path number for `Workbook.addSheet` even when prior delete +
+/// add cycles have already consumed slots.
+fn nextMaxSheetPathNumFromStore(store: *const store_mod.PartStore) Error!u32 {
+    const names = try store.partNames();
+    var max_n: u32 = 0;
+    const prefix = "xl/worksheets/sheet";
+    const suffix = ".xml";
+    for (names) |name| {
+        if (!std.mem.startsWith(u8, name, prefix)) continue;
+        if (!std.mem.endsWith(u8, name, suffix)) continue;
+        const num_str = name[prefix.len .. name.len - suffix.len];
+        if (num_str.len == 0) continue;
+        if (std.fmt.parseInt(u32, num_str, 10)) |n| {
+            if (n > max_n) max_n = n;
+        } else |_| {}
+    }
+    return max_n;
+}
+
 /// Highest `worksheets/sheetN.xml` number referenced by a
 /// `Target="…"` attribute in the workbook rels XML. Returns 0 when
 /// no such target exists. Robust against absolute (`/xl/worksheets/`)
 /// and relative (`worksheets/`) prefixes — both decode to the same
-/// number.
+/// number. Kept for potential future callers; `Workbook.addSheet`
+/// uses `nextMaxSheetPathNumFromStore` instead so orphan parts
+/// don't collide.
 fn nextMaxSheetPathNumFromRels(xml: []const u8) u32 {
     var max_n: u32 = 0;
     const needle = "sheet";
