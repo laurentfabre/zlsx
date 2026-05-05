@@ -1407,18 +1407,8 @@ pub const Editor = struct {
             }
         }
 
-        // Legacy path for freshly-added sheets (iter-er-4 retires).
-        if (self.pending_mutations.get(sheet_idx)) |ms| {
-            const xml_copy = try self.allocator.dupe(u8, ms.xml.items);
-            errdefer self.allocator.free(xml_copy);
-            const spans_copy = try self.allocator.dupe(CellSpan, ms.spans.items);
-            return .{ .allocator = self.allocator, .xml = xml_copy, .cells = spans_copy };
-        }
-
         const path = self.sheet_paths[sheet_idx];
-        // Source ZIP entry first; if absent, this is a freshly-
-        // added sheet (Phase 3e iter-sheet-1) — return its empty
-        // body template so callers can scan an untouched new sheet.
+        // Source ZIP entry first.
         if (findEntryByName(self.entries, path)) |entry_idx| {
             const entry = self.entries[entry_idx];
             const payload = self.src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
@@ -1432,9 +1422,10 @@ pub const Editor = struct {
             const cells = try scanWorksheetXml(self.allocator, xml);
             return .{ .allocator = self.allocator, .xml = xml, .cells = cells };
         }
-        if (self.findPendingNewSheet(path)) |ns_idx| {
-            const ns = self.pending_new_sheets.items[ns_idx];
-            const xml = try self.allocator.dupe(u8, ns.body_xml);
+        // B2 iter-er-4 (2/N): wb.addSheet'd sheet — body lives in
+        // PartStore (set by Workbook.addSheet). Dupe + scan.
+        if (try self.workbook.store.part(path)) |part| {
+            const xml = try self.allocator.dupe(u8, part.bytes);
             errdefer self.allocator.free(xml);
             const cells = try scanWorksheetXml(self.allocator, xml);
             return .{ .allocator = self.allocator, .xml = xml, .cells = cells };
@@ -1655,97 +1646,43 @@ pub const Editor = struct {
     /// characters), `error.DuplicateSheetName`, plus any propagated
     /// allocator errors.
     pub fn addSheet(self: *Editor, name: []const u8) !u32 {
-        const writer_mod = xlsx;
-        try writer_mod.validateSheetName(name);
-
-        // Defensive bound to keep `@intCast(old_paths.len)` to u32
-        // at the function tail safe on 64-bit targets. OOXML / Excel
-        // 2007+ has no documented sheet limit (Excel is effectively
-        // memory-bounded; the legacy XLS 255-sheet cap doesn't apply
-        // to .xlsx), so set the cap at the type bound rather than a
-        // legacy ceiling that would reject workbooks Excel accepts.
         if (self.sheet_paths.len >= std.math.maxInt(u32)) return error.TooManySheets;
 
-        // Reject duplicates against existing source sheets and any
-        // pending additions. Source sheet names live in the source's
-        // workbook.xml; rather than re-parse it here, query the
-        // already-extracted Book (Editor's open path used Book.open
-        // for sheet path resolution but didn't keep the names).
-        // Cheapest: read workbook.xml once and scan for `name="…"`.
-        if (try self.isSheetNameTaken(name, null, null)) return error.DuplicateSheetName;
-
-        // Pick the next sheet_id, sheet path number, and rId by
-        // scanning the workbook.xml + rels for the highest existing,
-        // AND every pending_new_sheets entry (otherwise repeated
-        // addSheet calls collide on the same rId / sheetId / path).
-        const wb_xml = try self.readEntry("xl/workbook.xml");
-        defer self.allocator.free(wb_xml);
-        const rels_xml = try self.readEntry("xl/_rels/workbook.xml.rels");
-        defer self.allocator.free(rels_xml);
-
-        var next_sheet_id = nextMaxAttr(wb_xml, "sheetId=\"") + 1;
-        var next_rid_num = nextMaxRId(rels_xml) + 1;
-        var next_path_num = nextMaxSheetPathNum(self.entries) + 1;
-        for (self.pending_new_sheets.items) |s| {
-            if (s.sheet_id >= next_sheet_id) next_sheet_id = s.sheet_id + 1;
-            // s.rid is "rIdN"; strip the "rId" prefix. The pending
-            // entries were produced by addSheet itself, so a parseInt
-            // failure here is a real internal-invariant break — assert
-            // it instead of silently dropping (which would yield a
-            // duplicate rId on the next addSheet call).
-            if (std.mem.startsWith(u8, s.rid, "rId")) {
-                const n = std.fmt.parseInt(u32, s.rid["rId".len..], 10) catch unreachable;
-                if (n >= next_rid_num) next_rid_num = n + 1;
-            }
-            // s.path is "xl/worksheets/sheetN.xml". Same internal-
-            // invariant applies to the path number.
-            const prefix = "xl/worksheets/sheet";
-            const suffix = ".xml";
-            if (std.mem.startsWith(u8, s.path, prefix) and std.mem.endsWith(u8, s.path, suffix)) {
-                const num_str = s.path[prefix.len .. s.path.len - suffix.len];
-                const n = std.fmt.parseInt(u32, num_str, 10) catch unreachable;
-                if (n >= next_path_num) next_path_num = n + 1;
-            }
-        }
-
-        // Build the new entries. Each field gets its own errdefer
-        // so a mid-init OOM frees only the slices we've already
-        // produced — the previous struct-init form deferred all
-        // cleanup behind one `errdefer ns.deinit(...)` that fires
-        // only after the struct is fully built, leaking earlier
-        // allocs if a later one failed.
-        const ns_name = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(ns_name);
-        const ns_path = try std.fmt.allocPrint(self.allocator, "xl/worksheets/sheet{d}.xml", .{next_path_num});
-        errdefer self.allocator.free(ns_path);
-        const ns_rid = try std.fmt.allocPrint(self.allocator, "rId{d}", .{next_rid_num});
-        errdefer self.allocator.free(ns_rid);
-        const ns_body = try self.allocator.dupe(u8, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
-            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
-            "<sheetData></sheetData></worksheet>");
-        errdefer self.allocator.free(ns_body);
-        const ns: NewSheet = .{
-            .name = ns_name,
-            .path = ns_path,
-            .rid = ns_rid,
-            .sheet_id = next_sheet_id,
-            .body_xml = ns_body,
+        // B2 iter-er-4 (2/N): full migration. Editor.addSheet
+        // delegates to Workbook.addSheet, which patches workbook.xml
+        // + workbook.xml.rels + Content_Types in-memory via
+        // PartStore and grows the typed-overlay worksheets array.
+        // The legacy `pending_new_sheets` queue is retired.
+        //
+        // Workbook.addSheet runs its own duplicate-name check
+        // against `workbook.sheets` — that view reflects the
+        // post-rename names because Editor.renameSheet now patches
+        // the workbook view in-memory too (see below).
+        const ws = self.workbook.addSheet(name) catch |err| switch (err) {
+            error.SheetNameInUse => return error.DuplicateSheetName,
+            else => return err,
         };
+        // Capture sheet_idx + part name BEFORE any future structural
+        // mutation invalidates the *Worksheet pointer.
+        const new_idx = ws.sheet_idx;
+        const part_name = try ws.resolvePartName();
 
-        // Grow sheet_paths so subsequent setCell etc. resolve the
-        // new index. sheet_paths is currently `[]const []const u8`;
-        // rebuild a fresh slice with the new tail.
+        // Mirror in self.sheet_paths so editor-level paths
+        // (scanWorksheet, setCell, etc.) resolve the new index.
+        // Path string is duped into the editor allocator —
+        // Editor.deinit frees per-entry via `self.allocator.free`.
+        const new_path = try self.allocator.dupe(u8, part_name);
+        errdefer self.allocator.free(new_path);
+
         const old_paths = self.sheet_paths;
         const new_paths = try self.allocator.alloc([]const u8, old_paths.len + 1);
         errdefer self.allocator.free(new_paths);
         @memcpy(new_paths[0..old_paths.len], old_paths);
-        new_paths[old_paths.len] = ns.path; // borrow; freed via NewSheet.deinit
+        new_paths[old_paths.len] = new_path;
 
-        try self.pending_new_sheets.append(self.allocator, ns);
         self.sheet_paths = new_paths;
-        self.allocator.free(old_paths); // inner strings still owned by their original allocs
-
-        return @intCast(old_paths.len);
+        self.allocator.free(old_paths);
+        return new_idx;
     }
 
     /// Rename a sheet (Phase 3e, iter-sheet-2). v1 patches only
@@ -1757,86 +1694,17 @@ pub const Editor = struct {
     /// the next iter ships.
     pub fn renameSheet(self: *Editor, sheet_idx: u32, new_name: []const u8) !void {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
-        const writer_mod = xlsx;
-        try writer_mod.validateSheetName(new_name);
-
-        // Resolve current name + rId. For a source sheet, look up
-        // via workbook.xml + rels; for a pending-new-sheet, use the
-        // NewSheet entry's name + rid fields.
-        const path = self.sheet_paths[sheet_idx];
-        var current_name: []u8 = undefined;
-        var current_rid: ?[]u8 = null;
-        var current_name_owned = false;
-        var current_rid_owned = false;
-        defer if (current_name_owned) self.allocator.free(current_name);
-        defer if (current_rid_owned) if (current_rid) |r| self.allocator.free(r);
-        if (self.findPendingNewSheet(path)) |ns_idx| {
-            current_name = self.pending_new_sheets.items[ns_idx].name;
-        } else {
-            const meta = (try self.sheetMetaAtPath(path)) orelse return error.SheetEntryNotFound;
-            current_name = meta.name;
-            current_name_owned = true;
-            current_rid = meta.rid;
-            current_rid_owned = true;
-        }
-
-        // No-op short-circuit: only when the EFFECTIVE current name
-        // (taking pending renames into account) equals the new name
-        // BYTE-EXACT. asciiEqlFold here would silently drop legit
-        // case-only renames; loading current_name from workbook.xml
-        // would silently drop a same-session "rename back to
-        // original" (`A->B` then `B->A`).
-        const eff_current: []const u8 = blk: {
-            for (self.pending_renames.items) |r| {
-                if (r.sheet_idx == sheet_idx) break :blk r.new_name;
-            }
-            break :blk current_name;
+        // B2 iter-er-4 (2/N): delegate to Workbook.renameSheet,
+        // which patches xl/workbook.xml in-memory + runs the formula
+        // rewriter (cross-sheet refs become valid, not #REF!) — the
+        // strict-better path versus the legacy `pending_renames`
+        // queue that this Editor used to maintain. Translates the
+        // workbook-layer error names back to Editor's contract.
+        if (sheet_idx >= self.workbook.sheetCount()) return error.SheetIndexOutOfRange;
+        self.workbook.renameSheet(sheet_idx, new_name) catch |err| switch (err) {
+            error.SheetNameInUse => return error.DuplicateSheetName,
+            else => return err,
         };
-        if (std.mem.eql(u8, eff_current, new_name)) return;
-
-        // Reject duplicates against every OTHER sheet's effective
-        // name. "Effective" lets `A->C` then `B->A` work because
-        // sheet 0's effective name after the first rename is `C`,
-        // freeing `A` for sheet 1. Skip-by-rId lets the renamed
-        // source sheet itself drop out of the candidate set.
-        if (try self.isSheetNameTaken(new_name, sheet_idx, current_rid)) return error.DuplicateSheetName;
-
-        // Pending-new-sheet path: mutate the NewSheet's name in
-        // place, no workbook.xml patch needed (the sheet doesn't
-        // exist there yet).
-        if (self.findPendingNewSheet(path)) |ns_idx| {
-            const ns = &self.pending_new_sheets.items[ns_idx];
-            const new_owned = try self.allocator.dupe(u8, new_name);
-            self.allocator.free(ns.name);
-            ns.name = new_owned;
-            return;
-        }
-
-        // Source sheet path: record the rename for save-time
-        // workbook.xml patch. If a previous rename targeted the
-        // same sheet, replace its new_name (don't accumulate).
-        for (self.pending_renames.items) |*r| {
-            if (r.sheet_idx == sheet_idx) {
-                const replaced = try self.allocator.dupe(u8, new_name);
-                self.allocator.free(r.new_name);
-                r.new_name = replaced;
-                return;
-            }
-        }
-        const old_dup = try self.allocator.dupe(u8, current_name);
-        errdefer self.allocator.free(old_dup);
-        const new_dup = try self.allocator.dupe(u8, new_name);
-        errdefer self.allocator.free(new_dup);
-        // Take ownership of the rId (sheetMetaAtPath returned an
-        // owned dupe). Disable the deferred free above.
-        const rid_owned = current_rid.?;
-        current_rid_owned = false;
-        try self.pending_renames.append(self.allocator, .{
-            .sheet_idx = sheet_idx,
-            .rid = rid_owned,
-            .old_name = old_dup,
-            .new_name = new_dup,
-        });
     }
 
     /// Delete a sheet (Phase 3e, iter-sheet-3). v1 contract:
@@ -1881,28 +1749,16 @@ pub const Editor = struct {
                 return error.SheetDeleteWithDefinedNamesNotSupported;
         }
 
-        const path = self.sheet_paths[sheet_idx];
-
-        if (self.findPendingNewSheet(path)) |ns_idx| {
-            // Pending-new sheet: remove from pending_new_sheets.
-            // orderedRemove (NOT swapRemove) so the remaining new
-            // sheets keep their original order — save-time loops
-            // rely on `source_count + i` indexing matching
-            // sheet_paths' tail. NewSheet.path borrows from
-            // sheet_paths; deinit frees name/rid/body only.
-            var ns = self.pending_new_sheets.orderedRemove(ns_idx);
-            ns.deinit(self.allocator);
-        } else {
-            const meta = (try self.sheetMetaAtPath(path)) orelse return error.SheetEntryNotFound;
-            self.allocator.free(meta.name); // not needed for delete
-            const path_dup = try self.allocator.dupe(u8, path);
-            errdefer self.allocator.free(path_dup);
-            errdefer self.allocator.free(meta.rid);
-            try self.pending_deletes.append(self.allocator, .{
-                .path = path_dup,
-                .rid = meta.rid,
-            });
-        }
+        // B2 iter-er-4 (2/N): full migration to Workbook.deleteSheet.
+        // workbook.xml + workbook.xml.rels + Content_Types are
+        // patched in-memory; the workbook view shrinks immediately
+        // so subsequent name-collision checks (in addSheet) reflect
+        // the post-delete state. The deleted sheet's part bytes
+        // remain in PartStore (orphan-part v1 trade-off documented
+        // on Workbook.deleteSheet) — Excel and openpyxl tolerate
+        // unreferenced parts via the OPC reader's
+        // Content_Types-driven part discovery.
+        try self.workbook.deleteSheet(sheet_idx);
 
         // Rebuild sheet_paths without the deleted entry. Free the
         // deleted entry's path bytes; other entries are still
