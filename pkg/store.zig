@@ -473,14 +473,25 @@ pub const PartStore = struct {
         };
         // Mirror the override into parts[idx].bytes so subsequent
         // part() lookups see the updated content. NOTE: derived
-        // metadata (content_type entries in OTHER parts inferred
-        // from a replaced [Content_Types].xml, rels in OTHER parts
-        // inferred from a replaced .rels, etc.) is NOT refreshed
-        // until the next open(). The current contract is: the
-        // replaced part's bytes are visible via part(name); other
-        // parts' inferred metadata stays as it was at open-time.
+        // content_type entries inferred from a replaced
+        // [Content_Types].xml are NOT refreshed until the next
+        // open() — same v1 contract as before.
         self.parts[idx].bytes = dupe_bytes;
         self.parts[idx].compression_method = method;
+
+        // Rels-cache refresh: when the replaced part is itself a
+        // `_rels/<base>.rels` file, re-parse its relationships so
+        // `store.rels(owner)` returns the post-replace view.
+        // Without this, `Workbook.addSheet` and similar callers
+        // could patch a rels file but downstream
+        // `Worksheet.resolvePartName` (which queries `store.rels`)
+        // wouldn't see the new entry until the workbook was
+        // re-opened. iter-er-4.
+        if (try relsOwner(ar_alloc, name)) |owner| {
+            const fresh = try parseRelationships(ar_alloc, dupe_bytes);
+            // `put` overwrites any existing entry for this owner.
+            try self.rels_by_owner.put(ar_alloc, owner, fresh);
+        }
     }
 
     /// Atomic write of the package to `path`. Untouched parts are

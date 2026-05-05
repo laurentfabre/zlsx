@@ -141,6 +141,12 @@ pub const Error = error{
     /// (`xlsx.max_row`). Caller should split the append into
     /// multiple sheets — there is no in-place recovery.
     RowIndexOutOfRange,
+    /// `Workbook.addSheet` refused because the workbook already
+    /// holds the type-system maximum (`std.math.maxInt(u32)`)
+    /// number of sheets. Excel imposes no documented sheet count
+    /// limit (memory-bounded) but the typed-overlay's u32
+    /// indexing does.
+    TooManySheets,
     WriteFailed,
 } || workbook_xml_mod.Error || sheet_xml_mod.ParseError || sst_xml_mod.Error || styles_xml_mod.Error || store_mod.Error ||
     zlsx.formula_rewriter.Error ||
@@ -1369,6 +1375,129 @@ pub const Workbook = struct {
         assert(std.mem.eql(u8, self.workbook.sheets[sheet_idx].name, new_name));
     }
 
+    /// Add a new empty sheet to the workbook (B2 iter-er-4
+    /// structural-edit surface). Allocates a fresh sheet part
+    /// (`xl/worksheets/sheetN.xml`), patches `xl/workbook.xml` +
+    /// `xl/_rels/workbook.xml.rels` (and `[Content_Types].xml` via
+    /// `PartStore.addPart`), then grows the typed-overlay
+    /// `worksheets` array. Returns a handle to the newly-added
+    /// `Worksheet` view.
+    ///
+    /// The new sheet's body is the OOXML-minimal empty-sheet
+    /// template — `<worksheet>` wrapping `<sheetData/>`. Subsequent
+    /// `setCell` / `appendRows` / `addImage` calls operate through
+    /// the returned handle.
+    ///
+    /// **Cap.** Refuses with `error.TooManySheets` if the workbook
+    /// already holds `std.math.maxInt(u32)` sheets. Excel itself
+    /// has no documented sheet count limit (memory-bounded), but
+    /// the typed-overlay's u32 indexing does.
+    ///
+    /// **Errors:**
+    ///   - `error.InvalidSheetName` per `validateSheetName`'s
+    ///     contract (length, reserved chars, "history").
+    ///   - `error.SheetNameInUse` if the name collides with any
+    ///     existing sheet (case-insensitive ASCII).
+    ///   - `error.TooManySheets` at the u32 cap.
+    ///   - `error.MissingWorkbookPart` / `error.MissingWorkbookRels`
+    ///     if the prerequisite parts have been spliced away.
+    ///
+    /// **Atomicity.** Like `addImage`, the mutation is not perfectly
+    /// transactional across the four PartStore writes; ordering
+    /// (addPart → rels → workbook.xml → view-refresh) keeps the
+    /// workbook consistent right up to the workbook.xml splice.
+    /// A failure between addPart and the workbook.xml patch leaves
+    /// the part in the store unreferenced; cleanup ships with
+    /// `removePart` in a future iter.
+    ///
+    /// **Pointer lifetime.** The returned `*Worksheet` (and any
+    /// `*Worksheet` previously returned by `Workbook.sheet`) is
+    /// invalidated by the next structural mutation (`addSheet`,
+    /// `deleteSheet`) — those calls reallocate `self.worksheets`.
+    /// Re-fetch via `wb.sheet(idx)` after structural edits.
+    pub fn addSheet(self: *Workbook, name: []const u8) Error!*Worksheet {
+        try validateSheetName(name);
+        if (self.worksheets.len >= std.math.maxInt(u32)) return error.TooManySheets;
+        for (self.workbook.sheets) |s| {
+            if (asciiCaseInsensitiveEql(s.name, name)) return error.SheetNameInUse;
+        }
+
+        const wb_part = (try self.store.part("xl/workbook.xml")) orelse
+            return error.MissingWorkbookPart;
+        const rels_part = (try self.store.part("xl/_rels/workbook.xml.rels")) orelse
+            return error.MissingWorkbookRels;
+
+        // Pick non-colliding identifiers by scanning the source bytes.
+        // Each addSheet rescans because previous calls extend the
+        // workbook view in-place — nothing else tracks the running
+        // high-water marks.
+        const next_sheet_id = nextMaxNumericAttr(wb_part.bytes, "sheetId=\"") + 1;
+        const next_rid_num = nextMaxNumericAttr(rels_part.bytes, "Id=\"rId") + 1;
+        const next_path_num = nextMaxSheetPathNumFromRels(rels_part.bytes) + 1;
+
+        var path_buf: [64]u8 = undefined;
+        const new_path = try std.fmt.bufPrint(&path_buf, "xl/worksheets/sheet{d}.xml", .{next_path_num});
+        var rid_buf: [32]u8 = undefined;
+        const new_rid = try std.fmt.bufPrint(&rid_buf, "rId{d}", .{next_rid_num});
+
+        const empty_body =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+            "<sheetData/></worksheet>";
+
+        try self.store.addPart(
+            new_path,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+            empty_body,
+        );
+
+        // workbook.xml.rels: add `<Relationship Id="rIdN" Type="…/worksheet" Target="worksheets/sheetN.xml"/>`.
+        const new_rels_xml = try patchWorkbookRelsAddSheet(self.allocator, rels_part.bytes, new_rid, new_path);
+        defer self.allocator.free(new_rels_xml);
+        try self.store.replacePart("xl/_rels/workbook.xml.rels", new_rels_xml);
+
+        // workbook.xml: add `<sheet name="…" sheetId="N" r:id="rIdN"/>`.
+        const new_wb_xml = try patchWorkbookXmlAddSheet(self.allocator, wb_part.bytes, name, next_sheet_id, new_rid);
+        defer self.allocator.free(new_wb_xml);
+        try self.store.replacePart("xl/workbook.xml", new_wb_xml);
+
+        // Re-parse workbook.xml. The patch added one sheet so the
+        // fresh view's sheet count must equal the old view's + 1.
+        const wb_part2 = (try self.store.part("xl/workbook.xml")) orelse
+            return error.MissingWorkbookPart;
+        var fresh = try workbook_xml_mod.parse(self.allocator, wb_part2.bytes);
+        errdefer fresh.deinit(self.allocator);
+        if (fresh.sheets.len != self.workbook.sheets.len + 1) {
+            return error.SheetCountMismatch;
+        }
+
+        // Grow the worksheets slot table to match the new view.
+        const old_count = self.worksheets.len;
+        const new_count = old_count + 1;
+        const new_slots = try self.allocator.alloc(Worksheet, new_count);
+        errdefer self.allocator.free(new_slots);
+        @memcpy(new_slots[0..old_count], self.worksheets);
+        new_slots[old_count] = .{
+            .workbook = self,
+            .sheet_idx = @intCast(old_count),
+            .parsed = null,
+            .resolved_part_name = null,
+        };
+        // Patch back-pointers — old slots may have moved during
+        // the realloc.
+        for (new_slots) |*ws| ws.workbook = self;
+
+        // Commit: swap workbook view, free old slots, install new.
+        self.workbook.deinit(self.allocator);
+        self.workbook = fresh;
+        self.allocator.free(self.worksheets);
+        self.worksheets = new_slots;
+
+        const new_idx: u32 = @intCast(old_count);
+        assert(new_idx < self.worksheets.len);
+        return &self.worksheets[new_idx];
+    }
+
     /// Embed `bytes` (PNG/JPEG/GIF, declared via `mime`) as an image
     /// pinned to `cell_anchor` on the sheet at `sheet_idx`. v1 ships a
     /// MINIMAL surface:
@@ -1875,6 +2004,131 @@ fn appendXmlEscaped(allocator: Allocator, out: *std.ArrayList(u8), s: []const u8
 /// any external borrows of `wb.workbook.sheets[i].name` from before
 /// `renameSheet` are invalidated. The contract says callers don't
 /// hold those slices across mutation; this is the enforcement point.
+// ─── B2 iter-er-4 addSheet helpers ────────────────────────────────────
+
+/// Scan `xml` for the largest `attr_prefixN"` numeric value (e.g.
+/// `sheetId="3"` or `Id="rId7"`). Returns 0 when no match is found.
+/// Used by `Workbook.addSheet` to pick non-colliding ids when
+/// multiple addSheet calls land before the next save.
+fn nextMaxNumericAttr(xml: []const u8, attr_prefix: []const u8) u32 {
+    var max_id: u32 = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, i, attr_prefix)) |pos| {
+        const num_start = pos + attr_prefix.len;
+        var num_end = num_start;
+        while (num_end < xml.len and xml[num_end] >= '0' and xml[num_end] <= '9') : (num_end += 1) {}
+        if (num_end > num_start) {
+            if (std.fmt.parseInt(u32, xml[num_start..num_end], 10)) |n| {
+                if (n > max_id) max_id = n;
+            } else |_| {}
+        }
+        i = num_end + 1;
+    }
+    return max_id;
+}
+
+/// Highest `worksheets/sheetN.xml` number referenced by a
+/// `Target="…"` attribute in the workbook rels XML. Returns 0 when
+/// no such target exists. Robust against absolute (`/xl/worksheets/`)
+/// and relative (`worksheets/`) prefixes — both decode to the same
+/// number.
+fn nextMaxSheetPathNumFromRels(xml: []const u8) u32 {
+    var max_n: u32 = 0;
+    const needle = "sheet";
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, i, needle)) |pos| {
+        const num_start = pos + needle.len;
+        var num_end = num_start;
+        while (num_end < xml.len and xml[num_end] >= '0' and xml[num_end] <= '9') : (num_end += 1) {}
+        if (num_end > num_start and num_end + 4 <= xml.len and
+            std.mem.eql(u8, xml[num_end .. num_end + 4], ".xml"))
+        {
+            // Pre-context check: only count when this `sheetN.xml`
+            // is preceded by `worksheets/` somewhere in the same
+            // attribute span — strips out drawings, comments,
+            // pivots, etc.
+            const ctx_start = if (pos >= 24) pos - 24 else 0;
+            if (std.mem.lastIndexOf(u8, xml[ctx_start..pos], "worksheets/") != null) {
+                if (std.fmt.parseInt(u32, xml[num_start..num_end], 10)) |n| {
+                    if (n > max_n) max_n = n;
+                } else |_| {}
+            }
+        }
+        i = num_end + 1;
+    }
+    return max_n;
+}
+
+/// Splice a new `<Relationship/>` for a worksheet into
+/// `xl/_rels/workbook.xml.rels` immediately before `</Relationships>`.
+/// Caller frees the returned slice.
+fn patchWorkbookRelsAddSheet(
+    allocator: Allocator,
+    xml: []const u8,
+    rid: []const u8,
+    full_path: []const u8,
+) Error![]u8 {
+    const close = std.mem.indexOf(u8, xml, "</Relationships>") orelse return error.MalformedWorkbookRels;
+    // Target is relative to xl/_rels/, so strip the "xl/" prefix
+    // from `full_path`. e.g. "xl/worksheets/sheet5.xml" →
+    // "worksheets/sheet5.xml".
+    const target = if (std.mem.startsWith(u8, full_path, "xl/")) full_path[3..] else full_path;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, xml.len + 256);
+    try out.appendSlice(allocator, xml[0..close]);
+    try out.appendSlice(allocator, "<Relationship Id=\"");
+    try out.appendSlice(allocator, rid);
+    try out.appendSlice(allocator, "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"");
+    try out.appendSlice(allocator, target);
+    try out.appendSlice(allocator, "\"/>");
+    try out.appendSlice(allocator, xml[close..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Splice a new `<sheet/>` line into `xl/workbook.xml` immediately
+/// before `</sheets>`. Caller frees the returned slice. The display
+/// name is XML-attribute-escaped; sheet_id and rid are emitted
+/// verbatim (caller-controlled identifiers).
+fn patchWorkbookXmlAddSheet(
+    allocator: Allocator,
+    xml: []const u8,
+    name: []const u8,
+    sheet_id: u32,
+    rid: []const u8,
+) Error![]u8 {
+    const close = std.mem.indexOf(u8, xml, "</sheets>") orelse return error.MalformedXml;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, xml.len + 256);
+    try out.appendSlice(allocator, xml[0..close]);
+    try out.appendSlice(allocator, "<sheet name=\"");
+    try appendXmlAttrEscapedW(allocator, &out, name);
+    var num_buf: [16]u8 = undefined;
+    try out.appendSlice(allocator, "\" sheetId=\"");
+    try out.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{sheet_id}));
+    try out.appendSlice(allocator, "\" r:id=\"");
+    try out.appendSlice(allocator, rid);
+    try out.appendSlice(allocator, "\"/>");
+    try out.appendSlice(allocator, xml[close..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// XML attribute-context escape: `<`, `>`, `&`, `"` → entity refs.
+/// Use when emitting into a double-quoted attribute value.
+fn appendXmlAttrEscapedW(allocator: Allocator, out: *std.ArrayList(u8), s: []const u8) Error!void {
+    for (s) |c| {
+        switch (c) {
+            '&' => try out.appendSlice(allocator, "&amp;"),
+            '<' => try out.appendSlice(allocator, "&lt;"),
+            '>' => try out.appendSlice(allocator, "&gt;"),
+            '"' => try out.appendSlice(allocator, "&quot;"),
+            else => try out.append(allocator, c),
+        }
+    }
+}
+
 fn refreshWorkbookXmlView(self: *Workbook) Error!void {
     const part = try self.store.part("xl/workbook.xml") orelse return error.MissingWorkbookPart;
     var fresh = try workbook_xml_mod.parse(self.allocator, part.bytes);
@@ -6538,6 +6792,148 @@ test "Worksheet.clearAppendedRows: deinit is safe after clear" {
     // cleared — the iter-er-3 symmetric guard only fires while
     // appends are LIVE.
     try ws.setCell("A1", .{ .number = 99.0 });
+}
+
+// ─── B2 iter-er-4 (1/N): Workbook.addSheet ────────────────────────────
+
+test "Workbook.addSheet: appends a new empty sheet and returns its handle" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var wb = try Workbook.open(allocator, path);
+    defer wb.deinit();
+
+    const before_count = wb.sheetCount();
+    const ws = try wb.addSheet("Iter-Er-4-One");
+    try std.testing.expectEqual(before_count + 1, wb.sheetCount());
+    try std.testing.expectEqualStrings("Iter-Er-4-One", ws.name());
+    try std.testing.expect(ws.parsed == null);
+    try std.testing.expect(ws.appended_rows.items.len == 0);
+    try std.testing.expect(ws.deltas.count() == 0);
+
+    // Returned handle must point at the last slot in worksheets.
+    try std.testing.expectEqual(@as(u32, before_count), ws.sheet_idx);
+    try std.testing.expectEqual(&wb.worksheets[before_count], ws);
+
+    // resolvePartName for the new sheet finds the freshly-allocated
+    // part — proves addPart + rels patch wired correctly.
+    const part_name = try ws.resolvePartName();
+    try std.testing.expect(std.mem.startsWith(u8, part_name, "xl/worksheets/sheet"));
+    try std.testing.expect(std.mem.endsWith(u8, part_name, ".xml"));
+}
+
+test "Workbook.addSheet: refuses duplicate name (case-insensitive)" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var wb = try Workbook.open(allocator, path);
+    defer wb.deinit();
+
+    _ = try wb.addSheet("UniqueSheet");
+    try std.testing.expectError(error.SheetNameInUse, wb.addSheet("UniqueSheet"));
+    try std.testing.expectError(error.SheetNameInUse, wb.addSheet("UNIQUESHEET"));
+    try std.testing.expectError(error.SheetNameInUse, wb.addSheet("uniquesheet"));
+}
+
+test "Workbook.addSheet: refuses InvalidSheetName per the validateSheetName contract" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var wb = try Workbook.open(allocator, path);
+    defer wb.deinit();
+
+    try std.testing.expectError(error.InvalidSheetName, wb.addSheet(""));
+    try std.testing.expectError(error.InvalidSheetName, wb.addSheet("colon:bad"));
+    try std.testing.expectError(error.InvalidSheetName, wb.addSheet("history"));
+    try std.testing.expectError(error.InvalidSheetName, wb.addSheet("HISTORY"));
+}
+
+test "Workbook.addSheet: multiple consecutive adds pick non-colliding ids" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var wb = try Workbook.open(allocator, path);
+    defer wb.deinit();
+
+    const before_count = wb.sheetCount();
+    // Don't HOLD the pointers across calls — addSheet reallocates
+    // self.worksheets, invalidating prior returns. Re-fetch after
+    // every structural call.
+    const idx_a: u32 = blk: {
+        const ws = try wb.addSheet("A");
+        break :blk ws.sheet_idx;
+    };
+    const idx_b: u32 = blk: {
+        const ws = try wb.addSheet("B");
+        break :blk ws.sheet_idx;
+    };
+    const idx_c: u32 = blk: {
+        const ws = try wb.addSheet("C");
+        break :blk ws.sheet_idx;
+    };
+
+    try std.testing.expectEqual(before_count + 3, wb.sheetCount());
+    try std.testing.expectEqualStrings("A", (try wb.sheet(idx_a)).name());
+    try std.testing.expectEqualStrings("B", (try wb.sheet(idx_b)).name());
+    try std.testing.expectEqualStrings("C", (try wb.sheet(idx_c)).name());
+
+    // Distinct part names (sheet ids and path numbers don't collide).
+    const path_a = try (try wb.sheet(idx_a)).resolvePartName();
+    const path_b = try (try wb.sheet(idx_b)).resolvePartName();
+    const path_c = try (try wb.sheet(idx_c)).resolvePartName();
+    try std.testing.expect(!std.mem.eql(u8, path_a, path_b));
+    try std.testing.expect(!std.mem.eql(u8, path_a, path_c));
+    try std.testing.expect(!std.mem.eql(u8, path_b, path_c));
+
+    // Sheet ids in the workbook view are also distinct.
+    var seen: std.AutoHashMapUnmanaged(u32, void) = .{};
+    defer seen.deinit(allocator);
+    for (wb.workbook.sheets) |s| {
+        const gop = try seen.getOrPut(allocator, s.sheet_id);
+        try std.testing.expect(!gop.found_existing);
+    }
+}
+
+test "Workbook.addSheet: name with XML special chars escapes safely into workbook.xml" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var wb = try Workbook.open(allocator, path);
+    defer wb.deinit();
+
+    const tricky = "AT&T <wow>";
+    _ = try wb.addSheet(tricky);
+    // Attribute-escaped on the wire.
+    const wb_part = (try wb.store.part("xl/workbook.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, wb_part.bytes, "AT&amp;T &lt;wow&gt;") != null);
+    // The raw bytes must NOT contain the un-escaped name. The
+    // workbook view (and `ws.name()`) holds the encoded attribute
+    // value verbatim; consumers do their own entity decoding —
+    // matches the renameSheet contract documented at line 521.
+    try std.testing.expect(std.mem.indexOf(u8, wb_part.bytes, "AT&T <wow>") == null);
+}
+
+test "Workbook.addSheet: returned handle accepts setCell + appendRows" {
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var wb = try Workbook.open(allocator, path);
+    defer wb.deinit();
+
+    const ws = try wb.addSheet("Mutable");
+
+    // setCell should land in deltas without erroring.
+    try ws.setCell("B7", .{ .number = 42.0 });
+    try std.testing.expectEqual(@as(u32, 1), ws.deltas.count());
+
+    // setCell + appendRows still mutually exclusive — clear deltas
+    // first.
+    freeDeltaStrings(allocator, &ws.deltas);
+    ws.deltas.clearAndFree(allocator);
+
+    const row = [_]zlsx.Cell{ .{ .integer = 1 }, .{ .string = "ok" } };
+    try ws.appendRows(&.{&row});
+    try std.testing.expectEqual(@as(usize, 1), ws.appended_rows.items.len);
 }
 
 // ─── B2 iter-er-3 fuzz: parse-free XML helpers stay no-panic ──
