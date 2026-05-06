@@ -152,19 +152,6 @@ pub const MutatedSheet = struct {
     }
 };
 
-/// State for one Phase 3e (iter-row-2/3) row insert/delete.
-pub const RowEdit = struct {
-    sheet_idx: u32,
-    row: u32, // 1-based; for insert this is `before_row`,
-    // for delete this is the row to remove.
-};
-
-/// State for one Phase 3e (iter-col-3/4) column insert/delete.
-pub const ColEdit = struct {
-    sheet_idx: u32,
-    col_1based: u32, // 1-based (A=1, B=2, …)
-};
-
 /// State for one Phase 3e (iter-sheet-3) sheet deletion.
 pub const SheetDelete = struct {
     path: []u8, // owned
@@ -297,27 +284,6 @@ pub const Editor = struct {
     /// sheet become `#REF!` until the iter-col-1 formula tokenizer
     /// ships.
     pending_deletes: std.ArrayListUnmanaged(SheetDelete),
-    /// Pending row insertions (Phase 3e iter-row-2). Each entry
-    /// shifts every row at `before_row..` down by 1 in the named
-    /// sheet's worksheet XML at save time. v1 limitations: only
-    /// `<row r=>` + `<c r=>` row component + `<mergeCells>` ref +
-    /// `<dimension>` are rewritten; data validations, hyperlinks,
-    /// conditional formatting, defined names, formulas, drawings
-    /// and pivots are left unchanged. Refuse if any of those
-    /// elements exist (conservative guard).
-    pending_row_inserts: std.ArrayListUnmanaged(RowEdit),
-    /// Pending row deletions (Phase 3e iter-row-3). Same shape as
-    /// inserts: shifts every row > deleted_row up by 1. Same v1
-    /// limitations.
-    pending_row_deletes: std.ArrayListUnmanaged(RowEdit),
-    /// Pending column inserts (Phase 3e iter-col-3). Shifts every
-    /// column at or above `before_col` right by one position.
-    /// Same conservative guards as row edits — refuses sheets
-    /// with formulas (no formula tokenizer in v1).
-    pending_col_inserts: std.ArrayListUnmanaged(ColEdit),
-    /// Pending column deletes (Phase 3e iter-col-4). Symmetric to
-    /// inserts.
-    pending_col_deletes: std.ArrayListUnmanaged(ColEdit),
 
     /// B2 iter-er-1 read-side parity: `Editor.open` constructs an
     /// internal `Workbook` view via `Workbook.fromBook` so subsequent
@@ -539,10 +505,6 @@ pub const Editor = struct {
             .pending_new_sheets = .{},
             .pending_renames = .{},
             .pending_deletes = .{},
-            .pending_row_inserts = .{},
-            .pending_row_deletes = .{},
-            .pending_col_inserts = .{},
-            .pending_col_deletes = .{},
         };
     }
 
@@ -573,10 +535,6 @@ pub const Editor = struct {
         self.pending_renames.deinit(self.allocator);
         for (self.pending_deletes.items) |*d| d.deinit(self.allocator);
         self.pending_deletes.deinit(self.allocator);
-        self.pending_row_inserts.deinit(self.allocator);
-        self.pending_row_deletes.deinit(self.allocator);
-        self.pending_col_inserts.deinit(self.allocator);
-        self.pending_col_deletes.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -599,11 +557,6 @@ pub const Editor = struct {
         // too, but checking here surfaces a stable error name across
         // both branches.
         if (self.sheetHasWorkbookDeltas(sheet_idx)) return error.SheetHasUnsavedMutations;
-        // Also refuse when a row/col edit is queued for this sheet:
-        // save() runs the row/col substitution first, then the append
-        // pass would overwrite that substituted entry with XML built
-        // from the pre-edit source — silently dropping the edit.
-        if (self.sheetHasPendingRowOrColEdit(sheet_idx)) return error.SheetHasUnsavedRowOrColEdit;
         // Empty append is a documented no-op — recording it as a
         // pending mutation would underflow the row-index math in
         // `buildSubstitutedSheet` (start_row + 0 - 1 = u32.max).
@@ -614,60 +567,13 @@ pub const Editor = struct {
         // splice via `Worksheet.emitWithAppends`). Worksheet enforces
         // the column-cap + integer-precision guards pre-allocation,
         // so editor-level validation is unnecessary on this branch.
-        const path = self.sheet_paths[sheet_idx];
-        if (self.findPendingNewSheet(path) == null and sheet_idx < self.workbook.sheetCount()) {
-            const ws = try self.workbook.sheet(sheet_idx);
-            return ws.appendRows(rows);
-        }
-
-        // Legacy `pending_appends` path: pending-new sheets — those
-        // haven't migrated through `Workbook.addSheet` yet (iter-er-4
-        // ships that, retiring this branch). New sheets emit their
-        // body XML through `injectAppendedRows` in the new-sheet
-        // save block.
-        const writer_mod = xlsx;
-        for (rows) |row| {
-            if (row.len > max_col_1based) return error.ColumnIndexOutOfRange;
-        }
-        for (rows) |row| for (row) |c| switch (c) {
-            .empty, .number, .boolean, .string => {},
-            .integer => |n| {
-                // Match writer.zig's contract: integers must round-
-                // trip exactly through f64 (Excel stores all numerics
-                // as IEEE-754 doubles). Reject up front rather than
-                // silently rounding on open.
-                if (!writer_mod.fitsExactlyInF64(n)) return error.IntegerExceedsExcelPrecision;
-            },
-        };
-        const gop = try self.pending_appends.getOrPut(self.allocator, sheet_idx);
-        if (!gop.found_existing) gop.value_ptr.* = .{};
-        for (rows) |row| {
-            const owned = try self.allocator.alloc(Cell, row.len);
-            errdefer self.allocator.free(owned);
-            // Track how many string buffers we duped successfully so
-            // a mid-loop OOM doesn't leak the prefix.
-            var duped: usize = 0;
-            errdefer {
-                for (owned[0..duped]) |c| switch (c) {
-                    .string => |s| self.allocator.free(s),
-                    else => {},
-                };
-            }
-            for (row, 0..) |c, i| {
-                switch (c) {
-                    // String cells need their byte contents duped
-                    // because the caller may have passed a temporary
-                    // slice; the editor holds onto pending appends
-                    // until save and beyond.
-                    .string => |s| {
-                        owned[i] = .{ .string = try self.allocator.dupe(u8, s) };
-                    },
-                    else => owned[i] = c,
-                }
-                duped = i + 1;
-            }
-            try gop.value_ptr.rows.append(self.allocator, owned);
-        }
+        // After iter-er-4 (2/N), all sheets — source AND
+        // wb.addSheet'd — flow through `Worksheet.appendRows`.
+        // The legacy `pending_appends` queue + `findPendingNewSheet`
+        // branch retired in iter-er-6 cleanup phase 2.
+        if (sheet_idx >= self.workbook.sheetCount()) return error.SheetIndexOutOfRange;
+        const ws = try self.workbook.sheet(sheet_idx);
+        return ws.appendRows(rows);
     }
 
     /// Write the workbook (with any pending appends applied) to
@@ -694,11 +600,7 @@ pub const Editor = struct {
             !self.workbook.store.hasUnsavedChanges() and
             self.pending_new_sheets.items.len == 0 and
             self.pending_renames.items.len == 0 and
-            self.pending_deletes.items.len == 0 and
-            self.pending_row_inserts.items.len == 0 and
-            self.pending_row_deletes.items.len == 0 and
-            self.pending_col_inserts.items.len == 0 and
-            self.pending_col_deletes.items.len == 0)
+            self.pending_deletes.items.len == 0)
         {
             try w.writeAll(self.src_buf);
             try atomic_file.finish();
@@ -784,53 +686,6 @@ pub const Editor = struct {
                 self.allocator.free(e.cdfh);
             }
             extra_entries.deinit(self.allocator);
-        }
-
-        // Phase 3e iter-row-2/3: apply row inserts + deletes by
-        // building a substituted sheet entry per affected sheet.
-        // Each sheet has at most one pending row edit (recordRowEdit
-        // enforces that), so order doesn't matter.
-        for (self.pending_row_inserts.items) |edit| {
-            const path = self.sheet_paths[edit.sheet_idx];
-            const entry_idx = findEntryByName(self.entries, path) orelse
-                return error.SheetEntryNotFound;
-            const entry = self.entries[entry_idx];
-            const payload_bytes = self.src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
-            const src_xml = try decompressZipPayload(self.allocator, payload_bytes, entry.compression_method, entry.uncompressed_size);
-            defer self.allocator.free(src_xml);
-            const new_xml = try applyRowEditToWorksheet(self.allocator, src_xml, edit.row, .insert);
-            subs[entry_idx] = try buildEntryFromXml(self.allocator, path, new_xml);
-        }
-        for (self.pending_row_deletes.items) |edit| {
-            const path = self.sheet_paths[edit.sheet_idx];
-            const entry_idx = findEntryByName(self.entries, path) orelse
-                return error.SheetEntryNotFound;
-            const entry = self.entries[entry_idx];
-            const payload_bytes = self.src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
-            const src_xml = try decompressZipPayload(self.allocator, payload_bytes, entry.compression_method, entry.uncompressed_size);
-            defer self.allocator.free(src_xml);
-            const new_xml = try applyRowEditToWorksheet(self.allocator, src_xml, edit.row, .delete);
-            subs[entry_idx] = try buildEntryFromXml(self.allocator, path, new_xml);
-        }
-        for (self.pending_col_inserts.items) |edit| {
-            const path = self.sheet_paths[edit.sheet_idx];
-            const entry_idx = findEntryByName(self.entries, path) orelse return error.SheetEntryNotFound;
-            const entry = self.entries[entry_idx];
-            const payload_bytes = self.src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
-            const src_xml = try decompressZipPayload(self.allocator, payload_bytes, entry.compression_method, entry.uncompressed_size);
-            defer self.allocator.free(src_xml);
-            const new_xml = try applyColEditToWorksheet(self.allocator, src_xml, edit.col_1based, .insert);
-            subs[entry_idx] = try buildEntryFromXml(self.allocator, path, new_xml);
-        }
-        for (self.pending_col_deletes.items) |edit| {
-            const path = self.sheet_paths[edit.sheet_idx];
-            const entry_idx = findEntryByName(self.entries, path) orelse return error.SheetEntryNotFound;
-            const entry = self.entries[entry_idx];
-            const payload_bytes = self.src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
-            const src_xml = try decompressZipPayload(self.allocator, payload_bytes, entry.compression_method, entry.uncompressed_size);
-            defer self.allocator.free(src_xml);
-            const new_xml = try applyColEditToWorksheet(self.allocator, src_xml, edit.col_1based, .delete);
-            subs[entry_idx] = try buildEntryFromXml(self.allocator, path, new_xml);
         }
 
         // B2 iter-er-3: existing-sheet appends route through the
@@ -1500,9 +1355,6 @@ pub const Editor = struct {
         // legacy-path branch below skips Worksheet.setCell, so we
         // need an editor-level check.)
         if (self.sheetHasWorkbookAppendedRows(sheet_idx)) return error.SheetHasUnsavedAppends;
-        // Refuse when a row/col edit is queued for this sheet — same
-        // save-order race that affects appendRows.
-        if (self.sheetHasPendingRowOrColEdit(sheet_idx)) return error.SheetHasUnsavedRowOrColEdit;
         if (row == 0 or row > max_row) return error.RowIndexOutOfRange;
         if (col >= max_col_1based) return error.ColumnIndexOutOfRange;
 
@@ -1735,11 +1587,7 @@ pub const Editor = struct {
         if (self.pending_appends.count() > 0 or
             self.workbookHasAnyDeltas() or
             self.workbookHasAnyAppendedRows() or
-            self.pending_renames.items.len > 0 or
-            self.pending_row_inserts.items.len > 0 or
-            self.pending_row_deletes.items.len > 0 or
-            self.pending_col_inserts.items.len > 0 or
-            self.pending_col_deletes.items.len > 0)
+            self.pending_renames.items.len > 0)
         {
             // deleteSheet rebuilds sheet_paths; queued row/col edits
             // hold raw indices into it and would silently point at
@@ -1800,14 +1648,14 @@ pub const Editor = struct {
     ///     (setCell / appendRows / row inserts/deletes); save
     ///     first to apply those.
     pub fn insertRow(self: *Editor, sheet_idx: u32, before_row: u32) !void {
-        try self.recordRowEdit(sheet_idx, before_row, &self.pending_row_inserts, true);
+        try self.recordRowEdit(sheet_idx, before_row, true);
     }
 
     /// Delete row `row` in sheet `sheet_idx` (Phase 3e, iter-row-3).
     /// Every row > `row` shifts up by 1. Same v1 limitations as
     /// `insertRow`.
     pub fn deleteRow(self: *Editor, sheet_idx: u32, row: u32) !void {
-        try self.recordRowEdit(sheet_idx, row, &self.pending_row_deletes, false);
+        try self.recordRowEdit(sheet_idx, row, false);
     }
 
     /// Insert a blank column at position `before_col` (1-based,
@@ -1815,27 +1663,13 @@ pub const Editor = struct {
     /// limitations as `insertRow` — formula bodies, defined names,
     /// and structured-table refs aren't rewritten and are refused.
     pub fn insertColumn(self: *Editor, sheet_idx: u32, before_col_1based: u32) !void {
-        try self.recordColEdit(sheet_idx, before_col_1based, &self.pending_col_inserts);
+        try self.recordColEdit(sheet_idx, before_col_1based, true);
     }
 
     /// Delete column `col_1based` (1-based) in sheet `sheet_idx`.
     /// Phase 3e iter-col-4.
     pub fn deleteColumn(self: *Editor, sheet_idx: u32, col_1based: u32) !void {
-        try self.recordColEdit(sheet_idx, col_1based, &self.pending_col_deletes);
-    }
-
-    /// True when `sheet_idx` already has a queued insertRow,
-    /// deleteRow, insertColumn, or deleteColumn. Used by
-    /// appendRows/setCell to refuse mixing with a row/col edit on
-    /// the same sheet — save() applies row/col edits before
-    /// appends/mutations and the latter would otherwise overwrite
-    /// the row/col-substituted entry from pre-edit source XML.
-    fn sheetHasPendingRowOrColEdit(self: *Editor, sheet_idx: u32) bool {
-        for (self.pending_row_inserts.items) |e| if (e.sheet_idx == sheet_idx) return true;
-        for (self.pending_row_deletes.items) |e| if (e.sheet_idx == sheet_idx) return true;
-        for (self.pending_col_inserts.items) |e| if (e.sheet_idx == sheet_idx) return true;
-        for (self.pending_col_deletes.items) |e| if (e.sheet_idx == sheet_idx) return true;
-        return false;
+        try self.recordColEdit(sheet_idx, col_1based, false);
     }
 
     /// True iff any worksheet in the embedded workbook has staged
@@ -1903,95 +1737,33 @@ pub const Editor = struct {
         return false;
     }
 
-    /// Cross-sheet reference carriers: tags whose body or attrs can
-    /// hold an `OtherSheet!Ref` pointer. If any sheet in the workbook
-    /// has one of these, a row/column edit on a *different* sheet
-    /// can still leave a stale reference pointing at the edited
-    /// sheet's old layout. Until the formula tokenizer (iter-col-1)
-    /// rewrites them, refuse globally.
-    ///   - `<f>` / `<f ` / `<f/`     — formula bodies (=Sheet1!B:B)
-    ///   - `<hyperlinks`             — `location="Sheet1!C5"` etc.
-    ///   - `<dataValidations`        — formula1/formula2 may cross
-    ///   - `<conditionalFormatting`  — cfRule formulas may cross
-    fn anySheetCrossSheetCarrier(self: *Editor) !struct { found: bool, kind: enum { none, formula, hyperlink, data_validation, cond_format } } {
-        for (self.sheet_paths) |path| {
-            if (self.findPendingNewSheet(path) != null) continue;
-            const entry_idx = findEntryByName(self.entries, path) orelse continue;
-            const e = self.entries[entry_idx];
-            const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
-            const xml = try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
-            defer self.allocator.free(xml);
-            if (std.mem.indexOf(u8, xml, "<f>") != null or
-                std.mem.indexOf(u8, xml, "<f ") != null or
-                std.mem.indexOf(u8, xml, "<f/") != null)
-                return .{ .found = true, .kind = .formula };
-            if (std.mem.indexOf(u8, xml, "<hyperlinks") != null)
-                return .{ .found = true, .kind = .hyperlink };
-            if (std.mem.indexOf(u8, xml, "<dataValidations") != null)
-                return .{ .found = true, .kind = .data_validation };
-            if (std.mem.indexOf(u8, xml, "<conditionalFormatting") != null)
-                return .{ .found = true, .kind = .cond_format };
-        }
-        return .{ .found = false, .kind = .none };
-    }
-
     fn recordColEdit(
         self: *Editor,
         sheet_idx: u32,
         col_1based: u32,
-        list: *std.ArrayListUnmanaged(ColEdit),
+        is_insert: bool,
     ) !void {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
         if (col_1based == 0 or col_1based > max_col_1based) return error.ColumnIndexOutOfRange;
-        if (self.pending_appends.contains(sheet_idx) or
-            self.sheetHasWorkbookDeltas(sheet_idx) or
+        if (self.sheetHasWorkbookDeltas(sheet_idx) or
             self.sheetHasWorkbookAppendedRows(sheet_idx))
         {
             return error.ColEditRequiresCleanSheet;
         }
-        for (self.pending_row_inserts.items) |e| {
-            if (e.sheet_idx == sheet_idx) return error.ColEditRequiresCleanSheet;
-        }
-        for (self.pending_row_deletes.items) |e| {
-            if (e.sheet_idx == sheet_idx) return error.ColEditRequiresCleanSheet;
-        }
-        for (self.pending_col_inserts.items) |e| {
-            if (e.sheet_idx == sheet_idx) return error.ColEditRequiresCleanSheet;
-        }
-        for (self.pending_col_deletes.items) |e| {
-            if (e.sheet_idx == sheet_idx) return error.ColEditRequiresCleanSheet;
-        }
 
+        // Per-sheet content guard — same axes as recordRowEdit.
         const path = self.sheet_paths[sheet_idx];
-        if (self.findPendingNewSheet(path) != null) return error.ColEditOnNewSheetUnsupported;
-
-        // B2 iter-er-5 (col axes) lifted: defined names + formulas
-        // + hyperlinks + DV/CF are all rewritten by
-        // `Workbook.insertColumn` / `deleteColumn` via the four
-        // `rewriteAll*` calls. The local guards below still refuse
-        // sheets that carry constructs WITHOUT a rewriter
-        // (drawings / pivots / panes / autoFilter / tables) — see
-        // `docs/plans/refusal-audit.md` for the staying axes.
-
         if (findEntryByName(self.entries, path)) |entry_idx| {
             const e = self.entries[entry_idx];
             const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
             const xml = try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
             defer self.allocator.free(xml);
-            // Local-only structures we don't yet rewrite — the
-            // cross-sheet carriers above are already checked
-            // workbook-wide.
             const guards = [_][]const u8{
                 "<autoFilter",
                 "<tableParts",
                 "<drawing",
                 "<legacyDrawing",
                 "<picture",
-                // <pane xSplit=..|ySplit=..|topLeftCell=..> carries
-                // column/row coordinates that aren't rewritten by
-                // the row/col edit path. Refuse rather than save a
-                // workbook with frozen panes pointing at the wrong
-                // boundary.
                 "<pane ",
                 "<pane/",
                 "<pane\t",
@@ -2005,14 +1777,6 @@ pub const Editor = struct {
             }
         } else return error.SheetEntryNotFound;
 
-        // B2 iter-er-4 (3/N): delegate the byte transform to
-        // `Workbook.insertColumn` / `deleteColumn` (which patches
-        // PartStore + invalidates the parsed view). The legacy
-        // `pending_col_*` queue is no longer populated; the
-        // Editor.save block that consumed it stays dormant
-        // (always-empty list) until the iter-er-6 cleanup retires
-        // it.
-        const is_insert = list == &self.pending_col_inserts;
         if (is_insert) {
             try self.workbook.insertColumn(sheet_idx, col_1based);
         } else {
@@ -2024,50 +1788,28 @@ pub const Editor = struct {
         self: *Editor,
         sheet_idx: u32,
         row: u32,
-        list: *std.ArrayListUnmanaged(RowEdit),
         is_insert: bool,
     ) !void {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
         if (row == 0 or row > max_row) return error.RowIndexOutOfRange;
-        // Conservative: refuse when other mutations target this
-        // sheet (would need cross-pending state shifts we don't
-        // model in v1).
-        if (self.pending_appends.contains(sheet_idx) or
-            self.sheetHasWorkbookDeltas(sheet_idx) or
+        // Refuse when staged mutations target the same sheet — the
+        // typed-overlay row shift invalidates the parsed view, so
+        // existing deltas / appended_rows would point at the
+        // pre-shift refs and produce stale output. Same invariant
+        // as Worksheet.appendRows / Worksheet.setCell mutual
+        // exclusion.
+        if (self.sheetHasWorkbookDeltas(sheet_idx) or
             self.sheetHasWorkbookAppendedRows(sheet_idx))
         {
             return error.RowEditRequiresCleanSheet;
         }
-        for (self.pending_row_inserts.items) |e| {
-            if (e.sheet_idx == sheet_idx) return error.RowEditRequiresCleanSheet;
-        }
-        for (self.pending_row_deletes.items) |e| {
-            if (e.sheet_idx == sheet_idx) return error.RowEditRequiresCleanSheet;
-        }
-        for (self.pending_col_inserts.items) |e| {
-            if (e.sheet_idx == sheet_idx) return error.RowEditRequiresCleanSheet;
-        }
-        for (self.pending_col_deletes.items) |e| {
-            if (e.sheet_idx == sheet_idx) return error.RowEditRequiresCleanSheet;
-        }
 
-        // Pending-new sheets have empty bodies — insertRow/deleteRow
-        // on them is meaningless and the save path can't substitute
-        // a non-existent source ZIP entry. Reject up front.
+        // Per-sheet content guard: refuse sheets whose bodies carry
+        // constructs the rewriters don't yet handle (drawings,
+        // pivots, frozen panes, tableParts, autoFilter). See
+        // `docs/plans/refusal-audit.md` "Axes that stay refused"
+        // for the rationale.
         const path = self.sheet_paths[sheet_idx];
-        if (self.findPendingNewSheet(path) != null) return error.RowEditOnNewSheetUnsupported;
-
-        // B2 iter-er-5 (row axes) lifted: defined names + formulas
-        // + hyperlinks + DV/CF are all rewritten by
-        // `Workbook.insertRow` / `deleteRow` via the four
-        // `rewriteAll*` calls. The local guards below still refuse
-        // sheets that carry constructs WITHOUT a rewriter
-        // (drawings / pivots / panes / autoFilter / tables) — see
-        // `docs/plans/refusal-audit.md` for the staying axes.
-
-        // Conservative content guard: scan the worksheet XML for
-        // local-only elements that v1 doesn't rewrite. If any are
-        // present, refuse rather than silently corrupt the workbook.
         if (findEntryByName(self.entries, path)) |entry_idx| {
             const e = self.entries[entry_idx];
             const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
@@ -2097,14 +1839,11 @@ pub const Editor = struct {
             }
         } else return error.SheetEntryNotFound;
 
-        // B2 iter-er-4 (3/N): delegate to Workbook.{insertRow,
-        // deleteRow}. Same retirement semantics as recordColEdit.
         if (is_insert) {
             try self.workbook.insertRow(sheet_idx, row);
         } else {
             try self.workbook.deleteRow(sheet_idx, row);
         }
-        _ = list;
     }
 
     /// True when some sheet has an effective name matching
