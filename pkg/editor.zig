@@ -594,35 +594,22 @@ pub const Editor = struct {
         defer atomic_file.deinit();
         const w = &atomic_file.file_writer.interface;
 
-        if (self.pending_appends.count() == 0 and
-            !self.workbookHasAnyDeltas() and
+        if (!self.workbookHasAnyDeltas() and
             !self.workbookHasAnyAppendedRows() and
-            !self.workbook.store.hasUnsavedChanges() and
-            self.pending_new_sheets.items.len == 0 and
-            self.pending_renames.items.len == 0 and
-            self.pending_deletes.items.len == 0)
+            !self.workbook.store.hasUnsavedChanges())
         {
             try w.writeAll(self.src_buf);
             try atomic_file.finish();
             return;
         }
 
-        // Detect whether any pending append carries a string cell;
+        // Detect whether any staged append carries a string cell;
         // if so, the SST entry must be substituted alongside the
-        // sheets so the new t="s" indices resolve. Two staging
-        // buffers feed this check post-iter-er-3: the legacy
-        // `pending_appends` (new-sheet branch) and the per-Worksheet
-        // `appended_rows` (existing-sheet workbook fast-path).
+        // sheets so the new t="s" indices resolve. Post-iter-er-4
+        // all appends flow through `Worksheet.appended_rows` (the
+        // workbook fast-path); the legacy `pending_appends` queue
+        // is no longer populated.
         var has_strings = false;
-        var pa_check = self.pending_appends.iterator();
-        outer: while (pa_check.next()) |kv| {
-            for (kv.value_ptr.rows.items) |row| {
-                for (row) |c| if (c == .string) {
-                    has_strings = true;
-                    break :outer;
-                };
-            }
-        }
         if (!has_strings and self.workbookHasAnyAppendedStrings()) has_strings = true;
 
         // Locate sharedStrings.xml entry + count source SST entries
@@ -943,57 +930,6 @@ pub const Editor = struct {
         // above so a workbook that ALSO got a fresh SST has all
         // its workbook.xml-rels updates applied through the same
         // patchEntryForNewSheets re-substitution flow.
-        // Phase 3e iter-sheet-3: pending sheet deletions. Patch
-        // workbook.xml (drop the <sheet> line), rels (drop the
-        // Relationship), Content_Types (drop the Override). The
-        // entry-skipping in the LFH-emit loop further down drops
-        // the sheet's worksheet-XML ZIP entry itself.
-        if (self.pending_deletes.items.len > 0) {
-            try patchEntryForDeletes(
-                self.allocator,
-                self.entries,
-                self.src_buf,
-                subs,
-                "xl/workbook.xml",
-                self.pending_deletes.items,
-                patchWorkbookXmlForDeletes,
-            );
-            try patchEntryForDeletes(
-                self.allocator,
-                self.entries,
-                self.src_buf,
-                subs,
-                "xl/_rels/workbook.xml.rels",
-                self.pending_deletes.items,
-                patchWorkbookRelsForDeletes,
-            );
-            try patchEntryForDeletes(
-                self.allocator,
-                self.entries,
-                self.src_buf,
-                subs,
-                "[Content_Types].xml",
-                self.pending_deletes.items,
-                patchContentTypesForDeletes,
-            );
-        }
-
-        // Phase 3e iter-sheet-2: pending sheet renames. Composes
-        // through patchEntryForRenames's re-substitution path, so
-        // it stacks correctly on top of any prior workbook.xml
-        // modification (addSheet's <sheets> patch).
-        if (self.pending_renames.items.len > 0) {
-            try patchEntryForRenames(
-                self.allocator,
-                self.entries,
-                self.src_buf,
-                subs,
-                "xl/workbook.xml",
-                self.pending_renames.items,
-                patchWorkbookXmlForRenames,
-            );
-        }
-
         // Emit LFHs in LFH-offset order. Each substituted entry's LFH
         // / payload are freshly built; others copy from src_buf.
         const new_lfh_offsets = try self.allocator.alloc(u32, self.entries.len);
@@ -1006,47 +942,6 @@ pub const Editor = struct {
                 return es[a].lfh_offset < es[b].lfh_offset;
             }
         }.lessThan);
-
-        // Phase 3e iter-sheet-3: mask of entries to drop entirely
-        // (the deleted sheets' worksheet XML). The size validation
-        // and emission loops skip these.
-        const deleted_mask = try self.allocator.alloc(bool, self.entries.len);
-        defer self.allocator.free(deleted_mask);
-        @memset(deleted_mask, false);
-        for (self.pending_deletes.items) |d| {
-            if (findEntryByName(self.entries, d.path)) |di| deleted_mask[di] = true;
-        }
-        // Drop xl/calcChain.xml when any sheet is being deleted —
-        // it's a recompute cache, Excel rebuilds it on open. The
-        // structural-edits plan calls this out as standard cleanup
-        // for destructive edits. Also drop the rels entry that
-        // points at it via `<Relationship Type=".../calcChain"/>`
-        // to avoid a dangling relationship.
-        if (self.pending_deletes.items.len > 0) {
-            if (findEntryByName(self.entries, "xl/calcChain.xml")) |ci| {
-                deleted_mask[ci] = true;
-                // Patch rels to drop the calcChain Relationship.
-                try patchEntryForDeletes(
-                    self.allocator,
-                    self.entries,
-                    self.src_buf,
-                    subs,
-                    "xl/_rels/workbook.xml.rels",
-                    self.pending_deletes.items,
-                    patchWorkbookRelsForCalcChainDrop,
-                );
-                // Patch [Content_Types] to drop calcChain Override.
-                try patchEntryForDeletes(
-                    self.allocator,
-                    self.entries,
-                    self.src_buf,
-                    subs,
-                    "[Content_Types].xml",
-                    self.pending_deletes.items,
-                    patchContentTypesForCalcChainDrop,
-                );
-            }
-        }
 
         // Pre-validate that the rewritten archive stays within ZIP32
         // bounds. Source size is already <= 4 GiB (Editor.open caps),
@@ -1062,7 +957,6 @@ pub const Editor = struct {
         var planned_total: u64 = 0;
         var live_entry_count: usize = 0;
         for (lfh_sorted) |i| {
-            if (deleted_mask[i]) continue;
             live_entry_count += 1;
             if (subs[i]) |s| {
                 planned_total += @as(u64, s.lfh.len) + @as(u64, s.payload.len);
@@ -1076,7 +970,6 @@ pub const Editor = struct {
         }
         const planned_cd_offset = planned_total;
         for (self.entries, 0..) |entry, i| {
-            if (deleted_mask[i]) continue;
             if (subs[i]) |s| {
                 planned_total += @as(u64, s.cdfh.len);
             } else {
@@ -1099,7 +992,6 @@ pub const Editor = struct {
 
         var written: u64 = 0;
         for (lfh_sorted) |i| {
-            if (deleted_mask[i]) continue;
             new_lfh_offsets[i] = @intCast(written);
             if (subs[i]) |s| {
                 try w.writeAll(s.lfh);
@@ -1128,7 +1020,6 @@ pub const Editor = struct {
 
         const new_cd_offset: u32 = @intCast(written);
         for (self.entries, 0..) |entry, i| {
-            if (deleted_mask[i]) continue;
             if (subs[i]) |s| {
                 var cdfh_copy = try self.allocator.dupe(u8, s.cdfh);
                 defer self.allocator.free(cdfh_copy);
@@ -1189,11 +1080,8 @@ pub const Editor = struct {
     /// independent (no caching yet) — repeated calls re-decompress.
     pub fn scanWorksheet(self: *Editor, sheet_idx: u32) !WorksheetSpans {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
-        // The scanner does NOT see staged appends — neither the
-        // legacy `pending_appends` (new sheets) nor the iter-er-3
-        // `Worksheet.appended_rows` (existing sheets) flow into
-        // the parsed view. Reject rather than return a stale span set.
-        if (self.pending_appends.contains(sheet_idx)) return error.SheetHasUnsavedAppends;
+        // Reject staged appends — `Worksheet.appended_rows` doesn't
+        // flow into the parsed view; the span set would be stale.
         if (self.sheetHasWorkbookAppendedRows(sheet_idx)) return error.SheetHasUnsavedAppends;
 
         // B2 iter-er-2: existing-sheet setCell deltas live on the
@@ -1285,7 +1173,6 @@ pub const Editor = struct {
         cell: Cell,
     ) !void {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
-        if (self.pending_appends.contains(sheet_idx)) return error.SheetHasUnsavedAppends;
         // B2 iter-er-3 symmetric guard: workbook-side appended_rows
         // are mutually exclusive with setCell on the same sheet.
         // (Worksheet.setCell enforces this internally too, but the
@@ -1521,12 +1408,10 @@ pub const Editor = struct {
     pub fn deleteSheet(self: *Editor, sheet_idx: u32) !void {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
         if (self.sheet_paths.len <= 1) return error.CannotDeleteLastSheet;
-        if (self.pending_appends.count() > 0 or
-            self.workbookHasAnyDeltas() or
-            self.workbookHasAnyAppendedRows() or
-            self.pending_renames.items.len > 0)
+        if (self.workbookHasAnyDeltas() or
+            self.workbookHasAnyAppendedRows())
         {
-            // deleteSheet rebuilds sheet_paths; queued row/col edits
+            // deleteSheet rebuilds sheet_paths; queued mutations
             // hold raw indices into it and would silently point at
             // the wrong sheet (or out-of-bounds) after the rebuild.
             return error.SheetDeleteRequiresCleanState;
@@ -1781,81 +1666,6 @@ pub const Editor = struct {
         } else {
             try self.workbook.deleteRow(sheet_idx, row);
         }
-    }
-
-    /// True when some sheet has an effective name matching
-    /// `candidate` case-insensitively, EXCLUDING the sheet at
-    /// `except_sheet_idx` (if non-null) and the source `<sheet>`
-    /// entry whose r:id matches `except_rid` (if non-null).
-    ///
-    /// "Effective" means: pending-rename's new_name takes precedence
-    /// over the raw workbook.xml name; pending-new-sheets contribute
-    /// their NewSheet.name. Walks raw workbook.xml directly so
-    /// entries `parseWorkbookSheets` skipped (broken rels) still
-    /// participate in dup detection.
-    fn isSheetNameTaken(
-        self: *Editor,
-        candidate: []const u8,
-        except_sheet_idx: ?u32,
-        except_rid: ?[]const u8,
-    ) !bool {
-
-        // 1. Raw <sheet> entries from workbook.xml. Apply pending
-        //    renames as we walk to compute effective names.
-        const wb = try self.readEntry("xl/workbook.xml");
-        defer self.allocator.free(wb);
-        var i: usize = 0;
-        while (findTagOpen(wb, i, "sheet")) |t| {
-            const attrs = wb[t.start + "<sheet".len .. t.after_open - 1];
-            const rid = getAttr(attrs, "r:id") orelse {
-                i = t.after_open;
-                continue;
-            };
-            if (except_rid) |skip_rid| if (std.mem.eql(u8, rid, skip_rid)) {
-                i = t.after_open;
-                continue;
-            };
-            // Skip sheets queued for deletion — their names are
-            // freed for reuse on save.
-            var was_deleted = false;
-            for (self.pending_deletes.items) |d| {
-                if (std.mem.eql(u8, d.rid, rid)) {
-                    was_deleted = true;
-                    break;
-                }
-            }
-            if (was_deleted) {
-                i = t.after_open;
-                continue;
-            }
-            // Effective name: pending-rename's new_name if any
-            // matches this rId; else the raw (decoded) name.
-            var rename_hit: ?[]const u8 = null;
-            for (self.pending_renames.items) |r| {
-                if (std.mem.eql(u8, r.rid, rid)) {
-                    rename_hit = r.new_name;
-                    break;
-                }
-            }
-            if (rename_hit) |nm| {
-                if (casefold.excelSheetNameEql(nm, candidate)) return true;
-            } else if (getAttr(attrs, "name")) |raw| {
-                var decoded: std.ArrayListUnmanaged(u8) = .{};
-                defer decoded.deinit(self.allocator);
-                try decodeXmlAttrInto(self.allocator, &decoded, raw);
-                if (casefold.excelSheetNameEql(decoded.items, candidate)) return true;
-            }
-            i = t.after_open;
-        }
-
-        // 2. Pending new sheets. Indexed by sheet_idx for the skip.
-        const source_count: u32 = @intCast(self.sheet_paths.len - self.pending_new_sheets.items.len);
-        for (self.pending_new_sheets.items, 0..) |s, ns_idx| {
-            const my_idx: u32 = source_count + @as(u32, @intCast(ns_idx));
-            if (except_sheet_idx) |ei| if (my_idx == ei) continue;
-            if (casefold.excelSheetNameEql(s.name, candidate)) return true;
-        }
-        return false;
     }
 
     /// Look up the source workbook's `<sheet>` row whose r:id
