@@ -893,39 +893,6 @@ pub const Editor = struct {
             }
         }
 
-        // Phase 3e iter-sheet-1: emit each new sheet's body BEFORE
-        // the SST commit so any string cells injected here extend
-        // sst_appender in time. Metadata patches (workbook.xml,
-        // rels, Content_Types) come after — they don't touch the
-        // SST.
-        if (self.pending_new_sheets.items.len > 0) {
-            const source_count: u32 = @intCast(self.sheet_paths.len - self.pending_new_sheets.items.len);
-            for (self.pending_new_sheets.items, 0..) |new_sheet, i| {
-                const sheet_idx_for_new: u32 = source_count + @as(u32, @intCast(i));
-                const body_owned: []u8 = blk: {
-                    if (self.pending_mutations.get(sheet_idx_for_new)) |ms|
-                        break :blk try self.allocator.dupe(u8, ms.xml.items);
-                    if (self.pending_appends.get(sheet_idx_for_new)) |buf| {
-                        // New sheet starts empty, so appended rows
-                        // begin at row 1. Pass sst_ptr so any
-                        // string cells extend the SST in time for
-                        // the commit below.
-                        break :blk try injectAppendedRows(
-                            self.allocator,
-                            new_sheet.body_xml,
-                            buf.rows.items,
-                            1,
-                            sst_ptr,
-                        );
-                    }
-                    break :blk try self.allocator.dupe(u8, new_sheet.body_xml);
-                };
-                // buildEntryFromXml takes ownership of body_owned.
-                const new_entry = try buildEntryFromXml(self.allocator, new_sheet.path, body_owned);
-                try extra_entries.append(self.allocator, new_entry);
-            }
-        }
-
         if (has_strings and sst_appender.new_strings.items.len > 0) {
             if (create_new_sst) {
                 // SST-less source workbook — build a fresh
@@ -976,36 +943,6 @@ pub const Editor = struct {
         // above so a workbook that ALSO got a fresh SST has all
         // its workbook.xml-rels updates applied through the same
         // patchEntryForNewSheets re-substitution flow.
-        if (self.pending_new_sheets.items.len > 0) {
-            try patchEntryForNewSheets(
-                self.allocator,
-                self.entries,
-                self.src_buf,
-                subs,
-                "xl/workbook.xml",
-                self.pending_new_sheets.items,
-                patchWorkbookXmlForNewSheets,
-            );
-            try patchEntryForNewSheets(
-                self.allocator,
-                self.entries,
-                self.src_buf,
-                subs,
-                "xl/_rels/workbook.xml.rels",
-                self.pending_new_sheets.items,
-                patchWorkbookRelsForNewSheets,
-            );
-            try patchEntryForNewSheets(
-                self.allocator,
-                self.entries,
-                self.src_buf,
-                subs,
-                "[Content_Types].xml",
-                self.pending_new_sheets.items,
-                patchContentTypesForNewSheets,
-            );
-        }
-
         // Phase 3e iter-sheet-3: pending sheet deletions. Patch
         // workbook.xml (drop the <sheet> line), rels (drop the
         // Relationship), Content_Types (drop the Override). The
