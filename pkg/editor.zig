@@ -127,92 +127,6 @@ pub const WorksheetSpans = struct {
 /// Lifetime: the source buffer + entry table are held resident;
 /// `deinit` frees both. Single-threaded per Editor instance, matching
 /// the rest of zlsx.
-// ─── Editor support types (hoisted from inside the Editor struct so
-// they can be referenced from pkg/editor.zig once Editor relocates).
-// No semantic change vs the prior `Editor.X` form.
-
-/// Buffered appended rows for one sheet. iter-lms-2 accepts
-/// numeric / integer / boolean / empty cells only — string cells
-/// require SST extension which lands in iter-lms-3.
-pub const AppendBuffer = struct {
-    rows: std.ArrayListUnmanaged([]Cell) = .{},
-};
-
-/// Decompressed worksheet XML kept resident so successive
-/// `setCell` calls amortise the decompress + tokenize cost.
-/// `spans` is kept in source-order and in sync with `xml` —
-/// every splice updates both.
-pub const MutatedSheet = struct {
-    xml: std.ArrayListUnmanaged(u8) = .{},
-    spans: std.ArrayListUnmanaged(CellSpan) = .{},
-
-    pub fn deinit(self: *MutatedSheet, allocator: Allocator) void {
-        self.xml.deinit(allocator);
-        self.spans.deinit(allocator);
-    }
-};
-
-/// State for one Phase 3e (iter-row-2/3) row insert/delete.
-pub const RowEdit = struct {
-    sheet_idx: u32,
-    row: u32, // 1-based; for insert this is `before_row`,
-    // for delete this is the row to remove.
-};
-
-/// State for one Phase 3e (iter-col-3/4) column insert/delete.
-pub const ColEdit = struct {
-    sheet_idx: u32,
-    col_1based: u32, // 1-based (A=1, B=2, …)
-};
-
-/// State for one Phase 3e (iter-sheet-3) sheet deletion.
-pub const SheetDelete = struct {
-    path: []u8, // owned
-    rid: []u8, // owned
-
-    pub fn deinit(self: *SheetDelete, alloc: Allocator) void {
-        alloc.free(self.path);
-        alloc.free(self.rid);
-    }
-};
-
-/// State for one Phase 3e (iter-sheet-2) sheet rename.
-/// `rid` is the source workbook's `r:id="rIdN"` for this sheet,
-/// captured at renameSheet time. The save-time patcher matches
-/// `<sheet r:id="…">` by this rId — Book.sheets indexing might
-/// drop entries with broken rels, so a positional walk over the
-/// raw workbook.xml order would target the wrong line.
-pub const SheetRename = struct {
-    sheet_idx: u32,
-    rid: []u8,
-    old_name: []u8,
-    new_name: []u8,
-
-    pub fn deinit(self: *SheetRename, alloc: Allocator) void {
-        alloc.free(self.rid);
-        alloc.free(self.old_name);
-        alloc.free(self.new_name);
-    }
-};
-
-/// State for one Phase 3e (iter-sheet-1) sheet addition. `path`
-/// is a BORROWED slice into the editor's `sheet_paths` array
-/// (the addSheet helper grows that array and stores the owned
-/// path bytes there); `deinit` does NOT free it.
-pub const NewSheet = struct {
-    name: []u8, // owned dupe of caller's name
-    path: []const u8, // borrowed from Editor.sheet_paths
-    rid: []u8, // owned, "rIdN"
-    sheet_id: u32,
-    body_xml: []u8, // owned, empty worksheet template
-
-    pub fn deinit(self: *NewSheet, alloc: Allocator) void {
-        alloc.free(self.name);
-        alloc.free(self.rid);
-        alloc.free(self.body_xml);
-    }
-};
-
 /// Per-entry spans captured by the iter-lms-1b raw-ZIP scanner.
 /// All offsets/lengths are relative to `src_buf`.
 pub const ZipEntry = struct {
@@ -272,53 +186,6 @@ pub const Editor = struct {
     /// (resolved via `Book.open` at editor-construction time so the
     /// editor doesn't need to re-parse rels itself).
     sheet_paths: []const []const u8,
-    /// Pending appended rows per sheet. Empty when no mutation has
-    /// been requested — `save` then flows through the byte-identical
-    /// passthrough path. Each `AppendBuffer.rows` slice + every
-    /// inner row slice is allocator-owned.
-    pending_appends: std.AutoHashMapUnmanaged(u32, AppendBuffer),
-    /// Pending sheet additions (Phase 3e / iter-sheet-1). Each entry
-    /// produces a new ZIP entry at save time + patches workbook.xml,
-    /// rels, and [Content_Types].xml. The Editor's `sheet_paths`
-    /// slice is grown synchronously on `addSheet` so subsequent
-    /// `setCell` / `scanWorksheet` calls can target the new sheet
-    /// by its returned index.
-    pending_new_sheets: std.ArrayListUnmanaged(NewSheet),
-    /// Pending sheet renames (Phase 3e iter-sheet-2). Each entry
-    /// patches the matching `<sheet name="OLD"…>` line in
-    /// `xl/workbook.xml` to use the new name. v1 limitation:
-    /// formulas in OTHER sheets that reference the renamed sheet
-    /// by name (`'OLD'!A1`) are NOT rewritten — that requires a
-    /// formula tokenizer (iter-col-1).
-    pending_renames: std.ArrayListUnmanaged(SheetRename),
-    /// Pending sheet deletions (Phase 3e iter-sheet-3). Each entry
-    /// drops the matching ZIP entry at save + patches workbook.xml,
-    /// rels, Content_Types. Cross-sheet formula refs to the deleted
-    /// sheet become `#REF!` until the iter-col-1 formula tokenizer
-    /// ships.
-    pending_deletes: std.ArrayListUnmanaged(SheetDelete),
-    /// Pending row insertions (Phase 3e iter-row-2). Each entry
-    /// shifts every row at `before_row..` down by 1 in the named
-    /// sheet's worksheet XML at save time. v1 limitations: only
-    /// `<row r=>` + `<c r=>` row component + `<mergeCells>` ref +
-    /// `<dimension>` are rewritten; data validations, hyperlinks,
-    /// conditional formatting, defined names, formulas, drawings
-    /// and pivots are left unchanged. Refuse if any of those
-    /// elements exist (conservative guard).
-    pending_row_inserts: std.ArrayListUnmanaged(RowEdit),
-    /// Pending row deletions (Phase 3e iter-row-3). Same shape as
-    /// inserts: shifts every row > deleted_row up by 1. Same v1
-    /// limitations.
-    pending_row_deletes: std.ArrayListUnmanaged(RowEdit),
-    /// Pending column inserts (Phase 3e iter-col-3). Shifts every
-    /// column at or above `before_col` right by one position.
-    /// Same conservative guards as row edits — refuses sheets
-    /// with formulas (no formula tokenizer in v1).
-    pending_col_inserts: std.ArrayListUnmanaged(ColEdit),
-    /// Pending column deletes (Phase 3e iter-col-4). Symmetric to
-    /// inserts.
-    pending_col_deletes: std.ArrayListUnmanaged(ColEdit),
-
     /// B2 iter-er-1 read-side parity: `Editor.open` constructs an
     /// internal `Workbook` view via `Workbook.fromBook` so subsequent
     /// iters can route reads through the typed-overlay surface
@@ -327,15 +194,6 @@ pub const Editor = struct {
     /// pipeline still walks `entries` + `src_buf` directly.
     /// `Editor.deinit` cleans up both Editor and Workbook.
     workbook: Workbook,
-
-    /// Pending in-place cell mutations per sheet (Phase 3d / iter-cm-2).
-    /// Each entry holds the decompressed-and-mutated worksheet XML
-    /// plus an in-sync span index. Populated lazily by `setCell` on
-    /// first call; consumed at `save`. Cannot coexist with
-    /// `pending_appends` for the same sheet — refused with
-    /// `error.SheetHasUnsavedAppends` (or the symmetric
-    /// `error.SheetHasUnsavedMutations` from `appendRows`).
-    pending_mutations: std.AutoHashMapUnmanaged(u32, MutatedSheet),
 
     pub fn open(allocator: Allocator, path: []const u8) !Editor {
         const file = try std.fs.cwd().openFile(path, .{});
@@ -534,15 +392,6 @@ pub const Editor = struct {
             .eocd_comment = eocd_comment,
             .sheet_paths = sheet_paths_alloc.?,
             .workbook = workbook_built.?,
-            .pending_appends = .{},
-            .pending_mutations = .{},
-            .pending_new_sheets = .{},
-            .pending_renames = .{},
-            .pending_deletes = .{},
-            .pending_row_inserts = .{},
-            .pending_row_deletes = .{},
-            .pending_col_inserts = .{},
-            .pending_col_deletes = .{},
         };
     }
 
@@ -552,31 +401,6 @@ pub const Editor = struct {
         self.allocator.free(self.entries);
         for (self.sheet_paths) |p| self.allocator.free(p);
         self.allocator.free(self.sheet_paths);
-        var it = self.pending_appends.valueIterator();
-        while (it.next()) |buf| {
-            for (buf.rows.items) |row| {
-                for (row) |c| switch (c) {
-                    .string => |s| self.allocator.free(s),
-                    else => {},
-                };
-                self.allocator.free(row);
-            }
-            buf.rows.deinit(self.allocator);
-        }
-        self.pending_appends.deinit(self.allocator);
-        var mit = self.pending_mutations.valueIterator();
-        while (mit.next()) |m| m.deinit(self.allocator);
-        self.pending_mutations.deinit(self.allocator);
-        for (self.pending_new_sheets.items) |*s| s.deinit(self.allocator);
-        self.pending_new_sheets.deinit(self.allocator);
-        for (self.pending_renames.items) |*r| r.deinit(self.allocator);
-        self.pending_renames.deinit(self.allocator);
-        for (self.pending_deletes.items) |*d| d.deinit(self.allocator);
-        self.pending_deletes.deinit(self.allocator);
-        self.pending_row_inserts.deinit(self.allocator);
-        self.pending_row_deletes.deinit(self.allocator);
-        self.pending_col_inserts.deinit(self.allocator);
-        self.pending_col_deletes.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -599,11 +423,6 @@ pub const Editor = struct {
         // too, but checking here surfaces a stable error name across
         // both branches.
         if (self.sheetHasWorkbookDeltas(sheet_idx)) return error.SheetHasUnsavedMutations;
-        // Also refuse when a row/col edit is queued for this sheet:
-        // save() runs the row/col substitution first, then the append
-        // pass would overwrite that substituted entry with XML built
-        // from the pre-edit source — silently dropping the edit.
-        if (self.sheetHasPendingRowOrColEdit(sheet_idx)) return error.SheetHasUnsavedRowOrColEdit;
         // Empty append is a documented no-op — recording it as a
         // pending mutation would underflow the row-index math in
         // `buildSubstitutedSheet` (start_row + 0 - 1 = u32.max).
@@ -614,60 +433,13 @@ pub const Editor = struct {
         // splice via `Worksheet.emitWithAppends`). Worksheet enforces
         // the column-cap + integer-precision guards pre-allocation,
         // so editor-level validation is unnecessary on this branch.
-        const path = self.sheet_paths[sheet_idx];
-        if (self.findPendingNewSheet(path) == null and sheet_idx < self.workbook.sheetCount()) {
-            const ws = try self.workbook.sheet(sheet_idx);
-            return ws.appendRows(rows);
-        }
-
-        // Legacy `pending_appends` path: pending-new sheets — those
-        // haven't migrated through `Workbook.addSheet` yet (iter-er-4
-        // ships that, retiring this branch). New sheets emit their
-        // body XML through `injectAppendedRows` in the new-sheet
-        // save block.
-        const writer_mod = xlsx;
-        for (rows) |row| {
-            if (row.len > max_col_1based) return error.ColumnIndexOutOfRange;
-        }
-        for (rows) |row| for (row) |c| switch (c) {
-            .empty, .number, .boolean, .string => {},
-            .integer => |n| {
-                // Match writer.zig's contract: integers must round-
-                // trip exactly through f64 (Excel stores all numerics
-                // as IEEE-754 doubles). Reject up front rather than
-                // silently rounding on open.
-                if (!writer_mod.fitsExactlyInF64(n)) return error.IntegerExceedsExcelPrecision;
-            },
-        };
-        const gop = try self.pending_appends.getOrPut(self.allocator, sheet_idx);
-        if (!gop.found_existing) gop.value_ptr.* = .{};
-        for (rows) |row| {
-            const owned = try self.allocator.alloc(Cell, row.len);
-            errdefer self.allocator.free(owned);
-            // Track how many string buffers we duped successfully so
-            // a mid-loop OOM doesn't leak the prefix.
-            var duped: usize = 0;
-            errdefer {
-                for (owned[0..duped]) |c| switch (c) {
-                    .string => |s| self.allocator.free(s),
-                    else => {},
-                };
-            }
-            for (row, 0..) |c, i| {
-                switch (c) {
-                    // String cells need their byte contents duped
-                    // because the caller may have passed a temporary
-                    // slice; the editor holds onto pending appends
-                    // until save and beyond.
-                    .string => |s| {
-                        owned[i] = .{ .string = try self.allocator.dupe(u8, s) };
-                    },
-                    else => owned[i] = c,
-                }
-                duped = i + 1;
-            }
-            try gop.value_ptr.rows.append(self.allocator, owned);
-        }
+        // After iter-er-4 (2/N), all sheets — source AND
+        // wb.addSheet'd — flow through `Worksheet.appendRows`.
+        // The legacy `pending_appends` queue + `findPendingNewSheet`
+        // branch retired in iter-er-6 cleanup phase 2.
+        if (sheet_idx >= self.workbook.sheetCount()) return error.SheetIndexOutOfRange;
+        const ws = try self.workbook.sheet(sheet_idx);
+        return ws.appendRows(rows);
     }
 
     /// Write the workbook (with any pending appends applied) to
@@ -688,39 +460,22 @@ pub const Editor = struct {
         defer atomic_file.deinit();
         const w = &atomic_file.file_writer.interface;
 
-        if (self.pending_appends.count() == 0 and
-            !self.workbookHasAnyDeltas() and
+        if (!self.workbookHasAnyDeltas() and
             !self.workbookHasAnyAppendedRows() and
-            !self.workbook.store.hasUnsavedChanges() and
-            self.pending_new_sheets.items.len == 0 and
-            self.pending_renames.items.len == 0 and
-            self.pending_deletes.items.len == 0 and
-            self.pending_row_inserts.items.len == 0 and
-            self.pending_row_deletes.items.len == 0 and
-            self.pending_col_inserts.items.len == 0 and
-            self.pending_col_deletes.items.len == 0)
+            !self.workbook.store.hasUnsavedChanges())
         {
             try w.writeAll(self.src_buf);
             try atomic_file.finish();
             return;
         }
 
-        // Detect whether any pending append carries a string cell;
+        // Detect whether any staged append carries a string cell;
         // if so, the SST entry must be substituted alongside the
-        // sheets so the new t="s" indices resolve. Two staging
-        // buffers feed this check post-iter-er-3: the legacy
-        // `pending_appends` (new-sheet branch) and the per-Worksheet
-        // `appended_rows` (existing-sheet workbook fast-path).
+        // sheets so the new t="s" indices resolve. Post-iter-er-4
+        // all appends flow through `Worksheet.appended_rows` (the
+        // workbook fast-path); the legacy `pending_appends` queue
+        // is no longer populated.
         var has_strings = false;
-        var pa_check = self.pending_appends.iterator();
-        outer: while (pa_check.next()) |kv| {
-            for (kv.value_ptr.rows.items) |row| {
-                for (row) |c| if (c == .string) {
-                    has_strings = true;
-                    break :outer;
-                };
-            }
-        }
         if (!has_strings and self.workbookHasAnyAppendedStrings()) has_strings = true;
 
         // Locate sharedStrings.xml entry + count source SST entries
@@ -786,53 +541,6 @@ pub const Editor = struct {
             extra_entries.deinit(self.allocator);
         }
 
-        // Phase 3e iter-row-2/3: apply row inserts + deletes by
-        // building a substituted sheet entry per affected sheet.
-        // Each sheet has at most one pending row edit (recordRowEdit
-        // enforces that), so order doesn't matter.
-        for (self.pending_row_inserts.items) |edit| {
-            const path = self.sheet_paths[edit.sheet_idx];
-            const entry_idx = findEntryByName(self.entries, path) orelse
-                return error.SheetEntryNotFound;
-            const entry = self.entries[entry_idx];
-            const payload_bytes = self.src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
-            const src_xml = try decompressZipPayload(self.allocator, payload_bytes, entry.compression_method, entry.uncompressed_size);
-            defer self.allocator.free(src_xml);
-            const new_xml = try applyRowEditToWorksheet(self.allocator, src_xml, edit.row, .insert);
-            subs[entry_idx] = try buildEntryFromXml(self.allocator, path, new_xml);
-        }
-        for (self.pending_row_deletes.items) |edit| {
-            const path = self.sheet_paths[edit.sheet_idx];
-            const entry_idx = findEntryByName(self.entries, path) orelse
-                return error.SheetEntryNotFound;
-            const entry = self.entries[entry_idx];
-            const payload_bytes = self.src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
-            const src_xml = try decompressZipPayload(self.allocator, payload_bytes, entry.compression_method, entry.uncompressed_size);
-            defer self.allocator.free(src_xml);
-            const new_xml = try applyRowEditToWorksheet(self.allocator, src_xml, edit.row, .delete);
-            subs[entry_idx] = try buildEntryFromXml(self.allocator, path, new_xml);
-        }
-        for (self.pending_col_inserts.items) |edit| {
-            const path = self.sheet_paths[edit.sheet_idx];
-            const entry_idx = findEntryByName(self.entries, path) orelse return error.SheetEntryNotFound;
-            const entry = self.entries[entry_idx];
-            const payload_bytes = self.src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
-            const src_xml = try decompressZipPayload(self.allocator, payload_bytes, entry.compression_method, entry.uncompressed_size);
-            defer self.allocator.free(src_xml);
-            const new_xml = try applyColEditToWorksheet(self.allocator, src_xml, edit.col_1based, .insert);
-            subs[entry_idx] = try buildEntryFromXml(self.allocator, path, new_xml);
-        }
-        for (self.pending_col_deletes.items) |edit| {
-            const path = self.sheet_paths[edit.sheet_idx];
-            const entry_idx = findEntryByName(self.entries, path) orelse return error.SheetEntryNotFound;
-            const entry = self.entries[entry_idx];
-            const payload_bytes = self.src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
-            const src_xml = try decompressZipPayload(self.allocator, payload_bytes, entry.compression_method, entry.uncompressed_size);
-            defer self.allocator.free(src_xml);
-            const new_xml = try applyColEditToWorksheet(self.allocator, src_xml, edit.col_1based, .delete);
-            subs[entry_idx] = try buildEntryFromXml(self.allocator, path, new_xml);
-        }
-
         // B2 iter-er-3: existing-sheet appends route through the
         // workbook fast-path. `Worksheet.emitWithAppends` reads the
         // source XML straight from the part store (no
@@ -867,7 +575,6 @@ pub const Editor = struct {
                 // direct callers of `editor.workbook.addSheet` don't
                 // grow self.sheet_paths, so we can't index it).
                 const path = try ws.resolvePartName();
-                if (self.findPendingNewSheet(path) != null) continue;
                 // entry_idx is null for sheets created via
                 // `Workbook.addSheet` after Editor.open — those parts
                 // exist in PartStore but not in self.entries, so the
@@ -936,7 +643,6 @@ pub const Editor = struct {
                 // direct callers of `editor.workbook.addSheet` don't
                 // grow self.sheet_paths, so we can't index it).
                 const path = try ws.resolvePartName();
-                if (self.findPendingNewSheet(path) != null) continue;
                 // entry_idx is null for sheets created via
                 // `Workbook.addSheet` (iter-er-4). Their parts live in
                 // PartStore but not in self.entries; the emitted entry
@@ -1004,7 +710,6 @@ pub const Editor = struct {
                 if (ws.appended_rows.items.len > 0) continue;
                 if (ws.deltas.count() > 0) continue;
                 const path = try ws.resolvePartName();
-                if (self.findPendingNewSheet(path) != null) continue;
                 if (findEntryByName(self.entries, path) != null) continue;
                 // New sheet without mutations — emit verbatim from
                 // PartStore. PartStore's bytes were set by
@@ -1035,39 +740,6 @@ pub const Editor = struct {
                 const part = (try self.workbook.store.part(entry.name)) orelse continue;
                 const body_owned = try self.allocator.dupe(u8, part.bytes);
                 subs[i] = try buildEntryFromXml(self.allocator, entry.name, body_owned);
-            }
-        }
-
-        // Phase 3e iter-sheet-1: emit each new sheet's body BEFORE
-        // the SST commit so any string cells injected here extend
-        // sst_appender in time. Metadata patches (workbook.xml,
-        // rels, Content_Types) come after — they don't touch the
-        // SST.
-        if (self.pending_new_sheets.items.len > 0) {
-            const source_count: u32 = @intCast(self.sheet_paths.len - self.pending_new_sheets.items.len);
-            for (self.pending_new_sheets.items, 0..) |new_sheet, i| {
-                const sheet_idx_for_new: u32 = source_count + @as(u32, @intCast(i));
-                const body_owned: []u8 = blk: {
-                    if (self.pending_mutations.get(sheet_idx_for_new)) |ms|
-                        break :blk try self.allocator.dupe(u8, ms.xml.items);
-                    if (self.pending_appends.get(sheet_idx_for_new)) |buf| {
-                        // New sheet starts empty, so appended rows
-                        // begin at row 1. Pass sst_ptr so any
-                        // string cells extend the SST in time for
-                        // the commit below.
-                        break :blk try injectAppendedRows(
-                            self.allocator,
-                            new_sheet.body_xml,
-                            buf.rows.items,
-                            1,
-                            sst_ptr,
-                        );
-                    }
-                    break :blk try self.allocator.dupe(u8, new_sheet.body_xml);
-                };
-                // buildEntryFromXml takes ownership of body_owned.
-                const new_entry = try buildEntryFromXml(self.allocator, new_sheet.path, body_owned);
-                try extra_entries.append(self.allocator, new_entry);
             }
         }
 
@@ -1116,92 +788,6 @@ pub const Editor = struct {
             }
         }
 
-        // Phase 3e iter-sheet-1 (continued): metadata patches for
-        // the new sheets — these must run AFTER the SST patches
-        // above so a workbook that ALSO got a fresh SST has all
-        // its workbook.xml-rels updates applied through the same
-        // patchEntryForNewSheets re-substitution flow.
-        if (self.pending_new_sheets.items.len > 0) {
-            try patchEntryForNewSheets(
-                self.allocator,
-                self.entries,
-                self.src_buf,
-                subs,
-                "xl/workbook.xml",
-                self.pending_new_sheets.items,
-                patchWorkbookXmlForNewSheets,
-            );
-            try patchEntryForNewSheets(
-                self.allocator,
-                self.entries,
-                self.src_buf,
-                subs,
-                "xl/_rels/workbook.xml.rels",
-                self.pending_new_sheets.items,
-                patchWorkbookRelsForNewSheets,
-            );
-            try patchEntryForNewSheets(
-                self.allocator,
-                self.entries,
-                self.src_buf,
-                subs,
-                "[Content_Types].xml",
-                self.pending_new_sheets.items,
-                patchContentTypesForNewSheets,
-            );
-        }
-
-        // Phase 3e iter-sheet-3: pending sheet deletions. Patch
-        // workbook.xml (drop the <sheet> line), rels (drop the
-        // Relationship), Content_Types (drop the Override). The
-        // entry-skipping in the LFH-emit loop further down drops
-        // the sheet's worksheet-XML ZIP entry itself.
-        if (self.pending_deletes.items.len > 0) {
-            try patchEntryForDeletes(
-                self.allocator,
-                self.entries,
-                self.src_buf,
-                subs,
-                "xl/workbook.xml",
-                self.pending_deletes.items,
-                patchWorkbookXmlForDeletes,
-            );
-            try patchEntryForDeletes(
-                self.allocator,
-                self.entries,
-                self.src_buf,
-                subs,
-                "xl/_rels/workbook.xml.rels",
-                self.pending_deletes.items,
-                patchWorkbookRelsForDeletes,
-            );
-            try patchEntryForDeletes(
-                self.allocator,
-                self.entries,
-                self.src_buf,
-                subs,
-                "[Content_Types].xml",
-                self.pending_deletes.items,
-                patchContentTypesForDeletes,
-            );
-        }
-
-        // Phase 3e iter-sheet-2: pending sheet renames. Composes
-        // through patchEntryForRenames's re-substitution path, so
-        // it stacks correctly on top of any prior workbook.xml
-        // modification (addSheet's <sheets> patch).
-        if (self.pending_renames.items.len > 0) {
-            try patchEntryForRenames(
-                self.allocator,
-                self.entries,
-                self.src_buf,
-                subs,
-                "xl/workbook.xml",
-                self.pending_renames.items,
-                patchWorkbookXmlForRenames,
-            );
-        }
-
         // Emit LFHs in LFH-offset order. Each substituted entry's LFH
         // / payload are freshly built; others copy from src_buf.
         const new_lfh_offsets = try self.allocator.alloc(u32, self.entries.len);
@@ -1214,47 +800,6 @@ pub const Editor = struct {
                 return es[a].lfh_offset < es[b].lfh_offset;
             }
         }.lessThan);
-
-        // Phase 3e iter-sheet-3: mask of entries to drop entirely
-        // (the deleted sheets' worksheet XML). The size validation
-        // and emission loops skip these.
-        const deleted_mask = try self.allocator.alloc(bool, self.entries.len);
-        defer self.allocator.free(deleted_mask);
-        @memset(deleted_mask, false);
-        for (self.pending_deletes.items) |d| {
-            if (findEntryByName(self.entries, d.path)) |di| deleted_mask[di] = true;
-        }
-        // Drop xl/calcChain.xml when any sheet is being deleted —
-        // it's a recompute cache, Excel rebuilds it on open. The
-        // structural-edits plan calls this out as standard cleanup
-        // for destructive edits. Also drop the rels entry that
-        // points at it via `<Relationship Type=".../calcChain"/>`
-        // to avoid a dangling relationship.
-        if (self.pending_deletes.items.len > 0) {
-            if (findEntryByName(self.entries, "xl/calcChain.xml")) |ci| {
-                deleted_mask[ci] = true;
-                // Patch rels to drop the calcChain Relationship.
-                try patchEntryForDeletes(
-                    self.allocator,
-                    self.entries,
-                    self.src_buf,
-                    subs,
-                    "xl/_rels/workbook.xml.rels",
-                    self.pending_deletes.items,
-                    patchWorkbookRelsForCalcChainDrop,
-                );
-                // Patch [Content_Types] to drop calcChain Override.
-                try patchEntryForDeletes(
-                    self.allocator,
-                    self.entries,
-                    self.src_buf,
-                    subs,
-                    "[Content_Types].xml",
-                    self.pending_deletes.items,
-                    patchContentTypesForCalcChainDrop,
-                );
-            }
-        }
 
         // Pre-validate that the rewritten archive stays within ZIP32
         // bounds. Source size is already <= 4 GiB (Editor.open caps),
@@ -1270,7 +815,6 @@ pub const Editor = struct {
         var planned_total: u64 = 0;
         var live_entry_count: usize = 0;
         for (lfh_sorted) |i| {
-            if (deleted_mask[i]) continue;
             live_entry_count += 1;
             if (subs[i]) |s| {
                 planned_total += @as(u64, s.lfh.len) + @as(u64, s.payload.len);
@@ -1284,7 +828,6 @@ pub const Editor = struct {
         }
         const planned_cd_offset = planned_total;
         for (self.entries, 0..) |entry, i| {
-            if (deleted_mask[i]) continue;
             if (subs[i]) |s| {
                 planned_total += @as(u64, s.cdfh.len);
             } else {
@@ -1307,7 +850,6 @@ pub const Editor = struct {
 
         var written: u64 = 0;
         for (lfh_sorted) |i| {
-            if (deleted_mask[i]) continue;
             new_lfh_offsets[i] = @intCast(written);
             if (subs[i]) |s| {
                 try w.writeAll(s.lfh);
@@ -1336,7 +878,6 @@ pub const Editor = struct {
 
         const new_cd_offset: u32 = @intCast(written);
         for (self.entries, 0..) |entry, i| {
-            if (deleted_mask[i]) continue;
             if (subs[i]) |s| {
                 var cdfh_copy = try self.allocator.dupe(u8, s.cdfh);
                 defer self.allocator.free(cdfh_copy);
@@ -1397,11 +938,8 @@ pub const Editor = struct {
     /// independent (no caching yet) — repeated calls re-decompress.
     pub fn scanWorksheet(self: *Editor, sheet_idx: u32) !WorksheetSpans {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
-        // The scanner does NOT see staged appends — neither the
-        // legacy `pending_appends` (new sheets) nor the iter-er-3
-        // `Worksheet.appended_rows` (existing sheets) flow into
-        // the parsed view. Reject rather than return a stale span set.
-        if (self.pending_appends.contains(sheet_idx)) return error.SheetHasUnsavedAppends;
+        // Reject staged appends — `Worksheet.appended_rows` doesn't
+        // flow into the parsed view; the span set would be stale.
         if (self.sheetHasWorkbookAppendedRows(sheet_idx)) return error.SheetHasUnsavedAppends;
 
         // B2 iter-er-2: existing-sheet setCell deltas live on the
@@ -1493,16 +1031,12 @@ pub const Editor = struct {
         cell: Cell,
     ) !void {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
-        if (self.pending_appends.contains(sheet_idx)) return error.SheetHasUnsavedAppends;
         // B2 iter-er-3 symmetric guard: workbook-side appended_rows
         // are mutually exclusive with setCell on the same sheet.
         // (Worksheet.setCell enforces this internally too, but the
         // legacy-path branch below skips Worksheet.setCell, so we
         // need an editor-level check.)
         if (self.sheetHasWorkbookAppendedRows(sheet_idx)) return error.SheetHasUnsavedAppends;
-        // Refuse when a row/col edit is queued for this sheet — same
-        // save-order race that affects appendRows.
-        if (self.sheetHasPendingRowOrColEdit(sheet_idx)) return error.SheetHasUnsavedRowOrColEdit;
         if (row == 0 or row > max_row) return error.RowIndexOutOfRange;
         if (col >= max_col_1based) return error.ColumnIndexOutOfRange;
 
@@ -1533,103 +1067,11 @@ pub const Editor = struct {
             return;
         }
 
-        // ── Legacy path for freshly-added sheets (iter-er-4 retires) ──
-        switch (cell) {
-            .integer => |n| {
-                if (!xlsx.fitsExactlyInF64(n)) return error.IntegerExceedsExcelPrecision;
-            },
-            .string, .number, .boolean, .empty => {},
-        }
-        const ms_existed_before = self.pending_mutations.contains(sheet_idx);
-        const ms = try self.getOrInitMutatedSheet(sheet_idx);
-        errdefer if (!ms_existed_before) {
-            if (self.pending_mutations.fetchRemove(sheet_idx)) |kv| {
-                var v = kv.value;
-                v.deinit(self.allocator);
-            }
-        };
-
-        var idx: ?usize = null;
-        var insert_before_idx: ?usize = null;
-        var last_in_row_idx: ?usize = null;
-        for (ms.spans.items, 0..) |s, i| {
-            if (s.row != row) continue;
-            if (s.col == col) {
-                idx = i;
-                break;
-            }
-            last_in_row_idx = i;
-            if (s.col > col and insert_before_idx == null) insert_before_idx = i;
-        }
-        if (idx == null) {
-            const row_has_anchor = last_in_row_idx != null or insert_before_idx != null;
-            if (!row_has_anchor) {
-                if (try insertCellIntoEmptyRow(self.allocator, ms, row, col, cell)) return;
-                try insertMissingRow(self.allocator, ms, row, col, cell);
-                return;
-            }
-            var new_buf: std.ArrayListUnmanaged(u8) = .{};
-            defer new_buf.deinit(self.allocator);
-            try emitCellXml(self.allocator, &new_buf, row, col, cell);
-            const opening_gt = std.mem.indexOfScalar(u8, new_buf.items, '>') orelse return error.InternalInvariantBroken;
-            const insert_at: usize = if (insert_before_idx) |i|
-                ms.spans.items[i].start
-            else
-                ms.spans.items[last_in_row_idx.?].end;
-            try ms.spans.ensureUnusedCapacity(self.allocator, 1);
-            try ms.xml.insertSlice(self.allocator, insert_at, new_buf.items);
-            const new_len = new_buf.items.len;
-            for (ms.spans.items) |*s| {
-                if (s.start >= insert_at) {
-                    s.start += new_len;
-                    s.end += new_len;
-                    s.body_start += new_len;
-                }
-            }
-            const new_span: CellSpan = .{
-                .start = insert_at,
-                .end = insert_at + new_len,
-                .body_start = insert_at + opening_gt + 1,
-                .row = row,
-                .col = col,
-            };
-            const span_pos: usize = insert_before_idx orelse (last_in_row_idx.? + 1);
-            ms.spans.insertAssumeCapacity(span_pos, new_span);
-            return;
-        }
-        const span_idx = idx.?;
-        const old = ms.spans.items[span_idx];
-        if (sourceCellHasMetadata(ms.xml.items, old)) return error.SetCellSourceCellHasMetadata;
-
-        var new_buf: std.ArrayListUnmanaged(u8) = .{};
-        defer new_buf.deinit(self.allocator);
-        try emitCellXml(self.allocator, &new_buf, row, col, cell);
-        const old_len = old.end - old.start;
-        const new_len = new_buf.items.len;
-        try ms.xml.replaceRange(self.allocator, old.start, old_len, new_buf.items);
-        const old_end = old.end;
-        for (ms.spans.items, 0..) |*s, i| {
-            if (i == span_idx) continue;
-            if (s.start >= old_end) {
-                const start_signed: isize = @as(isize, @intCast(s.start)) +
-                    @as(isize, @intCast(new_len)) - @as(isize, @intCast(old_len));
-                const end_signed: isize = @as(isize, @intCast(s.end)) +
-                    @as(isize, @intCast(new_len)) - @as(isize, @intCast(old_len));
-                const body_signed: isize = @as(isize, @intCast(s.body_start)) +
-                    @as(isize, @intCast(new_len)) - @as(isize, @intCast(old_len));
-                s.start = @intCast(start_signed);
-                s.end = @intCast(end_signed);
-                s.body_start = @intCast(body_signed);
-            }
-        }
-        const opening_gt = std.mem.indexOfScalar(u8, new_buf.items, '>') orelse unreachable;
-        ms.spans.items[span_idx] = .{
-            .start = old.start,
-            .end = old.start + new_len,
-            .body_start = old.start + opening_gt + 1,
-            .row = row,
-            .col = col,
-        };
+        // sheet_idx is bounded by sheet_paths.len above and
+        // sheet_paths.len == workbook.sheetCount() post-#77, so the
+        // typed-overlay branch always fires. The legacy
+        // pending_mutations path is unreachable.
+        unreachable;
     }
 
     pub fn setCells(
@@ -1732,28 +1174,18 @@ pub const Editor = struct {
     pub fn deleteSheet(self: *Editor, sheet_idx: u32) !void {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
         if (self.sheet_paths.len <= 1) return error.CannotDeleteLastSheet;
-        if (self.pending_appends.count() > 0 or
-            self.workbookHasAnyDeltas() or
-            self.workbookHasAnyAppendedRows() or
-            self.pending_renames.items.len > 0 or
-            self.pending_row_inserts.items.len > 0 or
-            self.pending_row_deletes.items.len > 0 or
-            self.pending_col_inserts.items.len > 0 or
-            self.pending_col_deletes.items.len > 0)
+        if (self.workbookHasAnyDeltas() or
+            self.workbookHasAnyAppendedRows())
         {
-            // deleteSheet rebuilds sheet_paths; queued row/col edits
+            // deleteSheet rebuilds sheet_paths; queued mutations
             // hold raw indices into it and would silently point at
             // the wrong sheet (or out-of-bounds) after the rebuild.
             return error.SheetDeleteRequiresCleanState;
         }
 
         // Conservative guard: refuse SOURCE-sheet deletes when the
-        // workbook has any `<definedName>` entries. Pending-new
-        // sheet deletes don't shift any existing localSheetId or
-        // formula reference (the new sheet was never saved), so
-        // they're safe regardless.
-        const path_check = self.sheet_paths[sheet_idx];
-        if (self.findPendingNewSheet(path_check) == null) {
+        // workbook has any `<definedName>` entries.
+        {
             const wb_check = try self.readEntry("xl/workbook.xml");
             defer self.allocator.free(wb_check);
             if (std.mem.indexOf(u8, wb_check, "<definedName") != null)
@@ -1800,14 +1232,14 @@ pub const Editor = struct {
     ///     (setCell / appendRows / row inserts/deletes); save
     ///     first to apply those.
     pub fn insertRow(self: *Editor, sheet_idx: u32, before_row: u32) !void {
-        try self.recordRowEdit(sheet_idx, before_row, &self.pending_row_inserts, true);
+        try self.recordRowEdit(sheet_idx, before_row, true);
     }
 
     /// Delete row `row` in sheet `sheet_idx` (Phase 3e, iter-row-3).
     /// Every row > `row` shifts up by 1. Same v1 limitations as
     /// `insertRow`.
     pub fn deleteRow(self: *Editor, sheet_idx: u32, row: u32) !void {
-        try self.recordRowEdit(sheet_idx, row, &self.pending_row_deletes, false);
+        try self.recordRowEdit(sheet_idx, row, false);
     }
 
     /// Insert a blank column at position `before_col` (1-based,
@@ -1815,27 +1247,13 @@ pub const Editor = struct {
     /// limitations as `insertRow` — formula bodies, defined names,
     /// and structured-table refs aren't rewritten and are refused.
     pub fn insertColumn(self: *Editor, sheet_idx: u32, before_col_1based: u32) !void {
-        try self.recordColEdit(sheet_idx, before_col_1based, &self.pending_col_inserts);
+        try self.recordColEdit(sheet_idx, before_col_1based, true);
     }
 
     /// Delete column `col_1based` (1-based) in sheet `sheet_idx`.
     /// Phase 3e iter-col-4.
     pub fn deleteColumn(self: *Editor, sheet_idx: u32, col_1based: u32) !void {
-        try self.recordColEdit(sheet_idx, col_1based, &self.pending_col_deletes);
-    }
-
-    /// True when `sheet_idx` already has a queued insertRow,
-    /// deleteRow, insertColumn, or deleteColumn. Used by
-    /// appendRows/setCell to refuse mixing with a row/col edit on
-    /// the same sheet — save() applies row/col edits before
-    /// appends/mutations and the latter would otherwise overwrite
-    /// the row/col-substituted entry from pre-edit source XML.
-    fn sheetHasPendingRowOrColEdit(self: *Editor, sheet_idx: u32) bool {
-        for (self.pending_row_inserts.items) |e| if (e.sheet_idx == sheet_idx) return true;
-        for (self.pending_row_deletes.items) |e| if (e.sheet_idx == sheet_idx) return true;
-        for (self.pending_col_inserts.items) |e| if (e.sheet_idx == sheet_idx) return true;
-        for (self.pending_col_deletes.items) |e| if (e.sheet_idx == sheet_idx) return true;
-        return false;
+        try self.recordColEdit(sheet_idx, col_1based, false);
     }
 
     /// True iff any worksheet in the embedded workbook has staged
@@ -1903,95 +1321,33 @@ pub const Editor = struct {
         return false;
     }
 
-    /// Cross-sheet reference carriers: tags whose body or attrs can
-    /// hold an `OtherSheet!Ref` pointer. If any sheet in the workbook
-    /// has one of these, a row/column edit on a *different* sheet
-    /// can still leave a stale reference pointing at the edited
-    /// sheet's old layout. Until the formula tokenizer (iter-col-1)
-    /// rewrites them, refuse globally.
-    ///   - `<f>` / `<f ` / `<f/`     — formula bodies (=Sheet1!B:B)
-    ///   - `<hyperlinks`             — `location="Sheet1!C5"` etc.
-    ///   - `<dataValidations`        — formula1/formula2 may cross
-    ///   - `<conditionalFormatting`  — cfRule formulas may cross
-    fn anySheetCrossSheetCarrier(self: *Editor) !struct { found: bool, kind: enum { none, formula, hyperlink, data_validation, cond_format } } {
-        for (self.sheet_paths) |path| {
-            if (self.findPendingNewSheet(path) != null) continue;
-            const entry_idx = findEntryByName(self.entries, path) orelse continue;
-            const e = self.entries[entry_idx];
-            const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
-            const xml = try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
-            defer self.allocator.free(xml);
-            if (std.mem.indexOf(u8, xml, "<f>") != null or
-                std.mem.indexOf(u8, xml, "<f ") != null or
-                std.mem.indexOf(u8, xml, "<f/") != null)
-                return .{ .found = true, .kind = .formula };
-            if (std.mem.indexOf(u8, xml, "<hyperlinks") != null)
-                return .{ .found = true, .kind = .hyperlink };
-            if (std.mem.indexOf(u8, xml, "<dataValidations") != null)
-                return .{ .found = true, .kind = .data_validation };
-            if (std.mem.indexOf(u8, xml, "<conditionalFormatting") != null)
-                return .{ .found = true, .kind = .cond_format };
-        }
-        return .{ .found = false, .kind = .none };
-    }
-
     fn recordColEdit(
         self: *Editor,
         sheet_idx: u32,
         col_1based: u32,
-        list: *std.ArrayListUnmanaged(ColEdit),
+        is_insert: bool,
     ) !void {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
         if (col_1based == 0 or col_1based > max_col_1based) return error.ColumnIndexOutOfRange;
-        if (self.pending_appends.contains(sheet_idx) or
-            self.sheetHasWorkbookDeltas(sheet_idx) or
+        if (self.sheetHasWorkbookDeltas(sheet_idx) or
             self.sheetHasWorkbookAppendedRows(sheet_idx))
         {
             return error.ColEditRequiresCleanSheet;
         }
-        for (self.pending_row_inserts.items) |e| {
-            if (e.sheet_idx == sheet_idx) return error.ColEditRequiresCleanSheet;
-        }
-        for (self.pending_row_deletes.items) |e| {
-            if (e.sheet_idx == sheet_idx) return error.ColEditRequiresCleanSheet;
-        }
-        for (self.pending_col_inserts.items) |e| {
-            if (e.sheet_idx == sheet_idx) return error.ColEditRequiresCleanSheet;
-        }
-        for (self.pending_col_deletes.items) |e| {
-            if (e.sheet_idx == sheet_idx) return error.ColEditRequiresCleanSheet;
-        }
 
+        // Per-sheet content guard — same axes as recordRowEdit.
         const path = self.sheet_paths[sheet_idx];
-        if (self.findPendingNewSheet(path) != null) return error.ColEditOnNewSheetUnsupported;
-
-        // B2 iter-er-5 (col axes) lifted: defined names + formulas
-        // + hyperlinks + DV/CF are all rewritten by
-        // `Workbook.insertColumn` / `deleteColumn` via the four
-        // `rewriteAll*` calls. The local guards below still refuse
-        // sheets that carry constructs WITHOUT a rewriter
-        // (drawings / pivots / panes / autoFilter / tables) — see
-        // `docs/plans/refusal-audit.md` for the staying axes.
-
         if (findEntryByName(self.entries, path)) |entry_idx| {
             const e = self.entries[entry_idx];
             const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
             const xml = try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
             defer self.allocator.free(xml);
-            // Local-only structures we don't yet rewrite — the
-            // cross-sheet carriers above are already checked
-            // workbook-wide.
             const guards = [_][]const u8{
                 "<autoFilter",
                 "<tableParts",
                 "<drawing",
                 "<legacyDrawing",
                 "<picture",
-                // <pane xSplit=..|ySplit=..|topLeftCell=..> carries
-                // column/row coordinates that aren't rewritten by
-                // the row/col edit path. Refuse rather than save a
-                // workbook with frozen panes pointing at the wrong
-                // boundary.
                 "<pane ",
                 "<pane/",
                 "<pane\t",
@@ -2005,14 +1361,6 @@ pub const Editor = struct {
             }
         } else return error.SheetEntryNotFound;
 
-        // B2 iter-er-4 (3/N): delegate the byte transform to
-        // `Workbook.insertColumn` / `deleteColumn` (which patches
-        // PartStore + invalidates the parsed view). The legacy
-        // `pending_col_*` queue is no longer populated; the
-        // Editor.save block that consumed it stays dormant
-        // (always-empty list) until the iter-er-6 cleanup retires
-        // it.
-        const is_insert = list == &self.pending_col_inserts;
         if (is_insert) {
             try self.workbook.insertColumn(sheet_idx, col_1based);
         } else {
@@ -2024,50 +1372,28 @@ pub const Editor = struct {
         self: *Editor,
         sheet_idx: u32,
         row: u32,
-        list: *std.ArrayListUnmanaged(RowEdit),
         is_insert: bool,
     ) !void {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
         if (row == 0 or row > max_row) return error.RowIndexOutOfRange;
-        // Conservative: refuse when other mutations target this
-        // sheet (would need cross-pending state shifts we don't
-        // model in v1).
-        if (self.pending_appends.contains(sheet_idx) or
-            self.sheetHasWorkbookDeltas(sheet_idx) or
+        // Refuse when staged mutations target the same sheet — the
+        // typed-overlay row shift invalidates the parsed view, so
+        // existing deltas / appended_rows would point at the
+        // pre-shift refs and produce stale output. Same invariant
+        // as Worksheet.appendRows / Worksheet.setCell mutual
+        // exclusion.
+        if (self.sheetHasWorkbookDeltas(sheet_idx) or
             self.sheetHasWorkbookAppendedRows(sheet_idx))
         {
             return error.RowEditRequiresCleanSheet;
         }
-        for (self.pending_row_inserts.items) |e| {
-            if (e.sheet_idx == sheet_idx) return error.RowEditRequiresCleanSheet;
-        }
-        for (self.pending_row_deletes.items) |e| {
-            if (e.sheet_idx == sheet_idx) return error.RowEditRequiresCleanSheet;
-        }
-        for (self.pending_col_inserts.items) |e| {
-            if (e.sheet_idx == sheet_idx) return error.RowEditRequiresCleanSheet;
-        }
-        for (self.pending_col_deletes.items) |e| {
-            if (e.sheet_idx == sheet_idx) return error.RowEditRequiresCleanSheet;
-        }
 
-        // Pending-new sheets have empty bodies — insertRow/deleteRow
-        // on them is meaningless and the save path can't substitute
-        // a non-existent source ZIP entry. Reject up front.
+        // Per-sheet content guard: refuse sheets whose bodies carry
+        // constructs the rewriters don't yet handle (drawings,
+        // pivots, frozen panes, tableParts, autoFilter). See
+        // `docs/plans/refusal-audit.md` "Axes that stay refused"
+        // for the rationale.
         const path = self.sheet_paths[sheet_idx];
-        if (self.findPendingNewSheet(path) != null) return error.RowEditOnNewSheetUnsupported;
-
-        // B2 iter-er-5 (row axes) lifted: defined names + formulas
-        // + hyperlinks + DV/CF are all rewritten by
-        // `Workbook.insertRow` / `deleteRow` via the four
-        // `rewriteAll*` calls. The local guards below still refuse
-        // sheets that carry constructs WITHOUT a rewriter
-        // (drawings / pivots / panes / autoFilter / tables) — see
-        // `docs/plans/refusal-audit.md` for the staying axes.
-
-        // Conservative content guard: scan the worksheet XML for
-        // local-only elements that v1 doesn't rewrite. If any are
-        // present, refuse rather than silently corrupt the workbook.
         if (findEntryByName(self.entries, path)) |entry_idx| {
             const e = self.entries[entry_idx];
             const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
@@ -2097,155 +1423,11 @@ pub const Editor = struct {
             }
         } else return error.SheetEntryNotFound;
 
-        // B2 iter-er-4 (3/N): delegate to Workbook.{insertRow,
-        // deleteRow}. Same retirement semantics as recordColEdit.
         if (is_insert) {
             try self.workbook.insertRow(sheet_idx, row);
         } else {
             try self.workbook.deleteRow(sheet_idx, row);
         }
-        _ = list;
-    }
-
-    /// True when some sheet has an effective name matching
-    /// `candidate` case-insensitively, EXCLUDING the sheet at
-    /// `except_sheet_idx` (if non-null) and the source `<sheet>`
-    /// entry whose r:id matches `except_rid` (if non-null).
-    ///
-    /// "Effective" means: pending-rename's new_name takes precedence
-    /// over the raw workbook.xml name; pending-new-sheets contribute
-    /// their NewSheet.name. Walks raw workbook.xml directly so
-    /// entries `parseWorkbookSheets` skipped (broken rels) still
-    /// participate in dup detection.
-    fn isSheetNameTaken(
-        self: *Editor,
-        candidate: []const u8,
-        except_sheet_idx: ?u32,
-        except_rid: ?[]const u8,
-    ) !bool {
-
-        // 1. Raw <sheet> entries from workbook.xml. Apply pending
-        //    renames as we walk to compute effective names.
-        const wb = try self.readEntry("xl/workbook.xml");
-        defer self.allocator.free(wb);
-        var i: usize = 0;
-        while (findTagOpen(wb, i, "sheet")) |t| {
-            const attrs = wb[t.start + "<sheet".len .. t.after_open - 1];
-            const rid = getAttr(attrs, "r:id") orelse {
-                i = t.after_open;
-                continue;
-            };
-            if (except_rid) |skip_rid| if (std.mem.eql(u8, rid, skip_rid)) {
-                i = t.after_open;
-                continue;
-            };
-            // Skip sheets queued for deletion — their names are
-            // freed for reuse on save.
-            var was_deleted = false;
-            for (self.pending_deletes.items) |d| {
-                if (std.mem.eql(u8, d.rid, rid)) {
-                    was_deleted = true;
-                    break;
-                }
-            }
-            if (was_deleted) {
-                i = t.after_open;
-                continue;
-            }
-            // Effective name: pending-rename's new_name if any
-            // matches this rId; else the raw (decoded) name.
-            var rename_hit: ?[]const u8 = null;
-            for (self.pending_renames.items) |r| {
-                if (std.mem.eql(u8, r.rid, rid)) {
-                    rename_hit = r.new_name;
-                    break;
-                }
-            }
-            if (rename_hit) |nm| {
-                if (casefold.excelSheetNameEql(nm, candidate)) return true;
-            } else if (getAttr(attrs, "name")) |raw| {
-                var decoded: std.ArrayListUnmanaged(u8) = .{};
-                defer decoded.deinit(self.allocator);
-                try decodeXmlAttrInto(self.allocator, &decoded, raw);
-                if (casefold.excelSheetNameEql(decoded.items, candidate)) return true;
-            }
-            i = t.after_open;
-        }
-
-        // 2. Pending new sheets. Indexed by sheet_idx for the skip.
-        const source_count: u32 = @intCast(self.sheet_paths.len - self.pending_new_sheets.items.len);
-        for (self.pending_new_sheets.items, 0..) |s, ns_idx| {
-            const my_idx: u32 = source_count + @as(u32, @intCast(ns_idx));
-            if (except_sheet_idx) |ei| if (my_idx == ei) continue;
-            if (casefold.excelSheetNameEql(s.name, candidate)) return true;
-        }
-        return false;
-    }
-
-    /// Look up the source workbook's `<sheet>` row whose r:id
-    /// resolves (via rels) to `target_path`. Returns owned dupes of
-    /// the (entity-decoded) name AND the rId, or null when no
-    /// match. Caller frees both. iter-sheet-2 needs the rId to
-    /// match `<sheet>` lines by-id rather than by-position.
-    fn sheetMetaAtPath(self: *Editor, target_path: []const u8) !?struct { name: []u8, rid: []u8 } {
-        const wb = try self.readEntry("xl/workbook.xml");
-        defer self.allocator.free(wb);
-        const rels = try self.readEntry("xl/_rels/workbook.xml.rels");
-        defer self.allocator.free(rels);
-
-        var i: usize = 0;
-        while (findTagOpen(wb, i, "sheet")) |t| {
-            const sh_attrs = wb[t.start + "<sheet".len .. t.after_open - 1];
-            const rid = getAttr(sh_attrs, "r:id") orelse {
-                i = t.after_open;
-                continue;
-            };
-            const name_raw = getAttr(sh_attrs, "name") orelse {
-                i = t.after_open;
-                continue;
-            };
-            var rels_i: usize = 0;
-            while (std.mem.indexOfPos(u8, rels, rels_i, "<Relationship")) |rel_pos| {
-                const rel_end = std.mem.indexOfScalarPos(u8, rels, rel_pos, '>') orelse break;
-                const rel_attrs = rels[rel_pos + "<Relationship".len .. rel_end];
-                const id = getAttr(rel_attrs, "Id") orelse {
-                    rels_i = rel_end + 1;
-                    continue;
-                };
-                if (!std.mem.eql(u8, id, rid)) {
-                    rels_i = rel_end + 1;
-                    continue;
-                }
-                const target = getAttr(rel_attrs, "Target") orelse {
-                    rels_i = rel_end + 1;
-                    continue;
-                };
-                // Three legal forms for the same path:
-                //   - "worksheets/sheet1.xml" (relative; needs xl/)
-                //   - "xl/worksheets/sheet1.xml" (already prefixed)
-                //   - "/xl/worksheets/sheet1.xml" (absolute) —
-                //     parseWorkbookSheets accepts this; we must too.
-                const t_norm = if (target.len > 0 and target[0] == '/') target[1..] else target;
-                var matches = std.mem.eql(u8, t_norm, target_path);
-                if (!matches) {
-                    var prefixed_buf: [256]u8 = undefined;
-                    const prefixed = std.fmt.bufPrint(&prefixed_buf, "xl/{s}", .{t_norm}) catch break;
-                    matches = std.mem.eql(u8, prefixed, target_path);
-                }
-                if (matches) {
-                    var decoded: std.ArrayListUnmanaged(u8) = .{};
-                    errdefer decoded.deinit(self.allocator);
-                    try decodeXmlAttrInto(self.allocator, &decoded, name_raw);
-                    const name_owned = try decoded.toOwnedSlice(self.allocator);
-                    errdefer self.allocator.free(name_owned);
-                    const rid_owned = try self.allocator.dupe(u8, rid);
-                    return .{ .name = name_owned, .rid = rid_owned };
-                }
-                rels_i = rel_end + 1;
-            }
-            i = t.after_open;
-        }
-        return null;
     }
 
     /// Decompress an entry by name. Caller owns the returned slice.
@@ -2257,456 +1439,7 @@ pub const Editor = struct {
         return try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
     }
 
-    fn getOrInitMutatedSheet(self: *Editor, sheet_idx: u32) !*MutatedSheet {
-        const gop = try self.pending_mutations.getOrPut(self.allocator, sheet_idx);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .{};
-            errdefer {
-                gop.value_ptr.deinit(self.allocator);
-                _ = self.pending_mutations.remove(sheet_idx);
-            }
-            const path = self.sheet_paths[sheet_idx];
-            // First try the source ZIP entry. If absent, this is a
-            // pending-new-sheet (Phase 3e iter-sheet-1) — seed the
-            // mutation buffer from its empty body template.
-            if (findEntryByName(self.entries, path)) |entry_idx| {
-                const entry = self.entries[entry_idx];
-                const payload = self.src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
-                const xml = try decompressZipPayload(
-                    self.allocator,
-                    payload,
-                    entry.compression_method,
-                    entry.uncompressed_size,
-                );
-                defer self.allocator.free(xml);
-                try gop.value_ptr.xml.appendSlice(self.allocator, xml);
-            } else {
-                const ns_idx = self.findPendingNewSheet(path) orelse
-                    return error.SheetEntryNotFound;
-                try gop.value_ptr.xml.appendSlice(
-                    self.allocator,
-                    self.pending_new_sheets.items[ns_idx].body_xml,
-                );
-            }
-            const spans = try scanWorksheetXml(self.allocator, gop.value_ptr.xml.items);
-            defer self.allocator.free(spans);
-            try gop.value_ptr.spans.appendSlice(self.allocator, spans);
-        }
-        return gop.value_ptr;
-    }
-
-    fn findPendingNewSheet(self: *Editor, path: []const u8) ?usize {
-        for (self.pending_new_sheets.items, 0..) |s, i| {
-            if (std.mem.eql(u8, s.path, path)) return i;
-        }
-        return null;
-    }
 };
-
-/// True if the source span carries any attribute beyond `r="…"` OR
-/// any body content beyond a single `<v>…</v>`. Iter-cm-2 contract:
-/// the replacement is a canonical `<c r="…"…>…</c>`, so anything
-/// non-canonical on the source (`s="N"`, `<f>`, `<is>`, phonetic
-/// hints, unknown attrs/children) would be silently dropped. Caller
-/// rejects with a typed error rather than corrupt.
-fn sourceCellHasMetadata(xml: []const u8, span: CellSpan) bool {
-    const attrs_end = if (span.body_start > 0) span.body_start - 1 else return false;
-    if (attrs_end <= span.start + 2) return false;
-    const attrs = xml[span.start + 2 .. attrs_end];
-    // Self-closing form has `/` as the last byte of attrs; trim it.
-    const trimmed_attrs = if (attrs.len > 0 and attrs[attrs.len - 1] == '/')
-        attrs[0 .. attrs.len - 1]
-    else
-        attrs;
-
-    // Walk the attrs region. Allowed: `r="…"` and `t="…"` (the
-    // type override — we're replacing the value, so the source
-    // type tag is moot anyway). Reject on anything else (`s=`
-    // styles, `cm=`/`vm=` metadata, namespace-prefixed extensions)
-    // because those carry semantic state setCell would silently
-    // drop. iter-cm-2e relaxes this to a preserve-and-merge model.
-    var i: usize = 0;
-    while (i < trimmed_attrs.len) {
-        // Skip whitespace.
-        while (i < trimmed_attrs.len and (trimmed_attrs[i] == ' ' or
-            trimmed_attrs[i] == '\t' or trimmed_attrs[i] == '\n' or
-            trimmed_attrs[i] == '\r')) i += 1;
-        if (i >= trimmed_attrs.len) break;
-        // Find attribute name terminator (`=` or whitespace before `=`).
-        const name_start = i;
-        while (i < trimmed_attrs.len and trimmed_attrs[i] != '=' and
-            trimmed_attrs[i] != ' ' and trimmed_attrs[i] != '\t' and
-            trimmed_attrs[i] != '\n' and trimmed_attrs[i] != '\r') i += 1;
-        const name = trimmed_attrs[name_start..i];
-        if (!std.mem.eql(u8, name, "r") and !std.mem.eql(u8, name, "t"))
-            return true; // any attr other than r/t is metadata
-        // Skip `=` and the quoted value.
-        while (i < trimmed_attrs.len and trimmed_attrs[i] != '=') i += 1;
-        if (i >= trimmed_attrs.len) return true;
-        i += 1;
-        if (i >= trimmed_attrs.len or
-            (trimmed_attrs[i] != '"' and trimmed_attrs[i] != '\''))
-            return true;
-        const quote = trimmed_attrs[i];
-        i += 1;
-        while (i < trimmed_attrs.len and trimmed_attrs[i] != quote) i += 1;
-        if (i >= trimmed_attrs.len) return true;
-        i += 1;
-    }
-
-    // Check body. Reject any tag that isn't part of the canonical
-    // value envelope (`<v>`, `<is>`, `<t>` and their closes —
-    // empty `<is>`/`<t>`/`<v>` self-closing forms accepted too).
-    // Anything else — `<f>` formulas, `<rPh>` phonetic hints,
-    // `<phoneticPr>`, `<extLst>` extensions — carries semantic
-    // state setCell would silently drop. iter-cm-2e relaxes this
-    // to a preserve-and-merge model.
-    if (span.end < span.body_start + "</c>".len) return false;
-    const body_end = span.end - "</c>".len;
-    if (body_end <= span.body_start) return false;
-    const body = xml[span.body_start..body_end];
-
-    var bi: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, body, bi, '<')) |lt| {
-        const after = lt + 1;
-        if (after >= body.len) return true;
-        // Step over `/` for closing tags; same allow-list applies.
-        const name_start = if (body[after] == '/') after + 1 else after;
-        if (name_start >= body.len) return true;
-        // Find tag-name terminator (whitespace, `/`, `>`).
-        var ne = name_start;
-        while (ne < body.len and body[ne] != ' ' and body[ne] != '\t' and
-            body[ne] != '\n' and body[ne] != '\r' and
-            body[ne] != '/' and body[ne] != '>') ne += 1;
-        const name = body[name_start..ne];
-        const allowed = std.mem.eql(u8, name, "v") or
-            std.mem.eql(u8, name, "is") or
-            std.mem.eql(u8, name, "t");
-        if (!allowed) return true;
-        // Advance past the tag's `>`.
-        const gt = std.mem.indexOfScalarPos(u8, body, ne, '>') orelse return true;
-        bi = gt + 1;
-    }
-    return false;
-}
-
-/// Splice a new cell into a row that exists with `<row r="N">` but
-/// has no inner `<c>` cells (e.g. style/height-only `<row r="5"
-/// ht="24"/>`). Returns true if the row was found and the cell
-/// inserted; false if no matching row exists (caller falls
-/// through to the missing-row insert path).
-fn insertCellIntoEmptyRow(
-    allocator: Allocator,
-    ms: *MutatedSheet,
-    row: u32,
-    col: u32,
-    cell: Cell,
-) !bool {
-    // Walk every `<row>` opening matching either an explicit
-    // `r="N"` attribute OR the implicit row counter (1-based count
-    // of rows seen). OOXML allows r= to be omitted and
-    // scanWorksheetXml already supports it; this helper must match
-    // that semantics or it will misclassify cellless implicit-row
-    // rows as missing and duplicate them.
-    var pos: usize = 0;
-    var implicit_row: u32 = 0;
-    while (findTagOpen(ms.xml.items, pos, "row")) |t| {
-        implicit_row += 1;
-        const attrs_full = ms.xml.items[t.start + "<row".len .. t.after_open - 1];
-        const trimmed = std.mem.trimRight(u8, attrs_full, " \t\r\n");
-        const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
-        const attrs = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
-        const effective_row: u32 = blk: {
-            if (getAttr(attrs, "r")) |r_attr| {
-                const parsed = std.fmt.parseInt(u32, r_attr, 10) catch 0;
-                if (parsed > 0) break :blk parsed;
-            }
-            // Same recovery cascade Rows.next uses: try the body's
-            // first cell ref, fall back to the implicit counter.
-            if (!is_self_closing) {
-                if (recoverRowFromFirstCell(ms.xml.items, t.after_open)) |n|
-                    break :blk n;
-            }
-            break :blk implicit_row;
-        };
-        if (effective_row != row) {
-            pos = t.after_open;
-            continue;
-        }
-
-        // Found the row. Reserve span capacity up front so the
-        // final insert can't OOM after we've already mutated xml.
-        try ms.spans.ensureUnusedCapacity(allocator, 1);
-        // Build the cell bytes once.
-        var cell_buf: std.ArrayListUnmanaged(u8) = .{};
-        defer cell_buf.deinit(allocator);
-        try emitCellXml(allocator, &cell_buf, row, col, cell);
-        // Body-start offset is constant across both branches below;
-        // compute now so any InternalInvariantBroken surfaces BEFORE
-        // ms.xml is mutated, keeping setCell atomic on that error.
-        const cell_opening_gt = std.mem.indexOfScalar(u8, cell_buf.items, '>') orelse return error.InternalInvariantBroken;
-
-        if (is_self_closing) {
-            // Expand `<row …/>` to `<row …><c …>…</c></row>`.
-            // Position of the `/` is at `t.after_open - 2` (just
-            // before the closing `>`).
-            const slash_pos = t.after_open - 2;
-            // Build replacement: `>` + cell + `</row>`
-            var repl: std.ArrayListUnmanaged(u8) = .{};
-            defer repl.deinit(allocator);
-            try repl.append(allocator, '>');
-            try repl.appendSlice(allocator, cell_buf.items);
-            try repl.appendSlice(allocator, "</row>");
-            try ms.xml.replaceRange(allocator, slash_pos, 2, repl.items);
-            const delta_signed: isize = @as(isize, @intCast(repl.items.len)) - 2;
-            // Shift later spans.
-            for (ms.spans.items) |*s| {
-                if (s.start >= t.after_open) {
-                    s.start = @intCast(@as(isize, @intCast(s.start)) + delta_signed);
-                    s.end = @intCast(@as(isize, @intCast(s.end)) + delta_signed);
-                    s.body_start = @intCast(@as(isize, @intCast(s.body_start)) + delta_signed);
-                }
-            }
-            // The new cell starts where the old `/>` ended (replaced).
-            const cell_abs_start = slash_pos + 1;
-            const new_span: CellSpan = .{
-                .start = cell_abs_start,
-                .end = cell_abs_start + cell_buf.items.len,
-                .body_start = cell_abs_start + cell_opening_gt + 1,
-                .row = row,
-                .col = col,
-            };
-            // Insert at the right position in spans (source order).
-            var span_pos: usize = ms.spans.items.len;
-            for (ms.spans.items, 0..) |s, i| {
-                if (s.start >= new_span.end) {
-                    span_pos = i;
-                    break;
-                }
-            }
-            ms.spans.insertAssumeCapacity(span_pos, new_span);
-            return true;
-        }
-
-        // Body form `<row …>...</row>` with no inner cells. Splice
-        // the new cell at `t.after_open` (just past the `>`).
-        try ms.xml.insertSlice(allocator, t.after_open, cell_buf.items);
-        for (ms.spans.items) |*s| {
-            if (s.start >= t.after_open) {
-                s.start += cell_buf.items.len;
-                s.end += cell_buf.items.len;
-                s.body_start += cell_buf.items.len;
-            }
-        }
-        const new_span: CellSpan = .{
-            .start = t.after_open,
-            .end = t.after_open + cell_buf.items.len,
-            .body_start = t.after_open + cell_opening_gt + 1,
-            .row = row,
-            .col = col,
-        };
-        var span_pos: usize = ms.spans.items.len;
-        for (ms.spans.items, 0..) |s, i| {
-            if (s.start >= new_span.end) {
-                span_pos = i;
-                break;
-            }
-        }
-        ms.spans.insertAssumeCapacity(span_pos, new_span);
-        return true;
-    }
-    return false;
-}
-
-/// Insert a new `<row r="N"><c …>…</c></row>` block into the
-/// MutatedSheet at the lexicographic position for `row`. iter-cm-2d.
-fn insertMissingRow(
-    allocator: Allocator,
-    ms: *MutatedSheet,
-    row: u32,
-    col: u32,
-    cell: Cell,
-) !void {
-    // Reserve span capacity up front so the final insert can't OOM
-    // after we've already shifted bytes + offsets.
-    try ms.spans.ensureUnusedCapacity(allocator, 1);
-
-    // Build the new row block + run the cell-opening invariant check
-    // BEFORE any ms.xml mutation. The walk below may expand a
-    // self-closing `<sheetData/>` to `<sheetData></sheetData>`; if
-    // emitCellXml ever produced bytes without '>', surfacing the
-    // typed error here keeps ms.xml unchanged on the failure path.
-    var new_buf: std.ArrayListUnmanaged(u8) = .{};
-    defer new_buf.deinit(allocator);
-    try new_buf.writer(allocator).print("<row r=\"{d}\">", .{row});
-    const cell_start_in_buf = new_buf.items.len;
-    try emitCellXml(allocator, &new_buf, row, col, cell);
-    try new_buf.appendSlice(allocator, "</row>");
-    const cell_bytes = new_buf.items[cell_start_in_buf .. new_buf.items.len - "</row>".len];
-    const opening_gt_off = std.mem.indexOfScalar(u8, cell_bytes, '>') orelse return error.InternalInvariantBroken;
-
-    // Find insertion offset:
-    //   - just before the next-higher row's `<row` opening, OR
-    //   - just before `</sheetData>` if no higher row exists.
-    //
-    // Walk EVERY `<row>` tag (not just rows that produced spans) so
-    // cellless rows like `<row r="5"/>` or `<row r="5"></row>`
-    // anchor the position correctly. Going only by spans would
-    // misorder a `setCell(row=3, …)` on a sheet with row 5 empty +
-    // row 10 populated (would produce XML order 5,3,10). Use the
-    // same explicit-r → first-cell → implicit-counter cascade
-    // Rows.next uses.
-    var insert_at: usize = 0;
-    var anchored = false;
-    var pos_walk: usize = 0;
-    var implicit_row_walk: u32 = 0;
-    while (findTagOpen(ms.xml.items, pos_walk, "row")) |t| {
-        implicit_row_walk += 1;
-        const attrs_full = ms.xml.items[t.start + "<row".len .. t.after_open - 1];
-        const trimmed = std.mem.trimRight(u8, attrs_full, " \t\r\n");
-        const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
-        const attrs = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
-        const effective_row: u32 = blk: {
-            if (getAttr(attrs, "r")) |r_attr| {
-                const parsed = std.fmt.parseInt(u32, r_attr, 10) catch 0;
-                if (parsed > 0) break :blk parsed;
-            }
-            if (!is_self_closing) {
-                if (recoverRowFromFirstCell(ms.xml.items, t.after_open)) |n|
-                    break :blk n;
-            }
-            break :blk implicit_row_walk;
-        };
-        if (effective_row > row) {
-            insert_at = t.start;
-            anchored = true;
-            break;
-        }
-        pos_walk = t.after_open;
-    }
-    if (!anchored) {
-        // No higher row — append before `</sheetData>`. If the
-        // worksheet is empty (`<sheetData/>` self-closing form),
-        // expand it to `<sheetData></sheetData>` first; mirrors
-        // what the append path does in `injectAppendedRows`.
-        if (std.mem.indexOf(u8, ms.xml.items, "</sheetData>")) |end| {
-            insert_at = end;
-        } else if (std.mem.indexOf(u8, ms.xml.items, "<sheetData")) |sd_open| {
-            // Find the closing `>` of the self-closing tag.
-            const sd_close = std.mem.indexOfScalarPos(u8, ms.xml.items, sd_open, '>') orelse
-                return error.MalformedXml;
-            if (sd_close == 0 or ms.xml.items[sd_close - 1] != '/')
-                return error.MalformedXml;
-            // Replace `<sheetData [attrs]/>` with `<sheetData
-            // [attrs]></sheetData>`. Net byte delta = +
-            // "</sheetData>".len ("/" is consumed). All spans
-            // after sd_close shift by that delta.
-            const expand_at = sd_close - 1; // position of the `/`
-            try ms.xml.replaceRange(allocator, expand_at, 2, "></sheetData>");
-            const delta: usize = "></sheetData>".len - 2;
-            for (ms.spans.items) |*s| {
-                if (s.start >= sd_close) {
-                    s.start += delta;
-                    s.end += delta;
-                    s.body_start += delta;
-                }
-            }
-            // Recompute insertion offset — the new `</sheetData>`
-            // sits where the old `/` was, plus 1 (for the new `>`).
-            insert_at = expand_at + 1;
-        } else {
-            return error.MalformedXml;
-        }
-    }
-
-    try ms.xml.insertSlice(allocator, insert_at, new_buf.items);
-    const new_len = new_buf.items.len;
-
-    // Shift every later span by new_len.
-    for (ms.spans.items) |*s| {
-        if (s.start >= insert_at) {
-            s.start += new_len;
-            s.end += new_len;
-            s.body_start += new_len;
-        }
-    }
-
-    // Compute the new cell's span. Inside new_buf, the cell starts
-    // at `cell_start_in_buf` and ends at `new_buf.len - "</row>".len`.
-    const cell_abs_start = insert_at + cell_start_in_buf;
-    const cell_abs_end = insert_at + new_buf.items.len - "</row>".len;
-    const new_cell_span: CellSpan = .{
-        .start = cell_abs_start,
-        .end = cell_abs_end,
-        .body_start = cell_abs_start + opening_gt_off + 1,
-        .row = row,
-        .col = col,
-    };
-
-    // Find the right insertion index in spans (source order).
-    var span_pos: usize = ms.spans.items.len;
-    for (ms.spans.items, 0..) |s, i| {
-        if (s.start >= cell_abs_end) {
-            span_pos = i;
-            break;
-        }
-    }
-    ms.spans.insertAssumeCapacity(span_pos, new_cell_span);
-}
-
-/// Emit a fresh `<c r="REF"…>…</c>` for one cell. Output is canonical
-/// (no formula, no inline-string body, no preserved source attrs)
-/// — iter-cm-2a contract. Caller owns `out`'s buffer.
-fn emitCellXml(
-    allocator: Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    row: u32,
-    col: u32,
-    cell: Cell,
-) !void {
-    const writer_mod = xlsx;
-    var ref_buf: [16]u8 = undefined;
-    const ref = try writer_mod.formatCellRef(&ref_buf, row, @intCast(col));
-
-    // Empty cells get a self-closing form to match what writers emit.
-    if (cell == .empty) {
-        try out.writer(allocator).print("<c r=\"{s}\"/>", .{ref});
-        return;
-    }
-
-    const type_attr: []const u8 = switch (cell) {
-        .boolean => " t=\"b\"",
-        // iter-cm-2b: emit strings as `t="inlineStr"` rather than
-        // patching the SST. Valid OOXML, smaller surface area, no
-        // cross-cell coordination needed. Trade-off: repeated
-        // strings are no longer deduped by setCell — callers who
-        // care can normalise upstream or fall back to a writer.
-        .string => " t=\"inlineStr\"",
-        else => "",
-    };
-    try out.writer(allocator).print("<c r=\"{s}\"{s}>", .{ ref, type_attr });
-    switch (cell) {
-        .empty => unreachable,
-        .string => |s| {
-            try out.appendSlice(allocator, "<is><t");
-            // Honour OOXML's xml:space="preserve" semantics for
-            // strings whose first/last byte is whitespace —
-            // matches the writer's existing rule.
-            const needs_preserve = s.len > 0 and
-                (s[0] == ' ' or s[0] == '\t' or s[0] == '\n' or s[0] == '\r' or
-                    s[s.len - 1] == ' ' or s[s.len - 1] == '\t' or
-                    s[s.len - 1] == '\n' or s[s.len - 1] == '\r');
-            if (needs_preserve) try out.appendSlice(allocator, " xml:space=\"preserve\"");
-            try out.append(allocator, '>');
-            try appendXmlEscaped(allocator, out, s);
-            try out.appendSlice(allocator, "</t></is>");
-        },
-        .integer => |n| try out.writer(allocator).print("<v>{d}</v>", .{n}),
-        .number => |f| try out.writer(allocator).print("<v>{d}</v>", .{f}),
-        .boolean => |b| try out.writer(allocator).print("<v>{d}</v>", .{@intFromBool(b)}),
-    }
-    try out.appendSlice(allocator, "</c>");
-}
 
 /// Walk worksheet XML and emit a span per `<c>` element. Pure
 /// function — no allocator state beyond the returned slice. Mirrors
@@ -2880,64 +1613,6 @@ const SstAppender = struct {
     }
 };
 
-fn buildSubstitutedSheet(
-    allocator: Allocator,
-    entry: ZipEntry,
-    src_buf: []u8,
-    appended_rows: []const []Cell,
-    sst: ?*SstAppender,
-) !SubstitutedEntry {
-    // Decompress source payload.
-    const payload = src_buf[entry.lfh_offset + entry.lfh_total_len ..][0..entry.payload_len];
-    const decompressed = try decompressZipPayload(
-        allocator,
-        payload,
-        entry.compression_method,
-        entry.uncompressed_size,
-    );
-    defer allocator.free(decompressed);
-
-    // Find the first row index for the appends — one past the
-    // highest used row in the source.
-    const highest_row = findHighestRowInSheetXml(decompressed);
-    const start_row: u32 = highest_row + 1;
-    // Refuse appends that push past Excel's max row (1,048,576).
-    const final_row: u64 = @as(u64, start_row) + @as(u64, appended_rows.len) - 1;
-    if (final_row > max_row) return error.RowIndexOutOfRange;
-
-    // Inject `<row r="N">…</row>` blocks before `</sheetData>`.
-    const injected = try injectAppendedRows(
-        allocator,
-        decompressed,
-        appended_rows,
-        start_row,
-        sst,
-    );
-
-    // Update the canonical-form `<dimension ref="A1:Z<row>"/>` to
-    // extend both row AND column bounds when the appended rows
-    // pushed past the source's declared dimension. Other shapes
-    // (no dimension / open-tag form / single-cell ref) are left
-    // alone — Excel recomputes the dimension on its next save so
-    // staleness on those is tolerable.
-    const new_max_row: u32 = start_row +
-        @as(u32, @intCast(appended_rows.len)) - 1;
-    var new_max_col_1based: u32 = 0;
-    for (appended_rows) |row| {
-        if (row.len > new_max_col_1based) new_max_col_1based = @intCast(row.len);
-    }
-    const new_xml = blk: {
-        if (try updateDimension(allocator, injected, new_max_row, new_max_col_1based)) |patched| {
-            allocator.free(injected);
-            break :blk patched;
-        } else {
-            break :blk injected;
-        }
-    };
-
-    return try buildEntryFromXml(allocator, entry.name, new_xml);
-}
-
 /// Count `<si>` openings in a sharedStrings.xml body. Cheap one-pass
 /// scan — used once at save() to know how many indices the source
 /// SST already occupies before assigning indices to appended strings.
@@ -2985,698 +1660,6 @@ fn buildFreshSstXml(allocator: Allocator, strings: []const []const u8) ![]u8 {
     }
     try out.appendSlice(allocator, "</sst>");
     return try out.toOwnedSlice(allocator);
-}
-
-/// Splice an `Override` into `[Content_Types].xml` so readers
-/// recognise the freshly-created `xl/sharedStrings.xml` part.
-/// No-op (returns null) when the override is already present.
-/// Scan `xml` for the largest `attr="N"` numeric value (e.g.
-/// `sheetId="3"`). Returns 0 when no match is found. Used by
-/// `Editor.addSheet` to pick non-colliding ids.
-fn nextMaxAttr(xml: []const u8, attr_prefix: []const u8) u32 {
-    var max_id: u32 = 0;
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, xml, i, attr_prefix)) |pos| {
-        const num_start = pos + attr_prefix.len;
-        var num_end = num_start;
-        while (num_end < xml.len and xml[num_end] >= '0' and xml[num_end] <= '9') : (num_end += 1) {}
-        if (num_end > num_start) {
-            if (std.fmt.parseInt(u32, xml[num_start..num_end], 10)) |n| {
-                if (n > max_id) max_id = n;
-            } else |_| {}
-        }
-        i = num_end + 1;
-    }
-    return max_id;
-}
-
-/// Largest existing `rIdN` numeric suffix in the rels XML.
-fn nextMaxRId(xml: []const u8) u32 {
-    return nextMaxAttr(xml, "Id=\"rId");
-}
-
-/// Highest `sheetN.xml` number seen in the entry table. Returns
-/// 0 when no `xl/worksheets/sheet*.xml` entry exists.
-fn nextMaxSheetPathNum(entries: []const ZipEntry) u32 {
-    const prefix = "xl/worksheets/sheet";
-    const suffix = ".xml";
-    var max_n: u32 = 0;
-    for (entries) |e| {
-        if (!std.mem.startsWith(u8, e.name, prefix)) continue;
-        if (!std.mem.endsWith(u8, e.name, suffix)) continue;
-        const num_str = e.name[prefix.len .. e.name.len - suffix.len];
-        if (num_str.len == 0) continue;
-        if (std.fmt.parseInt(u32, num_str, 10)) |n| {
-            if (n > max_n) max_n = n;
-        } else |_| {}
-    }
-    return max_n;
-}
-
-/// Rewrite `xl/workbook.xml`'s `<sheet>` line at position
-/// `r.sheet_idx` (0-based among `<sheet>` elements in source
-/// order) for each pending rename. Iter-sheet-2.
-///
-/// Match is by POSITION, not by name — addSheet's patcher may have
-/// already appended new `<sheet>` lines, and a freshly-added sheet
-/// with the same name as a pre-rename old name would otherwise be
-/// hit by accident.
-fn patchWorkbookXmlForRenames(
-    allocator: Allocator,
-    xml: []const u8,
-    renames: []const SheetRename,
-) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
-    errdefer out.deinit(allocator);
-
-    var i: usize = 0;
-    while (findTagOpen(xml, i, "sheet")) |t| {
-        try out.appendSlice(allocator, xml[i .. t.start + "<sheet".len]);
-        const attrs = xml[t.start + "<sheet".len .. t.after_open - 1];
-        const sh_end = t.after_open - 1; // position of `>`
-
-        // Match by `r:id` (captured at renameSheet time). Position-
-        // based match would target the wrong line on workbooks where
-        // Book.sheets indexing diverges from raw <sheet> order
-        // (e.g. broken rels entries skipped by parseWorkbookSheets).
-        var matched_new: ?[]const u8 = null;
-        if (getAttr(attrs, "r:id")) |rid| {
-            for (renames) |r| {
-                if (std.mem.eql(u8, r.rid, rid)) {
-                    matched_new = r.new_name;
-                    break;
-                }
-            }
-        }
-
-        if (matched_new) |new_name| {
-            // Rewrite the `name="..."` attribute. Walk attrs and
-            // emit verbatim except the name field, which we
-            // replace with the escaped new value.
-            var ai: usize = 0;
-            while (ai < attrs.len) {
-                // Skip whitespace.
-                while (ai < attrs.len and (attrs[ai] == ' ' or
-                    attrs[ai] == '\t' or attrs[ai] == '\n' or
-                    attrs[ai] == '\r')) : (ai += 1)
-                {
-                    try out.append(allocator, attrs[ai]);
-                }
-                if (ai >= attrs.len) break;
-                // Read attribute name.
-                const name_start = ai;
-                while (ai < attrs.len and attrs[ai] != '=' and
-                    attrs[ai] != ' ' and attrs[ai] != '\t' and
-                    attrs[ai] != '\n' and attrs[ai] != '\r') ai += 1;
-                const attr_name = attrs[name_start..ai];
-                // Skip = and the quote.
-                while (ai < attrs.len and attrs[ai] != '=') ai += 1;
-                if (ai >= attrs.len) {
-                    try out.appendSlice(allocator, attrs[name_start..]);
-                    break;
-                }
-                ai += 1;
-                if (ai >= attrs.len) {
-                    try out.appendSlice(allocator, attrs[name_start..]);
-                    break;
-                }
-                const quote = attrs[ai];
-                ai += 1;
-                const val_start = ai;
-                while (ai < attrs.len and attrs[ai] != quote) ai += 1;
-                const val = attrs[val_start..ai];
-                if (ai < attrs.len) ai += 1; // step past closing quote
-
-                if (std.mem.eql(u8, attr_name, "name")) {
-                    try out.appendSlice(allocator, "name=\"");
-                    try appendXmlAttrEscaped(allocator, &out, new_name);
-                    try out.append(allocator, '"');
-                } else {
-                    // Verbatim: name=quote+value+quote.
-                    try out.appendSlice(allocator, attr_name);
-                    try out.append(allocator, '=');
-                    try out.append(allocator, quote);
-                    try out.appendSlice(allocator, val);
-                    try out.append(allocator, quote);
-                }
-            }
-        } else {
-            try out.appendSlice(allocator, attrs);
-        }
-
-        i = sh_end;
-    }
-    try out.appendSlice(allocator, xml[i..]);
-    return try out.toOwnedSlice(allocator);
-}
-
-/// Splice the new-sheet `<sheet …/>` lines into `xl/workbook.xml`'s
-/// `<sheets>…</sheets>` block. iter-sheet-1.
-fn patchWorkbookXmlForNewSheets(
-    allocator: Allocator,
-    xml: []const u8,
-    new_sheets: []const NewSheet,
-) ![]u8 {
-    const close = std.mem.indexOf(u8, xml, "</sheets>") orelse return error.MalformedXml;
-    var out: std.ArrayListUnmanaged(u8) = .{};
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, xml[0..close]);
-    for (new_sheets) |s| {
-        try out.appendSlice(allocator, "<sheet name=\"");
-        try appendXmlAttrEscaped(allocator, &out, s.name);
-        try out.writer(allocator).print(
-            "\" sheetId=\"{d}\" r:id=\"{s}\"/>",
-            .{ s.sheet_id, s.rid },
-        );
-    }
-    try out.appendSlice(allocator, xml[close..]);
-    return try out.toOwnedSlice(allocator);
-}
-
-/// Splice `<Relationship/>` entries for the new sheets into the
-/// workbook rels file. iter-sheet-1.
-fn patchWorkbookRelsForNewSheets(
-    allocator: Allocator,
-    xml: []const u8,
-    new_sheets: []const NewSheet,
-) ![]u8 {
-    const close = std.mem.indexOf(u8, xml, "</Relationships>") orelse return error.MalformedXml;
-    var out: std.ArrayListUnmanaged(u8) = .{};
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, xml[0..close]);
-    for (new_sheets) |s| {
-        // Target is relative to xl/_rels/, so strip the "xl/" prefix
-        // from the sheet path. e.g. "xl/worksheets/sheet5.xml" →
-        // "worksheets/sheet5.xml".
-        const target = if (std.mem.startsWith(u8, s.path, "xl/")) s.path[3..] else s.path;
-        try out.writer(allocator).print(
-            "<Relationship Id=\"{s}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"{s}\"/>",
-            .{ s.rid, target },
-        );
-    }
-    try out.appendSlice(allocator, xml[close..]);
-    return try out.toOwnedSlice(allocator);
-}
-
-/// Splice `<Override PartName="/xl/worksheets/…" ContentType="…"/>`
-/// entries for the new sheets into `[Content_Types].xml`. iter-sheet-1.
-fn patchContentTypesForNewSheets(
-    allocator: Allocator,
-    xml: []const u8,
-    new_sheets: []const NewSheet,
-) ![]u8 {
-    const close = std.mem.indexOf(u8, xml, "</Types>") orelse return error.MalformedXml;
-    var out: std.ArrayListUnmanaged(u8) = .{};
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, xml[0..close]);
-    for (new_sheets) |s| {
-        try out.writer(allocator).print(
-            "<Override PartName=\"/{s}\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>",
-            .{s.path},
-        );
-    }
-    try out.appendSlice(allocator, xml[close..]);
-    return try out.toOwnedSlice(allocator);
-}
-/// Drop the calcChain `<Relationship/>` (Type ends with
-/// `/relationships/calcChain`) from the workbook rels file. Used
-/// alongside the calcChain ZIP-entry drop on delete.
-fn patchWorkbookRelsForCalcChainDrop(
-    allocator: Allocator,
-    xml: []const u8,
-    deletes: []const SheetDelete,
-) ![]u8 {
-    _ = deletes;
-    var out: std.ArrayListUnmanaged(u8) = .{};
-    errdefer out.deinit(allocator);
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, xml, i, "<Relationship")) |rel_pos| {
-        const rel_end = std.mem.indexOfScalarPos(u8, xml, rel_pos, '>') orelse {
-            try out.appendSlice(allocator, xml[i..]);
-            return try out.toOwnedSlice(allocator);
-        };
-        const rel_attrs = xml[rel_pos + "<Relationship".len .. rel_end];
-        var dropped = false;
-        if (getAttr(rel_attrs, "Type")) |ty| {
-            if (std.mem.endsWith(u8, ty, "/calcChain")) dropped = true;
-        }
-        if (!dropped) {
-            if (getAttr(rel_attrs, "Target")) |tg| {
-                if (std.mem.endsWith(u8, tg, "calcChain.xml")) dropped = true;
-            }
-        }
-        if (dropped) {
-            try out.appendSlice(allocator, xml[i..rel_pos]);
-            i = rel_end + 1;
-        } else {
-            try out.appendSlice(allocator, xml[i .. rel_end + 1]);
-            i = rel_end + 1;
-        }
-    }
-    try out.appendSlice(allocator, xml[i..]);
-    return try out.toOwnedSlice(allocator);
-}
-
-/// Drop `<Override PartName="/xl/calcChain.xml" .../>` from
-/// [Content_Types].xml.
-fn patchContentTypesForCalcChainDrop(
-    allocator: Allocator,
-    xml: []const u8,
-    deletes: []const SheetDelete,
-) ![]u8 {
-    _ = deletes;
-    var out: std.ArrayListUnmanaged(u8) = .{};
-    errdefer out.deinit(allocator);
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, xml, i, "<Override")) |o_pos| {
-        const o_end = std.mem.indexOfScalarPos(u8, xml, o_pos, '>') orelse {
-            try out.appendSlice(allocator, xml[i..]);
-            return try out.toOwnedSlice(allocator);
-        };
-        const o_attrs = xml[o_pos + "<Override".len .. o_end];
-        var dropped = false;
-        if (getAttr(o_attrs, "PartName")) |part| {
-            const part_norm = if (part.len > 0 and part[0] == '/') part[1..] else part;
-            if (std.mem.eql(u8, part_norm, "xl/calcChain.xml")) dropped = true;
-        }
-        if (dropped) {
-            try out.appendSlice(allocator, xml[i..o_pos]);
-            i = o_end + 1;
-        } else {
-            try out.appendSlice(allocator, xml[i .. o_end + 1]);
-            i = o_end + 1;
-        }
-    }
-    try out.appendSlice(allocator, xml[i..]);
-    return try out.toOwnedSlice(allocator);
-}
-
-/// Walk `<workbookView>` attributes and rewrite `activeTab=` and
-/// `firstSheet=` values to account for deleted sheets. Other attrs
-/// pass through verbatim.
-fn patchViewAttrs(
-    allocator: Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    attrs: []const u8,
-    dropped_positions: []const u32,
-    live_count: u32,
-) !void {
-    var i: usize = 0;
-    while (i < attrs.len) {
-        // Skip whitespace (preserve verbatim).
-        const ws_start = i;
-        while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
-            attrs[i] == '\n' or attrs[i] == '\r')) i += 1;
-        try out.appendSlice(allocator, attrs[ws_start..i]);
-        if (i >= attrs.len) break;
-
-        // Read attribute name.
-        const name_start = i;
-        while (i < attrs.len and attrs[i] != '=' and attrs[i] != ' ' and
-            attrs[i] != '\t' and attrs[i] != '\n' and attrs[i] != '\r') i += 1;
-        const attr_name = attrs[name_start..i];
-
-        // Skip optional whitespace + `=`.
-        while (i < attrs.len and attrs[i] != '=') i += 1;
-        if (i >= attrs.len) {
-            try out.appendSlice(allocator, attrs[name_start..]);
-            return;
-        }
-        i += 1; // past `=`
-        // Tolerate whitespace between `=` and the opening quote
-        // (legal XML; some generators emit it).
-        while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
-            attrs[i] == '\n' or attrs[i] == '\r')) i += 1;
-        if (i >= attrs.len or (attrs[i] != '"' and attrs[i] != '\'')) {
-            try out.appendSlice(allocator, attrs[name_start..]);
-            return;
-        }
-        const quote = attrs[i];
-        i += 1;
-        const val_start = i;
-        while (i < attrs.len and attrs[i] != quote) i += 1;
-        const val = attrs[val_start..i];
-        if (i < attrs.len) i += 1; // past closing quote
-
-        const is_active = std.mem.eql(u8, attr_name, "activeTab");
-        const is_first = std.mem.eql(u8, attr_name, "firstSheet");
-        if (is_active or is_first) {
-            const old_n = std.fmt.parseInt(u32, val, 10) catch live_count;
-            var new_n: u32 = 0;
-            if (live_count > 0) {
-                var was_dropped = false;
-                var shift: u32 = 0;
-                for (dropped_positions) |dp| {
-                    if (dp == old_n) was_dropped = true;
-                    if (dp < old_n) shift += 1;
-                }
-                if (was_dropped) {
-                    new_n = 0;
-                } else if (old_n >= shift) {
-                    new_n = old_n - shift;
-                } else {
-                    new_n = 0;
-                }
-                if (new_n >= live_count) new_n = live_count - 1;
-            }
-            try out.appendSlice(allocator, attr_name);
-            try out.append(allocator, '=');
-            try out.append(allocator, quote);
-            try out.writer(allocator).print("{d}", .{new_n});
-            try out.append(allocator, quote);
-        } else {
-            // Verbatim: name + `=` + quote + value + quote.
-            try out.appendSlice(allocator, attr_name);
-            try out.append(allocator, '=');
-            try out.append(allocator, quote);
-            try out.appendSlice(allocator, val);
-            try out.append(allocator, quote);
-        }
-    }
-}
-
-/// Drop the `<sheet r:id="rIdN"/>` line from `xl/workbook.xml`
-/// for each pending delete (matched by r:id). Two passes:
-///   1. First walk computes which raw `<sheet>` positions are
-///      being deleted so we can later shift `activeTab`.
-///   2. Second pass emits the result, dropping deleted lines and
-///      patching `<workbookView activeTab="N"/>` so it never
-///      points past the new last sheet.
-///
-/// Limitation called out in the iter-sheet-3 plan: `<definedName>`
-/// entries tied to deleted sheets via `localSheetId` are NOT
-/// rewritten — that needs the formula tokenizer (iter-col-1).
-/// Print areas / named ranges referencing the deleted sheet may
-/// fail repair in strict readers.
-fn patchWorkbookXmlForDeletes(
-    allocator: Allocator,
-    xml: []const u8,
-    deletes: []const SheetDelete,
-) ![]u8 {
-    // Single-pass walk: visit `<sheet>` and `<workbookView>` tags
-    // in source order, regardless of which appears first in the
-    // file. parseWorkbookSheets order matches the raw `<sheet>`
-    // sequence (broken-rels-skipped sheets aside, which we don't
-    // try to model here).
-    var dropped_positions: std.ArrayListUnmanaged(u32) = .{};
-    defer dropped_positions.deinit(allocator);
-    var live_count: u32 = 0;
-    var sheet_pos: u32 = 0;
-    {
-        var i: usize = 0;
-        while (findTagOpen(xml, i, "sheet")) |t| {
-            const attrs = xml[t.start + "<sheet".len .. t.after_open - 1];
-            var is_dropped = false;
-            if (getAttr(attrs, "r:id")) |rid| {
-                for (deletes) |d| {
-                    if (std.mem.eql(u8, d.rid, rid)) {
-                        is_dropped = true;
-                        break;
-                    }
-                }
-            }
-            if (is_dropped) try dropped_positions.append(allocator, sheet_pos) else live_count += 1;
-            sheet_pos += 1;
-            i = t.after_open;
-        }
-    }
-
-    var out: std.ArrayListUnmanaged(u8) = .{};
-    errdefer out.deinit(allocator);
-
-    // Walk both tag types together, sorted by source position.
-    // For each interesting tag, emit bytes up to it, transform
-    // it, advance.
-    var i: usize = 0;
-    while (true) {
-        const next_sheet = findTagOpen(xml, i, "sheet");
-        const next_view = findTagOpen(xml, i, "workbookView");
-        var pick_sheet: bool = false;
-        var pick_view: bool = false;
-        if (next_sheet) |s| {
-            if (next_view) |v| {
-                if (s.start < v.start) pick_sheet = true else pick_view = true;
-            } else pick_sheet = true;
-        } else if (next_view != null) pick_view = true else break;
-
-        if (pick_sheet) {
-            const t = next_sheet.?;
-            const attrs = xml[t.start + "<sheet".len .. t.after_open - 1];
-            const is_self_closing = attrs.len > 0 and attrs[attrs.len - 1] == '/';
-            var dropped = false;
-            if (getAttr(attrs, "r:id")) |rid| {
-                for (deletes) |d| {
-                    if (std.mem.eql(u8, d.rid, rid)) {
-                        dropped = true;
-                        break;
-                    }
-                }
-            }
-            if (dropped) {
-                // Drop the entire `<sheet>` element. For self-closing
-                // form `<sheet ... />`, after_open is past the `>`.
-                // For body form `<sheet ...></sheet>`, also skip
-                // past the matching `</sheet>` close so we don't
-                // leave a dangling close tag.
-                try out.appendSlice(allocator, xml[i..t.start]);
-                if (is_self_closing) {
-                    i = t.after_open;
-                } else {
-                    if (std.mem.indexOfPos(u8, xml, t.after_open, "</sheet>")) |close_pos| {
-                        i = close_pos + "</sheet>".len;
-                    } else {
-                        i = t.after_open;
-                    }
-                }
-            } else {
-                try out.appendSlice(allocator, xml[i..t.after_open]);
-                i = t.after_open;
-            }
-        } else {
-            const t = next_view.?;
-            try out.appendSlice(allocator, xml[i..t.start]);
-            // Rewrite both activeTab + firstSheet attributes inside
-            // <workbookView>, in source order, so each adjustment
-            // composes cleanly. Both attributes get the same
-            // shift/clamp treatment.
-            const view_attrs_start = t.start + "<workbookView".len;
-            const view_attrs_end = t.after_open - 1;
-            try out.append(allocator, '<');
-            try out.appendSlice(allocator, "workbookView");
-            try patchViewAttrs(
-                allocator,
-                &out,
-                xml[view_attrs_start..view_attrs_end],
-                dropped_positions.items,
-                live_count,
-            );
-            // Emit the closing `>` (or `/>` for self-closing).
-            try out.appendSlice(allocator, xml[view_attrs_end..t.after_open]);
-            i = t.after_open;
-        }
-    }
-    try out.appendSlice(allocator, xml[i..]);
-    return try out.toOwnedSlice(allocator);
-}
-
-/// Drop `<Relationship Id="rIdN" .../>` lines from
-/// `xl/_rels/workbook.xml.rels` for each pending delete.
-fn patchWorkbookRelsForDeletes(
-    allocator: Allocator,
-    xml: []const u8,
-    deletes: []const SheetDelete,
-) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
-    errdefer out.deinit(allocator);
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, xml, i, "<Relationship")) |rel_pos| {
-        const rel_end = std.mem.indexOfScalarPos(u8, xml, rel_pos, '>') orelse {
-            try out.appendSlice(allocator, xml[i..]);
-            return try out.toOwnedSlice(allocator);
-        };
-        const rel_attrs = xml[rel_pos + "<Relationship".len .. rel_end];
-        var dropped = false;
-        if (getAttr(rel_attrs, "Id")) |id| {
-            for (deletes) |d| {
-                if (std.mem.eql(u8, d.rid, id)) {
-                    dropped = true;
-                    break;
-                }
-            }
-        }
-        if (dropped) {
-            try out.appendSlice(allocator, xml[i..rel_pos]);
-            i = rel_end + 1;
-        } else {
-            try out.appendSlice(allocator, xml[i .. rel_end + 1]);
-            i = rel_end + 1;
-        }
-    }
-    try out.appendSlice(allocator, xml[i..]);
-    return try out.toOwnedSlice(allocator);
-}
-
-/// Drop `<Override PartName="/xl/worksheets/sheetN.xml" …/>`
-/// entries for each pending delete.
-fn patchContentTypesForDeletes(
-    allocator: Allocator,
-    xml: []const u8,
-    deletes: []const SheetDelete,
-) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
-    errdefer out.deinit(allocator);
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, xml, i, "<Override")) |o_pos| {
-        const o_end = std.mem.indexOfScalarPos(u8, xml, o_pos, '>') orelse {
-            try out.appendSlice(allocator, xml[i..]);
-            return try out.toOwnedSlice(allocator);
-        };
-        const o_attrs = xml[o_pos + "<Override".len .. o_end];
-        var dropped = false;
-        if (getAttr(o_attrs, "PartName")) |part| {
-            // Strip leading `/` before comparing: PartName values
-            // are absolute (`/xl/worksheets/sheetN.xml`).
-            const part_norm = if (part.len > 0 and part[0] == '/') part[1..] else part;
-            for (deletes) |d| {
-                if (std.mem.eql(u8, d.path, part_norm)) {
-                    dropped = true;
-                    break;
-                }
-            }
-        }
-        if (dropped) {
-            try out.appendSlice(allocator, xml[i..o_pos]);
-            i = o_end + 1;
-        } else {
-            try out.appendSlice(allocator, xml[i .. o_end + 1]);
-            i = o_end + 1;
-        }
-    }
-    try out.appendSlice(allocator, xml[i..]);
-    return try out.toOwnedSlice(allocator);
-}
-
-/// Twin of `patchEntryForNewSheets` for sheet deletes.
-fn patchEntryForDeletes(
-    allocator: Allocator,
-    entries: []const ZipEntry,
-    src_buf: []u8,
-    subs: []?SubstitutedEntry,
-    entry_name: []const u8,
-    deletes: []const SheetDelete,
-    patcher: *const fn (Allocator, []const u8, []const SheetDelete) anyerror![]u8,
-) !void {
-    const entry_idx = findEntryByName(entries, entry_name) orelse
-        return error.MissingEntry;
-    var src_xml: []u8 = undefined;
-    var src_xml_owned = false;
-    if (subs[entry_idx]) |s| {
-        src_xml = try decompressZipPayload(allocator, s.payload, s.compression_method, s.uncompressed_size);
-        src_xml_owned = true;
-        allocator.free(s.lfh);
-        allocator.free(s.payload);
-        allocator.free(s.cdfh);
-        subs[entry_idx] = null;
-    } else {
-        const e = entries[entry_idx];
-        const payload = src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
-        src_xml = try decompressZipPayload(allocator, payload, e.compression_method, e.uncompressed_size);
-        src_xml_owned = true;
-    }
-    defer if (src_xml_owned) allocator.free(src_xml);
-
-    const new_xml = try patcher(allocator, src_xml, deletes);
-    subs[entry_idx] = try buildEntryFromXml(allocator, entry_name, new_xml);
-}
-
-/// Twin of `patchEntryForNewSheets` for sheet renames. Same
-/// re-substitution semantics — composes with new-sheet patches
-/// already in subs[entry_idx].
-fn patchEntryForRenames(
-    allocator: Allocator,
-    entries: []const ZipEntry,
-    src_buf: []u8,
-    subs: []?SubstitutedEntry,
-    entry_name: []const u8,
-    renames: []const SheetRename,
-    patcher: *const fn (Allocator, []const u8, []const SheetRename) anyerror![]u8,
-) !void {
-    const entry_idx = findEntryByName(entries, entry_name) orelse
-        return error.MissingEntry;
-    var src_xml: []u8 = undefined;
-    var src_xml_owned = false;
-    if (subs[entry_idx]) |s| {
-        src_xml = try decompressZipPayload(
-            allocator,
-            s.payload,
-            s.compression_method,
-            s.uncompressed_size,
-        );
-        src_xml_owned = true;
-        allocator.free(s.lfh);
-        allocator.free(s.payload);
-        allocator.free(s.cdfh);
-        subs[entry_idx] = null;
-    } else {
-        const e = entries[entry_idx];
-        const payload = src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
-        src_xml = try decompressZipPayload(allocator, payload, e.compression_method, e.uncompressed_size);
-        src_xml_owned = true;
-    }
-    defer if (src_xml_owned) allocator.free(src_xml);
-
-    const new_xml = try patcher(allocator, src_xml, renames);
-    subs[entry_idx] = try buildEntryFromXml(allocator, entry_name, new_xml);
-}
-
-/// Variant of `patchEntryXml` that threads a NewSheet slice through
-/// to the patcher. Decompresses the named entry, hands it to
-/// `patcher`, wraps the result back into a fresh SubstitutedEntry
-/// stored at `subs[entry_idx]`. Errors when the entry is missing
-/// — unlike the SST path, the workbook + rels + Content_Types
-/// MUST exist for `addSheet` to be meaningful.
-fn patchEntryForNewSheets(
-    allocator: Allocator,
-    entries: []const ZipEntry,
-    src_buf: []u8,
-    subs: []?SubstitutedEntry,
-    entry_name: []const u8,
-    new_sheets: []const NewSheet,
-    patcher: *const fn (Allocator, []const u8, []const NewSheet) anyerror![]u8,
-) !void {
-    const entry_idx = findEntryByName(entries, entry_name) orelse
-        return error.MissingEntry;
-    // If a previous pass already substituted this entry (e.g. SST
-    // creation patched workbook rels), patch the already-substituted
-    // bytes instead of re-decompressing the source.
-    var src_xml: []u8 = undefined;
-    var src_xml_owned = false;
-    if (subs[entry_idx]) |s| {
-        // The substituted entry's payload is compressed bytes;
-        // decompress to get the XML again.
-        src_xml = try decompressZipPayload(
-            allocator,
-            s.payload,
-            s.compression_method,
-            s.uncompressed_size,
-        );
-        src_xml_owned = true;
-        // Drop the old substituted entry — we're rebuilding it.
-        allocator.free(s.lfh);
-        allocator.free(s.payload);
-        allocator.free(s.cdfh);
-        subs[entry_idx] = null;
-    } else {
-        const e = entries[entry_idx];
-        const payload = src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
-        src_xml = try decompressZipPayload(allocator, payload, e.compression_method, e.uncompressed_size);
-        src_xml_owned = true;
-    }
-    defer if (src_xml_owned) allocator.free(src_xml);
-
-    const new_xml = try patcher(allocator, src_xml, new_sheets);
-    // buildEntryFromXml takes ownership of new_xml.
-    subs[entry_idx] = try buildEntryFromXml(allocator, entry_name, new_xml);
 }
 
 fn addSstContentTypeOverride(allocator: Allocator, xml: []const u8) !?[]u8 {
