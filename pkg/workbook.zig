@@ -7580,3 +7580,205 @@ test "fuzz: emitWithAppends end-to-end on adversarial sheetData payload" {
         },
     });
 }
+
+// ─── iter-er-7 task C-1: Workbook.save edge-case coverage ─────────────
+
+test "Workbook.save: SST-less source + appendRows .string creates SST + rels + Override" {
+    // Exercises the appended_rows × no-SST branch end-to-end. Build a
+    // synthetic SST-less .xlsx, stage one `.string` cell via
+    // `Worksheet.appendRows`, save, then re-open and assert:
+    //   - `xl/sharedStrings.xml` part now exists
+    //   - `xl/_rels/workbook.xml.rels` carries the SST `<Relationship>`
+    //   - `[Content_Types].xml` carries the SST Override entry
+    //   - the appended cell reads back as a shared_string with index 0
+    const alloc = std.testing.allocator;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var src_buf: [256]u8 = undefined;
+    var out_buf: [256]u8 = undefined;
+    const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-er7-c1-sstless-src-{d}.xlsx", .{prng.random().int(u32)});
+    const out_path = try std.fmt.bufPrint(&out_buf, ".zig-cache/test-er7-c1-sstless-out-{d}.xlsx", .{prng.random().int(u32)});
+
+    try writeMinimalSstLessXlsx(alloc, src_path);
+    defer std.fs.cwd().deleteFile(src_path) catch {};
+
+    const appended_text = "appended-via-rows-fresh-sst";
+    {
+        var wb = try Workbook.open(alloc, src_path);
+        defer wb.deinit();
+        const v = try wb.sst();
+        try std.testing.expect(v == null); // sanity: source has no SST
+
+        const s0 = try wb.sheet(0);
+        const row = [_]zlsx.Cell{.{ .string = appended_text }};
+        try s0.appendRows(&.{&row});
+        try wb.save(out_path);
+    }
+    defer std.fs.cwd().deleteFile(out_path) catch {};
+
+    var wb2 = try Workbook.open(alloc, out_path);
+    defer wb2.deinit();
+
+    // Fresh SST part — exactly one entry, our text.
+    const sst_view = try wb2.sst();
+    try std.testing.expect(sst_view != null);
+    try std.testing.expectEqual(@as(usize, 1), sst_view.?.entries.len);
+    const t0 = try wb2.sstText(0);
+    try std.testing.expect(t0 != null);
+    try std.testing.expectEqualStrings(appended_text, t0.?);
+
+    // Workbook rels contain the SST relationship.
+    const rels_part = try wb2.store.part("xl/_rels/workbook.xml.rels") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, rels_part.bytes, "sharedStrings") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rels_part.bytes, "/relationships/sharedStrings") != null);
+
+    // [Content_Types].xml carries the SST Override.
+    const ct_part = try wb2.store.part("[Content_Types].xml") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, ct_part.bytes, "/xl/sharedStrings.xml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ct_part.bytes, "sharedStrings+xml") != null);
+
+    // Reader observes the appended cell. The empty source had no rows,
+    // so the appended row lands at row 1.
+    const s0r = try wb2.sheet(0);
+    const cell = try s0r.cellByRef("A1");
+    try std.testing.expect(cell != null);
+    try std.testing.expect(cell.?.cell_type == .shared_string);
+    try std.testing.expectEqualStrings("0", cell.?.raw_value.?);
+}
+
+test "Workbook.save: mixed deltas (sheet 0) + appends (sheet 1) share one SST plan" {
+    // Stage `setCell` on sheet 0 (string + numeric) and `appendRows`
+    // on sheet 1 (string + numeric) in the same save. The
+    // SstExtensionPlan must dedup across BOTH axes — assert each cell
+    // observes its expected SST index after re-open.
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-er7-c1-mixed-{d}.xlsx", .{prng.random().int(u32)});
+
+    const delta_text = "er7-c1-delta-shared";
+    const append_text = "er7-c1-append-shared";
+
+    var pre_count: u32 = 0;
+    {
+        var wb = try Workbook.open(alloc, src_path);
+        defer wb.deinit();
+        pre_count = @intCast((try wb.sst()).?.entries.len);
+
+        // Sheet 0: setCell with shared_string + numeric.
+        const s0 = try wb.sheet(0);
+        try s0.setCell("Z998", .{ .shared_string = delta_text });
+        try s0.setCell("Z999", .{ .number = 42.0 });
+
+        // Sheet 1: appendRows with string + numeric.
+        const s1 = try wb.sheet(1);
+        const row = [_]zlsx.Cell{ .{ .string = append_text }, .{ .number = 7.5 } };
+        try s1.appendRows(&.{&row});
+
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb2 = try Workbook.open(alloc, tmp_path);
+    defer wb2.deinit();
+
+    // SST grew by exactly two — one per axis (texts differ).
+    const sst2 = (try wb2.sst()).?;
+    try std.testing.expectEqual(@as(usize, pre_count + 2), sst2.entries.len);
+
+    // Sheet 0 delta cell — shared_string at pre_count (deltas walk first).
+    const s0r = try wb2.sheet(0);
+    const c_delta = try s0r.cellByRef("Z998");
+    try std.testing.expect(c_delta != null);
+    try std.testing.expect(c_delta.?.cell_type == .shared_string);
+    var ibuf: [16]u8 = undefined;
+    const expected_delta_idx = try std.fmt.bufPrint(&ibuf, "{d}", .{pre_count});
+    try std.testing.expectEqualStrings(expected_delta_idx, c_delta.?.raw_value.?);
+    const delta_resolved = try wb2.sstText(pre_count);
+    try std.testing.expectEqualStrings(delta_text, delta_resolved.?);
+
+    // Sheet 0 numeric delta cell — round-trips.
+    const c_num = try s0r.cellByRef("Z999");
+    try std.testing.expect(c_num != null);
+    try std.testing.expectEqualStrings("42", c_num.?.raw_value.?);
+
+    // Sheet 1 appended cells — first appended row lands at last_row + 1.
+    // Locate by SST text rather than row arithmetic to keep this robust
+    // against fixture row count drift.
+    const sst_idx_appended = pre_count + 1;
+    var ibuf2: [16]u8 = undefined;
+    const expected_append_idx = try std.fmt.bufPrint(&ibuf2, "{d}", .{sst_idx_appended});
+    const append_resolved = try wb2.sstText(sst_idx_appended);
+    try std.testing.expectEqualStrings(append_text, append_resolved.?);
+
+    // Verify the appended sheet's serialized XML carries the right index +
+    // the numeric cell. The sheet part name is whatever sheet 1 resolves
+    // to; read it via the typed handle.
+    const s1r = try wb2.sheet(1);
+    const part_name = try s1r.resolvePartName();
+    const sheet_part = try wb2.store.part(part_name) orelse
+        return error.TestUnexpectedResult;
+    const needle = try std.fmt.allocPrint(alloc, "t=\"s\"><v>{s}</v>", .{expected_append_idx});
+    defer alloc.free(needle);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_part.bytes, needle) != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet_part.bytes, "<v>7.5</v>") != null);
+}
+
+test "Workbook.save: renameSheet rewriter composes with setCell on a different sheet" {
+    // Run the rewriter (renameSheet does formula + defined-name + ...
+    // rewrites internally), then stage a setCell on a sheet not yet
+    // edited, save, re-open. Reader must see BOTH the renamed sheet
+    // AND the setCell mutation.
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(src_path, .{}) catch return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var tmp_buf: [256]u8 = undefined;
+    var out_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-er7-c1-rw-in-{d}.xlsx", .{prng.random().int(u32)});
+    const out_path = try std.fmt.bufPrint(&out_buf, ".zig-cache/test-er7-c1-rw-out-{d}.xlsx", .{prng.random().int(u32)});
+
+    // Stage a cross-sheet formula on sheet 0 referencing Sheet2, save.
+    {
+        var wb = try Workbook.open(alloc, src_path);
+        defer wb.deinit();
+        const s0 = try wb.sheet(0);
+        try s0.setCell("A1", .{ .formula = "Sheet2!A1+1" });
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    // Rename sheet 1, then stage a setCell on sheet 0 (not yet edited
+    // in this Workbook instance), save, re-open, verify both.
+    {
+        var wb = try Workbook.open(alloc, tmp_path);
+        defer wb.deinit();
+        try wb.renameSheet(1, "Renamed7");
+
+        const s0 = try wb.sheet(0);
+        try s0.setCell("B1", .{ .number = 99.5 });
+
+        try wb.save(out_path);
+    }
+    defer std.fs.cwd().deleteFile(out_path) catch {};
+
+    var wb2 = try Workbook.open(alloc, out_path);
+    defer wb2.deinit();
+
+    // Rename landed.
+    try std.testing.expectEqualStrings("Renamed7", (try wb2.sheet(1)).name());
+
+    // Cross-sheet formula was rewritten by renameSheet's rewriter.
+    const a1 = (try (try wb2.sheet(0)).cellByRef("A1")).?;
+    try std.testing.expectEqualStrings("Renamed7!A1+1", a1.formula.?);
+
+    // setCell mutation on sheet 0 round-tripped.
+    const b1 = (try (try wb2.sheet(0)).cellByRef("B1")).?;
+    try std.testing.expectEqualStrings("99.5", b1.raw_value.?);
+}
