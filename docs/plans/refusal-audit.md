@@ -7,10 +7,12 @@
 
 ## Status
 
-iter-er-5 audit complete (2026-05-05). 5 axes ready to lift — each
-gets its own PR; per-axis parity tests prove the lift doesn't
-regress refused-shape detection. 4 axes stay refused (no rewriter
-exists; lifting silently corrupts).
+iter-er-5 audit complete (2026-05-05); all 5 lifts shipped (final
+`SheetDeleteWithDefinedNamesNotSupported` lift on 2026-05-08 — the
+`delete_sheet` rewriter variant from `feat(formula+workbook):
+delete_sheet rewriter variant — final iter-er-5 lift unlock`
+landed first). 4 axes stay refused (no rewriter exists; lifting
+silently corrupts).
 
 ## Methodology
 

@@ -719,14 +719,11 @@ pub const Editor = struct {
             return error.SheetDeleteRequiresCleanState;
         }
 
-        // Conservative guard: refuse SOURCE-sheet deletes when the
-        // workbook has any `<definedName>` entries.
-        {
-            const wb_check = try self.readEntry("xl/workbook.xml");
-            defer self.allocator.free(wb_check);
-            if (std.mem.indexOf(u8, wb_check, "<definedName") != null)
-                return error.SheetDeleteWithDefinedNamesNotSupported;
-        }
+        // iter-er-5 (5/5) lift: the `<definedName>` guard is gone.
+        // `Workbook.deleteSheet` runs the four cross-sheet rewriters
+        // (defined-names, formulas, hyperlinks, DV/CF) with the
+        // `delete_sheet` edit variant — refs targeting the deleted
+        // sheet become `#REF!`, refs to surviving sheets stay intact.
 
         // B2 iter-er-4 (2/N): full migration to Workbook.deleteSheet.
         // workbook.xml + workbook.xml.rels + Content_Types are

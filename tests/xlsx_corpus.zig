@@ -483,7 +483,6 @@ test "corpus surface: iter28-34 reader APIs round-trip on real fixtures" {
 //     (sheet has drawings, autoFilter, tableParts, frozen panes …)
 //   - error.RowEditExceedsMaxRow, error.ColEditExceedsMaxCol
 //   - error.RowEditRequiresCleanSheet
-//   - error.SheetDeleteWithDefinedNamesNotSupported
 //   - error.SheetDeleteRequiresCleanState
 //   - error.CannotDeleteLastSheet, error.LastSheetUndeletable
 //   - error.SheetHasUnsavedAppends, error.SheetHasUnsavedMutations
@@ -532,7 +531,6 @@ fn isRefusalSkip(err: anyerror) bool {
         error.RowEditRequiresCleanSheet,
         error.RowEditExceedsMaxRow,
         error.ColEditExceedsMaxCol,
-        error.SheetDeleteWithDefinedNamesNotSupported,
         error.SheetDeleteRequiresCleanState,
         error.CannotDeleteLastSheet,
         error.LastSheetUndeletable,
