@@ -455,3 +455,757 @@ test "corpus surface: iter28-34 reader APIs round-trip on real fixtures" {
         }
     }
 }
+
+// ─── iter-er-7 task A: corpus parity sweep across editor mutation axes ───
+//
+// `Editor.save` was rewritten in PR #84 (`refactor/editor-er-6-thin-shim`)
+// to delegate to `Workbook.save` / `PartStore.save`. The unit tests cover
+// representative inputs; this sweep walks every committed corpus fixture
+// through every supported mutation axis and asserts reader-shape parity
+// (NOT byte-identity — the new layout differs from the legacy
+// raw-rebuild path).
+//
+// Axes:
+//   1. setCell           (one cell mutation per sheet)
+//   2. appendRows        (append a single row of mixed cell types)
+//   3. addSheet          (add a sheet with a unique name + 1 row)
+//   4. deleteSheet       (delete the LAST sheet only — never sheet 0,
+//                         never on a single-sheet fixture)
+//   5. renameSheet       (rename sheet 0 to a unique-suffixed name)
+//   6. insertRow         (insert at row 1)
+//   7. deleteRow         (delete row 1)
+//   8. insertColumn      (insert at col 1)
+//   9. deleteColumn      (delete col 1)
+//
+// Refusal tolerance — these come from `docs/plans/refusal-audit.md` and
+// are model-level invariants, not regressions. Each axis logs+skips on:
+//   - error.RowEditUnsafeForSheet, error.ColEditUnsafeForSheet
+//     (sheet has drawings, autoFilter, tableParts, frozen panes …)
+//   - error.RowEditExceedsMaxRow, error.ColEditExceedsMaxCol
+//   - error.RowEditRequiresCleanSheet
+//   - error.SheetDeleteWithDefinedNamesNotSupported
+//   - error.SheetDeleteRequiresCleanState
+//   - error.CannotDeleteLastSheet, error.LastSheetUndeletable
+//   - error.SheetHasUnsavedAppends, error.SheetHasUnsavedMutations
+//   - error.InvalidCellRef (insertRow/deleteRow on completely empty sheets)
+// Anything else is a real failure.
+
+const corpus_fixtures = [_][]const u8{
+    "frictionless_2sheets.xlsx",
+    "openpyxl_guess_types.xlsx",
+    "phpoi_test1.xlsx",
+    "worldbank_catalog.xlsx",
+};
+
+const TmpFs = struct {
+    dir: std.testing.TmpDir,
+    pub fn init() TmpFs {
+        return .{ .dir = std.testing.tmpDir(.{}) };
+    }
+    pub fn deinit(self: *TmpFs) void {
+        self.dir.cleanup();
+    }
+    pub fn path(self: *TmpFs, alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
+        const d = try self.dir.dir.realpathAlloc(alloc, ".");
+        defer alloc.free(d);
+        return std.fs.path.joinZ(alloc, &.{ d, name });
+    }
+};
+
+fn corpusPath(alloc: std.mem.Allocator, fixture: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}{s}", .{ corpus_dir, fixture });
+}
+
+fn fixtureExists(fixture: []const u8) bool {
+    var path_buf: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}{s}", .{ corpus_dir, fixture }) catch return false;
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
+}
+
+/// True iff `err` is a documented refusal we should log+skip for the
+/// fixture/axis pair. Anything else propagates so the test fails.
+fn isRefusalSkip(err: anyerror) bool {
+    return switch (err) {
+        error.RowEditUnsafeForSheet,
+        error.ColEditUnsafeForSheet,
+        error.RowEditRequiresCleanSheet,
+        error.RowEditExceedsMaxRow,
+        error.ColEditExceedsMaxCol,
+        error.SheetDeleteWithDefinedNamesNotSupported,
+        error.SheetDeleteRequiresCleanState,
+        error.CannotDeleteLastSheet,
+        error.LastSheetUndeletable,
+        error.SheetHasUnsavedAppends,
+        error.SheetHasUnsavedMutations,
+        error.DuplicateSheetName,
+        error.InvalidCellRef,
+        => true,
+        else => false,
+    };
+}
+
+/// True iff `err` is an `Editor.open`-time ZIP-shape refusal. These
+/// fixtures can't be loaded by `Editor` at all (separate contract from
+/// the per-axis refusals tracked in `isRefusalSkip`). Skip the fixture
+/// for ALL axes when this fires.
+fn isOpenSkip(err: anyerror) bool {
+    return switch (err) {
+        error.ZipDataDescriptorNotSupported,
+        error.ZipEncryptedNotSupported,
+        error.Zip64NotSupported,
+        error.ZipSplitNotSupported,
+        error.ZipTooLarge,
+        => true,
+        else => false,
+    };
+}
+
+/// Walk every sheet of `book` row-by-row; surfaces malformed-XML /
+/// reader-shape regressions that the matrix path would mask.
+fn walkAllSheets(book: *xlsx.Book, alloc: std.mem.Allocator) !void {
+    for (book.sheets) |sheet| {
+        var rows = try book.rows(sheet, alloc);
+        defer rows.deinit();
+        while (try rows.next()) |_| {}
+    }
+}
+
+/// Count rows of `sheet` — used to assert pre/post deltas where the
+/// axis predicts an exact change.
+fn countRowsOf(book: *xlsx.Book, sheet: xlsx.Sheet, alloc: std.mem.Allocator) !usize {
+    var rows = try book.rows(sheet, alloc);
+    defer rows.deinit();
+    var n: usize = 0;
+    while (try rows.next()) |_| : (n += 1) {}
+    return n;
+}
+
+/// Search every row of `sheet` for a cell whose `.string` matches
+/// `needle`. Returns true on first hit. Used by setCell / appendRows /
+/// addSheet / renameSheet to confirm the mutation reached the wire.
+fn sheetContainsString(
+    book: *xlsx.Book,
+    sheet: xlsx.Sheet,
+    alloc: std.mem.Allocator,
+    needle: []const u8,
+) !bool {
+    var rows = try book.rows(sheet, alloc);
+    defer rows.deinit();
+    while (try rows.next()) |row| {
+        for (row) |cell| switch (cell) {
+            .string => |s| if (std.mem.eql(u8, s, needle)) return true,
+            else => {},
+        };
+    }
+    return false;
+}
+
+test "corpus parity: setCell on every fixture round-trips through reader" {
+    const alloc = std.testing.allocator;
+    var any_run: usize = 0;
+    for (corpus_fixtures) |fixture| {
+        if (!fixtureExists(fixture)) {
+            std.debug.print("\n  [skip] {s} not in corpus\n", .{fixture});
+            continue;
+        }
+        var tt = TmpFs.init();
+        defer tt.deinit();
+        const src = try corpusPath(alloc, fixture);
+        defer alloc.free(src);
+        const dst = try tt.path(alloc, "out.xlsx");
+        defer alloc.free(dst);
+
+        // setCell on row 1 col 0 of EVERY sheet — uses a unique sentinel
+        // string per sheet so we can grep it back through the reader.
+        const sentinel = "ZLSX_SETCELL_E7A_SENTINEL";
+        var skip_fixture = false;
+        open_block: {
+            var ed = zlsx_pkg.Editor.open(alloc, src) catch |err| {
+                if (isOpenSkip(err)) {
+                    std.debug.print(
+                        "\n  [skip open] {s}: {s}\n",
+                        .{ fixture, @errorName(err) },
+                    );
+                    skip_fixture = true;
+                    break :open_block;
+                }
+                return err;
+            };
+            defer ed.deinit();
+            const sheet_count: u32 = @intCast(ed.workbook.sheetCount());
+            var i: u32 = 0;
+            while (i < sheet_count) : (i += 1) {
+                ed.setCell(i, 1, 0, .{ .string = sentinel }) catch |err| {
+                    if (isRefusalSkip(err)) {
+                        std.debug.print(
+                            "\n  [refuse-skip setCell] {s} sheet#{d}: {s}\n",
+                            .{ fixture, i, @errorName(err) },
+                        );
+                        continue;
+                    }
+                    return err;
+                };
+            }
+            try ed.save(dst);
+        }
+        if (skip_fixture) continue;
+
+        var book = try xlsx.Book.open(alloc, dst);
+        defer book.deinit();
+        try walkAllSheets(&book, alloc);
+        // Every sheet that accepted the setCell must surface the
+        // sentinel; sheets that refused (above, via continue) won't.
+        // Detecting "at least one hit" is enough for parity — we
+        // already gated per-sheet errors above.
+        var any_hit = false;
+        for (book.sheets) |sheet| {
+            if (try sheetContainsString(&book, sheet, alloc, sentinel)) {
+                any_hit = true;
+                break;
+            }
+        }
+        try std.testing.expect(any_hit);
+        any_run += 1;
+    }
+    if (any_run == 0) return error.SkipZigTest;
+}
+
+test "corpus parity: appendRows on every fixture round-trips through reader" {
+    const alloc = std.testing.allocator;
+    var any_run: usize = 0;
+    for (corpus_fixtures) |fixture| {
+        if (!fixtureExists(fixture)) {
+            std.debug.print("\n  [skip] {s} not in corpus\n", .{fixture});
+            continue;
+        }
+        var tt = TmpFs.init();
+        defer tt.deinit();
+        const src = try corpusPath(alloc, fixture);
+        defer alloc.free(src);
+        const dst = try tt.path(alloc, "out.xlsx");
+        defer alloc.free(dst);
+
+        const sentinel = "ZLSX_APPEND_E7A_SENTINEL";
+        const append_row = [_]xlsx.Cell{
+            .{ .string = sentinel },
+            .{ .integer = 12345 },
+            .{ .number = 6.5 },
+            .{ .boolean = true },
+        };
+        const rows_to_append = [_][]const xlsx.Cell{&append_row};
+
+        var per_sheet_ok = std.AutoHashMap(u32, void).init(alloc);
+        defer per_sheet_ok.deinit();
+
+        var skip_fixture = false;
+        open_block: {
+            var ed = zlsx_pkg.Editor.open(alloc, src) catch |err| {
+                if (isOpenSkip(err)) {
+                    std.debug.print(
+                        "\n  [skip open] {s}: {s}\n",
+                        .{ fixture, @errorName(err) },
+                    );
+                    skip_fixture = true;
+                    break :open_block;
+                }
+                return err;
+            };
+            defer ed.deinit();
+            const sheet_count: u32 = @intCast(ed.workbook.sheetCount());
+            var i: u32 = 0;
+            while (i < sheet_count) : (i += 1) {
+                ed.appendRows(i, &rows_to_append) catch |err| {
+                    if (isRefusalSkip(err)) {
+                        std.debug.print(
+                            "\n  [refuse-skip appendRows] {s} sheet#{d}: {s}\n",
+                            .{ fixture, i, @errorName(err) },
+                        );
+                        continue;
+                    }
+                    return err;
+                };
+                try per_sheet_ok.put(i, {});
+            }
+            try ed.save(dst);
+        }
+        if (skip_fixture) continue;
+
+        var book = try xlsx.Book.open(alloc, dst);
+        defer book.deinit();
+        try walkAllSheets(&book, alloc);
+
+        // For each sheet that accepted the append, the sentinel must
+        // be present somewhere in that sheet's body.
+        var it = per_sheet_ok.keyIterator();
+        while (it.next()) |idx_ptr| {
+            const idx = idx_ptr.*;
+            try std.testing.expect(idx < book.sheets.len);
+            const sheet = book.sheets[idx];
+            try std.testing.expect(try sheetContainsString(&book, sheet, alloc, sentinel));
+        }
+        any_run += 1;
+    }
+    if (any_run == 0) return error.SkipZigTest;
+}
+
+test "corpus parity: addSheet on every fixture round-trips through reader" {
+    const alloc = std.testing.allocator;
+    var any_run: usize = 0;
+    for (corpus_fixtures) |fixture| {
+        if (!fixtureExists(fixture)) {
+            std.debug.print("\n  [skip] {s} not in corpus\n", .{fixture});
+            continue;
+        }
+        var tt = TmpFs.init();
+        defer tt.deinit();
+        const src = try corpusPath(alloc, fixture);
+        defer alloc.free(src);
+        const dst = try tt.path(alloc, "out.xlsx");
+        defer alloc.free(dst);
+
+        const new_name = "ZlsxE7A_Added";
+        const sentinel = "ZLSX_ADDSHEET_E7A_SENTINEL";
+        const original_sheet_count = blk: {
+            var b = try xlsx.Book.open(alloc, src);
+            defer b.deinit();
+            break :blk b.sheets.len;
+        };
+
+        var skip_fixture = false;
+        open_block: {
+            var ed = zlsx_pkg.Editor.open(alloc, src) catch |err| {
+                if (isOpenSkip(err)) {
+                    std.debug.print(
+                        "\n  [skip open] {s}: {s}\n",
+                        .{ fixture, @errorName(err) },
+                    );
+                    skip_fixture = true;
+                    break :open_block;
+                }
+                return err;
+            };
+            defer ed.deinit();
+            const new_idx = ed.addSheet(new_name) catch |err| {
+                if (isRefusalSkip(err)) {
+                    std.debug.print(
+                        "\n  [refuse-skip addSheet] {s}: {s}\n",
+                        .{ fixture, @errorName(err) },
+                    );
+                    continue;
+                }
+                return err;
+            };
+            // Write one row through the workbook fast-path. This goes
+            // through `Worksheet.appendRows` for added sheets too
+            // (post iter-er-4) — no separate code path.
+            const append_row = [_]xlsx.Cell{
+                .{ .string = sentinel },
+                .{ .integer = 1 },
+            };
+            const rows_to_append = [_][]const xlsx.Cell{&append_row};
+            try ed.appendRows(new_idx, &rows_to_append);
+            try ed.save(dst);
+        }
+        if (skip_fixture) continue;
+
+        var book = try xlsx.Book.open(alloc, dst);
+        defer book.deinit();
+        try walkAllSheets(&book, alloc);
+        try std.testing.expectEqual(original_sheet_count + 1, book.sheets.len);
+        const added = book.sheetByName(new_name) orelse return error.AddedSheetMissing;
+        try std.testing.expect(try sheetContainsString(&book, added, alloc, sentinel));
+        any_run += 1;
+    }
+    if (any_run == 0) return error.SkipZigTest;
+}
+
+test "corpus parity: deleteSheet (last sheet) on multi-sheet fixtures" {
+    const alloc = std.testing.allocator;
+    var any_run: usize = 0;
+    var any_attempted: usize = 0;
+    for (corpus_fixtures) |fixture| {
+        if (!fixtureExists(fixture)) {
+            std.debug.print("\n  [skip] {s} not in corpus\n", .{fixture});
+            continue;
+        }
+        var tt = TmpFs.init();
+        defer tt.deinit();
+        const src = try corpusPath(alloc, fixture);
+        defer alloc.free(src);
+        const dst = try tt.path(alloc, "out.xlsx");
+        defer alloc.free(dst);
+
+        // Probe sheet count + capture last sheet's name BEFORE the
+        // delete so we can verify it's gone post-save.
+        const probe = blk: {
+            var b = try xlsx.Book.open(alloc, src);
+            defer b.deinit();
+            const last_idx = b.sheets.len - 1;
+            const last_name = try alloc.dupe(u8, b.sheets[last_idx].name);
+            break :blk .{
+                .count = b.sheets.len,
+                .last_idx = @as(u32, @intCast(last_idx)),
+                .last_name = last_name,
+            };
+        };
+        defer alloc.free(probe.last_name);
+
+        if (probe.count <= 1) {
+            // Single-sheet fixtures — never delete the only sheet
+            // (per task constraints + LastSheetUndeletable invariant).
+            std.debug.print(
+                "\n  [skip deleteSheet] {s}: single-sheet fixture\n",
+                .{fixture},
+            );
+            continue;
+        }
+
+        any_attempted += 1;
+        var skip_fixture = false;
+        open_block: {
+            var ed = zlsx_pkg.Editor.open(alloc, src) catch |err| {
+                if (isOpenSkip(err)) {
+                    std.debug.print(
+                        "\n  [skip open] {s}: {s}\n",
+                        .{ fixture, @errorName(err) },
+                    );
+                    skip_fixture = true;
+                    break :open_block;
+                }
+                return err;
+            };
+            defer ed.deinit();
+            ed.deleteSheet(probe.last_idx) catch |err| {
+                if (isRefusalSkip(err)) {
+                    std.debug.print(
+                        "\n  [refuse-skip deleteSheet] {s} idx={d}: {s}\n",
+                        .{ fixture, probe.last_idx, @errorName(err) },
+                    );
+                    continue;
+                }
+                return err;
+            };
+            try ed.save(dst);
+        }
+        if (skip_fixture) continue;
+
+        var book = try xlsx.Book.open(alloc, dst);
+        defer book.deinit();
+        try walkAllSheets(&book, alloc);
+        try std.testing.expectEqual(probe.count - 1, book.sheets.len);
+        // The deleted sheet's name must no longer resolve.
+        try std.testing.expect(book.sheetByName(probe.last_name) == null);
+        any_run += 1;
+    }
+    if (any_attempted == 0) return error.SkipZigTest;
+}
+
+test "corpus parity: renameSheet on every fixture round-trips through reader" {
+    const alloc = std.testing.allocator;
+    var any_run: usize = 0;
+    for (corpus_fixtures) |fixture| {
+        if (!fixtureExists(fixture)) {
+            std.debug.print("\n  [skip] {s} not in corpus\n", .{fixture});
+            continue;
+        }
+        var tt = TmpFs.init();
+        defer tt.deinit();
+        const src = try corpusPath(alloc, fixture);
+        defer alloc.free(src);
+        const dst = try tt.path(alloc, "out.xlsx");
+        defer alloc.free(dst);
+
+        // Capture sheet 0's original name + its first row's first
+        // string-or-numeric cell (the latter is just "are we still
+        // reading the same data shape?").
+        const original_name = blk: {
+            var b = try xlsx.Book.open(alloc, src);
+            defer b.deinit();
+            break :blk try alloc.dupe(u8, b.sheets[0].name);
+        };
+        defer alloc.free(original_name);
+
+        const new_name = "ZlsxE7A_Renamed_Sheet0";
+        var skip_fixture = false;
+        open_block: {
+            var ed = zlsx_pkg.Editor.open(alloc, src) catch |err| {
+                if (isOpenSkip(err)) {
+                    std.debug.print(
+                        "\n  [skip open] {s}: {s}\n",
+                        .{ fixture, @errorName(err) },
+                    );
+                    skip_fixture = true;
+                    break :open_block;
+                }
+                return err;
+            };
+            defer ed.deinit();
+            ed.renameSheet(0, new_name) catch |err| {
+                if (isRefusalSkip(err)) {
+                    std.debug.print(
+                        "\n  [refuse-skip renameSheet] {s}: {s}\n",
+                        .{ fixture, @errorName(err) },
+                    );
+                    continue;
+                }
+                return err;
+            };
+            try ed.save(dst);
+        }
+        if (skip_fixture) continue;
+
+        var book = try xlsx.Book.open(alloc, dst);
+        defer book.deinit();
+        try walkAllSheets(&book, alloc);
+        try std.testing.expectEqualStrings(new_name, book.sheets[0].name);
+        // The old name must no longer resolve unless another sheet
+        // shared it (none of the corpus fixtures do, but keep the
+        // assertion soft if equality drifts).
+        if (!std.mem.eql(u8, original_name, new_name)) {
+            try std.testing.expect(book.sheetByName(original_name) == null);
+        }
+        any_run += 1;
+    }
+    if (any_run == 0) return error.SkipZigTest;
+}
+
+test "corpus parity: insertRow on every fixture round-trips through reader" {
+    const alloc = std.testing.allocator;
+    var any_attempted: usize = 0;
+    for (corpus_fixtures) |fixture| {
+        if (!fixtureExists(fixture)) {
+            std.debug.print("\n  [skip] {s} not in corpus\n", .{fixture});
+            continue;
+        }
+        var tt = TmpFs.init();
+        defer tt.deinit();
+        const src = try corpusPath(alloc, fixture);
+        defer alloc.free(src);
+        const dst = try tt.path(alloc, "out.xlsx");
+        defer alloc.free(dst);
+
+        const pre_count = blk: {
+            var b = try xlsx.Book.open(alloc, src);
+            defer b.deinit();
+            // Sheet 0 row count for the post-save assertion.
+            break :blk try countRowsOf(&b, b.sheets[0], alloc);
+        };
+
+        any_attempted += 1;
+        var skip_fixture = false;
+        open_block: {
+            var ed = zlsx_pkg.Editor.open(alloc, src) catch |err| {
+                if (isOpenSkip(err)) {
+                    std.debug.print(
+                        "\n  [skip open] {s}: {s}\n",
+                        .{ fixture, @errorName(err) },
+                    );
+                    skip_fixture = true;
+                    break :open_block;
+                }
+                return err;
+            };
+            defer ed.deinit();
+            ed.insertRow(0, 1) catch |err| {
+                if (isRefusalSkip(err)) {
+                    std.debug.print(
+                        "\n  [refuse-skip insertRow] {s}: {s}\n",
+                        .{ fixture, @errorName(err) },
+                    );
+                    continue;
+                }
+                return err;
+            };
+            try ed.save(dst);
+        }
+        if (skip_fixture) continue;
+
+        var book = try xlsx.Book.open(alloc, dst);
+        defer book.deinit();
+        try walkAllSheets(&book, alloc);
+        // Inserted row at row 1 has no <row> element — readable row
+        // count is unchanged in the typical case. Allow ±1 slack so
+        // fixtures whose insert path materialises a placeholder
+        // <row> (today: none in the corpus, but allow drift) still
+        // pass shape-parity.
+        const post_count = try countRowsOf(&book, book.sheets[0], alloc);
+        try std.testing.expect(post_count >= pre_count and post_count <= pre_count + 1);
+    }
+    if (any_attempted == 0) return error.SkipZigTest;
+}
+
+test "corpus parity: deleteRow on every fixture round-trips through reader" {
+    const alloc = std.testing.allocator;
+    var any_attempted: usize = 0;
+    for (corpus_fixtures) |fixture| {
+        if (!fixtureExists(fixture)) {
+            std.debug.print("\n  [skip] {s} not in corpus\n", .{fixture});
+            continue;
+        }
+        var tt = TmpFs.init();
+        defer tt.deinit();
+        const src = try corpusPath(alloc, fixture);
+        defer alloc.free(src);
+        const dst = try tt.path(alloc, "out.xlsx");
+        defer alloc.free(dst);
+
+        const pre_count = blk: {
+            var b = try xlsx.Book.open(alloc, src);
+            defer b.deinit();
+            break :blk try countRowsOf(&b, b.sheets[0], alloc);
+        };
+
+        any_attempted += 1;
+        var accepted = false;
+        var skip_fixture = false;
+        open_block: {
+            var ed = zlsx_pkg.Editor.open(alloc, src) catch |err| {
+                if (isOpenSkip(err)) {
+                    std.debug.print(
+                        "\n  [skip open] {s}: {s}\n",
+                        .{ fixture, @errorName(err) },
+                    );
+                    skip_fixture = true;
+                    break :open_block;
+                }
+                return err;
+            };
+            defer ed.deinit();
+            ed.deleteRow(0, 1) catch |err| {
+                if (isRefusalSkip(err)) {
+                    std.debug.print(
+                        "\n  [refuse-skip deleteRow] {s}: {s}\n",
+                        .{ fixture, @errorName(err) },
+                    );
+                    continue;
+                }
+                return err;
+            };
+            try ed.save(dst);
+            accepted = true;
+        }
+        if (skip_fixture) continue;
+        if (!accepted) continue;
+
+        var book = try xlsx.Book.open(alloc, dst);
+        defer book.deinit();
+        try walkAllSheets(&book, alloc);
+        const post_count = try countRowsOf(&book, book.sheets[0], alloc);
+        // Deleting a populated row drops one entry from the iterator
+        // (the row has cells; not just a style-only `<row r="N"/>`).
+        // Allow ±1 slack to absorb fixtures whose row 1 happens to be
+        // empty (no <row> element) — deleteRow on those is a no-op
+        // shape-wise but still legal.
+        try std.testing.expect(post_count == pre_count or post_count + 1 == pre_count);
+    }
+    if (any_attempted == 0) return error.SkipZigTest;
+}
+
+test "corpus parity: insertColumn on every fixture round-trips through reader" {
+    const alloc = std.testing.allocator;
+    var any_attempted: usize = 0;
+    for (corpus_fixtures) |fixture| {
+        if (!fixtureExists(fixture)) {
+            std.debug.print("\n  [skip] {s} not in corpus\n", .{fixture});
+            continue;
+        }
+        var tt = TmpFs.init();
+        defer tt.deinit();
+        const src = try corpusPath(alloc, fixture);
+        defer alloc.free(src);
+        const dst = try tt.path(alloc, "out.xlsx");
+        defer alloc.free(dst);
+
+        any_attempted += 1;
+        var accepted = false;
+        var skip_fixture = false;
+        open_block: {
+            var ed = zlsx_pkg.Editor.open(alloc, src) catch |err| {
+                if (isOpenSkip(err)) {
+                    std.debug.print(
+                        "\n  [skip open] {s}: {s}\n",
+                        .{ fixture, @errorName(err) },
+                    );
+                    skip_fixture = true;
+                    break :open_block;
+                }
+                return err;
+            };
+            defer ed.deinit();
+            ed.insertColumn(0, 1) catch |err| {
+                if (isRefusalSkip(err)) {
+                    std.debug.print(
+                        "\n  [refuse-skip insertColumn] {s}: {s}\n",
+                        .{ fixture, @errorName(err) },
+                    );
+                    continue;
+                }
+                return err;
+            };
+            try ed.save(dst);
+            accepted = true;
+        }
+        if (skip_fixture) continue;
+        if (!accepted) continue;
+
+        var book = try xlsx.Book.open(alloc, dst);
+        defer book.deinit();
+        try walkAllSheets(&book, alloc);
+    }
+    if (any_attempted == 0) return error.SkipZigTest;
+}
+
+test "corpus parity: deleteColumn on every fixture round-trips through reader" {
+    const alloc = std.testing.allocator;
+    var any_attempted: usize = 0;
+    for (corpus_fixtures) |fixture| {
+        if (!fixtureExists(fixture)) {
+            std.debug.print("\n  [skip] {s} not in corpus\n", .{fixture});
+            continue;
+        }
+        var tt = TmpFs.init();
+        defer tt.deinit();
+        const src = try corpusPath(alloc, fixture);
+        defer alloc.free(src);
+        const dst = try tt.path(alloc, "out.xlsx");
+        defer alloc.free(dst);
+
+        any_attempted += 1;
+        var accepted = false;
+        var skip_fixture = false;
+        open_block: {
+            var ed = zlsx_pkg.Editor.open(alloc, src) catch |err| {
+                if (isOpenSkip(err)) {
+                    std.debug.print(
+                        "\n  [skip open] {s}: {s}\n",
+                        .{ fixture, @errorName(err) },
+                    );
+                    skip_fixture = true;
+                    break :open_block;
+                }
+                return err;
+            };
+            defer ed.deinit();
+            ed.deleteColumn(0, 1) catch |err| {
+                if (isRefusalSkip(err)) {
+                    std.debug.print(
+                        "\n  [refuse-skip deleteColumn] {s}: {s}\n",
+                        .{ fixture, @errorName(err) },
+                    );
+                    continue;
+                }
+                return err;
+            };
+            try ed.save(dst);
+            accepted = true;
+        }
+        if (skip_fixture) continue;
+        if (!accepted) continue;
+
+        var book = try xlsx.Book.open(alloc, dst);
+        defer book.deinit();
+        try walkAllSheets(&book, alloc);
+    }
+    if (any_attempted == 0) return error.SkipZigTest;
+}
