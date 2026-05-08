@@ -155,6 +155,13 @@ pub const Error = error{
     /// limit (memory-bounded) but the typed-overlay's u32
     /// indexing does.
     TooManySheets,
+    /// `Worksheet.emitWithAppendsUsingPlan` was given a string cell
+    /// whose payload was not registered in the SST extension plan.
+    /// Surfaces only on a `Workbook.save` bookkeeping bug — the plan
+    /// builder walks every sheet's `appended_rows` and `deltas`, so
+    /// reaching this error means a string was added between plan-
+    /// build and emit.
+    SharedStringNotInPlan,
     WriteFailed,
 } || workbook_xml_mod.Error || sheet_xml_mod.ParseError || sst_xml_mod.Error || styles_xml_mod.Error || store_mod.Error ||
     zlsx.formula_rewriter.Error ||
@@ -612,6 +619,23 @@ pub const Workbook = struct {
         }
 
         for (self.worksheets) |*ws| {
+            // Per-sheet, deltas and appended_rows are mutually
+            // exclusive (refused at staging time). Handle whichever
+            // is non-empty; skip clean sheets entirely.
+            if (ws.appended_rows.items.len > 0) {
+                assert(ws.deltas.count() == 0);
+                const part_name = try ws.resolvePartName();
+                const new_xml = try ws.emitWithAppendsUsingPlan(self.allocator, &sst_plan);
+                defer self.allocator.free(new_xml);
+                try self.store.replacePart(part_name, new_xml);
+                ws.clearAppendedRows(self.allocator);
+                if (ws.parsed) |*p| {
+                    var stale = p.*;
+                    stale.deinit(self.allocator);
+                    ws.parsed = null;
+                }
+                continue;
+            }
             if (ws.deltas.count() == 0) continue;
             _ = try ws.ensureParsed();
             const part_name = ws.resolved_part_name.?;
@@ -2944,6 +2968,54 @@ const SstExtensionPlan = struct {
 /// the existing SST (when present) and against each other, and stage
 /// the resulting unique-new-strings list into a plan. The plan owns
 /// duplicates of every staged string; callers free via `plan.deinit`.
+/// Register a string `s` into `plan.new_strings` if it matches no
+/// existing SST entry and isn't already staged. Owns the dupe.
+fn registerSharedString(
+    wb: *Workbook,
+    plan: *SstExtensionPlan,
+    s: []const u8,
+    decoded_existing: []const []const u8,
+) Error!void {
+    for (decoded_existing) |de| {
+        if (std.mem.eql(u8, de, s)) return;
+    }
+    for (plan.new_strings.items) |existing| {
+        if (std.mem.eql(u8, existing, s)) return;
+    }
+    const owned = try wb.allocator.dupe(u8, s);
+    errdefer wb.allocator.free(owned);
+    try plan.new_strings.append(wb.allocator, owned);
+}
+
+/// Append an existing-match record for string `s` if an existing SST
+/// entry decodes to it and we haven't already recorded it. Owns the
+/// dupe. Skips strings staged into `plan.new_strings` (those resolve
+/// via the new-strings index, not the side table).
+fn registerExistingMatch(
+    wb: *Workbook,
+    plan: *SstExtensionPlan,
+    s: []const u8,
+    decoded_existing: []const []const u8,
+) Error!void {
+    for (plan.new_strings.items) |n| {
+        if (std.mem.eql(u8, n, s)) return;
+    }
+    for (plan.existing_matches.items) |em| {
+        if (std.mem.eql(u8, em.text, s)) return;
+    }
+    var found_idx: u32 = std.math.maxInt(u32);
+    for (decoded_existing, 0..) |de, i| {
+        if (std.mem.eql(u8, de, s)) {
+            found_idx = @intCast(i);
+            break;
+        }
+    }
+    if (found_idx == std.math.maxInt(u32)) return;
+    const owned = try wb.allocator.dupe(u8, s);
+    errdefer wb.allocator.free(owned);
+    try plan.existing_matches.append(wb.allocator, .{ .text = owned, .index = found_idx });
+}
+
 fn buildSstExtensionPlan(wb: *Workbook) Error!SstExtensionPlan {
     assert(@intFromPtr(wb) != 0);
     assert(@intFromPtr(wb.allocator.vtable) != 0);
@@ -2951,9 +3023,10 @@ fn buildSstExtensionPlan(wb: *Workbook) Error!SstExtensionPlan {
     var plan: SstExtensionPlan = .{};
     errdefer plan.deinit(wb.allocator);
 
-    // Quick scan: any `.shared_string` at all? Skips any work — and
-    // crucially, skips parsing the SST — when the workbook has no
-    // shared-string deltas pending.
+    // Quick scan: any shared-string payload (delta `.shared_string`
+    // OR appended-row `.string`)? Skips any work — and crucially,
+    // skips parsing the SST — when the workbook has no string
+    // mutations pending across either axis.
     var any: bool = false;
     for (wb.worksheets) |*ws| {
         var it = ws.deltas.valueIterator();
@@ -2964,6 +3037,17 @@ fn buildSstExtensionPlan(wb: *Workbook) Error!SstExtensionPlan {
             },
             else => {},
         };
+        if (any) break;
+        for (ws.appended_rows.items) |row| {
+            for (row) |c| switch (c) {
+                .string => {
+                    any = true;
+                    break;
+                },
+                else => {},
+            };
+            if (any) break;
+        }
         if (any) break;
     }
     if (!any) return plan;
@@ -3001,40 +3085,26 @@ fn buildSstExtensionPlan(wb: *Workbook) Error!SstExtensionPlan {
         }
     }
 
-    // Walk deltas in worksheet order, then in iteration order. Order
-    // is observable to test assertions, so document: "first occurrence
-    // across (worksheet 0..N, iteration order) wins the lower index".
+    // Walk strings in worksheet order: first deltas (iteration
+    // order), then appended_rows (row-major / col-major). Order is
+    // observable to test assertions: "first occurrence across the
+    // unified walk wins the lower index". Per-sheet, deltas and
+    // appends are mutually exclusive (refused at staging time), but
+    // we order deltas-before-appends regardless for determinism.
     for (wb.worksheets) |*ws| {
-        var it = ws.deltas.valueIterator();
-        while (it.next()) |v| {
+        var dit = ws.deltas.valueIterator();
+        while (dit.next()) |v| {
             const s = switch (v.*) {
                 .shared_string => |t| t,
                 else => continue,
             };
-
-            // De-dup against existing SST entries (decoded).
-            var matched_existing: bool = false;
-            for (decoded_existing) |de| {
-                if (std.mem.eql(u8, de, s)) {
-                    matched_existing = true;
-                    break;
-                }
-            }
-            if (matched_existing) continue;
-
-            // De-dup against already-staged new strings.
-            var dup_in_plan: bool = false;
-            for (plan.new_strings.items) |existing| {
-                if (std.mem.eql(u8, existing, s)) {
-                    dup_in_plan = true;
-                    break;
-                }
-            }
-            if (dup_in_plan) continue;
-
-            const owned = try wb.allocator.dupe(u8, s);
-            errdefer wb.allocator.free(owned);
-            try plan.new_strings.append(wb.allocator, owned);
+            try registerSharedString(wb, &plan, s, decoded_existing);
+        }
+        for (ws.appended_rows.items) |row| {
+            for (row) |c| switch (c) {
+                .string => |s| try registerSharedString(wb, &plan, s, decoded_existing),
+                else => {},
+            };
         }
     }
 
@@ -3062,13 +3132,13 @@ fn buildSstExtensionPlan(wb: *Workbook) Error!SstExtensionPlan {
     // case where a freshly-staged shared_string matches an existing
     // SST entry, we still want a valid emit path.
 
-    // Fast path A: no new strings. Every delta matched an existing
-    // SST entry — we skip regeneration. To keep emit correct, emit
-    // a separate index lookup via a side-table keyed by raw user
-    // text → existing index.
-    if (!plan.has_new_strings and existing_view != null) {
-        // Build the existing-match side table now.
-        const view = existing_view.?;
+    // Build the existing-match side table for any string (delta or
+    // appended) whose text equals an existing SST entry. Both fast
+    // paths (A: no new strings; B: some new strings) need this so
+    // `plan.indexOf(s)` resolves to the existing index, not a fresh
+    // one. `registerExistingMatch` skips strings that landed in
+    // `plan.new_strings`.
+    if (existing_view != null) {
         for (wb.worksheets) |*ws| {
             var it = ws.deltas.valueIterator();
             while (it.next()) |v| {
@@ -3076,77 +3146,13 @@ fn buildSstExtensionPlan(wb: *Workbook) Error!SstExtensionPlan {
                     .shared_string => |t| t,
                     else => continue,
                 };
-                // Already handled? linear scan keeps things simple.
-                var already: bool = false;
-                for (plan.existing_matches.items) |em| {
-                    if (std.mem.eql(u8, em.text, s)) {
-                        already = true;
-                        break;
-                    }
-                }
-                if (already) continue;
-                // Find the matching existing index.
-                var found_idx: u32 = std.math.maxInt(u32);
-                for (decoded_existing, 0..) |de, i| {
-                    if (std.mem.eql(u8, de, s)) {
-                        found_idx = @intCast(i);
-                        break;
-                    }
-                }
-                assert(found_idx != std.math.maxInt(u32));
-                const owned = try wb.allocator.dupe(u8, s);
-                errdefer wb.allocator.free(owned);
-                try plan.existing_matches.append(wb.allocator, .{ .text = owned, .index = found_idx });
+                try registerExistingMatch(wb, &plan, s, decoded_existing);
             }
-        }
-        _ = view;
-    }
-
-    // Fast path B: there ARE new strings. We also need an existing-
-    // match side table for any deltas whose text equals an existing
-    // entry — those should resolve to the existing index, not a fresh
-    // one. The de-dup loop above already skipped them from
-    // plan.new_strings; populate the side table.
-    if (plan.has_new_strings and existing_view != null) {
-        for (wb.worksheets) |*ws| {
-            var it = ws.deltas.valueIterator();
-            while (it.next()) |v| {
-                const s = switch (v.*) {
-                    .shared_string => |t| t,
-                    else => continue,
+            for (ws.appended_rows.items) |row| {
+                for (row) |c| switch (c) {
+                    .string => |s| try registerExistingMatch(wb, &plan, s, decoded_existing),
+                    else => {},
                 };
-                // If it's in plan.new_strings, it didn't match
-                // existing — skip.
-                var in_new: bool = false;
-                for (plan.new_strings.items) |n| {
-                    if (std.mem.eql(u8, n, s)) {
-                        in_new = true;
-                        break;
-                    }
-                }
-                if (in_new) continue;
-
-                // Skip if already registered in side table.
-                var already: bool = false;
-                for (plan.existing_matches.items) |em| {
-                    if (std.mem.eql(u8, em.text, s)) {
-                        already = true;
-                        break;
-                    }
-                }
-                if (already) continue;
-
-                var found_idx: u32 = std.math.maxInt(u32);
-                for (decoded_existing, 0..) |de, i| {
-                    if (std.mem.eql(u8, de, s)) {
-                        found_idx = @intCast(i);
-                        break;
-                    }
-                }
-                assert(found_idx != std.math.maxInt(u32));
-                const owned = try wb.allocator.dupe(u8, s);
-                errdefer wb.allocator.free(owned);
-                try plan.existing_matches.append(wb.allocator, .{ .text = owned, .index = found_idx });
             }
         }
     }
@@ -4087,6 +4093,88 @@ pub const Worksheet = struct {
         };
     }
 
+    /// Plan-driven sibling of `emitWithAppends`. Used by
+    /// `Workbook.save`: every string cell resolves its SST index via
+    /// `plan.indexOf(s)` (which already deduplicates against existing
+    /// SST entries and across sheets). Caller does NOT receive
+    /// `new_strings` — those live in `plan.new_strings`. Returns the
+    /// spliced XML only.
+    ///
+    /// Caller invariants: `appended_rows.items.len > 0`,
+    /// `deltas.count() == 0`, every `.string` payload appearing in
+    /// `appended_rows` is registered in `plan` (either as a new
+    /// string or an existing-match entry).
+    pub fn emitWithAppendsUsingPlan(
+        self: *Worksheet,
+        allocator: Allocator,
+        plan: *const SstExtensionPlan,
+    ) Error![]u8 {
+        assert(self.appended_rows.items.len > 0);
+        if (self.deltas.count() > 0) return error.SheetHasUnsavedMutations;
+
+        const part_name = try self.resolvePartName();
+        assert(part_name.len > 0);
+        const part = try self.workbook.store.part(part_name) orelse return error.MissingSheetPart;
+        const src_xml = part.bytes;
+
+        const highest_row = appendXmlFindHighestRow(src_xml);
+        const start_row: u32 = highest_row + 1;
+        assert(start_row >= 1);
+        const final_row64: u64 = @as(u64, start_row) + self.appended_rows.items.len - 1;
+        if (final_row64 > zlsx.max_row) return error.RowIndexOutOfRange;
+        const final_row: u32 = @intCast(final_row64);
+        assert(start_row <= final_row);
+
+        var max_col_1based: u32 = 0;
+        for (self.appended_rows.items) |row| {
+            if (row.len > max_col_1based) max_col_1based = @intCast(row.len);
+        }
+        assert(max_col_1based <= zlsx.max_col_1based);
+
+        var rows_buf: std.ArrayList(u8) = .empty;
+        defer rows_buf.deinit(allocator);
+        try rows_buf.ensureTotalCapacity(allocator, self.appended_rows.items.len * 32);
+
+        for (self.appended_rows.items, 0..) |row, ri| {
+            const row_idx: u32 = start_row + @as(u32, @intCast(ri));
+            try rows_buf.appendSlice(allocator, "<row r=\"");
+            var num_buf: [16]u8 = undefined;
+            try rows_buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{row_idx}));
+            try rows_buf.appendSlice(allocator, "\">");
+            for (row, 0..) |cell, ci| {
+                const col_1based: u32 = @as(u32, @intCast(ci)) + 1;
+                try appendCellXmlForAppendUsingPlan(
+                    allocator,
+                    &rows_buf,
+                    cell,
+                    .{ .row = row_idx, .col = col_1based },
+                    plan,
+                );
+            }
+            try rows_buf.appendSlice(allocator, "</row>");
+        }
+        assert(rows_buf.items.len > 0);
+
+        const injected = try appendXmlInjectRows(allocator, src_xml, rows_buf.items);
+        errdefer allocator.free(injected);
+
+        const final_xml = blk: {
+            const widened = try appendXmlUpdateDimensionBR(
+                allocator,
+                injected,
+                final_row,
+                max_col_1based,
+            );
+            if (widened) |w| {
+                allocator.free(injected);
+                break :blk w;
+            }
+            break :blk injected;
+        };
+        assert(final_xml.len > src_xml.len);
+        return final_xml;
+    }
+
     /// Free + reset `appended_rows` after `Workbook.save` (or
     /// `Editor.save` in iter-er-3) has consumed the staged rows.
     /// Pairs with `appendRows` — same allocator semantics.
@@ -4162,6 +4250,56 @@ fn appendCellXmlForAppend(
             new_strings[sst_cursor.*] = dup;
             sst_cursor.* += 1;
             owned_strings.* += 1;
+            try out.appendSlice(allocator, "<c r=\"");
+            try out.appendSlice(allocator, ref_str);
+            try out.appendSlice(allocator, "\" t=\"s\"><v>");
+            try out.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{idx}));
+            try out.appendSlice(allocator, "</v></c>");
+        },
+    }
+}
+
+/// Plan-driven sibling of `appendCellXmlForAppend`. String indices
+/// resolve via `plan.indexOf(s)`; the plan owns the string entries
+/// (no per-cell dupe needed). All other cell shapes render
+/// identically.
+fn appendCellXmlForAppendUsingPlan(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    cell: zlsx.Cell,
+    ref: CellRef,
+    plan: *const SstExtensionPlan,
+) Error!void {
+    assert(ref.col >= 1 and ref.col <= zlsx.max_col_1based);
+    assert(ref.row >= 1 and ref.row <= zlsx.max_row);
+    var ref_buf: [16]u8 = undefined;
+    const ref_str = formatA1Ref(&ref_buf, ref);
+    var num_buf: [64]u8 = undefined;
+    switch (cell) {
+        .empty => return,
+        .integer => |x| {
+            try out.appendSlice(allocator, "<c r=\"");
+            try out.appendSlice(allocator, ref_str);
+            try out.appendSlice(allocator, "\"><v>");
+            try out.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{x}));
+            try out.appendSlice(allocator, "</v></c>");
+        },
+        .number => |f| {
+            try out.appendSlice(allocator, "<c r=\"");
+            try out.appendSlice(allocator, ref_str);
+            try out.appendSlice(allocator, "\"><v>");
+            try out.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{f}));
+            try out.appendSlice(allocator, "</v></c>");
+        },
+        .boolean => |b| {
+            try out.appendSlice(allocator, "<c r=\"");
+            try out.appendSlice(allocator, ref_str);
+            try out.appendSlice(allocator, "\" t=\"b\"><v>");
+            try out.appendSlice(allocator, if (b) "1" else "0");
+            try out.appendSlice(allocator, "</v></c>");
+        },
+        .string => |s| {
+            const idx = plan.indexOf(s) orelse return error.SharedStringNotInPlan;
             try out.appendSlice(allocator, "<c r=\"");
             try out.appendSlice(allocator, ref_str);
             try out.appendSlice(allocator, "\" t=\"s\"><v>");
