@@ -2969,14 +2969,22 @@ const SstExtensionPlan = struct {
 /// the resulting unique-new-strings list into a plan. The plan owns
 /// duplicates of every staged string; callers free via `plan.deinit`.
 /// Register a string `s` into `plan.new_strings` if it matches no
-/// existing SST entry and isn't already staged. Owns the dupe.
+/// existing PLAIN SST entry and isn't already staged. Owns the dupe.
+/// Rich entries (`is_rich_existing[i] == true`) are skipped from
+/// the match loop — a new string equal to a rich entry's
+/// concatenated runs still allocates a fresh `<si><t>` because the
+/// reader can't resolve `t="s"` indices that point at rich `<r>`
+/// blocks as plain text.
 fn registerSharedString(
     wb: *Workbook,
     plan: *SstExtensionPlan,
     s: []const u8,
     decoded_existing: []const []const u8,
+    is_rich_existing: []const bool,
 ) Error!void {
-    for (decoded_existing) |de| {
+    assert(decoded_existing.len == is_rich_existing.len);
+    for (decoded_existing, 0..) |de, i| {
+        if (is_rich_existing[i]) continue;
         if (std.mem.eql(u8, de, s)) return;
     }
     for (plan.new_strings.items) |existing| {
@@ -2987,16 +2995,20 @@ fn registerSharedString(
     try plan.new_strings.append(wb.allocator, owned);
 }
 
-/// Append an existing-match record for string `s` if an existing SST
-/// entry decodes to it and we haven't already recorded it. Owns the
-/// dupe. Skips strings staged into `plan.new_strings` (those resolve
-/// via the new-strings index, not the side table).
+/// Append an existing-match record for string `s` if an existing
+/// PLAIN SST entry decodes to it and we haven't already recorded
+/// it. Owns the dupe. Skips strings staged into `plan.new_strings`
+/// (those resolve via the new-strings index, not the side table).
+/// Rich entries are skipped — same reasoning as
+/// `registerSharedString`.
 fn registerExistingMatch(
     wb: *Workbook,
     plan: *SstExtensionPlan,
     s: []const u8,
     decoded_existing: []const []const u8,
+    is_rich_existing: []const bool,
 ) Error!void {
+    assert(decoded_existing.len == is_rich_existing.len);
     for (plan.new_strings.items) |n| {
         if (std.mem.eql(u8, n, s)) return;
     }
@@ -3005,6 +3017,7 @@ fn registerExistingMatch(
     }
     var found_idx: u32 = std.math.maxInt(u32);
     for (decoded_existing, 0..) |de, i| {
+        if (is_rich_existing[i]) continue;
         if (std.mem.eql(u8, de, s)) {
             found_idx = @intCast(i);
             break;
@@ -3067,21 +3080,33 @@ fn buildSstExtensionPlan(wb: *Workbook) Error!SstExtensionPlan {
 
     // Pre-decode every existing plain entry once into an arena so
     // each new string compares against decoded text. Rich entries
-    // get a sentinel empty slice (matched-equal would be wrong, but
-    // an empty new string never equals a rich entry by construction
-    // — `.plain` and `.rich` are disjoint).
+    // are tracked in a parallel `is_rich_existing` array and SKIPPED
+    // from the match loops — a new string can never resolve to a
+    // rich entry's index because the OOXML reader treats `<c t="s">`
+    // pointing at a rich `<si><r>…</r></si>` differently from a
+    // plain one. Without the explicit skip, the previous sentinel
+    // (empty slice) silently mis-resolved an empty new string `""`
+    // to a rich entry's index.
     var decode_arena = std.heap.ArenaAllocator.init(wb.allocator);
     defer decode_arena.deinit();
     const da = decode_arena.allocator();
 
     var decoded_existing: [][]const u8 = &.{};
+    var is_rich_existing: []bool = &.{};
     if (existing_view) |view| {
         decoded_existing = try da.alloc([]const u8, view.entries.len);
+        is_rich_existing = try da.alloc(bool, view.entries.len);
         for (view.entries, 0..) |e, i| {
-            decoded_existing[i] = switch (e) {
-                .plain => |s| try sst_xml_mod.decodeText(da, s),
-                .rich => "", // never matches a non-empty new string
-            };
+            switch (e) {
+                .plain => |s| {
+                    decoded_existing[i] = try sst_xml_mod.decodeText(da, s);
+                    is_rich_existing[i] = false;
+                },
+                .rich => {
+                    decoded_existing[i] = "";
+                    is_rich_existing[i] = true;
+                },
+            }
         }
     }
 
@@ -3098,11 +3123,11 @@ fn buildSstExtensionPlan(wb: *Workbook) Error!SstExtensionPlan {
                 .shared_string => |t| t,
                 else => continue,
             };
-            try registerSharedString(wb, &plan, s, decoded_existing);
+            try registerSharedString(wb, &plan, s, decoded_existing, is_rich_existing);
         }
         for (ws.appended_rows.items) |row| {
             for (row) |c| switch (c) {
-                .string => |s| try registerSharedString(wb, &plan, s, decoded_existing),
+                .string => |s| try registerSharedString(wb, &plan, s, decoded_existing, is_rich_existing),
                 else => {},
             };
         }
@@ -3146,11 +3171,11 @@ fn buildSstExtensionPlan(wb: *Workbook) Error!SstExtensionPlan {
                     .shared_string => |t| t,
                     else => continue,
                 };
-                try registerExistingMatch(wb, &plan, s, decoded_existing);
+                try registerExistingMatch(wb, &plan, s, decoded_existing, is_rich_existing);
             }
             for (ws.appended_rows.items) |row| {
                 for (row) |c| switch (c) {
-                    .string => |s| try registerExistingMatch(wb, &plan, s, decoded_existing),
+                    .string => |s| try registerExistingMatch(wb, &plan, s, decoded_existing, is_rich_existing),
                     else => {},
                 };
             }
@@ -7366,6 +7391,57 @@ fn fuzzEmitWithAppendsStructural(_: void, input: []const u8) anyerror!void {
     };
     defer allocator.free(new_xml);
     ws.clearAppendedRows(allocator);
+}
+
+test "registerSharedString: empty new string vs rich existing entry registers as new (not aliased)" {
+    // Regression for the iter-er-7 review finding: rich SST entries
+    // were represented as `""` in `decoded_existing` with the comment
+    // "an empty new string never equals a rich entry by construction"
+    // — but `eql("", "")` IS true, so an empty new string silently
+    // aliased to the rich entry's index, emitting `<c t="s"><v>idx</v></c>`
+    // pointing at a `<si><r>…</r></si>` block. Excel resolves that as
+    // the concatenated rich-run text, NOT as empty plain text.
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+
+    var plan: SstExtensionPlan = .{};
+    defer plan.deinit(std.testing.allocator);
+
+    const decoded = [_][]const u8{""};
+    const is_rich = [_]bool{true};
+
+    try registerSharedString(&wb, &plan, "", &decoded, &is_rich);
+    try std.testing.expectEqual(@as(usize, 1), plan.new_strings.items.len);
+    try std.testing.expectEqualStrings("", plan.new_strings.items[0]);
+
+    try registerExistingMatch(&wb, &plan, "", &decoded, &is_rich);
+    try std.testing.expectEqual(@as(usize, 0), plan.existing_matches.items.len);
+}
+
+test "registerSharedString: empty new string vs PLAIN existing entry deduplicates correctly" {
+    // Companion to the rich-entry regression test — confirms the fix
+    // didn't accidentally break the dedup contract for plain entries.
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.fs.cwd().access(path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+
+    var plan: SstExtensionPlan = .{};
+    defer plan.deinit(std.testing.allocator);
+
+    const decoded = [_][]const u8{""};
+    const is_rich = [_]bool{false};
+
+    try registerSharedString(&wb, &plan, "", &decoded, &is_rich);
+    try std.testing.expectEqual(@as(usize, 0), plan.new_strings.items.len);
+
+    try registerExistingMatch(&wb, &plan, "", &decoded, &is_rich);
+    try std.testing.expectEqual(@as(usize, 1), plan.existing_matches.items.len);
+    try std.testing.expectEqual(@as(u32, 0), plan.existing_matches.items[0].index);
 }
 
 test "fuzz: emitWithAppendsUsingPlan end-to-end on adversarial sheetData payload" {
