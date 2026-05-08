@@ -442,500 +442,36 @@ pub const Editor = struct {
         return ws.appendRows(rows);
     }
 
-    /// Write the workbook (with any pending appends applied) to
-    /// `out_path`. Atomic via `std.fs.Dir.atomicFile`.
+    /// Persist the workbook to `out_path`. Atomic via
+    /// `std.fs.Dir.atomicFile`. Two paths:
     ///
-    /// **No-op save**: when no `appendRows` calls have been made,
-    /// streams `src_buf` verbatim — preserves SHA256 round-trip for
-    /// any well-formed source archive (canonical or not).
+    /// **Passthrough**: when no `setCell` / `appendRows` /
+    /// `addSheet` / `deleteSheet` / `renameSheet` / row+col edit /
+    /// rewriter has touched anything, streams `src_buf` verbatim.
+    /// Preserves the source SHA256 byte-for-byte.
     ///
-    /// **Mutated save**: walks the entry table, substitutes each
-    /// modified sheet entry with a freshly-emitted LFH+payload (new
-    /// CRC32 / sizes), and re-emits the central directory + EOCD
-    /// with patched offsets. Sheets that weren't touched flow through
-    /// verbatim; the source's preserved EOCD comment is kept.
+    /// **Mutated**: delegates to `Workbook.save`, which collects
+    /// all staged deltas + appended_rows into an SST extension plan
+    /// (when string cells are present), emits patched sheet XML
+    /// per worksheet, then `PartStore.save` rebuilds the ZIP from
+    /// the override map. Source LFH bytes for untouched parts copy
+    /// through byte-for-byte; the EOCD comment is preserved.
     pub fn save(self: *Editor, out_path: []const u8) !void {
-        var write_buf: [4096]u8 = undefined;
-        var atomic_file = try std.fs.cwd().atomicFile(out_path, .{ .write_buffer = &write_buf });
-        defer atomic_file.deinit();
-        const w = &atomic_file.file_writer.interface;
-
         if (!self.workbookHasAnyDeltas() and
             !self.workbookHasAnyAppendedRows() and
             !self.workbook.store.hasUnsavedChanges())
         {
+            var write_buf: [4096]u8 = undefined;
+            var atomic_file = try std.fs.cwd().atomicFile(out_path, .{ .write_buffer = &write_buf });
+            defer atomic_file.deinit();
+            const w = &atomic_file.file_writer.interface;
             try w.writeAll(self.src_buf);
             try atomic_file.finish();
             return;
         }
-
-        // Detect whether any staged append carries a string cell;
-        // if so, the SST entry must be substituted alongside the
-        // sheets so the new t="s" indices resolve. Post-iter-er-4
-        // all appends flow through `Worksheet.appended_rows` (the
-        // workbook fast-path); the legacy `pending_appends` queue
-        // is no longer populated.
-        var has_strings = false;
-        if (!has_strings and self.workbookHasAnyAppendedStrings()) has_strings = true;
-
-        // Locate sharedStrings.xml entry + count source SST entries
-        // when string cells are pending. iter-lms-3+follow-up:
-        // SST-less source workbooks (only inline strings or numeric
-        // data) get a fresh sharedStrings.xml created on demand,
-        // along with rels + Content_Types patches. `create_new_sst`
-        // is true on the SST-less path; index counter starts at 0.
-        var sst_entry_idx: ?usize = null;
-        var source_sst_count: u32 = 0;
-        var sst_xml_owned: ?[]u8 = null;
-        var create_new_sst = false;
-        defer if (sst_xml_owned) |x| self.allocator.free(x);
-        if (has_strings) {
-            if (findEntryByName(self.entries, "xl/sharedStrings.xml")) |idx| {
-                sst_entry_idx = idx;
-                const sst_entry = self.entries[idx];
-                const sst_payload = self.src_buf[sst_entry.lfh_offset + sst_entry.lfh_total_len ..][0..sst_entry.payload_len];
-                sst_xml_owned = try decompressZipPayload(
-                    self.allocator,
-                    sst_payload,
-                    sst_entry.compression_method,
-                    sst_entry.uncompressed_size,
-                );
-                source_sst_count = countSiInSst(sst_xml_owned.?);
-            } else {
-                create_new_sst = true;
-            }
-        }
-
-        var sst_appender: SstAppender = .{
-            .allocator = self.allocator,
-            .next_idx = source_sst_count,
-        };
-        defer sst_appender.deinit();
-        const sst_ptr: ?*SstAppender = if (has_strings) &sst_appender else null;
-
-        // Build substituted entries for each modified sheet.
-        const subs = try self.allocator.alloc(?SubstitutedEntry, self.entries.len);
-        for (subs) |*slot| slot.* = null;
-        defer {
-            for (subs) |maybe_sub| if (maybe_sub) |s| {
-                self.allocator.free(s.lfh);
-                self.allocator.free(s.payload);
-                self.allocator.free(s.cdfh);
-            };
-            self.allocator.free(subs);
-        }
-
-        // Appendix entries: brand-new ZIP entries that don't exist
-        // in the source (a fresh sharedStrings.xml when the source
-        // had none, plus iter-er-4 sheets created via
-        // `Workbook.addSheet` whose part isn't in self.entries).
-        // Lifetime: their .lfh / .payload / .cdfh slices are owned;
-        // the deferred free runs at end-of-save.
-        var extra_entries: std.ArrayListUnmanaged(SubstitutedEntry) = .{};
-        defer {
-            for (extra_entries.items) |e| {
-                self.allocator.free(e.lfh);
-                self.allocator.free(e.payload);
-                self.allocator.free(e.cdfh);
-            }
-            extra_entries.deinit(self.allocator);
-        }
-
-        // B2 iter-er-3: existing-sheet appends route through the
-        // workbook fast-path. `Worksheet.emitWithAppends` reads the
-        // source XML straight from the part store (no
-        // `ensureParsed`), splices appended rows before
-        // `</sheetData>`, widens `<dimension>`, and returns the new
-        // SST entries to merge. New-sheet appends still flow
-        // through `pending_appends` — the new-sheet block downstream
-        // consumes `pending_appends.get(sheet_idx_for_new)` directly.
-        //
-        // Each outcome's `new_strings` is owned by the editor
-        // allocator (deep-copied from `Worksheet.appended_rows` so
-        // it survives any clearAppendedRows). The strings stay live
-        // until `buildSubstitutedSst` dupes them into the new SST
-        // XML — i.e., end of save(). Accumulate the headers + their
-        // owned elements in `pending_outcome_strings` and free at
-        // save end.
-        var pending_outcome_strings: std.ArrayListUnmanaged([]const []const u8) = .{};
-        defer {
-            for (pending_outcome_strings.items) |strs| {
-                for (strs) |s| self.allocator.free(s);
-                self.allocator.free(@constCast(strs));
-            }
-            pending_outcome_strings.deinit(self.allocator);
-        }
-        {
-            var sheet_idx: u32 = 0;
-            const ws_count: u32 = @intCast(self.workbook.sheetCount());
-            while (sheet_idx < ws_count) : (sheet_idx += 1) {
-                const ws = try self.workbook.sheet(sheet_idx);
-                if (ws.appended_rows.items.len == 0) continue;
-                // Resolve part name via the typed-overlay (iter-er-4
-                // direct callers of `editor.workbook.addSheet` don't
-                // grow self.sheet_paths, so we can't index it).
-                const path = try ws.resolvePartName();
-                // entry_idx is null for sheets created via
-                // `Workbook.addSheet` after Editor.open — those parts
-                // exist in PartStore but not in self.entries, so the
-                // emitted entry routes to extra_entries instead of
-                // subs[].
-                const entry_idx_opt = findEntryByName(self.entries, path);
-
-                const sst_base_idx: u32 = if (sst_ptr) |p| p.next_idx else 0;
-                const outcome = try ws.emitWithAppends(self.allocator, sst_base_idx);
-                // Reserve the stash slots up front so the
-                // `appendAssumeCapacity` below are infallible.
-                // Without this, an OOM between `buildEntryFromXml`
-                // (which unconditionally consumes new_xml via its
-                // internal defer) and the stash would either leak or
-                // double-free the strings depending on which side
-                // catches the error first.
-                try pending_outcome_strings.ensureUnusedCapacity(self.allocator, 1);
-                if (entry_idx_opt == null) try extra_entries.ensureUnusedCapacity(self.allocator, 1);
-
-                // Ownership flag: buildEntryFromXml's internal
-                // `defer allocator.free(new_xml)` consumes new_xml
-                // on every exit (success AND error), so we must NOT
-                // double-free it from our own errdefer once we've
-                // entered that call.
-                var new_xml_owned: bool = true;
-                errdefer if (new_xml_owned) self.allocator.free(outcome.new_xml);
-                errdefer {
-                    for (outcome.new_strings) |s| self.allocator.free(s);
-                    self.allocator.free(outcome.new_strings);
-                }
-                if (sst_ptr) |p| {
-                    const expected_after = p.next_idx + @as(u32, @intCast(outcome.new_strings.len));
-                    for (outcome.new_strings) |s| _ = try p.add(s);
-                    // Pair-assertion: SST cursor advanced exactly
-                    // once per index emitWithAppends burned into the
-                    // XML. A mismatch means a sibling save-step
-                    // bumped next_idx between capture and add.
-                    std.debug.assert(p.next_idx == expected_after);
-                }
-                new_xml_owned = false;
-                const new_entry = try buildEntryFromXml(self.allocator, path, outcome.new_xml);
-                if (entry_idx_opt) |entry_idx| {
-                    subs[entry_idx] = new_entry;
-                } else {
-                    extra_entries.appendAssumeCapacity(new_entry);
-                }
-                // Infallible — capacity reserved at top of iteration.
-                pending_outcome_strings.appendAssumeCapacity(outcome.new_strings);
-            }
-        }
-
-        // B2 iter-er-2: cell mutations now live in
-        // `editor.workbook.worksheets[i].deltas`. For each existing
-        // sheet with non-empty deltas, regenerate the sheet's XML via
-        // `Worksheet.emitWithDeltas` (parsed view + deltas merged
-        // canonically), then feed through buildEntryFromXml.
-        // appendRows + setCell on the same sheet is rejected at
-        // mutation time so no merge step is needed here.
-        {
-            var sheet_idx: u32 = 0;
-            const ws_count: u32 = @intCast(self.workbook.sheetCount());
-            while (sheet_idx < ws_count) : (sheet_idx += 1) {
-                const ws = try self.workbook.sheet(sheet_idx);
-                if (ws.deltas.count() == 0) continue;
-                // Resolve part name via the typed-overlay (iter-er-4
-                // direct callers of `editor.workbook.addSheet` don't
-                // grow self.sheet_paths, so we can't index it).
-                const path = try ws.resolvePartName();
-                // entry_idx is null for sheets created via
-                // `Workbook.addSheet` (iter-er-4). Their parts live in
-                // PartStore but not in self.entries; the emitted entry
-                // routes to extra_entries instead of subs[].
-                const entry_idx_opt = findEntryByName(self.entries, path);
-                if (entry_idx_opt == null) try extra_entries.ensureUnusedCapacity(self.allocator, 1);
-
-                const fresh_xml = try ws.emitWithDeltas(self.allocator);
-                defer self.allocator.free(fresh_xml);
-
-                // Best-effort `<dimension>` widen — same canonical-form
-                // contract as the append path. Walk deltas to find the
-                // bounding (min/max) row+col of mutated cells.
-                var dmin_row: u32 = std.math.maxInt(u32);
-                var dmax_row: u32 = 0;
-                var dmin_col1: u32 = std.math.maxInt(u32);
-                var dmax_col1: u32 = 0;
-                var dit = ws.deltas.keyIterator();
-                while (dit.next()) |cr| {
-                    if (cr.row < dmin_row) dmin_row = cr.row;
-                    if (cr.row > dmax_row) dmax_row = cr.row;
-                    if (cr.col < dmin_col1) dmin_col1 = cr.col;
-                    if (cr.col > dmax_col1) dmax_col1 = cr.col;
-                }
-                const xml_to_use = if (dmax_row > 0)
-                    (try updateDimensionRange(
-                        self.allocator,
-                        fresh_xml,
-                        dmin_row,
-                        dmax_row,
-                        dmin_col1,
-                        dmax_col1,
-                    )) orelse try self.allocator.dupe(u8, fresh_xml)
-                else
-                    try self.allocator.dupe(u8, fresh_xml);
-                // buildEntryFromXml takes ownership of `xml_to_use`.
-                const new_entry = try buildEntryFromXml(self.allocator, path, xml_to_use);
-                if (entry_idx_opt) |entry_idx| {
-                    subs[entry_idx] = new_entry;
-                } else {
-                    extra_entries.appendAssumeCapacity(new_entry);
-                }
-            }
-        }
-
-        // B2 iter-er-4 (2/N): emit any sheet that exists in the
-        // workbook view but has no source entry AND no mutations
-        // (setCell deltas / appendRows). These are sheets created
-        // via `Workbook.addSheet` whose body lives verbatim in
-        // PartStore. The two walks above only emit when there's
-        // something to render; this pass picks up the no-mutation
-        // case so the new sheet's bytes flow into the output ZIP.
-        //
-        // Resolve the part name via the typed-overlay's
-        // `Worksheet.resolvePartName` (parse-free) rather than
-        // `self.sheet_paths[idx]` — direct callers of
-        // `editor.workbook.addSheet` (bypassing the Editor.addSheet
-        // shim) don't grow `self.sheet_paths`, but the typed-overlay
-        // always knows the part name.
-        {
-            var sheet_idx: u32 = 0;
-            const ws_count: u32 = @intCast(self.workbook.sheetCount());
-            while (sheet_idx < ws_count) : (sheet_idx += 1) {
-                const ws = try self.workbook.sheet(sheet_idx);
-                if (ws.appended_rows.items.len > 0) continue;
-                if (ws.deltas.count() > 0) continue;
-                const path = try ws.resolvePartName();
-                if (findEntryByName(self.entries, path) != null) continue;
-                // New sheet without mutations — emit verbatim from
-                // PartStore. PartStore's bytes were set by
-                // `Workbook.addSheet` to the empty-sheet template.
-                const part = (try self.workbook.store.part(path)) orelse
-                    return error.MissingSheetPart;
-                try extra_entries.ensureUnusedCapacity(self.allocator, 1);
-                const body_owned = try self.allocator.dupe(u8, part.bytes);
-                const new_entry = try buildEntryFromXml(self.allocator, path, body_owned);
-                extra_entries.appendAssumeCapacity(new_entry);
-            }
-        }
-
-        // B2 iter-er-4 (2/N): sync PartStore overrides for source
-        // parts that the existing walks didn't substitute. The
-        // typed-overlay path (`Workbook.addSheet`, `addImage`, and
-        // future iter-er-X mutators) patches workbook.xml,
-        // workbook.xml.rels, and `[Content_Types].xml` in-memory via
-        // PartStore — Editor.save's ZIP rebuild reads from src_buf
-        // by default and would emit stale bytes for those metadata
-        // parts. This pass copies any PartStore override that maps
-        // to an unmutated source entry into subs[], so the freshly-
-        // patched bytes flow into the output archive.
-        {
-            for (self.entries, 0..) |entry, i| {
-                if (subs[i] != null) continue;
-                if (!self.workbook.store.isOverridden(entry.name)) continue;
-                const part = (try self.workbook.store.part(entry.name)) orelse continue;
-                const body_owned = try self.allocator.dupe(u8, part.bytes);
-                subs[i] = try buildEntryFromXml(self.allocator, entry.name, body_owned);
-            }
-        }
-
-        if (has_strings and sst_appender.new_strings.items.len > 0) {
-            if (create_new_sst) {
-                // SST-less source workbook — build a fresh
-                // sharedStrings.xml from scratch, patch rels +
-                // Content_Types so Excel / readers recognise it.
-                const new_sst_xml = try buildFreshSstXml(
-                    self.allocator,
-                    sst_appender.new_strings.items,
-                );
-                const new_entry = try buildEntryFromXml(
-                    self.allocator,
-                    "xl/sharedStrings.xml",
-                    new_sst_xml,
-                );
-                try extra_entries.append(self.allocator, new_entry);
-
-                try patchEntryXml(
-                    self.allocator,
-                    self.entries,
-                    self.src_buf,
-                    subs,
-                    "xl/_rels/workbook.xml.rels",
-                    addSstRelationship,
-                );
-                try patchEntryXml(
-                    self.allocator,
-                    self.entries,
-                    self.src_buf,
-                    subs,
-                    "[Content_Types].xml",
-                    addSstContentTypeOverride,
-                );
-            } else {
-                // Existing SST entry — substitute in place.
-                const sst_idx = sst_entry_idx.?;
-                subs[sst_idx] = try buildSubstitutedSst(
-                    self.allocator,
-                    self.entries[sst_idx],
-                    sst_xml_owned.?,
-                    sst_appender.new_strings.items,
-                    source_sst_count,
-                );
-            }
-        }
-
-        // Emit LFHs in LFH-offset order. Each substituted entry's LFH
-        // / payload are freshly built; others copy from src_buf.
-        const new_lfh_offsets = try self.allocator.alloc(u32, self.entries.len);
-        defer self.allocator.free(new_lfh_offsets);
-        const lfh_sorted = try self.allocator.alloc(usize, self.entries.len);
-        defer self.allocator.free(lfh_sorted);
-        for (lfh_sorted, 0..) |*slot, i| slot.* = i;
-        std.mem.sort(usize, lfh_sorted, self.entries, struct {
-            fn lessThan(es: []const ZipEntry, a: usize, b: usize) bool {
-                return es[a].lfh_offset < es[b].lfh_offset;
-            }
-        }.lessThan);
-
-        // Pre-validate that the rewritten archive stays within ZIP32
-        // bounds. Source size is already <= 4 GiB (Editor.open caps),
-        // but substitutions + appendix entries can push the total over.
-        // Without this guard the `@intCast(u32, ...)` writes below
-        // would trap (safe builds) or silently truncate offsets
-        // (release builds), producing an unreadable archive.
-        // Use `>= maxInt(u32)` rather than `>` so ZIP32 sentinel
-        // values (`0xFFFFFFFF` for offsets/sizes, `0xFFFF` for
-        // entry counts) are also rejected.
-        const max_u32: u64 = std.math.maxInt(u32);
-        const max_u16: usize = std.math.maxInt(u16);
-        var planned_total: u64 = 0;
-        var live_entry_count: usize = 0;
-        for (lfh_sorted) |i| {
-            live_entry_count += 1;
-            if (subs[i]) |s| {
-                planned_total += @as(u64, s.lfh.len) + @as(u64, s.payload.len);
-            } else {
-                const e = self.entries[i];
-                planned_total += @as(u64, e.lfh_total_len) + @as(u64, e.payload_len);
-            }
-        }
-        for (extra_entries.items) |e| {
-            planned_total += @as(u64, e.lfh.len) + @as(u64, e.payload.len);
-        }
-        const planned_cd_offset = planned_total;
-        for (self.entries, 0..) |entry, i| {
-            if (subs[i]) |s| {
-                planned_total += @as(u64, s.cdfh.len);
-            } else {
-                planned_total += @as(u64, entry.cdfh_total_len);
-            }
-        }
-        for (extra_entries.items) |e| planned_total += @as(u64, e.cdfh.len);
-        const planned_cd_size = planned_total - planned_cd_offset;
-        const planned_archive_size = planned_total +
-            @as(u64, @sizeOf(std.zip.EndRecord)) +
-            @as(u64, self.eocd_comment.len);
-        const planned_entries = live_entry_count + extra_entries.items.len;
-        if (planned_cd_offset >= max_u32 or
-            planned_cd_size >= max_u32 or
-            planned_archive_size >= max_u32 or
-            planned_entries >= max_u16)
-        {
-            return error.Zip64NotSupported;
-        }
-
-        var written: u64 = 0;
-        for (lfh_sorted) |i| {
-            new_lfh_offsets[i] = @intCast(written);
-            if (subs[i]) |s| {
-                try w.writeAll(s.lfh);
-                try w.writeAll(s.payload);
-                written += @as(u64, s.lfh.len) + @as(u64, s.payload.len);
-            } else {
-                const e = self.entries[i];
-                const lfh_bytes = self.src_buf[e.lfh_offset .. e.lfh_offset + e.lfh_total_len];
-                try w.writeAll(lfh_bytes);
-                const payload_bytes = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
-                try w.writeAll(payload_bytes);
-                written += @as(u64, e.lfh_total_len) + @as(u64, e.payload_len);
-            }
-        }
-
-        // Emit appendix entries (brand-new parts that didn't exist in
-        // source). Track their new LFH offsets for the CD rewrite.
-        const extra_lfh_offsets = try self.allocator.alloc(u32, extra_entries.items.len);
-        defer self.allocator.free(extra_lfh_offsets);
-        for (extra_entries.items, 0..) |e, ei| {
-            extra_lfh_offsets[ei] = @intCast(written);
-            try w.writeAll(e.lfh);
-            try w.writeAll(e.payload);
-            written += @as(u64, e.lfh.len) + @as(u64, e.payload.len);
-        }
-
-        const new_cd_offset: u32 = @intCast(written);
-        for (self.entries, 0..) |entry, i| {
-            if (subs[i]) |s| {
-                var cdfh_copy = try self.allocator.dupe(u8, s.cdfh);
-                defer self.allocator.free(cdfh_copy);
-                const lfh_field_pos = @sizeOf(std.zip.CentralDirectoryFileHeader) - 4;
-                std.mem.writeInt(u32, cdfh_copy[lfh_field_pos..][0..4], new_lfh_offsets[i], .little);
-                try w.writeAll(cdfh_copy);
-                written += @as(u64, cdfh_copy.len);
-            } else {
-                var cdfh_bytes: [@sizeOf(std.zip.CentralDirectoryFileHeader)]u8 = undefined;
-                const src_cdfh = self.src_buf[entry.cdfh_offset .. entry.cdfh_offset + cdfh_bytes.len];
-                @memcpy(&cdfh_bytes, src_cdfh);
-                const lfh_field_pos = cdfh_bytes.len - 4;
-                std.mem.writeInt(u32, cdfh_bytes[lfh_field_pos..][0..4], new_lfh_offsets[i], .little);
-                try w.writeAll(&cdfh_bytes);
-                const var_off = entry.cdfh_offset + cdfh_bytes.len;
-                const var_len = entry.cdfh_total_len - cdfh_bytes.len;
-                try w.writeAll(self.src_buf[var_off .. var_off + var_len]);
-                written += @as(u64, entry.cdfh_total_len);
-            }
-        }
-        // Emit appendix CDFHs after the source-entry CDFHs.
-        for (extra_entries.items, 0..) |e, ei| {
-            var cdfh_copy = try self.allocator.dupe(u8, e.cdfh);
-            defer self.allocator.free(cdfh_copy);
-            const lfh_field_pos = @sizeOf(std.zip.CentralDirectoryFileHeader) - 4;
-            std.mem.writeInt(u32, cdfh_copy[lfh_field_pos..][0..4], extra_lfh_offsets[ei], .little);
-            try w.writeAll(cdfh_copy);
-            written += @as(u64, cdfh_copy.len);
-        }
-        const new_cd_size: u32 = @intCast(written - new_cd_offset);
-
-        const total_entries = live_entry_count + extra_entries.items.len;
-        var eocd_out: std.zip.EndRecord = .{
-            .signature = std.zip.end_record_sig,
-            .disk_number = 0,
-            .central_directory_disk_number = 0,
-            .record_count_disk = @intCast(total_entries),
-            .record_count_total = @intCast(total_entries),
-            .central_directory_size = new_cd_size,
-            .central_directory_offset = new_cd_offset,
-            .comment_len = @intCast(self.eocd_comment.len),
-        };
-        if (@import("builtin").cpu.arch.endian() != .little)
-            std.mem.byteSwapAllFields(std.zip.EndRecord, &eocd_out);
-        try w.writeAll(std.mem.asBytes(&eocd_out));
-        try w.writeAll(self.eocd_comment);
-
-        try atomic_file.finish();
+        try self.workbook.save(out_path);
     }
 
-    /// Decompress sheet `sheet_idx` and walk its `<c>` elements,
-    /// returning a `WorksheetSpans` index over every cell. The
-    /// foundation for Phase 3d cell-mutate (iter-cm-1) — read-only
-    /// today; iter-cm-2 builds `setCell` on top.
-    ///
-    /// The returned `xml` + `cells` borrow the same allocation;
-    /// caller frees both via `WorksheetSpans.deinit`. Scans are
-    /// independent (no caching yet) — repeated calls re-decompress.
     pub fn scanWorksheet(self: *Editor, sheet_idx: u32) !WorksheetSpans {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
         // Reject staged appends — `Worksheet.appended_rows` doesn't
@@ -2656,8 +2192,9 @@ test "Editor: appendRows with string cells extends SST (iter-lms-3)" {
         const append_rows = [_][]const Cell{
             &.{ .{ .string = "beta" }, .{ .integer = 2 } },
             &.{ .{ .string = "gamma" }, .{ .boolean = true } },
-            // Same plain-text as an existing entry — must NOT alias
-            // (always-new SST index per the iter-lms-3 contract).
+            // Same plain-text as an existing entry — dedups via the
+            // SST extension plan (iter-er-6 unified Editor.save with
+            // the typed-overlay's setCell-delta semantics).
             &.{ .{ .string = "alpha" }, .{ .integer = 3 } },
         };
         try ed.appendRows(0, &append_rows);
@@ -2689,9 +2226,10 @@ test "Editor: appendRows with string cells extends SST (iter-lms-3)" {
 
     try std.testing.expectEqual(@as(?[]const Cell, null), try rows.next());
 
-    // SST must have grown — original 1 entry + 3 appended strings
-    // (no reuse, even though "alpha" repeats).
-    try std.testing.expectEqual(@as(usize, 4), book.sharedStringsCount());
+    // SST grows by every UNIQUE new string; "alpha" already
+    // existed, so only "beta" and "gamma" extend the table —
+    // 1 existing + 2 new = 3.
+    try std.testing.expectEqual(@as(usize, 3), book.sharedStringsCount());
 }
 
 test "Editor: SST-less workbook gets fresh sharedStrings.xml on string append" {
