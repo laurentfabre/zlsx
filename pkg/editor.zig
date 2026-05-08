@@ -1209,103 +1209,11 @@ pub const Editor = struct {
             return;
         }
 
-        // ── Legacy path for freshly-added sheets (iter-er-4 retires) ──
-        switch (cell) {
-            .integer => |n| {
-                if (!xlsx.fitsExactlyInF64(n)) return error.IntegerExceedsExcelPrecision;
-            },
-            .string, .number, .boolean, .empty => {},
-        }
-        const ms_existed_before = self.pending_mutations.contains(sheet_idx);
-        const ms = try self.getOrInitMutatedSheet(sheet_idx);
-        errdefer if (!ms_existed_before) {
-            if (self.pending_mutations.fetchRemove(sheet_idx)) |kv| {
-                var v = kv.value;
-                v.deinit(self.allocator);
-            }
-        };
-
-        var idx: ?usize = null;
-        var insert_before_idx: ?usize = null;
-        var last_in_row_idx: ?usize = null;
-        for (ms.spans.items, 0..) |s, i| {
-            if (s.row != row) continue;
-            if (s.col == col) {
-                idx = i;
-                break;
-            }
-            last_in_row_idx = i;
-            if (s.col > col and insert_before_idx == null) insert_before_idx = i;
-        }
-        if (idx == null) {
-            const row_has_anchor = last_in_row_idx != null or insert_before_idx != null;
-            if (!row_has_anchor) {
-                if (try insertCellIntoEmptyRow(self.allocator, ms, row, col, cell)) return;
-                try insertMissingRow(self.allocator, ms, row, col, cell);
-                return;
-            }
-            var new_buf: std.ArrayListUnmanaged(u8) = .{};
-            defer new_buf.deinit(self.allocator);
-            try emitCellXml(self.allocator, &new_buf, row, col, cell);
-            const opening_gt = std.mem.indexOfScalar(u8, new_buf.items, '>') orelse return error.InternalInvariantBroken;
-            const insert_at: usize = if (insert_before_idx) |i|
-                ms.spans.items[i].start
-            else
-                ms.spans.items[last_in_row_idx.?].end;
-            try ms.spans.ensureUnusedCapacity(self.allocator, 1);
-            try ms.xml.insertSlice(self.allocator, insert_at, new_buf.items);
-            const new_len = new_buf.items.len;
-            for (ms.spans.items) |*s| {
-                if (s.start >= insert_at) {
-                    s.start += new_len;
-                    s.end += new_len;
-                    s.body_start += new_len;
-                }
-            }
-            const new_span: CellSpan = .{
-                .start = insert_at,
-                .end = insert_at + new_len,
-                .body_start = insert_at + opening_gt + 1,
-                .row = row,
-                .col = col,
-            };
-            const span_pos: usize = insert_before_idx orelse (last_in_row_idx.? + 1);
-            ms.spans.insertAssumeCapacity(span_pos, new_span);
-            return;
-        }
-        const span_idx = idx.?;
-        const old = ms.spans.items[span_idx];
-        if (sourceCellHasMetadata(ms.xml.items, old)) return error.SetCellSourceCellHasMetadata;
-
-        var new_buf: std.ArrayListUnmanaged(u8) = .{};
-        defer new_buf.deinit(self.allocator);
-        try emitCellXml(self.allocator, &new_buf, row, col, cell);
-        const old_len = old.end - old.start;
-        const new_len = new_buf.items.len;
-        try ms.xml.replaceRange(self.allocator, old.start, old_len, new_buf.items);
-        const old_end = old.end;
-        for (ms.spans.items, 0..) |*s, i| {
-            if (i == span_idx) continue;
-            if (s.start >= old_end) {
-                const start_signed: isize = @as(isize, @intCast(s.start)) +
-                    @as(isize, @intCast(new_len)) - @as(isize, @intCast(old_len));
-                const end_signed: isize = @as(isize, @intCast(s.end)) +
-                    @as(isize, @intCast(new_len)) - @as(isize, @intCast(old_len));
-                const body_signed: isize = @as(isize, @intCast(s.body_start)) +
-                    @as(isize, @intCast(new_len)) - @as(isize, @intCast(old_len));
-                s.start = @intCast(start_signed);
-                s.end = @intCast(end_signed);
-                s.body_start = @intCast(body_signed);
-            }
-        }
-        const opening_gt = std.mem.indexOfScalar(u8, new_buf.items, '>') orelse unreachable;
-        ms.spans.items[span_idx] = .{
-            .start = old.start,
-            .end = old.start + new_len,
-            .body_start = old.start + opening_gt + 1,
-            .row = row,
-            .col = col,
-        };
+        // sheet_idx is bounded by sheet_paths.len above and
+        // sheet_paths.len == workbook.sheetCount() post-#77, so the
+        // typed-overlay branch always fires. The legacy
+        // pending_mutations path is unreachable.
+        unreachable;
     }
 
     pub fn setCells(
