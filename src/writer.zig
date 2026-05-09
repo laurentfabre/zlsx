@@ -2172,7 +2172,6 @@ fn validateHyperlinkRange(range: []const u8) !void {
 // emitBorderSide, emitDxfBorderSide, borderStyleName,
 // patternTypeName) moved to pkg/styles_plan.zig per B3 iter-wr-2.
 
-
 /// XML 1.0 forbids most C0 control bytes in document content.
 /// Allowed: 0x09 (tab), 0x0A (LF), 0x0D (CR). Forbidden:
 /// 0x00–0x08, 0x0B, 0x0C, 0x0E–0x1F, plus 0x7F (DEL — XML 1.0
