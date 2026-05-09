@@ -462,19 +462,38 @@ pub const Workbook = struct {
     /// will call `Workbook.empty(alloc)`, populate via `addSheet` +
     /// `setCell` / `appendRows`, then `save(path)`.
     ///
-    /// **Iteration order**: this method depends on `PartStore.fresh`,
-    /// which is being added in a parallel branch
-    /// (`feat/iter-wr-prep-partstore-fresh`). Until that lands, the
-    /// implementation uses a private `freshPartStore` helper inside
-    /// this file — it materialises the four required parts via the
-    /// existing `PartStore.open` path by writing a tiny synthetic
-    /// archive to a temp file, opening it, then deleting the file.
-    /// The merge order will be: PartStore.fresh PR lands first, then
-    /// this file's `freshPartStore` helper is replaced with a single
-    /// `PartStore.fresh(allocator)` call.
     pub fn empty(allocator: Allocator) Error!Workbook {
-        var store = try freshPartStore(allocator);
+        var store = try PartStore.fresh(allocator);
         errdefer store.deinit();
+
+        // `PartStore.fresh` seeds only `[Content_Types].xml`. Seed
+        // the OOXML-minimum remaining parts before handing off to
+        // `fromStore`. `addPart` appends the corresponding
+        // `<Default>` / `<Override>` to CT.xml automatically.
+        try store.addPart(
+            "_rels/.rels",
+            "application/vnd.openxmlformats-package.relationships+xml",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+                "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>" ++
+                "</Relationships>",
+        );
+        try store.addPart(
+            "xl/workbook.xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+                "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">" ++
+                "<sheets></sheets>" ++
+                "</workbook>",
+        );
+        try store.addPart(
+            "xl/_rels/workbook.xml.rels",
+            "application/vnd.openxmlformats-package.relationships+xml",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+                "</Relationships>",
+        );
+
         return try fromStore(allocator, store);
     }
 
@@ -2027,161 +2046,6 @@ pub const Workbook = struct {
         _ = try self.rewriteAllValidationsAndConditionalFormats(edit, target);
     }
 };
-
-/// Build a fresh `PartStore` for an empty workbook. Materialises the
-/// OOXML-minimum required parts:
-///   - `[Content_Types].xml` — `<Default>` for `xml` + `rels`, plus
-///     a single `<Override>` for `xl/workbook.xml`. No per-sheet
-///     override (zero sheets at construction time; `addSheet`
-///     splices the sheet override on demand).
-///   - `_rels/.rels` — package-level relationship pointing at
-///     `xl/workbook.xml`.
-///   - `xl/workbook.xml` — empty `<workbook>` with the standard
-///     namespaces and an empty `<sheets/>` element.
-///   - `xl/_rels/workbook.xml.rels` — empty `<Relationships>`.
-///
-/// **Temporary scaffolding**: this helper exists because
-/// `PartStore.open` is the only constructor PartStore exposes today.
-/// The parallel `feat/iter-wr-prep-partstore-fresh` branch adds
-/// `PartStore.fresh(allocator)` — once that lands, replace the body
-/// of `Workbook.empty` with a single `PartStore.fresh(allocator)`
-/// call and delete this helper.
-fn freshPartStore(allocator: Allocator) Error!PartStore {
-    const content_types =
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
-        "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">" ++
-        "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>" ++
-        "<Default Extension=\"xml\" ContentType=\"application/xml\"/>" ++
-        "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>" ++
-        "</Types>";
-    const root_rels =
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
-        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
-        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>" ++
-        "</Relationships>";
-    // `<sheets></sheets>` (open/close form) NOT `<sheets/>`. The
-    // existing `patchWorkbookXmlAddSheet` helper splices new sheet
-    // entries before `</sheets>`; the self-closing form would force a
-    // separate code path with no tangible benefit. Empty body is
-    // valid OOXML — the spec doesn't require `<sheet>` children at
-    // the schema level.
-    const workbook_xml =
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
-        "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">" ++
-        "<sheets></sheets>" ++
-        "</workbook>";
-    const workbook_rels =
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
-        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
-        "</Relationships>";
-
-    const FreshEntry = struct { name: []const u8, body: []const u8 };
-    const entries = [_]FreshEntry{
-        .{ .name = "[Content_Types].xml", .body = content_types },
-        .{ .name = "_rels/.rels", .body = root_rels },
-        .{ .name = "xl/workbook.xml", .body = workbook_xml },
-        .{ .name = "xl/_rels/workbook.xml.rels", .body = workbook_rels },
-    };
-
-    // Synthesise a STORED-method ZIP in memory (LFH + payload, then
-    // central directory, then EOCD). Mirrors `writeMinimalSstLessXlsx`
-    // — the structure is fixed, no compression, no extra fields.
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-
-    const Lfh = struct { offset: u32, name: []const u8, body: []const u8, crc: u32 };
-    var lfhs: std.ArrayList(Lfh) = .empty;
-    defer lfhs.deinit(allocator);
-
-    for (entries) |e| {
-        const off: u32 = @intCast(buf.items.len);
-        const crc = std.hash.Crc32.hash(e.body);
-        var hdr: [30]u8 = undefined;
-        std.mem.writeInt(u32, hdr[0..4], 0x04034b50, .little);
-        std.mem.writeInt(u16, hdr[4..6], 20, .little);
-        std.mem.writeInt(u16, hdr[6..8], 0, .little);
-        std.mem.writeInt(u16, hdr[8..10], 0, .little); // STORED
-        std.mem.writeInt(u16, hdr[10..12], 0, .little);
-        std.mem.writeInt(u16, hdr[12..14], 0, .little);
-        std.mem.writeInt(u32, hdr[14..18], crc, .little);
-        std.mem.writeInt(u32, hdr[18..22], @intCast(e.body.len), .little);
-        std.mem.writeInt(u32, hdr[22..26], @intCast(e.body.len), .little);
-        std.mem.writeInt(u16, hdr[26..28], @intCast(e.name.len), .little);
-        std.mem.writeInt(u16, hdr[28..30], 0, .little);
-        try buf.appendSlice(allocator, &hdr);
-        try buf.appendSlice(allocator, e.name);
-        try buf.appendSlice(allocator, e.body);
-        try lfhs.append(allocator, .{ .offset = off, .name = e.name, .body = e.body, .crc = crc });
-    }
-
-    const cd_off: u32 = @intCast(buf.items.len);
-    for (lfhs.items) |l| {
-        var cdfh: [46]u8 = undefined;
-        std.mem.writeInt(u32, cdfh[0..4], 0x02014b50, .little);
-        std.mem.writeInt(u16, cdfh[4..6], 20, .little);
-        std.mem.writeInt(u16, cdfh[6..8], 20, .little);
-        std.mem.writeInt(u16, cdfh[8..10], 0, .little);
-        std.mem.writeInt(u16, cdfh[10..12], 0, .little);
-        std.mem.writeInt(u16, cdfh[12..14], 0, .little);
-        std.mem.writeInt(u16, cdfh[14..16], 0, .little);
-        std.mem.writeInt(u32, cdfh[16..20], l.crc, .little);
-        std.mem.writeInt(u32, cdfh[20..24], @intCast(l.body.len), .little);
-        std.mem.writeInt(u32, cdfh[24..28], @intCast(l.body.len), .little);
-        std.mem.writeInt(u16, cdfh[28..30], @intCast(l.name.len), .little);
-        std.mem.writeInt(u16, cdfh[30..32], 0, .little);
-        std.mem.writeInt(u16, cdfh[32..34], 0, .little);
-        std.mem.writeInt(u16, cdfh[34..36], 0, .little);
-        std.mem.writeInt(u16, cdfh[36..38], 0, .little);
-        std.mem.writeInt(u32, cdfh[38..42], 0, .little);
-        std.mem.writeInt(u32, cdfh[42..46], l.offset, .little);
-        try buf.appendSlice(allocator, &cdfh);
-        try buf.appendSlice(allocator, l.name);
-    }
-    const cd_size: u32 = @intCast(@as(u32, @intCast(buf.items.len)) - cd_off);
-
-    var eocd: [22]u8 = undefined;
-    std.mem.writeInt(u32, eocd[0..4], 0x06054b50, .little);
-    std.mem.writeInt(u16, eocd[4..6], 0, .little);
-    std.mem.writeInt(u16, eocd[6..8], 0, .little);
-    std.mem.writeInt(u16, eocd[8..10], @intCast(lfhs.items.len), .little);
-    std.mem.writeInt(u16, eocd[10..12], @intCast(lfhs.items.len), .little);
-    std.mem.writeInt(u32, eocd[12..16], cd_size, .little);
-    std.mem.writeInt(u32, eocd[16..20], cd_off, .little);
-    std.mem.writeInt(u16, eocd[20..22], 0, .little);
-    try buf.appendSlice(allocator, &eocd);
-
-    // Materialise to a unique temp file under `.zig-cache/` (always
-    // writable in CI), open via `PartStore.open`, then unlink. The
-    // PartStore keeps the file handle open for the lifetime of the
-    // store; on POSIX, unlinking a file with an open handle is safe
-    // — the inode persists until the last close. On Windows the
-    // unlink is best-effort (`catch {}`) for the same reason as the
-    // existing `writeMinimalSstLessXlsx` callers.
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
-    var tmp_buf: [256]u8 = undefined;
-    const tmp_path = std.fmt.bufPrint(
-        &tmp_buf,
-        ".zig-cache/wb-empty-scaffold-{d}.xlsx",
-        .{prng.random().int(u32)},
-    ) catch return error.WriteFailed;
-
-    const f = std.fs.cwd().createFile(tmp_path, .{}) catch return error.WriteFailed;
-    f.writeAll(buf.items) catch {
-        f.close();
-        std.fs.cwd().deleteFile(tmp_path) catch {};
-        return error.WriteFailed;
-    };
-    f.close();
-
-    const store = PartStore.open(allocator, tmp_path) catch |err| {
-        std.fs.cwd().deleteFile(tmp_path) catch {};
-        return err;
-    };
-    // Best-effort cleanup. PartStore keeps the file handle open until
-    // its `deinit`; the inode survives the unlink on POSIX.
-    std.fs.cwd().deleteFile(tmp_path) catch {};
-    return store;
-}
 
 /// Validate a candidate sheet name per Excel's rules. v1 contract
 /// (see `Workbook.renameSheet` docstring for the rationale):
