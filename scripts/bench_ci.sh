@@ -33,6 +33,9 @@ echo "[bench-ci] building benchmark binaries (ReleaseFast)..."
     -Mzlsx_sst_plan=pkg/sst_plan.zig \
     -Mzlsx_styles_plan=pkg/styles_plan.zig \
     -Mzlsx_workbook_xml_plan=pkg/workbook_xml_plan.zig \
+    --dep zlsx_sst_plan --dep zlsx_zip -Mzlsx=src/xlsx.zig \
+    -Mzlsx_sst_plan=pkg/sst_plan.zig \
+    -Mzlsx_zip=pkg/zip.zig \
     -O ReleaseFast \
     -femit-bin="$OUT_DIR/bench_zlsx_read"
 "$ZIG_BIN" build-exe \
@@ -41,6 +44,9 @@ echo "[bench-ci] building benchmark binaries (ReleaseFast)..."
     -Mzlsx_sst_plan=pkg/sst_plan.zig \
     -Mzlsx_styles_plan=pkg/styles_plan.zig \
     -Mzlsx_workbook_xml_plan=pkg/workbook_xml_plan.zig \
+    --dep zlsx_sst_plan --dep zlsx_zip -Mzlsx=src/xlsx.zig \
+    -Mzlsx_sst_plan=pkg/sst_plan.zig \
+    -Mzlsx_zip=pkg/zip.zig \
     -O ReleaseFast \
     -femit-bin="$OUT_DIR/bench_zlsx_write"
 
