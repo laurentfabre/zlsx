@@ -37,6 +37,14 @@ const std = @import("std");
 const xlsx = @import("xlsx.zig");
 const casefold = @import("unicode/casefold.zig");
 
+// B3 iter-wr-1: SST unification. Writer stages strings + rich entries
+// through the shared `SstExtensionPlan` substrate (see
+// `pkg/sst_plan.zig`) instead of a Writer-local pool. The plan module
+// is std-only, so this dep doesn't form a cycle through `pkg/workbook`.
+const sst_plan = @import("zlsx_sst_plan");
+const SstExtensionPlan = sst_plan.SstExtensionPlan;
+const PlanRichRun = sst_plan.RichRun;
+
 const Allocator = std.mem.Allocator;
 
 /// Returns true iff `n` can be represented exactly as an IEEE-754 double
@@ -394,16 +402,19 @@ pub const Writer = struct {
     allocator: Allocator,
     // Accumulated sheet writers (owned).
     sheets: std.ArrayListUnmanaged(*SheetWriter) = .{},
-    // Shared-string table: unique strings + lookup from content → index.
-    sst_strings: std.ArrayListUnmanaged([]u8) = .{},
-    sst_index: std.StringHashMapUnmanaged(u32) = .{},
-    // Parallel to `sst_strings`: true → the entry holds pre-serialized
-    // rich-text `<r>…</r>` inner body (emitted as-is between `<si>` and
-    // `</si>`); false → plain text, wrapped with `<t xml:space="preserve">`
-    // on emit. Set by `sstInternRich`; read in the SST emit loop.
-    sst_is_rich: std.ArrayListUnmanaged(bool) = .{},
+    // Shared-string table substrate (B3 iter-wr-1). Plain entries land
+    // in `sst_plan.new_strings` (O(1) dedup via the hash side-index);
+    // rich entries land in `sst_plan.new_rich_strings` (no dedup,
+    // matches `xlsx.Writer`'s iter33 policy). `base_index` stays at 0
+    // for fresh-emit, so plan-level indices ARE the SST indices the
+    // emit loop hands to `<v>{idx}</v>`. Replaces the four pre-iter-wr-1
+    // fields (`sst_strings` / `sst_index` / `sst_is_rich` / `sst_count`).
+    sst_plan: SstExtensionPlan = .{},
     // Total number of string-typed cells written across all sheets
-    // (informational — OOXML's <sst count="..."> field).
+    // (informational — OOXML's <sst count="..."> field). Distinct from
+    // `sst_plan.new_strings.items.len` (= uniqueCount); a single cell
+    // hitting an existing entry still bumps `sst_count` but leaves
+    // `new_strings.items.len` unchanged.
     sst_count: u64 = 0,
     // Registered styles (unique). Index 0 in the emitted <cellXfs> is the
     // default no-style entry; user styles start at 1 so the value
@@ -436,10 +447,7 @@ pub const Writer = struct {
             self.allocator.destroy(s);
         }
         self.sheets.deinit(self.allocator);
-        for (self.sst_strings.items) |s| self.allocator.free(s);
-        self.sst_strings.deinit(self.allocator);
-        self.sst_index.deinit(self.allocator);
-        self.sst_is_rich.deinit(self.allocator);
+        self.sst_plan.deinit(self.allocator);
         // Each style owns its font_name / number_format slices (if any)
         // on the writer's heap; drop them here before the styles
         // ArrayList goes.
@@ -608,57 +616,58 @@ pub const Writer = struct {
         });
     }
 
-    /// Return the 0-based SST index for `s`. Dedups; copies the string
-    /// into the writer's pool on first sight so callers don't need to
-    /// keep it alive.
+    /// Return the 0-based SST index for plain string `s`. Dedups
+    /// against `sst_plan.new_strings` via the plan's O(1) hash
+    /// side-index; copies the string into the plan's pool on first
+    /// sight so callers don't need to keep it alive.
+    ///
+    /// `base_index` is 0 in fresh-emit, so the plan index IS the SST
+    /// index — no further offset needed at the call site.
     fn sstIntern(self: *Writer, s: []const u8) !u32 {
-        if (self.sst_index.get(s)) |idx| return idx;
-        const owned = try self.allocator.dupe(u8, s);
-        errdefer self.allocator.free(owned);
-        const idx: u32 = @intCast(self.sst_strings.items.len);
-        try self.sst_strings.append(self.allocator, owned);
-        try self.sst_is_rich.append(self.allocator, false);
-        try self.sst_index.put(self.allocator, owned, idx);
-        return idx;
+        return try self.sst_plan.registerNewPlain(self.allocator, s);
     }
 
-    /// Serialise a rich-text run list into a pre-formatted `<r>…</r>`
-    /// inner body and store it as a new SST entry. Always appends
-    /// (no dedup — rich-text entries are rare and dedup would need
-    /// hashing the full formatted form, which iter33 skips).
-    /// Returns the SST index for use as `<v>{idx}</v>` in a
-    /// `<c t="s">` cell.
+    /// Stage a rich-text run list into the plan's typed
+    /// `new_rich_strings` axis and return the 0-based SST index.
+    /// Always appends (no dedup — same iter33 policy as before; rich
+    /// entries are rare enough that hashing the formatted form costs
+    /// more than it saves). Translates the writer's `RichTextRun`
+    /// shape into the plan's `RichRun` shape: u32 ARGB → 8-hex string
+    /// (the plan stores pre-formatted color bytes since Workbook's
+    /// delta path reads raw `<color rgb="…"/>` slices straight from
+    /// the source XML); `size` (f32) → `font_size` (f32). Strike +
+    /// underline ride along as `false` because the writer's public
+    /// surface doesn't expose them — the SST emitter consults those
+    /// flags but they remain false-equivalent here.
     fn sstInternRich(self: *Writer, runs: []const RichTextRun) !u32 {
-        var buf: std.ArrayListUnmanaged(u8) = .{};
-        errdefer buf.deinit(self.allocator);
-        for (runs) |r| {
-            try buf.appendSlice(self.allocator, "<r>");
-            // <rPr>…</rPr> — only emit when at least one property is set.
-            const has_props = r.bold or r.italic or r.color_argb != null or
-                r.size != null or r.font_name != null;
-            if (has_props) {
-                try buf.appendSlice(self.allocator, "<rPr>");
-                if (r.bold) try buf.appendSlice(self.allocator, "<b/>");
-                if (r.italic) try buf.appendSlice(self.allocator, "<i/>");
-                if (r.size) |sz| try buf.print(self.allocator, "<sz val=\"{d}\"/>", .{sz});
-                if (r.color_argb) |c| try buf.print(self.allocator, "<color rgb=\"{X:0>8}\"/>", .{c});
-                if (r.font_name) |n| {
-                    try buf.appendSlice(self.allocator, "<rFont val=\"");
-                    try appendXmlEscaped(self.allocator, &buf, n);
-                    try buf.appendSlice(self.allocator, "\"/>");
-                }
-                try buf.appendSlice(self.allocator, "</rPr>");
-            }
-            try buf.appendSlice(self.allocator, "<t xml:space=\"preserve\">");
-            try appendXmlEscaped(self.allocator, &buf, r.text);
-            try buf.appendSlice(self.allocator, "</t></r>");
+        // Translate writer-runs → plan-runs into a per-call arena so
+        // the plan registrar (which dups every byte itself) sees an
+        // owned buffer; on success the arena is freed and the plan
+        // owns the duped copies.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const aalloc = arena.allocator();
+
+        const plan_runs = try aalloc.alloc(PlanRichRun, runs.len);
+        for (runs, 0..) |r, i| {
+            const color: ?[]const u8 = if (r.color_argb) |c| blk: {
+                var hex_buf: [8]u8 = undefined;
+                _ = std.fmt.bufPrint(&hex_buf, "{X:0>8}", .{c}) catch unreachable;
+                break :blk try aalloc.dupe(u8, &hex_buf);
+            } else null;
+            plan_runs[i] = .{
+                .text = r.text,
+                .bold = r.bold,
+                .italic = r.italic,
+                .underline = false,
+                .strike = false,
+                .font_name = r.font_name,
+                .font_size = r.size,
+                .color_argb = color,
+            };
         }
-        const owned = try buf.toOwnedSlice(self.allocator);
-        errdefer self.allocator.free(owned);
-        const idx: u32 = @intCast(self.sst_strings.items.len);
-        try self.sst_strings.append(self.allocator, owned);
-        try self.sst_is_rich.append(self.allocator, true);
-        return idx;
+        const entry = try self.sst_plan.registerNewRich(self.allocator, plan_runs);
+        return self.sst_plan.indexOfRich(entry) orelse unreachable;
     }
 
     /// Serialise everything and write to `path`. Overwrites.
@@ -1193,20 +1202,60 @@ pub const Writer = struct {
             try zw.addEntry(vml_name, vml.items);
         }
 
-        // 6. xl/sharedStrings.xml
+        // 6. xl/sharedStrings.xml — emits the staged
+        // `SstExtensionPlan` (B3 iter-wr-1). Plain entries first
+        // (matches the index ordering `sstIntern` returns), then rich
+        // entries — `indexOfRich` assumes that layout. `xml:space=
+        // "preserve"` is unconditional on plain entries (Writer's
+        // pre-iter-wr-1 byte contract; differs from
+        // `pkg/workbook.zig::appendNewSiEntries` which emits the
+        // attribute conditionally per OOXML's whitespace rules).
         {
             var sst: std.ArrayListUnmanaged(u8) = .{};
             defer sst.deinit(alloc);
-            try sst.print(alloc, SST_HEAD_FMT, .{ self.sst_count, self.sst_strings.items.len });
-            for (self.sst_strings.items, self.sst_is_rich.items) |s, is_rich| {
+            const unique_count = self.sst_plan.new_strings.items.len +
+                self.sst_plan.new_rich_strings.items.len;
+            try sst.print(alloc, SST_HEAD_FMT, .{ self.sst_count, unique_count });
+            for (self.sst_plan.new_strings.items) |s| {
+                try sst.appendSlice(alloc, "<si><t xml:space=\"preserve\">");
+                try appendXmlEscaped(alloc, &sst, s);
+                try sst.appendSlice(alloc, "</t></si>");
+            }
+            for (self.sst_plan.new_rich_strings.items) |entry| {
                 try sst.appendSlice(alloc, "<si>");
-                if (is_rich) {
-                    // Pre-serialised `<r>…</r>` body — emit verbatim.
-                    try sst.appendSlice(alloc, s);
-                } else {
+                for (entry.runs) |r| {
+                    try sst.appendSlice(alloc, "<r>");
+                    // <rPr>…</rPr> — only emit when at least one prop is
+                    // set. Underline + strike are storage-only on the
+                    // plan side; Writer's RichTextRun never sets them
+                    // (false-equivalent), so they don't gate `has_props`
+                    // and stay un-emitted, preserving the byte format.
+                    const has_props = r.bold or r.italic or r.color_argb != null or
+                        r.font_size != null or r.font_name != null;
+                    if (has_props) {
+                        try sst.appendSlice(alloc, "<rPr>");
+                        if (r.bold) try sst.appendSlice(alloc, "<b/>");
+                        if (r.italic) try sst.appendSlice(alloc, "<i/>");
+                        if (r.font_size) |sz| try sst.print(alloc, "<sz val=\"{d}\"/>", .{sz});
+                        if (r.color_argb) |c| {
+                            // Plan stores pre-formatted 8-hex bytes;
+                            // emit verbatim (matches Writer's pre-
+                            // iter-wr-1 `{X:0>8}` output, sourced
+                            // upstream by `sstInternRich`).
+                            try sst.appendSlice(alloc, "<color rgb=\"");
+                            try sst.appendSlice(alloc, c);
+                            try sst.appendSlice(alloc, "\"/>");
+                        }
+                        if (r.font_name) |n| {
+                            try sst.appendSlice(alloc, "<rFont val=\"");
+                            try appendXmlEscaped(alloc, &sst, n);
+                            try sst.appendSlice(alloc, "\"/>");
+                        }
+                        try sst.appendSlice(alloc, "</rPr>");
+                    }
                     try sst.appendSlice(alloc, "<t xml:space=\"preserve\">");
-                    try appendXmlEscaped(alloc, &sst, s);
-                    try sst.appendSlice(alloc, "</t>");
+                    try appendXmlEscaped(alloc, &sst, r.text);
+                    try sst.appendSlice(alloc, "</t></r>");
                 }
                 try sst.appendSlice(alloc, "</si>");
             }
@@ -3581,7 +3630,7 @@ test "Writer: multi-sheet round-trip + SST dedup" {
         try w.save(tmp_path);
 
         // 3 unique strings after dedup: hello, world, zig.
-        try std.testing.expectEqual(@as(usize, 3), w.sst_strings.items.len);
+        try std.testing.expectEqual(@as(usize, 3), w.sst_plan.new_strings.items.len);
         // 4 string-cell writes total.
         try std.testing.expectEqual(@as(u64, 4), w.sst_count);
     }
@@ -5479,7 +5528,7 @@ test "fuzz Writer.sstIntern dedup invariant" {
             try seen_indices.put(s, idx);
         }
         // strings.len must equal the distinct count.
-        try std.testing.expectEqual(@as(u32, @intCast(seen_indices.count())), @as(u32, @intCast(w.sst_strings.items.len)));
+        try std.testing.expectEqual(@as(u32, @intCast(seen_indices.count())), @as(u32, @intCast(w.sst_plan.new_strings.items.len)));
     }
 }
 
@@ -6072,7 +6121,7 @@ test "fuzz Writer state-machine: random op ordering with invariants" {
                 else => {
                     // No-op probe — repeatedly query sheet metadata.
                     _ = w.styles.items.len;
-                    _ = w.sst_strings.items.len;
+                    _ = w.sst_plan.new_strings.items.len;
                     _ = w.sheets.items.len;
                 },
             }

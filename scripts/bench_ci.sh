@@ -29,12 +29,14 @@ echo "[bench-ci] building benchmark binaries (ReleaseFast)..."
 # ("zig build-exe FILE" + "-Mroot=FILE" together is rejected as duplicate).
 "$ZIG_BIN" build-exe \
     --dep zlsx -Mroot=tests/bench/bench_zlsx.zig \
-    -Mzlsx=src/xlsx.zig \
+    --dep zlsx_sst_plan -Mzlsx=src/xlsx.zig \
+    -Mzlsx_sst_plan=pkg/sst_plan.zig \
     -O ReleaseFast \
     -femit-bin="$OUT_DIR/bench_zlsx_read"
 "$ZIG_BIN" build-exe \
     --dep zlsx -Mroot=tests/bench/bench_write_zlsx.zig \
-    -Mzlsx=src/xlsx.zig \
+    --dep zlsx_sst_plan -Mzlsx=src/xlsx.zig \
+    -Mzlsx_sst_plan=pkg/sst_plan.zig \
     -O ReleaseFast \
     -femit-bin="$OUT_DIR/bench_zlsx_write"
 
