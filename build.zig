@@ -39,6 +39,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // B3 iter-wr-3: shared workbook.xml fresh-emit plan substrate
+    // (defined-name validator + storage + emitter). Same std-only,
+    // cycle-free shape as `sst_plan_mod` — both Workbook and
+    // `xlsx.Writer` import this without forming `writer → zlsx_pkg
+    // → workbook → zlsx → writer`.
+    const workbook_xml_plan_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/workbook_xml_plan.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Public module. Consumers add zlsx to their build.zig.zon as a
     // path or git dependency, then `@import("zlsx")`.
     const zlsx_mod = b.addModule("zlsx", .{
@@ -48,6 +59,7 @@ pub fn build(b: *std.Build) void {
     });
     zlsx_mod.addImport("zlsx_sst_plan", sst_plan_mod);
     zlsx_mod.addImport("zlsx_styles_plan", styles_plan_mod);
+    zlsx_mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
 
     // Unit tests (embedded in src/xlsx.zig, including the fuzz suite).
     const unit_mod = b.createModule(.{
@@ -57,6 +69,7 @@ pub fn build(b: *std.Build) void {
     });
     unit_mod.addImport("zlsx_sst_plan", sst_plan_mod);
     unit_mod.addImport("zlsx_styles_plan", styles_plan_mod);
+    unit_mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
     const unit_tests = b.addTest(.{ .root_module = unit_mod });
     const test_step = b.step("test", "Run zlsx unit + fuzz-smoke tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
@@ -78,6 +91,7 @@ pub fn build(b: *std.Build) void {
     });
     unit_fuzz_mod.addImport("zlsx_sst_plan", sst_plan_mod);
     unit_fuzz_mod.addImport("zlsx_styles_plan", styles_plan_mod);
+    unit_fuzz_mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
     const unit_fuzz_tests = b.addTest(.{ .root_module = unit_fuzz_mod });
     const fuzz_step = b.step("fuzz", "Run coverage-guided fuzz targets (Linux x64; macOS/Windows broken upstream)");
     fuzz_step.dependOn(&b.addRunArtifact(unit_fuzz_tests).step);
@@ -141,6 +155,7 @@ pub fn build(b: *std.Build) void {
     });
     writer_mod.addImport("zlsx_sst_plan", sst_plan_mod);
     writer_mod.addImport("zlsx_styles_plan", styles_plan_mod);
+    writer_mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
     const writer_tests = b.addTest(.{ .root_module = writer_mod });
     test_step.dependOn(&b.addRunArtifact(writer_tests).step);
 
@@ -167,6 +182,17 @@ pub fn build(b: *std.Build) void {
     });
     const styles_plan_tests = b.addTest(.{ .root_module = styles_plan_tests_mod });
     test_step.dependOn(&b.addRunArtifact(styles_plan_tests).step);
+    // B3 iter-wr-3 standalone tests for the workbook.xml fresh-emit
+    // plan substrate. Same shape as `sst_plan_tests_mod`: a tiny
+    // module exercising the validator + plan + emit invariants
+    // without the surrounding consumer wiring.
+    const workbook_xml_plan_tests_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/workbook_xml_plan.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const workbook_xml_plan_tests = b.addTest(.{ .root_module = workbook_xml_plan_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(workbook_xml_plan_tests).step);
 
     // Unicode case-fold + NFC module tests (A1: Excel sheet-name
     // dedup, wired into validateSheetName + Editor.isSheetNameTaken).
@@ -240,6 +266,7 @@ pub fn build(b: *std.Build) void {
     // `addStyle` / `addDxf` / `internNumFmt` thin pass-throughs that
     // delegate to a `StylesPlan`, mirroring the SST-plan wiring.
     package_mod.addImport("zlsx_styles_plan", styles_plan_mod);
+    package_mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
 
     // After the B2 iter-er-0 Editor relocation, `cli_mod` reaches
     // Editor through `zlsx_pkg` and xlsx via the named `zlsx` dep.
@@ -315,6 +342,7 @@ pub fn build(b: *std.Build) void {
     package_workbook_tests_mod.addImport("zlsx", zlsx_mod);
     package_workbook_tests_mod.addImport("zlsx_sst_plan", sst_plan_mod);
     package_workbook_tests_mod.addImport("zlsx_styles_plan", styles_plan_mod);
+    package_workbook_tests_mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
     const package_workbook_tests = b.addTest(.{ .root_module = package_workbook_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_workbook_tests).step);
 
