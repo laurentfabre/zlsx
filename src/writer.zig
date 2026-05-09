@@ -45,6 +45,16 @@ const sst_plan = @import("zlsx_sst_plan");
 const SstExtensionPlan = sst_plan.SstExtensionPlan;
 const PlanRichRun = sst_plan.RichRun;
 
+// B3 iter-wr-2: Styles unification. Writer's style + dxf + numFmt
+// registries + the `xl/styles.xml` emitter live in
+// `pkg/styles_plan.zig` so Workbook's fresh-emit path can use the
+// same code without a circular module dep. Type-of-record (`Style`,
+// `Dxf`, `BorderSide`, `BorderStyle`, `PatternType`, `HAlign`) is
+// re-exported below to keep the writer's public API surface
+// unchanged.
+const styles_plan_mod = @import("zlsx_styles_plan");
+pub const StylesPlan = styles_plan_mod.StylesPlan;
+
 const Allocator = std.mem.Allocator;
 
 /// Returns true iff `n` can be represented exactly as an IEEE-754 double
@@ -113,60 +123,18 @@ const SST_HEAD_FMT: []const u8 =
 ;
 const SST_TAIL: []const u8 = "</sst>";
 
-// Static skeleton for xl/styles.xml. Fixed sections (fills at index 0=none
-// and 1=gray125, empty border, default cellStyleXfs entry, "Normal"
-// cellStyle) — fonts and cellXfs get appended dynamically.
-const STYLES_HEAD: []const u8 =
-    \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-    \\<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-;
-const STYLES_FONTS_DEFAULT: []const u8 =
-    \\<font><sz val="11"/><name val="Calibri"/></font>
-;
-const STYLES_FILLS: []const u8 =
-    \\<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>
-;
-const STYLES_BORDERS: []const u8 =
-    \\<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
-;
-const STYLES_CELL_STYLE_XFS: []const u8 =
-    \\<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
-;
-const STYLES_DEFAULT_CELL_XF: []const u8 =
-    \\<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
-;
-const STYLES_CELL_STYLES: []const u8 =
-    \\<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
-;
-const STYLES_TAIL: []const u8 = "</styleSheet>";
-
-/// OOXML reserves numFmtIds 0..=49 for built-ins; user numFmts must
-/// start at 164 (Excel's convention — 50..=163 are "reserved").
-const NUM_FMT_BASE: u32 = 164;
+// xl/styles.xml skeleton + emit logic moved to `pkg/styles_plan.zig`
+// (B3 iter-wr-2). The static blobs (`STYLES_HEAD`, `STYLES_FONTS_DEFAULT`,
+// `STYLES_CELL_STYLE_XFS`, `STYLES_DEFAULT_CELL_XF`, `STYLES_CELL_STYLES`,
+// `STYLES_TAIL`) and the `NUM_FMT_BASE` constant live there now.
 
 // ─── Writer public API ───────────────────────────────────────────────
 
-/// OOXML border-side style enum. `.none` is the default (no side
-/// emitted); numeric tag values are part of the C ABI — append
-/// new entries, never reorder.
-pub const BorderStyle = enum(u8) {
-    none = 0,
-    thin = 1,
-    medium = 2,
-    dashed = 3,
-    dotted = 4,
-    thick = 5,
-    double = 6,
-    hair = 7,
-    medium_dashed = 8,
-    dash_dot = 9,
-    medium_dash_dot = 10,
-    dash_dot_dot = 11,
-    medium_dash_dot_dot = 12,
-    slant_dash_dot = 13,
-};
+/// OOXML border-side style enum. Hosted by `pkg/styles_plan.zig` —
+/// re-exported so `xlsx.Writer.addStyle(.{ ... .border_left = ... })`
+/// keeps its pre-iter-wr-2 surface.
+pub const BorderStyle = styles_plan_mod.BorderStyle;
 
-/// One side of a cell border (left / right / top / bottom / diagonal).
 /// Comparison operator for `cellIs` conditional-format rules.
 /// Names mirror `DataValidationOp`; the two OOXML enums share the
 /// same wire-format tokens but live in different grammar slots.
@@ -204,23 +172,7 @@ pub const CfOperator = enum {
 /// Scoped to the subset of properties real conditional formats
 /// actually toggle (bold / font color / solid fill). Full differential
 /// font / border support can layer on later without breaking shape.
-pub const Dxf = struct {
-    font_bold: bool = false,
-    font_italic: bool = false,
-    font_color_argb: ?u32 = null,
-    /// Font size in points. Rare in CF rules but cheap to support —
-    /// the `<sz val="…"/>` child renders the differential font at
-    /// an explicit pt size instead of inheriting the cell style.
-    font_size: ?f32 = null,
-    fill_fg_argb: ?u32 = null,
-    /// Per-side border overrides — emitted inside the dxf's
-    /// `<border>` block. Use `.none` (the default) to inherit the
-    /// cell's existing border on that side.
-    border_left: BorderSide = .{},
-    border_right: BorderSide = .{},
-    border_top: BorderSide = .{},
-    border_bottom: BorderSide = .{},
-};
+pub const Dxf = styles_plan_mod.Dxf;
 
 /// Cell comment (note) attached via `SheetWriter.addComment`. Emits
 /// as `<comments><authors/><commentList/></comments>` under
@@ -260,118 +212,10 @@ pub const RichRowCell = union(enum) {
     rich: []const RichTextRun,
 };
 
-pub const BorderSide = struct {
-    style: BorderStyle = .none,
-    /// ARGB colour for the border line. Null = OOXML default (auto).
-    color_argb: ?u32 = null,
-};
-
-/// OOXML `<patternFill patternType="…"/>` values. `.none` is the
-/// default (no fill); numeric tag values are part of the C ABI —
-/// append new entries, never reorder.
-pub const PatternType = enum(u8) {
-    none = 0,
-    solid = 1,
-    gray125 = 2,
-    gray0625 = 3,
-    dark_gray = 4,
-    medium_gray = 5,
-    light_gray = 6,
-    dark_horizontal = 7,
-    dark_vertical = 8,
-    dark_down = 9,
-    dark_up = 10,
-    dark_grid = 11,
-    dark_trellis = 12,
-    light_horizontal = 13,
-    light_vertical = 14,
-    light_down = 15,
-    light_up = 16,
-    light_grid = 17,
-    light_trellis = 18,
-};
-
-/// Horizontal alignment for a cell style. `.general` is the OOXML
-/// default (no `<alignment>` element emitted); nonzero values emit
-/// `<alignment horizontal="…"/>`. Numeric tag values are part of the
-/// C ABI — append new entries, never reorder.
-pub const HAlign = enum(u8) {
-    general = 0,
-    left = 1,
-    center = 2,
-    right = 3,
-    fill = 4,
-    justify = 5,
-    center_continuous = 6,
-    distributed = 7,
-};
-
-/// Cell style registered via `Writer.addStyle`. Fields default to
-/// "unset" so `Writer.addStyle(.{ .font_bold = true })` produces
-/// the minimum-overhead styles.xml entry.
-///
-/// Phase 3b stages:
-///   - stage 1: font bold/italic                         [shipped]
-///   - stage 2 (this release): font name/size/color,
-///             horizontal alignment, wrap_text
-///   - stage 3: fills (patternType, fg/bg rgb)
-///   - stage 4: borders (left/right/top/bottom + style + color)
-///   - stage 5: number formats, column widths, freeze panes, auto_filter
-///
-/// `font_name` is caller-owned for the duration of the `addStyle`
-/// call; the writer dupes it into its own pool so callers can free
-/// the original immediately after.
-pub const Style = struct {
-    font_bold: bool = false,
-    font_italic: bool = false,
-    /// Null = default (11 pt). Must be positive and finite when set.
-    font_size: ?f32 = null,
-    /// Null = default ("Calibri"). Escaped for XML on emit.
-    font_name: ?[]const u8 = null,
-    /// Null = default (theme auto). ARGB packed: 0xAARRGGBB.
-    font_color_argb: ?u32 = null,
-    alignment_horizontal: HAlign = .general,
-    wrap_text: bool = false,
-    /// `.none` emits no fill (style points at fillId=0). Any other
-    /// value emits a `<patternFill>` element. For "solid" highlights
-    /// set `.fill_pattern = .solid` plus `.fill_fg_argb` to the
-    /// desired ARGB colour.
-    fill_pattern: PatternType = .none,
-    /// Foreground (pattern) colour, ARGB packed 0xAARRGGBB. Null = OOXML default.
-    fill_fg_argb: ?u32 = null,
-    /// Background (pattern backdrop) colour, ARGB packed 0xAARRGGBB. Null = OOXML default.
-    fill_bg_argb: ?u32 = null,
-    /// Cell border sides. Defaults emit no side — set any of these
-    /// `style` fields to get a border. A style that touches any
-    /// border field (sides or diagonal flags) gets its own
-    /// `<border>` entry in xl/styles.xml.
-    border_left: BorderSide = .{},
-    border_right: BorderSide = .{},
-    border_top: BorderSide = .{},
-    border_bottom: BorderSide = .{},
-    border_diagonal: BorderSide = .{},
-    /// Draw the diagonal from the lower-left corner upward to the
-    /// upper-right. Requires `border_diagonal.style != .none` to
-    /// render.
-    diagonal_up: bool = false,
-    /// Draw the diagonal from the upper-left corner downward to the
-    /// lower-right. Same `border_diagonal.style` gates rendering.
-    diagonal_down: bool = false,
-    /// OOXML number format string (e.g., "0.00", "m/d/yyyy",
-    /// "$#,##0.00"). Null = General. Custom strings register as user
-    /// numFmts starting at id 164; multiple styles using the same
-    /// format string share a single numFmtId.
-    number_format: ?[]const u8 = null,
-};
-
-fn hasBorder(s: Style) bool {
-    return s.border_left.style != .none or
-        s.border_right.style != .none or
-        s.border_top.style != .none or
-        s.border_bottom.style != .none or
-        s.border_diagonal.style != .none or
-        s.diagonal_up or s.diagonal_down;
-}
+pub const BorderSide = styles_plan_mod.BorderSide;
+pub const PatternType = styles_plan_mod.PatternType;
+pub const HAlign = styles_plan_mod.HAlign;
+pub const Style = styles_plan_mod.Style;
 
 /// A workbook-level defined name (named range, print area,
 /// validation source, etc.). Emitted in xl/workbook.xml as
@@ -416,21 +260,13 @@ pub const Writer = struct {
     // hitting an existing entry still bumps `sst_count` but leaves
     // `new_strings.items.len` unchanged.
     sst_count: u64 = 0,
-    // Registered styles (unique). Index 0 in the emitted <cellXfs> is the
-    // default no-style entry; user styles start at 1 so the value
-    // returned from `addStyle()` can be used directly as the cell's
-    // `s="N"` attribute.
-    styles: std.ArrayListUnmanaged(Style) = .{},
-    // Differential formats used by conditional-formatting rules.
-    // One entry per unique Dxf; rules reference them by dxfId.
-    // Emitted as `<dxfs count="N">…</dxfs>` inside styles.xml.
-    dxfs: std.ArrayListUnmanaged(Dxf) = .{},
-    // Number-format pool (stage 5). Parallel arrays: `num_fmts` owns
-    // the format strings (writer-allocated); `num_fmt_index` maps
-    // format → numFmtId (starting at 164 — OOXML reserves 0..=49 for
-    // built-ins). All values are unique.
-    num_fmts: std.ArrayListUnmanaged([]u8) = .{},
-    num_fmt_index: std.StringHashMapUnmanaged(u32) = .{},
+    // Styles substrate (B3 iter-wr-2). Replaces the pre-iter-wr-2
+    // `styles` / `dxfs` / `num_fmts` / `num_fmt_index` quartet of
+    // fields. The plan owns all duped style strings and the user-numFmt
+    // pool, dedupes by content, and emits byte-identical
+    // `xl/styles.xml`. Workbook (`pkg/workbook.zig`) uses the same
+    // type — see `pkg/styles_plan.zig`.
+    styles_plan: StylesPlan = .{},
     // Workbook-level defined names — emitted as `<definedNames>` in
     // xl/workbook.xml between `</sheets>` and `</workbook>`. Both
     // workbook-scoped (no localSheetId) and sheet-scoped names are
@@ -448,19 +284,8 @@ pub const Writer = struct {
         }
         self.sheets.deinit(self.allocator);
         self.sst_plan.deinit(self.allocator);
-        // Each style owns its font_name / number_format slices (if any)
-        // on the writer's heap; drop them here before the styles
-        // ArrayList goes.
-        for (self.styles.items) |s| {
-            if (s.font_name) |n| self.allocator.free(n);
-            if (s.number_format) |n| self.allocator.free(n);
-        }
-        self.styles.deinit(self.allocator);
-        // Dxfs carry no owned slices (fixed-size fields only).
-        self.dxfs.deinit(self.allocator);
-        for (self.num_fmts.items) |n| self.allocator.free(n);
-        self.num_fmts.deinit(self.allocator);
-        self.num_fmt_index.deinit(self.allocator);
+        // Plan owns all duped style strings + the user-numFmt pool.
+        self.styles_plan.deinit(self.allocator);
         for (self.defined_names.items) |dn| {
             self.allocator.free(dn.name);
             self.allocator.free(dn.refers_to);
@@ -473,46 +298,11 @@ pub const Writer = struct {
     /// structurally (including content-comparing `font_name`, not
     /// just slice-header comparing). Returning value is 1-based —
     /// cellXfs[0] is reserved for the default no-style record.
+    ///
+    /// Thin pass-through to `StylesPlan.addStyle`; see
+    /// `pkg/styles_plan.zig` for the dedup + validation logic.
     pub fn addStyle(self: *Writer, style: Style) !u32 {
-        // Validate stage-2 inputs up front so dedup doesn't have to
-        // handle subtly-equal-but-invalid specs.
-        if (style.font_size) |s| {
-            if (!std.math.isFinite(s) or s <= 0) return error.InvalidFontSize;
-        }
-        if (style.font_name) |n| {
-            if (n.len == 0) return error.InvalidFontName;
-        }
-        if (style.number_format) |n| {
-            if (n.len == 0) return error.InvalidNumberFormat;
-        }
-
-        // Side-effect of validation: register the format string in the
-        // numFmt pool (dedup via StringHashMap). Happens BEFORE dedup of
-        // the parent Style so we don't register formats for rejected
-        // styles.
-        if (style.number_format) |fmt| {
-            _ = try self.internNumFmt(fmt);
-        }
-
-        // Linear-scan dedup. Need content-equal font_name comparison
-        // (std.meta.eql on `?[]const u8` compares slice headers only).
-        for (self.styles.items, 0..) |existing, i| {
-            if (stylesEqual(existing, style)) return @intCast(i + 1);
-        }
-
-        // New entry — dupe font_name / number_format into writer-owned
-        // storage so the caller can free their buffers immediately.
-        var owned_style = style;
-        if (style.font_name) |n| {
-            owned_style.font_name = try self.allocator.dupe(u8, n);
-        }
-        errdefer if (owned_style.font_name) |n| self.allocator.free(n);
-        if (style.number_format) |n| {
-            owned_style.number_format = try self.allocator.dupe(u8, n);
-        }
-        errdefer if (owned_style.number_format) |n| self.allocator.free(n);
-        try self.styles.append(self.allocator, owned_style);
-        return @intCast(self.styles.items.len);
+        return try self.styles_plan.addStyle(self.allocator, style);
     }
 
     /// Register a differential format (font / fill overrides applied
@@ -525,25 +315,10 @@ pub const Writer = struct {
     /// `…Expression` as the `dxf_id` parameter. It is a *pure* dxf
     /// id (0-based into `<dxfs>`), distinct from the style id used
     /// by `addStyle`.
+    ///
+    /// Thin pass-through to `StylesPlan.addDxf`.
     pub fn addDxf(self: *Writer, dxf: Dxf) !u32 {
-        for (self.dxfs.items, 0..) |existing, i| {
-            if (std.meta.eql(existing, dxf)) return @intCast(i);
-        }
-        try self.dxfs.append(self.allocator, dxf);
-        return @intCast(self.dxfs.items.len - 1);
-    }
-
-    /// Return the numFmtId for `fmt`, allocating a new entry at id >=
-    /// NUM_FMT_BASE (164) on first sight. Subsequent calls with the
-    /// same content return the same id.
-    fn internNumFmt(self: *Writer, fmt: []const u8) !u32 {
-        if (self.num_fmt_index.get(fmt)) |id| return id;
-        const owned = try self.allocator.dupe(u8, fmt);
-        errdefer self.allocator.free(owned);
-        const id: u32 = @intCast(NUM_FMT_BASE + self.num_fmts.items.len);
-        try self.num_fmts.append(self.allocator, owned);
-        try self.num_fmt_index.put(self.allocator, owned, id);
-        return id;
+        return try self.styles_plan.addDxf(self.allocator, dxf);
     }
 
     /// Add a sheet and return a handle to append rows. Sheet is owned
@@ -685,7 +460,7 @@ pub const Writer = struct {
         // Dxfs live in styles.xml too — conditional formatting alone
         // is enough to require the part, even when no user style was
         // registered via addStyle.
-        const have_styles = self.styles.items.len > 0 or self.dxfs.items.len > 0;
+        const have_styles = !self.styles_plan.isEmpty();
 
         // 1. [Content_Types].xml
         //
@@ -1264,15 +1039,16 @@ pub const Writer = struct {
         }
 
         // 7. xl/styles.xml — only when the caller registered any styles.
-        // Keeps the "no styles" path byte-identical to v0.2.0-0.2.3 output.
-        if (have_styles) try emitStylesXml(
-            alloc,
-            &zw,
-            self.styles.items,
-            self.num_fmts.items,
-            &self.num_fmt_index,
-            self.dxfs.items,
-        );
+        // Keeps the "no styles" path byte-identical to v0.2.0-0.2.3
+        // output. The emit logic itself lives on `StylesPlan` (B3
+        // iter-wr-2), so Workbook's fresh-emit path can reuse the
+        // same byte-stable producer.
+        if (have_styles) {
+            var styles_buf: std.ArrayListUnmanaged(u8) = .{};
+            defer styles_buf.deinit(alloc);
+            try self.styles_plan.emit(alloc, &styles_buf);
+            try zw.addEntry("xl/styles.xml", styles_buf.items);
+        }
 
         try zw.finalize();
 
@@ -1828,7 +1604,7 @@ pub const SheetWriter = struct {
             return error.InvalidDataValidation;
         }
         if (!needs_two and formula2 != null) return error.InvalidDataValidation;
-        if (dxf_id >= self.parent.dxfs.items.len) return error.UnknownDxfId;
+        if (dxf_id >= self.parent.styles_plan.dxfs.items.len) return error.UnknownDxfId;
 
         const range_copy = try self.parent.allocator.dupe(u8, range);
         errdefer self.parent.allocator.free(range_copy);
@@ -1865,7 +1641,7 @@ pub const SheetWriter = struct {
     ) !void {
         try validateHyperlinkRange(range);
         if (formula.len == 0) return error.InvalidDataValidation;
-        if (dxf_id >= self.parent.dxfs.items.len) return error.UnknownDxfId;
+        if (dxf_id >= self.parent.styles_plan.dxfs.items.len) return error.UnknownDxfId;
 
         const range_copy = try self.parent.allocator.dupe(u8, range);
         errdefer self.parent.allocator.free(range_copy);
@@ -1956,7 +1732,7 @@ pub const SheetWriter = struct {
         styles: []const u32,
     ) !void {
         if (styles.len != cells.len) return error.StyleCountMismatch;
-        const max_style_id: u32 = @intCast(self.parent.styles.items.len);
+        const max_style_id: u32 = @intCast(self.parent.styles_plan.styles.items.len);
         for (styles) |sid| {
             if (sid > max_style_id) return error.UnknownStyleId;
         }
@@ -2392,357 +2168,10 @@ fn validateHyperlinkRange(range: []const u8) !void {
     }
 }
 
-/// Content-compare two styles. Necessary because std.meta.eql on
-/// `?[]const u8` compares slice headers (pointer + length) rather than
-/// the underlying bytes, so two registrations of `font_name = "Arial"`
-/// from distinct buffers would not dedup.
-fn stylesEqual(a: Style, b: Style) bool {
-    if (a.font_bold != b.font_bold) return false;
-    if (a.font_italic != b.font_italic) return false;
-    if (!std.meta.eql(a.font_size, b.font_size)) return false;
-    if (a.font_color_argb != b.font_color_argb) return false;
-    if (a.alignment_horizontal != b.alignment_horizontal) return false;
-    if (a.wrap_text != b.wrap_text) return false;
-    if (a.fill_pattern != b.fill_pattern) return false;
-    if (a.fill_fg_argb != b.fill_fg_argb) return false;
-    if (a.fill_bg_argb != b.fill_bg_argb) return false;
-    if (!std.meta.eql(a.border_left, b.border_left)) return false;
-    if (!std.meta.eql(a.border_right, b.border_right)) return false;
-    if (!std.meta.eql(a.border_top, b.border_top)) return false;
-    if (!std.meta.eql(a.border_bottom, b.border_bottom)) return false;
-    if (!std.meta.eql(a.border_diagonal, b.border_diagonal)) return false;
-    if (a.diagonal_up != b.diagonal_up) return false;
-    if (a.diagonal_down != b.diagonal_down) return false;
-    // Content-compare font_name.
-    if ((a.font_name == null) != (b.font_name == null)) return false;
-    if (a.font_name) |an| {
-        if (!std.mem.eql(u8, an, b.font_name.?)) return false;
-    }
-    // Content-compare number_format.
-    if ((a.number_format == null) != (b.number_format == null)) return false;
-    if (a.number_format) |an| {
-        if (!std.mem.eql(u8, an, b.number_format.?)) return false;
-    }
-    return true;
-}
+// xl/styles.xml emitter + helpers (stylesEqual, hAlignName,
+// emitBorderSide, emitDxfBorderSide, borderStyleName,
+// patternTypeName) moved to pkg/styles_plan.zig per B3 iter-wr-2.
 
-/// Emit xl/styles.xml based on the registered style list. Fonts are
-/// keyed 1:1 with styles (fonts[i+1] corresponds to style i); deduping
-/// fonts independently of styles is a Phase 3b stage-3 optimisation.
-/// `<cellXfs>` gets the default entry at index 0 plus one entry per
-/// user style, with `applyAlignment="1"` when a style sets any
-/// alignment/wrap field.
-fn emitStylesXml(
-    alloc: Allocator,
-    zw: *ZipWriter,
-    styles: []const Style,
-    num_fmts: []const []const u8,
-    num_fmt_index: *const std.StringHashMapUnmanaged(u32),
-    dxfs: []const Dxf,
-) !void {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
-    defer buf.deinit(alloc);
-
-    try buf.appendSlice(alloc, STYLES_HEAD);
-
-    // <numFmts> — emitted only when the user registered any custom
-    // format. Built-ins (General / 0..=49) don't go here.
-    if (num_fmts.len > 0) {
-        try buf.print(alloc, "<numFmts count=\"{d}\">", .{num_fmts.len});
-        for (num_fmts, 0..) |fmt, i| {
-            const id: u32 = @intCast(NUM_FMT_BASE + i);
-            try buf.print(alloc, "<numFmt numFmtId=\"{d}\" formatCode=\"", .{id});
-            try appendXmlEscaped(alloc, &buf, fmt);
-            try buf.appendSlice(alloc, "\"/>");
-        }
-        try buf.appendSlice(alloc, "</numFmts>");
-    }
-
-    // <fonts>: default at index 0 + one per user style.
-    try buf.print(alloc, "<fonts count=\"{d}\">", .{styles.len + 1});
-    try buf.appendSlice(alloc, STYLES_FONTS_DEFAULT);
-    for (styles) |s| {
-        try buf.appendSlice(alloc, "<font>");
-        if (s.font_bold) try buf.appendSlice(alloc, "<b/>");
-        if (s.font_italic) try buf.appendSlice(alloc, "<i/>");
-        // <sz> — configurable in stage 2; fall back to 11 when unset.
-        const size = s.font_size orelse 11.0;
-        try buf.print(alloc, "<sz val=\"{d}\"/>", .{size});
-        // <color> — only when set; theme auto is implied by omission.
-        if (s.font_color_argb) |c| try buf.print(
-            alloc,
-            "<color rgb=\"{X:0>8}\"/>",
-            .{c},
-        );
-        // <name> — configurable in stage 2; default "Calibri".
-        try buf.appendSlice(alloc, "<name val=\"");
-        if (s.font_name) |n| {
-            try appendXmlEscaped(alloc, &buf, n);
-        } else {
-            try buf.appendSlice(alloc, "Calibri");
-        }
-        try buf.appendSlice(alloc, "\"/></font>");
-    }
-    try buf.appendSlice(alloc, "</fonts>");
-
-    // <fills>: 2 reserved slots (none, gray125 — conventional OOXML
-    // defaults), then one user fill per style that sets any fill field.
-    // Styles without a fill reference fillId=0.
-    var fill_ids = try alloc.alloc(u32, styles.len);
-    defer alloc.free(fill_ids);
-    var next_user_fill_id: u32 = 2;
-    for (styles, 0..) |s, i| {
-        if (s.fill_pattern != .none or s.fill_fg_argb != null or s.fill_bg_argb != null) {
-            fill_ids[i] = next_user_fill_id;
-            next_user_fill_id += 1;
-        } else {
-            fill_ids[i] = 0;
-        }
-    }
-    try buf.print(alloc, "<fills count=\"{d}\">", .{next_user_fill_id});
-    try buf.appendSlice(alloc, "<fill><patternFill patternType=\"none\"/></fill>");
-    try buf.appendSlice(alloc, "<fill><patternFill patternType=\"gray125\"/></fill>");
-    for (styles) |s| {
-        if (s.fill_pattern == .none and s.fill_fg_argb == null and s.fill_bg_argb == null) continue;
-        try buf.print(
-            alloc,
-            "<fill><patternFill patternType=\"{s}\"",
-            .{patternTypeName(s.fill_pattern)},
-        );
-        if (s.fill_fg_argb == null and s.fill_bg_argb == null) {
-            try buf.appendSlice(alloc, "/></fill>");
-        } else {
-            try buf.appendSlice(alloc, ">");
-            if (s.fill_fg_argb) |c| try buf.print(alloc, "<fgColor rgb=\"{X:0>8}\"/>", .{c});
-            if (s.fill_bg_argb) |c| try buf.print(alloc, "<bgColor rgb=\"{X:0>8}\"/>", .{c});
-            try buf.appendSlice(alloc, "</patternFill></fill>");
-        }
-    }
-    try buf.appendSlice(alloc, "</fills>");
-
-    // <borders>: default empty border at index 0, then one per style
-    // that touches any border field. Styles without borders keep
-    // borderId=0.
-    var border_ids = try alloc.alloc(u32, styles.len);
-    defer alloc.free(border_ids);
-    var next_user_border_id: u32 = 1;
-    for (styles, 0..) |s, i| {
-        if (hasBorder(s)) {
-            border_ids[i] = next_user_border_id;
-            next_user_border_id += 1;
-        } else {
-            border_ids[i] = 0;
-        }
-    }
-    try buf.print(alloc, "<borders count=\"{d}\">", .{next_user_border_id});
-    try buf.appendSlice(alloc, "<border><left/><right/><top/><bottom/><diagonal/></border>");
-    for (styles) |s| {
-        if (!hasBorder(s)) continue;
-        try buf.appendSlice(alloc, "<border");
-        if (s.diagonal_up) try buf.appendSlice(alloc, " diagonalUp=\"1\"");
-        if (s.diagonal_down) try buf.appendSlice(alloc, " diagonalDown=\"1\"");
-        try buf.appendSlice(alloc, ">");
-        try emitBorderSide(alloc, &buf, "left", s.border_left);
-        try emitBorderSide(alloc, &buf, "right", s.border_right);
-        try emitBorderSide(alloc, &buf, "top", s.border_top);
-        try emitBorderSide(alloc, &buf, "bottom", s.border_bottom);
-        try emitBorderSide(alloc, &buf, "diagonal", s.border_diagonal);
-        try buf.appendSlice(alloc, "</border>");
-    }
-    try buf.appendSlice(alloc, "</borders>");
-    try buf.appendSlice(alloc, STYLES_CELL_STYLE_XFS);
-
-    // <cellXfs>: default at index 0 + one per user style.
-    try buf.print(alloc, "<cellXfs count=\"{d}\">", .{styles.len + 1});
-    try buf.appendSlice(alloc, STYLES_DEFAULT_CELL_XF);
-    for (styles, 0..) |s, i| {
-        const has_alignment = s.alignment_horizontal != .general or s.wrap_text;
-        const fill_id = fill_ids[i];
-        const border_id = border_ids[i];
-        const num_fmt_id: u32 = if (s.number_format) |fmt|
-            (num_fmt_index.get(fmt) orelse 0)
-        else
-            0;
-        try buf.print(
-            alloc,
-            "<xf numFmtId=\"{d}\" fontId=\"{d}\" fillId=\"{d}\" borderId=\"{d}\" xfId=\"0\" applyFont=\"1\"",
-            .{ num_fmt_id, i + 1, fill_id, border_id },
-        );
-        if (num_fmt_id != 0) try buf.appendSlice(alloc, " applyNumberFormat=\"1\"");
-        if (fill_id != 0) try buf.appendSlice(alloc, " applyFill=\"1\"");
-        if (border_id != 0) try buf.appendSlice(alloc, " applyBorder=\"1\"");
-        if (has_alignment) {
-            try buf.appendSlice(alloc, " applyAlignment=\"1\"><alignment");
-            if (s.alignment_horizontal != .general) {
-                try buf.print(alloc, " horizontal=\"{s}\"", .{hAlignName(s.alignment_horizontal)});
-            }
-            if (s.wrap_text) try buf.appendSlice(alloc, " wrapText=\"1\"");
-            try buf.appendSlice(alloc, "/></xf>");
-        } else {
-            try buf.appendSlice(alloc, "/>");
-        }
-    }
-    try buf.appendSlice(alloc, "</cellXfs>");
-
-    // <cellStyles> sits between <cellXfs> and <dxfs> per the OOXML
-    // stylesheet element-order schema. We emit the canonical
-    // single-entry "Normal" record so consumers (Excel, LibreOffice,
-    // openpyxl) accept the file in strict-validation mode — the
-    // previous "skip cellStyles when no dxfs" trick worked only
-    // because dxfs was absent.
-    try buf.appendSlice(alloc, STYLES_CELL_STYLES);
-
-    // <dxfs> — differential formats for conditional-formatting rules.
-    if (dxfs.len > 0) {
-        try buf.print(alloc, "<dxfs count=\"{d}\">", .{dxfs.len});
-        for (dxfs) |dxf| {
-            try buf.appendSlice(alloc, "<dxf>");
-            // <font> — only emitted when something differs from default.
-            const has_font = dxf.font_bold or dxf.font_italic or
-                dxf.font_color_argb != null or dxf.font_size != null;
-            if (has_font) {
-                try buf.appendSlice(alloc, "<font>");
-                if (dxf.font_bold) try buf.appendSlice(alloc, "<b/>");
-                if (dxf.font_italic) try buf.appendSlice(alloc, "<i/>");
-                if (dxf.font_color_argb) |c| {
-                    try buf.print(alloc, "<color rgb=\"{X:0>8}\"/>", .{c});
-                }
-                if (dxf.font_size) |sz| {
-                    try buf.print(alloc, "<sz val=\"{d}\"/>", .{sz});
-                }
-                try buf.appendSlice(alloc, "</font>");
-            }
-            // <fill> — only the fgColor variant of patternFill solid.
-            if (dxf.fill_fg_argb) |fg| {
-                try buf.print(
-                    alloc,
-                    "<fill><patternFill patternType=\"solid\"><fgColor rgb=\"{X:0>8}\"/><bgColor rgb=\"{X:0>8}\"/></patternFill></fill>",
-                    .{ fg, fg },
-                );
-            }
-            // <border> — emit when any side has a non-.none style.
-            const has_border = dxf.border_left.style != .none or
-                dxf.border_right.style != .none or
-                dxf.border_top.style != .none or
-                dxf.border_bottom.style != .none;
-            if (has_border) {
-                try buf.appendSlice(alloc, "<border>");
-                try emitDxfBorderSide(alloc, &buf, "left", dxf.border_left);
-                try emitDxfBorderSide(alloc, &buf, "right", dxf.border_right);
-                try emitDxfBorderSide(alloc, &buf, "top", dxf.border_top);
-                try emitDxfBorderSide(alloc, &buf, "bottom", dxf.border_bottom);
-                try buf.appendSlice(alloc, "</border>");
-            }
-            try buf.appendSlice(alloc, "</dxf>");
-        }
-        try buf.appendSlice(alloc, "</dxfs>");
-    }
-
-    // <cellStyles> was already emitted before <dxfs> (schema-
-    // required order). The previous trailing append produced a
-    // duplicate block — removed.
-    try buf.appendSlice(alloc, STYLES_TAIL);
-
-    try zw.addEntry("xl/styles.xml", buf.items);
-}
-
-fn hAlignName(a: HAlign) []const u8 {
-    return switch (a) {
-        .general => "general",
-        .left => "left",
-        .center => "center",
-        .right => "right",
-        .fill => "fill",
-        .justify => "justify",
-        .center_continuous => "centerContinuous",
-        .distributed => "distributed",
-    };
-}
-
-/// Emit one `<left>` / `<right>` / `<top>` / `<bottom>` element
-/// for a dxf `<border>` block. Self-closing when the side is
-/// `.none`; opens with `style="…"` + nested `<color>` otherwise.
-fn emitDxfBorderSide(
-    alloc: Allocator,
-    buf: *std.ArrayListUnmanaged(u8),
-    tag: []const u8,
-    side: BorderSide,
-) !void {
-    if (side.style == .none) {
-        try buf.print(alloc, "<{s}/>", .{tag});
-        return;
-    }
-    try buf.print(alloc, "<{s} style=\"{s}\">", .{ tag, borderStyleName(side.style) });
-    if (side.color_argb) |c| {
-        try buf.print(alloc, "<color rgb=\"{X:0>8}\"/>", .{c});
-    }
-    try buf.print(alloc, "</{s}>", .{tag});
-}
-
-fn borderStyleName(b: BorderStyle) []const u8 {
-    return switch (b) {
-        .none => "none",
-        .thin => "thin",
-        .medium => "medium",
-        .dashed => "dashed",
-        .dotted => "dotted",
-        .thick => "thick",
-        .double => "double",
-        .hair => "hair",
-        .medium_dashed => "mediumDashed",
-        .dash_dot => "dashDot",
-        .medium_dash_dot => "mediumDashDot",
-        .dash_dot_dot => "dashDotDot",
-        .medium_dash_dot_dot => "mediumDashDotDot",
-        .slant_dash_dot => "slantDashDot",
-    };
-}
-
-fn emitBorderSide(
-    alloc: Allocator,
-    buf: *std.ArrayListUnmanaged(u8),
-    tag: []const u8,
-    side: BorderSide,
-) !void {
-    if (side.style == .none and side.color_argb == null) {
-        // Empty side — OOXML wants the element present but attribute-less.
-        try buf.print(alloc, "<{s}/>", .{tag});
-        return;
-    }
-    try buf.print(alloc, "<{s}", .{tag});
-    if (side.style != .none) {
-        try buf.print(alloc, " style=\"{s}\"", .{borderStyleName(side.style)});
-    }
-    if (side.color_argb) |c| {
-        try buf.print(alloc, "><color rgb=\"{X:0>8}\"/></{s}>", .{ c, tag });
-    } else {
-        try buf.appendSlice(alloc, "/>");
-    }
-}
-
-fn patternTypeName(p: PatternType) []const u8 {
-    return switch (p) {
-        .none => "none",
-        .solid => "solid",
-        .gray125 => "gray125",
-        .gray0625 => "gray0625",
-        .dark_gray => "darkGray",
-        .medium_gray => "mediumGray",
-        .light_gray => "lightGray",
-        .dark_horizontal => "darkHorizontal",
-        .dark_vertical => "darkVertical",
-        .dark_down => "darkDown",
-        .dark_up => "darkUp",
-        .dark_grid => "darkGrid",
-        .dark_trellis => "darkTrellis",
-        .light_horizontal => "lightHorizontal",
-        .light_vertical => "lightVertical",
-        .light_down => "lightDown",
-        .light_up => "lightUp",
-        .light_grid => "lightGrid",
-        .light_trellis => "lightTrellis",
-    };
-}
 
 /// XML 1.0 forbids most C0 control bytes in document content.
 /// Allowed: 0x09 (tab), 0x0A (LF), 0x0D (CR). Forbidden:
@@ -5557,7 +4986,7 @@ test "fuzz Writer.addStyle dedup on bool combos" {
         } else {
             distinct_indices[bi][ii] = idx;
         }
-        try std.testing.expect(w.styles.items.len <= 4);
+        try std.testing.expect(w.styles_plan.styles.items.len <= 4);
     }
 }
 
@@ -6079,7 +5508,7 @@ test "fuzz Writer state-machine: random op ordering with invariants" {
                 2 => {
                     // register a style — max 4 unique (2 bools).
                     _ = try w.addStyle(.{ .font_bold = rng.boolean(), .font_italic = rng.boolean() });
-                    try std.testing.expect(w.styles.items.len <= 4);
+                    try std.testing.expect(w.styles_plan.styles.items.len <= 4);
                 },
                 3 => {
                     // save + re-read + assert row counts
@@ -6101,7 +5530,7 @@ test "fuzz Writer state-machine: random op ordering with invariants" {
                 },
                 4 => {
                     // styled write — needs at least 1 style registered
-                    if (n_sheets == 0 or w.styles.items.len == 0) continue;
+                    if (n_sheets == 0 or w.styles_plan.styles.items.len == 0) continue;
                     const si = rng.intRangeAtMost(usize, 0, n_sheets - 1);
                     var cells: [3]xlsx.Cell = undefined;
                     var styles: [3]u32 = undefined;
@@ -6110,7 +5539,7 @@ test "fuzz Writer state-machine: random op ordering with invariants" {
                     _ = &str_store;
                     for (0..nc) |ci| {
                         cells[ci] = randomCellDeep(rng, &str_buf[ci]);
-                        styles[ci] = rng.intRangeAtMost(u32, 0, @intCast(w.styles.items.len));
+                        styles[ci] = rng.intRangeAtMost(u32, 0, @intCast(w.styles_plan.styles.items.len));
                     }
                     sheet_handles[si].?.writeRowStyled(cells[0..nc], styles[0..nc]) catch |e| switch (e) {
                         error.IntegerExceedsExcelPrecision => continue,
@@ -6120,7 +5549,7 @@ test "fuzz Writer state-machine: random op ordering with invariants" {
                 },
                 else => {
                     // No-op probe — repeatedly query sheet metadata.
-                    _ = w.styles.items.len;
+                    _ = w.styles_plan.styles.items.len;
                     _ = w.sst_plan.new_strings.items.len;
                     _ = w.sheets.items.len;
                 },

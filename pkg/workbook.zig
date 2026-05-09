@@ -34,6 +34,7 @@ const zlsx = @import("zlsx");
 const drawing_emit = @import("drawing_emit.zig");
 const sheet_edit = @import("sheet_edit.zig");
 const sst_plan_mod = @import("zlsx_sst_plan");
+const styles_plan_mod = @import("zlsx_styles_plan");
 
 const PartStore = store_mod.PartStore;
 
@@ -50,7 +51,23 @@ pub const RichRun = sst_plan_mod.RichRun;
 pub const RichEntry = sst_plan_mod.RichEntry;
 pub const SstExtensionPlan = sst_plan_mod.SstExtensionPlan;
 
+// B3 iter-wr-2: shared `StylesPlan` substrate. Workbook gains
+// `addStyle` / `addDxf` / `internNumFmt` thin pass-throughs that
+// delegate to a `StylesPlan`. Type re-exports keep the
+// `pkg.Workbook.addStyle(.{ ... })` call shape ergonomic.
+pub const StylesPlan = styles_plan_mod.StylesPlan;
+pub const Style = styles_plan_mod.Style;
+pub const Dxf = styles_plan_mod.Dxf;
+pub const BorderSide = styles_plan_mod.BorderSide;
+pub const BorderStyle = styles_plan_mod.BorderStyle;
+pub const PatternType = styles_plan_mod.PatternType;
+pub const HAlign = styles_plan_mod.HAlign;
+
 pub const Error = error{
+    /// Style validation failed — empty font name, non-positive font
+    /// size, or empty number format string. Surfaces from
+    /// `Workbook.addStyle` / `Workbook.internNumFmt`.
+    InvalidStyle,
     MissingWorkbookPart,
     MissingSheetPart,
     MissingRelationship,
@@ -379,6 +396,15 @@ pub const Workbook = struct {
     sst_view: ?sst_xml_mod.SstXml = null,
     styles_view: ?styles_xml_mod.StylesXml = null,
 
+    /// B3 iter-wr-2: fresh-emit styles registry. Mirrors the SST plan
+    /// pattern — Workbook gains `addStyle` / `addDxf` / `internNumFmt`
+    /// pass-throughs so callers can stage styles + dxfs + custom
+    /// number formats without going through `xlsx.Writer`. The plan
+    /// owns every duped string; `deinit` walks it. Empty-by-default,
+    /// so an existing-file workbook that never calls `addStyle`
+    /// pays nothing.
+    styles_plan: StylesPlan = .{},
+
     /// Open an .xlsx file as a typed `Workbook`.
     ///
     /// Errors if `xl/workbook.xml` is absent or malformed; otherwise
@@ -518,8 +544,45 @@ pub const Workbook = struct {
             var view = v.*;
             view.deinit(self.allocator);
         }
+        self.styles_plan.deinit(self.allocator);
         self.workbook.deinit(self.allocator);
         self.store.deinit();
+    }
+
+    /// Register a cell style in the workbook-level styles plan and
+    /// return its 1-based `s="…"` index. Dedupes by content. Mirrors
+    /// `xlsx.Writer.addStyle` byte-for-byte (both ultimately route
+    /// through `StylesPlan.addStyle`). Use this in conjunction with
+    /// `Worksheet.setCell` to author styled cells without going
+    /// through Writer's fluent-builder API.
+    pub fn addStyle(self: *Workbook, style: Style) Error!u32 {
+        return self.styles_plan.addStyle(self.allocator, style) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidFontSize, error.InvalidFontName, error.InvalidNumberFormat => return error.InvalidStyle,
+        };
+    }
+
+    /// Register a differential format for conditional formatting and
+    /// return its 0-based dxfId. Dedupes by content. Mirrors
+    /// `xlsx.Writer.addDxf` byte-for-byte.
+    pub fn addDxf(self: *Workbook, dxf: Dxf) Error!u32 {
+        return self.styles_plan.addDxf(self.allocator, dxf) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => unreachable,
+        };
+    }
+
+    /// Intern a custom number format string into the workbook's
+    /// numFmt pool and return the assigned numFmtId. Subsequent calls
+    /// with the same `format_code` return the same id. The first
+    /// custom format gets id `styles_plan.NUM_FMT_BASE` (164); each
+    /// new format increments the counter.
+    pub fn internNumFmt(self: *Workbook, format_code: []const u8) Error!u32 {
+        if (format_code.len == 0) return error.InvalidStyle;
+        return self.styles_plan.internNumFmt(self.allocator, format_code) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => unreachable,
+        };
     }
 
     pub fn sheetCount(self: *const Workbook) u32 {
@@ -7906,4 +7969,178 @@ test "SstExtensionPlan: indexOf vs indexOfRich" {
 
     // Plain lookup of an unstaged string returns null.
     try std.testing.expectEqual(@as(?u32, null), plan.indexOf("not-staged"));
+}
+
+// ─── B3 iter-wr-2: byte-equivalence gate ─────────────────────────────
+//
+// The styles axis is the most byte-fragile surface in the entire
+// OOXML emit (`docs/plans/writer-rebase.md` §1.10 catalogues every
+// rigid invariant). This test pins that the StylesPlan emitted via
+// `Workbook.addStyle` / `Workbook.addDxf` / `Workbook.internNumFmt`
+// produces byte-identical `xl/styles.xml` to `xlsx.Writer.addStyle` /
+// `addDxf` for the same logical workbook. One missed attribute order
+// or one swapped child element here = "repaired" prompts across the
+// corpus on save, so this gate exists explicitly to catch silent
+// regressions when the plan substrate evolves.
+
+test "StylesPlan parity: Workbook + Writer emit identical xl/styles.xml bytes" {
+    const a = std.testing.allocator;
+
+    // Build the same logical style set on both sides. Cover every
+    // axis flagged byte-fragile in §1.10:
+    //   - bold / italic / size / color / font_name (font block)
+    //   - alignment + wrap_text
+    //   - solid + non-solid pattern fills with fg + bg colors
+    //   - all five border sides + diagonals (with diagonal_up flag)
+    //   - custom number format (numFmts at id 164)
+    //   - dxf with font + fill + border children
+    const writer_mod = zlsx.writer_types;
+
+    var w = writer_mod.Writer.init(a);
+    defer w.deinit();
+
+    var plan: StylesPlan = .{};
+    defer plan.deinit(a);
+
+    const s1 = writer_mod.Style{
+        .font_bold = true,
+        .font_italic = true,
+        .font_size = 14.0,
+        .font_color_argb = 0xFF112233,
+        .font_name = "Arial",
+        .alignment_horizontal = .center,
+        .wrap_text = true,
+        .fill_pattern = .solid,
+        .fill_fg_argb = 0xFFCCDDEE,
+        .fill_bg_argb = 0xFF445566,
+        .border_left = .{ .style = .thin, .color_argb = 0xFF000000 },
+        .border_right = .{ .style = .medium, .color_argb = 0xFFFF0000 },
+        .border_top = .{ .style = .dashed },
+        .border_bottom = .{ .style = .double, .color_argb = 0xFF00FF00 },
+        .border_diagonal = .{ .style = .thin, .color_argb = 0xFF0000FF },
+        .diagonal_up = true,
+        .number_format = "#,##0.00",
+    };
+    const s2 = writer_mod.Style{ .font_bold = true };
+    const s3 = writer_mod.Style{
+        .number_format = "yyyy-mm-dd",
+        .alignment_horizontal = .right,
+    };
+    const d1 = writer_mod.Dxf{
+        .font_bold = true,
+        .font_color_argb = 0xFFAA0000,
+        .font_size = 12.0,
+        .fill_fg_argb = 0xFFAACCFF,
+        .border_left = .{ .style = .thick, .color_argb = 0xFF334455 },
+        .border_right = .{ .style = .thin },
+    };
+    const d2 = writer_mod.Dxf{ .font_italic = true };
+
+    // Equivalent typed values on the plan side. The types are
+    // re-exports — the literal can be used verbatim.
+    const ps1: Style = .{
+        .font_bold = true,
+        .font_italic = true,
+        .font_size = 14.0,
+        .font_color_argb = 0xFF112233,
+        .font_name = "Arial",
+        .alignment_horizontal = .center,
+        .wrap_text = true,
+        .fill_pattern = .solid,
+        .fill_fg_argb = 0xFFCCDDEE,
+        .fill_bg_argb = 0xFF445566,
+        .border_left = .{ .style = .thin, .color_argb = 0xFF000000 },
+        .border_right = .{ .style = .medium, .color_argb = 0xFFFF0000 },
+        .border_top = .{ .style = .dashed },
+        .border_bottom = .{ .style = .double, .color_argb = 0xFF00FF00 },
+        .border_diagonal = .{ .style = .thin, .color_argb = 0xFF0000FF },
+        .diagonal_up = true,
+        .number_format = "#,##0.00",
+    };
+    const ps2: Style = .{ .font_bold = true };
+    const ps3: Style = .{
+        .number_format = "yyyy-mm-dd",
+        .alignment_horizontal = .right,
+    };
+    const pd1: Dxf = .{
+        .font_bold = true,
+        .font_color_argb = 0xFFAA0000,
+        .font_size = 12.0,
+        .fill_fg_argb = 0xFFAACCFF,
+        .border_left = .{ .style = .thick, .color_argb = 0xFF334455 },
+        .border_right = .{ .style = .thin },
+    };
+    const pd2: Dxf = .{ .font_italic = true };
+
+    // Register on the writer side.
+    _ = try w.addStyle(s1);
+    _ = try w.addStyle(s2);
+    _ = try w.addStyle(s3);
+    _ = try w.addDxf(d1);
+    _ = try w.addDxf(d2);
+
+    // Register on the plan side via the same call shape Workbook
+    // exposes.
+    _ = try plan.addStyle(a, ps1);
+    _ = try plan.addStyle(a, ps2);
+    _ = try plan.addStyle(a, ps3);
+    _ = try plan.addDxf(a, pd1);
+    _ = try plan.addDxf(a, pd2);
+
+    // Emit both. Writer routes through `Writer.styles_plan.emit`
+    // internally, so the comparison is structurally trivial — but
+    // we keep two emit paths for safety in case Writer's
+    // emit-styles call site grows additional logic in the future.
+    var writer_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer writer_buf.deinit(a);
+    try w.styles_plan.emit(a, &writer_buf);
+
+    var plan_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer plan_buf.deinit(a);
+    try plan.emit(a, &plan_buf);
+
+    try std.testing.expectEqualSlices(u8, writer_buf.items, plan_buf.items);
+
+    // Sanity: byte stability invariants from §1.10. cellStyles MUST
+    // sit between cellXfs and dxfs.
+    const out = plan_buf.items;
+    const cellxfs = std.mem.indexOf(u8, out, "<cellXfs").?;
+    const cellstyles = std.mem.indexOf(u8, out, "<cellStyles count=\"1\">").?;
+    const dxfs = std.mem.indexOf(u8, out, "<dxfs count=\"2\">").?;
+    try std.testing.expect(cellxfs < cellstyles);
+    try std.testing.expect(cellstyles < dxfs);
+    // numFmts emitted with both custom formats.
+    try std.testing.expect(std.mem.indexOf(u8, out, "<numFmts count=\"2\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "numFmtId=\"164\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "numFmtId=\"165\"") != null);
+}
+
+test "Workbook.addStyle / addDxf / internNumFmt expose the shared StylesPlan" {
+    const a = std.testing.allocator;
+
+    var wb = try Workbook.empty(a);
+    defer wb.deinit();
+
+    const idx1 = try wb.addStyle(.{ .font_bold = true });
+    const idx2 = try wb.addStyle(.{ .font_italic = true });
+    const idx3 = try wb.addStyle(.{ .font_bold = true }); // dedup
+    try std.testing.expectEqual(@as(u32, 1), idx1);
+    try std.testing.expectEqual(@as(u32, 2), idx2);
+    try std.testing.expectEqual(@as(u32, 1), idx3);
+
+    const dxf1 = try wb.addDxf(.{ .font_bold = true });
+    const dxf2 = try wb.addDxf(.{ .font_italic = true });
+    try std.testing.expectEqual(@as(u32, 0), dxf1);
+    try std.testing.expectEqual(@as(u32, 1), dxf2);
+
+    const fmt1 = try wb.internNumFmt("0.00");
+    const fmt2 = try wb.internNumFmt("yyyy-mm-dd");
+    const fmt3 = try wb.internNumFmt("0.00"); // dedup
+    try std.testing.expectEqual(styles_plan_mod.NUM_FMT_BASE, fmt1);
+    try std.testing.expectEqual(styles_plan_mod.NUM_FMT_BASE + 1, fmt2);
+    try std.testing.expectEqual(styles_plan_mod.NUM_FMT_BASE, fmt3);
+
+    // Validation surfaces typed.
+    try std.testing.expectError(error.InvalidStyle, wb.internNumFmt(""));
+    try std.testing.expectError(error.InvalidStyle, wb.addStyle(.{ .font_size = -1.0 }));
 }
