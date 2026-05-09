@@ -451,6 +451,52 @@ pub const Workbook = struct {
         return wb;
     }
 
+    /// Construct a fresh, empty `Workbook` with no source archive. The
+    /// returned workbook holds the OOXML-minimum required parts:
+    /// `[Content_Types].xml`, `_rels/.rels`, `xl/workbook.xml` (with
+    /// an empty `<sheets/>`), and `xl/_rels/workbook.xml.rels` (with
+    /// an empty `<Relationships>` body). Zero worksheets in the typed
+    /// view; `addSheet(name)` grows it.
+    ///
+    /// Used by the upcoming B3 Writer-rebase track: `xlsx.Writer.save`
+    /// will call `Workbook.empty(alloc)`, populate via `addSheet` +
+    /// `setCell` / `appendRows`, then `save(path)`.
+    ///
+    pub fn empty(allocator: Allocator) Error!Workbook {
+        var store = try PartStore.fresh(allocator);
+        errdefer store.deinit();
+
+        // `PartStore.fresh` seeds only `[Content_Types].xml`. Seed
+        // the OOXML-minimum remaining parts before handing off to
+        // `fromStore`. `addPart` appends the corresponding
+        // `<Default>` / `<Override>` to CT.xml automatically.
+        try store.addPart(
+            "_rels/.rels",
+            "application/vnd.openxmlformats-package.relationships+xml",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+                "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>" ++
+                "</Relationships>",
+        );
+        try store.addPart(
+            "xl/workbook.xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+                "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">" ++
+                "<sheets></sheets>" ++
+                "</workbook>",
+        );
+        try store.addPart(
+            "xl/_rels/workbook.xml.rels",
+            "application/vnd.openxmlformats-package.relationships+xml",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+                "</Relationships>",
+        );
+
+        return try fromStore(allocator, store);
+    }
+
     pub fn deinit(self: *Workbook) void {
         for (self.worksheets) |*ws| ws.deinit(self.allocator);
         self.allocator.free(self.worksheets);
@@ -2918,6 +2964,36 @@ const ExistingMatch = struct {
     index: u32,
 };
 
+/// One run inside a rich-text SST entry. Mirrors `xlsx.RichTextRun`'s
+/// public shape (text + bold + italic + size + color_argb + font_name)
+/// so the Writer-side wiring (iter-wr-1, out of scope here) can stage
+/// runs without an extra translation step. `color_argb` is encoded as
+/// the raw 8-hex-digit ARGB value (e.g. "FF0000FF") rather than a
+/// `u32`; the SST emit path passes the bytes through `<color
+/// rgb="…"/>` verbatim, so producers do their own formatting if they
+/// want a different surface. Strike + underline ride along (writer
+/// doesn't currently surface them, but OOXML does — keeping the
+/// substrate complete avoids a follow-up plan extension).
+pub const RichRun = struct {
+    text: []const u8,
+    bold: bool = false,
+    italic: bool = false,
+    underline: bool = false,
+    strike: bool = false,
+    font_name: ?[]const u8 = null,
+    font_size: ?f32 = null,
+    color_argb: ?[]const u8 = null,
+};
+
+/// One rich-text SST entry. `runs` is borrowed by the registrar
+/// (`SstExtensionPlan` dups every run + every owned string field into
+/// the workbook allocator at registration time, so callers can free
+/// their staging buffers immediately after `registerSharedRichString`
+/// returns).
+pub const RichEntry = struct {
+    runs: []const RichRun,
+};
+
 const SstExtensionPlan = struct {
     /// True when at least one `.shared_string` delta required a fresh
     /// SST entry (i.e. the user-supplied text didn't already match an
@@ -2939,11 +3015,36 @@ const SstExtensionPlan = struct {
     /// branch in `applySstExtensionPlan`.
     sst_part_exists: bool = false,
 
+    /// Rich-text new-entries axis. Each entry carries an array of
+    /// typed `RichRun`s; `applySstExtensionPlan` emits one
+    /// `<si><r><rPr/>…<t/></r>…</si>` block per entry, alongside the
+    /// plain `new_strings` blocks. Indices in this axis follow the
+    /// plain ones — the first rich entry sits at
+    /// `base_index + new_strings.len`.
+    ///
+    /// **Substrate only**: `buildSstExtensionPlan` does NOT populate
+    /// this axis today. The Writer-side wiring (iter-wr-1) will call
+    /// `registerSharedRichString` before per-sheet emit; until then
+    /// the field stays empty in production paths and only test code
+    /// hand-builds it. No dedup against existing rich entries is
+    /// performed (matches the writer's iter33 policy: hashing the
+    /// formatted form costs more than it saves at typical SST sizes).
+    new_rich_strings: std.ArrayListUnmanaged(RichEntry) = .empty,
+
     fn deinit(self: *SstExtensionPlan, allocator: Allocator) void {
         for (self.new_strings.items) |s| allocator.free(s);
         self.new_strings.deinit(allocator);
         for (self.existing_matches.items) |em| allocator.free(em.text);
         self.existing_matches.deinit(allocator);
+        for (self.new_rich_strings.items) |entry| {
+            for (entry.runs) |r| {
+                allocator.free(r.text);
+                if (r.font_name) |n| allocator.free(n);
+                if (r.color_argb) |c| allocator.free(c);
+            }
+            allocator.free(entry.runs);
+        }
+        self.new_rich_strings.deinit(allocator);
         self.* = undefined;
     }
 
@@ -2962,7 +3063,88 @@ const SstExtensionPlan = struct {
         }
         return null;
     }
+
+    /// Resolve the SST index for a rich-text entry by reference
+    /// (pointer equality on the `runs` slice). Rich entries are
+    /// indexed AFTER plain new strings; the first rich entry lands at
+    /// `base_index + new_strings.len`. Returns null if `entry`'s
+    /// `runs` slice is not the one that was registered into this
+    /// plan. Callers staging a rich entry typically retain the
+    /// pointer they got back from `registerSharedRichString` and
+    /// pass it straight through.
+    fn indexOfRich(self: *const SstExtensionPlan, entry: *const RichEntry) ?u32 {
+        for (self.new_rich_strings.items, 0..) |*staged, i| {
+            if (staged == entry) {
+                const rich_offset: u32 = @intCast(i);
+                return self.base_index +
+                    @as(u32, @intCast(self.new_strings.items.len)) +
+                    rich_offset;
+            }
+        }
+        return null;
+    }
 };
+
+/// Stage a rich-text entry into `plan.new_rich_strings`. Every owned
+/// byte (run text, font_name, color_argb) is duped into `wb.allocator`
+/// so the caller can free its own staging buffers immediately. Rich
+/// entries are NOT de-duplicated — same policy as `xlsx.Writer`'s
+/// `sstInternRich` (hashing the formatted form is more expensive than
+/// a fresh `<si><r>…</r></si>` at typical SST sizes). Returns a
+/// pointer to the staged entry; the pointer is stable for the
+/// lifetime of `plan` (we only ever append to `new_rich_strings`,
+/// never reorder).
+///
+/// Callers typically use the returned pointer with `plan.indexOfRich`
+/// at per-sheet emit time. The plan owns every byte; `plan.deinit`
+/// frees them.
+fn registerSharedRichString(
+    wb: *Workbook,
+    plan: *SstExtensionPlan,
+    runs: []const RichRun,
+) Error!*const RichEntry {
+    assert(@intFromPtr(wb) != 0);
+    assert(@intFromPtr(wb.allocator.vtable) != 0);
+    const a = wb.allocator;
+
+    // Atomicity: dupe every owned byte BEFORE appending the entry to
+    // the plan. If any dupe fails, `errdefer` walks back the slice
+    // we've built so far. The plan's `new_rich_strings` only sees the
+    // entry on the success path.
+    const owned_runs = try a.alloc(RichRun, runs.len);
+    var built: usize = 0;
+    errdefer {
+        for (owned_runs[0..built]) |r| {
+            a.free(r.text);
+            if (r.font_name) |n| a.free(n);
+            if (r.color_argb) |c| a.free(c);
+        }
+        a.free(owned_runs);
+    }
+    for (runs, 0..) |r, i| {
+        const owned_text = try a.dupe(u8, r.text);
+        errdefer a.free(owned_text);
+        const owned_fn: ?[]const u8 = if (r.font_name) |n| try a.dupe(u8, n) else null;
+        errdefer if (owned_fn) |n| a.free(n);
+        const owned_c: ?[]const u8 = if (r.color_argb) |c| try a.dupe(u8, c) else null;
+        owned_runs[i] = .{
+            .text = owned_text,
+            .bold = r.bold,
+            .italic = r.italic,
+            .underline = r.underline,
+            .strike = r.strike,
+            .font_name = owned_fn,
+            .font_size = r.font_size,
+            .color_argb = owned_c,
+        };
+        built = i + 1;
+    }
+
+    try plan.new_rich_strings.append(a, .{ .runs = owned_runs });
+    plan.has_new_strings = plan.new_strings.items.len > 0 or
+        plan.new_rich_strings.items.len > 0;
+    return &plan.new_rich_strings.items[plan.new_rich_strings.items.len - 1];
+}
 
 /// Walk every worksheet's `.shared_string` deltas, de-dup against
 /// the existing SST (when present) and against each other, and stage
@@ -3193,17 +3375,21 @@ fn buildSstExtensionPlan(wb: *Workbook) Error!SstExtensionPlan {
 /// `xl/_rels/workbook.xml.rels`.
 fn applySstExtensionPlan(wb: *Workbook, plan: *const SstExtensionPlan) Error!void {
     assert(plan.has_new_strings);
-    assert(plan.new_strings.items.len > 0);
+    // At least one of the two new-entry axes must be non-empty when
+    // `has_new_strings` is true. Plain-only and rich-only and mixed
+    // are all valid call shapes.
+    assert(plan.new_strings.items.len > 0 or plan.new_rich_strings.items.len > 0);
 
     if (plan.sst_part_exists) {
         // Re-emit the SST part with the existing entries preserved
-        // verbatim and the new strings appended.
+        // verbatim and the new entries (plain then rich) appended.
         const existing_part = try wb.store.part("xl/sharedStrings.xml") orelse
             return Error.MissingWorkbookPart; // sst_part_exists invariant violated
         const new_xml = try emitSstXmlForExtension(
             wb.allocator,
             existing_part.bytes,
             plan.new_strings.items,
+            plan.new_rich_strings.items,
         );
         defer wb.allocator.free(new_xml);
         try wb.store.replacePart("xl/sharedStrings.xml", new_xml);
@@ -3211,9 +3397,13 @@ fn applySstExtensionPlan(wb: *Workbook, plan: *const SstExtensionPlan) Error!voi
     }
 
     // Source had no SST. Emit a fresh one containing only the new
-    // strings, register it as a new part with the correct content
-    // type, then patch the workbook rels file.
-    const fresh_xml = try emitFreshSstXml(wb.allocator, plan.new_strings.items);
+    // entries (plain + rich), register it as a new part with the
+    // correct content type, then patch the workbook rels file.
+    const fresh_xml = try emitFreshSstXml(
+        wb.allocator,
+        plan.new_strings.items,
+        plan.new_rich_strings.items,
+    );
     defer wb.allocator.free(fresh_xml);
 
     try wb.store.addPart(
@@ -3239,9 +3429,10 @@ fn emitSstXmlForExtension(
     allocator: Allocator,
     src_xml: []const u8,
     new_strings: []const []const u8,
+    new_rich: []const RichEntry,
 ) Error![]u8 {
     assert(src_xml.len > 0);
-    assert(new_strings.len > 0);
+    assert(new_strings.len > 0 or new_rich.len > 0);
 
     // Locate `<sst …>` opening tag.
     const sst_open = std.mem.indexOf(u8, src_xml, "<sst") orelse
@@ -3259,12 +3450,12 @@ fn emitSstXmlForExtension(
         }
         break :blk countSiOpens(src_xml);
     };
-    const new_si_count: u32 = @intCast(new_strings.len);
+    const new_si_count: u32 = @intCast(new_strings.len + new_rich.len);
     const total_si: u32 = existing_si_count + new_si_count;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.ensureTotalCapacity(allocator, src_xml.len + 64 * new_strings.len);
+    try out.ensureTotalCapacity(allocator, src_xml.len + 64 * (new_strings.len + new_rich.len));
 
     // Copy bytes up to and INCLUDING `<sst`, then rewrite the
     // attribute blob with patched count/uniqueCount, then continue
@@ -3290,8 +3481,10 @@ fn emitSstXmlForExtension(
 
     if (is_self_closing) {
         // Source had `<sst …/>` with no body. Emit only the new entries
-        // followed by a fresh `</sst>`.
+        // followed by a fresh `</sst>`. Plain entries first, then
+        // rich — `indexOfRich` assumes that order.
         try appendNewSiEntries(allocator, &out, new_strings);
+        try appendNewRichSiEntries(allocator, &out, new_rich);
         try out.appendSlice(allocator, "</sst>");
         // Anything past the original `/>` is post-element trailing
         // bytes (rare, but preserve).
@@ -3302,36 +3495,91 @@ fn emitSstXmlForExtension(
     }
 
     // Normal form: copy body verbatim up to `</sst>`, then append
-    // new entries, then `</sst>` + trailing.
+    // new entries (plain then rich), then `</sst>` + trailing.
     const body_start = sst_open_gt + 1;
     const close = std.mem.indexOfPos(u8, src_xml, body_start, "</sst>") orelse
         return error.MalformedXml;
     try out.appendSlice(allocator, src_xml[body_start..close]);
     try appendNewSiEntries(allocator, &out, new_strings);
+    try appendNewRichSiEntries(allocator, &out, new_rich);
     try out.appendSlice(allocator, src_xml[close..]);
     return try out.toOwnedSlice(allocator);
 }
 
 /// Build a complete `xl/sharedStrings.xml` from scratch. Used when
 /// the source workbook had no SST part.
-fn emitFreshSstXml(allocator: Allocator, new_strings: []const []const u8) Error![]u8 {
-    assert(new_strings.len > 0);
+fn emitFreshSstXml(
+    allocator: Allocator,
+    new_strings: []const []const u8,
+    new_rich: []const RichEntry,
+) Error![]u8 {
+    assert(new_strings.len > 0 or new_rich.len > 0);
+    const total: usize = new_strings.len + new_rich.len;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.ensureTotalCapacity(allocator, 256 + 64 * new_strings.len);
+    try out.ensureTotalCapacity(allocator, 256 + 64 * total);
 
     try out.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
     try out.appendSlice(allocator, "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"");
     var nbuf: [32]u8 = undefined;
     try out.appendSlice(allocator, " count=\"");
-    try out.appendSlice(allocator, try std.fmt.bufPrint(&nbuf, "{d}", .{new_strings.len}));
+    try out.appendSlice(allocator, try std.fmt.bufPrint(&nbuf, "{d}", .{total}));
     try out.appendSlice(allocator, "\" uniqueCount=\"");
-    try out.appendSlice(allocator, try std.fmt.bufPrint(&nbuf, "{d}", .{new_strings.len}));
+    try out.appendSlice(allocator, try std.fmt.bufPrint(&nbuf, "{d}", .{total}));
     try out.appendSlice(allocator, "\">");
     try appendNewSiEntries(allocator, &out, new_strings);
+    try appendNewRichSiEntries(allocator, &out, new_rich);
     try out.appendSlice(allocator, "</sst>");
     return try out.toOwnedSlice(allocator);
+}
+
+/// Append one `<si><r>…</r>…</si>` per rich entry. Mirrors the
+/// emitter shape used by `xlsx.Writer.sstInternRich` so reader
+/// round-trips agree on the byte layout. Each run that has at least
+/// one typography flag set emits an `<rPr>` block; runs with no
+/// flags emit only `<t>`.
+fn appendNewRichSiEntries(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    new_rich: []const RichEntry,
+) Error!void {
+    for (new_rich) |entry| {
+        try out.appendSlice(allocator, "<si>");
+        for (entry.runs) |r| {
+            try out.appendSlice(allocator, "<r>");
+            const has_props = r.bold or r.italic or r.underline or r.strike or
+                r.font_size != null or r.font_name != null or r.color_argb != null;
+            if (has_props) {
+                try out.appendSlice(allocator, "<rPr>");
+                if (r.bold) try out.appendSlice(allocator, "<b/>");
+                if (r.italic) try out.appendSlice(allocator, "<i/>");
+                if (r.strike) try out.appendSlice(allocator, "<strike/>");
+                if (r.underline) try out.appendSlice(allocator, "<u/>");
+                if (r.font_size) |sz| {
+                    var szbuf: [32]u8 = undefined;
+                    try out.appendSlice(allocator, "<sz val=\"");
+                    try out.appendSlice(allocator, try std.fmt.bufPrint(&szbuf, "{d}", .{sz}));
+                    try out.appendSlice(allocator, "\"/>");
+                }
+                if (r.color_argb) |c| {
+                    try out.appendSlice(allocator, "<color rgb=\"");
+                    try appendXmlEscapedText(allocator, out, c);
+                    try out.appendSlice(allocator, "\"/>");
+                }
+                if (r.font_name) |n| {
+                    try out.appendSlice(allocator, "<rFont val=\"");
+                    try appendXmlEscapedText(allocator, out, n);
+                    try out.appendSlice(allocator, "\"/>");
+                }
+                try out.appendSlice(allocator, "</rPr>");
+            }
+            try out.appendSlice(allocator, "<t xml:space=\"preserve\">");
+            try appendXmlEscapedText(allocator, out, r.text);
+            try out.appendSlice(allocator, "</t></r>");
+        }
+        try out.appendSlice(allocator, "</si>");
+    }
 }
 
 /// Append one `<si><t>…</t></si>` per new string to `out`, with
@@ -7667,4 +7915,154 @@ test "Workbook.save: renameSheet rewriter composes with setCell on a different s
     // setCell mutation on sheet 0 round-tripped.
     const b1 = (try (try wb2.sheet(0)).cellByRef("B1")).?;
     try std.testing.expectEqualStrings("99.5", b1.raw_value.?);
+}
+
+// ─── B3 prep: Workbook.empty() — fresh-from-scratch constructor ──
+
+test "Workbook.empty: returns empty workbook with valid skeleton" {
+    const alloc = std.testing.allocator;
+
+    var wb = try Workbook.empty(alloc);
+    defer wb.deinit();
+
+    // Zero sheets in the typed view.
+    try std.testing.expectEqual(@as(u32, 0), wb.sheetCount());
+
+    // Required parts are all materialised in the PartStore.
+    try std.testing.expect((try wb.store.part("[Content_Types].xml")) != null);
+    try std.testing.expect((try wb.store.part("_rels/.rels")) != null);
+    try std.testing.expect((try wb.store.part("xl/workbook.xml")) != null);
+    try std.testing.expect((try wb.store.part("xl/_rels/workbook.xml.rels")) != null);
+
+    // Save to disk and re-open via Book.open + Workbook.open. Both
+    // surfaces must agree on sheet count == 0.
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-empty-skel-{d}.xlsx", .{prng.random().int(u32)});
+
+    try wb.save(tmp_path);
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var book = try zlsx.Book.open(alloc, tmp_path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 0), book.sheets.len);
+
+    var wb2 = try Workbook.open(alloc, tmp_path);
+    defer wb2.deinit();
+    try std.testing.expectEqual(@as(u32, 0), wb2.sheetCount());
+}
+
+test "Workbook.empty + addSheet + appendRows: round-trips through reader" {
+    const alloc = std.testing.allocator;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-empty-roundtrip-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.empty(alloc);
+        defer wb.deinit();
+
+        const ws = try wb.addSheet("Sheet1");
+        const row = [_]zlsx.Cell{
+            .{ .integer = 7 },
+            .{ .string = "hello" },
+        };
+        try ws.appendRows(&.{&row});
+        try wb.save(tmp_path);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var wb2 = try Workbook.open(alloc, tmp_path);
+    defer wb2.deinit();
+    try std.testing.expectEqual(@as(u32, 1), wb2.sheetCount());
+
+    const s0 = try wb2.sheet(0);
+    try std.testing.expectEqualStrings("Sheet1", s0.name());
+
+    // A1 — integer.
+    const a1 = (try s0.cellByRef("A1")).?;
+    try std.testing.expect(a1.cell_type == .number);
+    try std.testing.expectEqualStrings("7", a1.raw_value.?);
+
+    // B1 — shared_string pointing at the sole SST entry.
+    const b1 = (try s0.cellByRef("B1")).?;
+    try std.testing.expect(b1.cell_type == .shared_string);
+    try std.testing.expectEqualStrings("0", b1.raw_value.?);
+    const t0 = try wb2.sstText(0);
+    try std.testing.expect(t0 != null);
+    try std.testing.expectEqualStrings("hello", t0.?);
+}
+
+// ─── B3 prep: SstExtensionPlan rich-string axis ─────────────────────
+
+test "SstExtensionPlan: rich-axis register + deinit" {
+    const alloc = std.testing.allocator;
+
+    // Open a workbook so we have a `wb.allocator` to thread through.
+    // The plan registrar dups bytes via `wb.allocator`; the empty
+    // workbook from `Workbook.empty` is the cheapest scaffold.
+    var wb = try Workbook.empty(alloc);
+    defer wb.deinit();
+
+    var plan: SstExtensionPlan = .{};
+    defer plan.deinit(wb.allocator);
+
+    const runs = [_]RichRun{
+        .{ .text = "Hello, ", .bold = true },
+        .{ .text = "world", .italic = true, .font_name = "Arial", .font_size = 12.0 },
+    };
+
+    const entry = try registerSharedRichString(&wb, &plan, &runs);
+    try std.testing.expectEqual(@as(usize, 1), plan.new_rich_strings.items.len);
+    try std.testing.expect(plan.has_new_strings);
+
+    // Returned pointer is stable + aliases the staged slot.
+    try std.testing.expect(entry == &plan.new_rich_strings.items[0]);
+
+    // Run bytes were duped into the plan's allocator — the source
+    // `runs` array can be discarded without leaving a dangling slice.
+    try std.testing.expectEqualStrings("Hello, ", plan.new_rich_strings.items[0].runs[0].text);
+    try std.testing.expect(plan.new_rich_strings.items[0].runs[0].bold);
+    try std.testing.expectEqualStrings("world", plan.new_rich_strings.items[0].runs[1].text);
+    try std.testing.expect(plan.new_rich_strings.items[0].runs[1].italic);
+    try std.testing.expectEqualStrings("Arial", plan.new_rich_strings.items[0].runs[1].font_name.?);
+
+    // `std.testing.allocator` will catch any leak when `plan.deinit`
+    // runs above — the rich-axis cleanup must mirror the plain one.
+}
+
+test "SstExtensionPlan: indexOf vs indexOfRich" {
+    const alloc = std.testing.allocator;
+
+    var wb = try Workbook.empty(alloc);
+    defer wb.deinit();
+
+    var plan: SstExtensionPlan = .{};
+    defer plan.deinit(wb.allocator);
+
+    // Stage one plain entry. `registerSharedString` requires the same
+    // decoded-existing / is-rich-existing parallel slices that
+    // `buildSstExtensionPlan` builds — pass empty slices since we
+    // have no source SST.
+    const decoded_existing: []const []const u8 = &.{};
+    const is_rich_existing: []const bool = &.{};
+    try registerSharedString(&wb, &plan, "alpha", decoded_existing, is_rich_existing);
+    try std.testing.expectEqual(@as(usize, 1), plan.new_strings.items.len);
+
+    // Stage one rich entry.
+    const runs = [_]RichRun{
+        .{ .text = "beta", .bold = true },
+    };
+    const rich_entry = try registerSharedRichString(&wb, &plan, &runs);
+
+    // base_index defaults to 0 (no source SST). Plain comes first;
+    // rich follows after the plain block. With one of each:
+    //   - plain "alpha" → 0
+    //   - rich  "beta"  → 1
+    try std.testing.expectEqual(@as(?u32, 0), plan.indexOf("alpha"));
+    try std.testing.expectEqual(@as(?u32, 1), plan.indexOfRich(rich_entry));
+
+    // Plain lookup of an unstaged string returns null.
+    try std.testing.expectEqual(@as(?u32, null), plan.indexOf("not-staged"));
 }
