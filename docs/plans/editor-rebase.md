@@ -10,16 +10,20 @@
 > conservative refusal posture and its public API for one minor
 > line.
 
-## Status (as of 2026-05-05)
+## Status (closed 2026-05-09)
+
+**B2 fully shipped.** All iters merged through PR #89.
 
 - iter-er-0 ✅ (Editor relocated to `pkg/editor.zig`; nested-types hoist) — PRs #61, #65
 - iter-er-1 ✅ (Read-side parity — `Editor.open` constructs an internal `Workbook` via `Workbook.fromBook`) — PR #66
 - iter-er-2 ✅ (`setCell` / `setCells` rebase — existing-sheet routes through `Worksheet.setCell` + `emitWithDeltas`) — PRs #67, #68
-- iter-er-3 ✅ (`appendRows` rebase — `Worksheet.appendRows` API + `Worksheet.emitWithAppends` substring-splice fast-path; consumer wiring + bench gate green at 1.016× = 176.72 ms median vs 174 ms baseline, well under the 1.10× / 191.4 ms walk-away ceiling) — PRs #69 (bench harness), #70 (writer Huffman u13 cap fix), #71 (1/2 API surface), #73 (2/2 consumer + zig-defensive audit)
-- iter-er-4 (Structural edits — `addSheet` / `renameSheet` / `deleteSheet` flow through Workbook; Workbook gains `addSheet` + `deleteSheet` if not already shipped under B1) — 🚧 in flight. Sheet-level mutators ✅ shipped: PR #74 (`Workbook.addSheet` typed surface + `PartStore.replacePart` rels-cache refresh + `PartStore.isOverridden`); PR #77 (Editor.{addSheet,deleteSheet,renameSheet,scanWorksheet} migrated; bypasses pending_new_sheets/pending_renames; `Workbook.addSheet` collision check decodes XML entities; orphan-aware path-num allocator; legacy save blocks are dead but retained for the iter-er-6 cleanup PR). Row/col edits routing through Workbook ⏳ pending — separate iter-er-4 sub-PR.
-- iter-er-5 (Refusal-list audit — walk every guard, decide which lift, which stay) — ✅ audit complete (2026-05-05); see [refusal-audit.md](refusal-audit.md). 5 axes scheduled to lift as separate PRs (formula / defined-names / hyperlink / data-validation / conditional-format — all rewriters already shipped); 4 axes stay refused (drawings / pivots / panes / autoFilter — no rewriter)
-- iter-er-6 (`Editor.save` rebase to `Workbook.save` — single emit path; retires the dead `pending_*` state from iter-er-3/4) — ⏳ pending
-- iter-er-7 (Corpus parity sweep + perf bench — `≤ 1.5×` ZIP-substitution latency gate) — ⏳ pending
+- iter-er-3 ✅ (`appendRows` rebase — `Worksheet.appendRows` API + `Worksheet.emitWithAppends` substring-splice fast-path; bench gate green at 1.016×) — PRs #69, #70, #71, #73
+- iter-er-4 ✅ (structural edits — addSheet / renameSheet / deleteSheet / row+col edits all flow through Workbook): sheet-level via PRs #74 + #77; row/col edits via PR #82 (Editor delegates `insertRow`/`deleteRow`/`insertColumn`/`deleteColumn` to typed-overlay Workbook; legacy `pending_row_*`/`pending_col_*` queues retired)
+- iter-er-5 ✅ (refusal-list lifts) — 5 of 5 axes lifted: rename_sheet (#79); four row/col axes (formula / defined-names / hyperlink / DV+CF — all in #82); `delete_sheet` rewriter variant (#81) + final `SheetDeleteWithDefinedNamesNotSupported` lift (#89). Per-sheet drawing / pivot / pane / autoFilter / table refusals stay (no rewriter exists, lifting silently corrupts — see [refusal-audit.md](refusal-audit.md))
+- iter-er-6 ✅ (`Editor.save` rebase to `Workbook.save` — single emit path): phases 1–3 dead-state cleanup (#83, -2062 LOC) + thin-shim proper (#84, -1238 LOC); `Editor.save` is now a 14-line shim (passthrough preserves SHA256 byte-identity for no-mutation saves; mutated path delegates to `Workbook.save` → `PartStore.save`)
+- iter-er-7 ✅ (corpus parity sweep + perf bench): task A corpus parity (#86, +9 tests, 0 bug surfaces); task B bench refresh (#85, all gates green at 1.076× of 174 ms canonical baseline; ≤ 1.10× strict and ≤ 1.50× loose ceilings both PASS); task C Workbook.save edge-case tests + retire legacy `Worksheet.emitWithAppends` (#87). Bonus: Codex review found a HIGH bug — empty SST string mis-resolved to rich entry index (#88).
+
+**Final state**: pkg/editor.zig 6021 → 3231 LOC (-46%). `pkg/workbook.zig` owns the SST extension plan + per-sheet emit + atomic ZIP rebuild via `PartStore.save`. The four cross-sheet rewriters (`rewriteAllFormulas`, `rewriteAllDefinedNames`, `rewriteAllHyperlinkLocations`, `rewriteAllValidationsAndConditionalFormats`) are wired into `Workbook.{insertRow, deleteRow, insertColumn, deleteColumn, renameSheet, deleteSheet}`. The next track is **B3** (Writer rebase onto Workbook) — see `post-0.2.9-roadmap.md` Tier B and the proposed iter-wr-0..7 in `~/.claude/projects/-Users-lf-Projects-Pro-zlsx/memory/project_iter_er_3_pre_work.md`.
 
 ## Problem
 
