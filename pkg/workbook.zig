@@ -2499,7 +2499,6 @@ fn sheetNameMatchesDecoded(allocator: Allocator, view_name: []const u8, input: [
     return asciiCaseInsensitiveEql(decoded.items, input);
 }
 
-
 /// Scan `xml` for the largest `attr_prefixN"` numeric value (e.g.
 /// `sheetId="3"` or `Id="rId7"`). Returns 0 when no match is found.
 /// Used by `Workbook.addSheet` to pick non-colliding ids when
@@ -7447,24 +7446,24 @@ test "fuzz: appendXmlFindHighestRow never crashes on adversarial sheet XML" {
             "<row r=\"99999\"/>",
             "<c r=\"A1\"/>",
             "<col r=\"1\"/><conditionalFormatting r=\"A1\"/>",
-            "<row r=\"\"/>",                      // empty digits
-            "<row r=\"-5\"/>",                    // negative — parseInt fails, returns null
-            "<row r=\"99999999999999999999\"/>",  // overflow
-            "<c r=\"A99999999999999999999\"/>",   // overflowing cell ref
-            "<row\nr=\"5\">",                     // newline before attr
-            "<row\tr=\"5\">",                     // tab before attr
-            "<row spans=\"1:5\" r=\"7\"/>",       // attr-order swap
-            "<c s=\"1\" r=\"B12\"/>",             // attr-order swap on c
-            "<rowabc r=\"99\"/>",                 // not a real row tag
-            "<cabc r=\"A1\"/>",                   // not a real c tag
-            "<row r=\"1\" r=\"2\"/>",             // duplicate r=
-            "<row r=\"  5  \"/>",                 // padded digits
-            "<row r=\"5",                         // truncated
-            "<row r=",                            // truncated mid-attr
-            "<row",                               // truncated tag
-            "<<<<<<<",                            // pathological
+            "<row r=\"\"/>", // empty digits
+            "<row r=\"-5\"/>", // negative — parseInt fails, returns null
+            "<row r=\"99999999999999999999\"/>", // overflow
+            "<c r=\"A99999999999999999999\"/>", // overflowing cell ref
+            "<row\nr=\"5\">", // newline before attr
+            "<row\tr=\"5\">", // tab before attr
+            "<row spans=\"1:5\" r=\"7\"/>", // attr-order swap
+            "<c s=\"1\" r=\"B12\"/>", // attr-order swap on c
+            "<rowabc r=\"99\"/>", // not a real row tag
+            "<cabc r=\"A1\"/>", // not a real c tag
+            "<row r=\"1\" r=\"2\"/>", // duplicate r=
+            "<row r=\"  5  \"/>", // padded digits
+            "<row r=\"5", // truncated
+            "<row r=", // truncated mid-attr
+            "<row", // truncated tag
+            "<<<<<<<", // pathological
             "<row r=\"5\"><!--<row r=\"99\"/>--></row>", // comment-wrapped
-            "<row r=\"\xff\xfe\"/>",              // invalid UTF-8 in attr
+            "<row r=\"\xff\xfe\"/>", // invalid UTF-8 in attr
         },
     });
 }
@@ -7481,20 +7480,20 @@ test "fuzz: appendXmlUpdateDimensionBR never crashes on adversarial XML" {
         .corpus = &[_][]const u8{
             "",
             "<dimension ref=\"A1:Z10\"/>",
-            "<dimension ref=\"A1\"/>",                // single-cell — passthrough null
-            "<dimension ref=\"\"/>",                  // empty ref
-            "<dimension ref=\"A1:\"/>",               // missing BR
-            "<dimension ref=\":Z10\"/>",              // missing TL
-            "<dimension ref=\"$A$1:$Z$10\"/>",        // dollar-anchored
-            "<dimension ref=\"Sheet1!A1:Z10\"/>",     // sheet-prefixed
-            "<dimension ref=\"AAAA1:ZZZZ99999\"/>",   // exceeds max_col
-            "<dimension ref=\"A99999999999999:Z1\"/>",// overflow row
-            "<dimension ref=\"a1:z10\"/>",            // lowercase
-            "<dimension ref=\"A1:Z10",                // truncated quote
-            "<x:dimension ref=\"A1:Z10\"/>",          // namespace prefix
-            "<dimension>",                            // open tag, no attrs
-            "<dimension/>",                           // self-closing, no attrs
-            "<<<<<<<<<<<",                            // pathological
+            "<dimension ref=\"A1\"/>", // single-cell — passthrough null
+            "<dimension ref=\"\"/>", // empty ref
+            "<dimension ref=\"A1:\"/>", // missing BR
+            "<dimension ref=\":Z10\"/>", // missing TL
+            "<dimension ref=\"$A$1:$Z$10\"/>", // dollar-anchored
+            "<dimension ref=\"Sheet1!A1:Z10\"/>", // sheet-prefixed
+            "<dimension ref=\"AAAA1:ZZZZ99999\"/>", // exceeds max_col
+            "<dimension ref=\"A99999999999999:Z1\"/>", // overflow row
+            "<dimension ref=\"a1:z10\"/>", // lowercase
+            "<dimension ref=\"A1:Z10", // truncated quote
+            "<x:dimension ref=\"A1:Z10\"/>", // namespace prefix
+            "<dimension>", // open tag, no attrs
+            "<dimension/>", // self-closing, no attrs
+            "<<<<<<<<<<<", // pathological
         },
     });
 }
@@ -7513,18 +7512,18 @@ test "fuzz: appendXmlInjectRows never crashes on adversarial sheet XML" {
             "",
             "<sheetData></sheetData>",
             "<sheetData/>",
-            "<sheetData attr=\"x\"/>",                    // attrs on self-closing
-            "<sheetData></sheetData",                     // truncated close
-            "<sheetData>",                                // unclosed open
-            "</sheetData>",                               // close before open
-            "<sheetData></sheetData></sheetData>",        // double close
-            "<sheetdata></sheetdata>",                    // wrong case
-            "<x:sheetData/>",                             // namespace prefix
-            "<!--<sheetData/>-->",                        // comment-wrapped
-            "<sheetData attr=\">\"/>",                    // `>` in quoted attr
-            "<sheetData/<sheetData/>",                    // nested malformed
-            "<sheetData",                                 // truncated open
-            "<<<<<<<<<<",                                 // pathological
+            "<sheetData attr=\"x\"/>", // attrs on self-closing
+            "<sheetData></sheetData", // truncated close
+            "<sheetData>", // unclosed open
+            "</sheetData>", // close before open
+            "<sheetData></sheetData></sheetData>", // double close
+            "<sheetdata></sheetdata>", // wrong case
+            "<x:sheetData/>", // namespace prefix
+            "<!--<sheetData/>-->", // comment-wrapped
+            "<sheetData attr=\">\"/>", // `>` in quoted attr
+            "<sheetData/<sheetData/>", // nested malformed
+            "<sheetData", // truncated open
+            "<<<<<<<<<<", // pathological
         },
     });
 }
@@ -7581,18 +7580,18 @@ fn fuzzAppendCellXmlForAppend(_: void, input: []const u8) anyerror!void {
 test "fuzz: appendCellXmlForAppendUsingPlan never crashes on attacker-shaped cells" {
     try std.testing.fuzz({}, fuzzAppendCellXmlForAppend, .{
         .corpus = &[_][]const u8{
-            "\x00",                  // .empty
-            "\x01\x05",              // .integer
-            "\x02hello",             // .number
-            "\x03\x01",              // .boolean
-            "\x04alpha",             // .string "alpha"
-            "\x04",                  // .string ""
-            "\x04<<<<",              // .string with XML chars
-            "\x04&amp;",             // .string already escaped
-            "\x04\x00null",          // .string with NUL — isXmlSafeText rejects
-            "\x04\x01ctrl",          // .string with control byte
-            "\x04\x09tab",           // .string with tab — XML-safe
-            "\x04\xc0\x80",          // .string with overlong UTF-8
+            "\x00", // .empty
+            "\x01\x05", // .integer
+            "\x02hello", // .number
+            "\x03\x01", // .boolean
+            "\x04alpha", // .string "alpha"
+            "\x04", // .string ""
+            "\x04<<<<", // .string with XML chars
+            "\x04&amp;", // .string already escaped
+            "\x04\x00null", // .string with NUL — isXmlSafeText rejects
+            "\x04\x01ctrl", // .string with control byte
+            "\x04\x09tab", // .string with tab — XML-safe
+            "\x04\xc0\x80", // .string with overlong UTF-8
             "\x04" ++ ([_]u8{'A'} ** 256), // .string long text
         },
     });
@@ -7619,28 +7618,28 @@ test "fuzz: appendXmlUpdateDimensionBR never crashes on mutated ref body" {
     try std.testing.fuzz({}, fuzzAppendXmlUpdateDimensionBRMutated, .{
         .corpus = &[_][]const u8{
             "A1:Z10",
-            "A:Z",                          // letters only
-            "1:10",                         // digits only
-            "A1:A1:A1",                     // multiple colons
-            "A1::Z10",                      // double colon
-            "AAAA1:ZZZZZZ99999",            // letter-overflow
-            "A0:Z0",                        // zero rows
-            "A1:Z" ++ "9" ** 12,           // overflow row digits
-            ":",                            // bare colon
-            "A1:",                          // missing BR
-            ":Z10",                         // missing TL
-            "Z\"A1:Z10",                    // injection attempt
+            "A:Z", // letters only
+            "1:10", // digits only
+            "A1:A1:A1", // multiple colons
+            "A1::Z10", // double colon
+            "AAAA1:ZZZZZZ99999", // letter-overflow
+            "A0:Z0", // zero rows
+            "A1:Z" ++ "9" ** 12, // overflow row digits
+            ":", // bare colon
+            "A1:", // missing BR
+            ":Z10", // missing TL
+            "Z\"A1:Z10", // injection attempt
             "A1:Z10\" />\"<dimension ref=\"X1:Y9", // double dimension
-            "A1:" ++ "Z" ** 64,             // long letter sequence
+            "A1:" ++ "Z" ** 64, // long letter sequence
             "AABCDEF1:XYZ9876",
             "$A$1:$Z$10",
             "Sheet!A1:Z10",
-            "1A:10Z",                       // letters/digits swapped
-            "A0001:Z0010",                  // leading zeros
-            "  A1:Z10  ",                   // padded
-            "A1:Z10\x00",                   // NUL terminated
-            "A1:Z10\xff\xfe",               // invalid UTF-8 trailing
-            "",                             // empty ref body
+            "1A:10Z", // letters/digits swapped
+            "A0001:Z0010", // leading zeros
+            "  A1:Z10  ", // padded
+            "A1:Z10\x00", // NUL terminated
+            "A1:Z10\xff\xfe", // invalid UTF-8 trailing
+            "", // empty ref body
         },
     });
 }
@@ -7755,17 +7754,17 @@ test "fuzz: emitWithAppendsUsingPlan end-to-end on adversarial sheetData payload
             "",
             "<row r=\"1\"><c r=\"A1\"><v>1</v></c></row>",
             "<row r=\"99999\"/>",
-            "<row r=\"1048575\"/>",                              // one below max
-            "<row r=\"1048576\"/>",                              // exactly max — append would overflow
-            "<row r=\"1048577\"/>",                              // already past max
-            "<!-- nested <row r=\"1048576\"/> comment -->",      // adversarial comment
+            "<row r=\"1048575\"/>", // one below max
+            "<row r=\"1048576\"/>", // exactly max — append would overflow
+            "<row r=\"1048577\"/>", // already past max
+            "<!-- nested <row r=\"1048576\"/> comment -->", // adversarial comment
             "<row r=\"5\"><c r=\"A5\"><v></v></c></row>",
-            "<row r=\"5\"><c><v></v></c></row>",                 // <c> with no r=
-            "<row><c/></row>",                                   // explicit-row-less form
+            "<row r=\"5\"><c><v></v></c></row>", // <c> with no r=
+            "<row><c/></row>", // explicit-row-less form
             // 5k bytes of pseudo-row data — exercise large-input path
             "<row r=\"100\">" ++ ([_]u8{ '<', 'c', '/', '>' } ** 1000) ++ "</row>",
-            "<col r=\"1\"/><c/><row/>",                          // mixed
-            "\x00\x00\x00\x00",                                  // NUL-only
+            "<col r=\"1\"/><c/><row/>", // mixed
+            "\x00\x00\x00\x00", // NUL-only
             "<row r=\"1\"><c r=\"&lt;&gt;\"><v>1</v></c></row>", // entity refs
             "<row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c></row>", // sst index 0
         },

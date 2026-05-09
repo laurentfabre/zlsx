@@ -59,6 +59,22 @@ pub const StylesPlan = styles_plan_mod.StylesPlan;
 const workbook_xml_plan = @import("zlsx_workbook_xml_plan");
 const WorkbookXmlPlan = workbook_xml_plan.WorkbookXmlPlan;
 const WorkbookXmlSheetEntry = workbook_xml_plan.SheetEntry;
+// B3 iter-wr-5: ZIP layout unification. Writer's per-archive LFH/CDFH/
+// EOCD emission now routes through the shared `pkg/zip.zig` substrate.
+// std-only; takes deflateCompress as a callback to avoid the
+// writer→pkg→writer module-graph cycle.
+const zip = @import("zlsx_zip");
+
+/// Function-pointer adapter wrapping `deflateCompress` with the
+/// `anyerror!void` return type that `zip.Archive.addEntry`'s
+/// `DeflateFn` expects.
+fn deflateCompressErased(
+    alloc: Allocator,
+    input: []const u8,
+    out: *std.ArrayListUnmanaged(u8),
+) anyerror!void {
+    return deflateCompress(alloc, input, out);
+}
 
 const Allocator = std.mem.Allocator;
 
@@ -432,7 +448,7 @@ pub const Writer = struct {
         var zip_buf: std.ArrayListUnmanaged(u8) = .{};
         defer zip_buf.deinit(self.allocator);
 
-        var zw = ZipWriter.init(self.allocator, &zip_buf);
+        var zw = zip.Archive.init(self.allocator, &zip_buf);
         defer zw.deinit();
 
         const alloc = self.allocator;
@@ -499,11 +515,11 @@ pub const Writer = struct {
                 }
             }
             try ct.appendSlice(alloc, CONTENT_TYPES_TAIL);
-            try zw.addEntry("[Content_Types].xml", ct.items);
+            try zw.addEntry("[Content_Types].xml", ct.items, deflateCompressErased);
         }
 
         // 2. _rels/.rels (static)
-        try zw.addEntry("_rels/.rels", ROOT_RELS);
+        try zw.addEntry("_rels/.rels", ROOT_RELS, deflateCompressErased);
 
         // 3. xl/workbook.xml — B3 iter-wr-3: emission lives on the
         // shared plan. Build the sheet-entry view (one entry per
@@ -523,7 +539,7 @@ pub const Writer = struct {
                 &self.workbook_xml_plan,
             );
             defer alloc.free(wb_bytes);
-            try zw.addEntry("xl/workbook.xml", wb_bytes);
+            try zw.addEntry("xl/workbook.xml", wb_bytes, deflateCompressErased);
         }
 
         // 4. xl/_rels/workbook.xml.rels
@@ -552,7 +568,7 @@ pub const Writer = struct {
                 );
             }
             try rels.appendSlice(alloc, WORKBOOK_RELS_TAIL);
-            try zw.addEntry("xl/_rels/workbook.xml.rels", rels.items);
+            try zw.addEntry("xl/_rels/workbook.xml.rels", rels.items, deflateCompressErased);
         }
 
         // 5. xl/worksheets/sheetN.xml
@@ -764,7 +780,7 @@ pub const Writer = struct {
 
             var name_buf: [64]u8 = undefined;
             const entry_name = try std.fmt.bufPrint(&name_buf, "xl/worksheets/sheet{d}.xml", .{i + 1});
-            try zw.addEntry(entry_name, full.items);
+            try zw.addEntry(entry_name, full.items, deflateCompressErased);
         }
 
         // 5a. xl/worksheets/_rels/sheetN.xml.rels (hyperlinks + comments)
@@ -802,7 +818,7 @@ pub const Writer = struct {
 
             var rels_name_buf: [64]u8 = undefined;
             const rels_name = try std.fmt.bufPrint(&rels_name_buf, "xl/worksheets/_rels/sheet{d}.xml.rels", .{i + 1});
-            try zw.addEntry(rels_name, rels.items);
+            try zw.addEntry(rels_name, rels.items, deflateCompressErased);
         }
 
         // 5b. xl/commentsN.xml + xl/drawings/vmlDrawingN.vml (per sheet with comments).
@@ -862,7 +878,7 @@ pub const Writer = struct {
             try cx.appendSlice(alloc, "</commentList></comments>");
             var cn_buf: [64]u8 = undefined;
             const cn = try std.fmt.bufPrint(&cn_buf, "xl/comments{d}.xml", .{i + 1});
-            try zw.addEntry(cn, cx.items);
+            try zw.addEntry(cn, cx.items, deflateCompressErased);
 
             // Minimal VML drawing — one <v:shape> per comment, with
             // the oct-encoded Row/Column client data Excel uses to
@@ -935,7 +951,7 @@ pub const Writer = struct {
             try vml.appendSlice(alloc, "</xml>");
             var vml_buf: [64]u8 = undefined;
             const vml_name = try std.fmt.bufPrint(&vml_buf, "xl/drawings/vmlDrawing{d}.vml", .{i + 1});
-            try zw.addEntry(vml_name, vml.items);
+            try zw.addEntry(vml_name, vml.items, deflateCompressErased);
         }
 
         // 6. xl/sharedStrings.xml — emits the staged
@@ -996,7 +1012,7 @@ pub const Writer = struct {
                 try sst.appendSlice(alloc, "</si>");
             }
             try sst.appendSlice(alloc, SST_TAIL);
-            try zw.addEntry("xl/sharedStrings.xml", sst.items);
+            try zw.addEntry("xl/sharedStrings.xml", sst.items, deflateCompressErased);
         }
 
         // 7. xl/styles.xml — only when the caller registered any styles.
@@ -1008,7 +1024,7 @@ pub const Writer = struct {
             var styles_buf: std.ArrayListUnmanaged(u8) = .{};
             defer styles_buf.deinit(alloc);
             try self.styles_plan.emit(alloc, &styles_buf);
-            try zw.addEntry("xl/styles.xml", styles_buf.items);
+            try zw.addEntry("xl/styles.xml", styles_buf.items, deflateCompressErased);
         }
 
         try zw.finalize();
@@ -2463,7 +2479,7 @@ fn scaleFreqs(src: []const u32, dst: []u16) void {
 
 /// Emit `tokens` as a single final dynamic-huffman block. Assumes
 /// `tokens.len > 0` — empty inputs are handled upstream (stored
-/// fallback in ZipWriter.addEntry).
+/// fallback in zip.Archive.addEntry).
 fn emitDynamicBlock(
     alloc: Allocator,
     tokens: []const DeflateToken,
@@ -2610,190 +2626,15 @@ pub fn deflateCompress(alloc: Allocator, input: []const u8, out: *std.ArrayListU
     try bw.flushByte();
 }
 
-// ─── ZIP writer (deflate + stored fallback) ──────────────────────────
-
-/// Minimal zip archive builder. Appends file entries to a byte buffer;
-/// `finalize()` emits the central directory + end-of-central-directory
-/// trailer. Each entry is deflate-compressed unless compression grows
-/// the payload (empty entries, near-random bytes), in which case the
-/// entry falls back to stored (method 0). Both Excel and LibreOffice
-/// accept mixed-method archives.
-const ZipWriter = struct {
-    allocator: Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    // Per-entry info accumulated for the central directory.
-    entries: std.ArrayListUnmanaged(EntryMeta) = .{},
-
-    const EntryMeta = struct {
-        name: []u8, // owned copy
-        crc32: u32,
-        compressed_size: u32,
-        uncompressed_size: u32,
-        local_offset: u32,
-        method: std.zip.CompressionMethod,
-    };
-
-    fn init(alloc: Allocator, out: *std.ArrayListUnmanaged(u8)) ZipWriter {
-        return .{ .allocator = alloc, .out = out };
-    }
-
-    fn deinit(self: *ZipWriter) void {
-        for (self.entries.items) |e| self.allocator.free(e.name);
-        self.entries.deinit(self.allocator);
-    }
-
-    fn addEntry(self: *ZipWriter, name: []const u8, data: []const u8) !void {
-        const alloc = self.allocator;
-        if (data.len > std.math.maxInt(u32)) return error.EntryTooLarge;
-        if (name.len > std.math.maxInt(u16)) return error.NameTooLong;
-
-        const crc = std.hash.Crc32.hash(data);
-        const offset: u32 = @intCast(self.out.items.len);
-
-        // Sub-1 KB entries skip compression. The dynamic-huffman block
-        // header adds ~60-120 bytes of fixed overhead that rarely pays
-        // back on tiny XML fragments (Content_Types.xml, workbook rels,
-        // empty sheet templates) — and the hash-chain init is pure waste.
-        // The big entries (sheet1.xml, sharedStrings.xml, styles.xml)
-        // dominate archive size, so bypassing small ones loses negligible
-        // savings and shaves real per-entry wall time.
-        //
-        // If deflate still inflates a ≥ 1 KB payload (already-compressed
-        // or near-random content), fall back to stored.
-        const COMPRESS_MIN: usize = 1024;
-        var compressed: std.ArrayListUnmanaged(u8) = .{};
-        defer compressed.deinit(alloc);
-
-        var method: std.zip.CompressionMethod = .deflate;
-        var payload: []const u8 = undefined;
-        if (data.len >= COMPRESS_MIN) {
-            try deflateCompress(alloc, data, &compressed);
-        }
-        if (data.len < COMPRESS_MIN or compressed.items.len >= data.len) {
-            method = .store;
-            payload = data;
-        } else {
-            payload = compressed.items;
-        }
-        if (payload.len > std.math.maxInt(u32)) return error.EntryTooLarge;
-
-        const hdr: std.zip.LocalFileHeader = .{
-            .signature = std.zip.local_file_header_sig,
-            .version_needed_to_extract = 20,
-            .flags = .{ .encrypted = false, ._ = 0 },
-            .compression_method = method,
-            .last_modification_time = 0,
-            .last_modification_date = 0x21, // 1980-01-01, minimum valid
-            .crc32 = crc,
-            .compressed_size = @intCast(payload.len),
-            .uncompressed_size = @intCast(data.len),
-            .filename_len = @intCast(name.len),
-            .extra_len = 0,
-        };
-        try appendStruct(alloc, self.out, std.zip.LocalFileHeader, hdr);
-        try self.out.appendSlice(alloc, name);
-        try self.out.appendSlice(alloc, payload);
-
-        const owned_name = try alloc.dupe(u8, name);
-        errdefer alloc.free(owned_name);
-        try self.entries.append(alloc, .{
-            .name = owned_name,
-            .crc32 = crc,
-            .compressed_size = @intCast(payload.len),
-            .uncompressed_size = @intCast(data.len),
-            .local_offset = offset,
-            .method = method,
-        });
-    }
-
-    fn finalize(self: *ZipWriter) !void {
-        const alloc = self.allocator;
-        // ZIP32 EOCD records the per-disk + total entry counts in u16
-        // fields. >65535 entries needs Zip64 (which we don't emit).
-        // Without this guard the @intCast at the EndRecord build trapped
-        // in safe builds and silently truncated in ReleaseFast — both
-        // produce a workbook Excel rejects.
-        if (self.entries.items.len > std.math.maxInt(u16)) {
-            return error.TooManyZipEntries;
-        }
-        // cd_start IS written to the EOCD as u32, so 0xFFFFFFFF is
-        // the Zip64 sentinel — readers (including zlsx's own) treat
-        // it as "look for Zip64 extra fields". We don't emit Zip64,
-        // so reject `>= 0xFFFFFFFF` strictly. (Total file length is
-        // not on-wire, so a final byte count of 0xFFFFFFFF with a
-        // smaller cd_start is fine — only the serialized field
-        // matters.)
-        if (self.out.items.len >= std.math.maxInt(u32)) {
-            return error.ZipArchiveTooLarge;
-        }
-        const cd_start: u32 = @intCast(self.out.items.len);
-
-        for (self.entries.items) |e| {
-            const cd: std.zip.CentralDirectoryFileHeader = .{
-                .signature = std.zip.central_file_header_sig,
-                .version_made_by = 20,
-                .version_needed_to_extract = 20,
-                .flags = .{ .encrypted = false, ._ = 0 },
-                .compression_method = e.method,
-                .last_modification_time = 0,
-                .last_modification_date = 0x21,
-                .crc32 = e.crc32,
-                .compressed_size = e.compressed_size,
-                .uncompressed_size = e.uncompressed_size,
-                .filename_len = @intCast(e.name.len),
-                .extra_len = 0,
-                .comment_len = 0,
-                .disk_number = 0,
-                .internal_file_attributes = 0,
-                .external_file_attributes = 0,
-                .local_file_header_offset = e.local_offset,
-            };
-            try appendStruct(alloc, self.out, std.zip.CentralDirectoryFileHeader, cd);
-            try self.out.appendSlice(alloc, e.name);
-        }
-
-        // What matters for ZIP32 sentinel-safety is the SERIALIZED
-        // cd_size field — NOT the cd_end position (which isn't on
-        // wire). Compute cd_size in u64 to avoid casting cd_end.
-        const cd_size_u64 = self.out.items.len - cd_start;
-        if (cd_size_u64 >= std.math.maxInt(u32)) {
-            return error.ZipArchiveTooLarge;
-        }
-        const cd_size: u32 = @intCast(cd_size_u64);
-        // Round-trip guard: zlsx's reader rejects files whose
-        // stat.size > maxInt(u32) (we don't support Zip64). Also
-        // reject when the total written-so-far + EOCD would push
-        // past 4 GiB, so we don't generate archives we can't open.
-        // EndRecord is fixed-size; we use a generous overhead.
-        if (self.out.items.len + 22 > std.math.maxInt(u32)) {
-            return error.ZipArchiveTooLarge;
-        }
-
-        const end: std.zip.EndRecord = .{
-            .signature = std.zip.end_record_sig,
-            .disk_number = 0,
-            .central_directory_disk_number = 0,
-            .record_count_disk = @intCast(self.entries.items.len),
-            .record_count_total = @intCast(self.entries.items.len),
-            .central_directory_size = cd_size,
-            .central_directory_offset = cd_start,
-            .comment_len = 0,
-        };
-        try appendStruct(alloc, self.out, std.zip.EndRecord, end);
-    }
-};
-
-fn appendStruct(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), comptime T: type, value: T) !void {
-    // ZIP headers are defined little-endian on disk. On a big-endian
-    // host, dumping the native struct bytes would emit byte-swapped
-    // signatures/sizes/offsets and produce archives that Excel and
-    // std.zip can't open. Mirrors the editor save path's pattern.
-    var v = value;
-    if (@import("builtin").cpu.arch.endian() != .little)
-        std.mem.byteSwapAllFields(T, &v);
-    const bytes = std.mem.asBytes(&v);
-    try out.appendSlice(alloc, bytes);
-}
+// ─── ZIP writer ─────────────────────────────────────────────────────
+//
+// B3 iter-wr-5: Writer's private `ZipWriter` struct + `appendStruct`
+// helper retired; the canonical LFH+CDFH+EOCD layout now lives in
+// `pkg/zip.zig` (`zip.Archive`). `Writer.save` consumes it via the
+// `zlsx_zip` named import — same byte-stable invariants, one source
+// of truth shared with `pkg.PartStore.save` (`d6235f3` total-size
+// guard, `66e4ccd` ZIP32 sentinel guards, `410b4bc` huffman u13
+// regression fix all preserved).
 
 // ─── Tests ───────────────────────────────────────────────────────────
 
@@ -5155,7 +4996,7 @@ test "fuzz SheetWriter: random stage-5 per-sheet feature combos" {
     }
 }
 
-test "fuzz ZipWriter produces archives our reader can walk" {
+test "fuzz zip.Archive produces archives our reader can walk" {
     const iters = fuzzIterationsW() / 10;
     const seed = fuzzSeedW();
     var prng = std.Random.DefaultPrng.init(seed);
@@ -5173,7 +5014,7 @@ test "fuzz ZipWriter produces archives our reader can walk" {
     for (0..iters) |_| {
         var zip_buf: std.ArrayListUnmanaged(u8) = .{};
         defer zip_buf.deinit(std.testing.allocator);
-        var zw = ZipWriter.init(std.testing.allocator, &zip_buf);
+        var zw = zip.Archive.init(std.testing.allocator, &zip_buf);
         defer zw.deinit();
 
         const n_entries = rng.intRangeAtMost(usize, 1, 6);
@@ -5186,7 +5027,7 @@ test "fuzz ZipWriter produces archives our reader can walk" {
             var payload: [512]u8 = undefined;
             const payload_len = rng.intRangeAtMost(usize, 0, payload.len);
             rng.bytes(payload[0..payload_len]);
-            try zw.addEntry(expected_names[i][0..name_len], payload[0..payload_len]);
+            try zw.addEntry(expected_names[i][0..name_len], payload[0..payload_len], deflateCompressErased);
         }
         try zw.finalize();
 
@@ -5216,7 +5057,7 @@ test "fuzz ZipWriter produces archives our reader can walk" {
 
 fn deflateRoundTrip(alloc: Allocator, input: []const u8) !bool {
     // `deflateCompress` asserts input.len > 0 — empty inputs bypass
-    // compression at the ZipWriter layer, so special-case here.
+    // compression at the zip.Archive layer, so special-case here.
     if (input.len == 0) return true;
 
     var compressed: std.ArrayListUnmanaged(u8) = .{};
@@ -5575,7 +5416,7 @@ test "fuzz Writer: boundary numeric values survive round-trip" {
     }
 }
 
-test "fuzz ZipWriter: adversarial entry names" {
+test "fuzz zip.Archive: adversarial entry names" {
     // Names with path traversal, embedded nulls, UTF-8, max-length.
     // We don't promise to *reject* these (addEntry just writes bytes) —
     // we promise the result is still a walkable zip and our reader
@@ -5612,7 +5453,7 @@ test "fuzz ZipWriter: adversarial entry names" {
     for (0..iters) |_| {
         var zip_buf: std.ArrayListUnmanaged(u8) = .{};
         defer zip_buf.deinit(std.testing.allocator);
-        var zw = ZipWriter.init(std.testing.allocator, &zip_buf);
+        var zw = zip.Archive.init(std.testing.allocator, &zip_buf);
         defer zw.deinit();
 
         var emitted: usize = 0;
@@ -5622,7 +5463,7 @@ test "fuzz ZipWriter: adversarial entry names" {
             var payload: [128]u8 = undefined;
             const plen = rng.intRangeAtMost(usize, 0, payload.len);
             rng.bytes(payload[0..plen]);
-            zw.addEntry(name, payload[0..plen]) catch |e| switch (e) {
+            zw.addEntry(name, payload[0..plen], deflateCompressErased) catch |e| switch (e) {
                 error.NameTooLong, error.EntryTooLarge => continue,
                 else => return e,
             };
