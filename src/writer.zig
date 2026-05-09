@@ -65,6 +65,14 @@ const WorkbookXmlSheetEntry = workbook_xml_plan.SheetEntry;
 // writer→pkg→writer module-graph cycle.
 const zip = @import("zlsx_zip");
 
+// B3 iter-wr-4: per-sheet fresh-emit unification. Writer's
+// `xl/worksheets/sheetN.xml` + per-sheet rels + comments + VML
+// drawing emit routes through the shared `pkg/sheet_plan.zig`
+// substrate. std-only; same cycle-avoidance argument as the
+// other plan modules. Workbook (`pkg/workbook.zig`) gains the
+// same emit surface for fresh-file production in future iters.
+const sheet_plan = @import("zlsx_sheet_plan");
+
 /// Function-pointer adapter wrapping `deflateCompress` with the
 /// `anyerror!void` return type that `zip.Archive.addEntry`'s
 /// `DeflateFn` expects.
@@ -74,6 +82,48 @@ fn deflateCompressErased(
     out: *std.ArrayListUnmanaged(u8),
 ) anyerror!void {
     return deflateCompress(alloc, input, out);
+}
+
+/// B3 iter-wr-4: project Writer's `ConditionalFormat` onto the
+/// plan's `sheet_plan.ConditionalFormat` view. Maps the Writer-local
+/// `CfOperator` enum onto the plan's identical enum (same OOXML
+/// tokens, declared independently to keep the plan std-only); the
+/// inner formula slices are aliased through unchanged.
+fn projectConditionalFormat(cf: ConditionalFormat) sheet_plan.ConditionalFormat {
+    return .{
+        .range = cf.range,
+        .rule = switch (cf.rule) {
+            .cell_is => |r| .{ .cell_is = .{
+                .operator = projectCfOperator(r.operator),
+                .formula1 = r.formula1,
+                .formula2 = r.formula2,
+                .dxf_id = r.dxf_id,
+            } },
+            .expression => |r| .{ .expression = .{
+                .formula = r.formula,
+                .dxf_id = r.dxf_id,
+            } },
+            .color_scale => |r| .{ .color_scale = .{
+                .low_color_argb = r.low_color_argb,
+                .mid_color_argb = r.mid_color_argb,
+                .high_color_argb = r.high_color_argb,
+            } },
+            .data_bar => |r| .{ .data_bar = .{ .color_argb = r.color_argb } },
+        },
+    };
+}
+
+inline fn projectCfOperator(op: CfOperator) sheet_plan.CfOperator {
+    return switch (op) {
+        .less_than => .less_than,
+        .less_than_or_equal => .less_than_or_equal,
+        .equal => .equal,
+        .not_equal => .not_equal,
+        .greater_than => .greater_than,
+        .greater_than_or_equal => .greater_than_or_equal,
+        .between => .between,
+        .not_between => .not_between,
+    };
 }
 
 const Allocator = std.mem.Allocator;
@@ -572,211 +622,91 @@ pub const Writer = struct {
         }
 
         // 5. xl/worksheets/sheetN.xml
+        //
+        // B3 iter-wr-4: per-sheet emit routes through `sheet_plan`'s
+        // shared `emitWorksheetXml`. Writer's `SheetWriter`-local
+        // arrays are projected onto the plan's
+        // `SheetEmitInputs` view via per-sheet scratch buffers so the
+        // plan stays std-only (no Writer-internal types reach it).
+        // The byte output is identical to the prior local emit
+        // branch — child-element order, attribute order, and
+        // optional-block elision are all locked by the plan's tests.
         for (self.sheets.items, 0..) |sw, i| {
             var full: std.ArrayListUnmanaged(u8) = .{};
             defer full.deinit(alloc);
-            try full.appendSlice(alloc, WORKSHEET_PROLOG);
 
-            // <sheetViews> — emitted when any pane is frozen (stage 5).
-            if (sw.freeze_rows != 0 or sw.freeze_cols != 0) {
-                try full.appendSlice(alloc, "<sheetViews><sheetView workbookViewId=\"0\">");
-                try full.appendSlice(alloc, "<pane");
-                if (sw.freeze_cols != 0) try full.print(alloc, " xSplit=\"{d}\"", .{sw.freeze_cols});
-                if (sw.freeze_rows != 0) try full.print(alloc, " ySplit=\"{d}\"", .{sw.freeze_rows});
-                var tl_buf: [16]u8 = undefined;
-                const top_left = try formatCellRef(&tl_buf, sw.freeze_rows + 1, sw.freeze_cols);
-                const active_pane: []const u8 = if (sw.freeze_rows != 0 and sw.freeze_cols != 0)
-                    "bottomRight"
-                else if (sw.freeze_rows != 0)
-                    "bottomLeft"
-                else
-                    "topRight";
-                try full.print(alloc, " topLeftCell=\"{s}\" activePane=\"{s}\" state=\"frozen\"/>", .{ top_left, active_pane });
-                try full.appendSlice(alloc, "</sheetView></sheetViews>");
+            // Project Writer's heap-owned arrays onto the plan's
+            // const-slice view. The intermediate buffers live for
+            // the duration of one sheet emit; no extra string
+            // duplications happen here because the plan slices
+            // straight into the SheetWriter's owned buffers.
+            const hyperlinks_view = try alloc.alloc(sheet_plan.Hyperlink, sw.hyperlinks.items.len);
+            defer alloc.free(hyperlinks_view);
+            for (sw.hyperlinks.items, 0..) |h, k| {
+                hyperlinks_view[k] = .{ .range = h.range, .url = h.url };
             }
 
-            // <cols> — one <col> per registered width override.
-            if (sw.column_widths.items.len > 0) {
-                try full.appendSlice(alloc, "<cols>");
-                for (sw.column_widths.items) |cw| {
-                    try full.print(
-                        alloc,
-                        "<col min=\"{d}\" max=\"{d}\" width=\"{d}\" customWidth=\"1\"/>",
-                        .{ cw.col_min, cw.col_max, cw.width },
-                    );
-                }
-                try full.appendSlice(alloc, "</cols>");
+            const internal_hl_view = try alloc.alloc(sheet_plan.InternalHyperlink, sw.internal_hyperlinks.items.len);
+            defer alloc.free(internal_hl_view);
+            for (sw.internal_hyperlinks.items, 0..) |h, k| {
+                internal_hl_view[k] = .{ .range = h.range, .location = h.location };
             }
 
-            try full.appendSlice(alloc, "<sheetData>");
-            try full.appendSlice(alloc, sw.body.items);
-            try full.appendSlice(alloc, "</sheetData>");
-
-            // <autoFilter> must come after </sheetData>.
-            if (sw.auto_filter_range) |range| {
-                try full.appendSlice(alloc, "<autoFilter ref=\"");
-                try appendXmlEscaped(alloc, &full, range);
-                try full.appendSlice(alloc, "\"/>");
+            const merges_view = try alloc.alloc([]const u8, sw.merged_cells.items.len);
+            defer alloc.free(merges_view);
+            for (sw.merged_cells.items, 0..) |range, k| {
+                merges_view[k] = range;
             }
 
-            // <mergeCells> follows <autoFilter> per ECMA-376 CT_Worksheet
-            // child order. Ranges were validated on intake, but defensively
-            // xml-escape them on emit anyway.
-            if (sw.merged_cells.items.len > 0) {
-                try full.print(alloc, "<mergeCells count=\"{d}\">", .{sw.merged_cells.items.len});
-                for (sw.merged_cells.items) |range| {
-                    try full.appendSlice(alloc, "<mergeCell ref=\"");
-                    try appendXmlEscaped(alloc, &full, range);
-                    try full.appendSlice(alloc, "\"/>");
-                }
-                try full.appendSlice(alloc, "</mergeCells>");
+            const cw_view = try alloc.alloc(sheet_plan.ColumnWidth, sw.column_widths.items.len);
+            defer alloc.free(cw_view);
+            for (sw.column_widths.items, 0..) |cw, k| {
+                cw_view[k] = .{ .col_min = cw.col_min, .col_max = cw.col_max, .width = cw.width };
             }
 
-            // <conditionalFormatting> slots between <mergeCells> and
-            // <dataValidations> per ECMA-376 CT_Worksheet child order.
-            // One <conditionalFormatting> block per rule is simpler
-            // than grouping by sqref, and Excel accepts either shape.
-            for (sw.conditional_formats.items, 1..) |cf, cf_priority| {
-                // Priority increments per rule so overlapping ranges
-                // produce a deterministic cascade — Excel resolves
-                // ties via document order but some validators flag
-                // duplicate priorities. Earlier-registered rules win
-                // (lower priority number → higher precedence).
-                try full.appendSlice(alloc, "<conditionalFormatting sqref=\"");
-                try appendXmlEscaped(alloc, &full, cf.range);
-                try full.appendSlice(alloc, "\">");
-                switch (cf.rule) {
-                    .cell_is => |r| {
-                        try full.print(
-                            alloc,
-                            "<cfRule type=\"cellIs\" dxfId=\"{d}\" priority=\"{d}\" operator=\"{s}\">",
-                            .{ r.dxf_id, cf_priority, r.operator.toOoxml() },
-                        );
-                        try full.appendSlice(alloc, "<formula>");
-                        try appendXmlEscaped(alloc, &full, r.formula1);
-                        try full.appendSlice(alloc, "</formula>");
-                        if (r.formula2) |f2| {
-                            try full.appendSlice(alloc, "<formula>");
-                            try appendXmlEscaped(alloc, &full, f2);
-                            try full.appendSlice(alloc, "</formula>");
-                        }
-                        try full.appendSlice(alloc, "</cfRule>");
-                    },
-                    .expression => |r| {
-                        try full.print(
-                            alloc,
-                            "<cfRule type=\"expression\" dxfId=\"{d}\" priority=\"{d}\">",
-                            .{ r.dxf_id, cf_priority },
-                        );
-                        try full.appendSlice(alloc, "<formula>");
-                        try appendXmlEscaped(alloc, &full, r.formula);
-                        try full.appendSlice(alloc, "</formula>");
-                        try full.appendSlice(alloc, "</cfRule>");
-                    },
-                    .color_scale => |r| {
-                        try full.print(
-                            alloc,
-                            "<cfRule type=\"colorScale\" priority=\"{d}\"><colorScale>",
-                            .{cf_priority},
-                        );
-                        if (r.mid_color_argb != null) {
-                            // 3-stop: min / 50th percentile / max.
-                            try full.appendSlice(alloc, "<cfvo type=\"min\"/><cfvo type=\"percentile\" val=\"50\"/><cfvo type=\"max\"/>");
-                            try full.print(alloc, "<color rgb=\"{X:0>8}\"/>", .{r.low_color_argb});
-                            try full.print(alloc, "<color rgb=\"{X:0>8}\"/>", .{r.mid_color_argb.?});
-                            try full.print(alloc, "<color rgb=\"{X:0>8}\"/>", .{r.high_color_argb});
-                        } else {
-                            // 2-stop: min / max only.
-                            try full.appendSlice(alloc, "<cfvo type=\"min\"/><cfvo type=\"max\"/>");
-                            try full.print(alloc, "<color rgb=\"{X:0>8}\"/>", .{r.low_color_argb});
-                            try full.print(alloc, "<color rgb=\"{X:0>8}\"/>", .{r.high_color_argb});
-                        }
-                        try full.appendSlice(alloc, "</colorScale></cfRule>");
-                    },
-                    .data_bar => |r| {
-                        try full.print(
-                            alloc,
-                            "<cfRule type=\"dataBar\" priority=\"{d}\"><dataBar><cfvo type=\"min\"/><cfvo type=\"max\"/>",
-                            .{cf_priority},
-                        );
-                        try full.print(alloc, "<color rgb=\"{X:0>8}\"/>", .{r.color_argb});
-                        try full.appendSlice(alloc, "</dataBar></cfRule>");
-                    },
-                }
-                try full.appendSlice(alloc, "</conditionalFormatting>");
+            const cf_view = try alloc.alloc(sheet_plan.ConditionalFormat, sw.conditional_formats.items.len);
+            defer alloc.free(cf_view);
+            for (sw.conditional_formats.items, 0..) |cf, k| {
+                cf_view[k] = projectConditionalFormat(cf);
             }
 
-            // <dataValidations> slots between <mergeCells> and
-            // <hyperlinks> per ECMA-376 CT_Worksheet child order. Two
-            // emission paths share the block: iter13 list entries (dropdown)
-            // first, then iter23 numeric / custom entries.
-            const dv_list_count = sw.data_validations.items.len;
-            const dv_range_count = sw.data_validation_ranges.items.len;
-            if (dv_list_count + dv_range_count > 0) {
-                try full.print(alloc, "<dataValidations count=\"{d}\">", .{dv_list_count + dv_range_count});
-                for (sw.data_validations.items) |dv| {
-                    try full.appendSlice(alloc, "<dataValidation type=\"list\" allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"");
-                    try appendXmlEscaped(alloc, &full, dv.range);
-                    try full.appendSlice(alloc, "\"><formula1>&quot;");
-                    for (dv.values, 0..) |v, vi| {
-                        if (vi != 0) try full.append(alloc, ',');
-                        try appendXmlEscaped(alloc, &full, v);
-                    }
-                    try full.appendSlice(alloc, "&quot;</formula1></dataValidation>");
-                }
-                for (sw.data_validation_ranges.items) |dv| {
-                    try full.appendSlice(alloc, "<dataValidation type=\"");
-                    try full.appendSlice(alloc, dv.kind_name);
-                    try full.appendSlice(alloc, "\"");
-                    if (dv.op_name) |op| {
-                        try full.print(alloc, " operator=\"{s}\"", .{op});
-                    }
-                    try full.appendSlice(alloc, " allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"");
-                    try appendXmlEscaped(alloc, &full, dv.range);
-                    try full.appendSlice(alloc, "\"><formula1>");
-                    try appendXmlEscaped(alloc, &full, dv.formula1);
-                    try full.appendSlice(alloc, "</formula1>");
-                    if (dv.formula2) |f2| {
-                        try full.appendSlice(alloc, "<formula2>");
-                        try appendXmlEscaped(alloc, &full, f2);
-                        try full.appendSlice(alloc, "</formula2>");
-                    }
-                    try full.appendSlice(alloc, "</dataValidation>");
-                }
-                try full.appendSlice(alloc, "</dataValidations>");
+            const dvl_view = try alloc.alloc(sheet_plan.DataValidationList, sw.data_validations.items.len);
+            defer alloc.free(dvl_view);
+            for (sw.data_validations.items, 0..) |dv, k| {
+                // []u8 → []const u8 for the values inner slice. Writer's
+                // DataValidationList.values is `[][]u8`; the plan view
+                // wants `[]const []const u8`. A second per-row scratch
+                // array projects the inner pointers without any
+                // string duplication.
+                dvl_view[k] = .{ .range = dv.range, .values = @ptrCast(dv.values) };
             }
 
-            // <hyperlinks> follows <mergeCells> per ECMA-376 ordering.
-            // External entries get r:id references into the per-sheet
-            // _rels file written below; internal entries use
-            // `location="…"` with no rels coupling.
-            if (sw.hyperlinks.items.len > 0 or sw.internal_hyperlinks.items.len > 0) {
-                try full.appendSlice(alloc, "<hyperlinks>");
-                for (sw.hyperlinks.items, 0..) |h, idx| {
-                    try full.appendSlice(alloc, "<hyperlink ref=\"");
-                    try appendXmlEscaped(alloc, &full, h.range);
-                    try full.print(alloc, "\" r:id=\"rId{d}\"/>", .{idx + 1});
-                }
-                for (sw.internal_hyperlinks.items) |h| {
-                    try full.appendSlice(alloc, "<hyperlink ref=\"");
-                    try appendXmlEscaped(alloc, &full, h.range);
-                    try full.appendSlice(alloc, "\" location=\"");
-                    try appendXmlEscaped(alloc, &full, h.location);
-                    try full.appendSlice(alloc, "\"/>");
-                }
-                try full.appendSlice(alloc, "</hyperlinks>");
+            const dvr_view = try alloc.alloc(sheet_plan.DataValidationRange, sw.data_validation_ranges.items.len);
+            defer alloc.free(dvr_view);
+            for (sw.data_validation_ranges.items, 0..) |dv, k| {
+                dvr_view[k] = .{
+                    .range = dv.range,
+                    .kind_name = dv.kind_name,
+                    .op_name = dv.op_name,
+                    .formula1 = dv.formula1,
+                    .formula2 = dv.formula2,
+                };
             }
 
-            // <legacyDrawing> links the sheet to its VML drawing part
-            // so Excel renders the yellow note indicators. The rId
-            // scheme inside the per-sheet rels is: rId1..N = external
-            // hyperlinks, next = comments, last = vmlDrawing.
-            if (sw.comments.items.len > 0) {
-                const vml_rid = sw.hyperlinks.items.len + 2;
-                try full.print(alloc, "<legacyDrawing r:id=\"rId{d}\"/>", .{vml_rid});
-            }
-
-            try full.appendSlice(alloc, "</worksheet>");
+            try sheet_plan.emitWorksheetXml(alloc, &full, .{
+                .body = sw.body.items,
+                .freeze_rows = sw.freeze_rows,
+                .freeze_cols = sw.freeze_cols,
+                .column_widths = cw_view,
+                .auto_filter_range = sw.auto_filter_range,
+                .merged_cells = merges_view,
+                .conditional_formats = cf_view,
+                .data_validations = dvl_view,
+                .data_validation_ranges = dvr_view,
+                .hyperlinks = hyperlinks_view,
+                .internal_hyperlinks = internal_hl_view,
+                .comment_count = sw.comments.items.len,
+            });
 
             var name_buf: [64]u8 = undefined;
             const entry_name = try std.fmt.bufPrint(&name_buf, "xl/worksheets/sheet{d}.xml", .{i + 1});
@@ -785,36 +715,29 @@ pub const Writer = struct {
 
         // 5a. xl/worksheets/_rels/sheetN.xml.rels (hyperlinks + comments)
         //
-        // The Default Extension="rels" content-type in [Content_Types].xml
-        // covers any .rels file we add here — no extra <Override> needed.
-        // Relationship ID scheme: rId1..N = external hyperlinks, then
-        // one for comments, one for vmlDrawing (when sheet has comments).
+        // B3 iter-wr-4: per-sheet rels emit routes through
+        // `sheet_plan.emitSheetRels`. The Default Extension="rels"
+        // content-type in [Content_Types].xml covers any .rels file
+        // we add here — no extra <Override> needed. rId scheme is
+        // owned by the plan (1..N hyperlinks, then comments, then
+        // vmlDrawing) so writer + workbook share one source.
         for (self.sheets.items, 0..) |sw, i| {
-            if (sw.hyperlinks.items.len == 0 and sw.comments.items.len == 0) continue;
+            const hyperlinks_view = try alloc.alloc(sheet_plan.Hyperlink, sw.hyperlinks.items.len);
+            defer alloc.free(hyperlinks_view);
+            for (sw.hyperlinks.items, 0..) |h, k| {
+                hyperlinks_view[k] = .{ .range = h.range, .url = h.url };
+            }
 
             var rels: std.ArrayListUnmanaged(u8) = .{};
             defer rels.deinit(alloc);
-            try rels.appendSlice(alloc, WORKBOOK_RELS_HEAD);
-            for (sw.hyperlinks.items, 0..) |h, idx| {
-                try rels.print(alloc, "<Relationship Id=\"rId{d}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"", .{idx + 1});
-                try appendXmlEscaped(alloc, &rels, h.url);
-                try rels.appendSlice(alloc, "\" TargetMode=\"External\"/>");
-            }
-            if (sw.comments.items.len > 0) {
-                const comments_rid = sw.hyperlinks.items.len + 1;
-                const vml_rid = sw.hyperlinks.items.len + 2;
-                try rels.print(
-                    alloc,
-                    "<Relationship Id=\"rId{d}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\" Target=\"../comments{d}.xml\"/>",
-                    .{ comments_rid, i + 1 },
-                );
-                try rels.print(
-                    alloc,
-                    "<Relationship Id=\"rId{d}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing\" Target=\"../drawings/vmlDrawing{d}.vml\"/>",
-                    .{ vml_rid, i + 1 },
-                );
-            }
-            try rels.appendSlice(alloc, WORKBOOK_RELS_TAIL);
+            const wrote = try sheet_plan.emitSheetRels(
+                alloc,
+                &rels,
+                i,
+                hyperlinks_view,
+                sw.comments.items.len,
+            );
+            if (!wrote) continue;
 
             var rels_name_buf: [64]u8 = undefined;
             const rels_name = try std.fmt.bufPrint(&rels_name_buf, "xl/worksheets/_rels/sheet{d}.xml.rels", .{i + 1});
@@ -823,132 +746,35 @@ pub const Writer = struct {
 
         // 5b. xl/commentsN.xml + xl/drawings/vmlDrawingN.vml (per sheet with comments).
         //
-        // Authors get deduped into the <authors> table so the
-        // <comment authorId=…> indirection works — the reader
-        // preserves that layout round-trip (see parseCommentsForSheet).
-        // The VML drawing is the minimal legacy shape Excel needs to
-        // render the yellow note indicator; one <v:shape> per comment.
+        // B3 iter-wr-4: comments + VML drawing emit routes through
+        // `sheet_plan.emitCommentsXml` / `emitVmlDrawingXml`. Author
+        // dedup, plain-text body shape, idmap chunking, and the
+        // XFD/1048576 anchor clamp all live on the plan so the
+        // byte format is shared between Writer and (future) Workbook
+        // fresh-emit. Per `a966e29` the anchor clamp prevents
+        // inverted shapes on cells near the rightmost column.
         for (self.sheets.items, 0..) |sw, i| {
             if (sw.comments.items.len == 0) continue;
 
-            // Build the unique author list.
-            var authors: std.ArrayListUnmanaged([]const u8) = .{};
-            defer authors.deinit(alloc);
-            var author_ids: std.ArrayListUnmanaged(usize) = .{};
-            defer author_ids.deinit(alloc);
-            for (sw.comments.items) |c| {
-                var found: ?usize = null;
-                for (authors.items, 0..) |a, j| {
-                    if (std.mem.eql(u8, a, c.author)) {
-                        found = j;
-                        break;
-                    }
-                }
-                if (found) |j| {
-                    try author_ids.append(alloc, j);
-                } else {
-                    try author_ids.append(alloc, authors.items.len);
-                    try authors.append(alloc, c.author);
-                }
+            // Project Writer's `Comment` slice onto the plan's view.
+            // Same layout, just different namespace — no string
+            // duplication.
+            const comments_view = try alloc.alloc(sheet_plan.Comment, sw.comments.items.len);
+            defer alloc.free(comments_view);
+            for (sw.comments.items, 0..) |c, k| {
+                comments_view[k] = .{ .ref = c.ref, .author = c.author, .text = c.text };
             }
 
             var cx: std.ArrayListUnmanaged(u8) = .{};
             defer cx.deinit(alloc);
-            try cx.appendSlice(alloc, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
-            try cx.appendSlice(alloc, "<comments xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">");
-            try cx.appendSlice(alloc, "<authors>");
-            for (authors.items) |a| {
-                try cx.appendSlice(alloc, "<author>");
-                try appendXmlEscaped(alloc, &cx, a);
-                try cx.appendSlice(alloc, "</author>");
-            }
-            try cx.appendSlice(alloc, "</authors><commentList>");
-            for (sw.comments.items, author_ids.items) |c, aid| {
-                // addComment only takes a plain-text body, so emit
-                // `<text><t .../>` directly — no synthetic `<r>` run
-                // wrapper. With the wrapper the reader treats every
-                // writer-produced comment as rich text and surfaces
-                // a single-run `Comment.runs`, contradicting the
-                // plain/rich distinction the reader's contract draws
-                // (`runs == null` means plain).
-                try cx.print(alloc, "<comment ref=\"{s}\" authorId=\"{d}\"><text><t xml:space=\"preserve\">", .{ c.ref, aid });
-                try appendXmlEscaped(alloc, &cx, c.text);
-                try cx.appendSlice(alloc, "</t></text></comment>");
-            }
-            try cx.appendSlice(alloc, "</commentList></comments>");
+            try sheet_plan.emitCommentsXml(alloc, &cx, comments_view);
             var cn_buf: [64]u8 = undefined;
             const cn = try std.fmt.bufPrint(&cn_buf, "xl/comments{d}.xml", .{i + 1});
             try zw.addEntry(cn, cx.items, deflateCompressErased);
 
-            // Minimal VML drawing — one <v:shape> per comment, with
-            // the oct-encoded Row/Column client data Excel uses to
-            // anchor the note. The shape template `_x0000_t202` and
-            // shapelayout `idmap` are boilerplate that every Excel-
-            // authored file carries.
             var vml: std.ArrayListUnmanaged(u8) = .{};
             defer vml.deinit(alloc);
-            try vml.appendSlice(alloc,
-                \\<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel">
-            );
-            // Each `<o:idmap>` chunk covers 1024 shape IDs. Our shape
-            // IDs start at 1025 and increment per comment, so the
-            // first idmap (data="1") covers IDs 1024-2047 = 1023
-            // comments. Workbooks with more comments need additional
-            // idmap entries: "1,2" covers 2047 shapes, "1,2,3" for
-            // 3071, and so on. Over-provisioning by one is harmless;
-            // Excel ignores idmaps with no referenced shapes.
-            // Highest shape ID = 1024 + num_comments (shape IDs
-            // start at 1025 and run through 1024 + num_comments).
-            // floor(highest_id / 1024) is the last idmap index;
-            // +1 because idmaps are 1-indexed.
-            const num_idmaps: usize = sw.comments.items.len / 1024 + 1;
-            try vml.appendSlice(alloc, "<o:shapelayout v:ext=\"edit\"><o:idmap v:ext=\"edit\" data=\"");
-            for (0..num_idmaps) |k| {
-                if (k != 0) try vml.append(alloc, ',');
-                try vml.print(alloc, "{d}", .{k + 1});
-            }
-            try vml.appendSlice(alloc, "\"/></o:shapelayout>");
-            try vml.appendSlice(alloc,
-                \\<v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype>
-            );
-            for (sw.comments.items, 0..) |c, shape_idx| {
-                // `addComment` ran `validateHyperlinkRange` at intake
-                // so any ref that reaches save() is valid A1. Assert
-                // on drift — silently dropping a comment would make
-                // audit-side invariant breaks invisible.
-                const rc = try parseA1Corner(c.ref);
-                const row0 = rc.row - 1;
-                const col0 = rc.col - 1;
-                // Per-comment anchor: each note occupies a 3-col × 2-row
-                // rectangle starting one column to the right of its
-                // cell. Prior revision hardcoded `1, 15, 0, 2, 4, 31,
-                // 4, 3` for every comment which made all open notes
-                // overlap in the same region of the sheet.
-                //
-                // OOXML VML x:Anchor is 8 numbers:
-                //   fromCol, fromColPx, fromRow, fromRowPx,
-                //   toCol,   toColPx,   toRow,   toRowPx
-                // Clamp the anchor "to" corner to Excel's hard grid so
-                // comments on cells near XFD/1048576 don't reference
-                // off-sheet cells. Excel tolerates it, but some strict
-                // VML parsers do not.
-                // Clamp BOTH endpoints to the hard XFD/1048576 grid.
-                // For a comment on the rightmost column (col0 ==
-                // EXCEL_MAX_COL - 1), the unclamped from_col would
-                // be EXCEL_MAX_COL while to_col clamps back to
-                // EXCEL_MAX_COL - 1, producing an inverted anchor.
-                // Same shape on the bottom row.
-                const from_col = @min(col0 + 1, EXCEL_MAX_COL - 1);
-                const from_row = @min(row0, EXCEL_MAX_ROW - 1);
-                const to_col = @min(col0 + 3, EXCEL_MAX_COL - 1);
-                const to_row = @min(row0 + 4, EXCEL_MAX_ROW - 1);
-                try vml.print(
-                    alloc,
-                    "<v:shape id=\"_x0000_s{d}\" type=\"#_x0000_t202\" style=\"position:absolute;margin-left:60pt;margin-top:10pt;width:100pt;height:60pt;z-index:{d};visibility:hidden\" fillcolor=\"#ffffe1\" o:insetmode=\"auto\"><v:fill color2=\"#ffffe1\"/><v:shadow on=\"t\" color=\"black\" obscured=\"t\"/><v:path o:connecttype=\"none\"/><v:textbox><div style=\"text-align:left\"/></v:textbox><x:ClientData ObjectType=\"Note\"><x:MoveWithCells/><x:SizeWithCells/><x:Anchor>{d}, 15, {d}, 2, {d}, 31, {d}, 3</x:Anchor><x:AutoFill>False</x:AutoFill><x:Row>{d}</x:Row><x:Column>{d}</x:Column></x:ClientData></v:shape>",
-                    .{ 1025 + shape_idx, shape_idx + 1, from_col, from_row, to_col, to_row, row0, col0 },
-                );
-            }
-            try vml.appendSlice(alloc, "</xml>");
+            try sheet_plan.emitVmlDrawingXml(alloc, &vml, comments_view);
             var vml_buf: [64]u8 = undefined;
             const vml_name = try std.fmt.bufPrint(&vml_buf, "xl/drawings/vmlDrawing{d}.vml", .{i + 1});
             try zw.addEntry(vml_name, vml.items, deflateCompressErased);
@@ -5773,4 +5599,349 @@ test "deflateCompress: large repetitive payload doesn't trip Huffman assert" {
         }
     }
     try std.testing.expectEqual(@as(usize, 50_000), row_count);
+}
+
+// ─── iter-wr-4 byte-equivalence parity ───────────────────────────────
+//
+// These tests build a Writer-saved workbook, then construct the
+// same per-sheet bytes by calling `pkg/sheet_plan.zig` directly.
+// The two outputs must be byte-identical — that's the contract
+// that lets future iters (wr-6) collapse `Writer.save` into a thin
+// shim around `Workbook.save` without producing a "repaired"
+// prompt across the corpus.
+//
+// Each test extracts the relevant sheet/comments/vml/rels part out
+// of the Writer-emitted ZIP, then runs the plan module on a
+// hand-built `SheetEmitInputs` and compares.
+
+/// Walk a saved-on-disk archive, extract one entry's uncompressed
+/// bytes by name. Returns owned bytes (caller frees). Returns
+/// `error.PartNotFound` if the entry isn't in the archive.
+fn extractParityEntry(
+    alloc: Allocator,
+    archive_path: []const u8,
+    target: []const u8,
+) ![]u8 {
+    var file = try std.fs.cwd().openFile(archive_path, .{});
+    defer file.close();
+    var fbuf: [4096]u8 = undefined;
+    var fr = file.reader(&fbuf);
+    var iter = try std.zip.Iterator.init(&fr);
+    var name_buf: [128]u8 = undefined;
+    while (try iter.next()) |entry| {
+        if (entry.filename_len > name_buf.len) continue;
+        try fr.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+        const filename = name_buf[0..entry.filename_len];
+        try fr.interface.readSliceAll(filename);
+        if (std.mem.eql(u8, filename, target)) {
+            return try extractEntryForTest(alloc, entry, &fr);
+        }
+    }
+    return error.PartNotFound;
+}
+
+test "iter-wr-4 parity: empty body sheet — byte identical" {
+    const a = std.testing.allocator;
+    var tmp = TestTmp.init();
+    defer tmp.deinit();
+    const path = try tmp.path(a, "iter_wr4_empty.xlsx");
+    defer a.free(path);
+
+    var w = Writer.init(a);
+    defer w.deinit();
+    _ = try w.addSheet("Sheet1");
+    try w.save(path);
+
+    const writer_bytes = try extractParityEntry(a, path, "xl/worksheets/sheet1.xml");
+    defer a.free(writer_bytes);
+
+    var plan_buf: std.ArrayListUnmanaged(u8) = .{};
+    defer plan_buf.deinit(a);
+    try sheet_plan.emitWorksheetXml(a, &plan_buf, .{ .body = "" });
+
+    try std.testing.expectEqualSlices(u8, plan_buf.items, writer_bytes);
+}
+
+test "iter-wr-4 parity: mixed cell types row — byte identical" {
+    const a = std.testing.allocator;
+    var tmp = TestTmp.init();
+    defer tmp.deinit();
+    const path = try tmp.path(a, "iter_wr4_mixed.xlsx");
+    defer a.free(path);
+
+    var w = Writer.init(a);
+    defer w.deinit();
+    const sw = try w.addSheet("Sheet1");
+    try sw.writeRow(&.{
+        .{ .string = "hello" },
+        .{ .integer = 42 },
+        .{ .number = 3.14 },
+        .{ .boolean = true },
+        .empty,
+    });
+    try w.save(path);
+
+    const writer_bytes = try extractParityEntry(a, path, "xl/worksheets/sheet1.xml");
+    defer a.free(writer_bytes);
+
+    // Pull the body bytes out of the writer-saved sheet — they live
+    // between <sheetData> and </sheetData>. The plan module is
+    // body-agnostic; row-emit primitives are still owned by Writer
+    // (writeRowImpl). The parity is on the surrounding worksheet
+    // shape.
+    const open = "<sheetData>";
+    const close = "</sheetData>";
+    const open_pos = std.mem.indexOf(u8, writer_bytes, open) orelse return error.TestFailed;
+    const close_pos = std.mem.indexOf(u8, writer_bytes, close) orelse return error.TestFailed;
+    const body = writer_bytes[open_pos + open.len .. close_pos];
+
+    var plan_buf: std.ArrayListUnmanaged(u8) = .{};
+    defer plan_buf.deinit(a);
+    try sheet_plan.emitWorksheetXml(a, &plan_buf, .{ .body = body });
+
+    try std.testing.expectEqualSlices(u8, plan_buf.items, writer_bytes);
+}
+
+test "iter-wr-4 parity: frozen panes — byte identical" {
+    const a = std.testing.allocator;
+    var tmp = TestTmp.init();
+    defer tmp.deinit();
+    const path = try tmp.path(a, "iter_wr4_frozen.xlsx");
+    defer a.free(path);
+
+    var w = Writer.init(a);
+    defer w.deinit();
+    const sw = try w.addSheet("Sheet1");
+    try sw.freezePanes(1, 2);
+    try sw.writeRow(&.{ .{ .string = "header" }, .{ .integer = 1 } });
+    try w.save(path);
+
+    const writer_bytes = try extractParityEntry(a, path, "xl/worksheets/sheet1.xml");
+    defer a.free(writer_bytes);
+
+    const open = "<sheetData>";
+    const close = "</sheetData>";
+    const open_pos = std.mem.indexOf(u8, writer_bytes, open) orelse return error.TestFailed;
+    const close_pos = std.mem.indexOf(u8, writer_bytes, close) orelse return error.TestFailed;
+    const body = writer_bytes[open_pos + open.len .. close_pos];
+
+    var plan_buf: std.ArrayListUnmanaged(u8) = .{};
+    defer plan_buf.deinit(a);
+    try sheet_plan.emitWorksheetXml(a, &plan_buf, .{
+        .body = body,
+        .freeze_rows = 1,
+        .freeze_cols = 2,
+    });
+
+    try std.testing.expectEqualSlices(u8, plan_buf.items, writer_bytes);
+}
+
+test "iter-wr-4 parity: kitchen-sink (merges + autoFilter + DV + CF + hyperlinks)" {
+    const a = std.testing.allocator;
+    var tmp = TestTmp.init();
+    defer tmp.deinit();
+    const path = try tmp.path(a, "iter_wr4_kitchen.xlsx");
+    defer a.free(path);
+
+    var w = Writer.init(a);
+    defer w.deinit();
+    const dxf_id = try w.addDxf(.{ .font_bold = true });
+    const sw = try w.addSheet("Sheet1");
+
+    try sw.writeRow(&.{ .{ .string = "header" }, .{ .integer = 1 }, .{ .integer = 2 } });
+    try sw.writeRow(&.{ .{ .string = "row" }, .{ .integer = 3 }, .{ .integer = 4 } });
+    try sw.setColumnWidth(0, 12.5);
+    try sw.setColumnWidth(1, 5.0);
+    try sw.addMergedCell("A1:B2");
+    try sw.setAutoFilter("A1:C1");
+    try sw.addDataValidationList("C1:C10", &.{ "yes", "no" });
+    try sw.addDataValidationNumeric("B1:B10", .whole, .between, "1", "100");
+    try sw.addConditionalFormatCellIs("B1:B10", .greater_than, "10", null, dxf_id);
+    try sw.addHyperlink("A1", "https://ex.com/?q=1&x=2");
+    try sw.addInternalHyperlink("A2", "Sheet1!B2");
+
+    try w.save(path);
+
+    const writer_bytes = try extractParityEntry(a, path, "xl/worksheets/sheet1.xml");
+    defer a.free(writer_bytes);
+
+    const open = "<sheetData>";
+    const close = "</sheetData>";
+    const open_pos = std.mem.indexOf(u8, writer_bytes, open) orelse return error.TestFailed;
+    const close_pos = std.mem.indexOf(u8, writer_bytes, close) orelse return error.TestFailed;
+    const body = writer_bytes[open_pos + open.len .. close_pos];
+
+    // Re-build the inputs view by hand — same projection Writer.save
+    // does, but with literal slices.
+    const cws = [_]sheet_plan.ColumnWidth{
+        .{ .col_min = 1, .col_max = 1, .width = 12.5 },
+        .{ .col_min = 2, .col_max = 2, .width = 5.0 },
+    };
+    const merges = [_][]const u8{"A1:B2"};
+    const list_vals = [_][]const u8{ "yes", "no" };
+    const lists = [_]sheet_plan.DataValidationList{
+        .{ .range = "C1:C10", .values = &list_vals },
+    };
+    const ranges = [_]sheet_plan.DataValidationRange{
+        .{
+            .range = "B1:B10",
+            .kind_name = "whole",
+            .op_name = "between",
+            .formula1 = "1",
+            .formula2 = "100",
+        },
+    };
+    const cfs = [_]sheet_plan.ConditionalFormat{
+        .{ .range = "B1:B10", .rule = .{ .cell_is = .{
+            .operator = .greater_than,
+            .formula1 = "10",
+            .formula2 = null,
+            .dxf_id = dxf_id,
+        } } },
+    };
+    const hls = [_]sheet_plan.Hyperlink{
+        .{ .range = "A1", .url = "https://ex.com/?q=1&x=2" },
+    };
+    const intl = [_]sheet_plan.InternalHyperlink{
+        .{ .range = "A2", .location = "Sheet1!B2" },
+    };
+
+    var plan_buf: std.ArrayListUnmanaged(u8) = .{};
+    defer plan_buf.deinit(a);
+    try sheet_plan.emitWorksheetXml(a, &plan_buf, .{
+        .body = body,
+        .column_widths = &cws,
+        .auto_filter_range = "A1:C1",
+        .merged_cells = &merges,
+        .conditional_formats = &cfs,
+        .data_validations = &lists,
+        .data_validation_ranges = &ranges,
+        .hyperlinks = &hls,
+        .internal_hyperlinks = &intl,
+    });
+
+    try std.testing.expectEqualSlices(u8, plan_buf.items, writer_bytes);
+}
+
+test "iter-wr-4 parity: rich-row sheet — byte identical" {
+    const a = std.testing.allocator;
+    var tmp = TestTmp.init();
+    defer tmp.deinit();
+    const path = try tmp.path(a, "iter_wr4_rich.xlsx");
+    defer a.free(path);
+
+    var w = Writer.init(a);
+    defer w.deinit();
+    const sw = try w.addSheet("Sheet1");
+    const runs = [_]RichTextRun{
+        .{ .text = "bold ", .bold = true },
+        .{ .text = "italic", .italic = true, .color_argb = 0xFFFF0000 },
+    };
+    try sw.writeRichRow(&.{ .{ .rich = &runs }, .{ .string = "plain" } });
+    try w.save(path);
+
+    const writer_bytes = try extractParityEntry(a, path, "xl/worksheets/sheet1.xml");
+    defer a.free(writer_bytes);
+
+    const open = "<sheetData>";
+    const close = "</sheetData>";
+    const open_pos = std.mem.indexOf(u8, writer_bytes, open) orelse return error.TestFailed;
+    const close_pos = std.mem.indexOf(u8, writer_bytes, close) orelse return error.TestFailed;
+    const body = writer_bytes[open_pos + open.len .. close_pos];
+
+    var plan_buf: std.ArrayListUnmanaged(u8) = .{};
+    defer plan_buf.deinit(a);
+    try sheet_plan.emitWorksheetXml(a, &plan_buf, .{ .body = body });
+
+    try std.testing.expectEqualSlices(u8, plan_buf.items, writer_bytes);
+}
+
+test "iter-wr-4 parity: comments + VML — byte identical (CT.xml VML Default-before-Override pin)" {
+    const a = std.testing.allocator;
+    var tmp = TestTmp.init();
+    defer tmp.deinit();
+    const path = try tmp.path(a, "iter_wr4_comments.xlsx");
+    defer a.free(path);
+
+    var w = Writer.init(a);
+    defer w.deinit();
+    const sw = try w.addSheet("Sheet1");
+    try sw.writeRow(&.{.{ .string = "x" }});
+    try sw.addComment("A1", "alice", "first note");
+    try sw.addComment("A2", "bob", "second");
+    try sw.addComment("A3", "alice", "third");
+    try w.save(path);
+
+    // Pin: CT.xml VML Default precedes any Override. This was the
+    // `50ed225` regression — if it drifts, every comment-bearing
+    // workbook trips Excel's "repaired" prompt.
+    const ct = try extractParityEntry(a, path, "[Content_Types].xml");
+    defer a.free(ct);
+    const vml_default_pos = std.mem.indexOf(u8, ct, "Default Extension=\"vml\"") orelse
+        return error.TestFailed;
+    const first_override_pos = std.mem.indexOf(u8, ct, "<Override") orelse
+        return error.TestFailed;
+    try std.testing.expect(vml_default_pos < first_override_pos);
+
+    // commentsN.xml byte parity.
+    const writer_comments = try extractParityEntry(a, path, "xl/comments1.xml");
+    defer a.free(writer_comments);
+
+    const comments_view = [_]sheet_plan.Comment{
+        .{ .ref = "A1", .author = "alice", .text = "first note" },
+        .{ .ref = "A2", .author = "bob", .text = "second" },
+        .{ .ref = "A3", .author = "alice", .text = "third" },
+    };
+    var plan_comments: std.ArrayListUnmanaged(u8) = .{};
+    defer plan_comments.deinit(a);
+    try sheet_plan.emitCommentsXml(a, &plan_comments, &comments_view);
+    try std.testing.expectEqualSlices(u8, plan_comments.items, writer_comments);
+
+    // vmlDrawingN.vml byte parity.
+    const writer_vml = try extractParityEntry(a, path, "xl/drawings/vmlDrawing1.vml");
+    defer a.free(writer_vml);
+    var plan_vml: std.ArrayListUnmanaged(u8) = .{};
+    defer plan_vml.deinit(a);
+    try sheet_plan.emitVmlDrawingXml(a, &plan_vml, &comments_view);
+    try std.testing.expectEqualSlices(u8, plan_vml.items, writer_vml);
+
+    // sheet1.xml.rels byte parity (rId numbering across hyperlinks +
+    // drawings + comments).
+    const writer_rels = try extractParityEntry(a, path, "xl/worksheets/_rels/sheet1.xml.rels");
+    defer a.free(writer_rels);
+    var plan_rels: std.ArrayListUnmanaged(u8) = .{};
+    defer plan_rels.deinit(a);
+    const wrote = try sheet_plan.emitSheetRels(a, &plan_rels, 0, &.{}, comments_view.len);
+    try std.testing.expect(wrote);
+    try std.testing.expectEqualSlices(u8, plan_rels.items, writer_rels);
+}
+
+test "iter-wr-4 parity: rels with hyperlinks AND comments — rId numbering stable" {
+    const a = std.testing.allocator;
+    var tmp = TestTmp.init();
+    defer tmp.deinit();
+    const path = try tmp.path(a, "iter_wr4_rels_combo.xlsx");
+    defer a.free(path);
+
+    var w = Writer.init(a);
+    defer w.deinit();
+    const sw = try w.addSheet("Sheet1");
+    try sw.writeRow(&.{.{ .string = "x" }});
+    try sw.addHyperlink("A1", "https://ex.com");
+    try sw.addHyperlink("A2", "https://ex2.com");
+    try sw.addComment("A3", "alice", "note");
+    try w.save(path);
+
+    const writer_rels = try extractParityEntry(a, path, "xl/worksheets/_rels/sheet1.xml.rels");
+    defer a.free(writer_rels);
+
+    const hls = [_]sheet_plan.Hyperlink{
+        .{ .range = "A1", .url = "https://ex.com" },
+        .{ .range = "A2", .url = "https://ex2.com" },
+    };
+    var plan_rels: std.ArrayListUnmanaged(u8) = .{};
+    defer plan_rels.deinit(a);
+    const wrote = try sheet_plan.emitSheetRels(a, &plan_rels, 0, &hls, 1);
+    try std.testing.expect(wrote);
+    try std.testing.expectEqualSlices(u8, plan_rels.items, writer_rels);
 }
