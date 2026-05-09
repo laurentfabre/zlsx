@@ -98,7 +98,13 @@ pub const PartStore = struct {
     /// retain compressed bytes for parts callers never touch.
     /// `materializeAt` and the byte-preserving `save()` path both
     /// re-read from this handle by `seekTo` + `readAll`.
-    file: std.fs.File,
+    ///
+    /// `null` for stores built via `PartStore.fresh()` — no source
+    /// archive exists, so every part lives in `overrides[i]` and
+    /// `save()` never reads from a source file. Code paths that
+    /// dereference `self.file` are gated on `overrides[i] == null`,
+    /// which can never be true for a fresh store.
+    file: ?std.fs.File,
     /// Per-part raw ZIP entries (LFH/CDFH/payload offsets). Same
     /// length + ordering as `parts`.
     entries: []ZipEntry,
@@ -206,8 +212,93 @@ pub const PartStore = struct {
         };
     }
 
+    /// Construct a from-scratch PartStore with no source archive.
+    /// Every part the caller wants in the output is added via
+    /// `addPart`; nothing else is on disk yet. Save emits a fresh
+    /// LFH+CDFH+payload for every entry — never reads from a source
+    /// file (there is none).
+    ///
+    /// Seeds an empty `[Content_Types].xml` so subsequent
+    /// `addPart(name, ct, bytes)` calls have a valid CT document to
+    /// stage `<Override>` entries into. Without the seed, the very
+    /// first `addPart` would fail with `error.MissingContentTypes`.
+    ///
+    /// Calling `save(path)` immediately after `fresh()` (no addPart)
+    /// emits a 1-entry ZIP containing only the empty
+    /// `[Content_Types].xml` — spec-legal but useless to OOXML
+    /// readers (no workbook, no rels). This is intentional: the
+    /// store doesn't enforce OOXML well-formedness; that's the
+    /// caller's job (Workbook.create or similar).
+    pub fn fresh(allocator: std.mem.Allocator) Error!PartStore {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const ar_alloc = arena.allocator();
+
+        // Minimum spec-legal [Content_Types].xml. No <Default> or
+        // <Override> entries — addPart will append them lazily.
+        const seed_ct_xml =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+            "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">" ++
+            "</Types>";
+        const owned_ct_name = try ar_alloc.dupe(u8, "[Content_Types].xml");
+        const owned_ct_bytes = try ar_alloc.dupe(u8, seed_ct_xml);
+
+        // STORED (method 0): the seed XML is well under the 1 KiB
+        // deflate threshold used elsewhere in the file. Mirrors the
+        // `bytes.len < 1024` branch in `addPart` / `replacePart`.
+        const owned_payload = try ar_alloc.dupe(u8, seed_ct_xml);
+
+        const entries = try ar_alloc.alloc(ZipEntry, 1);
+        entries[0] = .{
+            .name = owned_ct_name,
+            .lfh_offset = 0,
+            .lfh_total_len = 0,
+            .cdfh_offset = 0,
+            .cdfh_total_len = 0,
+            .payload_offset = 0,
+            .compressed_size = @intCast(owned_payload.len),
+            .uncompressed_size = @intCast(seed_ct_xml.len),
+            .compression_method = 0,
+            .crc32 = std.hash.Crc32.hash(seed_ct_xml),
+            .data_descriptor_len = 0,
+            .has_data_descriptor = false,
+        };
+        const parts = try ar_alloc.alloc(Part, 1);
+        parts[0] = .{
+            .name = owned_ct_name,
+            // [Content_Types].xml has no content_type of its own —
+            // it IS the content-type registry. Matches the result of
+            // `resolveContentTypes` for the same input.
+            .content_type = null,
+            .bytes = owned_ct_bytes,
+            .compression_method = 0,
+            .payload_offset = 0,
+            .compressed_size = @intCast(owned_payload.len),
+            .uncompressed_size = @intCast(seed_ct_xml.len),
+            .crc32 = std.hash.Crc32.hash(seed_ct_xml),
+        };
+        const overrides = try ar_alloc.alloc(?Override, 1);
+        overrides[0] = .{
+            .payload = owned_payload,
+            .compression_method = 0,
+            .crc32 = std.hash.Crc32.hash(seed_ct_xml),
+            .uncompressed_size = @intCast(seed_ct_xml.len),
+        };
+
+        return .{
+            .allocator = allocator,
+            .arena = arena,
+            .file = null,
+            .entries = entries,
+            .parts = parts,
+            .overrides = overrides,
+            .rels_by_owner = .empty,
+            .eocd_comment = &.{},
+        };
+    }
+
     pub fn deinit(self: *PartStore) void {
-        self.file.close();
+        if (self.file) |*f| f.close();
         self.arena.deinit();
     }
 
@@ -488,9 +579,9 @@ pub const PartStore = struct {
         // wouldn't see the new entry until the workbook was
         // re-opened. iter-er-4.
         if (try relsOwner(ar_alloc, name)) |owner| {
-            const fresh = try parseRelationships(ar_alloc, dupe_bytes);
+            const refreshed = try parseRelationships(ar_alloc, dupe_bytes);
             // `put` overwrites any existing entry for this owner.
-            try self.rels_by_owner.put(ar_alloc, owner, fresh);
+            try self.rels_by_owner.put(ar_alloc, owner, refreshed);
         }
     }
 
@@ -585,8 +676,13 @@ pub const PartStore = struct {
                 const total = e.lfh_total_len + e.compressed_size + e.data_descriptor_len;
                 const region = try std.heap.page_allocator.alloc(u8, total);
                 defer std.heap.page_allocator.free(region);
-                try self.file.seekTo(e.lfh_offset);
-                const r = try self.file.readAll(region);
+                // Source-byte branch: only reachable when `overrides[i]
+                // == null`, which implies the store came from `open()`
+                // and `self.file` is non-null. Fresh stores override
+                // every entry, so this branch never fires for them.
+                const src = self.file orelse return Error.BadZip;
+                try src.seekTo(e.lfh_offset);
+                const r = try src.readAll(region);
                 if (r != total) return Error.BadZip;
                 try w.writeAll(region);
                 written += @as(u64, region.len);
@@ -626,8 +722,12 @@ pub const PartStore = struct {
                 // patch the lfh_offset field at byte 42-46.
                 const cdfh = try self.allocator.alloc(u8, e.cdfh_total_len);
                 defer self.allocator.free(cdfh);
-                try self.file.seekTo(e.cdfh_offset);
-                const r = try self.file.readAll(cdfh);
+                // Same invariant as the LFH branch above: untouched
+                // entries imply we came from `open()` with a real
+                // source file.
+                const src = self.file orelse return Error.BadZip;
+                try src.seekTo(e.cdfh_offset);
+                const r = try src.readAll(cdfh);
                 if (r != e.cdfh_total_len) return Error.BadZip;
                 std.mem.writeInt(u32, cdfh[42..46], new_lfh_offsets[i], .little);
                 try w.writeAll(cdfh);
@@ -698,8 +798,13 @@ pub const PartStore = struct {
 
         const compressed = try std.heap.page_allocator.alloc(u8, p.compressed_size);
         defer std.heap.page_allocator.free(compressed);
-        try self.file.seekTo(p.payload_offset);
-        const n = try self.file.readAll(compressed);
+        // Fresh stores never have non-materialized parts (every part
+        // is either inherently empty or carried in an `overrides[i]`
+        // slot with bytes already in the arena). If we land here with
+        // no source file, the store invariant is violated.
+        const src = self.file orelse return Error.BadZip;
+        try src.seekTo(p.payload_offset);
+        const n = try src.readAll(compressed);
         if (n != p.compressed_size) return Error.BadZip;
 
         const bytes = try decompressPayload(
@@ -2184,4 +2289,127 @@ test "PartStore.addPart: atomic on every allocation-failure step" {
         Closure.run,
         .{fixture},
     );
+}
+
+test "PartStore.fresh: returns empty store" {
+    var store = try PartStore.fresh(std.testing.allocator);
+    defer store.deinit();
+
+    // No source file backing a fresh store.
+    try std.testing.expect(store.file == null);
+    // No EOCD comment.
+    try std.testing.expectEqual(@as(usize, 0), store.eocd_comment.len);
+    // No relationships seeded.
+    try std.testing.expectEqual(@as(u32, 0), store.rels_by_owner.count());
+
+    // The store is seeded with `[Content_Types].xml` so subsequent
+    // `addPart` calls have a CT document to stage Override entries
+    // into. The seed is held as an override too, which is what makes
+    // the all-overrides save path fire on save().
+    const names = try store.partNames();
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("[Content_Types].xml", names[0]);
+    try std.testing.expect(store.overrides.len == 1);
+    try std.testing.expect(store.overrides[0] != null);
+
+    // Allocator is wired through (arena child of testing.allocator).
+    // No way to assert that directly; testing.allocator's leak check
+    // at end-of-test catches any orphan allocation.
+}
+
+test "PartStore.fresh: addPart populates the store" {
+    var store = try PartStore.fresh(std.testing.allocator);
+    defer store.deinit();
+
+    try store.addPart("hello.txt", "text/plain", "hello world");
+
+    const p = (try store.part("hello.txt")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, "hello world", p.bytes);
+    try std.testing.expectEqualStrings("text/plain", p.content_type.?);
+
+    // [Content_Types].xml must now declare the new part via an
+    // <Override> — same contract as addPart on a non-fresh store.
+    const ct = (try store.part("[Content_Types].xml")) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, ct.bytes, "/hello.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ct.bytes, "text/plain") != null);
+}
+
+test "PartStore.fresh: save round-trips through PartStore.open" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "fresh_round.xlsx" });
+    defer std.testing.allocator.free(out_path);
+
+    // Two parts: one tiny (forced STORED by the <1 KiB heuristic),
+    // one >= 1 KiB (deflated when it shrinks).
+    const small_name = "tiny.xml";
+    const small_bytes = "<x/>";
+    const big_name = "xl/big.xml";
+    var big_buf: [2048]u8 = undefined;
+    // Highly compressible payload so deflate definitely wins.
+    @memset(&big_buf, 'A');
+    const big_bytes: []const u8 = &big_buf;
+
+    {
+        var store = try PartStore.fresh(std.testing.allocator);
+        defer store.deinit();
+        try store.addPart(small_name, "application/xml", small_bytes);
+        try store.addPart(big_name, "application/xml", big_bytes);
+        try store.save(out_path);
+    }
+
+    var dst = try PartStore.open(std.testing.allocator, out_path);
+    defer dst.deinit();
+
+    const small = (try dst.part(small_name)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, small_bytes, small.bytes);
+    try std.testing.expectEqualStrings("application/xml", small.content_type.?);
+    // Tiny input: STORED.
+    try std.testing.expectEqual(@as(u16, 0), small.compression_method);
+
+    const big = (try dst.part(big_name)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, big_bytes, big.bytes);
+    try std.testing.expectEqualStrings("application/xml", big.content_type.?);
+    // 2 KiB of 'A' compresses to a few bytes — deflate should win.
+    try std.testing.expectEqual(@as(u16, 8), big.compression_method);
+
+    // Three entries on disk: seeded CT.xml + the two added parts.
+    const dst_names = try dst.partNames();
+    try std.testing.expectEqual(@as(usize, 3), dst_names.len);
+}
+
+test "PartStore.fresh: save with zero addParts produces a valid 1-entry ZIP" {
+    // Strict "0-entry ZIP" isn't reachable through `fresh()` because
+    // the constructor seeds `[Content_Types].xml` (precondition for
+    // addPart). The closest contract is: `fresh()` immediately
+    // followed by `save()` produces a 1-entry ZIP holding only the
+    // seeded CT.xml. That archive must round-trip cleanly through
+    // `open()`.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "fresh_empty.xlsx" });
+    defer std.testing.allocator.free(out_path);
+
+    {
+        var store = try PartStore.fresh(std.testing.allocator);
+        defer store.deinit();
+        try store.save(out_path);
+    }
+
+    var dst = try PartStore.open(std.testing.allocator, out_path);
+    defer dst.deinit();
+
+    const dst_names = try dst.partNames();
+    try std.testing.expectEqual(@as(usize, 1), dst_names.len);
+    try std.testing.expectEqualStrings("[Content_Types].xml", dst_names[0]);
+
+    const ct = (try dst.part("[Content_Types].xml")) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, ct.bytes, "<Types") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ct.bytes, "</Types>") != null);
 }
