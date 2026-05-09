@@ -48,12 +48,17 @@ const PlanRichRun = sst_plan.RichRun;
 // B3 iter-wr-2: Styles unification. Writer's style + dxf + numFmt
 // registries + the `xl/styles.xml` emitter live in
 // `pkg/styles_plan.zig` so Workbook's fresh-emit path can use the
-// same code without a circular module dep. Type-of-record (`Style`,
-// `Dxf`, `BorderSide`, `BorderStyle`, `PatternType`, `HAlign`) is
-// re-exported below to keep the writer's public API surface
-// unchanged.
+// same code without a circular module dep.
 const styles_plan_mod = @import("zlsx_styles_plan");
 pub const StylesPlan = styles_plan_mod.StylesPlan;
+
+// B3 iter-wr-3: workbook.xml unification. Writer stages defined names
+// + emits `xl/workbook.xml` through the shared `WorkbookXmlPlan`
+// substrate (see `pkg/workbook_xml_plan.zig`). Same cycle-avoidance
+// argument as `sst_plan` above — std-only, no `pkg/workbook` import.
+const workbook_xml_plan = @import("zlsx_workbook_xml_plan");
+const WorkbookXmlPlan = workbook_xml_plan.WorkbookXmlPlan;
+const WorkbookXmlSheetEntry = workbook_xml_plan.SheetEntry;
 
 const Allocator = std.mem.Allocator;
 
@@ -99,12 +104,10 @@ const ROOT_RELS: []const u8 =
     \\</Relationships>
 ;
 
-const WORKBOOK_HEAD: []const u8 =
-    \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-    \\<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>
-;
-const WORKBOOK_SHEETS_CLOSE: []const u8 = "</sheets>";
-const WORKBOOK_END: []const u8 = "</workbook>";
+// B3 iter-wr-3: `WORKBOOK_HEAD` / `WORKBOOK_SHEETS_CLOSE` /
+// `WORKBOOK_END` retired. The fresh-emit shape is owned by
+// `pkg/workbook_xml_plan.zig:emitWorkbookXml`, which is the
+// canonical home for `xl/workbook.xml` byte serialization.
 
 const WORKBOOK_RELS_HEAD: []const u8 =
     \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -220,27 +223,16 @@ pub const Style = styles_plan_mod.Style;
 /// A workbook-level defined name (named range, print area,
 /// validation source, etc.). Emitted in xl/workbook.xml as
 /// `<definedName name="..." [localSheetId="N"] [hidden="1"]>...</definedName>`.
-pub const DefinedName = struct {
-    /// Owned by the writer (heap-duped on add).
-    name: []u8,
-    /// Owned by the writer. Formula text — typically a sheet-
-    /// qualified range like `Sheet1!$A$1:$A$10` or a constant
-    /// like `42`. Not validated here; caller is responsible for
-    /// emitting a valid Excel expression.
-    refers_to: []u8,
-    /// null → workbook-scope; otherwise the 0-based sheet index
-    /// (must be < self.sheets.items.len at save() time).
-    local_sheet_id: ?u32 = null,
-    /// Hidden names don't appear in Excel's Name Manager UI but
-    /// still resolve in formulas (used for print areas under the
-    /// `_xlnm.Print_Area` convention).
-    hidden: bool = false,
-};
+///
+/// B3 iter-wr-3: storage moved to `pkg/workbook_xml_plan.zig`. This
+/// alias keeps `xlsx.Writer.DefinedName` callable for any consumer
+/// that named the type explicitly.
+pub const DefinedName = workbook_xml_plan.DefinedName;
 
-pub const DefinedNameOptions = struct {
-    local_sheet_id: ?u32 = null,
-    hidden: bool = false,
-};
+/// B3 iter-wr-3: re-exported from `pkg/workbook_xml_plan.zig`. Same
+/// shape as the prior writer-local struct (`local_sheet_id`,
+/// `hidden`), so call sites compile unchanged.
+pub const DefinedNameOptions = workbook_xml_plan.DefinedNameOptions;
 
 pub const Writer = struct {
     allocator: Allocator,
@@ -267,11 +259,14 @@ pub const Writer = struct {
     // `xl/styles.xml`. Workbook (`pkg/workbook.zig`) uses the same
     // type — see `pkg/styles_plan.zig`.
     styles_plan: StylesPlan = .{},
-    // Workbook-level defined names — emitted as `<definedNames>` in
+    // Workbook.xml fresh-emit plan substrate (B3 iter-wr-3). Holds
+    // the staged defined-name pool — emitted as `<definedNames>` in
     // xl/workbook.xml between `</sheets>` and `</workbook>`. Both
     // workbook-scoped (no localSheetId) and sheet-scoped names are
-    // supported via the optional `local_sheet_id`.
-    defined_names: std.ArrayListUnmanaged(DefinedName) = .{},
+    // supported via the optional `local_sheet_id` on the plan's
+    // `DefinedName`. Replaces the pre-iter-wr-3 Writer-local
+    // `defined_names: ArrayList(DefinedName)`.
+    workbook_xml_plan: WorkbookXmlPlan = .{},
 
     pub fn init(allocator: Allocator) Writer {
         return .{ .allocator = allocator };
@@ -286,11 +281,8 @@ pub const Writer = struct {
         self.sst_plan.deinit(self.allocator);
         // Plan owns all duped style strings + the user-numFmt pool.
         self.styles_plan.deinit(self.allocator);
-        for (self.defined_names.items) |dn| {
-            self.allocator.free(dn.name);
-            self.allocator.free(dn.refers_to);
-        }
-        self.defined_names.deinit(self.allocator);
+        // Plan owns all duped defined-name strings.
+        self.workbook_xml_plan.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -367,28 +359,16 @@ pub const Writer = struct {
         refers_to: []const u8,
         opts: DefinedNameOptions,
     ) !void {
-        try validateDefinedName(name);
-        if (refers_to.len == 0) return error.InvalidDefinedNameRefersTo;
-        // Excel defined names are case-insensitive and unique
-        // within each scope (workbook-scope or per-sheet). A
-        // duplicate would be repaired or dropped on open, so
-        // reject up-front.
-        for (self.defined_names.items) |existing| {
-            if (existing.local_sheet_id != opts.local_sheet_id) continue;
-            if (std.ascii.eqlIgnoreCase(existing.name, name)) {
-                return error.DuplicateDefinedName;
-            }
-        }
-        const name_copy = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(name_copy);
-        const refers_copy = try self.allocator.dupe(u8, refers_to);
-        errdefer self.allocator.free(refers_copy);
-        try self.defined_names.append(self.allocator, .{
-            .name = name_copy,
-            .refers_to = refers_copy,
-            .local_sheet_id = opts.local_sheet_id,
-            .hidden = opts.hidden,
-        });
+        // B3 iter-wr-3: validation + dedup + storage all live on the
+        // shared plan. Same rule set as before (full Excel name
+        // grammar, case-insensitive duplicate reject per scope,
+        // empty refers_to reject); same byte format on emit.
+        return self.workbook_xml_plan.addDefinedName(
+            self.allocator,
+            name,
+            refers_to,
+            opts,
+        );
     }
 
     /// Return the 0-based SST index for plain string `s`. Dedups
@@ -525,44 +505,25 @@ pub const Writer = struct {
         // 2. _rels/.rels (static)
         try zw.addEntry("_rels/.rels", ROOT_RELS);
 
-        // 3. xl/workbook.xml
+        // 3. xl/workbook.xml — B3 iter-wr-3: emission lives on the
+        // shared plan. Build the sheet-entry view (one entry per
+        // registered sheet, declaration order) and hand off to
+        // `workbook_xml_plan.emitWorkbookXml`. The plan owns the
+        // defined-name pool already; the bytes coming back are
+        // byte-for-byte equivalent to the pre-iter-wr-3 local emit.
         {
-            var wb: std.ArrayListUnmanaged(u8) = .{};
-            defer wb.deinit(alloc);
-            try wb.appendSlice(alloc, WORKBOOK_HEAD);
+            const sheet_entries = try alloc.alloc(WorkbookXmlSheetEntry, self.sheets.items.len);
+            defer alloc.free(sheet_entries);
             for (self.sheets.items, 0..) |sw, i| {
-                // Sheet names can contain XML-special chars (e.g. "R&D",
-                // "x<y"); escape them before inlining into the attribute.
-                try wb.appendSlice(alloc, "<sheet name=\"");
-                try appendXmlEscaped(alloc, &wb, sw.name);
-                try wb.print(alloc, "\" sheetId=\"{d}\" r:id=\"rId{d}\"/>", .{ i + 1, i + 1 });
+                sheet_entries[i] = .{ .name = sw.name };
             }
-            try wb.appendSlice(alloc, WORKBOOK_SHEETS_CLOSE);
-            // <definedNames> sits between </sheets> and </workbook>
-            // per the OOXML schema. Emit only if non-empty so the
-            // pre-API byte output stays unchanged for workbooks that
-            // don't register any names.
-            if (self.defined_names.items.len > 0) {
-                try wb.appendSlice(alloc, "<definedNames>");
-                for (self.defined_names.items) |dn| {
-                    if (dn.local_sheet_id) |sid| {
-                        if (sid >= self.sheets.items.len) return error.InvalidDefinedNameLocalSheetId;
-                    }
-                    try wb.appendSlice(alloc, "<definedName name=\"");
-                    try appendXmlEscaped(alloc, &wb, dn.name);
-                    try wb.appendSlice(alloc, "\"");
-                    if (dn.local_sheet_id) |sid| {
-                        try wb.print(alloc, " localSheetId=\"{d}\"", .{sid});
-                    }
-                    if (dn.hidden) try wb.appendSlice(alloc, " hidden=\"1\"");
-                    try wb.appendSlice(alloc, ">");
-                    try appendXmlEscaped(alloc, &wb, dn.refers_to);
-                    try wb.appendSlice(alloc, "</definedName>");
-                }
-                try wb.appendSlice(alloc, "</definedNames>");
-            }
-            try wb.appendSlice(alloc, WORKBOOK_END);
-            try zw.addEntry("xl/workbook.xml", wb.items);
+            const wb_bytes = try workbook_xml_plan.emitWorkbookXml(
+                alloc,
+                sheet_entries,
+                &self.workbook_xml_plan,
+            );
+            defer alloc.free(wb_bytes);
+            try zw.addEntry("xl/workbook.xml", wb_bytes);
         }
 
         // 4. xl/_rels/workbook.xml.rels
@@ -2054,93 +2015,11 @@ pub fn validateSheetName(name: []const u8) !void {
     if (casefold.excelSheetNameEql(name, "History")) return error.InvalidSheetName;
 }
 
-/// Excel defined-name rules (per MS docs):
-/// - 1..255 bytes
-/// - First char: letter, `_`, or `\`
-/// - Rest: letters, digits, `_`, `.` (NO `\`, NO `?`)
-/// - Must NOT exactly match an A1 cell reference shape (column
-///   [A, XFD] + row [1, 1048576] in any case combination)
-/// - Must NOT be the single letter `R` or `C` (case-insensitive)
-///   — Excel reserves these for R1C1 row/column references
-/// We don't enforce the "not equal to a built-in name" rule
-/// because the `_xlnm.Print_Area` family is intentionally usable.
-fn validateDefinedName(name: []const u8) !void {
-    if (name.len == 0 or name.len > 255) return error.InvalidDefinedName;
-    const first = name[0];
-    if (!isAsciiLetter(first) and first != '_' and first != '\\') return error.InvalidDefinedName;
-    for (name[1..]) |c| {
-        if (!isAsciiLetter(c) and !isAsciiDigit(c) and c != '_' and c != '.') {
-            return error.InvalidDefinedName;
-        }
-    }
-    if (name.len == 1 and (first == 'R' or first == 'r' or first == 'C' or first == 'c')) {
-        return error.InvalidDefinedName;
-    }
-    if (looksLikeCellRef(name)) return error.InvalidDefinedName;
-    // Excel also reserves R1C1-shaped names (`R[<digits>]C[<digits>]`,
-    // case-insensitive). Bare `R` / `C` were already rejected above.
-    if (looksLikeR1C1Ref(name)) return error.InvalidDefinedName;
-}
-
-/// True if `s` matches the case-insensitive R1C1 reference shape:
-/// `R<digits>C<digits>`, `R<digits>C`, `RC<digits>`, or `RC`. The
-/// digits may be absent (relative reference) or present (absolute).
-/// Used to keep R1C1-shaped names out of the workbook's
-/// definedNames pool — Excel treats them as actual references.
-fn looksLikeR1C1Ref(s: []const u8) bool {
-    if (s.len < 2) return false;
-    const first = s[0];
-    if (first != 'R' and first != 'r') return false;
-    var i: usize = 1;
-    // Optional digits after R.
-    while (i < s.len and isAsciiDigit(s[i])) : (i += 1) {}
-    if (i >= s.len) return false;
-    const c = s[i];
-    if (c != 'C' and c != 'c') return false;
-    i += 1;
-    // Optional digits after C.
-    while (i < s.len and isAsciiDigit(s[i])) : (i += 1) {}
-    return i == s.len;
-}
-
-inline fn isAsciiLetter(c: u8) bool {
-    return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z');
-}
-
-inline fn isAsciiDigit(c: u8) bool {
-    return c >= '0' and c <= '9';
-}
-
-/// True if `s` matches the A1 cell-ref shape (case-insensitive
-/// column letters in [A, XFD], row in [1, 1048576]). Used by the
-/// defined-name validator to reject names that would be parsed as
-/// cell refs.
-fn looksLikeCellRef(s: []const u8) bool {
-    if (s.len < 2 or s.len > 10) return false;
-    var i: usize = 0;
-    var col_v: u32 = 0;
-    var col_n: usize = 0;
-    while (i < s.len and isAsciiLetter(s[i])) : (i += 1) {
-        // Bail at the first letter past the 3-char cap — names
-        // longer than that aren't cell-ref shaped, and continuing
-        // the multiply-by-26 would overflow `col_v`.
-        col_n += 1;
-        if (col_n > 3) return false;
-        const upper: u8 = if (s[i] >= 'a' and s[i] <= 'z') s[i] - ('a' - 'A') else s[i];
-        const offset_one_based: u32 = @as(u32, upper) - @as(u32, 'A') + 1;
-        col_v = col_v * 26 + offset_one_based;
-    }
-    if (col_n == 0 or col_n > 3 or col_v == 0 or col_v > 16384) return false;
-    var row_v: u64 = 0;
-    var row_n: usize = 0;
-    while (i < s.len and isAsciiDigit(s[i])) : (i += 1) {
-        row_v = row_v * 10 + @as(u64, s[i] - '0');
-        if (row_v > 1_048_576) return false;
-        row_n += 1;
-    }
-    if (row_n == 0) return false;
-    return i == s.len and row_v >= 1;
-}
+/// B3 iter-wr-3: defined-name validator + R1C1 / A1 ref-shape
+/// detection moved to `pkg/workbook_xml_plan.zig`. The exported
+/// alias keeps the writer-side test suite calling
+/// `validateDefinedName(name)` against the canonical implementation.
+const validateDefinedName = workbook_xml_plan.validateDefinedName;
 
 fn validateAutoFilterRange(range: []const u8) !void {
     if (range.len == 0) return error.InvalidAutoFilterRange;
@@ -5814,13 +5693,13 @@ test "Writer.addDefinedName: stores name + refers_to with options" {
         "Sheet1!$A$1:$B$1",
         .{ .local_sheet_id = 0, .hidden = true },
     );
-    try std.testing.expectEqual(@as(usize, 2), w.defined_names.items.len);
-    try std.testing.expectEqualStrings("MyRange", w.defined_names.items[0].name);
-    try std.testing.expectEqualStrings("Sheet1!$A$1:$B$1", w.defined_names.items[0].refers_to);
-    try std.testing.expectEqual(@as(?u32, null), w.defined_names.items[0].local_sheet_id);
-    try std.testing.expectEqual(false, w.defined_names.items[0].hidden);
-    try std.testing.expectEqual(@as(?u32, 0), w.defined_names.items[1].local_sheet_id);
-    try std.testing.expectEqual(true, w.defined_names.items[1].hidden);
+    try std.testing.expectEqual(@as(usize, 2), w.workbook_xml_plan.defined_names.items.len);
+    try std.testing.expectEqualStrings("MyRange", w.workbook_xml_plan.defined_names.items[0].name);
+    try std.testing.expectEqualStrings("Sheet1!$A$1:$B$1", w.workbook_xml_plan.defined_names.items[0].refers_to);
+    try std.testing.expectEqual(@as(?u32, null), w.workbook_xml_plan.defined_names.items[0].local_sheet_id);
+    try std.testing.expectEqual(false, w.workbook_xml_plan.defined_names.items[0].hidden);
+    try std.testing.expectEqual(@as(?u32, 0), w.workbook_xml_plan.defined_names.items[1].local_sheet_id);
+    try std.testing.expectEqual(true, w.workbook_xml_plan.defined_names.items[1].hidden);
 }
 
 test "Writer.addDefinedName: rejects invalid name + empty refers_to" {
@@ -5858,7 +5737,7 @@ test "Writer.addDefinedName: rejects case-insensitive duplicates per scope" {
     try w.addDefinedName("Rate", "Sheet1!$B$1", .{ .local_sheet_id = 0 });
     // Same name in another sheet's scope — also accepted.
     try w.addDefinedName("Rate", "Sheet2!$B$1", .{ .local_sheet_id = 1 });
-    try std.testing.expectEqual(@as(usize, 3), w.defined_names.items.len);
+    try std.testing.expectEqual(@as(usize, 3), w.workbook_xml_plan.defined_names.items.len);
 }
 
 test "validateDefinedName: rejects ? and \\ in trailing chars" {

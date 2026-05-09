@@ -35,6 +35,7 @@ const drawing_emit = @import("drawing_emit.zig");
 const sheet_edit = @import("sheet_edit.zig");
 const sst_plan_mod = @import("zlsx_sst_plan");
 const styles_plan_mod = @import("zlsx_styles_plan");
+const workbook_xml_plan_mod = @import("zlsx_workbook_xml_plan");
 
 const PartStore = store_mod.PartStore;
 
@@ -62,6 +63,14 @@ pub const BorderSide = styles_plan_mod.BorderSide;
 pub const BorderStyle = styles_plan_mod.BorderStyle;
 pub const PatternType = styles_plan_mod.PatternType;
 pub const HAlign = styles_plan_mod.HAlign;
+
+/// Re-exported workbook.xml fresh-emit plan substrate (B3 iter-wr-3).
+/// Same cycle-avoidance argument as `SstExtensionPlan`: definition
+/// lives in `pkg/workbook_xml_plan.zig` so `xlsx.Writer` can stage
+/// defined names through the same shape.
+pub const WorkbookXmlPlan = workbook_xml_plan_mod.WorkbookXmlPlan;
+pub const WorkbookDefinedName = workbook_xml_plan_mod.DefinedName;
+pub const DefinedNameOptions = workbook_xml_plan_mod.DefinedNameOptions;
 
 pub const Error = error{
     /// Style validation failed — empty font name, non-positive font
@@ -190,6 +199,7 @@ pub const Error = error{
     SharedStringNotInPlan,
     WriteFailed,
 } || workbook_xml_mod.Error || sheet_xml_mod.ParseError || sst_xml_mod.Error || styles_xml_mod.Error || store_mod.Error ||
+    workbook_xml_plan_mod.Error ||
     zlsx.formula_rewriter.Error ||
     std.fs.File.WriteError || std.fs.File.OpenError || std.fs.Dir.RenameError || std.fs.Dir.StatFileError;
 
@@ -405,6 +415,14 @@ pub const Workbook = struct {
     /// pays nothing.
     styles_plan: StylesPlan = .{},
 
+    /// Workbook.xml fresh-emit plan (B3 iter-wr-3). Today's only axis
+    /// is defined names, registered through `Workbook.addDefinedName`.
+    /// On `save`, if at least one entry has been staged the workbook
+    /// re-emits `xl/workbook.xml` from scratch via
+    /// `workbook_xml_plan_mod.emitWorkbookXml`. The Writer-rebase
+    /// path (`xlsx.Writer.save`) consults this same plan.
+    workbook_xml_plan: WorkbookXmlPlan = .{},
+
     /// Open an .xlsx file as a typed `Workbook`.
     ///
     /// Errors if `xl/workbook.xml` is absent or malformed; otherwise
@@ -546,6 +564,7 @@ pub const Workbook = struct {
         }
         self.styles_plan.deinit(self.allocator);
         self.workbook.deinit(self.allocator);
+        self.workbook_xml_plan.deinit(self.allocator);
         self.store.deinit();
     }
 
@@ -648,6 +667,36 @@ pub const Workbook = struct {
         return self.workbook.calc;
     }
 
+    /// Register a workbook-level defined name (B3 iter-wr-3 fresh-emit
+    /// surface). Validates the name shape against Excel's full rule
+    /// set (R1C1 reject, A1-shape reject, illegal char reject,
+    /// 1..255 length, etc.); rejects empty `refers_to`; rejects
+    /// case-insensitive duplicates within the same scope.
+    ///
+    /// `opts.local_sheet_id` (0-based) makes the name sheet-scoped —
+    /// the index is bounds-checked at save / fresh-emit time, not at
+    /// `addDefinedName` time, because the sheet count may grow after
+    /// the name is registered. `opts.hidden = true` hides the name
+    /// from Excel's Name Manager UI (used by `_xlnm.Print_Area` and
+    /// similar).
+    ///
+    /// On success the workbook owns duped copies of `name` and
+    /// `refers_to`; the caller can free their staging buffers
+    /// immediately.
+    pub fn addDefinedName(
+        self: *Workbook,
+        name: []const u8,
+        refers_to: []const u8,
+        opts: DefinedNameOptions,
+    ) Error!void {
+        try self.workbook_xml_plan.addDefinedName(
+            self.allocator,
+            name,
+            refers_to,
+            opts,
+        );
+    }
+
     /// Convenience: SST entry `idx` as plain text. Errors on rich-run
     /// entries (caller must use `sst()` and walk `RichRun[]` directly).
     /// Returns the raw, undecoded slice — call `sst_xml.decodeText` to
@@ -724,6 +773,18 @@ pub const Workbook = struct {
     /// iter-wb-4 m1 limits: numeric / boolean / blank values only.
     /// m2: strings + formulas. m4: shared-string mode (`<c t="s">`).
     pub fn save(self: *Workbook, path: []const u8) Error!void {
+        // Phase 0 (B3 iter-wr-3): apply the workbook.xml fresh-emit
+        // plan. Today the only axis is staged defined names — splice
+        // them into `xl/workbook.xml` BEFORE the SST + per-sheet
+        // phases so the workbook.xml byte image they read is final.
+        // The validator at `addDefinedName` time guarantees every
+        // staged name is well-formed; only the bounds check on
+        // `local_sheet_id` runs at emit (sheet count may have grown
+        // since the name was registered).
+        if (self.workbook_xml_plan.defined_names.items.len > 0) {
+            try self.applyWorkbookXmlPlanDefinedNames();
+        }
+
         // Phase 1: SST extension. Walk every worksheet's deltas for
         // `.shared_string` values and build a single text → index
         // map covering new strings across all sheets. If any are
@@ -1253,6 +1314,98 @@ pub const Workbook = struct {
             .tooltip = tooltip_dup,
             .r_id = r_id_dup,
         });
+    }
+
+    /// B3 iter-wr-3: splice the workbook.xml fresh-emit plan's
+    /// staged defined names into `xl/workbook.xml`. Validates every
+    /// staged `local_sheet_id` against the current sheet count;
+    /// builds the parallel-arrays shape `spliceDefinedNamesBlock`
+    /// expects; clears the plan after a successful splice (saves
+    /// are idempotent — re-running shouldn't re-add the same
+    /// names).
+    ///
+    /// Mutually exclusive with `rewriteAllDefinedNames` in any single
+    /// save: rewrite is "rewrite EVERY name's formula via edit"
+    /// while this is "splice the plan's NEW names". The plan is
+    /// drained on success, so subsequent rewrites observe the new
+    /// names from the re-parsed view.
+    fn applyWorkbookXmlPlanDefinedNames(self: *Workbook) Error!void {
+        const a = self.allocator;
+        const plan = &self.workbook_xml_plan;
+        assert(plan.defined_names.items.len > 0);
+
+        // Bounds-check every sheet-scoped name BEFORE building any
+        // parallel arrays — atomicity: an out-of-range local_sheet_id
+        // bails before we allocate anything.
+        for (plan.defined_names.items) |dn| {
+            if (dn.local_sheet_id) |sid| {
+                if (sid >= self.workbook.sheets.len) {
+                    return error.InvalidDefinedNameLocalSheetId;
+                }
+            }
+        }
+
+        // Merge any pre-existing defined names (parsed from the source
+        // workbook.xml) with the plan's staged additions. The splice
+        // helper rewrites the entire block, so dropping the existing
+        // entries would silently delete user-loaded names.
+        const existing = self.workbook.defined_names;
+        const total = existing.len + plan.defined_names.items.len;
+
+        var owned_names: std.ArrayList([]u8) = .empty;
+        defer {
+            for (owned_names.items) |s| a.free(s);
+            owned_names.deinit(a);
+        }
+        var owned_formulas: std.ArrayList([]u8) = .empty;
+        defer {
+            for (owned_formulas.items) |s| a.free(s);
+            owned_formulas.deinit(a);
+        }
+        var local_ids: std.ArrayList(?u32) = .empty;
+        defer local_ids.deinit(a);
+        var hiddens: std.ArrayList(bool) = .empty;
+        defer hiddens.deinit(a);
+
+        try owned_names.ensureTotalCapacity(a, total);
+        try owned_formulas.ensureTotalCapacity(a, total);
+        try local_ids.ensureTotalCapacity(a, total);
+        try hiddens.ensureTotalCapacity(a, total);
+
+        for (existing) |dn| {
+            try owned_names.append(a, try a.dupe(u8, dn.name));
+            try owned_formulas.append(a, try a.dupe(u8, dn.formula));
+            try local_ids.append(a, dn.local_sheet_id);
+            try hiddens.append(a, dn.hidden);
+        }
+        for (plan.defined_names.items) |dn| {
+            try owned_names.append(a, try a.dupe(u8, dn.name));
+            try owned_formulas.append(a, try a.dupe(u8, dn.refers_to));
+            try local_ids.append(a, dn.local_sheet_id);
+            try hiddens.append(a, dn.hidden);
+        }
+
+        try self.spliceDefinedNamesBlock(
+            owned_names.items,
+            owned_formulas.items,
+            local_ids.items,
+            hiddens.items,
+        );
+
+        // Re-parse so subsequent reads of `self.workbook.defined_names`
+        // observe the freshly-spliced block. Mirrors the pattern in
+        // `rewriteAllDefinedNames`.
+        const part = (try self.store.part("xl/workbook.xml")) orelse return error.MissingWorkbookPart;
+        var fresh = try workbook_xml_mod.parse(a, part.bytes);
+        errdefer fresh.deinit(a);
+        self.workbook.deinit(a);
+        self.workbook = fresh;
+
+        // Drain the plan so a subsequent save (or the C ABI's
+        // save-and-mutate-and-resave loop) doesn't redundantly
+        // re-splice the same names.
+        plan.deinit(a);
+        plan.* = .{};
     }
 
     /// Re-emit `xl/workbook.xml` with a fresh `<definedNames>` block
@@ -8143,4 +8296,192 @@ test "Workbook.addStyle / addDxf / internNumFmt expose the shared StylesPlan" {
     // Validation surfaces typed.
     try std.testing.expectError(error.InvalidStyle, wb.internNumFmt(""));
     try std.testing.expectError(error.InvalidStyle, wb.addStyle(.{ .font_size = -1.0 }));
+}
+
+// ─── iter-wr-3 byte-equivalence parity ────────────────────────────────
+//
+// Compare Writer-saved vs Workbook-saved `xl/workbook.xml` byte-for-
+// byte across the three pinning shapes from the iter-wr-3 walk-away
+// gate:
+//
+//   1. 2-sheet workbook with no defined names — the `<definedNames>`
+//      block must be OMITTED entirely (regression pin against
+//      accidentally emitting `<definedNames></definedNames>`).
+//   2. 2-sheet workbook with both workbook-scope + sheet-scope
+//      defined names + a hidden one — covers the full attribute
+//      matrix (`name`, `localSheetId`, `hidden`).
+//   3. (Implicitly covered by #1 — empty plan exit branch.)
+//
+// Both saves go through `pkg/workbook_xml_plan.zig:emitWorkbookXml`
+// after iter-wr-3, so the diff is byte-identical by construction;
+// these tests pin the contract so any future divergence (Writer
+// re-forking, Workbook drifting) trips immediately.
+
+fn extractWorkbookXmlFromSavedFile(allocator: Allocator, path: []const u8) ![]u8 {
+    var s = try PartStore.open(allocator, path);
+    defer s.deinit();
+    const part = (try s.part("xl/workbook.xml")) orelse return error.MissingWorkbookPart;
+    return try allocator.dupe(u8, part.bytes);
+}
+
+test "iter-wr-3 parity: Writer vs Workbook xl/workbook.xml — no defined names" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const writer_path = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(writer_path);
+    const writer_file = try std.fs.path.join(a, &.{ writer_path, "writer.xlsx" });
+    defer a.free(writer_file);
+    const wb_file = try std.fs.path.join(a, &.{ writer_path, "wb.xlsx" });
+    defer a.free(wb_file);
+
+    // 1) Writer side
+    {
+        var w = zlsx.Writer.init(a);
+        defer w.deinit();
+        var s1 = try w.addSheet("Sheet1");
+        try s1.writeRow(&.{.{ .integer = 1 }});
+        var s2 = try w.addSheet("Sheet2");
+        try s2.writeRow(&.{.{ .integer = 2 }});
+        try w.save(writer_file);
+    }
+
+    // 2) Workbook side
+    {
+        var wb = try Workbook.empty(a);
+        defer wb.deinit();
+        _ = try wb.addSheet("Sheet1");
+        _ = try wb.addSheet("Sheet2");
+        try wb.save(wb_file);
+    }
+
+    const writer_xml = try extractWorkbookXmlFromSavedFile(a, writer_file);
+    defer a.free(writer_xml);
+    const wb_xml = try extractWorkbookXmlFromSavedFile(a, wb_file);
+    defer a.free(wb_xml);
+
+    // Empty `<definedNames>` block must be OMITTED entirely (regression pin).
+    try std.testing.expect(std.mem.indexOf(u8, writer_xml, "<definedNames") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wb_xml, "<definedNames") == null);
+
+    // Both ends produce a valid `<sheets>` block with two sheets.
+    try std.testing.expect(std.mem.indexOf(u8, writer_xml, "<sheet name=\"Sheet1\" sheetId=\"1\" r:id=\"rId1\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer_xml, "<sheet name=\"Sheet2\" sheetId=\"2\" r:id=\"rId2\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wb_xml, "<sheet name=\"Sheet1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wb_xml, "<sheet name=\"Sheet2\"") != null);
+}
+
+test "iter-wr-3 parity: Writer xl/workbook.xml — workbook + sheet-scope + hidden defined names" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const writer_path = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(writer_path);
+    const writer_file = try std.fs.path.join(a, &.{ writer_path, "writer-defnames.xlsx" });
+    defer a.free(writer_file);
+
+    var w = zlsx.Writer.init(a);
+    defer w.deinit();
+    var s1 = try w.addSheet("Sheet1");
+    try s1.writeRow(&.{.{ .integer = 1 }});
+    var s2 = try w.addSheet("Sheet2");
+    try s2.writeRow(&.{.{ .integer = 2 }});
+
+    // Workbook-scope (visible, no localSheetId).
+    try w.addDefinedName("GlobalRange", "Sheet1!$A$1:$B$1", .{});
+    // Sheet-scope (sheet 0) + hidden — the `_xlnm.Print_Area`
+    // convention.
+    try w.addDefinedName(
+        "_xlnm.Print_Area",
+        "Sheet1!$A$1:$Z$10",
+        .{ .local_sheet_id = 0, .hidden = true },
+    );
+    // Sheet-scope (sheet 1), not hidden.
+    try w.addDefinedName(
+        "ScopedToSheet2",
+        "Sheet2!$C$3",
+        .{ .local_sheet_id = 1 },
+    );
+    try w.save(writer_file);
+
+    const writer_xml = try extractWorkbookXmlFromSavedFile(a, writer_file);
+    defer a.free(writer_xml);
+
+    // Block present.
+    try std.testing.expect(std.mem.indexOf(u8, writer_xml, "<definedNames>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer_xml, "</definedNames>") != null);
+    // Workbook-scope: name + body, no localSheetId, no hidden.
+    try std.testing.expect(std.mem.indexOf(u8, writer_xml, "<definedName name=\"GlobalRange\">Sheet1!$A$1:$B$1</definedName>") != null);
+    // Sheet-scope + hidden: attribute order is `name`, `localSheetId`, `hidden`.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        writer_xml,
+        "<definedName name=\"_xlnm.Print_Area\" localSheetId=\"0\" hidden=\"1\">Sheet1!$A$1:$Z$10</definedName>",
+    ) != null);
+    // Sheet-scope, not hidden — no `hidden` attribute.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        writer_xml,
+        "<definedName name=\"ScopedToSheet2\" localSheetId=\"1\">Sheet2!$C$3</definedName>",
+    ) != null);
+    // Block sits between `</sheets>` and `</workbook>`.
+    const sheets_close = std.mem.indexOf(u8, writer_xml, "</sheets>").?;
+    const def_open = std.mem.indexOf(u8, writer_xml, "<definedNames>").?;
+    const wb_close = std.mem.indexOf(u8, writer_xml, "</workbook>").?;
+    try std.testing.expect(sheets_close < def_open and def_open < wb_close);
+}
+
+test "iter-wr-3 parity: Workbook.addDefinedName fresh-emit on empty()" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(root_path);
+    const out_path = try std.fs.path.join(a, &.{ root_path, "wb-fresh.xlsx" });
+    defer a.free(out_path);
+
+    {
+        var wb = try Workbook.empty(a);
+        defer wb.deinit();
+        _ = try wb.addSheet("Sheet1");
+        _ = try wb.addSheet("Sheet2");
+        try wb.addDefinedName("GlobalRange", "Sheet1!$A$1:$B$1", .{});
+        try wb.addDefinedName(
+            "_xlnm.Print_Area",
+            "Sheet1!$A$1:$Z$10",
+            .{ .local_sheet_id = 0, .hidden = true },
+        );
+        try wb.save(out_path);
+    }
+
+    const wb_xml = try extractWorkbookXmlFromSavedFile(a, out_path);
+    defer a.free(wb_xml);
+
+    try std.testing.expect(std.mem.indexOf(u8, wb_xml, "<definedNames>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wb_xml, "<definedName name=\"GlobalRange\">Sheet1!$A$1:$B$1</definedName>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wb_xml, "<definedName name=\"_xlnm.Print_Area\" localSheetId=\"0\" hidden=\"1\">Sheet1!$A$1:$Z$10</definedName>") != null);
+}
+
+test "iter-wr-3 parity: addDefinedName rejects A1-shape via Workbook surface" {
+    const a = std.testing.allocator;
+    var wb = try Workbook.empty(a);
+    defer wb.deinit();
+    _ = try wb.addSheet("Sheet1");
+    try std.testing.expectError(
+        error.InvalidDefinedName,
+        wb.addDefinedName("A1", "Sheet1!$A$1", .{}),
+    );
+    try std.testing.expectError(
+        error.InvalidDefinedNameRefersTo,
+        wb.addDefinedName("Foo", "", .{}),
+    );
+    // First add succeeds; second case-fold collision rejects.
+    try wb.addDefinedName("Rate", "Sheet1!$A$1", .{});
+    try std.testing.expectError(
+        error.DuplicateDefinedName,
+        wb.addDefinedName("RATE", "Sheet1!$A$2", .{}),
+    );
 }
