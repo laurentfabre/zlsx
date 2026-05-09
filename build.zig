@@ -17,6 +17,16 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "version", pkg_version);
     const build_options_mod = build_options.createModule();
 
+    // B3 iter-wr-1: shared `SstExtensionPlan` substrate. Std-only by
+    // design, so wiring it into the writer + xlsx test trees does not
+    // form the cycle `writer → zlsx_pkg → workbook → zlsx → writer`
+    // that the comment near `extract_images_mod` warns about.
+    const sst_plan_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/sst_plan.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Public module. Consumers add zlsx to their build.zig.zon as a
     // path or git dependency, then `@import("zlsx")`.
     const zlsx_mod = b.addModule("zlsx", .{
@@ -24,6 +34,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    zlsx_mod.addImport("zlsx_sst_plan", sst_plan_mod);
 
     // Unit tests (embedded in src/xlsx.zig, including the fuzz suite).
     const unit_mod = b.createModule(.{
@@ -31,6 +42,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    unit_mod.addImport("zlsx_sst_plan", sst_plan_mod);
     const unit_tests = b.addTest(.{ .root_module = unit_mod });
     const test_step = b.step("test", "Run zlsx unit + fuzz-smoke tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
@@ -50,6 +62,7 @@ pub fn build(b: *std.Build) void {
         // this directly in Zig 0.15.2 — set it on the module.
         .fuzz = true,
     });
+    unit_fuzz_mod.addImport("zlsx_sst_plan", sst_plan_mod);
     const unit_fuzz_tests = b.addTest(.{ .root_module = unit_fuzz_mod });
     const fuzz_step = b.step("fuzz", "Run coverage-guided fuzz targets (Linux x64; macOS/Windows broken upstream)");
     fuzz_step.dependOn(&b.addRunArtifact(unit_fuzz_tests).step);
@@ -103,14 +116,29 @@ pub fn build(b: *std.Build) void {
     const cli_tests = b.addTest(.{ .root_module = cli_mod });
     test_step.dependOn(&b.addRunArtifact(cli_tests).step);
 
-    // Writer unit tests (MVP: round-trip via the reader).
+    // Writer unit tests (MVP: round-trip via the reader). Pulls in the
+    // SST plan module (B3 iter-wr-1) so writer.zig can stage strings
+    // through `SstExtensionPlan`.
     const writer_mod = b.createModule(.{
         .root_source_file = b.path("src/writer.zig"),
         .target = target,
         .optimize = optimize,
     });
+    writer_mod.addImport("zlsx_sst_plan", sst_plan_mod);
     const writer_tests = b.addTest(.{ .root_module = writer_mod });
     test_step.dependOn(&b.addRunArtifact(writer_tests).step);
+
+    // Standalone tests for the SST plan substrate (it's tiny but the
+    // dedup invariants pin Writer's hot path; cover them in their own
+    // step rather than rely on the in-tree Workbook tests touching
+    // them).
+    const sst_plan_tests_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/sst_plan.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const sst_plan_tests = b.addTest(.{ .root_module = sst_plan_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(sst_plan_tests).step);
 
     // Unicode case-fold + NFC module tests (A1: Excel sheet-name
     // dedup, wired into validateSheetName + Editor.isSheetNameTaken).
@@ -173,6 +201,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     package_mod.addImport("zlsx", zlsx_mod);
+    // B3 iter-wr-1: workbook.zig stages strings through the shared
+    // SST plan substrate via a named import (`@import("zlsx_sst_plan")`)
+    // so the file is owned by exactly one module — using a relative
+    // `@import("sst_plan.zig")` would make pkg/sst_plan.zig a member
+    // of every module that reaches workbook.zig, which collides with
+    // the dedicated `zlsx_sst_plan` module declaration.
+    package_mod.addImport("zlsx_sst_plan", sst_plan_mod);
 
     // After the B2 iter-er-0 Editor relocation, `cli_mod` reaches
     // Editor through `zlsx_pkg` and xlsx via the named `zlsx` dep.
@@ -246,6 +281,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     package_workbook_tests_mod.addImport("zlsx", zlsx_mod);
+    package_workbook_tests_mod.addImport("zlsx_sst_plan", sst_plan_mod);
     const package_workbook_tests = b.addTest(.{ .root_module = package_workbook_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_workbook_tests).step);
 

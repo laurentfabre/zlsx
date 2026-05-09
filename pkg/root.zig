@@ -48,6 +48,13 @@ pub const ResolvedStyle = workbook_mod.ResolvedStyle;
 pub const WorkbookError = workbook_mod.Error;
 pub const NumberFormatInfo = workbook_mod.NumberFormatInfo;
 
+/// Shared-strings extension-plan substrate (B3 iter-wr-1). Re-exported
+/// so `xlsx.Writer` (in `src/`) can stage strings + rich-text runs
+/// through the same dedup/storage types Workbook uses.
+pub const SstExtensionPlan = workbook_mod.SstExtensionPlan;
+pub const RichRun = workbook_mod.RichRun;
+pub const RichEntry = workbook_mod.RichEntry;
+
 /// Greenfield drawing-emit surface (B1 iter-wb-c2b). Re-exported so
 /// callers can spell `pkg.ImageMime`, `pkg.ImageCellAnchor` without
 /// reaching into `drawing_emit` directly.

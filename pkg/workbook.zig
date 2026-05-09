@@ -33,6 +33,7 @@ const typed_parts = @import("typed_parts/root.zig");
 const zlsx = @import("zlsx");
 const drawing_emit = @import("drawing_emit.zig");
 const sheet_edit = @import("sheet_edit.zig");
+const sst_plan_mod = @import("zlsx_sst_plan");
 
 const PartStore = store_mod.PartStore;
 
@@ -40,6 +41,14 @@ const workbook_xml_mod = typed_parts.workbook_xml;
 const sheet_xml_mod = typed_parts.sheet_xml;
 const sst_xml_mod = typed_parts.sst_xml;
 const styles_xml_mod = typed_parts.styles_xml;
+
+/// Re-exported SST extension-plan substrate (B3 iter-wr-1). Definition
+/// moved to `pkg/sst_plan.zig` so `xlsx.Writer` can import the same
+/// types without the cycle that would form via `zlsx → writer.zig →
+/// pkg/workbook.zig → zlsx`.
+pub const RichRun = sst_plan_mod.RichRun;
+pub const RichEntry = sst_plan_mod.RichEntry;
+pub const SstExtensionPlan = sst_plan_mod.SstExtensionPlan;
 
 pub const Error = error{
     MissingWorkbookPart,
@@ -2938,7 +2947,7 @@ fn emitCell(
     }
 }
 
-// ─── SST extension (iter-wb-4 m4) ────────────────────────────────────
+// ─── SST extension (iter-wb-4 m4 + iter-wr-1 substrate move) ───────
 
 /// Plan for extending the workbook's shared-string table with new
 /// strings collected from `.shared_string` deltas across every
@@ -2950,154 +2959,27 @@ fn emitCell(
 /// addPart + workbook.xml.rels splice when SST is absent).
 ///
 /// De-dup policy:
-///   - linear scan against existing entries (decoded), then linear
-///     scan against already-staged new strings.
-///   - linear was chosen over a hashmap because (a) the typical
-///     write workload stages a small handful of new strings while
-///     the SST may carry thousands of existing entries; building a
-///     hashmap of decoded existing entries up front is more work
-///     than scanning per-new-string. (b) keeping the implementation
-///     stdlib-only and trivially auditable matters more than constant-
-///     factor speed at the SST sizes encountered in practice.
-const ExistingMatch = struct {
-    text: []const u8,
-    index: u32,
-};
-
-/// One run inside a rich-text SST entry. Mirrors `xlsx.RichTextRun`'s
-/// public shape (text + bold + italic + size + color_argb + font_name)
-/// so the Writer-side wiring (iter-wr-1, out of scope here) can stage
-/// runs without an extra translation step. `color_argb` is encoded as
-/// the raw 8-hex-digit ARGB value (e.g. "FF0000FF") rather than a
-/// `u32`; the SST emit path passes the bytes through `<color
-/// rgb="…"/>` verbatim, so producers do their own formatting if they
-/// want a different surface. Strike + underline ride along (writer
-/// doesn't currently surface them, but OOXML does — keeping the
-/// substrate complete avoids a follow-up plan extension).
-pub const RichRun = struct {
-    text: []const u8,
-    bold: bool = false,
-    italic: bool = false,
-    underline: bool = false,
-    strike: bool = false,
-    font_name: ?[]const u8 = null,
-    font_size: ?f32 = null,
-    color_argb: ?[]const u8 = null,
-};
-
-/// One rich-text SST entry. `runs` is borrowed by the registrar
-/// (`SstExtensionPlan` dups every run + every owned string field into
-/// the workbook allocator at registration time, so callers can free
-/// their staging buffers immediately after `registerSharedRichString`
-/// returns).
-pub const RichEntry = struct {
-    runs: []const RichRun,
-};
-
-const SstExtensionPlan = struct {
-    /// True when at least one `.shared_string` delta required a fresh
-    /// SST entry (i.e. the user-supplied text didn't already match an
-    /// existing entry).
-    has_new_strings: bool = false,
-    /// Allocator owns: every entry of `new_strings` (duped on insert),
-    /// the slice itself.
-    new_strings: std.ArrayListUnmanaged([]const u8) = .empty,
-    /// Side table: deltas whose text matched an existing SST entry.
-    /// Allows `indexOf` to resolve those without rescanning the SST.
-    /// Allocator owns each `text` slice.
-    existing_matches: std.ArrayListUnmanaged(ExistingMatch) = .empty,
-    /// Index of the FIRST new string within the regenerated SST. For
-    /// an existing-SST workbook this is the existing entry count;
-    /// for a freshly-created SST it's 0.
-    base_index: u32 = 0,
-    /// Tracks whether the SST part already existed at plan-build time.
-    /// Drives the `replacePart` vs `addPart + workbook.xml.rels splice`
-    /// branch in `applySstExtensionPlan`.
-    sst_part_exists: bool = false,
-
-    /// Rich-text new-entries axis. Each entry carries an array of
-    /// typed `RichRun`s; `applySstExtensionPlan` emits one
-    /// `<si><r><rPr/>…<t/></r>…</si>` block per entry, alongside the
-    /// plain `new_strings` blocks. Indices in this axis follow the
-    /// plain ones — the first rich entry sits at
-    /// `base_index + new_strings.len`.
-    ///
-    /// **Substrate only**: `buildSstExtensionPlan` does NOT populate
-    /// this axis today. The Writer-side wiring (iter-wr-1) will call
-    /// `registerSharedRichString` before per-sheet emit; until then
-    /// the field stays empty in production paths and only test code
-    /// hand-builds it. No dedup against existing rich entries is
-    /// performed (matches the writer's iter33 policy: hashing the
-    /// formatted form costs more than it saves at typical SST sizes).
-    new_rich_strings: std.ArrayListUnmanaged(RichEntry) = .empty,
-
-    fn deinit(self: *SstExtensionPlan, allocator: Allocator) void {
-        for (self.new_strings.items) |s| allocator.free(s);
-        self.new_strings.deinit(allocator);
-        for (self.existing_matches.items) |em| allocator.free(em.text);
-        self.existing_matches.deinit(allocator);
-        for (self.new_rich_strings.items) |entry| {
-            for (entry.runs) |r| {
-                allocator.free(r.text);
-                if (r.font_name) |n| allocator.free(n);
-                if (r.color_argb) |c| allocator.free(c);
-            }
-            allocator.free(entry.runs);
-        }
-        self.new_rich_strings.deinit(allocator);
-        self.* = undefined;
-    }
-
-    /// Resolve the SST index for a (raw, unescaped) string staged
-    /// via `setCell(.{ .shared_string = ... })`. Returns null if
-    /// `s` was never staged into this plan (caller invariant: every
-    /// `.shared_string` delta is registered before per-sheet emit).
-    fn indexOf(self: *const SstExtensionPlan, s: []const u8) ?u32 {
-        for (self.existing_matches.items) |em| {
-            if (std.mem.eql(u8, em.text, s)) return em.index;
-        }
-        for (self.new_strings.items, 0..) |existing, i| {
-            if (std.mem.eql(u8, existing, s)) {
-                return self.base_index + @as(u32, @intCast(i));
-            }
-        }
-        return null;
-    }
-
-    /// Resolve the SST index for a rich-text entry by reference
-    /// (pointer equality on the `runs` slice). Rich entries are
-    /// indexed AFTER plain new strings; the first rich entry lands at
-    /// `base_index + new_strings.len`. Returns null if `entry`'s
-    /// `runs` slice is not the one that was registered into this
-    /// plan. Callers staging a rich entry typically retain the
-    /// pointer they got back from `registerSharedRichString` and
-    /// pass it straight through.
-    fn indexOfRich(self: *const SstExtensionPlan, entry: *const RichEntry) ?u32 {
-        for (self.new_rich_strings.items, 0..) |*staged, i| {
-            if (staged == entry) {
-                const rich_offset: u32 = @intCast(i);
-                return self.base_index +
-                    @as(u32, @intCast(self.new_strings.items.len)) +
-                    rich_offset;
-            }
-        }
-        return null;
-    }
-};
-
-/// Stage a rich-text entry into `plan.new_rich_strings`. Every owned
-/// byte (run text, font_name, color_argb) is duped into `wb.allocator`
-/// so the caller can free its own staging buffers immediately. Rich
-/// entries are NOT de-duplicated — same policy as `xlsx.Writer`'s
-/// `sstInternRich` (hashing the formatted form is more expensive than
-/// a fresh `<si><r>…</r></si>` at typical SST sizes). Returns a
-/// pointer to the staged entry; the pointer is stable for the
-/// lifetime of `plan` (we only ever append to `new_rich_strings`,
-/// never reorder).
+///   - existing-SST entries: linear scan over decoded text. Linear was
+///     chosen over a hashmap because the typical write workload stages
+///     a small handful of new strings while the SST may carry
+///     thousands of existing entries; building a hashmap of decoded
+///     existing entries up front is more work than scanning per-new-
+///     string. Stdlib-only + trivially auditable matters more than
+///     constant-factor speed at typical SST sizes.
+///   - already-staged new strings: O(1) hash via
+///     `plan.new_strings_index` (added in iter-wr-1 to keep
+///     `xlsx.Writer`'s hot writeRow loop linear in cell count rather
+///     than quadratic).
 ///
-/// Callers typically use the returned pointer with `plan.indexOfRich`
-/// at per-sheet emit time. The plan owns every byte; `plan.deinit`
-/// frees them.
+/// The plan struct itself lives in `pkg/sst_plan.zig` so `xlsx.Writer`
+/// can stage entries through the same shape without forming a module
+/// cycle (workbook → zlsx → writer.zig).
+const ExistingMatch = sst_plan_mod.ExistingMatch;
+
+/// Compatibility wrapper around `SstExtensionPlan.registerNewRich` so
+/// the existing in-tree tests (and any future Workbook-side caller
+/// that already has a `*Workbook` in scope) keep their call site
+/// unchanged. Pure delegate — see `pkg/sst_plan.zig` for the impl.
 fn registerSharedRichString(
     wb: *Workbook,
     plan: *SstExtensionPlan,
@@ -3105,45 +2987,7 @@ fn registerSharedRichString(
 ) Error!*const RichEntry {
     assert(@intFromPtr(wb) != 0);
     assert(@intFromPtr(wb.allocator.vtable) != 0);
-    const a = wb.allocator;
-
-    // Atomicity: dupe every owned byte BEFORE appending the entry to
-    // the plan. If any dupe fails, `errdefer` walks back the slice
-    // we've built so far. The plan's `new_rich_strings` only sees the
-    // entry on the success path.
-    const owned_runs = try a.alloc(RichRun, runs.len);
-    var built: usize = 0;
-    errdefer {
-        for (owned_runs[0..built]) |r| {
-            a.free(r.text);
-            if (r.font_name) |n| a.free(n);
-            if (r.color_argb) |c| a.free(c);
-        }
-        a.free(owned_runs);
-    }
-    for (runs, 0..) |r, i| {
-        const owned_text = try a.dupe(u8, r.text);
-        errdefer a.free(owned_text);
-        const owned_fn: ?[]const u8 = if (r.font_name) |n| try a.dupe(u8, n) else null;
-        errdefer if (owned_fn) |n| a.free(n);
-        const owned_c: ?[]const u8 = if (r.color_argb) |c| try a.dupe(u8, c) else null;
-        owned_runs[i] = .{
-            .text = owned_text,
-            .bold = r.bold,
-            .italic = r.italic,
-            .underline = r.underline,
-            .strike = r.strike,
-            .font_name = owned_fn,
-            .font_size = r.font_size,
-            .color_argb = owned_c,
-        };
-        built = i + 1;
-    }
-
-    try plan.new_rich_strings.append(a, .{ .runs = owned_runs });
-    plan.has_new_strings = plan.new_strings.items.len > 0 or
-        plan.new_rich_strings.items.len > 0;
-    return &plan.new_rich_strings.items[plan.new_rich_strings.items.len - 1];
+    return try plan.registerNewRich(wb.allocator, runs);
 }
 
 /// Walk every worksheet's `.shared_string` deltas, de-dup against
@@ -3169,12 +3013,13 @@ fn registerSharedString(
         if (is_rich_existing[i]) continue;
         if (std.mem.eql(u8, de, s)) return;
     }
-    for (plan.new_strings.items) |existing| {
-        if (std.mem.eql(u8, existing, s)) return;
-    }
+    if (plan.new_strings_index.contains(s)) return;
     const owned = try wb.allocator.dupe(u8, s);
     errdefer wb.allocator.free(owned);
+    const idx: u32 = @intCast(plan.new_strings.items.len);
     try plan.new_strings.append(wb.allocator, owned);
+    errdefer _ = plan.new_strings.pop();
+    try plan.new_strings_index.put(wb.allocator, owned, idx);
 }
 
 /// Append an existing-match record for string `s` if an existing
@@ -3191,6 +3036,7 @@ fn registerExistingMatch(
     is_rich_existing: []const bool,
 ) Error!void {
     assert(decoded_existing.len == is_rich_existing.len);
+    if (plan.new_strings_index.contains(s)) return;
     for (plan.new_strings.items) |n| {
         if (std.mem.eql(u8, n, s)) return;
     }
@@ -7060,17 +6906,12 @@ test "Worksheet.emitWithAppendsUsingPlan: splices rows and threads sst_base_idx"
     // Hand-build a plan covering every staged string. Mirrors what
     // `buildSstExtensionPlan` would produce: one new entry "alpha" at
     // base_index 100 (caller-side equivalent of the legacy
-    // sst_base_idx argument).
-    var plan: SstExtensionPlan = .{};
+    // sst_base_idx argument). `registerNewPlain` keeps `new_strings`
+    // and `new_strings_index` in sync; the prior hand-pushed
+    // `new_strings.append` form would silently desync the hash index.
+    var plan: SstExtensionPlan = .{ .base_index = 100, .sst_part_exists = true };
     defer plan.deinit(allocator);
-    const dup = try allocator.dupe(u8, "alpha");
-    {
-        errdefer allocator.free(dup);
-        try plan.new_strings.append(allocator, dup);
-    }
-    plan.has_new_strings = true;
-    plan.sst_part_exists = true;
-    plan.base_index = 100;
+    _ = try plan.registerNewPlain(allocator, "alpha");
 
     const new_xml = try ws.emitWithAppendsUsingPlan(allocator, &plan);
     defer allocator.free(new_xml);
