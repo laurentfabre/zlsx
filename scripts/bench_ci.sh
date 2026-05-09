@@ -29,23 +29,19 @@ echo "[bench-ci] building benchmark binaries (ReleaseFast)..."
 # ("zig build-exe FILE" + "-Mroot=FILE" together is rejected as duplicate).
 "$ZIG_BIN" build-exe \
     --dep zlsx -Mroot=tests/bench/bench_zlsx.zig \
-    --dep zlsx_sst_plan --dep zlsx_styles_plan --dep zlsx_workbook_xml_plan -Mzlsx=src/xlsx.zig \
+    --dep zlsx_sst_plan --dep zlsx_styles_plan --dep zlsx_workbook_xml_plan --dep zlsx_zip -Mzlsx=src/xlsx.zig \
     -Mzlsx_sst_plan=pkg/sst_plan.zig \
     -Mzlsx_styles_plan=pkg/styles_plan.zig \
     -Mzlsx_workbook_xml_plan=pkg/workbook_xml_plan.zig \
-    --dep zlsx_sst_plan --dep zlsx_zip -Mzlsx=src/xlsx.zig \
-    -Mzlsx_sst_plan=pkg/sst_plan.zig \
     -Mzlsx_zip=pkg/zip.zig \
     -O ReleaseFast \
     -femit-bin="$OUT_DIR/bench_zlsx_read"
 "$ZIG_BIN" build-exe \
     --dep zlsx -Mroot=tests/bench/bench_write_zlsx.zig \
-    --dep zlsx_sst_plan --dep zlsx_styles_plan --dep zlsx_workbook_xml_plan -Mzlsx=src/xlsx.zig \
+    --dep zlsx_sst_plan --dep zlsx_styles_plan --dep zlsx_workbook_xml_plan --dep zlsx_zip -Mzlsx=src/xlsx.zig \
     -Mzlsx_sst_plan=pkg/sst_plan.zig \
     -Mzlsx_styles_plan=pkg/styles_plan.zig \
     -Mzlsx_workbook_xml_plan=pkg/workbook_xml_plan.zig \
-    --dep zlsx_sst_plan --dep zlsx_zip -Mzlsx=src/xlsx.zig \
-    -Mzlsx_sst_plan=pkg/sst_plan.zig \
     -Mzlsx_zip=pkg/zip.zig \
     -O ReleaseFast \
     -femit-bin="$OUT_DIR/bench_zlsx_write"

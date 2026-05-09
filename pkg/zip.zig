@@ -294,7 +294,7 @@ test "Archive: empty archive finalises with EOCD only" {
     try arc.finalize();
     // EOCD is 22 bytes minimum; signature first.
     try testing.expectEqual(@as(usize, 22), buf.items.len);
-    try testing.expectEqual(std.zip.end_record_sig, std.mem.readInt(u32, buf.items[0..4], .little));
+    try testing.expectEqualSlices(u8, &std.zip.end_record_sig, buf.items[0..4]);
 }
 
 test "Archive: single small entry round-trips via std.zip.Iterator" {
