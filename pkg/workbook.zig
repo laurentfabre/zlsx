@@ -36,6 +36,11 @@ const sheet_edit = @import("sheet_edit.zig");
 const sst_plan_mod = @import("zlsx_sst_plan");
 const styles_plan_mod = @import("zlsx_styles_plan");
 const workbook_xml_plan_mod = @import("zlsx_workbook_xml_plan");
+// B3 iter-wr-6: canonical XML-escape helpers + sheet-plan registry
+// types live on `pkg/sheet_plan.zig`. Workbook routes its <Override>,
+// `<sheet name="…">`, `<si>`, and rich-run emit through the same
+// byte-stable producers `xlsx.Writer` uses.
+const sheet_plan = @import("zlsx_sheet_plan");
 
 const PartStore = store_mod.PartStore;
 
@@ -1628,15 +1633,19 @@ pub const Workbook = struct {
     /// no `parsed = null` invalidation is required here. Caller still
     /// must call `save` to commit to disk.
     ///
-    /// **Length cap.** v1 enforces a UTF-8 byte length of 1..127. Excel
-    /// proper limits sheet names to 31 *characters* (Unicode codepoints,
-    /// not bytes). For ASCII inputs the two coincide; for Unicode the
-    /// byte cap is conservative — a follow-up iter can wire in
-    /// `src/unicode/casefold.zig` for full character-count semantics.
+    /// **Length cap.** B3 iter-wr-6 lifted the validator to the
+    /// canonical Writer-side `xlsx.validateSheetName` (Unicode-scalar
+    /// aware): names cap at 31 SCALARS — Excel's actual rule —
+    /// regardless of UTF-8 byte length, additionally rejecting
+    /// 0x00..0x1F control bytes and leading/trailing apostrophes.
+    /// Pre-iter-wr-6 the cap was a conservative 127-byte fence.
     ///
-    /// **Case folding.** Duplicate-name detection uses ASCII case-fold
-    /// (a..z ↔ A..Z) only; "Sheet1" and "ŠHEET1" with non-ASCII letters
-    /// fold differently than Excel does. Same follow-up iter applies.
+    /// **Case folding.** Duplicate-name detection still uses ASCII
+    /// case-fold (a..z ↔ A..Z); the Writer-side `addSheet` collision
+    /// loop uses the Unicode case-fold via
+    /// `src/unicode/casefold.zig`. Workbook's collision check is
+    /// per-sheet rather than per-write, so the ASCII compromise is
+    /// retained here pending a follow-up iter.
     ///
     /// **Defined names.** Sheet-qualified `<definedName>` formulas
     /// (`Sheet2!$A$1` etc.) are NOT rewritten by this iter — only
@@ -2272,20 +2281,19 @@ pub const Workbook = struct {
     }
 };
 
-/// Validate a candidate sheet name per Excel's rules. v1 contract
-/// (see `Workbook.renameSheet` docstring for the rationale):
-///   - 1..127 bytes (UTF-8 byte length, NOT Unicode codepoints)
+/// Validate a candidate sheet name per Excel's rules. B3 iter-wr-6
+/// delegates to `zlsx.validateSheetName` (the Writer-side
+/// Unicode-scalar-aware validator at `src/writer.zig`):
+///   - 1..31 Unicode SCALARS (Excel's actual limit)
+///   - no 0x00..0x1F control bytes
 ///   - none of `: \ / ? * [ ]`
-///   - case-insensitive ASCII compare not equal to "history"
+///   - no leading or trailing apostrophe
+///   - Unicode case-fold compare not equal to "History"
+///
+/// Workbook's `Error` surface is unchanged — both validators
+/// surface the same `error.InvalidSheetName` token.
 fn validateSheetName(name: []const u8) Error!void {
-    if (name.len == 0) return error.InvalidSheetName;
-    if (name.len > 127) return error.InvalidSheetName;
-    for (name) |c| switch (c) {
-        ':', '\\', '/', '?', '*', '[', ']' => return error.InvalidSheetName,
-        else => {},
-    };
-    // Sheet-name reserved word. Excel rejects this case-insensitively.
-    if (asciiCaseInsensitiveEql(name, "history")) return error.InvalidSheetName;
+    zlsx.validateSheetName(name) catch return error.InvalidSheetName;
 }
 
 /// Lowercase-ASCII byte-equality. Non-ASCII bytes compare verbatim.
@@ -2441,6 +2449,15 @@ fn patchWorkbookXmlSheetName(
 /// Append `s` to `out`, XML-escaping the five canonical entities
 /// (`<`, `>`, `&`, `"`, `'`). Other bytes (including UTF-8
 /// continuation bytes for non-ASCII characters) pass through verbatim.
+/// B3 iter-wr-6 NOTE: kept local rather than forwarded to
+/// `pkg/sheet_plan.zig::appendXmlEscaped`. The plan-side variant
+/// rejects XML 1.0 forbidden control bytes with `error.InvalidXmlByte`;
+/// Workbook's `Error` set deliberately omits that variant (one-minor
+/// API freeze on Workbook's public Error surface), and Workbook's
+/// callers pre-validate text via `isXmlSafeText` so a forbidden byte
+/// would already be a contract violation. To stay byte-equivalent
+/// without widening `Error`, this 5-entity escape stays inline.
+/// Producers: sheet-name patch, definedName + sheet-rels emit.
 fn appendXmlEscaped(allocator: Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
     for (s) |c| switch (c) {
         '<' => try out.appendSlice(allocator, "&lt;"),
@@ -4693,10 +4710,12 @@ fn freeDeltaStrings(allocator: Allocator, deltas: *std.AutoHashMapUnmanaged(Cell
     }
 }
 
-/// Escape XML text content (`<`, `>`, `&`) into `out`. Quote chars
-/// pass through — this helper is for ELEMENT-content escaping, not
-/// attribute-value escaping. Caller pre-validates that bytes are
-/// XML-1.0-safe via `isXmlSafeText`.
+/// B3 iter-wr-6 NOTE: kept local for the same reason as
+/// `appendXmlEscaped` above — `pkg/sheet_plan.zig::appendXmlEscapedText`
+/// rejects XML 1.0 forbidden control bytes via `error.InvalidXmlByte`,
+/// which is not in Workbook's `Error` set. 3-entity (`<`, `>`, `&`)
+/// element-content escape; quotes pass through verbatim per the
+/// byte-stable contract.
 fn appendXmlEscapedText(allocator: Allocator, out: *std.ArrayList(u8), text: []const u8) Error!void {
     for (text) |b| {
         switch (b) {

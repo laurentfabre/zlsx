@@ -503,7 +503,17 @@ pub const PartStore = struct {
     /// Append `s` to `buf` with XML attribute-value escaping. Covers
     /// the five XML-significant characters; sufficient for emitting
     /// caller-provided part names + content types into the
-    /// [Content_Types].xml override entries.
+    /// `[Content_Types].xml` override entries.
+    ///
+    /// B3 iter-wr-6 NOTE: kept local rather than forwarded to
+    /// `pkg/sheet_plan.zig::appendXmlEscaped`. The plan-side variant
+    /// returns the broader `sheet_plan.Error` set (includes
+    /// `RowOutOfRange`, `InvalidMergeRange`, …) which `PartStore`'s
+    /// `Error` set deliberately omits. Forwarding would widen
+    /// `addPart`'s declared error set beyond what its callers
+    /// (Workbook.* paths) accept. The 5-entity escape stays inline;
+    /// the canonical home for the rejecting variant remains
+    /// `pkg/sheet_plan.zig`.
     fn appendXmlEscaped(
         alloc: std.mem.Allocator,
         buf: *std.ArrayListUnmanaged(u8),

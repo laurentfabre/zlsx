@@ -627,11 +627,17 @@ pub fn validateHyperlinkRange(range: []const u8) Error!void {
 
 /// XML 1.0 forbids most C0 control bytes in document content.
 /// Allowed: 0x09 (tab), 0x0A (LF), 0x0D (CR). Forbidden:
-/// 0x00–0x08, 0x0B, 0x0C, 0x0E–0x1F, plus 0x7F (DEL — XML 1.0
-/// production [2] disallows it in element/attribute text).
+/// 0x00–0x08, 0x0B, 0x0C, 0x0E–0x1F.
+///
+/// 0x7F (DEL) is **valid** under XML 1.0 production [2] —
+/// `Char ::= #x9 | #xA | #xD | [#x20-#xD7FF] | …` — DEL falls in
+/// `[#x20-#xD7FF]` and many real-world workbooks carry it. B3
+/// iter-wr-6 reconciled the lift: the Writer-side test pinned
+/// 0x7F as legal (matching spec); the wr-4 plan-side variant
+/// erroneously rejected it. Restored to spec here.
 pub inline fn isForbiddenXmlByte(c: u8) bool {
     return switch (c) {
-        0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F => true,
+        0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => true,
         else => false,
     };
 }
@@ -644,6 +650,11 @@ pub fn assertNoForbiddenXmlBytes(s: []const u8) Error!void {
 /// (`<`, `>`, `&`, `"`, `'`) and rejecting XML 1.0 forbidden control
 /// bytes. Other bytes (including UTF-8 continuation bytes for non-
 /// ASCII characters) pass through verbatim.
+///
+/// Use this for ATTRIBUTE values where `"` and `'` need escaping.
+/// For ELEMENT text content, prefer `appendXmlEscapedText` so the
+/// quote characters round-trip verbatim and the byte image matches
+/// the prior `pkg/workbook.zig::appendXmlEscapedText` output.
 pub fn appendXmlEscaped(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), s: []const u8) Error!void {
     for (s) |ch| {
         if (isForbiddenXmlByte(ch)) return error.InvalidXmlByte;
@@ -653,6 +664,24 @@ pub fn appendXmlEscaped(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), 
             '&' => try out.appendSlice(allocator, "&amp;"),
             '"' => try out.appendSlice(allocator, "&quot;"),
             '\'' => try out.appendSlice(allocator, "&apos;"),
+            else => try out.append(allocator, ch),
+        }
+    }
+}
+
+/// Append `s` to `out`, XML-escaping the three element-content
+/// entities (`<`, `>`, `&`) and rejecting XML 1.0 forbidden control
+/// bytes. The two quote characters (`"`, `'`) pass through verbatim
+/// — that's the byte-stable contract for element text bodies (see
+/// `pkg/workbook.zig` pre-iter-wr-6 emission). Use `appendXmlEscaped`
+/// for attribute values where the quote characters MUST be escaped.
+pub fn appendXmlEscapedText(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), s: []const u8) Error!void {
+    for (s) |ch| {
+        if (isForbiddenXmlByte(ch)) return error.InvalidXmlByte;
+        switch (ch) {
+            '<' => try out.appendSlice(allocator, "&lt;"),
+            '>' => try out.appendSlice(allocator, "&gt;"),
+            '&' => try out.appendSlice(allocator, "&amp;"),
             else => try out.append(allocator, ch),
         }
     }
@@ -697,6 +726,29 @@ test "appendXmlEscaped permits tab/LF/CR" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(a);
     try appendXmlEscaped(a, &buf, "tab\there\nline\rrun");
+    try std.testing.expectEqualStrings("tab\there\nline\rrun", buf.items);
+}
+
+test "appendXmlEscapedText escapes only <, >, & — quotes verbatim" {
+    const a = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(a);
+    try appendXmlEscapedText(a, &buf, "<>&\"'");
+    try std.testing.expectEqualStrings("&lt;&gt;&amp;\"'", buf.items);
+}
+
+test "appendXmlEscapedText rejects forbidden control bytes" {
+    const a = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(a);
+    try std.testing.expectError(error.InvalidXmlByte, appendXmlEscapedText(a, &buf, "ok\x00bad"));
+}
+
+test "appendXmlEscapedText permits tab/LF/CR" {
+    const a = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(a);
+    try appendXmlEscapedText(a, &buf, "tab\there\nline\rrun");
     try std.testing.expectEqualStrings("tab\there\nline\rrun", buf.items);
 }
 
@@ -952,11 +1004,16 @@ test "emitVmlDrawingXml: anchor clamp on XFD column" {
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "<x:Anchor>16383, 15, 0, 2, 16383, 31, 4, 3</x:Anchor>") != null);
 }
 
-test "isForbiddenXmlByte: includes DEL, excludes tab/LF/CR" {
+test "isForbiddenXmlByte: rejects C0 control bytes, accepts tab/LF/CR/DEL" {
     try std.testing.expect(isForbiddenXmlByte(0x00));
-    try std.testing.expect(isForbiddenXmlByte(0x7F));
+    try std.testing.expect(isForbiddenXmlByte(0x01));
+    try std.testing.expect(isForbiddenXmlByte(0x0B));
+    try std.testing.expect(isForbiddenXmlByte(0x1F));
     try std.testing.expect(!isForbiddenXmlByte(0x09));
     try std.testing.expect(!isForbiddenXmlByte(0x0A));
     try std.testing.expect(!isForbiddenXmlByte(0x0D));
     try std.testing.expect(!isForbiddenXmlByte(0x20));
+    // 0x7F (DEL) is valid per XML 1.0 production [2] (lies in
+    // `[#x20-#xD7FF]`). B3 iter-wr-6 reconciled with the spec.
+    try std.testing.expect(!isForbiddenXmlByte(0x7F));
 }

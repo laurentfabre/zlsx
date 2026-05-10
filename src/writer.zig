@@ -1749,64 +1749,29 @@ pub const SheetWriter = struct {
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
+/// B3 iter-wr-6: A1 cell-ref formatter canonicalised in
+/// `pkg/sheet_plan.zig`. The forwarder keeps the writer-side public
+/// surface (a `pub` symbol some test files import directly) without
+/// duplicating the bit-bashing.
 pub fn formatCellRef(buf: *[16]u8, row: u32, col_idx: u32) ![]u8 {
-    // Excel hard limit: 1 ≤ row ≤ 1_048_576, 0 ≤ col_idx < 16_384
-    // (column XFD). Reject above that — formats above the cap may
-    // technically fit `col_chars[8]u8` but Excel rejects the
-    // workbook silently and produces an undiagnosable failure.
-    if (row == 0 or row > EXCEL_MAX_ROW) return error.RowOutOfRange;
-    if (col_idx >= EXCEL_MAX_COL) return error.ColumnOutOfRange;
-    // Column letter (1-based in xlsx: A=1, Z=26, AA=27 …).
-    var col_chars: [8]u8 = undefined;
-    var pos: usize = col_chars.len;
-    var c = col_idx + 1;
-    while (c > 0) {
-        c -= 1;
-        pos -= 1;
-        col_chars[pos] = 'A' + @as(u8, @intCast(c % 26));
-        c /= 26;
-    }
-    const letters = col_chars[pos..];
-    return std.fmt.bufPrint(buf, "{s}{d}", .{ letters, row });
+    return sheet_plan.formatCellRef(buf, row, col_idx);
 }
 
-// Excel's hard limits: 16 384 columns (XFD) × 1 048 576 rows.
-const EXCEL_MAX_COL: u32 = 16_384;
-const EXCEL_MAX_ROW: u32 = 1_048_576;
+// Excel's hard limits: 16 384 columns (XFD) × 1 048 576 rows. B3
+// iter-wr-6 lifted the constants to `pkg/sheet_plan.zig` so the
+// reader, writer, and Workbook fresh-emit share one canonical
+// definition. The aliases below keep this file's existing call
+// sites compiling unchanged.
+const EXCEL_MAX_COL: u32 = sheet_plan.EXCEL_MAX_COL;
+const EXCEL_MAX_ROW: u32 = sheet_plan.EXCEL_MAX_ROW;
 
-const MergeCorner = struct { col: u32, row: u32 };
-
-fn parseA1Corner(s: []const u8) !MergeCorner {
-    if (s.len == 0) return error.InvalidMergeRange;
-    var i: usize = 0;
-    var col: u32 = 0;
-    while (i < s.len and s[i] >= 'A' and s[i] <= 'Z') : (i += 1) {
-        col = col * 26 + (s[i] - 'A' + 1);
-        if (col > EXCEL_MAX_COL) return error.InvalidMergeRange;
-    }
-    // Need at least one letter and at least one digit after it.
-    if (i == 0 or i == s.len) return error.InvalidMergeRange;
-    // Leading zero (e.g., "A0", "A01") is not a valid A1 row.
-    if (s[i] == '0') return error.InvalidMergeRange;
-    var row: u32 = 0;
-    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
-        row = row * 10 + (s[i] - '0');
-        if (row > EXCEL_MAX_ROW) return error.InvalidMergeRange;
-    }
-    if (i != s.len) return error.InvalidMergeRange;
-    return .{ .col = col, .row = row };
-}
-
-fn validateMergeRange(range: []const u8) !void {
-    const colon = std.mem.indexOfScalar(u8, range, ':') orelse return error.InvalidMergeRange;
-    const tl = try parseA1Corner(range[0..colon]);
-    const br = try parseA1Corner(range[colon + 1 ..]);
-    // Top-left must strictly precede or equal bottom-right on both axes.
-    if (tl.col > br.col or tl.row > br.row) return error.InvalidMergeRange;
-    // Single-cell "merge" is a no-op that Excel warns on — reject it
-    // so callers catch typos at write time rather than on file-open.
-    if (tl.col == br.col and tl.row == br.row) return error.InvalidMergeRange;
-}
+// B3 iter-wr-6: A1 corner parsing + range validators canonicalised
+// in `pkg/sheet_plan.zig`. The aliases preserve the writer-side
+// names (and the writer-side test suite still references them
+// directly).
+const MergeCorner = sheet_plan.A1Corner;
+const parseA1Corner = sheet_plan.parseA1Corner;
+const validateMergeRange = sheet_plan.validateMergeRange;
 
 /// Byte-wise ASCII case-fold equality. Excel's sheet-name uniqueness
 /// rule is Unicode-case-insensitive, but ASCII case-fold catches the
@@ -1863,75 +1828,25 @@ pub fn validateSheetName(name: []const u8) !void {
 /// `validateDefinedName(name)` against the canonical implementation.
 const validateDefinedName = workbook_xml_plan.validateDefinedName;
 
-fn validateAutoFilterRange(range: []const u8) !void {
-    if (range.len == 0) return error.InvalidAutoFilterRange;
-    if (std.mem.indexOfScalar(u8, range, ':')) |colon| {
-        const tl = parseA1Corner(range[0..colon]) catch return error.InvalidAutoFilterRange;
-        const br = parseA1Corner(range[colon + 1 ..]) catch return error.InvalidAutoFilterRange;
-        if (tl.col > br.col or tl.row > br.row) return error.InvalidAutoFilterRange;
-    } else {
-        _ = parseA1Corner(range) catch return error.InvalidAutoFilterRange;
-    }
-}
-
-fn validateHyperlinkRange(range: []const u8) !void {
-    if (range.len == 0) return error.InvalidHyperlinkRange;
-    if (std.mem.indexOfScalar(u8, range, ':')) |colon| {
-        // Rectangle form — mirror the merge-range rules except that
-        // single-cell ranges ARE valid here (a 1×1 hyperlink is exactly
-        // the A1 form, just with redundant `:` sugar).
-        const tl = parseA1Corner(range[0..colon]) catch return error.InvalidHyperlinkRange;
-        const br = parseA1Corner(range[colon + 1 ..]) catch return error.InvalidHyperlinkRange;
-        if (tl.col > br.col or tl.row > br.row) return error.InvalidHyperlinkRange;
-    } else {
-        // Single-cell form — just an A1 reference.
-        _ = parseA1Corner(range) catch return error.InvalidHyperlinkRange;
-    }
-}
+// B3 iter-wr-6: range validators canonicalised in
+// `pkg/sheet_plan.zig`. Same byte-stable shape as the prior locals
+// (single-cell ranges are valid for hyperlinks/auto-filter, rejected
+// for merges; inverted corners rejected on every axis).
+const validateAutoFilterRange = sheet_plan.validateAutoFilterRange;
+const validateHyperlinkRange = sheet_plan.validateHyperlinkRange;
 
 // xl/styles.xml emitter + helpers (stylesEqual, hAlignName,
 // emitBorderSide, emitDxfBorderSide, borderStyleName,
 // patternTypeName) moved to pkg/styles_plan.zig per B3 iter-wr-2.
 
-/// XML 1.0 forbids most C0 control bytes in document content.
-/// Allowed: 0x09 (tab), 0x0A (LF), 0x0D (CR). Forbidden:
-/// 0x00–0x08, 0x0B, 0x0C, 0x0E–0x1F, plus 0x7F (DEL — XML 1.0
-/// production [2] disallows it in element/attribute text). A
-/// cell string, comment, URL, formula, or rich-text run carrying
-/// any of these would emit a workbook that consumers reject as
-/// "not well-formed", so reject at write time with a typed error
-/// instead of silently producing a broken file.
-fn appendXmlEscaped(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
-    for (s) |ch| {
-        if (isForbiddenXmlByte(ch)) return error.InvalidXmlByte;
-        switch (ch) {
-            '<' => try out.appendSlice(alloc, "&lt;"),
-            '>' => try out.appendSlice(alloc, "&gt;"),
-            '&' => try out.appendSlice(alloc, "&amp;"),
-            '"' => try out.appendSlice(alloc, "&quot;"),
-            '\'' => try out.appendSlice(alloc, "&apos;"),
-            else => try out.append(alloc, ch),
-        }
-    }
-}
-
-/// Pre-validate a user string for XML 1.0 forbidden bytes. Exposes
-/// the same `error.InvalidXmlByte` as appendXmlEscaped so callers
-/// can detect the failure up-front and keep mutation paths atomic
-/// (avoiding half-written rows / partial XML output).
-fn assertNoForbiddenXmlBytes(s: []const u8) !void {
-    for (s) |c| if (isForbiddenXmlByte(c)) return error.InvalidXmlByte;
-}
-
-inline fn isForbiddenXmlByte(c: u8) bool {
-    // XML 1.0 `Char` production: #x9 | #xA | #xD | [#x20-#xD7FF] ...
-    // Legal byte-level chars are tab (0x09), LF (0x0A), CR (0x0D),
-    // and anything ≥ 0x20. Everything else < 0x20 must be rejected.
-    // DEL (0x7F) IS valid — it falls inside `[#x20-#xD7FF]`.
-    if (c == 0x09 or c == 0x0A or c == 0x0D) return false;
-    if (c < 0x20) return true;
-    return false;
-}
+// XML 1.0 escape + forbidden-byte helpers: B3 iter-wr-6 lifted these
+// to `pkg/sheet_plan.zig` so writer.zig + workbook.zig + store.zig
+// share one byte-stable producer. The aliases below keep this file's
+// existing call sites (~80 across writer.zig + tests) compiling
+// unchanged — no perf cost; the compiler inlines the forward.
+const appendXmlEscaped = sheet_plan.appendXmlEscaped;
+const assertNoForbiddenXmlBytes = sheet_plan.assertNoForbiddenXmlBytes;
+const isForbiddenXmlByte = sheet_plan.isForbiddenXmlByte;
 
 // ─── Deflate (LZ77 + dynamic huffman + lazy matching) ────────────────
 //
