@@ -25,7 +25,9 @@ class Zlsx < Formula
   # into a tap pinned to an older release, also drop the
   # zlsx-extract-images line from the test block.
   version "0.4.0"
-  license "MIT"
+  # Proprietary (commercial + 60-day eval). Distribute via personal tap
+  # only; homebrew/core requires OSI-approved licenses.
+  license :cannot_represent
 
   on_macos do
     if Hardware::CPU.arm?

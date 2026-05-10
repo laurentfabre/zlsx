@@ -163,7 +163,11 @@ Remaining: IANA MIME registration (deferred to v1.0).
 
 ## 🅿️ Parked / out-of-band
 
-- **Relicense PR #102** (MIT → PolyForm NC) — parked by decision.
+- ~~**Relicense PR #102** (MIT → commercial)~~ — **decided and merged
+  2026-08-01**: zlsx is **proprietary** — repository public for reading,
+  60-day artifact-only evaluation, commercial license (wrapper-layer
+  source rights only; never the Zig core). Prior MIT releases (≤ v0.7.0)
+  keep their MIT grant perpetually.
 - ~~**Zig 0.16 migration**~~ — shipped: the toolchain in #120, the embedding arc's
   forward-port in #123. `stash@{0}` is discharged and safe to drop.
 - **zlsx-cloud SaaS** — separate design arc (`docs/plans/saas-*`, gitignored).
@@ -194,8 +198,8 @@ Proven end-to-end on a live workspace, using released artifacts only:
 
 Next, in value order: harden the Data Source (per-file×sheet partitions,
 row-range splits, type widening, the writer half → `py-zlsx[spark]`), then a
-`zlsx dbx` CLI family (push / pull / genie) over std.http. The parked relicense
-PR #102 is load-bearing here — the PolyForm NC boundary is the pro tier.
+`zlsx dbx` CLI family (push / pull / genie) over std.http. The relicense
+(#102) is load-bearing here — the proprietary boundary is the pro tier.
 
 ## 🔭 Candidate follow-ups (value/effort order)
 
