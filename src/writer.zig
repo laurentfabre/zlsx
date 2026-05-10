@@ -73,6 +73,18 @@ const zip = @import("zlsx_zip");
 // same emit surface for fresh-file production in future iters.
 const sheet_plan = @import("zlsx_sheet_plan");
 
+// B3 iter-wr-7: shared fresh-archive emit substrate. Lifts the entire
+// `Writer.save` archive orchestration ([Content_Types].xml + rels +
+// workbook.xml + per-sheet sheet/rels/comments/vml + sst + styles +
+// ZIP CD/EOCD) into a std-only module so `pkg.Workbook.saveFreshEmit`
+// can produce byte-identical archives without re-implementing the
+// orchestration. `Writer.save` is now a thin shim atop this module —
+// the per-Writer state (sheets, sst_plan, styles_plan,
+// workbook_xml_plan, sst_count) projects onto `fresh_emit.ArchiveInputs`
+// in ~30 LOC. Same cycle-avoidance pattern: takes a `DeflateFn`
+// callback so the deflate impl in this file stays downstream.
+const fresh_emit = @import("zlsx_fresh_emit");
+
 /// Function-pointer adapter wrapping `deflateCompress` with the
 /// `anyerror!void` return type that `zip.Archive.addEntry`'s
 /// `DeflateFn` expects.
@@ -469,395 +481,33 @@ pub const Writer = struct {
     }
 
     /// Serialise everything and write to `path`. Overwrites.
+    ///
+    /// B3 iter-wr-7: thin shim. Builds per-sheet `SheetInput`s from
+    /// the registered `SheetWriter` list and forwards to the shared
+    /// `pkg/fresh_emit.zig` archive substrate. Same byte format,
+    /// same byte-stability invariants — they all live on the substrate
+    /// now (see `docs/plans/writer-rebase.md` §1 + §2). Writer-local
+    /// state remains the source of truth: the registries (sst_plan,
+    /// styles_plan, workbook_xml_plan, sst_count) plus per-sheet
+    /// (name, body, state) are projected onto `fresh_emit.ArchiveInputs`
+    /// without copy or duplication. Errors flow through verbatim
+    /// (NoSheets, OutOfMemory, ZIP sentinels, etc.).
     pub fn save(self: *Writer, path: []const u8) !void {
         if (self.sheets.items.len == 0) return error.NoSheets;
 
-        var zip_buf: std.ArrayListUnmanaged(u8) = .{};
-        defer zip_buf.deinit(self.allocator);
-
-        var zw = zip.Archive.init(self.allocator, &zip_buf);
-        defer zw.deinit();
-
-        const alloc = self.allocator;
-
-        // Dxfs live in styles.xml too — conditional formatting alone
-        // is enough to require the part, even when no user style was
-        // registered via addStyle.
-        const have_styles = !self.styles_plan.isEmpty();
-
-        // 1. [Content_Types].xml
-        //
-        // OPC schema requires every <Default> element BEFORE any
-        // <Override> element. The flow is:
-        //   1. CONTENT_TYPES_DEFAULTS — opens <Types> + canonical
-        //      `rels`/`xml` Defaults.
-        //   2. Optional `vml` Default for comment-bearing
-        //      workbooks (must precede ALL Overrides).
-        //   3. CONTENT_TYPES_FIXED_OVERRIDES — workbook +
-        //      sharedStrings.
-        //   4. Per-sheet, optional styles + per-comments
-        //      Overrides.
-        //   5. CONTENT_TYPES_TAIL — closes </Types>.
-        {
-            var ct: std.ArrayListUnmanaged(u8) = .{};
-            defer ct.deinit(alloc);
-            // ─── Phase 1: Defaults ──────────────────────────────
-            try ct.appendSlice(alloc, CONTENT_TYPES_DEFAULTS);
-            var any_comments = false;
-            for (self.sheets.items) |sw| {
-                if (sw.state.comments.items.len > 0) {
-                    any_comments = true;
-                    break;
-                }
-            }
-            if (any_comments) {
-                try ct.appendSlice(
-                    alloc,
-                    "<Default Extension=\"vml\" ContentType=\"application/vnd.openxmlformats-officedocument.vmlDrawing\"/>",
-                );
-            }
-            // ─── Phase 2: Overrides ─────────────────────────────
-            try ct.appendSlice(alloc, CONTENT_TYPES_FIXED_OVERRIDES);
-            for (self.sheets.items, 0..) |_, i| {
-                try ct.print(
-                    alloc,
-                    "<Override PartName=\"/xl/worksheets/sheet{d}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>",
-                    .{i + 1},
-                );
-            }
-            if (have_styles) {
-                try ct.appendSlice(
-                    alloc,
-                    "<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>",
-                );
-            }
-            if (any_comments) {
-                for (self.sheets.items, 0..) |sw, i| {
-                    if (sw.state.comments.items.len == 0) continue;
-                    try ct.print(
-                        alloc,
-                        "<Override PartName=\"/xl/comments{d}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml\"/>",
-                        .{i + 1},
-                    );
-                }
-            }
-            try ct.appendSlice(alloc, CONTENT_TYPES_TAIL);
-            try zw.addEntry("[Content_Types].xml", ct.items, deflateCompressErased);
-        }
-
-        // 2. _rels/.rels (static)
-        try zw.addEntry("_rels/.rels", ROOT_RELS, deflateCompressErased);
-
-        // 3. xl/workbook.xml — B3 iter-wr-3: emission lives on the
-        // shared plan. Build the sheet-entry view (one entry per
-        // registered sheet, declaration order) and hand off to
-        // `workbook_xml_plan.emitWorkbookXml`. The plan owns the
-        // defined-name pool already; the bytes coming back are
-        // byte-for-byte equivalent to the pre-iter-wr-3 local emit.
-        {
-            const sheet_entries = try alloc.alloc(WorkbookXmlSheetEntry, self.sheets.items.len);
-            defer alloc.free(sheet_entries);
-            for (self.sheets.items, 0..) |sw, i| {
-                sheet_entries[i] = .{ .name = sw.name };
-            }
-            const wb_bytes = try workbook_xml_plan.emitWorkbookXml(
-                alloc,
-                sheet_entries,
-                &self.workbook_xml_plan,
-            );
-            defer alloc.free(wb_bytes);
-            try zw.addEntry("xl/workbook.xml", wb_bytes, deflateCompressErased);
-        }
-
-        // 4. xl/_rels/workbook.xml.rels
-        {
-            var rels: std.ArrayListUnmanaged(u8) = .{};
-            defer rels.deinit(alloc);
-            try rels.appendSlice(alloc, WORKBOOK_RELS_HEAD);
-            for (self.sheets.items, 0..) |_, i| {
-                try rels.print(
-                    alloc,
-                    "<Relationship Id=\"rId{d}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{d}.xml\"/>",
-                    .{ i + 1, i + 1 },
-                );
-            }
-            // Shared strings relationship id follows after sheets.
-            try rels.print(
-                alloc,
-                "<Relationship Id=\"rId{d}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/>",
-                .{self.sheets.items.len + 1},
-            );
-            if (have_styles) {
-                try rels.print(
-                    alloc,
-                    "<Relationship Id=\"rId{d}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>",
-                    .{self.sheets.items.len + 2},
-                );
-            }
-            try rels.appendSlice(alloc, WORKBOOK_RELS_TAIL);
-            try zw.addEntry("xl/_rels/workbook.xml.rels", rels.items, deflateCompressErased);
-        }
-
-        // 5. xl/worksheets/sheetN.xml
-        //
-        // B3 iter-wr-4: per-sheet emit routes through `sheet_plan`'s
-        // shared `emitWorksheetXml`. Writer's `SheetWriter`-local
-        // arrays are projected onto the plan's
-        // `SheetEmitInputs` view via per-sheet scratch buffers so the
-        // plan stays std-only (no Writer-internal types reach it).
-        // The byte output is identical to the prior local emit
-        // branch — child-element order, attribute order, and
-        // optional-block elision are all locked by the plan's tests.
+        const inputs = try self.allocator.alloc(fresh_emit.SheetInput, self.sheets.items.len);
+        defer self.allocator.free(inputs);
         for (self.sheets.items, 0..) |sw, i| {
-            var full: std.ArrayListUnmanaged(u8) = .{};
-            defer full.deinit(alloc);
-
-            // Project Writer's heap-owned arrays onto the plan's
-            // const-slice view. The intermediate buffers live for
-            // the duration of one sheet emit; no extra string
-            // duplications happen here because the plan slices
-            // straight into the SheetWriter's owned buffers.
-            const hyperlinks_view = try alloc.alloc(sheet_plan.Hyperlink, sw.state.hyperlinks.items.len);
-            defer alloc.free(hyperlinks_view);
-            for (sw.state.hyperlinks.items, 0..) |h, k| {
-                hyperlinks_view[k] = .{ .range = h.range, .url = h.url };
-            }
-
-            const internal_hl_view = try alloc.alloc(sheet_plan.InternalHyperlink, sw.state.internal_hyperlinks.items.len);
-            defer alloc.free(internal_hl_view);
-            for (sw.state.internal_hyperlinks.items, 0..) |h, k| {
-                internal_hl_view[k] = .{ .range = h.range, .location = h.location };
-            }
-
-            const merges_view = try alloc.alloc([]const u8, sw.state.merged_cells.items.len);
-            defer alloc.free(merges_view);
-            for (sw.state.merged_cells.items, 0..) |range, k| {
-                merges_view[k] = range;
-            }
-
-            const cw_view = try alloc.alloc(sheet_plan.ColumnWidth, sw.state.column_widths.items.len);
-            defer alloc.free(cw_view);
-            for (sw.state.column_widths.items, 0..) |cw, k| {
-                cw_view[k] = .{ .col_min = cw.col_min, .col_max = cw.col_max, .width = cw.width };
-            }
-
-            const cf_view = try alloc.alloc(sheet_plan.ConditionalFormat, sw.state.conditional_formats.items.len);
-            defer alloc.free(cf_view);
-            for (sw.state.conditional_formats.items, 0..) |cf, k| {
-                // SheetState stores `[]u8`-owned slices; the
-                // const-slice view coerces implicitly per axis except
-                // for the union arm, which we re-pack by hand.
-                cf_view[k] = .{
-                    .range = cf.range,
-                    .rule = switch (cf.rule) {
-                        .cell_is => |r| .{ .cell_is = .{
-                            .operator = r.operator,
-                            .formula1 = r.formula1,
-                            .formula2 = r.formula2,
-                            .dxf_id = r.dxf_id,
-                        } },
-                        .expression => |r| .{ .expression = .{
-                            .formula = r.formula,
-                            .dxf_id = r.dxf_id,
-                        } },
-                        .color_scale => |r| .{ .color_scale = .{
-                            .low_color_argb = r.low_color_argb,
-                            .mid_color_argb = r.mid_color_argb,
-                            .high_color_argb = r.high_color_argb,
-                        } },
-                        .data_bar => |r| .{ .data_bar = .{ .color_argb = r.color_argb } },
-                    },
-                };
-            }
-
-            const dvl_view = try alloc.alloc(sheet_plan.DataValidationList, sw.state.data_validations.items.len);
-            defer alloc.free(dvl_view);
-            for (sw.state.data_validations.items, 0..) |dv, k| {
-                // []u8 → []const u8 for the values inner slice. Writer's
-                // DataValidationList.values is `[][]u8`; the plan view
-                // wants `[]const []const u8`. A second per-row scratch
-                // array projects the inner pointers without any
-                // string duplication.
-                dvl_view[k] = .{ .range = dv.range, .values = @ptrCast(dv.values) };
-            }
-
-            const dvr_view = try alloc.alloc(sheet_plan.DataValidationRange, sw.state.data_validation_ranges.items.len);
-            defer alloc.free(dvr_view);
-            for (sw.state.data_validation_ranges.items, 0..) |dv, k| {
-                dvr_view[k] = .{
-                    .range = dv.range,
-                    .kind_name = dv.kind_name,
-                    .op_name = dv.op_name,
-                    .formula1 = dv.formula1,
-                    .formula2 = dv.formula2,
-                };
-            }
-
-            try sheet_plan.emitWorksheetXml(alloc, &full, .{
-                .body = sw.body.items,
-                .freeze_rows = sw.state.freeze_rows,
-                .freeze_cols = sw.state.freeze_cols,
-                .column_widths = cw_view,
-                .auto_filter_range = sw.state.auto_filter_range,
-                .merged_cells = merges_view,
-                .conditional_formats = cf_view,
-                .data_validations = dvl_view,
-                .data_validation_ranges = dvr_view,
-                .hyperlinks = hyperlinks_view,
-                .internal_hyperlinks = internal_hl_view,
-                .comment_count = sw.state.comments.items.len,
-            });
-
-            var name_buf: [64]u8 = undefined;
-            const entry_name = try std.fmt.bufPrint(&name_buf, "xl/worksheets/sheet{d}.xml", .{i + 1});
-            try zw.addEntry(entry_name, full.items, deflateCompressErased);
+            inputs[i] = .{ .name = sw.name, .body = sw.body.items, .state = &sw.state };
         }
 
-        // 5a. xl/worksheets/_rels/sheetN.xml.rels (hyperlinks + comments)
-        //
-        // B3 iter-wr-4: per-sheet rels emit routes through
-        // `sheet_plan.emitSheetRels`. The Default Extension="rels"
-        // content-type in [Content_Types].xml covers any .rels file
-        // we add here — no extra <Override> needed. rId scheme is
-        // owned by the plan (1..N hyperlinks, then comments, then
-        // vmlDrawing) so writer + workbook share one source.
-        for (self.sheets.items, 0..) |sw, i| {
-            const hyperlinks_view = try alloc.alloc(sheet_plan.Hyperlink, sw.state.hyperlinks.items.len);
-            defer alloc.free(hyperlinks_view);
-            for (sw.state.hyperlinks.items, 0..) |h, k| {
-                hyperlinks_view[k] = .{ .range = h.range, .url = h.url };
-            }
-
-            var rels: std.ArrayListUnmanaged(u8) = .{};
-            defer rels.deinit(alloc);
-            const wrote = try sheet_plan.emitSheetRels(
-                alloc,
-                &rels,
-                i,
-                hyperlinks_view,
-                sw.state.comments.items.len,
-            );
-            if (!wrote) continue;
-
-            var rels_name_buf: [64]u8 = undefined;
-            const rels_name = try std.fmt.bufPrint(&rels_name_buf, "xl/worksheets/_rels/sheet{d}.xml.rels", .{i + 1});
-            try zw.addEntry(rels_name, rels.items, deflateCompressErased);
-        }
-
-        // 5b. xl/commentsN.xml + xl/drawings/vmlDrawingN.vml (per sheet with comments).
-        //
-        // B3 iter-wr-4: comments + VML drawing emit routes through
-        // `sheet_plan.emitCommentsXml` / `emitVmlDrawingXml`. Author
-        // dedup, plain-text body shape, idmap chunking, and the
-        // XFD/1048576 anchor clamp all live on the plan so the
-        // byte format is shared between Writer and (future) Workbook
-        // fresh-emit. Per `a966e29` the anchor clamp prevents
-        // inverted shapes on cells near the rightmost column.
-        for (self.sheets.items, 0..) |sw, i| {
-            if (sw.state.comments.items.len == 0) continue;
-
-            // Project Writer's `Comment` slice onto the plan's view.
-            // Same layout, just different namespace — no string
-            // duplication.
-            const comments_view = try alloc.alloc(sheet_plan.Comment, sw.state.comments.items.len);
-            defer alloc.free(comments_view);
-            for (sw.state.comments.items, 0..) |c, k| {
-                comments_view[k] = .{ .ref = c.ref, .author = c.author, .text = c.text };
-            }
-
-            var cx: std.ArrayListUnmanaged(u8) = .{};
-            defer cx.deinit(alloc);
-            try sheet_plan.emitCommentsXml(alloc, &cx, comments_view);
-            var cn_buf: [64]u8 = undefined;
-            const cn = try std.fmt.bufPrint(&cn_buf, "xl/comments{d}.xml", .{i + 1});
-            try zw.addEntry(cn, cx.items, deflateCompressErased);
-
-            var vml: std.ArrayListUnmanaged(u8) = .{};
-            defer vml.deinit(alloc);
-            try sheet_plan.emitVmlDrawingXml(alloc, &vml, comments_view);
-            var vml_buf: [64]u8 = undefined;
-            const vml_name = try std.fmt.bufPrint(&vml_buf, "xl/drawings/vmlDrawing{d}.vml", .{i + 1});
-            try zw.addEntry(vml_name, vml.items, deflateCompressErased);
-        }
-
-        // 6. xl/sharedStrings.xml — emits the staged
-        // `SstExtensionPlan` (B3 iter-wr-1). Plain entries first
-        // (matches the index ordering `sstIntern` returns), then rich
-        // entries — `indexOfRich` assumes that layout. `xml:space=
-        // "preserve"` is unconditional on plain entries (Writer's
-        // pre-iter-wr-1 byte contract; differs from
-        // `pkg/workbook.zig::appendNewSiEntries` which emits the
-        // attribute conditionally per OOXML's whitespace rules).
-        {
-            var sst: std.ArrayListUnmanaged(u8) = .{};
-            defer sst.deinit(alloc);
-            const unique_count = self.sst_plan.new_strings.items.len +
-                self.sst_plan.new_rich_strings.items.len;
-            try sst.print(alloc, SST_HEAD_FMT, .{ self.sst_count, unique_count });
-            for (self.sst_plan.new_strings.items) |s| {
-                try sst.appendSlice(alloc, "<si><t xml:space=\"preserve\">");
-                try appendXmlEscaped(alloc, &sst, s);
-                try sst.appendSlice(alloc, "</t></si>");
-            }
-            for (self.sst_plan.new_rich_strings.items) |entry| {
-                try sst.appendSlice(alloc, "<si>");
-                for (entry.runs) |r| {
-                    try sst.appendSlice(alloc, "<r>");
-                    // <rPr>…</rPr> — only emit when at least one prop is
-                    // set. Underline + strike are storage-only on the
-                    // plan side; Writer's RichTextRun never sets them
-                    // (false-equivalent), so they don't gate `has_props`
-                    // and stay un-emitted, preserving the byte format.
-                    const has_props = r.bold or r.italic or r.color_argb != null or
-                        r.font_size != null or r.font_name != null;
-                    if (has_props) {
-                        try sst.appendSlice(alloc, "<rPr>");
-                        if (r.bold) try sst.appendSlice(alloc, "<b/>");
-                        if (r.italic) try sst.appendSlice(alloc, "<i/>");
-                        if (r.font_size) |sz| try sst.print(alloc, "<sz val=\"{d}\"/>", .{sz});
-                        if (r.color_argb) |c| {
-                            // Plan stores pre-formatted 8-hex bytes;
-                            // emit verbatim (matches Writer's pre-
-                            // iter-wr-1 `{X:0>8}` output, sourced
-                            // upstream by `sstInternRich`).
-                            try sst.appendSlice(alloc, "<color rgb=\"");
-                            try sst.appendSlice(alloc, c);
-                            try sst.appendSlice(alloc, "\"/>");
-                        }
-                        if (r.font_name) |n| {
-                            try sst.appendSlice(alloc, "<rFont val=\"");
-                            try appendXmlEscaped(alloc, &sst, n);
-                            try sst.appendSlice(alloc, "\"/>");
-                        }
-                        try sst.appendSlice(alloc, "</rPr>");
-                    }
-                    try sst.appendSlice(alloc, "<t xml:space=\"preserve\">");
-                    try appendXmlEscaped(alloc, &sst, r.text);
-                    try sst.appendSlice(alloc, "</t></r>");
-                }
-                try sst.appendSlice(alloc, "</si>");
-            }
-            try sst.appendSlice(alloc, SST_TAIL);
-            try zw.addEntry("xl/sharedStrings.xml", sst.items, deflateCompressErased);
-        }
-
-        // 7. xl/styles.xml — only when the caller registered any styles.
-        // Keeps the "no styles" path byte-identical to v0.2.0-0.2.3
-        // output. The emit logic itself lives on `StylesPlan` (B3
-        // iter-wr-2), so Workbook's fresh-emit path can reuse the
-        // same byte-stable producer.
-        if (have_styles) {
-            var styles_buf: std.ArrayListUnmanaged(u8) = .{};
-            defer styles_buf.deinit(alloc);
-            try self.styles_plan.emit(alloc, &styles_buf);
-            try zw.addEntry("xl/styles.xml", styles_buf.items, deflateCompressErased);
-        }
-
-        try zw.finalize();
-
-        var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(zip_buf.items);
+        return fresh_emit.saveArchiveToPath(self.allocator, path, .{
+            .sheets = inputs,
+            .sst_plan = &self.sst_plan,
+            .sst_count = self.sst_count,
+            .styles_plan = &self.styles_plan,
+            .workbook_xml_plan = &self.workbook_xml_plan,
+        }, deflateCompressErased);
     }
 };
 
