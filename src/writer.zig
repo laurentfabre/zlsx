@@ -84,35 +84,12 @@ fn deflateCompressErased(
     return deflateCompress(alloc, input, out);
 }
 
-/// B3 iter-wr-4: project Writer's `ConditionalFormat` onto the
-/// plan's `sheet_plan.ConditionalFormat` view. Maps the Writer-local
-/// `CfOperator` enum onto the plan's identical enum (same OOXML
-/// tokens, declared independently to keep the plan std-only); the
-/// inner formula slices are aliased through unchanged.
-fn projectConditionalFormat(cf: ConditionalFormat) sheet_plan.ConditionalFormat {
-    return .{
-        .range = cf.range,
-        .rule = switch (cf.rule) {
-            .cell_is => |r| .{ .cell_is = .{
-                .operator = projectCfOperator(r.operator),
-                .formula1 = r.formula1,
-                .formula2 = r.formula2,
-                .dxf_id = r.dxf_id,
-            } },
-            .expression => |r| .{ .expression = .{
-                .formula = r.formula,
-                .dxf_id = r.dxf_id,
-            } },
-            .color_scale => |r| .{ .color_scale = .{
-                .low_color_argb = r.low_color_argb,
-                .mid_color_argb = r.mid_color_argb,
-                .high_color_argb = r.high_color_argb,
-            } },
-            .data_bar => |r| .{ .data_bar = .{ .color_argb = r.color_argb } },
-        },
-    };
-}
-
+/// B3 iter-wr-6: `projectConditionalFormat` retired — `Writer.save`
+/// inlines the union-arm projection now that the storage lives on
+/// `sheet_plan.SheetState`. `projectCfOperator` survives because the
+/// Writer-side `CfOperator` enum is a separate (identical-shape) type
+/// from `sheet_plan.CfOperator` and the public `addConditionalFormatCellIs`
+/// signature still takes the Writer-local enum.
 inline fn projectCfOperator(op: CfOperator) sheet_plan.CfOperator {
     return switch (op) {
         .less_than => .less_than,
@@ -528,7 +505,7 @@ pub const Writer = struct {
             try ct.appendSlice(alloc, CONTENT_TYPES_DEFAULTS);
             var any_comments = false;
             for (self.sheets.items) |sw| {
-                if (sw.comments.items.len > 0) {
+                if (sw.state.comments.items.len > 0) {
                     any_comments = true;
                     break;
                 }
@@ -556,7 +533,7 @@ pub const Writer = struct {
             }
             if (any_comments) {
                 for (self.sheets.items, 0..) |sw, i| {
-                    if (sw.comments.items.len == 0) continue;
+                    if (sw.state.comments.items.len == 0) continue;
                     try ct.print(
                         alloc,
                         "<Override PartName=\"/xl/comments{d}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml\"/>",
@@ -640,39 +617,62 @@ pub const Writer = struct {
             // the duration of one sheet emit; no extra string
             // duplications happen here because the plan slices
             // straight into the SheetWriter's owned buffers.
-            const hyperlinks_view = try alloc.alloc(sheet_plan.Hyperlink, sw.hyperlinks.items.len);
+            const hyperlinks_view = try alloc.alloc(sheet_plan.Hyperlink, sw.state.hyperlinks.items.len);
             defer alloc.free(hyperlinks_view);
-            for (sw.hyperlinks.items, 0..) |h, k| {
+            for (sw.state.hyperlinks.items, 0..) |h, k| {
                 hyperlinks_view[k] = .{ .range = h.range, .url = h.url };
             }
 
-            const internal_hl_view = try alloc.alloc(sheet_plan.InternalHyperlink, sw.internal_hyperlinks.items.len);
+            const internal_hl_view = try alloc.alloc(sheet_plan.InternalHyperlink, sw.state.internal_hyperlinks.items.len);
             defer alloc.free(internal_hl_view);
-            for (sw.internal_hyperlinks.items, 0..) |h, k| {
+            for (sw.state.internal_hyperlinks.items, 0..) |h, k| {
                 internal_hl_view[k] = .{ .range = h.range, .location = h.location };
             }
 
-            const merges_view = try alloc.alloc([]const u8, sw.merged_cells.items.len);
+            const merges_view = try alloc.alloc([]const u8, sw.state.merged_cells.items.len);
             defer alloc.free(merges_view);
-            for (sw.merged_cells.items, 0..) |range, k| {
+            for (sw.state.merged_cells.items, 0..) |range, k| {
                 merges_view[k] = range;
             }
 
-            const cw_view = try alloc.alloc(sheet_plan.ColumnWidth, sw.column_widths.items.len);
+            const cw_view = try alloc.alloc(sheet_plan.ColumnWidth, sw.state.column_widths.items.len);
             defer alloc.free(cw_view);
-            for (sw.column_widths.items, 0..) |cw, k| {
+            for (sw.state.column_widths.items, 0..) |cw, k| {
                 cw_view[k] = .{ .col_min = cw.col_min, .col_max = cw.col_max, .width = cw.width };
             }
 
-            const cf_view = try alloc.alloc(sheet_plan.ConditionalFormat, sw.conditional_formats.items.len);
+            const cf_view = try alloc.alloc(sheet_plan.ConditionalFormat, sw.state.conditional_formats.items.len);
             defer alloc.free(cf_view);
-            for (sw.conditional_formats.items, 0..) |cf, k| {
-                cf_view[k] = projectConditionalFormat(cf);
+            for (sw.state.conditional_formats.items, 0..) |cf, k| {
+                // SheetState stores `[]u8`-owned slices; the
+                // const-slice view coerces implicitly per axis except
+                // for the union arm, which we re-pack by hand.
+                cf_view[k] = .{
+                    .range = cf.range,
+                    .rule = switch (cf.rule) {
+                        .cell_is => |r| .{ .cell_is = .{
+                            .operator = r.operator,
+                            .formula1 = r.formula1,
+                            .formula2 = r.formula2,
+                            .dxf_id = r.dxf_id,
+                        } },
+                        .expression => |r| .{ .expression = .{
+                            .formula = r.formula,
+                            .dxf_id = r.dxf_id,
+                        } },
+                        .color_scale => |r| .{ .color_scale = .{
+                            .low_color_argb = r.low_color_argb,
+                            .mid_color_argb = r.mid_color_argb,
+                            .high_color_argb = r.high_color_argb,
+                        } },
+                        .data_bar => |r| .{ .data_bar = .{ .color_argb = r.color_argb } },
+                    },
+                };
             }
 
-            const dvl_view = try alloc.alloc(sheet_plan.DataValidationList, sw.data_validations.items.len);
+            const dvl_view = try alloc.alloc(sheet_plan.DataValidationList, sw.state.data_validations.items.len);
             defer alloc.free(dvl_view);
-            for (sw.data_validations.items, 0..) |dv, k| {
+            for (sw.state.data_validations.items, 0..) |dv, k| {
                 // []u8 → []const u8 for the values inner slice. Writer's
                 // DataValidationList.values is `[][]u8`; the plan view
                 // wants `[]const []const u8`. A second per-row scratch
@@ -681,9 +681,9 @@ pub const Writer = struct {
                 dvl_view[k] = .{ .range = dv.range, .values = @ptrCast(dv.values) };
             }
 
-            const dvr_view = try alloc.alloc(sheet_plan.DataValidationRange, sw.data_validation_ranges.items.len);
+            const dvr_view = try alloc.alloc(sheet_plan.DataValidationRange, sw.state.data_validation_ranges.items.len);
             defer alloc.free(dvr_view);
-            for (sw.data_validation_ranges.items, 0..) |dv, k| {
+            for (sw.state.data_validation_ranges.items, 0..) |dv, k| {
                 dvr_view[k] = .{
                     .range = dv.range,
                     .kind_name = dv.kind_name,
@@ -695,17 +695,17 @@ pub const Writer = struct {
 
             try sheet_plan.emitWorksheetXml(alloc, &full, .{
                 .body = sw.body.items,
-                .freeze_rows = sw.freeze_rows,
-                .freeze_cols = sw.freeze_cols,
+                .freeze_rows = sw.state.freeze_rows,
+                .freeze_cols = sw.state.freeze_cols,
                 .column_widths = cw_view,
-                .auto_filter_range = sw.auto_filter_range,
+                .auto_filter_range = sw.state.auto_filter_range,
                 .merged_cells = merges_view,
                 .conditional_formats = cf_view,
                 .data_validations = dvl_view,
                 .data_validation_ranges = dvr_view,
                 .hyperlinks = hyperlinks_view,
                 .internal_hyperlinks = internal_hl_view,
-                .comment_count = sw.comments.items.len,
+                .comment_count = sw.state.comments.items.len,
             });
 
             var name_buf: [64]u8 = undefined;
@@ -722,9 +722,9 @@ pub const Writer = struct {
         // owned by the plan (1..N hyperlinks, then comments, then
         // vmlDrawing) so writer + workbook share one source.
         for (self.sheets.items, 0..) |sw, i| {
-            const hyperlinks_view = try alloc.alloc(sheet_plan.Hyperlink, sw.hyperlinks.items.len);
+            const hyperlinks_view = try alloc.alloc(sheet_plan.Hyperlink, sw.state.hyperlinks.items.len);
             defer alloc.free(hyperlinks_view);
-            for (sw.hyperlinks.items, 0..) |h, k| {
+            for (sw.state.hyperlinks.items, 0..) |h, k| {
                 hyperlinks_view[k] = .{ .range = h.range, .url = h.url };
             }
 
@@ -735,7 +735,7 @@ pub const Writer = struct {
                 &rels,
                 i,
                 hyperlinks_view,
-                sw.comments.items.len,
+                sw.state.comments.items.len,
             );
             if (!wrote) continue;
 
@@ -754,14 +754,14 @@ pub const Writer = struct {
         // fresh-emit. Per `a966e29` the anchor clamp prevents
         // inverted shapes on cells near the rightmost column.
         for (self.sheets.items, 0..) |sw, i| {
-            if (sw.comments.items.len == 0) continue;
+            if (sw.state.comments.items.len == 0) continue;
 
             // Project Writer's `Comment` slice onto the plan's view.
             // Same layout, just different namespace — no string
             // duplication.
-            const comments_view = try alloc.alloc(sheet_plan.Comment, sw.comments.items.len);
+            const comments_view = try alloc.alloc(sheet_plan.Comment, sw.state.comments.items.len);
             defer alloc.free(comments_view);
-            for (sw.comments.items, 0..) |c, k| {
+            for (sw.state.comments.items, 0..) |c, k| {
                 comments_view[k] = .{ .ref = c.ref, .author = c.author, .text = c.text };
             }
 
@@ -1016,51 +1016,15 @@ pub const SheetWriter = struct {
     body: std.ArrayListUnmanaged(u8) = .{},
     // 1-based row index (xlsx convention).
     next_row: u32 = 1,
-    // Stage 5: per-sheet layout features.
-    column_widths: std.ArrayListUnmanaged(ColumnWidth) = .{},
-    /// Row-height overrides keyed by 0-based row index (0 = row 1).
-    /// Height is in Excel point units (default 15.0). Emitted on the
-    /// matching `<row>` as `ht="…" customHeight="1"`. Rows emit
-    /// sequentially inside `writeRow`, so callers must set the
-    /// override BEFORE the corresponding row is written — later calls
-    /// on an already-emitted row are silently ignored.
-    row_heights: std.AutoHashMapUnmanaged(u32, f32) = .{},
-    /// Number of rows frozen at the top (1 = freeze row 1). 0 = none.
-    freeze_rows: u32 = 0,
-    /// Number of columns frozen at the left (1 = freeze column A). 0 = none.
-    freeze_cols: u32 = 0,
-    /// Auto-filter range (e.g., "A1:E1"). null = no filter.
-    /// Owned by the SheetWriter.
-    auto_filter_range: ?[]u8 = null,
-    /// Merged cell ranges (e.g., "A1:B2"). Each entry is a
-    /// SheetWriter-owned copy of a validated A1-style range.
-    merged_cells: std.ArrayListUnmanaged([]u8) = .{},
-    /// External-URL hyperlinks registered against cells or ranges.
-    /// Each entry gets an rId in `xl/worksheets/_rels/sheetN.xml.rels`
-    /// whose position in this list is its 1-based rId index.
-    hyperlinks: std.ArrayListUnmanaged(Hyperlink) = .{},
-    /// Internal (same-workbook) hyperlinks. No rels entry — emitted
-    /// alongside external hyperlinks inside the `<hyperlinks>` block
-    /// using `location="…"` instead of `r:id`.
-    internal_hyperlinks: std.ArrayListUnmanaged(InternalHyperlink) = .{},
-    /// Cell comments (notes) emitted via `SheetWriter.addComment`.
-    /// Each entry gets one `<comment>` under `xl/commentsN.xml`
-    /// plus one VML shape under `xl/drawings/vmlDrawingN.xml`.
-    comments: std.ArrayListUnmanaged(Comment) = .{},
-    /// Conditional-format rules — emitted as
-    /// `<conditionalFormatting sqref="…"><cfRule …/></conditionalFormatting>`
-    /// between `<mergeCells>` and `<dataValidations>` per
-    /// ECMA-376 CT_Worksheet ordering. Populated by
-    /// `addConditionalFormatCellIs` / `…Expression`.
-    conditional_formats: std.ArrayListUnmanaged(ConditionalFormat) = .{},
-    /// List-type data validations (dropdowns). Emitted as a single
-    /// `<dataValidations>` block with one `<dataValidation>` per entry.
-    data_validations: std.ArrayListUnmanaged(DataValidationList) = .{},
-    /// Numeric / date / time / text-length / custom data validations.
-    /// Sharing the `<dataValidations>` block with the list entries;
-    /// the two lists are kept separate so iter13 list-validation code
-    /// stays unchanged.
-    data_validation_ranges: std.ArrayListUnmanaged(DataValidationRange) = .{},
+    /// B3 iter-wr-6: per-sheet registries (column widths, row
+    /// heights, freeze panes, auto filter, merge cells, hyperlinks,
+    /// internal hyperlinks, comments, conditional formats, data
+    /// validations) all live on the shared `pkg/sheet_plan.zig`
+    /// `SheetState` so `xlsx.Writer.SheetWriter` and (future,
+    /// wr-7) `pkg.Worksheet` produce byte-identical outputs through
+    /// the same registration + heap-ownership code path.
+    /// Replaces 11 fields and the matching deinit branches.
+    state: sheet_plan.SheetState = .{},
 
     fn init(parent: *Writer, name: []const u8) !SheetWriter {
         return .{
@@ -1072,53 +1036,7 @@ pub const SheetWriter = struct {
     fn deinit(self: *SheetWriter) void {
         self.parent.allocator.free(self.name);
         self.body.deinit(self.parent.allocator);
-        self.column_widths.deinit(self.parent.allocator);
-        self.row_heights.deinit(self.parent.allocator);
-        if (self.auto_filter_range) |r| self.parent.allocator.free(r);
-        for (self.merged_cells.items) |r| self.parent.allocator.free(r);
-        self.merged_cells.deinit(self.parent.allocator);
-        for (self.hyperlinks.items) |h| {
-            self.parent.allocator.free(h.range);
-            self.parent.allocator.free(h.url);
-        }
-        self.hyperlinks.deinit(self.parent.allocator);
-        for (self.internal_hyperlinks.items) |h| {
-            self.parent.allocator.free(h.range);
-            self.parent.allocator.free(h.location);
-        }
-        self.internal_hyperlinks.deinit(self.parent.allocator);
-        for (self.comments.items) |c| {
-            self.parent.allocator.free(c.ref);
-            self.parent.allocator.free(c.author);
-            self.parent.allocator.free(c.text);
-        }
-        self.comments.deinit(self.parent.allocator);
-        for (self.conditional_formats.items) |cf| {
-            self.parent.allocator.free(cf.range);
-            switch (cf.rule) {
-                .cell_is => |r| {
-                    self.parent.allocator.free(r.formula1);
-                    if (r.formula2) |f| self.parent.allocator.free(f);
-                },
-                .expression => |r| self.parent.allocator.free(r.formula),
-                // Color scale + data bar carry no owned slices —
-                // all fields are scalar ARGB values.
-                .color_scale, .data_bar => {},
-            }
-        }
-        self.conditional_formats.deinit(self.parent.allocator);
-        for (self.data_validations.items) |dv| {
-            self.parent.allocator.free(dv.range);
-            for (dv.values) |v| self.parent.allocator.free(v);
-            self.parent.allocator.free(dv.values);
-        }
-        self.data_validations.deinit(self.parent.allocator);
-        for (self.data_validation_ranges.items) |dv| {
-            self.parent.allocator.free(dv.range);
-            self.parent.allocator.free(dv.formula1);
-            if (dv.formula2) |f2| self.parent.allocator.free(f2);
-        }
-        self.data_validation_ranges.deinit(self.parent.allocator);
+        self.state.deinit(self.parent.allocator);
         self.* = undefined;
     }
 
@@ -1126,20 +1044,11 @@ pub const SheetWriter = struct {
     /// 8.43). `col_idx` is 0-based (A=0, B=1, …). Multiple calls on
     /// the same column append a new override — the emitter keeps them
     /// in order, so a later call wins on overlap in Excel.
+    /// B3 iter-wr-6: thin forwarder onto `sheet_plan.SheetState`.
     pub fn setColumnWidth(self: *SheetWriter, col_idx: u32, width: f32) !void {
-        if (!std.math.isFinite(width) or width <= 0) return error.InvalidColumnWidth;
-        if (col_idx >= EXCEL_MAX_COL) return error.ColumnOutOfRange;
-        const col_1based = col_idx + 1;
-        try self.column_widths.append(self.parent.allocator, .{
-            .col_min = col_1based,
-            .col_max = col_1based,
-            .width = width,
-        });
+        return self.state.setColumnWidth(self.parent.allocator, col_idx, width);
     }
 
-    /// Freeze the top `rows` rows and left `cols` columns. Pass 0 to
-    /// disable one axis (e.g., `freezePanes(1, 0)` freezes only row 1).
-    /// Calling again overrides the previous setting.
     /// Set `row_idx`'s height in Excel point units (default row
     /// height is ~15 pt). `row_idx` is 0-based (0 = row 1). Must be
     /// called before the matching `writeRow` / `writeRowStyled` — the
@@ -1147,56 +1056,33 @@ pub const SheetWriter = struct {
     /// already-emitted row is silently ignored (no retroactive XML
     /// rewrite). Later calls on the same row_idx override earlier
     /// ones as long as the row hasn't been written yet.
+    /// B3 iter-wr-6: thin forwarder onto `sheet_plan.SheetState`.
     pub fn setRowHeight(self: *SheetWriter, row_idx: u32, height: f32) !void {
-        // Excel rejects rows above 409.5 points (the UI cap). Heights
-        // outside the (0, 409.5] range produce a workbook the consumer
-        // repairs on open, so reject up-front with InvalidRowHeight.
-        if (!std.math.isFinite(height) or height <= 0 or height > 409.5) {
-            return error.InvalidRowHeight;
-        }
-        if (row_idx >= EXCEL_MAX_ROW) return error.RowOutOfRange;
-        try self.row_heights.put(self.parent.allocator, row_idx, height);
+        return self.state.setRowHeight(self.parent.allocator, row_idx, height);
     }
 
+    /// Freeze the top `rows` rows and left `cols` columns. Pass 0 to
+    /// disable one axis (e.g., `freezePanes(1, 0)` freezes only row 1).
+    /// Calling again overrides the previous setting.
+    /// B3 iter-wr-6: thin forwarder onto `sheet_plan.SheetState`.
     pub fn freezePanes(self: *SheetWriter, rows: u32, cols: u32) error{ RowOutOfRange, ColumnOutOfRange }!void {
-        // Reject splits that would leave NO visible pane below /
-        // right of the freeze. save() later computes the top-left
-        // visible cell as `formatCellRef(freeze_rows + 1, freeze_cols)`,
-        // which requires:
-        //   freeze_rows + 1 ≤ EXCEL_MAX_ROW  ↔  freeze_rows < EXCEL_MAX_ROW
-        //   freeze_cols     <  EXCEL_MAX_COL
-        // Strict inequality matters: freeze_rows == EXCEL_MAX_ROW
-        // would push the visible row past Excel's last row.
-        if (rows >= EXCEL_MAX_ROW) return error.RowOutOfRange;
-        if (cols >= EXCEL_MAX_COL) return error.ColumnOutOfRange;
-        self.freeze_rows = rows;
-        self.freeze_cols = cols;
+        return self.state.freezePanes(rows, cols);
     }
 
     /// Apply an auto-filter over the given A1-style range (e.g.,
-    /// "A1:E1"). Caller-owned; the writer dupes it. The range must
-    /// resolve to valid A1 corners (column [A, XFD], row [1,
-    /// 1048576]) and the bottom-right corner must not be above or
-    /// to the left of the top-left — Excel rejects malformed
-    /// `<autoFilter ref=...>` at file-open with a "repaired"
-    /// prompt, so we surface it as `InvalidAutoFilterRange`.
+    /// "A1:E1"). Caller-owned; the writer dupes it.
+    /// B3 iter-wr-6: thin forwarder onto `sheet_plan.SheetState`.
     pub fn setAutoFilter(self: *SheetWriter, range: []const u8) !void {
-        try validateAutoFilterRange(range);
-        if (self.auto_filter_range) |old| self.parent.allocator.free(old);
-        self.auto_filter_range = try self.parent.allocator.dupe(u8, range);
+        return self.state.setAutoFilter(self.parent.allocator, range);
     }
 
     /// Merge a rectangular cell range (e.g., "A1:B2"). The range must
     /// be a valid multi-cell A1-style span — single-cell ranges and
     /// inverted (bottom-right-before-top-left) ranges are rejected.
-    /// Caller-owned; the writer dupes it. Multiple merges per sheet
-    /// are allowed; callers are responsible for avoiding overlaps,
-    /// which Excel rejects at file-open time.
+    /// Caller-owned; the writer dupes it.
+    /// B3 iter-wr-6: thin forwarder onto `sheet_plan.SheetState`.
     pub fn addMergedCell(self: *SheetWriter, range: []const u8) !void {
-        try validateMergeRange(range);
-        const copy = try self.parent.allocator.dupe(u8, range);
-        errdefer self.parent.allocator.free(copy);
-        try self.merged_cells.append(self.parent.allocator, copy);
+        return self.state.addMergedCell(self.parent.allocator, range);
     }
 
     /// Attach a list-type data validation (dropdown) to a cell or
@@ -1207,38 +1093,13 @@ pub const SheetWriter = struct {
     /// quotes in values are rejected (callers who need those should
     /// use a range-reference validation — not yet supported). Empty
     /// values and empty `values` slice also rejected.
+    /// B3 iter-wr-6: thin forwarder onto `sheet_plan.SheetState`.
     pub fn addDataValidationList(
         self: *SheetWriter,
         range: []const u8,
         values: []const []const u8,
     ) !void {
-        try validateHyperlinkRange(range); // same A1 single-or-range shape
-        if (values.len == 0) return error.InvalidDataValidation;
-        for (values) |v| {
-            if (v.len == 0) return error.InvalidDataValidation;
-            // Comma breaks the Excel list format; bare `"` breaks the
-            // outer quoting. We xml-escape on emit, so `<>&` are safe.
-            if (std.mem.indexOfScalar(u8, v, ',') != null) return error.InvalidDataValidation;
-            if (std.mem.indexOfScalar(u8, v, '"') != null) return error.InvalidDataValidation;
-        }
-
-        const alloc = self.parent.allocator;
-        const range_copy = try alloc.dupe(u8, range);
-        errdefer alloc.free(range_copy);
-
-        const values_copy = try alloc.alloc([]u8, values.len);
-        errdefer alloc.free(values_copy);
-        var copied: usize = 0;
-        errdefer for (values_copy[0..copied]) |v| alloc.free(v);
-        for (values, 0..) |v, i| {
-            values_copy[i] = try alloc.dupe(u8, v);
-            copied = i + 1;
-        }
-
-        try self.data_validations.append(alloc, .{
-            .range = range_copy,
-            .values = values_copy,
-        });
+        return self.state.addDataValidationList(self.parent.allocator, range, values);
     }
 
     /// Attach a numeric / date / time / text-length data validation.
@@ -1249,6 +1110,12 @@ pub const SheetWriter = struct {
     /// otherwise — mismatches surface `error.InvalidDataValidation`.
     /// Excel displays number-typed validations as red-circle errors
     /// when the cell value falls outside the constraint.
+    /// Attach a numeric / date / time / text-length data validation.
+    /// `formula2` must be non-null iff `op` is `.between` or
+    /// `.not_between`. B3 iter-wr-6: forwards onto
+    /// `sheet_plan.SheetState.addDataValidationRange` — the writer-side
+    /// `kind`/`op` enums translate to the canonical OOXML token
+    /// strings here.
     pub fn addDataValidationNumeric(
         self: *SheetWriter,
         range: []const u8,
@@ -1257,129 +1124,52 @@ pub const SheetWriter = struct {
         formula1: []const u8,
         formula2: ?[]const u8,
     ) !void {
-        try validateHyperlinkRange(range);
-        if (formula1.len == 0) return error.InvalidDataValidation;
-        const needs_two = op.needsSecondFormula();
-        if (needs_two and (formula2 == null or formula2.?.len == 0)) return error.InvalidDataValidation;
-        if (!needs_two and formula2 != null) return error.InvalidDataValidation;
-
-        const alloc = self.parent.allocator;
-        const range_copy = try alloc.dupe(u8, range);
-        errdefer alloc.free(range_copy);
-        const f1_copy = try alloc.dupe(u8, formula1);
-        errdefer alloc.free(f1_copy);
-        const f2_copy: ?[]u8 = if (formula2) |f| try alloc.dupe(u8, f) else null;
-        errdefer if (f2_copy) |f| alloc.free(f);
-
-        try self.data_validation_ranges.append(alloc, .{
-            .range = range_copy,
-            .kind_name = kind.toOoxml(),
-            .op_name = op.toOoxml(),
-            .formula1 = f1_copy,
-            .formula2 = f2_copy,
-        });
+        return self.state.addDataValidationRange(
+            self.parent.allocator,
+            range,
+            kind.toOoxml(),
+            op.toOoxml(),
+            formula1,
+            formula2,
+            op.needsSecondFormula(),
+        );
     }
 
     /// Attach a custom-formula data validation. `formula` is any
-    /// Excel formula that evaluates to TRUE for accepted cell
-    /// values (e.g. `LEN(A1)>3`, `AND(A1>0,A1<100)`). XML-special
-    /// characters in the formula are entity-escaped on emit.
-    /// Rejects empty formula with `error.InvalidDataValidation`.
+    /// Excel formula that evaluates to TRUE for accepted cell values.
+    /// B3 iter-wr-6: thin forwarder onto `sheet_plan.SheetState`.
     pub fn addDataValidationCustom(
         self: *SheetWriter,
         range: []const u8,
         formula: []const u8,
     ) !void {
-        try validateHyperlinkRange(range);
-        if (formula.len == 0) return error.InvalidDataValidation;
-
-        const alloc = self.parent.allocator;
-        const range_copy = try alloc.dupe(u8, range);
-        errdefer alloc.free(range_copy);
-        const f_copy = try alloc.dupe(u8, formula);
-        errdefer alloc.free(f_copy);
-
-        try self.data_validation_ranges.append(alloc, .{
-            .range = range_copy,
-            .kind_name = "custom",
-            .op_name = null,
-            .formula1 = f_copy,
-            .formula2 = null,
-        });
+        return self.state.addDataValidationCustom(self.parent.allocator, range, formula);
     }
 
     /// Attach a hyperlink to a cell or rectangular range. `range` is
-    /// A1-style — single cell ("A1") or span ("B2:C3"), same column/
-    /// row bounds as Excel (max XFD × 1 048 576). `url` is the
-    /// external target (http/https/mailto/file/…); it's xml-escaped
-    /// on emit, so `?q=1&x=2` style query strings are safe. Empty
-    /// URLs and malformed ranges are rejected. Caller-owned; both
-    /// args are duped.
+    /// A1-style; `url` is the external target (xml-escaped on emit).
+    /// B3 iter-wr-6: thin forwarder onto `sheet_plan.SheetState`.
     pub fn addHyperlink(self: *SheetWriter, range: []const u8, url: []const u8) !void {
-        try validateHyperlinkRange(range);
-        if (url.len == 0) return error.InvalidHyperlinkUrl;
-        const range_copy = try self.parent.allocator.dupe(u8, range);
-        errdefer self.parent.allocator.free(range_copy);
-        const url_copy = try self.parent.allocator.dupe(u8, url);
-        errdefer self.parent.allocator.free(url_copy);
-        try self.hyperlinks.append(self.parent.allocator, .{
-            .range = range_copy,
-            .url = url_copy,
-        });
+        return self.state.addHyperlink(self.parent.allocator, range, url);
     }
 
     /// Attach an internal hyperlink that jumps to another cell or
-    /// range within the same workbook. `location` is an OOXML
-    /// workbook-scoped reference like `Sheet2!A1`, `'My Sheet'!B2:C3`,
-    /// or a named range. Emitted as `<hyperlink ref="…" location="…"/>`
-    /// without an r:id — no `_rels` entry needed. `range` validation
-    /// matches `addHyperlink` (single-cell or rectangle A1-style);
-    /// empty `location` strings are rejected.
+    /// range within the same workbook. Emitted as
+    /// `<hyperlink ref="…" location="…"/>` without an `r:id`.
+    /// B3 iter-wr-6: thin forwarder onto `sheet_plan.SheetState`.
     pub fn addInternalHyperlink(self: *SheetWriter, range: []const u8, location: []const u8) !void {
-        try validateHyperlinkRange(range);
-        if (location.len == 0) return error.InvalidHyperlinkLocation;
-        const range_copy = try self.parent.allocator.dupe(u8, range);
-        errdefer self.parent.allocator.free(range_copy);
-        const loc_copy = try self.parent.allocator.dupe(u8, location);
-        errdefer self.parent.allocator.free(loc_copy);
-        try self.internal_hyperlinks.append(self.parent.allocator, .{
-            .range = range_copy,
-            .location = loc_copy,
-        });
+        return self.state.addInternalHyperlink(self.parent.allocator, range, location);
     }
 
-    /// Attach a cell comment (note) to `ref` (a single-cell A1 ref
-    /// — ranges are rejected because Excel comments target a single
-    /// cell). `author` is shown in Excel's comment thread header;
-    /// pass empty string for anonymous. `text` is the plain-text
-    /// body; XML-special chars are escaped on emit.
-    ///
-    /// Errors: `InvalidMergeRange` on malformed ref (reused because
-    /// the validator matches the same shape), `InvalidCommentRef`
-    /// when the ref parses as a range rather than a single cell.
+    /// Attach a cell comment (note) to a single-cell A1 ref.
+    /// B3 iter-wr-6: thin forwarder onto `sheet_plan.SheetState`.
     pub fn addComment(
         self: *SheetWriter,
         ref: []const u8,
         author: []const u8,
         text: []const u8,
     ) !void {
-        // Reuse the merge-range validator — ref must be a valid A1
-        // single cell (no colon, no whitespace).
-        if (ref.len == 0) return error.InvalidCommentRef;
-        if (std.mem.indexOfScalar(u8, ref, ':') != null) return error.InvalidCommentRef;
-        try validateHyperlinkRange(ref);
-
-        const ref_copy = try self.parent.allocator.dupe(u8, ref);
-        errdefer self.parent.allocator.free(ref_copy);
-        const author_copy = try self.parent.allocator.dupe(u8, author);
-        errdefer self.parent.allocator.free(author_copy);
-        const text_copy = try self.parent.allocator.dupe(u8, text);
-        errdefer self.parent.allocator.free(text_copy);
-        try self.comments.append(self.parent.allocator, .{
-            .ref = ref_copy,
-            .author = author_copy,
-            .text = text_copy,
-        });
+        return self.state.addComment(self.parent.allocator, ref, author, text);
     }
 
     /// Attach a `cellIs`-type conditional-format rule. `range` is
@@ -1392,6 +1182,9 @@ pub const SheetWriter = struct {
     /// Returns `InvalidDataValidation` on empty formula / two-formula
     /// mismatch, `InvalidHyperlinkRange` on bad range, `UnknownDxfId`
     /// on out-of-range dxf.
+    /// Attach a `cellIs`-type conditional-format rule. B3 iter-wr-6:
+    /// forwards onto `sheet_plan.SheetState`; the `dxf_id` bounds
+    /// check threads through the parent's `styles_plan.dxfs` count.
     pub fn addConditionalFormatCellIs(
         self: *SheetWriter,
         range: []const u8,
@@ -1400,75 +1193,37 @@ pub const SheetWriter = struct {
         formula2: ?[]const u8,
         dxf_id: u32,
     ) !void {
-        try validateHyperlinkRange(range);
-        if (formula1.len == 0) return error.InvalidDataValidation;
-        const needs_two = operator.needsSecondFormula();
-        if (needs_two and (formula2 == null or formula2.?.len == 0)) {
-            return error.InvalidDataValidation;
-        }
-        if (!needs_two and formula2 != null) return error.InvalidDataValidation;
-        if (dxf_id >= self.parent.styles_plan.dxfs.items.len) return error.UnknownDxfId;
-
-        const range_copy = try self.parent.allocator.dupe(u8, range);
-        errdefer self.parent.allocator.free(range_copy);
-        const f1_copy = try self.parent.allocator.dupe(u8, formula1);
-        errdefer self.parent.allocator.free(f1_copy);
-        const f2_copy: ?[]u8 = if (formula2) |f|
-            try self.parent.allocator.dupe(u8, f)
-        else
-            null;
-        errdefer if (f2_copy) |f| self.parent.allocator.free(f);
-
-        try self.conditional_formats.append(self.parent.allocator, .{
-            .range = range_copy,
-            .rule = .{ .cell_is = .{
-                .operator = operator,
-                .formula1 = f1_copy,
-                .formula2 = f2_copy,
-                .dxf_id = dxf_id,
-            } },
-        });
+        return self.state.addConditionalFormatCellIs(
+            self.parent.allocator,
+            range,
+            projectCfOperator(operator),
+            formula1,
+            formula2,
+            dxf_id,
+            self.parent.styles_plan.dxfs.items.len,
+        );
     }
 
-    /// Attach an `expression`-type conditional-format rule — the
-    /// generic escape hatch for rules that aren't plain cell-vs-value
-    /// comparisons (e.g. `MOD(ROW(),2)=0` for zebra stripes,
-    /// `A2>$A$1` for row-vs-other-cell). Returns `InvalidDataValidation`
-    /// on empty formula, `InvalidHyperlinkRange` on bad range,
-    /// `UnknownDxfId` on out-of-range dxf.
+    /// Attach an `expression`-type conditional-format rule.
+    /// B3 iter-wr-6: thin forwarder onto `sheet_plan.SheetState`.
     pub fn addConditionalFormatExpression(
         self: *SheetWriter,
         range: []const u8,
         formula: []const u8,
         dxf_id: u32,
     ) !void {
-        try validateHyperlinkRange(range);
-        if (formula.len == 0) return error.InvalidDataValidation;
-        if (dxf_id >= self.parent.styles_plan.dxfs.items.len) return error.UnknownDxfId;
-
-        const range_copy = try self.parent.allocator.dupe(u8, range);
-        errdefer self.parent.allocator.free(range_copy);
-        const f_copy = try self.parent.allocator.dupe(u8, formula);
-        errdefer self.parent.allocator.free(f_copy);
-
-        try self.conditional_formats.append(self.parent.allocator, .{
-            .range = range_copy,
-            .rule = .{ .expression = .{
-                .formula = f_copy,
-                .dxf_id = dxf_id,
-            } },
-        });
+        return self.state.addConditionalFormatExpression(
+            self.parent.allocator,
+            range,
+            formula,
+            dxf_id,
+            self.parent.styles_plan.dxfs.items.len,
+        );
     }
 
-    /// Attach a color-scale conditional format: gradient background
-    /// from `low_color_argb` (at the range's minimum value) through
-    /// `mid_color_argb` (50th percentile, when non-null) to
-    /// `high_color_argb` (maximum value). A null mid produces a
-    /// two-stop gradient instead of three.
-    ///
-    /// Excel renders this as a heatmap — common for quickly spotting
-    /// outliers in a data column. Returns `InvalidHyperlinkRange` on
-    /// bad range.
+    /// Attach a color-scale conditional format. Null `mid_color_argb`
+    /// produces a 2-stop gradient; non-null gives 3-stop.
+    /// B3 iter-wr-6: thin forwarder onto `sheet_plan.SheetState`.
     pub fn addConditionalFormatColorScale(
         self: *SheetWriter,
         range: []const u8,
@@ -1476,38 +1231,27 @@ pub const SheetWriter = struct {
         mid_color_argb: ?u32,
         high_color_argb: u32,
     ) !void {
-        try validateHyperlinkRange(range);
-        const range_copy = try self.parent.allocator.dupe(u8, range);
-        errdefer self.parent.allocator.free(range_copy);
-        try self.conditional_formats.append(self.parent.allocator, .{
-            .range = range_copy,
-            .rule = .{ .color_scale = .{
-                .low_color_argb = low_color_argb,
-                .mid_color_argb = mid_color_argb,
-                .high_color_argb = high_color_argb,
-            } },
-        });
+        return self.state.addConditionalFormatColorScale(
+            self.parent.allocator,
+            range,
+            low_color_argb,
+            mid_color_argb,
+            high_color_argb,
+        );
     }
 
-    /// Attach a data-bar conditional format: an in-cell horizontal
-    /// bar chart where each cell's bar length is proportional to
-    /// its value relative to the range's min/max. `color_argb` is
-    /// the bar fill — Excel's default is `0xFF638EC6` (a muted
-    /// blue) but any ARGB works.
+    /// Attach a data-bar conditional format.
+    /// B3 iter-wr-6: thin forwarder onto `sheet_plan.SheetState`.
     pub fn addConditionalFormatDataBar(
         self: *SheetWriter,
         range: []const u8,
         color_argb: u32,
     ) !void {
-        try validateHyperlinkRange(range);
-        const range_copy = try self.parent.allocator.dupe(u8, range);
-        errdefer self.parent.allocator.free(range_copy);
-        try self.conditional_formats.append(self.parent.allocator, .{
-            .range = range_copy,
-            .rule = .{ .data_bar = .{
-                .color_argb = color_argb,
-            } },
-        });
+        return self.state.addConditionalFormatDataBar(
+            self.parent.allocator,
+            range,
+            color_argb,
+        );
     }
 
     /// Write a row of cells. Empty cells are omitted from the output
@@ -1590,7 +1334,7 @@ pub const SheetWriter = struct {
         };
 
         const alloc = self.parent.allocator;
-        if (self.row_heights.get(self.next_row - 1)) |h| {
+        if (self.state.row_heights.get(self.next_row - 1)) |h| {
             try self.body.print(alloc, "<row r=\"{d}\" ht=\"{d}\" customHeight=\"1\">", .{ self.next_row, h });
         } else {
             try self.body.print(alloc, "<row r=\"{d}\">", .{self.next_row});
@@ -1667,7 +1411,7 @@ pub const SheetWriter = struct {
         const alloc = self.parent.allocator;
         // Row index is 0-based inside the height map; next_row is
         // 1-based per xlsx convention, so subtract 1 on lookup.
-        if (self.row_heights.get(self.next_row - 1)) |h| {
+        if (self.state.row_heights.get(self.next_row - 1)) |h| {
             try self.body.print(alloc, "<row r=\"{d}\" ht=\"{d}\" customHeight=\"1\">", .{ self.next_row, h });
         } else {
             try self.body.print(alloc, "<row r=\"{d}\">", .{self.next_row});

@@ -58,6 +58,14 @@ pub const Error = error{
     InvalidAutoFilterRange,
     InvalidHyperlinkRange,
     InvalidXmlByte,
+    // SheetState registration errors (B3 iter-wr-6).
+    InvalidColumnWidth,
+    InvalidRowHeight,
+    InvalidHyperlinkUrl,
+    InvalidHyperlinkLocation,
+    InvalidCommentRef,
+    InvalidDataValidation,
+    UnknownDxfId,
 };
 
 // ─── State types — identical shape to `xlsx.Writer.SheetWriter` ──────
@@ -168,6 +176,523 @@ pub const DataValidationRange = struct {
     formula1: []const u8,
     /// Required iff `op_name` is "between" or "notBetween".
     formula2: ?[]const u8,
+};
+
+// ─── SheetState — shared per-sheet registry ──────────────────────────
+
+/// Heap-owned versions of the const-slice registry entries above.
+/// `SheetState` keeps these so the registration helpers can validate +
+/// dupe + append without juggling an external arena. The matching
+/// const-slice variants on `SheetEmitInputs` accept the same shape via
+/// `@ptrCast`-free implicit-coercion at the slice level.
+const HyperlinkOwned = struct { range: []u8, url: []u8 };
+const InternalHyperlinkOwned = struct { range: []u8, location: []u8 };
+const CommentOwned = struct { ref: []u8, author: []u8, text: []u8 };
+const ConditionalFormatOwned = struct {
+    range: []u8,
+    rule: ConditionalFormatRuleOwned,
+};
+const ConditionalFormatRuleOwned = union(enum) {
+    cell_is: struct {
+        operator: CfOperator,
+        formula1: []u8,
+        formula2: ?[]u8,
+        dxf_id: u32,
+    },
+    expression: struct {
+        formula: []u8,
+        dxf_id: u32,
+    },
+    color_scale: struct {
+        low_color_argb: u32,
+        mid_color_argb: ?u32,
+        high_color_argb: u32,
+    },
+    data_bar: struct {
+        color_argb: u32,
+    },
+};
+const DataValidationListOwned = struct {
+    range: []u8,
+    values: [][]u8,
+};
+const DataValidationRangeOwned = struct {
+    range: []u8,
+    kind_name: []const u8,
+    op_name: ?[]const u8,
+    formula1: []u8,
+    formula2: ?[]u8,
+};
+
+/// Shared per-sheet registry. Both `Writer.SheetWriter` (B3 iter-wr-6)
+/// and the future Workbook fresh-emit path (B3 iter-wr-7) hold one of
+/// these — registration logic + heap ownership + destruction live in
+/// exactly one place. The const-slice projection methods produce the
+/// `SheetEmitInputs` views consumed by `emitWorksheetXml`.
+///
+/// All `add*` / `set*` methods take an explicit `Allocator` rather
+/// than capture one at construction time so the same state can be
+/// driven from multiple call sites without re-binding.
+pub const SheetState = struct {
+    column_widths: std.ArrayListUnmanaged(ColumnWidth) = .empty,
+    /// Row-height overrides keyed by 0-based row index.
+    row_heights: std.AutoHashMapUnmanaged(u32, f32) = .empty,
+    freeze_rows: u32 = 0,
+    freeze_cols: u32 = 0,
+    /// Auto-filter range (e.g., "A1:E1"). null = no filter. Owned.
+    auto_filter_range: ?[]u8 = null,
+    /// Merged cell ranges (e.g., "A1:B2"). Each entry owned.
+    merged_cells: std.ArrayListUnmanaged([]u8) = .empty,
+    hyperlinks: std.ArrayListUnmanaged(HyperlinkOwned) = .empty,
+    internal_hyperlinks: std.ArrayListUnmanaged(InternalHyperlinkOwned) = .empty,
+    comments: std.ArrayListUnmanaged(CommentOwned) = .empty,
+    conditional_formats: std.ArrayListUnmanaged(ConditionalFormatOwned) = .empty,
+    data_validations: std.ArrayListUnmanaged(DataValidationListOwned) = .empty,
+    data_validation_ranges: std.ArrayListUnmanaged(DataValidationRangeOwned) = .empty,
+
+    pub fn deinit(self: *SheetState, allocator: Allocator) void {
+        self.column_widths.deinit(allocator);
+        self.row_heights.deinit(allocator);
+        if (self.auto_filter_range) |r| allocator.free(r);
+        for (self.merged_cells.items) |r| allocator.free(r);
+        self.merged_cells.deinit(allocator);
+        for (self.hyperlinks.items) |h| {
+            allocator.free(h.range);
+            allocator.free(h.url);
+        }
+        self.hyperlinks.deinit(allocator);
+        for (self.internal_hyperlinks.items) |h| {
+            allocator.free(h.range);
+            allocator.free(h.location);
+        }
+        self.internal_hyperlinks.deinit(allocator);
+        for (self.comments.items) |c| {
+            allocator.free(c.ref);
+            allocator.free(c.author);
+            allocator.free(c.text);
+        }
+        self.comments.deinit(allocator);
+        for (self.conditional_formats.items) |cf| {
+            allocator.free(cf.range);
+            switch (cf.rule) {
+                .cell_is => |r| {
+                    allocator.free(r.formula1);
+                    if (r.formula2) |f| allocator.free(f);
+                },
+                .expression => |r| allocator.free(r.formula),
+                .color_scale, .data_bar => {},
+            }
+        }
+        self.conditional_formats.deinit(allocator);
+        for (self.data_validations.items) |dv| {
+            allocator.free(dv.range);
+            for (dv.values) |v| allocator.free(v);
+            allocator.free(dv.values);
+        }
+        self.data_validations.deinit(allocator);
+        for (self.data_validation_ranges.items) |dv| {
+            allocator.free(dv.range);
+            allocator.free(dv.formula1);
+            if (dv.formula2) |f| allocator.free(f);
+        }
+        self.data_validation_ranges.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub const SetColumnWidthError = error{
+        OutOfMemory,
+        InvalidColumnWidth,
+        ColumnOutOfRange,
+    };
+
+    /// Register a column-width override. `col_idx` is 0-based.
+    /// Multiple calls on the same column append; the last wins on
+    /// emit (Excel applies later overlapping `<col>` entries).
+    pub fn setColumnWidth(
+        self: *SheetState,
+        allocator: Allocator,
+        col_idx: u32,
+        width: f32,
+    ) Error!void {
+        if (!std.math.isFinite(width) or width <= 0) return error.InvalidColumnWidth;
+        if (col_idx >= EXCEL_MAX_COL) return error.ColumnOutOfRange;
+        const col_1based = col_idx + 1;
+        try self.column_widths.append(allocator, .{
+            .col_min = col_1based,
+            .col_max = col_1based,
+            .width = width,
+        });
+    }
+
+    pub const SetRowHeightError = error{
+        OutOfMemory,
+        InvalidRowHeight,
+        RowOutOfRange,
+    };
+
+    /// Set `row_idx`'s height in Excel point units (default 15).
+    /// 0-based; later calls on the same row override earlier ones
+    /// until the row is emitted (after which they're silently
+    /// ignored — there's no retroactive XML rewrite).
+    pub fn setRowHeight(
+        self: *SheetState,
+        allocator: Allocator,
+        row_idx: u32,
+        height: f32,
+    ) Error!void {
+        // Excel rejects rows above 409.5 points (the UI cap).
+        if (!std.math.isFinite(height) or height <= 0 or height > 409.5) {
+            return error.InvalidRowHeight;
+        }
+        if (row_idx >= EXCEL_MAX_ROW) return error.RowOutOfRange;
+        try self.row_heights.put(allocator, row_idx, height);
+    }
+
+    pub const FreezePanesError = error{ RowOutOfRange, ColumnOutOfRange };
+
+    /// Freeze the top `rows` and left `cols`. Pass 0 to disable
+    /// either axis. Calling again overrides. Narrow error set
+    /// pinned because `xlsx.Writer.SheetWriter.freezePanes`
+    /// exposes the same explicit set as part of the one-minor
+    /// API freeze.
+    pub fn freezePanes(
+        self: *SheetState,
+        rows: u32,
+        cols: u32,
+    ) FreezePanesError!void {
+        if (rows >= EXCEL_MAX_ROW) return error.RowOutOfRange;
+        if (cols >= EXCEL_MAX_COL) return error.ColumnOutOfRange;
+        self.freeze_rows = rows;
+        self.freeze_cols = cols;
+    }
+
+    pub const SetAutoFilterError = error{ OutOfMemory, InvalidAutoFilterRange };
+
+    pub fn setAutoFilter(
+        self: *SheetState,
+        allocator: Allocator,
+        range: []const u8,
+    ) Error!void {
+        try validateAutoFilterRange(range);
+        if (self.auto_filter_range) |old| allocator.free(old);
+        self.auto_filter_range = try allocator.dupe(u8, range);
+    }
+
+    pub const AddMergedCellError = error{ OutOfMemory, InvalidMergeRange };
+
+    pub fn addMergedCell(
+        self: *SheetState,
+        allocator: Allocator,
+        range: []const u8,
+    ) Error!void {
+        try validateMergeRange(range);
+        const copy = try allocator.dupe(u8, range);
+        errdefer allocator.free(copy);
+        try self.merged_cells.append(allocator, copy);
+    }
+
+    pub const AddHyperlinkError = error{
+        OutOfMemory,
+        InvalidHyperlinkRange,
+        InvalidHyperlinkUrl,
+    };
+
+    pub fn addHyperlink(
+        self: *SheetState,
+        allocator: Allocator,
+        range: []const u8,
+        url: []const u8,
+    ) Error!void {
+        try validateHyperlinkRange(range);
+        if (url.len == 0) return error.InvalidHyperlinkUrl;
+        const range_copy = try allocator.dupe(u8, range);
+        errdefer allocator.free(range_copy);
+        const url_copy = try allocator.dupe(u8, url);
+        errdefer allocator.free(url_copy);
+        try self.hyperlinks.append(allocator, .{
+            .range = range_copy,
+            .url = url_copy,
+        });
+    }
+
+    pub const AddInternalHyperlinkError = error{
+        OutOfMemory,
+        InvalidHyperlinkRange,
+        InvalidHyperlinkLocation,
+    };
+
+    pub fn addInternalHyperlink(
+        self: *SheetState,
+        allocator: Allocator,
+        range: []const u8,
+        location: []const u8,
+    ) Error!void {
+        try validateHyperlinkRange(range);
+        if (location.len == 0) return error.InvalidHyperlinkLocation;
+        const range_copy = try allocator.dupe(u8, range);
+        errdefer allocator.free(range_copy);
+        const loc_copy = try allocator.dupe(u8, location);
+        errdefer allocator.free(loc_copy);
+        try self.internal_hyperlinks.append(allocator, .{
+            .range = range_copy,
+            .location = loc_copy,
+        });
+    }
+
+    pub const AddCommentError = error{
+        OutOfMemory,
+        InvalidCommentRef,
+        InvalidHyperlinkRange,
+    };
+
+    /// Attach a cell comment (note) to a single-cell A1 ref.
+    /// Range refs ("A1:B2") are rejected with `InvalidCommentRef`.
+    pub fn addComment(
+        self: *SheetState,
+        allocator: Allocator,
+        ref: []const u8,
+        author: []const u8,
+        text: []const u8,
+    ) Error!void {
+        if (ref.len == 0) return error.InvalidCommentRef;
+        if (std.mem.indexOfScalar(u8, ref, ':') != null) return error.InvalidCommentRef;
+        try validateHyperlinkRange(ref);
+        const ref_copy = try allocator.dupe(u8, ref);
+        errdefer allocator.free(ref_copy);
+        const author_copy = try allocator.dupe(u8, author);
+        errdefer allocator.free(author_copy);
+        const text_copy = try allocator.dupe(u8, text);
+        errdefer allocator.free(text_copy);
+        try self.comments.append(allocator, .{
+            .ref = ref_copy,
+            .author = author_copy,
+            .text = text_copy,
+        });
+    }
+
+    pub const AddDataValidationListError = error{
+        OutOfMemory,
+        InvalidHyperlinkRange,
+        InvalidDataValidation,
+    };
+
+    pub fn addDataValidationList(
+        self: *SheetState,
+        allocator: Allocator,
+        range: []const u8,
+        values: []const []const u8,
+    ) Error!void {
+        try validateHyperlinkRange(range);
+        if (values.len == 0) return error.InvalidDataValidation;
+        for (values) |v| {
+            if (v.len == 0) return error.InvalidDataValidation;
+            // Comma breaks Excel's list format; bare `"` breaks the
+            // outer quoting. XML-special chars escape on emit.
+            if (std.mem.indexOfScalar(u8, v, ',') != null) return error.InvalidDataValidation;
+            if (std.mem.indexOfScalar(u8, v, '"') != null) return error.InvalidDataValidation;
+        }
+
+        const range_copy = try allocator.dupe(u8, range);
+        errdefer allocator.free(range_copy);
+
+        const values_copy = try allocator.alloc([]u8, values.len);
+        errdefer allocator.free(values_copy);
+        var copied: usize = 0;
+        errdefer for (values_copy[0..copied]) |v| allocator.free(v);
+        for (values, 0..) |v, i| {
+            values_copy[i] = try allocator.dupe(u8, v);
+            copied = i + 1;
+        }
+
+        try self.data_validations.append(allocator, .{
+            .range = range_copy,
+            .values = values_copy,
+        });
+    }
+
+    pub const AddDataValidationRangeError = error{
+        OutOfMemory,
+        InvalidHyperlinkRange,
+        InvalidDataValidation,
+    };
+
+    /// Generic numeric / date / time / text-length / custom range
+    /// validation. `kind_name` and `op_name` must be the exact OOXML
+    /// tokens (e.g., "whole", "between") — the writer- and
+    /// workbook-facing wrappers translate enum inputs upstream.
+    pub fn addDataValidationRange(
+        self: *SheetState,
+        allocator: Allocator,
+        range: []const u8,
+        kind_name: []const u8,
+        op_name: ?[]const u8,
+        formula1: []const u8,
+        formula2: ?[]const u8,
+        needs_two: bool,
+    ) Error!void {
+        try validateHyperlinkRange(range);
+        if (formula1.len == 0) return error.InvalidDataValidation;
+        if (needs_two and (formula2 == null or formula2.?.len == 0)) {
+            return error.InvalidDataValidation;
+        }
+        if (!needs_two and formula2 != null) return error.InvalidDataValidation;
+
+        const range_copy = try allocator.dupe(u8, range);
+        errdefer allocator.free(range_copy);
+        const f1_copy = try allocator.dupe(u8, formula1);
+        errdefer allocator.free(f1_copy);
+        const f2_copy: ?[]u8 = if (formula2) |f| try allocator.dupe(u8, f) else null;
+        errdefer if (f2_copy) |f| allocator.free(f);
+
+        try self.data_validation_ranges.append(allocator, .{
+            .range = range_copy,
+            .kind_name = kind_name,
+            .op_name = op_name,
+            .formula1 = f1_copy,
+            .formula2 = f2_copy,
+        });
+    }
+
+    /// Custom-formula data validation. `formula` is any Excel formula
+    /// returning TRUE for accepted cell values. Empty formula
+    /// rejects with `InvalidDataValidation`.
+    pub fn addDataValidationCustom(
+        self: *SheetState,
+        allocator: Allocator,
+        range: []const u8,
+        formula: []const u8,
+    ) Error!void {
+        try validateHyperlinkRange(range);
+        if (formula.len == 0) return error.InvalidDataValidation;
+
+        const range_copy = try allocator.dupe(u8, range);
+        errdefer allocator.free(range_copy);
+        const f_copy = try allocator.dupe(u8, formula);
+        errdefer allocator.free(f_copy);
+
+        try self.data_validation_ranges.append(allocator, .{
+            .range = range_copy,
+            .kind_name = "custom",
+            .op_name = null,
+            .formula1 = f_copy,
+            .formula2 = null,
+        });
+    }
+
+    pub const AddConditionalFormatError = error{
+        OutOfMemory,
+        InvalidHyperlinkRange,
+        InvalidDataValidation,
+        UnknownDxfId,
+    };
+
+    /// `cellIs`-type rule. `dxf_count` is the upper bound on
+    /// `dxf_id` (i.e., the parent's registered dxf count); the
+    /// caller threads its dxf table through here so SheetState
+    /// stays orthogonal to the styles substrate.
+    pub fn addConditionalFormatCellIs(
+        self: *SheetState,
+        allocator: Allocator,
+        range: []const u8,
+        operator: CfOperator,
+        formula1: []const u8,
+        formula2: ?[]const u8,
+        dxf_id: u32,
+        dxf_count: usize,
+    ) Error!void {
+        try validateHyperlinkRange(range);
+        if (formula1.len == 0) return error.InvalidDataValidation;
+        const needs_two = operator.needsSecondFormula();
+        if (needs_two and (formula2 == null or formula2.?.len == 0)) {
+            return error.InvalidDataValidation;
+        }
+        if (!needs_two and formula2 != null) return error.InvalidDataValidation;
+        if (dxf_id >= dxf_count) return error.UnknownDxfId;
+
+        const range_copy = try allocator.dupe(u8, range);
+        errdefer allocator.free(range_copy);
+        const f1_copy = try allocator.dupe(u8, formula1);
+        errdefer allocator.free(f1_copy);
+        const f2_copy: ?[]u8 = if (formula2) |f| try allocator.dupe(u8, f) else null;
+        errdefer if (f2_copy) |f| allocator.free(f);
+
+        try self.conditional_formats.append(allocator, .{
+            .range = range_copy,
+            .rule = .{ .cell_is = .{
+                .operator = operator,
+                .formula1 = f1_copy,
+                .formula2 = f2_copy,
+                .dxf_id = dxf_id,
+            } },
+        });
+    }
+
+    /// `expression`-type rule (generic formula).
+    pub fn addConditionalFormatExpression(
+        self: *SheetState,
+        allocator: Allocator,
+        range: []const u8,
+        formula: []const u8,
+        dxf_id: u32,
+        dxf_count: usize,
+    ) Error!void {
+        try validateHyperlinkRange(range);
+        if (formula.len == 0) return error.InvalidDataValidation;
+        if (dxf_id >= dxf_count) return error.UnknownDxfId;
+
+        const range_copy = try allocator.dupe(u8, range);
+        errdefer allocator.free(range_copy);
+        const f_copy = try allocator.dupe(u8, formula);
+        errdefer allocator.free(f_copy);
+
+        try self.conditional_formats.append(allocator, .{
+            .range = range_copy,
+            .rule = .{ .expression = .{
+                .formula = f_copy,
+                .dxf_id = dxf_id,
+            } },
+        });
+    }
+
+    /// 2- or 3-stop color-scale rule. Null `mid_color_argb` ⇒ 2-stop.
+    pub fn addConditionalFormatColorScale(
+        self: *SheetState,
+        allocator: Allocator,
+        range: []const u8,
+        low_color_argb: u32,
+        mid_color_argb: ?u32,
+        high_color_argb: u32,
+    ) Error!void {
+        try validateHyperlinkRange(range);
+        const range_copy = try allocator.dupe(u8, range);
+        errdefer allocator.free(range_copy);
+        try self.conditional_formats.append(allocator, .{
+            .range = range_copy,
+            .rule = .{ .color_scale = .{
+                .low_color_argb = low_color_argb,
+                .mid_color_argb = mid_color_argb,
+                .high_color_argb = high_color_argb,
+            } },
+        });
+    }
+
+    /// In-cell horizontal data-bar rule.
+    pub fn addConditionalFormatDataBar(
+        self: *SheetState,
+        allocator: Allocator,
+        range: []const u8,
+        color_argb: u32,
+    ) Error!void {
+        try validateHyperlinkRange(range);
+        const range_copy = try allocator.dupe(u8, range);
+        errdefer allocator.free(range_copy);
+        try self.conditional_formats.append(allocator, .{
+            .range = range_copy,
+            .rule = .{ .data_bar = .{
+                .color_argb = color_argb,
+            } },
+        });
+    }
 };
 
 /// All inputs for a per-sheet `xl/worksheets/sheetN.xml` emit.
