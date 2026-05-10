@@ -12,14 +12,24 @@
 > must preserve, and the proposed iter-wr-1..7 sequencing. Companion
 > to `editor-rebase.md`. No code is touched in wr-0.
 
-## Status (as of 2026-05-09)
+## Status (as of 2026-05-10)
 
 - B0 PartStore — ✅ shipped
 - B1 Workbook typed overlay — ✅ shipped
 - B2 Editor rebase — ✅ closed; `Editor.save` is a 14-line shim, `pkg/editor.zig` shrank 6021 → 3231 LOC (-46%)
-- **B3 Writer rebase — ⏳ in flight (this doc = wr-0)**
-  - wr-0 inventory pass — 🚧 (this PR)
-  - wr-1..7 — ⏳ pending
+- **B3 Writer rebase — 🚧 in flight, 5/7 iters shipped**
+  - wr-0 inventory ✅ #91 (this doc)
+  - wr-1 SST ✅ #94 — `pkg/sst_plan.zig` (309 LOC, std-only)
+  - wr-2 Styles ✅ #95 — `pkg/styles_plan.zig` (842 LOC; most byte-fragile axis — pinned by a byte-equivalence parity test that locks every §1.10 invariant)
+  - wr-3 workbook.xml ✅ #97 — `pkg/workbook_xml_plan.zig` (472 LOC) + `Workbook.addDefinedName` with full Excel name-rule validation
+  - wr-5 ZIP ✅ #96 — `pkg/zip.zig` (354 LOC, std-only; takes a `DeflateFn` callback to avoid the `writer → pkg → workbook → writer` module-graph cycle)
+  - wr-4 sheet emit 🚧 PR #98 — `pkg/sheet_plan.zig` (962 LOC); 7 byte-equivalence parity tests + 24 standalone tests; bench 6.5 ms = 1.00× of 6.7 ms baseline. Scoped to **emit-substrate move only**; the 13 `Worksheet.add*` / `set*` methods migrate in wr-6.
+  - wr-6 thin shim + helper dedup + Worksheet `add*`/`set*` API — ⏳ pending
+  - wr-7 corpus parity sweep + bench gate — ⏳ pending
+
+3 B3 prep PRs landed alongside the iters: #92 `PartStore.fresh()`, #93 `Workbook.empty()` + `SstExtensionPlan` rich-string axis, #90 docs flip B2 to ✅.
+
+**Architectural pattern locked in**: each Writer subsystem extracts into a std-only `pkg/<subsystem>_plan.zig` module that Writer + Workbook both consume. `src/writer.zig`: 6579 → 5947 LOC (-632, -10%) so far.
 
 ## Problem
 
