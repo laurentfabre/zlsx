@@ -123,6 +123,7 @@ wraparound).
 | **Fix: writer.zig Huffman u15 → u13 freq scale** | ✅ shipped (PR #70 — `lit_enc.generate(&lit_freq, 15)` crashed inside `std.compress.flate.HuffmanEncoder.bitCounts` on `<sheetData>` payloads ≥ ~10k repetitive numeric rows; tightening `scaleFreqs` cap to u13 gives the level walker enough numerical headroom to converge; output is still valid DEFLATE; 50_000×5 round-trip regression test) |
 | **D1** Formula evaluator | deferred indefinitely |
 | **D2** Typed chart emit | deferred |
+| **Refusal lift: frozen panes** | ✅ shipped 2026-05-11 — `pkg/sheet_edit.zig` shifts `xSplit`/`ySplit` + `topLeftCell` for `state="frozen"` / `state="frozenSplit"` panes during the row/col byte transform; editor refusal guards dropped the `<pane>` scan; `state="split"` (pixel offsets) surfaces `error.SplitPaneNotSupported`. 11 pure-function tests on the byte transform + 4 Editor round-trip tests pin the lift. Remaining refused axes (per `docs/plans/refusal-audit.md`): drawings/pictures (anchor rewriter not yet wired), pivots/tableParts/autoFilter (cross-part ref graph, stays). |
 
 Public surface added by this batch:
 - New module `zlsx_pkg` (root: `src/package/root.zig`) re-exports

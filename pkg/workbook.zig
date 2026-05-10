@@ -209,6 +209,20 @@ pub const Error = error{
     /// `Workbook.insertColumn` refused because shifting an
     /// existing column would push it past Excel's XFD-column cap.
     ColEditExceedsMaxCol,
+    /// `Workbook.{insertRow, deleteRow, insertColumn, deleteColumn}`
+    /// refused because the sheet carries a `<pane>` with
+    /// `state="split"` (or missing `state`, which OOXML defaults to
+    /// "split"). Pixel-coordinate splits can't be meaningfully
+    /// shifted by row/col edits; only `state="frozen"` /
+    /// `state="frozenSplit"` panes are rewritten. Surfaces from
+    /// `pkg/sheet_edit.zig`.
+    SplitPaneNotSupported,
+    /// `Workbook.{insertRow, deleteRow, insertColumn, deleteColumn}`
+    /// found a `<pane>` element whose `xSplit`, `ySplit`, or
+    /// `topLeftCell` attribute couldn't be parsed (non-integer
+    /// split, malformed A1 ref). Refused rather than silently
+    /// dropping the pane element. Surfaces from `pkg/sheet_edit.zig`.
+    MalformedPaneSplit,
     /// `Workbook.addSheet` refused because the workbook already
     /// holds the type-system maximum (`std.math.maxInt(u32)`)
     /// number of sheets. Excel imposes no documented sheet count
