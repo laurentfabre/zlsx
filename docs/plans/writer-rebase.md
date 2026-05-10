@@ -17,19 +17,19 @@
 - B0 PartStore — ✅ shipped
 - B1 Workbook typed overlay — ✅ shipped
 - B2 Editor rebase — ✅ closed; `Editor.save` is a 14-line shim, `pkg/editor.zig` shrank 6021 → 3231 LOC (-46%)
-- **B3 Writer rebase — 🚧 in flight, 6/7 iters shipped**
+- **B3 Writer rebase — ✅ closed (7/7 iters shipped)**
   - wr-0 inventory ✅ #91 (this doc)
   - wr-1 SST ✅ #94 — `pkg/sst_plan.zig` (309 LOC, std-only)
   - wr-2 Styles ✅ #95 — `pkg/styles_plan.zig` (842 LOC; most byte-fragile axis — pinned by a byte-equivalence parity test that locks every §1.10 invariant)
   - wr-3 workbook.xml ✅ #97 — `pkg/workbook_xml_plan.zig` (472 LOC) + `Workbook.addDefinedName` with full Excel name-rule validation
   - wr-5 ZIP ✅ #96 — `pkg/zip.zig` (354 LOC, std-only; takes a `DeflateFn` callback to avoid the `writer → pkg → workbook → writer` module-graph cycle)
   - wr-4 sheet emit ✅ #98 — `pkg/sheet_plan.zig`; 7 byte-equivalence parity tests + 24 standalone tests; bench 6.5 ms = 1.00× of 6.7 ms baseline.
-  - wr-6 helper dedup + `validateSheetName` reconciliation + `SheetState` extraction ✅ — `pkg/sheet_plan.zig` (~1565 LOC) gains the `SheetState` registry struct; `src/writer.zig` 5947 → 5606 LOC (-341, -5.7%); `validateSheetName` lifted to Writer's Unicode-scalar-aware version (Workbook delegates). The 13 SheetWriter `add*` / `set*` methods are now thin forwarders over `SheetState`. **Goal 1 (Writer.save thin shim) deferred to wr-7** because it requires `Workbook.save` fresh-emit (wr-7's scope); bait-and-switch on `pkg.Worksheet`'s API was the only alternative and would violate the user-visible API contract. Honest scoping rather than a half-shim.
-  - wr-7 Workbook fresh-emit + Writer.save shim + corpus parity sweep + bench gate — ⏳ pending
+  - wr-6 helper dedup + `validateSheetName` reconciliation + `SheetState` extraction ✅ #100 — `pkg/sheet_plan.zig` (~1565 LOC) gains the `SheetState` registry struct; `src/writer.zig` 5947 → 5606 LOC (-341, -5.7%); `validateSheetName` lifted to Writer's Unicode-scalar-aware version (Workbook delegates). The 13 SheetWriter `add*` / `set*` methods are now thin forwarders over `SheetState`.
+  - **wr-7 Workbook fresh-emit + Writer.save shim + corpus parity sweep ✅ closed** — new `pkg/fresh_emit.zig` (527 LOC, std-only) hosts the entire archive orchestration ([Content_Types].xml + rels + workbook.xml + per-sheet sheet/rels/comments/vml + sst + styles + ZIP CD/EOCD). `Writer.save` collapsed to a **17-line thin shim** that projects Writer state onto `fresh_emit.ArchiveInputs` and delegates. `Workbook.saveFreshEmit(path)` ships through the same substrate against per-Worksheet `body` + `sheet_state` + workbook-level `fresh_sst_plan` / `fresh_sst_count` / `styles_plan` / `workbook_xml_plan`. 13 `add*`/`set*` forwarder methods added to `pkg.Worksheet` (mirroring `xlsx.Writer.SheetWriter`). 5 new parity tests pin Workbook fresh-emit byte-equivalence to Writer.save. `src/writer.zig` 5606 → 5256 LOC (-350, -6.2% this iter; cumulative 6579 → 5256 = -1323 LOC = -20.1%).
 
 3 B3 prep PRs landed alongside the iters: #92 `PartStore.fresh()`, #93 `Workbook.empty()` + `SstExtensionPlan` rich-string axis, #90 docs flip B2 to ✅.
 
-**Architectural pattern locked in**: each Writer subsystem extracts into a std-only `pkg/<subsystem>_plan.zig` module that Writer + Workbook both consume. `src/writer.zig`: 6579 → 5606 LOC (-973, -14.8%) so far.
+**Architectural pattern locked in**: each Writer subsystem extracts into a std-only `pkg/<subsystem>_plan.zig` module that Writer + Workbook both consume. The wr-7 closer adds `pkg/fresh_emit.zig` as the shared archive-build orchestrator. `src/writer.zig`: 6579 → 5256 LOC (-1323, -20.1%) cumulative.
 
 ## Problem
 

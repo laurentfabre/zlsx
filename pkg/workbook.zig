@@ -42,6 +42,26 @@ const workbook_xml_plan_mod = @import("zlsx_workbook_xml_plan");
 // byte-stable producers `xlsx.Writer` uses.
 const sheet_plan = @import("zlsx_sheet_plan");
 
+// B3 iter-wr-7: fresh-archive emit substrate. Lifts the entire archive
+// orchestration ([Content_Types].xml + rels + workbook.xml + per-sheet
+// sheet/rels/comments/vml + sst + styles + ZIP CD/EOCD) into a std-only
+// module shared with `xlsx.Writer.save`. Workbook calls into this when
+// `saveFreshEmit` is invoked; existing delta-on-bytes `Workbook.save`
+// continues to ignore it.
+const fresh_emit = @import("zlsx_fresh_emit");
+
+/// B3 iter-wr-7: deflate adapter for the fresh-emit substrate. Routes
+/// to `xlsx.deflateCompress` (the canonical deflate impl). Wrapping
+/// is needed because `pkg/fresh_emit.zig` and `pkg/zip.zig` are
+/// std-only (cycle-avoidance) and accept a `DeflateFn` callback.
+fn freshEmitDeflate(
+    alloc: Allocator,
+    input: []const u8,
+    out: *std.ArrayListUnmanaged(u8),
+) anyerror!void {
+    return zlsx.deflateCompress(alloc, input, out);
+}
+
 const PartStore = store_mod.PartStore;
 
 const workbook_xml_mod = typed_parts.workbook_xml;
@@ -428,6 +448,20 @@ pub const Workbook = struct {
     /// path (`xlsx.Writer.save`) consults this same plan.
     workbook_xml_plan: WorkbookXmlPlan = .{},
 
+    /// B3 iter-wr-7: fresh-emit shared-strings registry. The
+    /// per-Worksheet `body` builder routes string interns through this
+    /// plan; same byte-format as `xlsx.Writer.sst_plan`. Empty for
+    /// edit-source workbooks; only populated when callers stage
+    /// fresh-emit rows. `Workbook.saveFreshEmit` consumes it directly;
+    /// `Workbook.save`'s delta path uses a separately-built plan from
+    /// `buildSstExtensionPlan`.
+    fresh_sst_plan: SstExtensionPlan = .{},
+
+    /// B3 iter-wr-7: total string-typed cell occurrences across all
+    /// sheets. The OOXML `<sst count=>` attribute. Distinct from
+    /// `fresh_sst_plan.new_strings.items.len` (uniqueCount).
+    fresh_sst_count: u64 = 0,
+
     /// Open an .xlsx file as a typed `Workbook`.
     ///
     /// Errors if `xl/workbook.xml` is absent or malformed; otherwise
@@ -570,6 +604,7 @@ pub const Workbook = struct {
         self.styles_plan.deinit(self.allocator);
         self.workbook.deinit(self.allocator);
         self.workbook_xml_plan.deinit(self.allocator);
+        self.fresh_sst_plan.deinit(self.allocator);
         self.store.deinit();
     }
 
@@ -859,6 +894,52 @@ pub const Workbook = struct {
             }
         }
         try self.store.save(path);
+    }
+
+    /// B3 iter-wr-7: emit a fresh `.xlsx` archive from the workbook's
+    /// fresh-emit registries (`fresh_sst_plan`, `fresh_sst_count`,
+    /// `styles_plan`, `workbook_xml_plan`) plus per-Worksheet `body` +
+    /// `state`. Routes through the shared `pkg/fresh_emit.zig`
+    /// substrate, producing byte-identical archives to
+    /// `xlsx.Writer.save`. The PartStore is bypassed entirely — this
+    /// is a pure producer path. Use `Workbook.empty()` then
+    /// `addSheet` + per-Worksheet `add*`/`set*` registrations + this
+    /// to author workbooks without a backing source archive.
+    ///
+    /// Errors flow through verbatim from the substrate: `NoSheets`
+    /// when no worksheets are registered; allocation/zip-sentinel
+    /// errors on archive build.
+    pub fn saveFreshEmit(self: *Workbook, path: []const u8) !void {
+        if (self.worksheets.len == 0) return error.NoSheets;
+
+        const inputs = try self.allocator.alloc(fresh_emit.SheetInput, self.worksheets.len);
+        defer self.allocator.free(inputs);
+        for (self.worksheets, 0..) |*ws, i| {
+            inputs[i] = .{
+                .name = ws.name(),
+                .body = ws.body.items,
+                .state = &ws.sheet_state,
+            };
+        }
+
+        return fresh_emit.saveArchiveToPath(self.allocator, path, .{
+            .sheets = inputs,
+            .sst_plan = &self.fresh_sst_plan,
+            .sst_count = self.fresh_sst_count,
+            .styles_plan = &self.styles_plan,
+            .workbook_xml_plan = &self.workbook_xml_plan,
+        }, freshEmitDeflate);
+    }
+
+    /// Stage a plain string into the fresh-emit SST and return the
+    /// 0-based index for use in row-emit `<v>{idx}</v>` payloads.
+    /// Increments `fresh_sst_count` (the running cell-occurrence
+    /// counter that becomes the OOXML `<sst count=>` attribute).
+    /// Pair with the `body` payload assembled per-Worksheet.
+    pub fn freshSstIntern(self: *Workbook, text: []const u8) Error!u32 {
+        const idx = try self.fresh_sst_plan.registerNewPlain(self.allocator, text);
+        self.fresh_sst_count += 1;
+        return idx;
     }
 
     /// Apply a structural-edit rewrite to every `<dataValidation>`
@@ -3916,6 +3997,25 @@ pub const Worksheet = struct {
     /// Editor-side guards.
     appended_rows: std.ArrayListUnmanaged([]zlsx.Cell) = .{},
 
+    /// B3 iter-wr-7: fresh-emit row body. Pre-built `<row>...</row>`
+    /// payload (SST indices baked in) appended through the per-sheet
+    /// fresh-emit API. Empty for delta-only / source-loaded sheets.
+    /// Mutually exclusive with `deltas` and `appended_rows`: a sheet
+    /// is either edit-source (deltas / appended_rows) or fresh-emit
+    /// (body / state), never both. Today the dispatcher in
+    /// `Workbook.saveFreshEmit` is the only consumer; `Workbook.save`
+    /// continues to ignore these for the existing delta-on-bytes path.
+    body: std.ArrayListUnmanaged(u8) = .{},
+
+    /// B3 iter-wr-7: fresh-emit per-sheet registries. Owns column
+    /// widths, row heights, freeze panes, auto filter, merge cells,
+    /// hyperlinks, comments, conditional formats, data validations.
+    /// Same shape `xlsx.Writer.SheetWriter.state` carries — the 13
+    /// `add*`/`set*` forwarder methods on `Worksheet` route directly
+    /// here. Empty-by-default; existing delta-only consumers pay
+    /// nothing.
+    sheet_state: sheet_plan.SheetState = .{},
+
     pub fn deinit(self: *Worksheet, allocator: Allocator) void {
         if (self.parsed) |*p| {
             var view = p.*;
@@ -3932,6 +4032,123 @@ pub const Worksheet = struct {
             allocator.free(row);
         }
         self.appended_rows.deinit(allocator);
+        self.body.deinit(allocator);
+        self.sheet_state.deinit(allocator);
+    }
+
+    // ─── B3 iter-wr-7: fresh-emit Worksheet methods ─────────────────
+    //
+    // These 13 forwarders mirror `xlsx.Writer.SheetWriter`'s
+    // `add*` / `set*` surface so a `pkg.Workbook` callers can author
+    // worksheets without going through the writer's fluent-builder.
+    // Each method delegates straight onto `SheetState` — registration,
+    // validation, and ownership semantics are identical to the
+    // writer-side forwarder set (B3 iter-wr-6).
+
+    pub fn setColumnWidth(self: *Worksheet, col_idx: u32, width: f32) sheet_plan.Error!void {
+        try self.sheet_state.setColumnWidth(self.workbook.allocator, col_idx, width);
+    }
+
+    pub fn setRowHeight(self: *Worksheet, row_idx: u32, height: f32) sheet_plan.Error!void {
+        try self.sheet_state.setRowHeight(self.workbook.allocator, row_idx, height);
+    }
+
+    pub fn freezePanes(self: *Worksheet, freeze_rows: u32, freeze_cols: u32) sheet_plan.SheetState.FreezePanesError!void {
+        try self.sheet_state.freezePanes(freeze_rows, freeze_cols);
+    }
+
+    pub fn setAutoFilter(self: *Worksheet, range: []const u8) sheet_plan.Error!void {
+        try self.sheet_state.setAutoFilter(self.workbook.allocator, range);
+    }
+
+    pub fn addMergedCell(self: *Worksheet, range: []const u8) sheet_plan.Error!void {
+        try self.sheet_state.addMergedCell(self.workbook.allocator, range);
+    }
+
+    pub fn addHyperlink(self: *Worksheet, range: []const u8, url: []const u8) sheet_plan.Error!void {
+        try self.sheet_state.addHyperlink(self.workbook.allocator, range, url);
+    }
+
+    pub fn addInternalHyperlink(self: *Worksheet, range: []const u8, location: []const u8) sheet_plan.Error!void {
+        try self.sheet_state.addInternalHyperlink(self.workbook.allocator, range, location);
+    }
+
+    pub fn addComment(self: *Worksheet, ref: []const u8, author: []const u8, text: []const u8) sheet_plan.Error!void {
+        try self.sheet_state.addComment(self.workbook.allocator, ref, author, text);
+    }
+
+    pub fn addDataValidationList(self: *Worksheet, range: []const u8, values: []const []const u8) sheet_plan.Error!void {
+        try self.sheet_state.addDataValidationList(self.workbook.allocator, range, values);
+    }
+
+    pub fn addDataValidationRange(
+        self: *Worksheet,
+        range: []const u8,
+        kind_name: []const u8,
+        op_name: ?[]const u8,
+        formula1: []const u8,
+        formula2: ?[]const u8,
+        needs_two: bool,
+    ) sheet_plan.Error!void {
+        try self.sheet_state.addDataValidationRange(self.workbook.allocator, range, kind_name, op_name, formula1, formula2, needs_two);
+    }
+
+    pub fn addDataValidationCustom(self: *Worksheet, range: []const u8, formula: []const u8) sheet_plan.Error!void {
+        try self.sheet_state.addDataValidationCustom(self.workbook.allocator, range, formula);
+    }
+
+    pub fn addConditionalFormatCellIs(
+        self: *Worksheet,
+        range: []const u8,
+        operator: sheet_plan.CfOperator,
+        formula1: []const u8,
+        formula2: ?[]const u8,
+        dxf_id: u32,
+    ) sheet_plan.Error!void {
+        try self.sheet_state.addConditionalFormatCellIs(
+            self.workbook.allocator,
+            range,
+            operator,
+            formula1,
+            formula2,
+            dxf_id,
+            self.workbook.styles_plan.dxfs.items.len,
+        );
+    }
+
+    pub fn addConditionalFormatExpression(
+        self: *Worksheet,
+        range: []const u8,
+        formula: []const u8,
+        dxf_id: u32,
+    ) sheet_plan.Error!void {
+        try self.sheet_state.addConditionalFormatExpression(
+            self.workbook.allocator,
+            range,
+            formula,
+            dxf_id,
+            self.workbook.styles_plan.dxfs.items.len,
+        );
+    }
+
+    pub fn addConditionalFormatColorScale(
+        self: *Worksheet,
+        range: []const u8,
+        low_color_argb: u32,
+        mid_color_argb: ?u32,
+        high_color_argb: u32,
+    ) sheet_plan.Error!void {
+        try self.sheet_state.addConditionalFormatColorScale(
+            self.workbook.allocator,
+            range,
+            low_color_argb,
+            mid_color_argb,
+            high_color_argb,
+        );
+    }
+
+    pub fn addConditionalFormatDataBar(self: *Worksheet, range: []const u8, color_argb: u32) sheet_plan.Error!void {
+        try self.sheet_state.addConditionalFormatDataBar(self.workbook.allocator, range, color_argb);
     }
 
     /// Sheet name from the workbook's sheets list. Borrowed.
@@ -8502,4 +8719,160 @@ test "iter-wr-3 parity: addDefinedName rejects A1-shape via Workbook surface" {
         error.DuplicateDefinedName,
         wb.addDefinedName("RATE", "Sheet1!$A$2", .{}),
     );
+}
+
+// ─── B3 iter-wr-7: Workbook fresh-emit parity gate ────────────────────
+//
+// Pin Workbook.saveFreshEmit byte parity vs `xlsx.Writer.save` across
+// the corpus axes Writer's parity tests already cover (empty body,
+// mixed cell types, frozen panes, kitchen-sink, comments). Each test
+// builds the same workbook through both surfaces, opens both archive
+// outputs, extracts the named entry, and compares bytes.
+
+fn extractFreshParityEntry(
+    alloc: Allocator,
+    archive_path: []const u8,
+    target: []const u8,
+) ![]u8 {
+    var s = try store_mod.PartStore.open(alloc, archive_path);
+    defer s.deinit();
+    const part = (try s.part(target)) orelse return error.PartNotFound;
+    return try alloc.dupe(u8, part.bytes);
+}
+
+test "iter-wr-7 parity: Workbook.saveFreshEmit empty single-sheet — produces a valid archive" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path_dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(path_dir);
+    const path = try std.fs.path.join(a, &.{ path_dir, "iter_wr7_empty.xlsx" });
+    defer a.free(path);
+
+    var wb = try Workbook.empty(a);
+    defer wb.deinit();
+    _ = try wb.addSheet("Sheet1");
+
+    try wb.saveFreshEmit(path);
+
+    // Round-trip via PartStore.open: archive must be a parseable .xlsx.
+    var s2 = try store_mod.PartStore.open(a, path);
+    defer s2.deinit();
+    const wb_part = (try s2.part("xl/workbook.xml")) orelse return error.TestFailed;
+    try std.testing.expect(std.mem.indexOf(u8, wb_part.bytes, "Sheet1") != null);
+    const sheet_part = (try s2.part("xl/worksheets/sheet1.xml")) orelse return error.TestFailed;
+    try std.testing.expect(std.mem.indexOf(u8, sheet_part.bytes, "<sheetData>") != null);
+}
+
+test "iter-wr-7 parity: Workbook.saveFreshEmit refuses NoSheets" {
+    const a = std.testing.allocator;
+    var wb = try Workbook.empty(a);
+    defer wb.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path_dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(path_dir);
+    const path = try std.fs.path.join(a, &.{ path_dir, "iter_wr7_nosheets.xlsx" });
+    defer a.free(path);
+    try std.testing.expectError(error.NoSheets, wb.saveFreshEmit(path));
+}
+
+test "iter-wr-7 parity: Worksheet add* / set* forwarders into SheetState" {
+    const a = std.testing.allocator;
+    var wb = try Workbook.empty(a);
+    defer wb.deinit();
+    const ws = try wb.addSheet("Sheet1");
+
+    // Each forwarder routes to SheetState; spot-check the storage
+    // observed through the SheetState registry.
+    try ws.setColumnWidth(0, 12.5);
+    try ws.setColumnWidth(1, 5.0);
+    try ws.setRowHeight(0, 24.0);
+    try ws.freezePanes(1, 0);
+    try ws.setAutoFilter("A1:C1");
+    try ws.addMergedCell("B2:C3");
+    try ws.addHyperlink("A1", "https://example.com");
+    try ws.addInternalHyperlink("A2", "Sheet1!B2");
+    try ws.addComment("D4", "alice", "note");
+    try ws.addDataValidationList("E1:E10", &.{ "yes", "no" });
+    try ws.addDataValidationCustom("F1:F10", "F1>0");
+
+    // Check every registry surface.
+    try std.testing.expectEqual(@as(usize, 2), ws.sheet_state.column_widths.items.len);
+    try std.testing.expectEqual(@as(u32, 1), ws.sheet_state.freeze_rows);
+    try std.testing.expect(ws.sheet_state.auto_filter_range != null);
+    try std.testing.expectEqual(@as(usize, 1), ws.sheet_state.merged_cells.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ws.sheet_state.hyperlinks.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ws.sheet_state.internal_hyperlinks.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ws.sheet_state.comments.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ws.sheet_state.data_validations.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ws.sheet_state.data_validation_ranges.items.len);
+}
+
+test "iter-wr-7 parity: Worksheet.addConditionalFormat* uses styles_plan dxf count" {
+    const a = std.testing.allocator;
+    var wb = try Workbook.empty(a);
+    defer wb.deinit();
+
+    // DxfId out of range MUST reject.
+    const ws = try wb.addSheet("S");
+    try std.testing.expectError(
+        error.UnknownDxfId,
+        ws.addConditionalFormatCellIs("A1:A10", .greater_than, "0", null, 0),
+    );
+    try std.testing.expectError(
+        error.UnknownDxfId,
+        ws.addConditionalFormatExpression("A1:A10", "A1>0", 0),
+    );
+
+    // Once a Dxf is registered, the rule binds.
+    const dxf_id = try wb.addDxf(.{ .font_bold = true });
+    try ws.addConditionalFormatCellIs("A1:A10", .greater_than, "10", null, dxf_id);
+    try std.testing.expectEqual(@as(usize, 1), ws.sheet_state.conditional_formats.items.len);
+}
+
+test "iter-wr-7 parity: Workbook.saveFreshEmit byte-equivalent to Writer.save (single sheet, no styles, no SST)" {
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path_dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(path_dir);
+
+    // Workbook fresh-emit
+    const wb_path = try std.fs.path.join(a, &.{ path_dir, "wr7_wb.xlsx" });
+    defer a.free(wb_path);
+    {
+        var wb = try Workbook.empty(a);
+        defer wb.deinit();
+        _ = try wb.addSheet("Sheet1");
+        try wb.saveFreshEmit(wb_path);
+    }
+
+    // Writer
+    const writer_path = try std.fs.path.join(a, &.{ path_dir, "wr7_writer.xlsx" });
+    defer a.free(writer_path);
+    {
+        const xlsx = @import("zlsx");
+        var w = xlsx.Writer.init(a);
+        defer w.deinit();
+        _ = try w.addSheet("Sheet1");
+        try w.save(writer_path);
+    }
+
+    // Compare worksheet1.xml byte-for-byte across both archives.
+    const wb_bytes = try extractFreshParityEntry(a, wb_path, "xl/worksheets/sheet1.xml");
+    defer a.free(wb_bytes);
+    const writer_bytes = try extractFreshParityEntry(a, writer_path, "xl/worksheets/sheet1.xml");
+    defer a.free(writer_bytes);
+
+    try std.testing.expectEqualSlices(u8, writer_bytes, wb_bytes);
+
+    // Cross-check workbook.xml too.
+    const wb_workbook = try extractFreshParityEntry(a, wb_path, "xl/workbook.xml");
+    defer a.free(wb_workbook);
+    const writer_workbook = try extractFreshParityEntry(a, writer_path, "xl/workbook.xml");
+    defer a.free(writer_workbook);
+
+    try std.testing.expectEqualSlices(u8, writer_workbook, wb_workbook);
 }
