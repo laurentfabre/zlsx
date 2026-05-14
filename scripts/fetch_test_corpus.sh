@@ -28,7 +28,8 @@
 # break every PR's CI for reasons unrelated to zlsx, so those
 # fetches go through `fetch_optional` which warns and continues
 # instead of aborting. Tests that need a missing fixture skip
-# cleanly (see e.g. `tests/perf_*`).
+# cleanly (see `tests/*_corpus.zig`'s `openOrSkip` pattern and
+# the per-name skip table in `tests/package_corpus.zig`).
 
 set -euo pipefail
 
