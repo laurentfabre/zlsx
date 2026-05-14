@@ -865,7 +865,6 @@ pub const Editor = struct {
             // during the byte transform, and refuses split-state panes
             // with `error.SplitPaneNotSupported`.
             const guards = [_][]const u8{
-                "<autoFilter",
                 "<tableParts",
                 "<drawing",
                 "<legacyDrawing",
@@ -907,13 +906,13 @@ pub const Editor = struct {
 
         // Per-sheet content guard: refuse sheets whose bodies carry
         // constructs the rewriters don't yet handle (drawings,
-        // pivots, tableParts, autoFilter). `<pane>` is no longer in
-        // this list — `pkg/sheet_edit.zig` shifts ySplit +
-        // topLeftCell for frozen/frozenSplit panes during the byte
-        // transform, and refuses split-state panes with
-        // `error.SplitPaneNotSupported`. See
-        // `docs/plans/refusal-audit.md` "Axes that stay refused"
-        // for the remaining rationale.
+        // pivots, tableParts). `<pane>` and `<autoFilter>` are no
+        // longer in this list — `pkg/sheet_edit.zig` shifts ySplit
+        // + topLeftCell for frozen/frozenSplit panes (split-state
+        // panes surface `error.SplitPaneNotSupported`) and rewrites
+        // `<autoFilter ref>` + `<filterColumn colId>` during the
+        // byte transform. See `docs/plans/refusal-audit.md` "Axes
+        // that stay refused" for the remaining rationale.
         const path = self.sheet_paths[sheet_idx];
         if (findEntryByName(self.entries, path)) |entry_idx| {
             const e = self.entries[entry_idx];
@@ -921,7 +920,6 @@ pub const Editor = struct {
             const xml = try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
             defer self.allocator.free(xml);
             const guards = [_][]const u8{
-                "<autoFilter",
                 "<tableParts",
                 "<drawing",
                 "<legacyDrawing",
@@ -3460,4 +3458,108 @@ test "iter-er-1: Editor.workbook.cellByRef matches Book.cell for known cells" {
     try std.testing.expectEqualStrings("B1", c.ref);
     try std.testing.expect(c.raw_value != null);
     try std.testing.expectEqualStrings("1", c.raw_value.?);
+}
+
+// ---------------------------------------------------------------------------
+// autoFilter round-trip tests (refusal lift; replaces prior ColEditUnsafe /
+// RowEditUnsafe refusals on sheets carrying <autoFilter>).
+// ---------------------------------------------------------------------------
+
+fn buildAutoFilterFixture(path: []const u8) !void {
+    var w = xlsx.Writer.init(std.testing.allocator);
+    defer w.deinit();
+    var s = try w.addSheet("S");
+    try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 }, .{ .integer = 4 } });
+    try s.writeRow(&.{ .{ .integer = 5 }, .{ .integer = 6 }, .{ .integer = 7 }, .{ .integer = 8 } });
+    try s.setAutoFilter("B1:D2");
+    try w.save(path);
+}
+
+fn assertSheetXmlContains(ed: *Editor, needle: []const u8) !void {
+    const xml = try ed.readEntry("xl/worksheets/sheet1.xml");
+    defer std.testing.allocator.free(xml);
+    if (std.mem.indexOf(u8, xml, needle) == null) {
+        std.debug.print("\nexpected sheet1.xml to contain `{s}`; got:\n{s}\n", .{ needle, xml });
+        return error.TestExpectedNeedle;
+    }
+}
+
+test "Editor: insertRow on a sheet carrying <autoFilter> rewrites range" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "af_insrow_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "af_insrow_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    try buildAutoFilterFixture(src_path);
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(dst_path);
+    }
+    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    defer ed2.deinit();
+    // B1:D2 → B1:D3 after inserting a row at row 2.
+    try assertSheetXmlContains(&ed2, "ref=\"B1:D3\"");
+}
+
+test "Editor: insertColumn on a sheet carrying <autoFilter> rewrites range" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "af_inscol_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "af_inscol_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    try buildAutoFilterFixture(src_path);
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertColumn(0, 3); // insert before col C, inside B:D
+        try ed.save(dst_path);
+    }
+    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    defer ed2.deinit();
+    // B1:D2 → B1:E2 after extending the range by one column.
+    try assertSheetXmlContains(&ed2, "ref=\"B1:E2\"");
+}
+
+test "Editor: deleteRow on a sheet carrying <autoFilter> rewrites range" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "af_delrow_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "af_delrow_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    try buildAutoFilterFixture(src_path);
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.deleteRow(0, 2); // delete row 2 (the BR of B1:D2)
+        try ed.save(dst_path);
+    }
+    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    defer ed2.deinit();
+    // B1:D2 → B1:D1 after the BR row vanishes.
+    try assertSheetXmlContains(&ed2, "ref=\"B1:D1\"");
+}
+
+test "Editor: deleteColumn on a sheet carrying <autoFilter> shrinks range" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "af_delcol_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "af_delcol_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    try buildAutoFilterFixture(src_path);
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.deleteColumn(0, 3); // delete col C inside B:D
+        try ed.save(dst_path);
+    }
+    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    defer ed2.deinit();
+    // B1:D2 → B1:C2 (BR shrinks by one column).
+    try assertSheetXmlContains(&ed2, "ref=\"B1:C2\"");
 }

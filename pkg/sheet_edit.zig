@@ -64,6 +64,8 @@ pub fn applyColEditToWorksheet(
         } else if (matchTagAt(src, i, "pane")) |t| {
             try processPaneTagCol(allocator, &out, src, t, col_1based, kind);
             i = t.after_open;
+        } else if (matchTagAt(src, i, "autoFilter")) |t| {
+            try processAutoFilterTagCol(allocator, &out, src, t, col_1based, kind, &i);
         } else {
             try out.append(allocator, '<');
             i += 1;
@@ -346,6 +348,257 @@ fn processMergeCellTagCol(
     try writeWithReplacedAttr(allocator, out, src, t, "<mergeCell".len, "ref", new_ref);
 }
 
+/// Rewrite `<autoFilter ref="A1:E10">…</autoFilter>` for a column
+/// edit. Shifts the col halves of `ref` on the open tag AND walks
+/// `<filterColumn colId="N">` children: `colId` is a 0-based offset
+/// from the autoFilter's left edge (ECMA-376 §18.3.2.7), so any col
+/// edit that changes the range's starting column requires
+/// recomputing every surviving filterColumn's `colId`. A
+/// filterColumn whose absolute column was deleted is dropped
+/// entirely (open + body + close).
+///
+/// On range collapse (single-column filter where that column is
+/// deleted), the entire `<autoFilter>` is dropped.
+///
+/// Caveat: nested `<sortState ref="…">` carries its own range that
+/// would also need shifting — not handled in v1.
+fn processAutoFilterTagCol(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    col_1based: u32,
+    kind: RowEditKind,
+    i: *usize,
+) !void {
+    const attrs_full = src[t.start + "<autoFilter".len .. t.after_open - 1];
+    const trimmed = std.mem.trimRight(u8, attrs_full, " \t\r\n");
+    const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
+    const attrs_for_lookup = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
+    const r_attr = getAttr(attrs_for_lookup, "ref");
+    if (r_attr == null) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        i.* = t.after_open;
+        return;
+    }
+    const ref = r_attr.?;
+    const colon = std.mem.indexOfScalar(u8, ref, ':');
+
+    // Capture old + new column bounds; needed for filterColumn
+    // colId rebasing.
+    var old_tl_col: u32 = 0;
+    var old_br_col: u32 = 0;
+    if (colon) |c| {
+        old_tl_col = parseColFromA1(ref[0..c]) orelse 0;
+        old_br_col = parseColFromA1(ref[c + 1 ..]) orelse 0;
+    } else {
+        old_tl_col = parseColFromA1(ref) orelse 0;
+        old_br_col = old_tl_col;
+    }
+
+    // Detect collapse: delete-match where every column in the
+    // range is exactly the deleted column.
+    var drop_entire = false;
+    if (kind == .delete and old_tl_col == col_1based and old_br_col == col_1based and old_tl_col != 0) {
+        drop_entire = true;
+    }
+
+    if (drop_entire) {
+        if (is_self_closing) {
+            i.* = t.after_open;
+        } else {
+            const close = std.mem.indexOfPos(u8, src, t.after_open, "</autoFilter>") orelse t.after_open;
+            i.* = if (close + "</autoFilter>".len <= src.len) close + "</autoFilter>".len else t.after_open;
+        }
+        return;
+    }
+
+    // Compute new ref. Pass through on any malformed half.
+    var new_ref_buf: [40]u8 = undefined;
+    var new_ref: []const u8 = ref;
+    if (colon) |c| {
+        var tl_buf: [16]u8 = undefined;
+        var br_buf: [16]u8 = undefined;
+        const tl_new = shiftSingleA1Col(ref[0..c], col_1based, kind, &tl_buf, false) catch {
+            try out.appendSlice(allocator, src[t.start..t.after_open]);
+            i.* = t.after_open;
+            return;
+        };
+        const br_new = shiftSingleA1Col(ref[c + 1 ..], col_1based, kind, &br_buf, true) catch {
+            try out.appendSlice(allocator, src[t.start..t.after_open]);
+            i.* = t.after_open;
+            return;
+        };
+        new_ref = try std.fmt.bufPrint(&new_ref_buf, "{s}:{s}", .{ tl_new, br_new });
+    } else {
+        var b: [16]u8 = undefined;
+        const shifted = shiftSingleA1Col(ref, col_1based, kind, &b, false) catch {
+            try out.appendSlice(allocator, src[t.start..t.after_open]);
+            i.* = t.after_open;
+            return;
+        };
+        @memcpy(new_ref_buf[0..shifted.len], shifted);
+        new_ref = new_ref_buf[0..shifted.len];
+    }
+
+    // Emit open tag with possibly-rewritten ref.
+    if (std.mem.eql(u8, ref, new_ref)) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+    } else {
+        try writeWithReplacedAttr(allocator, out, src, t, "<autoFilter".len, "ref", new_ref);
+    }
+
+    if (is_self_closing) {
+        i.* = t.after_open;
+        return;
+    }
+
+    // Open form: walk children to `</autoFilter>`. Rewrite any
+    // `<filterColumn colId>` to its post-edit offset; drop
+    // filterColumns whose absolute column was deleted.
+    const new_tl_col: u32 = blk: {
+        const new_colon = std.mem.indexOfScalar(u8, new_ref, ':');
+        if (new_colon) |nc| {
+            break :blk parseColFromA1(new_ref[0..nc]) orelse old_tl_col;
+        }
+        break :blk parseColFromA1(new_ref) orelse old_tl_col;
+    };
+
+    const close_tag = "</autoFilter>";
+    const close_pos = std.mem.indexOfPos(u8, src, t.after_open, close_tag) orelse {
+        // Malformed: no close tag found. Stop after the open tag.
+        i.* = t.after_open;
+        return;
+    };
+
+    var j: usize = t.after_open;
+    while (j < close_pos) {
+        const next_lt = std.mem.indexOfScalarPos(u8, src, j, '<') orelse {
+            try out.appendSlice(allocator, src[j..close_pos]);
+            j = close_pos;
+            break;
+        };
+        if (next_lt >= close_pos) {
+            try out.appendSlice(allocator, src[j..close_pos]);
+            j = close_pos;
+            break;
+        }
+        try out.appendSlice(allocator, src[j..next_lt]);
+        j = next_lt;
+
+        if (matchTagAt(src, j, "filterColumn")) |ft| {
+            try processFilterColumnTag(
+                allocator,
+                out,
+                src,
+                ft,
+                col_1based,
+                kind,
+                old_tl_col,
+                new_tl_col,
+                close_pos,
+                &j,
+            );
+        } else {
+            try out.append(allocator, '<');
+            j += 1;
+        }
+    }
+
+    // Emit `</autoFilter>` and advance past it.
+    try out.appendSlice(allocator, src[close_pos .. close_pos + close_tag.len]);
+    i.* = close_pos + close_tag.len;
+}
+
+/// Rewrite a `<filterColumn colId="N">` child of `<autoFilter>`.
+/// `colId` is a 0-based offset from the autoFilter's left edge.
+/// Drop the filterColumn (skipping any children up to
+/// `</filterColumn>`) when its absolute column is the one being
+/// deleted; otherwise rewrite `colId` to the post-edit offset.
+fn processFilterColumnTag(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    col_1based: u32,
+    kind: RowEditKind,
+    old_tl_col: u32,
+    new_tl_col: u32,
+    autofilter_close_pos: usize,
+    j: *usize,
+) !void {
+    const attrs_full = src[t.start + "<filterColumn".len .. t.after_open - 1];
+    const trimmed = std.mem.trimRight(u8, attrs_full, " \t\r\n");
+    const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
+    const attrs_for_lookup = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
+    const id_attr = getAttr(attrs_for_lookup, "colId");
+
+    // No colId or unparseable / out-of-range autoFilter — emit
+    // verbatim, advance past the open tag only.
+    if (id_attr == null or old_tl_col == 0) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        j.* = t.after_open;
+        return;
+    }
+    const old_id = std.fmt.parseInt(u32, id_attr.?, 10) catch {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        j.* = t.after_open;
+        return;
+    };
+    const old_abs = old_tl_col + old_id;
+
+    var drop = false;
+    var new_abs = old_abs;
+    switch (kind) {
+        .insert => if (old_abs >= col_1based) {
+            if (old_abs >= max_col_1based) {
+                try out.appendSlice(allocator, src[t.start..t.after_open]);
+                j.* = t.after_open;
+                return;
+            }
+            new_abs = old_abs + 1;
+        },
+        .delete => if (old_abs == col_1based) {
+            drop = true;
+        } else if (old_abs > col_1based) {
+            new_abs = old_abs - 1;
+        },
+    }
+
+    if (drop) {
+        if (is_self_closing) {
+            j.* = t.after_open;
+        } else {
+            const close_str = "</filterColumn>";
+            const close = std.mem.indexOfPos(u8, src, t.after_open, close_str) orelse autofilter_close_pos;
+            const after_close = if (close + close_str.len <= autofilter_close_pos)
+                close + close_str.len
+            else
+                close;
+            j.* = after_close;
+        }
+        return;
+    }
+
+    // Compute new colId. new_abs should never sit before
+    // new_tl_col under a well-formed edit; if it does, fall back
+    // to a verbatim emit.
+    if (new_tl_col == 0 or new_abs < new_tl_col) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        j.* = t.after_open;
+        return;
+    }
+    const new_id = new_abs - new_tl_col;
+    if (new_id == old_id) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+    } else {
+        var idbuf: [16]u8 = undefined;
+        const new_id_str = try std.fmt.bufPrint(&idbuf, "{d}", .{new_id});
+        try writeWithReplacedAttr(allocator, out, src, t, "<filterColumn".len, "colId", new_id_str);
+    }
+    j.* = t.after_open;
+}
+
 fn processDimensionTagCol(
     allocator: Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -513,6 +766,8 @@ pub fn applyRowEditToWorksheet(
         } else if (matchTagAt(src, i, "pane")) |t| {
             try processPaneTagRow(allocator, &out, src, t, row, kind);
             i = t.after_open;
+        } else if (matchTagAt(src, i, "autoFilter")) |t| {
+            try processAutoFilterTagRow(allocator, &out, src, t, row, kind, &i);
         } else {
             // Some other tag; emit `<` and continue past it.
             try out.append(allocator, '<');
@@ -707,6 +962,99 @@ fn processMergeCellTag(
         return;
     }
     try writeWithReplacedAttr(allocator, out, src, t, "<mergeCell".len, "ref", new_ref);
+}
+
+/// Rewrite `<autoFilter ref="A1:E10">…</autoFilter>` for a row
+/// edit. Shifts the row halves of `ref` on the open tag; children
+/// (`<filterColumn>`, `<sortState>`, …) are unaffected by row
+/// edits and pass through verbatim. If the entire range collapses
+/// onto the deleted row, the whole element (open form: open + body
+/// + close; self-closing form: just the open tag) is dropped.
+///
+/// Caveat: nested `<sortState ref="…">` carries its own range that
+/// would also need shifting — not handled in v1; zlsx never emits
+/// open-form autoFilter so this only matters for third-party files
+/// that mix autoFilter sortState with row edits.
+fn processAutoFilterTagRow(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    row: u32,
+    kind: RowEditKind,
+    i: *usize,
+) !void {
+    const attrs_full = src[t.start + "<autoFilter".len .. t.after_open - 1];
+    const trimmed = std.mem.trimRight(u8, attrs_full, " \t\r\n");
+    const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
+    const attrs_for_lookup = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
+    const r_attr = getAttr(attrs_for_lookup, "ref");
+    if (r_attr == null) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        i.* = t.after_open;
+        return;
+    }
+    const ref = r_attr.?;
+    const colon = std.mem.indexOfScalar(u8, ref, ':');
+
+    // Detect collapse: delete-match where every row in the range is
+    // exactly the deleted row.
+    var drop_entire = false;
+    if (kind == .delete) {
+        if (colon) |c| {
+            const tl_row = parseRowFromA1(ref[0..c]) orelse 0;
+            const br_row = parseRowFromA1(ref[c + 1 ..]) orelse 0;
+            if (tl_row == row and br_row == row) drop_entire = true;
+        } else {
+            const tl_row = parseRowFromA1(ref) orelse 0;
+            if (tl_row == row) drop_entire = true;
+        }
+    }
+
+    if (drop_entire) {
+        if (is_self_closing) {
+            i.* = t.after_open;
+        } else {
+            const close = std.mem.indexOfPos(u8, src, t.after_open, "</autoFilter>") orelse t.after_open;
+            i.* = if (close + "</autoFilter>".len <= src.len) close + "</autoFilter>".len else t.after_open;
+        }
+        return;
+    }
+
+    // Compute new ref. On any malformed half, pass through verbatim.
+    var new_ref_buf: [40]u8 = undefined;
+    var new_ref: []const u8 = ref;
+    if (colon) |c| {
+        var tl_buf: [16]u8 = undefined;
+        var br_buf: [16]u8 = undefined;
+        const tl_new = shiftSingleA1(ref[0..c], row, kind, &tl_buf, false) catch {
+            try out.appendSlice(allocator, src[t.start..t.after_open]);
+            i.* = t.after_open;
+            return;
+        };
+        const br_new = shiftSingleA1(ref[c + 1 ..], row, kind, &br_buf, true) catch {
+            try out.appendSlice(allocator, src[t.start..t.after_open]);
+            i.* = t.after_open;
+            return;
+        };
+        new_ref = try std.fmt.bufPrint(&new_ref_buf, "{s}:{s}", .{ tl_new, br_new });
+    } else {
+        var b: [16]u8 = undefined;
+        const shifted = shiftSingleA1(ref, row, kind, &b, false) catch {
+            try out.appendSlice(allocator, src[t.start..t.after_open]);
+            i.* = t.after_open;
+            return;
+        };
+        @memcpy(new_ref_buf[0..shifted.len], shifted);
+        new_ref = new_ref_buf[0..shifted.len];
+    }
+
+    if (std.mem.eql(u8, ref, new_ref)) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+    } else {
+        try writeWithReplacedAttr(allocator, out, src, t, "<autoFilter".len, "ref", new_ref);
+    }
+    i.* = t.after_open;
 }
 
 /// Parse the row component (digits) from an A1-style ref. Returns
@@ -1085,4 +1433,163 @@ pub fn colLetterEditor(buf: []u8, col_idx: u32) []u8 {
     }
     std.mem.reverse(u8, buf[0..i]);
     return buf[0..i];
+}
+
+// ---------------------------------------------------------------------------
+// autoFilter rewriter tests (refusal lift; see docs/plans/refusal-audit.md).
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn wrapSheet(allocator: Allocator, body: []const u8) ![]u8 {
+    const head = "<worksheet><sheetData><row r=\"1\"><c r=\"A1\"/></row></sheetData>";
+    const tail = "</worksheet>";
+    var buf = try allocator.alloc(u8, head.len + body.len + tail.len);
+    @memcpy(buf[0..head.len], head);
+    @memcpy(buf[head.len .. head.len + body.len], body);
+    @memcpy(buf[head.len + body.len ..], tail);
+    return buf;
+}
+
+test "autoFilter row insert: shifts ref row halves" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<autoFilter ref=\"B2:D5\"/>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 3, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "ref=\"B2:D6\"") != null);
+}
+
+test "autoFilter row delete inside range: shifts BR row only" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<autoFilter ref=\"B2:D5\"/>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 3, .delete);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "ref=\"B2:D4\"") != null);
+}
+
+test "autoFilter row delete that collapses entire range: drops self-closing tag" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<autoFilter ref=\"A5:D5\"/>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 5, .delete);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<autoFilter") == null);
+}
+
+test "autoFilter row delete that collapses entire range: drops open form + body" {
+    const a = testing.allocator;
+    const src = try wrapSheet(
+        a,
+        "<autoFilter ref=\"A5:D5\"><filterColumn colId=\"0\"><filters><filter val=\"x\"/></filters></filterColumn></autoFilter>",
+    );
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 5, .delete);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<autoFilter") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "<filterColumn") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "</autoFilter>") == null);
+}
+
+test "autoFilter col insert before range: shifts both halves right" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<autoFilter ref=\"D2:G5\"/>");
+    defer a.free(src);
+    const out = try applyColEditToWorksheet(a, src, 2, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "ref=\"E2:H5\"") != null);
+}
+
+test "autoFilter col delete inside range: BR shrinks by one" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<autoFilter ref=\"B2:E5\"/>");
+    defer a.free(src);
+    const out = try applyColEditToWorksheet(a, src, 4, .delete);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "ref=\"B2:D5\"") != null);
+}
+
+test "autoFilter col delete on single-column range: drops entire tag" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<autoFilter ref=\"C1:C10\"/>");
+    defer a.free(src);
+    const out = try applyColEditToWorksheet(a, src, 3, .delete);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<autoFilter") == null);
+}
+
+test "autoFilter open form: filterColumn colId rebases on col delete inside range" {
+    const a = testing.allocator;
+    // Range B2:E5 (cols B,C,D,E). Delete col B → range B2:D5
+    // (cols B,C,D — original C/D/E shifted left). filterColumn
+    // colId=0 (was B) is dropped; colId=1 (was C) → 0; colId=2
+    // (was D) → 1; colId=3 (was E) → 2.
+    const body =
+        "<autoFilter ref=\"B2:E5\">" ++
+        "<filterColumn colId=\"0\"><filters><filter val=\"x\"/></filters></filterColumn>" ++
+        "<filterColumn colId=\"1\"><filters><filter val=\"y\"/></filters></filterColumn>" ++
+        "<filterColumn colId=\"2\"><filters><filter val=\"z\"/></filters></filterColumn>" ++
+        "<filterColumn colId=\"3\"><filters><filter val=\"w\"/></filters></filterColumn>" ++
+        "</autoFilter>";
+    const src = try wrapSheet(a, body);
+    defer a.free(src);
+    const out = try applyColEditToWorksheet(a, src, 2, .delete);
+    defer a.free(out);
+    // The col-B filterColumn (val=x) was dropped entirely.
+    try testing.expect(std.mem.indexOf(u8, out, "val=\"x\"") == null);
+    // Range shrinks to B2:D5.
+    try testing.expect(std.mem.indexOf(u8, out, "ref=\"B2:D5\"") != null);
+    // Surviving filterColumns rebased: y→0, z→1, w→2.
+    const y_at = std.mem.indexOf(u8, out, "val=\"y\"").?;
+    const z_at = std.mem.indexOf(u8, out, "val=\"z\"").?;
+    const w_at = std.mem.indexOf(u8, out, "val=\"w\"").?;
+    try testing.expect(std.mem.indexOf(u8, out[0..y_at], "colId=\"0\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out[0..z_at], "colId=\"1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out[0..w_at], "colId=\"2\"") != null);
+}
+
+test "autoFilter open form: filterColumn colId rebases on col insert inside range" {
+    const a = testing.allocator;
+    // Range B2:E5. Insert col C (=3) → range B2:F5; new col is at
+    // colId=1 (no filterColumn there). Old colIds: 0 (B) stays 0;
+    // 1 (C) → 2; 2 (D) → 3; 3 (E) → 4.
+    const body =
+        "<autoFilter ref=\"B2:E5\">" ++
+        "<filterColumn colId=\"0\"><filters><filter val=\"x\"/></filters></filterColumn>" ++
+        "<filterColumn colId=\"1\"><filters><filter val=\"y\"/></filters></filterColumn>" ++
+        "<filterColumn colId=\"2\"><filters><filter val=\"z\"/></filters></filterColumn>" ++
+        "<filterColumn colId=\"3\"><filters><filter val=\"w\"/></filters></filterColumn>" ++
+        "</autoFilter>";
+    const src = try wrapSheet(a, body);
+    defer a.free(src);
+    const out = try applyColEditToWorksheet(a, src, 3, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "ref=\"B2:F5\"") != null);
+    const x_at = std.mem.indexOf(u8, out, "val=\"x\"").?;
+    const y_at = std.mem.indexOf(u8, out, "val=\"y\"").?;
+    const z_at = std.mem.indexOf(u8, out, "val=\"z\"").?;
+    const w_at = std.mem.indexOf(u8, out, "val=\"w\"").?;
+    try testing.expect(std.mem.indexOf(u8, out[0..x_at], "colId=\"0\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out[0..y_at], "colId=\"2\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out[0..z_at], "colId=\"3\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out[0..w_at], "colId=\"4\"") != null);
+}
+
+test "autoFilter col insert past range: ref unchanged" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<autoFilter ref=\"B2:D5\"/>");
+    defer a.free(src);
+    const out = try applyColEditToWorksheet(a, src, 10, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "ref=\"B2:D5\"") != null);
+}
+
+test "autoFilter passes through when ref attribute is missing" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<autoFilter/>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 1, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<autoFilter/>") != null);
 }
