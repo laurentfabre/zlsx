@@ -285,7 +285,12 @@ fn readCorner(src: []const u8, corner_lo: usize, corner_hi: usize, axis: Axis) ?
 /// anchor body `[lo, hi)`. Returns null if the block isn't
 /// present.
 const BlockBounds = struct {
+    /// Byte offset of the `<` of the opening tag.
+    open_start: usize,
+    /// Byte offset just past the `>` of the opening tag (start
+    /// of the inner text content).
     lo: usize,
+    /// Byte offset of the `<` of the closing tag.
     hi: usize,
 };
 
@@ -321,7 +326,7 @@ fn findCornerBlock(src: []const u8, lo: usize, hi: usize, name: []const u8) ?Blo
     const inner_lo = open_pos + open_needle.len;
     const close_pos = std.mem.indexOfPos(u8, src, inner_lo, close_needle) orelse return null;
     if (close_pos >= hi) return null;
-    return .{ .lo = inner_lo, .hi = close_pos };
+    return .{ .open_start = open_pos, .lo = inner_lo, .hi = close_pos };
 }
 
 fn processTwoCellAnchor(
@@ -389,11 +394,18 @@ fn processTwoCellAnchor(
     // Emit the anchor open tag verbatim.
     try out.appendSlice(allocator, src[a.open_start..a.after_open]);
 
-    // Walk body, splicing rewritten coord text where applicable.
-    try emitCornerSpliced(allocator, out, src, body_lo, from_block, from_corner, new_from);
-    try emitBetween(allocator, out, src, from_block, to_block);
-    try emitCornerSpliced(allocator, out, src, to_block.lo, to_block, to_corner, new_to);
-    try out.appendSlice(allocator, src[to_block.hi..a.after_close]);
+    // Body layout (unchanged regions emit verbatim; corner
+    // bodies emit spliced):
+    //   src[body_lo .. from_block.open_start]      lead-in to <xdr:from>
+    //   <xdr:from>...spliced...</xdr:from>          from-block (incl. tags)
+    //   src[from_close_end .. to_block.open_start]  between from + to
+    //   <xdr:to>...spliced...</xdr:to>              to-block (incl. tags)
+    //   src[to_close_end .. a.after_close]          tail (e.g. <xdr:pic>...</xdr:twoCellAnchor>)
+    try out.appendSlice(allocator, src[body_lo..from_block.open_start]);
+    try emitCornerBlock(allocator, out, src, from_block, "from", from_corner, new_from);
+    try out.appendSlice(allocator, src[closeAfter(from_block, "from")..to_block.open_start]);
+    try emitCornerBlock(allocator, out, src, to_block, "to", to_corner, new_to);
+    try out.appendSlice(allocator, src[closeAfter(to_block, "to")..a.after_close]);
     cursor.* = a.after_close;
 }
 
@@ -439,92 +451,55 @@ fn processOneCellAnchor(
     }
 
     try out.appendSlice(allocator, src[a.open_start..a.after_open]);
-    try emitCornerSpliced(allocator, out, src, body_lo, from_block, from_corner, new_from);
-    try out.appendSlice(allocator, src[from_block.hi..a.after_close]);
+    try out.appendSlice(allocator, src[body_lo..from_block.open_start]);
+    try emitCornerBlock(allocator, out, src, from_block, "from", from_corner, new_from);
+    try out.appendSlice(allocator, src[closeAfter(from_block, "from")..a.after_close]);
     cursor.* = a.after_close;
 }
 
-/// Emit `src[block_lo .. block.lo]` (any leading whitespace /
-/// other elements before the corner block opens), then the
-/// corner block contents with the axis sub-element's text spliced
-/// to `new_value`. If the corner sub-element couldn't be parsed
-/// (corner is null) the block emits verbatim.
-fn emitCornerSpliced(
+/// Emit `<xdr:NAME>…</xdr:NAME>` (open + body + close) with the
+/// axis sub-element's text spliced to `new_value`. If the corner
+/// sub-element couldn't be parsed (corner is null) the block
+/// emits verbatim.
+fn emitCornerBlock(
     allocator: Allocator,
     out: *std.ArrayListUnmanaged(u8),
     src: []const u8,
-    block_lo: usize,
     block: BlockBounds,
+    name: []const u8,
     corner: ?CornerCoord,
     new_value: ?u32,
 ) Error!void {
-    // Lead-in: whatever sits between `block_lo` and the start of
-    // the corner-block's open tag. For from-block, block_lo is
-    // body_lo; for to-block this isn't called (emitBetween covers
-    // it). Since findCornerBlock returns inner bounds, we need to
-    // back up from block.lo by the open tag's length to find the
-    // open tag's start.
-    const open_tag_len = 1 + xdr_prefix.len + "from".len + 1; // '<xdr:from>'
-    // `from` and `to` happen to be the same length (4); treat both
-    // identically. We could derive from `block.lo` by scanning
-    // backwards for `<` instead, but the two names happen to be
-    // size-symmetric.
-    _ = open_tag_len;
-    // Find the actual open `<` so we don't depend on the name's
-    // length symmetry.
-    var open_back = block.lo;
-    while (open_back > block_lo) : (open_back -= 1) {
-        if (src[open_back - 1] == '<') {
-            open_back -= 1;
-            break;
-        }
-    }
-    // Emit lead-in (everything before `<xdr:from>` / `<xdr:to>`).
-    try out.appendSlice(allocator, src[block_lo..open_back]);
-    // Emit the open tag itself.
-    try out.appendSlice(allocator, src[open_back..block.lo]);
+    // Open tag: `src[open_start .. lo]` is `<xdr:NAME>`.
+    try out.appendSlice(allocator, src[block.open_start..block.lo]);
 
     if (corner == null or new_value == null or corner.?.value == new_value.?) {
-        // No rewrite needed (or possible): pass through the body.
+        // No rewrite needed: pass through the body verbatim.
         try out.appendSlice(allocator, src[block.lo..block.hi]);
-        return;
+    } else {
+        const c = corner.?;
+        // Emit body up to the axis sub-element's text.
+        try out.appendSlice(allocator, src[block.lo..c.span.text_start]);
+        // Splice the new value as a decimal integer. u32 max is
+        // 10 digits — bufPrint into a 16-byte buffer cannot exhaust.
+        var num_buf: [16]u8 = undefined;
+        const new_text = std.fmt.bufPrint(&num_buf, "{d}", .{new_value.?}) catch unreachable;
+        try out.appendSlice(allocator, new_text);
+        // Emit the rest of the body.
+        try out.appendSlice(allocator, src[c.span.text_end..block.hi]);
     }
 
-    const c = corner.?;
-    // Emit body up to the axis sub-element's text.
-    try out.appendSlice(allocator, src[block.lo..c.span.text_start]);
-    // Splice the new value as a decimal integer. u32 max is 10
-    // digits — bufPrint into a 16-byte buffer cannot exhaust.
-    var num_buf: [16]u8 = undefined;
-    const new_text = std.fmt.bufPrint(&num_buf, "{d}", .{new_value.?}) catch unreachable;
-    try out.appendSlice(allocator, new_text);
-    // Emit the rest of the body.
-    try out.appendSlice(allocator, src[c.span.text_end..block.hi]);
+    // Close tag: `src[hi .. closeAfter(block, name)]` is
+    // `</xdr:NAME>`.
+    try out.appendSlice(allocator, src[block.hi..closeAfter(block, name)]);
 }
 
-/// Emit `src[from_block.hi .. <to_block_open_start>]`.
-fn emitBetween(
-    allocator: Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    src: []const u8,
-    from_block: BlockBounds,
-    to_block: BlockBounds,
-) Error!void {
-    // Find the `<xdr:to>` open tag's start so we can include all
-    // bytes between the from-block close and the to-block open.
-    const close_to_block = "</xdr:from>".len; // already past from.hi (inner end)
-    _ = close_to_block;
-    // Walk back from to_block.lo to find the `<` of `<xdr:to>`.
-    var to_open = to_block.lo;
-    while (to_open > from_block.hi) : (to_open -= 1) {
-        if (src[to_open - 1] == '<') {
-            to_open -= 1;
-            break;
-        }
-    }
-    try out.appendSlice(allocator, src[from_block.hi..to_open]);
-    // Note: emitCornerSpliced will write the open tag separately
-    // when called for the to-block.
+/// Byte offset just past the `>` of the corner block's closing
+/// `</xdr:NAME>` tag. `findCornerBlock` already validated that
+/// the closing tag is well-formed in the input, so we compute
+/// the offset arithmetically rather than rescanning.
+fn closeAfter(block: BlockBounds, name: []const u8) usize {
+    return block.hi + "</".len + xdr_prefix.len + name.len + 1; // 1 for '>'
 }
 
 // ---------------------------------------------------------------------------
@@ -682,6 +657,38 @@ test "absoluteAnchor passes through unchanged" {
     const out = try applyEditToDrawing(a, src, .col, 0, .insert);
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "<xdr:absoluteAnchor>") != null);
+}
+
+test "twoCellAnchor: rewrite preserves <xdr:to> opener (regression: emit-block bug)" {
+    const a = testing.allocator;
+    const src = try wrapDrawing(a, sample_two);
+    defer a.free(src);
+    const out = try applyEditToDrawing(a, src, .col, 0, .insert);
+    defer a.free(out);
+    // Both opener tags AND closer tags must survive the splice —
+    // the prior emit-block code dropped <xdr:to> in valid input.
+    try testing.expect(std.mem.indexOf(u8, out, "<xdr:from>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "</xdr:from>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<xdr:to>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "</xdr:to>") != null);
+    // Each appears exactly once for a single anchor.
+    var i: usize = 0;
+    var to_open_count: usize = 0;
+    while (std.mem.indexOfPos(u8, out, i, "<xdr:to>")) |idx| {
+        to_open_count += 1;
+        i = idx + 1;
+    }
+    try testing.expectEqual(@as(usize, 1), to_open_count);
+}
+
+test "twoCellAnchor: no-op rewrite is byte-identical (SHA256 passthrough)" {
+    const a = testing.allocator;
+    const src = try wrapDrawing(a, sample_two);
+    defer a.free(src);
+    // Insert at col 100 — well past the anchor's to=3. No coord changes.
+    const out = try applyEditToDrawing(a, src, .col, 100, .insert);
+    defer a.free(out);
+    try testing.expectEqualSlices(u8, src, out);
 }
 
 test "two adjacent twoCellAnchors both rewrite correctly" {

@@ -3746,3 +3746,51 @@ test "Editor: deleteColumn at the anchor's column drops the oneCellAnchor (dr-1)
     }
     try std.testing.expect(!try drawingPartContains(dst_path, "<xdr:oneCellAnchor>"));
 }
+
+test "Editor: drawing rewrite tolerates XML whitespace around `=` in worksheet rels (dr-1 REL-602/604)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "draw_eq_ws_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "draw_eq_ws_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    try buildDrawingFixture(src_path, 3, 5);
+    // Splice a custom `<drawing  r:id  =  "rId99"/>` into sheet1.xml
+    // ALONGSIDE the existing well-formed `<drawing r:id="rIdN"/>`
+    // emitted by addImage; we exercise the parser's whitespace
+    // tolerance even though the resolved part is the SAME.
+    {
+        var store = try store_mod.PartStore.open(std.testing.allocator, src_path);
+        defer store.deinit();
+        const sheet_name = "xl/worksheets/sheet1.xml";
+        const orig = (try store.part(sheet_name)) orelse return error.MissingSheet;
+        // Find the existing <drawing tag and rewrite it with
+        // whitespace around `=`.
+        const orig_open = std.mem.indexOf(u8, orig.bytes, "<drawing ") orelse return error.NoDrawingTag;
+        const orig_end = std.mem.indexOfPos(u8, orig.bytes, orig_open, "/>") orelse return error.NoDrawingClose;
+        // Extract the rId from the existing tag.
+        const eq = std.mem.indexOfScalarPos(u8, orig.bytes, orig_open, '=') orelse return error.NoEq;
+        const q1 = std.mem.indexOfScalarPos(u8, orig.bytes, eq, '"') orelse return error.NoQ1;
+        const q2 = std.mem.indexOfScalarPos(u8, orig.bytes, q1 + 1, '"') orelse return error.NoQ2;
+        const rid = orig.bytes[q1 + 1 .. q2];
+        var ws_tag_buf: [128]u8 = undefined;
+        const ws_tag = try std.fmt.bufPrint(&ws_tag_buf, "<drawing  r:id  =  \"{s}\" />", .{rid});
+        var new_xml = try std.testing.allocator.alloc(u8, orig.bytes.len - (orig_end + 2 - orig_open) + ws_tag.len);
+        defer std.testing.allocator.free(new_xml);
+        @memcpy(new_xml[0..orig_open], orig.bytes[0..orig_open]);
+        @memcpy(new_xml[orig_open .. orig_open + ws_tag.len], ws_tag);
+        @memcpy(new_xml[orig_open + ws_tag.len ..], orig.bytes[orig_end + 2 ..]);
+        try store.replacePart(sheet_name, new_xml);
+        try store.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertColumn(0, 2);
+        try ed.save(dst_path);
+    }
+    // The drawing's xdr:col MUST shift; if findAttrValue mishandled
+    // the whitespace, applyDrawingEditForSheet would silently skip
+    // and the col would still be 2.
+    try std.testing.expect(try drawingPartContains(dst_path, "<xdr:col>3</xdr:col>"));
+}

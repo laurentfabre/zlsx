@@ -2442,7 +2442,10 @@ fn findWorksheetDrawingRid(sheet_xml: []const u8) ?[]const u8 {
     while (i < sheet_xml.len) {
         const lt = std.mem.indexOfScalarPos(u8, sheet_xml, i, '<') orelse return null;
         const need = "<drawing".len;
-        if (lt + need > sheet_xml.len) return null;
+        // `>=`: when sheet_xml ends exactly at `<drawing` we'd
+        // otherwise read one byte past the slice. Found by Codex
+        // review (REL-601 P2).
+        if (lt + need >= sheet_xml.len) return null;
         if (std.mem.eql(u8, sheet_xml[lt .. lt + need], "<drawing")) {
             const after_byte = sheet_xml[lt + need];
             if (after_byte == ' ' or after_byte == '\t' or after_byte == '\r' or
@@ -2467,18 +2470,33 @@ fn relTargetForId(rels: []const store_mod.Relationship, id: []const u8) ?[]const
 }
 
 /// Read the value of `attr_name` (e.g. `r:id`) from a single
-/// element's bytes. Tolerates single or double quotes. Returns
-/// null when absent.
+/// element's bytes. Tolerates single or double quotes AND
+/// XML 1.0 §3.1 `Eq` whitespace on both sides of `=` (per
+/// Codex review REL-602 + REL-604). Returns null when absent.
 fn findAttrValue(element_bytes: []const u8, attr_name: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i < element_bytes.len) {
         const eq = std.mem.indexOfScalarPos(u8, element_bytes, i, '=') orelse return null;
-        if (eq < attr_name.len) {
+        // Walk backward across XML whitespace to find the end of
+        // the attribute name (XML allows `name = "value"`).
+        var name_end = eq;
+        while (name_end > 0) {
+            const ch = element_bytes[name_end - 1];
+            if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r') {
+                name_end -= 1;
+                continue;
+            }
+            break;
+        }
+        if (name_end < attr_name.len) {
             i = eq + 1;
             continue;
         }
-        const name_start = eq - attr_name.len;
-        if (std.mem.eql(u8, element_bytes[name_start..eq], attr_name)) {
+        const name_start = name_end - attr_name.len;
+        if (std.mem.eql(u8, element_bytes[name_start..name_end], attr_name)) {
+            // Confirm the byte before the name is whitespace or
+            // `<` (otherwise this is a longer attr like
+            // `xr:id`, `customxr:id`, etc.).
             if (name_start == 0 or
                 element_bytes[name_start - 1] == ' ' or
                 element_bytes[name_start - 1] == '\t' or
@@ -2486,10 +2504,20 @@ fn findAttrValue(element_bytes: []const u8, attr_name: []const u8) ?[]const u8 {
                 element_bytes[name_start - 1] == '\r' or
                 element_bytes[name_start - 1] == '<')
             {
-                if (eq + 1 >= element_bytes.len) return null;
-                const quote = element_bytes[eq + 1];
+                // Skip XML whitespace between `=` and the quote.
+                var quote_pos = eq + 1;
+                while (quote_pos < element_bytes.len) {
+                    const ch = element_bytes[quote_pos];
+                    if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r') {
+                        quote_pos += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if (quote_pos >= element_bytes.len) return null;
+                const quote = element_bytes[quote_pos];
                 if (quote != '"' and quote != '\'') return null;
-                const value_start = eq + 2;
+                const value_start = quote_pos + 1;
                 const value_end = std.mem.indexOfScalarPos(u8, element_bytes, value_start, quote) orelse return null;
                 return element_bytes[value_start..value_end];
             }
