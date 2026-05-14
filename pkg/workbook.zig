@@ -34,6 +34,7 @@ const zlsx = @import("zlsx");
 const drawing_emit = @import("drawing_emit.zig");
 const sheet_edit = @import("sheet_edit.zig");
 const drawing_edit = @import("drawing_edit.zig");
+const vml_edit = @import("vml_edit.zig");
 const sst_plan_mod = @import("zlsx_sst_plan");
 const styles_plan_mod = @import("zlsx_styles_plan");
 const workbook_xml_plan_mod = @import("zlsx_workbook_xml_plan");
@@ -235,6 +236,25 @@ pub const Error = error{
     /// `<xdr:col>` or `<xdr:row>` value past `std.math.maxInt(u32)`.
     /// Practically unreachable. Surfaces from `pkg/drawing_edit.zig`.
     DrawingCoordinateOverflow,
+    /// dr-2: `Workbook.{insertRow, deleteRow, insertColumn, deleteColumn}`
+    /// failed while rewriting the sheet's legacy VML drawing
+    /// part because the part's structure didn't match the
+    /// expected `<x:Anchor>` 8-int payload shape OR an
+    /// `<x:Row>`/`<x:Column>` value couldn't be parsed. Refused
+    /// rather than emit a silently-corrupted VML drawing.
+    /// Surfaces from `pkg/vml_edit.zig`.
+    MalformedVmlDrawing,
+    /// dr-2: `Workbook.{insertRow, insertColumn}` would shift a
+    /// VML anchor coordinate past `std.math.maxInt(u32)`.
+    /// Practically unreachable. Surfaces from `pkg/vml_edit.zig`.
+    VmlCoordinateOverflow,
+    /// dr-2 / REL-705: `Workbook.{insertRow, deleteRow, insertColumn,
+    /// deleteColumn}` failed while rewriting the sheet's
+    /// `xl/commentsN.xml` part because a `<comment ref>` couldn't
+    /// be parsed as a single A1 cell. Refused rather than emit a
+    /// silently-corrupted comments part. Surfaces from
+    /// `pkg/vml_edit.zig::applyEditToCommentsXml`.
+    MalformedCommentsXml,
     /// `Workbook.addSheet` refused because the workbook already
     /// holds the type-system maximum (`std.math.maxInt(u32)`)
     /// number of sheets. Excel imposes no documented sheet count
@@ -2354,6 +2374,11 @@ pub const Workbook = struct {
         // passthrough holds.
         try self.applyDrawingEditForSheet(part_name, part.bytes, spec);
 
+        // dr-2: rewrite legacy VML drawing + paired comments part
+        // (anchor cell + display rect + paired `<comment ref>`).
+        // Sheets without `<legacyDrawing r:id>` skip silently.
+        try self.applyVmlDrawingEditForSheet(part_name, part.bytes, spec);
+
         // Invalidate the cached parsed view — the row/col-shifted
         // bytes don't match the previously-parsed structure, and
         // any subsequent ensureParsed must re-tokenize the new
@@ -2431,7 +2456,99 @@ pub const Workbook = struct {
             try self.store.replacePart(drawing_part_name, new_drawing);
         }
     }
+
+    /// dr-2: rewrite the legacy VML drawing part referenced by
+    /// the sheet (if any), AND the paired comments part. VML
+    /// `<x:Anchor>` 8-int payload + the `<x:Row>`/`<x:Column>`
+    /// anchor cell shift in step with the edit; shapes whose
+    /// anchor cell is on the deleted axis drop. The paired
+    /// `<comment ref>` in `xl/commentsN.xml` shifts/drops
+    /// alongside (REL-705 — they MUST stay synchronized).
+    fn applyVmlDrawingEditForSheet(
+        self: *Workbook,
+        sheet_part_name: []const u8,
+        sheet_xml: []const u8,
+        spec: SheetEditSpec,
+    ) Error!void {
+        const idx_1based = spec.row orelse spec.col.?;
+        if (idx_1based == 0) return;
+        const axis: vml_edit.Axis = if (spec.row != null) .row else .col;
+        const kind: vml_edit.EditKind = switch (spec.kind) {
+            .insert => .insert,
+            .delete => .delete,
+        };
+        const rels = self.store.rels(sheet_part_name);
+
+        // VML drawing rewrite (anchor cell + display rect).
+        if (findWorksheetLegacyDrawingRid(sheet_xml)) |rid| {
+            if (relTargetForId(rels, rid)) |target| {
+                if (try self.store.resolve(sheet_part_name, target)) |drawing_part_name| {
+                    if (try self.store.part(drawing_part_name)) |drawing_part| {
+                        const new_bytes = try vml_edit.applyEditToVmlDrawing(
+                            self.allocator,
+                            drawing_part.bytes,
+                            axis,
+                            idx_1based - 1,
+                            kind,
+                        );
+                        defer self.allocator.free(new_bytes);
+                        if (!std.mem.eql(u8, drawing_part.bytes, new_bytes)) {
+                            try self.store.replacePart(drawing_part_name, new_bytes);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Comments part rewrite (REL-705): every VML note shape
+        // has a paired `<comment ref>` in `xl/commentsN.xml` —
+        // they MUST stay synchronized. Drop on delete-match,
+        // shift otherwise. Identified by relationship Type
+        // (`/relationships/comments` suffix — catches both
+        // Transitional and Strict OOXML namespace URIs).
+        for (rels) |rel| {
+            if (!std.mem.endsWith(u8, rel.type, "/relationships/comments")) continue;
+            const comments_part_name = (try self.store.resolve(sheet_part_name, rel.target)) orelse continue;
+            const comments_part = (try self.store.part(comments_part_name)) orelse continue;
+            const new_bytes = try vml_edit.applyEditToCommentsXml(
+                self.allocator,
+                comments_part.bytes,
+                axis,
+                idx_1based,
+                kind,
+            );
+            defer self.allocator.free(new_bytes);
+            if (!std.mem.eql(u8, comments_part.bytes, new_bytes)) {
+                try self.store.replacePart(comments_part_name, new_bytes);
+            }
+        }
+    }
 };
+
+/// Find the value of `r:id` on the worksheet's `<legacyDrawing>`
+/// element (always self-closing, at most one per sheet). Returns
+/// null when the element isn't present. The xdr-side `<drawing>`
+/// element has its own finder; the two are distinct elements and
+/// must not match each other.
+fn findWorksheetLegacyDrawingRid(sheet_xml: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < sheet_xml.len) {
+        const lt = std.mem.indexOfScalarPos(u8, sheet_xml, i, '<') orelse return null;
+        const need = "<legacyDrawing".len;
+        if (lt + need >= sheet_xml.len) return null;
+        if (std.mem.eql(u8, sheet_xml[lt .. lt + need], "<legacyDrawing")) {
+            const after_byte = sheet_xml[lt + need];
+            if (after_byte == ' ' or after_byte == '\t' or after_byte == '\r' or
+                after_byte == '\n' or after_byte == '/' or after_byte == '>')
+            {
+                const tag_end = std.mem.indexOfScalarPos(u8, sheet_xml, lt, '>') orelse return null;
+                return findAttrValue(sheet_xml[lt .. tag_end + 1], "r:id");
+            }
+        }
+        i = lt + 1;
+    }
+    return null;
+}
 
 /// Find the value of `r:id` on the worksheet's CT_Worksheet
 /// `<drawing>` element (always self-closing, at most one per
