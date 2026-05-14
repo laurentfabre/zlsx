@@ -360,8 +360,13 @@ fn processMergeCellTagCol(
 /// On range collapse (single-column filter where that column is
 /// deleted), the entire `<autoFilter>` is dropped.
 ///
-/// Caveat: nested `<sortState ref="…">` carries its own range that
-/// would also need shifting — not handled in v1.
+/// Caveat: nested `<sortState ref="…">` is not rewritten when the
+/// `<autoFilter>` is sheet-bare (open form). When this function is
+/// delegated to from `pkg/table_edit.zig` for an `<autoFilter>`
+/// inside a `<table>`, sortState IS handled — by table_edit's outer
+/// walker, which intercepts `<sortState>` siblings independently.
+/// zlsx's writer never emits open-form sheet-bare autoFilter, so
+/// the remaining caveat only matters for third-party files.
 pub fn processAutoFilterTagCol(
     allocator: Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -971,9 +976,12 @@ fn processMergeCellTag(
 /// onto the deleted row, the whole element (open form: open + body
 /// + close; self-closing form: just the open tag) is dropped.
 ///
-/// Caveat: nested `<sortState ref="…">` carries its own range that
-/// would also need shifting — not handled in v1; zlsx never emits
-/// open-form autoFilter so this only matters for third-party files
+/// Caveat: nested `<sortState ref="…">` is not rewritten when the
+/// `<autoFilter>` is sheet-bare (open form). For table-inner
+/// `<autoFilter>` (delegated from `pkg/table_edit.zig`), sortState
+/// is handled by table_edit's outer walker. zlsx's writer never
+/// emits open-form sheet-bare autoFilter, so the remaining caveat
+/// only matters for third-party files
 /// that mix autoFilter sortState with row edits.
 pub fn processAutoFilterTagRow(
     allocator: Allocator,

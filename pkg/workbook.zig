@@ -2685,6 +2685,13 @@ const TablePartRidIterator = struct {
                     after_byte == '\n' or after_byte == '/' or after_byte == '>')
                 {
                     const tag_end = std.mem.indexOfScalarPos(u8, self.sheet_xml, lt, '>') orelse return null;
+                    // REL-B524: refuse to consume a `<tablePart>` whose
+                    // closing `>` lies past the parent `<tableParts>`
+                    // block — well-formed XML guarantees this won't
+                    // happen, but on adversarial input the iterator
+                    // would otherwise leak a rid from outside the
+                    // block.
+                    if (tag_end >= self.block_end) return null;
                     self.cursor = tag_end + 1;
                     if (findAttrValue(self.sheet_xml[lt .. tag_end + 1], "r:id")) |rid| {
                         return rid;

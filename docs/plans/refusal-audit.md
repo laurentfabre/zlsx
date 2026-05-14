@@ -120,10 +120,15 @@ guard).
 After the `delete_sheet` rewriter variant ships, the `deleteSheet`
 defined-names refusal lifts trivially.
 
-After all five ship: delete `anySheetCrossSheetCarrier` +
-`RowEditUnsafeForSheet` / `ColEditUnsafeForSheet` (the latter two
-stay only for the per-sheet drawing/pivot/pane/autoFilter cases,
-which keep narrower error names).
+**Status (2026-05-14)**: `anySheetCrossSheetCarrier` is gone — the
+five rewriters shipped through B2 iter-er-5 (formula, hyperlink, DV,
+CF, defined-names). `RowEditUnsafeForSheet` / `ColEditUnsafeForSheet`
+remain solely as the umbrella errors for the structured-table
+pre-flight (`pkg/editor.zig` remaps `TableCollapseUnsafe` /
+`TableHeaderRowDeleteUnsafe` / `MalformedTableXml` /
+`TableCoordinateOverflow` into them). The drawing / pane /
+autoFilter axes lift via dedicated typed errors and no longer
+surface the umbrella names.
 
 ## What this audit explicitly does NOT do
 

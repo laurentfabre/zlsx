@@ -867,8 +867,20 @@ pub const Editor = struct {
         // before any sheet bytes are mutated.
         const path = self.sheet_paths[sheet_idx];
         const tbl_kind: table_edit.EditKind = if (is_insert) .insert else .delete;
+        // REL-B527/B528: remap every table_edit refusal/diagnostic
+        // to the existing `ColEditUnsafeForSheet` axis. Surfacing
+        // `MalformedTableXml` / `TableCoordinateOverflow` raw would
+        // leak Workbook-internal error names through Editor's
+        // public surface — and a user staring at "MalformedTableXml"
+        // from `Editor.insertColumn` has no actionable fix beyond
+        // "this sheet is unsafe to edit", which is exactly what
+        // `ColEditUnsafeForSheet` already means.
         self.workbook.preflightTableEditsForSheet(path, .col, col_1based, tbl_kind) catch |err| switch (err) {
-            error.TableCollapseUnsafe, error.TableHeaderRowDeleteUnsafe => return error.ColEditUnsafeForSheet,
+            error.TableCollapseUnsafe,
+            error.TableHeaderRowDeleteUnsafe,
+            error.MalformedTableXml,
+            error.TableCoordinateOverflow,
+            => return error.ColEditUnsafeForSheet,
             else => |e| return e,
         };
 
@@ -913,8 +925,15 @@ pub const Editor = struct {
         // schema-invalid table states, not unrewritten ones).
         const path = self.sheet_paths[sheet_idx];
         const tbl_kind: table_edit.EditKind = if (is_insert) .insert else .delete;
+        // REL-B527/B528: same remap as recordColEdit — every
+        // table_edit refusal/diagnostic folds into the existing
+        // `RowEditUnsafeForSheet` axis.
         self.workbook.preflightTableEditsForSheet(path, .row, row, tbl_kind) catch |err| switch (err) {
-            error.TableCollapseUnsafe, error.TableHeaderRowDeleteUnsafe => return error.RowEditUnsafeForSheet,
+            error.TableCollapseUnsafe,
+            error.TableHeaderRowDeleteUnsafe,
+            error.MalformedTableXml,
+            error.TableCoordinateOverflow,
+            => return error.RowEditUnsafeForSheet,
             else => |e| return e,
         };
 
@@ -3920,9 +3939,22 @@ fn copyCorpusToTmp(src_corpus: []const u8, dst_path: [:0]const u8) !void {
 fn tablePartContains(path: []const u8, table_part: []const u8, needle: []const u8) !bool {
     var ed = try Editor.open(std.testing.allocator, path);
     defer ed.deinit();
-    const xml = ed.readEntry(table_part) catch return false;
+    // Propagate readEntry errors so the assertion fails loudly when
+    // the part is missing — the previous `catch return false` silently
+    // turned MissingEntry into "needle not found", letting tests with
+    // negative assertions pass against a deleted part (REL-B532).
+    const xml = try ed.readEntry(table_part);
     defer std.testing.allocator.free(xml);
     return std.mem.indexOf(u8, xml, needle) != null;
+}
+
+/// Read an entry's bytes via the Editor's source-archive view.
+/// Test-only helper for byte-equality assertions on parts that
+/// aren't supposed to change.
+fn readEntryBytes(path: []const u8, entry_name: []const u8) ![]u8 {
+    var ed = try Editor.open(std.testing.allocator, path);
+    defer ed.deinit();
+    return try ed.readEntry(entry_name);
 }
 
 test "Editor: insertRow above table shifts <table ref> in xl/tables/tableN.xml" {
@@ -4015,8 +4047,13 @@ test "Editor: edit outside table range is byte-stable inside the table part" {
         try ed.insertColumn(0, 12);
         try ed.save(dst_path);
     }
-    // Table ref unchanged; the byte-equal short-circuit in
-    // applyTableEditsForSheet skips the replacePart, so SHA256
-    // passthrough holds for the table part.
-    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "ref=\"C9:E10\""));
+    // REL-B530: actually verify byte-identity (not just substring
+    // presence). The byte-equal short-circuit in
+    // applyTableEditsForSheet must skip the replacePart entirely so
+    // the table part flows through ZIP substitution untouched.
+    const src_table = try readEntryBytes(src_path, "xl/tables/table1.xml");
+    defer std.testing.allocator.free(src_table);
+    const dst_table = try readEntryBytes(dst_path, "xl/tables/table1.xml");
+    defer std.testing.allocator.free(dst_table);
+    try std.testing.expectEqualSlices(u8, src_table, dst_table);
 }

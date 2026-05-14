@@ -16,9 +16,15 @@
 //! `count=` is updated to match.
 //!
 //! Per ECMA-376 §18.5.1.78 (`CT_TableColumn`), `<tableColumn id>`
-//! is a stable workbook-unique field ID, NOT a positional index —
-//! survivors keep their ids; an inserted column claims the
-//! max(existing ids) + 1.
+//! is a stable **table-unique** field ID, NOT a positional index
+//! and NOT workbook-unique (the `<table id>` attribute is the
+//! workbook-unique one) — survivors keep their ids; an inserted
+//! column claims `max(existing ids) + 1`.
+//!
+//! `<tableColumn name>` must also be unique within the parent table
+//! (same spec section). Synthetic inserts probe `Column<id>`,
+//! `Column<id>_2`, ... until finding a free name to avoid clashing
+//! with a pre-existing column literally named "Column4" etc.
 //!
 //! Pre-flight refusals: a table cannot legally collapse to zero
 //! columns or zero rows (header + ≥0 data rows). Edits that would
@@ -75,8 +81,12 @@ const TableHeader = struct {
     br_col: u32,
     tl_row: u32,
     br_row: u32,
-    /// Defaults to 1 per ECMA-376 §18.5.1.2.
+    /// Defaults to 1 per ECMA-376 §18.5.1.2. Distinguishes
+    /// "explicit 0" (legitimate header-less table) from "absent or
+    /// 1" (default headered table) so `checkEditSafe` can permit
+    /// top-row deletes in the header-less case (REL-A501).
     header_row_count: u32,
+    header_row_count_explicit_zero: bool,
 };
 
 /// Apply one row OR column edit to a `xl/tables/tableN.xml` body.
@@ -157,13 +167,20 @@ fn parseTableHeader(src: []const u8) ?TableHeader {
             const attrs = src[t.start + "<table".len .. t.after_open - 1];
             const ref = getAttr(attrs, "ref") orelse return null;
             const range = parseRange(ref) orelse return null;
-            const hrc: u32 = blk: {
-                if (getAttr(attrs, "headerRowCount")) |v| {
-                    const n = std.fmt.parseInt(u32, v, 10) catch break :blk 1;
-                    break :blk n;
+            // REL-A501 + REL-A509: distinguish "explicit 0" from
+            // "default 1". Malformed (un-parseable) values fall
+            // back to the spec default (1) — strictness here would
+            // surface MalformedTableXml from a third-party file
+            // with `headerRowCount="x"`, which Editor would remap
+            // to RowEditUnsafeForSheet anyway.
+            var hrc: u32 = 1;
+            var hrc_explicit_zero = false;
+            if (getAttr(attrs, "headerRowCount")) |v| {
+                if (std.fmt.parseInt(u32, v, 10) catch null) |n| {
+                    hrc = n;
+                    if (n == 0) hrc_explicit_zero = true;
                 }
-                break :blk 1;
-            };
+            }
             return .{
                 .tag = t,
                 .tl_col = range.tl_col,
@@ -171,6 +188,7 @@ fn parseTableHeader(src: []const u8) ?TableHeader {
                 .tl_row = range.tl_row,
                 .br_row = range.br_row,
                 .header_row_count = hrc,
+                .header_row_count_explicit_zero = hrc_explicit_zero,
             };
         }
         i = lt + 1;
@@ -212,11 +230,12 @@ fn checkEditSafe(hdr: TableHeader, axis: Axis, idx_1based: u32, kind: EditKind) 
     // kind == .delete
     switch (axis) {
         .row => {
-            // Header-row delete (only refuse when the edit lands on
-            // the table's top row AND the table actually has a
-            // header). zlsx considers headerRowCount >= 1 to mean
-            // "row tl_row is the header" — refuse those deletes.
-            if (idx_1based == hdr.tl_row and hdr.header_row_count >= 1) {
+            // Header-row delete: refuse when the edit lands on the
+            // table's top row AND the table actually has a header
+            // (REL-A501). `headerRowCount="0"` (explicit) means a
+            // header-less table — top-row delete is a normal data
+            // shrink, not a structural break, so allow it.
+            if (idx_1based == hdr.tl_row and hdr.header_row_count >= 1 and !hdr.header_row_count_explicit_zero) {
                 return error.TableHeaderRowDeleteUnsafe;
             }
             // Collapse: single-row table whose only row is deleted.
@@ -492,9 +511,19 @@ fn processTableColumnsForCol(
     const old_count_attr = getAttr(attrs_full, "count");
     const old_count = if (old_count_attr) |c| (std.fmt.parseInt(u32, c, 10) catch null) else null;
     const expected_count = hdr.br_col - hdr.tl_col + 1;
-    // Trust the attr when present and consistent; fall back to the
-    // header range otherwise.
-    const total_cols = if (old_count) |c| (if (c == expected_count) c else expected_count) else expected_count;
+    // REL-A505: refuse when the source's `<tableColumns count>`
+    // disagrees with the range. The previous code silently picked
+    // `expected_count`, producing a `count=` value that didn't
+    // match the actual `<tableColumn>` child count — invalid OOXML
+    // that Excel would surface as a repair-load. A divergent count
+    // means either the file was malformed or it carries a
+    // shape we don't model (e.g., `<tableColumns>` with `<extLst>`
+    // overrides). Either way, refuse the edit so the caller can
+    // surface a typed error rather than emit broken XML.
+    if (old_count) |c| {
+        if (c != expected_count) return error.MalformedTableXml;
+    }
+    const total_cols = expected_count;
 
     // The position within the table at which to insert/delete a
     // `<tableColumn>`. 0-based, mirrors filterColumn colId.
@@ -513,7 +542,7 @@ fn processTableColumnsForCol(
 
     // Pre-pass: find the max existing `<tableColumn id>` so the
     // synthetic insert claims `max + 1` without colliding with any
-    // not-yet-walked sibling. ids are stable workbook-unique
+    // not-yet-walked sibling. ids are stable table-unique
     // identifiers (ECMA-376 §18.5.1.78), not positions.
     const max_existing_id = scanMaxTableColumnId(src, t.after_open, close_pos);
 
@@ -552,7 +581,7 @@ fn processTableColumnsForCol(
             switch (kind) {
                 .insert => {
                     if (!inserted and seen_pos == target_pos) {
-                        try emitSyntheticTableColumn(allocator, out, max_existing_id + 1);
+                        try emitSyntheticTableColumn(allocator, out, src, t.after_open, close_pos, max_existing_id + 1);
                         inserted = true;
                     }
                     // Copy this tableColumn verbatim — ids stay
@@ -579,7 +608,7 @@ fn processTableColumnsForCol(
 
     // Insert beyond the last existing column? (target_pos == count)
     if (kind == .insert and !inserted) {
-        try emitSyntheticTableColumn(allocator, out, max_existing_id + 1);
+        try emitSyntheticTableColumn(allocator, out, src, t.after_open, close_pos, max_existing_id + 1);
     }
 
     // Emit close tag and advance.
@@ -590,11 +619,51 @@ fn processTableColumnsForCol(
 fn emitSyntheticTableColumn(
     allocator: Allocator,
     out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    body_start: usize,
+    body_end: usize,
     new_id: u32,
 ) !void {
-    var buf: [64]u8 = undefined;
-    const written = try std.fmt.bufPrint(&buf, "<tableColumn id=\"{d}\" name=\"Column{d}\"/>", .{ new_id, new_id });
+    // REL-A502: pick a `name` attribute that doesn't collide with
+    // any existing `<tableColumn name>` in the same table (ECMA-376
+    // §18.5.1.78 requires names unique within the parent table).
+    // Try `Column<id>`, then `Column<id>_2`, `Column<id>_3`, ...
+    var name_buf: [40]u8 = undefined;
+    var suffix: u32 = 1;
+    const name = while (true) {
+        const candidate = if (suffix == 1)
+            try std.fmt.bufPrint(&name_buf, "Column{d}", .{new_id})
+        else
+            try std.fmt.bufPrint(&name_buf, "Column{d}_{d}", .{ new_id, suffix });
+        if (!tableColumnNameTaken(src, body_start, body_end, candidate)) break candidate;
+        suffix += 1;
+        if (suffix > 1000) return error.MalformedTableXml; // pathological
+    };
+    var buf: [80]u8 = undefined;
+    const written = try std.fmt.bufPrint(&buf, "<tableColumn id=\"{d}\" name=\"{s}\"/>", .{ new_id, name });
     try out.appendSlice(allocator, written);
+}
+
+/// Walk `<tableColumn>` siblings looking for one whose `name`
+/// attribute equals `candidate`. Used by `emitSyntheticTableColumn`
+/// to dodge name collisions on insert (REL-A502).
+fn tableColumnNameTaken(src: []const u8, body_start: usize, body_end: usize, candidate: []const u8) bool {
+    var k = body_start;
+    while (k < body_end) {
+        const lt = std.mem.indexOfScalarPos(u8, src, k, '<') orelse return false;
+        if (lt >= body_end) return false;
+        if (sheet_edit.matchTagAt(src, lt, "tableColumn")) |ct| {
+            if (ct.after_open > body_end) return false;
+            const attrs = src[ct.start + "<tableColumn".len .. ct.after_open - 1];
+            if (getAttr(attrs, "name")) |existing| {
+                if (std.mem.eql(u8, existing, candidate)) return true;
+            }
+            k = ct.after_open;
+        } else {
+            k = lt + 1;
+        }
+    }
+    return false;
 }
 
 /// Walk the `<tableColumns>` body for the highest `<tableColumn id>`
@@ -753,3 +822,119 @@ test "table with no autoFilter shifts table ref only" {
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "ref=\"B2:D6\"") != null);
 }
+
+// REL-A501: headerRowCount="0" tables permit top-row delete.
+test "headerRowCount=0 permits top-row delete" {
+    const a = testing.allocator;
+    const headerless =
+        \\<?xml version="1.0"?>
+        \\<table id="1" ref="B2:D5" headerRowCount="0"><tableColumns count="3"><tableColumn id="1" name="a"/><tableColumn id="2" name="b"/><tableColumn id="3" name="c"/></tableColumns></table>
+    ;
+    const out = try applyEditToTable(a, headerless, .row, 2, .delete);
+    defer a.free(out);
+    // tl_row=2, br_row=5; delete row 2 → tl=2 (stays), br=4. Range B2:D4.
+    try testing.expect(std.mem.indexOf(u8, out, "ref=\"B2:D4\"") != null);
+}
+
+// REL-A501 (companion): default (absent) headerRowCount still refuses
+// top-row delete — the default is 1.
+test "absent headerRowCount refuses top-row delete (defaults to 1)" {
+    const a = testing.allocator;
+    const default_hdr =
+        \\<?xml version="1.0"?>
+        \\<table id="1" ref="B2:D5"><tableColumns count="3"><tableColumn id="1" name="a"/><tableColumn id="2" name="b"/><tableColumn id="3" name="c"/></tableColumns></table>
+    ;
+    const r = applyEditToTable(a, default_hdr, .row, 2, .delete);
+    try testing.expectError(error.TableHeaderRowDeleteUnsafe, r);
+}
+
+// REL-A502: synthetic <tableColumn name=> dodges existing-name collision.
+test "synthetic insert avoids name collision with existing Column<id>" {
+    const a = testing.allocator;
+    // Existing ids 1,2,3; existing names include "Column4" already.
+    // After insert at col 4 (D, inside B2:D5 → range becomes B2:E5),
+    // synthetic id = max(1,2,3)+1 = 4. Naive name "Column4" collides
+    // with the existing "Column4"; the fix should pick "Column4_2".
+    const colliding =
+        \\<?xml version="1.0"?>
+        \\<table id="1" ref="B2:D5"><tableColumns count="3"><tableColumn id="1" name="a"/><tableColumn id="2" name="Column4"/><tableColumn id="3" name="c"/></tableColumns></table>
+    ;
+    const out = try applyEditToTable(a, colliding, .col, 3, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "ref=\"B2:E5\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<tableColumn id=\"4\" name=\"Column4_2\"/>") != null);
+    // The original "Column4" survives unchanged.
+    try testing.expect(std.mem.indexOf(u8, out, "<tableColumn id=\"2\" name=\"Column4\"/>") != null);
+}
+
+// REL-A502 (companion): no collision → uses bare Column<id>.
+test "synthetic insert uses bare Column<id> when no collision" {
+    const a = testing.allocator;
+    const out = try applyEditToTable(a, sample_table, .col, 4, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<tableColumn id=\"4\" name=\"Column4\"/>") != null);
+}
+
+// REL-A505: <tableColumns count> divergence → MalformedTableXml.
+test "tableColumns count disagreeing with range refuses MalformedTableXml" {
+    const a = testing.allocator;
+    // Range B2:D5 implies count=3; source claims count=2 (sparse / malformed).
+    const sparse =
+        \\<?xml version="1.0"?>
+        \\<table id="1" ref="B2:D5"><tableColumns count="2"><tableColumn id="1" name="a"/><tableColumn id="2" name="b"/></tableColumns></table>
+    ;
+    const r = applyEditToTable(a, sparse, .col, 3, .insert);
+    try testing.expectError(error.MalformedTableXml, r);
+}
+
+// REL-A509: scanMaxTableColumnId handles sparse / non-contiguous ids.
+test "synthetic id is max+1 with sparse ids (1, 5, 99 → 100)" {
+    const a = testing.allocator;
+    // Range B2:D5 (3 cols); ids deliberately sparse.
+    const sparse_ids =
+        \\<?xml version="1.0"?>
+        \\<table id="1" ref="B2:D5"><tableColumns count="3"><tableColumn id="1" name="a"/><tableColumn id="5" name="b"/><tableColumn id="99" name="c"/></tableColumns></table>
+    ;
+    const out = try applyEditToTable(a, sparse_ids, .col, 3, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<tableColumn id=\"100\" name=\"Column100\"/>") != null);
+}
+
+// REL-A509: sortState collapse-drop on full-range delete-match.
+test "sortState drops on collapse" {
+    const a = testing.allocator;
+    // Single-column sortState that collapses on col-delete.
+    const single_col_sort =
+        \\<?xml version="1.0"?>
+        \\<table id="1" ref="A1:C5"><autoFilter ref="A1:C5"/><sortState ref="B2:B5"><sortCondition ref="B2:B5"/></sortState><tableColumns count="3"><tableColumn id="1" name="x"/><tableColumn id="2" name="y"/><tableColumn id="3" name="z"/></tableColumns></table>
+    ;
+    const out = try applyEditToTable(a, single_col_sort, .col, 2, .delete);
+    defer a.free(out);
+    // Table range A1:C5 → A1:B5; sortState was B2:B5 → collapses (drop).
+    try testing.expect(std.mem.indexOf(u8, out, "ref=\"A1:B5\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<sortState") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "</sortState>") == null);
+}
+
+// REL-A509: insert beyond the last column (target_pos == count) appends
+// the synthetic tableColumn at the end.
+test "col insert at right edge appends synthetic tableColumn at end" {
+    const a = testing.allocator;
+    // Insert at col 6 (F) — exactly one past br_col=5 (E) of C9:E10.
+    // Per shiftSingleA1Col semantics: insert at col == br_col+1 with
+    // is_br_corner=true keeps br_col unchanged because the gap is at
+    // the position AFTER br. So we expect ref unchanged here, no
+    // synthetic column added.
+    //
+    // Instead test the "insert AT br_col" case: col 5 (E). target_pos
+    // = 5 - 3 = 2 (the third / last column position).
+    const out = try applyEditToTable(a, sample_table, .col, 5, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "ref=\"C9:F10\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<tableColumns count=\"4\">") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<tableColumn id=\"4\" name=\"Column4\"/>") != null);
+}
+
+// REL-B524: TablePartRidIterator boundary check is exercised by the
+// editor round-trip tests (the iterator lives in workbook.zig). The
+// isolation test here is for table_edit only.
