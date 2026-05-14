@@ -19,10 +19,16 @@
 # variants + bad-CRC) so we don't need a network round-trip for the
 # obvious ZIP edge cases.
 #
-# If any URL goes 404, the script fails loudly with the URL that
-# broke — don't silently skip, because a gap here means the
-# corresponding test stops exercising its edge case without anyone
-# noticing.
+# Group (1) base corpus is committed to the repo, so its `fetch`
+# calls never hit the network in CI; if one ever did and went 404,
+# we still fail loudly. Groups (2) and (3) are downloaded each run
+# from third-party endpoints we don't control — World Bank, ECDC,
+# ONS, GitHub-hosted POI / openxlsx mirrors. Per-vendor SSL cert
+# expiry, transient TLS resets, and rate limits would otherwise
+# break every PR's CI for reasons unrelated to zlsx, so those
+# fetches go through `fetch_optional` which warns and continues
+# instead of aborting. Tests that need a missing fixture skip
+# cleanly (see e.g. `tests/perf_*`).
 
 set -euo pipefail
 
@@ -88,12 +94,35 @@ fetch() {
   mv "$dest.tmp" "$dest"
 }
 
+# Same as fetch, but tolerates curl failure: drops the .tmp,
+# prints a SKIP line, and continues. Used for groups (2) and (3)
+# whose endpoints are out of our control. Tests that depend on
+# the missing fixture skip cleanly.
+fetch_optional() {
+  local entry="$1"
+  local name="${entry%%|*}"
+  local url="${entry#*|}"
+  local dest="$dir/$name"
+  if [[ -f "$dest" ]]; then
+    printf '  · %-44s (already present, %s)\n' "$name" "$(du -h "$dest" | cut -f1)"
+    return
+  fi
+  printf '  ↓ %-44s %s\n' "$name" "$url"
+  if curl -sfL --max-time 120 -o "$dest.tmp" "$url"; then
+    mv "$dest.tmp" "$dest"
+  else
+    local rc=$?
+    rm -f "$dest.tmp"
+    printf '  ⚠ %-44s SKIP (curl exit %d) — dependent tests will skip\n' "$name" "$rc" >&2
+  fi
+}
+
 echo "(1) base corpus —"
 for entry in "${base_files[@]}"; do fetch "$entry"; done
 
 echo
 echo "(2) large fixtures —"
-for entry in "${large_files[@]}"; do fetch "$entry"; done
+for entry in "${large_files[@]}"; do fetch_optional "$entry"; done
 
 # WDI ships as a zip-of-xlsx; extract idempotently. Write to .tmp
 # first so a failed `unzip` (e.g. if the zip's internal layout
@@ -107,7 +136,7 @@ fi
 
 echo
 echo "(3) adversarial fixtures —"
-for entry in "${broken_files[@]}"; do fetch "$entry"; done
+for entry in "${broken_files[@]}"; do fetch_optional "$entry"; done
 
 echo
 echo "(4) locally-derived adversarial variants —"
