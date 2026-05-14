@@ -676,8 +676,12 @@ fn tableColumnNameTaken(src: []const u8, body_start: usize, body_end: usize, can
 }
 
 /// Count direct `<tableColumn>` children inside a `<tableColumns>`
-/// body. Codex Ticket 651: prevents `count="3"` + 2 actual children
-/// from sneaking past the round-1 count-divergence check.
+/// body. Codex Ticket 651 introduced this; Codex Ticket 701 fixed
+/// the flat-scan: when a direct `<tableColumn>` is found we MUST
+/// advance past its full `<tableColumn>...</tableColumn>` body so a
+/// descendant `<tableColumn>` (e.g., nested inside an `<extLst>`
+/// extension) doesn't get double-counted as a sibling. Mirrors the
+/// `ct_end` advance in `processTableColumnsForCol`.
 fn countTableColumnChildren(src: []const u8, body_start: usize, body_end: usize) u32 {
     var n: u32 = 0;
     var k = body_start;
@@ -687,7 +691,16 @@ fn countTableColumnChildren(src: []const u8, body_start: usize, body_end: usize)
         if (sheet_edit.matchTagAt(src, lt, "tableColumn")) |ct| {
             if (ct.after_open > body_end) return n;
             n += 1;
-            k = ct.after_open;
+            const attrs_full = src[ct.start + "<tableColumn".len .. ct.after_open - 1];
+            const trimmed = std.mem.trimRight(u8, attrs_full, " \t\r\n");
+            const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
+            if (is_self_closing) {
+                k = ct.after_open;
+            } else {
+                const cend = "</tableColumn>";
+                const p = std.mem.indexOfPos(u8, src, ct.after_open, cend) orelse body_end;
+                k = if (p + cend.len <= body_end) p + cend.len else body_end;
+            }
         } else {
             k = lt + 1;
         }
@@ -927,6 +940,24 @@ test "tableColumns child count disagreeing with range refuses MalformedTableXml"
         \\<table id="1" ref="B2:D5"><tableColumns count="3"><tableColumn id="1" name="a"/><tableColumn id="2" name="b"/></tableColumns></table>
     ;
     const r = applyEditToTable(a, sparse_children, .col, 3, .insert);
+    try testing.expectError(error.MalformedTableXml, r);
+}
+
+// Codex Ticket 701: nested <tableColumn> descendants (e.g., inside
+// an <extLst>) must not be miscounted as direct siblings. A flat
+// scan would see 3 tags here while the actual direct child count
+// is 2 — refuse before the rewrite walker emits broken bytes.
+test "nested <tableColumn> descendant doesn't inflate child count" {
+    const a = testing.allocator;
+    // 2 direct children; first child has an <extLst> with a nested
+    // x14:tableColumn-shaped element (we use the bare tag name to
+    // exercise the flat-scan failure mode). count="3", range width
+    // 3 (B2:D5), but only 2 direct children → must refuse.
+    const nested =
+        \\<?xml version="1.0"?>
+        \\<table id="1" ref="B2:D5"><tableColumns count="3"><tableColumn id="1" name="a"><extLst><ext><tableColumn id="99" name="ghost"/></ext></extLst></tableColumn><tableColumn id="2" name="b"/></tableColumns></table>
+    ;
+    const r = applyEditToTable(a, nested, .col, 3, .insert);
     try testing.expectError(error.MalformedTableXml, r);
 }
 
