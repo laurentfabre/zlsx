@@ -33,6 +33,7 @@ const typed_parts = @import("typed_parts/root.zig");
 const zlsx = @import("zlsx");
 const drawing_emit = @import("drawing_emit.zig");
 const sheet_edit = @import("sheet_edit.zig");
+const drawing_edit = @import("drawing_edit.zig");
 const sst_plan_mod = @import("zlsx_sst_plan");
 const styles_plan_mod = @import("zlsx_styles_plan");
 const workbook_xml_plan_mod = @import("zlsx_workbook_xml_plan");
@@ -223,6 +224,17 @@ pub const Error = error{
     /// split, malformed A1 ref). Refused rather than silently
     /// dropping the pane element. Surfaces from `pkg/sheet_edit.zig`.
     MalformedPaneSplit,
+    /// dr-1: `Workbook.{insertRow, deleteRow, insertColumn, deleteColumn}`
+    /// failed while rewriting the sheet's xdr drawing part because
+    /// the part's structure didn't match the expected
+    /// `<xdr:from>`/`<xdr:to>` shape. Refused rather than emit a
+    /// silently-corrupted drawing. Surfaces from
+    /// `pkg/drawing_edit.zig`.
+    MalformedDrawingXml,
+    /// dr-1: `Workbook.{insertRow, insertColumn}` would shift an
+    /// `<xdr:col>` or `<xdr:row>` value past `std.math.maxInt(u32)`.
+    /// Practically unreachable. Surfaces from `pkg/drawing_edit.zig`.
+    DrawingCoordinateOverflow,
     /// `Workbook.addSheet` refused because the workbook already
     /// holds the type-system maximum (`std.math.maxInt(u32)`)
     /// number of sheets. Excel imposes no documented sheet count
@@ -2335,6 +2347,13 @@ pub const Workbook = struct {
         defer self.allocator.free(new_xml);
         try self.store.replacePart(part_name, new_xml);
 
+        // dr-1: rewrite modern xdr drawing anchors in the sheet's
+        // referenced `xl/drawings/drawingN.xml` part. Sheets without
+        // a `<drawing r:id>` element skip silently; no-op rewrites
+        // are byte-identical and skip `replacePart` so SHA256
+        // passthrough holds.
+        try self.applyDrawingEditForSheet(part_name, part.bytes, spec);
+
         // Invalidate the cached parsed view — the row/col-shifted
         // bytes don't match the previously-parsed structure, and
         // any subsequent ensureParsed must re-tokenize the new
@@ -2374,7 +2393,111 @@ pub const Workbook = struct {
         _ = try self.rewriteAllHyperlinkLocations(edit, target);
         _ = try self.rewriteAllValidationsAndConditionalFormats(edit, target);
     }
+
+    /// dr-1: rewrite the modern xdr drawing part referenced by the
+    /// sheet (if any). `<xdr:from>` / `<xdr:to>` `<xdr:col>` /
+    /// `<xdr:row>` 0-based coordinates inside `<xdr:twoCellAnchor>`
+    /// and `<xdr:oneCellAnchor>` shift in step with the worksheet
+    /// row/col edit; full-collapse anchors drop. Sheets without a
+    /// `<drawing r:id>` element skip silently.
+    fn applyDrawingEditForSheet(
+        self: *Workbook,
+        sheet_part_name: []const u8,
+        sheet_xml: []const u8,
+        spec: SheetEditSpec,
+    ) Error!void {
+        const rid = findWorksheetDrawingRid(sheet_xml) orelse return;
+        const rels = self.store.rels(sheet_part_name);
+        const target = relTargetForId(rels, rid) orelse return;
+        const drawing_part_name = (try self.store.resolve(sheet_part_name, target)) orelse return;
+        const drawing_part = (try self.store.part(drawing_part_name)) orelse return;
+
+        const idx_1based = spec.row orelse spec.col.?;
+        if (idx_1based == 0) return;
+        const axis: drawing_edit.Axis = if (spec.row != null) .row else .col;
+        const kind: drawing_edit.EditKind = switch (spec.kind) {
+            .insert => .insert,
+            .delete => .delete,
+        };
+        const new_drawing = try drawing_edit.applyEditToDrawing(
+            self.allocator,
+            drawing_part.bytes,
+            axis,
+            idx_1based - 1,
+            kind,
+        );
+        defer self.allocator.free(new_drawing);
+        if (!std.mem.eql(u8, drawing_part.bytes, new_drawing)) {
+            try self.store.replacePart(drawing_part_name, new_drawing);
+        }
+    }
 };
+
+/// Find the value of `r:id` on the worksheet's CT_Worksheet
+/// `<drawing>` element (always self-closing, at most one per
+/// sheet). Disambiguates from `<legacyDrawing>` and namespace-
+/// prefixed siblings. Returns null when absent.
+fn findWorksheetDrawingRid(sheet_xml: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < sheet_xml.len) {
+        const lt = std.mem.indexOfScalarPos(u8, sheet_xml, i, '<') orelse return null;
+        const need = "<drawing".len;
+        if (lt + need > sheet_xml.len) return null;
+        if (std.mem.eql(u8, sheet_xml[lt .. lt + need], "<drawing")) {
+            const after_byte = sheet_xml[lt + need];
+            if (after_byte == ' ' or after_byte == '\t' or after_byte == '\r' or
+                after_byte == '\n' or after_byte == '/' or after_byte == '>')
+            {
+                const tag_end = std.mem.indexOfScalarPos(u8, sheet_xml, lt, '>') orelse return null;
+                return findAttrValue(sheet_xml[lt .. tag_end + 1], "r:id");
+            }
+        }
+        i = lt + 1;
+    }
+    return null;
+}
+
+/// Look up the `target` of a Relationship by `id`. Returns null
+/// if no relationship matches.
+fn relTargetForId(rels: []const store_mod.Relationship, id: []const u8) ?[]const u8 {
+    for (rels) |r| {
+        if (std.mem.eql(u8, r.id, id)) return r.target;
+    }
+    return null;
+}
+
+/// Read the value of `attr_name` (e.g. `r:id`) from a single
+/// element's bytes. Tolerates single or double quotes. Returns
+/// null when absent.
+fn findAttrValue(element_bytes: []const u8, attr_name: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < element_bytes.len) {
+        const eq = std.mem.indexOfScalarPos(u8, element_bytes, i, '=') orelse return null;
+        if (eq < attr_name.len) {
+            i = eq + 1;
+            continue;
+        }
+        const name_start = eq - attr_name.len;
+        if (std.mem.eql(u8, element_bytes[name_start..eq], attr_name)) {
+            if (name_start == 0 or
+                element_bytes[name_start - 1] == ' ' or
+                element_bytes[name_start - 1] == '\t' or
+                element_bytes[name_start - 1] == '\n' or
+                element_bytes[name_start - 1] == '\r' or
+                element_bytes[name_start - 1] == '<')
+            {
+                if (eq + 1 >= element_bytes.len) return null;
+                const quote = element_bytes[eq + 1];
+                if (quote != '"' and quote != '\'') return null;
+                const value_start = eq + 2;
+                const value_end = std.mem.indexOfScalarPos(u8, element_bytes, value_start, quote) orelse return null;
+                return element_bytes[value_start..value_end];
+            }
+        }
+        i = eq + 1;
+    }
+    return null;
+}
 
 /// Validate a candidate sheet name per Excel's rules. B3 iter-wr-6
 /// delegates to `zlsx.validateSheetName` (the Writer-side
