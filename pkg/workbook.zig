@@ -2591,10 +2591,13 @@ pub const Workbook = struct {
     /// `<tablePart r:id>` through the sheet rels, and run
     /// `table_edit.applyEditToTable` against the referenced
     /// `xl/tables/tableN.xml` part. Sheets without `<tableParts>`
-    /// skip silently. Pre-flight refusals (collapse, header-row
-    /// delete) are caught upstream by the Editor; reaching this
-    /// code with an unsafe edit propagates the table-edit typed
-    /// error to the caller.
+    /// skip silently. Pre-flight refusals (`TableCollapseUnsafe`,
+    /// `TableHeaderRowDeleteUnsafe`, `MalformedTableXml`,
+    /// `TableCoordinateOverflow`) are caught upstream by the
+    /// Editor and remapped to `RowEditUnsafeForSheet` /
+    /// `ColEditUnsafeForSheet`; reaching this code with an unsafe
+    /// edit propagates the raw table-edit typed error to the caller
+    /// (Workbook callers that bypass Editor see the original).
     fn applyTableEditsForSheet(
         self: *Workbook,
         sheet_part_name: []const u8,

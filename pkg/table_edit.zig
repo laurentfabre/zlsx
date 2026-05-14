@@ -511,18 +511,27 @@ fn processTableColumnsForCol(
     const old_count_attr = getAttr(attrs_full, "count");
     const old_count = if (old_count_attr) |c| (std.fmt.parseInt(u32, c, 10) catch null) else null;
     const expected_count = hdr.br_col - hdr.tl_col + 1;
-    // REL-A505: refuse when the source's `<tableColumns count>`
-    // disagrees with the range. The previous code silently picked
-    // `expected_count`, producing a `count=` value that didn't
-    // match the actual `<tableColumn>` child count — invalid OOXML
-    // that Excel would surface as a repair-load. A divergent count
-    // means either the file was malformed or it carries a
-    // shape we don't model (e.g., `<tableColumns>` with `<extLst>`
-    // overrides). Either way, refuse the edit so the caller can
-    // surface a typed error rather than emit broken XML.
+    // REL-A505 + Codex Ticket 651: refuse on any of three
+    // independent divergence conditions. The round-1 fix only
+    // checked the declared `count` attr against `expected_count`;
+    // that misses the case where `count="3"` agrees with a
+    // `B2:D5` range but only TWO `<tableColumn>` children are
+    // present — the walker would emit `count="4"` after an insert
+    // while outputting only THREE children, producing repair-load
+    // XML. We now also count actual children and require ALL
+    // THREE (declared count, child count, range width) to agree.
+    //
+    // Refusal happens before this function emits the rewritten
+    // `<tableColumns>` open tag. Bytes already buffered by the
+    // outer walker (`<table>` open + any preceding autoFilter /
+    // sortState) are reclaimed via `applyEditToTable`'s outer
+    // `errdefer out.deinit(allocator)` so no caller observes a
+    // partial result.
+    const child_count = countTableColumnChildren(src, t.after_open, close_pos);
     if (old_count) |c| {
         if (c != expected_count) return error.MalformedTableXml;
     }
+    if (child_count != expected_count) return error.MalformedTableXml;
     const total_cols = expected_count;
 
     // The position within the table at which to insert/delete a
@@ -664,6 +673,26 @@ fn tableColumnNameTaken(src: []const u8, body_start: usize, body_end: usize, can
         }
     }
     return false;
+}
+
+/// Count direct `<tableColumn>` children inside a `<tableColumns>`
+/// body. Codex Ticket 651: prevents `count="3"` + 2 actual children
+/// from sneaking past the round-1 count-divergence check.
+fn countTableColumnChildren(src: []const u8, body_start: usize, body_end: usize) u32 {
+    var n: u32 = 0;
+    var k = body_start;
+    while (k < body_end) {
+        const lt = std.mem.indexOfScalarPos(u8, src, k, '<') orelse return n;
+        if (lt >= body_end) return n;
+        if (sheet_edit.matchTagAt(src, lt, "tableColumn")) |ct| {
+            if (ct.after_open > body_end) return n;
+            n += 1;
+            k = ct.after_open;
+        } else {
+            k = lt + 1;
+        }
+    }
+    return n;
 }
 
 /// Walk the `<tableColumns>` body for the highest `<tableColumn id>`
@@ -875,7 +904,7 @@ test "synthetic insert uses bare Column<id> when no collision" {
     try testing.expect(std.mem.indexOf(u8, out, "<tableColumn id=\"4\" name=\"Column4\"/>") != null);
 }
 
-// REL-A505: <tableColumns count> divergence → MalformedTableXml.
+// REL-A505: <tableColumns count> attr disagreeing with range → MalformedTableXml.
 test "tableColumns count disagreeing with range refuses MalformedTableXml" {
     const a = testing.allocator;
     // Range B2:D5 implies count=3; source claims count=2 (sparse / malformed).
@@ -884,6 +913,20 @@ test "tableColumns count disagreeing with range refuses MalformedTableXml" {
         \\<table id="1" ref="B2:D5"><tableColumns count="2"><tableColumn id="1" name="a"/><tableColumn id="2" name="b"/></tableColumns></table>
     ;
     const r = applyEditToTable(a, sparse, .col, 3, .insert);
+    try testing.expectError(error.MalformedTableXml, r);
+}
+
+// Codex Ticket 651: <tableColumns count> attr matches range but
+// the actual <tableColumn> child count differs. Round-1 fix only
+// checked the declared count vs range and missed this branch.
+test "tableColumns child count disagreeing with range refuses MalformedTableXml" {
+    const a = testing.allocator;
+    // Range B2:D5 implies 3 cols; declared count=3 agrees; only 2 actual children.
+    const sparse_children =
+        \\<?xml version="1.0"?>
+        \\<table id="1" ref="B2:D5"><tableColumns count="3"><tableColumn id="1" name="a"/><tableColumn id="2" name="b"/></tableColumns></table>
+    ;
+    const r = applyEditToTable(a, sparse_children, .col, 3, .insert);
     try testing.expectError(error.MalformedTableXml, r);
 }
 
