@@ -360,9 +360,14 @@ fn processMergeCellTagCol(
 /// On range collapse (single-column filter where that column is
 /// deleted), the entire `<autoFilter>` is dropped.
 ///
-/// Caveat: nested `<sortState ref="…">` carries its own range that
-/// would also need shifting — not handled in v1.
-fn processAutoFilterTagCol(
+/// Caveat: nested `<sortState ref="…">` is not rewritten when the
+/// `<autoFilter>` is sheet-bare (open form). When this function is
+/// delegated to from `pkg/table_edit.zig` for an `<autoFilter>`
+/// inside a `<table>`, sortState IS handled — by table_edit's outer
+/// walker, which intercepts `<sortState>` siblings independently.
+/// zlsx's writer never emits open-form sheet-bare autoFilter, so
+/// the remaining caveat only matters for third-party files.
+pub fn processAutoFilterTagCol(
     allocator: Allocator,
     out: *std.ArrayListUnmanaged(u8),
     src: []const u8,
@@ -671,7 +676,7 @@ fn processDimensionTagCol(
 
 /// Shift the column letters of an A1 ref. `is_br_corner` shrinks
 /// the BR corner by one on delete-match.
-fn shiftSingleA1Col(ref: []const u8, col_1based: u32, kind: RowEditKind, buf: *[16]u8, is_br_corner: bool) ![]const u8 {
+pub fn shiftSingleA1Col(ref: []const u8, col_1based: u32, kind: RowEditKind, buf: *[16]u8, is_br_corner: bool) ![]const u8 {
     var letters_end: usize = 0;
     while (letters_end < ref.len and ref[letters_end] >= 'A' and ref[letters_end] <= 'Z') letters_end += 1;
     if (letters_end == 0) return error.MalformedXml;
@@ -697,7 +702,7 @@ fn shiftSingleA1Col(ref: []const u8, col_1based: u32, kind: RowEditKind, buf: *[
     return try std.fmt.bufPrint(buf, "{s}{s}", .{ new_letters, ref[letters_end..] });
 }
 
-fn parseColFromA1(ref: []const u8) ?u32 {
+pub fn parseColFromA1(ref: []const u8) ?u32 {
     var letters_end: usize = 0;
     while (letters_end < ref.len and ref[letters_end] >= 'A' and ref[letters_end] <= 'Z') letters_end += 1;
     if (letters_end == 0) return null;
@@ -777,7 +782,7 @@ pub fn applyRowEditToWorksheet(
     return try out.toOwnedSlice(allocator);
 }
 
-fn matchTagAt(src: []const u8, i: usize, tag: []const u8) ?TagOpen {
+pub fn matchTagAt(src: []const u8, i: usize, tag: []const u8) ?TagOpen {
     if (i >= src.len or src[i] != '<') return null;
     const after = i + 1 + tag.len;
     if (after > src.len) return null;
@@ -926,7 +931,7 @@ fn processMergeCellTag(
             if (tl_row == row) return; // drop tag entirely
         }
         var new_ref_buf: [16]u8 = undefined;
-        const new_ref = shiftSingleA1(ref, row, kind, &new_ref_buf, false) catch {
+        const new_ref = shiftSingleA1Row(ref, row, kind, &new_ref_buf, false) catch {
             try out.appendSlice(allocator, src[t.start..t.after_open]);
             return;
         };
@@ -947,11 +952,11 @@ fn processMergeCellTag(
     }
     var tl_buf: [16]u8 = undefined;
     var br_buf: [16]u8 = undefined;
-    const tl_new = shiftSingleA1(ref[0..colon], row, kind, &tl_buf, false) catch {
+    const tl_new = shiftSingleA1Row(ref[0..colon], row, kind, &tl_buf, false) catch {
         try out.appendSlice(allocator, src[t.start..t.after_open]);
         return;
     };
-    const br_new = shiftSingleA1(ref[colon + 1 ..], row, kind, &br_buf, true) catch {
+    const br_new = shiftSingleA1Row(ref[colon + 1 ..], row, kind, &br_buf, true) catch {
         try out.appendSlice(allocator, src[t.start..t.after_open]);
         return;
     };
@@ -971,11 +976,14 @@ fn processMergeCellTag(
 /// onto the deleted row, the whole element (open form: open + body
 /// + close; self-closing form: just the open tag) is dropped.
 ///
-/// Caveat: nested `<sortState ref="…">` carries its own range that
-/// would also need shifting — not handled in v1; zlsx never emits
-/// open-form autoFilter so this only matters for third-party files
+/// Caveat: nested `<sortState ref="…">` is not rewritten when the
+/// `<autoFilter>` is sheet-bare (open form). For table-inner
+/// `<autoFilter>` (delegated from `pkg/table_edit.zig`), sortState
+/// is handled by table_edit's outer walker. zlsx's writer never
+/// emits open-form sheet-bare autoFilter, so the remaining caveat
+/// only matters for third-party files
 /// that mix autoFilter sortState with row edits.
-fn processAutoFilterTagRow(
+pub fn processAutoFilterTagRow(
     allocator: Allocator,
     out: *std.ArrayListUnmanaged(u8),
     src: []const u8,
@@ -1027,12 +1035,12 @@ fn processAutoFilterTagRow(
     if (colon) |c| {
         var tl_buf: [16]u8 = undefined;
         var br_buf: [16]u8 = undefined;
-        const tl_new = shiftSingleA1(ref[0..c], row, kind, &tl_buf, false) catch {
+        const tl_new = shiftSingleA1Row(ref[0..c], row, kind, &tl_buf, false) catch {
             try out.appendSlice(allocator, src[t.start..t.after_open]);
             i.* = t.after_open;
             return;
         };
-        const br_new = shiftSingleA1(ref[c + 1 ..], row, kind, &br_buf, true) catch {
+        const br_new = shiftSingleA1Row(ref[c + 1 ..], row, kind, &br_buf, true) catch {
             try out.appendSlice(allocator, src[t.start..t.after_open]);
             i.* = t.after_open;
             return;
@@ -1040,7 +1048,7 @@ fn processAutoFilterTagRow(
         new_ref = try std.fmt.bufPrint(&new_ref_buf, "{s}:{s}", .{ tl_new, br_new });
     } else {
         var b: [16]u8 = undefined;
-        const shifted = shiftSingleA1(ref, row, kind, &b, false) catch {
+        const shifted = shiftSingleA1Row(ref, row, kind, &b, false) catch {
             try out.appendSlice(allocator, src[t.start..t.after_open]);
             i.* = t.after_open;
             return;
@@ -1059,7 +1067,7 @@ fn processAutoFilterTagRow(
 
 /// Parse the row component (digits) from an A1-style ref. Returns
 /// null on malformed input.
-fn parseRowFromA1(ref: []const u8) ?u32 {
+pub fn parseRowFromA1(ref: []const u8) ?u32 {
     var letters_end: usize = 0;
     while (letters_end < ref.len and ref[letters_end] >= 'A' and ref[letters_end] <= 'Z') letters_end += 1;
     if (letters_end == 0 or letters_end == ref.len) return null;
@@ -1095,7 +1103,7 @@ fn processDimensionTag(
             }
         }
         var b: [16]u8 = undefined;
-        const new_ref = shiftSingleA1(ref, row, kind, &b, false) catch {
+        const new_ref = shiftSingleA1Row(ref, row, kind, &b, false) catch {
             try out.appendSlice(allocator, src[t.start..t.after_open]);
             return;
         };
@@ -1120,11 +1128,11 @@ fn processDimensionTag(
     }
     var tl_buf: [16]u8 = undefined;
     var br_buf: [16]u8 = undefined;
-    const tl_new = shiftSingleA1(ref[0..colon], row, kind, &tl_buf, false) catch {
+    const tl_new = shiftSingleA1Row(ref[0..colon], row, kind, &tl_buf, false) catch {
         try out.appendSlice(allocator, src[t.start..t.after_open]);
         return;
     };
-    const br_new = shiftSingleA1(ref[colon + 1 ..], row, kind, &br_buf, true) catch {
+    const br_new = shiftSingleA1Row(ref[colon + 1 ..], row, kind, &br_buf, true) catch {
         try out.appendSlice(allocator, src[t.start..t.after_open]);
         return;
     };
@@ -1141,7 +1149,7 @@ fn processDimensionTag(
 /// says "this is the bottom-right of a rectangular range" — on a
 /// delete-match (old_row == row), BR corners shrink by 1 so the
 /// range collapses to the row above the deleted one.
-fn shiftSingleA1(ref: []const u8, row: u32, kind: RowEditKind, buf: *[16]u8, is_br_corner: bool) ![]const u8 {
+pub fn shiftSingleA1Row(ref: []const u8, row: u32, kind: RowEditKind, buf: *[16]u8, is_br_corner: bool) ![]const u8 {
     var letters_end: usize = 0;
     while (letters_end < ref.len and ref[letters_end] >= 'A' and ref[letters_end] <= 'Z') letters_end += 1;
     if (letters_end == 0 or letters_end == ref.len) return error.MalformedXml;
@@ -1176,7 +1184,7 @@ fn shiftSingleA1(ref: []const u8, row: u32, kind: RowEditKind, buf: *[16]u8, is_
 /// Emit the original `<tag attrs>` with `attr_name="..."` value
 /// replaced by `new_value`. `tag_name_len` is the length of the
 /// tag name including the leading `<` (e.g. `"<c".len` = 2).
-fn writeWithReplacedAttr(
+pub fn writeWithReplacedAttr(
     allocator: Allocator,
     out: *std.ArrayListUnmanaged(u8),
     src: []const u8,
@@ -1262,7 +1270,7 @@ fn processPaneTagRow(
     }
 
     if (getAttr(attrs, "topLeftCell")) |tl| {
-        const shifted = shiftSingleA1(tl, row, kind, &tl_buf, false) catch return error.MalformedPaneSplit;
+        const shifted = shiftSingleA1Row(tl, row, kind, &tl_buf, false) catch return error.MalformedPaneSplit;
         if (!std.mem.eql(u8, shifted, tl)) {
             subs[n_subs] = .{ .name = "topLeftCell", .new_value = shifted };
             n_subs += 1;
