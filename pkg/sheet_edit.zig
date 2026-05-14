@@ -25,7 +25,6 @@ const max_row = xlsx.max_row;
 const max_col_1based = xlsx.max_col_1based;
 const getAttr = xlsx.getAttr;
 
-
 /// Apply one column edit (insert or delete at `col_1based`) to a
 /// worksheet XML buffer. iter-col-3/4 v1: rewrites `<c r="A1">`
 /// column letter, `<col min=N max=M>` bounds, `<mergeCells>` rect
@@ -61,6 +60,9 @@ pub fn applyColEditToWorksheet(
             i = t.after_open;
         } else if (matchTagAt(src, i, "dimension")) |t| {
             try processDimensionTagCol(allocator, &out, src, t, col_1based, kind);
+            i = t.after_open;
+        } else if (matchTagAt(src, i, "pane")) |t| {
+            try processPaneTagCol(allocator, &out, src, t, col_1based, kind);
             i = t.after_open;
         } else {
             try out.append(allocator, '<');
@@ -508,6 +510,9 @@ pub fn applyRowEditToWorksheet(
         } else if (matchTagAt(src, i, "dimension")) |t| {
             try processDimensionTag(allocator, &out, src, t, row, kind);
             i = t.after_open;
+        } else if (matchTagAt(src, i, "pane")) |t| {
+            try processPaneTagRow(allocator, &out, src, t, row, kind);
+            i = t.after_open;
         } else {
             // Some other tag; emit `<` and continue past it.
             try out.append(allocator, '<');
@@ -867,6 +872,191 @@ fn writeWithReplacedRowAttr(
     try writeWithReplacedAttr(allocator, out, src, t, tag_name_len, "r", s);
 }
 
+/// Rewrite `<pane>` for a row edit: shift `ySplit` if the edit
+/// lands inside the frozen-row region; shift `topLeftCell` as a
+/// regular A1 ref. Only `state="frozen"` and `state="frozenSplit"`
+/// are rewritten — `state="split"` (or absent, which OOXML defaults
+/// to split) carries pixel offsets in xSplit/ySplit and can't be
+/// meaningfully shifted by integer row/col edits.
+fn processPaneTagRow(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    row: u32,
+    kind: RowEditKind,
+) !void {
+    const attrs = src[t.start + "<pane".len .. t.after_open - 1];
+    if (!paneStateIsFrozen(attrs)) return error.SplitPaneNotSupported;
+
+    var y_buf: [16]u8 = undefined;
+    var tl_buf: [16]u8 = undefined;
+    var subs: [2]AttrSub = undefined;
+    var n_subs: usize = 0;
+
+    if (getAttr(attrs, "ySplit")) |y_str| {
+        const y_old = std.fmt.parseInt(u32, y_str, 10) catch return error.MalformedPaneSplit;
+        var y_new: ?u32 = null;
+        switch (kind) {
+            .insert => if (y_old != 0 and row <= y_old) {
+                if (y_old >= max_row) return error.RowEditExceedsMaxRow;
+                y_new = y_old + 1;
+            },
+            .delete => if (y_old != 0 and row <= y_old) {
+                y_new = y_old - 1;
+            },
+        }
+        if (y_new) |yn| {
+            const s = try std.fmt.bufPrint(&y_buf, "{d}", .{yn});
+            subs[n_subs] = .{ .name = "ySplit", .new_value = s };
+            n_subs += 1;
+        }
+    }
+
+    if (getAttr(attrs, "topLeftCell")) |tl| {
+        const shifted = shiftSingleA1(tl, row, kind, &tl_buf, false) catch return error.MalformedPaneSplit;
+        if (!std.mem.eql(u8, shifted, tl)) {
+            subs[n_subs] = .{ .name = "topLeftCell", .new_value = shifted };
+            n_subs += 1;
+        }
+    }
+
+    if (n_subs == 0) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    }
+    try writeWithReplacedAttrs(allocator, out, src, t, "<pane".len, subs[0..n_subs]);
+}
+
+/// Column counterpart of `processPaneTagRow`. Shifts `xSplit` and
+/// the column component of `topLeftCell`. Same `state="frozen"` /
+/// `state="frozenSplit"` precondition.
+fn processPaneTagCol(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    col_1based: u32,
+    kind: RowEditKind,
+) !void {
+    const attrs = src[t.start + "<pane".len .. t.after_open - 1];
+    if (!paneStateIsFrozen(attrs)) return error.SplitPaneNotSupported;
+
+    var x_buf: [16]u8 = undefined;
+    var tl_buf: [16]u8 = undefined;
+    var subs: [2]AttrSub = undefined;
+    var n_subs: usize = 0;
+
+    if (getAttr(attrs, "xSplit")) |x_str| {
+        const x_old = std.fmt.parseInt(u32, x_str, 10) catch return error.MalformedPaneSplit;
+        var x_new: ?u32 = null;
+        switch (kind) {
+            .insert => if (x_old != 0 and col_1based <= x_old) {
+                if (x_old >= max_col_1based) return error.ColEditExceedsMaxCol;
+                x_new = x_old + 1;
+            },
+            .delete => if (x_old != 0 and col_1based <= x_old) {
+                x_new = x_old - 1;
+            },
+        }
+        if (x_new) |xn| {
+            const s = try std.fmt.bufPrint(&x_buf, "{d}", .{xn});
+            subs[n_subs] = .{ .name = "xSplit", .new_value = s };
+            n_subs += 1;
+        }
+    }
+
+    if (getAttr(attrs, "topLeftCell")) |tl| {
+        const shifted = shiftSingleA1Col(tl, col_1based, kind, &tl_buf, false) catch return error.MalformedPaneSplit;
+        if (!std.mem.eql(u8, shifted, tl)) {
+            subs[n_subs] = .{ .name = "topLeftCell", .new_value = shifted };
+            n_subs += 1;
+        }
+    }
+
+    if (n_subs == 0) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    }
+    try writeWithReplacedAttrs(allocator, out, src, t, "<pane".len, subs[0..n_subs]);
+}
+
+fn paneStateIsFrozen(attrs: []const u8) bool {
+    const s = getAttr(attrs, "state") orelse return false;
+    return std.mem.eql(u8, s, "frozen") or std.mem.eql(u8, s, "frozenSplit");
+}
+
+const AttrSub = struct {
+    name: []const u8,
+    new_value: []const u8,
+};
+
+/// Re-emit a tag with N attribute values substituted. Walks the
+/// attribute list once; for each attr whose name appears in `subs`,
+/// emit the substituted value (preserving the original quote char).
+/// Unknown attrs, surrounding whitespace, and the closing `/>` / `>`
+/// pass through verbatim. Stable across attr reordering between
+/// inputs because each attr is matched by name, not position.
+fn writeWithReplacedAttrs(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    tag_name_len: usize,
+    subs: []const AttrSub,
+) !void {
+    try out.appendSlice(allocator, src[t.start .. t.start + tag_name_len]);
+    var i: usize = t.start + tag_name_len;
+    const end = t.after_open;
+    while (i < end) {
+        const ws_start = i;
+        while (i < end and (src[i] == ' ' or src[i] == '\t' or src[i] == '\n' or src[i] == '\r')) i += 1;
+        try out.appendSlice(allocator, src[ws_start..i]);
+        if (i >= end) break;
+        // Reached the closing `>` or self-close `/>` — emit verbatim
+        // and stop.
+        if (src[i] == '/' or src[i] == '>') {
+            try out.appendSlice(allocator, src[i..end]);
+            return;
+        }
+        const name_start = i;
+        while (i < end and src[i] != '=' and src[i] != ' ' and src[i] != '\t' and src[i] != '\n' and src[i] != '\r' and src[i] != '/' and src[i] != '>') i += 1;
+        const name = src[name_start..i];
+        if (i >= end or src[i] != '=') {
+            try out.appendSlice(allocator, name);
+            continue;
+        }
+        i += 1;
+        if (i >= end or (src[i] != '"' and src[i] != '\'')) {
+            try out.appendSlice(allocator, src[name_start..i]);
+            continue;
+        }
+        const quote = src[i];
+        i += 1;
+        const val_start = i;
+        while (i < end and src[i] != quote) i += 1;
+        const val_end_excl = i;
+        if (i < end) i += 1;
+        _ = val_start;
+        _ = val_end_excl;
+        var replacement: ?[]const u8 = null;
+        for (subs) |sub| {
+            if (std.mem.eql(u8, name, sub.name)) {
+                replacement = sub.new_value;
+                break;
+            }
+        }
+        if (replacement) |v| {
+            try out.appendSlice(allocator, name);
+            try out.append(allocator, '=');
+            try out.append(allocator, quote);
+            try out.appendSlice(allocator, v);
+            try out.append(allocator, quote);
+        } else {
+            try out.appendSlice(allocator, src[name_start..i]);
+        }
+    }
+}
 
 /// Parse uppercase A-Z letters as a 1-based Excel column index
 /// (A=1, B=2, ..., Z=26, AA=27, ..., XFD=16384). Returns null on

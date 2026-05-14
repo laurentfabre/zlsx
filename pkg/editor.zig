@@ -860,17 +860,16 @@ pub const Editor = struct {
             const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
             const xml = try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
             defer self.allocator.free(xml);
+            // <pane> is no longer in this list — `pkg/sheet_edit.zig`
+            // shifts xSplit + topLeftCell for frozen/frozenSplit panes
+            // during the byte transform, and refuses split-state panes
+            // with `error.SplitPaneNotSupported`.
             const guards = [_][]const u8{
                 "<autoFilter",
                 "<tableParts",
                 "<drawing",
                 "<legacyDrawing",
                 "<picture",
-                "<pane ",
-                "<pane/",
-                "<pane\t",
-                "<pane\n",
-                "<pane\r",
             };
             for (guards) |g| {
                 if (std.mem.indexOf(u8, xml, g) != null) {
@@ -908,9 +907,13 @@ pub const Editor = struct {
 
         // Per-sheet content guard: refuse sheets whose bodies carry
         // constructs the rewriters don't yet handle (drawings,
-        // pivots, frozen panes, tableParts, autoFilter). See
+        // pivots, tableParts, autoFilter). `<pane>` is no longer in
+        // this list — `pkg/sheet_edit.zig` shifts ySplit +
+        // topLeftCell for frozen/frozenSplit panes during the byte
+        // transform, and refuses split-state panes with
+        // `error.SplitPaneNotSupported`. See
         // `docs/plans/refusal-audit.md` "Axes that stay refused"
-        // for the rationale.
+        // for the remaining rationale.
         const path = self.sheet_paths[sheet_idx];
         if (findEntryByName(self.entries, path)) |entry_idx| {
             const e = self.entries[entry_idx];
@@ -923,16 +926,6 @@ pub const Editor = struct {
                 "<drawing",
                 "<legacyDrawing",
                 "<picture",
-                // <pane xSplit=..|ySplit=..|topLeftCell=..> carries
-                // column/row coordinates that aren't rewritten by
-                // the row/col edit path. Refuse rather than save a
-                // workbook with frozen panes pointing at the wrong
-                // boundary.
-                "<pane ",
-                "<pane/",
-                "<pane\t",
-                "<pane\n",
-                "<pane\r",
             };
             for (guards) |g| {
                 if (std.mem.indexOf(u8, xml, g) != null) {
@@ -956,7 +949,6 @@ pub const Editor = struct {
         const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
         return try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
     }
-
 };
 
 /// Walk worksheet XML and emit a span per `<c>` element. Pure
@@ -2090,6 +2082,146 @@ test "applyColEditToWorksheet collapses single-cell dimension on col delete" {
     try std.testing.expect(std.mem.indexOf(u8, out, "ref=\"B2\"") == null);
 }
 
+// ─── pane rewriter (lifts the `<pane>` per-sheet row/col refusal) ──
+
+test "applyRowEditToWorksheet: insertRow above frozen ySplit grows the freeze" {
+    const src =
+        "<worksheet><sheetViews><sheetView workbookViewId=\"0\">" ++
+        "<pane ySplit=\"3\" topLeftCell=\"A4\" activePane=\"bottomLeft\" state=\"frozen\"/>" ++
+        "</sheetView></sheetViews>" ++
+        "<sheetData/></worksheet>";
+    const out = try applyRowEditToWorksheet(std.testing.allocator, src, 2, .insert);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ySplit=\"4\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "topLeftCell=\"A5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "state=\"frozen\"") != null);
+}
+
+test "applyRowEditToWorksheet: insertRow below frozen ySplit leaves freeze alone" {
+    const src =
+        "<worksheet><sheetViews><sheetView workbookViewId=\"0\">" ++
+        "<pane ySplit=\"3\" topLeftCell=\"A4\" activePane=\"bottomLeft\" state=\"frozen\"/>" ++
+        "</sheetView></sheetViews>" ++
+        "<sheetData/></worksheet>";
+    const out = try applyRowEditToWorksheet(std.testing.allocator, src, 5, .insert);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ySplit=\"3\"") != null);
+    // topLeftCell row 4 < insert row 5, so it doesn't shift.
+    try std.testing.expect(std.mem.indexOf(u8, out, "topLeftCell=\"A4\"") != null);
+}
+
+test "applyRowEditToWorksheet: deleteRow inside frozen ySplit shrinks the freeze" {
+    const src =
+        "<worksheet><sheetViews><sheetView workbookViewId=\"0\">" ++
+        "<pane ySplit=\"3\" topLeftCell=\"A4\" activePane=\"bottomLeft\" state=\"frozen\"/>" ++
+        "</sheetView></sheetViews>" ++
+        "<sheetData/></worksheet>";
+    const out = try applyRowEditToWorksheet(std.testing.allocator, src, 2, .delete);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ySplit=\"2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "topLeftCell=\"A3\"") != null);
+}
+
+test "applyColEditToWorksheet: insertColumn inside frozen xSplit grows the freeze" {
+    const src =
+        "<worksheet><sheetViews><sheetView workbookViewId=\"0\">" ++
+        "<pane xSplit=\"2\" topLeftCell=\"C1\" activePane=\"topRight\" state=\"frozen\"/>" ++
+        "</sheetView></sheetViews>" ++
+        "<sheetData/></worksheet>";
+    const out = try applyColEditToWorksheet(std.testing.allocator, src, 1, .insert);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "xSplit=\"3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "topLeftCell=\"D1\"") != null);
+}
+
+test "applyColEditToWorksheet: deleteColumn inside frozen xSplit shrinks the freeze" {
+    const src =
+        "<worksheet><sheetViews><sheetView workbookViewId=\"0\">" ++
+        "<pane xSplit=\"2\" topLeftCell=\"C1\" activePane=\"topRight\" state=\"frozen\"/>" ++
+        "</sheetView></sheetViews>" ++
+        "<sheetData/></worksheet>";
+    const out = try applyColEditToWorksheet(std.testing.allocator, src, 1, .delete);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "xSplit=\"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "topLeftCell=\"B1\"") != null);
+}
+
+test "applyRowEditToWorksheet: row+col freeze (bottomRight) shifts both axes" {
+    const src =
+        "<worksheet><sheetViews><sheetView workbookViewId=\"0\">" ++
+        "<pane xSplit=\"2\" ySplit=\"1\" topLeftCell=\"C2\" activePane=\"bottomRight\" state=\"frozen\"/>" ++
+        "</sheetView></sheetViews>" ++
+        "<sheetData/></worksheet>";
+    // Row insert at 1 lands inside the row freeze (ySplit=1).
+    const out = try applyRowEditToWorksheet(std.testing.allocator, src, 1, .insert);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ySplit=\"2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "xSplit=\"2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "topLeftCell=\"C3\"") != null);
+}
+
+test "applyRowEditToWorksheet: ySplit=1 delete row 1 collapses freeze to 0" {
+    const src =
+        "<worksheet><sheetViews><sheetView workbookViewId=\"0\">" ++
+        "<pane ySplit=\"1\" topLeftCell=\"A2\" activePane=\"bottomLeft\" state=\"frozen\"/>" ++
+        "</sheetView></sheetViews>" ++
+        "<sheetData/></worksheet>";
+    const out = try applyRowEditToWorksheet(std.testing.allocator, src, 1, .delete);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ySplit=\"0\"") != null);
+    // topLeftCell row 2 > deleted row 1, so it shifts up to A1.
+    try std.testing.expect(std.mem.indexOf(u8, out, "topLeftCell=\"A1\"") != null);
+}
+
+test "applyRowEditToWorksheet: refuses split-state pane (pixel offsets)" {
+    const src =
+        "<worksheet><sheetViews><sheetView workbookViewId=\"0\">" ++
+        "<pane ySplit=\"2400\" topLeftCell=\"A5\" activePane=\"bottomLeft\" state=\"split\"/>" ++
+        "</sheetView></sheetViews>" ++
+        "<sheetData/></worksheet>";
+    try std.testing.expectError(
+        error.SplitPaneNotSupported,
+        applyRowEditToWorksheet(std.testing.allocator, src, 1, .insert),
+    );
+}
+
+test "applyColEditToWorksheet: refuses pane with missing state attr (OOXML default = split)" {
+    const src =
+        "<worksheet><sheetViews><sheetView workbookViewId=\"0\">" ++
+        "<pane xSplit=\"1200\" topLeftCell=\"E1\" activePane=\"topRight\"/>" ++
+        "</sheetView></sheetViews>" ++
+        "<sheetData/></worksheet>";
+    try std.testing.expectError(
+        error.SplitPaneNotSupported,
+        applyColEditToWorksheet(std.testing.allocator, src, 1, .insert),
+    );
+}
+
+test "applyRowEditToWorksheet: pane with frozenSplit state is rewritten" {
+    const src =
+        "<worksheet><sheetViews><sheetView workbookViewId=\"0\">" ++
+        "<pane ySplit=\"2\" topLeftCell=\"A3\" activePane=\"bottomLeft\" state=\"frozenSplit\"/>" ++
+        "</sheetView></sheetViews>" ++
+        "<sheetData/></worksheet>";
+    const out = try applyRowEditToWorksheet(std.testing.allocator, src, 1, .insert);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ySplit=\"3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "topLeftCell=\"A4\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "state=\"frozenSplit\"") != null);
+}
+
+test "applyRowEditToWorksheet: pane with malformed ySplit surfaces typed error" {
+    const src =
+        "<worksheet><sheetViews><sheetView workbookViewId=\"0\">" ++
+        "<pane ySplit=\"abc\" topLeftCell=\"A4\" state=\"frozen\"/>" ++
+        "</sheetView></sheetViews>" ++
+        "<sheetData/></worksheet>";
+    try std.testing.expectError(
+        error.MalformedPaneSplit,
+        applyRowEditToWorksheet(std.testing.allocator, src, 1, .insert),
+    );
+}
+
 test "Editor: insertRow shifts existing rows down (iter-row-2)" {
     var tt = TestTmp.init();
     defer tt.deinit();
@@ -2237,27 +2369,127 @@ test "Editor: row/col edits with cross-sheet hyperlinks rewrite locations (iter-
     }
 }
 
-test "Editor: row/col edits refuse on sheets with frozen panes" {
+test "Editor: insertRow on frozen-pane sheet shifts ySplit + topLeftCell" {
+    // Post-lift: `<pane>` is no longer in the row-edit refusal
+    // guards. The frozen pane's ySplit and topLeftCell row shift
+    // alongside the row attrs. xSplit is unaffected by a row edit.
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "pane_unsafe.xlsx");
+    const src_path = try tt.path(std.testing.allocator, "pane_insert_row.xlsx");
     defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "pane_insert_row_out.xlsx");
+    defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("S");
         try s.writeRow(&.{.{ .integer = 1 }});
         try s.writeRow(&.{.{ .integer = 2 }});
+        try s.freezePanes(1, 2); // rows=1, cols=2 → ySplit=1, xSplit=2, topLeftCell=C2
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertRow(0, 1);
+        try ed.save(dst_path);
+    }
+    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    defer ed2.deinit();
+    const part = (try ed2.workbook.store.part("xl/worksheets/sheet1.xml")) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "ySplit=\"2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "xSplit=\"2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "topLeftCell=\"C3\"") != null);
+}
+
+test "Editor: insertColumn on frozen-pane sheet shifts xSplit + topLeftCell" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const writer_mod = xlsx;
+    const src_path = try tt.path(std.testing.allocator, "pane_insert_col.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "pane_insert_col_out.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 } });
         try s.freezePanes(1, 2);
         try w.save(src_path);
     }
-    var ed = try Editor.open(std.testing.allocator, src_path);
-    defer ed.deinit();
-    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 1));
-    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 1));
-    try std.testing.expectError(error.ColEditUnsafeForSheet, ed.insertColumn(0, 1));
-    try std.testing.expectError(error.ColEditUnsafeForSheet, ed.deleteColumn(0, 1));
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertColumn(0, 1);
+        try ed.save(dst_path);
+    }
+    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    defer ed2.deinit();
+    const part = (try ed2.workbook.store.part("xl/worksheets/sheet1.xml")) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "xSplit=\"3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "ySplit=\"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "topLeftCell=\"D2\"") != null);
+}
+
+test "Editor: deleteRow + deleteColumn on frozen-pane sheet shrinks freeze" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const writer_mod = xlsx;
+    const src_path = try tt.path(std.testing.allocator, "pane_delete.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "pane_delete_out.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 } });
+        try s.writeRow(&.{ .{ .integer = 4 }, .{ .integer = 5 }, .{ .integer = 6 } });
+        try s.freezePanes(1, 2);
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.deleteRow(0, 1); // ySplit 1→0, topLeftCell row 2→1
+        try ed.save(dst_path);
+    }
+    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    defer ed2.deinit();
+    const part = (try ed2.workbook.store.part("xl/worksheets/sheet1.xml")) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "ySplit=\"0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "topLeftCell=\"C1\"") != null);
+}
+
+test "Editor: deleteColumn on frozen-pane sheet shrinks xSplit" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const writer_mod = xlsx;
+    const src_path = try tt.path(std.testing.allocator, "pane_delete_col.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "pane_delete_col_out.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 } });
+        try s.freezePanes(1, 2);
+        try w.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.deleteColumn(0, 1); // xSplit 2→1, topLeftCell col C→B
+        try ed.save(dst_path);
+    }
+    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    defer ed2.deinit();
+    const part = (try ed2.workbook.store.part("xl/worksheets/sheet1.xml")) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "xSplit=\"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "topLeftCell=\"B2\"") != null);
 }
 
 test "Editor: deleteSheet on a different sheet is allowed after a column edit (iter-er-4 (3/N))" {
