@@ -861,19 +861,21 @@ pub const Editor = struct {
             const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
             const xml = try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
             defer self.allocator.free(xml);
-            // `<pane>`, `<picture>`, and modern `<drawing>` (xdr)
-            // are no longer in this list — `pkg/sheet_edit.zig`
-            // shifts pane splits during the byte transform,
-            // CT_SheetBackgroundPicture is a coordinate-free
-            // `r:id` reference (ECMA-376 §18.3.1.67), and
-            // `pkg/drawing_edit.zig` (wired through
-            // `Workbook.applyDrawingEditForSheet`) shifts
-            // `<xdr:from>`/`<xdr:to>` row/col coords in the
-            // referenced drawing part. `<legacyDrawing>` (VML)
-            // and `<tableParts>` stay refused.
+            // `<pane>`, `<picture>`, modern `<drawing>` (xdr), and
+            // `<legacyDrawing>` (VML) are no longer in this list —
+            // `pkg/sheet_edit.zig` shifts pane splits during the
+            // byte transform, CT_SheetBackgroundPicture is a
+            // coordinate-free `r:id` reference (ECMA-376
+            // §18.3.1.67), `pkg/drawing_edit.zig` (wired through
+            // `Workbook.applyDrawingEditForSheet`) shifts xdr
+            // anchor coords in the referenced drawing part, and
+            // `pkg/vml_edit.zig` (wired through
+            // `Workbook.applyVmlDrawingEditForSheet`) shifts VML
+            // `<x:Anchor>` + `<x:Row>`/`<x:Column>` + paired
+            // `<comment ref>` in `xl/commentsN.xml`. Only
+            // `<tableParts>` (cross-part graph) remains.
             const guards = [_][]const u8{
                 "<tableParts",
-                "<legacyDrawing",
             };
             for (guards) |g| {
                 if (std.mem.indexOf(u8, xml, g) != null) {
@@ -909,18 +911,14 @@ pub const Editor = struct {
             return error.RowEditRequiresCleanSheet;
         }
 
-        // Per-sheet content guard: refuse sheets whose bodies carry
-        // constructs the rewriters don't yet handle (legacy VML
-        // drawings, pivots, tableParts). `<pane>`, `<autoFilter>`,
-        // `<picture>`, and modern `<drawing>` (xdr) are no longer
-        // in this list — `pkg/sheet_edit.zig` rewrites pane +
-        // autoFilter during the worksheet byte transform,
-        // CT_SheetBackgroundPicture is a coordinate-free
-        // background-image reference (ECMA-376 §18.3.1.67), and
-        // `pkg/drawing_edit.zig` (wired through
-        // `Workbook.applyDrawingEditForSheet`) shifts xdr anchor
-        // coords in the referenced drawing part. See
-        // `docs/plans/refusal-audit.md` for the remaining rationale.
+        // Per-sheet content guard: only `<tableParts>` remains
+        // refused (cross-part ref graph in xl/tables/*.xml; no
+        // rewriter wired). `<pane>`, `<autoFilter>`, `<picture>`,
+        // modern `<drawing>` (xdr), and `<legacyDrawing>` (VML)
+        // are all rewritten by their respective byte-transform
+        // pipelines — see the matching comment in `recordColEdit`
+        // for the full attribution. See `docs/plans/refusal-audit.md`
+        // for the remaining rationale.
         const path = self.sheet_paths[sheet_idx];
         if (findEntryByName(self.entries, path)) |entry_idx| {
             const e = self.entries[entry_idx];
@@ -929,7 +927,6 @@ pub const Editor = struct {
             defer self.allocator.free(xml);
             const guards = [_][]const u8{
                 "<tableParts",
-                "<legacyDrawing",
             };
             for (guards) |g| {
                 if (std.mem.indexOf(u8, xml, g) != null) {
@@ -3793,4 +3790,132 @@ test "Editor: drawing rewrite tolerates XML whitespace around `=` in worksheet r
     // the whitespace, applyDrawingEditForSheet would silently skip
     // and the col would still be 2.
     try std.testing.expect(try drawingPartContains(dst_path, "<xdr:col>3</xdr:col>"));
+}
+
+// ---------------------------------------------------------------------------
+// VML legacy drawings refusal lift (dr-2).
+// `Writer.addComment` produces a `<v:shape>` block in
+// `xl/drawings/vmlDrawing1.vml` AND a `<comment>` entry in
+// `xl/comments1.xml`. After Editor row/col edits, both must shift.
+// ---------------------------------------------------------------------------
+
+fn buildCommentFixture(path: []const u8, comment_ref: []const u8) !void {
+    var w = xlsx.Writer.init(std.testing.allocator);
+    defer w.deinit();
+    var s = try w.addSheet("S");
+    try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 }, .{ .integer = 4 } });
+    try s.writeRow(&.{ .{ .integer = 5 }, .{ .integer = 6 }, .{ .integer = 7 }, .{ .integer = 8 } });
+    try s.writeRow(&.{ .{ .integer = 9 }, .{ .integer = 10 }, .{ .integer = 11 }, .{ .integer = 12 } });
+    try s.writeRow(&.{ .{ .integer = 13 }, .{ .integer = 14 }, .{ .integer = 15 }, .{ .integer = 16 } });
+    try s.writeRow(&.{ .{ .integer = 17 }, .{ .integer = 18 }, .{ .integer = 19 }, .{ .integer = 20 } });
+    try s.addComment(comment_ref, "Author", "test note");
+    try w.save(path);
+}
+
+fn vmlPartContains(path: []const u8, needle: []const u8) !bool {
+    var store = try store_mod.PartStore.open(std.testing.allocator, path);
+    defer store.deinit();
+    const vml = (try store.part("xl/drawings/vmlDrawing1.vml")) orelse return error.MissingVml;
+    return std.mem.indexOf(u8, vml.bytes, needle) != null;
+}
+
+fn commentsPartContains(path: []const u8, needle: []const u8) !bool {
+    var store = try store_mod.PartStore.open(std.testing.allocator, path);
+    defer store.deinit();
+    const part = (try store.part("xl/comments1.xml")) orelse return error.MissingComments;
+    return std.mem.indexOf(u8, part.bytes, needle) != null;
+}
+
+test "Editor: insertColumn shifts VML anchor + x:Column (dr-2)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "vml_inscol_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "vml_inscol_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    try buildCommentFixture(src_path, "C5");
+    try std.testing.expect(try vmlPartContains(src_path, "<x:Column>2</x:Column>"));
+    try std.testing.expect(try vmlPartContains(src_path, "<x:Anchor>3, 15, 4, 2, 5, 31, 8, 3</x:Anchor>"));
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertColumn(0, 2);
+        try ed.save(dst_path);
+    }
+    try std.testing.expect(try vmlPartContains(dst_path, "<x:Column>3</x:Column>"));
+    try std.testing.expect(try vmlPartContains(dst_path, "<x:Anchor>4, 15, 4, 2, 6, 31, 8, 3</x:Anchor>"));
+}
+
+test "Editor: insertRow shifts VML anchor + x:Row (dr-2)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "vml_insrow_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "vml_insrow_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    try buildCommentFixture(src_path, "C5");
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertRow(0, 3);
+        try ed.save(dst_path);
+    }
+    try std.testing.expect(try vmlPartContains(dst_path, "<x:Row>5</x:Row>"));
+    try std.testing.expect(try vmlPartContains(dst_path, "<x:Anchor>3, 15, 5, 2, 5, 31, 9, 3</x:Anchor>"));
+    try std.testing.expect(try vmlPartContains(dst_path, "<x:Column>2</x:Column>"));
+}
+
+test "Editor: deleteColumn at the comment's column drops the v:shape (dr-2)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "vml_delcol_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "vml_delcol_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    try buildCommentFixture(src_path, "C5");
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.deleteColumn(0, 3);
+        try ed.save(dst_path);
+    }
+    try std.testing.expect(!try vmlPartContains(dst_path, "<v:shape "));
+}
+
+test "Editor: insertColumn shifts BOTH VML anchor AND comments ref (REL-705)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "vml_cmt_inscol_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "vml_cmt_inscol_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    try buildCommentFixture(src_path, "C5");
+    try std.testing.expect(try commentsPartContains(src_path, "ref=\"C5\""));
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertColumn(0, 2);
+        try ed.save(dst_path);
+    }
+    try std.testing.expect(try vmlPartContains(dst_path, "<x:Column>3</x:Column>"));
+    try std.testing.expect(try commentsPartContains(dst_path, "ref=\"D5\""));
+    try std.testing.expect(!try commentsPartContains(dst_path, "ref=\"C5\""));
+}
+
+test "Editor: deleteColumn at comment's column drops BOTH VML shape AND comment entry (REL-705)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "vml_cmt_delcol_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "vml_cmt_delcol_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    try buildCommentFixture(src_path, "C5");
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.deleteColumn(0, 3);
+        try ed.save(dst_path);
+    }
+    try std.testing.expect(!try vmlPartContains(dst_path, "<v:shape "));
+    try std.testing.expect(!try commentsPartContains(dst_path, "<comment "));
 }
