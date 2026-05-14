@@ -861,16 +861,18 @@ pub const Editor = struct {
             const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
             const xml = try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
             defer self.allocator.free(xml);
-            // <pane> is no longer in this list — `pkg/sheet_edit.zig`
-            // shifts xSplit + topLeftCell for frozen/frozenSplit panes
-            // during the byte transform, and refuses split-state panes
-            // with `error.SplitPaneNotSupported`. `<picture>` is also
-            // off the list — CT_SheetBackgroundPicture is a single
-            // `r:id` reference to a tiled background image with no
-            // row/col coordinates (ECMA-376 §18.3.1.67).
+            // `<pane>`, `<picture>`, and modern `<drawing>` (xdr)
+            // are no longer in this list — `pkg/sheet_edit.zig`
+            // shifts pane splits during the byte transform,
+            // CT_SheetBackgroundPicture is a coordinate-free
+            // `r:id` reference (ECMA-376 §18.3.1.67), and
+            // `pkg/drawing_edit.zig` (wired through
+            // `Workbook.applyDrawingEditForSheet`) shifts
+            // `<xdr:from>`/`<xdr:to>` row/col coords in the
+            // referenced drawing part. `<legacyDrawing>` (VML)
+            // and `<tableParts>` stay refused.
             const guards = [_][]const u8{
                 "<tableParts",
-                "<drawing",
                 "<legacyDrawing",
             };
             for (guards) |g| {
@@ -908,14 +910,17 @@ pub const Editor = struct {
         }
 
         // Per-sheet content guard: refuse sheets whose bodies carry
-        // constructs the rewriters don't yet handle (drawings,
-        // pivots, tableParts). `<pane>`, `<autoFilter>`, and
-        // `<picture>` are no longer in this list — pane/autoFilter
-        // get rewritten by `pkg/sheet_edit.zig` during the byte
-        // transform, and CT_SheetBackgroundPicture is a coordinate-
-        // free background-image reference (ECMA-376 §18.3.1.67).
-        // See `docs/plans/refusal-audit.md` "Axes that stay refused"
-        // for the remaining rationale.
+        // constructs the rewriters don't yet handle (legacy VML
+        // drawings, pivots, tableParts). `<pane>`, `<autoFilter>`,
+        // `<picture>`, and modern `<drawing>` (xdr) are no longer
+        // in this list — `pkg/sheet_edit.zig` rewrites pane +
+        // autoFilter during the worksheet byte transform,
+        // CT_SheetBackgroundPicture is a coordinate-free
+        // background-image reference (ECMA-376 §18.3.1.67), and
+        // `pkg/drawing_edit.zig` (wired through
+        // `Workbook.applyDrawingEditForSheet`) shifts xdr anchor
+        // coords in the referenced drawing part. See
+        // `docs/plans/refusal-audit.md` for the remaining rationale.
         const path = self.sheet_paths[sheet_idx];
         if (findEntryByName(self.entries, path)) |entry_idx| {
             const e = self.entries[entry_idx];
@@ -924,7 +929,6 @@ pub const Editor = struct {
             defer self.allocator.free(xml);
             const guards = [_][]const u8{
                 "<tableParts",
-                "<drawing",
                 "<legacyDrawing",
             };
             for (guards) |g| {
@@ -3645,4 +3649,148 @@ test "Editor: insertColumn on sheet with `<picture>` background no longer refuse
     var ed2 = try Editor.open(std.testing.allocator, dst_path);
     defer ed2.deinit();
     try assertSheetXmlContains(&ed2, "<picture r:id=\"rId99\"/>");
+}
+
+// ---------------------------------------------------------------------------
+// Modern xdr drawings refusal lift (dr-1).
+// `Workbook.addImage` produces a `<xdr:oneCellAnchor>` at the requested
+// 1-based cell. After Editor row/col edits, the shifted xdr coords (0-based
+// in the wire format) must reflect the same insert/delete semantics as the
+// rest of the byte transform.
+// ---------------------------------------------------------------------------
+
+const tiny_png_1x1_for_editor = [_]u8{
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+    0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x00, 0x00, 0x00, 0x00, 0x3A, 0x7E, 0x9B,
+    0x55, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41,
+    0x54, 0x78, 0x9C, 0x63, 0x00, 0x00, 0x00, 0x02,
+    0x00, 0x01, 0xE2, 0x21, 0xBC, 0x33, 0x00, 0x00,
+    0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
+    0x60, 0x82,
+};
+
+fn buildDrawingFixture(path: []const u8, anchor_col: u32, anchor_row: u32) !void {
+    {
+        var w = xlsx.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 }, .{ .integer = 4 } });
+        try s.writeRow(&.{ .{ .integer = 5 }, .{ .integer = 6 }, .{ .integer = 7 }, .{ .integer = 8 } });
+        try w.save(path);
+    }
+    var wb = try workbook_mod.Workbook.open(std.testing.allocator, path);
+    defer wb.deinit();
+    try wb.addImage(0, .{ .col = anchor_col, .row = anchor_row }, &tiny_png_1x1_for_editor, .png);
+    try wb.save(path);
+}
+
+fn drawingPartContains(path: []const u8, needle: []const u8) !bool {
+    var store = try store_mod.PartStore.open(std.testing.allocator, path);
+    defer store.deinit();
+    const drawing = (try store.part("xl/drawings/drawing1.xml")) orelse return error.MissingDrawing;
+    return std.mem.indexOf(u8, drawing.bytes, needle) != null;
+}
+
+test "Editor: insertColumn shifts xdr drawing anchor col (dr-1)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "draw_inscol_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "draw_inscol_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    try buildDrawingFixture(src_path, 3, 5);
+    try std.testing.expect(try drawingPartContains(src_path, "<xdr:col>2</xdr:col>"));
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertColumn(0, 2);
+        try ed.save(dst_path);
+    }
+    try std.testing.expect(try drawingPartContains(dst_path, "<xdr:col>3</xdr:col>"));
+    try std.testing.expect(try drawingPartContains(dst_path, "<xdr:row>4</xdr:row>"));
+}
+
+test "Editor: insertRow shifts xdr drawing anchor row (dr-1)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "draw_insrow_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "draw_insrow_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    try buildDrawingFixture(src_path, 3, 5);
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertRow(0, 3);
+        try ed.save(dst_path);
+    }
+    try std.testing.expect(try drawingPartContains(dst_path, "<xdr:col>2</xdr:col>"));
+    try std.testing.expect(try drawingPartContains(dst_path, "<xdr:row>5</xdr:row>"));
+}
+
+test "Editor: deleteColumn at the anchor's column drops the oneCellAnchor (dr-1)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "draw_delcol_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "draw_delcol_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    try buildDrawingFixture(src_path, 3, 5);
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.deleteColumn(0, 3);
+        try ed.save(dst_path);
+    }
+    try std.testing.expect(!try drawingPartContains(dst_path, "<xdr:oneCellAnchor>"));
+}
+
+test "Editor: drawing rewrite tolerates XML whitespace around `=` in worksheet rels (dr-1 REL-602/604)" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "draw_eq_ws_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "draw_eq_ws_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    try buildDrawingFixture(src_path, 3, 5);
+    // Splice a custom `<drawing  r:id  =  "rId99"/>` into sheet1.xml
+    // ALONGSIDE the existing well-formed `<drawing r:id="rIdN"/>`
+    // emitted by addImage; we exercise the parser's whitespace
+    // tolerance even though the resolved part is the SAME.
+    {
+        var store = try store_mod.PartStore.open(std.testing.allocator, src_path);
+        defer store.deinit();
+        const sheet_name = "xl/worksheets/sheet1.xml";
+        const orig = (try store.part(sheet_name)) orelse return error.MissingSheet;
+        // Find the existing <drawing tag and rewrite it with
+        // whitespace around `=`.
+        const orig_open = std.mem.indexOf(u8, orig.bytes, "<drawing ") orelse return error.NoDrawingTag;
+        const orig_end = std.mem.indexOfPos(u8, orig.bytes, orig_open, "/>") orelse return error.NoDrawingClose;
+        // Extract the rId from the existing tag.
+        const eq = std.mem.indexOfScalarPos(u8, orig.bytes, orig_open, '=') orelse return error.NoEq;
+        const q1 = std.mem.indexOfScalarPos(u8, orig.bytes, eq, '"') orelse return error.NoQ1;
+        const q2 = std.mem.indexOfScalarPos(u8, orig.bytes, q1 + 1, '"') orelse return error.NoQ2;
+        const rid = orig.bytes[q1 + 1 .. q2];
+        var ws_tag_buf: [128]u8 = undefined;
+        const ws_tag = try std.fmt.bufPrint(&ws_tag_buf, "<drawing  r:id  =  \"{s}\" />", .{rid});
+        var new_xml = try std.testing.allocator.alloc(u8, orig.bytes.len - (orig_end + 2 - orig_open) + ws_tag.len);
+        defer std.testing.allocator.free(new_xml);
+        @memcpy(new_xml[0..orig_open], orig.bytes[0..orig_open]);
+        @memcpy(new_xml[orig_open .. orig_open + ws_tag.len], ws_tag);
+        @memcpy(new_xml[orig_open + ws_tag.len ..], orig.bytes[orig_end + 2 ..]);
+        try store.replacePart(sheet_name, new_xml);
+        try store.save(src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertColumn(0, 2);
+        try ed.save(dst_path);
+    }
+    // The drawing's xdr:col MUST shift; if findAttrValue mishandled
+    // the whitespace, applyDrawingEditForSheet would silently skip
+    // and the col would still be 2.
+    try std.testing.expect(try drawingPartContains(dst_path, "<xdr:col>3</xdr:col>"));
 }
