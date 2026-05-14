@@ -15,6 +15,7 @@ const std = @import("std");
 const xlsx = @import("zlsx");
 const workbook_mod = @import("workbook.zig");
 const sheet_edit = @import("sheet_edit.zig");
+const table_edit = @import("table_edit.zig");
 const store_mod = @import("store.zig");
 
 const Allocator = std.mem.Allocator;
@@ -854,35 +855,22 @@ pub const Editor = struct {
             return error.ColEditRequiresCleanSheet;
         }
 
-        // Per-sheet content guard — same axes as recordRowEdit.
+        // Per-sheet content guard — `<pane>`, `<picture>`, modern
+        // `<drawing>` (xdr), `<legacyDrawing>` (VML), `<autoFilter>`,
+        // and `<tableParts>` are all rewritten by their own
+        // byte-transform pipelines; see the matching comment in
+        // `recordRowEdit`. `<tableParts>` is pre-flighted (vs
+        // string-scanned) — `Workbook.preflightTableEditsForSheet`
+        // dry-runs `pkg/table_edit.zig::applyEditToTable` against
+        // each referenced `xl/tables/tableN.xml` and surfaces
+        // `TableCollapseUnsafe` / `TableHeaderRowDeleteUnsafe`
+        // before any sheet bytes are mutated.
         const path = self.sheet_paths[sheet_idx];
-        if (findEntryByName(self.entries, path)) |entry_idx| {
-            const e = self.entries[entry_idx];
-            const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
-            const xml = try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
-            defer self.allocator.free(xml);
-            // `<pane>`, `<picture>`, modern `<drawing>` (xdr), and
-            // `<legacyDrawing>` (VML) are no longer in this list —
-            // `pkg/sheet_edit.zig` shifts pane splits during the
-            // byte transform, CT_SheetBackgroundPicture is a
-            // coordinate-free `r:id` reference (ECMA-376
-            // §18.3.1.67), `pkg/drawing_edit.zig` (wired through
-            // `Workbook.applyDrawingEditForSheet`) shifts xdr
-            // anchor coords in the referenced drawing part, and
-            // `pkg/vml_edit.zig` (wired through
-            // `Workbook.applyVmlDrawingEditForSheet`) shifts VML
-            // `<x:Anchor>` + `<x:Row>`/`<x:Column>` + paired
-            // `<comment ref>` in `xl/commentsN.xml`. Only
-            // `<tableParts>` (cross-part graph) remains.
-            const guards = [_][]const u8{
-                "<tableParts",
-            };
-            for (guards) |g| {
-                if (std.mem.indexOf(u8, xml, g) != null) {
-                    return error.ColEditUnsafeForSheet;
-                }
-            }
-        } else return error.SheetEntryNotFound;
+        const tbl_kind: table_edit.EditKind = if (is_insert) .insert else .delete;
+        self.workbook.preflightTableEditsForSheet(path, .col, col_1based, tbl_kind) catch |err| switch (err) {
+            error.TableCollapseUnsafe, error.TableHeaderRowDeleteUnsafe => return error.ColEditUnsafeForSheet,
+            else => |e| return e,
+        };
 
         if (is_insert) {
             try self.workbook.insertColumn(sheet_idx, col_1based);
@@ -911,29 +899,24 @@ pub const Editor = struct {
             return error.RowEditRequiresCleanSheet;
         }
 
-        // Per-sheet content guard: only `<tableParts>` remains
-        // refused (cross-part ref graph in xl/tables/*.xml; no
-        // rewriter wired). `<pane>`, `<autoFilter>`, `<picture>`,
-        // modern `<drawing>` (xdr), and `<legacyDrawing>` (VML)
-        // are all rewritten by their respective byte-transform
-        // pipelines — see the matching comment in `recordColEdit`
-        // for the full attribution. See `docs/plans/refusal-audit.md`
-        // for the remaining rationale.
+        // Per-sheet content guard: every prior axis (pane,
+        // autoFilter, picture, modern + legacy drawings) is
+        // rewritten by its own byte-transform pipeline. The last
+        // axis — `<tableParts>` — is now pre-flighted (vs
+        // string-scanned). `Workbook.preflightTableEditsForSheet`
+        // dry-runs `pkg/table_edit.zig::applyEditToTable` against
+        // each referenced `xl/tables/tableN.xml` and surfaces
+        // `TableCollapseUnsafe` / `TableHeaderRowDeleteUnsafe`
+        // before any sheet bytes are mutated. See
+        // `docs/plans/refusal-audit.md` for the v1 limitations
+        // (collapse + header-row delete still refused — those are
+        // schema-invalid table states, not unrewritten ones).
         const path = self.sheet_paths[sheet_idx];
-        if (findEntryByName(self.entries, path)) |entry_idx| {
-            const e = self.entries[entry_idx];
-            const payload = self.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len];
-            const xml = try decompressZipPayload(self.allocator, payload, e.compression_method, e.uncompressed_size);
-            defer self.allocator.free(xml);
-            const guards = [_][]const u8{
-                "<tableParts",
-            };
-            for (guards) |g| {
-                if (std.mem.indexOf(u8, xml, g) != null) {
-                    return error.RowEditUnsafeForSheet;
-                }
-            }
-        } else return error.SheetEntryNotFound;
+        const tbl_kind: table_edit.EditKind = if (is_insert) .insert else .delete;
+        self.workbook.preflightTableEditsForSheet(path, .row, row, tbl_kind) catch |err| switch (err) {
+            error.TableCollapseUnsafe, error.TableHeaderRowDeleteUnsafe => return error.RowEditUnsafeForSheet,
+            else => |e| return e,
+        };
 
         if (is_insert) {
             try self.workbook.insertRow(sheet_idx, row);
@@ -3918,4 +3901,122 @@ test "Editor: deleteColumn at comment's column drops BOTH VML shape AND comment 
     }
     try std.testing.expect(!try vmlPartContains(dst_path, "<v:shape "));
     try std.testing.expect(!try commentsPartContains(dst_path, "<comment "));
+}
+
+// ---------------------------------------------------------------------------
+// <tableParts> round-trip tests (refusal lift; replaces prior
+// RowEditUnsafeForSheet / ColEditUnsafeForSheet on sheets carrying
+// `<tableParts>`). Drives a real corpus fixture because the Writer
+// doesn't synthesize tables; collapse / header-row-delete paths
+// stay refused (those are schema-invalid table states, not
+// unrewritten ones).
+// ---------------------------------------------------------------------------
+
+fn copyCorpusToTmp(src_corpus: []const u8, dst_path: [:0]const u8) !void {
+    std.fs.cwd().access(src_corpus, .{}) catch return error.SkipZigTest;
+    try std.fs.cwd().copyFile(src_corpus, std.fs.cwd(), dst_path, .{});
+}
+
+fn tablePartContains(path: []const u8, table_part: []const u8, needle: []const u8) !bool {
+    var ed = try Editor.open(std.testing.allocator, path);
+    defer ed.deinit();
+    const xml = ed.readEntry(table_part) catch return false;
+    defer std.testing.allocator.free(xml);
+    return std.mem.indexOf(u8, xml, needle) != null;
+}
+
+test "Editor: insertRow above table shifts <table ref> in xl/tables/tableN.xml" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "tbl_insrow_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "tbl_insrow_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    copyCorpusToTmp("tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertRow(0, 5); // Above the table at C9:E10.
+        try ed.save(dst_path);
+    }
+    // Expect C9:E10 → C10:E11.
+    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "ref=\"C10:E11\""));
+    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "<autoFilter ref=\"C10:E11\""));
+}
+
+test "Editor: insertColumn inside table extends range and adds synthetic tableColumn" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "tbl_inscol_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "tbl_inscol_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    copyCorpusToTmp("tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertColumn(0, 4); // Insert at col D — inside C9:E10.
+        try ed.save(dst_path);
+    }
+    // C9:E10 → C9:F10. <tableColumns count="3"> → "4".
+    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "ref=\"C9:F10\""));
+    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "<tableColumns count=\"4\">"));
+    // The corpus table has tableColumn ids 1, 2, 3 → synthetic
+    // claims id=4 (max + 1).
+    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "<tableColumn id=\"4\""));
+}
+
+test "Editor: deleteColumn inside table drops matching tableColumn" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "tbl_delcol_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "tbl_delcol_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    copyCorpusToTmp("tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.deleteColumn(0, 4); // Drop col D — middle of C9:E10.
+        try ed.save(dst_path);
+    }
+    // C9:E10 → C9:D10. count goes 3 → 2; the middle tableColumn
+    // (id="3" in this corpus, name="Column1") goes away.
+    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "ref=\"C9:D10\""));
+    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "<tableColumns count=\"2\">"));
+    try std.testing.expect(!try tablePartContains(dst_path, "xl/tables/table1.xml", "name=\"Column1\""));
+}
+
+test "Editor: deleteRow on table's header row refuses with RowEditUnsafeForSheet" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "tbl_hdrrow_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    copyCorpusToTmp("tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
+    var ed = try Editor.open(std.testing.allocator, src_path);
+    defer ed.deinit();
+    // Table is at C9:E10 — row 9 is the header row.
+    const r = ed.deleteRow(0, 9);
+    try std.testing.expectError(error.RowEditUnsafeForSheet, r);
+}
+
+test "Editor: edit outside table range is byte-stable inside the table part" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "tbl_outside_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "tbl_outside_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    copyCorpusToTmp("tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        // Insert a column far past the table's BR (E = col 5).
+        try ed.insertColumn(0, 12);
+        try ed.save(dst_path);
+    }
+    // Table ref unchanged; the byte-equal short-circuit in
+    // applyTableEditsForSheet skips the replacePart, so SHA256
+    // passthrough holds for the table part.
+    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "ref=\"C9:E10\""));
 }

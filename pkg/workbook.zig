@@ -35,6 +35,7 @@ const drawing_emit = @import("drawing_emit.zig");
 const sheet_edit = @import("sheet_edit.zig");
 const drawing_edit = @import("drawing_edit.zig");
 const vml_edit = @import("vml_edit.zig");
+const table_edit = @import("table_edit.zig");
 const sst_plan_mod = @import("zlsx_sst_plan");
 const styles_plan_mod = @import("zlsx_styles_plan");
 const workbook_xml_plan_mod = @import("zlsx_workbook_xml_plan");
@@ -255,6 +256,28 @@ pub const Error = error{
     /// silently-corrupted comments part. Surfaces from
     /// `pkg/vml_edit.zig::applyEditToCommentsXml`.
     MalformedCommentsXml,
+    /// `Workbook.{insertRow, deleteRow, insertColumn, deleteColumn}`
+    /// failed while rewriting an `xl/tables/tableN.xml` part because
+    /// the part's `<table ref>` couldn't be parsed. Refused rather
+    /// than emit a silently-corrupted table part. Surfaces from
+    /// `pkg/table_edit.zig`.
+    MalformedTableXml,
+    /// `Workbook.{insertRow, insertColumn}` would shift a table
+    /// range corner past Excel's row/column cap. Practically
+    /// unreachable. Surfaces from `pkg/table_edit.zig`.
+    TableCoordinateOverflow,
+    /// `Workbook.{deleteRow, deleteColumn}` would shrink a structured
+    /// table to zero columns or zero rows. The Editor pre-flight
+    /// converts this into the user-facing `RowEditUnsafeForSheet` /
+    /// `ColEditUnsafeForSheet`, so this variant only surfaces when a
+    /// caller bypasses Editor. Surfaces from `pkg/table_edit.zig`.
+    TableCollapseUnsafe,
+    /// `Workbook.deleteRow` would remove a structured table's header
+    /// row (top of `<table ref>` when `headerRowCount >= 1`, the
+    /// default). Like `TableCollapseUnsafe`, the Editor pre-flight
+    /// remaps this to `RowEditUnsafeForSheet`. Surfaces from
+    /// `pkg/table_edit.zig`.
+    TableHeaderRowDeleteUnsafe,
     /// `Workbook.addSheet` refused because the workbook already
     /// holds the type-system maximum (`std.math.maxInt(u32)`)
     /// number of sheets. Excel imposes no documented sheet count
@@ -2379,6 +2402,13 @@ pub const Workbook = struct {
         // Sheets without `<legacyDrawing r:id>` skip silently.
         try self.applyVmlDrawingEditForSheet(part_name, part.bytes, spec);
 
+        // tbl: rewrite each `xl/tables/tableN.xml` referenced from
+        // the sheet's `<tableParts>` block. Sheets without
+        // `<tableParts>` skip silently. The Editor pre-flights
+        // unsafe edits (collapse / header-row delete) before we get
+        // here, so this call only encounters safe shifts.
+        try self.applyTableEditsForSheet(part_name, part.bytes, spec);
+
         // Invalidate the cached parsed view — the row/col-shifted
         // bytes don't match the previously-parsed structure, and
         // any subsequent ensureParsed must re-tokenize the new
@@ -2522,6 +2552,149 @@ pub const Workbook = struct {
                 try self.store.replacePart(comments_part_name, new_bytes);
             }
         }
+    }
+
+    /// tbl pre-flight: dry-run `table_edit.applyEditToTable`
+    /// against every table part referenced from the sheet's
+    /// `<tableParts>` block, freeing the dry-run output. Returns
+    /// the first refusal (e.g. `TableCollapseUnsafe`,
+    /// `TableHeaderRowDeleteUnsafe`) so the Editor can surface
+    /// `RowEditUnsafeForSheet` / `ColEditUnsafeForSheet` BEFORE any
+    /// sheet bytes are mutated. Sheets without `<tableParts>` are
+    /// no-ops.
+    pub fn preflightTableEditsForSheet(
+        self: *Workbook,
+        sheet_part_name: []const u8,
+        axis: table_edit.Axis,
+        idx_1based: u32,
+        kind: table_edit.EditKind,
+    ) Error!void {
+        const sheet_part = (try self.store.part(sheet_part_name)) orelse return;
+        const rels = self.store.rels(sheet_part_name);
+        var rid_iter = TablePartRidIterator.init(sheet_part.bytes);
+        while (rid_iter.next()) |rid| {
+            const target = relTargetForId(rels, rid) orelse continue;
+            const table_part_name = (try self.store.resolve(sheet_part_name, target)) orelse continue;
+            const table_part = (try self.store.part(table_part_name)) orelse continue;
+            const out = try table_edit.applyEditToTable(
+                self.allocator,
+                table_part.bytes,
+                axis,
+                idx_1based,
+                kind,
+            );
+            self.allocator.free(out);
+        }
+    }
+
+    /// tbl: walk the sheet's `<tableParts>` block, resolve each
+    /// `<tablePart r:id>` through the sheet rels, and run
+    /// `table_edit.applyEditToTable` against the referenced
+    /// `xl/tables/tableN.xml` part. Sheets without `<tableParts>`
+    /// skip silently. Pre-flight refusals (collapse, header-row
+    /// delete) are caught upstream by the Editor; reaching this
+    /// code with an unsafe edit propagates the table-edit typed
+    /// error to the caller.
+    fn applyTableEditsForSheet(
+        self: *Workbook,
+        sheet_part_name: []const u8,
+        sheet_xml: []const u8,
+        spec: SheetEditSpec,
+    ) Error!void {
+        const idx_1based = spec.row orelse spec.col.?;
+        if (idx_1based == 0) return;
+        const axis: table_edit.Axis = if (spec.row != null) .row else .col;
+        const kind: table_edit.EditKind = switch (spec.kind) {
+            .insert => .insert,
+            .delete => .delete,
+        };
+        const rels = self.store.rels(sheet_part_name);
+
+        var rid_iter = TablePartRidIterator.init(sheet_xml);
+        while (rid_iter.next()) |rid| {
+            const target = relTargetForId(rels, rid) orelse continue;
+            const table_part_name = (try self.store.resolve(sheet_part_name, target)) orelse continue;
+            const table_part = (try self.store.part(table_part_name)) orelse continue;
+            const new_bytes = try table_edit.applyEditToTable(
+                self.allocator,
+                table_part.bytes,
+                axis,
+                idx_1based,
+                kind,
+            );
+            defer self.allocator.free(new_bytes);
+            if (!std.mem.eql(u8, table_part.bytes, new_bytes)) {
+                try self.store.replacePart(table_part_name, new_bytes);
+            }
+        }
+    }
+};
+
+/// Iterator over `<tablePart r:id>` elements inside a worksheet's
+/// `<tableParts>` block. Yields the rid string for each child.
+/// Allocator-free, single-pass.
+const TablePartRidIterator = struct {
+    sheet_xml: []const u8,
+    cursor: usize,
+    block_end: usize,
+    found_block: bool,
+
+    fn init(sheet_xml: []const u8) TablePartRidIterator {
+        // Locate `<tableParts>` open + matching close. Leave
+        // cursor inside the block; on absence, set cursor == end.
+        var i: usize = 0;
+        while (i < sheet_xml.len) {
+            const lt = std.mem.indexOfScalarPos(u8, sheet_xml, i, '<') orelse break;
+            const need = "<tableParts".len;
+            if (lt + need >= sheet_xml.len) break;
+            if (std.mem.eql(u8, sheet_xml[lt .. lt + need], "<tableParts")) {
+                const after_byte = sheet_xml[lt + need];
+                if (after_byte == ' ' or after_byte == '\t' or after_byte == '\r' or
+                    after_byte == '\n' or after_byte == '/' or after_byte == '>')
+                {
+                    const open_end = std.mem.indexOfScalarPos(u8, sheet_xml, lt, '>') orelse break;
+                    // Self-closing `<tableParts/>` — empty block.
+                    if (open_end > 0 and sheet_xml[open_end - 1] == '/') {
+                        return .{ .sheet_xml = sheet_xml, .cursor = 0, .block_end = 0, .found_block = false };
+                    }
+                    const close = std.mem.indexOfPos(u8, sheet_xml, open_end + 1, "</tableParts>") orelse break;
+                    return .{
+                        .sheet_xml = sheet_xml,
+                        .cursor = open_end + 1,
+                        .block_end = close,
+                        .found_block = true,
+                    };
+                }
+            }
+            i = lt + 1;
+        }
+        return .{ .sheet_xml = sheet_xml, .cursor = 0, .block_end = 0, .found_block = false };
+    }
+
+    fn next(self: *TablePartRidIterator) ?[]const u8 {
+        if (!self.found_block) return null;
+        while (self.cursor < self.block_end) {
+            const lt = std.mem.indexOfScalarPos(u8, self.sheet_xml, self.cursor, '<') orelse return null;
+            if (lt >= self.block_end) return null;
+            const need = "<tablePart".len;
+            if (lt + need >= self.sheet_xml.len) return null;
+            if (std.mem.eql(u8, self.sheet_xml[lt .. lt + need], "<tablePart")) {
+                // Disambiguate `<tablePart` from `<tableParts`.
+                const after_byte = self.sheet_xml[lt + need];
+                if (after_byte == ' ' or after_byte == '\t' or after_byte == '\r' or
+                    after_byte == '\n' or after_byte == '/' or after_byte == '>')
+                {
+                    const tag_end = std.mem.indexOfScalarPos(u8, self.sheet_xml, lt, '>') orelse return null;
+                    self.cursor = tag_end + 1;
+                    if (findAttrValue(self.sheet_xml[lt .. tag_end + 1], "r:id")) |rid| {
+                        return rid;
+                    }
+                    continue;
+                }
+            }
+            self.cursor = lt + 1;
+        }
+        return null;
     }
 };
 
