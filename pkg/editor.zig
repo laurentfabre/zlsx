@@ -15,6 +15,7 @@ const std = @import("std");
 const xlsx = @import("zlsx");
 const workbook_mod = @import("workbook.zig");
 const sheet_edit = @import("sheet_edit.zig");
+const store_mod = @import("store.zig");
 
 const Allocator = std.mem.Allocator;
 const Workbook = workbook_mod.Workbook;
@@ -863,12 +864,14 @@ pub const Editor = struct {
             // <pane> is no longer in this list — `pkg/sheet_edit.zig`
             // shifts xSplit + topLeftCell for frozen/frozenSplit panes
             // during the byte transform, and refuses split-state panes
-            // with `error.SplitPaneNotSupported`.
+            // with `error.SplitPaneNotSupported`. `<picture>` is also
+            // off the list — CT_SheetBackgroundPicture is a single
+            // `r:id` reference to a tiled background image with no
+            // row/col coordinates (ECMA-376 §18.3.1.67).
             const guards = [_][]const u8{
                 "<tableParts",
                 "<drawing",
                 "<legacyDrawing",
-                "<picture",
             };
             for (guards) |g| {
                 if (std.mem.indexOf(u8, xml, g) != null) {
@@ -906,13 +909,13 @@ pub const Editor = struct {
 
         // Per-sheet content guard: refuse sheets whose bodies carry
         // constructs the rewriters don't yet handle (drawings,
-        // pivots, tableParts). `<pane>` and `<autoFilter>` are no
-        // longer in this list — `pkg/sheet_edit.zig` shifts ySplit
-        // + topLeftCell for frozen/frozenSplit panes (split-state
-        // panes surface `error.SplitPaneNotSupported`) and rewrites
-        // `<autoFilter ref>` + `<filterColumn colId>` during the
-        // byte transform. See `docs/plans/refusal-audit.md` "Axes
-        // that stay refused" for the remaining rationale.
+        // pivots, tableParts). `<pane>`, `<autoFilter>`, and
+        // `<picture>` are no longer in this list — pane/autoFilter
+        // get rewritten by `pkg/sheet_edit.zig` during the byte
+        // transform, and CT_SheetBackgroundPicture is a coordinate-
+        // free background-image reference (ECMA-376 §18.3.1.67).
+        // See `docs/plans/refusal-audit.md` "Axes that stay refused"
+        // for the remaining rationale.
         const path = self.sheet_paths[sheet_idx];
         if (findEntryByName(self.entries, path)) |entry_idx| {
             const e = self.entries[entry_idx];
@@ -923,7 +926,6 @@ pub const Editor = struct {
                 "<tableParts",
                 "<drawing",
                 "<legacyDrawing",
-                "<picture",
             };
             for (guards) |g| {
                 if (std.mem.indexOf(u8, xml, g) != null) {
@@ -3562,4 +3564,85 @@ test "Editor: deleteColumn on a sheet carrying <autoFilter> shrinks range" {
     defer ed2.deinit();
     // B1:D2 → B1:C2 (BR shrinks by one column).
     try assertSheetXmlContains(&ed2, "ref=\"B1:C2\"");
+}
+
+// ---------------------------------------------------------------------------
+// <picture> refusal lift (dr-0).
+// CT_SheetBackgroundPicture is a single coordinate-free `r:id` reference to
+// a tiled background image; row/col edits cannot misalign it. Confirm the
+// guard drop by injecting a `<picture/>` element into a sheet that wasn't
+// authored with one (zlsx's writer never emits CT_SheetBackgroundPicture)
+// and round-tripping insertRow + insertColumn through the Editor.
+// ---------------------------------------------------------------------------
+
+fn buildPictureFixture(path: []const u8) !void {
+    // Stage 1: produce a baseline workbook with the writer.
+    {
+        var w = xlsx.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 } });
+        try s.writeRow(&.{ .{ .integer = 3 }, .{ .integer = 4 } });
+        try w.save(path);
+    }
+
+    // Stage 2: splice `<picture r:id="rId99"/>` before `</worksheet>` in
+    // sheet1.xml via PartStore.replacePart, then save back over the
+    // baseline. The dangling rId99 doesn't resolve to anything in the
+    // sheet's rels; that's fine for this test — the guard is what we're
+    // exercising, and ECMA-376 readers tolerate dangling rels by
+    // ignoring the picture element rather than failing the file.
+    var store = try store_mod.PartStore.open(std.testing.allocator, path);
+    defer store.deinit();
+    const sheet_name = "xl/worksheets/sheet1.xml";
+    const orig = (try store.part(sheet_name)) orelse return error.MissingSheet;
+    const inject = "<picture r:id=\"rId99\"/>";
+    const close = "</worksheet>";
+    const idx = std.mem.indexOf(u8, orig.bytes, close) orelse return error.NoWorksheetClose;
+    var new_xml = try std.testing.allocator.alloc(u8, orig.bytes.len + inject.len);
+    defer std.testing.allocator.free(new_xml);
+    @memcpy(new_xml[0..idx], orig.bytes[0..idx]);
+    @memcpy(new_xml[idx .. idx + inject.len], inject);
+    @memcpy(new_xml[idx + inject.len ..], orig.bytes[idx..]);
+    try store.replacePart(sheet_name, new_xml);
+    try store.save(path);
+}
+
+test "Editor: insertRow on sheet with `<picture>` background no longer refused" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "pic_insrow_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "pic_insrow_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    try buildPictureFixture(src_path);
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(dst_path);
+    }
+    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    defer ed2.deinit();
+    // The `<picture>` element passes through unchanged (no row/col coords).
+    try assertSheetXmlContains(&ed2, "<picture r:id=\"rId99\"/>");
+}
+
+test "Editor: insertColumn on sheet with `<picture>` background no longer refused" {
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, "pic_inscol_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, "pic_inscol_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    try buildPictureFixture(src_path);
+    {
+        var ed = try Editor.open(std.testing.allocator, src_path);
+        defer ed.deinit();
+        try ed.insertColumn(0, 2);
+        try ed.save(dst_path);
+    }
+    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    defer ed2.deinit();
+    try assertSheetXmlContains(&ed2, "<picture r:id=\"rId99\"/>");
 }
