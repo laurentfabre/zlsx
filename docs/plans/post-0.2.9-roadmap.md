@@ -9,6 +9,26 @@ pulled forward of formula work, chart emit demoted to Tier D,
 walk-away gates tightened (grammar-class instead of corpus-percentage,
 report-only bench CI).
 
+## Status (as of 2026-05-14)
+
+**Drawings axis fully lifted** — the original B2 iter-er-5 audit's
+mechanical refusals are now ALL closed. The five lifts that
+shipped 2026-05-11 → 2026-05-14:
+
+- frozen panes (#103) — `pkg/sheet_edit.zig::processPaneTagRow/Col`
+- autoFilter (#104) — `pkg/sheet_edit.zig::processAutoFilterTagRow/Col`
+- background `<picture>` (#107) — guard drop only
+- modern xdr `<drawing>` (#108) — new `pkg/drawing_edit.zig`
+- VML `<legacyDrawing>` + paired `<comment ref>` (#109) — new
+  `pkg/vml_edit.zig` (anchor + comments parts in one wiring)
+
+Only `<tableParts>` row/col-edit refusal remains (cross-part ref
+graph in `xl/tables/*.xml`; stays per audit).
+
+v1 limitations on lifted axes (defer until a real fixture
+surfaces them): `pkg/drawing_edit.zig` hard-codes `xdr:` prefix;
+`pkg/vml_edit.zig` hard-codes `v:` and `x:` prefixes.
+
 ## Status (as of 2026-05-03)
 
 Tier-A, the Tier-B keystone (B0), and **B1 Workbook overlay are
