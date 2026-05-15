@@ -30,7 +30,7 @@ from typing import Iterator, Union
 
 from . import _ffi
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 """Python-package version. Tracks the Zig library's major+minor; the patch
 level may drift when the binding ships a Python-only fix."""
 
