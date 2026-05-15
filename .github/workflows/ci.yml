@@ -15,7 +15,7 @@ jobs:
       matrix:
         os: [macos-14, ubuntu-22.04]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Zig 0.15.2
         shell: bash
@@ -64,7 +64,7 @@ jobs:
           - x86_64-windows-gnu
           - aarch64-macos
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Zig 0.15.2
         shell: bash
         run: |
@@ -83,7 +83,7 @@ jobs:
     # is complete and the suite passes natively, flip this to false.
     continue-on-error: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Zig 0.15.2
         uses: mlugg/setup-zig@v2

@@ -18,7 +18,7 @@ jobs:
     name: Test-presence check
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Verify tests change with src/* or pkg/*
@@ -32,7 +32,7 @@ jobs:
     name: C ABI 3-file transaction
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Verify ABI lockstep
@@ -46,7 +46,7 @@ jobs:
     name: Monotonic test count
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Test count must not decrease
@@ -66,7 +66,7 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Generate TDAD map

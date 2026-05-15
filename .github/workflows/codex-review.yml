@@ -30,7 +30,7 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'codex-review')
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 

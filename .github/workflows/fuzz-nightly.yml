@@ -44,7 +44,7 @@ jobs:
     # fuzz crashes must turn the job red; the artefact-upload step
     # uses `if: always()` so crash files are still collected.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Zig 0.15.2
         uses: mlugg/setup-zig@v2

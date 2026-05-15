@@ -62,7 +62,7 @@ jobs:
             dylib_dir: bin
             staticlib_name: zlsx_static.lib
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Zig 0.15.2
         shell: bash
