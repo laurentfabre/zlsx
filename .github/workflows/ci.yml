@@ -81,7 +81,7 @@ jobs:
     # get visibility into what fails on Windows without blocking main.
     # Once the /tmp/-path migration in src/writer.zig + src/xlsx.zig
     # is complete and the suite passes natively, flip this to false.
-    continue-on-error: true
+    continue-on-error: false
     steps:
       - uses: actions/checkout@v4
 
