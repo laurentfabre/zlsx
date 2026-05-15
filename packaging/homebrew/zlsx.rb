@@ -24,7 +24,7 @@ class Zlsx < Formula
   # only ships in 0.3.0+ tarballs. If you cherry-pick this template
   # into a tap pinned to an older release, also drop the
   # zlsx-extract-images line from the test block.
-  version "0.3.0"
+  version "0.4.0"
   license "MIT"
 
   on_macos do
