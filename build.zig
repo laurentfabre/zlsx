@@ -408,6 +408,49 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(extract_images_exe);
 
+    // emb-4 compat-matrix tooling. `emb4-fixture` writes a small
+    // .xlsx exercising the full setEmbeddings surface; the user
+    // hand-drives it through Excel mac, Excel Win, LibreOffice, and
+    // Numbers per docs/plans/emb-4-compat-matrix.md, then
+    // `emb4-verify` re-opens the round-tripped file and reports
+    // whether the workbook→index rel + embedding parts survived.
+    const emb4_fixture_mod = b.createModule(.{
+        .root_source_file = b.path("tests/emb-4/fixture_gen.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    emb4_fixture_mod.addImport("zlsx_pkg", package_mod);
+    emb4_fixture_mod.addImport("zlsx", zlsx_mod);
+    const emb4_fixture_exe = b.addExecutable(.{
+        .name = "zlsx-emb4-fixture",
+        .root_module = emb4_fixture_mod,
+    });
+    const emb4_fixture_run = b.addRunArtifact(emb4_fixture_exe);
+    if (b.args) |args| emb4_fixture_run.addArgs(args);
+    const emb4_fixture_step = b.step(
+        "emb4-fixture",
+        "Write a small embeddings-bearing .xlsx for the emb-4 compat matrix (arg: out path)",
+    );
+    emb4_fixture_step.dependOn(&emb4_fixture_run.step);
+
+    const emb4_verify_mod = b.createModule(.{
+        .root_source_file = b.path("tests/emb-4/verify.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    emb4_verify_mod.addImport("zlsx_pkg", package_mod);
+    const emb4_verify_exe = b.addExecutable(.{
+        .name = "zlsx-emb4-verify",
+        .root_module = emb4_verify_mod,
+    });
+    const emb4_verify_run = b.addRunArtifact(emb4_verify_exe);
+    if (b.args) |args| emb4_verify_run.addArgs(args);
+    const emb4_verify_step = b.step(
+        "emb4-verify",
+        "Verify embedding parts survived a round-trip through an external tool (arg: file path)",
+    );
+    emb4_verify_step.dependOn(&emb4_verify_run.step);
+
     // Per-source-file test targets so each module gets its own test
     // binary (matches the rest of build.zig's pattern).
     const package_store_tests_mod = b.createModule(.{
