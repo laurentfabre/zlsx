@@ -1,9 +1,7 @@
-//! Embedding-part wire-format primitives (emb-1a).
+//! Embedding-part wire-format primitives (emb-1).
 //!
-//! Pure functions over byte slices. No XML, no Unicode text
-//! canonicalization, no allocator-owning surfaces (allocator only
-//! appears where the caller explicitly asked for an owned buffer
-//! return). The XML + text canonicalization pieces ship in emb-1b.
+//! Pure functions over byte slices. Allocators appear only for caller-
+//! provided output buffers or temporary NFC normalization.
 //!
 //! See `docs/plans/embeddings-in-xlsx.md` for the format spec. This
 //! file implements:
@@ -11,6 +9,14 @@
 //! - `VecHeader` (24 bytes) + `HashHeader` (16 bytes) byte layout
 //!   with comptime size asserts pinning the disk offset of record 0.
 //! - `Dtype` enum mapping the wire byte + the XML attribute string.
+//! - `parseIndex` — low-allocation parser for
+//!   `xl/zlsxEmbeddings/index.xml`, writing coverage records into a
+//!   caller-provided slice.
+//! - `parseIndexRelationships` + `validateIndexRelationships` —
+//!   low-allocation validation for `index.xml.rels` before emb-2
+//!   materializes vec/hash parts through PartStore.
+//! - `parseVecPart` / `parseHashPart` — exact-size binary views with
+//!   per-record helpers.
 //! - f32 → binary16 / bfloat16 conversion (the compiler's IEEE 754
 //!   lowering plus a vetted bf16 round-to-nearest-even path).
 //! - int8 symmetric + asymmetric per-vector quantization +
@@ -22,6 +28,8 @@
 //! - `canonicalizeNumber` — Ryu shortest-round-trip via
 //!   `std.fmt.float.render`, with the v1 special-case rules from
 //!   the spec (`0.0` and `-0.0` both → `0`; NaN/inf rejected).
+//! - `canonicalizeText` and `xxh3Canonical` — trim Unicode whitespace,
+//!   NFC-normalize text, then hash the canonical row payload shape.
 //! - `xxh3` thin wrapper over `std.hash.XxHash3` so callers don't
 //!   pin a specific stdlib symbol.
 //!
@@ -32,6 +40,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const nfc = @import("zlsx_nfc");
 
 pub const Error = error{
     BadMagic,
@@ -40,10 +49,30 @@ pub const Error = error{
     InvalidReservedBytes,
     HeaderTooShort,
     BodyTooShort,
+    BodySizeMismatch,
     CountMismatch,
+    DimensionMismatch,
+    DtypeMismatch,
     DimensionOutOfRange,
     MalformedNumber,
+    MalformedIndexXml,
+    MalformedRelationshipsXml,
+    MissingAttribute,
+    MissingRelationship,
+    UnsupportedHashAlgorithm,
+    InvalidBoolean,
+    InvalidCoverageId,
+    DuplicateCoverageId,
+    DuplicateRelationshipId,
+    DuplicateRelationshipTarget,
+    InvalidIndexRelationship,
+    InvalidRange,
+    CoverageCountMismatch,
+    CoverageOverlap,
+    InvalidUtf8,
+    UnicodeNormalizationFailed,
     BufferTooSmall,
+    OutOfMemory,
 };
 
 // ---------------------------------------------------------------
@@ -59,6 +88,17 @@ pub const VEC_MAGIC: u32 = 0x4345565A;
 pub const HASH_MAGIC: u32 = 0x4853485A;
 
 pub const WIRE_VERSION: u32 = 1;
+pub const EMBEDDINGS_DIR: []const u8 = "xl/zlsxEmbeddings";
+pub const INDEX_PART_NAME: []const u8 = "xl/zlsxEmbeddings/index.xml";
+pub const INDEX_RELS_PART_NAME: []const u8 = "xl/zlsxEmbeddings/_rels/index.xml.rels";
+pub const INDEX_NAMESPACE: []const u8 = "http://schemas.laurentfabre.dev/zlsx/2026/embeddings";
+pub const HASH_ALGO_XXH3_64: []const u8 = "xxh3-64";
+pub const INDEX_CONTENT_TYPE: []const u8 = "application/vnd.laurentfabre.zlsx.embedding-index+xml";
+pub const VEC_CONTENT_TYPE: []const u8 = "application/vnd.laurentfabre.zlsx.embedding-vec";
+pub const HASH_CONTENT_TYPE: []const u8 = "application/vnd.laurentfabre.zlsx.embedding-hash";
+pub const REL_TYPE_EMBEDDINGS: []const u8 = "http://schemas.laurentfabre.dev/zlsx/2026/relationships/embeddings";
+pub const REL_TYPE_VEC: []const u8 = "http://schemas.laurentfabre.dev/zlsx/2026/relationships/embedding-vec";
+pub const REL_TYPE_HASH: []const u8 = "http://schemas.laurentfabre.dev/zlsx/2026/relationships/embedding-hash";
 
 /// The sole no-vector / tombstone marker. Slot whose stored hash
 /// equals this value MUST be skipped by query consumers (the vec
@@ -93,6 +133,25 @@ pub const Dtype = enum(u8) {
         };
     }
 
+    pub fn fromString(s: []const u8) Error!Dtype {
+        if (std.mem.eql(u8, s, "f32")) return .f32;
+        if (std.mem.eql(u8, s, "binary16")) return .binary16;
+        if (std.mem.eql(u8, s, "bfloat16")) return .bfloat16;
+        if (std.mem.eql(u8, s, "int8-sym-per-vec")) return .int8_sym_per_vec;
+        if (std.mem.eql(u8, s, "int8-asym-per-vec")) return .int8_asym_per_vec;
+        return Error.InvalidDtype;
+    }
+
+    pub fn string(self: Dtype) []const u8 {
+        return switch (self) {
+            .f32 => "f32",
+            .binary16 => "binary16",
+            .bfloat16 => "bfloat16",
+            .int8_sym_per_vec => "int8-sym-per-vec",
+            .int8_asym_per_vec => "int8-asym-per-vec",
+        };
+    }
+
     /// Wire-bytes per vector record for a given dimension. The
     /// header bytes are NOT included.
     pub fn recordBytes(self: Dtype, dim: u32) usize {
@@ -105,6 +164,475 @@ pub const Dtype = enum(u8) {
         };
     }
 };
+
+// ---------------------------------------------------------------
+// index.xml parser
+// ---------------------------------------------------------------
+
+pub const EXCEL_MAX_ROW: u32 = 1_048_576;
+pub const EXCEL_MAX_COL: u32 = 16_384;
+
+pub const A1Corner = struct {
+    row: u32, // 1-based
+    col: u32, // 0-based
+};
+
+pub const A1Range = struct {
+    first: A1Corner,
+    last: A1Corner,
+
+    pub fn rowCount(self: A1Range) u32 {
+        std.debug.assert(self.last.row >= self.first.row);
+        return self.last.row - self.first.row + 1;
+    }
+
+    pub fn overlaps(self: A1Range, other: A1Range) bool {
+        return self.first.row <= other.last.row and other.first.row <= self.last.row and
+            self.first.col <= other.last.col and other.first.col <= self.last.col;
+    }
+};
+
+pub const Coverage = struct {
+    id: []const u8,
+    worksheet_target: []const u8,
+    range: []const u8,
+    parsed_range: A1Range,
+    column: []const u8,
+    column_idx: u32,
+    count: u32,
+    include_formulas: bool,
+    vec_rid: []const u8,
+    hash_rid: []const u8,
+};
+
+pub const Index = struct {
+    version: u32,
+    model: []const u8,
+    dim: u32,
+    dtype: Dtype,
+    hash_algo: []const u8,
+    coverages: []const Coverage,
+};
+
+pub const TargetMode = enum {
+    internal,
+    external,
+};
+
+pub const IndexRelationship = struct {
+    id: []const u8,
+    type: []const u8,
+    target: []const u8,
+    target_mode: TargetMode,
+};
+
+pub fn parseIndex(xml: []const u8, coverage_buf: []Coverage) Error!Index {
+    var pos: usize = 0;
+    const root = (try nextXmlTag(xml, &pos)) orelse return Error.MalformedIndexXml;
+    if (root.closing) return Error.MalformedIndexXml;
+    if (!std.mem.eql(u8, localName(root.name), "embeddings")) return Error.MalformedIndexXml;
+
+    const xmlns = try attrValueRequired(root.body, "xmlns");
+    if (!std.mem.eql(u8, xmlns, INDEX_NAMESPACE)) return Error.MalformedIndexXml;
+
+    const version = try parseU32Decimal(try attrValueRequired(root.body, "version"));
+    if (version != WIRE_VERSION) return Error.UnsupportedVersion;
+    const model = try attrValueRequired(root.body, "model");
+    const dim = try parseU32Decimal(try attrValueRequired(root.body, "dim"));
+    if (dim == 0) return Error.DimensionOutOfRange;
+    const dtype = try Dtype.fromString(try attrValueRequired(root.body, "dtype"));
+    const hash_algo = try attrValueRequired(root.body, "hash_algo");
+    if (!std.mem.eql(u8, hash_algo, HASH_ALGO_XXH3_64)) return Error.UnsupportedHashAlgorithm;
+
+    var coverage_count: usize = 0;
+    var saw_root_close = root.self_closing;
+    while (!saw_root_close) {
+        const tag = (try nextXmlTag(xml, &pos)) orelse return Error.MalformedIndexXml;
+        const lname = localName(tag.name);
+        if (tag.closing) {
+            if (std.mem.eql(u8, lname, "embeddings")) {
+                saw_root_close = true;
+                break;
+            }
+            continue;
+        }
+        if (!std.mem.eql(u8, lname, "coverage")) continue;
+        if (coverage_count == coverage_buf.len) return Error.BufferTooSmall;
+
+        const coverage = try parseCoverage(tag.body);
+        for (coverage_buf[0..coverage_count]) |prev| {
+            if (std.mem.eql(u8, prev.id, coverage.id)) return Error.DuplicateCoverageId;
+            if (std.mem.eql(u8, prev.vec_rid, coverage.vec_rid) or
+                std.mem.eql(u8, prev.vec_rid, coverage.hash_rid) or
+                std.mem.eql(u8, prev.hash_rid, coverage.vec_rid) or
+                std.mem.eql(u8, prev.hash_rid, coverage.hash_rid))
+            {
+                return Error.DuplicateRelationshipId;
+            }
+            if (std.mem.eql(u8, prev.worksheet_target, coverage.worksheet_target) and
+                prev.parsed_range.overlaps(coverage.parsed_range))
+            {
+                return Error.CoverageOverlap;
+            }
+        }
+        coverage_buf[coverage_count] = coverage;
+        coverage_count += 1;
+    }
+    if (coverage_count == 0) return Error.MalformedIndexXml;
+    return .{
+        .version = version,
+        .model = model,
+        .dim = dim,
+        .dtype = dtype,
+        .hash_algo = hash_algo,
+        .coverages = coverage_buf[0..coverage_count],
+    };
+}
+
+pub fn parseIndexRelationships(xml: []const u8, rel_buf: []IndexRelationship) Error![]IndexRelationship {
+    var pos: usize = 0;
+    const root = (nextXmlTag(xml, &pos) catch return Error.MalformedRelationshipsXml) orelse
+        return Error.MalformedRelationshipsXml;
+    if (root.closing) return Error.MalformedRelationshipsXml;
+    if (!std.mem.eql(u8, localName(root.name), "Relationships")) return Error.MalformedRelationshipsXml;
+
+    var rel_count: usize = 0;
+    var saw_root_close = root.self_closing;
+    while (!saw_root_close) {
+        const tag = (nextXmlTag(xml, &pos) catch return Error.MalformedRelationshipsXml) orelse
+            return Error.MalformedRelationshipsXml;
+        const lname = localName(tag.name);
+        if (tag.closing) {
+            if (std.mem.eql(u8, lname, "Relationships")) {
+                saw_root_close = true;
+                break;
+            }
+            continue;
+        }
+        if (!std.mem.eql(u8, lname, "Relationship")) continue;
+        if (rel_count == rel_buf.len) return Error.BufferTooSmall;
+
+        const rel = try parseIndexRelationship(tag.body);
+        for (rel_buf[0..rel_count]) |prev| {
+            if (std.mem.eql(u8, prev.id, rel.id)) return Error.DuplicateRelationshipId;
+        }
+        rel_buf[rel_count] = rel;
+        rel_count += 1;
+    }
+    return rel_buf[0..rel_count];
+}
+
+/// Validate that every coverage's `vec_rId` and `hash_rId` resolves
+/// to a non-external relationship with the v1 relationship type and
+/// deterministic per-coverage target (`<id>/vec.bin` or
+/// `<id>/hashes.bin`). This is intentionally independent of
+/// `PartStore`; emb-2 will use PartStore only to normalize and
+/// materialize the already-validated target.
+pub fn validateIndexRelationships(index: Index, rels: []const IndexRelationship) Error!void {
+    for (index.coverages) |coverage| {
+        const vec_rel = try coverageRelationship(coverage, rels, .vec);
+        const hash_rel = try coverageRelationship(coverage, rels, .hash);
+        if (std.mem.eql(u8, vec_rel.target, hash_rel.target)) return Error.DuplicateRelationshipTarget;
+
+        var vec_expected_buf: [80]u8 = undefined;
+        const vec_expected = try expectedVecTarget(coverage.id, &vec_expected_buf);
+        if (!std.mem.eql(u8, vec_rel.target, vec_expected)) return Error.InvalidIndexRelationship;
+
+        var hash_expected_buf: [80]u8 = undefined;
+        const hash_expected = try expectedHashTarget(coverage.id, &hash_expected_buf);
+        if (!std.mem.eql(u8, hash_rel.target, hash_expected)) return Error.InvalidIndexRelationship;
+    }
+
+    for (index.coverages, 0..) |lhs, lhs_i| {
+        const lhs_vec = try coverageRelationship(lhs, rels, .vec);
+        const lhs_hash = try coverageRelationship(lhs, rels, .hash);
+        for (index.coverages[0..lhs_i]) |rhs| {
+            const rhs_vec = try coverageRelationship(rhs, rels, .vec);
+            const rhs_hash = try coverageRelationship(rhs, rels, .hash);
+            if (std.mem.eql(u8, lhs_vec.target, rhs_vec.target) or
+                std.mem.eql(u8, lhs_vec.target, rhs_hash.target) or
+                std.mem.eql(u8, lhs_hash.target, rhs_vec.target) or
+                std.mem.eql(u8, lhs_hash.target, rhs_hash.target))
+            {
+                return Error.DuplicateRelationshipTarget;
+            }
+        }
+    }
+}
+
+pub fn expectedVecTarget(id: []const u8, out: []u8) Error![]const u8 {
+    return expectedCoverageTarget(id, "vec.bin", out);
+}
+
+pub fn expectedHashTarget(id: []const u8, out: []u8) Error![]const u8 {
+    return expectedCoverageTarget(id, "hashes.bin", out);
+}
+
+fn parseCoverage(tag_body: []const u8) Error!Coverage {
+    const id = try attrValueRequired(tag_body, "id");
+    try validateCoverageId(id);
+    const worksheet_target = try attrValueRequired(tag_body, "worksheet_target");
+    const range_raw = try attrValueRequired(tag_body, "range");
+    const parsed_range = try parseA1Range(range_raw);
+    const column = try attrValueRequired(tag_body, "column");
+    const column_idx = try parseColumnName(column);
+    if (column_idx < parsed_range.first.col or column_idx > parsed_range.last.col) return Error.InvalidRange;
+    const count = try parseU32Decimal(try attrValueRequired(tag_body, "count"));
+    if (count != parsed_range.rowCount()) return Error.CoverageCountMismatch;
+    const include_formulas = if (try attrValue(tag_body, "include_formulas")) |raw|
+        try parseBool(raw)
+    else
+        false;
+    const vec_rid = try attrValueRequired(tag_body, "vec_rId");
+    const hash_rid = try attrValueRequired(tag_body, "hash_rId");
+    if (std.mem.eql(u8, vec_rid, hash_rid)) return Error.DuplicateRelationshipId;
+    return .{
+        .id = id,
+        .worksheet_target = worksheet_target,
+        .range = range_raw,
+        .parsed_range = parsed_range,
+        .column = column,
+        .column_idx = column_idx,
+        .count = count,
+        .include_formulas = include_formulas,
+        .vec_rid = vec_rid,
+        .hash_rid = hash_rid,
+    };
+}
+
+fn parseIndexRelationship(tag_body: []const u8) Error!IndexRelationship {
+    const id = try attrValueRequired(tag_body, "Id");
+    const rtype = try attrValueRequired(tag_body, "Type");
+    const target = try attrValueRequired(tag_body, "Target");
+    const target_mode: TargetMode = if (try attrValue(tag_body, "TargetMode")) |mode| blk: {
+        if (std.mem.eql(u8, mode, "External")) break :blk .external;
+        if (std.mem.eql(u8, mode, "Internal")) break :blk .internal;
+        return Error.InvalidIndexRelationship;
+    } else .internal;
+    return .{
+        .id = id,
+        .type = rtype,
+        .target = target,
+        .target_mode = target_mode,
+    };
+}
+
+pub const CoverageRelKind = enum {
+    vec,
+    hash,
+};
+
+pub fn coverageRelationship(
+    coverage: Coverage,
+    rels: []const IndexRelationship,
+    kind: CoverageRelKind,
+) Error!IndexRelationship {
+    const rid = switch (kind) {
+        .vec => coverage.vec_rid,
+        .hash => coverage.hash_rid,
+    };
+    const want_type = switch (kind) {
+        .vec => REL_TYPE_VEC,
+        .hash => REL_TYPE_HASH,
+    };
+    for (rels) |rel| {
+        if (!std.mem.eql(u8, rel.id, rid)) continue;
+        if (rel.target_mode != .internal) return Error.InvalidIndexRelationship;
+        if (!std.mem.eql(u8, rel.type, want_type)) return Error.InvalidIndexRelationship;
+        return rel;
+    }
+    return Error.MissingRelationship;
+}
+
+fn expectedCoverageTarget(id: []const u8, leaf: []const u8, out: []u8) Error![]const u8 {
+    try validateCoverageId(id);
+    return std.fmt.bufPrint(out, "{s}/{s}", .{ id, leaf }) catch Error.BufferTooSmall;
+}
+
+fn validateCoverageId(id: []const u8) Error!void {
+    if (id.len == 0 or id.len > 63) return Error.InvalidCoverageId;
+    for (id) |b| {
+        const ok = (b >= 'A' and b <= 'Z') or
+            (b >= 'a' and b <= 'z') or
+            (b >= '0' and b <= '9') or
+            b == '_' or b == '-';
+        if (!ok) return Error.InvalidCoverageId;
+    }
+}
+
+pub fn parseA1Range(s: []const u8) Error!A1Range {
+    const colon = std.mem.indexOfScalar(u8, s, ':');
+    const first = try parseA1Corner(if (colon) |c| s[0..c] else s);
+    const last = try parseA1Corner(if (colon) |c| s[c + 1 ..] else s);
+    if (first.row > last.row) return Error.InvalidRange;
+    if (first.col > last.col) return Error.InvalidRange;
+    return .{ .first = first, .last = last };
+}
+
+pub fn parseA1Corner(s: []const u8) Error!A1Corner {
+    if (s.len == 0) return Error.InvalidRange;
+    var i: usize = 0;
+    var col: u32 = 0;
+    while (i < s.len and isAsciiAlpha(s[i])) : (i += 1) {
+        const upper = std.ascii.toUpper(s[i]);
+        col = std.math.mul(u32, col, 26) catch return Error.InvalidRange;
+        col = std.math.add(u32, col, @as(u32, upper - 'A' + 1)) catch return Error.InvalidRange;
+        if (col > EXCEL_MAX_COL) return Error.InvalidRange;
+    }
+    if (i == 0 or i == s.len) return Error.InvalidRange;
+    if (s[i] == '0') return Error.InvalidRange;
+    const row = try parseU32Decimal(s[i..]);
+    if (row == 0 or row > EXCEL_MAX_ROW) return Error.InvalidRange;
+    return .{ .row = row, .col = col - 1 };
+}
+
+pub fn parseColumnName(s: []const u8) Error!u32 {
+    if (s.len == 0) return Error.InvalidRange;
+    var col: u32 = 0;
+    for (s) |b| {
+        if (!isAsciiAlpha(b)) return Error.InvalidRange;
+        const upper = std.ascii.toUpper(b);
+        col = std.math.mul(u32, col, 26) catch return Error.InvalidRange;
+        col = std.math.add(u32, col, @as(u32, upper - 'A' + 1)) catch return Error.InvalidRange;
+        if (col > EXCEL_MAX_COL) return Error.InvalidRange;
+    }
+    return col - 1;
+}
+
+const XmlTag = struct {
+    name: []const u8,
+    body: []const u8,
+    closing: bool,
+    self_closing: bool,
+};
+
+fn nextXmlTag(xml: []const u8, pos: *usize) Error!?XmlTag {
+    while (pos.* < xml.len) {
+        const lt = std.mem.indexOfScalarPos(u8, xml, pos.*, '<') orelse {
+            pos.* = xml.len;
+            return null;
+        };
+        if (std.mem.startsWith(u8, xml[lt..], "<!--")) {
+            const end = std.mem.indexOfPos(u8, xml, lt + 4, "-->") orelse return Error.MalformedIndexXml;
+            pos.* = end + 3;
+            continue;
+        }
+        const gt = try findXmlTagEnd(xml, lt + 1);
+        pos.* = gt + 1;
+        var body = std.mem.trim(u8, xml[lt + 1 .. gt], " \t\r\n");
+        if (body.len == 0) continue;
+        if (body[0] == '?' or body[0] == '!') continue;
+
+        const closing = body[0] == '/';
+        if (closing) body = std.mem.trim(u8, body[1..], " \t\r\n");
+
+        var self_closing = false;
+        if (!closing and body.len > 0 and body[body.len - 1] == '/') {
+            self_closing = true;
+            body = std.mem.trim(u8, body[0 .. body.len - 1], " \t\r\n");
+        }
+        if (body.len == 0) return Error.MalformedIndexXml;
+        const name_end = scanNameEnd(body, 0);
+        return .{
+            .name = body[0..name_end],
+            .body = body,
+            .closing = closing,
+            .self_closing = self_closing,
+        };
+    }
+    return null;
+}
+
+fn findXmlTagEnd(xml: []const u8, start: usize) Error!usize {
+    var quote: u8 = 0;
+    var i = start;
+    while (i < xml.len) : (i += 1) {
+        const b = xml[i];
+        if (quote != 0) {
+            if (b == quote) quote = 0;
+            continue;
+        }
+        if (b == '"' or b == '\'') {
+            quote = b;
+            continue;
+        }
+        if (b == '>') return i;
+    }
+    return Error.MalformedIndexXml;
+}
+
+fn attrValueRequired(tag_body: []const u8, name: []const u8) Error![]const u8 {
+    return (try attrValue(tag_body, name)) orelse Error.MissingAttribute;
+}
+
+fn attrValue(tag_body: []const u8, name: []const u8) Error!?[]const u8 {
+    var i = scanNameEnd(tag_body, 0);
+    while (i < tag_body.len) {
+        skipXmlSpace(tag_body, &i);
+        if (i >= tag_body.len) return null;
+        const key_start = i;
+        i = scanNameEnd(tag_body, i);
+        if (i == key_start) return Error.MalformedIndexXml;
+        const key = tag_body[key_start..i];
+        skipXmlSpace(tag_body, &i);
+        if (i >= tag_body.len or tag_body[i] != '=') return Error.MalformedIndexXml;
+        i += 1;
+        skipXmlSpace(tag_body, &i);
+        if (i >= tag_body.len or (tag_body[i] != '"' and tag_body[i] != '\'')) return Error.MalformedIndexXml;
+        const quote = tag_body[i];
+        i += 1;
+        const value_start = i;
+        while (i < tag_body.len and tag_body[i] != quote) : (i += 1) {}
+        if (i >= tag_body.len) return Error.MalformedIndexXml;
+        const value = tag_body[value_start..i];
+        i += 1;
+        if (std.mem.eql(u8, key, name)) return value;
+    }
+    return null;
+}
+
+fn scanNameEnd(s: []const u8, start: usize) usize {
+    var i = start;
+    while (i < s.len) : (i += 1) {
+        const b = s[i];
+        if (isXmlSpace(b) or b == '=' or b == '/') break;
+    }
+    return i;
+}
+
+fn localName(name: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, name, ':')) |i| return name[i + 1 ..];
+    return name;
+}
+
+fn skipXmlSpace(s: []const u8, i: *usize) void {
+    while (i.* < s.len and isXmlSpace(s[i.*])) i.* += 1;
+}
+
+fn isXmlSpace(b: u8) bool {
+    return b == ' ' or b == '\t' or b == '\n' or b == '\r';
+}
+
+fn isAsciiAlpha(b: u8) bool {
+    return (b >= 'A' and b <= 'Z') or (b >= 'a' and b <= 'z');
+}
+
+fn parseU32Decimal(s: []const u8) Error!u32 {
+    if (s.len == 0) return Error.MalformedIndexXml;
+    var v: u32 = 0;
+    for (s) |b| {
+        if (b < '0' or b > '9') return Error.MalformedIndexXml;
+        v = std.math.mul(u32, v, 10) catch return Error.MalformedIndexXml;
+        v = std.math.add(u32, v, @as(u32, b - '0')) catch return Error.MalformedIndexXml;
+    }
+    return v;
+}
+
+fn parseBool(s: []const u8) Error!bool {
+    if (std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "1")) return true;
+    if (std.mem.eql(u8, s, "false") or std.mem.eql(u8, s, "0")) return false;
+    return Error.InvalidBoolean;
+}
 
 // ---------------------------------------------------------------
 // Header layouts
@@ -162,6 +690,29 @@ pub const ParsedHashHeader = struct {
     count: u32,
 };
 
+pub const ParsedVecPart = struct {
+    header: ParsedVecHeader,
+    body: []const u8,
+
+    pub fn record(self: ParsedVecPart, idx: u32) Error![]const u8 {
+        if (idx >= self.header.count) return Error.InvalidRange;
+        const record_len = self.header.dtype.recordBytes(self.header.dim);
+        const start = @as(usize, idx) * record_len;
+        return self.body[start .. start + record_len];
+    }
+};
+
+pub const ParsedHashPart = struct {
+    header: ParsedHashHeader,
+    values_bytes: []const u8,
+
+    pub fn value(self: ParsedHashPart, idx: u32) Error!u64 {
+        if (idx >= self.header.count) return Error.InvalidRange;
+        const start = @as(usize, idx) * @sizeOf(u64);
+        return std.mem.readInt(u64, self.values_bytes[start .. start + @sizeOf(u64)][0..8], .little);
+    }
+};
+
 pub fn parseVecHeader(bytes: []const u8) Error!ParsedVecHeader {
     if (bytes.len < VEC_HEADER_BYTES) return Error.HeaderTooShort;
     const magic = std.mem.readInt(u32, bytes[0..4], .little);
@@ -177,9 +728,18 @@ pub fn parseVecHeader(bytes: []const u8) Error!ParsedVecHeader {
     }
     // Body-size check: header must be followed by exactly
     // `count * recordBytes(dim)` bytes.
-    const want_body: usize = @as(usize, count) * dtype.recordBytes(dim);
-    if (bytes.len < VEC_HEADER_BYTES + want_body) return Error.BodyTooShort;
+    const want_len = try checkedPartLen(VEC_HEADER_BYTES, count, dtype.recordBytes(dim));
+    if (bytes.len < want_len) return Error.BodyTooShort;
+    if (bytes.len != want_len) return Error.BodySizeMismatch;
     return .{ .version = version, .dim = dim, .count = count, .dtype = dtype };
+}
+
+pub fn parseVecPart(bytes: []const u8) Error!ParsedVecPart {
+    const header = try parseVecHeader(bytes);
+    return .{
+        .header = header,
+        .body = bytes[VEC_HEADER_BYTES..],
+    };
 }
 
 pub fn parseHashHeader(bytes: []const u8) Error!ParsedHashHeader {
@@ -191,15 +751,37 @@ pub fn parseHashHeader(bytes: []const u8) Error!ParsedHashHeader {
     const count = std.mem.readInt(u32, bytes[8..12], .little);
     const reserved = std.mem.readInt(u32, bytes[12..16], .little);
     if (reserved != 0) return Error.InvalidReservedBytes;
-    const want_body: usize = @as(usize, count) * @sizeOf(u64);
-    if (bytes.len < HASH_HEADER_BYTES + want_body) return Error.BodyTooShort;
+    const want_len = try checkedPartLen(HASH_HEADER_BYTES, count, @sizeOf(u64));
+    if (bytes.len < want_len) return Error.BodyTooShort;
+    if (bytes.len != want_len) return Error.BodySizeMismatch;
     return .{ .version = version, .count = count };
+}
+
+pub fn parseHashPart(bytes: []const u8) Error!ParsedHashPart {
+    const header = try parseHashHeader(bytes);
+    return .{
+        .header = header,
+        .values_bytes = bytes[HASH_HEADER_BYTES..],
+    };
 }
 
 /// Cross-check between a parsed VecHeader and a parsed HashHeader
 /// for the same coverage: counts MUST match.
 pub fn checkPairConsistent(vec: ParsedVecHeader, hash: ParsedHashHeader) Error!void {
     if (vec.count != hash.count) return Error.CountMismatch;
+}
+
+pub fn checkCoverageBinary(index: Index, coverage: Coverage, vec: ParsedVecHeader, hash: ParsedHashHeader) Error!void {
+    if (vec.dim != index.dim) return Error.DimensionMismatch;
+    if (vec.dtype != index.dtype) return Error.DtypeMismatch;
+    if (vec.count != coverage.count) return Error.CountMismatch;
+    if (hash.count != coverage.count) return Error.CountMismatch;
+}
+
+fn checkedPartLen(header_len: usize, count: u32, record_len: usize) Error!usize {
+    const body_len = std.math.mul(usize, @intCast(count), record_len) catch
+        return Error.BodyTooShort;
+    return std.math.add(usize, header_len, body_len) catch Error.BodyTooShort;
 }
 
 // ---------------------------------------------------------------
@@ -429,6 +1011,125 @@ fn isAsciiSpace(b: u8) bool {
 }
 
 // ---------------------------------------------------------------
+// Hash canonicalization
+// ---------------------------------------------------------------
+
+pub const CanonicalCell = union(enum) {
+    blank,
+    string: []const u8,
+    boolean: bool,
+    number: []const u8,
+    error_value: []const u8,
+};
+
+/// Canonicalize visible text for embedding hashes: trim Unicode
+/// `White_Space=Y` codepoints from both ends, then NFC-normalize.
+/// The normalized bytes are appended to `out`.
+pub fn canonicalizeText(
+    allocator: Allocator,
+    input: []const u8,
+    out: *std.ArrayListUnmanaged(u8),
+) Error!void {
+    const trimmed = try trimUnicodeWhitespace(input);
+    const normalized = nfc.normalize(allocator, trimmed) catch |err| switch (err) {
+        error.OutOfMemory => return Error.OutOfMemory,
+        error.InvalidUtf8 => return Error.InvalidUtf8,
+        else => return Error.UnicodeNormalizationFailed,
+    };
+    defer allocator.free(normalized);
+    try out.appendSlice(allocator, normalized);
+}
+
+/// Compose and hash:
+///
+/// `worksheet_target \x1F row_decimal \x1F cell_kind \x1F payload`
+///
+/// `scratch` is caller-owned and is cleared before use.
+pub fn xxh3Canonical(
+    allocator: Allocator,
+    worksheet_target: []const u8,
+    row: u32,
+    cell: CanonicalCell,
+    scratch: *std.ArrayListUnmanaged(u8),
+) Error!u64 {
+    if (row == 0 or row > EXCEL_MAX_ROW) return Error.InvalidRange;
+    scratch.clearRetainingCapacity();
+    try scratch.appendSlice(allocator, worksheet_target);
+    try scratch.append(allocator, 0x1F);
+
+    var row_buf: [10]u8 = undefined;
+    const row_s = std.fmt.bufPrint(&row_buf, "{d}", .{row}) catch unreachable;
+    try scratch.appendSlice(allocator, row_s);
+    try scratch.append(allocator, 0x1F);
+
+    switch (cell) {
+        .blank => {
+            try scratch.append(allocator, 'b');
+            try scratch.append(allocator, 0x1F);
+        },
+        .string => |s| {
+            try scratch.append(allocator, 's');
+            try scratch.append(allocator, 0x1F);
+            try canonicalizeText(allocator, s, scratch);
+        },
+        .boolean => |b| {
+            try scratch.append(allocator, 'B');
+            try scratch.append(allocator, 0x1F);
+            try scratch.append(allocator, if (b) '1' else '0');
+        },
+        .number => |raw| {
+            try scratch.append(allocator, 'n');
+            try scratch.append(allocator, 0x1F);
+            var num_buf: [64]u8 = undefined;
+            const canonical = try canonicalizeNumber(raw, &num_buf);
+            try scratch.appendSlice(allocator, canonical);
+        },
+        .error_value => |raw| {
+            try scratch.append(allocator, 'e');
+            try scratch.append(allocator, 0x1F);
+            try scratch.appendSlice(allocator, raw);
+        },
+    }
+    return xxh3(scratch.items);
+}
+
+fn trimUnicodeWhitespace(input: []const u8) Error![]const u8 {
+    if (!std.unicode.utf8ValidateSlice(input)) return Error.InvalidUtf8;
+    var i: usize = 0;
+    var first_non_ws: ?usize = null;
+    var end_non_ws: usize = 0;
+    while (i < input.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(input[i]) catch return Error.InvalidUtf8;
+        const cp = std.unicode.utf8Decode(input[i .. i + seq_len]) catch return Error.InvalidUtf8;
+        if (!isUnicodeWhitespace(cp)) {
+            if (first_non_ws == null) first_non_ws = i;
+            end_non_ws = i + seq_len;
+        }
+        i += seq_len;
+    }
+    const start = first_non_ws orelse return input[0..0];
+    return input[start..end_non_ws];
+}
+
+fn isUnicodeWhitespace(cp: u21) bool {
+    return switch (cp) {
+        0x0009...0x000D,
+        0x0020,
+        0x0085,
+        0x00A0,
+        0x1680,
+        0x2000...0x200A,
+        0x2028,
+        0x2029,
+        0x202F,
+        0x205F,
+        0x3000,
+        => true,
+        else => false,
+    };
+}
+
+// ---------------------------------------------------------------
 // xxh3-64 thin wrapper
 // ---------------------------------------------------------------
 
@@ -467,6 +1168,193 @@ test "Dtype.fromU8: known values map; out-of-range rejects" {
     try testing.expectEqual(Dtype.int8_asym_per_vec, try Dtype.fromU8(4));
     try testing.expectError(Error.InvalidDtype, Dtype.fromU8(5));
     try testing.expectError(Error.InvalidDtype, Dtype.fromU8(255));
+}
+
+test "Dtype string mapping rejects ambiguous f16 spelling" {
+    try testing.expectEqual(Dtype.f32, try Dtype.fromString("f32"));
+    try testing.expectEqual(Dtype.binary16, try Dtype.fromString("binary16"));
+    try testing.expectEqual(Dtype.bfloat16, try Dtype.fromString("bfloat16"));
+    try testing.expectEqual(Dtype.int8_sym_per_vec, try Dtype.fromString("int8-sym-per-vec"));
+    try testing.expectEqual(Dtype.int8_asym_per_vec, try Dtype.fromString("int8-asym-per-vec"));
+    try testing.expectEqualStrings("int8-sym-per-vec", Dtype.int8_sym_per_vec.string());
+    try testing.expectError(Error.InvalidDtype, Dtype.fromString("f16"));
+}
+
+test "parseA1Range: validates Excel bounds and row ordering" {
+    const r = try parseA1Range("A2:C10");
+    try testing.expectEqual(@as(u32, 2), r.first.row);
+    try testing.expectEqual(@as(u32, 0), r.first.col);
+    try testing.expectEqual(@as(u32, 10), r.last.row);
+    try testing.expectEqual(@as(u32, 2), r.last.col);
+    try testing.expectEqual(@as(u32, 9), r.rowCount());
+    try testing.expectEqual(@as(u32, 16_383), try parseColumnName("XFD"));
+    try testing.expectError(Error.InvalidRange, parseA1Range("A0:A1"));
+    try testing.expectError(Error.InvalidRange, parseA1Range("A2:A1"));
+    try testing.expectError(Error.InvalidRange, parseA1Range("XFE1:XFE2"));
+}
+
+test "parseIndex: parses plural coverage blocks" {
+    const xml =
+        \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings"
+        \\            version="1"
+        \\            model="text-embedding-3-small"
+        \\            dim="1536"
+        \\            dtype="int8-sym-per-vec"
+        \\            hash_algo="xxh3-64">
+        \\  <coverage id="title"
+        \\            worksheet_target="worksheets/sheet1.xml"
+        \\            range="A2:A10001" column="A"
+        \\            count="10000"
+        \\            include_formulas="false"
+        \\            vec_rId="rId1" hash_rId="rId2"/>
+        \\  <coverage id="body"
+        \\            worksheet_target="worksheets/sheet1.xml"
+        \\            range="B2:B10001" column="B"
+        \\            count="10000"
+        \\            include_formulas="true"
+        \\            vec_rId="rId3" hash_rId="rId4"/>
+        \\</embeddings>
+    ;
+    var coverages: [2]Coverage = undefined;
+    const index = try parseIndex(xml, &coverages);
+    try testing.expectEqual(@as(u32, 1), index.version);
+    try testing.expectEqualStrings("text-embedding-3-small", index.model);
+    try testing.expectEqual(@as(u32, 1536), index.dim);
+    try testing.expectEqual(Dtype.int8_sym_per_vec, index.dtype);
+    try testing.expectEqual(@as(usize, 2), index.coverages.len);
+    try testing.expectEqualStrings("title", index.coverages[0].id);
+    try testing.expectEqual(@as(u32, 10_000), index.coverages[0].count);
+    try testing.expect(!index.coverages[0].include_formulas);
+    try testing.expect(index.coverages[1].include_formulas);
+    try testing.expectEqual(@as(u32, 1), index.coverages[1].column_idx);
+}
+
+test "parseIndexRelationships: validates relationship types and deterministic targets" {
+    const index_xml =
+        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
+        \\  <coverage id="title" worksheet_target="worksheets/sheet1.xml" range="A1:A2" column="A" count="2" vec_rId="rId1" hash_rId="rId2"/>
+        \\  <coverage id="body" worksheet_target="worksheets/sheet1.xml" range="B1:B2" column="B" count="2" vec_rId="rId3" hash_rId="rId4"/>
+        \\</embeddings>
+    ;
+    var coverages: [2]Coverage = undefined;
+    const index = try parseIndex(index_xml, &coverages);
+
+    const rels_xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+        "<Relationship Id=\"rId1\" Type=\"" ++ REL_TYPE_VEC ++ "\" Target=\"title/vec.bin\"/>" ++
+        "<Relationship Id=\"rId2\" Type=\"" ++ REL_TYPE_HASH ++ "\" Target=\"title/hashes.bin\"/>" ++
+        "<Relationship Id=\"rId3\" Type=\"" ++ REL_TYPE_VEC ++ "\" Target=\"body/vec.bin\"/>" ++
+        "<Relationship Id=\"rId4\" Type=\"" ++ REL_TYPE_HASH ++ "\" Target=\"body/hashes.bin\"/>" ++
+        "</Relationships>";
+    var rels_buf: [4]IndexRelationship = undefined;
+    const rels = try parseIndexRelationships(rels_xml, &rels_buf);
+    try testing.expectEqual(@as(usize, 4), rels.len);
+    try validateIndexRelationships(index, rels);
+
+    var target_buf: [80]u8 = undefined;
+    try testing.expectEqualStrings("title/vec.bin", try expectedVecTarget("title", &target_buf));
+    try testing.expectEqualStrings("title/hashes.bin", try expectedHashTarget("title", &target_buf));
+}
+
+test "parseIndexRelationships: rejects bad rel ids, targets, and modes" {
+    const index_xml =
+        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
+        \\  <coverage id="title" worksheet_target="worksheets/sheet1.xml" range="A1:A1" column="A" count="1" vec_rId="rId1" hash_rId="rId2"/>
+        \\</embeddings>
+    ;
+    var coverages: [1]Coverage = undefined;
+    const index = try parseIndex(index_xml, &coverages);
+
+    const duplicate_id =
+        "<Relationships>" ++
+        "<Relationship Id=\"rId1\" Type=\"" ++ REL_TYPE_VEC ++ "\" Target=\"title/vec.bin\"/>" ++
+        "<Relationship Id=\"rId1\" Type=\"" ++ REL_TYPE_HASH ++ "\" Target=\"title/hashes.bin\"/>" ++
+        "</Relationships>";
+    var rels_buf: [2]IndexRelationship = undefined;
+    try testing.expectError(Error.DuplicateRelationshipId, parseIndexRelationships(duplicate_id, &rels_buf));
+
+    const external =
+        "<Relationships>" ++
+        "<Relationship Id=\"rId1\" Type=\"" ++ REL_TYPE_VEC ++ "\" Target=\"https://example.com/v\" TargetMode=\"External\"/>" ++
+        "<Relationship Id=\"rId2\" Type=\"" ++ REL_TYPE_HASH ++ "\" Target=\"title/hashes.bin\"/>" ++
+        "</Relationships>";
+    const external_rels = try parseIndexRelationships(external, &rels_buf);
+    try testing.expectError(Error.InvalidIndexRelationship, validateIndexRelationships(index, external_rels));
+
+    const duplicate_target =
+        "<Relationships>" ++
+        "<Relationship Id=\"rId1\" Type=\"" ++ REL_TYPE_VEC ++ "\" Target=\"title/vec.bin\"/>" ++
+        "<Relationship Id=\"rId2\" Type=\"" ++ REL_TYPE_HASH ++ "\" Target=\"title/vec.bin\"/>" ++
+        "</Relationships>";
+    const duplicate_target_rels = try parseIndexRelationships(duplicate_target, &rels_buf);
+    try testing.expectError(Error.DuplicateRelationshipTarget, validateIndexRelationships(index, duplicate_target_rels));
+
+    const wrong_target =
+        "<Relationships>" ++
+        "<Relationship Id=\"rId1\" Type=\"" ++ REL_TYPE_VEC ++ "\" Target=\"other/vec.bin\"/>" ++
+        "<Relationship Id=\"rId2\" Type=\"" ++ REL_TYPE_HASH ++ "\" Target=\"title/hashes.bin\"/>" ++
+        "</Relationships>";
+    const wrong_target_rels = try parseIndexRelationships(wrong_target, &rels_buf);
+    try testing.expectError(Error.InvalidIndexRelationship, validateIndexRelationships(index, wrong_target_rels));
+
+    const missing =
+        "<Relationships>" ++
+        "<Relationship Id=\"rId1\" Type=\"" ++ REL_TYPE_VEC ++ "\" Target=\"title/vec.bin\"/>" ++
+        "</Relationships>";
+    const missing_rels = try parseIndexRelationships(missing, &rels_buf);
+    try testing.expectError(Error.MissingRelationship, validateIndexRelationships(index, missing_rels));
+}
+
+test "parseIndex: rejects duplicate ids, overlapping coverage, and count mismatch" {
+    const duplicate_id =
+        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
+        \\  <coverage id="dup" worksheet_target="worksheets/sheet1.xml" range="A1:A2" column="A" count="2" vec_rId="rId1" hash_rId="rId2"/>
+        \\  <coverage id="dup" worksheet_target="worksheets/sheet2.xml" range="A1:A2" column="A" count="2" vec_rId="rId3" hash_rId="rId4"/>
+        \\</embeddings>
+    ;
+    var coverages: [2]Coverage = undefined;
+    try testing.expectError(Error.DuplicateCoverageId, parseIndex(duplicate_id, &coverages));
+
+    const overlap =
+        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
+        \\  <coverage id="a" worksheet_target="worksheets/sheet1.xml" range="A1:B2" column="A" count="2" vec_rId="rId1" hash_rId="rId2"/>
+        \\  <coverage id="b" worksheet_target="worksheets/sheet1.xml" range="B2:C4" column="B" count="3" vec_rId="rId3" hash_rId="rId4"/>
+        \\</embeddings>
+    ;
+    try testing.expectError(Error.CoverageOverlap, parseIndex(overlap, &coverages));
+
+    const count_mismatch =
+        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
+        \\  <coverage id="a" worksheet_target="worksheets/sheet1.xml" range="A1:A2" column="A" count="3" vec_rId="rId1" hash_rId="rId2"/>
+        \\</embeddings>
+    ;
+    try testing.expectError(Error.CoverageCountMismatch, parseIndex(count_mismatch, coverages[0..1]));
+}
+
+test "parseIndex: rejects unsupported manifest values" {
+    const bad_dtype =
+        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f16" hash_algo="xxh3-64">
+        \\  <coverage id="a" worksheet_target="worksheets/sheet1.xml" range="A1:A1" column="A" count="1" vec_rId="rId1" hash_rId="rId2"/>
+        \\</embeddings>
+    ;
+    var coverages: [1]Coverage = undefined;
+    try testing.expectError(Error.InvalidDtype, parseIndex(bad_dtype, &coverages));
+
+    const future_version =
+        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="2" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
+        \\  <coverage id="a" worksheet_target="worksheets/sheet1.xml" range="A1:A1" column="A" count="1" vec_rId="rId1" hash_rId="rId2"/>
+        \\</embeddings>
+    ;
+    try testing.expectError(Error.UnsupportedVersion, parseIndex(future_version, &coverages));
+
+    const bad_hash =
+        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="sha256">
+        \\  <coverage id="a" worksheet_target="worksheets/sheet1.xml" range="A1:A1" column="A" count="1" vec_rId="rId1" hash_rId="rId2"/>
+        \\</embeddings>
+    ;
+    try testing.expectError(Error.UnsupportedHashAlgorithm, parseIndex(bad_hash, &coverages));
 }
 
 test "parseVecHeader: well-formed header round-trips" {
@@ -543,12 +1431,91 @@ test "parseHashHeader: well-formed round-trips" {
     try testing.expectEqual(@as(u32, 1), got.count);
 }
 
+test "parseVecPart/parseHashPart: exact-size views and record access" {
+    var vec_buf: [VEC_HEADER_BYTES + 16]u8 = undefined;
+    @memset(&vec_buf, 0);
+    std.mem.writeInt(u32, vec_buf[0..4], VEC_MAGIC, .little);
+    std.mem.writeInt(u32, vec_buf[4..8], WIRE_VERSION, .little);
+    std.mem.writeInt(u32, vec_buf[8..12], 2, .little);
+    std.mem.writeInt(u32, vec_buf[12..16], 2, .little);
+    vec_buf[16] = @intFromEnum(Dtype.f32);
+    vec_buf[VEC_HEADER_BYTES + 8] = 0xAB;
+
+    const vec = try parseVecPart(&vec_buf);
+    try testing.expectEqual(@as(u32, 2), vec.header.count);
+    try testing.expectEqual(@as(usize, 16), vec.body.len);
+    try testing.expectEqual(@as(usize, 8), (try vec.record(1)).len);
+    try testing.expectEqual(@as(u8, 0xAB), (try vec.record(1))[0]);
+    try testing.expectError(Error.InvalidRange, vec.record(2));
+
+    var hash_buf: [HASH_HEADER_BYTES + 16]u8 = undefined;
+    @memset(&hash_buf, 0);
+    std.mem.writeInt(u32, hash_buf[0..4], HASH_MAGIC, .little);
+    std.mem.writeInt(u32, hash_buf[4..8], WIRE_VERSION, .little);
+    std.mem.writeInt(u32, hash_buf[8..12], 2, .little);
+    std.mem.writeInt(u64, hash_buf[HASH_HEADER_BYTES..][0..8], 0x0102030405060708, .little);
+    std.mem.writeInt(u64, hash_buf[HASH_HEADER_BYTES + 8 ..][0..8], TOMBSTONE_HASH, .little);
+
+    const hashes = try parseHashPart(&hash_buf);
+    try testing.expectEqual(@as(u64, 0x0102030405060708), try hashes.value(0));
+    try testing.expectEqual(TOMBSTONE_HASH, try hashes.value(1));
+    try testing.expectError(Error.InvalidRange, hashes.value(2));
+}
+
+test "parseVecHeader/parseHashHeader: trailing bytes rejected" {
+    var vec_buf: [VEC_HEADER_BYTES + 1]u8 = undefined;
+    @memset(&vec_buf, 0);
+    std.mem.writeInt(u32, vec_buf[0..4], VEC_MAGIC, .little);
+    std.mem.writeInt(u32, vec_buf[4..8], WIRE_VERSION, .little);
+    std.mem.writeInt(u32, vec_buf[8..12], 1, .little);
+    std.mem.writeInt(u32, vec_buf[12..16], 0, .little);
+    vec_buf[16] = @intFromEnum(Dtype.f32);
+    try testing.expectError(Error.BodySizeMismatch, parseVecHeader(&vec_buf));
+
+    var hash_buf: [HASH_HEADER_BYTES + 1]u8 = undefined;
+    @memset(&hash_buf, 0);
+    std.mem.writeInt(u32, hash_buf[0..4], HASH_MAGIC, .little);
+    std.mem.writeInt(u32, hash_buf[4..8], WIRE_VERSION, .little);
+    std.mem.writeInt(u32, hash_buf[8..12], 0, .little);
+    try testing.expectError(Error.BodySizeMismatch, parseHashHeader(&hash_buf));
+}
+
 test "checkPairConsistent: count mismatch flagged" {
     const v: ParsedVecHeader = .{ .version = 1, .dim = 4, .count = 10, .dtype = .f32 };
     const h_ok: ParsedHashHeader = .{ .version = 1, .count = 10 };
     const h_bad: ParsedHashHeader = .{ .version = 1, .count = 11 };
     try checkPairConsistent(v, h_ok);
     try testing.expectError(Error.CountMismatch, checkPairConsistent(v, h_bad));
+}
+
+test "checkCoverageBinary: validates dim, dtype, and counts against index coverage" {
+    const index_xml =
+        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
+        \\  <coverage id="a" worksheet_target="worksheets/sheet1.xml" range="A1:A2" column="A" count="2" vec_rId="rId1" hash_rId="rId2"/>
+        \\</embeddings>
+    ;
+    var coverages: [1]Coverage = undefined;
+    const index = try parseIndex(index_xml, &coverages);
+    const coverage = index.coverages[0];
+
+    try checkCoverageBinary(
+        index,
+        coverage,
+        .{ .version = 1, .dim = 3, .count = 2, .dtype = .f32 },
+        .{ .version = 1, .count = 2 },
+    );
+    try testing.expectError(
+        Error.DimensionMismatch,
+        checkCoverageBinary(index, coverage, .{ .version = 1, .dim = 4, .count = 2, .dtype = .f32 }, .{ .version = 1, .count = 2 }),
+    );
+    try testing.expectError(
+        Error.DtypeMismatch,
+        checkCoverageBinary(index, coverage, .{ .version = 1, .dim = 3, .count = 2, .dtype = .bfloat16 }, .{ .version = 1, .count = 2 }),
+    );
+    try testing.expectError(
+        Error.CountMismatch,
+        checkCoverageBinary(index, coverage, .{ .version = 1, .dim = 3, .count = 3, .dtype = .f32 }, .{ .version = 1, .count = 2 }),
+    );
 }
 
 test "f32ToBfloat16: representable values round-trip exactly" {
@@ -718,6 +1685,74 @@ test "canonicalizeNumber: empty input rejected" {
     var buf: [64]u8 = undefined;
     try testing.expectError(Error.MalformedNumber, canonicalizeNumber("", &buf));
     try testing.expectError(Error.MalformedNumber, canonicalizeNumber("   ", &buf));
+}
+
+test "canonicalizeText: trims Unicode whitespace and NFC-normalizes" {
+    const a = testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(a);
+
+    try canonicalizeText(a, "\u{00A0}Cafe\u{301}\u{2003}", &out);
+    try testing.expectEqualStrings("Caf\u{00E9}", out.items);
+}
+
+test "canonicalizeText: invalid UTF-8 rejected" {
+    const a = testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(a);
+    try testing.expectError(Error.InvalidUtf8, canonicalizeText(a, "\xFF", &out));
+}
+
+test "xxh3Canonical: equivalent text and number payloads hash identically" {
+    const a = testing.allocator;
+    var scratch_a: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch_a.deinit(a);
+    var scratch_b: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch_b.deinit(a);
+
+    const text_a = try xxh3Canonical(a, "worksheets/sheet1.xml", 2, .{ .string = " Cafe\u{301} " }, &scratch_a);
+    const text_b = try xxh3Canonical(a, "worksheets/sheet1.xml", 2, .{ .string = "Caf\u{00E9}" }, &scratch_b);
+    try testing.expectEqual(text_a, text_b);
+
+    const num_a = try xxh3Canonical(a, "worksheets/sheet1.xml", 2, .{ .number = "0.1" }, &scratch_a);
+    const num_b = try xxh3Canonical(a, "worksheets/sheet1.xml", 2, .{ .number = "1.0000000000000001E-1" }, &scratch_b);
+    try testing.expectEqual(num_a, num_b);
+}
+
+test "xxh3Canonical: worksheet target and row are part of the hash" {
+    const a = testing.allocator;
+    var scratch_a: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch_a.deinit(a);
+    var scratch_b: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch_b.deinit(a);
+
+    const row_2 = try xxh3Canonical(a, "worksheets/sheet1.xml", 2, .{ .boolean = true }, &scratch_a);
+    const row_3 = try xxh3Canonical(a, "worksheets/sheet1.xml", 3, .{ .boolean = true }, &scratch_b);
+    try testing.expect(row_2 != row_3);
+
+    const sheet_1 = try xxh3Canonical(a, "worksheets/sheet1.xml", 2, .blank, &scratch_a);
+    const sheet_2 = try xxh3Canonical(a, "worksheets/sheet2.xml", 2, .blank, &scratch_b);
+    try testing.expect(sheet_1 != sheet_2);
+}
+
+fn allocationFailureCanonicalHash(allocator: Allocator) !void {
+    var scratch: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch.deinit(allocator);
+    _ = try xxh3Canonical(
+        allocator,
+        "worksheets/sheet1.xml",
+        2,
+        .{ .string = "\u{00A0}Cafe\u{301}\u{2003}" },
+        &scratch,
+    );
+}
+
+test "xxh3Canonical: allocation failures clean up and propagate" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        allocationFailureCanonicalHash,
+        .{},
+    );
 }
 
 test "xxh3: matches stdlib XxHash3 with seed 0 (regression pin)" {

@@ -68,8 +68,7 @@ pub const Editor = editor_mod.Editor;
 pub const CellSpan = editor_mod.CellSpan;
 pub const WorksheetSpans = editor_mod.WorksheetSpans;
 
-/// Embedding-part wire-format primitives (emb-1a). Pure functions
-/// over byte slices for the on-disk vec.bin / hashes.bin parts under
-/// `xl/zlsxEmbeddings/`. The XML manifest parser and Unicode text
-/// canonicalization ship in emb-1b.
+/// Embedding-part wire-format primitives (emb-1). Pure functions over
+/// byte slices for the on-disk index.xml / index.xml.rels / vec.bin /
+/// hashes.bin parts under `xl/zlsxEmbeddings/`.
 pub const embedding_part = @import("embedding_part.zig");

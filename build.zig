@@ -75,6 +75,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Unicode NFC normalizer shared by writer/editor validation and
+    // the embedding-part canonical hash pipeline.
+    const nfc_mod = b.createModule(.{
+        .root_source_file = b.path("src/unicode/nfc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // B3 iter-wr-7: fresh-archive emit substrate. Lifts the entire
     // archive orchestration (Content_Types.xml + rels + workbook.xml +
     // per-sheet sheet/rels/comments/vml + sst + styles + ZIP CD/EOCD)
@@ -106,6 +114,7 @@ pub fn build(b: *std.Build) void {
     zlsx_mod.addImport("zlsx_zip", zip_mod);
     zlsx_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
     zlsx_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
+    zlsx_mod.addImport("zlsx_nfc", nfc_mod);
 
     // Unit tests (embedded in src/xlsx.zig, including the fuzz suite).
     const unit_mod = b.createModule(.{
@@ -119,6 +128,7 @@ pub fn build(b: *std.Build) void {
     unit_mod.addImport("zlsx_zip", zip_mod);
     unit_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
     unit_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
+    unit_mod.addImport("zlsx_nfc", nfc_mod);
     const unit_tests = b.addTest(.{ .root_module = unit_mod });
     const test_step = b.step("test", "Run zlsx unit + fuzz-smoke tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
@@ -135,7 +145,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         // The `fuzz: ?bool` flag on Module flips the compile to
         // emit -ffuzz instrumentation. `addTest` doesn't expose
-        // this directly in Zig 0.15.2 — set it on the module.
+        // this directly here — set it on the module.
         .fuzz = true,
     });
     unit_fuzz_mod.addImport("zlsx_sst_plan", sst_plan_mod);
@@ -144,8 +154,9 @@ pub fn build(b: *std.Build) void {
     unit_fuzz_mod.addImport("zlsx_zip", zip_mod);
     unit_fuzz_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
     unit_fuzz_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
+    unit_fuzz_mod.addImport("zlsx_nfc", nfc_mod);
     const unit_fuzz_tests = b.addTest(.{ .root_module = unit_fuzz_mod });
-    const fuzz_step = b.step("fuzz", "Run coverage-guided fuzz targets (Linux x64; macOS/Windows broken upstream)");
+    const fuzz_step = b.step("fuzz", "Run coverage-guided fuzz targets (validated on Linux x64)");
     fuzz_step.dependOn(&b.addRunArtifact(unit_fuzz_tests).step);
 
     // Package-layer fuzz module is wired further down, after
@@ -211,6 +222,7 @@ pub fn build(b: *std.Build) void {
     writer_mod.addImport("zlsx_zip", zip_mod);
     writer_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
     writer_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
+    writer_mod.addImport("zlsx_nfc", nfc_mod);
     const writer_tests = b.addTest(.{ .root_module = writer_mod });
     test_step.dependOn(&b.addRunArtifact(writer_tests).step);
 
@@ -295,17 +307,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    unicode_mod.addImport("zlsx_nfc", nfc_mod);
     const unicode_tests = b.addTest(.{ .root_module = unicode_mod });
     test_step.dependOn(&b.addRunArtifact(unicode_tests).step);
 
     // A1 phase 3: standalone NFC tests (the casefold module imports
     // nfc.zig but has its own tests; this catches NFC bugs that
     // wouldn't surface through the casefold compositional path).
-    const nfc_mod = b.createModule(.{
-        .root_source_file = b.path("src/unicode/nfc.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
     const nfc_tests = b.addTest(.{ .root_module = nfc_mod });
     test_step.dependOn(&b.addRunArtifact(nfc_tests).step);
 
@@ -364,6 +372,7 @@ pub fn build(b: *std.Build) void {
     package_mod.addImport("zlsx_zip", zip_mod);
     package_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
     package_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
+    package_mod.addImport("zlsx_nfc", nfc_mod);
 
     // After the B2 iter-er-0 Editor relocation, `cli_mod` reaches
     // Editor through `zlsx_pkg` and xlsx via the named `zlsx` dep.
@@ -376,11 +385,11 @@ pub fn build(b: *std.Build) void {
     // C2a: standalone `zlsx-extract-images` binary that drives the
     // package layer (PartStore + imageParts) without going through
     // Editor / Book. Shipped as a separate exe rather than a CLI
-    // subcommand because cli_mod + zlsx_pkg + writer can't coexist
-    // in one compilation under Zig 0.15.2 (every file that
-    // `@import("writer")`s ends up claimed by both writer's tree
-    // and zlsx_pkg's tree). The standalone binary's module sees
-    // zlsx_pkg + writer in isolation, so no collision.
+    // subcommand because cli_mod + zlsx_pkg + writer hit the
+    // module-graph collision documented in AGENTS.md (every file
+    // that `@import("writer")`s ended up claimed by both writer's
+    // tree and zlsx_pkg's tree). Re-check under Zig 0.16.0 before
+    // merging this back into the main CLI.
     const extract_images_mod = b.createModule(.{
         .root_source_file = b.path("src/extract_images_main.zig"),
         .target = target,
@@ -425,6 +434,15 @@ pub fn build(b: *std.Build) void {
     const package_typed_parts_tests = b.addTest(.{ .root_module = package_typed_parts_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_typed_parts_tests).step);
 
+    const embedding_part_tests_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/embedding_part.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    embedding_part_tests_mod.addImport("zlsx_nfc", nfc_mod);
+    const embedding_part_tests = b.addTest(.{ .root_module = embedding_part_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(embedding_part_tests).step);
+
     // pkg/workbook.zig — Workbook + Worksheet typed-overlay roots
     // (B1 iter-wb-2). Composes PartStore + typed_parts into a single
     // model surface; read-only in this iter, mutation lands iter-wb-4.
@@ -443,6 +461,7 @@ pub fn build(b: *std.Build) void {
     package_workbook_tests_mod.addImport("zlsx_zip", zip_mod);
     package_workbook_tests_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
     package_workbook_tests_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
+    package_workbook_tests_mod.addImport("zlsx_nfc", nfc_mod);
     const package_workbook_tests = b.addTest(.{ .root_module = package_workbook_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_workbook_tests).step);
 
