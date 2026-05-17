@@ -25,7 +25,7 @@
 
 const std = @import("std");
 const tables = @import("tables/casefold_data.zig");
-const nfc = @import("nfc.zig");
+const nfc = @import("zlsx_nfc");
 
 /// Fully fold a UTF-8 string using non-Turkic full case folding.
 /// Returns owned bytes — caller frees.

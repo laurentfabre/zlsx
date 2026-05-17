@@ -47,6 +47,9 @@ pub const Worksheet = workbook_mod.Worksheet;
 pub const ResolvedStyle = workbook_mod.ResolvedStyle;
 pub const WorkbookError = workbook_mod.Error;
 pub const NumberFormatInfo = workbook_mod.NumberFormatInfo;
+pub const EmbeddingView = workbook_mod.EmbeddingView;
+pub const EmbeddingCoverageView = workbook_mod.EmbeddingCoverageView;
+pub const EmbeddingCoverageInput = workbook_mod.EmbeddingCoverageInput;
 
 /// Shared-strings extension-plan substrate (B3 iter-wr-1). Re-exported
 /// so `xlsx.Writer` (in `src/`) can stage strings + rich-text runs
@@ -67,3 +70,8 @@ const editor_mod = @import("editor.zig");
 pub const Editor = editor_mod.Editor;
 pub const CellSpan = editor_mod.CellSpan;
 pub const WorksheetSpans = editor_mod.WorksheetSpans;
+
+/// Embedding-part wire-format primitives (emb-1). Pure functions over
+/// byte slices for the on-disk index.xml / index.xml.rels / vec.bin /
+/// hashes.bin parts under `xl/zlsxEmbeddings/`.
+pub const embedding_part = @import("embedding_part.zig");
