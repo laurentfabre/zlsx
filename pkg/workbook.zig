@@ -296,6 +296,17 @@ pub const Error = error{
     /// that is not present in the package. Surfaces from
     /// `Workbook.embeddings()` (emb-2).
     MissingEmbeddingPart,
+    /// `Workbook.setEmbeddings` input failed semantic validation —
+    /// vector / hash count diverges from the declared range, or
+    /// `inputs.len == 0`. Surfaces from `setEmbeddings` (emb-3).
+    InvalidEmbeddingInput,
+    /// `Workbook.setEmbeddings` produced a part that would exceed
+    /// PartStore's 512 MiB read-side decompression cap. The writer
+    /// refuses to emit a workbook it cannot subsequently re-read.
+    /// Mitigations: pick a more aggressive quantization (int8 vs
+    /// f32), split into multiple smaller coverages, or accept the
+    /// future-streaming-API workaround when it lands (v1.1).
+    EmbeddingExceedsArchiveLimit,
     WriteFailed,
 } || workbook_xml_mod.Error || sheet_xml_mod.ParseError || sst_xml_mod.Error || styles_xml_mod.Error || store_mod.Error ||
     workbook_xml_plan_mod.Error ||
@@ -535,6 +546,53 @@ fn resolveEmbeddingRelTarget(
     }
     return null;
 }
+
+/// `<coverage id>` charset + length rules per the spec: required,
+/// 1..63 chars, `[A-Za-z0-9_-]` only. Mirrors the parser-side rule
+/// from `embedding_part.zig`'s `parseIndex`.
+fn isValidEmbeddingCoverageId(id: []const u8) bool {
+    if (id.len == 0 or id.len > 63) return false;
+    for (id) |c| {
+        const ok = (c >= 'A' and c <= 'Z') or
+            (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or
+            c == '_' or c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// One coverage's input to `Workbook.setEmbeddings`. The caller
+/// supplies pre-quantized vectors AND pre-computed hashes (xxh3-64
+/// of the canonical row content per the spec). Vector / hash
+/// computation against live cells is the caller's responsibility
+/// in v1 — typical flow is read cell text → embed via external
+/// API → compute hash via `embedding_part.xxh3Canonical`.
+pub const EmbeddingCoverageInput = struct {
+    id: []const u8,
+    worksheet_target: []const u8,
+    range: []const u8,
+    column: []const u8,
+    include_formulas: bool = false,
+    /// Pre-quantized vec.bin body bytes — already in the on-disk
+    /// layout for `dtype` (length = count * dtype.recordBytes(dim)).
+    /// For f32, this is `count * dim * 4` little-endian f32 bytes.
+    /// For int8 sym, this is `count * (4 + dim)` bytes (per-row
+    /// f32 scale + i8[dim]). Use `embedding_part.quantizeF32ToI8Sym`
+    /// upstream to produce the bytes.
+    vec_body: []const u8,
+    /// Per-row xxh3-64 hashes (length = count). Use
+    /// `TOMBSTONE_HASH` for sparse / formula-excluded rows.
+    hashes: []const u64,
+};
+
+/// In-memory cap mirroring PartStore's read-side decompression
+/// ceiling (`pkg/store.zig:1266`). `setEmbeddings` refuses to emit
+/// any part exceeding this size so zlsx never writes a workbook
+/// it cannot subsequently re-read.
+const EMBEDDING_PART_MAX_BYTES: usize = 512 * 1024 * 1024;
+const EMBEDDING_RELS_CONTENT_TYPE: []const u8 =
+    "application/vnd.openxmlformats-package.relationships+xml";
 
 pub const Workbook = struct {
     allocator: Allocator,
@@ -1020,6 +1078,210 @@ pub const Workbook = struct {
             .coverages = views,
         };
         return self.embedding_view;
+    }
+
+    /// emb-3a: write embedding parts under `xl/zlsxEmbeddings/`.
+    ///
+    /// `inputs` — one entry per `<coverage>` to register. Caller
+    /// owns vector quantization (provide `vec_body` in the on-disk
+    /// dtype layout) and hash computation (provide `hashes` of
+    /// length `count`).
+    ///
+    /// Parts written:
+    /// - `xl/zlsxEmbeddings/index.xml` — the manifest
+    /// - `xl/zlsxEmbeddings/_rels/index.xml.rels` — vec/hash rels
+    /// - `xl/zlsxEmbeddings/<id>/vec.bin` per coverage
+    /// - `xl/zlsxEmbeddings/<id>/hashes.bin` per coverage
+    ///
+    /// Content_Types Overrides are added automatically via
+    /// `PartStore.addPart`. The workbook → index relationship in
+    /// `xl/_rels/workbook.xml.rels` is NOT registered in v1 (emb-3a)
+    /// — `Workbook.embeddings()` discovers the index via direct part
+    /// lookup, so round-tripping through zlsx works. Excel and other
+    /// OPC consumers MAY strip the embedding parts on save without
+    /// that workbook rel; emb-3b will add the rel mutation.
+    ///
+    /// Errors:
+    /// - `InvalidEmbeddingInput` — `inputs.len == 0`, or per-input
+    ///   `vec_body` / `hashes` length mismatch against the range-
+    ///   derived count.
+    /// - `embedding_part.Error.InvalidRange` — range is not a valid
+    ///   A1 form.
+    /// - `embedding_part.Error.InvalidCoverageId` — id is empty,
+    ///   too long, or has a forbidden character.
+    /// - `embedding_part.Error.DuplicateCoverageId` — two inputs
+    ///   share the same `id`.
+    /// - `EmbeddingExceedsArchiveLimit` — any part would exceed
+    ///   PartStore's 512 MiB read cap.
+    /// - `embedding_part.Error.BodySizeMismatch` — `vec_body.len`
+    ///   does not equal `count * dtype.recordBytes(dim)`.
+    pub fn setEmbeddings(
+        self: *Workbook,
+        model: []const u8,
+        dim: u32,
+        dtype: embedding_part.Dtype,
+        inputs: []const EmbeddingCoverageInput,
+    ) Error!void {
+        if (inputs.len == 0) return error.InvalidEmbeddingInput;
+        if (dim == 0) return error.InvalidEmbeddingInput;
+
+        // Pass 1: per-input semantic validation + spec assembly.
+        // rId strings are owned (heap-allocated since they don't
+        // exist as static lits with the right number).
+        var specs = try self.allocator.alloc(embedding_part.CoverageSpec, inputs.len);
+        // `spec_freed` tracks how many specs have rIds we still need
+        // to free on error. Cleanup loop walks specs[0..spec_freed].
+        var spec_freed: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < spec_freed) : (i += 1) {
+                self.allocator.free(specs[i].vec_rid);
+                self.allocator.free(specs[i].hash_rid);
+            }
+            self.allocator.free(specs);
+        }
+
+        for (inputs, 0..) |inp, i| {
+            if (!isValidEmbeddingCoverageId(inp.id))
+                return error.InvalidCoverageId;
+            const range = try embedding_part.parseA1Range(inp.range);
+            const count: u32 = range.last.row - range.first.row + 1;
+            const expected_body: usize = @as(usize, count) * dtype.recordBytes(dim);
+            if (inp.vec_body.len != expected_body) return error.InvalidEmbeddingInput;
+            if (inp.hashes.len != count) return error.InvalidEmbeddingInput;
+
+            // Allocate rIds; +1 to make them 1-based.
+            var rid_buf: [24]u8 = undefined;
+            const vec_rid = std.fmt.bufPrint(&rid_buf, "rId{d}", .{2 * i + 1}) catch
+                return error.WriteFailed;
+            const vec_rid_dup = try self.allocator.dupe(u8, vec_rid);
+            errdefer self.allocator.free(vec_rid_dup);
+            const hash_rid = std.fmt.bufPrint(&rid_buf, "rId{d}", .{2 * i + 2}) catch
+                return error.WriteFailed;
+            const hash_rid_dup = try self.allocator.dupe(u8, hash_rid);
+            errdefer self.allocator.free(hash_rid_dup);
+
+            specs[i] = .{
+                .id = inp.id,
+                .worksheet_target = inp.worksheet_target,
+                .range = inp.range,
+                .column = inp.column,
+                .count = count,
+                .include_formulas = inp.include_formulas,
+                .vec_rid = vec_rid_dup,
+                .hash_rid = hash_rid_dup,
+            };
+            spec_freed = i + 1;
+        }
+
+        // Pass 2: duplicate-id rejection.
+        for (specs, 0..) |s, i| {
+            for (specs[i + 1 ..]) |t| {
+                if (std.mem.eql(u8, s.id, t.id)) return error.DuplicateCoverageId;
+            }
+        }
+
+        // Pass 3: encode + addPart per coverage's binaries.
+        for (inputs, specs) |inp, s| {
+            const vec_part = try embedding_part.encodeVecPart(
+                self.allocator,
+                .{ .version = embedding_part.WIRE_VERSION, .dim = dim, .count = s.count, .dtype = dtype },
+                inp.vec_body,
+            );
+            defer self.allocator.free(vec_part);
+            if (vec_part.len > EMBEDDING_PART_MAX_BYTES)
+                return error.EmbeddingExceedsArchiveLimit;
+
+            const hash_part = try embedding_part.encodeHashesPart(self.allocator, inp.hashes);
+            defer self.allocator.free(hash_part);
+            if (hash_part.len > EMBEDDING_PART_MAX_BYTES)
+                return error.EmbeddingExceedsArchiveLimit;
+
+            var path_buf: [256]u8 = undefined;
+            const vec_path = std.fmt.bufPrint(
+                &path_buf,
+                "{s}/{s}/vec.bin",
+                .{ embedding_part.EMBEDDINGS_DIR, s.id },
+            ) catch return error.WriteFailed;
+            try self.store.addPart(vec_path, embedding_part.VEC_CONTENT_TYPE, vec_part);
+
+            const hash_path = std.fmt.bufPrint(
+                &path_buf,
+                "{s}/{s}/hashes.bin",
+                .{ embedding_part.EMBEDDINGS_DIR, s.id },
+            ) catch return error.WriteFailed;
+            try self.store.addPart(hash_path, embedding_part.HASH_CONTENT_TYPE, hash_part);
+        }
+
+        // Pass 4: index.xml + index.xml.rels.
+        const index_xml = try embedding_part.encodeIndexXml(self.allocator, .{
+            .model = model,
+            .dim = dim,
+            .dtype = dtype,
+            .hash_algo = embedding_part.HASH_ALGO_XXH3_64,
+            .coverages = specs,
+        });
+        defer self.allocator.free(index_xml);
+        if (index_xml.len > EMBEDDING_PART_MAX_BYTES)
+            return error.EmbeddingExceedsArchiveLimit;
+        try self.store.addPart(
+            embedding_part.INDEX_PART_NAME,
+            embedding_part.INDEX_CONTENT_TYPE,
+            index_xml,
+        );
+
+        // Build rels list (2 per coverage). Targets are
+        // `<id>/{vec,hashes}.bin` relative to xl/zlsxEmbeddings/.
+        var rels = try self.allocator.alloc(embedding_part.RelSpec, 2 * specs.len);
+        defer self.allocator.free(rels);
+        // Target strings owned per-rel (heap-allocated since each is
+        // unique). Free after rels XML is emitted.
+        var rel_freed: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < rel_freed) : (i += 1) self.allocator.free(rels[i].target);
+        }
+        for (specs, 0..) |s, i| {
+            var target_buf: [128]u8 = undefined;
+            const vec_target = std.fmt.bufPrint(&target_buf, "{s}/vec.bin", .{s.id}) catch
+                return error.WriteFailed;
+            const vec_target_dup = try self.allocator.dupe(u8, vec_target);
+            rels[2 * i + 0] = .{
+                .id = s.vec_rid,
+                .type = embedding_part.REL_TYPE_VEC,
+                .target = vec_target_dup,
+            };
+            rel_freed = 2 * i + 1;
+
+            const hash_target = std.fmt.bufPrint(&target_buf, "{s}/hashes.bin", .{s.id}) catch
+                return error.WriteFailed;
+            const hash_target_dup = try self.allocator.dupe(u8, hash_target);
+            rels[2 * i + 1] = .{
+                .id = s.hash_rid,
+                .type = embedding_part.REL_TYPE_HASH,
+                .target = hash_target_dup,
+            };
+            rel_freed = 2 * i + 2;
+        }
+
+        const rels_xml = try embedding_part.encodeIndexRelsXml(self.allocator, rels);
+        defer self.allocator.free(rels_xml);
+        try self.store.addPart(
+            embedding_part.INDEX_RELS_PART_NAME,
+            EMBEDDING_RELS_CONTENT_TYPE,
+            rels_xml,
+        );
+
+        // Free the owned target / rId strings now that they're
+        // emitted into rels_xml.
+        for (rels) |r| self.allocator.free(r.target);
+        rel_freed = 0;
+        for (specs) |s| {
+            self.allocator.free(s.vec_rid);
+            self.allocator.free(s.hash_rid);
+        }
+        spec_freed = 0;
+        self.allocator.free(specs);
     }
 
     /// Resolve the number-format string a cell of `style_idx` would
@@ -9696,4 +9958,165 @@ test "Workbook.embeddings: count mismatch between coverage and binaries rejected
     try seedEmbeddingParts(&wb, vec_buf.items, hash_buf.items);
 
     try std.testing.expectError(error.CountMismatch, wb.embeddings());
+}
+
+// ---------------------------------------------------------------
+// emb-3a: Workbook.setEmbeddings tests
+// ---------------------------------------------------------------
+
+// Build vec_body bytes for `dtype=f32` from an f32 slice — each
+// scalar emits as 4 little-endian bytes.
+fn buildF32Body(buf: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, vectors: []const f32) !void {
+    buf.clearRetainingCapacity();
+    var le: [4]u8 = undefined;
+    for (vectors) |v| {
+        std.mem.writeInt(u32, &le, @bitCast(v), .little);
+        try buf.appendSlice(a, &le);
+    }
+}
+
+test "Workbook.setEmbeddings: single coverage round-trips through embeddings()" {
+    var wb = try Workbook.empty(std.testing.allocator);
+    defer wb.deinit();
+
+    // 2-d × 3-row f32 coverage.
+    const vectors = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const hashes = [_]u64{ 0x1111, 0x2222, 0x3333 };
+    var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer body_buf.deinit(std.testing.allocator);
+    try buildF32Body(&body_buf, std.testing.allocator, &vectors);
+
+    const inputs = [_]EmbeddingCoverageInput{.{
+        .id = "title",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A4",
+        .column = "A",
+        .include_formulas = false,
+        .vec_body = body_buf.items,
+        .hashes = &hashes,
+    }};
+    try wb.setEmbeddings("test-model", 2, .f32, &inputs);
+
+    const view = (try wb.embeddings()).?;
+    try std.testing.expectEqualStrings("test-model", view.index.model);
+    try std.testing.expectEqual(@as(u32, 2), view.index.dim);
+    try std.testing.expectEqual(embedding_part.Dtype.f32, view.index.dtype);
+    try std.testing.expectEqual(@as(usize, 1), view.coverages.len);
+    const c = &view.coverages[0];
+    try std.testing.expectEqualStrings("title", c.coverage.id);
+    try std.testing.expectEqual(@as(u32, 3), c.vec.header.count);
+    try std.testing.expectEqual(@as(u32, 3), c.hashes.header.count);
+    try std.testing.expectEqual(@as(u64, 0x2222), try c.hashes.value(1));
+}
+
+test "Workbook.setEmbeddings: multi-coverage Title+Body" {
+    var wb = try Workbook.empty(std.testing.allocator);
+    defer wb.deinit();
+
+    const t_vec = [_]f32{ 1, 1 };
+    const b_vec = [_]f32{ 2, 2, 3, 3 };
+    var t_body: std.ArrayListUnmanaged(u8) = .empty;
+    defer t_body.deinit(std.testing.allocator);
+    var b_body: std.ArrayListUnmanaged(u8) = .empty;
+    defer b_body.deinit(std.testing.allocator);
+    try buildF32Body(&t_body, std.testing.allocator, &t_vec);
+    try buildF32Body(&b_body, std.testing.allocator, &b_vec);
+
+    const t_hashes = [_]u64{0x10};
+    const b_hashes = [_]u64{ 0x20, 0x21 };
+
+    const inputs = [_]EmbeddingCoverageInput{
+        .{ .id = "title", .worksheet_target = "worksheets/sheet1.xml", .range = "A2:A2", .column = "A", .vec_body = t_body.items, .hashes = &t_hashes },
+        .{ .id = "body", .worksheet_target = "worksheets/sheet1.xml", .range = "B2:B3", .column = "B", .vec_body = b_body.items, .hashes = &b_hashes },
+    };
+    try wb.setEmbeddings("m", 2, .f32, &inputs);
+
+    const view = (try wb.embeddings()).?;
+    try std.testing.expectEqual(@as(usize, 2), view.coverages.len);
+    try std.testing.expect(view.coverageById("title") != null);
+    try std.testing.expect(view.coverageById("body") != null);
+    try std.testing.expectEqual(@as(u32, 1), view.coverageById("title").?.coverage.count);
+    try std.testing.expectEqual(@as(u32, 2), view.coverageById("body").?.coverage.count);
+}
+
+test "Workbook.setEmbeddings: rejects empty inputs" {
+    var wb = try Workbook.empty(std.testing.allocator);
+    defer wb.deinit();
+    try std.testing.expectError(
+        error.InvalidEmbeddingInput,
+        wb.setEmbeddings("m", 4, .f32, &.{}),
+    );
+}
+
+test "Workbook.setEmbeddings: vec_body / hashes length mismatch rejected" {
+    var wb = try Workbook.empty(std.testing.allocator);
+    defer wb.deinit();
+
+    const vectors = [_]f32{ 1, 2, 3, 4 }; // 2-d × 2-row
+    var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer body_buf.deinit(std.testing.allocator);
+    try buildF32Body(&body_buf, std.testing.allocator, &vectors);
+    const hashes = [_]u64{ 0xA, 0xB, 0xC }; // wrong: declared range is 2 rows
+
+    const inputs = [_]EmbeddingCoverageInput{.{
+        .id = "x",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A3",
+        .column = "A",
+        .vec_body = body_buf.items,
+        .hashes = &hashes,
+    }};
+    try std.testing.expectError(
+        error.InvalidEmbeddingInput,
+        wb.setEmbeddings("m", 2, .f32, &inputs),
+    );
+}
+
+test "Workbook.setEmbeddings: invalid coverage id rejected" {
+    var wb = try Workbook.empty(std.testing.allocator);
+    defer wb.deinit();
+
+    const vectors = [_]f32{ 1, 2 };
+    var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer body_buf.deinit(std.testing.allocator);
+    try buildF32Body(&body_buf, std.testing.allocator, &vectors);
+    const hashes = [_]u64{0xA};
+
+    const inputs = [_]EmbeddingCoverageInput{.{
+        .id = "bad id with spaces",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A2",
+        .column = "A",
+        .vec_body = body_buf.items,
+        .hashes = &hashes,
+    }};
+    try std.testing.expectError(
+        error.InvalidCoverageId,
+        wb.setEmbeddings("m", 2, .f32, &inputs),
+    );
+}
+
+test "Workbook.setEmbeddings: duplicate coverage ids rejected" {
+    var wb = try Workbook.empty(std.testing.allocator);
+    defer wb.deinit();
+
+    const vectors = [_]f32{ 1, 2 };
+    var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer body_buf.deinit(std.testing.allocator);
+    try buildF32Body(&body_buf, std.testing.allocator, &vectors);
+    const hashes = [_]u64{0xA};
+
+    const dup_input: EmbeddingCoverageInput = .{
+        .id = "title",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A2",
+        .column = "A",
+        .vec_body = body_buf.items,
+        .hashes = &hashes,
+    };
+    const inputs = [_]EmbeddingCoverageInput{ dup_input, dup_input };
+    try std.testing.expectError(
+        error.DuplicateCoverageId,
+        wb.setEmbeddings("m", 2, .f32, &inputs),
+    );
 }

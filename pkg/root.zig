@@ -49,6 +49,7 @@ pub const WorkbookError = workbook_mod.Error;
 pub const NumberFormatInfo = workbook_mod.NumberFormatInfo;
 pub const EmbeddingView = workbook_mod.EmbeddingView;
 pub const EmbeddingCoverageView = workbook_mod.EmbeddingCoverageView;
+pub const EmbeddingCoverageInput = workbook_mod.EmbeddingCoverageInput;
 
 /// Shared-strings extension-plan substrate (B3 iter-wr-1). Re-exported
 /// so `xlsx.Writer` (in `src/`) can stage strings + rich-text runs

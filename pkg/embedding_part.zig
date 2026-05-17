@@ -1142,6 +1142,185 @@ pub fn xxh3(bytes: []const u8) u64 {
 }
 
 // ---------------------------------------------------------------
+// Encoders — emb-3a write path
+// ---------------------------------------------------------------
+
+/// Caller-fillable spec for one `<coverage>` element. Matches the
+/// schema fields the design pins; XML escaping is handled by
+/// `encodeIndexXml`.
+pub const CoverageSpec = struct {
+    id: []const u8,
+    worksheet_target: []const u8,
+    range: []const u8,
+    column: []const u8,
+    count: u32,
+    include_formulas: bool,
+    vec_rid: []const u8,
+    hash_rid: []const u8,
+};
+
+pub const IndexSpec = struct {
+    model: []const u8,
+    dim: u32,
+    dtype: Dtype,
+    hash_algo: []const u8,
+    coverages: []const CoverageSpec,
+};
+
+pub const RelSpec = struct {
+    id: []const u8,
+    type: []const u8,
+    target: []const u8,
+};
+
+/// Write the 24-byte vec.bin header at the start of `out`. Asserts
+/// `out.len >= VEC_HEADER_BYTES`. Returns a slice into `out` covering
+/// the header.
+pub fn writeVecHeader(out: []u8, header: ParsedVecHeader) []u8 {
+    std.debug.assert(out.len >= VEC_HEADER_BYTES);
+    std.mem.writeInt(u32, out[0..4], VEC_MAGIC, .little);
+    std.mem.writeInt(u32, out[4..8], WIRE_VERSION, .little);
+    std.mem.writeInt(u32, out[8..12], header.dim, .little);
+    std.mem.writeInt(u32, out[12..16], header.count, .little);
+    out[16] = @intFromEnum(header.dtype);
+    @memset(out[17..VEC_HEADER_BYTES], 0);
+    return out[0..VEC_HEADER_BYTES];
+}
+
+/// Write the 16-byte hashes.bin header at the start of `out`.
+pub fn writeHashHeader(out: []u8, header: ParsedHashHeader) []u8 {
+    std.debug.assert(out.len >= HASH_HEADER_BYTES);
+    std.mem.writeInt(u32, out[0..4], HASH_MAGIC, .little);
+    std.mem.writeInt(u32, out[4..8], WIRE_VERSION, .little);
+    std.mem.writeInt(u32, out[8..12], header.count, .little);
+    std.mem.writeInt(u32, out[12..16], 0, .little);
+    return out[0..HASH_HEADER_BYTES];
+}
+
+/// Build a complete vec.bin: 24-byte header followed by
+/// `header.count * header.dtype.recordBytes(header.dim)` body bytes
+/// supplied by the caller. The body MUST already be in the on-disk
+/// layout for the chosen dtype — for int8 quantization that means
+/// `f32 scale; i8 values[dim]` per row (sym) or `f32 scale; i8 zero;
+/// i8 values[dim]` (asym). Use `quantizeF32ToI8Sym/Asym` upstream to
+/// produce the body bytes; this function does NOT quantize.
+pub fn encodeVecPart(allocator: Allocator, header: ParsedVecHeader, body: []const u8) Error![]u8 {
+    const expected_body: usize = @as(usize, header.count) * header.dtype.recordBytes(header.dim);
+    if (body.len != expected_body) return Error.BodySizeMismatch;
+    var buf = try allocator.alloc(u8, VEC_HEADER_BYTES + body.len);
+    errdefer allocator.free(buf);
+    _ = writeVecHeader(buf, header);
+    @memcpy(buf[VEC_HEADER_BYTES..], body);
+    return buf;
+}
+
+/// Build a complete hashes.bin: 16-byte header + count×u64 LE.
+pub fn encodeHashesPart(allocator: Allocator, hashes: []const u64) Error![]u8 {
+    if (hashes.len > std.math.maxInt(u32)) return Error.CountMismatch;
+    var buf = try allocator.alloc(u8, HASH_HEADER_BYTES + hashes.len * @sizeOf(u64));
+    errdefer allocator.free(buf);
+    _ = writeHashHeader(buf, .{ .version = WIRE_VERSION, .count = @intCast(hashes.len) });
+    for (hashes, 0..) |h, i| {
+        const off = HASH_HEADER_BYTES + i * @sizeOf(u64);
+        std.mem.writeInt(u64, buf[off..][0..8], h, .little);
+    }
+    return buf;
+}
+
+/// Build the index.xml manifest from `spec`. XML-escapes user-
+/// provided text fields (`model` and the per-coverage `id`,
+/// `worksheet_target`, `range`, `column`).
+pub fn encodeIndexXml(allocator: Allocator, spec: IndexSpec) Error![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
+    try buf.appendSlice(allocator, "<embeddings xmlns=\"");
+    try appendXmlEscaped(&buf, allocator, INDEX_NAMESPACE);
+    try buf.appendSlice(allocator, "\" version=\"1\" model=\"");
+    try appendXmlEscaped(&buf, allocator, spec.model);
+    try buf.appendSlice(allocator, "\" dim=\"");
+    try appendDecimal(&buf, allocator, spec.dim);
+    try buf.appendSlice(allocator, "\" dtype=\"");
+    try buf.appendSlice(allocator, dtypeXmlName(spec.dtype));
+    try buf.appendSlice(allocator, "\" hash_algo=\"");
+    try appendXmlEscaped(&buf, allocator, spec.hash_algo);
+    try buf.appendSlice(allocator, "\">\n");
+
+    for (spec.coverages) |c| {
+        try buf.appendSlice(allocator, "  <coverage id=\"");
+        try appendXmlEscaped(&buf, allocator, c.id);
+        try buf.appendSlice(allocator, "\" worksheet_target=\"");
+        try appendXmlEscaped(&buf, allocator, c.worksheet_target);
+        try buf.appendSlice(allocator, "\" range=\"");
+        try appendXmlEscaped(&buf, allocator, c.range);
+        try buf.appendSlice(allocator, "\" column=\"");
+        try appendXmlEscaped(&buf, allocator, c.column);
+        try buf.appendSlice(allocator, "\" count=\"");
+        try appendDecimal(&buf, allocator, c.count);
+        try buf.appendSlice(allocator, "\" include_formulas=\"");
+        try buf.appendSlice(allocator, if (c.include_formulas) "true" else "false");
+        try buf.appendSlice(allocator, "\" vec_rId=\"");
+        try appendXmlEscaped(&buf, allocator, c.vec_rid);
+        try buf.appendSlice(allocator, "\" hash_rId=\"");
+        try appendXmlEscaped(&buf, allocator, c.hash_rid);
+        try buf.appendSlice(allocator, "\"/>\n");
+    }
+
+    try buf.appendSlice(allocator, "</embeddings>\n");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Build the index.xml.rels file linking each coverage's vec.bin /
+/// hashes.bin sub-part via its rId.
+pub fn encodeIndexRelsXml(allocator: Allocator, rels: []const RelSpec) Error![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
+    try buf.appendSlice(allocator, "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n");
+    for (rels) |r| {
+        try buf.appendSlice(allocator, "  <Relationship Id=\"");
+        try appendXmlEscaped(&buf, allocator, r.id);
+        try buf.appendSlice(allocator, "\" Type=\"");
+        try appendXmlEscaped(&buf, allocator, r.type);
+        try buf.appendSlice(allocator, "\" Target=\"");
+        try appendXmlEscaped(&buf, allocator, r.target);
+        try buf.appendSlice(allocator, "\"/>\n");
+    }
+    try buf.appendSlice(allocator, "</Relationships>\n");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn dtypeXmlName(d: Dtype) []const u8 {
+    return switch (d) {
+        .f32 => "f32",
+        .binary16 => "binary16",
+        .bfloat16 => "bfloat16",
+        .int8_sym_per_vec => "int8-sym-per-vec",
+        .int8_asym_per_vec => "int8-asym-per-vec",
+    };
+}
+
+fn appendDecimal(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, value: u32) Error!void {
+    var num: [16]u8 = undefined;
+    const s = std.fmt.bufPrint(&num, "{d}", .{value}) catch return Error.BufferTooSmall;
+    try buf.appendSlice(allocator, s);
+}
+
+fn appendXmlEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, s: []const u8) Error!void {
+    // OOXML attribute-value escaping: & < > " (single quote left
+    // alone since we use double-quoted attributes throughout).
+    for (s) |c| switch (c) {
+        '&' => try buf.appendSlice(allocator, "&amp;"),
+        '<' => try buf.appendSlice(allocator, "&lt;"),
+        '>' => try buf.appendSlice(allocator, "&gt;"),
+        '"' => try buf.appendSlice(allocator, "&quot;"),
+        else => try buf.append(allocator, c),
+    };
+}
+
+// ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
 
@@ -1766,4 +1945,124 @@ test "xxh3: matches stdlib XxHash3 with seed 0 (regression pin)" {
 
 test "TOMBSTONE_HASH constant equals u64::MAX" {
     try testing.expectEqual(std.math.maxInt(u64), TOMBSTONE_HASH);
+}
+
+test "encodeVecPart: header + body round-trip through parseVecPart" {
+    const a = testing.allocator;
+    const dim: u32 = 2;
+    const count: u32 = 3;
+    var body: [3 * 2 * 4]u8 = undefined;
+    @memset(&body, 0);
+    // f32 record bytes: 4 per scalar. Write deterministic values.
+    for (0..count) |row| {
+        for (0..dim) |col| {
+            const off = (row * dim + col) * 4;
+            const v: f32 = @floatFromInt(row * 10 + col);
+            std.mem.writeInt(u32, body[off..][0..4], @bitCast(v), .little);
+        }
+    }
+    const part = try encodeVecPart(a, .{ .version = WIRE_VERSION, .dim = dim, .count = count, .dtype = .f32 }, &body);
+    defer a.free(part);
+
+    const parsed = try parseVecPart(part);
+    try testing.expectEqual(@as(u32, dim), parsed.header.dim);
+    try testing.expectEqual(@as(u32, count), parsed.header.count);
+    try testing.expectEqual(Dtype.f32, parsed.header.dtype);
+    try testing.expectEqualSlices(u8, &body, parsed.body);
+}
+
+test "encodeVecPart: body size mismatch rejected" {
+    const a = testing.allocator;
+    var bad_body: [4]u8 = .{0} ** 4; // 1×f32 — but header says count=2, dim=1 → expects 8
+    try testing.expectError(
+        Error.BodySizeMismatch,
+        encodeVecPart(a, .{ .version = WIRE_VERSION, .dim = 1, .count = 2, .dtype = .f32 }, &bad_body),
+    );
+}
+
+test "encodeHashesPart: round-trips through parseHashPart" {
+    const a = testing.allocator;
+    const hashes = [_]u64{ 0xDEADBEEF, TOMBSTONE_HASH, 0xCAFEBABE };
+    const part = try encodeHashesPart(a, &hashes);
+    defer a.free(part);
+
+    const parsed = try parseHashPart(part);
+    try testing.expectEqual(@as(u32, 3), parsed.header.count);
+    for (hashes, 0..) |want, i| {
+        try testing.expectEqual(want, try parsed.value(@intCast(i)));
+    }
+}
+
+test "encodeIndexXml: round-trips through parseIndex with one coverage" {
+    const a = testing.allocator;
+    const cov_spec = [_]CoverageSpec{.{
+        .id = "title",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A100",
+        .column = "A",
+        .count = 99,
+        .include_formulas = false,
+        .vec_rid = "rId1",
+        .hash_rid = "rId2",
+    }};
+    const xml = try encodeIndexXml(a, .{
+        .model = "text-embedding-3-small",
+        .dim = 1536,
+        .dtype = .int8_sym_per_vec,
+        .hash_algo = HASH_ALGO_XXH3_64,
+        .coverages = &cov_spec,
+    });
+    defer a.free(xml);
+
+    var cov_buf: [4]Coverage = undefined;
+    const idx = try parseIndex(xml, &cov_buf);
+    try testing.expectEqualStrings("text-embedding-3-small", idx.model);
+    try testing.expectEqual(@as(u32, 1536), idx.dim);
+    try testing.expectEqual(Dtype.int8_sym_per_vec, idx.dtype);
+    try testing.expectEqual(@as(usize, 1), idx.coverages.len);
+
+    const c = idx.coverages[0];
+    try testing.expectEqualStrings("title", c.id);
+    try testing.expectEqualStrings("worksheets/sheet1.xml", c.worksheet_target);
+    try testing.expectEqualStrings("rId1", c.vec_rid);
+    try testing.expectEqualStrings("rId2", c.hash_rid);
+    try testing.expectEqual(@as(u32, 99), c.count);
+    try testing.expect(!c.include_formulas);
+}
+
+test "encodeIndexXml: XML-escapes special characters in model name" {
+    const a = testing.allocator;
+    const xml = try encodeIndexXml(a, .{
+        .model = "model<test>&\"name\"",
+        .dim = 4,
+        .dtype = .f32,
+        .hash_algo = HASH_ALGO_XXH3_64,
+        .coverages = &.{},
+    });
+    defer a.free(xml);
+    // The four special characters must not appear unescaped inside
+    // the attribute value (the XML declaration's `?>` is OK).
+    try testing.expect(std.mem.indexOf(u8, xml, "&lt;test&gt;") != null);
+    try testing.expect(std.mem.indexOf(u8, xml, "&amp;") != null);
+    try testing.expect(std.mem.indexOf(u8, xml, "&quot;name&quot;") != null);
+    try testing.expect(std.mem.indexOf(u8, xml, "model<test>") == null);
+}
+
+test "encodeIndexRelsXml: round-trips through parseIndexRelationships" {
+    const a = testing.allocator;
+    const rels = [_]RelSpec{
+        .{ .id = "rId1", .type = REL_TYPE_VEC, .target = "title/vec.bin" },
+        .{ .id = "rId2", .type = REL_TYPE_HASH, .target = "title/hashes.bin" },
+    };
+    const xml = try encodeIndexRelsXml(a, &rels);
+    defer a.free(xml);
+
+    var rel_buf: [4]IndexRelationship = undefined;
+    const parsed = try parseIndexRelationships(xml, &rel_buf);
+    try testing.expectEqual(@as(usize, 2), parsed.len);
+    try testing.expectEqualStrings("rId1", parsed[0].id);
+    try testing.expectEqualStrings("title/vec.bin", parsed[0].target);
+    try testing.expectEqual(TargetMode.internal, parsed[0].target_mode);
+    try testing.expectEqualStrings("rId2", parsed[1].id);
+    try testing.expectEqualStrings("title/hashes.bin", parsed[1].target);
 }
