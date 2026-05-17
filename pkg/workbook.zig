@@ -32,6 +32,7 @@ const store_mod = @import("store.zig");
 const typed_parts = @import("typed_parts/root.zig");
 const zlsx = @import("zlsx");
 const drawing_emit = @import("drawing_emit.zig");
+const embedding_part = @import("embedding_part.zig");
 const sheet_edit = @import("sheet_edit.zig");
 const drawing_edit = @import("drawing_edit.zig");
 const vml_edit = @import("vml_edit.zig");
@@ -291,9 +292,14 @@ pub const Error = error{
     /// reaching this error means a string was added between plan-
     /// build and emit.
     SharedStringNotInPlan,
+    /// Embedding index relationships resolved to a vec/hash target
+    /// that is not present in the package. Surfaces from
+    /// `Workbook.embeddings()` (emb-2).
+    MissingEmbeddingPart,
     WriteFailed,
 } || workbook_xml_mod.Error || sheet_xml_mod.ParseError || sst_xml_mod.Error || styles_xml_mod.Error || store_mod.Error ||
     workbook_xml_plan_mod.Error ||
+    embedding_part.Error ||
     zlsx.formula_rewriter.Error ||
     std.fs.File.WriteError || std.fs.File.OpenError || std.fs.Dir.RenameError || std.fs.Dir.StatFileError;
 
@@ -483,6 +489,53 @@ fn builtinNumFmtCode(id: u32) ?[]const u8 {
     };
 }
 
+// ---------------------------------------------------------------
+// Embedding view (emb-2 — read-only access to xl/zlsxEmbeddings/*)
+// ---------------------------------------------------------------
+
+/// One parsed coverage block resolved against the workbook's
+/// PartStore: the manifest entry plus the typed header+body views
+/// of its vec.bin and hashes.bin sub-parts. All slices borrow from
+/// the parent `Workbook`'s `PartStore` and remain valid until
+/// `Workbook.deinit`.
+pub const EmbeddingCoverageView = struct {
+    coverage: embedding_part.Coverage,
+    vec: embedding_part.ParsedVecPart,
+    hashes: embedding_part.ParsedHashPart,
+};
+
+/// Lazy workbook-level view of zlsx embedding parts. The index
+/// borrows XML string slices from `index.xml`; each binary part
+/// view borrows directly from the `PartStore`-materialized bytes.
+pub const EmbeddingView = struct {
+    index: embedding_part.Index,
+    coverages: []const EmbeddingCoverageView,
+
+    /// Look up a coverage by its `<coverage id="...">` attribute.
+    /// Returns `null` if no coverage with that id exists.
+    pub fn coverageById(
+        self: EmbeddingView,
+        id: []const u8,
+    ) ?*const EmbeddingCoverageView {
+        assert(id.len > 0);
+        for (self.coverages) |*coverage| {
+            if (std.mem.eql(u8, coverage.coverage.id, id)) return coverage;
+        }
+        return null;
+    }
+};
+
+fn resolveEmbeddingRelTarget(
+    rels: []const embedding_part.IndexRelationship,
+    rid: []const u8,
+) ?[]const u8 {
+    if (rid.len == 0) return null;
+    for (rels) |r| {
+        if (std.mem.eql(u8, r.id, rid)) return r.target;
+    }
+    return null;
+}
+
 pub const Workbook = struct {
     allocator: Allocator,
     store: PartStore,
@@ -530,6 +583,15 @@ pub const Workbook = struct {
     /// sheets. The OOXML `<sst count=>` attribute. Distinct from
     /// `fresh_sst_plan.new_strings.items.len` (uniqueCount).
     fresh_sst_count: u64 = 0,
+
+    /// emb-2: lazy view of `xl/zlsxEmbeddings/*`. `null` until
+    /// `Workbook.embeddings()` is first called; cached thereafter.
+    /// All XML / binary leaf slices borrow from PartStore arena;
+    /// only the three storage handles below are heap-owned.
+    embedding_view: ?EmbeddingView = null,
+    embedding_index_storage: ?[]embedding_part.Coverage = null,
+    embedding_rels_storage: ?[]embedding_part.IndexRelationship = null,
+    embedding_coverage_views: ?[]EmbeddingCoverageView = null,
 
     /// Open an .xlsx file as a typed `Workbook`.
     ///
@@ -674,6 +736,9 @@ pub const Workbook = struct {
         self.workbook.deinit(self.allocator);
         self.workbook_xml_plan.deinit(self.allocator);
         self.fresh_sst_plan.deinit(self.allocator);
+        if (self.embedding_coverage_views) |s| self.allocator.free(s);
+        if (self.embedding_rels_storage) |s| self.allocator.free(s);
+        if (self.embedding_index_storage) |s| self.allocator.free(s);
         self.store.deinit();
     }
 
@@ -834,6 +899,127 @@ pub const Workbook = struct {
         const part = try self.store.part("xl/styles.xml") orelse return null;
         self.styles_view = try styles_xml_mod.parse(self.allocator, part.bytes);
         return &self.styles_view.?;
+    }
+
+    /// emb-2: lazily-parsed `xl/zlsxEmbeddings/*`. Returns `null` if
+    /// the workbook has no embedding index part; cached thereafter.
+    ///
+    /// All slices in the returned view borrow from PartStore arena
+    /// memory and stay valid until `Workbook.deinit`. The three
+    /// heap-owned arrays (the parsed-coverage storage backing
+    /// `index.coverages`, the parsed-relationship storage, and the
+    /// per-coverage view array) are freed by `deinit`.
+    ///
+    /// Errors:
+    /// - `MissingEmbeddingPart` if the index references a vec.bin or
+    ///   hashes.bin sub-part by relationship rId but the resolved
+    ///   target is not present, OR if the index exists without a
+    ///   companion `_rels/index.xml.rels`.
+    /// - `embedding_part.Error.CountMismatch` if a coverage's
+    ///   declared count diverges from either binary header's count.
+    /// - Other `embedding_part.Error` variants from header / XML
+    ///   parsing on malformed input.
+    pub fn embeddings(self: *Workbook) Error!?EmbeddingView {
+        if (self.embedding_view) |v| return v;
+
+        const idx_part = (try self.store.part(embedding_part.INDEX_PART_NAME)) orelse
+            return null;
+
+        // Grow-loop for parseIndex (it requires a caller-provided
+        // Coverage buffer; size unknown until we parse). Start at
+        // 4 since real workbooks typically have 1-2 coverages.
+        var idx_cap: usize = 4;
+        var idx_storage: []embedding_part.Coverage = try self.allocator.alloc(
+            embedding_part.Coverage,
+            idx_cap,
+        );
+        const idx = while (true) {
+            const got = embedding_part.parseIndex(idx_part.bytes, idx_storage) catch |err| switch (err) {
+                error.BufferTooSmall => {
+                    self.allocator.free(idx_storage);
+                    idx_cap = std.math.mul(usize, idx_cap, 2) catch return error.BufferTooSmall;
+                    idx_storage = try self.allocator.alloc(embedding_part.Coverage, idx_cap);
+                    continue;
+                },
+                else => |e| {
+                    self.allocator.free(idx_storage);
+                    return e;
+                },
+            };
+            break got;
+        };
+        errdefer self.allocator.free(idx_storage);
+
+        // Rels are required once an index is present. Each coverage
+        // contributes two rels (vec_rId + hash_rId), so start the
+        // grow-loop sized accordingly.
+        const rels_part = (try self.store.part(embedding_part.INDEX_RELS_PART_NAME)) orelse
+            return error.MissingEmbeddingPart;
+        var rels_cap: usize = @max(idx.coverages.len * 2, 4);
+        var rels_storage: []embedding_part.IndexRelationship = try self.allocator.alloc(
+            embedding_part.IndexRelationship,
+            rels_cap,
+        );
+        const rels = while (true) {
+            const got = embedding_part.parseIndexRelationships(rels_part.bytes, rels_storage) catch |err| switch (err) {
+                error.BufferTooSmall => {
+                    self.allocator.free(rels_storage);
+                    rels_cap = std.math.mul(usize, rels_cap, 2) catch return error.BufferTooSmall;
+                    rels_storage = try self.allocator.alloc(embedding_part.IndexRelationship, rels_cap);
+                    continue;
+                },
+                else => |e| {
+                    self.allocator.free(rels_storage);
+                    return e;
+                },
+            };
+            break got;
+        };
+        errdefer self.allocator.free(rels_storage);
+
+        // Build per-coverage views. Resolves each rId → Target via the
+        // relationships, then resolves Target → part bytes via the
+        // PartStore (using `EMBEDDINGS_DIR` as the base for the
+        // relative Target string).
+        const views = try self.allocator.alloc(EmbeddingCoverageView, idx.coverages.len);
+        errdefer self.allocator.free(views);
+
+        var path_buf: [256]u8 = undefined;
+        for (idx.coverages, 0..) |coverage, i| {
+            const vec_target = resolveEmbeddingRelTarget(rels, coverage.vec_rid) orelse
+                return error.MissingEmbeddingPart;
+            const hash_target = resolveEmbeddingRelTarget(rels, coverage.hash_rid) orelse
+                return error.MissingEmbeddingPart;
+
+            const vec_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ embedding_part.EMBEDDINGS_DIR, vec_target }) catch
+                return error.MissingEmbeddingPart;
+            const vec_part = (try self.store.part(vec_path)) orelse
+                return error.MissingEmbeddingPart;
+            const parsed_vec = try embedding_part.parseVecPart(vec_part.bytes);
+
+            const hash_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ embedding_part.EMBEDDINGS_DIR, hash_target }) catch
+                return error.MissingEmbeddingPart;
+            const hash_part = (try self.store.part(hash_path)) orelse
+                return error.MissingEmbeddingPart;
+            const parsed_hash = try embedding_part.parseHashPart(hash_part.bytes);
+
+            try embedding_part.checkCoverageBinary(idx, coverage, parsed_vec.header, parsed_hash.header);
+
+            views[i] = .{
+                .coverage = coverage,
+                .vec = parsed_vec,
+                .hashes = parsed_hash,
+            };
+        }
+
+        self.embedding_index_storage = idx_storage;
+        self.embedding_rels_storage = rels_storage;
+        self.embedding_coverage_views = views;
+        self.embedding_view = .{
+            .index = idx,
+            .coverages = views,
+        };
+        return self.embedding_view;
     }
 
     /// Resolve the number-format string a cell of `style_idx` would
@@ -9340,4 +9526,174 @@ test "iter-wr-7 parity: Workbook.saveFreshEmit byte-equivalent to Writer.save (s
     defer a.free(writer_workbook);
 
     try std.testing.expectEqualSlices(u8, writer_workbook, wb_workbook);
+}
+
+// ---------------------------------------------------------------
+// emb-2: Workbook.embeddings() accessor tests
+// ---------------------------------------------------------------
+
+// Build a minimal valid vec.bin: header (24 B) + `count` records of
+// `dtype.recordBytes(dim)` zeroed bytes.
+fn buildSynthVec(
+    buf: *std.ArrayListUnmanaged(u8),
+    a: std.mem.Allocator,
+    dim: u32,
+    count: u32,
+    dtype: embedding_part.Dtype,
+) !void {
+    buf.clearRetainingCapacity();
+    var hdr_bytes: [embedding_part.VEC_HEADER_BYTES]u8 = undefined;
+    @memset(&hdr_bytes, 0);
+    std.mem.writeInt(u32, hdr_bytes[0..4], embedding_part.VEC_MAGIC, .little);
+    std.mem.writeInt(u32, hdr_bytes[4..8], embedding_part.WIRE_VERSION, .little);
+    std.mem.writeInt(u32, hdr_bytes[8..12], dim, .little);
+    std.mem.writeInt(u32, hdr_bytes[12..16], count, .little);
+    hdr_bytes[16] = @intFromEnum(dtype);
+    try buf.appendSlice(a, &hdr_bytes);
+    const body_bytes: usize = @as(usize, count) * dtype.recordBytes(dim);
+    try buf.appendNTimes(a, 0, body_bytes);
+}
+
+// Build a minimal valid hashes.bin: header (16 B) + `count` u64
+// values (all set to TOMBSTONE_HASH for simplicity).
+fn buildSynthHashes(
+    buf: *std.ArrayListUnmanaged(u8),
+    a: std.mem.Allocator,
+    count: u32,
+) !void {
+    buf.clearRetainingCapacity();
+    var hdr_bytes: [embedding_part.HASH_HEADER_BYTES]u8 = undefined;
+    @memset(&hdr_bytes, 0);
+    std.mem.writeInt(u32, hdr_bytes[0..4], embedding_part.HASH_MAGIC, .little);
+    std.mem.writeInt(u32, hdr_bytes[4..8], embedding_part.WIRE_VERSION, .little);
+    std.mem.writeInt(u32, hdr_bytes[8..12], count, .little);
+    try buf.appendSlice(a, &hdr_bytes);
+    var rec: [8]u8 = undefined;
+    std.mem.writeInt(u64, &rec, embedding_part.TOMBSTONE_HASH, .little);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) try buf.appendSlice(a, &rec);
+}
+
+const SYNTH_INDEX_XML: []const u8 =
+    \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="1" model="test-model" dim="2" dtype="f32" hash_algo="xxh3-64">
+    \\  <coverage id="title" worksheet_target="worksheets/sheet1.xml" range="A2:A2" column="A" count="1" include_formulas="false" vec_rId="rId1" hash_rId="rId2"/>
+    \\</embeddings>
+;
+
+const SYNTH_INDEX_RELS_XML: []const u8 =
+    \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    \\<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    \\  <Relationship Id="rId1" Type="http://schemas.laurentfabre.dev/zlsx/2026/relationships/embedding-vec" Target="title/vec.bin"/>
+    \\  <Relationship Id="rId2" Type="http://schemas.laurentfabre.dev/zlsx/2026/relationships/embedding-hash" Target="title/hashes.bin"/>
+    \\</Relationships>
+;
+
+const RELS_CONTENT_TYPE: []const u8 =
+    "application/vnd.openxmlformats-package.relationships+xml";
+
+fn seedEmbeddingParts(wb: *Workbook, vec_bytes: []const u8, hash_bytes: []const u8) !void {
+    try wb.store.addPart(embedding_part.INDEX_PART_NAME, embedding_part.INDEX_CONTENT_TYPE, SYNTH_INDEX_XML);
+    try wb.store.addPart(embedding_part.INDEX_RELS_PART_NAME, RELS_CONTENT_TYPE, SYNTH_INDEX_RELS_XML);
+    try wb.store.addPart("xl/zlsxEmbeddings/title/vec.bin", embedding_part.VEC_CONTENT_TYPE, vec_bytes);
+    try wb.store.addPart("xl/zlsxEmbeddings/title/hashes.bin", embedding_part.HASH_CONTENT_TYPE, hash_bytes);
+}
+
+test "Workbook.embeddings: returns null on workbook with no embedding parts" {
+    var wb = try Workbook.empty(std.testing.allocator);
+    defer wb.deinit();
+    try std.testing.expect((try wb.embeddings()) == null);
+}
+
+test "Workbook.embeddings: parses single-coverage synthetic workbook" {
+    var wb = try Workbook.empty(std.testing.allocator);
+    defer wb.deinit();
+
+    var vec_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer vec_buf.deinit(std.testing.allocator);
+    var hash_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer hash_buf.deinit(std.testing.allocator);
+    try buildSynthVec(&vec_buf, std.testing.allocator, 2, 1, .f32);
+    try buildSynthHashes(&hash_buf, std.testing.allocator, 1);
+    try seedEmbeddingParts(&wb, vec_buf.items, hash_buf.items);
+
+    const view = (try wb.embeddings()).?;
+    try std.testing.expectEqualStrings("test-model", view.index.model);
+    try std.testing.expectEqual(@as(u32, 2), view.index.dim);
+    try std.testing.expectEqual(embedding_part.Dtype.f32, view.index.dtype);
+    try std.testing.expectEqual(@as(usize, 1), view.coverages.len);
+
+    const coverage = &view.coverages[0];
+    try std.testing.expectEqualStrings("title", coverage.coverage.id);
+    try std.testing.expectEqualStrings("worksheets/sheet1.xml", coverage.coverage.worksheet_target);
+    try std.testing.expectEqual(@as(u32, 1), coverage.coverage.count);
+    try std.testing.expectEqual(@as(u32, 1), coverage.vec.header.count);
+    try std.testing.expectEqual(@as(u32, 1), coverage.hashes.header.count);
+}
+
+test "Workbook.embeddings: coverageById finds + misses correctly" {
+    var wb = try Workbook.empty(std.testing.allocator);
+    defer wb.deinit();
+    var vec_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer vec_buf.deinit(std.testing.allocator);
+    var hash_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer hash_buf.deinit(std.testing.allocator);
+    try buildSynthVec(&vec_buf, std.testing.allocator, 2, 1, .f32);
+    try buildSynthHashes(&hash_buf, std.testing.allocator, 1);
+    try seedEmbeddingParts(&wb, vec_buf.items, hash_buf.items);
+
+    const view = (try wb.embeddings()).?;
+    const hit = view.coverageById("title");
+    try std.testing.expect(hit != null);
+    try std.testing.expectEqualStrings("title", hit.?.coverage.id);
+    try std.testing.expect(view.coverageById("nonexistent") == null);
+}
+
+test "Workbook.embeddings: lazy cache — second call returns same coverage slice ptr" {
+    var wb = try Workbook.empty(std.testing.allocator);
+    defer wb.deinit();
+    var vec_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer vec_buf.deinit(std.testing.allocator);
+    var hash_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer hash_buf.deinit(std.testing.allocator);
+    try buildSynthVec(&vec_buf, std.testing.allocator, 2, 1, .f32);
+    try buildSynthHashes(&hash_buf, std.testing.allocator, 1);
+    try seedEmbeddingParts(&wb, vec_buf.items, hash_buf.items);
+
+    const first = (try wb.embeddings()).?;
+    const second = (try wb.embeddings()).?;
+    try std.testing.expectEqual(first.coverages.ptr, second.coverages.ptr);
+    try std.testing.expectEqual(first.coverages.len, second.coverages.len);
+}
+
+test "Workbook.embeddings: index without rels surfaces MissingEmbeddingPart" {
+    var wb = try Workbook.empty(std.testing.allocator);
+    defer wb.deinit();
+    // Add only the index, not the rels file.
+    try wb.store.addPart(embedding_part.INDEX_PART_NAME, embedding_part.INDEX_CONTENT_TYPE, SYNTH_INDEX_XML);
+    try std.testing.expectError(error.MissingEmbeddingPart, wb.embeddings());
+}
+
+test "Workbook.embeddings: missing vec/hash sub-part surfaces MissingEmbeddingPart" {
+    var wb = try Workbook.empty(std.testing.allocator);
+    defer wb.deinit();
+    // Add index + rels but omit the vec/hash sub-parts.
+    try wb.store.addPart(embedding_part.INDEX_PART_NAME, embedding_part.INDEX_CONTENT_TYPE, SYNTH_INDEX_XML);
+    try wb.store.addPart(embedding_part.INDEX_RELS_PART_NAME, RELS_CONTENT_TYPE, SYNTH_INDEX_RELS_XML);
+    try std.testing.expectError(error.MissingEmbeddingPart, wb.embeddings());
+}
+
+test "Workbook.embeddings: count mismatch between coverage and binaries rejected" {
+    var wb = try Workbook.empty(std.testing.allocator);
+    defer wb.deinit();
+    var vec_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer vec_buf.deinit(std.testing.allocator);
+    var hash_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer hash_buf.deinit(std.testing.allocator);
+    // Index declares count=1 but we emit binaries with count=2 → mismatch.
+    try buildSynthVec(&vec_buf, std.testing.allocator, 2, 2, .f32);
+    try buildSynthHashes(&hash_buf, std.testing.allocator, 2);
+    try seedEmbeddingParts(&wb, vec_buf.items, hash_buf.items);
+
+    try std.testing.expectError(error.CountMismatch, wb.embeddings());
 }
