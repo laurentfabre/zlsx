@@ -76,9 +76,15 @@ pub fn build(b: *std.Build) void {
     });
 
     // Unicode NFC normalizer shared by writer/editor validation and
-    // the embedding-part canonical hash pipeline.
+    // the embedding-part canonical hash pipeline. Lives at top-level
+    // `unicode/` (not `src/unicode/`) so its package directory does
+    // NOT overlap with the `zlsx` module (rooted at `src/xlsx.zig`,
+    // package dir `src/`) — Zig 0.15 forbids a single file from
+    // belonging to two modules' package trees, which is what happens
+    // if zlsx_nfc lives anywhere under `src/`. See the "Known
+    // module-graph constraint" section of post-0.2.9-roadmap.md.
     const nfc_mod = b.createModule(.{
-        .root_source_file = b.path("src/unicode/nfc.zig"),
+        .root_source_file = b.path("unicode/nfc.zig"),
         .target = target,
         .optimize = optimize,
     });
