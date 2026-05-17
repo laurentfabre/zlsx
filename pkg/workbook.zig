@@ -562,6 +562,26 @@ fn isValidEmbeddingCoverageId(id: []const u8) bool {
     return true;
 }
 
+/// `upsertEmbeddingPart` adds the named part if absent, or replaces
+/// its bytes if present. emb-3b: a second `setEmbeddings` call on
+/// the same workbook must succeed rather than surface
+/// `PartAlreadyExists`, so every part that setEmbeddings writes goes
+/// through this helper. `replacePart` reuses the existing
+/// `[Content_Types].xml` Override entry that the original addPart
+/// installed; `addPart` declares one fresh.
+fn upsertEmbeddingPart(
+    store: *store_mod.PartStore,
+    name: []const u8,
+    content_type: []const u8,
+    bytes: []const u8,
+) !void {
+    if ((try store.part(name)) != null) {
+        try store.replacePart(name, bytes);
+    } else {
+        try store.addPart(name, content_type, bytes);
+    }
+}
+
 /// One coverage's input to `Workbook.setEmbeddings`. The caller
 /// supplies pre-quantized vectors AND pre-computed hashes (xxh3-64
 /// of the canonical row content per the spec). Vector / hash
@@ -1095,11 +1115,16 @@ pub const Workbook = struct {
     ///
     /// Content_Types Overrides are added automatically via
     /// `PartStore.addPart`. The workbook → index relationship in
-    /// `xl/_rels/workbook.xml.rels` is NOT registered in v1 (emb-3a)
-    /// — `Workbook.embeddings()` discovers the index via direct part
-    /// lookup, so round-tripping through zlsx works. Excel and other
-    /// OPC consumers MAY strip the embedding parts on save without
-    /// that workbook rel; emb-3b will add the rel mutation.
+    /// `xl/_rels/workbook.xml.rels` is registered (emb-3b) under
+    /// `REL_TYPE_EMBEDDINGS` with target `zlsxEmbeddings/index.xml`
+    /// so OPC consumers that prune unreferenced parts on passive
+    /// save preserve the embedding part set. A second `setEmbeddings`
+    /// call on the same workbook detects existing parts and routes
+    /// them through `PartStore.replacePart` rather than surfacing
+    /// `PartAlreadyExists`; vec/hash sub-parts for coverage ids that
+    /// were present in the prior write but absent from the new one
+    /// remain in the archive as orphans (no inbound relationship,
+    /// no index reference) — same v1 trade-off as `deleteSheet`.
     ///
     /// Errors:
     /// - `InvalidEmbeddingInput` — `inputs.len == 0`, or per-input
@@ -1111,10 +1136,18 @@ pub const Workbook = struct {
     ///   too long, or has a forbidden character.
     /// - `embedding_part.Error.DuplicateCoverageId` — two inputs
     ///   share the same `id`.
+    /// - `embedding_part.Error.CoverageOverlap` — two inputs name
+    ///   the same `worksheet_target` and their A1 ranges intersect.
     /// - `EmbeddingExceedsArchiveLimit` — any part would exceed
     ///   PartStore's 512 MiB read cap.
     /// - `embedding_part.Error.BodySizeMismatch` — `vec_body.len`
     ///   does not equal `count * dtype.recordBytes(dim)`.
+    /// - `MissingWorkbookRels` — `xl/_rels/workbook.xml.rels` is
+    ///   absent. emb-3b registers a workbook→index relationship,
+    ///   so the file must exist (every conforming workbook carries
+    ///   one; absence indicates malformed input).
+    /// - `MalformedWorkbookRels` — the rels file is missing the
+    ///   closing `</Relationships>` tag.
     pub fn setEmbeddings(
         self: *Workbook,
         model: []const u8,
@@ -1141,6 +1174,12 @@ pub const Workbook = struct {
             self.allocator.free(specs);
         }
 
+        // Parallel array of parsed ranges, used for the overlap
+        // check below. Not stored in CoverageSpec since the index-
+        // XML encoder consumes the raw A1 string only.
+        const parsed_ranges = try self.allocator.alloc(embedding_part.A1Range, inputs.len);
+        defer self.allocator.free(parsed_ranges);
+
         for (inputs, 0..) |inp, i| {
             if (!isValidEmbeddingCoverageId(inp.id))
                 return error.InvalidCoverageId;
@@ -1149,6 +1188,7 @@ pub const Workbook = struct {
             const expected_body: usize = @as(usize, count) * dtype.recordBytes(dim);
             if (inp.vec_body.len != expected_body) return error.InvalidEmbeddingInput;
             if (inp.hashes.len != count) return error.InvalidEmbeddingInput;
+            parsed_ranges[i] = range;
 
             // Allocate rIds; +1 to make them 1-based.
             var rid_buf: [24]u8 = undefined;
@@ -1174,14 +1214,27 @@ pub const Workbook = struct {
             spec_freed = i + 1;
         }
 
-        // Pass 2: duplicate-id rejection.
+        // Pass 2a: duplicate-id rejection.
         for (specs, 0..) |s, i| {
             for (specs[i + 1 ..]) |t| {
                 if (std.mem.eql(u8, s.id, t.id)) return error.DuplicateCoverageId;
             }
         }
 
-        // Pass 3: encode + addPart per coverage's binaries.
+        // Pass 2b (emb-3b): coverage-overlap rejection. Two coverages
+        // overlap when they name the same worksheet_target AND their
+        // A1 ranges intersect — mirrors the parse-time check enforced
+        // by `embedding_part.parseIndex`, so a setEmbeddings followed
+        // by a Workbook.embeddings() roundtrip stays consistent.
+        for (specs, 0..) |s, i| {
+            for (specs[i + 1 ..], 0..) |t, j_off| {
+                const j = i + 1 + j_off;
+                if (!std.mem.eql(u8, s.worksheet_target, t.worksheet_target)) continue;
+                if (parsed_ranges[i].overlaps(parsed_ranges[j])) return error.CoverageOverlap;
+            }
+        }
+
+        // Pass 3: encode + upsert per coverage's binaries.
         for (inputs, specs) |inp, s| {
             const vec_part = try embedding_part.encodeVecPart(
                 self.allocator,
@@ -1197,20 +1250,35 @@ pub const Workbook = struct {
             if (hash_part.len > EMBEDDING_PART_MAX_BYTES)
                 return error.EmbeddingExceedsArchiveLimit;
 
-            var path_buf: [256]u8 = undefined;
+            // `vec_path` and `hash_path` need to outlive the bufPrint
+            // scratch since `upsertEmbeddingPart` may use them across
+            // an addPart/replacePart branch. Each goes into its own
+            // 256-byte stack buffer.
+            var vec_path_buf: [256]u8 = undefined;
             const vec_path = std.fmt.bufPrint(
-                &path_buf,
+                &vec_path_buf,
                 "{s}/{s}/vec.bin",
                 .{ embedding_part.EMBEDDINGS_DIR, s.id },
             ) catch return error.WriteFailed;
-            try self.store.addPart(vec_path, embedding_part.VEC_CONTENT_TYPE, vec_part);
+            try upsertEmbeddingPart(
+                &self.store,
+                vec_path,
+                embedding_part.VEC_CONTENT_TYPE,
+                vec_part,
+            );
 
+            var hash_path_buf: [256]u8 = undefined;
             const hash_path = std.fmt.bufPrint(
-                &path_buf,
+                &hash_path_buf,
                 "{s}/{s}/hashes.bin",
                 .{ embedding_part.EMBEDDINGS_DIR, s.id },
             ) catch return error.WriteFailed;
-            try self.store.addPart(hash_path, embedding_part.HASH_CONTENT_TYPE, hash_part);
+            try upsertEmbeddingPart(
+                &self.store,
+                hash_path,
+                embedding_part.HASH_CONTENT_TYPE,
+                hash_part,
+            );
         }
 
         // Pass 4: index.xml + index.xml.rels.
@@ -1224,7 +1292,8 @@ pub const Workbook = struct {
         defer self.allocator.free(index_xml);
         if (index_xml.len > EMBEDDING_PART_MAX_BYTES)
             return error.EmbeddingExceedsArchiveLimit;
-        try self.store.addPart(
+        try upsertEmbeddingPart(
+            &self.store,
             embedding_part.INDEX_PART_NAME,
             embedding_part.INDEX_CONTENT_TYPE,
             index_xml,
@@ -1266,11 +1335,21 @@ pub const Workbook = struct {
 
         const rels_xml = try embedding_part.encodeIndexRelsXml(self.allocator, rels);
         defer self.allocator.free(rels_xml);
-        try self.store.addPart(
+        try upsertEmbeddingPart(
+            &self.store,
             embedding_part.INDEX_RELS_PART_NAME,
             EMBEDDING_RELS_CONTENT_TYPE,
             rels_xml,
         );
+
+        // emb-3b: register the workbook → index relationship in
+        // `xl/_rels/workbook.xml.rels`. OPC consumers may legitimately
+        // strip unknown parts that no parent part references on a
+        // passive save; the embeddings rel pins the index so a save
+        // through Excel / LibreOffice / Numbers preserves the part
+        // set. Idempotent — a prior call leaves the existing rel
+        // intact rather than appending a duplicate.
+        try self.registerWorkbookEmbeddingsRel();
 
         // Free the owned target / rId strings now that they're
         // emitted into rels_xml.
@@ -1282,6 +1361,46 @@ pub const Workbook = struct {
         }
         spec_freed = 0;
         self.allocator.free(specs);
+    }
+
+    /// emb-3b: Ensure `xl/_rels/workbook.xml.rels` carries a
+    /// `<Relationship Type="…/relationships/embeddings"
+    /// Target="zlsxEmbeddings/index.xml"/>` entry. Idempotent: if a
+    /// rel with the embeddings type already exists, returns without
+    /// mutation (preserves the prior rId). Otherwise picks the next
+    /// free rId (one past the largest `rId<N>` in the file) and
+    /// splices in a new entry before `</Relationships>`.
+    ///
+    /// Surfaces `MissingWorkbookRels` if `xl/_rels/workbook.xml.rels`
+    /// is absent, and `MalformedWorkbookRels` if the file lacks
+    /// a closing `</Relationships>` tag.
+    fn registerWorkbookEmbeddingsRel(self: *Workbook) Error!void {
+        const rels_part = (try self.store.part("xl/_rels/workbook.xml.rels")) orelse
+            return error.MissingWorkbookRels;
+
+        // Idempotency: if a rel with our Type attribute is already
+        // present, leave it alone. Rationale: a second setEmbeddings
+        // call on the same workbook (replace path) should NOT append
+        // a duplicate Relationship. ECMA-376 Part 2 §10.1.2 doesn't
+        // explicitly forbid duplicates, but OPC consumers treat
+        // (Type, Target) as the functional key — extra rels with the
+        // same Type are at best confusing, at worst rejected.
+        if (std.mem.indexOf(u8, rels_part.bytes, embedding_part.REL_TYPE_EMBEDDINGS) != null) {
+            return;
+        }
+
+        const next_rid_num = nextMaxNumericAttr(rels_part.bytes, "Id=\"rId") + 1;
+        var rid_buf: [32]u8 = undefined;
+        const new_rid = std.fmt.bufPrint(&rid_buf, "rId{d}", .{next_rid_num}) catch
+            return error.WriteFailed;
+
+        const new_xml = try patchWorkbookRelsAddEmbeddings(
+            self.allocator,
+            rels_part.bytes,
+            new_rid,
+        );
+        defer self.allocator.free(new_xml);
+        try self.store.replacePart("xl/_rels/workbook.xml.rels", new_xml);
     }
 
     /// Resolve the number-format string a cell of `style_idx` would
@@ -3611,6 +3730,31 @@ fn patchWorkbookRelsAddSheet(
     try out.appendSlice(allocator, "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"");
     try out.appendSlice(allocator, target);
     try out.appendSlice(allocator, "\"/>");
+    try out.appendSlice(allocator, xml[close..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// emb-3b: Splice a `<Relationship/>` for the zlsxEmbeddings index
+/// into `xl/_rels/workbook.xml.rels` immediately before
+/// `</Relationships>`. Target is `zlsxEmbeddings/index.xml`
+/// (relative to `xl/`, the base implied by the rels-file location).
+/// Caller frees the returned slice.
+fn patchWorkbookRelsAddEmbeddings(
+    allocator: Allocator,
+    xml: []const u8,
+    rid: []const u8,
+) Error![]u8 {
+    const close = std.mem.indexOf(u8, xml, "</Relationships>") orelse return error.MalformedWorkbookRels;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, xml.len + 256);
+    try out.appendSlice(allocator, xml[0..close]);
+    try out.appendSlice(allocator, "<Relationship Id=\"");
+    try out.appendSlice(allocator, rid);
+    try out.appendSlice(allocator, "\" Type=\"");
+    try out.appendSlice(allocator, embedding_part.REL_TYPE_EMBEDDINGS);
+    try out.appendSlice(allocator, "\" Target=\"zlsxEmbeddings/index.xml\"/>");
     try out.appendSlice(allocator, xml[close..]);
     return try out.toOwnedSlice(allocator);
 }
@@ -10119,4 +10263,175 @@ test "Workbook.setEmbeddings: duplicate coverage ids rejected" {
         error.DuplicateCoverageId,
         wb.setEmbeddings("m", 2, .f32, &inputs),
     );
+}
+
+// ---------------------------------------------------------------
+// emb-3b: workbook→index rel, replace path, overlap rejection
+// ---------------------------------------------------------------
+
+test "Workbook.setEmbeddings: registers workbook→index rel (emb-3b)" {
+    var wb = try Workbook.empty(std.testing.allocator);
+    defer wb.deinit();
+
+    const vectors = [_]f32{ 1, 2 };
+    var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer body_buf.deinit(std.testing.allocator);
+    try buildF32Body(&body_buf, std.testing.allocator, &vectors);
+    const hashes = [_]u64{0xAA};
+
+    const inputs = [_]EmbeddingCoverageInput{.{
+        .id = "title",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A2",
+        .column = "A",
+        .vec_body = body_buf.items,
+        .hashes = &hashes,
+    }};
+    try wb.setEmbeddings("m", 2, .f32, &inputs);
+
+    // workbook.xml.rels must now carry exactly one Relationship with
+    // the embeddings Type and Target=zlsxEmbeddings/index.xml.
+    const rels_part = (try wb.store.part("xl/_rels/workbook.xml.rels")).?;
+    try std.testing.expect(
+        std.mem.indexOf(u8, rels_part.bytes, embedding_part.REL_TYPE_EMBEDDINGS) != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, rels_part.bytes, "Target=\"zlsxEmbeddings/index.xml\"") != null,
+    );
+    // Count occurrences of the rel Type — must be exactly one.
+    var count: usize = 0;
+    var scan_pos: usize = 0;
+    while (std.mem.indexOfPos(u8, rels_part.bytes, scan_pos, embedding_part.REL_TYPE_EMBEDDINGS)) |p| {
+        count += 1;
+        scan_pos = p + embedding_part.REL_TYPE_EMBEDDINGS.len;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "Workbook.setEmbeddings: second call replaces parts without PartAlreadyExists (emb-3b)" {
+    var wb = try Workbook.empty(std.testing.allocator);
+    defer wb.deinit();
+
+    // First write: 2-d × 1-row.
+    const v1 = [_]f32{ 1, 2 };
+    var b1: std.ArrayListUnmanaged(u8) = .empty;
+    defer b1.deinit(std.testing.allocator);
+    try buildF32Body(&b1, std.testing.allocator, &v1);
+    const h1 = [_]u64{0x1111};
+    const inputs1 = [_]EmbeddingCoverageInput{.{
+        .id = "title",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A2",
+        .column = "A",
+        .vec_body = b1.items,
+        .hashes = &h1,
+    }};
+    try wb.setEmbeddings("model-a", 2, .f32, &inputs1);
+
+    // Second write: same id, different model + bigger row range — the
+    // bytes of every embedding part change. Pre emb-3b this returned
+    // error.PartAlreadyExists on the first addPart.
+    const v2 = [_]f32{ 3, 4, 5, 6 };
+    var b2: std.ArrayListUnmanaged(u8) = .empty;
+    defer b2.deinit(std.testing.allocator);
+    try buildF32Body(&b2, std.testing.allocator, &v2);
+    const h2 = [_]u64{ 0x2222, 0x3333 };
+    const inputs2 = [_]EmbeddingCoverageInput{.{
+        .id = "title",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A3",
+        .column = "A",
+        .vec_body = b2.items,
+        .hashes = &h2,
+    }};
+    try wb.setEmbeddings("model-b", 2, .f32, &inputs2);
+
+    // The second model + count survive the round-trip.
+    const view = (try wb.embeddings()).?;
+    try std.testing.expectEqualStrings("model-b", view.index.model);
+    try std.testing.expectEqual(@as(usize, 1), view.coverages.len);
+    try std.testing.expectEqual(@as(u32, 2), view.coverages[0].coverage.count);
+    try std.testing.expectEqual(@as(u64, 0x3333), try view.coverages[0].hashes.value(1));
+
+    // Second call must NOT duplicate the workbook→index rel.
+    const rels_part = (try wb.store.part("xl/_rels/workbook.xml.rels")).?;
+    var count: usize = 0;
+    var scan_pos: usize = 0;
+    while (std.mem.indexOfPos(u8, rels_part.bytes, scan_pos, embedding_part.REL_TYPE_EMBEDDINGS)) |p| {
+        count += 1;
+        scan_pos = p + embedding_part.REL_TYPE_EMBEDDINGS.len;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "Workbook.setEmbeddings: overlapping ranges on same worksheet rejected (emb-3b)" {
+    var wb = try Workbook.empty(std.testing.allocator);
+    defer wb.deinit();
+
+    // 2 rows × 2 dim × f32 = 16 bytes per coverage body.
+    const v = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(std.testing.allocator);
+    try buildF32Body(&body, std.testing.allocator, &v);
+    const hashes_a = [_]u64{ 0xA, 0xB };
+    const hashes_b = [_]u64{ 0xC, 0xD };
+
+    // A2:A3 and A3:A4 overlap on A3.
+    const inputs = [_]EmbeddingCoverageInput{
+        .{
+            .id = "a",
+            .worksheet_target = "worksheets/sheet1.xml",
+            .range = "A2:A3",
+            .column = "A",
+            .vec_body = body.items[0..16],
+            .hashes = &hashes_a,
+        },
+        .{
+            .id = "b",
+            .worksheet_target = "worksheets/sheet1.xml",
+            .range = "A3:A4",
+            .column = "A",
+            .vec_body = body.items[16..32],
+            .hashes = &hashes_b,
+        },
+    };
+    try std.testing.expectError(
+        error.CoverageOverlap,
+        wb.setEmbeddings("m", 2, .f32, &inputs),
+    );
+}
+
+test "Workbook.setEmbeddings: same range on different worksheets is NOT overlap (emb-3b)" {
+    var wb = try Workbook.empty(std.testing.allocator);
+    defer wb.deinit();
+
+    const v = [_]f32{ 1, 2, 3, 4 };
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(std.testing.allocator);
+    try buildF32Body(&body, std.testing.allocator, &v);
+    const ha = [_]u64{0xA};
+    const hb = [_]u64{0xB};
+
+    const inputs = [_]EmbeddingCoverageInput{
+        .{
+            .id = "a",
+            .worksheet_target = "worksheets/sheet1.xml",
+            .range = "A2:A2",
+            .column = "A",
+            .vec_body = body.items[0 .. 1 * 2 * 4],
+            .hashes = &ha,
+        },
+        .{
+            .id = "b",
+            .worksheet_target = "worksheets/sheet2.xml",
+            .range = "A2:A2",
+            .column = "A",
+            .vec_body = body.items[1 * 2 * 4 ..],
+            .hashes = &hb,
+        },
+    };
+    // Different worksheet_target → no overlap; setEmbeddings succeeds.
+    try wb.setEmbeddings("m", 2, .f32, &inputs);
+    const view = (try wb.embeddings()).?;
+    try std.testing.expectEqual(@as(usize, 2), view.coverages.len);
 }
