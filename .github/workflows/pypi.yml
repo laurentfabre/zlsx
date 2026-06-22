@@ -50,7 +50,7 @@ jobs:
             libfile: zlsx.dll
             lib_dir: bin
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Zig 0.15.2
         shell: bash
