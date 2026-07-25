@@ -158,12 +158,19 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 | Comments / notes | ✓⁶ | ? | ✓ | — |
 | Chart / image / pivot access | — | — | ~ | — |
 | Load-modify-save | — | — | ✓ | — |
+| Sheet visibility (`hidden` / `veryHidden`) | ✓⁷ | — | ✓ | — |
+| Document properties (`docProps`) read | ✓⁸ | — | ✓ | — |
+| Document properties scrub | ✓⁹ | — | — | — |
 
 ¹ Returns a single `Float` type for any non-text number — callers cast to integer if needed.
 ² `xlsx.fromExcelSerial(cell.number) -> ?DateTime`; out-of-range serials (1900 leap-bug window) return `null`.
 ³ `Book.richRuns(sst_idx)` surfaces per-`<r>` bold / italic + ARGB color / size / font name. Theme colors (`<color theme="N"/>`) are resolved via the workbook's `xl/theme/theme1.xml` palette (iter52); `<color indexed="N"/>` and `tint` are still not resolved.
 ⁴ `Rows.parseDate(col_idx)` combines style-lookup + date-format detection + serial decoding into one call. Returns `?DateTime` (or `datetime.datetime | None` in Python). The low-level chain (`styleIndices()` + `isDateFormat()` + `fromExcelSerial()`) is still exposed for callers that need the individual pieces.
 ⁵ `Book.cellFont(style_idx)` surfaces bold / italic / ARGB color / size / font name; `Book.cellFill(style_idx)` surfaces `patternType` + fg / bg ARGB; `Book.cellBorder(style_idx)` surfaces `style` + color per side (left / right / top / bottom / diagonal). Theme colors (`theme="N"`) are resolved via the `xl/theme/theme1.xml` palette (iter52). `indexed="N"` (legacy palette) and `tint` modifiers are still not resolved.
+⁷ `sheet.state` on the reader, and `state` in `zlsx list-sheets` / `meta` output. `veryHidden` sheets are unreachable from Excel's UI — only VBA can reveal them — so a workbook can carry data no reviewer would ever see. `meta` also emits `hidden_sheet_count` / `very_hidden_sheet_count` so a caller can gate with `jq` alone.
+⁸ `Workbook.docProps()` / `Editor.docProps()` (Zig), `Editor.doc_props()` (Python), `zlsx meta --output pretty-json` (`doc_props` object). Covers `dc:creator`, `cp:lastModifiedBy`, title/subject/description/keywords/category, timestamps, `Company`, `Manager`, `Application`, `HyperlinkBase`, plus a `docProps/custom.xml` presence flag.
+⁹ `Editor.stripDocProps(mask)` / `strip_doc_props()` / `zlsx scrub-metadata in.xlsx --out clean.xlsx`. Removes the elements outright rather than blanking them — an empty `<dc:creator/>` still says the document had an author. Timestamps and revision are kept by default (`Mask.all` takes them too). Cell data is byte-preserved. **Scope:** values and metadata only — string literals inside formulas are NOT masked, see [`docs/plans/formula-literal-masking.md`](docs/plans/formula-literal-masking.md).
+
 ⁶ `Book.comments(sheet)` returns `{top_left, author, text, runs}` for every `<comment>` under `<commentList>`. `text` is always the concatenated plain-text form; `runs` is populated (per-run bold/italic/color/size/font_name) when the source body used `<r><rPr>` formatting, null otherwise.
 
 ### Writer capability
