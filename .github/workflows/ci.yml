@@ -55,8 +55,8 @@ jobs:
       # Public-module gate. `tests/consumer/` is a separate package with
       # a path dependency on the repo root, so this exercises zlsx the
       # way a downstream project does — importing `zlsx` and `zlsx_pkg`
-      # in one compilation, which was impossible under 0.15.2's
-      # three-module collision. It writes, reads, edits and re-reads a
+      # in one compilation, which the pre-0.16 three-module collision
+      # made impossible. It writes, reads, edits and re-reads a
       # workbook, and exits non-zero on any mismatch.
       - name: Consumer co-import round-trip
         working-directory: tests/consumer
