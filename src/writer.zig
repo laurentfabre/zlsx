@@ -292,7 +292,7 @@ pub const DefinedNameOptions = workbook_xml_plan.DefinedNameOptions;
 pub const Writer = struct {
     allocator: Allocator,
     // Accumulated sheet writers (owned).
-    sheets: std.ArrayListUnmanaged(*SheetWriter) = .{},
+    sheets: std.ArrayListUnmanaged(*SheetWriter) = .empty,
     // Shared-string table substrate (B3 iter-wr-1). Plain entries land
     // in `sst_plan.new_strings` (O(1) dedup via the hash side-index);
     // rich entries land in `sst_plan.new_rich_strings` (no dedup,
@@ -663,7 +663,7 @@ pub const SheetWriter = struct {
     // Owned copy of the sheet name.
     name: []u8,
     // Accumulated `<row>` elements; emitted inside <sheetData> on save.
-    body: std.ArrayListUnmanaged(u8) = .{},
+    body: std.ArrayListUnmanaged(u8) = .empty,
     // 1-based row index (xlsx convention).
     next_row: u32 = 1,
     /// B3 iter-wr-6: per-sheet registries (column widths, row
@@ -1678,7 +1678,7 @@ fn emitDynamicBlock(
     for (0..num_lit) |k| combined[k] = @intCast(lit_codes[k].len);
     for (0..num_dist) |k| combined[num_lit + k] = @intCast(dist_codes[k].len);
 
-    var codegen_syms: std.ArrayListUnmanaged(CodegenSym) = .{};
+    var codegen_syms: std.ArrayListUnmanaged(CodegenSym) = .empty;
     defer codegen_syms.deinit(alloc);
     try rleEncodeCodeLengths(alloc, combined[0 .. num_lit + num_dist], &codegen_syms);
 
@@ -1751,7 +1751,7 @@ fn emitDynamicBlock(
 pub fn deflateCompress(alloc: Allocator, input: []const u8, out: *std.ArrayListUnmanaged(u8)) !void {
     std.debug.assert(input.len > 0);
 
-    var tokens: std.ArrayListUnmanaged(DeflateToken) = .{};
+    var tokens: std.ArrayListUnmanaged(DeflateToken) = .empty;
     defer tokens.deinit(alloc);
     try tokens.ensureTotalCapacity(alloc, input.len);
     try tokenizeLazy(alloc, input, &tokens);
@@ -1792,8 +1792,8 @@ const TestTmp = struct {
     pub fn deinit(self: *TestTmp) void {
         self.dir.cleanup();
     }
-    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
-        const dir = try self.dir.dir.realpathAlloc(alloc, ".");
+    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, io: std.Io, name: []const u8) ![:0]u8 {
+        const dir = try self.dir.dir.realPathFileAlloc(io, ".", alloc);
         defer alloc.free(dir);
         return std.fs.path.joinZ(alloc, &.{ dir, name });
     }
@@ -1809,7 +1809,7 @@ test "formatCellRef: A1, B2, Z1, AA1, AAA1" {
 }
 
 test "appendXmlEscaped covers all 5 entities" {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
     try appendXmlEscaped(std.testing.allocator, &buf, "a<b>c&d\"e'f");
     try std.testing.expectEqualStrings("a&lt;b&gt;c&amp;d&quot;e&apos;f", buf.items);
@@ -1973,6 +1973,9 @@ test "Writer: writeRowStyled rejects out-of-range style id" {
 }
 
 test "Writer: stage-5 number format registers + emits numFmts" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "writer_numfmt.xlsx");
@@ -2004,7 +2007,7 @@ test "Writer: stage-5 number format registers + emits numFmts" {
     }
 
     const styles_xml = blk: {
-        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer file.close();
         var fbuf: [4096]u8 = undefined;
         var fr = file.reader(&fbuf);
@@ -2032,6 +2035,9 @@ test "Writer: stage-5 number format registers + emits numFmts" {
 }
 
 test "Writer: writeRowWithFormulas emits <f> + cached <v> correctly" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "writer_formulas.xlsx");
@@ -2072,7 +2078,7 @@ test "Writer: writeRowWithFormulas emits <f> + cached <v> correctly" {
     }
 
     const sheet_xml = blk: {
-        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer file.close();
         var fbuf: [4096]u8 = undefined;
         var fr = file.reader(&fbuf);
@@ -2114,6 +2120,9 @@ test "Writer: writeRowWithFormulas emits <f> + cached <v> correctly" {
 }
 
 test "Writer: setRowHeight emits ht + customHeight, only on marked rows" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "writer_row_heights.xlsx");
@@ -2146,7 +2155,7 @@ test "Writer: setRowHeight emits ht + customHeight, only on marked rows" {
     }
 
     const sheet_xml = blk: {
-        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer file.close();
         var fbuf: [4096]u8 = undefined;
         var fr = file.reader(&fbuf);
@@ -2183,6 +2192,9 @@ test "Writer: setRowHeight emits ht + customHeight, only on marked rows" {
 }
 
 test "Writer: stage-5 sheet-level features (cols, freeze, autoFilter)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "writer_sheet_features.xlsx");
@@ -2213,7 +2225,7 @@ test "Writer: stage-5 sheet-level features (cols, freeze, autoFilter)" {
     // Read the raw sheet1.xml to verify the new sections are present in
     // the right order (sheetViews → cols → sheetData → autoFilter).
     const sheet_xml = blk: {
-        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer file.close();
         var fbuf: [4096]u8 = undefined;
         var fr = file.reader(&fbuf);
@@ -2251,6 +2263,9 @@ test "Writer: stage-5 sheet-level features (cols, freeze, autoFilter)" {
 }
 
 test "Writer: addMergedCell validates + emits <mergeCells> block" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "writer_merged_cells.xlsx");
@@ -2290,7 +2305,7 @@ test "Writer: addMergedCell validates + emits <mergeCells> block" {
 
     // Inspect raw sheet1.xml for the expected block + ordering.
     const sheet_xml = blk: {
-        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer file.close();
         var fbuf: [4096]u8 = undefined;
         var fr = file.reader(&fbuf);
@@ -2331,6 +2346,9 @@ test "Writer: addMergedCell validates + emits <mergeCells> block" {
 }
 
 test "Writer: addDataValidationNumeric + Custom emit correct XML" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "writer_dv_ranges.xlsx");
@@ -2368,7 +2386,7 @@ test "Writer: addDataValidationNumeric + Custom emit correct XML" {
     }
 
     const sheet_xml = blk: {
-        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer file.close();
         var fbuf: [4096]u8 = undefined;
         var fr = file.reader(&fbuf);
@@ -2420,6 +2438,9 @@ test "Writer: addDataValidationNumeric + Custom emit correct XML" {
 }
 
 test "Writer: VML idmap expands for >1023 comments per sheet" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // iter48 — the hardcoded `<o:idmap data="1"/>` only covered
@@ -2448,7 +2469,7 @@ test "Writer: VML idmap expands for >1023 comments per sheet" {
     }
 
     // Unzip xl/drawings/vmlDrawing1.vml + grep for `data="1,2"`.
-    var file = try std.fs.cwd().openFile(tmp_path, .{});
+    var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
     defer file.close();
     var fbuf: [4096]u8 = undefined;
     var fr = file.reader(&fbuf);
@@ -2481,7 +2502,7 @@ test "Writer: VML idmap expands for >1023 comments per sheet" {
         try sheet2.writeRow(&.{.{ .string = "x" }});
         try w2.save(tmp_small);
     }
-    var file2 = try std.fs.cwd().openFile(tmp_small, .{});
+    var file2 = try std.Io.Dir.cwd().openFile(io, tmp_small, .{});
     defer file2.close();
     var fbuf2: [4096]u8 = undefined;
     var fr2 = file2.reader(&fbuf2);
@@ -2505,6 +2526,9 @@ test "Writer: VML idmap expands for >1023 comments per sheet" {
 }
 
 test "Writer: comment on XFD column emits non-inverted VML anchor" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "writer_comment_xfd.xlsx");
@@ -2518,7 +2542,7 @@ test "Writer: comment on XFD column emits non-inverted VML anchor" {
         try sheet.writeRow(&.{.{ .string = "x" }});
         try w.save(tmp_path);
     }
-    var file = try std.fs.cwd().openFile(tmp_path, .{});
+    var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
     defer file.close();
     var fbuf: [4096]u8 = undefined;
     var fr = file.reader(&fbuf);
@@ -2555,6 +2579,9 @@ test "Writer: comment on XFD column emits non-inverted VML anchor" {
 }
 
 test "Writer: conditional formatting — colorScale (2+3 stop) + dataBar" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cf_gradient.xlsx");
@@ -2597,7 +2624,7 @@ test "Writer: conditional formatting — colorScale (2+3 stop) + dataBar" {
 
     // Extract sheet1.xml and check the wire fragments.
     const sheet_xml = blk: {
-        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer file.close();
         var fbuf: [4096]u8 = undefined;
         var fr = file.reader(&fbuf);
@@ -2640,6 +2667,9 @@ test "Writer: conditional formatting — colorScale (2+3 stop) + dataBar" {
 }
 
 test "Writer: conditional formatting — cellIs + expression rules + dxfs table" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "writer_conditional_formatting.xlsx");
@@ -2697,7 +2727,7 @@ test "Writer: conditional formatting — cellIs + expression rules + dxfs table"
     var sheet_xml: []u8 = undefined;
     var styles_xml: []u8 = undefined;
     {
-        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer file.close();
         var fbuf: [4096]u8 = undefined;
         var fr = file.reader(&fbuf);
@@ -2757,6 +2787,9 @@ test "Writer: conditional formatting — cellIs + expression rules + dxfs table"
 }
 
 test "Writer: addDataValidationList validates + emits <dataValidations> block" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "writer_dv_list.xlsx");
@@ -2786,7 +2819,7 @@ test "Writer: addDataValidationList validates + emits <dataValidations> block" {
     }
 
     const sheet_xml = blk: {
-        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer file.close();
         var fbuf: [4096]u8 = undefined;
         var fr = file.reader(&fbuf);
@@ -2829,6 +2862,9 @@ test "Writer: addDataValidationList validates + emits <dataValidations> block" {
 }
 
 test "Writer: addDataValidationList — no block when none registered" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "writer_no_dv.xlsx");
@@ -2843,7 +2879,7 @@ test "Writer: addDataValidationList — no block when none registered" {
     }
 
     const sheet_xml = blk: {
-        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer file.close();
         var fbuf: [4096]u8 = undefined;
         var fr = file.reader(&fbuf);
@@ -2865,6 +2901,9 @@ test "Writer: addDataValidationList — no block when none registered" {
 }
 
 test "Writer: addHyperlink validates + emits <hyperlinks> + per-sheet _rels" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "writer_hyperlinks.xlsx");
@@ -2895,7 +2934,7 @@ test "Writer: addHyperlink validates + emits <hyperlinks> + per-sheet _rels" {
 
     // Inspect xl/worksheets/sheet1.xml.
     const sheet_xml = blk: {
-        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer file.close();
         var fbuf: [4096]u8 = undefined;
         var fr = file.reader(&fbuf);
@@ -2931,7 +2970,7 @@ test "Writer: addHyperlink validates + emits <hyperlinks> + per-sheet _rels" {
 
     // Inspect xl/worksheets/_rels/sheet1.xml.rels.
     const rels_xml = blk: {
-        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer file.close();
         var fbuf: [4096]u8 = undefined;
         var fr = file.reader(&fbuf);
@@ -2965,6 +3004,9 @@ test "Writer: addHyperlink validates + emits <hyperlinks> + per-sheet _rels" {
 }
 
 test "Writer: no <hyperlinks> block or _rels entry when none registered" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "writer_no_hyperlinks.xlsx");
@@ -2980,7 +3022,7 @@ test "Writer: no <hyperlinks> block or _rels entry when none registered" {
 
     // Neither the sheet XML's <hyperlinks> section nor the per-sheet
     // _rels file should exist.
-    var file = try std.fs.cwd().openFile(tmp_path, .{});
+    var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
     defer file.close();
     var fbuf: [4096]u8 = undefined;
     var fr = file.reader(&fbuf);
@@ -2998,6 +3040,9 @@ test "Writer: no <hyperlinks> block or _rels entry when none registered" {
 }
 
 test "Writer: no <mergeCells> block when none registered" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "writer_no_merged.xlsx");
@@ -3012,7 +3057,7 @@ test "Writer: no <mergeCells> block when none registered" {
     }
 
     const sheet_xml = blk: {
-        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer file.close();
         var fbuf: [4096]u8 = undefined;
         var fr = file.reader(&fbuf);
@@ -3035,6 +3080,9 @@ test "Writer: no <mergeCells> block when none registered" {
 }
 
 test "Writer: stage-4 border sides emit into styles.xml" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "writer_styles_borders.xlsx");
@@ -3078,7 +3126,7 @@ test "Writer: stage-4 border sides emit into styles.xml" {
     }
 
     const styles_xml = blk: {
-        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer file.close();
         var fbuf: [4096]u8 = undefined;
         var fr = file.reader(&fbuf);
@@ -3108,6 +3156,9 @@ test "Writer: stage-4 border sides emit into styles.xml" {
 }
 
 test "Writer: stage-3 fill fields emit into styles.xml" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "writer_styles_fills.xlsx");
@@ -3154,7 +3205,7 @@ test "Writer: stage-3 fill fields emit into styles.xml" {
 
     // Grep the emitted styles.xml for the expected OOXML markers.
     const styles_xml = blk: {
-        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer file.close();
         var fbuf: [4096]u8 = undefined;
         var fr = file.reader(&fbuf);
@@ -3186,6 +3237,9 @@ test "Writer: stage-3 fill fields emit into styles.xml" {
 }
 
 test "Writer: stage-2 style fields emit into styles.xml" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "writer_styles_stage2.xlsx");
@@ -3233,7 +3287,7 @@ test "Writer: stage-2 style fields emit into styles.xml" {
     defer book.deinit();
 
     const styles_xml = blk: {
-        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer file.close();
         var fbuf: [4096]u8 = undefined;
         var fr = file.reader(&fbuf);
@@ -3261,6 +3315,9 @@ test "Writer: stage-2 style fields emit into styles.xml" {
 }
 
 test "Writer: styles — bold + italic round-trip" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "writer_styles_bold.xlsx");
@@ -3320,7 +3377,7 @@ test "Writer: styles — bold + italic round-trip" {
     // italic markers + applyFont attribute — proves the styles.xml
     // emission path actually ran.
     const styles_xml = blk: {
-        var file = try std.fs.cwd().openFile(tmp_path, .{});
+        var file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer file.close();
         var fbuf: [4096]u8 = undefined;
         var fr = file.reader(&fbuf);
@@ -3693,7 +3750,7 @@ test "fuzz appendXmlEscaped: no raw XML specials in output" {
     var prng = std.Random.DefaultPrng.init(fuzzSeedW());
     const rng = prng.random();
     var input_buf: [512]u8 = undefined;
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(std.testing.allocator);
 
     for (0..iters) |_| {
@@ -3734,7 +3791,7 @@ test "fuzz appendXmlEscaped: no raw XML specials in output" {
 }
 
 test "appendXmlEscaped rejects forbidden XML 1.0 control bytes" {
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(std.testing.allocator);
     // Each of these should error — none are legal in XML 1.0 text.
     const cases = [_][]const u8{
@@ -4132,6 +4189,9 @@ test "fuzz SheetWriter: random stage-5 per-sheet feature combos" {
 }
 
 test "fuzz zip.Archive produces archives our reader can walk" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterationsW() / 10;
     const seed = fuzzSeedW();
     var prng = std.Random.DefaultPrng.init(seed);
@@ -4147,7 +4207,7 @@ test "fuzz zip.Archive produces archives our reader can walk" {
 
     defer std.testing.allocator.free(tmp_path);
     for (0..iters) |_| {
-        var zip_buf: std.ArrayListUnmanaged(u8) = .{};
+        var zip_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer zip_buf.deinit(std.testing.allocator);
         var zw = zip.Archive.init(std.testing.allocator, &zip_buf);
         defer zw.deinit();
@@ -4168,11 +4228,11 @@ test "fuzz zip.Archive produces archives our reader can walk" {
 
         // Write to disk and walk it with std.zip.Iterator.
         {
-            var file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+            var file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
             defer file.close();
             try file.writeAll(zip_buf.items);
         }
-        var f = try std.fs.cwd().openFile(tmp_path, .{});
+        var f = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer f.close();
         var read_buf: [4096]u8 = undefined;
         var fr = f.reader(&read_buf);
@@ -4195,7 +4255,7 @@ fn deflateRoundTrip(alloc: Allocator, input: []const u8) !bool {
     // compression at the zip.Archive layer, so special-case here.
     if (input.len == 0) return true;
 
-    var compressed: std.ArrayListUnmanaged(u8) = .{};
+    var compressed: std.ArrayListUnmanaged(u8) = .empty;
     defer compressed.deinit(alloc);
     try deflateCompress(alloc, input, &compressed);
 
@@ -4203,7 +4263,7 @@ fn deflateRoundTrip(alloc: Allocator, input: []const u8) !bool {
     var window: [std.compress.flate.max_window_len]u8 = undefined;
     var dec = std.compress.flate.Decompress.init(&reader, .raw, &window);
 
-    var round_tripped: std.ArrayListUnmanaged(u8) = .{};
+    var round_tripped: std.ArrayListUnmanaged(u8) = .empty;
     defer round_tripped.deinit(alloc);
     var aw = std.Io.Writer.Allocating.fromArrayList(alloc, &round_tripped);
     _ = try dec.reader.streamRemaining(&aw.writer);
@@ -4552,6 +4612,9 @@ test "fuzz Writer: boundary numeric values survive round-trip" {
 }
 
 test "fuzz zip.Archive: adversarial entry names" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Names with path traversal, embedded nulls, UTF-8, max-length.
     // We don't promise to *reject* these (addEntry just writes bytes) —
     // we promise the result is still a walkable zip and our reader
@@ -4586,7 +4649,7 @@ test "fuzz zip.Archive: adversarial entry names" {
     // central-directory layout.
     const iters = fuzzIterationsW() / 10;
     for (0..iters) |_| {
-        var zip_buf: std.ArrayListUnmanaged(u8) = .{};
+        var zip_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer zip_buf.deinit(std.testing.allocator);
         var zw = zip.Archive.init(std.testing.allocator, &zip_buf);
         defer zw.deinit();
@@ -4609,11 +4672,11 @@ test "fuzz zip.Archive: adversarial entry names" {
         // Spill to disk and walk with std.zip.Iterator. Must match the
         // count of successful addEntry calls.
         {
-            var f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+            var f = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
             defer f.close();
             try f.writeAll(zip_buf.items);
         }
-        var f = try std.fs.cwd().openFile(tmp_path, .{});
+        var f = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
         defer f.close();
         var read_buf: [4096]u8 = undefined;
         var fr = f.reader(&read_buf);
@@ -4928,13 +4991,14 @@ test "deflateCompress: large repetitive payload doesn't trip Huffman assert" {
 /// `error.PartNotFound` if the entry isn't in the archive.
 fn extractParityEntry(
     alloc: Allocator,
+    io: std.Io,
     archive_path: []const u8,
     target: []const u8,
 ) ![]u8 {
-    var file = try std.fs.cwd().openFile(archive_path, .{});
-    defer file.close();
+    var file = try std.Io.Dir.cwd().openFile(io, archive_path, .{});
+    defer file.close(io);
     var fbuf: [4096]u8 = undefined;
-    var fr = file.reader(&fbuf);
+    var fr = file.reader(io, &fbuf);
     var iter = try std.zip.Iterator.init(&fr);
     var name_buf: [128]u8 = undefined;
     while (try iter.next()) |entry| {
@@ -4964,7 +5028,7 @@ test "iter-wr-4 parity: empty body sheet — byte identical" {
     const writer_bytes = try extractParityEntry(a, path, "xl/worksheets/sheet1.xml");
     defer a.free(writer_bytes);
 
-    var plan_buf: std.ArrayListUnmanaged(u8) = .{};
+    var plan_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer plan_buf.deinit(a);
     try sheet_plan.emitWorksheetXml(a, &plan_buf, .{ .body = "" });
 
@@ -5004,7 +5068,7 @@ test "iter-wr-4 parity: mixed cell types row — byte identical" {
     const close_pos = std.mem.indexOf(u8, writer_bytes, close) orelse return error.TestFailed;
     const body = writer_bytes[open_pos + open.len .. close_pos];
 
-    var plan_buf: std.ArrayListUnmanaged(u8) = .{};
+    var plan_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer plan_buf.deinit(a);
     try sheet_plan.emitWorksheetXml(a, &plan_buf, .{ .body = body });
 
@@ -5034,7 +5098,7 @@ test "iter-wr-4 parity: frozen panes — byte identical" {
     const close_pos = std.mem.indexOf(u8, writer_bytes, close) orelse return error.TestFailed;
     const body = writer_bytes[open_pos + open.len .. close_pos];
 
-    var plan_buf: std.ArrayListUnmanaged(u8) = .{};
+    var plan_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer plan_buf.deinit(a);
     try sheet_plan.emitWorksheetXml(a, &plan_buf, .{
         .body = body,
@@ -5115,7 +5179,7 @@ test "iter-wr-4 parity: kitchen-sink (merges + autoFilter + DV + CF + hyperlinks
         .{ .range = "A2", .location = "Sheet1!B2" },
     };
 
-    var plan_buf: std.ArrayListUnmanaged(u8) = .{};
+    var plan_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer plan_buf.deinit(a);
     try sheet_plan.emitWorksheetXml(a, &plan_buf, .{
         .body = body,
@@ -5158,7 +5222,7 @@ test "iter-wr-4 parity: rich-row sheet — byte identical" {
     const close_pos = std.mem.indexOf(u8, writer_bytes, close) orelse return error.TestFailed;
     const body = writer_bytes[open_pos + open.len .. close_pos];
 
-    var plan_buf: std.ArrayListUnmanaged(u8) = .{};
+    var plan_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer plan_buf.deinit(a);
     try sheet_plan.emitWorksheetXml(a, &plan_buf, .{ .body = body });
 
@@ -5201,7 +5265,7 @@ test "iter-wr-4 parity: comments + VML — byte identical (CT.xml VML Default-be
         .{ .ref = "A2", .author = "bob", .text = "second" },
         .{ .ref = "A3", .author = "alice", .text = "third" },
     };
-    var plan_comments: std.ArrayListUnmanaged(u8) = .{};
+    var plan_comments: std.ArrayListUnmanaged(u8) = .empty;
     defer plan_comments.deinit(a);
     try sheet_plan.emitCommentsXml(a, &plan_comments, &comments_view);
     try std.testing.expectEqualSlices(u8, plan_comments.items, writer_comments);
@@ -5209,7 +5273,7 @@ test "iter-wr-4 parity: comments + VML — byte identical (CT.xml VML Default-be
     // vmlDrawingN.vml byte parity.
     const writer_vml = try extractParityEntry(a, path, "xl/drawings/vmlDrawing1.vml");
     defer a.free(writer_vml);
-    var plan_vml: std.ArrayListUnmanaged(u8) = .{};
+    var plan_vml: std.ArrayListUnmanaged(u8) = .empty;
     defer plan_vml.deinit(a);
     try sheet_plan.emitVmlDrawingXml(a, &plan_vml, &comments_view);
     try std.testing.expectEqualSlices(u8, plan_vml.items, writer_vml);
@@ -5218,7 +5282,7 @@ test "iter-wr-4 parity: comments + VML — byte identical (CT.xml VML Default-be
     // drawings + comments).
     const writer_rels = try extractParityEntry(a, path, "xl/worksheets/_rels/sheet1.xml.rels");
     defer a.free(writer_rels);
-    var plan_rels: std.ArrayListUnmanaged(u8) = .{};
+    var plan_rels: std.ArrayListUnmanaged(u8) = .empty;
     defer plan_rels.deinit(a);
     const wrote = try sheet_plan.emitSheetRels(a, &plan_rels, 0, &.{}, comments_view.len);
     try std.testing.expect(wrote);
@@ -5248,7 +5312,7 @@ test "iter-wr-4 parity: rels with hyperlinks AND comments — rId numbering stab
         .{ .range = "A1", .url = "https://ex.com" },
         .{ .range = "A2", .url = "https://ex2.com" },
     };
-    var plan_rels: std.ArrayListUnmanaged(u8) = .{};
+    var plan_rels: std.ArrayListUnmanaged(u8) = .empty;
     defer plan_rels.deinit(a);
     const wrote = try sheet_plan.emitSheetRels(a, &plan_rels, 0, &hls, 1);
     try std.testing.expect(wrote);

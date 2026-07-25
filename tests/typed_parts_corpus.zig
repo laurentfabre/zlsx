@@ -38,6 +38,9 @@ const fixtures = [_][]const u8{
 };
 
 test "typed_parts corpus sweep — every well-known part parses without leak" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
     var any_seen: bool = false;
     var workbooks_parsed: u32 = 0;
@@ -49,7 +52,7 @@ test "typed_parts corpus sweep — every well-known part parses without leak" {
     for (fixtures) |name| {
         var path_buf: [256]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "{s}{s}", .{ corpus_dir, name });
-        std.fs.cwd().access(path, .{}) catch continue;
+        std.Io.Dir.cwd().access(io, path, .{}) catch continue;
         any_seen = true;
 
         var store = pkg.PartStore.open(alloc, path) catch |err| {

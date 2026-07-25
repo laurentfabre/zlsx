@@ -1809,8 +1809,11 @@ fn parseElementI64(xml: []const u8, open: []const u8, close: []const u8) ?i64 {
 // ─── Tests ────────────────────────────────────────────────────────────
 
 test "imageAnchors: openxlsx_loadExample.xlsx surfaces 2 anchored images" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/openxlsx_loadExample.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var s = try PartStore.open(std.testing.allocator, fixture);
     defer s.deinit();
@@ -1838,10 +1841,13 @@ test "imageAnchors: openxlsx_loadExample.xlsx surfaces 2 anchored images" {
 }
 
 test "imageAnchors: skips drawings with shapes only (no <xdr:pic>)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // poi_58325_db.xlsx ships shape-only drawings. The parser must
     // walk them without producing image anchors.
     const fixture = "tests/corpus/poi_58325_db.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var s = try PartStore.open(std.testing.allocator, fixture);
     defer s.deinit();
@@ -1858,10 +1864,13 @@ test "imageAnchors: skips drawings with shapes only (no <xdr:pic>)" {
 }
 
 test "imageAnchors: workbook with no drawings returns empty slice" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // worldbank_catalog has no drawings at all; the parser should
     // walk every sheet and find nothing.
     const fixture = "tests/corpus/worldbank_catalog.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var s = try PartStore.open(std.testing.allocator, fixture);
     defer s.deinit();
@@ -1873,8 +1882,11 @@ test "imageAnchors: workbook with no drawings returns empty slice" {
 }
 
 test "chartAnchors: openxlsx_loadExample.xlsx surfaces embedded charts" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/openxlsx_loadExample.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var s = try PartStore.open(std.testing.allocator, fixture);
     defer s.deinit();
@@ -1916,8 +1928,11 @@ test "chartAnchors: openxlsx_loadExample.xlsx surfaces embedded charts" {
 }
 
 test "chartAnchors: workbook with no charts returns empty slice" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/worldbank_catalog.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var s = try PartStore.open(std.testing.allocator, fixture);
     defer s.deinit();
@@ -2374,6 +2389,9 @@ test "findLocalChartElement skips ':chartSpace' false matches" {
 }
 
 test "findLocalNamespacePrefix walks past 4 KiB inside a block" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // collectChartsFromSheet uses findLocalNamespacePrefix to probe
     // for a chart-namespace prefix declared LOCALLY on `<*:chart>`.
     // If the anchor block is large enough that the local xmlns:c
@@ -2405,6 +2423,9 @@ test "findLocalNamespacePrefix walks past 4 KiB inside a block" {
 }
 
 test "resolveDrawingPrefixes maps canonical + custom prefixes" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Canonical prefixes — round-trip.
     {
         const xml =

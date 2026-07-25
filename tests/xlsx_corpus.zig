@@ -226,6 +226,9 @@ test "openxlsx loadExample — 4 sheets including pivot/slicer" {
 // false-positive parse).
 
 test "adversarial: truncated ZIPs error cleanly" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
     const cases = [_][]const u8{
         "derived_truncated_pre_eocd.xlsx",
@@ -238,7 +241,7 @@ test "adversarial: truncated ZIPs error cleanly" {
     for (cases) |name| {
         var path_buf: [256]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "{s}{s}", .{ corpus_dir, name });
-        if (std.fs.cwd().access(path, .{})) |_| {} else |_| continue;
+        if (std.Io.Dir.cwd().access(io, path, .{})) |_| {} else |_| continue;
         // Whether open returns an error or succeeds is fixture-dependent;
         // the contract is "no crash / no hang / no UB". We only assert
         // we get *some* result back without panicking.
@@ -250,6 +253,9 @@ test "adversarial: truncated ZIPs error cleanly" {
 }
 
 test "adversarial: bare ZIPs (not xlsx) error with a typed reason" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
     const cases = [_][]const u8{
         "ziprs_invalid_offset.zip",
@@ -264,7 +270,7 @@ test "adversarial: bare ZIPs (not xlsx) error with a typed reason" {
     for (cases) |name| {
         var path_buf: [256]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "{s}{s}", .{ corpus_dir, name });
-        if (std.fs.cwd().access(path, .{})) |_| {} else |_| continue;
+        if (std.Io.Dir.cwd().access(io, path, .{})) |_| {} else |_| continue;
         // Bare ZIPs must NOT parse as xlsx. They either fail at the ZIP
         // layer (BadZip) or at the missing-workbook step
         // (MissingWorkbook). Anything else means the reader silently
@@ -342,6 +348,9 @@ test "adversarial: clusterfuzz minimised XSSF input" {
 }
 
 test "adversarial: calamine fixtures (encoded entities, empty SI, etc.)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
     const cases = [_]struct { name: []const u8, min_rows: usize }{
         .{ .name = "calamine_encoded_entities.xlsx", .min_rows = 1 },
@@ -352,7 +361,7 @@ test "adversarial: calamine fixtures (encoded entities, empty SI, etc.)" {
     for (cases) |c| {
         var path_buf: [256]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "{s}{s}", .{ corpus_dir, c.name });
-        if (std.fs.cwd().access(path, .{})) |_| {} else |_| continue;
+        if (std.Io.Dir.cwd().access(io, path, .{})) |_| {} else |_| continue;
         var book = try xlsx.Book.open(alloc, path);
         defer book.deinit();
         try std.testing.expect(book.sheets.len >= 1);
@@ -505,7 +514,7 @@ const TmpFs = struct {
         self.dir.cleanup();
     }
     pub fn path(self: *TmpFs, alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
-        const d = try self.dir.dir.realpathAlloc(alloc, ".");
+        const d = try self.dir.dir.realPathFileAlloc(io, ".", alloc);
         defer alloc.free(d);
         return std.fs.path.joinZ(alloc, &.{ d, name });
     }
@@ -518,7 +527,7 @@ fn corpusPath(alloc: std.mem.Allocator, fixture: []const u8) ![]u8 {
 fn fixtureExists(fixture: []const u8) bool {
     var path_buf: [256]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}{s}", .{ corpus_dir, fixture }) catch return false;
-    std.fs.cwd().access(path, .{}) catch return false;
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
     return true;
 }
 

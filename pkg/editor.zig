@@ -197,17 +197,24 @@ pub const Editor = struct {
     /// `Editor.deinit` cleans up both Editor and Workbook.
     workbook: Workbook,
 
-    pub fn open(allocator: Allocator, path: []const u8) !Editor {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
-        const stat = try file.stat();
+    pub fn open(allocator: Allocator, io: std.Io, path: []const u8) !Editor {
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        const stat = try file.stat(io);
         // Refuse files > 4 GiB up front (ZIP64 isn't supported by v1
         // per the plan; documented limit).
         if (stat.size > std.math.maxInt(u32)) return error.ZipTooLarge;
         const buf = try allocator.alloc(u8, @intCast(stat.size));
         errdefer allocator.free(buf);
-        const n = try file.readAll(buf);
-        if (n != buf.len) return error.UnexpectedEof;
+        // 0.16 reads go through the Reader interface; `readSliceAll`
+        // is the exact-length read that 0.15's `readAll` + length
+        // check expressed.
+        var read_buf: [4096]u8 = undefined;
+        var file_reader = file.reader(io, &read_buf);
+        file_reader.interface.readSliceAll(buf) catch |err| switch (err) {
+            error.EndOfStream => return error.UnexpectedEof,
+            else => return err,
+        };
 
         // Scan the source ZIP and capture verbatim spans.
         //
@@ -259,7 +266,7 @@ pub const Editor = struct {
         if (comment_off + eocd.comment_len > buf.len) return error.BadZip;
         const eocd_comment = buf[comment_off .. comment_off + eocd.comment_len];
 
-        var entries: std.ArrayListUnmanaged(ZipEntry) = .{};
+        var entries: std.ArrayListUnmanaged(ZipEntry) = .empty;
         errdefer entries.deinit(allocator);
         try entries.ensureTotalCapacity(allocator, eocd.record_count_total);
 
@@ -464,7 +471,7 @@ pub const Editor = struct {
             !self.workbook.store.hasUnsavedChanges())
         {
             var write_buf: [4096]u8 = undefined;
-            var atomic_file = try std.fs.cwd().atomicFile(out_path, .{ .write_buffer = &write_buf });
+            var atomic_file = try std.Io.Dir.cwd().atomicFile(out_path, .{ .write_buffer = &write_buf });
             defer atomic_file.deinit();
             const w = &atomic_file.file_writer.interface;
             try w.writeAll(self.src_buf);
@@ -959,7 +966,7 @@ pub const Editor = struct {
 /// the row/cell parser in `Rows.next` but records byte offsets
 /// instead of decoding values.
 fn scanWorksheetXml(allocator: Allocator, xml: []const u8) ![]CellSpan {
-    var out: std.ArrayListUnmanaged(CellSpan) = .{};
+    var out: std.ArrayListUnmanaged(CellSpan) = .empty;
     errdefer out.deinit(allocator);
 
     var pos: usize = 0;
@@ -1130,8 +1137,8 @@ const TestTmp = struct {
     pub fn deinit(self: *TestTmp) void {
         self.dir.cleanup();
     }
-    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
-        const d = try self.dir.dir.realpathAlloc(alloc, ".");
+    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, io: std.Io, name: []const u8) ![:0]u8 {
+        const d = try self.dir.dir.realPathFileAlloc(io, ".", alloc);
         defer alloc.free(d);
         return std.fs.path.joinZ(alloc, &.{ d, name });
     }
@@ -1140,6 +1147,9 @@ const TestTmp = struct {
 // ─── Tests ───────────────────────────────────────────────────────────
 
 test "Editor: byte-identical passthrough (iter-lms-1)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
@@ -1164,7 +1174,7 @@ test "Editor: byte-identical passthrough (iter-lms-1)" {
     const Sha256 = std.crypto.hash.sha2.Sha256;
     var src_hash: [Sha256.digest_length]u8 = undefined;
     {
-        const f = try std.fs.cwd().openFile(src_path, .{});
+        const f = try std.Io.Dir.cwd().openFile(io, src_path, .{});
         defer f.close();
         const buf = try std.testing.allocator.alloc(u8, @intCast((try f.stat()).size));
         defer std.testing.allocator.free(buf);
@@ -1182,7 +1192,7 @@ test "Editor: byte-identical passthrough (iter-lms-1)" {
     // SHA256 of destination must match.
     var dst_hash: [Sha256.digest_length]u8 = undefined;
     {
-        const f = try std.fs.cwd().openFile(dst_path, .{});
+        const f = try std.Io.Dir.cwd().openFile(io, dst_path, .{});
         defer f.close();
         const buf = try std.testing.allocator.alloc(u8, @intCast((try f.stat()).size));
         defer std.testing.allocator.free(buf);
@@ -1419,7 +1429,7 @@ test "Editor: SST-less workbook gets fresh sharedStrings.xml on string append" {
         var ed = try Editor.open(std.testing.allocator, src_path);
         defer ed.deinit();
 
-        var filtered: std.ArrayListUnmanaged(ZipEntry) = .{};
+        var filtered: std.ArrayListUnmanaged(ZipEntry) = .empty;
         defer filtered.deinit(std.testing.allocator);
         var saw_sst = false;
         for (ed.entries) |e| {
@@ -3931,9 +3941,9 @@ test "Editor: deleteColumn at comment's column drops BOTH VML shape AND comment 
 // unrewritten ones).
 // ---------------------------------------------------------------------------
 
-fn copyCorpusToTmp(src_corpus: []const u8, dst_path: [:0]const u8) !void {
-    std.fs.cwd().access(src_corpus, .{}) catch return error.SkipZigTest;
-    try std.fs.cwd().copyFile(src_corpus, std.fs.cwd(), dst_path, .{});
+fn copyCorpusToTmp(io: std.Io, src_corpus: []const u8, dst_path: [:0]const u8) !void {
+    std.Io.Dir.cwd().access(io, src_corpus, .{}) catch return error.SkipZigTest;
+    try std.Io.Dir.cwd().copyFile(src_corpus, std.Io.Dir.cwd(), dst_path, io, .{});
 }
 
 fn tablePartContains(path: []const u8, table_part: []const u8, needle: []const u8) !bool {

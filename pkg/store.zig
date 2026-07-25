@@ -22,6 +22,7 @@
 //! consume the same code.
 
 const std = @import("std");
+const AtomicFile = @import("atomic_file.zig").AtomicFile;
 
 pub const Part = struct {
     name: []const u8,
@@ -83,10 +84,15 @@ pub const Error = error{
     /// bytes are written so the atomic-file output is never left in
     /// a partial state.
     ZipArchiveTooLarge,
-} || std.fs.File.OpenError || std.mem.Allocator.Error || std.fs.File.ReadError || std.fs.File.SeekError;
+} || std.Io.File.OpenError || std.mem.Allocator.Error || std.Io.File.Reader.Error || std.Io.File.SeekError;
 
 pub const PartStore = struct {
     allocator: std.mem.Allocator,
+    /// The `Io` this store was opened with. `materializeAt` and the
+    /// byte-preserving `save()` path both re-touch the source handle
+    /// long after `open()` returned, and 0.16 needs an `Io` for each
+    /// of those calls — so the store carries its own.
+    io: std.Io,
     /// Arena-owned storage for every borrowed slice exposed via the
     /// public API (part names, content types, rel attrs, decompressed
     /// part bytes). Caller-visible slices stay valid until `deinit`.
@@ -104,7 +110,7 @@ pub const PartStore = struct {
     /// `save()` never reads from a source file. Code paths that
     /// dereference `self.file` are gated on `overrides[i] == null`,
     /// which can never be true for a fresh store.
-    file: ?std.fs.File,
+    file: ?std.Io.File,
     /// Per-part raw ZIP entries (LFH/CDFH/payload offsets). Same
     /// length + ordering as `parts`.
     entries: []ZipEntry,
@@ -119,14 +125,14 @@ pub const PartStore = struct {
     /// Preserved across save() so byte-identical comments survive.
     eocd_comment: []const u8,
 
-    pub fn open(allocator: std.mem.Allocator, path: []const u8) !PartStore {
+    pub fn open(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !PartStore {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const ar_alloc = arena.allocator();
 
-        var file = try std.fs.cwd().openFile(path, .{});
-        errdefer file.close();
-        const stat = try file.stat();
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        errdefer file.close(io);
+        const stat = try file.stat(io);
         if (stat.size > std.math.maxInt(u32)) return Error.Zip64NotSupported;
         const size: usize = @intCast(stat.size);
 
@@ -342,7 +348,7 @@ pub const PartStore = struct {
         const owned_user_bytes = try ar_alloc.dupe(u8, bytes);
 
         // Compress user payload via the same policy as replacePart.
-        var compressed: std.ArrayListUnmanaged(u8) = .{};
+        var compressed: std.ArrayListUnmanaged(u8) = .empty;
         defer compressed.deinit(ar_alloc);
         var method: u16 = 8;
         if (bytes.len < 1024 or bytes.len == 0) {
@@ -470,7 +476,7 @@ pub const PartStore = struct {
         if (new_xml.len >= std.math.maxInt(u32)) return Error.Zip64NotSupported;
 
         // Compress the new CT XML — same policy as replacePart.
-        var ct_compressed: std.ArrayListUnmanaged(u8) = .{};
+        var ct_compressed: std.ArrayListUnmanaged(u8) = .empty;
         defer ct_compressed.deinit(ar_alloc);
         var ct_method: u16 = 8;
         if (new_xml.len < 1024 or new_xml.len == 0) {
@@ -543,7 +549,7 @@ pub const PartStore = struct {
         //     header overhead dominates the gain on tiny XML.
         //   - Larger inputs: deflate. Fall back to STORED if deflate
         //     didn't actually shrink the payload.
-        var compressed: std.ArrayListUnmanaged(u8) = .{};
+        var compressed: std.ArrayListUnmanaged(u8) = .empty;
         defer compressed.deinit(ar_alloc);
         var method: u16 = 8;
         if (bytes.len < 1024 or bytes.len == 0) {
@@ -645,7 +651,7 @@ pub const PartStore = struct {
         if (total_projected > std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
 
         var write_buf: [4096]u8 = undefined;
-        var atomic_file = try std.fs.cwd().atomicFile(path, .{ .write_buffer = &write_buf });
+        var atomic_file = try AtomicFile.init(self.io, path, &write_buf);
         defer atomic_file.deinit();
         const w = &atomic_file.file_writer.interface;
 
@@ -1596,8 +1602,11 @@ fn parentDir(name: []const u8) []const u8 {
 // ─── Tests ────────────────────────────────────────────────────────────
 
 test "PartStore.open: enumerates parts of frictionless_2sheets.xlsx" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var store = try PartStore.open(std.testing.allocator, fixture);
     defer store.deinit();
@@ -1617,8 +1626,11 @@ test "PartStore.open: enumerates parts of frictionless_2sheets.xlsx" {
 }
 
 test "PartStore.part: workbook.xml has a workbook content type" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var store = try PartStore.open(std.testing.allocator, fixture);
     defer store.deinit();
@@ -1637,8 +1649,11 @@ test "PartStore.part: workbook.xml has a workbook content type" {
 }
 
 test "PartStore.rels: package-root + workbook rels parse" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var store = try PartStore.open(std.testing.allocator, fixture);
     defer store.deinit();
@@ -1684,8 +1699,11 @@ test "relsOwner: shape decoder" {
 }
 
 test "PartStore.resolve: relative + absolute targets" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var store = try PartStore.open(std.testing.allocator, fixture);
     defer store.deinit();
@@ -1706,8 +1724,11 @@ test "PartStore.resolve: relative + absolute targets" {
 }
 
 test "PartStore.imageParts: extract embedded images (C2a MVP)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/poi_58325_db.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var store = try PartStore.open(std.testing.allocator, fixture);
     defer store.deinit();
@@ -1727,8 +1748,11 @@ test "PartStore.imageParts: extract embedded images (C2a MVP)" {
 }
 
 test "PartStore: data descriptors detected in fixtures with flag 0x0008" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var store = try PartStore.open(std.testing.allocator, fixture);
     defer store.deinit();
@@ -1745,12 +1769,15 @@ test "PartStore: data descriptors detected in fixtures with flag 0x0008" {
 }
 
 test "PartStore.save: byte-preserving round-trip with no mutations" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
     const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "round_trip.xlsx" });
     defer std.testing.allocator.free(out_path);
@@ -1776,12 +1803,15 @@ test "PartStore.save: byte-preserving round-trip with no mutations" {
 }
 
 test "PartStore.replacePart + save: replaced part has new bytes; others untouched" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
     const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "modified.xlsx" });
     defer std.testing.allocator.free(out_path);
@@ -1822,12 +1852,15 @@ test "PartStore.replacePart + save: replaced part has new bytes; others untouche
 }
 
 test "PartStore.replacePart: large input round-trips through deflate" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
     const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "deflate_round_trip.xlsx" });
     defer std.testing.allocator.free(out_path);
@@ -1859,8 +1892,11 @@ test "PartStore.replacePart: large input round-trips through deflate" {
 }
 
 test "PartStore.replacePart: unknown part name returns PartNotFound" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var store = try PartStore.open(std.testing.allocator, fixture);
     defer store.deinit();
@@ -1869,10 +1905,13 @@ test "PartStore.replacePart: unknown part name returns PartNotFound" {
 }
 
 test "PartStore.open: rejects non-PK file" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "garbage.xlsx", .data = "not a zip" });
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "garbage.xlsx" });
     defer std.testing.allocator.free(path);
@@ -1881,6 +1920,9 @@ test "PartStore.open: rejects non-PK file" {
 }
 
 test "PartStore.open: rejects split-disk EOCD" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Build a minimal 22-byte EOCD with this_disk=1 (split). No CD
     // entries needed — the disk check fires before the CD walk.
     var eocd: [22]u8 = undefined;
@@ -1893,7 +1935,7 @@ test "PartStore.open: rejects split-disk EOCD" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "split.xlsx", .data = &eocd });
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "split.xlsx" });
     defer std.testing.allocator.free(path);
@@ -1982,8 +2024,11 @@ test "looksExternal classifies URL / UNC / drive-letter targets" {
 }
 
 test "PartStore.resolve: external targets return null" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
     var store = try PartStore.open(std.testing.allocator, fixture);
     defer store.deinit();
 
@@ -2039,12 +2084,15 @@ test "decompressPayload: rejects ZIP-bomb declared sizes" {
 }
 
 test "PartStore.addPart + save: new part survives round-trip with content type" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
     const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "added.xlsx" });
     defer std.testing.allocator.free(out_path);
@@ -2069,12 +2117,15 @@ test "PartStore.addPart + save: new part survives round-trip with content type" 
 }
 
 test "PartStore.addPart: multiple parts in one session all register content types" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
     const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "added_two.xlsx" });
     defer std.testing.allocator.free(out_path);
@@ -2103,12 +2154,15 @@ test "PartStore.addPart: multiple parts in one session all register content type
 }
 
 test "PartStore.addPart: XML-escapes part name + content type into Content_Types" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
     const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "added_meta.xlsx" });
     defer std.testing.allocator.free(out_path);
@@ -2143,8 +2197,11 @@ test "PartStore.addPart: XML-escapes part name + content type into Content_Types
 }
 
 test "PartStore.addPart: rejects duplicate part name" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var store = try PartStore.open(std.testing.allocator, fixture);
     defer store.deinit();
@@ -2162,7 +2219,12 @@ test "PartStore.addPart: rejects duplicate part name" {
 // Contract: the parser must not panic / deadlock / OOB-read on
 // any input — typed errors are fine.
 
-fn fuzzDecodeXmlEntitiesTarget(_: void, input: []const u8) anyerror!void {
+fn fuzzDecodeXmlEntitiesTarget(_: void, smith: *std.testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    // 4 KiB matches the PRNG harness's scratch bound, so a crash
+    // found here reproduces against the same input shape.
+    var smith_buf: [4096]u8 = undefined;
+    const input = smith_buf[0..smith.slice(&smith_buf)];
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const decoded = decodeXmlEntities(arena.allocator(), input) catch return;
@@ -2183,11 +2245,21 @@ test "fuzz: decodeXmlEntities never crashes on adversarial input" {
     });
 }
 
-fn fuzzLooksExternalTarget(_: void, input: []const u8) anyerror!void {
+fn fuzzLooksExternalTarget(_: void, smith: *std.testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    // 4 KiB matches the PRNG harness's scratch bound, so a crash
+    // found here reproduces against the same input shape.
+    var smith_buf: [4096]u8 = undefined;
+    const input = smith_buf[0..smith.slice(&smith_buf)];
     _ = looksExternal(input);
 }
 
-fn fuzzParseRelationshipsTarget(_: void, input: []const u8) anyerror!void {
+fn fuzzParseRelationshipsTarget(_: void, smith: *std.testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    // 4 KiB matches the PRNG harness's scratch bound, so a crash
+    // found here reproduces against the same input shape.
+    var smith_buf: [4096]u8 = undefined;
+    const input = smith_buf[0..smith.slice(&smith_buf)];
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     _ = parseRelationships(arena.allocator(), input) catch {};
@@ -2225,12 +2297,15 @@ test "fuzz: looksExternal never crashes on adversarial input" {
 }
 
 test "PartStore.addPart: large input round-trips through deflate" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
     const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "added_large.xlsx" });
     defer std.testing.allocator.free(out_path);
@@ -2255,8 +2330,11 @@ test "PartStore.addPart: large input round-trips through deflate" {
 }
 
 test "PartStore.addPart: atomic on every allocation-failure step" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
     // Drive addPart through std.testing.checkAllAllocationFailures
     // so every single fallible allocation along the way takes a
@@ -2346,9 +2424,12 @@ test "PartStore.fresh: addPart populates the store" {
 }
 
 test "PartStore.fresh: save round-trips through PartStore.open" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
     const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "fresh_round.xlsx" });
     defer std.testing.allocator.free(out_path);
@@ -2392,6 +2473,9 @@ test "PartStore.fresh: save round-trips through PartStore.open" {
 }
 
 test "PartStore.fresh: save with zero addParts produces a valid 1-entry ZIP" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Strict "0-entry ZIP" isn't reachable through `fresh()` because
     // the constructor seeds `[Content_Types].xml` (precondition for
     // addPart). The closest contract is: `fresh()` immediately
@@ -2400,7 +2484,7 @@ test "PartStore.fresh: save with zero addParts produces a valid 1-entry ZIP" {
     // `open()`.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
     const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "fresh_empty.xlsx" });
     defer std.testing.allocator.free(out_path);

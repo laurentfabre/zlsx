@@ -831,7 +831,7 @@ export fn zlsx_rows_open(
         state.unref();
         return null;
     };
-    rs.* = .{ .book = state, .inner = inner, .c_cells = .{} };
+    rs.* = .{ .book = state, .inner = inner, .c_cells = .empty };
     return @ptrCast(rs);
 }
 
@@ -1207,8 +1207,8 @@ fn matrixOpenInner(state: *BookState, sheet_idx: u32) !*MatrixState {
     ms.* = .{
         .book = state,
         .string_arena = std.heap.ArenaAllocator.init(gpa),
-        .flat_cells = .{},
-        .offsets = .{},
+        .flat_cells = .empty,
+        .offsets = .empty,
     };
     errdefer ms.string_arena.deinit();
     errdefer ms.flat_cells.deinit(gpa);
@@ -1285,8 +1285,8 @@ const TestTmp = struct {
     pub fn deinit(self: *TestTmp) void {
         self.dir.cleanup();
     }
-    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
-        const d = try self.dir.dir.realpathAlloc(alloc, ".");
+    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, io: std.Io, name: []const u8) ![:0]u8 {
+        const d = try self.dir.dir.realPathFileAlloc(io, ".", alloc);
         defer alloc.free(d);
         return std.fs.path.joinZ(alloc, &.{ d, name });
     }
@@ -1328,11 +1328,14 @@ test "CCell round-trip for each tag" {
 }
 
 test "abi full lifecycle on smallest corpus file" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Skip only when the corpus file is absent (the corpus isn't
     // committed — scripts/fetch_test_corpus.sh materializes it). Any
     // other failure path is a real regression and must fail the test.
     const path_bytes = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(path_bytes, .{}) catch |err| switch (err) {
+    std.Io.Dir.cwd().access(io, path_bytes, .{}) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
@@ -1367,8 +1370,11 @@ test "abi full lifecycle on smallest corpus file" {
 }
 
 test "refcount: close book before rows is safe" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const path_bytes = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(path_bytes, .{}) catch |err| switch (err) {
+    std.Io.Dir.cwd().access(io, path_bytes, .{}) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
@@ -1830,7 +1836,7 @@ export fn zlsx_writer_save(
     const path = path_ptr[0..path_len];
 
     // Writer.save takes a null-terminated path under the hood when it
-    // calls std.fs.cwd().createFile. std.mem.Allocator.dupeZ hands us a
+    // calls std.Io.Dir.cwd().createFile. std.mem.Allocator.dupeZ hands us a
     // sentinel-terminated copy without hand-rolling it.
     const owned_path = gpa.dupeZ(u8, path) catch {
         writeError(err_buf, err_buf_len, "OutOfMemory");
@@ -3834,11 +3840,14 @@ test "fuzz C ABI: err_buf edge cases never overrun" {
 }
 
 test "fuzz C ABI: interleaved book + rows handles refcount correctly" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Open N books + rows iterators in random order, close in random
     // order. Memory stays balanced (tested via testing.allocator's
     // implicit leak check at end).
     const corpus = "tests/corpus/frictionless_2sheets.xlsx";
-    std.fs.cwd().access(corpus, .{}) catch return;
+    std.Io.Dir.cwd().access(io, corpus, .{}) catch return;
 
     const iters = fuzzItersCabi() / 10;
     const seed = fuzzSeedCabi();

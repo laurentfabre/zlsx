@@ -100,5 +100,5 @@ pub fn main() !void {
     else
         (if (lazy) "stream-lazy" else "stream");
     const msg = try std.fmt.bufPrint(&buf, "mode={s} rows={d} str={d} int={d} num={d} bool={d} empty={d}\n", .{ tag, n_rows, n_str, n_int, n_num, n_bool, n_empty });
-    _ = std.fs.File.stdout().write(msg) catch {};
+    _ = std.Io.File.stdout().write(msg) catch {};
 }

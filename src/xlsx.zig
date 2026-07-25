@@ -426,7 +426,7 @@ pub const DomainError = error{
 
 /// Owner of the open zip file handle, its reader buffer, and cached
 /// central-directory offsets for lazily-extractable parts. Heap-boxed
-/// because `std.fs.File.Reader` embeds a pointer into its own buffer:
+/// because `std.Io.File.Reader` embeds a pointer into its own buffer:
 /// moving it by value (e.g. returning `Book` from `openLazy`) would
 /// invalidate that pointer. One indirection sidesteps the whole class
 /// of bug.
@@ -436,9 +436,13 @@ pub const DomainError = error{
 /// populating the maps now makes the slice-B swap to on-demand
 /// extraction a one-line change per part.
 const ZipArchive = struct {
-    file: std.fs.File,
+    /// 0.16 routes every file operation through an `Io`. The archive
+    /// owns its handle for the Book's lifetime, so it carries the `Io`
+    /// it was opened with rather than making every method take one.
+    io: std.Io,
+    file: std.Io.File,
     reader_buf: [4096]u8 = undefined,
-    reader: std.fs.File.Reader,
+    reader: std.Io.File.Reader,
     sheet_offsets: std.StringHashMapUnmanaged(Entry) = .{},
     comments_offsets: std.StringHashMapUnmanaged(Entry) = .{},
     vml_offsets: std.StringHashMapUnmanaged(Entry) = .{},
@@ -453,22 +457,23 @@ const ZipArchive = struct {
     /// maps. On success, `self` owns the file handle; `deinit` closes
     /// it. The file stays open for the caller's lifetime so subsequent
     /// `extractEntry` calls can re-seek.
-    fn open(allocator: Allocator, archive_path: []const u8) !*ZipArchive {
+    fn open(allocator: Allocator, io: std.Io, archive_path: []const u8) !*ZipArchive {
         const self = try allocator.create(ZipArchive);
         errdefer allocator.destroy(self);
 
         self.* = .{
-            .file = try std.fs.cwd().openFile(archive_path, .{}),
+            .io = io,
+            .file = try std.Io.Dir.cwd().openFile(io, archive_path, .{}),
             .reader = undefined,
             .sheet_offsets = .{},
             .comments_offsets = .{},
             .vml_offsets = .{},
         };
-        errdefer self.file.close();
+        errdefer self.file.close(io);
 
         // reader embeds a pointer into self.reader_buf — must run after
         // the struct lives at its final heap address.
-        self.reader = self.file.reader(&self.reader_buf);
+        self.reader = self.file.reader(io, &self.reader_buf);
 
         errdefer self.sheet_offsets.deinit(allocator);
         errdefer self.comments_offsets.deinit(allocator);
@@ -481,7 +486,7 @@ const ZipArchive = struct {
         self.sheet_offsets.deinit(allocator);
         self.comments_offsets.deinit(allocator);
         self.vml_offsets.deinit(allocator);
-        self.file.close();
+        self.file.close(self.io);
         allocator.destroy(self);
     }
 
@@ -546,6 +551,10 @@ pub const SstBackend = union(enum) {
 
 pub const Book = struct {
     allocator: Allocator,
+    /// The `Io` this book was opened with. Retained because lazy
+    /// backends may re-touch the filesystem after `openLazy` returns,
+    /// and 0.16 requires an `Io` for every such call.
+    io: std.Io,
     /// Open zip archive backing this book. Owns the file handle and
     /// reader. Set by `openLazy`; torn down LAST in `deinit` (after
     /// every borrowed part buffer is freed).
@@ -661,7 +670,7 @@ pub const Book = struct {
     cell_xf_border_ids: []u32 = &.{},
     /// Owned backing storage for every string referenced by `sheets`,
     /// sheet_data keys, and entity-decoded shared strings.
-    strings: std.ArrayListUnmanaged([]u8) = .{},
+    strings: std.ArrayListUnmanaged([]u8) = .empty,
 
     /// Open and parse the workbook skeleton. Sheet XML is eagerly
     /// decompressed (xlsx files we target are small — ~300 KB — and
@@ -673,8 +682,8 @@ pub const Book = struct {
     /// Book is in use (matters on Windows file locks; harmless
     /// elsewhere). Slice B will split `loadEagerParts` out of
     /// `openLazy` so only the `open` facade pays for it.
-    pub fn open(allocator: Allocator, path: []const u8) !Book {
-        var book = try Book.openLazy(allocator, path);
+    pub fn open(allocator: Allocator, io: std.Io, path: []const u8) !Book {
+        var book = try Book.openLazy(allocator, io, path);
         errdefer book.deinit();
         try book.loadEagerParts();
         book.closeArchive();
@@ -732,26 +741,27 @@ pub const Book = struct {
     /// Single-threaded contract — the lazy backend mutates internal
     /// state on first-touch. Multi-threaded SST access requires the
     /// caller to serialise externally or to call `Book.open` instead.
-    pub fn openSstLazy(allocator: Allocator, path: []const u8) !Book {
-        var book = try Book.openLazyWithSst(allocator, path, .lazy);
+    pub fn openSstLazy(allocator: Allocator, io: std.Io, path: []const u8) !Book {
+        var book = try Book.openLazyWithSst(allocator, io, path, .lazy);
         errdefer book.deinit();
         try book.loadEagerParts();
         book.closeArchive();
         return book;
     }
 
-    pub fn openLazy(allocator: Allocator, path: []const u8) !Book {
-        return Book.openLazyWithSst(allocator, path, .eager);
+    pub fn openLazy(allocator: Allocator, io: std.Io, path: []const u8) !Book {
+        return Book.openLazyWithSst(allocator, io, path, .eager);
     }
 
-    fn openLazyWithSst(allocator: Allocator, path: []const u8, sst_strategy: SstStrategy) !Book {
+    fn openLazyWithSst(allocator: Allocator, io: std.Io, path: []const u8, sst_strategy: SstStrategy) !Book {
         var book: Book = .{
             .allocator = allocator,
+            .io = io,
             .sst_arena = std.heap.ArenaAllocator.init(allocator),
         };
         errdefer book.deinit();
 
-        book.archive = try ZipArchive.open(allocator, path);
+        book.archive = try ZipArchive.open(allocator, io, path);
 
         var iter = std.zip.Iterator.init(&book.archive.?.reader) catch return error.BadZip;
 
@@ -1262,14 +1272,14 @@ pub const Book = struct {
             },
             .book = self,
             .allocator = allocator,
-            .row_cells = .{},
-            .row_styles = .{},
-            .row_date_types = .{},
-            .row_error_strings = .{},
-            .row_formula_strings = .{},
-            .row_formula_refs = .{},
+            .row_cells = .empty,
+            .row_styles = .empty,
+            .row_date_types = .empty,
+            .row_error_strings = .empty,
+            .row_formula_strings = .empty,
+            .row_formula_refs = .empty,
             .shared_si_to_base_ref = .{},
-            .array_ranges = .{},
+            .array_ranges = .empty,
             .arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
@@ -1327,7 +1337,7 @@ pub const Book = struct {
         // wholesale doubled peak memory on entity-heavy workbooks for
         // no benefit.
         const arena_alloc = matrix.arena.allocator();
-        var row_acc: std.ArrayListUnmanaged([]const Cell) = .{};
+        var row_acc: std.ArrayListUnmanaged([]const Cell) = .empty;
         // Pre-size the outer accumulator using the SST length as a
         // *very* loose order-of-magnitude hint; for sparse sheets
         // this overshoots, but the arena absorbs the slack on
@@ -2069,7 +2079,7 @@ pub const Rows = struct {
 
         // Multi-run or entity-bearing — allocate into the row arena.
         const a = self.arena.allocator();
-        var buf: std.ArrayListUnmanaged(u8) = .{};
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         var i: usize = 0;
         while (std.mem.indexOfPos(u8, body, i, "<t")) |t_start| {
             const gt = std.mem.indexOfScalarPos(u8, body, t_start, '>') orelse return error.MalformedXml;
@@ -2089,7 +2099,7 @@ pub const Rows = struct {
     fn internOrBorrow(self: *Rows, raw: []const u8) ![]const u8 {
         if (std.mem.indexOfScalar(u8, raw, '&') == null) return raw;
         const a = self.arena.allocator();
-        var buf: std.ArrayListUnmanaged(u8) = .{};
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         try appendDecoded(a, &buf, raw);
         return try buf.toOwnedSlice(a);
     }
@@ -2348,7 +2358,7 @@ pub fn parseWorkbookSheets(book: *Book, wb_xml: []const u8, rels_xml: []const u8
     }
 
     // Walk <sheet name="..." r:id="..."/> in workbook.xml.
-    var sheets: std.ArrayListUnmanaged(Sheet) = .{};
+    var sheets: std.ArrayListUnmanaged(Sheet) = .empty;
     errdefer sheets.deinit(book.allocator);
 
     i = 0;
@@ -2377,7 +2387,7 @@ pub fn parseWorkbookSheets(book: *Book, wb_xml: []const u8, rels_xml: []const u8
         };
 
         // Path is relative to xl/ — prepend if not absolute. Own it.
-        var path_buf: std.ArrayListUnmanaged(u8) = .{};
+        var path_buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer path_buf.deinit(book.allocator);
         if (std.mem.startsWith(u8, target, "/")) {
             try path_buf.appendSlice(book.allocator, target[1..]);
@@ -2389,7 +2399,7 @@ pub fn parseWorkbookSheets(book: *Book, wb_xml: []const u8, rels_xml: []const u8
         try book.strings.append(book.allocator, path);
 
         // Name needs entity decoding (hotels with & in their names).
-        var name_buf: std.ArrayListUnmanaged(u8) = .{};
+        var name_buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer name_buf.deinit(book.allocator);
         try appendDecoded(book.allocator, &name_buf, name);
         const name_decoded = try name_buf.toOwnedSlice(book.allocator);
@@ -2462,7 +2472,7 @@ fn parseMergedRangesForSheet(book: *Book, sheet_path: []const u8, xml: []const u
     const mc_end = std.mem.indexOfPos(u8, xml, mc_start, "</mergeCells>") orelse return;
     const block = xml[mc_start..mc_end];
 
-    var ranges: std.ArrayListUnmanaged(MergeRange) = .{};
+    var ranges: std.ArrayListUnmanaged(MergeRange) = .empty;
     errdefer ranges.deinit(book.allocator);
 
     // Honour the `count="N"` attribute when present — lets us
@@ -2665,7 +2675,7 @@ fn parseHyperlinksForSheet(book: *Book, sheet_path: []const u8, xml: []const u8)
     // sheet has no per-sheet rels — internal entries still parse.
     const rels_xml: ?[]const u8 = book.sheet_rels_data.get(sheet_path);
 
-    var entries: std.ArrayListUnmanaged(Hyperlink) = .{};
+    var entries: std.ArrayListUnmanaged(Hyperlink) = .empty;
     errdefer entries.deinit(book.allocator);
 
     var probe: usize = 0;
@@ -2748,7 +2758,7 @@ fn splitFormula1List(book: *Book, formula1: []const u8) !?[][]const u8 {
         return null;
     if (trimmed.len == 0) return null;
 
-    var out: std.ArrayListUnmanaged([]const u8) = .{};
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer out.deinit(book.allocator);
 
     const arena = book.sst_arena.allocator();
@@ -2850,7 +2860,7 @@ fn parseCommentsForSheet(book: *Book, sheet_path: []const u8) !void {
     const cxml = comments_xml orelse return;
 
     // Parse <authors>: one per <author>…</author>.
-    var authors: std.ArrayListUnmanaged([]const u8) = .{};
+    var authors: std.ArrayListUnmanaged([]const u8) = .empty;
     defer authors.deinit(book.allocator);
     const arena = book.sst_arena.allocator();
     if (std.mem.indexOf(u8, cxml, "<authors>")) |ap| {
@@ -2870,7 +2880,7 @@ fn parseCommentsForSheet(book: *Book, sheet_path: []const u8) !void {
     // <text>…</text></comment> per entry. Comment text may contain
     // rich runs — concatenate all <t>…</t> contents for the flat
     // `text` field.
-    var entries: std.ArrayListUnmanaged(Comment) = .{};
+    var entries: std.ArrayListUnmanaged(Comment) = .empty;
     errdefer entries.deinit(book.allocator);
     const cl_pos = std.mem.indexOf(u8, cxml, "<commentList>") orelse return;
     const cl_end = std.mem.indexOfPos(u8, cxml, cl_pos, "</commentList>") orelse return;
@@ -2910,9 +2920,9 @@ fn parseCommentsForSheet(book: *Book, sheet_path: []const u8) !void {
         // Mirrors the iter26 SST parser's structure: `<r>` toggles
         // `saw_r`; `<rPr>` populates `pending_flags`; each `<t>`
         // consumed inside `<r>` appends a RichRun.
-        var text_buf: std.ArrayListUnmanaged(u8) = .{};
+        var text_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer text_buf.deinit(arena);
-        var runs_list: std.ArrayListUnmanaged(RichRun) = .{};
+        var runs_list: std.ArrayListUnmanaged(RichRun) = .empty;
         errdefer runs_list.deinit(arena);
         var saw_r = false;
         var pending_flags: RichRun = .{ .text = "" };
@@ -3015,7 +3025,7 @@ fn parseDataValidationsForSheet(book: *Book, sheet_path: []const u8, xml: []cons
     const dv_end = std.mem.indexOfPos(u8, xml, dv_start, "</dataValidations>") orelse return;
     const block = xml[dv_start..dv_end];
 
-    var entries: std.ArrayListUnmanaged(DataValidation) = .{};
+    var entries: std.ArrayListUnmanaged(DataValidation) = .empty;
     errdefer entries.deinit(book.allocator);
 
     var i: usize = 0;
@@ -3354,7 +3364,7 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
     if (std.mem.indexOf(u8, xml, "<fonts")) |fp| {
         const fp_end = std.mem.indexOfPos(u8, xml, fp, "</fonts>") orelse xml.len;
         const block = xml[fp..fp_end];
-        var fonts_list: std.ArrayListUnmanaged(Font) = .{};
+        var fonts_list: std.ArrayListUnmanaged(Font) = .empty;
         errdefer fonts_list.deinit(book.allocator);
         var i: usize = 0;
         while (std.mem.indexOfPos(u8, block, i, "<font")) |font_pos| {
@@ -3396,7 +3406,7 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
     if (std.mem.indexOf(u8, xml, "<fills")) |fp| {
         const fp_end = std.mem.indexOfPos(u8, xml, fp, "</fills>") orelse xml.len;
         const block = xml[fp..fp_end];
-        var fills_list: std.ArrayListUnmanaged(Fill) = .{};
+        var fills_list: std.ArrayListUnmanaged(Fill) = .empty;
         errdefer fills_list.deinit(book.allocator);
         var i: usize = 0;
         while (std.mem.indexOfPos(u8, block, i, "<fill")) |fill_pos| {
@@ -3435,7 +3445,7 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
     if (std.mem.indexOf(u8, xml, "<borders")) |bp| {
         const bp_end = std.mem.indexOfPos(u8, xml, bp, "</borders>") orelse xml.len;
         const block = xml[bp..bp_end];
-        var borders_list: std.ArrayListUnmanaged(Border) = .{};
+        var borders_list: std.ArrayListUnmanaged(Border) = .empty;
         errdefer borders_list.deinit(book.allocator);
         var i: usize = 0;
         while (std.mem.indexOfPos(u8, block, i, "<border")) |border_pos| {
@@ -3509,15 +3519,15 @@ fn parseStyles(book: *Book, xml: []const u8) !void {
     const xfs_end = std.mem.indexOfPos(u8, xml, xfs_pos, "</cellXfs>") orelse return;
     const xfs_block = xml[xfs_pos..xfs_end];
 
-    var ids: std.ArrayListUnmanaged(u32) = .{};
+    var ids: std.ArrayListUnmanaged(u32) = .empty;
     errdefer ids.deinit(book.allocator);
-    var font_ids: std.ArrayListUnmanaged(u32) = .{};
+    var font_ids: std.ArrayListUnmanaged(u32) = .empty;
     errdefer font_ids.deinit(book.allocator);
-    var fill_ids: std.ArrayListUnmanaged(u32) = .{};
+    var fill_ids: std.ArrayListUnmanaged(u32) = .empty;
     errdefer fill_ids.deinit(book.allocator);
-    var border_ids: std.ArrayListUnmanaged(u32) = .{};
+    var border_ids: std.ArrayListUnmanaged(u32) = .empty;
     errdefer border_ids.deinit(book.allocator);
-    var alignments: std.ArrayListUnmanaged(Alignment) = .{};
+    var alignments: std.ArrayListUnmanaged(Alignment) = .empty;
     errdefer alignments.deinit(book.allocator);
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, xfs_block, i, "<xf")) |xp| {
@@ -3803,7 +3813,7 @@ pub fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
         break :blk @min(claimed, sst_xml.len / 5);
     };
 
-    var strings: std.ArrayListUnmanaged([]const u8) = .{};
+    var strings: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer strings.deinit(book.allocator);
     try strings.ensureTotalCapacity(book.allocator, hint);
     const arena_alloc = book.sst_arena.allocator();
@@ -4036,8 +4046,8 @@ fn parseSharedStringsLazy(book: *Book, sst_xml: []u8) !void {
         break :blk @min(claimed, sst_xml.len / 5);
     };
 
-    var offsets: std.ArrayListUnmanaged(usize) = .{};
-    var lengths: std.ArrayListUnmanaged(usize) = .{};
+    var offsets: std.ArrayListUnmanaged(usize) = .empty;
+    var lengths: std.ArrayListUnmanaged(usize) = .empty;
     errdefer offsets.deinit(book.allocator);
     errdefer lengths.deinit(book.allocator);
     try offsets.ensureTotalCapacity(book.allocator, hint);
@@ -4313,7 +4323,7 @@ fn materialiseSstEntry(book: *Book, idx: usize) ![]const u8 {
 pub fn extractEntryToBuffer(
     allocator: Allocator,
     entry: std.zip.Iterator.Entry,
-    stream: *std.fs.File.Reader,
+    stream: *std.Io.File.Reader,
 ) ![]u8 {
     switch (entry.compression_method) {
         .store, .deflate => {},
@@ -4364,7 +4374,7 @@ const TestTmp = struct {
         self.dir.cleanup();
     }
     pub fn path(self: *TestTmp, alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
-        const d = try self.dir.dir.realpathAlloc(alloc, ".");
+        const d = try self.dir.dir.realPathFileAlloc(io, ".", alloc);
         defer alloc.free(d);
         return std.fs.path.joinZ(alloc, &.{ d, name });
     }
@@ -5038,7 +5048,7 @@ test "openSstLazy: phonetic <rPh> annotations are dropped from materialised text
     // Read the file and rewrite xl/sharedStrings.xml in place to
     // inject a phonetic annotation. Skip the test if anything fails
     // so this stays a regression guard rather than a flaky CI step.
-    const file_data = std.fs.cwd().readFileAlloc(std.testing.allocator, tmp_path, 1 << 20) catch return;
+    const file_data = std.Io.Dir.cwd().readFileAlloc(std.testing.allocator, tmp_path, 1 << 20) catch return;
     defer std.testing.allocator.free(file_data);
 
     // For simplicity, rebuild a workbook with the canonical SST
@@ -6089,7 +6099,7 @@ test "getAttr" {
 
 test "appendDecoded entities" {
     const alloc = std.testing.allocator;
-    var buf: std.ArrayListUnmanaged(u8) = .{};
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(alloc);
     try appendDecoded(alloc, &buf, "Smith &amp; Co &lt;HQ&gt; &#233;");
     try std.testing.expectEqualStrings("Smith & Co <HQ> é", buf.items);
@@ -6216,7 +6226,7 @@ test "fuzz appendDecoded" {
     var buf: [512]u8 = undefined;
     for (0..iters) |_| {
         const input = randomInput(rng, &buf);
-        var out: std.ArrayListUnmanaged(u8) = .{};
+        var out: std.ArrayListUnmanaged(u8) = .empty;
         defer out.deinit(std.testing.allocator);
         appendDecoded(std.testing.allocator, &out, input) catch {};
     }
@@ -6272,7 +6282,12 @@ test "fuzz extractVValue" {
 // @embedFile so the test binary stays self-contained — no runtime
 // filesystem access required.
 
-fn fuzzParseSharedStringsTarget(_: void, input: []const u8) anyerror!void {
+fn fuzzParseSharedStringsTarget(_: void, smith: *std.testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    // 4 KiB matches the PRNG harness's scratch bound, so a crash
+    // found here reproduces against the same input shape.
+    var smith_buf: [4096]u8 = undefined;
+    const input = smith_buf[0..smith.slice(&smith_buf)];
     var book: Book = .{
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
@@ -6304,7 +6319,12 @@ test "fuzz parseSharedStrings — coverage-guided" {
     });
 }
 
-fn fuzzParseWorkbookSheetsTarget(_: void, input: []const u8) anyerror!void {
+fn fuzzParseWorkbookSheetsTarget(_: void, smith: *std.testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    // 4 KiB matches the PRNG harness's scratch bound, so a crash
+    // found here reproduces against the same input shape.
+    var smith_buf: [4096]u8 = undefined;
+    const input = smith_buf[0..smith.slice(&smith_buf)];
     // The workbook parser also wants a rels XML alongside the
     // workbook bytes. Use a fixed minimal rels so the fuzzer can
     // mutate the workbook side without losing coverage on the rels
@@ -6724,14 +6744,14 @@ fn consumeAllRows(alloc: std.mem.Allocator, shared_strings: []const []const u8, 
         .pos = 0,
         .shared_strings = shared_strings,
         .allocator = alloc,
-        .row_cells = .{},
-        .row_styles = .{},
-        .row_date_types = .{},
-        .row_error_strings = .{},
-        .row_formula_strings = .{},
-        .row_formula_refs = .{},
+        .row_cells = .empty,
+        .row_styles = .empty,
+        .row_date_types = .empty,
+        .row_error_strings = .empty,
+        .row_formula_strings = .empty,
+        .row_formula_refs = .empty,
         .shared_si_to_base_ref = .{},
-        .array_ranges = .{},
+        .array_ranges = .empty,
         .arena = std.heap.ArenaAllocator.init(alloc),
     };
     defer rows.deinit();
@@ -6775,13 +6795,16 @@ test "fuzz appendDecoded mutations" {
     var dst: [512]u8 = undefined;
     for (0..iters) |_| {
         const input = mutate(rng, entity_template, &dst);
-        var out: std.ArrayListUnmanaged(u8) = .{};
+        var out: std.ArrayListUnmanaged(u8) = .empty;
         defer out.deinit(std.testing.allocator);
         appendDecoded(std.testing.allocator, &out, input) catch {};
     }
 }
 
 test "fuzz Book.open against arbitrary bytes" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Almost every byte-string is rejected at the zip signature check,
     // but the error path itself must be crash-free. A small fraction
     // of inputs will accidentally pass the zip header and exercise the
@@ -6796,7 +6819,7 @@ test "fuzz Book.open against arbitrary bytes" {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         tmp.dir.writeFile(.{ .sub_path = "fuzz.xlsx", .data = input }) catch continue;
-        const path = tmp.dir.realpathAlloc(std.testing.allocator, "fuzz.xlsx") catch continue;
+        const path = tmp.dir.realPathFileAlloc(io, "fuzz.xlsx", std.testing.allocator) catch continue;
         defer std.testing.allocator.free(path);
 
         var book = Book.open(std.testing.allocator, path) catch continue;
@@ -6872,7 +6895,7 @@ test "fuzz Rows.next on synthetic cells with out-of-range SST indices" {
     // `<v>` value is a random u32 (likely out-of-range). Rows.next
     // must either surface a MalformedXml error or return an empty
     // slice — never crash.
-    var sheet_xml_buf: std.ArrayListUnmanaged(u8) = .{};
+    var sheet_xml_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer sheet_xml_buf.deinit(std.testing.allocator);
 
     for (0..iters) |_| {
@@ -6895,14 +6918,14 @@ test "fuzz Rows.next on synthetic cells with out-of-range SST indices" {
             .pos = 0,
             .shared_strings = &sst_entries,
             .allocator = std.testing.allocator,
-            .row_cells = .{},
-            .row_styles = .{},
-            .row_date_types = .{},
-            .row_error_strings = .{},
-            .row_formula_strings = .{},
-            .row_formula_refs = .{},
+            .row_cells = .empty,
+            .row_styles = .empty,
+            .row_date_types = .empty,
+            .row_error_strings = .empty,
+            .row_formula_strings = .empty,
+            .row_formula_refs = .empty,
             .shared_si_to_base_ref = .{},
-            .array_ranges = .{},
+            .array_ranges = .empty,
             .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
         };
         defer rows.deinit();
@@ -6931,14 +6954,14 @@ test "Rows.currentRowNumber recovers from cell r attr when <row r> is absent/bad
         .pos = 0,
         .shared_strings = &.{},
         .allocator = std.testing.allocator,
-        .row_cells = .{},
-        .row_styles = .{},
-        .row_date_types = .{},
-        .row_error_strings = .{},
-        .row_formula_strings = .{},
-        .row_formula_refs = .{},
+        .row_cells = .empty,
+        .row_styles = .empty,
+        .row_date_types = .empty,
+        .row_error_strings = .empty,
+        .row_formula_strings = .empty,
+        .row_formula_refs = .empty,
         .shared_si_to_base_ref = .{},
-        .array_ranges = .{},
+        .array_ranges = .empty,
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
@@ -6965,14 +6988,14 @@ test "Rows.currentRowNumber recovers cell-r with non-space whitespace after <c" 
         .pos = 0,
         .shared_strings = &.{},
         .allocator = std.testing.allocator,
-        .row_cells = .{},
-        .row_styles = .{},
-        .row_date_types = .{},
-        .row_error_strings = .{},
-        .row_formula_strings = .{},
-        .row_formula_refs = .{},
+        .row_cells = .empty,
+        .row_styles = .empty,
+        .row_date_types = .empty,
+        .row_error_strings = .empty,
+        .row_formula_strings = .empty,
+        .row_formula_refs = .empty,
         .shared_si_to_base_ref = .{},
-        .array_ranges = .{},
+        .array_ranges = .empty,
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
@@ -6999,14 +7022,14 @@ test "Rows.currentRowNumber falls through to yield count when row body is empty"
         .pos = 0,
         .shared_strings = &.{},
         .allocator = std.testing.allocator,
-        .row_cells = .{},
-        .row_styles = .{},
-        .row_date_types = .{},
-        .row_error_strings = .{},
-        .row_formula_strings = .{},
-        .row_formula_refs = .{},
+        .row_cells = .empty,
+        .row_styles = .empty,
+        .row_date_types = .empty,
+        .row_error_strings = .empty,
+        .row_formula_strings = .empty,
+        .row_formula_refs = .empty,
         .shared_si_to_base_ref = .{},
-        .array_ranges = .{},
+        .array_ranges = .empty,
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
@@ -7281,14 +7304,14 @@ test "array-formula spread: base + slaves resolve via formula_refs" {
         .pos = 0,
         .shared_strings = &.{},
         .allocator = std.testing.allocator,
-        .row_cells = .{},
-        .row_styles = .{},
-        .row_date_types = .{},
-        .row_error_strings = .{},
-        .row_formula_strings = .{},
-        .row_formula_refs = .{},
+        .row_cells = .empty,
+        .row_styles = .empty,
+        .row_date_types = .empty,
+        .row_error_strings = .empty,
+        .row_formula_strings = .empty,
+        .row_formula_refs = .empty,
         .shared_si_to_base_ref = .{},
-        .array_ranges = .{},
+        .array_ranges = .empty,
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
@@ -7350,14 +7373,14 @@ test "array-formula spread: out-of-order rows still resolve slaves" {
         .pos = 0,
         .shared_strings = &.{},
         .allocator = std.testing.allocator,
-        .row_cells = .{},
-        .row_styles = .{},
-        .row_date_types = .{},
-        .row_error_strings = .{},
-        .row_formula_strings = .{},
-        .row_formula_refs = .{},
+        .row_cells = .empty,
+        .row_styles = .empty,
+        .row_date_types = .empty,
+        .row_error_strings = .empty,
+        .row_formula_strings = .empty,
+        .row_formula_refs = .empty,
         .shared_si_to_base_ref = .{},
-        .array_ranges = .{},
+        .array_ranges = .empty,
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
@@ -7390,14 +7413,14 @@ test "array-formula spread: own <f> on a cell inside the range wins" {
         .pos = 0,
         .shared_strings = &.{},
         .allocator = std.testing.allocator,
-        .row_cells = .{},
-        .row_styles = .{},
-        .row_date_types = .{},
-        .row_error_strings = .{},
-        .row_formula_strings = .{},
-        .row_formula_refs = .{},
+        .row_cells = .empty,
+        .row_styles = .empty,
+        .row_date_types = .empty,
+        .row_error_strings = .empty,
+        .row_formula_strings = .empty,
+        .row_formula_refs = .empty,
         .shared_si_to_base_ref = .{},
-        .array_ranges = .{},
+        .array_ranges = .empty,
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
@@ -7431,14 +7454,14 @@ test "array-formula spread: base without <v> still spreads to slaves" {
         .pos = 0,
         .shared_strings = &.{},
         .allocator = std.testing.allocator,
-        .row_cells = .{},
-        .row_styles = .{},
-        .row_date_types = .{},
-        .row_error_strings = .{},
-        .row_formula_strings = .{},
-        .row_formula_refs = .{},
+        .row_cells = .empty,
+        .row_styles = .empty,
+        .row_date_types = .empty,
+        .row_error_strings = .empty,
+        .row_formula_strings = .empty,
+        .row_formula_refs = .empty,
         .shared_si_to_base_ref = .{},
-        .array_ranges = .{},
+        .array_ranges = .empty,
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();

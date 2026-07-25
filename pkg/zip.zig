@@ -84,7 +84,7 @@ pub const Archive = struct {
     allocator: Allocator,
     out: *std.ArrayListUnmanaged(u8),
     /// Per-entry info accumulated for the central directory.
-    entries: std.ArrayListUnmanaged(EntryMeta) = .{},
+    entries: std.ArrayListUnmanaged(EntryMeta) = .empty,
 
     const EntryMeta = struct {
         /// Owned copy (arena would also work but the Archive's lifetime
@@ -134,7 +134,7 @@ pub const Archive = struct {
         // If deflate still inflates a ≥ 1 KB payload (already-compressed
         // or near-random content), fall back to STORED.
         const COMPRESS_MIN: usize = 1024;
-        var compressed: std.ArrayListUnmanaged(u8) = .{};
+        var compressed: std.ArrayListUnmanaged(u8) = .empty;
         defer compressed.deinit(alloc);
 
         var method: std.zip.CompressionMethod = .deflate;
@@ -287,7 +287,7 @@ fn stubDeflate(
 }
 
 test "Archive: empty archive finalises with EOCD only" {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(testing.allocator);
     var arc = Archive.init(testing.allocator, &buf);
     defer arc.deinit();
@@ -298,7 +298,7 @@ test "Archive: empty archive finalises with EOCD only" {
 }
 
 test "Archive: single small entry round-trips via std.zip.Iterator" {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(testing.allocator);
     var arc = Archive.init(testing.allocator, &buf);
     defer arc.deinit();
@@ -324,7 +324,7 @@ test "Archive: single small entry round-trips via std.zip.Iterator" {
 }
 
 test "Archive: multiple entries preserve order" {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(testing.allocator);
     var arc = Archive.init(testing.allocator, &buf);
     defer arc.deinit();
@@ -340,7 +340,7 @@ test "Archive: multiple entries preserve order" {
 }
 
 test "Archive: stub deflate falls back to STORED" {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(testing.allocator);
     var arc = Archive.init(testing.allocator, &buf);
     defer arc.deinit();

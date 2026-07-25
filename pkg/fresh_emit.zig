@@ -119,7 +119,7 @@ pub fn emitArchiveBytes(
 
     // 1. [Content_Types].xml
     {
-        var ct: std.ArrayListUnmanaged(u8) = .{};
+        var ct: std.ArrayListUnmanaged(u8) = .empty;
         defer ct.deinit(allocator);
         try ct.appendSlice(allocator, CONTENT_TYPES_DEFAULTS);
         var any_comments = false;
@@ -184,7 +184,7 @@ pub fn emitArchiveBytes(
 
     // 4. xl/_rels/workbook.xml.rels
     {
-        var rels: std.ArrayListUnmanaged(u8) = .{};
+        var rels: std.ArrayListUnmanaged(u8) = .empty;
         defer rels.deinit(allocator);
         try rels.appendSlice(allocator, WORKBOOK_RELS_HEAD);
         for (inputs.sheets, 0..) |_, i| {
@@ -212,7 +212,7 @@ pub fn emitArchiveBytes(
 
     // 5. xl/worksheets/sheetN.xml — per-sheet via sheet_plan emitter.
     for (inputs.sheets, 0..) |s, i| {
-        var full: std.ArrayListUnmanaged(u8) = .{};
+        var full: std.ArrayListUnmanaged(u8) = .empty;
         defer full.deinit(allocator);
 
         const st = s.state;
@@ -315,7 +315,7 @@ pub fn emitArchiveBytes(
             hyperlinks_view[k] = .{ .range = h.range, .url = h.url };
         }
 
-        var rels: std.ArrayListUnmanaged(u8) = .{};
+        var rels: std.ArrayListUnmanaged(u8) = .empty;
         defer rels.deinit(allocator);
         const wrote = try sheet_plan.emitSheetRels(
             allocator,
@@ -342,14 +342,14 @@ pub fn emitArchiveBytes(
             comments_view[k] = .{ .ref = c.ref, .author = c.author, .text = c.text };
         }
 
-        var cx: std.ArrayListUnmanaged(u8) = .{};
+        var cx: std.ArrayListUnmanaged(u8) = .empty;
         defer cx.deinit(allocator);
         try sheet_plan.emitCommentsXml(allocator, &cx, comments_view);
         var cn_buf: [64]u8 = undefined;
         const cn = try std.fmt.bufPrint(&cn_buf, "xl/comments{d}.xml", .{i + 1});
         try arc.addEntry(cn, cx.items, deflate);
 
-        var vml: std.ArrayListUnmanaged(u8) = .{};
+        var vml: std.ArrayListUnmanaged(u8) = .empty;
         defer vml.deinit(allocator);
         try sheet_plan.emitVmlDrawingXml(allocator, &vml, comments_view);
         var vml_buf: [64]u8 = undefined;
@@ -359,7 +359,7 @@ pub fn emitArchiveBytes(
 
     // 6. xl/sharedStrings.xml
     {
-        var sst: std.ArrayListUnmanaged(u8) = .{};
+        var sst: std.ArrayListUnmanaged(u8) = .empty;
         defer sst.deinit(allocator);
         const unique_count = inputs.sst_plan.new_strings.items.len +
             inputs.sst_plan.new_rich_strings.items.len;
@@ -404,7 +404,7 @@ pub fn emitArchiveBytes(
 
     // 7. xl/styles.xml — only when caller registered any styles.
     if (have_styles) {
-        var styles_buf: std.ArrayListUnmanaged(u8) = .{};
+        var styles_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer styles_buf.deinit(allocator);
         // StylesPlan.emit may return error.OutOfMemory or its broader
         // validation set; bubble through.
@@ -419,18 +419,21 @@ pub fn emitArchiveBytes(
 /// to `path`, truncating any existing file.
 pub fn saveArchiveToPath(
     allocator: Allocator,
+    io: std.Io,
     path: []const u8,
     inputs: ArchiveInputs,
     deflate: DeflateFn,
 ) !void {
-    var zip_buf: std.ArrayListUnmanaged(u8) = .{};
+    var zip_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer zip_buf.deinit(allocator);
 
     try emitArchiveBytes(allocator, &zip_buf, inputs, deflate);
 
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(zip_buf.items);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = zip_buf.items,
+        .flags = .{ .truncate = true },
+    });
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────
@@ -485,7 +488,7 @@ test "fresh_emit: empty single-sheet archive — no styles, no SST entries" {
     var workbook_xml_plan: workbook_xml_plan_mod.WorkbookXmlPlan = .{};
     defer workbook_xml_plan.deinit(a);
 
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(a);
 
     try emitArchiveBytes(a, &out, .{
@@ -513,7 +516,7 @@ test "fresh_emit: NoSheets refusal" {
     var workbook_xml_plan: workbook_xml_plan_mod.WorkbookXmlPlan = .{};
     defer workbook_xml_plan.deinit(a);
 
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(a);
 
     const result = emitArchiveBytes(a, &out, .{

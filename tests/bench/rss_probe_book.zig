@@ -44,5 +44,5 @@ pub fn main() !void {
 
     var stdout_buf: [64]u8 = undefined;
     const out = try std.fmt.bufPrint(&stdout_buf, "{d}\n", .{delta});
-    _ = try std.fs.File.stdout().writeAll(out);
+    _ = try std.Io.File.stdout().writeAll(out);
 }

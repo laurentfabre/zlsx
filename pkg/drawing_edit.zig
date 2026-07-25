@@ -59,7 +59,7 @@ pub fn applyEditToDrawing(
     index: u32,
     kind: EditKind,
 ) Error![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
     var i: usize = 0;

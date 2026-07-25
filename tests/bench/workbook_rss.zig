@@ -54,7 +54,7 @@ fn currentRss() !u64 {
 fn findProbe(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     var path_buf: [256]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "zig-out/bin/{s}", .{name});
-    std.fs.cwd().access(path, .{}) catch return error.ProbeBinaryNotFound;
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.ProbeBinaryNotFound;
     return try allocator.dupe(u8, path);
 }
 
@@ -99,6 +99,9 @@ fn runSynthProbe(allocator: std.mem.Allocator, exe: []const u8, out_path: []cons
 }
 
 test "RSS gate: Workbook.openLazy ≤ 2× Book.openLazy on 100k × 10 fixture" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Probe RSS support up front so an unsupported platform skips
     // before the synth runs.
     _ = currentRss() catch return error.SkipZigTest;
@@ -116,7 +119,7 @@ test "RSS gate: Workbook.openLazy ≤ 2× Book.openLazy on 100k × 10 fixture" {
     // 2. Generate fixture (cached). On a fresh checkout this is the
     //    longest step; the probe self-skips when the file is present.
     try runSynthProbe(allocator, synth_exe, FIXTURE_PATH);
-    const fixture_size = (try std.fs.cwd().statFile(FIXTURE_PATH)).size;
+    const fixture_size = (try std.Io.Dir.cwd().statFile(io, FIXTURE_PATH)).size;
     std.debug.print(
         "[rss-gate] fixture: {s} ({d:.2} MB)\n",
         .{ FIXTURE_PATH, @as(f64, @floatFromInt(fixture_size)) / (1024.0 * 1024.0) },

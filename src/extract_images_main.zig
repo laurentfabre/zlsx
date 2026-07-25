@@ -33,7 +33,7 @@ pub fn main() !u8 {
     defer std.process.argsFree(alloc, args);
 
     var stderr_buf: [256]u8 = undefined;
-    var stderr_w = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_w = std.Io.File.stderr().writer(&stderr_buf);
     const err = &stderr_w.interface;
     defer err.flush() catch {};
 
@@ -66,18 +66,18 @@ pub fn main() !u8 {
     };
     defer store.deinit();
 
-    std.fs.cwd().makePath(out_dir) catch |e| {
+    std.Io.Dir.cwd().createDirPath(io, out_dir) catch |e| {
         try err.print("cannot create '{s}': {s}\n", .{ out_dir, @errorName(e) });
         return 5;
     };
-    var dir = std.fs.cwd().openDir(out_dir, .{}) catch |e| {
+    var dir = std.Io.Dir.cwd().openDir(io, out_dir, .{}) catch |e| {
         try err.print("cannot open '{s}': {s}\n", .{ out_dir, @errorName(e) });
         return 5;
     };
     defer dir.close();
 
     var stdout_buf: [256]u8 = undefined;
-    var stdout_w = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_w = std.Io.File.stdout().writer(&stdout_buf);
     const out = &stdout_w.interface;
     defer out.flush() catch {};
 

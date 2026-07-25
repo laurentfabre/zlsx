@@ -1600,7 +1600,7 @@ pub fn main() u8 {
         // good luck figuring out what."
         if (classified == 1) {
             var stderr_buf: [128]u8 = undefined;
-            var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+            var stderr_file = std.Io.File.stderr().writer(&stderr_buf);
             const err = &stderr_file.interface;
             err.print("zlsx: {s}\n", .{@errorName(e)}) catch {};
             err.flush() catch {};
@@ -1630,7 +1630,7 @@ fn runMain() !u8 {
     defer std.process.argsFree(alloc, raw_args);
 
     var stdout_buf: [16 * 1024]u8 = undefined;
-    var stdout_file = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_file = std.Io.File.stdout().writer(&stdout_buf);
     const out = &stdout_file.interface;
     // iter60a: flush on normal exit AND on a signal-triggered stop.
     // Per-record flushes below surface SIGPIPE promptly; this trailing
@@ -1641,7 +1641,7 @@ fn runMain() !u8 {
     defer out.flush() catch {};
 
     var stderr_buf: [4 * 1024]u8 = undefined;
-    var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_file = std.Io.File.stderr().writer(&stderr_buf);
     const err = &stderr_file.interface;
     defer err.flush() catch {};
 
@@ -2057,7 +2057,7 @@ fn runRowsOnSheetCore(
     // Lifetime is this function's scope; row iteration yields fresh
     // cell buffers per row, so we must copy header cell contents out
     // before the next `rows.next()` call reuses the buffer.
-    var header_keys: std.ArrayListUnmanaged([]u8) = .{};
+    var header_keys: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
         for (header_keys.items) |k| alloc.free(k);
         header_keys.deinit(alloc);
@@ -2086,24 +2086,24 @@ fn runRowsOnSheetCore(
     // contract (cells[i] lives in column i) requires we write `.empty`
     // into out-of-range columns rather than compacting the slice.
     // Only allocated when --range is actually present.
-    var masked: std.ArrayListUnmanaged(xlsx.Cell) = .{};
+    var masked: std.ArrayListUnmanaged(xlsx.Cell) = .empty;
     defer masked.deinit(alloc);
     // iter59b-4: parallel masked style indices — lives next to `masked`
     // so `masked.items[i]` and `masked_styles.items[i]` stay paired
     // through every view transformation below. Only populated when
     // --range is present AND we're on the envelope-positional path.
-    var masked_styles: std.ArrayListUnmanaged(?u32) = .{};
+    var masked_styles: std.ArrayListUnmanaged(?u32) = .empty;
     defer masked_styles.deinit(alloc);
     // Parallel masked date-type flags — same lockstep invariant as
     // `masked_styles`, wired through `writeRowEnvelope` so the sliced
     // envelope still surfaces `t:"date"` for date-styled numerics.
-    var masked_dates: std.ArrayListUnmanaged(bool) = .{};
+    var masked_dates: std.ArrayListUnmanaged(bool) = .empty;
     defer masked_dates.deinit(alloc);
     // iter61-c: parallel masked error-string slice. Same lockstep
     // invariant as `masked_styles` / `masked_dates`, wired through
     // `writeRowEnvelope` so the sliced envelope still surfaces
     // `t:"error"` for cells whose source `<c>` was `t="e"`.
-    var masked_errors: std.ArrayListUnmanaged(?[]const u8) = .{};
+    var masked_errors: std.ArrayListUnmanaged(?[]const u8) = .empty;
     defer masked_errors.deinit(alloc);
     // iter61-b: parallel masked formula-string + formula-ref slices.
     // Same lockstep invariant — wired through `writeRowEnvelope` so
@@ -2111,9 +2111,9 @@ fn runRowsOnSheetCore(
     // cells whose source `<c>` carried `<f>`. The two are mutually
     // exclusive per cell (a cell either has its own formula text or
     // is a shared-formula slave referencing one).
-    var masked_formulas: std.ArrayListUnmanaged(?[]const u8) = .{};
+    var masked_formulas: std.ArrayListUnmanaged(?[]const u8) = .empty;
     defer masked_formulas.deinit(alloc);
-    var masked_formula_refs: std.ArrayListUnmanaged(?xlsx.CellRef) = .{};
+    var masked_formula_refs: std.ArrayListUnmanaged(?xlsx.CellRef) = .empty;
     defer masked_formula_refs.deinit(alloc);
 
     while (try rows.next()) |cells| {
@@ -3480,7 +3480,7 @@ fn runAppendRowsCommand(
     // Slurp stdin once. NDJSON volumes for append are typically
     // bounded (audit logs, ETL deltas); refuse > 256 MiB to keep
     // pathological inputs from OOM-ing the process.
-    const stdin = std.fs.File.stdin();
+    const stdin = std.Io.File.stdin();
     var stdin_buf: [8192]u8 = undefined;
     var stdin_reader = stdin.reader(&stdin_buf);
     const all_input = stdin_reader.interface.allocRemaining(alloc, .limited(256 * 1024 * 1024)) catch |e| {
@@ -3928,7 +3928,7 @@ const TestTmp = struct {
         self.dir.cleanup();
     }
     pub fn path(self: *TestTmp, alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
-        const d = try self.dir.dir.realpathAlloc(alloc, ".");
+        const d = try self.dir.dir.realPathFileAlloc(io, ".", alloc);
         defer alloc.free(d);
         return std.fs.path.joinZ(alloc, &.{ d, name });
     }
@@ -7123,14 +7123,14 @@ test "Rows.formulaStrings returns entity-decoded text (iter61-b P2)" {
         .pos = 0,
         .shared_strings = &.{},
         .allocator = std.testing.allocator,
-        .row_cells = .{},
-        .row_styles = .{},
-        .row_date_types = .{},
-        .row_error_strings = .{},
-        .row_formula_strings = .{},
-        .row_formula_refs = .{},
+        .row_cells = .empty,
+        .row_styles = .empty,
+        .row_date_types = .empty,
+        .row_error_strings = .empty,
+        .row_formula_strings = .empty,
+        .row_formula_refs = .empty,
         .shared_si_to_base_ref = .{},
-        .array_ranges = .{},
+        .array_ranges = .empty,
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();

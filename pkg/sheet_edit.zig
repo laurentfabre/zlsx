@@ -38,7 +38,7 @@ pub fn applyColEditToWorksheet(
     col_1based: u32,
     kind: RowEditKind,
 ) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
     var i: usize = 0;
@@ -743,7 +743,7 @@ pub fn applyRowEditToWorksheet(
     row: u32,
     kind: RowEditKind,
 ) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
     var i: usize = 0;

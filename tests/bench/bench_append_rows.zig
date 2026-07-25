@@ -100,6 +100,6 @@ pub fn main() !void {
     );
 
     // Cleanup so repeated bench runs in the same tmpdir don't OOM.
-    std.fs.cwd().deleteFile(src_path) catch {};
-    std.fs.cwd().deleteFile(dst_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, dst_path) catch {};
 }
