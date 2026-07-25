@@ -491,6 +491,28 @@ pub fn build(b: *std.Build) void {
     const package_workbook_tests = b.addTest(.{ .root_module = package_workbook_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_workbook_tests).step);
 
+    // pkg/editor.zig had no test target at all, so its inline tests
+    // were never collected: Zig gathers tests from the root file and
+    // the files it imports *within the same module*, and nothing that
+    // was already a test root reaches editor.zig (workbook.zig does not
+    // import it — the dependency runs the other way). Same module wiring
+    // as the workbook target above, since editor.zig pulls workbook.zig
+    // in as a plain file import.
+    const package_editor_tests_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/editor.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    package_editor_tests_mod.addImport("zlsx", zlsx_mod);
+    package_editor_tests_mod.addImport("zlsx_sst_plan", sst_plan_mod);
+    package_editor_tests_mod.addImport("zlsx_styles_plan", styles_plan_mod);
+    package_editor_tests_mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
+    package_editor_tests_mod.addImport("zlsx_zip", zip_mod);
+    package_editor_tests_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
+    package_editor_tests_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
+    const package_editor_tests = b.addTest(.{ .root_module = package_editor_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(package_editor_tests).step);
+
     // Package-layer fuzz module: pkg/store.zig hosts fuzz targets
     // for decodeXmlEntities + looksExternal. Same fuzz=true flag
     // as src/xlsx.zig's unit_fuzz_mod, separate binary because

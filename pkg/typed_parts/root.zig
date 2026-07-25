@@ -25,6 +25,7 @@ pub const sheet_xml = @import("sheet_xml.zig");
 pub const sst_xml = @import("sst_xml.zig");
 pub const styles_xml = @import("styles_xml.zig");
 pub const theme_xml = @import("theme_xml.zig");
+pub const doc_props_xml = @import("doc_props_xml.zig");
 
 test {
     _ = workbook_xml;
@@ -32,4 +33,5 @@ test {
     _ = sst_xml;
     _ = styles_xml;
     _ = theme_xml;
+    _ = doc_props_xml;
 }

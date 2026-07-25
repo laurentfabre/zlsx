@@ -71,11 +71,15 @@ const workbook_xml_mod = typed_parts.workbook_xml;
 const sheet_xml_mod = typed_parts.sheet_xml;
 const sst_xml_mod = typed_parts.sst_xml;
 const styles_xml_mod = typed_parts.styles_xml;
+const doc_props_mod = typed_parts.doc_props_xml;
 
 /// Re-exported SST extension-plan substrate (B3 iter-wr-1). Definition
 /// moved to `pkg/sst_plan.zig` so `xlsx.Writer` can import the same
 /// types without the cycle that would form via `zlsx → writer.zig →
 /// pkg/workbook.zig → zlsx`.
+pub const DocProps = doc_props_mod.DocProps;
+pub const DocPropsMask = doc_props_mod.Mask;
+
 pub const RichRun = sst_plan_mod.RichRun;
 pub const RichEntry = sst_plan_mod.RichEntry;
 pub const SstExtensionPlan = sst_plan_mod.SstExtensionPlan;
@@ -719,6 +723,68 @@ pub const Workbook = struct {
     pub fn sheetCount(self: *const Workbook) u32 {
         assert(self.worksheets.len == self.workbook.sheets.len);
         return @intCast(self.worksheets.len);
+    }
+
+    /// Typed view over `docProps/core.xml` + `docProps/app.xml`, plus a
+    /// presence flag for `docProps/custom.xml`.
+    ///
+    /// All three parts are optional; a workbook without any of them
+    /// yields a `DocProps` for which `isEmpty()` is true. Returned
+    /// strings borrow from the store's part buffers and stay valid
+    /// until `deinit`.
+    ///
+    /// This is a read of raw parts rather than a cached typed overlay:
+    /// document properties are tiny, touched rarely, and re-parsing on
+    /// demand keeps them out of the open() hot path.
+    pub fn docProps(self: *const Workbook) Error!DocProps {
+        const core = try self.store.part(doc_props_mod.core_part_name);
+        const app = try self.store.part(doc_props_mod.app_part_name);
+        const custom = try self.store.part(doc_props_mod.custom_part_name);
+        return doc_props_mod.parse(
+            if (core) |p| p.bytes else null,
+            if (app) |p| p.bytes else null,
+            custom != null,
+        );
+    }
+
+    /// Rewrite `docProps/core.xml` and `docProps/app.xml` with every
+    /// field the mask targets removed, and (when
+    /// `mask.custom_properties`) drop `docProps/custom.xml` entirely.
+    ///
+    /// Everything else is byte-preserved: only the parts that actually
+    /// carry masked fields are replaced, and within those only the
+    /// matched elements are excised. A workbook with no docProps parts
+    /// is a no-op.
+    ///
+    /// Changes are staged in the PartStore and land on the next `save`.
+    pub fn stripDocProps(self: *Workbook, mask: DocPropsMask) Error!void {
+        const a = self.allocator;
+
+        if (try self.store.part(doc_props_mod.core_part_name)) |core| {
+            const scrubbed = try doc_props_mod.scrubCore(a, core.bytes, mask);
+            defer a.free(scrubbed);
+            // Skip the write when nothing changed so an untouched part
+            // keeps its original compressed bytes in the saved archive.
+            if (!std.mem.eql(u8, scrubbed, core.bytes)) {
+                try self.store.replacePart(doc_props_mod.core_part_name, scrubbed);
+            }
+        }
+
+        if (try self.store.part(doc_props_mod.app_part_name)) |app| {
+            const scrubbed = try doc_props_mod.scrubApp(a, app.bytes, mask);
+            defer a.free(scrubbed);
+            if (!std.mem.eql(u8, scrubbed, app.bytes)) {
+                try self.store.replacePart(doc_props_mod.app_part_name, scrubbed);
+            }
+        }
+
+        if (mask.custom_properties) {
+            // Custom properties are arbitrary user-defined key/value
+            // pairs, so there is nothing to selectively scrub — the
+            // part goes wholesale, along with its content-type override
+            // and the workbook relationship pointing at it.
+            try self.store.removePart(doc_props_mod.custom_part_name);
+        }
     }
 
     /// Borrow a `Worksheet` handle by zero-based index. Materialises

@@ -65,5 +65,10 @@ pub const ImageCellAnchor = drawing_emit_mod.ImageCellAnchor;
 /// Editor — load-modify-save overlay (relocated to pkg/ in B2 iter-er-0).
 const editor_mod = @import("editor.zig");
 pub const Editor = editor_mod.Editor;
+
+/// Document-properties view + scrub mask, re-exported so consumers can
+/// name the types without reaching into `typed_parts`.
+pub const DocProps = workbook_mod.DocProps;
+pub const DocPropsMask = workbook_mod.DocPropsMask;
 pub const CellSpan = editor_mod.CellSpan;
 pub const WorksheetSpans = editor_mod.WorksheetSpans;

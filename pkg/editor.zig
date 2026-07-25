@@ -644,6 +644,25 @@ pub const Editor = struct {
     /// Errors: `error.InvalidSheetName` (empty / >31 chars / banned
     /// characters), `error.DuplicateSheetName`, plus any propagated
     /// allocator errors.
+    /// Typed view over the workbook's `docProps/*` metadata.
+    ///
+    /// Delegates to `Workbook.docProps`. Returned strings borrow from
+    /// the store and stay valid until the Editor is deinitialised.
+    pub fn docProps(self: *const Editor) !workbook_mod.DocProps {
+        return self.workbook.docProps();
+    }
+
+    /// Strip identifying document metadata, staged for the next `save`.
+    ///
+    /// This is the counterpart to cell masking: without it, a workbook
+    /// whose cells have been pseudonymised still ships `dc:creator`,
+    /// `cp:lastModifiedBy` and `Company` in the archive, untouched by
+    /// every edit because zlsx used to copy those parts through
+    /// verbatim. Everything the mask does not name is byte-preserved.
+    pub fn stripDocProps(self: *Editor, mask: workbook_mod.DocPropsMask) !void {
+        return self.workbook.stripDocProps(mask);
+    }
+
     pub fn addSheet(self: *Editor, name: []const u8) !u32 {
         if (self.sheet_paths.len >= std.math.maxInt(u32)) return error.TooManySheets;
 
@@ -1179,7 +1198,10 @@ test "Editor: byte-identical passthrough (iter-lms-1)" {
         defer f.close(io);
         const buf = try std.testing.allocator.alloc(u8, @intCast((try f.stat(io)).size));
         defer std.testing.allocator.free(buf);
-        _ = try f.readAll(buf);
+        {
+            var fr = f.reader(io, &.{});
+            try fr.interface.readSliceAll(buf);
+        }
         Sha256.hash(buf, &src_hash, .{});
     }
 
@@ -1197,7 +1219,10 @@ test "Editor: byte-identical passthrough (iter-lms-1)" {
         defer f.close(io);
         const buf = try std.testing.allocator.alloc(u8, @intCast((try f.stat(io)).size));
         defer std.testing.allocator.free(buf);
-        _ = try f.readAll(buf);
+        {
+            var fr = f.reader(io, &.{});
+            try fr.interface.readSliceAll(buf);
+        }
         Sha256.hash(buf, &dst_hash, .{});
     }
     try std.testing.expectEqualSlices(u8, &src_hash, &dst_hash);
@@ -3573,15 +3598,15 @@ test "Editor: scanWorksheet rejects out-of-range sheet idx" {
 /// Build a 2-sheet xlsx via the writer (which produces a non-DataDescriptor
 /// ZIP that Editor accepts) and return its temp path. Caller frees the
 /// returned slice and is responsible for the TestTmp lifecycle.
-fn buildIterEr1Fixture(tt: *TestTmp, alloc: std.mem.Allocator) ![:0]u8 {
-    const path = try tt.path(alloc, "iter_er_1.xlsx");
+fn buildIterEr1Fixture(io: std.Io, tt: *TestTmp, alloc: std.mem.Allocator) ![:0]u8 {
+    const path = try tt.path(alloc, io, "iter_er_1.xlsx");
     var w = xlsx.Writer.init(alloc);
     defer w.deinit();
     var s1 = try w.addSheet("Alpha");
     try s1.writeRow(&.{ .{ .string = "h" }, .{ .integer = 1 } });
     var s2 = try w.addSheet("Beta");
     try s2.writeRow(&.{ .{ .string = "x" }, .{ .number = 2.5 } });
-    try w.save(path);
+    try w.save(io, path);
     return path;
 }
 
@@ -3591,7 +3616,7 @@ test "iter-er-1: Editor.open populates a Workbook view (sheet count + names matc
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const path = try buildIterEr1Fixture(&tt, std.testing.allocator);
+    const path = try buildIterEr1Fixture(io, &tt, std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     var ed = try Editor.open(std.testing.allocator, io, path);
@@ -3621,7 +3646,7 @@ test "iter-er-1: Editor.deinit cleans up Workbook + everything else (no leaks)" 
     // outlives the editor.
     var tt = TestTmp.init();
     defer tt.deinit();
-    const path = try buildIterEr1Fixture(&tt, std.testing.allocator);
+    const path = try buildIterEr1Fixture(io, &tt, std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     {
@@ -3638,7 +3663,7 @@ test "iter-er-1: Editor.workbook.cellByRef matches Book.cell for known cells" {
     // accessor finds cells the writer emitted.
     var tt = TestTmp.init();
     defer tt.deinit();
-    const path = try buildIterEr1Fixture(&tt, std.testing.allocator);
+    const path = try buildIterEr1Fixture(io, &tt, std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     var ed = try Editor.open(std.testing.allocator, io, path);
@@ -3658,14 +3683,14 @@ test "iter-er-1: Editor.workbook.cellByRef matches Book.cell for known cells" {
 // RowEditUnsafe refusals on sheets carrying <autoFilter>).
 // ---------------------------------------------------------------------------
 
-fn buildAutoFilterFixture(path: []const u8) !void {
+fn buildAutoFilterFixture(io: std.Io, path: []const u8) !void {
     var w = xlsx.Writer.init(std.testing.allocator);
     defer w.deinit();
     var s = try w.addSheet("S");
     try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 }, .{ .integer = 4 } });
     try s.writeRow(&.{ .{ .integer = 5 }, .{ .integer = 6 }, .{ .integer = 7 }, .{ .integer = 8 } });
     try s.setAutoFilter("B1:D2");
-    try w.save(path);
+    try w.save(io, path);
 }
 
 fn assertSheetXmlContains(ed: *Editor, needle: []const u8) !void {
@@ -3687,7 +3712,7 @@ test "Editor: insertRow on a sheet carrying <autoFilter> rewrites range" {
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "af_insrow_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildAutoFilterFixture(src_path);
+    try buildAutoFilterFixture(io, src_path);
     {
         var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
@@ -3710,7 +3735,7 @@ test "Editor: insertColumn on a sheet carrying <autoFilter> rewrites range" {
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "af_inscol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildAutoFilterFixture(src_path);
+    try buildAutoFilterFixture(io, src_path);
     {
         var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
@@ -3733,7 +3758,7 @@ test "Editor: deleteRow on a sheet carrying <autoFilter> rewrites range" {
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "af_delrow_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildAutoFilterFixture(src_path);
+    try buildAutoFilterFixture(io, src_path);
     {
         var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
@@ -3756,7 +3781,7 @@ test "Editor: deleteColumn on a sheet carrying <autoFilter> shrinks range" {
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "af_delcol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildAutoFilterFixture(src_path);
+    try buildAutoFilterFixture(io, src_path);
     {
         var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
@@ -3786,7 +3811,7 @@ fn buildPictureFixture(io: std.Io, path: []const u8) !void {
         var s = try w.addSheet("S");
         try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 } });
         try s.writeRow(&.{ .{ .integer = 3 }, .{ .integer = 4 } });
-        try w.save(path);
+        try w.save(io, path);
     }
 
     // Stage 2: splice `<picture r:id="rId99"/>` before `</worksheet>` in
@@ -3795,7 +3820,7 @@ fn buildPictureFixture(io: std.Io, path: []const u8) !void {
     // sheet's rels; that's fine for this test — the guard is what we're
     // exercising, and ECMA-376 readers tolerate dangling rels by
     // ignoring the picture element rather than failing the file.
-    var store = try store_mod.PartStore.open(std.testing.allocator, path);
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, path);
     defer store.deinit();
     const sheet_name = "xl/worksheets/sheet1.xml";
     const orig = (try store.part(sheet_name)) orelse return error.MissingSheet;
@@ -3821,7 +3846,7 @@ test "Editor: insertRow on sheet with `<picture>` background no longer refused" 
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "pic_insrow_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildPictureFixture(src_path);
+    try buildPictureFixture(io, src_path);
     {
         var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
@@ -3844,7 +3869,7 @@ test "Editor: insertColumn on sheet with `<picture>` background no longer refuse
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "pic_inscol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildPictureFixture(src_path);
+    try buildPictureFixture(io, src_path);
     {
         var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
@@ -3876,23 +3901,23 @@ const tiny_png_1x1_for_editor = [_]u8{
     0x60, 0x82,
 };
 
-fn buildDrawingFixture(path: []const u8, anchor_col: u32, anchor_row: u32) !void {
+fn buildDrawingFixture(io: std.Io, path: []const u8, anchor_col: u32, anchor_row: u32) !void {
     {
         var w = xlsx.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("S");
         try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 }, .{ .integer = 4 } });
         try s.writeRow(&.{ .{ .integer = 5 }, .{ .integer = 6 }, .{ .integer = 7 }, .{ .integer = 8 } });
-        try w.save(path);
+        try w.save(io, path);
     }
-    var wb = try workbook_mod.Workbook.open(std.testing.allocator, path);
+    var wb = try workbook_mod.Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
     try wb.addImage(0, .{ .col = anchor_col, .row = anchor_row }, &tiny_png_1x1_for_editor, .png);
-    try wb.save(path);
+    try wb.save(io, path);
 }
 
-fn drawingPartContains(path: []const u8, needle: []const u8) !bool {
-    var store = try store_mod.PartStore.open(std.testing.allocator, path);
+fn drawingPartContains(io: std.Io, path: []const u8, needle: []const u8) !bool {
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, path);
     defer store.deinit();
     const drawing = (try store.part("xl/drawings/drawing1.xml")) orelse return error.MissingDrawing;
     return std.mem.indexOf(u8, drawing.bytes, needle) != null;
@@ -3908,16 +3933,16 @@ test "Editor: insertColumn shifts xdr drawing anchor col (dr-1)" {
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "draw_inscol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildDrawingFixture(src_path, 3, 5);
-    try std.testing.expect(try drawingPartContains(src_path, "<xdr:col>2</xdr:col>"));
+    try buildDrawingFixture(io, src_path, 3, 5);
+    try std.testing.expect(try drawingPartContains(io, src_path, "<xdr:col>2</xdr:col>"));
     {
         var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertColumn(0, 2);
         try ed.save(io, dst_path);
     }
-    try std.testing.expect(try drawingPartContains(dst_path, "<xdr:col>3</xdr:col>"));
-    try std.testing.expect(try drawingPartContains(dst_path, "<xdr:row>4</xdr:row>"));
+    try std.testing.expect(try drawingPartContains(io, dst_path, "<xdr:col>3</xdr:col>"));
+    try std.testing.expect(try drawingPartContains(io, dst_path, "<xdr:row>4</xdr:row>"));
 }
 
 test "Editor: insertRow shifts xdr drawing anchor row (dr-1)" {
@@ -3930,15 +3955,15 @@ test "Editor: insertRow shifts xdr drawing anchor row (dr-1)" {
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "draw_insrow_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildDrawingFixture(src_path, 3, 5);
+    try buildDrawingFixture(io, src_path, 3, 5);
     {
         var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertRow(0, 3);
         try ed.save(io, dst_path);
     }
-    try std.testing.expect(try drawingPartContains(dst_path, "<xdr:col>2</xdr:col>"));
-    try std.testing.expect(try drawingPartContains(dst_path, "<xdr:row>5</xdr:row>"));
+    try std.testing.expect(try drawingPartContains(io, dst_path, "<xdr:col>2</xdr:col>"));
+    try std.testing.expect(try drawingPartContains(io, dst_path, "<xdr:row>5</xdr:row>"));
 }
 
 test "Editor: deleteColumn at the anchor's column drops the oneCellAnchor (dr-1)" {
@@ -3951,14 +3976,14 @@ test "Editor: deleteColumn at the anchor's column drops the oneCellAnchor (dr-1)
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "draw_delcol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildDrawingFixture(src_path, 3, 5);
+    try buildDrawingFixture(io, src_path, 3, 5);
     {
         var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteColumn(0, 3);
         try ed.save(io, dst_path);
     }
-    try std.testing.expect(!try drawingPartContains(dst_path, "<xdr:oneCellAnchor>"));
+    try std.testing.expect(!try drawingPartContains(io, dst_path, "<xdr:oneCellAnchor>"));
 }
 
 test "Editor: drawing rewrite tolerates XML whitespace around `=` in worksheet rels (dr-1 REL-602/604)" {
@@ -3971,7 +3996,7 @@ test "Editor: drawing rewrite tolerates XML whitespace around `=` in worksheet r
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "draw_eq_ws_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildDrawingFixture(src_path, 3, 5);
+    try buildDrawingFixture(io, src_path, 3, 5);
     // Splice a custom `<drawing  r:id  =  "rId99"/>` into sheet1.xml
     // ALONGSIDE the existing well-formed `<drawing r:id="rIdN"/>`
     // emitted by addImage; we exercise the parser's whitespace
@@ -4009,7 +4034,7 @@ test "Editor: drawing rewrite tolerates XML whitespace around `=` in worksheet r
     // The drawing's xdr:col MUST shift; if findAttrValue mishandled
     // the whitespace, applyDrawingEditForSheet would silently skip
     // and the col would still be 2.
-    try std.testing.expect(try drawingPartContains(dst_path, "<xdr:col>3</xdr:col>"));
+    try std.testing.expect(try drawingPartContains(io, dst_path, "<xdr:col>3</xdr:col>"));
 }
 
 // ---------------------------------------------------------------------------
@@ -4019,7 +4044,7 @@ test "Editor: drawing rewrite tolerates XML whitespace around `=` in worksheet r
 // `xl/comments1.xml`. After Editor row/col edits, both must shift.
 // ---------------------------------------------------------------------------
 
-fn buildCommentFixture(path: []const u8, comment_ref: []const u8) !void {
+fn buildCommentFixture(io: std.Io, path: []const u8, comment_ref: []const u8) !void {
     var w = xlsx.Writer.init(std.testing.allocator);
     defer w.deinit();
     var s = try w.addSheet("S");
@@ -4029,18 +4054,18 @@ fn buildCommentFixture(path: []const u8, comment_ref: []const u8) !void {
     try s.writeRow(&.{ .{ .integer = 13 }, .{ .integer = 14 }, .{ .integer = 15 }, .{ .integer = 16 } });
     try s.writeRow(&.{ .{ .integer = 17 }, .{ .integer = 18 }, .{ .integer = 19 }, .{ .integer = 20 } });
     try s.addComment(comment_ref, "Author", "test note");
-    try w.save(path);
+    try w.save(io, path);
 }
 
-fn vmlPartContains(path: []const u8, needle: []const u8) !bool {
-    var store = try store_mod.PartStore.open(std.testing.allocator, path);
+fn vmlPartContains(io: std.Io, path: []const u8, needle: []const u8) !bool {
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, path);
     defer store.deinit();
     const vml = (try store.part("xl/drawings/vmlDrawing1.vml")) orelse return error.MissingVml;
     return std.mem.indexOf(u8, vml.bytes, needle) != null;
 }
 
-fn commentsPartContains(path: []const u8, needle: []const u8) !bool {
-    var store = try store_mod.PartStore.open(std.testing.allocator, path);
+fn commentsPartContains(io: std.Io, path: []const u8, needle: []const u8) !bool {
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, path);
     defer store.deinit();
     const part = (try store.part("xl/comments1.xml")) orelse return error.MissingComments;
     return std.mem.indexOf(u8, part.bytes, needle) != null;
@@ -4056,17 +4081,17 @@ test "Editor: insertColumn shifts VML anchor + x:Column (dr-2)" {
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "vml_inscol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildCommentFixture(src_path, "C5");
-    try std.testing.expect(try vmlPartContains(src_path, "<x:Column>2</x:Column>"));
-    try std.testing.expect(try vmlPartContains(src_path, "<x:Anchor>3, 15, 4, 2, 5, 31, 8, 3</x:Anchor>"));
+    try buildCommentFixture(io, src_path, "C5");
+    try std.testing.expect(try vmlPartContains(io, src_path, "<x:Column>2</x:Column>"));
+    try std.testing.expect(try vmlPartContains(io, src_path, "<x:Anchor>3, 15, 4, 2, 5, 31, 8, 3</x:Anchor>"));
     {
         var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertColumn(0, 2);
         try ed.save(io, dst_path);
     }
-    try std.testing.expect(try vmlPartContains(dst_path, "<x:Column>3</x:Column>"));
-    try std.testing.expect(try vmlPartContains(dst_path, "<x:Anchor>4, 15, 4, 2, 6, 31, 8, 3</x:Anchor>"));
+    try std.testing.expect(try vmlPartContains(io, dst_path, "<x:Column>3</x:Column>"));
+    try std.testing.expect(try vmlPartContains(io, dst_path, "<x:Anchor>4, 15, 4, 2, 6, 31, 8, 3</x:Anchor>"));
 }
 
 test "Editor: insertRow shifts VML anchor + x:Row (dr-2)" {
@@ -4079,16 +4104,16 @@ test "Editor: insertRow shifts VML anchor + x:Row (dr-2)" {
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "vml_insrow_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildCommentFixture(src_path, "C5");
+    try buildCommentFixture(io, src_path, "C5");
     {
         var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertRow(0, 3);
         try ed.save(io, dst_path);
     }
-    try std.testing.expect(try vmlPartContains(dst_path, "<x:Row>5</x:Row>"));
-    try std.testing.expect(try vmlPartContains(dst_path, "<x:Anchor>3, 15, 5, 2, 5, 31, 9, 3</x:Anchor>"));
-    try std.testing.expect(try vmlPartContains(dst_path, "<x:Column>2</x:Column>"));
+    try std.testing.expect(try vmlPartContains(io, dst_path, "<x:Row>5</x:Row>"));
+    try std.testing.expect(try vmlPartContains(io, dst_path, "<x:Anchor>3, 15, 5, 2, 5, 31, 9, 3</x:Anchor>"));
+    try std.testing.expect(try vmlPartContains(io, dst_path, "<x:Column>2</x:Column>"));
 }
 
 test "Editor: deleteColumn at the comment's column drops the v:shape (dr-2)" {
@@ -4101,14 +4126,14 @@ test "Editor: deleteColumn at the comment's column drops the v:shape (dr-2)" {
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "vml_delcol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildCommentFixture(src_path, "C5");
+    try buildCommentFixture(io, src_path, "C5");
     {
         var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteColumn(0, 3);
         try ed.save(io, dst_path);
     }
-    try std.testing.expect(!try vmlPartContains(dst_path, "<v:shape "));
+    try std.testing.expect(!try vmlPartContains(io, dst_path, "<v:shape "));
 }
 
 test "Editor: insertColumn shifts BOTH VML anchor AND comments ref (REL-705)" {
@@ -4121,17 +4146,17 @@ test "Editor: insertColumn shifts BOTH VML anchor AND comments ref (REL-705)" {
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "vml_cmt_inscol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildCommentFixture(src_path, "C5");
-    try std.testing.expect(try commentsPartContains(src_path, "ref=\"C5\""));
+    try buildCommentFixture(io, src_path, "C5");
+    try std.testing.expect(try commentsPartContains(io, src_path, "ref=\"C5\""));
     {
         var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertColumn(0, 2);
         try ed.save(io, dst_path);
     }
-    try std.testing.expect(try vmlPartContains(dst_path, "<x:Column>3</x:Column>"));
-    try std.testing.expect(try commentsPartContains(dst_path, "ref=\"D5\""));
-    try std.testing.expect(!try commentsPartContains(dst_path, "ref=\"C5\""));
+    try std.testing.expect(try vmlPartContains(io, dst_path, "<x:Column>3</x:Column>"));
+    try std.testing.expect(try commentsPartContains(io, dst_path, "ref=\"D5\""));
+    try std.testing.expect(!try commentsPartContains(io, dst_path, "ref=\"C5\""));
 }
 
 test "Editor: deleteColumn at comment's column drops BOTH VML shape AND comment entry (REL-705)" {
@@ -4144,15 +4169,15 @@ test "Editor: deleteColumn at comment's column drops BOTH VML shape AND comment 
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "vml_cmt_delcol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildCommentFixture(src_path, "C5");
+    try buildCommentFixture(io, src_path, "C5");
     {
         var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteColumn(0, 3);
         try ed.save(io, dst_path);
     }
-    try std.testing.expect(!try vmlPartContains(dst_path, "<v:shape "));
-    try std.testing.expect(!try commentsPartContains(dst_path, "<comment "));
+    try std.testing.expect(!try vmlPartContains(io, dst_path, "<v:shape "));
+    try std.testing.expect(!try commentsPartContains(io, dst_path, "<comment "));
 }
 
 // ---------------------------------------------------------------------------
@@ -4169,8 +4194,8 @@ fn copyCorpusToTmp(io: std.Io, src_corpus: []const u8, dst_path: [:0]const u8) !
     try std.Io.Dir.cwd().copyFile(src_corpus, std.Io.Dir.cwd(), dst_path, io, .{});
 }
 
-fn tablePartContains(path: []const u8, table_part: []const u8, needle: []const u8) !bool {
-    var ed = try Editor.open(std.testing.allocator, path);
+fn tablePartContains(io: std.Io, path: []const u8, table_part: []const u8, needle: []const u8) !bool {
+    var ed = try Editor.open(std.testing.allocator, io, path);
     defer ed.deinit();
     // Propagate readEntry errors so the assertion fails loudly when
     // the part is missing — the previous `catch return false` silently
@@ -4184,8 +4209,8 @@ fn tablePartContains(path: []const u8, table_part: []const u8, needle: []const u
 /// Read an entry's bytes via the Editor's source-archive view.
 /// Test-only helper for byte-equality assertions on parts that
 /// aren't supposed to change.
-fn readEntryBytes(path: []const u8, entry_name: []const u8) ![]u8 {
-    var ed = try Editor.open(std.testing.allocator, path);
+fn readEntryBytes(io: std.Io, path: []const u8, entry_name: []const u8) ![]u8 {
+    var ed = try Editor.open(std.testing.allocator, io, path);
     defer ed.deinit();
     return try ed.readEntry(entry_name);
 }
@@ -4200,7 +4225,7 @@ test "Editor: insertRow above table shifts <table ref> in xl/tables/tableN.xml" 
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "tbl_insrow_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    copyCorpusToTmp("tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
+    copyCorpusToTmp(io, "tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
     {
         var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
@@ -4208,8 +4233,8 @@ test "Editor: insertRow above table shifts <table ref> in xl/tables/tableN.xml" 
         try ed.save(io, dst_path);
     }
     // Expect C9:E10 → C10:E11.
-    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "ref=\"C10:E11\""));
-    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "<autoFilter ref=\"C10:E11\""));
+    try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "ref=\"C10:E11\""));
+    try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "<autoFilter ref=\"C10:E11\""));
 }
 
 test "Editor: insertColumn inside table extends range and adds synthetic tableColumn" {
@@ -4222,7 +4247,7 @@ test "Editor: insertColumn inside table extends range and adds synthetic tableCo
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "tbl_inscol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    copyCorpusToTmp("tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
+    copyCorpusToTmp(io, "tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
     {
         var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
@@ -4230,11 +4255,11 @@ test "Editor: insertColumn inside table extends range and adds synthetic tableCo
         try ed.save(io, dst_path);
     }
     // C9:E10 → C9:F10. <tableColumns count="3"> → "4".
-    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "ref=\"C9:F10\""));
-    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "<tableColumns count=\"4\">"));
+    try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "ref=\"C9:F10\""));
+    try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "<tableColumns count=\"4\">"));
     // The corpus table has tableColumn ids 1, 2, 3 → synthetic
     // claims id=4 (max + 1).
-    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "<tableColumn id=\"4\""));
+    try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "<tableColumn id=\"4\""));
 }
 
 test "Editor: deleteColumn inside table drops matching tableColumn" {
@@ -4247,7 +4272,7 @@ test "Editor: deleteColumn inside table drops matching tableColumn" {
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "tbl_delcol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    copyCorpusToTmp("tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
+    copyCorpusToTmp(io, "tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
     {
         var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
@@ -4256,9 +4281,9 @@ test "Editor: deleteColumn inside table drops matching tableColumn" {
     }
     // C9:E10 → C9:D10. count goes 3 → 2; the middle tableColumn
     // (id="3" in this corpus, name="Column1") goes away.
-    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "ref=\"C9:D10\""));
-    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "<tableColumns count=\"2\">"));
-    try std.testing.expect(!try tablePartContains(dst_path, "xl/tables/table1.xml", "name=\"Column1\""));
+    try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "ref=\"C9:D10\""));
+    try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "<tableColumns count=\"2\">"));
+    try std.testing.expect(!try tablePartContains(io, dst_path, "xl/tables/table1.xml", "name=\"Column1\""));
 }
 
 test "Editor: deleteRow on table's header row refuses with RowEditUnsafeForSheet" {
@@ -4269,7 +4294,7 @@ test "Editor: deleteRow on table's header row refuses with RowEditUnsafeForSheet
     defer tt.deinit();
     const src_path = try tt.path(std.testing.allocator, io, "tbl_hdrrow_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    copyCorpusToTmp("tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
+    copyCorpusToTmp(io, "tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
     var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
     // Table is at C9:E10 — row 9 is the header row.
@@ -4287,7 +4312,7 @@ test "Editor: edit outside table range is byte-stable inside the table part" {
     defer std.testing.allocator.free(src_path);
     const dst_path = try tt.path(std.testing.allocator, io, "tbl_outside_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    copyCorpusToTmp("tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
+    copyCorpusToTmp(io, "tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
     {
         var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
@@ -4299,9 +4324,203 @@ test "Editor: edit outside table range is byte-stable inside the table part" {
     // presence). The byte-equal short-circuit in
     // applyTableEditsForSheet must skip the replacePart entirely so
     // the table part flows through ZIP substitution untouched.
-    const src_table = try readEntryBytes(src_path, "xl/tables/table1.xml");
+    const src_table = try readEntryBytes(io, src_path, "xl/tables/table1.xml");
     defer std.testing.allocator.free(src_table);
-    const dst_table = try readEntryBytes(dst_path, "xl/tables/table1.xml");
+    const dst_table = try readEntryBytes(io, dst_path, "xl/tables/table1.xml");
     defer std.testing.allocator.free(dst_table);
     try std.testing.expectEqualSlices(u8, src_table, dst_table);
+}
+
+// ─── docProps read + scrub (Z3) ──────────────────────────────────────
+//
+// End-to-end rather than unit: the parser has its own tests in
+// pkg/typed_parts/doc_props_xml.zig. What matters here is that the
+// parts survive a real Editor round trip, that the scrub reaches the
+// saved archive, and — the load-bearing bit — that scrubbing metadata
+// does not disturb a single cell.
+
+/// Local entry reader for the docProps tests. Takes an `io` explicitly
+/// rather than reusing `readEntryBytes`, which predates io threading.
+fn readEntryBytesIo(io: std.Io, path: []const u8, entry_name: []const u8) ![]u8 {
+    var ed = try Editor.open(std.testing.allocator, io, path);
+    defer ed.deinit();
+    return try ed.readEntry(entry_name);
+}
+
+/// Build a workbook that carries docProps parts with known PII. The
+/// zlsx Writer does not emit docProps, so they are injected through
+/// PartStore.addPart, which is also what exercises the content-type
+/// registration path the scrub later has to unwind.
+fn buildDocPropsFixture(io: std.Io, path: [:0]const u8) !void {
+    const a = std.testing.allocator;
+
+    {
+        var w = xlsx.Writer.init(a);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{ .{ .string = "name" }, .{ .integer = 1 } });
+        try s.writeRow(&.{ .{ .string = "keep-me" }, .{ .integer = 2 } });
+        try w.save(io, path);
+    }
+
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+
+    try wb.store.addPart(
+        "docProps/core.xml",
+        "application/vnd.openxmlformats-package.core-properties+xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+            "<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\"" ++
+            " xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\">" ++
+            "<dc:creator>Jane Q. Fixture</dc:creator>" ++
+            "<cp:lastModifiedBy>Jane Q. Fixture</cp:lastModifiedBy>" ++
+            "<dc:title>Confidential Q3</dc:title>" ++
+            "<dcterms:created xsi:type=\"dcterms:W3CDTF\">2020-01-01T00:00:00Z</dcterms:created>" ++
+            "<cp:revision>4</cp:revision>" ++
+            "</cp:coreProperties>",
+    );
+    try wb.store.addPart(
+        "docProps/app.xml",
+        "application/vnd.openxmlformats-officedocument.extended-properties+xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+            "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\">" ++
+            "<TotalTime>7</TotalTime><Company>AcmeCorp</Company><Manager>Bob Boss</Manager>" ++
+            "</Properties>",
+    );
+    try wb.store.addPart(
+        "docProps/custom.xml",
+        "application/vnd.openxmlformats-officedocument.custom-properties+xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+            "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/custom-properties\">" ++
+            "<property name=\"Owner\"><vt:lpwstr>Jane Q. Fixture</vt:lpwstr></property>" ++
+            "</Properties>",
+    );
+    try wb.save(io, path);
+}
+
+test "Editor.docProps: reads creator, company and custom-props presence" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "docprops_read.xlsx");
+    defer std.testing.allocator.free(path);
+
+    try buildDocPropsFixture(io, path);
+
+    var ed = try Editor.open(std.testing.allocator, io, path);
+    defer ed.deinit();
+
+    const props = try ed.docProps();
+    try std.testing.expectEqualStrings("Jane Q. Fixture", props.creator.?);
+    try std.testing.expectEqualStrings("Jane Q. Fixture", props.last_modified_by.?);
+    try std.testing.expectEqualStrings("Confidential Q3", props.title.?);
+    try std.testing.expectEqualStrings("AcmeCorp", props.company.?);
+    try std.testing.expectEqualStrings("Bob Boss", props.manager.?);
+    try std.testing.expect(props.has_custom_properties);
+    try std.testing.expect(props.hasIdentifyingFields());
+}
+
+test "Editor.stripDocProps: PII gone from the saved archive, cells intact" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "docprops_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "docprops_clean.xlsx");
+    defer std.testing.allocator.free(dst);
+
+    try buildDocPropsFixture(io, src);
+
+    {
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.stripDocProps(.{});
+        try ed.save(io, dst);
+    }
+
+    // core.xml: identifying fields gone, timestamp + revision kept.
+    const core = try readEntryBytesIo(io, dst, "docProps/core.xml");
+    defer std.testing.allocator.free(core);
+    try std.testing.expect(std.mem.indexOf(u8, core, "Jane Q. Fixture") == null);
+    try std.testing.expect(std.mem.indexOf(u8, core, "Confidential Q3") == null);
+    try std.testing.expect(std.mem.indexOf(u8, core, "2020-01-01T00:00:00Z") != null);
+    try std.testing.expect(std.mem.indexOf(u8, core, "<cp:revision>4</cp:revision>") != null);
+
+    // app.xml: company + manager gone, unmodelled TotalTime survives.
+    const app = try readEntryBytesIo(io, dst, "docProps/app.xml");
+    defer std.testing.allocator.free(app);
+    try std.testing.expect(std.mem.indexOf(u8, app, "AcmeCorp") == null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "Bob Boss") == null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "<TotalTime>7</TotalTime>") != null);
+
+    // custom.xml: dropped wholesale, and its content-type override with
+    // it — a dangling Override makes the package invalid.
+    try std.testing.expectError(
+        error.MissingEntry,
+        readEntryBytesIo(io, dst, "docProps/custom.xml"),
+    );
+    const ct = try readEntryBytesIo(io, dst, "[Content_Types].xml");
+    defer std.testing.allocator.free(ct);
+    try std.testing.expect(std.mem.indexOf(u8, ct, "docProps/custom.xml") == null);
+    // The parts that stayed must still be declared.
+    try std.testing.expect(std.mem.indexOf(u8, ct, "docProps/core.xml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ct, "docProps/app.xml") != null);
+
+    // The whole point: cell data is untouched.
+    const src_sheet = try readEntryBytesIo(io, src, "xl/worksheets/sheet1.xml");
+    defer std.testing.allocator.free(src_sheet);
+    const dst_sheet = try readEntryBytesIo(io, dst, "xl/worksheets/sheet1.xml");
+    defer std.testing.allocator.free(dst_sheet);
+    try std.testing.expectEqualSlices(u8, src_sheet, dst_sheet);
+
+    // And the scrubbed workbook still reads back through the reader.
+    var re = try Editor.open(std.testing.allocator, io, dst);
+    defer re.deinit();
+    const after = try re.docProps();
+    try std.testing.expect(after.creator == null);
+    try std.testing.expect(after.company == null);
+    try std.testing.expect(!after.has_custom_properties);
+    try std.testing.expect(!after.hasIdentifyingFields());
+}
+
+test "Editor.stripDocProps: no docProps parts is a clean no-op" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "nodocprops_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "nodocprops_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+
+    // Writer-produced workbooks carry no docProps at all.
+    {
+        var w = xlsx.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(io, src);
+    }
+
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    const props = try ed.docProps();
+    try std.testing.expect(props.isEmpty());
+
+    // Must not error, and must not invent parts.
+    try ed.stripDocProps(.{});
+    try ed.save(io, dst);
+
+    try std.testing.expectError(
+        error.MissingEntry,
+        readEntryBytesIo(io, dst, "docProps/core.xml"),
+    );
 }

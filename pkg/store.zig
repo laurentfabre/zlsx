@@ -555,6 +555,77 @@ pub const PartStore = struct {
         };
     }
 
+    /// Drop a part from the archive, along with its
+    /// `[Content_Types].xml` override and any `<Relationship>` in any
+    /// `.rels` part that targets it.
+    ///
+    /// Idempotent: removing an absent part is a no-op, not an error.
+    /// That is the friendlier contract for scrub-style callers which
+    /// ask for removal without first checking presence.
+    ///
+    /// Ordering matters. The content-type and relationship edits run
+    /// FIRST, while the parallel arrays still hold their original
+    /// indices, and the compaction happens last — doing it the other
+    /// way round would have those edits addressing shifted slots.
+    ///
+    /// Not for structural parts. Removing `xl/workbook.xml` or a live
+    /// worksheet would produce an archive that no reader accepts; this
+    /// exists for genuinely optional parts such as `docProps/custom.xml`.
+    pub fn removePart(self: *PartStore, name: []const u8) !void {
+        const idx = self.findIndex(name) orelse return;
+        const ar_alloc = self.arena.allocator();
+
+        // 1. Content-type override, if the part had one.
+        if (self.findIndex("[Content_Types].xml")) |ct_idx| {
+            const ct = try self.part("[Content_Types].xml") orelse return Error.MissingContentTypes;
+            const stripped = try removeContentTypeOverride(ar_alloc, ct.bytes, name);
+            defer ar_alloc.free(stripped);
+            if (!std.mem.eql(u8, stripped, ct.bytes)) {
+                // Guard against removing the CT part itself, which
+                // would make the archive unreadable.
+                std.debug.assert(ct_idx != idx);
+                try self.replacePart("[Content_Types].xml", stripped);
+            }
+        }
+
+        // 2. Any relationship pointing at it. Targets are written
+        //    relative to the rels file's owner, so both the bare name
+        //    and a leading-slash absolute form are matched.
+        for (self.parts, 0..) |p, i| {
+            if (i == idx) continue;
+            if (!std.mem.endsWith(u8, p.name, ".rels")) continue;
+            const rels_part = try self.part(p.name) orelse continue;
+            const stripped = try removeRelationshipsTo(ar_alloc, rels_part.bytes, name);
+            defer ar_alloc.free(stripped);
+            if (!std.mem.eql(u8, stripped, rels_part.bytes)) {
+                try self.replacePart(p.name, stripped);
+            }
+        }
+
+        // 3. Compact the three parallel arrays. alloc+copy rather than
+        //    in-place shifting for the same reason addPart grows that
+        //    way: a failed allocation must leave the store untouched.
+        const n = self.parts.len;
+        std.debug.assert(n > 0);
+        const new_entries = try ar_alloc.alloc(ZipEntry, n - 1);
+        const new_parts = try ar_alloc.alloc(Part, n - 1);
+        const new_overrides = try ar_alloc.alloc(?Override, n - 1);
+
+        var w: usize = 0;
+        for (0..n) |r| {
+            if (r == idx) continue;
+            new_entries[w] = self.entries[r];
+            new_parts[w] = self.parts[r];
+            new_overrides[w] = self.overrides[r];
+            w += 1;
+        }
+        std.debug.assert(w == n - 1);
+
+        self.entries = new_entries;
+        self.parts = new_parts;
+        self.overrides = new_overrides;
+    }
+
     pub fn replacePart(self: *PartStore, name: []const u8, bytes: []const u8) !void {
         const idx = self.findIndex(name) orelse return error.PartNotFound;
         const ar_alloc = self.arena.allocator();
@@ -1423,6 +1494,66 @@ fn extensionEql(name: []const u8, ext: []const u8) bool {
 ///   "xl/_rels/workbook.xml.rels"     → "xl/workbook.xml"
 ///   "xl/worksheets/_rels/sheet1.xml.rels" → "xl/worksheets/sheet1.xml"
 /// Returns null if `name` isn't a `_rels/<base>.rels` shape.
+/// Remove `<Override PartName="/<name>" …/>` from a `[Content_Types].xml`
+/// body. Returns allocator-owned bytes; unchanged input yields a copy.
+fn removeContentTypeOverride(
+    allocator: std.mem.Allocator,
+    ct_xml: []const u8,
+    part_name: []const u8,
+) ![]u8 {
+    // OOXML writes override targets absolute-from-package-root.
+    const needle = try std.fmt.allocPrint(allocator, "PartName=\"/{s}\"", .{part_name});
+    defer allocator.free(needle);
+    return removeSelfClosingElementContaining(allocator, ct_xml, "<Override", needle);
+}
+
+/// Remove every `<Relationship … Target="…"/>` whose target resolves to
+/// `part_name`. Both the bare relative form and the leading-slash
+/// absolute form appear in the wild, so both are matched.
+fn removeRelationshipsTo(
+    allocator: std.mem.Allocator,
+    rels_xml: []const u8,
+    part_name: []const u8,
+) ![]u8 {
+    const rel = try std.fmt.allocPrint(allocator, "Target=\"{s}\"", .{part_name});
+    defer allocator.free(rel);
+    const abs = try std.fmt.allocPrint(allocator, "Target=\"/{s}\"", .{part_name});
+    defer allocator.free(abs);
+
+    const once = try removeSelfClosingElementContaining(allocator, rels_xml, "<Relationship", rel);
+    defer allocator.free(once);
+    return removeSelfClosingElementContaining(allocator, once, "<Relationship", abs);
+}
+
+/// Copy `xml` minus every `<open … needle … >` element. Used for the
+/// flat, self-closing elements that Content_Types and .rels are built
+/// from, so no nesting handling is required.
+fn removeSelfClosingElementContaining(
+    allocator: std.mem.Allocator,
+    xml: []const u8,
+    open_tag: []const u8,
+    needle: []const u8,
+) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < xml.len) {
+        const start = std.mem.indexOfPos(u8, xml, i, open_tag) orelse break;
+        const gt = std.mem.indexOfScalarPos(u8, xml, start, '>') orelse break;
+        const elem = xml[start .. gt + 1];
+        if (std.mem.indexOf(u8, elem, needle) != null) {
+            // Drop the element: copy up to it, resume after it.
+            try out.appendSlice(allocator, xml[i..start]);
+        } else {
+            try out.appendSlice(allocator, xml[i .. gt + 1]);
+        }
+        i = gt + 1;
+    }
+    try out.appendSlice(allocator, xml[i..]);
+    return out.toOwnedSlice(allocator);
+}
+
 fn relsOwner(arena: std.mem.Allocator, name: []const u8) !?[]const u8 {
     if (!std.mem.endsWith(u8, name, ".rels")) return null;
     // Find the `_rels` directory segment. It's either prefix-less
