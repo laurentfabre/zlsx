@@ -34,6 +34,7 @@
 //! * Pivot tables, charts, drawings.
 
 const std = @import("std");
+const fuzz_config = @import("fuzz_config");
 const xlsx = @import("xlsx.zig");
 const casefold = @import("unicode/casefold.zig");
 
@@ -3537,8 +3538,11 @@ test "Writer: addSheet validates Unicode scalar count (not bytes) for 31-char li
 }
 
 test "fuzz validateSheetName: adversarial bytes never panic + only valid names pass" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterationsW();
-    const seed = fuzzSeedW();
+    const seed = fuzzSeedW(io);
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
 
@@ -3705,31 +3709,26 @@ test "Writer: exposed via @import(\"xlsx.zig\") namespace re-export" {
 const fuzz_default_iters_writer: usize = 1_000;
 
 fn fuzzIterationsW() usize {
-    const env = std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_ITERS") catch return fuzz_default_iters_writer;
-    defer std.heap.page_allocator.free(env);
-    var digits: [32]u8 = undefined;
-    var di: usize = 0;
-    for (env) |c| {
-        if (c == '_') continue;
-        if (di == digits.len) break;
-        digits[di] = c;
-        di += 1;
-    }
-    return std.fmt.parseInt(usize, digits[0..di], 10) catch fuzz_default_iters_writer;
+    // Override comes from build.zig via -Dfuzz-iters or the
+    // XLSX_FUZZ_ITERS environment variable; 0.16 test binaries
+    // cannot read the environment themselves.
+    return fuzz_config.iters_override orelse fuzz_default_iters_writer;
 }
 
-fn fuzzSeedW() u64 {
-    if (std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_SEED")) |s| {
-        defer std.heap.page_allocator.free(s);
-        return std.fmt.parseInt(u64, s, 10) catch 0xA1F8ED;
-    } else |_| {
-        return @bitCast(std.time.milliTimestamp());
-    }
+fn fuzzSeedW(io: std.Io) u64 {
+    if (fuzz_config.seed_override) |s| return s;
+    // std.time lost every function in 0.16; a varying default
+    // seed now comes from the monotonic clock via Io.
+    const ts = std.Io.Clock.now(.awake, io);
+    return @bitCast(@as(i64, @truncate(ts.nanoseconds)));
 }
 
 test "fuzz formatCellRef: no overflow, always starts with A-Z" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterationsW();
-    var prng = std.Random.DefaultPrng.init(fuzzSeedW());
+    var prng = std.Random.DefaultPrng.init(fuzzSeedW(io));
     const rng = prng.random();
     var buf: [16]u8 = undefined;
     for (0..iters) |_| {
@@ -3746,8 +3745,11 @@ test "fuzz formatCellRef: no overflow, always starts with A-Z" {
 }
 
 test "fuzz appendXmlEscaped: no raw XML specials in output" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterationsW();
-    var prng = std.Random.DefaultPrng.init(fuzzSeedW());
+    var prng = std.Random.DefaultPrng.init(fuzzSeedW(io));
     const rng = prng.random();
     var input_buf: [512]u8 = undefined;
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -3817,8 +3819,11 @@ test "appendXmlEscaped rejects forbidden XML 1.0 control bytes" {
 }
 
 test "fuzz fitsExactlyInF64 matches round-trip reference" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterationsW();
-    var prng = std.Random.DefaultPrng.init(fuzzSeedW());
+    var prng = std.Random.DefaultPrng.init(fuzzSeedW(io));
     const rng = prng.random();
 
     for (0..iters) |_| {
@@ -3838,8 +3843,11 @@ test "fuzz fitsExactlyInF64 matches round-trip reference" {
 }
 
 test "fuzz Writer.sstIntern dedup invariant" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterationsW();
-    var prng = std.Random.DefaultPrng.init(fuzzSeedW());
+    var prng = std.Random.DefaultPrng.init(fuzzSeedW(io));
     const rng = prng.random();
 
     var w = Writer.init(std.testing.allocator);
@@ -3873,8 +3881,11 @@ test "fuzz Writer.sstIntern dedup invariant" {
 }
 
 test "fuzz Writer.addStyle dedup on bool combos" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterationsW();
-    var prng = std.Random.DefaultPrng.init(fuzzSeedW());
+    var prng = std.Random.DefaultPrng.init(fuzzSeedW(io));
     const rng = prng.random();
 
     var w = Writer.init(std.testing.allocator);
@@ -3902,8 +3913,11 @@ test "fuzz Writer.addStyle dedup on bool combos" {
 }
 
 test "fuzz Writer end-to-end round-trip via reader" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterationsW() / 10; // each iter does real zip I/O
-    const seed = fuzzSeedW();
+    const seed = fuzzSeedW(io);
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var tt = TestTmp.init();
@@ -3976,12 +3990,15 @@ test "fuzz Writer end-to-end round-trip via reader" {
 }
 
 test "fuzz Writer: random stage 2-5 style combos survive round-trip" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Register styles with every stage's fields pseudo-randomly set,
     // save the workbook, and confirm the reader parses it cleanly.
     // Catches any crash in emitStylesXml caused by unusual field
     // combinations (e.g. fill + border + numFmt simultaneously).
     const iters = fuzzIterationsW() / 20;
-    const seed = fuzzSeedW();
+    const seed = fuzzSeedW(io);
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var tmp_path_buf: [64]u8 = undefined;
@@ -4056,11 +4073,14 @@ test "fuzz Writer: random stage 2-5 style combos survive round-trip" {
 }
 
 test "fuzz SheetWriter: random stage-5 per-sheet feature combos" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Hammer setColumnWidth / freezePanes / setAutoFilter in random
     // orderings; save; confirm the archive is valid + the ordering
     // invariant (sheetViews < cols < sheetData < autoFilter) holds.
     const iters = fuzzIterationsW() / 20;
-    const seed = fuzzSeedW();
+    const seed = fuzzSeedW(io);
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var tmp_path_buf: [64]u8 = undefined;
@@ -4193,7 +4213,7 @@ test "fuzz zip.Archive produces archives our reader can walk" {
     defer threaded.deinit();
     const io = threaded.io();
     const iters = fuzzIterationsW() / 10;
-    const seed = fuzzSeedW();
+    const seed = fuzzSeedW(io);
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var tmp_path_buf: [64]u8 = undefined;
@@ -4301,8 +4321,11 @@ test "deflate: round-trip on canonical inputs" {
 }
 
 test "fuzz deflate: random bytes round-trip through stdlib Decompress" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterationsW() / 50;
-    const seed = fuzzSeedW();
+    const seed = fuzzSeedW(io);
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
 
@@ -4361,8 +4384,11 @@ fn randomCellDeep(
 }
 
 test "fuzz Writer state-machine: random op ordering with invariants" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterationsW() / 20;
-    const seed = fuzzSeedW();
+    const seed = fuzzSeedW(io);
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var tmp_path_buf: [64]u8 = undefined;
@@ -4473,10 +4499,13 @@ test "fuzz Writer state-machine: random op ordering with invariants" {
 }
 
 test "fuzz Writer: multi-save preserves all prior rows" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Call save() twice with rows added in between. The second saved
     // file must contain ALL rows written across both batches.
     const iters = fuzzIterationsW() / 20;
-    const seed = fuzzSeedW();
+    const seed = fuzzSeedW(io);
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var tmp_path_buf: [64]u8 = undefined;
@@ -4521,9 +4550,12 @@ test "fuzz Writer: multi-save preserves all prior rows" {
 }
 
 test "fuzz Writer: boundary numeric values survive round-trip" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Mix extreme numeric values into rows and assert they round-trip.
     const iters = fuzzIterationsW() / 20;
-    const seed = fuzzSeedW();
+    const seed = fuzzSeedW(io);
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var tmp_path_buf: [64]u8 = undefined;
@@ -4619,7 +4651,7 @@ test "fuzz zip.Archive: adversarial entry names" {
     // We don't promise to *reject* these (addEntry just writes bytes) —
     // we promise the result is still a walkable zip and our reader
     // doesn't blow up on the unusual names.
-    const seed = fuzzSeedW();
+    const seed = fuzzSeedW(io);
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var tmp_path_buf: [64]u8 = undefined;

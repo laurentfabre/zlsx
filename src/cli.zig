@@ -5,6 +5,7 @@
 //! pipeable into jq / awk, no Python interpreter floor.
 
 const std = @import("std");
+const fuzz_config = @import("fuzz_config");
 const builtin = @import("builtin");
 const xlsx = @import("zlsx");
 const zlsx_pkg = @import("zlsx_pkg");
@@ -5978,31 +5979,26 @@ test "runSstCommand emits one record per shared-string entry" {
 // ─── Fuzz tests ──────────────────────────────────────────────────────
 
 fn fuzzItersCli() usize {
-    const env = std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_ITERS") catch return 1_000;
-    defer std.heap.page_allocator.free(env);
-    var digits: [32]u8 = undefined;
-    var di: usize = 0;
-    for (env) |c| {
-        if (c == '_') continue;
-        if (di == digits.len) break;
-        digits[di] = c;
-        di += 1;
-    }
-    return std.fmt.parseInt(usize, digits[0..di], 10) catch 1_000;
+    // Override comes from build.zig via -Dfuzz-iters or the
+    // XLSX_FUZZ_ITERS environment variable; 0.16 test binaries
+    // cannot read the environment themselves.
+    return fuzz_config.iters_override orelse 1_000;
 }
 
-fn fuzzSeedCli() u64 {
-    if (std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_SEED")) |s| {
-        defer std.heap.page_allocator.free(s);
-        return std.fmt.parseInt(u64, s, 10) catch 0xA1F8ED;
-    } else |_| {
-        return @bitCast(std.time.milliTimestamp());
-    }
+fn fuzzSeedCli(io: std.Io) u64 {
+    if (fuzz_config.seed_override) |s| return s;
+    // std.time lost every function in 0.16; a varying default
+    // seed now comes from the monotonic clock via Io.
+    const ts = std.Io.Clock.now(.awake, io);
+    return @bitCast(@as(i64, @truncate(ts.nanoseconds)));
 }
 
 test "fuzz colLetter: output is uppercase A-Z" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzItersCli();
-    var prng = std.Random.DefaultPrng.init(fuzzSeedCli());
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCli(io));
     const rng = prng.random();
     var buf: [8]u8 = undefined;
     for (0..iters) |_| {
@@ -6020,8 +6016,11 @@ test "fuzz colLetter: output is uppercase A-Z" {
 }
 
 test "fuzz parseArgs: arbitrary tokens never panic" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzItersCli();
-    var prng = std.Random.DefaultPrng.init(fuzzSeedCli());
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCli(io));
     const rng = prng.random();
 
     var token_pool: [8][32]u8 = undefined;
@@ -6045,8 +6044,11 @@ test "fuzz parseArgs: arbitrary tokens never panic" {
 }
 
 test "fuzz writeJsonString: no raw control chars survive" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzItersCli();
-    var prng = std.Random.DefaultPrng.init(fuzzSeedCli());
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCli(io));
     const rng = prng.random();
 
     var input: [256]u8 = undefined;
@@ -6082,8 +6084,11 @@ test "fuzz writeJsonString: no raw control chars survive" {
 }
 
 test "fuzz writeCsvField: balanced quotes + no bare quote outside them" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzItersCli();
-    var prng = std.Random.DefaultPrng.init(fuzzSeedCli());
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCli(io));
     const rng = prng.random();
 
     var input: [256]u8 = undefined;

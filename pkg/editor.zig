@@ -974,7 +974,7 @@ fn scanWorksheetXml(allocator: Allocator, xml: []const u8) ![]CellSpan {
 
     while (findTagOpen(xml, pos, "row")) |row_tag| {
         const row_attrs = xml[row_tag.start + "<row".len .. row_tag.after_open - 1];
-        const row_attrs_trim = std.mem.trimRight(u8, row_attrs, " \t\r\n");
+        const row_attrs_trim = std.mem.trimEnd(u8, row_attrs, " \t\r\n");
         const is_self_closing_row = row_attrs_trim.len > 0 and
             row_attrs_trim[row_attrs_trim.len - 1] == '/';
         const row_attrs_for_lookup = if (is_self_closing_row)
@@ -1044,7 +1044,7 @@ fn scanWorksheetXml(allocator: Allocator, xml: []const u8) ![]CellSpan {
             // whitespace). Mirrors the same trim on the <row .../>
             // path.
             const candidate_attrs = xml[c_start + 2 .. gt];
-            const trimmed = std.mem.trimRight(u8, candidate_attrs, " \t\r\n");
+            const trimmed = std.mem.trimEnd(u8, candidate_attrs, " \t\r\n");
             const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
             const attrs = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else candidate_attrs;
 

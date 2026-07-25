@@ -21,6 +21,7 @@
 //! shared strings + integer/float/boolean cells).
 
 const std = @import("std");
+const fuzz_config = @import("fuzz_config");
 pub const casefold = @import("unicode/casefold.zig");
 const Allocator = std.mem.Allocator;
 
@@ -1712,7 +1713,7 @@ pub const Rows = struct {
             // that helper scans forward for `</row>` and would happily
             // grab the *next* row's first cell ref, mis-numbering this
             // empty row.
-            const attrs_no_ws = std.mem.trimRight(u8, attrs, " \t\r\n");
+            const attrs_no_ws = std.mem.trimEnd(u8, attrs, " \t\r\n");
             const is_self_closing_row = attrs_no_ws.len > 0 and
                 attrs_no_ws[attrs_no_ws.len - 1] == '/';
             if (row_r_valid) |n| {
@@ -6139,27 +6140,18 @@ const fuzz_default_iters: usize = 1_000;
 const fuzz_max_input_len: usize = 4_096;
 
 fn fuzzIterations() usize {
-    const env = std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_ITERS") catch return fuzz_default_iters;
-    defer std.heap.page_allocator.free(env);
-    // Strip underscores so humans can write "1_000_000".
-    var digits_buf: [32]u8 = undefined;
-    var di: usize = 0;
-    for (env) |c| {
-        if (c == '_') continue;
-        if (di == digits_buf.len) break;
-        digits_buf[di] = c;
-        di += 1;
-    }
-    return std.fmt.parseInt(usize, digits_buf[0..di], 10) catch fuzz_default_iters;
+    // Override comes from build.zig via -Dfuzz-iters or the
+    // XLSX_FUZZ_ITERS environment variable; 0.16 test binaries
+    // cannot read the environment themselves.
+    return fuzz_config.iters_override orelse fuzz_default_iters;
 }
 
-fn fuzzSeed() u64 {
-    if (std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_SEED")) |s| {
-        defer std.heap.page_allocator.free(s);
-        return std.fmt.parseInt(u64, s, 10) catch 0xA1F8ED;
-    } else |_| {
-        return @bitCast(std.time.milliTimestamp());
-    }
+fn fuzzSeed(io: std.Io) u64 {
+    if (fuzz_config.seed_override) |s| return s;
+    // std.time lost every function in 0.16; a varying default
+    // seed now comes from the monotonic clock via Io.
+    const ts = std.Io.Clock.now(.awake, io);
+    return @bitCast(@as(i64, @truncate(ts.nanoseconds)));
 }
 
 fn randomInput(rng: std.Random, buf: []u8) []u8 {
@@ -6197,8 +6189,11 @@ test "fuzz parseA1Ref + parseA1Range: adversarial bytes never panic" {
 }
 
 test "fuzz columnIndexFromRef" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterations();
-    const seed = fuzzSeed();
+    const seed = fuzzSeed(io);
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var buf: [64]u8 = undefined;
@@ -6209,8 +6204,11 @@ test "fuzz columnIndexFromRef" {
 }
 
 test "fuzz parseNumericCell" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterations();
-    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    var prng = std.Random.DefaultPrng.init(fuzzSeed(io));
     const rng = prng.random();
     var buf: [128]u8 = undefined;
     for (0..iters) |_| {
@@ -6220,8 +6218,11 @@ test "fuzz parseNumericCell" {
 }
 
 test "fuzz appendDecoded" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterations();
-    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    var prng = std.Random.DefaultPrng.init(fuzzSeed(io));
     const rng = prng.random();
     var buf: [512]u8 = undefined;
     for (0..iters) |_| {
@@ -6233,8 +6234,11 @@ test "fuzz appendDecoded" {
 }
 
 test "fuzz getAttr" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterations();
-    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    var prng = std.Random.DefaultPrng.init(fuzzSeed(io));
     const rng = prng.random();
     var buf: [256]u8 = undefined;
     var name_buf: [16]u8 = undefined;
@@ -6247,8 +6251,11 @@ test "fuzz getAttr" {
 }
 
 test "fuzz findTagOpen" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterations();
-    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    var prng = std.Random.DefaultPrng.init(fuzzSeed(io));
     const rng = prng.random();
     var buf: [512]u8 = undefined;
     const tags = [_][]const u8{ "c", "row", "si", "sheet", "Relationship", "t" };
@@ -6261,8 +6268,11 @@ test "fuzz findTagOpen" {
 }
 
 test "fuzz extractVValue" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterations();
-    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    var prng = std.Random.DefaultPrng.init(fuzzSeed(io));
     const rng = prng.random();
     var buf: [256]u8 = undefined;
     for (0..iters) |_| {
@@ -6361,8 +6371,11 @@ test "fuzz parseWorkbookSheets — coverage-guided" {
 }
 
 test "fuzz parseSharedStrings" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterations();
-    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    var prng = std.Random.DefaultPrng.init(fuzzSeed(io));
     const rng = prng.random();
     var buf: [fuzz_max_input_len]u8 = undefined;
     for (0..iters) |_| {
@@ -6435,8 +6448,11 @@ test "parseWorkbookSheets leaves uses_1904_epoch false for 1900 workbooks" {
 }
 
 test "fuzz parseWorkbookSheets" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterations();
-    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    var prng = std.Random.DefaultPrng.init(fuzzSeed(io));
     const rng = prng.random();
     var buf: [fuzz_max_input_len]u8 = undefined;
     for (0..iters) |_| {
@@ -6451,8 +6467,11 @@ test "fuzz parseWorkbookSheets" {
 }
 
 test "fuzz parseStyles" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterations();
-    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    var prng = std.Random.DefaultPrng.init(fuzzSeed(io));
     const rng = prng.random();
     var buf: [fuzz_max_input_len]u8 = undefined;
     for (0..iters) |_| {
@@ -6464,8 +6483,11 @@ test "fuzz parseStyles" {
 }
 
 test "fuzz parseCommentsForSheet" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterations();
-    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    var prng = std.Random.DefaultPrng.init(fuzzSeed(io));
     const rng = prng.random();
     var buf: [fuzz_max_input_len]u8 = undefined;
     const sheet_path = "xl/worksheets/sheet1.xml";
@@ -6502,6 +6524,9 @@ test "fuzz parseCommentsForSheet" {
 }
 
 test "fuzz writer.addComment: adversarial author + text never crash emission" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Writer-side fuzz: random bytes fed into addComment (ref, author,
@@ -6511,7 +6536,7 @@ test "fuzz writer.addComment: adversarial author + text never crash emission" {
     // emit valid XML (entity-escaped) so save() completes without
     // a panic.
     const iters = fuzzIterations();
-    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    var prng = std.Random.DefaultPrng.init(fuzzSeed(io));
     const rng = prng.random();
     var buf: [fuzz_max_input_len]u8 = undefined;
 
@@ -6540,6 +6565,9 @@ test "fuzz writer.addComment: adversarial author + text never crash emission" {
 }
 
 test "fuzz writer.addConditionalFormat + addDxf: adversarial inputs never crash emission" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Writer-side fuzz for iter40-41 surfaces. Random bytes feed
@@ -6548,7 +6576,7 @@ test "fuzz writer.addConditionalFormat + addDxf: adversarial inputs never crash 
     // rejected at validate time; valid ones with adversarial
     // formulas must still emit valid CF XML so save() completes.
     const iters = fuzzIterations();
-    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    var prng = std.Random.DefaultPrng.init(fuzzSeed(io));
     const rng = prng.random();
     var buf: [fuzz_max_input_len]u8 = undefined;
 
@@ -6682,8 +6710,11 @@ pub fn mutate(rng: std.Random, src: []const u8, dst: []u8) []u8 {
 }
 
 test "fuzz parseSharedStrings mutations" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterations();
-    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    var prng = std.Random.DefaultPrng.init(fuzzSeed(io));
     const rng = prng.random();
     var dst: [fuzz_max_input_len]u8 = undefined;
     for (0..iters) |_| {
@@ -6697,8 +6728,11 @@ test "fuzz parseSharedStrings mutations" {
 }
 
 test "fuzz parseWorkbookSheets mutations" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterations();
-    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    var prng = std.Random.DefaultPrng.init(fuzzSeed(io));
     const rng = prng.random();
     var wb_dst: [fuzz_max_input_len]u8 = undefined;
     var rels_dst: [fuzz_max_input_len]u8 = undefined;
@@ -6762,8 +6796,11 @@ fn consumeAllRows(alloc: std.mem.Allocator, shared_strings: []const []const u8, 
 }
 
 test "fuzz Rows.next mutations on real sheet XML" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterations();
-    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    var prng = std.Random.DefaultPrng.init(fuzzSeed(io));
     const rng = prng.random();
     var dst: [fuzz_max_input_len]u8 = undefined;
     // A 1-element SST so cells with t="s" can resolve index 0.
@@ -6775,8 +6812,11 @@ test "fuzz Rows.next mutations on real sheet XML" {
 }
 
 test "fuzz Rows.next on random bytes" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterations();
-    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    var prng = std.Random.DefaultPrng.init(fuzzSeed(io));
     const rng = prng.random();
     var buf: [fuzz_max_input_len]u8 = undefined;
     const sst = [_][]const u8{"shared-entry"};
@@ -6787,10 +6827,13 @@ test "fuzz Rows.next on random bytes" {
 }
 
 test "fuzz appendDecoded mutations" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Entity-dense template to exercise every branch of the decoder.
     const entity_template = "prefix &amp; &lt; &gt; &quot; &apos; &#233; &#xE9; &unknown; trailing";
     const iters = fuzzIterations();
-    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    var prng = std.Random.DefaultPrng.init(fuzzSeed(io));
     const rng = prng.random();
     var dst: [512]u8 = undefined;
     for (0..iters) |_| {
@@ -6810,7 +6853,7 @@ test "fuzz Book.open against arbitrary bytes" {
     // of inputs will accidentally pass the zip header and exercise the
     // XML parsers downstream.
     const iters = fuzzIterations() / 4; // file IO is expensive; scale down
-    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    var prng = std.Random.DefaultPrng.init(fuzzSeed(io));
     const rng = prng.random();
     var buf: [fuzz_max_input_len]u8 = undefined;
     for (0..iters) |_| {
@@ -6884,8 +6927,11 @@ pub const writer_types = @import("writer.zig");
 // deliberately-high SST indices and confirms the reader doesn't crash.
 
 test "fuzz Rows.next on synthetic cells with out-of-range SST indices" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzIterations();
-    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    var prng = std.Random.DefaultPrng.init(fuzzSeed(io));
     const rng = prng.random();
 
     // Build a tiny SST of 3 entries (indices 0..2 valid).

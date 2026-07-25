@@ -40,6 +40,7 @@
 //! the version untouched.
 
 const std = @import("std");
+const fuzz_config = @import("fuzz_config");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const xlsx = @import("zlsx");
@@ -2534,7 +2535,9 @@ fn cDxfBorderToZig(s: CDxfBorderSide) writer_mod.BorderSide {
     // Byte → BorderStyle enum. Out-of-range codes fall back to
     // `.none` (safe default — a misconfigured side renders as
     // inherit-from-cell instead of a random border shape).
-    const style: writer_mod.BorderStyle = std.meta.intToEnum(writer_mod.BorderStyle, s.style) catch .none;
+    // 0.16: `std.meta.intToEnum` (error union) became `std.enums.fromInt`
+    // (optional), so the out-of-range fallback is `orelse`, not `catch`.
+    const style: writer_mod.BorderStyle = std.enums.fromInt(writer_mod.BorderStyle, s.style) orelse .none;
     return .{
         .style = style,
         .color_argb = if (s.has_color != 0) s.color_argb else null,
@@ -3192,17 +3195,10 @@ test "writer C ABI: add_merged_cell round-trips + rejects bad ranges" {
 // ─── Fuzz tests ──────────────────────────────────────────────────────
 
 fn fuzzItersCabi() usize {
-    const env = std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_ITERS") catch return 1_000;
-    defer std.heap.page_allocator.free(env);
-    var digits: [32]u8 = undefined;
-    var di: usize = 0;
-    for (env) |c| {
-        if (c == '_') continue;
-        if (di == digits.len) break;
-        digits[di] = c;
-        di += 1;
-    }
-    return std.fmt.parseInt(usize, digits[0..di], 10) catch 1_000;
+    // Override comes from build.zig via -Dfuzz-iters or the
+    // XLSX_FUZZ_ITERS environment variable; 0.16 test binaries
+    // cannot read the environment themselves.
+    return fuzz_config.iters_override orelse 1_000;
 }
 
 // ─── Editor (load-modify-save) ───────────────────────────────────────
@@ -3350,13 +3346,12 @@ export fn zlsx_editor_save(
     return 0;
 }
 
-fn fuzzSeedCabi() u64 {
-    if (std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_SEED")) |s| {
-        defer std.heap.page_allocator.free(s);
-        return std.fmt.parseInt(u64, s, 10) catch 0xA1F8ED;
-    } else |_| {
-        return @bitCast(std.time.milliTimestamp());
-    }
+fn fuzzSeedCabi(io: std.Io) u64 {
+    if (fuzz_config.seed_override) |s| return s;
+    // std.time lost every function in 0.16; a varying default
+    // seed now comes from the monotonic clock via Io.
+    const ts = std.Io.Clock.now(.awake, io);
+    return @bitCast(@as(i64, @truncate(ts.nanoseconds)));
 }
 
 test "writer C ABI: write_row_with_formulas round-trips through reader" {
@@ -3606,8 +3601,11 @@ test "fromCCell: null str_ptr with str_len>0 is rejected" {
 }
 
 test "fuzz fromCCell: random tags never panic" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzItersCabi();
-    var prng = std.Random.DefaultPrng.init(fuzzSeedCabi());
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCabi(io));
     const rng = prng.random();
 
     // Keep a valid-looking str_ptr so the string-tag branch can
@@ -3641,8 +3639,11 @@ test "fuzz fromCCell: random tags never panic" {
 }
 
 test "fuzz toCCell ↔ fromCCell round-trip for valid Cells" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzItersCabi();
-    var prng = std.Random.DefaultPrng.init(fuzzSeedCabi());
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCabi(io));
     const rng = prng.random();
 
     var strpool: [256]u8 = undefined;
@@ -3682,8 +3683,11 @@ test "fuzz toCCell ↔ fromCCell round-trip for valid Cells" {
 }
 
 test "fuzz writer via C ABI: random operations round-trip" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzItersCabi() / 20; // expensive — real zip I/O
-    const seed = fuzzSeedCabi();
+    const seed = fuzzSeedCabi(io);
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var tmp_path_buf: [64]u8 = undefined;
@@ -3804,12 +3808,15 @@ test "fuzz writer via C ABI: random operations round-trip" {
 // ─── Deep C-ABI fuzz ────────────────────────────────────────────────
 
 test "fuzz C ABI: err_buf edge cases never overrun" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Known failure paths (missing file, unknown sheet name) with
     // minimum-length / NULL error buffers. writeError must refuse to
     // write anything when buf is NULL or len == 0, and must always
     // null-terminate when len >= 1.
     const iters = fuzzItersCabi();
-    var prng = std.Random.DefaultPrng.init(fuzzSeedCabi());
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCabi(io));
     const rng = prng.random();
 
     const bogus_path: [*:0]const u8 = "/nonexistent/__zlsx_fuzz_404__.xlsx";
@@ -3850,7 +3857,7 @@ test "fuzz C ABI: interleaved book + rows handles refcount correctly" {
     std.Io.Dir.cwd().access(io, corpus, .{}) catch return;
 
     const iters = fuzzItersCabi() / 10;
-    const seed = fuzzSeedCabi();
+    const seed = fuzzSeedCabi(io);
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     const path_z: [*:0]const u8 = @ptrCast(corpus.ptr);
@@ -3898,13 +3905,16 @@ test "fuzz C ABI: interleaved book + rows handles refcount correctly" {
 }
 
 test "fuzz C ABI writer: NULL err_buf + zero-cell rows" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // NULL err_buf on all failure paths, plus write_row with NULL cells
     // and cells_len=0 (which is a legitimate empty row per the ABI).
     const iters = fuzzItersCabi();
-    var prng = std.Random.DefaultPrng.init(fuzzSeedCabi());
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCabi(io));
     const rng = prng.random();
 
-    const seed = fuzzSeedCabi();
+    const seed = fuzzSeedCabi(io);
     var tmp_buf: [64]u8 = undefined;
     var tt = TestTmp.init();
 
@@ -3957,11 +3967,14 @@ test "fuzz C ABI writer: NULL err_buf + zero-cell rows" {
 }
 
 test "fuzz C ABI: random u32 tag in CCell never panics through full row" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Goes beyond the existing fromCCell unit fuzz — runs the bad-tag
     // CCell through an actual zlsx_sheet_writer_write_row call so the
     // integer-precision pre-pass + error return path are also exercised.
     const iters = fuzzItersCabi();
-    var prng = std.Random.DefaultPrng.init(fuzzSeedCabi());
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCabi(io));
     const rng = prng.random();
     var err_buf: [64]u8 = undefined;
 

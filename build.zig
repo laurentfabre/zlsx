@@ -93,6 +93,34 @@ pub fn build(b: *std.Build) void {
     fresh_emit_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
     fresh_emit_mod.addImport("zlsx_zip", zip_mod);
 
+    // PRNG fuzz-harness knobs.
+    //
+    // These used to be read at runtime via `std.process.getEnvVarOwned`.
+    // Zig 0.16 removed that, and made the process environment
+    // non-ambient: a test binary built with `Io.Threaded.init(gpa, .{})`
+    // sees an EMPTY environ, so a test can no longer read
+    // XLSX_FUZZ_ITERS itself (verified experimentally, not assumed).
+    //
+    // The build runner still has an environment, so read the same two
+    // variables here and pass them down as build options. That keeps
+    // the documented invocation working unchanged:
+    //
+    //     XLSX_FUZZ_ITERS=50_000 zig build test
+    //     XLSX_FUZZ_SEED=12345   zig build test
+    //
+    // An explicit -Dfuzz-iters / -Dfuzz-seed wins over the environment
+    // so a CI job can pin values regardless of ambient state.
+    const fuzz_opts = b.addOptions();
+    fuzz_opts.addOption(?usize, "iters_override", blk: {
+        if (b.option(usize, "fuzz-iters", "PRNG fuzz iterations per target")) |v| break :blk v;
+        break :blk parseUnderscoredInt(usize, b.graph.environ_map.get("XLSX_FUZZ_ITERS"));
+    });
+    fuzz_opts.addOption(?u64, "seed_override", blk: {
+        if (b.option(u64, "fuzz-seed", "PRNG fuzz seed")) |v| break :blk v;
+        break :blk parseUnderscoredInt(u64, b.graph.environ_map.get("XLSX_FUZZ_SEED"));
+    });
+    const fuzz_config_mod = fuzz_opts.createModule();
+
     // Public module. Consumers add zlsx to their build.zig.zon as a
     // path or git dependency, then `@import("zlsx")`.
     const zlsx_mod = b.addModule("zlsx", .{
@@ -106,6 +134,7 @@ pub fn build(b: *std.Build) void {
     zlsx_mod.addImport("zlsx_zip", zip_mod);
     zlsx_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
     zlsx_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
+    zlsx_mod.addImport("fuzz_config", fuzz_config_mod);
 
     // Unit tests (embedded in src/xlsx.zig, including the fuzz suite).
     const unit_mod = b.createModule(.{
@@ -119,6 +148,7 @@ pub fn build(b: *std.Build) void {
     unit_mod.addImport("zlsx_zip", zip_mod);
     unit_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
     unit_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
+    unit_mod.addImport("fuzz_config", fuzz_config_mod);
     const unit_tests = b.addTest(.{ .root_module = unit_mod });
     const test_step = b.step("test", "Run zlsx unit + fuzz-smoke tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
@@ -144,6 +174,7 @@ pub fn build(b: *std.Build) void {
     unit_fuzz_mod.addImport("zlsx_zip", zip_mod);
     unit_fuzz_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
     unit_fuzz_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
+    unit_fuzz_mod.addImport("fuzz_config", fuzz_config_mod);
     const unit_fuzz_tests = b.addTest(.{ .root_module = unit_fuzz_mod });
     const fuzz_step = b.step("fuzz", "Run coverage-guided fuzz targets (Linux x64; macOS/Windows broken upstream)");
     fuzz_step.dependOn(&b.addRunArtifact(unit_fuzz_tests).step);
@@ -182,6 +213,7 @@ pub fn build(b: *std.Build) void {
         .single_threaded = single_threaded,
     });
     cli_mod.addImport("build_options", build_options_mod);
+    cli_mod.addImport("fuzz_config", fuzz_config_mod);
     // `cli_mod.addImport("zlsx", zlsx_mod);` is wired below, after
     // `package_mod` is declared (cli also gains a `zlsx_pkg` dep
     // post B2 iter-er-0).
@@ -211,6 +243,7 @@ pub fn build(b: *std.Build) void {
     writer_mod.addImport("zlsx_zip", zip_mod);
     writer_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
     writer_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
+    writer_mod.addImport("fuzz_config", fuzz_config_mod);
     const writer_tests = b.addTest(.{ .root_module = writer_mod });
     test_step.dependOn(&b.addRunArtifact(writer_tests).step);
 
@@ -511,6 +544,7 @@ pub fn build(b: *std.Build) void {
         .single_threaded = single_threaded,
     });
     c_abi_mod.addImport("build_options", build_options_mod);
+    c_abi_mod.addImport("fuzz_config", fuzz_config_mod);
     // After the B2 iter-er-0 Editor relocation, c_abi reaches Editor
     // through zlsx_pkg and xlsx via the named `zlsx` dep (no more
     // relative `@import("xlsx.zig")` / `@import("writer.zig")`, so
@@ -687,4 +721,23 @@ pub fn build(b: *std.Build) void {
 
     const bench_synth_tests = b.addTest(.{ .root_module = bench_synth_mod });
     test_step.dependOn(&b.addRunArtifact(bench_synth_tests).step);
+}
+
+/// Parse an optional env-var string that may contain `_` digit
+/// separators ("1_000_000"), the spelling the fuzz docs use. Returns
+/// null for absent or unparseable input so the caller falls back to the
+/// in-source default rather than failing the build on a typo'd shell
+/// variable.
+fn parseUnderscoredInt(comptime T: type, raw: ?[]const u8) ?T {
+    const s = raw orelse return null;
+    var digits: [32]u8 = undefined;
+    var n: usize = 0;
+    for (s) |c| {
+        if (c == '_') continue;
+        if (n == digits.len) return null;
+        digits[n] = c;
+        n += 1;
+    }
+    if (n == 0) return null;
+    return std.fmt.parseInt(T, digits[0..n], 10) catch null;
 }
