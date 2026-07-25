@@ -160,6 +160,18 @@ Throughput at that size (rows/sec):
 | xlsxwriter | ~15,070 |
 | openpyxl | ~6,590 |
 
+> ⚠️ **The zlsx write-path rows above are pre-0.16 and need re-running.**
+> They were measured on 2026-04-25 against the in-house LZ77 +
+> dynamic-huffman encoder, which the Zig 0.16 migration retired in
+> favour of stdlib `std.compress.flate`. A spot check after the swap
+> (100k rows × 5 cells, ReleaseFast, Apple silicon) sustained
+> **~590,000 styled rows/sec**, so the change is not a regression — but
+> that is a different machine and row shape, so it does not slot into
+> this table. The three-way comparison needs a fresh `hyperfine` run
+> with xlsxwriter and openpyxl present before these numbers are trusted
+> again. Reader rows are unaffected: the read path already used
+> stdlib `std.compress.flate.Decompress`.
+
 ### Methodology — allocator choice matters
 
 The bench binary uses `std.heap.smp_allocator`. An earlier revision used `std.heap.DebugAllocator(.{})` — that allocator tracks every allocation with metadata + (optionally) stack traces and makes the same workload take ~2.5× longer (24–29 ms instead of 9–10 ms on this hardware). `DebugAllocator` is the right default inside *tests* because it catches leaks and double-frees; it is **not** what a production downstream user would plug into `Writer.init`. The numbers above use the allocator a real caller would reach for.

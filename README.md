@@ -4,7 +4,7 @@
 
 # zlsx
 
-Tiny `.xlsx` reader **and** writer for Zig. Single-file library, no third-party deps — just `std.zip` + `std.compress.flate` (for reads) + an in-house LZ77 + dynamic-huffman deflate compressor with lazy matching (for writes, since Zig 0.16.0's `std.compress.flate.Compress` is still mid-refactor) + a hand-rolled XML walker scoped to what spreadsheets actually need. Ships with a CLI, a C ABI, and Python bindings.
+Tiny `.xlsx` reader **and** writer for Zig. Single-file library, no third-party deps — just `std.zip` + `std.compress.flate` (both directions) + a hand-rolled XML walker scoped to what spreadsheets actually need. Ships with a CLI, a C ABI, and Python bindings.
 
 **Reader**: 1.7-2.0 ms on small files, **3.3 ms / 2.37 MB** on a 67 KB workbook with 1,144 shared strings — **1.11× faster than calamine-rust**, 6.4× faster than python-calamine, 37× faster than openpyxl on that file, at the **smallest RSS of the four** (~7-18× lower than the Python stack, ~1.3× lower than calamine). Native-speed tier on every corpus file. [Full benchmark table →](docs/benchmarks.md)
 
@@ -419,7 +419,7 @@ zlsx leads calamine-rust on **every corpus file** (1.02-1.11× faster), holds th
 | xlsxwriter 3.2 (`constant_memory`) | 66.4 ms | 25.61 MB | 55.2 KB | 9.93× slower |
 | openpyxl 3.1 (`write_only`) | 151.9 ms | 41.65 MB | 52.8 KB | 22.74× slower |
 
-zlsx Writer ships an in-house LZ77 + dynamic-huffman deflate compressor with lazy matching and a word-size SIMD match-length compare — 8 bytes per XOR-then-`@ctz` pass in the LZ77 inner loop, ~6× fewer iterations than byte-at-a-time on typical 3-30-byte XML matches. Zig 0.16.0's stdlib `std.compress.flate.Compress` is still mid-refactor and does not compile (we piggy-back on `std.compress.flate.HuffmanEncoder`, the one module in `std.compress.flate` that *is* usable). Sub-1 KB entries bypass compression so the dynamic-block header overhead doesn't inflate tiny XML. **~149,000 styled rows/sec** — 9.93× xlsxwriter, 22.74× openpyxl, at a third of xlsxwriter's RSS. See [`docs/benchmarks.md`](docs/benchmarks.md) for the full matrix.
+zlsx Writer compresses ZIP payloads with Zig 0.16's public `std.compress.flate.Compress` at its default level. Earlier releases carried an in-house LZ77 + dynamic-huffman encoder purely because 0.15.2's stdlib compressor did not compile; 0.16 ships a working one, so ~500 lines of hand-rolled tokenizer, bit-writer and codegen were retired in its favour. Sub-1 KB entries bypass compression so deflate block overhead doesn't inflate tiny XML. Measured after the swap: **~590,000 styled rows/sec** (100k rows x 5 cells, ReleaseFast, Apple silicon), comfortably above the ~149,000 rows/sec the in-house encoder was documented at. Treat that as an absolute floor rather than a speedup ratio — the old encoder cannot be built on 0.16 at all, so a same-machine A/B is not possible. See [`docs/benchmarks.md`](docs/benchmarks.md) for the full matrix.
 
 ## Zig version
 

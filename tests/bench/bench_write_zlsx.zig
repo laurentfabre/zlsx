@@ -11,6 +11,7 @@ const std = @import("std");
 const xlsx = @import("zlsx");
 
 pub fn main(init: std.process.Init) !void {
+    const io = init.io;
     const alloc = std.heap.smp_allocator;
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
@@ -67,5 +68,5 @@ pub fn main(init: std.process.Init) !void {
         try sheet.writeRowStyled(&cells, &styles);
     }
 
-    try w.save(args[1]);
+    try w.save(io, args[1]);
 }
