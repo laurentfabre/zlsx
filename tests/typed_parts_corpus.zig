@@ -55,7 +55,7 @@ test "typed_parts corpus sweep — every well-known part parses without leak" {
         std.Io.Dir.cwd().access(io, path, .{}) catch continue;
         any_seen = true;
 
-        var store = pkg.PartStore.open(alloc, path) catch |err| {
+        var store = pkg.PartStore.open(alloc, io, path) catch |err| {
             std.debug.print("\n  [open failed] {s} -> {s}\n", .{ name, @errorName(err) });
             return err;
         };

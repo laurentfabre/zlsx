@@ -1608,7 +1608,7 @@ test "PartStore.open: enumerates parts of frictionless_2sheets.xlsx" {
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
-    var store = try PartStore.open(std.testing.allocator, fixture);
+    var store = try PartStore.open(std.testing.allocator, io, fixture);
     defer store.deinit();
 
     const names = try store.partNames();
@@ -1632,7 +1632,7 @@ test "PartStore.part: workbook.xml has a workbook content type" {
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
-    var store = try PartStore.open(std.testing.allocator, fixture);
+    var store = try PartStore.open(std.testing.allocator, io, fixture);
     defer store.deinit();
 
     const wb = try store.part("xl/workbook.xml") orelse return error.TestUnexpectedResult;
@@ -1655,7 +1655,7 @@ test "PartStore.rels: package-root + workbook rels parse" {
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
-    var store = try PartStore.open(std.testing.allocator, fixture);
+    var store = try PartStore.open(std.testing.allocator, io, fixture);
     defer store.deinit();
 
     // Package-level rels (`_rels/.rels`, owner = "") must point at
@@ -1705,7 +1705,7 @@ test "PartStore.resolve: relative + absolute targets" {
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
-    var store = try PartStore.open(std.testing.allocator, fixture);
+    var store = try PartStore.open(std.testing.allocator, io, fixture);
     defer store.deinit();
 
     // Relative: workbook.xml's rels target "worksheets/sheet1.xml" →
@@ -1730,7 +1730,7 @@ test "PartStore.imageParts: extract embedded images (C2a MVP)" {
     const fixture = "tests/corpus/poi_58325_db.xlsx";
     std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
-    var store = try PartStore.open(std.testing.allocator, fixture);
+    var store = try PartStore.open(std.testing.allocator, io, fixture);
     defer store.deinit();
 
     const images = try store.imageParts();
@@ -1754,7 +1754,7 @@ test "PartStore: data descriptors detected in fixtures with flag 0x0008" {
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
-    var store = try PartStore.open(std.testing.allocator, fixture);
+    var store = try PartStore.open(std.testing.allocator, io, fixture);
     defer store.deinit();
 
     // frictionless_2sheets.xlsx has data-descriptor flag set on every
@@ -1783,16 +1783,16 @@ test "PartStore.save: byte-preserving round-trip with no mutations" {
     defer std.testing.allocator.free(out_path);
 
     {
-        var store = try PartStore.open(std.testing.allocator, fixture);
+        var store = try PartStore.open(std.testing.allocator, io, fixture);
         defer store.deinit();
         try store.save(out_path);
     }
 
     // Re-open the saved file. Every part must decompress to the
     // same bytes as the source.
-    var src = try PartStore.open(std.testing.allocator, fixture);
+    var src = try PartStore.open(std.testing.allocator, io, fixture);
     defer src.deinit();
-    var dst = try PartStore.open(std.testing.allocator, out_path);
+    var dst = try PartStore.open(std.testing.allocator, io, out_path);
     defer dst.deinit();
 
     try std.testing.expectEqual(src.parts.len, dst.parts.len);
@@ -1822,7 +1822,7 @@ test "PartStore.replacePart + save: replaced part has new bytes; others untouche
 
     var src_workbook_bytes: []const u8 = undefined;
     {
-        var store = try PartStore.open(std.testing.allocator, fixture);
+        var store = try PartStore.open(std.testing.allocator, io, fixture);
         defer store.deinit();
         const wb_part = try store.part("xl/workbook.xml") orelse return error.TestUnexpectedResult;
         src_workbook_bytes = wb_part.bytes;
@@ -1833,7 +1833,7 @@ test "PartStore.replacePart + save: replaced part has new bytes; others untouche
         try store.save(out_path);
     }
 
-    var dst = try PartStore.open(std.testing.allocator, out_path);
+    var dst = try PartStore.open(std.testing.allocator, io, out_path);
     defer dst.deinit();
 
     // Replaced part has the new bytes.
@@ -1843,7 +1843,7 @@ test "PartStore.replacePart + save: replaced part has new bytes; others untouche
     // Sanity: at least one OTHER part still matches the source's
     // decompressed bytes byte-for-byte. sharedStrings.xml in
     // frictionless_2sheets is a stable Override-typed part.
-    var src = try PartStore.open(std.testing.allocator, fixture);
+    var src = try PartStore.open(std.testing.allocator, io, fixture);
     defer src.deinit();
     if (try src.part("xl/sharedStrings.xml")) |s| {
         const d = try dst.part("xl/sharedStrings.xml") orelse return error.TestUnexpectedResult;
@@ -1874,7 +1874,7 @@ test "PartStore.replacePart: large input round-trips through deflate" {
     const replacement: []const u8 = &buf;
 
     {
-        var store = try PartStore.open(std.testing.allocator, fixture);
+        var store = try PartStore.open(std.testing.allocator, io, fixture);
         defer store.deinit();
         try store.replacePart("xl/workbook.xml", replacement);
         // Compression must shrink the payload — 10 KiB of one byte
@@ -1885,7 +1885,7 @@ test "PartStore.replacePart: large input round-trips through deflate" {
         try store.save(out_path);
     }
 
-    var dst = try PartStore.open(std.testing.allocator, out_path);
+    var dst = try PartStore.open(std.testing.allocator, io, out_path);
     defer dst.deinit();
     const wb = try dst.part("xl/workbook.xml") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, replacement, wb.bytes);
@@ -1898,7 +1898,7 @@ test "PartStore.replacePart: unknown part name returns PartNotFound" {
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
-    var store = try PartStore.open(std.testing.allocator, fixture);
+    var store = try PartStore.open(std.testing.allocator, io, fixture);
     defer store.deinit();
 
     try std.testing.expectError(error.PartNotFound, store.replacePart("xl/does_not_exist.xml", "x"));
@@ -1910,13 +1910,13 @@ test "PartStore.open: rejects non-PK file" {
     const io = threaded.io();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "garbage.xlsx", .data = "not a zip" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "garbage.xlsx", .data = "not a zip" });
     const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "garbage.xlsx" });
     defer std.testing.allocator.free(path);
 
-    try std.testing.expectError(Error.NotPkzip, PartStore.open(std.testing.allocator, path));
+    try std.testing.expectError(Error.NotPkzip, PartStore.open(std.testing.allocator, io, path));
 }
 
 test "PartStore.open: rejects split-disk EOCD" {
@@ -1934,7 +1934,7 @@ test "PartStore.open: rejects split-disk EOCD" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "split.xlsx", .data = &eocd });
+    try tmp.dir.writeFile(io, .{ .sub_path = "split.xlsx", .data = &eocd });
     const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "split.xlsx" });
@@ -1942,7 +1942,7 @@ test "PartStore.open: rejects split-disk EOCD" {
 
     try std.testing.expectError(
         Error.SplitArchiveNotSupported,
-        PartStore.open(std.testing.allocator, path),
+        PartStore.open(std.testing.allocator, io, path),
     );
 }
 
@@ -2029,7 +2029,7 @@ test "PartStore.resolve: external targets return null" {
     const io = threaded.io();
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
-    var store = try PartStore.open(std.testing.allocator, fixture);
+    var store = try PartStore.open(std.testing.allocator, io, fixture);
     defer store.deinit();
 
     try std.testing.expectEqual(@as(?[]const u8, null), try store.resolve("xl/worksheets/sheet1.xml", "https://example.com/a.png"));
@@ -2102,13 +2102,13 @@ test "PartStore.addPart + save: new part survives round-trip with content type" 
     const new_part_bytes = "<?xml version=\"1.0\"?><custom>added</custom>";
 
     {
-        var store = try PartStore.open(std.testing.allocator, fixture);
+        var store = try PartStore.open(std.testing.allocator, io, fixture);
         defer store.deinit();
         try store.addPart(new_part_name, new_part_ct, new_part_bytes);
         try store.save(out_path);
     }
 
-    var dst = try PartStore.open(std.testing.allocator, out_path);
+    var dst = try PartStore.open(std.testing.allocator, io, out_path);
     defer dst.deinit();
 
     const part_in_dst = try dst.part(new_part_name) orelse return error.TestUnexpectedResult;
@@ -2131,14 +2131,14 @@ test "PartStore.addPart: multiple parts in one session all register content type
     defer std.testing.allocator.free(out_path);
 
     {
-        var store = try PartStore.open(std.testing.allocator, fixture);
+        var store = try PartStore.open(std.testing.allocator, io, fixture);
         defer store.deinit();
         try store.addPart("xl/customA.xml", "application/xml", "<a/>");
         try store.addPart("xl/customB.xml", "application/xml", "<b/>");
         try store.save(out_path);
     }
 
-    var dst = try PartStore.open(std.testing.allocator, out_path);
+    var dst = try PartStore.open(std.testing.allocator, io, out_path);
     defer dst.deinit();
 
     // Both parts present.
@@ -2172,13 +2172,13 @@ test "PartStore.addPart: XML-escapes part name + content type into Content_Types
     // serialise it as `&amp;` to keep the XML well-formed.
     const tricky_name = "xl/a&b.xml";
     {
-        var store = try PartStore.open(std.testing.allocator, fixture);
+        var store = try PartStore.open(std.testing.allocator, io, fixture);
         defer store.deinit();
         try store.addPart(tricky_name, "application/xml", "<x/>");
         try store.save(out_path);
     }
 
-    var dst = try PartStore.open(std.testing.allocator, out_path);
+    var dst = try PartStore.open(std.testing.allocator, io, out_path);
     defer dst.deinit();
     // Reopened part is found under its raw name (the .rels parser
     // decodes entities to recover the literal).
@@ -2203,7 +2203,7 @@ test "PartStore.addPart: rejects duplicate part name" {
     const fixture = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
-    var store = try PartStore.open(std.testing.allocator, fixture);
+    var store = try PartStore.open(std.testing.allocator, io, fixture);
     defer store.deinit();
 
     try std.testing.expectError(
@@ -2317,13 +2317,13 @@ test "PartStore.addPart: large input round-trips through deflate" {
     @memset(big_bytes, 'A');
 
     {
-        var store = try PartStore.open(std.testing.allocator, fixture);
+        var store = try PartStore.open(std.testing.allocator, io, fixture);
         defer store.deinit();
         try store.addPart("xl/extra.bin", "application/octet-stream", big_bytes);
         try store.save(out_path);
     }
 
-    var dst = try PartStore.open(std.testing.allocator, out_path);
+    var dst = try PartStore.open(std.testing.allocator, io, out_path);
     defer dst.deinit();
     const got = try dst.part("xl/extra.bin") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, big_bytes, got.bytes);
@@ -2351,7 +2351,7 @@ test "PartStore.addPart: atomic on every allocation-failure step" {
             // own contract: every OOM either propagates as-is or
             // is converted to a different error. open() failing
             // is fine; we just need to propagate it.
-            var store = try PartStore.open(alloc, src_fixture);
+            var store = try PartStore.open(alloc, io, src_fixture);
             defer store.deinit();
 
             const before_count = store.parts.len;
@@ -2452,7 +2452,7 @@ test "PartStore.fresh: save round-trips through PartStore.open" {
         try store.save(out_path);
     }
 
-    var dst = try PartStore.open(std.testing.allocator, out_path);
+    var dst = try PartStore.open(std.testing.allocator, io, out_path);
     defer dst.deinit();
 
     const small = (try dst.part(small_name)) orelse return error.TestUnexpectedResult;
@@ -2495,7 +2495,7 @@ test "PartStore.fresh: save with zero addParts produces a valid 1-entry ZIP" {
         try store.save(out_path);
     }
 
-    var dst = try PartStore.open(std.testing.allocator, out_path);
+    var dst = try PartStore.open(std.testing.allocator, io, out_path);
     defer dst.deinit();
 
     const dst_names = try dst.partNames();

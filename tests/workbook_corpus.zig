@@ -51,7 +51,7 @@ test "Workbook corpus sweep — open + materialise every sheet without leak" {
         std.Io.Dir.cwd().access(io, path, .{}) catch continue;
         any_seen = true;
 
-        var wb = pkg.Workbook.open(alloc, path) catch |err| {
+        var wb = pkg.Workbook.open(alloc, io, path) catch |err| {
             std.debug.print("\n  [Workbook.open failed] {s} -> {s}\n", .{ name, @errorName(err) });
             return err;
         };

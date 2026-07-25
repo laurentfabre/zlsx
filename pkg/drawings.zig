@@ -1815,7 +1815,7 @@ test "imageAnchors: openxlsx_loadExample.xlsx surfaces 2 anchored images" {
     const fixture = "tests/corpus/openxlsx_loadExample.xlsx";
     std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
-    var s = try PartStore.open(std.testing.allocator, fixture);
+    var s = try PartStore.open(std.testing.allocator, io, fixture);
     defer s.deinit();
 
     const anchors = try imageAnchors(&s, std.testing.allocator);
@@ -1849,7 +1849,7 @@ test "imageAnchors: skips drawings with shapes only (no <xdr:pic>)" {
     const fixture = "tests/corpus/poi_58325_db.xlsx";
     std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
-    var s = try PartStore.open(std.testing.allocator, fixture);
+    var s = try PartStore.open(std.testing.allocator, io, fixture);
     defer s.deinit();
 
     const anchors = try imageAnchors(&s, std.testing.allocator);
@@ -1872,7 +1872,7 @@ test "imageAnchors: workbook with no drawings returns empty slice" {
     const fixture = "tests/corpus/worldbank_catalog.xlsx";
     std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
-    var s = try PartStore.open(std.testing.allocator, fixture);
+    var s = try PartStore.open(std.testing.allocator, io, fixture);
     defer s.deinit();
 
     const anchors = try imageAnchors(&s, std.testing.allocator);
@@ -1888,7 +1888,7 @@ test "chartAnchors: openxlsx_loadExample.xlsx surfaces embedded charts" {
     const fixture = "tests/corpus/openxlsx_loadExample.xlsx";
     std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
-    var s = try PartStore.open(std.testing.allocator, fixture);
+    var s = try PartStore.open(std.testing.allocator, io, fixture);
     defer s.deinit();
 
     const charts = try chartAnchors(&s, std.testing.allocator);
@@ -1934,7 +1934,7 @@ test "chartAnchors: workbook with no charts returns empty slice" {
     const fixture = "tests/corpus/worldbank_catalog.xlsx";
     std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
-    var s = try PartStore.open(std.testing.allocator, fixture);
+    var s = try PartStore.open(std.testing.allocator, io, fixture);
     defer s.deinit();
 
     const charts = try chartAnchors(&s, std.testing.allocator);

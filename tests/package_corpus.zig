@@ -93,7 +93,7 @@ test "PartStore corpus sweep — open + walk every fixture without crash" {
         std.Io.Dir.cwd().access(io, path, .{}) catch continue;
         any_seen = true;
 
-        const open_result = pkg.PartStore.open(alloc, path);
+        const open_result = pkg.PartStore.open(alloc, io, path);
         switch (fix.verdict) {
             .must_open_clean => {
                 var store = open_result catch |err| {

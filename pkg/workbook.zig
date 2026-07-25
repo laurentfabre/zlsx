@@ -5815,7 +5815,7 @@ test "Workbook.open: minimal corpus fixture exposes sheets" {
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     try std.testing.expectEqual(@as(u32, 2), wb.sheetCount());
@@ -5837,7 +5837,7 @@ test "Workbook.sheetByName: case-sensitive lookup, null on miss" {
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     const found = try wb.sheetByName("Sheet1");
@@ -5858,7 +5858,7 @@ test "Worksheet.ensureParsed: lazy cells/rows materialise on access" {
     const path = "tests/corpus/openpyxl_guess_types.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     const s0 = try wb.sheet(0);
@@ -5877,7 +5877,7 @@ test "Workbook.sst: optional, lazily parsed, cached" {
     const path = "tests/corpus/worldbank_catalog.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     const sst1 = try wb.sst();
@@ -5895,7 +5895,7 @@ test "Workbook.styles: lazily parsed, returns non-null on a real fixture" {
     const path = "tests/corpus/worldbank_catalog.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     const st = try wb.styles();
@@ -5909,7 +5909,7 @@ test "Workbook.numberFormatFor: built-in id 0 resolves to General" {
     const path = "tests/corpus/worldbank_catalog.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     // Find a style whose numFmtId is a built-in (≥0, <164). Most
@@ -5943,7 +5943,7 @@ test "Workbook.numberFormatFor: out-of-range style_idx returns null" {
     const path = "tests/corpus/worldbank_catalog.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     const st = (try wb.styles()).?;
@@ -6028,7 +6028,7 @@ test "Workbook.definedNames: surfaces empty list on fixture without names" {
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     // frictionless emits `<definedNames/>` (self-closing). Should
@@ -6044,7 +6044,7 @@ test "Workbook.definedNamesGlobal / definedNamesForSheet: split by scope" {
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     const global = try wb.definedNamesGlobal(std.testing.allocator);
@@ -6066,7 +6066,7 @@ test "Workbook.sstText: plain entry returns the raw slice; rich errors" {
     const path = "tests/corpus/worldbank_catalog.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     // The corpus fixture's first SST entry should be plain text.
@@ -6086,7 +6086,7 @@ test "Worksheet.cellByRef: A1-ref lookup matches case-insensitively" {
     const path = "tests/corpus/openpyxl_guess_types.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     const s0 = try wb.sheet(0);
@@ -6143,11 +6143,11 @@ test "Workbook.setCell + save: round-trip a number through PartStore" {
     // Stage a temp output path under .zig-cache (always writable in
     // CI). Random suffix so parallel test binaries don't collide.
     var tmp_buf: [256]u8 = undefined;
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-setcell-{d}.xlsx", .{prng.random().int(u32)});
 
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
         const s0 = try wb.sheet(0);
         try s0.setCell("A1", .{ .number = 42 });
@@ -6157,7 +6157,7 @@ test "Workbook.setCell + save: round-trip a number through PartStore" {
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
     // Re-open and verify the cells round-tripped.
-    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb2.deinit();
     const s0 = try wb2.sheet(0);
     const a1 = try s0.cellByRef("A1");
@@ -6182,11 +6182,11 @@ test "Workbook.setCell + save: boolean and blank land typed correctly" {
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
     var tmp_buf: [256]u8 = undefined;
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-bool-{d}.xlsx", .{prng.random().int(u32)});
 
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
         const s0 = try wb.sheet(0);
         try s0.setCell("A1", .{ .boolean = true });
@@ -6196,7 +6196,7 @@ test "Workbook.setCell + save: boolean and blank land typed correctly" {
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb2.deinit();
     const s0 = try wb2.sheet(0);
 
@@ -6224,7 +6224,7 @@ test "Workbook.setCell: invalid ref errors before saving" {
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, src_path);
+    var wb = try Workbook.open(std.testing.allocator, io, src_path);
     defer wb.deinit();
     const s0 = try wb.sheet(0);
 
@@ -6240,11 +6240,11 @@ test "Workbook.setCell: string round-trips via inlineStr" {
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
     var tmp_buf: [256]u8 = undefined;
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-string-{d}.xlsx", .{prng.random().int(u32)});
 
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
         const s0 = try wb.sheet(0);
         // Simple string
@@ -6257,7 +6257,7 @@ test "Workbook.setCell: string round-trips via inlineStr" {
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb2.deinit();
     const s0 = try wb2.sheet(0);
 
@@ -6287,7 +6287,7 @@ test "Workbook.setCell: control bytes in string rejected before save" {
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, src_path);
+    var wb = try Workbook.open(std.testing.allocator, io, src_path);
     defer wb.deinit();
     const s0 = try wb.sheet(0);
 
@@ -6312,7 +6312,7 @@ test "Workbook.setCell: string overwrite frees prior allocation" {
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, src_path);
+    var wb = try Workbook.open(std.testing.allocator, io, src_path);
     defer wb.deinit();
     const s0 = try wb.sheet(0);
 
@@ -6332,11 +6332,11 @@ test "Workbook.setCell: formula round-trips with no cached value" {
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
     var tmp_buf: [256]u8 = undefined;
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-formula-{d}.xlsx", .{prng.random().int(u32)});
 
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
         const s0 = try wb.sheet(0);
         try s0.setCell("A1", .{ .formula = "SUM(B1:B10)" });
@@ -6346,7 +6346,7 @@ test "Workbook.setCell: formula round-trips with no cached value" {
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb2.deinit();
     const s0 = try wb2.sheet(0);
 
@@ -6371,7 +6371,7 @@ test "Workbook.setCell: formula control bytes rejected; overwrite leak-free" {
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, src_path);
+    var wb = try Workbook.open(std.testing.allocator, io, src_path);
     defer wb.deinit();
     const s0 = try wb.sheet(0);
 
@@ -6395,14 +6395,14 @@ test "Workbook.setCell: shared_string round-trips on a fixture WITH existing SST
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
     var tmp_buf: [256]u8 = undefined;
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-sst-extend-{d}.xlsx", .{prng.random().int(u32)});
 
     const new_text = "zlsx-iter-wb-4-m4-sentinel-string";
 
     var pre_count: u32 = 0;
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
         const sst_view = (try wb.sst()).?;
         pre_count = @intCast(sst_view.entries.len);
@@ -6414,7 +6414,7 @@ test "Workbook.setCell: shared_string round-trips on a fixture WITH existing SST
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb2.deinit();
 
     // SST grew by exactly one and the new entry resolves to our text.
@@ -6444,7 +6444,7 @@ test "Workbook.setCell: shared_string creates SST on a workbook without one" {
     const alloc = std.testing.allocator;
 
     var tmp_buf: [256]u8 = undefined;
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     const src_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-sstless-src-{d}.xlsx", .{prng.random().int(u32)});
     var tmp_buf2: [256]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_buf2, ".zig-cache/test-wb-sstless-out-{d}.xlsx", .{prng.random().int(u32)});
@@ -6455,14 +6455,14 @@ test "Workbook.setCell: shared_string creates SST on a workbook without one" {
     const new_text = "fresh-sst-greeting";
     // Sanity: the synthetic source has no SST.
     {
-        var wb_check = try Workbook.open(alloc, src_path);
+        var wb_check = try Workbook.open(alloc, io, src_path);
         defer wb_check.deinit();
         const v = try wb_check.sst();
         try std.testing.expect(v == null);
     }
 
     {
-        var wb = try Workbook.open(alloc, src_path);
+        var wb = try Workbook.open(alloc, io, src_path);
         defer wb.deinit();
         const s0 = try wb.sheet(0);
         try s0.setCell("A1", .{ .shared_string = new_text });
@@ -6470,7 +6470,7 @@ test "Workbook.setCell: shared_string creates SST on a workbook without one" {
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb2 = try Workbook.open(alloc, tmp_path);
+    var wb2 = try Workbook.open(alloc, io, tmp_path);
     defer wb2.deinit();
 
     // SST part now exists with exactly one entry at index 0.
@@ -6496,14 +6496,14 @@ test "Workbook.setCell: shared_string de-dups identical text across cells" {
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
     var tmp_buf: [256]u8 = undefined;
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-sst-dedup-{d}.xlsx", .{prng.random().int(u32)});
 
     const new_text = "zlsx-dedup-target-string";
 
     var pre_count: u32 = 0;
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
         pre_count = @intCast((try wb.sst()).?.entries.len);
 
@@ -6514,7 +6514,7 @@ test "Workbook.setCell: shared_string de-dups identical text across cells" {
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb2.deinit();
 
     // SST grew by exactly ONE despite two cells writing the same text.
@@ -6543,7 +6543,7 @@ test "Workbook.setCell: mixed inlineStr + shared_string in one save" {
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
     var tmp_buf: [256]u8 = undefined;
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-sst-mixed-{d}.xlsx", .{prng.random().int(u32)});
 
     const inline_text = "stays-inline-mixed-mode";
@@ -6551,7 +6551,7 @@ test "Workbook.setCell: mixed inlineStr + shared_string in one save" {
 
     var pre_count: u32 = 0;
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
         pre_count = @intCast((try wb.sst()).?.entries.len);
 
@@ -6562,7 +6562,7 @@ test "Workbook.setCell: mixed inlineStr + shared_string in one save" {
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb2.deinit();
     const sst2 = (try wb2.sst()).?;
     try std.testing.expectEqual(@as(usize, pre_count + 1), sst2.entries.len);
@@ -6593,7 +6593,7 @@ test "Workbook.fromBook: round-trip parity with Book.open on same path" {
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var book = try zlsx.Book.open(std.testing.allocator, path);
+    var book = try zlsx.Book.open(std.testing.allocator, io, path);
     defer book.deinit();
 
     var wb = try Workbook.fromBook(std.testing.allocator, &book, path);
@@ -6614,7 +6614,7 @@ test "Workbook.fromBook: independent lifetime — wb deinits before book" {
     const path = "tests/corpus/openpyxl_guess_types.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var book = try zlsx.Book.open(std.testing.allocator, path);
+    var book = try zlsx.Book.open(std.testing.allocator, io, path);
     defer book.deinit();
 
     var wb = try Workbook.fromBook(std.testing.allocator, &book, path);
@@ -6633,7 +6633,7 @@ test "Workbook.fromBook: mismatched path errors SheetCountMismatch or opens clea
     std.Io.Dir.cwd().access(io, path_a, .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, path_b, .{}) catch return error.SkipZigTest;
 
-    var book = try zlsx.Book.open(std.testing.allocator, path_a);
+    var book = try zlsx.Book.open(std.testing.allocator, io, path_a);
     defer book.deinit();
 
     // Pass `book` opened from path_a, but path_b — sheet counts differ
@@ -6651,12 +6651,12 @@ test "Workbook.rewriteAllFormulas: insert_rows shifts every formula's row refs i
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
     var tmp_buf: [256]u8 = undefined;
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-rewrite-all-{d}.xlsx", .{prng.random().int(u32)});
 
     // Stage some formulas first, save, then re-open and rewrite.
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
         const s0 = try wb.sheet(0);
         try s0.setCell("A1", .{ .formula = "SUM(B5:B10)" });
@@ -6666,7 +6666,7 @@ test "Workbook.rewriteAllFormulas: insert_rows shifts every formula's row refs i
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb = try Workbook.open(std.testing.allocator, tmp_path);
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb.deinit();
 
     // Insert 1 row at row 4 — every ref to row >= 4 shifts +1.
@@ -6683,7 +6683,7 @@ test "Workbook.rewriteAllFormulas: insert_rows shifts every formula's row refs i
     try wb.save(tmp2_path);
     defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
 
-    var wb2 = try Workbook.open(std.testing.allocator, tmp2_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
     defer wb2.deinit();
     const s0 = try wb2.sheet(0);
     const a1 = (try s0.cellByRef("A1")).?;
@@ -6701,7 +6701,7 @@ test "Workbook.rewriteAllFormulas: no-op count == 0 on a workbook without formul
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, src_path);
+    var wb = try Workbook.open(std.testing.allocator, io, src_path);
     defer wb.deinit();
 
     // Pristine fixture has no <f> cells — nothing to rewrite.
@@ -6719,11 +6719,11 @@ test "Workbook.rewriteAllFormulas: rename_sheet rewrites quoted sheet qualifiers
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
     var tmp_buf: [256]u8 = undefined;
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-rewrite-rename-{d}.xlsx", .{prng.random().int(u32)});
 
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
         const s0 = try wb.sheet(0);
         // Cross-sheet ref using the source's actual sheet name "Sheet2".
@@ -6732,7 +6732,7 @@ test "Workbook.rewriteAllFormulas: rename_sheet rewrites quoted sheet qualifiers
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb = try Workbook.open(std.testing.allocator, tmp_path);
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb.deinit();
     const count = try wb.rewriteAllFormulas(.{
         .rename_sheet = .{ .old = "Sheet2", .new = "Renamed" },
@@ -6744,7 +6744,7 @@ test "Workbook.rewriteAllFormulas: rename_sheet rewrites quoted sheet qualifiers
     try wb.save(tmp2_path);
     defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
 
-    var wb2 = try Workbook.open(std.testing.allocator, tmp2_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
     defer wb2.deinit();
     const a1 = (try (try wb2.sheet(0)).cellByRef("A1")).?;
     // Bare cross-sheet name re-emits as bare.
@@ -6802,13 +6802,13 @@ test "Workbook.rewriteAllValidationsAndConditionalFormats: insert_rows shifts DV
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     var tmp_buf: [256]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-rows-{d}.xlsx", .{prng.random().int(u32)});
 
     // Stage: open fixture, inject DV block on sheet 0, save.
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
 
         // Two DVs: one with formula1 only, one with both formulas +
@@ -6826,7 +6826,7 @@ test "Workbook.rewriteAllValidationsAndConditionalFormats: insert_rows shifts DV
     var tmp2_buf: [256]u8 = undefined;
     const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-rows-out-{d}.xlsx", .{prng.random().int(u32)});
     {
-        var wb = try Workbook.open(std.testing.allocator, tmp_path);
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
         defer wb.deinit();
 
         const count = try wb.rewriteAllValidationsAndConditionalFormats(
@@ -6843,7 +6843,7 @@ test "Workbook.rewriteAllValidationsAndConditionalFormats: insert_rows shifts DV
     defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
 
     // Round-trip: re-open, re-parse, verify shifted formulas.
-    var wb2 = try Workbook.open(std.testing.allocator, tmp2_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
     defer wb2.deinit();
     const ws = try wb2.sheet(0);
     const dvs = try ws.validations();
@@ -6865,12 +6865,12 @@ test "Workbook.rewriteAllValidationsAndConditionalFormats: insert_cols shifts CF
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     var tmp_buf: [256]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-cols-{d}.xlsx", .{prng.random().int(u32)});
 
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
 
         // CF block with two cfRules (one with `dxfId` we expect to
@@ -6886,7 +6886,7 @@ test "Workbook.rewriteAllValidationsAndConditionalFormats: insert_cols shifts CF
     var tmp2_buf: [256]u8 = undefined;
     const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-cols-out-{d}.xlsx", .{prng.random().int(u32)});
     {
-        var wb = try Workbook.open(std.testing.allocator, tmp_path);
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
         defer wb.deinit();
         const ws_name_owned = try std.testing.allocator.dupe(u8, (try wb.sheet(0)).name());
         defer std.testing.allocator.free(ws_name_owned);
@@ -6904,7 +6904,7 @@ test "Workbook.rewriteAllValidationsAndConditionalFormats: insert_cols shifts CF
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
 
-    var wb2 = try Workbook.open(std.testing.allocator, tmp2_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
     defer wb2.deinit();
     const ws = try wb2.sheet(0);
     const cfs = try ws.conditionalFormats();
@@ -6925,7 +6925,7 @@ test "Workbook.rewriteAllValidationsAndConditionalFormats: no-op count == 0 on w
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, src_path);
+    var wb = try Workbook.open(std.testing.allocator, io, src_path);
     defer wb.deinit();
 
     // Pristine fixture — no <dataValidations>, no <conditionalFormatting>.
@@ -6943,14 +6943,14 @@ test "Workbook.renameSheet: happy path renames sheet and rewrites cross-sheet fo
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
 
     var tmp_buf: [256]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-rename-in-{d}.xlsx", .{prng.random().int(u32)});
 
     // Stage a cross-sheet formula referencing "Sheet2", save fresh copy.
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
         const s0 = try wb.sheet(0);
         try s0.setCell("A1", .{ .formula = "Sheet2!A1+1" });
@@ -6962,7 +6962,7 @@ test "Workbook.renameSheet: happy path renames sheet and rewrites cross-sheet fo
     var tmp2_buf: [256]u8 = undefined;
     const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-wb-rename-out-{d}.xlsx", .{prng.random().int(u32)});
     {
-        var wb = try Workbook.open(std.testing.allocator, tmp_path);
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
         defer wb.deinit();
         try wb.renameSheet(1, "Renamed");
 
@@ -6973,7 +6973,7 @@ test "Workbook.renameSheet: happy path renames sheet and rewrites cross-sheet fo
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
 
-    var wb2 = try Workbook.open(std.testing.allocator, tmp2_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
     defer wb2.deinit();
     try std.testing.expectEqualStrings("Renamed", (try wb2.sheet(1)).name());
     const a1 = (try (try wb2.sheet(0)).cellByRef("A1")).?;
@@ -6986,7 +6986,7 @@ test "Workbook.renameSheet: rejects forbidden character with InvalidSheetName" {
     const io = threaded.io();
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
-    var wb = try Workbook.open(std.testing.allocator, src_path);
+    var wb = try Workbook.open(std.testing.allocator, io, src_path);
     defer wb.deinit();
     try std.testing.expectError(error.InvalidSheetName, wb.renameSheet(0, "Has:Colon"));
     // Other forbidden characters round out the negative space.
@@ -7008,7 +7008,7 @@ test "Workbook.renameSheet: duplicate name errors SheetNameInUse" {
     const io = threaded.io();
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
-    var wb = try Workbook.open(std.testing.allocator, src_path);
+    var wb = try Workbook.open(std.testing.allocator, io, src_path);
     defer wb.deinit();
     const s0_name_owned = try std.testing.allocator.dupe(u8, (try wb.sheet(0)).name());
     defer std.testing.allocator.free(s0_name_owned);
@@ -7029,7 +7029,7 @@ test "Workbook.renameSheet: out-of-range index errors SheetIndexOutOfRange" {
     const io = threaded.io();
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
-    var wb = try Workbook.open(std.testing.allocator, src_path);
+    var wb = try Workbook.open(std.testing.allocator, io, src_path);
     defer wb.deinit();
     try std.testing.expectError(error.SheetIndexOutOfRange, wb.renameSheet(99, "X"));
     // Boundary: exact sheetCount() is also out-of-range (0-based index).
@@ -7042,7 +7042,7 @@ test "Workbook.renameSheet: no-op when new_name equals current name" {
     const io = threaded.io();
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
-    var wb = try Workbook.open(std.testing.allocator, src_path);
+    var wb = try Workbook.open(std.testing.allocator, io, src_path);
     defer wb.deinit();
     const before = try std.testing.allocator.dupe(u8, (try wb.sheet(0)).name());
     defer std.testing.allocator.free(before);
@@ -7059,7 +7059,7 @@ test "Worksheet.cellStyle: cell with no style attribute returns null" {
     const path = "tests/corpus/phpoi_test1.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     const s0 = try wb.sheet(0);
@@ -7081,7 +7081,7 @@ test "Worksheet.cellStyle: applyFont surfaces the bold font on phpoi B2" {
     const path = "tests/corpus/phpoi_test1.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     const s0 = try wb.sheet(0);
@@ -7107,7 +7107,7 @@ test "Worksheet.cellStyle: applyAlignment surfaces wrap_text; built-in numFmt id
     const path = "tests/corpus/phpoi_test1.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     const s0 = try wb.sheet(0);
@@ -7133,11 +7133,11 @@ test "Workbook.deleteCell: removes existing cell from saved sheet" {
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
     var tmp_buf: [256]u8 = undefined;
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-delete-{d}.xlsx", .{prng.random().int(u32)});
 
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
         const s0 = try wb.sheet(0);
         // Sanity: A1 exists before delete.
@@ -7149,7 +7149,7 @@ test "Workbook.deleteCell: removes existing cell from saved sheet" {
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb2.deinit();
     const s0 = try wb2.sheet(0);
 
@@ -7165,11 +7165,11 @@ test "Workbook.deleteCell vs setCell(.blank): elision vs empty cell" {
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
     var tmp_buf: [256]u8 = undefined;
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-delete-vs-blank-{d}.xlsx", .{prng.random().int(u32)});
 
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
         const s0 = try wb.sheet(0);
         // Stage two side-by-side cells so both refs land in the same
@@ -7182,7 +7182,7 @@ test "Workbook.deleteCell vs setCell(.blank): elision vs empty cell" {
 
     // Re-open and stage delete on Z1, blank on Z2; save again.
     {
-        var wb = try Workbook.open(std.testing.allocator, tmp_path);
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
         defer wb.deinit();
         const s0 = try wb.sheet(0);
         try s0.deleteCell("Z1");
@@ -7192,7 +7192,7 @@ test "Workbook.deleteCell vs setCell(.blank): elision vs empty cell" {
 
     // Inspect the regenerated sheet bytes directly: Z1 must be absent,
     // Z2 must be present as a self-closing empty <c>.
-    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb2.deinit();
     const s0 = try wb2.sheet(0);
     _ = try s0.ensureParsed(); // populates resolved_part_name
@@ -7218,11 +7218,11 @@ test "Workbook.deleteCell: non-existent ref is a no-op" {
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
     var tmp_buf: [256]u8 = undefined;
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-delete-noop-{d}.xlsx", .{prng.random().int(u32)});
 
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
         const s0 = try wb.sheet(0);
         // A ref guaranteed not to exist in the source corpus.
@@ -7232,7 +7232,7 @@ test "Workbook.deleteCell: non-existent ref is a no-op" {
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb2.deinit();
     const s0 = try wb2.sheet(0);
     try std.testing.expect((try s0.cellByRef("ZZ9999")) == null);
@@ -7244,7 +7244,7 @@ test "Workbook.hasUnsavedChanges: pristine workbook is clean" {
     const io = threaded.io();
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
     try std.testing.expect(!wb.hasUnsavedChanges());
 }
@@ -7255,7 +7255,7 @@ test "Workbook.hasUnsavedChanges: setCell flips the bit" {
     const io = threaded.io();
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
     const s0 = try wb.sheet(0);
     try s0.setCell("A1", .{ .number = 42 });
@@ -7270,11 +7270,11 @@ test "Workbook.hasUnsavedChanges: save clears delta-only dirt; PartStore overrid
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
     var tmp_buf: [256]u8 = undefined;
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-dirty-{d}.xlsx", .{prng.random().int(u32)});
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
     const s0 = try wb.sheet(0);
     try s0.setCell("A1", .{ .number = 42 });
@@ -7286,7 +7286,7 @@ test "Workbook.hasUnsavedChanges: save clears delta-only dirt; PartStore overrid
     try std.testing.expect(wb.hasUnsavedChanges());
 
     // Re-open from disk: clean again.
-    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb2.deinit();
     try std.testing.expect(!wb2.hasUnsavedChanges());
 }
@@ -7297,7 +7297,7 @@ test "Workbook.hasUnsavedChanges: renameSheet flips via PartStore override" {
     const io = threaded.io();
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
     try wb.renameSheet(1, "Renamed");
     try std.testing.expect(wb.hasUnsavedChanges());
@@ -7310,7 +7310,7 @@ test "Workbook.deleteSheet: happy path drops second sheet, byte-stable round-tri
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
 
     var tmp_buf: [256]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-delete-out-{d}.xlsx", .{prng.random().int(u32)});
@@ -7320,7 +7320,7 @@ test "Workbook.deleteSheet: happy path drops second sheet, byte-stable round-tri
     var s0_name_buf: [128]u8 = undefined;
     var s0_name_len: usize = 0;
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
         try std.testing.expectEqual(@as(u32, 2), wb.sheetCount());
 
@@ -7339,7 +7339,7 @@ test "Workbook.deleteSheet: happy path drops second sheet, byte-stable round-tri
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb2 = try Workbook.open(std.testing.allocator, tmp_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb2.deinit();
     try std.testing.expectEqual(@as(u32, 1), wb2.sheetCount());
     try std.testing.expectEqualStrings(s0_name_buf[0..s0_name_len], (try wb2.sheet(0)).name());
@@ -7369,7 +7369,7 @@ test "Workbook.deleteSheet: refuses to remove the sole remaining sheet" {
     const io = threaded.io();
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
-    var wb = try Workbook.open(std.testing.allocator, src_path);
+    var wb = try Workbook.open(std.testing.allocator, io, src_path);
     defer wb.deinit();
 
     try wb.deleteSheet(1);
@@ -7385,7 +7385,7 @@ test "Workbook.deleteSheet: out-of-range index errors SheetIndexOutOfRange" {
     const io = threaded.io();
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
-    var wb = try Workbook.open(std.testing.allocator, src_path);
+    var wb = try Workbook.open(std.testing.allocator, io, src_path);
     defer wb.deinit();
     try std.testing.expectError(error.SheetIndexOutOfRange, wb.deleteSheet(99));
     // Boundary: exact sheetCount() is also out-of-range (0-based).
@@ -7434,7 +7434,7 @@ test "Workbook.rewriteAllDefinedNames: workbook-scope insert_rows shifts and per
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
 
     var tmp_buf: [256]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-defnames-in-{d}.xlsx", .{prng.random().int(u32)});
@@ -7442,7 +7442,7 @@ test "Workbook.rewriteAllDefinedNames: workbook-scope insert_rows shifts and per
     // Build a fixture with a workbook-scope defined name pointing at
     // `Sheet1!A1+B1`. Saved to tmp_path; subsequent open reads it back.
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
         try testInjectDefinedNames(
             &wb,
@@ -7452,7 +7452,7 @@ test "Workbook.rewriteAllDefinedNames: workbook-scope insert_rows shifts and per
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb = try Workbook.open(std.testing.allocator, tmp_path);
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb.deinit();
 
     // Sanity: the synthetic name is visible.
@@ -7475,7 +7475,7 @@ test "Workbook.rewriteAllDefinedNames: workbook-scope insert_rows shifts and per
     try wb.save(tmp2_path);
     defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
 
-    var wb2 = try Workbook.open(std.testing.allocator, tmp2_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
     defer wb2.deinit();
     try std.testing.expectEqual(@as(usize, 1), wb2.definedNames().len);
     try std.testing.expectEqualStrings("Sheet1!A2+B2", wb2.definedNames()[0].formula);
@@ -7496,7 +7496,7 @@ test "Workbook.rewriteAllDefinedNames: sheet-scope localSheetId preserved across
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
 
     var tmp_buf: [256]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-defnames-local-in-{d}.xlsx", .{prng.random().int(u32)});
@@ -7506,7 +7506,7 @@ test "Workbook.rewriteAllDefinedNames: sheet-scope localSheetId preserved across
     // (resolved from local_sheet_id=0) and target_sheet=null OR "Sheet1",
     // an insert_rows at row=4 count=2 should shift B5 → B7.
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
         try testInjectDefinedNames(
             &wb,
@@ -7516,7 +7516,7 @@ test "Workbook.rewriteAllDefinedNames: sheet-scope localSheetId preserved across
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb = try Workbook.open(std.testing.allocator, tmp_path);
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb.deinit();
 
     // Sanity: the sheet-scope name was parsed correctly.
@@ -7547,7 +7547,7 @@ test "Workbook.rewriteAllDefinedNames: sheet-scope localSheetId preserved across
     try wb.save(tmp2_path);
     defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
 
-    var wb2 = try Workbook.open(std.testing.allocator, tmp2_path);
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
     defer wb2.deinit();
     try std.testing.expectEqual(@as(?u32, 0), wb2.definedNames()[0].local_sheet_id);
     try std.testing.expectEqualStrings("B7", wb2.definedNames()[0].formula);
@@ -7597,7 +7597,7 @@ test "Workbook.rewriteAllHyperlinkLocations: internal hyperlink shifts when targ
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
 
     var tmp_buf: [256]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-hl-in-{d}.xlsx", .{prng.random().int(u32)});
@@ -7606,7 +7606,7 @@ test "Workbook.rewriteAllHyperlinkLocations: internal hyperlink shifts when targ
     // hyperlink resolves to "Sheet1" (sheet 0); a row insert at 1 with
     // count=4 shifts row 5 → row 9 → location should become A9.
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
         try testInjectHyperlinks(
             &wb,
@@ -7616,7 +7616,7 @@ test "Workbook.rewriteAllHyperlinkLocations: internal hyperlink shifts when targ
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb = try Workbook.open(std.testing.allocator, tmp_path);
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb.deinit();
 
     {
@@ -7650,7 +7650,7 @@ test "Workbook.rewriteAllHyperlinkLocations: external (r_id != null) hyperlink s
     const src_path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
 
     var tmp_buf: [256]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-hl-ext-in-{d}.xlsx", .{prng.random().int(u32)});
@@ -7658,7 +7658,7 @@ test "Workbook.rewriteAllHyperlinkLocations: external (r_id != null) hyperlink s
     // External hyperlink — r:id present, no location. The rewriter
     // must skip it (count == 0), leaving the entry untouched.
     {
-        var wb = try Workbook.open(std.testing.allocator, src_path);
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
         defer wb.deinit();
         try testInjectHyperlinks(
             &wb,
@@ -7668,7 +7668,7 @@ test "Workbook.rewriteAllHyperlinkLocations: external (r_id != null) hyperlink s
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb = try Workbook.open(std.testing.allocator, tmp_path);
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb.deinit();
 
     {
@@ -7716,7 +7716,7 @@ test "Workbook.addImage: round-trips PNG into a drawing-less workbook" {
     const io = threaded.io();
     const allocator = std.testing.allocator;
 
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     var src_buf: [128]u8 = undefined;
     const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-addimg-src-{d}.xlsx", .{prng.random().int(u32)});
     try writeMinimalSstLessXlsx(allocator, src_path);
@@ -7727,13 +7727,13 @@ test "Workbook.addImage: round-trips PNG into a drawing-less workbook" {
     defer std.Io.Dir.cwd().deleteFile(io, dst_path) catch {};
 
     {
-        var wb = try Workbook.open(allocator, src_path);
+        var wb = try Workbook.open(allocator, io, src_path);
         defer wb.deinit();
         try wb.addImage(0, .{ .col = 1, .row = 1 }, &tiny_png_1x1, .png);
         try wb.save(dst_path);
     }
 
-    var store = try PartStore.open(allocator, dst_path);
+    var store = try PartStore.open(allocator, io, dst_path);
     defer store.deinit();
 
     const image_part = try store.part("xl/media/image1.png");
@@ -7782,13 +7782,13 @@ test "Workbook.addImage: PNG declared but JPEG bytes errors MimeMagicMismatch" {
     const io = threaded.io();
     const allocator = std.testing.allocator;
 
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     var src_buf: [128]u8 = undefined;
     const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-addimg-mime-{d}.xlsx", .{prng.random().int(u32)});
     try writeMinimalSstLessXlsx(allocator, src_path);
     defer std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
 
-    var wb = try Workbook.open(allocator, src_path);
+    var wb = try Workbook.open(allocator, io, src_path);
     defer wb.deinit();
 
     const fake_jpeg = [_]u8{ 0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10 };
@@ -7804,7 +7804,7 @@ test "Workbook.addImage: rejects sheet that already has a drawing" {
     const io = threaded.io();
     const allocator = std.testing.allocator;
 
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     var src_buf: [128]u8 = undefined;
     const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-addimg-existing-{d}.xlsx", .{prng.random().int(u32)});
     try writeMinimalSstLessXlsx(allocator, src_path);
@@ -7816,7 +7816,7 @@ test "Workbook.addImage: rejects sheet that already has a drawing" {
 
     // Stage 1: add an image and save.
     {
-        var wb = try Workbook.open(allocator, src_path);
+        var wb = try Workbook.open(allocator, io, src_path);
         defer wb.deinit();
         try wb.addImage(0, .{ .col = 1, .row = 1 }, &tiny_png_1x1, .png);
         try wb.save(dst_path);
@@ -7825,7 +7825,7 @@ test "Workbook.addImage: rejects sheet that already has a drawing" {
     // Stage 2: re-open and try to add a second image to the same
     // sheet — must fail with SheetHasExistingDrawing.
     {
-        var wb2 = try Workbook.open(allocator, dst_path);
+        var wb2 = try Workbook.open(allocator, io, dst_path);
         defer wb2.deinit();
         try std.testing.expectError(
             error.SheetHasExistingDrawing,
@@ -7840,13 +7840,13 @@ test "Workbook.addImage: rejects 0-based anchor with InvalidAnchor" {
     const io = threaded.io();
     const allocator = std.testing.allocator;
 
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     var src_buf: [128]u8 = undefined;
     const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-addimg-anchor-{d}.xlsx", .{prng.random().int(u32)});
     try writeMinimalSstLessXlsx(allocator, src_path);
     defer std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
 
-    var wb = try Workbook.open(allocator, src_path);
+    var wb = try Workbook.open(allocator, io, src_path);
     defer wb.deinit();
 
     try std.testing.expectError(
@@ -7867,7 +7867,7 @@ test "Worksheet.appendRows: stages rows into appended_rows with deep-copied stri
     const io = threaded.io();
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     const ws = try wb.sheet(0);
@@ -7892,7 +7892,7 @@ test "Worksheet.appendRows: refuses when deltas are staged on the same sheet" {
     const io = threaded.io();
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     const ws = try wb.sheet(0);
@@ -7908,7 +7908,7 @@ test "Worksheet.setCell: refuses when appended_rows are staged on the same sheet
     const io = threaded.io();
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     const ws = try wb.sheet(0);
@@ -7924,7 +7924,7 @@ test "Worksheet.appendRows: rejects lossy integers before any allocation" {
     const io = threaded.io();
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     const ws = try wb.sheet(0);
@@ -7944,7 +7944,7 @@ test "Worksheet.appendRows: empty rows slice is a no-op" {
     const io = threaded.io();
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     const ws = try wb.sheet(0);
@@ -7958,7 +7958,7 @@ test "Worksheet.resolvePartName: parse-free — does not populate self.parsed" {
     const io = threaded.io();
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     const ws = try wb.sheet(0);
@@ -7978,7 +7978,7 @@ test "Worksheet.resolvePartName: idempotent — returns the same cached pointer"
     const io = threaded.io();
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     const ws = try wb.sheet(0);
@@ -7994,7 +7994,7 @@ test "Worksheet.resolvePartName: agrees with ensureParsed's cached part name" {
     const io = threaded.io();
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     const ws = try wb.sheet(0);
@@ -8010,7 +8010,7 @@ test "Worksheet.emitWithAppendsUsingPlan: splices rows and threads sst_base_idx"
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var wb = try Workbook.open(allocator, path);
+    var wb = try Workbook.open(allocator, io, path);
     defer wb.deinit();
 
     const ws = try wb.sheet(0);
@@ -8055,7 +8055,7 @@ test "Worksheet.emitWithAppendsUsingPlan: rejects appends past max_row" {
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var wb = try Workbook.open(allocator, path);
+    var wb = try Workbook.open(allocator, io, path);
     defer wb.deinit();
 
     const ws = try wb.sheet(0);
@@ -8095,7 +8095,7 @@ test "Worksheet.emitWithAppendsUsingPlan: rewrites self-closing <sheetData/> to 
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var wb = try Workbook.open(allocator, path);
+    var wb = try Workbook.open(allocator, io, path);
     defer wb.deinit();
 
     const ws = try wb.sheet(0);
@@ -8137,7 +8137,7 @@ test "Worksheet.emitWithAppendsUsingPlan: refuses when deltas are staged on the 
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var wb = try Workbook.open(allocator, path);
+    var wb = try Workbook.open(allocator, io, path);
     defer wb.deinit();
 
     // Stage appends, THEN forge a delta directly (bypassing the
@@ -8183,7 +8183,7 @@ test "Worksheet.clearAppendedRows: deinit is safe after clear" {
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var wb = try Workbook.open(allocator, path);
+    var wb = try Workbook.open(allocator, io, path);
     defer wb.deinit();
 
     const ws = try wb.sheet(0);
@@ -8209,7 +8209,7 @@ test "Workbook.addSheet: appends a new empty sheet and returns its handle" {
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var wb = try Workbook.open(allocator, path);
+    var wb = try Workbook.open(allocator, io, path);
     defer wb.deinit();
 
     const before_count = wb.sheetCount();
@@ -8238,7 +8238,7 @@ test "Workbook.addSheet: refuses duplicate name (case-insensitive)" {
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var wb = try Workbook.open(allocator, path);
+    var wb = try Workbook.open(allocator, io, path);
     defer wb.deinit();
 
     _ = try wb.addSheet("UniqueSheet");
@@ -8254,7 +8254,7 @@ test "Workbook.addSheet: refuses InvalidSheetName per the validateSheetName cont
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var wb = try Workbook.open(allocator, path);
+    var wb = try Workbook.open(allocator, io, path);
     defer wb.deinit();
 
     try std.testing.expectError(error.InvalidSheetName, wb.addSheet(""));
@@ -8270,7 +8270,7 @@ test "Workbook.addSheet: multiple consecutive adds pick non-colliding ids" {
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var wb = try Workbook.open(allocator, path);
+    var wb = try Workbook.open(allocator, io, path);
     defer wb.deinit();
 
     const before_count = wb.sheetCount();
@@ -8319,7 +8319,7 @@ test "Workbook.addSheet: name with XML special chars escapes safely into workboo
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var wb = try Workbook.open(allocator, path);
+    var wb = try Workbook.open(allocator, io, path);
     defer wb.deinit();
 
     const tricky = "AT&T <wow>";
@@ -8341,7 +8341,7 @@ test "Workbook.addSheet: returned handle accepts setCell + appendRows" {
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var wb = try Workbook.open(allocator, path);
+    var wb = try Workbook.open(allocator, io, path);
     defer wb.deinit();
 
     const ws = try wb.addSheet("Mutable");
@@ -8674,7 +8674,7 @@ test "registerSharedString: empty new string vs rich existing entry registers as
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     var plan: SstExtensionPlan = .{};
@@ -8700,7 +8700,7 @@ test "registerSharedString: empty new string vs PLAIN existing entry deduplicate
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var wb = try Workbook.open(std.testing.allocator, path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
     var plan: SstExtensionPlan = .{};
@@ -8755,7 +8755,7 @@ test "Workbook.save: SST-less source + appendRows .string creates SST + rels + O
     //   - the appended cell reads back as a shared_string with index 0
     const alloc = std.testing.allocator;
 
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     var src_buf: [256]u8 = undefined;
     var out_buf: [256]u8 = undefined;
     const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-er7-c1-sstless-src-{d}.xlsx", .{prng.random().int(u32)});
@@ -8766,7 +8766,7 @@ test "Workbook.save: SST-less source + appendRows .string creates SST + rels + O
 
     const appended_text = "appended-via-rows-fresh-sst";
     {
-        var wb = try Workbook.open(alloc, src_path);
+        var wb = try Workbook.open(alloc, io, src_path);
         defer wb.deinit();
         const v = try wb.sst();
         try std.testing.expect(v == null); // sanity: source has no SST
@@ -8778,7 +8778,7 @@ test "Workbook.save: SST-less source + appendRows .string creates SST + rels + O
     }
     defer std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
 
-    var wb2 = try Workbook.open(alloc, out_path);
+    var wb2 = try Workbook.open(alloc, io, out_path);
     defer wb2.deinit();
 
     // Fresh SST part — exactly one entry, our text.
@@ -8822,7 +8822,7 @@ test "Workbook.save: mixed deltas (sheet 0) + appends (sheet 1) share one SST pl
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     var tmp_buf: [256]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-er7-c1-mixed-{d}.xlsx", .{prng.random().int(u32)});
 
@@ -8831,7 +8831,7 @@ test "Workbook.save: mixed deltas (sheet 0) + appends (sheet 1) share one SST pl
 
     var pre_count: u32 = 0;
     {
-        var wb = try Workbook.open(alloc, src_path);
+        var wb = try Workbook.open(alloc, io, src_path);
         defer wb.deinit();
         pre_count = @intCast((try wb.sst()).?.entries.len);
 
@@ -8849,7 +8849,7 @@ test "Workbook.save: mixed deltas (sheet 0) + appends (sheet 1) share one SST pl
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb2 = try Workbook.open(alloc, tmp_path);
+    var wb2 = try Workbook.open(alloc, io, tmp_path);
     defer wb2.deinit();
 
     // SST grew by exactly two — one per axis (texts differ).
@@ -8906,7 +8906,7 @@ test "Workbook.save: renameSheet rewriter composes with setCell on a different s
     std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     var tmp_buf: [256]u8 = undefined;
     var out_buf: [256]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-er7-c1-rw-in-{d}.xlsx", .{prng.random().int(u32)});
@@ -8914,7 +8914,7 @@ test "Workbook.save: renameSheet rewriter composes with setCell on a different s
 
     // Stage a cross-sheet formula on sheet 0 referencing Sheet2, save.
     {
-        var wb = try Workbook.open(alloc, src_path);
+        var wb = try Workbook.open(alloc, io, src_path);
         defer wb.deinit();
         const s0 = try wb.sheet(0);
         try s0.setCell("A1", .{ .formula = "Sheet2!A1+1" });
@@ -8925,7 +8925,7 @@ test "Workbook.save: renameSheet rewriter composes with setCell on a different s
     // Rename sheet 1, then stage a setCell on sheet 0 (not yet edited
     // in this Workbook instance), save, re-open, verify both.
     {
-        var wb = try Workbook.open(alloc, tmp_path);
+        var wb = try Workbook.open(alloc, io, tmp_path);
         defer wb.deinit();
         try wb.renameSheet(1, "Renamed7");
 
@@ -8936,7 +8936,7 @@ test "Workbook.save: renameSheet rewriter composes with setCell on a different s
     }
     defer std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
 
-    var wb2 = try Workbook.open(alloc, out_path);
+    var wb2 = try Workbook.open(alloc, io, out_path);
     defer wb2.deinit();
 
     // Rename landed.
@@ -8973,18 +8973,18 @@ test "Workbook.empty: returns empty workbook with valid skeleton" {
 
     // Save to disk and re-open via Book.open + Workbook.open. Both
     // surfaces must agree on sheet count == 0.
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     var tmp_buf: [256]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-empty-skel-{d}.xlsx", .{prng.random().int(u32)});
 
     try wb.save(tmp_path);
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var book = try zlsx.Book.open(alloc, tmp_path);
+    var book = try zlsx.Book.open(alloc, io, tmp_path);
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 0), book.sheets.len);
 
-    var wb2 = try Workbook.open(alloc, tmp_path);
+    var wb2 = try Workbook.open(alloc, io, tmp_path);
     defer wb2.deinit();
     try std.testing.expectEqual(@as(u32, 0), wb2.sheetCount());
 }
@@ -8995,7 +8995,7 @@ test "Workbook.empty + addSheet + appendRows: round-trips through reader" {
     const io = threaded.io();
     const alloc = std.testing.allocator;
 
-    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     var tmp_buf: [256]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-empty-roundtrip-{d}.xlsx", .{prng.random().int(u32)});
 
@@ -9013,7 +9013,7 @@ test "Workbook.empty + addSheet + appendRows: round-trips through reader" {
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    var wb2 = try Workbook.open(alloc, tmp_path);
+    var wb2 = try Workbook.open(alloc, io, tmp_path);
     defer wb2.deinit();
     try std.testing.expectEqual(@as(u32, 1), wb2.sheetCount());
 
@@ -9516,7 +9516,7 @@ test "iter-wr-7 parity: Workbook.saveFreshEmit empty single-sheet — produces a
     try wb.saveFreshEmit(path);
 
     // Round-trip via PartStore.open: archive must be a parseable .xlsx.
-    var s2 = try store_mod.PartStore.open(a, path);
+    var s2 = try store_mod.PartStore.open(a, io, path);
     defer s2.deinit();
     const wb_part = (try s2.part("xl/workbook.xml")) orelse return error.TestFailed;
     try std.testing.expect(std.mem.indexOf(u8, wb_part.bytes, "Sheet1") != null);

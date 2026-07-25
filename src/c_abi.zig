@@ -2689,6 +2689,9 @@ export fn zlsx_sheet_writer_add_comment(
 // ─── Writer tests ────────────────────────────────────────────────────
 
 test "writer: round-trip via reader" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "c_abi_writer_roundtrip.xlsx");
@@ -2726,7 +2729,7 @@ test "writer: round-trip via reader" {
     try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w.?, tmp_path.ptr, tmp_path.len, &err_buf, err_buf.len));
 
     // Read it back through the public API.
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
     try std.testing.expectEqualStrings("Summary", book.sheets[0].name);
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
@@ -3135,6 +3138,9 @@ test "reader C ABI: merged_range + hyperlink getters round-trip" {
 }
 
 test "writer C ABI: add_merged_cell round-trips + rejects bad ranges" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "c_abi_merged_cell.xlsx");
@@ -3185,7 +3191,7 @@ test "writer C ABI: add_merged_cell round-trips + rejects bad ranges" {
     try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_write_row(sw.?, &row, row.len, &err_buf, err_buf.len));
     try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w.?, tmp_path.ptr, tmp_path.len, &err_buf, err_buf.len));
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
     var rows_iter = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows_iter.deinit();
@@ -3355,6 +3361,9 @@ fn fuzzSeedCabi(io: std.Io) u64 {
 }
 
 test "writer C ABI: write_row_with_formulas round-trips through reader" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "c_abi_write_formulas.xlsx");
@@ -3394,7 +3403,7 @@ test "writer C ABI: write_row_with_formulas round-trips through reader" {
     try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w.?, tmp_path.ptr, tmp_path.len, &err_buf, err_buf.len));
 
     // Read back through the Zig reader, confirm formula text + cached value.
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -3445,6 +3454,9 @@ test "writer C ABI: write_row_with_formulas round-trips through reader" {
 }
 
 test "writer C ABI: add_hyperlink + add_internal_hyperlink round-trip" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "c_abi_hyperlink_writer.xlsx");
@@ -3490,7 +3502,7 @@ test "writer C ABI: add_hyperlink + add_internal_hyperlink round-trip" {
     try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w.?, tmp_path.ptr, tmp_path.len, &err_buf, err_buf.len));
 
     // Read back through the Zig reader, confirm both hyperlinks survived.
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
     const links = book.hyperlinks(book.sheets[0]);
     try std.testing.expectEqual(@as(usize, 2), links.len);
@@ -3519,6 +3531,9 @@ test "writer C ABI: add_hyperlink + add_internal_hyperlink round-trip" {
 }
 
 test "editor C ABI: open + append_row + save round-trip" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const src_path = try tt.path(std.testing.allocator, "c_abi_editor_src.xlsx");
@@ -3557,7 +3572,7 @@ test "editor C ABI: open + append_row + save round-trip" {
     try std.testing.expectEqual(@as(i32, 0), rc_save);
 
     // Verify via the reader.
-    var book = try xlsx.Book.open(std.testing.allocator, dst_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -3794,7 +3809,7 @@ test "fuzz writer via C ABI: random operations round-trip" {
         try std.testing.expectEqual(@as(i32, 0), save_rc);
 
         // Re-read to verify the file isn't malformed.
-        var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+        var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
         defer book.deinit();
         try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
         var rows = try book.rows(book.sheets[0], std.testing.allocator);

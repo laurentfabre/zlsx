@@ -3928,7 +3928,7 @@ const TestTmp = struct {
     pub fn deinit(self: *TestTmp) void {
         self.dir.cleanup();
     }
-    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
+    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, io: std.Io, name: []const u8) ![:0]u8 {
         const d = try self.dir.dir.realPathFileAlloc(io, ".", alloc);
         defer alloc.free(d);
         return std.fs.path.joinZ(alloc, &.{ d, name });
@@ -3987,6 +3987,9 @@ test "parseArgs: set-cell subcommand token is skipped, --ref / --value parse" {
 }
 
 test "runSetCellCommand rewrites a single cell and saves to --out" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx.writer_types;
@@ -4017,7 +4020,7 @@ test "runSetCellCommand rewrites a single cell and saves to --out" {
 
     // Verify by re-opening the saved file: B1 must be "hello", A1
     // unchanged, A2 unchanged.
-    var book = try xlsx.Book.open(std.testing.allocator, dst_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -4102,6 +4105,9 @@ test "parseColLettersToOneBased: A=1, Z=26, AA=27, XFD=16384, XFE rejected" {
 }
 
 test "runRowEditCommand insert-row + delete-row round-trip" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx.writer_types;
@@ -4133,7 +4139,7 @@ test "runRowEditCommand insert-row + delete-row round-trip" {
         try std.testing.expectEqual(@as(u8, 0), try runRowEditCommand(std.testing.allocator, a, &err_w));
     }
     {
-        var book = try xlsx.Book.open(std.testing.allocator, dst_path);
+        var book = try xlsx.Book.open(std.testing.allocator, io, dst_path);
         defer book.deinit();
         var rows = try book.rows(book.sheets[0], std.testing.allocator);
         defer rows.deinit();
@@ -4148,6 +4154,9 @@ test "runRowEditCommand insert-row + delete-row round-trip" {
 }
 
 test "runAddSheetCommand + runRenameSheetCommand + runDeleteSheetCommand round-trip" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx.writer_types;
@@ -4180,7 +4189,7 @@ test "runAddSheetCommand + runRenameSheetCommand + runDeleteSheetCommand round-t
         try std.testing.expectEqual(@as(u8, 0), try runAddSheetCommand(std.testing.allocator, a, &err_w));
     }
     {
-        var book = try xlsx.Book.open(std.testing.allocator, after_add);
+        var book = try xlsx.Book.open(std.testing.allocator, io, after_add);
         defer book.deinit();
         try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
         try std.testing.expectEqualStrings("Second", book.sheets[1].name);
@@ -4199,7 +4208,7 @@ test "runAddSheetCommand + runRenameSheetCommand + runDeleteSheetCommand round-t
         try std.testing.expectEqual(@as(u8, 0), try runRenameSheetCommand(std.testing.allocator, a, &err_w));
     }
     {
-        var book = try xlsx.Book.open(std.testing.allocator, after_rename);
+        var book = try xlsx.Book.open(std.testing.allocator, io, after_rename);
         defer book.deinit();
         try std.testing.expectEqualStrings("Renamed", book.sheets[0].name);
     }
@@ -4216,7 +4225,7 @@ test "runAddSheetCommand + runRenameSheetCommand + runDeleteSheetCommand round-t
         try std.testing.expectEqual(@as(u8, 0), try runDeleteSheetCommand(std.testing.allocator, a, &err_w));
     }
     {
-        var book = try xlsx.Book.open(std.testing.allocator, after_delete);
+        var book = try xlsx.Book.open(std.testing.allocator, io, after_delete);
         defer book.deinit();
         try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
         try std.testing.expectEqualStrings("Renamed", book.sheets[0].name);
@@ -4744,6 +4753,9 @@ test "parseArgs --start-row / --end-row round-trip and rejections" {
 }
 
 test "runCellsCommand --start-row / --end-row bound the emitted cell stream" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_rowbounds_iter59b.xlsx");
@@ -4762,7 +4774,7 @@ test "runCellsCommand --start-row / --end-row bound the emitted cell stream" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const countLines = struct {
@@ -4863,6 +4875,9 @@ test "parseArgs --range round-trip and rejections" {
 }
 
 test "runCellsCommand --range filters by bounding rectangle" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_range_iter59b2.xlsx");
@@ -4882,7 +4897,7 @@ test "runCellsCommand --range filters by bounding rectangle" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const countLines = struct {
@@ -4940,6 +4955,9 @@ test "runCellsCommand --range filters by bounding rectangle" {
 }
 
 test "runRowsCommand --range filters rows + masks out-of-range cells" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_range_rows_iter59b2.xlsx");
@@ -4957,7 +4975,7 @@ test "runRowsCommand --range filters rows + masks out-of-range cells" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const countLines = struct {
@@ -5040,6 +5058,9 @@ test "parseArgs --header scoping" {
 }
 
 test "runRowsCommand --header promotes first row and emits fields dict" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_header_iter59b3.xlsx");
@@ -5055,7 +5076,7 @@ test "runRowsCommand --header promotes first row and emits fields dict" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const countLines = struct {
@@ -5087,6 +5108,9 @@ test "runRowsCommand --header promotes first row and emits fields dict" {
 }
 
 test "runRowsCommand --header duplicate header keys emitted verbatim" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_header_dup_iter59b3.xlsx");
@@ -5101,7 +5125,7 @@ test "runRowsCommand --header duplicate header keys emitted verbatim" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [1024]u8 = undefined;
@@ -5114,6 +5138,9 @@ test "runRowsCommand --header duplicate header keys emitted verbatim" {
 }
 
 test "runRowsCommand --header empty header cells fall back to col_<letter>" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_header_empty_iter59b3.xlsx");
@@ -5129,7 +5156,7 @@ test "runRowsCommand --header empty header cells fall back to col_<letter>" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [1024]u8 = undefined;
@@ -5143,6 +5170,9 @@ test "runRowsCommand --header empty header cells fall back to col_<letter>" {
 }
 
 test "runRowsCommand --header + --range derives keys only from in-range cols" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Header row has 4 cells across A..D ("w","x","y","z"); a --range
@@ -5161,7 +5191,7 @@ test "runRowsCommand --header + --range derives keys only from in-range cols" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [1024]u8 = undefined;
@@ -5186,6 +5216,9 @@ test "runRowsCommand --header + --range derives keys only from in-range cols" {
 }
 
 test "runRowsCommand --include-blanks on csv/header is a no-op for blank rows" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Tight contract per iter59b-4 P2 follow-up: --include-blanks
@@ -5207,7 +5240,7 @@ test "runRowsCommand --include-blanks on csv/header is a no-op for blank rows" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     // csv + --range B:B + --include-blanks — range is all-empty
@@ -5223,6 +5256,9 @@ test "runRowsCommand --include-blanks on csv/header is a no-op for blank rows" {
 }
 
 test "runRowsCommand --range + --include-blanks keeps blank-only ranged rows" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // A row with data only in A/D (both outside the B:C range) and
@@ -5240,7 +5276,7 @@ test "runRowsCommand --range + --include-blanks keeps blank-only ranged rows" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [1024]u8 = undefined;
@@ -5264,6 +5300,9 @@ test "runRowsCommand --range + --include-blanks keeps blank-only ranged rows" {
 }
 
 test "writeTerseStyleBlock doesn't leak empty border for diagonal-only sides" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Codex P2: a cell whose border has ONLY the diagonal side set
@@ -5287,7 +5326,7 @@ test "writeTerseStyleBlock doesn't leak empty border for diagonal-only sides" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [1024]u8 = undefined;
@@ -5389,6 +5428,9 @@ test "parseArgs --with-styles scoping" {
 }
 
 test "runCellsCommand --include-blanks emits t:\"blank\" for empty cells" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_blanks_iter59b4.xlsx");
@@ -5403,7 +5445,7 @@ test "runCellsCommand --include-blanks emits t:\"blank\" for empty cells" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [2048]u8 = undefined;
@@ -5419,6 +5461,9 @@ test "runCellsCommand --include-blanks emits t:\"blank\" for empty cells" {
 }
 
 test "runCellsCommand without --include-blanks still skips empties" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Regression guard: default behaviour preserved when the flag is off.
@@ -5432,7 +5477,7 @@ test "runCellsCommand without --include-blanks still skips empties" {
         try s0.writeRow(&.{ .{ .string = "x" }, .empty, .{ .integer = 7 } });
         try w.save(tmp_path);
     }
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [2048]u8 = undefined;
@@ -5445,6 +5490,9 @@ test "runCellsCommand without --include-blanks still skips empties" {
 }
 
 test "runCellsCommand --with-styles emits terse style block for styled cells" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_with_styles_iter59b4.xlsx");
@@ -5470,7 +5518,7 @@ test "runCellsCommand --with-styles emits terse style block for styled cells" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [4096]u8 = undefined;
@@ -5491,6 +5539,9 @@ test "runCellsCommand --with-styles emits terse style block for styled cells" {
 }
 
 test "runRowsCommand --with-styles on envelope attaches style to per-cell records" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_rows_styles_iter59b4.xlsx");
@@ -5508,7 +5559,7 @@ test "runRowsCommand --with-styles on envelope attaches style to per-cell record
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [2048]u8 = undefined;
@@ -5529,6 +5580,9 @@ test "runRowsCommand --with-styles on envelope attaches style to per-cell record
 }
 
 test "runCellsCommand --skip / --take slice the emitted cell stream" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_pagination_iter59a.xlsx");
@@ -5547,7 +5601,7 @@ test "runCellsCommand --skip / --take slice the emitted cell stream" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const countLines = struct {
@@ -5624,6 +5678,9 @@ test "runMetaCommand emits path:null on non-UTF-8 workbook path" {
 }
 
 test "runListSheetsCommand emits one sheet record per sheet" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_list_sheets_iter57.xlsx");
@@ -5641,7 +5698,7 @@ test "runListSheetsCommand emits one sheet record per sheet" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [1024]u8 = undefined;
@@ -5656,6 +5713,9 @@ test "runListSheetsCommand emits one sheet record per sheet" {
 }
 
 test "runMetaCommand emits workbook record with sst/has_* fields then sheet records" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_meta_iter57.xlsx");
@@ -5675,7 +5735,7 @@ test "runMetaCommand emits workbook record with sst/has_* fields then sheet reco
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [4096]u8 = undefined;
@@ -5726,6 +5786,9 @@ test "runMetaCommand emits workbook record with sst/has_* fields then sheet reco
 }
 
 test "legacy --list-sheets flag still emits plain text (regression guard)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Regression guard: the legacy plain-text shape is exactly
@@ -5745,7 +5808,7 @@ test "legacy --list-sheets flag still emits plain text (regression guard)" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [256]u8 = undefined;
@@ -5800,6 +5863,9 @@ test "parseArgs routes iter58 sub-commands correctly" {
 }
 
 test "runCommentsCommand emits one record per comment across every sheet" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_comments_iter58.xlsx");
@@ -5817,7 +5883,7 @@ test "runCommentsCommand emits one record per comment across every sheet" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [2048]u8 = undefined;
@@ -5845,6 +5911,9 @@ test "runCommentsCommand emits one record per comment across every sheet" {
 }
 
 test "runValidationsCommand emits list validation with values array" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_validations_iter58.xlsx");
@@ -5859,7 +5928,7 @@ test "runValidationsCommand emits list validation with values array" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [2048]u8 = undefined;
@@ -5878,6 +5947,9 @@ test "runValidationsCommand emits list validation with values array" {
 }
 
 test "runHyperlinksCommand emits url set + location null for external links" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_hyperlinks_iter58.xlsx");
@@ -5892,7 +5964,7 @@ test "runHyperlinksCommand emits url set + location null for external links" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [2048]u8 = undefined;
@@ -5909,6 +5981,9 @@ test "runHyperlinksCommand emits url set + location null for external links" {
 }
 
 test "runStylesCommand emits one record per cell-XF entry" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_styles_iter58.xlsx");
@@ -5923,7 +5998,7 @@ test "runStylesCommand emits one record per cell-XF entry" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [4096]u8 = undefined;
@@ -5945,6 +6020,9 @@ test "runStylesCommand emits one record per cell-XF entry" {
 }
 
 test "runSstCommand emits one record per shared-string entry" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_sst_iter58.xlsx");
@@ -5959,7 +6037,7 @@ test "runSstCommand emits one record per shared-string entry" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [4096]u8 = undefined;
@@ -6249,6 +6327,9 @@ test "detectSubcommand skips --output value (value that collides with a sub-comm
 }
 
 test "runCellsAcrossSheets compact-ndjson emits per-sheet prologue and omits sheet/sheet_idx on cell records" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_compact_cells_iter60b.xlsx");
@@ -6265,7 +6346,7 @@ test "runCellsAcrossSheets compact-ndjson emits per-sheet prologue and omits she
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var buf: [4096]u8 = undefined;
@@ -6322,6 +6403,9 @@ test "runCellsAcrossSheets compact-ndjson emits per-sheet prologue and omits she
 }
 
 test "runMetaCommand pretty-json collapses workbook + sheets into one JSON object" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_pretty_meta_iter60b.xlsx");
@@ -6337,7 +6421,7 @@ test "runMetaCommand pretty-json collapses workbook + sheets into one JSON objec
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var buf: [4096]u8 = undefined;
@@ -6432,6 +6516,9 @@ test "globMatch literal / wildcards / edge cases" {
 }
 
 test "runCellsAcrossSheets --all-sheets emits every sheet with correct sheet_idx" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_all_sheets_iter59c.xlsx");
@@ -6447,7 +6534,7 @@ test "runCellsAcrossSheets --all-sheets emits every sheet with correct sheet_idx
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [2048]u8 = undefined;
@@ -6464,6 +6551,9 @@ test "runCellsAcrossSheets --all-sheets emits every sheet with correct sheet_idx
 }
 
 test "runCellsAcrossSheets --sheet-glob selects only matching sheets" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_glob_iter59c.xlsx");
@@ -6481,7 +6571,7 @@ test "runCellsAcrossSheets --sheet-glob selects only matching sheets" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [2048]u8 = undefined;
@@ -6501,6 +6591,9 @@ test "runCellsAcrossSheets --sheet-glob selects only matching sheets" {
 }
 
 test "runCellsAcrossSheets --all-sheets --skip --take slices the cross-sheet stream" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_cross_pag_iter59c.xlsx");
@@ -6518,7 +6611,7 @@ test "runCellsAcrossSheets --all-sheets --skip --take slices the cross-sheet str
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [4096]u8 = undefined;
@@ -6589,6 +6682,9 @@ test "writeErrorRecord sheet-scoped + workbook-scoped shapes (iter60c)" {
 }
 
 test "runCellsAcrossSheets emits inline kind:error for a malformed sheet and continues (iter60c)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Two-sheet workbook: sheet 0 valid, sheet 1's loaded XML is
@@ -6609,7 +6705,7 @@ test "runCellsAcrossSheets emits inline kind:error for a malformed sheet and con
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     // Replace sheet 1's loaded XML with a payload that opens a `<row>`
@@ -6648,6 +6744,9 @@ test "runCellsAcrossSheets emits inline kind:error for a malformed sheet and con
 }
 
 test "runCellsCommand single-sheet malformed sheet emits one error record without propagating (iter60c)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_iter60c_single.xlsx");
@@ -6661,7 +6760,7 @@ test "runCellsCommand single-sheet malformed sheet emits one error record withou
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const bad_path = book.sheets[0].path;
@@ -6721,6 +6820,9 @@ test "writeRowEnvelope emits t:date inside cells array" {
 }
 
 test "runCellsCommand emits t:date for a date-styled numeric cell (iter61-a)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_iter61a_cells.xlsx");
@@ -6741,7 +6843,7 @@ test "runCellsCommand emits t:date for a date-styled numeric cell (iter61-a)" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [4096]u8 = undefined;
@@ -6756,6 +6858,9 @@ test "runCellsCommand emits t:date for a date-styled numeric cell (iter61-a)" {
 }
 
 test "runRowsCommand envelope emits t:date inside cells array (iter61-a)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_iter61a_rows.xlsx");
@@ -6773,7 +6878,7 @@ test "runRowsCommand envelope emits t:date inside cells array (iter61-a)" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [4096]u8 = undefined;
@@ -6790,6 +6895,9 @@ test "runRowsCommand envelope emits t:date inside cells array (iter61-a)" {
 }
 
 test "runCellsCommand skips t:date auto-convert on 1904-epoch workbook" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // iter61-a P1 follow-up: workbooks with <workbookPr date1904="1"/>
@@ -6811,7 +6919,7 @@ test "runCellsCommand skips t:date auto-convert on 1904-epoch workbook" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     // Simulate a 1904-epoch workbook.
@@ -6879,6 +6987,9 @@ test "writeRowEnvelope emits t:error inside cells array (iter61-c)" {
 }
 
 test "runCellsCommand emits t:error for a t=\"e\" cell (iter61-c)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // The zlsx Writer can't emit OOXML t="e" cells directly, so we
     // mirror the iter60c pattern: write a valid workbook, open it,
     // then post-inject a sheet1.xml carrying `<c t="e"><v>#DIV/0!</v></c>`
@@ -6897,7 +7008,7 @@ test "runCellsCommand emits t:error for a t=\"e\" cell (iter61-c)" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const sheet_path = book.sheets[0].path;
@@ -6935,6 +7046,9 @@ test "runCellsCommand emits t:error for a t=\"e\" cell (iter61-c)" {
 }
 
 test "runRowsCommand envelope emits t:error inside cells array (iter61-c)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const tmp_path = try tt.path(std.testing.allocator, "cli_iter61c_error_rows.xlsx");
@@ -6948,7 +7062,7 @@ test "runRowsCommand envelope emits t:error inside cells array (iter61-c)" {
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const sheet_path = book.sheets[0].path;
@@ -7149,6 +7263,9 @@ test "Rows.formulaStrings returns entity-decoded text (iter61-b P2)" {
 }
 
 test "runCellsCommand emits t:formula for stand-alone, shared-base, shared-slave (iter61-b)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Mirror the iter60c / iter61-c post-injection trick: write a valid
@@ -7165,7 +7282,7 @@ test "runCellsCommand emits t:formula for stand-alone, shared-base, shared-slave
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const sheet_path = book.sheets[0].path;
@@ -7231,6 +7348,9 @@ test "runCellsCommand emits t:formula for stand-alone, shared-base, shared-slave
 }
 
 test "runCellsCommand emits t:formula with formula_ref for array-formula slaves" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Same post-injection trick: write a workbook then replace the
@@ -7249,7 +7369,7 @@ test "runCellsCommand emits t:formula with formula_ref for array-formula slaves"
         try w.save(tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const sheet_path = book.sheets[0].path;

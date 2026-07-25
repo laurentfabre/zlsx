@@ -298,6 +298,9 @@ test "Archive: empty archive finalises with EOCD only" {
 }
 
 test "Archive: single small entry round-trips via std.zip.Iterator" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(testing.allocator);
     var arc = Archive.init(testing.allocator, &buf);
@@ -309,12 +312,12 @@ test "Archive: single small entry round-trips via std.zip.Iterator" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     {
-        var f = try tmp.dir.createFile("a.zip", .{});
-        defer f.close();
+        var f = try tmp.dir.createFile(io, "a.zip", .{});
+        defer f.close(io);
         try f.writeAll(buf.items);
     }
-    var f = try tmp.dir.openFile("a.zip", .{});
-    defer f.close();
+    var f = try tmp.dir.openFile(io, "a.zip", .{});
+    defer f.close(io);
     var read_buf: [4096]u8 = undefined;
     var fr = f.reader(&read_buf);
     var iter = try std.zip.Iterator.init(&fr);
