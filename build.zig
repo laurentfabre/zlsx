@@ -408,12 +408,24 @@ pub fn build(b: *std.Build) void {
 
     // C2a: standalone `zlsx-extract-images` binary that drives the
     // package layer (PartStore + imageParts) without going through
-    // Editor / Book. Shipped as a separate exe rather than a CLI
-    // subcommand because cli_mod + zlsx_pkg + writer can't coexist
-    // in one compilation under Zig 0.15.2 (every file that
-    // `@import("writer")`s ends up claimed by both writer's tree
-    // and zlsx_pkg's tree). The standalone binary's module sees
-    // zlsx_pkg + writer in isolation, so no collision.
+    // Editor / Book.
+    //
+    // It was split out because `cli_mod` + `zlsx_pkg` + `writer` could
+    // not coexist in one compilation under Zig 0.15.2 — every file that
+    // `@import("writer")`ed ended up claimed by both writer's tree and
+    // zlsx_pkg's tree.
+    //
+    // **That constraint no longer holds on 0.16** (verified by probe:
+    // adding `cli_mod.addImport("writer", writer_mod)` on top of the
+    // existing `zlsx` + `zlsx_pkg` imports builds clean and keeps
+    // 1029/1029 tests green). So merging this back into the CLI as a
+    // subcommand is now *possible*. It is deliberately NOT done here:
+    // `zlsx-extract-images` is a shipped binary and removing it is a
+    // user-visible packaging change, not a build-graph cleanup. Left as
+    // an explicit product decision.
+    //
+    // What downstream consumers care about — importing `zlsx` and
+    // `zlsx_pkg` together — is gated by `tests/consumer/`.
     const extract_images_mod = b.createModule(.{
         .root_source_file = b.path("src/extract_images_main.zig"),
         .target = target,

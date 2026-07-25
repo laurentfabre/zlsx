@@ -143,7 +143,17 @@ Beyond that, Linux x64 is the only supported target anyway; macOS (Mach-O `addEn
 
 ### Three-module collision
 
-`build.zig` documents a Zig 0.15.2-era limitation (re-verify on 0.16): `cli_mod`, `zlsx_pkg`, and `writer` cannot coexist in one compilation, because every file that `@import("writer")`s ends up claimed by both writer's tree and zlsx_pkg's tree. That's why `zlsx-extract-images` is a separate exe rather than a CLI subcommand. Don't try to merge it back without re-checking the constraint.
+**Resolved on 0.16 — the note below is history, not a live constraint.**
+
+Under Zig 0.15.2, `cli_mod`, `zlsx_pkg` and `writer` could not coexist in one compilation: every file that `@import("writer")`ed ended up claimed by both writer's tree and zlsx_pkg's tree. That is why `zlsx-extract-images` ships as a separate exe rather than a CLI subcommand.
+
+The 0.16 migration retested it directly — adding `cli_mod.addImport("writer", writer_mod)` on top of the existing `zlsx` + `zlsx_pkg` imports builds clean and keeps 1029/1029 tests green. Merging `zlsx-extract-images` back into the CLI is therefore possible now. It has deliberately **not** been done: dropping a shipped binary is a user-visible packaging change and belongs to whoever owns that call, not to a build-graph tidy-up.
+
+What downstream consumers actually depend on — importing `zlsx` and `zlsx_pkg` together — is now a build gate, not a claim: `tests/consumer/` is a standalone package with a path dependency on the repo root that writes a workbook with `zlsx.Writer`, reads it with `zlsx.Book`, mutates it through `zlsx_pkg.Editor`, and re-reads to verify. Run it with:
+
+```sh
+cd tests/consumer && zig build && ./zig-out/bin/consumer /tmp/in.xlsx /tmp/out.xlsx
+```
 
 ### `-Dsingle-threaded` swaps the allocator
 

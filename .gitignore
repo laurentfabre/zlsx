@@ -9,3 +9,10 @@ __pycache__/
 .pytest_cache/
 build/
 dist/
+# Knowledge base — private working vault (architecture notes + collaboration prefs).
+# Track individual notes with `git add -f` if you want them in the repo.
+docs/kb/
+
+# Z2 co-import gate build artifacts (tests/consumer is its own package)
+tests/consumer/zig-out/
+tests/consumer/.zig-cache/
