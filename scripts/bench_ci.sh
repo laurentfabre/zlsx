@@ -9,7 +9,7 @@
 #
 # Expects:
 #   - hyperfine on PATH
-#   - zig 0.15.2 on PATH
+#   - zig 0.16.0 on PATH
 #   - tests/corpus/{worldbank_catalog,ons_cpi_detailed}.xlsx already
 #     fetched (cache layer in .github/workflows/bench.yml)
 #

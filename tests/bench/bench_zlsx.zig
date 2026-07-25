@@ -24,11 +24,10 @@
 const std = @import("std");
 const xlsx = @import("zlsx");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     const alloc = std.heap.smp_allocator;
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) {
         std.debug.print("usage: {s} [--materialise] <xlsx>\n", .{args[0]});
         return;

@@ -29,11 +29,11 @@ const zlsx_pkg = @import("zlsx_pkg");
 const default_rows: usize = 100_000;
 const cells_per_row: usize = 5;
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
     const alloc = std.heap.smp_allocator;
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) {
         std.debug.print("usage: {s} <tmpdir> [rows]\n", .{args[0]});
         return;
@@ -55,7 +55,7 @@ pub fn main() !void {
         // shape — Editor.appendRows won't trigger fresh-SST creation
         // for our numeric appends.
         try s.writeRow(&.{.{ .integer = 0 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
 
     // Pre-allocate the row payload — 5 numeric cells per row, same
@@ -80,14 +80,16 @@ pub fn main() !void {
     }
 
     // ── Step 2: open + append + save with wall-clock timing. ──────
-    var timer = try std.time.Timer.start();
+    // 0.16 removed std.time.Timer along with the rest of std.time's
+    // functions; monotonic timing comes from the Io clock now.
+    const t_start = std.Io.Clock.now(.awake, io).nanoseconds;
     {
-        var ed = try zlsx_pkg.Editor.open(alloc, src_path);
+        var ed = try zlsx_pkg.Editor.open(alloc, io, src_path);
         defer ed.deinit();
         try ed.appendRows(0, all_rows);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    const elapsed_ns = timer.read();
+    const elapsed_ns: u64 = @intCast(std.Io.Clock.now(.awake, io).nanoseconds - t_start);
 
     const total_cells = rows * cells_per_row;
     const total_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;

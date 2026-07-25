@@ -7,13 +7,13 @@ const std = @import("std");
 const pkg = @import("zlsx_pkg");
 const rss = @import("rss");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) {
         std.debug.print("usage: {s} <fixture.xlsx>\n", .{args[0]});
         std.process.exit(2);
@@ -28,7 +28,7 @@ pub fn main() !void {
 
     const baseline = try rss.rssBytes();
 
-    var wb = try pkg.Workbook.openLazy(allocator, fixture);
+    var wb = try pkg.Workbook.openLazy(allocator, io, fixture);
     defer wb.deinit();
     // Touch nothing — same contract as the Book probe.
 
@@ -37,5 +37,10 @@ pub fn main() !void {
 
     var stdout_buf: [64]u8 = undefined;
     const out = try std.fmt.bufPrint(&stdout_buf, "{d}\n", .{delta});
-    _ = try std.Io.File.stdout().writeAll(out);
+    {
+        var obuf: [4096]u8 = undefined;
+        var ow = std.Io.File.stdout().writer(io, &obuf);
+        try ow.interface.writeAll(out);
+        try ow.interface.flush();
+    }
 }

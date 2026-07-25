@@ -42,8 +42,8 @@ pub const COLS_PER_ROW: u32 = 5;
 
 pub const Error = error{
     SynthFailed,
-} || std.mem.Allocator.Error || std.Io.File.OpenError || std.Io.File.WriteError ||
-    std.fs.Dir.StatFileError;
+} || std.mem.Allocator.Error || std.Io.File.OpenError || std.Io.File.Writer.Error ||
+    std.Io.Dir.StatFileError;
 
 /// Emit the synthetic workbook to `out_path`. Returns immediately if the
 /// file already exists at `out_path` (cache hit) — assumes the existing
@@ -92,7 +92,7 @@ pub fn synthesize(allocator: Allocator, io: std.Io, out_path: []const u8) !void 
         }
     }
 
-    try w.save(out_path);
+    try w.save(io, out_path);
 
     // Postcondition: the file we just emitted is non-empty and at least
     // as big as one byte per cell (very loose lower bound — compressed

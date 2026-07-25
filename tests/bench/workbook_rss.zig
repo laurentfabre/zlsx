@@ -51,7 +51,7 @@ fn currentRss() !u64 {
 
 /// Locate one of the three probe executables produced by the build
 /// step. They install at `zig-out/bin/zlsx-bench-rss-{book,workbook,synth}`.
-fn findProbe(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+fn findProbe(allocator: std.mem.Allocator, io: std.Io, name: []const u8) ![]u8 {
     var path_buf: [256]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "zig-out/bin/{s}", .{name});
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.ProbeBinaryNotFound;
@@ -60,23 +60,25 @@ fn findProbe(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
 
 /// Spawn the RSS probe (book or workbook backend) and parse the
 /// single decimal line it prints to stdout.
-fn runRssProbe(allocator: std.mem.Allocator, exe: []const u8, fixture: []const u8) !u64 {
-    var child = std.process.Child.init(&.{ exe, fixture }, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Inherit;
-
-    try child.spawn();
+fn runRssProbe(io: std.Io, exe: []const u8, fixture: []const u8) !u64 {
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ exe, fixture },
+        .stdout = .pipe,
+        .stderr = .inherit,
+    });
 
     const stdout = child.stdout.?;
     var buf: [256]u8 = undefined;
-    const n = stdout.read(&buf) catch |err| {
-        _ = child.kill() catch {};
+    var rbuf: [256]u8 = undefined;
+    var reader = stdout.reader(io, &rbuf);
+    const n = reader.interface.readSliceShort(&buf) catch |err| {
+        child.kill(io);
         return err;
     };
 
-    const term = try child.wait();
+    const term = try child.wait(io);
     switch (term) {
-        .Exited => |code| if (code != 0) return error.ProbeFailed,
+        .exited => |code| if (code != 0) return error.ProbeFailed,
         else => return error.ProbeFailed,
     }
 
@@ -86,14 +88,18 @@ fn runRssProbe(allocator: std.mem.Allocator, exe: []const u8, fixture: []const u
 
 /// Spawn the synth probe to (re)generate the cached fixture. Inherits
 /// stdout/stderr so a long synth run isn't silent.
-fn runSynthProbe(allocator: std.mem.Allocator, exe: []const u8, out_path: []const u8) !void {
-    var child = std.process.Child.init(&.{ exe, out_path }, allocator);
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    try child.spawn();
-    const term = try child.wait();
+fn runSynthProbe(io: std.Io, exe: []const u8, out_path: []const u8) !void {
+    // 0.16 replaced Child.init + child.spawn() with process.spawn(io,
+    // options); stdio inheritance moved into SpawnOptions and the
+    // allocator is no longer part of the call.
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ exe, out_path },
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    const term = try child.wait(io);
     switch (term) {
-        .Exited => |code| if (code != 0) return error.SynthFailed,
+        .exited => |code| if (code != 0) return error.SynthFailed,
         else => return error.SynthFailed,
     }
 }
@@ -109,17 +115,17 @@ test "RSS gate: Workbook.openLazy ≤ 2× Book.openLazy on 100k × 10 fixture" {
     const allocator = std.testing.allocator;
 
     // 1. Locate the three probe binaries the bench step installs.
-    const synth_exe = findProbe(allocator, "zlsx-bench-rss-synth") catch return error.SkipZigTest;
+    const synth_exe = findProbe(allocator, io, "zlsx-bench-rss-synth") catch return error.SkipZigTest;
     defer allocator.free(synth_exe);
-    const book_exe = findProbe(allocator, "zlsx-bench-rss-book") catch return error.SkipZigTest;
+    const book_exe = findProbe(allocator, io, "zlsx-bench-rss-book") catch return error.SkipZigTest;
     defer allocator.free(book_exe);
-    const wb_exe = findProbe(allocator, "zlsx-bench-rss-workbook") catch return error.SkipZigTest;
+    const wb_exe = findProbe(allocator, io, "zlsx-bench-rss-workbook") catch return error.SkipZigTest;
     defer allocator.free(wb_exe);
 
     // 2. Generate fixture (cached). On a fresh checkout this is the
     //    longest step; the probe self-skips when the file is present.
-    try runSynthProbe(allocator, synth_exe, FIXTURE_PATH);
-    const fixture_size = (try std.Io.Dir.cwd().statFile(io, FIXTURE_PATH)).size;
+    try runSynthProbe(io, synth_exe, FIXTURE_PATH);
+    const fixture_size = (try std.Io.Dir.cwd().statFile(io, FIXTURE_PATH, .{})).size;
     std.debug.print(
         "[rss-gate] fixture: {s} ({d:.2} MB)\n",
         .{ FIXTURE_PATH, @as(f64, @floatFromInt(fixture_size)) / (1024.0 * 1024.0) },
@@ -127,8 +133,8 @@ test "RSS gate: Workbook.openLazy ≤ 2× Book.openLazy on 100k × 10 fixture" {
 
     // 3. Two child invocations — one per backend. Each probe
     //    independently measures its own RSS delta.
-    const book_rss = try runRssProbe(allocator, book_exe, FIXTURE_PATH);
-    const wb_rss = try runRssProbe(allocator, wb_exe, FIXTURE_PATH);
+    const book_rss = try runRssProbe(io, book_exe, FIXTURE_PATH);
+    const wb_rss = try runRssProbe(io, wb_exe, FIXTURE_PATH);
 
     const book_mb = @as(f64, @floatFromInt(book_rss)) / (1024.0 * 1024.0);
     const wb_mb = @as(f64, @floatFromInt(wb_rss)) / (1024.0 * 1024.0);
