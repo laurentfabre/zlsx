@@ -1518,15 +1518,21 @@ const signals = struct {
     var sigterm_fired = std.atomic.Value(bool).init(false);
     var sigpipe_fired = std.atomic.Value(bool).init(false);
 
-    fn onSigpipe(_: i32) callconv(.c) void {
+    /// 0.16 types the POSIX signal-handler parameter per platform —
+    /// Linux uses a generated `SIG` enum, other targets an int — so
+    /// derive it from `Sigaction.handler_fn` instead of hard-coding
+    /// `i32`, which only compiled on some targets.
+    const SigArg = @typeInfo(@typeInfo(std.posix.Sigaction.handler_fn).pointer.child).@"fn".params[0].type.?;
+
+    fn onSigpipe(_: SigArg) callconv(.c) void {
         sigpipe_fired.store(true, .release);
         stop_streaming.store(true, .release);
     }
-    fn onSigint(_: i32) callconv(.c) void {
+    fn onSigint(_: SigArg) callconv(.c) void {
         sigint_fired.store(true, .release);
         stop_streaming.store(true, .release);
     }
-    fn onSigterm(_: i32) callconv(.c) void {
+    fn onSigterm(_: SigArg) callconv(.c) void {
         sigterm_fired.store(true, .release);
         stop_streaming.store(true, .release);
     }
@@ -1587,13 +1593,13 @@ fn classifyTopLevelError(e: anyerror) u8 {
     };
 }
 
-pub fn main() u8 {
+pub fn main(init: std.process.Init) u8 {
     // iter60a: the process-hygiene slice. Install SIGPIPE / SIGINT /
     // SIGTERM handlers before any emission can begin so a fast pipe
     // teardown (e.g. `| head -0`) never races the first write.
     signals.install();
 
-    const code = runMain() catch |e| blk: {
+    const code = runMain(init) catch |e| blk: {
         const classified = classifyTopLevelError(e);
         // Preserve the diagnostic for unclassified errors so field
         // users still get a handle to file a bug — exit 1 without
@@ -1601,7 +1607,7 @@ pub fn main() u8 {
         // good luck figuring out what."
         if (classified == 1) {
             var stderr_buf: [128]u8 = undefined;
-            var stderr_file = std.Io.File.stderr().writer(&stderr_buf);
+            var stderr_file = std.Io.File.stderr().writer(init.io, &stderr_buf);
             const err = &stderr_file.interface;
             err.print("zlsx: {s}\n", .{@errorName(e)}) catch {};
             err.flush() catch {};
@@ -1613,16 +1619,18 @@ pub fn main() u8 {
 
 /// Process-wide Io for the CLI.
 ///
-/// Zig 0.16 requires an `Io` for every filesystem and stdio call. The
-/// CLI has exactly one entry point and a flat dispatch graph, so rather
-/// than threading a parameter through every command function this is
-/// set once at the top of `runMain`, before any dispatch. Named
-/// `proc_io` rather than `io` so it cannot collide with the locally
-/// bound `io` in test blocks.
-var proc_threaded: std.Io.Threaded = undefined;
+/// Zig 0.16 requires an `Io` for every filesystem and stdio call. It is
+/// handed to `main` via `std.process.Init` and stashed here so the
+/// dispatch switch can reach it without threading a parameter through
+/// every command signature. The command functions that actually touch
+/// the filesystem still take an `io` parameter — that keeps them
+/// testable, since tests never run `runMain` and so never set this.
+///
+/// Named `proc_io` rather than `io` so it cannot collide with the
+/// locally bound `io` in test blocks.
 var proc_io: std.Io = undefined;
 
-fn runMain() !u8 {
+fn runMain(init: std.process.Init) !u8 {
     // Debug builds use the leak-detecting allocator; release builds use
     // smp_allocator — fast, pure-Zig (no libc dep). smp_allocator asserts
     // !builtin.single_threaded, so single-threaded builds fall back to
@@ -1638,15 +1646,20 @@ fn runMain() !u8 {
         std.heap.smp_allocator;
     const alloc = if (builtin.mode == .Debug) gpa.allocator() else release_alloc;
 
-    proc_threaded = .init(alloc, .{});
-    defer proc_threaded.deinit();
-    proc_io = proc_threaded.io();
+    // 0.16 hands main its Io and argv through `std.process.Init`
+    // rather than exposing them ambiently — `std.process.argsAlloc` is
+    // gone. Take both from there instead of standing up our own
+    // Threaded instance.
+    proc_io = init.io;
 
-    const raw_args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, raw_args);
+    // toSlice wants an arena — process.Init carries one whose lifetime
+    // is the whole process, which is exactly argv's lifetime. Passing
+    // the general-purpose allocator instead leaks, since 0.16 has no
+    // argsFree counterpart.
+    const raw_args = try init.minimal.args.toSlice(init.arena.allocator());
 
     var stdout_buf: [16 * 1024]u8 = undefined;
-    var stdout_file = std.Io.File.stdout().writer(&stdout_buf);
+    var stdout_file = std.Io.File.stdout().writer(proc_io, &stdout_buf);
     const out = &stdout_file.interface;
     // iter60a: flush on normal exit AND on a signal-triggered stop.
     // Per-record flushes below surface SIGPIPE promptly; this trailing
@@ -1657,7 +1670,7 @@ fn runMain() !u8 {
     defer out.flush() catch {};
 
     var stderr_buf: [4 * 1024]u8 = undefined;
-    var stderr_file = std.Io.File.stderr().writer(&stderr_buf);
+    var stderr_file = std.Io.File.stderr().writer(proc_io, &stderr_buf);
     const err = &stderr_file.interface;
     defer err.flush() catch {};
 
@@ -1716,12 +1729,12 @@ fn runMain() !u8 {
 
     // iter-sst-4: dispatch on --sst-lazy.
     var book = if (args.sst_lazy)
-        xlsx.Book.openSstLazy(alloc, args.file) catch |e| {
+        xlsx.Book.openSstLazy(alloc, proc_io, args.file) catch |e| {
             try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
             return 2;
         }
     else
-        xlsx.Book.open(alloc, args.file) catch |e| {
+        xlsx.Book.open(alloc, proc_io, args.file) catch |e| {
             try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
             return 2;
         };
