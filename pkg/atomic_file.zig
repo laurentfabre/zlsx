@@ -164,7 +164,10 @@ test "atomic file leaves no debris when abandoned" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var tmp = std.testing.tmpDir(.{});
+    // `.iterate = true` is required to call `iterate()` below. macOS
+    // tolerates a non-iterable handle; Linux returns BADF and Windows
+    // ACCESS_DENIED, so omitting it passes locally and fails in CI.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     const path = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);

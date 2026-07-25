@@ -28,23 +28,28 @@ pub const Error = error{
 /// Current resident-set size in bytes for this process. Returns
 /// `error.RssNotAvailable` on platforms without an implementation
 /// (callers should `try` and the test should SKIP).
-pub fn rssBytes() Error!u64 {
+pub fn rssBytes(io: std.Io) Error!u64 {
     return switch (builtin.os.tag) {
-        .linux => readLinuxVmRss(),
+        .linux => readLinuxVmRss(io),
         .macos => readMacosResidentSize(),
         .freebsd, .netbsd, .openbsd, .dragonfly => readBsdRuMaxRss(),
         else => error.RssNotAvailable,
     };
 }
 
-fn readLinuxVmRss() Error!u64 {
-    var file = std.fs.openFileAbsolute("/proc/self/status", .{}) catch return error.RssReadFailed;
-    defer file.close();
+fn readLinuxVmRss(io: std.Io) Error!u64 {
+    // 0.16 moved absolute-path opens under std.Io.Dir and every call
+    // takes an Io. This path is Linux-only, so macOS builds never
+    // compiled it and the migration missed it until CI ran.
+    var file = std.Io.Dir.openFileAbsolute(io, "/proc/self/status", .{}) catch
+        return error.RssReadFailed;
+    defer file.close(io);
 
     // `/proc/self/status` is small (≤ 4 KB on contemporary kernels);
     // a fixed buffer is safe and avoids any allocator dependency.
     var buf: [8192]u8 = undefined;
-    const n = file.read(&buf) catch return error.RssReadFailed;
+    var fr = file.reader(io, &.{});
+    const n = fr.interface.readSliceShort(&buf) catch return error.RssReadFailed;
     const text = buf[0..n];
 
     var it = std.mem.splitScalar(u8, text, '\n');
@@ -142,7 +147,10 @@ fn readBsdRuMaxRss() Error!u64 {
 // ─── Tests ─────────────────────────────────────────────────────────
 
 test "rssBytes: returns a non-zero reading on supported platforms" {
-    const r = rssBytes() catch |err| switch (err) {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const r = rssBytes(io) catch |err| switch (err) {
         // Windows path — skip, don't fail.
         error.RssNotAvailable => return error.SkipZigTest,
         else => return err,
@@ -155,7 +163,10 @@ test "rssBytes: returns a non-zero reading on supported platforms" {
 }
 
 test "rssBytes: monotonic-ish across a heap allocation burst" {
-    const before = rssBytes() catch |err| switch (err) {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const before = rssBytes(io) catch |err| switch (err) {
         error.RssNotAvailable => return error.SkipZigTest,
         else => return err,
     };
@@ -168,7 +179,7 @@ test "rssBytes: monotonic-ish across a heap allocation burst" {
     defer std.testing.allocator.free(buf);
     @memset(buf, 0xAA);
 
-    const after = rssBytes() catch return error.SkipZigTest;
+    const after = rssBytes(io) catch return error.SkipZigTest;
 
     // RSS measurement is coarse; we don't insist `after > before`
     // (kernel page reclamation can fire between the calls). Just

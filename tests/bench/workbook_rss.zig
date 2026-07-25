@@ -43,7 +43,7 @@ const FIXTURE_PATH = ".zig-cache/bench-100k-x-10.xlsx";
 const RATIO_CEILING: f64 = 1.5;
 
 fn currentRss() !u64 {
-    return rss.rssBytes() catch |err| switch (err) {
+    return rss.rssBytes(io) catch |err| switch (err) {
         error.RssNotAvailable => return error.SkipZigTest,
         else => return err,
     };

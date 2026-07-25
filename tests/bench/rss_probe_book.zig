@@ -33,13 +33,13 @@ pub fn main(init: std.process.Init) !void {
         @memset(warmup, 0);
     }
 
-    const baseline = try rss.rssBytes();
+    const baseline = try rss.rssBytes(io);
 
     var book = try xlsx.Book.openLazy(allocator, io, fixture);
     defer book.deinit();
     // Touch nothing — the gate is "before any sheet is touched".
 
-    const after = try rss.rssBytes();
+    const after = try rss.rssBytes(io);
     const delta: u64 = if (after > baseline) after - baseline else 0;
 
     var stdout_buf: [64]u8 = undefined;

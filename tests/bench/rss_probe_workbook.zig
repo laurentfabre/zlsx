@@ -26,13 +26,13 @@ pub fn main(init: std.process.Init) !void {
         @memset(warmup, 0);
     }
 
-    const baseline = try rss.rssBytes();
+    const baseline = try rss.rssBytes(io);
 
     var wb = try pkg.Workbook.openLazy(allocator, io, fixture);
     defer wb.deinit();
     // Touch nothing — same contract as the Book probe.
 
-    const after = try rss.rssBytes();
+    const after = try rss.rssBytes(io);
     const delta: u64 = if (after > baseline) after - baseline else 0;
 
     var stdout_buf: [64]u8 = undefined;
