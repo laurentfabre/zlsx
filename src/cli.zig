@@ -61,6 +61,11 @@ const Subcommand = enum {
     add_sheet,
     rename_sheet,
     delete_sheet,
+    /// Z3: strip identifying document metadata (docProps/core.xml,
+    /// docProps/app.xml, docProps/custom.xml) and save to `--out`.
+    /// Cell data is untouched — this is the metadata counterpart to
+    /// masking cell values.
+    scrub_metadata,
 };
 
 /// iter60b: `--output` wire-shape switch.
@@ -242,6 +247,7 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
         if (std.mem.eql(u8, a, "delete-sheet")) return .delete_sheet;
         if (std.mem.eql(u8, a, "meta")) return .meta;
         if (std.mem.eql(u8, a, "list-sheets")) return .list_sheets;
+        if (std.mem.eql(u8, a, "scrub-metadata")) return .scrub_metadata;
         if (std.mem.eql(u8, a, "comments")) return .comments;
         if (std.mem.eql(u8, a, "validations")) return .validations;
         if (std.mem.eql(u8, a, "hyperlinks")) return .hyperlinks;
@@ -354,7 +360,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         .styles,
         .sst,
         => true,
-        .rows, .cells, .comments, .validations, .hyperlinks, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet => false,
+        .rows, .cells, .comments, .validations, .hyperlinks, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata => false,
     };
 
     var out: Args = .{ .file = "", .subcommand = detected_sub };
@@ -532,6 +538,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
                     std.mem.eql(u8, a, "rows") or
                     std.mem.eql(u8, a, "meta") or
                     std.mem.eql(u8, a, "list-sheets") or
+                    std.mem.eql(u8, a, "scrub-metadata") or
                     std.mem.eql(u8, a, "comments") or
                     std.mem.eql(u8, a, "validations") or
                     std.mem.eql(u8, a, "hyperlinks") or
@@ -564,7 +571,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.start_row != null or out.end_row != null) {
         switch (detected_sub) {
             .rows, .cells, .comments => {},
-            .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet => {
+            .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata => {
                 return ArgError.BadArgValue;
             },
         }
@@ -576,7 +583,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.range != null) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet => {
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata => {
                 return ArgError.BadArgValue;
             },
         }
@@ -608,7 +615,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.include_blanks) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet => {
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata => {
                 return ArgError.BadArgValue;
             },
         }
@@ -617,7 +624,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.with_styles) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet => {
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata => {
                 return ArgError.BadArgValue;
             },
         }
@@ -631,11 +638,19 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
             if (out.header) return ArgError.BadArgValue;
         }
     }
-    // iter60b: `pretty-json` is the meta-only collapsed-object variant
-    // (docs/jq-for-excel.md v4.1). Every other sub-command emits a
-    // streaming shape — a collapsed single-object rewrite doesn't
-    // compose. Reject at parse time rather than silently fall back.
-    if (out.output == .pretty_json and detected_sub != .meta) {
+    // iter60b: `pretty-json` is the collapsed-object variant
+    // (docs/jq-for-excel.md v4.1). Every streaming sub-command emits a
+    // record-per-line shape that a collapsed single-object rewrite
+    // doesn't compose with, so those are still rejected at parse time
+    // rather than silently falling back.
+    //
+    // `list-sheets` joined `meta` here: it is workbook-scoped and
+    // bounded (one record per sheet), so a single object is a coherent
+    // shape — and callers checking sheet visibility want to `jq` the
+    // whole answer at once rather than stream it.
+    if (out.output == .pretty_json and
+        detected_sub != .meta and detected_sub != .list_sheets)
+    {
         return ArgError.BadArgValue;
     }
     // `--format` shapes only `rows` output. On sheet-scoped sub-commands
@@ -683,6 +698,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         .add_sheet,
         .rename_sheet,
         .delete_sheet,
+        .scrub_metadata,
         => {},
         else => return ArgError.BadArgValue,
     };
@@ -1724,6 +1740,7 @@ fn runMain(init: std.process.Init) !u8 {
         .add_sheet => return try runAddSheetCommand(alloc, proc_io, args, err),
         .rename_sheet => return try runRenameSheetCommand(alloc, proc_io, args, err),
         .delete_sheet => return try runDeleteSheetCommand(alloc, proc_io, args, err),
+        .scrub_metadata => return try runScrubMetadataCommand(alloc, proc_io, args, err),
         else => {},
     }
 
@@ -1768,11 +1785,20 @@ fn runMain(init: std.process.Init) !u8 {
                 try err.flush();
                 break :blk null;
             };
-            try runMetaCommand(out, &book, path_opt, args.output);
+            // Document properties come from the package layer, which
+            // the reader-only Book has no view of. The reader accepts
+            // some archives the package layer refuses (ZIP data
+            // descriptors, for one), so a failure here degrades to
+            // `"doc_props": null` rather than failing `meta` outright.
+            var dp_wb: ?zlsx_pkg.Workbook = zlsx_pkg.Workbook.open(alloc, proc_io, args.file) catch null;
+            defer if (dp_wb) |*w| w.deinit();
+            const dp: ?zlsx_pkg.DocProps = if (dp_wb) |*w| (w.docProps() catch null) else null;
+
+            try runMetaCommand(out, &book, path_opt, args.output, dp);
             return 0;
         },
         .list_sheets => {
-            try runListSheetsCommand(out, &book);
+            try runListSheetsCommand(out, &book, args.output);
             return 0;
         },
         .comments => {
@@ -1817,6 +1843,7 @@ fn runMain(init: std.process.Init) !u8 {
         .add_sheet,
         .rename_sheet,
         .delete_sheet,
+        .scrub_metadata,
         => unreachable,
         .rows, .cells => {},
     }
@@ -1869,6 +1896,7 @@ fn runMain(init: std.process.Init) !u8 {
         .add_sheet,
         .rename_sheet,
         .delete_sheet,
+        .scrub_metadata,
         => unreachable,
     }
     return 0;
@@ -2692,7 +2720,21 @@ fn runMetaCommand(
     book: *const xlsx.Book,
     path: ?[]const u8,
     output: OutputMode,
+    /// Document properties, or null when the package layer could not
+    /// open the archive. The reader accepts some archives the Editor
+    /// refuses (ZIP data descriptors, for one), so `meta` must still
+    /// work without them rather than fail the whole command.
+    doc_props: ?zlsx_pkg.DocProps,
 ) !void {
+    // Hidden-sheet tally. Exposed as scalars so a caller can gate on it
+    // with jq alone rather than reducing over the sheets array.
+    var hidden_count: usize = 0;
+    var very_hidden_count: usize = 0;
+    for (book.sheets) |s| switch (s.state) {
+        .hidden => hidden_count += 1,
+        .very_hidden => very_hidden_count += 1,
+        .visible => {},
+    };
     // Workbook-level `has_comments` is the OR across every sheet —
     // saves callers a reduce step when they only want "does this file
     // have any comments at all?".
@@ -2731,6 +2773,11 @@ fn runMetaCommand(
                 if (any_comments) "true" else "false",
             },
         );
+        try out.print(
+            "  \"hidden_sheet_count\": {d},\n  \"very_hidden_sheet_count\": {d},\n",
+            .{ hidden_count, very_hidden_count },
+        );
+        try writeDocPropsPretty(out, doc_props);
         try out.writeAll("  \"sheets\": [");
         if (book.sheets.len == 0) {
             try out.writeAll("]\n}\n");
@@ -2744,8 +2791,8 @@ fn runMetaCommand(
             try out.writeAll("    {\"kind\": \"sheet\", \"sheet\": ");
             try writeJsonString(out, s.name);
             try out.print(
-                ", \"sheet_idx\": {d}, \"has_comments\": {s}}}",
-                .{ i, if (sheet_has_comments) "true" else "false" },
+                ", \"sheet_idx\": {d}, \"state\": \"{s}\", \"has_comments\": {s}}}",
+                .{ i, s.state.toString(), if (sheet_has_comments) "true" else "false" },
             );
             if (i + 1 < book.sheets.len) try out.writeByte(',');
             try out.writeByte('\n');
@@ -2765,13 +2812,19 @@ fn runMetaCommand(
         .{ book.sheets.len, book.sharedStringsCount(), book.rich_runs_by_sst_idx.count() },
     );
     try out.print(
-        ",\"has_styles\":{s},\"has_theme\":{s},\"has_comments\":{s}}}\n",
+        ",\"has_styles\":{s},\"has_theme\":{s},\"has_comments\":{s}",
         .{
             if (book.styles_xml != null) "true" else "false",
             if (book.theme_xml != null) "true" else "false",
             if (any_comments) "true" else "false",
         },
     );
+    try out.print(
+        ",\"hidden_sheet_count\":{d},\"very_hidden_sheet_count\":{d}",
+        .{ hidden_count, very_hidden_count },
+    );
+    try writeDocPropsCompact(out, doc_props);
+    try out.writeAll("}\n");
 
     // iter60b-P1: compact mode is a documented no-op for meta's
     // per-sheet records. Stripping sheet/sheet_idx here would orphan
@@ -2785,23 +2838,165 @@ fn runMetaCommand(
         try out.writeAll("{\"kind\":\"sheet\",\"sheet\":");
         try writeJsonString(out, s.name);
         try out.print(
-            ",\"sheet_idx\":{d},\"has_comments\":{s}}}\n",
-            .{ i, if (sheet_has_comments) "true" else "false" },
+            ",\"sheet_idx\":{d},\"state\":\"{s}\",\"has_comments\":{s}}}\n",
+            .{ i, s.state.toString(), if (sheet_has_comments) "true" else "false" },
         );
     }
     try out.flush();
+}
+
+/// Emit the `doc_props` object for `meta --output pretty-json`.
+///
+/// Absent parts render as `null` rather than being omitted, so a
+/// consumer can distinguish "zlsx could not read them" from "the
+/// workbook genuinely has none" without a schema lookup.
+fn writeDocPropsPretty(out: *std.Io.Writer, props: ?zlsx_pkg.DocProps) !void {
+    const dp = props orelse {
+        try out.writeAll("  \"doc_props\": null,\n");
+        return;
+    };
+    try out.writeAll("  \"doc_props\": {\n");
+    try writeDocPropField(out, "creator", dp.creator, "    ", true);
+    try writeDocPropField(out, "last_modified_by", dp.last_modified_by, "    ", true);
+    try writeDocPropField(out, "title", dp.title, "    ", true);
+    try writeDocPropField(out, "subject", dp.subject, "    ", true);
+    try writeDocPropField(out, "description", dp.description, "    ", true);
+    try writeDocPropField(out, "keywords", dp.keywords, "    ", true);
+    try writeDocPropField(out, "category", dp.category, "    ", true);
+    try writeDocPropField(out, "created", dp.created, "    ", true);
+    try writeDocPropField(out, "modified", dp.modified, "    ", true);
+    try writeDocPropField(out, "revision", dp.revision, "    ", true);
+    try writeDocPropField(out, "company", dp.company, "    ", true);
+    try writeDocPropField(out, "manager", dp.manager, "    ", true);
+    try writeDocPropField(out, "application", dp.application, "    ", true);
+    try writeDocPropField(out, "hyperlink_base", dp.hyperlink_base, "    ", true);
+    try out.print(
+        "    \"has_custom_properties\": {s}\n  }},\n",
+        .{if (dp.has_custom_properties) "true" else "false"},
+    );
+}
+
+/// Same object, single-line, for the NDJSON envelope.
+fn writeDocPropsCompact(out: *std.Io.Writer, props: ?zlsx_pkg.DocProps) !void {
+    const dp = props orelse {
+        try out.writeAll(",\"doc_props\":null");
+        return;
+    };
+    try out.writeAll(",\"doc_props\":{");
+    try writeDocPropField(out, "creator", dp.creator, "", false);
+    try writeDocPropField(out, "last_modified_by", dp.last_modified_by, "", false);
+    try writeDocPropField(out, "title", dp.title, "", false);
+    try writeDocPropField(out, "subject", dp.subject, "", false);
+    try writeDocPropField(out, "description", dp.description, "", false);
+    try writeDocPropField(out, "keywords", dp.keywords, "", false);
+    try writeDocPropField(out, "category", dp.category, "", false);
+    try writeDocPropField(out, "created", dp.created, "", false);
+    try writeDocPropField(out, "modified", dp.modified, "", false);
+    try writeDocPropField(out, "revision", dp.revision, "", false);
+    try writeDocPropField(out, "company", dp.company, "", false);
+    try writeDocPropField(out, "manager", dp.manager, "", false);
+    try writeDocPropField(out, "application", dp.application, "", false);
+    try writeDocPropField(out, "hyperlink_base", dp.hyperlink_base, "", false);
+    try out.print(
+        "\"has_custom_properties\":{s}}}",
+        .{if (dp.has_custom_properties) "true" else "false"},
+    );
+}
+
+/// One `"key": value` pair. Null fields emit JSON `null` so the object
+/// shape is stable across workbooks — consumers can index without
+/// existence checks.
+fn writeDocPropField(
+    out: *std.Io.Writer,
+    key: []const u8,
+    value: ?[]const u8,
+    indent: []const u8,
+    pretty: bool,
+) !void {
+    try out.writeAll(indent);
+    try out.writeByte('"');
+    try out.writeAll(key);
+    try out.writeAll(if (pretty) "\": " else "\":");
+    if (value) |v| try writeJsonString(out, v) else try out.writeAll("null");
+    try out.writeAll(",");
+    if (pretty) try out.writeByte('\n');
+}
+
+/// `zlsx scrub-metadata <in.xlsx> --out <clean.xlsx>`
+///
+/// Strips authorship metadata and saves. Everything else — every cell,
+/// every untouched part — flows through the Editor's byte-preserving
+/// save path unchanged.
+fn runScrubMetadataCommand(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    args: Args,
+    err: *std.Io.Writer,
+) !u8 {
+    const out_path = args.out_path orelse {
+        try err.writeAll("zlsx: scrub-metadata requires --out PATH\n");
+        try err.flush();
+        return 2;
+    };
+
+    var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    defer ed.deinit();
+
+    ed.stripDocProps(.{}) catch |e| {
+        try err.print("zlsx: scrub-metadata: {s}\n", .{@errorName(e)});
+        try err.flush();
+        return 3;
+    };
+
+    ed.save(io, out_path) catch |e| {
+        try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
+        try err.flush();
+        return 5;
+    };
+    return 0;
 }
 
 /// iter57: lighter NDJSON variant of `meta` — one record per sheet,
 /// name + index only. Same envelope shape as `meta`'s sheet record
 /// minus the workbook-scoped `has_comments` field, so consumers can
 /// trivially swap between the two commands.
-fn runListSheetsCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
+fn runListSheetsCommand(out: *std.Io.Writer, book: *const xlsx.Book, output: OutputMode) !void {
+    if (output == .pretty_json) {
+        try out.writeAll("{\n  \"sheets\": [");
+        if (book.sheets.len == 0) {
+            try out.writeAll("]\n}\n");
+            try out.flush();
+            return;
+        }
+        try out.writeByte('\n');
+        for (book.sheets, 0..) |s, i| {
+            if (signals.shouldStop()) return;
+            try out.writeAll("    {\"kind\": \"sheet\", \"sheet\": ");
+            try writeJsonString(out, s.name);
+            try out.print(
+                ", \"sheet_idx\": {d}, \"state\": \"{s}\"}}",
+                .{ i, s.state.toString() },
+            );
+            if (i + 1 < book.sheets.len) try out.writeByte(',');
+            try out.writeByte('\n');
+        }
+        try out.writeAll("  ]\n}\n");
+        try out.flush();
+        return;
+    }
+
     for (book.sheets, 0..) |s, i| {
         if (signals.shouldStop()) return;
         try out.writeAll("{\"kind\":\"sheet\",\"sheet\":");
         try writeJsonString(out, s.name);
-        try out.print(",\"sheet_idx\":{d}}}\n", .{i});
+        // `state` surfaces `<sheet state="…">`. veryHidden sheets are
+        // unreachable from Excel's UI, so a caller scanning a workbook
+        // has no other way to learn they exist.
+        try out.print(",\"sheet_idx\":{d},\"state\":\"{s}\"}}\n", .{ i, s.state.toString() });
     }
     try out.flush();
 }
@@ -5711,7 +5906,7 @@ test "runMetaCommand emits path:null on non-UTF-8 workbook path" {
     };
     defer empty_book.deinit();
 
-    try runMetaCommand(&w, &empty_book, null, .ndjson);
+    try runMetaCommand(&w, &empty_book, null, .ndjson, null);
 
     const out = scratch[0..w.end];
     // The path field must serialize as literal `null`, not a string.
@@ -5745,11 +5940,14 @@ test "runListSheetsCommand emits one sheet record per sheet" {
 
     var scratch: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runListSheetsCommand(&w, &book);
+    try runListSheetsCommand(&w, &book, .ndjson);
+    // Z4: every record now carries `state`. Writer-produced sheets are
+    // all visible; the veryHidden path is covered by the sheet-state
+    // test below.
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"sheet\",\"sheet\":\"Data\",\"sheet_idx\":0}\n" ++
-            "{\"kind\":\"sheet\",\"sheet\":\"Other\",\"sheet_idx\":1}\n" ++
-            "{\"kind\":\"sheet\",\"sheet\":\"She\\\"et\",\"sheet_idx\":2}\n",
+        "{\"kind\":\"sheet\",\"sheet\":\"Data\",\"sheet_idx\":0,\"state\":\"visible\"}\n" ++
+            "{\"kind\":\"sheet\",\"sheet\":\"Other\",\"sheet_idx\":1,\"state\":\"visible\"}\n" ++
+            "{\"kind\":\"sheet\",\"sheet\":\"She\\\"et\",\"sheet_idx\":2,\"state\":\"visible\"}\n",
         w.buffered(),
     );
 }
@@ -5782,7 +5980,7 @@ test "runMetaCommand emits workbook record with sst/has_* fields then sheet reco
 
     var scratch: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runMetaCommand(&w, &book, tmp_path, .ndjson);
+    try runMetaCommand(&w, &book, tmp_path, .ndjson, null);
 
     const out = w.buffered();
     // Parse NDJSON line by line and assert field presence + values.
@@ -6343,15 +6541,24 @@ test "parseArgs --output missing value is MissingValue" {
     try std.testing.expectError(ArgError.MissingValue, parseArgs(&argv));
 }
 
-test "parseArgs --output pretty-json is rejected on every sub-command other than meta" {
+test "parseArgs --output pretty-json is rejected on streaming sub-commands" {
+    // Z4: `list-sheets` moved OUT of this list — it is workbook-scoped
+    // and bounded, so a collapsed object is a coherent shape and
+    // callers gating on sheet visibility want the whole answer at once.
+    // Everything below still streams record-per-line.
     const subs = [_][]const u8{
-        "cells",       "rows",       "list-sheets", "comments",
-        "validations", "hyperlinks", "styles",      "sst",
+        "cells",       "rows",       "comments",
+        "validations", "hyperlinks", "styles",
+        "sst",
     };
     for (subs) |sub| {
         const argv = [_][]const u8{ sub, "--output", "pretty-json", "f.xlsx" };
         try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
     }
+    // list-sheets now accepts it.
+    const argv_ls = [_][]const u8{ "list-sheets", "--output", "pretty-json", "f.xlsx" };
+    const parsed = try parseArgs(&argv_ls);
+    try std.testing.expectEqual(OutputMode.pretty_json, parsed.output);
     // Bare `zlsx file.xlsx` defaults to the `rows` sub-command, which
     // also cannot accept pretty-json.
     const argv_bare = [_][]const u8{ "--output", "pretty-json", "f.xlsx" };
@@ -6468,7 +6675,7 @@ test "runMetaCommand pretty-json collapses workbook + sheets into one JSON objec
 
     var buf: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try runMetaCommand(&w, &book, tmp_path, .pretty_json);
+    try runMetaCommand(&w, &book, tmp_path, .pretty_json, null);
 
     const out = w.buffered();
 

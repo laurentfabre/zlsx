@@ -204,6 +204,38 @@ pub const Cell = union(enum) {
 pub const Sheet = struct {
     name: []const u8,
     path: []const u8, // e.g. "xl/worksheets/sheet1.xml"
+    /// Visibility from `<sheet state="…">`. Absent attribute means
+    /// visible, which is by far the common case.
+    ///
+    /// Worth surfacing rather than ignoring: `veryHidden` sheets are
+    /// unreachable from Excel's UI (only VBA can reveal them), so a
+    /// workbook can carry data no human reviewer would ever see. A
+    /// masking or review pipeline needs to know they are there.
+    state: SheetState = .visible,
+};
+
+/// `<sheet state="…">` values per ECMA-376. Anything unrecognised is
+/// treated as `visible` — the schema default — rather than rejected,
+/// since sheet visibility must never fail an open.
+pub const SheetState = enum {
+    visible,
+    hidden,
+    very_hidden,
+
+    pub fn parse(raw: []const u8) SheetState {
+        if (std.mem.eql(u8, raw, "hidden")) return .hidden;
+        if (std.mem.eql(u8, raw, "veryHidden")) return .very_hidden;
+        return .visible;
+    }
+
+    /// The OOXML spelling, for round-tripping into output formats.
+    pub fn toString(self: SheetState) []const u8 {
+        return switch (self) {
+            .visible => "visible",
+            .hidden => "hidden",
+            .very_hidden => "veryHidden",
+        };
+    }
 };
 
 /// A1-style cell reference broken into components. Column is 0-based
@@ -2406,7 +2438,16 @@ pub fn parseWorkbookSheets(book: *Book, wb_xml: []const u8, rels_xml: []const u8
         const name_decoded = try name_buf.toOwnedSlice(book.allocator);
         try book.strings.append(book.allocator, name_decoded);
 
-        try sheets.append(book.allocator, .{ .name = name_decoded, .path = path });
+        const state: SheetState = if (getAttr(attrs, "state")) |raw|
+            SheetState.parse(raw)
+        else
+            .visible;
+
+        try sheets.append(book.allocator, .{
+            .name = name_decoded,
+            .path = path,
+            .state = state,
+        });
         i = gt + 1;
     }
 
