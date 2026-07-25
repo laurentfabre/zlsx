@@ -141,7 +141,7 @@ pub const Error = error{
     /// element in the source `xl/workbook.xml` bytes. Surfaces only
     /// if the file mutated under us between parse and patch.
     SheetElementNotFound,
-    /// `Workbook.fromBook(book, path)` opened `path` but the resulting
+    /// `Workbook.fromBook(book, io, path)` opened `path` but the resulting
     /// sheet count disagreed with `book.sheets.len`. Typically a path-
     /// drift bug in the caller (wrong path passed, file renamed,
     /// etc.). v1 of `fromBook` is a re-open + sanity-check shim;
@@ -295,7 +295,10 @@ pub const Error = error{
 } || workbook_xml_mod.Error || sheet_xml_mod.ParseError || sst_xml_mod.Error || styles_xml_mod.Error || store_mod.Error ||
     workbook_xml_plan_mod.Error ||
     zlsx.formula_rewriter.Error ||
-    std.Io.File.WriteError || std.Io.File.OpenError || std.fs.Dir.RenameError || std.fs.Dir.StatFileError;
+    std.Io.File.Writer.Error || std.Io.File.OpenError || std.Io.Dir.RenameError || std.Io.Dir.StatFileError ||
+    // pkg/atomic_file.zig's temp-name probe loop, reachable through
+    // PartStore.save on the write path.
+    error{TempNameExhausted};
 
 /// Mutation primitive (B1 iter-wb-4). Strings emit as `inlineStr`
 /// — cell-local text, no SST extension required. `shared_string`
@@ -536,10 +539,10 @@ pub const Workbook = struct {
     /// Errors if `xl/workbook.xml` is absent or malformed; otherwise
     /// every sheet is left lazy. `deinit` is required on success and
     /// on error after `open` returns successfully.
-    pub fn open(allocator: Allocator, path: []const u8) Error!Workbook {
+    pub fn open(allocator: Allocator, io: std.Io, path: []const u8) Error!Workbook {
         assert(path.len > 0);
 
-        var store = try PartStore.open(allocator, path);
+        var store = try PartStore.open(allocator, io, path);
         errdefer store.deinit();
 
         return try fromStore(allocator, store);
@@ -551,9 +554,9 @@ pub const Workbook = struct {
     /// callers (and the iter-wb-6 RSS gate) can pin to the future-
     /// correct symbol; later iters may add an SST-lazy / drawings-lazy
     /// strategy here without changing call sites.
-    pub fn openLazy(allocator: Allocator, path: []const u8) Error!Workbook {
+    pub fn openLazy(allocator: Allocator, io: std.Io, path: []const u8) Error!Workbook {
         assert(path.len > 0);
-        return Workbook.open(allocator, path);
+        return Workbook.open(allocator, io, path);
     }
 
     /// Construct a `Workbook` from an already-opened `PartStore`.
@@ -591,7 +594,7 @@ pub const Workbook = struct {
     /// passes the path that was originally used to open `book`.
     ///
     /// **v1 contract — re-reads the file.** Today this is a thin
-    /// wrapper around `Workbook.open(alloc, path)` plus a sanity check
+    /// wrapper around `Workbook.open(alloc, io, path)` plus a sanity check
     /// that the resulting sheet count matches `book.sheets.len`. The
     /// "without re-reading the file" promise from the workbook-overlay
     /// plan needs a `PartStore`-from-bytes constructor (or PartStore /
@@ -603,9 +606,9 @@ pub const Workbook = struct {
     /// Workbook disagree on sheet count — typically a sign of a path
     /// drift bug in the caller (passed the wrong path, file was
     /// renamed, etc.).
-    pub fn fromBook(allocator: Allocator, book: *const zlsx.Book, path: []const u8) Error!Workbook {
+    pub fn fromBook(allocator: Allocator, io: std.Io, book: *const zlsx.Book, path: []const u8) Error!Workbook {
         assert(path.len > 0);
-        var wb = try Workbook.open(allocator, path);
+        var wb = try Workbook.open(allocator, io, path);
         errdefer wb.deinit();
 
         if (wb.sheetCount() != book.sheets.len) return error.SheetCountMismatch;
@@ -620,11 +623,11 @@ pub const Workbook = struct {
     /// view; `addSheet(name)` grows it.
     ///
     /// Used by the upcoming B3 Writer-rebase track: `xlsx.Writer.save`
-    /// will call `Workbook.empty(alloc)`, populate via `addSheet` +
+    /// will call `Workbook.empty(alloc, io)`, populate via `addSheet` +
     /// `setCell` / `appendRows`, then `save(path)`.
     ///
-    pub fn empty(allocator: Allocator) Error!Workbook {
-        var store = try PartStore.fresh(allocator);
+    pub fn empty(allocator: Allocator, io: std.Io) Error!Workbook {
+        var store = try PartStore.fresh(allocator, io);
         errdefer store.deinit();
 
         // `PartStore.fresh` seeds only `[Content_Types].xml`. Seed
@@ -881,7 +884,7 @@ pub const Workbook = struct {
     ///
     /// iter-wb-4 m1 limits: numeric / boolean / blank values only.
     /// m2: strings + formulas. m4: shared-string mode (`<c t="s">`).
-    pub fn save(self: *Workbook, path: []const u8) Error!void {
+    pub fn save(self: *Workbook, io: std.Io, path: []const u8) Error!void {
         // Phase 0 (B3 iter-wr-3): apply the workbook.xml fresh-emit
         // plan. Today the only axis is staged defined names — splice
         // them into `xl/workbook.xml` BEFORE the SST + per-sheet
@@ -962,7 +965,7 @@ pub const Workbook = struct {
                 self.sst_view = null;
             }
         }
-        try self.store.save(path);
+        try self.store.save(io, path);
     }
 
     /// B3 iter-wr-7: emit a fresh `.xlsx` archive from the workbook's
@@ -978,7 +981,7 @@ pub const Workbook = struct {
     /// Errors flow through verbatim from the substrate: `NoSheets`
     /// when no worksheets are registered; allocation/zip-sentinel
     /// errors on archive build.
-    pub fn saveFreshEmit(self: *Workbook, path: []const u8) !void {
+    pub fn saveFreshEmit(self: *Workbook, io: std.Io, path: []const u8) !void {
         if (self.worksheets.len == 0) return error.NoSheets;
 
         const inputs = try self.allocator.alloc(fresh_emit.SheetInput, self.worksheets.len);
@@ -991,7 +994,7 @@ pub const Workbook = struct {
             };
         }
 
-        return fresh_emit.saveArchiveToPath(self.allocator, path, .{
+        return fresh_emit.saveArchiveToPath(self.allocator, io, path, .{
             .sheets = inputs,
             .sst_plan = &self.fresh_sst_plan,
             .sst_count = self.fresh_sst_count,
@@ -6152,7 +6155,7 @@ test "Workbook.setCell + save: round-trip a number through PartStore" {
         const s0 = try wb.sheet(0);
         try s0.setCell("A1", .{ .number = 42 });
         try s0.setCell("B2", .{ .number = -3.14 });
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -6192,7 +6195,7 @@ test "Workbook.setCell + save: boolean and blank land typed correctly" {
         try s0.setCell("A1", .{ .boolean = true });
         try s0.setCell("B1", .{ .boolean = false });
         try s0.setCell("C1", .blank);
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -6253,7 +6256,7 @@ test "Workbook.setCell: string round-trips via inlineStr" {
         try s0.setCell("B1", .{ .string = "<a> & \"foo\"" });
         // Whitespace-bracketed string — must emit xml:space="preserve"
         try s0.setCell("C1", .{ .string = "  spaced  " });
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -6342,7 +6345,7 @@ test "Workbook.setCell: formula round-trips with no cached value" {
         try s0.setCell("A1", .{ .formula = "SUM(B1:B10)" });
         // Formula with XML-special chars (e.g. comparison operators)
         try s0.setCell("A2", .{ .formula = "IF(B1<C1, \"low\", \"high\")" });
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -6410,7 +6413,7 @@ test "Workbook.setCell: shared_string round-trips on a fixture WITH existing SST
 
         const s0 = try wb.sheet(0);
         try s0.setCell("Z999", .{ .shared_string = new_text });
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -6449,7 +6452,7 @@ test "Workbook.setCell: shared_string creates SST on a workbook without one" {
     var tmp_buf2: [256]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_buf2, ".zig-cache/test-wb-sstless-out-{d}.xlsx", .{prng.random().int(u32)});
 
-    try writeMinimalSstLessXlsx(alloc, src_path);
+    try writeMinimalSstLessXlsx(alloc, io, src_path);
     defer std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
 
     const new_text = "fresh-sst-greeting";
@@ -6466,7 +6469,7 @@ test "Workbook.setCell: shared_string creates SST on a workbook without one" {
         defer wb.deinit();
         const s0 = try wb.sheet(0);
         try s0.setCell("A1", .{ .shared_string = new_text });
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -6510,7 +6513,7 @@ test "Workbook.setCell: shared_string de-dups identical text across cells" {
         const s0 = try wb.sheet(0);
         try s0.setCell("Z998", .{ .shared_string = new_text });
         try s0.setCell("Z999", .{ .shared_string = new_text });
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -6558,7 +6561,7 @@ test "Workbook.setCell: mixed inlineStr + shared_string in one save" {
         const s0 = try wb.sheet(0);
         try s0.setCell("Z997", .{ .string = inline_text });
         try s0.setCell("Z998", .{ .shared_string = shared_text });
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -6596,7 +6599,7 @@ test "Workbook.fromBook: round-trip parity with Book.open on same path" {
     var book = try zlsx.Book.open(std.testing.allocator, io, path);
     defer book.deinit();
 
-    var wb = try Workbook.fromBook(std.testing.allocator, &book, path);
+    var wb = try Workbook.fromBook(std.testing.allocator, io, &book, path);
     defer wb.deinit();
 
     try std.testing.expectEqual(@as(usize, book.sheets.len), wb.sheetCount());
@@ -6617,7 +6620,7 @@ test "Workbook.fromBook: independent lifetime — wb deinits before book" {
     var book = try zlsx.Book.open(std.testing.allocator, io, path);
     defer book.deinit();
 
-    var wb = try Workbook.fromBook(std.testing.allocator, &book, path);
+    var wb = try Workbook.fromBook(std.testing.allocator, io, &book, path);
     // Tear down Workbook FIRST while book is still alive — must be
     // independent. std.testing.allocator catches any leak from a
     // mistaken shared-arena assumption.
@@ -6639,7 +6642,7 @@ test "Workbook.fromBook: mismatched path errors SheetCountMismatch or opens clea
     // Pass `book` opened from path_a, but path_b — sheet counts differ
     // (2 vs 1) so fromBook surfaces the drift cleanly rather than
     // returning an inconsistent Workbook.
-    const result = Workbook.fromBook(std.testing.allocator, &book, path_b);
+    const result = Workbook.fromBook(std.testing.allocator, io, &book, path_b);
     try std.testing.expectError(Error.SheetCountMismatch, result);
 }
 
@@ -6662,7 +6665,7 @@ test "Workbook.rewriteAllFormulas: insert_rows shifts every formula's row refs i
         try s0.setCell("A1", .{ .formula = "SUM(B5:B10)" });
         try s0.setCell("B2", .{ .formula = "B7+1" });
         try s0.setCell("C3", .{ .formula = "B2*B5" }); // already-rewritten ref + a target ref
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -6680,7 +6683,7 @@ test "Workbook.rewriteAllFormulas: insert_rows shifts every formula's row refs i
 
     var tmp2_buf: [256]u8 = undefined;
     const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-rewrite-all-out-{d}.xlsx", .{prng.random().int(u32)});
-    try wb.save(tmp2_path);
+    try wb.save(io, tmp2_path);
     defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
 
     var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
@@ -6728,7 +6731,7 @@ test "Workbook.rewriteAllFormulas: rename_sheet rewrites quoted sheet qualifiers
         const s0 = try wb.sheet(0);
         // Cross-sheet ref using the source's actual sheet name "Sheet2".
         try s0.setCell("A1", .{ .formula = "Sheet2!A1+1" });
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -6741,7 +6744,7 @@ test "Workbook.rewriteAllFormulas: rename_sheet rewrites quoted sheet qualifiers
 
     var tmp2_buf: [256]u8 = undefined;
     const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-rewrite-rename-out-{d}.xlsx", .{prng.random().int(u32)});
-    try wb.save(tmp2_path);
+    try wb.save(io, tmp2_path);
     defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
 
     var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
@@ -6818,7 +6821,7 @@ test "Workbook.rewriteAllValidationsAndConditionalFormats: insert_rows shifts DV
             \\<dataValidations count="2"><dataValidation type="list" allowBlank="1" sqref="A1:A10"><formula1>B5:B10</formula1></dataValidation><dataValidation type="whole" operator="between" errorTitle="Bad" sqref="C1:C10"><formula1>B5</formula1><formula2>B7+1</formula2></dataValidation></dataValidations>
         ;
         try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, dv, "");
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -6838,7 +6841,7 @@ test "Workbook.rewriteAllValidationsAndConditionalFormats: insert_rows shifts DV
         // formula2 "B7+1" → "B8+1" (1)
         try std.testing.expectEqual(@as(u32, 3), count);
 
-        try wb.save(tmp2_path);
+        try wb.save(io, tmp2_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
 
@@ -6879,7 +6882,7 @@ test "Workbook.rewriteAllValidationsAndConditionalFormats: insert_cols shifts CF
             \\<conditionalFormatting sqref="D1:D10"><cfRule type="expression" dxfId="0" priority="1"><formula>D1+E1</formula></cfRule><cfRule type="containsBlanks" priority="2"/></conditionalFormatting>
         ;
         try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, "", cf);
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -6900,7 +6903,7 @@ test "Workbook.rewriteAllValidationsAndConditionalFormats: insert_cols shifts CF
         // CF formula "D1+E1" → "E1+F1" (1 body, 2 refs shifted = 1 rewrite)
         try std.testing.expectEqual(@as(u32, 1), count);
 
-        try wb.save(tmp2_path);
+        try wb.save(io, tmp2_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
 
@@ -6954,7 +6957,7 @@ test "Workbook.renameSheet: happy path renames sheet and rewrites cross-sheet fo
         defer wb.deinit();
         const s0 = try wb.sheet(0);
         try s0.setCell("A1", .{ .formula = "Sheet2!A1+1" });
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -6969,7 +6972,7 @@ test "Workbook.renameSheet: happy path renames sheet and rewrites cross-sheet fo
         // In-memory view must reflect the rename immediately.
         try std.testing.expectEqualStrings("Renamed", (try wb.sheet(1)).name());
 
-        try wb.save(tmp2_path);
+        try wb.save(io, tmp2_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
 
@@ -7145,7 +7148,7 @@ test "Workbook.deleteCell: removes existing cell from saved sheet" {
         try std.testing.expect(before != null);
 
         try s0.deleteCell("A1");
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -7176,7 +7179,7 @@ test "Workbook.deleteCell vs setCell(.blank): elision vs empty cell" {
         // <sheetData>; one is fully removed, the other left empty.
         try s0.setCell("Z1", .{ .number = 7 });
         try s0.setCell("Z2", .{ .number = 8 });
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -7187,7 +7190,7 @@ test "Workbook.deleteCell vs setCell(.blank): elision vs empty cell" {
         const s0 = try wb.sheet(0);
         try s0.deleteCell("Z1");
         try s0.setCell("Z2", .blank);
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
 
     // Inspect the regenerated sheet bytes directly: Z1 must be absent,
@@ -7228,7 +7231,7 @@ test "Workbook.deleteCell: non-existent ref is a no-op" {
         // A ref guaranteed not to exist in the source corpus.
         try s0.deleteCell("ZZ9999");
         // Save must succeed; the .deleted delta has no original to elide.
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -7279,7 +7282,7 @@ test "Workbook.hasUnsavedChanges: save clears delta-only dirt; PartStore overrid
     const s0 = try wb.sheet(0);
     try s0.setCell("A1", .{ .number = 42 });
     try std.testing.expect(wb.hasUnsavedChanges());
-    try wb.save(tmp_path);
+    try wb.save(io, tmp_path);
     // deltas are cleared by save, but PartStore overrides (set by
     // save's replacePart calls) persist — predicate stays true.
     // This documents the "diff vs original" semantics.
@@ -7335,7 +7338,7 @@ test "Workbook.deleteSheet: happy path drops second sheet, byte-stable round-tri
         try std.testing.expectEqual(@as(u32, 1), wb.sheetCount());
         try std.testing.expectEqualStrings(s0_name_buf[0..s0_name_len], (try wb.sheet(0)).name());
 
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -7403,6 +7406,7 @@ test "Workbook.deleteSheet: out-of-range index errors SheetIndexOutOfRange" {
 /// rewriter against persisted bytes.
 fn testInjectDefinedNames(
     wb: *Workbook,
+    io: std.Io,
     block_inner: []const u8,
     out_path: []const u8,
 ) !void {
@@ -7424,7 +7428,7 @@ fn testInjectDefinedNames(
     try out.appendSlice(a, src[insert_at..]);
 
     try wb.store.replacePart("xl/workbook.xml", out.items);
-    try wb.save(out_path);
+    try wb.save(io, out_path);
 }
 
 test "Workbook.rewriteAllDefinedNames: workbook-scope insert_rows shifts and persists" {
@@ -7446,6 +7450,7 @@ test "Workbook.rewriteAllDefinedNames: workbook-scope insert_rows shifts and per
         defer wb.deinit();
         try testInjectDefinedNames(
             &wb,
+            io,
             "<definedName name=\"MyName\">Sheet1!A1+B1</definedName>",
             tmp_path,
         );
@@ -7472,7 +7477,7 @@ test "Workbook.rewriteAllDefinedNames: workbook-scope insert_rows shifts and per
     // Persistence: save + re-open the rewritten workbook.
     var tmp2_buf: [256]u8 = undefined;
     const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-defnames-out-{d}.xlsx", .{prng.random().int(u32)});
-    try wb.save(tmp2_path);
+    try wb.save(io, tmp2_path);
     defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
 
     var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
@@ -7510,6 +7515,7 @@ test "Workbook.rewriteAllDefinedNames: sheet-scope localSheetId preserved across
         defer wb.deinit();
         try testInjectDefinedNames(
             &wb,
+            io,
             "<definedName name=\"LocalRef\" localSheetId=\"0\">B5</definedName>",
             tmp_path,
         );
@@ -7544,7 +7550,7 @@ test "Workbook.rewriteAllDefinedNames: sheet-scope localSheetId preserved across
     // error otherwise).
     var tmp2_buf: [256]u8 = undefined;
     const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-defnames-local-out-{d}.xlsx", .{prng.random().int(u32)});
-    try wb.save(tmp2_path);
+    try wb.save(io, tmp2_path);
     defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
 
     var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
@@ -7558,6 +7564,7 @@ test "Workbook.rewriteAllDefinedNames: sheet-scope localSheetId preserved across
 /// hyperlinks tests.
 fn testInjectHyperlinks(
     wb: *Workbook,
+    io: std.Io,
     block_inner: []const u8,
     out_path: []const u8,
 ) !void {
@@ -7587,7 +7594,7 @@ fn testInjectHyperlinks(
         view.deinit(wb.allocator);
         ws.parsed = null;
     }
-    try wb.save(out_path);
+    try wb.save(io, out_path);
 }
 
 test "Workbook.rewriteAllHyperlinkLocations: internal hyperlink shifts when target_sheet matches" {
@@ -7610,6 +7617,7 @@ test "Workbook.rewriteAllHyperlinkLocations: internal hyperlink shifts when targ
         defer wb.deinit();
         try testInjectHyperlinks(
             &wb,
+            io,
             "<hyperlink ref=\"C3\" location=\"A5\" display=\"jump\"/>",
             tmp_path,
         );
@@ -7662,6 +7670,7 @@ test "Workbook.rewriteAllHyperlinkLocations: external (r_id != null) hyperlink s
         defer wb.deinit();
         try testInjectHyperlinks(
             &wb,
+            io,
             "<hyperlink ref=\"D4\" r:id=\"rIdFake\" display=\"external\"/>",
             tmp_path,
         );
@@ -7719,7 +7728,7 @@ test "Workbook.addImage: round-trips PNG into a drawing-less workbook" {
     var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     var src_buf: [128]u8 = undefined;
     const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-addimg-src-{d}.xlsx", .{prng.random().int(u32)});
-    try writeMinimalSstLessXlsx(allocator, src_path);
+    try writeMinimalSstLessXlsx(allocator, io, src_path);
     defer std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
 
     var dst_buf: [128]u8 = undefined;
@@ -7730,7 +7739,7 @@ test "Workbook.addImage: round-trips PNG into a drawing-less workbook" {
         var wb = try Workbook.open(allocator, io, src_path);
         defer wb.deinit();
         try wb.addImage(0, .{ .col = 1, .row = 1 }, &tiny_png_1x1, .png);
-        try wb.save(dst_path);
+        try wb.save(io, dst_path);
     }
 
     var store = try PartStore.open(allocator, io, dst_path);
@@ -7785,7 +7794,7 @@ test "Workbook.addImage: PNG declared but JPEG bytes errors MimeMagicMismatch" {
     var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     var src_buf: [128]u8 = undefined;
     const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-addimg-mime-{d}.xlsx", .{prng.random().int(u32)});
-    try writeMinimalSstLessXlsx(allocator, src_path);
+    try writeMinimalSstLessXlsx(allocator, io, src_path);
     defer std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
 
     var wb = try Workbook.open(allocator, io, src_path);
@@ -7807,7 +7816,7 @@ test "Workbook.addImage: rejects sheet that already has a drawing" {
     var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     var src_buf: [128]u8 = undefined;
     const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-addimg-existing-{d}.xlsx", .{prng.random().int(u32)});
-    try writeMinimalSstLessXlsx(allocator, src_path);
+    try writeMinimalSstLessXlsx(allocator, io, src_path);
     defer std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
 
     var dst_buf: [128]u8 = undefined;
@@ -7819,7 +7828,7 @@ test "Workbook.addImage: rejects sheet that already has a drawing" {
         var wb = try Workbook.open(allocator, io, src_path);
         defer wb.deinit();
         try wb.addImage(0, .{ .col = 1, .row = 1 }, &tiny_png_1x1, .png);
-        try wb.save(dst_path);
+        try wb.save(io, dst_path);
     }
 
     // Stage 2: re-open and try to add a second image to the same
@@ -7843,7 +7852,7 @@ test "Workbook.addImage: rejects 0-based anchor with InvalidAnchor" {
     var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     var src_buf: [128]u8 = undefined;
     const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-addimg-anchor-{d}.xlsx", .{prng.random().int(u32)});
-    try writeMinimalSstLessXlsx(allocator, src_path);
+    try writeMinimalSstLessXlsx(allocator, io, src_path);
     defer std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
 
     var wb = try Workbook.open(allocator, io, src_path);
@@ -8614,7 +8623,7 @@ fn fuzzEmitWithAppendsStructural(_: void, smith: *std.testing.Smith) anyerror!vo
     const path = "tests/corpus/frictionless_2sheets.xlsx";
     std.Io.Dir.cwd().access(io, path, .{}) catch return;
     const allocator = std.testing.allocator;
-    var wb = try Workbook.open(allocator, path);
+    var wb = try Workbook.open(allocator, io, path);
     defer wb.deinit();
 
     const ws = try wb.sheet(0);
@@ -8761,7 +8770,7 @@ test "Workbook.save: SST-less source + appendRows .string creates SST + rels + O
     const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-er7-c1-sstless-src-{d}.xlsx", .{prng.random().int(u32)});
     const out_path = try std.fmt.bufPrint(&out_buf, ".zig-cache/test-er7-c1-sstless-out-{d}.xlsx", .{prng.random().int(u32)});
 
-    try writeMinimalSstLessXlsx(alloc, src_path);
+    try writeMinimalSstLessXlsx(alloc, io, src_path);
     defer std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
 
     const appended_text = "appended-via-rows-fresh-sst";
@@ -8774,7 +8783,7 @@ test "Workbook.save: SST-less source + appendRows .string creates SST + rels + O
         const s0 = try wb.sheet(0);
         const row = [_]zlsx.Cell{.{ .string = appended_text }};
         try s0.appendRows(&.{&row});
-        try wb.save(out_path);
+        try wb.save(io, out_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
 
@@ -8845,7 +8854,7 @@ test "Workbook.save: mixed deltas (sheet 0) + appends (sheet 1) share one SST pl
         const row = [_]zlsx.Cell{ .{ .string = append_text }, .{ .number = 7.5 } };
         try s1.appendRows(&.{&row});
 
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -8918,7 +8927,7 @@ test "Workbook.save: renameSheet rewriter composes with setCell on a different s
         defer wb.deinit();
         const s0 = try wb.sheet(0);
         try s0.setCell("A1", .{ .formula = "Sheet2!A1+1" });
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -8932,7 +8941,7 @@ test "Workbook.save: renameSheet rewriter composes with setCell on a different s
         const s0 = try wb.sheet(0);
         try s0.setCell("B1", .{ .number = 99.5 });
 
-        try wb.save(out_path);
+        try wb.save(io, out_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
 
@@ -8959,7 +8968,7 @@ test "Workbook.empty: returns empty workbook with valid skeleton" {
     const io = threaded.io();
     const alloc = std.testing.allocator;
 
-    var wb = try Workbook.empty(alloc);
+    var wb = try Workbook.empty(alloc, io);
     defer wb.deinit();
 
     // Zero sheets in the typed view.
@@ -8977,7 +8986,7 @@ test "Workbook.empty: returns empty workbook with valid skeleton" {
     var tmp_buf: [256]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-empty-skel-{d}.xlsx", .{prng.random().int(u32)});
 
-    try wb.save(tmp_path);
+    try wb.save(io, tmp_path);
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
     var book = try zlsx.Book.open(alloc, io, tmp_path);
@@ -9000,7 +9009,7 @@ test "Workbook.empty + addSheet + appendRows: round-trips through reader" {
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-empty-roundtrip-{d}.xlsx", .{prng.random().int(u32)});
 
     {
-        var wb = try Workbook.empty(alloc);
+        var wb = try Workbook.empty(alloc, io);
         defer wb.deinit();
 
         const ws = try wb.addSheet("Sheet1");
@@ -9009,7 +9018,7 @@ test "Workbook.empty + addSheet + appendRows: round-trips through reader" {
             .{ .string = "hello" },
         };
         try ws.appendRows(&.{&row});
-        try wb.save(tmp_path);
+        try wb.save(io, tmp_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
@@ -9037,12 +9046,15 @@ test "Workbook.empty + addSheet + appendRows: round-trips through reader" {
 // ─── B3 prep: SstExtensionPlan rich-string axis ─────────────────────
 
 test "SstExtensionPlan: rich-axis register + deinit" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
 
     // Open a workbook so we have a `wb.allocator` to thread through.
     // The plan registrar dups bytes via `wb.allocator`; the empty
     // workbook from `Workbook.empty` is the cheapest scaffold.
-    var wb = try Workbook.empty(alloc);
+    var wb = try Workbook.empty(alloc, io);
     defer wb.deinit();
 
     var plan: SstExtensionPlan = .{};
@@ -9073,9 +9085,12 @@ test "SstExtensionPlan: rich-axis register + deinit" {
 }
 
 test "SstExtensionPlan: indexOf vs indexOfRich" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
 
-    var wb = try Workbook.empty(alloc);
+    var wb = try Workbook.empty(alloc, io);
     defer wb.deinit();
 
     var plan: SstExtensionPlan = .{};
@@ -9252,9 +9267,12 @@ test "StylesPlan parity: Workbook + Writer emit identical xl/styles.xml bytes" {
 }
 
 test "Workbook.addStyle / addDxf / internNumFmt expose the shared StylesPlan" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const a = std.testing.allocator;
 
-    var wb = try Workbook.empty(a);
+    var wb = try Workbook.empty(a, io);
     defer wb.deinit();
 
     const idx1 = try wb.addStyle(.{ .font_bold = true });
@@ -9300,8 +9318,8 @@ test "Workbook.addStyle / addDxf / internNumFmt expose the shared StylesPlan" {
 // these tests pin the contract so any future divergence (Writer
 // re-forking, Workbook drifting) trips immediately.
 
-fn extractWorkbookXmlFromSavedFile(allocator: Allocator, path: []const u8) ![]u8 {
-    var s = try PartStore.open(allocator, path);
+fn extractWorkbookXmlFromSavedFile(allocator: Allocator, io: std.Io, path: []const u8) ![]u8 {
+    var s = try PartStore.open(allocator, io, path);
     defer s.deinit();
     const part = (try s.part("xl/workbook.xml")) orelse return error.MissingWorkbookPart;
     return try allocator.dupe(u8, part.bytes);
@@ -9330,21 +9348,21 @@ test "iter-wr-3 parity: Writer vs Workbook xl/workbook.xml — no defined names"
         try s1.writeRow(&.{.{ .integer = 1 }});
         var s2 = try w.addSheet("Sheet2");
         try s2.writeRow(&.{.{ .integer = 2 }});
-        try w.save(writer_file);
+        try w.save(io, writer_file);
     }
 
     // 2) Workbook side
     {
-        var wb = try Workbook.empty(a);
+        var wb = try Workbook.empty(a, io);
         defer wb.deinit();
         _ = try wb.addSheet("Sheet1");
         _ = try wb.addSheet("Sheet2");
-        try wb.save(wb_file);
+        try wb.save(io, wb_file);
     }
 
-    const writer_xml = try extractWorkbookXmlFromSavedFile(a, writer_file);
+    const writer_xml = try extractWorkbookXmlFromSavedFile(a, io, writer_file);
     defer a.free(writer_xml);
-    const wb_xml = try extractWorkbookXmlFromSavedFile(a, wb_file);
+    const wb_xml = try extractWorkbookXmlFromSavedFile(a, io, wb_file);
     defer a.free(wb_xml);
 
     // Empty `<definedNames>` block must be OMITTED entirely (regression pin).
@@ -9393,9 +9411,9 @@ test "iter-wr-3 parity: Writer xl/workbook.xml — workbook + sheet-scope + hidd
         "Sheet2!$C$3",
         .{ .local_sheet_id = 1 },
     );
-    try w.save(writer_file);
+    try w.save(io, writer_file);
 
-    const writer_xml = try extractWorkbookXmlFromSavedFile(a, writer_file);
+    const writer_xml = try extractWorkbookXmlFromSavedFile(a, io, writer_file);
     defer a.free(writer_xml);
 
     // Block present.
@@ -9436,7 +9454,7 @@ test "iter-wr-3 parity: Workbook.addDefinedName fresh-emit on empty()" {
     defer a.free(out_path);
 
     {
-        var wb = try Workbook.empty(a);
+        var wb = try Workbook.empty(a, io);
         defer wb.deinit();
         _ = try wb.addSheet("Sheet1");
         _ = try wb.addSheet("Sheet2");
@@ -9446,10 +9464,10 @@ test "iter-wr-3 parity: Workbook.addDefinedName fresh-emit on empty()" {
             "Sheet1!$A$1:$Z$10",
             .{ .local_sheet_id = 0, .hidden = true },
         );
-        try wb.save(out_path);
+        try wb.save(io, out_path);
     }
 
-    const wb_xml = try extractWorkbookXmlFromSavedFile(a, out_path);
+    const wb_xml = try extractWorkbookXmlFromSavedFile(a, io, out_path);
     defer a.free(wb_xml);
 
     try std.testing.expect(std.mem.indexOf(u8, wb_xml, "<definedNames>") != null);
@@ -9458,8 +9476,11 @@ test "iter-wr-3 parity: Workbook.addDefinedName fresh-emit on empty()" {
 }
 
 test "iter-wr-3 parity: addDefinedName rejects A1-shape via Workbook surface" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const a = std.testing.allocator;
-    var wb = try Workbook.empty(a);
+    var wb = try Workbook.empty(a, io);
     defer wb.deinit();
     _ = try wb.addSheet("Sheet1");
     try std.testing.expectError(
@@ -9488,10 +9509,11 @@ test "iter-wr-3 parity: addDefinedName rejects A1-shape via Workbook surface" {
 
 fn extractFreshParityEntry(
     alloc: Allocator,
+    io: std.Io,
     archive_path: []const u8,
     target: []const u8,
 ) ![]u8 {
-    var s = try store_mod.PartStore.open(alloc, archive_path);
+    var s = try store_mod.PartStore.open(alloc, io, archive_path);
     defer s.deinit();
     const part = (try s.part(target)) orelse return error.PartNotFound;
     return try alloc.dupe(u8, part.bytes);
@@ -9509,11 +9531,11 @@ test "iter-wr-7 parity: Workbook.saveFreshEmit empty single-sheet — produces a
     const path = try std.fs.path.join(a, &.{ path_dir, "iter_wr7_empty.xlsx" });
     defer a.free(path);
 
-    var wb = try Workbook.empty(a);
+    var wb = try Workbook.empty(a, io);
     defer wb.deinit();
     _ = try wb.addSheet("Sheet1");
 
-    try wb.saveFreshEmit(path);
+    try wb.saveFreshEmit(io, path);
 
     // Round-trip via PartStore.open: archive must be a parseable .xlsx.
     var s2 = try store_mod.PartStore.open(a, io, path);
@@ -9529,7 +9551,7 @@ test "iter-wr-7 parity: Workbook.saveFreshEmit refuses NoSheets" {
     defer threaded.deinit();
     const io = threaded.io();
     const a = std.testing.allocator;
-    var wb = try Workbook.empty(a);
+    var wb = try Workbook.empty(a, io);
     defer wb.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9537,12 +9559,15 @@ test "iter-wr-7 parity: Workbook.saveFreshEmit refuses NoSheets" {
     defer a.free(path_dir);
     const path = try std.fs.path.join(a, &.{ path_dir, "iter_wr7_nosheets.xlsx" });
     defer a.free(path);
-    try std.testing.expectError(error.NoSheets, wb.saveFreshEmit(path));
+    try std.testing.expectError(error.NoSheets, wb.saveFreshEmit(io, path));
 }
 
 test "iter-wr-7 parity: Worksheet add* / set* forwarders into SheetState" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const a = std.testing.allocator;
-    var wb = try Workbook.empty(a);
+    var wb = try Workbook.empty(a, io);
     defer wb.deinit();
     const ws = try wb.addSheet("Sheet1");
 
@@ -9573,8 +9598,11 @@ test "iter-wr-7 parity: Worksheet add* / set* forwarders into SheetState" {
 }
 
 test "iter-wr-7 parity: Worksheet.addConditionalFormat* uses styles_plan dxf count" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const a = std.testing.allocator;
-    var wb = try Workbook.empty(a);
+    var wb = try Workbook.empty(a, io);
     defer wb.deinit();
 
     // DxfId out of range MUST reject.
@@ -9609,10 +9637,10 @@ test "iter-wr-7 parity: Workbook.saveFreshEmit byte-equivalent to Writer.save (s
     const wb_path = try std.fs.path.join(a, &.{ path_dir, "wr7_wb.xlsx" });
     defer a.free(wb_path);
     {
-        var wb = try Workbook.empty(a);
+        var wb = try Workbook.empty(a, io);
         defer wb.deinit();
         _ = try wb.addSheet("Sheet1");
-        try wb.saveFreshEmit(wb_path);
+        try wb.saveFreshEmit(io, wb_path);
     }
 
     // Writer
@@ -9623,21 +9651,21 @@ test "iter-wr-7 parity: Workbook.saveFreshEmit byte-equivalent to Writer.save (s
         var w = xlsx.Writer.init(a);
         defer w.deinit();
         _ = try w.addSheet("Sheet1");
-        try w.save(writer_path);
+        try w.save(io, writer_path);
     }
 
     // Compare worksheet1.xml byte-for-byte across both archives.
-    const wb_bytes = try extractFreshParityEntry(a, wb_path, "xl/worksheets/sheet1.xml");
+    const wb_bytes = try extractFreshParityEntry(a, io, wb_path, "xl/worksheets/sheet1.xml");
     defer a.free(wb_bytes);
-    const writer_bytes = try extractFreshParityEntry(a, writer_path, "xl/worksheets/sheet1.xml");
+    const writer_bytes = try extractFreshParityEntry(a, io, writer_path, "xl/worksheets/sheet1.xml");
     defer a.free(writer_bytes);
 
     try std.testing.expectEqualSlices(u8, writer_bytes, wb_bytes);
 
     // Cross-check workbook.xml too.
-    const wb_workbook = try extractFreshParityEntry(a, wb_path, "xl/workbook.xml");
+    const wb_workbook = try extractFreshParityEntry(a, io, wb_path, "xl/workbook.xml");
     defer a.free(wb_workbook);
-    const writer_workbook = try extractFreshParityEntry(a, writer_path, "xl/workbook.xml");
+    const writer_workbook = try extractFreshParityEntry(a, io, writer_path, "xl/workbook.xml");
     defer a.free(writer_workbook);
 
     try std.testing.expectEqualSlices(u8, writer_workbook, wb_workbook);

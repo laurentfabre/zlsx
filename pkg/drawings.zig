@@ -2389,9 +2389,6 @@ test "findLocalChartElement skips ':chartSpace' false matches" {
 }
 
 test "findLocalNamespacePrefix walks past 4 KiB inside a block" {
-    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
     // collectChartsFromSheet uses findLocalNamespacePrefix to probe
     // for a chart-namespace prefix declared LOCALLY on `<*:chart>`.
     // If the anchor block is large enough that the local xmlns:c
@@ -2404,12 +2401,12 @@ test "findLocalNamespacePrefix walks past 4 KiB inside a block" {
         \\<c2:chart xmlns:c2="http://schemas.openxmlformats.org/drawingml/2006/chart"/></chart-prefix-late>
     ;
     var doc_buf: [8192]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&doc_buf);
-    const w = fbs.writer();
+    var fbs = std.Io.Writer.fixed(&doc_buf);
+    const w = &fbs;
     try w.writeAll(head);
     try w.writeAll(&pad_buf);
     try w.writeAll(tail);
-    const block = fbs.getWritten();
+    const block = fbs.buffered();
 
     // Bounded helper: misses the late binding (cap at 4 KiB).
     try std.testing.expectEqual(
@@ -2423,9 +2420,6 @@ test "findLocalNamespacePrefix walks past 4 KiB inside a block" {
 }
 
 test "resolveDrawingPrefixes maps canonical + custom prefixes" {
-    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
     // Canonical prefixes — round-trip.
     {
         const xml =
@@ -2574,12 +2568,12 @@ test "resolveDrawingPrefixes maps canonical + custom prefixes" {
             \\<dr:twoCellAnchor xmlns:dr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/></xdr:wsDr>
         ;
         var doc_buf: [8192]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&doc_buf);
-        const w = fbs.writer();
+        var fbs = std.Io.Writer.fixed(&doc_buf);
+        const w = &fbs;
         try w.writeAll(head);
         try w.writeAll(&pad_buf);
         try w.writeAll(tail);
-        const doc = fbs.getWritten();
+        const doc = fbs.buffered();
         const p = resolveDrawingPrefixes(doc);
         try std.testing.expectEqualStrings("xdr", p.xdr);
         try std.testing.expectEqual(@as(usize, 1), p.xdr_alts_len);
@@ -2616,12 +2610,12 @@ test "resolveDrawingPrefixes maps canonical + custom prefixes" {
             \\<other xmlns:dml="http://schemas.openxmlformats.org/drawingml/2006/main"/></xdr:wsDr>
         ;
         var doc_buf: [8192]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&doc_buf);
-        const w = fbs.writer();
+        var fbs = std.Io.Writer.fixed(&doc_buf);
+        const w = &fbs;
         try w.writeAll(head);
         try w.writeAll(&pad_buf);
         try w.writeAll(tail);
-        const doc = fbs.getWritten();
+        const doc = fbs.buffered();
         const p = resolveDrawingPrefixes(doc);
         // Canonical fallback wins — late dml binding is invisible.
         try std.testing.expectEqualStrings("a", p.a);

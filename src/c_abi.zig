@@ -93,11 +93,16 @@ pub const Editor = extern struct { _opaque: u8 };
 // (Rows borrows slices into the Book's decompressed XML and SST buffers).
 const BookState = struct {
     inner: xlsx.Book,
+    /// Owned Io backing every filesystem call made through this handle.
+    /// Torn down with the handle; see zlsx_book_open for why it lives
+    /// here rather than in a global.
+    threaded: std.Io.Threaded,
     refcount: std.atomic.Value(u32) = .{ .raw = 1 },
 
     fn unref(self: *BookState) void {
         if (self.refcount.fetchSub(1, .acq_rel) == 1) {
             self.inner.deinit();
+            self.threaded.deinit();
             gpa.destroy(self);
         }
     }
@@ -238,18 +243,23 @@ export fn zlsx_book_open(
     err_buf_len: usize,
 ) callconv(.c) ?*Book {
     const path = std.mem.span(path_ptr);
-    const inner = xlsx.Book.open(gpa, path) catch |e| {
-        writeError(err_buf, err_buf_len, @errorName(e));
-        return null;
-    };
 
+    // 0.16 needs an `Io` for every filesystem call, and a C caller has
+    // no way to hand us a Zig `std.Io`. The handle owns one: allocate
+    // the state first so the `Threaded` sits at a stable address (it is
+    // not safe to move after init), then open into it.
     const state = gpa.create(BookState) catch {
-        var mutable = inner;
-        mutable.deinit();
         writeError(err_buf, err_buf_len, "OutOfMemory");
         return null;
     };
-    state.* = .{ .inner = inner };
+    state.* = .{ .inner = undefined, .threaded = .init(gpa, .{}) };
+
+    state.inner = xlsx.Book.open(gpa, state.threaded.io(), path) catch |e| {
+        state.threaded.deinit();
+        gpa.destroy(state);
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return null;
+    };
     return @ptrCast(state);
 }
 
@@ -1428,6 +1438,9 @@ pub const SheetWriter = extern struct { _opaque: u8 };
 
 const WriterState = struct {
     inner: writer_mod.Writer,
+    /// See BookState.threaded — the writer handle owns the Io its
+    /// save path writes through.
+    threaded: std.Io.Threaded,
     /// SheetWriterStates we hand out via `zlsx_writer_add_sheet`.
     /// They're per-writer wrappers around inner-writer pointers, so
     /// their lifetime ends with the parent writer. Track them here
@@ -1484,6 +1497,7 @@ export fn zlsx_writer_create(
     };
     state.* = .{
         .inner = writer_mod.Writer.init(gpa),
+        .threaded = .init(gpa, .{}),
         .sheet_wrappers = .empty,
     };
     return @ptrCast(state);
@@ -1497,6 +1511,7 @@ export fn zlsx_writer_close(w: ?*Writer) callconv(.c) void {
         for (state.sheet_wrappers.items) |sw| gpa.destroy(sw);
         state.sheet_wrappers.deinit(gpa);
         state.inner.deinit();
+        state.threaded.deinit();
         gpa.destroy(state);
     }
 }
@@ -1845,7 +1860,7 @@ export fn zlsx_writer_save(
     };
     defer gpa.free(owned_path);
 
-    state.inner.save(owned_path) catch |e| {
+    state.inner.save(state.threaded.io(), owned_path) catch |e| {
         writeError(err_buf, err_buf_len, @errorName(e));
         return -1;
     };
@@ -2694,7 +2709,7 @@ test "writer: round-trip via reader" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "c_abi_writer_roundtrip.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "c_abi_writer_roundtrip.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     var err_buf: [128]u8 = undefined;
@@ -2743,9 +2758,12 @@ test "writer: round-trip via reader" {
 }
 
 test "reader C ABI: data_validation getters round-trip" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "c_abi_reader_dv.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "c_abi_reader_dv.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -2757,7 +2775,7 @@ test "reader C ABI: data_validation getters round-trip" {
         // XML-escaped chars must survive writer → reader → C ABI.
         try sheet.addDataValidationList("C3", &.{ "R&D", "Q<A" });
         try sheet.writeRow(&.{.{ .string = "hdr" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var err_buf: [128]u8 = undefined;
@@ -2799,9 +2817,12 @@ test "reader C ABI: data_validation getters round-trip" {
 }
 
 test "writer C ABI: add_data_validation_numeric + custom round-trip via reader" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "c_abi_writer_dv_ext.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "c_abi_writer_dv_ext.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     var err_buf: [128]u8 = undefined;
@@ -2953,11 +2974,14 @@ test "writer C ABI: add_data_validation_numeric + custom round-trip via reader" 
 }
 
 test "reader C ABI: cell_font + cell_fill + cell_border + styleIndices + numFmt getters round-trip" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // iter28-32 added styles-surface exports — this test hits the C
     // layer directly (separate from Python coverage in test_basic.py).
-    const tmp_path = try tt.path(std.testing.allocator, "c_abi_cell_styles.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "c_abi_cell_styles.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -2979,7 +3003,7 @@ test "reader C ABI: cell_font + cell_fill + cell_border + styleIndices + numFmt 
             &.{ .{ .number = 44927 }, .{ .string = "bold" }, .{ .integer = 42 } },
             &.{ date_style, bold_red, 0 },
         );
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var err_buf: [128]u8 = undefined;
@@ -3059,9 +3083,12 @@ test "reader C ABI: cell_font + cell_fill + cell_border + styleIndices + numFmt 
 }
 
 test "reader C ABI: merged_range + hyperlink getters round-trip" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "c_abi_reader_meta.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "c_abi_reader_meta.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     // Build a workbook with merges + hyperlinks through the Zig writer,
@@ -3076,7 +3103,7 @@ test "reader C ABI: merged_range + hyperlink getters round-trip" {
         try sheet.addHyperlink("E5:F5", "mailto:x@example.com");
         try sheet.addInternalHyperlink("G7", "S1!A1");
         try sheet.writeRow(&.{.{ .string = "x" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var err_buf: [128]u8 = undefined;
@@ -3143,7 +3170,7 @@ test "writer C ABI: add_merged_cell round-trips + rejects bad ranges" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "c_abi_merged_cell.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "c_abi_merged_cell.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     var err_buf: [128]u8 = undefined;
@@ -3211,6 +3238,8 @@ fn fuzzItersCabi() usize {
 
 const EditorState = struct {
     inner: zlsx_pkg.Editor,
+    /// See BookState.threaded.
+    threaded: std.Io.Threaded,
 };
 
 /// Open an existing xlsx for append-only mutation. Returns an Editor
@@ -3221,17 +3250,20 @@ export fn zlsx_editor_open(
     err_buf_len: usize,
 ) callconv(.c) ?*Editor {
     const path = std.mem.span(path_ptr);
-    const inner = zlsx_pkg.Editor.open(gpa, path) catch |e| {
-        writeError(err_buf, err_buf_len, @errorName(e));
-        return null;
-    };
+    // Same ownership shape as zlsx_book_open: the handle owns its Io,
+    // allocated first so the Threaded never moves after init.
     const state = gpa.create(EditorState) catch {
-        var mutable = inner;
-        mutable.deinit();
         writeError(err_buf, err_buf_len, "OutOfMemory");
         return null;
     };
-    state.* = .{ .inner = inner };
+    state.threaded = .init(gpa, .{});
+    const inner = zlsx_pkg.Editor.open(gpa, state.threaded.io(), path) catch |e| {
+        state.threaded.deinit();
+        gpa.destroy(state);
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return null;
+    };
+    state.inner = inner;
     return @ptrCast(state);
 }
 
@@ -3345,7 +3377,7 @@ export fn zlsx_editor_save(
 ) callconv(.c) i32 {
     const state: *EditorState = @ptrCast(@alignCast(ed));
     const out_path = out_path_ptr[0..out_path_len];
-    state.inner.save(out_path) catch |e| {
+    state.inner.save(state.threaded.io(), out_path) catch |e| {
         writeError(err_buf, err_buf_len, @errorName(e));
         return -1;
     };
@@ -3366,7 +3398,7 @@ test "writer C ABI: write_row_with_formulas round-trips through reader" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "c_abi_write_formulas.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "c_abi_write_formulas.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     var err_buf: [128]u8 = undefined;
@@ -3459,7 +3491,7 @@ test "writer C ABI: add_hyperlink + add_internal_hyperlink round-trip" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "c_abi_hyperlink_writer.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "c_abi_hyperlink_writer.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     var err_buf: [128]u8 = undefined;
@@ -3536,9 +3568,9 @@ test "editor C ABI: open + append_row + save round-trip" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "c_abi_editor_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "c_abi_editor_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "c_abi_editor_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "c_abi_editor_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
 
     // Build a source workbook through the writer.
@@ -3547,7 +3579,7 @@ test "editor C ABI: open + append_row + save round-trip" {
         defer w.deinit();
         var s = try w.addSheet("D");
         try s.writeRow(&.{ .{ .string = "alpha" }, .{ .integer = 1 } });
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
 
     var err_buf: [128]u8 = undefined;
@@ -3712,7 +3744,7 @@ test "fuzz writer via C ABI: random operations round-trip" {
 
     const _fuzz_name = std.fmt.bufPrint(&tmp_path_buf, "fuzz_cabi_{x}.xlsx", .{seed}) catch unreachable;
 
-    const tmp_path = try tt.path(std.testing.allocator, _fuzz_name);
+    const tmp_path = try tt.path(std.testing.allocator, io, _fuzz_name);
 
     defer std.testing.allocator.free(tmp_path);
     var err_buf: [128]u8 = undefined;
@@ -3937,7 +3969,7 @@ test "fuzz C ABI writer: NULL err_buf + zero-cell rows" {
 
     const _fuzz_name = std.fmt.bufPrint(&tmp_buf, "fuzz_cabi_nullbuf_{x}.xlsx", .{seed}) catch unreachable;
 
-    const tmp_path = try tt.path(std.testing.allocator, _fuzz_name);
+    const tmp_path = try tt.path(std.testing.allocator, io, _fuzz_name);
 
     defer std.testing.allocator.free(tmp_path);
     for (0..iters / 50) |_| {

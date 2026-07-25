@@ -312,14 +312,12 @@ test "Archive: single small entry round-trips via std.zip.Iterator" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     {
-        var f = try tmp.dir.createFile(io, "a.zip", .{});
-        defer f.close(io);
-        try f.writeAll(buf.items);
+        try tmp.dir.writeFile(io, .{ .sub_path = "a.zip", .data = buf.items });
     }
     var f = try tmp.dir.openFile(io, "a.zip", .{});
     defer f.close(io);
     var read_buf: [4096]u8 = undefined;
-    var fr = f.reader(&read_buf);
+    var fr = f.reader(io, &read_buf);
     var iter = try std.zip.Iterator.init(&fr);
     var seen: usize = 0;
     while (try iter.next()) |_| seen += 1;

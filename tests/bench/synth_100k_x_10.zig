@@ -48,12 +48,12 @@ pub const Error = error{
 /// Emit the synthetic workbook to `out_path`. Returns immediately if the
 /// file already exists at `out_path` (cache hit) — assumes the existing
 /// fixture matches the geometry above.
-pub fn synthesize(allocator: Allocator, out_path: []const u8) !void {
+pub fn synthesize(allocator: Allocator, io: std.Io, out_path: []const u8) !void {
     std.debug.assert(out_path.len > 0);
 
     // Cache hit: file present + non-empty. We don't validate the
     // geometry — the cache key is the path itself, picked by the caller.
-    if (std.Io.Dir.cwd().statFile(io, out_path)) |stat| {
+    if (std.Io.Dir.cwd().statFile(io, out_path, .{})) |stat| {
         if (stat.size > 0) return;
     } else |_| {
         // missing or unreadable — fall through and regenerate
@@ -97,7 +97,7 @@ pub fn synthesize(allocator: Allocator, out_path: []const u8) !void {
     // Postcondition: the file we just emitted is non-empty and at least
     // as big as one byte per cell (very loose lower bound — compressed
     // 5M numeric cells is ~30-50 MB in practice).
-    const stat = try std.Io.Dir.cwd().statFile(io, out_path);
+    const stat = try std.Io.Dir.cwd().statFile(io, out_path, .{});
     std.debug.assert(stat.size > 0);
 }
 
@@ -114,13 +114,13 @@ test "synthesize: regenerates and caches" {
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
     // First call: generates.
-    try synthesizeWithGeometry(std.testing.allocator, tmp_path, 1, 5, 2);
-    const stat1 = try std.Io.Dir.cwd().statFile(io, tmp_path);
+    try synthesizeWithGeometry(std.testing.allocator, io, tmp_path, 1, 5, 2);
+    const stat1 = try std.Io.Dir.cwd().statFile(io, tmp_path, .{});
     try std.testing.expect(stat1.size > 0);
 
     // Second call: cache hit (path-based; no regeneration).
-    try synthesizeWithGeometry(std.testing.allocator, tmp_path, 1, 5, 2);
-    const stat2 = try std.Io.Dir.cwd().statFile(io, tmp_path);
+    try synthesizeWithGeometry(std.testing.allocator, io, tmp_path, 1, 5, 2);
+    const stat2 = try std.Io.Dir.cwd().statFile(io, tmp_path, .{});
     try std.testing.expectEqual(stat1.size, stat2.size);
 }
 
@@ -129,6 +129,7 @@ test "synthesize: regenerates and caches" {
 /// ROWS_PER_SHEET / COLS_PER_ROW` because those are the gate's contract.
 pub fn synthesizeWithGeometry(
     allocator: Allocator,
+    io: std.Io,
     out_path: []const u8,
     sheet_count: u32,
     rows_per_sheet: u32,
@@ -140,7 +141,7 @@ pub fn synthesizeWithGeometry(
     std.debug.assert(cols_per_row >= 1);
     std.debug.assert(cols_per_row <= 16);
 
-    if (std.Io.Dir.cwd().statFile(io, out_path)) |stat| {
+    if (std.Io.Dir.cwd().statFile(io, out_path, .{})) |stat| {
         if (stat.size > 0) return;
     } else |_| {}
 
@@ -172,5 +173,5 @@ pub fn synthesizeWithGeometry(
         }
     }
 
-    try w.save(out_path);
+    try w.save(io, out_path);
 }

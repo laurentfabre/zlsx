@@ -4543,7 +4543,7 @@ test "Book.mergedRanges: round-trip through writer + reader" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "reader_merged_roundtrip.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "reader_merged_roundtrip.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -4555,7 +4555,7 @@ test "Book.mergedRanges: round-trip through writer + reader" {
         try sheet.addMergedCell("B5:D7");
         try sheet.addMergedCell("XFD1048575:XFD1048576");
         try sheet.writeRow(&.{.{ .string = "hdr" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.open(std.testing.allocator, io, tmp_path);
@@ -4577,7 +4577,7 @@ test "Book.hyperlinks: round-trip through writer + reader" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "reader_hyperlinks_roundtrip.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "reader_hyperlinks_roundtrip.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -4589,7 +4589,7 @@ test "Book.hyperlinks: round-trip through writer + reader" {
         try sheet.addHyperlink("B2:C3", "mailto:foo@example.com");
         try sheet.addHyperlink("D5", "https://docs.example.com/");
         try sheet.writeRow(&.{.{ .string = "click" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.open(std.testing.allocator, io, tmp_path);
@@ -4619,7 +4619,7 @@ test "Book.dataValidations: round-trip through writer + reader" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "reader_dv_roundtrip.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "reader_dv_roundtrip.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -4633,7 +4633,7 @@ test "Book.dataValidations: round-trip through writer + reader" {
         // reader must decode back on the way out.
         try sheet.addDataValidationList("B2", &.{ "R&D", "Q<A", "x>y" });
         try sheet.writeRow(&.{.{ .string = "hdr" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.open(std.testing.allocator, io, tmp_path);
@@ -4670,7 +4670,7 @@ test "Book.dataValidations: numeric + custom round-trip kind / op / formula1 / f
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "reader_dv_numeric_roundtrip.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "reader_dv_numeric_roundtrip.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -4687,7 +4687,7 @@ test "Book.dataValidations: numeric + custom round-trip kind / op / formula1 / f
         // List still round-trips alongside the new kinds.
         try sheet.addDataValidationList("G7", &.{ "Yes", "No" });
         try sheet.writeRow(&.{.{ .string = "hdr" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.open(std.testing.allocator, io, tmp_path);
@@ -4743,7 +4743,7 @@ test "Book.dataValidations: empty slice for sheets without validations" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "reader_no_dv.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "reader_no_dv.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -4752,7 +4752,7 @@ test "Book.dataValidations: empty slice for sheets without validations" {
         defer w.deinit();
         var sheet = try w.addSheet("Plain");
         try sheet.writeRow(&.{.{ .string = "a" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.open(std.testing.allocator, io, tmp_path);
@@ -4766,7 +4766,7 @@ test "writer.addComment: emits comments that round-trip through Book.comments" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "writer_comments_roundtrip.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "writer_comments_roundtrip.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -4778,7 +4778,7 @@ test "writer.addComment: emits comments that round-trip through Book.comments" {
         try sheet.addComment("C3", "Bob & Co", "R&D notes");
         try sheet.addComment("D4", "Alice", "follow-up"); // same author reused
         try sheet.writeRow(&.{.{ .string = "hdr" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
 
         // Rejection paths — single-cell refs only, non-empty.
         try std.testing.expectError(error.InvalidCommentRef, sheet.addComment("", "a", "b"));
@@ -4810,7 +4810,7 @@ test "writer.addComment: XML-special chars in author + text round-trip via entit
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "comments_xml_special.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "comments_xml_special.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -4820,7 +4820,7 @@ test "writer.addComment: XML-special chars in author + text round-trip via entit
         var sheet = try w.addSheet("S");
         try sheet.addComment("A1", "R&D <Lead>", "review <this> & \"that\" quickly");
         try sheet.writeRow(&.{.{ .string = "x" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
     var book = try Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
@@ -4838,7 +4838,7 @@ test "writer.addComment: multi-sheet with comments keeps per-sheet rels independ
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "comments_multi_sheet.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "comments_multi_sheet.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -4858,7 +4858,7 @@ test "writer.addComment: multi-sheet with comments keeps per-sheet rels independ
         try s3.addComment("B2", "Bob", "on S3");
         try s3.addComment("C3", "Carol", "also on S3");
         try s3.writeRow(&.{.{ .string = "z" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
     var book = try Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
@@ -4880,7 +4880,7 @@ test "writer.addComment: 50 comments in one sheet stress-test authors + rels" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "comments_stress.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "comments_stress.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -4899,7 +4899,7 @@ test "writer.addComment: 50 comments in one sheet stress-test authors + rels" {
             try sheet.addComment(ref, author, text);
         }
         try sheet.writeRow(&.{.{ .string = "hdr" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
     var book = try Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
@@ -4921,7 +4921,7 @@ test "writer.writeRichRow: emits rich-text SST entries readable by Book.richRuns
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "writer_rich_roundtrip.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "writer_rich_roundtrip.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -4938,7 +4938,7 @@ test "writer.writeRichRow: emits rich-text SST entries readable by Book.richRuns
             } },
             .{ .integer = 42 },
         });
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.open(std.testing.allocator, io, tmp_path);
@@ -4961,6 +4961,9 @@ test "writer.writeRichRow: emits rich-text SST entries readable by Book.richRuns
 }
 
 test "Book.richRuns: rich-text SST entries expose per-run bold/italic" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Direct parseSharedStrings drive — avoids needing the writer to
     // emit rich text (it doesn't yet). Covers: plain `<t>` → null runs,
     // single `<r>` with `<b/>`, multiple `<r>` with mixed flags,
@@ -4976,6 +4979,7 @@ test "Book.richRuns: rich-text SST entries expose per-run bold/italic" {
         "</sst>";
 
     var book: Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
@@ -5032,6 +5036,9 @@ test "Book.richRuns: rich-text SST entries expose per-run bold/italic" {
 }
 
 test "parseSharedStrings: phonetic <rPh> annotations are dropped from visible text" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // A typical East-Asian SST entry: visible Kanji text with a
     // phonetic-guide (furigana) <rPh> wrapping the reading. The
     // visible cell content is the OUTER <t>; the <rPh><t> inner is
@@ -5047,6 +5054,7 @@ test "parseSharedStrings: phonetic <rPh> annotations are dropped from visible te
         "</sst>";
 
     var book: Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
@@ -5066,7 +5074,7 @@ test "openSstLazy: phonetic <rPh> annotations are dropped from materialised text
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const tmp_path = try tt.path(std.testing.allocator, "lazy_rph.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "lazy_rph.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         // Build a minimal workbook with one cell, then patch the
@@ -5077,12 +5085,12 @@ test "openSstLazy: phonetic <rPh> annotations are dropped from materialised text
         defer w.deinit();
         var s = try w.addSheet("S");
         try s.writeRow(&.{.{ .string = "漢字" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
     // Read the file and rewrite xl/sharedStrings.xml in place to
     // inject a phonetic annotation. Skip the test if anything fails
     // so this stays a regression guard rather than a flaky CI step.
-    const file_data = std.Io.Dir.cwd().readFileAlloc(io, std.testing.allocator, tmp_path, 1 << 20) catch return;
+    const file_data = std.Io.Dir.cwd().readFileAlloc(io, tmp_path, std.testing.allocator, .limited(1 << 20)) catch return;
     defer std.testing.allocator.free(file_data);
 
     // For simplicity, rebuild a workbook with the canonical SST
@@ -5096,6 +5104,7 @@ test "openSstLazy: phonetic <rPh> annotations are dropped from materialised text
         "</sst>";
 
     var book: Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
@@ -5119,6 +5128,9 @@ test "openSstLazy: phonetic <rPh> annotations are dropped from materialised text
 }
 
 test "parseSharedStrings: self-closing <rPh/> is also skipped" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Defensive: producers occasionally emit empty/self-closing <rPh/>.
     // The parser must skip past it without recursing.
     const sst_xml =
@@ -5127,6 +5139,7 @@ test "parseSharedStrings: self-closing <rPh/> is also skipped" {
         "</sst>";
 
     var book: Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
@@ -5140,6 +5153,9 @@ test "parseSharedStrings: self-closing <rPh/> is also skipped" {
 }
 
 test "parseSharedStrings: hostile uniqueCount is capped against XML size" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // A malformed or hostile workbook can claim an absurd uniqueCount
     // to force a multi-GB pre-allocation. The hint is capped against
     // the XML size, so this short SST parses cleanly under the test
@@ -5152,6 +5168,7 @@ test "parseSharedStrings: hostile uniqueCount is capped against XML size" {
         "</sst>";
 
     var book: Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
@@ -5172,7 +5189,7 @@ test "openSstLazy: lazy SST resolves on demand and matches eager (iter-sst-3b)" 
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = @import("writer.zig");
-    const tmp_path = try tt.path(std.testing.allocator, "open_sst_lazy.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "open_sst_lazy.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     // Build a workbook with a handful of distinct shared strings so
@@ -5191,7 +5208,7 @@ test "openSstLazy: lazy SST resolves on demand and matches eager (iter-sst-3b)" 
             .{ .string = "alpha" }, // dedup'd in SST
             .{ .string = "epsilon" },
         });
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     // Eager open: every entry pre-decoded.
@@ -5237,6 +5254,9 @@ test "openSstLazy: lazy SST resolves on demand and matches eager (iter-sst-3b)" 
 }
 
 test "openSstLazy: rich-runs eagerly captured on lazy backend (iter-sst-3b)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Direct parseSharedStringsLazy drive against a known SST XML —
     // covers the contract that lazy-opened books still expose
     // `Book.richRuns(idx)` with the same shape as eager.
@@ -5248,6 +5268,7 @@ test "openSstLazy: rich-runs eagerly captured on lazy backend (iter-sst-3b)" {
         "</sst>";
 
     var book: Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
@@ -5385,7 +5406,7 @@ test "Rows.parseDate: auto-convert date-styled cells through the reader" {
     // Must return null for non-date-styled numbers, null for
     // string cells, and the correct DateTime for date-styled
     // numerics.
-    const tmp_path = try tt.path(std.testing.allocator, "rows_parse_date.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "rows_parse_date.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -5406,7 +5427,7 @@ test "Rows.parseDate: auto-convert date-styled cells through the reader" {
             },
             &.{ date_style, pct_style, 0, 0 },
         );
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.open(std.testing.allocator, io, tmp_path);
@@ -5444,7 +5465,7 @@ test "Book.numberFormat + isDateFormat: built-in, custom, and per-cell style loo
     // cellXfs is parsed, per-cell `s="N"` is tracked via
     // Rows.styleIndices(), numberFormat() resolves built-ins + custom,
     // and isDateFormat() gets the heuristic right.
-    const tmp_path = try tt.path(std.testing.allocator, "reader_numfmt.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "reader_numfmt.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -5459,7 +5480,7 @@ test "Book.numberFormat + isDateFormat: built-in, custom, and per-cell style loo
             &.{ .{ .number = 44927 }, .{ .number = 0.25 }, .{ .integer = 42 } },
             &.{ date_style, pct_style, 0 },
         );
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.open(std.testing.allocator, io, tmp_path);
@@ -5497,7 +5518,7 @@ test "Book.cellFont: round-trips bold / color / size / name from xl/styles.xml" 
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "reader_cell_font.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "reader_cell_font.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -5516,7 +5537,7 @@ test "Book.cellFont: round-trips bold / color / size / name from xl/styles.xml" 
             &.{ .{ .string = "bold-red" }, .{ .string = "italic" }, .{ .string = "bare" } },
             &.{ bold_style, plain_style, 0 },
         );
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.open(std.testing.allocator, io, tmp_path);
@@ -5547,10 +5568,14 @@ test "Book.cellFont: round-trips bold / color / size / name from xl/styles.xml" 
 }
 
 test "parseCommentsForSheet: rich-text comment bodies populate Comment.runs" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // iter53 — comments that use `<r><rPr>` wrappers surface the
     // runs alongside the flat text. Plain-text bodies still produce
     // `runs = null` (the zero-overhead path).
     var book: Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
@@ -5604,12 +5629,16 @@ test "parseCommentsForSheet: rich-text comment bodies populate Comment.runs" {
 }
 
 test "parseCommentsForSheet: authors + refs + flattened rich-text bodies" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Drive the parser directly with pre-populated sheet_rels_data +
     // comments_data maps so we don't need the writer (which doesn't
     // emit comments) or a real xlsx archive on disk. Mirrors the
     // Python end-to-end test but stays inside Zig for CI coverage
     // even when the Python stack doesn't run.
     var book: Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
@@ -5652,6 +5681,9 @@ test "parseCommentsForSheet: authors + refs + flattened rich-text bodies" {
 }
 
 test "parseTheme: 12-entry palette + <color theme=N/> resolution in fonts/fills/borders" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const theme_xml =
         \\<?xml version="1.0"?>
         \\<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
@@ -5671,6 +5703,7 @@ test "parseTheme: 12-entry palette + <color theme=N/> resolution in fonts/fills/
         \\</a:clrScheme></a:themeElements></a:theme>
     ;
     var book: Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
@@ -5724,6 +5757,9 @@ test "parseTheme: 12-entry palette + <color theme=N/> resolution in fonts/fills/
 }
 
 test "parseStyles: cellXfs handles <xf/> and <xf> variants (no attrs)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Regression guard for an iter35 audit finding: `<xf ` (with
     // required trailing space) silently dropped bare `<xf/>` or
     // `<xf>` entries, shifting every subsequent style index. This
@@ -5743,6 +5779,7 @@ test "parseStyles: cellXfs handles <xf/> and <xf> variants (no attrs)" {
         \\</styleSheet>
     ;
     var book: Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
@@ -5759,6 +5796,9 @@ test "parseStyles: cellXfs handles <xf/> and <xf> variants (no attrs)" {
 }
 
 test "parseWorkbookSheets: pretty-printed <sheet\\n ...> is recognised" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const wb_xml =
         \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
         \\<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -5778,6 +5818,7 @@ test "parseWorkbookSheets: pretty-printed <sheet\\n ...> is recognised" {
         "</Relationships>";
 
     var book: Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
@@ -5788,7 +5829,11 @@ test "parseWorkbookSheets: pretty-printed <sheet\\n ...> is recognised" {
 }
 
 test "parseColorAttr requires exactly 8 hex digits for rgb=" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var book: Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
@@ -5834,6 +5879,9 @@ test "fromExcelSerial: 86400-second rounding carries to next day" {
 }
 
 test "parseStyles: custom numFmt formatCode is XML-entity decoded" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // OOXML escapes quotes inside formatCode as `&quot;`. The reader
     // must decode so callers see the real format string and the
     // is-date-format scanner doesn't misclassify literal text as date
@@ -5846,6 +5894,7 @@ test "parseStyles: custom numFmt formatCode is XML-entity decoded" {
         "</styleSheet>";
 
     var book: Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
@@ -5866,7 +5915,7 @@ test "Book.cellBorder: round-trip sided styles + color through writer" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "reader_cell_border.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "reader_cell_border.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -5884,7 +5933,7 @@ test "Book.cellBorder: round-trip sided styles + color through writer" {
             &.{ .{ .string = "boxed" }, .{ .string = "plain" } },
             &.{ boxed, 0 },
         );
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.open(std.testing.allocator, io, tmp_path);
@@ -5918,7 +5967,7 @@ test "Book.cellFill: round-trip solid fg/bg and pattern 'none' default" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "reader_cell_fill.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "reader_cell_fill.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -5934,7 +5983,7 @@ test "Book.cellFill: round-trip solid fg/bg and pattern 'none' default" {
             &.{ .{ .string = "filled" }, .{ .string = "plain" } },
             &.{ red_fill, 0 },
         );
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.open(std.testing.allocator, io, tmp_path);
@@ -5958,6 +6007,9 @@ test "Book.cellFill: round-trip solid fg/bg and pattern 'none' default" {
 }
 
 test "Book.richRuns: color / size / font_name from <rPr>" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const sst_xml =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" ++
         "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"3\">" ++
@@ -5970,6 +6022,7 @@ test "Book.richRuns: color / size / font_name from <rPr>" {
         "</sst>";
 
     var book: Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
@@ -6005,7 +6058,7 @@ test "Book.hyperlinks: internal hyperlinks (location) round-trip + mixed externa
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "reader_internal_hyperlinks.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "reader_internal_hyperlinks.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -6021,7 +6074,7 @@ test "Book.hyperlinks: internal hyperlinks (location) round-trip + mixed externa
         // Rejection path.
         try std.testing.expectError(error.InvalidHyperlinkLocation, s2.addInternalHyperlink("A3", ""));
         try std.testing.expectError(error.InvalidHyperlinkRange, s2.addInternalHyperlink("", "Main!A1"));
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.open(std.testing.allocator, io, tmp_path);
@@ -6056,7 +6109,7 @@ test "Book.hyperlinks: internal-only sheet (no _rels file needed)" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "reader_internal_only.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "reader_internal_only.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -6067,7 +6120,7 @@ test "Book.hyperlinks: internal-only sheet (no _rels file needed)" {
         var s2 = try w.addSheet("TOC");
         try s2.addInternalHyperlink("A1", "Main!A1");
         try s2.writeRow(&.{.{ .string = "ToC" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.open(std.testing.allocator, io, tmp_path);
@@ -6084,7 +6137,7 @@ test "Book.hyperlinks: empty slice for sheets without hyperlinks" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "reader_no_hyperlinks.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "reader_no_hyperlinks.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -6093,7 +6146,7 @@ test "Book.hyperlinks: empty slice for sheets without hyperlinks" {
         defer w.deinit();
         var sheet = try w.addSheet("Plain");
         try sheet.writeRow(&.{.{ .string = "no-links" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.open(std.testing.allocator, io, tmp_path);
@@ -6107,7 +6160,7 @@ test "Book.mergedRanges: empty slice for sheets without merges" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "reader_no_merged.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "reader_no_merged.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -6116,7 +6169,7 @@ test "Book.mergedRanges: empty slice for sheets without merges" {
         defer w.deinit();
         var sheet = try w.addSheet("Sheet1");
         try sheet.writeRow(&.{.{ .string = "a" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.open(std.testing.allocator, io, tmp_path);
@@ -6357,11 +6410,15 @@ test "fuzz extractVValue" {
 
 fn fuzzParseSharedStringsTarget(_: void, smith: *std.testing.Smith) anyerror!void {
     @disableInstrumentation();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // 4 KiB matches the PRNG harness's scratch bound, so a crash
     // found here reproduces against the same input shape.
     var smith_buf: [4096]u8 = undefined;
     const input = smith_buf[0..smith.slice(&smith_buf)];
     var book: Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
@@ -6394,6 +6451,9 @@ test "fuzz parseSharedStrings — coverage-guided" {
 
 fn fuzzParseWorkbookSheetsTarget(_: void, smith: *std.testing.Smith) anyerror!void {
     @disableInstrumentation();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // 4 KiB matches the PRNG harness's scratch bound, so a crash
     // found here reproduces against the same input shape.
     var smith_buf: [4096]u8 = undefined;
@@ -6408,6 +6468,7 @@ fn fuzzParseWorkbookSheetsTarget(_: void, smith: *std.testing.Smith) anyerror!vo
         "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>" ++
         "</Relationships>";
     var book: Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
@@ -6443,7 +6504,7 @@ test "fuzz parseSharedStrings" {
     var buf: [fuzz_max_input_len]u8 = undefined;
     for (0..iters) |_| {
         const input = randomInput(rng, &buf);
-        var book: Book = .{ .allocator = std.testing.allocator, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+        var book: Book = .{ .allocator = std.testing.allocator, .io = io, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
         defer book.deinit();
         // parseSharedStrings may borrow spans from the xml buffer when
         // no entity decoding is needed; dupe it so the buffer outlives
@@ -6455,6 +6516,9 @@ test "fuzz parseSharedStrings" {
 }
 
 test "parseWorkbookSheets sets uses_1904_epoch past a <workbookProtection> prefix" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Regression: <workbookProtection> shares the `<workbookPr` prefix.
     // A naive prefix-match would stop on the protection tag, miss
     // date1904 on the real workbookPr element, and silently fall back
@@ -6476,6 +6540,7 @@ test "parseWorkbookSheets sets uses_1904_epoch past a <workbookProtection> prefi
     ;
 
     var book: Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
@@ -6486,6 +6551,9 @@ test "parseWorkbookSheets sets uses_1904_epoch past a <workbookProtection> prefi
 }
 
 test "parseWorkbookSheets leaves uses_1904_epoch false for 1900 workbooks" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const wb_xml =
         \\<?xml version="1.0"?>
         \\<workbook>
@@ -6501,6 +6569,7 @@ test "parseWorkbookSheets leaves uses_1904_epoch false for 1900 workbooks" {
     ;
 
     var book: Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
@@ -6523,7 +6592,7 @@ test "fuzz parseWorkbookSheets" {
         const mid = input.len / 2;
         const wb = input[0..mid];
         const rels = input[mid..];
-        var book: Book = .{ .allocator = std.testing.allocator, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+        var book: Book = .{ .allocator = std.testing.allocator, .io = io, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
         defer book.deinit();
         parseWorkbookSheets(&book, wb, rels) catch {};
     }
@@ -6539,7 +6608,7 @@ test "fuzz parseStyles" {
     var buf: [fuzz_max_input_len]u8 = undefined;
     for (0..iters) |_| {
         const input = randomInput(rng, &buf);
-        var book: Book = .{ .allocator = std.testing.allocator, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+        var book: Book = .{ .allocator = std.testing.allocator, .io = io, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
         defer book.deinit();
         parseStyles(&book, input) catch {};
     }
@@ -6559,7 +6628,7 @@ test "fuzz parseCommentsForSheet" {
         const mid = input.len / 2;
         const rels_input = input[0..mid];
         const comments_input = input[mid..];
-        var book: Book = .{ .allocator = std.testing.allocator, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+        var book: Book = .{ .allocator = std.testing.allocator, .io = io, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
         defer book.deinit();
 
         const owned_rels = std.testing.allocator.dupe(u8, rels_input) catch continue;
@@ -6604,7 +6673,7 @@ test "fuzz writer.addComment: adversarial author + text never crash emission" {
     var buf: [fuzz_max_input_len]u8 = undefined;
 
     const writer = @import("writer.zig");
-    const tmp_path = try tt.path(std.testing.allocator, "fuzz_addcomment.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "fuzz_addcomment.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     for (0..iters) |_| {
@@ -6623,7 +6692,7 @@ test "fuzz writer.addComment: adversarial author + text never crash emission" {
         // must tolerate any author/text content.
         _ = sheet.addComment(ref, author, text) catch {};
         sheet.writeRow(&.{.{ .string = "x" }}) catch continue;
-        w.save(tmp_path) catch {};
+        w.save(io, tmp_path) catch {};
     }
 }
 
@@ -6644,7 +6713,7 @@ test "fuzz writer.addConditionalFormat + addDxf: adversarial inputs never crash 
     var buf: [fuzz_max_input_len]u8 = undefined;
 
     const writer = @import("writer.zig");
-    const tmp_path = try tt.path(std.testing.allocator, "fuzz_addcf.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "fuzz_addcf.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     const ops = [_]writer.CfOperator{
@@ -6680,7 +6749,7 @@ test "fuzz writer.addConditionalFormat + addDxf: adversarial inputs never crash 
         _ = sheet.addConditionalFormatCellIs(range, op, formula1, f2, dxf_id) catch {};
         _ = sheet.addConditionalFormatExpression(range, formula1, dxf_id) catch {};
         sheet.writeRow(&.{.{ .string = "x" }}) catch continue;
-        w.save(tmp_path) catch {};
+        w.save(io, tmp_path) catch {};
     }
 }
 
@@ -6782,7 +6851,7 @@ test "fuzz parseSharedStrings mutations" {
     var dst: [fuzz_max_input_len]u8 = undefined;
     for (0..iters) |_| {
         const input = mutate(rng, sst_template, &dst);
-        var book: Book = .{ .allocator = std.testing.allocator, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+        var book: Book = .{ .allocator = std.testing.allocator, .io = io, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
         defer book.deinit();
         const owned = std.testing.allocator.dupe(u8, input) catch continue;
         book.shared_strings_xml = owned;
@@ -6802,7 +6871,7 @@ test "fuzz parseWorkbookSheets mutations" {
     for (0..iters) |_| {
         const wb = mutate(rng, workbook_template, &wb_dst);
         const rels = mutate(rng, rels_template, &rels_dst);
-        var book: Book = .{ .allocator = std.testing.allocator, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+        var book: Book = .{ .allocator = std.testing.allocator, .io = io, .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
         defer book.deinit();
         parseWorkbookSheets(&book, wb, rels) catch {};
     }
@@ -7161,7 +7230,7 @@ test "openLazy path loads sheets lazily, yields identical state to open()" {
     // Build a small multi-sheet workbook with merged ranges, hyperlinks,
     // data validations, and comments so every per-sheet side-index gets
     // a round-trip comparison.
-    const tmp_path = try tt.path(std.testing.allocator, "iter54_lazy_struct.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "iter54_lazy_struct.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
@@ -7179,7 +7248,7 @@ test "openLazy path loads sheets lazily, yields identical state to open()" {
         try s2.writeRow(&.{.{ .string = "x" }});
         try s2.writeRow(&.{.{ .number = 42.0 }});
 
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     // Eager path.
@@ -7227,7 +7296,7 @@ test "openLazy -> ensureSheetLoaded is idempotent" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "iter54_lazy_idempotent.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "iter54_lazy_idempotent.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
@@ -7237,7 +7306,7 @@ test "openLazy -> ensureSheetLoaded is idempotent" {
         try s.addMergedCell("A1:A2");
         try s.writeRow(&.{.{ .string = "x" }});
         try s.writeRow(&.{.{ .number = 1.0 }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.openLazy(std.testing.allocator, io, tmp_path);
@@ -7269,7 +7338,7 @@ test "openLazy parses workbook-wide styles + theme (no sheet load required)" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "iter54_lazy_styles.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "iter54_lazy_styles.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
@@ -7282,7 +7351,7 @@ test "openLazy parses workbook-wide styles + theme (no sheet load required)" {
         const s_idx = try w.addStyle(.{ .number_format = "0.00%" });
         var s = try w.addSheet("One");
         try s.writeRowStyled(&.{.{ .number = 0.5 }}, &.{s_idx});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.openLazy(std.testing.allocator, io, tmp_path);
@@ -7305,7 +7374,7 @@ test "streamSheet: out-of-range index errors, valid index hits cache on Book.ope
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "iter54_stream_sheet.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "iter54_stream_sheet.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
@@ -7315,7 +7384,7 @@ test "streamSheet: out-of-range index errors, valid index hits cache on Book.ope
         try s0.writeRow(&.{.{ .string = "a" }});
         var s1 = try w.addSheet("Beta");
         try s1.writeRow(&.{.{ .number = 1.0 }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.open(std.testing.allocator, io, tmp_path);
@@ -7343,7 +7412,7 @@ test "streamSheet: lazily materializes a single sheet on openLazy" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "iter54_stream_lazy.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "iter54_stream_lazy.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
@@ -7353,7 +7422,7 @@ test "streamSheet: lazily materializes a single sheet on openLazy" {
         try s0.writeRow(&.{.{ .string = "a" }});
         var s1 = try w.addSheet("Beta");
         try s1.writeRow(&.{.{ .string = "b" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.openLazy(std.testing.allocator, io, tmp_path);
@@ -7378,7 +7447,7 @@ test "preloadSheet populates per-sheet metadata without rows() iteration" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "iter54_preload_sheet.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "iter54_preload_sheet.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = @import("writer.zig");
@@ -7388,7 +7457,7 @@ test "preloadSheet populates per-sheet metadata without rows() iteration" {
         try s.addMergedCell("A1:C1");
         try s.writeRow(&.{.{ .string = "merged" }});
         try s.writeRow(&.{.{ .number = 1.0 }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.openLazy(std.testing.allocator, io, tmp_path);
@@ -7615,7 +7684,7 @@ test "Book.materialiseSheet: dense matrix matches streaming rows()" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "materialise_basic.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "materialise_basic.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -7638,7 +7707,7 @@ test "Book.materialiseSheet: dense matrix matches streaming rows()" {
             .{ .integer = 25 },
             .empty,
         });
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     // Streaming reference: collect every row's cells into an owned
@@ -7712,7 +7781,7 @@ test "Book.materialiseSheet: testing.allocator confirms zero leaks" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "materialise_leakcheck.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "materialise_leakcheck.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -7731,7 +7800,7 @@ test "Book.materialiseSheet: testing.allocator confirms zero leaks" {
             .{ .string = "row two" },
             .{ .number = 2.5 },
         });
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.open(std.testing.allocator, io, tmp_path);
@@ -7751,7 +7820,7 @@ test "Book.materialiseSheet: empty sheet yields zero rows" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "materialise_empty.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "materialise_empty.xlsx");
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -7759,7 +7828,7 @@ test "Book.materialiseSheet: empty sheet yields zero rows" {
         var w = writer.Writer.init(std.testing.allocator);
         defer w.deinit();
         _ = try w.addSheet("Empty");
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
     var book = try Book.open(std.testing.allocator, io, tmp_path);

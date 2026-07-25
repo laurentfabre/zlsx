@@ -24,6 +24,22 @@
 const std = @import("std");
 const AtomicFile = @import("atomic_file.zig").AtomicFile;
 
+/// Read exactly `dest.len` bytes at `offset`.
+///
+/// Zig 0.16 removed `File.seekTo` / `File.readAll`; positional reads go
+/// through a `File.Reader`. An empty reader buffer is deliberate — it
+/// makes `readSliceAll` read straight into `dest` with no intermediate
+/// copy, which is what the old `seekTo` + `readAll` pair did.
+///
+/// A short read was `n != expected` -> BadZip before; it is now
+/// `error.EndOfStream`, mapped to the same BadZip so the archive-level
+/// contract is unchanged.
+fn readAtExact(file: std.Io.File, io: std.Io, offset: u64, dest: []u8) Error!void {
+    var fr = file.reader(io, &.{});
+    fr.seekTo(offset) catch return Error.BadZip;
+    fr.interface.readSliceAll(dest) catch return Error.BadZip;
+}
+
 pub const Part = struct {
     name: []const u8,
     /// Resolved via `[Content_Types].xml` (Override > Default by
@@ -146,8 +162,10 @@ pub const PartStore = struct {
         // munmap rather than holding them inside the process arena.
         const scratch = try std.heap.page_allocator.alloc(u8, size);
         defer std.heap.page_allocator.free(scratch);
-        const n = try file.readAll(scratch);
-        if (n != size) return Error.BadZip;
+        {
+            var fr = file.reader(io, &.{});
+            fr.interface.readSliceAll(scratch) catch return Error.BadZip;
+        }
 
         const entries = try scanCentralDirectory(ar_alloc, scratch);
 
@@ -208,6 +226,7 @@ pub const PartStore = struct {
 
         return .{
             .allocator = allocator,
+            .io = io,
             .arena = arena,
             .file = file,
             .entries = entries,
@@ -235,7 +254,7 @@ pub const PartStore = struct {
     /// readers (no workbook, no rels). This is intentional: the
     /// store doesn't enforce OOXML well-formedness; that's the
     /// caller's job (Workbook.create or similar).
-    pub fn fresh(allocator: std.mem.Allocator) Error!PartStore {
+    pub fn fresh(allocator: std.mem.Allocator, io: std.Io) Error!PartStore {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const ar_alloc = arena.allocator();
@@ -293,6 +312,7 @@ pub const PartStore = struct {
 
         return .{
             .allocator = allocator,
+            .io = io,
             .arena = arena,
             .file = null,
             .entries = entries,
@@ -304,7 +324,7 @@ pub const PartStore = struct {
     }
 
     pub fn deinit(self: *PartStore) void {
-        if (self.file) |*f| f.close();
+        if (self.file) |*f| f.close(self.io);
         self.arena.deinit();
     }
 
@@ -606,7 +626,7 @@ pub const PartStore = struct {
     /// CDFH copied with patched lfh_offset). Overridden parts get
     /// fresh LFH + payload but reuse the source CDFH (with patched
     /// fields). EOCD comment is preserved.
-    pub fn save(self: *PartStore, path: []const u8) !void {
+    pub fn save(self: *PartStore, io: std.Io, path: []const u8) !void {
         // Preflight ZIP32 limits BEFORE opening the output file. Every
         // offset / size field on the wire is u32 (offsets, CD size,
         // payload sizes) or u16 (name length, comment length, entry
@@ -651,7 +671,7 @@ pub const PartStore = struct {
         if (total_projected > std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
 
         var write_buf: [4096]u8 = undefined;
-        var atomic_file = try AtomicFile.init(self.io, path, &write_buf);
+        var atomic_file = try AtomicFile.init(io, path, &write_buf);
         defer atomic_file.deinit();
         const w = &atomic_file.file_writer.interface;
 
@@ -697,9 +717,7 @@ pub const PartStore = struct {
                 // and `self.file` is non-null. Fresh stores override
                 // every entry, so this branch never fires for them.
                 const src = self.file orelse return Error.BadZip;
-                try src.seekTo(e.lfh_offset);
-                const r = try src.readAll(region);
-                if (r != total) return Error.BadZip;
+                try readAtExact(src, io, e.lfh_offset, region);
                 try w.writeAll(region);
                 written += @as(u64, region.len);
             }
@@ -742,9 +760,7 @@ pub const PartStore = struct {
                 // entries imply we came from `open()` with a real
                 // source file.
                 const src = self.file orelse return Error.BadZip;
-                try src.seekTo(e.cdfh_offset);
-                const r = try src.readAll(cdfh);
-                if (r != e.cdfh_total_len) return Error.BadZip;
+                try readAtExact(src, io, e.cdfh_offset, cdfh);
                 std.mem.writeInt(u32, cdfh[42..46], new_lfh_offsets[i], .little);
                 try w.writeAll(cdfh);
                 written += @as(u64, cdfh.len);
@@ -819,9 +835,7 @@ pub const PartStore = struct {
         // slot with bytes already in the arena). If we land here with
         // no source file, the store invariant is violated.
         const src = self.file orelse return Error.BadZip;
-        try src.seekTo(p.payload_offset);
-        const n = try src.readAll(compressed);
-        if (n != p.compressed_size) return Error.BadZip;
+        try readAtExact(src, self.io, p.payload_offset, compressed);
 
         const bytes = try decompressPayload(
             ar_alloc,
@@ -1785,7 +1799,7 @@ test "PartStore.save: byte-preserving round-trip with no mutations" {
     {
         var store = try PartStore.open(std.testing.allocator, io, fixture);
         defer store.deinit();
-        try store.save(out_path);
+        try store.save(io, out_path);
     }
 
     // Re-open the saved file. Every part must decompress to the
@@ -1830,7 +1844,7 @@ test "PartStore.replacePart + save: replaced part has new bytes; others untouche
         // round-trip test. workbook.xml ensures we exercise the
         // override path on a part that exists in every fixture.
         try store.replacePart("xl/workbook.xml", replacement);
-        try store.save(out_path);
+        try store.save(io, out_path);
     }
 
     var dst = try PartStore.open(std.testing.allocator, io, out_path);
@@ -1882,7 +1896,7 @@ test "PartStore.replacePart: large input round-trips through deflate" {
         const ov = store.overrides[store.findIndex("xl/workbook.xml").?].?;
         try std.testing.expectEqual(@as(u16, 8), ov.compression_method);
         try std.testing.expect(ov.payload.len < replacement.len);
-        try store.save(out_path);
+        try store.save(io, out_path);
     }
 
     var dst = try PartStore.open(std.testing.allocator, io, out_path);
@@ -2105,7 +2119,7 @@ test "PartStore.addPart + save: new part survives round-trip with content type" 
         var store = try PartStore.open(std.testing.allocator, io, fixture);
         defer store.deinit();
         try store.addPart(new_part_name, new_part_ct, new_part_bytes);
-        try store.save(out_path);
+        try store.save(io, out_path);
     }
 
     var dst = try PartStore.open(std.testing.allocator, io, out_path);
@@ -2135,7 +2149,7 @@ test "PartStore.addPart: multiple parts in one session all register content type
         defer store.deinit();
         try store.addPart("xl/customA.xml", "application/xml", "<a/>");
         try store.addPart("xl/customB.xml", "application/xml", "<b/>");
-        try store.save(out_path);
+        try store.save(io, out_path);
     }
 
     var dst = try PartStore.open(std.testing.allocator, io, out_path);
@@ -2175,7 +2189,7 @@ test "PartStore.addPart: XML-escapes part name + content type into Content_Types
         var store = try PartStore.open(std.testing.allocator, io, fixture);
         defer store.deinit();
         try store.addPart(tricky_name, "application/xml", "<x/>");
-        try store.save(out_path);
+        try store.save(io, out_path);
     }
 
     var dst = try PartStore.open(std.testing.allocator, io, out_path);
@@ -2320,7 +2334,7 @@ test "PartStore.addPart: large input round-trips through deflate" {
         var store = try PartStore.open(std.testing.allocator, io, fixture);
         defer store.deinit();
         try store.addPart("xl/extra.bin", "application/octet-stream", big_bytes);
-        try store.save(out_path);
+        try store.save(io, out_path);
     }
 
     var dst = try PartStore.open(std.testing.allocator, io, out_path);
@@ -2345,13 +2359,13 @@ test "PartStore.addPart: atomic on every allocation-failure step" {
     // arrays grown by alloc+copy not realloc, staged CT update —
     // is exactly what this verifies.
     const Closure = struct {
-        fn run(alloc: std.mem.Allocator, src_fixture: []const u8) !void {
+        fn run(alloc: std.mem.Allocator, run_io: std.Io, src_fixture: []const u8) !void {
             // The store itself is opened under the failing
             // allocator too — checkAllAllocationFailures has its
             // own contract: every OOM either propagates as-is or
             // is converted to a different error. open() failing
             // is fine; we just need to propagate it.
-            var store = try PartStore.open(alloc, io, src_fixture);
+            var store = try PartStore.open(alloc, run_io, src_fixture);
             defer store.deinit();
 
             const before_count = store.parts.len;
@@ -2375,12 +2389,17 @@ test "PartStore.addPart: atomic on every allocation-failure step" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         Closure.run,
-        .{fixture},
+        // io travels through the extra-args tuple: an inner struct
+        // fn cannot capture it from the enclosing test scope.
+        .{ io, fixture },
     );
 }
 
 test "PartStore.fresh: returns empty store" {
-    var store = try PartStore.fresh(std.testing.allocator);
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var store = try PartStore.fresh(std.testing.allocator, io);
     defer store.deinit();
 
     // No source file backing a fresh store.
@@ -2406,7 +2425,10 @@ test "PartStore.fresh: returns empty store" {
 }
 
 test "PartStore.fresh: addPart populates the store" {
-    var store = try PartStore.fresh(std.testing.allocator);
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var store = try PartStore.fresh(std.testing.allocator, io);
     defer store.deinit();
 
     try store.addPart("hello.txt", "text/plain", "hello world");
@@ -2445,11 +2467,11 @@ test "PartStore.fresh: save round-trips through PartStore.open" {
     const big_bytes: []const u8 = &big_buf;
 
     {
-        var store = try PartStore.fresh(std.testing.allocator);
+        var store = try PartStore.fresh(std.testing.allocator, io);
         defer store.deinit();
         try store.addPart(small_name, "application/xml", small_bytes);
         try store.addPart(big_name, "application/xml", big_bytes);
-        try store.save(out_path);
+        try store.save(io, out_path);
     }
 
     var dst = try PartStore.open(std.testing.allocator, io, out_path);
@@ -2490,9 +2512,9 @@ test "PartStore.fresh: save with zero addParts produces a valid 1-entry ZIP" {
     defer std.testing.allocator.free(out_path);
 
     {
-        var store = try PartStore.fresh(std.testing.allocator);
+        var store = try PartStore.fresh(std.testing.allocator, io);
         defer store.deinit();
-        try store.save(out_path);
+        try store.save(io, out_path);
     }
 
     var dst = try PartStore.open(std.testing.allocator, io, out_path);

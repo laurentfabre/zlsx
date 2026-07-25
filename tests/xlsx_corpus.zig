@@ -660,7 +660,7 @@ test "corpus parity: setCell on every fixture round-trips through reader" {
                     return err;
                 };
             }
-            try ed.save(dst);
+            try ed.save(io, dst);
         }
         if (skip_fixture) continue;
 
@@ -743,7 +743,7 @@ test "corpus parity: appendRows on every fixture round-trips through reader" {
                 };
                 try per_sheet_ok.put(i, {});
             }
-            try ed.save(dst);
+            try ed.save(io, dst);
         }
         if (skip_fixture) continue;
 
@@ -824,7 +824,7 @@ test "corpus parity: addSheet on every fixture round-trips through reader" {
             };
             const rows_to_append = [_][]const xlsx.Cell{&append_row};
             try ed.appendRows(new_idx, &rows_to_append);
-            try ed.save(dst);
+            try ed.save(io, dst);
         }
         if (skip_fixture) continue;
 
@@ -908,7 +908,7 @@ test "corpus parity: deleteSheet (last sheet) on multi-sheet fixtures" {
                 }
                 return err;
             };
-            try ed.save(dst);
+            try ed.save(io, dst);
         }
         if (skip_fixture) continue;
 
@@ -976,7 +976,7 @@ test "corpus parity: renameSheet on every fixture round-trips through reader" {
                 }
                 return err;
             };
-            try ed.save(dst);
+            try ed.save(io, dst);
         }
         if (skip_fixture) continue;
 
@@ -1045,7 +1045,7 @@ test "corpus parity: insertRow on every fixture round-trips through reader" {
                 }
                 return err;
             };
-            try ed.save(dst);
+            try ed.save(io, dst);
         }
         if (skip_fixture) continue;
 
@@ -1113,7 +1113,7 @@ test "corpus parity: deleteRow on every fixture round-trips through reader" {
                 }
                 return err;
             };
-            try ed.save(dst);
+            try ed.save(io, dst);
             accepted = true;
         }
         if (skip_fixture) continue;
@@ -1177,7 +1177,7 @@ test "corpus parity: insertColumn on every fixture round-trips through reader" {
                 }
                 return err;
             };
-            try ed.save(dst);
+            try ed.save(io, dst);
             accepted = true;
         }
         if (skip_fixture) continue;
@@ -1234,7 +1234,7 @@ test "corpus parity: deleteColumn on every fixture round-trips through reader" {
                 }
                 return err;
             };
-            try ed.save(dst);
+            try ed.save(io, dst);
             accepted = true;
         }
         if (skip_fixture) continue;
