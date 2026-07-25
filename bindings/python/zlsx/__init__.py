@@ -2881,6 +2881,79 @@ class Editor:
             row, col, value = edit
             self.set_cell(sheet_idx, row, col, value)
 
+    def doc_props(self) -> dict:
+        """Read the workbook's ``docProps`` metadata.
+
+        Returns a dict with one key per field (``creator``,
+        ``last_modified_by``, ``company``, …) plus
+        ``has_custom_properties``. Absent fields are ``None``.
+
+        These parts round-trip untouched through every edit, so a
+        pipeline that masks cell values still ships the original
+        author's name unless it scrubs them — see
+        :meth:`strip_doc_props`.
+
+        Requires libzlsx 0.5.0+.
+        """
+        if not _ffi._HAS_DOCPROPS:
+            raise ZlsxError("libzlsx too old: zlsx_editor_docprop_at unavailable")
+
+        out: dict = {}
+        ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        length = ctypes.c_size_t(0)
+        for name, field_id in _ffi.DOCPROP_FIELDS.items():
+            rc = _ffi.lib.zlsx_editor_docprop_at(
+                self._handle,
+                ctypes.c_uint32(field_id),
+                ctypes.byref(ptr),
+                ctypes.byref(length),
+            )
+            if rc == -2:
+                raise ZlsxError("zlsx_editor_docprop_at: could not read docProps")
+            if rc != 0:
+                raise ZlsxError(f"zlsx_editor_docprop_at({name}): rc={rc}")
+            if length.value == 0:
+                out[name] = None
+            else:
+                out[name] = bytes(
+                    ctypes.cast(
+                        ptr, ctypes.POINTER(ctypes.c_ubyte * length.value)
+                    ).contents
+                ).decode("utf-8", "replace")
+
+        has_custom = _ffi.lib.zlsx_editor_has_custom_properties(self._handle)
+        if has_custom < 0:
+            raise ZlsxError("zlsx_editor_has_custom_properties failed")
+        out["has_custom_properties"] = bool(has_custom)
+        return out
+
+    def strip_doc_props(self, strip_timestamps: bool = False) -> None:
+        """Remove identifying document metadata, staged for the next
+        :meth:`save`.
+
+        Drops ``dc:creator``, ``cp:lastModifiedBy``, title/subject/
+        description/keywords/category, ``Company``, ``Manager``,
+        ``HyperlinkBase`` and the whole ``docProps/custom.xml`` part.
+        Cell data is untouched.
+
+        ``strip_timestamps`` additionally removes created/modified/
+        revision. Those are kept by default: rarely identifying on
+        their own, and removing them visibly empties Excel's
+        document-info pane.
+
+        Requires libzlsx 0.5.0+.
+        """
+        if not _ffi._HAS_DOCPROPS:
+            raise ZlsxError("libzlsx too old: zlsx_editor_strip_doc_props unavailable")
+        rc = _ffi.lib.zlsx_editor_strip_doc_props(
+            self._handle,
+            ctypes.c_int32(1 if strip_timestamps else 0),
+            self._err,
+            _ERR_BUF_LEN,
+        )
+        if rc != 0:
+            raise ZlsxError(f"zlsx_editor_strip_doc_props: {_decode_err(self._err)}")
+
     def save(self, out_path: Union[str, Path]) -> None:
         """Write the (mutated) workbook atomically to ``out_path``.
         Pass the same path as the source to overwrite in place."""

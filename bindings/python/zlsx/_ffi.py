@@ -1055,6 +1055,64 @@ if _HAS_EDITOR:
     ]
     lib.zlsx_editor_save.restype = ctypes.c_int32
 
+
+# ---- Document properties (Z3) ---------------------------------------
+#
+# Feature-probed: an older libzlsx on the system must not break the
+# import, per the binding's compatibility contract.
+DOCPROP_CREATOR = 0
+DOCPROP_LAST_MODIFIED_BY = 1
+DOCPROP_TITLE = 2
+DOCPROP_SUBJECT = 3
+DOCPROP_DESCRIPTION = 4
+DOCPROP_KEYWORDS = 5
+DOCPROP_CATEGORY = 6
+DOCPROP_CREATED = 7
+DOCPROP_MODIFIED = 8
+DOCPROP_REVISION = 9
+DOCPROP_COMPANY = 10
+DOCPROP_MANAGER = 11
+DOCPROP_APPLICATION = 12
+DOCPROP_HYPERLINK_BASE = 13
+
+DOCPROP_FIELDS = {
+    "creator": DOCPROP_CREATOR,
+    "last_modified_by": DOCPROP_LAST_MODIFIED_BY,
+    "title": DOCPROP_TITLE,
+    "subject": DOCPROP_SUBJECT,
+    "description": DOCPROP_DESCRIPTION,
+    "keywords": DOCPROP_KEYWORDS,
+    "category": DOCPROP_CATEGORY,
+    "created": DOCPROP_CREATED,
+    "modified": DOCPROP_MODIFIED,
+    "revision": DOCPROP_REVISION,
+    "company": DOCPROP_COMPANY,
+    "manager": DOCPROP_MANAGER,
+    "application": DOCPROP_APPLICATION,
+    "hyperlink_base": DOCPROP_HYPERLINK_BASE,
+}
+
+_HAS_DOCPROPS = hasattr(lib, "zlsx_editor_docprop_at")
+if _HAS_DOCPROPS:
+    lib.zlsx_editor_docprop_at.argtypes = [
+        editor_handle,
+        ctypes.c_uint32,                            # field selector
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.zlsx_editor_docprop_at.restype = ctypes.c_int32
+
+    lib.zlsx_editor_has_custom_properties.argtypes = [editor_handle]
+    lib.zlsx_editor_has_custom_properties.restype = ctypes.c_int32
+
+    lib.zlsx_editor_strip_doc_props.argtypes = [
+        editor_handle,
+        ctypes.c_int32,                             # strip_timestamps
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_strip_doc_props.restype = ctypes.c_int32
+
 _HAS_EDITOR_SET_CELL = hasattr(lib, "zlsx_editor_set_cell")
 if _HAS_EDITOR_SET_CELL:
     lib.zlsx_editor_set_cell.argtypes = [

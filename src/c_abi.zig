@@ -4185,3 +4185,106 @@ test "zlsx_sheet_writer_set_row_height + freeze_panes_checked propagate errors" 
     try std.testing.expectEqual(@as(i32, -1), zlsx_sheet_writer_freeze_panes_checked(sw, 0, 16_384, &err_buf, err_buf.len));
     try std.testing.expect(std.mem.indexOf(u8, &err_buf, "ColumnOutOfRange") != null);
 }
+
+// ─── Document properties (Z3) ────────────────────────────────────────
+
+/// Which `docProps` field `zlsx_editor_docprop_at` returns.
+///
+/// A field selector rather than 14 separate exports, and an explicit
+/// `u32` rather than a Zig enum so the numeric values are part of the
+/// ABI contract: appending is safe, renumbering is not.
+pub const ZLSX_DOCPROP_CREATOR: u32 = 0;
+pub const ZLSX_DOCPROP_LAST_MODIFIED_BY: u32 = 1;
+pub const ZLSX_DOCPROP_TITLE: u32 = 2;
+pub const ZLSX_DOCPROP_SUBJECT: u32 = 3;
+pub const ZLSX_DOCPROP_DESCRIPTION: u32 = 4;
+pub const ZLSX_DOCPROP_KEYWORDS: u32 = 5;
+pub const ZLSX_DOCPROP_CATEGORY: u32 = 6;
+pub const ZLSX_DOCPROP_CREATED: u32 = 7;
+pub const ZLSX_DOCPROP_MODIFIED: u32 = 8;
+pub const ZLSX_DOCPROP_REVISION: u32 = 9;
+pub const ZLSX_DOCPROP_COMPANY: u32 = 10;
+pub const ZLSX_DOCPROP_MANAGER: u32 = 11;
+pub const ZLSX_DOCPROP_APPLICATION: u32 = 12;
+pub const ZLSX_DOCPROP_HYPERLINK_BASE: u32 = 13;
+
+/// Read one document-properties field from an Editor handle into
+/// `out_ptr` / `out_len`. Pointer lifetime matches the Editor.
+///
+/// Returns 0 on success (including "field absent", which yields
+/// `out_len = 0`), -1 on an unknown field id, -2 when the properties
+/// could not be read at all.
+///
+/// Absent and empty are both reported as `out_len = 0`. The
+/// distinction exists in the Zig API but is not worth an extra ABI
+/// slot: no caller has needed to act on it, and a scrub treats them
+/// identically.
+export fn zlsx_editor_docprop_at(
+    ed: *Editor,
+    field: u32,
+    out_ptr: *[*]const u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const state: *EditorState = @ptrCast(@alignCast(ed));
+    const props = state.inner.docProps() catch return -2;
+
+    const v: ?[]const u8 = switch (field) {
+        ZLSX_DOCPROP_CREATOR => props.creator,
+        ZLSX_DOCPROP_LAST_MODIFIED_BY => props.last_modified_by,
+        ZLSX_DOCPROP_TITLE => props.title,
+        ZLSX_DOCPROP_SUBJECT => props.subject,
+        ZLSX_DOCPROP_DESCRIPTION => props.description,
+        ZLSX_DOCPROP_KEYWORDS => props.keywords,
+        ZLSX_DOCPROP_CATEGORY => props.category,
+        ZLSX_DOCPROP_CREATED => props.created,
+        ZLSX_DOCPROP_MODIFIED => props.modified,
+        ZLSX_DOCPROP_REVISION => props.revision,
+        ZLSX_DOCPROP_COMPANY => props.company,
+        ZLSX_DOCPROP_MANAGER => props.manager,
+        ZLSX_DOCPROP_APPLICATION => props.application,
+        ZLSX_DOCPROP_HYPERLINK_BASE => props.hyperlink_base,
+        else => return -1,
+    };
+
+    if (v) |slice| {
+        out_ptr.* = slice.ptr;
+        out_len.* = slice.len;
+    } else {
+        out_len.* = 0;
+    }
+    return 0;
+}
+
+/// Non-zero when the archive carries a `docProps/custom.xml` part.
+/// Returns -1 if the properties could not be read.
+export fn zlsx_editor_has_custom_properties(ed: *Editor) callconv(.c) i32 {
+    const state: *EditorState = @ptrCast(@alignCast(ed));
+    const props = state.inner.docProps() catch return -1;
+    return if (props.has_custom_properties) 1 else 0;
+}
+
+/// Strip identifying document metadata, staged for the next save.
+///
+/// `strip_timestamps` also removes `dcterms:created` / `dcterms:modified`
+/// / `cp:revision`, which the default mask keeps — they are rarely
+/// identifying alone and removing them visibly empties Excel's
+/// document-info pane.
+///
+/// Returns 0 on success, -1 on failure (`err_buf` populated).
+export fn zlsx_editor_strip_doc_props(
+    ed: *Editor,
+    strip_timestamps: i32,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state: *EditorState = @ptrCast(@alignCast(ed));
+    const mask: zlsx_pkg.DocPropsMask = if (strip_timestamps != 0)
+        .{ .application = true, .created = true, .modified = true, .revision = true }
+    else
+        .{};
+    state.inner.stripDocProps(mask) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    return 0;
+}

@@ -1243,6 +1243,48 @@ int32_t zlsx_editor_save(
     uint8_t       * err_buf,
     size_t          err_buf_len);
 
+/* ---- Document properties (Z3) --------------------------------------
+ *
+ * Field selectors for zlsx_editor_docprop_at(). Numeric values are part
+ * of the ABI contract: appending is safe, renumbering is not.
+ */
+#define ZLSX_DOCPROP_CREATOR           0u
+#define ZLSX_DOCPROP_LAST_MODIFIED_BY  1u
+#define ZLSX_DOCPROP_TITLE             2u
+#define ZLSX_DOCPROP_SUBJECT           3u
+#define ZLSX_DOCPROP_DESCRIPTION       4u
+#define ZLSX_DOCPROP_KEYWORDS          5u
+#define ZLSX_DOCPROP_CATEGORY          6u
+#define ZLSX_DOCPROP_CREATED           7u
+#define ZLSX_DOCPROP_MODIFIED          8u
+#define ZLSX_DOCPROP_REVISION          9u
+#define ZLSX_DOCPROP_COMPANY          10u
+#define ZLSX_DOCPROP_MANAGER          11u
+#define ZLSX_DOCPROP_APPLICATION      12u
+#define ZLSX_DOCPROP_HYPERLINK_BASE   13u
+
+/* Read one docProps field. Pointer lifetime matches the Editor.
+ * Returns 0 on success (absent field yields *out_len == 0),
+ * -1 on unknown field id, -2 if the properties could not be read. */
+int32_t zlsx_editor_docprop_at(
+    zlsx_editor_t       * ed,
+    uint32_t              field,
+    const unsigned char** out_ptr,
+    size_t              * out_len);
+
+/* Non-zero when docProps/custom.xml is present; -1 on read failure. */
+int32_t zlsx_editor_has_custom_properties(zlsx_editor_t * ed);
+
+/* Strip identifying document metadata, staged for the next save.
+ * strip_timestamps also drops created/modified/revision, which the
+ * default mask keeps. Returns 0 on success, -1 on failure. */
+int32_t zlsx_editor_strip_doc_props(
+    zlsx_editor_t * ed,
+    int32_t         strip_timestamps,
+    uint8_t       * err_buf,
+    size_t          err_buf_len);
+
+
 #ifdef __cplusplus
 }
 #endif
