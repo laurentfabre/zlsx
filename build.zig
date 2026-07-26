@@ -541,6 +541,20 @@ pub fn build(b: *std.Build) void {
     );
     emb4_passive_step.dependOn(&emb4_passive_run.step);
 
+    // The helpers are also installed into zig-out/bin so the matrix runner can
+    // invoke them directly. Going through `zig build emb4-verify` collapses any
+    // non-zero verifier exit into build-failure 1, which erases exactly the
+    // distinction the matrix exists to record: 3 STRIPPED vs 4 PARTS-ONLY vs
+    // 5 ORPHANED-REL are all different verdicts, and 3 is an *expected* result
+    // for the archive-rebuilding tools.
+    const emb4_tools_step = b.step(
+        "emb4-tools",
+        "Install the emb-4 matrix helpers into zig-out/bin (preserves their exit codes)",
+    );
+    emb4_tools_step.dependOn(&b.addInstallArtifact(emb4_fixture_exe, .{}).step);
+    emb4_tools_step.dependOn(&b.addInstallArtifact(emb4_verify_exe, .{}).step);
+    emb4_tools_step.dependOn(&b.addInstallArtifact(emb4_passive_exe, .{}).step);
+
     // Per-source-file test targets so each module gets its own test
     // binary (matches the rest of build.zig's pattern).
     const package_store_tests_mod = b.createModule(.{

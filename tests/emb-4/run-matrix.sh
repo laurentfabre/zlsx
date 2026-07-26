@@ -7,12 +7,11 @@
 # Excel Win, Numbers) it stages a per-tool copy and prints the exact open →
 # save → verify steps.
 #
-# Build path is OS-aware:
-#   * macOS 26.4 — `zig build` can't link the build runner (libSystem arm64
-#     slice missing), so the helpers are compiled standalone with
-#     `zig build-exe -target aarch64-macos-none` (see
-#     docs/kb/workflows/macos-test-workaround.md).
-#   * everything else (CI Linux) — the canonical `zig build emb4-*` steps.
+# Helpers are built through the canonical `zig build emb4-*` steps on every
+# platform. (Before the 0.16 migration, macOS needed a standalone
+# `zig build-exe -target aarch64-macos-none` path because 0.15.2's bundled
+# libSystem had no arm64-macos slice; 0.16.0 links the build runner natively,
+# so the hand-rolled module wiring is gone.)
 #
 # Usage:  tests/emb-4/run-matrix.sh [workdir]    (default workdir: /tmp/zlsx-emb4)
 set -uo pipefail
@@ -21,10 +20,12 @@ cd "$(git rev-parse --show-toplevel)"
 WORK="${1:-/tmp/zlsx-emb4}"
 mkdir -p "$WORK/bin"
 FIXTURE="$WORK/zlsx-emb4.xlsx"
-# zlsx pins Zig 0.15.2. Prefer the documented local 0.15.2 binary over whatever
-# `zig` happens to be on PATH (commonly 0.16.x here, whose stdlib differs).
+# zlsx pins Zig 0.16.0 (see .github/workflows/ci.yml). Prefer the pinned local
+# binary over whatever `zig` happens to be on PATH — the emb-4 helpers use
+# 0.16's `std.process.Init` entry point and will not compile under 0.15.x.
+ZIG_PIN=0.16.0
 if [[ -z "${ZIG:-}" ]]; then
-  if [[ -x "$HOME/.zvm/0.15.2/zig" ]]; then ZIG="$HOME/.zvm/0.15.2/zig"; else ZIG="$(command -v zig)"; fi
+  if [[ -x "$HOME/.zvm/$ZIG_PIN/zig" ]]; then ZIG="$HOME/.zvm/$ZIG_PIN/zig"; else ZIG="$(command -v zig)"; fi
 fi
 PASS=0; FAIL=0
 
@@ -33,28 +34,18 @@ ok()   { printf '   \033[1;32m✔ %s\033[0m\n' "$*"; }
 warn() { printf '   \033[1;33m⚠ %s\033[0m\n' "$*"; }
 
 ZV="$("$ZIG" version 2>/dev/null)"
-[[ "$ZV" == "0.15.2" ]] || warn "zig is $ZV, expected 0.15.2 ($ZIG) — set ZIG=… to override"
+[[ "$ZV" == "$ZIG_PIN" ]] || warn "zig is $ZV, expected $ZIG_PIN ($ZIG) — set ZIG=… to override"
 
 # ---- build helpers --------------------------------------------------------
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  note "building helpers (standalone — macOS 26.4 path)"
-  TAIL=( --dep zlsx_sst_plan --dep zlsx_styles_plan --dep zlsx_workbook_xml_plan --dep zlsx_zip --dep zlsx_sheet_plan --dep zlsx_fresh_emit --dep zlsx_nfc -Mzlsx=src/xlsx.zig
-    --dep zlsx --dep zlsx_sst_plan --dep zlsx_styles_plan --dep zlsx_workbook_xml_plan --dep zlsx_zip --dep zlsx_sheet_plan --dep zlsx_fresh_emit --dep zlsx_nfc -Mzlsx_pkg=pkg/root.zig
-    --dep zlsx_sst_plan --dep zlsx_styles_plan --dep zlsx_workbook_xml_plan --dep zlsx_sheet_plan --dep zlsx_zip -Mzlsx_fresh_emit=pkg/fresh_emit.zig
-    -Mzlsx_sst_plan=pkg/sst_plan.zig -Mzlsx_styles_plan=pkg/styles_plan.zig -Mzlsx_workbook_xml_plan=pkg/workbook_xml_plan.zig -Mzlsx_zip=pkg/zip.zig -Mzlsx_sheet_plan=pkg/sheet_plan.zig -Mzlsx_nfc=unicode/nfc.zig )
-  T=aarch64-macos-none
-  "$ZIG" build-exe -target "$T" -femit-bin="$WORK/bin/fixture"      --dep zlsx_pkg --dep zlsx -Mroot=tests/emb-4/fixture_gen.zig  "${TAIL[@]}" || exit 1
-  "$ZIG" build-exe -target "$T" -femit-bin="$WORK/bin/verify"       --dep zlsx_pkg          -Mroot=tests/emb-4/verify.zig       "${TAIL[@]}" || exit 1
-  "$ZIG" build-exe -target "$T" -femit-bin="$WORK/bin/passive-save" --dep zlsx_pkg          -Mroot=tests/emb-4/passive_save.zig "${TAIL[@]}" || exit 1
-  emb4_gen()     { "$WORK/bin/fixture" "$1"; }
-  emb4_verify()  { "$WORK/bin/verify" "$1"; }
-  emb4_passive() { "$WORK/bin/passive-save" "$1" "$2"; }
-else
-  note "building helpers (zig build steps)"
-  emb4_gen()     { "$ZIG" build emb4-fixture -- "$1"; }
-  emb4_verify()  { "$ZIG" build emb4-verify  -- "$1"; }
-  emb4_passive() { "$ZIG" build emb4-passive-save -- "$1" "$2"; }
-fi
+note "building helpers (zig build emb4-tools)"
+# Invoke the installed binaries directly rather than via `zig build emb4-verify`:
+# the build runner collapses any non-zero child exit into failure code 1, and the
+# whole matrix is about telling 3 STRIPPED from 4 PARTS-ONLY from 5 ORPHANED-REL.
+"$ZIG" build emb4-tools || exit 1
+BIN=zig-out/bin
+emb4_gen()     { "$BIN/zlsx-emb4-fixture" "$1"; }
+emb4_verify()  { "$BIN/zlsx-emb4-verify" "$1"; }
+emb4_passive() { "$BIN/zlsx-emb4-passive-save" "$1" "$2"; }
 
 # ---- fixture + baseline ---------------------------------------------------
 note "generate fixture"
@@ -112,8 +103,7 @@ note "GUI legs — stage per-tool copies (manual open → File▸Save → close 
 for tool in excel-mac excel-win numbers; do
   cp "$FIXTURE" "$WORK/$tool.xlsx"
   printf '   • %-10s  open %s  →  File▸Save (not Save As)  →  close, then:\n' "$tool" "$WORK/$tool.xlsx"
-  if [[ "$(uname -s)" == "Darwin" ]]; then printf '                %s %s\n' "$WORK/bin/verify" "$WORK/$tool.xlsx"
-  else printf '                zig build emb4-verify -- %s\n' "$WORK/$tool.xlsx"; fi
+  printf '                %s %s\n' "$BIN/zlsx-emb4-verify" "$WORK/$tool.xlsx"
 done
 printf '   (Numbers preserves xlsx only via File▸Export To▸Excel — export over %s.)\n' "$WORK/numbers.xlsx"
 

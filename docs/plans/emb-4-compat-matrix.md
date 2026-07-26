@@ -99,13 +99,13 @@ LibreOffice headless if installed), then stages a per-tool copy for the
 GUI-only tools and prints their open → save → verify steps. Re-run it any
 time the writer changes.
 
-> **Local build on macOS 26.4.** `zig build emb4-*` cannot link the build
-> runner here (the SDK's `libSystem` has no `arm64-macos` slice). The runner
-> falls back to a standalone `zig build-exe -target aarch64-macos-none` that
-> mirrors the `build.zig` module graph — see
-> `docs/kb/workflows/macos-test-workaround.md`. On CI (Linux) it uses the
-> canonical `zig build emb4-fixture` / `emb4-verify` / `emb4-passive-save`
-> steps. The runner prefers the pinned `~/.zvm/0.15.2/zig` over PATH.
+> **Build path (since the 0.16 migration).** The runner drives the canonical
+> `zig build emb4-fixture` / `emb4-verify` / `emb4-passive-save` steps on every
+> platform, and prefers the pinned `~/.zvm/0.16.0/zig` over PATH. Under 0.15.2
+> the helpers do not compile at all — they use 0.16's `std.process.Init` entry
+> point. The old macOS-only standalone `zig build-exe -target aarch64-macos-none`
+> fallback (0.15.2's bundled `libSystem` had no `arm64-macos` slice, so the build
+> runner would not link) has been removed.
 
 > **LibreOffice headless on macOS 26.4 needs one GUI launch first (2026-05-30).**
 > A cold `soffice --convert-to` hangs (empty log) until LibreOffice has completed
