@@ -135,11 +135,21 @@ When new ABI exports land but older `libzlsx` versions are still installed, `_ff
 - `unit_fuzz_tests` — fuzz targets in `src/xlsx.zig` (reader / parser surface).
 - `package_fuzz_tests` — fuzz targets in `pkg/store.zig` (`decodeXmlEntities`, `looksExternal`).
 
-**Coverage-guided fuzzing does not currently run at all on Zig 0.16.0**, on any platform: building an `-ffuzz` test binary fails inside Zig's own `lib/compiler/test_runner.zig:566` (`expected type '*const debug.StackTrace', found '*builtin.StackTrace'`). That code is only instantiated in fuzz mode, which is why `zig build test` is unaffected. Upstream bug, not ours.
+**Coverage-guided fuzzing works**, but only because `vendor/zig-test-runner/` exists.
 
-Two things follow. First, the targets still execute as single-input smoke tests under `zig build test`, so they are not dead weight. Second, the correct invocation is `zig build fuzz --fuzz` — `fuzz` alone is the *step name*; the `--fuzz` *flag* is what enables coverage-guided mode. Omitting it makes the build runner panic on a null `fuzz_context` the moment the instrumented binary reports coverage. The nightly workflow already uses the right form and will start fuzzing for real the day upstream lands the fix.
+Zig 0.16.0 ships two bugs that make `-ffuzz` builds unusable out of the box: its own `lib/compiler/test_runner.zig` fails to compile (`writeStackTrace` receives a `*builtin.StackTrace` where a `*const debug.StackTrace` is required), and even once that is fixed the runner calls the fuzzer ABI during the test-discovery pass, when `fuzzer.test_i` is still `undefined` — segfaulting on every target that supplies a seed corpus. `vendor/zig-test-runner/` is upstream's runner with those two hunks patched, wired into the two fuzz binaries only via `.test_runner` in `build.zig`. **Read `vendor/zig-test-runner/README.md` before touching it, and delete the whole directory as soon as a Zig release fuzzes without it.**
 
-Beyond that, Linux x64 is the only supported target anyway; macOS (Mach-O `addEntryPoint`) and Windows (shared-memory + COFF/PE debug info) are separately broken upstream. Don't claim "fuzzing works" from a macOS dev box — it doesn't.
+The correct invocation is:
+
+```sh
+zig build fuzz --fuzz --webui=127.0.0.1:0
+```
+
+`fuzz` alone is the *step name*; `--fuzz` is the *flag* that enables coverage-guided mode, and omitting it makes the build runner panic on a null `fuzz_context`. A healthy session runs until killed, so wrap it in `timeout` — exit 124/143 means "ran the full session", not failure.
+
+Verified locally: a 100 s session completes with 226/226 tests and writes fuzzer state under `.zig-cache/v/`.
+
+Linux x64 remains the only supported target; macOS (Mach-O `addEntryPoint`) and Windows (shared-memory + COFF/PE debug info) are separately broken upstream.
 
 ### Three-module collision
 
