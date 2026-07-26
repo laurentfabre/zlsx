@@ -61,7 +61,7 @@ narrower error codes.
 | ~~**Background `<picture>`**~~ | ~~`recordRowEdit` / `recordColEdit` per-sheet `<picture` scan~~ | ~~`RowEditUnsafeForSheet` / `ColEditUnsafeForSheet`~~ | ✅ **Lifted 2026-05-14** (iter dr-0). CT_SheetBackgroundPicture (ECMA-376 §18.3.1.67) is a single coordinate-free `r:id` reference to a tiled background image — row/col edits cannot misalign it. Editor's row+col guards no longer scan for `<picture`; the element passes through the byte transform unchanged. |
 | ~~**Structured tables (`<tableParts>`)**~~ | ~~`recordRowEdit` / `recordColEdit` per-sheet `<tableParts` scan~~ | ~~`RowEditUnsafeForSheet` / `ColEditUnsafeForSheet`~~ | ✅ **Lifted 2026-05-14** (iter tbl-1). New `pkg/table_edit.zig` walks each `xl/tables/tableN.xml` referenced from the sheet's `<tableParts>` block (resolved through sheet rels). Shifts `<table ref>`, inner `<autoFilter ref>` (delegated to `sheet_edit.processAutoFilterTagCol`/`Row`, including `<filterColumn colId>` rebase), and inner `<sortState ref>` — closing the prior autoFilter caveat. On col edits, drops the matching `<tableColumn>` on a delete and adds a synthetic `<tableColumn id="max+1" name="ColumnN"/>` on an insert; `<tableColumns count=>` updates accordingly. Wired through `Workbook.applyTableEditsForSheet`. Editor pre-flight via `Workbook.preflightTableEditsForSheet` dry-runs the transform per table part BEFORE any sheet bytes are mutated, so the all-or-nothing contract holds. v1 limitations (still refused — schema-invalid table states, not unrewritten ones): row-delete on the table's header row → `TableHeaderRowDeleteUnsafe` (always when `headerRowCount >= 1`, the default); delete that would collapse the range to zero columns or zero rows → `TableCollapseUnsafe`; both surface as `RowEditUnsafeForSheet` / `ColEditUnsafeForSheet` to Editor callers. `<extLst>` table extensions pass through verbatim; `totalsRowCount > 0` BR-row deletes are not refused (lossy — let Excel recompute). 12 pure-function tests + 5 Editor round-trip tests pin the lift. New typed errors: `MalformedTableXml`, `TableCoordinateOverflow`, `TableCollapseUnsafe`, `TableHeaderRowDeleteUnsafe`. |
 | **Pivots** | _no scan; refused at consumer level_ | _n/a_ | Pivot caches (`xl/pivotCache/*`) and pivot tables (`xl/pivotTables/pivotN.xml`) carry their own cross-part graph. zlsx's writer never emits pivots; this row exists for completeness only. Lifting is a separate axis from `<tableParts>` (different element + different ref graph) and stays out of v1. |
-| ~~**autoFilter**~~ | ~~`recordRowEdit` / `recordColEdit` per-sheet `<autoFilter` scan~~ | ~~`RowEditUnsafeForSheet` / `ColEditUnsafeForSheet`~~ | ✅ **Lifted 2026-05-14**. `pkg/sheet_edit.zig` now shifts the row/col halves of `<autoFilter ref="…">` during the byte transform, drops the entire element on full-range collapse (delete that wipes the only row or only column the range covers), and walks `<filterColumn colId="N">` children for col edits — `colId` is a 0-based offset within the autoFilter range, so survivors rebase to `new_abs - new_tl_col` and the filterColumn at the deleted column is dropped entirely. Editor's row+col refusal guards no longer scan for `<autoFilter`. Caveat: nested `<sortState ref="…">` carries its own range that isn't yet rewritten — third-party files with sortState inside autoFilter will silently miscompute on row/col edits. zlsx's own writer never emits open-form autoFilter or sortState. |
+| ~~**autoFilter**~~ | ~~`recordRowEdit` / `recordColEdit` per-sheet `<autoFilter` scan~~ | ~~`RowEditUnsafeForSheet` / `ColEditUnsafeForSheet`~~ | ✅ **Lifted 2026-05-14**. `pkg/sheet_edit.zig` now shifts the row/col halves of `<autoFilter ref="…">` during the byte transform, drops the entire element on full-range collapse (delete that wipes the only row or only column the range covers), and walks `<filterColumn colId="N">` children for col edits — `colId` is a 0-based offset within the autoFilter range, so survivors rebase to `new_abs - new_tl_col` and the filterColumn at the deleted column is dropped entirely. Editor's row+col refusal guards no longer scan for `<autoFilter`. ~~Caveat: nested `<sortState ref="…">` carries its own range that isn't yet rewritten.~~ **Closed 2026-07-26 (iter-sv-1)** — `<sortState ref>` and `<sortCondition ref>` are rewritten in every context (sheet-bare, autoFilter-nested, table-nested), from one implementation in `sheet_edit.zig` that `table_edit.zig` delegates to. |
 | ~~**Frozen panes**~~ | ~~`recordColEdit` per-sheet `<pane ` scan~~ | ~~`ColEditUnsafeForSheet`~~ | ✅ **Lifted 2026-05-11**. `pkg/sheet_edit.zig` now shifts `xSplit`/`ySplit` + `topLeftCell` for `state="frozen"` / `state="frozenSplit"` panes during the byte transform. `state="split"` (or absent state, OOXML default = split) carries pixel offsets and surfaces `error.SplitPaneNotSupported`. Editor's row+col refusal guards no longer scan for `<pane>`. |
 | **`deleteSheet` on a single-sheet workbook** | `Workbook.deleteSheet` via `Editor.deleteSheet` | `LastSheetUndeletable` (in `pkg/workbook.Error`) | Excel rejects the file on open if the workbook has zero sheets. Ergonomic refusal — stays. |
 
@@ -129,6 +129,47 @@ pre-flight (`pkg/editor.zig` remaps `TableCollapseUnsafe` /
 `TableCoordinateOverflow` into them). The drawing / pane /
 autoFilter axes lift via dedicated typed errors and no longer
 surface the umbrella names.
+
+## The other failure mode: silently unhandled coordinates
+
+Everything above is about **refusals** — cases where the Editor
+correctly declines an edit it cannot perform safely. A refusal is
+loud, and the user can act on it.
+
+There is a second, worse class: a coordinate-bearing attribute that
+is neither rewritten nor refused, so the edit "succeeds" and leaves
+the attribute pointing at the wrong cells. Nothing surfaces. This is
+the exact outcome the north star exists to prevent — *"every row/col
+edit either rewrites all coordinate-bearing parts correctly or
+refuses with a typed error."*
+
+Four were found and closed in iter-sv-1 (2026-07-26):
+
+| Element | What went stale | Reached via |
+|---|---|---|
+| `<sheetView topLeftCell>` | the view's scroll anchor | every scrolled Excel-authored sheet |
+| `<selection activeCell/sqref>` | the saved selection, incl. multi-range `sqref` lists | essentially every Excel-authored sheet |
+| `<sortState ref>` | the sorted range, sheet-bare and autoFilter-nested | third-party files |
+| `<sortCondition ref>` | the sort key range | **also inside `<table>`** — already-shipped code |
+
+The last one is the notable finding: `<sortCondition>` was unrewritten
+even on the structured-tables path that shipped in #111, whose own
+test asserted the parent `<sortState>` shifted but never checked the
+child. A test that pins the parent and ignores the child is how this
+class survives review.
+
+None of these were refused, and zlsx's own writer emits none of them —
+which is why they stayed invisible. They only bite on
+**load-modify-save of third-party files**, which is the product's
+primary use case.
+
+**Method note for future audits.** The refusal list is derived from
+what the Editor *scans for*. This class is invisible to that method by
+construction: there is no guard to enumerate. Finding these needed the
+inverse question — for each coordinate-bearing element in
+CT_Worksheet, does a rewriter dispatch on it? The remaining unaudited
+surface by that question is `<extLst>` blocks (`x14:`/`x15:`
+extensions), which pass through verbatim everywhere.
 
 ## What this audit explicitly does NOT do
 

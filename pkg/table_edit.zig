@@ -139,7 +139,18 @@ pub fn applyEditToTable(
                 .row => try sheet_edit.processAutoFilterTagRow(allocator, &out, src, t, idx_1based, ek, &i),
             }
         } else if (sheet_edit.matchTagAt(src, i, "sortState")) |t| {
-            try processSortStateTag(allocator, &out, src, t, axis, idx_1based, ek, &i);
+            // Delegate, same as autoFilter above: one sortState
+            // implementation serves the table, sheet-bare and
+            // autoFilter-nested contexts.
+            switch (axis) {
+                .col => try sheet_edit.processSortStateTagCol(allocator, &out, src, t, idx_1based, ek, &i),
+                .row => try sheet_edit.processSortStateTagRow(allocator, &out, src, t, idx_1based, ek, &i),
+            }
+        } else if (sheet_edit.matchTagAt(src, i, "sortCondition")) |t| {
+            switch (axis) {
+                .col => try sheet_edit.processSortConditionTagCol(allocator, &out, src, t, idx_1based, ek, &i),
+                .row => try sheet_edit.processSortConditionTagRow(allocator, &out, src, t, idx_1based, ek, &i),
+            }
         } else if (sheet_edit.matchTagAt(src, i, "tableColumns")) |t| {
             if (axis == .col) {
                 try processTableColumnsForCol(allocator, &out, src, t, hdr, idx_1based, kind, &i);
@@ -358,102 +369,6 @@ fn formatColLettersLocal(buf: *[8]u8, col_1based: u32) ![]const u8 {
     const len = tmp.len - pos;
     @memcpy(buf[0..len], tmp[pos..]);
     return buf[0..len];
-}
-
-fn processSortStateTag(
-    allocator: Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    src: []const u8,
-    t: TagOpen,
-    axis: Axis,
-    idx_1based: u32,
-    kind: sheet_edit.RowEditKind,
-    i: *usize,
-) !void {
-    const attrs_full = src[t.start + "<sortState".len .. t.after_open - 1];
-    const trimmed = std.mem.trimEnd(u8, attrs_full, " \t\r\n");
-    const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
-    const attrs_for_lookup = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
-    const r_attr = getAttr(attrs_for_lookup, "ref");
-    if (r_attr == null) {
-        try out.appendSlice(allocator, src[t.start..t.after_open]);
-        i.* = t.after_open;
-        return;
-    }
-    const ref = r_attr.?;
-    const colon = std.mem.indexOfScalar(u8, ref, ':');
-
-    // Capture bounds on the edited axis to decide drop-vs-shift.
-    var old_tl: u32 = 0;
-    var old_br: u32 = 0;
-    switch (axis) {
-        .col => if (colon) |c| {
-            old_tl = sheet_edit.parseColFromA1(ref[0..c]) orelse 0;
-            old_br = sheet_edit.parseColFromA1(ref[c + 1 ..]) orelse 0;
-        } else {
-            old_tl = sheet_edit.parseColFromA1(ref) orelse 0;
-            old_br = old_tl;
-        },
-        .row => if (colon) |c| {
-            old_tl = sheet_edit.parseRowFromA1(ref[0..c]) orelse 0;
-            old_br = sheet_edit.parseRowFromA1(ref[c + 1 ..]) orelse 0;
-        } else {
-            old_tl = sheet_edit.parseRowFromA1(ref) orelse 0;
-            old_br = old_tl;
-        },
-    }
-
-    // Full-range collapse: drop the entire sortState (mirrors
-    // sheet_edit's autoFilter drop-on-collapse). The sortState's
-    // body (sortCondition children) goes with it.
-    const drop_entire =
-        kind == .delete and old_tl == idx_1based and old_br == idx_1based and old_tl != 0;
-    if (drop_entire) {
-        if (is_self_closing) {
-            i.* = t.after_open;
-        } else {
-            const close = std.mem.indexOfPos(u8, src, t.after_open, "</sortState>") orelse t.after_open;
-            i.* = if (close + "</sortState>".len <= src.len) close + "</sortState>".len else t.after_open;
-        }
-        return;
-    }
-
-    // Compute new ref via the axis-appropriate shifter.
-    var tl_buf: [16]u8 = undefined;
-    var br_buf: [16]u8 = undefined;
-    var new_ref_buf: [40]u8 = undefined;
-    var new_ref: []const u8 = ref;
-    if (colon) |c| {
-        const tl_new = shiftHalf(ref[0..c], axis, idx_1based, kind, &tl_buf, false) catch {
-            try out.appendSlice(allocator, src[t.start..t.after_open]);
-            i.* = t.after_open;
-            return;
-        };
-        const br_new = shiftHalf(ref[c + 1 ..], axis, idx_1based, kind, &br_buf, true) catch {
-            try out.appendSlice(allocator, src[t.start..t.after_open]);
-            i.* = t.after_open;
-            return;
-        };
-        new_ref = std.fmt.bufPrint(&new_ref_buf, "{s}:{s}", .{ tl_new, br_new }) catch {
-            try out.appendSlice(allocator, src[t.start..t.after_open]);
-            i.* = t.after_open;
-            return;
-        };
-    } else {
-        const shifted = shiftHalf(ref, axis, idx_1based, kind, &tl_buf, false) catch {
-            try out.appendSlice(allocator, src[t.start..t.after_open]);
-            i.* = t.after_open;
-            return;
-        };
-        @memcpy(new_ref_buf[0..shifted.len], shifted);
-        new_ref = new_ref_buf[0..shifted.len];
-    }
-    if (std.mem.eql(u8, ref, new_ref)) {
-        try out.appendSlice(allocator, src[t.start..t.after_open]);
-    } else {
-        try sheet_edit.writeWithReplacedAttr(allocator, out, src, t, "<sortState".len, "ref", new_ref);
-    }
-    i.* = t.after_open;
 }
 
 /// Wrapper that picks the right axis-specific shifter. Keeps the
@@ -836,6 +751,20 @@ test "sortState ref shifts in step" {
     // tl_row 1, br_row 5 → insert at 1 → tl 2, br 6.
     try testing.expect(std.mem.indexOf(u8, out, "<table id=\"1\" ref=\"A2:C6\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "<sortState ref=\"A3:C6\"") != null);
+}
+
+test "sortCondition ref shifts with its parent sortState" {
+    const a = testing.allocator;
+    const with_sort =
+        \\<?xml version="1.0"?>
+        \\<table id="1" ref="A1:C5"><autoFilter ref="A1:C5"><filterColumn colId="0"/></autoFilter><sortState ref="A2:C5"><sortCondition ref="A2:A5"/></sortState><tableColumns count="3"><tableColumn id="1" name="x"/><tableColumn id="2" name="y"/><tableColumn id="3" name="z"/></tableColumns></table>
+    ;
+    const out = try applyEditToTable(a, with_sort, .row, 1, .insert);
+    defer a.free(out);
+    // The parent shifts A2:C5 → A3:C6, so the child sort key must
+    // shift A2:A5 → A3:A6 in step. Leaving it behind points the sort
+    // at the wrong rows with no error surfaced.
+    try testing.expect(std.mem.indexOf(u8, out, "<sortCondition ref=\"A3:A6\"") != null);
 }
 
 test "edits outside table range pass through" {

@@ -5,6 +5,13 @@
 //! `deleteColumn`). Lifted out of `pkg/editor.zig` verbatim — the
 //! XML walker is unchanged; only its visibility moves.
 //!
+//! Coordinate-bearing elements handled here: `<row r>`, `<c r>`,
+//! `<col min/max>`, `<mergeCell ref>`, `<dimension ref>`,
+//! `<pane xSplit/ySplit/topLeftCell>`, `<autoFilter ref>` +
+//! `<filterColumn colId>`, `<sheetView topLeftCell>`,
+//! `<selection activeCell/sqref>`, `<sortState ref>` and
+//! `<sortCondition ref>`.
+//!
 //! Both `applyRowEditToWorksheet` and `applyColEditToWorksheet`
 //! take the source sheet XML bytes and an edit kind, and return a
 //! freshly-allocated buffer with the row/col attributes shifted in
@@ -66,6 +73,16 @@ pub fn applyColEditToWorksheet(
             i = t.after_open;
         } else if (matchTagAt(src, i, "autoFilter")) |t| {
             try processAutoFilterTagCol(allocator, &out, src, t, col_1based, kind, &i);
+        } else if (matchTagAt(src, i, "sheetView")) |t| {
+            try processSheetViewTagCol(allocator, &out, src, t, col_1based, kind);
+            i = t.after_open;
+        } else if (matchTagAt(src, i, "selection")) |t| {
+            try processSelectionTagCol(allocator, &out, src, t, col_1based, kind);
+            i = t.after_open;
+        } else if (matchTagAt(src, i, "sortState")) |t| {
+            try processSortStateTagCol(allocator, &out, src, t, col_1based, kind, &i);
+        } else if (matchTagAt(src, i, "sortCondition")) |t| {
+            try processSortConditionTagCol(allocator, &out, src, t, col_1based, kind, &i);
         } else {
             try out.append(allocator, '<');
             i += 1;
@@ -360,13 +377,11 @@ fn processMergeCellTagCol(
 /// On range collapse (single-column filter where that column is
 /// deleted), the entire `<autoFilter>` is dropped.
 ///
-/// Caveat: nested `<sortState ref="…">` is not rewritten when the
-/// `<autoFilter>` is sheet-bare (open form). When this function is
-/// delegated to from `pkg/table_edit.zig` for an `<autoFilter>`
-/// inside a `<table>`, sortState IS handled — by table_edit's outer
-/// walker, which intercepts `<sortState>` siblings independently.
-/// zlsx's writer never emits open-form sheet-bare autoFilter, so
-/// the remaining caveat only matters for third-party files.
+/// Nested `<sortState ref="…">` and its `<sortCondition ref="…">`
+/// children are rewritten too (iter-sv-1), closing the caveat this
+/// comment used to carry. One implementation covers all three
+/// contexts — sheet-bare, autoFilter-nested, and table-nested (which
+/// `pkg/table_edit.zig` reaches by delegating here).
 pub fn processAutoFilterTagCol(
     allocator: Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -504,6 +519,14 @@ pub fn processAutoFilterTagCol(
                 close_pos,
                 &j,
             );
+        } else if (matchTagAt(src, j, "sortState")) |st| {
+            // Only the column walker consumes autoFilter children, so
+            // a nested sortState never reaches the top-level dispatch
+            // on this axis and has to be handled here. (The row walker
+            // stops at the open tag, so its children fall through.)
+            try processSortStateTagCol(allocator, out, src, st, col_1based, kind, &j);
+        } else if (matchTagAt(src, j, "sortCondition")) |sc| {
+            try processSortConditionTagCol(allocator, out, src, sc, col_1based, kind, &j);
         } else {
             try out.append(allocator, '<');
             j += 1;
@@ -773,6 +796,16 @@ pub fn applyRowEditToWorksheet(
             i = t.after_open;
         } else if (matchTagAt(src, i, "autoFilter")) |t| {
             try processAutoFilterTagRow(allocator, &out, src, t, row, kind, &i);
+        } else if (matchTagAt(src, i, "sheetView")) |t| {
+            try processSheetViewTagRow(allocator, &out, src, t, row, kind);
+            i = t.after_open;
+        } else if (matchTagAt(src, i, "selection")) |t| {
+            try processSelectionTagRow(allocator, &out, src, t, row, kind);
+            i = t.after_open;
+        } else if (matchTagAt(src, i, "sortState")) |t| {
+            try processSortStateTagRow(allocator, &out, src, t, row, kind, &i);
+        } else if (matchTagAt(src, i, "sortCondition")) |t| {
+            try processSortConditionTagRow(allocator, &out, src, t, row, kind, &i);
         } else {
             // Some other tag; emit `<` and continue past it.
             try out.append(allocator, '<');
@@ -1342,6 +1375,388 @@ fn paneStateIsFrozen(attrs: []const u8) bool {
     return std.mem.eql(u8, s, "frozen") or std.mem.eql(u8, s, "frozenSplit");
 }
 
+/// Axis selector for the handlers that share one implementation
+/// across row and column edits.
+///
+/// The older handlers in this file predate it and come as explicit
+/// `…TagRow` / `…TagCol` pairs. The newer ones below keep that public
+/// shape — the two dispatch loops stay branch-free — but back it with
+/// a single axis-generic body, because the row and column logic for
+/// these elements differs only in which A1 component moves.
+pub const Axis = enum { row, col };
+
+fn shiftHalfOnAxis(
+    ref: []const u8,
+    axis: Axis,
+    idx_1based: u32,
+    kind: RowEditKind,
+    buf: *[16]u8,
+    is_br_corner: bool,
+) ![]const u8 {
+    return switch (axis) {
+        .row => shiftSingleA1Row(ref, idx_1based, kind, buf, is_br_corner),
+        .col => shiftSingleA1Col(ref, idx_1based, kind, buf, is_br_corner),
+    };
+}
+
+fn parseOnAxis(ref: []const u8, axis: Axis) ?u32 {
+    return switch (axis) {
+        .row => parseRowFromA1(ref),
+        .col => parseColFromA1(ref),
+    };
+}
+
+/// Shift a single A1 ref (`B5`) or an `A1:B2` range along `axis`.
+///
+/// Returns `null` when the range **collapses** — a delete whose target
+/// is the only row/column the range spans on that axis, leaving
+/// nothing for it to point at. Callers decide what a collapse means
+/// for their element: `<sortState>` drops entirely, an `sqref` entry
+/// is dropped from the list.
+///
+/// Result borrows from `out_buf`.
+fn shiftRefOrRange(
+    ref: []const u8,
+    axis: Axis,
+    idx_1based: u32,
+    kind: RowEditKind,
+    out_buf: *[40]u8,
+) !?[]const u8 {
+    var tl_buf: [16]u8 = undefined;
+    var br_buf: [16]u8 = undefined;
+
+    if (std.mem.indexOfScalar(u8, ref, ':')) |c| {
+        const tl_old = parseOnAxis(ref[0..c], axis) orelse 0;
+        const br_old = parseOnAxis(ref[c + 1 ..], axis) orelse 0;
+        if (kind == .delete and tl_old != 0 and tl_old == idx_1based and br_old == idx_1based) return null;
+        const tl_new = try shiftHalfOnAxis(ref[0..c], axis, idx_1based, kind, &tl_buf, false);
+        const br_new = try shiftHalfOnAxis(ref[c + 1 ..], axis, idx_1based, kind, &br_buf, true);
+        return try std.fmt.bufPrint(out_buf, "{s}:{s}", .{ tl_new, br_new });
+    }
+
+    const old = parseOnAxis(ref, axis) orelse 0;
+    if (kind == .delete and old != 0 and old == idx_1based) return null;
+    const shifted = try shiftHalfOnAxis(ref, axis, idx_1based, kind, &tl_buf, false);
+    @memcpy(out_buf[0..shifted.len], shifted);
+    return out_buf[0..shifted.len];
+}
+
+/// Rewrite `<sheetView topLeftCell="…">` — the scroll anchor of the
+/// view, distinct from the `<pane topLeftCell>` handled above.
+///
+/// A scroll anchor never collapses. Deleting the very row/column it
+/// names does not orphan it: whatever slides into that position
+/// becomes the new top-left, which is exactly the behaviour a reader
+/// expects, so the index is held rather than pulled back. That is why
+/// this passes `is_br_corner = false` and ignores the collapse path.
+fn processSheetViewTag(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    axis: Axis,
+    idx_1based: u32,
+    kind: RowEditKind,
+) !void {
+    const attrs = src[t.start + "<sheetView".len .. t.after_open - 1];
+    const tl = getAttr(attrs, "topLeftCell") orelse {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    };
+    var buf: [16]u8 = undefined;
+    const shifted = shiftHalfOnAxis(tl, axis, idx_1based, kind, &buf, false) catch {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    };
+    if (std.mem.eql(u8, shifted, tl)) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    }
+    try writeWithReplacedAttr(allocator, out, src, t, "<sheetView".len, "topLeftCell", shifted);
+}
+
+pub fn processSheetViewTagCol(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    col_1based: u32,
+    kind: RowEditKind,
+) !void {
+    return processSheetViewTag(allocator, out, src, t, .col, col_1based, kind);
+}
+
+pub fn processSheetViewTagRow(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    row: u32,
+    kind: RowEditKind,
+) !void {
+    return processSheetViewTag(allocator, out, src, t, .row, row, kind);
+}
+
+/// Rewrite `<selection activeCell="B5" sqref="B5 D1:D9"/>`.
+///
+/// `sqref` is a space-separated list of refs and ranges (ECMA-376
+/// §18.3.1.78), so each entry shifts independently and an entry whose
+/// range collapses is dropped from the list.
+///
+/// `activeCell` is an anchor, not a data reference, and gets the same
+/// hold-the-index treatment as `topLeftCell`. If every `sqref` entry
+/// collapses the element is kept but its `sqref` falls back to the
+/// active cell (or `A1`): selection is pure view state, so any
+/// schema-valid value is correct, and rewriting an attribute is safer
+/// than excising an element mid-walk.
+fn processSelectionTag(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    axis: Axis,
+    idx_1based: u32,
+    kind: RowEditKind,
+) !void {
+    const attrs = src[t.start + "<selection".len .. t.after_open - 1];
+
+    var active_buf: [16]u8 = undefined;
+    var new_active: ?[]const u8 = null;
+    if (getAttr(attrs, "activeCell")) |ac| {
+        new_active = shiftHalfOnAxis(ac, axis, idx_1based, kind, &active_buf, false) catch {
+            try out.appendSlice(allocator, src[t.start..t.after_open]);
+            return;
+        };
+    }
+
+    const sqref = getAttr(attrs, "sqref");
+    var sq_out: std.ArrayListUnmanaged(u8) = .empty;
+    defer sq_out.deinit(allocator);
+    if (sqref) |sq| {
+        var it = std.mem.tokenizeAny(u8, sq, " \t\r\n");
+        while (it.next()) |entry| {
+            var ent_buf: [40]u8 = undefined;
+            const shifted = shiftRefOrRange(entry, axis, idx_1based, kind, &ent_buf) catch {
+                try out.appendSlice(allocator, src[t.start..t.after_open]);
+                return;
+            };
+            const keep = shifted orelse continue; // collapsed — drop this entry
+            if (sq_out.items.len > 0) try sq_out.append(allocator, ' ');
+            try sq_out.appendSlice(allocator, keep);
+        }
+        if (sq_out.items.len == 0) {
+            try sq_out.appendSlice(allocator, new_active orelse "A1");
+        }
+    }
+
+    var subs: [2]AttrSub = undefined;
+    var n_subs: usize = 0;
+    if (new_active) |na| {
+        if (!std.mem.eql(u8, na, getAttr(attrs, "activeCell").?)) {
+            subs[n_subs] = .{ .name = "activeCell", .new_value = na };
+            n_subs += 1;
+        }
+    }
+    if (sqref) |sq| {
+        if (!std.mem.eql(u8, sq_out.items, sq)) {
+            subs[n_subs] = .{ .name = "sqref", .new_value = sq_out.items };
+            n_subs += 1;
+        }
+    }
+
+    if (n_subs == 0) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    }
+    try writeWithReplacedAttrs(allocator, out, src, t, "<selection".len, subs[0..n_subs]);
+}
+
+pub fn processSelectionTagCol(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    col_1based: u32,
+    kind: RowEditKind,
+) !void {
+    return processSelectionTag(allocator, out, src, t, .col, col_1based, kind);
+}
+
+pub fn processSelectionTagRow(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    row: u32,
+    kind: RowEditKind,
+) !void {
+    return processSelectionTag(allocator, out, src, t, .row, row, kind);
+}
+
+/// Rewrite `<sortState ref="…">` and drop it whole when its range
+/// collapses (the body's `<sortCondition>` children go with it).
+///
+/// This is the single implementation for both contexts: sheet-bare
+/// `<sortState>`, `<sortState>` nested inside an open-form
+/// `<autoFilter>`, and `<sortState>` inside a `<table>` — which
+/// `pkg/table_edit.zig` reaches by delegating here, the same way it
+/// already delegates `<autoFilter>`.
+fn processSortStateTag(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    axis: Axis,
+    idx_1based: u32,
+    kind: RowEditKind,
+    i: *usize,
+) !void {
+    const attrs_full = src[t.start + "<sortState".len .. t.after_open - 1];
+    const trimmed = std.mem.trimEnd(u8, attrs_full, " \t\r\n");
+    const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
+    const attrs = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
+
+    const ref = getAttr(attrs, "ref") orelse {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        i.* = t.after_open;
+        return;
+    };
+
+    var buf: [40]u8 = undefined;
+    const shifted = shiftRefOrRange(ref, axis, idx_1based, kind, &buf) catch {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        i.* = t.after_open;
+        return;
+    };
+
+    if (shifted == null) {
+        // Collapsed: drop the open tag, the body, and the close tag.
+        if (is_self_closing) {
+            i.* = t.after_open;
+        } else {
+            const close = std.mem.indexOfPos(u8, src, t.after_open, "</sortState>") orelse {
+                i.* = t.after_open;
+                return;
+            };
+            i.* = close + "</sortState>".len;
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, ref, shifted.?)) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+    } else {
+        try writeWithReplacedAttr(allocator, out, src, t, "<sortState".len, "ref", shifted.?);
+    }
+    // Children are left to the caller's walker, which dispatches
+    // `<sortCondition>` as a sibling tag.
+    i.* = t.after_open;
+}
+
+pub fn processSortStateTagCol(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    col_1based: u32,
+    kind: RowEditKind,
+    i: *usize,
+) !void {
+    return processSortStateTag(allocator, out, src, t, .col, col_1based, kind, i);
+}
+
+pub fn processSortStateTagRow(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    row: u32,
+    kind: RowEditKind,
+    i: *usize,
+) !void {
+    return processSortStateTag(allocator, out, src, t, .row, row, kind, i);
+}
+
+/// Rewrite `<sortCondition ref="…">`, the sort key range inside a
+/// `<sortState>`. It must move in step with its parent — a parent
+/// that shifts while the key stays behind sorts on the wrong cells,
+/// with no error surfaced anywhere.
+///
+/// A collapsed key range drops the condition; the parent `<sortState>`
+/// survives, since its own range may still span other columns.
+fn processSortConditionTag(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    axis: Axis,
+    idx_1based: u32,
+    kind: RowEditKind,
+    i: *usize,
+) !void {
+    const attrs_full = src[t.start + "<sortCondition".len .. t.after_open - 1];
+    const trimmed = std.mem.trimEnd(u8, attrs_full, " \t\r\n");
+    const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
+    const attrs = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
+
+    const ref = getAttr(attrs, "ref") orelse {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        i.* = t.after_open;
+        return;
+    };
+
+    var buf: [40]u8 = undefined;
+    const shifted = shiftRefOrRange(ref, axis, idx_1based, kind, &buf) catch {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        i.* = t.after_open;
+        return;
+    };
+
+    if (shifted == null) {
+        if (is_self_closing) {
+            i.* = t.after_open;
+        } else {
+            const close = std.mem.indexOfPos(u8, src, t.after_open, "</sortCondition>") orelse {
+                i.* = t.after_open;
+                return;
+            };
+            i.* = close + "</sortCondition>".len;
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, ref, shifted.?)) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+    } else {
+        try writeWithReplacedAttr(allocator, out, src, t, "<sortCondition".len, "ref", shifted.?);
+    }
+    i.* = t.after_open;
+}
+
+pub fn processSortConditionTagCol(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    col_1based: u32,
+    kind: RowEditKind,
+    i: *usize,
+) !void {
+    return processSortConditionTag(allocator, out, src, t, .col, col_1based, kind, i);
+}
+
+pub fn processSortConditionTagRow(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    row: u32,
+    kind: RowEditKind,
+    i: *usize,
+) !void {
+    return processSortConditionTag(allocator, out, src, t, .row, row, kind, i);
+}
+
 const AttrSub = struct {
     name: []const u8,
     new_value: []const u8,
@@ -1600,4 +2015,137 @@ test "autoFilter passes through when ref attribute is missing" {
     const out = try applyRowEditToWorksheet(a, src, 1, .insert);
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "<autoFilter/>") != null);
+}
+
+// ─── iter-sv-1: sheetView / selection / sortState coordinate attrs ──
+//
+// Each of these carries a coordinate that row/col edits used to leave
+// behind. None of them surfaced an error when they went stale — the
+// workbook just quietly pointed somewhere wrong, which is the failure
+// mode the library exists to prevent.
+
+test "sheetView topLeftCell shifts on row insert" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<sheetViews><sheetView topLeftCell=\"B5\" workbookViewId=\"0\"/></sheetViews>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 2, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "topLeftCell=\"B6\"") != null);
+}
+
+test "sheetView topLeftCell shifts on col insert" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<sheetViews><sheetView topLeftCell=\"C1\" workbookViewId=\"0\"/></sheetViews>");
+    defer a.free(src);
+    const out = try applyColEditToWorksheet(a, src, 2, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "topLeftCell=\"D1\"") != null);
+}
+
+test "sheetView topLeftCell holds its index when its own row is deleted" {
+    const a = testing.allocator;
+    // A scroll anchor does not collapse: whatever slides into row 5
+    // becomes the new top-left, so the index stays put.
+    const src = try wrapSheet(a, "<sheetViews><sheetView topLeftCell=\"B5\"/></sheetViews>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 5, .delete);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "topLeftCell=\"B5\"") != null);
+}
+
+test "sheetViews container is not mistaken for sheetView" {
+    const a = testing.allocator;
+    // `<sheetViews>` shares a prefix with `<sheetView>`; matchTagAt's
+    // delimiter check is what keeps them apart. Guard it explicitly.
+    const src = try wrapSheet(a, "<sheetViews><sheetView topLeftCell=\"A9\"/></sheetViews>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 1, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<sheetViews>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "</sheetViews>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "topLeftCell=\"A10\"") != null);
+}
+
+test "selection activeCell and sqref both shift" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<selection activeCell=\"B5\" sqref=\"B5\"/>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 2, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "activeCell=\"B6\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "sqref=\"B6\"") != null);
+}
+
+test "selection sqref shifts every entry of a multi-range list" {
+    const a = testing.allocator;
+    // sqref is a space-separated list (ECMA-376 18.3.1.78).
+    const src = try wrapSheet(a, "<selection activeCell=\"A2\" sqref=\"A2 C4:D6 F8\"/>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 1, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "sqref=\"A3 C5:D7 F9\"") != null);
+}
+
+test "selection sqref drops only the entry whose range collapses" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<selection activeCell=\"A1\" sqref=\"A1 C3:D3 F8\"/>");
+    defer a.free(src);
+    // Row 3 delete collapses C3:D3; the siblings survive and shift.
+    const out = try applyRowEditToWorksheet(a, src, 3, .delete);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "sqref=\"A1 F7\"") != null);
+}
+
+test "selection falls back to activeCell when every sqref entry collapses" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<selection activeCell=\"C3\" sqref=\"C3:D3\"/>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 3, .delete);
+    defer a.free(out);
+    // Selection is view state, so any schema-valid sqref is correct;
+    // rewriting the attribute beats excising the element mid-walk.
+    try testing.expect(std.mem.indexOf(u8, out, "sqref=\"C3\"") != null);
+}
+
+test "sheet-bare sortState ref shifts" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<sortState ref=\"A2:D10\"/>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 1, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "ref=\"A3:D11\"") != null);
+}
+
+test "sheet-bare sortState drops with its body on range collapse" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<sortState ref=\"A4:D4\"><sortCondition ref=\"A4:A4\"/></sortState>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 4, .delete);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "sortState") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "sortCondition") == null);
+}
+
+test "sortCondition shifts in step with its parent sortState" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<sortState ref=\"A2:D10\"><sortCondition ref=\"B2:B10\"/></sortState>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 1, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<sortState ref=\"A3:D11\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<sortCondition ref=\"B3:B11\"") != null);
+}
+
+test "sortState nested in open-form autoFilter shifts on a col edit" {
+    const a = testing.allocator;
+    // The column walker consumes autoFilter children, so this path
+    // reaches sortState only via the dispatch added inside that
+    // walker — the row axis exercises the top-level dispatch instead.
+    const src = try wrapSheet(a, "<autoFilter ref=\"A1:E10\"><sortState ref=\"B2:D10\"><sortCondition ref=\"C2:C10\"/></sortState></autoFilter>");
+    defer a.free(src);
+    const out = try applyColEditToWorksheet(a, src, 1, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<autoFilter ref=\"B1:F10\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<sortState ref=\"C2:E10\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<sortCondition ref=\"D2:D10\"") != null);
 }
