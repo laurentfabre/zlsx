@@ -183,6 +183,14 @@ This does not block the *harness* or the writer — both are correct. It blocks 
 the compat bar "green," and should be reconciled in `embeddings-in-xlsx.md` (§Goals.0
 compat set) before the binding/CLI slices.
 
+> **Followed up by emb-4B (2026-07-26).** The "or add a recompute-from-source path"
+> option above needs somewhere durable to record *that* a strip happened.
+> `docs/plans/emb-4b-carrier-matrix.md` measures six carriers against the same
+> rebuilding consumers and finds three that survive them — `docProps/custom.xml`,
+> cell data, and `<definedName>`. So the recovery-record option is real rather than
+> hypothetical. Note that `<extLst>`, the ECMA-sanctioned extension point, is *not*
+> among them: it is stripped by both openpyxl and LibreOffice.
+
 ---
 
 ## What to do on failure
