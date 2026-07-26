@@ -30,10 +30,24 @@ name: Fuzz Nightly
 # Fuzzing genuinely runs now, so this job is a real gate again: a crash
 # turns it red. Do NOT reintroduce a blanket "warn and exit 0" branch.
 #
-# Linux only: Zig 0.16.0's fuzz support is additionally broken on
-# Windows (shared-memory + COFF/PE debug-info gaps) and macOS
-# (Mach-O addEntryPoint crash). When upstream lands fixes, add
-# matrix entries here.
+# PLATFORM: macOS, not Linux — and that is a deliberate inversion.
+#
+# This job ran on ubuntu-22.04 because under 0.15 macOS fuzzing was the
+# broken one (Mach-O `addEntryPoint`). On 0.16.0 the reverse is true,
+# verified both ways:
+#
+#   * macOS 0.16.0 runs a full session cleanly, no panics, and writes
+#     fuzzer corpus/coverage state under `.zig-cache/v/`.
+#   * ubuntu-22.04 0.16.0 compiles and runs the tests, then the BUILD
+#     RUNNER panics in `std/Build/Fuzz.zig:477 addEntryPoint`
+#     ("start index 1 is larger than end index 0") while collecting
+#     coverage. That is in the build system, not the test binary, so
+#     unlike the two runner bugs it cannot be patched from here.
+#
+# Linux x64 remains the intended long-term home; switch back the moment
+# a Zig release fixes that panic. A permanently-red Linux job was NOT
+# added alongside — that is precisely the no-signal noise this workflow
+# just escaped.
 #
 # Cost note: zlsx is a public repo so Actions minutes are free.
 # A single nightly run sized to fuzz_duration_seconds is well
@@ -55,8 +69,8 @@ permissions:
 
 jobs:
   fuzz:
-    name: fuzz / ubuntu-22.04 (Linux x64)
-    runs-on: ubuntu-22.04
+    name: fuzz / macos-14
+    runs-on: macos-14
     # Hard ceiling: regardless of input duration, never let a
     # single run exceed 90 min. Catches a runaway fuzzer trapped
     # in an instrumentation pathology before it eats the day's
