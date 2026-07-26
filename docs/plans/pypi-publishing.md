@@ -1,7 +1,20 @@
-# PyPI publishing — one manual step is outstanding
+# PyPI publishing — deferred by decision
 
-**Status: blocked on a PyPI-side action that only the account owner can
-perform.** Everything on the repository side is correct and verified.
+**Status: DEFERRED (2026-07-26), not blocked-and-forgotten.** The
+remaining step is a PyPI-side action only the account owner can perform,
+and it has been consciously postponed rather than overlooked.
+Everything on the repository side is correct and verified.
+
+Practical consequence: **`pip install py-zlsx` does not work and will
+not until this is done.** The wheels build fine on every release; they
+simply never reach the index. Anyone needing the Python binding installs
+from source in the meantime.
+
+Nothing here needs re-investigating when it is picked up — the values
+below are verified against the current workflow, and the release job
+reminds you at the moment it matters (it preflights on tag push and
+names every field). Do not re-raise it as a discovered problem; it is a
+known, priced decision.
 
 ---
 
