@@ -11,7 +11,7 @@ Two operating modes:
 
   --mode nfc:
     Reads `UnicodeData.txt` + `CompositionExclusions.txt` and emits
-    a vendored Zig data file powering `src/unicode/nfc.zig`.
+    a vendored Zig data file powering `unicode/nfc.zig`.
     Includes:
       - canonical decomposition mappings (UnicodeData col 5,
         excluding `<compat>` prefixed entries);
@@ -30,7 +30,7 @@ Usage:
     scripts/gen_unicode_tables.py --mode nfc \\
         --input /path/to/UnicodeData.txt \\
         --excl /path/to/CompositionExclusions.txt \\
-        --output src/unicode/tables/nfc_data.zig
+        --output unicode/tables/nfc_data.zig
 
 Each generated file pins the Unicode version + SHA-256 of every
 input in its header so re-generation is reproducible.

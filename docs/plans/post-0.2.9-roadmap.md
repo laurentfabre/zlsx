@@ -155,10 +155,19 @@ Public surface added by this batch:
   `PartStore`, `Part`, `Relationship`, `imageAnchors`,
   `ChartAnchor`, `chartAnchors`. Consumable independently of the
   reader/writer surface.
-- `src/unicode/casefold.zig` + `src/unicode/nfc.zig` for the
+- `src/unicode/casefold.zig` + `unicode/nfc.zig` for the
   sheet-name dedup pipeline.
 
-### Known module-graph constraint (Zig 0.15.2)
+### Known module-graph constraint (Zig 0.15.2 — still true on 0.16.0)
+
+> **Re-verified 2026-07-26 against Zig 0.16.0.** A minimal repro (a
+> file relatively imported by one module root while also being another
+> named module's root) still fails with
+> `error: file exists in modules 'root' and 'leafmod'` /
+> `note: files must belong to only one module`. The constraint below is
+> unchanged by the 0.16 migration; `unicode/nfc.zig` lives at top level
+> for exactly this reason — it is imported by `src/unicode/casefold.zig`
+> (the `zlsx` tree) and `pkg/embedding_part.zig` (the `zlsx_pkg` tree).
 
 A `zlsx extract-images` CLI subcommand was attempted as part of
 this batch but reverted. The Zig 0.15 module-graph computation
