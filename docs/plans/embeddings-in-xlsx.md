@@ -9,10 +9,22 @@
 
 ## Status
 
-Design only (2026-05-16). No code yet. Compat matrix (Excel-on-mac,
-Excel-on-Windows, LibreOffice, Numbers) needs to run against a real
-prototype part before any of this lands. Google Sheets is documented
-as a known-stripping consumer, not a preservation target.
+~~Design only (2026-05-16). No code yet.~~
+
+**Updated 2026-07-26.** E1/E2/E3 shipped (#123); the compat matrix ran
+(emb-4) and the carrier matrix ran (emb-4B, #124). The **durability
+contract is decided** — see the section of that name below. It amends
+Goal 2, narrows Goal 3, and changes step 6 of the Staleness model.
+
+Measured, not assumed:
+- **Vectors** survive Excel-mac and zlsx; Numbers and LibreOffice strip
+  them. Excel-for-Windows is still unrun (`E4W`).
+- **A recovery record** survives every rebuilder measured so far, in a
+  hidden `<definedName>` (primary) and `docProps/custom.xml`
+  (secondary). Numbers is unrun and is the live risk.
+
+Google Sheets remains a documented known-stripping consumer, not a
+preservation target.
 
 ## Goals
 
@@ -24,12 +36,25 @@ as a known-stripping consumer, not a preservation target.
    row for GS is "informational, expected to strip".
 1. A workbook with embeddings opens in vanilla Excel without a
    "we recovered the file" / "we removed features" dialog.
-2. A save-then-reopen cycle through any v1 target preserves the
-   embedding part byte-for-byte (or at minimum, structurally — the
-   part survives, attributes inside it survive).
+2. ~~A save-then-reopen cycle through any v1 target preserves the
+   embedding part byte-for-byte.~~ **Amended 2026-07-26 — the original
+   goal is unachievable and was refuted by emb-4.** Split in two:
+   - **2a — vectors.** A save-then-reopen preserves the embedding part
+     structurally through **Excel and zlsx**. Numbers and LibreOffice
+     Calc rebuild the archive from their own model and drop it. That
+     is a property of their OOXML export filters, not something zlsx
+     can influence.
+   - **2b — detectability.** A save-then-reopen through *any* v1
+     target preserves enough for zlsx to know, on next open, that
+     vectors existed and are gone, and with what provenance. See
+     **Durability contract** below.
 3. The embedding part is **invisible** in the cell grid — it does not
-   show up as a hidden sheet, a defined name, a comment, or any
-   user-visible feature.
+   show up as a visible sheet, a *visible* defined name, a comment, or
+   any user-visible feature. (Originally "a defined name" without
+   qualification. Narrowed 2026-07-26: the recovery record uses a
+   `<definedName hidden="1">`, which Excel's Name Manager does not
+   list. The vectors themselves remain in the custom OPC part and are
+   still bound by the unqualified rule.)
 4. zlsx can detect staleness: if a cell value changes in another
    tool, zlsx knows on next open which embeddings need recomputing.
 5. File size overhead is bounded (≈ 1–2 KB per row of int8-quantized
@@ -48,6 +73,114 @@ as a known-stripping consumer, not a preservation target.
 - Preserving Office digital signatures across an embedding write
   (see Caveats — signatures are invalidated by any package mutation,
   which is the expected behavior for added relationships).
+
+## Durability contract (decided 2026-07-26)
+
+**The promise: Excel-durable vectors, universally-durable evidence.**
+
+> zlsx guarantees that a workbook which loses its vectors **says so**.
+> It does not guarantee that every tool keeps the vectors — two of the
+> four v1 targets provably do not.
+
+This is the reconciliation §Goals.0 was blocked on. It rests on two
+measurements, not on judgement: `emb-4-compat-matrix.md` (which
+carriers hold the vectors) and `emb-4b-carrier-matrix.md` (what
+survives the tools that don't).
+
+### What was decided, and against what
+
+emb-4 established that Numbers and LibreOffice strip
+`xl/zlsxEmbeddings/*` — parts removed, not merely unreferenced, so no
+reader-side scan recovers them. The choice was between accepting
+"Excel-durable, best-effort elsewhere" and documenting it loudly, or
+carrying a recovery path. That choice could not be made until emb-4B
+established that a recovery path was even possible. It is: three
+carriers survive both measured rebuilders.
+
+**Rejected: silent best-effort.** "The vectors may vanish and you
+won't know" fails the same standard as the row/col edit contract —
+either the operation is correct or it refuses, never silently wrong.
+A vector set that disappears without trace is the embedding-arc
+equivalent of a silently corrupted workbook.
+
+**Rejected: putting vectors somewhere durable.** The only carrier that
+survives everything *and* could hold vectors is cell data, which
+violates Goal 3 outright (visible under Sheet ▸ Unhide), pollutes the
+SST, and costs 4× in size for base64. Not worth it to serve two of
+four targets.
+
+**Adopted: a recovery record in a durable carrier.** ~100–200 bytes of
+provenance — model id, dim, dtype, coverage ranges, and a digest over
+the hash set — carried where the rebuilders don't reach. It is not the
+vectors and cannot reconstruct them. It makes their absence
+*detectable and attributable*, which is what lets a caller re-embed
+deliberately instead of silently getting nothing.
+
+### Carrier choice
+
+**Primary: `<definedName hidden="1">`. Secondary: `docProps/custom.xml`.**
+
+Both survive both measured rebuilders. They are carried together
+because their *removal* mechanisms are disjoint — Document Inspector ▸
+Document Properties and Personal Information strips `docProps` and
+does not touch defined names; a tool that normalizes names does not
+touch `docProps`. Redundancy costs ~200 bytes, which is noise against
+a vector set.
+
+| Carrier | Why / why not |
+|---|---|
+| `<definedName hidden="1">` | **Primary.** Survives both rebuilders. `hidden="1"` keeps it out of Excel's Name Manager, which is what narrows Goal 3 rather than breaking it. No Document Inspector module enumerates defined names. |
+| `docProps/custom.xml` | **Secondary.** Survives both rebuilders, but Inspector ▸ Document Properties removes it — a common corporate pre-share flow, hence secondary rather than primary. |
+| cell data | Rejected: survives everything, but visible under Sheet ▸ Unhide (violates Goal 3), pollutes the SST. |
+| `customXml/` | Rejected: fails openpyxl, *and* Inspector ▸ Custom XML Data targets it by name. Strictly worse on both axes. |
+| `<extLst>` | Rejected on measurement. The extension point ECMA-376 sanctions for vendor data, and the intuitive first choice — stripped by both openpyxl and LibreOffice. Do not re-derive this as the obvious answer. |
+
+### Encoding requirements (measured, not assumed)
+
+Round-tripping the record through LibreOffice showed three
+normalizations a reader MUST tolerate. Each would be a silent
+recovery-record loss if the parser were written to match its own
+writer's bytes:
+
+1. **`hidden="1"` becomes `hidden="true"`.** Both are valid
+   `xsd:boolean` lexical forms. Accept `1`, `true`, `0`, `false`.
+2. **The payload is XML-escaped.** A `"quoted string"` formula comes
+   back as `&quot;quoted string&quot;`. Unescape before parsing.
+3. **The element gains attributes** (`function="false"`,
+   `vbProcedure="false"`). Match on `name=`, never on the whole tag.
+
+Capacity is ~255 chars per name in practice. One coverage fits
+comfortably; many do not. The record therefore **chunks across
+numbered names** (`_zlsxRecovery0`, `_zlsxRecovery1`, …) rather than
+truncating — a truncated provenance record is worse than none, because
+it reads as authoritative.
+
+### What this changes downstream
+
+The Staleness model's step 6 currently says the caller must track
+externally whether a workbook had embeddings, "zlsx itself does not
+know". With the recovery record, **zlsx knows.**
+`EmbeddingsMissing` stops being a caller-supplied assertion and becomes
+a detected state carrying provenance. That is the concrete API
+consequence, and it is what unblocks E5: the Python surface can now
+express "these vectors were stripped by some tool, here is what they
+were" instead of being unable to distinguish that from "never had
+any".
+
+### Known risk, stated plainly
+
+**Numbers is unmeasured**, and it is the most aggressive rebuilder of
+the four. If it strips defined names *and* `docProps/custom.xml`, the
+recovery record does not survive it and the contract weakens to
+"detectable except through Numbers". That would not invalidate the
+design — the carriers are declared in one place and the record is
+~200 bytes — but it would need saying out loud in the user-facing
+docs. Running that leg is the single highest-value open measurement.
+
+`E4W` (Excel for Windows) remains open for the *vector* half of the
+contract. If Excel-Win preserves like Excel-mac, "Excel-durable" is a
+real promise; if it strips, 2a collapses to "zlsx-durable" and the
+recovery record carries proportionally more weight.
 
 ## Recommendation: custom OPC part
 
@@ -537,13 +670,26 @@ On `Workbook.openWithEmbeddings(path)`:
 5. **Redaction sweep**: identify hashes that no longer match any
    live row in the coverage range (i.e. row deleted in plain Excel).
    Mark for prune on next save.
-6. **If `xl/zlsxEmbeddings/index.xml` is absent but the workbook was
-   known to have embeddings** (caller tracks this externally — zlsx
-   itself does not know): surface `EmbeddingsMissing` to the caller.
-   zlsx does NOT automatically re-embed, because (a) the model
-   provenance is gone with the index, (b) re-embedding costs money,
-   and (c) the caller is the only entity that knows whether the
-   strip was expected (Google Sheets round-trip) or surprising.
+6. **If `xl/zlsxEmbeddings/index.xml` is absent, read the recovery
+   record** (hidden `<definedName>`, falling back to
+   `docProps/custom.xml`) per the Durability contract.
+   - **Record present** → the vectors were stripped by some consumer.
+     Surface `EmbeddingsStripped` carrying the recovered provenance:
+     model id, dim, dtype, coverage ranges, hash-set digest. The
+     caller now knows *what* to re-embed, not merely that something
+     is missing.
+   - **Record absent too** → the workbook never had embeddings, or
+     passed through a consumer that strips even the record (see the
+     Numbers risk above). Return `null`; this is not an error.
+
+   ~~caller tracks this externally — zlsx itself does not know~~ —
+   superseded 2026-07-26. zlsx detects the stripped state itself; that
+   is the whole point of the recovery record.
+
+   zlsx still does NOT automatically re-embed: it costs money, and
+   only the caller knows whether the strip was expected (a deliberate
+   LibreOffice round-trip) or surprising (an Excel regression worth
+   filing). The record changes what zlsx *knows*, not who decides.
 
 On `Workbook.save()`:
 - If embeddings unchanged: passthrough the part bytes (SHA256

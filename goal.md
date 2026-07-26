@@ -4,7 +4,7 @@
 > Detail lives in `docs/plans/`; narrated context + collaboration rules live in the
 > knowledge base at `docs/kb/` (open `docs/kb/kb.html`, gitignored).
 
-_Last updated: 2026-05-31_
+_Last updated: 2026-07-26_
 
 ---
 
@@ -19,10 +19,11 @@ Performance posture (the bar to hold): 1.7–12× over calamine, 38× over openp
 
 ---
 
-## 🔥 Active track — embeddings in xlsx (PR #115)
+## 🔥 Active track — embeddings in xlsx (on `main` as of #123 + #124)
 
 Store semantic vector embeddings inside `.xlsx` via vendor-namespaced OPC parts under
-`xl/zlsxEmbeddings/`. Branch `feat/emb-1a-embedding-part`.
+`xl/zlsxEmbeddings/`. E1/E2/E3/E0 shipped in **#123**; the carrier matrix in **#124**.
+(PR #115 is dead — it was cut from pre-migration `main` and was re-applied by hand.)
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#e0e0e0', 'primaryBorderColor': '#00d4ff', 'lineColor': '#00d4ff', 'secondaryColor': '#16213e', 'tertiaryColor': '#0f3460', 'fontFamily': 'monospace'}}}%%
@@ -31,12 +32,14 @@ graph LR
     E1 --> E2["emb-2/3a/3b ✅<br/>read + write + rel"]
     E2 --> E4["emb-4 ✅ 3-tool<br/>matrix done<br/>(Win pending host)"]
     E4 --> E4B["emb-4B ◐ carrier matrix<br/>3 carriers survive<br/>both rebuilders"]
-    E4B --> RX["⬅ NEXT: reconcile<br/>compat finding in<br/>design doc"]
-    RX --> E5["emb-5<br/>Python (NumPy + valid_mask)"]
+    E4B --> DEC{{"durability contract<br/>DECIDED 2026-07-26"}}
+    DEC --> ER["⬅ NEXT: emb-R<br/>recovery record<br/>hidden definedName + docProps"]
+    ER --> E5["emb-5<br/>Python (NumPy + valid_mask)"]
     E5 --> E6["emb-6<br/>CLI: zlsx embed / --prune / --strip"]
     style E4 fill:#16213e
     style E4B fill:#16213e
-    style RX fill:#0f3460
+    style DEC fill:#0f3460
+    style ER fill:#0f3460
 ```
 
 **emb-4 — DONE for the 3 reachable desktop tools (validated 2026-05-30/31).**
@@ -73,14 +76,36 @@ archive-rebuilding consumers reachable without a GUI:
 > *and* is enumerated by no Document Inspector module. It was never considered in the
 > design doc's "Why NOT" section. Matrix: `docs/plans/emb-4b-carrier-matrix.md`.
 
-**▶ NEXT OBJECTIVE — reconcile the compat finding in `embeddings-in-xlsx.md`** (§Goals.0)
-before emb-5/emb-6. The decision is now better informed but still a product call: accept
-**"Excel-durable, best-effort elsewhere"** as the v1 contract and document it loudly,
-**or** carry a recovery record in a second carrier so a stripped workbook still says so
-and emb-6 can **recompute from source** (re-embed when vec/hash parts are missing but
-covered cells still match — the hash column exists to detect exactly this drift).
-emb-4B moved the second option from "would need a hiding spot we don't have" to
-"three measured candidates". Then: emb-5 (Python), emb-6 (CLI).
+**✅ DURABILITY CONTRACT — DECIDED 2026-07-26.** The reconciliation that gated
+emb-5/emb-6 is done; §Goals.0 is amended.
+
+> **Excel-durable vectors, universally-durable evidence.** zlsx guarantees that a
+> workbook which loses its vectors **says so**. It does not guarantee every tool keeps
+> them — two of the four v1 targets provably do not.
+
+Rejected **silent best-effort** on the same standard as the row/col edit contract: either
+the operation is correct or it refuses, never silently wrong. Rejected **putting vectors
+somewhere universally durable** — the only carrier that survives everything *and* could
+hold them is cell data, which is user-visible, pollutes the SST, and costs 4× in size to
+serve two of four targets.
+
+Ships instead: a ~200-byte **recovery record** (model id, dim, dtype, coverage ranges,
+hash digest) in a **hidden `<definedName>`** (primary) + **`docProps/custom.xml`**
+(secondary) — both, because their removal mechanisms are disjoint (Document Inspector
+strips docProps, not defined names). `hidden="1"` keeps it out of Excel's Name Manager,
+which is what narrows Goal 3 rather than breaking it.
+
+Measured encoding requirements a reader MUST tolerate (found by round-tripping, not
+assumed): LibreOffice rewrites `hidden="1"` → `hidden="true"`, XML-escapes the payload
+(`"x"` → `&quot;x&quot;`), and adds `function="false"` / `vbProcedure="false"`. Match on
+`name=`, never on the whole tag.
+
+**⛔ Live risk:** Numbers is the most aggressive rebuilder and is **unmeasured**. If it
+strips the record too, the contract weakens to "detectable except through Numbers" —
+survivable, but it must be said out loud. Highest-value open measurement in the arc.
+
+**▶ NEXT — emb-R (recovery record), then emb-5 (Python), emb-6 (CLI).**
+Full reasoning: `docs/plans/embeddings-in-xlsx.md` §Durability contract.
 
 Spec: `docs/plans/embeddings-in-xlsx.md` · matrix + Findings: `docs/plans/emb-4-compat-matrix.md`.
 
@@ -100,7 +125,8 @@ Spec: `docs/plans/embeddings-in-xlsx.md` · matrix + Findings: `docs/plans/emb-4
 ## 🅿️ Parked / out-of-band
 
 - **Relicense PR #102** (MIT → PolyForm NC) — parked by decision.
-- **Zig 0.16 migration** — forward-port preserved in `stash@{0}`; own branch when it lands.
+- ~~**Zig 0.16 migration**~~ — shipped: the toolchain in #120, the embedding arc's
+  forward-port in #123. `stash@{0}` is discharged and safe to drop.
 - **zlsx-cloud SaaS** — separate design arc (`docs/plans/saas-*`, gitignored).
 
 ## 🔭 Candidate follow-ups (value/effort order)

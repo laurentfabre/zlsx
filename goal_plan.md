@@ -65,7 +65,8 @@ Status vocabulary is fixed by the site's pill styling — use only these:
 | E4 | Tool survival test | done | 1-2 wk | E3 | Measure which spreadsheet apps keep the vectors when they save. |
 | E4W | Tool survival, Excel on Windows | blocked | 1 d | E4, a Windows host | The one untested app, and the one that decides whether the promise is real. |
 | E4B | Carrier survival test | partial | 1 wk | E4 | Measure which *other* hiding places survive the apps that erase the vectors. Six carriers measured against openpyxl, LibreOffice and Excel-mac; three survive both rebuilders. Numbers + Excel-Win legs still manual. |
-| E5 | Embeddings from Python | blocked | 2-3 wk | E4W, E4B, durability decision | Reach the vectors from Python, once we know what durability we can promise. |
+| ER | Recovery record | planned | 1 wk | E4B, durability decision | Write and read the ~200-byte provenance record that makes a stripped vector set detectable. Hidden `<definedName>` + `docProps/custom.xml`. |
+| E5 | Embeddings from Python | planned | 2-3 wk | ER | Reach the vectors from Python. Unblocked 2026-07-26: the durability contract is decided, so the API can express it. |
 | E6 | Embeddings from the command line | planned | 2-3 wk | E5 | Add, prune and strip vectors without writing code. |
 | D1 | Compute formulas | deferred | — | C1 | Deliberately out of scope. Reading and editing is the product. |
 | D2 | Author charts | deferred | — | B1 | Deferred on the same reasoning. |
@@ -94,15 +95,16 @@ graph TD
     E0 --> E4["E4 tool survival ✅<br/>bar NOT met"]
     E4 --> E4W["E4W Excel/Windows ⛔<br/>needs a host"]
     E4 --> E4B["E4B carrier survival ◐<br/>3 carriers survive<br/>both rebuilders"]
-    E4W --> DEC{{"durability contract<br/>decision — YOURS"}}
-    E4B --> DEC
-    DEC --> E5["E5 Python ⛔"]
+    E4B --> DEC{{"durability contract<br/>DECIDED 2026-07-26"}}
+    E4W -.->|"affects 2a only"| DEC
+    DEC --> ER["ER recovery record 📋"]
+    ER --> E5["E5 Python 📋"]
     E5 --> E6["E6 CLI 📋"]
 
     style DEC fill:#0f3460,stroke:#00d4ff,stroke-width:2px
     style E4 fill:#16213e
     style E4W fill:#16213e
-    style E5 fill:#16213e
+    style ER fill:#16213e
 ```
 
 ---
@@ -113,8 +115,34 @@ Everything structural is built. `B0→B1→B2→B3` closed the archive model,
 the checked structures, and the unified read/write path; that is the
 product and it is done.
 
-**The only live arc is embeddings, and it is stalled on a decision, not
-on code.**
+**The only live arc is embeddings. It was stalled on a decision; that
+decision is made (2026-07-26) and the arc is unblocked.**
+
+> **The contract: Excel-durable vectors, universally-durable evidence.**
+> zlsx guarantees that a workbook which loses its vectors *says so*. It
+> does not guarantee every tool keeps them — two of the four v1 targets
+> provably do not.
+>
+> Silent best-effort was rejected on the same standard as the row/col
+> edit contract: either the operation is correct or it refuses, never
+> silently wrong. Putting the vectors somewhere universally durable was
+> rejected too — the only carrier that survives everything *and* could
+> hold them is cell data, which is user-visible, pollutes the SST, and
+> costs 4× in size to serve two of four targets.
+>
+> What ships instead is a ~200-byte **recovery record** — model id,
+> dim, dtype, coverage ranges, hash digest — in a hidden
+> `<definedName>` (primary) and `docProps/custom.xml` (secondary),
+> carried in both because their removal mechanisms are disjoint. It
+> cannot reconstruct the vectors. It makes their absence detectable and
+> attributable, so a caller re-embeds deliberately instead of silently
+> getting nothing. Full reasoning:
+> `docs/plans/embeddings-in-xlsx.md` §Durability contract.
+>
+> **Live risk:** Numbers is the most aggressive rebuilder and is
+> unmeasured. If it strips the record too, the contract weakens to
+> "detectable except through Numbers" — survivable, but it must be said
+> out loud. That leg is the highest-value open measurement in the arc.
 
 `E4` did its job: it measured, and the measurement was bad news. Of the
 three reachable targets, only Excel for Mac preserves the vectors on
@@ -153,16 +181,21 @@ expensive:
   change the ranking. Full matrix:
   `docs/plans/emb-4b-carrier-matrix.md`.
 
-`E5` is marked `blocked` rather than `planned` on purpose. The Python
-surface has to *express* the durability contract — what an absent vector
-set means, whether there is a recompute entry point. Build it before the
-contract is settled and the public API gets reworked after it ships.
+`E5` was `blocked` on purpose: the Python surface has to *express* the
+durability contract — what an absent vector set means, whether there is
+a recompute entry point — and building it first would mean reworking a
+public API after it shipped.
 
-> **The decision itself is not an engineering call and is not mine to
-> make.** It is: what do we promise users about workbooks that pass
-> through Numbers or LibreOffice? Full reasoning and the rejected
-> options are in `docs/plans/emb-4-compat-matrix.md` §Findings and
-> `docs/plans/embeddings-in-xlsx.md` §Goals.0.
+**That reason is discharged.** The contract is decided, so `E5` is now
+`planned`, behind one new piece: `ER`, the recovery record itself. `ER`
+is what gives `E5` something to express. The Python surface can now
+distinguish three states that were previously indistinguishable —
+vectors present, vectors stripped *with known provenance*, and never
+embedded — where before it could only say "nothing here".
+
+`E4W` no longer gates `E5`. It settles how strong clause 2a is
+("Excel-durable" vs "zlsx-durable"), which is a documentation question
+about an already-decided contract, not an API-shape question.
 
 ---
 
