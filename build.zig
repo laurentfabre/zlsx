@@ -555,6 +555,90 @@ pub fn build(b: *std.Build) void {
     emb4_tools_step.dependOn(&b.addInstallArtifact(emb4_verify_exe, .{}).step);
     emb4_tools_step.dependOn(&b.addInstallArtifact(emb4_passive_exe, .{}).step);
 
+    // emb-4B carrier-survival tooling. emb-4 established that the custom
+    // OPC part does not survive Numbers or LibreOffice; emb-4B measures
+    // whether any *other* place in the package does, so a small recovery
+    // record can ride in a second carrier. See tests/emb-4b/carriers.zig.
+    //
+    // The carrier catalogue is its own named module because both the
+    // generator and the verifier import it, and a file reachable from two
+    // module package trees is a hard error ("file exists in modules ...").
+    const emb4b_carriers_mod = b.createModule(.{
+        .root_source_file = b.path("tests/emb-4b/carriers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const emb4b_fixture_mod = b.createModule(.{
+        .root_source_file = b.path("tests/emb-4b/carrier_gen.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    emb4b_fixture_mod.addImport("zlsx_pkg", package_mod);
+    emb4b_fixture_mod.addImport("zlsx", zlsx_mod);
+    emb4b_fixture_mod.addImport("emb4b_carriers", emb4b_carriers_mod);
+    const emb4b_fixture_exe = b.addExecutable(.{
+        .name = "zlsx-emb4b-fixture",
+        .root_module = emb4b_fixture_mod,
+    });
+    const emb4b_fixture_run = b.addRunArtifact(emb4b_fixture_exe);
+    if (b.args) |args| emb4b_fixture_run.addArgs(args);
+    const emb4b_fixture_step = b.step(
+        "emb4b-fixture",
+        "Write the emb-4B carrier fixture: one marker in six carriers (arg: out path)",
+    );
+    emb4b_fixture_step.dependOn(&emb4b_fixture_run.step);
+
+    const emb4b_verify_mod = b.createModule(.{
+        .root_source_file = b.path("tests/emb-4b/carrier_verify.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    emb4b_verify_mod.addImport("zlsx_pkg", package_mod);
+    emb4b_verify_mod.addImport("emb4b_carriers", emb4b_carriers_mod);
+    const emb4b_verify_exe = b.addExecutable(.{
+        .name = "zlsx-emb4b-verify",
+        .root_module = emb4b_verify_mod,
+    });
+    const emb4b_verify_run = b.addRunArtifact(emb4b_verify_exe);
+    if (b.args) |args| emb4b_verify_run.addArgs(args);
+    const emb4b_verify_step = b.step(
+        "emb4b-verify",
+        "Report which emb-4B carriers survived a round-trip (arg: file path)",
+    );
+    emb4b_verify_step.dependOn(&emb4b_verify_run.step);
+
+    // Same exit-code reasoning as emb4-tools: the verifier's exit code IS
+    // the carrier-loss count, and `zig build` would flatten it to 1.
+    const emb4b_tools_step = b.step(
+        "emb4b-tools",
+        "Install the emb-4B carrier helpers into zig-out/bin (preserves their exit codes)",
+    );
+    emb4b_tools_step.dependOn(&b.addInstallArtifact(emb4b_fixture_exe, .{}).step);
+    emb4b_tools_step.dependOn(&b.addInstallArtifact(emb4b_verify_exe, .{}).step);
+
+    // The carrier catalogue and the workbook.xml patch helpers carry unit
+    // tests; wire them into `zig build test` so a regression in the fixture
+    // generator fails the gate rather than waiting for a matrix run.
+    const emb4b_carriers_tests_mod = b.createModule(.{
+        .root_source_file = b.path("tests/emb-4b/carriers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const emb4b_carriers_tests = b.addTest(.{ .root_module = emb4b_carriers_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(emb4b_carriers_tests).step);
+
+    const emb4b_gen_tests_mod = b.createModule(.{
+        .root_source_file = b.path("tests/emb-4b/carrier_gen.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    emb4b_gen_tests_mod.addImport("zlsx_pkg", package_mod);
+    emb4b_gen_tests_mod.addImport("zlsx", zlsx_mod);
+    emb4b_gen_tests_mod.addImport("emb4b_carriers", emb4b_carriers_mod);
+    const emb4b_gen_tests = b.addTest(.{ .root_module = emb4b_gen_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(emb4b_gen_tests).step);
+
     // Per-source-file test targets so each module gets its own test
     // binary (matches the rest of build.zig's pattern).
     const package_store_tests_mod = b.createModule(.{
