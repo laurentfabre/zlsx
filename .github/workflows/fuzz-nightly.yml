@@ -4,36 +4,50 @@ name: Fuzz Nightly
 # targets on a Linux x64 runner once per day. Crash artefacts are
 # uploaded so a regression can be reproduced + replayed locally.
 #
-# TWO BUGS WERE FIXED HERE — read before editing:
+# THREE BUGS WERE FIXED TO GET THIS WORKING — read before editing:
 #
 # 1. The invocation was `zig build fuzz`, where `fuzz` is a STEP NAME.
 #    Coverage-guided fuzzing needs the `--fuzz` FLAG. Without it the
 #    build runner never populates `fuzz_context`, and the first
 #    `coverage_id` message from the -ffuzz-instrumented test binary
-#    unwrapped null and panicked inside std (Run.zig `evalZigTest`).
-#    That failed in ~330 ms, before any fuzzing, and the workflow was
-#    red every night from 2026-04-29 onward — 88 consecutive runs that
-#    never fuzzed a single input. The duration/timeout/artefact plumbing
-#    below was all dead code.
+#    unwrapped null and panicked inside std. That failed in ~330 ms,
+#    before any fuzzing, and the workflow was red every night from
+#    2026-04-29 onward — 88 consecutive runs that fuzzed nothing.
 #
-# 2. With the flag fixed, Zig 0.16.0 still cannot build an -ffuzz test
-#    binary: its own `lib/compiler/test_runner.zig:566` fails to compile
-#    with `expected type '*const debug.StackTrace', found
-#    '*builtin.StackTrace'`. That code is only instantiated in fuzz
-#    mode, which is why `zig build test` is unaffected. This is an
-#    upstream bug, not a zlsx one.
+# 2. Zig 0.16.0 cannot compile its own test runner in `-ffuzz` mode
+#    (`writeStackTrace` gets a `*builtin.StackTrace` where a
+#    `*const debug.StackTrace` is required).
 #
-# So the job now runs the correct invocation and classifies the outcome:
-# the known-upstream compile failure is reported as a warning and exits
-# 0 (a permanently-red nightly carries no signal), while ANY other
-# failure — including a real fuzz crash — turns the job red. When
-# upstream fixes the test runner, this job starts genuinely fuzzing with
-# no further edits.
+# 3. Even patched, the runner called the fuzzer ABI during the
+#    discovery pass, when `fuzzer.test_i` is still `undefined` —
+#    segfaulting on every target that supplies a seed corpus.
 #
-# Linux only: Zig 0.16.0's fuzz support is additionally broken on
-# Windows (shared-memory + COFF/PE debug-info gaps) and macOS
-# (Mach-O addEntryPoint crash). When upstream lands fixes, add
-# matrix entries here.
+# 2 and 3 are fixed in `vendor/zig-test-runner/`, a copy of upstream's
+# runner with two hunks changed, used ONLY by the fuzz binaries. See
+# its README for the removal condition — delete it as soon as a Zig
+# release fuzzes without it.
+#
+# Fuzzing genuinely runs now, so this job is a real gate again: a crash
+# turns it red. Do NOT reintroduce a blanket "warn and exit 0" branch.
+#
+# PLATFORM: macOS, not Linux — and that is a deliberate inversion.
+#
+# This job ran on ubuntu-22.04 because under 0.15 macOS fuzzing was the
+# broken one (Mach-O `addEntryPoint`). On 0.16.0 the reverse is true,
+# verified both ways:
+#
+#   * macOS 0.16.0 runs a full session cleanly, no panics, and writes
+#     fuzzer corpus/coverage state under `.zig-cache/v/`.
+#   * ubuntu-22.04 0.16.0 compiles and runs the tests, then the BUILD
+#     RUNNER panics in `std/Build/Fuzz.zig:477 addEntryPoint`
+#     ("start index 1 is larger than end index 0") while collecting
+#     coverage. That is in the build system, not the test binary, so
+#     unlike the two runner bugs it cannot be patched from here.
+#
+# Linux x64 remains the intended long-term home; switch back the moment
+# a Zig release fixes that panic. A permanently-red Linux job was NOT
+# added alongside — that is precisely the no-signal noise this workflow
+# just escaped.
 #
 # Cost note: zlsx is a public repo so Actions minutes are free.
 # A single nightly run sized to fuzz_duration_seconds is well
@@ -55,8 +69,8 @@ permissions:
 
 jobs:
   fuzz:
-    name: fuzz / ubuntu-22.04 (Linux x64)
-    runs-on: ubuntu-22.04
+    name: fuzz / macos-14
+    runs-on: macos-14
     # Hard ceiling: regardless of input duration, never let a
     # single run exceed 90 min. Catches a runaway fuzzer trapped
     # in an instrumentation pathology before it eats the day's
@@ -81,17 +95,30 @@ jobs:
           DURATION_SECONDS: ${{ github.event.inputs.duration_seconds || '1800' }}
         # `--fuzz` is the flag that actually enables coverage-guided
         # fuzzing; `fuzz` alone is just our step name. `--fuzz` implies
-        # `--webui`, and the fuzzer runs until killed, so the wall-clock
-        # cap comes from `timeout`: 124 (TERM-on-timeout) and 143
-        # (SIGTERM-killed) are the healthy "ran the full session" exits.
+        # `--webui`, and the fuzzer runs until killed, so the session
+        # needs a wall-clock cap.
+        #
+        # A background watchdog rather than `timeout(1)`: that is GNU
+        # coreutils and is NOT present on macOS runners, where this job
+        # now runs. Installing coreutils just for a sleep-and-kill would
+        # be a dependency for nothing.
         run: |
           set +e
-          timeout --preserve-status --signal=TERM "${DURATION_SECONDS}s" \
-            zig build fuzz --fuzz --webui=127.0.0.1:0 2>&1 | tee fuzz.log
-          rc=${PIPESTATUS[0]}
+          zig build fuzz --fuzz --webui=127.0.0.1:0 > fuzz.log 2>&1 &
+          fuzz_pid=$!
+          ( sleep "${DURATION_SECONDS}"; kill -TERM "$fuzz_pid" 2>/dev/null ) &
+          watchdog_pid=$!
+
+          wait "$fuzz_pid"
+          rc=$?
+          kill "$watchdog_pid" 2>/dev/null
           set -e
 
-          if [[ "$rc" == "124" || "$rc" == "143" ]]; then
+          cat fuzz.log
+
+          # 143 = SIGTERM from the watchdog, i.e. it ran the whole
+          # session without finding anything. That is the healthy path.
+          if [[ "$rc" == "143" || "$rc" == "124" ]]; then
             echo "::notice::fuzz session ran the full ${DURATION_SECONDS}s with no crash"
             exit 0
           fi
@@ -100,20 +127,8 @@ jobs:
             exit 0
           fi
 
-          # Known upstream blocker: Zig 0.16.0 cannot compile its own
-          # test runner in fuzz mode. Warn rather than fail — a nightly
-          # that is red for a reason we cannot fix carries no signal and
-          # trains everyone to ignore it. Any OTHER failure, including a
-          # genuine fuzz crash, still turns the job red.
-          if grep -q "test_runner.zig.*debug.StackTrace" fuzz.log; then
-            echo "::warning::coverage-guided fuzzing is blocked by an upstream Zig 0.16.0 bug \
-          (lib/compiler/test_runner.zig fails to compile in -ffuzz mode: expected \
-          '*const debug.StackTrace', found '*builtin.StackTrace'). The invocation here is \
-          correct and will start fuzzing as soon as upstream ships the fix. Targets still run \
-          as single-input smoke tests under \`zig build test\`."
-            exit 0
-          fi
-
+          # Anything else is a real failure: a genuine fuzz crash, or a
+          # toolchain regression. Both must be visible.
           echo "::error::fuzz session failed (rc=$rc) — see log and crash artefacts"
           exit "$rc"
 

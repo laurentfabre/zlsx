@@ -175,7 +175,24 @@ pub fn build(b: *std.Build) void {
     unit_fuzz_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
     unit_fuzz_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
     unit_fuzz_mod.addImport("fuzz_config", fuzz_config_mod);
-    const unit_fuzz_tests = b.addTest(.{ .root_module = unit_fuzz_mod });
+    // Zig 0.16.0 cannot compile its own test runner in `-ffuzz` mode
+    // (`writeStackTrace` receives a `*builtin.StackTrace` where a
+    // `*const debug.StackTrace` is required), which blocked coverage-
+    // guided fuzzing entirely. `vendor/zig-test-runner/` is upstream's
+    // runner with that one hunk fixed; see its README for the removal
+    // condition once a Zig release carries the fix.
+    //
+    // Scoped to the two fuzz binaries only — every other test target
+    // below uses the stock runner from the toolchain.
+    const fuzz_test_runner: std.Build.Step.Compile.TestRunner = .{
+        .path = b.path("vendor/zig-test-runner/test_runner.zig"),
+        .mode = .server,
+    };
+
+    const unit_fuzz_tests = b.addTest(.{
+        .root_module = unit_fuzz_mod,
+        .test_runner = fuzz_test_runner,
+    });
     const fuzz_step = b.step("fuzz", "Run coverage-guided fuzz targets (Linux x64; macOS/Windows broken upstream)");
     fuzz_step.dependOn(&b.addRunArtifact(unit_fuzz_tests).step);
 
@@ -524,7 +541,10 @@ pub fn build(b: *std.Build) void {
         .fuzz = true,
     });
     package_fuzz_mod.addImport("zlsx", zlsx_mod);
-    const package_fuzz_tests = b.addTest(.{ .root_module = package_fuzz_mod });
+    const package_fuzz_tests = b.addTest(.{
+        .root_module = package_fuzz_mod,
+        .test_runner = fuzz_test_runner,
+    });
     fuzz_step.dependOn(&b.addRunArtifact(package_fuzz_tests).step);
 
     // tests/package_corpus.zig — corpus-level integration test for
