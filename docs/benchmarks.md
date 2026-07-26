@@ -160,17 +160,19 @@ Throughput at that size (rows/sec):
 | xlsxwriter | ~15,070 |
 | openpyxl | ~6,590 |
 
-> ⚠️ **The zlsx write-path rows above are pre-0.16 and need re-running.**
-> They were measured on 2026-04-25 against the in-house LZ77 +
-> dynamic-huffman encoder, which the Zig 0.16 migration retired in
-> favour of stdlib `std.compress.flate`. A spot check after the swap
-> (100k rows × 5 cells, ReleaseFast, Apple silicon) sustained
-> **~590,000 styled rows/sec**, so the change is not a regression — but
-> that is a different machine and row shape, so it does not slot into
-> this table. The three-way comparison needs a fresh `hyperfine` run
-> with xlsxwriter and openpyxl present before these numbers are trusted
-> again. Reader rows are unaffected: the read path already used
-> stdlib `std.compress.flate.Decompress`.
+> **Re-measured after the Zig 0.16 deflate swap — the numbers hold.**
+> The zlsx write row was originally measured against the in-house LZ77 +
+> dynamic-huffman encoder, which the 0.16 migration retired in favour of
+> stdlib `std.compress.flate`. Re-running the *same* harness
+> (`scripts/bench_ci.sh`) on the *same* fixture and machine class gives
+> **6.58 ms ± 0.21** against the 6.7 ms ± 0.3 recorded above: unchanged
+> within noise, so the ratios against xlsxwriter and openpyxl stand.
+>
+> Caveat on scope: only the zlsx row was re-run. The xlsxwriter and
+> openpyxl figures are carried forward from 2026-04-25 — nothing about
+> this change could move them, but they have not been independently
+> re-verified. Reader rows are unaffected either way: the read path
+> already went through stdlib `std.compress.flate.Decompress`.
 
 ### Methodology — allocator choice matters
 

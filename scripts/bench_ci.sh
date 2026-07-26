@@ -25,30 +25,15 @@ mkdir -p "$OUT_DIR"
 ZIG_BIN="${ZIG_BIN:-zig}"
 
 echo "[bench-ci] building benchmark binaries (ReleaseFast)..."
-# Note: -Mroot specifies the entry module — no positional path argument
-# ("zig build-exe FILE" + "-Mroot=FILE" together is rejected as duplicate).
-"$ZIG_BIN" build-exe \
-    --dep zlsx -Mroot=tests/bench/bench_zlsx.zig \
-    --dep zlsx_sst_plan --dep zlsx_styles_plan --dep zlsx_workbook_xml_plan --dep zlsx_zip --dep zlsx_sheet_plan --dep zlsx_fresh_emit -Mzlsx=src/xlsx.zig \
-    -Mzlsx_sst_plan=pkg/sst_plan.zig \
-    -Mzlsx_styles_plan=pkg/styles_plan.zig \
-    -Mzlsx_workbook_xml_plan=pkg/workbook_xml_plan.zig \
-    -Mzlsx_zip=pkg/zip.zig \
-    -Mzlsx_sheet_plan=pkg/sheet_plan.zig \
-    --dep zlsx_sst_plan --dep zlsx_styles_plan --dep zlsx_workbook_xml_plan --dep zlsx_sheet_plan --dep zlsx_zip -Mzlsx_fresh_emit=pkg/fresh_emit.zig \
-    -O ReleaseFast \
-    -femit-bin="$OUT_DIR/bench_zlsx_read"
-"$ZIG_BIN" build-exe \
-    --dep zlsx -Mroot=tests/bench/bench_write_zlsx.zig \
-    --dep zlsx_sst_plan --dep zlsx_styles_plan --dep zlsx_workbook_xml_plan --dep zlsx_zip --dep zlsx_sheet_plan --dep zlsx_fresh_emit -Mzlsx=src/xlsx.zig \
-    -Mzlsx_sst_plan=pkg/sst_plan.zig \
-    -Mzlsx_styles_plan=pkg/styles_plan.zig \
-    -Mzlsx_workbook_xml_plan=pkg/workbook_xml_plan.zig \
-    -Mzlsx_zip=pkg/zip.zig \
-    -Mzlsx_sheet_plan=pkg/sheet_plan.zig \
-    --dep zlsx_sst_plan --dep zlsx_styles_plan --dep zlsx_workbook_xml_plan --dep zlsx_sheet_plan --dep zlsx_zip -Mzlsx_fresh_emit=pkg/fresh_emit.zig \
-    -O ReleaseFast \
-    -femit-bin="$OUT_DIR/bench_zlsx_write"
+# Built through `zig build` rather than hand-rolled `build-exe` lines.
+# The old form restated the entire module graph here, so every new named
+# module had to be added in two places or this script broke on its own —
+# and because no build step compiled these files, they silently kept a
+# stale API through the whole Zig 0.16 migration. build.zig is now the
+# single source of truth; `zig build test` compile-checks them too.
+"$ZIG_BIN" build bench-exes -Doptimize=ReleaseFast --prefix "$OUT_DIR/zig-out"
+cp "$OUT_DIR/zig-out/bin/zlsx-bench-read"  "$OUT_DIR/bench_zlsx_read"
+cp "$OUT_DIR/zig-out/bin/zlsx-bench-write" "$OUT_DIR/bench_zlsx_write"
 
 # Fixture set is intentionally small + stable: worldbank_catalog
 # (67 KB, 1144 SST entries — exercises the SST + row stream) and

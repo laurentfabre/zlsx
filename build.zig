@@ -747,6 +747,60 @@ pub fn build(b: *std.Build) void {
     bench_append_rows_step.dependOn(&bench_append_rows_install.step);
     bench_append_rows_step.dependOn(&bench_append_rows_run.step);
 
+    // ── bench harness executables ────────────────────────────────────
+    //
+    // These two were previously built ONLY by `scripts/bench_ci.sh`'s
+    // hand-rolled `build-exe` invocations, which restated the whole
+    // module graph by hand. Two consequences, both of which actually
+    // bit during the 0.16 migration:
+    //
+    //   * every new named module had to be added to the script as well
+    //     as here, or the bench job broke on its own;
+    //   * no `zig build` step compiled these files, so they silently
+    //     kept a stale API through a tree-wide migration and only the
+    //     nightly bench job noticed.
+    //
+    // Defining them here makes `zig build` the single source of truth
+    // for the module graph, and hanging them off `test_step` means a
+    // signature change that misses them is a local test failure rather
+    // than a CI-only surprise. `bench-exes` installs them for
+    // bench_ci.sh to run under hyperfine.
+    const bench_read_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/bench_zlsx.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .single_threaded = single_threaded,
+    });
+    bench_read_mod.addImport("zlsx", zlsx_mod);
+    const bench_read_exe = b.addExecutable(.{
+        .name = "zlsx-bench-read",
+        .root_module = bench_read_mod,
+    });
+
+    const bench_write_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/bench_write_zlsx.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .single_threaded = single_threaded,
+    });
+    bench_write_mod.addImport("zlsx", zlsx_mod);
+    const bench_write_exe = b.addExecutable(.{
+        .name = "zlsx-bench-write",
+        .root_module = bench_write_mod,
+    });
+
+    const bench_exes_step = b.step(
+        "bench-exes",
+        "Build the read + write bench binaries (consumed by scripts/bench_ci.sh)",
+    );
+    bench_exes_step.dependOn(&b.addInstallArtifact(bench_read_exe, .{}).step);
+    bench_exes_step.dependOn(&b.addInstallArtifact(bench_write_exe, .{}).step);
+
+    // Compile-only on the default test path: catches API drift without
+    // paying for a ReleaseFast link on every `zig build test`.
+    test_step.dependOn(&bench_read_exe.step);
+    test_step.dependOn(&bench_write_exe.step);
+
     // Per-module unit tests for the bench helpers (rss + synth).
     // These DO go on the default `test` step — they're cheap and
     // exercise the platform-specific code paths.
