@@ -124,8 +124,39 @@ jobs:
           # Expect 5 wheels (one per matrix leg).
           test "$(ls dist/*.whl | wc -l)" = "5"
 
+      # Trusted publishing needs a PyPI-side publisher whose claims match
+      # this job exactly. If the project does not exist yet, that means a
+      # *pending* publisher — an existing-project publisher cannot be
+      # attached to a name nobody owns. Every release before 0.5.0 failed
+      # here with `invalid-publisher` and a bare stack trace, so surface
+      # the remediation up front rather than after the fact.
+      - name: Preflight — trusted-publisher configuration
+        run: |
+          set -euo pipefail
+          code=$(curl -s -o /dev/null -w '%{http_code}' https://pypi.org/pypi/py-zlsx/json)
+          echo "pypi.org/project/py-zlsx -> HTTP $code"
+          if [[ "$code" == "404" ]]; then
+            echo "::warning::py-zlsx does not exist on PyPI yet. Trusted publishing \
+          will fail with 'invalid-publisher' until a PENDING publisher is created at \
+          https://pypi.org/manage/account/publishing/ with EXACTLY these values -- \
+          PyPI Project Name: py-zlsx | Owner: laurentfabre | Repository name: zlsx | \
+          Workflow name: pypi.yml | Environment name: pypi"
+          fi
+
       - name: Publish to PyPI
+        id: publish
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
           skip-existing: true
+
+      - name: Explain a trusted-publishing failure
+        if: failure() && steps.publish.outcome == 'failure'
+        run: |
+          echo "::error::Publish failed. If the log says 'invalid-publisher', the \
+          workflow is fine and PyPI simply has no publisher matching it. Create one at \
+          https://pypi.org/manage/account/publishing/ -- PyPI Project Name: py-zlsx | \
+          Owner: laurentfabre | Repository name: zlsx | Workflow name: pypi.yml | \
+          Environment name: pypi. Use the PENDING publisher form while the project does \
+          not exist yet. No workflow change is needed."
+          exit 1
