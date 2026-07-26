@@ -18,14 +18,20 @@
 //!     through to two `foldString` calls + `mem.eql`.
 //!
 //! Out-of-scope for this phase: NFC normalisation (lands in
-//! `src/unicode/nfc.zig`), char-length validation
+//! `unicode/nfc.zig`), char-length validation
 //! (`excelSheetNameLength`), and the writer/editor `asciiEqlFold`
 //! call-site replacement. Each of those is a separate milestone in
 //! the A1 plan; this module ships the foundation.
 
 const std = @import("std");
 const tables = @import("tables/casefold_data.zig");
-const nfc = @import("nfc.zig");
+// Named module, not a relative import: `pkg/embedding_part.zig` needs
+// the same normalizer, and a file may belong to exactly one module's
+// package tree. Rooting it at top-level `unicode/` keeps it out of
+// both `src/` (the `zlsx` tree) and `pkg/` (the `zlsx_pkg` tree).
+// Re-verified against Zig 0.16.0 — the constraint is unchanged from
+// 0.15: "file exists in modules 'root' and 'leafmod'".
+const nfc = @import("zlsx_nfc");
 
 /// Fully fold a UTF-8 string using non-Turkic full case folding.
 /// Returns owned bytes — caller frees.
