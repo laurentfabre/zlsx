@@ -105,10 +105,15 @@ Spec: `docs/plans/embeddings-in-xlsx.md` · matrix + Findings: `docs/plans/emb-4
 
 ## 🔭 Candidate follow-ups (value/effort order)
 
-1. Latent silent-corruption fixes (`<sheetView topLeftCell>`, `<selection>`, bare-sheet
-   `<sortState>`) — one small `pkg/sheet_edit.zig` PR.
-2. Fuzz the byte-walkers (`pkg/{table,drawing,vml,sheet}_edit.zig`, ~3000 LOC, none yet).
+1. ~~Latent silent-corruption fixes (`<sheetView topLeftCell>`, `<selection>`, bare-sheet
+   `<sortState>`)~~ — ✅ **done (#125)**. Also caught a fourth, `<sortCondition ref>`,
+   unrewritten even inside `<table>` on the path that shipped in #111.
+2. **Fuzz the byte-walkers** (`pkg/{table,drawing,vml,sheet}_edit.zig`, ~3000 LOC, none
+   yet) — now the top candidate, and #125 is the argument for it: that code had four
+   unhandled elements and the gap was invisible to the refusal audit's method.
 3. CDATA-aware shared tag scanner (candidate for `ziglib`).
+4. `<extLst>` coordinate fixups (`x14:`/`x15:` blocks) — the one surface still passing
+   through verbatim everywhere, per #125's audit note.
 
 ---
 

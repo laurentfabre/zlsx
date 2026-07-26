@@ -4524,3 +4524,108 @@ test "Editor.stripDocProps: no docProps parts is a clean no-op" {
         readEntryBytesIo(io, dst, "docProps/core.xml"),
     );
 }
+
+// ─── iter-sv-1: third-party view/sort attrs survive structural edits ──
+
+/// Build a fixture shaped like an Excel-authored sheet.
+///
+/// zlsx's own writer never emits `<sheetView topLeftCell>`,
+/// `<selection>` or a sheet-bare `<sortState>` — but every scrolled
+/// Excel file carries the first two, so this is the load-modify-save
+/// shape where a stale coordinate actually bites. The writer produces
+/// the archive, then the parts are patched to third-party shape.
+fn buildThirdPartyViewFixture(io: std.Io, path: []const u8) !void {
+    const a = std.testing.allocator;
+    {
+        var w = xlsx.Writer.init(a);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 } });
+        try s.writeRow(&.{ .{ .integer = 3 }, .{ .integer = 4 } });
+        try w.save(io, path);
+    }
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+
+    const name = "xl/worksheets/sheet1.xml";
+    const p = (try wb.store.part(name)) orelse return error.MissingSheetPart;
+
+    // CT_Worksheet fixes child order: sheetViews before sheetData,
+    // sortState after it. Injecting out of order would make this a
+    // test of a schema-invalid file rather than of the rewriter.
+    const views =
+        "<sheetViews><sheetView topLeftCell=\"B5\" workbookViewId=\"0\">" ++
+        "<selection activeCell=\"B5\" sqref=\"B5 D7:E9\"/>" ++
+        "</sheetView></sheetViews>";
+    const sort = "<sortState ref=\"A6:B9\"><sortCondition ref=\"B6:B9\"/></sortState>";
+
+    const sd_open = std.mem.indexOf(u8, p.bytes, "<sheetData") orelse return error.MalformedXml;
+    const sd_close_tag = "</sheetData>";
+    const sd_close = std.mem.indexOf(u8, p.bytes, sd_close_tag) orelse return error.MalformedXml;
+    const after_sd = sd_close + sd_close_tag.len;
+
+    const patched = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{
+        p.bytes[0..sd_open],
+        views,
+        p.bytes[sd_open..after_sd],
+        sort,
+        p.bytes[after_sd..],
+    });
+    defer a.free(patched);
+    try wb.store.replacePart(name, patched);
+    try wb.save(io, path);
+}
+
+test "Editor: insertRow rewrites third-party sheetView, selection and sortState" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, io, "tpv_insrow_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, io, "tpv_insrow_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    try buildThirdPartyViewFixture(io, src_path);
+    {
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, dst_path);
+    }
+    var ed2 = try Editor.open(std.testing.allocator, io, dst_path);
+    defer ed2.deinit();
+    // Everything at or below row 2 moves down one.
+    try assertSheetXmlContains(&ed2, "topLeftCell=\"B6\"");
+    try assertSheetXmlContains(&ed2, "activeCell=\"B6\"");
+    try assertSheetXmlContains(&ed2, "sqref=\"B6 D8:E10\"");
+    try assertSheetXmlContains(&ed2, "<sortState ref=\"A7:B10\"");
+    try assertSheetXmlContains(&ed2, "<sortCondition ref=\"B7:B10\"");
+}
+
+test "Editor: insertColumn rewrites third-party sheetView, selection and sortState" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, io, "tpv_inscol_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, io, "tpv_inscol_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    try buildThirdPartyViewFixture(io, src_path);
+    {
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
+        defer ed.deinit();
+        try ed.insertColumn(0, 2); // insert before column B
+        try ed.save(io, dst_path);
+    }
+    var ed2 = try Editor.open(std.testing.allocator, io, dst_path);
+    defer ed2.deinit();
+    // Everything at or right of column B moves one column right.
+    try assertSheetXmlContains(&ed2, "topLeftCell=\"C5\"");
+    try assertSheetXmlContains(&ed2, "activeCell=\"C5\"");
+    try assertSheetXmlContains(&ed2, "sqref=\"C5 E7:F9\"");
+    try assertSheetXmlContains(&ed2, "<sortState ref=\"A6:C9\"");
+    try assertSheetXmlContains(&ed2, "<sortCondition ref=\"C6:C9\"");
+}
