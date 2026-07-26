@@ -73,7 +73,7 @@ pub fn applyEditToVmlDrawing(
     index: u32,
     kind: EditKind,
 ) Error![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
     var i: usize = 0;
@@ -491,7 +491,7 @@ pub fn applyEditToCommentsXml(
     index_1based: u32,
     kind: EditKind,
 ) Error![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
     var i: usize = 0;

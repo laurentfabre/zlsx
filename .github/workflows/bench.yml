@@ -41,10 +41,10 @@ jobs:
           key: zlsx-corpus-v1-${{ runner.os }}-${{ hashFiles('scripts/fetch_test_corpus.sh') }}
           restore-keys: zlsx-corpus-v1-${{ runner.os }}-
 
-      - name: Install Zig 0.15.2
+      - name: Install Zig 0.16.0
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
 
       - name: Install hyperfine
         # Pin to a release that supports `-N` / `--shell=none`. Ubuntu

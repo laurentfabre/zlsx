@@ -42,18 +42,18 @@ pub const COLS_PER_ROW: u32 = 5;
 
 pub const Error = error{
     SynthFailed,
-} || std.mem.Allocator.Error || std.fs.File.OpenError || std.fs.File.WriteError ||
-    std.fs.Dir.StatFileError;
+} || std.mem.Allocator.Error || std.Io.File.OpenError || std.Io.File.Writer.Error ||
+    std.Io.Dir.StatFileError;
 
 /// Emit the synthetic workbook to `out_path`. Returns immediately if the
 /// file already exists at `out_path` (cache hit) — assumes the existing
 /// fixture matches the geometry above.
-pub fn synthesize(allocator: Allocator, out_path: []const u8) !void {
+pub fn synthesize(allocator: Allocator, io: std.Io, out_path: []const u8) !void {
     std.debug.assert(out_path.len > 0);
 
     // Cache hit: file present + non-empty. We don't validate the
     // geometry — the cache key is the path itself, picked by the caller.
-    if (std.fs.cwd().statFile(out_path)) |stat| {
+    if (std.Io.Dir.cwd().statFile(io, out_path, .{})) |stat| {
         if (stat.size > 0) return;
     } else |_| {
         // missing or unreadable — fall through and regenerate
@@ -63,7 +63,7 @@ pub fn synthesize(allocator: Allocator, out_path: []const u8) !void {
     // Zig build system on every invocation but a fresh checkout might
     // not have it before any `zig build` runs.
     if (std.fs.path.dirname(out_path)) |dir| {
-        std.fs.cwd().makePath(dir) catch |err| switch (err) {
+        std.Io.Dir.cwd().createDirPath(io, dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -92,32 +92,35 @@ pub fn synthesize(allocator: Allocator, out_path: []const u8) !void {
         }
     }
 
-    try w.save(out_path);
+    try w.save(io, out_path);
 
     // Postcondition: the file we just emitted is non-empty and at least
     // as big as one byte per cell (very loose lower bound — compressed
     // 5M numeric cells is ~30-50 MB in practice).
-    const stat = try std.fs.cwd().statFile(out_path);
+    const stat = try std.Io.Dir.cwd().statFile(io, out_path, .{});
     std.debug.assert(stat.size > 0);
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────
 
 test "synthesize: regenerates and caches" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Reduced geometry for the unit test — full 5M cells is too slow
     // for the default test path. The gate test exercises the real
     // dimensions via `bench-workbook-rss`.
     const tmp_path = ".zig-cache/test-synth-tiny.xlsx";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
     // First call: generates.
-    try synthesizeWithGeometry(std.testing.allocator, tmp_path, 1, 5, 2);
-    const stat1 = try std.fs.cwd().statFile(tmp_path);
+    try synthesizeWithGeometry(std.testing.allocator, io, tmp_path, 1, 5, 2);
+    const stat1 = try std.Io.Dir.cwd().statFile(io, tmp_path, .{});
     try std.testing.expect(stat1.size > 0);
 
     // Second call: cache hit (path-based; no regeneration).
-    try synthesizeWithGeometry(std.testing.allocator, tmp_path, 1, 5, 2);
-    const stat2 = try std.fs.cwd().statFile(tmp_path);
+    try synthesizeWithGeometry(std.testing.allocator, io, tmp_path, 1, 5, 2);
+    const stat2 = try std.Io.Dir.cwd().statFile(io, tmp_path, .{});
     try std.testing.expectEqual(stat1.size, stat2.size);
 }
 
@@ -126,6 +129,7 @@ test "synthesize: regenerates and caches" {
 /// ROWS_PER_SHEET / COLS_PER_ROW` because those are the gate's contract.
 pub fn synthesizeWithGeometry(
     allocator: Allocator,
+    io: std.Io,
     out_path: []const u8,
     sheet_count: u32,
     rows_per_sheet: u32,
@@ -137,12 +141,12 @@ pub fn synthesizeWithGeometry(
     std.debug.assert(cols_per_row >= 1);
     std.debug.assert(cols_per_row <= 16);
 
-    if (std.fs.cwd().statFile(out_path)) |stat| {
+    if (std.Io.Dir.cwd().statFile(io, out_path, .{})) |stat| {
         if (stat.size > 0) return;
     } else |_| {}
 
     if (std.fs.path.dirname(out_path)) |dir| {
-        std.fs.cwd().makePath(dir) catch |err| switch (err) {
+        std.Io.Dir.cwd().createDirPath(io, dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -169,5 +173,5 @@ pub fn synthesizeWithGeometry(
         }
     }
 
-    try w.save(out_path);
+    try w.save(io, out_path);
 }

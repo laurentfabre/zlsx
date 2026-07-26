@@ -1,0 +1,18 @@
+.{
+    .name = .zlsx_consumer,
+    .version = "0.0.0",
+    .fingerprint = 0x984beadec4755f81,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Path dep on the repo root — this is the whole point of the
+        // gate: prove an EXTERNAL consumer can pull zlsx in the same way
+        // a sibling project (nemonym) will, and import both public
+        // modules at once.
+        .zlsx = .{ .path = "../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

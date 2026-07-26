@@ -4,7 +4,7 @@
 
 # zlsx
 
-Tiny `.xlsx` reader **and** writer for Zig. Single-file library, no third-party deps — just `std.zip` + `std.compress.flate` (for reads) + an in-house LZ77 + dynamic-huffman deflate compressor with lazy matching (for writes, since Zig 0.15.2's `std.compress.flate.Compress` is still mid-refactor) + a hand-rolled XML walker scoped to what spreadsheets actually need. Ships with a CLI, a C ABI, and Python bindings.
+Tiny `.xlsx` reader **and** writer for Zig. Single-file library, no third-party deps — just `std.zip` + `std.compress.flate` (both directions) + a hand-rolled XML walker scoped to what spreadsheets actually need. Ships with a CLI, a C ABI, and Python bindings.
 
 **Reader**: 1.7-2.0 ms on small files, **3.3 ms / 2.37 MB** on a 67 KB workbook with 1,144 shared strings — **1.11× faster than calamine-rust**, 6.4× faster than python-calamine, 37× faster than openpyxl on that file, at the **smallest RSS of the four** (~7-18× lower than the Python stack, ~1.3× lower than calamine). Native-speed tier on every corpus file. [Full benchmark table →](docs/benchmarks.md)
 
@@ -158,12 +158,19 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 | Comments / notes | ✓⁶ | ? | ✓ | — |
 | Chart / image / pivot access | — | — | ~ | — |
 | Load-modify-save | — | — | ✓ | — |
+| Sheet visibility (`hidden` / `veryHidden`) | ✓⁷ | — | ✓ | — |
+| Document properties (`docProps`) read | ✓⁸ | — | ✓ | — |
+| Document properties scrub | ✓⁹ | — | — | — |
 
 ¹ Returns a single `Float` type for any non-text number — callers cast to integer if needed.
 ² `xlsx.fromExcelSerial(cell.number) -> ?DateTime`; out-of-range serials (1900 leap-bug window) return `null`.
 ³ `Book.richRuns(sst_idx)` surfaces per-`<r>` bold / italic + ARGB color / size / font name. Theme colors (`<color theme="N"/>`) are resolved via the workbook's `xl/theme/theme1.xml` palette (iter52); `<color indexed="N"/>` and `tint` are still not resolved.
 ⁴ `Rows.parseDate(col_idx)` combines style-lookup + date-format detection + serial decoding into one call. Returns `?DateTime` (or `datetime.datetime | None` in Python). The low-level chain (`styleIndices()` + `isDateFormat()` + `fromExcelSerial()`) is still exposed for callers that need the individual pieces.
 ⁵ `Book.cellFont(style_idx)` surfaces bold / italic / ARGB color / size / font name; `Book.cellFill(style_idx)` surfaces `patternType` + fg / bg ARGB; `Book.cellBorder(style_idx)` surfaces `style` + color per side (left / right / top / bottom / diagonal). Theme colors (`theme="N"`) are resolved via the `xl/theme/theme1.xml` palette (iter52). `indexed="N"` (legacy palette) and `tint` modifiers are still not resolved.
+⁷ `sheet.state` on the reader, and `state` in `zlsx list-sheets` / `meta` output. `veryHidden` sheets are unreachable from Excel's UI — only VBA can reveal them — so a workbook can carry data no reviewer would ever see. `meta` also emits `hidden_sheet_count` / `very_hidden_sheet_count` so a caller can gate with `jq` alone.
+⁸ `Workbook.docProps()` / `Editor.docProps()` (Zig), `Editor.doc_props()` (Python), `zlsx meta --output pretty-json` (`doc_props` object). Covers `dc:creator`, `cp:lastModifiedBy`, title/subject/description/keywords/category, timestamps, `Company`, `Manager`, `Application`, `HyperlinkBase`, plus a `docProps/custom.xml` presence flag.
+⁹ `Editor.stripDocProps(mask)` / `strip_doc_props()` / `zlsx scrub-metadata in.xlsx --out clean.xlsx`. Removes the elements outright rather than blanking them — an empty `<dc:creator/>` still says the document had an author. Timestamps and revision are kept by default (`Mask.all` takes them too). Cell data is byte-preserved. **Scope:** values and metadata only — string literals inside formulas are NOT masked, see [`docs/plans/formula-literal-masking.md`](docs/plans/formula-literal-masking.md).
+
 ⁶ `Book.comments(sheet)` returns `{top_left, author, text, runs}` for every `<comment>` under `<commentList>`. `text` is always the concatenated plain-text form; `runs` is populated (per-run bold/italic/color/size/font_name) when the source body used `<r><rPr>` formatting, null otherwise.
 
 ### Writer capability
@@ -419,11 +426,11 @@ zlsx leads calamine-rust on **every corpus file** (1.02-1.11× faster), holds th
 | xlsxwriter 3.2 (`constant_memory`) | 66.4 ms | 25.61 MB | 55.2 KB | 9.93× slower |
 | openpyxl 3.1 (`write_only`) | 151.9 ms | 41.65 MB | 52.8 KB | 22.74× slower |
 
-zlsx Writer ships an in-house LZ77 + dynamic-huffman deflate compressor with lazy matching and a word-size SIMD match-length compare — 8 bytes per XOR-then-`@ctz` pass in the LZ77 inner loop, ~6× fewer iterations than byte-at-a-time on typical 3-30-byte XML matches. Zig 0.15.2's stdlib `std.compress.flate.Compress` is still mid-refactor and does not compile (we piggy-back on `std.compress.flate.HuffmanEncoder`, the one module in `std.compress.flate` that *is* usable). Sub-1 KB entries bypass compression so the dynamic-block header overhead doesn't inflate tiny XML. **~149,000 styled rows/sec** — 9.93× xlsxwriter, 22.74× openpyxl, at a third of xlsxwriter's RSS. See [`docs/benchmarks.md`](docs/benchmarks.md) for the full matrix.
+zlsx Writer compresses ZIP payloads with Zig 0.16's public `std.compress.flate.Compress` at its default level. Earlier releases carried an in-house LZ77 + dynamic-huffman encoder purely because 0.15.2's stdlib compressor did not compile; 0.16 ships a working one, so ~500 lines of hand-rolled tokenizer, bit-writer and codegen were retired in its favour. Sub-1 KB entries bypass compression so deflate block overhead doesn't inflate tiny XML. Re-running the documented bench harness after the swap gives **6.58 ms ± 0.21** on the 1,000-styled-row fixture against the 6.7 ms ± 0.3 the in-house encoder recorded — unchanged within noise. See [`docs/benchmarks.md`](docs/benchmarks.md) for the full matrix.
 
 ## Zig version
 
-Built against **Zig 0.15.2**. Uses `std.Io` / writer-gate APIs, `std.zip.Iterator`, `std.compress.flate.Decompress`. Older Zig versions need minor surgery on the Reader/Writer types.
+Built against **Zig 0.16.0**. Uses `std.Io` / writer-gate APIs, `std.zip.Iterator`, `std.compress.flate.Decompress`. Older Zig versions need minor surgery on the Reader/Writer types.
 
 ## API
 

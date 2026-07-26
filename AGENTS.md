@@ -2,13 +2,13 @@
 
 Guide for LLM coding agents (Claude Code, Codex, Cursor) working on this repository. Dense on purpose: every rule below has caused a bug or burned an afternoon at least once.
 
-> **Toolchain.** This project targets **Zig 0.15.2 only**. Verify with `zig version` before doing anything else — Zig's stdlib churns between minor releases and 0.16 changes are not backward compatible (`std.Thread.Mutex` → `std.Io.Mutex`, `std.time.nanoTimestamp` removed, `std.process.Child.run` signature change). If `zig version` doesn't print `0.15.2`, fix the PATH before debugging anything else.
+> **Toolchain.** This project targets **Zig 0.16.0 only**. Verify with `zig version` before doing anything else — Zig's stdlib churns hard between minor releases, and 0.16 is a large break from 0.15: I/O is no longer ambient (`std.fs` moved under `std.Io` and every call takes an `io`), `std.time` lost all its functions, and `main` now receives a `std.process.Init`. See the stale-API guard below before writing any stdlib call. If `zig version` doesn't print `0.16.0`, fix the PATH before debugging anything else.
 
 ---
 
 ## What this project is
 
-zlsx is a fast, mostly-read `.xlsx` library written in Zig 0.15.2. It ships:
+zlsx is a fast, mostly-read `.xlsx` library written in Zig 0.16.0. It ships:
 
 - **`zlsx`** — Zig module (reader + writer) for direct consumption from Zig.
 - **`zlsx_pkg`** — package-layer module (PartStore, image/chart anchors) usable without the full reader/writer surface.
@@ -135,11 +135,25 @@ When new ABI exports land but older `libzlsx` versions are still installed, `_ff
 - `unit_fuzz_tests` — fuzz targets in `src/xlsx.zig` (reader / parser surface).
 - `package_fuzz_tests` — fuzz targets in `pkg/store.zig` (`decodeXmlEntities`, `looksExternal`).
 
-Both require **Linux x64**; macOS and Windows are upstream-broken in Zig 0.15.2. Don't claim "fuzzing works" from a macOS dev box — it doesn't.
+**Coverage-guided fuzzing does not currently run at all on Zig 0.16.0**, on any platform: building an `-ffuzz` test binary fails inside Zig's own `lib/compiler/test_runner.zig:566` (`expected type '*const debug.StackTrace', found '*builtin.StackTrace'`). That code is only instantiated in fuzz mode, which is why `zig build test` is unaffected. Upstream bug, not ours.
+
+Two things follow. First, the targets still execute as single-input smoke tests under `zig build test`, so they are not dead weight. Second, the correct invocation is `zig build fuzz --fuzz` — `fuzz` alone is the *step name*; the `--fuzz` *flag* is what enables coverage-guided mode. Omitting it makes the build runner panic on a null `fuzz_context` the moment the instrumented binary reports coverage. The nightly workflow already uses the right form and will start fuzzing for real the day upstream lands the fix.
+
+Beyond that, Linux x64 is the only supported target anyway; macOS (Mach-O `addEntryPoint`) and Windows (shared-memory + COFF/PE debug info) are separately broken upstream. Don't claim "fuzzing works" from a macOS dev box — it doesn't.
 
 ### Three-module collision
 
-`build.zig` documents a Zig 0.15.2 limitation: `cli_mod`, `zlsx_pkg`, and `writer` cannot coexist in one compilation, because every file that `@import("writer")`s ends up claimed by both writer's tree and zlsx_pkg's tree. That's why `zlsx-extract-images` is a separate exe rather than a CLI subcommand. Don't try to merge it back without re-checking the constraint.
+**Resolved on 0.16 — the note below is history, not a live constraint.**
+
+Under Zig 0.15.2, `cli_mod`, `zlsx_pkg` and `writer` could not coexist in one compilation: every file that `@import("writer")`ed ended up claimed by both writer's tree and zlsx_pkg's tree. That is why `zlsx-extract-images` ships as a separate exe rather than a CLI subcommand.
+
+The 0.16 migration retested it directly — adding `cli_mod.addImport("writer", writer_mod)` on top of the existing `zlsx` + `zlsx_pkg` imports builds clean and keeps 1029/1029 tests green. Merging `zlsx-extract-images` back into the CLI is therefore possible now. It has deliberately **not** been done: dropping a shipped binary is a user-visible packaging change and belongs to whoever owns that call, not to a build-graph tidy-up.
+
+What downstream consumers actually depend on — importing `zlsx` and `zlsx_pkg` together — is now a build gate, not a claim: `tests/consumer/` is a standalone package with a path dependency on the repo root that writes a workbook with `zlsx.Writer`, reads it with `zlsx.Book`, mutates it through `zlsx_pkg.Editor`, and re-reads to verify. Run it with:
+
+```sh
+cd tests/consumer && zig build && ./zig-out/bin/consumer /tmp/in.xlsx /tmp/out.xlsx
+```
 
 ### `-Dsingle-threaded` swaps the allocator
 
@@ -225,21 +239,44 @@ For portable code, periodic `zig build -Dtarget=aarch64-linux-musl` (compile-onl
 
 ## Stale-API guard — do NOT emit
 
-These were correct in older Zig but are stale as of 0.15.x. If you're tempted to write them, don't:
+These were correct in older Zig but are stale as of **0.16**. If you're tempted to write them, don't:
+
+**The 0.16 headline: I/O is no longer ambient.** Every filesystem, stdio,
+clock, and child-process call takes an `io: std.Io`. Programs receive one
+(plus argv, a gpa and an arena) through `std.process.Init`, the parameter
+`main` now takes. Library code should accept an `io` parameter rather
+than manufacturing one; long-lived owners (`Book`, `PartStore`, the C ABI
+handles) retain the `Io` they were opened with because they re-touch the
+file after the opening call returns.
 
 | Stale | Replacement |
 |---|---|
-| `std.io.getStdOut().writer()` | `std.fs.File.stdout().deprecatedWriter()` (or new `std.Io.Writer`) |
-| `std.io.getStdErr().writer()` | `std.fs.File.stderr().deprecatedWriter()` |
+| `std.fs.cwd()` | `std.Io.Dir.cwd()`, and every method takes `io` first: `.openFile(io, path, .{})` |
+| `std.fs.File` / `std.fs.File.Reader` | `std.Io.File` / `std.Io.File.Reader` |
+| `file.readAll(buf)` / `file.seekTo(n)` | Removed. Make a `file.reader(io, &.{})` and use `reader.seekTo(n)` + `reader.interface.readSliceAll(buf)` |
+| `file.writeAll(bytes)` after `createFile` | `dir.writeFile(io, .{ .sub_path = p, .data = bytes })` |
+| `dir.realpathAlloc(alloc, p)` | `dir.realPathFileAlloc(io, p, alloc)` — renamed **and** reordered |
+| `std.fs.Dir.atomicFile` | Removed. Use `pkg/atomic_file.zig`'s `AtomicFile` |
+| `std.fs.File.stdout().writer(&buf)` | `std.Io.File.stdout().writer(io, &buf)` |
+| `std.process.argsAlloc(alloc)` / `argsFree` | `init.minimal.args.toSlice(init.arena.allocator())`; there is no free — the arena owns it |
+| `std.process.getEnvVarOwned` | Gone. A test binary's environ is **empty**; read env in `build.zig` via `b.graph.environ_map` and pass values down as build options |
+| `std.process.Child.init` + `child.spawn()` | `std.process.spawn(io, .{ .argv = …, .stdout = .pipe })`; `Term` tags are lowercase (`.exited`) |
+| `std.time.nanoTimestamp` / `milliTimestamp` / `std.time.Timer` | All gone — `std.time` has no functions. Use `std.Io.Clock.now(.awake, io).nanoseconds` (an `i96`) |
+| `std.crypto.random` | Gone. Prefer a design that needs no entropy (e.g. exclusive-create probing) |
+| `std.mem.trimRight` / `trimLeft` | `std.mem.trimEnd` / `trimStart` |
+| `std.meta.intToEnum` (error union) | `std.enums.fromInt` — returns an **optional**, so `orelse` not `catch` |
+| `std.io.fixedBufferStream(&buf)` + `.getWritten()` | `std.Io.Writer.fixed(&buf)` + `.buffered()` |
+| `std.heap.GeneralPurposeAllocator` | `std.heap.DebugAllocator`, or take `init.gpa` |
+| `std.ArrayListUnmanaged(T) = .{}` / `T{}` | `= .empty` |
+| `fn (context, input: []const u8)` fuzz target | `fn (context, smith: *std.testing.Smith)`; draw bytes with `smith.slice(&buf)` |
+| POSIX signal handler typed `fn (i32)` | Derive it: `@typeInfo(@typeInfo(std.posix.Sigaction.handler_fn).pointer.child).@"fn".params[0].type.?` — 0.16 types it per platform |
+| `std.io.getStdOut().writer()` | `std.Io.File.stdout().writer(io, &buf)` |
 | `std.fmt.format("{}", .{x})` on a custom-`format` type | `{f}` is now required |
 | `BoundedArray`, `LinearFifo` | `ArrayListUnmanaged` over a stack/static buffer |
 | `async fn`, `await`, `suspend`, `resume` keywords | Removed; asynchrony via `std.Io` interface |
 | `usingnamespace` | Removed |
-| `std.ArrayList(T).init(allocator)` (managed) as default | `std.ArrayList(T).empty` + explicit allocator on `.append(allocator, x)` / `.deinit(allocator)` |
-| `std.testing.fuzzInput()` | `std.testing.fuzz(ctx, testOne, .{})` |
-| Lossy int→float coercion (`const x: f32 = 1_234_567_890;`) | Compile error in 0.15.x |
+| Lossy int→float coercion (`const x: f32 = 1_234_567_890;`) | Compile error |
 | Bare `{}` format on a type with a `format` method | Compile error; must use `{f}` |
-| `std.heap.GeneralPurposeAllocator(.{})` deinit returning `bool` | Returns `Check{ .ok, .leak }` enum |
 
 ---
 
@@ -247,8 +284,8 @@ These were correct in older Zig but are stale as of 0.15.x. If you're tempted to
 
 ### Wrong zig binary
 **Symptom**: cryptic stdlib errors, missing functions, signature mismatches that don't match what this guide describes.
-**Cause**: shell PATH selects a different Zig than 0.15.2.
-**Fix**: `zig version`. If it isn't `0.15.2`, fix the PATH before debugging anything else.
+**Cause**: shell PATH selects a different Zig than 0.16.0.
+**Fix**: `zig version`. If it isn't `0.16.0`, fix the PATH before debugging anything else.
 
 ### Build cache lying
 `rm -rf .zig-cache zig-out` clears the per-project cache. Only do this when build behavior diverges from `build.zig` reality — not as a reflex.
@@ -300,7 +337,7 @@ Installed as a `commit-msg` hook (run `scripts/install-hooks.sh` once after clon
 
 ## Process when making changes
 
-1. **Confirm the toolchain**: `zig version` should print `0.15.2`. If not, fix that before anything else.
+1. **Confirm the toolchain**: `zig version` should print `0.16.0`. If not, fix that before anything else.
 2. **Read the roadmap**: `docs/plans/post-0.2.9-roadmap.md` and any per-phase plan in `docs/plans/`.
 3. **Write the test first**: add a `test "<name>"` block, watch it fail with `zig build test`, then implement.
 4. **Verify the file is in the test graph**: a new file's tests don't run unless the file is `@import`-ed from something already wired in `build.zig`.
@@ -327,7 +364,7 @@ ls docs/plans/                            # roadmap + phase plans
 
 ## Anti-patterns
 
-- Using a non-0.15.2 zig — every error you see will be confusing.
+- Using a non-0.16.0 zig — every error you see will be confusing.
 - Adding a third-party Zig runtime dependency without authorization. zlsx is stdlib-only.
 - Reordering or inserting fields into a published `extern struct` (breaks the C ABI).
 - Updating `src/c_abi.zig` without updating `include/zlsx.h` and `bindings/python/zlsx/_ffi.py` in the same change.

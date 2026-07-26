@@ -5,6 +5,7 @@
 //! pipeable into jq / awk, no Python interpreter floor.
 
 const std = @import("std");
+const fuzz_config = @import("fuzz_config");
 const builtin = @import("builtin");
 const xlsx = @import("zlsx");
 const zlsx_pkg = @import("zlsx_pkg");
@@ -60,6 +61,11 @@ const Subcommand = enum {
     add_sheet,
     rename_sheet,
     delete_sheet,
+    /// Z3: strip identifying document metadata (docProps/core.xml,
+    /// docProps/app.xml, docProps/custom.xml) and save to `--out`.
+    /// Cell data is untouched — this is the metadata counterpart to
+    /// masking cell values.
+    scrub_metadata,
 };
 
 /// iter60b: `--output` wire-shape switch.
@@ -241,6 +247,7 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
         if (std.mem.eql(u8, a, "delete-sheet")) return .delete_sheet;
         if (std.mem.eql(u8, a, "meta")) return .meta;
         if (std.mem.eql(u8, a, "list-sheets")) return .list_sheets;
+        if (std.mem.eql(u8, a, "scrub-metadata")) return .scrub_metadata;
         if (std.mem.eql(u8, a, "comments")) return .comments;
         if (std.mem.eql(u8, a, "validations")) return .validations;
         if (std.mem.eql(u8, a, "hyperlinks")) return .hyperlinks;
@@ -353,7 +360,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         .styles,
         .sst,
         => true,
-        .rows, .cells, .comments, .validations, .hyperlinks, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet => false,
+        .rows, .cells, .comments, .validations, .hyperlinks, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata => false,
     };
 
     var out: Args = .{ .file = "", .subcommand = detected_sub };
@@ -531,6 +538,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
                     std.mem.eql(u8, a, "rows") or
                     std.mem.eql(u8, a, "meta") or
                     std.mem.eql(u8, a, "list-sheets") or
+                    std.mem.eql(u8, a, "scrub-metadata") or
                     std.mem.eql(u8, a, "comments") or
                     std.mem.eql(u8, a, "validations") or
                     std.mem.eql(u8, a, "hyperlinks") or
@@ -563,7 +571,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.start_row != null or out.end_row != null) {
         switch (detected_sub) {
             .rows, .cells, .comments => {},
-            .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet => {
+            .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata => {
                 return ArgError.BadArgValue;
             },
         }
@@ -575,7 +583,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.range != null) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet => {
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata => {
                 return ArgError.BadArgValue;
             },
         }
@@ -607,7 +615,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.include_blanks) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet => {
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata => {
                 return ArgError.BadArgValue;
             },
         }
@@ -616,7 +624,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.with_styles) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet => {
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata => {
                 return ArgError.BadArgValue;
             },
         }
@@ -630,11 +638,19 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
             if (out.header) return ArgError.BadArgValue;
         }
     }
-    // iter60b: `pretty-json` is the meta-only collapsed-object variant
-    // (docs/jq-for-excel.md v4.1). Every other sub-command emits a
-    // streaming shape — a collapsed single-object rewrite doesn't
-    // compose. Reject at parse time rather than silently fall back.
-    if (out.output == .pretty_json and detected_sub != .meta) {
+    // iter60b: `pretty-json` is the collapsed-object variant
+    // (docs/jq-for-excel.md v4.1). Every streaming sub-command emits a
+    // record-per-line shape that a collapsed single-object rewrite
+    // doesn't compose with, so those are still rejected at parse time
+    // rather than silently falling back.
+    //
+    // `list-sheets` joined `meta` here: it is workbook-scoped and
+    // bounded (one record per sheet), so a single object is a coherent
+    // shape — and callers checking sheet visibility want to `jq` the
+    // whole answer at once rather than stream it.
+    if (out.output == .pretty_json and
+        detected_sub != .meta and detected_sub != .list_sheets)
+    {
         return ArgError.BadArgValue;
     }
     // `--format` shapes only `rows` output. On sheet-scoped sub-commands
@@ -682,6 +698,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         .add_sheet,
         .rename_sheet,
         .delete_sheet,
+        .scrub_metadata,
         => {},
         else => return ArgError.BadArgValue,
     };
@@ -1517,15 +1534,21 @@ const signals = struct {
     var sigterm_fired = std.atomic.Value(bool).init(false);
     var sigpipe_fired = std.atomic.Value(bool).init(false);
 
-    fn onSigpipe(_: i32) callconv(.c) void {
+    /// 0.16 types the POSIX signal-handler parameter per platform —
+    /// Linux uses a generated `SIG` enum, other targets an int — so
+    /// derive it from `Sigaction.handler_fn` instead of hard-coding
+    /// `i32`, which only compiled on some targets.
+    const SigArg = @typeInfo(@typeInfo(std.posix.Sigaction.handler_fn).pointer.child).@"fn".params[0].type.?;
+
+    fn onSigpipe(_: SigArg) callconv(.c) void {
         sigpipe_fired.store(true, .release);
         stop_streaming.store(true, .release);
     }
-    fn onSigint(_: i32) callconv(.c) void {
+    fn onSigint(_: SigArg) callconv(.c) void {
         sigint_fired.store(true, .release);
         stop_streaming.store(true, .release);
     }
-    fn onSigterm(_: i32) callconv(.c) void {
+    fn onSigterm(_: SigArg) callconv(.c) void {
         sigterm_fired.store(true, .release);
         stop_streaming.store(true, .release);
     }
@@ -1586,13 +1609,13 @@ fn classifyTopLevelError(e: anyerror) u8 {
     };
 }
 
-pub fn main() u8 {
+pub fn main(init: std.process.Init) u8 {
     // iter60a: the process-hygiene slice. Install SIGPIPE / SIGINT /
     // SIGTERM handlers before any emission can begin so a fast pipe
     // teardown (e.g. `| head -0`) never races the first write.
     signals.install();
 
-    const code = runMain() catch |e| blk: {
+    const code = runMain(init) catch |e| blk: {
         const classified = classifyTopLevelError(e);
         // Preserve the diagnostic for unclassified errors so field
         // users still get a handle to file a bug — exit 1 without
@@ -1600,7 +1623,7 @@ pub fn main() u8 {
         // good luck figuring out what."
         if (classified == 1) {
             var stderr_buf: [128]u8 = undefined;
-            var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+            var stderr_file = std.Io.File.stderr().writer(init.io, &stderr_buf);
             const err = &stderr_file.interface;
             err.print("zlsx: {s}\n", .{@errorName(e)}) catch {};
             err.flush() catch {};
@@ -1610,7 +1633,20 @@ pub fn main() u8 {
     return signals.exitCode(code);
 }
 
-fn runMain() !u8 {
+/// Process-wide Io for the CLI.
+///
+/// Zig 0.16 requires an `Io` for every filesystem and stdio call. It is
+/// handed to `main` via `std.process.Init` and stashed here so the
+/// dispatch switch can reach it without threading a parameter through
+/// every command signature. The command functions that actually touch
+/// the filesystem still take an `io` parameter — that keeps them
+/// testable, since tests never run `runMain` and so never set this.
+///
+/// Named `proc_io` rather than `io` so it cannot collide with the
+/// locally bound `io` in test blocks.
+var proc_io: std.Io = undefined;
+
+fn runMain(init: std.process.Init) !u8 {
     // Debug builds use the leak-detecting allocator; release builds use
     // smp_allocator — fast, pure-Zig (no libc dep). smp_allocator asserts
     // !builtin.single_threaded, so single-threaded builds fall back to
@@ -1626,11 +1662,20 @@ fn runMain() !u8 {
         std.heap.smp_allocator;
     const alloc = if (builtin.mode == .Debug) gpa.allocator() else release_alloc;
 
-    const raw_args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, raw_args);
+    // 0.16 hands main its Io and argv through `std.process.Init`
+    // rather than exposing them ambiently — `std.process.argsAlloc` is
+    // gone. Take both from there instead of standing up our own
+    // Threaded instance.
+    proc_io = init.io;
+
+    // toSlice wants an arena — process.Init carries one whose lifetime
+    // is the whole process, which is exactly argv's lifetime. Passing
+    // the general-purpose allocator instead leaks, since 0.16 has no
+    // argsFree counterpart.
+    const raw_args = try init.minimal.args.toSlice(init.arena.allocator());
 
     var stdout_buf: [16 * 1024]u8 = undefined;
-    var stdout_file = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_file = std.Io.File.stdout().writer(proc_io, &stdout_buf);
     const out = &stdout_file.interface;
     // iter60a: flush on normal exit AND on a signal-triggered stop.
     // Per-record flushes below surface SIGPIPE promptly; this trailing
@@ -1641,7 +1686,7 @@ fn runMain() !u8 {
     defer out.flush() catch {};
 
     var stderr_buf: [4 * 1024]u8 = undefined;
-    var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_file = std.Io.File.stderr().writer(proc_io, &stderr_buf);
     const err = &stderr_file.interface;
     defer err.flush() catch {};
 
@@ -1681,31 +1726,32 @@ fn runMain() !u8 {
     // archive) instead of Book (read-only), so dispatch BEFORE the
     // Book open. Returns its own exit code.
     if (args.subcommand == .append_rows) {
-        return try runAppendRowsCommand(alloc, args, err);
+        return try runAppendRowsCommand(alloc, proc_io, args, err);
     }
     // iter-cm-4: same dispatch pattern for set-cell — Editor route.
     if (args.subcommand == .set_cell) {
-        return try runSetCellCommand(alloc, args, err);
+        return try runSetCellCommand(alloc, proc_io, args, err);
     }
     // iter-row-4 / iter-col-5 / iter-sheet-5: structural-edit
     // sub-commands also route through Editor.
     switch (args.subcommand) {
-        .insert_row, .delete_row => return try runRowEditCommand(alloc, args, err),
-        .insert_column, .delete_column => return try runColEditCommand(alloc, args, err),
-        .add_sheet => return try runAddSheetCommand(alloc, args, err),
-        .rename_sheet => return try runRenameSheetCommand(alloc, args, err),
-        .delete_sheet => return try runDeleteSheetCommand(alloc, args, err),
+        .insert_row, .delete_row => return try runRowEditCommand(alloc, proc_io, args, err),
+        .insert_column, .delete_column => return try runColEditCommand(alloc, proc_io, args, err),
+        .add_sheet => return try runAddSheetCommand(alloc, proc_io, args, err),
+        .rename_sheet => return try runRenameSheetCommand(alloc, proc_io, args, err),
+        .delete_sheet => return try runDeleteSheetCommand(alloc, proc_io, args, err),
+        .scrub_metadata => return try runScrubMetadataCommand(alloc, proc_io, args, err),
         else => {},
     }
 
     // iter-sst-4: dispatch on --sst-lazy.
     var book = if (args.sst_lazy)
-        xlsx.Book.openSstLazy(alloc, args.file) catch |e| {
+        xlsx.Book.openSstLazy(alloc, proc_io, args.file) catch |e| {
             try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
             return 2;
         }
     else
-        xlsx.Book.open(alloc, args.file) catch |e| {
+        xlsx.Book.open(alloc, proc_io, args.file) catch |e| {
             try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
             return 2;
         };
@@ -1739,11 +1785,20 @@ fn runMain() !u8 {
                 try err.flush();
                 break :blk null;
             };
-            try runMetaCommand(out, &book, path_opt, args.output);
+            // Document properties come from the package layer, which
+            // the reader-only Book has no view of. The reader accepts
+            // some archives the package layer refuses (ZIP data
+            // descriptors, for one), so a failure here degrades to
+            // `"doc_props": null` rather than failing `meta` outright.
+            var dp_wb: ?zlsx_pkg.Workbook = zlsx_pkg.Workbook.open(alloc, proc_io, args.file) catch null;
+            defer if (dp_wb) |*w| w.deinit();
+            const dp: ?zlsx_pkg.DocProps = if (dp_wb) |*w| (w.docProps() catch null) else null;
+
+            try runMetaCommand(out, &book, path_opt, args.output, dp);
             return 0;
         },
         .list_sheets => {
-            try runListSheetsCommand(out, &book);
+            try runListSheetsCommand(out, &book, args.output);
             return 0;
         },
         .comments => {
@@ -1788,6 +1843,7 @@ fn runMain() !u8 {
         .add_sheet,
         .rename_sheet,
         .delete_sheet,
+        .scrub_metadata,
         => unreachable,
         .rows, .cells => {},
     }
@@ -1840,6 +1896,7 @@ fn runMain() !u8 {
         .add_sheet,
         .rename_sheet,
         .delete_sheet,
+        .scrub_metadata,
         => unreachable,
     }
     return 0;
@@ -2057,7 +2114,7 @@ fn runRowsOnSheetCore(
     // Lifetime is this function's scope; row iteration yields fresh
     // cell buffers per row, so we must copy header cell contents out
     // before the next `rows.next()` call reuses the buffer.
-    var header_keys: std.ArrayListUnmanaged([]u8) = .{};
+    var header_keys: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
         for (header_keys.items) |k| alloc.free(k);
         header_keys.deinit(alloc);
@@ -2086,24 +2143,24 @@ fn runRowsOnSheetCore(
     // contract (cells[i] lives in column i) requires we write `.empty`
     // into out-of-range columns rather than compacting the slice.
     // Only allocated when --range is actually present.
-    var masked: std.ArrayListUnmanaged(xlsx.Cell) = .{};
+    var masked: std.ArrayListUnmanaged(xlsx.Cell) = .empty;
     defer masked.deinit(alloc);
     // iter59b-4: parallel masked style indices — lives next to `masked`
     // so `masked.items[i]` and `masked_styles.items[i]` stay paired
     // through every view transformation below. Only populated when
     // --range is present AND we're on the envelope-positional path.
-    var masked_styles: std.ArrayListUnmanaged(?u32) = .{};
+    var masked_styles: std.ArrayListUnmanaged(?u32) = .empty;
     defer masked_styles.deinit(alloc);
     // Parallel masked date-type flags — same lockstep invariant as
     // `masked_styles`, wired through `writeRowEnvelope` so the sliced
     // envelope still surfaces `t:"date"` for date-styled numerics.
-    var masked_dates: std.ArrayListUnmanaged(bool) = .{};
+    var masked_dates: std.ArrayListUnmanaged(bool) = .empty;
     defer masked_dates.deinit(alloc);
     // iter61-c: parallel masked error-string slice. Same lockstep
     // invariant as `masked_styles` / `masked_dates`, wired through
     // `writeRowEnvelope` so the sliced envelope still surfaces
     // `t:"error"` for cells whose source `<c>` was `t="e"`.
-    var masked_errors: std.ArrayListUnmanaged(?[]const u8) = .{};
+    var masked_errors: std.ArrayListUnmanaged(?[]const u8) = .empty;
     defer masked_errors.deinit(alloc);
     // iter61-b: parallel masked formula-string + formula-ref slices.
     // Same lockstep invariant — wired through `writeRowEnvelope` so
@@ -2111,9 +2168,9 @@ fn runRowsOnSheetCore(
     // cells whose source `<c>` carried `<f>`. The two are mutually
     // exclusive per cell (a cell either has its own formula text or
     // is a shared-formula slave referencing one).
-    var masked_formulas: std.ArrayListUnmanaged(?[]const u8) = .{};
+    var masked_formulas: std.ArrayListUnmanaged(?[]const u8) = .empty;
     defer masked_formulas.deinit(alloc);
-    var masked_formula_refs: std.ArrayListUnmanaged(?xlsx.CellRef) = .{};
+    var masked_formula_refs: std.ArrayListUnmanaged(?xlsx.CellRef) = .empty;
     defer masked_formula_refs.deinit(alloc);
 
     while (try rows.next()) |cells| {
@@ -2663,7 +2720,21 @@ fn runMetaCommand(
     book: *const xlsx.Book,
     path: ?[]const u8,
     output: OutputMode,
+    /// Document properties, or null when the package layer could not
+    /// open the archive. The reader accepts some archives the Editor
+    /// refuses (ZIP data descriptors, for one), so `meta` must still
+    /// work without them rather than fail the whole command.
+    doc_props: ?zlsx_pkg.DocProps,
 ) !void {
+    // Hidden-sheet tally. Exposed as scalars so a caller can gate on it
+    // with jq alone rather than reducing over the sheets array.
+    var hidden_count: usize = 0;
+    var very_hidden_count: usize = 0;
+    for (book.sheets) |s| switch (s.state) {
+        .hidden => hidden_count += 1,
+        .very_hidden => very_hidden_count += 1,
+        .visible => {},
+    };
     // Workbook-level `has_comments` is the OR across every sheet —
     // saves callers a reduce step when they only want "does this file
     // have any comments at all?".
@@ -2702,6 +2773,11 @@ fn runMetaCommand(
                 if (any_comments) "true" else "false",
             },
         );
+        try out.print(
+            "  \"hidden_sheet_count\": {d},\n  \"very_hidden_sheet_count\": {d},\n",
+            .{ hidden_count, very_hidden_count },
+        );
+        try writeDocPropsPretty(out, doc_props);
         try out.writeAll("  \"sheets\": [");
         if (book.sheets.len == 0) {
             try out.writeAll("]\n}\n");
@@ -2715,8 +2791,8 @@ fn runMetaCommand(
             try out.writeAll("    {\"kind\": \"sheet\", \"sheet\": ");
             try writeJsonString(out, s.name);
             try out.print(
-                ", \"sheet_idx\": {d}, \"has_comments\": {s}}}",
-                .{ i, if (sheet_has_comments) "true" else "false" },
+                ", \"sheet_idx\": {d}, \"state\": \"{s}\", \"has_comments\": {s}}}",
+                .{ i, s.state.toString(), if (sheet_has_comments) "true" else "false" },
             );
             if (i + 1 < book.sheets.len) try out.writeByte(',');
             try out.writeByte('\n');
@@ -2736,13 +2812,19 @@ fn runMetaCommand(
         .{ book.sheets.len, book.sharedStringsCount(), book.rich_runs_by_sst_idx.count() },
     );
     try out.print(
-        ",\"has_styles\":{s},\"has_theme\":{s},\"has_comments\":{s}}}\n",
+        ",\"has_styles\":{s},\"has_theme\":{s},\"has_comments\":{s}",
         .{
             if (book.styles_xml != null) "true" else "false",
             if (book.theme_xml != null) "true" else "false",
             if (any_comments) "true" else "false",
         },
     );
+    try out.print(
+        ",\"hidden_sheet_count\":{d},\"very_hidden_sheet_count\":{d}",
+        .{ hidden_count, very_hidden_count },
+    );
+    try writeDocPropsCompact(out, doc_props);
+    try out.writeAll("}\n");
 
     // iter60b-P1: compact mode is a documented no-op for meta's
     // per-sheet records. Stripping sheet/sheet_idx here would orphan
@@ -2756,23 +2838,165 @@ fn runMetaCommand(
         try out.writeAll("{\"kind\":\"sheet\",\"sheet\":");
         try writeJsonString(out, s.name);
         try out.print(
-            ",\"sheet_idx\":{d},\"has_comments\":{s}}}\n",
-            .{ i, if (sheet_has_comments) "true" else "false" },
+            ",\"sheet_idx\":{d},\"state\":\"{s}\",\"has_comments\":{s}}}\n",
+            .{ i, s.state.toString(), if (sheet_has_comments) "true" else "false" },
         );
     }
     try out.flush();
+}
+
+/// Emit the `doc_props` object for `meta --output pretty-json`.
+///
+/// Absent parts render as `null` rather than being omitted, so a
+/// consumer can distinguish "zlsx could not read them" from "the
+/// workbook genuinely has none" without a schema lookup.
+fn writeDocPropsPretty(out: *std.Io.Writer, props: ?zlsx_pkg.DocProps) !void {
+    const dp = props orelse {
+        try out.writeAll("  \"doc_props\": null,\n");
+        return;
+    };
+    try out.writeAll("  \"doc_props\": {\n");
+    try writeDocPropField(out, "creator", dp.creator, "    ", true);
+    try writeDocPropField(out, "last_modified_by", dp.last_modified_by, "    ", true);
+    try writeDocPropField(out, "title", dp.title, "    ", true);
+    try writeDocPropField(out, "subject", dp.subject, "    ", true);
+    try writeDocPropField(out, "description", dp.description, "    ", true);
+    try writeDocPropField(out, "keywords", dp.keywords, "    ", true);
+    try writeDocPropField(out, "category", dp.category, "    ", true);
+    try writeDocPropField(out, "created", dp.created, "    ", true);
+    try writeDocPropField(out, "modified", dp.modified, "    ", true);
+    try writeDocPropField(out, "revision", dp.revision, "    ", true);
+    try writeDocPropField(out, "company", dp.company, "    ", true);
+    try writeDocPropField(out, "manager", dp.manager, "    ", true);
+    try writeDocPropField(out, "application", dp.application, "    ", true);
+    try writeDocPropField(out, "hyperlink_base", dp.hyperlink_base, "    ", true);
+    try out.print(
+        "    \"has_custom_properties\": {s}\n  }},\n",
+        .{if (dp.has_custom_properties) "true" else "false"},
+    );
+}
+
+/// Same object, single-line, for the NDJSON envelope.
+fn writeDocPropsCompact(out: *std.Io.Writer, props: ?zlsx_pkg.DocProps) !void {
+    const dp = props orelse {
+        try out.writeAll(",\"doc_props\":null");
+        return;
+    };
+    try out.writeAll(",\"doc_props\":{");
+    try writeDocPropField(out, "creator", dp.creator, "", false);
+    try writeDocPropField(out, "last_modified_by", dp.last_modified_by, "", false);
+    try writeDocPropField(out, "title", dp.title, "", false);
+    try writeDocPropField(out, "subject", dp.subject, "", false);
+    try writeDocPropField(out, "description", dp.description, "", false);
+    try writeDocPropField(out, "keywords", dp.keywords, "", false);
+    try writeDocPropField(out, "category", dp.category, "", false);
+    try writeDocPropField(out, "created", dp.created, "", false);
+    try writeDocPropField(out, "modified", dp.modified, "", false);
+    try writeDocPropField(out, "revision", dp.revision, "", false);
+    try writeDocPropField(out, "company", dp.company, "", false);
+    try writeDocPropField(out, "manager", dp.manager, "", false);
+    try writeDocPropField(out, "application", dp.application, "", false);
+    try writeDocPropField(out, "hyperlink_base", dp.hyperlink_base, "", false);
+    try out.print(
+        "\"has_custom_properties\":{s}}}",
+        .{if (dp.has_custom_properties) "true" else "false"},
+    );
+}
+
+/// One `"key": value` pair. Null fields emit JSON `null` so the object
+/// shape is stable across workbooks — consumers can index without
+/// existence checks.
+fn writeDocPropField(
+    out: *std.Io.Writer,
+    key: []const u8,
+    value: ?[]const u8,
+    indent: []const u8,
+    pretty: bool,
+) !void {
+    try out.writeAll(indent);
+    try out.writeByte('"');
+    try out.writeAll(key);
+    try out.writeAll(if (pretty) "\": " else "\":");
+    if (value) |v| try writeJsonString(out, v) else try out.writeAll("null");
+    try out.writeAll(",");
+    if (pretty) try out.writeByte('\n');
+}
+
+/// `zlsx scrub-metadata <in.xlsx> --out <clean.xlsx>`
+///
+/// Strips authorship metadata and saves. Everything else — every cell,
+/// every untouched part — flows through the Editor's byte-preserving
+/// save path unchanged.
+fn runScrubMetadataCommand(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    args: Args,
+    err: *std.Io.Writer,
+) !u8 {
+    const out_path = args.out_path orelse {
+        try err.writeAll("zlsx: scrub-metadata requires --out PATH\n");
+        try err.flush();
+        return 2;
+    };
+
+    var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    defer ed.deinit();
+
+    ed.stripDocProps(.{}) catch |e| {
+        try err.print("zlsx: scrub-metadata: {s}\n", .{@errorName(e)});
+        try err.flush();
+        return 3;
+    };
+
+    ed.save(io, out_path) catch |e| {
+        try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
+        try err.flush();
+        return 5;
+    };
+    return 0;
 }
 
 /// iter57: lighter NDJSON variant of `meta` — one record per sheet,
 /// name + index only. Same envelope shape as `meta`'s sheet record
 /// minus the workbook-scoped `has_comments` field, so consumers can
 /// trivially swap between the two commands.
-fn runListSheetsCommand(out: *std.Io.Writer, book: *const xlsx.Book) !void {
+fn runListSheetsCommand(out: *std.Io.Writer, book: *const xlsx.Book, output: OutputMode) !void {
+    if (output == .pretty_json) {
+        try out.writeAll("{\n  \"sheets\": [");
+        if (book.sheets.len == 0) {
+            try out.writeAll("]\n}\n");
+            try out.flush();
+            return;
+        }
+        try out.writeByte('\n');
+        for (book.sheets, 0..) |s, i| {
+            if (signals.shouldStop()) return;
+            try out.writeAll("    {\"kind\": \"sheet\", \"sheet\": ");
+            try writeJsonString(out, s.name);
+            try out.print(
+                ", \"sheet_idx\": {d}, \"state\": \"{s}\"}}",
+                .{ i, s.state.toString() },
+            );
+            if (i + 1 < book.sheets.len) try out.writeByte(',');
+            try out.writeByte('\n');
+        }
+        try out.writeAll("  ]\n}\n");
+        try out.flush();
+        return;
+    }
+
     for (book.sheets, 0..) |s, i| {
         if (signals.shouldStop()) return;
         try out.writeAll("{\"kind\":\"sheet\",\"sheet\":");
         try writeJsonString(out, s.name);
-        try out.print(",\"sheet_idx\":{d}}}\n", .{i});
+        // `state` surfaces `<sheet state="…">`. veryHidden sheets are
+        // unreachable from Excel's UI, so a caller scanning a workbook
+        // has no other way to learn they exist.
+        try out.print(",\"sheet_idx\":{d},\"state\":\"{s}\"}}\n", .{ i, s.state.toString() });
     }
     try out.flush();
 }
@@ -3446,6 +3670,7 @@ fn runSstCommand(
 /// errors, 5 on save failure.
 fn runAppendRowsCommand(
     alloc: std.mem.Allocator,
+    io: std.Io,
     args: Args,
     err: *std.Io.Writer,
 ) !u8 {
@@ -3470,7 +3695,7 @@ fn runAppendRowsCommand(
     }
     const sheet_idx: u32 = @intCast(sheet_idx_opt.?);
 
-    var ed = zlsx_pkg.Editor.open(alloc, args.file) catch |e| {
+    var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
         return 2;
@@ -3480,9 +3705,9 @@ fn runAppendRowsCommand(
     // Slurp stdin once. NDJSON volumes for append are typically
     // bounded (audit logs, ETL deltas); refuse > 256 MiB to keep
     // pathological inputs from OOM-ing the process.
-    const stdin = std.fs.File.stdin();
+    const stdin = std.Io.File.stdin();
     var stdin_buf: [8192]u8 = undefined;
-    var stdin_reader = stdin.reader(&stdin_buf);
+    var stdin_reader = stdin.reader(proc_io, &stdin_buf);
     const all_input = stdin_reader.interface.allocRemaining(alloc, .limited(256 * 1024 * 1024)) catch |e| {
         try err.print("zlsx: failed to read stdin: {s}\n", .{@errorName(e)});
         try err.flush();
@@ -3549,7 +3774,7 @@ fn runAppendRowsCommand(
         };
     }
 
-    ed.save(out_path) catch |e| {
+    ed.save(io, out_path) catch |e| {
         try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
         try err.flush();
         return 5;
@@ -3563,6 +3788,7 @@ fn runAppendRowsCommand(
 /// accepted types match `append-rows` exactly.
 fn runSetCellCommand(
     alloc: std.mem.Allocator,
+    io: std.Io,
     args: Args,
     err: *std.Io.Writer,
 ) !u8 {
@@ -3624,7 +3850,7 @@ fn runSetCellCommand(
         return 3;
     };
 
-    var ed = zlsx_pkg.Editor.open(alloc, args.file) catch |e| {
+    var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
         return 2;
@@ -3636,7 +3862,7 @@ fn runSetCellCommand(
         try err.flush();
         return 3;
     };
-    ed.save(out_path) catch |e| {
+    ed.save(io, out_path) catch |e| {
         try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
         try err.flush();
         return 5;
@@ -3675,6 +3901,7 @@ fn requireSheetIdxU32(args: Args, err: *std.Io.Writer, who: []const u8) !u32 {
 
 fn runRowEditCommand(
     alloc: std.mem.Allocator,
+    io: std.Io,
     args: Args,
     err: *std.Io.Writer,
 ) !u8 {
@@ -3694,7 +3921,7 @@ fn runRowEditCommand(
         return 1;
     };
 
-    var ed = zlsx_pkg.Editor.open(alloc, args.file) catch |e| {
+    var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
         return 2;
@@ -3714,7 +3941,7 @@ fn runRowEditCommand(
         },
         else => unreachable,
     }
-    ed.save(out_path) catch |e| {
+    ed.save(io, out_path) catch |e| {
         try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
         try err.flush();
         return 5;
@@ -3724,6 +3951,7 @@ fn runRowEditCommand(
 
 fn runColEditCommand(
     alloc: std.mem.Allocator,
+    io: std.Io,
     args: Args,
     err: *std.Io.Writer,
 ) !u8 {
@@ -3748,7 +3976,7 @@ fn runColEditCommand(
         return 1;
     };
 
-    var ed = zlsx_pkg.Editor.open(alloc, args.file) catch |e| {
+    var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
         return 2;
@@ -3768,7 +3996,7 @@ fn runColEditCommand(
         },
         else => unreachable,
     }
-    ed.save(out_path) catch |e| {
+    ed.save(io, out_path) catch |e| {
         try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
         try err.flush();
         return 5;
@@ -3778,6 +4006,7 @@ fn runColEditCommand(
 
 fn runAddSheetCommand(
     alloc: std.mem.Allocator,
+    io: std.Io,
     args: Args,
     err: *std.Io.Writer,
 ) !u8 {
@@ -3792,7 +4021,7 @@ fn runAddSheetCommand(
         return 1;
     };
 
-    var ed = zlsx_pkg.Editor.open(alloc, args.file) catch |e| {
+    var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
         return 2;
@@ -3804,7 +4033,7 @@ fn runAddSheetCommand(
         try err.flush();
         return 3;
     };
-    ed.save(out_path) catch |e| {
+    ed.save(io, out_path) catch |e| {
         try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
         try err.flush();
         return 5;
@@ -3814,6 +4043,7 @@ fn runAddSheetCommand(
 
 fn runRenameSheetCommand(
     alloc: std.mem.Allocator,
+    io: std.Io,
     args: Args,
     err: *std.Io.Writer,
 ) !u8 {
@@ -3829,7 +4059,7 @@ fn runRenameSheetCommand(
         return 1;
     };
 
-    var ed = zlsx_pkg.Editor.open(alloc, args.file) catch |e| {
+    var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
         return 2;
@@ -3841,7 +4071,7 @@ fn runRenameSheetCommand(
         try err.flush();
         return 3;
     };
-    ed.save(out_path) catch |e| {
+    ed.save(io, out_path) catch |e| {
         try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
         try err.flush();
         return 5;
@@ -3851,6 +4081,7 @@ fn runRenameSheetCommand(
 
 fn runDeleteSheetCommand(
     alloc: std.mem.Allocator,
+    io: std.Io,
     args: Args,
     err: *std.Io.Writer,
 ) !u8 {
@@ -3861,7 +4092,7 @@ fn runDeleteSheetCommand(
     };
     const sheet_idx = requireSheetIdxU32(args, err, "delete-sheet") catch return 1;
 
-    var ed = zlsx_pkg.Editor.open(alloc, args.file) catch |e| {
+    var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
         return 2;
@@ -3873,7 +4104,7 @@ fn runDeleteSheetCommand(
         try err.flush();
         return 3;
     };
-    ed.save(out_path) catch |e| {
+    ed.save(io, out_path) catch |e| {
         try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
         try err.flush();
         return 5;
@@ -3927,8 +4158,8 @@ const TestTmp = struct {
     pub fn deinit(self: *TestTmp) void {
         self.dir.cleanup();
     }
-    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
-        const d = try self.dir.dir.realpathAlloc(alloc, ".");
+    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, io: std.Io, name: []const u8) ![:0]u8 {
+        const d = try self.dir.dir.realPathFileAlloc(io, ".", alloc);
         defer alloc.free(d);
         return std.fs.path.joinZ(alloc, &.{ d, name });
     }
@@ -3986,12 +4217,15 @@ test "parseArgs: set-cell subcommand token is skipped, --ref / --value parse" {
 }
 
 test "runSetCellCommand rewrites a single cell and saves to --out" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx.writer_types;
-    const src_path = try tt.path(std.testing.allocator, "cli_set_cell_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "cli_set_cell_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "cli_set_cell_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "cli_set_cell_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -3999,7 +4233,7 @@ test "runSetCellCommand rewrites a single cell and saves to --out" {
         var s = try w.addSheet("S");
         try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 } });
         try s.writeRow(&.{ .{ .integer = 3 }, .{ .integer = 4 } });
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     var err_buf: [1024]u8 = undefined;
     var err_w = std.Io.Writer.fixed(&err_buf);
@@ -4011,12 +4245,12 @@ test "runSetCellCommand rewrites a single cell and saves to --out" {
         .cell_ref = "B1",
         .cell_value_json = "\"hello\"",
     };
-    const rc = try runSetCellCommand(std.testing.allocator, args, &err_w);
+    const rc = try runSetCellCommand(std.testing.allocator, io, args, &err_w);
     try std.testing.expectEqual(@as(u8, 0), rc);
 
     // Verify by re-opening the saved file: B1 must be "hello", A1
     // unchanged, A2 unchanged.
-    var book = try xlsx.Book.open(std.testing.allocator, dst_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -4029,35 +4263,38 @@ test "runSetCellCommand rewrites a single cell and saves to --out" {
 }
 
 test "runSetCellCommand rejects missing --ref / --value / --out" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx.writer_types;
-    const src_path = try tt.path(std.testing.allocator, "cli_set_cell_missing.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "cli_set_cell_missing.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("S");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     var err_buf: [1024]u8 = undefined;
     {
         var err_w = std.Io.Writer.fixed(&err_buf);
         const a: Args = .{ .file = src_path, .subcommand = .set_cell, .sheet_index = 0, .cell_ref = "A1", .cell_value_json = "1" };
-        try std.testing.expectEqual(@as(u8, 1), try runSetCellCommand(std.testing.allocator, a, &err_w));
+        try std.testing.expectEqual(@as(u8, 1), try runSetCellCommand(std.testing.allocator, io, a, &err_w));
     }
     {
         var err_w = std.Io.Writer.fixed(&err_buf);
         // Dummy out path — set-cell rejects on missing --ref before
         // ever attempting to write, so this never hits the filesystem.
         const a: Args = .{ .file = src_path, .subcommand = .set_cell, .sheet_index = 0, .out_path = "unused.xlsx", .cell_value_json = "1" };
-        try std.testing.expectEqual(@as(u8, 1), try runSetCellCommand(std.testing.allocator, a, &err_w));
+        try std.testing.expectEqual(@as(u8, 1), try runSetCellCommand(std.testing.allocator, io, a, &err_w));
     }
     {
         var err_w = std.Io.Writer.fixed(&err_buf);
         const a: Args = .{ .file = src_path, .subcommand = .set_cell, .sheet_index = 0, .out_path = "unused.xlsx", .cell_ref = "A1" };
-        try std.testing.expectEqual(@as(u8, 1), try runSetCellCommand(std.testing.allocator, a, &err_w));
+        try std.testing.expectEqual(@as(u8, 1), try runSetCellCommand(std.testing.allocator, io, a, &err_w));
     }
 }
 
@@ -4101,12 +4338,15 @@ test "parseColLettersToOneBased: A=1, Z=26, AA=27, XFD=16384, XFE rejected" {
 }
 
 test "runRowEditCommand insert-row + delete-row round-trip" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx.writer_types;
-    const src_path = try tt.path(std.testing.allocator, "cli_row_edit_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "cli_row_edit_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "cli_row_edit_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "cli_row_edit_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -4115,7 +4355,7 @@ test "runRowEditCommand insert-row + delete-row round-trip" {
         try s.writeRow(&.{.{ .integer = 1 }});
         try s.writeRow(&.{.{ .integer = 2 }});
         try s.writeRow(&.{.{ .integer = 3 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     var err_buf: [1024]u8 = undefined;
 
@@ -4129,10 +4369,10 @@ test "runRowEditCommand insert-row + delete-row round-trip" {
             .out_path = dst_path,
             .row_1based = 2,
         };
-        try std.testing.expectEqual(@as(u8, 0), try runRowEditCommand(std.testing.allocator, a, &err_w));
+        try std.testing.expectEqual(@as(u8, 0), try runRowEditCommand(std.testing.allocator, io, a, &err_w));
     }
     {
-        var book = try xlsx.Book.open(std.testing.allocator, dst_path);
+        var book = try xlsx.Book.open(std.testing.allocator, io, dst_path);
         defer book.deinit();
         var rows = try book.rows(book.sheets[0], std.testing.allocator);
         defer rows.deinit();
@@ -4147,23 +4387,26 @@ test "runRowEditCommand insert-row + delete-row round-trip" {
 }
 
 test "runAddSheetCommand + runRenameSheetCommand + runDeleteSheetCommand round-trip" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx.writer_types;
-    const src_path = try tt.path(std.testing.allocator, "cli_sheet_ops_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "cli_sheet_ops_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const after_add = try tt.path(std.testing.allocator, "cli_sheet_ops_add.xlsx");
+    const after_add = try tt.path(std.testing.allocator, io, "cli_sheet_ops_add.xlsx");
     defer std.testing.allocator.free(after_add);
-    const after_rename = try tt.path(std.testing.allocator, "cli_sheet_ops_rename.xlsx");
+    const after_rename = try tt.path(std.testing.allocator, io, "cli_sheet_ops_rename.xlsx");
     defer std.testing.allocator.free(after_rename);
-    const after_delete = try tt.path(std.testing.allocator, "cli_sheet_ops_delete.xlsx");
+    const after_delete = try tt.path(std.testing.allocator, io, "cli_sheet_ops_delete.xlsx");
     defer std.testing.allocator.free(after_delete);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("First");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     var err_buf: [1024]u8 = undefined;
 
@@ -4176,10 +4419,10 @@ test "runAddSheetCommand + runRenameSheetCommand + runDeleteSheetCommand round-t
             .out_path = after_add,
             .new_sheet_name = "Second",
         };
-        try std.testing.expectEqual(@as(u8, 0), try runAddSheetCommand(std.testing.allocator, a, &err_w));
+        try std.testing.expectEqual(@as(u8, 0), try runAddSheetCommand(std.testing.allocator, io, a, &err_w));
     }
     {
-        var book = try xlsx.Book.open(std.testing.allocator, after_add);
+        var book = try xlsx.Book.open(std.testing.allocator, io, after_add);
         defer book.deinit();
         try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
         try std.testing.expectEqualStrings("Second", book.sheets[1].name);
@@ -4195,10 +4438,10 @@ test "runAddSheetCommand + runRenameSheetCommand + runDeleteSheetCommand round-t
             .out_path = after_rename,
             .new_sheet_name = "Renamed",
         };
-        try std.testing.expectEqual(@as(u8, 0), try runRenameSheetCommand(std.testing.allocator, a, &err_w));
+        try std.testing.expectEqual(@as(u8, 0), try runRenameSheetCommand(std.testing.allocator, io, a, &err_w));
     }
     {
-        var book = try xlsx.Book.open(std.testing.allocator, after_rename);
+        var book = try xlsx.Book.open(std.testing.allocator, io, after_rename);
         defer book.deinit();
         try std.testing.expectEqualStrings("Renamed", book.sheets[0].name);
     }
@@ -4212,10 +4455,10 @@ test "runAddSheetCommand + runRenameSheetCommand + runDeleteSheetCommand round-t
             .sheet_index = 1,
             .out_path = after_delete,
         };
-        try std.testing.expectEqual(@as(u8, 0), try runDeleteSheetCommand(std.testing.allocator, a, &err_w));
+        try std.testing.expectEqual(@as(u8, 0), try runDeleteSheetCommand(std.testing.allocator, io, a, &err_w));
     }
     {
-        var book = try xlsx.Book.open(std.testing.allocator, after_delete);
+        var book = try xlsx.Book.open(std.testing.allocator, io, after_delete);
         defer book.deinit();
         try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
         try std.testing.expectEqualStrings("Renamed", book.sheets[0].name);
@@ -4743,9 +4986,12 @@ test "parseArgs --start-row / --end-row round-trip and rejections" {
 }
 
 test "runCellsCommand --start-row / --end-row bound the emitted cell stream" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_rowbounds_iter59b.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_rowbounds_iter59b.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -4758,10 +5004,10 @@ test "runCellsCommand --start-row / --end-row bound the emitted cell stream" {
         try s0.writeRow(&.{.{ .string = "c3" }});
         try s0.writeRow(&.{.{ .string = "c4" }});
         try s0.writeRow(&.{.{ .string = "c5" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const countLines = struct {
@@ -4862,9 +5108,12 @@ test "parseArgs --range round-trip and rejections" {
 }
 
 test "runCellsCommand --range filters by bounding rectangle" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_range_iter59b2.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_range_iter59b2.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -4878,10 +5127,10 @@ test "runCellsCommand --range filters by bounding rectangle" {
         try s0.writeRow(&.{ .{ .string = "A3" }, .{ .string = "B3" }, .{ .string = "C3" }, .{ .string = "D3" }, .{ .string = "E3" } });
         try s0.writeRow(&.{ .{ .string = "A4" }, .{ .string = "B4" }, .{ .string = "C4" }, .{ .string = "D4" }, .{ .string = "E4" } });
         try s0.writeRow(&.{ .{ .string = "A5" }, .{ .string = "B5" }, .{ .string = "C5" }, .{ .string = "D5" }, .{ .string = "E5" } });
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const countLines = struct {
@@ -4939,9 +5188,12 @@ test "runCellsCommand --range filters by bounding rectangle" {
 }
 
 test "runRowsCommand --range filters rows + masks out-of-range cells" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_range_rows_iter59b2.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_range_rows_iter59b2.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -4953,10 +5205,10 @@ test "runRowsCommand --range filters rows + masks out-of-range cells" {
         try s0.writeRow(&.{ .{ .string = "A3" }, .{ .string = "B3" }, .{ .string = "C3" }, .{ .string = "D3" }, .{ .string = "E3" } });
         try s0.writeRow(&.{ .{ .string = "A4" }, .{ .string = "B4" }, .{ .string = "C4" }, .{ .string = "D4" }, .{ .string = "E4" } });
         try s0.writeRow(&.{ .{ .string = "A5" }, .{ .string = "B5" }, .{ .string = "C5" }, .{ .string = "D5" }, .{ .string = "E5" } });
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const countLines = struct {
@@ -5039,9 +5291,12 @@ test "parseArgs --header scoping" {
 }
 
 test "runRowsCommand --header promotes first row and emits fields dict" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_header_iter59b3.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_header_iter59b3.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5051,10 +5306,10 @@ test "runRowsCommand --header promotes first row and emits fields dict" {
         try s0.writeRow(&.{ .{ .string = "name" }, .{ .string = "qty" } });
         try s0.writeRow(&.{ .{ .string = "apple" }, .{ .integer = 3 } });
         try s0.writeRow(&.{ .{ .string = "pear" }, .{ .integer = 7 } });
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const countLines = struct {
@@ -5086,9 +5341,12 @@ test "runRowsCommand --header promotes first row and emits fields dict" {
 }
 
 test "runRowsCommand --header duplicate header keys emitted verbatim" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_header_dup_iter59b3.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_header_dup_iter59b3.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5097,10 +5355,10 @@ test "runRowsCommand --header duplicate header keys emitted verbatim" {
         var s0 = try w.addSheet("Data");
         try s0.writeRow(&.{ .{ .string = "x" }, .{ .string = "x" } });
         try s0.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 } });
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [1024]u8 = undefined;
@@ -5113,9 +5371,12 @@ test "runRowsCommand --header duplicate header keys emitted verbatim" {
 }
 
 test "runRowsCommand --header empty header cells fall back to col_<letter>" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_header_empty_iter59b3.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_header_empty_iter59b3.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5125,10 +5386,10 @@ test "runRowsCommand --header empty header cells fall back to col_<letter>" {
         // Header: A="name", B=empty, C="qty" → keys "name","col_B","qty".
         try s0.writeRow(&.{ .{ .string = "name" }, .empty, .{ .string = "qty" } });
         try s0.writeRow(&.{ .{ .string = "apple" }, .{ .integer = 42 }, .{ .integer = 3 } });
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [1024]u8 = undefined;
@@ -5142,13 +5403,16 @@ test "runRowsCommand --header empty header cells fall back to col_<letter>" {
 }
 
 test "runRowsCommand --header + --range derives keys only from in-range cols" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Header row has 4 cells across A..D ("w","x","y","z"); a --range
     // B:C must consume only the B/C header cells and emit data dicts
     // keyed exactly {"x","y"} — no `col_A` / `col_D` leak from the
     // masked full-width view.
-    const tmp_path = try tt.path(std.testing.allocator, "cli_header_range_iter59b3.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_header_range_iter59b3.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5157,10 +5421,10 @@ test "runRowsCommand --header + --range derives keys only from in-range cols" {
         var s0 = try w.addSheet("Data");
         try s0.writeRow(&.{ .{ .string = "w" }, .{ .string = "x" }, .{ .string = "y" }, .{ .string = "z" } });
         try s0.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 }, .{ .integer = 4 } });
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [1024]u8 = undefined;
@@ -5185,6 +5449,9 @@ test "runRowsCommand --header + --range derives keys only from in-range cols" {
 }
 
 test "runRowsCommand --include-blanks on csv/header is a no-op for blank rows" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Tight contract per iter59b-4 P2 follow-up: --include-blanks
@@ -5193,7 +5460,7 @@ test "runRowsCommand --include-blanks on csv/header is a no-op for blank rows" {
     // documented no-op and must NOT inject extra blank output lines.
     // On --header the flag is also a no-op — a blank row must not
     // promote to a `col_*`-keyed header.
-    const tmp_path = try tt.path(std.testing.allocator, "cli_blanks_flat_iter59b4.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_blanks_flat_iter59b4.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5203,10 +5470,10 @@ test "runRowsCommand --include-blanks on csv/header is a no-op for blank rows" {
         // Row 1: A only; B/C blank. Row 2: C only; A/B blank.
         try s0.writeRow(&.{ .{ .string = "x" }, .empty, .empty });
         try s0.writeRow(&.{ .empty, .empty, .{ .string = "y" } });
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     // csv + --range B:B + --include-blanks — range is all-empty
@@ -5222,12 +5489,15 @@ test "runRowsCommand --include-blanks on csv/header is a no-op for blank rows" {
 }
 
 test "runRowsCommand --range + --include-blanks keeps blank-only ranged rows" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // A row with data only in A/D (both outside the B:C range) and
     // --include-blanks must still emit with two t:"blank" cells —
     // the whole point of --include-blanks is to surface empties.
-    const tmp_path = try tt.path(std.testing.allocator, "cli_range_blank_iter59b4.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_range_blank_iter59b4.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5236,10 +5506,10 @@ test "runRowsCommand --range + --include-blanks keeps blank-only ranged rows" {
         var s0 = try w.addSheet("Data");
         // Row 1: "x" in A, "y" in D. Nothing in B/C.
         try s0.writeRow(&.{ .{ .string = "x" }, .empty, .empty, .{ .string = "y" } });
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [1024]u8 = undefined;
@@ -5263,6 +5533,9 @@ test "runRowsCommand --range + --include-blanks keeps blank-only ranged rows" {
 }
 
 test "writeTerseStyleBlock doesn't leak empty border for diagonal-only sides" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Codex P2: a cell whose border has ONLY the diagonal side set
@@ -5272,7 +5545,7 @@ test "writeTerseStyleBlock doesn't leak empty border for diagonal-only sides" {
     // Zig writer attaches a default font to every styled cell
     // (which may have a color), but the "border" key must never
     // appear with an empty object.
-    const tmp_path = try tt.path(std.testing.allocator, "cli_diag_only_iter59b4.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_diag_only_iter59b4.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5283,10 +5556,10 @@ test "writeTerseStyleBlock doesn't leak empty border for diagonal-only sides" {
         });
         var s0 = try w.addSheet("Data");
         try s0.writeRowStyled(&.{.{ .string = "x" }}, &.{diag_style});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [1024]u8 = undefined;
@@ -5388,9 +5661,12 @@ test "parseArgs --with-styles scoping" {
 }
 
 test "runCellsCommand --include-blanks emits t:\"blank\" for empty cells" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_blanks_iter59b4.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_blanks_iter59b4.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5399,10 +5675,10 @@ test "runCellsCommand --include-blanks emits t:\"blank\" for empty cells" {
         var s0 = try w.addSheet("Data");
         // Row 1: A="x", B=empty, C=7 → a single sparse row with a gap.
         try s0.writeRow(&.{ .{ .string = "x" }, .empty, .{ .integer = 7 } });
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [2048]u8 = undefined;
@@ -5418,10 +5694,13 @@ test "runCellsCommand --include-blanks emits t:\"blank\" for empty cells" {
 }
 
 test "runCellsCommand without --include-blanks still skips empties" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Regression guard: default behaviour preserved when the flag is off.
-    const tmp_path = try tt.path(std.testing.allocator, "cli_blanks_off_iter59b4.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_blanks_off_iter59b4.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5429,9 +5708,9 @@ test "runCellsCommand without --include-blanks still skips empties" {
         defer w.deinit();
         var s0 = try w.addSheet("Data");
         try s0.writeRow(&.{ .{ .string = "x" }, .empty, .{ .integer = 7 } });
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [2048]u8 = undefined;
@@ -5444,9 +5723,12 @@ test "runCellsCommand without --include-blanks still skips empties" {
 }
 
 test "runCellsCommand --with-styles emits terse style block for styled cells" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_with_styles_iter59b4.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_with_styles_iter59b4.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5466,10 +5748,10 @@ test "runCellsCommand --with-styles emits terse style block for styled cells" {
             &.{ styled, styled },
         );
         try s0.writeRow(&.{ .{ .string = "apple" }, .{ .integer = 3 } });
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [4096]u8 = undefined;
@@ -5490,9 +5772,12 @@ test "runCellsCommand --with-styles emits terse style block for styled cells" {
 }
 
 test "runRowsCommand --with-styles on envelope attaches style to per-cell records" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_rows_styles_iter59b4.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_rows_styles_iter59b4.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5504,10 +5789,10 @@ test "runRowsCommand --with-styles on envelope attaches style to per-cell record
             &.{ .{ .string = "a" }, .{ .string = "b" } },
             &.{ italic, 0 },
         );
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [2048]u8 = undefined;
@@ -5528,9 +5813,12 @@ test "runRowsCommand --with-styles on envelope attaches style to per-cell record
 }
 
 test "runCellsCommand --skip / --take slice the emitted cell stream" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_pagination_iter59a.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_pagination_iter59a.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5543,10 +5831,10 @@ test "runCellsCommand --skip / --take slice the emitted cell stream" {
         try s0.writeRow(&.{.{ .string = "c3" }});
         try s0.writeRow(&.{.{ .string = "c4" }});
         try s0.writeRow(&.{.{ .string = "c5" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const countLines = struct {
@@ -5602,6 +5890,9 @@ test "runCellsCommand --skip / --take slice the emitted cell stream" {
 }
 
 test "runMetaCommand emits path:null on non-UTF-8 workbook path" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var scratch: [512]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
 
@@ -5609,12 +5900,13 @@ test "runMetaCommand emits path:null on non-UTF-8 workbook path" {
     // file — runMetaCommand only dereferences book.sheets / sst /
     // styles_xml / theme_xml / rich_runs_by_sst_idx / comments.
     var empty_book: xlsx.Book = .{
+        .io = io,
         .allocator = std.testing.allocator,
         .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer empty_book.deinit();
 
-    try runMetaCommand(&w, &empty_book, null, .ndjson);
+    try runMetaCommand(&w, &empty_book, null, .ndjson, null);
 
     const out = scratch[0..w.end];
     // The path field must serialize as literal `null`, not a string.
@@ -5623,9 +5915,12 @@ test "runMetaCommand emits path:null on non-UTF-8 workbook path" {
 }
 
 test "runListSheetsCommand emits one sheet record per sheet" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_list_sheets_iter57.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_list_sheets_iter57.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5637,27 +5932,33 @@ test "runListSheetsCommand emits one sheet record per sheet" {
         try s1.writeRow(&.{.{ .integer = 1 }});
         var s2 = try w.addSheet("She\"et"); // name with a quote — must be JSON-escaped
         try s2.writeRow(&.{.{ .boolean = true }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runListSheetsCommand(&w, &book);
+    try runListSheetsCommand(&w, &book, .ndjson);
+    // Z4: every record now carries `state`. Writer-produced sheets are
+    // all visible; the veryHidden path is covered by the sheet-state
+    // test below.
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"sheet\",\"sheet\":\"Data\",\"sheet_idx\":0}\n" ++
-            "{\"kind\":\"sheet\",\"sheet\":\"Other\",\"sheet_idx\":1}\n" ++
-            "{\"kind\":\"sheet\",\"sheet\":\"She\\\"et\",\"sheet_idx\":2}\n",
+        "{\"kind\":\"sheet\",\"sheet\":\"Data\",\"sheet_idx\":0,\"state\":\"visible\"}\n" ++
+            "{\"kind\":\"sheet\",\"sheet\":\"Other\",\"sheet_idx\":1,\"state\":\"visible\"}\n" ++
+            "{\"kind\":\"sheet\",\"sheet\":\"She\\\"et\",\"sheet_idx\":2,\"state\":\"visible\"}\n",
         w.buffered(),
     );
 }
 
 test "runMetaCommand emits workbook record with sst/has_* fields then sheet records" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_meta_iter57.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_meta_iter57.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5671,15 +5972,15 @@ test "runMetaCommand emits workbook record with sst/has_* fields then sheet reco
         try s0.addComment("A1", "me", "hi there"); // forces has_comments=true for this sheet
         var s1 = try w.addSheet("NoComments");
         try s1.writeRow(&.{.{ .integer = 42 }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&scratch);
-    try runMetaCommand(&w, &book, tmp_path, .ndjson);
+    try runMetaCommand(&w, &book, tmp_path, .ndjson, null);
 
     const out = w.buffered();
     // Parse NDJSON line by line and assert field presence + values.
@@ -5725,13 +6026,16 @@ test "runMetaCommand emits workbook record with sst/has_* fields then sheet reco
 }
 
 test "legacy --list-sheets flag still emits plain text (regression guard)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Regression guard: the legacy plain-text shape is exactly
     // `<name>\n` per sheet, no JSON, no sub-command routing. This
     // mirrors the code path in main() line-for-line so the flag
     // keeps working across iter57.
-    const tmp_path = try tt.path(std.testing.allocator, "cli_legacy_list_sheets.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_legacy_list_sheets.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5741,10 +6045,10 @@ test "legacy --list-sheets flag still emits plain text (regression guard)" {
         try s0.writeRow(&.{.{ .string = "x" }});
         var s1 = try w.addSheet("More");
         try s1.writeRow(&.{.{ .string = "y" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [256]u8 = undefined;
@@ -5799,9 +6103,12 @@ test "parseArgs routes iter58 sub-commands correctly" {
 }
 
 test "runCommentsCommand emits one record per comment across every sheet" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_comments_iter58.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_comments_iter58.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5813,10 +6120,10 @@ test "runCommentsCommand emits one record per comment across every sheet" {
         var s1 = try w.addSheet("Other");
         try s1.writeRow(&.{.{ .integer = 1 }});
         try s1.addComment("B2", "Bob", "hi");
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [2048]u8 = undefined;
@@ -5844,9 +6151,12 @@ test "runCommentsCommand emits one record per comment across every sheet" {
 }
 
 test "runValidationsCommand emits list validation with values array" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_validations_iter58.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_validations_iter58.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5855,10 +6165,10 @@ test "runValidationsCommand emits list validation with values array" {
         var s0 = try w.addSheet("Data");
         try s0.writeRow(&.{.{ .string = "fruit" }});
         try s0.addDataValidationList("B2:B100", &.{ "apple", "banana" });
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [2048]u8 = undefined;
@@ -5877,9 +6187,12 @@ test "runValidationsCommand emits list validation with values array" {
 }
 
 test "runHyperlinksCommand emits url set + location null for external links" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_hyperlinks_iter58.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_hyperlinks_iter58.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5888,10 +6201,10 @@ test "runHyperlinksCommand emits url set + location null for external links" {
         var s0 = try w.addSheet("Data");
         try s0.writeRow(&.{.{ .string = "site" }});
         try s0.addHyperlink("A2", "https://example.com/");
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [2048]u8 = undefined;
@@ -5908,9 +6221,12 @@ test "runHyperlinksCommand emits url set + location null for external links" {
 }
 
 test "runStylesCommand emits one record per cell-XF entry" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_styles_iter58.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_styles_iter58.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5919,10 +6235,10 @@ test "runStylesCommand emits one record per cell-XF entry" {
         _ = try w.addStyle(.{ .font_bold = true });
         var s0 = try w.addSheet("Data");
         try s0.writeRow(&.{.{ .string = "hdr" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [4096]u8 = undefined;
@@ -5944,9 +6260,12 @@ test "runStylesCommand emits one record per cell-XF entry" {
 }
 
 test "runSstCommand emits one record per shared-string entry" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_sst_iter58.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_sst_iter58.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -5955,10 +6274,10 @@ test "runSstCommand emits one record per shared-string entry" {
         var s0 = try w.addSheet("Data");
         try s0.writeRow(&.{ .{ .string = "header" }, .{ .string = "qty" } });
         try s0.writeRow(&.{ .{ .string = "apple" }, .{ .integer = 3 } });
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [4096]u8 = undefined;
@@ -5978,31 +6297,26 @@ test "runSstCommand emits one record per shared-string entry" {
 // ─── Fuzz tests ──────────────────────────────────────────────────────
 
 fn fuzzItersCli() usize {
-    const env = std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_ITERS") catch return 1_000;
-    defer std.heap.page_allocator.free(env);
-    var digits: [32]u8 = undefined;
-    var di: usize = 0;
-    for (env) |c| {
-        if (c == '_') continue;
-        if (di == digits.len) break;
-        digits[di] = c;
-        di += 1;
-    }
-    return std.fmt.parseInt(usize, digits[0..di], 10) catch 1_000;
+    // Override comes from build.zig via -Dfuzz-iters or the
+    // XLSX_FUZZ_ITERS environment variable; 0.16 test binaries
+    // cannot read the environment themselves.
+    return fuzz_config.iters_override orelse 1_000;
 }
 
-fn fuzzSeedCli() u64 {
-    if (std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_SEED")) |s| {
-        defer std.heap.page_allocator.free(s);
-        return std.fmt.parseInt(u64, s, 10) catch 0xA1F8ED;
-    } else |_| {
-        return @bitCast(std.time.milliTimestamp());
-    }
+fn fuzzSeedCli(io: std.Io) u64 {
+    if (fuzz_config.seed_override) |s| return s;
+    // std.time lost every function in 0.16; a varying default
+    // seed now comes from the monotonic clock via Io.
+    const ts = std.Io.Clock.now(.awake, io);
+    return @bitCast(@as(i64, @truncate(ts.nanoseconds)));
 }
 
 test "fuzz colLetter: output is uppercase A-Z" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzItersCli();
-    var prng = std.Random.DefaultPrng.init(fuzzSeedCli());
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCli(io));
     const rng = prng.random();
     var buf: [8]u8 = undefined;
     for (0..iters) |_| {
@@ -6020,8 +6334,11 @@ test "fuzz colLetter: output is uppercase A-Z" {
 }
 
 test "fuzz parseArgs: arbitrary tokens never panic" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzItersCli();
-    var prng = std.Random.DefaultPrng.init(fuzzSeedCli());
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCli(io));
     const rng = prng.random();
 
     var token_pool: [8][32]u8 = undefined;
@@ -6045,8 +6362,11 @@ test "fuzz parseArgs: arbitrary tokens never panic" {
 }
 
 test "fuzz writeJsonString: no raw control chars survive" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzItersCli();
-    var prng = std.Random.DefaultPrng.init(fuzzSeedCli());
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCli(io));
     const rng = prng.random();
 
     var input: [256]u8 = undefined;
@@ -6082,8 +6402,11 @@ test "fuzz writeJsonString: no raw control chars survive" {
 }
 
 test "fuzz writeCsvField: balanced quotes + no bare quote outside them" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const iters = fuzzItersCli();
-    var prng = std.Random.DefaultPrng.init(fuzzSeedCli());
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCli(io));
     const rng = prng.random();
 
     var input: [256]u8 = undefined;
@@ -6218,15 +6541,24 @@ test "parseArgs --output missing value is MissingValue" {
     try std.testing.expectError(ArgError.MissingValue, parseArgs(&argv));
 }
 
-test "parseArgs --output pretty-json is rejected on every sub-command other than meta" {
+test "parseArgs --output pretty-json is rejected on streaming sub-commands" {
+    // Z4: `list-sheets` moved OUT of this list — it is workbook-scoped
+    // and bounded, so a collapsed object is a coherent shape and
+    // callers gating on sheet visibility want the whole answer at once.
+    // Everything below still streams record-per-line.
     const subs = [_][]const u8{
-        "cells",       "rows",       "list-sheets", "comments",
-        "validations", "hyperlinks", "styles",      "sst",
+        "cells",       "rows",       "comments",
+        "validations", "hyperlinks", "styles",
+        "sst",
     };
     for (subs) |sub| {
         const argv = [_][]const u8{ sub, "--output", "pretty-json", "f.xlsx" };
         try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
     }
+    // list-sheets now accepts it.
+    const argv_ls = [_][]const u8{ "list-sheets", "--output", "pretty-json", "f.xlsx" };
+    const parsed = try parseArgs(&argv_ls);
+    try std.testing.expectEqual(OutputMode.pretty_json, parsed.output);
     // Bare `zlsx file.xlsx` defaults to the `rows` sub-command, which
     // also cannot accept pretty-json.
     const argv_bare = [_][]const u8{ "--output", "pretty-json", "f.xlsx" };
@@ -6244,9 +6576,12 @@ test "detectSubcommand skips --output value (value that collides with a sub-comm
 }
 
 test "runCellsAcrossSheets compact-ndjson emits per-sheet prologue and omits sheet/sheet_idx on cell records" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_compact_cells_iter60b.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_compact_cells_iter60b.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -6257,10 +6592,10 @@ test "runCellsAcrossSheets compact-ndjson emits per-sheet prologue and omits she
         try s0.writeRow(&.{ .{ .string = "a" }, .{ .integer = 1 } });
         var s1 = try w.addSheet("Other");
         try s1.writeRow(&.{.{ .string = "x" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var buf: [4096]u8 = undefined;
@@ -6317,9 +6652,12 @@ test "runCellsAcrossSheets compact-ndjson emits per-sheet prologue and omits she
 }
 
 test "runMetaCommand pretty-json collapses workbook + sheets into one JSON object" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_pretty_meta_iter60b.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_pretty_meta_iter60b.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -6329,15 +6667,15 @@ test "runMetaCommand pretty-json collapses workbook + sheets into one JSON objec
         try s0.writeRow(&.{.{ .string = "hdr" }});
         var s1 = try w.addSheet("Other");
         try s1.writeRow(&.{.{ .integer = 1 }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var buf: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try runMetaCommand(&w, &book, tmp_path, .pretty_json);
+    try runMetaCommand(&w, &book, tmp_path, .pretty_json, null);
 
     const out = w.buffered();
 
@@ -6427,9 +6765,12 @@ test "globMatch literal / wildcards / edge cases" {
 }
 
 test "runCellsAcrossSheets --all-sheets emits every sheet with correct sheet_idx" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_all_sheets_iter59c.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_all_sheets_iter59c.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -6439,10 +6780,10 @@ test "runCellsAcrossSheets --all-sheets emits every sheet with correct sheet_idx
         try s0.writeRow(&.{.{ .string = "A1_alpha" }});
         var s1 = try w.addSheet("Beta");
         try s1.writeRow(&.{.{ .string = "A1_beta" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [2048]u8 = undefined;
@@ -6459,9 +6800,12 @@ test "runCellsAcrossSheets --all-sheets emits every sheet with correct sheet_idx
 }
 
 test "runCellsAcrossSheets --sheet-glob selects only matching sheets" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_glob_iter59c.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_glob_iter59c.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -6473,10 +6817,10 @@ test "runCellsAcrossSheets --sheet-glob selects only matching sheets" {
         try s1.writeRow(&.{.{ .string = "v2" }});
         var s2 = try w.addSheet("Data3");
         try s2.writeRow(&.{.{ .string = "v3" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [2048]u8 = undefined;
@@ -6496,9 +6840,12 @@ test "runCellsAcrossSheets --sheet-glob selects only matching sheets" {
 }
 
 test "runCellsAcrossSheets --all-sheets --skip --take slices the cross-sheet stream" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_cross_pag_iter59c.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_cross_pag_iter59c.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -6510,10 +6857,10 @@ test "runCellsAcrossSheets --all-sheets --skip --take slices the cross-sheet str
         var s1 = try w.addSheet("B");
         // 3 cells on sheet 1 → d, e, f.
         try s1.writeRow(&.{ .{ .string = "d" }, .{ .string = "e" }, .{ .string = "f" } });
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [4096]u8 = undefined;
@@ -6584,6 +6931,9 @@ test "writeErrorRecord sheet-scoped + workbook-scoped shapes (iter60c)" {
 }
 
 test "runCellsAcrossSheets emits inline kind:error for a malformed sheet and continues (iter60c)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Two-sheet workbook: sheet 0 valid, sheet 1's loaded XML is
@@ -6591,7 +6941,7 @@ test "runCellsAcrossSheets emits inline kind:error for a malformed sheet and con
     // `consumeRow → indexOfScalarPos('<') == null → error.MalformedXml`.
     // The CLI must emit one inline `kind:"error"` record at sheet
     // boundary, keep going, and exit cleanly (no propagation).
-    const tmp_path = try tt.path(std.testing.allocator, "cli_iter60c_malformed.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_iter60c_malformed.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -6601,10 +6951,10 @@ test "runCellsAcrossSheets emits inline kind:error for a malformed sheet and con
         try s0.writeRow(&.{ .{ .string = "g1" }, .{ .string = "g2" } });
         var s1 = try w.addSheet("Bad");
         try s1.writeRow(&.{.{ .string = "b1" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     // Replace sheet 1's loaded XML with a payload that opens a `<row>`
@@ -6643,9 +6993,12 @@ test "runCellsAcrossSheets emits inline kind:error for a malformed sheet and con
 }
 
 test "runCellsCommand single-sheet malformed sheet emits one error record without propagating (iter60c)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_iter60c_single.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_iter60c_single.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -6653,10 +7006,10 @@ test "runCellsCommand single-sheet malformed sheet emits one error record withou
         defer w.deinit();
         var s0 = try w.addSheet("Only");
         try s0.writeRow(&.{.{ .string = "x" }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const bad_path = book.sheets[0].path;
@@ -6716,9 +7069,12 @@ test "writeRowEnvelope emits t:date inside cells array" {
 }
 
 test "runCellsCommand emits t:date for a date-styled numeric cell (iter61-a)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_iter61a_cells.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_iter61a_cells.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -6733,10 +7089,10 @@ test "runCellsCommand emits t:date for a date-styled numeric cell (iter61-a)" {
             &.{ .{ .integer = 7 }, .{ .integer = 45458 } },
             &.{ 0, date_style },
         );
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [4096]u8 = undefined;
@@ -6751,9 +7107,12 @@ test "runCellsCommand emits t:date for a date-styled numeric cell (iter61-a)" {
 }
 
 test "runRowsCommand envelope emits t:date inside cells array (iter61-a)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_iter61a_rows.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_iter61a_rows.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -6765,10 +7124,10 @@ test "runRowsCommand envelope emits t:date inside cells array (iter61-a)" {
             &.{ .{ .integer = 7 }, .{ .integer = 45458 } },
             &.{ 0, date_style },
         );
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     var scratch: [4096]u8 = undefined;
@@ -6785,13 +7144,16 @@ test "runRowsCommand envelope emits t:date inside cells array (iter61-a)" {
 }
 
 test "runCellsCommand skips t:date auto-convert on 1904-epoch workbook" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // iter61-a P1 follow-up: workbooks with <workbookPr date1904="1"/>
     // shift every serial by 1462 days. Until proper 1904 decoding ships,
     // the CLI must NOT auto-convert these cells to t:"date" — the
     // numeric value is the authoritative signal.
-    const tmp_path = try tt.path(std.testing.allocator, "cli_iter61a_date1904.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_iter61a_date1904.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -6803,10 +7165,10 @@ test "runCellsCommand skips t:date auto-convert on 1904-epoch workbook" {
         // workbook, then flip the flag post-open to simulate a 1904
         // file (the zlsx Writer doesn't emit 1904 workbooks today).
         try s.writeRowStyled(&.{.{ .integer = 45458 }}, &.{date_style});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     // Simulate a 1904-epoch workbook.
@@ -6874,6 +7236,9 @@ test "writeRowEnvelope emits t:error inside cells array (iter61-c)" {
 }
 
 test "runCellsCommand emits t:error for a t=\"e\" cell (iter61-c)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // The zlsx Writer can't emit OOXML t="e" cells directly, so we
     // mirror the iter60c pattern: write a valid workbook, open it,
     // then post-inject a sheet1.xml carrying `<c t="e"><v>#DIV/0!</v></c>`
@@ -6881,7 +7246,7 @@ test "runCellsCommand emits t:error for a t=\"e\" cell (iter61-c)" {
     // deinit.
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_iter61c_error.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_iter61c_error.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -6889,10 +7254,10 @@ test "runCellsCommand emits t:error for a t=\"e\" cell (iter61-c)" {
         defer w.deinit();
         var s = try w.addSheet("Data");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const sheet_path = book.sheets[0].path;
@@ -6930,9 +7295,12 @@ test "runCellsCommand emits t:error for a t=\"e\" cell (iter61-c)" {
 }
 
 test "runRowsCommand envelope emits t:error inside cells array (iter61-c)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const tmp_path = try tt.path(std.testing.allocator, "cli_iter61c_error_rows.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_iter61c_error_rows.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -6940,10 +7308,10 @@ test "runRowsCommand envelope emits t:error inside cells array (iter61-c)" {
         defer w.deinit();
         var s = try w.addSheet("Data");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const sheet_path = book.sheets[0].path;
@@ -7123,14 +7491,14 @@ test "Rows.formulaStrings returns entity-decoded text (iter61-b P2)" {
         .pos = 0,
         .shared_strings = &.{},
         .allocator = std.testing.allocator,
-        .row_cells = .{},
-        .row_styles = .{},
-        .row_date_types = .{},
-        .row_error_strings = .{},
-        .row_formula_strings = .{},
-        .row_formula_refs = .{},
+        .row_cells = .empty,
+        .row_styles = .empty,
+        .row_date_types = .empty,
+        .row_error_strings = .empty,
+        .row_formula_strings = .empty,
+        .row_formula_refs = .empty,
         .shared_si_to_base_ref = .{},
-        .array_ranges = .{},
+        .array_ranges = .empty,
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer rows.deinit();
@@ -7144,12 +7512,15 @@ test "Rows.formulaStrings returns entity-decoded text (iter61-b P2)" {
 }
 
 test "runCellsCommand emits t:formula for stand-alone, shared-base, shared-slave (iter61-b)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Mirror the iter60c / iter61-c post-injection trick: write a valid
     // workbook, then replace sheet1.xml with a hand-crafted blob that
     // exercises all three formula shapes in one row.
-    const tmp_path = try tt.path(std.testing.allocator, "cli_iter61b_formula.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_iter61b_formula.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -7157,10 +7528,10 @@ test "runCellsCommand emits t:formula for stand-alone, shared-base, shared-slave
         defer w.deinit();
         var s = try w.addSheet("Data");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const sheet_path = book.sheets[0].path;
@@ -7226,6 +7597,9 @@ test "runCellsCommand emits t:formula for stand-alone, shared-base, shared-slave
 }
 
 test "runCellsCommand emits t:formula with formula_ref for array-formula slaves" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Same post-injection trick: write a workbook then replace the
@@ -7233,7 +7607,7 @@ test "runCellsCommand emits t:formula with formula_ref for array-formula slaves"
     // C3 + C4 carry only cached <v> bodies. Reader must spread the
     // array formula context to the slaves so all three rows surface
     // as t:"formula" records.
-    const tmp_path = try tt.path(std.testing.allocator, "cli_array_spread.xlsx");
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_array_spread.xlsx");
     defer std.testing.allocator.free(tmp_path);
     {
         const writer = xlsx.writer_types;
@@ -7241,10 +7615,10 @@ test "runCellsCommand emits t:formula with formula_ref for array-formula slaves"
         defer w.deinit();
         var s = try w.addSheet("Data");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(tmp_path);
+        try w.save(io, tmp_path);
     }
 
-    var book = try xlsx.Book.open(std.testing.allocator, tmp_path);
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
     defer book.deinit();
 
     const sheet_path = book.sheets[0].path;

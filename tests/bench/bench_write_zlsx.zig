@@ -10,11 +10,11 @@
 const std = @import("std");
 const xlsx = @import("zlsx");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
     const alloc = std.heap.smp_allocator;
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) {
         std.debug.print("usage: {s} <out.xlsx>\n", .{args[0]});
         return;
@@ -68,5 +68,5 @@ pub fn main() !void {
         try sheet.writeRowStyled(&cells, &styles);
     }
 
-    try w.save(args[1]);
+    try w.save(io, args[1]);
 }

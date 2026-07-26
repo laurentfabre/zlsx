@@ -38,7 +38,7 @@ pub fn applyColEditToWorksheet(
     col_1based: u32,
     kind: RowEditKind,
 ) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
     var i: usize = 0;
@@ -84,7 +84,7 @@ fn processCellTagCol(
     i: *usize,
 ) !void {
     const attrs = src[t.start + "<c".len .. t.after_open - 1];
-    const trimmed = std.mem.trimRight(u8, attrs, " \t\r\n");
+    const trimmed = std.mem.trimEnd(u8, attrs, " \t\r\n");
     const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
     const attrs_for_lookup = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
     const r_attr = getAttr(attrs_for_lookup, "r");
@@ -282,7 +282,7 @@ fn emitColEntry(
     // OOXML <col/> is always an empty element. Detect the original
     // self-closing form (last non-ws byte of attrs is `/`) and
     // emit `/>` accordingly, so we don't leave open `<col>` tags.
-    const trimmed_attrs = std.mem.trimRight(u8, attrs, " \t\r\n");
+    const trimmed_attrs = std.mem.trimEnd(u8, attrs, " \t\r\n");
     const was_self_closing = trimmed_attrs.len > 0 and trimmed_attrs[trimmed_attrs.len - 1] == '/';
     if (was_self_closing) {
         try out.appendSlice(allocator, "/>");
@@ -377,7 +377,7 @@ pub fn processAutoFilterTagCol(
     i: *usize,
 ) !void {
     const attrs_full = src[t.start + "<autoFilter".len .. t.after_open - 1];
-    const trimmed = std.mem.trimRight(u8, attrs_full, " \t\r\n");
+    const trimmed = std.mem.trimEnd(u8, attrs_full, " \t\r\n");
     const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
     const attrs_for_lookup = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
     const r_attr = getAttr(attrs_for_lookup, "ref");
@@ -533,7 +533,7 @@ fn processFilterColumnTag(
     j: *usize,
 ) !void {
     const attrs_full = src[t.start + "<filterColumn".len .. t.after_open - 1];
-    const trimmed = std.mem.trimRight(u8, attrs_full, " \t\r\n");
+    const trimmed = std.mem.trimEnd(u8, attrs_full, " \t\r\n");
     const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
     const attrs_for_lookup = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
     const id_attr = getAttr(attrs_for_lookup, "colId");
@@ -743,7 +743,7 @@ pub fn applyRowEditToWorksheet(
     row: u32,
     kind: RowEditKind,
 ) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
     var i: usize = 0;
@@ -803,7 +803,7 @@ fn processRowTag(
     i: *usize,
 ) !void {
     const attrs = src[t.start + "<row".len .. t.after_open - 1];
-    const trimmed = std.mem.trimRight(u8, attrs, " \t\r\n");
+    const trimmed = std.mem.trimEnd(u8, attrs, " \t\r\n");
     const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
     const attrs_for_lookup = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
     const r_attr = getAttr(attrs_for_lookup, "r");
@@ -868,7 +868,7 @@ fn processCellTag(
     kind: RowEditKind,
 ) !void {
     const attrs = src[t.start + "<c".len .. t.after_open - 1];
-    const trimmed = std.mem.trimRight(u8, attrs, " \t\r\n");
+    const trimmed = std.mem.trimEnd(u8, attrs, " \t\r\n");
     const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
     const attrs_for_lookup = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
     const r_attr = getAttr(attrs_for_lookup, "r");
@@ -993,7 +993,7 @@ pub fn processAutoFilterTagRow(
     i: *usize,
 ) !void {
     const attrs_full = src[t.start + "<autoFilter".len .. t.after_open - 1];
-    const trimmed = std.mem.trimRight(u8, attrs_full, " \t\r\n");
+    const trimmed = std.mem.trimEnd(u8, attrs_full, " \t\r\n");
     const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
     const attrs_for_lookup = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
     const r_attr = getAttr(attrs_for_lookup, "ref");

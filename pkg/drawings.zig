@@ -1809,10 +1809,13 @@ fn parseElementI64(xml: []const u8, open: []const u8, close: []const u8) ?i64 {
 // ─── Tests ────────────────────────────────────────────────────────────
 
 test "imageAnchors: openxlsx_loadExample.xlsx surfaces 2 anchored images" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/openxlsx_loadExample.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
-    var s = try PartStore.open(std.testing.allocator, fixture);
+    var s = try PartStore.open(std.testing.allocator, io, fixture);
     defer s.deinit();
 
     const anchors = try imageAnchors(&s, std.testing.allocator);
@@ -1838,12 +1841,15 @@ test "imageAnchors: openxlsx_loadExample.xlsx surfaces 2 anchored images" {
 }
 
 test "imageAnchors: skips drawings with shapes only (no <xdr:pic>)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // poi_58325_db.xlsx ships shape-only drawings. The parser must
     // walk them without producing image anchors.
     const fixture = "tests/corpus/poi_58325_db.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
-    var s = try PartStore.open(std.testing.allocator, fixture);
+    var s = try PartStore.open(std.testing.allocator, io, fixture);
     defer s.deinit();
 
     const anchors = try imageAnchors(&s, std.testing.allocator);
@@ -1858,12 +1864,15 @@ test "imageAnchors: skips drawings with shapes only (no <xdr:pic>)" {
 }
 
 test "imageAnchors: workbook with no drawings returns empty slice" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // worldbank_catalog has no drawings at all; the parser should
     // walk every sheet and find nothing.
     const fixture = "tests/corpus/worldbank_catalog.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
-    var s = try PartStore.open(std.testing.allocator, fixture);
+    var s = try PartStore.open(std.testing.allocator, io, fixture);
     defer s.deinit();
 
     const anchors = try imageAnchors(&s, std.testing.allocator);
@@ -1873,10 +1882,13 @@ test "imageAnchors: workbook with no drawings returns empty slice" {
 }
 
 test "chartAnchors: openxlsx_loadExample.xlsx surfaces embedded charts" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/openxlsx_loadExample.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
-    var s = try PartStore.open(std.testing.allocator, fixture);
+    var s = try PartStore.open(std.testing.allocator, io, fixture);
     defer s.deinit();
 
     const charts = try chartAnchors(&s, std.testing.allocator);
@@ -1916,10 +1928,13 @@ test "chartAnchors: openxlsx_loadExample.xlsx surfaces embedded charts" {
 }
 
 test "chartAnchors: workbook with no charts returns empty slice" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const fixture = "tests/corpus/worldbank_catalog.xlsx";
-    std.fs.cwd().access(fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
 
-    var s = try PartStore.open(std.testing.allocator, fixture);
+    var s = try PartStore.open(std.testing.allocator, io, fixture);
     defer s.deinit();
 
     const charts = try chartAnchors(&s, std.testing.allocator);
@@ -2386,12 +2401,12 @@ test "findLocalNamespacePrefix walks past 4 KiB inside a block" {
         \\<c2:chart xmlns:c2="http://schemas.openxmlformats.org/drawingml/2006/chart"/></chart-prefix-late>
     ;
     var doc_buf: [8192]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&doc_buf);
-    const w = fbs.writer();
+    var fbs = std.Io.Writer.fixed(&doc_buf);
+    const w = &fbs;
     try w.writeAll(head);
     try w.writeAll(&pad_buf);
     try w.writeAll(tail);
-    const block = fbs.getWritten();
+    const block = fbs.buffered();
 
     // Bounded helper: misses the late binding (cap at 4 KiB).
     try std.testing.expectEqual(
@@ -2553,12 +2568,12 @@ test "resolveDrawingPrefixes maps canonical + custom prefixes" {
             \\<dr:twoCellAnchor xmlns:dr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/></xdr:wsDr>
         ;
         var doc_buf: [8192]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&doc_buf);
-        const w = fbs.writer();
+        var fbs = std.Io.Writer.fixed(&doc_buf);
+        const w = &fbs;
         try w.writeAll(head);
         try w.writeAll(&pad_buf);
         try w.writeAll(tail);
-        const doc = fbs.getWritten();
+        const doc = fbs.buffered();
         const p = resolveDrawingPrefixes(doc);
         try std.testing.expectEqualStrings("xdr", p.xdr);
         try std.testing.expectEqual(@as(usize, 1), p.xdr_alts_len);
@@ -2595,12 +2610,12 @@ test "resolveDrawingPrefixes maps canonical + custom prefixes" {
             \\<other xmlns:dml="http://schemas.openxmlformats.org/drawingml/2006/main"/></xdr:wsDr>
         ;
         var doc_buf: [8192]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&doc_buf);
-        const w = fbs.writer();
+        var fbs = std.Io.Writer.fixed(&doc_buf);
+        const w = &fbs;
         try w.writeAll(head);
         try w.writeAll(&pad_buf);
         try w.writeAll(tail);
-        const doc = fbs.getWritten();
+        const doc = fbs.buffered();
         const p = resolveDrawingPrefixes(doc);
         // Canonical fallback wins — late dml binding is invisible.
         try std.testing.expectEqualStrings("a", p.a);

@@ -82,15 +82,18 @@ const fixture_list = [_]struct { name: []const u8, verdict: Verdict }{
 };
 
 test "PartStore corpus sweep — open + walk every fixture without crash" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
     var any_seen: bool = false;
     for (fixture_list) |fix| {
         var path_buf: [256]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "{s}{s}", .{ corpus_dir, fix.name });
-        std.fs.cwd().access(path, .{}) catch continue;
+        std.Io.Dir.cwd().access(io, path, .{}) catch continue;
         any_seen = true;
 
-        const open_result = pkg.PartStore.open(alloc, path);
+        const open_result = pkg.PartStore.open(alloc, io, path);
         switch (fix.verdict) {
             .must_open_clean => {
                 var store = open_result catch |err| {

@@ -17,6 +17,7 @@ const workbook_mod = @import("workbook.zig");
 const sheet_edit = @import("sheet_edit.zig");
 const table_edit = @import("table_edit.zig");
 const store_mod = @import("store.zig");
+const AtomicFile = @import("atomic_file.zig").AtomicFile;
 
 const Allocator = std.mem.Allocator;
 const Workbook = workbook_mod.Workbook;
@@ -197,17 +198,24 @@ pub const Editor = struct {
     /// `Editor.deinit` cleans up both Editor and Workbook.
     workbook: Workbook,
 
-    pub fn open(allocator: Allocator, path: []const u8) !Editor {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
-        const stat = try file.stat();
+    pub fn open(allocator: Allocator, io: std.Io, path: []const u8) !Editor {
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        const stat = try file.stat(io);
         // Refuse files > 4 GiB up front (ZIP64 isn't supported by v1
         // per the plan; documented limit).
         if (stat.size > std.math.maxInt(u32)) return error.ZipTooLarge;
         const buf = try allocator.alloc(u8, @intCast(stat.size));
         errdefer allocator.free(buf);
-        const n = try file.readAll(buf);
-        if (n != buf.len) return error.UnexpectedEof;
+        // 0.16 reads go through the Reader interface; `readSliceAll`
+        // is the exact-length read that 0.15's `readAll` + length
+        // check expressed.
+        var read_buf: [4096]u8 = undefined;
+        var file_reader = file.reader(io, &read_buf);
+        file_reader.interface.readSliceAll(buf) catch |err| switch (err) {
+            error.EndOfStream => return error.UnexpectedEof,
+            else => return err,
+        };
 
         // Scan the source ZIP and capture verbatim spans.
         //
@@ -259,7 +267,7 @@ pub const Editor = struct {
         if (comment_off + eocd.comment_len > buf.len) return error.BadZip;
         const eocd_comment = buf[comment_off .. comment_off + eocd.comment_len];
 
-        var entries: std.ArrayListUnmanaged(ZipEntry) = .{};
+        var entries: std.ArrayListUnmanaged(ZipEntry) = .empty;
         errdefer entries.deinit(allocator);
         try entries.ensureTotalCapacity(allocator, eocd.record_count_total);
 
@@ -365,7 +373,7 @@ pub const Editor = struct {
             w.deinit();
         };
         {
-            var b = try Book.open(allocator, path);
+            var b = try Book.open(allocator, io, path);
             defer b.deinit();
             const out_paths = try allocator.alloc([]const u8, b.sheets.len);
             errdefer {
@@ -381,7 +389,7 @@ pub const Editor = struct {
             // sheet_count == book.sheets.len (errors SheetCountMismatch
             // on disagreement). v1 contract — future iters may share
             // bytes via PartStore-from-bytes.
-            workbook_built = try Workbook.fromBook(allocator, &b, path);
+            workbook_built = try Workbook.fromBook(allocator, io, &b, path);
         }
 
         return .{
@@ -458,20 +466,20 @@ pub const Editor = struct {
     /// per worksheet, then `PartStore.save` rebuilds the ZIP from
     /// the override map. Source LFH bytes for untouched parts copy
     /// through byte-for-byte; the EOCD comment is preserved.
-    pub fn save(self: *Editor, out_path: []const u8) !void {
+    pub fn save(self: *Editor, io: std.Io, out_path: []const u8) !void {
         if (!self.workbookHasAnyDeltas() and
             !self.workbookHasAnyAppendedRows() and
             !self.workbook.store.hasUnsavedChanges())
         {
             var write_buf: [4096]u8 = undefined;
-            var atomic_file = try std.fs.cwd().atomicFile(out_path, .{ .write_buffer = &write_buf });
+            var atomic_file = try AtomicFile.init(io, out_path, &write_buf);
             defer atomic_file.deinit();
             const w = &atomic_file.file_writer.interface;
             try w.writeAll(self.src_buf);
             try atomic_file.finish();
             return;
         }
-        try self.workbook.save(out_path);
+        try self.workbook.save(io, out_path);
     }
 
     pub fn scanWorksheet(self: *Editor, sheet_idx: u32) !WorksheetSpans {
@@ -636,6 +644,25 @@ pub const Editor = struct {
     /// Errors: `error.InvalidSheetName` (empty / >31 chars / banned
     /// characters), `error.DuplicateSheetName`, plus any propagated
     /// allocator errors.
+    /// Typed view over the workbook's `docProps/*` metadata.
+    ///
+    /// Delegates to `Workbook.docProps`. Returned strings borrow from
+    /// the store and stay valid until the Editor is deinitialised.
+    pub fn docProps(self: *const Editor) !workbook_mod.DocProps {
+        return self.workbook.docProps();
+    }
+
+    /// Strip identifying document metadata, staged for the next `save`.
+    ///
+    /// This is the counterpart to cell masking: without it, a workbook
+    /// whose cells have been pseudonymised still ships `dc:creator`,
+    /// `cp:lastModifiedBy` and `Company` in the archive, untouched by
+    /// every edit because zlsx used to copy those parts through
+    /// verbatim. Everything the mask does not name is byte-preserved.
+    pub fn stripDocProps(self: *Editor, mask: workbook_mod.DocPropsMask) !void {
+        return self.workbook.stripDocProps(mask);
+    }
+
     pub fn addSheet(self: *Editor, name: []const u8) !u32 {
         if (self.sheet_paths.len >= std.math.maxInt(u32)) return error.TooManySheets;
 
@@ -959,7 +986,7 @@ pub const Editor = struct {
 /// the row/cell parser in `Rows.next` but records byte offsets
 /// instead of decoding values.
 fn scanWorksheetXml(allocator: Allocator, xml: []const u8) ![]CellSpan {
-    var out: std.ArrayListUnmanaged(CellSpan) = .{};
+    var out: std.ArrayListUnmanaged(CellSpan) = .empty;
     errdefer out.deinit(allocator);
 
     var pos: usize = 0;
@@ -967,7 +994,7 @@ fn scanWorksheetXml(allocator: Allocator, xml: []const u8) ![]CellSpan {
 
     while (findTagOpen(xml, pos, "row")) |row_tag| {
         const row_attrs = xml[row_tag.start + "<row".len .. row_tag.after_open - 1];
-        const row_attrs_trim = std.mem.trimRight(u8, row_attrs, " \t\r\n");
+        const row_attrs_trim = std.mem.trimEnd(u8, row_attrs, " \t\r\n");
         const is_self_closing_row = row_attrs_trim.len > 0 and
             row_attrs_trim[row_attrs_trim.len - 1] == '/';
         const row_attrs_for_lookup = if (is_self_closing_row)
@@ -1037,7 +1064,7 @@ fn scanWorksheetXml(allocator: Allocator, xml: []const u8) ![]CellSpan {
             // whitespace). Mirrors the same trim on the <row .../>
             // path.
             const candidate_attrs = xml[c_start + 2 .. gt];
-            const trimmed = std.mem.trimRight(u8, candidate_attrs, " \t\r\n");
+            const trimmed = std.mem.trimEnd(u8, candidate_attrs, " \t\r\n");
             const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
             const attrs = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else candidate_attrs;
 
@@ -1130,8 +1157,8 @@ const TestTmp = struct {
     pub fn deinit(self: *TestTmp) void {
         self.dir.cleanup();
     }
-    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
-        const d = try self.dir.dir.realpathAlloc(alloc, ".");
+    pub fn path(self: *TestTmp, alloc: std.mem.Allocator, io: std.Io, name: []const u8) ![:0]u8 {
+        const d = try self.dir.dir.realPathFileAlloc(io, ".", alloc);
         defer alloc.free(d);
         return std.fs.path.joinZ(alloc, &.{ d, name });
     }
@@ -1140,12 +1167,15 @@ const TestTmp = struct {
 // ─── Tests ───────────────────────────────────────────────────────────
 
 test "Editor: byte-identical passthrough (iter-lms-1)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "editor_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "editor_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "editor_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "editor_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
 
     // Build a non-trivial workbook so the round-trip exercises real
@@ -1157,53 +1187,62 @@ test "Editor: byte-identical passthrough (iter-lms-1)" {
         var s = try w.addSheet("Data");
         try s.writeRow(&.{ .{ .string = "header" }, .{ .integer = 42 } });
         try s.writeRow(&.{ .{ .string = "row1" }, .{ .number = 3.14 } });
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
 
     // SHA256 of source.
     const Sha256 = std.crypto.hash.sha2.Sha256;
     var src_hash: [Sha256.digest_length]u8 = undefined;
     {
-        const f = try std.fs.cwd().openFile(src_path, .{});
-        defer f.close();
-        const buf = try std.testing.allocator.alloc(u8, @intCast((try f.stat()).size));
+        const f = try std.Io.Dir.cwd().openFile(io, src_path, .{});
+        defer f.close(io);
+        const buf = try std.testing.allocator.alloc(u8, @intCast((try f.stat(io)).size));
         defer std.testing.allocator.free(buf);
-        _ = try f.readAll(buf);
+        {
+            var fr = f.reader(io, &.{});
+            try fr.interface.readSliceAll(buf);
+        }
         Sha256.hash(buf, &src_hash, .{});
     }
 
     // Round-trip through Editor.
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
 
     // SHA256 of destination must match.
     var dst_hash: [Sha256.digest_length]u8 = undefined;
     {
-        const f = try std.fs.cwd().openFile(dst_path, .{});
-        defer f.close();
-        const buf = try std.testing.allocator.alloc(u8, @intCast((try f.stat()).size));
+        const f = try std.Io.Dir.cwd().openFile(io, dst_path, .{});
+        defer f.close(io);
+        const buf = try std.testing.allocator.alloc(u8, @intCast((try f.stat(io)).size));
         defer std.testing.allocator.free(buf);
-        _ = try f.readAll(buf);
+        {
+            var fr = f.reader(io, &.{});
+            try fr.interface.readSliceAll(buf);
+        }
         Sha256.hash(buf, &dst_hash, .{});
     }
     try std.testing.expectEqualSlices(u8, &src_hash, &dst_hash);
 
     // The destination must still open as a valid workbook through
     // the reader — confirms we didn't corrupt anything.
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
     try std.testing.expectEqualStrings("Data", book.sheets[0].name);
 }
 
 test "Editor: raw-ZIP scanner builds entry table (iter-lms-1b)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "editor_scan.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "editor_scan.xlsx");
     defer std.testing.allocator.free(src_path);
 
     {
@@ -1211,10 +1250,10 @@ test "Editor: raw-ZIP scanner builds entry table (iter-lms-1b)" {
         defer w.deinit();
         var s = try w.addSheet("Sheet1");
         try s.writeRow(&.{ .{ .string = "a" }, .{ .integer = 1 } });
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
 
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
 
     // Every Excel-shape archive has at least these parts: the rels
@@ -1244,12 +1283,15 @@ test "Editor: raw-ZIP scanner builds entry table (iter-lms-1b)" {
 }
 
 test "Editor: appendRows + save round-trips through reader (iter-lms-2)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "editor_append_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "editor_append_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "editor_append_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "editor_append_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
 
     // Source workbook: 2 rows.
@@ -1259,24 +1301,24 @@ test "Editor: appendRows + save round-trips through reader (iter-lms-2)" {
         var s = try w.addSheet("Data");
         try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 10 } });
         try s.writeRow(&.{ .{ .integer = 2 }, .{ .integer = 20 } });
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
 
     // Append two more rows via Editor.
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         const append_rows = [_][]const Cell{
             &.{ .{ .integer = 3 }, .{ .integer = 30 } },
             &.{ .{ .integer = 4 }, .{ .integer = 40 } },
         };
         try ed.appendRows(0, &append_rows);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
 
     // Read back via Book — confirm 4 rows total, original cells intact,
     // new cells at the expected indices.
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -1301,10 +1343,13 @@ test "Editor: appendRows + save round-trips through reader (iter-lms-2)" {
 }
 
 test "Editor: appendRows rejects out-of-range sheet idx + lossy ints" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "editor_append_reject.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "editor_append_reject.xlsx");
     defer std.testing.allocator.free(src_path);
 
     {
@@ -1312,10 +1357,10 @@ test "Editor: appendRows rejects out-of-range sheet idx + lossy ints" {
         defer w.deinit();
         var s = try w.addSheet("S");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
 
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
 
     const ok_rows = [_][]const Cell{&.{.{ .integer = 2 }}};
@@ -1328,12 +1373,15 @@ test "Editor: appendRows rejects out-of-range sheet idx + lossy ints" {
 }
 
 test "Editor: appendRows with string cells extends SST (iter-lms-3)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "editor_append_str_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "editor_append_str_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "editor_append_str_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "editor_append_str_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
 
     // Source workbook with one string row so the SST exists.
@@ -1342,12 +1390,12 @@ test "Editor: appendRows with string cells extends SST (iter-lms-3)" {
         defer w.deinit();
         var s = try w.addSheet("Data");
         try s.writeRow(&.{ .{ .string = "alpha" }, .{ .integer = 1 } });
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
 
     // Append a row that mixes string + integer + boolean.
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         const append_rows = [_][]const Cell{
             &.{ .{ .string = "beta" }, .{ .integer = 2 } },
@@ -1358,12 +1406,12 @@ test "Editor: appendRows with string cells extends SST (iter-lms-3)" {
             &.{ .{ .string = "alpha" }, .{ .integer = 3 } },
         };
         try ed.appendRows(0, &append_rows);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
 
     // Read back through Book — every appended string resolves to the
     // expected content.
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -1393,12 +1441,15 @@ test "Editor: appendRows with string cells extends SST (iter-lms-3)" {
 }
 
 test "Editor: SST-less workbook gets fresh sharedStrings.xml on string append" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "editor_sstless_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "editor_sstless_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "editor_sstless_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "editor_sstless_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
 
     // Build a workbook (the Zig writer always emits sharedStrings.xml).
@@ -1407,7 +1458,7 @@ test "Editor: SST-less workbook gets fresh sharedStrings.xml on string append" {
         defer w.deinit();
         var s = try w.addSheet("D");
         try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 } });
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
 
     // Force the create-new-sst path: open the editor, then strip the
@@ -1416,10 +1467,10 @@ test "Editor: SST-less workbook gets fresh sharedStrings.xml on string append" {
     // without this the test would fall back to the substitute-
     // existing-SST path and never exercise the new branch.
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
 
-        var filtered: std.ArrayListUnmanaged(ZipEntry) = .{};
+        var filtered: std.ArrayListUnmanaged(ZipEntry) = .empty;
         defer filtered.deinit(std.testing.allocator);
         var saw_sst = false;
         for (ed.entries) |e| {
@@ -1438,10 +1489,10 @@ test "Editor: SST-less workbook gets fresh sharedStrings.xml on string append" {
             &.{ .{ .string = "beta" }, .{ .integer = 20 } },
         };
         try ed.appendRows(0, &append_rows);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
 
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -1468,10 +1519,13 @@ test "Editor: SST-less workbook gets fresh sharedStrings.xml on string append" {
 }
 
 test "Editor: scanWorksheet returns one span per <c> element (iter-cm-1)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "scan_basic.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "scan_basic.xlsx");
     defer std.testing.allocator.free(src_path);
 
     {
@@ -1481,10 +1535,10 @@ test "Editor: scanWorksheet returns one span per <c> element (iter-cm-1)" {
         try s.writeRow(&.{ .{ .string = "h1" }, .{ .string = "h2" }, .{ .string = "h3" } });
         try s.writeRow(&.{ .{ .integer = 1 }, .{ .number = 2.5 }, .{ .boolean = true } });
         try s.writeRow(&.{ .{ .string = "x" }, .{ .empty = {} }, .{ .integer = 99 } });
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
 
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
 
     var spans = try ed.scanWorksheet(0);
@@ -1511,10 +1565,13 @@ test "Editor: scanWorksheet returns one span per <c> element (iter-cm-1)" {
 }
 
 test "Editor: scanWorksheet (row,col) matches Book.rows on every cell" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "scan_roundtrip.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "scan_roundtrip.xlsx");
     defer std.testing.allocator.free(src_path);
 
     {
@@ -1525,18 +1582,18 @@ test "Editor: scanWorksheet (row,col) matches Book.rows on every cell" {
         try s.writeRow(&.{ .{ .string = "alpha" }, .{ .integer = 10 }, .{ .boolean = true } });
         try s.writeRow(&.{ .{ .string = "beta" }, .{ .integer = 20 }, .{ .boolean = false } });
         try s.writeRow(&.{ .{ .string = "gamma" }, .{ .empty = {} }, .{ .boolean = true } });
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
 
     // Read the source via the Editor scanner.
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
     var spans = try ed.scanWorksheet(0);
     defer spans.deinit();
 
     // Read the same file through Book.rows; every non-empty cell
     // must have a matching span at the same (row, col).
-    var book = try Book.open(std.testing.allocator, src_path);
+    var book = try Book.open(std.testing.allocator, io, src_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -1576,12 +1633,15 @@ test "scanWorksheetXml: pretty-printed cells (newline after <c) + r-less rows" {
 }
 
 test "Editor: setCell replaces a numeric cell in place (iter-cm-2a)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "setcell_basic_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "setcell_basic_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "setcell_basic_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "setcell_basic_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
 
     {
@@ -1590,18 +1650,18 @@ test "Editor: setCell replaces a numeric cell in place (iter-cm-2a)" {
         var s = try w.addSheet("S");
         try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 } });
         try s.writeRow(&.{ .{ .integer = 3 }, .{ .integer = 4 } });
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
 
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.setCell(0, 1, 1, .{ .integer = 99 }); // B1: 2 -> 99
         try ed.setCell(0, 2, 0, .{ .number = 3.5 }); // A2: 3 -> 3.5
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
 
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -1616,12 +1676,15 @@ test "Editor: setCell replaces a numeric cell in place (iter-cm-2a)" {
 }
 
 test "Editor: setCell with strings emits inline-string cells (iter-cm-2b)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "setcell_str_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "setcell_str_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "setcell_str_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "setcell_str_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
 
     {
@@ -1629,20 +1692,20 @@ test "Editor: setCell with strings emits inline-string cells (iter-cm-2b)" {
         defer w.deinit();
         var s = try w.addSheet("S");
         try s.writeRow(&.{ .{ .string = "a" }, .{ .string = "b" } });
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
 
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         // Replace shared-string cells with inline strings — including
         // entity-needing chars and leading/trailing whitespace.
         try ed.setCell(0, 1, 0, .{ .string = "Done & dusted" });
         try ed.setCell(0, 1, 1, .{ .string = " trim me " });
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
 
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -1653,12 +1716,15 @@ test "Editor: setCell with strings emits inline-string cells (iter-cm-2b)" {
 }
 
 test "Editor: setCell inserts a missing cell into an existing row (iter-cm-2c)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "setcell_insert.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "setcell_insert.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "setcell_insert_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "setcell_insert_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -1667,18 +1733,18 @@ test "Editor: setCell inserts a missing cell into an existing row (iter-cm-2c)" 
         // Row 1 has cells at A, C — gap at B. Row 2 has only A.
         try s.writeRow(&.{ .{ .integer = 1 }, .{ .empty = {} }, .{ .integer = 3 } });
         try s.writeRow(&.{.{ .integer = 4 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         // Insert into the gap at row 1 col 1.
         try ed.setCell(0, 1, 1, .{ .integer = 99 });
         // Insert at end-of-row in row 2: row has A only; append B.
         try ed.setCell(0, 2, 1, .{ .string = "appended" });
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -1692,12 +1758,15 @@ test "Editor: setCell inserts a missing cell into an existing row (iter-cm-2c)" 
 }
 
 test "Editor: setCell inserts a missing row at the right position (iter-cm-2d)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "setcell_row_insert.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "setcell_row_insert.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "setcell_row_insert_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "setcell_row_insert_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -1705,19 +1774,19 @@ test "Editor: setCell inserts a missing row at the right position (iter-cm-2d)" 
         var s = try w.addSheet("S");
         try s.writeRow(&.{.{ .integer = 1 }}); // row 1
         try s.writeRow(&.{.{ .integer = 5 }}); // row 2
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         // Insert a row beyond the source (row 5 — fresh).
         try ed.setCell(0, 5, 0, .{ .string = "row5" });
         // Insert a row in the middle (between rows 2 and 5 — call
         // it row 3).
         try ed.setCell(0, 3, 0, .{ .integer = 33 });
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -1745,6 +1814,9 @@ test "Editor: setCell inserts a missing row at the right position (iter-cm-2d)" 
 // home for metadata-aware mutation.
 
 test "Editor: setCell handles empty <row r=N/> rows without duplicating" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Build a sheet with a self-closing row in the middle. The
@@ -1754,9 +1826,9 @@ test "Editor: setCell handles empty <row r=N/> rows without duplicating" {
     // round-trip a writer-emitted body row through Editor + verify
     // setCell on a row-with-cells doesn't duplicate.
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "setcell_empty_row.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "setcell_empty_row.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "setcell_empty_row_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "setcell_empty_row_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -1764,19 +1836,19 @@ test "Editor: setCell handles empty <row r=N/> rows without duplicating" {
         var s = try w.addSheet("S");
         try s.writeRow(&.{.{ .integer = 1 }}); // r=1 with cells
         try s.writeRow(&.{.{ .integer = 5 }}); // r=2 with cells
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         // setCell on row 2 col 1 — row 2 already exists. The
         // pre-fix code path classified it as missing because no
         // span had row=2 col=1. Should now correctly insert into
         // the existing row's body, not duplicate.
         try ed.setCell(0, 2, 1, .{ .integer = 999 });
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -1792,15 +1864,18 @@ test "Editor: setCell handles empty <row r=N/> rows without duplicating" {
 }
 
 test "Editor: setCell populates an empty <sheetData/> worksheet" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Write a workbook with only header cells, no body — produces
     // <sheetData/> in some readers' canonical form. Assert setCell
     // expands it to <sheetData></sheetData> form transparently.
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "setcell_empty_sd.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "setcell_empty_sd.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "setcell_empty_sd_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "setcell_empty_sd_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
 
     {
@@ -1812,17 +1887,17 @@ test "Editor: setCell populates an empty <sheetData/> worksheet" {
         // common path doesn't regress by writing an unmodified sheet
         // and inserting a row.
         _ = try w.addSheet("S");
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
 
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.setCell(0, 1, 0, .{ .integer = 42 });
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
 
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -1831,30 +1906,33 @@ test "Editor: setCell populates an empty <sheetData/> worksheet" {
 }
 
 test "Editor: editor.workbook.addSheet path round-trips through Editor.save (iter-er-4)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "wb_addsheet_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "wb_addsheet_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "wb_addsheet_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "wb_addsheet_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("Original");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         // Bypass Editor.addSheet — go straight through the
         // typed-overlay surface. Editor.save's verbatim-emit walk
         // and PartStore-overrides sync should pick it up.
         _ = try ed.workbook.addSheet("FromWorkbook");
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
     try std.testing.expectEqualStrings("Original", book.sheets[0].name);
@@ -1862,22 +1940,25 @@ test "Editor: editor.workbook.addSheet path round-trips through Editor.save (ite
 }
 
 test "Editor: editor.workbook.addSheet + setCell on returned handle round-trips" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "wb_addsheet_set_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "wb_addsheet_set_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "wb_addsheet_set_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "wb_addsheet_set_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("Source");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         const new_ws_idx = blk: {
             const ws = try ed.workbook.addSheet("Target");
@@ -1890,9 +1971,9 @@ test "Editor: editor.workbook.addSheet + setCell on returned handle round-trips"
         // this test since no further structural mutations happen,
         // but exercises the documented re-fetch pattern).
         _ = new_ws_idx;
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
     var rows = try book.rows(book.sheets[1], std.testing.allocator);
@@ -1903,31 +1984,34 @@ test "Editor: editor.workbook.addSheet + setCell on returned handle round-trips"
 }
 
 test "Editor: addSheet appends a new sheet and round-trips through reader (iter-sheet-1)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "addsheet_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "addsheet_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "addsheet_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "addsheet_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("Original");
         try s.writeRow(&.{.{ .integer = 42 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         const new_idx = try ed.addSheet("Added");
         try std.testing.expectEqual(@as(u32, 1), new_idx);
         // The new sheet should be addressable via setCell.
         try ed.setCell(new_idx, 1, 0, .{ .string = "hello" });
         try ed.setCell(new_idx, 1, 1, .{ .integer = 99 });
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
     try std.testing.expectEqualStrings("Original", book.sheets[0].name);
@@ -1940,58 +2024,64 @@ test "Editor: addSheet appends a new sheet and round-trips through reader (iter-
 }
 
 test "Editor: addSheet escapes quotes in name attribute" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Codex P1: pre-fix, names with `"` produced malformed
     // workbook.xml (`name="He said "Hi""`). Use attr-escape that
     // covers `"` → `&quot;`.
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "addsheet_quote.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "addsheet_quote.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "addsheet_quote_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "addsheet_quote_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("Original");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         // validateSheetName accepts `"` so we must round-trip it.
         _ = try ed.addSheet("He said \"Hi\"");
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
     try std.testing.expectEqualStrings("He said \"Hi\"", book.sheets[1].name);
 }
 
 test "Editor: insertColumn shifts existing cells right (iter-col-3)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "insertcol_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "insertcol_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "insertcol_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "insertcol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("S");
         try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 } });
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertColumn(0, 2); // insert before col B
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -2004,27 +2094,30 @@ test "Editor: insertColumn shifts existing cells right (iter-col-3)" {
 }
 
 test "Editor: deleteColumn drops a column + shifts everything right of it left" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "deletecol_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "deletecol_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "deletecol_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "deletecol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("S");
         try s.writeRow(&.{ .{ .integer = 10 }, .{ .integer = 20 }, .{ .integer = 30 } });
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteColumn(0, 2); // delete col B (the 20)
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -2226,12 +2319,15 @@ test "applyRowEditToWorksheet: pane with malformed ySplit surfaces typed error" 
 }
 
 test "Editor: insertRow shifts existing rows down (iter-row-2)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "insertrow_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "insertrow_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "insertrow_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "insertrow_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -2240,15 +2336,15 @@ test "Editor: insertRow shifts existing rows down (iter-row-2)" {
         try s.writeRow(&.{.{ .integer = 1 }});
         try s.writeRow(&.{.{ .integer = 2 }});
         try s.writeRow(&.{.{ .integer = 3 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertRow(0, 2); // insert blank row before row 2
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -2265,12 +2361,15 @@ test "Editor: insertRow shifts existing rows down (iter-row-2)" {
 }
 
 test "Editor: deleteRow removes a row + shifts everything below up" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "deleterow_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "deleterow_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "deleterow_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "deleterow_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -2279,15 +2378,15 @@ test "Editor: deleteRow removes a row + shifts everything below up" {
         try s.writeRow(&.{.{ .integer = 10 }});
         try s.writeRow(&.{.{ .integer = 20 }});
         try s.writeRow(&.{.{ .integer = 30 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteRow(0, 2);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -2299,6 +2398,9 @@ test "Editor: deleteRow removes a row + shifts everything below up" {
 }
 
 test "Editor: insertRow on a sheet carrying formulas rewrites refs (iter-er-5 lift)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Pre iter-er-5 lift: refused with `RowEditWithFormulasNotSupported`.
     // Post-lift: `Workbook.insertRow` runs `rewriteAllFormulas` so
     // cross-sheet and bare formula refs shift alongside the byte
@@ -2306,28 +2408,31 @@ test "Editor: insertRow on a sheet carrying formulas rewrites refs (iter-er-5 li
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "row_unsafe.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "row_unsafe.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("S");
         try s.writeRowWithFormulas(&.{.{ .integer = 0 }}, &.{"SUM(A1:A1)"});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertRow(0, 1);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteRow(0, 1);
     }
 }
 
 test "Editor: row/col edits with cross-sheet hyperlinks rewrite locations (iter-er-5 lift)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Pre iter-er-5 lift: refused with `RowEditUnsafeForSheet` /
     // `ColEditUnsafeForSheet`. Post-lift: `Workbook.{insertRow,
     // deleteRow, insertColumn, deleteColumn}` runs
@@ -2337,7 +2442,7 @@ test "Editor: row/col edits with cross-sheet hyperlinks rewrite locations (iter-
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "xref_hyperlink.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "xref_hyperlink.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -2348,40 +2453,43 @@ test "Editor: row/col edits with cross-sheet hyperlinks rewrite locations (iter-
         var s2 = try w.addSheet("WithLink");
         try s2.writeRow(&.{.{ .string = "click" }});
         try s2.addInternalHyperlink("A1", "Plain!C5");
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertRow(0, 1);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteRow(0, 1);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertColumn(0, 1);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteColumn(0, 1);
     }
 }
 
 test "Editor: insertRow on frozen-pane sheet shifts ySplit + topLeftCell" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Post-lift: `<pane>` is no longer in the row-edit refusal
     // guards. The frozen pane's ySplit and topLeftCell row shift
     // alongside the row attrs. xSplit is unaffected by a row edit.
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "pane_insert_row.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "pane_insert_row.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "pane_insert_row_out.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "pane_insert_row_out.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -2390,15 +2498,15 @@ test "Editor: insertRow on frozen-pane sheet shifts ySplit + topLeftCell" {
         try s.writeRow(&.{.{ .integer = 1 }});
         try s.writeRow(&.{.{ .integer = 2 }});
         try s.freezePanes(1, 2); // rows=1, cols=2 → ySplit=1, xSplit=2, topLeftCell=C2
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertRow(0, 1);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    var ed2 = try Editor.open(std.testing.allocator, io, dst_path);
     defer ed2.deinit();
     const part = (try ed2.workbook.store.part("xl/worksheets/sheet1.xml")) orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "ySplit=\"2\"") != null);
@@ -2407,12 +2515,15 @@ test "Editor: insertRow on frozen-pane sheet shifts ySplit + topLeftCell" {
 }
 
 test "Editor: insertColumn on frozen-pane sheet shifts xSplit + topLeftCell" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "pane_insert_col.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "pane_insert_col.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "pane_insert_col_out.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "pane_insert_col_out.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -2420,15 +2531,15 @@ test "Editor: insertColumn on frozen-pane sheet shifts xSplit + topLeftCell" {
         var s = try w.addSheet("S");
         try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 } });
         try s.freezePanes(1, 2);
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertColumn(0, 1);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    var ed2 = try Editor.open(std.testing.allocator, io, dst_path);
     defer ed2.deinit();
     const part = (try ed2.workbook.store.part("xl/worksheets/sheet1.xml")) orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "xSplit=\"3\"") != null);
@@ -2437,12 +2548,15 @@ test "Editor: insertColumn on frozen-pane sheet shifts xSplit + topLeftCell" {
 }
 
 test "Editor: deleteRow + deleteColumn on frozen-pane sheet shrinks freeze" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "pane_delete.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "pane_delete.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "pane_delete_out.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "pane_delete_out.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -2451,15 +2565,15 @@ test "Editor: deleteRow + deleteColumn on frozen-pane sheet shrinks freeze" {
         try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 } });
         try s.writeRow(&.{ .{ .integer = 4 }, .{ .integer = 5 }, .{ .integer = 6 } });
         try s.freezePanes(1, 2);
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteRow(0, 1); // ySplit 1→0, topLeftCell row 2→1
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    var ed2 = try Editor.open(std.testing.allocator, io, dst_path);
     defer ed2.deinit();
     const part = (try ed2.workbook.store.part("xl/worksheets/sheet1.xml")) orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "ySplit=\"0\"") != null);
@@ -2467,12 +2581,15 @@ test "Editor: deleteRow + deleteColumn on frozen-pane sheet shrinks freeze" {
 }
 
 test "Editor: deleteColumn on frozen-pane sheet shrinks xSplit" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "pane_delete_col.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "pane_delete_col.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "pane_delete_col_out.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "pane_delete_col_out.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -2480,15 +2597,15 @@ test "Editor: deleteColumn on frozen-pane sheet shrinks xSplit" {
         var s = try w.addSheet("S");
         try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 } });
         try s.freezePanes(1, 2);
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteColumn(0, 1); // xSplit 2→1, topLeftCell col C→B
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    var ed2 = try Editor.open(std.testing.allocator, io, dst_path);
     defer ed2.deinit();
     const part = (try ed2.workbook.store.part("xl/worksheets/sheet1.xml")) orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "xSplit=\"1\"") != null);
@@ -2496,6 +2613,9 @@ test "Editor: deleteColumn on frozen-pane sheet shrinks xSplit" {
 }
 
 test "Editor: deleteSheet on a different sheet is allowed after a column edit (iter-er-4 (3/N))" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Pre iter-er-4 (3/N), `Editor.insertColumn` queued a pending
     // edit and `deleteSheet` refused with `SheetDeleteRequiresCleanState`
     // because the queued edit's `sheet_idx` would shift after the
@@ -2506,7 +2626,7 @@ test "Editor: deleteSheet on a different sheet is allowed after a column edit (i
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "delsheet_after_col.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "delsheet_after_col.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -2515,9 +2635,9 @@ test "Editor: deleteSheet on a different sheet is allowed after a column edit (i
         try s1.writeRow(&.{.{ .integer = 1 }});
         var s2 = try w.addSheet("B");
         try s2.writeRow(&.{.{ .integer = 2 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
     try ed.insertColumn(0, 1);
     // Used to error SheetDeleteRequiresCleanState; now succeeds.
@@ -2526,11 +2646,14 @@ test "Editor: deleteSheet on a different sheet is allowed after a column edit (i
 }
 
 test "Editor: deleteSheet on a different sheet is allowed after a row edit (iter-er-4 (3/N))" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Same parity as the column-edit test above.
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "delsheet_after_row.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "delsheet_after_row.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -2540,9 +2663,9 @@ test "Editor: deleteSheet on a different sheet is allowed after a row edit (iter
         try s1.writeRow(&.{.{ .integer = 2 }});
         var s2 = try w.addSheet("B");
         try s2.writeRow(&.{.{ .integer = 3 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
     try ed.insertRow(0, 1);
     try ed.deleteSheet(1);
@@ -2550,6 +2673,9 @@ test "Editor: deleteSheet on a different sheet is allowed after a row edit (iter
 }
 
 test "Editor: appendRows + setCell after a row/col edit compose (iter-er-4 (3/N))" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Pre iter-er-4 (3/N), insertColumn / deleteRow queued a
     // pending edit and subsequent appendRows / setCell on the
     // same sheet refused with `SheetHasUnsavedRowOrColEdit`
@@ -2562,18 +2688,18 @@ test "Editor: appendRows + setCell after a row/col edit compose (iter-er-4 (3/N)
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "append_after_coledit.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "append_after_coledit.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("S");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     // appendRows after a column edit composes:
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertColumn(0, 1);
         try ed.appendRows(0, &.{&.{.{ .integer = 99 }}});
@@ -2583,20 +2709,20 @@ test "Editor: appendRows + setCell after a row/col edit compose (iter-er-4 (3/N)
     // mutually exclusive — that invariant is independent of
     // row/col edits):
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertColumn(0, 1);
         try ed.setCell(0, 5, 0, .{ .integer = 99 });
     }
     // Same parity for deleteRow:
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteRow(0, 1);
         try ed.appendRows(0, &.{&.{.{ .integer = 99 }}});
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteRow(0, 1);
         try ed.setCell(0, 5, 0, .{ .integer = 99 });
@@ -2604,6 +2730,9 @@ test "Editor: appendRows + setCell after a row/col edit compose (iter-er-4 (3/N)
 }
 
 test "Editor: row edits with cross-sheet formulas rewrite refs (iter-er-5 lift)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Pre iter-er-5 lift: refused with `RowEditWithFormulasNotSupported`
     // / `ColEditWithFormulasNotSupported` because sheet2's formula
     // `Plain!A1+Plain!A2` references rows in the clean sheet.
@@ -2613,7 +2742,7 @@ test "Editor: row edits with cross-sheet formulas rewrite refs (iter-er-5 lift)"
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "row_xsheet_formula.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "row_xsheet_formula.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -2623,37 +2752,40 @@ test "Editor: row edits with cross-sheet formulas rewrite refs (iter-er-5 lift)"
         try s1.writeRow(&.{.{ .integer = 2 }});
         var s2 = try w.addSheet("HasFormula");
         try s2.writeRowWithFormulas(&.{.{ .integer = 0 }}, &.{"Plain!A1+Plain!A2"});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertRow(0, 1);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteRow(0, 1);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertColumn(0, 1);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteColumn(0, 1);
     }
 }
 
 test "Editor: deleteSheet drops a source sheet (iter-sheet-3)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "delete_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "delete_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "delete_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "delete_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -2664,15 +2796,15 @@ test "Editor: deleteSheet drops a source sheet (iter-sheet-3)" {
         try s2.writeRow(&.{.{ .integer = 2 }});
         var s3 = try w.addSheet("AlsoKeep");
         try s3.writeRow(&.{.{ .integer = 3 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteSheet(1);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
     try std.testing.expectEqualStrings("Keep", book.sheets[0].name);
@@ -2680,58 +2812,64 @@ test "Editor: deleteSheet drops a source sheet (iter-sheet-3)" {
 }
 
 test "Editor: deleteSheet drops a pending-new sheet" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "delete_new.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "delete_new.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "delete_new_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "delete_new_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         _ = try w.addSheet("Original");
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         const new_idx = try ed.addSheet("Tmp");
         try ed.deleteSheet(new_idx);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
     try std.testing.expectEqualStrings("Original", book.sheets[0].name);
 }
 
 test "Editor: deleteSheet preserves order of other pending-new sheets" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Codex P1: swapRemove reordered remaining new sheets. orderedRemove
     // keeps them aligned with sheet_paths' tail.
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "delete_order.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "delete_order.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "delete_order_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "delete_order_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         _ = try w.addSheet("Source");
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         const a = try ed.addSheet("A"); // idx 1
         _ = try ed.addSheet("B"); // idx 2
         _ = try ed.addSheet("C"); // idx 3
         try ed.deleteSheet(a); // remove A; B,C should stay in order
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 3), book.sheets.len);
     try std.testing.expectEqualStrings("Source", book.sheets[0].name);
@@ -2740,31 +2878,34 @@ test "Editor: deleteSheet preserves order of other pending-new sheets" {
 }
 
 test "Editor: deleteSheet frees name for reuse via addSheet" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Codex P2: pre-fix, addSheet rejected reuse of a deleted
     // source sheet's name as DuplicateSheetName.
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "delete_reuse.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "delete_reuse.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "delete_reuse_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "delete_reuse_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         _ = try w.addSheet("Keep");
         _ = try w.addSheet("Drop");
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteSheet(1);
         // Reuse the deleted name.
         _ = try ed.addSheet("Drop");
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
     try std.testing.expectEqualStrings("Keep", book.sheets[0].name);
@@ -2772,64 +2913,73 @@ test "Editor: deleteSheet frees name for reuse via addSheet" {
 }
 
 test "Editor: deleteSheet rejects last-sheet" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "delete_last.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "delete_last.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         _ = try w.addSheet("Solo");
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
     try std.testing.expectError(error.CannotDeleteLastSheet, ed.deleteSheet(0));
     try std.testing.expectError(error.SheetIndexOutOfRange, ed.deleteSheet(99));
 }
 
 test "Editor: deleteSheet rejects dirty state" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "delete_dirty.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "delete_dirty.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         _ = try w.addSheet("S1");
         _ = try w.addSheet("S2");
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
     try ed.appendRows(0, &.{&.{.{ .integer = 5 }}});
     try std.testing.expectError(error.SheetDeleteRequiresCleanState, ed.deleteSheet(1));
 }
 
 test "Editor: renameSheet renames an existing sheet (iter-sheet-2)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "rename_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "rename_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "rename_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "rename_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("OldName");
         try s.writeRow(&.{.{ .integer = 42 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.renameSheet(0, "NewName");
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     try std.testing.expectEqualStrings("NewName", book.sheets[0].name);
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
@@ -2839,19 +2989,22 @@ test "Editor: renameSheet renames an existing sheet (iter-sheet-2)" {
 }
 
 test "Editor: renameSheet rejects duplicates and invalid names" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "rename_reject.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "rename_reject.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         _ = try w.addSheet("First");
         _ = try w.addSheet("Second");
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
     // Same name (case-insensitive) is a no-op, not an error.
     try ed.renameSheet(0, "FIRST");
@@ -2865,81 +3018,90 @@ test "Editor: renameSheet rejects duplicates and invalid names" {
 }
 
 test "Editor: renameSheet supports undo (rename A->B then B->A)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "rename_undo.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "rename_undo.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "rename_undo_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "rename_undo_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("Original");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.renameSheet(0, "Renamed");
         // Now revert. Pre-fix this was silently dropped.
         try ed.renameSheet(0, "Original");
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     try std.testing.expectEqualStrings("Original", book.sheets[0].name);
 }
 
 test "Editor: renameSheet persists case-only changes" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Excel uniqueness is case-insensitive but the displayed
     // casing matters. asciiEqlFold short-circuit dropped legit
     // case-only renames pre-fix.
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "rename_case.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "rename_case.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "rename_case_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "rename_case_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("sheet1");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.renameSheet(0, "Sheet1");
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     try std.testing.expectEqualStrings("Sheet1", book.sheets[0].name);
 }
 
 test "Editor: rename + add reuses names freed by earlier renames" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Codex P2: pre-fix, rotate / swap rename workflows were
     // rejected because the dup check only saw raw source names.
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "rename_rotate.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "rename_rotate.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "rename_rotate_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "rename_rotate_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         _ = try w.addSheet("A");
         _ = try w.addSheet("B");
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         // A -> C, then B -> A (rotate).
         try ed.renameSheet(0, "C");
@@ -2948,9 +3110,9 @@ test "Editor: rename + add reuses names freed by earlier renames" {
         // earlier old-name was "B", but sheet 1 is now "A". Adding
         // "B" should succeed.
         _ = try ed.addSheet("B");
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     try std.testing.expectEqualStrings("C", book.sheets[0].name);
     try std.testing.expectEqualStrings("A", book.sheets[1].name);
@@ -2958,62 +3120,68 @@ test "Editor: rename + add reuses names freed by earlier renames" {
 }
 
 test "Editor: renameSheet on a pending-new sheet mutates in place" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "rename_new.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "rename_new.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "rename_new_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "rename_new_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("Source");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         const idx = try ed.addSheet("Tmp");
         try ed.renameSheet(idx, "Final");
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
     try std.testing.expectEqualStrings("Final", book.sheets[1].name);
 }
 
 test "Editor: appendRows works on freshly-added sheets" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Codex P1: pre-fix, save() failed with SheetEntryNotFound when
     // appendRows targeted a sheet created via addSheet, because the
     // pending_appends loop assumed every sheet had a source entry.
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "addsheet_append.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "addsheet_append.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "addsheet_append_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "addsheet_append_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("Original");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         const new_idx = try ed.addSheet("Fresh");
         try ed.appendRows(new_idx, &.{
             &.{ .{ .string = "alpha" }, .{ .integer = 10 } },
             &.{ .{ .string = "beta" }, .{ .integer = 20 } },
         });
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
     try std.testing.expectEqualStrings("Fresh", book.sheets[1].name);
@@ -3028,19 +3196,22 @@ test "Editor: appendRows works on freshly-added sheets" {
 }
 
 test "Editor: scanWorksheet works on freshly-added sheets (iter-sheet-1)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "scan_new_sheet.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "scan_new_sheet.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("Original");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
     const new_idx = try ed.addSheet("Empty");
     // scanWorksheet on the brand-new untouched sheet must not error
@@ -3051,22 +3222,25 @@ test "Editor: scanWorksheet works on freshly-added sheets (iter-sheet-1)" {
 }
 
 test "Editor: addSheet handles XML-escaped duplicate names (R&D)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // The source workbook stores `R&D` as `name="R&amp;D"` in
     // workbook.xml. Pre-fix, sheetNameExists compared raw bytes
     // and accepted the duplicate. Now decode entities first.
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "addsheet_amp.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "addsheet_amp.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("R&D");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
     try std.testing.expectError(error.DuplicateSheetName, ed.addSheet("R&D"));
     // Case-insensitive too.
@@ -3074,25 +3248,28 @@ test "Editor: addSheet handles XML-escaped duplicate names (R&D)" {
 }
 
 test "Editor: addSheet allocates non-colliding ids across multiple calls" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Codex caught: pre-fix, two addSheet calls in one session
     // produced duplicate rIds / sheetIds / sheet paths because the
     // max scan only looked at the source.
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "addsheet_seq_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "addsheet_seq_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "addsheet_seq_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "addsheet_seq_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("Original");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         const a = try ed.addSheet("A");
         const b = try ed.addSheet("B");
@@ -3100,9 +3277,9 @@ test "Editor: addSheet allocates non-colliding ids across multiple calls" {
         try ed.setCell(a, 1, 0, .{ .string = "in_a" });
         try ed.setCell(b, 1, 0, .{ .string = "in_b" });
         try ed.setCell(c, 1, 0, .{ .string = "in_c" });
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 4), book.sheets.len);
     try std.testing.expectEqualStrings("Original", book.sheets[0].name);
@@ -3122,19 +3299,22 @@ test "Editor: addSheet allocates non-colliding ids across multiple calls" {
 }
 
 test "Editor: addSheet duplicate names are case-insensitive" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "addsheet_case.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "addsheet_case.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("Existing");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
     // Existing source sheet — case-insensitive collision.
     try std.testing.expectError(error.DuplicateSheetName, ed.addSheet("EXISTING"));
@@ -3146,19 +3326,22 @@ test "Editor: addSheet duplicate names are case-insensitive" {
 }
 
 test "Editor: addSheet rejects invalid + duplicate names" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "addsheet_reject.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "addsheet_reject.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("Existing");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
     try std.testing.expectError(error.InvalidSheetName, ed.addSheet(""));
     try std.testing.expectError(error.InvalidSheetName, ed.addSheet("a:b"));
@@ -3168,12 +3351,15 @@ test "Editor: addSheet rejects invalid + duplicate names" {
 }
 
 test "Editor: setCells applies a batch in source order (iter-cm-3)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "setcells_batch.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "setcells_batch.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "setcells_batch_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "setcells_batch_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
@@ -3181,19 +3367,19 @@ test "Editor: setCells applies a batch in source order (iter-cm-3)" {
         var s = try w.addSheet("S");
         try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 } });
         try s.writeRow(&.{ .{ .integer = 4 }, .{ .integer = 5 }, .{ .integer = 6 } });
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.setCells(0, &.{
             .{ .row = 1, .col = 0, .cell = .{ .integer = 100 } },
             .{ .row = 1, .col = 2, .cell = .{ .number = 3.14 } },
             .{ .row = 2, .col = 1, .cell = .{ .string = "x" } },
         });
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -3208,14 +3394,17 @@ test "Editor: setCells applies a batch in source order (iter-cm-3)" {
 }
 
 test "Editor: setCell amortises decompress across many calls (iter-cm-2a)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Lazy-init the MutatedSheet on first call; subsequent calls
     // mutate the cached buffer.
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "setcell_many.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "setcell_many.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "setcell_many_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "setcell_many_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
 
     {
@@ -3226,11 +3415,11 @@ test "Editor: setCell amortises decompress across many calls (iter-cm-2a)" {
         while (i < 10) : (i += 1) {
             try s.writeRow(&.{ .{ .integer = i }, .{ .integer = i * 2 }, .{ .integer = i * 3 } });
         }
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
 
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         // Set every cell to 999. After this only the (row, col) -> 999
         // mapping should hold.
@@ -3241,10 +3430,10 @@ test "Editor: setCell amortises decompress across many calls (iter-cm-2a)" {
                 try ed.setCell(0, r, c, .{ .integer = 999 });
             }
         }
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
 
-    var book = try Book.open(std.testing.allocator, dst_path);
+    var book = try Book.open(std.testing.allocator, io, dst_path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], std.testing.allocator);
     defer rows.deinit();
@@ -3256,19 +3445,22 @@ test "Editor: setCell amortises decompress across many calls (iter-cm-2a)" {
 }
 
 test "Editor: setCell rejects unsupported cases (iter-cm-2a)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "setcell_reject.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "setcell_reject.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("S");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
     // Out-of-range sheet
     try std.testing.expectError(error.SheetIndexOutOfRange, ed.setCell(99, 1, 0, .{ .integer = 1 }));
@@ -3286,19 +3478,22 @@ test "Editor: setCell rejects unsupported cases (iter-cm-2a)" {
 }
 
 test "Editor: appendRows rejects sheets with pending setCell mutations" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "setcell_then_append.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "setcell_then_append.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("S");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
     try ed.setCell(0, 1, 0, .{ .integer = 2 });
     try std.testing.expectError(
@@ -3308,22 +3503,25 @@ test "Editor: appendRows rejects sheets with pending setCell mutations" {
 }
 
 test "Editor: scanWorksheet sees setCell mutations (no stale read)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // Codex caught: pre-fix, scanWorksheet decompressed from
     // src_buf and ignored pending_mutations. A setCell-then-scan
     // workflow got pre-mutation spans.
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "setcell_then_scan.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "setcell_then_scan.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("S");
         try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 } });
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
 
     // Capture the byte length of the pre-mutation XML.
@@ -3343,22 +3541,25 @@ test "Editor: scanWorksheet sees setCell mutations (no stale read)" {
 }
 
 test "Editor: scanWorksheet rejects sheets with unsaved appendRows" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     // The scanner reads from src_buf and would silently miss rows
     // queued in pending_appends. Contract: reject so callers can't
     // act on a stale span set.
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "scan_pending.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "scan_pending.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("S");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
     // Scan works on a clean Editor.
     {
@@ -3372,19 +3573,22 @@ test "Editor: scanWorksheet rejects sheets with unsaved appendRows" {
 }
 
 test "Editor: scanWorksheet rejects out-of-range sheet idx" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
     const writer_mod = xlsx;
-    const src_path = try tt.path(std.testing.allocator, "scan_oor.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "scan_oor.xlsx");
     defer std.testing.allocator.free(src_path);
     {
         var w = writer_mod.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("S");
         try s.writeRow(&.{.{ .integer = 1 }});
-        try w.save(src_path);
+        try w.save(io, src_path);
     }
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
     try std.testing.expectError(error.SheetIndexOutOfRange, ed.scanWorksheet(99));
 }
@@ -3394,25 +3598,28 @@ test "Editor: scanWorksheet rejects out-of-range sheet idx" {
 /// Build a 2-sheet xlsx via the writer (which produces a non-DataDescriptor
 /// ZIP that Editor accepts) and return its temp path. Caller frees the
 /// returned slice and is responsible for the TestTmp lifecycle.
-fn buildIterEr1Fixture(tt: *TestTmp, alloc: std.mem.Allocator) ![:0]u8 {
-    const path = try tt.path(alloc, "iter_er_1.xlsx");
+fn buildIterEr1Fixture(io: std.Io, tt: *TestTmp, alloc: std.mem.Allocator) ![:0]u8 {
+    const path = try tt.path(alloc, io, "iter_er_1.xlsx");
     var w = xlsx.Writer.init(alloc);
     defer w.deinit();
     var s1 = try w.addSheet("Alpha");
     try s1.writeRow(&.{ .{ .string = "h" }, .{ .integer = 1 } });
     var s2 = try w.addSheet("Beta");
     try s2.writeRow(&.{ .{ .string = "x" }, .{ .number = 2.5 } });
-    try w.save(path);
+    try w.save(io, path);
     return path;
 }
 
 test "iter-er-1: Editor.open populates a Workbook view (sheet count + names match)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const path = try buildIterEr1Fixture(&tt, std.testing.allocator);
+    const path = try buildIterEr1Fixture(io, &tt, std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var ed = try Editor.open(std.testing.allocator, path);
+    var ed = try Editor.open(std.testing.allocator, io, path);
     defer ed.deinit();
 
     // sheet_paths is built from Book.sheets[i].path. workbook view's
@@ -3430,30 +3637,36 @@ test "iter-er-1: Editor.open populates a Workbook view (sheet count + names matc
 }
 
 test "iter-er-1: Editor.deinit cleans up Workbook + everything else (no leaks)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Editor.deinit calls self.workbook.deinit() before freeing
     // src_buf / entries / sheet_paths. Under std.testing.allocator
     // (which panics on leak), this test fails if any allocation
     // outlives the editor.
     var tt = TestTmp.init();
     defer tt.deinit();
-    const path = try buildIterEr1Fixture(&tt, std.testing.allocator);
+    const path = try buildIterEr1Fixture(io, &tt, std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     {
-        var ed = try Editor.open(std.testing.allocator, path);
+        var ed = try Editor.open(std.testing.allocator, io, path);
         ed.deinit();
     }
 }
 
 test "iter-er-1: Editor.workbook.cellByRef matches Book.cell for known cells" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Cross-API parity sanity check: the Workbook view's per-cell
     // accessor finds cells the writer emitted.
     var tt = TestTmp.init();
     defer tt.deinit();
-    const path = try buildIterEr1Fixture(&tt, std.testing.allocator);
+    const path = try buildIterEr1Fixture(io, &tt, std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var ed = try Editor.open(std.testing.allocator, path);
+    var ed = try Editor.open(std.testing.allocator, io, path);
     defer ed.deinit();
 
     // The writer wrote integer 1 at B1 of "Alpha"; the typed-overlay
@@ -3470,14 +3683,14 @@ test "iter-er-1: Editor.workbook.cellByRef matches Book.cell for known cells" {
 // RowEditUnsafe refusals on sheets carrying <autoFilter>).
 // ---------------------------------------------------------------------------
 
-fn buildAutoFilterFixture(path: []const u8) !void {
+fn buildAutoFilterFixture(io: std.Io, path: []const u8) !void {
     var w = xlsx.Writer.init(std.testing.allocator);
     defer w.deinit();
     var s = try w.addSheet("S");
     try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 }, .{ .integer = 4 } });
     try s.writeRow(&.{ .{ .integer = 5 }, .{ .integer = 6 }, .{ .integer = 7 }, .{ .integer = 8 } });
     try s.setAutoFilter("B1:D2");
-    try w.save(path);
+    try w.save(io, path);
 }
 
 fn assertSheetXmlContains(ed: *Editor, needle: []const u8) !void {
@@ -3490,80 +3703,92 @@ fn assertSheetXmlContains(ed: *Editor, needle: []const u8) !void {
 }
 
 test "Editor: insertRow on a sheet carrying <autoFilter> rewrites range" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "af_insrow_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "af_insrow_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "af_insrow_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "af_insrow_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildAutoFilterFixture(src_path);
+    try buildAutoFilterFixture(io, src_path);
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertRow(0, 2);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    var ed2 = try Editor.open(std.testing.allocator, io, dst_path);
     defer ed2.deinit();
     // B1:D2 → B1:D3 after inserting a row at row 2.
     try assertSheetXmlContains(&ed2, "ref=\"B1:D3\"");
 }
 
 test "Editor: insertColumn on a sheet carrying <autoFilter> rewrites range" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "af_inscol_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "af_inscol_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "af_inscol_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "af_inscol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildAutoFilterFixture(src_path);
+    try buildAutoFilterFixture(io, src_path);
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertColumn(0, 3); // insert before col C, inside B:D
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    var ed2 = try Editor.open(std.testing.allocator, io, dst_path);
     defer ed2.deinit();
     // B1:D2 → B1:E2 after extending the range by one column.
     try assertSheetXmlContains(&ed2, "ref=\"B1:E2\"");
 }
 
 test "Editor: deleteRow on a sheet carrying <autoFilter> rewrites range" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "af_delrow_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "af_delrow_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "af_delrow_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "af_delrow_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildAutoFilterFixture(src_path);
+    try buildAutoFilterFixture(io, src_path);
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteRow(0, 2); // delete row 2 (the BR of B1:D2)
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    var ed2 = try Editor.open(std.testing.allocator, io, dst_path);
     defer ed2.deinit();
     // B1:D2 → B1:D1 after the BR row vanishes.
     try assertSheetXmlContains(&ed2, "ref=\"B1:D1\"");
 }
 
 test "Editor: deleteColumn on a sheet carrying <autoFilter> shrinks range" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "af_delcol_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "af_delcol_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "af_delcol_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "af_delcol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildAutoFilterFixture(src_path);
+    try buildAutoFilterFixture(io, src_path);
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteColumn(0, 3); // delete col C inside B:D
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    var ed2 = try Editor.open(std.testing.allocator, io, dst_path);
     defer ed2.deinit();
     // B1:D2 → B1:C2 (BR shrinks by one column).
     try assertSheetXmlContains(&ed2, "ref=\"B1:C2\"");
@@ -3578,7 +3803,7 @@ test "Editor: deleteColumn on a sheet carrying <autoFilter> shrinks range" {
 // and round-tripping insertRow + insertColumn through the Editor.
 // ---------------------------------------------------------------------------
 
-fn buildPictureFixture(path: []const u8) !void {
+fn buildPictureFixture(io: std.Io, path: []const u8) !void {
     // Stage 1: produce a baseline workbook with the writer.
     {
         var w = xlsx.Writer.init(std.testing.allocator);
@@ -3586,7 +3811,7 @@ fn buildPictureFixture(path: []const u8) !void {
         var s = try w.addSheet("S");
         try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 } });
         try s.writeRow(&.{ .{ .integer = 3 }, .{ .integer = 4 } });
-        try w.save(path);
+        try w.save(io, path);
     }
 
     // Stage 2: splice `<picture r:id="rId99"/>` before `</worksheet>` in
@@ -3595,7 +3820,7 @@ fn buildPictureFixture(path: []const u8) !void {
     // sheet's rels; that's fine for this test — the guard is what we're
     // exercising, and ECMA-376 readers tolerate dangling rels by
     // ignoring the picture element rather than failing the file.
-    var store = try store_mod.PartStore.open(std.testing.allocator, path);
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, path);
     defer store.deinit();
     const sheet_name = "xl/worksheets/sheet1.xml";
     const orig = (try store.part(sheet_name)) orelse return error.MissingSheet;
@@ -3608,44 +3833,50 @@ fn buildPictureFixture(path: []const u8) !void {
     @memcpy(new_xml[idx .. idx + inject.len], inject);
     @memcpy(new_xml[idx + inject.len ..], orig.bytes[idx..]);
     try store.replacePart(sheet_name, new_xml);
-    try store.save(path);
+    try store.save(io, path);
 }
 
 test "Editor: insertRow on sheet with `<picture>` background no longer refused" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "pic_insrow_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "pic_insrow_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "pic_insrow_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "pic_insrow_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildPictureFixture(src_path);
+    try buildPictureFixture(io, src_path);
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertRow(0, 2);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    var ed2 = try Editor.open(std.testing.allocator, io, dst_path);
     defer ed2.deinit();
     // The `<picture>` element passes through unchanged (no row/col coords).
     try assertSheetXmlContains(&ed2, "<picture r:id=\"rId99\"/>");
 }
 
 test "Editor: insertColumn on sheet with `<picture>` background no longer refused" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "pic_inscol_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "pic_inscol_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "pic_inscol_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "pic_inscol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildPictureFixture(src_path);
+    try buildPictureFixture(io, src_path);
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertColumn(0, 2);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    var ed2 = try Editor.open(std.testing.allocator, dst_path);
+    var ed2 = try Editor.open(std.testing.allocator, io, dst_path);
     defer ed2.deinit();
     try assertSheetXmlContains(&ed2, "<picture r:id=\"rId99\"/>");
 }
@@ -3670,96 +3901,108 @@ const tiny_png_1x1_for_editor = [_]u8{
     0x60, 0x82,
 };
 
-fn buildDrawingFixture(path: []const u8, anchor_col: u32, anchor_row: u32) !void {
+fn buildDrawingFixture(io: std.Io, path: []const u8, anchor_col: u32, anchor_row: u32) !void {
     {
         var w = xlsx.Writer.init(std.testing.allocator);
         defer w.deinit();
         var s = try w.addSheet("S");
         try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 }, .{ .integer = 4 } });
         try s.writeRow(&.{ .{ .integer = 5 }, .{ .integer = 6 }, .{ .integer = 7 }, .{ .integer = 8 } });
-        try w.save(path);
+        try w.save(io, path);
     }
-    var wb = try workbook_mod.Workbook.open(std.testing.allocator, path);
+    var wb = try workbook_mod.Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
     try wb.addImage(0, .{ .col = anchor_col, .row = anchor_row }, &tiny_png_1x1_for_editor, .png);
-    try wb.save(path);
+    try wb.save(io, path);
 }
 
-fn drawingPartContains(path: []const u8, needle: []const u8) !bool {
-    var store = try store_mod.PartStore.open(std.testing.allocator, path);
+fn drawingPartContains(io: std.Io, path: []const u8, needle: []const u8) !bool {
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, path);
     defer store.deinit();
     const drawing = (try store.part("xl/drawings/drawing1.xml")) orelse return error.MissingDrawing;
     return std.mem.indexOf(u8, drawing.bytes, needle) != null;
 }
 
 test "Editor: insertColumn shifts xdr drawing anchor col (dr-1)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "draw_inscol_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "draw_inscol_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "draw_inscol_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "draw_inscol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildDrawingFixture(src_path, 3, 5);
-    try std.testing.expect(try drawingPartContains(src_path, "<xdr:col>2</xdr:col>"));
+    try buildDrawingFixture(io, src_path, 3, 5);
+    try std.testing.expect(try drawingPartContains(io, src_path, "<xdr:col>2</xdr:col>"));
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertColumn(0, 2);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    try std.testing.expect(try drawingPartContains(dst_path, "<xdr:col>3</xdr:col>"));
-    try std.testing.expect(try drawingPartContains(dst_path, "<xdr:row>4</xdr:row>"));
+    try std.testing.expect(try drawingPartContains(io, dst_path, "<xdr:col>3</xdr:col>"));
+    try std.testing.expect(try drawingPartContains(io, dst_path, "<xdr:row>4</xdr:row>"));
 }
 
 test "Editor: insertRow shifts xdr drawing anchor row (dr-1)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "draw_insrow_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "draw_insrow_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "draw_insrow_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "draw_insrow_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildDrawingFixture(src_path, 3, 5);
+    try buildDrawingFixture(io, src_path, 3, 5);
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertRow(0, 3);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    try std.testing.expect(try drawingPartContains(dst_path, "<xdr:col>2</xdr:col>"));
-    try std.testing.expect(try drawingPartContains(dst_path, "<xdr:row>5</xdr:row>"));
+    try std.testing.expect(try drawingPartContains(io, dst_path, "<xdr:col>2</xdr:col>"));
+    try std.testing.expect(try drawingPartContains(io, dst_path, "<xdr:row>5</xdr:row>"));
 }
 
 test "Editor: deleteColumn at the anchor's column drops the oneCellAnchor (dr-1)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "draw_delcol_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "draw_delcol_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "draw_delcol_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "draw_delcol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildDrawingFixture(src_path, 3, 5);
+    try buildDrawingFixture(io, src_path, 3, 5);
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteColumn(0, 3);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    try std.testing.expect(!try drawingPartContains(dst_path, "<xdr:oneCellAnchor>"));
+    try std.testing.expect(!try drawingPartContains(io, dst_path, "<xdr:oneCellAnchor>"));
 }
 
 test "Editor: drawing rewrite tolerates XML whitespace around `=` in worksheet rels (dr-1 REL-602/604)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "draw_eq_ws_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "draw_eq_ws_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "draw_eq_ws_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "draw_eq_ws_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildDrawingFixture(src_path, 3, 5);
+    try buildDrawingFixture(io, src_path, 3, 5);
     // Splice a custom `<drawing  r:id  =  "rId99"/>` into sheet1.xml
     // ALONGSIDE the existing well-formed `<drawing r:id="rIdN"/>`
     // emitted by addImage; we exercise the parser's whitespace
     // tolerance even though the resolved part is the SAME.
     {
-        var store = try store_mod.PartStore.open(std.testing.allocator, src_path);
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, src_path);
         defer store.deinit();
         const sheet_name = "xl/worksheets/sheet1.xml";
         const orig = (try store.part(sheet_name)) orelse return error.MissingSheet;
@@ -3780,18 +4023,18 @@ test "Editor: drawing rewrite tolerates XML whitespace around `=` in worksheet r
         @memcpy(new_xml[orig_open .. orig_open + ws_tag.len], ws_tag);
         @memcpy(new_xml[orig_open + ws_tag.len ..], orig.bytes[orig_end + 2 ..]);
         try store.replacePart(sheet_name, new_xml);
-        try store.save(src_path);
+        try store.save(io, src_path);
     }
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertColumn(0, 2);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
     // The drawing's xdr:col MUST shift; if findAttrValue mishandled
     // the whitespace, applyDrawingEditForSheet would silently skip
     // and the col would still be 2.
-    try std.testing.expect(try drawingPartContains(dst_path, "<xdr:col>3</xdr:col>"));
+    try std.testing.expect(try drawingPartContains(io, dst_path, "<xdr:col>3</xdr:col>"));
 }
 
 // ---------------------------------------------------------------------------
@@ -3801,7 +4044,7 @@ test "Editor: drawing rewrite tolerates XML whitespace around `=` in worksheet r
 // `xl/comments1.xml`. After Editor row/col edits, both must shift.
 // ---------------------------------------------------------------------------
 
-fn buildCommentFixture(path: []const u8, comment_ref: []const u8) !void {
+fn buildCommentFixture(io: std.Io, path: []const u8, comment_ref: []const u8) !void {
     var w = xlsx.Writer.init(std.testing.allocator);
     defer w.deinit();
     var s = try w.addSheet("S");
@@ -3811,115 +4054,130 @@ fn buildCommentFixture(path: []const u8, comment_ref: []const u8) !void {
     try s.writeRow(&.{ .{ .integer = 13 }, .{ .integer = 14 }, .{ .integer = 15 }, .{ .integer = 16 } });
     try s.writeRow(&.{ .{ .integer = 17 }, .{ .integer = 18 }, .{ .integer = 19 }, .{ .integer = 20 } });
     try s.addComment(comment_ref, "Author", "test note");
-    try w.save(path);
+    try w.save(io, path);
 }
 
-fn vmlPartContains(path: []const u8, needle: []const u8) !bool {
-    var store = try store_mod.PartStore.open(std.testing.allocator, path);
+fn vmlPartContains(io: std.Io, path: []const u8, needle: []const u8) !bool {
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, path);
     defer store.deinit();
     const vml = (try store.part("xl/drawings/vmlDrawing1.vml")) orelse return error.MissingVml;
     return std.mem.indexOf(u8, vml.bytes, needle) != null;
 }
 
-fn commentsPartContains(path: []const u8, needle: []const u8) !bool {
-    var store = try store_mod.PartStore.open(std.testing.allocator, path);
+fn commentsPartContains(io: std.Io, path: []const u8, needle: []const u8) !bool {
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, path);
     defer store.deinit();
     const part = (try store.part("xl/comments1.xml")) orelse return error.MissingComments;
     return std.mem.indexOf(u8, part.bytes, needle) != null;
 }
 
 test "Editor: insertColumn shifts VML anchor + x:Column (dr-2)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "vml_inscol_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "vml_inscol_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "vml_inscol_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "vml_inscol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildCommentFixture(src_path, "C5");
-    try std.testing.expect(try vmlPartContains(src_path, "<x:Column>2</x:Column>"));
-    try std.testing.expect(try vmlPartContains(src_path, "<x:Anchor>3, 15, 4, 2, 5, 31, 8, 3</x:Anchor>"));
+    try buildCommentFixture(io, src_path, "C5");
+    try std.testing.expect(try vmlPartContains(io, src_path, "<x:Column>2</x:Column>"));
+    try std.testing.expect(try vmlPartContains(io, src_path, "<x:Anchor>3, 15, 4, 2, 5, 31, 8, 3</x:Anchor>"));
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertColumn(0, 2);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    try std.testing.expect(try vmlPartContains(dst_path, "<x:Column>3</x:Column>"));
-    try std.testing.expect(try vmlPartContains(dst_path, "<x:Anchor>4, 15, 4, 2, 6, 31, 8, 3</x:Anchor>"));
+    try std.testing.expect(try vmlPartContains(io, dst_path, "<x:Column>3</x:Column>"));
+    try std.testing.expect(try vmlPartContains(io, dst_path, "<x:Anchor>4, 15, 4, 2, 6, 31, 8, 3</x:Anchor>"));
 }
 
 test "Editor: insertRow shifts VML anchor + x:Row (dr-2)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "vml_insrow_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "vml_insrow_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "vml_insrow_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "vml_insrow_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildCommentFixture(src_path, "C5");
+    try buildCommentFixture(io, src_path, "C5");
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertRow(0, 3);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    try std.testing.expect(try vmlPartContains(dst_path, "<x:Row>5</x:Row>"));
-    try std.testing.expect(try vmlPartContains(dst_path, "<x:Anchor>3, 15, 5, 2, 5, 31, 9, 3</x:Anchor>"));
-    try std.testing.expect(try vmlPartContains(dst_path, "<x:Column>2</x:Column>"));
+    try std.testing.expect(try vmlPartContains(io, dst_path, "<x:Row>5</x:Row>"));
+    try std.testing.expect(try vmlPartContains(io, dst_path, "<x:Anchor>3, 15, 5, 2, 5, 31, 9, 3</x:Anchor>"));
+    try std.testing.expect(try vmlPartContains(io, dst_path, "<x:Column>2</x:Column>"));
 }
 
 test "Editor: deleteColumn at the comment's column drops the v:shape (dr-2)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "vml_delcol_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "vml_delcol_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "vml_delcol_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "vml_delcol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildCommentFixture(src_path, "C5");
+    try buildCommentFixture(io, src_path, "C5");
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteColumn(0, 3);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    try std.testing.expect(!try vmlPartContains(dst_path, "<v:shape "));
+    try std.testing.expect(!try vmlPartContains(io, dst_path, "<v:shape "));
 }
 
 test "Editor: insertColumn shifts BOTH VML anchor AND comments ref (REL-705)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "vml_cmt_inscol_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "vml_cmt_inscol_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "vml_cmt_inscol_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "vml_cmt_inscol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildCommentFixture(src_path, "C5");
-    try std.testing.expect(try commentsPartContains(src_path, "ref=\"C5\""));
+    try buildCommentFixture(io, src_path, "C5");
+    try std.testing.expect(try commentsPartContains(io, src_path, "ref=\"C5\""));
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertColumn(0, 2);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    try std.testing.expect(try vmlPartContains(dst_path, "<x:Column>3</x:Column>"));
-    try std.testing.expect(try commentsPartContains(dst_path, "ref=\"D5\""));
-    try std.testing.expect(!try commentsPartContains(dst_path, "ref=\"C5\""));
+    try std.testing.expect(try vmlPartContains(io, dst_path, "<x:Column>3</x:Column>"));
+    try std.testing.expect(try commentsPartContains(io, dst_path, "ref=\"D5\""));
+    try std.testing.expect(!try commentsPartContains(io, dst_path, "ref=\"C5\""));
 }
 
 test "Editor: deleteColumn at comment's column drops BOTH VML shape AND comment entry (REL-705)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "vml_cmt_delcol_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "vml_cmt_delcol_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "vml_cmt_delcol_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "vml_cmt_delcol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    try buildCommentFixture(src_path, "C5");
+    try buildCommentFixture(io, src_path, "C5");
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteColumn(0, 3);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
-    try std.testing.expect(!try vmlPartContains(dst_path, "<v:shape "));
-    try std.testing.expect(!try commentsPartContains(dst_path, "<comment "));
+    try std.testing.expect(!try vmlPartContains(io, dst_path, "<v:shape "));
+    try std.testing.expect(!try commentsPartContains(io, dst_path, "<comment "));
 }
 
 // ---------------------------------------------------------------------------
@@ -3931,13 +4189,13 @@ test "Editor: deleteColumn at comment's column drops BOTH VML shape AND comment 
 // unrewritten ones).
 // ---------------------------------------------------------------------------
 
-fn copyCorpusToTmp(src_corpus: []const u8, dst_path: [:0]const u8) !void {
-    std.fs.cwd().access(src_corpus, .{}) catch return error.SkipZigTest;
-    try std.fs.cwd().copyFile(src_corpus, std.fs.cwd(), dst_path, .{});
+fn copyCorpusToTmp(io: std.Io, src_corpus: []const u8, dst_path: [:0]const u8) !void {
+    std.Io.Dir.cwd().access(io, src_corpus, .{}) catch return error.SkipZigTest;
+    try std.Io.Dir.cwd().copyFile(src_corpus, std.Io.Dir.cwd(), dst_path, io, .{});
 }
 
-fn tablePartContains(path: []const u8, table_part: []const u8, needle: []const u8) !bool {
-    var ed = try Editor.open(std.testing.allocator, path);
+fn tablePartContains(io: std.Io, path: []const u8, table_part: []const u8, needle: []const u8) !bool {
+    var ed = try Editor.open(std.testing.allocator, io, path);
     defer ed.deinit();
     // Propagate readEntry errors so the assertion fails loudly when
     // the part is missing — the previous `catch return false` silently
@@ -3951,81 +4209,93 @@ fn tablePartContains(path: []const u8, table_part: []const u8, needle: []const u
 /// Read an entry's bytes via the Editor's source-archive view.
 /// Test-only helper for byte-equality assertions on parts that
 /// aren't supposed to change.
-fn readEntryBytes(path: []const u8, entry_name: []const u8) ![]u8 {
-    var ed = try Editor.open(std.testing.allocator, path);
+fn readEntryBytes(io: std.Io, path: []const u8, entry_name: []const u8) ![]u8 {
+    var ed = try Editor.open(std.testing.allocator, io, path);
     defer ed.deinit();
     return try ed.readEntry(entry_name);
 }
 
 test "Editor: insertRow above table shifts <table ref> in xl/tables/tableN.xml" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "tbl_insrow_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "tbl_insrow_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "tbl_insrow_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "tbl_insrow_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    copyCorpusToTmp("tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
+    copyCorpusToTmp(io, "tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertRow(0, 5); // Above the table at C9:E10.
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
     // Expect C9:E10 → C10:E11.
-    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "ref=\"C10:E11\""));
-    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "<autoFilter ref=\"C10:E11\""));
+    try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "ref=\"C10:E11\""));
+    try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "<autoFilter ref=\"C10:E11\""));
 }
 
 test "Editor: insertColumn inside table extends range and adds synthetic tableColumn" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "tbl_inscol_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "tbl_inscol_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "tbl_inscol_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "tbl_inscol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    copyCorpusToTmp("tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
+    copyCorpusToTmp(io, "tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.insertColumn(0, 4); // Insert at col D — inside C9:E10.
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
     // C9:E10 → C9:F10. <tableColumns count="3"> → "4".
-    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "ref=\"C9:F10\""));
-    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "<tableColumns count=\"4\">"));
+    try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "ref=\"C9:F10\""));
+    try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "<tableColumns count=\"4\">"));
     // The corpus table has tableColumn ids 1, 2, 3 → synthetic
     // claims id=4 (max + 1).
-    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "<tableColumn id=\"4\""));
+    try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "<tableColumn id=\"4\""));
 }
 
 test "Editor: deleteColumn inside table drops matching tableColumn" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "tbl_delcol_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "tbl_delcol_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "tbl_delcol_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "tbl_delcol_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    copyCorpusToTmp("tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
+    copyCorpusToTmp(io, "tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         try ed.deleteColumn(0, 4); // Drop col D — middle of C9:E10.
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
     // C9:E10 → C9:D10. count goes 3 → 2; the middle tableColumn
     // (id="3" in this corpus, name="Column1") goes away.
-    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "ref=\"C9:D10\""));
-    try std.testing.expect(try tablePartContains(dst_path, "xl/tables/table1.xml", "<tableColumns count=\"2\">"));
-    try std.testing.expect(!try tablePartContains(dst_path, "xl/tables/table1.xml", "name=\"Column1\""));
+    try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "ref=\"C9:D10\""));
+    try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "<tableColumns count=\"2\">"));
+    try std.testing.expect(!try tablePartContains(io, dst_path, "xl/tables/table1.xml", "name=\"Column1\""));
 }
 
 test "Editor: deleteRow on table's header row refuses with RowEditUnsafeForSheet" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "tbl_hdrrow_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "tbl_hdrrow_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    copyCorpusToTmp("tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
-    var ed = try Editor.open(std.testing.allocator, src_path);
+    copyCorpusToTmp(io, "tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
+    var ed = try Editor.open(std.testing.allocator, io, src_path);
     defer ed.deinit();
     // Table is at C9:E10 — row 9 is the header row.
     const r = ed.deleteRow(0, 9);
@@ -4033,27 +4303,224 @@ test "Editor: deleteRow on table's header row refuses with RowEditUnsafeForSheet
 }
 
 test "Editor: edit outside table range is byte-stable inside the table part" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src_path = try tt.path(std.testing.allocator, "tbl_outside_src.xlsx");
+    const src_path = try tt.path(std.testing.allocator, io, "tbl_outside_src.xlsx");
     defer std.testing.allocator.free(src_path);
-    const dst_path = try tt.path(std.testing.allocator, "tbl_outside_dst.xlsx");
+    const dst_path = try tt.path(std.testing.allocator, io, "tbl_outside_dst.xlsx");
     defer std.testing.allocator.free(dst_path);
-    copyCorpusToTmp("tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
+    copyCorpusToTmp(io, "tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
     {
-        var ed = try Editor.open(std.testing.allocator, src_path);
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
         defer ed.deinit();
         // Insert a column far past the table's BR (E = col 5).
         try ed.insertColumn(0, 12);
-        try ed.save(dst_path);
+        try ed.save(io, dst_path);
     }
     // REL-B530: actually verify byte-identity (not just substring
     // presence). The byte-equal short-circuit in
     // applyTableEditsForSheet must skip the replacePart entirely so
     // the table part flows through ZIP substitution untouched.
-    const src_table = try readEntryBytes(src_path, "xl/tables/table1.xml");
+    const src_table = try readEntryBytes(io, src_path, "xl/tables/table1.xml");
     defer std.testing.allocator.free(src_table);
-    const dst_table = try readEntryBytes(dst_path, "xl/tables/table1.xml");
+    const dst_table = try readEntryBytes(io, dst_path, "xl/tables/table1.xml");
     defer std.testing.allocator.free(dst_table);
     try std.testing.expectEqualSlices(u8, src_table, dst_table);
+}
+
+// ─── docProps read + scrub (Z3) ──────────────────────────────────────
+//
+// End-to-end rather than unit: the parser has its own tests in
+// pkg/typed_parts/doc_props_xml.zig. What matters here is that the
+// parts survive a real Editor round trip, that the scrub reaches the
+// saved archive, and — the load-bearing bit — that scrubbing metadata
+// does not disturb a single cell.
+
+/// Local entry reader for the docProps tests. Takes an `io` explicitly
+/// rather than reusing `readEntryBytes`, which predates io threading.
+fn readEntryBytesIo(io: std.Io, path: []const u8, entry_name: []const u8) ![]u8 {
+    var ed = try Editor.open(std.testing.allocator, io, path);
+    defer ed.deinit();
+    return try ed.readEntry(entry_name);
+}
+
+/// Build a workbook that carries docProps parts with known PII. The
+/// zlsx Writer does not emit docProps, so they are injected through
+/// PartStore.addPart, which is also what exercises the content-type
+/// registration path the scrub later has to unwind.
+fn buildDocPropsFixture(io: std.Io, path: [:0]const u8) !void {
+    const a = std.testing.allocator;
+
+    {
+        var w = xlsx.Writer.init(a);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{ .{ .string = "name" }, .{ .integer = 1 } });
+        try s.writeRow(&.{ .{ .string = "keep-me" }, .{ .integer = 2 } });
+        try w.save(io, path);
+    }
+
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+
+    try wb.store.addPart(
+        "docProps/core.xml",
+        "application/vnd.openxmlformats-package.core-properties+xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+            "<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\"" ++
+            " xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\">" ++
+            "<dc:creator>Jane Q. Fixture</dc:creator>" ++
+            "<cp:lastModifiedBy>Jane Q. Fixture</cp:lastModifiedBy>" ++
+            "<dc:title>Confidential Q3</dc:title>" ++
+            "<dcterms:created xsi:type=\"dcterms:W3CDTF\">2020-01-01T00:00:00Z</dcterms:created>" ++
+            "<cp:revision>4</cp:revision>" ++
+            "</cp:coreProperties>",
+    );
+    try wb.store.addPart(
+        "docProps/app.xml",
+        "application/vnd.openxmlformats-officedocument.extended-properties+xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+            "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\">" ++
+            "<TotalTime>7</TotalTime><Company>AcmeCorp</Company><Manager>Bob Boss</Manager>" ++
+            "</Properties>",
+    );
+    try wb.store.addPart(
+        "docProps/custom.xml",
+        "application/vnd.openxmlformats-officedocument.custom-properties+xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+            "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/custom-properties\">" ++
+            "<property name=\"Owner\"><vt:lpwstr>Jane Q. Fixture</vt:lpwstr></property>" ++
+            "</Properties>",
+    );
+    try wb.save(io, path);
+}
+
+test "Editor.docProps: reads creator, company and custom-props presence" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "docprops_read.xlsx");
+    defer std.testing.allocator.free(path);
+
+    try buildDocPropsFixture(io, path);
+
+    var ed = try Editor.open(std.testing.allocator, io, path);
+    defer ed.deinit();
+
+    const props = try ed.docProps();
+    try std.testing.expectEqualStrings("Jane Q. Fixture", props.creator.?);
+    try std.testing.expectEqualStrings("Jane Q. Fixture", props.last_modified_by.?);
+    try std.testing.expectEqualStrings("Confidential Q3", props.title.?);
+    try std.testing.expectEqualStrings("AcmeCorp", props.company.?);
+    try std.testing.expectEqualStrings("Bob Boss", props.manager.?);
+    try std.testing.expect(props.has_custom_properties);
+    try std.testing.expect(props.hasIdentifyingFields());
+}
+
+test "Editor.stripDocProps: PII gone from the saved archive, cells intact" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "docprops_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "docprops_clean.xlsx");
+    defer std.testing.allocator.free(dst);
+
+    try buildDocPropsFixture(io, src);
+
+    {
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.stripDocProps(.{});
+        try ed.save(io, dst);
+    }
+
+    // core.xml: identifying fields gone, timestamp + revision kept.
+    const core = try readEntryBytesIo(io, dst, "docProps/core.xml");
+    defer std.testing.allocator.free(core);
+    try std.testing.expect(std.mem.indexOf(u8, core, "Jane Q. Fixture") == null);
+    try std.testing.expect(std.mem.indexOf(u8, core, "Confidential Q3") == null);
+    try std.testing.expect(std.mem.indexOf(u8, core, "2020-01-01T00:00:00Z") != null);
+    try std.testing.expect(std.mem.indexOf(u8, core, "<cp:revision>4</cp:revision>") != null);
+
+    // app.xml: company + manager gone, unmodelled TotalTime survives.
+    const app = try readEntryBytesIo(io, dst, "docProps/app.xml");
+    defer std.testing.allocator.free(app);
+    try std.testing.expect(std.mem.indexOf(u8, app, "AcmeCorp") == null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "Bob Boss") == null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "<TotalTime>7</TotalTime>") != null);
+
+    // custom.xml: dropped wholesale, and its content-type override with
+    // it — a dangling Override makes the package invalid.
+    try std.testing.expectError(
+        error.MissingEntry,
+        readEntryBytesIo(io, dst, "docProps/custom.xml"),
+    );
+    const ct = try readEntryBytesIo(io, dst, "[Content_Types].xml");
+    defer std.testing.allocator.free(ct);
+    try std.testing.expect(std.mem.indexOf(u8, ct, "docProps/custom.xml") == null);
+    // The parts that stayed must still be declared.
+    try std.testing.expect(std.mem.indexOf(u8, ct, "docProps/core.xml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ct, "docProps/app.xml") != null);
+
+    // The whole point: cell data is untouched.
+    const src_sheet = try readEntryBytesIo(io, src, "xl/worksheets/sheet1.xml");
+    defer std.testing.allocator.free(src_sheet);
+    const dst_sheet = try readEntryBytesIo(io, dst, "xl/worksheets/sheet1.xml");
+    defer std.testing.allocator.free(dst_sheet);
+    try std.testing.expectEqualSlices(u8, src_sheet, dst_sheet);
+
+    // And the scrubbed workbook still reads back through the reader.
+    var re = try Editor.open(std.testing.allocator, io, dst);
+    defer re.deinit();
+    const after = try re.docProps();
+    try std.testing.expect(after.creator == null);
+    try std.testing.expect(after.company == null);
+    try std.testing.expect(!after.has_custom_properties);
+    try std.testing.expect(!after.hasIdentifyingFields());
+}
+
+test "Editor.stripDocProps: no docProps parts is a clean no-op" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "nodocprops_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "nodocprops_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+
+    // Writer-produced workbooks carry no docProps at all.
+    {
+        var w = xlsx.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(io, src);
+    }
+
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    const props = try ed.docProps();
+    try std.testing.expect(props.isEmpty());
+
+    // Must not error, and must not invent parts.
+    try ed.stripDocProps(.{});
+    try ed.save(io, dst);
+
+    try std.testing.expectError(
+        error.MissingEntry,
+        readEntryBytesIo(io, dst, "docProps/core.xml"),
+    );
 }

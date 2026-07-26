@@ -24,16 +24,17 @@
 const std = @import("std");
 const pkg = @import("zlsx_pkg");
 
-pub fn main() !u8 {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !u8 {
+    // 0.16 supplies the allocator, Io and argv through process.Init;
+    // std.heap.GeneralPurposeAllocator and std.process.argsAlloc are
+    // both gone.
+    const alloc = init.gpa;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     var stderr_buf: [256]u8 = undefined;
-    var stderr_w = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_w = std.Io.File.stderr().writer(io, &stderr_buf);
     const err = &stderr_w.interface;
     defer err.flush() catch {};
 
@@ -60,24 +61,24 @@ pub fn main() !u8 {
         return 1;
     }
 
-    var store = pkg.PartStore.open(alloc, in_path) catch |e| {
+    var store = pkg.PartStore.open(alloc, io, in_path) catch |e| {
         try err.print("cannot open '{s}': {s}\n", .{ in_path, @errorName(e) });
         return 2;
     };
     defer store.deinit();
 
-    std.fs.cwd().makePath(out_dir) catch |e| {
+    std.Io.Dir.cwd().createDirPath(io, out_dir) catch |e| {
         try err.print("cannot create '{s}': {s}\n", .{ out_dir, @errorName(e) });
         return 5;
     };
-    var dir = std.fs.cwd().openDir(out_dir, .{}) catch |e| {
+    var dir = std.Io.Dir.cwd().openDir(io, out_dir, .{}) catch |e| {
         try err.print("cannot open '{s}': {s}\n", .{ out_dir, @errorName(e) });
         return 5;
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var stdout_buf: [256]u8 = undefined;
-    var stdout_w = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_w = std.Io.File.stdout().writer(io, &stdout_buf);
     const out = &stdout_w.interface;
     defer out.flush() catch {};
 
@@ -94,7 +95,7 @@ pub fn main() !u8 {
         // documented contract is "mirror unzip xl/media/* -d out".
         if (!std.mem.startsWith(u8, p.name, "xl/media/")) continue;
         const basename = std.fs.path.basename(p.name);
-        dir.writeFile(.{ .sub_path = basename, .data = p.bytes }) catch |e| {
+        dir.writeFile(io, .{ .sub_path = basename, .data = p.bytes }) catch |e| {
             try err.print("write '{s}': {s}\n", .{ basename, @errorName(e) });
             return 5;
         };

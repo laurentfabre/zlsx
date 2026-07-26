@@ -112,7 +112,7 @@ pub fn applyEditToTable(
         .delete => .delete,
     };
 
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
     var i: usize = 0;
@@ -371,7 +371,7 @@ fn processSortStateTag(
     i: *usize,
 ) !void {
     const attrs_full = src[t.start + "<sortState".len .. t.after_open - 1];
-    const trimmed = std.mem.trimRight(u8, attrs_full, " \t\r\n");
+    const trimmed = std.mem.trimEnd(u8, attrs_full, " \t\r\n");
     const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
     const attrs_for_lookup = if (is_self_closing) trimmed[0 .. trimmed.len - 1] else trimmed;
     const r_attr = getAttr(attrs_for_lookup, "ref");
@@ -575,7 +575,7 @@ fn processTableColumnsForCol(
 
         if (sheet_edit.matchTagAt(src, j, "tableColumn")) |ct| {
             const ct_attrs_full = src[ct.start + "<tableColumn".len .. ct.after_open - 1];
-            const trimmed = std.mem.trimRight(u8, ct_attrs_full, " \t\r\n");
+            const trimmed = std.mem.trimEnd(u8, ct_attrs_full, " \t\r\n");
             const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
 
             // Locate the full extent of this tableColumn (open +
@@ -692,7 +692,7 @@ fn countTableColumnChildren(src: []const u8, body_start: usize, body_end: usize)
             if (ct.after_open > body_end) return n;
             n += 1;
             const attrs_full = src[ct.start + "<tableColumn".len .. ct.after_open - 1];
-            const trimmed = std.mem.trimRight(u8, attrs_full, " \t\r\n");
+            const trimmed = std.mem.trimEnd(u8, attrs_full, " \t\r\n");
             const is_self_closing = trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
             if (is_self_closing) {
                 k = ct.after_open;

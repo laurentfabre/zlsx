@@ -136,7 +136,7 @@ fn foldUtf8(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     // pre-validated.
     if (!std.unicode.utf8ValidateSlice(input)) return error.InvalidUtf8;
 
-    var out = std.ArrayListUnmanaged(u8){};
+    var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     // Worst-case growth: ß (0xC3 0x9F, 2 bytes) folds to "ss" (2 bytes).
     // Most Latin folds are 1:1 in length; a 2× safety margin is plenty.

@@ -106,7 +106,7 @@ pub fn rewriteFormula(
     // unchanged keep their borrowed slices; mutated tokens point
     // into this list. Freed only after `format` has copied every
     // byte into the final output.
-    var owned: std.ArrayListUnmanaged([]u8) = .{};
+    var owned: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
         for (owned.items) |s| allocator.free(s);
         owned.deinit(allocator);
@@ -357,7 +357,7 @@ fn decodeQuotedSheet(allocator: std.mem.Allocator, lex: []const u8) Error![]u8 {
     const has_close = lex[lex.len - 1] == '\'';
     const inner = if (has_close) lex[1 .. lex.len - 1] else lex[1..];
 
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
     var i: usize = 0;
@@ -383,7 +383,7 @@ fn encodeSheetName(allocator: std.mem.Allocator, name: []const u8) Error![]u8 {
     }
 
     // Quoted form: leading `'`, doubled apostrophes inside, trailing `'`.
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
     try out.append(allocator, '\'');

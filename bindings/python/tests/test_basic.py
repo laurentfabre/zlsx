@@ -1917,3 +1917,76 @@ def test_editor_open_invalid_path_raises():
 
     with pytest.raises(zlsx.ZlsxError):
         zlsx.edit("/nonexistent/path/does/not/exist.xlsx")
+
+
+# ---- Document properties (Z3) ---------------------------------------
+
+
+def _write_docprops_fixture(path: Path) -> None:
+    """A workbook carrying known PII in docProps.
+
+    The Writer emits no docProps parts, so this drives the CLI's
+    scrub-metadata counterpart from the other side: build a plain
+    workbook, then confirm the binding reports "no metadata" for it.
+    Populated-metadata coverage lives in the Zig suite, which can
+    inject parts via PartStore.addPart directly.
+    """
+    with zlsx.Writer() as w:
+        sheet = w.add_sheet("Data")
+        sheet.write_row(["name", 1])
+        sheet.write_row(["keep-me", 2])
+        w.save(path)
+
+
+def test_editor_doc_props_reports_absent_metadata(tmp_path):
+    """A Writer-produced workbook has no docProps at all — every field
+    is None rather than an empty string, so callers can tell "absent"
+    from "blank"."""
+    from zlsx import _ffi as ffi
+
+    if not ffi._HAS_DOCPROPS:
+        pytest.skip("loaded libzlsx predates the docProps ABI (0.5.0+)")
+
+    src = tmp_path / "nodocprops.xlsx"
+    _write_docprops_fixture(src)
+
+    ed = zlsx.Editor(src)
+    props = ed.doc_props()
+
+    assert props["creator"] is None
+    assert props["last_modified_by"] is None
+    assert props["company"] is None
+    assert props["has_custom_properties"] is False
+    # The full field set is always present, so consumers can index
+    # without existence checks.
+    for key in ("title", "subject", "description", "keywords", "category",
+                "created", "modified", "revision", "manager",
+                "application", "hyperlink_base"):
+        assert key in props
+
+
+def test_editor_strip_doc_props_is_a_noop_without_metadata(tmp_path):
+    """Scrubbing a workbook that has no docProps must not error and
+    must not invent the parts."""
+    from zlsx import _ffi as ffi
+
+    if not ffi._HAS_DOCPROPS:
+        pytest.skip("loaded libzlsx predates the docProps ABI (0.5.0+)")
+
+    src = tmp_path / "scrub_src.xlsx"
+    dst = tmp_path / "scrub_dst.xlsx"
+    _write_docprops_fixture(src)
+
+    ed = zlsx.Editor(src)
+    ed.strip_doc_props()
+    ed.save(dst)
+
+    assert dst.exists()
+    # Cell data survives the metadata scrub untouched.
+    _header, rows = zlsx.read(dst)
+    assert rows[0][0] == "name"
+    assert rows[1][0] == "keep-me"
+
+    after = zlsx.Editor(dst).doc_props()
+    assert after["creator"] is None
+    assert after["has_custom_properties"] is False

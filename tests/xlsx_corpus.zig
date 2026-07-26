@@ -16,10 +16,10 @@ const zlsx_pkg = @import("zlsx_pkg");
 
 const corpus_dir = "tests/corpus/";
 
-fn openOrSkip(alloc: std.mem.Allocator, filename: []const u8) !xlsx.Book {
+fn openOrSkip(alloc: std.mem.Allocator, io: std.Io, filename: []const u8) !xlsx.Book {
     var path_buf: [256]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}{s}", .{ corpus_dir, filename });
-    return xlsx.Book.open(alloc, path) catch |err| switch (err) {
+    return xlsx.Book.open(alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => {
             std.debug.print("\n  [skip] {s} not in corpus — run scripts/fetch_test_corpus.sh\n", .{filename});
             return error.SkipZigTest;
@@ -58,8 +58,11 @@ fn firstRowCells(
 }
 
 test "frictionless sample-2-sheets — small SST, multi-sheet" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
-    var book = try openOrSkip(alloc, "frictionless_2sheets.xlsx");
+    var book = try openOrSkip(alloc, io, "frictionless_2sheets.xlsx");
     defer book.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
@@ -85,8 +88,11 @@ test "frictionless sample-2-sheets — small SST, multi-sheet" {
 }
 
 test "openpyxl guess_types — mixed cell types in a genuine fixture" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
-    var book = try openOrSkip(alloc, "openpyxl_guess_types.xlsx");
+    var book = try openOrSkip(alloc, io, "openpyxl_guess_types.xlsx");
     defer book.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
@@ -101,8 +107,11 @@ test "openpyxl guess_types — mixed cell types in a genuine fixture" {
 }
 
 test "ph-poi test1 — 3 sheets, sparse diagonal + embedded newline" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
-    var book = try openOrSkip(alloc, "phpoi_test1.xlsx");
+    var book = try openOrSkip(alloc, io, "phpoi_test1.xlsx");
     defer book.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), book.sheets.len);
@@ -117,8 +126,11 @@ test "ph-poi test1 — 3 sheets, sparse diagonal + embedded newline" {
 }
 
 test "World Bank Data Catalog — heavy SST (1144 entries, 143 KB)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
-    var book = try openOrSkip(alloc, "worldbank_catalog.xlsx");
+    var book = try openOrSkip(alloc, io, "worldbank_catalog.xlsx");
     defer book.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
@@ -155,13 +167,16 @@ test "World Bank Data Catalog — heavy SST (1144 entries, 143 KB)" {
 // specific stress dimension the small base corpus can't reach.
 
 test "WDI Excel — 401k rows × 6 sheets, r-less <c> cells" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // The World Bank's WDI exporter emits `<row><c t="s"><v>N</v></c>…`
     // with no `r=` on either tag. This is spec-legal but unusual; before
     // the implicit-column fix, every cell tripped MalformedXml. Pin the
     // row count + sheet count so a regression in the fallback path
     // re-fails the suite.
     const alloc = std.testing.allocator;
-    var book = try openOrSkip(alloc, "wdi_excel.xlsx");
+    var book = try openOrSkip(alloc, io, "wdi_excel.xlsx");
     defer book.deinit();
 
     try std.testing.expect(book.sheets.len >= 6);
@@ -174,8 +189,11 @@ test "WDI Excel — 401k rows × 6 sheets, r-less <c> cells" {
 }
 
 test "ECDC COVID — 49k single-sheet rows, modest SST" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
-    var book = try openOrSkip(alloc, "ecdc_covid.xlsx");
+    var book = try openOrSkip(alloc, io, "ecdc_covid.xlsx");
     defer book.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
@@ -185,16 +203,22 @@ test "ECDC COVID — 49k single-sheet rows, modest SST" {
 }
 
 test "ONS CPI detailed — 41-sheet workbook" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
-    var book = try openOrSkip(alloc, "ons_cpi_detailed.xlsx");
+    var book = try openOrSkip(alloc, io, "ons_cpi_detailed.xlsx");
     defer book.deinit();
     // 1 contents + 40 numbered tables; tolerate ±2 around the publication.
     try std.testing.expect(book.sheets.len >= 35 and book.sheets.len <= 45);
 }
 
 test "POI 57893 many-merges — 50k mergeCells" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
-    var book = try openOrSkip(alloc, "poi_57893_many_merges.xlsx");
+    var book = try openOrSkip(alloc, io, "poi_57893_many_merges.xlsx");
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
     const merged = book.mergedRanges(book.sheets[0]);
@@ -202,19 +226,25 @@ test "POI 57893 many-merges — 50k mergeCells" {
 }
 
 test "POI 58325_db — self-closing <row/> elements" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Sheet1 has 4 rows, three of which are `<row r="N" ht="..."/>`
     // (style/height-only, no cells). Before the self-closing fix the
     // row iterator went off the rails on the first such row.
     const alloc = std.testing.allocator;
-    var book = try openOrSkip(alloc, "poi_58325_db.xlsx");
+    var book = try openOrSkip(alloc, io, "poi_58325_db.xlsx");
     defer book.deinit();
     const n = try rowCount(&book, book.sheets[0], alloc);
     try std.testing.expectEqual(@as(usize, 4), n);
 }
 
 test "openxlsx loadExample — 4 sheets including pivot/slicer" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
-    var book = try openOrSkip(alloc, "openxlsx_loadExample.xlsx");
+    var book = try openOrSkip(alloc, io, "openxlsx_loadExample.xlsx");
     defer book.deinit();
     try std.testing.expect(book.sheets.len >= 4);
 }
@@ -226,6 +256,9 @@ test "openxlsx loadExample — 4 sheets including pivot/slicer" {
 // false-positive parse).
 
 test "adversarial: truncated ZIPs error cleanly" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
     const cases = [_][]const u8{
         "derived_truncated_pre_eocd.xlsx",
@@ -238,11 +271,11 @@ test "adversarial: truncated ZIPs error cleanly" {
     for (cases) |name| {
         var path_buf: [256]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "{s}{s}", .{ corpus_dir, name });
-        if (std.fs.cwd().access(path, .{})) |_| {} else |_| continue;
+        if (std.Io.Dir.cwd().access(io, path, .{})) |_| {} else |_| continue;
         // Whether open returns an error or succeeds is fixture-dependent;
         // the contract is "no crash / no hang / no UB". We only assert
         // we get *some* result back without panicking.
-        if (xlsx.Book.open(alloc, path)) |book_const| {
+        if (xlsx.Book.open(alloc, io, path)) |book_const| {
             var book = book_const;
             defer book.deinit();
         } else |_| {}
@@ -250,6 +283,9 @@ test "adversarial: truncated ZIPs error cleanly" {
 }
 
 test "adversarial: bare ZIPs (not xlsx) error with a typed reason" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
     const cases = [_][]const u8{
         "ziprs_invalid_offset.zip",
@@ -264,12 +300,12 @@ test "adversarial: bare ZIPs (not xlsx) error with a typed reason" {
     for (cases) |name| {
         var path_buf: [256]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "{s}{s}", .{ corpus_dir, name });
-        if (std.fs.cwd().access(path, .{})) |_| {} else |_| continue;
+        if (std.Io.Dir.cwd().access(io, path, .{})) |_| {} else |_| continue;
         // Bare ZIPs must NOT parse as xlsx. They either fail at the ZIP
         // layer (BadZip) or at the missing-workbook step
         // (MissingWorkbook). Anything else means the reader silently
         // accepted a non-xlsx archive, which is a real defect.
-        const result = xlsx.Book.open(alloc, path);
+        const result = xlsx.Book.open(alloc, io, path);
         if (result) |book_const| {
             var book = book_const;
             defer book.deinit();
@@ -280,21 +316,27 @@ test "adversarial: bare ZIPs (not xlsx) error with a typed reason" {
 }
 
 test "adversarial: MalformedSSTCount — declared count clamped to actual" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // The SST is declared as `count="8876876876876"` but contains 8
     // entries. zlsx must NOT trust the attribute (would over-allocate
     // and crash); it must walk the actual <si> elements. Real count = 8.
     const alloc = std.testing.allocator;
-    var book = try openOrSkip(alloc, "poi_MalformedSSTCount.xlsx");
+    var book = try openOrSkip(alloc, io, "poi_MalformedSSTCount.xlsx");
     defer book.deinit();
     try std.testing.expect(book.sharedStringsCount() < 100);
 }
 
 test "adversarial: shared-strings amplification PoC opens without OOM" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // POI's poc-shared-strings.xlsx is a billion-laughs-style PoC with
     // a single huge <si> blob. Opening must complete in bounded memory
     // (no exponential expansion) and the row iterator must not fault.
     const alloc = std.testing.allocator;
-    var book = try openOrSkip(alloc, "poi_poc_shared_strings.xlsx");
+    var book = try openOrSkip(alloc, io, "poi_poc_shared_strings.xlsx");
     defer book.deinit();
     // 1 SST entry (the giant one); 4000 rows referencing it.
     try std.testing.expect(book.sharedStringsCount() < 1000);
@@ -303,22 +345,28 @@ test "adversarial: shared-strings amplification PoC opens without OOM" {
 }
 
 test "adversarial: encrypted xlsx — opens permissively, no crash" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // POI's workbookProtection-workbook_password-2013.xlsx is encrypted
     // at the OLE-CFB layer. zlsx isn't an OLE reader, so it'll read
     // whatever ZIP happens to be inside (typically a small placeholder
     // workbook). Goal: no panic, no UB. v1 doesn't surface a typed
     // "encrypted" error — that's a follow-up.
     const alloc = std.testing.allocator;
-    var book = try openOrSkip(alloc, "poi_workbook_password_2013.xlsx");
+    var book = try openOrSkip(alloc, io, "poi_workbook_password_2013.xlsx");
     defer book.deinit();
 }
 
 test "adversarial: trash entry inside otherwise-valid xlsx" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // POI's Excel_file_with_trash_item.xlsx has an extra ZIP entry
     // unrelated to the OOXML structure. zlsx ignores unknown entries
     // and reads the workbook normally.
     const alloc = std.testing.allocator;
-    var book = try openOrSkip(alloc, "poi_excel_with_trash_item.xlsx");
+    var book = try openOrSkip(alloc, io, "poi_excel_with_trash_item.xlsx");
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
     const n = try rowCount(&book, book.sheets[0], alloc);
@@ -326,22 +374,31 @@ test "adversarial: trash entry inside otherwise-valid xlsx" {
 }
 
 test "adversarial: XXE in [Content_Types].xml — no external fetch" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // POI's xxe_in_schema.xlsx attempts XML external-entity injection.
     // zlsx must parse with no external resolution (we never call out
     // to a network or filesystem path). Goal: no panic, no hang.
     const alloc = std.testing.allocator;
-    var book = try openOrSkip(alloc, "poi_xxe_in_schema.xlsx");
+    var book = try openOrSkip(alloc, io, "poi_xxe_in_schema.xlsx");
     defer book.deinit();
 }
 
 test "adversarial: clusterfuzz minimised XSSF input" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
-    var book = try openOrSkip(alloc, "poi_clusterfuzz_xssf.xlsx");
+    var book = try openOrSkip(alloc, io, "poi_clusterfuzz_xssf.xlsx");
     defer book.deinit();
     // Whatever the minimised input parses to, opening must not panic.
 }
 
 test "adversarial: calamine fixtures (encoded entities, empty SI, etc.)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
     const cases = [_]struct { name: []const u8, min_rows: usize }{
         .{ .name = "calamine_encoded_entities.xlsx", .min_rows = 1 },
@@ -352,8 +409,8 @@ test "adversarial: calamine fixtures (encoded entities, empty SI, etc.)" {
     for (cases) |c| {
         var path_buf: [256]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "{s}{s}", .{ corpus_dir, c.name });
-        if (std.fs.cwd().access(path, .{})) |_| {} else |_| continue;
-        var book = try xlsx.Book.open(alloc, path);
+        if (std.Io.Dir.cwd().access(io, path, .{})) |_| {} else |_| continue;
+        var book = try xlsx.Book.open(alloc, io, path);
         defer book.deinit();
         try std.testing.expect(book.sheets.len >= 1);
         const n = try rowCount(&book, book.sheets[0], alloc);
@@ -362,17 +419,20 @@ test "adversarial: calamine fixtures (encoded entities, empty SI, etc.)" {
 }
 
 test "Editor.scanWorksheet (iter-cm-1): every Book.rows cell has a matching span" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Phase 3d foundation. Walk worldbank_catalog through the new
     // span scanner; every non-empty cell that Book.rows surfaces
     // must have a matching CellSpan at the same (row, col).
     const alloc = std.testing.allocator;
     const path = corpus_dir ++ "worldbank_catalog.xlsx";
-    var ed = try zlsx_pkg.Editor.open(alloc, path);
+    var ed = try zlsx_pkg.Editor.open(alloc, io, path);
     defer ed.deinit();
     var spans = try ed.scanWorksheet(0);
     defer spans.deinit();
 
-    var book = try xlsx.Book.open(alloc, path);
+    var book = try xlsx.Book.open(alloc, io, path);
     defer book.deinit();
     var rows = try book.rows(book.sheets[0], alloc);
     defer rows.deinit();
@@ -394,6 +454,9 @@ test "Editor.scanWorksheet (iter-cm-1): every Book.rows cell has a matching span
 }
 
 test "corpus surface: iter28-34 reader APIs round-trip on real fixtures" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // The per-cell style / font / fill / border / numFmt / rich-runs /
     // comments APIs were added in iter28-34 but their tests use
     // synthesised fixtures. Exercise them against real-world xlsx files
@@ -407,7 +470,7 @@ test "corpus surface: iter28-34 reader APIs round-trip on real fixtures" {
     // same length as cells; numberFormat() + isDateFormat() must not
     // crash on any style index the sheet references.
     {
-        var book = try openOrSkip(alloc, "openpyxl_guess_types.xlsx");
+        var book = try openOrSkip(alloc, io, "openpyxl_guess_types.xlsx");
         defer book.deinit();
         const sheet = book.sheets[0];
         var rows = try book.rows(sheet, alloc);
@@ -433,7 +496,7 @@ test "corpus surface: iter28-34 reader APIs round-trip on real fixtures" {
     // null for every plain entry (the common case — no regression
     // into false-positive rich-runs on files without <r> wrappers).
     {
-        var book = try openOrSkip(alloc, "worldbank_catalog.xlsx");
+        var book = try openOrSkip(alloc, io, "worldbank_catalog.xlsx");
         defer book.deinit();
         var rich_count: usize = 0;
         for (0..book.sharedStringsCount()) |i| {
@@ -448,7 +511,7 @@ test "corpus surface: iter28-34 reader APIs round-trip on real fixtures" {
     // but comments() must still return an empty slice (never crash /
     // leak) for every sheet.
     {
-        var book = try openOrSkip(alloc, "worldbank_catalog.xlsx");
+        var book = try openOrSkip(alloc, io, "worldbank_catalog.xlsx");
         defer book.deinit();
         for (book.sheets) |sheet| {
             try std.testing.expectEqual(@as(usize, 0), book.comments(sheet).len);
@@ -504,8 +567,8 @@ const TmpFs = struct {
     pub fn deinit(self: *TmpFs) void {
         self.dir.cleanup();
     }
-    pub fn path(self: *TmpFs, alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
-        const d = try self.dir.dir.realpathAlloc(alloc, ".");
+    pub fn path(self: *TmpFs, alloc: std.mem.Allocator, io: std.Io, name: []const u8) ![:0]u8 {
+        const d = try self.dir.dir.realPathFileAlloc(io, ".", alloc);
         defer alloc.free(d);
         return std.fs.path.joinZ(alloc, &.{ d, name });
     }
@@ -515,10 +578,10 @@ fn corpusPath(alloc: std.mem.Allocator, fixture: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "{s}{s}", .{ corpus_dir, fixture });
 }
 
-fn fixtureExists(fixture: []const u8) bool {
+fn fixtureExists(io: std.Io, fixture: []const u8) bool {
     var path_buf: [256]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}{s}", .{ corpus_dir, fixture }) catch return false;
-    std.fs.cwd().access(path, .{}) catch return false;
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
     return true;
 }
 
@@ -600,10 +663,13 @@ fn sheetContainsString(
 }
 
 test "corpus parity: setCell on every fixture round-trips through reader" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
     var any_run: usize = 0;
     for (corpus_fixtures) |fixture| {
-        if (!fixtureExists(fixture)) {
+        if (!fixtureExists(io, fixture)) {
             std.debug.print("\n  [skip] {s} not in corpus\n", .{fixture});
             continue;
         }
@@ -611,7 +677,7 @@ test "corpus parity: setCell on every fixture round-trips through reader" {
         defer tt.deinit();
         const src = try corpusPath(alloc, fixture);
         defer alloc.free(src);
-        const dst = try tt.path(alloc, "out.xlsx");
+        const dst = try tt.path(alloc, io, "out.xlsx");
         defer alloc.free(dst);
 
         // setCell on row 1 col 0 of EVERY sheet — uses a unique sentinel
@@ -619,7 +685,7 @@ test "corpus parity: setCell on every fixture round-trips through reader" {
         const sentinel = "ZLSX_SETCELL_E7A_SENTINEL";
         var skip_fixture = false;
         open_block: {
-            var ed = zlsx_pkg.Editor.open(alloc, src) catch |err| {
+            var ed = zlsx_pkg.Editor.open(alloc, io, src) catch |err| {
                 if (isOpenSkip(err)) {
                     std.debug.print(
                         "\n  [skip open] {s}: {s}\n",
@@ -645,11 +711,11 @@ test "corpus parity: setCell on every fixture round-trips through reader" {
                     return err;
                 };
             }
-            try ed.save(dst);
+            try ed.save(io, dst);
         }
         if (skip_fixture) continue;
 
-        var book = try xlsx.Book.open(alloc, dst);
+        var book = try xlsx.Book.open(alloc, io, dst);
         defer book.deinit();
         try walkAllSheets(&book, alloc);
         // Every sheet that accepted the setCell must surface the
@@ -670,10 +736,13 @@ test "corpus parity: setCell on every fixture round-trips through reader" {
 }
 
 test "corpus parity: appendRows on every fixture round-trips through reader" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
     var any_run: usize = 0;
     for (corpus_fixtures) |fixture| {
-        if (!fixtureExists(fixture)) {
+        if (!fixtureExists(io, fixture)) {
             std.debug.print("\n  [skip] {s} not in corpus\n", .{fixture});
             continue;
         }
@@ -681,7 +750,7 @@ test "corpus parity: appendRows on every fixture round-trips through reader" {
         defer tt.deinit();
         const src = try corpusPath(alloc, fixture);
         defer alloc.free(src);
-        const dst = try tt.path(alloc, "out.xlsx");
+        const dst = try tt.path(alloc, io, "out.xlsx");
         defer alloc.free(dst);
 
         const sentinel = "ZLSX_APPEND_E7A_SENTINEL";
@@ -698,7 +767,7 @@ test "corpus parity: appendRows on every fixture round-trips through reader" {
 
         var skip_fixture = false;
         open_block: {
-            var ed = zlsx_pkg.Editor.open(alloc, src) catch |err| {
+            var ed = zlsx_pkg.Editor.open(alloc, io, src) catch |err| {
                 if (isOpenSkip(err)) {
                     std.debug.print(
                         "\n  [skip open] {s}: {s}\n",
@@ -725,11 +794,11 @@ test "corpus parity: appendRows on every fixture round-trips through reader" {
                 };
                 try per_sheet_ok.put(i, {});
             }
-            try ed.save(dst);
+            try ed.save(io, dst);
         }
         if (skip_fixture) continue;
 
-        var book = try xlsx.Book.open(alloc, dst);
+        var book = try xlsx.Book.open(alloc, io, dst);
         defer book.deinit();
         try walkAllSheets(&book, alloc);
 
@@ -748,10 +817,13 @@ test "corpus parity: appendRows on every fixture round-trips through reader" {
 }
 
 test "corpus parity: addSheet on every fixture round-trips through reader" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
     var any_run: usize = 0;
     for (corpus_fixtures) |fixture| {
-        if (!fixtureExists(fixture)) {
+        if (!fixtureExists(io, fixture)) {
             std.debug.print("\n  [skip] {s} not in corpus\n", .{fixture});
             continue;
         }
@@ -759,20 +831,20 @@ test "corpus parity: addSheet on every fixture round-trips through reader" {
         defer tt.deinit();
         const src = try corpusPath(alloc, fixture);
         defer alloc.free(src);
-        const dst = try tt.path(alloc, "out.xlsx");
+        const dst = try tt.path(alloc, io, "out.xlsx");
         defer alloc.free(dst);
 
         const new_name = "ZlsxE7A_Added";
         const sentinel = "ZLSX_ADDSHEET_E7A_SENTINEL";
         const original_sheet_count = blk: {
-            var b = try xlsx.Book.open(alloc, src);
+            var b = try xlsx.Book.open(alloc, io, src);
             defer b.deinit();
             break :blk b.sheets.len;
         };
 
         var skip_fixture = false;
         open_block: {
-            var ed = zlsx_pkg.Editor.open(alloc, src) catch |err| {
+            var ed = zlsx_pkg.Editor.open(alloc, io, src) catch |err| {
                 if (isOpenSkip(err)) {
                     std.debug.print(
                         "\n  [skip open] {s}: {s}\n",
@@ -803,11 +875,11 @@ test "corpus parity: addSheet on every fixture round-trips through reader" {
             };
             const rows_to_append = [_][]const xlsx.Cell{&append_row};
             try ed.appendRows(new_idx, &rows_to_append);
-            try ed.save(dst);
+            try ed.save(io, dst);
         }
         if (skip_fixture) continue;
 
-        var book = try xlsx.Book.open(alloc, dst);
+        var book = try xlsx.Book.open(alloc, io, dst);
         defer book.deinit();
         try walkAllSheets(&book, alloc);
         try std.testing.expectEqual(original_sheet_count + 1, book.sheets.len);
@@ -819,11 +891,14 @@ test "corpus parity: addSheet on every fixture round-trips through reader" {
 }
 
 test "corpus parity: deleteSheet (last sheet) on multi-sheet fixtures" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
     var any_run: usize = 0;
     var any_attempted: usize = 0;
     for (corpus_fixtures) |fixture| {
-        if (!fixtureExists(fixture)) {
+        if (!fixtureExists(io, fixture)) {
             std.debug.print("\n  [skip] {s} not in corpus\n", .{fixture});
             continue;
         }
@@ -831,13 +906,13 @@ test "corpus parity: deleteSheet (last sheet) on multi-sheet fixtures" {
         defer tt.deinit();
         const src = try corpusPath(alloc, fixture);
         defer alloc.free(src);
-        const dst = try tt.path(alloc, "out.xlsx");
+        const dst = try tt.path(alloc, io, "out.xlsx");
         defer alloc.free(dst);
 
         // Probe sheet count + capture last sheet's name BEFORE the
         // delete so we can verify it's gone post-save.
         const probe = blk: {
-            var b = try xlsx.Book.open(alloc, src);
+            var b = try xlsx.Book.open(alloc, io, src);
             defer b.deinit();
             const last_idx = b.sheets.len - 1;
             const last_name = try alloc.dupe(u8, b.sheets[last_idx].name);
@@ -862,7 +937,7 @@ test "corpus parity: deleteSheet (last sheet) on multi-sheet fixtures" {
         any_attempted += 1;
         var skip_fixture = false;
         open_block: {
-            var ed = zlsx_pkg.Editor.open(alloc, src) catch |err| {
+            var ed = zlsx_pkg.Editor.open(alloc, io, src) catch |err| {
                 if (isOpenSkip(err)) {
                     std.debug.print(
                         "\n  [skip open] {s}: {s}\n",
@@ -884,11 +959,11 @@ test "corpus parity: deleteSheet (last sheet) on multi-sheet fixtures" {
                 }
                 return err;
             };
-            try ed.save(dst);
+            try ed.save(io, dst);
         }
         if (skip_fixture) continue;
 
-        var book = try xlsx.Book.open(alloc, dst);
+        var book = try xlsx.Book.open(alloc, io, dst);
         defer book.deinit();
         try walkAllSheets(&book, alloc);
         try std.testing.expectEqual(probe.count - 1, book.sheets.len);
@@ -900,10 +975,13 @@ test "corpus parity: deleteSheet (last sheet) on multi-sheet fixtures" {
 }
 
 test "corpus parity: renameSheet on every fixture round-trips through reader" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
     var any_run: usize = 0;
     for (corpus_fixtures) |fixture| {
-        if (!fixtureExists(fixture)) {
+        if (!fixtureExists(io, fixture)) {
             std.debug.print("\n  [skip] {s} not in corpus\n", .{fixture});
             continue;
         }
@@ -911,14 +989,14 @@ test "corpus parity: renameSheet on every fixture round-trips through reader" {
         defer tt.deinit();
         const src = try corpusPath(alloc, fixture);
         defer alloc.free(src);
-        const dst = try tt.path(alloc, "out.xlsx");
+        const dst = try tt.path(alloc, io, "out.xlsx");
         defer alloc.free(dst);
 
         // Capture sheet 0's original name + its first row's first
         // string-or-numeric cell (the latter is just "are we still
         // reading the same data shape?").
         const original_name = blk: {
-            var b = try xlsx.Book.open(alloc, src);
+            var b = try xlsx.Book.open(alloc, io, src);
             defer b.deinit();
             break :blk try alloc.dupe(u8, b.sheets[0].name);
         };
@@ -927,7 +1005,7 @@ test "corpus parity: renameSheet on every fixture round-trips through reader" {
         const new_name = "ZlsxE7A_Renamed_Sheet0";
         var skip_fixture = false;
         open_block: {
-            var ed = zlsx_pkg.Editor.open(alloc, src) catch |err| {
+            var ed = zlsx_pkg.Editor.open(alloc, io, src) catch |err| {
                 if (isOpenSkip(err)) {
                     std.debug.print(
                         "\n  [skip open] {s}: {s}\n",
@@ -949,11 +1027,11 @@ test "corpus parity: renameSheet on every fixture round-trips through reader" {
                 }
                 return err;
             };
-            try ed.save(dst);
+            try ed.save(io, dst);
         }
         if (skip_fixture) continue;
 
-        var book = try xlsx.Book.open(alloc, dst);
+        var book = try xlsx.Book.open(alloc, io, dst);
         defer book.deinit();
         try walkAllSheets(&book, alloc);
         try std.testing.expectEqualStrings(new_name, book.sheets[0].name);
@@ -969,10 +1047,13 @@ test "corpus parity: renameSheet on every fixture round-trips through reader" {
 }
 
 test "corpus parity: insertRow on every fixture round-trips through reader" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
     var any_attempted: usize = 0;
     for (corpus_fixtures) |fixture| {
-        if (!fixtureExists(fixture)) {
+        if (!fixtureExists(io, fixture)) {
             std.debug.print("\n  [skip] {s} not in corpus\n", .{fixture});
             continue;
         }
@@ -980,11 +1061,11 @@ test "corpus parity: insertRow on every fixture round-trips through reader" {
         defer tt.deinit();
         const src = try corpusPath(alloc, fixture);
         defer alloc.free(src);
-        const dst = try tt.path(alloc, "out.xlsx");
+        const dst = try tt.path(alloc, io, "out.xlsx");
         defer alloc.free(dst);
 
         const pre_count = blk: {
-            var b = try xlsx.Book.open(alloc, src);
+            var b = try xlsx.Book.open(alloc, io, src);
             defer b.deinit();
             // Sheet 0 row count for the post-save assertion.
             break :blk try countRowsOf(&b, b.sheets[0], alloc);
@@ -993,7 +1074,7 @@ test "corpus parity: insertRow on every fixture round-trips through reader" {
         any_attempted += 1;
         var skip_fixture = false;
         open_block: {
-            var ed = zlsx_pkg.Editor.open(alloc, src) catch |err| {
+            var ed = zlsx_pkg.Editor.open(alloc, io, src) catch |err| {
                 if (isOpenSkip(err)) {
                     std.debug.print(
                         "\n  [skip open] {s}: {s}\n",
@@ -1015,11 +1096,11 @@ test "corpus parity: insertRow on every fixture round-trips through reader" {
                 }
                 return err;
             };
-            try ed.save(dst);
+            try ed.save(io, dst);
         }
         if (skip_fixture) continue;
 
-        var book = try xlsx.Book.open(alloc, dst);
+        var book = try xlsx.Book.open(alloc, io, dst);
         defer book.deinit();
         try walkAllSheets(&book, alloc);
         // Inserted row at row 1 has no <row> element — readable row
@@ -1034,10 +1115,13 @@ test "corpus parity: insertRow on every fixture round-trips through reader" {
 }
 
 test "corpus parity: deleteRow on every fixture round-trips through reader" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
     var any_attempted: usize = 0;
     for (corpus_fixtures) |fixture| {
-        if (!fixtureExists(fixture)) {
+        if (!fixtureExists(io, fixture)) {
             std.debug.print("\n  [skip] {s} not in corpus\n", .{fixture});
             continue;
         }
@@ -1045,11 +1129,11 @@ test "corpus parity: deleteRow on every fixture round-trips through reader" {
         defer tt.deinit();
         const src = try corpusPath(alloc, fixture);
         defer alloc.free(src);
-        const dst = try tt.path(alloc, "out.xlsx");
+        const dst = try tt.path(alloc, io, "out.xlsx");
         defer alloc.free(dst);
 
         const pre_count = blk: {
-            var b = try xlsx.Book.open(alloc, src);
+            var b = try xlsx.Book.open(alloc, io, src);
             defer b.deinit();
             break :blk try countRowsOf(&b, b.sheets[0], alloc);
         };
@@ -1058,7 +1142,7 @@ test "corpus parity: deleteRow on every fixture round-trips through reader" {
         var accepted = false;
         var skip_fixture = false;
         open_block: {
-            var ed = zlsx_pkg.Editor.open(alloc, src) catch |err| {
+            var ed = zlsx_pkg.Editor.open(alloc, io, src) catch |err| {
                 if (isOpenSkip(err)) {
                     std.debug.print(
                         "\n  [skip open] {s}: {s}\n",
@@ -1080,13 +1164,13 @@ test "corpus parity: deleteRow on every fixture round-trips through reader" {
                 }
                 return err;
             };
-            try ed.save(dst);
+            try ed.save(io, dst);
             accepted = true;
         }
         if (skip_fixture) continue;
         if (!accepted) continue;
 
-        var book = try xlsx.Book.open(alloc, dst);
+        var book = try xlsx.Book.open(alloc, io, dst);
         defer book.deinit();
         try walkAllSheets(&book, alloc);
         const post_count = try countRowsOf(&book, book.sheets[0], alloc);
@@ -1101,10 +1185,13 @@ test "corpus parity: deleteRow on every fixture round-trips through reader" {
 }
 
 test "corpus parity: insertColumn on every fixture round-trips through reader" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
     var any_attempted: usize = 0;
     for (corpus_fixtures) |fixture| {
-        if (!fixtureExists(fixture)) {
+        if (!fixtureExists(io, fixture)) {
             std.debug.print("\n  [skip] {s} not in corpus\n", .{fixture});
             continue;
         }
@@ -1112,14 +1199,14 @@ test "corpus parity: insertColumn on every fixture round-trips through reader" {
         defer tt.deinit();
         const src = try corpusPath(alloc, fixture);
         defer alloc.free(src);
-        const dst = try tt.path(alloc, "out.xlsx");
+        const dst = try tt.path(alloc, io, "out.xlsx");
         defer alloc.free(dst);
 
         any_attempted += 1;
         var accepted = false;
         var skip_fixture = false;
         open_block: {
-            var ed = zlsx_pkg.Editor.open(alloc, src) catch |err| {
+            var ed = zlsx_pkg.Editor.open(alloc, io, src) catch |err| {
                 if (isOpenSkip(err)) {
                     std.debug.print(
                         "\n  [skip open] {s}: {s}\n",
@@ -1141,13 +1228,13 @@ test "corpus parity: insertColumn on every fixture round-trips through reader" {
                 }
                 return err;
             };
-            try ed.save(dst);
+            try ed.save(io, dst);
             accepted = true;
         }
         if (skip_fixture) continue;
         if (!accepted) continue;
 
-        var book = try xlsx.Book.open(alloc, dst);
+        var book = try xlsx.Book.open(alloc, io, dst);
         defer book.deinit();
         try walkAllSheets(&book, alloc);
     }
@@ -1155,10 +1242,13 @@ test "corpus parity: insertColumn on every fixture round-trips through reader" {
 }
 
 test "corpus parity: deleteColumn on every fixture round-trips through reader" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const alloc = std.testing.allocator;
     var any_attempted: usize = 0;
     for (corpus_fixtures) |fixture| {
-        if (!fixtureExists(fixture)) {
+        if (!fixtureExists(io, fixture)) {
             std.debug.print("\n  [skip] {s} not in corpus\n", .{fixture});
             continue;
         }
@@ -1166,14 +1256,14 @@ test "corpus parity: deleteColumn on every fixture round-trips through reader" {
         defer tt.deinit();
         const src = try corpusPath(alloc, fixture);
         defer alloc.free(src);
-        const dst = try tt.path(alloc, "out.xlsx");
+        const dst = try tt.path(alloc, io, "out.xlsx");
         defer alloc.free(dst);
 
         any_attempted += 1;
         var accepted = false;
         var skip_fixture = false;
         open_block: {
-            var ed = zlsx_pkg.Editor.open(alloc, src) catch |err| {
+            var ed = zlsx_pkg.Editor.open(alloc, io, src) catch |err| {
                 if (isOpenSkip(err)) {
                     std.debug.print(
                         "\n  [skip open] {s}: {s}\n",
@@ -1195,13 +1285,13 @@ test "corpus parity: deleteColumn on every fixture round-trips through reader" {
                 }
                 return err;
             };
-            try ed.save(dst);
+            try ed.save(io, dst);
             accepted = true;
         }
         if (skip_fixture) continue;
         if (!accepted) continue;
 
-        var book = try xlsx.Book.open(alloc, dst);
+        var book = try xlsx.Book.open(alloc, io, dst);
         defer book.deinit();
         try walkAllSheets(&book, alloc);
     }

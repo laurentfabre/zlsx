@@ -75,7 +75,7 @@ pub const Error = error{OutOfMemory};
 /// the caller; each token's `.text` borrows from `input` and stays
 /// valid as long as `input` does. Free with `allocator.free(out)`.
 pub fn tokenize(allocator: std.mem.Allocator, input: []const u8) Error![]Token {
-    var out: std.ArrayListUnmanaged(Token) = .{};
+    var out: std.ArrayListUnmanaged(Token) = .empty;
     errdefer out.deinit(allocator);
 
     var i: usize = 0;
