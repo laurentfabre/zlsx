@@ -84,13 +84,46 @@ else
   warn "LibreOffice not installed (brew install --cask libreoffice to enable this leg)"
 fi
 
+# ---- semi-automated leg: Excel for Mac via AppleScript --------------------
+# Runs under $HOME on purpose: Excel opens files from /tmp in Protected View,
+# which blocks `save` and would turn this into a measurement of Protected
+# View rather than of Excel's preservation behaviour.
+#
+# This leg doubles as the "opens without a dialog" check the parent matrix
+# treats as a blocking failure — a modal would stall the Apple event, which
+# is precisely how the Numbers leg fails.
+if [[ "$(uname -s)" == "Darwin" && -d "/Applications/Microsoft Excel.app" ]]; then
+  note "leg: Excel for Mac (AppleScript open → save → close)"
+  XL="$HOME/zlsx-emb4b-excel-leg.xlsx"
+  cp "$FIXTURE" "$XL"
+  if timeout 300 osascript >/dev/null 2>&1 <<APPLESCRIPT
+with timeout of 280 seconds
+  tell application "Microsoft Excel"
+    set wbk to open workbook workbook file name POSIX file "$XL"
+    save wbk
+    close wbk saving no
+  end tell
+end timeout
+APPLESCRIPT
+  then
+    "$BIN/zlsx-emb4b-verify" "$XL"; warn "Excel for Mac lost $? carriers"
+  else
+    warn "Excel AppleScript leg failed or timed out — run it by hand against $XL"
+  fi
+  rm -f "$XL"
+else
+  warn "Excel for Mac not present — skipping leg"
+fi
+
 # ---- GUI legs -------------------------------------------------------------
-# Numbers and Excel are not driven from here. AppleScript `export` against
-# Numbers hangs with -1712 (AppleEvent timed out) even with an explicit
-# 400s timeout block, and diagnosing that needs assistive access that a
-# headless run cannot assume. Staged for a manual pass instead.
+# Numbers is not driven from here. AppleScript `export … as Microsoft Excel`
+# returns -1712 (AppleEvent timed out) on every attempt, including inside an
+# explicit 400s timeout block and with the app activated; diagnosing it needs
+# assistive access a headless run cannot assume. The identical script shape
+# drives Excel to completion above, so this is a Numbers scripting fault
+# rather than a harness bug.
 note "GUI legs — stage copies (manual open → save → verify)"
-for tool in excel-mac excel-win numbers; do
+for tool in excel-win numbers; do
   cp "$FIXTURE" "$WORK/$tool.xlsx"
   printf '   • %-10s  open %s  →  save  →  close, then:\n' "$tool" "$WORK/$tool.xlsx"
   printf '                %s %s\n' "$BIN/zlsx-emb4b-verify" "$WORK/$tool.xlsx"

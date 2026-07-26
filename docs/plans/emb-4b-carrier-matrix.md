@@ -70,33 +70,41 @@ build-failure 1.
 
 Verified 2026-07-26 on macOS 26.4, Zig 0.16.0, fixture nonce `8f3a2c1d`.
 
-| Carrier | Location | zlsx (control) | openpyxl 3.1.5 | LibreOffice Calc 26.2.3.2 | Numbers 14.5 | Excel mac | Excel Win |
+| Carrier | Location | zlsx (control) | Excel mac 16.109.2 | openpyxl 3.1.5 | LibreOffice Calc 26.2.3.2 | Numbers 14.5 | Excel Win |
 |---|---|---|---|---|---|---|---|
-| `opc_part` | `xl/zlsxEmbeddings/index.xml` | ✅ | ❌ | ❌ | _pending_ | _pending_ | _pending_ |
-| `custom_xml` | `customXml/item1.xml` | ✅ | ❌ | ✅ | _pending_ | _pending_ | _pending_ |
-| `doc_props` | `docProps/custom.xml` | ✅ | **✅** | **✅** | _pending_ | _pending_ | _pending_ |
-| `cell_data` | hidden sheet `zlsxE4B` A1 | ✅ | **✅** | **✅** | _pending_ | _pending_ | _pending_ |
-| `defined_name` | `<definedName ZlsxE4BRecovery>` | ✅ | **✅** | **✅** | _pending_ | _pending_ | _pending_ |
-| `ext_lst` | `xl/workbook.xml` `<extLst><ext>` | ✅ | ❌ | ❌ | _pending_ | _pending_ | _pending_ |
-| | **carriers lost** | 0/6 | 3/6 | 2/6 | — | — | — |
+| `opc_part` | `xl/zlsxEmbeddings/index.xml` | ✅ | ✅ | ❌ | ❌ | _pending_ | _pending_ |
+| `custom_xml` | `customXml/item1.xml` | ✅ | ✅ | ❌ | ✅ | _pending_ | _pending_ |
+| `doc_props` | `docProps/custom.xml` | ✅ | ✅ | **✅** | **✅** | _pending_ | _pending_ |
+| `cell_data` | hidden sheet `zlsxE4B` A1 | ✅ | ✅ | **✅** | **✅** | _pending_ | _pending_ |
+| `defined_name` | `<definedName ZlsxE4BRecovery>` | ✅ | ✅ | **✅** | **✅** | _pending_ | _pending_ |
+| `ext_lst` | `xl/workbook.xml` `<extLst><ext>` | ✅ | ✅ | ❌ | ❌ | _pending_ | _pending_ |
+| | **carriers lost** | 0/6 | **0/6** | 3/6 | 2/6 | — | — |
 
-Informational: `state="hidden"` on the marker sheet survived both
-automated legs, so the `cell_data` carrier keeps its concealment
-through a rebuild — it just never had concealment from the Inspector
-in the first place.
+Informational: `state="hidden"` on the marker sheet survived every leg
+run so far, so the `cell_data` carrier keeps its concealment through a
+rebuild — it just never had concealment from the Inspector in the first
+place.
+
+**Excel opens the six-carrier fixture without a dialog.** That is not a
+throwaway detail: this doc's parent sets "any warning / recovered-file /
+removed-features dialog is a blocking failure", and the fixture adds
+five carriers of surface beyond what emb-4 tested. The AppleScript leg
+is itself the evidence — a modal would have blocked the Apple event,
+which is exactly how the Numbers leg fails.
 
 ### Legs not yet run
 
 - **Apple Numbers** — the other archive-rebuilding tool, and the leg
-  that matters most. Not automatable from here: AppleScript `export …
-  as Microsoft Excel` returns `-1712 AppleEvent timed out` even inside
-  an explicit 400 s timeout block, and diagnosing that needs assistive
-  access for `osascript` which is not granted on this host. Numbers
-  itself quits cleanly afterwards, so nothing is wedged. Run manually:
-  open the staged copy, File ▸ Export To ▸ Excel into a non-TCC folder
-  (`~/`, not `~/Documents`), then verify.
-- **Excel for Mac** — expected to preserve all six (emb-4 showed it
-  round-trips unknown parts). Confirmation only.
+  that matters most, since it could change the ranking below. Not
+  automatable from here: AppleScript `export … as Microsoft Excel`
+  returns `-1712 AppleEvent timed out` on three attempts, including
+  inside an explicit 400 s timeout block and with the app activated.
+  Diagnosing it needs assistive access for `osascript` that this host
+  does not grant. Numbers quits cleanly afterwards, so nothing is
+  wedged — the same script shape drives Excel to completion, so this is
+  a Numbers-specific scripting fault rather than a harness bug. Run
+  manually: open the staged copy, File ▸ Export To ▸ Excel into a
+  non-TCC folder (`~/`, not `~/Documents`), then verify.
 - **Excel for Windows** — still blocked on a Windows host with Excel,
   exactly as `E4W` is. A GitHub Actions `windows-latest` runner does
   **not** close this: the CI job proves the binary runs on Windows, not
@@ -108,7 +116,9 @@ in the first place.
 ## Findings
 
 **Three carriers survive both archive-rebuilding consumers measured so
-far:** `docProps/custom.xml`, cell data, and `<definedName>`.
+far:** `docProps/custom.xml`, cell data, and `<definedName>`. Excel for
+Mac preserves all six, reproducing emb-4's verdict on `opc_part` and
+confirming that nothing in the wider fixture upsets it.
 
 That is the result emb-4B existed to get. A recovery record *can* be
 carried durably through a tool that erases the vectors, which turns
