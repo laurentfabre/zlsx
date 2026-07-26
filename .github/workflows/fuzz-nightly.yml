@@ -95,17 +95,30 @@ jobs:
           DURATION_SECONDS: ${{ github.event.inputs.duration_seconds || '1800' }}
         # `--fuzz` is the flag that actually enables coverage-guided
         # fuzzing; `fuzz` alone is just our step name. `--fuzz` implies
-        # `--webui`, and the fuzzer runs until killed, so the wall-clock
-        # cap comes from `timeout`: 124 (TERM-on-timeout) and 143
-        # (SIGTERM-killed) are the healthy "ran the full session" exits.
+        # `--webui`, and the fuzzer runs until killed, so the session
+        # needs a wall-clock cap.
+        #
+        # A background watchdog rather than `timeout(1)`: that is GNU
+        # coreutils and is NOT present on macOS runners, where this job
+        # now runs. Installing coreutils just for a sleep-and-kill would
+        # be a dependency for nothing.
         run: |
           set +e
-          timeout --preserve-status --signal=TERM "${DURATION_SECONDS}s" \
-            zig build fuzz --fuzz --webui=127.0.0.1:0 2>&1 | tee fuzz.log
-          rc=${PIPESTATUS[0]}
+          zig build fuzz --fuzz --webui=127.0.0.1:0 > fuzz.log 2>&1 &
+          fuzz_pid=$!
+          ( sleep "${DURATION_SECONDS}"; kill -TERM "$fuzz_pid" 2>/dev/null ) &
+          watchdog_pid=$!
+
+          wait "$fuzz_pid"
+          rc=$?
+          kill "$watchdog_pid" 2>/dev/null
           set -e
 
-          if [[ "$rc" == "124" || "$rc" == "143" ]]; then
+          cat fuzz.log
+
+          # 143 = SIGTERM from the watchdog, i.e. it ran the whole
+          # session without finding anything. That is the healthy path.
+          if [[ "$rc" == "143" || "$rc" == "124" ]]; then
             echo "::notice::fuzz session ran the full ${DURATION_SECONDS}s with no crash"
             exit 0
           fi
