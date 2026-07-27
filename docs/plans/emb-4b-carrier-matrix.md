@@ -70,20 +70,51 @@ build-failure 1.
 
 Verified 2026-07-26 on macOS 26.4, Zig 0.16.0, fixture nonce `8f3a2c1d`.
 
-| Carrier | Location | zlsx (control) | Excel mac 16.109.2 | openpyxl 3.1.5 | LibreOffice Calc 26.2.3.2 | Numbers 14.5 | Excel Win |
+| Carrier | Location | zlsx (control) | Excel mac 16.109.2 | openpyxl 3.1.5 | LibreOffice Calc 26.2.3.2 | **Numbers 15.3** | Excel Win |
 |---|---|---|---|---|---|---|---|
-| `opc_part` | `xl/zlsxEmbeddings/index.xml` | ✅ | ✅ | ❌ | ❌ | _pending_ | _pending_ |
-| `custom_xml` | `customXml/item1.xml` | ✅ | ✅ | ❌ | ✅ | _pending_ | _pending_ |
-| `doc_props` | `docProps/custom.xml` | ✅ | ✅ | **✅** | **✅** | _pending_ | _pending_ |
-| `cell_data` | hidden sheet `zlsxE4B` A1 | ✅ | ✅ | **✅** | **✅** | _pending_ | _pending_ |
-| `defined_name` | `<definedName ZlsxE4BRecovery>` | ✅ | ✅ | **✅** | **✅** | _pending_ | _pending_ |
-| `ext_lst` | `xl/workbook.xml` `<extLst><ext>` | ✅ | ✅ | ❌ | ❌ | _pending_ | _pending_ |
-| | **carriers lost** | 0/6 | **0/6** | 3/6 | 2/6 | — | — |
+| `opc_part` | `xl/zlsxEmbeddings/index.xml` | ✅ | ✅ | ❌ | ❌ | ❌ | _pending_ |
+| `custom_xml` | `customXml/item1.xml` | ✅ | ✅ | ❌ | ✅ | ❌ | _pending_ |
+| `doc_props` | `docProps/custom.xml` | ✅ | ✅ | **✅** | **✅** | ❌ | _pending_ |
+| `cell_data` | hidden sheet `zlsxE4B` A1 | ✅ | ✅ | **✅** | **✅** | **✅** | _pending_ |
+| `defined_name` | `<definedName ZlsxE4BRecovery>` | ✅ | ✅ | **✅** | **✅** | ❌ | _pending_ |
+| `ext_lst` | `xl/workbook.xml` `<extLst><ext>` | ✅ | ✅ | ❌ | ❌ | ❌ | _pending_ |
+| | **carriers lost** | 0/6 | **0/6** | 3/6 | 2/6 | **5/6** | — |
 
-Informational: `state="hidden"` on the marker sheet survived every leg
-run so far, so the `cell_data` carrier keeps its concealment through a
-rebuild — it just never had concealment from the Inspector in the first
-place.
+Informational: `state="hidden"` on the marker sheet survived every leg,
+Numbers included — so the `cell_data` carrier keeps its concealment
+through a rebuild. It just never had concealment from the Document
+Inspector in the first place.
+
+> **Numbers erases everything except cell data (measured 2026-07-27,
+> Numbers 15.3).** This is the result the matrix's "live risk" note
+> warned about, and it landed on the bad side. Numbers strips 5 of 6
+> carriers — including **both** recovery-record carriers. Only content
+> that is part of the workbook model itself survives its export.
+>
+> Note the version: the emb-4 matrix records Numbers 14.5; the machine
+> now runs 15.3, so this is a *newer* build, not an older one, and the
+> behaviour is not a regression that a future update will fix.
+
+### How the Numbers leg is driven (it is scriptable after all)
+
+Earlier attempts concluded Numbers could not be automated, on three
+`-1712 AppleEvent timed out` failures. That was the wrong conclusion
+from a correct observation: the **`open` Apple event** hangs
+indefinitely, but the application is otherwise fully responsive —
+`get version` and `count of documents` answer instantly.
+
+Opening through LaunchServices instead of Apple events sidesteps it
+entirely, and once a document is open, `export` works first time:
+
+```bash
+open -a Numbers fixture.xlsx        # LaunchServices, not an Apple event
+# poll: osascript -e 'tell application "Numbers" to count of documents'
+osascript -e 'tell application "Numbers" to \
+  export document 1 to POSIX file "'"$HOME"'/out.xlsx" as Microsoft Excel'
+```
+
+Export must target a non-TCC folder (`~/`, not `~/Documents`), and the
+destination must not already exist.
 
 **Excel opens the six-carrier fixture without a dialog.** That is not a
 throwaway detail: this doc's parent sets "any warning / recovered-file /
@@ -94,17 +125,8 @@ which is exactly how the Numbers leg fails.
 
 ### Legs not yet run
 
-- **Apple Numbers** — the other archive-rebuilding tool, and the leg
-  that matters most, since it could change the ranking below. Not
-  automatable from here: AppleScript `export … as Microsoft Excel`
-  returns `-1712 AppleEvent timed out` on three attempts, including
-  inside an explicit 400 s timeout block and with the app activated.
-  Diagnosing it needs assistive access for `osascript` that this host
-  does not grant. Numbers quits cleanly afterwards, so nothing is
-  wedged — the same script shape drives Excel to completion, so this is
-  a Numbers-specific scripting fault rather than a harness bug. Run
-  manually: open the staged copy, File ▸ Export To ▸ Excel into a
-  non-TCC folder (`~/`, not `~/Documents`), then verify.
+- ~~**Apple Numbers**~~ — **run 2026-07-27**, see the matrix above and
+  the runner note. It did change the ranking, decisively.
 - **Excel for Windows** — still blocked on a Windows host with Excel,
   exactly as `E4W` is. A GitHub Actions `windows-latest` runner does
   **not** close this: the CI job proves the binary runs on Windows, not
@@ -115,15 +137,22 @@ which is exactly how the Numbers leg fails.
 
 ## Findings
 
-**Three carriers survive both archive-rebuilding consumers measured so
-far:** `docProps/custom.xml`, cell data, and `<definedName>`. Excel for
-Mac preserves all six, reproducing emb-4's verdict on `opc_part` and
+**Three carriers survive openpyxl and LibreOffice:**
+`docProps/custom.xml`, cell data, and `<definedName>`. Excel for Mac
+preserves all six, reproducing emb-4's verdict on `opc_part` and
 confirming that nothing in the wider fixture upsets it.
 
 That is the result emb-4B existed to get. A recovery record *can* be
-carried durably through a tool that erases the vectors, which turns
-"the data is gone and nothing recovers it" into "the data is gone and
-the workbook still says so" — a materially different product promise.
+carried through a tool that erases the vectors, which turns "the data
+is gone and nothing recovers it" into "the data is gone and the
+workbook still says so".
+
+**But only one carrier survives Numbers, and it is the visible one.**
+Numbers strips 5 of 6, including both recovery-record carriers. So the
+promise is real for openpyxl and LibreOffice and *false for Numbers* —
+a workbook that passes through Numbers is once again indistinguishable
+from one that never had embeddings. See the trade-off section below;
+this is the single most consequential row in the matrix.
 
 Two results are worth calling out because they contradict the prior
 reasoning:
@@ -139,31 +168,53 @@ reasoning:
   Data ▸ Remove All targets it by name). The design doc's rejection of
   `customXml/` stands, now on measured rather than predicted grounds.
 
-**Ranking for a recovery-record carrier**, on the evidence so far:
+**Ranking for a recovery-record carrier**, with every reachable leg run:
 
-1. **`defined_name`** — survives both rebuilders, and is not
+1. **`defined_name`** — survives openpyxl and LibreOffice, and is not
    enumerated by any Document Inspector module. Capacity-bounded, which
-   a recovery record can live within.
-2. **`doc_props`** — survives both rebuilders, but Document Inspector ▸
+   a recovery record can live within. **Erased by Numbers.**
+2. **`doc_props`** — same survival profile, but Document Inspector ▸
    Document Properties and Personal Information removes it, and that is
-   a commonly-run corporate compliance flow.
-3. **`cell_data`** — survives everything, but is the most visible
-   option by a wide margin: Sheet ▸ Unhide reveals it to any curious
-   user, and it pollutes the cell grid and the SST.
+   a commonly-run corporate compliance flow. **Erased by Numbers.**
+3. **`cell_data`** — **the only carrier that survives Numbers**, and it
+   survives everything else too. Also the most visible option by a wide
+   margin: Sheet ▸ Unhide reveals it to any curious user, and it
+   pollutes the cell grid and the SST.
 
-`defined_name` leading is a genuinely new input to the durability
-decision: it was never considered in `embeddings-in-xlsx.md`, whose
-"Why NOT" section covers `customXml/`, hidden worksheets,
-`docProps/custom.xml` and sidecar files — but not defined names.
+`defined_name` leading was a genuinely new input to the durability
+decision — it was never considered in `embeddings-in-xlsx.md`'s "Why
+NOT" section. It remains the right *primary* carrier. What the Numbers
+leg changes is that no combination of invisible carriers is universal.
+
+### The trade-off is now explicit, and it is real
+
+Every carrier that is invisible to the user is erased by Numbers. The
+only carrier Numbers preserves is the one that is part of the workbook
+model — and therefore visible. That is not an implementation gap to
+engineer around; it follows from *why* Numbers keeps things at all. It
+rebuilds the file from its own document model, so exactly the content
+that model represents survives, and nothing else.
+
+So there are two honest positions, and they cannot both be held:
+
+- **Invisible, not universal** (what ships): the record hides from the
+  Document Inspector and the Name Manager, and a Numbers round-trip
+  erases it. Goal 3 intact; the promise carries an exception.
+- **Universal, not invisible**: add cell data as a third carrier, and a
+  Numbers round-trip keeps the provenance — at the cost of a hidden
+  sheet a user can reveal with Sheet ▸ Unhide. Goal 3 breached.
+
+The second is a one-flag change on top of the existing writer, not a
+redesign. It is left as an opt-in rather than a default because it
+trades a stated product goal for durability against one application,
+and that is a call for whoever owns the promise, not for the harness
+that measured it.
 
 ### What this does *not* settle
 
-emb-4B measures **survival**, not the product decision. It does not by
-itself answer what zlsx promises about workbooks that pass through
-Numbers or LibreOffice; it removes the excuse that the answer had to be
-a guess. Two legs are still open (Numbers, Excel Win) and Numbers in
-particular could change the ranking — it is the tool whose rebuild is
-most aggressive.
+emb-4B measures **survival**, not the product decision. Excel for
+Windows remains unrun (`E4W`) and is the one gap left in the vector
+half of the contract.
 
 ---
 

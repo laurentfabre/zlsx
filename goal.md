@@ -68,9 +68,11 @@ archive-rebuilding consumers reachable without a GUI:
 - ⚠️ **Split** — `customXml/` survives LibreOffice, not openpyxl.
 - ✅ **Excel for Mac → 0/6 lost** (AppleScript leg, automated) — and it opens the
   six-carrier fixture with no dialog, which the parent matrix treats as a blocking bar.
-- ⛔ Numbers + Excel-Win legs still manual (AppleScript `export` against Numbers hangs
-  `-1712` on three attempts; `osascript` lacks assistive access here). Numbers is the
-  most aggressive rebuilder and could still change the ranking.
+- ❌ **Numbers 15.3 → 5/6 lost** (run 2026-07-27) — strips the OPC part, customXml,
+  docProps, defined names and extLst. **Only cell data survives.** Drive it with
+  `open -a Numbers` (the `open` Apple event hangs; LaunchServices does not) then
+  `export document 1`.
+- ⛔ Excel-Win leg still needs a licensed Windows host.
 
 > **Key finding:** a **recovery record** — model id, dim, dtype, coverage ranges,
 > content hash; ~100–200 bytes, *not* the vectors — can be carried durably through a
@@ -81,9 +83,12 @@ archive-rebuilding consumers reachable without a GUI:
 **✅ DURABILITY CONTRACT — DECIDED 2026-07-26.** The reconciliation that gated
 emb-5/emb-6 is done; §Goals.0 is amended.
 
-> **Excel-durable vectors, universally-durable evidence.** zlsx guarantees that a
-> workbook which loses its vectors **says so**. It does not guarantee every tool keeps
-> them — two of the four v1 targets provably do not.
+> **Excel-durable vectors; evidence that survives every measured consumer except Apple
+> Numbers.** zlsx guarantees that a workbook which loses its vectors **says so** — unless
+> it went through Numbers, which erases the evidence too.
+>
+> ⚠️ Corrected 2026-07-27: this read "universally-durable evidence" while the Numbers leg
+> was unrun. That claim was false and is withdrawn, not softened.
 
 Rejected **silent best-effort** on the same standard as the row/col edit contract: either
 the operation is correct or it refuses, never silently wrong. Rejected **putting vectors
@@ -102,9 +107,12 @@ assumed): LibreOffice rewrites `hidden="1"` → `hidden="true"`, XML-escapes the
 (`"x"` → `&quot;x&quot;`), and adds `function="false"` / `vbProcedure="false"`. Match on
 `name=`, never on the whole tag.
 
-**⛔ Live risk:** Numbers is the most aggressive rebuilder and is **unmeasured**. If it
-strips the record too, the contract weakens to "detectable except through Numbers" —
-survivable, but it must be said out loud. Highest-value open measurement in the arc.
+**⛔ The risk materialised.** Numbers strips both recovery carriers, so a Numbers export
+reports `absent`, not `stripped`. It cannot be engineered around: every invisible carrier
+dies there, and the only survivor — cell data — is visible by definition, because Numbers
+rebuilds from its own document model. **Open product call:** accept "invisible, not
+universal" (what ships), or add cell data as an opt-in third carrier and trade Goal 3 for
+universality. One flag on the existing writer.
 
 **✅ emb-R SHIPPED (2026-07-27).** `pkg/recovery_record.zig` + both carriers. `embeddings()`
 now returns `EmbeddingState` — `present` / `stripped` / `absent` — so a stripped workbook
