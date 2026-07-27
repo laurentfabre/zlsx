@@ -64,9 +64,9 @@ Status vocabulary is fixed by the site's pill styling — use only these:
 | E0 | Embedding compiler catch-up | done | — | E3, Z1 | Re-apply the embedding work on the current compiler after the migration. |
 | E4 | Tool survival test | done | 1-2 wk | E3 | Measure which spreadsheet apps keep the vectors when they save. |
 | E4W | Tool survival, Excel on Windows | blocked | 1 d | E4, a Windows host | The one untested app, and the one that decides whether the promise is real. |
-| E4B | Carrier survival test | partial | 1 wk | E4 | Measure which *other* hiding places survive the apps that erase the vectors. Six carriers measured against openpyxl, LibreOffice and Excel-mac; three survive both rebuilders. Numbers + Excel-Win legs still manual. |
+| E4B | Carrier survival test | done | 1 wk | E4 | Measure which *other* hiding places survive the apps that erase the vectors. All reachable legs run. Three carriers survive openpyxl + LibreOffice; **Numbers 15.3 strips 5 of 6, including both recovery carriers** — only cell data survives it. |
 | ER | Recovery record | done | 1 wk | E4B, durability decision | The ~200-byte provenance record that makes a stripped vector set detectable. Hidden `<definedName>` + `docProps/custom.xml`; `embeddings()` returns `present`/`stripped`/`absent`. Validated against LibreOffice and openpyxl. |
-| E5 | Embeddings from Python | planned | 2-3 wk | ER | Reach the vectors from Python. Unblocked: the contract is decided and `EmbeddingState` gives the binding the three states to expose. |
+| E5 | Embeddings from Python | done | 2-3 wk | ER | Reach the vectors from Python. `zlsx.embeddings(path)` → present / stripped / absent; vectors as NumPy float32, `valid_mask` for tombstones, provenance recovered on a stripped workbook. |
 | E6 | Embeddings from the command line | planned | 2-3 wk | E5 | Add, prune and strip vectors without writing code. |
 | D1 | Compute formulas | deferred | — | C1 | Deliberately out of scope. Reading and editing is the product. |
 | D2 | Author charts | deferred | — | B1 | Deferred on the same reasoning. |
@@ -94,7 +94,7 @@ graph TD
     E3 --> E0
     E0 --> E4["E4 tool survival ✅<br/>bar NOT met"]
     E4 --> E4W["E4W Excel/Windows ⛔<br/>needs a host"]
-    E4 --> E4B["E4B carrier survival ◐<br/>3 carriers survive<br/>both rebuilders"]
+    E4 --> E4B["E4B carrier survival ✅<br/>Numbers strips 5/6"]
     E4B --> DEC{{"durability contract<br/>DECIDED 2026-07-26"}}
     E4W -.->|"affects 2a only"| DEC
     DEC --> ER["ER recovery record ✅"]
@@ -118,7 +118,8 @@ product and it is done.
 **The only live arc is embeddings. It was stalled on a decision; that
 decision is made (2026-07-26) and the arc is unblocked.**
 
-> **The contract: Excel-durable vectors, universally-durable evidence.**
+> **The contract: Excel-durable vectors; evidence that survives every
+> measured consumer except Apple Numbers.**
 > zlsx guarantees that a workbook which loses its vectors *says so*. It
 > does not guarantee every tool keeps them — two of the four v1 targets
 > provably do not.
@@ -139,10 +140,21 @@ decision is made (2026-07-26) and the arc is unblocked.**
 > getting nothing. Full reasoning:
 > `docs/plans/embeddings-in-xlsx.md` §Durability contract.
 >
-> **Live risk:** Numbers is the most aggressive rebuilder and is
-> unmeasured. If it strips the record too, the contract weakens to
-> "detectable except through Numbers" — survivable, but it must be said
-> out loud. That leg is the highest-value open measurement in the arc.
+> **The risk materialised (2026-07-27).** Numbers 15.3 strips 5 of 6
+> carriers, including **both** recovery carriers. A Numbers export
+> reports `absent`, not `stripped` — vectors and evidence go together.
+> The contract holds for openpyxl and LibreOffice and is false for
+> Numbers, and that has to be said in user-facing docs.
+>
+> It cannot be engineered around: every carrier invisible to the user is
+> erased by Numbers, and the only survivor is cell data, which is
+> visible. Numbers rebuilds from its own document model, so exactly what
+> that model represents survives. Invisibility and Numbers-durability
+> are mutually exclusive by construction. Both positions therefore
+> ship: the default stays invisible (Goal 3 intact), and
+> `recovery_in_cells = true` adds the cell carrier for callers who would
+> rather have a visible sheet than a silent loss. Verified against a
+> real Numbers 15.3 export in both configurations.
 
 `E4` did its job: it measured, and the measurement was bad news. Of the
 three reachable targets, only Excel for Mac preserves the vectors on

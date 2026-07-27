@@ -1188,3 +1188,86 @@ if _HAS_CELL_ALIGNMENT:
         ctypes.POINTER(CellAlignment),
     ]
     lib.zlsx_cell_alignment.restype = ctypes.c_int32
+
+
+# ─── Embeddings (E5) ─────────────────────────────────────────────────
+
+emb_handle = ctypes.c_void_p
+
+ZLSX_EMB_ABSENT = 0
+ZLSX_EMB_PRESENT = 1
+ZLSX_EMB_STRIPPED = 2
+
+ZLSX_EMB_CARRIER_DEFINED_NAME = 0
+ZLSX_EMB_CARRIER_DOC_PROPS = 1
+ZLSX_EMB_CARRIER_CELL_DATA = 2
+
+# Feature-gated like the editor surface: a wheel built against an older
+# libzlsx must still import, with the embedding API simply absent.
+_HAS_EMB = hasattr(lib, "zlsx_emb_open")
+if _HAS_EMB:
+    lib.zlsx_emb_open.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_emb_open.restype = emb_handle
+
+    lib.zlsx_emb_close.argtypes = [emb_handle]
+    lib.zlsx_emb_close.restype = None
+
+    lib.zlsx_emb_state.argtypes = [emb_handle]
+    lib.zlsx_emb_state.restype = ctypes.c_uint32
+
+    for _name in ("zlsx_emb_model", "zlsx_emb_dtype"):
+        _fn = getattr(lib, _name)
+        _fn.argtypes = [emb_handle, ctypes.c_char_p, ctypes.c_size_t]
+        _fn.restype = ctypes.c_size_t
+
+    lib.zlsx_emb_dim.argtypes = [emb_handle]
+    lib.zlsx_emb_dim.restype = ctypes.c_uint32
+
+    lib.zlsx_emb_coverage_count.argtypes = [emb_handle]
+    lib.zlsx_emb_coverage_count.restype = ctypes.c_size_t
+
+    for _name in (
+        "zlsx_emb_coverage_id",
+        "zlsx_emb_coverage_range",
+        "zlsx_emb_coverage_sheet",
+    ):
+        _fn = getattr(lib, _name)
+        _fn.argtypes = [
+            emb_handle,
+            ctypes.c_size_t,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+        _fn.restype = ctypes.c_size_t
+
+    lib.zlsx_emb_coverage_rows.argtypes = [emb_handle, ctypes.c_size_t]
+    lib.zlsx_emb_coverage_rows.restype = ctypes.c_uint32
+
+    lib.zlsx_emb_digest.argtypes = [emb_handle]
+    lib.zlsx_emb_digest.restype = ctypes.c_uint64
+
+    lib.zlsx_emb_carrier.argtypes = [emb_handle]
+    lib.zlsx_emb_carrier.restype = ctypes.c_uint32
+
+    lib.zlsx_emb_tombstone.argtypes = []
+    lib.zlsx_emb_tombstone.restype = ctypes.c_uint64
+
+    lib.zlsx_emb_vectors.argtypes = [
+        emb_handle,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_emb_vectors.restype = ctypes.c_int32
+
+    lib.zlsx_emb_hashes.argtypes = [
+        emb_handle,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_emb_hashes.restype = ctypes.c_int32

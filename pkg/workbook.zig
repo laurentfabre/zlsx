@@ -544,6 +544,25 @@ pub const EmbeddingView = struct {
     }
 };
 
+/// Where `setEmbeddings` places the ER recovery record.
+///
+/// The default carriers (a hidden `<definedName>` and
+/// `docProps/custom.xml`) are invisible to the user but are erased by
+/// Apple Numbers. The cell carrier is the only one Numbers preserves,
+/// and it is visible under Sheet ▸ Unhide.
+///
+/// That is not a gap to engineer away. Numbers rebuilds the file from
+/// its own document model, so precisely what that model represents
+/// survives — and anything invisible to the user is outside it.
+/// **Invisibility and Numbers-durability are mutually exclusive by
+/// construction**, so this is a choice the caller makes, not one the
+/// library can make for them. Default = invisible.
+pub const RecoveryOptions = struct {
+    /// Also write the record into a hidden sheet, so it survives a
+    /// Numbers export. Costs a sheet the user can reveal.
+    recovery_in_cells: bool = false,
+};
+
 /// What `Workbook.embeddings()` found.
 ///
 /// A tagged union rather than `?EmbeddingView` on purpose. The whole
@@ -717,6 +736,7 @@ pub const Workbook = struct {
     /// the Workbook.
     recovery_cov_storage: ?[]recovery_record.RecoveredCoverage = null,
     recovery_text_storage: ?[]u8 = null,
+    recovery_opts: RecoveryOptions = .{},
 
     /// Open an .xlsx file as a typed `Workbook`.
     ///
@@ -1244,11 +1264,38 @@ pub const Workbook = struct {
         }
 
         if (joined.items.len == 0) {
-            const dp = (try self.store.part("docProps/custom.xml")) orelse return null;
-            var val_buf: [recovery_record.MAX_CHUNK * recovery_record.MAX_CHUNKS]u8 = undefined;
-            const v = recovery_record.findDocPropValue(dp.bytes, &val_buf) orelse return null;
-            try joined.appendSlice(self.allocator, v);
-            carrier = .doc_props;
+            if (try self.store.part("docProps/custom.xml")) |dp| {
+                var val_buf: [recovery_record.MAX_CHUNK * recovery_record.MAX_CHUNKS]u8 = undefined;
+                if (recovery_record.findDocPropValue(dp.bytes, &val_buf)) |v| {
+                    try joined.appendSlice(self.allocator, v);
+                    carrier = .doc_props;
+                }
+            }
+        }
+
+        // Third: the opt-in cell carrier. Scanned rather than looked up
+        // by path, because the payload lands inline in the sheet or in
+        // sharedStrings depending on the consumer, and a Numbers export
+        // renumbers the sheets besides.
+        if (joined.items.len == 0) {
+            var names: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer names.deinit(self.allocator);
+            for (self.store.parts) |p| {
+                if (std.mem.startsWith(u8, p.name, "xl/worksheets/") or
+                    std.mem.eql(u8, p.name, "xl/sharedStrings.xml"))
+                {
+                    try names.append(self.allocator, p.name);
+                }
+            }
+            for (names.items) |n| {
+                const p = (try self.store.part(n)) orelse continue;
+                var val_buf: [recovery_record.MAX_CHUNK * recovery_record.MAX_CHUNKS]u8 = undefined;
+                if (recovery_record.findRecordInText(p.bytes, &val_buf)) |v| {
+                    try joined.appendSlice(self.allocator, v);
+                    carrier = .cell_data;
+                    break;
+                }
+            }
         }
         if (joined.items.len == 0) return null;
 
@@ -1336,8 +1383,27 @@ pub const Workbook = struct {
         dtype: embedding_part.Dtype,
         inputs: []const EmbeddingCoverageInput,
     ) Error!void {
+        return self.setEmbeddingsOpts(model, dim, dtype, inputs, .{});
+    }
+
+    /// `setEmbeddings` with the durability trade-off exposed.
+    ///
+    /// The default is what `setEmbeddings` does: the recovery record
+    /// rides in carriers no user can see, and Apple Numbers erases it.
+    /// `recovery_in_cells` buys Numbers-durability at the cost of a
+    /// hidden sheet a user can reveal — the two cannot be had together
+    /// (see `RecoveryOptions`).
+    pub fn setEmbeddingsOpts(
+        self: *Workbook,
+        model: []const u8,
+        dim: u32,
+        dtype: embedding_part.Dtype,
+        inputs: []const EmbeddingCoverageInput,
+        opts: RecoveryOptions,
+    ) Error!void {
         if (inputs.len == 0) return error.InvalidEmbeddingInput;
         if (dim == 0) return error.InvalidEmbeddingInput;
+        self.recovery_opts = opts;
 
         // Pass 1: per-input semantic validation + spec assembly.
         // rId strings are owned (heap-allocated since they don't
@@ -1633,6 +1699,25 @@ pub const Workbook = struct {
         }
 
         try self.writeRecoveryDocProp(rec);
+        if (self.recovery_opts.recovery_in_cells) try self.writeRecoveryCell(rec);
+    }
+
+    /// Write the record into a hidden sheet as ordinary cell content.
+    ///
+    /// Ordinary on purpose: cell data is the only thing Numbers keeps,
+    /// precisely because it is part of the document model rather than
+    /// package furniture. Anything cleverer would be outside that model
+    /// and would not survive.
+    ///
+    /// Idempotent — a re-embed rewrites the sheet's single cell rather
+    /// than adding a second sheet.
+    fn writeRecoveryCell(self: *Workbook, rec: []const u8) Error!void {
+        if (try self.sheetByName(recovery_record.CELL_SHEET_NAME)) |ws| {
+            try ws.setCell("A1", .{ .string = rec });
+            return;
+        }
+        const ws = try self.addSheet(recovery_record.CELL_SHEET_NAME);
+        try ws.appendRows(&[_][]const zlsx.Cell{&.{.{ .string = rec }}});
     }
 
     /// Remove `_zlsxRecovery*` entries from the staged defined-name
@@ -11493,4 +11578,112 @@ test "fuzz: byte-walkers survive mutated real-world shapes" {
         // 512 iterations' worth of retained allocations.
         _ = arena.reset(.retain_capacity);
     }
+}
+
+// ─── ER: the opt-in cell carrier ────────────────────────────────────
+//
+// Numbers 15.3 strips every carrier except cell data (emb-4B,
+// 2026-07-27). These pin that the opt-in actually closes that hole,
+// and that it stays off by default — it costs a user-visible sheet, so
+// turning it on must be a decision, never a surprise.
+
+/// Strip every carrier Numbers strips, leaving only cell content.
+fn stripAllButCells(wb: *Workbook) !void {
+    try stripEmbeddingParts(wb);
+    wb.store.removePart("docProps/custom.xml") catch {};
+    const wbx = (try wb.store.part("xl/workbook.xml")) orelse return;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(wb.allocator);
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, wbx.bytes, i, "<definedName")) |open| {
+        const gt = std.mem.indexOfScalarPos(u8, wbx.bytes, open, '>') orelse break;
+        try out.appendSlice(wb.allocator, wbx.bytes[i..open]);
+        const close = std.mem.indexOfPos(u8, wbx.bytes, gt, "</definedName>") orelse break;
+        i = close + "</definedName>".len;
+    }
+    try out.appendSlice(wb.allocator, wbx.bytes[i..]);
+    try wb.store.replacePart("xl/workbook.xml", out.items);
+}
+
+test "ER cells: off by default — no recovery sheet is created" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+    try setupEmbeddedWorkbook(&wb);
+    // The default must not cost the user a visible sheet.
+    try std.testing.expect((try wb.sheetByName(recovery_record.CELL_SHEET_NAME)) == null);
+}
+
+test "ER cells: opt-in creates the recovery sheet" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+    const ws = try wb.addSheet("Items");
+    try ws.appendRows(&[_][]const zlsx.Cell{&.{.{ .string = "Alpha" }}});
+    var vec_body: [2 * (4 + 2)]u8 = @splat(0);
+    const hashes = [_]u64{ 1, 2 };
+    try wb.setEmbeddingsOpts("m1", 2, .int8_sym_per_vec, &[_]EmbeddingCoverageInput{.{
+        .id = "title",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A3",
+        .column = "A",
+        .include_formulas = false,
+        .vec_body = &vec_body,
+        .hashes = &hashes,
+    }}, .{ .recovery_in_cells = true });
+    try std.testing.expect((try wb.sheetByName(recovery_record.CELL_SHEET_NAME)) != null);
+}
+
+test "ER cells: the record survives a Numbers-shaped strip" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var wb = try Workbook.empty(std.testing.allocator, io);
+    defer wb.deinit();
+    const ws = try wb.addSheet("Items");
+    try ws.appendRows(&[_][]const zlsx.Cell{&.{.{ .string = "Alpha" }}});
+    var vec_body: [2 * (4 + 2)]u8 = @splat(0);
+    const hashes = [_]u64{ 1, 2 };
+    try wb.setEmbeddingsOpts("numbers-proof", 2, .int8_sym_per_vec, &[_]EmbeddingCoverageInput{.{
+        .id = "title",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A3",
+        .column = "A",
+        .include_formulas = false,
+        .vec_body = &vec_body,
+        .hashes = &hashes,
+    }}, .{ .recovery_in_cells = true });
+
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const file = try std.fmt.allocPrint(std.testing.allocator, "{s}/cells.xlsx", .{dir});
+    defer std.testing.allocator.free(file);
+    try wb.save(io, file);
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, file);
+    defer wb2.deinit();
+    try stripAllButCells(&wb2);
+
+    // Everything Numbers removes is gone; only cell content remains.
+    const state = try wb2.embeddings();
+    try std.testing.expect(state == .stripped);
+    try std.testing.expectEqual(recovery_record.Carrier.cell_data, state.stripped.carrier);
+    try std.testing.expectEqualStrings("numbers-proof", state.stripped.model);
+}
+
+test "ER cells: without the opt-in, a Numbers-shaped strip reports absent" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+    try setupEmbeddedWorkbook(&wb);
+    try stripAllButCells(&wb);
+    // This is the measured Numbers outcome, and the reason the opt-in
+    // exists. Pinned so the default's cost is explicit in the suite.
+    try std.testing.expect((try wb.embeddings()) == .absent);
 }

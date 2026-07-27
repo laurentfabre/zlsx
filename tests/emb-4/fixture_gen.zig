@@ -47,10 +47,16 @@ pub fn main(init: std.process.Init) !u8 {
     defer err.flush() catch {};
 
     if (args.len < 2) {
-        try err.print("usage: {s} <out.xlsx>\n", .{args[0]});
+        try err.print("usage: {s} <out.xlsx> [--cells]\n", .{args[0]});
         return 2;
     }
     const out_path = args[1];
+    // --cells turns on the opt-in cell carrier, the only one Apple
+    // Numbers preserves. Off by default, matching the library default.
+    var recovery_in_cells = false;
+    for (args[2..]) |a| {
+        if (std.mem.eql(u8, a, "--cells")) recovery_in_cells = true;
+    }
 
     var wb = try pkg.Workbook.empty(allocator, io);
     defer wb.deinit();
@@ -104,7 +110,13 @@ pub fn main(init: std.process.Init) !u8 {
             .hashes = &body_hashes,
         },
     };
-    try wb.setEmbeddings("emb-4-fixture-v1", dim, .int8_sym_per_vec, &inputs);
+    try wb.setEmbeddingsOpts(
+        "emb-4-fixture-v1",
+        dim,
+        .int8_sym_per_vec,
+        &inputs,
+        .{ .recovery_in_cells = recovery_in_cells },
+    );
 
     try wb.save(io, out_path);
 
@@ -115,8 +127,8 @@ pub fn main(init: std.process.Init) !u8 {
     const out = &stdout_w.interface;
     defer out.flush() catch {};
     try out.print(
-        "wrote emb-4 fixture: {s}\n  model=emb-4-fixture-v1 dim=4 dtype=int8-sym-per-vec coverages=title,body\n",
-        .{out_path},
+        "wrote emb-4 fixture: {s}\n  model=emb-4-fixture-v1 dim=4 dtype=int8-sym-per-vec coverages=title,body recovery_in_cells={}\n",
+        .{ out_path, recovery_in_cells },
     );
     return 0;
 }

@@ -25,6 +25,7 @@ Cell type mapping (``zlsx_cell_tag_t`` → Python):
 from __future__ import annotations
 
 import ctypes
+import os
 from pathlib import Path
 from typing import Iterator, Union
 
@@ -61,6 +62,10 @@ __all__ = [
     "ZlsxError",
     "Editor",
     "edit",
+    "Embeddings",
+    "EmbeddingsStripped",
+    "Coverage",
+    "embeddings",
 ]
 
 
@@ -2997,3 +3002,325 @@ def edit(path: Union[str, Path]) -> Editor:
     """Open an existing xlsx for append-only mutation. See
     :class:`Editor` for the full contract."""
     return Editor(path)
+
+
+# ─── Embeddings (E5) ─────────────────────────────────────────────────
+#
+# Semantic vectors stored inside the .xlsx, read back with their
+# provenance. The API's shape is dictated by a measured fact: some
+# spreadsheet applications rebuild the archive on save and delete the
+# vector parts outright. A ~200-byte recovery record survives that in
+# most of them, so a workbook which lost its vectors can still say what
+# it held.
+#
+# Hence three states, not two. `vectors()` raising on a stripped
+# workbook is deliberate — returning an empty array would recreate
+# exactly the silent-nothing this design exists to prevent.
+#
+# ── The Numbers exception (measured 2026-07-27, Numbers 15.3) ────────
+#
+# Apple Numbers erases the recovery record too. It strips 5 of the 6
+# carriers tested; the only survivor is cell data, which is visible to
+# the user and therefore not where the record lives.
+#
+# So a workbook exported from Numbers reports `absent`, NOT `stripped`.
+# It is indistinguishable from one that never had embeddings, and no
+# amount of reader-side effort recovers it. This is a property of how
+# Numbers exports — it rebuilds the file from its own document model, so
+# only what that model represents survives — not something the binding
+# can detect or work around.
+#
+# Practical consequence for callers: `absent` means "no embeddings
+# here", not "never had any". If a pipeline needs to distinguish those,
+# it has to track expectations outside the workbook.
+#
+# See docs/plans/emb-4b-carrier-matrix.md for the measurement.
+
+
+class EmbeddingsStripped(ZlsxError):
+    """Vectors were deleted by some tool; provenance survived.
+
+    Raised by :meth:`Embeddings.vectors` and :meth:`Embeddings.hashes`.
+    The workbook still knows its model, dimension, dtype and covered
+    ranges — read them off the :class:`Embeddings` object and re-embed
+    from source.
+
+    .. note::
+       This is the *recoverable* loss. Apple Numbers erases the
+       recovery record along with the vectors, so a Numbers export
+       reports ``absent`` and never raises this. See the module notes.
+    """
+
+
+@dataclass(frozen=True)
+class Coverage:
+    """One embedded range within a workbook.
+
+    ``rows`` is the vector count, available whether or not the vectors
+    themselves survived.
+    """
+
+    id: str
+    sheet: str
+    range: str
+    rows: int
+
+
+class Embeddings:
+    """Embedding set of a workbook, in one of three states.
+
+    Use as a context manager::
+
+        with zlsx.embeddings("report.xlsx") as emb:
+            if emb.present:
+                vecs = emb.vectors("title")          # (rows, dim) float32
+                live = vecs[emb.valid_mask("title")]  # drop deleted rows
+            elif emb.stripped:
+                print("stripped by a tool; was", emb.model, emb.coverages)
+            else:
+                print("no embeddings")
+
+    ``present`` / ``stripped`` / ``absent`` are mutually exclusive.
+    ``model``, ``dim``, ``dtype`` and ``coverages`` are populated for
+    both ``present`` and ``stripped`` — recovering them after a strip is
+    the entire point of the recovery record.
+
+    .. warning::
+       ``absent`` does **not** prove the workbook never had embeddings.
+       Apple Numbers strips the recovery record along with the vectors
+       (measured on 15.3), so a Numbers export is indistinguishable from
+       a workbook that never had any. Pipelines that must tell those
+       apart have to track the expectation outside the file.
+    """
+
+    __slots__ = ("_h", "_state", "_closed")
+
+    def __init__(self, path: str | os.PathLike[str]) -> None:
+        if not _ffi._HAS_EMB:
+            raise ZlsxError(
+                "libzlsx is too old for the embeddings API "
+                "(zlsx_emb_open missing); rebuild or upgrade the library"
+            )
+        err = ctypes.create_string_buffer(256)
+        h = _ffi.lib.zlsx_emb_open(str(path).encode(), err, len(err))
+        if not h:
+            raise ZlsxError(err.value.decode() or "failed to open workbook")
+        self._h = h
+        self._closed = False
+        self._state = _ffi.lib.zlsx_emb_state(h)
+
+    # ── lifecycle ────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        if not self._closed:
+            _ffi.lib.zlsx_emb_close(self._h)
+            self._closed = True
+
+    def __enter__(self) -> Embeddings:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _check(self) -> None:
+        if self._closed:
+            raise ZlsxError("Embeddings handle is closed")
+
+    # ── state ────────────────────────────────────────────────────────
+
+    @property
+    def present(self) -> bool:
+        """Vectors are available."""
+        return self._state == _ffi.ZLSX_EMB_PRESENT
+
+    @property
+    def stripped(self) -> bool:
+        """Vectors were deleted by a tool; provenance recovered."""
+        return self._state == _ffi.ZLSX_EMB_STRIPPED
+
+    @property
+    def absent(self) -> bool:
+        """No embeddings and no recovery record.
+
+        Usually means the workbook never had any — but also what a
+        Numbers export looks like, because Numbers erases the record
+        too. The two cases are not distinguishable from the file.
+        """
+        return self._state == _ffi.ZLSX_EMB_ABSENT
+
+    @property
+    def state(self) -> str:
+        return {
+            _ffi.ZLSX_EMB_PRESENT: "present",
+            _ffi.ZLSX_EMB_STRIPPED: "stripped",
+        }.get(self._state, "absent")
+
+    # ── provenance (present or stripped) ─────────────────────────────
+
+    def _str(self, fn, *args: object) -> str:
+        self._check()
+        n = fn(self._h, *args, None, 0)
+        if n == 0:
+            return ""
+        buf = ctypes.create_string_buffer(n + 1)
+        fn(self._h, *args, buf, len(buf))
+        return buf.value.decode()
+
+    @property
+    def model(self) -> str:
+        return self._str(_ffi.lib.zlsx_emb_model)
+
+    @property
+    def dim(self) -> int:
+        self._check()
+        return int(_ffi.lib.zlsx_emb_dim(self._h))
+
+    @property
+    def dtype(self) -> str:
+        return self._str(_ffi.lib.zlsx_emb_dtype)
+
+    @property
+    def coverages(self) -> list[Coverage]:
+        self._check()
+        n = _ffi.lib.zlsx_emb_coverage_count(self._h)
+        out: list[Coverage] = []
+        for i in range(n):
+            out.append(
+                Coverage(
+                    id=self._str(_ffi.lib.zlsx_emb_coverage_id, i),
+                    sheet=self._str(_ffi.lib.zlsx_emb_coverage_sheet, i),
+                    range=self._str(_ffi.lib.zlsx_emb_coverage_range, i),
+                    rows=int(_ffi.lib.zlsx_emb_coverage_rows(self._h, i)),
+                )
+            )
+        return out
+
+    # ── stripped-only ────────────────────────────────────────────────
+
+    @property
+    def digest(self) -> int | None:
+        """Content fingerprint at embed time, or ``None`` unless stripped.
+
+        Recomputable from the current cells, so an equal digest means the
+        covered content has not drifted and a re-embed reproduces the
+        same vectors.
+        """
+        self._check()
+        if not self.stripped:
+            return None
+        return int(_ffi.lib.zlsx_emb_digest(self._h))
+
+    @property
+    def carrier(self) -> str | None:
+        """Which carrier the record survived in, or ``None`` unless stripped."""
+        self._check()
+        if not self.stripped:
+            return None
+        c = _ffi.lib.zlsx_emb_carrier(self._h)
+        return {
+            _ffi.ZLSX_EMB_CARRIER_DOC_PROPS: "doc_props",
+            _ffi.ZLSX_EMB_CARRIER_CELL_DATA: "cell_data",
+        }.get(c, "defined_name")
+
+    # ── vectors (present only) ───────────────────────────────────────
+
+    def _coverage_index(self, coverage: str | int) -> tuple[int, int]:
+        covs = self.coverages
+        if isinstance(coverage, int):
+            if not 0 <= coverage < len(covs):
+                raise IndexError(f"coverage index {coverage} out of range")
+            return coverage, covs[coverage].rows
+        for i, c in enumerate(covs):
+            if c.id == coverage:
+                return i, c.rows
+        raise KeyError(f"no coverage named {coverage!r}")
+
+    def _require_present(self) -> None:
+        if self.stripped:
+            raise EmbeddingsStripped(
+                f"vectors were stripped by another tool; the workbook recorded "
+                f"model={self.model!r} dim={self.dim} dtype={self.dtype!r} "
+                f"over {len(self.coverages)} coverage(s). Re-embed from source."
+            )
+        if self.absent:
+            raise ZlsxError("this workbook has no embeddings")
+
+    def vectors(self, coverage: str | int = 0):
+        """Vectors for ``coverage`` as a ``(rows, dim)`` float32 array.
+
+        Requires NumPy. Raises :class:`EmbeddingsStripped` when the
+        vectors were deleted — the provenance is still readable off this
+        object, and an empty array would hide that.
+
+        Decoding happens in Zig: one FFI call per coverage rather than
+        per row, and each dtype's layout has exactly one implementation.
+        """
+        import numpy as np
+
+        self._check()
+        self._require_present()
+        i, rows = self._coverage_index(coverage)
+        dim = self.dim
+        out = np.empty(rows * dim, dtype=np.float32)
+        rc = _ffi.lib.zlsx_emb_vectors(
+            self._h,
+            i,
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            out.size,
+        )
+        if rc != 0:
+            raise ZlsxError(f"zlsx_emb_vectors failed (rc={rc})")
+        return out.reshape(rows, dim)
+
+    def hashes(self, coverage: str | int = 0):
+        """Per-row content hashes for ``coverage`` as a uint64 array."""
+        import numpy as np
+
+        self._check()
+        self._require_present()
+        i, rows = self._coverage_index(coverage)
+        out = np.empty(rows, dtype=np.uint64)
+        rc = _ffi.lib.zlsx_emb_hashes(
+            self._h,
+            i,
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+            out.size,
+        )
+        if rc != 0:
+            raise ZlsxError(f"zlsx_emb_hashes failed (rc={rc})")
+        return out
+
+    def valid_mask(self, coverage: str | int = 0):
+        """Boolean mask, False where the row was deleted (tombstoned).
+
+        A deleted row keeps its slot in the vector array so indices stay
+        aligned with the covered range; its hash is the tombstone
+        sentinel. Mask before using the vectors::
+
+            v = emb.vectors("title")[emb.valid_mask("title")]
+        """
+        import numpy as np
+
+        tomb = np.uint64(_ffi.lib.zlsx_emb_tombstone())
+        return self.hashes(coverage) != tomb
+
+    def __repr__(self) -> str:
+        if self._closed:
+            return "<Embeddings closed>"
+        if self.absent:
+            return "<Embeddings absent>"
+        return (
+            f"<Embeddings {self.state} model={self.model!r} dim={self.dim} "
+            f"dtype={self.dtype!r} coverages={len(self.coverages)}>"
+        )
+
+
+def embeddings(path: str | os.PathLike[str]) -> Embeddings:
+    """Open a workbook's embedding set. See :class:`Embeddings`."""
+    return Embeddings(path)

@@ -98,6 +98,17 @@ pub const MAX_CHUNKS: usize = 16;
 /// Custom document property name for the secondary carrier.
 pub const DOC_PROP_NAME: []const u8 = "ZlsxEmbeddingRecovery";
 
+/// Sheet that carries the record when the cell carrier is enabled.
+///
+/// Opt-in, because it is the one carrier a user can see: Sheet ▸ Unhide
+/// reveals it. It is also the ONLY carrier Apple Numbers preserves —
+/// measured 2026-07-27, Numbers 15.3 strips the other five. That is not
+/// an implementation gap: Numbers rebuilds the file from its own
+/// document model, so exactly what that model represents survives, and
+/// everything invisible to the user is outside it. Invisibility and
+/// Numbers-durability are mutually exclusive by construction.
+pub const CELL_SHEET_NAME: []const u8 = "zlsxRecovery";
+
 pub const RecoveredCoverage = struct {
     id: []const u8,
     worksheet_target: []const u8,
@@ -107,7 +118,7 @@ pub const RecoveredCoverage = struct {
 
 /// Which carrier a record was recovered from. Reported so a caller
 /// (and the compat matrix) can tell which survived a given consumer.
-pub const Carrier = enum { defined_name, doc_props };
+pub const Carrier = enum { defined_name, doc_props, cell_data };
 
 pub const RecoveryRecord = struct {
     model: []const u8,
@@ -451,6 +462,26 @@ fn stripQuotes(s: []const u8) []const u8 {
     return s;
 }
 
+/// Find a record anywhere in a text blob by its magic prefix.
+///
+/// Used for the cell carrier, whose payload may land inline in the
+/// sheet XML or be lifted into `sharedStrings.xml` depending on the
+/// consumer's shared-string policy — so the reader scans rather than
+/// assuming a location. The record is percent-encoded ASCII, so it
+/// terminates at the first byte that cannot appear in one.
+pub fn findRecordInText(text: []const u8, buf: []u8) ?[]const u8 {
+    const at = std.mem.indexOf(u8, text, MAGIC) orelse return null;
+    var end = at;
+    while (end < text.len) : (end += 1) {
+        const c = text[end];
+        const ok = isUnreserved(c) or c == '%' or c == '|';
+        if (!ok) break;
+    }
+    const raw = text[at..end];
+    if (raw.len > buf.len) return null;
+    return xmlUnescape(buf, raw);
+}
+
 /// Extract the record from `docProps/custom.xml` — the secondary
 /// carrier. Same normalization tolerance as the defined-name path.
 pub fn findDocPropValue(
@@ -678,4 +709,35 @@ test "a realistic two-coverage record fits in one chunk" {
     // that silently doubles the size shows up here.
     try testing.expect(enc.len <= MAX_CHUNK);
     try testing.expectEqual(@as(usize, 1), chunkCount(enc.len));
+}
+
+test "findRecordInText pulls a record out of surrounding sheet XML" {
+    const xml =
+        \\<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>zlsxER1|m|4|f32|xxh3-64|0|0000000000000000</t></is></c></row></sheetData></worksheet>
+    ;
+    var buf: [256]u8 = undefined;
+    const got = findRecordInText(xml, &buf) orelse return error.TestExpectedValue;
+    try testing.expectEqualStrings("zlsxER1|m|4|f32|xxh3-64|0|0000000000000000", got);
+}
+
+test "findRecordInText survives the shared-strings landing site" {
+    const sst =
+        \\<sst count="2"><si><t>Alpha</t></si><si><t>zlsxER1|m|4|f32|xxh3-64|0|00000000000000ff</t></si></sst>
+    ;
+    var buf: [256]u8 = undefined;
+    const got = findRecordInText(sst, &buf) orelse return error.TestExpectedValue;
+    try testing.expectEqualStrings("zlsxER1|m|4|f32|xxh3-64|0|00000000000000ff", got);
+}
+
+test "findRecordInText returns null when no record is present" {
+    var buf: [64]u8 = undefined;
+    try testing.expect(findRecordInText("<sst><si><t>Alpha</t></si></sst>", &buf) == null);
+}
+
+test "cell carrier is a distinct Carrier variant" {
+    // Guards against a future refactor collapsing it into doc_props:
+    // the compat matrices report which carrier answered, and cell_data
+    // answering means something different from the other two.
+    try testing.expect(Carrier.cell_data != Carrier.doc_props);
+    try testing.expect(Carrier.cell_data != Carrier.defined_name);
 }
