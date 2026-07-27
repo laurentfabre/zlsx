@@ -66,6 +66,11 @@ const Subcommand = enum {
     /// Cell data is untouched — this is the metadata counterpart to
     /// masking cell values.
     scrub_metadata,
+    /// emb-6a: embedding maintenance. `--strip` removes the embedding
+    /// parts *and* the recovery record, so the result reports `absent`
+    /// rather than `stripped` — the pre-share operation from the
+    /// design's Caveats. Requires `--out PATH`.
+    embed,
 };
 
 /// iter60b: `--output` wire-shape switch.
@@ -162,6 +167,9 @@ const Args = struct {
     /// sub-command. Required for `append-rows`, ignored / rejected
     /// elsewhere. Set via `--out PATH`.
     out_path: ?[]const u8 = null,
+    /// emb-6a: `embed --strip` — remove the embedding parts and the
+    /// recovery record. Rejected on every other sub-command.
+    strip: bool = false,
     /// iter-cm-4: A1-style cell ref for the `set-cell` sub-command.
     /// Set via `--ref A1`.
     cell_ref: ?[]const u8 = null,
@@ -248,6 +256,7 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
         if (std.mem.eql(u8, a, "meta")) return .meta;
         if (std.mem.eql(u8, a, "list-sheets")) return .list_sheets;
         if (std.mem.eql(u8, a, "scrub-metadata")) return .scrub_metadata;
+        if (std.mem.eql(u8, a, "embed")) return .embed;
         if (std.mem.eql(u8, a, "comments")) return .comments;
         if (std.mem.eql(u8, a, "validations")) return .validations;
         if (std.mem.eql(u8, a, "hyperlinks")) return .hyperlinks;
@@ -273,7 +282,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     // pick the wrong file path.
     const boolean_flags = [_][]const u8{
         "--list-sheets", "--header",     "--include-blanks", "--with-styles",
-        "--sst-lazy",    "--all-sheets", "--help",
+        "--sst-lazy",    "--all-sheets", "--help",           "--strip",
     };
     // Value-bearing flags. `--key=value` is split into [--key, value]
     // ONLY when key is one of these — otherwise the token is left
@@ -360,7 +369,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         .styles,
         .sst,
         => true,
-        .rows, .cells, .comments, .validations, .hyperlinks, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata => false,
+        .rows, .cells, .comments, .validations, .hyperlinks, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => false,
     };
 
     var out: Args = .{ .file = "", .subcommand = detected_sub };
@@ -425,6 +434,12 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
             out.sheet_name = argv[i];
+        } else if (std.mem.eql(u8, a, "--strip")) {
+            // emb-6a: no value. Only `embed` acts on it; anywhere else
+            // it is a typo for something, and silently ignoring it on a
+            // destructive-sounding flag would be the wrong tolerance.
+            if (out.subcommand != .embed) return ArgError.UnknownFlag;
+            out.strip = true;
         } else if (std.mem.eql(u8, a, "--all-sheets")) {
             // iter59c: no value; expands selection to every sheet.
             // On workbook-scoped sub-commands silently accept (same
@@ -539,6 +554,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
                     std.mem.eql(u8, a, "meta") or
                     std.mem.eql(u8, a, "list-sheets") or
                     std.mem.eql(u8, a, "scrub-metadata") or
+                    std.mem.eql(u8, a, "embed") or
                     std.mem.eql(u8, a, "comments") or
                     std.mem.eql(u8, a, "validations") or
                     std.mem.eql(u8, a, "hyperlinks") or
@@ -571,7 +587,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.start_row != null or out.end_row != null) {
         switch (detected_sub) {
             .rows, .cells, .comments => {},
-            .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata => {
+            .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -583,7 +599,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.range != null) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata => {
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -615,7 +631,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.include_blanks) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata => {
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -624,7 +640,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.with_styles) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata => {
+            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -699,6 +715,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         .rename_sheet,
         .delete_sheet,
         .scrub_metadata,
+        .embed,
         => {},
         else => return ArgError.BadArgValue,
     };
@@ -895,6 +912,13 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\  delete-sheet       load-modify-save: drop a sheet (cannot drop
         \\                     the last remaining sheet). Required:
         \\                     --out PATH, --sheet N.
+        \\  embed --strip      load-modify-save: remove the embedding parts
+        \\                     AND the recovery record, so the result reports
+        \\                     `absent` rather than `stripped`. The pre-share
+        \\                     operation — use it before handing a workbook to
+        \\                     someone who should not have the vectors or the
+        \\                     provenance. Required: --strip, --out PATH.
+        \\                     e.g. `zlsx embed book.xlsx --strip --out clean.xlsx`
         \\
         \\Formats (rows only)
         \\  jsonl              NDJSON row envelope (default, iter55a):
@@ -1741,6 +1765,7 @@ fn runMain(init: std.process.Init) !u8 {
         .rename_sheet => return try runRenameSheetCommand(alloc, proc_io, args, err),
         .delete_sheet => return try runDeleteSheetCommand(alloc, proc_io, args, err),
         .scrub_metadata => return try runScrubMetadataCommand(alloc, proc_io, args, err),
+        .embed => return try runEmbedCommand(alloc, proc_io, args, err),
         else => {},
     }
 
@@ -1844,6 +1869,7 @@ fn runMain(init: std.process.Init) !u8 {
         .rename_sheet,
         .delete_sheet,
         .scrub_metadata,
+        .embed,
         => unreachable,
         .rows, .cells => {},
     }
@@ -1897,6 +1923,7 @@ fn runMain(init: std.process.Init) !u8 {
         .rename_sheet,
         .delete_sheet,
         .scrub_metadata,
+        .embed,
         => unreachable,
     }
     return 0;
@@ -2948,6 +2975,53 @@ fn runScrubMetadataCommand(
 
     ed.stripDocProps(.{}) catch |e| {
         try err.print("zlsx: scrub-metadata: {s}\n", .{@errorName(e)});
+        try err.flush();
+        return 3;
+    };
+
+    ed.save(io, out_path) catch |e| {
+        try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
+        try err.flush();
+        return 5;
+    };
+    return 0;
+}
+
+/// emb-6a: `zlsx embed <file> --strip --out PATH`.
+///
+/// Removes the embedding parts and the recovery record together, so
+/// the saved workbook reports `absent` rather than `stripped`. That is
+/// the point of the operation: this is the pre-share path, and leaving
+/// recoverable provenance behind would defeat it.
+fn runEmbedCommand(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    args: Args,
+    err: *std.Io.Writer,
+) !u8 {
+    // `embed` will grow a write path (emb-6c); until then --strip is
+    // the only thing it does, so an bare `embed` is a usage error
+    // rather than a silent no-op save.
+    if (!args.strip) {
+        try err.writeAll("zlsx: embed requires --strip (the write path is not implemented yet)\n");
+        try err.flush();
+        return 2;
+    }
+    const out_path = args.out_path orelse {
+        try err.writeAll("zlsx: embed --strip requires --out PATH\n");
+        try err.flush();
+        return 2;
+    };
+
+    var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    defer ed.deinit();
+
+    ed.workbook.stripEmbeddings() catch |e| {
+        try err.print("zlsx: embed --strip: {s}\n", .{@errorName(e)});
         try err.flush();
         return 3;
     };
