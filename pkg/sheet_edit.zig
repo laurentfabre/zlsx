@@ -717,6 +717,13 @@ pub fn shiftSingleA1Col(ref: []const u8, col_1based: u32, kind: RowEditKind, buf
         },
     }
     if (new_col == old_col) {
+        // `buf` is a fixed 16 bytes; `ref` comes from an attribute and
+        // is arbitrary length. A valid column letter followed by an
+        // over-long row number — `A99999999999999999` — parses fine and
+        // then overran this copy. Refuse rather than truncate: a
+        // silently shortened reference is a wrong reference.
+        // Found by fuzzing, 2026-07-27.
+        if (ref.len > buf.len) return error.MalformedXml;
         @memcpy(buf[0..ref.len], ref);
         return buf[0..ref.len];
     }
@@ -818,7 +825,13 @@ pub fn applyRowEditToWorksheet(
 pub fn matchTagAt(src: []const u8, i: usize, tag: []const u8) ?TagOpen {
     if (i >= src.len or src[i] != '<') return null;
     const after = i + 1 + tag.len;
-    if (after > src.len) return null;
+    // `>=`, not `>`: `after == src.len` means the input ends exactly
+    // where the delimiter would be, so there is no byte to read and no
+    // way for the tag to be validly terminated. The `>` form read one
+    // past the end on inputs like `"<row"` — an OOB read reachable from
+    // any truncated or corrupt sheet part, which is attacker-controlled
+    // input on the load-modify-save path. Found by fuzzing, 2026-07-27.
+    if (after >= src.len) return null;
     if (!std.mem.eql(u8, src[i + 1 .. i + 1 + tag.len], tag)) return null;
     const c = src[after];
     if (c != ' ' and c != '\t' and c != '\n' and c != '\r' and c != '/' and c != '>') return null;
@@ -1208,6 +1221,13 @@ pub fn shiftSingleA1Row(ref: []const u8, row: u32, kind: RowEditKind, buf: *[16]
         },
     }
     if (new_row == old_row) {
+        // `buf` is a fixed 16 bytes; `ref` comes from an attribute and
+        // is arbitrary length. A valid column letter followed by an
+        // over-long row number — `A99999999999999999` — parses fine and
+        // then overran this copy. Refuse rather than truncate: a
+        // silently shortened reference is a wrong reference.
+        // Found by fuzzing, 2026-07-27.
+        if (ref.len > buf.len) return error.MalformedXml;
         @memcpy(buf[0..ref.len], ref);
         return buf[0..ref.len];
     }
@@ -1237,7 +1257,18 @@ pub fn writeWithReplacedAttr(
         return;
     };
     const val_start_in_src = attrs_full_start + pat_off + pat.len;
-    const val_end_in_src = std.mem.indexOfScalarPos(u8, src, val_start_in_src, '"') orelse {
+    // Bound the search to the tag's own extent. Searching all of `src`
+    // meant an unterminated attribute value — `<autoFilter ref="A1:E10>`
+    // — matched a quote belonging to some later element, putting
+    // `val_end_in_src` past `t.after_open` and making the final
+    // `src[val_end_in_src..t.after_open]` slice backwards: a panic, not
+    // a typed error, on input any corrupt or hand-edited sheet part can
+    // carry. Found by fuzzing, 2026-07-27.
+    const val_end_in_src = blk: {
+        const found = std.mem.indexOfScalarPos(u8, src, val_start_in_src, '"') orelse
+            break :blk null;
+        break :blk if (found < t.after_open) found else null;
+    } orelse {
         try out.appendSlice(allocator, src[t.start..t.after_open]);
         return;
     };
@@ -2148,4 +2179,150 @@ test "sortState nested in open-form autoFilter shifts on a col edit" {
     try testing.expect(std.mem.indexOf(u8, out, "<autoFilter ref=\"B1:F10\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "<sortState ref=\"C2:E10\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "<sortCondition ref=\"D2:D10\"") != null);
+}
+
+// ─── fuzz targets ───────────────────────────────────────────────────
+//
+// These walkers are ~3000 LOC of hand-rolled byte-splicing across
+// sheet/table/drawing/vml_edit, and until now none of it was fuzzed.
+// #125 is the argument for doing so: it found four coordinate-bearing
+// elements the walkers neither rewrote nor refused, one of which had
+// shipped and survived review. Those were found by reading. Fuzzing
+// covers the shapes reading does not reach — truncated tags, unclosed
+// elements, attributes that stop mid-quote, coordinates at the u32
+// boundary.
+//
+// Contract: the walker must not panic, hang, or read out of bounds on
+// ANY input. Returning a typed error is fine; producing nonsense XML
+// from nonsense input is fine. Crashing is not.
+//
+// Each input is swept across both edit kinds and a few indices rather
+// than consuming Smith entropy for them. That keeps the corpus plain
+// readable XML, and makes every entry exercise the collapse boundary
+// (delete at the index the element occupies), which is where the
+// drop-vs-shift branches live.
+
+const fuzz_indices = [_]u32{ 1, 2, 5 };
+
+fn fuzzSheetEditTarget(_: void, smith: *std.testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    // 4 KiB matches the PRNG harness's scratch bound, so a crash found
+    // here reproduces against the same input shape.
+    var smith_buf: [4096]u8 = undefined;
+    const input = smith_buf[0..smith.slice(&smith_buf)];
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for (fuzz_indices) |idx| {
+        inline for (.{ .insert, .delete }) |kind| {
+            if (applyRowEditToWorksheet(a, input, idx, kind)) |out| {
+                a.free(out);
+            } else |_| {}
+            if (applyColEditToWorksheet(a, input, idx, kind)) |out| {
+                a.free(out);
+            } else |_| {}
+        }
+    }
+}
+
+/// Corpus entries are the shapes that actually broke things, plus the
+/// truncations a hand-written test would not think to write.
+const sheet_edit_corpus = [_][]const u8{
+    "",
+    "<worksheet/>",
+    "<worksheet><sheetData/></worksheet>",
+    // The four elements #125 found unhandled.
+    "<sheetViews><sheetView topLeftCell=\"B5\"/></sheetViews>",
+    "<selection activeCell=\"B5\" sqref=\"B5 D7:E9\"/>",
+    "<sortState ref=\"A2:D10\"><sortCondition ref=\"B2:B10\"/></sortState>",
+    // Truncations: every one of these is a place the walker indexes
+    // forward after matching a tag name.
+    "<c r=",
+    "<c r=\"",
+    "<c r=\"A",
+    "<row r=\"1\"><c r=\"A1\"",
+    "<mergeCell ref=\"A1:B2",
+    "<autoFilter ref=\"A1:E10\"><filterColumn colId=\"0\"",
+    "<sortState ref=\"A1:B2\"><sortCondition",
+    "<pane xSplit=\"2\" topLeftCell=\"C1\" state=\"frozen\"",
+    "<sheetView topLeftCell=",
+    "<selection sqref=\"A1 \"",
+    "<selection sqref=\"   \"/>",
+    // Coordinate extremes — the shift helpers do bounds arithmetic.
+    "<c r=\"XFD1048576\"/>",
+    "<c r=\"A0\"/>",
+    "<row r=\"0\"/>",
+    "<row r=\"4294967296\"/>",
+    "<col min=\"0\" max=\"0\"/>",
+    "<col min=\"16384\" max=\"16384\"/>",
+    "<mergeCell ref=\"A1:A1\"/>",
+    "<dimension ref=\"A1:A1\"/>",
+    // Malformed but plausible.
+    "<c r=\"1A\"/>",
+    "<c r=\"\"/>",
+    "<c r=\"$A$1\"/>",
+    "<autoFilter ref=\"\"/>",
+    "<sortState/>",
+    "<sortCondition ref=\"\"/>",
+    "<<<<>>>>",
+    "<c<c<c<c",
+};
+
+test "matchTagAt does not read past the end on a bare truncated tag" {
+    // Regression, found by the fuzz target below within seconds of it
+    // existing. `"<row"` ends exactly where the delimiter would be:
+    // the old `after > src.len` guard let the read through.
+    try testing.expect(matchTagAt("<row", 0, "row") == null);
+    try testing.expect(matchTagAt("<c", 0, "c") == null);
+    try testing.expect(matchTagAt("<mergeCell", 0, "mergeCell") == null);
+    // Still matches when a delimiter is actually present.
+    try testing.expect(matchTagAt("<row>", 0, "row") != null);
+    try testing.expect(matchTagAt("<row />", 0, "row") != null);
+    // And still rejects a longer name that merely shares the prefix.
+    try testing.expect(matchTagAt("<rowspan>", 0, "row") == null);
+}
+
+test "unterminated attribute value does not slice backwards" {
+    // Regression. `ref="A1:E10` never closes inside the tag, but there
+    // are quotes later in the document; the unbounded search matched
+    // one of those and produced start > end. Found by the mutation
+    // stress in workbook.zig.
+    const a = testing.allocator;
+    const src =
+        \\<worksheet><autoFilter ref="A1:E10><row r="1"><c r="A1"/></row></worksheet>
+    ;
+    // Contract is "does not crash"; a typed error or passthrough are
+    // both acceptable outcomes.
+    if (applyRowEditToWorksheet(a, src, 1, .insert)) |out| a.free(out) else |_| {}
+    if (applyColEditToWorksheet(a, src, 1, .insert)) |out| a.free(out) else |_| {}
+    if (applyRowEditToWorksheet(a, src, 1, .delete)) |out| a.free(out) else |_| {}
+    if (applyColEditToWorksheet(a, src, 1, .delete)) |out| a.free(out) else |_| {}
+}
+
+test "an over-long A1 reference is refused, not truncated" {
+    // Regression. `A` parses as column 1 and the row digits are never
+    // bounded, so the ref outgrew the 16-byte scratch buffer. Silent
+    // truncation would be worse than an error: a shortened reference
+    // still looks like a valid one.
+    var buf: [16]u8 = undefined;
+    const long_ref = "A99999999999999999";
+    try testing.expect(long_ref.len > buf.len);
+    try testing.expectError(
+        error.MalformedXml,
+        shiftSingleA1Col(long_ref, 99, .insert, &buf, false),
+    );
+    var buf2: [16]u8 = undefined;
+    try testing.expectError(
+        error.MalformedXml,
+        shiftSingleA1Row(long_ref, 99, .insert, &buf2, false),
+    );
+    // A normal ref still round-trips unchanged when nothing shifts.
+    var buf3: [16]u8 = undefined;
+    try testing.expectEqualStrings("B7", try shiftSingleA1Col("B7", 99, .insert, &buf3, false));
+}
+
+test "fuzz: sheet_edit walkers never crash on adversarial XML" {
+    try std.testing.fuzz({}, fuzzSheetEditTarget, .{ .corpus = &sheet_edit_corpus });
 }

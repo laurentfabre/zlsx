@@ -758,6 +758,37 @@ pub fn build(b: *std.Build) void {
     });
     fuzz_step.dependOn(&b.addRunArtifact(package_fuzz_tests).step);
 
+    // Byte-walker fuzz modules. These four files are ~3000 LOC of
+    // hand-rolled byte-splicing over attacker-controlled XML and had no
+    // fuzz coverage at all; #125 found four unhandled coordinate
+    // elements in them by reading, and the first fuzz run found an
+    // out-of-bounds read in `matchTagAt` within seconds.
+    //
+    // They need their own modules because nothing already wired into
+    // `fuzz` reaches them: `package_fuzz_mod` is rooted at store.zig,
+    // which does not import the edit walkers. A target the fuzz step
+    // cannot reach is a target that never runs — the same trap
+    // scripts/bench_ci.sh fell into.
+    //
+    // Each is std-only or std+zlsx, so the modules stay cheap.
+    const walker_fuzz = [_]struct { name: []const u8, path: []const u8, needs_zlsx: bool }{
+        .{ .name = "sheet_edit", .path = "pkg/sheet_edit.zig", .needs_zlsx = true },
+        .{ .name = "table_edit", .path = "pkg/table_edit.zig", .needs_zlsx = true },
+        .{ .name = "drawing_edit", .path = "pkg/drawing_edit.zig", .needs_zlsx = false },
+        .{ .name = "vml_edit", .path = "pkg/vml_edit.zig", .needs_zlsx = false },
+    };
+    for (walker_fuzz) |w| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(w.path),
+            .target = target,
+            .optimize = optimize,
+            .fuzz = true,
+        });
+        if (w.needs_zlsx) mod.addImport("zlsx", zlsx_mod);
+        const t = b.addTest(.{ .root_module = mod, .test_runner = fuzz_test_runner });
+        fuzz_step.dependOn(&b.addRunArtifact(t).step);
+    }
+
     // tests/package_corpus.zig — corpus-level integration test for
     // the package layer. Imports `zlsx_pkg` and walks every fixture
     // through PartStore.open + partNames + imageAnchors +

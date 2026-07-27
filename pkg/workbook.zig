@@ -11385,3 +11385,112 @@ test "ER: digest changes when the covered content changes" {
     try stripEmbeddingParts(&wb2);
     try std.testing.expect(first != (try wb2.embeddings()).stripped.digest);
 }
+
+// ─── byte-walker mutation stress ────────────────────────────────────
+//
+// The `std.testing.fuzz` targets in sheet/table/drawing/vml_edit.zig
+// are the deep path, but coverage-guided fuzzing only works on Linux
+// x64 (Mach-O parsing bug upstream, same reason src/xlsx.zig uses a
+// PRNG harness). Without something portable, the walkers get seed-
+// corpus coverage only on the machines most development happens on.
+//
+// This mutates the seed shapes instead of generating random bytes.
+// Pure random input almost never produces something a tag-matching
+// walker will descend into, so it exercises the early-return paths and
+// little else; mutation keeps inputs XML-shaped while corrupting them
+// exactly where the walkers index forward.
+//
+// Fixed seed, so a failure reproduces. 50k iterations is free — it
+// does not move the suite's wall clock, which is dominated by
+// compilation — so the default is set well above what is needed to
+// catch a regression of any bug found so far. When hunting something
+// new, raise it: 2M has been run clean over these seeds.
+
+const walker_stress_iters: usize = 50_000;
+const walker_stress_seed: u64 = 0x5EED_B17E_0FFA_11ED;
+
+const walker_seeds = [_][]const u8{
+    "<worksheet><sheetData><row r=\"1\"><c r=\"A1\"><v>1</v></c></row></sheetData></worksheet>",
+    "<mergeCells count=\"1\"><mergeCell ref=\"A1:B2\"/></mergeCells>",
+    "<autoFilter ref=\"A1:E10\"><filterColumn colId=\"0\"/></autoFilter>",
+    "<sortState ref=\"A2:D10\"><sortCondition ref=\"B2:B10\"/></sortState>",
+    "<sheetViews><sheetView topLeftCell=\"B5\"><selection activeCell=\"B5\" sqref=\"B5 D7:E9\"/></sheetView></sheetViews>",
+    "<pane xSplit=\"2\" ySplit=\"1\" topLeftCell=\"C2\" state=\"frozen\"/>",
+    "<table id=\"1\" ref=\"A1:C5\"><tableColumns count=\"3\"><tableColumn id=\"1\" name=\"x\"/></tableColumns></table>",
+    "<xdr:twoCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:row>0</xdr:row></xdr:from></xdr:twoCellAnchor>",
+    "<v:shape><x:ClientData><x:Row>0</x:Row><x:Column>0</x:Column><x:Anchor>1, 2, 3, 4, 5, 6, 7, 8</x:Anchor></x:ClientData></v:shape>",
+    "<comments><commentList><comment ref=\"A1\" authorId=\"0\"/></commentList></comments>",
+};
+
+/// Corrupt `src` in a way that keeps it recognisable to a tag matcher.
+fn mutateWalkerInput(rng: std.Random, src: []const u8, buf: []u8) []u8 {
+    const n = @min(src.len, buf.len);
+    @memcpy(buf[0..n], src[0..n]);
+    var len = n;
+    const rounds = rng.intRangeAtMost(usize, 1, 4);
+    var r: usize = 0;
+    while (r < rounds) : (r += 1) {
+        if (len == 0) break;
+        switch (rng.intRangeLessThan(u8, 0, 4)) {
+            // Truncate — the shape that found the matchTagAt OOB.
+            0 => len = rng.intRangeAtMost(usize, 0, len),
+            // Flip a byte.
+            1 => buf[rng.intRangeLessThan(usize, 0, len)] = rng.int(u8),
+            // Splice in a structural character at a random offset.
+            2 => buf[rng.intRangeLessThan(usize, 0, len)] = "<>/\"'= ".*[rng.intRangeLessThan(usize, 0, 7)],
+            // Duplicate a span, which lengthens attribute values and
+            // pushes coordinates toward their parse limits.
+            else => {
+                const at = rng.intRangeLessThan(usize, 0, len);
+                const take = @min(rng.intRangeAtMost(usize, 1, 16), len - at);
+                if (len + take <= buf.len) {
+                    std.mem.copyBackwards(u8, buf[at + take .. len + take], buf[at..len]);
+                    len += take;
+                }
+            },
+        }
+    }
+    return buf[0..len];
+}
+
+test "fuzz: byte-walkers survive mutated real-world shapes" {
+    var prng = std.Random.DefaultPrng.init(walker_stress_seed);
+    const rng = prng.random();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [8192]u8 = undefined;
+    var i: usize = 0;
+    while (i < walker_stress_iters) : (i += 1) {
+        const seed_input = walker_seeds[rng.intRangeLessThan(usize, 0, walker_seeds.len)];
+        const input = mutateWalkerInput(rng, seed_input, &buf);
+        const idx = rng.intRangeAtMost(u32, 1, 8);
+        const kind: sheet_edit.RowEditKind = if (rng.boolean()) .insert else .delete;
+        const axis_row = rng.boolean();
+
+        const a = arena.allocator();
+        // Every walker sees every input: a shape that looks like a
+        // drawing is still valid input to the sheet walker, and the
+        // point is that none of them may crash on anything.
+        if (sheet_edit.applyRowEditToWorksheet(a, input, idx, kind)) |o| a.free(o) else |_| {}
+        if (sheet_edit.applyColEditToWorksheet(a, input, idx, kind)) |o| a.free(o) else |_| {}
+
+        const t_axis: table_edit.Axis = if (axis_row) .row else .col;
+        const t_kind: table_edit.EditKind = if (kind == .insert) .insert else .delete;
+        if (table_edit.applyEditToTable(a, input, t_axis, idx, t_kind)) |o| a.free(o) else |_| {}
+
+        const d_axis: drawing_edit.Axis = if (axis_row) .row else .col;
+        const d_kind: drawing_edit.EditKind = if (kind == .insert) .insert else .delete;
+        if (drawing_edit.applyEditToDrawing(a, input, d_axis, idx, d_kind)) |o| a.free(o) else |_| {}
+
+        const v_axis: vml_edit.Axis = if (axis_row) .row else .col;
+        const v_kind: vml_edit.EditKind = if (kind == .insert) .insert else .delete;
+        if (vml_edit.applyEditToVmlDrawing(a, input, v_axis, idx, v_kind)) |o| a.free(o) else |_| {}
+        if (vml_edit.applyEditToCommentsXml(a, input, v_axis, idx, v_kind)) |o| a.free(o) else |_| {}
+
+        // Reclaim per-iteration so a leak shows up as a bound, not as
+        // 512 iterations' worth of retained allocations.
+        _ = arena.reset(.retain_capacity);
+    }
+}
