@@ -1050,3 +1050,68 @@ test "comments: two comments rewrite + drop independently" {
     }
     try testing.expectEqual(@as(usize, 1), count);
 }
+
+// ─── fuzz targets ───────────────────────────────────────────────────
+//
+// See the note in sheet_edit.zig. VML is the odd one: `<x:Anchor>`
+// carries eight comma-separated ints of which only four are
+// coordinates, and the comments part must stay synchronised with it
+// (REL-705). Both halves are fuzzed, because a crash in either breaks
+// the pair.
+
+fn fuzzVmlEditTarget(_: void, smith: *std.testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    var smith_buf: [4096]u8 = undefined;
+    const input = smith_buf[0..smith.slice(&smith_buf)];
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for ([_]u32{ 1, 2, 5 }) |idx| {
+        inline for (.{ .row, .col }) |axis| {
+            inline for (.{ .insert, .delete }) |kind| {
+                if (applyEditToVmlDrawing(a, input, axis, idx, kind)) |out| {
+                    a.free(out);
+                } else |_| {}
+                if (applyEditToCommentsXml(a, input, axis, idx, kind)) |out| {
+                    a.free(out);
+                } else |_| {}
+            }
+        }
+    }
+}
+
+test "fuzz: vml_edit walkers never crash on adversarial input" {
+    try std.testing.fuzz({}, fuzzVmlEditTarget, .{
+        .corpus = &[_][]const u8{
+            "",
+            "<xml/>",
+            "<v:shape><x:ClientData><x:Row>0</x:Row><x:Column>0</x:Column></x:ClientData></v:shape>",
+            "<v:shape><x:ClientData><x:Anchor>1, 2, 3, 4, 5, 6, 7, 8</x:Anchor></x:ClientData></v:shape>",
+            // Anchor with the wrong arity, both directions.
+            "<x:Anchor>1, 2, 3</x:Anchor>",
+            "<x:Anchor>1,2,3,4,5,6,7,8,9,10</x:Anchor>",
+            "<x:Anchor></x:Anchor>",
+            "<x:Anchor>,,,,,,,</x:Anchor>",
+            "<x:Anchor>a, b, c, d, e, f, g, h</x:Anchor>",
+            "<x:Anchor>4294967296, 0, 0, 0, 0, 0, 0, 0</x:Anchor>",
+            "<x:Anchor>-1, -1, -1, -1, -1, -1, -1, -1</x:Anchor>",
+            // ClientData without the coordinate children.
+            "<v:shape><x:ClientData/></v:shape>",
+            "<v:shape/>",
+            // The paired comments half.
+            "<comments><commentList><comment ref=\"A1\" authorId=\"0\"/></commentList></comments>",
+            "<comment ref=\"\"/>",
+            "<comment ref=\"XFD1048576\"/>",
+            "<comment ref=\"A0\"/>",
+            "<comment ref=",
+            // Truncations.
+            "<v:shape><x:ClientData><x:Row>0",
+            "<v:shape><x:ClientData",
+            "<x:Anchor>1, 2, 3, 4, 5, 6, 7, 8",
+            "<v:",
+            "<x:",
+        },
+    });
+}

@@ -941,3 +941,61 @@ test "col insert at right edge appends synthetic tableColumn at end" {
 // REL-B524: TablePartRidIterator boundary check is exercised by the
 // editor round-trip tests (the iterator lives in workbook.zig). The
 // isolation test here is for table_edit only.
+
+// ─── fuzz target ────────────────────────────────────────────────────
+//
+// See the note in sheet_edit.zig. This walker additionally mutates
+// `<tableColumns count=>` and synthesises column entries, so it has
+// arithmetic sheet_edit does not.
+
+fn fuzzTableEditTarget(_: void, smith: *std.testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    var smith_buf: [4096]u8 = undefined;
+    const input = smith_buf[0..smith.slice(&smith_buf)];
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for ([_]u32{ 1, 2, 5 }) |idx| {
+        inline for (.{ .row, .col }) |axis| {
+            inline for (.{ .insert, .delete }) |kind| {
+                if (applyEditToTable(a, input, axis, idx, kind)) |out| {
+                    a.free(out);
+                } else |_| {}
+            }
+        }
+    }
+}
+
+test "fuzz: applyEditToTable never crashes on adversarial XML" {
+    try std.testing.fuzz({}, fuzzTableEditTarget, .{
+        .corpus = &[_][]const u8{
+            "",
+            "<table/>",
+            "<table ref=\"A1:C5\"/>",
+            "<table id=\"1\" ref=\"A1:C5\"><tableColumns count=\"3\"><tableColumn id=\"1\" name=\"x\"/></tableColumns></table>",
+            // count= disagreeing with the actual child count, both ways.
+            "<table id=\"1\" ref=\"A1:C5\"><tableColumns count=\"99\"><tableColumn id=\"1\" name=\"x\"/></tableColumns></table>",
+            "<table id=\"1\" ref=\"A1:C5\"><tableColumns count=\"0\"><tableColumn id=\"1\" name=\"x\"/></tableColumns></table>",
+            "<table id=\"1\" ref=\"A1:C5\"><tableColumns count=\"-1\"/></table>",
+            // Nested sortState / sortCondition — the #125 additions.
+            "<table id=\"1\" ref=\"A1:C5\"><sortState ref=\"A2:C5\"><sortCondition ref=\"A2:A5\"/></sortState></table>",
+            "<table id=\"1\" ref=\"A1:C5\"><autoFilter ref=\"A1:C5\"><filterColumn colId=\"0\"/></autoFilter></table>",
+            // headerRowCount drives the refusal branches.
+            "<table id=\"1\" ref=\"A1:C5\" headerRowCount=\"0\"/>",
+            "<table id=\"1\" ref=\"A1:C5\" headerRowCount=\"9\"/>",
+            "<table id=\"1\" ref=\"A1:A1\"/>",
+            // Truncations.
+            "<table id=\"1\" ref=",
+            "<table id=\"1\" ref=\"A1:C5\"><tableColumns",
+            "<table id=\"1\" ref=\"A1:C5\"><tableColumn id=",
+            "<table id=\"1\" ref=\"A1:C5\"><sortState",
+            "<table",
+            // Coordinate extremes.
+            "<table id=\"1\" ref=\"XFD1048576:XFD1048576\"/>",
+            "<table id=\"1\" ref=\"A0:A0\"/>",
+            "<table id=\"1\" ref=\"4294967295\"/>",
+        },
+    });
+}
