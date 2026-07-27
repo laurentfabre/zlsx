@@ -76,11 +76,22 @@ preservation target.
 
 ## Durability contract (decided 2026-07-26)
 
-**The promise: Excel-durable vectors, universally-durable evidence.**
+**The promise: Excel-durable vectors; evidence that survives every
+measured consumer except Apple Numbers.**
 
-> zlsx guarantees that a workbook which loses its vectors **says so**.
-> It does not guarantee that every tool keeps the vectors — two of the
+> zlsx guarantees that a workbook which loses its vectors **says so** —
+> unless it passed through Numbers, which erases the evidence too.
+> It does not guarantee that every tool keeps the vectors; two of the
 > four v1 targets provably do not.
+
+> ⚠️ **Corrected 2026-07-27.** This section originally read
+> "universally-durable evidence". That was written while the Numbers leg
+> was still unrun, and it is **false**: Numbers strips 5 of 6 carriers,
+> including both recovery-record carriers. The wording is fixed rather
+> than quietly softened, because the earlier claim shipped in #126 and
+> anyone who read it deserves to see it withdrawn. See
+> `emb-4b-carrier-matrix.md` for the measurement and the trade-off it
+> forces.
 
 This is the reconciliation §Goals.0 was blocked on. It rests on two
 measurements, not on judgement: `emb-4-compat-matrix.md` (which
@@ -203,15 +214,45 @@ The last two rows are the reason for carrying two carriers rather than
 one: each is independently sufficient, and their removal mechanisms do
 not overlap.
 
-### Known risk, stated plainly
+### The known risk materialised
 
-**Numbers is unmeasured**, and it is the most aggressive rebuilder of
-the four. If it strips defined names *and* `docProps/custom.xml`, the
-recovery record does not survive it and the contract weakens to
-"detectable except through Numbers". That would not invalidate the
-design — the carriers are declared in one place and the record is
-~200 bytes — but it would need saying out loud in the user-facing
-docs. Running that leg is the single highest-value open measurement.
+The risk recorded here was: *"if Numbers strips defined names **and**
+`docProps/custom.xml`, the contract weakens to 'detectable except
+through Numbers'."*
+
+**Measured 2026-07-27 on Numbers 15.3: it strips both.** It strips 5 of
+6 carriers — everything except cell data. A workbook exported from
+Numbers reports `absent`, not `stripped`: the vectors and the evidence
+go together, which is the exact state ER was built to prevent.
+
+The contract holds as written for openpyxl and LibreOffice. For Numbers
+it does not, and that has to be said in the user-facing docs rather
+than buried here.
+
+**Why it cannot be engineered around.** Every carrier invisible to the
+user is erased by Numbers; the only survivor is the one that is part of
+the workbook model, and therefore visible. That follows from *why*
+Numbers preserves anything: it rebuilds the file from its own document
+model, so precisely what that model represents survives. Invisibility
+and Numbers-durability are mutually exclusive here — not by
+implementation, by construction.
+
+**The escape hatch ships**, as `RecoveryOptions.recovery_in_cells`:
+
+```zig
+try wb.setEmbeddingsOpts(model, dim, dtype, inputs,
+    .{ .recovery_in_cells = true });   // survives Numbers; costs a visible sheet
+```
+
+Default off, so Goal 3 holds unless a caller deliberately trades it.
+Verified against a real Numbers 15.3 export: the default fixture comes
+back `absent`, the `--cells` fixture comes back `stripped` with
+`carrier=cell_data` and full provenance.
+
+The library does not choose for you. The default is invisible because
+that is the stated product goal; the hatch is one flag away because
+"your vectors silently vanished" is a worse outcome for some callers
+than "there is a sheet you can unhide".
 
 `E4W` (Excel for Windows) remains open for the *vector* half of the
 contract. If Excel-Win preserves like Excel-mac, "Excel-durable" is a
