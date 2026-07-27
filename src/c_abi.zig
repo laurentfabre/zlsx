@@ -4288,3 +4288,263 @@ export fn zlsx_editor_strip_doc_props(
     };
     return 0;
 }
+
+// ─── E5: embeddings ──────────────────────────────────────────────────
+//
+// A dedicated read-only handle rather than accessors hung off `Book`:
+// embeddings live on `zlsx_pkg.Workbook` (the OPC part model), while
+// `Book` is the streaming cell reader. Bolting one onto the other would
+// mean opening and holding both models for every caller who wants
+// either.
+//
+// The state split is the whole point of the surface. A consumer must be
+// able to tell "vectors here" from "vectors were stripped by some tool,
+// and here is what they were" from "never had any" — see
+// docs/plans/embeddings-in-xlsx.md §Durability contract.
+
+/// Opaque embeddings handle. Created by `zlsx_emb_open`, freed by
+/// `zlsx_emb_close`.
+pub const Emb = extern struct { _opaque: u8 };
+
+pub const ZLSX_EMB_ABSENT: u32 = 0;
+pub const ZLSX_EMB_PRESENT: u32 = 1;
+pub const ZLSX_EMB_STRIPPED: u32 = 2;
+
+pub const ZLSX_EMB_CARRIER_DEFINED_NAME: u32 = 0;
+pub const ZLSX_EMB_CARRIER_DOC_PROPS: u32 = 1;
+/// Opt-in carrier: the only one Apple Numbers preserves.
+pub const ZLSX_EMB_CARRIER_CELL_DATA: u32 = 2;
+
+const EmbState = struct {
+    inner: zlsx_pkg.Workbook,
+    threaded: std.Io.Threaded,
+    /// Snapshot taken at open. Held rather than re-queried per call so
+    /// every accessor sees one consistent answer, and so a caller
+    /// cannot observe the state change under it.
+    state: zlsx_pkg.EmbeddingState,
+};
+
+/// Open an .xlsx and resolve its embedding state. Returns NULL on an
+/// I/O or parse failure; an absent or stripped embedding set is a
+/// successful open, reported through `zlsx_emb_state`.
+export fn zlsx_emb_open(
+    path_ptr: [*:0]const u8,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) ?*Emb {
+    const path = std.mem.span(path_ptr);
+    const st = gpa.create(EmbState) catch {
+        writeError(err_buf, err_buf_len, "OutOfMemory");
+        return null;
+    };
+    st.threaded = .init(gpa, .{});
+    st.inner = zlsx_pkg.Workbook.open(gpa, st.threaded.io(), path) catch |e| {
+        st.threaded.deinit();
+        gpa.destroy(st);
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return null;
+    };
+    st.state = st.inner.embeddings() catch |e| {
+        st.inner.deinit();
+        st.threaded.deinit();
+        gpa.destroy(st);
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return null;
+    };
+    return @ptrCast(st);
+}
+
+export fn zlsx_emb_close(h: ?*Emb) callconv(.c) void {
+    if (h) |p| {
+        const st: *EmbState = @ptrCast(@alignCast(p));
+        st.inner.deinit();
+        st.threaded.deinit();
+        gpa.destroy(st);
+    }
+}
+
+export fn zlsx_emb_state(h: *Emb) callconv(.c) u32 {
+    const st: *EmbState = @ptrCast(@alignCast(h));
+    return switch (st.state) {
+        .absent => ZLSX_EMB_ABSENT,
+        .present => ZLSX_EMB_PRESENT,
+        .stripped => ZLSX_EMB_STRIPPED,
+    };
+}
+
+fn copyOut(s: []const u8, out_buf: [*]u8, out_buf_len: usize) usize {
+    if (out_buf_len == 0) return s.len;
+    const n = @min(s.len, out_buf_len - 1);
+    @memcpy(out_buf[0..n], s[0..n]);
+    out_buf[n] = 0;
+    return s.len;
+}
+
+/// Model provenance. Available for PRESENT *and* STRIPPED — recovering
+/// it after a strip is the entire reason the ER record exists.
+export fn zlsx_emb_model(h: *Emb, out_buf: [*]u8, out_buf_len: usize) callconv(.c) usize {
+    const st: *EmbState = @ptrCast(@alignCast(h));
+    return switch (st.state) {
+        .present => |v| copyOut(v.index.model, out_buf, out_buf_len),
+        .stripped => |r| copyOut(r.model, out_buf, out_buf_len),
+        .absent => 0,
+    };
+}
+
+export fn zlsx_emb_dim(h: *Emb) callconv(.c) u32 {
+    const st: *EmbState = @ptrCast(@alignCast(h));
+    return switch (st.state) {
+        .present => |v| v.index.dim,
+        .stripped => |r| r.dim,
+        .absent => 0,
+    };
+}
+
+export fn zlsx_emb_dtype(h: *Emb, out_buf: [*]u8, out_buf_len: usize) callconv(.c) usize {
+    const st: *EmbState = @ptrCast(@alignCast(h));
+    return switch (st.state) {
+        .present => |v| copyOut(v.index.dtype.string(), out_buf, out_buf_len),
+        .stripped => |r| copyOut(r.dtype, out_buf, out_buf_len),
+        .absent => 0,
+    };
+}
+
+export fn zlsx_emb_coverage_count(h: *Emb) callconv(.c) usize {
+    const st: *EmbState = @ptrCast(@alignCast(h));
+    return switch (st.state) {
+        .present => |v| v.coverages.len,
+        .stripped => |r| r.coverages.len,
+        .absent => 0,
+    };
+}
+
+export fn zlsx_emb_coverage_id(h: *Emb, i: usize, out_buf: [*]u8, out_buf_len: usize) callconv(.c) usize {
+    const st: *EmbState = @ptrCast(@alignCast(h));
+    return switch (st.state) {
+        .present => |v| if (i < v.coverages.len)
+            copyOut(v.coverages[i].coverage.id, out_buf, out_buf_len)
+        else
+            0,
+        .stripped => |r| if (i < r.coverages.len)
+            copyOut(r.coverages[i].id, out_buf, out_buf_len)
+        else
+            0,
+        .absent => 0,
+    };
+}
+
+export fn zlsx_emb_coverage_range(h: *Emb, i: usize, out_buf: [*]u8, out_buf_len: usize) callconv(.c) usize {
+    const st: *EmbState = @ptrCast(@alignCast(h));
+    return switch (st.state) {
+        .present => |v| if (i < v.coverages.len)
+            copyOut(v.coverages[i].coverage.range, out_buf, out_buf_len)
+        else
+            0,
+        .stripped => |r| if (i < r.coverages.len)
+            copyOut(r.coverages[i].range, out_buf, out_buf_len)
+        else
+            0,
+        .absent => 0,
+    };
+}
+
+export fn zlsx_emb_coverage_sheet(h: *Emb, i: usize, out_buf: [*]u8, out_buf_len: usize) callconv(.c) usize {
+    const st: *EmbState = @ptrCast(@alignCast(h));
+    return switch (st.state) {
+        .present => |v| if (i < v.coverages.len)
+            copyOut(v.coverages[i].coverage.worksheet_target, out_buf, out_buf_len)
+        else
+            0,
+        .stripped => |r| if (i < r.coverages.len)
+            copyOut(r.coverages[i].worksheet_target, out_buf, out_buf_len)
+        else
+            0,
+        .absent => 0,
+    };
+}
+
+/// Row count for coverage `i` — the number of vectors, present or
+/// stripped. Sizes the caller's output buffers.
+export fn zlsx_emb_coverage_rows(h: *Emb, i: usize) callconv(.c) u32 {
+    const st: *EmbState = @ptrCast(@alignCast(h));
+    return switch (st.state) {
+        .present => |v| if (i < v.coverages.len) v.coverages[i].vec.header.count else 0,
+        .stripped => |r| if (i < r.coverages.len) r.coverages[i].count else 0,
+        .absent => 0,
+    };
+}
+
+/// Content fingerprint recorded at embed time. STRIPPED only; 0
+/// otherwise. Recomputable from the current cells, so equal means the
+/// covered content has not drifted and a re-embed reproduces the same
+/// vectors.
+export fn zlsx_emb_digest(h: *Emb) callconv(.c) u64 {
+    const st: *EmbState = @ptrCast(@alignCast(h));
+    return switch (st.state) {
+        .stripped => |r| r.digest,
+        else => 0,
+    };
+}
+
+/// Which carrier the recovery record came from. STRIPPED only.
+export fn zlsx_emb_carrier(h: *Emb) callconv(.c) u32 {
+    const st: *EmbState = @ptrCast(@alignCast(h));
+    return switch (st.state) {
+        .stripped => |r| switch (r.carrier) {
+            .defined_name => ZLSX_EMB_CARRIER_DEFINED_NAME,
+            .doc_props => ZLSX_EMB_CARRIER_DOC_PROPS,
+            .cell_data => ZLSX_EMB_CARRIER_CELL_DATA,
+        },
+        else => 0,
+    };
+}
+
+/// The hash value that marks a deleted row. Exposed rather than left
+/// for the binding to hard-code, so the tombstone contract has one
+/// definition.
+export fn zlsx_emb_tombstone() callconv(.c) u64 {
+    return zlsx_pkg.embedding_part.TOMBSTONE_HASH;
+}
+
+/// Decode coverage `i`'s vectors into `out` as f32, row-major
+/// `[rows][dim]`. `out_len` must be exactly `rows * dim`.
+///
+/// One call per coverage: a 500-row × 1536-dim coverage would otherwise
+/// be 500 FFI crossings, and the dtype layout stays on this side rather
+/// than being reimplemented in every binding.
+///
+/// Returns 0 on success, -1 on a bad index or size, -2 when the state
+/// is not PRESENT (a stripped coverage has provenance but no vectors —
+/// the distinction the caller must not paper over).
+export fn zlsx_emb_vectors(h: *Emb, i: usize, out: [*]f32, out_len: usize) callconv(.c) i32 {
+    const st: *EmbState = @ptrCast(@alignCast(h));
+    const v = switch (st.state) {
+        .present => |x| x,
+        else => return -2,
+    };
+    if (i >= v.coverages.len) return -1;
+    zlsx_pkg.embedding_part.decodeAllF32(v.coverages[i].vec, out[0..out_len]) catch return -1;
+    return 0;
+}
+
+/// Copy coverage `i`'s per-row content hashes into `out`. `out_len`
+/// must be exactly `rows`. Same return convention as
+/// `zlsx_emb_vectors`.
+///
+/// A row whose hash equals `zlsx_emb_tombstone()` was deleted; that is
+/// what a binding turns into a validity mask.
+export fn zlsx_emb_hashes(h: *Emb, i: usize, out: [*]u64, out_len: usize) callconv(.c) i32 {
+    const st: *EmbState = @ptrCast(@alignCast(h));
+    const v = switch (st.state) {
+        .present => |x| x,
+        else => return -2,
+    };
+    if (i >= v.coverages.len) return -1;
+    const hp = v.coverages[i].hashes;
+    if (out_len != hp.header.count) return -1;
+    var k: usize = 0;
+    while (k < out_len) : (k += 1) {
+        out[k] = hp.value(@intCast(k)) catch return -1;
+    }
+    return 0;
+}

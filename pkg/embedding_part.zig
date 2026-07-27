@@ -961,6 +961,56 @@ pub fn dequantizeI8Asym(values: []const i8, scale: f32, zero: i8, out: []f32) vo
     }
 }
 
+/// Decode an entire coverage's `vec.bin` body into `out` as f32,
+/// row-major `[count][dim]`.
+///
+/// One call per coverage rather than per row: FFI consumers pay
+/// per-call dispatch, and a 500-row × 1536-dim coverage is 500 crossings
+/// the caller does not need to make. It also keeps every dtype's layout
+/// knowledge here — a binding that dequantized on its own side would be
+/// a second implementation to keep in step with `recordBytes`.
+///
+/// `out.len` must be exactly `count * dim`.
+pub fn decodeAllF32(vec: ParsedVecPart, out: []f32) Error!void {
+    const dim: usize = vec.header.dim;
+    const count: usize = vec.header.count;
+    if (out.len != count * dim) return Error.InvalidRange;
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const rec = try vec.record(@intCast(i));
+        const dst = out[i * dim ..][0..dim];
+        switch (vec.header.dtype) {
+            .f32 => {
+                for (dst, 0..) |*v, j| {
+                    v.* = @bitCast(std.mem.readInt(u32, rec[j * 4 ..][0..4], .little));
+                }
+            },
+            .binary16 => {
+                for (dst, 0..) |*v, j| {
+                    v.* = binary16ToF32(std.mem.readInt(u16, rec[j * 2 ..][0..2], .little));
+                }
+            },
+            .bfloat16 => {
+                for (dst, 0..) |*v, j| {
+                    v.* = bfloat16ToF32(std.mem.readInt(u16, rec[j * 2 ..][0..2], .little));
+                }
+            },
+            .int8_sym_per_vec => {
+                const scale: f32 = @bitCast(std.mem.readInt(u32, rec[0..4], .little));
+                const q: []const i8 = @ptrCast(rec[4..]);
+                dequantizeI8Sym(q, scale, dst);
+            },
+            .int8_asym_per_vec => {
+                const scale: f32 = @bitCast(std.mem.readInt(u32, rec[0..4], .little));
+                const zero: i8 = @bitCast(rec[4]);
+                const q: []const i8 = @ptrCast(rec[5..]);
+                dequantizeI8Asym(q, scale, zero, dst);
+            },
+        }
+    }
+}
+
 // ---------------------------------------------------------------
 // Number canonicalization (Ryu shortest-round-trip)
 // ---------------------------------------------------------------
@@ -2065,4 +2115,57 @@ test "encodeIndexRelsXml: round-trips through parseIndexRelationships" {
     try testing.expectEqual(TargetMode.internal, parsed[0].target_mode);
     try testing.expectEqualStrings("rId2", parsed[1].id);
     try testing.expectEqualStrings("title/hashes.bin", parsed[1].target);
+}
+
+test "decodeAllF32 round-trips int8-sym across every row" {
+    // Two rows, dim 3, distinct scales so a row-indexing bug shows up
+    // as a magnitude error rather than a subtle sign flip.
+    const dim: u32 = 3;
+    var body: [2 * (4 + 3)]u8 = undefined;
+    std.mem.writeInt(u32, body[0..4], @bitCast(@as(f32, 1.27)), .little);
+    body[4] = @bitCast(@as(i8, 127));
+    body[5] = @bitCast(@as(i8, -127));
+    body[6] = @bitCast(@as(i8, 0));
+    std.mem.writeInt(u32, body[7..11], @bitCast(@as(f32, 2.54)), .little);
+    body[11] = @bitCast(@as(i8, 127));
+    body[12] = @bitCast(@as(i8, 0));
+    body[13] = @bitCast(@as(i8, -127));
+
+    const vec: ParsedVecPart = .{
+        .header = .{ .version = 1, .dtype = .int8_sym_per_vec, .dim = dim, .count = 2 },
+        .body = &body,
+    };
+    var out: [6]f32 = undefined;
+    try decodeAllF32(vec, &out);
+
+    try testing.expectApproxEqAbs(@as(f32, 1.27), out[0], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, -1.27), out[1], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), out[2], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 2.54), out[3], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), out[4], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, -2.54), out[5], 0.001);
+}
+
+test "decodeAllF32 handles plain f32 bodies" {
+    const dim: u32 = 2;
+    var body: [2 * 2 * 4]u8 = undefined;
+    const vals = [_]f32{ 1.5, -2.25, 0.0, 3.75 };
+    for (vals, 0..) |v, i| std.mem.writeInt(u32, body[i * 4 ..][0..4], @bitCast(v), .little);
+    const vec: ParsedVecPart = .{
+        .header = .{ .version = 1, .dtype = .f32, .dim = dim, .count = 2 },
+        .body = &body,
+    };
+    var out: [4]f32 = undefined;
+    try decodeAllF32(vec, &out);
+    for (vals, out) |want, got| try testing.expectEqual(want, got);
+}
+
+test "decodeAllF32 rejects a mis-sized output buffer" {
+    var body: [4 + 2]u8 = @splat(0);
+    const vec: ParsedVecPart = .{
+        .header = .{ .version = 1, .dtype = .int8_sym_per_vec, .dim = 2, .count = 1 },
+        .body = &body,
+    };
+    var too_small: [1]f32 = undefined;
+    try testing.expectError(Error.InvalidRange, decodeAllF32(vec, &too_small));
 }
