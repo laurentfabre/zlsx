@@ -170,6 +170,9 @@ const Args = struct {
     /// emb-6a: `embed --strip` — remove the embedding parts and the
     /// recovery record. Rejected on every other sub-command.
     strip: bool = false,
+    /// emb-6b: `embed --prune` — tombstone slots whose row is no longer
+    /// embeddable. Rejected on every other sub-command.
+    prune: bool = false,
     /// iter-cm-4: A1-style cell ref for the `set-cell` sub-command.
     /// Set via `--ref A1`.
     cell_ref: ?[]const u8 = null,
@@ -283,6 +286,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     const boolean_flags = [_][]const u8{
         "--list-sheets", "--header",     "--include-blanks", "--with-styles",
         "--sst-lazy",    "--all-sheets", "--help",           "--strip",
+        "--prune",
     };
     // Value-bearing flags. `--key=value` is split into [--key, value]
     // ONLY when key is one of these — otherwise the token is left
@@ -440,6 +444,9 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
             // destructive-sounding flag would be the wrong tolerance.
             if (out.subcommand != .embed) return ArgError.UnknownFlag;
             out.strip = true;
+        } else if (std.mem.eql(u8, a, "--prune")) {
+            if (out.subcommand != .embed) return ArgError.UnknownFlag;
+            out.prune = true;
         } else if (std.mem.eql(u8, a, "--all-sheets")) {
             // iter59c: no value; expands selection to every sheet.
             // On workbook-scoped sub-commands silently accept (same
@@ -919,6 +926,16 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                     someone who should not have the vectors or the
         \\                     provenance. Required: --strip, --out PATH.
         \\                     e.g. `zlsx embed book.xlsx --strip --out clean.xlsx`
+        \\  embed --prune      load-modify-save: tombstone every slot whose
+        \\                     row is no longer embeddable and zero its
+        \\                     vector — the redaction sweep. A row deleted
+        \\                     in plain Excel leaves its vector on disk;
+        \\                     this removes it. Content that merely changed
+        \\                     is reported stale, NOT redacted. Emits one
+        \\                     NDJSON summary on stdout. `count` and the
+        \\                     coverage range never move. Required:
+        \\                     --prune, --out PATH. Mutually exclusive
+        \\                     with --strip.
         \\
         \\Formats (rows only)
         \\  jsonl              NDJSON row envelope (default, iter55a):
@@ -1765,7 +1782,7 @@ fn runMain(init: std.process.Init) !u8 {
         .rename_sheet => return try runRenameSheetCommand(alloc, proc_io, args, err),
         .delete_sheet => return try runDeleteSheetCommand(alloc, proc_io, args, err),
         .scrub_metadata => return try runScrubMetadataCommand(alloc, proc_io, args, err),
-        .embed => return try runEmbedCommand(alloc, proc_io, args, err),
+        .embed => return try runEmbedCommand(alloc, proc_io, args, out, err),
         else => {},
     }
 
@@ -2997,18 +3014,27 @@ fn runEmbedCommand(
     alloc: std.mem.Allocator,
     io: std.Io,
     args: Args,
+    out: *std.Io.Writer,
     err: *std.Io.Writer,
 ) !u8 {
-    // `embed` will grow a write path (emb-6c); until then --strip is
-    // the only thing it does, so an bare `embed` is a usage error
-    // rather than a silent no-op save.
-    if (!args.strip) {
-        try err.writeAll("zlsx: embed requires --strip (the write path is not implemented yet)\n");
+    // `embed` will grow a write path (emb-6c); until then --strip and
+    // --prune are the only things it does, so a bare `embed` is a usage
+    // error rather than a silent no-op save.
+    if (!args.strip and !args.prune) {
+        try err.writeAll("zlsx: embed requires --strip or --prune (the write path is not implemented yet)\n");
         try err.flush();
         return 2;
     }
+    // --strip removes everything --prune would carefully preserve.
+    // Asking for both is a contradiction, not a refinement.
+    if (args.strip and args.prune) {
+        try err.writeAll("zlsx: embed --strip and --prune are mutually exclusive\n");
+        try err.flush();
+        return 2;
+    }
+    const mode: []const u8 = if (args.strip) "--strip" else "--prune";
     const out_path = args.out_path orelse {
-        try err.writeAll("zlsx: embed --strip requires --out PATH\n");
+        try err.print("zlsx: embed {s} requires --out PATH\n", .{mode});
         try err.flush();
         return 2;
     };
@@ -3020,11 +3046,28 @@ fn runEmbedCommand(
     };
     defer ed.deinit();
 
-    ed.workbook.stripEmbeddings() catch |e| {
-        try err.print("zlsx: embed --strip: {s}\n", .{@errorName(e)});
-        try err.flush();
-        return 3;
-    };
+    if (args.strip) {
+        ed.workbook.stripEmbeddings() catch |e| {
+            try err.print("zlsx: embed --strip: {s}\n", .{@errorName(e)});
+            try err.flush();
+            return 3;
+        };
+    } else {
+        const report = ed.workbook.pruneEmbeddings() catch |e| {
+            try err.print("zlsx: embed --prune: {s}\n", .{@errorName(e)});
+            try err.flush();
+            return 3;
+        };
+        // Prune's result is the point of running it — how many vectors
+        // outlived their text. Reported on stdout in the same NDJSON
+        // envelope the reader sub-commands use, so it composes with jq
+        // rather than needing to be scraped from a log line.
+        try out.print(
+            "{{\"kind\":\"prune\",\"redacted\":{d},\"stale\":{d},\"fresh\":{d},\"valid_empty\":{d}}}\n",
+            .{ report.redacted, report.stale, report.fresh, report.valid_empty },
+        );
+        try out.flush();
+    }
 
     ed.save(io, out_path) catch |e| {
         try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });

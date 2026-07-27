@@ -544,6 +544,46 @@ pub const EmbeddingView = struct {
     }
 };
 
+/// One covered slot's standing against current cell content.
+///
+/// The four cases are the design's Recompute contract verbatim
+/// (`docs/plans/embeddings-in-xlsx.md` §Tombstone contract). Named
+/// states rather than a bool because "stale" and "no longer embeddable"
+/// call for different actions: the first is a re-embed the caller may
+/// or may not want, the second is a redaction `--prune` performs.
+pub const SlotState = enum {
+    /// Stored hash matches the current cell. Nothing to do.
+    fresh,
+    /// Content moved on, or a tombstoned row became embeddable again.
+    /// The vector no longer describes the cell; re-embed to fix. NOT
+    /// redacted — there is still content here, so this is drift, not an
+    /// orphan.
+    stale,
+    /// Was embedded, is no longer embeddable — the row was deleted or
+    /// blanked in a plain-Excel edit. This is the redaction case: the
+    /// vector outlived the text it came from.
+    stale_needs_tombstone,
+    /// Tombstone that is still correct — nothing embeddable there.
+    valid_empty,
+};
+
+/// What `pruneEmbeddings` did, and what it deliberately left alone.
+pub const PruneReport = struct {
+    /// Slots turned into tombstones this call.
+    redacted: usize = 0,
+    /// Content drifted but is still embeddable — left as-is. Surfaced
+    /// rather than silently redacted: deleting a vector because its
+    /// text was *edited* would lose data the caller never asked to
+    /// lose.
+    stale: usize = 0,
+    fresh: usize = 0,
+    valid_empty: usize = 0,
+
+    pub fn total(self: PruneReport) usize {
+        return self.redacted + self.stale + self.fresh + self.valid_empty;
+    }
+};
+
 /// Where `setEmbeddings` places the ER recovery record.
 ///
 /// The default carriers (a hidden `<definedName>` and
@@ -605,6 +645,38 @@ fn resolveEmbeddingRelTarget(
         if (std.mem.eql(u8, r.id, rid)) return r.target;
     }
     return null;
+}
+
+/// Tombstone slot `slot` in place: `u64::MAX` in hashes.bin, zeroes
+/// over the vec.bin record.
+///
+/// Both parts keep their length and their headers — `count` is
+/// unchanged, because the format is dense and slot `i` must keep
+/// meaning row `first_row + i`.
+///
+/// The vector bytes are zeroed rather than merely unreferenced: the
+/// point of a redaction is that the numbers describing deleted text
+/// stop existing on disk, not that a flag says to ignore them.
+fn redactSlot(
+    vec: []u8,
+    hashes: []u8,
+    slot: u32,
+    dim: u32,
+    dtype: embedding_part.Dtype,
+) Error!void {
+    const rec_len = dtype.recordBytes(dim);
+    const vec_start = embedding_part.VEC_HEADER_BYTES + @as(usize, slot) * rec_len;
+    if (vec_start + rec_len > vec.len) return error.InvalidEmbeddingInput;
+    @memset(vec[vec_start .. vec_start + rec_len], 0);
+
+    const hash_start = embedding_part.HASH_HEADER_BYTES + @as(usize, slot) * @sizeOf(u64);
+    if (hash_start + @sizeOf(u64) > hashes.len) return error.InvalidEmbeddingInput;
+    std.mem.writeInt(
+        u64,
+        hashes[hash_start..][0..8],
+        embedding_part.TOMBSTONE_HASH,
+        .little,
+    );
 }
 
 /// `<coverage id>` charset + length rules per the spec: required,
@@ -1651,6 +1723,251 @@ pub const Workbook = struct {
         try self.removeRecoveryDocProp();
         try self.removeRecoveryCellSheet();
 
+        self.invalidateEmbeddingCache();
+    }
+
+    /// Run the redaction sweep: tombstone every slot whose row is no
+    /// longer embeddable, and zero the vector that described it.
+    ///
+    /// This is the `--prune` half of the design's redaction policy
+    /// (§Caveats). A row deleted or blanked in plain Excel leaves its
+    /// vector behind on disk — recoverable, and describing text the
+    /// user believes they removed. The hash column is what detects it:
+    /// the stored hash no longer matches anything embeddable at that
+    /// row.
+    ///
+    /// `count` and `@range` do NOT change. The format is dense — slot
+    /// `i` is row `first_row + i`, always — so compacting would
+    /// silently re-point every later slot at the wrong row. A redacted
+    /// slot stays in place as a tombstone.
+    ///
+    /// Content that merely *drifted* is reported, not redacted; see
+    /// `PruneReport.stale`.
+    pub fn pruneEmbeddings(self: *Workbook) Error!PruneReport {
+        const view = (try self.embeddings()).viewOrNull() orelse return .{};
+        const dim = view.index.dim;
+
+        // Resolve rid→target again rather than reaching into the cached
+        // view: the write below needs part *names*, which the view does
+        // not carry.
+        const rels_part = (try self.store.part(embedding_part.INDEX_RELS_PART_NAME)) orelse
+            return error.MissingEmbeddingPart;
+        var rels_buf: [64]embedding_part.IndexRelationship = undefined;
+        const rels = embedding_part.parseIndexRelationships(rels_part.bytes, &rels_buf) catch
+            return error.MissingEmbeddingPart;
+
+        var report: PruneReport = .{};
+        var scratch: std.ArrayListUnmanaged(u8) = .empty;
+        defer scratch.deinit(self.allocator);
+
+        // Patched bytes are staged per coverage and written before
+        // moving on, but the cache is only invalidated at the end —
+        // `view` borrows into the old part bytes and must stay valid
+        // for the whole walk.
+        var pending: std.ArrayListUnmanaged(struct { name: []const u8, bytes: []u8 }) = .empty;
+        defer {
+            for (pending.items) |p| {
+                self.allocator.free(p.name);
+                self.allocator.free(p.bytes);
+            }
+            pending.deinit(self.allocator);
+        }
+
+        for (view.coverages) |cv| {
+            const cov = cv.coverage;
+            const ws = (try self.worksheetForTarget(cov.worksheet_target)) orelse continue;
+
+            const vec_name = try self.embeddingPartName(rels, cov.vec_rid);
+            defer self.allocator.free(vec_name);
+            const hash_name = try self.embeddingPartName(rels, cov.hash_rid);
+            defer self.allocator.free(hash_name);
+
+            const vec_src = ((try self.store.part(vec_name)) orelse
+                return error.MissingEmbeddingPart).bytes;
+            const hash_src = ((try self.store.part(hash_name)) orelse
+                return error.MissingEmbeddingPart).bytes;
+
+            // Copied lazily: a coverage with nothing to redact must not
+            // rewrite its parts at all, so an unchanged workbook stays
+            // byte-identical.
+            var new_vec: ?[]u8 = null;
+            var new_hash: ?[]u8 = null;
+            errdefer {
+                if (new_vec) |b| self.allocator.free(b);
+                if (new_hash) |b| self.allocator.free(b);
+            }
+
+            var slot: u32 = 0;
+            while (slot < cov.count) : (slot += 1) {
+                const row = cov.parsed_range.first.row + slot;
+                const stored = try cv.hashes.value(slot);
+                const state = try self.classifySlot(ws, cov, row, stored, &scratch);
+                switch (state) {
+                    .fresh => report.fresh += 1,
+                    .stale => report.stale += 1,
+                    .valid_empty => report.valid_empty += 1,
+                    .stale_needs_tombstone => {
+                        report.redacted += 1;
+                        if (new_vec == null) new_vec = try self.allocator.dupe(u8, vec_src);
+                        if (new_hash == null) new_hash = try self.allocator.dupe(u8, hash_src);
+                        try redactSlot(new_vec.?, new_hash.?, slot, dim, cv.vec.header.dtype);
+                    },
+                }
+            }
+
+            if (new_vec) |b| {
+                const owned = try self.allocator.dupe(u8, vec_name);
+                errdefer self.allocator.free(owned);
+                try pending.append(self.allocator, .{ .name = owned, .bytes = b });
+                new_vec = null;
+            }
+            if (new_hash) |b| {
+                const owned = try self.allocator.dupe(u8, hash_name);
+                errdefer self.allocator.free(owned);
+                try pending.append(self.allocator, .{ .name = owned, .bytes = b });
+                new_hash = null;
+            }
+        }
+
+        for (pending.items) |p| try self.store.replacePart(p.name, p.bytes);
+        if (report.redacted > 0) self.invalidateEmbeddingCache();
+        return report;
+    }
+
+    /// Allocator-owned full part name for a coverage's rId.
+    fn embeddingPartName(
+        self: *Workbook,
+        rels: []const embedding_part.IndexRelationship,
+        rid: []const u8,
+    ) Error![]const u8 {
+        const target = resolveEmbeddingRelTarget(rels, rid) orelse
+            return error.MissingEmbeddingPart;
+        return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{
+            embedding_part.EMBEDDINGS_DIR, target,
+        }) catch return error.WriteFailed;
+    }
+
+    /// Classify one slot against the live cell at `row`.
+    fn classifySlot(
+        self: *Workbook,
+        ws: *Worksheet,
+        cov: embedding_part.Coverage,
+        row: u32,
+        stored: u64,
+        scratch: *std.ArrayListUnmanaged(u8),
+    ) Error!SlotState {
+        var ref_buf: [16]u8 = undefined;
+        const ref = std.fmt.bufPrint(&ref_buf, "{s}{d}", .{ cov.column, row }) catch
+            return error.WriteFailed;
+
+        const was_tombstone = stored == embedding_part.TOMBSTONE_HASH;
+
+        // `cellByRef` reads the parsed sheet XML, which does not carry
+        // staged `setCell` edits. Without this, `setCell(.blank)` then
+        // `prune()` then `save()` would write the blank and keep the
+        // vector — the exact orphan this call exists to remove.
+        //
+        // A staged value is never reported `fresh`: re-deriving its
+        // canonical hash would mean reproducing the save-time encoding
+        // (SST routing, Ryu number formatting), and guessing wrong
+        // would claim freshness that isn't there. Drift is the safe
+        // answer, and the caller re-embeds.
+        // `column_idx` is 0-based (`embedding_part.parseColumnName`
+        // returns `col - 1`); `deltas` is keyed by `parseA1Ref`, which
+        // is 1-based. Two conventions, one codebase — the `+ 1` is
+        // load-bearing, and without it every lookup silently misses.
+        if (ws.deltas.get(.{ .row = row, .col = cov.column_idx + 1 })) |pending| {
+            const embeddable = switch (pending) {
+                .blank, .deleted => false,
+                .string, .shared_string => |s| s.len > 0,
+                .formula => cov.include_formulas,
+                .number, .boolean => true,
+            };
+            if (!embeddable) return if (was_tombstone) .valid_empty else .stale_needs_tombstone;
+            return .stale;
+        }
+
+        const canonical = try self.canonicalCellFor(ws, ref, cov.include_formulas);
+
+        const cell = canonical orelse {
+            // Nothing embeddable here now.
+            return if (was_tombstone) .valid_empty else .stale_needs_tombstone;
+        };
+
+        // Embeddable. A tombstone means the row *became* embeddable
+        // since the last embed — stale, but there is nothing to redact.
+        if (was_tombstone) return .stale;
+
+        const now = embedding_part.xxh3Canonical(
+            self.allocator,
+            cov.worksheet_target,
+            row,
+            cell,
+            scratch,
+        ) catch return error.WriteFailed;
+        return if (now == stored) .fresh else .stale;
+    }
+
+    /// Live cell → the canonical form the hash is taken over, or null
+    /// when the row is not embeddable (blank, or a formula while
+    /// `include_formulas="false"`).
+    fn canonicalCellFor(
+        self: *Workbook,
+        ws: *Worksheet,
+        ref: []const u8,
+        include_formulas: bool,
+    ) Error!?embedding_part.CanonicalCell {
+        const cell = (try ws.cellByRef(ref)) orelse return null;
+        if (cell.formula != null and !include_formulas) return null;
+        const raw = cell.raw_value orelse return null;
+        if (raw.len == 0) return null;
+
+        return switch (cell.cell_type) {
+            .shared_string => blk: {
+                const idx = std.fmt.parseInt(u32, raw, 10) catch return error.UnsupportedCellValue;
+                const text = (try self.sstText(idx)) orelse return null;
+                break :blk if (text.len == 0) null else .{ .string = text };
+            },
+            .inline_string, .formula_string => .{ .string = raw },
+            .number, .date => .{ .number = raw },
+            // Strict per spec: `<v>` is exactly "0" or "1"; anything
+            // else is malformed OOXML rather than a value to coerce.
+            .boolean => if (std.mem.eql(u8, raw, "1"))
+                .{ .boolean = true }
+            else if (std.mem.eql(u8, raw, "0"))
+                .{ .boolean = false }
+            else
+                return error.UnsupportedCellValue,
+            .error_value => .{ .error_value = raw },
+        };
+    }
+
+    /// The `Worksheet` a coverage's `@worksheet_target` names, if it is
+    /// still in the workbook. Targets are relative to `xl/`.
+    fn worksheetForTarget(self: *Workbook, target: []const u8) Error!?*Worksheet {
+        var buf: [256]u8 = undefined;
+        const want = std.fmt.bufPrint(&buf, "xl/{s}", .{target}) catch return null;
+        var i: u32 = 0;
+        while (i < self.sheetCount()) : (i += 1) {
+            const ws = try self.sheet(i);
+            const name = try ws.resolvePartName();
+            if (std.mem.eql(u8, name, want)) return ws;
+        }
+        return null;
+    }
+
+    /// Free the lazily-parsed embedding views.
+    ///
+    /// `embeddings()` assigns these storages unconditionally, so a
+    /// re-parse after a mutation would leak the previous allocation if
+    /// they were merely nulled.
+    fn invalidateEmbeddingCache(self: *Workbook) void {
+        if (self.embedding_coverage_views) |s| self.allocator.free(s);
+        if (self.embedding_rels_storage) |s| self.allocator.free(s);
+        if (self.embedding_index_storage) |s| self.allocator.free(s);
+        self.embedding_coverage_views = null;
+        self.embedding_rels_storage = null;
+        self.embedding_index_storage = null;
         self.embedding_view = null;
     }
 
@@ -12040,4 +12357,255 @@ test "strip: keeps custom document properties that are not ours" {
     try std.testing.expect(std.mem.indexOf(u8, dp.bytes, "Department") != null);
     try std.testing.expect(std.mem.indexOf(u8, dp.bytes, "Finance") != null);
     try std.testing.expect(std.mem.indexOf(u8, dp.bytes, recovery_record.DOC_PROP_NAME) == null);
+}
+
+// ─── emb-6b: pruneEmbeddings — the redaction sweep ──────────────────
+//
+// A row deleted or blanked in plain Excel leaves its vector on disk,
+// describing text the user believes they removed. The hash column is
+// what detects it. Slots are tombstoned in place: `count` and `@range`
+// never move, because the format is dense and slot `i` must keep
+// meaning row `first_row + i`.
+
+const PRUNE_WS_TARGET: []const u8 = "worksheets/sheet1.xml";
+
+/// Real canonical hash for a string cell, so slots can be `fresh`
+/// rather than merely "not equal to an arbitrary constant".
+fn pruneHashFor(row: u32, text: []const u8) !u64 {
+    var scratch: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+    return embedding_part.xxh3Canonical(
+        std.testing.allocator,
+        PRUNE_WS_TARGET,
+        row,
+        .{ .string = text },
+        &scratch,
+    );
+}
+
+/// Build the coverage **on disk** and return the path.
+///
+/// The sweep classifies against saved cell XML, and `appendRows` only
+/// stages rows until a save — so an in-memory fixture reads as an empty
+/// sheet and every slot would look deleted. Round-tripping is also the
+/// real shape: `--prune` opens a file another tool has already written.
+///
+/// `rows` supplies each covered row's text; a null entry writes an
+/// empty cell, which is what a row blanked in Excel leaves behind.
+fn writePruneFile(
+    io: std.Io,
+    dir: []const u8,
+    name: []const u8,
+    rows: [2]?[]const u8,
+    hashes: [2]u64,
+) ![]const u8 {
+    var wb = try Workbook.empty(std.testing.allocator, io);
+    defer wb.deinit();
+    const ws = try wb.addSheet("Items");
+    try ws.appendRows(&[_][]const zlsx.Cell{&.{.{ .string = "Title" }}});
+    for (rows) |maybe| {
+        try ws.appendRows(&[_][]const zlsx.Cell{&.{.{ .string = maybe orelse "" }}});
+    }
+    // Non-zero so a redacted record is distinguishable from an
+    // untouched one.
+    var vec_body: [2 * (4 + 2)]u8 = @splat(7);
+    try wb.setEmbeddings("m", 2, .int8_sym_per_vec, &[_]EmbeddingCoverageInput{.{
+        .id = "title",
+        .worksheet_target = PRUNE_WS_TARGET,
+        .range = "A2:A3",
+        .column = "A",
+        .include_formulas = false,
+        .vec_body = &vec_body,
+        .hashes = &hashes,
+    }});
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ dir, name });
+    errdefer std.testing.allocator.free(path);
+    try wb.save(io, path);
+    return path;
+}
+
+test "prune: unchanged content is fresh and rewrites nothing" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+
+    const path = try writePruneFile(io, dir, "fresh.xlsx", .{ "Alpha", "Beta" }, .{
+        try pruneHashFor(2, "Alpha"),
+        try pruneHashFor(3, "Beta"),
+    });
+    defer std.testing.allocator.free(path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
+    defer wb.deinit();
+
+    const report = try wb.pruneEmbeddings();
+    try std.testing.expectEqual(@as(usize, 0), report.redacted);
+    try std.testing.expectEqual(@as(usize, 2), report.fresh);
+    try std.testing.expectEqual(@as(usize, 2), report.total());
+}
+
+test "prune: a blanked row is redacted in place" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+
+    // Row 3 carries no text but the coverage still claims it — what a
+    // row deleted in plain Excel leaves behind.
+    const path = try writePruneFile(io, dir, "redact.xlsx", .{ "Alpha", null }, .{
+        try pruneHashFor(2, "Alpha"),
+        try pruneHashFor(3, "Beta"),
+    });
+    defer std.testing.allocator.free(path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
+    defer wb.deinit();
+
+    const report = try wb.pruneEmbeddings();
+    try std.testing.expectEqual(@as(usize, 1), report.redacted);
+    try std.testing.expectEqual(@as(usize, 1), report.fresh);
+
+    const view = (try wb.embeddings()).viewOrNull().?;
+    const cov = view.coverages[0];
+    // count and @range must not move — the mapping is positional, so
+    // compacting would re-point every later slot at the wrong row.
+    try std.testing.expectEqual(@as(u32, 2), cov.coverage.count);
+    try std.testing.expectEqualStrings("A2:A3", cov.coverage.range);
+    try std.testing.expectEqual(embedding_part.TOMBSTONE_HASH, try cov.hashes.value(1));
+    try std.testing.expect((try cov.hashes.value(0)) != embedding_part.TOMBSTONE_HASH);
+
+    // The vector is gone, not merely flagged.
+    for (try cov.vec.record(1)) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    var any_nonzero = false;
+    for (try cov.vec.record(0)) |b| {
+        if (b != 0) any_nonzero = true;
+    }
+    try std.testing.expect(any_nonzero);
+}
+
+test "prune: drifted content is reported stale, not redacted" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+
+    // Both rows still have text; row 3's stored hash is for other text.
+    const path = try writePruneFile(io, dir, "drift.xlsx", .{ "Alpha", "Beta" }, .{
+        try pruneHashFor(2, "Alpha"),
+        try pruneHashFor(3, "Gamma"),
+    });
+    defer std.testing.allocator.free(path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
+    defer wb.deinit();
+
+    const report = try wb.pruneEmbeddings();
+    // Editing text is not deleting it. Redacting here would destroy a
+    // vector the caller never asked to lose.
+    try std.testing.expectEqual(@as(usize, 0), report.redacted);
+    try std.testing.expectEqual(@as(usize, 1), report.stale);
+    try std.testing.expectEqual(@as(usize, 1), report.fresh);
+}
+
+test "prune: an already-tombstoned empty row stays valid_empty" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+
+    const path = try writePruneFile(io, dir, "tomb.xlsx", .{ "Alpha", null }, .{
+        try pruneHashFor(2, "Alpha"),
+        embedding_part.TOMBSTONE_HASH,
+    });
+    defer std.testing.allocator.free(path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
+    defer wb.deinit();
+
+    const report = try wb.pruneEmbeddings();
+    try std.testing.expectEqual(@as(usize, 0), report.redacted);
+    try std.testing.expectEqual(@as(usize, 1), report.valid_empty);
+    try std.testing.expectEqual(@as(usize, 1), report.fresh);
+}
+
+test "prune: is idempotent" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+
+    const path = try writePruneFile(io, dir, "idem.xlsx", .{ "Alpha", null }, .{
+        try pruneHashFor(2, "Alpha"),
+        try pruneHashFor(3, "Beta"),
+    });
+    defer std.testing.allocator.free(path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
+    defer wb.deinit();
+
+    const first = try wb.pruneEmbeddings();
+    try std.testing.expectEqual(@as(usize, 1), first.redacted);
+
+    const second = try wb.pruneEmbeddings();
+    // Now a correct tombstone, so there is nothing left to redact.
+    try std.testing.expectEqual(@as(usize, 0), second.redacted);
+    try std.testing.expectEqual(@as(usize, 1), second.valid_empty);
+}
+
+test "prune: a staged blanking delta redacts even though the XML still has text" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+
+    const path = try writePruneFile(io, dir, "delta.xlsx", .{ "Alpha", "Beta" }, .{
+        try pruneHashFor(2, "Alpha"),
+        try pruneHashFor(3, "Beta"),
+    });
+    defer std.testing.allocator.free(path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
+    defer wb.deinit();
+
+    const ws = try wb.sheet(0);
+    try ws.setCell("A3", .{ .blank = {} });
+
+    // `cellByRef` reads the parsed XML, which still says "Beta". A
+    // sweep that consulted only that would let this save write the
+    // blank and keep the vector — an orphan created by the very API
+    // meant to remove them.
+    const report = try wb.pruneEmbeddings();
+    try std.testing.expectEqual(@as(usize, 1), report.redacted);
+
+    const view = (try wb.embeddings()).viewOrNull().?;
+    try std.testing.expectEqual(
+        embedding_part.TOMBSTONE_HASH,
+        try view.coverages[0].hashes.value(1),
+    );
+}
+
+test "prune: reports nothing on a workbook without embeddings" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+    const ws = try wb.addSheet("Items");
+    try ws.appendRows(&[_][]const zlsx.Cell{&.{.{ .string = "Alpha" }}});
+
+    const report = try wb.pruneEmbeddings();
+    try std.testing.expectEqual(@as(usize, 0), report.total());
 }
