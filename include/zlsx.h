@@ -45,6 +45,7 @@ typedef struct zlsx_matrix_t zlsx_matrix_t;
 typedef struct zlsx_writer_t zlsx_writer_t;
 typedef struct zlsx_sheet_writer_t zlsx_sheet_writer_t;
 typedef struct zlsx_editor_t zlsx_editor_t;
+typedef struct zlsx_emb_t zlsx_emb_t;
 
 /* Cell tag discriminator. */
 typedef enum {
@@ -1283,6 +1284,74 @@ int32_t zlsx_editor_strip_doc_props(
     int32_t         strip_timestamps,
     uint8_t       * err_buf,
     size_t          err_buf_len);
+
+
+/* ── Embeddings (E5) ───────────────────────────────────────────────
+ *
+ * A read-only handle over an .xlsx's embedding set. Separate from
+ * zlsx_book_t because embeddings live in the OPC part model while
+ * zlsx_book_t is the streaming cell reader.
+ *
+ * The three states are the point of this surface. Some spreadsheet
+ * applications rebuild the archive on save and delete the vector
+ * parts; a ~200-byte recovery record survives that, so a stripped
+ * workbook can still report what it used to hold. A consumer must be
+ * able to tell the three cases apart. */
+#define ZLSX_EMB_ABSENT   0u  /* never had embeddings */
+#define ZLSX_EMB_PRESENT  1u  /* vectors available */
+#define ZLSX_EMB_STRIPPED 2u  /* vectors deleted; provenance recovered */
+
+#define ZLSX_EMB_CARRIER_DEFINED_NAME 0u
+#define ZLSX_EMB_CARRIER_DOC_PROPS    1u
+
+/* Open an .xlsx and resolve its embedding state. NULL on I/O or parse
+ * failure; an absent or stripped set is a successful open. */
+zlsx_emb_t * zlsx_emb_open(
+    const char * path,
+    uint8_t    * err_buf,
+    size_t       err_buf_len);
+
+void zlsx_emb_close(zlsx_emb_t * emb);
+
+/* One of the ZLSX_EMB_* state constants. */
+uint32_t zlsx_emb_state(zlsx_emb_t * emb);
+
+/* Provenance. Available for PRESENT *and* STRIPPED — recovering it
+ * after a strip is the reason the recovery record exists. String
+ * getters copy into out_buf null-terminated and return the full
+ * length; pass out_buf_len 0 to query the length. */
+size_t   zlsx_emb_model(zlsx_emb_t * emb, uint8_t * out_buf, size_t out_buf_len);
+uint32_t zlsx_emb_dim(zlsx_emb_t * emb);
+size_t   zlsx_emb_dtype(zlsx_emb_t * emb, uint8_t * out_buf, size_t out_buf_len);
+
+size_t   zlsx_emb_coverage_count(zlsx_emb_t * emb);
+size_t   zlsx_emb_coverage_id(zlsx_emb_t * emb, size_t i, uint8_t * out_buf, size_t out_buf_len);
+size_t   zlsx_emb_coverage_range(zlsx_emb_t * emb, size_t i, uint8_t * out_buf, size_t out_buf_len);
+size_t   zlsx_emb_coverage_sheet(zlsx_emb_t * emb, size_t i, uint8_t * out_buf, size_t out_buf_len);
+uint32_t zlsx_emb_coverage_rows(zlsx_emb_t * emb, size_t i);
+
+/* STRIPPED only; 0 otherwise. Content fingerprint at embed time —
+ * recomputable from current cells, so equal means the covered content
+ * has not drifted and a re-embed reproduces the same vectors. */
+uint64_t zlsx_emb_digest(zlsx_emb_t * emb);
+
+/* STRIPPED only. Which carrier the record was recovered from. */
+uint32_t zlsx_emb_carrier(zlsx_emb_t * emb);
+
+/* Hash value marking a deleted row. Exposed rather than hard-coded in
+ * each binding so the tombstone contract has one definition. */
+uint64_t zlsx_emb_tombstone(void);
+
+/* Decode coverage i's vectors as f32, row-major [rows][dim].
+ * out_len must be exactly rows * dim.
+ * Returns 0 on success, -1 on bad index or size, -2 when the state is
+ * not PRESENT (a stripped coverage has provenance but no vectors). */
+int32_t zlsx_emb_vectors(zlsx_emb_t * emb, size_t i, float * out, size_t out_len);
+
+/* Copy coverage i's per-row content hashes; out_len must equal rows.
+ * Same return convention. A row whose hash equals zlsx_emb_tombstone()
+ * was deleted. */
+int32_t zlsx_emb_hashes(zlsx_emb_t * emb, size_t i, uint64_t * out, size_t out_len);
 
 
 #ifdef __cplusplus

@@ -34,13 +34,14 @@ graph LR
     E4 --> E4B["emb-4B ◐ carrier matrix<br/>3 carriers survive<br/>both rebuilders"]
     E4B --> DEC{{"durability contract<br/>DECIDED 2026-07-26"}}
     DEC --> ER["emb-R ✅ recovery record<br/>hidden definedName + docProps"]
-    ER --> E5["⬅ NEXT: emb-5<br/>Python (NumPy + valid_mask)"]
-    E5 --> E6["emb-6<br/>CLI: zlsx embed / --prune / --strip"]
+    ER --> E5["emb-5 ✅ Python<br/>NumPy + valid_mask"]
+    E5 --> E6["⬅ NEXT: emb-6<br/>CLI: zlsx embed / --prune / --strip"]
     style E4 fill:#16213e
     style E4B fill:#16213e
     style DEC fill:#0f3460
     style ER fill:#16213e
-    style E5 fill:#0f3460
+    style E5 fill:#16213e
+    style E6 fill:#0f3460
 ```
 
 **emb-4 — DONE for the 3 reachable desktop tools (validated 2026-05-30/31).**
@@ -112,7 +113,14 @@ openpyxl both destroy the vectors and the provenance still comes back, via `defi
 with `docProps` removed it still recovers, and with the names removed it falls back to
 `doc_props`. Each carrier is independently sufficient.
 
-**▶ NEXT — emb-5 (Python), then emb-6 (CLI).**
+**✅ emb-5 SHIPPED (2026-07-27).** `zlsx.embeddings(path)` returns present / stripped /
+absent. Vectors come back as a NumPy `(rows, dim)` float32 array decoded in Zig — one FFI
+call per coverage, one implementation of each dtype layout — with `valid_mask()` for
+tombstoned rows. On a stripped workbook `vectors()` raises `EmbeddingsStripped` carrying
+the recovered model, dim, dtype and ranges, rather than returning an empty array: an empty
+array would be exactly the silent-nothing the contract rejects.
+
+**▶ NEXT — emb-6 (CLI).**
 Full reasoning: `docs/plans/embeddings-in-xlsx.md` §Durability contract.
 
 Spec: `docs/plans/embeddings-in-xlsx.md` · matrix + Findings: `docs/plans/emb-4-compat-matrix.md`.

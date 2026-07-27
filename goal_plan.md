@@ -66,7 +66,7 @@ Status vocabulary is fixed by the site's pill styling — use only these:
 | E4W | Tool survival, Excel on Windows | blocked | 1 d | E4, a Windows host | The one untested app, and the one that decides whether the promise is real. |
 | E4B | Carrier survival test | partial | 1 wk | E4 | Measure which *other* hiding places survive the apps that erase the vectors. Six carriers measured against openpyxl, LibreOffice and Excel-mac; three survive both rebuilders. Numbers + Excel-Win legs still manual. |
 | ER | Recovery record | done | 1 wk | E4B, durability decision | The ~200-byte provenance record that makes a stripped vector set detectable. Hidden `<definedName>` + `docProps/custom.xml`; `embeddings()` returns `present`/`stripped`/`absent`. Validated against LibreOffice and openpyxl. |
-| E5 | Embeddings from Python | planned | 2-3 wk | ER | Reach the vectors from Python. Unblocked: the contract is decided and `EmbeddingState` gives the binding the three states to expose. |
+| E5 | Embeddings from Python | done | 2-3 wk | ER | Reach the vectors from Python. `zlsx.embeddings(path)` → present / stripped / absent; vectors as NumPy float32, `valid_mask` for tombstones, provenance recovered on a stripped workbook. |
 | E6 | Embeddings from the command line | planned | 2-3 wk | E5 | Add, prune and strip vectors without writing code. |
 | D1 | Compute formulas | deferred | — | C1 | Deliberately out of scope. Reading and editing is the product. |
 | D2 | Author charts | deferred | — | B1 | Deferred on the same reasoning. |
