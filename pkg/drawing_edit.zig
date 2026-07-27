@@ -714,3 +714,55 @@ test "two adjacent twoCellAnchors both rewrite correctly" {
     try testing.expectEqual(@as(usize, 2), count_col2);
     try testing.expectEqual(@as(usize, 2), count_col4);
 }
+
+// ─── fuzz target ────────────────────────────────────────────────────
+//
+// See the note in sheet_edit.zig. This walker parses nested
+// `<xdr:from>` / `<xdr:to>` blocks with 0-based coordinates, so its
+// index arithmetic differs from the A1-based walkers.
+
+fn fuzzDrawingEditTarget(_: void, smith: *std.testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    var smith_buf: [4096]u8 = undefined;
+    const input = smith_buf[0..smith.slice(&smith_buf)];
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for ([_]u32{ 1, 2, 5 }) |idx| {
+        inline for (.{ .row, .col }) |axis| {
+            inline for (.{ .insert, .delete }) |kind| {
+                if (applyEditToDrawing(a, input, axis, idx, kind)) |out| {
+                    a.free(out);
+                } else |_| {}
+            }
+        }
+    }
+}
+
+test "fuzz: applyEditToDrawing never crashes on adversarial XML" {
+    try std.testing.fuzz({}, fuzzDrawingEditTarget, .{
+        .corpus = &[_][]const u8{
+            "",
+            "<xdr:wsDr/>",
+            "<xdr:twoCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:row>0</xdr:row></xdr:from><xdr:to><xdr:col>2</xdr:col><xdr:row>2</xdr:row></xdr:to></xdr:twoCellAnchor>",
+            "<xdr:oneCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:row>1</xdr:row></xdr:from></xdr:oneCellAnchor>",
+            "<xdr:absoluteAnchor><xdr:pos x=\"0\" y=\"0\"/></xdr:absoluteAnchor>",
+            // from without to, and the reverse.
+            "<xdr:twoCellAnchor><xdr:from><xdr:col>0</xdr:col></xdr:from></xdr:twoCellAnchor>",
+            "<xdr:twoCellAnchor><xdr:to><xdr:col>2</xdr:col></xdr:to></xdr:twoCellAnchor>",
+            // Non-numeric and extreme coordinates.
+            "<xdr:from><xdr:col>abc</xdr:col><xdr:row>-1</xdr:row></xdr:from>",
+            "<xdr:from><xdr:col>4294967296</xdr:col></xdr:from>",
+            "<xdr:from><xdr:col></xdr:col></xdr:from>",
+            "<xdr:from><xdr:col>16383</xdr:col><xdr:row>1048575</xdr:row></xdr:from>",
+            // Truncations.
+            "<xdr:twoCellAnchor><xdr:from><xdr:col>0",
+            "<xdr:twoCellAnchor><xdr:from",
+            "<xdr:col>",
+            "<xdr:",
+            "<xdr:twoCellAnchor",
+        },
+    });
+}
