@@ -3,10 +3,17 @@
 The tests are organised around the three states rather than the
 methods, because the states are the contract. Some spreadsheet
 applications rebuild the .xlsx archive on save and delete the vector
-parts outright; a small recovery record survives that, so a workbook
-which lost its vectors can still report what it held. A binding that
-could not distinguish "stripped" from "never had any" would hand the
-caller silence, which is exactly what the design rejects.
+parts outright; a small recovery record survives that in most of them,
+so a workbook which lost its vectors can still report what it held. A
+binding that could not distinguish "stripped" from "never had any"
+would hand the caller silence, which is exactly what the design
+rejects.
+
+The exception is Apple Numbers, which erases the record too — a
+Numbers export reports ``absent``, and the library genuinely cannot
+tell it from a workbook that never had embeddings. That limitation has
+its own section at the end of this file, pinned so a future change
+cannot alter it silently.
 
 Fixtures come from ``zig build emb4-tools``, which produces the same
 generator the compat matrices use. Tests skip when it has not been
@@ -15,7 +22,6 @@ built rather than failing, so a pure-Python checkout stays green.
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 import zipfile
 from pathlib import Path
@@ -278,3 +284,78 @@ def test_carrier_falls_back_to_doc_props(tmp_path: Path):
         assert e.stripped
         assert e.carrier == "doc_props"
         assert e.model == "emb-4-fixture-v1"
+
+
+# ── the Numbers case ─────────────────────────────────────────────────
+#
+# Numbers 15.3 strips 5 of 6 carriers, including BOTH recovery-record
+# carriers (measured 2026-07-27). A Numbers export therefore reports
+# `absent`, not `stripped` — the vectors and the evidence go together.
+#
+# That is a documented limitation rather than a bug, but it is pinned
+# here because it is the one case where the library genuinely cannot
+# tell the caller what happened, and a future change that silently
+# altered this behaviour should have to update a test that says so.
+
+
+@pytest.fixture
+def numbers_shaped(embedded: Path, tmp_path: Path) -> Path:
+    """The fixture with every carrier Numbers removes taken out.
+
+    Reproduced by archive surgery rather than by driving Numbers: the
+    result is byte-equivalent for the carriers under test, and the test
+    suite cannot assume macOS with Numbers installed.
+    """
+    import re
+
+    out = tmp_path / "numbers.xlsx"
+    zin = zipfile.ZipFile(embedded)
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zo:
+        for name in zin.namelist():
+            # Numbers drops the vector parts, docProps and customXml.
+            if name.startswith("xl/zlsxEmbeddings/"):
+                continue
+            if name in ("docProps/custom.xml",):
+                continue
+            if name.startswith("customXml/"):
+                continue
+            data = zin.read(name)
+            if name == "xl/workbook.xml":
+                # ...and the defined names, including the record chunks.
+                data = re.sub(
+                    r"<definedName[^>]*_zlsxRecovery[^>]*>.*?</definedName>",
+                    "",
+                    data.decode(),
+                    flags=re.S,
+                ).encode()
+            elif name == "xl/_rels/workbook.xml.rels":
+                data = re.sub(
+                    r"<Relationship[^>]*zlsxEmbeddings[^>]*/>", "", data.decode()
+                ).encode()
+            zo.writestr(name, data)
+    return out
+
+
+def test_numbers_export_reports_absent_not_stripped(numbers_shaped: Path):
+    """The documented limitation, asserted.
+
+    Numbers removes the evidence along with the vectors, so the library
+    cannot report `stripped`. If this ever becomes distinguishable, this
+    test should fail and the docs should change with it.
+    """
+    with zlsx.embeddings(numbers_shaped) as e:
+        assert e.absent
+        assert not e.stripped
+        assert e.state == "absent"
+        assert e.model == ""
+        assert e.coverages == []
+
+
+def test_numbers_export_does_not_raise_embeddings_stripped(numbers_shaped: Path):
+    """A caller gets the generic error, not the recoverable one — there
+    is no provenance to put in the message."""
+    pytest.importorskip("numpy")
+    with zlsx.embeddings(numbers_shaped) as e:
+        with pytest.raises(zlsx.ZlsxError) as ei:
+            e.vectors()
+        assert not isinstance(ei.value, zlsx.EmbeddingsStripped)

@@ -3009,12 +3009,32 @@ def edit(path: Union[str, Path]) -> Editor:
 # Semantic vectors stored inside the .xlsx, read back with their
 # provenance. The API's shape is dictated by a measured fact: some
 # spreadsheet applications rebuild the archive on save and delete the
-# vector parts outright. A ~200-byte recovery record survives that, so a
-# workbook which lost its vectors can still say what it held.
+# vector parts outright. A ~200-byte recovery record survives that in
+# most of them, so a workbook which lost its vectors can still say what
+# it held.
 #
 # Hence three states, not two. `vectors()` raising on a stripped
 # workbook is deliberate — returning an empty array would recreate
 # exactly the silent-nothing this design exists to prevent.
+#
+# ── The Numbers exception (measured 2026-07-27, Numbers 15.3) ────────
+#
+# Apple Numbers erases the recovery record too. It strips 5 of the 6
+# carriers tested; the only survivor is cell data, which is visible to
+# the user and therefore not where the record lives.
+#
+# So a workbook exported from Numbers reports `absent`, NOT `stripped`.
+# It is indistinguishable from one that never had embeddings, and no
+# amount of reader-side effort recovers it. This is a property of how
+# Numbers exports — it rebuilds the file from its own document model, so
+# only what that model represents survives — not something the binding
+# can detect or work around.
+#
+# Practical consequence for callers: `absent` means "no embeddings
+# here", not "never had any". If a pipeline needs to distinguish those,
+# it has to track expectations outside the workbook.
+#
+# See docs/plans/emb-4b-carrier-matrix.md for the measurement.
 
 
 class EmbeddingsStripped(ZlsxError):
@@ -3024,6 +3044,11 @@ class EmbeddingsStripped(ZlsxError):
     The workbook still knows its model, dimension, dtype and covered
     ranges — read them off the :class:`Embeddings` object and re-embed
     from source.
+
+    .. note::
+       This is the *recoverable* loss. Apple Numbers erases the
+       recovery record along with the vectors, so a Numbers export
+       reports ``absent`` and never raises this. See the module notes.
     """
 
 
@@ -3059,6 +3084,13 @@ class Embeddings:
     ``model``, ``dim``, ``dtype`` and ``coverages`` are populated for
     both ``present`` and ``stripped`` — recovering them after a strip is
     the entire point of the recovery record.
+
+    .. warning::
+       ``absent`` does **not** prove the workbook never had embeddings.
+       Apple Numbers strips the recovery record along with the vectors
+       (measured on 15.3), so a Numbers export is indistinguishable from
+       a workbook that never had any. Pipelines that must tell those
+       apart have to track the expectation outside the file.
     """
 
     __slots__ = ("_h", "_state", "_closed")
@@ -3114,7 +3146,12 @@ class Embeddings:
 
     @property
     def absent(self) -> bool:
-        """This workbook never had embeddings."""
+        """No embeddings and no recovery record.
+
+        Usually means the workbook never had any — but also what a
+        Numbers export looks like, because Numbers erases the record
+        too. The two cases are not distinguishable from the file.
+        """
         return self._state == _ffi.ZLSX_EMB_ABSENT
 
     @property
