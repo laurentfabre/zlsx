@@ -91,9 +91,12 @@ fn check(
     return switch (c) {
         // Structural, to stay a like-for-like control against emb-4.
         .opc_part => blk: {
-            const view = wb.embeddings() catch break :blk false;
-            if (view == null) break :blk false;
-            break :blk std.mem.eql(u8, view.?.index.model, marker);
+            // `.present` only — a `.stripped` result means the ER
+            // recovery record survived, which is a different carrier's
+            // verdict and must not be credited to this one.
+            const state = wb.embeddings() catch break :blk false;
+            const view = state.viewOrNull() orelse break :blk false;
+            break :blk std.mem.eql(u8, view.index.model, marker);
         },
         .custom_xml => partContains(wb, "customXml/item1.xml", marker),
         .doc_props => partContains(wb, "docProps/custom.xml", marker),

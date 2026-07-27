@@ -684,6 +684,18 @@ pub fn build(b: *std.Build) void {
     const embedding_part_tests = b.addTest(.{ .root_module = embedding_part_tests_mod });
     test_step.dependOn(&b.addRunArtifact(embedding_part_tests).step);
 
+    // pkg/recovery_record.zig — ER recovery-record codec + carrier
+    // extraction. Std-only, so it needs no imports; its own target
+    // keeps a failure attributable to the codec rather than to a
+    // workbook round-trip.
+    const recovery_record_tests_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/recovery_record.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const recovery_record_tests = b.addTest(.{ .root_module = recovery_record_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(recovery_record_tests).step);
+
     // pkg/workbook.zig — Workbook + Worksheet typed-overlay roots
     // (B1 iter-wb-2). Composes PartStore + typed_parts into a single
     // model surface; read-only in this iter, mutation lands iter-wb-4.

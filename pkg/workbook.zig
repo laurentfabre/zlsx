@@ -33,6 +33,7 @@ const typed_parts = @import("typed_parts/root.zig");
 const zlsx = @import("zlsx");
 const drawing_emit = @import("drawing_emit.zig");
 const embedding_part = @import("embedding_part.zig");
+const recovery_record = @import("recovery_record.zig");
 const sheet_edit = @import("sheet_edit.zig");
 const drawing_edit = @import("drawing_edit.zig");
 const vml_edit = @import("vml_edit.zig");
@@ -543,6 +544,39 @@ pub const EmbeddingView = struct {
     }
 };
 
+/// What `Workbook.embeddings()` found.
+///
+/// A tagged union rather than `?EmbeddingView` on purpose. The whole
+/// point of the ER recovery record is that a workbook which lost its
+/// vectors **says so** — if the accessor collapsed `.stripped` into a
+/// bare `null`, the default caller experience would still be silent,
+/// which is the outcome the durability contract rejects.
+///
+/// See `docs/plans/embeddings-in-xlsx.md` §Durability contract.
+pub const EmbeddingState = union(enum) {
+    /// `xl/zlsxEmbeddings/index.xml` present and parsed.
+    present: EmbeddingView,
+    /// The index is gone but a recovery record survived: some
+    /// consumer stripped the vectors. Carries what they were, so the
+    /// caller can re-embed deliberately with the original model and
+    /// ranges instead of guessing.
+    stripped: recovery_record.RecoveryRecord,
+    /// No index and no record — this workbook never had embeddings,
+    /// or passed through a consumer that strips even the record.
+    /// Not an error.
+    absent,
+
+    /// The view when present, else null. For callers that genuinely
+    /// only want the vectors and have already decided how to treat a
+    /// strip — the name says the state is being discarded.
+    pub fn viewOrNull(self: EmbeddingState) ?EmbeddingView {
+        return switch (self) {
+            .present => |v| v,
+            else => null,
+        };
+    }
+};
+
 fn resolveEmbeddingRelTarget(
     rels: []const embedding_part.IndexRelationship,
     rid: []const u8,
@@ -677,6 +711,12 @@ pub const Workbook = struct {
     embedding_index_storage: ?[]embedding_part.Coverage = null,
     embedding_rels_storage: ?[]embedding_part.IndexRelationship = null,
     embedding_coverage_views: ?[]EmbeddingCoverageView = null,
+
+    /// ER: backing storage for a recovered record. Its string slices
+    /// point into `recovery_text_storage`, so both live as long as
+    /// the Workbook.
+    recovery_cov_storage: ?[]recovery_record.RecoveredCoverage = null,
+    recovery_text_storage: ?[]u8 = null,
 
     /// Open an .xlsx file as a typed `Workbook`.
     ///
@@ -824,6 +864,8 @@ pub const Workbook = struct {
         if (self.embedding_coverage_views) |s| self.allocator.free(s);
         if (self.embedding_rels_storage) |s| self.allocator.free(s);
         if (self.embedding_index_storage) |s| self.allocator.free(s);
+        if (self.recovery_cov_storage) |s| self.allocator.free(s);
+        if (self.recovery_text_storage) |s| self.allocator.free(s);
         self.store.deinit();
     }
 
@@ -1066,11 +1108,17 @@ pub const Workbook = struct {
     ///   declared count diverges from either binary header's count.
     /// - Other `embedding_part.Error` variants from header / XML
     ///   parsing on malformed input.
-    pub fn embeddings(self: *Workbook) Error!?EmbeddingView {
-        if (self.embedding_view) |v| return v;
+    pub fn embeddings(self: *Workbook) Error!EmbeddingState {
+        if (self.embedding_view) |v| return .{ .present = v };
 
-        const idx_part = (try self.store.part(embedding_part.INDEX_PART_NAME)) orelse
-            return null;
+        const idx_part = (try self.store.part(embedding_part.INDEX_PART_NAME)) orelse {
+            // No index. Before reporting nothing, look for the ER
+            // recovery record: a consumer that rebuilds the archive
+            // drops the index but leaves the record, and the whole
+            // contract rests on telling those two cases apart.
+            if (try self.recoverEmbeddingRecord()) |rec| return .{ .stripped = rec };
+            return .absent;
+        };
 
         // Grow-loop for parseIndex (it requires a caller-provided
         // Coverage buffer; size unknown until we parse). Start at
@@ -1166,7 +1214,71 @@ pub const Workbook = struct {
             .index = idx,
             .coverages = views,
         };
-        return self.embedding_view;
+        return .{ .present = self.embedding_view.? };
+    }
+
+    /// ER read path: reassemble the recovery record from whichever
+    /// carrier survived.
+    ///
+    /// Tries the hidden `<definedName>` chunks first, then
+    /// `docProps/custom.xml`. Returns null when neither carries a
+    /// record, which is the honest "never had embeddings" answer.
+    ///
+    /// Storage for the parsed strings is owned by the Workbook and
+    /// freed in `deinit`, so the returned record stays valid for the
+    /// workbook's lifetime like every other view here.
+    fn recoverEmbeddingRecord(self: *Workbook) Error!?recovery_record.RecoveryRecord {
+        var joined: std.ArrayListUnmanaged(u8) = .empty;
+        defer joined.deinit(self.allocator);
+
+        var carrier: recovery_record.Carrier = .defined_name;
+        if (try self.store.part("xl/workbook.xml")) |wbx| {
+            var name_buf: [32]u8 = undefined;
+            var val_buf: [recovery_record.MAX_CHUNK * 4]u8 = undefined;
+            var i: usize = 0;
+            while (i < recovery_record.MAX_CHUNKS) : (i += 1) {
+                const name = recovery_record.chunkName(&name_buf, i);
+                const v = recovery_record.findDefinedNameValue(wbx.bytes, name, &val_buf) orelse break;
+                try joined.appendSlice(self.allocator, v);
+            }
+        }
+
+        if (joined.items.len == 0) {
+            const dp = (try self.store.part("docProps/custom.xml")) orelse return null;
+            var val_buf: [recovery_record.MAX_CHUNK * recovery_record.MAX_CHUNKS]u8 = undefined;
+            const v = recovery_record.findDocPropValue(dp.bytes, &val_buf) orelse return null;
+            try joined.appendSlice(self.allocator, v);
+            carrier = .doc_props;
+        }
+        if (joined.items.len == 0) return null;
+
+        // Grow-loop on both buffers, same contract as parseIndex.
+        var cov_cap: usize = 4;
+        var scratch_cap: usize = 512;
+        while (true) {
+            const covs = try self.allocator.alloc(recovery_record.RecoveredCoverage, cov_cap);
+            const scratch = try self.allocator.alloc(u8, scratch_cap);
+            const rec = recovery_record.decode(joined.items, carrier, covs, scratch) catch |e| {
+                self.allocator.free(covs);
+                self.allocator.free(scratch);
+                switch (e) {
+                    error.BufferTooSmall => {
+                        cov_cap *= 2;
+                        scratch_cap *= 2;
+                        if (scratch_cap > 1 << 20) return error.BufferTooSmall;
+                        continue;
+                    },
+                    // A record we cannot parse is reported as absent
+                    // rather than fatal: it is provenance, not data,
+                    // and a malformed one must not make an otherwise
+                    // readable workbook un-openable.
+                    else => return null,
+                }
+            };
+            self.recovery_cov_storage = covs;
+            self.recovery_text_storage = scratch;
+            return rec;
+        }
     }
 
     /// emb-3a: write embedding parts under `xl/zlsxEmbeddings/`.
@@ -1420,6 +1532,12 @@ pub const Workbook = struct {
         // intact rather than appending a duplicate.
         try self.registerWorkbookEmbeddingsRel();
 
+        // ER: write the recovery record. This is what makes a strip
+        // by Numbers or LibreOffice *detectable* — those tools drop
+        // every part above, and without the record the result is
+        // indistinguishable from a workbook that never had vectors.
+        try self.writeRecoveryRecord(model, dim, dtype, specs, inputs);
+
         // Free the owned target / rId strings now that they're
         // emitted into rels_xml.
         for (rels) |r| self.allocator.free(r.target);
@@ -1430,6 +1548,193 @@ pub const Workbook = struct {
         }
         spec_freed = 0;
         self.allocator.free(specs);
+    }
+
+    /// Fold every coverage's per-row content hashes into one digest,
+    /// in coverage order.
+    ///
+    /// Recomputable from the *current* cells via the same
+    /// canonicalization, which is the point: after a strip, equal
+    /// means the covered content has not drifted and a re-embed
+    /// reproduces the same vectors; unequal means the content moved
+    /// on too.
+    fn embeddingDigest(inputs: []const EmbeddingCoverageInput) u64 {
+        var h = std.hash.XxHash3.init(embedding_part.HASH_SEED);
+        for (inputs) |in| {
+            for (in.hashes) |x| {
+                var b: [8]u8 = undefined;
+                std.mem.writeInt(u64, &b, x, .little);
+                h.update(&b);
+            }
+        }
+        return h.final();
+    }
+
+    /// ER write path: encode the recovery record and place it in both
+    /// carriers — a hidden `<definedName>` (primary) and
+    /// `docProps/custom.xml` (secondary).
+    ///
+    /// Both, because their removal mechanisms are disjoint: Document
+    /// Inspector ▸ Document Properties and Personal Information strips
+    /// `docProps` and does not touch defined names. ~200 bytes of
+    /// redundancy against a vector set measured in megabytes.
+    fn writeRecoveryRecord(
+        self: *Workbook,
+        model: []const u8,
+        dim: u32,
+        dtype: embedding_part.Dtype,
+        specs: []const embedding_part.CoverageSpec,
+        inputs: []const EmbeddingCoverageInput,
+    ) Error!void {
+        var covs = try self.allocator.alloc(recovery_record.RecoveredCoverage, specs.len);
+        defer self.allocator.free(covs);
+        for (specs, inputs, 0..) |s, in, i| {
+            covs[i] = .{
+                .id = s.id,
+                .worksheet_target = s.worksheet_target,
+                .range = s.range,
+                .count = @intCast(in.hashes.len),
+            };
+        }
+
+        const rec = recovery_record.encode(self.allocator, .{
+            .model = model,
+            .dim = dim,
+            .dtype = dtype.string(),
+            .hash_algo = embedding_part.HASH_ALGO_XXH3_64,
+            .coverages = covs,
+            .digest = embeddingDigest(inputs),
+        }) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.WriteFailed,
+        };
+        defer self.allocator.free(rec);
+
+        const n = recovery_record.chunkCount(rec.len);
+        if (n > recovery_record.MAX_CHUNKS) return error.EmbeddingExceedsArchiveLimit;
+
+        // Upsert, not append: a second setEmbeddings on the same
+        // workbook must replace the record, not accumulate stale
+        // copies alongside it. Clear both the staged plan and any
+        // names already in the saved bytes before writing.
+        self.dropStagedRecoveryNames();
+        try self.stripRecoveryNamesFromWorkbookXml();
+
+        var name_buf: [32]u8 = undefined;
+        var lit_buf: [recovery_record.MAX_CHUNK + 2]u8 = undefined;
+        for (0..n) |i| {
+            const name = recovery_record.chunkName(&name_buf, i);
+            // A string-literal formula. The payload is percent-encoded
+            // ASCII, so it can never contain the quote that would need
+            // doubling here.
+            const lit = std.fmt.bufPrint(&lit_buf, "\"{s}\"", .{recovery_record.chunk(rec, i)}) catch
+                return error.WriteFailed;
+            try self.addDefinedName(name, lit, .{ .hidden = true });
+        }
+
+        try self.writeRecoveryDocProp(rec);
+    }
+
+    /// Remove `_zlsxRecovery*` entries from the staged defined-name
+    /// plan, freeing their owned strings.
+    fn dropStagedRecoveryNames(self: *Workbook) void {
+        const list = &self.workbook_xml_plan.defined_names;
+        var i: usize = 0;
+        while (i < list.items.len) {
+            if (std.mem.startsWith(u8, list.items[i].name, recovery_record.NAME_PREFIX)) {
+                const removed = list.orderedRemove(i);
+                self.allocator.free(removed.name);
+                self.allocator.free(removed.refers_to);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// Drop `<definedName name="_zlsxRecovery…">…</definedName>`
+    /// elements already present in `xl/workbook.xml`.
+    ///
+    /// Needed because the staged plan splices into the *saved* bytes:
+    /// without this, a re-embed after a save would leave the previous
+    /// record's chunks beside the new ones, and a reader concatenating
+    /// by index would splice two generations together.
+    fn stripRecoveryNamesFromWorkbookXml(self: *Workbook) Error!void {
+        const part = (try self.store.part("xl/workbook.xml")) orelse return;
+        const src = part.bytes;
+        if (std.mem.indexOf(u8, src, recovery_record.NAME_PREFIX) == null) return;
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(self.allocator);
+
+        var i: usize = 0;
+        while (i < src.len) {
+            const tag_open = std.mem.indexOfPos(u8, src, i, "<definedName") orelse {
+                try out.appendSlice(self.allocator, src[i..]);
+                break;
+            };
+            const gt = std.mem.indexOfScalarPos(u8, src, tag_open, '>') orelse {
+                try out.appendSlice(self.allocator, src[i..]);
+                break;
+            };
+            const attrs = src[tag_open..gt];
+            const is_ours = std.mem.indexOf(u8, attrs, recovery_record.NAME_PREFIX) != null;
+            if (!is_ours) {
+                try out.appendSlice(self.allocator, src[i .. gt + 1]);
+                i = gt + 1;
+                continue;
+            }
+            try out.appendSlice(self.allocator, src[i..tag_open]);
+            if (src[gt - 1] == '/') {
+                i = gt + 1;
+            } else {
+                const close = std.mem.indexOfPos(u8, src, gt + 1, "</definedName>") orelse {
+                    i = gt + 1;
+                    continue;
+                };
+                i = close + "</definedName>".len;
+            }
+        }
+        try self.store.replacePart("xl/workbook.xml", out.items);
+    }
+
+    /// Write the record into `docProps/custom.xml`, creating the part
+    /// (and its package relationship) when absent.
+    fn writeRecoveryDocProp(self: *Workbook, rec: []const u8) Error!void {
+        const xml = std.fmt.allocPrint(self.allocator,
+            \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            \\<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><property fmtid="{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}" pid="2" name="{s}"><vt:lpwstr>{s}</vt:lpwstr></property></Properties>
+        , .{ recovery_record.DOC_PROP_NAME, rec }) catch return error.WriteFailed;
+        defer self.allocator.free(xml);
+
+        if ((try self.store.part("docProps/custom.xml")) != null) {
+            try self.store.replacePart("docProps/custom.xml", xml);
+            return;
+        }
+        try self.store.addPart(
+            "docProps/custom.xml",
+            "application/vnd.openxmlformats-officedocument.custom-properties+xml",
+            xml,
+        );
+        try self.registerDocPropsCustomRel();
+    }
+
+    /// Add the package-level relationship for `docProps/custom.xml`.
+    /// Idempotent, same contract as `registerWorkbookEmbeddingsRel`.
+    fn registerDocPropsCustomRel(self: *Workbook) Error!void {
+        const REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties";
+        const rels_part = (try self.store.part("_rels/.rels")) orelse return;
+        if (std.mem.indexOf(u8, rels_part.bytes, REL_TYPE) != null) return;
+
+        const close = "</Relationships>";
+        const at = std.mem.lastIndexOf(u8, rels_part.bytes, close) orelse
+            return error.MalformedWorkbookRels;
+        const out = std.fmt.allocPrint(
+            self.allocator,
+            "{s}<Relationship Id=\"rIdZlsxRecovery\" Type=\"{s}\" Target=\"docProps/custom.xml\"/>{s}",
+            .{ rels_part.bytes[0..at], REL_TYPE, rels_part.bytes[at..] },
+        ) catch return error.WriteFailed;
+        defer self.allocator.free(out);
+        try self.store.replacePart("_rels/.rels", out);
     }
 
     /// emb-3b: Ensure `xl/_rels/workbook.xml.rels` carries a
@@ -10406,7 +10711,7 @@ test "Workbook.embeddings: returns null on workbook with no embedding parts" {
     const io = threaded.io();
     var wb = try Workbook.empty(std.testing.allocator, io);
     defer wb.deinit();
-    try std.testing.expect((try wb.embeddings()) == null);
+    try std.testing.expect((try wb.embeddings()) == .absent);
 }
 
 test "Workbook.embeddings: parses single-coverage synthetic workbook" {
@@ -10424,7 +10729,7 @@ test "Workbook.embeddings: parses single-coverage synthetic workbook" {
     try buildSynthHashes(&hash_buf, std.testing.allocator, 1);
     try seedEmbeddingParts(&wb, vec_buf.items, hash_buf.items);
 
-    const view = (try wb.embeddings()).?;
+    const view = (try wb.embeddings()).present;
     try std.testing.expectEqualStrings("test-model", view.index.model);
     try std.testing.expectEqual(@as(u32, 2), view.index.dim);
     try std.testing.expectEqual(embedding_part.Dtype.f32, view.index.dtype);
@@ -10452,7 +10757,7 @@ test "Workbook.embeddings: coverageById finds + misses correctly" {
     try buildSynthHashes(&hash_buf, std.testing.allocator, 1);
     try seedEmbeddingParts(&wb, vec_buf.items, hash_buf.items);
 
-    const view = (try wb.embeddings()).?;
+    const view = (try wb.embeddings()).present;
     const hit = view.coverageById("title");
     try std.testing.expect(hit != null);
     try std.testing.expectEqualStrings("title", hit.?.coverage.id);
@@ -10473,8 +10778,8 @@ test "Workbook.embeddings: lazy cache — second call returns same coverage slic
     try buildSynthHashes(&hash_buf, std.testing.allocator, 1);
     try seedEmbeddingParts(&wb, vec_buf.items, hash_buf.items);
 
-    const first = (try wb.embeddings()).?;
-    const second = (try wb.embeddings()).?;
+    const first = (try wb.embeddings()).present;
+    const second = (try wb.embeddings()).present;
     try std.testing.expectEqual(first.coverages.ptr, second.coverages.ptr);
     try std.testing.expectEqual(first.coverages.len, second.coverages.len);
 }
@@ -10560,7 +10865,7 @@ test "Workbook.setEmbeddings: single coverage round-trips through embeddings()" 
     }};
     try wb.setEmbeddings("test-model", 2, .f32, &inputs);
 
-    const view = (try wb.embeddings()).?;
+    const view = (try wb.embeddings()).present;
     try std.testing.expectEqualStrings("test-model", view.index.model);
     try std.testing.expectEqual(@as(u32, 2), view.index.dim);
     try std.testing.expectEqual(embedding_part.Dtype.f32, view.index.dtype);
@@ -10597,7 +10902,7 @@ test "Workbook.setEmbeddings: multi-coverage Title+Body" {
     };
     try wb.setEmbeddings("m", 2, .f32, &inputs);
 
-    const view = (try wb.embeddings()).?;
+    const view = (try wb.embeddings()).present;
     try std.testing.expectEqual(@as(usize, 2), view.coverages.len);
     try std.testing.expect(view.coverageById("title") != null);
     try std.testing.expect(view.coverageById("body") != null);
@@ -10787,7 +11092,7 @@ test "Workbook.setEmbeddings: second call replaces parts without PartAlreadyExis
     try wb.setEmbeddings("model-b", 2, .f32, &inputs2);
 
     // The second model + count survive the round-trip.
-    const view = (try wb.embeddings()).?;
+    const view = (try wb.embeddings()).present;
     try std.testing.expectEqualStrings("model-b", view.index.model);
     try std.testing.expectEqual(@as(usize, 1), view.coverages.len);
     try std.testing.expectEqual(@as(u32, 2), view.coverages[0].coverage.count);
@@ -10878,6 +11183,205 @@ test "Workbook.setEmbeddings: same range on different worksheets is NOT overlap 
     };
     // Different worksheet_target → no overlap; setEmbeddings succeeds.
     try wb.setEmbeddings("m", 2, .f32, &inputs);
-    const view = (try wb.embeddings()).?;
+    const view = (try wb.embeddings()).present;
     try std.testing.expectEqual(@as(usize, 2), view.coverages.len);
+}
+
+// ─── ER: recovery-record integration ────────────────────────────────
+//
+// The codec has its own tests in pkg/recovery_record.zig. These pin
+// the part that matters end-to-end: after a consumer strips
+// xl/zlsxEmbeddings/*, does the workbook still say what was there?
+
+/// Build a workbook with embeddings, then delete every embedding part
+/// the way Numbers and LibreOffice do — archive rebuilt, unknown parts
+/// gone, everything else intact.
+fn stripEmbeddingParts(wb: *Workbook) !void {
+    try wb.store.removePart(embedding_part.INDEX_PART_NAME);
+    try wb.store.removePart(embedding_part.INDEX_RELS_PART_NAME);
+    try wb.store.removePart("xl/zlsxEmbeddings/title/vec.bin");
+    try wb.store.removePart("xl/zlsxEmbeddings/title/hashes.bin");
+    wb.embedding_view = null;
+}
+
+/// Populate `wb` in place rather than returning one by value.
+///
+/// `Workbook` is self-referential — each `Worksheet` holds a
+/// `*PartStore` pointing back into the workbook — so returning it by
+/// value after `addSheet` leaves those pointers aimed at the dead
+/// stack slot. The caller owns the storage; this only fills it.
+fn setupEmbeddedWorkbook(wb: *Workbook) !void {
+    const ws = try wb.addSheet("Items");
+    try ws.appendRows(&[_][]const zlsx.Cell{
+        &.{.{ .string = "Title" }},
+        &.{.{ .string = "Alpha" }},
+    });
+    var vec_body: [2 * (4 + 2)]u8 = @splat(0);
+    const hashes = [_]u64{ 0xAAAA, 0xBBBB };
+    try wb.setEmbeddings("text-embedding-3-small", 2, .int8_sym_per_vec, &[_]EmbeddingCoverageInput{.{
+        .id = "title",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A3",
+        .column = "A",
+        .include_formulas = false,
+        .vec_body = &vec_body,
+        .hashes = &hashes,
+    }});
+}
+
+test "ER: setEmbeddings plants a recovery record in both carriers" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+    try setupEmbeddedWorkbook(&wb);
+
+    // docProps is written immediately; the defined name is staged and
+    // lands in xl/workbook.xml at save, so only the former is visible
+    // pre-save.
+    const dp = (try wb.store.part("docProps/custom.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, dp.bytes, recovery_record.MAGIC) != null);
+    try std.testing.expect(std.mem.indexOf(u8, dp.bytes, "text-embedding-3-small") != null);
+
+    var found = false;
+    for (wb.workbook_xml_plan.defined_names.items) |dn| {
+        if (std.mem.startsWith(u8, dn.name, recovery_record.NAME_PREFIX)) {
+            try std.testing.expect(dn.hidden);
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ER: a stripped workbook reports .stripped with the original provenance" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+    try setupEmbeddedWorkbook(&wb);
+    try stripEmbeddingParts(&wb);
+
+    const state = try wb.embeddings();
+    try std.testing.expect(state == .stripped);
+    const rec = state.stripped;
+    try std.testing.expectEqualStrings("text-embedding-3-small", rec.model);
+    try std.testing.expectEqual(@as(u32, 2), rec.dim);
+    try std.testing.expectEqualStrings("int8-sym-per-vec", rec.dtype);
+    try std.testing.expectEqual(@as(usize, 1), rec.coverages.len);
+    try std.testing.expectEqualStrings("title", rec.coverages[0].id);
+    try std.testing.expectEqualStrings("A2:A3", rec.coverages[0].range);
+    try std.testing.expectEqual(@as(u32, 2), rec.coverages[0].count);
+    // Pre-save the defined name is still staged, so docProps is the
+    // carrier that answers here.
+    try std.testing.expectEqual(recovery_record.Carrier.doc_props, rec.carrier);
+}
+
+test "ER: the defined-name carrier answers after a save round-trip" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var wb = try Workbook.empty(std.testing.allocator, io);
+    defer wb.deinit();
+    try setupEmbeddedWorkbook(&wb);
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const file = try std.fmt.allocPrint(std.testing.allocator, "{s}/er.xlsx", .{dir});
+    defer std.testing.allocator.free(file);
+    try wb.save(io, file);
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, file);
+    defer wb2.deinit();
+    // Sanity: the vectors are still there before we strip them.
+    try std.testing.expect((try wb2.embeddings()) == .present);
+
+    // Now strip the parts AND docProps, leaving only the defined name
+    // — the case where Document Inspector removed the properties but
+    // the name survived.
+    try stripEmbeddingParts(&wb2);
+    try wb2.store.removePart("docProps/custom.xml");
+
+    const state = try wb2.embeddings();
+    try std.testing.expect(state == .stripped);
+    try std.testing.expectEqual(recovery_record.Carrier.defined_name, state.stripped.carrier);
+    try std.testing.expectEqualStrings("text-embedding-3-small", state.stripped.model);
+}
+
+test "ER: no record and no index reports .absent, not an error" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+    _ = try wb.addSheet("S");
+    try std.testing.expect((try wb.embeddings()) == .absent);
+}
+
+test "ER: re-embedding replaces the record instead of accumulating chunks" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+    try setupEmbeddedWorkbook(&wb);
+
+    // A second setEmbeddings must not trip DuplicateDefinedName, and
+    // must leave exactly one generation of chunks behind — two
+    // generations concatenated by index would decode as garbage.
+    var vec_body: [2 * (4 + 2)]u8 = @splat(0);
+    const hashes = [_]u64{ 0xCCCC, 0xDDDD };
+    try wb.setEmbeddings("second-model", 2, .int8_sym_per_vec, &[_]EmbeddingCoverageInput{.{
+        .id = "title",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A3",
+        .column = "A",
+        .include_formulas = false,
+        .vec_body = &vec_body,
+        .hashes = &hashes,
+    }});
+
+    var chunk0: usize = 0;
+    for (wb.workbook_xml_plan.defined_names.items) |dn| {
+        if (std.mem.eql(u8, dn.name, "_zlsxRecovery0")) chunk0 += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), chunk0);
+
+    try stripEmbeddingParts(&wb);
+    const state = try wb.embeddings();
+    try std.testing.expectEqualStrings("second-model", state.stripped.model);
+}
+
+test "ER: digest changes when the covered content changes" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var wb = try Workbook.empty(std.testing.allocator, io);
+    defer wb.deinit();
+    try setupEmbeddedWorkbook(&wb);
+    try stripEmbeddingParts(&wb);
+    const first = (try wb.embeddings()).stripped.digest;
+
+    // Same model and ranges, different per-row content hashes: the
+    // digest is a content fingerprint, so it must move.
+    var wb2 = try Workbook.empty(std.testing.allocator, io);
+    defer wb2.deinit();
+    const ws = try wb2.addSheet("Items");
+    try ws.appendRows(&[_][]const zlsx.Cell{
+        &.{.{ .string = "Title" }},
+        &.{.{ .string = "Alpha" }},
+    });
+    var vec_body: [2 * (4 + 2)]u8 = @splat(0);
+    const other = [_]u64{ 0x1111, 0x2222 };
+    try wb2.setEmbeddings("text-embedding-3-small", 2, .int8_sym_per_vec, &[_]EmbeddingCoverageInput{.{
+        .id = "title",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A3",
+        .column = "A",
+        .include_formulas = false,
+        .vec_body = &vec_body,
+        .hashes = &other,
+    }});
+    try stripEmbeddingParts(&wb2);
+    try std.testing.expect(first != (try wb2.embeddings()).stripped.digest);
 }

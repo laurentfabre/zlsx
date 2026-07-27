@@ -167,6 +167,42 @@ express "these vectors were stripped by some tool, here is what they
 were" instead of being unable to distinguish that from "never had
 any".
 
+### Implemented and measured (ER, 2026-07-27)
+
+`pkg/recovery_record.zig` is the codec; `Workbook.setEmbeddings` writes
+both carriers; `Workbook.embeddings()` reads them back.
+
+**The accessor now returns a tagged union**, not `?EmbeddingView`:
+
+```zig
+pub const EmbeddingState = union(enum) {
+    present:  EmbeddingView,           // vectors here
+    stripped: RecoveryRecord,          // vectors gone, provenance recovered
+    absent,                            // never had any
+};
+```
+
+That is the API expressing the contract. Collapsing `.stripped` into a
+bare `null` would leave the default caller experience silent, which is
+the outcome this whole section rejects. `viewOrNull()` exists for
+callers that have already decided how to treat a strip — the name says
+the state is being discarded.
+
+End-to-end validation against the tools that motivated it. In every
+case the vectors are genuinely destroyed (index and workbook rel gone)
+and the provenance still comes back:
+
+| Round-trip | Vectors | Record | Carrier that answered |
+|---|---|---|---|
+| LibreOffice Calc 26.2.3.2 | destroyed | **recovered** | `defined_name` |
+| openpyxl 3.1.5 | destroyed | **recovered** | `defined_name` |
+| LibreOffice, then `docProps` removed (Document Inspector) | destroyed | **recovered** | `defined_name` |
+| LibreOffice, then defined names removed | destroyed | **recovered** | `doc_props` |
+
+The last two rows are the reason for carrying two carriers rather than
+one: each is independently sufficient, and their removal mechanisms do
+not overlap.
+
 ### Known risk, stated plainly
 
 **Numbers is unmeasured**, and it is the most aggressive rebuilder of
