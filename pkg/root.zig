@@ -48,6 +48,7 @@ pub const ResolvedStyle = workbook_mod.ResolvedStyle;
 pub const WorkbookError = workbook_mod.Error;
 pub const NumberFormatInfo = workbook_mod.NumberFormatInfo;
 pub const EmbeddingView = workbook_mod.EmbeddingView;
+pub const EmbeddingState = workbook_mod.EmbeddingState;
 pub const EmbeddingCoverageView = workbook_mod.EmbeddingCoverageView;
 pub const EmbeddingCoverageInput = workbook_mod.EmbeddingCoverageInput;
 
@@ -80,3 +81,4 @@ pub const WorksheetSpans = editor_mod.WorksheetSpans;
 /// byte slices for the on-disk index.xml / index.xml.rels / vec.bin /
 /// hashes.bin parts under `xl/zlsxEmbeddings/`.
 pub const embedding_part = @import("embedding_part.zig");
+pub const recovery_record = @import("recovery_record.zig");

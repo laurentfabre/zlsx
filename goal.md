@@ -33,13 +33,14 @@ graph LR
     E2 --> E4["emb-4 ✅ 3-tool<br/>matrix done<br/>(Win pending host)"]
     E4 --> E4B["emb-4B ◐ carrier matrix<br/>3 carriers survive<br/>both rebuilders"]
     E4B --> DEC{{"durability contract<br/>DECIDED 2026-07-26"}}
-    DEC --> ER["⬅ NEXT: emb-R<br/>recovery record<br/>hidden definedName + docProps"]
-    ER --> E5["emb-5<br/>Python (NumPy + valid_mask)"]
+    DEC --> ER["emb-R ✅ recovery record<br/>hidden definedName + docProps"]
+    ER --> E5["⬅ NEXT: emb-5<br/>Python (NumPy + valid_mask)"]
     E5 --> E6["emb-6<br/>CLI: zlsx embed / --prune / --strip"]
     style E4 fill:#16213e
     style E4B fill:#16213e
     style DEC fill:#0f3460
-    style ER fill:#0f3460
+    style ER fill:#16213e
+    style E5 fill:#0f3460
 ```
 
 **emb-4 — DONE for the 3 reachable desktop tools (validated 2026-05-30/31).**
@@ -104,7 +105,14 @@ assumed): LibreOffice rewrites `hidden="1"` → `hidden="true"`, XML-escapes the
 strips the record too, the contract weakens to "detectable except through Numbers" —
 survivable, but it must be said out loud. Highest-value open measurement in the arc.
 
-**▶ NEXT — emb-R (recovery record), then emb-5 (Python), emb-6 (CLI).**
+**✅ emb-R SHIPPED (2026-07-27).** `pkg/recovery_record.zig` + both carriers. `embeddings()`
+now returns `EmbeddingState` — `present` / `stripped` / `absent` — so a stripped workbook
+cannot be mistaken for one that never had vectors. Validated end-to-end: LibreOffice and
+openpyxl both destroy the vectors and the provenance still comes back, via `defined_name`;
+with `docProps` removed it still recovers, and with the names removed it falls back to
+`doc_props`. Each carrier is independently sufficient.
+
+**▶ NEXT — emb-5 (Python), then emb-6 (CLI).**
 Full reasoning: `docs/plans/embeddings-in-xlsx.md` §Durability contract.
 
 Spec: `docs/plans/embeddings-in-xlsx.md` · matrix + Findings: `docs/plans/emb-4-compat-matrix.md`.

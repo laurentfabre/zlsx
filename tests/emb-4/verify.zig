@@ -76,19 +76,32 @@ pub fn main(init: std.process.Init) !u8 {
     );
 
     // 2. Embeddings view + coverage walk.
-    const view_opt = wb.embeddings() catch |err| {
+    const state = wb.embeddings() catch |err| {
         try w.print(allocator, "  embeddings(): error.{s}\n", .{@errorName(err)});
         try stdout.writeAll(out_buf.items);
         return 3;
     };
-    if (view_opt == null) {
-        try w.print(allocator, "  embeddings(): null (no xl/zlsxEmbeddings/index.xml)\n", .{});
-        try stdout.writeAll(out_buf.items);
-        // Distinguish "no parts at all" (exit 3) from "rel present
-        // but parts gone" (exit 5).
-        return if (rel_present) 5 else 3;
-    }
-    const view = view_opt.?;
+    const view = switch (state) {
+        .present => |v| v,
+        // Both non-present cases are STRIPPED for this matrix — it
+        // measures whether the *parts* survived. The ER record does
+        // not change that verdict; it changes whether the strip is
+        // silent, so report which one happened.
+        .stripped => |rec| {
+            try w.print(allocator,
+                \\  embeddings(): stripped (no index) — ER recovery record SURVIVED
+                \\    recovered: model={s} dim={d} dtype={s} coverages={d} carrier={s}
+                \\
+            , .{ rec.model, rec.dim, rec.dtype, rec.coverages.len, @tagName(rec.carrier) });
+            try stdout.writeAll(out_buf.items);
+            return if (rel_present) 5 else 3;
+        },
+        .absent => {
+            try w.print(allocator, "  embeddings(): absent (no index, no ER recovery record)\n", .{});
+            try stdout.writeAll(out_buf.items);
+            return if (rel_present) 5 else 3;
+        },
+    };
 
     var fields_ok = true;
     try w.print(allocator, "  model: {s}", .{view.index.model});
