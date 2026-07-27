@@ -1200,6 +1200,7 @@ ZLSX_EMB_STRIPPED = 2
 
 ZLSX_EMB_CARRIER_DEFINED_NAME = 0
 ZLSX_EMB_CARRIER_DOC_PROPS = 1
+ZLSX_EMB_CARRIER_CELL_DATA = 2
 
 # Feature-gated like the editor surface: a wheel built against an older
 # libzlsx must still import, with the embedding API simply absent.

@@ -3186,7 +3186,10 @@ class Embeddings:
         if not self.stripped:
             return None
         c = _ffi.lib.zlsx_emb_carrier(self._h)
-        return "doc_props" if c == _ffi.ZLSX_EMB_CARRIER_DOC_PROPS else "defined_name"
+        return {
+            _ffi.ZLSX_EMB_CARRIER_DOC_PROPS: "doc_props",
+            _ffi.ZLSX_EMB_CARRIER_CELL_DATA: "cell_data",
+        }.get(c, "defined_name")
 
     # ── vectors (present only) ───────────────────────────────────────
 

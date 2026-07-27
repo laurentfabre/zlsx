@@ -237,11 +237,22 @@ model, so precisely what that model represents survives. Invisibility
 and Numbers-durability are mutually exclusive here — not by
 implementation, by construction.
 
-The escape hatch is a third carrier in cell data, which trades Goal 3
-for universality. It is a one-flag change on the existing writer and is
-deliberately **not** the default: it breaches a stated product goal to
-buy durability against one application. `emb-4b-carrier-matrix.md`
-§"The trade-off is now explicit" states both positions.
+**The escape hatch ships**, as `RecoveryOptions.recovery_in_cells`:
+
+```zig
+try wb.setEmbeddingsOpts(model, dim, dtype, inputs,
+    .{ .recovery_in_cells = true });   // survives Numbers; costs a visible sheet
+```
+
+Default off, so Goal 3 holds unless a caller deliberately trades it.
+Verified against a real Numbers 15.3 export: the default fixture comes
+back `absent`, the `--cells` fixture comes back `stripped` with
+`carrier=cell_data` and full provenance.
+
+The library does not choose for you. The default is invisible because
+that is the stated product goal; the hatch is one flag away because
+"your vectors silently vanished" is a worse outcome for some callers
+than "there is a sheet you can unhide".
 
 `E4W` (Excel for Windows) remains open for the *vector* half of the
 contract. If Excel-Win preserves like Excel-mac, "Excel-durable" is a

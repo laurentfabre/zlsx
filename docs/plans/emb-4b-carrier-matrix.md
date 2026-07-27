@@ -204,11 +204,23 @@ So there are two honest positions, and they cannot both be held:
   Numbers round-trip keeps the provenance — at the cost of a hidden
   sheet a user can reveal with Sheet ▸ Unhide. Goal 3 breached.
 
-The second is a one-flag change on top of the existing writer, not a
-redesign. It is left as an opt-in rather than a default because it
-trades a stated product goal for durability against one application,
-and that is a call for whoever owns the promise, not for the harness
-that measured it.
+**Both are now implemented, and the choice is the caller's.**
+`setEmbeddingsOpts(..., .{ .recovery_in_cells = true })` adds the cell
+carrier; the default leaves it off, so Goal 3 holds unless a caller
+deliberately trades it away.
+
+Verified against a real Numbers 15.3 export, not simulated:
+
+| fixture | after Numbers export |
+|---|---|
+| default carriers | `absent` — vectors *and* evidence gone |
+| `--cells` opt-in | `stripped`, `carrier=cell_data`, full provenance |
+
+So the trade-off is real in both directions and measured in both
+directions. What the library does *not* do is pick for you: the default
+is invisible because that is the stated product goal, and the escape
+hatch is one flag away because "your vectors silently vanished" is a
+worse outcome for some callers than "there is a sheet you can unhide".
 
 ### What this does *not* settle
 

@@ -150,9 +150,11 @@ decision is made (2026-07-26) and the arc is unblocked.**
 > erased by Numbers, and the only survivor is cell data, which is
 > visible. Numbers rebuilds from its own document model, so exactly what
 > that model represents survives. Invisibility and Numbers-durability
-> are mutually exclusive by construction. The escape hatch — cell data
-> as an opt-in third carrier — trades Goal 3 for universality and is a
-> product call, not a harness one.
+> are mutually exclusive by construction. Both positions therefore
+> ship: the default stays invisible (Goal 3 intact), and
+> `recovery_in_cells = true` adds the cell carrier for callers who would
+> rather have a visible sheet than a silent loss. Verified against a
+> real Numbers 15.3 export in both configurations.
 
 `E4` did its job: it measured, and the measurement was bad news. Of the
 three reachable targets, only Excel for Mac preserves the vectors on

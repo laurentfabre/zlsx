@@ -110,9 +110,10 @@ assumed): LibreOffice rewrites `hidden="1"` → `hidden="true"`, XML-escapes the
 **⛔ The risk materialised.** Numbers strips both recovery carriers, so a Numbers export
 reports `absent`, not `stripped`. It cannot be engineered around: every invisible carrier
 dies there, and the only survivor — cell data — is visible by definition, because Numbers
-rebuilds from its own document model. **Open product call:** accept "invisible, not
-universal" (what ships), or add cell data as an opt-in third carrier and trade Goal 3 for
-universality. One flag on the existing writer.
+rebuilds from its own document model. **Closed 2026-07-27:** both positions ship. Default is
+"invisible, not universal" (Goal 3 intact); `recovery_in_cells = true` adds the cell
+carrier and survives Numbers, at the cost of a sheet the user can unhide. Verified against
+a real Numbers export in both configurations.
 
 **✅ emb-R SHIPPED (2026-07-27).** `pkg/recovery_record.zig` + both carriers. `embeddings()`
 now returns `EmbeddingState` — `present` / `stripped` / `absent` — so a stripped workbook

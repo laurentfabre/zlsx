@@ -4312,6 +4312,8 @@ pub const ZLSX_EMB_STRIPPED: u32 = 2;
 
 pub const ZLSX_EMB_CARRIER_DEFINED_NAME: u32 = 0;
 pub const ZLSX_EMB_CARRIER_DOC_PROPS: u32 = 1;
+/// Opt-in carrier: the only one Apple Numbers preserves.
+pub const ZLSX_EMB_CARRIER_CELL_DATA: u32 = 2;
 
 const EmbState = struct {
     inner: zlsx_pkg.Workbook,
@@ -4491,6 +4493,7 @@ export fn zlsx_emb_carrier(h: *Emb) callconv(.c) u32 {
         .stripped => |r| switch (r.carrier) {
             .defined_name => ZLSX_EMB_CARRIER_DEFINED_NAME,
             .doc_props => ZLSX_EMB_CARRIER_DOC_PROPS,
+            .cell_data => ZLSX_EMB_CARRIER_CELL_DATA,
         },
         else => 0,
     };

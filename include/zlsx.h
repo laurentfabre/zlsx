@@ -1303,6 +1303,8 @@ int32_t zlsx_editor_strip_doc_props(
 
 #define ZLSX_EMB_CARRIER_DEFINED_NAME 0u
 #define ZLSX_EMB_CARRIER_DOC_PROPS    1u
+/* Opt-in carrier; the only one Apple Numbers preserves. */
+#define ZLSX_EMB_CARRIER_CELL_DATA    2u
 
 /* Open an .xlsx and resolve its embedding state. NULL on I/O or parse
  * failure; an absent or stripped set is a successful open. */
