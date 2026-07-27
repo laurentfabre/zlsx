@@ -1616,6 +1616,127 @@ pub const Workbook = struct {
         self.allocator.free(specs);
     }
 
+    /// Remove every embedding artefact — the exact inverse of
+    /// `setEmbeddings`, including the recovery record.
+    ///
+    /// This is the pre-share operation from the design's Caveats: it
+    /// removes the vectors *and* the evidence they ever existed, so a
+    /// stripped workbook reports `.absent` rather than `.stripped`.
+    /// That is deliberately the one place the durability contract's
+    /// "never a silent nothing" rule does not apply — the caller asked
+    /// for the nothing.
+    ///
+    /// Idempotent, and safe on a workbook that never had embeddings:
+    /// every removal below is a no-op when its part is missing.
+    /// Callable on a partially-stripped workbook too (a Numbers export
+    /// that kept the recovery record but dropped the vectors), which is
+    /// why the recovery carriers are cleaned unconditionally rather
+    /// than only when an index was found.
+    pub fn stripEmbeddings(self: *Workbook) Error!void {
+        // Sweep the whole `xl/zlsxEmbeddings/` directory rather than
+        // walking the index's coverage list. The index names the parts
+        // *this writer* created; the directory holds whatever is
+        // actually in the archive. They diverge exactly when it matters
+        // — a truncated or hand-edited index — and leaving vectors
+        // behind is the one failure this call exists to prevent.
+        //
+        // It also means a malformed index needs no special handling: it
+        // is just another part under the directory.
+        try self.removeEmbeddingDirParts();
+        try self.unregisterWorkbookEmbeddingsRel();
+
+        // The recovery record rides in three carriers; all three go.
+        self.dropStagedRecoveryNames();
+        try self.stripRecoveryNamesFromWorkbookXml();
+        try self.removeRecoveryDocProp();
+        try self.removeRecoveryCellSheet();
+
+        self.embedding_view = null;
+    }
+
+    /// Drop every `xl/zlsxEmbeddings/**` part — index, rels, and every
+    /// coverage's `vec.bin` / `hashes.bin`.
+    ///
+    /// Walks the store backwards because `removePart` compacts the
+    /// parallel arrays, so forward iteration would skip the entry that
+    /// slides into each removed slot.
+    ///
+    /// Each `removePart` independently drops the removed part's
+    /// content-type override and rewrites any `.rels` file pointing at
+    /// it, so no ordering between them is required.
+    fn removeEmbeddingDirParts(self: *Workbook) Error!void {
+        var i: usize = self.store.parts.len;
+        while (i > 0) {
+            i -= 1;
+            const name = self.store.parts[i].name;
+            if (!std.mem.startsWith(u8, name, embedding_part.EMBEDDINGS_DIR)) continue;
+            // Guard against a same-prefix sibling directory, e.g.
+            // `xl/zlsxEmbeddingsBackup/…`, which is not ours to delete.
+            if (name.len > embedding_part.EMBEDDINGS_DIR.len and
+                name[embedding_part.EMBEDDINGS_DIR.len] != '/') continue;
+            try self.store.removePart(name);
+        }
+    }
+
+    /// Remove the recovery property from `docProps/custom.xml`.
+    ///
+    /// Removes only our own `<property>`; the part itself goes only if
+    /// nothing else is left in it. A workbook can carry custom
+    /// properties that predate the embeddings, and a strip has no
+    /// business discarding them.
+    fn removeRecoveryDocProp(self: *Workbook) Error!void {
+        const part = (try self.store.part("docProps/custom.xml")) orelse return;
+        const src = part.bytes;
+        if (std.mem.indexOf(u8, src, recovery_record.DOC_PROP_NAME) == null) return;
+
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        const w = &out.writer;
+
+        // Two cursors, deliberately: `pos` is the start of the region
+        // not yet copied out, `scan` is where to look for the next
+        // element. A kept property must leave `pos` untouched so it
+        // stays inside the region a later copy flushes — advancing both
+        // would skip it into the gap and silently drop it.
+        var pos: usize = 0;
+        var scan: usize = 0;
+        var kept_properties: usize = 0;
+        while (std.mem.indexOfPos(u8, src, scan, "<property")) |start| {
+            // A `<property/>` with no close tag is malformed for this
+            // schema (the value is a required child). Stop rather than
+            // guess — erring toward keeping bytes we did not write.
+            const end_tag = std.mem.indexOfPos(u8, src, start, "</property>") orelse break;
+            const after = end_tag + "</property>".len;
+            if (std.mem.indexOf(u8, src[start..after], recovery_record.DOC_PROP_NAME) == null) {
+                kept_properties += 1;
+                scan = after;
+                continue;
+            }
+            w.writeAll(src[pos..start]) catch return error.WriteFailed;
+            pos = after;
+            scan = after;
+        }
+
+        if (kept_properties == 0) {
+            try self.store.removePart("docProps/custom.xml");
+            return;
+        }
+        w.writeAll(src[pos..]) catch return error.WriteFailed;
+        try self.store.replacePart("docProps/custom.xml", out.written());
+    }
+
+    /// Delete the hidden `zlsxRecovery` sheet written by the
+    /// `recovery_in_cells` opt-in, if it is present.
+    fn removeRecoveryCellSheet(self: *Workbook) Error!void {
+        // Names live on the parsed workbook view, not on `Worksheet` —
+        // same lookup `sheetByName` does.
+        for (self.workbook.sheets, 0..) |s, i| {
+            if (!std.mem.eql(u8, s.name, recovery_record.CELL_SHEET_NAME)) continue;
+            try self.deleteSheet(@intCast(i));
+            return;
+        }
+    }
+
     /// Fold every coverage's per-row content hashes into one digest,
     /// in coverage order.
     ///
@@ -1833,6 +1954,53 @@ pub const Workbook = struct {
     /// Surfaces `MissingWorkbookRels` if `xl/_rels/workbook.xml.rels`
     /// is absent, and `MalformedWorkbookRels` if the file lacks
     /// a closing `</Relationships>` tag.
+    /// Remove the workbook→index relationship.
+    ///
+    /// `PartStore.removePart` rewrites rels pointing at a removed part,
+    /// but it matches on the part's *full* name. This Target is written
+    /// relative to the rels file's owner — `zlsxEmbeddings/index.xml`,
+    /// not `xl/zlsxEmbeddings/index.xml` — so it survives that sweep and
+    /// would be left dangling at a part that no longer exists.
+    ///
+    /// Matched on Type, the same functional key the add path uses for
+    /// its idempotency check, so every Target spelling is covered.
+    fn unregisterWorkbookEmbeddingsRel(self: *Workbook) Error!void {
+        const rels_part = (try self.store.part("xl/_rels/workbook.xml.rels")) orelse return;
+        const src = rels_part.bytes;
+        if (std.mem.indexOf(u8, src, embedding_part.REL_TYPE_EMBEDDINGS) == null) return;
+
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        const w = &out.writer;
+
+        // Same two-cursor split as `removeRecoveryDocProp`: `pos` is the
+        // uncopied region, `scan` is the search head.
+        var pos: usize = 0;
+        var scan: usize = 0;
+        while (std.mem.indexOfPos(u8, src, scan, "<Relationship")) |start| {
+            // `<Relationships>` — the root — shares this prefix. Its
+            // span would run to the first child's `/>` and could carry
+            // our Type inside it, splicing away a sibling. Require a
+            // real tag boundary before treating the match as an element.
+            const next = start + "<Relationship".len;
+            if (next < src.len and src[next] != ' ' and src[next] != '/' and src[next] != '>') {
+                scan = next;
+                continue;
+            }
+            const close = std.mem.indexOfPos(u8, src, start, "/>") orelse break;
+            const after = close + "/>".len;
+            if (std.mem.indexOf(u8, src[start..after], embedding_part.REL_TYPE_EMBEDDINGS) == null) {
+                scan = after;
+                continue;
+            }
+            w.writeAll(src[pos..start]) catch return error.WriteFailed;
+            pos = after;
+            scan = after;
+        }
+        w.writeAll(src[pos..]) catch return error.WriteFailed;
+        try self.store.replacePart("xl/_rels/workbook.xml.rels", out.written());
+    }
+
     fn registerWorkbookEmbeddingsRel(self: *Workbook) Error!void {
         const rels_part = (try self.store.part("xl/_rels/workbook.xml.rels")) orelse
             return error.MissingWorkbookRels;
@@ -11686,4 +11854,190 @@ test "ER cells: without the opt-in, a Numbers-shaped strip reports absent" {
     // This is the measured Numbers outcome, and the reason the opt-in
     // exists. Pinned so the default's cost is explicit in the suite.
     try std.testing.expect((try wb.embeddings()) == .absent);
+}
+
+// ─── emb-6a: stripEmbeddings ────────────────────────────────────────
+//
+// The pre-share operation. Unlike a Numbers-shaped strip — which
+// removes the vectors and leaves the recovery record behind, so the
+// workbook still reports `.stripped` — this removes the evidence too
+// and reports `.absent`. The caller asked for the nothing.
+
+/// Count surviving parts under `xl/zlsxEmbeddings/`.
+fn embeddingDirPartCount(wb: *Workbook) usize {
+    var n: usize = 0;
+    for (wb.store.parts) |p| {
+        if (std.mem.startsWith(u8, p.name, embedding_part.EMBEDDINGS_DIR)) n += 1;
+    }
+    return n;
+}
+
+test "strip: removes every embedding part and reports absent" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+    try setupEmbeddedWorkbook(&wb);
+    try std.testing.expect(embeddingDirPartCount(&wb) > 0);
+
+    try wb.stripEmbeddings();
+
+    try std.testing.expectEqual(@as(usize, 0), embeddingDirPartCount(&wb));
+    // `.absent`, not `.stripped` — the distinction this call exists for.
+    try std.testing.expect((try wb.embeddings()) == .absent);
+}
+
+test "strip: clears all three recovery carriers" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+    try setupEmbeddedWorkbook(&wb);
+    try wb.stripEmbeddings();
+
+    // docProps carrier: the whole part goes, since the recovery
+    // property was the only thing in it.
+    try std.testing.expect((try wb.store.part("docProps/custom.xml")) == null);
+
+    // Staged defined-name carrier.
+    for (wb.workbook_xml_plan.defined_names.items) |dn| {
+        try std.testing.expect(!std.mem.startsWith(u8, dn.name, recovery_record.NAME_PREFIX));
+    }
+}
+
+test "strip: removes the recovery sheet the cell opt-in creates" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+
+    const ws = try wb.addSheet("Items");
+    try ws.appendRows(&[_][]const zlsx.Cell{
+        &.{.{ .string = "Title" }},
+        &.{.{ .string = "Alpha" }},
+    });
+    var vec_body: [2 * (4 + 2)]u8 = @splat(0);
+    const hashes = [_]u64{ 0xAAAA, 0xBBBB };
+    try wb.setEmbeddingsOpts("m", 2, .int8_sym_per_vec, &[_]EmbeddingCoverageInput{.{
+        .id = "title",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A3",
+        .column = "A",
+        .include_formulas = false,
+        .vec_body = &vec_body,
+        .hashes = &hashes,
+    }}, .{ .recovery_in_cells = true });
+    try std.testing.expect((try wb.sheetByName(recovery_record.CELL_SHEET_NAME)) != null);
+
+    try wb.stripEmbeddings();
+
+    // The visible cost of the opt-in has to go too, or a strip leaves a
+    // user-facing sheet behind advertising what was removed.
+    try std.testing.expect((try wb.sheetByName(recovery_record.CELL_SHEET_NAME)) == null);
+    try std.testing.expect((try wb.embeddings()) == .absent);
+}
+
+test "strip: is a no-op on a workbook that never had embeddings" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+    const ws = try wb.addSheet("Items");
+    try ws.appendRows(&[_][]const zlsx.Cell{&.{.{ .string = "Alpha" }}});
+
+    try wb.stripEmbeddings();
+
+    try std.testing.expect((try wb.embeddings()) == .absent);
+    try std.testing.expectEqual(@as(u32, 1), wb.sheetCount());
+}
+
+test "strip: is idempotent — a second strip changes nothing" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+    try setupEmbeddedWorkbook(&wb);
+
+    try wb.stripEmbeddings();
+    const after_first = wb.store.parts.len;
+    try wb.stripEmbeddings();
+
+    try std.testing.expectEqual(after_first, wb.store.parts.len);
+    try std.testing.expect((try wb.embeddings()) == .absent);
+}
+
+test "strip: sweeps a coverage part the index never named" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+    try setupEmbeddedWorkbook(&wb);
+
+    // A hand-edited or truncated index is exactly the case where
+    // walking the coverage list would strand vectors on disk. The
+    // directory sweep is what makes that unreachable.
+    try wb.store.addPart(
+        "xl/zlsxEmbeddings/orphan/vec.bin",
+        embedding_part.VEC_CONTENT_TYPE,
+        "ZVEC-not-in-the-index",
+    );
+
+    try wb.stripEmbeddings();
+
+    try std.testing.expectEqual(@as(usize, 0), embeddingDirPartCount(&wb));
+}
+
+test "strip: leaves no relationship pointing at the removed index" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+    try setupEmbeddedWorkbook(&wb);
+
+    const before = (try wb.store.part("xl/_rels/workbook.xml.rels")).?;
+    try std.testing.expect(
+        std.mem.indexOf(u8, before.bytes, embedding_part.REL_TYPE_EMBEDDINGS) != null,
+    );
+
+    try wb.stripEmbeddings();
+
+    // `removePart`'s rels sweep matches the part's full name, but this
+    // Target is relative to `xl/` — so it does NOT match, and without
+    // an explicit unregister the rel survives pointing at nothing.
+    // `emb4-verify` calls that ORPHANED-REL (exit 5); an in-memory
+    // `.absent` check does not see it, which is why this asserts on the
+    // rels bytes directly.
+    const after = (try wb.store.part("xl/_rels/workbook.xml.rels")).?;
+    try std.testing.expect(
+        std.mem.indexOf(u8, after.bytes, embedding_part.REL_TYPE_EMBEDDINGS) == null,
+    );
+    // The sibling rels must survive — this splices one element out, it
+    // does not rewrite the file.
+    try std.testing.expect(std.mem.indexOf(u8, after.bytes, "worksheets/sheet1.xml") != null);
+    try std.testing.expect(std.mem.startsWith(u8, after.bytes, "<?xml"));
+    try std.testing.expect(std.mem.endsWith(u8, after.bytes, "</Relationships>"));
+}
+
+test "strip: keeps custom document properties that are not ours" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+    try setupEmbeddedWorkbook(&wb);
+
+    // Re-plant the part carrying a foreign property alongside ours, the
+    // shape a third-party tool would leave. A strip removes only the
+    // property it wrote; discarding someone else's metadata would be a
+    // silent side effect of an unrelated request.
+    try wb.store.replacePart("docProps/custom.xml",
+        \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        \\<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="2" name="ZlsxEmbeddingRecovery"><vt:lpwstr>ZEMR1:payload</vt:lpwstr></property><property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="3" name="Department"><vt:lpwstr>Finance</vt:lpwstr></property></Properties>
+    );
+
+    try wb.stripEmbeddings();
+
+    const dp = (try wb.store.part("docProps/custom.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, dp.bytes, "Department") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dp.bytes, "Finance") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dp.bytes, recovery_record.DOC_PROP_NAME) == null);
 }
