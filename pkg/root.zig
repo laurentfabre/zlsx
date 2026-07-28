@@ -69,6 +69,11 @@ pub const ImageCellAnchor = drawing_emit_mod.ImageCellAnchor;
 /// Editor — load-modify-save overlay (relocated to pkg/ in B2 iter-er-0).
 const editor_mod = @import("editor.zig");
 pub const Editor = editor_mod.Editor;
+/// The element type `Editor.setCells` takes. Without it the batch form is
+/// unreachable from outside: a consumer cannot spell the slice it needs,
+/// and falls back to N × `setCell` — which is what nemonym's xlsx pipeline
+/// had to do.
+pub const Edit = editor_mod.Edit;
 
 /// Document-properties view + scrub mask, re-exported so consumers can
 /// name the types without reaching into `typed_parts`.
