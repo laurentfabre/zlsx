@@ -138,41 +138,56 @@ All four libraries read identical content from the file. The counter differences
 
 Same workload across all three implementations: 1,001 rows × 10 cols (one header row + 1,000 data rows). The header row has per-cell styles (bold white-on-blue fill, centre-aligned). Body rows mix strings, integers, floats, booleans, with the numeric columns referencing one of two shared number-format styles (`$#,##0.00` / `0.00%`). Sheet gets `column_width[0]=20` + `freeze_panes(row=1)`.
 
-20-run `hyperfine -N` median, last refreshed 2026-04-25. zlsx bench uses `smp_allocator` + in-house LZ77 + dynamic-huffman deflate with lazy matching + word-size SIMD match-length compare — see methodology notes below:
+20-run `hyperfine -N` mean ± σ. **All three rows re-measured together on
+2026-07-28** (macOS Apple Silicon, Zig 0.16.0, xlsxwriter 3.2.9, openpyxl
+3.1.5). zlsx bench uses `smp_allocator` + stdlib `std.compress.flate` — see
+methodology notes below:
 
 | Impl | Time | Peak RSS | Output size | Speedup (wall) |
 |---|---|---|---|---|
-| **zlsx Writer** | **6.7 ms ± 0.3** | **4.44 MB** | 54.9 KB | **1.00×** |
-| xlsxwriter 3.2 (`constant_memory`) | 66.4 ms ± 1.0 | 25.61 MB | 55.2 KB | 9.93× slower |
-| openpyxl 3.1 (`write_only`) | 151.9 ms ± 6.4 | 41.65 MB | 52.8 KB | 22.74× slower |
+| **zlsx Writer** | **7.7 ms ± 0.2** | **3.94 MB** | 56.6 KB | **1.00×** |
+| xlsxwriter 3.2.9 (`constant_memory`) | 78.5 ms ± 0.9 | 25.77 MB | 55.2 KB | 10.19× slower |
+| openpyxl 3.1.5 (`write_only`) | 168.9 ms ± 2.3 | 41.78 MB | 52.8 KB | 21.91× slower |
 
 ```
-  zlsx Writer    ▌              6.7 ms    1.00×
-  xlsxwriter     ▌▌▌▌▌▌▌▌       66.4 ms    9.93× slower
-  openpyxl       ▌▌…▌▌         151.9 ms   22.74× slower
+  zlsx Writer    ▌              7.7 ms    1.00×
+  xlsxwriter     ▌▌▌▌▌▌▌▌       78.5 ms   10.19× slower
+  openpyxl       ▌▌…▌▌         168.9 ms   21.91× slower
 ```
 
 Throughput at that size (rows/sec):
 
 | Impl | Styled rows/sec |
 |---|---|
-| **zlsx Writer** | **~149,000** |
-| xlsxwriter | ~15,070 |
-| openpyxl | ~6,590 |
+| **zlsx Writer** | **~130,000** |
+| xlsxwriter | ~12,700 |
+| openpyxl | ~5,900 |
 
-> **Re-measured after the Zig 0.16 deflate swap — the numbers hold.**
-> The zlsx write row was originally measured against the in-house LZ77 +
-> dynamic-huffman encoder, which the 0.16 migration retired in favour of
-> stdlib `std.compress.flate`. Re-running the *same* harness
-> (`scripts/bench_ci.sh`) on the *same* fixture and machine class gives
-> **6.58 ms ± 0.21** against the 6.7 ms ± 0.3 recorded above: unchanged
-> within noise, so the ratios against xlsxwriter and openpyxl stand.
+> **Full re-measurement, 2026-07-28 — the ratios hold, the absolutes moved.**
+> The April figures had a standing caveat: only the zlsx row had been re-run
+> after the 0.16 deflate swap, and the two Python rows were carried forward
+> unverified. All three are now measured in one `hyperfine` invocation on one
+> machine, which is the only way a cross-implementation ratio means anything.
 >
-> Caveat on scope: only the zlsx row was re-run. The xlsxwriter and
-> openpyxl figures are carried forward from 2026-04-25 — nothing about
-> this change could move them, but they have not been independently
-> re-verified. Reader rows are unaffected either way: the read path
-> already went through stdlib `std.compress.flate.Decompress`.
+> **Every absolute time rose 11–18% versus 2026-04-25** (zlsx 6.7 → 7.7 ms,
+> xlsxwriter 66.4 → 78.5, openpyxl 151.9 → 168.9). They moved *together*, so
+> this is the machine, not a regression in any of them — a different box and
+> three OS releases separate the two runs. The durable numbers are the
+> ratios, and those held: **9.93× → 10.19×** and **22.74× → 21.91×**.
+>
+> Two real changes, both zlsx-side and both from the deflate swap:
+> **peak RSS improved 4.44 → 3.94 MB**, and **output grew 54.9 → 56.6 KB**
+> (+3%). The April note said "the numbers hold" — true of *time*, which is
+> all it checked. Stdlib `flate` compresses slightly worse than the retired
+> in-house encoder's lazy matching. zlsx no longer lands byte-for-byte with
+> xlsxwriter; it is now ~1.4 KB larger on this workload.
+>
+> The Python rows are unchanged where they should be: both output sizes are
+> byte-identical to April (55.2 / 52.8 KB) and RSS moved <0.5%, which is the
+> check that the workload itself did not drift.
+>
+> Reader rows are unaffected: the read path already used stdlib
+> `std.compress.flate.Decompress`.
 
 ### Methodology — allocator choice matters
 
@@ -182,9 +197,27 @@ If you're considering zlsx for your own pipeline: pass whichever allocator you a
 
 ### Methodology — compression
 
-zlsx ships an in-house deflate compressor: LZ77 with a 32 KB sliding window + single-step lazy matching (defer one byte, take whichever match is longer) + dynamic huffman tables per block + word-size SIMD match-length compare (8 bytes per XOR-then-`@ctz` pass in the LZ77 inner loop, ~6× fewer iterations than byte-at-a-time on typical 3-30-byte XML matches). Zig 0.15.2's stdlib `std.compress.flate.Compress` still doesn't compile (`BlockWriter` references a missing `bit_writer` field; the token-emission path is `@panic("TODO")`), so we grow our own — `std.compress.flate.HuffmanEncoder` is the one flate-module file that *is* usable and handles the canonical-huffman bookkeeping.
+zlsx uses stdlib `std.compress.flate.Compress` (`src/writer.zig`
+`deflateCompress`). Per-entry the writer skips compression entirely for
+payloads under 1 KB — a deflate block header has fixed overhead that rarely
+pays back on tiny XML fragments — and falls back to stored when deflate
+inflates a ≥ 1 KB payload.
 
-Per-entry the writer skips compression entirely for payloads under 1 KB (the dynamic-huffman block header has ~60-120 bytes of fixed overhead that rarely pays back on tiny XML fragments), and falls back to stored when deflate inflates a ≥ 1 KB payload. Combined with the SIMD match compare, this lands archive size byte-for-byte with xlsxwriter at roughly half xlsxwriter's wall time and a third of openpyxl's.
+> **History, because the trade-off is worth knowing.** Through v0.4.0 zlsx
+> shipped an in-house deflate: LZ77 with a 32 KB window + single-step lazy
+> matching + dynamic huffman per block + word-size SIMD match-length compare.
+> It existed because Zig **0.15.2**'s `std.compress.flate.Compress` did not
+> compile (`BlockWriter` referenced a missing `bit_writer` field; the
+> token-emission path was `@panic("TODO")`). 0.16 fixed that, and the
+> migration retired ~600 lines of hand-rolled compressor in favour of stdlib.
+>
+> It was not free. The in-house encoder's lazy matching landed archive size
+> byte-for-byte with xlsxwriter; stdlib flate is **~3% larger** on this
+> workload (54.9 → 56.6 KB), which is now ~1.4 KB *above* xlsxwriter rather
+> than level with it. Wall time and RSS did not suffer — RSS improved. Six
+> hundred lines of compressor is a lot of surface to own for 3% of a 56 KB
+> file, so the trade was taken deliberately; this note exists so it is not
+> rediscovered as a mystery regression.
 
 ### Reproducing
 
@@ -236,4 +269,4 @@ Source for all four benches (~30 lines each) is in `tests/bench/` if you want to
 
 **On the read side**: zlsx (lazy) leads calamine-rust on every corpus file. Highlights: **ECDC 49k rows: zlsx 113 ms vs calamine 193 ms (1.70×)** and **WDI 76 MB / 401k rows: zlsx 2.36 s vs calamine 2.78 s (1.18×) at 293 MB RSS vs 1,315 MB (4.5× lighter)**. Python libraries trail 2-12× from worldbank up. Single-file droppable into a Zig build; no third-party runtime deps.
 
-**On the write side**: zlsx Writer is **9.93× faster than xlsxwriter and 22.74× faster than openpyxl** for a 1,001-row styled workbook — at ~6× lower RSS than xlsxwriter and ~9× below openpyxl. Archive size matches xlsxwriter within 0.5 % (zlsx 54.9 KB vs xlsxwriter 55.2 KB). The in-house LZ77 + dynamic-huffman deflate compressor (with lazy matching + word-size SIMD match compare) does what zlib-at-level-6 does, but tuned for the xlsx-XML workload.
+**On the write side**: zlsx Writer is **10.19× faster than xlsxwriter and 21.91× faster than openpyxl** for a 1,001-row styled workbook — at ~6.5× lower RSS than xlsxwriter and ~11× below openpyxl. Archive size is within 2.5% of xlsxwriter (zlsx 56.6 KB vs xlsxwriter 55.2 KB) since the move to stdlib `std.compress.flate`; the retired in-house encoder matched it byte-for-byte, which is the one dimension that swap cost anything (see Methodology — compression).
