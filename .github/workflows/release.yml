@@ -140,3 +140,34 @@ jobs:
         with:
           files: dist/SHA256SUMS
           fail_on_unmatched_files: true
+
+  homebrew:
+    name: homebrew tap
+    # Must follow `checksums`: the formula's four sha256 values are read
+    # from the SHA256SUMS asset that job uploads.
+    needs: checksums
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Publish the formula to the tap
+        # The tap is a SEPARATE repository, so `github.token` — scoped to
+        # this one — cannot push to it. It needs a PAT with contents:write
+        # on the tap repo, stored as HOMEBREW_TAP_TOKEN.
+        #
+        # Absent that secret this skips with a warning instead of failing.
+        # A red release job over packaging would be worse than the stale
+        # tap it replaces, and the manual path still works:
+        #   scripts/publish_homebrew_tap.sh <version>
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning title=Homebrew tap not updated::HOMEBREW_TAP_TOKEN is unset. Run scripts/publish_homebrew_tap.sh ${GITHUB_REF_NAME#v} locally, or add the secret."
+            exit 0
+          fi
+          gh auth setup-git
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          scripts/publish_homebrew_tap.sh "${GITHUB_REF_NAME#v}"
