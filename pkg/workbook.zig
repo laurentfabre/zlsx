@@ -2294,22 +2294,86 @@ pub const Workbook = struct {
     /// Write the record into `docProps/custom.xml`, creating the part
     /// (and its package relationship) when absent.
     fn writeRecoveryDocProp(self: *Workbook, rec: []const u8) Error!void {
+        // An existing part is edited, never overwritten. A workbook can
+        // carry custom properties that predate the embeddings, and
+        // embedding vectors is no reason to discard someone else's
+        // metadata — `removeRecoveryDocProp` is careful to preserve
+        // them on the way out, so the way in has to match.
+        if ((try self.store.part("docProps/custom.xml")) != null) {
+            return self.upsertRecoveryDocProp(rec);
+        }
+
         const xml = std.fmt.allocPrint(self.allocator,
             \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
             \\<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><property fmtid="{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}" pid="2" name="{s}"><vt:lpwstr>{s}</vt:lpwstr></property></Properties>
         , .{ recovery_record.DOC_PROP_NAME, rec }) catch return error.WriteFailed;
         defer self.allocator.free(xml);
 
-        if ((try self.store.part("docProps/custom.xml")) != null) {
-            try self.store.replacePart("docProps/custom.xml", xml);
-            return;
-        }
         try self.store.addPart(
             "docProps/custom.xml",
             "application/vnd.openxmlformats-officedocument.custom-properties+xml",
             xml,
         );
         try self.registerDocPropsCustomRel();
+    }
+
+    /// Splice the recovery property into an existing
+    /// `docProps/custom.xml`, replacing our own previous entry and
+    /// leaving every other property untouched.
+    fn upsertRecoveryDocProp(self: *Workbook, rec: []const u8) Error!void {
+        const part = (try self.store.part("docProps/custom.xml")) orelse return;
+        const src = part.bytes;
+
+        const close = std.mem.lastIndexOf(u8, src, "</Properties>") orelse {
+            // Not a custom-properties document at all. Nothing here is
+            // meaningful to preserve, so write a well-formed one.
+            const xml = std.fmt.allocPrint(self.allocator,
+                \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+                \\<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><property fmtid="{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}" pid="2" name="{s}"><vt:lpwstr>{s}</vt:lpwstr></property></Properties>
+            , .{ recovery_record.DOC_PROP_NAME, rec }) catch return error.WriteFailed;
+            defer self.allocator.free(xml);
+            return self.store.replacePart("docProps/custom.xml", xml);
+        };
+
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        const w = &out.writer;
+
+        // Drop our previous entry so a re-embed replaces rather than
+        // accumulates. Same two-cursor split as `removeRecoveryDocProp`:
+        // `pos` is the uncopied region, `scan` is the search head, and a
+        // kept property must leave `pos` alone.
+        var pos: usize = 0;
+        var scan: usize = 0;
+        while (std.mem.indexOfPos(u8, src, scan, "<property")) |start| {
+            if (start > close) break;
+            const end_tag = std.mem.indexOfPos(u8, src, start, "</property>") orelse break;
+            const after = end_tag + "</property>".len;
+            if (std.mem.indexOf(u8, src[start..after], recovery_record.DOC_PROP_NAME) == null) {
+                scan = after;
+                continue;
+            }
+            w.writeAll(src[pos..start]) catch return error.WriteFailed;
+            pos = after;
+            scan = after;
+        }
+
+        // `pid` must be unique within the part; colliding with a
+        // neighbour's would make the document invalid rather than
+        // merely odd. Spec floor is 2.
+        const next_pid = @max(nextMaxNumericAttr(src, "pid=\"") + 1, 2);
+
+        // Everything up to the closing tag, then our property, then the
+        // closing tag — so we land last and disturb no existing offsets.
+        const keep_end = @max(pos, @min(close, src.len));
+        w.writeAll(src[pos..keep_end]) catch return error.WriteFailed;
+        w.print(
+            "<property fmtid=\"{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}\" pid=\"{d}\" name=\"{s}\"><vt:lpwstr>{s}</vt:lpwstr></property>",
+            .{ next_pid, recovery_record.DOC_PROP_NAME, rec },
+        ) catch return error.WriteFailed;
+        w.writeAll(src[close..]) catch return error.WriteFailed;
+
+        try self.store.replacePart("docProps/custom.xml", out.written());
     }
 
     /// Add the package-level relationship for `docProps/custom.xml`.
@@ -12030,10 +12094,16 @@ test "ER: digest changes when the covered content changes" {
 // ─── byte-walker mutation stress ────────────────────────────────────
 //
 // The `std.testing.fuzz` targets in sheet/table/drawing/vml_edit.zig
-// are the deep path, but coverage-guided fuzzing only works on Linux
-// x64 (Mach-O parsing bug upstream, same reason src/xlsx.zig uses a
-// PRNG harness). Without something portable, the walkers get seed-
-// corpus coverage only on the machines most development happens on.
+// are the deep path, but coverage-guided fuzzing needs a working
+// `zig build fuzz --fuzz` session, which is a machine you have to be
+// on rather than something every test run gets. Without something
+// portable, the walkers get seed-corpus coverage only.
+//
+// (An earlier version of this comment said coverage-guided fuzzing
+// "only works on Linux x64". That was the **0.15** situation, carried
+// over from `src/xlsx.zig`, which correctly scopes the claim to that
+// version. On 0.16 it is inverted — the build-runner panic is the
+// Linux-only one — which is why `fuzz-nightly.yml` runs on `macos-14`.)
 //
 // This mutates the seed shapes instead of generating random bytes.
 // Pure random input almost never produces something a tag-matching
@@ -12790,4 +12860,108 @@ test "embeddableRows: rejects a column outside the range" {
         "C",
         false,
     ));
+}
+
+// ─── setEmbeddings must not clobber foreign custom properties ───────
+//
+// `writeRecoveryDocProp` used to replace `docProps/custom.xml`
+// wholesale with a single-property document, so embedding vectors
+// silently destroyed any custom properties the source workbook carried.
+// Found while writing its inverse in #132: `removeRecoveryDocProp`
+// preserves third-party properties on the way out, and that asymmetry
+// was the tell.
+
+/// A custom-properties part carrying one foreign property.
+const FOREIGN_DOCPROPS: []const u8 =
+    \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    \\<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="2" name="Department"><vt:lpwstr>Finance</vt:lpwstr></property></Properties>
+;
+
+test "setEmbeddings: keeps custom document properties it did not write" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+
+    // Planted before the embed, the way a workbook arriving from
+    // another tool would carry it.
+    try wb.store.addPart(
+        "docProps/custom.xml",
+        "application/vnd.openxmlformats-officedocument.custom-properties+xml",
+        FOREIGN_DOCPROPS,
+    );
+
+    try setupEmbeddedWorkbook(&wb);
+
+    const dp = (try wb.store.part("docProps/custom.xml")).?;
+    // The recovery record lands...
+    try std.testing.expect(std.mem.indexOf(u8, dp.bytes, recovery_record.DOC_PROP_NAME) != null);
+    // ...without taking the workbook's own metadata with it.
+    try std.testing.expect(std.mem.indexOf(u8, dp.bytes, "Department") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dp.bytes, "Finance") != null);
+    // Still one well-formed document, not two concatenated.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, dp.bytes, "</Properties>"),
+    );
+
+    // And the splice is still *readable*, not merely well-shaped. The
+    // defined-name carrier is staged until save, so pre-save this can
+    // only come back via docProps — which makes it a direct test that
+    // the edited part still parses.
+    try stripEmbeddingParts(&wb);
+    const state = try wb.embeddings();
+    try std.testing.expect(state == .stripped);
+    try std.testing.expectEqual(recovery_record.Carrier.doc_props, state.stripped.carrier);
+    try std.testing.expectEqualStrings("text-embedding-3-small", state.stripped.model);
+}
+
+test "setEmbeddings: gives the recovery property a non-colliding pid" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+
+    // Planted before the embed, the way a workbook arriving from
+    // another tool would carry it.
+    try wb.store.addPart(
+        "docProps/custom.xml",
+        "application/vnd.openxmlformats-officedocument.custom-properties+xml",
+        FOREIGN_DOCPROPS,
+    );
+
+    try setupEmbeddedWorkbook(&wb);
+
+    // The neighbour holds pid="2"; duplicating it would make the part
+    // invalid rather than merely odd.
+    const dp = (try wb.store.part("docProps/custom.xml")).?;
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, dp.bytes, "pid=\"2\""));
+    try std.testing.expect(std.mem.indexOf(u8, dp.bytes, "pid=\"3\"") != null);
+}
+
+test "setEmbeddings: re-embedding replaces the property, not accumulates" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(std.testing.allocator, threaded.io());
+    defer wb.deinit();
+    try setupEmbeddedWorkbook(&wb);
+    // Second embed on the same workbook — the sheet already exists, so
+    // only the write path re-runs.
+    var vec_body: [2 * (4 + 2)]u8 = @splat(0);
+    const hashes = [_]u64{ 0xCCCC, 0xDDDD };
+    try wb.setEmbeddings("text-embedding-3-small", 2, .int8_sym_per_vec, &[_]EmbeddingCoverageInput{.{
+        .id = "title",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A3",
+        .column = "A",
+        .include_formulas = false,
+        .vec_body = &vec_body,
+        .hashes = &hashes,
+    }});
+
+    const dp = (try wb.store.part("docProps/custom.xml")).?;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, dp.bytes, recovery_record.DOC_PROP_NAME),
+    );
 }
