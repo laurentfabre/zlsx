@@ -11323,7 +11323,7 @@ fn buildSynthHashes(
 
 const SYNTH_INDEX_XML: []const u8 =
     \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-    \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="1" model="test-model" dim="2" dtype="f32" hash_algo="xxh3-64">
+    \\<embeddings xmlns="http://schemas.fabre.me/zlsx/2026/embeddings" version="1" model="test-model" dim="2" dtype="f32" hash_algo="xxh3-64">
     \\  <coverage id="title" worksheet_target="worksheets/sheet1.xml" range="A2:A2" column="A" count="1" include_formulas="false" vec_rId="rId1" hash_rId="rId2"/>
     \\</embeddings>
 ;
@@ -11331,8 +11331,8 @@ const SYNTH_INDEX_XML: []const u8 =
 const SYNTH_INDEX_RELS_XML: []const u8 =
     \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
     \\<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-    \\  <Relationship Id="rId1" Type="http://schemas.laurentfabre.dev/zlsx/2026/relationships/embedding-vec" Target="title/vec.bin"/>
-    \\  <Relationship Id="rId2" Type="http://schemas.laurentfabre.dev/zlsx/2026/relationships/embedding-hash" Target="title/hashes.bin"/>
+    \\  <Relationship Id="rId1" Type="http://schemas.fabre.me/zlsx/2026/relationships/embedding-vec" Target="title/vec.bin"/>
+    \\  <Relationship Id="rId2" Type="http://schemas.fabre.me/zlsx/2026/relationships/embedding-hash" Target="title/hashes.bin"/>
     \\</Relationships>
 ;
 

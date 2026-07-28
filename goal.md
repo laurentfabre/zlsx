@@ -4,7 +4,7 @@
 > Detail lives in `docs/plans/`; narrated context + collaboration rules live in the
 > knowledge base at `docs/kb/` (open `docs/kb/kb.html`, gitignored).
 
-_Last updated: 2026-07-26_
+_Last updated: 2026-07-28_
 
 ---
 
@@ -19,11 +19,13 @@ Performance posture (the bar to hold): 1.7–12× over calamine, 38× over openp
 
 ---
 
-## 🔥 Active track — embeddings in xlsx (on `main` as of #123 + #124)
+## ✅ Completed track — embeddings in xlsx (all on `main` as of #134)
 
 Store semantic vector embeddings inside `.xlsx` via vendor-namespaced OPC parts under
-`xl/zlsxEmbeddings/`. E1/E2/E3/E0 shipped in **#123**; the carrier matrix in **#124**.
-(PR #115 is dead — it was cut from pre-migration `main` and was re-applied by hand.)
+`xl/zlsxEmbeddings/`, in the `fabre.me` namespace. E1/E2/E3/E0 shipped in **#123**;
+the carrier matrix in **#124**; ER in **#127**; E5 in **#130**; the emb-6 CLI in
+**#132/#133/#134**. (PR #115 is dead — it was cut from pre-migration `main` and was
+re-applied by hand.)
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#e0e0e0', 'primaryBorderColor': '#00d4ff', 'lineColor': '#00d4ff', 'secondaryColor': '#16213e', 'tertiaryColor': '#0f3460', 'fontFamily': 'monospace'}}}%%
@@ -35,7 +37,7 @@ graph LR
     E4B --> DEC{{"durability contract<br/>DECIDED 2026-07-26"}}
     DEC --> ER["emb-R ✅ recovery record<br/>hidden definedName + docProps"]
     ER --> E5["emb-5 ✅ Python<br/>NumPy + valid_mask"]
-    E5 --> E6["⬅ NEXT: emb-6<br/>CLI: zlsx embed / --prune / --strip"]
+    E5 --> E6["✅ emb-6 — CLI (#132/#133/#134)<br/>embed --strip / --prune / --extract / --vectors"]
     style E4 fill:#16213e
     style E4B fill:#16213e
     style DEC fill:#0f3460
@@ -129,13 +131,16 @@ tombstoned rows. On a stripped workbook `vectors()` raises `EmbeddingsStripped` 
 the recovered model, dim, dtype and ranges, rather than returning an empty array: an empty
 array would be exactly the silent-nothing the contract rejects.
 
-**▶ NEXT — emb-6 (CLI).**
+**✅ emb-6 (CLI) shipped 2026-07-28** — `--strip` (#132), `--prune` (#133),
+`--extract` / `--vectors` (#134). **The embedding arc is complete; what remains
+on it is IANA registration and the unrun Excel-Windows leg.**
 Full reasoning: `docs/plans/embeddings-in-xlsx.md` §Durability contract.
 
 Spec: `docs/plans/embeddings-in-xlsx.md` · matrix + Findings: `docs/plans/emb-4-compat-matrix.md`.
 
-**Blocking byte-ship decisions:** confirm the OPC relationship-URI namespace
-(`laurentfabre.dev` or alternative); IANA MIME registration (deferred to v1.0).
+**Byte-ship decisions:** OPC relationship-URI namespace ✅ **decided 2026-07-28
+— `schemas.fabre.me`** (MIME tree moved with it: `application/vnd.fabre.zlsx.*`).
+Remaining: IANA MIME registration (deferred to v1.0).
 
 ---
 
@@ -159,9 +164,12 @@ Spec: `docs/plans/embeddings-in-xlsx.md` · matrix + Findings: `docs/plans/emb-4
 1. ~~Latent silent-corruption fixes (`<sheetView topLeftCell>`, `<selection>`, bare-sheet
    `<sortState>`)~~ — ✅ **done (#125)**. Also caught a fourth, `<sortCondition ref>`,
    unrewritten even inside `<table>` on the path that shipped in #111.
-2. **Fuzz the byte-walkers** (`pkg/{table,drawing,vml,sheet}_edit.zig`, ~3000 LOC, none
-   yet) — now the top candidate, and #125 is the argument for it: that code had four
-   unhandled elements and the gap was invisible to the refusal audit's method.
+2. ~~**Fuzz the byte-walkers** (`pkg/{table,drawing,vml,sheet}_edit.zig`, ~3000 LOC)~~
+   — ✅ **done (#131)**. Found three crashes: `matchTagAt` read one past the end,
+   `writeWithReplacedAttr` sliced backwards on an unterminated value, and
+   `shiftSingleA1Col/Row` overran a fixed 16-byte buffer. #125 was the argument
+   for it, and it was right: that code had four unhandled elements the refusal
+   audit's method could not see.
 3. CDATA-aware shared tag scanner (candidate for `ziglib`).
 4. `<extLst>` coordinate fixups (`x14:`/`x15:` blocks) — the one surface still passing
    through verbatim everywhere, per #125's audit note.

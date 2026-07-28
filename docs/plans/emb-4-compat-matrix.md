@@ -140,7 +140,7 @@ Informational (expected to strip — out of v1 scope per the design):
 > **Static pre-check (2026-05-30).** Pretty-printing the writer output confirms
 > the OOXML-sensitive parts are spec-correct: per-part content-type `<Override>`s
 > for the vendor MIME types, a relative `Target="zlsxEmbeddings/index.xml"`
-> workbook relationship under the `schemas.laurentfabre.dev/zlsx/2026` namespace,
+> workbook relationship under the `schemas.fabre.me/zlsx/2026` namespace,
 > and well-formed `index.xml` + `_rels/index.xml.rels`. So the file *should* open
 > without warning; whether each consumer *preserves on save* is the empirical
 > question the GUI rows close.
