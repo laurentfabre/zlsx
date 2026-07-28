@@ -567,6 +567,22 @@ pub const SlotState = enum {
     valid_empty,
 };
 
+/// One row that has something worth embedding.
+pub const EmbeddableRow = struct {
+    row: u32,
+    /// Borrows from the shared-string table or the sheet XML.
+    text: []const u8,
+    /// The canonical content hash to store alongside the vector.
+    ///
+    /// Computed here rather than by the caller on purpose: it has to
+    /// match what `pruneEmbeddings` derives from the same cell, and a
+    /// caller holding only `text` cannot know whether the cell was a
+    /// string or a number — which changes the canonical form and so
+    /// the hash. Getting that wrong would make every freshly-written
+    /// row read back as drifted.
+    hash: u64,
+};
+
 /// What `pruneEmbeddings` did, and what it deliberately left alone.
 pub const PruneReport = struct {
     /// Slots turned into tombstones this call.
@@ -1911,6 +1927,61 @@ pub const Workbook = struct {
     /// Live cell → the canonical form the hash is taken over, or null
     /// when the row is not embeddable (blank, or a formula while
     /// `include_formulas="false"`).
+    /// Rows in `column` over `range` that carry embeddable content.
+    ///
+    /// Non-embeddable rows are **omitted**, not emitted with empty
+    /// text. The caller is about to pay one model invocation per row,
+    /// and embedding "" burns a call to produce a vector that means
+    /// nothing. The gaps are recoverable: any covered row missing from
+    /// this list gets `TOMBSTONE_HASH` when the vectors come back,
+    /// which is the same state `--prune` would leave it in.
+    ///
+    /// `text` borrows from the shared-string table or the sheet XML —
+    /// valid for as long as the `Workbook` is.
+    pub fn embeddableRows(
+        self: *Workbook,
+        allocator: Allocator,
+        worksheet_target: []const u8,
+        range: []const u8,
+        column: []const u8,
+        include_formulas: bool,
+    ) Error![]EmbeddableRow {
+        const parsed = try embedding_part.parseA1Range(range);
+        const col_idx = try embedding_part.parseColumnName(column);
+        if (col_idx < parsed.first.col or col_idx > parsed.last.col)
+            return error.InvalidRange;
+
+        const ws = (try self.worksheetForTarget(worksheet_target)) orelse
+            return error.MissingSheetPart;
+
+        var out: std.ArrayListUnmanaged(EmbeddableRow) = .empty;
+        errdefer out.deinit(allocator);
+        var scratch: std.ArrayListUnmanaged(u8) = .empty;
+        defer scratch.deinit(self.allocator);
+
+        var row = parsed.first.row;
+        while (row <= parsed.last.row) : (row += 1) {
+            var ref_buf: [16]u8 = undefined;
+            const ref = std.fmt.bufPrint(&ref_buf, "{s}{d}", .{ column, row }) catch
+                return error.WriteFailed;
+            const cell = (try self.canonicalCellFor(ws, ref, include_formulas)) orelse continue;
+            const text: []const u8 = switch (cell) {
+                .string, .number, .error_value => |s| s,
+                .boolean => |b| if (b) "1" else "0",
+                .blank => continue,
+            };
+            const hash = embedding_part.xxh3Canonical(
+                self.allocator,
+                worksheet_target,
+                row,
+                cell,
+                &scratch,
+            ) catch return error.WriteFailed;
+            try out.append(allocator, .{ .row = row, .text = text, .hash = hash });
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
     fn canonicalCellFor(
         self: *Workbook,
         ws: *Worksheet,
@@ -12608,4 +12679,115 @@ test "prune: reports nothing on a workbook without embeddings" {
 
     const report = try wb.pruneEmbeddings();
     try std.testing.expectEqual(@as(usize, 0), report.total());
+}
+
+// ─── emb-6c: embeddableRows — what the write path asks a model for ──
+
+test "embeddableRows: lists rows with content and omits the rest" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+
+    // Row 3 is blank — a gap the caller must not pay a model call for.
+    const path = try writePruneFile(io, dir, "extract.xlsx", .{ "Alpha", null }, .{
+        try pruneHashFor(2, "Alpha"),
+        try pruneHashFor(3, "Beta"),
+    });
+    defer std.testing.allocator.free(path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
+    defer wb.deinit();
+
+    const rows = try wb.embeddableRows(
+        std.testing.allocator,
+        PRUNE_WS_TARGET,
+        "A2:A3",
+        "A",
+        false,
+    );
+    defer std.testing.allocator.free(rows);
+
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(u32, 2), rows[0].row);
+    try std.testing.expectEqualStrings("Alpha", rows[0].text);
+}
+
+test "embeddableRows: its hashes read back as fresh under prune" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+
+    const path = try writePruneFile(io, dir, "roundtrip.xlsx", .{ "Alpha", "Beta" }, .{
+        embedding_part.TOMBSTONE_HASH,
+        embedding_part.TOMBSTONE_HASH,
+    });
+    defer std.testing.allocator.free(path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
+    defer wb.deinit();
+
+    const rows = try wb.embeddableRows(
+        std.testing.allocator,
+        PRUNE_WS_TARGET,
+        "A2:A3",
+        "A",
+        false,
+    );
+    defer std.testing.allocator.free(rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+
+    // Re-embed with exactly the hashes the write path would store.
+    var vec_body: [2 * (4 + 2)]u8 = @splat(3);
+    const hashes = [_]u64{ rows[0].hash, rows[1].hash };
+    try wb.setEmbeddings("m", 2, .int8_sym_per_vec, &[_]EmbeddingCoverageInput{.{
+        .id = "title",
+        .worksheet_target = PRUNE_WS_TARGET,
+        .range = "A2:A3",
+        .column = "A",
+        .include_formulas = false,
+        .vec_body = &vec_body,
+        .hashes = &hashes,
+    }});
+
+    // The whole point: what the writer stores, the sweep calls fresh.
+    // If these two disagreed, every freshly-embedded row would read
+    // back as drifted and `--prune` would be permanently noisy.
+    const report = try wb.pruneEmbeddings();
+    try std.testing.expectEqual(@as(usize, 2), report.fresh);
+    try std.testing.expectEqual(@as(usize, 0), report.stale);
+    try std.testing.expectEqual(@as(usize, 0), report.redacted);
+}
+
+test "embeddableRows: rejects a column outside the range" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+
+    const path = try writePruneFile(io, dir, "badcol.xlsx", .{ "Alpha", "Beta" }, .{
+        try pruneHashFor(2, "Alpha"),
+        try pruneHashFor(3, "Beta"),
+    });
+    defer std.testing.allocator.free(path);
+    var wb = try Workbook.open(std.testing.allocator, io, path);
+    defer wb.deinit();
+
+    // Silently embedding a different column than the coverage claims
+    // would produce vectors that describe the wrong cells.
+    try std.testing.expectError(error.InvalidRange, wb.embeddableRows(
+        std.testing.allocator,
+        PRUNE_WS_TARGET,
+        "A2:A3",
+        "C",
+        false,
+    ));
 }

@@ -173,6 +173,25 @@ const Args = struct {
     /// emb-6b: `embed --prune` — tombstone slots whose row is no longer
     /// embeddable. Rejected on every other sub-command.
     prune: bool = false,
+    /// emb-6c: `embed --extract` — emit the rows that need embedding as
+    /// NDJSON on stdout. Phase one of the out-of-band write path.
+    extract: bool = false,
+    /// emb-6c: `--vectors PATH` — NDJSON vectors to write back. Phase
+    /// two.
+    vectors_path: ?[]const u8 = null,
+    /// emb-6c: `--model NAME` — provenance recorded in the index.
+    model_name: ?[]const u8 = null,
+    /// emb-6c: `--column A` — the column letters being embedded.
+    /// Distinct from `--col`, which is a numeric index for column edits.
+    column_name: ?[]const u8 = null,
+    /// emb-6c: `--coverage A2:A100` — the covered A1 range. A dedicated
+    /// flag rather than `--range`, which parses to a rectangle for the
+    /// reader sub-commands and is rejected on `embed`.
+    coverage_range: ?[]const u8 = null,
+    /// emb-6c: `--id NAME` — `<coverage id>`; defaults to "default".
+    coverage_id: ?[]const u8 = null,
+    /// emb-6c: `--dtype f32|int8-sym` — on-disk vector encoding.
+    dtype_name: ?[]const u8 = null,
     /// iter-cm-4: A1-style cell ref for the `set-cell` sub-command.
     /// Set via `--ref A1`.
     cell_ref: ?[]const u8 = null,
@@ -239,7 +258,13 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
             std.mem.eql(u8, a, "--value") or
             std.mem.eql(u8, a, "--row") or
             std.mem.eql(u8, a, "--col") or
-            std.mem.eql(u8, a, "--new-name"))
+            std.mem.eql(u8, a, "--new-name") or
+            std.mem.eql(u8, a, "--vectors") or
+            std.mem.eql(u8, a, "--model") or
+            std.mem.eql(u8, a, "--column") or
+            std.mem.eql(u8, a, "--coverage") or
+            std.mem.eql(u8, a, "--id") or
+            std.mem.eql(u8, a, "--dtype"))
         {
             i += 1; // skip paired value (bounds-checked by caller)
             continue;
@@ -286,7 +311,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     const boolean_flags = [_][]const u8{
         "--list-sheets", "--header",     "--include-blanks", "--with-styles",
         "--sst-lazy",    "--all-sheets", "--help",           "--strip",
-        "--prune",
+        "--prune",       "--extract",
     };
     // Value-bearing flags. `--key=value` is split into [--key, value]
     // ONLY when key is one of these — otherwise the token is left
@@ -298,6 +323,8 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         "--take",       "--start-row", "--end-row", "--range",
         "--sheet-glob", "--output",    "--out",     "--ref",
         "--value",      "--row",       "--col",     "--new-name",
+        "--vectors",    "--model",     "--column",  "--coverage",
+        "--id",         "--dtype",
     };
     // Context-aware splitter: the token IMMEDIATELY following a
     // value-bearing flag is its literal value and must pass through
@@ -447,6 +474,39 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         } else if (std.mem.eql(u8, a, "--prune")) {
             if (out.subcommand != .embed) return ArgError.UnknownFlag;
             out.prune = true;
+        } else if (std.mem.eql(u8, a, "--extract")) {
+            if (out.subcommand != .embed) return ArgError.UnknownFlag;
+            out.extract = true;
+        } else if (std.mem.eql(u8, a, "--vectors")) {
+            if (out.subcommand != .embed) return ArgError.UnknownFlag;
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            out.vectors_path = argv[i];
+        } else if (std.mem.eql(u8, a, "--model")) {
+            if (out.subcommand != .embed) return ArgError.UnknownFlag;
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            out.model_name = argv[i];
+        } else if (std.mem.eql(u8, a, "--column")) {
+            if (out.subcommand != .embed) return ArgError.UnknownFlag;
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            out.column_name = argv[i];
+        } else if (std.mem.eql(u8, a, "--coverage")) {
+            if (out.subcommand != .embed) return ArgError.UnknownFlag;
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            out.coverage_range = argv[i];
+        } else if (std.mem.eql(u8, a, "--id")) {
+            if (out.subcommand != .embed) return ArgError.UnknownFlag;
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            out.coverage_id = argv[i];
+        } else if (std.mem.eql(u8, a, "--dtype")) {
+            if (out.subcommand != .embed) return ArgError.UnknownFlag;
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            out.dtype_name = argv[i];
         } else if (std.mem.eql(u8, a, "--all-sheets")) {
             // iter59c: no value; expands selection to every sheet.
             // On workbook-scoped sub-commands silently accept (same
@@ -936,6 +996,31 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                     coverage range never move. Required:
         \\                     --prune, --out PATH. Mutually exclusive
         \\                     with --strip.
+        \\  embed --extract    read-only: emit one NDJSON record per row
+        \\                     that has something worth embedding —
+        \\                     {"kind":"embed_row","row":N,"text":"…"}.
+        \\                     Rows with nothing embeddable are omitted,
+        \\                     not emitted empty. Required: --column A,
+        \\                     --coverage A2:A100. Takes no --out.
+        \\  embed --vectors P  write the embedding parts from NDJSON
+        \\                     vectors — {"row":N,"vector":[…]}. Covered
+        \\                     rows with no vector become tombstones, so a
+        \\                     partial embedding is representable. All
+        \\                     vectors must share one dimension. Required:
+        \\                     --column A, --coverage A2:A100, --model
+        \\                     NAME, --out PATH. Optional: --id NAME
+        \\                     (default "default"), --dtype f32|int8-sym
+        \\                     (default f32), --sheet N (default 0).
+        \\
+        \\                     The model is invoked out of band — zlsx
+        \\                     never makes a network call — so the two
+        \\                     phases compose through a pipe:
+        \\                       zlsx embed b.xlsx --extract --column A \
+        \\                         --coverage A2:A100 > rows.ndjson
+        \\                       my-embedder < rows.ndjson > vecs.ndjson
+        \\                       zlsx embed b.xlsx --vectors vecs.ndjson \
+        \\                         --model M --column A --coverage A2:A100 \
+        \\                         --out out.xlsx
         \\
         \\Formats (rows only)
         \\  jsonl              NDJSON row envelope (default, iter55a):
@@ -3004,6 +3089,297 @@ fn runScrubMetadataCommand(
     return 0;
 }
 
+/// The coverage's worksheet target, relative to `xl/` — the form
+/// `<coverage worksheet_target>` stores.
+fn embedWorksheetTarget(ws: *zlsx_pkg.Worksheet) ![]const u8 {
+    const part = try ws.resolvePartName();
+    return if (std.mem.startsWith(u8, part, "xl/")) part["xl/".len..] else part;
+}
+
+/// emb-6c phase one: `zlsx embed <file> --extract --column A --coverage A2:A100`.
+///
+/// Emits one NDJSON record per row that has something worth embedding.
+/// Rows with nothing embeddable are omitted rather than emitted empty —
+/// the consumer pays per row, and a vector for "" means nothing.
+fn runEmbedExtract(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    args: Args,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !u8 {
+    const column = args.column_name orelse {
+        try err.writeAll("zlsx: embed --extract requires --column A\n");
+        try err.flush();
+        return 2;
+    };
+    const range = args.coverage_range orelse {
+        try err.writeAll("zlsx: embed --extract requires --coverage A2:A100\n");
+        try err.flush();
+        return 2;
+    };
+
+    var wb = zlsx_pkg.Workbook.open(alloc, io, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    defer wb.deinit();
+
+    const ws = wb.sheet(@intCast(args.sheet_index orelse 0)) catch |e| {
+        try err.print("zlsx: sheet: {s}\n", .{@errorName(e)});
+        try err.flush();
+        return 3;
+    };
+    const target = embedWorksheetTarget(ws) catch |e| {
+        try err.print("zlsx: sheet: {s}\n", .{@errorName(e)});
+        try err.flush();
+        return 3;
+    };
+
+    const rows = wb.embeddableRows(alloc, target, range, column, false) catch |e| {
+        try err.print("zlsx: embed --extract: {s}\n", .{@errorName(e)});
+        try err.flush();
+        return 3;
+    };
+    defer alloc.free(rows);
+
+    for (rows) |r| {
+        try out.print("{{\"kind\":\"embed_row\",\"row\":{d},\"text\":", .{r.row});
+        try writeJsonString(out, r.text);
+        try out.writeAll("}\n");
+    }
+    try out.flush();
+    return 0;
+}
+
+/// emb-6c phase two: `zlsx embed <file> --vectors vecs.ndjson --model M
+/// --column A --coverage A2:A100 --out out.xlsx`.
+///
+/// Reads `{"row":N,"vector":[…]}` records, writes the embedding parts.
+/// Covered rows with no vector become tombstones — the same state
+/// `--prune` leaves them in, so a partial embedding is representable
+/// rather than an error.
+fn runEmbedApply(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    args: Args,
+    vectors_path: []const u8,
+    err: *std.Io.Writer,
+) !u8 {
+    const column = args.column_name orelse {
+        try err.writeAll("zlsx: embed --vectors requires --column A\n");
+        try err.flush();
+        return 2;
+    };
+    const range = args.coverage_range orelse {
+        try err.writeAll("zlsx: embed --vectors requires --coverage A2:A100\n");
+        try err.flush();
+        return 2;
+    };
+    const model = args.model_name orelse {
+        try err.writeAll("zlsx: embed --vectors requires --model NAME\n");
+        try err.flush();
+        return 2;
+    };
+    const out_path = args.out_path orelse {
+        try err.writeAll("zlsx: embed --vectors requires --out PATH\n");
+        try err.flush();
+        return 2;
+    };
+    const dtype: zlsx_pkg.embedding_part.Dtype = blk: {
+        const name = args.dtype_name orelse break :blk .f32;
+        if (std.mem.eql(u8, name, "f32")) break :blk .f32;
+        if (std.mem.eql(u8, name, "int8-sym")) break :blk .int8_sym_per_vec;
+        try err.print("zlsx: unknown --dtype '{s}' (want f32 | int8-sym)\n", .{name});
+        try err.flush();
+        return 2;
+    };
+
+    var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    defer ed.deinit();
+
+    const ws = ed.workbook.sheet(@intCast(args.sheet_index orelse 0)) catch |e| {
+        try err.print("zlsx: sheet: {s}\n", .{@errorName(e)});
+        try err.flush();
+        return 3;
+    };
+    const target = embedWorksheetTarget(ws) catch |e| {
+        try err.print("zlsx: sheet: {s}\n", .{@errorName(e)});
+        try err.flush();
+        return 3;
+    };
+
+    const rows = ed.workbook.embeddableRows(alloc, target, range, column, false) catch |e| {
+        try err.print("zlsx: embed --vectors: {s}\n", .{@errorName(e)});
+        try err.flush();
+        return 3;
+    };
+    defer alloc.free(rows);
+
+    var vecs = readVectorFile(alloc, io, vectors_path) catch |e| {
+        try err.print("zlsx: --vectors '{s}': {s}\n", .{ vectors_path, @errorName(e) });
+        try err.flush();
+        return 3;
+    };
+    defer {
+        var it = vecs.valueIterator();
+        while (it.next()) |v| alloc.free(v.*);
+        vecs.deinit(alloc);
+    }
+    if (vecs.count() == 0) {
+        try err.writeAll("zlsx: --vectors carried no records\n");
+        try err.flush();
+        return 3;
+    }
+
+    const parsed_range = zlsx_pkg.embedding_part.parseA1Range(range) catch |e| {
+        try err.print("zlsx: --coverage: {s}\n", .{@errorName(e)});
+        try err.flush();
+        return 2;
+    };
+    const first_row = parsed_range.first.row;
+    const count: u32 = parsed_range.last.row - first_row + 1;
+
+    // Dimension comes from the data, and every vector must agree — a
+    // ragged set would produce a part whose header lies about its rows.
+    var dim: u32 = 0;
+    {
+        var it = vecs.valueIterator();
+        while (it.next()) |v| {
+            const n: u32 = @intCast(v.len);
+            if (dim == 0) dim = n;
+            if (n != dim) {
+                try err.print("zlsx: --vectors: inconsistent dimensions ({d} vs {d})\n", .{ dim, n });
+                try err.flush();
+                return 3;
+            }
+        }
+    }
+    if (dim == 0) {
+        try err.writeAll("zlsx: --vectors: zero-length vector\n");
+        try err.flush();
+        return 3;
+    }
+
+    const rec_len = dtype.recordBytes(dim);
+    const vec_body = alloc.alloc(u8, @as(usize, count) * rec_len) catch return 4;
+    defer alloc.free(vec_body);
+    @memset(vec_body, 0);
+    const hashes = alloc.alloc(u64, count) catch return 4;
+    defer alloc.free(hashes);
+    // Every slot starts tombstoned; a row only becomes live if it is
+    // both embeddable and carries a vector.
+    @memset(hashes, zlsx_pkg.embedding_part.TOMBSTONE_HASH);
+
+    var written: usize = 0;
+    for (rows) |r| {
+        const vec = vecs.get(r.row) orelse continue;
+        const slot = r.row - first_row;
+        const dst = vec_body[@as(usize, slot) * rec_len ..][0..rec_len];
+        switch (dtype) {
+            .f32 => {
+                for (vec, 0..) |f, i| {
+                    std.mem.writeInt(u32, dst[i * 4 ..][0..4], @bitCast(f), .little);
+                }
+            },
+            .int8_sym_per_vec => {
+                const codes = alloc.alloc(i8, dim) catch return 4;
+                defer alloc.free(codes);
+                const res = zlsx_pkg.embedding_part.quantizeF32ToI8Sym(vec, codes);
+                std.mem.writeInt(u32, dst[0..4], @bitCast(res.scale), .little);
+                for (codes, 0..) |c, i| dst[4 + i] = @bitCast(c);
+            },
+            else => unreachable,
+        }
+        hashes[slot] = r.hash;
+        written += 1;
+    }
+
+    ed.workbook.setEmbeddings(model, dim, dtype, &[_]zlsx_pkg.EmbeddingCoverageInput{.{
+        .id = args.coverage_id orelse "default",
+        .worksheet_target = target,
+        .range = range,
+        .column = column,
+        .include_formulas = false,
+        .vec_body = vec_body,
+        .hashes = hashes,
+    }}) catch |e| {
+        try err.print("zlsx: setEmbeddings: {s}\n", .{@errorName(e)});
+        try err.flush();
+        return 3;
+    };
+
+    ed.save(io, out_path) catch |e| {
+        try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
+        try err.flush();
+        return 5;
+    };
+    return 0;
+}
+
+/// Parse `{"row":N,"vector":[…]}` NDJSON into row → owned f32 slice.
+fn readVectorFile(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !std.AutoHashMapUnmanaged(u32, []f32) {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(512 * 1024 * 1024));
+    defer alloc.free(bytes);
+
+    var map: std.AutoHashMapUnmanaged(u32, []f32) = .empty;
+    errdefer {
+        var it = map.valueIterator();
+        while (it.next()) |v| alloc.free(v.*);
+        map.deinit(alloc);
+    }
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => return error.InvalidVectorRecord,
+        };
+        const row_v = obj.get("row") orelse return error.InvalidVectorRecord;
+        const row: u32 = switch (row_v) {
+            .integer => |n| if (n > 0 and n <= std.math.maxInt(u32))
+                @intCast(n)
+            else
+                return error.InvalidVectorRecord,
+            else => return error.InvalidVectorRecord,
+        };
+        const vec_v = obj.get("vector") orelse return error.InvalidVectorRecord;
+        const arr = switch (vec_v) {
+            .array => |a| a,
+            else => return error.InvalidVectorRecord,
+        };
+        const vals = try alloc.alloc(f32, arr.items.len);
+        errdefer alloc.free(vals);
+        for (arr.items, 0..) |item, i| {
+            vals[i] = switch (item) {
+                .float => |f| @floatCast(f),
+                .integer => |n| @floatFromInt(n),
+                else => return error.InvalidVectorRecord,
+            };
+        }
+        // Last record for a row wins, so a regenerated tail can simply
+        // be appended rather than requiring the file be rewritten.
+        if (map.fetchPut(alloc, row, vals) catch return error.OutOfMemory) |old| {
+            alloc.free(old.value);
+        }
+    }
+    return map;
+}
+
 /// emb-6a: `zlsx embed <file> --strip --out PATH`.
 ///
 /// Removes the embedding parts and the recovery record together, so
@@ -3017,21 +3393,30 @@ fn runEmbedCommand(
     out: *std.Io.Writer,
     err: *std.Io.Writer,
 ) !u8 {
-    // `embed` will grow a write path (emb-6c); until then --strip and
-    // --prune are the only things it does, so a bare `embed` is a usage
-    // error rather than a silent no-op save.
-    if (!args.strip and !args.prune) {
-        try err.writeAll("zlsx: embed requires --strip or --prune (the write path is not implemented yet)\n");
+    // Exactly one mode. These do contradictory things to the same
+    // parts, so combining them is a confusion to surface rather than an
+    // order to resolve.
+    var mode_count: u8 = 0;
+    if (args.strip) mode_count += 1;
+    if (args.prune) mode_count += 1;
+    if (args.extract) mode_count += 1;
+    if (args.vectors_path != null) mode_count += 1;
+    if (mode_count == 0) {
+        try err.writeAll("zlsx: embed requires one of --extract, --vectors PATH, --prune, --strip\n");
         try err.flush();
         return 2;
     }
-    // --strip removes everything --prune would carefully preserve.
-    // Asking for both is a contradiction, not a refinement.
-    if (args.strip and args.prune) {
-        try err.writeAll("zlsx: embed --strip and --prune are mutually exclusive\n");
+    if (mode_count > 1) {
+        try err.writeAll("zlsx: embed modes are mutually exclusive (--extract / --vectors / --prune / --strip)\n");
         try err.flush();
         return 2;
     }
+
+    // Phase one of the write path: read-only, emits on stdout, never
+    // touches the workbook — so it deliberately does NOT want --out.
+    if (args.extract) return try runEmbedExtract(alloc, io, args, out, err);
+    if (args.vectors_path) |vp| return try runEmbedApply(alloc, io, args, vp, err);
+
     const mode: []const u8 = if (args.strip) "--strip" else "--prune";
     const out_path = args.out_path orelse {
         try err.print("zlsx: embed {s} requires --out PATH\n", .{mode});
