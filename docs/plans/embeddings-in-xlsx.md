@@ -323,8 +323,8 @@ The fixed-position parts (always present when embeddings exist):
 
 | File | Change |
 |---|---|
-| `[Content_Types].xml` | Add **one** Override per part. Always present: `PartName="/xl/zlsxEmbeddings/index.xml"` with ContentType `application/vnd.laurentfabre.zlsx.embedding-index+xml`. Per coverage block (see below): one Override for that coverage's vec.bin and one for its hashes.bin. ContentTypes are `application/vnd.laurentfabre.zlsx.embedding-vec` and `application/vnd.laurentfabre.zlsx.embedding-hash` (no `+octet-stream` structured suffix — that suffix is reserved for media types built on `application/octet-stream` per RFC 6839, which these are not). |
-| `xl/_rels/workbook.xml.rels` | Add one `Relationship Target="zlsxEmbeddings/index.xml"` Type `http://schemas.laurentfabre.dev/zlsx/2026/relationships/embeddings`. |
+| `[Content_Types].xml` | Add **one** Override per part. Always present: `PartName="/xl/zlsxEmbeddings/index.xml"` with ContentType `application/vnd.fabre.zlsx.embedding-index+xml`. Per coverage block (see below): one Override for that coverage's vec.bin and one for its hashes.bin. ContentTypes are `application/vnd.fabre.zlsx.embedding-vec` and `application/vnd.fabre.zlsx.embedding-hash` (no `+octet-stream` structured suffix — that suffix is reserved for media types built on `application/octet-stream` per RFC 6839, which these are not). |
+| `xl/_rels/workbook.xml.rels` | Add one `Relationship Target="zlsxEmbeddings/index.xml"` Type `http://schemas.fabre.me/zlsx/2026/relationships/embeddings`. |
 | `xl/zlsxEmbeddings/index.xml` (new) | Manifest: model name, dimension, dtype, hash algorithm, one or more `<coverage>` blocks. |
 | `xl/zlsxEmbeddings/_rels/index.xml.rels` (new) | One Relationship per coverage's vec.bin and hashes.bin sub-part, with Targets relative to the `xl/zlsxEmbeddings/` base. Types `.../zlsx/2026/relationships/embedding-vec` and `.../zlsx/2026/relationships/embedding-hash`. |
 
@@ -401,7 +401,7 @@ own conventions).
 
 ```xml
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings"
+<embeddings xmlns="http://schemas.fabre.me/zlsx/2026/embeddings"
             version="1"
             model="text-embedding-3-small"
             dim="1536"
@@ -639,7 +639,7 @@ canonicalizer and the hasher.
 | Excel "Save As .xlsx" from Excel itself should preserve (verify) | Compat matrix |
 | Workbook structure changes (insertRow/deleteRow in Excel) shift cells beneath embedded vectors → vectors map to wrong rows | Hash-based invalidation catches this; vectors with no matching hash get marked stale, not silently misattributed |
 | Size growth on dense embeddings | int8 quantization + deflate → ~1.2 KB/row for 1536-d; document |
-| Antivirus / DLP scanners flag unknown binary parts | Use vendor-tree MIME types (`application/vnd.laurentfabre.zlsx.*`); document the magic-number signature in the format docs so DLP rules can identify the part |
+| Antivirus / DLP scanners flag unknown binary parts | Use vendor-tree MIME types (`application/vnd.fabre.zlsx.*`); document the magic-number signature in the format docs so DLP rules can identify the part |
 | Model drift: workbook has vectors from model X, user later runs zlsx with model Y wired in | `index.xml` carries `model=` provenance; mismatch → refuse to add vs. existing, force re-embed-all |
 | Multiple embedding columns on one sheet | v1 supports N coverage blocks per `index.xml` with separate vec/hash sub-parts — no v2 deferral. |
 | Sparse embeddings (only some rows have text) | `hashes.bin` `u64::MAX` sentinel = "no embedding for this row"; vec slot still allocated but content undefined. Expected sentinel collision rate at 10⁹ rows is 5.4×10⁻¹¹ — negligible. |
@@ -809,15 +809,16 @@ On `Workbook.save()`:
 
 ## Open questions
 
-1. **Relationship URI**: provisional value
-   `http://schemas.laurentfabre.dev/zlsx/2026/relationships/embeddings`.
-   The `laurentfabre.dev` domain is owned by the project maintainer
-   (Laurent Fabre). Whether to register a longer-lived domain
-   (e.g. `zlsx.io`) before shipping is open. **Decision required
-   before any part bytes ship**, because changing the URI later
-   invalidates every workbook in the wild. Until the URI is final,
-   this design is BLOCKED on a written domain-ownership decision.
-2. **MIME prefix**: `application/vnd.laurentfabre.zlsx.*` follows
+1. **Relationship URI**: ~~provisional~~ **DECIDED 2026-07-28** —
+   `http://schemas.fabre.me/zlsx/2026/relationships/embeddings`.
+   The domain space is `fabre.me`, owned by the project maintainer
+   (Laurent Fabre). This supersedes the provisional
+   `schemas.laurentfabre.dev` value, which never shipped in a release.
+   Settled deliberately at this point rather than later: the CLI write
+   path (emb-6c, #134) had just made the format writable by end users,
+   and changing the URI after that invalidates every workbook in the
+   wild. No longer a blocker.
+2. **MIME prefix**: `application/vnd.fabre.zlsx.*` follows
    RFC 6838 vendor tree. IANA registration is open: we will not
    register before the format reaches v1.0 stability, but we will
    register before any third-party tooling encounters these MIME

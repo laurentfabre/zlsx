@@ -137,7 +137,7 @@ fn passTwo(
     const cx_m = carriers.marker(&mbuf, .custom_xml);
     const cx_item = try std.fmt.allocPrint(allocator,
         \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-        \\<zlsxRecovery xmlns="http://schemas.laurentfabre.dev/zlsx/2026/recovery"><record>{s}</record></zlsxRecovery>
+        \\<zlsxRecovery xmlns="http://schemas.fabre.me/zlsx/2026/recovery"><record>{s}</record></zlsxRecovery>
     , .{cx_m});
     defer allocator.free(cx_item);
     try wb.store.addPart("customXml/item1.xml", "application/xml", cx_item);
@@ -146,7 +146,7 @@ fn passTwo(
         "customXml/itemProps1.xml",
         "application/vnd.openxmlformats-officedocument.customXmlProperties+xml",
         \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-        \\<ds:datastoreItem xmlns:ds="http://schemas.openxmlformats.org/officeDocument/2006/customXml" ds:itemID="{7A1C4E90-6B2D-4F31-9E5A-2C1D8F3A0002}"><ds:schemaRefs><ds:schemaRef ds:uri="http://schemas.laurentfabre.dev/zlsx/2026/recovery"/></ds:schemaRefs></ds:datastoreItem>
+        \\<ds:datastoreItem xmlns:ds="http://schemas.openxmlformats.org/officeDocument/2006/customXml" ds:itemID="{7A1C4E90-6B2D-4F31-9E5A-2C1D8F3A0002}"><ds:schemaRefs><ds:schemaRef ds:uri="http://schemas.fabre.me/zlsx/2026/recovery"/></ds:schemaRefs></ds:datastoreItem>
         ,
     );
 
@@ -201,7 +201,7 @@ fn passTwo(
     const wbx = (try wb.store.part("xl/workbook.xml")) orelse return error.MissingWorkbookPart;
     const ext_m = carriers.marker(&mbuf, .ext_lst);
     const ext = try std.fmt.allocPrint(allocator,
-        \\<extLst><ext uri="{s}" xmlns:zlsxe4b="http://schemas.laurentfabre.dev/zlsx/2026/recovery"><zlsxe4b:recovery>{s}</zlsxe4b:recovery></ext></extLst>
+        \\<extLst><ext uri="{s}" xmlns:zlsxe4b="http://schemas.fabre.me/zlsx/2026/recovery"><zlsxe4b:recovery>{s}</zlsxe4b:recovery></ext></extLst>
     , .{ carriers.EXT_URI, ext_m });
     defer allocator.free(ext);
 

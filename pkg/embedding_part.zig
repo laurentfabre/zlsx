@@ -91,14 +91,14 @@ pub const WIRE_VERSION: u32 = 1;
 pub const EMBEDDINGS_DIR: []const u8 = "xl/zlsxEmbeddings";
 pub const INDEX_PART_NAME: []const u8 = "xl/zlsxEmbeddings/index.xml";
 pub const INDEX_RELS_PART_NAME: []const u8 = "xl/zlsxEmbeddings/_rels/index.xml.rels";
-pub const INDEX_NAMESPACE: []const u8 = "http://schemas.laurentfabre.dev/zlsx/2026/embeddings";
+pub const INDEX_NAMESPACE: []const u8 = "http://schemas.fabre.me/zlsx/2026/embeddings";
 pub const HASH_ALGO_XXH3_64: []const u8 = "xxh3-64";
-pub const INDEX_CONTENT_TYPE: []const u8 = "application/vnd.laurentfabre.zlsx.embedding-index+xml";
-pub const VEC_CONTENT_TYPE: []const u8 = "application/vnd.laurentfabre.zlsx.embedding-vec";
-pub const HASH_CONTENT_TYPE: []const u8 = "application/vnd.laurentfabre.zlsx.embedding-hash";
-pub const REL_TYPE_EMBEDDINGS: []const u8 = "http://schemas.laurentfabre.dev/zlsx/2026/relationships/embeddings";
-pub const REL_TYPE_VEC: []const u8 = "http://schemas.laurentfabre.dev/zlsx/2026/relationships/embedding-vec";
-pub const REL_TYPE_HASH: []const u8 = "http://schemas.laurentfabre.dev/zlsx/2026/relationships/embedding-hash";
+pub const INDEX_CONTENT_TYPE: []const u8 = "application/vnd.fabre.zlsx.embedding-index+xml";
+pub const VEC_CONTENT_TYPE: []const u8 = "application/vnd.fabre.zlsx.embedding-vec";
+pub const HASH_CONTENT_TYPE: []const u8 = "application/vnd.fabre.zlsx.embedding-hash";
+pub const REL_TYPE_EMBEDDINGS: []const u8 = "http://schemas.fabre.me/zlsx/2026/relationships/embeddings";
+pub const REL_TYPE_VEC: []const u8 = "http://schemas.fabre.me/zlsx/2026/relationships/embedding-vec";
+pub const REL_TYPE_HASH: []const u8 = "http://schemas.fabre.me/zlsx/2026/relationships/embedding-hash";
 
 /// The sole no-vector / tombstone marker. Slot whose stored hash
 /// equals this value MUST be skipped by query consumers (the vec
@@ -1425,7 +1425,7 @@ test "parseA1Range: validates Excel bounds and row ordering" {
 test "parseIndex: parses plural coverage blocks" {
     const xml =
         \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings"
+        \\<embeddings xmlns="http://schemas.fabre.me/zlsx/2026/embeddings"
         \\            version="1"
         \\            model="text-embedding-3-small"
         \\            dim="1536"
@@ -1461,7 +1461,7 @@ test "parseIndex: parses plural coverage blocks" {
 
 test "parseIndexRelationships: validates relationship types and deterministic targets" {
     const index_xml =
-        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
+        \\<embeddings xmlns="http://schemas.fabre.me/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
         \\  <coverage id="title" worksheet_target="worksheets/sheet1.xml" range="A1:A2" column="A" count="2" vec_rId="rId1" hash_rId="rId2"/>
         \\  <coverage id="body" worksheet_target="worksheets/sheet1.xml" range="B1:B2" column="B" count="2" vec_rId="rId3" hash_rId="rId4"/>
         \\</embeddings>
@@ -1489,7 +1489,7 @@ test "parseIndexRelationships: validates relationship types and deterministic ta
 
 test "parseIndexRelationships: rejects bad rel ids, targets, and modes" {
     const index_xml =
-        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
+        \\<embeddings xmlns="http://schemas.fabre.me/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
         \\  <coverage id="title" worksheet_target="worksheets/sheet1.xml" range="A1:A1" column="A" count="1" vec_rId="rId1" hash_rId="rId2"/>
         \\</embeddings>
     ;
@@ -1538,7 +1538,7 @@ test "parseIndexRelationships: rejects bad rel ids, targets, and modes" {
 
 test "parseIndex: rejects duplicate ids, overlapping coverage, and count mismatch" {
     const duplicate_id =
-        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
+        \\<embeddings xmlns="http://schemas.fabre.me/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
         \\  <coverage id="dup" worksheet_target="worksheets/sheet1.xml" range="A1:A2" column="A" count="2" vec_rId="rId1" hash_rId="rId2"/>
         \\  <coverage id="dup" worksheet_target="worksheets/sheet2.xml" range="A1:A2" column="A" count="2" vec_rId="rId3" hash_rId="rId4"/>
         \\</embeddings>
@@ -1547,7 +1547,7 @@ test "parseIndex: rejects duplicate ids, overlapping coverage, and count mismatc
     try testing.expectError(Error.DuplicateCoverageId, parseIndex(duplicate_id, &coverages));
 
     const overlap =
-        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
+        \\<embeddings xmlns="http://schemas.fabre.me/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
         \\  <coverage id="a" worksheet_target="worksheets/sheet1.xml" range="A1:B2" column="A" count="2" vec_rId="rId1" hash_rId="rId2"/>
         \\  <coverage id="b" worksheet_target="worksheets/sheet1.xml" range="B2:C4" column="B" count="3" vec_rId="rId3" hash_rId="rId4"/>
         \\</embeddings>
@@ -1555,7 +1555,7 @@ test "parseIndex: rejects duplicate ids, overlapping coverage, and count mismatc
     try testing.expectError(Error.CoverageOverlap, parseIndex(overlap, &coverages));
 
     const count_mismatch =
-        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
+        \\<embeddings xmlns="http://schemas.fabre.me/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
         \\  <coverage id="a" worksheet_target="worksheets/sheet1.xml" range="A1:A2" column="A" count="3" vec_rId="rId1" hash_rId="rId2"/>
         \\</embeddings>
     ;
@@ -1564,7 +1564,7 @@ test "parseIndex: rejects duplicate ids, overlapping coverage, and count mismatc
 
 test "parseIndex: rejects unsupported manifest values" {
     const bad_dtype =
-        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f16" hash_algo="xxh3-64">
+        \\<embeddings xmlns="http://schemas.fabre.me/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f16" hash_algo="xxh3-64">
         \\  <coverage id="a" worksheet_target="worksheets/sheet1.xml" range="A1:A1" column="A" count="1" vec_rId="rId1" hash_rId="rId2"/>
         \\</embeddings>
     ;
@@ -1572,14 +1572,14 @@ test "parseIndex: rejects unsupported manifest values" {
     try testing.expectError(Error.InvalidDtype, parseIndex(bad_dtype, &coverages));
 
     const future_version =
-        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="2" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
+        \\<embeddings xmlns="http://schemas.fabre.me/zlsx/2026/embeddings" version="2" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
         \\  <coverage id="a" worksheet_target="worksheets/sheet1.xml" range="A1:A1" column="A" count="1" vec_rId="rId1" hash_rId="rId2"/>
         \\</embeddings>
     ;
     try testing.expectError(Error.UnsupportedVersion, parseIndex(future_version, &coverages));
 
     const bad_hash =
-        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="sha256">
+        \\<embeddings xmlns="http://schemas.fabre.me/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="sha256">
         \\  <coverage id="a" worksheet_target="worksheets/sheet1.xml" range="A1:A1" column="A" count="1" vec_rId="rId1" hash_rId="rId2"/>
         \\</embeddings>
     ;
@@ -1719,7 +1719,7 @@ test "checkPairConsistent: count mismatch flagged" {
 
 test "checkCoverageBinary: validates dim, dtype, and counts against index coverage" {
     const index_xml =
-        \\<embeddings xmlns="http://schemas.laurentfabre.dev/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
+        \\<embeddings xmlns="http://schemas.fabre.me/zlsx/2026/embeddings" version="1" model="m" dim="3" dtype="f32" hash_algo="xxh3-64">
         \\  <coverage id="a" worksheet_target="worksheets/sheet1.xml" range="A1:A2" column="A" count="2" vec_rId="rId1" hash_rId="rId2"/>
         \\</embeddings>
     ;
