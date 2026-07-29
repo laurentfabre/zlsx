@@ -911,6 +911,14 @@ pub const Editor = struct {
             else => |e| return e,
         };
 
+        // `<xm:sqref>` is shifted by sheet_edit; `<xm:f>` is not
+        // routed through the formula rewriter yet, so refuse
+        // rather than half-maintain the sheet.
+        self.workbook.preflightExtensionEditsForSheet(path) catch |err| switch (err) {
+            error.ExtensionEditUnsafe => return error.ColEditUnsafeForSheet,
+            else => |e| return e,
+        };
+
         self.workbook.preflightTableEditsForSheet(path, .col, col_1based, tbl_kind) catch |err| switch (err) {
             error.TableCollapseUnsafe,
             error.TableHeaderRowDeleteUnsafe,
@@ -967,6 +975,14 @@ pub const Editor = struct {
         // Same pivot refusal as `recordColEdit` — see the note there.
         self.workbook.preflightPivotEditsForSheet(path) catch |err| switch (err) {
             error.PivotEditUnsafe => return error.RowEditUnsafeForSheet,
+            else => |e| return e,
+        };
+
+        // `<xm:sqref>` is shifted by sheet_edit; `<xm:f>` is not
+        // routed through the formula rewriter yet, so refuse
+        // rather than half-maintain the sheet.
+        self.workbook.preflightExtensionEditsForSheet(path) catch |err| switch (err) {
+            error.ExtensionEditUnsafe => return error.RowEditUnsafeForSheet,
             else => |e| return e,
         };
 
@@ -4745,4 +4761,76 @@ test "Editor: the pivot guard does not refuse sheets without one" {
     defer rows.deinit();
     const r1 = (try rows.next()) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(i64, 1), r1[0].integer);
+}
+
+// ─── extLst: xm:sqref shifts, xm:f refuses ──────────────────────────
+
+/// Sheet fixture carrying an `<extLst>` extension.
+fn writeExtLstFixture(io: std.Io, path: []const u8, ext_body: []const u8) !void {
+    {
+        var w = xlsx.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try s.writeRow(&.{.{ .integer = 2 }});
+        try w.save(io, path);
+    }
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, path);
+    defer store.deinit();
+    const sheet = (try store.part("xl/worksheets/sheet1.xml")).?;
+    const close = "</worksheet>";
+    const at = std.mem.lastIndexOf(u8, sheet.bytes, close).?;
+    const patched = try std.mem.concat(std.testing.allocator, u8, &.{
+        sheet.bytes[0..at], ext_body, close,
+    });
+    defer std.testing.allocator.free(patched);
+    try store.replacePart("xl/worksheets/sheet1.xml", patched);
+    try store.save(io, path);
+}
+
+test "Editor: insertRow refuses on an extLst carrying xm:f" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "xmf.xlsx");
+    defer std.testing.allocator.free(src);
+    try writeExtLstFixture(io, src, "<extLst><ext><x14:sparklineGroups><x14:sparklineGroup><x14:sparklines>" ++
+        "<x14:sparkline><xm:f>Sheet1!A1:A5</xm:f><xm:sqref>B1</xm:sqref>" ++
+        "</x14:sparkline></x14:sparklines></x14:sparklineGroup>" ++
+        "</x14:sparklineGroups></ext></extLst>");
+
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    // Shifting the xm:sqref while leaving xm:f stale would leave the
+    // workbook looking maintained but pointing at the old grid.
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 1));
+    try std.testing.expectError(error.ColEditUnsafeForSheet, ed.insertColumn(0, 1));
+}
+
+test "Editor: an extLst with only xm:sqref still edits, and shifts" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "xmsqref_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "xmsqref_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    try writeExtLstFixture(io, src, "<extLst><ext><x14:conditionalFormattings><x14:conditionalFormatting>" ++
+        "<xm:sqref>A5:A9</xm:sqref></x14:conditionalFormatting>" ++
+        "</x14:conditionalFormattings></ext></extLst>");
+
+    // The guard must be narrow: xm:f refuses, xm:sqref alone does not.
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    try ed.insertRow(0, 2);
+    try ed.save(io, dst);
+
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+    defer store.deinit();
+    const sheet = (try store.part("xl/worksheets/sheet1.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, sheet.bytes, "<xm:sqref>A6:A10</xm:sqref>") != null);
 }

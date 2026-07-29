@@ -286,6 +286,15 @@ pub const Error = error{
     /// `RowEditUnsafeForSheet` / `ColEditUnsafeForSheet`. Surfaces
     /// from `Workbook.preflightPivotEditsForSheet`.
     PivotEditUnsafe,
+    /// A row/col edit targets a sheet whose `<extLst>` carries an
+    /// `<xm:f>` formula reference (sparkline groups). `<xm:sqref>` is
+    /// shifted by `pkg/sheet_edit.zig`, but `<xm:f>` holds a formula
+    /// zlsx does not route through the formula rewriter yet, so the
+    /// edit refuses rather than leaving it stale. The Editor
+    /// pre-flight remaps this to `RowEditUnsafeForSheet` /
+    /// `ColEditUnsafeForSheet`. Surfaces from
+    /// `Workbook.preflightExtensionEditsForSheet`.
+    ExtensionEditUnsafe,
     /// `Workbook.deleteRow` would remove a structured table's header
     /// row (top of `<table ref>` when `headerRowCount >= 1`, the
     /// default). Like `TableCollapseUnsafe`, the Editor pre-flight
@@ -4288,6 +4297,32 @@ pub const Workbook = struct {
     ) Error!void {
         for (self.store.rels(sheet_part_name)) |rel| {
             if (isPivotRelType(rel.type)) return error.PivotEditUnsafe;
+        }
+    }
+
+    /// Refuse a row/col edit on a sheet whose `<extLst>` carries an
+    /// `<xm:f>` reference.
+    ///
+    /// `<extLst>` was the last surface passing through verbatim.
+    /// `<xm:sqref>` — the range an `x14:` extension applies to, and by
+    /// far the common case — is now shifted in `pkg/sheet_edit.zig`.
+    /// `<xm:f>` is the remainder: a formula reference (sparkline
+    /// groups) that needs the formula rewriter and a sheet-name
+    /// context this layer does not have.
+    ///
+    /// Refusing is the point. Half-closing the gap — shifting
+    /// `xm:sqref` and leaving `xm:f` silently stale — would be worse
+    /// than the original bug, because the workbook would now look
+    /// partially maintained. Either the edit is wholly correct or it
+    /// errors; routing `<xm:f>` through the rewriter is the lift that
+    /// lets this guard come out.
+    pub fn preflightExtensionEditsForSheet(
+        self: *Workbook,
+        sheet_part_name: []const u8,
+    ) Error!void {
+        const part = (try self.store.part(sheet_part_name)) orelse return;
+        if (std.mem.indexOf(u8, part.bytes, "<xm:f") != null) {
+            return error.ExtensionEditUnsafe;
         }
     }
 
