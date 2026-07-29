@@ -902,6 +902,15 @@ pub const Editor = struct {
         // from `Editor.insertColumn` has no actionable fix beyond
         // "this sheet is unsafe to edit", which is exactly what
         // `ColEditUnsafeForSheet` already means.
+        // Pivots have no rewriter, so they refuse. Checked before the
+        // table pre-flight because it is the cheaper test (a rels
+        // lookup vs a dry-run transform per table part) and either way
+        // the answer is the same refusal.
+        self.workbook.preflightPivotEditsForSheet(path) catch |err| switch (err) {
+            error.PivotEditUnsafe => return error.ColEditUnsafeForSheet,
+            else => |e| return e,
+        };
+
         self.workbook.preflightTableEditsForSheet(path, .col, col_1based, tbl_kind) catch |err| switch (err) {
             error.TableCollapseUnsafe,
             error.TableHeaderRowDeleteUnsafe,
@@ -955,6 +964,12 @@ pub const Editor = struct {
         // REL-B527/B528: same remap as recordColEdit — every
         // table_edit refusal/diagnostic folds into the existing
         // `RowEditUnsafeForSheet` axis.
+        // Same pivot refusal as `recordColEdit` — see the note there.
+        self.workbook.preflightPivotEditsForSheet(path) catch |err| switch (err) {
+            error.PivotEditUnsafe => return error.RowEditUnsafeForSheet,
+            else => |e| return e,
+        };
+
         self.workbook.preflightTableEditsForSheet(path, .row, row, tbl_kind) catch |err| switch (err) {
             error.TableCollapseUnsafe,
             error.TableHeaderRowDeleteUnsafe,
@@ -4628,4 +4643,106 @@ test "Editor: insertColumn rewrites third-party sheetView, selection and sortSta
     try assertSheetXmlContains(&ed2, "sqref=\"C5 E7:F9\"");
     try assertSheetXmlContains(&ed2, "<sortState ref=\"A6:C9\"");
     try assertSheetXmlContains(&ed2, "<sortCondition ref=\"C6:C9\"");
+}
+
+// ─── pivot refusal (silent-corruption fix) ──────────────────────────
+//
+// A pivot's `<location ref>` and its cache field ranges live in
+// `xl/pivotTables/*` + `xl/pivotCache/*`, keyed by a cross-part graph
+// zlsx has no rewriter for. Before this guard there was no refusal
+// either — neither this file nor `sheet_edit.zig` contained the string
+// "pivot" — so a row insert left every pivot coordinate pointing at
+// the pre-shift grid. `docs/plans/refusal-audit.md` recorded pivots as
+// "refused at consumer level"; they were not refused anywhere.
+
+const PIVOT_SHEET_RELS: []const u8 =
+    \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    \\<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/></Relationships>
+;
+
+/// Write a 3-row sheet, optionally wiring a pivot relationship onto it.
+fn writePivotFixture(io: std.Io, path: []const u8, with_pivot: bool) !void {
+    {
+        var w = xlsx.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try s.writeRow(&.{.{ .integer = 2 }});
+        try s.writeRow(&.{.{ .integer = 3 }});
+        try w.save(io, path);
+    }
+    if (!with_pivot) return;
+
+    // Injected through a real save/reopen because `addPart` does not
+    // refresh `PartStore`'s rels cache — and a genuine pivot workbook
+    // arrives from disk anyway.
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, path);
+    defer store.deinit();
+    try store.addPart(
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "application/vnd.openxmlformats-package.relationships+xml",
+        PIVOT_SHEET_RELS,
+    );
+    try store.save(io, path);
+}
+
+test "Editor: insertRow refuses on a sheet a pivot reads from" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "pivot_row.xlsx");
+    defer std.testing.allocator.free(src);
+    try writePivotFixture(io, src, true);
+
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    // Refusing is the whole point: silently shifting the grid would
+    // leave the pivot's `<location ref>` describing the old layout.
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 2));
+}
+
+test "Editor: insertColumn refuses on a sheet a pivot reads from" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "pivot_col.xlsx");
+    defer std.testing.allocator.free(src);
+    try writePivotFixture(io, src, true);
+
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    try std.testing.expectError(error.ColEditUnsafeForSheet, ed.insertColumn(0, 1));
+    try std.testing.expectError(error.ColEditUnsafeForSheet, ed.deleteColumn(0, 1));
+}
+
+test "Editor: the pivot guard does not refuse sheets without one" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "nopivot_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "nopivot_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    try writePivotFixture(io, src, false);
+
+    // A guard that refuses everything is not a guard. Same fixture,
+    // same edit, no pivot relationship — must still succeed.
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    try ed.insertRow(0, 2);
+    try ed.save(io, dst);
+
+    var book = try Book.open(std.testing.allocator, io, dst);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], std.testing.allocator);
+    defer rows.deinit();
+    const r1 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 1), r1[0].integer);
 }

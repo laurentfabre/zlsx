@@ -278,6 +278,14 @@ pub const Error = error{
     /// `ColEditUnsafeForSheet`, so this variant only surfaces when a
     /// caller bypasses Editor. Surfaces from `pkg/table_edit.zig`.
     TableCollapseUnsafe,
+    /// A row/col edit targets a sheet a pivot table reads from. The
+    /// pivot's `<location ref>` and cache field ranges live in a
+    /// cross-part graph zlsx has no rewriter for, so the edit refuses
+    /// rather than leaving those coordinates pointing at the pre-shift
+    /// grid. The Editor pre-flight remaps this to
+    /// `RowEditUnsafeForSheet` / `ColEditUnsafeForSheet`. Surfaces
+    /// from `Workbook.preflightPivotEditsForSheet`.
+    PivotEditUnsafe,
     /// `Workbook.deleteRow` would remove a structured table's header
     /// row (top of `<table ref>` when `headerRowCount >= 1`, the
     /// default). Like `TableCollapseUnsafe`, the Editor pre-flight
@@ -693,6 +701,25 @@ fn redactSlot(
         embedding_part.TOMBSTONE_HASH,
         .little,
     );
+}
+
+/// Whether a relationship type names a pivot part.
+///
+/// Matched on the trailing segment rather than the full URI: the
+/// transitional (`.../officeDocument/2006/relationships/pivotTable`)
+/// and strict (`.../officeDocument/2006/relationships/pivotTable` under
+/// a different host in some producers) spellings share the leaf, and a
+/// producer using a namespace zlsx has not seen must still be refused
+/// rather than silently edited. Over-matching here costs a refusal;
+/// under-matching costs a corrupted workbook.
+fn isPivotRelType(rel_type: []const u8) bool {
+    const leaf = if (std.mem.lastIndexOfScalar(u8, rel_type, '/')) |i|
+        rel_type[i + 1 ..]
+    else
+        rel_type;
+    return std.ascii.eqlIgnoreCase(leaf, "pivotTable") or
+        std.ascii.eqlIgnoreCase(leaf, "pivotCacheDefinition") or
+        std.ascii.eqlIgnoreCase(leaf, "pivotCacheRecords");
 }
 
 /// `<coverage id>` charset + length rules per the spec: required,
@@ -4230,6 +4257,37 @@ pub const Workbook = struct {
                 kind,
             );
             self.allocator.free(out);
+        }
+    }
+
+    /// Refuse a row/col edit on a sheet that a pivot table reads from.
+    ///
+    /// A pivot's `<location ref>` and its cache field ranges live in
+    /// `xl/pivotTables/pivotN.xml` and `xl/pivotCache/*`, keyed by a
+    /// cross-part reference graph zlsx has no rewriter for. Until it
+    /// does, the honest outcome is a typed refusal.
+    ///
+    /// This closes a **silent-corruption** path, not a feature gap.
+    /// `docs/plans/refusal-audit.md` recorded pivots as "refused at
+    /// consumer level" — they were not refused anywhere: neither
+    /// `pkg/sheet_edit.zig` nor `pkg/editor.zig` contained the string
+    /// "pivot". A row insert simply left every pivot coordinate
+    /// pointing at the pre-shift grid. Same class as the four
+    /// unrewritten elements #125 found, and invisible to the same
+    /// audit method for the same reason: you cannot enumerate a guard
+    /// that was never written.
+    ///
+    /// Detection is by relationship type rather than by scanning the
+    /// sheet body: a pivot leaves no required marker in the worksheet
+    /// XML (`<pivotSelection>` rides in `<sheetView>` but is
+    /// optional), while the r:id edge to the pivot part is what makes
+    /// the pivot depend on this sheet's coordinates at all.
+    pub fn preflightPivotEditsForSheet(
+        self: *Workbook,
+        sheet_part_name: []const u8,
+    ) Error!void {
+        for (self.store.rels(sheet_part_name)) |rel| {
+            if (isPivotRelType(rel.type)) return error.PivotEditUnsafe;
         }
     }
 
