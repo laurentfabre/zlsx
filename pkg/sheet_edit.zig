@@ -83,6 +83,8 @@ pub fn applyColEditToWorksheet(
             try processSortStateTagCol(allocator, &out, src, t, col_1based, kind, &i);
         } else if (matchTagAt(src, i, "sortCondition")) |t| {
             try processSortConditionTagCol(allocator, &out, src, t, col_1based, kind, &i);
+        } else if (matchTagAt(src, i, "xm:sqref")) |t| {
+            try processXmSqrefTag(allocator, &out, src, t, .col, col_1based, kind, &i);
         } else {
             try out.append(allocator, '<');
             i += 1;
@@ -813,6 +815,8 @@ pub fn applyRowEditToWorksheet(
             try processSortStateTagRow(allocator, &out, src, t, row, kind, &i);
         } else if (matchTagAt(src, i, "sortCondition")) |t| {
             try processSortConditionTagRow(allocator, &out, src, t, row, kind, &i);
+        } else if (matchTagAt(src, i, "xm:sqref")) |t| {
+            try processXmSqrefTag(allocator, &out, src, t, .row, row, kind, &i);
         } else {
             // Some other tag; emit `<` and continue past it.
             try out.append(allocator, '<');
@@ -1446,6 +1450,78 @@ fn parseOnAxis(ref: []const u8, axis: Axis) ?u32 {
 /// is dropped from the list.
 ///
 /// Result borrows from `out_buf`.
+/// Shift `<xm:sqref>A1:A10 C3</xm:sqref>` — the range an `x14:`/`x15:`
+/// extension applies to.
+///
+/// `<extLst>` was the last coordinate-bearing surface passing through
+/// **verbatim**: this file contained no reference to it, so an
+/// `x14:conditionalFormatting`, `x14:dataValidation`,
+/// `x14:sparklineGroup` or `x14:ignoredErrors` kept pointing at the
+/// pre-shift grid after a row/col edit. `docs/plans/refusal-audit.md`
+/// named it as the one surface its method could not reach.
+///
+/// Handled by element name rather than by walking into `<extLst>`:
+/// `xm:sqref` means the same thing — "the range this extension covers"
+/// — in every extension that carries it, and it appears nowhere else.
+/// Matching the leaf directly avoids tracking extension nesting, and a
+/// future `x14:` element carrying `xm:sqref` is then correct for free.
+///
+/// Unlike an attribute, this is element *text*, so the value lives
+/// between the open and close tags. Malformed input (no close tag,
+/// unshiftable ref) emits the original bytes unchanged — same failure
+/// posture as every other handler here.
+fn processXmSqrefTag(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    axis: Axis,
+    idx_1based: u32,
+    kind: RowEditKind,
+    i: *usize,
+) !void {
+    const CLOSE = "</xm:sqref>";
+    const text_start = t.after_open;
+    const close_at = std.mem.indexOfPos(u8, src, text_start, CLOSE) orelse {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        i.* = t.after_open;
+        return;
+    };
+    const body = src[text_start..close_at];
+
+    var shifted: std.ArrayListUnmanaged(u8) = .empty;
+    defer shifted.deinit(allocator);
+    var it = std.mem.tokenizeAny(u8, body, " \t\r\n");
+    while (it.next()) |entry| {
+        var ent_buf: [40]u8 = undefined;
+        const s = shiftRefOrRange(entry, axis, idx_1based, kind, &ent_buf) catch {
+            // Unparseable ref: emit the whole element untouched rather
+            // than a partially-shifted list.
+            try out.appendSlice(allocator, src[t.start .. close_at + CLOSE.len]);
+            i.* = close_at + CLOSE.len;
+            return;
+        };
+        const keep = s orelse continue; // range collapsed by a delete
+        if (shifted.items.len > 0) try shifted.append(allocator, ' ');
+        try shifted.appendSlice(allocator, keep);
+    }
+
+    // Every range collapsed. An empty `<xm:sqref/>` is schema-invalid,
+    // and dropping the element alone would orphan its sibling rule, so
+    // emit the original bytes and let the edit stand — the same
+    // trade-off `<selection sqref>` makes when its list empties.
+    if (shifted.items.len == 0) {
+        try out.appendSlice(allocator, src[t.start .. close_at + CLOSE.len]);
+        i.* = close_at + CLOSE.len;
+        return;
+    }
+
+    try out.appendSlice(allocator, src[t.start..text_start]);
+    try out.appendSlice(allocator, shifted.items);
+    try out.appendSlice(allocator, CLOSE);
+    i.* = close_at + CLOSE.len;
+}
+
 fn shiftRefOrRange(
     ref: []const u8,
     axis: Axis,
@@ -2325,4 +2401,87 @@ test "an over-long A1 reference is refused, not truncated" {
 
 test "fuzz: sheet_edit walkers never crash on adversarial XML" {
     try std.testing.fuzz({}, fuzzSheetEditTarget, .{ .corpus = &sheet_edit_corpus });
+}
+
+// ─── extLst / xm:sqref (the last verbatim-passthrough surface) ──────
+//
+// `docs/plans/refusal-audit.md` §"Method note": the refusal list is
+// derived from what the Editor *scans for*, and `<extLst>` blocks
+// (`x14:`/`x15:` extensions) "pass through verbatim everywhere" — the
+// one surface that method could not reach. These pin the shift.
+
+test "xm:sqref: row insert shifts the extension's range" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<extLst><ext uri=\"{78C0D931}\"><x14:conditionalFormattings>" ++
+        "<x14:conditionalFormatting><xm:sqref>A5:A9</xm:sqref>" ++
+        "</x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 2, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<xm:sqref>A6:A10</xm:sqref>") != null);
+}
+
+test "xm:sqref: col insert shifts the extension's range" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<extLst><ext><x14:dataValidations><x14:dataValidation>" ++
+        "<xm:sqref>C1:D4</xm:sqref></x14:dataValidation>" ++
+        "</x14:dataValidations></ext></extLst>");
+    defer a.free(src);
+    const out = try applyColEditToWorksheet(a, src, 1, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<xm:sqref>D1:E4</xm:sqref>") != null);
+}
+
+test "xm:sqref: a multi-range list shifts every entry" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<extLst><ext><xm:sqref>A5 C7:C9 E2</xm:sqref></ext></extLst>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 3, .insert);
+    defer a.free(out);
+    // A5 and C7:C9 are at/below the insert point and move; E2 is above
+    // it and must not.
+    try testing.expect(std.mem.indexOf(u8, out, "<xm:sqref>A6 C8:C10 E2</xm:sqref>") != null);
+}
+
+test "xm:sqref: ranges above the edit point are left alone" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<extLst><ext><xm:sqref>A1:A2</xm:sqref></ext></extLst>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 9, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<xm:sqref>A1:A2</xm:sqref>") != null);
+}
+
+test "xm:sqref: an unterminated element is emitted unchanged" {
+    const a = testing.allocator;
+    // No `</xm:sqref>`. Emitting the open tag and moving on beats
+    // scanning to end-of-buffer looking for a close that isn't there —
+    // the same failure posture every other handler here takes.
+    const src = try wrapSheet(a, "<extLst><ext><xm:sqref>A5:A9</ext></extLst>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 2, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "A5:A9") != null);
+}
+
+test "xm:sqref: an unparseable ref leaves the whole list untouched" {
+    const a = testing.allocator;
+    // Partially-shifting a list would be worse than not shifting it:
+    // the caller cannot tell which entries moved.
+    const src = try wrapSheet(a, "<extLst><ext><xm:sqref>A5 !!bogus!!</xm:sqref></ext></extLst>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 2, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<xm:sqref>A5 !!bogus!!</xm:sqref>") != null);
+}
+
+test "xm:sqref: a sheet with no extLst is byte-identical" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<autoFilter ref=\"B2:D5\"/>");
+    defer a.free(src);
+    const with = try applyRowEditToWorksheet(a, src, 2, .insert);
+    defer a.free(with);
+    // The new branch must not perturb sheets that never had one.
+    try testing.expect(std.mem.indexOf(u8, with, "xm:sqref") == null);
+    try testing.expect(std.mem.indexOf(u8, with, "<autoFilter ref=\"B3:D6\"/>") != null);
 }
