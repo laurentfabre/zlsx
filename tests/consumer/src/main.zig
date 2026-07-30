@@ -65,9 +65,14 @@ pub fn main(init: std.process.Init) !u8 {
     {
         var ed = try pkg.Editor.open(gpa, io, in_path);
         defer ed.deinit();
-        try ed.setCells(0, &.{
+        // Spell the batch as `pkg.Edit` deliberately: an inferred anonymous
+        // literal compiles even without the re-export, so only a named type
+        // pins it. This is the consumer shape that motivated exporting it —
+        // building the slice somewhere other than the call site.
+        const edits = [_]pkg.Edit{
             .{ .row = 2, .col = 0, .cell = .{ .string = SENTINEL } },
-        });
+        };
+        try ed.setCells(0, &edits);
         try ed.save(io, out_path);
     }
     try w.print("edited {s}\n", .{out_path});
