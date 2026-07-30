@@ -4,7 +4,7 @@
 > Detail lives in `docs/plans/`; narrated context + collaboration rules live in the
 > knowledge base at `docs/kb/` (open `docs/kb/kb.html`, gitignored).
 
-_Last updated: 2026-07-28_
+_Last updated: 2026-07-30_
 
 ---
 
@@ -149,8 +149,13 @@ Remaining: IANA MIME registration (deferred to v1.0).
 - **B2/B3 unification** — Writer + Editor collapsed onto `Workbook`; each subsystem a
   std-only `pkg/*_plan.zig`. `Editor.save` 14 LOC, `Writer.save` 17 LOC.
 - **Every row/col-edit refusal axis with a rewriter is lifted** on `main` (panes,
-  autoFilter, picture, xdr, VML+comments, structured tables). Only Pivots stay refused
-  (no rewriter; the writer never emits them).
+  autoFilter, picture, xdr, VML+comments, structured tables, extLst `xm:sqref` #140).
+  Two axes stay refused, now with *actual* guards: **pivots** (#139 — previously
+  claimed "refused at consumer level" while no refusal existed anywhere; a row edit
+  silently stranded every pivot coordinate) and **`<xm:f>`** sparkline formulas
+  (#140 — needs the formula rewriter + sheet-name context).
+- **v0.5.0 released 2026-07-30** — first release carrying the Zig 0.16 migration and
+  the whole embedding arc (#123–#140). Exercises #138's release automation end-to-end.
 
 ## 🅿️ Parked / out-of-band
 
@@ -158,6 +163,12 @@ Remaining: IANA MIME registration (deferred to v1.0).
 - ~~**Zig 0.16 migration**~~ — shipped: the toolchain in #120, the embedding arc's
   forward-port in #123. `stash@{0}` is discharged and safe to drop.
 - **zlsx-cloud SaaS** — separate design arc (`docs/plans/saas-*`, gitignored).
+
+## 🧭 Next pro track — Databricks interface (ideation, 2026-07-30)
+
+First pro feature: interface zlsx with Databricks, whose native Excel support is
+weak (JVM/POI-based `spark-excel` or driver-side pandas+openpyxl). Ideation lives
+in the private KB (`docs/kb/`, gitignored) alongside the SaaS arc.
 
 ## 🔭 Candidate follow-ups (value/effort order)
 
@@ -170,9 +181,18 @@ Remaining: IANA MIME registration (deferred to v1.0).
    `shiftSingleA1Col/Row` overran a fixed 16-byte buffer. #125 was the argument
    for it, and it was right: that code had four unhandled elements the refusal
    audit's method could not see.
-3. CDATA-aware shared tag scanner (candidate for `ziglib`).
-4. `<extLst>` coordinate fixups (`x14:`/`x15:` blocks) — the one surface still passing
-   through verbatim everywhere, per #125's audit note.
+3. ~~`<extLst>` coordinate fixups (`x14:`/`x15:` blocks)~~ — ✅ **done (#140)**:
+   `xm:sqref` shifts by leaf-element name; `<xm:f>` refuses via `ExtensionEditUnsafe`.
+   Same pass shipped the pivot refusal (#139) — the last guard-less silent-corruption
+   class the refusal audit's method could not see.
+4. **Route `<xm:f>` through the formula rewriter** — removes #140's
+   `ExtensionEditUnsafe` guard, which today refuses row/col edits on any sheet
+   carrying a sparkline formula. Needs a sheet-name context `sheet_edit.zig`
+   does not have. The highest-value remaining lift.
+5. **Cross-part pivot rewriter** — removes #139's refusal. Bigger lift:
+   `<location ref>` + cache field ranges across `xl/pivotTables/*` and
+   `xl/pivotCache/*`, a ref graph zlsx has never walked.
+6. CDATA-aware shared tag scanner (candidate for `ziglib`).
 
 ---
 
