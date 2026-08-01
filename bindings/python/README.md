@@ -122,6 +122,39 @@ The `Style` dataclass covers every openpyxl-parity style field shipped in Phase 
 
 `BorderSide.style` accepts 14 OOXML border style names: `"none"`, `"thin"`, `"medium"`, `"dashed"`, `"dotted"`, `"thick"`, `"double"`, `"hair"`, `"mediumDashed"`, `"dashDot"`, `"mediumDashDot"`, `"dashDotDot"`, `"mediumDashDotDot"`, `"slantDashDot"`.
 
+## Spark (PySpark Data Source)
+
+Spark 4.0+ / DBR 15.4+ (including serverless). `pip install py-zlsx[spark]`
+locally; on Databricks the plain wheel is enough — pyspark is already there.
+
+```python
+from zlsx.spark import ZlsxDataSource
+spark.dataSource.register(ZlsxDataSource)
+
+df = (spark.read.format("zlsx")
+      .option("sheet", "Sales")            # name, 0-based index, "a,b", or "*"
+      .option("rowsPerPartition", 100000)  # split big sheets across executors
+      .load("/Volumes/cat/schema/vol/*.xlsx"))
+
+(df.coalesce(1).write.format("zlsx")
+   .mode("overwrite")
+   .save("/Volumes/cat/schema/vol/report.xlsx"))
+```
+
+| Read option | Default | Meaning |
+|---|---|---|
+| `sheet` | `"0"` | Sheet name, index, comma list, or `*` for all sheets |
+| `header` | `true` | First row is column names; `false` → `_c0..` |
+| `inferRows` | `1000` | Rows sampled for schema inference (widens across the whole sample, not just the first row) |
+| `rowsPerPartition` | `0` (off) | Also split each sheet into row ranges |
+| `mode` | `permissive` | `permissive` nulls cells that don't fit the schema; `failfast` raises naming the exact file/sheet/row/column |
+
+Reads partition per (file × sheet); paths accept a file, directory, glob, or
+comma list. Writes: a `.xlsx` target is single-file mode and needs a
+single-partition DataFrame (`coalesce(1)`); any other path becomes a directory
+of `part-*.xlsx`. `date`/`timestamp` columns round-trip as styled Excel
+serials. Write options: `sheet` (default `"Sheet1"`), `header`.
+
 ## Migration from openpyxl
 
 ### Reads
@@ -191,6 +224,7 @@ with zlsx.write("out.xlsx") as w:
 - Formula cells on write (`write_row_with_formulas`) — emits `<f>` + cached `<v>`; Excel recalculates on open
 - Data validation (list / numeric / custom) and conditional formatting (cellIs / expression / colorScale / dataBar)
 - Refcounted handles — close the book while rows are still being consumed, the C ABI keeps the state alive until the last reference drops
+- PySpark Data Source (`zlsx.spark`) — batch read with per-(file×sheet) partitions and optional row-range splits, batch write to single-file or `part-*.xlsx` targets
 
 **Out** (by design, or queued)
 

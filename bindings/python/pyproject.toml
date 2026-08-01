@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "py-zlsx"
-version = "0.6.0"
+version = "0.7.0"
 description = "Python binding for zlsx — fast, read-mostly .xlsx library (Zig)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -34,6 +34,9 @@ Issues = "https://github.com/laurentfabre/zlsx/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
+# pyarrow is not optional: pyspark's Python Data Source worker imports
+# it on the read path (plan_data_source_read) and crashes without it.
+spark = ["pyspark>=4.0.0", "pyarrow>=11.0.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["zlsx"]

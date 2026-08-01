@@ -1,5 +1,14 @@
 """Query an xlsx workbook in a UC Volume directly with Spark SQL — no Delta copy.
 
+NOTE: this file is the ORIGINAL minimal proof (verified 2026-07-30) and
+stays as-is for the record. The productized source now ships in the
+wheel as ``zlsx.spark`` (py-zlsx 0.7.0+): per-(file x sheet) partitions,
+row-range splits, sample-wide type widening, permissive/failfast modes,
+and the writer half. Prefer it for anything beyond a demo:
+
+    from zlsx.spark import ZlsxDataSource
+    spark.dataSource.register(ZlsxDataSource)
+
 Two paths, tried in order:
 
   1. PySpark Data Source (Spark 4 / DBR 15.4+ / serverless):
