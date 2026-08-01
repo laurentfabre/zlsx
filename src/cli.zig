@@ -9,6 +9,7 @@ const fuzz_config = @import("fuzz_config");
 const builtin = @import("builtin");
 const xlsx = @import("zlsx");
 const zlsx_pkg = @import("zlsx_pkg");
+const dbx = @import("dbx.zig");
 
 const Format = enum {
     /// NEW default: row envelope `{kind,sheet,sheet_idx,row,cells:[…]}`.
@@ -1012,15 +1013,24 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                     (default "default"), --dtype f32|int8-sym
         \\                     (default f32), --sheet N (default 0).
         \\
-        \\                     The model is invoked out of band — zlsx
-        \\                     never makes a network call — so the two
-        \\                     phases compose through a pipe:
+        \\                     The model is invoked out of band — the
+        \\                     embed pipeline never makes a network call
+        \\                     — so the two phases compose through a pipe:
         \\                       zlsx embed b.xlsx --extract --column A \
         \\                         --coverage A2:A100 > rows.ndjson
         \\                       my-embedder < rows.ndjson > vecs.ndjson
         \\                       zlsx embed b.xlsx --vectors vecs.ndjson \
         \\                         --model M --column A --coverage A2:A100 \
         \\                         --out out.xlsx
+        \\  dbx push|pull|genie  Databricks over REST (the one network-
+        \\                     touching family). Auth from DATABRICKS_HOST
+        \\                     / DATABRICKS_TOKEN; genie space from
+        \\                     GENIE_SPACE_ID. push/pull transfer workbooks
+        \\                     to/from a UC Volume and REFUSE bytes that do
+        \\                     not parse as a workbook (upload preflight,
+        \\                     verify-before-rename download); genie asks a
+        \\                     Genie space and streams status + SQL + rows
+        \\                     as NDJSON. `zlsx dbx --help` for details.
         \\
         \\Formats (rows only)
         \\  jsonl              NDJSON row envelope (default, iter55a):
@@ -1815,6 +1825,14 @@ fn runMain(init: std.process.Init) !u8 {
     var stderr_file = std.Io.File.stderr().writer(proc_io, &stderr_buf);
     const err = &stderr_file.interface;
     defer err.flush() catch {};
+
+    // dbx-1: the Databricks family has its own argument grammar (no
+    // local workbook positional, env-based auth), so it delegates the
+    // whole tail before parseArgs rather than growing the Subcommand
+    // scoping matrix.
+    if (raw_args.len >= 2 and std.mem.eql(u8, raw_args[1], "dbx")) {
+        return try dbx.run(alloc, proc_io, init.minimal.environ, raw_args[2..], out, err);
+    }
 
     const args = parseArgs(raw_args[1..]) catch |e| switch (e) {
         ArgError.HelpRequested => {

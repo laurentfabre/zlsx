@@ -21,6 +21,9 @@
 const store_mod = @import("store.zig");
 const drawings_mod = @import("drawings.zig");
 
+/// dbx-1: crash-safe whole-file replacement, exported for the CLI's
+/// `dbx pull` (write-verify-rename). Same primitive PartStore.save uses.
+pub const AtomicFile = @import("atomic_file.zig").AtomicFile;
 pub const PartStore = store_mod.PartStore;
 pub const Part = store_mod.Part;
 pub const Relationship = store_mod.Relationship;
