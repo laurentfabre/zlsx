@@ -1,0 +1,278 @@
+# `zlsx` CLI reference
+
+The `zlsx` binary is "jq for Excel": the read/query sub-commands emit a
+uniform NDJSON envelope by default, composing cleanly with `jq`, `rg`,
+`awk`, `duckdb read_ndjson`, or an LLM ingest harness. Two deliberate
+exceptions: `rows` offers CSV/TSV/legacy escape hatches via `--format`, and
+`meta` / `list-sheets` offer a single collapsed JSON object via
+`--output pretty-json`.
+Mutation sub-commands (the edit family, `scrub-metadata`, `embed --strip` /
+`--vectors`) write the output workbook and stay silent on stdout on success —
+except `embed --prune`, which emits one NDJSON summary. Design rationale
+lives in [`jq-for-excel.md`](jq-for-excel.md) (historical; this page is the
+current contract).
+
+```bash
+zlsx file.xlsx                          # default: rows sub-command
+zlsx rows file.xlsx                     # explicit alias
+zlsx cells file.xlsx --range B2:Z100    # per-cell NDJSON, bounded
+zlsx meta file.xlsx --output pretty-json
+```
+
+**Contents**: [Sub-commands](#sub-commands) ·
+[Row envelope](#the-ndjson-row-envelope) · [Flags](#flags) ·
+[Example pipelines](#example-pipelines) ·
+[Pipeline safety](#pipeline-safety) · [Exit codes](#exit-codes) ·
+[License](#license)
+
+---
+
+## Sub-commands
+
+### Read (NDJSON out)
+
+| Command | `kind` | Per-line fields |
+|---|---|---|
+| `zlsx rows <file>` | `"row"` | `sheet, sheet_idx, row, cells[]` (each `{ref, col, t, v}`) |
+| `zlsx cells <file>` | `"cell"` | `sheet, sheet_idx, ref, row, col, t, v, style?` |
+| `zlsx comments <file>` | `"comment"` | `sheet, sheet_idx, ref, row, col, author, text, runs?` |
+| `zlsx validations <file>` | `"validation"` | `sheet, sheet_idx, range, rule_type, op?, formula1, formula2?, values?` |
+| `zlsx hyperlinks <file>` | `"hyperlink"` | `sheet, sheet_idx, range, url?, location?` |
+| `zlsx styles <file>` | `"style"` | `idx, font, fill, border, num_fmt` (workbook-wide) |
+| `zlsx sst <file>` | `"sst"` | `idx, text, runs?` (workbook-wide) |
+| `zlsx meta <file>` | `"workbook"` + `"sheet"` | workbook record first, then per-sheet records |
+| `zlsx list-sheets <file>` | `"sheet"` | `sheet, sheet_idx, state` — lighter-weight than `meta` |
+
+### Edit (load-modify-save)
+
+Every edit sub-command reads `<file>`, applies the change, and atomic-renames
+the result to `--out PATH` — the input is never modified in place. A refused
+edit (a construct the rewriter cannot shift safely yet — see
+[`plans/refusal-audit.md`](plans/refusal-audit.md)) exits with a diagnostic
+instead of writing a corrupt workbook; a successful save is byte-safe.
+
+| Command | Required flags | What it does |
+|---|---|---|
+| `append-rows` | `--sheet N --out P` | Append rows read from stdin — one JSON array per line (`null`→empty, `true/false`→bool, integer→int, number→float, string→str) |
+| `set-cell` | `--sheet N --ref A1 --value <JSON> --out P` | Rewrite one cell in place; `--value` is a single JSON token with the same type mapping |
+| `insert-row` / `delete-row` | `--sheet N --row N --out P` | Structural row edit (1-based row) |
+| `insert-column` / `delete-column` | `--sheet N --col LETTER --out P` | Structural column edit (`A`..`XFD`) |
+| `add-sheet` | `--new-name NAME --out P` | Append a new empty sheet |
+| `rename-sheet` | `--sheet N --new-name NAME --out P` | Rename a sheet (Unicode-aware duplicate check) |
+| `delete-sheet` | `--sheet N --out P` | Drop a sheet (cannot drop the last one) |
+| `scrub-metadata` | `--out P` | Strip `docProps` identity metadata (author, last-modified-by, company, …) — elements are removed outright, not blanked; cell data is byte-preserved |
+
+```bash
+cat rows.ndjson | zlsx append-rows in.xlsx --sheet 0 --out out.xlsx
+zlsx set-cell in.xlsx --sheet 0 --ref C5 --value '"hello"' --out out.xlsx
+zlsx scrub-metadata in.xlsx --out clean.xlsx
+```
+
+### Embeddings (`embed`)
+
+Manage embedding vectors stored *inside* the workbook (zlsx's embedding parts —
+`vnd.fabre.zlsx.*` OPC parts, invisible to Excel). The model is invoked out of
+band — the embed pipeline never makes a network call — so extract and write
+compose through a pipe:
+
+```bash
+zlsx embed book.xlsx --extract --column A --coverage A2:A100 > rows.ndjson
+my-embedder < rows.ndjson > vecs.ndjson
+zlsx embed book.xlsx --vectors vecs.ndjson --model M \
+    --column A --coverage A2:A100 --out out.xlsx
+```
+
+| Mode | Required flags | What it does |
+|---|---|---|
+| `embed --extract` | `--column A --coverage A2:A100` | Read-only: one `{"kind":"embed_row","row":N,"text":"…"}` record per embeddable row |
+| `embed --vectors P` | `--column A --coverage A2:A100 --model NAME --out P` | Write the embedding parts from `{"row":N,"vector":[…]}` NDJSON; covered rows with no vector become tombstones. Optional: `--id NAME`, `--dtype f32\|int8-sym`, `--sheet N` |
+| `embed --prune` | `--out P` | The redaction sweep: tombstone every slot whose row is no longer embeddable and zero its vector (a row deleted in plain Excel leaves its vector on disk — this removes it). Changed-but-present content is reported stale, not redacted |
+| `embed --strip` | `--out P` | Remove the embedding parts *and* the recovery record — the pre-share operation; the result reports `absent`, not `stripped` |
+
+### Databricks (`dbx`)
+
+The one network-touching family. Auth from `DATABRICKS_HOST` /
+`DATABRICKS_TOKEN`; Genie space from `GENIE_SPACE_ID` (or `--space ID`).
+
+| Command | What it does |
+|---|---|
+| `zlsx dbx push local.xlsx /Volumes/cat/schema/vol/f.xlsx [--overwrite]` | Upload a workbook to a Unity Catalog Volume — the file is parsed *before* upload, so garbage is refused client-side (exit 3) |
+| `zlsx dbx pull /Volumes/... local.xlsx` | Download a workbook — parsed before the atomic rename, so a truncated or non-workbook body never lands |
+| `zlsx dbx genie "question" [--space ID] [--timeout-secs N]` | Ask a Genie space; streams status / generated SQL / columns / rows / text as NDJSON |
+
+Workbooks and response bodies are capped at **64 MiB** in both directions:
+`push` refuses a larger local input before parsing or upload, and `pull` /
+`genie` reject a larger response after it is buffered (a correctness cap,
+not a hard memory bound). `genie` polls up to `--timeout-secs`
+(default **120**).
+
+---
+
+## The NDJSON row envelope
+
+```jsonl
+{"kind":"row","sheet":"Data","sheet_idx":0,"row":1,"cells":[{"ref":"A1","col":1,"t":"str","v":"name"},{"ref":"B1","col":2,"t":"str","v":"qty"}]}
+{"kind":"row","sheet":"Data","sheet_idx":0,"row":2,"cells":[{"ref":"A2","col":1,"t":"str","v":"apple"},{"ref":"B2","col":2,"t":"int","v":3}]}
+```
+
+`t` ∈ `"str"` | `"int"` | `"num"` | `"bool"` | `"blank"` | `"date"` | `"error"`
+| `"formula"`; empty cells are skipped from `cells[]` unless `--include-blanks`
+is set.
+
+- **Date cells** carry an extra `serial` field with the raw Excel serial
+  alongside the ISO `v`. Both the 1900 and 1904 (`<workbookPr date1904="1"/>`)
+  epochs decode correctly — `serial` always carries the source value unshifted.
+- **Formula cells** carry `formula` (own text) or `formula_ref`
+  (shared-formula base ref) plus an optional `cached` value instead of `v`.
+- **Error cells** carry the literal Excel error string in `v` (`"#DIV/0!"`,
+  `"#N/A"`, …).
+
+---
+
+## Flags
+
+**Default sheet scope** differs by family: `rows` / `cells` read sheet 0
+unless told otherwise; `comments` / `validations` / `hyperlinks` stream every
+sheet; `styles` / `sst` / `meta` / `list-sheets` are workbook-wide.
+
+**Sheet selection** — mutually exclusive:
+
+```bash
+--sheet N                     # 0-indexed
+--name "Summary"              # by name
+--all-sheets                  # every sheet concatenated
+--sheet-glob 'Data*'          # glob on sheet name (UTF-8 `?` matches one codepoint)
+```
+
+**Row / cell bounds** (rows / cells / comments):
+
+```bash
+--start-row 2 --end-row 100   # 1-based inclusive, per sheet
+--range B2:Z100               # A1 bounding rectangle (rows + cells only)
+--header                      # rows only: promote first row to keys, emit `fields` dict
+```
+
+**Stream pagination** — applies globally across the concatenated output:
+
+```bash
+--skip N --take M
+```
+
+**Cell metadata opt-ins** (cells / rows):
+
+```bash
+--include-blanks              # emit t:"blank" records for empty cells
+--with-styles                 # attach terse style: {bold?, italic?, fg?, bg?, nf?, border?}
+--sst-lazy                    # open with Book.openSstLazy — defer SST decode until first
+                              # cell access (huge-workbook RAM mitigation; sparse access
+                              # wins, full sweeps cost a bit more). Trade-off: malformed
+                              # <t> in the SST surfaces on first access, not at open.
+```
+
+**Output modes**:
+
+```bash
+--output ndjson               # default: invariant-envelope stream
+--output compact-ndjson       # sheet-prologue variant (drops sheet/sheet_idx on data
+                              # records); applies to rows / cells / comments /
+                              # validations / hyperlinks — a no-op on workbook-scoped
+                              # sub-commands
+--output pretty-json          # meta + list-sheets only: single collapsed JSON object
+                              # (rejected on the streaming sub-commands)
+```
+
+**Row format (rows sub-command only)** — legacy escape hatches:
+
+```bash
+--format jsonl                # default: envelope
+--format legacy-jsonl         # pre-iter55a bare arrays
+--format legacy-jsonl-dict    # pre-iter55a bare objects (old `--format jsonl-dict` is a
+                              # deprecated alias)
+--format tsv                  # tab-separated, \N for empty
+--format csv                  # RFC 4180-style quoting (LF record separators)
+```
+
+---
+
+## Example pipelines
+
+```bash
+# All string cells across every sheet.
+zlsx cells data.xlsx --all-sheets | jq 'select(.t=="str") | {sheet, ref, v}'
+
+# Sum a column from the CLI without loading everything.
+zlsx cells data.xlsx --range B2:B1000 | jq -r 'select(.t=="int" or .t=="num") | .v' | awk '{s+=$1} END {print s}'
+
+# Every comment across every sheet, as TSV.
+zlsx comments data.xlsx --all-sheets | jq -r '[.sheet, .ref, .author, .text] | @tsv'
+
+# Schema check: every list-type validation + its range.
+zlsx validations data.xlsx | jq 'select(.rule_type=="list") | {sheet, range, values}'
+
+# Grep SST for emails.
+zlsx sst data.xlsx | jq -r '.text' | rg '@\S+\.\S+'
+
+# Push a report to a UC Volume, then ask Genie about it.
+zlsx dbx push report.xlsx /Volumes/main/default/landing/report.xlsx
+zlsx dbx genie "what were total units last month?"
+```
+
+---
+
+## Pipeline safety
+
+On POSIX platforms, `zlsx cells huge.xlsx | head -10` exits 0 cleanly (no
+broken-pipe stderr noise), `SIGINT` → exit 130, and `SIGTERM` → exit 143 —
+both flushing in-flight records. The Windows build does not install these
+signal handlers.
+
+Malformed input handling is part-dependent — some parsers propagate
+`error.MalformedXml` and abort `Book.open` with exit 2, others are lenient and
+degrade to empty / partial metadata. In practice:
+
+- If `Book.open` fails, the CLI exits 2 with a stderr diagnostic and no stdout
+  stream.
+- If `Book.open` succeeds, the CLI emits as much as it can. Malformation
+  surfacing from `Rows.next()` during per-cell iteration is caught per-sheet
+  and emitted as an inline
+  `{"kind":"error","scope":"sheet","code":"MalformedXml",…}` record —
+  processing continues with neighbour sheets. Filter with
+  `jq 'select(.kind!="error")'` for the data-only stream.
+
+Scripts that need a precise part-by-part failure map should read the reader
+source (`src/xlsx.zig`) — the design-doc "Operational guarantees" section
+tracks the intent, but current behaviour is what `parseSharedStrings` /
+`parseStyles` / `parseTheme` / `parseMergedRangesForSheet` /
+`parseHyperlinksForSheet` / `parseDataValidationsForSheet` /
+`parseCommentsForSheet` actually do today.
+
+---
+
+## Exit codes
+
+The table below is the contract for the **read family**. The edit, embed,
+and dbx families reuse the same codes with per-command meanings — e.g.
+`dbx push` returns 3 when the upload preflight refuses a non-workbook, edit
+sub-commands return 3 on a refused structural edit, and the embed family
+returns 4 on a vector-buffer allocation failure. Scripts branching on exact
+codes for non-read sub-commands should test the specific command they use.
+
+| Code | Meaning (read family) |
+|---|---|
+| 0 | Success (inline `error` records may still have been emitted for recoverable sheet-level MalformedXml) |
+| 1 | Bad CLI arguments |
+| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time |
+| 3 | Sheet not found (by name / index). A `--sheet-glob` matching zero sheets is an empty *successful* stream (exit 0), not an error |
+| 4 | Reserved for reader decompression limits (`ZipBombSuspected`); today emitted only by the embed family on allocation failure |
+| 5 | OS error writing output (stdout write failure, disk full, mutation-save I/O) |
+| 130 | SIGINT (POSIX) |
+| 143 | SIGTERM (POSIX) |
+
+---
+
+## License
+
+zlsx is proprietary — see the repository [LICENSE](../LICENSE). The 60-day
+free evaluation covers the released binaries and wheels only; continued or
+non-evaluation use requires a commercial license
+(**laurent.fabre@gmail.com**).
