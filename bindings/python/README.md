@@ -35,6 +35,21 @@ with zlsx.open("workbook.xlsx") as book:
     header = next(summary.rows())
 ```
 
+### From bytes — no file, no temp path
+
+For workbook bytes that never touch a filesystem (SQL UDFs over binary
+columns, object-store reads, network payloads), `open_bytes` parses the
+buffer directly. The bytes are borrowed **only for the duration of the
+call** — discard them right after:
+
+```python
+with zlsx.open_bytes(content) as book:      # bytes, bytearray, or memoryview
+    for row in book.sheet(0).rows():
+        ...
+```
+
+Requires libzlsx 0.6.0+ (`zlsx_book_open_buffer` in the C ABI).
+
 ## Write
 
 The writer produces fresh workbooks (load-modify-save round-trip lands in Phase 3c). Cell styles registered via `Writer.add_style` get a 1-based index; pass those indices alongside values in `write_row(styles=[…])`.

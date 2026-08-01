@@ -114,6 +114,14 @@ lib.zlsx_book_open.argtypes = [
 ]
 lib.zlsx_book_open.restype = book_handle
 
+lib.zlsx_book_open_buffer.argtypes = [
+    ctypes.c_char_p,  # data (raw bytes; length passed separately, no NUL needed)
+    ctypes.c_size_t,  # len
+    ctypes.c_char_p,  # err_buf
+    ctypes.c_size_t,  # err_buf_len
+]
+lib.zlsx_book_open_buffer.restype = book_handle
+
 lib.zlsx_book_close.argtypes = [book_handle]
 lib.zlsx_book_close.restype = None
 

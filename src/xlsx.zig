@@ -473,12 +473,21 @@ const ZipArchive = struct {
     /// owns its handle for the Book's lifetime, so it carries the `Io`
     /// it was opened with rather than making every method take one.
     io: std.Io,
-    file: std.Io.File,
+    source: Source,
     reader_buf: [4096]u8 = undefined,
     reader: std.Io.File.Reader,
     sheet_offsets: std.StringHashMapUnmanaged(Entry) = .{},
     comments_offsets: std.StringHashMapUnmanaged(Entry) = .{},
     vml_offsets: std.StringHashMapUnmanaged(Entry) = .{},
+
+    /// What backs `reader`. `.file` owns its handle (`deinit` closes it);
+    /// `.memory` borrows the caller's bytes — the borrow lasts until the
+    /// archive is deinited, which for the eager `Book.openBuffer` facade
+    /// means only for the duration of the open call.
+    const Source = union(enum) {
+        file: std.Io.File,
+        memory: []const u8,
+    };
 
     const Entry = struct {
         file_offset: u64,
@@ -496,17 +505,17 @@ const ZipArchive = struct {
 
         self.* = .{
             .io = io,
-            .file = try std.Io.Dir.cwd().openFile(io, archive_path, .{}),
+            .source = .{ .file = try std.Io.Dir.cwd().openFile(io, archive_path, .{}) },
             .reader = undefined,
             .sheet_offsets = .{},
             .comments_offsets = .{},
             .vml_offsets = .{},
         };
-        errdefer self.file.close(io);
+        errdefer self.source.file.close(io);
 
         // reader embeds a pointer into self.reader_buf — must run after
         // the struct lives at its final heap address.
-        self.reader = self.file.reader(io, &self.reader_buf);
+        self.reader = self.source.file.reader(io, &self.reader_buf);
 
         errdefer self.sheet_offsets.deinit(allocator);
         errdefer self.comments_offsets.deinit(allocator);
@@ -515,11 +524,71 @@ const ZipArchive = struct {
         return self;
     }
 
+    /// Open an archive over bytes already in memory. No file handle, no
+    /// syscalls: a `std.Io.File.Reader` is fabricated whose vtable serves
+    /// reads from `data` and whose `.positional` mode makes every
+    /// `seekTo`/`seekBy` pure pointer arithmetic, so the whole existing
+    /// zip walk (std.zip.Iterator, extractEntryToBuffer) works unchanged.
+    ///
+    /// `data` is borrowed until `deinit`. The `.file` field of the reader
+    /// is `undefined` and provably never dereferenced: positional seeks
+    /// never touch it, `getSize` is short-circuited by pre-setting
+    /// `.size`, and every read dispatches through `memStream` below.
+    fn openFromMemory(allocator: Allocator, io: std.Io, data: []const u8) !*ZipArchive {
+        const self = try allocator.create(ZipArchive);
+        errdefer allocator.destroy(self);
+
+        self.* = .{
+            .io = io,
+            .source = .{ .memory = data },
+            .reader = undefined,
+            .sheet_offsets = .{},
+            .comments_offsets = .{},
+            .vml_offsets = .{},
+        };
+
+        // Same placement rule as `open`: the interface embeds a pointer
+        // into self.reader_buf, so build it after `self` is at its final
+        // heap address.
+        self.reader = .{
+            .io = io,
+            .file = undefined, // never touched — see doc comment
+            .mode = .positional,
+            .size = data.len,
+            .interface = .{
+                .vtable = &.{ .stream = memStream },
+                .buffer = &self.reader_buf,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+
+        return self;
+    }
+
+    /// `Io.Reader` vtable hook for the `.memory` source: serve bytes from
+    /// the borrowed slice at the File.Reader's tracked position. Mirrors
+    /// the contract of `std.Io.File.Reader.stream` — returns short reads
+    /// freely, `error.EndOfStream` only when `pos` is at/past the end.
+    fn memStream(io_reader: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const fr: *std.Io.File.Reader = @alignCast(@fieldParentPtr("interface", io_reader));
+        const self: *ZipArchive = @alignCast(@fieldParentPtr("reader", fr));
+        const data = self.source.memory;
+        if (fr.pos >= data.len) return error.EndOfStream;
+        const chunk = limit.sliceConst(data[@intCast(fr.pos)..]);
+        const n = try w.write(chunk);
+        fr.pos += n;
+        return n;
+    }
+
     fn deinit(self: *ZipArchive, allocator: Allocator) void {
         self.sheet_offsets.deinit(allocator);
         self.comments_offsets.deinit(allocator);
         self.vml_offsets.deinit(allocator);
-        self.file.close(self.io);
+        switch (self.source) {
+            .file => |f| f.close(self.io),
+            .memory => {},
+        }
         allocator.destroy(self);
     }
 
@@ -723,6 +792,25 @@ pub const Book = struct {
         return book;
     }
 
+    /// Open and parse a workbook from bytes already in memory — the
+    /// buffer-based variant of `open` (B-cabi-1). Same eager semantics:
+    /// every part is decoded into Book-owned storage and the archive is
+    /// released before returning, so **`bytes` is borrowed only for the
+    /// duration of this call** — the caller may free or reuse it
+    /// immediately after `openBuffer` returns.
+    ///
+    /// This is the entry point for callers that receive workbook bytes
+    /// without a filesystem path (SQL UDFs over `binaryFile` content,
+    /// network payloads, archives-within-archives). No temp file, no
+    /// syscalls beyond allocation.
+    pub fn openBuffer(allocator: Allocator, io: std.Io, bytes: []const u8) !Book {
+        var book = try Book.openLazyWithSst(allocator, io, .{ .buffer = bytes }, .eager);
+        errdefer book.deinit();
+        try book.loadEagerParts();
+        book.closeArchive();
+        return book;
+    }
+
     /// Close the backing archive early. Slice A's `open` facade calls
     /// this after eager loading so the source file doesn't stay locked
     /// for the Book's lifetime. Slice B's streaming path keeps the
@@ -775,7 +863,7 @@ pub const Book = struct {
     /// state on first-touch. Multi-threaded SST access requires the
     /// caller to serialise externally or to call `Book.open` instead.
     pub fn openSstLazy(allocator: Allocator, io: std.Io, path: []const u8) !Book {
-        var book = try Book.openLazyWithSst(allocator, io, path, .lazy);
+        var book = try Book.openLazyWithSst(allocator, io, .{ .path = path }, .lazy);
         errdefer book.deinit();
         try book.loadEagerParts();
         book.closeArchive();
@@ -783,10 +871,19 @@ pub const Book = struct {
     }
 
     pub fn openLazy(allocator: Allocator, io: std.Io, path: []const u8) !Book {
-        return Book.openLazyWithSst(allocator, io, path, .eager);
+        return Book.openLazyWithSst(allocator, io, .{ .path = path }, .eager);
     }
 
-    fn openLazyWithSst(allocator: Allocator, io: std.Io, path: []const u8, sst_strategy: SstStrategy) !Book {
+    /// Where `openLazyWithSst` gets its archive bytes. `.buffer` keeps
+    /// the borrow contract documented on `openBuffer`: the slice must
+    /// stay valid until the archive is deinited (for the eager facades,
+    /// the end of the open call).
+    const OpenSource = union(enum) {
+        path: []const u8,
+        buffer: []const u8,
+    };
+
+    fn openLazyWithSst(allocator: Allocator, io: std.Io, source: OpenSource, sst_strategy: SstStrategy) !Book {
         var book: Book = .{
             .allocator = allocator,
             .io = io,
@@ -794,7 +891,10 @@ pub const Book = struct {
         };
         errdefer book.deinit();
 
-        book.archive = try ZipArchive.open(allocator, io, path);
+        book.archive = switch (source) {
+            .path => |p| try ZipArchive.open(allocator, io, p),
+            .buffer => |b| try ZipArchive.openFromMemory(allocator, io, b),
+        };
 
         var iter = std.zip.Iterator.init(&book.archive.?.reader) catch return error.BadZip;
 
@@ -4610,6 +4710,130 @@ test "Book.mergedRanges: round-trip through writer + reader" {
     try std.testing.expectEqualDeep(CellRef{ .col = 3, .row = 7 }, ranges[1].bottom_right);
     try std.testing.expectEqualDeep(CellRef{ .col = 16383, .row = 1048575 }, ranges[2].top_left);
     try std.testing.expectEqualDeep(CellRef{ .col = 16383, .row = 1048576 }, ranges[2].bottom_right);
+}
+
+test "Book.openBuffer: parity with Book.open + bytes freed immediately after return" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, io, "open_buffer_parity.xlsx");
+    defer std.testing.allocator.free(tmp_path);
+
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Data");
+        try sheet.writeRow(&.{ .{ .string = "name" }, .{ .string = "n" } });
+        try sheet.writeRow(&.{ .{ .string = "alpha" }, .{ .integer = 42 } });
+        try sheet.writeRow(&.{ .{ .string = "beta" }, .{ .number = 2.5 } });
+        var sheet2 = try w.addSheet("Second");
+        try sheet2.writeRow(&.{.{ .boolean = true }});
+        try w.save(io, tmp_path);
+    }
+
+    // The borrow contract is the point of this test: openBuffer's doc
+    // says bytes are needed only for the duration of the call, so free
+    // them BEFORE touching the Book. Under std.testing.allocator a
+    // retained slice turns into a use-after-free the allocator flags.
+    var book_mem: Book = undefined;
+    {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, tmp_path, std.testing.allocator, .limited(1 << 20));
+        book_mem = try Book.openBuffer(std.testing.allocator, io, bytes);
+        std.testing.allocator.free(bytes);
+    }
+    defer book_mem.deinit();
+
+    var book_file = try Book.open(std.testing.allocator, io, tmp_path);
+    defer book_file.deinit();
+
+    try std.testing.expectEqual(book_file.sheets.len, book_mem.sheets.len);
+    for (book_file.sheets, book_mem.sheets) |sf, sm| {
+        try std.testing.expectEqualStrings(sf.name, sm.name);
+    }
+
+    var rows_mem = try book_mem.rows(book_mem.sheets[0], std.testing.allocator);
+    defer rows_mem.deinit();
+    _ = try rows_mem.next(); // header
+    const r1 = (try rows_mem.next()).?;
+    try std.testing.expectEqualStrings("alpha", r1[0].string);
+    try std.testing.expectEqual(@as(i64, 42), r1[1].integer);
+    const r2 = (try rows_mem.next()).?;
+    try std.testing.expectEqualStrings("beta", r2[0].string);
+    try std.testing.expectEqual(@as(f64, 2.5), r2[1].number);
+    try std.testing.expectEqual(@as(?[]Cell, null), try rows_mem.next());
+}
+
+test "Book.openBuffer: garbage, empty, and truncated buffers error without panicking" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try std.testing.expectError(error.BadZip, Book.openBuffer(std.testing.allocator, io, "this is not a zip archive"));
+    try std.testing.expectError(error.BadZip, Book.openBuffer(std.testing.allocator, io, &.{}));
+
+    // A valid workbook cut in half must error too — the EOCD record
+    // lives at the end, so truncation decapitates the central directory.
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, io, "open_buffer_truncated.xlsx");
+    defer std.testing.allocator.free(tmp_path);
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("S");
+        try sheet.writeRow(&.{.{ .string = "x" }});
+        try w.save(io, tmp_path);
+    }
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, tmp_path, std.testing.allocator, .limited(1 << 20));
+    defer std.testing.allocator.free(bytes);
+    const truncated = Book.openBuffer(std.testing.allocator, io, bytes[0 .. bytes.len / 2]);
+    try std.testing.expectError(error.BadZip, truncated);
+}
+
+test "fuzz Book.openBuffer: mutated workbook bytes never panic or leak" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, io, "open_buffer_fuzz.xlsx");
+    defer std.testing.allocator.free(tmp_path);
+    {
+        const writer = @import("writer.zig");
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Fz");
+        try sheet.writeRow(&.{ .{ .string = "a" }, .{ .integer = 1 } });
+        try sheet.writeRow(&.{ .{ .string = "b" }, .{ .number = 3.14 } });
+        try w.save(io, tmp_path);
+    }
+    const pristine = try std.Io.Dir.cwd().readFileAlloc(io, tmp_path, std.testing.allocator, .limited(1 << 20));
+    defer std.testing.allocator.free(pristine);
+
+    const mutated = try std.testing.allocator.dupe(u8, pristine);
+    defer std.testing.allocator.free(mutated);
+
+    const iters = fuzz_default_iters;
+    var prng = std.Random.DefaultPrng.init(0xB0FFE12);
+    const rng = prng.random();
+
+    for (0..iters) |_| {
+        @memcpy(mutated, pristine);
+        const flips = rng.intRangeAtMost(usize, 1, 8);
+        for (0..flips) |_| {
+            mutated[rng.uintLessThan(usize, mutated.len)] = rng.int(u8);
+        }
+        // Any outcome is acceptable except a panic or a leak: either the
+        // mutation is survivable and a Book comes back, or a typed error.
+        if (Book.openBuffer(std.testing.allocator, io, mutated)) |*book| {
+            var b = book.*;
+            b.deinit();
+        } else |_| {}
+    }
 }
 
 test "Book.hyperlinks: round-trip through writer + reader" {

@@ -88,6 +88,20 @@ zlsx_book_t * zlsx_book_open(const char * path,
                              uint8_t     * err_buf,
                              size_t        err_buf_len);
 
+/*
+ * Open an xlsx workbook from bytes already in memory. Same semantics as
+ * zlsx_book_open, but no filesystem access: the buffer is parsed eagerly
+ * and borrowed only for the duration of this call — the caller may free
+ * `data` immediately after zlsx_book_open_buffer returns.
+ *
+ * For callers that receive workbook bytes without a path: SQL UDFs over
+ * binary columns, network payloads, archives-within-archives.
+ */
+zlsx_book_t * zlsx_book_open_buffer(const uint8_t * data,
+                                    size_t          len,
+                                    uint8_t       * err_buf,
+                                    size_t          err_buf_len);
+
 /* Drop the caller's reference to a Book. NULL-safe (no-op). Active
  * row iterators hold their own references, so calling this while rows
  * are live is safe — the state is freed on the last reference. */

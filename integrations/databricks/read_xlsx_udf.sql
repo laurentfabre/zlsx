@@ -8,30 +8,38 @@
 --
 -- Placeholders to adapt: catalog.schema (here workspace.default) and the
 -- Volume paths. Sandbox facts, verified: the native-lib wheel loads
--- (ctypes/dlopen allowed), tempfile writes are allowed. The tempfile shim
--- exists because py-zlsx opens paths, not bytes — an open_bytes() API is
--- queued to remove it.
+-- (ctypes/dlopen allowed), tempfile writes are allowed.
+--
+-- py-zlsx >= 0.6.0 has zlsx.open_bytes() (the buffer-based C ABI), so the
+-- workbook bytes are parsed directly — no temp file. The hasattr fallback
+-- keeps the function working on a 0.5.0 wheel, where a tempfile shim is
+-- the only option.
 
 CREATE OR REPLACE FUNCTION workspace.default.read_xlsx_json(content BINARY, sheet STRING)
 RETURNS STRING
 LANGUAGE PYTHON
 ENVIRONMENT (
-  dependencies = '["/Volumes/workspace/default/zlsx_smoke/py_zlsx-0.5.0-py3-none-manylinux_2_28_aarch64.whl"]',
+  dependencies = '["/Volumes/workspace/default/zlsx_smoke/py_zlsx-0.6.0-py3-none-manylinux_2_28_aarch64.whl"]',
   environment_version = '3'
 )
 AS $$
-import tempfile, os, json
+import json
 import zlsx
 
-with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
-    f.write(bytes(content))
-    path = f.name
-try:
-    with zlsx.open(path) as book:
-        sel = int(sheet) if sheet.isdigit() else sheet
+sel = int(sheet) if sheet.isdigit() else sheet
+if hasattr(zlsx, "open_bytes"):
+    with zlsx.open_bytes(bytes(content)) as book:
         rows = list(book.sheet(sel).rows())
-finally:
-    os.unlink(path)
+else:  # py-zlsx 0.5.0: no buffer API — fall back to a tempfile shim
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+        f.write(bytes(content))
+        path = f.name
+    try:
+        with zlsx.open(path) as book:
+            rows = list(book.sheet(sel).rows())
+    finally:
+        os.unlink(path)
 header = [str(h) for h in rows[0]]
 return json.dumps([dict(zip(header, r)) for r in rows[1:]])
 $$;

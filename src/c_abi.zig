@@ -263,6 +263,37 @@ export fn zlsx_book_open(
     return @ptrCast(state);
 }
 
+/// Open an xlsx workbook from bytes already in memory (B-cabi-1).
+/// Same semantics as `zlsx_book_open`, but no filesystem access: the
+/// buffer is parsed eagerly and **borrowed only for the duration of
+/// this call** — the caller may free `data` immediately after return.
+/// Returns NULL on failure with a diagnostic in `err_buf` (if non-null).
+export fn zlsx_book_open_buffer(
+    data: ?[*]const u8,
+    len: usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) ?*Book {
+    const bytes: []const u8 = if (data) |d| d[0..len] else {
+        writeError(err_buf, err_buf_len, "NullBuffer");
+        return null;
+    };
+
+    const state = gpa.create(BookState) catch {
+        writeError(err_buf, err_buf_len, "OutOfMemory");
+        return null;
+    };
+    state.* = .{ .inner = undefined, .threaded = .init(gpa, .{}) };
+
+    state.inner = xlsx.Book.openBuffer(gpa, state.threaded.io(), bytes) catch |e| {
+        state.threaded.deinit();
+        gpa.destroy(state);
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return null;
+    };
+    return @ptrCast(state);
+}
+
 /// Drop the caller's reference to a Book. Safe to call with NULL (no-op).
 /// Active row iterators hold their own references, so this will not
 /// prematurely free the underlying state while rows are still being read.
@@ -1378,6 +1409,61 @@ test "abi full lifecycle on smallest corpus file" {
         row_count += 1;
     }
     try std.testing.expect(row_count >= 1);
+}
+
+test "zlsx_book_open_buffer: lifecycle on corpus bytes + buffer freed before use" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return, // corpus not fetched — same skip rule as the path test
+        else => return err,
+    };
+
+    var err_buf: [128]u8 = undefined;
+
+    // Free the source bytes before touching the Book: the ABI contract
+    // says the buffer is borrowed only for the duration of the call.
+    var book: ?*Book = null;
+    {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, std.testing.allocator, .limited(1 << 24));
+        book = zlsx_book_open_buffer(bytes.ptr, bytes.len, &err_buf, err_buf.len);
+        std.testing.allocator.free(bytes);
+    }
+    try std.testing.expect(book != null);
+    defer zlsx_book_close(book);
+
+    try std.testing.expect(zlsx_sheet_count(book.?) >= 1);
+
+    const rows = zlsx_rows_open(book.?, 0, &err_buf, err_buf.len);
+    try std.testing.expect(rows != null);
+    defer zlsx_rows_close(rows);
+
+    var cells_ptr: [*]const CCell = undefined;
+    var cells_len: usize = 0;
+    var row_count: usize = 0;
+    while (true) {
+        const rc = zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len);
+        if (rc == 0) break;
+        try std.testing.expectEqual(@as(i32, 1), rc);
+        row_count += 1;
+    }
+    try std.testing.expect(row_count >= 1);
+}
+
+test "zlsx_book_open_buffer: garbage and NULL report errors, never crash" {
+    var err_buf: [128]u8 = undefined;
+
+    const garbage = "definitely not a zip";
+    try std.testing.expectEqual(@as(?*Book, null), zlsx_book_open_buffer(garbage.ptr, garbage.len, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("BadZip", std.mem.sliceTo(&err_buf, 0));
+
+    try std.testing.expectEqual(@as(?*Book, null), zlsx_book_open_buffer(null, 0, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("NullBuffer", std.mem.sliceTo(&err_buf, 0));
+
+    // err_buf is optional — passing NULL must be safe on every path.
+    try std.testing.expectEqual(@as(?*Book, null), zlsx_book_open_buffer(garbage.ptr, garbage.len, null, 0));
 }
 
 test "refcount: close book before rows is safe" {
