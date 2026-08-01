@@ -4,7 +4,7 @@
 > Detail lives in `docs/plans/`; narrated context + collaboration rules live in the
 > knowledge base at `docs/kb/` (open `docs/kb/kb.html`, gitignored).
 
-_Last updated: 2026-07-30_
+_Last updated: 2026-08-01_
 
 ---
 
@@ -156,6 +156,10 @@ Remaining: IANA MIME registration (deferred to v1.0).
   (#140 — needs the formula rewriter + sheet-name context).
 - **v0.5.0 released 2026-07-30** — first release carrying the Zig 0.16 migration and
   the whole embedding arc (#123–#140). Exercises #138's release automation end-to-end.
+- **v0.6.0 released 2026-08-01** — `open_bytes()` at all three layers (#144:
+  `Book.openBuffer` / `zlsx_book_open_buffer` / `zlsx.open_bytes`; memory-backed
+  `File.Reader`, the borrow ends when the call returns). 5 binaries + 5 official
+  wheels + SHA256SUMS; Homebrew tap at 0.6.0.
 
 ## 🅿️ Parked / out-of-band
 
@@ -164,11 +168,34 @@ Remaining: IANA MIME registration (deferred to v1.0).
   forward-port in #123. `stash@{0}` is discharged and safe to drop.
 - **zlsx-cloud SaaS** — separate design arc (`docs/plans/saas-*`, gitignored).
 
-## 🧭 Next pro track — Databricks interface (ideation, 2026-07-30)
+## 🧭 Pro track — Databricks interface (ACTIVE; proofs 2026-07-30 → 08-01)
 
 First pro feature: interface zlsx with Databricks, whose native Excel support is
 weak (JVM/POI-based `spark-excel` or driver-side pandas+openpyxl). Ideation lives
-in the private KB (`docs/kb/`, gitignored) alongside the SaaS arc.
+in the private KB (`docs/kb/`, gitignored) alongside the SaaS arc; the verified
+experiments are in-tree at `integrations/databricks/` (#143).
+
+Proven end-to-end on a live workspace, using released artifacts only:
+
+- **Both directions** — xlsx → Volume → Delta → SQL aggregates, and a warehouse
+  table → styled report xlsx (2026-07-30).
+- **PySpark Data Source** — `spark.read.format("zlsx")` on serverless compute
+  over a Volume workbook, no Delta copy (a ~60-line `ZlsxDataSource` + the
+  released aarch64 wheel).
+- **`read_xlsx()` UC Python UDF in pure DBSQL** — the wheel loads inside the UDF
+  sandbox; the `wb_sales_live` view parses the workbook *file* at query time.
+  Liveness proven: edit the file, the next query reflects it — zero
+  re-ingestion. Runs shim-free on 0.6.0's `open_bytes()`, this track's first
+  code ask (#144).
+- **Genie on a live workbook** (2026-08-01) — the Genie space now carries
+  `wb_sales_live` in its data sources; asked what the live workbook says right
+  now, Genie generated SQL against the view and answered correctly. A
+  natural-language room over an Excel file, no landing step.
+
+Next, in value order: harden the Data Source (per-file×sheet partitions,
+row-range splits, type widening, the writer half → `py-zlsx[spark]`), then a
+`zlsx dbx` CLI family (push / pull / genie) over std.http. The parked relicense
+PR #102 is load-bearing here — the PolyForm NC boundary is the pro tier.
 
 ## 🔭 Candidate follow-ups (value/effort order)
 
