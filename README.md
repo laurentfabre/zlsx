@@ -102,6 +102,7 @@ try ed.save("out.xlsx");
 - **[docs/vs_calamine.md](docs/vs_calamine.md)** — feature gap vs `calamine` (Rust). Pick the right tool consciously.
 - **[docs/xlsx_test_corpus.md](docs/xlsx_test_corpus.md)** — public xlsx test corpus.
 - **[bindings/python/README.md](bindings/python/README.md)** — `py-zlsx` Python package: install, examples, scope, lifetime gotchas.
+- **[integrations/databricks/](integrations/databricks/README.md)** — verified Databricks experiments: `spark.read.format("zlsx")` on serverless, a DBSQL UDF + live view over a workbook, and a Genie space over zlsx-landed tables.
 - **[include/zlsx.h](include/zlsx.h)** — C ABI header. Embeddable from any FFI-capable language.
 - **[docs/plans/](docs/plans/)** — design plans for queued architectural work:
   - **[streaming-sst.md](docs/plans/streaming-sst.md)** — lazy SST resolution for million-entry workbooks (Q5 mitigation).
