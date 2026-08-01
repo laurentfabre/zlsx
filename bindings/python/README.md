@@ -155,6 +155,29 @@ single-partition DataFrame (`coalesce(1)`); any other path becomes a directory
 of `part-*.xlsx`. `date`/`timestamp` columns round-trip as styled Excel
 serials. Write options: `sheet` (default `"Sheet1"`), `header`.
 
+### Streaming — Auto Loader for Excel
+
+```python
+stream = (spark.readStream.format("zlsx")
+          .schema("region string, units bigint, revenue double")
+          .option("startingPosition", "earliest")   # or "latest"
+          .load("/Volumes/cat/schema/vol/landing/"))
+```
+
+Each workbook is ingested **exactly once** as it lands in the zone. The
+checkpoint offset is a fingerprint map (`path → (mtime_ns, size)`), so a
+restarted stream resumes from the offset alone. Semantics to know:
+
+- Land files **atomically** (write elsewhere, then move in) — a half-written
+  workbook fails the batch by name rather than ingesting garbage.
+- Files are treated as **immutable**: a changed fingerprint re-ingests the
+  whole workbook (the Auto Loader convention). Deletions are ignored.
+- The offset grows with the file count — sized for a landing zone of
+  thousands of workbooks, not millions.
+- All batch read options apply (`sheet`, `header`, `mode`,
+  `rowsPerPartition`); `startingPosition=latest` skips files already present
+  when the stream first starts.
+
 ## Migration from openpyxl
 
 ### Reads

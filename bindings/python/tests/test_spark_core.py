@@ -199,6 +199,42 @@ def test_resolve_sheets_errors():
         tab.resolve_sheets("3", names)
 
 
+def test_snapshot_files_empty_zone_and_fingerprints(tmp_path):
+    zone = tmp_path / "zone"
+    zone.mkdir()
+    assert tab.snapshot_files(str(zone)) == {}
+    assert tab.snapshot_files(str(zone / "*.xlsx")) == {}
+
+    a = tmp_path / "zone" / "a.xlsx"
+    a.write_bytes(b"AAAA")
+    _touch(zone / "~$a.xlsx")  # lock file ignored
+    snap = tab.snapshot_files(str(zone))
+    assert list(snap) == [str(a)]
+    mtime_ns, size = snap[str(a)]
+    assert size == 4 and mtime_ns > 0
+
+
+def test_snapshot_files_missing_literal_still_raises(tmp_path):
+    with pytest.raises(FileNotFoundError, match="no such workbook"):
+        tab.snapshot_files(str(tmp_path / "ghost.xlsx"))
+
+
+def test_diff_snapshots_new_changed_deleted():
+    old = {"/z/a.xlsx": [1, 10], "/z/gone.xlsx": [1, 5]}
+    new = {
+        "/z/a.xlsx": [1, 10],   # unchanged
+        "/z/b.xlsx": [2, 20],   # new
+        "/z/c.xlsx": [3, 30],   # new
+    }
+    assert tab.diff_snapshots(old, new) == ["/z/b.xlsx", "/z/c.xlsx"]
+    assert tab.diff_snapshots(old, old) == []
+    # changed mtime OR size re-ingests
+    assert tab.diff_snapshots({"/z/a.xlsx": [1, 10]}, {"/z/a.xlsx": [9, 10]}) == ["/z/a.xlsx"]
+    assert tab.diff_snapshots({"/z/a.xlsx": [1, 10]}, {"/z/a.xlsx": [1, 99]}) == ["/z/a.xlsx"]
+    # from-empty ingests everything, sorted
+    assert tab.diff_snapshots({}, new) == ["/z/a.xlsx", "/z/b.xlsx", "/z/c.xlsx"]
+
+
 def test_plan_row_ranges():
     assert tab.plan_row_ranges(10, 0) == [(0, 10)]
     assert tab.plan_row_ranges(10, 100) == [(0, 10)]

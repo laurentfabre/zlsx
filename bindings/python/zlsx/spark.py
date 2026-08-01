@@ -19,6 +19,14 @@ the pyspark half is already there — the plain wheel suffices.
        .option("sheet", "Report")
        .save("/Volumes/cat/schema/vol/report.xlsx"))
 
+    # Streaming: Auto Loader for Excel — ingest each workbook exactly
+    # once as it lands in the zone. Land files atomically; a rewritten
+    # file re-ingests wholesale (immutable-files convention).
+    stream = (spark.readStream.format("zlsx")
+              .schema("region string, units bigint, revenue double")
+              .option("startingPosition", "earliest")   # or "latest"
+              .load("/Volumes/cat/schema/vol/landing/"))
+
 Read options: ``sheet`` (default ``"0"``), ``header`` (default true),
 ``inferRows`` sample size (default 1000), ``rowsPerPartition`` (default
 0 = one partition per file x sheet), ``mode`` (``permissive`` nulls
@@ -42,6 +50,7 @@ from typing import Optional
 from pyspark.sql.datasource import (
     DataSource,
     DataSourceReader,
+    DataSourceStreamReader,
     DataSourceWriter,
     InputPartition,
     WriterCommitMessage,
@@ -135,14 +144,23 @@ class ZlsxDataSource(DataSource):
     def reader(self, schema):
         return ZlsxBatchReader(self.options, schema)
 
+    def streamReader(self, schema):
+        return ZlsxStreamReader(self.options, schema)
+
     def writer(self, schema, overwrite):
         return ZlsxBatchWriter(self.options, schema, overwrite)
 
 
-class ZlsxBatchReader(DataSourceReader):
-    def __init__(self, options, schema):
-        import zlsx
+class _ZlsxReaderBase:
+    """Option parsing, per-file partition planning, and row reading
+    shared by the batch and stream readers. Plain class (not a PySpark
+    interface) so each concrete reader mixes it with the right base —
+    the flat-inheritance shape the DataSource pickling contract wants.
+    """
 
+    def __init__(self, options, schema):
+        self._path_option = options["path"]
+        self._sheet_option = options.get("sheet", "0")
         self._kinds = _kinds_from_schema(schema, what="read")
         self._header = _truthy(options, "header", True)
         self._mode = options.get("mode", "permissive").strip().lower()
@@ -150,34 +168,36 @@ class ZlsxBatchReader(DataSourceReader):
             raise ValueError(
                 f"mode must be 'permissive' or 'failfast', got {self._mode!r}"
             )
-        rows_per_part = int(options.get("rowsPerPartition", "0"))
+        self._rows_per_part = int(options.get("rowsPerPartition", "0"))
 
-        # Driver-side planning: one partition per (file x sheet); with
-        # rowsPerPartition also split each sheet into row ranges, which
-        # costs one counting pass per sheet here (zlsx parses at C
-        # speed — the win on executors dwarfs it).
-        self._partitions: list[ZlsxPartition] = []
-        for path in _tabular.expand_paths(options["path"]):
-            with zlsx.open(path) as book:
-                for si in _tabular.resolve_sheets(
-                    options.get("sheet", "0"), book.sheets
+    def _plan_file(self, path):
+        """Partitions for one workbook: per selected sheet, optionally
+        split into row ranges (one counting pass here on the driver —
+        zlsx parses at C speed, the executor win dwarfs it)."""
+        import zlsx
+
+        out = []
+        try:
+            book = zlsx.open(path)
+        except Exception as e:
+            raise RuntimeError(
+                f"{path}: not a readable workbook ({e}); land files "
+                "atomically (write elsewhere, then move into the zone)"
+            ) from e
+        with book:
+            for si in _tabular.resolve_sheets(self._sheet_option, book.sheets):
+                name = book.sheets[si]
+                if self._rows_per_part <= 0:
+                    out.append(ZlsxPartition(path, si, name))
+                    continue
+                with book.sheet(si).rows() as rows:
+                    n = sum(1 for _ in rows)
+                n_data = max(0, n - 1) if self._header else n
+                for start, end in _tabular.plan_row_ranges(
+                    n_data, self._rows_per_part
                 ):
-                    name = book.sheets[si]
-                    if rows_per_part <= 0:
-                        self._partitions.append(ZlsxPartition(path, si, name))
-                        continue
-                    with book.sheet(si).rows() as rows:
-                        n = sum(1 for _ in rows)
-                    n_data = max(0, n - 1) if self._header else n
-                    for start, end in _tabular.plan_row_ranges(
-                        n_data, rows_per_part
-                    ):
-                        self._partitions.append(
-                            ZlsxPartition(path, si, name, start, end)
-                        )
-
-    def partitions(self):
-        return self._partitions
+                    out.append(ZlsxPartition(path, si, name, start, end))
+        return out
 
     def read(self, partition):
         import zlsx  # executor-side import
@@ -206,6 +226,62 @@ class ZlsxBatchReader(DataSourceReader):
                         yield tuple(
                             _tabular.coerce_row(row, kinds, mode, ctx, base + i)
                         )
+
+
+class ZlsxBatchReader(_ZlsxReaderBase, DataSourceReader):
+    def __init__(self, options, schema):
+        super().__init__(options, schema)
+        self._partitions: list[ZlsxPartition] = []
+        for path in _tabular.expand_paths(self._path_option):
+            self._partitions.extend(self._plan_file(path))
+
+    def partitions(self):
+        return self._partitions
+
+
+class ZlsxStreamReader(_ZlsxReaderBase, DataSourceStreamReader):
+    """File-arrival streaming — Auto Loader for Excel.
+
+    The offset is the fingerprint map of every file the stream has
+    admitted: ``{"files": {path: [mtime_ns, size]}}``. A microbatch is
+    the fingerprint diff between two offsets, so a restart needs only
+    the checkpointed offset to know exactly where it stood. Files are
+    expected to be IMMUTABLE once landed (move them in atomically); a
+    changed fingerprint re-ingests the whole workbook. Deletions are
+    ignored. The offset grows with the file count — fine for a landing
+    zone of thousands of workbooks, not for millions.
+
+    ``startingPosition=latest`` skips files already present when the
+    stream starts (default ``earliest`` ingests them in batch one).
+    """
+
+    def __init__(self, options, schema):
+        super().__init__(options, schema)
+        starting = options.get("startingPosition", "earliest").strip().lower()
+        if starting not in ("earliest", "latest"):
+            raise ValueError(
+                f"startingPosition must be 'earliest' or 'latest', got {starting!r}"
+            )
+        self._initial = {
+            "files": _tabular.snapshot_files(self._path_option)
+            if starting == "latest"
+            else {}
+        }
+
+    def initialOffset(self):
+        return self._initial
+
+    def latestOffset(self):
+        return {"files": _tabular.snapshot_files(self._path_option)}
+
+    def partitions(self, start, end):
+        parts = []
+        for path in _tabular.diff_snapshots(start["files"], end["files"]):
+            parts.extend(self._plan_file(path))
+        return parts
+
+    def commit(self, end):
+        pass  # Spark's checkpoint owns the offset; nothing to release
 
 
 @dataclass

@@ -251,6 +251,51 @@ def resolve_sheets(sheet_option: str, sheet_names) -> list[int]:
     return out
 
 
+def snapshot_files(path_option: str) -> dict:
+    """Fingerprint every workbook the path option currently matches:
+    ``{path: [mtime_ns, size]}``.
+
+    Streaming variant of :func:`expand_paths`: an empty directory or an
+    unmatched glob is a NORMAL state for a landing zone (nothing has
+    arrived yet), so both yield ``{}`` instead of raising. A literal
+    file path that does not exist still raises — naming one concrete
+    file that is absent is a configuration error, not an empty zone.
+    """
+    files: dict = {}
+    for entry in (e.strip() for e in path_option.split(",")):
+        if not entry:
+            continue
+        if os.path.isdir(entry):
+            hits = [
+                os.path.join(entry, f)
+                for f in os.listdir(entry)
+                if f.endswith((".xlsx", ".xlsm")) and not f.startswith("~$")
+            ]
+        elif _glob.has_magic(entry):
+            hits = _glob.glob(entry)
+        else:
+            if not os.path.isfile(entry):
+                raise FileNotFoundError(f"no such workbook: {entry}")
+            hits = [entry]
+        for path in hits:
+            try:
+                st = os.stat(path)
+            except FileNotFoundError:
+                continue  # raced with a delete between list and stat
+            files[path] = [st.st_mtime_ns, st.st_size]
+    return files
+
+
+def diff_snapshots(old: dict, new: dict) -> list:
+    """Paths that are new or changed in ``new`` relative to ``old``,
+    sorted for deterministic partition planning. Deletions are ignored:
+    a removed workbook has nothing left to ingest. A changed
+    fingerprint re-ingests the WHOLE file — the immutable-files
+    convention (same as Auto Loader); dedupe downstream if producers
+    rewrite in place."""
+    return sorted(p for p, fp in new.items() if old.get(p) != fp)
+
+
 def plan_row_ranges(n_data_rows: int, rows_per_partition: int):
     """Split ``n_data_rows`` into ``[(start, end)]`` ranges in data-row
     space (header excluded). One ``(0, n)`` range when splitting is off
