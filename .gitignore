@@ -16,3 +16,7 @@ docs/kb/
 # Z2 co-import gate build artifacts (tests/consumer is its own package)
 tests/consumer/zig-out/
 tests/consumer/.zig-cache/
+
+# Workspace credentials (Databricks PAT etc.) — never commit
+.env
+.env.*
