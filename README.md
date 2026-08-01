@@ -514,8 +514,6 @@ grants no license to use, copy, modify, or distribute it.
   The trial covers the release artifacts only; it does not include
   source-code rights.
 - **All other use** requires a commercial license from the copyright holder.
-- **Prior versions** (≤ v0.7.0) were released under MIT and keep their MIT
-  grant perpetually.
 
 > ⚠️ zlsx is **not "open source"** and not source-available in the licensing
 > sense — the code is published for reading, nothing more.

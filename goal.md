@@ -166,8 +166,8 @@ Remaining: IANA MIME registration (deferred to v1.0).
 - ~~**Relicense PR #102** (MIT → commercial)~~ — **decided and merged
   2026-08-01**: zlsx is **proprietary** — repository public for reading,
   60-day artifact-only evaluation, commercial license (wrapper-layer
-  source rights only; never the Zig core). Prior MIT releases (≤ v0.7.0)
-  keep their MIT grant perpetually.
+  source rights only; never the Zig core). The prior-versions MIT
+  acknowledgment was removed 2026-08-01 at Laurent's direction.
 - ~~**Zig 0.16 migration**~~ — shipped: the toolchain in #120, the embedding arc's
   forward-port in #123. `stash@{0}` is discharged and safe to drop.
 - **zlsx-cloud SaaS** — separate design arc (`docs/plans/saas-*`, gitignored).
