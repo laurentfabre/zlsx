@@ -219,7 +219,7 @@ How zlsx's current surface compares against the popular xlsx libraries. `✓` = 
 | CLI | ✓ (read-side) | — | — | — | — |
 | Third-party runtime deps | 0 (stdlib only) | ~5 Rust crates | 0 Python deps | 0 Python deps | 0 Python deps |
 | Static-link-friendly binary | ✓ | ✓ | — | — | — |
-| License | MIT | MIT / Apache-2 | MIT | BSD-3 | MIT |
+| License | Proprietary (commercial; 60-day free eval) | MIT / Apache-2 | MIT | BSD-3 | MIT |
 
 ## Install
 
@@ -505,4 +505,37 @@ See [`docs/xlsx_test_corpus.md`](docs/xlsx_test_corpus.md) for the public datase
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+zlsx is **proprietary software** — see [LICENSE](LICENSE). The repository is
+public so the source can be read and the project evaluated; that visibility
+grants no license to use, copy, modify, or distribute it.
+
+- **60-day free evaluation** for any person or organization — install and
+  integrate the **released binaries / wheels** and decide whether to license.
+  The trial covers the release artifacts only; it does not include
+  source-code rights.
+- **All other use** requires a commercial license from the copyright holder.
+- **Prior versions** (≤ v0.7.0) were released under MIT and keep their MIT
+  grant perpetually.
+
+> ⚠️ zlsx is **not "open source"** and not source-available in the licensing
+> sense — the code is published for reading, nothing more.
+
+### Commercial licensing
+
+If you (or your company) plan to use zlsx in a paid product, internal business workflow, hosted service, or any commercial setting beyond the 60-day evaluation, please email **laurent.fabre@gmail.com** with:
+
+- Your company name + a brief description of the intended use.
+- Whether the use is internal-only or includes redistribution / hosting.
+- Approximate scale (workbooks per month, deployment count, user count — whatever's natural).
+
+Pricing is negotiable and scales to project size. A commercial license
+covers use of the **compiled release artifacts** (binaries, wheels, the
+C ABI) and includes source rights **only for the wrapper and
+integration layer** — the Python binding (including the PySpark data
+source), SQL UDF definitions, and the integration examples — so you can
+read, adapt, and deploy the glue you actually operate. The Zig core's
+source is not licensed for commercial use under any tier.
+
+### Contributing
+
+Contributions are welcome under the project license + an additional grant that lets the maintainer offer commercial licenses on contributed code. See [CONTRIBUTING.md](CONTRIBUTING.md) for the DCO sign-off and inbound-grant terms.

@@ -1,21 +1,47 @@
-MIT License
+zlsx License
 
-Copyright (c) 2026 Laurent Fabre
+Copyright 2026 Laurent Fabre. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+zlsx is proprietary software. The repository is published so the source
+can be read and the project evaluated, but no license to use, copy,
+modify, or distribute the software — in source or compiled form — is
+granted by that availability. The only grants are the two below.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+## 60-day evaluation
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+A 60-day **free evaluation** is granted to any person or organization
+to install, run, and integrate the official release artifacts of zlsx —
+the compiled binaries and Python wheels published on the project's
+releases page — for the purpose of deciding whether to obtain a
+commercial license. The evaluation does not include any license to the
+source code: compiling the source, modifying it, or creating works
+based on it requires a commercial license. After 60 days, continued use
+requires a signed commercial license.
+
+## Commercial licenses
+
+Commercial licenses cover use of the official compiled release
+artifacts (binaries, wheels, and linking against the C ABI) and include
+source rights only for the wrapper and integration layer — the Python
+binding (including the PySpark data source), SQL UDF definitions, and
+integration examples — so licensees can read, adapt, and deploy the
+integration code they operate. Commercial licenses do not include
+rights to compile, modify, or create works based on the core (Zig)
+source.
+
+For commercial license inquiries, contact: laurent.fabre@gmail.com
+
+## Prior versions
+
+Prior releases of zlsx (every release up to and including v0.7.0, and
+every commit before this relicense) were published under the MIT
+License. Copies obtained under MIT keep their MIT grant perpetually.
+Only releases after the relicense commit are governed by the terms
+above.
+
+## No warranty; no liability
+
+As far as the law allows, the software comes as is, without any
+warranty or condition, and the copyright holder will not be liable for
+any damages arising out of these terms or the use or nature of the
+software, under any kind of legal claim.

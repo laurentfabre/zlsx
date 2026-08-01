@@ -7,14 +7,14 @@ name = "py-zlsx"
 version = "0.7.0"
 description = "Python binding for zlsx — fast, read-mostly .xlsx library (Zig)"
 readme = "README.md"
-license = { text = "MIT" }
+license = "LicenseRef-Proprietary"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 authors = [{ name = "Laurent Fabre" }]
 keywords = ["xlsx", "excel", "spreadsheet", "parser", "openpyxl-alternative"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Operating System :: Microsoft :: Windows",
@@ -42,4 +42,4 @@ spark = ["pyspark>=4.0.0", "pyarrow>=11.0.0"]
 packages = ["zlsx"]
 
 [tool.hatch.build.targets.sdist]
-include = ["zlsx/**", "tests/**", "README.md", "pyproject.toml"]
+include = ["zlsx/**", "tests/**", "README.md", "LICENSE", "pyproject.toml"]
