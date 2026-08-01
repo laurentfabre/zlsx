@@ -42,6 +42,11 @@ pub const AtomicFile = struct {
     /// Set by `finish`. Gates `deinit` so a successful rename is not
     /// followed by deleting the file we just published.
     finished: bool,
+    /// Set the moment `finish` closes the fd, BEFORE the rename can
+    /// fail. Without it a rename failure leaves `finished == false` and
+    /// `deinit` closes the same fd twice — EBADF, which Debug builds
+    /// escalate to a panic instead of the caller's error path.
+    file_closed: bool,
 
     /// 0.16 removed `std.crypto.random`, and randomness is not actually
     /// needed here: an exclusive create is itself atomic, so walking a
@@ -82,6 +87,7 @@ pub const AtomicFile = struct {
             .file = undefined,
             .file_writer = undefined,
             .finished = false,
+            .file_closed = false,
         };
 
         @memcpy(self.tmp_buf[0..prefix.len], prefix);
@@ -116,6 +122,7 @@ pub const AtomicFile = struct {
     pub fn finish(self: *AtomicFile) FinishError!void {
         try self.file_writer.flush();
         self.file.close(self.io);
+        self.file_closed = true;
         try self.dir.rename(self.tmpPath(), self.dir, self.dest_sub_path, self.io);
         self.finished = true;
     }
@@ -125,7 +132,7 @@ pub const AtomicFile = struct {
     /// no debris next to the user's workbook.
     pub fn deinit(self: *AtomicFile) void {
         if (!self.finished) {
-            self.file.close(self.io);
+            if (!self.file_closed) self.file.close(self.io);
             // Best-effort: if unlink fails there is nothing useful to
             // report from a deinit, and the original file is untouched
             // either way.
