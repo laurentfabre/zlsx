@@ -272,6 +272,5 @@ Proprietary — see [LICENSE](../../LICENSE).
 
 - A 60-day free evaluation applies to any person or organization — released wheels/binaries only, no source-code rights.
 - All other use requires a commercial license (which includes source rights for this Python wrapper layer, not the Zig core).
-- Prior MIT releases (≤ 0.7.0) keep their MIT grant perpetually.
 
 For commercial licensing, email **laurent.fabre@gmail.com**. See the [parent repository LICENSE](../../LICENSE) and [CONTRIBUTING.md](../../CONTRIBUTING.md) for full terms.
