@@ -159,3 +159,100 @@ def test_write_existing_single_file_requires_overwrite(spark, tmp_path):
     df.coalesce(1).write.format("zlsx").mode("overwrite").save(out)
     with pytest.raises(Exception, match="overwrite"):
         df.coalesce(1).write.format("zlsx").mode("append").save(out)
+
+
+# ─── streaming ────────────────────────────────────────────────────────
+
+
+def _land_wb(path, names):
+    """Write a one-sheet workbook with a `name` column, one row per name."""
+    with zlsx.write(str(path)) as w:
+        sh = w.add_sheet("Sheet1")
+        sh.write_row(["name", "n"])
+        for i, name in enumerate(names):
+            sh.write_row([name, i])
+
+
+def _drain(spark, zone, ckpt, sink):
+    """Run the stream until everything currently in the zone is
+    processed, then stop. processAllAvailable works with any source;
+    availableNow support for Python stream sources is not assumed."""
+    q = (
+        spark.readStream.format("zlsx")
+        .schema("name string, n bigint")
+        .load(str(zone))
+        .writeStream.format("parquet")
+        .option("path", str(sink))
+        .option("checkpointLocation", str(ckpt))
+        .trigger(processingTime="1 second")
+        .start()
+    )
+    try:
+        q.processAllAvailable()
+    finally:
+        q.stop()
+
+
+def test_stream_ingests_existing_then_only_new(spark, tmp_path):
+    zone = tmp_path / "zone"
+    zone.mkdir()
+    ckpt = tmp_path / "ckpt"
+    sink = tmp_path / "sink"
+    _land_wb(zone / "a.xlsx", ["a1", "a2"])
+    _land_wb(zone / "b.xlsx", ["b1"])
+
+    _drain(spark, zone, ckpt, sink)
+    got = {r.name for r in spark.read.parquet(str(sink)).collect()}
+    assert got == {"a1", "a2", "b1"}
+
+    # New file lands; a restarted stream on the SAME checkpoint must
+    # ingest it exactly once and re-ingest nothing.
+    _land_wb(zone / "c.xlsx", ["c1", "c2"])
+    _drain(spark, zone, ckpt, sink)
+    rows = spark.read.parquet(str(sink)).collect()
+    assert len(rows) == 5  # 3 old + 2 new, no duplicates
+    assert {r.name for r in rows} == {"a1", "a2", "b1", "c1", "c2"}
+
+
+def test_stream_available_now_trigger(spark, tmp_path):
+    """Serverless jobs compute REJECTS infinite triggers, so
+    availableNow is the trigger the platform forces. Python stream
+    sources don't implement it natively; Spark falls back to
+    single-batch execution — verify that path drains and terminates."""
+    zone = tmp_path / "zone"
+    zone.mkdir()
+    _land_wb(zone / "a.xlsx", ["x1", "x2"])
+
+    q = (
+        spark.readStream.format("zlsx")
+        .schema("name string, n bigint")
+        .load(str(zone))
+        .writeStream.format("parquet")
+        .option("path", str(tmp_path / "sink"))
+        .option("checkpointLocation", str(tmp_path / "ckpt"))
+        .trigger(availableNow=True)
+        .start()
+    )
+    q.awaitTermination()
+    got = {r.name for r in spark.read.parquet(str(tmp_path / "sink")).collect()}
+    assert got == {"x1", "x2"}
+
+
+def test_stream_starting_position_latest_skips_existing(spark, tmp_path):
+    from pyspark.sql.types import StructType
+
+    zone = tmp_path / "zone"
+    zone.mkdir()
+    _land_wb(zone / "pre.xlsx", ["old"])
+
+    from zlsx.spark import ZlsxStreamReader
+
+    schema = StructType.fromDDL("name string, n bigint")
+    latest = ZlsxStreamReader({"path": str(zone), "startingPosition": "latest"}, schema)
+    assert latest.initialOffset() == latest.latestOffset()
+    assert latest.partitions(latest.initialOffset(), latest.latestOffset()) == []
+
+    earliest = ZlsxStreamReader({"path": str(zone)}, schema)
+    assert earliest.initialOffset() == {"files": {}}
+    parts = earliest.partitions(earliest.initialOffset(), earliest.latestOffset())
+    assert len(parts) == 1 and parts[0].path.endswith("pre.xlsx")
