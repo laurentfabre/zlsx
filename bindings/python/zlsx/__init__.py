@@ -31,12 +31,13 @@ from typing import Iterator, Union
 
 from . import _ffi
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 """Python-package version. Tracks the Zig library's major+minor; the patch
 level may drift when the binding ships a Python-only fix."""
 
 __all__ = [
     "open",
+    "open_bytes",
     "write",
     "Book",
     "Sheet",
@@ -452,14 +453,19 @@ class Book:
     """
 
     def __init__(self, path: Union[str, Path]):
+        self._handle = None
         self._err = ctypes.create_string_buffer(_ERR_BUF_LEN)
         path_bytes = str(path).encode("utf-8")
-        self._handle = _ffi.lib.zlsx_book_open(path_bytes, self._err, _ERR_BUF_LEN)
-        if not self._handle:
+        handle = _ffi.lib.zlsx_book_open(path_bytes, self._err, _ERR_BUF_LEN)
+        if not handle:
             raise ZlsxError(f"zlsx_book_open({path!r}): {_decode_err(self._err)}")
+        self._attach(handle)
 
-        # Cache sheet names at open time — most callers enumerate them,
-        # and the list is short (<10 in typical workbooks).
+    def _attach(self, handle) -> None:
+        """Adopt an already-open C handle and cache sheet names — most
+        callers enumerate them, and the list is short (<10 in typical
+        workbooks). Shared by the path and buffer constructors."""
+        self._handle = handle
         count = _ffi.lib.zlsx_sheet_count(self._handle)
         self.sheets: list[str] = []
         name_buf = ctypes.create_string_buffer(256)
@@ -1292,6 +1298,32 @@ def open(path: Union[str, Path]) -> Book:  # noqa: A001  (shadows builtin by des
     xlsx archive. Raises :class:`ZlsxError` on parse failure.
     """
     return Book(path)
+
+
+def open_bytes(data: Union[bytes, bytearray, memoryview]) -> Book:
+    """Open an ``.xlsx`` workbook from bytes already in memory.
+
+    No filesystem access, no temp file: the buffer is parsed eagerly and
+    borrowed only for the duration of this call — the caller may discard
+    ``data`` immediately after ``open_bytes`` returns. This is the entry
+    point for callers that receive workbook bytes without a path (SQL
+    UDFs over binary columns, network payloads, object-store reads)::
+
+        with zlsx.open_bytes(content) as book:
+            for row in book.sheet(0).rows():
+                ...
+
+    Raises :class:`ZlsxError` on parse failure.
+    """
+    raw = bytes(data)
+    book = Book.__new__(Book)
+    book._handle = None
+    book._err = ctypes.create_string_buffer(_ERR_BUF_LEN)
+    handle = _ffi.lib.zlsx_book_open_buffer(raw, len(raw), book._err, _ERR_BUF_LEN)
+    if not handle:
+        raise ZlsxError(f"zlsx_book_open_buffer({len(raw)} bytes): {_decode_err(book._err)}")
+    book._attach(handle)
+    return book
 
 
 def read(

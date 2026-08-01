@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "py-zlsx"
-version = "0.5.0"
+version = "0.6.0"
 description = "Python binding for zlsx — fast, read-mostly .xlsx library (Zig)"
 readme = "README.md"
 license = { text = "MIT" }

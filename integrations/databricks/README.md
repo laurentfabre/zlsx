@@ -109,7 +109,7 @@ Ask it questions via the Conversation API or the UI — including
 | `spark_python_task` can't read Volumes | `Cannot read the python file /Volumes/…` | Put the script under `/Workspace/…` |
 | Genie `serialized_space` v2 validator | `column_configs must be sorted by column_name` | Sort them (see `create_genie_space.py`) |
 | Stale OAuth profile hijacks the CLI | `refresh token is invalid` despite a valid PAT | `DATABRICKS_AUTH_TYPE=pat DATABRICKS_CONFIG_FILE=/dev/null` |
-| py-zlsx opens **paths**, not bytes | UDF needs a tempfile shim | Works today (sandbox allows tempfile); an `open_bytes()` API is queued to remove it |
+| ~~py-zlsx opens **paths**, not bytes~~ | ~~UDF needs a tempfile shim~~ | Resolved in 0.6.0: `zlsx.open_bytes()` parses the buffer directly (`zlsx_book_open_buffer` in the C ABI). `read_xlsx_udf.sql` uses it with a tempfile fallback for 0.5.0 wheels |
 
 ## What the productized versions need
 

@@ -188,6 +188,52 @@ def test_writer_round_trip(tmp_path):
         assert rows[2][2] is False
 
 
+def test_open_bytes_round_trip(tmp_path):
+    out = tmp_path / "mem.xlsx"
+    with zlsx.write(out) as w:
+        sheet = w.add_sheet("Data")
+        sheet.write_row(["k", "v"])
+        sheet.write_row(["alpha", 42])
+        sheet.write_row(["beta", 2.5])
+        second = w.add_sheet("Second")
+        second.write_row([True])
+
+    data = out.read_bytes()
+    # Delete the file before opening from bytes: proves no path is
+    # touched and (post-open) that the buffer was only borrowed for
+    # the duration of the call.
+    out.unlink()
+
+    book = zlsx.open_bytes(data)
+    del data  # buffer contract: not needed after open_bytes returns
+    with book:
+        assert book.sheets == ["Data", "Second"]
+        rows = list(book.sheet("Data").rows())
+        assert rows[0] == ["k", "v"]
+        assert rows[1] == ["alpha", 42]
+        assert rows[2][0] == "beta"
+        assert abs(rows[2][1] - 2.5) < 1e-9
+        assert list(book.sheet("Second").rows()) == [[True]]
+
+
+def test_open_bytes_accepts_bytearray_and_memoryview(tmp_path):
+    out = tmp_path / "mem2.xlsx"
+    with zlsx.write(out) as w:
+        w.add_sheet("S").write_row(["x"])
+    raw = out.read_bytes()
+
+    for form in (bytearray(raw), memoryview(raw)):
+        with zlsx.open_bytes(form) as book:
+            assert list(book.sheet(0).rows()) == [["x"]]
+
+
+def test_open_bytes_garbage_raises():
+    with pytest.raises(zlsx.ZlsxError, match="BadZip"):
+        zlsx.open_bytes(b"definitely not a zip archive")
+    with pytest.raises(zlsx.ZlsxError):
+        zlsx.open_bytes(b"")
+
+
 def test_writer_multi_sheet_sst_dedup(tmp_path):
     out = tmp_path / "multi.xlsx"
     with zlsx.write(out) as w:
