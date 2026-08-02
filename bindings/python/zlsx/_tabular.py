@@ -2,8 +2,12 @@
 
 Everything here is driver/executor-agnostic and unit-testable without a
 Spark session: the type-widening lattice, schema inference over a row
-sample, permissive/failfast cell coercion, input-path expansion, and
-partition planning. :mod:`zlsx.spark` is the thin PySpark shell over it.
+sample (single- and multi-source), permissive/failfast cell coercion,
+input-path expansion, partition planning, and atomic part-file landing.
+:mod:`zlsx.spark` is the thin PySpark shell over it.
+
+The split is load-bearing, not cosmetic: no CI job installs pyspark, so
+anything living in ``spark.py`` ships untested. Logic goes here.
 
 Kinds are Spark DDL type names so inference can be rendered straight
 into a DDL schema string: ``boolean`` / ``bigint`` / ``double`` /
@@ -16,6 +20,8 @@ from __future__ import annotations
 import datetime as _dt
 import glob as _glob
 import os
+import uuid as _uuid
+from itertools import islice as _islice
 
 _EXCEL_EPOCH = _dt.datetime(1899, 12, 30)
 
@@ -55,7 +61,7 @@ def merge_kinds(a: str, b: str) -> str:
     return "string"
 
 
-def infer_fields(header, sample_rows):
+def infer_fields(header, sample_rows, *, collapse_void: bool = True):
     """Infer ``[(name, kind, nullable)]`` from a header and a row sample.
 
     Widens across EVERY sampled row, not just the first — an int column
@@ -63,6 +69,13 @@ def infer_fields(header, sample_rows):
     infers ``string``. A column that never held a value infers
     ``string`` (the CSV-source convention for "no evidence").
     Short rows mark the missing columns nullable.
+
+    ``collapse_void=False`` leaves a no-evidence column as ``"void"``
+    instead, so callers merging several sources can keep "no evidence
+    here" distinct from "genuinely textual" — an all-blank column in the
+    first workbook would otherwise pin the merged column to ``string``
+    and mask real types found in the others. Collapse once, after
+    merging, via :func:`collapse_void_fields`.
     """
     ncols = len(header) if header is not None else max(
         (len(r) for r in sample_rows), default=0
@@ -80,8 +93,135 @@ def infer_fields(header, sample_rows):
                 nullable[c] = True
             else:
                 kinds[c] = merge_kinds(kinds[c], kind_of(v))
-    kinds = [k if k != "void" else "string" for k in kinds]
+    if collapse_void:
+        kinds = [k if k != "void" else "string" for k in kinds]
     return list(zip(names, kinds, nullable))
+
+
+def collapse_void_fields(fields):
+    """Resolve any surviving ``"void"`` kind to ``string`` — the final
+    step for a field list built with ``infer_fields(collapse_void=False)``
+    and merged across sources."""
+    return [(n, "string" if k == "void" else k, nl) for n, k, nl in fields]
+
+
+def infer_schema(
+    paths,
+    *,
+    sheet_option: str = "0",
+    header: bool = True,
+    infer_rows: int = 1000,
+    infer_files: int = 10,
+) -> str:
+    """Infer one DDL schema across several workbooks and sheets.
+
+    Samples ``infer_rows`` data rows from every selected sheet of the
+    first ``infer_files`` workbooks (``0`` = all of them) and widens the
+    result across all of them, so a column that is integral in one file
+    and fractional in another resolves to ``double`` here rather than
+    nulling (permissive) or raising (failfast) at read time.
+
+    Empty sheets contribute nothing instead of aborting — one blank
+    workbook in a landing zone should not fail the stream. Only when NO
+    sampled sheet yields a header does this raise.
+    """
+    import zlsx
+
+    paths = list(paths)
+    if infer_files > 0:
+        paths = paths[:infer_files]
+
+    fields: list = []
+    sampled = 0
+    empty: list[str] = []
+    for path in paths:
+        with zlsx.open(path) as book:
+            for sheet_idx in resolve_sheets(sheet_option, book.sheets):
+                with book.sheet(sheet_idx).rows() as rows:
+                    it = iter(rows)
+                    head = next(it, None) if header else None
+                    sample = list(_islice(it, infer_rows))
+                if (header and head is None) or (not header and not sample):
+                    empty.append(f"{path} sheet {sheet_idx}")
+                    continue
+                fields = merge_fields(
+                    fields, infer_fields(head, sample, collapse_void=False)
+                )
+                sampled += 1
+
+    if sampled == 0:
+        shown = ", ".join(empty[:5]) + (" …" if len(empty) > 5 else "")
+        raise ValueError(
+            f"cannot infer a schema: no sampled sheet had data ({shown}); "
+            "supply one with .schema(...)"
+        )
+    return ddl(collapse_void_fields(fields))
+
+
+def land_atomically(path: str, payload: bytes) -> None:
+    """Put `payload` at `path` so no reader ever sees a partial workbook.
+
+    Writes a sibling temp file and renames it over the target, which is
+    atomic on POSIX and on the UC Volumes FUSE mount. Two attempts at the
+    same partition — speculative execution, or a retry racing a
+    straggler — therefore resolve to one complete file instead of
+    interleaving their bytes into the destination.
+
+    Filesystems that reject the rename fall back to one direct write: a
+    far narrower torn window than streaming row-by-row, though not
+    atomic. That is the best available there, and it is why this is a
+    fallback rather than the primary path.
+    """
+    tmp = f"{path}.zlsx-tmp-{_uuid.uuid4().hex[:12]}"
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(payload)
+        try:
+            os.replace(tmp, path)
+        except OSError:
+            with open(path, "wb") as fh:
+                fh.write(payload)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def merge_fields(a, b):
+    """Widen two inferred field lists into one that holds both.
+
+    Positional, because the read path coerces positionally
+    (:func:`coerce_row` zips row cells against kinds by index) — so
+    column *identity* here is the ordinal, not the name. The first
+    source names each column; a later source that disagrees on the name
+    at that position does not rename it. Kinds widen through
+    :func:`merge_kinds`; a column present in only one source, or
+    nullable in either, comes out nullable.
+
+    Used to infer one schema across several (file, sheet) sources
+    instead of trusting the first one to represent the rest.
+    """
+    if not a:
+        return list(b)
+    if not b:
+        return list(a)
+
+    out = []
+    for i in range(max(len(a), len(b))):
+        fa = a[i] if i < len(a) else None
+        fb = b[i] if i < len(b) else None
+        if fa is None or fb is None:
+            # Ragged across sources: the column is absent somewhere, so
+            # every row that source contributes is a null in it.
+            name, kind, _ = fa or fb
+            out.append((name, kind, True))
+            continue
+        name, kind_a, null_a = fa
+        _, kind_b, null_b = fb
+        out.append((name, merge_kinds(kind_a, kind_b), null_a or null_b))
+    return out
 
 
 def _column_names(header, ncols: int) -> list[str]:

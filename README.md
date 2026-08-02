@@ -158,7 +158,10 @@ Link the released library from any tarball — `cc app.c -Iinclude -Llib
 -lzlsx`. The reader and writer surfaces are fully exported, plus an editor
 subset (append rows, `set_cell`, save, docProps read/strip); in-memory
 workbooks come in via `zlsx_book_open_buffer` (that's what SQL UDFs over
-`BINARY` columns use), and a bulk-FFI matrix surface (`zlsx_matrix_open`)
+`BINARY` columns use) and go back out via `zlsx_writer_save_to_buffer`
+(`Writer.to_bytes()` in Python) for callers with no usable filesystem —
+object-store writers, upload bodies, in-process pipelines. A bulk-FFI matrix
+surface (`zlsx_matrix_open`)
 drains a whole sheet in one call for callers that pay per-call dispatch
 overhead. See [`include/zlsx.h`](include/zlsx.h). The Zig core source is
 published for reading — native consumers integrate by linking the released
@@ -217,10 +220,14 @@ stream = (spark.readStream.format("zlsx")
 df.coalesce(1).write.format("zlsx").mode("overwrite").save(".../report.xlsx")
 ```
 
-Schema inference samples up to `inferRows` rows from the first resolved
-file × sheet and widens across that sample; subsequent files and sheets are
-coerced to the inferred schema (`permissive` nulls non-conforming cells,
-`failfast` names the exact file/sheet/row/column). The streaming source
+Schema inference samples up to `inferRows` rows from every selected sheet of
+the first `inferFiles` workbooks (default 10, `0` = all) and widens across all
+of them, so a column that is integral in one file and fractional in another
+resolves to `double` rather than failing at read time; anything outside the
+sample is coerced to the inferred schema (`permissive` nulls non-conforming
+cells, `failfast` names the exact file/sheet/row/column). Parts are
+serialised in memory and renamed into place, so a reader — or a retried task
+— never observes a partial workbook. The streaming source
 deduplicates through its checkpoint — offset = fingerprint map
 `{path: (mtime, size)}` — so each atomically-landed workbook is ingested
 once; files are treated as immutable (a changed fingerprint re-ingests the

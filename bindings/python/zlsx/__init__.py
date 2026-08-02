@@ -31,7 +31,7 @@ from typing import Iterator, Union
 
 from . import _ffi
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 """Python-package version. Tracks the Zig library's major+minor; the patch
 level may drift when the binding ships a Python-only fix."""
 
@@ -2695,6 +2695,50 @@ class Writer:
         )
         if rc != 0:
             raise ZlsxError(f"zlsx_writer_save({target!r}): {_decode_err(self._err)}")
+
+    def to_bytes(self) -> bytes:
+        """Serialise the workbook and return it as ``bytes`` instead of
+        writing a file — the writer-side mirror of :func:`open_bytes`.
+
+        Byte-for-byte identical to what :meth:`save` would have written,
+        so anything that consumes an xlsx file consumes this. Use it when
+        there is no usable filesystem to save through — a Spark executor
+        writing to object storage, an upload body, an in-process pipeline
+        that never wants a temp file::
+
+            with zlsx.write() as w:
+                w.add_sheet("Report").write_row(["ok"])
+                payload = w.to_bytes()
+
+        The Writer stays usable: append more rows and call again, or
+        :meth:`save` to disk as well. Requires libzlsx 0.8.0+.
+        """
+        if not _ffi._HAS_SAVE_TO_BUFFER:
+            raise RuntimeError(
+                "loaded libzlsx does not expose writer save-to-buffer "
+                "(requires 0.8.0+); upgrade libzlsx"
+            )
+        if not self._handle:
+            raise ZlsxError("writer is closed")
+
+        out_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        out_len = ctypes.c_size_t(0)
+        rc = _ffi.lib.zlsx_writer_save_to_buffer(
+            self._handle,
+            ctypes.byref(out_ptr),
+            ctypes.byref(out_len),
+            self._err,
+            _ERR_BUF_LEN,
+        )
+        if rc != 0:
+            raise ZlsxError(f"zlsx_writer_save_to_buffer: {_decode_err(self._err)}")
+        try:
+            # One copy, at a length the callee reported. ctypes.string_at
+            # is length-delimited, so embedded NULs (every deflate stream
+            # has them) survive.
+            return ctypes.string_at(out_ptr, out_len.value)
+        finally:
+            _ffi.lib.zlsx_buffer_free(out_ptr, out_len)
 
     def add_dxf(self, dxf: "Dxf") -> int:
         """Register a differential format for conditional-formatting

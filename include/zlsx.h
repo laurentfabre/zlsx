@@ -799,6 +799,34 @@ int32_t zlsx_writer_save(
     uint8_t       * err_buf,
     size_t          err_buf_len);
 
+/*
+ * Serialise the in-memory workbook into a freshly allocated buffer
+ * instead of a file — the writer-side mirror of zlsx_book_open_buffer.
+ * On success writes the base pointer to *out_ptr, the byte count to
+ * *out_len, and returns 0; the caller owns those bytes and MUST release
+ * them with zlsx_buffer_free(*out_ptr, *out_len).
+ *
+ * Returns -1 on failure with a diagnostic in `err_buf`, leaving
+ * *out_ptr / *out_len untouched. Byte-for-byte identical to what
+ * zlsx_writer_save would have written to disk. The Writer remains
+ * usable and unmodified.
+ */
+int32_t zlsx_writer_save_to_buffer(
+    zlsx_writer_t * writer,
+    uint8_t      ** out_ptr,
+    size_t        * out_len,
+    uint8_t       * err_buf,
+    size_t          err_buf_len);
+
+/*
+ * Release a buffer handed out by zlsx_writer_save_to_buffer. `len` must
+ * be the exact length that call reported — the underlying allocator
+ * frees by slice, not by base pointer alone. NULL is a no-op.
+ */
+void zlsx_buffer_free(
+    uint8_t * ptr,
+    size_t    len);
+
 /* Register a workbook-level (or sheet-scoped) defined name.
  * `local_sheet_id_neg` < 0 means workbook-scope; >= 0 means
  * 0-based sheet index (must resolve at save() time).

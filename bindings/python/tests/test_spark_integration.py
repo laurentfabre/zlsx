@@ -256,3 +256,78 @@ def test_stream_starting_position_latest_skips_existing(spark, tmp_path):
     assert earliest.initialOffset() == {"files": {}}
     parts = earliest.partitions(earliest.initialOffset(), earliest.latestOffset())
     assert len(parts) == 1 and parts[0].path.endswith("pre.xlsx")
+
+
+# ─── cross-file inference + atomic part landing ───────────────────────
+
+
+def test_infer_widens_across_files(spark, tmp_path):
+    """A landing zone where the type evidence is split across files: the
+    first workbook alone says bigint, the pair says double. Before
+    multi-file inference this read nulled every fractional value."""
+    zone = tmp_path / "zone"
+    zone.mkdir()
+    for name, value in (("a.xlsx", 10), ("b.xlsx", 20.5)):
+        with zlsx.write(str(zone / name)) as w:
+            sh = w.add_sheet("S")
+            sh.write_row(["region", "revenue"])
+            sh.write_row(["AMER", value])
+
+    df = spark.read.format("zlsx").load(str(zone / "*.xlsx"))
+    assert dict(df.dtypes)["revenue"] == "double"
+    assert sorted(r.revenue for r in df.collect()) == [10.0, 20.5]
+
+
+def test_infer_files_bound_is_honoured(spark, tmp_path):
+    zone = tmp_path / "zone"
+    zone.mkdir()
+    for name, value in (("a.xlsx", 10), ("b.xlsx", 20.5)):
+        with zlsx.write(str(zone / name)) as w:
+            sh = w.add_sheet("S")
+            sh.write_row(["revenue"])
+            sh.write_row([value])
+
+    df = (
+        spark.read.format("zlsx")
+        .option("inferFiles", "1")
+        .load(str(zone / "*.xlsx"))
+    )
+    # Only a.xlsx sampled, so the schema stays narrow and b.xlsx's
+    # fractional value cannot fit — permissive mode nulls it.
+    assert dict(df.dtypes)["revenue"] == "bigint"
+    got = [r.revenue for r in df.collect()]
+    assert sorted(got, key=lambda v: (v is None, v)) == [10, None]
+
+
+def test_write_leaves_no_temp_files_behind(spark, tmp_path):
+    out = tmp_path / "outdir"
+    df = spark.createDataFrame([("a", 1), ("b", 2)], "name string, n bigint")
+    df.write.format("zlsx").mode("overwrite").save(str(out))
+
+    names = sorted(p.name for p in out.iterdir())
+    assert all(n.startswith("part-") and n.endswith(".xlsx") for n in names), names
+    assert not any("zlsx-tmp" in n for n in names)
+
+    got = set()
+    for p in out.iterdir():
+        with zlsx.open(str(p)) as book:
+            _, rows = book.sheet(0).read_all(header=True)
+            got.update(tuple(r) for r in rows)
+    assert got == {("a", 1), ("b", 2)}
+
+
+def test_overwrite_replaces_single_file_completely(spark, tmp_path):
+    """Rewriting the same single-file target must leave a valid workbook
+    holding only the new rows — not a mix of old and new bytes."""
+    out = tmp_path / "report.xlsx"
+    wide = spark.createDataFrame(
+        [(f"row{i}", i) for i in range(500)], "name string, n bigint"
+    )
+    wide.coalesce(1).write.format("zlsx").mode("overwrite").save(str(out))
+
+    small = spark.createDataFrame([("only", 1)], "name string, n bigint")
+    small.coalesce(1).write.format("zlsx").mode("overwrite").save(str(out))
+
+    with zlsx.open(str(out)) as book:
+        _, rows = book.sheet(0).read_all(header=True)
+    assert rows == [["only", 1]]

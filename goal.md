@@ -196,10 +196,24 @@ Proven end-to-end on a live workspace, using released artifacts only:
   now, Genie generated SQL against the view and answered correctly. A
   natural-language room over an Excel file, no landing step.
 
-Next, in value order: harden the Data Source (per-file×sheet partitions,
-row-range splits, type widening, the writer half → `py-zlsx[spark]`), then a
-`zlsx dbx` CLI family (push / pull / genie) over std.http. The relicense
-(#102) is load-bearing here — the proprietary boundary is the pro tier.
+Shipped since: the Data Source hardening (per-file×sheet partitions, row-range
+splits, type widening, the writer half) in #146, the `zlsx dbx` CLI family
+(push / pull / genie) over std.http in #147, and the streaming source — Auto
+Loader for Excel — in #148. The relicense (#102) is load-bearing here: the
+proprietary boundary is the pro tier.
+
+Next, in value order:
+
+- **`Writer.saveToOwnedBuffer` → `to_bytes()`** (Zig / C ABI / Python) so a
+  workbook can be produced without a filesystem, and cross-file schema
+  inference for the Data Source. Spark parts now serialise in memory and land
+  by rename, so no reader sees a partial workbook.
+- **`zlsx dbx audit`** — the fourth subcommand; `src/dbx.zig` has the other
+  three.
+- **Data Source, second pass**: a row-range partition still re-parses the rows
+  before its range (`islice` over the streaming iterator), so K range
+  partitions cost O(K²) decode work. Needs a skip-rows fast path in the
+  reader, not a Python-side fix.
 
 ## 🔭 Candidate follow-ups (value/effort order)
 
