@@ -239,14 +239,24 @@ UDF sandbox — a workbook in a Volume becomes a SQL view whose next query
 reflects the file's current bytes. Genie and agents can sit on a *file*.
 Pattern in [`integrations/databricks/read_xlsx_udf.sql`](integrations/databricks/read_xlsx_udf.sql).
 
-**3 · `zlsx dbx` in the static binary.** Workbook-aware transfer + Genie from
-the shell — push refuses non-workbooks before upload, pull parses before the
-atomic rename:
+**3 · `zlsx dbx` in the static binary.** Workbook-aware transfer, Genie, and
+landing-zone governance from the shell — push refuses non-workbooks before
+upload, pull parses before the atomic rename, audit answers whether the zone
+still matches what was ingested:
 
 ```bash
 zlsx dbx push report.xlsx /Volumes/main/default/landing/report.xlsx
 zlsx dbx genie "what were total units last month?"   # streams SQL + rows as NDJSON
+
+# Governance: content-hash every workbook, diff against the ingestion
+# record. Exit 3 on findings, so it drops straight into CI.
+zlsx dbx audit /Volumes/main/default/landing/ --table main.default.sales
 ```
+
+`audit` reports **drift** (a workbook rewritten after ingestion — the
+immutable-files convention the streaming source depends on), **orphans** (in
+the zone, never ingested), and **disappearances**, keyed on SHA-256 rather
+than the `(mtime, size)` fingerprint streaming uses.
 
 ---
 

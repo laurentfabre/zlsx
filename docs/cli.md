@@ -92,19 +92,59 @@ zlsx embed book.xlsx --vectors vecs.ndjson --model M \
 ### Databricks (`dbx`)
 
 The one network-touching family. Auth from `DATABRICKS_HOST` /
-`DATABRICKS_TOKEN`; Genie space from `GENIE_SPACE_ID` (or `--space ID`).
+`DATABRICKS_TOKEN`; Genie space from `GENIE_SPACE_ID` (or `--space ID`);
+SQL warehouse from `DATABRICKS_WAREHOUSE_ID` (or `--warehouse ID`).
 
 | Command | What it does |
 |---|---|
 | `zlsx dbx push local.xlsx /Volumes/cat/schema/vol/f.xlsx [--overwrite]` | Upload a workbook to a Unity Catalog Volume — the file is parsed *before* upload, so garbage is refused client-side (exit 3) |
 | `zlsx dbx pull /Volumes/... local.xlsx` | Download a workbook — parsed before the atomic rename, so a truncated or non-workbook body never lands |
 | `zlsx dbx genie "question" [--space ID] [--timeout-secs N]` | Ask a Genie space; streams status / generated SQL / columns / rows / text as NDJSON |
+| `zlsx dbx audit /Volumes/cat/schema/vol/zone/` | Hash every workbook in a landing zone and report drift / orphans / disappearances as NDJSON (exit 3 when there are findings) |
 
 Workbooks and response bodies are capped at **64 MiB** in both directions:
 `push` refuses a larger local input before parsing or upload, and `pull` /
 `genie` reject a larger response after it is buffered (a correctness cap,
 not a hard memory bound). `genie` polls up to `--timeout-secs`
 (default **120**).
+
+#### `dbx audit` — does the zone match what was ingested?
+
+Walks the Volume directory (recursively, to 8 levels), downloads each
+`.xlsx` / `.xlsm`, and records its **SHA-256**. Identity is the content
+hash, not the `(mtime, size)` fingerprint the streaming source keys its
+offsets on — that is the only way to catch a rewrite that preserved size
+and moved mtime backwards.
+
+| Flag | Effect |
+|---|---|
+| `--write-manifest <file>` | Record this run's hashes |
+| `--manifest <file>` | Compare against a prior run → `drift` / `new` / `missing` |
+| `--table <cat.sch.tbl>` | Compare against a table's ingestion record → `orphan` / `missing` |
+| `--source-column <name>` | Provenance column (default `_source_file`) |
+| `--warehouse <id>`, `--timeout-secs <n>` | SQL warehouse and poll budget (default **120**) |
+
+| Status | Meaning |
+|---|---|
+| `ok` | Hash matches the manifest; the ingestion record has seen it |
+| `new` | Present and readable, but the manifest has no entry — not a finding |
+| `drift` | Content hash changed — the immutable-files convention is broken |
+| `orphan` | In the zone, absent from the ingestion record: data the table never reflected |
+| `missing` | In the manifest or the record, gone from the zone |
+| `unreadable` | Bytes are there but do not parse as a workbook |
+
+```bash
+zlsx dbx audit /Volumes/main/default/landing/ --write-manifest audit.json
+# …later, in CI:
+zlsx dbx audit /Volumes/main/default/landing/ \
+    --manifest audit.json --table main.default.sales   # exit 3 → fail the job
+```
+
+`--table` splices identifiers into a `SELECT DISTINCT`, so both the table
+and the column must be plain `[A-Za-z0-9_]` identifiers (dots separating
+the parts); anything else is refused before a request is made. If the
+warehouse reports the result set as truncated, orphan findings are
+flagged as untrustworthy on stderr rather than silently under-reported.
 
 ---
 
