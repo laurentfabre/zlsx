@@ -1953,6 +1953,52 @@ export fn zlsx_writer_save(
     return 0;
 }
 
+/// Serialise the in-memory workbook into a freshly allocated buffer
+/// instead of a file — the writer-side mirror of `zlsx_book_open_buffer`.
+/// On success writes the base pointer into `out_ptr`, the length into
+/// `out_len`, and returns 0; the caller then owns those bytes and MUST
+/// release them with `zlsx_buffer_free(ptr, len)`.
+///
+/// Returns -1 on failure with a diagnostic in `err_buf`, leaving
+/// `out_ptr` / `out_len` untouched. The Writer stays usable and
+/// unmodified — call it twice and you get two equal buffers.
+export fn zlsx_writer_save_to_buffer(
+    w: *Writer,
+    out_ptr: ?*[*]u8,
+    out_len: ?*usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const op = out_ptr orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return -1;
+    };
+    const ol = out_len orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return -1;
+    };
+
+    const state: *WriterState = @ptrCast(@alignCast(w));
+    const bytes = state.inner.saveToOwnedBuffer(gpa) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+
+    // A zero-length archive is not reachable (NoSheets fires first, and
+    // any real archive carries an end-of-central-directory record), so
+    // `bytes.ptr` is always a valid single-item-many pointer here.
+    op.* = bytes.ptr;
+    ol.* = bytes.len;
+    return 0;
+}
+
+/// Release a buffer handed out by `zlsx_writer_save_to_buffer`. `len`
+/// must be the exact length that call reported — Zig's allocator
+/// interface frees by slice, not by base pointer alone. NULL is a no-op.
+export fn zlsx_buffer_free(ptr: ?[*]u8, len: usize) callconv(.c) void {
+    if (ptr) |p| gpa.free(p[0..len]);
+}
+
 // ─── Writer styles (Phase 3b stage 1) ────────────────────────────────
 //
 // Cell styles registered via `zlsx_writer_add_style` return a 1-based

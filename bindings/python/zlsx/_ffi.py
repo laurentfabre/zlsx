@@ -266,6 +266,32 @@ lib.zlsx_writer_save.argtypes = [
 ]
 lib.zlsx_writer_save.restype = ctypes.c_int32
 
+# ─── Writer to buffer (available in libzlsx 0.8.0+) ───────────────────
+#
+# The writer-side mirror of zlsx_book_open_buffer. Guarded like the
+# styles block so py-zlsx keeps importing against an older dylib; the
+# public Writer.to_bytes() raises a clear error when the symbol is
+# absent. restype is POINTER(c_ubyte) rather than c_char_p so ctypes
+# hands back the raw address instead of eagerly copying to bytes — the
+# copy is ours to make, once, at a known length.
+_HAS_SAVE_TO_BUFFER = hasattr(lib, "zlsx_writer_save_to_buffer")
+
+if _HAS_SAVE_TO_BUFFER:
+    lib.zlsx_writer_save_to_buffer.argtypes = [
+        writer_handle,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),  # out_ptr
+        ctypes.POINTER(ctypes.c_size_t),                 # out_len
+        ctypes.c_char_p,                                 # err_buf
+        ctypes.c_size_t,                                 # err_buf_len
+    ]
+    lib.zlsx_writer_save_to_buffer.restype = ctypes.c_int32
+
+    lib.zlsx_buffer_free.argtypes = [
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_buffer_free.restype = None
+
 # ─── Styles (Phase 3b, available in libzlsx 0.2.4+) ───────────────────
 #
 # The `_ex` convention documented in the header leaves us with a single

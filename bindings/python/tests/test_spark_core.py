@@ -7,6 +7,7 @@ when pyspark / a local JVM is unavailable).
 from __future__ import annotations
 
 import datetime as dt
+import os
 
 import pytest
 
@@ -241,3 +242,183 @@ def test_plan_row_ranges():
     assert tab.plan_row_ranges(10, 5) == [(0, 5), (5, 10)]
     assert tab.plan_row_ranges(11, 5) == [(0, 5), (5, 10), (10, 11)]
     assert tab.plan_row_ranges(0, 5) == [(0, 0)]
+
+
+# ─── cross-source widening (multi-file / multi-sheet inference) ───────
+
+
+def test_merge_fields_widens_kind_across_sources():
+    a = tab.infer_fields(["n"], [[1], [2]], collapse_void=False)
+    b = tab.infer_fields(["n"], [[3.5]], collapse_void=False)
+    assert tab.merge_fields(a, b) == [("n", "double", False)]
+    assert tab.merge_fields(b, a) == [("n", "double", False)]
+
+
+def test_merge_fields_incompatible_kinds_fall_to_string():
+    a = tab.infer_fields(["c"], [[1]], collapse_void=False)
+    b = tab.infer_fields(["c"], [["text"]], collapse_void=False)
+    assert tab.merge_fields(a, b) == [("c", "string", False)]
+
+
+def test_merge_fields_all_null_column_does_not_pin_string():
+    """The regression that motivated collapse_void=False: a blank column
+    in the first workbook must not force the merged column to string
+    when a later workbook shows it is numeric."""
+    a = tab.infer_fields(["v"], [[None], [None]], collapse_void=False)
+    b = tab.infer_fields(["v"], [[7]], collapse_void=False)
+    merged = tab.merge_fields(a, b)
+    assert merged == [("v", "bigint", True)]
+    assert tab.collapse_void_fields(merged) == [("v", "bigint", True)]
+    # …and with no evidence anywhere it still lands on string.
+    only_void = tab.merge_fields(a, a)
+    assert tab.collapse_void_fields(only_void) == [("v", "string", True)]
+
+
+def test_merge_fields_ragged_width_marks_missing_nullable():
+    a = tab.infer_fields(["x", "y"], [[1, 2]], collapse_void=False)
+    b = tab.infer_fields(["x"], [[3]], collapse_void=False)
+    merged = tab.merge_fields(a, b)
+    assert merged == [("x", "bigint", False), ("y", "bigint", True)]
+    # Symmetric: the wider source may arrive second.
+    assert tab.merge_fields(b, a) == merged
+
+
+def test_merge_fields_nullability_is_sticky():
+    a = tab.infer_fields(["x"], [[1]], collapse_void=False)
+    b = tab.infer_fields(["x"], [[None], [2]], collapse_void=False)
+    assert tab.merge_fields(a, b) == [("x", "bigint", True)]
+
+
+def test_merge_fields_first_source_names_the_columns():
+    a = tab.infer_fields(["region"], [["N"]], collapse_void=False)
+    b = tab.infer_fields(["zone"], [["S"]], collapse_void=False)
+    # Positional merge — the read path coerces by index, so a renamed
+    # column in a later file does not rename the schema.
+    assert tab.merge_fields(a, b) == [("region", "string", False)]
+
+
+def test_merge_fields_identity_with_empty():
+    a = tab.infer_fields(["x"], [[1]], collapse_void=False)
+    assert tab.merge_fields([], a) == a
+    assert tab.merge_fields(a, []) == a
+    assert tab.merge_fields([], []) == []
+
+
+def test_infer_fields_collapse_void_default_unchanged():
+    """Default behaviour is the pre-existing one — void collapses to
+    string in a single-source inference."""
+    assert tab.infer_fields(["v"], [[None]]) == [("v", "string", True)]
+
+
+# ─── infer_schema over real workbooks ─────────────────────────────────
+
+
+def _book(path, rows, sheet="Sheet1"):
+    import zlsx
+
+    with zlsx.write(path) as w:
+        s = w.add_sheet(sheet)
+        for r in rows:
+            s.write_row(r)
+
+
+def test_infer_schema_widens_across_files(tmp_path):
+    _book(tmp_path / "a.xlsx", [["region", "units"], ["N", 1]])
+    _book(tmp_path / "b.xlsx", [["region", "units"], ["S", 2.5]])
+    # File a alone would say bigint; the pair must say double.
+    assert tab.infer_schema([str(tmp_path / "a.xlsx")]) == "`region` string, `units` bigint"
+    assert tab.infer_schema(
+        [str(tmp_path / "a.xlsx"), str(tmp_path / "b.xlsx")]
+    ) == "`region` string, `units` double"
+
+
+def test_infer_schema_widens_across_sheets(tmp_path):
+    import zlsx
+
+    p = tmp_path / "multi.xlsx"
+    with zlsx.write(p) as w:
+        s1 = w.add_sheet("One")
+        s1.write_row(["v"])
+        s1.write_row([1])
+        s2 = w.add_sheet("Two")
+        s2.write_row(["v"])
+        s2.write_row(["text"])
+
+    assert tab.infer_schema([str(p)], sheet_option="0") == "`v` bigint"
+    assert tab.infer_schema([str(p)], sheet_option="*") == "`v` string"
+
+
+def test_infer_schema_respects_infer_files_bound(tmp_path):
+    _book(tmp_path / "a.xlsx", [["v"], [1]])
+    _book(tmp_path / "b.xlsx", [["v"], [2.5]])
+    paths = [str(tmp_path / "a.xlsx"), str(tmp_path / "b.xlsx")]
+    # Bounded to the first file: the second never opens, so no widening.
+    assert tab.infer_schema(paths, infer_files=1) == "`v` bigint"
+    assert tab.infer_schema(paths, infer_files=0) == "`v` double"
+
+
+def test_infer_schema_skips_empty_sheets(tmp_path):
+    import zlsx
+
+    with zlsx.write(tmp_path / "empty.xlsx") as w:
+        w.add_sheet("Blank")
+    _book(tmp_path / "data.xlsx", [["v"], [7]])
+
+    # A blank workbook in the zone contributes nothing rather than
+    # aborting the whole inference.
+    assert tab.infer_schema(
+        [str(tmp_path / "empty.xlsx"), str(tmp_path / "data.xlsx")]
+    ) == "`v` bigint"
+
+
+def test_infer_schema_all_empty_raises(tmp_path):
+    import zlsx
+
+    with zlsx.write(tmp_path / "empty.xlsx") as w:
+        w.add_sheet("Blank")
+    with pytest.raises(ValueError, match="no sampled sheet had data"):
+        tab.infer_schema([str(tmp_path / "empty.xlsx")])
+
+
+# ─── atomic part-file landing ─────────────────────────────────────────
+
+
+def test_land_atomically_writes_payload(tmp_path):
+    target = tmp_path / "part.xlsx"
+    tab.land_atomically(str(target), b"PK\x03\x04payload")
+    assert target.read_bytes() == b"PK\x03\x04payload"
+
+
+def test_land_atomically_overwrites_and_leaves_no_temp(tmp_path):
+    target = tmp_path / "part.xlsx"
+    target.write_bytes(b"stale")
+    tab.land_atomically(str(target), b"fresh")
+    assert target.read_bytes() == b"fresh"
+    assert [p.name for p in tmp_path.iterdir()] == ["part.xlsx"]
+
+
+def test_land_atomically_cleans_up_when_the_write_fails(tmp_path):
+    target = tmp_path / "sub" / "part.xlsx"   # parent does not exist
+    with pytest.raises(OSError):
+        tab.land_atomically(str(target), b"x")
+    assert not tmp_path.joinpath("sub").exists()
+
+
+def test_land_atomically_never_exposes_a_partial_file(tmp_path, monkeypatch):
+    """The point of the temp+rename: a reader polling the destination
+    sees either nothing or the complete payload, never a prefix."""
+    target = tmp_path / "part.xlsx"
+    seen = []
+
+    real_replace = os.replace
+
+    def spy(src, dst):
+        # At the moment of the rename the destination must not exist
+        # yet, and the temp must already hold every byte.
+        seen.append((os.path.exists(dst), os.path.getsize(src)))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", spy)
+    tab.land_atomically(str(target), b"0123456789")
+    assert seen == [(False, 10)]
+    assert target.read_bytes() == b"0123456789"

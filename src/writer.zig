@@ -496,19 +496,63 @@ pub const Writer = struct {
     pub fn save(self: *Writer, io: std.Io, path: []const u8) !void {
         if (self.sheets.items.len == 0) return error.NoSheets;
 
-        const inputs = try self.allocator.alloc(fresh_emit.SheetInput, self.sheets.items.len);
+        const inputs = try self.projectSheets();
         defer self.allocator.free(inputs);
+
+        return fresh_emit.saveArchiveToPath(self.allocator, io, path, self.archiveInputs(inputs), deflateCompressErased);
+    }
+
+    /// Serialise everything into a freshly allocated buffer instead of a
+    /// file. The caller owns the returned bytes and frees them with
+    /// `allocator.free`.
+    ///
+    /// Byte-for-byte identical to what `save` would have written to disk —
+    /// same archive substrate (`pkg/fresh_emit.zig`), same deflate hook,
+    /// so every byte-stability invariant the parity tests lock applies
+    /// here unchanged. The writer-side mirror of `Book.openBuffer`:
+    /// together they close the loop for callers with no usable
+    /// filesystem — Spark executors writing to object storage, the
+    /// `dbx push` path, in-process pipelines that never want a temp file.
+    ///
+    /// `allocator` serves both the returned buffer and the emit-time
+    /// scratch, so a caller can hand this an arena and drop the whole
+    /// serialisation in one shot. Writer-local registries stay untouched:
+    /// this does not consume the Writer, and calling it twice yields two
+    /// equal buffers.
+    pub fn saveToOwnedBuffer(self: *Writer, allocator: Allocator) ![]u8 {
+        if (self.sheets.items.len == 0) return error.NoSheets;
+
+        const inputs = try self.projectSheets();
+        defer self.allocator.free(inputs);
+
+        var zip_buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer zip_buf.deinit(allocator);
+
+        try fresh_emit.emitArchiveBytes(allocator, &zip_buf, self.archiveInputs(inputs), deflateCompressErased);
+        return zip_buf.toOwnedSlice(allocator);
+    }
+
+    /// Borrowed projection of the registered `SheetWriter` list onto the
+    /// archive substrate's per-sheet input shape. The returned slice is
+    /// caller-owned (free with `self.allocator.free`); every slice
+    /// *inside* it borrows Writer-owned memory and stays valid only as
+    /// long as the Writer does.
+    fn projectSheets(self: *Writer) ![]fresh_emit.SheetInput {
+        const inputs = try self.allocator.alloc(fresh_emit.SheetInput, self.sheets.items.len);
         for (self.sheets.items, 0..) |sw, i| {
             inputs[i] = .{ .name = sw.name, .body = sw.body.items, .state = &sw.state };
         }
+        return inputs;
+    }
 
-        return fresh_emit.saveArchiveToPath(self.allocator, io, path, .{
-            .sheets = inputs,
+    fn archiveInputs(self: *const Writer, sheets: []const fresh_emit.SheetInput) fresh_emit.ArchiveInputs {
+        return .{
+            .sheets = sheets,
             .sst_plan = &self.sst_plan,
             .sst_count = self.sst_count,
             .styles_plan = &self.styles_plan,
             .workbook_xml_plan = &self.workbook_xml_plan,
-        }, deflateCompressErased);
+        };
     }
 };
 
@@ -4914,4 +4958,135 @@ test "iter-wr-4 parity: rels with hyperlinks AND comments — rId numbering stab
     const wrote = try sheet_plan.emitSheetRels(a, &plan_rels, 0, &hls, 1);
     try std.testing.expect(wrote);
     try std.testing.expectEqualSlices(u8, plan_rels.items, writer_rels);
+}
+
+// ─── saveToOwnedBuffer ───────────────────────────────────────────────
+
+/// Populate `w` with a workbook exercising every substrate the archive
+/// emitter layers conditionally: SST strings (incl. a dedup hit), a
+/// registered style, a second sheet, and a comment (which pulls in the
+/// VML + content-type branches). Shared by the buffer parity tests so
+/// they cover more than the trivial one-cell archive.
+fn buildParityWorkbook(w: *Writer) !void {
+    const bold = try w.addStyle(.{ .font_bold = true });
+
+    var s1 = try w.addSheet("Summary");
+    try s1.writeRowStyled(&.{
+        .{ .string = "Region" },
+        .{ .string = "Units" },
+    }, &.{ bold, bold });
+    try s1.writeRow(&.{ .{ .string = "North" }, .{ .integer = 120 } });
+    // "North" again — an SST dedup hit, so sst_count and uniqueCount diverge.
+    try s1.writeRow(&.{ .{ .string = "North" }, .{ .number = 7.5 } });
+    try s1.addComment("A1", "alice", "grouped by region");
+
+    var s2 = try w.addSheet("Notes");
+    try s2.writeRow(&.{.{ .string = "second sheet" }});
+}
+
+test "Writer: saveToOwnedBuffer is byte-identical to save" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(a, io, "parity.xlsx");
+    defer a.free(path);
+
+    var w = Writer.init(a);
+    defer w.deinit();
+    try buildParityWorkbook(&w);
+
+    try w.save(io, path);
+    const from_disk = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 24));
+    defer a.free(from_disk);
+
+    const from_buffer = try w.saveToOwnedBuffer(a);
+    defer a.free(from_buffer);
+
+    // The archive substrate pins both zip timestamps (pkg/zip.zig writes
+    // 0 / 0x21), so identical inputs owe identical bytes — not merely
+    // equivalent archives.
+    try std.testing.expectEqualSlices(u8, from_disk, from_buffer);
+}
+
+test "Writer: saveToOwnedBuffer round-trips through Book.openBuffer" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var w = Writer.init(a);
+    defer w.deinit();
+    try buildParityWorkbook(&w);
+
+    const bytes = try w.saveToOwnedBuffer(a);
+    defer a.free(bytes);
+
+    var book = try xlsx.Book.openBuffer(a, io, bytes);
+    defer book.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
+    try std.testing.expectEqualStrings("Summary", book.sheets[0].name);
+    try std.testing.expectEqualStrings("Notes", book.sheets[1].name);
+
+    var rows = try book.rows(book.sheets[0], a);
+    defer rows.deinit();
+    const header = (try rows.next()).?;
+    try std.testing.expectEqualStrings("Region", header[0].string);
+    const r1 = (try rows.next()).?;
+    try std.testing.expectEqualStrings("North", r1[0].string);
+    try std.testing.expectEqual(@as(i64, 120), r1[1].integer);
+    const r2 = (try rows.next()).?;
+    try std.testing.expectEqualStrings("North", r2[0].string);
+    try std.testing.expectApproxEqAbs(@as(f64, 7.5), r2[1].number, 1e-9);
+}
+
+test "Writer: saveToOwnedBuffer does not consume the Writer" {
+    const a = std.testing.allocator;
+
+    var w = Writer.init(a);
+    defer w.deinit();
+    try buildParityWorkbook(&w);
+
+    const first = try w.saveToOwnedBuffer(a);
+    defer a.free(first);
+    const second = try w.saveToOwnedBuffer(a);
+    defer a.free(second);
+
+    // Emitting must not mutate the registries: a second call sees the
+    // same sst_plan / styles_plan state and owes the same bytes.
+    try std.testing.expectEqualSlices(u8, first, second);
+}
+
+test "Writer: saveToOwnedBuffer on an empty workbook fails with NoSheets" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    try std.testing.expectError(error.NoSheets, w.saveToOwnedBuffer(std.testing.allocator));
+}
+
+test "Writer: saveToOwnedBuffer buffer outlives an arena-scoped Writer" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The returned bytes come from `a`, not from the Writer's allocator,
+    // so tearing the Writer down must leave them intact — the property
+    // the Spark/dbx callers lean on when they build a workbook inside an
+    // arena and hand the bytes to an uploader.
+    var arena = std.heap.ArenaAllocator.init(a);
+    const bytes = blk: {
+        var w = Writer.init(arena.allocator());
+        defer w.deinit();
+        try buildParityWorkbook(&w);
+        break :blk try w.saveToOwnedBuffer(a);
+    };
+    defer a.free(bytes);
+    arena.deinit();
+
+    var book = try xlsx.Book.openBuffer(a, io, bytes);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
 }

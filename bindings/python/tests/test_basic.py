@@ -297,6 +297,76 @@ def test_writer_xml_special_chars_escape(tmp_path):
         assert row[0] == "a<b & c>d \"e\" 'f'"
 
 
+# ─── Writer.to_bytes (writer-side mirror of open_bytes) ───────────────
+
+
+def _sample_workbook(w):
+    bold = w.add_style(zlsx.Style(font_bold=True))
+    s = w.add_sheet("Summary")
+    s.write_row(["region", "units"], styles=[bold, bold])
+    s.write_row(["North", 120])
+    s.write_row(["North", 7.5])       # SST dedup hit
+    w.add_sheet("Notes").write_row(["second sheet"])
+
+
+def test_writer_to_bytes_matches_save(tmp_path):
+    out = tmp_path / "parity.xlsx"
+    with zlsx.write() as w:
+        _sample_workbook(w)
+        payload = w.to_bytes()
+        w.save(out)
+
+    assert payload == out.read_bytes(), "to_bytes must equal what save writes"
+
+
+def test_writer_to_bytes_round_trips_through_open_bytes():
+    with zlsx.write() as w:
+        _sample_workbook(w)
+        payload = w.to_bytes()
+
+    assert isinstance(payload, bytes)
+    assert payload[:2] == b"PK"
+    with zlsx.open_bytes(payload) as book:
+        assert book.sheets == ["Summary", "Notes"]
+        header, rows = book.sheet(0).read_all(header=True)
+        assert header == ["region", "units"]
+        assert rows == [["North", 120], ["North", 7.5]]
+
+
+def test_writer_to_bytes_is_repeatable_and_non_consuming():
+    with zlsx.write() as w:
+        _sample_workbook(w)
+        first = w.to_bytes()
+        second = w.to_bytes()
+        assert first == second
+        # Still usable afterwards: appending changes the next payload.
+        w.add_sheet("Third").write_row(["x"])
+        assert w.to_bytes() != first
+
+
+def test_writer_to_bytes_empty_workbook_raises():
+    with zlsx.write() as w:
+        with pytest.raises(zlsx.ZlsxError, match="NoSheets"):
+            w.to_bytes()
+
+
+def test_writer_to_bytes_after_close_raises():
+    w = zlsx.write()
+    w.add_sheet("S").write_row(["a"])
+    w.close()
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        w.to_bytes()
+
+
+def test_writer_to_bytes_survives_many_calls():
+    """The buffer is freed through zlsx_buffer_free on every call; a leak
+    here would be invisible in a single round-trip, so loop it."""
+    with zlsx.write() as w:
+        _sample_workbook(w)
+        sizes = {len(w.to_bytes()) for _ in range(200)}
+    assert len(sizes) == 1
+
+
 # ─── Styles (Phase 3b) ────────────────────────────────────────────────
 
 

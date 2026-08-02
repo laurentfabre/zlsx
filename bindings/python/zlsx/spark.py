@@ -28,13 +28,21 @@ the pyspark half is already there — the plain wheel suffices.
               .load("/Volumes/cat/schema/vol/landing/"))
 
 Read options: ``sheet`` (default ``"0"``), ``header`` (default true),
-``inferRows`` sample size (default 1000), ``rowsPerPartition`` (default
-0 = one partition per file x sheet), ``mode`` (``permissive`` nulls
-cells that don't fit the schema, ``failfast`` raises naming the exact
-file/sheet/row/column). Write options: ``sheet`` (default "Sheet1"),
-``header`` (default true). A ``.xlsx`` target path means single-file
-mode and requires a single-partition DataFrame (``coalesce(1)``); any
-other path is a directory of ``part-*.xlsx`` files.
+``inferRows`` sample size (default 1000), ``inferFiles`` workbooks to
+sample when inferring (default 10, ``0`` = all), ``rowsPerPartition``
+(default 0 = one partition per file x sheet), ``mode`` (``permissive``
+nulls cells that don't fit the schema, ``failfast`` raises naming the
+exact file/sheet/row/column). Write options: ``sheet`` (default
+"Sheet1"), ``header`` (default true). A ``.xlsx`` target path means
+single-file mode and requires a single-partition DataFrame
+(``coalesce(1)``); any other path is a directory of ``part-*.xlsx``
+files. Parts are serialised in memory and renamed into place, so a
+reader never sees a partial workbook.
+
+Inference widens across every sampled sheet of every sampled file, so
+mixed-precision or mixed-type columns across a landing zone resolve to
+a type that holds all of them instead of failing at read time. Supply
+``.schema(...)`` to skip inference entirely.
 
 Partition planning, schema inference and coercion live in
 :mod:`zlsx._tabular` (pure Python, unit-tested without Spark).
@@ -115,31 +123,17 @@ class ZlsxDataSource(DataSource):
         return "zlsx"
 
     def schema(self):
-        # Only called when the user did not supply a schema. Inference
-        # samples inferRows data rows from the FIRST resolved
-        # (file, sheet) and widens across the whole sample; with
-        # sheet="*" or multi-file input the remaining sheets must be
-        # column-compatible (coercion absorbs benign type drift).
-        import zlsx
-
+        # Only called when the user did not supply a schema. Widens
+        # across every selected sheet of the first inferFiles workbooks
+        # — see _tabular.infer_schema.
         opts = self.options
-        files = _tabular.expand_paths(opts["path"])
-        header = _truthy(opts, "header", True)
-        infer_rows = int(opts.get("inferRows", "1000"))
-        with zlsx.open(files[0]) as book:
-            sheet_idx = _tabular.resolve_sheets(
-                opts.get("sheet", "0"), book.sheets
-            )[0]
-            with book.sheet(sheet_idx).rows() as rows:
-                it = iter(rows)
-                head = next(it, None) if header else None
-                sample = list(islice(it, infer_rows))
-        if header and head is None:
-            raise ValueError(
-                f"{files[0]}: sheet {sheet_idx} is empty; cannot infer a "
-                "schema (supply one with .schema(...) or set header=false)"
-            )
-        return _tabular.ddl(_tabular.infer_fields(head, sample))
+        return _tabular.infer_schema(
+            _tabular.expand_paths(opts["path"]),
+            sheet_option=opts.get("sheet", "0"),
+            header=_truthy(opts, "header", True),
+            infer_rows=int(opts.get("inferRows", "1000")),
+            infer_files=int(opts.get("inferFiles", "10")),
+        )
 
     def reader(self, schema):
         return ZlsxBatchReader(self.options, schema)
@@ -344,7 +338,12 @@ class ZlsxBatchWriter(DataSourceWriter):
 
         date_fmt = {"date": "yyyy-mm-dd", "timestamp": "yyyy-mm-dd hh:mm:ss"}
         n = 0
-        with zlsx.write(out_path) as w:
+        # Serialise to bytes, then land the file in one step. The Writer
+        # buffers the whole archive in memory either way (see
+        # Writer.saveToOwnedBuffer), so this costs no extra streaming —
+        # what it buys is that no reader, and no retry, ever observes a
+        # half-written workbook at the destination path.
+        with zlsx.write() as w:
             styles = [
                 w.add_style(zlsx.Style(number_format=date_fmt[k]))
                 if k in date_fmt else 0
@@ -362,6 +361,9 @@ class ZlsxBatchWriter(DataSourceWriter):
                     [_to_cell(v) for v in row], styles=styles
                 )
                 n += 1
+            payload = w.to_bytes()
+
+        _tabular.land_atomically(out_path, payload)
         return ZlsxCommit(path=out_path, rows=n)
 
     def commit(self, messages):
