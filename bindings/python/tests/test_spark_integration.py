@@ -94,6 +94,46 @@ def test_rows_per_partition_splits_without_loss(spark, workbook):
     assert {r.product for r in df.collect()} == {"widget", "flange", "gizmo"}
 
 
+def test_many_row_range_partitions_lose_and_duplicate_nothing(spark, tmp_path):
+    """Every range partition past the first starts with a skip, so an
+    off-by-one there drops or repeats rows at partition boundaries
+    instead of failing loudly. Enough rows and partitions to catch it,
+    including a final short partition."""
+    path = str(tmp_path / "wide.xlsx")
+    n = 97                      # prime: guarantees a ragged last partition
+    with zlsx.write(path) as w:
+        s = w.add_sheet("S")
+        s.write_row(["idx", "label"])
+        for i in range(n):
+            s.write_row([i, f"row{i}"])
+
+    df = (spark.read.format("zlsx")
+          .option("rowsPerPartition", "10")
+          .load(path))
+    assert df.rdd.getNumPartitions() == 10          # ceil(97/10)
+
+    got = sorted(r.idx for r in df.collect())
+    assert got == list(range(n)), "rows lost or duplicated across boundaries"
+    # Labels must stay paired with their index — a skip that lands one
+    # row off would keep the count but shear the columns.
+    assert all(r.label == f"row{r.idx}" for r in df.collect())
+
+
+def test_row_range_partitions_match_unpartitioned_read(spark, tmp_path):
+    path = str(tmp_path / "cmp.xlsx")
+    with zlsx.write(path) as w:
+        s = w.add_sheet("S")
+        s.write_row(["a", "b"])
+        for i in range(50):
+            s.write_row([i, i * 1.5])
+
+    whole = spark.read.format("zlsx").load(path).collect()
+    split = (spark.read.format("zlsx")
+             .option("rowsPerPartition", "7")
+             .load(path).collect())
+    assert sorted((r.a, r.b) for r in whole) == sorted((r.a, r.b) for r in split)
+
+
 def test_user_schema_failfast_vs_permissive(spark, workbook):
     ddl = "region string, product string, units bigint, revenue bigint"
     permissive = (spark.read.format("zlsx").schema(ddl)

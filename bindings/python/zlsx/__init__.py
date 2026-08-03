@@ -1197,6 +1197,50 @@ class Rows:
                 out.append(None)
         return out
 
+    def skip(self, n: int) -> int:
+        """Advance past ``n`` rows without decoding their cells; returns
+        how many were actually skipped (fewer than ``n`` only at end of
+        sheet).
+
+        Equivalent to calling ``next()`` ``n`` times and throwing the
+        results away — same landing row, same numbering — but it does
+        not build the Python row lists for what it passes. That makes
+        range-partitioned reads affordable: partition *i* of a sheet
+        must first get past *i·size* rows it will never look at, so
+        decoding them turns K partitions into O(K²) work.
+
+        Falls back to draining ``next()`` against a pre-0.8.0 libzlsx,
+        so callers need no version check of their own.
+        """
+        if n < 0:
+            raise ValueError(f"skip count must be non-negative, got {n}")
+        if not self._handle:
+            raise ZlsxError("Rows iterator is closed")
+        if n == 0:
+            return 0
+
+        if not _ffi._HAS_ROWS_SKIP:
+            skipped = 0
+            for _ in range(n):
+                try:
+                    next(self)
+                except StopIteration:
+                    break
+                skipped += 1
+            return skipped
+
+        out = ctypes.c_size_t(0)
+        rc = _ffi.lib.zlsx_rows_skip(
+            self._handle, n, ctypes.byref(out), self._err, _ERR_BUF_LEN
+        )
+        if rc != 0:
+            raise ZlsxError(f"zlsx_rows_skip: {_decode_err(self._err)}")
+        # The previous row's cells are gone; keep the side-channel
+        # accessors (style_indices / parse_date) from reading a stale
+        # length into a cleared buffer.
+        self._current_len = 0
+        return int(out.value)
+
     def parse_date(self, col_idx: int) -> "datetime.datetime | None":
         """Decode the current-row cell at ``col_idx`` as a date-styled
         number. Returns a Python ``datetime.datetime`` when the cell

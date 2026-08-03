@@ -211,12 +211,15 @@ class _ZlsxReaderBase:
                         _tabular.coerce_row(row, kinds, mode, ctx, base + i)
                     )
             else:
-                # Row range: stream, skipping [0, start) cheaply.
+                # Row range: skip [0, start) without decoding it, then
+                # stream the range. `islice` here would decode and throw
+                # away every preceding row, so K range partitions cost
+                # O(K²) in decode work; Rows.skip walks row boundaries
+                # instead.
                 with sheet.rows() as rows:
                     it = iter(rows)
-                    if header:
-                        next(it, None)
-                    for i, row in enumerate(islice(it, p.start, p.end)):
+                    rows.skip(p.start + (1 if header else 0))
+                    for i, row in enumerate(islice(it, p.end - p.start)):
                         yield tuple(
                             _tabular.coerce_row(row, kinds, mode, ctx, base + i)
                         )

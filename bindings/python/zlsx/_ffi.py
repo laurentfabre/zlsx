@@ -163,6 +163,23 @@ lib.zlsx_rows_next.argtypes = [
 ]
 lib.zlsx_rows_next.restype = ctypes.c_int32
 
+# ─── Row skip (available in libzlsx 0.8.0+) ──────────────────────────
+#
+# Guarded like the other post-0.2.4 additions so py-zlsx keeps importing
+# against an older dylib; Rows.skip() falls back to draining next() when
+# the symbol is absent, which is what it replaces.
+_HAS_ROWS_SKIP = hasattr(lib, "zlsx_rows_skip")
+
+if _HAS_ROWS_SKIP:
+    lib.zlsx_rows_skip.argtypes = [
+        rows_handle,
+        ctypes.c_size_t,                     # n
+        ctypes.POINTER(ctypes.c_size_t),     # out_skipped
+        ctypes.c_char_p,                     # err_buf
+        ctypes.c_size_t,                     # err_buf_len
+    ]
+    lib.zlsx_rows_skip.restype = ctypes.c_int32
+
 # ─── Matrix exports (v0.2.8+, bulk-FFI for sheet-at-a-time reads) ─────
 
 _HAS_MATRIX = hasattr(lib, "zlsx_matrix_open")
