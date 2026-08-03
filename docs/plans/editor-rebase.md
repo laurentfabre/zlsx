@@ -357,7 +357,9 @@ path under a feature flag and ship the rebase incremental.
   Editor; iter-er-5 simply documents which Editor refusals lift
   once they ship.
 - **Tier-D items** (D1 evaluator, D2 chart emit) — never touched
-  by B2.
+  by B2. *(Historical: accurate for B2's scope. D1's project-level
+  "deferred indefinitely" status was reversed 2026-08-02 — see
+  `goal_formula.md` — which does not change what B2 shipped.)*
 - **C2b `addImage`** — depends on B1 + C2a; orthogonal to B2.
 - **Editor public-field cleanup** — `editor.sheet_paths` and
   similar deprecate in this minor line; removal is the next

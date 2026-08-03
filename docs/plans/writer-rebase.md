@@ -572,7 +572,7 @@ a feature flag or revert the offending iter.
 ## Out of scope (explicit)
 
 - **C2b drawing-anchor rewriter** — independent of B3; lifts the per-sheet drawing/picture refusal (Editor side, not Writer).
-- **C1 M2 m4 + later formula evaluator** — never touched by B3.
+- **C1 M2 m4 + later formula evaluator** — never touched by B3. *(Historical: accurate for B3's scope. The evaluator stopped being an indefinite "later" on 2026-08-02 — it is tier D1 with its own ladder in `goal_formula.md`.)*
 - **Streaming write surface** — risk only; full streaming is potential wr-8 / B-stream.
 - **Coverage-guided fuzzing of write path** — B-fuzz is parallel.
 - **Public field cleanup on Writer / SheetWriter** — current minor line keeps everything; deprecation lives in the next minor.

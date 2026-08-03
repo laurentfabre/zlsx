@@ -12,6 +12,11 @@ dispositioned; see §15) · Status: **PARKED (2026-08-02)** — the SHIP-READY r
 loop was stopped by owner directive after round 20; this document is committed as
 the design record, not as scheduled work. Round 21 was never run._
 
+_**M-1 landed 2026-08-03** (docs-only planning flip; see §13.1). The park still
+holds for M0 and everything above it — landing M-1 discharged the documentation
+debt that made the rest of the tree contradict this plan; it did not schedule the
+ladder._
+
 ---
 
 ## Table of contents
@@ -5493,19 +5498,25 @@ fixtures, the flow solvers' budget suite, the 1904 bound).
 ## 13. Documentation flips
 
 M-1 ships this checklist (extended by an rg sweep at M-1; each entry
-classified flip-at / historical-label):
+classified flip-at / historical-label).
+
+**Sweep run 2026-08-02 (M-1).** The release-gate regex below was run over
+the whole tree; every hit is now accounted for by one of the three tables
+in this section — the flip/label checklist, the M-1 disposition (§13.1),
+or the reviewed allowlist (§13.2). Two rows in the checklist carried stale
+line references and are corrected in place.
 
 | Doc | Claim | Action |
 |---|---|---|
 | `docs/plans/post-0.2.9-roadmap.md:144,203,208-211,487-488,596-607` | D1 deferred / exclusions | **M-1** flip |
 | `goal_plan.md` D1 row + `:214-219` "Deliberately not on this list" (+ site rebuild per `goal_plan.md:3-7` at M-1 and M9d) | deferred | **M-1** flip |
-| `goal_evol.md:48` scope line · `goal.md:219-222` follow-up 4 | out of scope / standalone | **M-1** flip |
+| `goal_evol.md:47-48` scope line · `goal.md` follow-up 4 (**was `:219-222`; now `:242-249`** — the list shifted after #154) | out of scope / standalone | **M-1** flip |
 | `docs/plans/formula-literal-masking.md:42-48` | misstates `<v>` preservation | **M-1** correction |
 | `docs/plans/editor-rebase.md:359` · `docs/plans/workbook-overlay.md:287` · `docs/plans/writer-rebase.md:575` · `docs/plans/structural-edits.md:121` ("Excel will recompute") | no-evaluation statements | **M-1** historical labels |
 | ~~`README.md:452-455`~~ | "Out (by design) … never computes" | **M6 — done**: the bullet now scopes the exclusion to the read path and points at the `eval`/`recalc`/`Workbook.recalculate` surface |
 | ~~`docs/cli.md`~~ | no eval/recalc | **M6 — done**: new **Formula (`eval` / `recalc`)** section — syntax, both stream grammars, record shapes, the nine-row exit table, SIGPIPE exception, commit-aware mapping; read-family exit table cross-links it |
 | ~~`docs/jq-for-excel.md:290-292`~~ | "reader, not a spreadsheet engine" | **M6 — done**: historical label; the read stream still never computes, the pointer goes to `cli.md` § Formula |
-| `docs/vs_calamine.md:64,90` | claims zlsx skips `<f>` / cannot emit formulas — **already false** (`xlsx.zig:2070-2153`, `writer.zig:940-955`) | **M-1** correction |
+| ~~`docs/vs_calamine.md:64,90`~~ | claims zlsx skips `<f>` / cannot emit formulas — **already false** (`src/xlsx.zig:1739-1770`, `src/writer.zig:992`) | **M-1 — done**: both rows corrected with the flip commit |
 | ~~`docs/vs_calamine.md:5,130`~~ | "no formula evaluation" (true until M5d2) | **M6 — done**: TL;DR and the pick-calamine list both labeled — and the list now notes calamine does not evaluate either |
 | ~~`docs/xlsx_test_corpus.md:27,56`~~ | "don't need to evaluate" | **M6 — done**: both rows scoped to the read path with pointers at the engine's own suites |
 | ~~`docs/package-layer.md`~~ | layer description | **M5d3 — done**: title's "read-only" retired with a note saying when it stopped being true (byte-preserving writes → `Workbook` mutation → M5d recalc), and a **Recalculation (M5d)** section added covering `recalculate` / `saveWithRecalc` / `openBuffer(Controlled)` / `markRecalcOnLoad` / `zlsx_recalc.writerSaveWithRecalc`, plus why the composition is a third module |
@@ -5514,15 +5525,55 @@ classified flip-at / historical-label):
 | ~~`src/xlsx.zig:1-13` · `src/cli.zig:1` · `pkg/workbook.zig` (emitCell branch)~~ | in-source scope comments (incl. the "future evaluator (Tier D1)" promise at the emitCell branch) | **M6 — done**: `cli.zig`'s "read-only" header names all three families; `xlsx.zig`'s blurb marked historical (the file itself still never evaluates); the Tier D1 promise replaced by the real rule — the engine exists, and the set-cell path deliberately stays cache-free |
 | ~~`src/formula/tokenizer.zig:566-575`~~ (scope note made false by the new token kinds) | tokenizer scope comment | **M1a — done**: module doc rewritten with the tokens; `rewriter.zig`'s matching "classifies these as `.unknown`" claim flipped too |
 | ~~`build.zig` ("zlsx and zlsx_pkg cannot coexist" — contradicted by `zlsx_recalc`)~~ | module-graph comment | **M5c — done**: the claim was already false (`cli_mod`, `corpus_mod` and `package_mod` all import both); what could not coexist under 0.15.2 was a *file* claimed by two module trees, which `AGENTS.md` marks history on 0.16. Comment rewritten to the real reason the RSS probes are split (a per-process RSS delta), and the graph is now gated by `assertAcyclicModules`. `build.zig` joins the release rg scan |
-| `src/writer.zig:1645-1647` (claims the reader does not expose formula text — already false, `src/xlsx.zig:2070-2135`) | stale reader claim | **M-1** historical correction; sweep regex extended to read-side formula-text claims |
+| ~~`src/writer.zig:1645-1647`~~ (claimed the reader does not expose formula text) | stale reader claim | **M-1: no action — already resolved.** The claim is gone from the tree; `:1645-1647` is now unrelated test code. The extended read-side regex (`reader (does not\|doesn't\|cannot\|can't) (expose\|surface\|return\|read).*formula`, plus `formula text.*(not exposed\|unavailable)`) over `src/ pkg/ include/ bindings/ docs/ README.md` returns zero hits (2026-08-02). The reader does expose it: `Rows.formulaStrings()` / `Rows.formulaRefs()`, `src/xlsx.zig:1739-1770` |
 | `AGENTS.md` | add formula conventions + harness how-to | **M4c** |
+
+### 13.1 M-1 disposition (2026-08-02)
+
+What the planning flip actually changed, so M9d can tell a discharged row
+from an open one:
+
+| Row | Disposition |
+|---|---|
+| `docs/plans/post-0.2.9-roadmap.md` | ✅ flipped — D1 table row, TL;DR, sequencing graph, iter-C1 note, and the whole "D1. Formula evaluator — minimal (deferred indefinitely)" section, which now points here and keeps its pre-reversal critique as a labelled quote |
+| `goal_plan.md` | ✅ flipped — D1 row is `planned` / 41 PRs (`deferred` → `planned` per the status legend at `:32-37`); "Deliberately not on this list" now covers D2 only and explains the D1 reversal |
+| `goal_evol.md` | ✅ flipped — formula evaluation is out of scope *for that work order*, not for the project |
+| `goal.md` follow-up 4 | ✅ flipped — `<xm:f>` route-through marked pullable after M2 rather than standalone |
+| `docs/plans/formula-literal-masking.md` | ✅ corrected + **cache policy table added** (three write paths, each with its cached-`<v>` behaviour and code cite); the "what would change the calculus" bullet now names `markRecalcOnLoad` (M5b2) and save-path recalc (M5d2) |
+| `docs/vs_calamine.md:64,90` | ✅ corrected — both cells were ✗ and are now ✓ with code cites; zlsx reads `<f>` and writes `<f>` today |
+| `src/writer.zig:1645-1647` | ✅ no action needed — claim already gone (see the row above); **M-1 changed no `.zig` file** |
+| 4 × plan docs (editor-rebase, workbook-overlay, writer-rebase, structural-edits) | ✅ historical labels applied — each keeps its original statement and gains a dated note that D1's project-level status changed without changing what that plan shipped |
+| `LICENSE` third-party-data carve-out | ⛔ **OWNER action — not done.** Blocks M1a (Unicode 17 `DerivedCoreProperties.txt` tables + `THIRD_PARTY_NOTICES` under Unicode License V3). Nothing in M-1 or M0 depends on it |
+
+### 13.2 Reviewed allowlist — sweep hits that are not scope claims
+
+Every remaining hit of the release-gate regex, classified. A hit in one of
+these files at one of these classes is **allowed**; anything else at M9d is
+a new claim and blocks.
+
+| Class | Where | Why it passes |
+|---|---|---|
+| **A · plan of record** | `goal_formula.md` (all hits) | This document. It is *about* evaluation; every mention is intentional |
+| **B · licence homonym** | `README.md:20-21,525,528,534,543` · `docs/cli.md:316-317` · `goal.md:168` · `bindings/python/README.md:273` | "evaluation" = the 60-day artifact-only licence term, not formula evaluation |
+| **C · "interpreter" / "interpret" homonym** | `docs/benchmarks.md:11,135` · `src/cli.zig:5` · `bindings/python/zlsx/__init__.py:12` · `bindings/python/zlsx/_ffi.py:74` · `bindings/python/tests/test_basic.py:101` · `bindings/python/tests/test_embeddings.py:105` · `include/zlsx.h:60,725` · `src/c_abi.zig:142` · `src/xlsx.zig:1205` · `pkg/store.zig:985` · `pkg/workbook.zig:7135,10259` · `pkg/embedding_part.zig:106` · `pkg/drawings.zig:950` · `docs/vs_calamine.md:143` | Python-interpreter startup, or "interpret these bytes as" — unrelated sense |
+| **D · out-of-scope, non-formula** | `pkg/store.zig:13` · `pkg/typed_parts/styles_xml.zig:25` · `pkg/drawings.zig:4` · `pkg/drawing_emit.zig:58` · `src/writer.zig:30-34` · `src/xlsx.zig:1819` · `pkg/workbook.zig:929` · `docs/package-layer.md:125` · `docs/plans/load-modify-save.md:73,178,258` · `docs/plans/cell-mutate.md:261` · `docs/plans/emb-4-compat-matrix.md:176` · `docs/plans/refusal-audit.md:189` · `docs/plans/embeddings-in-xlsx.md:8,638,847,892` · `docs/plans/workbook-overlay.md:216,280` · `docs/plans/editor-rebase.md:352` · `docs/plans/writer-rebase.md:572` · `docs/plans/structural-edits.md:276` · `docs/vs_calamine.md:91,145` · `docs/plans/post-0.2.9-roadmap.md:616` · `README.md:481` · `bindings/python/README.md:257` · `goal_plan.md:37` · `bindings/python/zlsx/__init__.py:2475` | Scope statements about ZIP64, styles, charts, pivots, `.xls`/`.xlsb`, Google Sheets, encryption, SST compaction — none about evaluation |
+| **E · `<dimension>` / Excel-recomputes-on-open** | `pkg/sheet_edit.zig:375,650,674,1146,1169,1223` · `docs/plans/load-modify-save.md:27,158,279` · `docs/plans/cell-mutate.md:6,49,67,207,255` · `docs/plans/structural-edits.md:100` · `docs/plans/post-0.2.9-roadmap.md:148` · `docs/plans/refusal-audit.md:62` | Structural-edit behaviour: zlsx leaves `<dimension>`/totals for Excel to fix on open. Not a claim about computing formulas |
+| **F · embedding-digest recompute** | `docs/plans/embeddings-in-xlsx.md:59,564,733,742,744,945` · `docs/plans/emb-4-compat-matrix.md:178,186` · `pkg/recovery_record.zig:132-133` · `pkg/workbook.zig:566,2167` · `include/zlsx.h:1399` · `src/c_abi.zig:4642` · `bindings/python/zlsx/__init__.py:3330` · `goal_plan.md:198` | `xxh3` content-digest recomputation in the embedding arc |
+| **G · factual formula-text description** | `docs/jq-for-excel.md:200` · `src/writer.zig:834,988` · `bindings/python/zlsx/__init__.py:1563` · `bindings/python/README.md:247` | Describes what zlsx does with formula *text* and caller-supplied cached values — accurate today and unaffected by the ladder until the row that owns it flips |
+
+**Flagged, not fixed by M-1** (outside its mandate, no formula claim):
+`bindings/python/zlsx/__init__.py:2475` and `src/writer.zig:30-34` both
+describe load→modify→save as out of scope in "Phase 3c" terms that predate
+the B-tier rebase. Whether they are stale is a Writer-scope question, not a
+D1 one.
 
 **Release gate (M9d)**: `rg -in "formula evaluation|never computes|not
 evaluated|out of scope|spreadsheet engine|auto-recalculate|don't need to
 evaluate|recalcs on open|evaluator stays deferred|evaluat|interpret|recomput|recalculat"
-README.md docs/ bindings/ goal*.md src/ include/ pkg/ build.zig` — every hit on a
-**reviewed allowlist** (flips done, historical labels, this plan) or the
-release blocks.
+README.md docs/ bindings/ goal*.md src/ include/ pkg/ build.zig` — every hit on the
+**reviewed allowlist** (§13.2, committed at M-1) or on a discharged checklist
+row (§13.1), or the release blocks. `tests/` is deliberately outside the
+scanned set. Re-classify, never widen the regex, when a new hit appears.
 
 ---
 

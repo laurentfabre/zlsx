@@ -68,7 +68,7 @@ Status vocabulary is fixed by the site's pill styling — use only these:
 | ER | Recovery record | done | 1 wk | E4B, durability decision | The ~200-byte provenance record that makes a stripped vector set detectable. Hidden `<definedName>` + `docProps/custom.xml`; `embeddings()` returns `present`/`stripped`/`absent`. Validated against LibreOffice and openpyxl. |
 | E5 | Embeddings from Python | done | 2-3 wk | ER | Reach the vectors from Python. `zlsx.embeddings(path)` → present / stripped / absent; vectors as NumPy float32, `valid_mask` for tombstones, provenance recovered on a stripped workbook. |
 | E6 | Embeddings from the command line | planned | 2-3 wk | E5 | Add, prune and strip vectors without writing code. |
-| D1 | Compute formulas | deferred | — | C1 | Deliberately out of scope. Reading and editing is the product. |
+| D1 | Compute formulas | planned | 41 PRs | C1 | Work out what the formulas in a workbook come to, and write the answers back where Excel would. Reversed 2026-08-02 — no longer out of scope. The whole ladder, M-1 to M9d, is in `goal_formula.md`; nobody has started it. |
 | D2 | Author charts | deferred | — | B1 | Deferred on the same reasoning. |
 
 <!-- ROADMAP:END -->
@@ -213,10 +213,16 @@ about an already-decided contract, not an API-shape question.
 
 ## Deliberately not on this list
 
-`D1` (compute formulas) and `D2` (author charts) are `deferred`, not
-backlog. Reading and editing is the product; evaluation and chart
-authoring are different products. They appear here so the question stops
-being re-asked, not because they are queued.
+`D2` (author charts) is `deferred`, not backlog. Reading and editing is
+the product; chart authoring is a different product. It appears here so
+the question stops being re-asked, not because it is queued.
+
+`D1` (compute formulas) **used to sit here on the same reasoning, and no
+longer does.** It was reversed on 2026-08-02 and is now `planned`, with
+its own ladder in `goal_formula.md`. The old argument — "evaluation is a
+different product" — was answered by scoping the evaluator as a bounded,
+oracle-gated tier that refuses rather than half-computes, not by
+loosening the product line.
 
 Loose ends that are not plan items — the stale Homebrew recipe, the
 unpublished Python package, the unverified benchmark columns, the

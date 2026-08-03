@@ -285,7 +285,9 @@ Workbook-vs-Book parity on every fixture.
 - C2b `addImage` on Workbook (separate plan, depends on B1
   iter-wb-2 + C2a).
 - D1 evaluator, D2 chart emit — deferred indefinitely per
-  roadmap.
+  roadmap. *(Historical: true when written. D1 was reversed
+  2026-08-02 and now has its own ladder in `goal_formula.md`;
+  it remains out of scope for B1 itself.)*
 
 ## Estimation
 
