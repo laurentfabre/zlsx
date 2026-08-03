@@ -806,6 +806,42 @@ pub fn build(b: *std.Build) void {
     const formula_decode_tests = b.addTest(.{ .root_module = formula_decode_mod });
     test_step.dependOn(&b.addRunArtifact(formula_decode_tests).step);
 
+    // M4b2: the `CT_CellFormula` attribute inventory, the shared
+    // topology, the translation matrix, and the workbook's calc state.
+    // Its own module for the same reason `decode.zig` has one — the
+    // attribute table and the topology must stay provable without the
+    // symbol layer above them — and it reaches `decode.zig` relatively,
+    // so both end up in the one engine module `pkg/` imports.
+    const formula_calc_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/calc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_calc_mod.addImport("zlsx_refs", refs_mod);
+    formula_calc_mod.addImport("zlsx_xid", xid_mod);
+    formula_calc_mod.addImport("zlsx_casefold", unicode_mod);
+    addOracleFixtures(b, formula_calc_mod);
+    const formula_calc_tests = b.addTest(.{ .root_module = formula_calc_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_calc_tests).step);
+
+    // M4b2: the calc fuzz target (§8.1) — no `<f>` attribute string and
+    // no `<calcPr>` may panic, leak, or classify two ways.
+    const formula_calc_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/calc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .fuzz = true,
+    });
+    formula_calc_fuzz_mod.addImport("zlsx_refs", refs_mod);
+    formula_calc_fuzz_mod.addImport("zlsx_xid", xid_mod);
+    formula_calc_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
+    addOracleFixtures(b, formula_calc_fuzz_mod);
+    const formula_calc_fuzz_tests = b.addTest(.{
+        .root_module = formula_calc_fuzz_mod,
+        .test_runner = fuzz_test_runner,
+    });
+    fuzz_step.dependOn(&b.addRunArtifact(formula_calc_fuzz_tests).step);
+
     // M4b1: the decode fuzz target (§8.1) — no input may panic, leak,
     // or produce a decode that differs between two runs.
     const formula_decode_fuzz_mod = b.createModule(.{

@@ -54,6 +54,7 @@ const coords = @import("zlsx_refs");
 /// accept — and the error would arrive as a type mismatch nobody can
 /// read. One module, one set of types.
 pub const decode = @import("decode.zig");
+pub const calc = @import("calc.zig");
 pub const env = @import("env.zig");
 pub const value = @import("value.zig");
 pub const metadata = @import("metadata.zig");

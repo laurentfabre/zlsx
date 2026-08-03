@@ -259,6 +259,110 @@ pub fn splitSerial(serial: f64) Error!struct { days: i32, fraction: f64 } {
     return .{ .days = @intFromFloat(whole), .fraction = serial - whole };
 }
 
+// ─── the `t="d"` lexical table (§5.7.2, M4b2) ────────────────────
+//
+// `ST_CellType`'s `d` says the `<v>` holds an ISO-8601 date. It does
+// **not** say which ISO-8601 — the grammar has offsets, week dates,
+// ordinal dates, reduced precision, and a `,` decimal separator, and
+// Office implements a small subset of it. §5.7.2 pins that subset to
+// exactly two forms, so the table below is the whole contract:
+//
+//   | form                          | example                    |
+//   |-------------------------------|----------------------------|
+//   | `YYYY-MM-DD`                  | `2026-08-03`               |
+//   | `YYYY-MM-DDTHH:MM:SS[.fff]`   | `2026-08-03T14:30:00.500`  |
+//
+// Everything else refuses, and the two that refuse most usefully are
+// named: a timezone offset (`Z`, `+01:00`) because a serial has no zone
+// to carry it in — reading `2026-08-03T00:00:00+01:00` as midnight local
+// and `…Z` as midnight UTC would make the same instant two serials — and
+// a date outside the active epoch, because `date1904` decides where the
+// range begins and the same text is a different serial under each.
+
+pub const LexicalError = error{
+    /// The text is not one of the two accepted forms.
+    MalformedDate,
+} || Error;
+
+/// The maximum fractional-second digits §5.7.2 accepts. Three, because
+/// that is what Office writes and a serial's binary64 fraction cannot
+/// represent a millisecond exactly anyway — a fourth digit would be a
+/// precision promise this conversion does not keep.
+pub const max_fractional_digits: usize = 3;
+
+/// Parse a `t="d"` `<v>` into a serial under the active epoch.
+///
+/// Returns the serial as `f64` because the second form carries a time of
+/// day, which is a fraction of a day and never an integer.
+pub fn serialFromLexical(system: DateSystem, text: []const u8) LexicalError!f64 {
+    // `YYYY-MM-DD` is 10 bytes and the shortest accepted form; nothing
+    // shorter can be either row of the table.
+    if (text.len < 10) return error.MalformedDate;
+    const year = try fixedDigits(i32, text[0..4]);
+    if (text[4] != '-') return error.MalformedDate;
+    const month = try fixedDigits(u8, text[5..7]);
+    if (text[7] != '-') return error.MalformedDate;
+    const day = try fixedDigits(u8, text[8..10]);
+
+    // `serialFromDate` owns the calendar, including both invented 1900
+    // days and the epoch's lower bound — the range check §5.7.2 asks
+    // for is its `DateOutOfRange`, not a second one written here.
+    const days = try serialFromDate(system, year, month, day);
+
+    const rest = text[10..];
+    if (rest.len == 0) return @floatFromInt(days);
+
+    // Row two: the `T` separator is mandatory, lowercase `t` is not the
+    // spelling Office writes, and a bare space is a different grammar.
+    if (rest[0] != 'T') return error.MalformedDate;
+    const clock = rest[1..];
+    if (clock.len < 8) return error.MalformedDate;
+    const hour = try fixedDigits(u8, clock[0..2]);
+    if (clock[2] != ':') return error.MalformedDate;
+    const minute = try fixedDigits(u8, clock[3..5]);
+    if (clock[5] != ':') return error.MalformedDate;
+    const second = try fixedDigits(u8, clock[6..8]);
+    // 24:00:00 is a legal ISO-8601 spelling of the next midnight and is
+    // not in the table: accepting it would make one serial reachable
+    // from two dates. Leap seconds are likewise absent from the domain.
+    if (hour > 23 or minute > 59 or second > 59) return error.MalformedDate;
+
+    var fraction: f64 = 0;
+    const tail = clock[8..];
+    if (tail.len != 0) {
+        // A trailing `Z` or `±HH:MM` lands here and refuses, which is
+        // the whole point of parsing the tail rather than ignoring it.
+        if (tail[0] != '.') return error.MalformedDate;
+        const digits = tail[1..];
+        if (digits.len == 0 or digits.len > max_fractional_digits) return error.MalformedDate;
+        var scale: f64 = 1;
+        var acc: f64 = 0;
+        for (digits) |c| {
+            if (c < '0' or c > '9') return error.MalformedDate;
+            acc = acc * 10 + @as(f64, @floatFromInt(c - '0'));
+            scale *= 10;
+        }
+        fraction = acc / scale;
+    }
+
+    const secs = @as(f64, @floatFromInt(hour)) * 3600.0 +
+        @as(f64, @floatFromInt(minute)) * 60.0 +
+        @as(f64, @floatFromInt(second)) + fraction;
+    return @as(f64, @floatFromInt(days)) + secs / 86_400.0;
+}
+
+/// Exactly `s.len` ASCII digits, no sign and no leading `+`. Written
+/// rather than reached for through `parseInt` because `parseInt` accepts
+/// `+7` and `-0`, and neither is a field of an ISO-8601 date.
+fn fixedDigits(comptime T: type, s: []const u8) LexicalError!T {
+    var acc: u32 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return error.MalformedDate;
+        acc = acc * 10 + (c - '0');
+    }
+    return std.math.cast(T, acc) orelse error.MalformedDate;
+}
+
 // ─── tests ───────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -471,4 +575,118 @@ test "checkAllAllocationFailures: conversion is allocation-free, and stays so" {
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, H.run, .{});
+}
+
+// ─── the `t="d"` lexical table ───────────────────────────────────
+
+test "t=\"d\": the two accepted forms, and only those two" {
+    // Row one. 2026-08-03 is 46 237 days after 1899-12-30.
+    try testing.expectEqual(
+        @as(f64, @floatFromInt(try serialFromDate(.d1900, 2026, 8, 3))),
+        try serialFromLexical(.d1900, "2026-08-03"),
+    );
+    // Row two, with and without the optional fraction. Midday is
+    // exactly 0.5 of a day, which binary64 holds without error.
+    const midday = try serialFromLexical(.d1900, "2026-08-03T12:00:00");
+    try testing.expectEqual(
+        @as(f64, @floatFromInt(try serialFromDate(.d1900, 2026, 8, 3))) + 0.5,
+        midday,
+    );
+    const with_ms = try serialFromLexical(.d1900, "2026-08-03T12:00:00.500");
+    try testing.expect(@abs(with_ms - (midday + 0.5 / 86_400.0)) < 1e-12);
+    // One and two fractional digits are tenths and hundredths, not a
+    // left-padded count of milliseconds.
+    const tenth = try serialFromLexical(.d1900, "2026-08-03T00:00:00.1");
+    try testing.expect(@abs(tenth - (@as(f64, @floatFromInt(
+        try serialFromDate(.d1900, 2026, 8, 3),
+    )) + 0.1 / 86_400.0)) < 1e-12);
+}
+
+test "t=\"d\": a timezone offset refuses, in every spelling" {
+    // The refusal §5.7.2 names explicitly: a serial has nowhere to put
+    // a zone, so the same instant would become two serials.
+    for ([_][]const u8{
+        "2026-08-03T12:00:00Z",
+        "2026-08-03T12:00:00+01:00",
+        "2026-08-03T12:00:00-05:00",
+        "2026-08-03T12:00:00.500Z",
+        "2026-08-03Z",
+        "2026-08-03+01:00",
+    }) |s| {
+        try testing.expectError(error.MalformedDate, serialFromLexical(.d1900, s));
+    }
+}
+
+test "t=\"d\": everything outside the table refuses" {
+    for ([_][]const u8{
+        "", // nothing
+        "2026-8-3", // unpadded fields
+        "26-08-03", // two-digit year
+        "2026/08/03", // wrong separator
+        "2026-08-03 12:00:00", // space instead of `T`
+        "2026-08-03t12:00:00", // lowercase separator
+        "2026-08-03T12:00", // reduced precision
+        "2026-08-03T12:00:00.", // a point with no digits
+        "2026-08-03T12:00:00.1234", // a fourth fractional digit
+        "2026-08-03T12:00:00,500", // the comma decimal separator
+        "2026-08-03T24:00:00", // legal ISO, two serials for one instant
+        "2026-08-03T12:60:00", // not a clock
+        "2026-08-03T12:00:60", // a leap second
+        "2026-W32-1", // week dates
+        "2026-215", // ordinal dates
+        "+2026-08-03", // a signed year
+        "2026-08-03 ", // trailing whitespace
+        " 2026-08-03", // leading whitespace
+    }) |s| {
+        try testing.expectError(error.MalformedDate, serialFromLexical(.d1900, s));
+    }
+    // Well-formed text that is not a date refuses as a *calendar*
+    // failure, not a lexical one — the two are different diagnoses and
+    // §5.7.2 maps both onto the same pre-mutation refusal.
+    for ([_][]const u8{ "2026-02-30", "2026-13-01", "2026-00-01", "2026-01-00" }) |s| {
+        try testing.expectError(error.DateOutOfRange, serialFromLexical(.d1900, s));
+    }
+}
+
+test "t=\"d\": the range check is the active epoch's, not a second one" {
+    // 1900-02-29 never happened, and is serial 60 under `d1900` for
+    // exactly the reason this module exists — while under `d1904` the
+    // same eight bytes are not a date at all.
+    try testing.expectEqual(@as(f64, 60), try serialFromLexical(.d1900, "1900-02-29"));
+    try testing.expectError(error.DateOutOfRange, serialFromLexical(.d1904, "1900-02-29"));
+    // The lower bound moves with the epoch: 1900-01-01 is serial 1 in
+    // one system and before the other's origin.
+    try testing.expectEqual(@as(f64, 1), try serialFromLexical(.d1900, "1900-01-01"));
+    try testing.expectError(error.DateOutOfRange, serialFromLexical(.d1904, "1900-01-01"));
+    try testing.expectEqual(@as(f64, 0), try serialFromLexical(.d1904, "1904-01-01"));
+    // …and so does the top, though both stop at 9999-12-31.
+    try testing.expectEqual(
+        @as(f64, @floatFromInt(max_serial_1900)),
+        try serialFromLexical(.d1900, "9999-12-31"),
+    );
+    try testing.expectEqual(
+        @as(f64, @floatFromInt(max_serial_1904)),
+        try serialFromLexical(.d1904, "9999-12-31"),
+    );
+    try testing.expectError(error.DateOutOfRange, serialFromLexical(.d1900, "0001-01-01"));
+}
+
+test "t=\"d\": the lexical table round-trips against the calendar" {
+    // Every accepted date must agree with `serialFromDate`, sampled
+    // across both systems and across the 1900 discontinuity.
+    var buf: [32]u8 = undefined;
+    for ([_]DateSystem{ .d1900, .d1904 }) |system| {
+        var serial: i32 = 0;
+        while (serial <= maxSerial(system)) : (serial += 4093) {
+            const d = try dateFromSerial(system, serial);
+            if (d.fictitious == .day_zero) continue; // `1900-01-00` has no lexical form
+            const s = try std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+                d.year, d.month, d.day,
+            });
+            try testing.expectEqual(
+                @as(f64, @floatFromInt(serial)),
+                try serialFromLexical(system, s),
+            );
+        }
+    }
 }
