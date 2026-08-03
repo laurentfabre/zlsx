@@ -7461,11 +7461,15 @@ fn toAsciiLower(c: u8) u8 {
 pub const FormulaRefusal = union(enum) {
     decode: engine.decode.Refusal,
     metadata: engine.metadata.Refusal,
+    /// M4b2: the `<f>` attribute inventory, the shared topology, and
+    /// the workbook's calc state.
+    calc: engine.calc.Refusal,
 
     pub fn planeTwo(self: FormulaRefusal) engine.decode.PlaneTwo {
         return switch (self) {
             .decode => |r| r.planeTwo(),
             .metadata => |r| r.planeTwo(),
+            .calc => |r| r.planeTwo(),
         };
     }
 };
@@ -7496,6 +7500,13 @@ pub const WorkbookEnv = struct {
     meta: engine.metadata.Metadata,
     dialects: engine.metadata.CellDialectResolver,
     fidelity: engine.value.Fidelity,
+    /// §5.7.6, read from `xl/workbook.xml` before any sheet is scanned
+    /// — `date1904` decides what a `t="d"` `<v>` *is*, so it cannot be
+    /// discovered halfway through. Every slice in it borrows the part
+    /// bytes, which the `PartStore` owns for the workbook's lifetime.
+    calc: engine.calc.CalcState,
+    /// `<sheetCalcPr>` per worksheet, in workbook order.
+    sheet_calc: []engine.calc.SheetCalcPr,
 
     /// One coordinate in one layer. `v` is null when the coordinate is
     /// *occupied by something with no value*: an uncached formula, a
@@ -7524,6 +7535,7 @@ pub const WorkbookEnv = struct {
         self.symbols.deinit();
         self.strings.deinit();
         self.meta.deinit(self.allocator);
+        self.calc.deinit(self.allocator);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -7555,12 +7567,25 @@ pub const WorkbookEnv = struct {
         };
         defer if (!keep) meta.deinit(allocator);
 
+        // §5.7.6 before §5.7.1: `date1904` decides what a `t="d"`
+        // `<v>` means, so the calc state is read before the first sheet
+        // rather than alongside them. Its slices borrow the part bytes.
+        const wb_part = (try wb.store.part("xl/workbook.xml")) orelse
+            return Error.MissingWorkbookPart;
+        var calc = switch (try engine.calc.parseCalcState(allocator, wb_part.bytes)) {
+            .ok => |c| c,
+            .refused => |r| return .{ .refused = .{ .calc = r } },
+        };
+        defer if (!keep) calc.deinit(allocator);
+
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer if (!keep) arena.deinit();
         const a = arena.allocator();
 
         const sheets = try a.alloc(Sheet, wb.worksheets.len);
         for (sheets) |*s| s.* = .{};
+        const sheet_calc = try a.alloc(engine.calc.SheetCalcPr, wb.worksheets.len);
+        for (sheet_calc) |*s| s.* = .{};
 
         var builder = engine.Builder.init(allocator, opts.collation);
         defer builder.deinit();
@@ -7588,6 +7613,7 @@ pub const WorkbookEnv = struct {
             var scanned = switch (try engine.decode.scanSheet(allocator, part.bytes, strings.items, .{
                 .limits = sheet_limits,
                 .fidelity = opts.fidelity,
+                .date_system = calc.date_system,
             })) {
                 .ok => |s| s,
                 .refused => |r| return .{ .refused = .{ .decode = r } },
@@ -7595,10 +7621,26 @@ pub const WorkbookEnv = struct {
             defer scanned.deinit();
             cell_budget -= @intCast(scanned.cells.len);
 
+            sheet_calc[idx] = switch (engine.calc.parseSheetCalcPr(part.bytes)) {
+                .ok => |c| c,
+                .refused => |r| return .{ .refused = .{ .calc = r } },
+            };
+
+            // M4b2: the `<f>` attribute inventory and the shared
+            // topology, over the cells the boundary just produced. A
+            // slave's formula is its master's, translated — which is why
+            // this runs before the cells are copied into the layer and
+            // not after.
+            const formulas = switch (try sharedFormulaText(allocator, a, scanned.cells)) {
+                .ok => |f| f,
+                .refused => |r| return .{ .refused = .{ .calc = r } },
+            };
+            defer allocator.free(formulas);
+
             // Stored cells arrive row-major already, so appending keeps
             // the ordering invariant without a sort.
             try sheets[idx].cells.ensureUnusedCapacity(a, scanned.cells.len);
-            for (scanned.cells) |c| {
+            for (scanned.cells, formulas) |c, text| {
                 sheets[idx].cells.appendAssumeCapacity(.{
                     .row = c.row,
                     .col = c.col,
@@ -7606,7 +7648,7 @@ pub const WorkbookEnv = struct {
                     .v = try dupeValue(a, c.input.scalar(), c.input == .uncached),
                     .cm = c.cm,
                     .vm = c.vm,
-                    .formula_text = if (c.formula) |f| try a.dupe(u8, f.text) else null,
+                    .formula_text = text,
                 });
             }
 
@@ -7659,6 +7701,8 @@ pub const WorkbookEnv = struct {
             .meta = meta,
             .dialects = undefined,
             .fidelity = opts.fidelity,
+            .calc = calc,
+            .sheet_calc = sheet_calc,
         };
         out.dialects = .{ .part = &out.meta, .role = .input };
         return .{ .ok = out };
@@ -8121,6 +8165,63 @@ fn decodeStrings(
         .limits = opts.limits,
         .fidelity = opts.fidelity,
     });
+}
+
+const SharedTextResult = union(enum) {
+    /// One entry per cell, in the order `scanSheet` produced them; null
+    /// where the cell has no `<f>`. The outer slice is the caller's to
+    /// free, the strings belong to the model arena.
+    ok: []const ?[]const u8,
+    refused: engine.calc.Refusal,
+};
+
+/// The effective formula text for every cell on one sheet (M4b2).
+///
+/// A shared slave's `<f>` is empty or absent in the file; its formula is
+/// its master's, translated by the slave's (Δrow, Δcol). Doing that here
+/// — between the decode boundary and the layer merge — is what lets
+/// `formulaAt` answer the same way for a slave as for any other cell,
+/// and it is why `xlsx.zig:2099`'s shape-based reader is not in the
+/// path: classification is by attribute.
+///
+/// Every refusal below is a normal return, so nothing may lean on
+/// `errdefer` to release `out` — hence the explicit `keep`.
+fn sharedFormulaText(
+    gpa: Allocator,
+    arena: Allocator,
+    cells: []const engine.decode.SheetCell,
+) Error!SharedTextResult {
+    var shared = switch (try engine.calc.classifySheet(gpa, cells)) {
+        .ok => |s| s,
+        .refused => |r| return .{ .refused = r },
+    };
+    defer shared.deinit();
+
+    const out = try gpa.alloc(?[]const u8, cells.len);
+    var keep = false;
+    defer if (!keep) gpa.free(out);
+    @memset(out, null);
+
+    // One parse per group, not one per slave.
+    var masters = switch (try engine.calc.parseMasters(gpa, shared.groups)) {
+        .ok => |m| m,
+        .refused => |r| return .{ .refused = r },
+    };
+    defer masters.deinit();
+
+    for (shared.entries) |e| {
+        out[e.cell] = switch (e.role) {
+            .slave => |sl| blk: {
+                var t = try masters.translateFor(gpa, sl.group, sl.delta);
+                defer t.deinit();
+                break :blk try arena.dupe(u8, t.text);
+            },
+            else => try arena.dupe(u8, e.formula.text),
+        };
+    }
+
+    keep = true;
+    return .{ .ok = out };
 }
 
 const MetadataResult = union(enum) {
@@ -14942,7 +15043,13 @@ test "checkAllAllocationFailures: building the adapter leaks nothing under OOM" 
                 allocator,
                 "<row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c>" ++
                     "<c><f>A1&amp;\"x\"</f><v>1</v></c>" ++
-                    "<c r=\"D1\" t=\"inlineStr\"><is><r><t>_x0041_</t></r></is></c></row>",
+                    "<c r=\"D1\" t=\"inlineStr\"><is><r><t>_x0041_</t></r></is></c></row>" ++
+                    // M4b2's path: a shared group whose slave's formula
+                    // is allocated by translation, not read from the
+                    // part. Placed below `A1:D3` so the range count
+                    // this test already pins is untouched.
+                    "<row r=\"4\"><c r=\"A4\"><f t=\"shared\" ref=\"A4:A5\" si=\"0\">B4+1</f><v>1</v></c></row>" ++
+                    "<row r=\"5\"><c r=\"A5\"><f t=\"shared\" si=\"0\"></f><v>2</v></c></row>",
             );
             defer allocator.free(sheet);
             var wb = try testWorkbookFromPartsWithNames(
@@ -14976,7 +15083,319 @@ test "checkAllAllocationFailures: building the adapter leaks nothing under OOM" 
             while (try it.next()) |_| n += 1;
             if (n != 5) return error.WrongCount;
             if ((try env.evalEnv().resolveSheet("r&d")) == null) return error.WrongSheet;
+
+            // The slave's formula exists only because translation
+            // allocated it — the part carries an empty `<f>`.
+            const slave = (try env.formulaAt(.{
+                .sheet = engine.env.SheetIndex.fromInt(0),
+                .row = try coords.Row.fromOneBased(5),
+                .col = try coords.Col.fromZeroBased(0),
+            })) orelse return error.MissingFormula;
+            if (!std.mem.eql(u8, slave, "B5+1")) return error.WrongTranslation;
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, H.run, .{io});
+}
+
+// ─── M4b2: calc state and shared formulas, through a real package ─────
+
+/// The `<calcPr>` element as it appears in the part, `<` through `>`,
+/// plus its close tag when it has one. Written here rather than reached
+/// for through the parser so the comparison has an independent left-hand
+/// side.
+fn rawCalcPr(bytes: []const u8) ?[]const u8 {
+    const start = std.mem.indexOf(u8, bytes, "<calcPr") orelse return null;
+    var i = start;
+    var quote: ?u8 = null;
+    while (i < bytes.len) : (i += 1) {
+        const c = bytes[i];
+        if (quote) |q| {
+            if (c == q) quote = null;
+            continue;
+        }
+        switch (c) {
+            '"', '\'' => quote = c,
+            '>' => {
+                if (bytes[i - 1] == '/') return bytes[start .. i + 1];
+                const close = std.mem.indexOfPos(u8, bytes, i, "</calcPr>") orelse return null;
+                return bytes[start .. close + "</calcPr>".len];
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+test "M4b2: every corpus `<calcPr>` round-trips byte-identically" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    var seen: usize = 0;
+    for (corpus_workbooks) |name| {
+        const path = try std.fmt.allocPrint(ta, "tests/corpus/{s}", .{name});
+        defer ta.free(path);
+        std.Io.Dir.cwd().access(io, path, .{}) catch continue;
+
+        var wb = Workbook.open(ta, io, path) catch continue;
+        defer wb.deinit();
+
+        const part = (try wb.store.part("xl/workbook.xml")) orelse continue;
+        var state = switch (try engine.calc.parseCalcState(ta, part.bytes)) {
+            .ok => |s| s,
+            .refused => |r| {
+                std.debug.print("{s}: calc state refused {t}\n", .{ name, r.reason });
+                return error.TestUnexpectedRefusal;
+            },
+        };
+        defer state.deinit(ta);
+
+        const raw = rawCalcPr(part.bytes);
+        try std.testing.expectEqual(raw != null, state.present);
+        if (raw == null) continue;
+        seen += 1;
+
+        var out: std.Io.Writer.Allocating = .init(ta);
+        defer out.deinit();
+        try state.writeCalcPr(&out.writer);
+        std.testing.expectEqualStrings(raw.?, out.written()) catch |e| {
+            std.debug.print("  in {s}\n", .{name});
+            return e;
+        };
+    }
+    // The test must not pass by finding nothing: 22 corpus workbooks
+    // carry a `<calcPr>`, and this list reaches most of them.
+    if (seen < 10) {
+        std.debug.print("only {d} corpus workbooks had a calcPr\n", .{seen});
+        return error.TooFewCalcPrWorkbooks;
+    }
+}
+
+test "M4b2: a shared slave's formula is its master's, translated" {
+    // `tests/corpus/calamine_non_monotonic_si.xlsx` — the workbook that
+    // decides the shape. Its slaves are `<f si="1" t="shared"></f>`,
+    // which `xlsx.zig:2099` drops because it recognizes only the
+    // self-closing form; classified by attribute they all resolve, and
+    // each translates from a master written *before* it with a
+    // non-monotonic `si`.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const path = "tests/corpus/calamine_non_monotonic_si.xlsx";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(ta, io, path);
+    defer wb.deinit();
+
+    var env = try expectBuilt(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    defer env.deinit();
+
+    const cases = [_]struct { a1: []const u8, want: []const u8 }{
+        // The three masters, unchanged.
+        .{ .a1 = "A3", .want = "A2+1" },
+        .{ .a1 = "B3", .want = "B2+2" },
+        .{ .a1 = "C3", .want = "C2+3" },
+        // …and their slaves, one row further down each time.
+        .{ .a1 = "A4", .want = "A3+1" },
+        .{ .a1 = "A5", .want = "A4+1" },
+        .{ .a1 = "A6", .want = "A5+1" },
+        .{ .a1 = "B4", .want = "B3+2" },
+        .{ .a1 = "B6", .want = "B5+2" },
+        .{ .a1 = "C5", .want = "C4+3" },
+        .{ .a1 = "C6", .want = "C5+3" },
+        // A plain formula is untouched by any of it.
+        .{ .a1 = "A2", .want = "A1+1" },
+    };
+    for (cases) |c| {
+        const ref = try coords.parseCell(c.a1, .{});
+        const got = try env.formulaAt(.{
+            .sheet = engine.env.SheetIndex.fromInt(0),
+            .row = ref.row,
+            .col = ref.col,
+        });
+        if (got == null) {
+            std.debug.print("{s}: no formula\n", .{c.a1});
+            return error.MissingFormula;
+        }
+        std.testing.expectEqualStrings(c.want, got.?) catch |e| {
+            std.debug.print("  at {s}\n", .{c.a1});
+            return e;
+        };
+    }
+}
+
+test "M4b2: a shared group with no references translates to itself" {
+    // `tests/corpus/openxlsx_loadExample.xlsx` shares `RAND()` across a
+    // 2-D `ref="I2:N5"` with `ca="1"` on every cell. Nothing in the body
+    // moves, so every slave reads back as the master — which is the
+    // property that keeps translation from inventing changes.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const path = "tests/corpus/openxlsx_loadExample.xlsx";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(ta, io, path);
+    defer wb.deinit();
+
+    var env = try expectBuilt(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    defer env.deinit();
+
+    // `xl/worksheets/sheet2.xml` is the sheet named `testing` (rId2).
+    const sheet = (try wb.sheetByName("testing")) orelse return error.SheetNotFound;
+    for ([_][]const u8{ "I2", "J2", "N2", "I5", "N5" }) |a1| {
+        const ref = try coords.parseCell(a1, .{});
+        const got = try env.formulaAt(.{
+            .sheet = engine.env.SheetIndex.fromInt(sheet.sheet_idx),
+            .row = ref.row,
+            .col = ref.col,
+        });
+        std.testing.expectEqualStrings("RAND()", got orelse "") catch |e| {
+            std.debug.print("  at {s}\n", .{a1});
+            return e;
+        };
+    }
+}
+
+/// The corpus workbooks the decode boundary refuses, and why. Named
+/// rather than tolerated: a build that starts refusing a workbook absent
+/// from this list is a regression, and one that stops refusing a
+/// workbook on it is a silently loosened contract.
+const corpus_expected_refusals = [_]struct {
+    name: []const u8,
+    reason: engine.decode.Refusal.Reason,
+    why: []const u8,
+}{
+    .{
+        .name = "poi_poc_shared_strings.xlsx",
+        .reason = .bad_attribute_value,
+        .why = "`<row r=\"0\">` — out of the grid. The reader skips such a row; " ++
+            "an engine that writes values back cannot (M4b1 decision 3).",
+    },
+};
+
+test "M4b2: every corpus workbook builds with the topology in the path" {
+    // The regression this guards: attribute-based classification and
+    // per-slave translation now run on every sheet of every build, so a
+    // workbook that used to model must still model — and the handful
+    // that legitimately refuse must refuse for the reason they always
+    // did, on the decode half rather than this row's.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    for (corpus_workbooks) |name| {
+        const path = try std.fmt.allocPrint(ta, "tests/corpus/{s}", .{name});
+        defer ta.free(path);
+        std.Io.Dir.cwd().access(io, path, .{}) catch continue;
+
+        var wb = Workbook.open(ta, io, path) catch continue;
+        defer wb.deinit();
+
+        switch (try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation })) {
+            .ok => |e| {
+                var env = e;
+                defer env.deinit();
+                // The calc state travelled with it, and so did one
+                // `<sheetCalcPr>` slot per worksheet.
+                try std.testing.expectEqual(wb.worksheets.len, env.sheet_calc.len);
+                try std.testing.expect(env.calc.full_precision);
+            },
+            .refused => |r| {
+                var expected = false;
+                for (corpus_expected_refusals) |e| {
+                    if (!std.mem.eql(u8, e.name, name)) continue;
+                    expected = true;
+                    switch (r) {
+                        .decode => |d| try std.testing.expectEqual(e.reason, d.reason),
+                        else => return error.WrongRefusalHalf,
+                    }
+                }
+                if (!expected) {
+                    std.debug.print("{s}: refused {any}\n", .{ name, r });
+                    return error.TestUnexpectedRefusal;
+                }
+            },
+        }
+    }
+}
+
+test "M4b2: the calc state decides what a `t=\"d\"` cell means" {
+    // `date1904` is read from `xl/workbook.xml` before the first sheet
+    // is scanned, which is the only ordering under which the same eight
+    // bytes cannot mean two different serials.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const body = "<row r=\"1\"><c r=\"A1\" t=\"d\"><v>2026-08-03</v></c></row>";
+    const sheet = try testSheetXml(ta, body);
+    defer ta.free(sheet);
+
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "Sheet1", .body = sheet }}, null);
+    defer wb.deinit();
+
+    var env = try expectBuilt(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    defer env.deinit();
+
+    // The fresh test workbook writes no `<workbookPr>`, so it is the
+    // 1900 system — the default every workbook without one has.
+    try std.testing.expectEqual(engine.calc.DateSystem.d1900, env.calc.date_system);
+    const v = try env.evalEnv().cellValue(.{
+        .sheet = engine.env.SheetIndex.fromInt(0),
+        .row = try coords.Row.fromOneBased(1),
+        .col = try coords.Col.fromOneBased(1),
+    });
+    const want: f64 = @floatFromInt(
+        try engine.calc.dates.serialFromDate(.d1900, 2026, 8, 3),
+    );
+    try std.testing.expectEqual(want, v.number);
+}
+
+test "M4b2: a broken shared topology refuses the build, typed" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // A slave whose `si` names no master. The reader would drop the
+    // cell; an engine that writes values back cannot.
+    const body =
+        "<row r=\"1\"><c r=\"A1\"><f t=\"shared\" ref=\"A1:A2\" si=\"0\">B1+1</f></c></row>" ++
+        "<row r=\"2\"><c r=\"A2\"><f t=\"shared\" si=\"9\"/></c></row>";
+    const sheet = try testSheetXml(ta, body);
+    defer ta.free(sheet);
+
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "Sheet1", .body = sheet }}, null);
+    defer wb.deinit();
+
+    const refusal = try expectRefused(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    switch (refusal) {
+        .calc => |r| {
+            try std.testing.expectEqual(engine.calc.Refusal.Reason.shared_unknown_si, r.reason);
+            try std.testing.expectEqual(@as(u32, 2), r.cell.?.row);
+        },
+        else => return error.WrongRefusalHalf,
+    }
+    try std.testing.expectEqual(
+        engine.decode.PlaneTwo.FormulaMalformedInput,
+        refusal.planeTwo(),
+    );
+
+    // …and a data-table formula refuses on its own plane.
+    const dt_body = "<row r=\"1\"><c r=\"A1\"><f dt2D=\"1\" r1=\"B1\">TABLE(B1,C1)</f></c></row>";
+    const dt_sheet = try testSheetXml(ta, dt_body);
+    defer ta.free(dt_sheet);
+    var dt_wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "Sheet1", .body = dt_sheet }}, null);
+    defer dt_wb.deinit();
+    const dt = try expectRefused(try buildEnvOrRefusal(ta, &dt_wb, .{ .collation = test_collation }));
+    try std.testing.expectEqual(
+        engine.decode.PlaneTwo.FormulaDataTableUnsupported,
+        dt.planeTwo(),
+    );
 }

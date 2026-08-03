@@ -124,12 +124,12 @@ Verified 2026-08-02 on `main` @ `07c99f0`:
 |---|---|---|
 | Tokenizer round-trip lossless; `Table1[A1]` mis-tokenized; **identifier predicate ASCII-only; error whitelist closed** | `tokenizer.zig:77,266-274,309-339` | M1a: correction fixtures; **Unicode identifier grammar** (sheet/defined names are not ASCII-only) + **extensible error-literal rule** (unknown `#…!`/`#…?` lexemes tokenize as `.error_lit`, byte-preserved) with astral/combining/unknown-error round-trips |
 | Many A1/ref helpers, mixed bases | rewriter; `xlsx.zig:241,2564`; writer; `workbook.zig:381,391,5396`; `sheet_plan.zig`; `sheet_edit.zig:117,1955`; `table_edit.zig:354`; `cli.zig:1065,4392` | M0: rg-derived consolidation + typed `SheetIndex`/`Row1`/`Col0` |
-| Shared slaves recognized only self-closing; early slaves dropped | `xlsx.zig:2099` | M4b2: attribute-based classification + sheet-wide topology validation |
-| Formula text + identifiers XML-escaped; **`<f>` attributes discarded by the typed parser** | `sheet_xml.zig:489-535`, `workbook_xml.zig:24,58` | M4b1 decode boundary + decoded symbol layer; M4b2 **complete `CT_CellFormula` attribute inventory** (§5.7.2) |
+| Shared slaves recognized only self-closing; early slaves dropped | `xlsx.zig:2099` | **CLOSED (M4b2)**: classification is by attribute (`t="shared"` + `ref` = master, without = slave), sheet-wide topology validated, slaves translated. `calamine_non_monotonic_si.xlsx` writes `<f si="1" t="shared"></f>` — the shape the reader drops |
+| Formula text + identifiers XML-escaped; **`<f>` attributes discarded by the typed parser** | `sheet_xml.zig:489-535`, `workbook_xml.zig:24,58` | M4b1 decode boundary + decoded symbol layer; **CLOSED (M4b2)**: the complete `CT_CellFormula` inventory is a table `classifyFormula` reads, one fixture per row, unknown attribute refuses (§5.7.2) |
 | Scanners literal-match `<sheetData>/<row>/<c>` | `sheet_xml.zig:421` | Namespace preflight refusal (M4b1) |
 | Delta model can't carry formula+cache; **`Writer.save` is path-only; its archive inputs are private** | `workbook.zig:353,5410,6206`; `writer.zig:484-512,940` | `ResolvedSheet` (§5.7.3); **`Writer.saveToOwnedBuffer(allocator, io)`** producer API (M5c; allocator-first per `AGENTS.md:194`) — `pkg/fresh_emit.zig:107` alone cannot serve an external orchestrator |
 | `PartStore.open` path-only, retains `io`; calcChain rels owner-relative (`Target="calcChain.xml"`), `removeRelationshipsTo` matches absolute | `store.zig:105-144,1510`; corpus `phpoi_test1.xlsx` | `Workbook.openBuffer(allocator, io, bytes)` — borrow ends at return, store copies (Book precedent); rel-target resolution relative to `xl/workbook.xml` (M5b2) |
-| `calcPr` partial; `date1904` absent from typed view; CV extension unparsed | `workbook_xml.zig:89,286-318` | M4b2 full calc-state (§5.7.6) |
+| `calcPr` partial; `date1904` absent from typed view; CV extension unparsed | `workbook_xml.zig:89,286-318` | **CLOSED (M4b2)**: complete `CT_CalcPr`, `sheetCalcPr`, `date1904` → `t="d"`'s epoch, extensions preserved byte-exact; every corpus `<calcPr>` round-trips (§5.7.6). CV2's feature name stays unpinned until M7b's byte-diff |
 | `cm`/`vm` = one-based metadata indexes; no parser; **spec-vs-Office collection resolution differs** | MS-OE376 | M4a typed reader; **transition rows name the exact collection (cellMetadata vs valueMetadata), record type, indexing, and missing-record behavior — pinned empirically by byte-diffed Excel references at M7b**, not assumed from the base schema |
 | Tables can carry `calculatedColumnFormula`/totals formulas | `table_edit.zig:39` | M4b3 producer inventory + refusal when member cells lack `<f>` |
 | Cached text may need C0 controls; emitters reject forbidden XML bytes | `sheet_plan.zig:1153` | ST_Xstring codec (M4f) |
@@ -1575,6 +1575,112 @@ written down.
     rels part and then replaces it, the same two-step `Workbook.empty` +
     `addSheet` takes.
 
+**M4b2 decisions (shipped 2026-08-04).** Fourteen points, in
+`src/formula/calc.zig` (the attribute inventory, the topology, the
+translation matrix, the calc state), `serial_date.zig` (the `t="d"`
+table), `decode.zig` (the epoch plumbing) and the adapter. The corpus
+decided five of them.
+
+1. **One corpus workbook decided the whole classification rule.**
+   `tests/corpus/calamine_non_monotonic_si.xlsx` writes its shared
+   slaves as `<f si="1" t="shared"></f>` — an open/close pair with an
+   empty body, not the self-closing form `xlsx.zig:2099` recognizes — so
+   a shape-based reader loses nine of that workbook's twelve shared
+   cells and recalculates them as blanks. The rule is the schema's:
+   **`t="shared"` with `ref` is a master, without `ref` is a slave**,
+   whatever shape the element has. The same file writes attributes in
+   the order `ref si t`, so order-independence is corpus-decided too.
+2. **`si` is a key, not an ordinal, and `ref` is not a topology gate.**
+   Same workbook: masters appear in the order 1, 0, 2, and
+   `ref="A3:A7"` names two rows that have no cell at all. So nothing
+   assumes `si` counts up, and a slave is never checked against its
+   master's declared range. What *is* checked is order — a master must
+   precede its slaves sheet-wide, because a slave is defined by
+   translating a formula it has not been given yet.
+3. **Two failure modes, two passes.** A slave whose master appears
+   *later* and a slave whose `si` names no master are different
+   statements about a file, and a single pass could only report the
+   second. Masters are collected first; slaves are classified against
+   the finished set.
+4. **The master is the single source of truth for a slave's formula.**
+   ECMA-376 requires a slave's body, when written, to *be* the
+   translated formula, so the two agree by construction and either would
+   be conformant. The master wins because that is one parse per group
+   rather than one per cell — `Masters` exists for exactly that — and
+   the slave's body is preserved and read by nothing.
+5. **Translation is an AST copy, and a reference operand collapses
+   whole.** `rewriter.zig` shifts text and defers full rows and columns
+   to M10+; a slave cannot defer, so translation copies the tree, shifts
+   every *relative* half by (Δrow, Δcol), and prints. An endpoint that
+   leaves the grid takes its entire operand to `#REF!` — never
+   `#REF!:B2`, which is a spelling the format has no token for
+   (MS-XLS `PtgRefErr`/`PtgAreaErr`). A qualifier survives its target:
+   `Sheet1!#REF!`, which is what Excel writes.
+6. **Collapse is a consequence of *this* translation, tracked as one.**
+   A `#REF!` the file already carried is left where it is, so
+   `translate(ast, 0)` is provably the identity — asserted on every
+   fixture in the matrix, byte for byte. Without the distinction, a
+   formula nothing moved would come back rewritten.
+7. **Children always have lower indices than their parents**, so one
+   ascending pass over the node array *is* a post-order walk and the
+   collapse rule sees its operands already decided. Asserted rather than
+   assumed (`assertChildrenBelow`).
+8. **The differential test needed a genuinely independent translator.**
+   The reference implementation scans the formula *text* for A1
+   references where `translate` walks a tree; they share nothing but
+   `coords`. It is deliberately naive, so the generator emits only
+   formulas it can read and only deltas that stay on the grid — every
+   construct it cannot handle (quoted sheet names, spills, structured
+   references, the off-grid collapse) has a fixture in the matrix
+   instead. 2 000 randomized cases, and the identity case doubles as a
+   print round-trip.
+9. **`<calcPr>` preserves unknown attributes where `<f>` refuses
+   them.** The opposite policy, deliberately: an unread `<f>` attribute
+   can change what a cell's formula *is*, and an unread `<calcPr>`
+   attribute cannot change what any cell contains. Refusing the latter
+   would refuse files that open everywhere. A *known* attribute with an
+   unknown value still refuses — an unclassified `calcMode` decides
+   whether the workbook recalculates.
+10. **The round-trip is reconstructed, never echoed.** `writeCalcPr`
+    rebuilds the element from the parsed attribute region and the
+    open/close form, so the corpus test proves the parse *kept* what it
+    needs rather than proving `memcpy` works. The two shapes that catch
+    a naive writer are both in the corpus: `<calcPr/>` with no
+    attributes at all, and `wdi_excel.xlsx`'s `<calcPr calcId="40001" />`
+    with a space before the `/>`.
+11. **The `t="d"` table lives in `serial_date.zig`, not with the calc
+    state.** It needs the epoch, which is calc state, but putting it in
+    `calc.zig` would have made `decode.zig` import `calc.zig` while
+    `calc.zig` imports `decode.zig`. `serial_date` already owns the
+    calendar including both invented 1900 days, and its
+    `DateOutOfRange` *is* the range check §5.7.2 asks for — a second one
+    would have been a second answer. `decode.Options` gains
+    `date_system`, and the adapter reads `<workbookPr date1904>` **before
+    the first sheet is scanned**, which is the only ordering under which
+    the same eight bytes cannot mean two serials.
+12. **`t="d"` with no `<v>` joins `b` and `e`.** A `t` that promises a
+    value the cell does not have is `missing_cached_value`, and the
+    uncached rule still wins first: a formula cell with no `<v>` is
+    uncached whatever `t` says. `date_cell_unsupported` is gone; its
+    successor `bad_date_cache` is a malformed-input refusal, not an
+    unsupported-construct one, because the construct is now supported.
+13. **CV2's marker is left unpinned on purpose.** The calcFeatures
+    extension is recognized by URI, its feature names are collected, and
+    every `<ext>` is preserved byte-exact — but which feature name
+    carries §5.4d's compatibility version is pinned the way §4 pins
+    every Office-vs-schema difference: from a byte-diffed Excel
+    reference (M7b). A name absent from the table leaves `text_compat`
+    at CV1, §5.4d's documented default, so nothing is lost and nothing
+    is invented; `textCompatOf` takes the table as a parameter so the
+    mapping is tested today against a synthetic row.
+14. **`classifySheet` leaked its first list when the second failed**,
+    found by this row's allocation-failure sweep: two `toOwnedSlice`
+    calls inside one struct literal have no `errdefer` between them, and
+    the first list is already owned by nothing by the time the second
+    fails. Ownership now moves one list at a time. The same shape is why
+    every refusal path in this file releases explicitly — a refusal is a
+    normal return, so `errdefer` never fires (M4b1 decision 13).
+
 ### 5.9 Name & identifier resolution
 
 Call position → strip layered prefixes → registry; unregistered →
@@ -1639,7 +1745,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M3b** | serial_date + criteria + RNG (PRNG KATs) + RunInputs + counted-allocator limits | Boundary oracles; criteria fuzz |
 | **M4a** | metadata.xml typed reader + cm/vm resolution + dialect primitives; **every record type classified — only `XLDAPR` interpreted; `XLRICHVALUE`/unknown value metadata on any input or result cell → pre-mutation typed refusal** | Fixtures incl. rich-value refusal; fuzz |
 | **M4b1** | EvalEnv adapter + decode boundary (**decoding split by carrier class (corrected)**: FORMULA carriers — `<f>` bodies, defined-name bodies, table formulas — **XML-entity decoding ONLY** (ST_Xstring does NOT apply; literal `"_x0041_"` in a formula survives byte-exact, round-trip oracle); STRING carriers — SST, inline, `t="str"` `<v>` — XML-entity THEN ST_Xstring, RICH strings concatenating all visible `<r>/<t>` runs in document order, `<rPh>` excluded (inline reader returns first `<t>` only, `sheet_xml.zig:552-563`; SST rich `sst_xml.zig:56-66`); authored STRING output ST_Xstring-encodes; authored FORMULA output XML-escapes only (raw borrowed XML today: `sheet_xml.zig:522`, `workbook_xml.zig:61`); authored formula text **XML-escapes ONLY — no ST_Xstring stage** (string carriers alone use ST_Xstring); authored-formula tests prove literal `_x0041_` stays literal; fixtures with `_x005F_`, encoded controls, and entity escapes in formulas AND names — `_xHHHH_`, escaped `_x005F_`, C0 controls, across SST/inline/`t="str"`; the SST view decodes XML entities only today, `sst_xml.zig:174-193`) + **input cell-type contract** (§5.7.2) + **implicit-coordinate reconstruction** (a `<c>` without `r` takes the column after the preceding cell — Office semantics, MS-OE376 §2.1.624; the parser SKIPS such cells today, `sheet_xml.zig:507`; fixtures: first-cell-no-r, gaps, formulas, out-of-grid) + symbol layer + namespace preflight | Decode/`'R&D'`/prefixed fixtures |
-| **M4b2** | Full calc-state parse + **CT_CellFormula attribute inventory** + shared classification + topology validation + translation | Slave-shape + topology matrix; attribute fixtures |
+| **M4b2** ✅ | Full calc-state parse (`CT_CalcPr` complete, `sheetCalcPr`, `date1904`, extensions byte-exact, `fullPrecision="0"` refuses) + **CT_CellFormula attribute inventory** (13 rows, one fixture each, unknown refuses) + **attribute-based** shared classification + sheet-wide topology validation + **AST copy-translation** (relative halves by (Δrow,Δcol); off-grid collapses the whole operand to `#REF!`) + `t="d"`'s normative lexical table | Slave-shape + topology matrix; attribute fixtures; 2 000-case randomized differential vs an independent translator; corpus `<calcPr>` byte round-trip; attribute/calc-state fuzz |
 | **M4b3** | Name resolution + table producers + 3D matrix + cache-based `evaluate` | Site semantics; opaque names; 3D fixtures |
 | **M4c** | F1a-1 (20: operators; IF, AND, OR, NOT, IFERROR, IFNA, IFS, SWITCH; ISBLANK, ISNUMBER, ISTEXT, ISERROR, ISERR, ISNA, ISLOGICAL, NA, N, T; **TRUE, FALSE** — added at M3a2, see the decisions block) | Oracle-first |
 | **M4d** | F1a-2 (~17: ABS, ROUND, ROUNDUP, ROUNDDOWN, INT, TRUNC, MOD, POWER, SQRT, EXP, LN, LOG, LOG10, SIGN, PI, RAND, RANDBETWEEN) + multi-callsite/lazy-branch draw KATs | Oracle-first; KATs |

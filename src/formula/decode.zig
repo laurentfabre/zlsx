@@ -69,6 +69,7 @@ const coords = @import("zlsx_refs");
 const value = @import("value.zig");
 const parser = @import("parser.zig");
 const tokenizer = @import("tokenizer.zig");
+const serial_date = @import("serial_date.zig");
 
 /// §10's plane-2 taxonomy has exactly one home (`metadata.zig:75-79`
 /// pays the same import for the same reason).
@@ -169,10 +170,11 @@ pub const Refusal = struct {
         /// A `t` outside `ST_CellType`'s enumeration. Never a silent
         /// number.
         unknown_cell_type,
-        /// `t="d"`. Valid, and its lexical table lands at M4b2 with
-        /// `date1904`; until then it refuses rather than being read as
-        /// something else.
-        date_cell_unsupported,
+        /// A `t="d"` `<v>` outside §5.7.2's normative lexical table —
+        /// not one of the two accepted ISO-8601 forms, carrying a
+        /// timezone offset, or naming a date the active epoch cannot
+        /// express (M4b2, `serial_date.serialFromLexical`).
+        bad_date_cache,
         /// A `<v>` that is not a number under §5.4's invariant grammar,
         /// or is one that binary64 cannot hold.
         bad_number_cache,
@@ -225,6 +227,7 @@ pub const Refusal = struct {
             .bad_number_cache,
             .bad_boolean_cache,
             .bad_error_cache,
+            .bad_date_cache,
             .missing_cached_value,
             .shared_string_index_out_of_range,
             .malformed_cell_ref,
@@ -239,7 +242,6 @@ pub const Refusal = struct {
             .unsupported_namespace,
             .unknown_namespace,
             .unencodable_formula_char,
-            .date_cell_unsupported,
             .unknown_builtin_name,
             .lambda_parameter_name,
             => .FormulaUnsupportedConstruct,
@@ -272,6 +274,11 @@ pub const Limits = struct {
 pub const Options = struct {
     limits: Limits = .{},
     fidelity: value.Fidelity = .excel,
+    /// Which epoch a `t="d"` `<v>` is read against (§5.7.2). Workbook-
+    /// derived and never caller-writable at the public layer — the
+    /// adapter reads it from `<workbookPr date1904>` — because the same
+    /// eight bytes are a different serial under each system.
+    date_system: serial_date.DateSystem = .d1900,
 };
 
 // ─── carrier classes ─────────────────────────────────────────────
@@ -1289,6 +1296,7 @@ pub fn classifyCell(
     raw: RawCell,
     strings: []const []const u8,
     fidelity: value.Fidelity,
+    date_system: serial_date.DateSystem,
 ) Classified {
     const t = CellType.fromAttr(raw.type_attr) orelse
         return .{ .refused = .unknown_cell_type };
@@ -1307,8 +1315,9 @@ pub fn classifyCell(
             // have been: an empty styled cell.
             .number, .shared_string, .formula_string => .{ .ok = .blank },
             // A `t` that promises a value the cell does not have.
-            .boolean, .error_value => .{ .refused = .missing_cached_value },
-            .date => .{ .refused = .date_cell_unsupported },
+            // `d` joins `b` and `e`: a `t` that promises a value the
+            // cell does not have.
+            .boolean, .error_value, .date => .{ .refused = .missing_cached_value },
             .inline_string => unreachable,
         };
     };
@@ -1340,7 +1349,16 @@ pub fn classifyCell(
             const e = errorFromSpelling(v) orelse break :blk .{ .refused = .bad_error_cache };
             break :blk .{ .ok = .{ .err = e } };
         },
-        .date => .{ .refused = .date_cell_unsupported },
+        // §5.7.2's normative lexical table, under the active epoch.
+        // Both failure shapes — a form outside the table and a date the
+        // epoch cannot express — are one pre-mutation refusal here; the
+        // two are distinguishable in `serial_date`, and nothing above
+        // this line acts on the difference.
+        .date => blk: {
+            const serial = serial_date.serialFromLexical(date_system, v) catch
+                break :blk .{ .refused = .bad_date_cache };
+            break :blk .{ .ok = .{ .number = serial } };
+        },
         .inline_string => unreachable,
     };
 }
@@ -1868,7 +1886,7 @@ const SheetWalk = struct {
             .has_formula = self.has_f,
             .v = v_raw,
             .is = is_text,
-        }, self.strings, self.opts.fidelity);
+        }, self.strings, self.opts.fidelity, self.opts.date_system);
 
         const input = switch (classified) {
             .refused => |reason| {
@@ -2499,7 +2517,7 @@ test "contract: malformed caches refuse, and never seed a zero" {
         .{ .xml = "<row r=\"1\"><c r=\"A1\" t=\"e\"><v></v></c></row>", .reason = .bad_error_cache },
         .{ .xml = "<row r=\"1\"><c r=\"A1\" t=\"e\"/></row>", .reason = .missing_cached_value },
         .{ .xml = "<row r=\"1\"><c r=\"A1\" t=\"s\"><v>7</v></c></row>", .reason = .shared_string_index_out_of_range },
-        .{ .xml = "<row r=\"1\"><c r=\"A1\" t=\"d\"><v>2026-08-03</v></c></row>", .reason = .date_cell_unsupported },
+        .{ .xml = "<row r=\"1\"><c r=\"A1\" t=\"d\"><v>2026-08-03T12:00:00Z</v></c></row>", .reason = .bad_date_cache },
     };
     for (cases) |c| {
         var buf: [512]u8 = undefined;
@@ -2717,6 +2735,112 @@ test "checkAllAllocationFailures: decoding leaks nothing under OOM" {
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, H.run, .{});
+}
+
+// ─── `t="d"` (§5.7.2's normative lexical table, M4b2) ────────────
+
+fn scanWithEpoch(xml: []const u8, system: serial_date.DateSystem) !SheetResult {
+    return scanSheet(testing.allocator, xml, &.{}, .{ .date_system = system });
+}
+
+test "t=\"d\": the two accepted forms become serials under the active epoch" {
+    var sheet = switch (try scanWithEpoch(sheetXml(
+        \\<row r="1"><c r="A1" t="d"><v>2026-08-03</v></c><c r="B1" t="d"><v>2026-08-03T12:00:00</v></c><c r="C1" t="d"><v>1900-02-29</v></c></row>
+    ), .d1900)) {
+        .ok => |s| s,
+        .refused => return error.TestUnexpectedRefusal,
+    };
+    defer sheet.deinit();
+
+    const day: f64 = @floatFromInt(try serial_date.serialFromDate(.d1900, 2026, 8, 3));
+    try testing.expectEqual(day, sheet.cells[0].input.number);
+    try testing.expectEqual(day + 0.5, sheet.cells[1].input.number);
+    // The invented day is a serial like any other, and only in 1900.
+    try testing.expectEqual(@as(f64, 60), sheet.cells[2].input.number);
+}
+
+test "t=\"d\": `date1904` reads the same bytes as a different serial" {
+    // Which is exactly why the epoch is workbook-derived and not a
+    // caller option at the public layer (§5.5).
+    for ([_]serial_date.DateSystem{ .d1900, .d1904 }) |system| {
+        var sheet = switch (try scanWithEpoch(sheetXml(
+            \\<row r="1"><c r="A1" t="d"><v>2026-08-03</v></c></row>
+        ), system)) {
+            .ok => |s| s,
+            .refused => return error.TestUnexpectedRefusal,
+        };
+        defer sheet.deinit();
+        const want: f64 = @floatFromInt(try serial_date.serialFromDate(system, 2026, 8, 3));
+        try testing.expectEqual(want, sheet.cells[0].input.number);
+    }
+}
+
+test "t=\"d\": a timezone offset, a bad form, and a bad date all refuse" {
+    for ([_][]const u8{
+        "2026-08-03T12:00:00Z",
+        "2026-08-03T12:00:00+01:00",
+        "2026-08-03 12:00:00",
+        "03/08/2026",
+        "2026-02-30",
+        "",
+    }) |v| {
+        var doc: std.ArrayListUnmanaged(u8) = .empty;
+        defer doc.deinit(testing.allocator);
+        try doc.appendSlice(testing.allocator, "<worksheet" ++ ns_attr ++
+            "><sheetData><row r=\"1\"><c r=\"A1\" t=\"d\"><v>");
+        try doc.appendSlice(testing.allocator, v);
+        try doc.appendSlice(testing.allocator, "</v></c></row></sheetData></worksheet>");
+        switch (try scanWithEpoch(doc.items, .d1900)) {
+            .ok => |s| {
+                var sheet = s;
+                sheet.deinit();
+                std.debug.print("accepted `{s}`\n", .{v});
+                return error.TestExpectedRefusal;
+            },
+            .refused => |r| {
+                try testing.expectEqual(Refusal.Reason.bad_date_cache, r.reason);
+                try testing.expectEqual(PlaneTwo.FormulaMalformedInput, r.planeTwo());
+            },
+        }
+    }
+    // A date the 1904 epoch cannot express refuses under it and is a
+    // serial under the other.
+    switch (try scanWithEpoch(sheetXml(
+        \\<row r="1"><c r="A1" t="d"><v>1900-02-29</v></c></row>
+    ), .d1904)) {
+        .ok => |s| {
+            var sheet = s;
+            sheet.deinit();
+            return error.TestExpectedRefusal;
+        },
+        .refused => |r| try testing.expectEqual(Refusal.Reason.bad_date_cache, r.reason),
+    }
+}
+
+test "t=\"d\": the uncached rule still wins, and a stored cell still needs a value" {
+    // §5.7.2's normative precedence is unchanged by the lexical table:
+    // a formula cell with no `<v>` is uncached whatever `t` says.
+    var sheet = switch (try scanWithEpoch(sheetXml(
+        \\<row r="1"><c r="A1" t="d"><f>TODAY()</f></c></row>
+    ), .d1900)) {
+        .ok => |s| s,
+        .refused => return error.TestUnexpectedRefusal,
+    };
+    defer sheet.deinit();
+    try testing.expectEqual(InputCell.uncached, sheet.cells[0].input);
+
+    // A *stored* `t="d"` with no `<v>` has nothing to interpret, the
+    // same way `t="b"` and `t="e"` do not.
+    switch (try scanWithEpoch(sheetXml(
+        \\<row r="1"><c r="A1" t="d"/></row>
+    ), .d1900)) {
+        .ok => |s| {
+            var sh = s;
+            sh.deinit();
+            return error.TestExpectedRefusal;
+        },
+        .refused => |r| try testing.expectEqual(Refusal.Reason.missing_cached_value, r.reason),
+    }
 }
 
 // ─── fuzz (§8.1: the decode boundary) ────────────────────────────
