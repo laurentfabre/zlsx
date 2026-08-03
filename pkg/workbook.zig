@@ -35,6 +35,7 @@ const drawing_emit = @import("drawing_emit.zig");
 const embedding_part = @import("embedding_part.zig");
 const recovery_record = @import("recovery_record.zig");
 const sheet_edit = @import("sheet_edit.zig");
+const coords = @import("zlsx_refs");
 const drawing_edit = @import("drawing_edit.zig");
 const vml_edit = @import("vml_edit.zig");
 const table_edit = @import("table_edit.zig");
@@ -393,58 +394,32 @@ pub const CellRef = struct {
 /// any malformed input (no letters, no digits, leading-zero row,
 /// out-of-range col [> Excel's 16384 limit] / row [> 1048576]).
 pub fn parseA1Ref(ref: []const u8) Error!CellRef {
-    if (ref.len < 2) return error.InvalidCellRef;
-    var i: usize = 0;
-    var col: u32 = 0;
-    while (i < ref.len) : (i += 1) {
-        const c = ref[i];
-        const upper: u8 = if (c >= 'a' and c <= 'z') c - 32 else c;
-        if (upper < 'A' or upper > 'Z') break;
-        // col := col*26 + (upper - 'A' + 1); trapping arithmetic
-        // catches overflow on absurd inputs ("AAAAAAAAAA").
-        const inc: u32 = @as(u32, upper - 'A') + 1;
-        col = std.math.mul(u32, col, 26) catch return error.InvalidCellRef;
-        col = std.math.add(u32, col, inc) catch return error.InvalidCellRef;
-    }
-    if (i == 0) return error.InvalidCellRef; // no letters
-    if (col > 16384) return error.InvalidCellRef; // Excel max column
-    if (i == ref.len) return error.InvalidCellRef; // no digits
-    if (ref[i] == '0') return error.InvalidCellRef; // leading zero forbidden
-    var row: u32 = 0;
-    while (i < ref.len) : (i += 1) {
-        const c = ref[i];
-        if (c < '0' or c > '9') return error.InvalidCellRef;
-        const dig: u32 = c - '0';
-        row = std.math.mul(u32, row, 10) catch return error.InvalidCellRef;
-        row = std.math.add(u32, row, dig) catch return error.InvalidCellRef;
-    }
-    if (row == 0 or row > 1048576) return error.InvalidCellRef;
-    return .{ .row = row, .col = col };
+    // M0 adapter over `zlsx_refs`. Policy preserved exactly: this is a
+    // user-facing entry point, so letters are case-insensitive and a
+    // leading-zero row is rejected.
+    const cell = coords.parseCell(ref, .{
+        .case = .insensitive,
+        .leading_zero_row = .reject,
+    }) catch return error.InvalidCellRef;
+    // Note the base difference from `zlsx.CellRef`, which this module
+    // does NOT share: here both fields are 1-based.
+    return .{ .row = cell.row.oneBased(), .col = cell.col.oneBased() };
 }
 
 /// Format a CellRef as A1 ("A1", "AA10") into `buf`. Returns the
 /// written slice. `buf.len >= 16` is sufficient for any in-range ref.
 pub fn formatA1Ref(buf: []u8, ref: CellRef) []u8 {
-    assert(ref.row >= 1 and ref.row <= 1048576);
-    assert(ref.col >= 1 and ref.col <= 16384);
-    assert(buf.len >= 16);
+    assert(ref.row >= 1 and ref.row <= coords.max_row);
+    assert(ref.col >= 1 and ref.col <= coords.max_col_1based);
+    assert(buf.len >= coords.format_buf_len);
 
-    // Letters: convert col (1-based) to base-26 with A=1..Z=26.
-    var letters: [4]u8 = undefined;
-    var n: usize = 0;
-    var c: u32 = ref.col;
-    while (c > 0) : (n += 1) {
-        const r: u32 = (c - 1) % 26;
-        letters[n] = @intCast(@as(u32, 'A') + r);
-        c = (c - 1) / 26;
-    }
-    // Reverse letters into buf[0..n].
-    var i: usize = 0;
-    while (i < n) : (i += 1) buf[i] = letters[n - 1 - i];
-
-    // Row digits — itoa.
-    const row_str = std.fmt.bufPrint(buf[n..], "{d}", .{ref.row}) catch unreachable;
-    return buf[0 .. n + row_str.len];
+    // The asserts above are exactly the constructors' preconditions, so
+    // the error branches are unreachable by construction.
+    const cell: coords.Cell = .{
+        .col = coords.Col.fromOneBased(ref.col) catch unreachable,
+        .row = coords.Row.fromOneBased(ref.row) catch unreachable,
+    };
+    return coords.formatCell(buf, cell);
 }
 
 /// Composite read-only view of a cell's resolved style. Each field
@@ -7103,14 +7078,7 @@ fn appendXmlUpdateDimensionBR(
 /// (A=1, …, XFD=16384). Returns null on empty input or anything
 /// past `max_col_1based`.
 fn appendXmlParseColLetters(s: []const u8) ?u32 {
-    if (s.len == 0) return null;
-    var n: u32 = 0;
-    for (s) |c| {
-        if (c < 'A' or c > 'Z') return null;
-        n = n * 26 + (c - 'A' + 1);
-        if (n > zlsx.max_col_1based) return null;
-    }
-    return n;
+    return coords.parseColNumber(s, .{ .case = .upper_only }) catch null;
 }
 
 /// Render `col_1based` as A, B, …, Z, AA, … into `buf`. Capacity 8
@@ -7118,16 +7086,8 @@ fn appendXmlParseColLetters(s: []const u8) ?u32 {
 fn appendXmlColLetters(buf: []u8, col_1based: u32) []u8 {
     assert(buf.len >= 7);
     assert(col_1based >= 1 and col_1based <= zlsx.max_col_1based);
-    var n: u32 = col_1based;
-    var i: usize = 0;
-    while (n > 0) {
-        const r = (n - 1) % 26;
-        buf[i] = 'A' + @as(u8, @intCast(r));
-        i += 1;
-        n = (n - 1) / 26;
-    }
-    std.mem.reverse(u8, buf[0..i]);
-    return buf[0..i];
+    const n = coords.writeColLetters(buf, coords.Col.fromOneBased(col_1based) catch unreachable);
+    return buf[0..n];
 }
 
 /// XML 1.0 §2.2: Char ::= #x9 | #xA | #xD | [#x20-#xD7FF] | …

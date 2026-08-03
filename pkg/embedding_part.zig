@@ -41,6 +41,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const nfc = @import("zlsx_nfc");
+const coords = @import("zlsx_refs");
 
 pub const Error = error{
     BadMagic,
@@ -169,8 +170,8 @@ pub const Dtype = enum(u8) {
 // index.xml parser
 // ---------------------------------------------------------------
 
-pub const EXCEL_MAX_ROW: u32 = 1_048_576;
-pub const EXCEL_MAX_COL: u32 = 16_384;
+pub const EXCEL_MAX_ROW: u32 = coords.max_row;
+pub const EXCEL_MAX_COL: u32 = coords.max_col_1based;
 
 pub const A1Corner = struct {
     row: u32, // 1-based
@@ -470,33 +471,20 @@ pub fn parseA1Range(s: []const u8) Error!A1Range {
 }
 
 pub fn parseA1Corner(s: []const u8) Error!A1Corner {
-    if (s.len == 0) return Error.InvalidRange;
-    var i: usize = 0;
-    var col: u32 = 0;
-    while (i < s.len and isAsciiAlpha(s[i])) : (i += 1) {
-        const upper = std.ascii.toUpper(s[i]);
-        col = std.math.mul(u32, col, 26) catch return Error.InvalidRange;
-        col = std.math.add(u32, col, @as(u32, upper - 'A' + 1)) catch return Error.InvalidRange;
-        if (col > EXCEL_MAX_COL) return Error.InvalidRange;
-    }
-    if (i == 0 or i == s.len) return Error.InvalidRange;
-    if (s[i] == '0') return Error.InvalidRange;
-    const row = try parseU32Decimal(s[i..]);
-    if (row == 0 or row > EXCEL_MAX_ROW) return Error.InvalidRange;
-    return .{ .row = row, .col = col - 1 };
+    // M0 adapter over `zlsx_refs`. Policy preserved exactly:
+    // coverage ranges are author-supplied, so letters are
+    // case-insensitive and a leading-zero row is rejected.
+    const cell = coords.parseCell(s, .{
+        .case = .insensitive,
+        .leading_zero_row = .reject,
+    }) catch return Error.InvalidRange;
+    return .{ .row = cell.row.oneBased(), .col = cell.col.zeroBased() };
 }
 
+/// Parse a bare column name ("A", "aa") to a **0-based** index.
 pub fn parseColumnName(s: []const u8) Error!u32 {
-    if (s.len == 0) return Error.InvalidRange;
-    var col: u32 = 0;
-    for (s) |b| {
-        if (!isAsciiAlpha(b)) return Error.InvalidRange;
-        const upper = std.ascii.toUpper(b);
-        col = std.math.mul(u32, col, 26) catch return Error.InvalidRange;
-        col = std.math.add(u32, col, @as(u32, upper - 'A' + 1)) catch return Error.InvalidRange;
-        if (col > EXCEL_MAX_COL) return Error.InvalidRange;
-    }
-    return col - 1;
+    const col = coords.parseCol(s, .{ .case = .insensitive }) catch return Error.InvalidRange;
+    return col.zeroBased();
 }
 
 const XmlTag = struct {

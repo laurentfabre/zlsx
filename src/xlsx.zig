@@ -23,6 +23,7 @@
 const std = @import("std");
 const fuzz_config = @import("fuzz_config");
 pub const casefold = @import("unicode/casefold.zig");
+const coords = @import("zlsx_refs");
 const Allocator = std.mem.Allocator;
 
 // ─── Public types ────────────────────────────────────────────────────
@@ -2485,14 +2486,12 @@ fn parseNumericCell(text: []const u8) !Cell {
 /// MalformedXml so adversarial XML can't drive `consumeCell`'s row-
 /// growth loop into a multi-MB allocation.
 pub fn columnIndexFromRef(ref: []const u8) !usize {
-    var idx: usize = 0;
-    var i: usize = 0;
-    while (i < ref.len and ref[i] >= 'A' and ref[i] <= 'Z') : (i += 1) {
-        idx = idx * 26 + (ref[i] - 'A' + 1);
-        if (idx > max_col_1based) return error.MalformedXml;
-    }
-    if (i == 0) return error.MalformedXml;
-    return idx - 1;
+    // M0 adapter over `zlsx_refs`. Prefix scan on purpose: this takes
+    // the column out of a full ref and does NOT validate the row part.
+    const prefix = coords.scanColPrefix(ref, .{
+        .case = .upper_only,
+    }) catch return error.MalformedXml;
+    return prefix.col_1based - 1;
 }
 
 // ─── Entity decoding ─────────────────────────────────────────────────
@@ -2656,35 +2655,23 @@ pub fn parseWorkbookSheets(book: *Book, wb_xml: []const u8, rels_xml: []const u8
 // ─── sharedStrings.xml parsing ───────────────────────────────────────
 
 /// Maximum column index in an Excel sheet (XFD, 1-based 16384).
-pub const max_col_1based: u32 = 16384;
+pub const max_col_1based: u32 = coords.max_col_1based;
 /// Maximum row index in an Excel sheet (1-based).
-pub const max_row: u32 = 1_048_576;
+pub const max_row: u32 = coords.max_row;
 
 /// Parse one corner of an A1-style reference ("B12") into `{col, row}`.
 /// Column is 0-based (A=0, B=1, …), row is 1-based (row1=1). Rejects
 /// empty input, lowercase, missing digits, row=0, and refs beyond
 /// Excel's XFD/1048576 sheet bounds.
 pub fn parseA1Ref(s: []const u8) !CellRef {
-    if (s.len == 0) return error.MalformedXml;
-    var i: usize = 0;
-    var col: u32 = 0;
-    while (i < s.len and s[i] >= 'A' and s[i] <= 'Z') : (i += 1) {
-        // Bail as soon as the running column exceeds the Excel max.
-        // The previous "saturate" approach risked u32 overflow on
-        // pathologically long all-letter prefixes since the
-        // multiplication ran before the bound check fired.
-        if (col > max_col_1based) return error.MalformedXml;
-        col = col * 26 + (s[i] - 'A' + 1);
-    }
-    if (i == 0 or i == s.len) return error.MalformedXml;
-    var row: u32 = 0;
-    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
-        if (row > max_row) return error.MalformedXml;
-        row = row * 10 + (s[i] - '0');
-    }
-    if (i != s.len or row == 0) return error.MalformedXml;
-    if (col > max_col_1based or row > max_row) return error.MalformedXml;
-    return .{ .col = col - 1, .row = row };
+    // M0 adapter over `zlsx_refs`. Policy preserved exactly: this path
+    // reads Excel-authored `r=` attributes, which are always uppercase,
+    // and has always tolerated a leading-zero row ("A01" → row 1).
+    const cell = coords.parseCell(s, .{
+        .case = .upper_only,
+        .leading_zero_row = .accept,
+    }) catch return error.MalformedXml;
+    return .{ .col = cell.col.zeroBased(), .row = cell.row.oneBased() };
 }
 
 /// Parse an A1-style range ("A1:B2"). Top-left corner must precede or

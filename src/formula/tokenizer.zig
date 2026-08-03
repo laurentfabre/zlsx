@@ -23,6 +23,7 @@
 //!   format(allocator, tokens) -> []u8
 
 const std = @import("std");
+const coords = @import("zlsx_refs");
 
 pub const Token = struct {
     kind: Kind,
@@ -422,13 +423,13 @@ fn isCellRef(s: []const u8) bool {
 }
 
 fn columnInRange(letters: []const u8) bool {
-    // Convert A=1, AA=27, ... up to XFD=16384. Case-insensitive.
-    var v: u32 = 0;
-    for (letters) |c| {
-        const upper: u8 = if (c >= 'a' and c <= 'z') c - ('a' - 'A') else c;
-        v = v * 26 + @as(u32, upper - 'A' + 1);
-    }
-    return v >= 1 and v <= 16384;
+    // M0 adapter over `zlsx_refs` (A=1 … XFD=16384, case-insensitive).
+    // The shared scanner uses trapping arithmetic, which also closes a
+    // latent overflow panic here: the old loop multiplied unchecked, so
+    // a long enough letter run would have trapped on `v * 26` rather
+    // than answering `false`.
+    _ = coords.parseColNumber(letters, .{ .case = .insensitive }) catch return false;
+    return true;
 }
 
 fn rowInRange(digits: []const u8) bool {

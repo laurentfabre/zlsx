@@ -48,6 +48,7 @@
 //! iter when needed.
 
 const std = @import("std");
+const coords = @import("zlsx_refs");
 
 const Allocator = std.mem.Allocator;
 
@@ -628,38 +629,20 @@ fn processCommentTag(
 const A1Ref = struct { col: u32, row: u32 };
 
 fn parseA1Single(ref: []const u8) ?A1Ref {
-    if (ref.len == 0) return null;
-    var i: usize = 0;
-    var col: u32 = 0;
-    while (i < ref.len and ref[i] >= 'A' and ref[i] <= 'Z') : (i += 1) {
-        col = col * 26 + (ref[i] - 'A' + 1);
-        if (col > 16384) return null;
-    }
-    if (i == 0 or i == ref.len) return null;
-    var row: u32 = 0;
-    while (i < ref.len) : (i += 1) {
-        const ch = ref[i];
-        if (ch < '0' or ch > '9') return null;
-        row = row * 10 + (ch - '0');
-        if (row > 1048576) return null;
-    }
-    if (row == 0) return null;
-    return .{ .col = col, .row = row };
+    // M0 adapter over `zlsx_refs`. Policy preserved exactly: VML
+    // comment refs are Excel-authored (uppercase) and this path has
+    // always tolerated a leading-zero row. Both fields stay 1-based.
+    const cell = coords.parseCell(ref, .{
+        .case = .upper_only,
+        .leading_zero_row = .accept,
+    }) catch return null;
+    return .{ .col = cell.col.oneBased(), .row = cell.row.oneBased() };
 }
 
 fn formatA1(buf: []u8, ref: A1Ref) ![]const u8 {
-    if (ref.col == 0 or ref.col > 16384 or ref.row == 0 or ref.row > 1048576) return error.MalformedCommentsXml;
-    var letters: [4]u8 = undefined;
-    var n_letters: usize = 0;
-    var c: u32 = ref.col;
-    while (c > 0) {
-        const digit = (c - 1) % 26;
-        letters[n_letters] = 'A' + @as(u8, @intCast(digit));
-        n_letters += 1;
-        c = (c - 1) / 26;
-    }
-    std.mem.reverse(u8, letters[0..n_letters]);
-    return std.fmt.bufPrint(buf, "{s}{d}", .{ letters[0..n_letters], ref.row }) catch unreachable;
+    const col = coords.Col.fromOneBased(ref.col) catch return error.MalformedCommentsXml;
+    const row = coords.Row.fromOneBased(ref.row) catch return error.MalformedCommentsXml;
+    return coords.formatCell(buf, .{ .col = col, .row = row });
 }
 
 /// Read the `ref="..."` attribute value from a `<comment>` open

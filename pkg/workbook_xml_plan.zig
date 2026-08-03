@@ -19,6 +19,7 @@
 //! Stdlib only. Zig 0.15.2.
 
 const std = @import("std");
+const coords = @import("zlsx_refs");
 
 const Allocator = std.mem.Allocator;
 
@@ -238,30 +239,15 @@ fn looksLikeR1C1Ref(s: []const u8) bool {
 /// defined-name validator to reject names that would be parsed as
 /// cell refs.
 fn looksLikeCellRef(s: []const u8) bool {
-    if (s.len < 2 or s.len > 10) return false;
-    var i: usize = 0;
-    var col_v: u32 = 0;
-    var col_n: usize = 0;
-    while (i < s.len and isAsciiLetter(s[i])) : (i += 1) {
-        // Bail at the first letter past the 3-char cap — names longer
-        // than that aren't cell-ref shaped, and continuing the
-        // multiply-by-26 would overflow `col_v`.
-        col_n += 1;
-        if (col_n > 3) return false;
-        const upper: u8 = if (s[i] >= 'a' and s[i] <= 'z') s[i] - ('a' - 'A') else s[i];
-        const offset_one_based: u32 = @as(u32, upper) - @as(u32, 'A') + 1;
-        col_v = col_v * 26 + offset_one_based;
-    }
-    if (col_n == 0 or col_n > 3 or col_v == 0 or col_v > 16384) return false;
-    var row_v: u64 = 0;
-    var row_n: usize = 0;
-    while (i < s.len and isAsciiDigit(s[i])) : (i += 1) {
-        row_v = row_v * 10 + @as(u64, s[i] - '0');
-        if (row_v > 1_048_576) return false;
-        row_n += 1;
-    }
-    if (row_n == 0) return false;
-    return i == s.len and row_v >= 1;
+    // M0 adapter over `zlsx_refs`. The old hand-rolled 3-letter cap is
+    // implied by the grid ceiling: a 4-letter run necessarily exceeds
+    // XFD and is rejected. Leading-zero rows ("A01") parse here, as
+    // they always have on this path.
+    _ = coords.parseCell(s, .{
+        .case = .insensitive,
+        .leading_zero_row = .accept,
+    }) catch return false;
+    return true;
 }
 
 inline fn isAsciiLetter(c: u8) bool {

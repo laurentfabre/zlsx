@@ -51,6 +51,7 @@
 const std = @import("std");
 const xlsx = @import("zlsx");
 const sheet_edit = @import("sheet_edit.zig");
+const coords = @import("zlsx_refs");
 
 const Allocator = std.mem.Allocator;
 const TagOpen = xlsx.TagOpen;
@@ -355,19 +356,13 @@ fn formatRange(buf: *[48]u8, b: NewBounds) ![]const u8 {
 /// `pkg/sheet_edit.zig::formatColLetters` (which is private). When a
 /// third consumer appears, lift both into a shared `pkg/range_a1.zig`.
 fn formatColLettersLocal(buf: *[8]u8, col_1based: u32) ![]const u8 {
-    if (col_1based == 0) return error.TableCoordinateOverflow;
-    var tmp: [8]u8 = undefined;
-    var pos: usize = tmp.len;
-    var c = col_1based;
-    while (c > 0) {
-        c -= 1;
-        if (pos == 0) return error.TableCoordinateOverflow;
-        pos -= 1;
-        tmp[pos] = @intCast('A' + (c % 26));
-        c /= 26;
-    }
-    const len = tmp.len - pos;
-    @memcpy(buf[0..len], tmp[pos..]);
+    // M0: this used to be a hand-rolled duplicate of
+    // `pkg/sheet_edit.zig::formatColLetters`, with a comment asking for
+    // a shared module once a third consumer appeared. `zlsx_refs` is
+    // that module. Unchecked writer — the pre-M0 behaviour accepted
+    // out-of-grid columns and only failed when the buffer ran out.
+    const len = coords.writeColNumberLetters(buf, col_1based) catch
+        return error.TableCoordinateOverflow;
     return buf[0..len];
 }
 
