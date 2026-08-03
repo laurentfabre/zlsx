@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const xlsx = @import("zlsx");
+const coords = @import("zlsx_refs");
 
 const Allocator = std.mem.Allocator;
 const TagOpen = xlsx.TagOpen;
@@ -744,19 +745,14 @@ pub fn parseColFromA1(ref: []const u8) ?u32 {
 /// Render a 0-based col_idx as A1 letters (A=0, Z=25, AA=26, ...).
 /// Caller-provided buffer; result borrows from buf.
 fn formatColLetters(buf: *[8]u8, col_idx: u32) ![]const u8 {
-    var col_chars: [8]u8 = undefined;
-    var pos: usize = col_chars.len;
-    var c = col_idx + 1;
-    while (c > 0) {
-        c -= 1;
-        pos -= 1;
-        if (pos == std.math.maxInt(usize)) return error.ColumnIndexOutOfRange;
-        col_chars[pos] = @intCast('A' + (c % 26));
-        c /= 26;
-        if (pos == 0 and c > 0) return error.ColumnIndexOutOfRange;
-    }
-    const len = col_chars.len - pos;
-    @memcpy(buf[0..len], col_chars[pos..]);
+    // M0 adapter over `zlsx_refs`. Deliberately the UNCHECKED writer:
+    // a shifted index can land past XFD here, and this path has always
+    // formatted it rather than erroring. The only failure is not
+    // fitting the buffer — plus a `col_idx` of `maxInt(u32)`, which the
+    // old `col_idx + 1` would have panicked on in Debug.
+    const one_based = std.math.add(u32, col_idx, 1) catch
+        return error.ColumnIndexOutOfRange;
+    const len = try coords.writeColNumberLetters(buf, one_based);
     return buf[0..len];
 }
 
@@ -1940,29 +1936,22 @@ fn writeWithReplacedAttrs(
 /// (A=1, B=2, ..., Z=26, AA=27, ..., XFD=16384). Returns null on
 /// empty input or anything past `max_col_1based`.
 pub fn parseColLetters(s: []const u8) ?u32 {
-    if (s.len == 0) return null;
-    var n: u32 = 0;
-    for (s) |c| {
-        if (c < 'A' or c > 'Z') return null;
-        n = n * 26 + (c - 'A' + 1);
-        if (n > max_col_1based) return null;
-    }
-    return n;
+    // M0 adapter over `zlsx_refs`. Policy preserved exactly: uppercase
+    // only (Excel-authored XML), grid-bounded, 1-based result.
+    return coords.parseColNumber(s, .{ .case = .upper_only }) catch null;
 }
 
 /// Render `col_idx` (0-based) as A, B, ..., Z, AA, AB, ... into `buf`.
 /// Capacity 8 is more than enough (Excel max is XFD = 3 letters).
 pub fn colLetterEditor(buf: []u8, col_idx: u32) []u8 {
-    var n: u32 = col_idx + 1;
-    var i: usize = 0;
-    while (n > 0) {
-        const r = (n - 1) % 26;
-        buf[i] = 'A' + @as(u8, @intCast(r));
-        i += 1;
-        n = (n - 1) / 26;
-    }
-    std.mem.reverse(u8, buf[0..i]);
-    return buf[0..i];
+    // Unchecked writer: this path takes an already-shifted 0-based
+    // index and has never bounds-checked it against the grid. The
+    // assert — not any caller's discipline — is what makes the error
+    // branch unreachable: 8 bytes covers the longest run any `u32` can
+    // produce. (No caller exists today; it is public API surface.)
+    std.debug.assert(buf.len >= 8);
+    const n = coords.writeColNumberLetters(buf, col_idx + 1) catch unreachable;
+    return buf[0..n];
 }
 
 // ---------------------------------------------------------------------------

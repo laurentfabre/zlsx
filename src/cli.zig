@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const xlsx = @import("zlsx");
 const zlsx_pkg = @import("zlsx_pkg");
 const dbx = @import("dbx.zig");
+const coords = @import("zlsx_refs");
 
 const Format = enum {
     /// NEW default: row envelope `{kind,sheet,sheet_idx,row,cells:[…]}`.
@@ -1063,15 +1064,11 @@ fn writeUsage(w: *std.Io.Writer) !void {
 }
 
 fn colLetter(buf: *[8]u8, idx: usize) []const u8 {
-    var i: usize = idx + 1; // xlsx columns are 1-based
-    var pos: usize = buf.len;
-    while (i > 0) {
-        i -= 1;
-        pos -= 1;
-        buf[pos] = 'A' + @as(u8, @intCast(i % 26));
-        i /= 26;
-    }
-    return buf[pos..];
+    // Unchecked writer: `idx` is a 0-based position in an emitted row,
+    // never validated against the grid on this path. An 8-byte buffer
+    // covers any `u32`, so the failure branch is unreachable.
+    const n = coords.writeColNumberLetters(buf, @intCast(idx + 1)) catch unreachable;
+    return buf[0..n];
 }
 
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
@@ -4395,14 +4392,10 @@ fn runSetCellCommand(
 /// reader's `parseA1Ref` letter loop. Returns null on malformed
 /// input.
 fn parseColLettersToOneBased(s: []const u8) ?u32 {
-    if (s.len == 0 or s.len > 3) return null;
-    var idx: u32 = 0;
-    for (s) |c| {
-        if (c < 'A' or c > 'Z') return null;
-        idx = idx * 26 + (@as(u32, c) - 'A' + 1);
-    }
-    if (idx == 0 or idx > 16384) return null;
-    return idx;
+    return coords.parseColNumber(s, .{
+        .case = .upper_only,
+        .max_letters = 3,
+    }) catch null;
 }
 
 fn requireSheetIdxU32(args: Args, err: *std.Io.Writer, who: []const u8) !u32 {

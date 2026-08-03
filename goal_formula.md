@@ -150,7 +150,7 @@ table).
 %%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#e0e0e0', 'primaryBorderColor': '#00d4ff', 'lineColor': '#00d4ff', 'secondaryColor': '#16213e', 'tertiaryColor': '#0f3460', 'fontFamily': 'monospace'}}}%%
 graph TD
     TOK["tokenizer.zig (M1a: Unicode idents,<br/>extensible error lits)"] --> PARSE["parser.zig — AST + printer"]
-    REFS["refs.zig (M0, typed coords)"] --> PARSE
+    REFS["refs/refs.zig — module zlsx_refs<br/>(M0, typed coords + import gate)"] --> PARSE
     PARSE --> EVAL["eval.zig — engine"]
     VAL["value.zig"] --> EVAL
     ENV["env.zig — EvalEnv (ordered sparse<br/>iteration + logicalBlankCount)"] --> EVAL
@@ -167,6 +167,22 @@ graph TD
     ORCH --> CABI["C ABI"]
     CABI --> PY["py-zlsx"] --> SPARK["zlsx.spark (batch, digest-verified)"]
 ```
+
+**M0 placement (decided 2026-08-03).** The coordinate module roots at
+top-level `refs/`, not `src/formula/`, for the same reason as `unicode/`:
+a file belongs to exactly one module's package tree, and the consumers
+span `zlsx` (`src/`), `zlsx_pkg` (`pkg/`), `zlsx_sheet_plan`, and
+`zlsx_workbook_xml_plan`. Under `src/` or `pkg/` the compile fails with
+"file exists in modules 'zlsx' and 'zlsx_refs'".
+
+M0 also found more duplication than the ladder row anticipated: **six**
+A1 parsers and **seven** column-letter formatters, disagreeing on column
+base (0- vs 1-based), case handling, and whether `A01` is a valid row —
+including two structs both named `CellRef` with different bases, and one
+file (`pkg/sheet_plan.zig`) that disagreed with itself. All are now
+adapters over `zlsx_refs`, each preserving its own policy via explicit
+options rather than being silently unified; `refs/import_gate.zig` runs
+in `zig build test` and fails on any new hand-rolled base-26 codec.
 
 ### 5.2 Grammar contract
 

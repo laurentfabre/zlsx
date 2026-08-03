@@ -44,6 +44,8 @@ pub fn build(b: *std.Build) void {
     // cycle-free shape as `sst_plan_mod` — both Workbook and
     // `xlsx.Writer` import this without forming `writer → zlsx_pkg
     // → workbook → zlsx → writer`.
+    // NOTE: `zlsx_refs` is wired into this module further down, right
+    // after `refs_mod` is created (it cannot be referenced yet here).
     const workbook_xml_plan_mod = b.createModule(.{
         .root_source_file = b.path("pkg/workbook_xml_plan.zig"),
         .target = target,
@@ -140,6 +142,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // M0 (tier D1): typed coordinates — the single owner of A1 parse /
+    // format and the grid bounds. Rooted at top-level `refs/` for the
+    // same one-file-one-module-tree reason as `unicode/` above: its
+    // consumers span `zlsx` (src/), `zlsx_pkg` (pkg/), and
+    // `zlsx_sheet_plan` (pkg/sheet_plan.zig).
+    const refs_mod = b.createModule(.{
+        .root_source_file = b.path("refs/refs.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sheet_plan_mod.addImport("zlsx_refs", refs_mod);
+    workbook_xml_plan_mod.addImport("zlsx_refs", refs_mod);
+
     // Public module. Consumers add zlsx to their build.zig.zon as a
     // path or git dependency, then `@import("zlsx")`.
     const zlsx_mod = b.addModule("zlsx", .{
@@ -155,6 +170,7 @@ pub fn build(b: *std.Build) void {
     zlsx_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
     zlsx_mod.addImport("fuzz_config", fuzz_config_mod);
     zlsx_mod.addImport("zlsx_nfc", nfc_mod);
+    zlsx_mod.addImport("zlsx_refs", refs_mod);
 
     // Unit tests (embedded in src/xlsx.zig, including the fuzz suite).
     const unit_mod = b.createModule(.{
@@ -170,6 +186,7 @@ pub fn build(b: *std.Build) void {
     unit_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
     unit_mod.addImport("fuzz_config", fuzz_config_mod);
     unit_mod.addImport("zlsx_nfc", nfc_mod);
+    unit_mod.addImport("zlsx_refs", refs_mod);
     const unit_tests = b.addTest(.{ .root_module = unit_mod });
     const test_step = b.step("test", "Run zlsx unit + fuzz-smoke tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
@@ -197,6 +214,7 @@ pub fn build(b: *std.Build) void {
     unit_fuzz_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
     unit_fuzz_mod.addImport("fuzz_config", fuzz_config_mod);
     unit_fuzz_mod.addImport("zlsx_nfc", nfc_mod);
+    unit_fuzz_mod.addImport("zlsx_refs", refs_mod);
     // Zig 0.16.0 cannot compile its own test runner in `-ffuzz` mode
     // (`writeStackTrace` receives a `*builtin.StackTrace` where a
     // `*const debug.StackTrace` is required), which blocked coverage-
@@ -253,6 +271,7 @@ pub fn build(b: *std.Build) void {
     });
     cli_mod.addImport("build_options", build_options_mod);
     cli_mod.addImport("fuzz_config", fuzz_config_mod);
+    cli_mod.addImport("zlsx_refs", refs_mod);
     // `cli_mod.addImport("zlsx", zlsx_mod);` is wired below, after
     // `package_mod` is declared (cli also gains a `zlsx_pkg` dep
     // post B2 iter-er-0).
@@ -284,6 +303,7 @@ pub fn build(b: *std.Build) void {
     writer_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
     writer_mod.addImport("fuzz_config", fuzz_config_mod);
     writer_mod.addImport("zlsx_nfc", nfc_mod);
+    writer_mod.addImport("zlsx_refs", refs_mod);
     const writer_tests = b.addTest(.{ .root_module = writer_mod });
     test_step.dependOn(&b.addRunArtifact(writer_tests).step);
 
@@ -319,6 +339,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    workbook_xml_plan_tests_mod.addImport("zlsx_refs", refs_mod);
     const workbook_xml_plan_tests = b.addTest(.{ .root_module = workbook_xml_plan_tests_mod });
     test_step.dependOn(&b.addRunArtifact(workbook_xml_plan_tests).step);
     // Standalone tests for the ZIP emit substrate (B3 iter-wr-5).
@@ -340,8 +361,49 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    sheet_plan_tests_mod.addImport("zlsx_refs", refs_mod);
     const sheet_plan_tests = b.addTest(.{ .root_module = sheet_plan_tests_mod });
     test_step.dependOn(&b.addRunArtifact(sheet_plan_tests).step);
+
+    // M0: standalone tests for the typed-coordinate module. Its own
+    // binary because every other suite reaches it only through an
+    // adapter, so a bug in the primitive would otherwise surface as a
+    // confusing failure three layers up.
+    const refs_tests = b.addTest(.{ .root_module = refs_mod });
+    test_step.dependOn(&b.addRunArtifact(refs_tests).step);
+
+    // M0 import gate. Scans every `src/` and `pkg/` source for
+    // bijective base-26 coordinate arithmetic — the fingerprint shared
+    // by all six pre-M0 A1 parsers — and fails the build on a new one.
+    // Wired into `test_step` so CI enforces it without a bespoke job.
+    const import_gate_mod = b.createModule(.{
+        .root_source_file = b.path("refs/import_gate.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const import_gate_exe = b.addExecutable(.{
+        .name = "import-gate",
+        .root_module = import_gate_mod,
+    });
+    const import_gate_run = b.addRunArtifact(import_gate_exe);
+    // 0.16: filesystem calls take the build graph's `Io`.
+    const gate_io = b.graph.io;
+    for ([_][]const u8{ "src", "pkg" }) |root| {
+        var dir = b.build_root.handle.openDir(gate_io, root, .{ .iterate = true }) catch
+            @panic("import gate: cannot open source dir");
+        defer dir.close(gate_io);
+        var walker = dir.walk(b.allocator) catch @panic("import gate: walk failed");
+        defer walker.deinit();
+        while (walker.next(gate_io) catch @panic("import gate: walk failed")) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+            import_gate_run.addFileArg(b.path(b.pathJoin(&.{ root, entry.path })));
+        }
+    }
+    test_step.dependOn(&import_gate_run.step);
+
+    const import_gate_tests = b.addTest(.{ .root_module = import_gate_mod });
+    test_step.dependOn(&b.addRunArtifact(import_gate_tests).step);
 
     // B3 iter-wr-7: standalone tests for the fresh-archive emit
     // substrate. Same separation rationale as `sst_plan_tests_mod` —
@@ -388,6 +450,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_tokenizer_mod.addImport("zlsx_refs", refs_mod);
     const formula_tokenizer_tests = b.addTest(.{ .root_module = formula_tokenizer_mod });
     test_step.dependOn(&b.addRunArtifact(formula_tokenizer_tests).step);
 
@@ -402,6 +465,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_rewriter_mod.addImport("zlsx_refs", refs_mod);
     const formula_rewriter_tests = b.addTest(.{ .root_module = formula_rewriter_mod });
     test_step.dependOn(&b.addRunArtifact(formula_rewriter_tests).step);
 
@@ -436,6 +500,7 @@ pub fn build(b: *std.Build) void {
     package_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
     package_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
     package_mod.addImport("zlsx_nfc", nfc_mod);
+    package_mod.addImport("zlsx_refs", refs_mod);
 
     // After the B2 iter-er-0 Editor relocation, `cli_mod` reaches
     // Editor through `zlsx_pkg` and xlsx via the named `zlsx` dep.
@@ -681,6 +746,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     embedding_part_tests_mod.addImport("zlsx_nfc", nfc_mod);
+    embedding_part_tests_mod.addImport("zlsx_refs", refs_mod);
     const embedding_part_tests = b.addTest(.{ .root_module = embedding_part_tests_mod });
     test_step.dependOn(&b.addRunArtifact(embedding_part_tests).step);
 
@@ -715,6 +781,7 @@ pub fn build(b: *std.Build) void {
     package_workbook_tests_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
     package_workbook_tests_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
     package_workbook_tests_mod.addImport("zlsx_nfc", nfc_mod);
+    package_workbook_tests_mod.addImport("zlsx_refs", refs_mod);
     const package_workbook_tests = b.addTest(.{ .root_module = package_workbook_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_workbook_tests).step);
 
@@ -738,6 +805,7 @@ pub fn build(b: *std.Build) void {
     package_editor_tests_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
     package_editor_tests_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
     package_editor_tests_mod.addImport("zlsx_nfc", nfc_mod);
+    package_editor_tests_mod.addImport("zlsx_refs", refs_mod);
     const package_editor_tests = b.addTest(.{ .root_module = package_editor_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_editor_tests).step);
 
@@ -785,6 +853,7 @@ pub fn build(b: *std.Build) void {
             .fuzz = true,
         });
         if (w.needs_zlsx) mod.addImport("zlsx", zlsx_mod);
+        mod.addImport("zlsx_refs", refs_mod);
         const t = b.addTest(.{ .root_module = mod, .test_runner = fuzz_test_runner });
         fuzz_step.dependOn(&b.addRunArtifact(t).step);
     }

@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const tokenizer = @import("tokenizer.zig");
+const coords = @import("zlsx_refs");
 const assert = std.debug.assert;
 const Token = tokenizer.Token;
 
@@ -85,8 +86,8 @@ pub const Error = error{
     InvalidEdit,
 };
 
-const MAX_ROWS: u32 = 1_048_576;
-const MAX_COLS: u32 = 16_384;
+const MAX_ROWS: u32 = coords.max_row;
+const MAX_COLS: u32 = coords.max_col_1based;
 
 // ─── public API ──────────────────────────────────────────────────
 
@@ -225,15 +226,14 @@ fn formatRef(allocator: std.mem.Allocator, ref: Ref) Error![]u8 {
 /// ASCII letter (caller has already vetted via tokenizer, but be
 /// explicit).
 fn colLettersToNum(letters: []const u8) ?u32 {
-    if (letters.len == 0) return null;
-    if (letters.len > 3) return null;
-    var v: u32 = 0;
-    for (letters) |c| {
-        const upper: u8 = if (c >= 'a' and c <= 'z') c - ('a' - 'A') else c;
-        if (upper < 'A' or upper > 'Z') return null;
-        v = v * 26 + @as(u32, upper - 'A' + 1);
-    }
-    return v;
+    // M0 adapter over `zlsx_refs`. Policy preserved exactly: at most 3
+    // letters, case-insensitive, and NO grid ceiling — an out-of-grid
+    // column like "ZZZ" is accepted here and rejected downstream.
+    return coords.parseColNumber(letters, .{
+        .case = .insensitive,
+        .max_letters = 3,
+        .bounds = .unchecked,
+    }) catch null;
 }
 
 /// Write column letters for `col` (1-based) into `buf`. Returns the
@@ -242,21 +242,8 @@ fn colLettersToNum(letters: []const u8) ?u32 {
 fn writeColLetters(buf: []u8, col: u32) usize {
     assert(col >= 1 and col <= MAX_COLS);
     assert(buf.len >= 3);
-    var stack: [3]u8 = undefined;
-    var n: u32 = col;
-    var depth: usize = 0;
-    while (n > 0) {
-        n -= 1;
-        stack[depth] = 'A' + @as(u8, @intCast(n % 26));
-        depth += 1;
-        n /= 26;
-    }
-    assert(depth >= 1 and depth <= 3);
-    var i: usize = 0;
-    while (i < depth) : (i += 1) {
-        buf[i] = stack[depth - 1 - i];
-    }
-    return depth;
+    // In grid by the assert above, so the typed constructor cannot fail.
+    return coords.writeColLetters(buf, coords.Col.fromOneBased(col) catch unreachable);
 }
 
 inline fn isAsciiAlpha(c: u8) bool {

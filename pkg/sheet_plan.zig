@@ -42,13 +42,14 @@
 //! with a strict 1.10× ceiling = 7.4ms.
 
 const std = @import("std");
+const coords = @import("zlsx_refs");
 
 const Allocator = std.mem.Allocator;
 
 // ─── Excel hard limits ────────────────────────────────────────────────
 
-pub const EXCEL_MAX_COL: u32 = 16_384;
-pub const EXCEL_MAX_ROW: u32 = 1_048_576;
+pub const EXCEL_MAX_COL: u32 = coords.max_col_1based;
+pub const EXCEL_MAX_ROW: u32 = coords.max_row;
 
 pub const Error = error{
     OutOfMemory,
@@ -1081,39 +1082,24 @@ pub fn emitVmlDrawingXml(
 pub const A1Corner = struct { col: u32, row: u32 };
 
 pub fn parseA1Corner(s: []const u8) Error!A1Corner {
-    if (s.len == 0) return error.InvalidMergeRange;
-    var i: usize = 0;
-    var col: u32 = 0;
-    while (i < s.len and s[i] >= 'A' and s[i] <= 'Z') : (i += 1) {
-        col = col * 26 + (s[i] - 'A' + 1);
-        if (col > EXCEL_MAX_COL) return error.InvalidMergeRange;
-    }
-    // Need at least one letter and at least one digit after it.
-    if (i == 0 or i == s.len) return error.InvalidMergeRange;
-    if (s[i] == '0') return error.InvalidMergeRange;
-    var row: u32 = 0;
-    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
-        row = row * 10 + (s[i] - '0');
-        if (row > EXCEL_MAX_ROW) return error.InvalidMergeRange;
-    }
-    if (i != s.len) return error.InvalidMergeRange;
-    return .{ .col = col, .row = row };
+    // M0 adapter over `zlsx_refs`. Policy preserved exactly: emit-side
+    // refs are uppercase, and a leading-zero row is rejected.
+    const cell = coords.parseCell(s, .{
+        .case = .upper_only,
+        .leading_zero_row = .reject,
+    }) catch return error.InvalidMergeRange;
+    // `A1Corner.col` is 1-based here — note that `formatCellRef` below
+    // takes a 0-based column. That mismatch predates M0 and is
+    // deliberately left alone; only the parsing is unified.
+    return .{ .col = cell.col.oneBased(), .row = cell.row.oneBased() };
 }
 
 pub fn formatCellRef(buf: *[16]u8, row: u32, col_idx: u32) Error![]u8 {
-    if (row == 0 or row > EXCEL_MAX_ROW) return error.RowOutOfRange;
-    if (col_idx >= EXCEL_MAX_COL) return error.ColumnOutOfRange;
-    var col_chars: [8]u8 = undefined;
-    var pos: usize = col_chars.len;
-    var c = col_idx + 1;
-    while (c > 0) {
-        c -= 1;
-        pos -= 1;
-        col_chars[pos] = 'A' + @as(u8, @intCast(c % 26));
-        c /= 26;
-    }
-    const letters = col_chars[pos..];
-    return std.fmt.bufPrint(buf, "{s}{d}", .{ letters, row }) catch unreachable;
+    // `col_idx` is 0-based on this entry point. Both bound checks keep
+    // their original error values.
+    const r = coords.Row.fromOneBased(row) catch return error.RowOutOfRange;
+    const c = coords.Col.fromZeroBased(col_idx) catch return error.ColumnOutOfRange;
+    return coords.formatCell(buf, .{ .col = c, .row = r });
 }
 
 /// Validate an A1-style merge range: must be `TL:BR` form, both
