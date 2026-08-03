@@ -640,6 +640,61 @@ pub fn build(b: *std.Build) void {
     });
     fuzz_step.dependOn(&b.addRunArtifact(formula_value_fuzz_tests).step);
 
+    // M3a2: the EvalEnv interface and its in-memory fake. Its own test
+    // target as well as being a dependency of the evaluator's, because
+    // env.zig must stay buildable WITHOUT eval.zig — the direction of
+    // that dependency is what keeps `src/formula/` free of `pkg/`.
+    //
+    // The `zlsx_casefold` and oracle imports are here because a test
+    // build analyses the tests of every file it imports, and env.zig
+    // imports value.zig. They cost nothing in a non-test build.
+    const formula_env_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/env.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_env_mod.addImport("zlsx_refs", refs_mod);
+    formula_env_mod.addImport("zlsx_casefold", unicode_mod);
+    addOracleFixtures(b, formula_env_mod);
+    const formula_env_tests = b.addTest(.{ .root_module = formula_env_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_env_tests).step);
+
+    // M3a2: the evaluator core plus the registry framework and the
+    // frozen inventory. One module: eval.zig and registry.zig import
+    // each other (the table needs the evaluator's `Value`, the
+    // dispatcher needs the table), which files in one module may do and
+    // separate modules may not.
+    const formula_eval_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/eval.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_eval_mod.addImport("zlsx_refs", refs_mod);
+    formula_eval_mod.addImport("zlsx_xid", xid_mod);
+    formula_eval_mod.addImport("zlsx_casefold", unicode_mod);
+    addOracleFixtures(b, formula_eval_mod);
+    const formula_eval_tests = b.addTest(.{ .root_module = formula_eval_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_eval_tests).step);
+
+    // M3a2: the non-finite escape fuzz target (§8.1). No evaluation of
+    // any input may produce a non-finite number, a zero-dimension
+    // matrix, a panic, or a leak.
+    const formula_eval_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/eval.zig"),
+        .target = target,
+        .optimize = optimize,
+        .fuzz = true,
+    });
+    formula_eval_fuzz_mod.addImport("zlsx_refs", refs_mod);
+    formula_eval_fuzz_mod.addImport("zlsx_xid", xid_mod);
+    formula_eval_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
+    addOracleFixtures(b, formula_eval_fuzz_mod);
+    const formula_eval_fuzz_tests = b.addTest(.{
+        .root_module = formula_eval_fuzz_mod,
+        .test_runner = fuzz_test_runner,
+    });
+    fuzz_step.dependOn(&b.addRunArtifact(formula_eval_fuzz_tests).step);
+
     // C1 milestone 2 (iter 1): pure-function A1 cell-formula
     // rewriter. Imports the M1 tokenizer via a relative path inside
     // src/formula/, so this module's package dir matches the
@@ -1327,6 +1382,24 @@ pub fn build(b: *std.Build) void {
 
     const bench_synth_tests = b.addTest(.{ .root_module = bench_synth_mod });
     test_step.dependOn(&b.addRunArtifact(bench_synth_tests).step);
+}
+
+/// The three committed oracle manifests, as anonymous imports.
+///
+/// `tests/oracle/` is outside every formula module's package tree, so a
+/// relative `@embedFile` cannot reach it — and reaching it is the point:
+/// every layer that ties itself to the oracle must tie itself to the
+/// *committed* manifests rather than to a copy that could drift.
+fn addOracleFixtures(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addAnonymousImport("oracle_hand_spec_excel", .{
+        .root_source_file = b.path("tests/oracle/fixtures/hand_spec_excel.json"),
+    });
+    mod.addAnonymousImport("oracle_hand_spec_ieee", .{
+        .root_source_file = b.path("tests/oracle/fixtures/hand_spec_ieee.json"),
+    });
+    mod.addAnonymousImport("oracle_libreoffice_suite", .{
+        .root_source_file = b.path("tests/oracle/fixtures/libreoffice_oracle_suite.json"),
+    });
 }
 
 /// Parse an optional env-var string that may contain `_` digit

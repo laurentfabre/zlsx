@@ -154,7 +154,7 @@ graph TD
     PARSE --> EVAL["eval.zig — engine"]
     VAL["value.zig"] --> EVAL
     ENV["env.zig — EvalEnv (ordered sparse<br/>iteration + logicalBlankCount)"] --> EVAL
-    CRIT["criteria.zig"] --> FN["functions.zig — registry"]
+    CRIT["criteria.zig"] --> FN["registry.zig — comptime table<br/>+ frozen v1 inventory"]
     SDATE["serial_date.zig"] --> FN
     XSTR["xstring.zig"] --> FN
     NUMFMT["numfmt.zig (M8)"] --> FN
@@ -548,7 +548,8 @@ open or got wrong, pinned here because M3a2 builds directly on them:
     manifests record `2^-1074` as `0x1` and `1E-308/10000000000` as
     `0x316A2`, across fidelities. Exactly **three** of the nine
     divergence points are oracle-backed — subnormals, overflow, and
-    division by zero — and each point carries an `evidence` field
+    division by zero — *(M3a2 makes it four: see M3a2 decision 1)* —
+    and each point carries an `evidence` field
     saying `oracle` or `spec_pinned` rather than implying support it
     does not have. A test asserts the count.
 11. **The Divergence ×2 gate asserts agreement as well as
@@ -591,13 +592,146 @@ open or got wrong, pinned here because M3a2 builds directly on them:
     without the other noticing.
 
 **Still open (needs the parked Excel oracle leg):** N2's zero-snap
-threshold (decision 6) and the `.excel` signed-zero policy (decision 8).
-Both are implemented per §5.4's text and both are labelled
-`spec_pinned`; neither can be confirmed until the M1b Excel adapter runs.
+*threshold* (decision 6) and the `.excel` signed-zero policy
+(decision 8). M3a2 turned the snap's **existence** into oracle-backed
+evidence (M3a2 decision 1), but the threshold is now only bounded
+below — `> ~1.85e-16` relative — and nothing on disk bounds it above;
+the signed-zero policy is unchanged and still `spec_pinned`. Neither
+can be confirmed until the M1b Excel adapter runs.
 
 **Deferred to M4f:** moving `src/unicode/casefold.zig` to top-level
 `unicode/` (decision 12). M4f ships `casing_v1` from the same directory
 and is the milestone that may touch it.
+
+**M3a2 decisions (shipped 2026-08-03).** Seventeen points the row left
+open, got wrong, or discovered — pinned here because M3b, M4b1, and
+every F-batch build directly on them:
+
+1. **The oracle decides a rule §5.4 never stated, and it upgrades N2
+   from text to evidence.** `(0.1+0.2)=0.3` is recorded **TRUE** by the
+   LibreOffice excel-fidelity manifest and **FALSE** by the hand-spec
+   `ieee` one. A comparison is a subtraction against zero, which puts it
+   inside N2's *additive* scope — and that reading is the only one under
+   which both committed manifests are satisfied at once. Numeric
+   comparison therefore routes through `applyZeroSnap`, the N2
+   divergence point's `evidence` flips to `oracle` (three → four), and
+   M3a1's "no committed manifest contains a zero-snap case" is
+   superseded. This is the **one change M3a2 makes to `value.zig`**: one
+   enum literal and the count assertion that guards it. Leaving the
+   label at `spec_pinned` would have understated evidence that is now on
+   disk, which is the failure mode the `evidence` field exists to
+   prevent.
+2. **`TRUE` and `FALSE` were missing from the frozen v1 list.** The
+   ladder's M4c row enumerates 18 names; the committed manifests contain
+   `TRUE()+1`, which M1a already tokenizes as a *call* (`.name`,
+   `paren_open`, `paren_close`) and not as a boolean literal. A row the
+   oracle can decide and the registry cannot answer is a gap, so both
+   names join F1a-1: M4c goes 18 → 20 and the Core gate 57 → 59. The
+   inventory file is the count source, so the ladder row was corrected
+   to match it rather than the reverse.
+3. **The frozen inventory is a committed TSV, not a Zig array.**
+   `src/formula/function_inventory_v1.tsv` — 175 rows of
+   `name<TAB>milestone<TAB>batch`, sorted, unique, tagged. Data because
+   §7 makes it the authoritative count source for *every later PR*:
+   regenerating a number from a file a shell can read is a different
+   activity from re-reading a table someone has to compile. Three tests
+   guard it — the total, per-milestone counts against the ladder, and
+   strict ascending order (uniqueness and sort in one assertion).
+4. **A formula's result is a value, so a top-level reference
+   dereferences through the same §5.3b row as an operand.** `=A1:A3`
+   spills under `dynamic_array` and intersects under `legacy` because
+   `reference_in_value` says so, not because the top level is special.
+   The one thing the top level *does* add is §10's multi-area refusal,
+   checked before the dereference so `(A1:A2,C1:C2)` refuses while
+   `SUM((A1:A2,C1:C2))` still works.
+5. **Runtime dependency capture happens where a reference is
+   CONSTRUCTED, not where it is read.** `IFS` is eager, so its untaken
+   arms evaluate to references it never dereferences — and capturing at
+   the point of read would report them as unread, which is exactly
+   backwards. §5.3a's split is between *evaluated* and *not evaluated*;
+   capture is placed to measure that.
+6. **The volatile-draw counter lives in the seam.** `DrawSource.draw`
+   increments before it calls out, so "zero draws in the dead branch" is
+   a property of the evaluator rather than of how carefully a fixture
+   was wired. M3b replaces the callback with `rng_v1`; the counter and
+   its meaning do not move.
+7. **Eagerness is asserted positively.** `IFS(FALSE,RAND(),TRUE,RAND())`
+   draws **2** and `AND(FALSE,RAND()>2)` draws **1** — fixtures that
+   fail if anyone "optimizes" a short-circuit in. A test that only
+   checked results would pass either way.
+8. **Coercion classes are behaviour, not documentation.** The dispatcher
+   applies each slot's class before the implementation runs, so `SQRT`
+   receives a number or an error and never re-derives a coercion. This
+   is what keeps `SQRT(-1)` a statement about the radicand — `#NUM!` —
+   with no possibility of it being a missing coercion in disguise.
+9. **Whether an array lifts is the dialect's decision, not the
+   function's.** `SQRT({4,9})` is `2` under `legacy` (the table's
+   `top_left_reduction`, which is a reduction and explicitly *not* an
+   intersection) and `{2,3}` under `dynamic_array`. A mixed signature —
+   a range slot beside a scalar one — refuses as `NotYetImplemented`
+   rather than guessing ahead of M7a's decision table.
+10. **`SQRT(-1)` is a second excel-adapter divergence, and the two
+    excel-fidelity manifests disagree with EACH OTHER about it.** The
+    hand-spec suite records `#NUM!` (Excel's answer); LibreOffice
+    records `#VALUE!`. That disagreement is itself the proof that the
+    row is about the adapter and not about the rule, so it joins `-0` in
+    a named `excel_adapter_divergences` list with the skip count
+    asserted — never silently dropped.
+11. **Wrong arity is `FormulaMalformedInput`, not `#VALUE!`.** Excel
+    cannot store a formula whose argument count its own registry
+    rejects, so such input did not come from a workbook. An unregistered
+    *call* is `FormulaUnsupportedFunction` (§7) and an unresolvable
+    *name* in value position is a plane-1 `#NAME?` (§5.9) — three
+    different answers to three different questions.
+12. **Not-yet-implemented is its own named refusal with an enumerated
+    membership.** `NotYetImplemented` maps to
+    `FormulaUnsupportedConstruct` but is listed separately in
+    `not_yet_implemented`, currently one entry: 3D sheet spans (M4b3).
+    A later row deletes a line and watches a test fail until it does —
+    which conflating the two would have made impossible.
+13. **The five required registry fields carry no defaults, and a test
+    reads `@typeInfo` to prove it.** An omitted propagation class is how
+    `COUNTA` quietly becomes `COUNT`. Three comptime checks back it up:
+    the two parallel per-slot tables must agree on slot count, a
+    `.plain` form must have an impl and no lazy slot, and a deferring
+    form must have a lazy slot and no impl.
+14. **The empty matrix normalizes at the call boundary and nowhere
+    else**, and is tested by invoking a test-local `Function` whose impl
+    returns `error.EmptyMatrix` — rather than by adding a fake entry to
+    the shipped table. The first v1 function that can produce one is
+    `FILTER` at M7a; the boundary is ready before it.
+15. **The fake implements the merge, not a stub of it.** Entries sort by
+    `(row, col, layer descending)` on insert, so ordered iteration is
+    independent of insertion order *by construction* — there is no code
+    path that could return backing order because there is no backing
+    order — and a merged read is a lower bound rather than a scan. Both
+    iterators carry their state inline behind a compile-time size bound,
+    so iteration allocates nothing.
+16. **Zig runs an imported file's tests only once something in it is
+    referenced.** `eval.zig`'s test artifact reported *0 tests* while
+    the file had no test of its own, silently taking `registry.zig`'s
+    eleven with it. `test { _ = registry; _ = env; }` is not decoration.
+17. **Operator chains are folded iteratively, and the evaluator's depth
+    limit is its own field.** Every value operator is left-associative,
+    so `1+1+1+…` parses as a tree as deep as it is long — and a
+    5 000-term sum, comfortably inside Excel's 8 192-character limit,
+    overflowed the stack when the walk recursed into it (caught by a
+    fixture, not by a review). `Evaluator.binary` now descends the left
+    spine on the heap and folds it back, which preserves §5.3c's
+    left-to-right operand order exactly while leaving recursion bounded
+    by *parenthesis* nesting — something §9 already bounds at 256. The
+    residual `max_eval_depth` is a separate `Options` field, not
+    `Limits.max_parse_depth`: the two count different things, and
+    reusing the parser's 256 would have refused a 300-term sum that
+    parsed perfectly well.
+
+**Spec-pinned at M3a2 (no committed manifest decides them):** `IF`'s
+omitted third argument is `FALSE`; `CHOOSE` truncates its index toward
+zero and is `#VALUE!` outside `1..n`; `IFS`/`SWITCH` with no match are
+`#N/A`; `AND`/`OR` over no logical value at all is `#VALUE!`; a
+disjoint `intersect` is `#NULL!`; a multi-area reference in a *value*
+context is `#VALUE!`; `A1#` against a non-anchor is `#REF!`; a
+reference to an unknown sheet is `#REF!`.
 
 ### 5.4 Numeric & text fidelity
 
@@ -1148,9 +1282,9 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M4b1** | EvalEnv adapter + decode boundary (**decoding split by carrier class (corrected)**: FORMULA carriers — `<f>` bodies, defined-name bodies, table formulas — **XML-entity decoding ONLY** (ST_Xstring does NOT apply; literal `"_x0041_"` in a formula survives byte-exact, round-trip oracle); STRING carriers — SST, inline, `t="str"` `<v>` — XML-entity THEN ST_Xstring, RICH strings concatenating all visible `<r>/<t>` runs in document order, `<rPh>` excluded (inline reader returns first `<t>` only, `sheet_xml.zig:552-563`; SST rich `sst_xml.zig:56-66`); authored STRING output ST_Xstring-encodes; authored FORMULA output XML-escapes only (raw borrowed XML today: `sheet_xml.zig:522`, `workbook_xml.zig:61`); authored formula text **XML-escapes ONLY — no ST_Xstring stage** (string carriers alone use ST_Xstring); authored-formula tests prove literal `_x0041_` stays literal; fixtures with `_x005F_`, encoded controls, and entity escapes in formulas AND names — `_xHHHH_`, escaped `_x005F_`, C0 controls, across SST/inline/`t="str"`; the SST view decodes XML entities only today, `sst_xml.zig:174-193`) + **input cell-type contract** (§5.7.2) + **implicit-coordinate reconstruction** (a `<c>` without `r` takes the column after the preceding cell — Office semantics, MS-OE376 §2.1.624; the parser SKIPS such cells today, `sheet_xml.zig:507`; fixtures: first-cell-no-r, gaps, formulas, out-of-grid) + symbol layer + namespace preflight | Decode/`'R&D'`/prefixed fixtures |
 | **M4b2** | Full calc-state parse + **CT_CellFormula attribute inventory** + shared classification + topology validation + translation | Slave-shape + topology matrix; attribute fixtures |
 | **M4b3** | Name resolution + table producers + 3D matrix + cache-based `evaluate` | Site semantics; opaque names; 3D fixtures |
-| **M4c** | F1a-1 (~18: operators; IF, AND, OR, NOT, IFERROR, IFNA, IFS, SWITCH; ISBLANK, ISNUMBER, ISTEXT, ISERROR, ISERR, ISNA, ISLOGICAL, NA, N, T) | Oracle-first |
+| **M4c** | F1a-1 (20: operators; IF, AND, OR, NOT, IFERROR, IFNA, IFS, SWITCH; ISBLANK, ISNUMBER, ISTEXT, ISERROR, ISERR, ISNA, ISLOGICAL, NA, N, T; **TRUE, FALSE** — added at M3a2, see the decisions block) | Oracle-first |
 | **M4d** | F1a-2 (~17: ABS, ROUND, ROUNDUP, ROUNDDOWN, INT, TRUNC, MOD, POWER, SQRT, EXP, LN, LOG, LOG10, SIGN, PI, RAND, RANDBETWEEN) + multi-callsite/lazy-branch draw KATs | Oracle-first; KATs |
-| **M4e** | F1b (~22: SUM, COUNT, COUNTA, COUNTBLANK, AVERAGE, MIN, MAX, SUMIF, COUNTIF, AVERAGEIF, SUMPRODUCT; VLOOKUP, HLOOKUP, INDEX, MATCH, XLOOKUP, XMATCH, CHOOSE, ROW, ROWS, COLUMN, COLUMNS) — **Core gate ≈57** | Oracle-first |
+| **M4e** | F1b (~22: SUM, COUNT, COUNTA, COUNTBLANK, AVERAGE, MIN, MAX, SUMIF, COUNTIF, AVERAGEIF, SUMPRODUCT; VLOOKUP, HLOOKUP, INDEX, MATCH, XLOOKUP, XMATCH, CHOOSE, ROW, ROWS, COLUMN, COLUMNS) — **Core gate 59** | Oracle-first |
 | **M4f** | F1c-text (~19: LEFT, RIGHT, MID, LEN, LOWER, UPPER, TRIM, CONCAT, CONCATENATE, TEXTJOIN, SUBSTITUTE, REPLACE, FIND, SEARCH, EXACT, VALUE, REPT, CHAR, CODE) + **CV1/CV2 shared text layer** (§5.4d; collation_v1 landed at M3a) | Oracle-first; codec tests; per-CV fixtures |
 | **M4g** | F1c-date (~15: DATE, YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, TODAY, NOW, EOMONTH, EDATE, WEEKDAY, DATEVALUE, TIMEVALUE, TIME) | Oracle-first |
 | **M5a1** | graph.zig: node model, SCC condensation, deterministic order, **seed table**, range-order contract; closure eval semantics | Scaling assertion; order fixtures; **randomized differential test vs a brute-force graph builder** (overlaps, full rows/cols, 3D spans, names, spill resize/invalidation — a missed edge passes perf tests but corrupts caches) |
@@ -1194,8 +1328,11 @@ classes, volatility (`ca` excluded — cell scheduling only), propagation class
 (`propagate|observe|per_element|per_function_provenance` — no generic
 skip-errors class survives §5.3c), reference-producing,
 DA-awareness, locale/collation/platform/CV flags, impl fn. **Frozen inventory
-file (committed M3a) is the authoritative count source**; every F-batch PR
-regenerates its count from it. Unregistered calls → typed refusal; `#NAME?`
+file (committed M3a) is the authoritative count source** —
+`src/formula/function_inventory_v1.tsv`, **175 rows** of
+`name<TAB>milestone<TAB>batch`, sorted and unique; every F-batch PR
+regenerates its count from it. The five metadata fields carry no defaults and
+a `@typeInfo` test proves it. Unregistered calls → typed refusal; `#NAME?`
 only for value-position resolution failure. Batch contents are enumerated in
 the ladder rows above (single source, no duplicate list to drift).
 
