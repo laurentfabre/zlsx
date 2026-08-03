@@ -5,8 +5,9 @@
 //! rows or columns, or sheet rename) to every A1-style cell or range
 //! reference it can recognise. Round-trip property of the underlying
 //! tokenizer is preserved for everything we don't touch — whitespace,
-//! literals, operators, names, and `.unknown` (external-workbook,
-//! dynamic-array spill, etc.) bytes pass through verbatim.
+//! literals, operators, names, and every opaque kind (`.unknown`,
+//! `.external_ref`, `.structured_ref`, the dynamic-array operators)
+//! pass through verbatim.
 //!
 //! Scope (this iter):
 //!   - Bare A1 cell refs:                   A1, $A$1, $A1, A$1
@@ -15,10 +16,12 @@
 //!   - Apostrophe-escaped quoted sheets:    'It''s'!A1
 //!   - Insert/delete rows/cols, sheet rename
 //!
-//! Out of scope (deferred — match tokenizer M1 boundaries):
+//! Out of scope (deferred):
 //!   - R1C1, structured table refs, 3D refs, dynamic-array `#`/`@`,
-//!     external-workbook brackets. The tokenizer classifies these
-//!     as `.unknown`; we leave them alone.
+//!     external-workbook brackets. Since M1a the tokenizer gives each
+//!     of these its own kind rather than lumping them into
+//!     `.unknown`; `isOpaqueQualifier` is where the rewriter names the
+//!     ones it must not follow.
 //!   - Full-column / full-row refs (`A:A`, `1:5`). The tokenizer
 //!     reports these as `name op_range name` / `number op_range
 //!     number`; this iter does not yet reshape them.
@@ -409,6 +412,17 @@ fn applyEdit(
 
     var i: usize = 0;
     while (i < work.len) {
+        // An external-workbook prefix disqualifies everything it
+        // qualifies, not just itself: in `[1]Sheet1!A1` the sheet and
+        // the ref are inside a workbook we cannot see, yet they
+        // tokenize as an ordinary `name bang cell_ref` triple that the
+        // qualifier matcher below would happily rewrite. Skip the
+        // whole chain.
+        if (work[i].kind == .external_ref) {
+            i = endOfExternalReference(work, i);
+            continue;
+        }
+
         // Detect sheet qualifier: (sheet_name | name) bang cell_ref [: cell_ref]
         const sq = matchSheetQualifier(work, i);
         if (sq) |info| {
@@ -418,12 +432,12 @@ fn applyEdit(
         }
 
         // Bare cell ref or range starting at this token. Skip
-        // refs that follow an `.unknown !` qualifier — those are
-        // scoped to an opaque (e.g. external-workbook) sheet that
-        // the rewriter cannot reason about. Mutating them would
-        // corrupt formulas pointing at workbooks we don't see.
+        // refs that follow an opaque `!` qualifier — those are
+        // scoped to a sheet the rewriter cannot reason about
+        // (external workbook, unclassifiable bytes). Mutating them
+        // would corrupt formulas pointing at workbooks we don't see.
         if (work[i].kind == .cell_ref) {
-            if (i >= 2 and work[i - 1].kind == .bang and work[i - 2].kind == .unknown) {
+            if (i >= 2 and work[i - 1].kind == .bang and isOpaqueQualifier(work[i - 2].kind)) {
                 i += 1;
                 continue;
             }
@@ -435,6 +449,38 @@ fn applyEdit(
 
         i += 1;
     }
+}
+
+/// Token kinds that stand in for a sheet the rewriter must not reason
+/// about. M1a split the old single `.unknown` bucket into typed kinds
+/// — an external-workbook prefix is now `.external_ref` — so the guard
+/// has to name each one; keying on `.unknown` alone silently started
+/// rewriting external references.
+fn isOpaqueQualifier(kind: Token.Kind) bool {
+    return switch (kind) {
+        .unknown, .external_ref, .structured_ref => true,
+        else => false,
+    };
+}
+
+/// Index just past everything an `.external_ref` at `start` qualifies:
+/// `[1]Sheet1!A1:B2`, `[1]!Name`, `'[B.xlsx]S'!A1`. Each element is
+/// optional, so a bare `[1]` consumes only itself.
+fn endOfExternalReference(work: []const Token, start: usize) usize {
+    assert(work[start].kind == .external_ref);
+    var i = start + 1;
+    if (i < work.len and (work[i].kind == .name or work[i].kind == .sheet_name)) i += 1;
+    if (i < work.len and work[i].kind == .bang) i += 1;
+    if (i < work.len and work[i].kind == .cell_ref) {
+        i += 1;
+        if (i + 1 < work.len and work[i].kind == .op_range and work[i + 1].kind == .cell_ref) {
+            i += 2;
+        }
+    } else if (i < work.len and work[i].kind == .name) {
+        // `[1]!DefinedName`
+        i += 1;
+    }
+    return i;
 }
 
 const SheetQualifierInfo = struct {
@@ -956,20 +1002,166 @@ test "target_sheet scopes sheet-qualified refs" {
     );
 }
 
-test "unknown tokens are not mutated" {
-    // External-workbook ref tokenizes as `.unknown`; survives intact.
+test "opaque tokens are not mutated" {
+    // External-workbook ref: `.external_ref` since M1a, and the sheet
+    // and cell it qualifies are inside a workbook we cannot see.
     try expectRewrite(
         "'[Book.xlsx]Sheet1'!A1+1",
         .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
         "'[Book.xlsx]Sheet1'!A1+1",
     );
-    // Dynamic-array spill `A1#` — the `A1` is a cell_ref but the
-    // trailing `#` is `.unknown`. Per the tokenizer's contract we
-    // SHOULD NOT touch `.unknown`. The bare A1 still shifts.
+    // Dynamic-array spill `A1#` — the `A1` is a live cell_ref and the
+    // trailing `#` is `.op_spill`. The ref still shifts; the operator
+    // is passed through.
     try expectRewrite(
         "A1#",
         .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
         "A2#",
+    );
+}
+
+// ─── M1a compat gate: untouched-construct identity ────────────────
+//
+// Every construct the tokenizer classifies but the rewriter must not
+// reach into has to come back byte-identical under EVERY edit
+// variant. This is the gate M1a's new token kinds are measured
+// against: a kind that is wrong is a licence for the rewriter to
+// mutate, and a silent mutation inside a table column name or an
+// external workbook reference corrupts a formula rather than failing.
+
+/// The full edit matrix, applied with the most permissive scoping
+/// available (`target_sheet = null` — "apply to bare refs everywhere
+/// AND every sheet-qualified ref"). Identity under these is the
+/// strongest form of the claim.
+const all_edits = [_]RewriteEdit{
+    .{ .insert_rows = .{ .at = 1, .count = 1 } },
+    .{ .delete_rows = .{ .at = 1, .count = 1 } },
+    .{ .insert_cols = .{ .at = 1, .count = 1 } },
+    .{ .delete_cols = .{ .at = 1, .count = 1 } },
+    .{ .rename_sheet = .{ .old = "Sheet1", .new = "Renamed" } },
+    .{ .delete_sheet = "Sheet1" },
+};
+
+fn expectIdentityUnderEveryEdit(input: []const u8) !void {
+    for (all_edits) |edit| {
+        const out = try rewriteFormula(testing.allocator, input, .{ .edit = edit });
+        defer testing.allocator.free(out);
+        if (!std.mem.eql(u8, input, out)) {
+            std.debug.print(
+                "edit {s} mutated an untouchable construct:\n  in:  '{s}'\n  out: '{s}'\n",
+                .{ @tagName(edit), input, out },
+            );
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+test "compat: structured table refs survive every edit byte-identically" {
+    // `Table1[A1]` is the correction the M1a ladder row names. Before
+    // M1a the inner `A1` tokenized as a live `.cell_ref`, so
+    // insert_rows rewrote a table COLUMN NAME to `A2` — a formula
+    // corruption with no error and no diagnostic.
+    for ([_][]const u8{
+        "Table1[A1]",
+        "Table1[Amount]",
+        "Table1[#All]",
+        "Table1[#Headers]",
+        "Table1[@Amount]",
+        "Table1[[#Data],[Amount]]",
+        "Table1[[#This Row],[Unit Cost]]",
+        "[@Amount]",
+        "[[Col A]:[Col B]]",
+        "Table1[Cost '[USD']]",
+        "SUM(Table1[Amount])",
+        "SUM(Table1[A1]:Table1[B2])",
+        "Sales[[#Data],[Q'[1']]]",
+    }) |c| try expectIdentityUnderEveryEdit(c);
+}
+
+test "compat: external references survive every edit byte-identically" {
+    // Both spellings, and everything each one qualifies — the sheet
+    // name and the cell reference belong to a workbook we never see.
+    for ([_][]const u8{
+        "'[Book.xlsx]Sheet1'!A1",
+        "'[Book.xlsx]Sheet1'!A1:B2",
+        "'[Book.xlsx]Sheet1'!$A$1",
+        "[1]Sheet1!A1",
+        "[1]Sheet1!A1:B2",
+        "[1]!Total",
+        "[12]'My Sheet'!A1",
+    }) |c| try expectIdentityUnderEveryEdit(c);
+}
+
+test "compat: literals, names and operators survive every edit" {
+    for ([_][]const u8{
+        "1+2*3",
+        "\"A1 inside a string\"",
+        "\"a\"\"b\"",
+        "TRUE",
+        "FALSE()",
+        "#N/A",
+        "#REF!",
+        "#DIV/0!",
+        "#GETTING_DATA",
+        "#BLOCKED!",
+        "#PYTHON!",
+        "{1,2;3,4}",
+        "MyName.Sub",
+        "\\Foo",
+        "SUM(MyRange)",
+        "  ",
+        "",
+        "50%",
+        "1.5e+10",
+        "R1C1",
+        "R[-1]C[2]",
+        "@SUM(MyRange)",
+    }) |c| try expectIdentityUnderEveryEdit(c);
+}
+
+test "compat: unicode names survive every edit" {
+    // Pre-M1a these shattered into one `.unknown` per byte. Round-trip
+    // held, so the identity gate passed for the wrong reason; the
+    // kinds are what makes it hold for the right one.
+    for ([_][]const u8{
+        "Ω",
+        "ДАННЫЕ",
+        "Größe+données",
+        "SUM(日本語)",
+        "\u{1D400}",
+        "e\u{0301}_total",
+        "\u{FF21}1",
+    }) |c| try expectIdentityUnderEveryEdit(c);
+}
+
+test "compat: recognised refs still rewrite next to untouchable ones" {
+    // The identity claim must not degrade into "the rewriter stopped
+    // working". A live ref beside an opaque construct still shifts.
+    try expectRewrite(
+        "Table1[A1]+A1",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "Table1[A1]+A2",
+    );
+    try expectRewrite(
+        "'[Book.xlsx]Sheet1'!A1+A1",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "'[Book.xlsx]Sheet1'!A1+A2",
+    );
+    try expectRewrite(
+        "[1]Sheet1!A1+Sheet1!A1",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "[1]Sheet1!A1+Sheet1!A2",
+    );
+    try expectRewrite(
+        "SUM(Table1[Amount])+B5",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "SUM(Table1[Amount])+B6",
+    );
+    // A sheet rename reaches the local sheet, never the external one.
+    try expectRewrite(
+        "'[Book.xlsx]Sheet1'!A1+Sheet1!A1",
+        .{ .edit = .{ .rename_sheet = .{ .old = "Sheet1", .new = "Renamed" } } },
+        "'[Book.xlsx]Sheet1'!A1+Renamed!A1",
     );
 }
 

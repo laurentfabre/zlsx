@@ -9,6 +9,7 @@
         "build.zig.zon",
         "src",
         "pkg",
+        "refs",
         "unicode",
         "tests",
         "scripts",
@@ -16,5 +17,6 @@
         "assets",
         "README.md",
         "LICENSE",
+        "THIRD_PARTY_NOTICES.md",
     },
 }

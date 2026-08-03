@@ -199,6 +199,56 @@ errors round-trip). Round-trip holds for all. Compat gate: previously-
 recognized constructs rewrite byte-identically; `Table1[A1]` correction
 fixtured.
 
+**M1a decisions (shipped 2026-08-03).** Nine points the row left open or
+got wrong, pinned here because M2 builds directly on them:
+
+1. **Refusals are out-of-band, not errors.** The tokenizer never fails
+   on malformed input (only OOM) — failing would break the round-trip
+   every downstream byte-identity gate rests on. `scan()` returns
+   `{tokens, refusals}` with a typed `Refusal.Reason` per construct
+   (`invalid_utf8`, `identifier_too_long`, `backslash_after_start`,
+   `r1c1_reference`, `external_reference`, `unterminated_*`), each
+   annotated with the §10 plane-2 error M2 raises for it. `tokenize()`
+   keeps the pre-M1a signature for the rewriter.
+2. **`?` dropped from the identifier set** (it was in the pre-M1a
+   predicate). Excel does not accept `?` in defined names, and the
+   normative grammar is `XID_Continue ∪ {_, .}`. Correction, fixtured.
+3. **Extensible-error rule is bounded**: `#` + 1..62 bytes of
+   `[A-Za-z0-9_/.]` + `!`/`?`, cap 64 bytes total. Unbounded, a stray
+   `#` swallows the rest of the expression looking for a terminator. A
+   `#` matching neither the whitelist nor this rule is `.op_spill`.
+4. **Bare `RC` is NOT rejected as R1C1** — `RC` is also column 471, so
+   `RC:RC` is a live A1 full-column reference and the A1 reading wins
+   under the §5.2 precedence. Rejection covers `R<n>C<n>` (≥1 digit)
+   plus `R[`/`C[` by lookahead. `RC1` never reaches the rule: it is a
+   cell reference.
+5. **`.external_ref` also covers the `[1]` workbook-index form**, and
+   the *whole chain it qualifies* is untouchable — `[1]Sheet1!A1`
+   tokenizes as an ordinary `name bang cell_ref` triple that the
+   rewriter would otherwise happily shift. `isOpaqueQualifier` +
+   `endOfExternalReference` in `rewriter.zig` are the guard; the compat
+   suite is what proves it.
+6. **`$1` needs its own scan branch.** Digits cannot start an
+   identifier, so the `$` of the absolute full-row form `$1:$1` would
+   otherwise strand as a lone lexeme and split a construct the pre-M1a
+   tokenizer kept whole.
+7. **`a\b` yields two adjacent names, not name-unknown-name.** `\` is
+   start-only, so it terminates the first identifier and starts a
+   second. The refusal is the signal; the token shape is incidental.
+8. **The regen gate normalises through `zig fmt`** before diffing: the
+   committed tables are formatted and `zig fmt` column-aligns long
+   scalar lists, so a raw diff reports whitespace churn on byte-correct
+   data. Running it also proved the committed casefold/NFC tables
+   reproduce exactly from their pinned inputs.
+9. **`refs/` was missing from `build.zig.zon` `.paths`** (M0 gap — the
+   packaged module could not have built); added with
+   `THIRD_PARTY_NOTICES.md`.
+
+**Still open (owner action):** `LICENSE` needs the third-party-data
+carve-out saying the Unicode-derived tables are licensed separately.
+`THIRD_PARTY_NOTICES.md` flags it; the carve-out itself is not a code
+change and is not made here.
+
 **Parser (M2)**: AST + canonical printer (parse→print→parse structural
 equality). Precedence (oracle-pinned rows): `:` > ` ` > `,`(ref) >
 unary`±`(right; `=-1^2=1`) > `%` (interaction fixtures) > `^` (left; `2^3^2=64`)
@@ -1279,7 +1329,7 @@ classified flip-at / historical-label):
 | `bindings/python/README.md:252` ("never") + **full new-API docs**: methods, `Matrix`, `ExcelError`, refusal/cancellation semantics | **M9a2** gate (docs land with the code PR) |
 | `bindings/python/README.md:177-179` ("all batch options apply to streaming" — false once recalc refuses streaming) + **Spark option table (batch-only)** | **M9b** gate |
 | `src/xlsx.zig:1-13` · `src/cli.zig:1,1141` · `pkg/workbook.zig:366,5477-5479` | in-source scope comments (incl. the "future evaluator (Tier D1)" promise at the emitCell branch) | with the code that changes them (**M5d/M6**) |
-| `src/formula/tokenizer.zig:566-575` (scope note made false by the new token kinds) | tokenizer scope comment | **M1a** (with the tokens themselves) |
+| ~~`src/formula/tokenizer.zig:566-575`~~ (scope note made false by the new token kinds) | tokenizer scope comment | **M1a — done**: module doc rewritten with the tokens; `rewriter.zig`'s matching "classifies these as `.unknown`" claim flipped too |
 | `build.zig:891-893` ("zlsx and zlsx_pkg cannot coexist" — contradicted by `zlsx_recalc`) | module-graph comment | **M5c**; `build.zig` joins the release rg scan |
 | `src/writer.zig:1645-1647` (claims the reader does not expose formula text — already false, `src/xlsx.zig:2070-2135`) | stale reader claim | **M-1** historical correction; sweep regex extended to read-side formula-text claims |
 | `AGENTS.md` | add formula conventions + harness how-to | **M4c** |
