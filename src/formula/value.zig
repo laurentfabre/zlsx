@@ -1113,7 +1113,14 @@ pub const DivergencePoint = struct {
 pub const divergence_points = [_]DivergencePoint{
     .{ .rule = "N1a", .what = "17-significant-digit literal ingress", .expect = .must_differ, .evidence = .spec_pinned },
     .{ .rule = "N1b", .what = "cached <v> import is full binary64", .expect = .must_agree, .evidence = .spec_pinned },
-    .{ .rule = "N2", .what = "near-zero additive result", .expect = .must_differ, .evidence = .spec_pinned },
+    // Oracle-backed since M3a2. A comparison is a subtraction against
+    // zero, so `(0.1+0.2)=0.3` is a zero-snap case — and the committed
+    // manifests decide it in BOTH directions: the LibreOffice
+    // excel-fidelity suite records TRUE, the hand-spec ieee suite FALSE.
+    // The snap's *existence* is therefore evidence, not text; its exact
+    // `2^-48` threshold is still spec-pinned (bounded below at ~1.85e-16
+    // relative by that row, and by nothing above).
+    .{ .rule = "N2", .what = "near-zero additive result", .expect = .must_differ, .evidence = .oracle },
     .{ .rule = "N2", .what = "near-zero product is outside additive scope", .expect = .must_agree, .evidence = .spec_pinned },
     .{ .rule = "N3", .what = "signed zero at publication", .expect = .must_differ, .evidence = .spec_pinned },
     .{ .rule = "N3", .what = "subnormals preserved", .expect = .must_agree, .evidence = .oracle },
@@ -1790,10 +1797,13 @@ test "Divergence ×2: the evidence label is honest about what the oracle decides
     for (divergence_points) |p| {
         if (p.evidence == .oracle) oracle_backed += 1;
     }
-    // Subnormals, overflow, and division by zero are the three the
-    // committed manifests decide. Everything else rests on §5.4's text,
-    // and says so rather than implying oracle backing.
-    try testing.expectEqual(@as(usize, 3), oracle_backed);
+    // Subnormals, overflow, and division by zero were the three M3a1
+    // could point at. M3a2 added a fourth: `(0.1+0.2)=0.3` is recorded
+    // TRUE by an excel-fidelity manifest and FALSE by the ieee one, and
+    // N2's snap is the only rule that produces that split. Everything
+    // else still rests on §5.4's text and says so rather than implying
+    // oracle backing.
+    try testing.expectEqual(@as(usize, 4), oracle_backed);
 }
 
 // ─── oracle ties (tests/oracle/fixtures) ─────────────────────────
