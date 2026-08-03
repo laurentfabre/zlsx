@@ -583,6 +583,63 @@ pub fn build(b: *std.Build) void {
     });
     fuzz_step.dependOn(&b.addRunArtifact(formula_parser_fuzz_tests).step);
 
+    // M3a1: the formula value model — ScalarValue/Matrix, the two
+    // fidelity rule tables, `parseDecimal`, the §5.3b shape and
+    // coercion tables, and `collation_v1`.
+    //
+    // `zlsx_casefold` is imported by the TEST section of value.zig and
+    // nowhere else. `src/unicode/casefold.zig` already belongs to the
+    // `zlsx` module's package tree (`src/xlsx.zig:25` imports it
+    // relatively), so a compilation holding both `zlsx` and a named
+    // module rooted on that file would fail "file exists in modules
+    // 'zlsx' and 'zlsx_casefold'" — the collision M0 hit with `refs/`.
+    // A file-scope `const` referenced only from a `test` block is not
+    // resolved in a non-test build (verified on 0.16.0), so consumers
+    // of value.zig from M3a2 onward can build it WITHOUT declaring this
+    // import and the collision never arises. `collation_v1` takes the
+    // fold as a parameter precisely so that stays true.
+    const formula_value_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/value.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_value_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_value_mod.addAnonymousImport("oracle_hand_spec_excel", .{
+        .root_source_file = b.path("tests/oracle/fixtures/hand_spec_excel.json"),
+    });
+    formula_value_mod.addAnonymousImport("oracle_hand_spec_ieee", .{
+        .root_source_file = b.path("tests/oracle/fixtures/hand_spec_ieee.json"),
+    });
+    formula_value_mod.addAnonymousImport("oracle_libreoffice_suite", .{
+        .root_source_file = b.path("tests/oracle/fixtures/libreoffice_oracle_suite.json"),
+    });
+    const formula_value_tests = b.addTest(.{ .root_module = formula_value_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_value_tests).step);
+
+    // M3a1: coverage-guided value fuzz targets (decimal ingress and
+    // arithmetic never panic and never go non-finite).
+    const formula_value_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/value.zig"),
+        .target = target,
+        .optimize = optimize,
+        .fuzz = true,
+    });
+    formula_value_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_value_fuzz_mod.addAnonymousImport("oracle_hand_spec_excel", .{
+        .root_source_file = b.path("tests/oracle/fixtures/hand_spec_excel.json"),
+    });
+    formula_value_fuzz_mod.addAnonymousImport("oracle_hand_spec_ieee", .{
+        .root_source_file = b.path("tests/oracle/fixtures/hand_spec_ieee.json"),
+    });
+    formula_value_fuzz_mod.addAnonymousImport("oracle_libreoffice_suite", .{
+        .root_source_file = b.path("tests/oracle/fixtures/libreoffice_oracle_suite.json"),
+    });
+    const formula_value_fuzz_tests = b.addTest(.{
+        .root_module = formula_value_fuzz_mod,
+        .test_runner = fuzz_test_runner,
+    });
+    fuzz_step.dependOn(&b.addRunArtifact(formula_value_fuzz_tests).step);
+
     // C1 milestone 2 (iter 1): pure-function A1 cell-formula
     // rewriter. Imports the M1 tokenizer via a relative path inside
     // src/formula/, so this module's package dir matches the

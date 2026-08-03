@@ -471,6 +471,134 @@ order of §5.6a (first stored error in area/sheet/row-major order wins for
 propagating aggregates). Mixed-error fixtures: IF, AND/OR, SUM over
 error-bearing ranges, VLOOKUP, array ops.
 
+**M3a1 decisions (shipped 2026-08-03).** Sixteen points the row left
+open or got wrong, pinned here because M3a2 builds directly on them:
+
+1. **Two number constructors, not one.** `ScalarValue.fromNumber`
+   asserts finiteness — an evaluator handing over a number it computed
+   knows it is finite, and a non-finite one is a bug in the caller.
+   `fromArithmetic` converts instead, because N4a's whole point is that
+   an overflow *is* a legitimate outcome (`#NUM!`). One constructor
+   doing both would either assert on a real overflow or let a
+   non-finite value into a `ScalarValue`, and both are worse than
+   having two names.
+2. **`provenanceOf` returns null for an actual number.** The §5.3b
+   matrix has seven rows and none of them is "already a number".
+   Returning a row anyway would invite a caller to look up a
+   disposition the normative table never stated.
+3. **The locale classifier's bias runs one way, deliberately.** A false
+   positive turns a case Excel answers with `#VALUE!` — a *successful*
+   plane-1 result — into a plane-2 refusal that stops a whole
+   recalculation; a false negative only costs a less informative error.
+   So `LocaleSensitive` requires a specific shape: a single decimal
+   comma, digit groups of exactly three under one consistent separator,
+   or currency/percent affixes around an otherwise-invariant number.
+   `1.2.3`, `1,23,456`, and `1 23` are not numbers under any locale and
+   get `#VALUE!`. Both sides are fixtured.
+4. **N1a applies to every ingress except `.cache_import`.** §5.4 pins
+   `literal` → N1a and `cache_import` → N1b but leaves
+   `text_coercion` / `function_arg` / `criteria` unstated. They round
+   like literals — Excel's `="1.2345678901234567"+0` yields the
+   15-digit value — and the cached `<v>` is the one input that is
+   *already* binary64, where re-rounding would corrupt a value nobody
+   asked us to reinterpret. Fixtured across all five ingresses in both
+   modes.
+5. **Space trimming is a property of the ingress, not of the text.**
+   `.literal` and `.cache_import` are stored forms and take their bytes
+   exactly; the three coercion ingresses trim ASCII spaces because that
+   is what Excel does with user text. `" 1 "` therefore parses on one
+   path and not the other — from one parser, which is the point of
+   there being only one.
+6. **N2's threshold is spec-pinned and provisional.** No committed
+   manifest contains a zero-snap case and the Excel oracle leg is
+   parked (M1b), so nothing on disk decides it. `2^-48` relative
+   (`zero_snap_relative_shift_v1`) snaps the textbook cases —
+   `1.1-1.0-0.1` and `0.1+0.2-0.3` — and is a **named constant** so
+   pinning it later is a one-line change with a fixture behind it.
+   Additive scope is enforced by construction rather than by comment:
+   `multiply` and `divide` never call the snap at all.
+7. **N5 has to choose between two renderings, and the choice is not
+   cosmetic.** Zig's `{d}` and `{e}` share the shortest-round-trip
+   digit generation and differ only in layout, so the shortest
+   round-tripping text is simply the shorter of the two. Positionally,
+   `5e-324` is **326 bytes** — a caller sizing a buffer for "a number"
+   would be wrong by an order of magnitude. `formatNumber` therefore
+   generates the positional form into private scratch and copies it out
+   only when it wins; `format_buf_len` is 32 and is a real bound.
+8. **`-0` is where the committed excel-fidelity evidence and §5.4
+   disagree — and it is the adapter, not the rule.** §5.4 says `.excel`
+   normalizes `-0` → `+0` at publication "(fixture-backed)". The only
+   committed excel-fidelity manifest is **LibreOffice**, which records
+   `-0` with bits `0x8000000000000000`. LibreOffice is not Excel and
+   the Excel leg is parked, so nothing on disk can settle it. §5.4's
+   rule is implemented as written; the row is listed in
+   `excel_adapter_divergences` and skipped from the excel-leg oracle
+   tie **by name**, with the skip count asserted — not silently
+   dropped.
+9. **Excel-fidelity manifests pin to 15 significant digits, not to
+   bits.** LibreOffice records `0.1+0.2` as `0.3` (bits
+   `0x3FD3333333333333`): its `<v>` carries the display-rounded value.
+   That is a serialization property of the adapter, **not** evidence
+   that excel-fidelity arithmetic rounds — §5.4 says publication is
+   post-N2/N3 binary64 and says nothing about rounding results. So the
+   tie compares excel manifests at 15 significant digits and `ieee`
+   manifests bit-exactly. M2 reached the same rule independently for
+   its precedence pins.
+10. **Subnormals are oracle-decided; most of §5.4 is not.** Both
+    manifests record `2^-1074` as `0x1` and `1E-308/10000000000` as
+    `0x316A2`, across fidelities. Exactly **three** of the nine
+    divergence points are oracle-backed — subnormals, overflow, and
+    division by zero — and each point carries an `evidence` field
+    saying `oracle` or `spec_pinned` rather than implying support it
+    does not have. A test asserts the count.
+11. **The Divergence ×2 gate asserts agreement as well as
+    disagreement.** A gate that only looked for differences would pass
+    if the modes diverged *everywhere*, which is exactly as wrong as
+    not diverging at all. Every point carries `must_differ` or
+    `must_agree`, both halves are asserted to have fired, and the probe
+    array is length-checked against the point array so a rule cannot be
+    added without a probe.
+12. **`collation_v1` takes the fold as a parameter, and the concrete
+    fold is imported only by the test section.**
+    `src/unicode/casefold.zig` already belongs to the `zlsx` module's
+    package tree (`src/xlsx.zig:25` imports it relatively), so a named
+    module rooted on the same file collides the moment `zlsx` imports
+    the formula engine — the failure M0 hit with `refs/` and M1a with
+    `unicode/xid.zig`. **Verified on 0.16.0**: a file-scope `const`
+    referenced only from a `test` block is not resolved in a non-test
+    build, so M3a2+ consumers compile `value.zig` without declaring the
+    import and the collision never arises. Injection keeps the
+    semantics independent of the build graph regardless.
+13. **Fold-equal implies equal for *ordering*, not just equality**, and
+    comparing folded sequences gives that for free: `A`/`a` and
+    `ß`/`ss`/`SS` come back `.eq` under `<` and `>`. A raw tie-break
+    would break it, which is why SORT/SORTBY's tie-break lives outside
+    the comparator under its own name (`sort_tiebreak_policy`).
+14. **Byte order over folded UTF-8 *is* code-point order**, so the
+    comparator needs no decoding pass. A property of the encoding,
+    recorded so nobody later "fixes" it into a slower loop.
+15. **`collation_v1` deliberately does not normalize, unlike sheet-name
+    dedup.** `casefold.excelSheetNameEql` applies NFC because
+    composed/decomposed sheet names should dedup; §5.3b says text
+    comparison uses code points as stored. Both behaviours are fixtured
+    side by side — `café` precomposed vs decomposed is *equal* as a
+    sheet name and *unequal* as text — so the difference reads as
+    intentional rather than as a missing call.
+16. **The shape and coercion tables ship as executable lookups.** Eight
+    shape rows × two dialects and the 7×8 = 56 coercion cells are
+    `switch` tables, with a fixture asserting every cell and a coverage
+    check proving that neither the table nor the fixture can lose a row
+    without the other noticing.
+
+**Still open (needs the parked Excel oracle leg):** N2's zero-snap
+threshold (decision 6) and the `.excel` signed-zero policy (decision 8).
+Both are implemented per §5.4's text and both are labelled
+`spec_pinned`; neither can be confirmed until the M1b Excel adapter runs.
+
+**Deferred to M4f:** moving `src/unicode/casefold.zig` to top-level
+`unicode/` (decision 12). M4f ships `casing_v1` from the same directory
+and is the milestone that may touch it.
+
 ### 5.4 Numeric & text fidelity
 
 **`excel_fp_rules_v1`** (fixture-pinned, oracle build recorded): N1a 15-digit
