@@ -768,6 +768,10 @@ tables.
 
 **5.4a Serial dates**: 0–60 domain (60 = fictitious 1900-02-29; 0 =
 1900-01-00), 1904 clean; boundaries pinned; reader contract untouched.
+Landed M3b as `src/formula/serial_date.zig` — **the 1900 epoch is two
+epochs** (serials 1–59 count from 1899-12-31, 61+ from 1899-12-30) and
+both invented days are representable rather than errors; see the M3b
+decisions block in §5.5.
 
 **5.4b Locale, collation, platform**: locale-sensitive **parses**
 (VALUE/DATEVALUE/TIMEVALUE/TEXT/NUMBERVALUE) carry pinned invariant grammars;
@@ -905,6 +909,134 @@ layer (CLI: shipped `--sheet N | --name NAME` grammar, one mandatory for
 only for argless ROW/COLUMN, `@` intersection row/col, `#This Row`; missing →
 `FormulaAnchorRequired`. Determinism: equal RunInputs + bytes + build +
 target ⇒ byte-equal; cross-target CI goldens; wall-clock only as cancellation.
+
+**M3b decisions (shipped 2026-08-03).** Eighteen points the row left
+open, got wrong, or discovered. They span §5.4a (serial dates), §5.3b
+(criteria), §5.5 (run inputs), and §9 (the byte budget), and are
+collected here because that is the section whose subject — what a run is
+*given* — covers all four.
+
+1. **The library reads no clock and no entropy source, and the type
+   system says so.** `now_utc_ms` and `rng_seed` are required fields
+   with no defaults, and a test reads `@typeInfo` to prove every other
+   field has one. A default would mean the library resolved an input on
+   its own, and "equal inputs ⇒ equal output" would be false in a way no
+   test could see.
+2. **`ResourceLimits` is a second limits struct, not an extension of
+   `parser.Limits`.** §9 holds three different kinds of limit: parse
+   *shape* (M2, enforced while parsing), aggregate *bytes and counts*
+   (this row, enforced by an allocator wrapper), and *work* counters —
+   cell evaluations, SCC passes — which can burn CPU without allocating
+   and therefore need explicit counters (M5a2). Three mechanisms, three
+   structs; merging them would put an enforcement point in a struct that
+   cannot reach it.
+3. **An exhausted budget is a refusal, not an allocation failure.**
+   `std.mem.Allocator` can only say `OutOfMemory`, so `Budget` records
+   the **first** category to trip and the evaluator maps that onto
+   `FormulaLimitExceeded`. Without the record, "your formula asked for
+   too much" and "this machine is out of memory" are the same error, and
+   only one of them is the caller's to fix.
+4. **Nothing mutates on a refusal.** The charge is checked *before* the
+   backing allocator is called, so a rejected allocation leaves the
+   counter and the heap exactly as they were. Below/at/above boundary
+   tests for all five categories.
+5. **`matrix_cells` is charged as a count, through an explicit
+   `charge`, not through the allocator.** §9 bounds *cells* so that the
+   limit means the same thing whatever `@sizeOf(ScalarValue)` happens to
+   be; routing it through byte accounting would silently re-scale it.
+6. **Three of the five categories have a charge site at M3b, and the
+   gap is named rather than hidden.** `run_arena` (the arena is built
+   over the budget), `string_payload` (concatenation, number formatting,
+   string-literal unescaping — borrowed text is *not* charged, because
+   the run did not create it), and `matrix_cells`. `retained_asts` and
+   `diagnostics` have no producer inside the evaluator: ASTs belong to
+   the caller and the diagnostic sink is M6's. The **mapping** is proven
+   for all five; the charge sites arrive with their producers.
+7. **The 1900 epoch is two epochs, and is written as two constants.**
+   Serials 1–59 count from 1899-12-31 and serials 61+ from 1899-12-30.
+   Expressing that as one epoch plus a correction is the same arithmetic
+   wearing a disguise; two named constants make the discontinuity
+   impossible to lose, and a comptime assertion pins their difference at
+   exactly one day.
+8. **Both invented days are representable, not errors.** Serial 0 is
+   `1900-01-00` and serial 60 is `1900-02-29`, a date that never
+   happened. Both appear in real workbooks, so a converter that refused
+   them would refuse files Excel opens. A `Fictitious` tag names which
+   one, so a caller that ignores it still gets a sensible `year`/
+   `month`/`day` rather than an out-of-band sentinel.
+9. **The round trip is tested over the whole domain, not a sample.**
+   ~3 M serials per system, walked in milliseconds. Every interesting
+   failure in date arithmetic is within two days of a boundary, which is
+   exactly what sampling misses. A separate monotonic-and-gapless test
+   covers the failure a round trip alone permits: two serials mapping to
+   one date.
+10. **Excel's documented maxima are asserted against the calendar, not
+    trusted.** `2958465` and `2957003` are checked at comptime against
+    `daysFromCivil(9999,12,31)`, and their 1462-day difference — the
+    constant every 1900↔1904 conversion turns on — is pinned too.
+11. **A criterion is not a comparison: it is type-restricted.** `">5"`
+    never matches a text cell, even though §5.3b's total preorder puts
+    every text above every number. Applying the preorder here would make
+    `COUNTIF(A:A,">5")` count words — wrong, and the kind of wrong that
+    looks right in a small fixture. **Spec-pinned**: no committed
+    manifest contains a criteria row.
+12. **Wildcards need a folded-unit → original-code-point map, and
+    per-code-point folding is what produces it.** §5.4b says `?`
+    consumes one code point of the *original*, so `"?"` matches `ß`
+    while `"?s"` does not, and `"ss"` matches it because a literal run
+    may span an expansion — provided it lands on a code-point boundary,
+    which is what stops `"s"` from matching half a folded `ß`. The
+    non-Turkic full fold is defined per code point, so folding
+    code-point-wise and folding the whole string agree byte for byte
+    (fixtured over a 16-string corpus) and only the former yields the
+    map. No change to `casefold.zig` was needed.
+13. **"Has a wildcard" and "needs the pattern matcher" are different
+    questions.** The first implementation conflated them and
+    `COUNTIF(range,"~*")` silently failed to match a literal `*`: the
+    escape still has to be stripped even when no wildcard survives it.
+    The field is `is_pattern`, and `hasWildcards` is tested separately.
+14. **Blank positions are scanned as runs, and whether a blank
+    satisfies the criteria is computed once per scan.** It is the same
+    answer at every position in a run; computing it per position is
+    exactly what would make `COUNTIF(A:A,"")` walk 1 048 576
+    coordinates. `ScanResult.visited` counts every position covered, so
+    a run-based cursor can be audited for double-counting.
+15. **`ScanResult` must not be blanket-reset.** `result.* = .{}`
+    discarded the caller's `hits` storage — found by a fixture reading
+    back `0xAAAAAAAA`, not by review. The reset preserves it.
+16. **`rng_v1` is written out rather than taken from
+    `std.Random.DefaultPrng`.** The plan names xoshiro256\*\*; the
+    stdlib's default is a different member of the family, and a stdlib
+    default is free to change between Zig releases — which is precisely
+    what a *versioned* generator must not do. Twenty lines of explicit
+    state is the cheaper guarantee.
+17. **The KATs were cross-checked against an independent
+    implementation, not recorded from this one.** A golden generated by
+    the code it guards proves only that the code agrees with itself.
+    `splitmix64(0)`'s published first output `0xE220A8397B1DCDAF`
+    anchors the seeding half from outside the repository.
+18. **`deadline` and `cancel` are absent from `EffectiveRunInputs` by
+    construction, and the dialect projection differs per operation.** A
+    field that is not in the struct cannot leak into a cache key, so the
+    exclusion needs no filter anyone could forget. `effective` takes an
+    `Operation` because standalone eval keys on the caller's dialect
+    while a recalc derives it per stored cell and normalizes it out —
+    keying on it there would split identical work across two entries.
+
+**Spec-pinned at M3b (no committed manifest decides them):** the
+type-restriction rule above; `""` matches true blanks and `""` cells
+while `"<>"` matches everything else; an error *spelling* (`"#N/A"`) is
+an error operand and matches error cells, which is why `COUNTIF` can
+match what `COUNT` cannot count; a text criterion never matches a
+logical cell and vice versa (§5.3b's cross-type rule); a trailing `~`
+escapes nothing and is dropped; wildcards are inert under an ordering
+operator.
+
+**Also verified at M3b:** criteria scanning reads through `EvalEnv`
+directly rather than through `Evaluator.readRange`, and the areas are
+still captured as runtime dependencies — because M3a2 records a
+reference where it is *constructed*, not where it is read. Fixture-pinned
+rather than assumed.
 
 ### 5.6 Graph, order, cycles, dynamic refs
 
@@ -1525,7 +1657,7 @@ adds a TEXT-heavy bench; M9d adds a mixed full-registry workload
 | `max_output_archive_bytes` | **2³²−1 bytes exactly** (matches the ZIP32 sentinel bounds `pkg/store.zig:720-742`) | serialized output archives — `saveToOwnedBuffer`, `save_to_buffer`, `saveWithRecalc`; identical typed outcome at every layer |
 | workbook materialization | **`max_workbook_compressed_bytes` 1 GiB; `max_workbook_decompressed_bytes` 4 GiB; `max_modeled_cells` 64M** — PartStore allocations (own arena, 512 MiB/part, `store.zig:105-129,1340-1384`) sit outside `max_run_arena_bytes`; early-refusal tests | pre-model refusal |
 | retained generations | `max_retained_generations` 4; **`max_retained_generation_bytes` 2 GiB; `max_retained_fds` 16** — in resolved limits + fingerprints; projected retention **preflighted before allocating or swapping** | pre-swap refusal |
-| aggregates — **bytes** (counted allocator) | `max_run_arena_bytes` **1 GiB**, live matrix cells 8M, string payload 256 MiB, retained ASTs 128 MiB, diagnostics 1 MiB — defaults; hard maxima 4× each; caller-adjustable via `Limits`; resolved values echoed + fingerprinted | byte accounting |
+| aggregates — **bytes** (counted allocator) | `max_run_arena_bytes` **1 GiB**, live matrix cells 8M, string payload 256 MiB, retained ASTs 128 MiB, diagnostics 1 MiB — defaults; hard maxima 4× each; caller-adjustable via `ResourceLimits` (M3b, `src/formula/run_inputs.zig` — a **separate struct from `parser.Limits`**, which bounds parse shape); resolved values echoed + fingerprinted. An exhausted category is `FormulaLimitExceeded`, never a bare `OutOfMemory`: the budget records which one tripped. `matrix_cells` is charged as a **count**, so the limit does not depend on `@sizeOf(ScalarValue)` | byte accounting; below/at/above per category |
 | aggregates — **work** (explicit checked counters; can burn CPU without allocating) | `max_total_cell_evals` **50M**, dependency edges 50M, `max_scc_iterations` = **caller RESOURCE ceiling only, default 32 767 (hard max 32 767)** — never conflated with the workbook's semantic `calcPr@iterateCount`: hitting `iterateCount` = success + non-converged, hitting a lower caller ceiling = `FormulaLimitExceeded` + zero mutation (§5.6c), `max_dynamic_passes` default 3 (caller-adjustable, hard max 10), sort/comparison ops 500M — defaults; hard maxima 4× unless stated; caller-adjustable **in Zig/C only — CLI and Python fix limits at defaults in v1 (declared, no flags)**; resolved values echoed + fingerprinted | decrement sites named per counter; below/at/above boundary tests |
 
 ---

@@ -55,6 +55,7 @@ const parser = @import("parser.zig");
 const value = @import("value.zig");
 const env = @import("env.zig");
 const registry = @import("registry.zig");
+const run_inputs = @import("run_inputs.zig");
 
 // ─── evaluator-layer values (§5.3a) ──────────────────────────────
 
@@ -219,10 +220,11 @@ pub const DependencyLog = struct {
 /// Where a site-dependent construct is being evaluated. `@`
 /// intersection needs it; standalone eval without one refuses rather
 /// than guessing a row (§5.5).
-pub const EvalSite = struct {
-    row: coords.Row,
-    col: coords.Col,
-};
+///
+/// Declared with the rest of a run's inputs, and re-exported here
+/// because every caller of the evaluator already has this namespace
+/// open.
+pub const EvalSite = run_inputs.EvalSite;
 
 pub const Options = struct {
     /// The sheet unqualified references resolve against. Required at
@@ -259,6 +261,14 @@ pub const Options = struct {
     /// It lives here rather than in `Limits` because `Limits` is M2's
     /// parse-limit struct; §9's aggregate-limit consolidation is M3b's.
     max_expr_depth: usize = 1024,
+    /// The §9 byte budget, when the caller wired one — normally by
+    /// building the run arena over `Budget.allocator(.run_arena)`.
+    ///
+    /// It is optional because a budget is a *policy*, and the evaluator
+    /// is usable without one; when present, an exhausted category turns
+    /// what the allocator could only call `OutOfMemory` into the typed
+    /// `FormulaLimitExceeded` the caller asked for.
+    budget: ?*run_inputs.Budget = null,
 };
 
 // ─── the evaluator ───────────────────────────────────────────────
@@ -297,7 +307,7 @@ pub const Evaluator = struct {
         self.ast = ast;
         self.sheet = self.opts.current_sheet;
         self.depth = 0;
-        const v = try self.evalNode(ast.root);
+        const v = self.evalNode(ast.root) catch |e| return self.mapBudget(e);
         // §10: a multi-area reference is not a representable result,
         // even though functions may take one as an argument.
         if (v == .reference and v.reference.areas.len != 1) {
@@ -307,8 +317,24 @@ pub const Evaluator = struct {
         // dereferences through the same §5.3b row as a reference reaching
         // an operator — which is why `=A1:A3` spills under `dynamic_array`
         // and intersects under `legacy` without either being special-cased.
-        if (v == .reference) return operandValue(try self.operandOf(v));
+        if (v == .reference) {
+            const op = self.operandOf(v) catch |e| return self.mapBudget(e);
+            return operandValue(op);
+        }
         return v;
+    }
+
+    /// A budget that ran out is a **refusal**, not an allocation
+    /// failure. `std.mem.Allocator` has only one way to say no, so the
+    /// budget records which category tripped and the distinction is
+    /// recovered here — otherwise a caller could not tell "your formula
+    /// asked for too much" from "this machine is out of memory", and
+    /// only one of those is actionable.
+    fn mapBudget(self: *Evaluator, e: EvalError) EvalError {
+        if (e != error.OutOfMemory) return e;
+        const b = self.opts.budget orelse return e;
+        if (b.tripped == null) return e;
+        return error.LimitExceeded;
     }
 
     // ─── environment reads (dependency capture lives here) ───────
@@ -381,14 +407,15 @@ pub const Evaluator = struct {
         assert(text.len >= 2 and text[0] == '"' and text[text.len - 1] == '"');
         const body = text[1 .. text.len - 1];
         if (std.mem.indexOfScalar(u8, body, '"') == null) return body; // borrow
-        var out: std.ArrayListUnmanaged(u8) = .empty;
-        try out.ensureTotalCapacity(self.arena, body.len);
+        const buf = try self.allocText(body.len);
+        var n: usize = 0;
         var k: usize = 0;
         while (k < body.len) : (k += 1) {
-            out.appendAssumeCapacity(body[k]);
+            buf[n] = body[k];
+            n += 1;
             if (body[k] == '"') k += 1; // skip the second of a `""` pair
         }
-        return out.items;
+        return buf[0..n];
     }
 
     fn errorLiteral(text: []const u8, known: bool) value.ErrorValue {
@@ -418,7 +445,26 @@ pub const Evaluator = struct {
         return .{ .array = m };
     }
 
+    /// Text the run produced, charged to §9's `string payload` budget.
+    /// Borrowed text — a string literal pointing into the source, a
+    /// cell's stored bytes — costs nothing and is not charged, because
+    /// the run did not create it.
+    fn allocText(self: *Evaluator, n: usize) EvalError![]u8 {
+        if (self.opts.budget) |b| {
+            b.charge(.string_payload, n) catch return error.LimitExceeded;
+        }
+        return self.arena.alloc(u8, n);
+    }
+
     fn newMatrix(self: *Evaluator, rows: u32, cols: u32) EvalError!value.Matrix {
+        if (self.opts.budget) |b| {
+            // A cell count, not a byte count: §9 bounds `live matrix
+            // cells` so the limit means the same thing whatever
+            // `@sizeOf(ScalarValue)` happens to be. The run arena frees
+            // nothing individually, so "live" is "allocated this run".
+            b.charge(.matrix_cells, @as(u64, rows) * @as(u64, cols)) catch
+                return error.LimitExceeded;
+        }
         return value.Matrix.init(self.arena, rows, cols) catch |e| switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             // §9's cap. Not a value outcome: no error value means "this
@@ -809,7 +855,7 @@ pub const Evaluator = struct {
             .concat => {
                 const x = try self.toText(a);
                 const y = try self.toText(b);
-                const out = try self.arena.alloc(u8, x.len + y.len);
+                const out = try self.allocText(x.len + y.len);
                 @memcpy(out[0..x.len], x);
                 @memcpy(out[x.len..], y);
                 return .{ .text = out };
@@ -849,7 +895,7 @@ pub const Evaluator = struct {
             .blank => "",
             .boolean => |b| if (b) "TRUE" else "FALSE",
             .number => |n| blk: {
-                const buf = try self.arena.alloc(u8, value.format_buf_len);
+                const buf = try self.allocText(value.format_buf_len);
                 break :blk value.formatNumber(buf, n);
             },
             .err => unreachable, // propagated before any coercion
@@ -1059,6 +1105,10 @@ pub const Evaluator = struct {
                 .err => |e| e,
             },
             .text => .{ .text = try self.toText(s) },
+            // A criterion is classified by `criteria.parse`, not coerced:
+            // turning `">5"` into a number here would throw the operator
+            // away before anything had read it.
+            .criteria => s,
             .value_any, .aggregate, .reference, .lazy_any => s,
         };
     }
@@ -1447,6 +1497,7 @@ const testing = std.testing;
 /// the engine is imported from `src/`, so the semantics take the fold as
 /// a parameter and only the tests name it.
 const casefold = @import("zlsx_casefold");
+const rng = @import("rng.zig");
 
 fn shippedFold(allocator: std.mem.Allocator, s: []const u8) anyerror![]u8 {
     return casefold.foldString(allocator, s);
@@ -2593,4 +2644,216 @@ test "fuzz: no evaluation escapes with a non-finite number or an empty matrix" {
             "SQRT({4,9})",
         },
     });
+}
+
+// ─── M3b: run inputs, the byte budget, and criteria end to end ───
+
+test "budget: an exhausted category is a refusal, not an allocation failure" {
+    // `std.mem.Allocator` has one way to say no; §9 has five reasons.
+    // The mapping is what recovers the difference, and it must hold for
+    // every category — including the three whose charge sites arrive
+    // with later rows.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+
+    inline for (@typeInfo(run_inputs.Category).@"enum".fields) |f| {
+        const cat: run_inputs.Category = @enumFromInt(f.value);
+        var budget = run_inputs.Budget.init(testing.allocator, .{});
+        var opts = h.options();
+        opts.budget = &budget;
+        var ev = Evaluator.init(h.arena(), h.fake.evalEnv(), opts);
+        defer ev.deinit();
+
+        // Untripped: a genuine allocator failure stays one.
+        try testing.expectEqual(EvalError.OutOfMemory, ev.mapBudget(error.OutOfMemory));
+        budget.charge(cat, budget.limits.get(cat) + 1) catch {};
+        try testing.expectEqual(@as(?run_inputs.Category, cat), budget.tripped);
+        try testing.expectEqual(EvalError.LimitExceeded, ev.mapBudget(error.OutOfMemory));
+        // …and every other error passes through untouched.
+        try testing.expectEqual(EvalError.UnsupportedFunction, ev.mapBudget(error.UnsupportedFunction));
+    }
+    try testing.expectEqual(parser.PlaneTwo.FormulaLimitExceeded, planeTwo(error.LimitExceeded));
+}
+
+/// Evaluate `src` against a budget whose `cat` limit is `limit`.
+fn evalUnderBudget(
+    gpa: std.mem.Allocator,
+    cat: run_inputs.Category,
+    limit: u64,
+    src: []const u8,
+) !void {
+    var budget = run_inputs.Budget.init(gpa, .{});
+    budget.limits.set(cat, limit);
+
+    var arena_state = std.heap.ArenaAllocator.init(budget.allocator(.run_arena));
+    defer arena_state.deinit();
+    var fake = env.Fake.init(gpa);
+    defer fake.deinit();
+    const sheet = try fake.addSheet("S");
+    var r: usize = 1;
+    while (r <= 32) : (r += 1) {
+        var buf: [8]u8 = undefined;
+        const ref = std.fmt.bufPrint(&buf, "A{d}", .{r}) catch unreachable;
+        try fake.putA1(sheet, .stored, ref, num(@floatFromInt(r)));
+    }
+
+    var draw_value: f64 = 0.5;
+    var draws = DrawSource.constant(&draw_value);
+    var ev = Evaluator.init(arena_state.allocator(), fake.evalEnv(), .{
+        .current_sheet = sheet,
+        .collation = .{ .fold = shippedFold },
+        .draws = &draws,
+        .budget = &budget,
+    });
+    defer ev.deinit();
+
+    var parsed = try parser.parse(gpa, src, .{});
+    defer parsed.deinit(gpa);
+    if (parsed == .refused) return error.MalformedInput;
+    _ = try ev.evaluate(parsed.ok);
+}
+
+test "budget: matrix cells refuse below, at, and above the limit" {
+    // `A1:A32*2` materializes 32 cells and produces 32 more.
+    const needed: u64 = 64;
+    try evalUnderBudget(testing.allocator, .matrix_cells, needed + 1, "A1:A32*2");
+    try evalUnderBudget(testing.allocator, .matrix_cells, needed, "A1:A32*2");
+    try testing.expectError(
+        error.LimitExceeded,
+        evalUnderBudget(testing.allocator, .matrix_cells, needed - 1, "A1:A32*2"),
+    );
+}
+
+test "budget: string payload refuses when concatenation outgrows it" {
+    // `"aaaa…"&"bbbb…"` allocates the joined text, and nothing else here
+    // is charged to the string budget.
+    const src = "\"aaaaaaaaaa\"&\"bbbbbbbbbb\"";
+    try evalUnderBudget(testing.allocator, .string_payload, 20, src);
+    try testing.expectError(
+        error.LimitExceeded,
+        evalUnderBudget(testing.allocator, .string_payload, 19, src),
+    );
+}
+
+test "budget: the run arena refuses when the whole run outgrows it" {
+    // Generous enough to finish, then one that is not. The failure is a
+    // typed limit rather than an anonymous OOM, which is the point.
+    try evalUnderBudget(testing.allocator, .run_arena, 1 << 20, "SUM(A1:A32)+1");
+    try testing.expectError(
+        error.LimitExceeded,
+        evalUnderBudget(testing.allocator, .run_arena, 64, "A1:A32*2"),
+    );
+}
+
+test "rng: a draw sequence is reproducible from RunInputs alone" {
+    const H = struct {
+        fn run(seed: u64, out: *[2]f64) !void {
+            var h: Harness = undefined;
+            try h.init(testing.allocator);
+            defer h.deinit();
+
+            const inputs = run_inputs.RunInputs{
+                .now_utc_ms = 0,
+                .rng_seed = seed,
+                .limits = .{},
+            };
+            try inputs.validate();
+
+            var generator = rng.Rng.init(inputs.rng_seed);
+            var source = generator.drawSource();
+            var opts = h.options();
+            opts.draws = &source;
+            opts.fidelity = inputs.fidelity;
+            opts.dialect = inputs.dialect;
+
+            const v = try h.evalOpts("RAND()&\"|\"&RAND()", opts);
+            // Two draws, in order, from one formula.
+            try testing.expectEqual(@as(u64, 2), source.count);
+
+            var it = std.mem.splitScalar(u8, v.scalar.text, '|');
+            out[0] = try std.fmt.parseFloat(f64, it.next().?);
+            out[1] = try std.fmt.parseFloat(f64, it.next().?);
+        }
+    };
+
+    var first: [2]f64 = undefined;
+    var again: [2]f64 = undefined;
+    var other: [2]f64 = undefined;
+    try H.run(0xC0FFEE, &first);
+    try H.run(0xC0FFEE, &again);
+    try H.run(0xC0FFEF, &other);
+
+    // Equal RunInputs ⇒ equal output, bit for bit. Nothing else went
+    // into the run: no clock, no entropy source.
+    try testing.expectEqual(@as(u64, @bitCast(first[0])), @as(u64, @bitCast(again[0])));
+    try testing.expectEqual(@as(u64, @bitCast(first[1])), @as(u64, @bitCast(again[1])));
+    // A different seed is a different run.
+    try testing.expect(first[0] != other[0]);
+    // And the two draws within a run are distinct, which is what makes
+    // "the seam is called once per draw" observable at all.
+    try testing.expect(first[0] != first[1]);
+
+    // The stream is `rng_v1`'s, not something the evaluator invented.
+    var direct = rng.Rng.init(0xC0FFEE);
+    try testing.expectEqual(direct.nextFloat(), first[0]);
+    try testing.expectEqual(direct.nextFloat(), first[1]);
+}
+
+test "criteria: COUNTIF and SUMIF evaluate through the aligned cursor" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    try h.put("A1", .{ .text = "apple" });
+    try h.put("A2", .{ .text = "pear" });
+    try h.put("A3", .{ .text = "APPLE" });
+    try h.put("B1", num(10));
+    try h.put("B2", num(20));
+    try h.put("B3", num(30));
+
+    // Case-insensitive under `collation_v1`, like every other match.
+    try testing.expectEqual(@as(f64, 2), (try h.scalar("COUNTIF(A1:A3,\"apple\")")).number);
+    try testing.expectEqual(@as(f64, 1), (try h.scalar("COUNTIF(A1:A3,\"pear\")")).number);
+    try testing.expectEqual(@as(f64, 3), (try h.scalar("COUNTIF(A1:A3,\"*\")")).number);
+    try testing.expectEqual(@as(f64, 2), (try h.scalar("COUNTIF(B1:B3,\">15\")")).number);
+    // A numeric criterion is type-restricted: the text column has no
+    // numbers in it, whatever the cross-type order would say.
+    try testing.expectEqual(@as(f64, 0), (try h.scalar("COUNTIF(A1:A3,\">15\")")).number);
+
+    // Three-argument SUMIF projects the sum range from its top-left.
+    try testing.expectEqual(@as(f64, 40), (try h.scalar("SUMIF(A1:A3,\"apple\",B1:B3)")).number);
+    try testing.expectEqual(@as(f64, 40), (try h.scalar("SUMIF(A1:A3,\"apple\",B1)")).number);
+    // Two-argument SUMIF sums the criteria range itself.
+    try testing.expectEqual(@as(f64, 50), (try h.scalar("SUMIF(B1:B3,\">15\")")).number);
+
+    // A criterion may arrive as a reference rather than a literal.
+    try h.put("D1", .{ .text = "pear" });
+    try testing.expectEqual(@as(f64, 1), (try h.scalar("COUNTIF(A1:A3,D1)")).number);
+    // A non-reference in a reference slot is `#VALUE!`, not a refusal.
+    try testing.expectEqual(value.KnownError.value, (try h.scalar("COUNTIF(1,\"x\")")).err.known);
+}
+
+test "criteria: the ranges a COUNTIF reads are captured as dependencies" {
+    // `criteria.scan` reads through `EvalEnv` directly rather than
+    // through `Evaluator.readRange`, so this is the test that the
+    // M3a2 capture-at-construction rule covers it anyway.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    try h.put("A1", .{ .text = "x" });
+    try h.put("B1", num(1));
+
+    _ = try h.eval("SUMIF(A1:A3,\"x\",B1:B3)");
+    const a = coords.parseRange("A1:A3", .{}) catch unreachable;
+    const b = coords.parseRange("B1:B3", .{}) catch unreachable;
+    try testing.expect(h.ev.deps.hasArea(.{ .sheet = h.sheet, .range = a.normalized() }));
+    try testing.expect(h.ev.deps.hasArea(.{ .sheet = h.sheet, .range = b.normalized() }));
+}
+
+test "criteria: a locale-flavoured criterion refuses rather than guessing" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    try h.put("A1", num(2));
+    try testing.expectError(error.LocaleSensitiveInput, h.eval("COUNTIF(A1:A3,\">1,5\")"));
 }
