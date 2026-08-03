@@ -748,6 +748,43 @@ pub fn build(b: *std.Build) void {
     const formula_rng_tests = b.addTest(.{ .root_module = formula_rng_mod });
     test_step.dependOn(&b.addRunArtifact(formula_rng_tests).step);
 
+    // M4a: `xl/metadata.xml` — typed reader, cm/vm resolution, dialect
+    // primitives. It roots with the parser's imports because its
+    // refusals are `parser.PlaneTwo` values: §10's taxonomy has one home
+    // and this file refuses into it rather than beside it. `env.zig`
+    // comes along because M4a binds the reader to `EvalEnv.dialectOf`
+    // through `env.DialectResolver` — the dependency points this way, so
+    // `env.zig` stays a leaf.
+    const formula_metadata_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/metadata.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_metadata_mod.addImport("zlsx_refs", refs_mod);
+    formula_metadata_mod.addImport("zlsx_xid", xid_mod);
+    formula_metadata_mod.addImport("zlsx_casefold", unicode_mod);
+    addOracleFixtures(b, formula_metadata_mod);
+    const formula_metadata_tests = b.addTest(.{ .root_module = formula_metadata_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_metadata_tests).step);
+
+    // M4a: the metadata fuzz target (§8.1) — no part can panic, leak, or
+    // leave a run's dialects partially resolved.
+    const formula_metadata_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/metadata.zig"),
+        .target = target,
+        .optimize = optimize,
+        .fuzz = true,
+    });
+    formula_metadata_fuzz_mod.addImport("zlsx_refs", refs_mod);
+    formula_metadata_fuzz_mod.addImport("zlsx_xid", xid_mod);
+    formula_metadata_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
+    addOracleFixtures(b, formula_metadata_fuzz_mod);
+    const formula_metadata_fuzz_tests = b.addTest(.{
+        .root_module = formula_metadata_fuzz_mod,
+        .test_runner = fuzz_test_runner,
+    });
+    fuzz_step.dependOn(&b.addRunArtifact(formula_metadata_fuzz_tests).step);
+
     // M3a2: the non-finite escape fuzz target (§8.1). No evaluation of
     // any input may produce a non-finite number, a zero-dimension
     // matrix, a panic, or a leak.

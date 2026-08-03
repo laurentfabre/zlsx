@@ -135,6 +135,15 @@ pub fn planeTwo(e: EvalError) parser.PlaneTwo {
         // `SheetIndex` from `resolveSheet`, and it converts shape and
         // grid failures into `#VALUE!` at the call that caused them.
         error.MalformedInput, error.UnknownSheet, error.ShapeMismatch, error.RefOutOfGrid => .FormulaMalformedInput,
+        // M4a. The precise plane — unsupported construct for a rich
+        // value, malformed input for a broken part — travels with the
+        // resolver's own `Refusal` (`metadata.CellDialectResolver.
+        // last_refusal`), which is what the report carries. Here the
+        // detail is already gone, so this maps to the class that ALWAYS
+        // refuses (§5.7.7): collapsing onto a mark-eligible class could
+        // let `.keep_stale_and_mark` suppress a refusal the taxonomy
+        // says must stand.
+        error.MetadataRefused => .FormulaMalformedInput,
     };
 }
 
