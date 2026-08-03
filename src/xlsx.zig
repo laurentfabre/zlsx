@@ -1660,6 +1660,12 @@ pub const Rows = struct {
     /// to the older per-string malloc/free list this saves ~one free
     /// per entity-bearing or rich-text cell per row.
     arena: std.heap.ArenaAllocator,
+    /// Memoized answer to "does this sheet carry shared or array
+    /// formulas?" — the two constructs whose state spans rows. Computed
+    /// on first use by `skipRows`, which needs it to decide whether a
+    /// boundary-scan skip is exact; null until then. See
+    /// `hasFormulaSpreads`.
+    formula_spreads: ?bool = null,
     /// 1-based OOXML row number of the most recently yielded row.
     /// Resolution priority (highest to lowest):
     ///   1. `<row r="N">` when present and N >= 1.
@@ -1875,6 +1881,99 @@ pub const Rows = struct {
             return self.row_cells.items;
         }
         return null;
+    }
+
+    /// Does the sheet contain a construct whose state spans rows?
+    ///
+    /// Only two do: `<f t="shared">`, whose base cell registers an `si`
+    /// that slave cells in later rows resolve against, and
+    /// `<f t="array">`, whose base registers a rectangle that later
+    /// cells fall inside. Both are built exclusively by a full decode,
+    /// so a skip that walks past them would strand every later
+    /// dependant. Everything else a row carries is row-local.
+    ///
+    /// Deliberately conservative: matched loosely (either quote style,
+    /// anywhere in the part) so a false positive costs a slower skip
+    /// while a false negative would cost correctness. Memoized — one
+    /// scan of the sheet buffer per iterator, not per skip.
+    fn hasFormulaSpreads(self: *Rows) bool {
+        if (self.formula_spreads) |known| return known;
+        // Gate on `<f` first: a sheet with no formula element at all
+        // cannot have a spread, and that is the common case for the
+        // data sheets range-partitioning targets. One pass over the
+        // part instead of four — the scan is proportional to the whole
+        // sheet, so it is the fixed cost of the first skip.
+        const found = std.mem.indexOf(u8, self.xml, "<f") != null and
+            (std.mem.indexOf(u8, self.xml, "\"shared\"") != null or
+                std.mem.indexOf(u8, self.xml, "'shared'") != null or
+                std.mem.indexOf(u8, self.xml, "\"array\"") != null or
+                std.mem.indexOf(u8, self.xml, "'array'") != null);
+        self.formula_spreads = found;
+        return found;
+    }
+
+    /// Advance past the next `n` rows without materialising their
+    /// cells. Returns how many were actually skipped — fewer than `n`
+    /// only at end of sheet.
+    ///
+    /// This exists for range-partitioned reads: partition *i* of a
+    /// sheet wants rows [i·S, (i+1)·S) and must first get past i·S rows
+    /// it will never look at. Decoding those (SST lookups, style and
+    /// date resolution, six parallel arrays, arena traffic) made K
+    /// partitions cost O(K²) in decode work; a boundary scan makes the
+    /// same traversal cost a `</row>` search per row, which is a
+    /// fraction of the inflation every partition already pays.
+    ///
+    /// Exactness over speed when the sheet has formula spreads: those
+    /// need `next()`'s bookkeeping, so this transparently falls back to
+    /// decoding. Callers get the same rows either way; only the cost
+    /// differs. `skipRows(0)` is a no-op.
+    ///
+    /// Row numbering stays consistent: `yield_count` advances per
+    /// skipped row exactly as `next()` would, so a later row with no
+    /// usable `r` attribute still resolves to the same number it would
+    /// have without the skip.
+    pub fn skipRows(self: *Rows, n: usize) !usize {
+        if (n == 0) return 0;
+
+        if (self.hasFormulaSpreads()) {
+            var decoded: usize = 0;
+            while (decoded < n) : (decoded += 1) {
+                if ((try self.next()) == null) break;
+            }
+            return decoded;
+        }
+
+        var skipped: usize = 0;
+        while (skipped < n) {
+            const row_start = findTagOpen(self.xml, self.pos, "row") orelse break;
+            self.yield_count += 1;
+            skipped += 1;
+
+            const attrs = self.xml[row_start.start + "<row".len .. row_start.after_open - 1];
+            const attrs_no_ws = std.mem.trimEnd(u8, attrs, " \t\r\n");
+            if (attrs_no_ws.len > 0 and attrs_no_ws[attrs_no_ws.len - 1] == '/') {
+                // `<row .../>` — no body to walk past.
+                self.pos = row_start.after_open;
+                continue;
+            }
+
+            // Well-formed XML cannot carry a raw `<` in text or in an
+            // attribute value, so the first literal `</row>` after the
+            // open tag is this row's close. That is the same
+            // assumption `consumeRow` makes when it tests for `</row>`
+            // at each `<`; searching for the whole needle just lets the
+            // stdlib scan it in blocks.
+            const close = std.mem.indexOfPos(u8, self.xml, row_start.after_open, "</row>") orelse {
+                // Truncated sheet: consume the remainder so the next
+                // `next()` reports end-of-sheet rather than rescanning
+                // the same malformed tail forever.
+                self.pos = self.xml.len;
+                break;
+            };
+            self.pos = close + "</row>".len;
+        }
+        return skipped;
     }
 
     fn consumeRow(self: *Rows) !void {
@@ -8124,3 +8223,185 @@ test "Book.materialiseSheet: empty sheet yields zero rows" {
 //         }
 //     };
 //     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{tmp_path});
+
+// ─── Rows.skipRows ───────────────────────────────────────────────────
+
+fn testRows(alloc: std.mem.Allocator, shared: []const []const u8, xml: []const u8) Rows {
+    return .{
+        .xml = xml,
+        .pos = 0,
+        .shared_strings = shared,
+        .allocator = alloc,
+        .row_cells = .empty,
+        .row_styles = .empty,
+        .row_date_types = .empty,
+        .row_error_strings = .empty,
+        .row_formula_strings = .empty,
+        .row_formula_refs = .empty,
+        .shared_si_to_base_ref = .{},
+        .array_ranges = .empty,
+        .arena = std.heap.ArenaAllocator.init(alloc),
+    };
+}
+
+const skip_sheet_xml =
+    "<worksheet><sheetData>" ++
+    "<row r=\"1\"><c r=\"A1\"><v>10</v></c><c r=\"B1\"><v>11</v></c></row>" ++
+    "<row r=\"2\"><c r=\"A2\"><v>20</v></c><c r=\"B2\"><v>21</v></c></row>" ++
+    "<row r=\"3\"/>" ++
+    "<row r=\"4\"><c r=\"A4\"><v>40</v></c><c r=\"B4\"><v>41</v></c></row>" ++
+    "<row r=\"5\"><c r=\"A5\"><v>50</v></c><c r=\"B5\"><v>51</v></c></row>" ++
+    "</sheetData></worksheet>";
+
+test "skipRows(0) is a no-op" {
+    var rows = testRows(std.testing.allocator, &.{}, skip_sheet_xml);
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 0), try rows.skipRows(0));
+    const first = (try rows.next()).?;
+    try std.testing.expectEqual(@as(i64, 10), first[0].integer);
+}
+
+test "skipRows lands on the same row full iteration would" {
+    // For every k, skip(k) + next() must equal the (k+1)-th row of a
+    // plain walk — the property the whole partitioned-read path rests
+    // on. An off-by-one here silently drops or duplicates rows across
+    // partition boundaries rather than failing loudly.
+    const expected = [_]i64{ 10, 20, -1, 40, 50 }; // -1 = the empty row 3
+    for (0..expected.len) |k| {
+        var rows = testRows(std.testing.allocator, &.{}, skip_sheet_xml);
+        defer rows.deinit();
+        try std.testing.expectEqual(k, try rows.skipRows(k));
+        const row = (try rows.next()).?;
+        if (expected[k] == -1) {
+            try std.testing.expectEqual(@as(usize, 0), row.len);
+        } else {
+            try std.testing.expectEqual(expected[k], row[0].integer);
+        }
+        try std.testing.expectEqual(@as(u32, @intCast(k + 1)), rows.current_row);
+    }
+}
+
+test "skipRows counts self-closing rows" {
+    var rows = testRows(std.testing.allocator, &.{}, skip_sheet_xml);
+    defer rows.deinit();
+    // Rows 1..3 include the self-closing `<row r="3"/>`.
+    try std.testing.expectEqual(@as(usize, 3), try rows.skipRows(3));
+    const row = (try rows.next()).?;
+    try std.testing.expectEqual(@as(i64, 40), row[0].integer);
+    try std.testing.expectEqual(@as(u32, 4), rows.current_row);
+}
+
+test "skipRows past the end reports what it actually skipped" {
+    var rows = testRows(std.testing.allocator, &.{}, skip_sheet_xml);
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 5), try rows.skipRows(99));
+    try std.testing.expectEqual(@as(?[]const Cell, null), try rows.next());
+}
+
+test "skipRows then drain yields exactly the remaining rows" {
+    var rows = testRows(std.testing.allocator, &.{}, skip_sheet_xml);
+    defer rows.deinit();
+    _ = try rows.skipRows(2);
+    var seen: usize = 0;
+    while (try rows.next()) |_| seen += 1;
+    try std.testing.expectEqual(@as(usize, 3), seen);
+}
+
+test "skipRows keeps row numbering when rows carry no r attribute" {
+    // With no `r` anywhere, row numbers come from yield_count — so the
+    // skip must advance that counter exactly as next() would, or every
+    // row after a skip is mis-numbered.
+    const xml =
+        "<worksheet><sheetData>" ++
+        "<row><c><v>1</v></c></row>" ++
+        "<row><c><v>2</v></c></row>" ++
+        "<row><c><v>3</v></c></row>" ++
+        "</sheetData></worksheet>";
+
+    var skipped = testRows(std.testing.allocator, &.{}, xml);
+    defer skipped.deinit();
+    _ = try skipped.skipRows(2);
+    _ = (try skipped.next()).?;
+
+    var walked = testRows(std.testing.allocator, &.{}, xml);
+    defer walked.deinit();
+    _ = (try walked.next()).?;
+    _ = (try walked.next()).?;
+    _ = (try walked.next()).?;
+
+    try std.testing.expectEqual(walked.current_row, skipped.current_row);
+    try std.testing.expectEqual(@as(u32, 3), skipped.current_row);
+}
+
+test "skipRows falls back to decoding when the sheet has shared formulas" {
+    // The base cell registering si="0" lives in a row the caller skips.
+    // A boundary-scan skip would walk past it and strand the slave in
+    // row 3 with no resolvable base, so this sheet must take the
+    // decode path.
+    const xml =
+        "<worksheet><sheetData>" ++
+        "<row r=\"1\"><c r=\"A1\"><v>1</v></c></row>" ++
+        "<row r=\"2\"><c r=\"A2\"><f t=\"shared\" ref=\"A2:A3\" si=\"0\">B2*2</f><v>4</v></c></row>" ++
+        "<row r=\"3\"><c r=\"A3\"><f t=\"shared\" si=\"0\"/><v>6</v></c></row>" ++
+        "</sheetData></worksheet>";
+
+    var rows = testRows(std.testing.allocator, &.{}, xml);
+    defer rows.deinit();
+    try std.testing.expect(rows.hasFormulaSpreads());
+
+    try std.testing.expectEqual(@as(usize, 2), try rows.skipRows(2));
+    _ = (try rows.next()).?; // row 3, the slave
+    const refs = rows.formulaRefs();
+    try std.testing.expect(refs.len > 0);
+    // Base resolved to A2 — only possible because row 2 was decoded.
+    try std.testing.expect(refs[0] != null);
+    try std.testing.expectEqual(@as(u32, 2), refs[0].?.row);
+}
+
+test "skipRows takes the scan path when no formula spreads are present" {
+    var rows = testRows(std.testing.allocator, &.{}, skip_sheet_xml);
+    defer rows.deinit();
+    try std.testing.expect(!rows.hasFormulaSpreads());
+    try std.testing.expectEqual(@as(usize, 2), try rows.skipRows(2));
+}
+
+test "hasFormulaSpreads spots array formulas and both quote styles" {
+    const array_xml =
+        "<worksheet><sheetData><row r=\"1\">" ++
+        "<c r=\"A1\"><f t=\"array\" ref=\"A1:A2\">SUM(B1:B2)</f><v>3</v></c>" ++
+        "</row></sheetData></worksheet>";
+    var a = testRows(std.testing.allocator, &.{}, array_xml);
+    defer a.deinit();
+    try std.testing.expect(a.hasFormulaSpreads());
+
+    const single_quoted =
+        "<worksheet><sheetData><row r='1'>" ++
+        "<c r='A1'><f t='shared' ref='A1:A2' si='0'>B1</f><v>1</v></c>" ++
+        "</row></sheetData></worksheet>";
+    var s = testRows(std.testing.allocator, &.{}, single_quoted);
+    defer s.deinit();
+    try std.testing.expect(s.hasFormulaSpreads());
+}
+
+test "skipRows survives a truncated final row" {
+    // No closing `</row>`: the skip must consume the tail and report
+    // end-of-sheet rather than spinning on the same position.
+    const xml =
+        "<worksheet><sheetData>" ++
+        "<row r=\"1\"><c r=\"A1\"><v>1</v></c></row>" ++
+        "<row r=\"2\"><c r=\"A2\"><v>2</v></c>";
+    var rows = testRows(std.testing.allocator, &.{}, xml);
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 2), try rows.skipRows(5));
+    try std.testing.expectEqual(@as(?[]const Cell, null), try rows.next());
+}
+
+test "skipRows does not confuse rowBreaks for a row" {
+    const xml =
+        "<worksheet><sheetData>" ++
+        "<row r=\"1\"><c r=\"A1\"><v>1</v></c></row>" ++
+        "</sheetData><rowBreaks count=\"1\"><brk id=\"1\"/></rowBreaks></worksheet>";
+    var rows = testRows(std.testing.allocator, &.{}, xml);
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try rows.skipRows(4));
+}

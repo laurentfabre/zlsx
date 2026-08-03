@@ -923,6 +923,38 @@ export fn zlsx_rows_next(
     return 1;
 }
 
+/// Advance past `n` rows without decoding their cells, and write the
+/// number actually skipped into `out_skipped` (fewer than `n` only at
+/// end of sheet). Returns 0 on success, -1 on failure with a
+/// diagnostic in `err_buf`.
+///
+/// Semantically identical to calling `zlsx_rows_next` `n` times and
+/// discarding the results — same landing row, same row numbering — but
+/// it does not build the cell arrays for what it passes. Intended for
+/// range-partitioned reads, where every partition must first get past
+/// the rows belonging to earlier partitions.
+///
+/// The cells of the most recently yielded row are invalidated, exactly
+/// as `zlsx_rows_next` invalidates them.
+export fn zlsx_rows_skip(
+    rows: *Rows,
+    n: usize,
+    out_skipped: ?*usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const rs: *RowsState = @ptrCast(@alignCast(rows));
+
+    const skipped = rs.inner.skipRows(n) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    // The C-side cell view belongs to a row that is now behind us.
+    rs.c_cells.clearRetainingCapacity();
+    if (out_skipped) |o| o.* = skipped;
+    return 0;
+}
+
 /// Style index for column `col_idx` of the most recently yielded row.
 /// Valid between `zlsx_rows_next` calls (the same lifetime contract
 /// as the cells). Returns:

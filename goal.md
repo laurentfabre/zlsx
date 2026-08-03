@@ -212,10 +212,17 @@ Next, in value order:
   manifest and/or a table's ingestion record, report drift / orphan / missing
   as NDJSON with exit 3 on findings. Live-verified against
   `workspace.default.zlsx_sales`.
-- **Data Source, second pass**: a row-range partition still re-parses the rows
-  before its range (`islice` over the streaming iterator), so K range
-  partitions cost O(K²) decode work. Needs a skip-rows fast path in the
-  reader, not a Python-side fix.
+- ~~**Data Source, second pass**: row-range partitions re-parse~~ — ✅ done:
+  `Rows.skipRows` (Zig) → `zlsx_rows_skip` → `Rows.skip` (Python), used by the
+  Spark row-range read path. Skipping a row costs **175 ns** against **2470 ns**
+  to decode one (ReleaseFast, 200k-row sheet) — 14× on the traversal, 2.4–2.6×
+  end-to-end at 16–64 partitions.
+
+  **The quadratic is not gone, it is cheaper.** Each partition still re-opens
+  and re-inflates the whole sheet part, and that per-partition cost is now what
+  dominates a partitioned read. Removing it needs a shared inflated-sheet cache
+  across partitions on one executor — a different piece of work, and one that
+  only pays off when partitions of the same file land together.
 
 ## 🔭 Candidate follow-ups (value/effort order)
 

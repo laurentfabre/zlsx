@@ -297,6 +297,104 @@ def test_writer_xml_special_chars_escape(tmp_path):
         assert row[0] == "a<b & c>d \"e\" 'f'"
 
 
+# ─── Rows.skip ────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def skip_book(tmp_path):
+    out = tmp_path / "skip.xlsx"
+    with zlsx.write(out) as w:
+        s = w.add_sheet("S")
+        s.write_row(["name", "n"])
+        for i in range(20):
+            s.write_row([f"r{i}", i])
+    return out
+
+
+def test_rows_skip_lands_where_next_would(skip_book):
+    """The property every range-partitioned read rests on: skip(k) then
+    next() is the (k+1)-th row of a plain walk."""
+    with zlsx.open(skip_book) as book:
+        with book.sheet(0).rows() as rows:
+            walked = [list(r) for r in rows]
+
+    for k in range(len(walked)):
+        with zlsx.open(skip_book) as book:
+            with book.sheet(0).rows() as rows:
+                assert rows.skip(k) == k
+                assert list(next(iter(rows))) == walked[k]
+
+
+def test_rows_skip_then_drain_yields_the_remainder(skip_book):
+    with zlsx.open(skip_book) as book:
+        with book.sheet(0).rows() as rows:
+            rows.skip(5)
+            rest = [list(r) for r in rows]
+    assert len(rest) == 16          # 21 rows total, 5 skipped
+    assert rest[0][0] == "r4"
+
+
+def test_rows_skip_past_end_reports_actual_count(skip_book):
+    with zlsx.open(skip_book) as book:
+        with book.sheet(0).rows() as rows:
+            assert rows.skip(10_000) == 21
+            assert list(rows) == []
+
+
+def test_rows_skip_zero_and_negative(skip_book):
+    with zlsx.open(skip_book) as book:
+        with book.sheet(0).rows() as rows:
+            assert rows.skip(0) == 0
+            assert list(next(iter(rows))) == ["name", "n"]
+            with pytest.raises(ValueError, match="non-negative"):
+                rows.skip(-1)
+
+
+def test_rows_skip_after_close_raises(skip_book):
+    with zlsx.open(skip_book) as book:
+        rows = book.sheet(0).rows()
+        rows.close()
+        with pytest.raises(zlsx.ZlsxError, match="closed"):
+            rows.skip(1)
+
+
+def test_rows_skip_interleaves_with_next(skip_book):
+    with zlsx.open(skip_book) as book:
+        with book.sheet(0).rows() as rows:
+            it = iter(rows)
+            next(it)                      # header
+            rows.skip(3)                  # r0..r2
+            assert list(next(it))[0] == "r3"
+            rows.skip(2)                  # r4, r5
+            assert list(next(it))[0] == "r6"
+
+
+def test_rows_skip_over_formula_cells(tmp_path):
+    """Skipping across rows that carry formulas still lands correctly.
+
+    Note this exercises the fast scan path, not the fallback: the zlsx
+    writer emits plain ``<f>`` and never ``t="shared"`` / ``t="array"``,
+    so no workbook it produces has cross-row formula state. The
+    fallback — a shared base in a skipped row still resolving for its
+    slave — is covered in Zig against raw sheet XML
+    ("skipRows falls back to decoding when the sheet has shared
+    formulas" in src/xlsx.zig), which is the only place such a sheet
+    can be constructed.
+    """
+    out = tmp_path / "formulas.xlsx"
+    with zlsx.write(out) as w:
+        s = w.add_sheet("S")
+        s.write_row(["a"])
+        s.write_row_with_formulas([None], ["B1*2"])
+        s.write_row_with_formulas([None], ["B2*2"])
+        s.write_row(["last"])
+
+    with zlsx.open(out) as book:
+        with book.sheet(0).rows() as rows:
+            assert rows.skip(3) == 3
+            assert list(next(iter(rows)))[0] == "last"
+
+
 # ─── Writer.to_bytes (writer-side mirror of open_bytes) ───────────────
 
 

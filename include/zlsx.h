@@ -470,6 +470,27 @@ int32_t zlsx_rows_next(zlsx_rows_t         * rows,
                        size_t               err_buf_len);
 
 /*
+ * Advance past `n` rows without decoding their cells; writes the number
+ * actually skipped to *out_skipped (fewer than `n` only at end of
+ * sheet). Returns 0 on success, -1 on failure with a diagnostic in
+ * err_buf.
+ *
+ * Semantically identical to calling zlsx_rows_next() `n` times and
+ * discarding the results — same landing row, same row numbering — but
+ * without building the cell arrays for what it passes. Intended for
+ * range-partitioned reads, where each partition must first get past the
+ * rows belonging to earlier partitions.
+ *
+ * Invalidates the cells of the most recently yielded row, exactly as
+ * zlsx_rows_next() does.
+ */
+int32_t zlsx_rows_skip(zlsx_rows_t * rows,
+                       size_t        n,
+                       size_t      * out_skipped,
+                       uint8_t     * err_buf,
+                       size_t        err_buf_len);
+
+/*
  * Style index for column `col_idx` of the most recently yielded row.
  * Valid between zlsx_rows_next() calls. Returns 0 and writes
  * `*out_style_idx` when the cell had an `s="…"` attribute; returns
