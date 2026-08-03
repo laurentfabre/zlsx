@@ -208,8 +208,10 @@ Next, in value order:
   workbook can be produced without a filesystem, and cross-file schema
   inference for the Data Source. Spark parts now serialise in memory and land
   by rename, so no reader sees a partial workbook.
-- **`zlsx dbx audit`** — the fourth subcommand; `src/dbx.zig` has the other
-  three.
+- ~~**`zlsx dbx audit`**~~ — ✅ done: content-hash the zone, diff against a
+  manifest and/or a table's ingestion record, report drift / orphan / missing
+  as NDJSON with exit 3 on findings. Live-verified against
+  `workspace.default.zlsx_sales`.
 - **Data Source, second pass**: a row-range partition still re-parses the rows
   before its range (`islice` over the streaming iterator), so K range
   partitions cost O(K²) decode work. Needs a skip-rows fast path in the

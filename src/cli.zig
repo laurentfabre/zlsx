@@ -4685,6 +4685,16 @@ const TestTmp = struct {
     }
 };
 
+test {
+    // Pull `dbx.zig` into the test build's analysis set. Zig analyses
+    // lazily: `dbx` is referenced only from `run()`, which no test calls,
+    // so without this the compiler never looks at the file and its tests
+    // are never collected — they silently did not run from #147 until
+    // this reference was added. Any future src/*.zig that hangs off a
+    // command dispatch needs the same line.
+    _ = dbx;
+}
+
 test "colLetter A,B,Z,AA,AZ,BA,ZZ,AAA" {
     var buf: [8]u8 = undefined;
     try std.testing.expectEqualStrings("A", colLetter(&buf, 0));
