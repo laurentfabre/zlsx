@@ -529,6 +529,60 @@ pub fn build(b: *std.Build) void {
     });
     fuzz_step.dependOn(&b.addRunArtifact(formula_tokenizer_fuzz_tests).step);
 
+    // M2: the formula parser — AST, canonical printer, typed refusals.
+    // Sits in the same package dir as the tokenizer it consumes, so the
+    // relative `@import("tokenizer.zig")` resolves and `@embedFile` can
+    // reach the M1a fixture tables for the round-trip corpus gate.
+    //
+    // The oracle manifests come in as anonymous imports rather than a
+    // relative `@embedFile`: `tests/oracle/` is outside this module's
+    // package tree, and the parser must pin its precedence against the
+    // *committed* manifests, not against a copy that could drift.
+    const formula_parser_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/parser.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_parser_mod.addImport("zlsx_refs", refs_mod);
+    formula_parser_mod.addImport("zlsx_xid", xid_mod);
+    formula_parser_mod.addAnonymousImport("oracle_hand_spec_excel", .{
+        .root_source_file = b.path("tests/oracle/fixtures/hand_spec_excel.json"),
+    });
+    formula_parser_mod.addAnonymousImport("oracle_hand_spec_ieee", .{
+        .root_source_file = b.path("tests/oracle/fixtures/hand_spec_ieee.json"),
+    });
+    formula_parser_mod.addAnonymousImport("oracle_libreoffice_suite", .{
+        .root_source_file = b.path("tests/oracle/fixtures/libreoffice_oracle_suite.json"),
+    });
+    const formula_parser_tests = b.addTest(.{ .root_module = formula_parser_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_parser_tests).step);
+
+    // M2: coverage-guided parser fuzz target (no panic, no lost bytes,
+    // print/re-parse structural equality). Same `.fuzz = true` +
+    // vendored test-runner pattern as the tokenizer's.
+    const formula_parser_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/parser.zig"),
+        .target = target,
+        .optimize = optimize,
+        .fuzz = true,
+    });
+    formula_parser_fuzz_mod.addImport("zlsx_refs", refs_mod);
+    formula_parser_fuzz_mod.addImport("zlsx_xid", xid_mod);
+    formula_parser_fuzz_mod.addAnonymousImport("oracle_hand_spec_excel", .{
+        .root_source_file = b.path("tests/oracle/fixtures/hand_spec_excel.json"),
+    });
+    formula_parser_fuzz_mod.addAnonymousImport("oracle_hand_spec_ieee", .{
+        .root_source_file = b.path("tests/oracle/fixtures/hand_spec_ieee.json"),
+    });
+    formula_parser_fuzz_mod.addAnonymousImport("oracle_libreoffice_suite", .{
+        .root_source_file = b.path("tests/oracle/fixtures/libreoffice_oracle_suite.json"),
+    });
+    const formula_parser_fuzz_tests = b.addTest(.{
+        .root_module = formula_parser_fuzz_mod,
+        .test_runner = fuzz_test_runner,
+    });
+    fuzz_step.dependOn(&b.addRunArtifact(formula_parser_fuzz_tests).step);
+
     // C1 milestone 2 (iter 1): pure-function A1 cell-formula
     // rewriter. Imports the M1 tokenizer via a relative path inside
     // src/formula/, so this module's package dir matches the
