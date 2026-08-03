@@ -676,6 +676,78 @@ pub fn build(b: *std.Build) void {
     const formula_eval_tests = b.addTest(.{ .root_module = formula_eval_mod });
     test_step.dependOn(&b.addRunArtifact(formula_eval_tests).step);
 
+    // M3b: run inputs + the §9 byte budget, and serial dates. Both are
+    // leaves — they import `value.zig` and nothing else in the engine —
+    // so each gets its own module and its own test target, which is what
+    // keeps them buildable without the evaluator.
+    const formula_run_inputs_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/run_inputs.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_run_inputs_mod.addImport("zlsx_refs", refs_mod);
+    formula_run_inputs_mod.addImport("zlsx_casefold", unicode_mod);
+    addOracleFixtures(b, formula_run_inputs_mod);
+    const formula_run_inputs_tests = b.addTest(.{ .root_module = formula_run_inputs_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_run_inputs_tests).step);
+
+    const formula_serial_date_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/serial_date.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_serial_date_mod.addImport("zlsx_refs", refs_mod);
+    formula_serial_date_mod.addImport("zlsx_casefold", unicode_mod);
+    addOracleFixtures(b, formula_serial_date_mod);
+    const formula_serial_date_tests = b.addTest(.{ .root_module = formula_serial_date_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_serial_date_tests).step);
+
+    // M3b: criteria. Its own test target as well as being reached from
+    // the evaluator's, because criteria must stay buildable without the
+    // evaluator — `criteria.scan` reads through `EvalEnv`, never through
+    // an `Evaluator`.
+    const formula_criteria_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/criteria.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_criteria_mod.addImport("zlsx_refs", refs_mod);
+    formula_criteria_mod.addImport("zlsx_casefold", unicode_mod);
+    addOracleFixtures(b, formula_criteria_mod);
+    const formula_criteria_tests = b.addTest(.{ .root_module = formula_criteria_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_criteria_tests).step);
+
+    // M3b: the criteria fuzz target (§8.1) — no criterion string may
+    // panic, leak, or match non-deterministically.
+    const formula_criteria_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/criteria.zig"),
+        .target = target,
+        .optimize = optimize,
+        .fuzz = true,
+    });
+    formula_criteria_fuzz_mod.addImport("zlsx_refs", refs_mod);
+    formula_criteria_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
+    addOracleFixtures(b, formula_criteria_fuzz_mod);
+    const formula_criteria_fuzz_tests = b.addTest(.{
+        .root_module = formula_criteria_fuzz_mod,
+        .test_runner = fuzz_test_runner,
+    });
+    fuzz_step.dependOn(&b.addRunArtifact(formula_criteria_fuzz_tests).step);
+
+    // M3b: `rng_v1`. Rooted with the evaluator's imports because it
+    // constructs the `DrawSource` the evaluator counts.
+    const formula_rng_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/rng.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_rng_mod.addImport("zlsx_refs", refs_mod);
+    formula_rng_mod.addImport("zlsx_xid", xid_mod);
+    formula_rng_mod.addImport("zlsx_casefold", unicode_mod);
+    addOracleFixtures(b, formula_rng_mod);
+    const formula_rng_tests = b.addTest(.{ .root_module = formula_rng_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_rng_tests).step);
+
     // M3a2: the non-finite escape fuzz target (§8.1). No evaluation of
     // any input may produce a non-finite number, a zero-dimension
     // matrix, a panic, or a leak.

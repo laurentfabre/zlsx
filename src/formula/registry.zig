@@ -46,6 +46,7 @@ const assert = std.debug.assert;
 const value = @import("value.zig");
 const env = @import("env.zig");
 const eval = @import("eval.zig");
+const criteria = @import("criteria.zig");
 
 const Value = eval.Value;
 
@@ -110,6 +111,10 @@ pub const CoercionClass = enum {
     aggregate,
     /// Must be a reference; anything else is `#VALUE!`.
     reference,
+    /// A criterion. Collapsed to a scalar like the numeric classes, but
+    /// **not** coerced: `criteria.parse` classifies it, and coercing
+    /// `">5"` to a number first would destroy the operator.
+    criteria,
     /// A slot the form defers. The dispatcher never evaluates it.
     lazy_any,
 
@@ -117,7 +122,7 @@ pub const CoercionClass = enum {
     /// over an array argument (§5.3b `array where scalar expected`).
     pub fn isScalarClass(self: CoercionClass) bool {
         return switch (self) {
-            .number, .text, .logical => true,
+            .number, .text, .logical, .criteria => true,
             .value_any, .aggregate, .reference, .lazy_any => false,
         };
     }
@@ -367,6 +372,32 @@ pub const functions = [_]Function{
         .volatility = .stable,
         .propagation = .per_function_provenance,
         .impl = fnCountBlank,
+    },
+
+    // ── criteria: the two shapes §5.6a's alignment rule distinguishes ──
+    .{
+        .name = "COUNTIF",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .reference, .criteria },
+            .rest = &none_c,
+        },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .collation_sensitive = true,
+        .impl = fnCountIf,
+    },
+    .{
+        .name = "SUMIF",
+        .arity = .{ .min = 2, .max = 3, .fixed = &[_]Laziness{ .eager, .eager, .eager }, .rest = &none_l },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .reference, .criteria, .reference },
+            .rest = &none_c,
+        },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .collation_sensitive = true,
+        .impl = fnSumIf,
     },
 
     // ── the lazy forms. No `impl`: deferring an arm means holding an
@@ -751,6 +782,95 @@ fn fnSwitch(ctx: CallCtx, args: []const Value) FnError!Value {
     // A trailing odd argument is the default.
     if (i < args.len) return args[i];
     return Value.err(.na);
+}
+
+// ── criteria functions ──
+
+fn criteriaContext(ctx: CallCtx) criteria.Context {
+    return .{
+        .allocator = ctx.arena(),
+        .collation = ctx.ev.opts.collation,
+        .fidelity = ctx.fidelity(),
+    };
+}
+
+fn singleArea(v: eval.Value) ?env.RangeRef {
+    return switch (v) {
+        .reference => |r| r.single(),
+        else => null,
+    };
+}
+
+/// `criteria.Error` reaches the evaluator's taxonomy. `BadFold` is the
+/// only member without a home there, and it is an injected-fold failure
+/// rather than a value outcome.
+fn mapCriteriaError(e: anyerror) FnError {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.LocaleSensitiveInput => error.LocaleSensitiveInput,
+        error.ShapeMismatch => error.ShapeMismatch,
+        error.RefOutOfGrid => error.RefOutOfGrid,
+        error.UnknownSheet => error.UnknownSheet,
+        else => error.MalformedInput,
+    };
+}
+
+/// Run one aligned pass. Both `COUNTIF` and `SUMIF` are this call plus a
+/// choice of which number to return — which is the point of §5.6a
+/// putting the alignment in one place.
+fn runScan(
+    ctx: CallCtx,
+    areas: []const env.RangeRef,
+    mode: env.AlignMode,
+    criterion: criteria.Criterion,
+) FnError!?criteria.ScanResult {
+    const cursors = try ctx.arena().alloc(usize, areas.len);
+    const scratch = try ctx.arena().alloc(value.ScalarValue, areas.len);
+    var out: criteria.ScanResult = .{};
+    criteria.scan(
+        criteriaContext(ctx),
+        ctx.ev.environment,
+        areas,
+        mode,
+        &.{criterion},
+        cursors,
+        scratch,
+        &out,
+    ) catch |e| {
+        // §5.6a: unequal dimensions under `.require_equal` are `#VALUE!`,
+        // a value outcome rather than a refusal.
+        if (e == error.ShapeMismatch or e == error.RefOutOfGrid) return null;
+        return mapCriteriaError(e);
+    };
+    return out;
+}
+
+fn fnCountIf(ctx: CallCtx, args: []const Value) FnError!Value {
+    const area = singleArea(args[0]) orelse return Value.err(.value);
+    const criterion = criteria.parse(args[1].scalar, ctx.fidelity()) catch |e| return mapCriteriaError(e);
+    const areas = [_]env.RangeRef{area};
+    const out = (try runScan(ctx, &areas, .require_equal, criterion)) orelse return Value.err(.value);
+    return Value.num(@floatFromInt(out.matched));
+}
+
+fn fnSumIf(ctx: CallCtx, args: []const Value) FnError!Value {
+    const area = singleArea(args[0]) orelse return Value.err(.value);
+    const criterion = criteria.parse(args[1].scalar, ctx.fidelity()) catch |e| return mapCriteriaError(e);
+
+    if (args.len < 3) {
+        // Two-argument form: the criteria range is also the sum range.
+        const areas = [_]env.RangeRef{area};
+        const out = (try runScan(ctx, &areas, .require_equal, criterion)) orelse return Value.err(.value);
+        return Value.num(out.numeric_total);
+    }
+    const sum_area = singleArea(args[2]) orelse return Value.err(.value);
+    // §5.6a: the sum range is PROJECTED from its top-left using the
+    // criteria range's dimensions. The ranges need not be written the
+    // same size, and Excel documents the projection rather than the
+    // shape check `*IFS` uses.
+    const areas = [_]env.RangeRef{ area, sum_area };
+    const out = (try runScan(ctx, &areas, .project_from_first, criterion)) orelse return Value.err(.value);
+    return Value.num(out.numeric_total);
 }
 
 // ─── the frozen inventory (committed data) ───────────────────────
