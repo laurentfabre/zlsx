@@ -720,10 +720,14 @@ every F-batch build directly on them:
     spine on the heap and folds it back, which preserves §5.3c's
     left-to-right operand order exactly while leaving recursion bounded
     by *parenthesis* nesting — something §9 already bounds at 256. The
-    residual `max_eval_depth` is a separate `Options` field, not
-    `Limits.max_parse_depth`: the two count different things, and
-    reusing the parser's 256 would have refused a 300-term sum that
-    parsed perfectly well.
+    residual `max_expr_depth` is a separate `Options` field. **Three
+    depths exist and none substitutes for another**:
+    `Limits.max_parse_depth` (256, recursing grammar productions),
+    §9's `max_eval_depth` (512, dependency-closure recursion — M5a's
+    graph, not an expression), and `max_expr_depth` (AST nodes on the
+    stack). Reusing the parser's 256 would have refused a 300-term sum
+    that parsed perfectly well; reusing §9's name would have collided
+    two unrelated quantities. §9 gains a row for the new one.
 
 **Spec-pinned at M3a2 (no committed manifest decides them):** `IF`'s
 omitted third argument is `FALSE`; `CHOOSE` truncates its index toward
@@ -1516,7 +1520,8 @@ adds a TEXT-heavy bench; M9d adds a mixed full-registry workload
 | cell-text 32 767 cp | **Excel-domain rule, NOT a refusal**: producing longer text yields `#VALUE!` (Excel's own REPT behavior — a successful error value) | oracle-pinned |
 | `max_text_bytes_safety` | 1 MiB | per-string resource cap (typed refusal; distinct from the Excel-domain rule) |
 | `max_matrix_cells` | 4 M | elements |
-| `max_eval_depth` | 512 | dependency-closure recursion |
+| `max_eval_depth` | 512 | dependency-closure recursion (cell → cell; M5a) |
+| `max_expr_depth` | 1024 | **expression-tree walk** (AST nodes on the stack; M3a2, `eval.Options`). Distinct from both `max_parse_depth` (recursing grammar productions) and `max_eval_depth` above. Left-associative operator chains are folded iteratively, so in practice only parenthesis nesting reaches it |
 | `max_output_archive_bytes` | **2³²−1 bytes exactly** (matches the ZIP32 sentinel bounds `pkg/store.zig:720-742`) | serialized output archives — `saveToOwnedBuffer`, `save_to_buffer`, `saveWithRecalc`; identical typed outcome at every layer |
 | workbook materialization | **`max_workbook_compressed_bytes` 1 GiB; `max_workbook_decompressed_bytes` 4 GiB; `max_modeled_cells` 64M** — PartStore allocations (own arena, 512 MiB/part, `store.zig:105-129,1340-1384`) sit outside `max_run_arena_bytes`; early-refusal tests | pre-model refusal |
 | retained generations | `max_retained_generations` 4; **`max_retained_generation_bytes` 2 GiB; `max_retained_fds` 16** — in resolved limits + fingerprints; projected retention **preflighted before allocating or swapping** | pre-swap refusal |

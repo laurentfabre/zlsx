@@ -239,14 +239,15 @@ pub const Options = struct {
     dialect: value.Dialect = .dynamic_array,
     site: ?EvalSite = null,
     limits: parser.Limits = .{},
-    /// Recursion bound for the AST walk — a **stack** limit, and
-    /// deliberately not `Limits.max_parse_depth`.
+    /// Recursion bound for the **expression-tree walk** — a stack limit.
     ///
-    /// The two count different things. The parser's depth counts
-    /// recursing grammar productions, so `1+1+1+…` is depth 1 however
-    /// long it gets; the evaluator's walk descends one frame per node,
-    /// so the same text is a left-leaning tree as deep as it is long.
-    /// Reusing the parser's 256 would conflate the two.
+    /// Three different depths exist and none substitutes for another.
+    /// `Limits.max_parse_depth` (256) counts recursing grammar
+    /// productions, so `1+1+1+…` is depth 1 however long it gets. §9's
+    /// `max_eval_depth` (512) counts *dependency-closure* recursion —
+    /// cell to cell, M5a's graph, not an expression at all. This one
+    /// counts AST nodes on the stack, where that same flat sum is a
+    /// left-leaning tree as deep as it is long.
     ///
     /// Left-associative operator chains are folded iteratively (see
     /// `Evaluator.binary`), so in practice this bound is reached only
@@ -254,7 +255,10 @@ pub const Options = struct {
     /// bounds far lower. It is the backstop for a hand-built AST that
     /// never went through the parser. A §9 limit: it raises
     /// `FormulaLimitExceeded`, a defined outcome rather than a crash.
-    max_eval_depth: usize = 1024,
+    ///
+    /// It lives here rather than in `Limits` because `Limits` is M2's
+    /// parse-limit struct; §9's aggregate-limit consolidation is M3b's.
+    max_expr_depth: usize = 1024,
 };
 
 // ─── the evaluator ───────────────────────────────────────────────
@@ -327,7 +331,7 @@ pub const Evaluator = struct {
     // ─── node dispatch ───────────────────────────────────────────
 
     fn evalNode(self: *Evaluator, i: parser.Index) EvalError!Value {
-        if (self.depth >= self.opts.max_eval_depth) return error.LimitExceeded;
+        if (self.depth >= self.opts.max_expr_depth) return error.LimitExceeded;
         self.depth += 1;
         defer self.depth -= 1;
 
@@ -2236,10 +2240,10 @@ test "limits: a flat expression is not a deep one" {
     for (0..600) |_| try nested.append(testing.allocator, ')');
     var deep = wide;
     deep.limits.max_parse_depth = 4096;
-    deep.max_eval_depth = 100;
+    deep.max_expr_depth = 100;
     try testing.expectError(error.LimitExceeded, h.evalOpts(nested.items, deep));
     // …and the same text evaluates once the evaluator is allowed the depth.
-    deep.max_eval_depth = 4096;
+    deep.max_expr_depth = 4096;
     try testing.expectEqual(@as(f64, 1), (try h.evalOpts(nested.items, deep)).scalar.number);
 }
 
