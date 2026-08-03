@@ -44,6 +44,13 @@ jobs:
       - name: Unit + fuzz-smoke tests
         run: zig build test
 
+      # M1b: the oracle replays from committed manifests, so it gates
+      # the build on a machine with no Excel and no LibreOffice
+      # installed. Named separately from `test` so a failure here reads
+      # as "the recorded evidence changed", not "a unit test broke".
+      - name: Oracle replay (committed manifests, no apps)
+        run: zig build test-oracle
+
       - name: Fetch corpus + integration tests
         run: |
           bash scripts/fetch_test_corpus.sh

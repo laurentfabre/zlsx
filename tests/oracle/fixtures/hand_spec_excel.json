@@ -1,0 +1,108 @@
+{
+  "schema": "zlsx-oracle-manifest-1",
+  "case": "oracle_suite",
+  "fidelity": "excel",
+  "provenance": {
+    "adapter": "hand_spec",
+    "app_build": "goal_formula.md \u00a75.2 precedence + \u00a710 error taxonomy; MS-OE376 operator semantics",
+    "os": "n/a (derived, not executed)",
+    "locale": "en_US.UTF-8",
+    "extractor_version": "oracle-extractor-1",
+    "workbook_digest": "efd5887a20e8d408ed4d8c83bb6f4acc0342ee3b9d58e04d22a660bccf1ee515",
+    "recorded": "2026-08-03"
+  },
+  "calc": {
+    "calc_mode": "auto",
+    "full_calc_on_load": false,
+    "full_precision": true,
+    "date1904": false
+  },
+  "cells": [
+    {
+      "sheet": "Spec",
+      "ref": "A1",
+      "kind": "number",
+      "bits": "0x4000000000000000",
+      "source": "2.0",
+      "formula": "1+1"
+    },
+    {
+      "sheet": "Spec",
+      "ref": "A4",
+      "kind": "number",
+      "bits": "0x4050000000000000",
+      "source": "64.0",
+      "formula": "2^3^2"
+    },
+    {
+      "sheet": "Spec",
+      "ref": "A5",
+      "kind": "number",
+      "bits": "0x3FF0000000000000",
+      "source": "1.0",
+      "formula": "-1^2"
+    },
+    {
+      "sheet": "Spec",
+      "ref": "A6",
+      "kind": "error",
+      "error_kind": "div0",
+      "error_spelling": "#DIV/0!",
+      "formula": "1/0"
+    },
+    {
+      "sheet": "Spec",
+      "ref": "A7",
+      "kind": "error",
+      "error_kind": "num",
+      "error_spelling": "#NUM!",
+      "formula": "SQRT(-1)"
+    },
+    {
+      "sheet": "Spec",
+      "ref": "A8",
+      "kind": "error",
+      "error_kind": "value",
+      "error_spelling": "#VALUE!",
+      "formula": "\"a\"+1"
+    },
+    {
+      "sheet": "Spec",
+      "ref": "A9",
+      "kind": "number",
+      "bits": "0x4000000000000000",
+      "source": "2.0",
+      "formula": "TRUE()+1"
+    },
+    {
+      "sheet": "Spec",
+      "ref": "A10",
+      "kind": "text",
+      "text": "1x",
+      "formula": "1&\"x\""
+    },
+    {
+      "sheet": "Spec",
+      "ref": "A12",
+      "kind": "boolean",
+      "boolean": true,
+      "formula": "\"a\"<\"B\""
+    },
+    {
+      "sheet": "Spec",
+      "ref": "A13",
+      "kind": "number",
+      "bits": "0x3FB999999999999A",
+      "source": "0.1",
+      "formula": "10%"
+    },
+    {
+      "sheet": "Spec",
+      "ref": "A14",
+      "kind": "error",
+      "error_kind": "num",
+      "error_spelling": "#NUM!",
+      "formula": "1E+308*10"
+    }
+  ]
+}

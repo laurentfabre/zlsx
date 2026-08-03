@@ -1006,6 +1006,92 @@ corpus > LO; `.ieee` mode — the normative `ieee_fp_rules_v1` table +
 hand-derived bit goldens lead, with Excel retained only as a recorded
 divergence witness. Conflicts recorded, never averaged. Regeneration = reviewed command + manifest diff.
 
+**M1b decisions (shipped 2026-08-03).** The harness lives in
+`tests/oracle/` (replay, pure Zig, no application needed) and
+`scripts/oracle/` (recording: Python, AppleScript, shell). Fourteen
+points the row left open or got wrong:
+
+1. **Independence is structural.** The oracle imports nothing from
+   `zlsx` — it carries its own ZIP reader (`tests/oracle/zip_reader.zig`,
+   own central-directory walk + `std.compress.flate`) and its own XML
+   scanner (`xml_scan.zig`). An oracle that read workbooks through
+   `pkg/zip.zig` and `pkg/sheet_xml.zig` would have the same bug on both
+   sides of every comparison and would confirm zlsx against itself.
+   `scripts/oracle/build_inputs.py` hand-authors the input XML for the
+   same reason — plus the plain fact that no sane writer will emit a
+   cached value that contradicts its own formula, which is exactly what
+   a sentinel is.
+2. **Recording and replay are separate programs.** Recording needs
+   macOS, Excel and LibreOffice; replay needs a committed JSON file.
+   `zig build test-oracle` therefore gates CI on a Linux box with no
+   spreadsheet application installed — evidence gathered once keeps
+   gating everywhere.
+3. **The Excel leg is PARKED — it needs a human.** Excel 16.111.2
+   answers AppleScript property queries (`version`, `name of every
+   workbook`, `calculate full rebuild`) but every window operation is a
+   no-op or refused: `open workbook`, `open -a`, `close … saving no`,
+   and `quit` (which returns "User canceled", −128). That signature is a
+   modal dialog nobody has dismissed. It cannot be diagnosed from here
+   either: `osascript` lacks assistive access (−1728), so the dialog
+   cannot even be read. **Ask:** bring Excel to the front, dismiss
+   whatever is on screen, close any open workbook, then re-run
+   `scripts/oracle/regenerate.sh`. The driver
+   (`scripts/oracle/record_excel_mac.sh`) is complete and exits 3 with
+   this instruction; the LO and hand-spec legs shipped without it.
+4. **Excel silently refuses cells that are out of column order within a
+   row.** Rows ascending and cells ascending *within* each row are both
+   mandatory; violate either and Excel declines to open the file with no
+   error an automated caller can see. zlsx and LibreOffice both accept
+   the unsorted form, so nothing else in the tree reveals this.
+5. **Excel is sandboxed.** A scripted open of a path outside its
+   container fails silently and reports success. Inputs are staged into
+   `~/Library/Containers/com.microsoft.Excel/Data/Documents/` first.
+6. **LibreOffice: replace only `Standard/Module1.xba`.** Writing
+   `user/basic/script.xlc` or `Standard/script.xlb` de-registers the
+   Basic library; the macro then does not exist and `soffice` reports
+   that by exiting 0 having done nothing. The profile must be
+   materialised by one `--terminate_after_init` run before the macro is
+   installed.
+7. **The stale-dependency sentinel's discriminating power is
+   UNVERIFIED.** It is built as specified — a three-deep chain with a
+   deliberately inverted `calcChain` — but whether `CalculateFull` and
+   `CalculateFullRebuild` actually differ on it could not be measured
+   with the Excel leg parked. It functions today as a second,
+   independent stale-value proof on a different formula shape. Measure
+   it when the Excel leg runs; do not cite the discrimination until then.
+8. **Sentinels are checked against the raw extraction, never a
+   manifest.** A manifest excludes volatile cells by design, so checking
+   the volatile sentinel there would pass by absence — the exact failure
+   it guards against.
+9. **An empty sentinel set cannot vacuously accept a run**
+   (`sentinel.hasProof`), and neither can a set of volatile draws alone:
+   Excel redraws volatiles on load without a full calculation.
+10. **`hand_spec` has no workbook**, so its provenance digest pins the
+    *input* workbook its values answer, and its `app_build` names the
+    authority the values were derived from. Cases whose answer cannot be
+    defended from a documented rule are deliberately ABSENT — a
+    hand-spec entry that is really a recollection of Excel outranks the
+    corpus and LibreOffice under §8.2 precedence.
+11. **The corpus admits zero workbooks today**, all 28 screened out for
+    unknown provenance. That is the correct answer, and it is why the
+    corpus is a witness in both fidelities rather than an authority.
+12. **Application-leg digests change on every run** — Excel and
+    LibreOffice embed timestamps on save — so `regenerate.sh` classifies
+    a digest-only diff explicitly. Without that, reviewers learn to skim
+    past a diff that is usually noise and one day is not.
+13. **`std.json.parseFromSlice` needs `allocate = .alloc_always`.** The
+    default borrows escape-free strings from the input buffer, so a
+    manifest outlives its JSON bytes as a struct full of dangling
+    slices that still compare and print as though fine.
+14. **First recorded divergences** (LibreOffice 26.2.5.2 vs the
+    hand-derived suite), pinned as named tests in `replay.zig`:
+    `SQRT(-1)` → `#VALUE!` in LO where the spec says `#NUM!`; `0.1+0.2`
+    → `0x3FD3333333333333` in LO where IEEE gives `…334`; `1/3` one ULP
+    low; and consequently `(0.1+0.2)=0.3` → TRUE. LO **preserved**
+    signed zero (`-0` → `0x8000000000000000`). Ten other hand-derived
+    `.excel` cases — operator precedence, error taxonomy, coercion,
+    percent, overflow-to-`#NUM!` — were confirmed independently.
+
 ### 8.3 Comparison rule
 
 Bit-exact parsed binary64; per-case documented tolerances only; decoded
