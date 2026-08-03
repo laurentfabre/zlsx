@@ -460,6 +460,44 @@ pub fn build(b: *std.Build) void {
     const xid_tests = b.addTest(.{ .root_module = xid_mod });
     test_step.dependOn(&b.addRunArtifact(xid_tests).step);
 
+    // M1b: the oracle harness. Deliberately imports NOTHING from zlsx —
+    // it carries its own ZIP and XML decoders (`tests/oracle/zip_reader.zig`,
+    // `xml_scan.zig`) because an oracle that shared a decoder with the
+    // implementation under test could not detect a bug in that decoder.
+    // The replay half runs in `zig build test` with no spreadsheet
+    // application installed; recording is a separate, explicit command.
+    const oracle_mod = b.createModule(.{
+        .root_source_file = b.path("tests/oracle/replay.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // Read by `sentinel_set.zig`, which checks its planted values
+    // against the builder script rather than trusting them to stay in
+    // sync by convention.
+    oracle_mod.addAnonymousImport("build_inputs_py", .{
+        .root_source_file = b.path("scripts/oracle/build_inputs.py"),
+    });
+    const oracle_tests = b.addTest(.{ .root_module = oracle_mod });
+    test_step.dependOn(&b.addRunArtifact(oracle_tests).step);
+
+    // Also reachable on its own, so CI can show the oracle gate as a
+    // named step and a developer can run it without the full suite.
+    const oracle_step = b.step("test-oracle", "Replay the committed oracle manifests (no apps needed)");
+    oracle_step.dependOn(&b.addRunArtifact(oracle_tests).step);
+
+    // The recorder. Not wired into `test` — it drives nothing by
+    // itself, but `scripts/oracle/regenerate.sh` needs the binary.
+    const oracle_record_mod = b.createModule(.{
+        .root_source_file = b.path("tests/oracle/record.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const oracle_record_exe = b.addExecutable(.{
+        .name = "zlsx-oracle-record",
+        .root_module = oracle_record_mod,
+    });
+    b.installArtifact(oracle_record_exe);
+
     // C1 milestone 1: formula tokenizer + loss-preserving printer.
     // M1a widened it to Unicode identifiers (`zlsx_xid`), the
     // dynamic-array / structured-ref token kinds, and extensible error
