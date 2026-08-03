@@ -5,6 +5,11 @@
 // SHA-256 of UnicodeData.txt: 2e1efc1dcb59c575eedf5ccae60f95229f706ee6d031835247d843c11d96470c
 // SHA-256 of CompositionExclusions.txt: 2f239196ef3b5b61db5cc476e9bd80f534d15aa1b74e1be1dea5d042a344c85f
 // Unicode version: 17.0.0
+//
+// This file contains data derived from the Unicode Character
+// Database, used under the Unicode License v3. See
+// THIRD_PARTY_NOTICES.md at the repository root for the full
+// license text and attribution.
 
 pub const unicode_version: []const u8 = "17.0.0";
 

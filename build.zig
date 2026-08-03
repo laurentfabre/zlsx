@@ -142,6 +142,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // M1a (tier D1): UAX #31 `XID_Start` / `XID_Continue` tables — the
+    // Unicode half of the formula identifier grammar. Rooted next to
+    // `nfc.zig` for the same one-file-one-module-tree reason; the
+    // tokenizer lives in `src/`, so the tables cannot.
+    const xid_mod = b.createModule(.{
+        .root_source_file = b.path("unicode/xid.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // M0 (tier D1): typed coordinates — the single owner of A1 parse /
     // format and the grid bounds. Rooted at top-level `refs/` for the
     // same one-file-one-module-tree reason as `unicode/` above: its
@@ -171,6 +181,7 @@ pub fn build(b: *std.Build) void {
     zlsx_mod.addImport("fuzz_config", fuzz_config_mod);
     zlsx_mod.addImport("zlsx_nfc", nfc_mod);
     zlsx_mod.addImport("zlsx_refs", refs_mod);
+    zlsx_mod.addImport("zlsx_xid", xid_mod);
 
     // Unit tests (embedded in src/xlsx.zig, including the fuzz suite).
     const unit_mod = b.createModule(.{
@@ -187,6 +198,7 @@ pub fn build(b: *std.Build) void {
     unit_mod.addImport("fuzz_config", fuzz_config_mod);
     unit_mod.addImport("zlsx_nfc", nfc_mod);
     unit_mod.addImport("zlsx_refs", refs_mod);
+    unit_mod.addImport("zlsx_xid", xid_mod);
     const unit_tests = b.addTest(.{ .root_module = unit_mod });
     const test_step = b.step("test", "Run zlsx unit + fuzz-smoke tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
@@ -215,6 +227,7 @@ pub fn build(b: *std.Build) void {
     unit_fuzz_mod.addImport("fuzz_config", fuzz_config_mod);
     unit_fuzz_mod.addImport("zlsx_nfc", nfc_mod);
     unit_fuzz_mod.addImport("zlsx_refs", refs_mod);
+    unit_fuzz_mod.addImport("zlsx_xid", xid_mod);
     // Zig 0.16.0 cannot compile its own test runner in `-ffuzz` mode
     // (`writeStackTrace` receives a `*builtin.StackTrace` where a
     // `*const debug.StackTrace` is required), which blocked coverage-
@@ -442,17 +455,41 @@ pub fn build(b: *std.Build) void {
     const nfc_tests = b.addTest(.{ .root_module = nfc_mod });
     test_step.dependOn(&b.addRunArtifact(nfc_tests).step);
 
+    // M1a: XID interval-table tests (boundary cases + a full-space
+    // sweep of the binary search against a linear scan).
+    const xid_tests = b.addTest(.{ .root_module = xid_mod });
+    test_step.dependOn(&b.addRunArtifact(xid_tests).step);
+
     // C1 milestone 1: formula tokenizer + loss-preserving printer.
-    // Independent module (no cross-deps yet) — the rewriter that
-    // depends on this lands in later C1 iterations.
+    // M1a widened it to Unicode identifiers (`zlsx_xid`), the
+    // dynamic-array / structured-ref token kinds, and extensible error
+    // literals; the parser that consumes those lands at M2.
     const formula_tokenizer_mod = b.createModule(.{
         .root_source_file = b.path("src/formula/tokenizer.zig"),
         .target = target,
         .optimize = optimize,
     });
     formula_tokenizer_mod.addImport("zlsx_refs", refs_mod);
+    formula_tokenizer_mod.addImport("zlsx_xid", xid_mod);
     const formula_tokenizer_tests = b.addTest(.{ .root_module = formula_tokenizer_mod });
     test_step.dependOn(&b.addRunArtifact(formula_tokenizer_tests).step);
+
+    // M1a: coverage-guided tokenizer fuzz target (round-trip identity,
+    // no-panic, refusal/kind consistency). Same `.fuzz = true` +
+    // vendored test-runner pattern as `unit_fuzz_mod`.
+    const formula_tokenizer_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/tokenizer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .fuzz = true,
+    });
+    formula_tokenizer_fuzz_mod.addImport("zlsx_refs", refs_mod);
+    formula_tokenizer_fuzz_mod.addImport("zlsx_xid", xid_mod);
+    const formula_tokenizer_fuzz_tests = b.addTest(.{
+        .root_module = formula_tokenizer_fuzz_mod,
+        .test_runner = fuzz_test_runner,
+    });
+    fuzz_step.dependOn(&b.addRunArtifact(formula_tokenizer_fuzz_tests).step);
 
     // C1 milestone 2 (iter 1): pure-function A1 cell-formula
     // rewriter. Imports the M1 tokenizer via a relative path inside
@@ -466,6 +503,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     formula_rewriter_mod.addImport("zlsx_refs", refs_mod);
+    formula_rewriter_mod.addImport("zlsx_xid", xid_mod);
     const formula_rewriter_tests = b.addTest(.{ .root_module = formula_rewriter_mod });
     test_step.dependOn(&b.addRunArtifact(formula_rewriter_tests).step);
 

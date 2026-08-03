@@ -33,7 +33,7 @@ jobs:
           echo "$PWD/zig-${T}-${ZIG_VER}" >> "$GITHUB_PATH"
 
       - name: zig fmt --check
-        run: zig fmt --check src/ tests/ build.zig
+        run: zig fmt --check src/ tests/ unicode/ refs/ build.zig
 
       - name: Build (Debug)
         run: zig build
@@ -63,6 +63,36 @@ jobs:
         run: |
           zig build
           ./zig-out/bin/consumer "${RUNNER_TEMP}/consumer-in.xlsx" "${RUNNER_TEMP}/consumer-out.xlsx"
+
+  # M1a gates. Both are cheap and independent of the test matrix, so
+  # they run once rather than per-OS.
+  unicode-and-notices:
+    name: unicode tables + third-party notices
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Zig 0.16.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz" | tar -xJ
+          echo "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # Asserts the notice is wired into every distribution channel.
+      # No network, no toolchain — if this fails the repo is misconfigured.
+      - name: Third-party notices are shipped everywhere
+        run: scripts/ci/check_third_party_notices.sh repo
+
+      # Re-derives every vendored Unicode table from its pinned inputs.
+      # Tolerates a download failure (unicode.org outage must not block
+      # PRs); never tolerates a digest mismatch or a table diff.
+      - name: Unicode tables match their pinned inputs
+        run: scripts/ci/check_unicode_tables.sh
 
   cross-compile:
     name: cross / ${{ matrix.target }}
@@ -108,7 +138,7 @@ jobs:
           python-version: "3.12"
 
       - name: zig fmt --check
-        run: zig fmt --check src/ tests/ build.zig
+        run: zig fmt --check src/ tests/ unicode/ refs/ build.zig
 
       - name: Build (Debug)
         run: zig build

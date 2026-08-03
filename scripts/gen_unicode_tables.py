@@ -2,7 +2,7 @@
 """
 A1 (post-0.2.9 roadmap): Unicode table generator.
 
-Two operating modes:
+Three operating modes:
 
   --mode casefold:
     Reads `CaseFolding.txt` and emits a vendored Zig data file
@@ -22,6 +22,16 @@ Two operating modes:
     Hangul (U+AC00..U+D7A3) is handled algorithmically by the
     runtime — its 11172 codepoints stay out of the table.
 
+  --mode xid:
+    Reads `DerivedCoreProperties.txt` and emits a vendored Zig data
+    file powering `unicode/xid.zig` — the identifier grammar the
+    formula tokenizer needs (M1a of the tier-D1 ladder). Two sorted,
+    merged, non-overlapping interval tables: `XID_Start` and
+    `XID_Continue`. The Zig side binary-searches them, so lookup is
+    allocation-free.
+
+    Zig's stdlib ships no XID tables, which is why this mode exists.
+
 Usage:
     scripts/gen_unicode_tables.py --mode casefold \\
         --input /path/to/CaseFolding.txt \\
@@ -32,8 +42,15 @@ Usage:
         --excl /path/to/CompositionExclusions.txt \\
         --output unicode/tables/nfc_data.zig
 
+    scripts/gen_unicode_tables.py --mode xid \\
+        --input /path/to/DerivedCoreProperties.txt \\
+        --output unicode/tables/xid_data.zig
+
 Each generated file pins the Unicode version + SHA-256 of every
 input in its header so re-generation is reproducible.
+`scripts/ci/check_unicode_tables.sh` is the regen gate: it fetches
+the pinned inputs, verifies those digests, re-runs the generator and
+fails on any diff.
 """
 from __future__ import annotations
 
@@ -43,6 +60,14 @@ import re
 import sys
 from pathlib import Path
 
+
+ATTRIBUTION = [
+    "//",
+    "// This file contains data derived from the Unicode Character",
+    "// Database, used under the Unicode License v3. See",
+    "// THIRD_PARTY_NOTICES.md at the repository root for the full",
+    "// license text and attribution.",
+]
 
 CASEFOLD_LINE = re.compile(
     r"^(?P<code>[0-9A-F]+);\s*"
@@ -107,6 +132,7 @@ def emit_zig(
         f"// SHA-256 of input: {input_sha256}",
         f"// Unicode version: {version}",
         "// Policy: non-Turkic full case fold (statuses C + F).",
+        *ATTRIBUTION,
         "",
         f'pub const unicode_version: []const u8 = "{version}";',
         "",
@@ -242,6 +268,7 @@ def emit_nfc_zig(
         lines.append(f"// SHA-256 of {k}: {v}")
     lines.extend([
         f"// Unicode version: {version}",
+        *ATTRIBUTION,
         "",
         f'pub const unicode_version: []const u8 = "{version}";',
         "",
@@ -289,6 +316,120 @@ def emit_nfc_zig(
     )
 
 
+DERIVED_PROP_LINE = re.compile(
+    r"^(?P<lo>[0-9A-F]{4,6})(?:\.\.(?P<hi>[0-9A-F]{4,6}))?\s*;\s*(?P<prop>[A-Za-z_]+)"
+)
+
+DERIVED_VERSION_LINE = re.compile(r"^# DerivedCoreProperties-(?P<version>[0-9.]+)\.txt")
+
+
+def parse_derived_core_properties(
+    path: Path, wanted: tuple[str, ...]
+) -> tuple[str, dict[str, list[tuple[int, int]]]]:
+    """Extract the requested binary properties from
+    `DerivedCoreProperties.txt` as sorted, merged, non-overlapping
+    [lo, hi] intervals. Returns (unicode_version, {prop: intervals})."""
+    version = ""
+    raw: dict[str, list[tuple[int, int]]] = {p: [] for p in wanted}
+    with path.open() as f:
+        for line in f:
+            if line.startswith("#"):
+                if not version:
+                    m = DERIVED_VERSION_LINE.match(line)
+                    if m:
+                        version = m.group("version")
+                continue
+            m = DERIVED_PROP_LINE.match(line)
+            if not m:
+                continue
+            prop = m.group("prop")
+            if prop not in raw:
+                continue
+            lo = int(m.group("lo"), 16)
+            hi = int(m.group("hi"), 16) if m.group("hi") else lo
+            raw[prop].append((lo, hi))
+    if not version:
+        raise SystemExit(
+            "gen_unicode_tables: input missing # DerivedCoreProperties-X.Y.Z.txt header"
+        )
+    out: dict[str, list[tuple[int, int]]] = {}
+    for prop, intervals in raw.items():
+        if not intervals:
+            raise SystemExit(f"gen_unicode_tables: property {prop} absent from input")
+        out[prop] = merge_intervals(intervals)
+    return version, out
+
+
+def merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Sort and coalesce touching or overlapping ranges. Coalescing
+    matters: the UCD lists XID_Start in general-category order, so
+    adjacent categories produce ranges that abut (e.g. `0041..005A`
+    and `005B` would stay two rows) and every merged pair is one
+    fewer binary-search step at runtime."""
+    merged: list[tuple[int, int]] = []
+    for lo, hi in sorted(intervals):
+        if merged and lo <= merged[-1][1] + 1:
+            prev_lo, prev_hi = merged[-1]
+            merged[-1] = (prev_lo, max(prev_hi, hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def emit_xid_zig(
+    out_path: Path,
+    version: str,
+    props: dict[str, list[tuple[int, int]]],
+    input_sha256: str,
+) -> None:
+    """Render `xid_data.zig` with two interval tables."""
+    start = props["XID_Start"]
+    cont = props["XID_Continue"]
+
+    # XID_Start ⊆ XID_Continue is a UCD invariant. Assert it here so a
+    # future UCD revision that broke it could not slip into the tree.
+    for lo, hi in start:
+        if not any(c_lo <= lo and hi <= c_hi for c_lo, c_hi in cont):
+            raise SystemExit(
+                f"gen_unicode_tables: XID_Start range U+{lo:04X}..U+{hi:04X} "
+                "is not contained in XID_Continue"
+            )
+
+    lines = [
+        "// AUTO-GENERATED by scripts/gen_unicode_tables.py — DO NOT EDIT",
+        "// Source: https://www.unicode.org/Public/17.0.0/ucd/DerivedCoreProperties.txt",
+        f"// SHA-256 of input: {input_sha256}",
+        f"// Unicode version: {version}",
+        "// Properties: XID_Start, XID_Continue (UAX #31 identifier syntax).",
+        *ATTRIBUTION,
+        "",
+        f'pub const unicode_version: []const u8 = "{version}";',
+        "",
+        "/// An inclusive codepoint interval. Tables are sorted by `lo`,",
+        "/// non-overlapping, and coalesced, so a binary search over `lo`",
+        "/// answers membership in one probe chain with no allocation.",
+        "pub const Range = struct { lo: u21, hi: u21 };",
+        "",
+        "pub const xid_start: []const Range = &.{",
+    ]
+    for lo, hi in start:
+        lines.append(f"    .{{ .lo = 0x{lo:04X}, .hi = 0x{hi:04X} }},")
+    lines.append("};")
+    lines.append("")
+    lines.append("pub const xid_continue: []const Range = &.{")
+    for lo, hi in cont:
+        lines.append(f"    .{{ .lo = 0x{lo:04X}, .hi = 0x{hi:04X} }},")
+    lines.append("};")
+    lines.append("")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines))
+    print(
+        f"gen_unicode_tables(xid): {len(start)} XID_Start ranges, "
+        f"{len(cont)} XID_Continue ranges → {out_path}"
+    )
+
+
 def parse_unicode_version_from_data(path: Path) -> str:
     """UnicodeData.txt has no version header. Use the path's
     sibling Derived files or just hard-code current. Better: read
@@ -299,7 +440,7 @@ def parse_unicode_version_from_data(path: Path) -> str:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["casefold", "nfc"], default="casefold")
+    p.add_argument("--mode", choices=["casefold", "nfc", "xid"], default="casefold")
     p.add_argument("--input", type=Path, required=True)
     p.add_argument("--excl", type=Path, default=None, help="CompositionExclusions.txt (NFC only)")
     p.add_argument("--output", type=Path, required=True)
@@ -310,6 +451,14 @@ def main() -> int:
         digest = hashlib.sha256(raw).hexdigest()
         version, entries = parse_input(args.input)
         emit_zig(args.output, version, entries, digest)
+        return 0
+
+    if args.mode == "xid":
+        digest = hashlib.sha256(args.input.read_bytes()).hexdigest()
+        version, props = parse_derived_core_properties(
+            args.input, ("XID_Start", "XID_Continue")
+        )
+        emit_xid_zig(args.output, version, props, digest)
         return 0
 
     # NFC mode.

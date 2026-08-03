@@ -8,7 +8,12 @@ version = "0.8.0"
 description = "Python binding for zlsx — fast, read-mostly .xlsx library (Zig)"
 readme = "README.md"
 license = "LicenseRef-Proprietary"
-license-files = ["LICENSE"]
+# THIRD_PARTY_NOTICES.md is a symlink to the repo-root file (same
+# arrangement as LICENSE). It carries the Unicode License v3 notice for
+# the UCD-derived tables inside the bundled dylib, which must travel
+# with every copy — listing it here puts it in the wheel's
+# `.dist-info/licenses/` AND the sdist.
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.9"
 authors = [{ name = "Laurent Fabre" }]
 keywords = ["xlsx", "excel", "spreadsheet", "parser", "openpyxl-alternative"]
@@ -42,4 +47,11 @@ spark = ["pyspark>=4.0.0", "pyarrow>=11.0.0"]
 packages = ["zlsx"]
 
 [tool.hatch.build.targets.sdist]
-include = ["zlsx/**", "tests/**", "README.md", "LICENSE", "pyproject.toml"]
+include = [
+    "zlsx/**",
+    "tests/**",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "pyproject.toml",
+]

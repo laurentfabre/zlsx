@@ -85,6 +85,15 @@ jobs:
           mkdir -p dist
           mv dist_untagged/py_zlsx-*-py3-none-${{ matrix.wheel_tag }}.whl dist/
 
+      # The wheel bundles libzlsx, which carries UCD-derived tables. The
+      # Unicode license requires its notice to travel with the copy, so
+      # a wheel without it must not reach PyPI.
+      - name: Verify third-party notices are in the wheel
+        run: |
+          for w in bindings/python/dist/*.whl; do
+            scripts/ci/check_third_party_notices.sh archive "$w"
+          done
+
       - name: Upload wheel to the GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3

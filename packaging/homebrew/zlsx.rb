@@ -57,7 +57,11 @@ class Zlsx < Formula
     bin.install Dir["bin/*"]
     lib.install Dir["lib/*"]
     include.install "include/zlsx.h"
-    doc.install "README.md"
+    # THIRD_PARTY_NOTICES.md carries the Unicode License v3 notice for
+    # the UCD-derived tables compiled into the binaries. The license
+    # requires it to travel with copies, so it installs alongside the
+    # README rather than being dropped as documentation noise.
+    doc.install "README.md", "THIRD_PARTY_NOTICES.md"
   end
 
   test do

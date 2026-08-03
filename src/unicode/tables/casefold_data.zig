@@ -3,6 +3,11 @@
 // SHA-256 of input: ff8d8fefbf123574205085d6714c36149eb946d717a0c585c27f0f4ef58c4183
 // Unicode version: 17.0.0
 // Policy: non-Turkic full case fold (statuses C + F).
+//
+// This file contains data derived from the Unicode Character
+// Database, used under the Unicode License v3. See
+// THIRD_PARTY_NOTICES.md at the repository root for the full
+// license text and attribution.
 
 pub const unicode_version: []const u8 = "17.0.0";
 

@@ -92,8 +92,15 @@ jobs:
           cp "zig-out/lib/${{ matrix.staticlib_name }}" "$STAGE/lib/"
           if [ -f "zig-out/lib/zlsx.lib" ]; then cp zig-out/lib/zlsx.lib "$STAGE/lib/"; fi
           cp include/zlsx.h "$STAGE/include/"
-          cp README.md LICENSE "$STAGE/"
+          # THIRD_PARTY_NOTICES.md is not optional: the Unicode
+          # Character Database data compiled into every binary is
+          # licensed on the condition that its notice travels with
+          # copies. `check_third_party_notices.sh` gates this.
+          cp README.md LICENSE THIRD_PARTY_NOTICES.md "$STAGE/"
           echo "STAGE=$STAGE" >> "$GITHUB_ENV"
+
+      - name: Verify third-party notices are staged
+        run: scripts/ci/check_third_party_notices.sh stage "$STAGE"
 
       - name: Create tar.gz archive
         if: matrix.archive_format == 'tar.gz'
