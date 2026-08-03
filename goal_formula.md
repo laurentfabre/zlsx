@@ -1352,6 +1352,113 @@ maintained.
 untouched, `c_abi.zig:1837-1920`) + Python land at M9a2 with probes. v1
 authors `.scalar`; M7b1 recalculates/persists **existing** CSE only; **both `.cse` and `.dynamic_array` authoring land at M7c**.
 
+**M4a decisions (shipped 2026-08-03).** Seventeen points the row left
+open, got wrong, or discovered. They span §5.3b (dialect), §5.6a
+(`dialectOf`), §5.8b (`cm`/`vm`) and §10 (refusals), and are collected
+here because §5.8b is where the `cm`/`vm` contract lives.
+
+1. **Everything in the part is spec-pinned, and the sources are named.**
+   No committed manifest in `tests/oracle/fixtures/` contains a metadata
+   row and no workbook in `tests/corpus/` carries an `xl/metadata.xml`
+   part, so nothing here is oracle-decided. The element and attribute
+   inventory comes from ECMA-376 `sml-sheetMetadata.xsd`, `c@cm`/`c@vm`
+   from `CT_Cell` (`xsd:unsignedInt`, default `0`), one-based indexing
+   from `:133` above, and the type names from what Office writes. M7b
+   still re-pins the *transitions* from byte-diffed references; nothing
+   at M4a writes, so nothing at M4a front-runs that.
+2. **The classification table is the parser, not documentation.**
+   `element_inventory` has one row per schema element — 20 — and
+   `childOf(parent, name)` is a loop over it. An element with no row has
+   no legal position anywhere, so the parse refuses instead of skipping.
+   A table that only *described* the reader would drift from it in the
+   first commit that added an element.
+3. **Two tables, because the part has two kinds of "type".** Elements are
+   schema-defined and closed; metadata *type names* are producer-defined
+   strings and open. That is why `unknown` is a first-class row of
+   `type_classification` with a treatment rather than an error case —
+   there is no schema to consult about a name Excel invents next year.
+4. **Names that the schema overloads by position get distinct members.**
+   `bk` under `cellMetadata` and `bk` under `futureMetadata` are
+   different records; so are `t` under `mdx` and the `t` attribute of
+   `rc`. A reader that resolved element names globally would classify
+   whichever it saw first.
+5. **Only `XLDAPR` is interpreted, and the refusal is a property of the
+   reference — not of the file.** A workbook full of rich values
+   recalculates cleanly as long as the run neither reads nor writes a
+   cell that points at one. That is what makes `CellRole` a parameter of
+   resolution rather than a fact about the workbook: the input side and
+   the result side ask the same question and get the same answer, and the
+   role only decides which side the diagnostic names.
+6. **All value metadata refuses, which is deliberately wider than the
+   row's `XLRICHVALUE`/unknown.** Office declares `XLDAPR` with
+   `cellMeta="1"` — it is a *cell* metadata type. Reached through `vm` it
+   means something this reader has never been shown, and the safe reading
+   of "never been shown" is a refusal (`dynamic_array_in_value_metadata`),
+   not a dialect.
+7. **Value metadata is checked before cell metadata.** A cell carrying
+   both a dynamic-array mark and a rich value must refuse; checking `cm`
+   first would hand back a dialect a caller could act on before noticing
+   the part it must not touch.
+8. **Pre-mutation is a property of the API, not of the caller's
+   discipline.** `resolveRun` is two-phase: phase 1 classifies every cell
+   and writes nothing, phase 2 fills the output only once no refusal is
+   possible. A single-pass loop would leave every cell before the
+   rich-value one already resolved. Fixtured with a poisoned output
+   buffer, on the input side and the result side, and asserted by the
+   fuzz target on every input it survives parsing.
+9. **Parse-time and resolution-time refusals are different questions.**
+   The part being unreadable — bad XML, an unclassifiable element, an
+   attribute the schema does not define — refuses at parse. A rich value
+   refuses at the reference. Collapsing the two would make an untouched
+   rich value refuse a whole workbook, which is the over-refusal that
+   makes people disable the check.
+10. **One-based, and the `0` default is the argument.** `cm="0"` means
+    "no metadata"; a zero-based index could not distinguish that from
+    "the first block". The base schema's prose and Office's behaviour
+    differ here (`:133`), and this reader follows Office.
+11. **`count` attributes are recorded and not enforced.** Resolution
+    indexes by position. `tests/corpus/poi_MalformedSSTCount.xlsx` is
+    this repo's standing evidence that producers miscount, and refusing a
+    file Excel opens over a hint is a worse failure than ignoring it —
+    the hint is exposed for diagnostics instead.
+12. **An unknown attribute on an interpreted element refuses**, so
+    `CT_MetadataType`'s 28 attributes ship as data. The booleans are
+    parsed and validated, then discarded except `cellMeta`: a
+    "validated then dropped" attribute is classified, an unread one is
+    not.
+13. **`<!DOCTYPE>` refuses outright.** An entity-expanding metadata
+    reader is a denial-of-service surface with no upside;
+    `tests/corpus/poi_xxe_in_schema.xlsx` is why this repo takes that
+    seriously. Foreign content under `<ext>` is skipped wholesale by
+    depth, bounded by `max_skip_depth`.
+14. **Every inert element's payload is reachable only through a type that
+    refuses.** That is the invariant that makes "recognized and skipped"
+    safe for `metadataStrings`, `mdxMetadata` and `futureMetadata`: no
+    cell can consume them without first meeting `XLMDX`, `XLRICHVALUE`
+    or an unknown name. The interpreted set is exactly seven elements and
+    a test names them.
+15. **Type names match exactly, case included.** A differently-cased or
+    entity-escaped spelling classifies as `unknown` and therefore
+    refuses. The alternative is inferring "this is probably `XLDAPR`"
+    about a part we are about to overwrite values under.
+16. **`env.zig` stays a leaf: the dependency points the other way.**
+    `EvalEnv` gains `DialectResolver` — a context pointer and a function
+    pointer — and `metadata.zig` binds itself to it
+    (`CellDialectResolver`). The `Fake` gains `cm`/`vm` per cell and
+    answers `dialectOf` through the resolver when one is attached, so
+    every test written before the reader existed still means what it
+    said.
+17. **The env-level error collapses onto the class that always
+    refuses.** `EvalEnv` can only say `error.MetadataRefused`; the
+    precise plane — `FormulaUnsupportedConstruct` for a rich value,
+    `FormulaMalformedInput` for a broken part — travels with the
+    resolver's own `Refusal`, which the report carries. Where the detail
+    is already gone (`eval.planeTwo`) the mapping is
+    `FormulaMalformedInput`, because collapsing onto a mark-eligible
+    class could let `.keep_stale_and_mark` suppress a refusal §5.7.7 says
+    must stand. §10's taxonomy keeps one home: `metadata.zig` imports
+    `parser.PlaneTwo` rather than restating it.
+
 ### 5.9 Name & identifier resolution
 
 Call position → strip layered prefixes → registry; unregistered →

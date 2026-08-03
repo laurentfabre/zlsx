@@ -170,6 +170,10 @@ pub const Error = error{
     ShapeMismatch,
     /// A projected area would leave the grid (§5.6a criteria alignment).
     RefOutOfGrid,
+    /// A `DialectResolver` refused the cell's `cm`/`vm` metadata (M4a).
+    /// The typed refusal itself stays with the resolver, which owns the
+    /// diagnostic; this interface only needs to know the read failed.
+    MetadataRefused,
 };
 
 /// One occupied cell of the merged view.
@@ -297,6 +301,28 @@ pub const AlignedIterator = struct {
     }
 };
 
+// ─── cm/vm-derived dialect (M4a) ─────────────────────────────────
+
+/// How a stored cell's `cm`/`vm` metadata indexes become a dialect.
+///
+/// A function pointer rather than an import: `src/formula/metadata.zig`
+/// owns the `xl/metadata.xml` reader and every refusal it can raise, and
+/// routing the answer through this seam is what keeps `env.zig` a leaf —
+/// the evaluator's window onto a workbook must not grow a dependency on
+/// the part that happens to answer one of its questions.
+pub const DialectResolver = struct {
+    ctx: *anyopaque,
+    /// `cm`/`vm` exactly as the cell carried them; `0` means "absent",
+    /// which is `CT_Cell`'s own default. A cell whose metadata cannot be
+    /// interpreted yields `error.MetadataRefused` — never a guessed
+    /// dialect.
+    resolve: *const fn (ctx: *anyopaque, cm: u32, vm: u32) Error!value.Dialect,
+
+    pub fn dialectOf(self: DialectResolver, cm: u32, vm: u32) Error!value.Dialect {
+        return self.resolve(self.ctx, cm, vm);
+    }
+};
+
 // ─── the interface ───────────────────────────────────────────────
 
 /// The evaluator's whole window onto a workbook. A vtable rather than a
@@ -408,6 +434,12 @@ pub fn effectiveArea(area: RangeRef, dims: value.Shape, mode: AlignMode) Error!R
 pub const Fake = struct {
     allocator: std.mem.Allocator,
     sheets: std.ArrayListUnmanaged(Sheet) = .empty,
+    /// When set, `dialectOf` derives its answer from each cell's
+    /// `cm`/`vm` instead of the stored `dialect` field — the M4a path a
+    /// real workbook takes. Unset, the explicit field stands, so every
+    /// test written before the metadata reader existed still means what
+    /// it said.
+    dialect_resolver: ?DialectResolver = null,
 
     pub const Cell = struct {
         row: coords.Row,
@@ -419,6 +451,10 @@ pub const Fake = struct {
         /// `.legacy` marks a cell authored before dynamic arrays;
         /// `dialectOf` reports it (§5.3b's stored-cell property).
         dialect: value.Dialect = .dynamic_array,
+        /// `c@cm` / `c@vm`, one-based, `0` = absent. Read only when a
+        /// `dialect_resolver` is attached.
+        cm: u32 = 0,
+        vm: u32 = 0,
         /// Set on a dynamic-array anchor; `A1#` resolves through it.
         spill: ?value.Shape = null,
     };
@@ -524,6 +560,14 @@ pub const Fake = struct {
     fn vtDialectOf(ctx: *anyopaque, cell: CellRef) Error!value.Dialect {
         const self = selfOf(ctx);
         const s = try self.sheetConst(cell.sheet);
+        if (self.dialect_resolver) |r| {
+            // An unoccupied coordinate carries no metadata, which is
+            // exactly what `cm = 0` means — the resolver answers it the
+            // same way it answers an unmarked stored cell.
+            const m = merged(s, cell.row, cell.col) orelse
+                return r.dialectOf(0, 0);
+            return r.dialectOf(m.cm, m.vm);
+        }
         const m = merged(s, cell.row, cell.col) orelse return .dynamic_array;
         return m.dialect;
     }
@@ -1033,6 +1077,68 @@ test "fake: dialect, spill shape, and sheet resolution are per-cell properties" 
     try testing.expectEqual(@as(?value.Shape, .{ .rows = 3, .cols = 1 }), try e.spillShape(.{ .sheet = sh, .row = b1.row, .col = b1.col }));
     try testing.expectEqual(@as(?SheetIndex, sh), try e.resolveSheet("Data"));
     try testing.expectEqual(@as(?SheetIndex, null), try e.resolveSheet("Missing"));
+}
+
+test "fake: a dialect resolver takes over dialectOf, refusals included" {
+    // The stub stands in for M4a's metadata reader: `cm = 1` is a
+    // dynamic-array mark, `vm` of any kind refuses. The semantics are
+    // proven against the real reader in `metadata.zig`; what this test
+    // owns is the seam — that `dialectOf` asks the resolver at all, that
+    // it passes the cell's own `cm`/`vm`, and that a refusal surfaces as
+    // an error rather than as a guessed dialect.
+    const Stub = struct {
+        calls: u32 = 0,
+        fn resolve(ctx: *anyopaque, cm: u32, vm: u32) Error!value.Dialect {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            if (vm != 0) return error.MetadataRefused;
+            return if (cm == 1) .dynamic_array else .legacy;
+        }
+    };
+
+    var fake = Fake.init(testing.allocator);
+    defer fake.deinit();
+    const sh = try fake.addSheet("Data");
+    const marked = cellOf("A1");
+    const plain = cellOf("B1");
+    const rich = cellOf("C1");
+
+    // Every cell claims `.dynamic_array` in the stored field, so an
+    // answer of `.legacy` can only have come from the resolver.
+    try fake.put(sh, .stored, .{ .row = marked.row, .col = marked.col, .v = num(1), .cm = 1 });
+    try fake.put(sh, .stored, .{ .row = plain.row, .col = plain.col, .v = num(2) });
+    try fake.put(sh, .stored, .{ .row = rich.row, .col = rich.col, .v = num(3), .vm = 1 });
+
+    var stub: Stub = .{};
+    fake.dialect_resolver = .{ .ctx = &stub, .resolve = Stub.resolve };
+
+    const e = fake.evalEnv();
+    try testing.expectEqual(
+        value.Dialect.dynamic_array,
+        try e.dialectOf(.{ .sheet = sh, .row = marked.row, .col = marked.col }),
+    );
+    try testing.expectEqual(
+        value.Dialect.legacy,
+        try e.dialectOf(.{ .sheet = sh, .row = plain.row, .col = plain.col }),
+    );
+    try testing.expectError(
+        error.MetadataRefused,
+        e.dialectOf(.{ .sheet = sh, .row = rich.row, .col = rich.col }),
+    );
+    // An empty coordinate is asked about too — it carries no metadata,
+    // which is a resolvable state, not an absent one.
+    try testing.expectEqual(
+        value.Dialect.legacy,
+        try e.dialectOf(.{ .sheet = sh, .row = cellOf("Z9").row, .col = cellOf("Z9").col }),
+    );
+    try testing.expectEqual(@as(u32, 4), stub.calls);
+
+    // Detaching restores the stored-field reading, unchanged.
+    fake.dialect_resolver = null;
+    try testing.expectEqual(
+        value.Dialect.dynamic_array,
+        try e.dialectOf(.{ .sheet = sh, .row = plain.row, .col = plain.col }),
+    );
 }
 
 test "fake: an unknown sheet is an error, not a blank" {
