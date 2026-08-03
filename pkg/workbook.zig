@@ -56,6 +56,20 @@ const sheet_plan = @import("zlsx_sheet_plan");
 // continues to ignore it.
 const fresh_emit = @import("zlsx_fresh_emit");
 
+/// The formula engine, as ONE module (M4b1).
+///
+/// This import is the single point where `pkg/` and `src/formula/`
+/// meet, and it points one way: the engine never imports the package
+/// layer. It is also deliberately one module rather than four — a file
+/// compiled into two modules is two distinct types, so naming `env`,
+/// `value` and `decode` separately would build an `EvalEnv` the
+/// evaluator could not accept.
+///
+/// Bound to `engine` rather than `formula`: this file has a dozen
+/// parameters called `formula` (data-validation and conditional-format
+/// bodies), and a shadowed import is a compile error at every one.
+const engine = @import("zlsx_formula");
+
 /// B3 iter-wr-7: deflate adapter for the fresh-emit substrate. Routes
 /// to `xlsx.deflateCompress` (the canonical deflate impl). Wrapping
 /// is needed because `pkg/fresh_emit.zig` and `pkg/zip.zig` are
@@ -846,8 +860,15 @@ pub const Workbook = struct {
         assert(path.len > 0);
 
         var store = try PartStore.open(allocator, io, path);
-        errdefer store.deinit();
-
+        // `fromStore` takes ownership **including on failure** — it
+        // deinits the store itself when the workbook part is missing or
+        // malformed — so the errdefer here has to be disarmed before the
+        // hand-off. Armed, it double-frees the arena on every failing
+        // open, which is a segfault rather than the typed error the
+        // caller is expecting.
+        var owned = true;
+        errdefer if (owned) store.deinit();
+        owned = false;
         return try fromStore(allocator, store);
     }
 
@@ -931,7 +952,8 @@ pub const Workbook = struct {
     ///
     pub fn empty(allocator: Allocator, io: std.Io) Error!Workbook {
         var store = try PartStore.fresh(allocator, io);
-        errdefer store.deinit();
+        var owned = true;
+        errdefer if (owned) store.deinit();
 
         // `PartStore.fresh` seeds only `[Content_Types].xml`. Seed
         // the OOXML-minimum remaining parts before handing off to
@@ -961,6 +983,8 @@ pub const Workbook = struct {
                 "</Relationships>",
         );
 
+        // Ownership moves on failure too — see `open`.
+        owned = false;
         return try fromStore(allocator, store);
     }
 
@@ -7407,6 +7431,715 @@ fn toAsciiLower(c: u8) u8 {
     return if (c >= 'A' and c <= 'Z') c + 32 else c;
 }
 
+// ─── the EvalEnv adapter (M4b1, goal_engine.md §5.6a) ────────────────
+//
+// The evaluator reads a workbook through `EvalEnv` and nothing else.
+// `src/formula/env.zig` ships the interface and an in-memory fake; this
+// is the other implementation, and the only place in the tree where the
+// package layer and the engine meet. The direction is fixed: the engine
+// never imports `pkg/`, so everything below is the adapter reaching
+// down, never the engine reaching up.
+//
+// What it does, in order:
+//
+//   1. **Namespace preflight over every part the run will read** —
+//      before a byte is decoded and long before anything is mutated. A
+//      scanner that literal-matches `<sheetData>` reads a document in an
+//      unknown vocabulary as an empty sheet, and recalculating an empty
+//      sheet writes zeroes over real data.
+//   2. **Decode**, through `engine.decode`: shared strings, then each
+//      sheet, carrier class by carrier class.
+//   3. **Merge into layers** — stored cells from the part bytes, staged
+//      cells from the worksheet's pending deltas, computed cells the run
+//      writes back. Precedence is `computed > staged > stored`, exactly
+//      as the fake implements it, and the shared test suite is what
+//      keeps the two from drifting.
+
+/// A refusal from either half of the boundary. Both halves answer
+/// `planeTwo()`, which is what a caller acts on; the payload is kept
+/// whole so a diagnostic can say *which* part refused and where.
+pub const FormulaRefusal = union(enum) {
+    decode: engine.decode.Refusal,
+    metadata: engine.metadata.Refusal,
+
+    pub fn planeTwo(self: FormulaRefusal) engine.decode.PlaneTwo {
+        return switch (self) {
+            .decode => |r| r.planeTwo(),
+            .metadata => |r| r.planeTwo(),
+        };
+    }
+};
+
+pub const FormulaEnvOptions = struct {
+    /// §5.4b's fold, injected rather than imported — `value.zig` keeps
+    /// the concrete table out of the engine's non-test build, and this
+    /// adapter is a caller like any other.
+    collation: engine.value.Collation,
+    fidelity: engine.value.Fidelity = .excel,
+    limits: engine.decode.Limits = .{},
+};
+
+pub const WorkbookEnvBuild = union(enum) {
+    ok: WorkbookEnv,
+    refused: FormulaRefusal,
+};
+
+/// One workbook, as the evaluator sees it.
+pub const WorkbookEnv = struct {
+    allocator: Allocator,
+    workbook: *Workbook,
+    /// Owns every cell and every decoded string the model kept.
+    arena: std.heap.ArenaAllocator,
+    sheets: []Sheet,
+    strings: engine.decode.Strings,
+    symbols: engine.SymbolTable,
+    meta: engine.metadata.Metadata,
+    dialects: engine.metadata.CellDialectResolver,
+    fidelity: engine.value.Fidelity,
+
+    /// One coordinate in one layer. `v` is null when the coordinate is
+    /// *occupied by something with no value*: an uncached formula, a
+    /// staged blank, a staged deletion. That is not the same as a blank
+    /// value and not the same as an absent cell — it shadows lower
+    /// layers while contributing nothing to the merged view.
+    pub const Cell = struct {
+        row: coords.Row,
+        col: coords.Col,
+        layer: engine.env.Layer,
+        v: ?engine.value.ScalarValue,
+        cm: u32 = 0,
+        vm: u32 = 0,
+        /// Decoded `<f>` body (FORMULA carrier), when the cell has one.
+        formula_text: ?[]const u8 = null,
+    };
+
+    /// Sorted by (row, col, layer descending), so a merged read is the
+    /// first hit of a binary search rather than a scan — the same
+    /// invariant `env.Fake` keeps, for the same reason.
+    pub const Sheet = struct {
+        cells: std.ArrayListUnmanaged(Cell) = .empty,
+    };
+
+    pub fn deinit(self: *WorkbookEnv) void {
+        self.symbols.deinit();
+        self.strings.deinit();
+        self.meta.deinit(self.allocator);
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    /// Build the model. Returns a refusal rather than an error for
+    /// anything that is a statement about the workbook; `Error` is
+    /// reserved for allocation and for a package that is missing parts
+    /// its own manifest promises.
+    pub fn build(
+        allocator: Allocator,
+        wb: *Workbook,
+        opts: FormulaEnvOptions,
+    ) Error!WorkbookEnvBuild {
+        // Phase 1: preflight. Nothing below this line runs against a
+        // part whose vocabulary we have not recognized.
+        if (try preflightParts(wb, opts.limits)) |r| return .{ .refused = .{ .decode = r } };
+
+        var keep = false;
+
+        var strings = switch (try decodeStrings(allocator, wb, opts)) {
+            .ok => |s| s,
+            .refused => |r| return .{ .refused = .{ .decode = r } },
+        };
+        defer if (!keep) strings.deinit();
+
+        var meta = switch (try decodeMetadata(allocator, wb)) {
+            .ok => |m| m,
+            .refused => |r| return .{ .refused = .{ .metadata = r } },
+        };
+        defer if (!keep) meta.deinit(allocator);
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer if (!keep) arena.deinit();
+        const a = arena.allocator();
+
+        const sheets = try a.alloc(Sheet, wb.worksheets.len);
+        for (sheets) |*s| s.* = .{};
+
+        var builder = engine.Builder.init(allocator, opts.collation);
+        defer builder.deinit();
+        for (wb.workbook.sheets) |s| try builder.addSheet(s.name);
+        for (wb.definedNames()) |dn| {
+            try builder.addName(
+                dn.name,
+                dn.formula,
+                if (dn.local_sheet_id) |id| engine.env.SheetIndex.fromInt(id) else null,
+                dn.hidden,
+            );
+        }
+
+        // §9's `max_modeled_cells` bounds the whole model, so each
+        // sheet is scanned against what the sheets before it left.
+        var cell_budget: u32 = opts.limits.max_modeled_cells;
+        for (0..wb.worksheets.len) |i| {
+            const idx: u32 = @intCast(i);
+            const ws = try wb.sheet(idx);
+            const part_name = try ws.resolvePartName();
+            const part = (try wb.store.part(part_name)) orelse return Error.MissingSheetPart;
+
+            var sheet_limits = opts.limits;
+            sheet_limits.max_modeled_cells = cell_budget;
+            var scanned = switch (try engine.decode.scanSheet(allocator, part.bytes, strings.items, .{
+                .limits = sheet_limits,
+                .fidelity = opts.fidelity,
+            })) {
+                .ok => |s| s,
+                .refused => |r| return .{ .refused = .{ .decode = r } },
+            };
+            defer scanned.deinit();
+            cell_budget -= @intCast(scanned.cells.len);
+
+            // Stored cells arrive row-major already, so appending keeps
+            // the ordering invariant without a sort.
+            try sheets[idx].cells.ensureUnusedCapacity(a, scanned.cells.len);
+            for (scanned.cells) |c| {
+                sheets[idx].cells.appendAssumeCapacity(.{
+                    .row = c.row,
+                    .col = c.col,
+                    .layer = .stored,
+                    .v = try dupeValue(a, c.input.scalar(), c.input == .uncached),
+                    .cm = c.cm,
+                    .vm = c.vm,
+                    .formula_text = if (c.formula) |f| try a.dupe(u8, f.text) else null,
+                });
+            }
+
+            // Tables live in their own parts, reached through the
+            // sheet's `<tableParts>` rels.
+            var rids = TablePartRidIterator.init(part.bytes);
+            const rels = wb.store.rels(part_name);
+            while (rids.next()) |rid| {
+                const target = relTargetForId(rels, rid) orelse continue;
+                const table_name = (try wb.store.resolve(part_name, target)) orelse continue;
+                const table_part = (try wb.store.part(table_name)) orelse continue;
+                var table = switch (try engine.decode.scanTable(allocator, table_part.bytes, .{
+                    .limits = opts.limits,
+                    .fidelity = opts.fidelity,
+                })) {
+                    .ok => |t| t,
+                    .refused => |r| return .{ .refused = .{ .decode = r } },
+                };
+                defer table.deinit();
+                try builder.addTable(engine.env.SheetIndex.fromInt(idx), table);
+            }
+
+            // Staged deltas are the second layer. `setCell` has already
+            // validated the ref, so a delta that will not parse here is
+            // a bookkeeping bug, not a workbook statement.
+            var it = ws.deltas.iterator();
+            while (it.next()) |entry| {
+                const ref = entry.key_ptr.*;
+                const row = coords.Row.fromOneBased(ref.row) catch continue;
+                const col = coords.Col.fromOneBased(ref.col) catch continue;
+                const staged = try stagedCell(a, row, col, entry.value_ptr.*);
+                try insertCell(a, &sheets[idx], staged);
+            }
+        }
+
+        var symbols = switch (try builder.finish()) {
+            .ok => |t| t,
+            .refused => |r| return .{ .refused = .{ .decode = r } },
+        };
+        defer if (!keep) symbols.deinit();
+
+        keep = true;
+        var out: WorkbookEnv = .{
+            .allocator = allocator,
+            .workbook = wb,
+            .arena = arena,
+            .sheets = sheets,
+            .strings = strings,
+            .symbols = symbols,
+            .meta = meta,
+            .dialects = undefined,
+            .fidelity = opts.fidelity,
+        };
+        out.dialects = .{ .part = &out.meta, .role = .input };
+        return .{ .ok = out };
+    }
+
+    /// Re-seat the interior pointer the dialect resolver holds.
+    ///
+    /// `build` returns by value, so the `WorkbookEnv` the caller ends up
+    /// holding is at a different address than the one that was
+    /// constructed — and `CellDialectResolver.part` points *into* it.
+    /// Every accessor that needs the resolver calls this first rather
+    /// than trusting an address that was correct in another stack frame.
+    fn dialectResolver(self: *WorkbookEnv) engine.env.DialectResolver {
+        self.dialects.part = &self.meta;
+        return self.dialects.resolver();
+    }
+
+    /// The refusal a `dialectOf` call turned into `error.MetadataRefused`,
+    /// if any. The env interface can only say "the read failed"; the
+    /// precise plane travels here (M4a decision 17).
+    pub fn lastDialectRefusal(self: *const WorkbookEnv) ?engine.metadata.Refusal {
+        return self.dialects.last_refusal;
+    }
+
+    /// The decoded `<f>` body at a coordinate, or null when the cell has
+    /// no engine. Not part of `EvalEnv` — the evaluator reads *values*
+    /// through the interface; formulas are the model builder's business
+    /// (M5a) and this is where it will get them.
+    pub fn formulaAt(self: *WorkbookEnv, cell: engine.env.CellRef) engine.env.Error!?[]const u8 {
+        const sheet = try self.sheetConst(cell.sheet);
+        const m = merged(sheet, cell.row, cell.col) orelse return null;
+        return m.formula_text;
+    }
+
+    /// Whether a coordinate holds a formula cell whose cached value is
+    /// absent (§5.6c seeds it, §5.6f reads it as blank).
+    pub fn isUncached(self: *WorkbookEnv, cell: engine.env.CellRef) engine.env.Error!bool {
+        const sheet = try self.sheetConst(cell.sheet);
+        const m = merged(sheet, cell.row, cell.col) orelse return false;
+        return m.v == null and m.formula_text != null;
+    }
+
+    /// Write a value computed earlier in this run. The `.computed`
+    /// layer shadows both others, which is what makes `C1=SUM(A1:B2)`
+    /// read a 2×2 this run produced rather than the stale cache.
+    pub fn putComputed(
+        self: *WorkbookEnv,
+        sheet: engine.env.SheetIndex,
+        row: coords.Row,
+        col: coords.Col,
+        v: engine.value.ScalarValue,
+    ) engine.env.Error!void {
+        const s = try self.sheetMut(sheet);
+        const a = self.arena.allocator();
+        try insertCell(a, s, .{
+            .row = row,
+            .col = col,
+            .layer = .computed,
+            .v = try dupeValue(a, v, false),
+        });
+    }
+
+    pub fn evalEnv(self: *WorkbookEnv) engine.env.EvalEnv {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    const vtable: engine.env.EvalEnv.VTable = .{
+        .cellValue = vtCellValue,
+        .rangeIterator = vtRangeIterator,
+        .logicalBlankCount = vtLogicalBlankCount,
+        .alignedRangeIterator = vtAlignedRangeIterator,
+        .dialectOf = vtDialectOf,
+        .spillShape = vtSpillShape,
+        .resolveSheet = vtResolveSheet,
+    };
+
+    fn selfOf(ctx: *anyopaque) *WorkbookEnv {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn sheetMut(self: *WorkbookEnv, idx: engine.env.SheetIndex) engine.env.Error!*Sheet {
+        const i = idx.toInt();
+        if (i >= self.sheets.len) return error.UnknownSheet;
+        return &self.sheets[i];
+    }
+
+    fn sheetConst(self: *WorkbookEnv, idx: engine.env.SheetIndex) engine.env.Error!*const Sheet {
+        const i = idx.toInt();
+        if (i >= self.sheets.len) return error.UnknownSheet;
+        return &self.sheets[i];
+    }
+
+    /// The highest-precedence entry at a coordinate, or null when
+    /// nothing occupies it. Every accessor goes through this, which is
+    /// why `cellValue` and `rangeIterator` cannot disagree.
+    fn merged(s: *const Sheet, row: coords.Row, col: coords.Col) ?Cell {
+        const lo = lowerBound(s.cells.items, row, col, .computed);
+        if (lo >= s.cells.items.len) return null;
+        const c = s.cells.items[lo];
+        if (c.row != row or c.col != col) return null;
+        return c;
+    }
+
+    fn vtCellValue(ctx: *anyopaque, cell: engine.env.CellRef) engine.env.Error!engine.value.ScalarValue {
+        const self = selfOf(ctx);
+        const s = try self.sheetConst(cell.sheet);
+        const m = merged(s, cell.row, cell.col) orelse return .blank;
+        return m.v orelse .blank;
+    }
+
+    fn vtDialectOf(ctx: *anyopaque, cell: engine.env.CellRef) engine.env.Error!engine.value.Dialect {
+        const self = selfOf(ctx);
+        const s = try self.sheetConst(cell.sheet);
+        const r = self.dialectResolver();
+        // An unoccupied coordinate carries no metadata, which is what
+        // `cm = 0` means — the resolver answers it the same way it
+        // answers an unmarked stored cell.
+        const m = merged(s, cell.row, cell.col) orelse return r.dialectOf(0, 0);
+        return r.dialectOf(m.cm, m.vm);
+    }
+
+    /// No stored spill state exists before M7a: a spill's extent is not
+    /// recoverable from cached `<v>` values, and inventing one would
+    /// make `A1#` resolve to a guess. Null is the honest answer, and it
+    /// is the same answer `A1#` against a non-anchor gets.
+    fn vtSpillShape(ctx: *anyopaque, cell: engine.env.CellRef) engine.env.Error!?engine.value.Shape {
+        const self = selfOf(ctx);
+        _ = try self.sheetConst(cell.sheet);
+        return null;
+    }
+
+    fn vtResolveSheet(ctx: *anyopaque, name: []const u8) engine.env.Error!?engine.env.SheetIndex {
+        const self = selfOf(ctx);
+        return self.symbols.resolveSheet(self.allocator, name);
+    }
+
+    const RangeState = struct {
+        sheet: *const Sheet,
+        area: engine.env.RangeRef,
+        idx: usize,
+    };
+
+    fn vtRangeIterator(ctx: *anyopaque, area: engine.env.RangeRef) engine.env.Error!engine.env.RangeIterator {
+        const self = selfOf(ctx);
+        const s = try self.sheetConst(area.sheet);
+        const start = lowerBound(s.cells.items, area.range.first.row, area.range.first.col, .computed);
+        return engine.env.RangeIterator.wrap(
+            RangeState,
+            .{ .sheet = s, .area = area, .idx = start },
+            rangeNext,
+        );
+    }
+
+    fn rangeNext(it: *engine.env.RangeIterator) engine.env.Error!?engine.env.Entry {
+        const st = it.stateOf(RangeState);
+        const items = st.sheet.cells.items;
+        while (st.idx < items.len) {
+            const c = items[st.idx];
+            if (c.row.oneBased() > st.area.range.last.row.oneBased()) return null;
+            st.idx += 1;
+            const inside = st.area.offsetOf(c.row, c.col) != null;
+            // Entries are layer-descending within a coordinate, so the
+            // first one seen is the winner and the rest are shadowed.
+            while (st.idx < items.len and
+                items[st.idx].row == c.row and
+                items[st.idx].col == c.col) : (st.idx += 1)
+            {}
+            if (!inside) continue;
+            // An occupied coordinate with no value contributes nothing
+            // to the merged view — but it still shadowed the layers
+            // below it, which is why the skip happens here and not at
+            // insert time.
+            const v = c.v orelse continue;
+            return .{ .row = c.row, .col = c.col, .value = v, .layer = c.layer };
+        }
+        return null;
+    }
+
+    fn vtLogicalBlankCount(
+        ctx: *anyopaque,
+        area: engine.env.RangeRef,
+        class: engine.env.BlankClass,
+    ) engine.env.Error!u64 {
+        const self = selfOf(ctx);
+        var it = try vtRangeIterator(self, area);
+        var occupied: u64 = 0;
+        while (try it.next()) |e| {
+            const counts_as_blank = switch (class) {
+                .isblank_class => false,
+                .countblank_class => e.value == .text and e.value.text.len == 0,
+            };
+            if (!counts_as_blank) occupied += 1;
+        }
+        // Area minus occupancy: no per-coordinate test, so a whole
+        // column costs what its stored cells cost.
+        return area.cellCount() - occupied;
+    }
+
+    const AlignedState = struct {
+        env: *WorkbookEnv,
+        areas: []const engine.env.RangeRef,
+        mode: engine.env.AlignMode,
+        dims: engine.value.Shape,
+        offset: u64,
+        total: u64,
+    };
+
+    fn vtAlignedRangeIterator(
+        ctx: *anyopaque,
+        areas: []const engine.env.RangeRef,
+        mode: engine.env.AlignMode,
+        cursors: []usize,
+        out: []engine.value.ScalarValue,
+    ) engine.env.Error!engine.env.AlignedIterator {
+        const self = selfOf(ctx);
+        assert(areas.len > 0);
+        assert(cursors.len == areas.len and out.len == areas.len);
+        const dims = areas[0].shape();
+        // Validate every area up front: a cursor that discovered a
+        // shape mismatch halfway would have already reported rows the
+        // caller must now un-count.
+        for (areas) |ar| {
+            _ = try engine.env.effectiveArea(ar, dims, mode);
+            _ = try self.sheetConst(ar.sheet);
+        }
+        @memset(cursors, std.math.maxInt(usize));
+        return engine.env.AlignedIterator.wrap(
+            AlignedState,
+            .{
+                .env = self,
+                .areas = areas,
+                .mode = mode,
+                .dims = dims,
+                .offset = 0,
+                .total = @as(u64, dims.rows) * @as(u64, dims.cols),
+            },
+            cursors,
+            out,
+            alignedNext,
+        );
+    }
+
+    fn alignedNext(it: *engine.env.AlignedIterator) engine.env.Error!?engine.env.AlignedItem {
+        const st = it.stateOf(AlignedState);
+        if (st.offset >= st.total) return null;
+
+        var next_occupied: u64 = st.total;
+        for (st.areas, it.cursors) |ar, *cursor| {
+            const eff = try engine.env.effectiveArea(ar, st.dims, st.mode);
+            const s = try st.env.sheetConst(eff.sheet);
+            if (cursor.* == std.math.maxInt(usize)) {
+                cursor.* = lowerBound(
+                    s.cells.items,
+                    eff.range.first.row,
+                    eff.range.first.col,
+                    .computed,
+                );
+            }
+            const off = advance(s, eff, cursor, st.offset) orelse continue;
+            next_occupied = @min(next_occupied, off);
+        }
+
+        const cols = st.dims.cols;
+        const at = st.offset;
+        if (next_occupied > at) {
+            const run = next_occupied - at;
+            st.offset = next_occupied;
+            return .{ .blank_run = .{
+                .row_offset = @intCast(at / cols),
+                .col_offset = @intCast(at % cols),
+                .count = run,
+            } };
+        }
+
+        for (st.areas, it.out) |ar, *slot| {
+            const eff = try engine.env.effectiveArea(ar, st.dims, st.mode);
+            const s = try st.env.sheetConst(eff.sheet);
+            const cell = eff.cellAtOffset(at);
+            slot.* = if (merged(s, cell.row, cell.col)) |m| (m.v orelse .blank) else .blank;
+        }
+        st.offset = at + 1;
+        return .{ .cells = .{
+            .row_offset = @intCast(at / cols),
+            .col_offset = @intCast(at % cols),
+            .values = it.out,
+        } };
+    }
+
+    /// Move one area's cursor to the first offset ≥ `from` that holds a
+    /// *value*, returning it. Forward-only: offsets within an area
+    /// increase with (row, col), which is the order the backing is
+    /// sorted in.
+    fn advance(
+        s: *const Sheet,
+        eff: engine.env.RangeRef,
+        cursor: *usize,
+        from: u64,
+    ) ?u64 {
+        const items = s.cells.items;
+        while (cursor.* < items.len) {
+            const c = items[cursor.*];
+            if (c.row.oneBased() > eff.range.last.row.oneBased()) return null;
+            const off = eff.offsetOf(c.row, c.col) orelse {
+                cursor.* += 1;
+                continue;
+            };
+            if (off < from or (merged(s, c.row, c.col) orelse c).v == null) {
+                cursor.* += 1;
+                continue;
+            }
+            return off;
+        }
+        return null;
+    }
+
+    fn lowerBound(
+        items: []const Cell,
+        row: coords.Row,
+        col: coords.Col,
+        layer: engine.env.Layer,
+    ) usize {
+        var lo: usize = 0;
+        var hi: usize = items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (lessThanKey(items[mid], row, col, layer)) lo = mid + 1 else hi = mid;
+        }
+        return lo;
+    }
+
+    fn lessThanKey(
+        c: Cell,
+        row: coords.Row,
+        col: coords.Col,
+        layer: engine.env.Layer,
+    ) bool {
+        if (c.row.oneBased() != row.oneBased()) return c.row.oneBased() < row.oneBased();
+        if (c.col.zeroBased() != col.zeroBased()) return c.col.zeroBased() < col.zeroBased();
+        // Layer descending: the highest-precedence entry for a
+        // coordinate sorts first, so a merged read is the first hit.
+        return c.layer.precedence() > layer.precedence();
+    }
+
+    /// Insert or replace one cell in one layer, keeping the ordering
+    /// invariant by construction — there is no code path that could
+    /// return cells in insertion order, because there is no insertion
+    /// order.
+    fn insertCell(a: Allocator, s: *Sheet, c: Cell) Allocator.Error!void {
+        const at = lowerBound(s.cells.items, c.row, c.col, c.layer);
+        if (at < s.cells.items.len) {
+            const cur = s.cells.items[at];
+            if (cur.row == c.row and cur.col == c.col and cur.layer == c.layer) {
+                s.cells.items[at] = c;
+                return;
+            }
+        }
+        try s.cells.insert(a, at, c);
+    }
+
+    /// Copy a value's text into the model's own arena. A `ScalarValue`
+    /// borrows, and the scan arena that produced it is released as soon
+    /// as the sheet is decoded.
+    fn dupeValue(
+        a: Allocator,
+        v: engine.value.ScalarValue,
+        uncached: bool,
+    ) Allocator.Error!?engine.value.ScalarValue {
+        if (uncached) return null;
+        return switch (v) {
+            .blank => null,
+            .text => |t| .{ .text = try a.dupe(u8, t) },
+            .err => |e| switch (e) {
+                .known => v,
+                .rich => |spelling| .{ .err = .{ .rich = try a.dupe(u8, spelling) } },
+            },
+            else => v,
+        };
+    }
+
+    fn stagedCell(
+        a: Allocator,
+        row: coords.Row,
+        col: coords.Col,
+        v: CellValue,
+    ) Allocator.Error!Cell {
+        return switch (v) {
+            .number => |n| .{ .row = row, .col = col, .layer = .staged, .v = .{ .number = n } },
+            .boolean => |b| .{ .row = row, .col = col, .layer = .staged, .v = .{ .boolean = b } },
+            .string, .shared_string => |s| .{
+                .row = row,
+                .col = col,
+                .layer = .staged,
+                .v = .{ .text = try a.dupe(u8, s) },
+            },
+            // A staged formula has no cached value yet — that is what
+            // the run is about to compute.
+            .formula => |f| .{
+                .row = row,
+                .col = col,
+                .layer = .staged,
+                .v = null,
+                .formula_text = try a.dupe(u8, f),
+            },
+            // Both shadow whatever the stored layer had, and neither
+            // contributes a value.
+            .blank, .deleted => .{ .row = row, .col = col, .layer = .staged, .v = null },
+        };
+    }
+};
+
+/// Every part the run will read, checked for a vocabulary this engine
+/// implements — before decode, and therefore before any mutation.
+fn preflightParts(wb: *Workbook, limits: engine.decode.Limits) Error!?engine.decode.Refusal {
+    if (try wb.store.part("xl/workbook.xml")) |p| {
+        if (engine.decode.preflight(.workbook, p.bytes, limits)) |r| return r;
+    } else return Error.MissingWorkbookPart;
+
+    if (try sstPartName(wb)) |name| {
+        if (try wb.store.part(name)) |p| {
+            if (engine.decode.preflight(.shared_strings, p.bytes, limits)) |r| return r;
+        }
+    }
+
+    // Through `Workbook.sheet`, never over `worksheets` directly: the
+    // back-pointer each slot needs is patched in on first observation
+    // (`:6170-6174`), and `resolvePartName` dereferences it.
+    for (0..wb.worksheets.len) |i| {
+        const ws = try wb.sheet(@intCast(i));
+        const part_name = try ws.resolvePartName();
+        const part = (try wb.store.part(part_name)) orelse return Error.MissingSheetPart;
+        if (engine.decode.preflight(.worksheet, part.bytes, limits)) |r| return r;
+
+        var rids = TablePartRidIterator.init(part.bytes);
+        const rels = wb.store.rels(part_name);
+        while (rids.next()) |rid| {
+            const target = relTargetForId(rels, rid) orelse continue;
+            const table_name = (try wb.store.resolve(part_name, target)) orelse continue;
+            const table_part = (try wb.store.part(table_name)) orelse continue;
+            if (engine.decode.preflight(.table, table_part.bytes, limits)) |r| return r;
+        }
+    }
+    return null;
+}
+
+fn sstPartName(wb: *Workbook) Error!?[]const u8 {
+    if ((try wb.store.part("xl/sharedStrings.xml")) != null) return "xl/sharedStrings.xml";
+    return null;
+}
+
+fn decodeStrings(
+    allocator: Allocator,
+    wb: *Workbook,
+    opts: FormulaEnvOptions,
+) Error!engine.decode.StringsResult {
+    const name = (try sstPartName(wb)) orelse
+        return .{ .ok = engine.decode.emptyStrings(allocator) };
+    const part = (try wb.store.part(name)) orelse
+        return .{ .ok = engine.decode.emptyStrings(allocator) };
+    return engine.decode.decodeSharedStrings(allocator, part.bytes, .{
+        .limits = opts.limits,
+        .fidelity = opts.fidelity,
+    });
+}
+
+const MetadataResult = union(enum) {
+    ok: engine.metadata.Metadata,
+    refused: engine.metadata.Refusal,
+};
+
+/// A workbook with no `xl/metadata.xml` resolves `.legacy` everywhere,
+/// which is the correct reading: without the part there are no
+/// dynamic-array marks to find (M4a).
+fn decodeMetadata(allocator: Allocator, wb: *Workbook) Error!MetadataResult {
+    const part = (try wb.store.part("xl/metadata.xml")) orelse
+        return .{ .ok = engine.metadata.Metadata.none };
+    return switch (try engine.metadata.parse(allocator, part.bytes, .{})) {
+        .ok => |m| .{ .ok = m },
+        .refused => |r| .{ .refused = r },
+    };
+}
+
 // ─── Test helpers ─────────────────────────────────────────────────────
 
 /// Write a minimal SST-less .xlsx to `path` for testing the SST-
@@ -13017,4 +13750,1233 @@ test "setEmbeddings: re-embedding replaces the property, not accumulates" {
         @as(usize, 1),
         std.mem.count(u8, dp.bytes, recovery_record.DOC_PROP_NAME),
     );
+}
+
+// ─── the EvalEnv adapter (M4b1) ───────────────────────────────────────
+//
+// Two implementations of `EvalEnv` ship: the in-memory fake in
+// `src/formula/env.zig` and the adapter above. `SharedEnvSuite` is run
+// against BOTH, through one body — a suite the adapter passed and the
+// fake did not (or the reverse) would mean the interface has two
+// meanings, and every test written against the fake would be evidence
+// about the fake rather than about the contract.
+
+const test_ns_main = engine.decode.ns_main;
+
+const TestSheetSpec = struct {
+    /// Decoded name; the helper authors it (ST_Xstring, then XML
+    /// escaping) exactly as a writer would.
+    name: []const u8,
+    body: []const u8,
+    /// The attribute value verbatim, for tests about what a *producer*
+    /// wrote rather than about what this engine writes — an authored
+    /// `_x0041_` round-trips to `_x0041_`, so proving the decode side
+    /// needs bytes the encoder would never emit.
+    raw_name: ?[]const u8 = null,
+};
+
+/// Build a workbook entirely in memory: `PartStore.fresh` seeds
+/// `[Content_Types].xml` and `addPart` registers the rest, so a test can
+/// hand the adapter arbitrary sheet XML without going through a file.
+fn testWorkbookFromParts(
+    allocator: Allocator,
+    io: std.Io,
+    sheets: []const TestSheetSpec,
+    sst_xml: ?[]const u8,
+) !Workbook {
+    return testWorkbookFromPartsWithNames(allocator, io, sheets, sst_xml, "");
+}
+
+fn testWorkbookFromPartsWithNames(
+    allocator: Allocator,
+    io: std.Io,
+    sheets: []const TestSheetSpec,
+    sst_xml: ?[]const u8,
+    defined_names_xml: []const u8,
+) !Workbook {
+    var store = try PartStore.fresh(allocator, io);
+    var owned = true;
+    errdefer if (owned) store.deinit();
+
+    var wb_xml: std.ArrayListUnmanaged(u8) = .empty;
+    defer wb_xml.deinit(allocator);
+    var rels: std.ArrayListUnmanaged(u8) = .empty;
+    defer rels.deinit(allocator);
+
+    try wb_xml.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+        "<workbook xmlns=\"" ++ engine.decode.ns_main ++ "\" " ++
+        "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets>");
+    try rels.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">");
+
+    for (sheets, 0..) |s, i| {
+        // A sheet name is a STRING carrier: authored form is
+        // ST_Xstring-encoded and then XML-escaped.
+        const encoded = if (s.raw_name) |raw|
+            try allocator.dupe(u8, raw)
+        else
+            try engine.decode.encodeAuthoredString(allocator, s.name);
+        defer allocator.free(encoded);
+        const entry = try std.fmt.allocPrint(
+            allocator,
+            "<sheet name=\"{s}\" sheetId=\"{d}\" r:id=\"rId{d}\"/>",
+            .{ encoded, i + 1, i + 1 },
+        );
+        defer allocator.free(entry);
+        try wb_xml.appendSlice(allocator, entry);
+
+        const rel = try std.fmt.allocPrint(
+            allocator,
+            "<Relationship Id=\"rId{d}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{d}.xml\"/>",
+            .{ i + 1, i + 1 },
+        );
+        defer allocator.free(rel);
+        try rels.appendSlice(allocator, rel);
+    }
+    try wb_xml.appendSlice(allocator, "</sheets>");
+    try wb_xml.appendSlice(allocator, defined_names_xml);
+    try wb_xml.appendSlice(allocator, "</workbook>");
+    try rels.appendSlice(allocator, "</Relationships>");
+
+    try store.addPart(
+        "_rels/.rels",
+        "application/vnd.openxmlformats-package.relationships+xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+            "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>" ++
+            "</Relationships>",
+    );
+    try store.addPart(
+        "xl/workbook.xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+        wb_xml.items,
+    );
+    // Seeded empty, then REPLACED with the real content: `addPart` does
+    // not refresh the rels cache, `replacePart` does (`store.zig:688`).
+    // This is the same two-step `Workbook.empty` + `addSheet` take.
+    try store.addPart(
+        "xl/_rels/workbook.xml.rels",
+        "application/vnd.openxmlformats-package.relationships+xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>",
+    );
+    try store.replacePart("xl/_rels/workbook.xml.rels", rels.items);
+    for (sheets, 0..) |s, i| {
+        const part_name = try std.fmt.allocPrint(allocator, "xl/worksheets/sheet{d}.xml", .{i + 1});
+        defer allocator.free(part_name);
+        try store.addPart(
+            part_name,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+            s.body,
+        );
+    }
+    if (sst_xml) |body| {
+        try store.addPart(
+            "xl/sharedStrings.xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml",
+            body,
+        );
+    }
+
+    owned = false;
+    return try Workbook.fromStore(allocator, store);
+}
+
+/// A whole worksheet part around a `<sheetData>` body.
+fn testSheetXml(allocator: Allocator, body: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+            "<worksheet xmlns=\"{s}\"><sheetData>{s}</sheetData></worksheet>",
+        .{ test_ns_main, body },
+    );
+}
+
+fn testFold(allocator: Allocator, s: []const u8) anyerror![]u8 {
+    return zlsx.casefold.foldString(allocator, s);
+}
+
+const test_collation: engine.value.Collation = .{ .fold = &testFold };
+
+// ─── the shared suite ─────────────────────────────────────────────────
+
+/// One cell, in one layer, as a suite case states it.
+const EnvSpec = struct {
+    sheet: u32,
+    layer: engine.env.Layer,
+    a1: []const u8,
+    v: engine.value.ScalarValue,
+};
+
+/// Harness over `env.Fake`: the reference implementation.
+const FakeHarness = struct {
+    allocator: Allocator,
+    fake: engine.env.Fake,
+
+    fn init(allocator: Allocator, sheets: []const []const u8, cells: []const EnvSpec) !FakeHarness {
+        var h: FakeHarness = .{ .allocator = allocator, .fake = engine.env.Fake.init(allocator) };
+        errdefer h.fake.deinit();
+        for (sheets) |name| _ = try h.fake.addSheet(name);
+        for (cells) |c| {
+            try h.fake.putA1(engine.env.SheetIndex.fromInt(c.sheet), c.layer, c.a1, c.v);
+        }
+        return h;
+    }
+
+    fn deinit(self: *FakeHarness) void {
+        self.fake.deinit();
+    }
+
+    fn evalEnv(self: *FakeHarness) engine.env.EvalEnv {
+        return self.fake.evalEnv();
+    }
+};
+
+/// Harness over the adapter: the same cells, but round-tripped through
+/// real sheet XML, a real `PartStore`, and the decode boundary.
+const AdapterHarness = struct {
+    allocator: Allocator,
+    threaded: *std.Io.Threaded,
+    wb: Workbook,
+    env: WorkbookEnv,
+
+    fn init(allocator: Allocator, sheets: []const []const u8, cells: []const EnvSpec) !AdapterHarness {
+        const threaded = try allocator.create(std.Io.Threaded);
+        errdefer allocator.destroy(threaded);
+        threaded.* = .init(allocator, .{});
+        errdefer threaded.deinit();
+        const io = threaded.io();
+
+        // Stored cells become sheet XML — the adapter's whole job is to
+        // read them back, so a harness that injected them any other way
+        // would not be testing the adapter.
+        // `addPart` dupes every payload into the store's arena
+        // (`store.zig:368`), so the generated bodies live exactly as
+        // long as this scope — one `defer`, no ownership hand-off.
+        const bodies = try allocator.alloc([]u8, sheets.len);
+        var built: usize = 0;
+        defer {
+            for (bodies[0..built]) |b| allocator.free(b);
+            allocator.free(bodies);
+        }
+        for (sheets, 0..) |_, i| {
+            bodies[i] = try storedSheetBody(allocator, @intCast(i), cells);
+            built += 1;
+        }
+        const specs = try allocator.alloc(TestSheetSpec, sheets.len);
+        defer allocator.free(specs);
+        for (sheets, 0..) |name, i| specs[i] = .{ .name = name, .body = bodies[i] };
+
+        var wb = try testWorkbookFromParts(allocator, io, specs, null);
+        errdefer wb.deinit();
+
+        // Staged cells go through `setCell`, which is where a real
+        // caller's pending edits live.
+        for (cells) |c| {
+            if (c.layer != .staged) continue;
+            const ws = try wb.sheet(c.sheet);
+            try ws.setCell(c.a1, switch (c.v) {
+                .number => |n| CellValue{ .number = n },
+                .text => |t| CellValue{ .string = t },
+                .boolean => |b| CellValue{ .boolean = b },
+                else => return error.UnsupportedStagedValue,
+            });
+        }
+
+        var h: AdapterHarness = .{
+            .allocator = allocator,
+            .threaded = threaded,
+            .wb = wb,
+            .env = undefined,
+        };
+        h.env = switch (try WorkbookEnv.build(allocator, &h.wb, .{ .collation = test_collation })) {
+            .ok => |e| e,
+            .refused => return error.TestUnexpectedRefusal,
+        };
+        for (cells) |c| {
+            if (c.layer != .computed) continue;
+            const ref = try parseA1Ref(c.a1);
+            try h.env.putComputed(
+                engine.env.SheetIndex.fromInt(c.sheet),
+                try coords.Row.fromOneBased(ref.row),
+                try coords.Col.fromOneBased(ref.col),
+                c.v,
+            );
+        }
+        return h;
+    }
+
+    fn deinit(self: *AdapterHarness) void {
+        self.env.deinit();
+        self.wb.deinit();
+        self.threaded.deinit();
+        self.allocator.destroy(self.threaded);
+    }
+
+    /// The env borrows `&self.wb`, so the harness must be at its final
+    /// address before this is called — every caller stores it in a
+    /// `var` first.
+    fn evalEnv(self: *AdapterHarness) engine.env.EvalEnv {
+        self.env.workbook = &self.wb;
+        return self.env.evalEnv();
+    }
+
+    fn storedSheetBody(allocator: Allocator, sheet: u32, cells: []const EnvSpec) ![]u8 {
+        var mine: std.ArrayListUnmanaged(EnvSpec) = .empty;
+        defer mine.deinit(allocator);
+        for (cells) |c| {
+            if (c.sheet == sheet and c.layer == .stored) try mine.append(allocator, c);
+        }
+        std.mem.sortUnstable(EnvSpec, mine.items, {}, struct {
+            fn less(_: void, x: EnvSpec, y: EnvSpec) bool {
+                const a = parseA1Ref(x.a1) catch unreachable;
+                const b = parseA1Ref(y.a1) catch unreachable;
+                if (a.row != b.row) return a.row < b.row;
+                return a.col < b.col;
+            }
+        }.less);
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        var open_row: ?u32 = null;
+        for (mine.items) |c| {
+            const ref = try parseA1Ref(c.a1);
+            if (open_row == null or open_row.? != ref.row) {
+                if (open_row != null) try out.appendSlice(allocator, "</row>");
+                const head = try std.fmt.allocPrint(allocator, "<row r=\"{d}\">", .{ref.row});
+                defer allocator.free(head);
+                try out.appendSlice(allocator, head);
+                open_row = ref.row;
+            }
+            try appendCellXml(allocator, &out, c.a1, c.v);
+        }
+        if (open_row != null) try out.appendSlice(allocator, "</row>");
+        const body = try out.toOwnedSlice(allocator);
+        defer allocator.free(body);
+        return testSheetXml(allocator, body);
+    }
+
+    fn appendCellXml(
+        allocator: Allocator,
+        out: *std.ArrayListUnmanaged(u8),
+        a1: []const u8,
+        v: engine.value.ScalarValue,
+    ) !void {
+        const chunk = switch (v) {
+            .number => |n| try std.fmt.allocPrint(allocator, "<c r=\"{s}\"><v>{d}</v></c>", .{ a1, n }),
+            .boolean => |b| try std.fmt.allocPrint(
+                allocator,
+                "<c r=\"{s}\" t=\"b\"><v>{d}</v></c>",
+                .{ a1, @intFromBool(b) },
+            ),
+            .err => |e| try std.fmt.allocPrint(
+                allocator,
+                "<c r=\"{s}\" t=\"e\"><v>{s}</v></c>",
+                .{ a1, e.spelling() },
+            ),
+            .text => |t| blk: {
+                const encoded = try engine.decode.encodeAuthoredString(allocator, t);
+                defer allocator.free(encoded);
+                break :blk try std.fmt.allocPrint(
+                    allocator,
+                    "<c r=\"{s}\" t=\"inlineStr\"><is><t>{s}</t></is></c>",
+                    .{ a1, encoded },
+                );
+            },
+            .blank => return error.UnsupportedStoredValue,
+        };
+        defer allocator.free(chunk);
+        try out.appendSlice(allocator, chunk);
+    }
+};
+
+/// The contract, stated once and run against both implementations.
+const SharedEnvSuite = struct {
+    const ta = std.testing.allocator;
+
+    fn runAll(comptime H: type) !void {
+        try orderedSparseIteration(H);
+        try layerPrecedence(H);
+        try blankClasses(H);
+        try wholeColumnStaysProportional(H);
+        try alignedModes(H);
+        try alignedRunsCoverEveryPosition(H);
+        try unknownSheetIsAnError(H);
+        try sheetResolution(H);
+    }
+
+    fn num(v: f64) engine.value.ScalarValue {
+        return engine.value.ScalarValue.fromNumber(v);
+    }
+
+    fn text(s: []const u8) engine.value.ScalarValue {
+        return .{ .text = s };
+    }
+
+    fn areaOf(sheet: u32, a1: []const u8) engine.env.RangeRef {
+        const r = coords.parseRange(a1, .{ .dollar = .accept }) catch unreachable;
+        return .{ .sheet = engine.env.SheetIndex.fromInt(sheet), .range = r.normalized() };
+    }
+
+    fn cellOf(sheet: u32, a1: []const u8) engine.env.CellRef {
+        const c = coords.parseCell(a1, .{ .dollar = .accept }) catch unreachable;
+        return .{ .sheet = engine.env.SheetIndex.fromInt(sheet), .row = c.row, .col = c.col };
+    }
+
+    fn orderedSparseIteration(comptime H: type) !void {
+        // Order is a property of the interface, not of the backing: the
+        // cells are given out of order and must come back row-major.
+        var h = try H.init(ta, &.{"S"}, &.{
+            .{ .sheet = 0, .layer = .stored, .a1 = "B2", .v = num(2) },
+            .{ .sheet = 0, .layer = .stored, .a1 = "C1", .v = num(3) },
+            .{ .sheet = 0, .layer = .stored, .a1 = "A1", .v = num(1) },
+        });
+        defer h.deinit();
+
+        var it = try h.evalEnv().rangeIterator(areaOf(0, "A1:C3"));
+        var seen: [8][]const u8 = undefined;
+        var bufs: [8][16]u8 = undefined;
+        var n: usize = 0;
+        while (try it.next()) |e| {
+            seen[n] = coords.formatCell(&bufs[n], .{ .col = e.col, .row = e.row });
+            n += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 3), n);
+        try std.testing.expectEqualStrings("A1", seen[0]);
+        try std.testing.expectEqualStrings("C1", seen[1]);
+        try std.testing.expectEqualStrings("B2", seen[2]);
+    }
+
+    fn layerPrecedence(comptime H: type) !void {
+        // computed > staged > stored, at one coordinate, through both
+        // `cellValue` and the iterator.
+        var h = try H.init(ta, &.{"S"}, &.{
+            .{ .sheet = 0, .layer = .stored, .a1 = "A1", .v = num(1) },
+            .{ .sheet = 0, .layer = .staged, .a1 = "A1", .v = num(2) },
+            .{ .sheet = 0, .layer = .computed, .a1 = "A1", .v = num(3) },
+            .{ .sheet = 0, .layer = .stored, .a1 = "B1", .v = num(10) },
+            .{ .sheet = 0, .layer = .staged, .a1 = "C1", .v = num(20) },
+        });
+        defer h.deinit();
+        const e = h.evalEnv();
+
+        try std.testing.expect(engine.value.ScalarValue.eql(num(3), try e.cellValue(cellOf(0, "A1"))));
+        try std.testing.expect(engine.value.ScalarValue.eql(num(10), try e.cellValue(cellOf(0, "B1"))));
+        try std.testing.expect(engine.value.ScalarValue.eql(num(20), try e.cellValue(cellOf(0, "C1"))));
+
+        var it = try e.rangeIterator(areaOf(0, "A1:C1"));
+        const first = (try it.next()).?;
+        try std.testing.expectEqual(engine.env.Layer.computed, first.layer);
+        try std.testing.expect(engine.value.ScalarValue.eql(num(3), first.value));
+        var rest: usize = 0;
+        while (try it.next()) |_| rest += 1;
+        try std.testing.expectEqual(@as(usize, 2), rest);
+    }
+
+    fn blankClasses(comptime H: type) !void {
+        var h = try H.init(ta, &.{"S"}, &.{
+            .{ .sheet = 0, .layer = .stored, .a1 = "A1", .v = num(0) },
+            .{ .sheet = 0, .layer = .stored, .a1 = "A2", .v = text("") },
+            .{ .sheet = 0, .layer = .stored, .a1 = "A3", .v = engine.value.ScalarValue.errorOf(.na) },
+        });
+        defer h.deinit();
+        const e = h.evalEnv();
+        const area = areaOf(0, "A1:A4");
+        // ISBLANK sees one: A4. COUNTBLANK sees two: A4 and the `""`.
+        try std.testing.expectEqual(@as(u64, 1), try e.logicalBlankCount(area, .isblank_class));
+        try std.testing.expectEqual(@as(u64, 2), try e.logicalBlankCount(area, .countblank_class));
+    }
+
+    fn wholeColumnStaysProportional(comptime H: type) !void {
+        var h = try H.init(ta, &.{"S"}, &.{
+            .{ .sheet = 0, .layer = .stored, .a1 = "A7", .v = num(7) },
+        });
+        defer h.deinit();
+        const whole = engine.env.RangeRef{
+            .sheet = engine.env.SheetIndex.fromInt(0),
+            .range = .{
+                .first = .{ .col = try coords.Col.fromZeroBased(0), .row = try coords.Row.fromOneBased(1) },
+                .last = .{ .col = try coords.Col.fromZeroBased(0), .row = try coords.Row.fromOneBased(coords.max_row) },
+            },
+        };
+        try std.testing.expectEqual(
+            @as(u64, coords.max_row - 1),
+            try h.evalEnv().logicalBlankCount(whole, .isblank_class),
+        );
+    }
+
+    fn alignedModes(comptime H: type) !void {
+        var h = try H.init(ta, &.{"S"}, &.{
+            .{ .sheet = 0, .layer = .stored, .a1 = "C2", .v = num(42) },
+        });
+        defer h.deinit();
+        const e = h.evalEnv();
+        const areas = [_]engine.env.RangeRef{ areaOf(0, "A1:A2"), areaOf(0, "C1:C1") };
+        var cursors: [2]usize = undefined;
+        var out: [2]engine.value.ScalarValue = undefined;
+
+        try std.testing.expectError(
+            error.ShapeMismatch,
+            e.alignedRangeIterator(&areas, .require_equal, &cursors, &out),
+        );
+
+        // Projected, `C1:C1` covers C1:C2 — so C2's 42 lines up with A2.
+        var it = try e.alignedRangeIterator(&areas, .project_from_first, &cursors, &out);
+        var found: ?f64 = null;
+        while (try it.next()) |item| switch (item) {
+            .cells => |c| {
+                if (c.values[1] == .number) found = c.values[1].number;
+                try std.testing.expectEqual(@as(u32, 1), c.row_offset);
+            },
+            .blank_run => {},
+        };
+        try std.testing.expectEqual(@as(?f64, 42), found);
+    }
+
+    fn alignedRunsCoverEveryPosition(comptime H: type) !void {
+        var h = try H.init(ta, &.{"S"}, &.{
+            .{ .sheet = 0, .layer = .stored, .a1 = "A2", .v = text("x") },
+            .{ .sheet = 0, .layer = .stored, .a1 = "B4", .v = num(9) },
+        });
+        defer h.deinit();
+        const areas = [_]engine.env.RangeRef{ areaOf(0, "A1:A4"), areaOf(0, "B1:B4") };
+        var cursors: [2]usize = undefined;
+        var out: [2]engine.value.ScalarValue = undefined;
+        var it = try h.evalEnv().alignedRangeIterator(&areas, .require_equal, &cursors, &out);
+
+        var runs: usize = 0;
+        var occupied: usize = 0;
+        var covered: u64 = 0;
+        while (try it.next()) |item| switch (item) {
+            .blank_run => |r| {
+                runs += 1;
+                covered += r.count;
+            },
+            .cells => {
+                occupied += 1;
+                covered += 1;
+            },
+        };
+        try std.testing.expectEqual(@as(usize, 2), occupied);
+        try std.testing.expectEqual(@as(usize, 2), runs);
+        // Every position accounted for exactly once — the invariant that
+        // makes a run-based cursor safe for counting aggregates.
+        try std.testing.expectEqual(@as(u64, 4), covered);
+    }
+
+    fn unknownSheetIsAnError(comptime H: type) !void {
+        var h = try H.init(ta, &.{"S"}, &.{});
+        defer h.deinit();
+        try std.testing.expectError(error.UnknownSheet, h.evalEnv().cellValue(.{
+            .sheet = engine.env.SheetIndex.fromInt(7),
+            .row = try coords.Row.fromOneBased(1),
+            .col = try coords.Col.fromZeroBased(0),
+        }));
+    }
+
+    fn sheetResolution(comptime H: type) !void {
+        var h = try H.init(ta, &.{ "Data", "Other" }, &.{});
+        defer h.deinit();
+        const e = h.evalEnv();
+        try std.testing.expectEqual(
+            @as(?engine.env.SheetIndex, engine.env.SheetIndex.fromInt(0)),
+            try e.resolveSheet("Data"),
+        );
+        try std.testing.expectEqual(
+            @as(?engine.env.SheetIndex, engine.env.SheetIndex.fromInt(1)),
+            try e.resolveSheet("Other"),
+        );
+        try std.testing.expectEqual(
+            @as(?engine.env.SheetIndex, null),
+            try e.resolveSheet("Missing"),
+        );
+    }
+};
+
+test "env suite: the in-memory fake and the workbook adapter answer identically" {
+    try SharedEnvSuite.runAll(FakeHarness);
+    try SharedEnvSuite.runAll(AdapterHarness);
+}
+
+const corpus_workbooks = [_][]const u8{
+    "calamine_empty_s_attribute.xlsx",
+    "calamine_empty_shared_string.xlsx",
+    "calamine_encoded_entities.xlsx",
+    "calamine_non_monotonic_si.xlsx",
+    "ecdc_covid.xlsx",
+    "frictionless_2sheets.xlsx",
+    "ons_cpi_detailed.xlsx",
+    "openpyxl_guess_types.xlsx",
+    "openxlsx_loadExample.xlsx",
+    "phpoi_test1.xlsx",
+    "phpsheet_3654c.xlsx",
+    "poi_57893_many_merges.xlsx",
+    "poi_58325_db.xlsx",
+    "poi_excel_with_trash_item.xlsx",
+    "poi_MalformedSSTCount.xlsx",
+    "poi_poc_shared_strings.xlsx",
+    "wdi_excel.xlsx",
+    "worldbank_catalog.xlsx",
+};
+
+// ─── the decode boundary, through a real package ──────────────────────
+
+fn buildEnvOrRefusal(
+    allocator: Allocator,
+    wb: *Workbook,
+    opts: FormulaEnvOptions,
+) !WorkbookEnvBuild {
+    return WorkbookEnv.build(allocator, wb, opts);
+}
+
+fn expectBuilt(built: WorkbookEnvBuild) !WorkbookEnv {
+    return switch (built) {
+        .ok => |e| e,
+        .refused => |r| {
+            std.debug.print("unexpected refusal: {any}\n", .{r});
+            return error.TestUnexpectedRefusal;
+        },
+    };
+}
+
+fn expectRefused(built: WorkbookEnvBuild) !FormulaRefusal {
+    return switch (built) {
+        .refused => |r| r,
+        .ok => |e| {
+            var env = e;
+            env.deinit();
+            return error.TestExpectedRefusal;
+        },
+    };
+}
+
+fn textAt(env: *WorkbookEnv, sheet: u32, a1: []const u8) ![]const u8 {
+    const c = try coords.parseCell(a1, .{});
+    const v = try env.evalEnv().cellValue(.{
+        .sheet = engine.env.SheetIndex.fromInt(sheet),
+        .row = c.row,
+        .col = c.col,
+    });
+    return switch (v) {
+        .text => |t| t,
+        else => error.TestNotText,
+    };
+}
+
+test "M4b1: the carrier split survives a whole package, in both directions" {
+    // The row's hardest correctness claim, end to end. The SAME seven
+    // bytes — `_x0041_` — appear in a formula body, a defined-name body,
+    // a shared string, an inline string and a `t="str"` cache. The two
+    // formula carriers must hand them back untouched; the three string
+    // carriers must decode them to `A`.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const body =
+        "<row r=\"1\">" ++
+        "<c r=\"A1\" t=\"s\"><v>0</v></c>" ++
+        "<c r=\"B1\" t=\"inlineStr\"><is><t>_x0041_</t></is></c>" ++
+        "<c r=\"C1\" t=\"str\"><f>IF(A1&gt;0,&quot;_x0041_&quot;,&quot;b&quot;)</f><v>_x0041_</v></c>" ++
+        "<c r=\"D1\" t=\"s\"><v>1</v></c>" ++
+        "<c r=\"E1\" t=\"inlineStr\"><is><t>_x005F_x0041_ &amp; _x000D_</t></is></c>" ++
+        "</row>";
+    const sheet = try testSheetXml(ta, body);
+    defer ta.free(sheet);
+    const sst =
+        "<sst xmlns=\"" ++ engine.decode.ns_main ++ "\">" ++
+        "<si><t>_x0041_</t></si>" ++
+        "<si><r><t>_x005F_x0041_</t></r><r><t> &amp; _x0001_</t></r><rPh sb=\"0\" eb=\"1\"><t>PHONETIC</t></rPh></si>" ++
+        "</sst>";
+    const names =
+        "<definedNames>" ++
+        "<definedName name=\"Lit_x0041_\">IF(Sheet1!A1&gt;0,&quot;_x0041_&quot;,&quot;b&quot;)</definedName>" ++
+        "</definedNames>";
+
+    var wb = try testWorkbookFromPartsWithNames(
+        ta,
+        io,
+        &.{.{ .name = "Sheet1", .body = sheet }},
+        sst,
+        names,
+    );
+    defer wb.deinit();
+
+    var env = try expectBuilt(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    defer env.deinit();
+
+    // STRING carriers: all three decode, and the escaped underscore
+    // protects the text after it.
+    try std.testing.expectEqualStrings("A", try textAt(&env, 0, "A1"));
+    try std.testing.expectEqualStrings("A", try textAt(&env, 0, "B1"));
+    try std.testing.expectEqualStrings("A", try textAt(&env, 0, "C1"));
+    // Rich runs concatenate, the phonetic run is excluded, the entity
+    // decodes, and the encoded control becomes a control byte.
+    try std.testing.expectEqualStrings("_x0041_ & \x01", try textAt(&env, 0, "D1"));
+    try std.testing.expectEqualStrings("_x0041_ & \r", try textAt(&env, 0, "E1"));
+
+    // FORMULA carriers: byte-exact, entities decoded, `_x0041_` intact.
+    const f = (try env.formulaAt(.{
+        .sheet = engine.env.SheetIndex.fromInt(0),
+        .row = try coords.Row.fromOneBased(1),
+        .col = try coords.Col.fromZeroBased(2),
+    })).?;
+    try std.testing.expectEqualStrings("IF(A1>0,\"_x0041_\",\"b\")", f);
+
+    // …including a defined name's body, while the name's own
+    // identifier is ST_Xstring-typed and decodes.
+    try std.testing.expectEqual(@as(usize, 1), env.symbols.names.len);
+    try std.testing.expectEqualStrings("LitA", env.symbols.names[0].identifier);
+    try std.testing.expectEqualStrings(
+        "IF(Sheet1!A1>0,\"_x0041_\",\"b\")",
+        env.symbols.names[0].body,
+    );
+
+    // And the authored direction round-trips: what the engine would
+    // write for that formula reads back as the same bytes.
+    const authored = try engine.decode.encodeAuthoredFormula(ta, env.symbols.names[0].body);
+    defer ta.free(authored);
+    const back = try engine.decode.decodeAt(ta, .defined_name_body, authored);
+    defer ta.free(back);
+    try std.testing.expectEqualStrings(env.symbols.names[0].body, back);
+}
+
+test "M4b1: an entity-escaped sheet name resolves under the name a formula writes" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const sheet = try testSheetXml(ta, "<row r=\"1\"><c r=\"A1\"><v>1</v></c></row>");
+    defer ta.free(sheet);
+    var wb = try testWorkbookFromParts(ta, io, &.{
+        .{ .name = "R&D", .body = sheet },
+        .{ .name = "TabA", .body = sheet, .raw_name = "Tab_x0041_" },
+    }, null);
+    defer wb.deinit();
+
+    var env = try expectBuilt(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    defer env.deinit();
+    const e = env.evalEnv();
+
+    // `'R&D'!A1` in a formula spells the sheet name decoded; the
+    // workbook part spells it `R&amp;D`.
+    try std.testing.expectEqual(
+        @as(?engine.env.SheetIndex, engine.env.SheetIndex.fromInt(0)),
+        try e.resolveSheet("R&D"),
+    );
+    try std.testing.expectEqual(@as(?engine.env.SheetIndex, null), try e.resolveSheet("R&amp;D"));
+    // Sheet names are ST_Xstring-typed, and matching is case-folded.
+    try std.testing.expectEqual(
+        @as(?engine.env.SheetIndex, engine.env.SheetIndex.fromInt(1)),
+        try e.resolveSheet("tabA"),
+    );
+}
+
+test "M4b1: implicit coordinates through the adapter — first cell, gaps, formulas, grid edge" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // Row 1 has no `r` at all (first row → 1); row 2 declares its own;
+    // row 3 omits it again (predecessor + 1).
+    const sheet = try testSheetXml(
+        ta,
+        "<row><c><v>1</v></c><c><v>2</v></c><c r=\"E1\"><v>5</v></c><c><f>E1+1</f><v>6</v></c></row>" ++
+            "<row r=\"2\"><c><v>10</v></c></row>" ++
+            "<row><c><v>100</v></c></row>",
+    );
+    defer ta.free(sheet);
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+    defer wb.deinit();
+
+    var env = try expectBuilt(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    defer env.deinit();
+    const e = env.evalEnv();
+
+    const want = [_]struct { a1: []const u8, v: f64 }{
+        .{ .a1 = "A1", .v = 1 },
+        .{ .a1 = "B1", .v = 2 },
+        .{ .a1 = "E1", .v = 5 },
+        .{ .a1 = "F1", .v = 6 },
+        .{ .a1 = "A2", .v = 10 },
+        .{ .a1 = "A3", .v = 100 },
+    };
+    for (want) |w| {
+        const c = try coords.parseCell(w.a1, .{});
+        const got = try e.cellValue(.{
+            .sheet = engine.env.SheetIndex.fromInt(0),
+            .row = c.row,
+            .col = c.col,
+        });
+        std.testing.expect(engine.value.ScalarValue.eql(
+            engine.value.ScalarValue.fromNumber(w.v),
+            got,
+        )) catch |err| {
+            std.debug.print("at {s}: {any}\n", .{ w.a1, got });
+            return err;
+        };
+    }
+    // The r-less formula cell kept its body, at the reconstructed
+    // coordinate.
+    try std.testing.expectEqualStrings("E1+1", (try env.formulaAt(.{
+        .sheet = engine.env.SheetIndex.fromInt(0),
+        .row = try coords.Row.fromOneBased(1),
+        .col = try coords.Col.fromZeroBased(5),
+    })).?);
+
+    // Stepping past XFD refuses rather than wrapping or clamping.
+    const edge = try testSheetXml(ta, "<row r=\"1\"><c r=\"XFD1\"><v>1</v></c><c><v>2</v></c></row>");
+    defer ta.free(edge);
+    var wb2 = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = edge }}, null);
+    defer wb2.deinit();
+    const refusal = try expectRefused(try buildEnvOrRefusal(ta, &wb2, .{ .collation = test_collation }));
+    try std.testing.expectEqual(
+        engine.decode.Refusal.Reason.implicit_ref_out_of_grid,
+        refusal.decode.reason,
+    );
+}
+
+test "M4b1: the namespace preflight refuses before anything is decoded or mutated" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const good = try testSheetXml(ta, "<row r=\"1\"><c r=\"A1\"><v>1</v></c></row>");
+    defer ta.free(good);
+    const bogus =
+        "<?xml version=\"1.0\"?><worksheet xmlns=\"http://example.invalid/sheet\">" ++
+        "<sheetData><row r=\"1\"><c r=\"A1\"><v>1</v></c></row></sheetData></worksheet>";
+
+    var wb = try testWorkbookFromParts(ta, io, &.{
+        .{ .name = "Good", .body = good },
+        .{ .name = "Bad", .body = bogus },
+    }, null);
+    defer wb.deinit();
+
+    const before = try ta.dupe(u8, (try wb.store.part("xl/worksheets/sheet1.xml")).?.bytes);
+    defer ta.free(before);
+    const dirty_before = wb.hasUnsavedChanges();
+    const refusal = try expectRefused(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    try std.testing.expectEqual(
+        engine.decode.Refusal.Reason.unknown_namespace,
+        refusal.decode.reason,
+    );
+    try std.testing.expectEqual(
+        engine.decode.PlaneTwo.FormulaUnsupportedConstruct,
+        refusal.planeTwo(),
+    );
+    // Pre-mutation, and provably so: no part changed and the store's
+    // dirty flag is exactly where the refusal found it.
+    try std.testing.expectEqual(dirty_before, wb.hasUnsavedChanges());
+    try std.testing.expectEqualStrings(before, (try wb.store.part("xl/worksheets/sheet1.xml")).?.bytes);
+}
+
+test "M4b1: staged deltas shadow stored cells, and a staged formula is uncached" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const sheet = try testSheetXml(
+        ta,
+        "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"B1\"><v>2</v></c>" ++
+            "<c r=\"C1\"><f>A1+B1</f><v>3</v></c><c r=\"D1\"><f>A1*2</f></c></row>",
+    );
+    defer ta.free(sheet);
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+    defer wb.deinit();
+
+    const ws = try wb.sheet(0);
+    try ws.setCell("A1", .{ .number = 11 });
+    try ws.setCell("B1", .{ .formula = "SUM(A1:A1)" });
+
+    var env = try expectBuilt(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    defer env.deinit();
+    const e = env.evalEnv();
+    const s0 = engine.env.SheetIndex.fromInt(0);
+    const row1 = try coords.Row.fromOneBased(1);
+
+    // A staged number shadows the stored one.
+    try std.testing.expect(engine.value.ScalarValue.eql(
+        engine.value.ScalarValue.fromNumber(11),
+        try e.cellValue(.{ .sheet = s0, .row = row1, .col = try coords.Col.fromZeroBased(0) }),
+    ));
+    // A staged formula has no cached value yet: it reads blank and
+    // reports uncached, which is what §5.6c seeds from.
+    const b1: engine.env.CellRef = .{ .sheet = s0, .row = row1, .col = try coords.Col.fromZeroBased(1) };
+    try std.testing.expectEqual(engine.value.ScalarValue.blank, try e.cellValue(b1));
+    try std.testing.expect(try env.isUncached(b1));
+    try std.testing.expectEqualStrings("SUM(A1:A1)", (try env.formulaAt(b1)).?);
+
+    // A stored formula WITH a cache reads its cache…
+    const c1: engine.env.CellRef = .{ .sheet = s0, .row = row1, .col = try coords.Col.fromZeroBased(2) };
+    try std.testing.expect(engine.value.ScalarValue.eql(
+        engine.value.ScalarValue.fromNumber(3),
+        try e.cellValue(c1),
+    ));
+    try std.testing.expect(!try env.isUncached(c1));
+    // …and one WITHOUT is uncached, whatever it costs to notice.
+    const d1: engine.env.CellRef = .{ .sheet = s0, .row = row1, .col = try coords.Col.fromZeroBased(3) };
+    try std.testing.expectEqual(engine.value.ScalarValue.blank, try e.cellValue(d1));
+    try std.testing.expect(try env.isUncached(d1));
+
+    // A computed value shadows both, and the iterator agrees.
+    try env.putComputed(s0, row1, try coords.Col.fromZeroBased(0), engine.value.ScalarValue.fromNumber(99));
+    try std.testing.expect(engine.value.ScalarValue.eql(
+        engine.value.ScalarValue.fromNumber(99),
+        try e.cellValue(.{ .sheet = s0, .row = row1, .col = try coords.Col.fromZeroBased(0) }),
+    ));
+    var it = try e.rangeIterator(.{
+        .sheet = s0,
+        .range = (try coords.parseRange("A1:D1", .{})).normalized(),
+    });
+    const first = (try it.next()).?;
+    try std.testing.expectEqual(engine.env.Layer.computed, first.layer);
+}
+
+test "M4b1: an unknown t refuses through the adapter, never becoming a number" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const sheet = try testSheetXml(ta, "<row r=\"1\"><c r=\"A1\" t=\"q\"><v>7</v></c></row>");
+    defer ta.free(sheet);
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+    defer wb.deinit();
+
+    const refusal = try expectRefused(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    try std.testing.expectEqual(
+        engine.decode.Refusal.Reason.unknown_cell_type,
+        refusal.decode.reason,
+    );
+    try std.testing.expectEqual(
+        engine.decode.PlaneTwo.FormulaMalformedInput,
+        refusal.planeTwo(),
+    );
+    // The typed reader, by contrast, reads it as a number — which is
+    // exactly the silent normalization this row refuses to do.
+    const ws = try wb.sheet(0);
+    const cell = (try ws.cellByRef("A1")).?;
+    try std.testing.expectEqual(sheet_xml_mod.CellType.number, cell.cell_type);
+}
+
+test "M4b1: dialect resolves through the M4a metadata reader" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // No `xl/metadata.xml`: every cell is legacy, which is the correct
+    // reading — without the part there are no dynamic-array marks.
+    const sheet = try testSheetXml(ta, "<row r=\"1\"><c r=\"A1\" cm=\"1\"><v>1</v></c><c r=\"B1\"><v>2</v></c></row>");
+    defer ta.free(sheet);
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+    defer wb.deinit();
+
+    var env = try expectBuilt(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    defer env.deinit();
+    const e = env.evalEnv();
+    const s0 = engine.env.SheetIndex.fromInt(0);
+    const row1 = try coords.Row.fromOneBased(1);
+
+    // `cm="1"` with no metadata part is a dangling index — a refusal,
+    // not a guessed dialect.
+    try std.testing.expectError(error.MetadataRefused, e.dialectOf(.{
+        .sheet = s0,
+        .row = row1,
+        .col = try coords.Col.fromZeroBased(0),
+    }));
+    try std.testing.expectEqual(
+        engine.metadata.Refusal.Reason.index_out_of_range,
+        env.lastDialectRefusal().?.reason,
+    );
+    // An unmarked cell resolves legacy without consulting anything.
+    try std.testing.expectEqual(engine.value.Dialect.legacy, try e.dialectOf(.{
+        .sheet = s0,
+        .row = row1,
+        .col = try coords.Col.fromZeroBased(1),
+    }));
+}
+
+test "M4b1: a table part joins the symbol layer with its formulas decoded" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const sheet = try std.fmt.allocPrint(
+        ta,
+        "<?xml version=\"1.0\"?><worksheet xmlns=\"{s}\">" ++
+            "<sheetData><row r=\"1\"><c r=\"A1\"><v>1</v></c></row></sheetData>" ++
+            "<tableParts count=\"1\"><tablePart r:id=\"rIdT1\"/></tableParts></worksheet>",
+        .{test_ns_main},
+    );
+    defer ta.free(sheet);
+
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+    defer wb.deinit();
+
+    const table_xml = "<?xml version=\"1.0\"?><table xmlns=\"" ++ engine.decode.ns_main ++
+        "\" id=\"1\" name=\"Sales\" displayName=\"Sales\" ref=\"A1:B4\"><tableColumns count=\"2\">" ++
+        "<tableColumn id=\"1\" name=\"R&amp;D\"/>" ++
+        "<tableColumn id=\"2\" name=\"Total\"><calculatedColumnFormula>SUM(Sales[R&amp;D])&amp;&quot;_x0041_&quot;</calculatedColumnFormula></tableColumn>" ++
+        "</tableColumns></table>";
+    try wb.store.addPart(
+        "xl/tables/table1.xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml",
+        table_xml,
+    );
+    try wb.store.addPart(
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "application/vnd.openxmlformats-package.relationships+xml",
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>",
+    );
+    try wb.store.replacePart(
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+            "<Relationship Id=\"rIdT1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/table\" Target=\"../tables/table1.xml\"/>" ++
+            "</Relationships>",
+    );
+
+    var env = try expectBuilt(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    defer env.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), env.symbols.tables.len);
+    const resolved = try env.symbols.resolveName(ta, null, "sales");
+    try std.testing.expectEqualStrings("Sales", resolved.table.name);
+    // A column name is a STRING carrier; a calculated-column formula is
+    // a FORMULA carrier and keeps its literal escape.
+    try std.testing.expectEqualStrings("R&D", resolved.table.columns[0].name);
+    try std.testing.expectEqualStrings(
+        "SUM(Sales[R&D])&\"_x0041_\"",
+        resolved.table.columns[1].calculated_formula.?,
+    );
+}
+
+// ─── corpus ───────────────────────────────────────────────────────────
+
+const corpus_env_workbooks = [_][]const u8{
+    "calamine_empty_s_attribute.xlsx",
+    "calamine_empty_shared_string.xlsx",
+    "calamine_encoded_entities.xlsx",
+    "calamine_non_monotonic_si.xlsx",
+    "ecdc_covid.xlsx",
+    "frictionless_2sheets.xlsx",
+    "ons_cpi_detailed.xlsx",
+    "openpyxl_guess_types.xlsx",
+    "openxlsx_loadExample.xlsx",
+    "phpoi_test1.xlsx",
+    "phpsheet_3654c.xlsx",
+    "poi_57893_many_merges.xlsx",
+    "poi_58325_db.xlsx",
+    "poi_excel_with_trash_item.xlsx",
+    "poi_MalformedSSTCount.xlsx",
+    "poi_workbook_password_2013.xlsx",
+    "worldbank_catalog.xlsx",
+};
+
+test "M4b1 corpus: every readable workbook models, and each cell agrees with the reader" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    var modeled: usize = 0;
+    for (corpus_env_workbooks) |name| {
+        const path = try std.fmt.allocPrint(ta, "tests/corpus/{s}", .{name});
+        defer ta.free(path);
+        std.Io.Dir.cwd().access(io, path, .{}) catch continue;
+        var wb = Workbook.open(ta, io, path) catch continue;
+        defer wb.deinit();
+
+        var env = switch (try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation })) {
+            .ok => |e| e,
+            // A refusal is a legitimate outcome for a corpus this
+            // adversarial; what matters is that it is classified.
+            .refused => |r| {
+                _ = r.planeTwo();
+                continue;
+            },
+        };
+        defer env.deinit();
+        modeled += 1;
+
+        // Cross-check against the typed reader on the cells it can
+        // also see: two independent decode paths over the same bytes.
+        var checked: usize = 0;
+        for (0..wb.worksheets.len) |i| {
+            if (checked >= 8) break;
+            const ws = try wb.sheet(@intCast(i));
+            const rows = ws.rows() catch continue;
+            for (rows) |row| {
+                for (row.cells) |cell| {
+                    if (checked >= 8) break;
+                    if (cell.cell_type != .number) continue;
+                    const raw = cell.raw_value orelse continue;
+                    if (cell.formula != null) continue;
+                    const expected = std.fmt.parseFloat(f64, raw) catch continue;
+                    if (!std.math.isFinite(expected)) continue;
+                    const ref = parseA1Ref(cell.ref) catch continue;
+                    const got = try env.evalEnv().cellValue(.{
+                        .sheet = engine.env.SheetIndex.fromInt(@intCast(i)),
+                        .row = try coords.Row.fromOneBased(ref.row),
+                        .col = try coords.Col.fromOneBased(ref.col),
+                    });
+                    try std.testing.expect(got == .number);
+                    try std.testing.expectEqual(expected, got.number);
+                    checked += 1;
+                }
+            }
+        }
+    }
+    // The list is not decoration: if the corpus went missing entirely
+    // this test would otherwise pass by doing nothing.
+    if (modeled == 0) return error.SkipZigTest;
+    try std.testing.expect(modeled >= 8);
+}
+
+test "M4b1 corpus: a zero row index refuses where the reader silently drops it" {
+    // `tests/corpus/poi_poc_shared_strings.xlsx` carries `<row r="0">`.
+    // The typed reader skips such a row (`sheet_xml.zig:455`); an engine
+    // that writes values back cannot, because a dropped row is a row
+    // whose cells recalculate as blank.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+    const path = "tests/corpus/poi_poc_shared_strings.xlsx";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(ta, io, path);
+    defer wb.deinit();
+    const refusal = try expectRefused(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    try std.testing.expectEqual(
+        engine.decode.Refusal.Reason.bad_attribute_value,
+        refusal.decode.reason,
+    );
+    try std.testing.expectEqual(
+        engine.decode.PlaneTwo.FormulaMalformedInput,
+        refusal.planeTwo(),
+    );
+}
+
+test "M4b1 corpus: implicit coordinates, on a workbook that really omits them" {
+    // `tests/corpus/wdi_excel.xlsx` is the World Bank's WDI export, and
+    // it omits `r` on BOTH `<row>` and `<c>` throughout — 13.9M cells
+    // whose coordinates exist only as a rule. Sheet 5 is the small one;
+    // modeling sheet 1 (287 MB of XML) is a memory benchmark, not a
+    // correctness test, so this reads the part directly.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+    const path = "tests/corpus/wdi_excel.xlsx";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(ta, io, path);
+    defer wb.deinit();
+
+    const sst_part = (try wb.store.part("xl/sharedStrings.xml")) orelse return error.SkipZigTest;
+    var strings = switch (try engine.decode.decodeSharedStrings(ta, sst_part.bytes, .{})) {
+        .ok => |s| s,
+        .refused => return error.TestUnexpectedRefusal,
+    };
+    defer strings.deinit();
+
+    const part = (try wb.store.part("xl/worksheets/sheet5.xml")) orelse return error.SkipZigTest;
+    var scanned = switch (try engine.decode.scanSheet(ta, part.bytes, strings.items, .{})) {
+        .ok => |s| s,
+        .refused => |r| {
+            std.debug.print("unexpected refusal: {any}\n", .{r});
+            return error.TestUnexpectedRefusal;
+        },
+    };
+    defer scanned.deinit();
+
+    // Every coordinate was reconstructed, and they are strictly
+    // ascending row-major with no duplicates — which is the property a
+    // wrong rule would break first.
+    try std.testing.expect(scanned.cells.len > 400);
+    try std.testing.expectEqual(@as(u32, 1), scanned.cells[0].row.oneBased());
+    try std.testing.expectEqual(@as(u32, 0), scanned.cells[0].col.zeroBased());
+    var last: u64 = 0;
+    var texts: usize = 0;
+    for (scanned.cells) |c| {
+        const key = (@as(u64, c.row.oneBased()) << 32) | c.col.zeroBased();
+        try std.testing.expect(key > last);
+        last = key;
+        if (c.input == .text and c.input.text.len > 0) texts += 1;
+    }
+    try std.testing.expect(texts > 100);
+
+    // …and the §9 pre-model refusal fires on the 287 MB sheet rather
+    // than materializing it.
+    const built = try WorkbookEnv.build(ta, &wb, .{
+        .collation = test_collation,
+        .limits = .{ .max_modeled_cells = 1000 },
+    });
+    const refusal = try expectRefused(built);
+    try std.testing.expectEqual(
+        engine.decode.LimitKind.modeled_cells,
+        refusal.decode.limit.?,
+    );
+    try std.testing.expectEqual(
+        engine.decode.PlaneTwo.FormulaLimitExceeded,
+        refusal.planeTwo(),
+    );
+}
+
+test "checkAllAllocationFailures: building the adapter leaks nothing under OOM" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const H = struct {
+        fn run(allocator: Allocator, inner_io: std.Io) !void {
+            const sheet = try testSheetXml(
+                allocator,
+                "<row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c>" ++
+                    "<c><f>A1&amp;\"x\"</f><v>1</v></c>" ++
+                    "<c r=\"D1\" t=\"inlineStr\"><is><r><t>_x0041_</t></r></is></c></row>",
+            );
+            defer allocator.free(sheet);
+            var wb = try testWorkbookFromPartsWithNames(
+                allocator,
+                inner_io,
+                &.{.{ .name = "R&D", .body = sheet }},
+                "<sst xmlns=\"" ++ engine.decode.ns_main ++ "\"><si><t>s0</t></si></sst>",
+                "<definedNames><definedName name=\"N\">'R&amp;D'!$A$1</definedName></definedNames>",
+            );
+            defer wb.deinit();
+
+            const ws = try wb.sheet(0);
+            try ws.setCell("B2", .{ .number = 5 });
+
+            var env = switch (try WorkbookEnv.build(allocator, &wb, .{ .collation = test_collation })) {
+                .ok => |e| e,
+                .refused => return error.TestUnexpectedRefusal,
+            };
+            defer env.deinit();
+            try env.putComputed(
+                engine.env.SheetIndex.fromInt(0),
+                try coords.Row.fromOneBased(3),
+                try coords.Col.fromZeroBased(0),
+                engine.value.ScalarValue.fromNumber(7),
+            );
+            var it = try env.evalEnv().rangeIterator(.{
+                .sheet = engine.env.SheetIndex.fromInt(0),
+                .range = (try coords.parseRange("A1:D3", .{})).normalized(),
+            });
+            var n: usize = 0;
+            while (try it.next()) |_| n += 1;
+            if (n != 5) return error.WrongCount;
+            if ((try env.evalEnv().resolveSheet("r&d")) == null) return error.WrongSheet;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, H.run, .{io});
 }

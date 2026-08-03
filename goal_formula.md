@@ -1459,6 +1459,122 @@ here because §5.8b is where the `cm`/`vm` contract lives.
     must stand. §10's taxonomy keeps one home: `metadata.zig` imports
     `parser.PlaneTwo` rather than restating it.
 
+**M4b1 decisions (shipped 2026-08-03).** Nineteen points the row left
+open, got wrong, or discovered. They span §5.6a (`EvalEnv`), §5.7.1–2
+(decode boundary, input cell-type contract), §5.9 (symbols) and §9
+(limits), and the corpus decided four of them against what the row had
+written down.
+
+1. **The corpus decided the row axis, and it decided it against the
+   plan.** The row scoped implicit coordinates to `<c>` and said a
+   `<row>` without `r` should refuse. `tests/corpus/wdi_excel.xlsx` —
+   the World Bank's WDI export, 13.9M cells — omits `r` on **both**
+   `<row>` and `<c>` throughout, and `src/xlsx.zig:1858-1864` already
+   reconstructs it. Refusing would have refused a workbook this repo
+   reads today. The rule is now the same on both axes: the row after the
+   predecessor, first row 1.
+2. **A row's number is provisional until its first cell.** A producer
+   that omits `r` on the row may still put it on the cells, and then the
+   cells are the authority — which is exactly what the reader's
+   `recoverRowFromFirstCell` does. Deferring means both readings agree on
+   the same file instead of silently placing values two rows apart.
+3. **`<row r="0">` refuses where the reader skips it.**
+   `tests/corpus/poi_poc_shared_strings.xlsx` carries one. A reader may
+   drop a row it cannot place; an engine that writes values back cannot,
+   because a dropped row recalculates as blank cells.
+4. **Three carrier classes, not two.** FORMULA and STRING are the row's
+   named pair, but numeric/boolean/error `<v>` bodies needed a third
+   (`lexical`): they decode like formulas (entities only) and *author*
+   like neither — this engine generates their spelling, so there is
+   nothing to escape and nothing that can fail to encode.
+5. **Authoring a formula can fail, and that is the asymmetry's price.**
+   With no ST_Xstring stage, a formula containing a character XML cannot
+   represent has nowhere to go: `unencodable_formula_char`, not an
+   invented escape. Emitting `_x0001_` there would produce a formula that
+   reads back as seven literal characters.
+6. **Identifiers are STRING carriers; bodies are FORMULA carriers.**
+   `CT_Sheet@name`, `CT_DefinedName@name`, `CT_Table@name` and
+   `CT_TableColumn@name` are ST_Xstring-typed and decode both passes; the
+   `<definedName>` body, `<f>`, `<calculatedColumnFormula>` and
+   `<totalsRowFormula>` are the exception the row already named. One
+   fixture puts the same seven bytes in a name and in its own body and
+   pins the two answers side by side.
+7. **The preflight is a sweep, not a check.** Every part the run will
+   read — workbook, shared strings, every sheet, every table — is
+   namespace-checked before *any* of them is decoded, so a bad
+   vocabulary on sheet 9 cannot be discovered after sheet 1 has been
+   modeled. ISO Strict is refused as **classified** rather than unknown:
+   the vocabulary is nearly the same, and the parts it differs in are
+   exactly the parts recalc reads.
+8. **Foreign-namespace attributes are exempt from the inventory;
+   foreign-namespace elements inside `<sheetData>` are not.**
+   `x14ac:dyDescent` is on nearly every row Excel writes, so refusing a
+   namespaced extension would refuse the ordinary case. An unrecognized
+   element inside `<sheetData>` could be wrapping cells, so skipping it
+   would drop them: that refuses. Everything outside `<sheetData>` is
+   skipped wholesale without inspection.
+9. **Two `<c>` at one coordinate refuse.** Last-wins and first-wins are
+   both defensible, which is why neither is chosen silently.
+10. **`max_modeled_cells` is §9's name and §9's default (64M) — and it
+    does not bound memory.** Modeling `wdi_excel.xlsx` costs ~7 GB at
+    13.9M cells, well inside the limit. The cell count is a shape bound;
+    the **byte** budget (`max_run_arena_bytes`, §9 aggregates, counted
+    allocator) is what actually protects the process, and wiring it
+    through the model builder is M5's. Recorded here because the gap is
+    real and the number in §9 does not close it. The adapter charges the
+    limit workbook-wide (each sheet scans against what the sheets before
+    it left), not per sheet.
+11. **The engine is ONE module, and it had to become one.**
+    `pkg/workbook.zig` reaching `env`, `value` and `decode` as separate
+    modules would compile `env.zig` twice and build an `EvalEnv` the
+    evaluator could not accept. Worse, `src/xlsx.zig` imported
+    `formula/rewriter.zig` by relative path, which would have put
+    `tokenizer.zig` in both `zlsx` and the engine module — "file exists
+    in modules" is a build error, not a subtlety. `xlsx.zig` now reaches
+    the rewriter through the named module, and the engine is named once.
+12. **The pkg-facing module declares no `zlsx_casefold`.** That
+    dependency exists only for the TEST sections of `value.zig` and
+    `symbols.zig`; declaring it in a compilation that also contains
+    `zlsx` claims `src/unicode/casefold.zig` for two modules. Two module
+    objects, one root file, one of them test-only.
+13. **A refusal is a normal return, so `errdefer` does not fire.** Every
+    scan entry point releases its arena through `defer if (!keep)`, and
+    the fuzz target is what proves a refused parse frees what it
+    allocated.
+14. **`Builder.deinit` is idempotent.** An ownership rule a caller has to
+    remember is one a caller gets wrong under injected OOM — the
+    `consumed` flag makes the obvious `defer b.deinit()` correct on every
+    path, including the one where the allocator fails between the last
+    `add` and `finish`.
+15. **`Workbook.open` double-freed its `PartStore` on every failing
+    open**, found by this row's allocation-failure sweep:
+    `fromStore` takes ownership *including on failure*, and both it and
+    `open` had an armed `errdefer`. A workbook with no
+    `xl/workbook.xml` segfaulted instead of returning
+    `MissingWorkbookPart`. Fixed in `open` and `empty` by disarming
+    before the hand-off.
+16. **`dialectOf` routes through M4a, and a dangling `cm` refuses.** A
+    `cm="1"` on a workbook with no `xl/metadata.xml` is
+    `index_out_of_range`, not a guessed dialect; the precise refusal is
+    retrievable from the adapter (`lastDialectRefusal`) because the env
+    interface can only say `error.MetadataRefused` (M4a decision 17).
+17. **`spillShape` answers null through this row.** A spill's extent is
+    not recoverable from cached `<v>` values, and inventing one would
+    make `A1#` resolve to a guess. §5.8's stored spill state arrives at
+    M7a.
+18. **The adapter is proven by the fake's own suite.** Ordering,
+    precedence, both blank classes, the N-way cursor's modes and its
+    run/position accounting, unknown-sheet, sheet resolution — one test
+    body, two harnesses, and the adapter's harness authors real sheet XML
+    and reads it back through the decode boundary rather than injecting
+    cells directly.
+19. **`PartStore.addPart` does not refresh the rels cache;
+    `replacePart` does** (`store.zig:688`). Only a test-construction
+    consequence — real packages come from `open`, which parses every rels
+    part — but it is why the in-memory workbook builder seeds an empty
+    rels part and then replaces it, the same two-step `Workbook.empty` +
+    `addSheet` takes.
+
 ### 5.9 Name & identifier resolution
 
 Call position → strip layered prefixes → registry; unregistered →
