@@ -785,6 +785,86 @@ pub fn build(b: *std.Build) void {
     });
     fuzz_step.dependOn(&b.addRunArtifact(formula_metadata_fuzz_tests).step);
 
+    // M4b1: the XML decode boundary and the decoded symbol layer.
+    //
+    // One module rooted at `symbols.zig`, which imports `decode.zig`
+    // relatively: the symbol layer decodes through the boundary, so the
+    // two are a unit, and a `pkg/` adapter that reached them as two
+    // named modules would get two incompatible copies of every type
+    // they share with `env.zig`. `decode.zig` gets its own test target
+    // as well, because the boundary must stay buildable — and provable —
+    // without the symbol layer above it.
+    const formula_decode_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/decode.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_decode_mod.addImport("zlsx_refs", refs_mod);
+    formula_decode_mod.addImport("zlsx_xid", xid_mod);
+    formula_decode_mod.addImport("zlsx_casefold", unicode_mod);
+    addOracleFixtures(b, formula_decode_mod);
+    const formula_decode_tests = b.addTest(.{ .root_module = formula_decode_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_decode_tests).step);
+
+    // M4b1: the decode fuzz target (§8.1) — no input may panic, leak,
+    // or produce a decode that differs between two runs.
+    const formula_decode_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/decode.zig"),
+        .target = target,
+        .optimize = optimize,
+        .fuzz = true,
+    });
+    formula_decode_fuzz_mod.addImport("zlsx_refs", refs_mod);
+    formula_decode_fuzz_mod.addImport("zlsx_xid", xid_mod);
+    formula_decode_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
+    addOracleFixtures(b, formula_decode_fuzz_mod);
+    const formula_decode_fuzz_tests = b.addTest(.{
+        .root_module = formula_decode_fuzz_mod,
+        .test_runner = fuzz_test_runner,
+    });
+    fuzz_step.dependOn(&b.addRunArtifact(formula_decode_fuzz_tests).step);
+
+    // M4b1: the decoded symbol layer.
+    const formula_symbols_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/symbols.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_symbols_mod.addImport("zlsx_refs", refs_mod);
+    formula_symbols_mod.addImport("zlsx_xid", xid_mod);
+    formula_symbols_mod.addImport("zlsx_casefold", unicode_mod);
+    addOracleFixtures(b, formula_symbols_mod);
+    const formula_symbols_tests = b.addTest(.{ .root_module = formula_symbols_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_symbols_tests).step);
+
+    // M4b1: the same root, as the module `pkg/` imports — the ONE place
+    // the package layer and the engine meet (§5.6a). One module rather
+    // than four because a file compiled into two modules is two
+    // distinct types, and an adapter naming `env` and `symbols`
+    // separately would build an `EvalEnv` the evaluator could not take.
+    //
+    // It deliberately does NOT declare `zlsx_casefold` or the oracle
+    // fixtures. Those are imported by the TEST sections of `value.zig`
+    // and `symbols.zig` and are needed only in a test build rooted
+    // there; declaring them here would put `src/unicode/casefold.zig`
+    // in a compilation that also contains `zlsx` — which reaches the
+    // same file by relative import — and "file exists in modules 'zlsx'
+    // and 'zlsx_casefold'" is the collision that moved `unicode/` to the
+    // top level in the first place.
+    const formula_pkg_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/symbols.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_pkg_mod.addImport("zlsx_refs", refs_mod);
+    formula_pkg_mod.addImport("zlsx_xid", xid_mod);
+    // `src/xlsx.zig` re-exports the rewriter from here rather than by
+    // relative path: `rewriter.zig` and the engine module both contain
+    // `tokenizer.zig`, and a file may belong to only one module. Wired
+    // at the declaration site of the engine module because that is the
+    // constraint's home — see `xlsx.zig`'s `formula_rewriter`.
+    zlsx_mod.addImport("zlsx_formula", formula_pkg_mod);
+
     // M3a2: the non-finite escape fuzz target (§8.1). No evaluation of
     // any input may produce a non-finite number, a zero-dimension
     // matrix, a panic, or a leak.
@@ -852,6 +932,10 @@ pub fn build(b: *std.Build) void {
     package_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
     package_mod.addImport("zlsx_nfc", nfc_mod);
     package_mod.addImport("zlsx_refs", refs_mod);
+    // M4b1: the EvalEnv adapter. `pkg/workbook.zig` reaches the whole
+    // engine through this one module — see the import's comment there
+    // for why it is one and not four.
+    package_mod.addImport("zlsx_formula", formula_pkg_mod);
 
     // After the B2 iter-er-0 Editor relocation, `cli_mod` reaches
     // Editor through `zlsx_pkg` and xlsx via the named `zlsx` dep.
@@ -1133,6 +1217,10 @@ pub fn build(b: *std.Build) void {
     package_workbook_tests_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
     package_workbook_tests_mod.addImport("zlsx_nfc", nfc_mod);
     package_workbook_tests_mod.addImport("zlsx_refs", refs_mod);
+    // M4b1: this target is where the adapter's own tests run — the
+    // shared `EvalEnv` suite, the decode round-trips, and the corpus
+    // sweep.
+    package_workbook_tests_mod.addImport("zlsx_formula", formula_pkg_mod);
     const package_workbook_tests = b.addTest(.{ .root_module = package_workbook_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_workbook_tests).step);
 
@@ -1157,6 +1245,7 @@ pub fn build(b: *std.Build) void {
     package_editor_tests_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
     package_editor_tests_mod.addImport("zlsx_nfc", nfc_mod);
     package_editor_tests_mod.addImport("zlsx_refs", refs_mod);
+    package_editor_tests_mod.addImport("zlsx_formula", formula_pkg_mod);
     const package_editor_tests = b.addTest(.{ .root_module = package_editor_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_editor_tests).step);
 

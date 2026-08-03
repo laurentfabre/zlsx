@@ -7386,10 +7386,15 @@ pub const formatCellRef = @import("writer.zig").formatCellRef;
 /// C1 M2 m1 — pure-function A1 cell-formula rewriter. Re-exported
 /// for `zlsx_pkg` so `Workbook.rewriteAllFormulas(edit)` can apply
 /// row/col/sheet edits to every cell formula via
-/// `@import("zlsx").formula_rewriter`. Same module-graph rationale
-/// as `deflateCompress` above — avoids a separate `formula_rewriter`
-/// addImport on package_mod.
-pub const formula_rewriter = @import("formula/rewriter.zig");
+/// `@import("zlsx").formula_rewriter`.
+///
+/// Reached through the **named** `zlsx_formula` module rather than by
+/// relative path (M4b1). A relative import would make
+/// `src/formula/tokenizer.zig` a member of this module *and* of the
+/// engine module `pkg/workbook.zig`'s adapter imports — and a file may
+/// belong to only one. The engine is one module, named once, and both
+/// layers reach it by that name.
+pub const formula_rewriter = @import("zlsx_formula").rewriter;
 
 /// Whole-module re-export of `src/writer.zig`. Lets pkg/ and other
 /// consumers reach writer's input types (`Writer`, `SheetWriter`, `Style`,
