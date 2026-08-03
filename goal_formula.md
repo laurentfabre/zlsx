@@ -271,6 +271,110 @@ strip exactly one optional `=` after whitespace; `==` → parse refusal.
 layered `_xlfn.` / `_xlfn._xlws.` / `_xlfn.SINGLE`→`@`; `_xlpm.` refused;
 original spelling preserved.
 
+**M2 decisions (shipped 2026-08-03).** Fifteen points the row left open
+or got wrong, pinned here because M3a builds directly on them:
+
+1. **Number literals are not converted.** The AST keeps the source
+   spelling and defers `parseDecimal` to M3a1. Converting here would
+   force a rounding policy before §5.4 pins one, and the canonical
+   printer would then have to *re-render* every literal — turning a
+   round-trip property into a formatting bet.
+2. **The canonical printer is canonical, not byte-preserving.** Byte
+   fidelity stays the tokenizer's contract (`format(tokenize(x)) == x`);
+   the parser drops insignificant whitespace and normalises booleans to
+   `TRUE`/`FALSE`. Everything a canonical form cannot re-derive rides in
+   the AST verbatim: number spellings, string bodies, error spellings,
+   sheet-name quoting and its `''` escapes, structured-ref column names,
+   and the `_xlfn.` layers. Parenthesised groups keep an explicit node —
+   dropping redundant parens would change the structure the round-trip
+   is asserting.
+3. **A call requires `(` adjacent to the name.** M1a's classification
+   precedence is normative, so `SUM (A1)` keeps the kinds M1a assigned
+   it and parses as an *intersection*, not a call. Excel would read it
+   as a call; the divergence is unreachable through the workbook path
+   because stored `<f>` never spaces a call. Fixtured, and preferred
+   over shipping two classifiers that disagree.
+4. **`A1 -1` is subtraction, not an intersection.** `+` and `-` are
+   excluded from the primary-starter set that turns whitespace into the
+   intersection operator. Without the exclusion every `A1 -1` in the
+   corpus silently becomes an intersection with a negative literal.
+5. **`_xlfn.SINGLE(x)` and `@x` unify into one node.** Same operator,
+   two spellings: the node carries a `form` discriminator and the
+   original callee text, so downstream sees one shape and the printer
+   still hands back what was written. Unification requires exactly one
+   argument; anything else stays an ordinary call for the registry to
+   reject on arity.
+6. **`;` outside braces is `FormulaLocaleSensitiveInput`, not a syntax
+   error.** Inside braces it is the array row separator. The tokenizer
+   emits `.arg_sep` for both bytes, so the parser re-disambiguates on
+   the byte — the one place a token kind alone is not enough.
+7. **Full-span references are matched on the tokens, before any node
+   exists.** `A:A` and `1:1` are recognised speculatively, which keeps
+   the flat node array free of orphaned operands and makes
+   `max_ast_nodes` count only live nodes. Out-of-grid spans (`XFE:XFE`,
+   `1:1048577`) are deliberately **not** full spans: they stay generic
+   ranges over names and reach §5.9, which is where `#NAME?` is
+   provable.
+8. **Structured-ref item specifiers are a set.** The canonical form
+   orders them `#All #Data #Headers #Totals #This Row` regardless of how
+   they were written, so two spellings of one selection compare equal.
+   `@` sets `this_row` and records `at_shorthand` purely as a print
+   form. A bare part starting with an unescaped `#` **must** be a known
+   item specifier — `Table1[#Nope]` is malformed, not a column named
+   `#Nope` (that is `Table1['#Nope]`).
+9. **Column names are kept raw, with their `'` escapes intact**, so
+   printing needs no allocation and no re-escaping; `decodeColumnName`
+   resolves them for the M4b1 symbol layer. The bracketing rule is
+   stricter than the grammar needs — only `,` and `:` are genuinely
+   ambiguous, but the canonical form brackets anything outside
+   letters/digits/`_`/`.`/non-ASCII, because Excel writes
+   `Table1[@[Col A]]` and a canonical `Table1[@Col A]` would be a
+   spelling no other reader emits.
+10. **Refusals are a union, not an error set.** A refusal without a span
+    is not actionable and a Zig error carries no payload, so `parse`
+    returns `Parsed{ok|refused}` and reserves `error.OutOfMemory` for
+    the only real error. Tokenizer refusals are checked **before**
+    parsing and the first in detection order wins, so the diagnostic
+    names the construct rather than whatever syntax error it went on to
+    cause.
+11. **Three of the seven §9 parse limits are dominated at defaults.** A
+    code point is at most four UTF-8 bytes and
+    `max_formula_utf8_bytes = 4 × max_formula_chars`, so the byte cap
+    can be *reached* but never exceeded first; every token spans at
+    least one code point and `max_tokens > max_formula_chars`; nodes are
+    bounded by tokens. All three stay enforced and boundary-tested at
+    lowered ceilings, because `Limits` is caller-adjustable.
+12. **"No lost bytes" is an invariant, not a test.** `parse` accumulates
+    every consumed token's length — speculative matches rewind it with
+    the cursor — and asserts the total equals the input length on
+    success; `trailing_input` is what makes reaching the end mandatory.
+    Since M1a proved the tokens tile the input exactly, that total is a
+    proof no byte was skipped. The fuzz target adds the structural half:
+    spans nest inside their parent, and siblings are ordered and
+    disjoint.
+13. **Oracle pinning is by fidelity.** `ieee` manifests are compared
+    bit-exactly; `excel` manifests to 15 significant digits, which is
+    §5.4's own display rule — an excel-fidelity manifest records
+    `0.1+0.2` as `0.3`, so demanding exact bits there would test zlsx
+    against a rounding policy M3a1 has not landed. The tolerance cannot
+    blur a precedence question: the discriminating cases differ by a
+    factor of 8 (`2^3^2` = 64 vs 512) and by sign (`-1^2` = 1 vs −1).
+14. **`&` and the reference-operator ranks are spec-pinned, not
+    oracle-pinned.** No committed manifest mixes `&` with `+` or with a
+    comparison, and none exercises `,` or the intersection space. They
+    ship as fixtures **labelled as such** rather than claimed as
+    oracle-derived; closing that gap needs new oracle cases, not a new
+    parser.
+15. **§5.9 ships as a spec artifact plus classification, not
+    resolution.** There is no workbook at M2. The parser records
+    call-vs-value use, the peeled prefix layers, the original spelling,
+    and the `_xlnm.` flag; both resolution orders are exported as
+    checked arrays that M4b3 consumes.
+
+**Deferred to M10+:** call classification when whitespace separates the
+name from `(` (decision 3) — it needs a lexer-level rule the rewriter
+shares, not a parser-local override.
+
 ### 5.3 Value model & array semantics
 
 **5.3a Types**: `ScalarValue` = number(f64, finite) | text | boolean |
