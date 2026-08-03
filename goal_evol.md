@@ -45,7 +45,11 @@ implementable goals for a fresh session in this repo.*
 | Z4 | **Hidden sheets invisible in CLI** — `SheetState{visible,hidden,very_hidden}` is parsed (`pkg/typed_parts/workbook_xml.zig:42`, surfaced via `Worksheet.state()` at `pkg/workbook.zig:5221`) but `list-sheets`/`meta` never print it (zero `hidden` hits in `src/cli.zig`) | grep verified 2026-07-25 | a masking pipeline must *warn* when a workbook smuggles hidden/veryHidden sheets |
 
 **Explicitly out of scope** (log as deferred, do not drift):
-- Formula evaluation, pivot/chart authoring, `.xls`/`.xlsb` (README non-goals).
+- Pivot/chart authoring, `.xls`/`.xlsb` (README non-goals).
+- ~~Formula evaluation~~ — out of scope **for this work order**, but no
+  longer out of scope for the project: D1 was reversed on 2026-08-02 and
+  has its own ladder in `goal_formula.md`. Nemonym still must not drift
+  into it.
 - Masking string literals *inside formulas* — needs a formula text
   rewriter beyond `formula_rewriter`'s ref-rewriting; nemonym-side
   concern for now, note it in `docs/plans/` and move on.

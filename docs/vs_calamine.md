@@ -61,7 +61,7 @@ Calamine's `Data` enum vs zlsx's `Cell` union:
 | Sheet visibility (hidden/visible) | ✓ (`SheetVisible` enum) | ✗ |
 | Sheet type (worksheet/chartsheet/dialog) | ✓ (`SheetType` enum) | ✗ *(zlsx indexes all `xl/worksheets/*.xml` indiscriminately)* |
 | Defined names (named ranges) | `reader.defined_names() → &[(String, String)]` | ✗ |
-| Formulas (not cached values) | `reader.worksheet_formula(name) → Range<String>` | ✗ *(zlsx reads `<v>`; the `<f>` child is skipped)* |
+| Formulas (not cached values) | `reader.worksheet_formula(name) → Range<String>` | ✓ *(`Rows.formulaStrings()` / `Rows.formulaRefs()`, `src/xlsx.zig:1739-1770`; own formulas plus shared- and array-formula slaves, surfaced by the CLI as `t:"formula"` + `formula:<text>`)* |
 | Cached formula result | ✓ via `Data` in the range | ✓ via `Cell` (same `<v>` we all read) |
 | Merged cell regions | ✗ *(per the 0.26 Reader trait, merged regions are not exposed — they're in XML but calamine currently doesn't surface them in its stable API)* | ✗ |
 | Pictures / embedded images | `reader.pictures() → Option<Vec<(String, Vec<u8>)>>` | ✗ |
@@ -87,7 +87,7 @@ Calamine's `Data` enum vs zlsx's `Cell` union:
 | Freeze panes (top rows + left cols) | — | ✓ |
 | Auto-filter (A1-style range) | — | ✓ |
 | Load → modify → save round-trip | — | ✗ *(Phase 3c queued — preserves only what zlsx parses today)* |
-| Formulas (`<f>` emission on write) | — | ✗ *(explicitly out of scope; writer emits cached values only)* |
+| Formulas (`<f>` emission on write) | — | ✓ *(`SheetWriter.writeRowWithFormulas`, `src/writer.zig:992`; emits `<f>` plus the caller-supplied cached `<v>`)* |
 | Pictures / charts / pivots | — | ✗ *(out of scope)* |
 
 ## Ownership model

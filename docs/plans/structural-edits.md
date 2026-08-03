@@ -121,6 +121,11 @@ is a real textual transform — same shape as column rewrite below.
 For `deleteRow`: any formula that explicitly references the
 deleted row becomes `#REF!`. Excel handles this on next save;
 v1 leaves the formula text intact and lets Excel recompute.
+*(Historical: "lets Excel recompute" was the only option when this
+was written. D1 was reversed 2026-08-02 — once recalculation lands
+on the save path, `goal_formula.md` M5d2, deferring to Excel becomes
+a choice rather than the sole outcome. The v1 behaviour described
+here is unchanged.)*
 
 ### Phasing — 4 iters
 

@@ -141,7 +141,7 @@ wraparound).
 | **Convenience: Python binding setCell+lifecycle tests** | ✅ shipped (PR #42 — Editor C ABI round-trip; documented gap: Workbook overlay surface NOT yet exposed in C ABI, so binding still uses `Editor`) |
 | **Bench: appendRows wall-clock harness** | ✅ shipped (PR #69 — `tests/bench/bench_append_rows.zig` + `zig build bench-append-rows`; baseline 174 ms median on 100k×5; gate ceiling for iter-er-3 at 191.4 ms) |
 | **Fix: writer.zig Huffman u15 → u13 freq scale** | ✅ shipped (PR #70 — `lit_enc.generate(&lit_freq, 15)` crashed inside `std.compress.flate.HuffmanEncoder.bitCounts` on `<sheetData>` payloads ≥ ~10k repetitive numeric rows; tightening `scaleFreqs` cap to u13 gives the level walker enough numerical headroom to converge; output is still valid DEFLATE; 50_000×5 round-trip regression test) |
-| **D1** Formula evaluator | deferred indefinitely |
+| **D1** Formula evaluator | **planned** — reversed 2026-08-02; full ladder (41 rows, M-1 … M9d) in `goal_formula.md` |
 | **D2** Typed chart emit | deferred |
 | **Refusal lift: frozen panes** | ✅ shipped 2026-05-11 — `pkg/sheet_edit.zig` shifts `xSplit`/`ySplit` + `topLeftCell` for `state="frozen"` / `state="frozenSplit"` panes during the row/col byte transform; editor refusal guards dropped the `<pane>` scan; `state="split"` (pixel offsets) surfaces `error.SplitPaneNotSupported`. 11 pure-function tests on the byte transform + 4 Editor round-trip tests pin the lift. |
 | **Refusal lift: autoFilter** | ✅ shipped 2026-05-14 — `pkg/sheet_edit.zig::processAutoFilterTagRow`/`processAutoFilterTagCol` shifts the row/col halves of `<autoFilter ref>` during the byte transform; full-range collapse drops the element; `<filterColumn colId="N">` children rebase to `new_abs - new_tl_col` on col edits, with the filterColumn at the deleted column dropped entirely. Editor row+col guards no longer scan for `<autoFilter`. 11 pure-function tests + 4 Editor round-trip tests pin the lift. Caveat: nested `<sortState ref>` is now handled when the `<autoFilter>` lives inside a `<table>` (via the tableParts lift's outer walker — see row below). Sheet-bare open-form `<autoFilter>` with nested `<sortState>` remains uncovered (third-party files only; zlsx's writer never emits open-form autoFilter). |
@@ -207,8 +207,10 @@ CI report-only) ship inside a quarter. Foundational work is a 4–6+
 month effort organised as a Package store → Workbook overlay → Editor
 rebase → Writer rebase chain. Formula core (tokenizer + rewriter, no
 evaluator) and image extraction ride parallel after the part store
-exists. Pivot creation, chart creation, and a formula evaluator are
-all explicitly out of scope until production proves the prior tier.
+exists. Pivot creation and chart creation stay out of scope until
+production proves the prior tier. **The formula evaluator no longer
+does** — D1 was reversed on 2026-08-02 and now has its own ladder in
+`goal_formula.md`.
 
 ## Sequencing graph
 
@@ -239,7 +241,8 @@ all explicitly out of scope until production proves the prior tier.
                  requires the typed Worksheet model from B1.
 
                  Tier D (long-tail, optional)
-                 ├── D1 Formula evaluator (minimal)
+                 ├── D1 Formula evaluator  ← REVERSED 2026-08-02:
+                 │   now planned, own ladder (goal_formula.md)
                  ├── D2 Typed chart emit (line/bar/scatter)
                  └── (pivot creation explicitly out)
 ```
@@ -484,8 +487,8 @@ critique: tokenising formulas alone does NOT liberate structural edits
 **Approach (tightened):** tokenizer + rewriter handles formulas FIRST,
 then in successive iters expands to data-validation formulas,
 conditional-format formulas, defined names, internal hyperlink
-locations. Each iter shrinks the refusal set. Evaluator stays deferred
-to Tier D.
+locations. Each iter shrinks the refusal set. The evaluator is Tier D1
+— **no longer deferred** as of 2026-08-02; see `goal_formula.md`.
 
 **API delta:**
 ```zig
@@ -595,16 +598,26 @@ D-tier and keep `addImage` cell-anchor-only.
 
 ## Tier D — Long-tail, optional
 
-### D1. Formula evaluator — minimal (deferred indefinitely)
+### D1. Formula evaluator — **planned** (reversed 2026-08-02)
 
-After C1 has at least one quarter of production bake. Covers literals,
-arithmetic / comparison, cell+range refs, `SUM`, `MIN`, `MAX`,
-`AVERAGE`, `IF`, boolean ops, errors. Writes updated cached `<v>` for
-supported formulas; otherwise marks recalc-on-open.
+**This row's "deferred indefinitely" status was reversed on 2026-08-02.**
+The evaluator is now a planned tier with its own ladder — 41 rows,
+M-1 … M9d — specified in full in `goal_formula.md`. That document, not
+this section, is normative for D1 scope, sequencing, and gates.
 
-**Per critique:** an evaluator will consume the project if allowed.
-Stay optional indefinitely; only build if a concrete user demand
-appears.
+The minimal sketch this section used to carry (literals, arithmetic /
+comparison, cell+range refs, `SUM`, `MIN`, `MAX`, `AVERAGE`, `IF`,
+boolean ops, errors) is superseded: v1 freezes a far larger registry and
+adds recalculation on the save path, a CLI surface, C ABI + Python, and
+Spark batch recalc.
+
+> **Historical (pre-2026-08-02) critique, kept for the record:** "an
+> evaluator will consume the project if allowed. Stay optional
+> indefinitely; only build if a concrete user demand appears." The
+> reversal answers this with a bounded, oracle-gated ladder and a
+> refuse-rather-than-half-do contract rather than by dropping the
+> concern — see `goal_formula.md` §1 (What / Why — the D1 reversal),
+> §3 (constraints) and §14 (risks).
 
 ### D2. Typed chart emit (deferred)
 

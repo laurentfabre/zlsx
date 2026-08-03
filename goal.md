@@ -242,7 +242,11 @@ Next, in value order:
 4. **Route `<xm:f>` through the formula rewriter** — removes #140's
    `ExtensionEditUnsafe` guard, which today refuses row/col edits on any sheet
    carrying a sparkline formula. Needs a sheet-name context `sheet_edit.zig`
-   does not have. The highest-value remaining lift.
+   does not have. The highest-value remaining lift. **No longer standalone**
+   as of 2026-08-02: the D1 ladder (`goal_formula.md`) builds the parser and
+   name-resolution layer this needs, so the route-through is pullable once
+   M2 lands and is carried on that plan's M10+ backlog. Doing it before M2
+   means building the sheet-name context twice.
 5. **Cross-part pivot rewriter** — removes #139's refusal. Bigger lift:
    `<location ref>` + cache field ranges across `xl/pivotTables/*` and
    `xl/pivotCache/*`, a ref graph zlsx has never walked.
