@@ -842,6 +842,41 @@ pub fn build(b: *std.Build) void {
     });
     fuzz_step.dependOn(&b.addRunArtifact(formula_calc_fuzz_tests).step);
 
+    // M4b3: the `CT_DefinedName` and `CT_TableFormula` inventories,
+    // §5.9's resolution drivers, and the 3D reference matrix. Its own
+    // module for the reason `calc.zig` has one — the tables and the
+    // matrix must stay provable without the symbol layer that consumes
+    // them, and this file is the one the symbol layer imports.
+    const formula_names_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/names.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_names_mod.addImport("zlsx_refs", refs_mod);
+    formula_names_mod.addImport("zlsx_xid", xid_mod);
+    formula_names_mod.addImport("zlsx_casefold", unicode_mod);
+    addOracleFixtures(b, formula_names_mod);
+    const formula_names_tests = b.addTest(.{ .root_module = formula_names_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_names_tests).step);
+
+    // M4b3: the name/3D fuzz target (§8.1) — no defined-name attribute
+    // string and no 3D span may panic, leak, or resolve two ways.
+    const formula_names_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/names.zig"),
+        .target = target,
+        .optimize = optimize,
+        .fuzz = true,
+    });
+    formula_names_fuzz_mod.addImport("zlsx_refs", refs_mod);
+    formula_names_fuzz_mod.addImport("zlsx_xid", xid_mod);
+    formula_names_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
+    addOracleFixtures(b, formula_names_fuzz_mod);
+    const formula_names_fuzz_tests = b.addTest(.{
+        .root_module = formula_names_fuzz_mod,
+        .test_runner = fuzz_test_runner,
+    });
+    fuzz_step.dependOn(&b.addRunArtifact(formula_names_fuzz_tests).step);
+
     // M4b1: the decode fuzz target (§8.1) — no input may panic, leak,
     // or produce a decode that differs between two runs.
     const formula_decode_fuzz_mod = b.createModule(.{

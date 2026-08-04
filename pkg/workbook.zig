@@ -1173,6 +1173,99 @@ pub const Workbook = struct {
         return self.workbook.calc;
     }
 
+    /// **Internal (§5.6f).** Evaluate one formula against this
+    /// workbook's *cached* values.
+    ///
+    /// Cache-based, and that is the whole contract at this row: a
+    /// referenced formula cell yields the `<v>` the file already
+    /// carries, a formula cell with no cached value reads as blank, and
+    /// nothing is recomputed to make either true. Dependency-closure
+    /// evaluation — the thing that would make `A1` reflect a `B1` this
+    /// run changed — is M5a's, and the two behaviors are tested side by
+    /// side so the switch is never silent.
+    ///
+    /// Not exposed anywhere: §5.6f puts the CLI at M6, the C ABI and
+    /// Python at M9a and Spark at M9b, all after closure semantics
+    /// exist. A caller reaching this before then would get answers that
+    /// change meaning under it.
+    ///
+    /// **Purity.** Scratch-only. Everything the run produces lives in
+    /// the returned arena; the workbook's logical state and its
+    /// serialized bytes are identical before and after, on success, on
+    /// refusal and on a run that ran out of budget or memory. Gated by
+    /// byte-identity tests over all four.
+    pub fn evaluate(
+        self: *Workbook,
+        allocator: Allocator,
+        sheet_index: u32,
+        formula: []const u8,
+        opts: EvaluateOptions,
+    ) Error!EvaluateResult {
+        if (sheet_index >= self.worksheets.len) return Error.SheetNotFound;
+
+        var model = switch (try WorkbookEnv.build(allocator, self, .{
+            .collation = opts.collation,
+            .fidelity = opts.fidelity,
+            .limits = opts.limits,
+        })) {
+            .ok => |m| m,
+            .refused => |r| return .{ .refused = r },
+        };
+        defer model.deinit();
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        var keep = false;
+        defer if (!keep) arena.deinit();
+        const a = arena.allocator();
+
+        var parsed = try engine.parser.parse(a, formula, .{ .limits = opts.parse_limits });
+        const ast = switch (parsed) {
+            .ok => |x| x,
+            .refused => |r| {
+                parsed.deinit(a);
+                return .{ .parse_refused = r };
+            },
+        };
+
+        // Standalone eval draws nothing: no v1 volatile function is
+        // reachable from a cache-based read, and a draw source that
+        // produced numbers would make the same call answer differently
+        // twice. A run that reaches one trips the assertion rather than
+        // inventing a value.
+        var draws = engine.eval.DrawSource.constant(&unreachable_draw);
+        var resolution: engine.NameResolution = .{ .table = &model.symbols, .gpa = allocator };
+
+        var evaluator = engine.eval.Evaluator.init(a, model.evalEnv(), .{
+            .current_sheet = engine.env.SheetIndex.fromInt(sheet_index),
+            .collation = opts.collation,
+            .draws = &draws,
+            .fidelity = opts.fidelity,
+            .dialect = opts.dialect,
+            .site = opts.site,
+            .names = resolution.resolver(),
+            .array_formula = opts.array_formula,
+            .limits = opts.parse_limits,
+        });
+        defer evaluator.deinit();
+
+        const v = evaluator.evaluate(ast) catch |e| {
+            if (e == error.OutOfMemory) return Error.OutOfMemory;
+            return .{ .eval_refused = .{
+                .plane = engine.eval.planeTwo(e),
+                .name = resolution.last_refusal,
+                .three_d = evaluator.last_three_d,
+            } };
+        };
+        // Text in the result may still borrow the *model's* arena — a
+        // cached `<v>` read straight out of a part — and the model dies
+        // at this function's `defer`. Copying is what makes the
+        // returned arena the whole lifetime the caller has to track.
+        const owned = try cloneEvaluated(a, v);
+
+        keep = true;
+        return .{ .ok = .{ .arena = arena, .value = owned } };
+    }
+
     /// Register a workbook-level defined name (B3 iter-wr-3 fresh-emit
     /// surface). Validates the name shape against Excel's full rule
     /// set (R1C1 reject, A1-shape reject, illegal char reject,
@@ -7464,15 +7557,108 @@ pub const FormulaRefusal = union(enum) {
     /// M4b2: the `<f>` attribute inventory, the shared topology, and
     /// the workbook's calc state.
     calc: engine.calc.Refusal,
+    /// M4b3: the `CT_DefinedName` and `CT_TableFormula` inventories,
+    /// the table producers, and the 3D matrix.
+    names: engine.names.Refusal,
 
     pub fn planeTwo(self: FormulaRefusal) engine.decode.PlaneTwo {
         return switch (self) {
             .decode => |r| r.planeTwo(),
             .metadata => |r| r.planeTwo(),
             .calc => |r| r.planeTwo(),
+            .names => |r| r.planeTwo(),
         };
     }
 };
+
+// ─── standalone evaluation (§5.6f, M4b3) ─────────────────────────
+
+pub const EvaluateOptions = struct {
+    /// §5.4b's fold, injected — the same parameter `FormulaEnvOptions`
+    /// takes, for the same reason.
+    collation: engine.value.Collation,
+    fidelity: engine.value.Fidelity = .excel,
+    /// §5.3b. Standalone eval states its dialect; recalc reads each
+    /// stored cell's.
+    dialect: engine.value.Dialect = .dynamic_array,
+    /// Where a site-dependent construct (`@`) is being evaluated.
+    /// Absent refuses rather than guessing a row (§5.5).
+    site: ?engine.eval.EvalSite = null,
+    /// Whether the formula is a declared CSE/DA array formula (§5.6g).
+    array_formula: bool = false,
+    /// §9's bounds on *modeling the workbook* — cells, parts, depth.
+    limits: engine.decode.Limits = .{},
+    /// §9's bounds on *the formula* — tokens, nodes, nesting. Two
+    /// structs because they bound two different things, and M2 named
+    /// the second one before the first existed.
+    parse_limits: engine.parser.Limits = .{},
+};
+
+/// One evaluation's result, and the arena that owns every byte of it.
+pub const Evaluation = struct {
+    arena: std.heap.ArenaAllocator,
+    value: engine.eval.Value,
+
+    pub fn deinit(self: *Evaluation) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const EvaluateResult = union(enum) {
+    ok: Evaluation,
+    /// The workbook could not be modeled: a decode, metadata, calc or
+    /// name refusal, raised before a byte was evaluated.
+    refused: FormulaRefusal,
+    /// The formula did not parse (§5.2).
+    parse_refused: engine.parser.Refusal,
+    /// It parsed and the evaluator refused it (§10, plane 2). The two
+    /// resolvers' typed reasons ride along, because the plane alone
+    /// cannot say *which* name or *which* 3D rule.
+    eval_refused: struct {
+        plane: engine.decode.PlaneTwo,
+        name: ?engine.decode.Refusal = null,
+        three_d: ?engine.names.Refusal = null,
+    },
+
+    pub fn deinit(self: *EvaluateResult) void {
+        switch (self.*) {
+            .ok => |*e| e.deinit(),
+            else => {},
+        }
+        self.* = undefined;
+    }
+};
+
+/// A cache-based read draws nothing that varies. `RAND` is reachable
+/// from the registry, so the seam has to answer *something*; answering
+/// one fixed number keeps the same call from returning two values in
+/// one session, which is the property a cache-based evaluation is for.
+/// M5d wires `rng_v1` from `RunInputs`, where a draw has a schedule.
+var unreachable_draw: f64 = 0.5;
+
+/// Deep-copy an evaluated value into `a`.
+fn cloneEvaluated(a: Allocator, v: engine.eval.Value) Error!engine.eval.Value {
+    return switch (v) {
+        .scalar => |s| .{ .scalar = try cloneScalar(a, s) },
+        .missing_arg => .missing_arg,
+        .array => |m| blk: {
+            const cells = try a.alloc(engine.value.ScalarValue, m.cells.len);
+            for (m.cells, cells) |src, *dst| dst.* = try cloneScalar(a, src);
+            break :blk .{ .array = .{ .rows = m.rows, .cols = m.cols, .cells = cells } };
+        },
+        // `Evaluator.evaluate` dereferences a reference result through
+        // §5.3b before returning, so one cannot arrive here.
+        .reference => unreachable,
+    };
+}
+
+fn cloneScalar(a: Allocator, s: engine.value.ScalarValue) Error!engine.value.ScalarValue {
+    return switch (s) {
+        .text => |t| .{ .text = try a.dupe(u8, t) },
+        else => s,
+    };
+}
 
 pub const FormulaEnvOptions = struct {
     /// §5.4b's fold, injected rather than imported — `value.zig` keeps
@@ -7590,13 +7776,24 @@ pub const WorkbookEnv = struct {
         var builder = engine.Builder.init(allocator, opts.collation);
         defer builder.deinit();
         for (wb.workbook.sheets) |s| try builder.addSheet(s.name);
-        for (wb.definedNames()) |dn| {
-            try builder.addName(
-                dn.name,
-                dn.formula,
-                if (dn.local_sheet_id) |id| engine.env.SheetIndex.fromInt(id) else null,
-                dn.hidden,
-            );
+
+        // M4b3: the names come from the part, not from `definedNames()`.
+        // The typed view keeps four fields and drops the attribute
+        // region (`workbook_xml.zig:58-68`), and the attribute region is
+        // exactly what the `CT_DefinedName` inventory is about — three
+        // of the twelve dropped attributes mean the name is a macro
+        // entry point rather than a value.
+        var defined = switch (try engine.names.scanDefinedNames(allocator, wb_part.bytes)) {
+            .ok => |d| d,
+            .refused => |r| return .{ .refused = .{ .names = r } },
+        };
+        defer defined.deinit();
+        for (defined.rows) |dn| {
+            try builder.addName(dn.raw_identifier, dn.raw_body, .{
+                .scope = if (dn.local_sheet_id) |id| engine.env.SheetIndex.fromInt(id) else null,
+                .hidden = dn.hidden,
+                .attr_refusal = dn.refusal_when_referenced,
+            });
         }
 
         // §9's `max_modeled_cells` bounds the whole model, so each
@@ -7668,6 +7865,13 @@ pub const WorkbookEnv = struct {
                     .refused => |r| return .{ .refused = .{ .decode = r } },
                 };
                 defer table.deinit();
+                // M4b3: a table's producers, and the members they must
+                // have been materialized into. A calculated column that
+                // one data cell has no `<f>` for is a column this
+                // engine would recalculate as a blank.
+                if (try checkTableProducers(table, scanned.cells, formulas)) |r| {
+                    return .{ .refused = .{ .names = r } };
+                }
                 try builder.addTable(engine.env.SheetIndex.fromInt(idx), table);
             }
 
@@ -8186,6 +8390,110 @@ const SharedTextResult = union(enum) {
 ///
 /// Every refusal below is a normal return, so nothing may lean on
 /// `errdefer` to release `out` — hence the explicit `keep`.
+/// The sheet's cells, as M4b3's producer check asks about them.
+///
+/// `cells` is row-major and `formulas` is parallel to it (a slave's
+/// entry is its master's translated text), so "does this coordinate
+/// carry a formula" is a binary search rather than a scan — a
+/// calculated column over a 100 000-row table would otherwise be
+/// quadratic.
+const ProducerCells = struct {
+    cells: []const engine.decode.SheetCell,
+    formulas: []const ?[]const u8,
+
+    pub fn hasFormula(self: ProducerCells, row: coords.Row, col: coords.Col) bool {
+        var lo: usize = 0;
+        var hi: usize = self.cells.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const c = self.cells[mid];
+            if (c.row.oneBased() < row.oneBased() or
+                (c.row == row and c.col.zeroBased() < col.zeroBased()))
+            {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo >= self.cells.len) return false;
+        const hit = self.cells[lo];
+        if (hit.row != row or hit.col != col) return false;
+        return self.formulas[lo] != null;
+    }
+};
+
+/// §5.9's table producers, over one table and the sheet it sits on.
+///
+/// Two questions, in order: does every producer element's attribute
+/// region pass the `CT_TableFormula` inventory, and was every member
+/// cell the producer covers actually materialized with its own `<f>`.
+/// The second is the one that matters — Excel writes the producer into
+/// each data cell, so the part and the sheet say the same thing twice,
+/// and an engine that writes values back cannot pick a side when they
+/// disagree.
+fn checkTableProducers(
+    table: engine.decode.Table,
+    cells: []const engine.decode.SheetCell,
+    formulas: []const ?[]const u8,
+) Error!?engine.names.Refusal {
+    // A table whose `ref` will not parse is not this row's refusal —
+    // the geometry is unusable, so there is no member set to check.
+    const ref = coords.parseRange(table.ref, .{ .dollar = .accept }) catch return null;
+    const members: ProducerCells = .{ .cells = cells, .formulas = formulas };
+
+    for (table.columns, 0..) |column, i| {
+        const col_index = ref.first.col.zeroBased() + @as(u32, @intCast(i));
+        const col = coords.Col.fromZeroBased(col_index) catch continue;
+
+        if (column.calculated_formula) |text| {
+            switch (engine.names.classifyTableFormula(
+                .calculated_column,
+                column.calculated_attrs,
+                text,
+                0,
+            )) {
+                .refused => |r| return r,
+                .ok => {},
+            }
+            if (engine.names.producerSpan(
+                .calculated_column,
+                ref,
+                table.header_rows,
+                table.totals_rows,
+                col,
+            )) |span| {
+                if (engine.names.checkProducerMembers(ProducerCells, members, span)) |r| {
+                    return r;
+                }
+            }
+        }
+
+        if (column.totals_formula) |text| {
+            switch (engine.names.classifyTableFormula(
+                .totals_row,
+                column.totals_attrs,
+                text,
+                0,
+            )) {
+                .refused => |r| return r,
+                .ok => {},
+            }
+            if (engine.names.producerSpan(
+                .totals_row,
+                ref,
+                table.header_rows,
+                table.totals_rows,
+                col,
+            )) |span| {
+                if (engine.names.checkProducerMembers(ProducerCells, members, span)) |r| {
+                    return r;
+                }
+            }
+        }
+    }
+    return null;
+}
+
 fn sharedFormulaText(
     gpa: Allocator,
     arena: Allocator,
@@ -14813,7 +15121,15 @@ test "M4b1: a table part joins the symbol layer with its formulas decoded" {
     const sheet = try std.fmt.allocPrint(
         ta,
         "<?xml version=\"1.0\"?><worksheet xmlns=\"{s}\">" ++
-            "<sheetData><row r=\"1\"><c r=\"A1\"><v>1</v></c></row></sheetData>" ++
+            "<sheetData><row r=\"1\"><c r=\"A1\"><v>1</v></c></row>" ++
+            // The calculated column below covers B2:B4, and Excel
+            // materializes a producer into every member cell — M4b3
+            // refuses a table whose members are missing, so a fixture
+            // without them would be a table Excel never wrote.
+            "<row r=\"2\"><c r=\"B2\"><f>1</f><v>1</v></c></row>" ++
+            "<row r=\"3\"><c r=\"B3\"><f>1</f><v>1</v></c></row>" ++
+            "<row r=\"4\"><c r=\"B4\"><f>1</f><v>1</v></c></row>" ++
+            "</sheetData>" ++
             "<tableParts count=\"1\"><tablePart r:id=\"rIdT1\"/></tableParts></worksheet>",
         .{test_ns_main},
     );
@@ -15398,4 +15714,348 @@ test "M4b2: a broken shared topology refuses the build, typed" {
         engine.decode.PlaneTwo.FormulaDataTableUnsupported,
         dt.planeTwo(),
     );
+}
+
+// ─── M4b3: names, table producers, and cache-based `evaluate` ─────
+
+fn m4b3Sheet(allocator: Allocator, body: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "<?xml version=\"1.0\"?><worksheet xmlns=\"{s}\"><sheetData>{s}</sheetData></worksheet>",
+        .{ test_ns_main, body },
+    );
+}
+
+/// Every part's bytes, as the store would hand them out right now.
+/// The serialized-byte half of §5.6f's purity contract: `evaluate`
+/// may not change one of them.
+fn partSnapshot(allocator: Allocator, wb: *Workbook) ![]const []const u8 {
+    const out = try allocator.alloc([]const u8, wb.store.parts.len);
+    errdefer allocator.free(out);
+    for (wb.store.parts, out) |p, *dst| {
+        const cur = (try wb.store.part(p.name)) orelse return error.MissingPart;
+        dst.* = try allocator.dupe(u8, cur.bytes);
+    }
+    return out;
+}
+
+fn expectSnapshotUnchanged(allocator: Allocator, wb: *Workbook, before: []const []const u8) !void {
+    const after = try partSnapshot(allocator, wb);
+    defer {
+        for (after) |b| allocator.free(b);
+        allocator.free(after);
+    }
+    try std.testing.expectEqual(before.len, after.len);
+    for (before, after) |a, b| try std.testing.expectEqualSlices(u8, a, b);
+}
+
+fn freeSnapshot(allocator: Allocator, snap: []const []const u8) void {
+    for (snap) |b| allocator.free(b);
+    allocator.free(snap);
+}
+
+test "M4b3: evaluate reads cached values, and an uncached formula cell is blank" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // A1 is a plain number. B1 is a formula WITH a cached value that
+    // disagrees with its own formula, which is the whole point: a
+    // cache-based read returns the cache. C1 is a formula with no
+    // cached value at all.
+    const body =
+        "<row r=\"1\">" ++
+        "<c r=\"A1\"><v>2</v></c>" ++
+        "<c r=\"B1\"><f>A1*10</f><v>999</v></c>" ++
+        "<c r=\"C1\"><f>A1+1</f></c>" ++
+        "</row>";
+    const sheet = try m4b3Sheet(ta, body);
+    defer ta.free(sheet);
+
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+    defer wb.deinit();
+
+    // The cache, not a recomputation of `A1*10` (which would be 20).
+    var r1 = try wb.evaluate(ta, 0, "B1", .{ .collation = test_collation });
+    defer r1.deinit();
+    try std.testing.expectEqual(@as(f64, 999), r1.ok.value.scalar.number);
+
+    // No cached value: blank, which in a sum is zero. Not `A1+1`.
+    var r2 = try wb.evaluate(ta, 0, "SUM(C1,100)", .{ .collation = test_collation });
+    defer r2.deinit();
+    try std.testing.expectEqual(@as(f64, 100), r2.ok.value.scalar.number);
+
+    // …and no dependency closure: `B1` stays its cached 999 inside a
+    // larger expression too. M5a is what changes this answer, and the
+    // two behaviors are meant to be told apart.
+    var r3 = try wb.evaluate(ta, 0, "B1+A1", .{ .collation = test_collation });
+    defer r3.deinit();
+    try std.testing.expectEqual(@as(f64, 1001), r3.ok.value.scalar.number);
+}
+
+test "M4b3: evaluate mutates neither logical state nor serialized bytes" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const sheet = try m4b3Sheet(
+        ta,
+        "<row r=\"1\"><c r=\"A1\"><v>2</v></c><c r=\"B1\"><f>A1*10</f><v>20</v></c></row>",
+    );
+    defer ta.free(sheet);
+    // Two names that expand into each other: the interim depth guard is
+    // what stops them, and it stops a run that has already read cells.
+    var wb = try testWorkbookFromPartsWithNames(
+        ta,
+        io,
+        &.{.{ .name = "S", .body = sheet }},
+        null,
+        "<definedNames>" ++
+            "<definedName name=\"Ping\">Pong</definedName>" ++
+            "<definedName name=\"Pong\">Ping</definedName>" ++
+            "</definedNames>",
+    );
+    defer wb.deinit();
+
+    const before = try partSnapshot(ta, &wb);
+    defer freeSnapshot(ta, before);
+    // 1. Success.
+    var ok = try wb.evaluate(ta, 0, "A1+B1", .{ .collation = test_collation });
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(f64, 22), ok.ok.value.scalar.number);
+    try expectSnapshotUnchanged(ta, &wb, before);
+
+    // 2. Refusal — an unregistered function, refused mid-run.
+    var refused = try wb.evaluate(ta, 0, "VLOOKUP(1,A1:B1,2)", .{ .collation = test_collation });
+    defer refused.deinit();
+    try std.testing.expectEqual(
+        engine.decode.PlaneTwo.FormulaUnsupportedFunction,
+        refused.eval_refused.plane,
+    );
+    try expectSnapshotUnchanged(ta, &wb, before);
+
+    // 3. A run cut short partway through — the cancellation-shaped path
+    //    available at this row (a cancel token is M5d1's). `A1+B1` are
+    //    read, then the name expansion hits its depth guard and the
+    //    whole run abandons with a §9 limit.
+    var cut = try wb.evaluate(ta, 0, "A1+B1+Ping", .{ .collation = test_collation });
+    defer cut.deinit();
+    try std.testing.expectEqual(
+        engine.decode.PlaneTwo.FormulaLimitExceeded,
+        cut.eval_refused.plane,
+    );
+    try expectSnapshotUnchanged(ta, &wb, before);
+
+    // …and a formula the parser refuses outright, which never reaches
+    // the evaluator at all.
+    var short = try wb.evaluate(ta, 0, "A1+B1+A1+B1", .{
+        .collation = test_collation,
+        .parse_limits = .{ .max_tokens = 3 },
+    });
+    defer short.deinit();
+    try std.testing.expect(short == .parse_refused);
+    try expectSnapshotUnchanged(ta, &wb, before);
+
+    // 4. And a workbook-level refusal, raised before evaluation began.
+    var bad = try wb.evaluate(ta, 0, "((((", .{ .collation = test_collation });
+    defer bad.deinit();
+    try std.testing.expect(bad == .parse_refused);
+    try expectSnapshotUnchanged(ta, &wb, before);
+}
+
+test "M4b3: evaluate resolves defined names through §5.9's order" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const s0 = try m4b3Sheet(ta, "<row r=\"1\"><c r=\"A1\"><v>7</v></c></row>");
+    defer ta.free(s0);
+    const s1 = try m4b3Sheet(ta, "<row r=\"2\"><c r=\"B2\"><v>11</v></c></row>");
+    defer ta.free(s1);
+
+    const names_xml = "<definedNames>" ++
+        "<definedName name=\"Rate\">S0!$A$1</definedName>" ++
+        "<definedName name=\"Rate\" localSheetId=\"1\">S1!$B$2</definedName>" ++
+        "<definedName name=\"Macro\" vbProcedure=\"1\">Module1.Go</definedName>" ++
+        "<definedName name=\"Floating\">S0!A1</definedName>" ++
+        "</definedNames>";
+
+    var wb = try testWorkbookFromPartsWithNames(ta, io, &.{
+        .{ .name = "S0", .body = s0 },
+        .{ .name = "S1", .body = s1 },
+    }, null, names_xml);
+    defer wb.deinit();
+
+    // Shadowing, both directions, end to end.
+    var from0 = try wb.evaluate(ta, 0, "Rate", .{ .collation = test_collation });
+    defer from0.deinit();
+    try std.testing.expectEqual(@as(f64, 7), from0.ok.value.scalar.number);
+    var from1 = try wb.evaluate(ta, 1, "Rate", .{ .collation = test_collation });
+    defer from1.deinit();
+    try std.testing.expectEqual(@as(f64, 11), from1.ok.value.scalar.number);
+
+    // A macro name refuses when referenced, and says which rule.
+    var macro = try wb.evaluate(ta, 0, "Macro+1", .{ .collation = test_collation });
+    defer macro.deinit();
+    try std.testing.expectEqual(
+        engine.decode.PlaneTwo.FormulaUnsupportedConstruct,
+        macro.eval_refused.plane,
+    );
+    try std.testing.expectEqual(
+        engine.decode.Refusal.Reason.macro_defined_name,
+        macro.eval_refused.name.?.reason,
+    );
+
+    // A relative body refuses too, on its own reason.
+    var floating = try wb.evaluate(ta, 0, "Floating", .{ .collation = test_collation });
+    defer floating.deinit();
+    try std.testing.expectEqual(
+        engine.decode.Refusal.Reason.relative_reference_name,
+        floating.eval_refused.name.?.reason,
+    );
+
+    // A spelling nothing names is `#NAME?` — a value, not a refusal.
+    var missing = try wb.evaluate(ta, 0, "Nope", .{ .collation = test_collation });
+    defer missing.deinit();
+    try std.testing.expectEqual(
+        engine.value.KnownError.name,
+        missing.ok.value.scalar.err.known,
+    );
+
+    // The workbook was never touched by any of it.
+    const snap = try partSnapshot(ta, &wb);
+    defer freeSnapshot(ta, snap);
+    try expectSnapshotUnchanged(ta, &wb, snap);
+}
+
+test "M4b3: an unknown CT_DefinedName attribute refuses before the model is built" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const sheet = try m4b3Sheet(ta, "<row r=\"1\"><c r=\"A1\"><v>1</v></c></row>");
+    defer ta.free(sheet);
+    var wb = try testWorkbookFromPartsWithNames(
+        ta,
+        io,
+        &.{.{ .name = "S", .body = sheet }},
+        null,
+        "<definedNames><definedName name=\"N\" futureThing=\"1\">S!$A$1</definedName></definedNames>",
+    );
+    defer wb.deinit();
+
+    const r = try expectRefused(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    try std.testing.expectEqual(
+        engine.names.Refusal.Reason.unknown_defined_name_attribute,
+        r.names.reason,
+    );
+    try std.testing.expectEqual(engine.decode.PlaneTwo.FormulaUnsupportedConstruct, r.planeTwo());
+}
+
+test "M4b3: a table producer whose member cell has no <f> refuses" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // B2 and B4 carry the materialized producer; B3 does not, and
+    // recalculating B3 as a blank is what this refusal prevents.
+    const sheet = try std.fmt.allocPrint(
+        ta,
+        "<?xml version=\"1.0\"?><worksheet xmlns=\"{s}\"><sheetData>" ++
+            "<row r=\"2\"><c r=\"B2\"><f>1</f><v>1</v></c></row>" ++
+            "<row r=\"3\"><c r=\"B3\"><v>1</v></c></row>" ++
+            "<row r=\"4\"><c r=\"B4\"><f>1</f><v>1</v></c></row>" ++
+            "</sheetData><tableParts count=\"1\"><tablePart r:id=\"rIdT1\"/></tableParts></worksheet>",
+        .{test_ns_main},
+    );
+    defer ta.free(sheet);
+
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+    defer wb.deinit();
+
+    try wb.store.addPart(
+        "xl/tables/table1.xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml",
+        "<?xml version=\"1.0\"?><table xmlns=\"" ++ engine.decode.ns_main ++
+            "\" id=\"1\" name=\"T\" displayName=\"T\" ref=\"A1:B4\"><tableColumns count=\"2\">" ++
+            "<tableColumn id=\"1\" name=\"In\"/>" ++
+            "<tableColumn id=\"2\" name=\"Out\"><calculatedColumnFormula>T[In]*2</calculatedColumnFormula></tableColumn>" ++
+            "</tableColumns></table>",
+    );
+    try wb.store.addPart(
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "application/vnd.openxmlformats-package.relationships+xml",
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>",
+    );
+    try wb.store.replacePart(
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+            "<Relationship Id=\"rIdT1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/table\" Target=\"../tables/table1.xml\"/>" ++
+            "</Relationships>",
+    );
+
+    const r = try expectRefused(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    try std.testing.expectEqual(
+        engine.names.Refusal.Reason.table_member_missing_formula,
+        r.names.reason,
+    );
+
+    // The same table with B3 materialized builds clean — the refusal is
+    // about the missing member, not about producers existing.
+    const fixed = try std.fmt.allocPrint(
+        ta,
+        "<?xml version=\"1.0\"?><worksheet xmlns=\"{s}\"><sheetData>" ++
+            "<row r=\"2\"><c r=\"B2\"><f>1</f><v>1</v></c></row>" ++
+            "<row r=\"3\"><c r=\"B3\"><f>1</f><v>1</v></c></row>" ++
+            "<row r=\"4\"><c r=\"B4\"><f>1</f><v>1</v></c></row>" ++
+            "</sheetData><tableParts count=\"1\"><tablePart r:id=\"rIdT1\"/></tableParts></worksheet>",
+        .{test_ns_main},
+    );
+    defer ta.free(fixed);
+    try wb.store.replacePart("xl/worksheets/sheet1.xml", fixed);
+    var env = try expectBuilt(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    defer env.deinit();
+    try std.testing.expectEqual(@as(usize, 1), env.symbols.tables.len);
+}
+
+test "checkAllAllocationFailures: evaluate leaks nothing, and still mutates nothing" {
+    const H = struct {
+        fn run(allocator: Allocator) !void {
+            var threaded: std.Io.Threaded = .init(allocator, .{});
+            defer threaded.deinit();
+            const io = threaded.io();
+
+            const sheet = try m4b3Sheet(
+                allocator,
+                "<row r=\"1\"><c r=\"A1\"><v>2</v></c>" ++
+                    "<c r=\"B1\"><f>A1*10</f><v>20</v></c></row>",
+            );
+            defer allocator.free(sheet);
+            var wb = try testWorkbookFromPartsWithNames(
+                allocator,
+                io,
+                &.{.{ .name = "S", .body = sheet }},
+                null,
+                "<definedNames><definedName name=\"R\">S!$A$1</definedName></definedNames>",
+            );
+            defer wb.deinit();
+
+            var r = try wb.evaluate(allocator, 0, "R+B1", .{ .collation = test_collation });
+            defer r.deinit();
+            if (r != .ok) return error.WrongOutcome;
+            if (r.ok.value.scalar.number != 22) return error.WrongValue;
+
+            // An injected failure must not have left a value behind
+            // either: the parts are still what they were.
+            const part = (try wb.store.part("xl/worksheets/sheet1.xml")) orelse
+                return error.MissingPart;
+            if (std.mem.indexOf(u8, part.bytes, "<v>22</v>") != null) return error.Mutated;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, H.run, .{});
 }

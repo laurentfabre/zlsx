@@ -55,9 +55,15 @@ const coords = @import("zlsx_refs");
 /// read. One module, one set of types.
 pub const decode = @import("decode.zig");
 pub const calc = @import("calc.zig");
+pub const names = @import("names.zig");
 pub const env = @import("env.zig");
 pub const value = @import("value.zig");
 pub const metadata = @import("metadata.zig");
+/// M4b3: the adapter's `Workbook.evaluate` parses a formula and runs the
+/// evaluator, so both have to be reachable through the one module the
+/// package layer imports — for the same reason everything above is.
+pub const parser = @import("parser.zig");
+pub const eval = @import("eval.zig");
 /// Re-exported for `src/xlsx.zig`, which used to reach it by relative
 /// path. Same rule, one layer up: `rewriter.zig` and this module both
 /// contain `tokenizer.zig`, so they have to be the same module.
@@ -150,6 +156,14 @@ pub const Name = struct {
     scope: ?SheetIndex,
     hidden: bool,
     class: NameClass,
+    /// What the `CT_DefinedName` attribute inventory decided about
+    /// *referencing* this name (M4b3): `function`/`vbProcedure`/`xlm`
+    /// put `macro_defined_name` here. Null for an ordinary name.
+    ///
+    /// Carried rather than folded into `class` because the two answer
+    /// different questions — `class` is about the spelling, this is
+    /// about the attributes — and a name can be both.
+    attr_refusal: ?Refusal.Reason = null,
 };
 
 pub const Column = struct {
@@ -229,15 +243,34 @@ pub const SymbolTable = struct {
         return null;
     }
 
-    /// §5.9's order, in one pass per tier: sheet-scoped name → workbook
-    /// name → table. A `from` of null is a workbook-level context (a
-    /// name's own body, a standalone evaluation) and skips the first
-    /// tier rather than guessing a sheet.
+    /// §5.9's order — sheet-scoped name → workbook name → table →
+    /// `_xlnm.` builtin → `#NAME?`.
+    ///
+    /// The order is not written here. `names.resolveInOrder` walks
+    /// M2's exported `parser.value_resolution_order`, one tier per
+    /// entry, and this supplies the tiers; the array is the single
+    /// statement of the sequence and this file reads it. A `from` of
+    /// null is a workbook-level context (a name's own body, a
+    /// standalone evaluation) and the sheet-scoped tier declines rather
+    /// than guessing a sheet.
     pub fn resolveName(
         self: *const SymbolTable,
         gpa: std.mem.Allocator,
         from: ?SheetIndex,
         query: []const u8,
+    ) error{OutOfMemory}!Resolution {
+        return self.resolveNameTraced(gpa, from, query, null);
+    }
+
+    /// `resolveName`, recording the tiers it visited. The trace exists
+    /// for the tests that prove the walk followed the exported order
+    /// and stopped where it says it stops.
+    pub fn resolveNameTraced(
+        self: *const SymbolTable,
+        gpa: std.mem.Allocator,
+        from: ?SheetIndex,
+        query: []const u8,
+        trace: ?*names.ValueTrace,
     ) error{OutOfMemory}!Resolution {
         const folded = self.fold(gpa, query) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -245,24 +278,103 @@ pub const SymbolTable = struct {
         };
         defer gpa.free(folded);
 
-        if (from) |sheet| {
-            for (self.names) |*n| {
-                if (n.scope) |s| {
-                    if (s == sheet and std.mem.eql(u8, n.folded, folded)) return self.answer(n);
-                }
-            }
-        }
-        for (self.names) |*n| {
-            if (n.scope == null and std.mem.eql(u8, n.folded, folded)) return self.answer(n);
-        }
-        for (self.tables) |*t| {
-            if (std.mem.eql(u8, t.folded, folded)) return .{ .table = t };
-        }
-        return .not_found;
+        const lookup: Tiers = .{ .table = self, .raw = query };
+        const hit = names.resolveInOrder(
+            Tiers,
+            lookup,
+            &parser.value_resolution_order,
+            if (from) |s| s.toInt() else null,
+            folded,
+            trace,
+        ) orelse return .not_found;
+        return switch (hit) {
+            .name => |n| self.answer(gpa, n),
+            .table => |t| .{ .table = t },
+            .refused => |r| .{ .refused = .{ .reason = r } },
+        };
     }
 
-    fn answer(self: *const SymbolTable, n: *const Name) Resolution {
+    /// One tier of §5.9's order, answered on demand.
+    ///
+    /// `names.resolveInOrder` calls `at` once per entry in the order it
+    /// was handed, so every branch here is a *tier*, never a sequence.
+    /// The sequencing lives in the array.
+    const Tiers = struct {
+        table: *const SymbolTable,
+        /// The unfolded spelling, for the `_xlnm.` tier — a reserved
+        /// prefix is Excel's own ASCII and is classified on the source
+        /// spelling, not on a fold of it.
+        raw: []const u8,
+
+        pub const Hit = union(enum) {
+            name: *const Name,
+            table: *const Table,
+            refused: Refusal.Reason,
+        };
+
+        pub fn at(
+            self: Tiers,
+            stage: parser.ValueScope,
+            from: ?u32,
+            folded: []const u8,
+        ) ?Hit {
+            switch (stage) {
+                .sheet_scoped_name => {
+                    const sheet = from orelse return null;
+                    for (self.table.names) |*n| {
+                        const s = n.scope orelse continue;
+                        if (s.toInt() == sheet and std.mem.eql(u8, n.folded, folded)) {
+                            return .{ .name = n };
+                        }
+                    }
+                    return null;
+                },
+                .workbook_name => {
+                    for (self.table.names) |*n| {
+                        if (n.scope == null and std.mem.eql(u8, n.folded, folded)) {
+                            return .{ .name = n };
+                        }
+                    }
+                    return null;
+                },
+                .table => {
+                    for (self.table.tables) |*t| {
+                        if (std.mem.eql(u8, t.folded, folded)) return .{ .table = t };
+                    }
+                    return null;
+                },
+                .builtin_xlnm => {
+                    // Reached only when no `<definedName>` declares the
+                    // spelling. A recognized builtin that the workbook
+                    // never defined names nothing — `#NAME?`, so the
+                    // tier declines and the terminal stage answers. An
+                    // *unrecognized* `_xlnm.` spelling is a different
+                    // thing: the prefix is reserved, so treating it as
+                    // a user name that happens to start with it would
+                    // be a guess.
+                    return switch (classify(self.raw)) {
+                        .unknown_builtin => .{ .refused = .unknown_builtin_name },
+                        .lambda_parameter => .{ .refused = .lambda_parameter_name },
+                        .user, .builtin => null,
+                    };
+                },
+                // The terminal stage is the driver's; no tier supplies
+                // "provably nowhere".
+                .name_error => return null,
+            }
+        }
+    };
+
+    fn answer(
+        self: *const SymbolTable,
+        gpa: std.mem.Allocator,
+        n: *const Name,
+    ) error{OutOfMemory}!Resolution {
         _ = self;
+        // Three ways a name that *resolved* still refuses, in the order
+        // their evidence was gathered: the spelling (M4b1), the
+        // attributes (M4b3's inventory), then the body — which costs a
+        // parse and is therefore asked last.
         if (n.class.refusesWhenReferenced()) {
             return .{ .refused = .{ .reason = switch (n.class) {
                 .lambda_parameter => .lambda_parameter_name,
@@ -270,7 +382,29 @@ pub const SymbolTable = struct {
                 .user, .builtin => unreachable,
             } } };
         }
+        if (n.attr_refusal) |r| return .{ .refused = .{ .reason = r } };
+        if (try names.bodyRefusal(gpa, n.body)) |r| return .{ .refused = .{ .reason = r } };
         return .{ .name = n };
+    }
+
+    /// Expand a 3D sheet span over the workbook's own order (§5.6g).
+    ///
+    /// Inclusive at both ends, and `#REF!` when an endpoint names no
+    /// sheet or the two arrive in the wrong order. The sheet lookup is
+    /// the same case-folded one a single-sheet qualifier gets, because
+    /// `sheet1:SHEET3` is the same span as `Sheet1:Sheet3`.
+    pub fn resolveSheetSpan(
+        self: *const SymbolTable,
+        gpa: std.mem.Allocator,
+        first: []const u8,
+        last: []const u8,
+    ) error{OutOfMemory}!names.SpanExpansion {
+        const a = try self.resolveSheet(gpa, first);
+        const b = try self.resolveSheet(gpa, last);
+        return names.expandSpan(
+            if (a) |x| x.toInt() else null,
+            if (b) |y| y.toInt() else null,
+        );
     }
 
     fn fold(
@@ -279,6 +413,42 @@ pub const SymbolTable = struct {
         s: []const u8,
     ) anyerror![]u8 {
         return self.collation.fold(gpa, s);
+    }
+};
+
+/// The symbol table, as the evaluator's `env.NameResolver` seam.
+///
+/// Holds a scratch allocator because folding a query needs one and the
+/// seam has no allocator parameter — the evaluator asks a question, it
+/// does not fund one. Holds `last_refusal` for the same reason
+/// `metadata.CellDialectResolver` does: the interface can only say
+/// `error.NameRefused`, and the typed reason has to survive the trip
+/// (M4a decision 17).
+pub const NameResolution = struct {
+    table: *const SymbolTable,
+    gpa: std.mem.Allocator,
+    last_refusal: ?Refusal = null,
+
+    pub fn resolver(self: *NameResolution) env.NameResolver {
+        return .{ .ctx = self, .resolve = resolve };
+    }
+
+    fn resolve(
+        ctx: *anyopaque,
+        from: ?SheetIndex,
+        spelling: []const u8,
+    ) env.Error!env.NameBinding {
+        const self: *NameResolution = @ptrCast(@alignCast(ctx));
+        const r = try self.table.resolveName(self.gpa, from, spelling);
+        return switch (r) {
+            .name => |n| .{ .body = .{ .text = n.body, .scope = n.scope } },
+            .table => .table,
+            .not_found => .not_found,
+            .refused => |ref| {
+                self.last_refusal = ref;
+                return error.NameRefused;
+            },
+        };
     }
 };
 
@@ -343,6 +513,18 @@ pub const Builder = struct {
         try self.sheets.append(a, .{ .index = idx, .name = name, .folded = folded });
     }
 
+    /// Everything about a defined name that is not its two carriers.
+    /// A struct rather than positional parameters because M4b3 added
+    /// the third field and the next row will not be the last: three
+    /// bools and an optional in a row is a call site nobody can read.
+    pub const NameFacts = struct {
+        scope: ?SheetIndex = null,
+        hidden: bool = false,
+        /// What `classifyDefinedName` decided about referencing this
+        /// name, from the `CT_DefinedName` attribute inventory.
+        attr_refusal: ?Refusal.Reason = null,
+    };
+
     /// Add a defined name. `raw_identifier` is `CT_DefinedName@name`
     /// (a STRING carrier); `raw_body` is the element's text, which is a
     /// FORMULA carrier and therefore entity-decoded ONLY.
@@ -350,8 +532,7 @@ pub const Builder = struct {
         self: *Builder,
         raw_identifier: []const u8,
         raw_body: []const u8,
-        scope: ?SheetIndex,
-        hidden: bool,
+        facts: NameFacts,
     ) error{OutOfMemory}!void {
         if (self.refusal != null) return;
         const a = self.arena.allocator();
@@ -359,7 +540,7 @@ pub const Builder = struct {
         const body = try self.decodeInto(a, .defined_name_body, raw_body);
         const folded = try self.foldInto(a, identifier);
         for (self.names.items) |n| {
-            if (std.mem.eql(u8, n.folded, folded) and scopeEql(n.scope, scope)) {
+            if (std.mem.eql(u8, n.folded, folded) and scopeEql(n.scope, facts.scope)) {
                 self.refusal = .{ .reason = .duplicate_symbol };
                 return;
             }
@@ -368,9 +549,10 @@ pub const Builder = struct {
             .identifier = identifier,
             .folded = folded,
             .body = body,
-            .scope = scope,
-            .hidden = hidden,
+            .scope = facts.scope,
+            .hidden = facts.hidden,
             .class = classify(identifier),
+            .attr_refusal = facts.attr_refusal,
         });
     }
 
@@ -418,14 +600,14 @@ pub const Builder = struct {
         // here leaves the builder holding its arena, which is exactly
         // what the caller's `deinit` expects to find.
         const sheets = try self.sheets.toOwnedSlice(a);
-        const names = try self.names.toOwnedSlice(a);
+        const defined = try self.names.toOwnedSlice(a);
         const tables = try self.tables.toOwnedSlice(a);
         self.consumed = true;
         return .{ .ok = .{
             .arena = self.arena,
             .collation = self.collation,
             .sheets = sheets,
-            .names = names,
+            .names = defined,
             .tables = tables,
         } };
     }
@@ -493,7 +675,7 @@ fn sheetIdx(i: u32) SheetIndex {
 
 fn buildTable(
     sheets: []const []const u8,
-    names: []const struct {
+    defined: []const struct {
         id: []const u8,
         body: []const u8 = "",
         scope: ?u32 = null,
@@ -503,8 +685,11 @@ fn buildTable(
     var b = Builder.init(testing.allocator, collation_v1);
     defer b.deinit();
     for (sheets) |s| try b.addSheet(s);
-    for (names) |n| {
-        try b.addName(n.id, n.body, if (n.scope) |s| sheetIdx(s) else null, n.hidden);
+    for (defined) |n| {
+        try b.addName(n.id, n.body, .{
+            .scope = if (n.scope) |s| sheetIdx(s) else null,
+            .hidden = n.hidden,
+        });
     }
     return switch (try b.finish()) {
         .ok => |t| t,
@@ -650,7 +835,7 @@ test "symbols: a table resolves after names, and its columns fold too" {
     var b2 = Builder.init(testing.allocator, collation_v1);
     defer b2.deinit();
     try b2.addSheet("S");
-    try b2.addName("Sales", "S!$Z$1", null, false);
+    try b2.addName("Sales", "S!$Z$1", .{});
     try b2.addTable(sheetIdx(0), scanned);
     var t2 = switch (try b2.finish()) {
         .ok => |ok| ok,
@@ -688,7 +873,7 @@ test "symbols: a broken encoding refuses, and the table is not half-built" {
     var b = Builder.init(testing.allocator, collation_v1);
     defer b.deinit();
     try b.addSheet("Fine");
-    try b.addName("Bad&nbsp;Name", "1", null, false);
+    try b.addName("Bad&nbsp;Name", "1", .{});
     try b.addSheet("AlsoFine");
     switch (try b.finish()) {
         .ok => |t| {
@@ -723,9 +908,9 @@ test "checkAllAllocationFailures: building and resolving leak nothing under OOM"
             defer b.deinit();
             try b.addSheet("R&amp;D");
             try b.addSheet("Sheet_x0041_");
-            try b.addName("Data", "'R&amp;D'!$A$1", null, false);
-            try b.addName("Data", "'R&amp;D'!$B$2", SheetIndex.fromInt(1), false);
-            try b.addName("_xlpm.p", "1", null, false);
+            try b.addName("Data", "'R&amp;D'!$A$1", .{});
+            try b.addName("Data", "'R&amp;D'!$B$2", .{ .scope = SheetIndex.fromInt(1) });
+            try b.addName("_xlpm.p", "1", .{});
 
             const table_xml = "<table xmlns=\"" ++ decode.ns_main ++ "\" name=\"T\" ref=\"A1:B2\">" ++
                 "<tableColumns><tableColumn name=\"c\"/></tableColumns></table>";
@@ -759,4 +944,206 @@ test "coords stays reachable for the consumers of a table ref" {
     const r = try coords.parseRange("A1:B4", .{ .dollar = .accept });
     try testing.expectEqual(@as(u32, 1), r.first.row.oneBased());
     try testing.expectEqual(@as(u32, 1), r.last.col.zeroBased());
+}
+
+// ─── §5.9 resolution over a real table (M4b3) ────────────────────
+
+test "symbols: the tiers are walked in M2's exported order, and stop where they answer" {
+    var t = try buildTable(
+        &.{ "S0", "S1" },
+        &.{
+            .{ .id = "Data", .body = "S0!$A$1" },
+            .{ .id = "Local", .body = "S1!$B$2", .scope = 1 },
+        },
+    );
+    defer t.deinit();
+
+    // A sheet-scoped hit stops at the first tier.
+    var trace: names.ValueTrace = .{};
+    const local = try t.resolveNameTraced(testing.allocator, sheetIdx(1), "Local", &trace);
+    try testing.expectEqualStrings("S1!$B$2", local.name.body);
+    try testing.expectEqualSlices(
+        parser.ValueScope,
+        &.{.sheet_scoped_name},
+        trace.slice(),
+    );
+
+    // A workbook name is reached only after the sheet tier declines.
+    var t2: names.ValueTrace = .{};
+    _ = try t.resolveNameTraced(testing.allocator, sheetIdx(1), "Data", &t2);
+    try testing.expectEqualSlices(
+        parser.ValueScope,
+        &.{ .sheet_scoped_name, .workbook_name },
+        t2.slice(),
+    );
+
+    // Nowhere: every tier tried, in the exported order, ending at the
+    // terminal stage that *is* `#NAME?`.
+    var t3: names.ValueTrace = .{};
+    const nowhere = try t.resolveNameTraced(testing.allocator, sheetIdx(0), "Nope", &t3);
+    try testing.expect(nowhere == .not_found);
+    try testing.expectEqualSlices(
+        parser.ValueScope,
+        &parser.value_resolution_order,
+        t3.slice(),
+    );
+}
+
+test "symbols: shadowing runs both ways, one fixture per direction" {
+    var t = try buildTable(
+        &.{ "S0", "S1" },
+        &.{
+            .{ .id = "Rate", .body = "S0!$A$1" },
+            .{ .id = "Rate", .body = "S1!$B$2", .scope = 1 },
+        },
+    );
+    defer t.deinit();
+
+    // From the scoping sheet the local name wins…
+    const from_local = try t.resolveName(testing.allocator, sheetIdx(1), "Rate");
+    try testing.expectEqualStrings("S1!$B$2", from_local.name.body);
+    try testing.expectEqual(@as(?SheetIndex, sheetIdx(1)), from_local.name.scope);
+    // …and from any other sheet the workbook name does. The same
+    // spelling, two answers, decided by where it was asked from.
+    const from_other = try t.resolveName(testing.allocator, sheetIdx(0), "Rate");
+    try testing.expectEqualStrings("S0!$A$1", from_other.name.body);
+    try testing.expectEqual(@as(?SheetIndex, null), from_other.name.scope);
+}
+
+test "symbols: a macro name refuses when referenced, and carrying one does not" {
+    var b = Builder.init(testing.allocator, collation_v1);
+    defer b.deinit();
+    try b.addSheet("S");
+    try b.addName("Plain", "S!$A$1", .{});
+    try b.addName("Macro", "MACRO_BODY", .{ .attr_refusal = .macro_defined_name });
+    // Building succeeded: a workbook that merely *carries* a macro name
+    // is a workbook Excel opens, and so is this one.
+    var t = switch (try b.finish()) {
+        .ok => |ok| ok,
+        .refused => return error.TestUnexpectedRefusal,
+    };
+    defer t.deinit();
+
+    try testing.expect((try t.resolveName(testing.allocator, null, "Plain")) == .name);
+    const refused = try t.resolveName(testing.allocator, null, "Macro");
+    try testing.expectEqual(Refusal.Reason.macro_defined_name, refused.refused.reason);
+    try testing.expectEqual(
+        decode.PlaneTwo.FormulaUnsupportedConstruct,
+        refused.refused.planeTwo(),
+    );
+}
+
+test "symbols: a relative body refuses when referenced; an anchored one resolves" {
+    var t = try buildTable(&.{"S"}, &.{
+        .{ .id = "Anchored", .body = "S!$A$1" },
+        .{ .id = "Floating", .body = "S!A1" },
+    });
+    defer t.deinit();
+
+    try testing.expect((try t.resolveName(testing.allocator, null, "Anchored")) == .name);
+    const floating = try t.resolveName(testing.allocator, null, "Floating");
+    try testing.expectEqual(Refusal.Reason.relative_reference_name, floating.refused.reason);
+}
+
+test "symbols: the `_xlnm.` tier answers only for a spelling nothing declares" {
+    var t = try buildTable(&.{"S"}, &.{.{ .id = "_xlnm.Print_Area", .body = "S!$A$1:$C$9" }});
+    defer t.deinit();
+
+    // Declared: found at the name tier, before the builtin tier runs.
+    var trace: names.ValueTrace = .{};
+    const declared = try t.resolveNameTraced(
+        testing.allocator,
+        null,
+        "_xlnm.Print_Area",
+        &trace,
+    );
+    try testing.expect(declared == .name);
+    try testing.expect(trace.slice()[trace.len - 1] != .builtin_xlnm);
+
+    // Recognized but never declared: nothing names it, so `#NAME?`.
+    try testing.expect(
+        (try t.resolveName(testing.allocator, null, "_xlnm.Print_Titles")) == .not_found,
+    );
+    // Unrecognized under a reserved prefix: a guess this refuses to make.
+    const unknown = try t.resolveName(testing.allocator, null, "_xlnm.Invented");
+    try testing.expectEqual(Refusal.Reason.unknown_builtin_name, unknown.refused.reason);
+    const lambda = try t.resolveName(testing.allocator, null, "_xlpm.p");
+    try testing.expectEqual(Refusal.Reason.lambda_parameter_name, lambda.refused.reason);
+}
+
+test "symbols: a sheet span expands case-folded, inclusively, in workbook order" {
+    var t = try buildTable(&.{ "Jan", "Feb", "Mar", "Données" }, &.{});
+    defer t.deinit();
+
+    const all = try t.resolveSheetSpan(testing.allocator, "Jan", "Mar");
+    try testing.expectEqual(@as(u32, 0), all.members.first);
+    try testing.expectEqual(@as(u32, 2), all.members.last);
+    // The same fold every other symbol match uses.
+    const folded = try t.resolveSheetSpan(testing.allocator, "jan", "DONNÉES");
+    try testing.expectEqual(@as(u32, 3), folded.members.last);
+    // One sheet is a span.
+    try testing.expectEqual(
+        @as(u32, 1),
+        (try t.resolveSheetSpan(testing.allocator, "Feb", "Feb")).members.first,
+    );
+    // A deleted endpoint, and a pair that has swapped: both `#REF!`.
+    try testing.expect((try t.resolveSheetSpan(testing.allocator, "Jan", "Gone")) == .ref_error);
+    try testing.expect((try t.resolveSheetSpan(testing.allocator, "Mar", "Jan")) == .ref_error);
+}
+
+test "symbols: the resolver seam answers the evaluator's three questions" {
+    var t = try buildTable(&.{"S"}, &.{
+        .{ .id = "Good", .body = "S!$A$1" },
+        .{ .id = "Macro", .body = "X" },
+    });
+    defer t.deinit();
+    // Reach in and mark the second one, the way the inventory would.
+    const marked: *Name = @constCast(&t.names[1]);
+    marked.attr_refusal = .macro_defined_name;
+
+    var seam: NameResolution = .{ .table = &t, .gpa = testing.allocator };
+    const r = seam.resolver();
+
+    const found = try r.resolveName(sheetIdx(0), "good");
+    try testing.expectEqualStrings("S!$A$1", found.body.text);
+    try testing.expect((try r.resolveName(sheetIdx(0), "Missing")) == .not_found);
+
+    // A refusal arrives as one error and leaves its reason behind.
+    try testing.expectError(error.NameRefused, r.resolveName(sheetIdx(0), "Macro"));
+    try testing.expectEqual(Refusal.Reason.macro_defined_name, seam.last_refusal.?.reason);
+}
+
+test "checkAllAllocationFailures: M4b3 resolution leaks nothing under OOM" {
+    const H = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var b = Builder.init(allocator, collation_v1);
+            defer b.deinit();
+            try b.addSheet("S0");
+            try b.addSheet("S1");
+            try b.addName("Anchored", "S0!$A$1", .{});
+            try b.addName("Floating", "S0!A1", .{});
+            try b.addName("Macro", "M", .{ .attr_refusal = .macro_defined_name });
+            try b.addName("Local", "S1!$B$2", .{ .scope = SheetIndex.fromInt(1) });
+            var t = switch (try b.finish()) {
+                .ok => |ok| ok,
+                .refused => return error.TestUnexpectedRefusal,
+            };
+            defer t.deinit();
+
+            if ((try t.resolveName(allocator, SheetIndex.fromInt(1), "local")) != .name) {
+                return error.WrongName;
+            }
+            if ((try t.resolveName(allocator, null, "floating")) != .refused) return error.WrongBody;
+            if ((try t.resolveName(allocator, null, "macro")) != .refused) return error.WrongAttr;
+            if ((try t.resolveSheetSpan(allocator, "s0", "S1")) != .members) return error.WrongSpan;
+
+            var seam: NameResolution = .{ .table = &t, .gpa = allocator };
+            const r = seam.resolver();
+            _ = r.resolveName(SheetIndex.fromInt(0), "anchored") catch |e| {
+                if (e == error.OutOfMemory) return e;
+                return error.WrongSeam;
+            };
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, H.run, .{});
 }

@@ -153,7 +153,10 @@ graph TD
     REFS["refs/refs.zig — module zlsx_refs<br/>(M0, typed coords + import gate)"] --> PARSE
     PARSE --> EVAL["eval.zig — engine"]
     VAL["value.zig"] --> EVAL
-    ENV["env.zig — EvalEnv (ordered sparse<br/>iteration + logicalBlankCount)"] --> EVAL
+    ENV["env.zig — EvalEnv (ordered sparse<br/>iteration + logicalBlankCount)<br/>+ NameResolver seam (M4b3)"] --> EVAL
+    NAMES["names.zig (M4b3) — CT_DefinedName +<br/>CT_TableFormula inventories, §5.9 order<br/>drivers, 3D matrix"] --> EVAL
+    NAMES --> SYM["symbols.zig — decoded symbol layer<br/>(§5.9 tiers, resolver seam)"]
+    SYM --> WB
     CRIT["criteria.zig"] --> FN["registry.zig — comptime table<br/>+ frozen v1 inventory"]
     SDATE["serial_date.zig"] --> FN
     XSTR["xstring.zig"] --> FN
@@ -689,6 +692,13 @@ every F-batch build directly on them:
     `not_yet_implemented`, currently one entry: 3D sheet spans (M4b3).
     A later row deletes a line and watches a test fail until it does —
     which conflating the two would have made impossible.
+    **Settled at M4b3**: the row deleted that entry, the list is empty,
+    and the watching test is the one that used to expect
+    `NotYetImplemented` from a span. M4b3 also split off
+    `UnsupportedConstruct` for what v1 refuses *on purpose* (§5.6g's
+    ineligible 3D contexts, §5.9's disqualified names, a table
+    reference), so the enumerated list keeps meaning "not at this row"
+    rather than drifting into "never".
 13. **The five required registry fields carry no defaults, and a test
     reads `@typeInfo` to prove it.** An omitted propagation class is how
     `COUNTA` quietly becomes `COUNT`. Three comptime checks back it up:
@@ -1687,16 +1697,138 @@ Call position → strip layered prefixes → registry; unregistered →
 `FormulaUnsupportedFunction`. Value position → sheet-scoped name (shadowing)
 → workbook name → table → `_xlnm.` builtins → `#NAME?` (provable there). All
 matching over the decoded symbol layer, case-folded. **`CT_DefinedName`
-attribute inventory (M4b2, complete)**: refusal-when-referenced —
+attribute inventory (M4b3, complete — 16 rows)**: refusal-when-referenced —
 `function`, `vbProcedure`, `xlm`; inert-preserved — `functionGroupId`,
 `publishToServer`, `workbookParameter`, `comment`, `customMenu`,
 `description`, `help`, `shortcutKey`, `statusBar`, `xml:space`; **unknown
 attributes → pre-mutation typed refusal** (typed view keeps
-name/formula/scope/hidden, `workbook_xml.zig:58-68`); explicit M4b2
+name/formula/scope/hidden, `workbook_xml.zig:58-68`); explicit M4b3
 deliverable.
 Name bodies = graph
 nodes (M5a; depth-guard interim M4b3); opaque payloads inert unless
 referenced; relative-ref names → typed refusal v1; `_xlpm.`/LAMBDA/LET refused.
+
+**M4b3 decisions (shipped 2026-08-04).** Nineteen points, in
+`src/formula/names.zig` (the two inventories, §5.9's drivers, the 3D
+matrix), `symbols.zig` (the tiers and the resolver seam), `eval.zig`
+(expansion and 3D evaluation), `env.zig` (the seam), `decode.zig` (table
+geometry) and the adapter. The corpus decided three of them and
+**refused to decide the rest** — which is itself the row's most
+important finding.
+
+1. **The order is data, and the driver reads it.** `resolveInOrder`
+   takes §5.9's sequence as a *parameter* and iterates it;
+   `symbols.SymbolTable.Tiers` supplies one tier per entry and states no
+   sequence at all. The proof is a test that hands the driver a permuted
+   array and watches the winner change — a chain of `if`s could not do
+   that. M2 exported `value_resolution_order` and
+   `call_resolution_order` for exactly this, and a comptime check now
+   proves each is a permutation of its enum: a stage missing from the
+   array is a stage that never runs, a stage listed twice runs twice.
+2. **The `CT_DefinedName` inventory is sixteen rows, and the corpus
+   knows only three of them.** Across `tests/corpus/`, defined names
+   carry `name` (19), `localSheetId` (17) and `hidden` (10) and nothing
+   else. Every other row — including all three macro flags — is
+   **spec-pinned to ECMA-376 §18.2.5 and labelled as such** in the
+   table itself, rather than claimed as corpus- or oracle-derived.
+3. **The macro three refuse when *referenced*, not when read.** A
+   workbook may carry a `vbProcedure` name no formula mentions, and
+   refusing to open it would refuse files Excel opens. Same shape
+   `_xlpm.` and unknown `_xlnm.` already had, which is why
+   `macro_defined_name` joins them in `decode.Refusal.Reason` instead of
+   starting a second vocabulary for one case.
+4. **`function="0"` is an ordinary name.** The three flags are
+   `xsd:boolean`, so their presence is not the fact — their *value* is.
+   A producer that writes them explicitly false means nothing unusual,
+   and refusing it would refuse a file that says so.
+5. **The scan reads the part, not the typed view.** `workbook_xml.zig`
+   keeps four fields and drops the attribute region, which is precisely
+   the region the inventory is about. `names.scanDefinedNames` walks
+   `xl/workbook.xml` itself — the same choice M4b2 made for `<calcPr>`,
+   for the same reason.
+6. **Depth is what distinguishes a defined name from an element that
+   shares its tag.** A `<definedName>` inside somebody's `<extLst>` is
+   not a defined name, and a scanner matching on the tag alone would
+   invent names out of a foreign vocabulary.
+7. **A relative body refuses when referenced, and the body is asked
+   last.** Three things can disqualify a name that resolved — its
+   spelling (M4b1), its attributes (this row), and its body — and they
+   are checked in that order because only the third costs a parse.
+8. **A body that will not parse is the expansion's refusal, not the
+   name's.** `bodyRefusal` answers null for it; the parse that expands
+   it names the construct, with the construct's own offset. Flattening
+   both into "this name is bad" would lose which.
+9. **LAMBDA and LET refuse through the registry, not a second rule.**
+   They are unregistered calls, so §5.9's call-position order already
+   answers `FormulaUnsupportedFunction`. A name-level rule would have
+   been one refusal stated twice.
+10. **The `_xlnm.` tier answers only for a spelling nothing declares.**
+    A declared builtin is found at the name tier, before the builtin
+    tier runs. A *recognized* builtin the workbook never defined names
+    nothing, so the tier declines and `#NAME?` stands; an unrecognized
+    spelling under the reserved prefix refuses, because treating it as
+    a user name that happens to start with `_xlnm.` is a guess.
+11. **Name expansion is inline and depth-guarded, and says so.**
+    `max_name_expansion_depth = 8` is interim: M5a makes bodies graph
+    nodes, where `A = B`, `B = A` is a cycle like any other. Until then
+    inline expansion has to stop somewhere, and it stops with a §9 limit
+    that has a name rather than a stack overflow that does not.
+12. **A table producer's members must exist.** Excel materializes a
+    calculated column into every data cell, so the table part and the
+    sheet state it twice; when they disagree — a producer declared, a
+    member with no `<f>` — an engine that writes values back would
+    recalculate that member as a blank and delete a column. Neither side
+    is authoritative enough to pick, so it refuses. `CT_TableFormula`
+    itself is two attributes (`array`, plus `xml:space`), and
+    `decode.Table` gained `headerRowCount`/`totalsRowCount` because the
+    member set cannot be computed without them.
+13. **The fixture that had to change was wrong about Excel.** M4b1's
+    table test declared a calculated column over `B2:B4` on a sheet
+    holding only `A1` — a table Excel never wrote. It now carries its
+    members, which is what made the refusal visible as a fixture rather
+    than as a surprise.
+14. **§5.6g ships entirely spec-pinned, and the row says so rather than
+    implying otherwise.** No corpus workbook contains a 3D span; no
+    committed oracle manifest contains one either (§8.2). So the matrix
+    is pinned to the spec and labelled at its table, the per-function
+    oracle legs arrive with the functions (AVERAGE, MIN and MAX are
+    M4e), and this row's fixtures are the three eligible functions the
+    registry already holds plus the matrix itself.
+15. **Eligibility is judged at the enclosing call argument, and the
+    three reference operators are transparent.** `:`, ` ` and `,`
+    *compose* references, so `SUM(S1:S3!A1:B1)` is still SUM's argument;
+    every other operator consumes a value, so `SUM(S1:S3!A1*2)` hands
+    `*` a multi-area reference and refuses. Conservative on purpose:
+    refusing is the direction an engine that writes values back can
+    afford to be wrong in.
+16. **A span and a union are the same shape and not the same thing.**
+    `Reference.three_d` records which. After a union, `A1:B1` takes the
+    bounding box of two areas; after a span it takes one box per member
+    sheet, because a span is one reference repeated across sheets.
+    Nothing else in the evaluator branches on the flag — aggregating
+    over N areas is aggregating over N areas, which is why the six
+    eligible functions needed no 3D-specific code.
+17. **Reordered endpoints are not normalized.** `Sheet2:Sheet1` is a
+    span someone's edit broke; computing over the sheets between them
+    would answer a question nobody asked. It joins the missing endpoint
+    at `#REF!`, which is a *value* — the proof the span was evaluated
+    rather than refused.
+18. **`UnsupportedConstruct` and `NotYetImplemented` are two errors
+    because they answer two questions.** "Never in v1" is not "not at
+    this row", and only the second has an enumerated membership. M4b3
+    deleted the list's one entry (3D sheet spans) and a test now fails
+    if a span refuses that way again — the deletion being watched is
+    what decision 12 of §5.3 was for.
+19. **`evaluate` is pure by construction, and gated anyway.** It never
+    calls `putComputed`; every byte it produces lives in the arena it
+    hands back. The gate compares every part's bytes before and after on
+    four paths — success, evaluator refusal, a run cut short by a §9
+    limit, and the injected-OOM sweep — because "it does not mutate" is
+    a claim about code that changes, not about code as written. The
+    resolver seam it wires (`env.NameResolver`, `error.NameRefused`)
+    mirrors M4a's `DialectResolver`/`MetadataRefused` exactly: the
+    interface says the resolution failed, and the typed reason stays
+    with the resolver that owns the diagnostic.
 
 ### 5.10 Cycle-free composition (`zlsx_recalc`)
 
@@ -1746,7 +1878,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M4a** | metadata.xml typed reader + cm/vm resolution + dialect primitives; **every record type classified — only `XLDAPR` interpreted; `XLRICHVALUE`/unknown value metadata on any input or result cell → pre-mutation typed refusal** | Fixtures incl. rich-value refusal; fuzz |
 | **M4b1** | EvalEnv adapter + decode boundary (**decoding split by carrier class (corrected)**: FORMULA carriers — `<f>` bodies, defined-name bodies, table formulas — **XML-entity decoding ONLY** (ST_Xstring does NOT apply; literal `"_x0041_"` in a formula survives byte-exact, round-trip oracle); STRING carriers — SST, inline, `t="str"` `<v>` — XML-entity THEN ST_Xstring, RICH strings concatenating all visible `<r>/<t>` runs in document order, `<rPh>` excluded (inline reader returns first `<t>` only, `sheet_xml.zig:552-563`; SST rich `sst_xml.zig:56-66`); authored STRING output ST_Xstring-encodes; authored FORMULA output XML-escapes only (raw borrowed XML today: `sheet_xml.zig:522`, `workbook_xml.zig:61`); authored formula text **XML-escapes ONLY — no ST_Xstring stage** (string carriers alone use ST_Xstring); authored-formula tests prove literal `_x0041_` stays literal; fixtures with `_x005F_`, encoded controls, and entity escapes in formulas AND names — `_xHHHH_`, escaped `_x005F_`, C0 controls, across SST/inline/`t="str"`; the SST view decodes XML entities only today, `sst_xml.zig:174-193`) + **input cell-type contract** (§5.7.2) + **implicit-coordinate reconstruction** (a `<c>` without `r` takes the column after the preceding cell — Office semantics, MS-OE376 §2.1.624; the parser SKIPS such cells today, `sheet_xml.zig:507`; fixtures: first-cell-no-r, gaps, formulas, out-of-grid) + symbol layer + namespace preflight | Decode/`'R&D'`/prefixed fixtures |
 | **M4b2** ✅ | Full calc-state parse (`CT_CalcPr` complete, `sheetCalcPr`, `date1904`, extensions byte-exact, `fullPrecision="0"` refuses) + **CT_CellFormula attribute inventory** (13 rows, one fixture each, unknown refuses) + **attribute-based** shared classification + sheet-wide topology validation + **AST copy-translation** (relative halves by (Δrow,Δcol); off-grid collapses the whole operand to `#REF!`) + `t="d"`'s normative lexical table | Slave-shape + topology matrix; attribute fixtures; 2 000-case randomized differential vs an independent translator; corpus `<calcPr>` byte round-trip; attribute/calc-state fuzz |
-| **M4b3** | Name resolution + table producers + 3D matrix + cache-based `evaluate` | Site semantics; opaque names; 3D fixtures |
+| **M4b3** ✅ | Name resolution + table producers + 3D matrix + cache-based `evaluate` | Site semantics; opaque names; 3D fixtures |
 | **M4c** | F1a-1 (20: operators; IF, AND, OR, NOT, IFERROR, IFNA, IFS, SWITCH; ISBLANK, ISNUMBER, ISTEXT, ISERROR, ISERR, ISNA, ISLOGICAL, NA, N, T; **TRUE, FALSE** — added at M3a2, see the decisions block) | Oracle-first |
 | **M4d** | F1a-2 (~17: ABS, ROUND, ROUNDUP, ROUNDDOWN, INT, TRUNC, MOD, POWER, SQRT, EXP, LN, LOG, LOG10, SIGN, PI, RAND, RANDBETWEEN) + multi-callsite/lazy-branch draw KATs | Oracle-first; KATs |
 | **M4e** | F1b (~22: SUM, COUNT, COUNTA, COUNTBLANK, AVERAGE, MIN, MAX, SUMIF, COUNTIF, AVERAGEIF, SUMPRODUCT; VLOOKUP, HLOOKUP, INDEX, MATCH, XLOOKUP, XMATCH, CHOOSE, ROW, ROWS, COLUMN, COLUMNS) — **Core gate 59** | Oracle-first |
@@ -1809,7 +1941,8 @@ the ladder rows above (single source, no duplicate list to drift).
 
 tokenizer (M1a) · parser + limits (M2) · eval no-panic/leak/non-finite (M3a) ·
 criteria + PRNG KATs (M3b) · metadata (M4a) · decode/symbols (M4b1) ·
-topology + translation (M4b2) · draw KATs (M4d) · SCC + stabilization +
+topology + translation (M4b2) · **defined-name attributes + 3D spans
+(M4b3)** · draw KATs (M4d) · SCC + stabilization +
 rebuild-reuse (M5a) · patcher confinement + ResolvedSheet round-trip (M5b1) ·
 transaction post-failure + calc-state round-trip + refusal purity (M5b2) ·
 buffer equivalence (M5c) · determinism + scoped idempotence (M5d) · spill
