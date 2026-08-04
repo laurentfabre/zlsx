@@ -63,6 +63,7 @@ const eval = @import("eval.zig");
 const criteria = @import("criteria.zig");
 const text = @import("text.zig");
 const run_inputs = @import("run_inputs.zig");
+const serial_date = @import("serial_date.zig");
 const casing = @import("zlsx_casing");
 
 const Value = eval.Value;
@@ -125,6 +126,30 @@ pub const CallCtx = struct {
     /// §5.4b's code page, for `CHAR` and `CODE`.
     pub fn platformProfile(self: CallCtx) run_inputs.PlatformProfile {
         return self.ev.opts.platform_profile;
+    }
+
+    /// §5.4a's epoch. Every date function reads it through here for the
+    /// same reason the text ones read the compatibility version: what a
+    /// serial means is a property of the workbook, not of the function
+    /// that happened to be called.
+    pub fn dateSystem(self: CallCtx) run_inputs.DateSystem {
+        return self.ev.opts.date_system;
+    }
+
+    /// The serial `NOW()` reports — the run's instant, converted under
+    /// the run's epoch and offset.
+    ///
+    /// Computed rather than cached, and deterministic from `RunInputs`,
+    /// so two calls in one formula cannot disagree the way two clock
+    /// reads would. `NOW` is still `volatile_fn`: it changes between
+    /// RECALCULATIONS, which is a different question from whether it is
+    /// stable within one.
+    pub fn nowSerial(self: CallCtx) FnError!f64 {
+        return serial_date.serialFromUnixMs(
+            self.ev.opts.date_system,
+            self.ev.opts.now_utc_ms,
+            self.ev.opts.utc_offset_min,
+        ) catch error.MalformedInput;
     }
 };
 
@@ -248,6 +273,14 @@ pub const Function = struct {
     platform_sensitive: bool = false,
     /// Depends on a §5.4d compatibility version.
     cv_sensitive: bool = false,
+    /// Depends on §5.4a's date system. Separate from `cv_sensitive`
+    /// because they are different workbook properties with different
+    /// owners: one comes from `workbookPr@date1904` and changes what a
+    /// serial MEANS, the other comes from the metadata part and changes
+    /// what a character IS. `TIME`, `HOUR`, `MINUTE` and `SECOND` are
+    /// deliberately NOT flagged — a fraction of a day is the same
+    /// fraction under either epoch.
+    epoch_sensitive: bool = false,
     /// §5.4b's match policy. `.folded` is the default because the
     /// comparator is: `=`, `SEARCH` and every wildcard consumer fold
     /// before they compare. `.raw` is the exception a function has to
@@ -286,6 +319,7 @@ const num2 = [_]CoercionClass{ .number, .number };
 // "this slot is the text and that one is the count" is one thing to
 // read.
 const eager3 = [_]Laziness{ .eager, .eager, .eager };
+const num3 = [_]CoercionClass{ .number, .number, .number };
 const text1 = [_]CoercionClass{.text};
 const text2 = [_]CoercionClass{ .text, .text };
 const text_num = [_]CoercionClass{ .text, .number };
@@ -1072,6 +1106,144 @@ pub const functions = [_]Function{
         .volatility = .stable,
         .propagation = .propagate,
         .impl = fnTextJoin,
+    },
+
+    // ── M4g / F1c-date: fifteen names over §5.4a's two epochs. The
+    //    serial is the value; the epoch is what it means. ──
+    .{
+        .name = "DATE",
+        .arity = .{ .min = 3, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &num3, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnDate,
+    },
+    .{
+        .name = "TIME",
+        .arity = .{ .min = 3, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &num3, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        // A time is a fraction of a day and never touches the calendar,
+        // so it is the one constructor both epochs agree about.
+        .impl = fnTime,
+    },
+    .{
+        .name = "YEAR",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &num1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnYear,
+    },
+    .{
+        .name = "MONTH",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &num1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnMonth,
+    },
+    .{
+        .name = "DAY",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &num1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnDay,
+    },
+    .{
+        .name = "HOUR",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &num1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnHour,
+    },
+    .{
+        .name = "MINUTE",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &num1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnMinute,
+    },
+    .{
+        .name = "SECOND",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &num1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnSecond,
+    },
+    .{
+        .name = "WEEKDAY",
+        .arity = .{ .min = 1, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnWeekday,
+    },
+    .{
+        .name = "EDATE",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnEdate,
+    },
+    .{
+        .name = "EOMONTH",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnEomonth,
+    },
+    .{
+        .name = "DATEVALUE",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &text1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnDateValue,
+    },
+    .{
+        .name = "TIMEVALUE",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &text1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnTimeValue,
+    },
+    // The two volatiles. `TODAY` is `NOW` floored, and both take their
+    // instant from `RunInputs` rather than from a clock — which is what
+    // makes a recalc reproducible and a fixture possible.
+    .{
+        .name = "TODAY",
+        .arity = .{ .min = 0, .max = 0, .fixed = &none_l, .rest = &none_l },
+        .coercion = .{ .fixed = &none_c, .rest = &none_c },
+        .volatility = .volatile_fn,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnToday,
+    },
+    .{
+        .name = "NOW",
+        .arity = .{ .min = 0, .max = 0, .fixed = &none_l, .rest = &none_l },
+        .coercion = .{ .fixed = &none_c, .rest = &none_c },
+        .volatility = .volatile_fn,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnNow,
     },
 
     // ── the lazy forms. No `impl`: deferring an arm means holding an
@@ -3060,6 +3232,244 @@ fn fnTextJoin(ctx: CallCtx, args: []const Value) FnError!Value {
     return acc.finish();
 }
 
+// ─── M4g / F1c-date: the implementations ─────────────────────────
+
+/// A serial argument, split into its day and its time.
+///
+/// Every date-reading function starts here, so the domain check happens
+/// once: a negative serial is `#NUM!` — Excel's answer for a date before
+/// its epoch — and so is one past 9999-12-31. Truncation is Excel's too:
+/// `YEAR(43831.9)` reads the day 43831 sits in.
+fn serialParts(x: f64) ?struct { days: i32, fraction: f64 } {
+    const parts = serial_date.splitSerial(x) catch return null;
+    return .{ .days = parts.days, .fraction = parts.fraction };
+}
+
+fn dateOf(ctx: CallCtx, x: f64) ?serial_date.Date {
+    const parts = serialParts(x) orelse return null;
+    return serial_date.dateFromSerial(ctx.dateSystem(), parts.days) catch null;
+}
+
+fn fnDate(ctx: CallCtx, args: []const Value) FnError!Value {
+    const y_raw = @trunc(numArg(args, 0));
+    const m_raw = @trunc(numArg(args, 1));
+    const d_raw = @trunc(numArg(args, 2));
+
+    // Excel's two-digit-year window, on the ARGUMENT rather than on
+    // text: `DATE(20,1,1)` is 1920, not 2020, because the rule for a
+    // numeric year is "0–1899 means 1900 + y" and not the text
+    // grammar's 00–29/30–99 split. Two rules, deliberately different,
+    // and this is the one the function argument takes.
+    var year = y_raw;
+    if (year < 0 or year > 9999) return Value.err(.num);
+    if (year < 1900) year += 1900;
+
+    // Month and day overflow into the calendar instead of failing:
+    // `DATE(2020,13,1)` is January 2021 and `DATE(2020,1,32)` is
+    // February 1st. Excel documents both, and they are what makes
+    // `DATE(YEAR(d),MONTH(d)+1,1)` the idiomatic next-month formula.
+    const total_months = year * 12 + (m_raw - 1);
+    if (@abs(total_months) > 1_000_000) return Value.err(.num);
+    const norm_year = @floor(total_months / 12);
+    const norm_month = total_months - norm_year * 12 + 1;
+    if (norm_year < 0 or norm_year > 9999) return Value.err(.num);
+
+    const base = serial_date.serialFromDate(
+        ctx.dateSystem(),
+        @intFromFloat(norm_year),
+        @intFromFloat(norm_month),
+        1,
+    ) catch return Value.err(.num);
+    const serial = @as(f64, @floatFromInt(base)) + (d_raw - 1);
+    if (serial < 0 or serial > @as(f64, @floatFromInt(serial_date.maxSerial(ctx.dateSystem())))) {
+        return Value.err(.num);
+    }
+    return Value.num(serial);
+}
+
+fn fnTime(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const h = @trunc(numArg(args, 0));
+    const m = @trunc(numArg(args, 1));
+    const s = @trunc(numArg(args, 2));
+    // Excel's range check is on the arguments, before they are summed:
+    // `TIME(0,0,86400)` is `#NUM!` rather than tomorrow.
+    if (h < 0 or h > 32767 or m < 0 or m > 32767 or s < 0 or s > 32767) {
+        return Value.err(.num);
+    }
+    const secs = h * 3600 + m * 60 + s;
+    // …and the sum wraps into a day rather than overflowing, which is
+    // what makes `TIME(25,0,0)` 1:00 AM.
+    const frac = @mod(secs, 86_400.0) / 86_400.0;
+    return Value.num(frac);
+}
+
+fn fnYear(ctx: CallCtx, args: []const Value) FnError!Value {
+    const d = dateOf(ctx, numArg(args, 0)) orelse return Value.err(.num);
+    return Value.num(@floatFromInt(d.year));
+}
+
+fn fnMonth(ctx: CallCtx, args: []const Value) FnError!Value {
+    const d = dateOf(ctx, numArg(args, 0)) orelse return Value.err(.num);
+    return Value.num(@floatFromInt(d.month));
+}
+
+fn fnDay(ctx: CallCtx, args: []const Value) FnError!Value {
+    // Serial 0 under the 1900 system is `1900-01-00`, so `DAY(0)` is
+    // **0** — a day number no calendar has. It is what Excel answers,
+    // and `serial_date` represents it rather than refusing (§5.4a).
+    const d = dateOf(ctx, numArg(args, 0)) orelse return Value.err(.num);
+    return Value.num(@floatFromInt(d.day));
+}
+
+fn fnHour(ctx: CallCtx, args: []const Value) FnError!Value {
+    const t = clockOf(ctx, numArg(args, 0)) orelse return Value.err(.num);
+    return Value.num(@floatFromInt(t.hour));
+}
+
+fn fnMinute(ctx: CallCtx, args: []const Value) FnError!Value {
+    const t = clockOf(ctx, numArg(args, 0)) orelse return Value.err(.num);
+    return Value.num(@floatFromInt(t.minute));
+}
+
+fn fnSecond(ctx: CallCtx, args: []const Value) FnError!Value {
+    const t = clockOf(ctx, numArg(args, 0)) orelse return Value.err(.num);
+    return Value.num(@floatFromInt(t.second));
+}
+
+/// The clock half of a serial.
+///
+/// The epoch does not change the ANSWER — a fraction of a day is the
+/// same fraction under both — but it does change the DOMAIN, and that is
+/// the half worth getting right: the 1904 system's last serial is 1 462
+/// lower than the 1900 system's, so a serial between the two maxima is a
+/// date in one workbook and out of range in the other. Reading its clock
+/// while `YEAR` refuses it would be two answers about one cell.
+fn clockOf(ctx: CallCtx, x: f64) ?serial_date.Time {
+    const parts = serialParts(x) orelse return null;
+    if (parts.days > serial_date.maxSerial(ctx.dateSystem())) return null;
+    // A fraction that rounded up to the next midnight is 00:00:00 of
+    // the following day, which is exactly what the carry means: the
+    // clock reading is the same either way.
+    return serial_date.timeFromFraction(parts.fraction);
+}
+
+fn fnWeekday(ctx: CallCtx, args: []const Value) FnError!Value {
+    const parts = serialParts(numArg(args, 0)) orelse return Value.err(.num);
+    const kind: i64 = if (args.len >= 2) blk: {
+        const k = @trunc(numArg(args, 1));
+        if (k < 1 or k > 17) return Value.err(.num);
+        break :blk @intFromFloat(k);
+    } else 1;
+
+    // The day of week comes from the SERIAL, not from the calendar
+    // date the serial denotes, and under the 1900 system those are two
+    // different answers.
+    //
+    // 1900-02-29 never happened, but it occupies a serial, so serial
+    // arithmetic and the proleptic calendar drift apart by one day
+    // everywhere below the gap. Excel counts serials — `WEEKDAY(1)` is
+    // **1, Sunday**, though 1900-01-01 was a Monday — and a workbook
+    // whose `dddd` format says Sunday must not have a `WEEKDAY` that
+    // says Monday. Above serial 60 the two agree again, which is why
+    // the divergence is invisible in every date anyone actually uses.
+    //
+    // The 1904 system has no phantom day and therefore no drift; its
+    // phase is simply different, because its serial 0 is a Friday.
+    const phase: i64 = switch (ctx.dateSystem()) {
+        .d1900 => 6, // serial 1 is a Sunday
+        .d1904 => 5, // serial 0 is 1904-01-01, a Friday
+    };
+    const dow: i64 = @mod(@as(i64, parts.days) + phase, 7); // 0 = Sunday
+    return Value.num(@floatFromInt(weekdayNumber(kind, dow)));
+}
+
+/// Excel's seventeen `return_type` codes, as arithmetic over a
+/// Sunday-zero index rather than as a seventeen-row table: 1 and 17 are
+/// Sunday-first one-based, 2 and 11 are Monday-first one-based, 3 is
+/// Monday-first ZERO-based, and 12–16 walk the remaining start days.
+fn weekdayNumber(kind: i64, dow: i64) i64 {
+    return switch (kind) {
+        1, 17 => dow + 1,
+        2, 11 => @mod(dow + 6, 7) + 1,
+        3 => @mod(dow + 6, 7),
+        // 12 = Tuesday-first … 16 = Saturday-first.
+        12, 13, 14, 15, 16 => @mod(dow + 7 - (kind - 10), 7) + 1,
+        else => unreachable, // the caller range-checked
+    };
+}
+
+fn fnEdate(ctx: CallCtx, args: []const Value) FnError!Value {
+    return shiftMonths(ctx, args, .same_day);
+}
+
+fn fnEomonth(ctx: CallCtx, args: []const Value) FnError!Value {
+    return shiftMonths(ctx, args, .last_day);
+}
+
+const MonthLanding = enum { same_day, last_day };
+
+/// `EDATE` and `EOMONTH` are one walk with two landings, which is how
+/// Excel documents them and the only difference the code has.
+fn shiftMonths(ctx: CallCtx, args: []const Value, landing: MonthLanding) FnError!Value {
+    const d = dateOf(ctx, numArg(args, 0)) orelse return Value.err(.num);
+    const months = @trunc(numArg(args, 1));
+    if (@abs(months) > 1_000_000) return Value.err(.num);
+
+    const total: f64 = @as(f64, @floatFromInt(d.year)) * 12 +
+        @as(f64, @floatFromInt(d.month)) - 1 + months;
+    const year_f = @floor(total / 12);
+    if (year_f < 0 or year_f > 9999) return Value.err(.num);
+    const year: i32 = @intFromFloat(year_f);
+    const month: u8 = @intFromFloat(total - year_f * 12 + 1);
+
+    const in_month = serial_date.daysInMonth(year, month);
+    const day: u8 = switch (landing) {
+        // Clamped, not overflowed: one month after January 31st is
+        // February 28th (or 29th), because Excel's month arithmetic
+        // lands inside the month it names.
+        .same_day => @min(d.day, in_month),
+        .last_day => in_month,
+    };
+    const serial = serial_date.serialFromDate(ctx.dateSystem(), year, month, day) catch
+        return Value.err(.num);
+    return Value.num(@floatFromInt(serial));
+}
+
+fn fnDateValue(ctx: CallCtx, args: []const Value) FnError!Value {
+    const serial = serial_date.serialFromInvariantDate(
+        ctx.dateSystem(),
+        textArg(args, 0),
+    ) catch |e| switch (e) {
+        // §5.4b: a spelling whose MEANING depends on the locale is a
+        // typed refusal, never a fabricated `#VALUE!`. Text that is not
+        // a date at all is the ordinary Excel error, and the two stay
+        // distinguishable — which is the whole point of the split.
+        error.LocaleOrdered => return error.LocaleSensitiveInput,
+        else => return Value.err(.value),
+    };
+    return Value.num(@floatFromInt(serial));
+}
+
+fn fnTimeValue(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const frac = serial_date.fractionFromInvariantTime(textArg(args, 0)) catch |e| switch (e) {
+        error.LocaleOrdered => return error.LocaleSensitiveInput,
+        else => return Value.err(.value),
+    };
+    return Value.num(frac);
+}
+
+fn fnToday(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = args;
+    return Value.num(@floor(try ctx.nowSerial()));
+}
+
+fn fnNow(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = args;
+    return Value.num(try ctx.nowSerial());
+}
+
 // ─── tests ───────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -3589,6 +3999,53 @@ test "M4f: the ladder's running total is counted from the file too" {
     try testing.expectEqual(@as(usize, 78), shipped);
 }
 
+test "M4g: the running total moves with the batch, counted from the file" {
+    const rows = [_][]const u8{ "M4c", "M4d", "M4e", "M4f", "M4g" };
+    var shipped: usize = 0;
+    for (rows) |m| {
+        var it = inventory();
+        while (it.next()) |e| {
+            if (!std.mem.eql(u8, e.milestone, m)) continue;
+            if (lookup(e.name) == null) {
+                std.debug.print("shipped name does not resolve: {s} ({s})\n", .{ e.name, m });
+                return error.LadderTotalIncomplete;
+            }
+            shipped += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 93), shipped);
+}
+
+test "M4g: every F1c-date row declares all five fields, and its epoch honestly" {
+    var it = inventory();
+    var seen: usize = 0;
+    var epoch_rows: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4g")) continue;
+        const f = lookup(e.name).?;
+        seen += 1;
+        if (f.epoch_sensitive) epoch_rows += 1;
+
+        try testing.expectEqualStrings(e.name, f.name);
+        try testing.expectEqual(f.arity.fixed.len, f.coercion.fixed.len);
+        try testing.expectEqual(f.arity.rest.len, f.coercion.rest.len);
+        try testing.expectEqual(Form.plain, f.form);
+        try testing.expect(f.impl != null);
+        // A date function reads no text through the comparator and
+        // indexes no string, so neither of M4f's two flags belongs to
+        // any of them — asserted so a later row cannot set one by
+        // copying a neighbour.
+        try testing.expect(!f.collation_sensitive);
+        try testing.expect(!f.cv_sensitive);
+        try testing.expect(!f.reference_producing);
+        try testing.expect(!f.da_aware);
+    }
+    try testing.expectEqual(@as(usize, 15), seen);
+    // Ten of the fifteen depend on the epoch; the five that do not are
+    // the clock (TIME/HOUR/MINUTE/SECOND) and TIMEVALUE.
+    try testing.expectEqual(@as(usize, 10), epoch_rows);
+}
+
 test "M4f: every F1c row declares all five fields, and its policy explicitly" {
     // The same five-field check M4d and M4e applied, plus the two pieces
     // of metadata §5.4b makes this batch responsible for: a match policy
@@ -3898,12 +4355,18 @@ test "registry: lookup is case-insensitive and rejects unknown names" {
     try testing.expect(lookup("NOTAFUNCTION") == null);
 }
 
-test "registry: RAND and RANDBETWEEN are the only volatile rows" {
+test "registry: the volatile rows are the two draws and the two clocks" {
     // Both directions, because either alone passes for the wrong reason:
-    // naming the two proves they are volatile, counting proves nothing
+    // naming them proves they are volatile, counting proves nothing
     // else quietly became so. Every volatile row is a cell the M5a2
     // schedule has to re-key, so the set is not a detail.
-    const expected = [_][]const u8{ "RAND", "RANDBETWEEN" };
+    //
+    // M4g added the second pair. `TODAY` and `NOW` are volatile for a
+    // different reason than `RAND` is — they are stable within a run and
+    // change between recalculations, where a draw changes at every
+    // callsite — but the schedule treats them the same, which is what
+    // this flag is for.
+    const expected = [_][]const u8{ "RAND", "RANDBETWEEN", "TODAY", "NOW" };
     for (expected) |name| {
         try testing.expectEqual(Volatility.volatile_fn, lookup(name).?.volatility);
     }

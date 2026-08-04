@@ -78,7 +78,7 @@ Locked 2026-08-02 by Laurent (axioms; changing one reopens the plan):
 | # | Decision | Consequence |
 |---|---|---|
 | D-1 | Both recalc-on-save and standalone eval | `recalculate()` (in-memory transaction) + `saveWithRecalc` (file transaction, §5.7.9) + Writer path via orchestrator; eval at every layer |
-| D-2 | Registry phased to 300+, Core ~60 first | Core gate = M4e ✅ — **59** cumulative (M4c 20 + M4d 17 + M4e 22), counted from the frozen inventory committed at M3a rather than from this row. Past the gate: M4f ✅ adds 19 (F1c-text) → **78** |
+| D-2 | Registry phased to 300+, Core ~60 first | Core gate = M4e ✅ — **59** cumulative (M4c 20 + M4d 17 + M4e 22), counted from the frozen inventory committed at M3a rather than from this row. Past the gate: M4f ✅ adds 19 (F1c-text) → **78**, M4g ✅ adds 15 (F1c-date) → **93** |
 | D-3 | Dual fidelity modes | §5.4; `.excel` carries `platform_profile` + `collation_v1` |
 | D-4 | Dynamic arrays from the start | Array-first eval from M3a with the normative shape/coercion table (§5.3b); persistence staged behind proof gates; authoring via explicit `FormulaWrite.dialect` |
 | D-5 | Iterative calc honoring `calcPr` | CalcState workbook-derived; multi-SCC schedule normative (§5.6c) |
@@ -786,12 +786,22 @@ tables.
 Landed M3b as `src/formula/serial_date.zig` — **the 1900 epoch is two
 epochs** (serials 1–59 count from 1899-12-31, 61+ from 1899-12-30) and
 both invented days are representable rather than errors; see the M3b
-decisions block in §5.5.
+decisions block in §5.5. **`WEEKDAY` counts serials, not calendar days
+(M4g decision 1)**: the phantom day makes the two disagree by one
+everywhere below serial 61, and Excel counts serials — `WEEKDAY(1)` is
+Sunday though 1900-01-01 was a Monday. The 1904 system has no phantom
+and no drift, only a different phase.
 
 **5.4b Locale, collation, platform**: locale-sensitive **parses**
 (VALUE/DATEVALUE/TIMEVALUE/TEXT/NUMBERVALUE) carry pinned invariant grammars;
 outside-grammar input → `FormulaLocaleSensitiveInput` refusal (never a
-fabricated `#VALUE!`). **Locale-sensitive OUTPUT is pinned invariant in v1**
+fabricated `#VALUE!`). **The line the grammar draws (M4g decision 2): a
+spelling refuses exactly when the locale would change what it MEANS, not
+merely how it looks.** So `"1.5"` parses and `"1,5"` refuses; `DATEVALUE`
+accepts ISO and every named-month form unconditionally, accepts `M/D/YYYY`
+whenever one field settles the order (`"1/15/2020"` can only be January
+15th anywhere), and refuses `"1/2/2020"`, which is two dates. `TIMEVALUE`
+has no such refusal — a clock has one field order everywhere. **Locale-sensitive OUTPUT is pinned invariant in v1**
 — there is deliberately no locale field in `RunInputs`: `TEXT`/`FIXED`/
 `DOLLAR` render invariant en-US forms and `NUMBERVALUE`'s omitted separators
 default to `.`/`,` — each a recorded, fixtured divergence from Excel's
@@ -1898,7 +1908,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M4d** ✅ | F1a-2 (17: ABS, ROUND, ROUNDUP, ROUNDDOWN, INT, TRUNC, MOD, POWER, SQRT, EXP, LN, LOG, LOG10, SIGN, PI, RAND, RANDBETWEEN — **SQRT and RAND pinned here, registered at M3a2**) + multi-callsite/lazy-branch draw KATs | Oracle-first; KATs |
 | **M4e** ✅ | F1b (22: SUM, COUNT, COUNTA, COUNTBLANK, AVERAGE, MIN, MAX, SUMIF, COUNTIF, AVERAGEIF, SUMPRODUCT; VLOOKUP, HLOOKUP, INDEX, MATCH, XLOOKUP, XMATCH, CHOOSE, ROW, ROWS, COLUMN, COLUMNS — **the seven M3a2 framework subjects pinned here, registered at M3a2**) — **Core gate 59** | Oracle-first |
 | **M4f** ✅ | F1c-text (19: LEFT, RIGHT, MID, LEN, LOWER, UPPER, TRIM, CONCAT, CONCATENATE, TEXTJOIN, SUBSTITUTE, REPLACE, FIND, SEARCH, EXACT, VALUE, REPT, CHAR, CODE) + **CV1/CV2 shared text layer** (§5.4d; collation_v1 landed at M3a) + **`casing_v1`** + the `unicode/` move | Oracle-first; codec tests; per-CV fixtures |
-| **M4g** | F1c-date (~15: DATE, YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, TODAY, NOW, EOMONTH, EDATE, WEEKDAY, DATEVALUE, TIMEVALUE, TIME) | Oracle-first |
+| **M4g** ✅ | F1c-date (15: DATE, YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, TODAY, NOW, EOMONTH, EDATE, WEEKDAY, DATEVALUE, TIMEVALUE, TIME) + the **invariant date grammar** (§5.4b) + `RunInputs`' clock reaching the evaluator | Oracle-first; per-epoch fixtures |
 | **M5a1** | graph.zig: node model, SCC condensation, deterministic order, **seed table**, range-order contract; closure eval semantics | Scaling assertion; order fixtures; **randomized differential test vs a brute-force graph builder** (overlaps, full rows/cols, 3D spans, names, spill resize/invalidation — a missed edge passes perf tests but corrupts caches) |
 | **M5a2** | Iteration engine (multi-SCC schedule, convergence, clamps) + callsite-keyed volatile schedule + rebuild-reuse KATs + dynamic-edge fixpoint + **complete oracle-gated INDIRECT + OFFSET contracts** (the fixpoint's test subjects; registered fully here so M6's public CLI never exposes a half-function) | Iteration oracles; stabilization fuzz; INDIRECT/OFFSET fixtures |
 | **M5b0** | **`SourceBacking`** — ref-counted file/buffer backing shared across PartStore generations (each store exclusively owns + closes one `std.Io.File`, `store.zig:105-129,326-329`; shallow clone double-closes, moving breaks retention); backing unified; repeated-recalc + ownership tests. **Ladder-ordered FIRST of the M5b group — physically before M5b1/M5b2, because the transaction that requires it cannot land earlier than it** | Ownership tests; double-close fuzz |
@@ -2435,6 +2445,81 @@ count stopped being a property of a string.
     the function that answers the other question. `CHAR`'s five
     undefined windows-1252 slots (0x81, 0x8D, 0x8F, 0x90, 0x9D) map to
     the matching C1 control, which is what Windows itself does.
+
+---
+
+**M4g decisions (shipped 2026-08-04).** Nine points, in
+`src/formula/serial_date.zig` (the clock conversion and the invariant
+grammar), `registry.zig` (fifteen rows and their implementations) and
+`eval.zig` (fixtures, and the clock reaching `Options`). The row where
+the calendar and the serial turned out to disagree.
+
+1. **`WEEKDAY` counts SERIALS, not calendar days, and under the 1900
+    system those are different answers.** 1900-02-29 never happened but
+    it occupies a serial, so serial arithmetic and the proleptic
+    calendar drift apart by exactly one day everywhere below the gap.
+    The first implementation read the calendar and was wrong: Excel
+    answers **1 (Sunday) for `WEEKDAY(1)`** although 1900-01-01 was a
+    Monday, and a workbook whose `dddd` format says Sunday must not
+    have a `WEEKDAY` that says Monday. Above serial 60 the two agree
+    again, which is why the divergence is invisible in every date
+    anyone actually uses — and why it had to be found on purpose. The
+    1904 system has no phantom day and therefore no drift; only its
+    phase differs, because its serial 0 is a Friday.
+2. **`DATEVALUE` refuses exactly when the locale would change the
+    MEANING, which is M3a1's rule for numbers applied to dates.**
+    `"1.5"` parses and `"1,5"` refuses; likewise `"1/15/2020"` parses —
+    15 is not a month, so only one reading exists, in every locale — and
+    `"1/2/2020"` refuses, because it is January 2nd in the United States
+    and February 1st nearly everywhere else. ISO and named-month forms
+    always parse: neither has a field order a locale gets to decide.
+    The alternative considered and rejected was refusing every slash
+    form, which is simpler to state and throws away dates that are not
+    ambiguous at all.
+3. **The refusal and the error are different kinds of answer, and the
+    fixtures prove it with `IFERROR`.** `DATEVALUE("hello")` is
+    `#VALUE!` — a value a formula can catch. `DATEVALUE("1/2/2020")` is
+    `FormulaLocaleSensitiveInput` — a refusal that propagates past
+    `IFERROR` to the caller. Collapsing them would either hide an
+    ambiguity behind a catchable error or invent an error for text that
+    is a perfectly good date.
+4. **`TIMEVALUE` has no locale refusal, and that asymmetry is asserted
+    rather than assumed.** A clock has one field order everywhere, so
+    `LocaleOrdered` is unreachable from it; the test sweeps every hour
+    against five minute values to say so.
+5. **Two different two-digit-year rules ship, on purpose.**
+    `DATE(20,1,1)` is **1920** — Excel's rule for a numeric year below
+    1900 is `1900 + y`. `DATEVALUE("1/15/20")` is **2020** — the text
+    grammar uses the documented 00–29 / 30–99 window. They are
+    different rules for different inputs, both Excel's, and writing one
+    of them twice would have been the easy mistake.
+6. **`TODAY` and `NOW` are volatile for a different reason than `RAND`
+    is.** A draw changes at every callsite; the clock is stable within a
+    run and changes between recalculations. Both still re-key the M5a2
+    schedule, so both carry `volatile_fn` — and the registry gate that
+    said "RAND and RANDBETWEEN are the only volatile rows" was widened
+    deliberately rather than deleted, keeping its both-directions shape.
+7. **The instant is an INPUT, never a clock read.** `Options` carries
+    `now_utc_ms` and `utc_offset_min` beside the epoch, so a recalc is
+    reproducible from `RunInputs` alone and every volatile-date fixture
+    pins an exact answer. The offset is a fixed civil offset and can
+    move the DAY — 23:30 UTC plus 60 minutes is tomorrow — which is the
+    case a UTC-only engine gets wrong and the fixtures cover in both
+    directions. No OS timezone is consulted anywhere; TZif is M10+.
+8. **`epoch_sensitive` is a second flag, not a reuse of
+    `cv_sensitive`.** They are different workbook properties with
+    different owners: one comes from `workbookPr@date1904` and changes
+    what a serial MEANS, the other from the metadata part and changes
+    what a character IS. Ten of the fifteen names carry it; `TIME`,
+    `HOUR`, `MINUTE`, `SECOND` and `TIMEVALUE` do not, because a
+    fraction of a day is the same fraction under either epoch.
+9. **`EDATE` clamps and `DATE` overflows, and both are Excel.**
+    `EDATE(2020-01-31, 1)` is February 29th — month arithmetic lands
+    inside the month it names — while `DATE(2020,1,32)` is February 1st
+    and `DATE(2020,13,1)` is January 2021, because a constructor's
+    fields are a running total. One walk with two landings serves
+    `EDATE` and `EOMONTH`, which is how Excel documents them and the
+    only difference the code has.
 
 ---
 
