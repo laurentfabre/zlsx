@@ -46,7 +46,14 @@ pub const version = "casing_v1";
 /// diff, so this is the casing zlsx actually implements.
 pub const unicode_version = tables.unicode_version;
 
-pub const Error = error{ InvalidUtf8, OutOfMemory };
+/// Casing allocates and nothing else. Invalid UTF-8 does **not** refuse
+/// here: `criteria.fold` and `text.zig` both stay total over it, and a
+/// third module deciding differently would mean `UPPER` refused a string
+/// `LEN` was happy to measure. Bytes that are not valid UTF-8 pass
+/// through untouched — the closest thing to "leave it alone" a caller
+/// can act on, and unreachable from a workbook that came through the
+/// decode boundary.
+pub const Error = error{OutOfMemory};
 
 /// Full uppercase. Returns owned bytes — caller frees.
 pub fn toUpper(allocator: std.mem.Allocator, input: []const u8) Error![]u8 {
@@ -91,7 +98,11 @@ fn map(allocator: std.mem.Allocator, input: []const u8, dir: Direction) Error![]
     // not pay for the astral plane.
     if (isAscii(input)) return mapAscii(allocator, input, dir);
 
-    if (!std.unicode.utf8ValidateSlice(input)) return error.InvalidUtf8;
+    // Invalid UTF-8 keeps its ASCII cased and everything else verbatim.
+    // There is no scalar sequence to walk, so there is no Final_Sigma
+    // context either — and no answer better than "leave the bytes I
+    // cannot read alone".
+    if (!std.unicode.utf8ValidateSlice(input)) return mapAscii(allocator, input, dir);
 
     // Final_Sigma is a property of a scalar's NEIGHBOURS, so the input is
     // decoded once into scalars rather than walked byte-wise: deciding
@@ -121,6 +132,9 @@ fn map(allocator: std.mem.Allocator, input: []const u8, dir: Direction) Error![]
     return out.toOwnedSlice(allocator);
 }
 
+/// Byte-wise casing: every ASCII letter cased, every other byte copied.
+/// Correct for two inputs — a wholly-ASCII string, where it is also the
+/// fast path, and an invalid one, where it is the total answer.
 fn mapAscii(allocator: std.mem.Allocator, input: []const u8, dir: Direction) Error![]u8 {
     const out = try allocator.alloc(u8, input.len);
     for (input, 0..) |c, i| {
@@ -162,7 +176,10 @@ fn appendCodepoint(
     cp: u21,
 ) Error!void {
     var buf: [4]u8 = undefined;
-    const n = std.unicode.utf8Encode(cp, &buf) catch return error.InvalidUtf8;
+    // Unreachable by construction: every codepoint here came out of
+    // `utf8Decode` or out of a generated table, so none is a surrogate
+    // or out of range.
+    const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
     try out.appendSlice(allocator, buf[0..n]);
 }
 
@@ -333,9 +350,13 @@ test "combining marks and astral letters pass through the right path" {
     try expectUpper("\u{1E922}", "\u{1E900}");
 }
 
-test "invalid UTF-8 refuses rather than guessing" {
-    try testing.expectError(error.InvalidUtf8, toUpper(testing.allocator, "\xFFx"));
-    try testing.expectError(error.InvalidUtf8, toLower(testing.allocator, "ab\xC3"));
+test "invalid UTF-8 stays total, like the fold and the index layer" {
+    // Not a refusal: `criteria.fold` and `text.zig` both measure and
+    // match such a string, so refusing to case it would be the third
+    // module inventing a fourth answer. ASCII is cased, the unreadable
+    // bytes are left exactly as they came.
+    try expectUpper("\xFFx", "\xFFX");
+    try expectLower("AB\xC3", "ab\xC3");
 }
 
 test "table invariants: sorted, no duplicate sources, offsets in range" {
@@ -362,7 +383,11 @@ test "table invariants: sorted, no duplicate sources, offsets in range" {
 test "Unicode version pinned, and pinned to the same revision as the fold" {
     try testing.expectEqualStrings("17.0.0", unicode_version);
     // Casing and folding decide overlapping questions about the same
-    // alphabet; two revisions would be two alphabets.
-    const fold_tables = @import("tables/casefold_data.zig");
-    try testing.expectEqualStrings(fold_tables.unicode_version, unicode_version);
+    // alphabet; two revisions would be two alphabets. The check goes
+    // through the fold MODULE rather than its table file: importing
+    // `tables/casefold_data.zig` from here would put that file in two
+    // module trees, which is the same constraint that moved this whole
+    // directory out of `src/`.
+    const casefold = @import("zlsx_casefold");
+    try testing.expectEqualStrings(casefold.unicode_version, unicode_version);
 }

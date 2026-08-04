@@ -39,6 +39,12 @@ const tables = @import("tables/casefold_data.zig");
 // 0.15: "file exists in modules 'root' and 'leafmod'".
 const nfc = @import("zlsx_nfc");
 
+/// The Unicode revision the committed fold tables were generated from,
+/// re-exported so a consumer can check it against its own without
+/// importing the table file — which would put that file in a second
+/// module's package tree and fail to compile.
+pub const unicode_version = tables.unicode_version;
+
 /// Fully fold a UTF-8 string using non-Turkic full case folding.
 /// Returns owned bytes — caller frees.
 ///

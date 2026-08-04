@@ -177,6 +177,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // For the version cross-check only: casing and folding must be
+    // generated from one Unicode revision, and reaching the fold's
+    // table file directly would put it in two module trees.
+    casing_mod.addImport("zlsx_casefold", unicode_mod);
 
     // M0 (tier D1): typed coordinates — the single owner of A1 parse /
     // format and the grid bounds. Rooted at top-level `refs/` for the
@@ -209,6 +213,7 @@ pub fn build(b: *std.Build) void {
     zlsx_mod.addImport("zlsx_refs", refs_mod);
     zlsx_mod.addImport("zlsx_xid", xid_mod);
     zlsx_mod.addImport("zlsx_casefold", unicode_mod);
+    zlsx_mod.addImport("zlsx_casing", casing_mod);
 
     // Unit tests (embedded in src/xlsx.zig, including the fuzz suite).
     const unit_mod = b.createModule(.{
@@ -225,6 +230,7 @@ pub fn build(b: *std.Build) void {
     unit_mod.addImport("fuzz_config", fuzz_config_mod);
     unit_mod.addImport("zlsx_nfc", nfc_mod);
     unit_mod.addImport("zlsx_casefold", unicode_mod);
+    unit_mod.addImport("zlsx_casing", casing_mod);
     unit_mod.addImport("zlsx_refs", refs_mod);
     unit_mod.addImport("zlsx_xid", xid_mod);
     const unit_tests = b.addTest(.{ .root_module = unit_mod });
@@ -255,6 +261,7 @@ pub fn build(b: *std.Build) void {
     unit_fuzz_mod.addImport("fuzz_config", fuzz_config_mod);
     unit_fuzz_mod.addImport("zlsx_nfc", nfc_mod);
     unit_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
+    unit_fuzz_mod.addImport("zlsx_casing", casing_mod);
     unit_fuzz_mod.addImport("zlsx_refs", refs_mod);
     unit_fuzz_mod.addImport("zlsx_xid", xid_mod);
     // Zig 0.16.0 cannot compile its own test runner in `-ffuzz` mode
@@ -346,6 +353,7 @@ pub fn build(b: *std.Build) void {
     writer_mod.addImport("fuzz_config", fuzz_config_mod);
     writer_mod.addImport("zlsx_nfc", nfc_mod);
     writer_mod.addImport("zlsx_casefold", unicode_mod);
+    writer_mod.addImport("zlsx_casing", casing_mod);
     writer_mod.addImport("zlsx_refs", refs_mod);
     const writer_tests = b.addTest(.{ .root_module = writer_mod });
     test_step.dependOn(&b.addRunArtifact(writer_tests).step);
@@ -636,6 +644,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     formula_value_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_value_mod.addImport("zlsx_casing", casing_mod);
     formula_value_mod.addAnonymousImport("oracle_hand_spec_excel", .{
         .root_source_file = b.path("tests/oracle/fixtures/hand_spec_excel.json"),
     });
@@ -657,6 +666,7 @@ pub fn build(b: *std.Build) void {
         .fuzz = true,
     });
     formula_value_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_value_fuzz_mod.addImport("zlsx_casing", casing_mod);
     formula_value_fuzz_mod.addAnonymousImport("oracle_hand_spec_excel", .{
         .root_source_file = b.path("tests/oracle/fixtures/hand_spec_excel.json"),
     });
@@ -687,6 +697,7 @@ pub fn build(b: *std.Build) void {
     });
     formula_env_mod.addImport("zlsx_refs", refs_mod);
     formula_env_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_env_mod.addImport("zlsx_casing", casing_mod);
     addOracleFixtures(b, formula_env_mod);
     const formula_env_tests = b.addTest(.{ .root_module = formula_env_mod });
     test_step.dependOn(&b.addRunArtifact(formula_env_tests).step);
@@ -704,6 +715,7 @@ pub fn build(b: *std.Build) void {
     formula_eval_mod.addImport("zlsx_refs", refs_mod);
     formula_eval_mod.addImport("zlsx_xid", xid_mod);
     formula_eval_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_eval_mod.addImport("zlsx_casing", casing_mod);
     addOracleFixtures(b, formula_eval_mod);
     const formula_eval_tests = b.addTest(.{ .root_module = formula_eval_mod });
     test_step.dependOn(&b.addRunArtifact(formula_eval_tests).step);
@@ -719,6 +731,7 @@ pub fn build(b: *std.Build) void {
     });
     formula_run_inputs_mod.addImport("zlsx_refs", refs_mod);
     formula_run_inputs_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_run_inputs_mod.addImport("zlsx_casing", casing_mod);
     addOracleFixtures(b, formula_run_inputs_mod);
     const formula_run_inputs_tests = b.addTest(.{ .root_module = formula_run_inputs_mod });
     test_step.dependOn(&b.addRunArtifact(formula_run_inputs_tests).step);
@@ -730,6 +743,7 @@ pub fn build(b: *std.Build) void {
     });
     formula_serial_date_mod.addImport("zlsx_refs", refs_mod);
     formula_serial_date_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_serial_date_mod.addImport("zlsx_casing", casing_mod);
     addOracleFixtures(b, formula_serial_date_mod);
     const formula_serial_date_tests = b.addTest(.{ .root_module = formula_serial_date_mod });
     test_step.dependOn(&b.addRunArtifact(formula_serial_date_tests).step);
@@ -745,9 +759,27 @@ pub fn build(b: *std.Build) void {
     });
     formula_criteria_mod.addImport("zlsx_refs", refs_mod);
     formula_criteria_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_criteria_mod.addImport("zlsx_casing", casing_mod);
     addOracleFixtures(b, formula_criteria_mod);
     const formula_criteria_tests = b.addTest(.{ .root_module = formula_criteria_mod });
     test_step.dependOn(&b.addRunArtifact(formula_criteria_tests).step);
+
+    // M4f: §5.4d's shared text layer — the CV1/CV2 index unit and the
+    // conversions the five affected functions need. It sits below the
+    // evaluator like `criteria.zig` does, and imports neither it nor the
+    // registry: what a character IS cannot depend on which function
+    // asked.
+    const formula_text_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/text.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_text_mod.addImport("zlsx_refs", refs_mod);
+    formula_text_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_text_mod.addImport("zlsx_casing", casing_mod);
+    addOracleFixtures(b, formula_text_mod);
+    const formula_text_tests = b.addTest(.{ .root_module = formula_text_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_text_tests).step);
 
     // M3b: the criteria fuzz target (§8.1) — no criterion string may
     // panic, leak, or match non-deterministically.
@@ -759,6 +791,7 @@ pub fn build(b: *std.Build) void {
     });
     formula_criteria_fuzz_mod.addImport("zlsx_refs", refs_mod);
     formula_criteria_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_criteria_fuzz_mod.addImport("zlsx_casing", casing_mod);
     addOracleFixtures(b, formula_criteria_fuzz_mod);
     const formula_criteria_fuzz_tests = b.addTest(.{
         .root_module = formula_criteria_fuzz_mod,
@@ -776,6 +809,7 @@ pub fn build(b: *std.Build) void {
     formula_rng_mod.addImport("zlsx_refs", refs_mod);
     formula_rng_mod.addImport("zlsx_xid", xid_mod);
     formula_rng_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_rng_mod.addImport("zlsx_casing", casing_mod);
     addOracleFixtures(b, formula_rng_mod);
     const formula_rng_tests = b.addTest(.{ .root_module = formula_rng_mod });
     test_step.dependOn(&b.addRunArtifact(formula_rng_tests).step);
@@ -795,6 +829,7 @@ pub fn build(b: *std.Build) void {
     formula_metadata_mod.addImport("zlsx_refs", refs_mod);
     formula_metadata_mod.addImport("zlsx_xid", xid_mod);
     formula_metadata_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_metadata_mod.addImport("zlsx_casing", casing_mod);
     addOracleFixtures(b, formula_metadata_mod);
     const formula_metadata_tests = b.addTest(.{ .root_module = formula_metadata_mod });
     test_step.dependOn(&b.addRunArtifact(formula_metadata_tests).step);
@@ -810,6 +845,7 @@ pub fn build(b: *std.Build) void {
     formula_metadata_fuzz_mod.addImport("zlsx_refs", refs_mod);
     formula_metadata_fuzz_mod.addImport("zlsx_xid", xid_mod);
     formula_metadata_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_metadata_fuzz_mod.addImport("zlsx_casing", casing_mod);
     addOracleFixtures(b, formula_metadata_fuzz_mod);
     const formula_metadata_fuzz_tests = b.addTest(.{
         .root_module = formula_metadata_fuzz_mod,
@@ -834,6 +870,7 @@ pub fn build(b: *std.Build) void {
     formula_decode_mod.addImport("zlsx_refs", refs_mod);
     formula_decode_mod.addImport("zlsx_xid", xid_mod);
     formula_decode_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_decode_mod.addImport("zlsx_casing", casing_mod);
     addOracleFixtures(b, formula_decode_mod);
     const formula_decode_tests = b.addTest(.{ .root_module = formula_decode_mod });
     test_step.dependOn(&b.addRunArtifact(formula_decode_tests).step);
@@ -852,6 +889,7 @@ pub fn build(b: *std.Build) void {
     formula_calc_mod.addImport("zlsx_refs", refs_mod);
     formula_calc_mod.addImport("zlsx_xid", xid_mod);
     formula_calc_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_calc_mod.addImport("zlsx_casing", casing_mod);
     addOracleFixtures(b, formula_calc_mod);
     const formula_calc_tests = b.addTest(.{ .root_module = formula_calc_mod });
     test_step.dependOn(&b.addRunArtifact(formula_calc_tests).step);
@@ -867,6 +905,7 @@ pub fn build(b: *std.Build) void {
     formula_calc_fuzz_mod.addImport("zlsx_refs", refs_mod);
     formula_calc_fuzz_mod.addImport("zlsx_xid", xid_mod);
     formula_calc_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_calc_fuzz_mod.addImport("zlsx_casing", casing_mod);
     addOracleFixtures(b, formula_calc_fuzz_mod);
     const formula_calc_fuzz_tests = b.addTest(.{
         .root_module = formula_calc_fuzz_mod,
@@ -887,6 +926,7 @@ pub fn build(b: *std.Build) void {
     formula_names_mod.addImport("zlsx_refs", refs_mod);
     formula_names_mod.addImport("zlsx_xid", xid_mod);
     formula_names_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_names_mod.addImport("zlsx_casing", casing_mod);
     addOracleFixtures(b, formula_names_mod);
     const formula_names_tests = b.addTest(.{ .root_module = formula_names_mod });
     test_step.dependOn(&b.addRunArtifact(formula_names_tests).step);
@@ -902,6 +942,7 @@ pub fn build(b: *std.Build) void {
     formula_names_fuzz_mod.addImport("zlsx_refs", refs_mod);
     formula_names_fuzz_mod.addImport("zlsx_xid", xid_mod);
     formula_names_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_names_fuzz_mod.addImport("zlsx_casing", casing_mod);
     addOracleFixtures(b, formula_names_fuzz_mod);
     const formula_names_fuzz_tests = b.addTest(.{
         .root_module = formula_names_fuzz_mod,
@@ -920,6 +961,7 @@ pub fn build(b: *std.Build) void {
     formula_decode_fuzz_mod.addImport("zlsx_refs", refs_mod);
     formula_decode_fuzz_mod.addImport("zlsx_xid", xid_mod);
     formula_decode_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_decode_fuzz_mod.addImport("zlsx_casing", casing_mod);
     addOracleFixtures(b, formula_decode_fuzz_mod);
     const formula_decode_fuzz_tests = b.addTest(.{
         .root_module = formula_decode_fuzz_mod,
@@ -936,6 +978,7 @@ pub fn build(b: *std.Build) void {
     formula_symbols_mod.addImport("zlsx_refs", refs_mod);
     formula_symbols_mod.addImport("zlsx_xid", xid_mod);
     formula_symbols_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_symbols_mod.addImport("zlsx_casing", casing_mod);
     addOracleFixtures(b, formula_symbols_mod);
     const formula_symbols_tests = b.addTest(.{ .root_module = formula_symbols_mod });
     test_step.dependOn(&b.addRunArtifact(formula_symbols_tests).step);
@@ -980,6 +1023,7 @@ pub fn build(b: *std.Build) void {
     formula_eval_fuzz_mod.addImport("zlsx_refs", refs_mod);
     formula_eval_fuzz_mod.addImport("zlsx_xid", xid_mod);
     formula_eval_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_eval_fuzz_mod.addImport("zlsx_casing", casing_mod);
     addOracleFixtures(b, formula_eval_fuzz_mod);
     const formula_eval_fuzz_tests = b.addTest(.{
         .root_module = formula_eval_fuzz_mod,

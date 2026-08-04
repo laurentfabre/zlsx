@@ -61,6 +61,9 @@ const value = @import("value.zig");
 const env = @import("env.zig");
 const eval = @import("eval.zig");
 const criteria = @import("criteria.zig");
+const text = @import("text.zig");
+const run_inputs = @import("run_inputs.zig");
+const casing = @import("zlsx_casing");
 
 const Value = eval.Value;
 
@@ -108,6 +111,20 @@ pub const CallCtx = struct {
     /// failure the single-comparator rule exists to prevent.
     pub fn collation(self: CallCtx) value.Collation {
         return self.ev.opts.collation;
+    }
+
+    /// §5.4d's compatibility version — what a character is to the five
+    /// functions whose answer is a count or a position. Reached through
+    /// the context for the same reason the collation is: an
+    /// implementation that decided its own would be a second answer to
+    /// "how long is this string".
+    pub fn cv(self: CallCtx) text.Cv {
+        return self.ev.opts.text_compat;
+    }
+
+    /// §5.4b's code page, for `CHAR` and `CODE`.
+    pub fn platformProfile(self: CallCtx) run_inputs.PlatformProfile {
+        return self.ev.opts.platform_profile;
     }
 };
 

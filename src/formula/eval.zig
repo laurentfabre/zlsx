@@ -284,6 +284,16 @@ pub const Options = struct {
     /// cell and passes what it gets (§5.3b).
     dialect: value.Dialect = .dynamic_array,
     site: ?EvalSite = null,
+    /// §5.4d's compatibility version, and therefore what a *character*
+    /// is to `LEN`/`MID`/`FIND`/`SEARCH`/`REPLACE`. Workbook-derived:
+    /// recalc passes what `CalcState` parsed, and the default is CV1
+    /// because a workbook with no compatibility metadata IS CV1.
+    text_compat: run_inputs.CompatibilityVersion = .cv1,
+    /// §5.4b's code page, which `CHAR` and `CODE` resolve through. The
+    /// v1 enum is closed, so this is a seam rather than a choice — but
+    /// it is the seam a second profile lands in, and it belongs to the
+    /// run rather than to the workbook.
+    platform_profile: run_inputs.PlatformProfile = .windows_1252,
     /// §5.9 name resolution. Optional, and null is not a degraded mode
     /// but a *stated* one: with no symbol layer every spelling provably
     /// resolves nowhere, which is the terminal stage of the
