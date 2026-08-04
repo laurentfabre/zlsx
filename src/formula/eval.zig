@@ -1729,10 +1729,11 @@ fn staticWalk(
 const testing = std.testing;
 
 /// The shipped fold, wired in the test section only — the same
-/// arrangement `value.zig` uses, and for the same reason: a named module
-/// rooted on `src/unicode/casefold.zig` collides with `zlsx` the moment
-/// the engine is imported from `src/`, so the semantics take the fold as
-/// a parameter and only the tests name it.
+/// arrangement `value.zig` uses, and for the same reason: the semantics
+/// take the fold as a parameter so a second, quietly different
+/// comparator cannot appear, and only the tests name the concrete one.
+/// (Before M4f there was a build reason too, since the file then lived
+/// inside the `zlsx` package tree.)
 const casefold = @import("zlsx_casefold");
 const rng = @import("rng.zig");
 

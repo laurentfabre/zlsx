@@ -39,13 +39,13 @@
 //! ------------------------------
 //! `collation_v1` is stated once here as an algorithm over folded code
 //! points, and takes the fold as an injected `FoldFn`. That is not
-//! indirection for its own sake: the shipped fold lives at
-//! `src/unicode/casefold.zig`, which is inside the `zlsx` module's
-//! package tree (`src/xlsx.zig:25` imports it relatively), so a named
-//! module rooted on the same file would collide the moment `zlsx`
-//! imports the formula engine — the failure M0 hit with `refs/` and
-//! M1a hit with `unicode/xid.zig`. Injection keeps the *semantics*
-//! independent of the build graph; the test section below wires the
+//! indirection for its own sake. Until M4f the shipped fold lived at
+//! `src/unicode/casefold.zig`, inside the `zlsx` module's package tree,
+//! so a named module rooted on the same file collided the moment `zlsx`
+//! imported the formula engine — the failure M0 hit with `refs/` and
+//! M1a hit with `unicode/xid.zig`. M4f moved it to `unicode/`, which
+//! ends that particular collision; injection stays because it keeps the
+//! *semantics* independent of the build graph. The test section wires the
 //! real fold so the fixtures run against the shipped algorithm.
 
 const std = @import("std");
@@ -1136,9 +1136,8 @@ pub const divergence_points = [_]DivergencePoint{
 // resolved in a non-test build — verified against Zig 0.16.0 — so a
 // module built from this file without declaring `zlsx_casefold`
 // compiles fine. That is what lets the fixtures run against the shipped
-// algorithm while `collation_v1` stays injection-based, and it is what
-// keeps `src/unicode/casefold.zig` from having to belong to two module
-// trees at once (see the module header).
+// algorithm while `collation_v1` stays injection-based (see the module
+// header).
 
 const casefold = @import("zlsx_casefold");
 const testing = std.testing;
