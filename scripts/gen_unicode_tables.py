@@ -2,12 +2,32 @@
 """
 A1 (post-0.2.9 roadmap): Unicode table generator.
 
-Three operating modes:
+Four operating modes:
 
   --mode casefold:
     Reads `CaseFolding.txt` and emits a vendored Zig data file
-    powering `src/unicode/casefold.zig`. Policy: non-Turkic full
+    powering `unicode/casefold.zig`. Policy: non-Turkic full
     case fold (statuses C + F).
+
+  --mode casing:
+    Reads `UnicodeData.txt` + `SpecialCasing.txt` +
+    `DerivedCoreProperties.txt` and emits the `casing_v1` tables
+    powering `unicode/casing.zig` (M4f, §5.4b). Folding cannot
+    implement casing — `fold("ß")` is `"ss"` where `UPPER("ß")` is
+    `"SS"` — so this is a separate table with a separate policy:
+
+      - full mappings, not simple ones: `ß` → `SS` is
+        length-changing and a one-to-one table cannot express it;
+      - `SpecialCasing.txt`'s **unconditional** rows override
+        `UnicodeData.txt`'s simple mappings;
+      - the one locale-INdependent conditional row, `Final_Sigma`,
+        ships as its own runtime rule (Σ lowercases to ς at the end
+        of a word, σ elsewhere), with the `Cased` / `Case_Ignorable`
+        intervals it needs to decide "end of a word";
+      - every locale-conditional row (`tr`, `az`, `lt`) is
+        REJECTED. Turkish dotless-ı casing is a divergence zlsx
+        records rather than implements: there is no locale in
+        `RunInputs` to select it with (§5.4b).
 
   --mode nfc:
     Reads `UnicodeData.txt` + `CompositionExclusions.txt` and emits
@@ -35,7 +55,13 @@ Three operating modes:
 Usage:
     scripts/gen_unicode_tables.py --mode casefold \\
         --input /path/to/CaseFolding.txt \\
-        --output src/unicode/tables/casefold_data.zig
+        --output unicode/tables/casefold_data.zig
+
+    scripts/gen_unicode_tables.py --mode casing \\
+        --input /path/to/UnicodeData.txt \\
+        --special /path/to/SpecialCasing.txt \\
+        --props /path/to/DerivedCoreProperties.txt \\
+        --output unicode/tables/casing_data.zig
 
     scripts/gen_unicode_tables.py --mode nfc \\
         --input /path/to/UnicodeData.txt \\
@@ -159,6 +185,217 @@ def emit_zig(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines))
     print(f"gen_unicode_tables: {len(entries)} entries, {len(pool)} pool scalars → {out_path}")
+
+
+# ─── casing_v1 (M4f, §5.4b) ──────────────────────────────────────────
+
+# The three casing columns of UnicodeData.txt, which the NFC regex above
+# deliberately stops short of: fields 12, 13 and 14 (uppercase, lowercase
+# and titlecase simple mappings) of a 15-field record.
+UNICODE_DATA_FIELDS = 15
+UD_FIELD_UPPER = 12
+UD_FIELD_LOWER = 13
+UD_FIELD_TITLE = 14
+
+SPECIAL_CASING_VERSION_LINE = re.compile(r"^# SpecialCasing-(?P<version>[0-9.]+)\.txt")
+
+# The one conditional row that carries no language tag. Every other
+# condition in SpecialCasing.txt is `lt`, `tr` or `az`.
+FINAL_SIGMA = "Final_Sigma"
+
+
+def parse_simple_casing(path: Path) -> dict[str, dict[int, list[int]]]:
+    """UnicodeData.txt's simple upper/lower/title mappings.
+
+    Identity mappings are dropped: the runtime returns an unmapped
+    codepoint unchanged, so a row saying so would only cost a binary
+    search step. Range records (`<..., First>` / `<..., Last>`) carry no
+    casing and need no expansion."""
+    out: dict[str, dict[int, list[int]]] = {"upper": {}, "lower": {}, "title": {}}
+    with path.open() as f:
+        for line in f:
+            fields = line.rstrip("\n").split(";")
+            if len(fields) != UNICODE_DATA_FIELDS:
+                continue
+            cp = int(fields[0], 16)
+            for key, idx in (
+                ("upper", UD_FIELD_UPPER),
+                ("lower", UD_FIELD_LOWER),
+                ("title", UD_FIELD_TITLE),
+            ):
+                raw = fields[idx].strip()
+                if not raw:
+                    continue
+                mapping = [int(c, 16) for c in raw.split()]
+                if mapping == [cp]:
+                    continue
+                out[key][cp] = mapping
+    return out
+
+
+def parse_special_casing(
+    path: Path,
+) -> tuple[str, dict[str, dict[int, list[int]]], dict[str, list[int]], list[str]]:
+    """SpecialCasing.txt, split by this generator's policy.
+
+    Returns `(version, unconditional, final_sigma, rejected)` where
+    `unconditional` has the same shape as `parse_simple_casing`'s result,
+    `final_sigma` holds the one locale-independent conditional row, and
+    `rejected` names every locale-conditional row that was dropped — the
+    generator prints it, so "we do not do Turkish" stays a visible
+    decision rather than a silent absence."""
+    version = ""
+    uncond: dict[str, dict[int, list[int]]] = {"upper": {}, "lower": {}, "title": {}}
+    final_sigma: dict[str, list[int]] = {}
+    rejected: list[str] = []
+
+    with path.open() as f:
+        for raw_line in f:
+            if not version:
+                m = SPECIAL_CASING_VERSION_LINE.match(raw_line)
+                if m:
+                    version = m.group("version")
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            fields = [x.strip() for x in line.split(";")]
+            # `<code>; <lower>; <title>; <upper>;` then an optional
+            # condition list, then the trailing empty field the `;`
+            # terminator leaves behind.
+            if len(fields) < 5:
+                continue
+            cp = int(fields[0], 16)
+            lower = [int(c, 16) for c in fields[1].split()]
+            title = [int(c, 16) for c in fields[2].split()]
+            upper = [int(c, 16) for c in fields[3].split()]
+            condition = fields[4]
+
+            if not condition:
+                for key, mapping in (("upper", upper), ("lower", lower), ("title", title)):
+                    if mapping == [cp]:
+                        continue
+                    uncond[key][cp] = mapping
+                continue
+
+            if condition == FINAL_SIGMA:
+                if cp != 0x03A3:
+                    raise SystemExit(
+                        f"gen_unicode_tables: unexpected {FINAL_SIGMA} source U+{cp:04X}"
+                    )
+                final_sigma = {"source": [cp], "lower": lower}
+                continue
+
+            rejected.append(f"U+{cp:04X} ({condition})")
+
+    if not version:
+        raise SystemExit("gen_unicode_tables: input missing # SpecialCasing-X.Y.Z.txt header")
+    if not final_sigma:
+        raise SystemExit(f"gen_unicode_tables: {FINAL_SIGMA} row absent from SpecialCasing.txt")
+    return version, uncond, final_sigma, rejected
+
+
+def emit_casing_zig(
+    out_path: Path,
+    version: str,
+    simple: dict[str, dict[int, list[int]]],
+    special: dict[str, dict[int, list[int]]],
+    final_sigma: dict[str, list[int]],
+    props: dict[str, list[tuple[int, int]]],
+    digests: dict[str, str],
+    rejected: list[str],
+) -> None:
+    """Render `casing_data.zig`: three full-mapping tables, the
+    Final_Sigma rule, and the two property tables that rule needs."""
+    merged: dict[str, dict[int, list[int]]] = {}
+    for key in ("upper", "lower", "title"):
+        # SpecialCasing wins: its rows are the full mappings, and a full
+        # mapping that agrees with the simple one is not in the file.
+        combined = dict(simple[key])
+        combined.update(special[key])
+        merged[key] = combined
+
+    lines = [
+        "// AUTO-GENERATED by scripts/gen_unicode_tables.py — DO NOT EDIT",
+        "// Source files (UCD):",
+        "//   https://www.unicode.org/Public/UCD/latest/ucd/UnicodeData.txt",
+        "//   https://www.unicode.org/Public/UCD/latest/ucd/SpecialCasing.txt",
+        "//   https://www.unicode.org/Public/UCD/latest/ucd/DerivedCoreProperties.txt",
+    ]
+    for k, v in digests.items():
+        lines.append(f"// SHA-256 of {k}: {v}")
+    lines.extend([
+        f"// Unicode version: {version}",
+        "// Policy: `casing_v1` — locale-neutral FULL casing. UnicodeData",
+        "// simple mappings, overridden by unconditional SpecialCasing rows,",
+        "// plus the locale-independent Final_Sigma rule. Locale-conditional",
+        f"// rows (tr/az/lt) are rejected: {len(rejected)} dropped.",
+        *ATTRIBUTION,
+        "",
+        f'pub const unicode_version: []const u8 = "{version}";',
+        "",
+        "/// A full case mapping: `len` scalars at `offset` in the matching",
+        "/// pool. Length-changing by construction — `ß` (one scalar) maps to",
+        "/// `SS` (two), which is the whole reason this is not a `u21` pair.",
+        "pub const CaseEntry = struct { from: u21, len: u8, offset: u32 };",
+        "",
+    ])
+
+    for key in ("upper", "lower", "title"):
+        pool: list[int] = []
+        records: list[tuple[int, int, int]] = []
+        for cp in sorted(merged[key]):
+            mapping = merged[key][cp]
+            records.append((cp, len(mapping), len(pool)))
+            pool.extend(mapping)
+        lines.append(f"pub const {key}_entries: []const CaseEntry = &.{{")
+        for cp, length, offset in records:
+            lines.append(f"    .{{ .from = 0x{cp:04X}, .len = {length}, .offset = {offset} }},")
+        lines.append("};")
+        lines.append("")
+        lines.append(f"pub const {key}_scalars: []const u21 = &.{{")
+        for i in range(0, len(pool), 8):
+            chunk = ", ".join(f"0x{c:04X}" for c in pool[i : i + 8])
+            lines.append(f"    {chunk},")
+        lines.append("};")
+        lines.append("")
+
+    sigma_lower = final_sigma["lower"]
+    if len(sigma_lower) != 1:
+        raise SystemExit("gen_unicode_tables: Final_Sigma lower mapping is not a single scalar")
+    lines.extend([
+        "/// The one conditional SpecialCasing row that carries no language",
+        "/// tag: GREEK CAPITAL LETTER SIGMA lowercases to FINAL SIGMA at the",
+        "/// end of a word and to ordinary SMALL SIGMA everywhere else. The",
+        "/// condition is decided at runtime over the two property tables",
+        "/// below, because it is a property of the neighbours rather than of",
+        "/// the codepoint.",
+        f"pub const final_sigma_source: u21 = 0x{final_sigma['source'][0]:04X};",
+        f"pub const final_sigma_lower: u21 = 0x{sigma_lower[0]:04X};",
+        "",
+        "/// `Cased` and `Case_Ignorable` (UAX #29 / DerivedCoreProperties),",
+        "/// the two properties Final_Sigma is defined over. Same interval",
+        "/// shape as `xid_data.zig`: sorted, coalesced, binary-searchable,",
+        "/// allocation-free.",
+        "pub const Range = struct { lo: u21, hi: u21 };",
+        "",
+    ])
+    for prop, name in (("Cased", "cased"), ("Case_Ignorable", "case_ignorable")):
+        lines.append(f"pub const {name}: []const Range = &.{{")
+        for lo, hi in props[prop]:
+            lines.append(f"    .{{ .lo = 0x{lo:04X}, .hi = 0x{hi:04X} }},")
+        lines.append("};")
+        lines.append("")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines))
+    print(
+        f"gen_unicode_tables(casing): "
+        f"{len(merged['upper'])} upper, {len(merged['lower'])} lower, "
+        f"{len(merged['title'])} title, "
+        f"{len(props['Cased'])} cased + {len(props['Case_Ignorable'])} "
+        f"case-ignorable ranges → {out_path}"
+    )
+    print(f"gen_unicode_tables(casing): rejected {len(rejected)} locale rows: {', '.join(rejected)}")
 
 
 UNICODE_DATA_LINE = re.compile(
@@ -440,11 +677,45 @@ def parse_unicode_version_from_data(path: Path) -> str:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["casefold", "nfc", "xid"], default="casefold")
+    p.add_argument("--mode", choices=["casefold", "casing", "nfc", "xid"], default="casefold")
     p.add_argument("--input", type=Path, required=True)
     p.add_argument("--excl", type=Path, default=None, help="CompositionExclusions.txt (NFC only)")
+    p.add_argument("--special", type=Path, default=None, help="SpecialCasing.txt (casing only)")
+    p.add_argument(
+        "--props", type=Path, default=None, help="DerivedCoreProperties.txt (casing only)"
+    )
     p.add_argument("--output", type=Path, required=True)
     args = p.parse_args()
+
+    if args.mode == "casing":
+        if args.special is None or args.props is None:
+            print(
+                "gen_unicode_tables: --mode casing requires --special and --props",
+                file=sys.stderr,
+            )
+            return 2
+        simple = parse_simple_casing(args.input)
+        version, special, final_sigma, rejected = parse_special_casing(args.special)
+        prop_version, props = parse_derived_core_properties(
+            args.props, ("Cased", "Case_Ignorable")
+        )
+        # Three files, one Unicode revision. A casing table built from
+        # 17.0.0 mappings and 16.0.0 properties would decide Final_Sigma
+        # by a different alphabet than it cases.
+        if prop_version != version:
+            raise SystemExit(
+                "gen_unicode_tables: SpecialCasing is "
+                f"{version} but DerivedCoreProperties is {prop_version}"
+            )
+        digests = {
+            args.input.name: hashlib.sha256(args.input.read_bytes()).hexdigest(),
+            args.special.name: hashlib.sha256(args.special.read_bytes()).hexdigest(),
+            args.props.name: hashlib.sha256(args.props.read_bytes()).hexdigest(),
+        }
+        emit_casing_zig(
+            args.output, version, simple, special, final_sigma, props, digests, rejected
+        )
+        return 0
 
     if args.mode == "casefold":
         raw = args.input.read_bytes()

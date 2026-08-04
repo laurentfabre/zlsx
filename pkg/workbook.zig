@@ -3567,7 +3567,7 @@ pub const Workbook = struct {
     /// **Case folding.** Duplicate-name detection still uses ASCII
     /// case-fold (a..z ↔ A..Z); the Writer-side `addSheet` collision
     /// loop uses the Unicode case-fold via
-    /// `src/unicode/casefold.zig`. Workbook's collision check is
+    /// `unicode/casefold.zig`. Workbook's collision check is
     /// per-sheet rather than per-write, so the ASCII compromise is
     /// retained here pending a follow-up iter.
     ///
