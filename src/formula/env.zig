@@ -174,6 +174,11 @@ pub const Error = error{
     /// The typed refusal itself stays with the resolver, which owns the
     /// diagnostic; this interface only needs to know the read failed.
     MetadataRefused,
+    /// A `NameResolver` refused a spelling in value position (M4b3) —
+    /// a macro name, a reserved prefix, a relative body, or a table
+    /// reference. Same split as `MetadataRefused`: the typed reason
+    /// stays with the resolver that raised it.
+    NameRefused,
 };
 
 /// One occupied cell of the merged view.
@@ -320,6 +325,56 @@ pub const DialectResolver = struct {
 
     pub fn dialectOf(self: DialectResolver, cm: u32, vm: u32) Error!value.Dialect {
         return self.resolve(self.ctx, cm, vm);
+    }
+};
+
+/// What a spelling in value position resolves to (§5.9), as the
+/// evaluator sees it.
+///
+/// Deliberately thin. The symbol layer knows about scopes, folding,
+/// tables and the `_xlnm.` vocabulary; the evaluator needs to know
+/// whether there is a body to expand, and if not, which of the three
+/// non-answers it got. Keeping the union this small is what lets
+/// `eval.zig` stay ignorant of `symbols.zig` — which imports it.
+pub const NameBinding = union(enum) {
+    /// A defined name's decoded body, to expand.
+    body: struct {
+        text: []const u8,
+        /// The name's own scope, if it has one. Unqualified references
+        /// inside the body resolve against it; a workbook-scoped name
+        /// resolves them against the referencing sheet, which is the
+        /// only sheet in the picture.
+        scope: ?SheetIndex,
+    },
+    /// The spelling names a table. Evaluating one is M7b's; §5.9's
+    /// order still has to *reach* the table tier, because a table
+    /// shadows an `_xlnm.` builtin of the same spelling.
+    table,
+    /// Provably nowhere: `#NAME?`, a plane-1 error value.
+    not_found,
+};
+
+/// §5.9 name resolution, injected the way `DialectResolver` is.
+///
+/// A function pointer rather than an import, and for the same reason:
+/// `symbols.zig` imports this file, so this file cannot import it. A
+/// refusal arrives as `error.NameRefused` and the typed reason stays
+/// with the implementation, which owns the diagnostic (M4a decision 17,
+/// applied to the second resolver).
+pub const NameResolver = struct {
+    ctx: *anyopaque,
+    /// `from` is the sheet the reference sits on, or null at workbook
+    /// level (a name's own body). `spelling` is the source spelling,
+    /// undecoded and unfolded — folding is the symbol layer's, and it
+    /// owns the comparator.
+    resolve: *const fn (ctx: *anyopaque, from: ?SheetIndex, spelling: []const u8) Error!NameBinding,
+
+    pub fn resolveName(
+        self: NameResolver,
+        from: ?SheetIndex,
+        spelling: []const u8,
+    ) Error!NameBinding {
+        return self.resolve(self.ctx, from, spelling);
     }
 };
 

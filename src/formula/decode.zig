@@ -206,6 +206,17 @@ pub const Refusal = struct {
         /// LAMBDA/LET through v1, and a parameter binding reached from
         /// outside its own body has no value to give.
         lambda_parameter_name,
+        /// A referenced name carrying `function`, `vbProcedure`, or
+        /// `xlm` (M4b3's `CT_DefinedName` inventory). The name is a
+        /// macro entry point, not a value; resolving it as one would
+        /// answer a different question than the formula asked. Carried
+        /// rather than refused at read time — a macro name a formula
+        /// never mentions is not a reason to refuse a workbook.
+        macro_defined_name,
+        /// A referenced name whose body contains a relative reference.
+        /// What it denotes depends on where it is used, and v1 does not
+        /// carry the use site into name expansion (§5.9; M10+ lifts it).
+        relative_reference_name,
     };
 
     /// Exhaustive by construction — a new `Reason` fails to compile
@@ -244,6 +255,8 @@ pub const Refusal = struct {
             .unencodable_formula_char,
             .unknown_builtin_name,
             .lambda_parameter_name,
+            .macro_defined_name,
+            .relative_reference_name,
             => .FormulaUnsupportedConstruct,
 
             .limit_exceeded => .FormulaLimitExceeded,
@@ -1937,6 +1950,14 @@ const SheetWalk = struct {
     }
 };
 
+/// An `xsd:unsignedInt` attribute with a schema default. Null means the
+/// attribute was present and not that type — which for a table's row
+/// counts is a geometry nobody can compute.
+fn parseCount(raw: ?[]const u8, default: u32) ?u32 {
+    const s = raw orelse return default;
+    return std.fmt.parseInt(u32, s, 10) catch null;
+}
+
 /// `cm`/`vm` are `xsd:unsignedInt` with default `0`. Null means the
 /// attribute was present and not that type.
 fn parseIndexAttr(el: Element, name: []const u8) ?u32 {
@@ -1952,6 +1973,13 @@ pub const TableColumn = struct {
     /// Decoded (FORMULA carrier), when the column is calculated.
     calculated_formula: ?[]const u8,
     totals_formula: ?[]const u8,
+    /// The raw attribute regions of the two producer elements, kept for
+    /// the same reason `Formula.raw_attrs` is: M4b3's `CT_TableFormula`
+    /// inventory needs the bytes to inventory, and a reader that
+    /// dropped them would have nothing to refuse an unknown attribute
+    /// with. Empty when the element is absent.
+    calculated_attrs: []const u8 = "",
+    totals_attrs: []const u8 = "",
 };
 
 pub const Table = struct {
@@ -1961,6 +1989,11 @@ pub const Table = struct {
     display_name: []const u8,
     /// Raw `ref` (an A1 range; borrows from the input bytes).
     ref: []const u8,
+    /// `CT_Table@headerRowCount` / `@totalsRowCount`, with the schema's
+    /// defaults (1 and 0). They decide which rows a producer covers,
+    /// which is the whole of M4b3's member check.
+    header_rows: u32 = 1,
+    totals_rows: u32 = 0,
     columns: []TableColumn,
 
     pub fn deinit(self: *Table) void {
@@ -1998,6 +2031,8 @@ pub fn scanTable(
     var name: []const u8 = "";
     var display_name: []const u8 = "";
     var ref: []const u8 = "";
+    var header_rows: u32 = 1;
+    var totals_rows: u32 = 0;
 
     var depth: u32 = 0;
     var text_sink: ?*std.ArrayListUnmanaged(u8) = null;
@@ -2039,6 +2074,15 @@ pub fn scanTable(
                         .refused = try textRefusal(err, el.offset),
                     };
                     ref = el.attr("ref") orelse "";
+                    // A count that is not `xsd:unsignedInt` is a table
+                    // whose geometry nobody can compute, and computing
+                    // it wrong places a producer over the header.
+                    header_rows = parseCount(el.attr("headerRowCount"), 1) orelse return .{
+                        .refused = .{ .reason = .bad_attribute_value, .offset = offsetOf(el.offset) },
+                    };
+                    totals_rows = parseCount(el.attr("totalsRowCount"), 0) orelse return .{
+                        .refused = .{ .reason = .bad_attribute_value, .offset = offsetOf(el.offset) },
+                    };
                 } else if (isMain(&ns, el, "tableColumn")) {
                     const col_name = decodeAt(a, .table_column_name, el.attr("name") orelse "") catch |err| return .{
                         .refused = try textRefusal(err, el.offset),
@@ -2049,8 +2093,10 @@ pub fn scanTable(
                     column_depth = depth;
                 } else if (isMain(&ns, el, "calculatedColumnFormula")) {
                     text_sink = &calc;
+                    if (pending) |*p| p.calculated_attrs = el.attrs;
                 } else if (isMain(&ns, el, "totalsRowFormula")) {
                     text_sink = &totals;
+                    if (pending) |*p| p.totals_attrs = el.attrs;
                 }
                 if (e == .self_closing) {
                     text_sink = null;
@@ -2091,6 +2137,8 @@ pub fn scanTable(
         .name = name,
         .display_name = if (display_name.len > 0) display_name else name,
         .ref = ref,
+        .header_rows = header_rows,
+        .totals_rows = totals_rows,
         .columns = owned_columns,
     } };
 }

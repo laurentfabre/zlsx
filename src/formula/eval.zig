@@ -56,6 +56,11 @@ const value = @import("value.zig");
 const env = @import("env.zig");
 const registry = @import("registry.zig");
 const run_inputs = @import("run_inputs.zig");
+/// §5.9's resolution drivers and §5.6g's 3D matrix. The evaluator asks
+/// this file *what the rule is* and never restates one; the symbol
+/// layer that implements the tiers imports it too, which is why the
+/// rules live below both rather than inside either.
+const name_rules = @import("names.zig");
 
 // ─── evaluator-layer values (§5.3a) ──────────────────────────────
 
@@ -64,6 +69,16 @@ const run_inputs = @import("run_inputs.zig");
 /// while functions that take them keep working.
 pub const Reference = struct {
     areas: []const env.RangeRef,
+    /// Whether the areas are the members of a 3D sheet span (§5.6g)
+    /// rather than an authored union.
+    ///
+    /// The two are the same shape and not the same thing. `A1:B1` after
+    /// a union takes the bounding box of two areas; after a *span* it
+    /// takes one box per member sheet, because the span's members are
+    /// one reference repeated across sheets and not several references
+    /// side by side. Nothing else in the evaluator branches on it —
+    /// aggregation over N areas is aggregation over N areas.
+    three_d: bool = false,
 
     pub fn single(self: Reference) ?env.RangeRef {
         return if (self.areas.len == 1) self.areas[0] else null;
@@ -108,6 +123,16 @@ pub const EvalError = error{
     /// set is enumerated and tested, so a later row deletes entries
     /// rather than discovering them.
     NotYetImplemented,
+    /// A construct v1 refuses on purpose rather than has not reached: a
+    /// 3D span outside the frozen eligible list or inside an array or
+    /// intersection context (§5.6g), a name the `CT_DefinedName`
+    /// inventory or its own body disqualifies (§5.9), a table
+    /// reference (M7b evaluates one; §5.9's order only has to reach
+    /// it). Distinct from `NotYetImplemented` because the two answer
+    /// different questions — "never in v1" versus "not at this row" —
+    /// and only the second has an enumerated membership a later row
+    /// deletes from.
+    UnsupportedConstruct,
     /// A registered function called with an argument count it does not
     /// accept — a formula Excel could not have written.
     MalformedInput,
@@ -126,7 +151,7 @@ pub fn planeTwo(e: EvalError) parser.PlaneTwo {
         error.OutOfMemory => .FormulaLimitExceeded,
         error.LocaleSensitiveInput => .FormulaLocaleSensitiveInput,
         error.UnsupportedFunction => .FormulaUnsupportedFunction,
-        error.NotYetImplemented => .FormulaUnsupportedConstruct,
+        error.NotYetImplemented, error.UnsupportedConstruct => .FormulaUnsupportedConstruct,
         error.AnchorRequired => .FormulaAnchorRequired,
         error.ResultNotRepresentable => .FormulaResultNotRepresentable,
         error.LimitExceeded => .FormulaLimitExceeded,
@@ -135,6 +160,12 @@ pub fn planeTwo(e: EvalError) parser.PlaneTwo {
         // `SheetIndex` from `resolveSheet`, and it converts shape and
         // grid failures into `#VALUE!` at the call that caused them.
         error.MalformedInput, error.UnknownSheet, error.ShapeMismatch, error.RefOutOfGrid => .FormulaMalformedInput,
+        // M4b3, and the same split M4a's `MetadataRefused` uses: the
+        // interface can only say the resolution refused, and the typed
+        // reason travels with the resolver that raised it
+        // (`symbols.NameResolution.last_refusal`). Every reason it can
+        // carry is an unsupported construct, so nothing is lost here.
+        error.NameRefused => .FormulaUnsupportedConstruct,
         // M4a. The precise plane — unsupported construct for a rich
         // value, malformed input for a broken part — travels with the
         // resolver's own `Refusal` (`metadata.CellDialectResolver.
@@ -150,9 +181,13 @@ pub fn planeTwo(e: EvalError) parser.PlaneTwo {
 /// Constructs this row parses and refuses rather than evaluating. Named
 /// as data so the later row that implements one deletes a line here and
 /// watches a test fail until it does.
-pub const not_yet_implemented = [_][]const u8{
-    "3D sheet spans (M4b3)",
-};
+///
+/// **Empty as of M4b3**, which deleted its one entry — 3D sheet spans —
+/// and now evaluates them (§5.6g). The array stays, and so does the
+/// distinction it exists for: `UnsupportedConstruct` is "never in v1"
+/// and this list is "not at this row yet". A construct that lands here
+/// again has a milestone attached to it, in writing.
+pub const not_yet_implemented = [_][]const u8{};
 
 // ─── run instruments ─────────────────────────────────────────────
 
@@ -249,6 +284,17 @@ pub const Options = struct {
     /// cell and passes what it gets (§5.3b).
     dialect: value.Dialect = .dynamic_array,
     site: ?EvalSite = null,
+    /// §5.9 name resolution. Optional, and null is not a degraded mode
+    /// but a *stated* one: with no symbol layer every spelling provably
+    /// resolves nowhere, which is the terminal stage of the
+    /// value-position order and exactly what M3a2 shipped. Standalone
+    /// eval against a workbook wires `symbols.NameResolution`.
+    names: ?env.NameResolver = null,
+    /// Whether the formula is a declared array formula — legacy CSE
+    /// (`<f t="array">`) or dynamic-array. §5.6g forbids a 3D span
+    /// inside one, and the refusal is pre-eval, so the flag has to be
+    /// *declared* rather than discovered from the result's shape.
+    array_formula: bool = false,
     limits: parser.Limits = .{},
     /// Recursion bound for the **expression-tree walk** — a stack limit.
     ///
@@ -295,6 +341,17 @@ pub const Evaluator = struct {
     /// .current_sheet` except inside a qualified reference's target.
     sheet: env.SheetIndex,
     depth: usize = 0,
+    /// How many defined-name bodies are open on the stack. The interim
+    /// guard §5.9 asks for (M5a replaces it with graph nodes, where a
+    /// cycle through two names is a cycle like any other); until then
+    /// `A = B`, `B = A` has to stop somewhere with a §9 limit rather
+    /// than a stack overflow.
+    name_depth: usize = 0,
+    /// Which §5.6g rule an `error.UnsupportedConstruct` came from, when
+    /// it came from the 3D matrix. Same split as the two resolvers: the
+    /// error type says a construct was refused, the typed reason stays
+    /// with whatever raised it, and a report reads it from here.
+    last_three_d: ?name_rules.Refusal = null,
 
     pub fn init(arena: std.mem.Allocator, environment: env.EvalEnv, opts: Options) Evaluator {
         return .{
@@ -316,6 +373,14 @@ pub const Evaluator = struct {
         self.ast = ast;
         self.sheet = self.opts.current_sheet;
         self.depth = 0;
+        self.name_depth = 0;
+        // §5.6g's context legality, **before** anything is evaluated —
+        // which is what makes the same check usable pre-persist, where
+        // there is no result yet to inspect.
+        if (name_rules.checkThreeD(ast, .{ .array_formula = self.opts.array_formula })) |r| {
+            self.last_three_d = r;
+            return error.UnsupportedConstruct;
+        }
         const v = self.evalNode(ast.root) catch |e| return self.mapBudget(e);
         // §10: a multi-area reference is not a representable result,
         // even though functions may take one as an argument.
@@ -380,11 +445,17 @@ pub const Evaluator = struct {
             .ref_cell => |n| try self.cellReference(n.cell),
             .ref_full_col => |n| try self.fullColReference(n.first, n.last),
             .ref_full_row => |n| try self.fullRowReference(n.first, n.last),
-            // §5.9: at M3a2 there is no name table, so every name
-            // provably resolves nowhere and the terminal stage of the
-            // value-position order applies. M4b3 inserts the earlier
-            // stages ahead of this; it does not change the fallthrough.
-            .name, .structured => Value.err(.name),
+            // §5.9: with no symbol layer wired, every name provably
+            // resolves nowhere and the terminal stage of the
+            // value-position order applies. M4b3 inserted the earlier
+            // stages ahead of it and did not change the fallthrough.
+            //
+            // A structured reference still lands there whatever the
+            // symbol layer says: `Table[Col]` needs the table's
+            // geometry, which is M7b's, and answering `#NAME?` is the
+            // answer M3a2 gave — not a new claim about tables.
+            .name => |n| try self.namedValue(n.raw),
+            .structured => Value.err(.name),
             .qualified => |n| try self.qualified(n.sheet, n.target),
             .call => |n| try self.call(n.callee, n.args),
             .paren => |n| try self.evalNode(n.child),
@@ -519,18 +590,129 @@ pub const Evaluator = struct {
 
     fn qualified(self: *Evaluator, spec: parser.SheetSpec, target: parser.Index) EvalError!Value {
         // A quoted 3D span arrives as one token (`'Q1:Q4'!A1`), so a
-        // null `last` is not proof of a single sheet. Splitting it is
-        // name resolution's job (M4b3), and until that lands a span is
-        // refused rather than silently read as one strangely named sheet.
-        if (spec.last != null) return error.NotYetImplemented;
+        // null `last` is not proof of a single sheet — `isSpan` knows
+        // both spellings, and a sheet name cannot contain a colon.
         const name = try self.unquoteSheetName(spec);
-        if (std.mem.indexOfScalar(u8, name, ':') != null) return error.NotYetImplemented;
+        if (name_rules.isSpan(spec)) return self.threeDReference(spec, name, target);
         const idx = (try self.environment.resolveSheet(name)) orelse
             return Value.err(.ref); // a deleted or unknown sheet
         const saved = self.sheet;
         self.sheet = idx;
         defer self.sheet = saved;
         return self.evalNode(target);
+    }
+
+    /// §5.6g: one reference over an inclusive span of sheets, in
+    /// workbook order, as one area per member.
+    ///
+    /// Eligibility and context legality were settled before the walk
+    /// began (`evaluate`), so what is left here is arithmetic: resolve
+    /// the two endpoints, expand between them, and evaluate the target
+    /// once per member sheet. A multi-area reference is a shape the
+    /// aggregates already consume — the union operator produces one —
+    /// so the six eligible functions need no 3D-specific code.
+    fn threeDReference(
+        self: *Evaluator,
+        spec: parser.SheetSpec,
+        unquoted: []const u8,
+        target: parser.Index,
+    ) EvalError!Value {
+        const ends = name_rules.splitSpan(spec, unquoted) orelse
+            return Value.err(.ref);
+        const first = try self.environment.resolveSheet(ends.first);
+        const last = try self.environment.resolveSheet(ends.last);
+        const span = name_rules.expandSpan(
+            if (first) |f| f.toInt() else null,
+            if (last) |l| l.toInt() else null,
+        );
+        const members = switch (span) {
+            // A deleted endpoint, or two that have swapped. Excel
+            // leaves the spelling in place rather than repairing the
+            // span, and every cell it reached reads `#REF!`.
+            .ref_error => return Value.err(.ref),
+            .members => |m| m,
+        };
+
+        var areas: std.ArrayListUnmanaged(env.RangeRef) = .empty;
+        try areas.ensureTotalCapacity(self.arena, members.last - members.first + 1);
+        var s = members.first;
+        while (s <= members.last) : (s += 1) {
+            const saved = self.sheet;
+            self.sheet = env.SheetIndex.fromInt(s);
+            const r = self.evalAsReference(target) catch |e| {
+                self.sheet = saved;
+                return e;
+            };
+            self.sheet = saved;
+            // The target of a 3D qualifier is a reference by grammar;
+            // anything else is a tree no parser built.
+            const ref = r orelse return Value.err(.value);
+            try areas.appendSlice(self.arena, ref.areas);
+        }
+        return .{ .reference = .{ .areas = areas.items, .three_d = true } };
+    }
+
+    // ─── names (§5.9) ────────────────────────────────────────────
+
+    /// A spelling in value position.
+    ///
+    /// The order it resolves in is §5.9's, walked by the symbol layer
+    /// over M2's exported array; what arrives here is one of three
+    /// answers. A body is expanded inline — the interim shape, guarded
+    /// by depth, until M5a makes bodies graph nodes.
+    fn namedValue(self: *Evaluator, spelling: []const u8) EvalError!Value {
+        const resolver = self.opts.names orelse return Value.err(.name);
+        const binding = try resolver.resolveName(self.sheet, spelling);
+        return switch (binding) {
+            .not_found => Value.err(.name),
+            // §5.9's order reaches the table tier so a table can shadow
+            // an `_xlnm.` builtin; evaluating one is M7b's.
+            .table => error.UnsupportedConstruct,
+            .body => |b| self.expandName(b.text, b.scope),
+        };
+    }
+
+    fn expandName(
+        self: *Evaluator,
+        body: []const u8,
+        scope: ?env.SheetIndex,
+    ) EvalError!Value {
+        if (self.name_depth >= name_rules.max_name_expansion_depth) {
+            return error.LimitExceeded;
+        }
+        self.name_depth += 1;
+        defer self.name_depth -= 1;
+
+        // Parsed into the run arena: a name body is a formula, and the
+        // AST it produces lives exactly as long as the run does.
+        const parsed = try parser.parse(self.arena, body, .{ .limits = self.opts.limits });
+        const ast = switch (parsed) {
+            .ok => |a| a,
+            // A body that will not parse is a statement about the
+            // workbook, not about this evaluation.
+            .refused => return error.MalformedInput,
+        };
+        // §5.6g holds inside a name body too — expansion must not be a
+        // way to smuggle a 3D span past the pre-eval check.
+        if (name_rules.checkThreeD(ast, .{ .array_formula = self.opts.array_formula })) |r| {
+            self.last_three_d = r;
+            return error.UnsupportedConstruct;
+        }
+
+        const saved_ast = self.ast;
+        const saved_sheet = self.sheet;
+        self.ast = ast;
+        // A sheet-scoped name resolves its unqualified halves against
+        // its own sheet; a workbook-scoped one has no sheet of its own,
+        // so the referencing sheet stands. Relative bodies refused
+        // before they got here, which is what keeps this from being a
+        // guess about where the name was authored.
+        if (scope) |s| self.sheet = s;
+        defer {
+            self.ast = saved_ast;
+            self.sheet = saved_sheet;
+        }
+        return self.evalNode(ast.root);
     }
 
     fn unquoteSheetName(self: *Evaluator, spec: parser.SheetSpec) EvalError![]const u8 {
@@ -697,6 +879,24 @@ pub const Evaluator = struct {
         const r = (try self.evalAsReference(rhs)) orelse return Value.err(.value);
         switch (op) {
             .range => {
+                // §5.6g: `Sheet1:Sheet3!A1:B1` parses as the span's
+                // `A1` ranged with a bare `B1`, so the span's members
+                // are on the left and the second endpoint is on the
+                // right. It is one box per member sheet — the span
+                // repeats one reference across sheets, so the endpoint
+                // repeats with it.
+                if (l.three_d and !r.three_d) {
+                    const b = r.single() orelse return Value.err(.value);
+                    const areas = try self.arena.alloc(env.RangeRef, l.areas.len);
+                    for (l.areas, areas) |member, *out| {
+                        out.* = .{
+                            .sheet = member.sheet,
+                            .range = boundingBox(member.range, b.range),
+                        };
+                        try self.deps.noteArea(out.*);
+                    }
+                    return .{ .reference = .{ .areas = areas, .three_d = true } };
+                }
                 const a = l.single() orelse return Value.err(.value);
                 const b = r.single() orelse return Value.err(.value);
                 if (a.sheet != b.sheet) return Value.err(.value);
@@ -714,7 +914,10 @@ pub const Evaluator = struct {
                 const areas = try self.arena.alloc(env.RangeRef, l.areas.len + r.areas.len);
                 @memcpy(areas[0..l.areas.len], l.areas);
                 @memcpy(areas[l.areas.len..], r.areas);
-                return .{ .reference = .{ .areas = areas } };
+                return .{ .reference = .{
+                    .areas = areas,
+                    .three_d = l.three_d or r.three_d,
+                } };
             },
             else => unreachable,
         }
@@ -2190,7 +2393,12 @@ test "refusals: the plane-2 map is total and says what §10 says" {
     try testing.expectEqual(parser.PlaneTwo.FormulaMalformedInput, planeTwo(error.MalformedInput));
     try testing.expectEqual(parser.PlaneTwo.FormulaResultNotRepresentable, planeTwo(error.ResultNotRepresentable));
     try testing.expectEqual(parser.PlaneTwo.FormulaLimitExceeded, planeTwo(error.LimitExceeded));
-    try testing.expectEqual(@as(usize, 1), not_yet_implemented.len);
+    try testing.expectEqual(parser.PlaneTwo.FormulaUnsupportedConstruct, planeTwo(error.UnsupportedConstruct));
+    try testing.expectEqual(parser.PlaneTwo.FormulaUnsupportedConstruct, planeTwo(error.NameRefused));
+    // M4b3 deleted the list's one entry. It stays empty until a row
+    // needs it again, and the row that does writes a milestone next to
+    // whatever it adds.
+    try testing.expectEqual(@as(usize, 0), not_yet_implemented.len);
 }
 
 test "refusals: an unregistered call refuses, an unresolvable name is #NAME?" {
@@ -2210,14 +2418,123 @@ test "refusals: an unregistered call refuses, an unresolvable name is #NAME?" {
     try testing.expectError(error.MalformedInput, h.eval("IFERROR(1)"));
 }
 
-test "refusals: constructs whose milestone has not landed refuse by name" {
+test "refusals: a 3D span no longer refuses as not-yet-implemented" {
+    // The test the deletion is watched by. Until M4b3 this expected
+    // `NotYetImplemented`, which was the list's one entry; a span that
+    // refuses that way again means the entry came back without the
+    // milestone note the list exists to carry.
     var h: Harness = undefined;
     try h.init(testing.allocator);
     defer h.deinit();
     _ = try h.fake.addSheet("Q1");
-    // A 3D span is M4b3's; it refuses rather than being read as one
-    // strangely named sheet.
-    try testing.expectError(error.NotYetImplemented, h.eval("'Q1:Q4'!A1"));
+
+    // Ineligible consumer: a refusal, but a §5.6g one.
+    try testing.expectError(error.UnsupportedConstruct, h.eval("COUNTBLANK('Q1:Q4'!A1)"));
+    try testing.expectEqual(
+        name_rules.Refusal.Reason.three_d_ineligible_function,
+        h.ev.last_three_d.?.reason,
+    );
+    // And an eligible one evaluates. `Q4` does not exist, so the span
+    // is `#REF!` — a value, which is the proof it was evaluated at all.
+    try testing.expectEqual(value.KnownError.ref, (try h.scalar("SUM('Q1:Q4'!A1)")).err.known);
+
+    // Nothing anywhere in the evaluator answers `NotYetImplemented` for
+    // a span any more, in either spelling.
+    for ([_][]const u8{ "SUM(Q1:Q4!A1)", "'Q1:Q4'!A1", "SUM('Q1:Q4'!A1:B2)" }) |src| {
+        const r = h.eval(src);
+        if (r) |_| {} else |e| try testing.expect(e != error.NotYetImplemented);
+    }
+}
+
+// ─── 3D references (§5.6g, M4b3) ─────────────────────────────────
+
+test "3D: an eligible function aggregates a span, inclusively and in workbook order" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    // Sheet1 is index 0; the span below covers all three.
+    const s2 = try h.fake.addSheet("Sheet2");
+    const s3 = try h.fake.addSheet("Sheet3");
+    try h.fake.putA1(h.sheet, .stored, "A1", num(1));
+    try h.fake.putA1(s2, .stored, "A1", num(10));
+    try h.fake.putA1(s3, .stored, "A1", num(100));
+
+    try testing.expectEqual(@as(f64, 111), (try h.scalar("SUM(Sheet1:Sheet3!A1)")).number);
+    // Inclusive at both ends, and a one-sheet span is a span.
+    try testing.expectEqual(@as(f64, 110), (try h.scalar("SUM(Sheet2:Sheet3!A1)")).number);
+    try testing.expectEqual(@as(f64, 10), (try h.scalar("SUM(Sheet2:Sheet2!A1)")).number);
+    // Case folding is the symbol layer's — the in-memory fake matches
+    // sheet names exactly, and `symbols.resolveSheetSpan` is where the
+    // folded span lookup is proven.
+    // A range target expands per member, not once.
+    try h.fake.putA1(s3, .stored, "B1", num(1000));
+    try testing.expectEqual(@as(f64, 1111), (try h.scalar("SUM(Sheet1:Sheet3!A1:B1)")).number);
+}
+
+test "3D: the other two eligible functions this row can run agree with SUM" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    const s2 = try h.fake.addSheet("Sheet2");
+    try h.fake.putA1(h.sheet, .stored, "A1", num(1));
+    try h.fake.putA1(s2, .stored, "A1", .{ .text = "x" });
+
+    // AVERAGE, MIN and MAX are M4e's — their eligibility is fixtured in
+    // `names.zig` against the frozen matrix, and their oracle legs land
+    // with the functions. COUNT and COUNTA are registered here.
+    try testing.expectEqual(@as(f64, 1), (try h.scalar("COUNT(Sheet1:Sheet2!A1)")).number);
+    try testing.expectEqual(@as(f64, 2), (try h.scalar("COUNTA(Sheet1:Sheet2!A1)")).number);
+}
+
+test "3D: a missing or reordered endpoint pins #REF!, and evaluates nothing" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    const s2 = try h.fake.addSheet("Sheet2");
+    try h.fake.putA1(h.sheet, .stored, "A1", num(1));
+    try h.fake.putA1(s2, .stored, "A1", num(10));
+
+    // A deleted endpoint. Excel leaves the spelling in place rather
+    // than repairing the span.
+    try testing.expectEqual(
+        value.KnownError.ref,
+        (try h.scalar("SUM(Sheet1:Gone!A1)")).err.known,
+    );
+    try testing.expectEqual(
+        value.KnownError.ref,
+        (try h.scalar("SUM(Gone:Sheet2!A1)")).err.known,
+    );
+    // Reordered endpoints are not silently normalized: `Sheet2:Sheet1`
+    // is a span someone's edit broke, and summing between them would
+    // answer a question no one asked.
+    try testing.expectEqual(
+        value.KnownError.ref,
+        (try h.scalar("SUM(Sheet2:Sheet1!A1)")).err.known,
+    );
+}
+
+test "3D: array and intersection contexts refuse before anything is evaluated" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    _ = try h.fake.addSheet("Sheet2");
+
+    var opts = h.options();
+    opts.array_formula = true;
+    try testing.expectError(
+        error.UnsupportedConstruct,
+        h.evalOpts("SUM(Sheet1:Sheet2!A1)", opts),
+    );
+    try testing.expectEqual(
+        name_rules.Refusal.Reason.three_d_in_array_context,
+        h.ev.last_three_d.?.reason,
+    );
+
+    try testing.expectError(error.UnsupportedConstruct, h.eval("SUM(@Sheet1:Sheet2!A1)"));
+    try testing.expectEqual(
+        name_rules.Refusal.Reason.three_d_in_intersection_context,
+        h.ev.last_three_d.?.reason,
+    );
 }
 
 test "references: an unknown sheet is #REF!, a known one resolves" {
