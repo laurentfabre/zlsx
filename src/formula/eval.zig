@@ -3950,6 +3950,1195 @@ fn sweepShape(
     }
 }
 
+// ─── M4e: the F1b batch (§7, twenty-two names) ───────────────────
+//
+// Oracle-first, and the oracle decides **nothing** here. Not one of the
+// three committed manifests contains a formula calling any of the
+// twenty-two — §8.2's evidence is eighteen operator and literal cells
+// plus `SQRT(-1)`, and no aggregate, criteria, lookup or position name
+// appears in any of them. So the whole batch ships `spec_pinned`, its
+// oracle-row count is pinned at **zero**, and the label is checked
+// against the files in both directions exactly as M4c and M4d checked
+// theirs. A row claiming evidence no manifest holds fails; so does a
+// row shipping spec-pinned that a manifest decides; and so does a row
+// reading an EXCLUDED cell as evidence, which is M4d's third verdict
+// (decision 2) applied to a batch that needs it for a different reason
+// — this one holds no volatile, and the check is still three-valued
+// because the checker is shared rather than re-derived per row.
+
+/// One F1b fixture. `func` is the inventory name the row is a fixture
+/// FOR — the coverage test derives the batch from the frozen TSV and
+/// fails if any of the twenty-two has no row here.
+const F1bCase = struct {
+    func: []const u8,
+    formula: []const u8,
+    expect: Expect,
+    evidence: Evidence = .spec_pinned,
+    /// Why the spec says so, where the answer is one a reasonable
+    /// reading could get wrong.
+    note: []const u8 = "",
+};
+
+/// The environment every F1b fixture reads.
+///
+/// The A column repeats M4c's and M4d's provenance rows cell for cell,
+/// so the three batches can be compared against the same §5.3b table.
+/// Everything else is shaped for this batch: one column to aggregate,
+/// one range holding every population the three counting functions
+/// disagree about, and the tables the five lookups search.
+fn putF1bCells(h: *Harness) !void {
+    try h.put("A1", num(10)); // number
+    try h.put("A2", .{ .text = "abc" }); // non-numeric text
+    try h.put("A3", .{ .text = "" }); // `=""`, which is text and not blank
+    try h.put("A4", .{ .boolean = true }); // logical
+    try h.put("A5", value.ScalarValue.errorOf(.div0)); // an error that is not #N/A
+    try h.put("A6", value.ScalarValue.errorOf(.na)); // #N/A itself
+    // A7 is a true blank — deliberately not stored.
+    try h.put("A8", .{ .text = "7" }); // numeric text
+
+    // A plain numeric column: what an aggregate is for.
+    try h.put("C1", num(1));
+    try h.put("C2", num(2));
+    try h.put("C3", num(3));
+    try h.put("C4", num(4));
+
+    // §5.3c's spine, as ONE range. Every population the three counting
+    // functions disagree about is here, so all three can be fixtured
+    // side by side over the same cells rather than each over a range
+    // built to flatter it.
+    try h.put("D1", num(1)); // a number
+    try h.put("D2", .{ .text = "x" }); // text
+    try h.put("D3", value.ScalarValue.errorOf(.div0)); // an error
+    // D4 is a true blank.
+    try h.put("D5", .{ .text = "" }); // `=""`
+
+    // A negative zero, **stored** rather than written as the literal
+    // `-0`: N1a rounds a literal at ingress under `.excel`, and the
+    // divergence under test has to be the function's rather than the
+    // parser's (M4d decision 5).
+    try h.put("E1", num(-0.0));
+
+    // The lookup table: ascending keys down F, two result columns.
+    try h.put("F1", num(10));
+    try h.put("F2", num(20));
+    try h.put("F3", num(30));
+    try h.put("G1", .{ .text = "ten" });
+    try h.put("G2", .{ .text = "twenty" });
+    try h.put("G3", .{ .text = "thirty" });
+    try h.put("H1", num(100));
+    try h.put("H2", num(200));
+    try h.put("H3", num(300));
+
+    // The same table transposed, for HLOOKUP — one function under two
+    // axes, so it gets the same data laid out the other way.
+    try h.put("F5", num(10));
+    try h.put("G5", num(20));
+    try h.put("H5", num(30));
+    try h.put("F6", .{ .text = "ten" });
+    try h.put("G6", .{ .text = "twenty" });
+    try h.put("H6", .{ .text = "thirty" });
+
+    // Fold-equality's own table: `ß` folds to `ss`, so `STRASSE` and
+    // `Straße` are ONE key under `collation_v1` (§5.4b).
+    try h.put("J1", .{ .text = "Straße" });
+    try h.put("J2", .{ .text = "beta" });
+    try h.put("K1", num(1));
+    try h.put("K2", num(2));
+
+    // Descending, for `MATCH`'s type −1.
+    try h.put("N1", num(30));
+    try h.put("N2", num(20));
+    try h.put("N3", num(10));
+
+    // Duplicates, for the two search orders.
+    try h.put("P1", num(1));
+    try h.put("P2", num(2));
+    try h.put("P3", num(2));
+    try h.put("P4", num(3));
+}
+
+const f1b_cases = [_]F1bCase{
+    // ── the aggregates ──
+    .{ .func = "SUM", .formula = "SUM(C1:C4)", .expect = .{ .number = 10 } },
+    .{ .func = "SUM", .formula = "SUM(D1:D5)", .expect = .{ .err = .div0 }, .note = "SUM propagates an error found in a range; COUNT beside it does not" },
+    .{ .func = "SUM", .formula = "SUM(TRUE())", .expect = .{ .number = 1 }, .note = "a DIRECT logical coerces" },
+    .{ .func = "SUM", .formula = "SUM(A4)", .expect = .{ .number = 0 }, .note = "…and the same logical found in a range is ignored — §5.3b's split, one line apart" },
+    .{ .func = "AVERAGE", .formula = "AVERAGE(C1:C4)", .expect = .{ .number = 2.5 } },
+    .{ .func = "AVERAGE", .formula = "AVERAGE(1,2,3)", .expect = .{ .number = 2 } },
+    .{ .func = "AVERAGE", .formula = "AVERAGE(1,)", .expect = .{ .number = 0.5 }, .note = "an omitted argument is 0 AND is counted, so the denominator is 2" },
+    .{ .func = "AVERAGE", .formula = "AVERAGE(A2)", .expect = .{ .err = .div0 }, .note = "text in a range is ignored, and an average over nothing is a division by zero" },
+    .{ .func = "AVERAGE", .formula = "AVERAGE(A6)", .expect = .{ .err = .na } },
+    .{ .func = "AVERAGE", .formula = "AVERAGE(\"abc\")", .expect = .{ .err = .value }, .note = "a DIRECT text argument is #VALUE! where the same text in a range is skipped" },
+    .{ .func = "MIN", .formula = "MIN(C1:C4)", .expect = .{ .number = 1 } },
+    .{ .func = "MIN", .formula = "MIN(A2)", .expect = .{ .number = 0 }, .note = "no numbers anywhere is 0 — not #DIV/0!, and not #VALUE!" },
+    .{ .func = "MIN", .formula = "MIN(J1:J2)", .expect = .{ .number = 0 }, .note = "MIN never compares text (§5.4b): a column of it answers 0" },
+    .{ .func = "MIN", .formula = "MIN(\"abc\")", .expect = .{ .err = .value } },
+    .{ .func = "MIN", .formula = "MIN(A6)", .expect = .{ .err = .na } },
+    .{ .func = "MAX", .formula = "MAX(C1:C4)", .expect = .{ .number = 4 } },
+    .{ .func = "MAX", .formula = "MAX(-5,-3)", .expect = .{ .number = -3 } },
+    .{ .func = "MAX", .formula = "MAX(A4)", .expect = .{ .number = 0 } },
+    .{ .func = "MAX", .formula = "MAX(TRUE())", .expect = .{ .number = 1 } },
+    .{ .func = "SUMPRODUCT", .formula = "SUMPRODUCT(C1:C4,C1:C4)", .expect = .{ .number = 30 } },
+    .{ .func = "SUMPRODUCT", .formula = "SUMPRODUCT(C1:C4)", .expect = .{ .number = 10 }, .note = "one array is a sum" },
+    .{ .func = "SUMPRODUCT", .formula = "SUMPRODUCT({1,2},{3,4})", .expect = .{ .number = 11 } },
+    .{ .func = "SUMPRODUCT", .formula = "SUMPRODUCT(C1:C4,F1:F3)", .expect = .{ .err = .value }, .note = "identical dimensions required — SUMPRODUCT does not broadcast" },
+    .{ .func = "SUMPRODUCT", .formula = "SUMPRODUCT(A4)", .expect = .{ .number = 0 }, .note = "a logical contributes 0, where SUM(TRUE()) is 1" },
+    .{ .func = "SUMPRODUCT", .formula = "SUMPRODUCT(D1:D5)", .expect = .{ .err = .div0 } },
+
+    // ── the three-way COUNT split (§5.3c), over the one range ──
+    .{ .func = "COUNT", .formula = "COUNT(D1:D5)", .expect = .{ .number = 1 }, .note = "numbers only; the error is neither counted nor propagated" },
+    .{ .func = "COUNT", .formula = "COUNT(\"1\")", .expect = .{ .number = 1 }, .note = "a direct argument coerces" },
+    .{ .func = "COUNT", .formula = "COUNT(A8)", .expect = .{ .number = 0 }, .note = "…and the same numeric text in a range is NOT coerced" },
+    .{ .func = "COUNTA", .formula = "COUNTA(D1:D5)", .expect = .{ .number = 4 }, .note = "everything that is not a true blank — the error counts, and so does `\"\"`" },
+    .{ .func = "COUNTA", .formula = "COUNTA(A7)", .expect = .{ .number = 0 } },
+    .{ .func = "COUNTBLANK", .formula = "COUNTBLANK(D1:D5)", .expect = .{ .number = 2 }, .note = "true blanks PLUS `\"\"` — the third question, and the `.countblank_class` population" },
+
+    // ── criteria ──
+    .{ .func = "COUNTIF", .formula = "COUNTIF(C1:C4,\">2\")", .expect = .{ .number = 2 } },
+    .{ .func = "COUNTIF", .formula = "COUNTIF(D1:D5,\"#DIV/0!\")", .expect = .{ .number = 1 }, .note = "criteria CAN match errors, which is a third answer again" },
+    .{ .func = "COUNTIF", .formula = "COUNTIF(D1:D5,\"\")", .expect = .{ .number = 2 }, .note = "an empty criterion is the COUNTBLANK population, not the COUNTA one" },
+    .{ .func = "SUMIF", .formula = "SUMIF(C1:C4,\">2\")", .expect = .{ .number = 7 } },
+    .{ .func = "SUMIF", .formula = "SUMIF(F1:F3,\">=20\",H1:H3)", .expect = .{ .number = 500 } },
+    .{ .func = "AVERAGEIF", .formula = "AVERAGEIF(C1:C4,\">2\")", .expect = .{ .number = 3.5 } },
+    .{ .func = "AVERAGEIF", .formula = "AVERAGEIF(F1:F3,\">=20\",H1:H3)", .expect = .{ .number = 250 }, .note = "the average range is PROJECTED from its top-left (§5.6a), as SUMIF's is" },
+    .{ .func = "AVERAGEIF", .formula = "AVERAGEIF(C1:C4,\">99\")", .expect = .{ .err = .div0 }, .note = "where SUMIF answers 0, an average over no match is #DIV/0!" },
+
+    // ── VLOOKUP / HLOOKUP: one function under two axes ──
+    .{ .func = "VLOOKUP", .formula = "VLOOKUP(20,F1:H3,2,FALSE)", .expect = .{ .text = "twenty" } },
+    .{ .func = "VLOOKUP", .formula = "VLOOKUP(30,F1:H3,3)", .expect = .{ .number = 300 } },
+    .{ .func = "VLOOKUP", .formula = "VLOOKUP(25,F1:H3,2)", .expect = .{ .text = "twenty" }, .note = "the omitted fourth argument is TRUE — approximate is Excel's default" },
+    .{ .func = "VLOOKUP", .formula = "VLOOKUP(25,F1:H3,2,FALSE)", .expect = .{ .err = .na }, .note = "…and the same key exactly is #N/A" },
+    .{ .func = "VLOOKUP", .formula = "VLOOKUP(5,F1:H3,2)", .expect = .{ .err = .na }, .note = "nothing is ≤ 5, so approximate has no candidate either" },
+    .{ .func = "VLOOKUP", .formula = "VLOOKUP(20,F1:H3,4)", .expect = .{ .err = .ref }, .note = "past the table is #REF!" },
+    .{ .func = "VLOOKUP", .formula = "VLOOKUP(20,F1:H3,0)", .expect = .{ .err = .value }, .note = "…and below its first column is #VALUE!. Two mistakes, two spellings" },
+    .{ .func = "VLOOKUP", .formula = "VLOOKUP(\"STRASSE\",J1:K2,2,FALSE)", .expect = .{ .number = 1 }, .note = "fold-equal is EQUAL: `ß` folds to `ss`, so this is one key (§5.4b)" },
+    .{ .func = "HLOOKUP", .formula = "HLOOKUP(20,F5:H6,2,FALSE)", .expect = .{ .text = "twenty" } },
+    .{ .func = "HLOOKUP", .formula = "HLOOKUP(25,F5:H6,2)", .expect = .{ .text = "twenty" } },
+    .{ .func = "HLOOKUP", .formula = "HLOOKUP(5,F5:H6,2)", .expect = .{ .err = .na } },
+    .{ .func = "HLOOKUP", .formula = "HLOOKUP(20,F5:H6,3)", .expect = .{ .err = .ref } },
+
+    // ── MATCH / XMATCH: the position, not the value ──
+    .{ .func = "MATCH", .formula = "MATCH(20,F1:F3,0)", .expect = .{ .number = 2 } },
+    .{ .func = "MATCH", .formula = "MATCH(25,F1:F3,1)", .expect = .{ .number = 2 }, .note = "type 1 is the largest value ≤ the key, over an ascending vector" },
+    .{ .func = "MATCH", .formula = "MATCH(5,F1:F3,1)", .expect = .{ .err = .na } },
+    .{ .func = "MATCH", .formula = "MATCH(25,N1:N3,-1)", .expect = .{ .number = 1 }, .note = "type −1 is the smallest value ≥ the key, over a DESCENDING vector" },
+    .{ .func = "MATCH", .formula = "MATCH(35,N1:N3,-1)", .expect = .{ .err = .na } },
+    .{ .func = "MATCH", .formula = "MATCH(\"t*n\",G1:G3,0)", .expect = .{ .number = 1 }, .note = "exact match honours `*` and `?` — the criteria matcher's wildcards, shared" },
+    .{ .func = "MATCH", .formula = "MATCH(\"STRASSE\",J1:J2,0)", .expect = .{ .number = 1 } },
+    .{ .func = "MATCH", .formula = "MATCH(20,F1:H3,0)", .expect = .{ .err = .na }, .note = "a 2-D array has no single axis to answer a position along" },
+    .{ .func = "XMATCH", .formula = "XMATCH(20,F1:F3)", .expect = .{ .number = 2 }, .note = "XMATCH's default is EXACT where MATCH's is approximate" },
+    .{ .func = "XMATCH", .formula = "XMATCH(25,F1:F3,-1)", .expect = .{ .number = 2 }, .note = "mode −1 is MATCH's type 1: the signs are opposite between the two names" },
+    .{ .func = "XMATCH", .formula = "XMATCH(25,F1:F3,1)", .expect = .{ .number = 3 } },
+    .{ .func = "XMATCH", .formula = "XMATCH(25,F1:F3,0)", .expect = .{ .err = .na } },
+    .{ .func = "XMATCH", .formula = "XMATCH(\"t*\",G1:G3,0)", .expect = .{ .err = .na }, .note = "mode 0 makes the wildcards INERT — XMATCH asks for them by name in mode 2" },
+    .{ .func = "XMATCH", .formula = "XMATCH(\"t*\",G1:G3,2)", .expect = .{ .number = 1 } },
+    .{ .func = "XMATCH", .formula = "XMATCH(2,P1:P4,0,1)", .expect = .{ .number = 2 }, .note = "first-to-last finds the first of two equal keys…" },
+    .{ .func = "XMATCH", .formula = "XMATCH(2,P1:P4,0,-1)", .expect = .{ .number = 3 }, .note = "…and last-to-first finds the second" },
+    .{ .func = "XMATCH", .formula = "XMATCH(20,F1:F3,3)", .expect = .{ .err = .value }, .note = "an unlisted mode is #VALUE!, not the nearest listed one" },
+
+    // ── XLOOKUP ──
+    .{ .func = "XLOOKUP", .formula = "XLOOKUP(20,F1:F3,G1:G3)", .expect = .{ .text = "twenty" } },
+    .{ .func = "XLOOKUP", .formula = "XLOOKUP(99,F1:F3,G1:G3)", .expect = .{ .err = .na } },
+    .{ .func = "XLOOKUP", .formula = "XLOOKUP(99,F1:F3,G1:G3,\"none\")", .expect = .{ .text = "none" }, .note = "if_not_found replaces the #N/A of a failed MATCH, and nothing else" },
+    .{ .func = "XLOOKUP", .formula = "XLOOKUP(25,F1:F3,G1:G3,\"none\",-1)", .expect = .{ .text = "twenty" } },
+    .{ .func = "XLOOKUP", .formula = "XLOOKUP(25,F1:F3,G1:G3,\"none\",1)", .expect = .{ .text = "thirty" } },
+    .{ .func = "XLOOKUP", .formula = "XLOOKUP(20,F1:F3,G1:G2)", .expect = .{ .err = .value }, .note = "the return range is indexed along the lookup vector's axis and must match it" },
+
+    // ── INDEX ──
+    .{ .func = "INDEX", .formula = "INDEX(F1:H3,2,2)", .expect = .{ .text = "twenty" } },
+    .{ .func = "INDEX", .formula = "INDEX(F1:F3,2)", .expect = .{ .number = 20 }, .note = "one index runs along a vector's own axis" },
+    .{ .func = "INDEX", .formula = "INDEX({10,20,30},2)", .expect = .{ .number = 20 } },
+    .{ .func = "INDEX", .formula = "INDEX(F1:H3,4,1)", .expect = .{ .err = .ref } },
+    .{ .func = "INDEX", .formula = "INDEX(F1:H3,1,4)", .expect = .{ .err = .ref } },
+    .{ .func = "INDEX", .formula = "INDEX(F1:H3,-1,1)", .expect = .{ .err = .value }, .note = "past the array is #REF!, before it is #VALUE! — VLOOKUP's split again" },
+
+    // ── CHOOSE ──
+    .{ .func = "CHOOSE", .formula = "CHOOSE(2,10,20,30)", .expect = .{ .number = 20 } },
+    .{ .func = "CHOOSE", .formula = "CHOOSE(1,10,20)", .expect = .{ .number = 10 } },
+    .{ .func = "CHOOSE", .formula = "CHOOSE(1.9,10,20)", .expect = .{ .number = 10 }, .note = "the index truncates toward zero before the bound is checked" },
+    .{ .func = "CHOOSE", .formula = "CHOOSE(0,10)", .expect = .{ .err = .value } },
+    .{ .func = "CHOOSE", .formula = "CHOOSE(2,10)", .expect = .{ .err = .value } },
+
+    // ── position: what a reference IS ──
+    .{ .func = "ROW", .formula = "ROW(F2)", .expect = .{ .number = 2 } },
+    .{ .func = "ROW", .formula = "ROW(F1:H3)", .expect = .{ .number = 1 }, .note = "an area answers from its top-left; spilling the whole column is M7a's" },
+    .{ .func = "ROW", .formula = "ROW(1)", .expect = .{ .err = .value }, .note = "the `.reference` coercion class refuses a value before the impl runs" },
+    .{ .func = "COLUMN", .formula = "COLUMN(F2)", .expect = .{ .number = 6 } },
+    .{ .func = "COLUMN", .formula = "COLUMN(F1:H3)", .expect = .{ .number = 6 } },
+    .{ .func = "ROWS", .formula = "ROWS(F1:H3)", .expect = .{ .number = 3 } },
+    .{ .func = "ROWS", .formula = "ROWS(A1)", .expect = .{ .number = 1 } },
+    .{ .func = "ROWS", .formula = "ROWS({1,2;3,4})", .expect = .{ .number = 2 } },
+    .{ .func = "COLUMNS", .formula = "COLUMNS(F1:H3)", .expect = .{ .number = 3 } },
+    .{ .func = "COLUMNS", .formula = "COLUMNS({1,2;3,4})", .expect = .{ .number = 2 } },
+};
+
+test "M4e: every F1b fixture evaluates to what the oracle or the spec says" {
+    for (f1b_cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF1bCells(&h);
+
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("F1b `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectValue(c.expect, v) catch |e| {
+            std.debug.print("F1b `{s}` ({s}): wrong value\n", .{ c.formula, c.func });
+            return e;
+        };
+    }
+}
+
+test "M4e: all twenty-two frozen names resolve, and each has a fixture" {
+    var it = registry.inventory();
+    var batch: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4e")) continue;
+        batch += 1;
+
+        if (registry.lookup(e.name) == null) {
+            std.debug.print("F1b name does not resolve: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        }
+        var fixtures: usize = 0;
+        for (f1b_cases) |c| {
+            if (std.mem.eql(u8, c.func, e.name)) fixtures += 1;
+        }
+        if (fixtures == 0) {
+            std.debug.print("F1b name has no fixture: {s}\n", .{e.name});
+            return error.UnfixturedBatchFunction;
+        }
+    }
+    try testing.expectEqual(@as(usize, 22), batch);
+
+    // …and no fixture names something outside the batch.
+    for (f1b_cases) |c| {
+        var found = false;
+        var it2 = registry.inventory();
+        while (it2.next()) |e| {
+            if (std.mem.eql(u8, e.name, c.func) and std.mem.eql(u8, e.milestone, "M4e")) found = true;
+        }
+        if (!found) {
+            std.debug.print("fixture names a function outside F1b: {s}\n", .{c.func});
+            return error.FixtureOutsideBatch;
+        }
+    }
+}
+
+test "M4e: the evidence label on every fixture is true of the committed manifests" {
+    // Same three-valued checker M4d built (`silent` / `decided` /
+    // `excluded`), shared rather than re-derived — which is why this
+    // row gets the excluded-cell guard for free even though it holds no
+    // volatile of its own.
+    var oracle_rows: usize = 0;
+    var excluded_rows: usize = 0;
+    for (f1b_cases) |c| {
+        switch (try manifestVerdict(c.formula)) {
+            .decided => {
+                if (c.evidence != .oracle) {
+                    std.debug.print("`{s}` is decided by a manifest but ships spec-pinned\n", .{c.formula});
+                    return error.UnderstatedEvidence;
+                }
+                oracle_rows += 1;
+            },
+            .excluded => {
+                if (c.evidence != .spec_pinned) {
+                    std.debug.print("`{s}` claims evidence from an EXCLUDED manifest cell\n", .{c.formula});
+                    return error.ExcludedCellClaimedAsEvidence;
+                }
+                excluded_rows += 1;
+            },
+            .silent => {
+                if (c.evidence != .spec_pinned) {
+                    std.debug.print("`{s}` claims oracle evidence no manifest holds\n", .{c.formula});
+                    return error.UnbackedOracleClaim;
+                }
+            },
+        }
+    }
+    // **Zero** in twenty-two functions, stated as a number so it cannot
+    // drift silently. When the parked Excel leg runs (§8.2) and the
+    // suite grows F1b rows, this count moves and the row that moves it
+    // is the row that re-labels.
+    try testing.expectEqual(@as(usize, 0), oracle_rows);
+    try testing.expectEqual(@as(usize, 0), excluded_rows);
+
+    // Said the other way too, over the manifests rather than over the
+    // fixtures: not one committed cell calls an F1b name at all. That
+    // is what makes "the oracle decides nothing here" a fact about the
+    // files instead of a claim about the table above.
+    for ([_][]const u8{ oracle_excel, oracle_ieee, oracle_libreoffice }) |json| {
+        const doc = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+        defer doc.deinit();
+        for (doc.value.object.get("cells").?.array.items) |cell| {
+            const f = cell.object.get("formula") orelse continue;
+            if (f == .null) continue;
+            var it = registry.inventory();
+            while (it.next()) |e| {
+                if (!std.mem.eql(u8, e.milestone, "M4e")) continue;
+                if (std.mem.indexOf(u8, f.string, e.name) == null) continue;
+                std.debug.print("a manifest cell calls {s}: `{s}`\n", .{ e.name, f.string });
+                return error.UnexpectedOracleCoverage;
+            }
+        }
+    }
+}
+
+test "M4e: §5.3c's spine — the three counting functions over ONE range" {
+    // The row's whole point, in five cells. `COUNT` ignores the error,
+    // `COUNTA` counts it, `COUNTBLANK` answers a third question, and
+    // `SUM` — the fourth name over the same range — propagates it. Four
+    // functions, one range, four answers: the class is per function and
+    // never per family, which is exactly what §5.3c says and what a
+    // family-wide rule would get three-quarters wrong.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    try putF1bCells(&h);
+
+    try testing.expectEqual(@as(f64, 1), (try h.scalar("COUNT(D1:D5)")).number);
+    try testing.expectEqual(@as(f64, 4), (try h.scalar("COUNTA(D1:D5)")).number);
+    try testing.expectEqual(@as(f64, 2), (try h.scalar("COUNTBLANK(D1:D5)")).number);
+    try testing.expectEqual(value.KnownError.div0, (try h.scalar("SUM(D1:D5)")).err.known);
+
+    // The three populations partition nothing and overlap on purpose:
+    // `""` is counted by COUNTA **and** by COUNTBLANK, which is the
+    // pair a single "is it empty" predicate could not have produced.
+    try testing.expectEqual(@as(f64, 1), (try h.scalar("COUNTA(D5)")).number);
+    try testing.expectEqual(@as(f64, 1), (try h.scalar("COUNTBLANK(D5)")).number);
+    try testing.expectEqual(@as(f64, 0), (try h.scalar("COUNT(D5)")).number);
+    // …while `ISBLANK` disagrees with both, over the same cell.
+    try testing.expectEqual(false, (try h.scalar("ISBLANK(D5)")).boolean);
+    try testing.expectEqual(true, (try h.scalar("ISBLANK(D4)")).boolean);
+
+    // And the classes are what the registry says they are, name by
+    // name — `per_function_provenance` for the three that inspect
+    // provenance, `propagate` for the one that does not, and `observe`
+    // for the one that looks at an error without becoming it.
+    try testing.expectEqual(
+        value.PropagationClass.per_function_provenance,
+        registry.lookup("COUNT").?.propagation,
+    );
+    try testing.expectEqual(
+        value.PropagationClass.per_function_provenance,
+        registry.lookup("COUNTA").?.propagation,
+    );
+    try testing.expectEqual(
+        value.PropagationClass.per_function_provenance,
+        registry.lookup("COUNTBLANK").?.propagation,
+    );
+    try testing.expectEqual(value.PropagationClass.propagate, registry.lookup("SUM").?.propagation);
+    try testing.expectEqual(value.PropagationClass.observe, registry.lookup("CHOOSE").?.propagation);
+}
+
+test "M4e: the 3D eligible list is the frozen six, and BOTH directions are fixtured" {
+    // §5.6g freezes the list at exactly six, and every member of it is
+    // an M4e name — which is what makes this the row that can finally
+    // fixture it end to end. M4b3 could only run the three the registry
+    // already held (its decision 14); `AVERAGE`, `MIN` and `MAX`
+    // arrived here.
+    try testing.expectEqual(@as(usize, 6), name_rules.three_d_eligible.len);
+    for (name_rules.three_d_eligible) |name| {
+        try testing.expect(registry.lookup(name) != null);
+        var tagged = false;
+        var it = registry.inventory();
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, e.name, name)) tagged = std.mem.eql(u8, e.milestone, "M4e");
+        }
+        if (!tagged) {
+            std.debug.print("3D-eligible name is not an M4e row: {s}\n", .{name});
+            return error.EligibleOutsideBatch;
+        }
+    }
+
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    const s2 = try h.fake.addSheet("Sheet2");
+    try h.fake.putA1(h.sheet, .stored, "A1", num(4));
+    try h.fake.putA1(s2, .stored, "A1", num(6));
+
+    // Direction one: each of the six aggregates a span. Six functions,
+    // six different right answers over the same two cells — which is
+    // also the proof they aggregate the span rather than one member.
+    const Span = struct { name: []const u8, want: f64 };
+    const spans = [_]Span{
+        .{ .name = "SUM", .want = 10 },
+        .{ .name = "COUNT", .want = 2 },
+        .{ .name = "COUNTA", .want = 2 },
+        .{ .name = "AVERAGE", .want = 5 },
+        .{ .name = "MIN", .want = 4 },
+        .{ .name = "MAX", .want = 6 },
+    };
+    for (spans) |s| {
+        var buf: [64]u8 = undefined;
+        const src = try std.fmt.bufPrint(&buf, "{s}(Sheet1:Sheet2!A1)", .{s.name});
+        const got = h.scalar(src) catch |e| {
+            std.debug.print("eligible 3D consumer `{s}` refused: {t}\n", .{ src, e });
+            return e;
+        };
+        try testing.expectEqual(s.want, got.number);
+    }
+    // The list above is not a second copy of the frozen one: every
+    // frozen member must appear here, so a seventh eligible name cannot
+    // ship without a span fixture.
+    try testing.expectEqual(name_rules.three_d_eligible.len, spans.len);
+    for (name_rules.three_d_eligible) |name| {
+        var covered = false;
+        for (spans) |s| {
+            if (std.mem.eql(u8, s.name, name)) covered = true;
+        }
+        if (!covered) {
+            std.debug.print("eligible name has no 3D span fixture: {s}\n", .{name});
+            return error.UnfixturedEligibleFunction;
+        }
+    }
+
+    // Direction two: every OTHER name in the batch refuses a span, and
+    // refuses it **typed** — `UnsupportedConstruct` carrying §5.6g's
+    // own reason, not a generic failure. The list is derived from the
+    // inventory and the arity, so a name added to the batch later
+    // cannot ship without landing in one direction or the other.
+    var it = registry.inventory();
+    var refused: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4e")) continue;
+        if (name_rules.threeDEligible(e.name)) continue;
+        const f = registry.lookup(e.name).?;
+
+        // The span goes in the first slot and the rest is padded to the
+        // minimum arity. §5.6g refuses BEFORE evaluation, so what the
+        // padding would have evaluated to never matters.
+        var pad: [64]u8 = undefined;
+        var used: usize = 0;
+        var k: usize = 1;
+        while (k < @max(f.arity.min, 1)) : (k += 1) {
+            @memcpy(pad[used..][0..2], ",1");
+            used += 2;
+        }
+        var buf: [128]u8 = undefined;
+        const src = try std.fmt.bufPrint(&buf, "{s}(Sheet1:Sheet2!A1{s})", .{ e.name, pad[0..used] });
+
+        _ = h.eval(src) catch |err| {
+            if (err != error.UnsupportedConstruct) {
+                std.debug.print("`{s}` refused a span as {t}, not UnsupportedConstruct\n", .{ src, err });
+                return err;
+            }
+            try testing.expectEqual(
+                name_rules.Refusal.Reason.three_d_ineligible_function,
+                h.ev.last_three_d.?.reason,
+            );
+            refused += 1;
+            continue;
+        };
+        std.debug.print("ineligible name accepted a 3D span: {s}\n", .{src});
+        return error.IneligibleFunctionAcceptedSpan;
+    }
+    // Twenty-two names, six eligible, sixteen refusing — counted rather
+    // than asserted, so the two directions cannot both be describing
+    // the same subset.
+    try testing.expectEqual(@as(usize, 16), refused);
+}
+
+test "M4e: MIN and MAX are outside the comparator, the five lookups are inside it" {
+    // §5.4b's one named exception (plan revision 15, change 8), proved
+    // behaviourally rather than by reading the flag back.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    try putF1bCells(&h);
+    // Ascending under the fold — `Beta` sorts between them, which the
+    // raw code points would also give; the case is what makes the
+    // ordering below a statement about `collation_v1`.
+    try h.put("Q1", .{ .text = "alpha" });
+    try h.put("Q2", .{ .text = "Beta" });
+    try h.put("Q3", .{ .text = "gamma" });
+
+    // The exception, at its sharpest. Under the comparator's cross-type
+    // ranking (number < text < logical) any text outranks every number,
+    // so a MAX that used it would answer "gamma" here. It answers 4,
+    // because it never compares text at all.
+    try testing.expectEqual(@as(f64, 4), (try h.scalar("MAX(C1:C4,Q1:Q3)")).number);
+    try testing.expectEqual(@as(f64, 1), (try h.scalar("MIN(C1:C4,Q1:Q3)")).number);
+    // And with nothing numeric anywhere the answer is 0 — not the
+    // first string, and not an error.
+    try testing.expectEqual(@as(f64, 0), (try h.scalar("MAX(Q1:Q3)")).number);
+    try testing.expectEqual(@as(f64, 0), (try h.scalar("MIN(Q1:Q3)")).number);
+    // A DIRECT text argument still refuses, which is the other half of
+    // §5.4b's sentence: text is not compared, and it is not silently
+    // skipped when it was written out by hand either.
+    try testing.expectEqual(value.KnownError.value, (try h.scalar("MAX(\"gamma\")")).err.known);
+
+    // The five lookups take EQUALITY from the comparator: `ß` folds to
+    // `ss`, so `STRASSE` and `Straße` are one key. Every one of the
+    // five, because the flag is per function and the fold has to be
+    // reached the same way by each.
+    try testing.expectEqual(@as(f64, 1), (try h.scalar("VLOOKUP(\"STRASSE\",J1:K2,2,FALSE)")).number);
+    try testing.expectEqual(@as(f64, 1), (try h.scalar("MATCH(\"straSSe\",J1:J2,0)")).number);
+    try testing.expectEqual(@as(f64, 1), (try h.scalar("XMATCH(\"Strasse\",J1:J2,0)")).number);
+    try testing.expectEqual(@as(f64, 1), (try h.scalar("XLOOKUP(\"STRASSE\",J1:J2,K1:K2)")).number);
+    try h.put("R1", .{ .text = "Straße" });
+    try h.put("S1", .{ .text = "beta" });
+    try h.put("R2", num(1));
+    try h.put("S2", num(2));
+    try testing.expectEqual(@as(f64, 1), (try h.scalar("HLOOKUP(\"STRASSE\",R1:S2,2,FALSE)")).number);
+
+    // …and ORDERING from it too, which is the half an equality-only
+    // fixture would miss. `bz` sorts after `Beta` and before `gamma`,
+    // case-insensitively, so the largest key ≤ it is the second.
+    try testing.expectEqual(@as(f64, 2), (try h.scalar("MATCH(\"bz\",Q1:Q3,1)")).number);
+    try testing.expectEqual(@as(f64, 2), (try h.scalar("MATCH(\"BETA\",Q1:Q3,1)")).number);
+    try testing.expectEqual(@as(f64, 2), (try h.scalar("XMATCH(\"bz\",Q1:Q3,-1)")).number);
+    // Nothing sorts at or below `a`, since `a` is a proper prefix of
+    // `alpha` and therefore strictly less than it.
+    try testing.expectEqual(value.KnownError.na, (try h.scalar("MATCH(\"a\",Q1:Q3,1)")).err.known);
+    // An ordered match never crosses a type boundary: a numeric key
+    // finds nothing in a column of text, rather than the whole column.
+    try testing.expectEqual(value.KnownError.na, (try h.scalar("MATCH(5,Q1:Q3,1)")).err.known);
+}
+
+test "M4e: CHOOSE is lazy for a scalar selector and masks per element for an array one" {
+    // §5.3a assigns CHOOSE its fixtures at this row. The instrument is
+    // the draw COUNT, because a result cannot tell a draw that happened
+    // from one that did not — under a constant source both look alike.
+    const Case = struct { formula: []const u8, draws: u64, expect: Expect };
+    const cases = [_]Case{
+        // Every arm position of a three-arm call: one draw each, which
+        // is two dead arms at zero every time.
+        .{ .formula = "CHOOSE(1,RAND(),RAND(),RAND())", .draws = 1, .expect = .{ .number = 0.5 } },
+        .{ .formula = "CHOOSE(2,RAND(),RAND(),RAND())", .draws = 1, .expect = .{ .number = 0.5 } },
+        .{ .formula = "CHOOSE(3,RAND(),RAND(),RAND())", .draws = 1, .expect = .{ .number = 0.5 } },
+        // A dead arm at exactly zero, stated on its own: the volatile
+        // is in the arm nobody took, so the whole formula draws none.
+        .{ .formula = "CHOOSE(1,7,RAND())", .draws = 0, .expect = .{ .number = 7 } },
+        .{ .formula = "CHOOSE(2,RAND(),7)", .draws = 0, .expect = .{ .number = 7 } },
+        // An out-of-range selector takes NO arm, so nothing draws — and
+        // the answer is `#VALUE!` rather than the nearest arm.
+        .{ .formula = "CHOOSE(0,RAND(),RAND())", .draws = 0, .expect = .{ .err = .value } },
+        .{ .formula = "CHOOSE(3,RAND(),RAND())", .draws = 0, .expect = .{ .err = .value } },
+        // …and neither does a selector that is itself an error.
+        .{ .formula = "CHOOSE(1/0,RAND(),RAND())", .draws = 0, .expect = .{ .err = .div0 } },
+        // Two call sites in one formula are two call sites (§5.6d).
+        .{ .formula = "CHOOSE(1,RAND())+CHOOSE(1,RAND())", .draws = 2, .expect = .{ .number = 1 } },
+        // An ARRAY selector switches the whole form to per-element
+        // masking: every arm evaluates, so both volatiles draw, and the
+        // result is the mask's shape rather than one arm's.
+        .{
+            .formula = "CHOOSE({1,2},RAND(),RAND())",
+            .draws = 2,
+            .expect = .{ .array = .{
+                .rows = 1,
+                .cols = 2,
+                .cells = &.{ .{ .number = 0.5 }, .{ .number = 0.5 } },
+            } },
+        },
+        // Per-element errors stay per element: the second selector is
+        // out of range and only its cell is `#VALUE!`.
+        .{
+            .formula = "CHOOSE({1,9},10,20)",
+            .draws = 0,
+            .expect = .{ .array = .{
+                .rows = 1,
+                .cols = 2,
+                .cells = &.{ .{ .number = 10 }, .{ .err = .value } },
+            } },
+        },
+    };
+
+    for (cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF1bCells(&h);
+
+        h.draws.count = 0;
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("CHOOSE case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectValue(c.expect, v) catch |e| {
+            std.debug.print("CHOOSE case `{s}`: wrong value\n", .{c.formula});
+            return e;
+        };
+        if (h.draws.count != c.draws) {
+            std.debug.print(
+                "CHOOSE case `{s}`: expected {d} draws, counted {d}\n",
+                .{ c.formula, c.draws, h.draws.count },
+            );
+            return error.WrongDrawCount;
+        }
+    }
+}
+
+const F1bFidelityCase = struct {
+    formula: []const u8,
+    excel: f64,
+    ieee: f64,
+    why: []const u8,
+};
+
+/// Where `excel_fp_rules_v1` and `ieee_fp_rules_v1` part in F1b. Two
+/// places, and neither is the one M4d found: this batch never rounds to
+/// a decimal place, so `decimalView` is not involved at all.
+const f1b_fidelity_cases = [_]F1bFidelityCase{
+    // N2's zero-snap is **additive-scope**, and an aggregate is a chain
+    // of additions — so the rule M4d could only reach through a
+    // rounding argument reaches this batch through its own fold.
+    .{ .formula = "SUM(0.1,0.2,-0.3)", .excel = 0, .ieee = 5.551115123125783e-17, .why = "the running total lands within 2^-48 of zero relative to its operands" },
+    .{ .formula = "AVERAGE(0.1,0.2,-0.3)", .excel = 0, .ieee = 1.850371707708594e-17, .why = "the same total, divided by three — the snap happens before the division" },
+    .{ .formula = "SUMPRODUCT({0.1,0.2,-0.3},{1,1,1})", .excel = 0, .ieee = 5.551115123125783e-17, .why = "…and again through SUMPRODUCT's accumulator, which is the same addition" },
+    // N3: a negative zero survives publication under `.ieee` and is
+    // normalized under `.excel`. MIN and MAX are the only names in the
+    // batch that can produce one, because they RETURN an input rather
+    // than computing a result — an accumulator would have added it to
+    // `+0` and lost the sign on the way.
+    .{ .formula = "MIN(E1)", .excel = 0, .ieee = -0.0, .why = "MIN returns the stored -0 itself" },
+    .{ .formula = "MAX(E1)", .excel = 0, .ieee = -0.0, .why = "and so does MAX, over the same one-cell range" },
+};
+
+test "M4e: both fidelity modes are fixtured wherever the two rule tables disagree" {
+    for (f1b_fidelity_cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF1bCells(&h);
+
+        inline for ([_]value.Fidelity{ .excel, .ieee }) |mode| {
+            var opts = h.options();
+            opts.fidelity = mode;
+            const v = h.evalOpts(c.formula, opts) catch |e| {
+                std.debug.print("fidelity case `{s}` refused: {t}\n", .{ c.formula, e });
+                return e;
+            };
+            try testing.expect(v == .scalar);
+            const got = value.publish(v.scalar, mode);
+            const want = if (mode == .excel) c.excel else c.ieee;
+            try testing.expect(got == .number);
+            if (@as(u64, @bitCast(got.number)) != @as(u64, @bitCast(want))) {
+                std.debug.print(
+                    "`{s}` under {s}: expected {d} (0x{X:0>16}), got {d} (0x{X:0>16}) — {s}\n",
+                    .{
+                        c.formula,
+                        @tagName(mode),
+                        want,
+                        @as(u64, @bitCast(want)),
+                        got.number,
+                        @as(u64, @bitCast(got.number)),
+                        c.why,
+                    },
+                );
+                return error.FidelityMismatch;
+            }
+        }
+
+        // A table of "divergences" that agreed everywhere would pass a
+        // per-mode check and prove nothing.
+        if (@as(u64, @bitCast(c.excel)) == @as(u64, @bitCast(c.ieee))) {
+            std.debug.print("`{s}` is listed as a divergence but does not diverge\n", .{c.formula});
+            return error.NonDivergentFidelityCase;
+        }
+    }
+}
+
+test "M4e: the batch agrees across modes everywhere it is not listed as diverging" {
+    // The converse half. Most of F1b is mode-independent — a lookup
+    // returns a stored value unchanged, and a position is an integer —
+    // and saying so is what makes the short list above an enumeration
+    // rather than a sampling.
+    for (f1b_cases) |c| {
+        var listed = false;
+        for (f1b_fidelity_cases) |d| {
+            if (std.mem.eql(u8, d.formula, c.formula)) listed = true;
+        }
+        if (listed) continue;
+
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF1bCells(&h);
+
+        var excel_opts = h.options();
+        excel_opts.fidelity = .excel;
+        const a = try h.evalOpts(c.formula, excel_opts);
+        var ieee_opts = h.options();
+        ieee_opts.fidelity = .ieee;
+        const b = try h.evalOpts(c.formula, ieee_opts);
+        // Arrays reach this table too (`CHOOSE`'s masked form does not,
+        // but `INDEX`'s slices could), so agreement is checked over
+        // whatever shape came back rather than over a scalar.
+        if (a == .array or b == .array) {
+            try testing.expect(a == .array and b == .array);
+            try testing.expectEqual(a.array.rows, b.array.rows);
+            try testing.expectEqual(a.array.cols, b.array.cols);
+            for (a.array.cells, b.array.cells) |x, y| {
+                if (!value.PublishedScalar.eql(value.publish(x, .excel), value.publish(y, .ieee))) {
+                    std.debug.print("`{s}` diverges between modes but is not listed\n", .{c.formula});
+                    return error.UnlistedFidelityDivergence;
+                }
+            }
+            continue;
+        }
+        if (!value.PublishedScalar.eql(value.publish(a.scalar, .excel), value.publish(b.scalar, .ieee))) {
+            std.debug.print("`{s}` diverges between modes but is not listed\n", .{c.formula});
+            return error.UnlistedFidelityDivergence;
+        }
+    }
+}
+
+test "M4e: error order in every multi-argument name of the batch (§5.3c)" {
+    // Every case runs in both argument orders, because a fixture with
+    // one error in it proves propagation and says nothing about order.
+    // Half of this batch does not propagate at all, and for those the
+    // pair proves the opposite: the class overrides the rule in BOTH
+    // directions, which a single-order fixture could not distinguish
+    // from a lucky argument list.
+    const Case = struct { formula: []const u8, expect: Expect, note: []const u8 = "" };
+    const cases = [_]Case{
+        // The propagating aggregates: first error in §5.6a's order.
+        .{ .formula = "SUM(A5,A6)", .expect = .{ .err = .div0 } },
+        .{ .formula = "SUM(A6,A5)", .expect = .{ .err = .na } },
+        .{ .formula = "AVERAGE(A5,A6)", .expect = .{ .err = .div0 } },
+        .{ .formula = "AVERAGE(A6,A5)", .expect = .{ .err = .na } },
+        .{ .formula = "MIN(A5,A6)", .expect = .{ .err = .div0 } },
+        .{ .formula = "MIN(A6,A5)", .expect = .{ .err = .na } },
+        .{ .formula = "MAX(A5,A6)", .expect = .{ .err = .div0 } },
+        .{ .formula = "MAX(A6,A5)", .expect = .{ .err = .na } },
+        .{ .formula = "SUMPRODUCT(A5,A6)", .expect = .{ .err = .div0 }, .note = "the error pass runs argument by argument BEFORE the products" },
+        .{ .formula = "SUMPRODUCT(A6,A5)", .expect = .{ .err = .na } },
+        // The counting family: neither order propagates, which is the
+        // whole point of the class.
+        .{ .formula = "COUNT(A5,A6)", .expect = .{ .number = 0 } },
+        .{ .formula = "COUNT(A6,A5)", .expect = .{ .number = 0 } },
+        .{ .formula = "COUNTA(A5,A6)", .expect = .{ .number = 2 }, .note = "COUNTA counts the very errors COUNT ignores" },
+        .{ .formula = "COUNTA(A6,A5)", .expect = .{ .number = 2 } },
+        .{ .formula = "COUNTIF(A5,A6)", .expect = .{ .number = 0 } },
+        .{ .formula = "COUNTIF(A6,A5)", .expect = .{ .number = 0 } },
+        .{ .formula = "COUNTIF(A5,A5)", .expect = .{ .number = 1 }, .note = "…and a criterion CAN match one, which is why neither of the two above is a refusal" },
+        .{ .formula = "SUMIF(A5,A6)", .expect = .{ .number = 0 } },
+        .{ .formula = "SUMIF(A6,A5)", .expect = .{ .number = 0 } },
+        .{ .formula = "AVERAGEIF(A5,A6)", .expect = .{ .err = .div0 }, .note = "#DIV/0! from the division over no match, NOT from A5" },
+        .{ .formula = "AVERAGEIF(A6,A5)", .expect = .{ .err = .div0 } },
+        // The lookups, whose key slot is a reference the dispatcher's
+        // scan cannot see — so the order below is the implementation's.
+        .{ .formula = "VLOOKUP(A5,F1:H3,A6)", .expect = .{ .err = .div0 } },
+        .{ .formula = "VLOOKUP(A6,F1:H3,A5)", .expect = .{ .err = .na } },
+        .{ .formula = "HLOOKUP(A5,F5:H6,A6)", .expect = .{ .err = .div0 } },
+        .{ .formula = "HLOOKUP(A6,F5:H6,A5)", .expect = .{ .err = .na } },
+        .{ .formula = "MATCH(A5,F1:F3,A6)", .expect = .{ .err = .div0 } },
+        .{ .formula = "MATCH(A6,F1:F3,A5)", .expect = .{ .err = .na } },
+        .{ .formula = "XMATCH(A5,F1:F3,A6)", .expect = .{ .err = .div0 } },
+        .{ .formula = "XMATCH(A6,F1:F3,A5)", .expect = .{ .err = .na } },
+        // Slots 0 and 4 — the key and the match mode — with slots 1..3
+        // masked, so this pair really is about declaration order.
+        .{ .formula = "XLOOKUP(A5,F1:F3,G1:G3,\"x\",A6)", .expect = .{ .err = .div0 } },
+        .{ .formula = "XLOOKUP(A6,F1:F3,G1:G3,\"x\",A5)", .expect = .{ .err = .na } },
+        // …and `if_not_found` is a value this call may RETURN rather
+        // than one it propagates: an error there does not spoil a hit,
+        // and on a miss it is the answer.
+        .{ .formula = "XLOOKUP(20,F1:F3,G1:G3,A5)", .expect = .{ .text = "twenty" } },
+        .{ .formula = "XLOOKUP(99,F1:F3,G1:G3,A5)", .expect = .{ .err = .div0 }, .note = "returned, not propagated — the same cell, two outcomes" },
+        .{ .formula = "XLOOKUP(20,F1:F3,G1:G3,C1:C4)", .expect = .{ .text = "twenty" }, .note = "a RANGE fallback is fine too, which propagating it would have made #VALUE!" },
+        // …and an error found INSIDE a lookup table does not propagate
+        // at all. It is a value the lookup may return, which is the
+        // other half of `per_function_provenance`.
+        .{ .formula = "MATCH(20,A5:A6,0)", .expect = .{ .err = .na }, .note = "#N/A from a failed match, not #DIV/0! from the table" },
+        .{ .formula = "VLOOKUP(10,F1:H3,3)", .expect = .{ .number = 100 } },
+        // INDEX propagates from its index slots in declaration order,
+        // and returns an error found in the array as the value it is.
+        .{ .formula = "INDEX(F1:H3,A5,A6)", .expect = .{ .err = .div0 } },
+        .{ .formula = "INDEX(F1:H3,A6,A5)", .expect = .{ .err = .na } },
+        .{ .formula = "INDEX(A5:A6,1)", .expect = .{ .err = .div0 }, .note = "the element IS the error — propagation never entered into it" },
+        // CHOOSE observes, and laziness decides WHICH error you get.
+        .{ .formula = "CHOOSE(1,A5,A6)", .expect = .{ .err = .div0 } },
+        .{ .formula = "CHOOSE(2,A5,A6)", .expect = .{ .err = .na } },
+        .{ .formula = "CHOOSE(A5,1,2)", .expect = .{ .err = .div0 }, .note = "an erroring selector takes no arm at all" },
+    };
+
+    for (cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF1bCells(&h);
+
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("error-order case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectValue(c.expect, v) catch |e| {
+            std.debug.print("error-order case `{s}`: wrong value\n", .{c.formula});
+            return e;
+        };
+    }
+
+    // Every multi-argument name in the batch appears above, with the
+    // list derived from the registry's own arity rather than typed out
+    // — so a function that gains an argument later cannot slip past
+    // unordered. Each must appear at least TWICE: one order is not an
+    // order.
+    var it = registry.inventory();
+    var covered_names: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4e")) continue;
+        const f = registry.lookup(e.name).?;
+        const multi = f.arity.max == null or f.arity.max.? > 1;
+        if (!multi) continue;
+        var seen: usize = 0;
+        for (cases) |c| {
+            if (std.mem.startsWith(u8, c.formula, e.name) and c.formula[e.name.len] == '(') seen += 1;
+        }
+        if (seen < 2) {
+            std.debug.print("multi-argument name with {d} error-order fixtures: {s}\n", .{ seen, e.name });
+            return error.MissingErrorOrderFixture;
+        }
+        covered_names += 1;
+    }
+    // Seventeen of the twenty-two take more than one argument; the five
+    // that do not are COUNTBLANK, ROW, ROWS, COLUMN and COLUMNS.
+    try testing.expectEqual(@as(usize, 17), covered_names);
+}
+
+test "M4e: ROW and COLUMN answer from the site, or refuse for want of one" {
+    // The registry's only site-dependent rows. `AnchorRequired` already
+    // exists for `@` (§5.3b); these are the first *functions* to raise
+    // it, and the alternative — guessing 1 — would be a number nobody
+    // could tell from a real answer.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    try putF1bCells(&h);
+
+    try testing.expectError(error.AnchorRequired, h.eval("ROW()"));
+    try testing.expectError(error.AnchorRequired, h.eval("COLUMN()"));
+    try testing.expectEqual(parser.PlaneTwo.FormulaAnchorRequired, planeTwo(error.AnchorRequired));
+
+    var opts = h.options();
+    opts.site = .{
+        .row = coords.Row.fromOneBased(7) catch unreachable,
+        .col = coords.Col.fromZeroBased(2) catch unreachable,
+    };
+    try testing.expectEqual(@as(f64, 7), (try h.evalOpts("ROW()", opts)).scalar.number);
+    try testing.expectEqual(@as(f64, 3), (try h.evalOpts("COLUMN()", opts)).scalar.number);
+    // An explicit reference ignores the site entirely, which is what
+    // makes the zero-argument form the special case rather than the
+    // rule.
+    try testing.expectEqual(@as(f64, 2), (try h.evalOpts("ROW(F2)", opts)).scalar.number);
+    try testing.expectEqual(@as(f64, 6), (try h.evalOpts("COLUMN(F2)", opts)).scalar.number);
+    // ROWS and COLUMNS never consult it: they answer about a shape.
+    try testing.expectEqual(@as(f64, 3), (try h.scalar("ROWS(F1:H3)")).number);
+    try testing.expectEqual(@as(f64, 3), (try h.scalar("COLUMNS(F1:H3)")).number);
+}
+
+test "M4e: the two names that return an ARRAY return the right shape" {
+    // `INDEX` with a zero index and `XLOOKUP` with a 2-D return range
+    // are the batch's only array producers. Both answers are Excel's,
+    // and both are shapes this evaluator already carries — the spilling
+    // question they raise belongs to M7a, not to what they compute.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    try putF1bCells(&h);
+
+    const cases = [_]struct { formula: []const u8, expect: Expect }{
+        // A whole column of the table.
+        .{ .formula = "INDEX(F1:H3,0,2)", .expect = .{ .array = .{
+            .rows = 3,
+            .cols = 1,
+            .cells = &.{ .{ .text = "ten" }, .{ .text = "twenty" }, .{ .text = "thirty" } },
+        } } },
+        // A whole row — and the form a single index takes on a 2-D
+        // array, which is the same thing written more briefly.
+        .{ .formula = "INDEX(F1:H3,2,0)", .expect = .{ .array = .{
+            .rows = 1,
+            .cols = 3,
+            .cells = &.{ .{ .number = 20 }, .{ .text = "twenty" }, .{ .number = 200 } },
+        } } },
+        .{ .formula = "INDEX(F1:H3,2)", .expect = .{ .array = .{
+            .rows = 1,
+            .cols = 3,
+            .cells = &.{ .{ .number = 20 }, .{ .text = "twenty" }, .{ .number = 200 } },
+        } } },
+        // The whole array, when both indices are zero.
+        .{ .formula = "COLUMNS(INDEX(F1:H3,0,0))", .expect = .{ .number = 3 } },
+        // XLOOKUP's 2-D return: the row at the match, across the range.
+        .{ .formula = "XLOOKUP(20,F1:F3,G1:H3)", .expect = .{ .array = .{
+            .rows = 1,
+            .cols = 2,
+            .cells = &.{ .{ .text = "twenty" }, .{ .number = 200 } },
+        } } },
+    };
+    for (cases) |c| {
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("array case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectValue(c.expect, v) catch |e| {
+            std.debug.print("array case `{s}`: wrong shape or value\n", .{c.formula});
+            return e;
+        };
+    }
+}
+
+test "M4e: a rectangle beyond §9's cap is a limit, not a hang" {
+    // Lookups materialize their table, which is what buys them random
+    // access along an axis (`registry.Grid`). The bound on that is
+    // §9's `max_matrix_cells`, so an absurd range is a **limit** —
+    // a defined plane-2 outcome — rather than a run that never ends.
+    // Making a whole-column lookup fast is M7b2's row; making an
+    // impossible one refuse is this one's.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    try putF1bCells(&h);
+
+    try testing.expectError(error.LimitExceeded, h.eval("MATCH(1,A1:XFD100000,0)"));
+    try testing.expectError(error.LimitExceeded, h.eval("VLOOKUP(1,A1:XFD100000,2)"));
+    try testing.expectError(error.LimitExceeded, h.eval("SUMPRODUCT(A1:XFD100000)"));
+    try testing.expectEqual(parser.PlaneTwo.FormulaLimitExceeded, planeTwo(error.LimitExceeded));
+    // The aggregates walk sparsely instead and are unbothered by the
+    // same range — which is the difference the two access patterns
+    // make. `SUM` reaches D3's error and answers WITH it: an error
+    // value is a result, and therefore the proof the walk finished.
+    try testing.expectEqual(value.KnownError.div0, (try h.scalar("SUM(A1:XFD100000)")).err.known);
+    try testing.expectEqual(@as(f64, 10), (try h.scalar("SUM(C1:C1000000)")).number);
+    try testing.expectEqual(@as(f64, 4), (try h.scalar("COUNT(C1:C1000000)")).number);
+}
+
+// ─── M4e fuzz: no argument shape panics, leaks, or evaluates twice ──
+
+const f1b_names = [_][]const u8{
+    "AVERAGE", "AVERAGEIF", "CHOOSE",     "COLUMN",     "COLUMNS",
+    "COUNT",   "COUNTA",    "COUNTBLANK", "COUNTIF",    "HLOOKUP",
+    "INDEX",   "MATCH",     "MAX",        "MIN",        "ROW",
+    "ROWS",    "SUM",       "SUMIF",      "SUMPRODUCT", "VLOOKUP",
+    "XLOOKUP", "XMATCH",
+};
+
+/// Argument shapes. F1a-1's alphabet was about provenance and F1a-2's
+/// about numeric extremes; this one is about **shape**, because that is
+/// the failure mode a batch of aggregates and lookups has and the other
+/// two did not: a table with no rows, a vector that is really a
+/// rectangle, an index past the end, a multi-area set where one
+/// rectangle was expected, and a criterion that is not a criterion.
+const f1b_arg_shapes = [_][]const u8{
+    "A1",            "A2",     "A5",     "A7",
+    "A8",            "C1:C4",  "D1:D5",  "F1:H3",
+    "(A1:A2,C1:C4)", "{1,2}",  "{1;2}",  "{1,2;3,4}",
+    "0",             "1",      "-1",     "2.5",
+    "\"\"",          "\">2\"", "\"t*\"", "\"abc\"",
+    "",              "TRUE()", "1/0",    "1E+308",
+};
+
+fn fuzzF1bEnv(fake: *env.Fake) !env.SheetIndex {
+    const sheet = try fake.addSheet("S");
+    try fake.putA1(sheet, .stored, "A1", num(10));
+    try fake.putA1(sheet, .stored, "A2", .{ .text = "abc" });
+    try fake.putA1(sheet, .stored, "A5", value.ScalarValue.errorOf(.div0));
+    try fake.putA1(sheet, .stored, "A6", value.ScalarValue.errorOf(.na));
+    try fake.putA1(sheet, .stored, "A8", .{ .text = "7" });
+    try fake.putA1(sheet, .stored, "C1", num(1));
+    try fake.putA1(sheet, .stored, "C2", num(2));
+    try fake.putA1(sheet, .stored, "C3", num(3));
+    try fake.putA1(sheet, .stored, "C4", num(4));
+    try fake.putA1(sheet, .stored, "D1", num(1));
+    try fake.putA1(sheet, .stored, "D2", .{ .text = "x" });
+    try fake.putA1(sheet, .stored, "D3", value.ScalarValue.errorOf(.div0));
+    try fake.putA1(sheet, .stored, "D5", .{ .text = "" });
+    try fake.putA1(sheet, .stored, "F1", num(10));
+    try fake.putA1(sheet, .stored, "F2", num(20));
+    try fake.putA1(sheet, .stored, "F3", num(30));
+    try fake.putA1(sheet, .stored, "G1", .{ .text = "ten" });
+    try fake.putA1(sheet, .stored, "G2", .{ .text = "twenty" });
+    try fake.putA1(sheet, .stored, "G3", .{ .text = "thirty" });
+    try fake.putA1(sheet, .stored, "H1", num(100));
+    try fake.putA1(sheet, .stored, "H2", num(200));
+    try fake.putA1(sheet, .stored, "H3", num(300));
+    return sheet;
+}
+
+/// Build `NAME(a, b, b, …)`, padded to the function's own minimum
+/// arity. Without the padding a three-argument name like `XLOOKUP`
+/// would only ever be swept at arities it rejects outright, and the
+/// sweep would prove nothing about the one code path it exists to
+/// reach.
+fn buildF1bCall(buf: []u8, name: []const u8, args: []const []const u8) ?[]const u8 {
+    if (args.len == 0) return null;
+    const f = registry.lookup(name).?;
+    const min = @max(@as(usize, f.arity.min), args.len);
+    var w: usize = 0;
+    if (name.len + 1 > buf.len) return null;
+    @memcpy(buf[w..][0..name.len], name);
+    w += name.len;
+    buf[w] = '(';
+    w += 1;
+    var k: usize = 0;
+    while (k < min) : (k += 1) {
+        const arg = if (k < args.len) args[k] else args[args.len - 1];
+        if (w + arg.len + 2 > buf.len) return null;
+        if (k > 0) {
+            buf[w] = ',';
+            w += 1;
+        }
+        @memcpy(buf[w..][0..arg.len], arg);
+        w += arg.len;
+    }
+    if (w + 1 > buf.len) return null;
+    buf[w] = ')';
+    w += 1;
+    return buf[0..w];
+}
+
+fn fuzzF1bTarget(_: void, smith: *std.testing.Smith) anyerror!void {
+    @disableInstrumentation();
+
+    var picked: [6][]const u8 = undefined;
+    var n: usize = 0;
+    while (n < picked.len and !smith.eos()) : (n += 1) {
+        picked[n] = f1b_arg_shapes[smith.index(f1b_arg_shapes.len)];
+    }
+    if (n == 0) return;
+    const name = f1b_names[smith.index(f1b_names.len)];
+    var buf: [512]u8 = undefined;
+    const src = buildF1bCall(&buf, name, picked[0..n]) orelse return;
+
+    var parsed = parser.parse(std.testing.allocator, src, .{}) catch return;
+    defer parsed.deinit(std.testing.allocator);
+    if (parsed == .refused) return;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var fake = env.Fake.init(std.testing.allocator);
+    defer fake.deinit();
+    const sheet = try fuzzF1bEnv(&fake);
+
+    for ([_]value.Fidelity{ .excel, .ieee }) |mode| {
+        var draw_value: f64 = 0.5;
+        var draws = DrawSource.constant(&draw_value);
+        const opts: Options = .{
+            .current_sheet = sheet,
+            .collation = .{ .fold = shippedFold },
+            .draws = &draws,
+            .fidelity = mode,
+            .site = .{
+                .row = coords.Row.fromOneBased(2) catch unreachable,
+                .col = coords.Col.fromZeroBased(1) catch unreachable,
+            },
+        };
+
+        var first = Evaluator.init(arena_state.allocator(), fake.evalEnv(), opts);
+        defer first.deinit();
+        var second = Evaluator.init(arena_state.allocator(), fake.evalEnv(), opts);
+        defer second.deinit();
+
+        if (first.evaluate(parsed.ok)) |a| {
+            try assertRepresentable(a);
+            const b = second.evaluate(parsed.ok) catch return error.NondeterministicEvaluation;
+            try assertRepresentable(b);
+            if (!valuesAgree(a, b)) {
+                std.debug.print("`{s}` evaluated two ways\n", .{src});
+                return error.NondeterministicEvaluation;
+            }
+        } else |e| {
+            if (second.evaluate(parsed.ok)) |_| {
+                return error.NondeterministicEvaluation;
+            } else |e2| {
+                if (e != e2) return error.NondeterministicEvaluation;
+            }
+        }
+    }
+}
+
+test "fuzz: no F1b argument shape panics, leaks, or evaluates two ways" {
+    // The generator's alphabet is a second copy of the batch, so it is
+    // checked against the file rather than maintained by hand.
+    var it = registry.inventory();
+    var batch: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4e")) continue;
+        batch += 1;
+        var present = false;
+        for (f1b_names) |n| {
+            if (std.mem.eql(u8, n, e.name)) present = true;
+        }
+        if (!present) {
+            std.debug.print("fuzz alphabet is missing {s}\n", .{e.name});
+            return error.FuzzAlphabetIncomplete;
+        }
+    }
+    try testing.expectEqual(batch, f1b_names.len);
+
+    try std.testing.fuzz({}, fuzzF1bTarget, .{
+        .corpus = &[_][]const u8{
+            "SUM(C1:C4)",
+            "AVERAGE(A7)",
+            "AVERAGE((A1:A2,C1:C4))",
+            "MIN(D1:D5)",
+            "MAX({1,2;3,4})",
+            "SUMPRODUCT(C1:C4,C1:C4)",
+            "SUMPRODUCT(C1:C4,F1:H3)",
+            "COUNT(D1:D5)",
+            "COUNTA(D1:D5)",
+            "COUNTBLANK(D1:D5)",
+            "COUNTIF(D1:D5,\"\")",
+            "SUMIF(C1:C4,\">2\",F1:H3)",
+            "AVERAGEIF(C1:C4,\">99\")",
+            "VLOOKUP(\"t*\",F1:H3,3,FALSE)",
+            "VLOOKUP(1E+308,F1:H3,1E+308)",
+            "HLOOKUP(0,F1:H3,-1)",
+            "MATCH(\"\",D1:D5,0)",
+            "MATCH(2.5,F1:H3,-1)",
+            "XMATCH(1,C1:C4,2,-2)",
+            "XMATCH(1,C1:C4,1E+308,1E+308)",
+            "XLOOKUP(1,C1:C4,F1:H3,\"\",0,1)",
+            "XLOOKUP(1,F1:H3,C1:C4,1/0)",
+            "INDEX(F1:H3,0,0)",
+            "INDEX(F1:H3,1E+308,-1)",
+            "CHOOSE({1,2},C1:C4,D1:D5)",
+            "ROW((A1:A2,C1:C4))",
+            "COLUMNS({1,2;3,4})",
+        },
+    });
+}
+
+test "M4e: every name against every argument shape, exhaustively and in both modes" {
+    // The `fuzz` step is Linux-only (`build.zig` — coverage-guided
+    // fuzzing is broken upstream on macOS and Windows), so on the other
+    // two platforms the target above runs its corpus and nothing else.
+    // The property it exists to prove is small enough to prove by
+    // ENUMERATION instead: twenty-two names, every shape in the
+    // alphabet at one and two arguments — each padded to the name's own
+    // minimum arity so the three-argument lookups actually run — both
+    // rule tables, every input evaluated twice.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var fake = env.Fake.init(testing.allocator);
+    defer fake.deinit();
+    const sheet = try fuzzF1bEnv(&fake);
+
+    var checked: usize = 0;
+    for (f1b_names) |name| {
+        for (f1b_arg_shapes) |first_arg| {
+            var buf: [256]u8 = undefined;
+            if (buildF1bCall(&buf, name, &.{first_arg})) |one| {
+                try sweepShape(&arena_state, &fake, sheet, one, &checked);
+            }
+            for (f1b_arg_shapes) |second_arg| {
+                var pair_buf: [256]u8 = undefined;
+                const two = buildF1bCall(&pair_buf, name, &.{ first_arg, second_arg }) orelse continue;
+                try sweepShape(&arena_state, &fake, sheet, two, &checked);
+            }
+            // A lookup materializes its table into the arena, and this
+            // sweep runs tens of thousands of them. Reclaiming per
+            // shape keeps the enumeration's memory bounded by its
+            // widest single call rather than by its length.
+            _ = arena_state.reset(.retain_capacity);
+        }
+    }
+    // A sweep that silently stopped enumerating would still pass, so
+    // the count is asserted as a floor rather than left to the loops.
+    try testing.expect(checked > 20_000);
+}
+
 // ─── boundaries and refusals ─────────────────────────────────────
 
 fn emptyMatrixImpl(ctx: registry.CallCtx, args: []const Value) registry.FnError!Value {
@@ -4004,7 +5193,9 @@ test "refusals: an unregistered call refuses, an unresolvable name is #NAME?" {
 
     // §7: unregistered calls refuse rather than inventing `#NAME?` for a
     // function zlsx simply does not implement.
-    try testing.expectError(error.UnsupportedFunction, h.eval("VLOOKUP(1,A1:B2,2)"));
+    // `SUMIFS` is frozen in the inventory for M7b2 and unregistered
+    // today; `VLOOKUP` stood here until M4e registered it.
+    try testing.expectError(error.UnsupportedFunction, h.eval("SUMIFS(A1:B2,A1:B2,1)"));
     try testing.expectError(error.UnsupportedFunction, h.eval("NOTAFUNCTION()"));
     // §5.9: a value-position name that provably resolves nowhere is a
     // plane-1 `#NAME?`, which is a successful result.
@@ -4495,6 +5686,27 @@ test "checkAllAllocationFailures: evaluation leaks nothing under OOM" {
         "RANDBETWEEN(A1:B1,A1:B1)",
         "TRUNC((A1:B1,A1:A1),0)",
         "IFERROR(SQRT(-A1),LOG(A2))",
+        // M4e: every new impl at least once, plus the shapes that make
+        // one of them allocate — a materialized lookup table, a folded
+        // wildcard match, a criteria scan over a multi-area set, and
+        // the two names that build an array to return.
+        "AVERAGE(A1:B1,A2,TRUE())",
+        "MIN(A1:B1)+MAX(A1:B1)",
+        "SUMPRODUCT(A1:B1,A1:B1)",
+        "SUMPRODUCT({1,2},{3,4})",
+        "AVERAGEIF(A1:B1,\">1\",A1:B1)",
+        "COUNTIF((A1:A2,B1:B1),\">1\")",
+        "VLOOKUP(2,A1:B1,2)",
+        "VLOOKUP(\"a*\",A2:B2,1,FALSE)",
+        "HLOOKUP(2,A1:B1,1)",
+        "MATCH(\"ABC\",A2:B2,0)",
+        "XMATCH(2,A1:B1,-1,-1)",
+        "XLOOKUP(2,A1:B1,A1:B1,\"none\")",
+        "XLOOKUP(2,A1:A1,A1:B1)",
+        "INDEX(A1:B1,1,2)",
+        "INDEX(A1:B1,0,0)",
+        "ROW(A1)+COLUMN(B1)+ROWS(A1:B1)+COLUMNS(A1:B1)",
+        "CHOOSE(2,A1,A2)",
     };
     for (sources) |src| {
         try testing.checkAllAllocationFailures(testing.allocator, evalUnderOom, .{src});

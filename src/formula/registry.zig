@@ -44,11 +44,15 @@
 //! were already here as M3a2's framework subjects. That row *pins*
 //! them rather than adding them: they are held to the same five-field
 //! check, the same fixture-per-name coverage, and the same
-//! evidence labelling as the fifteen the row writes. The functions the
-//! framework still borrows from later rows (SUM, COUNT, COUNTA,
-//! COUNTBLANK, COUNTIF, SUMIF, CHOOSE) remain M4e's to pin; they are in
-//! the table because the framework needed them, not because their row
-//! has run.
+//! evidence labelling as the fifteen the row writes. **M4e closes
+//! F1b** — the twenty-two aggregate, criteria, lookup and
+//! position names — and with it the Core gate of 59, which is M4c's
+//! twenty plus M4d's seventeen plus this row's twenty-two, regenerated
+//! from the inventory rather than written down. Seven of the
+//! twenty-two (`SUM`, `COUNT`, `COUNTA`, `COUNTBLANK`, `COUNTIF`,
+//! `SUMIF`, `CHOOSE`) were the framework's borrowed subjects; M4e pins
+//! them where they stand, exactly as M4d pinned `SQRT` and `RAND`.
+//! Nothing in the table is now unpinned.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -88,6 +92,22 @@ pub const CallCtx = struct {
     /// branch" is a property of the evaluator rather than of a fixture.
     pub fn draw(self: CallCtx) f64 {
         return self.ev.opts.draws.draw();
+    }
+
+    /// Where the formula lives, for the two functions whose answer *is*
+    /// their position. Optional because standalone evaluation has no
+    /// stored cell (§5.3b): `ROW()` with no anchor raises
+    /// `error.AnchorRequired` rather than guessing 1.
+    pub fn site(self: CallCtx) ?eval.EvalSite {
+        return self.ev.opts.site;
+    }
+
+    /// `collation_v1`, for the five lookup names that take their
+    /// equality and their ordering from it (§5.4b). Reached through the
+    /// context rather than rebuilt, because a second comparator is the
+    /// failure the single-comparator rule exists to prevent.
+    pub fn collation(self: CallCtx) value.Collation {
+        return self.ev.opts.collation;
     }
 };
 
@@ -584,6 +604,43 @@ pub const functions = [_]Function{
         .propagation = .per_function_provenance,
         .impl = fnCountBlank,
     },
+    .{
+        .name = "AVERAGE",
+        .arity = .{ .min = 1, .max = null, .fixed = &none_l, .rest = &eager1 },
+        .coercion = .{ .fixed = &none_c, .rest = &[_]CoercionClass{.aggregate} },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnAverage,
+    },
+    // MIN and MAX are **not** `collation_sensitive`, and that is a
+    // decision rather than an omission: §5.4b names them as the
+    // comparator's one exception, because they never compare text at
+    // all — a direct text argument coerces or is `#VALUE!`, text found
+    // in a range is ignored, and no numbers anywhere is 0.
+    .{
+        .name = "MIN",
+        .arity = .{ .min = 1, .max = null, .fixed = &none_l, .rest = &eager1 },
+        .coercion = .{ .fixed = &none_c, .rest = &[_]CoercionClass{.aggregate} },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnMin,
+    },
+    .{
+        .name = "MAX",
+        .arity = .{ .min = 1, .max = null, .fixed = &none_l, .rest = &eager1 },
+        .coercion = .{ .fixed = &none_c, .rest = &[_]CoercionClass{.aggregate} },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnMax,
+    },
+    .{
+        .name = "SUMPRODUCT",
+        .arity = .{ .min = 1, .max = null, .fixed = &none_l, .rest = &eager1 },
+        .coercion = .{ .fixed = &none_c, .rest = &[_]CoercionClass{.aggregate} },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnSumProduct,
+    },
 
     // ── criteria: the two shapes §5.6a's alignment rule distinguishes ──
     .{
@@ -609,6 +666,163 @@ pub const functions = [_]Function{
         .propagation = .per_function_provenance,
         .collation_sensitive = true,
         .impl = fnSumIf,
+    },
+    .{
+        .name = "AVERAGEIF",
+        .arity = .{ .min = 2, .max = 3, .fixed = &[_]Laziness{ .eager, .eager, .eager }, .rest = &none_l },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .reference, .criteria, .reference },
+            .rest = &none_c,
+        },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .collation_sensitive = true,
+        .impl = fnAverageIf,
+    },
+
+    // ── lookups: the five names that take BOTH their equality and
+    //    their ordering from `collation_v1` (§5.4b), which is exactly
+    //    what MIN and MAX above do not.
+    //
+    //    All five are `per_function_provenance` rather than
+    //    `propagate`, for a reason §5.3c states and this is the first
+    //    batch to meet: an error found INSIDE a lookup table is not the
+    //    lookup's error — it is a value the lookup may or may not
+    //    return. The dispatcher's first-error scan cannot draw that
+    //    line (it sees evaluated scalars, and a table arrives as a
+    //    reference), and it cannot see an error in the KEY slot either,
+    //    which is `.value_any` and therefore also often a reference. So
+    //    §5.3c's declaration order is taken by `lookupPropagate` below,
+    //    where both halves are one rule. ──
+    .{
+        .name = "VLOOKUP",
+        .arity = .{
+            .min = 3,
+            .max = 4,
+            .fixed = &[_]Laziness{ .eager, .eager, .eager, .eager },
+            .rest = &none_l,
+        },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .value_any, .aggregate, .number, .logical },
+            .rest = &none_c,
+        },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .collation_sensitive = true,
+        .impl = fnVLookup,
+    },
+    .{
+        .name = "HLOOKUP",
+        .arity = .{
+            .min = 3,
+            .max = 4,
+            .fixed = &[_]Laziness{ .eager, .eager, .eager, .eager },
+            .rest = &none_l,
+        },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .value_any, .aggregate, .number, .logical },
+            .rest = &none_c,
+        },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .collation_sensitive = true,
+        .impl = fnHLookup,
+    },
+    .{
+        .name = "MATCH",
+        .arity = .{ .min = 2, .max = 3, .fixed = &[_]Laziness{ .eager, .eager, .eager }, .rest = &none_l },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .value_any, .aggregate, .number },
+            .rest = &none_c,
+        },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .collation_sensitive = true,
+        .impl = fnMatch,
+    },
+    .{
+        .name = "XLOOKUP",
+        .arity = .{
+            .min = 3,
+            .max = 6,
+            .fixed = &[_]Laziness{ .eager, .eager, .eager, .eager, .eager, .eager },
+            .rest = &none_l,
+        },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{
+                .value_any, .aggregate, .aggregate,
+                .value_any, .number,    .number,
+            },
+            .rest = &none_c,
+        },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .collation_sensitive = true,
+        .impl = fnXLookup,
+    },
+    .{
+        .name = "XMATCH",
+        .arity = .{
+            .min = 2,
+            .max = 4,
+            .fixed = &[_]Laziness{ .eager, .eager, .eager, .eager },
+            .rest = &none_l,
+        },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .value_any, .aggregate, .number, .number },
+            .rest = &none_c,
+        },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .collation_sensitive = true,
+        .impl = fnXMatch,
+    },
+    .{
+        .name = "INDEX",
+        .arity = .{ .min = 2, .max = 3, .fixed = &[_]Laziness{ .eager, .eager, .eager }, .rest = &none_l },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .aggregate, .number, .number },
+            .rest = &none_c,
+        },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnIndex,
+    },
+
+    // ── position: what a reference IS, rather than what it holds. The
+    //    zero-argument forms are the only site-dependent rows in the
+    //    registry, which is why `CallCtx.site` exists. ──
+    .{
+        .name = "ROW",
+        .arity = .{ .min = 0, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &[_]CoercionClass{.reference}, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnRow,
+    },
+    .{
+        .name = "COLUMN",
+        .arity = .{ .min = 0, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &[_]CoercionClass{.reference}, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnColumn,
+    },
+    .{
+        .name = "ROWS",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &[_]CoercionClass{.aggregate}, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnRows,
+    },
+    .{
+        .name = "COLUMNS",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &[_]CoercionClass{.aggregate}, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnColumns,
     },
 
     // ── the lazy forms. No `impl`: deferring an arm means holding an
@@ -1265,6 +1479,162 @@ fn fnCountBlank(ctx: CallCtx, args: []const Value) FnError!Value {
     return Value.num(@floatFromInt(total));
 }
 
+fn fnAverage(ctx: CallCtx, args: []const Value) FnError!Value {
+    const Acc = struct {
+        ctx: CallCtx,
+        total: f64 = 0,
+        n: f64 = 0,
+        failed: ?value.ScalarValue = null,
+
+        fn visit(self: *@This(), s: value.ScalarValue, via_range: bool) FnError!bool {
+            if (s == .err) {
+                self.failed = s;
+                return false;
+            }
+            // `SUM`'s split exactly: a range contributes numbers only,
+            // a direct argument coerces. The denominator follows the
+            // numerator, which is why `AVERAGE(1,)` is 0.5 and not 1.
+            const x: f64 = if (via_range) blk: {
+                if (s != .number) return true;
+                break :blk s.number;
+            } else switch (value.coerceToNumber(s, self.ctx.fidelity(), .function_arg)) {
+                .number => |n| n,
+                .value => |v| {
+                    self.failed = v;
+                    return false;
+                },
+                .locale_refusal => return error.LocaleSensitiveInput,
+            };
+            const r = value.addSub(self.ctx.rules(), self.total, x, .add);
+            if (r == .err) {
+                self.failed = r;
+                return false;
+            }
+            self.total = r.number;
+            self.n += 1;
+            return true;
+        }
+    };
+    var acc: Acc = .{ .ctx = ctx };
+    try visitArgs(ctx, args, &acc);
+    if (acc.failed) |f| return .{ .scalar = f };
+    // Nothing numeric anywhere is `#DIV/0!`, spelled by the division
+    // rather than tested for: an average of nothing IS a division by
+    // zero, and routing it through `divide` keeps one answer for it.
+    return .{ .scalar = value.divide(ctx.rules(), acc.total, acc.n) };
+}
+
+const Extreme = enum { min, max };
+
+/// `MIN` and `MAX` — outside `collation_v1`'s comparator by §5.4b,
+/// because they never compare text: a direct text argument coerces or
+/// is `#VALUE!`, text found in a range is ignored, and no numbers
+/// anywhere is 0 rather than an error.
+fn foldExtreme(ctx: CallCtx, args: []const Value, mode: Extreme) FnError!Value {
+    const Acc = struct {
+        ctx: CallCtx,
+        mode: Extreme,
+        best: ?f64 = null,
+        failed: ?value.ScalarValue = null,
+
+        fn visit(self: *@This(), s: value.ScalarValue, via_range: bool) FnError!bool {
+            if (s == .err) {
+                self.failed = s;
+                return false;
+            }
+            const x: f64 = if (via_range) blk: {
+                if (s != .number) return true;
+                break :blk s.number;
+            } else switch (value.coerceToNumber(s, self.ctx.fidelity(), .function_arg)) {
+                .number => |n| n,
+                .value => |v| {
+                    self.failed = v;
+                    return false;
+                },
+                .locale_refusal => return error.LocaleSensitiveInput,
+            };
+            const cur = self.best orelse {
+                self.best = x;
+                return true;
+            };
+            // Deliberately not `@min`/`@max`: those are IEEE
+            // minNum/maxNum, which treat `-0` and `+0` as
+            // interchangeable and would decide — silently, and in
+            // whichever direction the hardware felt like — the one case
+            // N3 makes observable between the two rule tables.
+            const take = switch (self.mode) {
+                .min => x < cur,
+                .max => x > cur,
+            };
+            if (take) self.best = x;
+            return true;
+        }
+    };
+    var acc: Acc = .{ .ctx = ctx, .mode = mode };
+    try visitArgs(ctx, args, &acc);
+    if (acc.failed) |f| return .{ .scalar = f };
+    return .{ .scalar = value.ScalarValue.fromArithmetic(acc.best orelse 0) };
+}
+
+fn fnMin(ctx: CallCtx, args: []const Value) FnError!Value {
+    return foldExtreme(ctx, args, .min);
+}
+
+fn fnMax(ctx: CallCtx, args: []const Value) FnError!Value {
+    return foldExtreme(ctx, args, .max);
+}
+
+fn fnSumProduct(ctx: CallCtx, args: []const Value) FnError!Value {
+    const grids = try ctx.arena().alloc(Grid, args.len);
+    for (args, grids) |a, *g| g.* = (try gridOf(ctx, a)) orelse return Value.err(.value);
+
+    // Excel requires identical dimensions here and does not broadcast:
+    // `SUMPRODUCT(A1:A3, 2)` is `#VALUE!`, not three doubled cells.
+    const rows = grids[0].rows;
+    const cols = grids[0].cols;
+    for (grids[1..]) |g| {
+        if (g.rows != rows or g.cols != cols) return Value.err(.value);
+    }
+
+    // Errors first, argument by argument and row-major within each —
+    // §5.6a's iteration order, which is the order `SUM` propagates in.
+    // Folding this into the product loop below would have made the
+    // answer depend on position instead of on declaration order.
+    for (grids) |g| {
+        var r: u32 = 0;
+        while (r < rows) : (r += 1) {
+            var c: u32 = 0;
+            while (c < cols) : (c += 1) {
+                const s = g.at(r, c);
+                if (s == .err) return .{ .scalar = s };
+            }
+        }
+    }
+
+    var total: f64 = 0;
+    var r: u32 = 0;
+    while (r < rows) : (r += 1) {
+        var c: u32 = 0;
+        while (c < cols) : (c += 1) {
+            var product: f64 = 1;
+            for (grids) |g| {
+                const s = g.at(r, c);
+                // Anything that is not a number contributes zero — the
+                // array rule, and the reason `SUMPRODUCT({TRUE})` is 0
+                // where `SUM(TRUE)` is 1.
+                const x: f64 = if (s == .number) s.number else 0;
+                const p = value.multiply(ctx.rules(), product, x);
+                if (p == .err) return .{ .scalar = p };
+                product = p.number;
+            }
+            const t = value.addSub(ctx.rules(), total, product, .add);
+            if (t == .err) return .{ .scalar = t };
+            total = t.number;
+        }
+    }
+    return .{ .scalar = value.ScalarValue.fromArithmetic(total) };
+}
+
 const LogicalFold = enum { all, any };
 
 fn foldLogical(ctx: CallCtx, args: []const Value, mode: LogicalFold) FnError!Value {
@@ -1435,6 +1805,495 @@ fn fnSumIf(ctx: CallCtx, args: []const Value) FnError!Value {
     const areas = [_]env.RangeRef{ area, sum_area };
     const out = (try runScan(ctx, &areas, .project_from_first, criterion)) orelse return Value.err(.value);
     return Value.num(out.numeric_total);
+}
+
+fn fnAverageIf(ctx: CallCtx, args: []const Value) FnError!Value {
+    const area = singleArea(args[0]) orelse return Value.err(.value);
+    const criterion = criteria.parse(args[1].scalar, ctx.fidelity()) catch |e| return mapCriteriaError(e);
+
+    const out = if (args.len < 3) blk: {
+        const areas = [_]env.RangeRef{area};
+        break :blk (try runScan(ctx, &areas, .require_equal, criterion)) orelse
+            return Value.err(.value);
+    } else blk: {
+        const avg_area = singleArea(args[2]) orelse return Value.err(.value);
+        // The same projection `SUMIF` uses, and for the same reason
+        // (§5.6a): Excel documents the average range as projected from
+        // its top-left rather than required to be the same size.
+        const areas = [_]env.RangeRef{ area, avg_area };
+        break :blk (try runScan(ctx, &areas, .project_from_first, criterion)) orelse
+            return Value.err(.value);
+    };
+    // An average over no matching number is `#DIV/0!`. This is the one
+    // place `AVERAGEIF` is not `SUMIF` with a division bolted on: a
+    // total of nothing is 0 and an average of nothing is not.
+    return .{ .scalar = value.divide(ctx.rules(), out.numeric_total, @floatFromInt(out.numeric_count)) };
+}
+
+// ─── lookups (§5.4b: equality AND ordering from `collation_v1`) ──
+
+/// A rectangular view of one argument, with random access.
+///
+/// Aggregate walking (`visitArgs`) is a fold and needs no coordinates;
+/// a lookup is a search along an axis and needs them, so a reference is
+/// materialized here rather than streamed. The cell cap is §9's, which
+/// is why a whole-column lookup is a **limit** rather than a hang —
+/// making it fast is M7b2's row, not this one.
+const Grid = struct {
+    rows: u32,
+    cols: u32,
+    src: union(enum) { matrix: value.Matrix, scalar: value.ScalarValue },
+
+    fn at(self: Grid, r: u32, c: u32) value.ScalarValue {
+        return switch (self.src) {
+            .scalar => |s| s,
+            .matrix => |m| m.at(r, c),
+        };
+    }
+};
+
+/// `null` where the argument is not one rectangle — a multi-area union,
+/// which every lookup in this batch answers `#VALUE!` for. A 3D span
+/// never reaches here: §5.6g refuses one at an ineligible function
+/// before evaluation starts.
+fn gridOf(ctx: CallCtx, v: Value) FnError!?Grid {
+    switch (v) {
+        .scalar => |s| return Grid{ .rows = 1, .cols = 1, .src = .{ .scalar = s } },
+        .missing_arg => return Grid{ .rows = 1, .cols = 1, .src = .{ .scalar = .blank } },
+        .array => |m| return Grid{ .rows = m.rows, .cols = m.cols, .src = .{ .matrix = m } },
+        .reference => |r| {
+            const area = r.single() orelse return null;
+            const shape = area.shape();
+            var m = try value.Matrix.init(ctx.arena(), shape.rows, shape.cols);
+            var it = try ctx.ev.readRange(area);
+            while (try it.next()) |e| {
+                m.set(
+                    e.row.oneBased() - area.range.first.row.oneBased(),
+                    e.col.zeroBased() - area.range.first.col.zeroBased(),
+                    e.value,
+                );
+            }
+            return Grid{ .rows = shape.rows, .cols = shape.cols, .src = .{ .matrix = m } };
+        },
+    }
+}
+
+/// One axis of a grid. `MATCH`, `XMATCH` and `XLOOKUP` search a vector;
+/// `VLOOKUP` and `HLOOKUP` search the first column or row of a table.
+const Vector = struct {
+    grid: Grid,
+    /// Down a column, rather than across a row.
+    down: bool,
+    len: u32,
+
+    /// Always the FIRST column (or row) of the grid — a lookup table's
+    /// key axis is its first, and a standalone vector has only one.
+    fn at(self: Vector, i: u32) value.ScalarValue {
+        return if (self.down) self.grid.at(i, 0) else self.grid.at(0, i);
+    }
+};
+
+/// A grid that is a vector, whichever way it runs. `null` for a 2-D
+/// one, which `MATCH` has no single axis to search.
+fn vectorOf(g: Grid) ?Vector {
+    if (g.cols == 1) return .{ .grid = g, .down = true, .len = g.rows };
+    if (g.rows == 1) return .{ .grid = g, .down = false, .len = g.cols };
+    return null;
+}
+
+/// Excel's match semantics, spelled once for the five names that share
+/// them. `MATCH`'s type and `XMATCH`'s mode are two spellings of this.
+const MatchMode = enum {
+    /// Equality, with `*`/`?`/`~` inert.
+    exact,
+    /// Equality, with the wildcards active — what `MATCH(…,0)` and an
+    /// unsorted `VLOOKUP` do, and what `XMATCH(…,2)` asks for by name.
+    wildcard,
+    /// The largest value ≤ the key (`MATCH` type 1, `XMATCH` mode −1).
+    exact_or_smaller,
+    /// The smallest value ≥ the key (`MATCH` type −1, `XMATCH` mode 1).
+    exact_or_larger,
+};
+
+const SearchOrder = enum { first_to_last, last_to_first };
+
+/// Lookup equality is `collation_v1`'s, reached through the criteria
+/// matcher rather than through a second comparator: §5.4b names lookup
+/// equality and criteria in the same sentence, the matcher is already
+/// type-restricted the way a lookup is (a numeric key never matches a
+/// text cell), and the wildcard engine is already there.
+///
+/// The lookup VALUE is not a criterion, though, which is why this is
+/// not `criteria.parse`: that would read `VLOOKUP("<5",…)` as "less
+/// than 5" where Excel looks for the literal text `<5`.
+fn lookupCriterion(s: value.ScalarValue, wildcards: bool) criteria.Criterion {
+    return switch (s) {
+        .number => |n| .{ .relation = .eq, .operand = .{ .number = n } },
+        .boolean => |b| .{ .relation = .eq, .operand = .{ .boolean = b } },
+        .err => |e| .{ .relation = .eq, .operand = .{ .err = e } },
+        .blank => .{ .relation = .eq, .operand = .empty },
+        .text => |t| .{
+            .relation = .eq,
+            .operand = .{ .text = t },
+            .is_pattern = wildcards and
+                (criteria.hasWildcards(t) or std.mem.indexOfScalar(u8, t, '~') != null),
+            .source = t,
+        },
+    };
+}
+
+/// Where the key is, along the vector — or `null` for no match.
+fn scanVector(
+    ctx: CallCtx,
+    vec: Vector,
+    key: value.ScalarValue,
+    mode: MatchMode,
+    order: SearchOrder,
+) FnError!?u32 {
+    const criterion = lookupCriterion(key, mode == .wildcard);
+    // A blank key in an ordered scan compares as 0 — the same adoption
+    // `Evaluator.compare` applies, hoisted here because the type
+    // restriction below has to ask about the adopted type, not the
+    // written one.
+    const ordered_key = if (key == .blank) value.ScalarValue.fromNumber(0) else key;
+
+    var best: ?u32 = null;
+    var i: u32 = 0;
+    while (i < vec.len) : (i += 1) {
+        const idx = if (order == .last_to_first) vec.len - 1 - i else i;
+        const cell = vec.at(idx);
+        switch (mode) {
+            .exact, .wildcard => {
+                const hit = criteria.matches(criteriaContext(ctx), criterion, cell) catch |e|
+                    return mapCriteriaError(e);
+                if (hit) return idx;
+            },
+            .exact_or_smaller, .exact_or_larger => {
+                // An empty cell is not a candidate, and an error in the
+                // lookup vector is not one either: the pass is looking
+                // for a value, and `#N/A` in a column is not an answer
+                // to "where is 5". Neither propagates — the error the
+                // caller sees is `#N/A`, from the failed match.
+                if (cell == .blank or cell == .err) continue;
+                if (ordered_key == .err) continue;
+                // Excel's ordered match never crosses a type boundary,
+                // so the total cross-type order (number < text <
+                // logical) decides which cells are candidates and
+                // nothing else.
+                const cr = value.crossTypeRank(cell) orelse continue;
+                const kr = value.crossTypeRank(ordered_key) orelse continue;
+                if (cr != kr) continue;
+
+                const rel = try ctx.ev.compare(cell, ordered_key);
+                const eligible = switch (mode) {
+                    .exact_or_smaller => rel != .gt,
+                    .exact_or_larger => rel != .lt,
+                    else => unreachable,
+                };
+                if (!eligible) continue;
+                const b = best orelse {
+                    best = idx;
+                    continue;
+                };
+                const against = try ctx.ev.compare(cell, vec.at(b));
+                const better = switch (mode) {
+                    .exact_or_smaller => against == .gt,
+                    .exact_or_larger => against == .lt,
+                    else => unreachable,
+                };
+                // Ties go to the LAST position in array order, whichever
+                // direction the scan ran — so `search_mode` changes an
+                // exact match's answer and leaves an ordered one alone,
+                // which is what makes the two search orders agree on
+                // sorted data the way Excel's binary search does.
+                if (better or (against == .eq and idx > b)) best = idx;
+            },
+        }
+    }
+    return best;
+}
+
+/// §5.3c's declaration order, taken by the implementation rather than
+/// by the dispatcher — which is what `per_function_provenance` means
+/// for these five names.
+///
+/// Two things `propagateAndInvoke` cannot do for a lookup. It cannot
+/// see an error in the KEY slot, because that slot is `.value_any` and
+/// a key usually arrives as a reference rather than as a scalar; and it
+/// must NOT propagate an error found inside the lookup TABLE, because
+/// that error is a value the lookup may or may not return. `tables` is
+/// the bitmask of slots holding one, and every other slot is read in
+/// declaration order through the same reduction the key needs.
+fn lookupPropagate(ctx: CallCtx, args: []const Value, tables: u8) FnError!?value.ScalarValue {
+    for (args, 0..) |a, k| {
+        if (k < 8 and (tables >> @intCast(k)) & 1 == 1) continue;
+        const s = try observedScalar(ctx, a);
+        if (s == .err) return s;
+    }
+    return null;
+}
+
+const LookupAxis = enum { vertical, horizontal };
+
+fn fnVLookup(ctx: CallCtx, args: []const Value) FnError!Value {
+    return lookupTable(ctx, args, .vertical);
+}
+
+fn fnHLookup(ctx: CallCtx, args: []const Value) FnError!Value {
+    return lookupTable(ctx, args, .horizontal);
+}
+
+/// `VLOOKUP` and `HLOOKUP` are one function under two axes — the table
+/// is transposed and nothing else changes, which is why they share an
+/// implementation rather than two that could drift.
+fn lookupTable(ctx: CallCtx, args: []const Value, axis: LookupAxis) FnError!Value {
+    // Slot 1 is the table; every other slot propagates, in order.
+    if (try lookupPropagate(ctx, args, 0b0010)) |e| return .{ .scalar = e };
+    const key = try observedScalar(ctx, args[0]);
+    const table = (try gridOf(ctx, args[1])) orelse return Value.err(.value);
+
+    // The result axis. Below 1 is a formula Excel calls `#VALUE!`;
+    // beyond the table is `#REF!` — two different mistakes, and Excel
+    // spells them differently.
+    const wanted = std.math.trunc(numArg(args, 2));
+    const limit: u32 = if (axis == .vertical) table.cols else table.rows;
+    if (wanted < 1) return Value.err(.value);
+    if (wanted > @as(f64, @floatFromInt(limit))) return Value.err(.ref);
+    const offset: u32 = @as(u32, @intFromFloat(wanted)) - 1;
+
+    // Excel's default is approximate, which is the default most people
+    // did not want; it is still the default.
+    const approximate = if (args.len >= 4) args[3].scalar.boolean else true;
+    const keys: Vector = if (axis == .vertical)
+        .{ .grid = table, .down = true, .len = table.rows }
+    else
+        .{ .grid = table, .down = false, .len = table.cols };
+
+    const hit = (try scanVector(
+        ctx,
+        keys,
+        key,
+        if (approximate) .exact_or_smaller else .wildcard,
+        .first_to_last,
+    )) orelse return Value.err(.na);
+
+    return .{
+        .scalar = if (axis == .vertical) table.at(hit, offset) else table.at(offset, hit),
+    };
+}
+
+fn fnMatch(ctx: CallCtx, args: []const Value) FnError!Value {
+    if (try lookupPropagate(ctx, args, 0b0010)) |e| return .{ .scalar = e };
+    const key = try observedScalar(ctx, args[0]);
+    const g = (try gridOf(ctx, args[1])) orelse return Value.err(.value);
+    // `MATCH` answers a position along one axis, and a 2-D array has no
+    // single one to answer along.
+    const vec = vectorOf(g) orelse return Value.err(.na);
+
+    const t = std.math.trunc(if (args.len >= 3) numArg(args, 2) else 1);
+    const mode: MatchMode = if (t > 0)
+        .exact_or_smaller
+    else if (t < 0)
+        .exact_or_larger
+    else
+        .wildcard;
+
+    const hit = (try scanVector(ctx, vec, key, mode, .first_to_last)) orelse
+        return Value.err(.na);
+    return Value.num(@floatFromInt(hit + 1));
+}
+
+/// `XMATCH`'s mode pair, shared with `XLOOKUP`. An unlisted mode is
+/// `#VALUE!` rather than a nearest-neighbour reading of what the caller
+/// might have meant.
+const XModes = struct { mode: MatchMode, order: SearchOrder };
+
+fn xModes(args: []const Value, mode_slot: usize, order_slot: usize) ?XModes {
+    const m = std.math.trunc(if (args.len > mode_slot) numArg(args, mode_slot) else 0);
+    const mode: MatchMode = if (m == 0)
+        .exact
+    else if (m == -1)
+        .exact_or_smaller
+    else if (m == 1)
+        .exact_or_larger
+    else if (m == 2)
+        .wildcard
+    else
+        return null;
+
+    // The two binary modes document a requirement on the *caller* (a
+    // sorted array), not a different answer: over sorted input a linear
+    // pass in the same direction lands on the same element, so they map
+    // onto the two scan orders rather than onto a second algorithm.
+    const s = std.math.trunc(if (args.len > order_slot) numArg(args, order_slot) else 1);
+    const order: SearchOrder = if (s == 1 or s == 2)
+        .first_to_last
+    else if (s == -1 or s == -2)
+        .last_to_first
+    else
+        return null;
+
+    return .{ .mode = mode, .order = order };
+}
+
+fn fnXMatch(ctx: CallCtx, args: []const Value) FnError!Value {
+    if (try lookupPropagate(ctx, args, 0b0010)) |e| return .{ .scalar = e };
+    const key = try observedScalar(ctx, args[0]);
+    const g = (try gridOf(ctx, args[1])) orelse return Value.err(.value);
+    const vec = vectorOf(g) orelse return Value.err(.na);
+    const m = xModes(args, 2, 3) orelse return Value.err(.value);
+
+    const hit = (try scanVector(ctx, vec, key, m.mode, m.order)) orelse
+        return Value.err(.na);
+    return Value.num(@floatFromInt(hit + 1));
+}
+
+fn fnXLookup(ctx: CallCtx, args: []const Value) FnError!Value {
+    // Slots 1 and 2 are the arrays — and slot 3, `if_not_found`, is
+    // masked with them. It is not an array; it is a value this call
+    // may RETURN, which puts it on the same side of the line for the
+    // same reason: propagating it would make a successful lookup fail
+    // over a fallback nobody reached. `XLOOKUP(20,…,A5)` is the hit,
+    // and `XLOOKUP(99,…,A5)` is A5 — returned, not propagated.
+    if (try lookupPropagate(ctx, args, 0b1110)) |e| return .{ .scalar = e };
+    const key = try observedScalar(ctx, args[0]);
+    const lg = (try gridOf(ctx, args[1])) orelse return Value.err(.value);
+    const vec = vectorOf(lg) orelse return Value.err(.value);
+    const rg = (try gridOf(ctx, args[2])) orelse return Value.err(.value);
+    const m = xModes(args, 4, 5) orelse return Value.err(.value);
+
+    // The return range is indexed along the axis the lookup vector runs
+    // on, and must be the same length on it.
+    const along: u32 = if (vec.down) rg.rows else rg.cols;
+    if (along != vec.len) return Value.err(.value);
+
+    const hit = (try scanVector(ctx, vec, key, m.mode, m.order)) orelse {
+        // `if_not_found` replaces the `#N/A` a failed match would be,
+        // and only that: it is not an `IFERROR`, so an error anywhere
+        // else has already propagated (§5.3c) and never reaches here.
+        if (args.len >= 4) return args[3];
+        return Value.err(.na);
+    };
+
+    // A vector return range yields the element; a 2-D one yields the
+    // whole row (or column) at the match, which is Excel's answer and
+    // an array this evaluator already carries.
+    const across: u32 = if (vec.down) rg.cols else rg.rows;
+    if (across == 1) {
+        return .{ .scalar = if (vec.down) rg.at(hit, 0) else rg.at(0, hit) };
+    }
+    var m2 = try value.Matrix.init(
+        ctx.arena(),
+        if (vec.down) 1 else across,
+        if (vec.down) across else 1,
+    );
+    var k: u32 = 0;
+    while (k < across) : (k += 1) {
+        if (vec.down) m2.set(0, k, rg.at(hit, k)) else m2.set(k, 0, rg.at(k, hit));
+    }
+    return .{ .array = m2 };
+}
+
+fn fnIndex(ctx: CallCtx, args: []const Value) FnError!Value {
+    const g = (try gridOf(ctx, args[0])) orelse return Value.err(.value);
+    const first = std.math.trunc(numArg(args, 1));
+
+    var want_row = first;
+    var want_col: f64 = if (args.len >= 3) std.math.trunc(numArg(args, 2)) else 0;
+    if (args.len < 3) {
+        // One index runs along a vector's own axis; on a 2-D array it
+        // selects a whole row, which is what a bare `0` column means
+        // below.
+        if (g.rows == 1) {
+            want_row = 1;
+            want_col = first;
+        } else if (g.cols == 1) {
+            want_col = 1;
+        }
+    }
+
+    if (want_row < 0 or want_col < 0) return Value.err(.value);
+    if (want_row > @as(f64, @floatFromInt(g.rows))) return Value.err(.ref);
+    if (want_col > @as(f64, @floatFromInt(g.cols))) return Value.err(.ref);
+    const r: u32 = @intFromFloat(want_row);
+    const c: u32 = @intFromFloat(want_col);
+
+    if (r > 0 and c > 0) return .{ .scalar = g.at(r - 1, c - 1) };
+    // A zero index means "the whole axis" — the form that makes
+    // `INDEX(A1:B3,0,2)` a column rather than an error.
+    const rows: u32 = if (r == 0) g.rows else 1;
+    const cols: u32 = if (c == 0) g.cols else 1;
+    if (rows == 1 and cols == 1) {
+        return .{ .scalar = g.at(if (r == 0) 0 else r - 1, if (c == 0) 0 else c - 1) };
+    }
+    var m = try value.Matrix.init(ctx.arena(), rows, cols);
+    var i: u32 = 0;
+    while (i < rows) : (i += 1) {
+        var j: u32 = 0;
+        while (j < cols) : (j += 1) {
+            m.set(i, j, g.at(if (r == 0) i else r - 1, if (c == 0) j else c - 1));
+        }
+    }
+    return .{ .array = m };
+}
+
+// ── position: what a reference IS ──
+
+/// The first area of a reference argument. The `.reference` coercion
+/// class has already turned a non-reference into `#VALUE!` and
+/// `.propagate` has already returned it, so the `else` arm is
+/// unreachable in practice and stated anyway — an exhaustive switch is
+/// cheaper than a comment claiming it cannot happen.
+fn firstArea(v: Value) ?env.RangeRef {
+    return switch (v) {
+        .reference => |r| if (r.areas.len == 0) null else r.areas[0],
+        else => null,
+    };
+}
+
+fn fnRow(ctx: CallCtx, args: []const Value) FnError!Value {
+    if (args.len == 0) {
+        const s = ctx.site() orelse return error.AnchorRequired;
+        return Value.num(@floatFromInt(s.row.oneBased()));
+    }
+    const area = firstArea(args[0]) orelse return Value.err(.value);
+    return Value.num(@floatFromInt(area.range.first.row.oneBased()));
+}
+
+fn fnColumn(ctx: CallCtx, args: []const Value) FnError!Value {
+    if (args.len == 0) {
+        const s = ctx.site() orelse return error.AnchorRequired;
+        return Value.num(@floatFromInt(s.col.zeroBased() + 1));
+    }
+    const area = firstArea(args[0]) orelse return Value.err(.value);
+    return Value.num(@floatFromInt(area.range.first.col.zeroBased() + 1));
+}
+
+const Axis = enum { rows, cols };
+
+/// How far an argument reaches along one axis. No cell is read: the
+/// answer is a property of the shape, which is why `ROWS(A1:A9)` is 9
+/// whether or not anything is stored in it.
+fn spanOf(v: Value, axis: Axis) u32 {
+    return switch (v) {
+        .reference => |r| blk: {
+            if (r.areas.len == 0) break :blk 1;
+            const s = r.areas[0].shape();
+            break :blk if (axis == .rows) s.rows else s.cols;
+        },
+        .array => |m| if (axis == .rows) m.rows else m.cols,
+        .scalar, .missing_arg => 1,
+    };
+}
+
+fn fnRows(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    return Value.num(@floatFromInt(spanOf(args[0], .rows)));
+}
+
+fn fnColumns(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    return Value.num(@floatFromInt(spanOf(args[0], .cols)));
 }
 
 // ─── the frozen inventory (committed data) ───────────────────────
@@ -1904,6 +2763,299 @@ test "M4d: the multi-argument names are derived from arity, not listed" {
     try testing.expectEqual(@as(?u8, 2), lookup("LOG").?.arity.max);
 }
 
+// ─── M4e: the F1b batch, against the frozen inventory ────────────
+
+const m4e_milestone = "M4e";
+const m4e_batch = "F1b";
+
+fn isM4e(e: InventoryEntry) bool {
+    return std.mem.eql(u8, e.milestone, m4e_milestone) and
+        std.mem.eql(u8, e.batch, m4e_batch);
+}
+
+test "M4e: the batch's size is regenerated from the inventory, never from prose" {
+    // The ladder row says "~22". This test does not say 22: it counts
+    // the file, and `inventory: per-milestone counts reproduce the
+    // ladder` holds the ladder's own number to the same file.
+    var it = inventory();
+    var counted: usize = 0;
+    while (it.next()) |e| {
+        if (isM4e(e)) counted += 1;
+    }
+    try testing.expect(counted > 0);
+
+    // Direction one — no omissions.
+    var it2 = inventory();
+    var resolved: usize = 0;
+    while (it2.next()) |e| {
+        if (!isM4e(e)) continue;
+        const f = lookup(e.name) orelse {
+            std.debug.print("F1b name not registered: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        };
+        try testing.expectEqualStrings(e.name, f.name);
+        resolved += 1;
+    }
+    try testing.expectEqual(counted, resolved);
+
+    // Direction two — no substitutions.
+    var registered: usize = 0;
+    for (&functions) |*f| {
+        var it3 = inventory();
+        while (it3.next()) |e| {
+            if (!std.mem.eql(u8, e.name, f.name)) continue;
+            if (std.mem.eql(u8, e.milestone, m4e_milestone)) {
+                if (!isM4e(e)) {
+                    std.debug.print("{s}: tagged {s} but batch {s}\n", .{ f.name, e.milestone, e.batch });
+                    return error.BatchTagMismatch;
+                }
+                registered += 1;
+            }
+            break;
+        }
+    }
+    try testing.expectEqual(counted, registered);
+}
+
+test "M4e: the Core gate is counted from the file, not read from the ladder" {
+    // §7 makes the TSV the count source, and the ladder's "Core gate
+    // 59" is the sum of three of its milestones. Counting it here from
+    // the file means the ladder's figure and the registry meet at the
+    // data: a twenty-third F1b row moves this number, and the only way
+    // to keep the prose true is to change the prose.
+    const rows = [_][]const u8{ "M4c", "M4d", "M4e" };
+    var core: usize = 0;
+    for (rows) |m| {
+        var it = inventory();
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, e.milestone, m)) core += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 59), core);
+
+    // …and every one of the fifty-nine resolves, which is what makes
+    // "the gate closes at M4e" a statement about the registry rather
+    // than about three counts that happen to add up.
+    var closed: usize = 0;
+    for (rows) |m| {
+        var it = inventory();
+        while (it.next()) |e| {
+            if (!std.mem.eql(u8, e.milestone, m)) continue;
+            if (lookup(e.name) == null) {
+                std.debug.print("Core-gate name does not resolve: {s} ({s})\n", .{ e.name, m });
+                return error.CoreGateIncomplete;
+            }
+            closed += 1;
+        }
+    }
+    try testing.expectEqual(core, closed);
+}
+
+test "M4e: every F1b row declares all five fields, and none of them by default" {
+    var it = inventory();
+    var seen: usize = 0;
+    while (it.next()) |e| {
+        if (!isM4e(e)) continue;
+        const f = lookup(e.name).?;
+        seen += 1;
+
+        try testing.expect(f.name.len > 0);
+        try testing.expectEqualStrings(e.name, f.name);
+
+        // Arity: a real range, with a repeating slot iff unbounded.
+        if (f.arity.max) |max| try testing.expect(f.arity.min <= max);
+        if (f.arity.max == null) try testing.expect(f.arity.rest.len > 0);
+        // Coercion: the two per-slot tables address the same slots, and
+        // a lazy slot lines up with the class that defers. `CHOOSE` is
+        // the only row here with one.
+        try testing.expectEqual(f.arity.fixed.len, f.coercion.fixed.len);
+        try testing.expectEqual(f.arity.rest.len, f.coercion.rest.len);
+        for (f.arity.fixed, f.coercion.fixed) |l, c| try testing.expectEqual(l == .lazy, c == .lazy_any);
+        for (f.arity.rest, f.coercion.rest) |l, c| try testing.expectEqual(l == .lazy, c == .lazy_any);
+        // Volatility: nothing in F1b is redrawn. Stated per row rather
+        // than assumed, because `.stable` is also what a forgotten
+        // field would look like if the field had a default.
+        try testing.expectEqual(Volatility.stable, f.volatility);
+        // Propagation: F1b uses three of §5.3c's four classes, and
+        // `per_element` — the operators' — is not one of them.
+        try testing.expect(f.propagation != .per_element);
+        // No member of this batch is lifted elementwise: every one of
+        // them consumes a range, an array, or a raw value itself.
+        // `da_aware` spilling is M7a's decision, not this row's.
+        try testing.expect(!f.liftable());
+        try testing.expect(!f.da_aware);
+        try testing.expect(!f.reference_producing);
+    }
+    try testing.expect(seen > 0);
+}
+
+test "M4e: the seven framework subjects carry the same five fields as the fifteen the row writes" {
+    // SUM, COUNT, COUNTA, COUNTBLANK, COUNTIF, SUMIF and CHOOSE were
+    // registered at M3a2 to exercise the framework, not because their
+    // row had run (M4c decision 12). M4e pins them where they stand —
+    // the same treatment M4d gave SQRT and RAND, and for the same
+    // reason: the rows written first are the ones most likely to have
+    // been waved through.
+    const pinned = [_][]const u8{
+        "SUM",     "COUNT", "COUNTA", "COUNTBLANK",
+        "COUNTIF", "SUMIF", "CHOOSE",
+    };
+    for (pinned) |name| {
+        const f = lookup(name).?;
+        try testing.expectEqualStrings(name, f.name);
+        try testing.expect(f.arity.min >= 1);
+        try testing.expectEqual(f.arity.fixed.len, f.coercion.fixed.len);
+        try testing.expectEqual(f.arity.rest.len, f.coercion.rest.len);
+        try testing.expectEqual(Volatility.stable, f.volatility);
+        try testing.expect(f.propagation != .per_element);
+        // Their table rows have NOT moved: `lookup` finds them where
+        // M3a2 put them, and the proof they belong to this batch is the
+        // inventory, not their position in the array.
+        try testing.expect(inInventory(name));
+        var it = inventory();
+        var tagged = false;
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, e.name, name)) tagged = isM4e(e);
+        }
+        if (!tagged) {
+            std.debug.print("{s} is pinned by M4e but the file does not tag it F1b\n", .{name});
+            return error.PinnedOutsideBatch;
+        }
+    }
+
+    // `CHOOSE` is the batch's one deferring form, and the only one of
+    // the seven that carries no `impl` — laziness lives in the
+    // evaluator because deferring an arm means holding an AST index.
+    const choose = lookup("CHOOSE").?;
+    try testing.expectEqual(Form.choose_form, choose.form);
+    try testing.expect(choose.impl == null);
+    try testing.expectEqual(Laziness.lazy, choose.arity.at(1));
+    try testing.expectEqual(Laziness.eager, choose.arity.at(0));
+}
+
+test "M4e: the batch's propagation classes are the ones §5.3c assigns" {
+    // Stated name by name, because §5.3c's whole point is that the
+    // class is per function and never per family: `COUNT` and `SUM`
+    // are neighbours in the same table and carry different classes,
+    // and so do `COUNTA` and `AVERAGE`.
+    // `per_function_provenance` is the class for a function whose
+    // answer depends on WHERE an error was found, not merely on
+    // whether there was one. The counting family is §5.3c's own
+    // example; the five lookups join it because an error inside a
+    // lookup table is a value the lookup may return rather than an
+    // error the lookup becomes.
+    const provenance = [_][]const u8{
+        "COUNT", "COUNTA",    "COUNTBLANK", "COUNTIF",
+        "SUMIF", "AVERAGEIF", "VLOOKUP",    "HLOOKUP",
+        "MATCH", "XLOOKUP",   "XMATCH",
+    };
+    for (provenance) |name| {
+        try testing.expectEqual(
+            value.PropagationClass.per_function_provenance,
+            lookup(name).?.propagation,
+        );
+    }
+    const propagators = [_][]const u8{
+        "SUM",   "AVERAGE", "MIN",    "MAX",  "SUMPRODUCT",
+        "INDEX", "ROW",     "COLUMN", "ROWS", "COLUMNS",
+    };
+    for (propagators) |name| {
+        try testing.expectEqual(value.PropagationClass.propagate, lookup(name).?.propagation);
+    }
+    // `CHOOSE` observes: it takes an index and hands back an arm, and
+    // an error in an arm it did not take is not its error.
+    try testing.expectEqual(value.PropagationClass.observe, lookup("CHOOSE").?.propagation);
+
+    // Together the three lists are the whole batch, so a name added to
+    // one and forgotten in another cannot pass.
+    var it = inventory();
+    var n: usize = 0;
+    while (it.next()) |e| {
+        if (isM4e(e)) n += 1;
+    }
+    try testing.expectEqual(n, provenance.len + propagators.len + 1);
+}
+
+test "M4e: MIN and MAX are out of the comparator, the five lookups are in it" {
+    // §5.4b's one named exception (plan revision 15, change 8). The
+    // split is registry data rather than a comment, because the flag is
+    // what a later collation change reads to know what it affects.
+    for ([_][]const u8{ "MIN", "MAX" }) |name| {
+        try testing.expect(!lookup(name).?.collation_sensitive);
+    }
+    for ([_][]const u8{ "VLOOKUP", "HLOOKUP", "MATCH", "XLOOKUP", "XMATCH" }) |name| {
+        try testing.expect(lookup(name).?.collation_sensitive);
+    }
+    // …and the whole batch, in both directions, so a sixth lookup
+    // added later cannot ship uncollated and a third extreme cannot
+    // ship collated.
+    const sensitive = [_][]const u8{
+        "COUNTIF", "SUMIF", "AVERAGEIF", "VLOOKUP",
+        "HLOOKUP", "MATCH", "XLOOKUP",   "XMATCH",
+    };
+    var it = inventory();
+    while (it.next()) |e| {
+        if (!isM4e(e)) continue;
+        var listed = false;
+        for (sensitive) |s| {
+            if (std.mem.eql(u8, s, e.name)) listed = true;
+        }
+        if (listed != lookup(e.name).?.collation_sensitive) {
+            std.debug.print("{s}: collation_sensitive={} but the list says {}\n", .{
+                e.name,
+                lookup(e.name).?.collation_sensitive,
+                listed,
+            });
+            return error.CollationFlagMismatch;
+        }
+    }
+}
+
+test "M4e: the multi-argument names are derived from arity, not listed" {
+    // The same gate M4d applied, over a batch where most names take
+    // more than one argument rather than most taking one. The list is
+    // checked against the registry's own arity so a function that
+    // gains an argument later cannot slip past unordered.
+    const expected = [_][]const u8{
+        "AVERAGE", "AVERAGEIF", "CHOOSE", "COUNT",      "COUNTA",
+        "COUNTIF", "HLOOKUP",   "INDEX",  "MATCH",      "MAX",
+        "MIN",     "SUM",       "SUMIF",  "SUMPRODUCT", "VLOOKUP",
+        "XLOOKUP", "XMATCH",
+    };
+    var it = inventory();
+    var multi: usize = 0;
+    while (it.next()) |e| {
+        if (!isM4e(e)) continue;
+        const f = lookup(e.name).?;
+        // Unbounded arity is multi-argument by construction.
+        if (f.arity.max) |max| {
+            if (max <= 1) continue;
+        }
+        multi += 1;
+        var named = false;
+        for (expected) |n| {
+            if (std.mem.eql(u8, n, e.name)) named = true;
+        }
+        if (!named) {
+            std.debug.print("multi-argument F1b name not in the list: {s}\n", .{e.name});
+            return error.UnlistedMultiArgFunction;
+        }
+    }
+    try testing.expectEqual(expected.len, multi);
+
+    // The five single-argument rows: the three position names that take
+    // one reference, and `COUNTBLANK`. `ROW`/`COLUMN` reach zero, which
+    // is what makes them the registry's only site-dependent rows.
+    try testing.expectEqual(@as(u8, 0), lookup("ROW").?.arity.min);
+    try testing.expectEqual(@as(?u8, 1), lookup("ROW").?.arity.max);
+    try testing.expectEqual(@as(u8, 0), lookup("COLUMN").?.arity.min);
+    try testing.expectEqual(@as(?u8, 1), lookup("COLUMN").?.arity.max);
+    for ([_][]const u8{ "ROWS", "COLUMNS", "COUNTBLANK" }) |name| {
+        try testing.expectEqual(@as(u8, 1), lookup(name).?.arity.min);
+        try testing.expectEqual(@as(?u8, 1), lookup(name).?.arity.max);
+    }
+}
+
 test "registry: the five required fields have no defaults" {
     // "Declares" is enforced by the type, not by review: a field with a
     // default can be omitted, and an omitted propagation class is how
@@ -1967,7 +3119,12 @@ test "registry: lookup is case-insensitive and rejects unknown names" {
     try testing.expect(lookup("sum") != null);
     try testing.expect(lookup("SuM") != null);
     try testing.expectEqualStrings("SUM", lookup("sum").?.name);
-    try testing.expect(lookup("VLOOKUP") == null); // frozen, not yet implemented
+    // A name the frozen inventory holds and no row has reached yet.
+    // `VLOOKUP` stood here until M4e registered it, which is what this
+    // line is for: the example has to be a function that is genuinely
+    // still ahead of the ladder, and every batch that lands moves it.
+    try testing.expect(lookup("SUMIFS") == null); // frozen, M7b2
+    try testing.expect(inInventory("SUMIFS"));
     try testing.expect(lookup("NOTAFUNCTION") == null);
 }
 
