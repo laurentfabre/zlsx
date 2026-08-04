@@ -1880,7 +1880,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M4b2** ✅ | Full calc-state parse (`CT_CalcPr` complete, `sheetCalcPr`, `date1904`, extensions byte-exact, `fullPrecision="0"` refuses) + **CT_CellFormula attribute inventory** (13 rows, one fixture each, unknown refuses) + **attribute-based** shared classification + sheet-wide topology validation + **AST copy-translation** (relative halves by (Δrow,Δcol); off-grid collapses the whole operand to `#REF!`) + `t="d"`'s normative lexical table | Slave-shape + topology matrix; attribute fixtures; 2 000-case randomized differential vs an independent translator; corpus `<calcPr>` byte round-trip; attribute/calc-state fuzz |
 | **M4b3** ✅ | Name resolution + table producers + 3D matrix + cache-based `evaluate` | Site semantics; opaque names; 3D fixtures |
 | **M4c** ✅ | F1a-1 (20: operators; IF, AND, OR, NOT, IFERROR, IFNA, IFS, SWITCH; ISBLANK, ISNUMBER, ISTEXT, ISERROR, ISERR, ISNA, ISLOGICAL, NA, N, T; **TRUE, FALSE** — added at M3a2, see the decisions block) | Oracle-first |
-| **M4d** | F1a-2 (~17: ABS, ROUND, ROUNDUP, ROUNDDOWN, INT, TRUNC, MOD, POWER, SQRT, EXP, LN, LOG, LOG10, SIGN, PI, RAND, RANDBETWEEN) + multi-callsite/lazy-branch draw KATs | Oracle-first; KATs |
+| **M4d** ✅ | F1a-2 (17: ABS, ROUND, ROUNDUP, ROUNDDOWN, INT, TRUNC, MOD, POWER, SQRT, EXP, LN, LOG, LOG10, SIGN, PI, RAND, RANDBETWEEN — **SQRT and RAND pinned here, registered at M3a2**) + multi-callsite/lazy-branch draw KATs | Oracle-first; KATs |
 | **M4e** | F1b (~22: SUM, COUNT, COUNTA, COUNTBLANK, AVERAGE, MIN, MAX, SUMIF, COUNTIF, AVERAGEIF, SUMPRODUCT; VLOOKUP, HLOOKUP, INDEX, MATCH, XLOOKUP, XMATCH, CHOOSE, ROW, ROWS, COLUMN, COLUMNS) — **Core gate 59** | Oracle-first |
 | **M4f** | F1c-text (~19: LEFT, RIGHT, MID, LEN, LOWER, UPPER, TRIM, CONCAT, CONCATENATE, TEXTJOIN, SUBSTITUTE, REPLACE, FIND, SEARCH, EXACT, VALUE, REPT, CHAR, CODE) + **CV1/CV2 shared text layer** (§5.4d; collation_v1 landed at M3a) | Oracle-first; codec tests; per-CV fixtures |
 | **M4g** | F1c-date (~15: DATE, YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, TODAY, NOW, EOMONTH, EDATE, WEEKDAY, DATEVALUE, TIMEVALUE, TIME) | Oracle-first |
@@ -2030,6 +2030,137 @@ functions.
     subjects, registered and tested but **not oracle-pinned**; M4d and
     M4e own them. "The registry has 29 entries" is not "29 functions
     have shipped".
+
+**M4d decisions (shipped 2026-08-04).** Thirteen points, in
+`src/formula/registry.zig` (fifteen new rows and their implementations,
+the batch gates), `eval.zig` (fixtures and KATs only), and `rng.zig`
+(one seam). The batch where the two fidelity rule tables stop being a
+property of the *parser* and become a property of a **function**.
+
+1. **The oracle decides one cell of seventeen functions, and its
+   evidence is a disagreement.** `SQRT(-1)` is the only F1a-2 formula
+   any committed manifest contains — and both excel-fidelity manifests
+   contain it with *different* answers: the hand-spec suite records
+   `#NUM!` (Excel's), LibreOffice records `#VALUE!`. Those two facts are
+   not in tension, they are the same fact: at most one of two files
+   claiming `"fidelity": "excel"` is Excel, which is what makes the row
+   about the adapter rather than about the rule. It stays named in
+   `excel_adapter_divergences` beside `-0`, the tie's skip count stays
+   pinned at 2, and a new M4d test asserts the **disagreement itself**
+   rather than only the skip — averaging the two would produce an answer
+   neither adapter gave. zlsx answers `#NUM!` in both modes, because a
+   radicand's domain is not a floating-point question.
+2. **A recorded manifest cell is not necessarily a deciding one, and
+   this row is where that started to matter.** M4c asked a two-valued
+   question — does any manifest contain this formula? F1a-1 held no
+   volatile, so it never met the third answer. The LibreOffice suite
+   records a `RAND()` cell marked `"excluded": "volatile_formula"`;
+   under M4c's question that reads as evidence, and this batch registers
+   `RAND`. So M4d's evidence check is three-valued — `silent`,
+   `decided`, `excluded` — with `excluded` its own assertion and its own
+   pinned count, and a fixture claiming evidence from an excluded cell
+   fails by name. §8.2 excludes volatiles from every external value
+   oracle; the checker now enforces that instead of assuming it.
+3. **`SQRT` and `RAND` are pinned where they stand.** Both were
+   registered at M3a2 as framework subjects. M4d holds them to the same
+   five-field check, the same fixture-per-name coverage, and the same
+   evidence labelling as the fifteen the row writes — but does not move
+   their table rows, because relocating a row to demonstrate that it
+   belongs to a batch would demonstrate something about the file rather
+   than about the table. The tests read the inventory instead.
+4. **The two rule tables reach this batch through exactly one function.**
+   N2's zero-snap is additive-scope-only and never applies to a function
+   result; N3's signed-zero policy applies at *publication*, not at
+   production; N4a is shared by both modes. What is left is which
+   decimal a rounding decision is taken on, and that is `decimalView` —
+   `excel_fp_rules_v1` reads N1a's 15 significant digits, and
+   `ieee_fp_rules_v1` says `literal_significant_digits = null` precisely
+   so the same call is a no-op there. One place, both directions,
+   fixtured in both modes.
+5. **The textbook `ROUND(2.675, 2)` case does NOT diverge, and finding
+   out why located the real divergence.** 2.675 is really
+   2.67499999999999982 — but multiplying it by 100 lands within half a
+   ULP of 267.5, so the *scaling* rounds up and both modes answer 2.68.
+   The divergence lives where the scaled value stays strictly below the
+   half-way point, which needs an argument carrying 16–17 significant
+   digits. The fixture cells are therefore **stored values**, not
+   literals: N1a would round a 17-digit literal to 15 at ingress under
+   `.excel`, and the divergence under test would have been the parser's.
+6. **`-0` is produced here and normalized later, so the collapse branch
+   carries a sign.** `ROUNDDOWN(-0.4, 0)` is `-0` before publication —
+   preserved bitwise by `.ieee`, normalized to `+0` by `.excel`. That
+   holds for the branch where every significant digit is rounded away
+   too, which is why it returns `copysign(0, n)` rather than a literal
+   zero; a bare `0` would have silently collapsed a mode divergence into
+   agreement. Comparisons in the fidelity fixtures are on **published**
+   values, bit for bit, because a comparison anywhere else cannot see
+   this at all.
+7. **The scale factor need not be representable, and the fix is a
+   bound rather than an invented digit limit.** `10^d` overflows above
+   `d = 308` and underflows below `-324`, while `d` arrives as an
+   arbitrary f64 a user typed. `roundAt` decides both extremes *before*
+   scaling, by comparing the requested place with the value's own
+   decimal exponent: `d ≥ 17 − e` is already exact (binary64 carries no
+   more than 17 significant digits), and `d + e ≤ −2` removes all of
+   them. What survives is bounded — `|n·10^d| < 10^17` by construction —
+   and the scaling splits into ≤300-decade steps so no *intermediate*
+   leaves range either. `ROUNDUP` at a collapsed place is the one case
+   that legitimately overflows, and N4a answers `#NUM!`.
+8. **`POWER` is the function spelling of `^` and shares its arithmetic
+   exactly — including where that is arguably wrong.** `0^0` is 1 here,
+   inherited from the operator; Excel answers `#NUM!` and LibreOffice
+   answers 1, and **no committed manifest records the cell**. Changing
+   it is an operator-level decision, and a functions row with no
+   evidence is the wrong place to take one. So the row pins the
+   *identity* instead — `POWER(a,b)` and `a^b` agree bit for bit in both
+   modes across negative bases, fractional exponents, overflow and
+   `0^0` — which is the property a workbook actually depends on, and
+   which makes the operator the single place a future oracle leg has to
+   change.
+9. **`MOD`'s quirk is the sign, and only the sign.** §5.4's N4 names it
+   specifically, so the implementation is floored modulus written out
+   (`n − d·floor(n/d)`) and the quotient is deliberately **not** read
+   through `decimalView`: widening MOD's quirk list would be inventing
+   an Excel behaviour no manifest recorded. Both modes therefore agree
+   on every MOD fixture, and the overflow of an extreme ratio reaches
+   `#NUM!` through N4a rather than through a magnitude test.
+10. **`RANDBETWEEN` draws exactly once, and that is a decision about
+    the instrument.** `rng_v1` has an exactly-uniform rejection sampler
+    (`nextIntInclusive`, M3b) and this function does not use it: a
+    rejection sampler draws a data-dependent number of times, which
+    would make the draw *counter* — the instrument every §5.6d KAT is
+    built on — unable to state anything. Scaling one draw is off perfect
+    uniformity by at most one part in 2^53. The `@min` clamp covers the
+    one case scaling cannot, a draw just under 1 against a wide span,
+    and a sweep over the ranges and draws that break it asserts every
+    result is an integer inside `[bottom, top]`.
+11. **Non-integer `RANDBETWEEN` bounds move INWARD.** `ceil` the bottom,
+    `floor` the top, so `RANDBETWEEN(1.5, 3.5)` draws from `{2,3}`. The
+    alternative reading — truncate both toward zero — lets it answer 1,
+    a value outside the interval the caller wrote. Nothing on disk
+    decides this, so the fixture ships `spec_pinned` and pins the
+    invariant a reader can check instead: every result lies within
+    `[bottom, top]`, and a range holding no integer is `#NUM!`.
+12. **`LOG`'s base-1 failure is `#DIV/0!`, not `#NUM!`.** It divides by
+    `LN(1)`, and that is the one place this family answers with
+    something other than a domain error — so it is its own line, its own
+    fixture, and its own error-order case proving an argument's error
+    still beats it. `LOG(x)` and `LOG10(x)` are one operation under two
+    spellings, as `TRUNC(x)` and `ROUNDDOWN(x,0)` are; both equivalences
+    are asserted rather than left to be inferred from two
+    implementations.
+13. **Reproducibility is a property of the seam, and the fuzz property
+    is proved by enumeration.** `Rng.fromRunInputs` is the only way a
+    run's generator is built, so "the draw sequence comes from
+    `RunInputs` alone" is a statement about an argument list — the KAT
+    ties the *evaluator's* first two draws to `rng_v1`'s own stream for
+    that seed, and proves a dead lazy arm consumes nothing by showing
+    the live arm receives the stream's **first** value. Separately: the
+    `fuzz` step is Linux-only (coverage-guided fuzzing is broken
+    upstream on macOS and Windows), so the batch is also swept
+    **exhaustively** — every name against every argument shape at one
+    and two arguments, in both modes, each input evaluated twice. A
+    sweep that always runs beats a search that runs on one platform.
 
 ---
 

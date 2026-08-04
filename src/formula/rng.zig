@@ -40,6 +40,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const eval = @import("eval.zig");
+const run_inputs = @import("run_inputs.zig");
 
 pub const version = "rng_v1";
 
@@ -68,6 +69,29 @@ pub const SplitMix64 = struct {
 /// xoshiro256\*\* 1.0 (Blackman & Vigna).
 pub const Rng = struct {
     s: [4]u64,
+
+    /// The generator a run uses, derived from `RunInputs` and nothing
+    /// else.
+    ///
+    /// §5.5's contract is that equal inputs give equal output, and the
+    /// draw sequence is the part of it most easily broken by reaching
+    /// for a clock or an entropy source. Routing every run's generator
+    /// through one named function makes "reproducible from `RunInputs`
+    /// alone" a property of the seam rather than of each caller's
+    /// discipline — a test can then take the argument list itself as the
+    /// statement, which is what M4d's KAT does.
+    pub fn fromRunInputs(inputs: run_inputs.RunInputs) Rng {
+        return Rng.init(inputs.rng_seed);
+    }
+
+    /// The same, from the projection a cache key is built out of. Kept
+    /// separate rather than folded into the above because the two
+    /// structs are not interchangeable: `EffectiveRunInputs` is what
+    /// survives into a fingerprint, and a run replayed from one must
+    /// draw the same sequence as the run it came from.
+    pub fn fromEffective(effective: run_inputs.EffectiveRunInputs) Rng {
+        return Rng.init(effective.rng_seed);
+    }
 
     pub fn init(seed: u64) Rng {
         var sm = SplitMix64.init(seed);
@@ -279,6 +303,51 @@ test "the draw source is the evaluator's seam, counted by it" {
     var direct = Rng.init(99);
     try testing.expectEqual(direct.nextFloat(), first);
     try testing.expectEqual(direct.nextFloat(), second);
+}
+
+test "the run's generator is a function of RunInputs and of nothing else" {
+    // M4d's draw KATs rest on this: the seam that turns a run into a
+    // stream reads one field, so two runs agree exactly when their seeds
+    // do — and the fields that are *not* the seed prove it by failing to
+    // change anything.
+    const base: run_inputs.RunInputs = .{ .now_utc_ms = 1, .rng_seed = 0xA5A5_1234, .limits = .{} };
+    try base.validate();
+
+    var a = Rng.fromRunInputs(base);
+    var b = Rng.fromRunInputs(base);
+    for (0..16) |_| try testing.expectEqual(a.next(), b.next());
+
+    // A different clock, offset, fidelity, or dialect is the same
+    // stream. That is not an accident of the implementation — a run
+    // whose seed is pinned must replay whatever else moved.
+    var moved = base;
+    moved.now_utc_ms = 999_999;
+    moved.utc_offset_min = 120;
+    moved.fidelity = .ieee;
+    moved.dialect = .legacy;
+    var c = Rng.fromRunInputs(moved);
+    var d = Rng.fromRunInputs(base);
+    for (0..16) |_| try testing.expectEqual(d.next(), c.next());
+
+    // A different seed is a different stream.
+    var seeded = base;
+    seeded.rng_seed = base.rng_seed +% 1;
+    var e = Rng.fromRunInputs(seeded);
+    var f = Rng.fromRunInputs(base);
+    var same: usize = 0;
+    for (0..16) |_| {
+        if (e.next() == f.next()) same += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), same);
+
+    // The fingerprintable projection names the same stream, for both
+    // operations — a replay from a cache key must not draw differently
+    // from the run that wrote it.
+    for ([_]run_inputs.Operation{ .standalone_eval, .recalc }) |op| {
+        var from_full = Rng.fromRunInputs(base);
+        var from_effective = Rng.fromEffective(base.effective(op));
+        for (0..8) |_| try testing.expectEqual(from_full.next(), from_effective.next());
+    }
 }
 
 test "state: no seed produces the all-zero fixed point" {

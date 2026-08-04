@@ -39,9 +39,14 @@
 //! functions it needed to exercise it. **M4c closes F1a-1** — the
 //! twenty names the inventory tags `M4c`, each with a fixture, each
 //! pinned to the oracle where a committed manifest decides it and
-//! labelled `spec_pinned` where none does. The functions the framework
-//! borrowed from later rows (SUM, COUNT, COUNTA, COUNTBLANK, COUNTIF,
-//! SUMIF, SQRT, RAND, CHOOSE) are still M4d/M4e's to pin; they are in
+//! labelled `spec_pinned` where none does. **M4d closes F1a-2**, the
+//! seventeen numeric names, and two of them — `SQRT` and `RAND` —
+//! were already here as M3a2's framework subjects. That row *pins*
+//! them rather than adding them: they are held to the same five-field
+//! check, the same fixture-per-name coverage, and the same
+//! evidence labelling as the fifteen the row writes. The functions the
+//! framework still borrows from later rows (SUM, COUNT, COUNTA,
+//! COUNTBLANK, COUNTIF, SUMIF, CHOOSE) remain M4e's to pin; they are in
 //! the table because the framework needed them, not because their row
 //! has run.
 
@@ -225,6 +230,12 @@ const lazy1 = [_]Laziness{.lazy};
 const none_l = [_]Laziness{};
 const none_c = [_]CoercionClass{};
 
+// F1a-2's two signatures. Named rather than spelled inline at fifteen
+// call sites, so "this slot takes a number" is one thing to read and one
+// thing to get wrong.
+const num1 = [_]CoercionClass{.number};
+const num2 = [_]CoercionClass{ .number, .number };
+
 pub const functions = [_]Function{
     // ── zero-argument literals and the volatile probe ──
     .{
@@ -261,6 +272,11 @@ pub const functions = [_]Function{
     },
 
     // ── scalar numerics: the liftable shape ──
+    //
+    // `SQRT` is an F1a-2 row that M3a2 wrote early, as `RAND` above is.
+    // M4d pins both; neither moved, because moving a row to prove it
+    // belongs to a batch would be proving it about the file rather than
+    // about the table. The M4d tests read the inventory instead.
     .{
         .name = "SQRT",
         .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
@@ -276,6 +292,143 @@ pub const functions = [_]Function{
         .volatility = .stable,
         .propagation = .propagate,
         .impl = fnNot,
+    },
+
+    // ── M4d / F1a-2: the numeric batch ──
+    //
+    // Fifteen rows, plus `SQRT` and `RAND` above. Every one of them is
+    // `.number`-classed and `.propagate`: the dispatcher coerces, the
+    // propagation pass returns on the first error, and the
+    // implementation therefore starts from a finite f64 it did not have
+    // to re-derive. The two facts that are *not* uniform are the two the
+    // tests state name by name — which rows are volatile, and which take
+    // more than one argument.
+    .{
+        .name = "ABS",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &num1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnAbs,
+    },
+    .{
+        .name = "SIGN",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &num1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnSign,
+    },
+    .{
+        .name = "INT",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &num1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnInt,
+    },
+    // ROUND/ROUNDUP/ROUNDDOWN take the digit count as a required second
+    // argument; TRUNC's is optional and defaults to 0, which is the only
+    // difference between `TRUNC(x)` and `ROUNDDOWN(x,0)`.
+    .{
+        .name = "ROUND",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnRound,
+    },
+    .{
+        .name = "ROUNDUP",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnRoundUp,
+    },
+    .{
+        .name = "ROUNDDOWN",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnRoundDown,
+    },
+    .{
+        .name = "TRUNC",
+        .arity = .{ .min = 1, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnTrunc,
+    },
+    .{
+        .name = "MOD",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnMod,
+    },
+    .{
+        .name = "POWER",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnPower,
+    },
+    .{
+        .name = "EXP",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &num1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnExp,
+    },
+    .{
+        .name = "LN",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &num1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnLn,
+    },
+    .{
+        .name = "LOG",
+        .arity = .{ .min = 1, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnLog,
+    },
+    .{
+        .name = "LOG10",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &num1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnLog10,
+    },
+    .{
+        .name = "PI",
+        .arity = .{ .min = 0, .max = 0, .fixed = &none_l, .rest = &none_l },
+        .coercion = .{ .fixed = &none_c, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnPi,
+    },
+    // The batch's second volatile, and the only one M4d adds. It draws
+    // exactly once per call from the same counted seam `RAND` uses —
+    // see `fnRandBetween` for why a rejection sampler would have been
+    // the wrong instrument here.
+    .{
+        .name = "RANDBETWEEN",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .volatile_fn,
+        .propagation = .propagate,
+        .impl = fnRandBetween,
     },
 
     // ── the `observe` class: looking at an error without becoming one ──
@@ -581,6 +734,300 @@ fn fnSqrt(ctx: CallCtx, args: []const Value) FnError!Value {
     // and not a NaN — N4a has no room for one.
     if (n < 0) return Value.err(.num);
     return Value.num(@sqrt(n));
+}
+
+// ── M4d / F1a-2: the numeric implementations ──
+//
+// Three rules hold across every one of them, so they are stated here
+// once instead of fifteen times.
+//
+// **A number leaves through `fromArithmetic`, never `fromNumber`.** N4a
+// says a non-finite result is not a value; `fromNumber` *asserts*
+// finiteness, so `EXP(1000)` through it is a panic, and through
+// `fromArithmetic` it is `#NUM!` — Excel's own answer, and the same one
+// under both rule tables because §5.4 gives the two modes one value
+// domain.
+//
+// **The fidelity mode enters in exactly one place.** N2's zero-snap is
+// additive-scope only, so it never applies here. N3's signed-zero policy
+// applies at *publication*, so a `-0` a truncation produces travels
+// intact and `value.publish` normalizes it under `.excel`. What the mode
+// does decide inside this batch is which decimal value is being operated
+// on — see `decimalView`.
+//
+// **The dispatcher has already coerced and propagated.** A `.number`
+// slot arrives as a finite `.number` scalar or the implementation was
+// never reached, so these functions assert that instead of re-deriving
+// it (§5.3b's coercion is the table's job, §5.3c's first-error-wins is
+// `propagateAndInvoke`'s).
+
+/// Read a `.number`-classed slot. The assertions are the contract with
+/// the table above stated where it is used: change a slot's class and
+/// this fires immediately rather than producing a quietly wrong number.
+fn numArg(args: []const Value, i: usize) f64 {
+    const s = args[i].scalar;
+    assert(s == .number);
+    assert(std.math.isFinite(s.number));
+    return s.number;
+}
+
+/// The one way a computed number leaves this batch.
+fn arith(x: f64) Value {
+    return .{ .scalar = value.ScalarValue.fromArithmetic(x) };
+}
+
+/// The value a fidelity mode considers `n` to *be*.
+///
+/// `.excel` reads the 15 significant digits N1a keeps, `.ieee` reads the
+/// binary64 itself — `literal_significant_digits` is `null` there
+/// precisely so this is a no-op. It is why `ROUND(2.675, 2)` is `2.68`
+/// in one mode and `2.67` in the other: 2.675 is really
+/// 2.67499999999999982, and only one of the two modes is looking at that.
+fn decimalView(rules: value.FpRules, n: f64) f64 {
+    const sig = rules.literal_significant_digits orelse return n;
+    return value.roundToSignificantDigits(n, sig);
+}
+
+const RoundMode = enum {
+    /// ROUND — half away from zero.
+    half_away,
+    /// ROUNDUP — away from zero.
+    away,
+    /// ROUNDDOWN and TRUNC — toward zero.
+    toward,
+};
+
+/// `x · 10^d`, split so no *intermediate* leaves binary64's range even
+/// where `10^d` alone would. `roundAt`'s guards bound the result; this
+/// keeps the journey to it representable too.
+fn scaleByPowerOfTen(x: f64, d: f64) f64 {
+    assert(@abs(d) < 400); // `roundAt` bounds `d` well inside this
+    var acc = x;
+    var left = d;
+    while (left > 300) : (left -= 300) acc *= 1e300;
+    while (left < -300) : (left += 300) acc *= 1e-300;
+    return acc * std.math.pow(f64, 10, left);
+}
+
+/// The shared body of ROUND / ROUNDUP / ROUNDDOWN / TRUNC.
+///
+/// Excel rounds at a **decimal** place and binary64 has none, so the
+/// implementation is scale → round → unscale. Two things make that more
+/// than three lines.
+///
+/// **The scale factor need not be representable.** `10^d` overflows
+/// above `d = 308` and underflows below `d = -324`, while `d` itself
+/// arrives as an arbitrary f64 the caller typed. Both extremes are
+/// decided *before* any scaling, by comparing the requested place with
+/// the value's own decimal exponent: a place below the last significant
+/// digit cannot change the value, and a place well above the leading one
+/// removes all of them. What is left in between is bounded —
+/// `|n·10^d| < 10^17` by construction — so the scaling never has to
+/// represent a quantity binary64 cannot hold.
+///
+/// **The modes disagree about half-way cases**, through `decimalView`
+/// and nowhere else.
+fn roundAt(rules: value.FpRules, n: f64, digits: f64, mode: RoundMode) value.ScalarValue {
+    assert(std.math.isFinite(n) and std.math.isFinite(digits));
+    // Zero has no significant digit to round at any place. Returning `n`
+    // rather than a literal 0 keeps a `-0` argument's sign, which is a
+    // value under `ieee_fp_rules_v1`.
+    if (n == 0) return value.ScalarValue.fromNumber(n);
+
+    // Excel truncates the digit count toward zero rather than rounding
+    // it: `ROUND(x, 2.9)` is `ROUND(x, 2)`.
+    const d = std.math.trunc(digits);
+    // The decimal exponent of the leading significant digit.
+    const e = @floor(@log10(@abs(n)));
+
+    // Below the last significant digit: binary64 carries at most 17 of
+    // them, so there is nothing left down there to round away.
+    if (d >= 17 - e) return value.ScalarValue.fromNumber(n);
+
+    // Two or more decades above the leading digit: `|n| ≤ 10^(e+1)` and
+    // the place is `10^(-d) ≥ 10^(e+2)`, so the scaled magnitude is at
+    // most 0.1 and all three modes answer without scaling anything.
+    if (d + e <= -2) {
+        return switch (mode) {
+            // `copysign` rather than a bare zero: `ROUNDDOWN(-1, -100)`
+            // is `-0` before publication — preserved by `.ieee`,
+            // normalized by `.excel`.
+            .half_away, .toward => value.ScalarValue.fromNumber(std.math.copysign(@as(f64, 0), n)),
+            // Away from zero at a place that large overflows, and N4a
+            // has an answer for that. Guarded rather than computed,
+            // because `10^(-d)` is the one power of ten here that a
+            // caller can push past the representable range.
+            .away => if (-d > 308)
+                value.ScalarValue.errorOf(.num)
+            else
+                value.ScalarValue.fromArithmetic(
+                    std.math.copysign(std.math.pow(f64, 10, -d), n),
+                ),
+        };
+    }
+
+    const scaled = decimalView(rules, scaleByPowerOfTen(n, d));
+    const placed = switch (mode) {
+        // Zig's `@round` is half-away-from-zero, which is Excel's rule.
+        .half_away => @round(scaled),
+        .away => std.math.copysign(@ceil(@abs(scaled)), scaled),
+        .toward => std.math.trunc(scaled),
+    };
+    return value.ScalarValue.fromArithmetic(scaleByPowerOfTen(placed, -d));
+}
+
+fn fnAbs(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    // `@abs(-0.0)` is `+0.0`, which is the answer in both modes: the
+    // absolute value of a signed zero has no sign left to preserve.
+    return arith(@abs(numArg(args, 0)));
+}
+
+fn fnSign(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const n = numArg(args, 0);
+    // `-0 == 0` is true, so a negative zero answers 0: SIGN reports the
+    // sign of a quantity, and the quantity is zero.
+    if (n > 0) return Value.num(1);
+    if (n < 0) return Value.num(-1);
+    return Value.num(0);
+}
+
+fn fnInt(ctx: CallCtx, args: []const Value) FnError!Value {
+    // Floor, not truncation: `INT(-2.5)` is `-3` where `TRUNC(-2.5)` is
+    // `-2`. The two functions existing separately is the reason to say
+    // which is which.
+    return arith(@floor(decimalView(ctx.rules(), numArg(args, 0))));
+}
+
+fn fnRound(ctx: CallCtx, args: []const Value) FnError!Value {
+    return .{ .scalar = roundAt(ctx.rules(), numArg(args, 0), numArg(args, 1), .half_away) };
+}
+
+fn fnRoundUp(ctx: CallCtx, args: []const Value) FnError!Value {
+    return .{ .scalar = roundAt(ctx.rules(), numArg(args, 0), numArg(args, 1), .away) };
+}
+
+fn fnRoundDown(ctx: CallCtx, args: []const Value) FnError!Value {
+    return .{ .scalar = roundAt(ctx.rules(), numArg(args, 0), numArg(args, 1), .toward) };
+}
+
+fn fnTrunc(ctx: CallCtx, args: []const Value) FnError!Value {
+    // The digit count is optional and 0 when omitted, which is the only
+    // thing separating `TRUNC(x)` from `ROUNDDOWN(x, 0)` — a fixture
+    // states that equivalence rather than leaving it to be inferred.
+    const digits = if (args.len >= 2) numArg(args, 1) else 0;
+    return .{ .scalar = roundAt(ctx.rules(), numArg(args, 0), digits, .toward) };
+}
+
+fn fnMod(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const n = numArg(args, 0);
+    const d = numArg(args, 1);
+    // Excel's answer for a zero divisor, and the reason this is not
+    // `@mod`: that builtin has no defined result here.
+    if (d == 0) return Value.err(.div0);
+    // §5.4's N4 names MOD's **sign** rule as a per-function quirk, and
+    // names only that: the result takes the DIVISOR's sign, so
+    // `MOD(-5,3)` is 1 and `MOD(5,-3)` is -1. That is floored modulus,
+    // written out rather than delegated so the overflow stays visible —
+    // an extreme ratio sends `d · floor(n/d)` to infinity, and N4a
+    // answers `#NUM!`. The quotient is deliberately NOT read through
+    // `decimalView`: N4 scopes MOD's quirk to the sign, and widening it
+    // here would be inventing an Excel behaviour no manifest recorded.
+    return arith(n - d * @floor(n / d));
+}
+
+fn fnPower(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    // POWER is the function spelling of `^` and runs the same
+    // arithmetic: `applyBinaryScalar`'s `.pow` arm is this same
+    // `std.math.pow` through this same `fromArithmetic`. A workbook must
+    // not get two answers for one operation, so the identity is a
+    // fixture rather than a comment.
+    return arith(std.math.pow(f64, numArg(args, 0), numArg(args, 1)));
+}
+
+fn fnExp(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    // `EXP(1000)` overflows, and `#NUM!` is reached through
+    // `fromArithmetic` rather than through a magnitude test — the
+    // boundary is the representation's, not a guessed one.
+    return arith(@exp(numArg(args, 0)));
+}
+
+fn fnLn(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const n = numArg(args, 0);
+    // The whole non-positive half is out of domain, zero included:
+    // `LN(0)` is `#NUM!` and not `-∞`, because N4a has no room for one.
+    if (n <= 0) return Value.err(.num);
+    return arith(@log(n));
+}
+
+fn fnLog10(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const n = numArg(args, 0);
+    if (n <= 0) return Value.err(.num);
+    return arith(@log10(n));
+}
+
+fn fnLog(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const n = numArg(args, 0);
+    if (n <= 0) return Value.err(.num);
+    // The base is optional and 10 when omitted, which makes `LOG(x)` and
+    // `LOG10(x)` one operation under two spellings.
+    const base = if (args.len >= 2) numArg(args, 1) else 10;
+    if (base <= 0) return Value.err(.num);
+    // Base 1 divides by `LN(1)`, and that failure is spelled `#DIV/0!`
+    // rather than `#NUM!` — the one place this family answers with
+    // something other than a domain error, which is why it is its own
+    // line and its own fixture.
+    if (base == 1) return Value.err(.div0);
+    // The two bases with an exact primitive get it: `LOG(8,2)` is 3 and
+    // `LOG(100,10)` is 2 exactly, where `@log(8)/@log(2)` is under no
+    // obligation to be.
+    if (base == 10) return arith(@log10(n));
+    if (base == 2) return arith(@log2(n));
+    return arith(@log(n) / @log(base));
+}
+
+fn fnPi(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    _ = args;
+    // The binary64 nearest π. Excel documents 15 digits and stores this
+    // same double, so there is nothing to round.
+    return Value.num(std.math.pi);
+}
+
+fn fnRandBetween(ctx: CallCtx, args: []const Value) FnError!Value {
+    const bottom = numArg(args, 0);
+    const top = numArg(args, 1);
+    // Non-integer bounds move INWARD — ceil the bottom, floor the top.
+    // The alternative reading, truncating both toward zero, lets
+    // `RANDBETWEEN(1.5, 3.5)` answer 1, a value outside the interval the
+    // caller wrote. No committed manifest decides this, so the fixture
+    // ships `spec_pinned` and pins the invariant a reader can check
+    // instead: every result lies within `[bottom, top]`.
+    const lo = @ceil(bottom);
+    const hi = @floor(top);
+    // Excel's answer for an empty range, including a range that is only
+    // empty after the bounds moved in.
+    if (lo > hi) return Value.err(.num);
+
+    // ONE draw, always. A rejection sampler would be exactly uniform and
+    // would draw a data-dependent number of times — which would make the
+    // draw counter, the instrument every §5.6d KAT is built on, unable
+    // to state anything. Scaling a single draw is off perfect uniformity
+    // by at most one part in 2^53.
+    const span = hi - lo + 1;
+    if (!std.math.isFinite(span)) return Value.err(.num);
+    const u = ctx.draw();
+    assert(u >= 0 and u < 1);
+    // `@min` covers the one case scaling cannot: a draw just under 1
+    // against a span large enough for the product to round up to it.
+    return arith(@min(hi, lo + @floor(u * span)));
 }
 
 fn fnNot(ctx: CallCtx, args: []const Value) FnError!Value {
@@ -1282,6 +1729,181 @@ test "M4c: the lazy forms are exactly the three §5.3a defers" {
     }
 }
 
+// ─── M4d: the F1a-2 batch, against the frozen inventory ──────────
+
+const m4d_milestone = "M4d";
+const m4d_batch = "F1a-2";
+
+fn isM4d(e: InventoryEntry) bool {
+    return std.mem.eql(u8, e.milestone, m4d_milestone) and
+        std.mem.eql(u8, e.batch, m4d_batch);
+}
+
+test "M4d: the batch's size is regenerated from the inventory, never from prose" {
+    // The ladder row says "~17". This test does not say 17: it counts
+    // the file. `inventory: per-milestone counts reproduce the ladder`
+    // holds the ladder's own number to the same file, so an eighteenth
+    // F1a-2 row fails there and is held to the registry here.
+    var it = inventory();
+    var counted: usize = 0;
+    while (it.next()) |e| {
+        if (isM4d(e)) counted += 1;
+    }
+    try testing.expect(counted > 0);
+
+    // Direction one — no omissions: every `M4d`/`F1a-2` row resolves,
+    // under the file's own spelling and not merely case-insensitively.
+    var it2 = inventory();
+    var resolved: usize = 0;
+    while (it2.next()) |e| {
+        if (!isM4d(e)) continue;
+        const f = lookup(e.name) orelse {
+            std.debug.print("F1a-2 name not registered: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        };
+        try testing.expectEqualStrings(e.name, f.name);
+        resolved += 1;
+    }
+    try testing.expectEqual(counted, resolved);
+
+    // Direction two — no substitutions: a registered function whose
+    // inventory row says `M4d` must be one the file lists under this
+    // batch. A name this row invented would be registered and tagged to
+    // some other milestone, and neither half above would have noticed.
+    var registered: usize = 0;
+    for (&functions) |*f| {
+        var it3 = inventory();
+        while (it3.next()) |e| {
+            if (!std.mem.eql(u8, e.name, f.name)) continue;
+            if (std.mem.eql(u8, e.milestone, m4d_milestone)) {
+                if (!isM4d(e)) {
+                    std.debug.print("{s}: tagged {s} but batch {s}\n", .{ f.name, e.milestone, e.batch });
+                    return error.BatchTagMismatch;
+                }
+                registered += 1;
+            }
+            break;
+        }
+    }
+    try testing.expectEqual(counted, registered);
+}
+
+test "M4d: every F1a-2 row declares all five fields, and none of them by default" {
+    var it = inventory();
+    var seen: usize = 0;
+    var volatiles: usize = 0;
+    while (it.next()) |e| {
+        if (!isM4d(e)) continue;
+        const f = lookup(e.name).?;
+        seen += 1;
+
+        try testing.expect(f.name.len > 0);
+        try testing.expectEqualStrings(e.name, f.name);
+
+        // Arity: a real range, bounded — nothing in F1a-2 is variadic,
+        // so every row states a maximum and none carries a repeating
+        // slot.
+        try testing.expect(f.arity.max != null);
+        try testing.expect(f.arity.min <= f.arity.max.?);
+        try testing.expectEqual(@as(usize, 0), f.arity.rest.len);
+        try testing.expectEqual(@as(usize, 0), f.coercion.rest.len);
+        // Coercion: the two per-slot tables address the same slots, and
+        // every declared slot of this batch is the numeric class. A
+        // `.value_any` here would silently skip the coercion the
+        // implementations rely on.
+        try testing.expectEqual(f.arity.fixed.len, f.coercion.fixed.len);
+        for (f.arity.fixed) |l| try testing.expectEqual(Laziness.eager, l);
+        for (f.coercion.fixed) |c| try testing.expectEqual(CoercionClass.number, c);
+        // Volatility: counted rather than assumed to be `.stable`,
+        // because `.stable` is also what a forgotten field would look
+        // like if the field had a default — which is why it has none.
+        if (f.volatility == .volatile_fn) volatiles += 1;
+        // Propagation: F1a-2 uses exactly one of §5.3c's four classes.
+        // Nothing in it observes an error; a numeric function handed one
+        // becomes it.
+        try testing.expectEqual(value.PropagationClass.propagate, f.propagation);
+        // Every row is eager and plain: no member of this batch defers
+        // an argument, so none may carry a form.
+        try testing.expectEqual(Form.plain, f.form);
+        try testing.expect(f.impl != null);
+    }
+    try testing.expect(seen > 0);
+    try testing.expectEqual(@as(usize, 2), volatiles);
+}
+
+test "M4d: SQRT and RAND carry the same five fields as the fifteen the row writes" {
+    // They were registered at M3a2 as framework subjects rather than
+    // written for this batch, so the row proves they are ordinary
+    // entries instead of assuming it — the same treatment M4c gave TRUE
+    // and FALSE, and for the same reason: an early row is the one most
+    // likely to have been waved through.
+    const sqrt = lookup("SQRT").?;
+    try testing.expectEqualStrings("SQRT", sqrt.name);
+    try testing.expectEqual(@as(u8, 1), sqrt.arity.min);
+    try testing.expectEqual(@as(?u8, 1), sqrt.arity.max);
+    try testing.expectEqual(@as(usize, 1), sqrt.coercion.fixed.len);
+    try testing.expectEqual(CoercionClass.number, sqrt.coercion.at(0));
+    try testing.expectEqual(Volatility.stable, sqrt.volatility);
+    try testing.expectEqual(value.PropagationClass.propagate, sqrt.propagation);
+    try testing.expect(sqrt.liftable());
+
+    const rand = lookup("RAND").?;
+    try testing.expectEqualStrings("RAND", rand.name);
+    try testing.expectEqual(@as(u8, 0), rand.arity.min);
+    try testing.expectEqual(@as(?u8, 0), rand.arity.max);
+    try testing.expectEqual(@as(usize, 0), rand.coercion.fixed.len);
+    try testing.expectEqual(Volatility.volatile_fn, rand.volatility);
+    try testing.expectEqual(value.PropagationClass.propagate, rand.propagation);
+    // No slot is nothing to lift, which is also true of PI.
+    try testing.expect(!rand.liftable());
+    try testing.expect(!lookup("PI").?.liftable());
+
+    // Both are in the frozen file under this row, which is what makes
+    // "pinned here" a statement about the inventory rather than a claim.
+    var it = inventory();
+    var found: usize = 0;
+    while (it.next()) |e| {
+        if (!isM4d(e)) continue;
+        if (std.mem.eql(u8, e.name, "SQRT") or std.mem.eql(u8, e.name, "RAND")) found += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), found);
+}
+
+test "M4d: the multi-argument names are derived from arity, not listed" {
+    // §5.3c's error-order gate applies to every name taking more than
+    // one argument, and `eval.zig` derives that set from the registry.
+    // Here is the same set stated by hand — the two must agree, or one
+    // of them is describing a table that no longer exists.
+    const expected = [_][]const u8{
+        "LOG",   "MOD",       "POWER",   "RANDBETWEEN",
+        "ROUND", "ROUNDDOWN", "ROUNDUP", "TRUNC",
+    };
+    var it = inventory();
+    var multi: usize = 0;
+    while (it.next()) |e| {
+        if (!isM4d(e)) continue;
+        const f = lookup(e.name).?;
+        if (f.arity.max.? <= 1) continue;
+        multi += 1;
+        var named = false;
+        for (expected) |n| {
+            if (std.mem.eql(u8, n, e.name)) named = true;
+        }
+        if (!named) {
+            std.debug.print("multi-argument F1a-2 name not in the list: {s}\n", .{e.name});
+            return error.UnlistedMultiArgFunction;
+        }
+    }
+    try testing.expectEqual(expected.len, multi);
+
+    // The two optional-argument rows, which are the only ones whose
+    // minimum and maximum differ.
+    try testing.expectEqual(@as(u8, 1), lookup("TRUNC").?.arity.min);
+    try testing.expectEqual(@as(?u8, 2), lookup("TRUNC").?.arity.max);
+    try testing.expectEqual(@as(u8, 1), lookup("LOG").?.arity.min);
+    try testing.expectEqual(@as(?u8, 2), lookup("LOG").?.arity.max);
+}
+
 test "registry: the five required fields have no defaults" {
     // "Declares" is enforced by the type, not by review: a field with a
     // default can be omitted, and an omitted propagation class is how
@@ -1349,13 +1971,29 @@ test "registry: lookup is case-insensitive and rejects unknown names" {
     try testing.expect(lookup("NOTAFUNCTION") == null);
 }
 
-test "registry: the volatile set is exactly what the fixtures rely on" {
+test "registry: RAND and RANDBETWEEN are the only volatile rows" {
+    // Both directions, because either alone passes for the wrong reason:
+    // naming the two proves they are volatile, counting proves nothing
+    // else quietly became so. Every volatile row is a cell the M5a2
+    // schedule has to re-key, so the set is not a detail.
+    const expected = [_][]const u8{ "RAND", "RANDBETWEEN" };
+    for (expected) |name| {
+        try testing.expectEqual(Volatility.volatile_fn, lookup(name).?.volatility);
+    }
     var volatiles: usize = 0;
     for (&functions) |*f| {
-        if (f.volatility == .volatile_fn) volatiles += 1;
+        if (f.volatility != .volatile_fn) continue;
+        volatiles += 1;
+        var named = false;
+        for (expected) |n| {
+            if (std.mem.eql(u8, n, f.name)) named = true;
+        }
+        if (!named) {
+            std.debug.print("unexpected volatile row: {s}\n", .{f.name});
+            return error.UnexpectedVolatileFunction;
+        }
     }
-    try testing.expectEqual(@as(usize, 1), volatiles);
-    try testing.expectEqual(Volatility.volatile_fn, lookup("RAND").?.volatility);
+    try testing.expectEqual(expected.len, volatiles);
 }
 
 test "registry: liftability follows the coercion classes" {
