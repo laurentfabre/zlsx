@@ -2912,6 +2912,1044 @@ test "fuzz: no F1a-1 argument shape panics, leaks, or evaluates two ways" {
     });
 }
 
+// ─── M4d: the F1a-2 batch (§7, seventeen numeric names) ──────────
+//
+// Oracle-first, and the oracle decides one cell of it: `SQRT(-1)`,
+// which both excel-fidelity manifests record and which they record
+// DIFFERENTLY. Everything else in seventeen functions rests on the spec,
+// so every row says which it is and the label is checked against the
+// files rather than trusted — the discipline M4c shipped, with one
+// addition this batch forced. F1a-1 held no volatile, so "does a
+// manifest contain this formula?" was a two-valued question there. The
+// LibreOffice suite records a `RAND()` cell and marks it
+// `"excluded": "volatile_formula"`; a cell that is recorded and
+// excluded decides nothing, and reading it as evidence would let this
+// row claim oracle backing for a value no oracle ever wrote down. So
+// M4d asks a three-valued question instead.
+
+/// One F1a-2 fixture. `func` is the inventory name the row is a fixture
+/// FOR — the coverage test derives the batch from the frozen TSV and
+/// fails if any of the seventeen has no row here.
+const F1a2Case = struct {
+    func: []const u8,
+    formula: []const u8,
+    expect: Expect,
+    evidence: Evidence = .spec_pinned,
+    /// Why the spec says so, where the answer is one a reasonable
+    /// reading could get wrong.
+    note: []const u8 = "",
+};
+
+/// The environment every F1a-2 fixture reads. The A-column repeats
+/// M4c's provenance rows so the two batches can be compared cell for
+/// cell; the B column carries the three values that make the fidelity
+/// modes disagree, and they are **stored** rather than written as
+/// literals on purpose — N1a would round a 17-digit literal to 15 at
+/// ingress under `.excel`, and then the divergence under test would be
+/// the parser's rather than the function's.
+fn putF1a2Cells(h: *Harness) !void {
+    try h.put("A1", num(10)); // number
+    try h.put("A2", .{ .text = "abc" }); // non-numeric text
+    try h.put("A4", .{ .boolean = true }); // logical
+    try h.put("A5", value.ScalarValue.errorOf(.div0)); // an error that is not #N/A
+    try h.put("A6", value.ScalarValue.errorOf(.na)); // #N/A itself
+    // A7 is a true blank — deliberately not stored.
+    try h.put("A8", .{ .text = "7" }); // numeric text
+    // One ULP below 2.5 and below 3: the 15-digit decimal view rounds
+    // each up to the boundary, raw binary64 does not.
+    try h.put("B1", num(2.4999999999999996));
+    try h.put("B2", num(2.9999999999999996));
+    // Negative and small: every truncating mode sends it to `-0`.
+    try h.put("B3", num(-0.4));
+}
+
+const f1a2_cases = [_]F1a2Case{
+    // ── ABS / SIGN / INT: the shape-preserving trio ──
+    .{ .func = "ABS", .formula = "ABS(-3)", .expect = .{ .number = 3 } },
+    .{ .func = "ABS", .formula = "ABS(A1)", .expect = .{ .number = 10 } },
+    .{ .func = "ABS", .formula = "ABS(A5)", .expect = .{ .err = .div0 }, .note = "numeric functions propagate; none of this batch observes" },
+    .{ .func = "ABS", .formula = "ABS(A8)", .expect = .{ .number = 7 }, .note = "the `.number` class coerces numeric text, unlike N" },
+    .{ .func = "ABS", .formula = "ABS(A2)", .expect = .{ .err = .value }, .note = "non-numeric text is #VALUE! at the coercion, not in the impl" },
+    .{ .func = "ABS", .formula = "ABS(A7)", .expect = .{ .number = 0 }, .note = "a blank coerces to 0" },
+    .{ .func = "SIGN", .formula = "SIGN(-4)", .expect = .{ .number = -1 } },
+    .{ .func = "SIGN", .formula = "SIGN(0)", .expect = .{ .number = 0 } },
+    .{ .func = "SIGN", .formula = "SIGN(A1)", .expect = .{ .number = 1 } },
+    .{ .func = "SIGN", .formula = "SIGN(A4)", .expect = .{ .number = 1 }, .note = "TRUE coerces to 1" },
+    .{ .func = "INT", .formula = "INT(2.9)", .expect = .{ .number = 2 } },
+    .{ .func = "INT", .formula = "INT(-2.5)", .expect = .{ .number = -3 }, .note = "INT floors; TRUNC truncates. The pair below is the same argument" },
+    .{ .func = "INT", .formula = "INT(A1)", .expect = .{ .number = 10 } },
+
+    // ── the rounding family ──
+    .{ .func = "TRUNC", .formula = "TRUNC(-2.5)", .expect = .{ .number = -2 }, .note = "toward zero, where INT(-2.5) is -3" },
+    .{ .func = "TRUNC", .formula = "TRUNC(2.9)", .expect = .{ .number = 2 } },
+    .{ .func = "TRUNC", .formula = "TRUNC(3.14159,2)", .expect = .{ .number = 3.14 } },
+    .{ .func = "TRUNC", .formula = "TRUNC(-3.14159,2)", .expect = .{ .number = -3.14 } },
+    .{ .func = "TRUNC", .formula = "TRUNC(1234.5,-2)", .expect = .{ .number = 1200 }, .note = "a negative digit count rounds to the left of the point" },
+    .{ .func = "ROUND", .formula = "ROUND(2.5,0)", .expect = .{ .number = 3 }, .note = "half AWAY from zero — not the banker's rounding IEEE defaults to" },
+    .{ .func = "ROUND", .formula = "ROUND(-2.5,0)", .expect = .{ .number = -3 } },
+    .{ .func = "ROUND", .formula = "ROUND(2.4,0)", .expect = .{ .number = 2 } },
+    .{ .func = "ROUND", .formula = "ROUND(3.14159,2)", .expect = .{ .number = 3.14 } },
+    .{ .func = "ROUND", .formula = "ROUND(1234.5,-2)", .expect = .{ .number = 1200 } },
+    .{ .func = "ROUND", .formula = "ROUND(1250,-2)", .expect = .{ .number = 1300 } },
+    .{ .func = "ROUND", .formula = "ROUND(A1,2.9)", .expect = .{ .number = 10 }, .note = "the digit count truncates toward zero: 2.9 digits is 2" },
+    .{ .func = "ROUNDUP", .formula = "ROUNDUP(2.1,0)", .expect = .{ .number = 3 } },
+    .{ .func = "ROUNDUP", .formula = "ROUNDUP(-2.1,0)", .expect = .{ .number = -3 }, .note = "away from zero in BOTH directions — not ceiling" },
+    .{ .func = "ROUNDUP", .formula = "ROUNDUP(3.14159,2)", .expect = .{ .number = 3.15 } },
+    .{ .func = "ROUNDUP", .formula = "ROUNDUP(0,0)", .expect = .{ .number = 0 }, .note = "zero has no significant digit to round away from" },
+    .{ .func = "ROUNDDOWN", .formula = "ROUNDDOWN(2.9,0)", .expect = .{ .number = 2 } },
+    .{ .func = "ROUNDDOWN", .formula = "ROUNDDOWN(-2.9,0)", .expect = .{ .number = -2 }, .note = "toward zero in both directions — not floor" },
+    .{ .func = "ROUNDDOWN", .formula = "ROUNDDOWN(3.14159,2)", .expect = .{ .number = 3.14 } },
+    // The place value pushed past everything the value holds, from both
+    // ends. These are the two branches `roundAt` takes before it scales.
+    .{ .func = "ROUND", .formula = "ROUND(A1,400)", .expect = .{ .number = 10 }, .note = "a place below the last significant digit cannot change the value" },
+    .{ .func = "ROUND", .formula = "ROUND(A1,-400)", .expect = .{ .number = 0 }, .note = "a place far above the leading digit removes every one of them" },
+    .{ .func = "ROUNDUP", .formula = "ROUNDUP(A1,-400)", .expect = .{ .err = .num }, .note = "…and rounding AWAY from zero at that place overflows (N4a)" },
+    .{ .func = "ROUNDDOWN", .formula = "ROUNDDOWN(A1,-400)", .expect = .{ .number = 0 } },
+
+    // ── MOD: §5.4's N4 names its sign rule specifically ──
+    .{ .func = "MOD", .formula = "MOD(5,3)", .expect = .{ .number = 2 } },
+    .{ .func = "MOD", .formula = "MOD(-5,3)", .expect = .{ .number = 1 }, .note = "the result takes the DIVISOR's sign, so this is 1 and not -2" },
+    .{ .func = "MOD", .formula = "MOD(5,-3)", .expect = .{ .number = -1 } },
+    .{ .func = "MOD", .formula = "MOD(-5,-3)", .expect = .{ .number = -2 } },
+    .{ .func = "MOD", .formula = "MOD(6,3)", .expect = .{ .number = 0 } },
+    .{ .func = "MOD", .formula = "MOD(5,0)", .expect = .{ .err = .div0 }, .note = "a zero divisor, spelled the way division spells it" },
+
+    // ── POWER: the function spelling of `^` ──
+    .{ .func = "POWER", .formula = "POWER(2,10)", .expect = .{ .number = 1024 } },
+    .{ .func = "POWER", .formula = "POWER(-2,3)", .expect = .{ .number = -8 } },
+    .{ .func = "POWER", .formula = "POWER(2,0.5)", .expect = .{ .number = 1.4142135623730951 } },
+    .{ .func = "POWER", .formula = "POWER(-8,1/3)", .expect = .{ .err = .num }, .note = "a negative base with a fractional exponent has no real root" },
+    .{ .func = "POWER", .formula = "POWER(2,1024)", .expect = .{ .err = .num }, .note = "overflow is #NUM! in both modes (N4a)" },
+
+    // ── SQRT: the row's one oracle-decided cell ──
+    .{
+        .func = "SQRT",
+        .formula = "SQRT(-1)",
+        .expect = .{ .err = .num },
+        .evidence = .oracle,
+        .note = "the hand-spec excel manifest records #NUM!; LibreOffice records #VALUE!, and that disagreement is a NAMED adapter divergence",
+    },
+    .{ .func = "SQRT", .formula = "SQRT(9)", .expect = .{ .number = 3 } },
+    .{ .func = "SQRT", .formula = "SQRT(0)", .expect = .{ .number = 0 } },
+    .{ .func = "SQRT", .formula = "SQRT(2)", .expect = .{ .number = 1.4142135623730951 } },
+
+    // ── the exponential/logarithm family ──
+    .{ .func = "EXP", .formula = "EXP(0)", .expect = .{ .number = 1 } },
+    .{ .func = "EXP", .formula = "EXP(1)", .expect = .{ .number = 2.718281828459045 } },
+    .{ .func = "EXP", .formula = "EXP(1000)", .expect = .{ .err = .num }, .note = "overflow, reached through fromArithmetic rather than a magnitude test" },
+    .{ .func = "EXP", .formula = "EXP(-1000)", .expect = .{ .number = 0 }, .note = "underflow is a representable 0, and therefore a value" },
+    .{ .func = "LN", .formula = "LN(1)", .expect = .{ .number = 0 } },
+    .{ .func = "LN", .formula = "LN(A1)", .expect = .{ .number = 2.302585092994046 } },
+    .{ .func = "LN", .formula = "LN(0)", .expect = .{ .err = .num }, .note = "LN(0) is #NUM!, not -infinity: N4a has no room for one" },
+    .{ .func = "LN", .formula = "LN(-1)", .expect = .{ .err = .num } },
+    .{ .func = "LOG10", .formula = "LOG10(1000)", .expect = .{ .number = 3 } },
+    .{ .func = "LOG10", .formula = "LOG10(1)", .expect = .{ .number = 0 } },
+    .{ .func = "LOG10", .formula = "LOG10(0)", .expect = .{ .err = .num } },
+    .{ .func = "LOG", .formula = "LOG(100)", .expect = .{ .number = 2 }, .note = "the base defaults to 10, which makes LOG(x) and LOG10(x) one operation" },
+    .{ .func = "LOG", .formula = "LOG(100,10)", .expect = .{ .number = 2 } },
+    .{ .func = "LOG", .formula = "LOG(8,2)", .expect = .{ .number = 3 } },
+    .{ .func = "LOG", .formula = "LOG(0)", .expect = .{ .err = .num } },
+    .{ .func = "LOG", .formula = "LOG(10,-2)", .expect = .{ .err = .num }, .note = "a non-positive base is a domain error" },
+    .{ .func = "LOG", .formula = "LOG(10,1)", .expect = .{ .err = .div0 }, .note = "base 1 divides by LN(1) — the family's one non-#NUM! failure" },
+
+    // ── PI: the batch's only constant ──
+    .{ .func = "PI", .formula = "PI()", .expect = .{ .number = 3.141592653589793 } },
+    .{ .func = "PI", .formula = "PI()*2", .expect = .{ .number = 6.283185307179586 } },
+
+    // ── the two volatiles, under the harness's fixed draw of 0.5 ──
+    .{
+        .func = "RAND",
+        .formula = "RAND()",
+        .expect = .{ .number = 0.5 },
+        .note = "the LibreOffice suite RECORDS this formula and excludes it as volatile; an excluded cell is not evidence",
+    },
+    .{ .func = "RANDBETWEEN", .formula = "RANDBETWEEN(1,1)", .expect = .{ .number = 1 }, .note = "a range of one is deterministic whatever the draw returns" },
+    .{ .func = "RANDBETWEEN", .formula = "RANDBETWEEN(0,10)", .expect = .{ .number = 5 } },
+    .{ .func = "RANDBETWEEN", .formula = "RANDBETWEEN(-3,-3)", .expect = .{ .number = -3 } },
+    .{ .func = "RANDBETWEEN", .formula = "RANDBETWEEN(5,1)", .expect = .{ .err = .num }, .note = "an empty range is #NUM!" },
+    .{ .func = "RANDBETWEEN", .formula = "RANDBETWEEN(1.5,3.5)", .expect = .{ .number = 3 }, .note = "non-integer bounds move INWARD, so every result is inside [bottom, top]" },
+    .{ .func = "RANDBETWEEN", .formula = "RANDBETWEEN(1.2,1.8)", .expect = .{ .err = .num }, .note = "…and a range holding no integer is empty after they move" },
+};
+
+test "M4d: every F1a-2 fixture evaluates to what the oracle or the spec says" {
+    for (f1a2_cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF1a2Cells(&h);
+
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("F1a-2 `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectValue(c.expect, v) catch |e| {
+            std.debug.print("F1a-2 `{s}` ({s}): wrong value\n", .{ c.formula, c.func });
+            return e;
+        };
+    }
+}
+
+test "M4d: all seventeen frozen names resolve, and each has a fixture" {
+    // The batch is read from `function_inventory_v1.tsv`, never written
+    // down here: §7 makes the file the count source, so an eighteenth
+    // row fails this test rather than shipping unfixtured.
+    var it = registry.inventory();
+    var batch: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4d")) continue;
+        batch += 1;
+
+        if (registry.lookup(e.name) == null) {
+            std.debug.print("F1a-2 name does not resolve: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        }
+        var fixtures: usize = 0;
+        for (f1a2_cases) |c| {
+            if (std.mem.eql(u8, c.func, e.name)) fixtures += 1;
+        }
+        if (fixtures == 0) {
+            std.debug.print("F1a-2 name has no fixture: {s}\n", .{e.name});
+            return error.UnfixturedBatchFunction;
+        }
+    }
+    try testing.expectEqual(@as(usize, 17), batch);
+
+    // …and no fixture names something outside the batch, which would
+    // make the coverage count above pass for the wrong reason.
+    for (f1a2_cases) |c| {
+        var found = false;
+        var it2 = registry.inventory();
+        while (it2.next()) |e| {
+            if (std.mem.eql(u8, e.name, c.func) and std.mem.eql(u8, e.milestone, "M4d")) found = true;
+        }
+        if (!found) {
+            std.debug.print("fixture names a function outside F1a-2: {s}\n", .{c.func});
+            return error.FixtureOutsideBatch;
+        }
+    }
+}
+
+/// What the committed manifests say about a formula. **Three** answers,
+/// where M4c needed two: a cell can be recorded and still decide
+/// nothing, which is exactly what `"excluded": "volatile_formula"`
+/// means. F1a-1 held no volatile so the distinction never arose; F1a-2
+/// registers `RAND` and `RANDBETWEEN`, and the LibreOffice suite records
+/// a `RAND()` cell it deliberately excludes.
+const ManifestVerdict = enum { silent, decided, excluded };
+
+fn manifestVerdict(formula: []const u8) !ManifestVerdict {
+    var verdict: ManifestVerdict = .silent;
+    for ([_][]const u8{ oracle_excel, oracle_ieee, oracle_libreoffice }) |json| {
+        const doc = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+        defer doc.deinit();
+        for (doc.value.object.get("cells").?.array.items) |cell| {
+            const f = cell.object.get("formula") orelse continue;
+            if (!std.mem.eql(u8, f.string, formula)) continue;
+            // A recorded value outranks an excluded one: if any manifest
+            // decides the formula, it is decided.
+            if (cell.object.get("excluded") == null) return .decided;
+            verdict = .excluded;
+        }
+    }
+    return verdict;
+}
+
+test "M4d: the evidence label on every fixture is true of the committed manifests" {
+    var oracle_rows: usize = 0;
+    var excluded_rows: usize = 0;
+    for (f1a2_cases) |c| {
+        switch (try manifestVerdict(c.formula)) {
+            .decided => {
+                if (c.evidence != .oracle) {
+                    std.debug.print("`{s}` is decided by a manifest but ships spec-pinned\n", .{c.formula});
+                    return error.UnderstatedEvidence;
+                }
+                oracle_rows += 1;
+            },
+            .excluded => {
+                // Recorded, and recorded as undecidable. Reading this as
+                // evidence is the specific mistake this arm exists to
+                // make impossible.
+                if (c.evidence != .spec_pinned) {
+                    std.debug.print("`{s}` claims evidence from an EXCLUDED manifest cell\n", .{c.formula});
+                    return error.ExcludedCellClaimedAsEvidence;
+                }
+                excluded_rows += 1;
+            },
+            .silent => {
+                if (c.evidence != .spec_pinned) {
+                    std.debug.print("`{s}` claims oracle evidence no manifest holds\n", .{c.formula});
+                    return error.UnbackedOracleClaim;
+                }
+            },
+        }
+    }
+    // Stated as numbers so the balance cannot drift silently. One
+    // oracle-decided cell in seventeen functions — `SQRT(-1)` — and one
+    // recorded-but-excluded cell, `RAND()`. When the parked Excel leg
+    // runs (§8.2) and the suite grows F1a-2 rows, these counts move and
+    // the row that moves them is the row that re-labels.
+    try testing.expectEqual(@as(usize, 1), oracle_rows);
+    try testing.expectEqual(@as(usize, 1), excluded_rows);
+}
+
+/// The error a manifest recorded for a formula, or null if it recorded
+/// no such cell (or recorded a non-error there).
+fn recordedErrorFor(json: []const u8, formula: []const u8) !?value.KnownError {
+    const doc = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer doc.deinit();
+    for (doc.value.object.get("cells").?.array.items) |cell| {
+        const f = cell.object.get("formula") orelse continue;
+        if (!std.mem.eql(u8, f.string, formula)) continue;
+        const spelling = cell.object.get("error_spelling") orelse continue;
+        return value.KnownError.fromSpelling(spelling.string);
+    }
+    return null;
+}
+
+test "M4d: SQRT(-1) is real evidence, and the two excel manifests still disagree" {
+    // The batch's one oracle cell is also a named adapter divergence,
+    // and those two facts are not in tension — they are the same fact.
+    // Both files claim `"fidelity": "excel"`; they record different
+    // errors for the same formula; so at most one of them is Excel, and
+    // the row that averaged them would produce an answer neither adapter
+    // gave. This test asserts the DISAGREEMENT, not merely the skip.
+    const hand = try recordedErrorFor(oracle_excel, "SQRT(-1)");
+    const lo = try recordedErrorFor(oracle_libreoffice, "SQRT(-1)");
+    try testing.expectEqual(value.KnownError.num, hand.?);
+    try testing.expectEqual(value.KnownError.value, lo.?);
+    try testing.expect(hand.? != lo.?);
+    // The ieee manifest is silent, so there is no third answer.
+    try testing.expect((try recordedErrorFor(oracle_ieee, "SQRT(-1)")) == null);
+
+    // The row is named in the divergence list rather than skipped
+    // anonymously — `-0` and this one, and the tie test asserts the
+    // skip count is exactly two.
+    var listed = false;
+    for (excel_adapter_divergences) |f| {
+        if (std.mem.eql(u8, f, "SQRT(-1)")) listed = true;
+    }
+    try testing.expect(listed);
+
+    // zlsx answers the hand-spec's `#NUM!` — Excel's answer — and does
+    // so in both modes, because a radicand's domain is not a
+    // floating-point-rules question.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    for ([_]value.Fidelity{ .excel, .ieee }) |mode| {
+        var opts = h.options();
+        opts.fidelity = mode;
+        const v = try h.evalOpts("SQRT(-1)", opts);
+        try testing.expectEqual(value.KnownError.num, v.scalar.err.known);
+    }
+}
+
+/// One row where `excel_fp_rules_v1` and `ieee_fp_rules_v1` answer
+/// differently. Compared as **published** values, bit for bit: N3's
+/// signed-zero policy applies at publication, so a comparison anywhere
+/// else would miss half of these.
+const F1a2FidelityCase = struct {
+    formula: []const u8,
+    excel: f64,
+    ieee: f64,
+    why: []const u8,
+};
+
+const f1a2_fidelity_cases = [_]F1a2FidelityCase{
+    // N1a's 15 significant digits are not only an ingress rule: under
+    // `excel_fp_rules_v1` they are what the value IS, so a rounding
+    // decision is taken on the decimal a user sees. B1 is one ULP below
+    // 2.5 and B2 one ULP below 3.
+    .{ .formula = "ROUND(B1,0)", .excel = 3, .ieee = 2, .why = "the 15-digit view of B1 is exactly 2.5, and 2.5 rounds away from zero" },
+    .{ .formula = "INT(B2)", .excel = 3, .ieee = 2, .why = "the same view, floored" },
+    .{ .formula = "TRUNC(B2)", .excel = 3, .ieee = 2, .why = "…and truncated" },
+    .{ .formula = "ROUNDDOWN(B2,0)", .excel = 3, .ieee = 2, .why = "TRUNC(x) and ROUNDDOWN(x,0) agree in both modes" },
+    // N3: a truncating mode produces `-0`, which `.excel` normalizes at
+    // publication and `.ieee` preserves bitwise.
+    .{ .formula = "ROUNDDOWN(B3,0)", .excel = 0, .ieee = -0.0, .why = "rounding -0.4 toward zero yields -0" },
+    .{ .formula = "TRUNC(B3)", .excel = 0, .ieee = -0.0, .why = "the same value by the other spelling" },
+    .{ .formula = "ROUND(B3,0)", .excel = 0, .ieee = -0.0, .why = "half-away-from-zero also leaves the sign behind" },
+    .{ .formula = "ROUNDDOWN(-1,-400)", .excel = 0, .ieee = -0.0, .why = "the collapse branch keeps the sign too, which is where a bare `0` would have lost it" },
+};
+
+test "M4d: both fidelity modes are fixtured wherever the two rule tables disagree" {
+    for (f1a2_fidelity_cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF1a2Cells(&h);
+
+        inline for ([_]value.Fidelity{ .excel, .ieee }) |mode| {
+            var opts = h.options();
+            opts.fidelity = mode;
+            const v = h.evalOpts(c.formula, opts) catch |e| {
+                std.debug.print("fidelity case `{s}` refused: {t}\n", .{ c.formula, e });
+                return e;
+            };
+            try testing.expect(v == .scalar);
+            const got = value.publish(v.scalar, mode);
+            const want = if (mode == .excel) c.excel else c.ieee;
+            try testing.expect(got == .number);
+            if (@as(u64, @bitCast(got.number)) != @as(u64, @bitCast(want))) {
+                std.debug.print(
+                    "`{s}` under {s}: expected {d} (0x{X:0>16}), got {d} (0x{X:0>16}) — {s}\n",
+                    .{
+                        c.formula,
+                        @tagName(mode),
+                        want,
+                        @as(u64, @bitCast(want)),
+                        got.number,
+                        @as(u64, @bitCast(got.number)),
+                        c.why,
+                    },
+                );
+                return error.FidelityMismatch;
+            }
+        }
+
+        // A table of "divergences" that agreed everywhere would pass a
+        // per-mode check and prove nothing, so every row must actually
+        // differ — the same both-directions gate M3a1's Divergence ×2
+        // applies to the rule tables themselves.
+        if (@as(u64, @bitCast(c.excel)) == @as(u64, @bitCast(c.ieee))) {
+            std.debug.print("`{s}` is listed as a divergence but does not diverge\n", .{c.formula});
+            return error.NonDivergentFidelityCase;
+        }
+    }
+}
+
+test "M4d: the batch agrees across modes everywhere it is not listed as diverging" {
+    // The other half of the gate. Most of F1a-2 is mode-independent, and
+    // saying so is what makes the short list above meaningful: if the
+    // modes differed everywhere, the divergence table would be a
+    // sampling rather than an enumeration.
+    for (f1a2_cases) |c| {
+        var listed = false;
+        for (f1a2_fidelity_cases) |d| {
+            if (std.mem.eql(u8, d.formula, c.formula)) listed = true;
+        }
+        if (listed) continue;
+
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF1a2Cells(&h);
+
+        var excel_opts = h.options();
+        excel_opts.fidelity = .excel;
+        const a = value.publish((try h.evalOpts(c.formula, excel_opts)).scalar, .excel);
+        var ieee_opts = h.options();
+        ieee_opts.fidelity = .ieee;
+        const b = value.publish((try h.evalOpts(c.formula, ieee_opts)).scalar, .ieee);
+        if (!value.PublishedScalar.eql(a, b)) {
+            std.debug.print("`{s}` diverges between modes but is not listed\n", .{c.formula});
+            return error.UnlistedFidelityDivergence;
+        }
+    }
+}
+
+test "M4d: POWER is the function spelling of `^`, and answers identically" {
+    // A workbook must not get two answers for one operation. Stated over
+    // the cases most likely to separate them — a negative base, a
+    // fractional exponent, an overflow, and `0^0`, which Excel and
+    // LibreOffice do not agree about and no committed manifest records.
+    // Whatever the operator answers there, POWER answers; changing it is
+    // an operator-level decision, and M4d has no evidence to make one.
+    const pairs = [_][2][]const u8{
+        .{ "POWER(2,10)", "2^10" },
+        .{ "POWER(-2,3)", "(-2)^3" },
+        .{ "POWER(2,0.5)", "2^0.5" },
+        .{ "POWER(0,0)", "0^0" },
+        .{ "POWER(-8,1/3)", "(-8)^(1/3)" },
+        .{ "POWER(2,1024)", "2^1024" },
+        .{ "POWER(10,-2)", "10^-2" },
+        .{ "POWER(A1,2)", "A1^2" },
+    };
+    for (pairs) |pair| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF1a2Cells(&h);
+
+        inline for ([_]value.Fidelity{ .excel, .ieee }) |mode| {
+            var opts = h.options();
+            opts.fidelity = mode;
+            const fn_v = try h.evalOpts(pair[0], opts);
+            const op_v = try h.evalOpts(pair[1], opts);
+            const a = value.publish(fn_v.scalar, mode);
+            const b = value.publish(op_v.scalar, mode);
+            if (!value.PublishedScalar.eql(a, b)) {
+                std.debug.print("`{s}` and `{s}` disagree under {s}\n", .{ pair[0], pair[1], @tagName(mode) });
+                return error.PowerOperatorMismatch;
+            }
+        }
+    }
+}
+
+test "M4d: TRUNC(x) is ROUNDDOWN(x,0), and LOG(x) is LOG10(x)" {
+    // Two pairs the table declares to be one operation under two
+    // spellings — the optional-argument defaults. An equivalence a
+    // reader would otherwise have to infer from two implementations.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    try putF1a2Cells(&h);
+
+    const subjects = [_][]const u8{ "2.9", "-2.9", "0", "A1", "B2", "B3", "1234.5" };
+    for (subjects) |s| {
+        var one: [64]u8 = undefined;
+        var two: [64]u8 = undefined;
+        const a = try h.scalar(try std.fmt.bufPrint(&one, "TRUNC({s})", .{s}));
+        const b = try h.scalar(try std.fmt.bufPrint(&two, "ROUNDDOWN({s},0)", .{s}));
+        try testing.expect(a.eql(b));
+    }
+    for ([_][]const u8{ "100", "A1", "0.5", "1" }) |s| {
+        var one: [64]u8 = undefined;
+        var two: [64]u8 = undefined;
+        const a = try h.scalar(try std.fmt.bufPrint(&one, "LOG({s})", .{s}));
+        const b = try h.scalar(try std.fmt.bufPrint(&two, "LOG10({s})", .{s}));
+        try testing.expect(a.eql(b));
+    }
+}
+
+test "M4d: error order in every multi-argument name of the batch (§5.3c)" {
+    // §5.3c: eager arguments evaluate in declaration order and the first
+    // error wins. Every case runs in both argument orders, because a
+    // fixture with one error in it proves propagation and says nothing
+    // about order.
+    const Case = struct { formula: []const u8, expect: value.KnownError };
+    const cases = [_]Case{
+        .{ .formula = "ROUND(A5,A6)", .expect = .div0 },
+        .{ .formula = "ROUND(A6,A5)", .expect = .na },
+        .{ .formula = "ROUNDUP(A5,A6)", .expect = .div0 },
+        .{ .formula = "ROUNDUP(A6,A5)", .expect = .na },
+        .{ .formula = "ROUNDDOWN(A5,A6)", .expect = .div0 },
+        .{ .formula = "ROUNDDOWN(A6,A5)", .expect = .na },
+        .{ .formula = "TRUNC(A5,A6)", .expect = .div0 },
+        .{ .formula = "TRUNC(A6,A5)", .expect = .na },
+        .{ .formula = "MOD(A5,A6)", .expect = .div0 },
+        .{ .formula = "MOD(A6,A5)", .expect = .na },
+        .{ .formula = "POWER(A5,A6)", .expect = .div0 },
+        .{ .formula = "POWER(A6,A5)", .expect = .na },
+        .{ .formula = "LOG(A5,A6)", .expect = .div0 },
+        .{ .formula = "LOG(A6,A5)", .expect = .na },
+        .{ .formula = "RANDBETWEEN(A5,A6)", .expect = .div0 },
+        .{ .formula = "RANDBETWEEN(A6,A5)", .expect = .na },
+        // Propagation runs BEFORE the implementation, so an argument's
+        // error beats a domain failure the implementation would have
+        // raised. Three functions, three domain failures, one answer.
+        .{ .formula = "MOD(A6,0)", .expect = .na },
+        .{ .formula = "LOG(A6,1)", .expect = .na },
+        .{ .formula = "RANDBETWEEN(A6,-1)", .expect = .na },
+        // …and from inside a range, in §5.6a's iteration order. A range
+        // in a scalar slot lifts, so this is the per-element answer of
+        // the first cell rather than a fold.
+        .{ .formula = "MOD(A5,A5)", .expect = .div0 },
+    };
+
+    for (cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF1a2Cells(&h);
+
+        const s = h.scalar(c.formula) catch |e| {
+            std.debug.print("error-order case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        if (s != .err or s.err != .known or s.err.known != c.expect) {
+            std.debug.print("error-order case `{s}`: expected {s}\n", .{ c.formula, c.expect.spelling() });
+            return error.WrongErrorOrder;
+        }
+    }
+
+    // Every multi-argument name in the batch appears above, with the
+    // list derived from the registry's own arity rather than typed out —
+    // so a function that gains an argument later cannot slip past
+    // unordered.
+    var it = registry.inventory();
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4d")) continue;
+        const f = registry.lookup(e.name).?;
+        const multi = f.arity.max == null or f.arity.max.? > 1;
+        if (!multi) continue;
+        var covered = false;
+        for (cases) |c| {
+            if (std.mem.startsWith(u8, c.formula, e.name) and c.formula[e.name.len] == '(') covered = true;
+        }
+        if (!covered) {
+            std.debug.print("multi-argument name with no error-order fixture: {s}\n", .{e.name});
+            return error.MissingErrorOrderFixture;
+        }
+    }
+}
+
+// ─── M4d draw KATs (§5.6d: multi-callsite, and lazy branches) ────
+
+test "M4d: draw counts — two RAND() in one formula, none in a dead branch" {
+    // §5.6d's own words: two `RAND()` in one cell are distinct call
+    // sites. The count is the instrument, because a result cannot tell a
+    // draw that happened from one that did not — under a constant source
+    // both look the same.
+    const Case = struct { formula: []const u8, draws: u64 };
+    const cases = [_]Case{
+        .{ .formula = "RAND()", .draws = 1 },
+        .{ .formula = "RAND()+RAND()", .draws = 2 },
+        .{ .formula = "RAND()+RAND()+RAND()", .draws = 3 },
+        .{ .formula = "RANDBETWEEN(1,6)", .draws = 1 },
+        .{ .formula = "RANDBETWEEN(1,6)+RANDBETWEEN(1,6)", .draws = 2 },
+        .{ .formula = "RAND()+RANDBETWEEN(1,6)", .draws = 2 },
+        // One draw per CALL, not per argument: RANDBETWEEN reads two
+        // arguments and draws once.
+        .{ .formula = "RANDBETWEEN(A1,A1)", .draws = 1 },
+        // The batch's fourteen stable names draw nothing, however
+        // arithmetic they look.
+        .{ .formula = "ABS(-1)+SQRT(4)+PI()+EXP(0)+SIGN(3)", .draws = 0 },
+        .{ .formula = "ROUND(PI(),2)+MOD(7,3)+POWER(2,3)+LOG(8,2)", .draws = 0 },
+        // A dead lazy branch draws ZERO — the property M4c proved for
+        // the three deferring forms, re-proved here for the volatiles
+        // this row adds.
+        .{ .formula = "IF(TRUE(),1,RANDBETWEEN(1,6))", .draws = 0 },
+        .{ .formula = "IF(FALSE(),RANDBETWEEN(1,6),1)", .draws = 0 },
+        .{ .formula = "IF(TRUE(),RAND(),RANDBETWEEN(1,6))", .draws = 1 },
+        .{ .formula = "IF(FALSE(),RAND(),RANDBETWEEN(1,6))", .draws = 1 },
+        .{ .formula = "IFERROR(1,RANDBETWEEN(1,6))", .draws = 0 },
+        .{ .formula = "IFNA(1,RAND()+RANDBETWEEN(1,6))", .draws = 0 },
+        .{ .formula = "IFNA(A5,RANDBETWEEN(1,6))", .draws = 0 },
+        // …and an eager form draws every arm it writes, which is the
+        // same fact stated so that "optimizing" a short-circuit in would
+        // fail rather than pass.
+        .{ .formula = "IFS(TRUE(),RAND(),TRUE(),RANDBETWEEN(1,6))", .draws = 2 },
+        .{ .formula = "SWITCH(1,1,RAND(),2,RANDBETWEEN(1,6))", .draws = 2 },
+        // A propagated error reaches the implementation never, so the
+        // volatile never draws either.
+        .{ .formula = "RANDBETWEEN(A5,A6)", .draws = 0 },
+        // A lift draws once per element, because each element is its own
+        // invocation.
+        .{ .formula = "RANDBETWEEN({1,1},{6,6})", .draws = 2 },
+    };
+
+    for (cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF1a2Cells(&h);
+
+        _ = h.eval(c.formula) catch |e| {
+            std.debug.print("draw case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        if (h.draws.count != c.draws) {
+            std.debug.print(
+                "`{s}`: expected {d} draws, saw {d}\n",
+                .{ c.formula, c.draws, h.draws.count },
+            );
+            return error.WrongDrawCount;
+        }
+    }
+}
+
+test "M4d KAT: the draw sequence is reproducible from RunInputs alone" {
+    // §5.6d's callsite-keyed schedule is M5a2's and needs a graph this
+    // row does not have. What M4d can state — and must, because every
+    // count above rests on it — is that the sequence a formula consumes
+    // is a function of `RunInputs` and of nothing else: not a clock, not
+    // an entropy source, not evaluation history.
+    const inputs: run_inputs.RunInputs = .{ .now_utc_ms = 0, .rng_seed = 0x5EED_1A2, .limits = .{} };
+    try inputs.validate();
+
+    // The stream this seed names, taken directly from `rng_v1`. Every
+    // expectation below is against these, so the KAT ties the EVALUATOR
+    // to the generator rather than to itself.
+    var direct = rng.Rng.fromRunInputs(inputs);
+    const d0 = direct.nextFloat();
+    const d1 = direct.nextFloat();
+    try testing.expect(d0 != d1);
+
+    {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        var generator = rng.Rng.fromRunInputs(inputs);
+        var source = generator.drawSource();
+        var opts = h.options();
+        opts.draws = &source;
+
+        // Two evaluations of one formula, off one source: the draws come
+        // out in order, and they are the generator's own first two.
+        const a = try h.evalOpts("RAND()", opts);
+        const b = try h.evalOpts("RAND()", opts);
+        try testing.expectEqual(@as(u64, @bitCast(d0)), @as(u64, @bitCast(a.scalar.number)));
+        try testing.expectEqual(@as(u64, @bitCast(d1)), @as(u64, @bitCast(b.scalar.number)));
+        try testing.expectEqual(@as(u64, 2), source.count);
+    }
+
+    {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        var generator = rng.Rng.fromRunInputs(inputs);
+        var source = generator.drawSource();
+        var opts = h.options();
+        opts.draws = &source;
+
+        // The dead arm does not merely produce nothing — it CONSUMES
+        // nothing, so the live arm receives the stream's first value. A
+        // draw that happened and was discarded would satisfy a count on
+        // the result and fail this.
+        const v = try h.evalOpts("IF(TRUE(),RAND(),RAND())", opts);
+        try testing.expectEqual(@as(u64, @bitCast(d0)), @as(u64, @bitCast(v.scalar.number)));
+        try testing.expectEqual(@as(u64, 1), source.count);
+    }
+
+    {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        var generator = rng.Rng.fromRunInputs(inputs);
+        var source = generator.drawSource();
+        var opts = h.options();
+        opts.draws = &source;
+
+        // Two call sites in ONE formula draw twice, and get different
+        // numbers. Subtraction rather than addition: a sum cannot tell
+        // `0.3 + 0.7` from `0.5 + 0.5`, and the property under test is
+        // that the two sites were handed different values.
+        const v = try h.evalOpts("RAND()-RAND()", opts);
+        try testing.expectEqual(@as(u64, 2), source.count);
+        try testing.expect(v.scalar.number != 0);
+    }
+
+    // Same inputs, same answer; different seed, different answer. The
+    // second half is what makes the first mean "derived from the seed"
+    // rather than "constant".
+    const again = try seededResult(inputs, "RAND()-RAND()");
+    const first = try seededResult(inputs, "RAND()-RAND()");
+    try testing.expectEqual(@as(u64, @bitCast(first)), @as(u64, @bitCast(again)));
+    var other = inputs;
+    other.rng_seed = inputs.rng_seed +% 1;
+    const different = try seededResult(other, "RAND()-RAND()");
+    try testing.expect(@as(u64, @bitCast(different)) != @as(u64, @bitCast(first)));
+
+    // RANDBETWEEN rides the same seam, so its result is a function of
+    // the same inputs — and stays inside the range it was given.
+    const roll = try seededResult(inputs, "RANDBETWEEN(1,6)");
+    try testing.expectEqual(@as(f64, @floor(1 + d0 * 6)), roll);
+    try testing.expect(roll >= 1 and roll <= 6);
+}
+
+/// Evaluate one formula against a generator built from `inputs` and
+/// nothing else, and hand back the number. The whole point of the helper
+/// is that it takes no other parameter: reproducibility is a property of
+/// the argument list.
+fn seededResult(inputs: run_inputs.RunInputs, formula: []const u8) !f64 {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    var generator = rng.Rng.fromRunInputs(inputs);
+    var source = generator.drawSource();
+    var opts = h.options();
+    opts.draws = &source;
+    const v = try h.evalOpts(formula, opts);
+    return v.scalar.number;
+}
+
+test "M4d: RANDBETWEEN stays inside its range across the whole draw interval" {
+    // The mapping from a `[0,1)` draw to an inclusive integer range is
+    // the one place a single draw can leave the range: a draw just under
+    // 1 against a wide span. Swept rather than sampled, over the ranges
+    // whose ends are the ones that go wrong.
+    const Range = struct { lo: []const u8, hi: []const u8, lo_n: f64, hi_n: f64 };
+    const ranges = [_]Range{
+        .{ .lo = "1", .hi = "6", .lo_n = 1, .hi_n = 6 },
+        .{ .lo = "0", .hi = "1", .lo_n = 0, .hi_n = 1 },
+        .{ .lo = "-5", .hi = "5", .lo_n = -5, .hi_n = 5 },
+        .{ .lo = "-1", .hi = "-1", .lo_n = -1, .hi_n = -1 },
+        .{ .lo = "1", .hi = "1000000000", .lo_n = 1, .hi_n = 1000000000 },
+    };
+    // Including the largest double strictly below 1, which is what
+    // `nextFloat` can actually return and what the `@min` clamp exists
+    // for.
+    const draws = [_]f64{ 0, 0.5, 0.999999, 1 - 0x1.0p-53 };
+
+    for (ranges) |r| {
+        for (draws) |d| {
+            var h: Harness = undefined;
+            try h.init(testing.allocator);
+            defer h.deinit();
+            h.draw_value = d;
+
+            var buf: [64]u8 = undefined;
+            const src = try std.fmt.bufPrint(&buf, "RANDBETWEEN({s},{s})", .{ r.lo, r.hi });
+            const s = try h.scalar(src);
+            try testing.expect(s == .number);
+            if (s.number < r.lo_n or s.number > r.hi_n) {
+                std.debug.print("`{s}` with draw {d} produced {d}\n", .{ src, d, s.number });
+                return error.RandBetweenOutOfRange;
+            }
+            // …and it is an integer, which is the other half of the
+            // function's name.
+            try testing.expectEqual(s.number, @floor(s.number));
+        }
+    }
+}
+
+// ─── M4d fuzz: no argument shape panics, leaks, or evaluates twice ──
+
+const f1a2_names = [_][]const u8{
+    "ABS",       "EXP",     "INT",   "LN",   "LOG",         "LOG10",
+    "MOD",       "PI",      "POWER", "RAND", "RANDBETWEEN", "ROUND",
+    "ROUNDDOWN", "ROUNDUP", "SIGN",  "SQRT", "TRUNC",
+};
+
+/// Argument *shapes* and magnitudes. F1a-1's alphabet was about
+/// provenance; this one adds the numeric extremes, because the failure
+/// mode a numeric batch has and a predicate batch does not is a result
+/// binary64 cannot hold — and `assertRepresentable` is watching for
+/// exactly that.
+const f1a2_arg_shapes = [_][]const u8{
+    "A1",      "A2",            "A5",     "A7",
+    "A8",      "0",             "-0",     "1",
+    "-1",      "2.5",           "-2.5",   "0.5",
+    "308",     "-308",          "400",    "-400",
+    "1E+308",  "-1E+308",       "1E-308", "2.2250738585072014E-308",
+    "1/0",     "1E+308*10",     "{1,2}",  "{1;2}",
+    "A1:A8",   "(A1:A2,A5:A6)", "",       "@A1:A8",
+    "\"1,5\"", "S!A1",          "PI()",   "16",
+};
+
+fn fuzzF1a2Env(fake: *env.Fake) !env.SheetIndex {
+    const sheet = try fake.addSheet("S");
+    try fake.putA1(sheet, .stored, "A1", num(10));
+    try fake.putA1(sheet, .stored, "A2", .{ .text = "abc" });
+    try fake.putA1(sheet, .stored, "A5", value.ScalarValue.errorOf(.div0));
+    try fake.putA1(sheet, .stored, "A6", value.ScalarValue.errorOf(.na));
+    try fake.putA1(sheet, .stored, "A8", .{ .text = "7" });
+    return sheet;
+}
+
+fn fuzzF1a2Target(_: void, smith: *std.testing.Smith) anyerror!void {
+    @disableInstrumentation();
+
+    var buf: [512]u8 = undefined;
+    var w: usize = 0;
+    const name = f1a2_names[smith.index(f1a2_names.len)];
+    @memcpy(buf[w..][0..name.len], name);
+    w += name.len;
+    buf[w] = '(';
+    w += 1;
+    var n: usize = 0;
+    while (n < 4 and !smith.eos()) : (n += 1) {
+        const arg = f1a2_arg_shapes[smith.index(f1a2_arg_shapes.len)];
+        if (w + arg.len + 2 > buf.len) break;
+        if (n > 0) {
+            buf[w] = ',';
+            w += 1;
+        }
+        @memcpy(buf[w..][0..arg.len], arg);
+        w += arg.len;
+    }
+    buf[w] = ')';
+    w += 1;
+    const src = buf[0..w];
+
+    var parsed = parser.parse(std.testing.allocator, src, .{}) catch return;
+    defer parsed.deinit(std.testing.allocator);
+    if (parsed == .refused) return;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var fake = env.Fake.init(std.testing.allocator);
+    defer fake.deinit();
+    const sheet = try fuzzF1a2Env(&fake);
+
+    // Both rule tables, because a numeric batch's answer may depend on
+    // which one is in force and "no shape produces a non-finite number"
+    // has to hold under each.
+    for ([_]value.Fidelity{ .excel, .ieee }) |mode| {
+        var draw_value: f64 = 0.5;
+        var draws = DrawSource.constant(&draw_value);
+        const opts: Options = .{
+            .current_sheet = sheet,
+            .collation = .{ .fold = shippedFold },
+            .draws = &draws,
+            .fidelity = mode,
+            .site = .{
+                .row = coords.Row.fromOneBased(2) catch unreachable,
+                .col = coords.Col.fromZeroBased(1) catch unreachable,
+            },
+        };
+
+        var first = Evaluator.init(arena_state.allocator(), fake.evalEnv(), opts);
+        defer first.deinit();
+        var second = Evaluator.init(arena_state.allocator(), fake.evalEnv(), opts);
+        defer second.deinit();
+
+        if (first.evaluate(parsed.ok)) |a| {
+            try assertRepresentable(a);
+            const b = second.evaluate(parsed.ok) catch return error.NondeterministicEvaluation;
+            try assertRepresentable(b);
+            if (!valuesAgree(a, b)) {
+                std.debug.print("`{s}` evaluated two ways\n", .{src});
+                return error.NondeterministicEvaluation;
+            }
+        } else |e| {
+            if (second.evaluate(parsed.ok)) |_| {
+                return error.NondeterministicEvaluation;
+            } else |e2| {
+                if (e != e2) return error.NondeterministicEvaluation;
+            }
+        }
+    }
+}
+
+test "fuzz: no F1a-2 argument shape panics, leaks, or evaluates two ways" {
+    // The generator's alphabet is a second copy of the batch, so it gets
+    // the same treatment as every other copy in this row: checked
+    // against the file rather than maintained by hand.
+    var it = registry.inventory();
+    var batch: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4d")) continue;
+        batch += 1;
+        var present = false;
+        for (f1a2_names) |n| {
+            if (std.mem.eql(u8, n, e.name)) present = true;
+        }
+        if (!present) {
+            std.debug.print("fuzz alphabet is missing {s}\n", .{e.name});
+            return error.FuzzAlphabetIncomplete;
+        }
+    }
+    try testing.expectEqual(batch, f1a2_names.len);
+
+    try std.testing.fuzz({}, fuzzF1a2Target, .{
+        .corpus = &[_][]const u8{
+            "ABS(-1E+308)",
+            "SIGN(-0)",
+            "INT(A1:A8)",
+            "ROUND(A1,400)",
+            "ROUND(A1,-400)",
+            "ROUNDUP(A1,-400)",
+            "ROUNDDOWN(1E-308,308)",
+            "TRUNC(2.2250738585072014E-308,400)",
+            "MOD(1E+308,1E-308)",
+            "MOD(A1,0)",
+            "POWER(1E+308,2)",
+            "POWER(-1,0.5)",
+            "EXP(1E+308)",
+            "LN(0)",
+            "LOG(A1,1)",
+            "LOG(0,0)",
+            "LOG10(-1)",
+            "SQRT(-1)",
+            "PI()",
+            "RAND()",
+            "RANDBETWEEN(1E+308,-1E+308)",
+            "RANDBETWEEN(-1E+308,1E+308)",
+            "RANDBETWEEN({1,2},{3,4})",
+        },
+    });
+}
+
+test "M4d: every name against every argument shape, exhaustively and in both modes" {
+    // The `fuzz` step is Linux-only (`build.zig:249` — coverage-guided
+    // fuzzing is broken upstream on macOS and Windows), so on the other
+    // two platforms the target above runs its corpus and nothing else.
+    // The property it exists to prove — no shape panics, leaks, produces
+    // a non-finite number, or evaluates two ways — is small enough here
+    // to prove by ENUMERATION instead of by search: seventeen names, one
+    // and two arguments, every shape in the alphabet, both rule tables.
+    // A sweep that always runs beats a search that runs on one platform.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var fake = env.Fake.init(testing.allocator);
+    defer fake.deinit();
+    const sheet = try fuzzF1a2Env(&fake);
+
+    var checked: usize = 0;
+    var buf: [256]u8 = undefined;
+    for (f1a2_names) |name| {
+        for (f1a2_arg_shapes) |first_arg| {
+            // The one-argument form belongs to `(name, first_arg)` and is
+            // built here rather than inside the pair loop — thirty-two
+            // identical rebuilds would have cost half the sweep's time
+            // and covered nothing the first one did not.
+            const one = std.fmt.bufPrint(&buf, "{s}({s})", .{ name, first_arg }) catch continue;
+            try sweepShape(&arena_state, &fake, sheet, one, &checked);
+            for (f1a2_arg_shapes) |second_arg| {
+                var pair_buf: [256]u8 = undefined;
+                const two = std.fmt.bufPrint(&pair_buf, "{s}({s},{s})", .{ name, first_arg, second_arg }) catch continue;
+                try sweepShape(&arena_state, &fake, sheet, two, &checked);
+            }
+        }
+    }
+    // A sweep that silently stopped enumerating would still pass, so the
+    // count is asserted as a floor rather than left to the loops.
+    try testing.expect(checked > 10_000);
+}
+
+/// One swept call: parse it, evaluate it twice under each rule table,
+/// and hold the four results to the same contract the fuzz target holds
+/// its inputs to. A malformed shape or an arity the registry rejects is
+/// not a finding — the property is about calls that *reach* an
+/// implementation.
+fn sweepShape(
+    arena_state: *std.heap.ArenaAllocator,
+    fake: *env.Fake,
+    sheet: env.SheetIndex,
+    src: []const u8,
+    checked: *usize,
+) !void {
+    var parsed = parser.parse(testing.allocator, src, .{}) catch return;
+    defer parsed.deinit(testing.allocator);
+    if (parsed == .refused) return;
+
+    for ([_]value.Fidelity{ .excel, .ieee }) |mode| {
+        var draw_value: f64 = 0.5;
+        var draws = DrawSource.constant(&draw_value);
+        const opts: Options = .{
+            .current_sheet = sheet,
+            .collation = .{ .fold = shippedFold },
+            .draws = &draws,
+            .fidelity = mode,
+            .site = .{
+                .row = coords.Row.fromOneBased(2) catch unreachable,
+                .col = coords.Col.fromZeroBased(1) catch unreachable,
+            },
+        };
+        var first = Evaluator.init(arena_state.allocator(), fake.evalEnv(), opts);
+        defer first.deinit();
+        var second = Evaluator.init(arena_state.allocator(), fake.evalEnv(), opts);
+        defer second.deinit();
+
+        if (first.evaluate(parsed.ok)) |a| {
+            assertRepresentable(a) catch |e| {
+                std.debug.print("`{s}` under {s} produced an unrepresentable value\n", .{ src, @tagName(mode) });
+                return e;
+            };
+            const b = second.evaluate(parsed.ok) catch {
+                std.debug.print("`{s}` succeeded then refused\n", .{src});
+                return error.NondeterministicEvaluation;
+            };
+            try assertRepresentable(b);
+            if (!valuesAgree(a, b)) {
+                std.debug.print("`{s}` evaluated two ways\n", .{src});
+                return error.NondeterministicEvaluation;
+            }
+        } else |e| {
+            if (second.evaluate(parsed.ok)) |_| {
+                std.debug.print("`{s}` refused then succeeded\n", .{src});
+                return error.NondeterministicEvaluation;
+            } else |e2| {
+                if (e != e2) return error.NondeterministicEvaluation;
+            }
+        }
+        checked.* += 1;
+    }
+}
+
 // ─── boundaries and refusals ─────────────────────────────────────
 
 fn emptyMatrixImpl(ctx: registry.CallCtx, args: []const Value) registry.FnError!Value {
@@ -3442,6 +4480,21 @@ test "checkAllAllocationFailures: evaluation leaks nothing under OOM" {
         "SWITCH(N(A1),2,T(A2),\"z\")",
         "AND(ISNA(NA()),OR(ISTEXT(A2),ISLOGICAL(A1)))",
         "NOT(ISBLANK(A1))",
+        // M4d: every new impl at least once, plus the shapes that make
+        // one of them allocate — the lifted array path through a scalar
+        // slot, a multi-area set, and a range walk.
+        "ABS(A1)+SIGN(A1)+INT(A1)",
+        "ROUND(A1,2)+ROUNDUP(A1,2)+ROUNDDOWN(A1,2)",
+        "TRUNC(A1)+TRUNC(A1,1)",
+        "MOD(A1,B1)+POWER(A1,B1)",
+        "EXP(A1)+LN(A1)+LOG(A1)+LOG10(A1)+SQRT(A1)+PI()",
+        "LOG(A1,B1)",
+        "RANDBETWEEN(A1,B1)+RAND()",
+        "ABS(A1:B1)",
+        "ROUND(A1:B1,0)",
+        "RANDBETWEEN(A1:B1,A1:B1)",
+        "TRUNC((A1:B1,A1:A1),0)",
+        "IFERROR(SQRT(-A1),LOG(A2))",
     };
     for (sources) |src| {
         try testing.checkAllAllocationFailures(testing.allocator, evalUnderOom, .{src});
