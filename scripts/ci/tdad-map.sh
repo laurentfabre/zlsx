@@ -73,7 +73,7 @@ fi
 related=""
 add() { related+="- $1"$'\n'; }
 
-if printf '%s\n' "$changed" | grep -qE '^src/(xlsx|writer)\.zig$|^src/unicode/|^unicode/|^src/formula/'; then
+if printf '%s\n' "$changed" | grep -qE '^src/(xlsx|writer)\.zig$|^unicode/|^src/formula/'; then
   add "\`tests/xlsx_corpus.zig\` — reader integration over the fixture corpus"
   add "\`tests/package_corpus.zig\` — package-layer integration"
   add "\`zig build fuzz\` — coverage-guided fuzz (Linux x64; \`src/xlsx.zig\` + \`pkg/store.zig\`)"

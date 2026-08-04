@@ -504,6 +504,52 @@ test "fresh_emit: empty single-sheet archive — no styles, no SST entries" {
     try testing.expectEqualSlices(u8, &std.zip.end_record_sig, out.items[out.items.len - 22 .. out.items.len - 22 + 4]);
 }
 
+test "fresh_emit: a fresh archive carries no metadata part, so it reads as CV1" {
+    // §5.4d (M4f): a workbook with no compatibility metadata IS
+    // compatibility version 1, and every file this emitter writes is
+    // such a workbook. The engine's default depends on that being true
+    // of the emitter, so it is asserted here rather than inferred from
+    // the part list in a comment: if a later row starts writing
+    // `xl/metadata.xml`, `LEN` of an astral character changes meaning
+    // for every fresh file and this is where that surfaces.
+    const a = testing.allocator;
+
+    var st = sheet_plan.SheetState{};
+    defer st.deinit(a);
+
+    const sheets = [_]SheetInput{
+        .{ .name = "Sheet1", .body = "", .state = &st },
+    };
+
+    var sst_plan: sst_plan_mod.SstExtensionPlan = .{};
+    defer sst_plan.deinit(a);
+
+    var styles_plan: styles_plan_mod.StylesPlan = .{};
+    defer styles_plan.deinit(a);
+
+    var workbook_xml_plan: workbook_xml_plan_mod.WorkbookXmlPlan = .{};
+    defer workbook_xml_plan.deinit(a);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(a);
+
+    try emitArchiveBytes(a, &out, .{
+        .sheets = &sheets,
+        .sst_plan = &sst_plan,
+        .sst_count = 0,
+        .styles_plan = &styles_plan,
+        .workbook_xml_plan = &workbook_xml_plan,
+    }, stubDeflate);
+
+    // The stub deflate stores rather than compresses, so the part names
+    // and the content-type overrides are both in the bytes verbatim.
+    try testing.expect(std.mem.indexOf(u8, out.items, "metadata.xml") == null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "sheetMetadata") == null);
+    // …and the archive is otherwise the one the test above built, so a
+    // vacuous pass is not available: the parts that SHOULD be there are.
+    try testing.expect(std.mem.indexOf(u8, out.items, "xl/workbook.xml") != null);
+}
+
 test "fresh_emit: NoSheets refusal" {
     const a = testing.allocator;
 
