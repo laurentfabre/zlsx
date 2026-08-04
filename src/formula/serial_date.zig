@@ -363,6 +363,272 @@ fn fixedDigits(comptime T: type, s: []const u8) LexicalError!T {
     return std.math.cast(T, acc) orelse error.MalformedDate;
 }
 
+// ─── the clock (§5.5, M4g) ───────────────────────────────────────
+
+pub const ms_per_day: i64 = 86_400_000;
+
+/// The serial a wall-clock instant denotes, under the active epoch.
+///
+/// The instant arrives as Unix milliseconds plus a fixed civil offset,
+/// which is `RunInputs`' whole model of time: no OS timezone is consulted
+/// anywhere in the engine, so `NOW()` in a run that passed no offset is
+/// UTC and says so. The epoch arithmetic stays here because the two 1900
+/// epochs are this module's secret and nothing else should have to know
+/// that a serial below 61 counts from a different day.
+pub fn serialFromUnixMs(system: DateSystem, unix_ms: i64, utc_offset_min: i32) Error!f64 {
+    const local_ms = unix_ms + @as(i64, utc_offset_min) * 60_000;
+    // Floor division, not truncation: an instant before 1970 has a
+    // negative millisecond count, and truncating would put it on the
+    // wrong side of midnight.
+    const days = @divFloor(local_ms, ms_per_day);
+    const ms_of_day = local_ms - days * ms_per_day;
+
+    const c = civilFromDays(days);
+    const serial = try serialFromDate(system, c.year, c.month, c.day);
+    return @as(f64, @floatFromInt(serial)) +
+        @as(f64, @floatFromInt(ms_of_day)) / @as(f64, @floatFromInt(ms_per_day));
+}
+
+// ─── the invariant date grammar (§5.4b, M4g) ─────────────────────
+//
+// `DATEVALUE` and `TIMEVALUE` are locale-sensitive PARSES, and §5.4b's
+// rule for those is that the grammar is pinned invariant and anything
+// outside it is a typed refusal rather than a fabricated `#VALUE!`.
+//
+// The line this draws is the one M3a1 drew for numbers, where `"1.5"`
+// parses and `"1,5"` refuses: **a spelling refuses exactly when the
+// locale would change what it MEANS, not merely how it looks.** So
+//
+//   * `YYYY-MM-DD` parses. ISO field order is not a locale's opinion.
+//   * A named month parses in any position — `1-Jan-2020`,
+//     `Jan 1, 2020`, `1 January 2020`. English month names are the
+//     invariant spelling, matching the invariant en-US OUTPUT §5.4b
+//     already pins for `TEXT`.
+//   * `M/D/YYYY` parses **only when one field settles the order**:
+//     `1/15/2020` can only be January 15th, in every locale that
+//     exists. `1/2/2020` cannot — it is January 2nd in the United
+//     States and February 1st almost everywhere else — so it refuses.
+//     Guessing en-US there would silently redate a European workbook.
+//
+// Times need no such rule: `H:MM:SS` is `H:MM:SS` everywhere, so
+// `TIMEVALUE` accepts it plus an optional AM/PM and refuses nothing on
+// locale grounds.
+
+pub const InvariantError = error{
+    /// Not a date or time at all — Excel's own `#VALUE!`.
+    NotADate,
+    /// A well-formed spelling whose meaning depends on the locale.
+    /// `DATEVALUE("1/2/2020")`: two readings, no way to choose.
+    LocaleOrdered,
+} || Error;
+
+const month_names = [_][]const u8{
+    "january", "february", "march",     "april",   "may",      "june",
+    "july",    "august",   "september", "october", "november", "december",
+};
+
+/// Excel's two-digit-year window, which is a documented rule rather
+/// than a locale one: 00–29 are 2000–2029, 30–99 are 1930–1999.
+fn expandYear(y: u32, digits: usize) u32 {
+    if (digits > 2) return y;
+    return if (y <= 29) 2000 + y else 1900 + y;
+}
+
+const Field = struct { value: u32, digits: usize };
+
+/// `DATEVALUE`'s grammar. Returns the whole-day serial.
+pub fn serialFromInvariantDate(system: DateSystem, text: []const u8) InvariantError!i32 {
+    const s = std.mem.trim(u8, text, " \t");
+    if (s.len == 0) return error.NotADate;
+
+    // ISO first: it is the only form with a fixed field order, and the
+    // only one that can be recognised by shape alone.
+    if (s.len >= 8 and countByte(s, '-') == 2 and firstFieldDigits(s) == 4) {
+        var it = std.mem.splitScalar(u8, s, '-');
+        const y = try numericField(it.next().?);
+        const m = try numericField(it.next().?);
+        const d = try numericField(it.next().?);
+        return finishDate(system, y.value, m.value, d.value);
+    }
+
+    var parts: [3][]const u8 = undefined;
+    const n = splitDateFields(s, &parts) orelse return error.NotADate;
+    if (n != 3) return error.NotADate;
+
+    // A named month settles the order wherever it sits, so it is tried
+    // before anything numeric is interpreted.
+    var month_at: ?usize = null;
+    var month: u32 = 0;
+    for (parts, 0..) |p, i| {
+        if (monthFromName(p)) |m| {
+            if (month_at != null) return error.NotADate; // two month names
+            month_at = i;
+            month = m;
+        }
+    }
+    if (month_at) |mi| {
+        var rest: [2]Field = undefined;
+        var k: usize = 0;
+        for (parts, 0..) |p, i| {
+            if (i == mi) continue;
+            rest[k] = try numericField(p);
+            k += 1;
+        }
+        // `Jan 1, 2020` and `1-Jan-2020` differ only in which side the
+        // year is on, and a year is the field with four digits — or,
+        // where both are short, the one that cannot be a day.
+        const a = rest[0];
+        const b = rest[1];
+        if (a.digits == 4) return finishDate(system, a.value, month, b.value);
+        if (b.digits == 4) return finishDate(system, b.value, month, a.value);
+        if (mi == 0) return finishDate(system, expandYear(b.value, b.digits), month, a.value);
+        return finishDate(system, expandYear(b.value, b.digits), month, a.value);
+    }
+
+    // All numeric. The last field is the year in every spelling zlsx
+    // accepts; the first two are the pair whose order a locale decides.
+    const f0 = try numericField(parts[0]);
+    const f1 = try numericField(parts[1]);
+    const f2 = try numericField(parts[2]);
+    const year = expandYear(f2.value, f2.digits);
+    if (f0.value >= 1 and f0.value <= 12 and f1.value >= 1 and f1.value <= 12) {
+        // Both readings are calendar-valid: this is the refusal §5.4b
+        // asks for, and the reason it is not `#VALUE!` is that the text
+        // IS a date — just not one this engine may choose between.
+        return error.LocaleOrdered;
+    }
+    if (f0.value > 12 and f1.value >= 1 and f1.value <= 12) {
+        // Only D/M/YYYY can be meant.
+        return finishDate(system, year, f1.value, f0.value);
+    }
+    // Only M/D/YYYY can be meant — or neither, which `finishDate`
+    // reports as the calendar error it is.
+    return finishDate(system, year, f0.value, f1.value);
+}
+
+/// `TIMEVALUE`'s grammar: `H:MM`, `H:MM:SS`, either with an optional
+/// `AM`/`PM`. Returns the day fraction.
+pub fn fractionFromInvariantTime(text: []const u8) InvariantError!f64 {
+    var s = std.mem.trim(u8, text, " \t");
+    if (s.len == 0) return error.NotADate;
+
+    var meridiem: ?bool = null; // true = PM
+    if (endsWithFold(s, "am") or endsWithFold(s, "pm")) {
+        meridiem = (s[s.len - 2] | 0x20) == 'p';
+        s = std.mem.trimEnd(u8, s[0 .. s.len - 2], " \t");
+    }
+
+    var it = std.mem.splitScalar(u8, s, ':');
+    const h = try numericField(it.next() orelse return error.NotADate);
+    const m = try numericField(it.next() orelse return error.NotADate);
+    var sec: u32 = 0;
+    if (it.next()) |third| sec = (try numericField(third)).value;
+    if (it.next() != null) return error.NotADate;
+
+    var hour = h.value;
+    if (meridiem) |pm| {
+        // A 12-hour clock has no hour 0 and no hour 13.
+        if (hour < 1 or hour > 12) return error.NotADate;
+        hour = if (pm) (if (hour == 12) 12 else hour + 12) else (if (hour == 12) 0 else hour);
+    } else if (hour > 23) {
+        return error.NotADate;
+    }
+    if (m.value > 59 or sec > 59) return error.NotADate;
+    return fractionFromTime(hour, m.value, sec);
+}
+
+fn finishDate(system: DateSystem, year: u32, month: u32, day: u32) InvariantError!i32 {
+    if (year > 9999 or month > 255 or day > 255) return error.NotADate;
+    return serialFromDate(
+        system,
+        @intCast(year),
+        @intCast(month),
+        @intCast(day),
+    ) catch error.NotADate;
+}
+
+fn numericField(s: []const u8) InvariantError!Field {
+    const t = std.mem.trim(u8, s, " \t");
+    if (t.len == 0 or t.len > 4) return error.NotADate;
+    var acc: u32 = 0;
+    for (t) |c| {
+        if (c < '0' or c > '9') return error.NotADate;
+        acc = acc * 10 + (c - '0');
+    }
+    return .{ .value = acc, .digits = t.len };
+}
+
+/// Split on `/`, `-`, or whitespace, dropping a single trailing comma
+/// from each field — which is what makes `Jan 1, 2020` one grammar with
+/// `Jan 1 2020` rather than two.
+fn splitDateFields(s: []const u8, out: *[3][]const u8) ?usize {
+    var n: usize = 0;
+    var start: ?usize = null;
+    for (s, 0..) |c, i| {
+        const is_sep = c == '/' or c == '-' or c == ' ' or c == '\t' or c == ',';
+        if (is_sep) {
+            if (start) |b| {
+                if (n == 3) return null;
+                out[n] = s[b..i];
+                n += 1;
+                start = null;
+            }
+            continue;
+        }
+        if (start == null) start = i;
+    }
+    if (start) |b| {
+        if (n == 3) return null;
+        out[n] = s[b..];
+        n += 1;
+    }
+    return n;
+}
+
+fn monthFromName(s: []const u8) ?u32 {
+    const t = std.mem.trim(u8, s, " \t,");
+    if (t.len < 3) return null;
+    for (month_names, 0..) |name, i| {
+        // A three-letter abbreviation or the whole name, nothing
+        // between: `Janua` is not a month.
+        if (eqlFoldAscii(t, name[0..3]) or eqlFoldAscii(t, name)) return @intCast(i + 1);
+    }
+    return null;
+}
+
+/// ASCII case-insensitive equality. Month names are ASCII by
+/// construction, so this needs neither the allocator nor the Unicode
+/// fold — and using the fold here would be claiming that `ⅿay` is May.
+fn eqlFoldAscii(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if ((x | 0x20) != (y | 0x20)) return false;
+    }
+    return true;
+}
+
+fn endsWithFold(s: []const u8, suffix: []const u8) bool {
+    if (s.len < suffix.len) return false;
+    return eqlFoldAscii(s[s.len - suffix.len ..], suffix);
+}
+
+fn countByte(s: []const u8, c: u8) usize {
+    var n: usize = 0;
+    for (s) |b| {
+        if (b == c) n += 1;
+    }
+    return n;
+}
+
+fn firstFieldDigits(s: []const u8) usize {
+    var n: usize = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') break;
+        n += 1;
+    }
+    return n;
+}
+
 // ─── tests ───────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -687,6 +953,191 @@ test "t=\"d\": the lexical table round-trips against the calendar" {
                 @as(f64, @floatFromInt(serial)),
                 try serialFromLexical(system, s),
             );
+        }
+    }
+}
+
+// ─── M4g: the clock and the invariant grammar ────────────────────
+
+test "serialFromUnixMs: the epoch offset, in both systems" {
+    // 1970-01-01T00:00:00Z is serial 25569 under the 1900 system and
+    // 24107 under 1904 — the two constants every spreadsheet import
+    // path in the world hard-codes, derived here instead.
+    try testing.expectEqual(@as(f64, 25569), try serialFromUnixMs(.d1900, 0, 0));
+    try testing.expectEqual(@as(f64, 24107), try serialFromUnixMs(.d1904, 0, 0));
+    // Half a day in is noon, in both.
+    try testing.expectEqual(@as(f64, 25569.5), try serialFromUnixMs(.d1900, ms_per_day / 2, 0));
+}
+
+test "serialFromUnixMs: the offset moves the day, and midnight is the boundary" {
+    // 23:30 UTC plus 60 minutes is 00:30 tomorrow — the case a
+    // truncating division gets wrong in one direction and a missing
+    // offset gets wrong in the other.
+    const late = 23 * 3_600_000 + 30 * 60_000;
+    const same_day = try serialFromUnixMs(.d1900, late, 0);
+    const next_day = try serialFromUnixMs(.d1900, late, 60);
+    try testing.expectEqual(@as(f64, 25569), @floor(same_day));
+    try testing.expectEqual(@as(f64, 25570), @floor(next_day));
+    // …and backwards across the same boundary.
+    const early = 30 * 60_000; // 00:30 UTC
+    try testing.expectEqual(
+        @as(f64, 25568),
+        @floor(try serialFromUnixMs(.d1900, early, -60)),
+    );
+}
+
+test "serialFromUnixMs: an instant before 1970 floors rather than truncates" {
+    // 1969-12-31T12:00:00Z. Truncating division would put this on
+    // 1970-01-01 at noon-in-the-wrong-direction.
+    const before = -(ms_per_day / 2);
+    try testing.expectEqual(@as(f64, 25568.5), try serialFromUnixMs(.d1900, before, 0));
+}
+
+test "DATEVALUE: ISO parses, in both systems" {
+    for ([_]DateSystem{ .d1900, .d1904 }) |system| {
+        const want = try serialFromDate(system, 2020, 1, 2);
+        try testing.expectEqual(want, try serialFromInvariantDate(system, "2020-01-02"));
+        try testing.expectEqual(want, try serialFromInvariantDate(system, "  2020-01-02  "));
+    }
+    // The 1904 system has no 1900 at all, which is a range error rather
+    // than a grammar one — and both surface as `NotADate`, because
+    // Excel's answer for an unrepresentable date is `#VALUE!`.
+    try testing.expectError(
+        error.NotADate,
+        serialFromInvariantDate(.d1904, "1900-06-15"),
+    );
+}
+
+test "DATEVALUE: a named month settles the order wherever it sits" {
+    const want = try serialFromDate(.d1900, 2020, 1, 15);
+    for ([_][]const u8{
+        "15-Jan-2020",
+        "Jan 15, 2020",
+        "January 15, 2020",
+        "15 January 2020",
+        "15-JANUARY-2020",
+        "jan 15 2020",
+    }) |s| {
+        try testing.expectEqual(want, try serialFromInvariantDate(.d1900, s));
+    }
+    // A day that could also be a month is still unambiguous once the
+    // month is named.
+    try testing.expectEqual(
+        try serialFromDate(.d1900, 2020, 3, 4),
+        try serialFromInvariantDate(.d1900, "4-Mar-2020"),
+    );
+    try testing.expectEqual(
+        try serialFromDate(.d1900, 2020, 3, 4),
+        try serialFromInvariantDate(.d1900, "Mar 4, 2020"),
+    );
+}
+
+test "DATEVALUE: a numeric date refuses exactly when the locale would decide it" {
+    // Unambiguous: 15 is not a month, so only one reading exists.
+    try testing.expectEqual(
+        try serialFromDate(.d1900, 2020, 1, 15),
+        try serialFromInvariantDate(.d1900, "1/15/2020"),
+    );
+    // …including the other way round, which is the reading most of the
+    // world writes.
+    try testing.expectEqual(
+        try serialFromDate(.d1900, 2020, 1, 15),
+        try serialFromInvariantDate(.d1900, "15/1/2020"),
+    );
+    // Ambiguous: January 2nd in the United States, February 1st almost
+    // everywhere else. Refused, and NOT as `#VALUE!` — the text is a
+    // date, just not one this engine may choose between.
+    try testing.expectError(
+        error.LocaleOrdered,
+        serialFromInvariantDate(.d1900, "1/2/2020"),
+    );
+    try testing.expectError(
+        error.LocaleOrdered,
+        serialFromInvariantDate(.d1900, "12-11-2020"),
+    );
+    // Not a date at all is the other outcome, and the two stay distinct.
+    for ([_][]const u8{ "hello", "", "2020", "1/2", "1/2/3/4", "32/1/2020" }) |s| {
+        try testing.expectError(error.NotADate, serialFromInvariantDate(.d1900, s));
+    }
+}
+
+test "DATEVALUE: Excel's two-digit-year window" {
+    // Documented, deterministic, and not a locale rule: 00–29 are
+    // 2000–2029 and 30–99 are 1930–1999.
+    try testing.expectEqual(
+        try serialFromDate(.d1900, 2029, 1, 15),
+        try serialFromInvariantDate(.d1900, "1/15/29"),
+    );
+    try testing.expectEqual(
+        try serialFromDate(.d1900, 1930, 1, 15),
+        try serialFromInvariantDate(.d1900, "1/15/30"),
+    );
+    try testing.expectEqual(
+        try serialFromDate(.d1900, 1999, 6, 1),
+        try serialFromInvariantDate(.d1900, "1-Jun-99"),
+    );
+}
+
+test "DATEVALUE: the 1900 leap-year artifact is reachable by name" {
+    // Serial 60 is a day that never happened, and `serialFromDate`
+    // represents it rather than refusing — so the grammar must not
+    // reject it on the way there.
+    try testing.expectEqual(
+        fictitious_leap_serial,
+        try serialFromInvariantDate(.d1900, "1900-02-29"),
+    );
+    try testing.expectEqual(
+        fictitious_leap_serial,
+        try serialFromInvariantDate(.d1900, "29-Feb-1900"),
+    );
+    // …and it is not a date in the 1904 system, where 1900 does not
+    // exist at all.
+    try testing.expectError(
+        error.NotADate,
+        serialFromInvariantDate(.d1904, "1900-02-29"),
+    );
+}
+
+test "TIMEVALUE: 24-hour, 12-hour, and what is not a time" {
+    try testing.expectEqual(
+        fractionFromTime(13, 30, 0),
+        try fractionFromInvariantTime("13:30"),
+    );
+    try testing.expectEqual(
+        fractionFromTime(13, 30, 45),
+        try fractionFromInvariantTime("13:30:45"),
+    );
+    try testing.expectEqual(
+        fractionFromTime(13, 30, 0),
+        try fractionFromInvariantTime("1:30 PM"),
+    );
+    try testing.expectEqual(
+        fractionFromTime(1, 30, 0),
+        try fractionFromInvariantTime("1:30 am"),
+    );
+    // Midnight and noon are the two the 12-hour clock gets wrong.
+    try testing.expectEqual(@as(f64, 0), try fractionFromInvariantTime("12:00 AM"));
+    try testing.expectEqual(@as(f64, 0.5), try fractionFromInvariantTime("12:00 PM"));
+
+    for ([_][]const u8{ "13:00 PM", "0:30 AM", "24:00", "1:60", "1:00:60", "hello", "13" }) |s| {
+        try testing.expectError(error.NotADate, fractionFromInvariantTime(s));
+    }
+}
+
+test "TIMEVALUE: no spelling refuses on locale grounds" {
+    // The asymmetry with DATEVALUE, asserted rather than left implicit:
+    // a clock has one field order everywhere, so `LocaleOrdered` is
+    // unreachable here. Swept over every hour and minute boundary that
+    // could plausibly be read two ways.
+    var buf: [16]u8 = undefined;
+    for (0..24) |h| {
+        for ([_]u32{ 0, 1, 12, 30, 59 }) |m| {
+            const s = try std.fmt.bufPrint(&buf, "{d}:{d:0>2}", .{ h, m });
+            const got = fractionFromInvariantTime(s) catch |e| {
+                std.debug.print("`{s}` refused: {t}\n", .{ s, e });
+                return e;
+            };
+            try testing.expectEqual(fractionFromTime(@intCast(h), m, 0), got);
         }
     }
 }

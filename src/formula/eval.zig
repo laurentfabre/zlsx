@@ -294,6 +294,21 @@ pub const Options = struct {
     /// recalc passes what `CalcState` parsed, and the default is CV1
     /// because a workbook with no compatibility metadata IS CV1.
     text_compat: run_inputs.CompatibilityVersion = .cv1,
+    /// §5.4a's epoch, and therefore what every serial in the workbook
+    /// MEANS. Workbook-derived (`workbookPr@date1904`), never
+    /// caller-set: a caller who could change it would silently redate
+    /// every cell in the file by four years and a day.
+    date_system: run_inputs.DateSystem = .d1900,
+    /// The instant `NOW()` and `TODAY()` report, as Unix milliseconds.
+    /// It is an INPUT rather than a clock read, which is what makes a
+    /// recalc reproducible from `RunInputs` alone and what lets every
+    /// volatile-date fixture pin an exact answer.
+    now_utc_ms: i64 = 0,
+    /// The fixed civil offset those two apply. Zero — UTC — at every
+    /// layer, because the stdlib has no portable local-timezone resolver
+    /// and zlsx is stdlib-only; a caller that wants local time passes
+    /// the offset. TZif is M10+.
+    utc_offset_min: i32 = 0,
     /// §5.4b's code page, which `CHAR` and `CODE` resolve through. The
     /// v1 enum is closed, so this is a seam rather than a choice — but
     /// it is the seam a second profile lands in, and it belongs to the
@@ -5745,6 +5760,436 @@ test "M4f: every name against every argument shape, in both versions" {
     }
     // Nineteen names × seven shapes × two versions.
     try testing.expectEqual(@as(usize, 19 * 7 * 2), checked);
+}
+
+// ─── M4g: the F1c-date batch (§7, fifteen names) ─────────────────
+//
+// Oracle-first, and — as at every F-batch so far — the three committed
+// manifests decide nothing: §8.2's evidence is eighteen operator and
+// literal cells plus `SQRT(-1)`. So the batch ships `spec_pinned` with
+// its oracle-row count pinned at **zero**, guarded by the same
+// three-valued checker.
+//
+// What is different here is the second axis. M4f's fixtures carried a
+// compatibility version; these carry an EPOCH, and the two epochs
+// disagree about the value of every date rather than about its length.
+// A fixture with no epoch means the same thing under both and is
+// asserted under both.
+
+/// 2020-01-01 in each system — the anchor every dated fixture below is
+/// written against, so a reader can check one number instead of forty.
+const serial_2020_1900: f64 = 43831;
+const serial_2020_1904: f64 = 42369;
+/// 2020-01-01T12:00:00Z as Unix milliseconds, for the two volatiles.
+const now_2020_noon_ms: i64 = 1_577_880_000_000;
+
+const F1dCase = struct {
+    func: []const u8,
+    formula: []const u8,
+    expect: Expect,
+    system: ?run_inputs.DateSystem = null,
+    evidence: Evidence = .spec_pinned,
+    note: []const u8 = "",
+};
+
+const f1d_cases = [_]F1dCase{
+    // ── DATE: the constructor, and its two overflow rules ──
+    .{ .func = "DATE", .formula = "DATE(2020,1,1)", .expect = .{ .number = serial_2020_1900 }, .system = .d1900 },
+    .{ .func = "DATE", .formula = "DATE(2020,1,1)", .expect = .{ .number = serial_2020_1904 }, .system = .d1904 },
+    .{ .func = "DATE", .formula = "DATE(2020,13,1)", .expect = .{ .number = 44197 }, .system = .d1900, .note = "month 13 is January of the next year" },
+    .{ .func = "DATE", .formula = "DATE(2020,1,32)", .expect = .{ .number = 43862 }, .system = .d1900, .note = "day 32 is the 1st of February" },
+    .{ .func = "DATE", .formula = "DATE(2020,0,1)", .expect = .{ .number = 43800 }, .system = .d1900, .note = "month 0 is December of the previous year" },
+    .{ .func = "DATE", .formula = "DATE(20,1,1)", .expect = .{ .number = 7306 }, .system = .d1900, .note = "1920-01-01: a numeric year below 1900 is 1900+y — NOT the text grammar's window" },
+    .{ .func = "DATE", .formula = "DATE(-1,1,1)", .expect = .{ .err = .num } },
+    .{ .func = "DATE", .formula = "DATE(10000,1,1)", .expect = .{ .err = .num } },
+
+    // ── the readers ──
+    .{ .func = "YEAR", .formula = "YEAR(43831)", .expect = .{ .number = 2020 }, .system = .d1900 },
+    .{ .func = "YEAR", .formula = "YEAR(42369)", .expect = .{ .number = 2020 }, .system = .d1904 },
+    .{ .func = "YEAR", .formula = "YEAR(-1)", .expect = .{ .err = .num }, .note = "no date precedes the epoch" },
+    .{ .func = "MONTH", .formula = "MONTH(43831)", .expect = .{ .number = 1 }, .system = .d1900 },
+    .{ .func = "MONTH", .formula = "MONTH(43862)", .expect = .{ .number = 2 }, .system = .d1900 },
+    .{ .func = "DAY", .formula = "DAY(43831)", .expect = .{ .number = 1 }, .system = .d1900 },
+    .{ .func = "DAY", .formula = "DAY(43861)", .expect = .{ .number = 31 }, .system = .d1900 },
+    // The fractional part is truncated, not rounded: 43831.9 is still
+    // the 1st.
+    .{ .func = "DAY", .formula = "DAY(43831.9)", .expect = .{ .number = 1 }, .system = .d1900 },
+
+    // ── §5.4a's two invented days, read back ──
+    .{ .func = "DAY", .formula = "DAY(0)", .expect = .{ .number = 0 }, .system = .d1900, .note = "1900-01-00: a day number no calendar has" },
+    .{ .func = "MONTH", .formula = "MONTH(0)", .expect = .{ .number = 1 }, .system = .d1900 },
+    .{ .func = "YEAR", .formula = "YEAR(0)", .expect = .{ .number = 1900 }, .system = .d1900 },
+    .{ .func = "DAY", .formula = "DAY(60)", .expect = .{ .number = 29 }, .system = .d1900, .note = "1900-02-29, which never happened" },
+    .{ .func = "MONTH", .formula = "MONTH(60)", .expect = .{ .number = 2 }, .system = .d1900 },
+    .{ .func = "DAY", .formula = "DAY(59)", .expect = .{ .number = 28 }, .system = .d1900, .note = "the day before the gap" },
+    .{ .func = "DAY", .formula = "DAY(61)", .expect = .{ .number = 1 }, .system = .d1900, .note = "and the day after it: 1900-03-01" },
+    // Under 1904 the same serials are ordinary days in 1904, which is
+    // the clearest statement that the epoch is not a display setting.
+    .{ .func = "DAY", .formula = "DAY(0)", .expect = .{ .number = 1 }, .system = .d1904 },
+    .{ .func = "YEAR", .formula = "YEAR(0)", .expect = .{ .number = 1904 }, .system = .d1904 },
+
+    // ── the clock: epoch-independent by construction ──
+    .{ .func = "TIME", .formula = "TIME(13,30,0)", .expect = .{ .number = 0.5625 } },
+    .{ .func = "TIME", .formula = "TIME(0,0,0)", .expect = .{ .number = 0 } },
+    .{ .func = "TIME", .formula = "TIME(25,0,0)", .expect = .{ .number = 0.041666666666666664 }, .note = "25 hours wraps into the next day" },
+    .{ .func = "TIME", .formula = "TIME(-1,0,0)", .expect = .{ .err = .num } },
+    .{ .func = "TIME", .formula = "TIME(0,0,86400)", .expect = .{ .err = .num }, .note = "the range check is on the ARGUMENT, before the sum" },
+    .{ .func = "HOUR", .formula = "HOUR(0.5625)", .expect = .{ .number = 13 } },
+    .{ .func = "MINUTE", .formula = "MINUTE(0.5625)", .expect = .{ .number = 30 } },
+    .{ .func = "SECOND", .formula = "SECOND(0.5625)", .expect = .{ .number = 0 } },
+    .{ .func = "HOUR", .formula = "HOUR(43831.5)", .expect = .{ .number = 12 }, .note = "a serial's whole part is irrelevant to its clock" },
+    .{ .func = "SECOND", .formula = "SECOND(0.9999999)", .expect = .{ .number = 0 }, .note = "rounding reaches midnight, and 24:00:00 is not a time" },
+    .{ .func = "HOUR", .formula = "HOUR(-0.5)", .expect = .{ .err = .num } },
+    // A serial between the two maxima is a date under 1900 and out of
+    // range under 1904, and the clock has to agree with the calendar
+    // about which: `YEAR` refusing while `HOUR` answered would be two
+    // answers about one cell.
+    .{ .func = "HOUR", .formula = "HOUR(2957500.5)", .expect = .{ .number = 12 }, .system = .d1900 },
+    .{ .func = "HOUR", .formula = "HOUR(2957500.5)", .expect = .{ .err = .num }, .system = .d1904 },
+    .{ .func = "YEAR", .formula = "YEAR(2957500)", .expect = .{ .err = .num }, .system = .d1904 },
+
+    // ── WEEKDAY ──
+    .{ .func = "WEEKDAY", .formula = "WEEKDAY(43831)", .expect = .{ .number = 4 }, .system = .d1900, .note = "2020-01-01 was a Wednesday" },
+    .{ .func = "WEEKDAY", .formula = "WEEKDAY(42369)", .expect = .{ .number = 4 }, .system = .d1904 },
+    .{ .func = "WEEKDAY", .formula = "WEEKDAY(43831,2)", .expect = .{ .number = 3 }, .system = .d1900, .note = "Monday-first, one-based" },
+    .{ .func = "WEEKDAY", .formula = "WEEKDAY(43831,3)", .expect = .{ .number = 2 }, .system = .d1900, .note = "Monday-first, ZERO-based" },
+    .{ .func = "WEEKDAY", .formula = "WEEKDAY(1)", .expect = .{ .number = 1 }, .system = .d1900, .note = "Excel counts serials: serial 1 is a Sunday though 1900-01-01 was a Monday" },
+    .{ .func = "WEEKDAY", .formula = "WEEKDAY(43831,0)", .expect = .{ .err = .num } },
+    .{ .func = "WEEKDAY", .formula = "WEEKDAY(43831,18)", .expect = .{ .err = .num } },
+
+    // ── EDATE / EOMONTH ──
+    .{ .func = "EDATE", .formula = "EDATE(43831,1)", .expect = .{ .number = 43862 }, .system = .d1900 },
+    .{ .func = "EDATE", .formula = "EDATE(43831,-1)", .expect = .{ .number = 43800 }, .system = .d1900 },
+    .{ .func = "EDATE", .formula = "EDATE(43861,1)", .expect = .{ .number = 43890 }, .system = .d1900, .note = "Jan 31 + 1 month clamps to Feb 29 in a leap year" },
+    .{ .func = "EDATE", .formula = "EDATE(43831,0)", .expect = .{ .number = 43831 }, .system = .d1900 },
+    .{ .func = "EOMONTH", .formula = "EOMONTH(43831,0)", .expect = .{ .number = 43861 }, .system = .d1900 },
+    .{ .func = "EOMONTH", .formula = "EOMONTH(43831,1)", .expect = .{ .number = 43890 }, .system = .d1900, .note = "February 2020 had 29 days" },
+    .{ .func = "EOMONTH", .formula = "EOMONTH(43831,-1)", .expect = .{ .number = 43830 }, .system = .d1900 },
+
+    // ── the parses ──
+    .{ .func = "DATEVALUE", .formula = "DATEVALUE(\"2020-01-01\")", .expect = .{ .number = serial_2020_1900 }, .system = .d1900 },
+    .{ .func = "DATEVALUE", .formula = "DATEVALUE(\"2020-01-01\")", .expect = .{ .number = serial_2020_1904 }, .system = .d1904 },
+    .{ .func = "DATEVALUE", .formula = "DATEVALUE(\"1-Jan-2020\")", .expect = .{ .number = serial_2020_1900 }, .system = .d1900 },
+    .{ .func = "DATEVALUE", .formula = "DATEVALUE(\"January 15, 2020\")", .expect = .{ .number = 43845 }, .system = .d1900 },
+    .{ .func = "DATEVALUE", .formula = "DATEVALUE(\"1/15/2020\")", .expect = .{ .number = 43845 }, .system = .d1900, .note = "15 is not a month, so only one reading exists" },
+    .{ .func = "DATEVALUE", .formula = "DATEVALUE(\"hello\")", .expect = .{ .err = .value } },
+    .{ .func = "TIMEVALUE", .formula = "TIMEVALUE(\"13:30\")", .expect = .{ .number = 0.5625 } },
+    .{ .func = "TIMEVALUE", .formula = "TIMEVALUE(\"1:30 PM\")", .expect = .{ .number = 0.5625 } },
+    .{ .func = "TIMEVALUE", .formula = "TIMEVALUE(\"12:00 AM\")", .expect = .{ .number = 0 } },
+    .{ .func = "TIMEVALUE", .formula = "TIMEVALUE(\"hello\")", .expect = .{ .err = .value } },
+
+    // ── the volatiles, at a pinned instant ──
+    .{ .func = "TODAY", .formula = "TODAY()", .expect = .{ .number = serial_2020_1900 }, .system = .d1900 },
+    .{ .func = "TODAY", .formula = "TODAY()", .expect = .{ .number = serial_2020_1904 }, .system = .d1904 },
+    .{ .func = "NOW", .formula = "NOW()", .expect = .{ .number = 43831.5 }, .system = .d1900 },
+    .{ .func = "NOW", .formula = "NOW()", .expect = .{ .number = 42369.5 }, .system = .d1904 },
+};
+
+fn f1dOptions(h: *Harness, system: run_inputs.DateSystem) Options {
+    var opts = h.options();
+    opts.date_system = system;
+    opts.now_utc_ms = now_2020_noon_ms;
+    return opts;
+}
+
+test "M4g: every F1c-date fixture evaluates to what the spec says, under its epoch" {
+    for (f1d_cases) |c| {
+        const systems: []const run_inputs.DateSystem =
+            if (c.system) |s| &.{s} else &.{ .d1900, .d1904 };
+        for (systems) |system| {
+            var h: Harness = undefined;
+            try h.init(testing.allocator);
+            defer h.deinit();
+
+            const v = h.evalOpts(c.formula, f1dOptions(&h, system)) catch |e| {
+                std.debug.print("F1c-date `{s}` ({t}) refused: {t}\n", .{ c.formula, system, e });
+                return e;
+            };
+            expectValue(c.expect, v) catch |e| {
+                std.debug.print("F1c-date `{s}` ({s}, {t}): wrong value\n", .{ c.formula, c.func, system });
+                return e;
+            };
+        }
+    }
+}
+
+test "M4g: all fifteen frozen names resolve, and each has a fixture" {
+    var it = registry.inventory();
+    var batch: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4g")) continue;
+        batch += 1;
+
+        if (registry.lookup(e.name) == null) {
+            std.debug.print("F1c-date name does not resolve: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        }
+        var fixtures: usize = 0;
+        for (f1d_cases) |c| {
+            if (std.mem.eql(u8, c.func, e.name)) fixtures += 1;
+        }
+        if (fixtures == 0) {
+            std.debug.print("F1c-date name has no fixture: {s}\n", .{e.name});
+            return error.UnfixturedBatchFunction;
+        }
+    }
+    try testing.expectEqual(@as(usize, 15), batch);
+
+    for (f1d_cases) |c| {
+        var found = false;
+        var it2 = registry.inventory();
+        while (it2.next()) |e| {
+            if (std.mem.eql(u8, e.name, c.func) and std.mem.eql(u8, e.milestone, "M4g")) found = true;
+        }
+        if (!found) {
+            std.debug.print("fixture names a function outside F1c-date: {s}\n", .{c.func});
+            return error.FixtureOutsideBatch;
+        }
+    }
+}
+
+test "M4g: the evidence label on every fixture is true of the committed manifests" {
+    var oracle_rows: usize = 0;
+    var excluded_rows: usize = 0;
+    for (f1d_cases) |c| {
+        switch (try manifestVerdict(c.formula)) {
+            .decided => {
+                if (c.evidence != .oracle) return error.UnderstatedEvidence;
+                oracle_rows += 1;
+            },
+            .excluded => {
+                if (c.evidence != .spec_pinned) return error.ExcludedCellClaimedAsEvidence;
+                excluded_rows += 1;
+            },
+            .silent => {
+                if (c.evidence != .spec_pinned) return error.UnbackedOracleClaim;
+            },
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), oracle_rows);
+    try testing.expectEqual(@as(usize, 0), excluded_rows);
+}
+
+test "M4g: the epoch flag is exactly the names a date system can reach" {
+    // Registry data in both directions, as M4f did for the
+    // compatibility version. `TIME`, `HOUR`, `MINUTE` and `SECOND` are
+    // the interesting absences: a fraction of a day is the same
+    // fraction under either epoch, and flagging them would claim a
+    // dependence that does not exist.
+    const epoch = [_][]const u8{
+        "DATE",  "YEAR",    "MONTH",     "DAY",   "WEEKDAY",
+        "EDATE", "EOMONTH", "DATEVALUE", "TODAY", "NOW",
+    };
+    var it = registry.inventory();
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4g")) continue;
+        var listed = false;
+        for (epoch) |n| {
+            if (std.mem.eql(u8, n, e.name)) listed = true;
+        }
+        if (listed != registry.lookup(e.name).?.epoch_sensitive) {
+            std.debug.print("{s}: epoch_sensitive={} but the list says {}\n", .{
+                e.name,
+                registry.lookup(e.name).?.epoch_sensitive,
+                listed,
+            });
+            return error.EpochFlagMismatch;
+        }
+    }
+
+    // …and the two volatiles are the only volatile rows in the batch.
+    var it2 = registry.inventory();
+    while (it2.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4g")) continue;
+        const want: registry.Volatility = if (std.mem.eql(u8, e.name, "TODAY") or
+            std.mem.eql(u8, e.name, "NOW")) .volatile_fn else .stable;
+        try testing.expectEqual(want, registry.lookup(e.name).?.volatility);
+    }
+}
+
+test "M4g: the same serial, two epochs, two dates" {
+    // The row's headline, in one cell: serial 43831 is 2020-01-01 in a
+    // 1900 workbook and 2024-01-02 in a 1904 one. Nothing about the
+    // value changed — only what the file says it means.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+
+    try testing.expectEqual(
+        @as(f64, 2020),
+        (try h.evalOpts("YEAR(43831)", f1dOptions(&h, .d1900))).scalar.number,
+    );
+    try testing.expectEqual(
+        @as(f64, 2024),
+        (try h.evalOpts("YEAR(43831)", f1dOptions(&h, .d1904))).scalar.number,
+    );
+    // The gap between the systems is 1462 days — four years and the
+    // 1900 phantom — and it holds for every date the 1904 system can
+    // express at all. Below serial 1462 there is no 1904 counterpart:
+    // those dates precede its epoch and simply are not dates there,
+    // which is the same fact seen from the other side.
+    for ([_]f64{ 2000, 43831, 90000 }) |serial| {
+        var buf: [64]u8 = undefined;
+        const a = try std.fmt.bufPrint(&buf, "YEAR({d})*10000+MONTH({d})*100+DAY({d})", .{ serial, serial, serial });
+        const under_1900 = (try h.evalOpts(a, f1dOptions(&h, .d1900))).scalar.number;
+        var buf2: [64]u8 = undefined;
+        const b = try std.fmt.bufPrint(&buf2, "YEAR({d})*10000+MONTH({d})*100+DAY({d})", .{ serial - 1462, serial - 1462, serial - 1462 });
+        const under_1904 = (try h.evalOpts(b, f1dOptions(&h, .d1904))).scalar.number;
+        try testing.expectEqual(under_1900, under_1904);
+    }
+}
+
+test "M4g: TODAY and NOW come from RunInputs, not from a clock" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+
+    // Determinism first: the same inputs give the same answer, which is
+    // what makes a volatile function reproducible at all.
+    var opts = f1dOptions(&h, .d1900);
+    const first = (try h.evalOpts("NOW()", opts)).scalar.number;
+    const second = (try h.evalOpts("NOW()", opts)).scalar.number;
+    try testing.expectEqual(first, second);
+    try testing.expectEqual(@as(f64, 43831.5), first);
+    // TODAY is NOW floored, asserted as a relationship rather than as
+    // two independent constants.
+    try testing.expectEqual(
+        @floor(first),
+        (try h.evalOpts("TODAY()", opts)).scalar.number,
+    );
+
+    // The offset is a civil offset and moves the clock, not the epoch.
+    opts.utc_offset_min = 90;
+    try testing.expectEqual(
+        @as(f64, 43831.5 + 90.0 / 1440.0),
+        (try h.evalOpts("NOW()", opts)).scalar.number,
+    );
+
+    // …and it can move the DAY, which is the case a UTC-only engine
+    // gets wrong. 23:30 UTC plus 60 minutes is tomorrow.
+    var late = f1dOptions(&h, .d1900);
+    late.now_utc_ms = now_2020_noon_ms + 11 * 3_600_000 + 30 * 60_000; // 23:30Z
+    try testing.expectEqual(
+        @as(f64, 43831),
+        (try h.evalOpts("TODAY()", late)).scalar.number,
+    );
+    late.utc_offset_min = 60;
+    try testing.expectEqual(
+        @as(f64, 43832),
+        (try h.evalOpts("TODAY()", late)).scalar.number,
+    );
+}
+
+test "M4g: DATEVALUE refuses a locale-ordered date and errors on a non-date" {
+    // §5.4b's split, end to end. The two outcomes are different KINDS
+    // of answer — one is a refusal the caller must handle, the other is
+    // a value a formula can catch with IFERROR — and collapsing them
+    // would either hide an ambiguity or invent an error.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    const opts = f1dOptions(&h, .d1900);
+
+    try testing.expectError(
+        error.LocaleSensitiveInput,
+        h.evalOpts("DATEVALUE(\"1/2/2020\")", opts),
+    );
+    try testing.expectError(
+        error.LocaleSensitiveInput,
+        h.evalOpts("DATEVALUE(\"12-11-2020\")", opts),
+    );
+    // Unambiguous by value, in either field order.
+    try testing.expectEqual(
+        @as(f64, 43845),
+        (try h.evalOpts("DATEVALUE(\"15/1/2020\")", opts)).scalar.number,
+    );
+    // Not a date is `#VALUE!`, and IFERROR proves it is a value rather
+    // than a refusal.
+    try testing.expectEqualStrings(
+        "no",
+        (try h.evalOpts("IFERROR(DATEVALUE(\"hello\"),\"no\")", opts)).scalar.text,
+    );
+    // A refusal is NOT catchable, which is the other half of the split.
+    try testing.expectError(
+        error.LocaleSensitiveInput,
+        h.evalOpts("IFERROR(DATEVALUE(\"1/2/2020\"),\"no\")", opts),
+    );
+}
+
+test "M4g: the batch agrees across both rule tables" {
+    // Dates are integer arithmetic over a serial, so the two fidelity
+    // modes have nothing to disagree about — asserted rather than
+    // assumed, because `TIME` divides and `NOW` carries a fraction.
+    for (f1d_cases) |c| {
+        const system = c.system orelse .d1900;
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+
+        var opts_e = f1dOptions(&h, system);
+        opts_e.fidelity = .excel;
+        var opts_i = f1dOptions(&h, system);
+        opts_i.fidelity = .ieee;
+
+        const a = h.evalOpts(c.formula, opts_e) catch continue;
+        const b = try h.evalOpts(c.formula, opts_i);
+        if (a == .scalar and b == .scalar and !a.scalar.eql(b.scalar)) {
+            std.debug.print("`{s}` differs between rule tables\n", .{c.formula});
+            return error.UnexpectedFidelityDivergence;
+        }
+    }
+}
+
+test "M4g: every name against every argument shape, in both epochs" {
+    const shapes = [_][]const u8{ "43831", "0", "\"abc\"", "TRUE", "A5", "A7", "{1,2}" };
+    var checked: usize = 0;
+    for ([_]run_inputs.DateSystem{ .d1900, .d1904 }) |system| {
+        var it = registry.inventory();
+        while (it.next()) |e| {
+            if (!std.mem.eql(u8, e.milestone, "M4g")) continue;
+            const f = registry.lookup(e.name).?;
+            for (shapes) |s| {
+                var buf: [256]u8 = undefined;
+                var w: std.Io.Writer = .fixed(&buf);
+                try w.print("{s}({s}", .{ e.name, s });
+                var k: usize = 1;
+                while (k < f.arity.min) : (k += 1) try w.print(",{s}", .{s});
+                try w.writeAll(")");
+                const src = w.buffered();
+
+                var h: Harness = undefined;
+                try h.init(testing.allocator);
+                defer h.deinit();
+                try putF1cCells(&h);
+                const first = h.evalOpts(src, f1dOptions(&h, system));
+
+                var h2: Harness = undefined;
+                try h2.init(testing.allocator);
+                defer h2.deinit();
+                try putF1cCells(&h2);
+                const second = h2.evalOpts(src, f1dOptions(&h2, system));
+
+                if (first) |a| {
+                    const b = second catch return error.NondeterministicEvaluation;
+                    if (a == .scalar and b == .scalar and !a.scalar.eql(b.scalar)) {
+                        std.debug.print("`{s}` gave two answers\n", .{src});
+                        return error.NondeterministicEvaluation;
+                    }
+                } else |err| {
+                    if (second) |_| {
+                        return error.NondeterministicEvaluation;
+                    } else |err2| {
+                        if (err != err2) return error.NondeterministicEvaluation;
+                    }
+                }
+                checked += 1;
+            }
+        }
+    }
+    // Fifteen names × seven shapes × two epochs. `TODAY` and `NOW` take
+    // no arguments and refuse every shape on arity, which is itself the
+    // assertion that a zero-argument row cannot quietly grow one.
+    try testing.expectEqual(@as(usize, 15 * 7 * 2), checked);
 }
 
 // ─── boundaries and refusals ─────────────────────────────────────
