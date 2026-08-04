@@ -22,7 +22,12 @@
 
 const std = @import("std");
 const fuzz_config = @import("fuzz_config");
-pub const casefold = @import("unicode/casefold.zig");
+// Named module, not a relative import, since M4f moved the file to
+// top-level `unicode/`: `casing.zig` needs the same fold and lives in
+// the same directory, and a file belongs to exactly one module's
+// package tree. Under `src/` it belonged to `zlsx`, so every test
+// module that wanted the fold had to reach it through this re-export.
+pub const casefold = @import("zlsx_casefold");
 const coords = @import("zlsx_refs");
 const Allocator = std.mem.Allocator;
 

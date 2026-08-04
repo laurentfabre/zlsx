@@ -36,7 +36,7 @@
 const std = @import("std");
 const fuzz_config = @import("fuzz_config");
 const xlsx = @import("xlsx.zig");
-const casefold = @import("unicode/casefold.zig");
+const casefold = @import("zlsx_casefold");
 
 // B3 iter-wr-1: SST unification. Writer stages strings + rich entries
 // through the shared `SstExtensionPlan` substrate (see

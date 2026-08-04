@@ -86,9 +86,13 @@ EOF
   return 0
 }
 
-# check <generated-file> <generator-mode> <input-name> [<extra-input-name>]
+# check <generated-file> <generator-mode> <input-name> [<flag>=<input-name>...]
+#
+# Every input after the first is given as the generator flag that carries
+# it, so a mode with three inputs (casing) needs no special case here.
 check() {
-  local out_file="$1" mode="$2" primary="$3" extra="${4:-}"
+  local out_file="$1" mode="$2" primary="$3"
+  shift 3
   local version
   version=$(pinned_version "$out_file")
   if [ -z "$version" ]; then
@@ -104,14 +108,17 @@ check() {
   if [ "$rc" -eq 1 ]; then skipped=1; return 0; fi
 
   local args=(--mode "$mode" --input "$primary_path" --output "$work/regenerated.zig")
-  if [ -n "$extra" ]; then
-    local extra_path="$work/$extra"
+  local spec flag name extra_path
+  for spec in "$@"; do
+    flag="${spec%%=*}"
+    name="${spec#*=}"
+    extra_path="$work/$name"
     rc=0
-    fetch_input "$version" "$extra" "$(pinned_digest "$out_file" "$extra")" "$extra_path" || rc=$?
+    fetch_input "$version" "$name" "$(pinned_digest "$out_file" "$name")" "$extra_path" || rc=$?
     if [ "$rc" -eq 2 ]; then exit 1; fi
     if [ "$rc" -eq 1 ]; then skipped=1; return 0; fi
-    args+=(--excl "$extra_path")
-  fi
+    args+=("$flag" "$extra_path")
+  done
 
   python3 scripts/gen_unicode_tables.py "${args[@]}" >/dev/null
 
@@ -133,7 +140,7 @@ $(head -40 "$work/table.diff")
 
 Regenerate with:
   python3 scripts/gen_unicode_tables.py --mode ${mode} \\
-      --input <${primary}> ${extra:+--excl <${extra}> }--output ${out_file}
+      --input <${primary}> $(printf '%s <%s> ' "${@/=/ }")--output ${out_file}
 EOF
     exit 1
   fi
@@ -141,8 +148,10 @@ EOF
 }
 
 check unicode/tables/xid_data.zig xid DerivedCoreProperties.txt
-check src/unicode/tables/casefold_data.zig casefold CaseFolding.txt
-check unicode/tables/nfc_data.zig nfc UnicodeData.txt CompositionExclusions.txt
+check unicode/tables/casefold_data.zig casefold CaseFolding.txt
+check unicode/tables/nfc_data.zig nfc UnicodeData.txt --excl=CompositionExclusions.txt
+check unicode/tables/casing_data.zig casing UnicodeData.txt \
+  --special=SpecialCasing.txt --props=DerivedCoreProperties.txt
 
 if [ "$skipped" -eq 1 ]; then
   echo "unicode-tables: PARTIAL — at least one input could not be downloaded."

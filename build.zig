@@ -152,6 +152,32 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // A1: full case folding (Excel sheet-name dedup, `collation_v1`).
+    // M4f moved it out of `src/unicode/` and up here beside the other
+    // three, which is where the one-file-one-module-tree rule always
+    // said it belonged: inside `src/` it was part of the `zlsx` package
+    // tree, so a compilation could not hold both `zlsx` and a named
+    // module rooted on it, and `src/formula/value.zig` had to keep its
+    // fold import confined to a test block to stay buildable. Now
+    // `zlsx` imports it by name like everyone else.
+    const unicode_mod = b.createModule(.{
+        .root_source_file = b.path("unicode/casefold.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    unicode_mod.addImport("zlsx_nfc", nfc_mod);
+
+    // M4f: `casing_v1` — full Unicode casing for UPPER/LOWER, and the
+    // titlecase half M8b's PROPER will segment over. A separate module
+    // from the fold beside it because they answer different questions:
+    // `fold("ß")` is the comparison key `"ss"`, `UPPER("ß")` is the
+    // displayed value `"SS"`.
+    const casing_mod = b.createModule(.{
+        .root_source_file = b.path("unicode/casing.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // M0 (tier D1): typed coordinates — the single owner of A1 parse /
     // format and the grid bounds. Rooted at top-level `refs/` for the
     // same one-file-one-module-tree reason as `unicode/` above: its
@@ -182,6 +208,7 @@ pub fn build(b: *std.Build) void {
     zlsx_mod.addImport("zlsx_nfc", nfc_mod);
     zlsx_mod.addImport("zlsx_refs", refs_mod);
     zlsx_mod.addImport("zlsx_xid", xid_mod);
+    zlsx_mod.addImport("zlsx_casefold", unicode_mod);
 
     // Unit tests (embedded in src/xlsx.zig, including the fuzz suite).
     const unit_mod = b.createModule(.{
@@ -197,6 +224,7 @@ pub fn build(b: *std.Build) void {
     unit_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
     unit_mod.addImport("fuzz_config", fuzz_config_mod);
     unit_mod.addImport("zlsx_nfc", nfc_mod);
+    unit_mod.addImport("zlsx_casefold", unicode_mod);
     unit_mod.addImport("zlsx_refs", refs_mod);
     unit_mod.addImport("zlsx_xid", xid_mod);
     const unit_tests = b.addTest(.{ .root_module = unit_mod });
@@ -226,6 +254,7 @@ pub fn build(b: *std.Build) void {
     unit_fuzz_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
     unit_fuzz_mod.addImport("fuzz_config", fuzz_config_mod);
     unit_fuzz_mod.addImport("zlsx_nfc", nfc_mod);
+    unit_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
     unit_fuzz_mod.addImport("zlsx_refs", refs_mod);
     unit_fuzz_mod.addImport("zlsx_xid", xid_mod);
     // Zig 0.16.0 cannot compile its own test runner in `-ffuzz` mode
@@ -316,6 +345,7 @@ pub fn build(b: *std.Build) void {
     writer_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
     writer_mod.addImport("fuzz_config", fuzz_config_mod);
     writer_mod.addImport("zlsx_nfc", nfc_mod);
+    writer_mod.addImport("zlsx_casefold", unicode_mod);
     writer_mod.addImport("zlsx_refs", refs_mod);
     const writer_tests = b.addTest(.{ .root_module = writer_mod });
     test_step.dependOn(&b.addRunArtifact(writer_tests).step);
@@ -438,14 +468,16 @@ pub fn build(b: *std.Build) void {
 
     // Unicode case-fold + NFC module tests (A1: Excel sheet-name
     // dedup, wired into validateSheetName + Editor.isSheetNameTaken).
-    const unicode_mod = b.createModule(.{
-        .root_source_file = b.path("src/unicode/casefold.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    unicode_mod.addImport("zlsx_nfc", nfc_mod);
+    // The module itself is created up with `nfc_mod`, because `zlsx`
+    // now imports it by name (M4f).
     const unicode_tests = b.addTest(.{ .root_module = unicode_mod });
     test_step.dependOn(&b.addRunArtifact(unicode_tests).step);
+
+    // M4f: `casing_v1` tests — the length-changing mappings, the dotted
+    // and dotless I, Final_Sigma in all three positions, and the table
+    // invariants.
+    const casing_tests = b.addTest(.{ .root_module = casing_mod });
+    test_step.dependOn(&b.addRunArtifact(casing_tests).step);
 
     // A1 phase 3: standalone NFC tests (the casefold module imports
     // nfc.zig but has its own tests; this catches NFC bugs that

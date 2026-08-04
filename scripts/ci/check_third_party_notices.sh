@@ -68,7 +68,8 @@ check_repo() {
   local tables=(
     unicode/tables/xid_data.zig
     unicode/tables/nfc_data.zig
-    src/unicode/tables/casefold_data.zig
+    unicode/tables/casefold_data.zig
+    unicode/tables/casing_data.zig
   )
   local t
   for t in "${tables[@]}"; do
