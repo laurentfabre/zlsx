@@ -124,10 +124,10 @@ pub fn build(b: *std.Build) void {
     const fuzz_config_mod = fuzz_opts.createModule();
 
     // Unicode NFC normalizer, shared by writer/editor sheet-name
-    // validation (via src/unicode/casefold.zig) and the embedding-part
+    // validation (via unicode/casefold.zig) and the embedding-part
     // canonical hash pipeline (pkg/embedding_part.zig).
     //
-    // Rooted at top-level `unicode/` rather than `src/unicode/`
+    // Rooted at top-level `unicode/` rather than under `src/`
     // deliberately: a file may belong to exactly one module's package
     // tree, and these two consumers sit in different trees (`src/` is
     // the `zlsx` module's package dir, `pkg/` is `zlsx_pkg`'s). Anywhere
@@ -628,16 +628,18 @@ pub fn build(b: *std.Build) void {
     // coercion tables, and `collation_v1`.
     //
     // `zlsx_casefold` is imported by the TEST section of value.zig and
-    // nowhere else. `src/unicode/casefold.zig` already belongs to the
-    // `zlsx` module's package tree (`src/xlsx.zig:25` imports it
-    // relatively), so a compilation holding both `zlsx` and a named
-    // module rooted on that file would fail "file exists in modules
-    // 'zlsx' and 'zlsx_casefold'" — the collision M0 hit with `refs/`.
-    // A file-scope `const` referenced only from a `test` block is not
-    // resolved in a non-test build (verified on 0.16.0), so consumers
-    // of value.zig from M3a2 onward can build it WITHOUT declaring this
-    // import and the collision never arises. `collation_v1` takes the
-    // fold as a parameter precisely so that stays true.
+    // nowhere else — a file-scope `const` referenced only from a `test`
+    // block is not resolved in a non-test build (verified on 0.16.0),
+    // so a consumer of value.zig can build it without declaring this
+    // import. `collation_v1` takes the fold as a parameter precisely so
+    // that stays true.
+    //
+    // Until M4f the confinement was also load-bearing: the fold lived
+    // at `src/unicode/casefold.zig`, inside the `zlsx` package tree, so
+    // a compilation holding both `zlsx` and a module rooted on that file
+    // failed "file exists in modules 'zlsx' and 'zlsx_casefold'" — the
+    // collision M0 hit with `refs/`. Moving the file up here dissolved
+    // that half; the parameter stays because it is the better design.
     const formula_value_mod = b.createModule(.{
         .root_source_file = b.path("src/formula/value.zig"),
         .target = target,
@@ -989,14 +991,9 @@ pub fn build(b: *std.Build) void {
     // distinct types, and an adapter naming `env` and `symbols`
     // separately would build an `EvalEnv` the evaluator could not take.
     //
-    // It deliberately does NOT declare `zlsx_casefold` or the oracle
-    // fixtures. Those are imported by the TEST sections of `value.zig`
-    // and `symbols.zig` and are needed only in a test build rooted
-    // there; declaring them here would put `src/unicode/casefold.zig`
-    // in a compilation that also contains `zlsx` — which reaches the
-    // same file by relative import — and "file exists in modules 'zlsx'
-    // and 'zlsx_casefold'" is the collision that moved `unicode/` to the
-    // top level in the first place.
+    // It deliberately does NOT declare the oracle fixtures: they are
+    // imported by the TEST sections of `value.zig` and `symbols.zig` and
+    // are needed only in a test build rooted there.
     const formula_pkg_mod = b.createModule(.{
         .root_source_file = b.path("src/formula/symbols.zig"),
         .target = target,
@@ -1004,6 +1001,11 @@ pub fn build(b: *std.Build) void {
     });
     formula_pkg_mod.addImport("zlsx_refs", refs_mod);
     formula_pkg_mod.addImport("zlsx_xid", xid_mod);
+    // M4f: the package-facing formula module reaches `registry.zig`,
+    // which now calls `casing_v1` for UPPER and LOWER. Unlike the fold,
+    // this one cannot be confined to a test block — it is what two
+    // shipped functions compute with.
+    formula_pkg_mod.addImport("zlsx_casing", casing_mod);
     // `src/xlsx.zig` re-exports the rewriter from here rather than by
     // relative path: `rewriter.zig` and the engine module both contain
     // `tokenizer.zig`, and a file may belong to only one module. Wired

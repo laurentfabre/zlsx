@@ -26,7 +26,8 @@ the gate; it fails the build if any of them stops carrying it.
 |---|---|---|
 | `unicode/tables/xid_data.zig` | `XID_Start`, `XID_Continue` from `DerivedCoreProperties.txt` | `unicode/xid.zig` — formula identifier grammar |
 | `unicode/tables/nfc_data.zig` | canonical decompositions, combining classes, composition exclusions from `UnicodeData.txt` + `CompositionExclusions.txt` | `unicode/nfc.zig` — NFC normalization |
-| `src/unicode/tables/casefold_data.zig` | full case folding (statuses C + F) from `CaseFolding.txt` | `src/unicode/casefold.zig` — sheet-name comparison |
+| `unicode/tables/casefold_data.zig` | full case folding (statuses C + F) from `CaseFolding.txt` | `unicode/casefold.zig` — sheet-name comparison, `collation_v1` |
+| `unicode/tables/casing_data.zig` | full upper/lower/title mappings from `UnicodeData.txt` + unconditional `SpecialCasing.txt`, plus `Cased` and `Case_Ignorable` from `DerivedCoreProperties.txt` | `unicode/casing.zig` — `casing_v1`, the `UPPER`/`LOWER` functions |
 
 Each generated file pins its Unicode version and the SHA-256 of every
 input in its header. `scripts/gen_unicode_tables.py` regenerates them;

@@ -248,6 +248,15 @@ pub const Function = struct {
     platform_sensitive: bool = false,
     /// Depends on a §5.4d compatibility version.
     cv_sensitive: bool = false,
+    /// §5.4b's match policy. `.folded` is the default because the
+    /// comparator is: `=`, `SEARCH` and every wildcard consumer fold
+    /// before they compare. `.raw` is the exception a function has to
+    /// declare — `FIND`, `SUBSTITUTE`, `EXACT` and `CODE` are
+    /// case-SENSITIVE, and the pair `FIND`/`SEARCH` exists precisely so
+    /// a user can choose. Explicit registry data rather than a comment,
+    /// because it is what a later collation change reads to know what it
+    /// does not affect.
+    match_policy: value.MatchPolicy = .folded,
 
     /// Whether an array in a scalar slot may be iterated elementwise.
     /// Mixed signatures (a range slot beside a scalar one) are M7a's
@@ -272,6 +281,16 @@ const none_c = [_]CoercionClass{};
 // thing to get wrong.
 const num1 = [_]CoercionClass{.number};
 const num2 = [_]CoercionClass{ .number, .number };
+
+// F1c-text's signatures. Same reason as F1a-2's above: named once, so
+// "this slot is the text and that one is the count" is one thing to
+// read.
+const eager3 = [_]Laziness{ .eager, .eager, .eager };
+const text1 = [_]CoercionClass{.text};
+const text2 = [_]CoercionClass{ .text, .text };
+const text_num = [_]CoercionClass{ .text, .number };
+const text_num_num = [_]CoercionClass{ .text, .number, .number };
+const text_text_num = [_]CoercionClass{ .text, .text, .number };
 
 pub const functions = [_]Function{
     // ── zero-argument literals and the volatile probe ──
@@ -840,6 +859,219 @@ pub const functions = [_]Function{
         .volatility = .stable,
         .propagation = .propagate,
         .impl = fnColumns,
+    },
+
+    // ── M4f / F1c-text: nineteen names, and the first rows whose
+    //    answer depends on what a *character* is (§5.4d). The
+    //    `cv_sensitive` flag marks the seven that count or index in
+    //    units; the rest operate on whole strings and cannot tell the
+    //    two versions apart. ──
+    .{
+        .name = "LEN",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &text1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .cv_sensitive = true,
+        .impl = fnLen,
+    },
+    .{
+        .name = "LEFT",
+        .arity = .{ .min = 1, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &text_num, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .cv_sensitive = true,
+        .impl = fnLeft,
+    },
+    .{
+        .name = "RIGHT",
+        .arity = .{ .min = 1, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &text_num, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .cv_sensitive = true,
+        .impl = fnRight,
+    },
+    .{
+        .name = "MID",
+        .arity = .{ .min = 3, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &text_num_num, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .cv_sensitive = true,
+        .impl = fnMid,
+    },
+    .{
+        .name = "REPLACE",
+        .arity = .{
+            .min = 4,
+            .max = 4,
+            .fixed = &[_]Laziness{ .eager, .eager, .eager, .eager },
+            .rest = &none_l,
+        },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .text, .number, .number, .text },
+            .rest = &none_c,
+        },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .cv_sensitive = true,
+        .impl = fnReplace,
+    },
+    .{
+        .name = "FIND",
+        .arity = .{ .min = 2, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &text_text_num, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .cv_sensitive = true,
+        // Case-sensitive and wildcard-free. `FIND` and `SEARCH` are the
+        // same question asked two ways, and this field is the difference.
+        .match_policy = .raw,
+        .impl = fnFind,
+    },
+    .{
+        .name = "SEARCH",
+        .arity = .{ .min = 2, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &text_text_num, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .cv_sensitive = true,
+        .collation_sensitive = true,
+        .match_policy = .folded,
+        .impl = fnSearch,
+    },
+
+    // ── whole-string operations: no index, so no compatibility
+    //    version can reach them. ──
+    .{
+        .name = "UPPER",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &text1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnUpper,
+    },
+    .{
+        .name = "LOWER",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &text1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnLower,
+    },
+    .{
+        .name = "TRIM",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &text1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnTrim,
+    },
+    .{
+        .name = "EXACT",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &text2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        // The whole point of `EXACT`: it is the one comparison in the
+        // language that does NOT fold.
+        .match_policy = .raw,
+        .impl = fnExact,
+    },
+    .{
+        .name = "SUBSTITUTE",
+        .arity = .{
+            .min = 3,
+            .max = 4,
+            .fixed = &[_]Laziness{ .eager, .eager, .eager, .eager },
+            .rest = &none_l,
+        },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .text, .text, .text, .number },
+            .rest = &none_c,
+        },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .match_policy = .raw,
+        .impl = fnSubstitute,
+    },
+    .{
+        .name = "REPT",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &text_num, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnRept,
+    },
+    .{
+        .name = "VALUE",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &text1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnValue,
+    },
+    .{
+        .name = "CHAR",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &num1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .platform_sensitive = true,
+        .impl = fnChar,
+    },
+    .{
+        .name = "CODE",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &text1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .platform_sensitive = true,
+        // A code page position is a byte, not a comparison: folding
+        // first would make `CODE("a")` and `CODE("A")` the same number.
+        .match_policy = .raw,
+        .impl = fnCode,
+    },
+
+    // ── joining: `CONCAT` and `TEXTJOIN` take ranges, `CONCATENATE`
+    //    does not. That is the whole difference between the first and
+    //    the third, and it is a coercion class rather than a comment. ──
+    .{
+        .name = "CONCAT",
+        .arity = .{ .min = 1, .max = null, .fixed = &eager1, .rest = &eager1 },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{.aggregate},
+            .rest = &[_]CoercionClass{.aggregate},
+        },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnConcat,
+    },
+    .{
+        .name = "CONCATENATE",
+        .arity = .{ .min = 1, .max = null, .fixed = &eager1, .rest = &eager1 },
+        .coercion = .{ .fixed = &text1, .rest = &text1 },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnConcatenate,
+    },
+    .{
+        .name = "TEXTJOIN",
+        .arity = .{
+            .min = 3,
+            .max = null,
+            .fixed = &[_]Laziness{ .eager, .eager, .eager },
+            .rest = &eager1,
+        },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .text, .logical, .aggregate },
+            .rest = &[_]CoercionClass{.aggregate},
+        },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnTextJoin,
     },
 
     // ── the lazy forms. No `impl`: deferring an arm means holding an
@@ -2358,6 +2590,474 @@ pub fn inInventory(name: []const u8) bool {
         if (std.mem.eql(u8, e.name, name)) return true;
     }
     return false;
+}
+
+// ─── M4f / F1c-text: the implementations ─────────────────────────
+
+/// §9's cell-text cap, in **code points** — not index units, so the two
+/// compatibility versions agree about where it is.
+///
+/// Producing longer text is an Excel-DOMAIN rule, not a refusal: Excel's
+/// own `REPT` answers `#VALUE!` past this length, which is a successful
+/// error value a formula can catch with `IFERROR`. A typed refusal here
+/// would turn a workbook Excel opens into one zlsx will not evaluate.
+const max_cell_text_code_points: usize = 32_767;
+
+/// The one way produced text leaves this batch. Slicing functions do not
+/// come through it — a slice cannot be longer than what it was cut from
+/// — but everything that GROWS a string does, including the `&` operator,
+/// which reaches this through `cappedText`.
+fn producedText(s: []const u8) Value {
+    return .{ .scalar = cappedText(s) };
+}
+
+/// The cap as a scalar, for the evaluator's `&`. Public because the
+/// operator is the evaluator's and the rule is this batch's, and the
+/// alternative is two places that both know what 32 767 means.
+pub fn cappedText(s: []const u8) value.ScalarValue {
+    if (codePointCount(s) > max_cell_text_code_points) {
+        return value.ScalarValue.errorOf(.value);
+    }
+    return .{ .text = s };
+}
+
+fn codePointCount(s: []const u8) usize {
+    // Invalid UTF-8 counts by bytes, the same total answer `text.zig`
+    // and `criteria.fold` give it.
+    return std.unicode.utf8CountCodepoints(s) catch s.len;
+}
+
+/// The text a `.text` slot was coerced to. The mirror of `numArg`: the
+/// dispatcher already ran §5.3b's text column, so an implementation that
+/// re-derived it would be deciding `TRUE` prints as `"TRUE"` twice.
+fn textArg(args: []const Value, i: usize) []const u8 {
+    const s = args[i].scalar;
+    assert(s == .text);
+    return s.text;
+}
+
+/// A count or position argument. Excel truncates a fractional one toward
+/// zero — `LEFT("abcd",2.9)` is `"ab"` — and answers `#VALUE!` for a
+/// negative one. Null means that `#VALUE!`.
+fn countOf(x: f64) ?usize {
+    if (x < 0) return null;
+    const t = @trunc(x);
+    // Any count past the largest string is the whole string, and every
+    // caller clamps, so saturating here costs nothing and keeps the
+    // conversion total.
+    if (t >= @as(f64, @floatFromInt(std.math.maxInt(u32)))) return std.math.maxInt(u32);
+    return @intFromFloat(t);
+}
+
+/// An optional trailing numeric argument. `LEFT(a,)` is not `LEFT(a)`:
+/// the omitted argument became blank and then 0, and Excel agrees.
+fn optNum(args: []const Value, i: usize, absent: f64) f64 {
+    if (args.len <= i) return absent;
+    return numArg(args, i);
+}
+
+/// Cut `count` units from `start`, converting §5.4d's one
+/// unrepresentable case into the typed refusal it is.
+fn sliceUnits(ctx: CallCtx, s: []const u8, start: usize, count: usize) FnError!Value {
+    const out = text.sliceUnits(ctx.cv(), s, start, count) catch |e| switch (e) {
+        error.SplitSurrogate => return error.ResultNotRepresentable,
+    };
+    return .{ .scalar = .{ .text = out } };
+}
+
+fn fnLen(ctx: CallCtx, args: []const Value) FnError!Value {
+    return Value.num(@floatFromInt(text.unitLen(ctx.cv(), textArg(args, 0))));
+}
+
+fn fnLeft(ctx: CallCtx, args: []const Value) FnError!Value {
+    const n = countOf(optNum(args, 1, 1)) orelse return Value.err(.value);
+    return sliceUnits(ctx, textArg(args, 0), 0, n);
+}
+
+fn fnRight(ctx: CallCtx, args: []const Value) FnError!Value {
+    const s = textArg(args, 0);
+    const n = countOf(optNum(args, 1, 1)) orelse return Value.err(.value);
+    const total = text.unitLen(ctx.cv(), s);
+    // Asking for more than there is yields all of it rather than
+    // underflowing the start position.
+    const start = if (n >= total) 0 else total - n;
+    return sliceUnits(ctx, s, start, n);
+}
+
+fn fnMid(ctx: CallCtx, args: []const Value) FnError!Value {
+    const s = textArg(args, 0);
+    // The 1-based start is checked BEFORE truncation, which is what
+    // makes `MID(s,0.5,1)` `#VALUE!` and `MID(s,1.5,1)` the first
+    // character.
+    const start_1 = numArg(args, 1);
+    if (start_1 < 1) return Value.err(.value);
+    const n = countOf(numArg(args, 2)) orelse return Value.err(.value);
+    const start = (countOf(start_1) orelse unreachable) - 1;
+    return sliceUnits(ctx, s, start, n);
+}
+
+fn fnReplace(ctx: CallCtx, args: []const Value) FnError!Value {
+    const old = textArg(args, 0);
+    const start_1 = numArg(args, 1);
+    if (start_1 < 1) return Value.err(.value);
+    const count = countOf(numArg(args, 2)) orelse return Value.err(.value);
+    const new = textArg(args, 3);
+    const start = (countOf(start_1) orelse unreachable) - 1;
+
+    const head_end = text.byteOfUnit(ctx.cv(), old, start) catch
+        return error.ResultNotRepresentable;
+    const tail_start = text.byteOfUnit(ctx.cv(), old, start +| count) catch
+        return error.ResultNotRepresentable;
+
+    const out = try std.mem.concat(ctx.arena(), u8, &.{
+        old[0..head_end],
+        new,
+        old[tail_start..],
+    });
+    return producedText(out);
+}
+
+fn fnFind(ctx: CallCtx, args: []const Value) FnError!Value {
+    const needle = textArg(args, 0);
+    const hay = textArg(args, 1);
+    const start_1 = optNum(args, 2, 1);
+    if (start_1 < 1) return Value.err(.value);
+    const start = (countOf(start_1) orelse unreachable) - 1;
+    if (start > text.unitLen(ctx.cv(), hay)) return Value.err(.value);
+
+    const from = text.byteOfUnit(ctx.cv(), hay, start) catch
+        return error.ResultNotRepresentable;
+    // A raw byte search, and it is exact rather than approximate: UTF-8
+    // is self-synchronizing, so a valid needle can only ever match on a
+    // character boundary of a valid haystack.
+    const at = std.mem.indexOfPos(u8, hay, from, needle) orelse
+        return Value.err(.value);
+    return Value.num(@floatFromInt(text.unitOfByte(ctx.cv(), hay, at) + 1));
+}
+
+fn fnSearch(ctx: CallCtx, args: []const Value) FnError!Value {
+    const needle = textArg(args, 0);
+    const hay = textArg(args, 1);
+    const start_1 = optNum(args, 2, 1);
+    if (start_1 < 1) return Value.err(.value);
+    const start = (countOf(start_1) orelse unreachable) - 1;
+    if (start > text.unitLen(ctx.cv(), hay)) return Value.err(.value);
+
+    // Units in, code points through the matcher, units out: the fold's
+    // positional map is keyed by code point and cannot be keyed by
+    // anything else, since a compatibility version is not a property of
+    // a string.
+    const from_cp = text.codePointOfUnit(ctx.cv(), hay, start);
+    const cx: criteria.Context = .{
+        .allocator = ctx.arena(),
+        .collation = ctx.collation(),
+        .fidelity = ctx.fidelity(),
+    };
+    const hit = criteria.searchText(cx, needle, hay, from_cp) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return Value.err(.value),
+    };
+    const cp = hit orelse return Value.err(.value);
+    return Value.num(@floatFromInt(text.unitOfCodePoint(ctx.cv(), hay, cp) + 1));
+}
+
+fn fnUpper(ctx: CallCtx, args: []const Value) FnError!Value {
+    return producedText(try casing.toUpper(ctx.arena(), textArg(args, 0)));
+}
+
+fn fnLower(ctx: CallCtx, args: []const Value) FnError!Value {
+    return producedText(try casing.toLower(ctx.arena(), textArg(args, 0)));
+}
+
+fn fnTrim(ctx: CallCtx, args: []const Value) FnError!Value {
+    const s = textArg(args, 0);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.ensureTotalCapacity(ctx.arena(), s.len);
+
+    // Excel's `TRIM` is about the SPACE character (0x20) and nothing
+    // else: a tab, a newline and a non-breaking space all survive it,
+    // which is why `CLEAN` exists separately (M8c). Bytes are enough —
+    // 0x20 cannot occur inside a multi-byte UTF-8 sequence.
+    var i: usize = 0;
+    var pending_gap = false;
+    var wrote_any = false;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == ' ') {
+            pending_gap = wrote_any;
+            continue;
+        }
+        if (pending_gap) {
+            try out.append(ctx.arena(), ' ');
+            pending_gap = false;
+        }
+        try out.append(ctx.arena(), s[i]);
+        wrote_any = true;
+    }
+    return .{ .scalar = .{ .text = try out.toOwnedSlice(ctx.arena()) } };
+}
+
+fn fnExact(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    // Byte equality, deliberately not `collation_v1`: `EXACT` is the one
+    // text comparison in the language that distinguishes case, and it
+    // does not normalize either — `"café"` precomposed and decomposed
+    // are different strings here, as they are everywhere else in §5.4b.
+    return Value.boolean(std.mem.eql(u8, textArg(args, 0), textArg(args, 1)));
+}
+
+fn fnSubstitute(ctx: CallCtx, args: []const Value) FnError!Value {
+    const s = textArg(args, 0);
+    const old = textArg(args, 1);
+    const new = textArg(args, 2);
+    // Which occurrence, if the caller named one. Excel counts from 1 and
+    // answers `#VALUE!` for 0 or less.
+    const which: ?usize = if (args.len >= 4) blk: {
+        const n = numArg(args, 3);
+        if (n < 1) return Value.err(.value);
+        break :blk countOf(n) orelse unreachable;
+    } else null;
+
+    // Replacing the empty string would match everywhere and terminate
+    // nowhere; Excel returns the text untouched.
+    if (old.len == 0) return .{ .scalar = .{ .text = s } };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.ensureTotalCapacity(ctx.arena(), s.len);
+    var i: usize = 0;
+    var seen: usize = 0;
+    while (std.mem.indexOfPos(u8, s, i, old)) |at| {
+        seen += 1;
+        try out.appendSlice(ctx.arena(), s[i..at]);
+        if (which == null or which.? == seen) {
+            try out.appendSlice(ctx.arena(), new);
+        } else {
+            try out.appendSlice(ctx.arena(), old);
+        }
+        i = at + old.len;
+    }
+    try out.appendSlice(ctx.arena(), s[i..]);
+    return producedText(try out.toOwnedSlice(ctx.arena()));
+}
+
+fn fnRept(ctx: CallCtx, args: []const Value) FnError!Value {
+    const s = textArg(args, 0);
+    const n = countOf(numArg(args, 1)) orelse return Value.err(.value);
+    if (n == 0 or s.len == 0) return .{ .scalar = .{ .text = "" } };
+
+    // The length check happens BEFORE the allocation, not after it:
+    // `REPT("x",1e9)` is `#VALUE!` in Excel, and reaching that answer by
+    // way of a gigabyte would be a §9 limit pretending to be a formula
+    // result.
+    const per = codePointCount(s);
+    if (per * n > max_cell_text_code_points) return Value.err(.value);
+
+    const out = try ctx.arena().alloc(u8, s.len * n);
+    var i: usize = 0;
+    while (i < n) : (i += 1) @memcpy(out[i * s.len ..][0..s.len], s);
+    return .{ .scalar = .{ .text = out } };
+}
+
+fn fnValue(ctx: CallCtx, args: []const Value) FnError!Value {
+    // §5.4b names `VALUE` a locale-sensitive PARSE, and §5.3b already
+    // splits text three ways for exactly this: a number, a `#VALUE!`,
+    // and text that parses only under some locale. The third is a typed
+    // refusal rather than a guess — `VALUE("1,5")` is 1.5 in Germany and
+    // 15 in the United States, and zlsx has no locale to pick with.
+    return switch (value.coerceToNumber(args[0].scalar, ctx.fidelity(), .text_coercion)) {
+        .number => |n| arith(n),
+        .value => |v| .{ .scalar = v },
+        .locale_refusal => error.LocaleSensitiveInput,
+    };
+}
+
+fn fnChar(ctx: CallCtx, args: []const Value) FnError!Value {
+    const n = numArg(args, 0);
+    const code = countOf(n) orelse return Value.err(.value);
+    // Excel's range is 1..255. Zero is `#VALUE!` rather than NUL: a
+    // string cannot hold it in a workbook either.
+    if (code < 1 or code > 255) return Value.err(.value);
+    const cp = codePageDecode(ctx.platformProfile(), @intCast(code));
+    var buf: [4]u8 = undefined;
+    const len = std.unicode.utf8Encode(cp, &buf) catch unreachable;
+    const out = try ctx.arena().dupe(u8, buf[0..len]);
+    return .{ .scalar = .{ .text = out } };
+}
+
+fn fnCode(ctx: CallCtx, args: []const Value) FnError!Value {
+    const s = textArg(args, 0);
+    if (s.len == 0) return Value.err(.value);
+    const seq_len = std.unicode.utf8ByteSequenceLength(s[0]) catch 1;
+    const cp: u21 = if (seq_len <= s.len)
+        std.unicode.utf8Decode(s[0..seq_len]) catch s[0]
+    else
+        s[0];
+    return Value.num(@floatFromInt(codePageEncode(ctx.platformProfile(), cp)));
+}
+
+// ── the code page (§5.4b) ──
+
+/// Windows-1252's five positions that are not Latin-1 and not defined
+/// either way in the code page: 0x81, 0x8D, 0x8F, 0x90, 0x9D. They map
+/// to the matching C1 control, which is what Windows itself does with
+/// them.
+const cp1252_high = [32]u21{
+    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+    0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
+};
+
+fn codePageDecode(profile: run_inputs.PlatformProfile, code: u8) u21 {
+    return switch (profile) {
+        .windows_1252 => if (code >= 0x80 and code <= 0x9F)
+            cp1252_high[code - 0x80]
+        else
+            code,
+    };
+}
+
+/// The inverse, with Excel's substitution for anything the code page
+/// cannot name: 63, the code of `?`. `CODE` reports a position in a
+/// 256-entry table, so a character outside it has no number to report —
+/// `UNICODE` (M8c) is the function that answers the other question.
+fn codePageEncode(profile: run_inputs.PlatformProfile, cp: u21) u8 {
+    switch (profile) {
+        .windows_1252 => {
+            if (cp < 0x80 or (cp >= 0xA0 and cp <= 0xFF)) return @intCast(cp);
+            for (cp1252_high, 0..) |mapped, i| {
+                if (mapped == cp) return @intCast(0x80 + i);
+            }
+            return '?';
+        },
+    }
+}
+
+// ── joining ──
+
+/// `CONCAT` and `TEXTJOIN` share one accumulator because they differ in
+/// exactly two ways — a delimiter and whether empties count — and a
+/// second walk would be a second answer to "what does a range
+/// contribute".
+const JoinAcc = struct {
+    ctx: CallCtx,
+    out: std.ArrayListUnmanaged(u8) = .empty,
+    delimiter: []const u8 = "",
+    skip_empty: bool = false,
+    wrote_any: bool = false,
+    failed: ?value.ScalarValue = null,
+    overflowed: bool = false,
+
+    /// The largest a within-cap result can possibly be: 32 767 code
+    /// points at four bytes each. Past it the answer is `#VALUE!`
+    /// whatever comes next, which is what lets a dense walk over a whole
+    /// column stop rather than emit a million delimiters.
+    const byte_ceiling = max_cell_text_code_points * 4;
+
+    fn visit(self: *JoinAcc, s: value.ScalarValue, via_range: bool) FnError!bool {
+        _ = via_range;
+        if (s == .err) {
+            // An error anywhere in the arguments — including inside a
+            // range — is the answer. Joining around it would hide it.
+            self.failed = s;
+            return false;
+        }
+        const t = try self.ctx.ev.toText(s);
+        if (self.skip_empty and t.len == 0) return true;
+        if (self.wrote_any and self.delimiter.len > 0) {
+            try self.out.appendSlice(self.ctx.arena(), self.delimiter);
+        }
+        try self.out.appendSlice(self.ctx.arena(), t);
+        self.wrote_any = true;
+        if (self.out.items.len > byte_ceiling) {
+            self.overflowed = true;
+            return false;
+        }
+        return true;
+    }
+
+    fn finish(self: *JoinAcc) FnError!Value {
+        if (self.failed) |f| return .{ .scalar = f };
+        if (self.overflowed) return Value.err(.value);
+        return producedText(try self.out.toOwnedSlice(self.ctx.arena()));
+    }
+};
+
+fn fnConcat(ctx: CallCtx, args: []const Value) FnError!Value {
+    // Sparse: `CONCAT` contributes nothing for a blank, so the blanks a
+    // sparse walk never yields would have contributed nothing anyway.
+    var acc: JoinAcc = .{ .ctx = ctx };
+    try visitArgs(ctx, args, &acc);
+    return acc.finish();
+}
+
+/// Walk arguments the way `visitArgs` does, except that a reference is
+/// walked **densely** — every coordinate in the area, blanks included.
+///
+/// §5.6a's sparse iteration is right for every aggregate M4e shipped,
+/// because none of them can tell a blank from an absence. `TEXTJOIN`
+/// with `ignore_empty` false is the first function in the ladder that
+/// can: each blank is an empty field, so skipping one silently drops a
+/// delimiter and shifts everything after it. The walk is bounded not by
+/// the area but by the accumulator, which stops as soon as the result
+/// cannot come in under §9's cap.
+fn visitArgsDense(ctx: CallCtx, args: []const Value, acc: *JoinAcc) FnError!void {
+    for (args) |a| switch (a) {
+        .missing_arg => {
+            if (!try acc.visit(.blank, false)) return;
+        },
+        .scalar => |s| {
+            if (!try acc.visit(s, false)) return;
+        },
+        .array => |m| for (m.cells) |s| {
+            if (!try acc.visit(s, true)) return;
+        },
+        .reference => |r| for (r.areas) |area| {
+            var it = try ctx.ev.readRange(area);
+            var expected: u64 = 0;
+            while (try it.next()) |e| {
+                // The sparse iterator yields stored cells in row-major
+                // order, so the gap between where it is and where it
+                // should be is exactly the run of blanks to emit.
+                const at = area.offsetOf(e.row, e.col) orelse continue;
+                while (expected < at) : (expected += 1) {
+                    if (!try acc.visit(.blank, true)) return;
+                }
+                if (!try acc.visit(e.value, true)) return;
+                expected = at + 1;
+            }
+            while (expected < area.cellCount()) : (expected += 1) {
+                if (!try acc.visit(.blank, true)) return;
+            }
+        },
+    };
+}
+
+fn fnConcatenate(ctx: CallCtx, args: []const Value) FnError!Value {
+    // Every slot is `.text`, so the arguments arrived already coerced
+    // and a range in one of them was intersected or lifted on the way —
+    // which is the documented difference from `CONCAT`, and the reason
+    // this one does not walk ranges.
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    for (args, 0..) |_, i| try out.appendSlice(ctx.arena(), textArg(args, i));
+    return producedText(try out.toOwnedSlice(ctx.arena()));
+}
+
+fn fnTextJoin(ctx: CallCtx, args: []const Value) FnError!Value {
+    const skip_empty = args[1].scalar.boolean;
+    var acc: JoinAcc = .{
+        .ctx = ctx,
+        .delimiter = textArg(args, 0),
+        .skip_empty = skip_empty,
+    };
+    // The flag decides which walk, because it decides whether a blank is
+    // observable: skipping empties makes a blank and an absence the same
+    // thing again, and a sparse walk is then both correct and cheaper.
+    if (skip_empty) {
+        try visitArgs(ctx, args[2..], &acc);
+    } else {
+        try visitArgsDense(ctx, args[2..], &acc);
+    }
+    return acc.finish();
 }
 
 // ─── tests ───────────────────────────────────────────────────────

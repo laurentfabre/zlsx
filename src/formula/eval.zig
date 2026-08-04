@@ -56,6 +56,11 @@ const value = @import("value.zig");
 const env = @import("env.zig");
 const registry = @import("registry.zig");
 const run_inputs = @import("run_inputs.zig");
+/// Test-only, for M4f: the ST_Xstring codec, so a round-trip can start
+/// from text a formula PRODUCED rather than from a hand-written string.
+/// A file-scope const referenced only from a `test` block is not
+/// resolved in a non-test build, so this costs a plain build nothing.
+const decode = @import("decode.zig");
 /// §5.9's resolution drivers and §5.6g's 3D matrix. The evaluator asks
 /// this file *what the rule is* and never restates one; the symbol
 /// layer that implements the tiers imports it too, which is why the
@@ -1080,7 +1085,13 @@ pub const Evaluator = struct {
                 const out = try self.allocText(x.len + y.len);
                 @memcpy(out[0..x.len], x);
                 @memcpy(out[x.len..], y);
-                return .{ .text = out };
+                // §9's cell-text cap applies to text a FORMULA produced,
+                // whichever construct produced it. Before M4f no formula
+                // could reach it — a literal is bounded by the 8 192-byte
+                // formula length — but `REPT` can, and `&` is how two of
+                // them are put together. A cap `CONCAT` enforced and `&`
+                // did not would be one rule with two answers.
+                return registry.cappedText(out);
             },
             .eq, .ne, .lt, .gt, .le, .ge => {
                 const ord = try self.compare(a, b);
@@ -1111,7 +1122,11 @@ pub const Evaluator = struct {
         };
     }
 
-    fn toText(self: *Evaluator, s: value.ScalarValue) EvalError![]const u8 {
+    /// Public since M4f: `CONCAT` and `TEXTJOIN` walk ranges themselves,
+    /// so they need the same "what does this value look like as text"
+    /// rule the dispatcher applies to a `.text` slot. A second copy in
+    /// the registry would be a second answer to how `TRUE` prints.
+    pub fn toText(self: *Evaluator, s: value.ScalarValue) EvalError![]const u8 {
         return switch (s) {
             .text => |t| t,
             .blank => "",
@@ -5147,6 +5162,588 @@ test "M4e: every name against every argument shape, exhaustively and in both mod
     // A sweep that silently stopped enumerating would still pass, so
     // the count is asserted as a floor rather than left to the loops.
     try testing.expect(checked > 20_000);
+}
+
+// ─── M4f: the F1c-text batch (§7, nineteen names) ────────────────
+//
+// Oracle-first, and — as at M4c, M4d and M4e — the three committed
+// manifests decide nothing here: §8.2's evidence is eighteen operator
+// and literal cells plus `SQRT(-1)`, and no text name appears in any of
+// them. So the batch ships `spec_pinned`, its oracle-row count is pinned
+// at **zero**, and the same three-valued checker guards it.
+//
+// What is different about this row is that a fixture is not fully
+// specified by a formula and a result any more. Two of them can hold at
+// once — `LEN("😀")` is 2 under CV1 and 1 under CV2, and both are
+// right — so the case carries the compatibility version it was written
+// for, and the version-free cases are asserted under BOTH.
+
+/// One F1c fixture. `cv` is null for the majority of rows, which mean
+/// the same thing under either version and are run under both.
+const F1cCase = struct {
+    func: []const u8,
+    formula: []const u8,
+    expect: Expect,
+    cv: ?run_inputs.CompatibilityVersion = null,
+    evidence: Evidence = .spec_pinned,
+    note: []const u8 = "",
+};
+
+/// The environment every F1c fixture reads.
+fn putF1cCells(h: *Harness) !void {
+    // §5.3b's provenance column again, cell for cell with M4c/M4d/M4e,
+    // so a text function's coercion can be compared against the same
+    // table the numeric batches were.
+    try h.put("A1", num(10));
+    try h.put("A2", .{ .text = "abc" });
+    try h.put("A3", .{ .text = "" });
+    try h.put("A4", .{ .boolean = true });
+    try h.put("A5", value.ScalarValue.errorOf(.div0));
+    // A7 is a true blank — deliberately not stored.
+    try h.put("A8", .{ .text = "7" });
+
+    // A column to join, holding one of each thing a range can hold.
+    try h.put("C1", .{ .text = "a" });
+    try h.put("C2", .{ .text = "b" });
+    // C3 is blank, which CONCAT contributes nothing for and TEXTJOIN
+    // skips only when asked to.
+    try h.put("C4", num(3));
+
+    // The astral cell: one code point, two UTF-16 code units. Every
+    // per-version fixture in the table reads it.
+    try h.put("E1", .{ .text = "a\u{1F600}b" });
+    // The length-changing casing cell.
+    try h.put("E2", .{ .text = "Straße" });
+    // A cell whose fold expands, for SEARCH's positional map.
+    try h.put("E3", .{ .text = "aßb" });
+}
+
+const f1c_cases = [_]F1cCase{
+    // ── LEN: the function the compatibility version is about ──
+    .{ .func = "LEN", .formula = "LEN(\"hello\")", .expect = .{ .number = 5 } },
+    .{ .func = "LEN", .formula = "LEN(\"\")", .expect = .{ .number = 0 } },
+    // Blank is the empty string to a text slot, not an error.
+    .{ .func = "LEN", .formula = "LEN(A7)", .expect = .{ .number = 0 } },
+    // A number coerces through §5.3b's text column before it is
+    // measured: `LEN(10)` is 2, not `#VALUE!`.
+    .{ .func = "LEN", .formula = "LEN(A1)", .expect = .{ .number = 2 } },
+    .{ .func = "LEN", .formula = "LEN(A4)", .expect = .{ .number = 4 }, .note = "TRUE prints as four characters" },
+    .{ .func = "LEN", .formula = "LEN(\"café\")", .expect = .{ .number = 4 }, .note = "characters, not the five bytes" },
+    .{ .func = "LEN", .formula = "LEN(E1)", .expect = .{ .number = 4 }, .cv = .cv1 },
+    .{ .func = "LEN", .formula = "LEN(E1)", .expect = .{ .number = 3 }, .cv = .cv2 },
+    // Not grapheme clustering, under either version.
+    .{ .func = "LEN", .formula = "LEN(\"e\u{0301}\")", .expect = .{ .number = 2 } },
+
+    // ── LEFT / RIGHT / MID ──
+    .{ .func = "LEFT", .formula = "LEFT(\"hello\",2)", .expect = .{ .text = "he" } },
+    .{ .func = "LEFT", .formula = "LEFT(\"hello\")", .expect = .{ .text = "h" }, .note = "the omitted count is 1" },
+    .{ .func = "LEFT", .formula = "LEFT(\"hello\",)", .expect = .{ .text = "" }, .note = "an omitted ARGUMENT is blank, and blank is 0" },
+    .{ .func = "LEFT", .formula = "LEFT(\"hello\",99)", .expect = .{ .text = "hello" } },
+    .{ .func = "LEFT", .formula = "LEFT(\"hello\",-1)", .expect = .{ .err = .value } },
+    .{ .func = "LEFT", .formula = "LEFT(\"hello\",2.9)", .expect = .{ .text = "he" }, .note = "a fractional count truncates" },
+    .{ .func = "LEFT", .formula = "LEFT(E1,2)", .expect = .{ .text = "a\u{1F600}" }, .cv = .cv2 },
+    .{ .func = "RIGHT", .formula = "RIGHT(\"hello\",3)", .expect = .{ .text = "llo" } },
+    .{ .func = "RIGHT", .formula = "RIGHT(\"hello\")", .expect = .{ .text = "o" } },
+    .{ .func = "RIGHT", .formula = "RIGHT(\"hello\",99)", .expect = .{ .text = "hello" } },
+    .{ .func = "RIGHT", .formula = "RIGHT(\"hello\",0)", .expect = .{ .text = "" } },
+    .{ .func = "MID", .formula = "MID(\"hello\",2,3)", .expect = .{ .text = "ell" } },
+    .{ .func = "MID", .formula = "MID(\"hello\",1,99)", .expect = .{ .text = "hello" } },
+    .{ .func = "MID", .formula = "MID(\"hello\",9,2)", .expect = .{ .text = "" }, .note = "past the end is empty, not an error" },
+    .{ .func = "MID", .formula = "MID(\"hello\",0,2)", .expect = .{ .err = .value }, .note = "the start is 1-based" },
+    .{ .func = "MID", .formula = "MID(\"hello\",1,-1)", .expect = .{ .err = .value } },
+    .{ .func = "MID", .formula = "MID(E1,2,1)", .expect = .{ .text = "\u{1F600}" }, .cv = .cv2 },
+
+    // ── REPLACE ──
+    .{ .func = "REPLACE", .formula = "REPLACE(\"abcdef\",2,3,\"XY\")", .expect = .{ .text = "aXYef" } },
+    .{ .func = "REPLACE", .formula = "REPLACE(\"abc\",1,0,\"X\")", .expect = .{ .text = "Xabc" }, .note = "replacing nothing inserts" },
+    .{ .func = "REPLACE", .formula = "REPLACE(\"abc\",9,3,\"X\")", .expect = .{ .text = "abcX" }, .note = "past the end appends" },
+    .{ .func = "REPLACE", .formula = "REPLACE(\"abc\",0,1,\"X\")", .expect = .{ .err = .value } },
+    .{ .func = "REPLACE", .formula = "REPLACE(\"abc\",1,-1,\"X\")", .expect = .{ .err = .value } },
+
+    // ── FIND: case-sensitive, no wildcards ──
+    .{ .func = "FIND", .formula = "FIND(\"l\",\"hello\")", .expect = .{ .number = 3 } },
+    .{ .func = "FIND", .formula = "FIND(\"l\",\"hello\",4)", .expect = .{ .number = 4 } },
+    .{ .func = "FIND", .formula = "FIND(\"L\",\"hello\")", .expect = .{ .err = .value }, .note = "case-SENSITIVE, which is the whole difference from SEARCH" },
+    .{ .func = "FIND", .formula = "FIND(\"*\",\"a*b\")", .expect = .{ .number = 2 }, .note = "no wildcards: a star is a star" },
+    .{ .func = "FIND", .formula = "FIND(\"z\",\"hello\")", .expect = .{ .err = .value } },
+    .{ .func = "FIND", .formula = "FIND(\"h\",\"hello\",0)", .expect = .{ .err = .value } },
+    .{ .func = "FIND", .formula = "FIND(\"\",\"hello\")", .expect = .{ .number = 1 } },
+    .{ .func = "FIND", .formula = "FIND(\"b\",E1)", .expect = .{ .number = 4 }, .cv = .cv1 },
+    .{ .func = "FIND", .formula = "FIND(\"b\",E1)", .expect = .{ .number = 3 }, .cv = .cv2 },
+
+    // ── SEARCH: folded, wildcards active ──
+    .{ .func = "SEARCH", .formula = "SEARCH(\"L\",\"hello\")", .expect = .{ .number = 3 }, .note = "case-INsensitive" },
+    .{ .func = "SEARCH", .formula = "SEARCH(\"l*o\",\"hello\")", .expect = .{ .number = 3 } },
+    .{ .func = "SEARCH", .formula = "SEARCH(\"h?l\",\"hello\")", .expect = .{ .number = 1 }, .note = "`?` is one character, so h-e-l matches at 1" },
+    .{ .func = "SEARCH", .formula = "SEARCH(\"h?o\",\"hello\")", .expect = .{ .err = .value } },
+    .{ .func = "SEARCH", .formula = "SEARCH(\"~*\",\"a*b\")", .expect = .{ .number = 2 }, .note = "the escape survives, same as in a criterion" },
+    .{ .func = "SEARCH", .formula = "SEARCH(\"z\",\"hello\")", .expect = .{ .err = .value } },
+    .{ .func = "SEARCH", .formula = "SEARCH(\"l\",\"hello\",4)", .expect = .{ .number = 4 } },
+    .{ .func = "SEARCH", .formula = "SEARCH(\"SS\",E3)", .expect = .{ .number = 2 }, .note = "the fold expands, and the position is the caller's" },
+    .{ .func = "SEARCH", .formula = "SEARCH(\"b\",E1)", .expect = .{ .number = 4 }, .cv = .cv1 },
+    .{ .func = "SEARCH", .formula = "SEARCH(\"b\",E1)", .expect = .{ .number = 3 }, .cv = .cv2 },
+
+    // ── casing ──
+    .{ .func = "UPPER", .formula = "UPPER(\"hello\")", .expect = .{ .text = "HELLO" } },
+    .{ .func = "UPPER", .formula = "UPPER(E2)", .expect = .{ .text = "STRASSE" }, .note = "ß→SS is length-changing; a simple mapping cannot do it" },
+    .{ .func = "UPPER", .formula = "UPPER(\"café\")", .expect = .{ .text = "CAFÉ" } },
+    .{ .func = "LOWER", .formula = "LOWER(\"HeLLo\")", .expect = .{ .text = "hello" } },
+    .{ .func = "LOWER", .formula = "LOWER(\"ΟΔΟΣ\")", .expect = .{ .text = "οδο\u{03C2}" }, .note = "Final_Sigma: ς at the end of a word" },
+    .{ .func = "LOWER", .formula = "LOWER(\"I\")", .expect = .{ .text = "i" }, .note = "locale-neutral; a Turkish Excel answers ı" },
+
+    // ── TRIM ──
+    .{ .func = "TRIM", .formula = "TRIM(\"  a  b  \")", .expect = .{ .text = "a b" } },
+    .{ .func = "TRIM", .formula = "TRIM(\"abc\")", .expect = .{ .text = "abc" } },
+    .{ .func = "TRIM", .formula = "TRIM(\"   \")", .expect = .{ .text = "" } },
+    .{ .func = "TRIM", .formula = "TRIM(\"a\u{00A0}b\")", .expect = .{ .text = "a\u{00A0}b" }, .note = "a non-breaking space is not a space; CLEAN is M8c" },
+
+    // ── EXACT ──
+    .{ .func = "EXACT", .formula = "EXACT(\"abc\",\"abc\")", .expect = .{ .boolean = true } },
+    .{ .func = "EXACT", .formula = "EXACT(\"abc\",\"ABC\")", .expect = .{ .boolean = false }, .note = "the one comparison that does not fold" },
+    .{ .func = "EXACT", .formula = "EXACT(\"ß\",\"SS\")", .expect = .{ .boolean = false }, .note = "…so fold-equality does not reach it either" },
+    .{ .func = "EXACT", .formula = "EXACT(\"\",A7)", .expect = .{ .boolean = true } },
+
+    // ── SUBSTITUTE ──
+    .{ .func = "SUBSTITUTE", .formula = "SUBSTITUTE(\"a-b-c\",\"-\",\"+\")", .expect = .{ .text = "a+b+c" } },
+    .{ .func = "SUBSTITUTE", .formula = "SUBSTITUTE(\"a-b-c\",\"-\",\"+\",2)", .expect = .{ .text = "a-b+c" } },
+    .{ .func = "SUBSTITUTE", .formula = "SUBSTITUTE(\"a-b\",\"-\",\"+\",9)", .expect = .{ .text = "a-b" }, .note = "an instance that is not there changes nothing" },
+    .{ .func = "SUBSTITUTE", .formula = "SUBSTITUTE(\"aAa\",\"a\",\"x\")", .expect = .{ .text = "xAx" }, .note = "case-SENSITIVE" },
+    .{ .func = "SUBSTITUTE", .formula = "SUBSTITUTE(\"abc\",\"\",\"x\")", .expect = .{ .text = "abc" }, .note = "an empty needle matches nowhere rather than everywhere" },
+    .{ .func = "SUBSTITUTE", .formula = "SUBSTITUTE(\"abc\",\"b\",\"\")", .expect = .{ .text = "ac" } },
+    .{ .func = "SUBSTITUTE", .formula = "SUBSTITUTE(\"a-b\",\"-\",\"+\",0)", .expect = .{ .err = .value } },
+
+    // ── REPT ──
+    .{ .func = "REPT", .formula = "REPT(\"ab\",3)", .expect = .{ .text = "ababab" } },
+    .{ .func = "REPT", .formula = "REPT(\"ab\",0)", .expect = .{ .text = "" } },
+    .{ .func = "REPT", .formula = "REPT(\"ab\",-1)", .expect = .{ .err = .value } },
+    .{ .func = "REPT", .formula = "REPT(\"ab\",2.9)", .expect = .{ .text = "abab" } },
+    .{ .func = "REPT", .formula = "REPT(\"ab\",100000)", .expect = .{ .err = .value }, .note = "§9's cell cap, as Excel's own #VALUE! rather than a refusal" },
+
+    // ── VALUE ──
+    .{ .func = "VALUE", .formula = "VALUE(\"42\")", .expect = .{ .number = 42 } },
+    .{ .func = "VALUE", .formula = "VALUE(\" -2.5e3 \")", .expect = .{ .number = -2500 } },
+    .{ .func = "VALUE", .formula = "VALUE(\"abc\")", .expect = .{ .err = .value } },
+    .{ .func = "VALUE", .formula = "VALUE(A8)", .expect = .{ .number = 7 } },
+
+    // ── CHAR / CODE ──
+    .{ .func = "CHAR", .formula = "CHAR(65)", .expect = .{ .text = "A" } },
+    .{ .func = "CHAR", .formula = "CHAR(0)", .expect = .{ .err = .value } },
+    .{ .func = "CHAR", .formula = "CHAR(256)", .expect = .{ .err = .value } },
+    .{ .func = "CHAR", .formula = "CHAR(128)", .expect = .{ .text = "€" }, .note = "windows-1252, not Latin-1: 0x80 is the euro sign" },
+    .{ .func = "CHAR", .formula = "CHAR(233)", .expect = .{ .text = "é" } },
+    .{ .func = "CODE", .formula = "CODE(\"A\")", .expect = .{ .number = 65 } },
+    .{ .func = "CODE", .formula = "CODE(\"abc\")", .expect = .{ .number = 97 }, .note = "the first character only" },
+    .{ .func = "CODE", .formula = "CODE(\"\")", .expect = .{ .err = .value } },
+    .{ .func = "CODE", .formula = "CODE(\"€\")", .expect = .{ .number = 128 } },
+    .{ .func = "CODE", .formula = "CODE(\"\u{1F600}\")", .expect = .{ .number = 63 }, .note = "outside the code page: Excel's `?` substitution" },
+
+    // ── joining ──
+    .{ .func = "CONCAT", .formula = "CONCAT(\"a\",\"b\",\"c\")", .expect = .{ .text = "abc" } },
+    .{ .func = "CONCAT", .formula = "CONCAT(C1:C4)", .expect = .{ .text = "ab3" }, .note = "a RANGE, which is the whole difference from CONCATENATE" },
+    .{ .func = "CONCAT", .formula = "CONCAT(\"x\",A5)", .expect = .{ .err = .div0 }, .note = "an error in an argument is the answer" },
+    .{ .func = "CONCATENATE", .formula = "CONCATENATE(\"a\",\"b\")", .expect = .{ .text = "ab" } },
+    .{ .func = "CONCATENATE", .formula = "CONCATENATE(\"n=\",A1)", .expect = .{ .text = "n=10" } },
+    .{ .func = "TEXTJOIN", .formula = "TEXTJOIN(\"-\",TRUE,\"a\",\"b\")", .expect = .{ .text = "a-b" } },
+    .{ .func = "TEXTJOIN", .formula = "TEXTJOIN(\"-\",TRUE,C1:C4)", .expect = .{ .text = "a-b-3" }, .note = "the blank is skipped" },
+    .{ .func = "TEXTJOIN", .formula = "TEXTJOIN(\"-\",FALSE,C1:C4)", .expect = .{ .text = "a-b--3" }, .note = "…and kept, which is what the flag is for" },
+    .{ .func = "TEXTJOIN", .formula = "TEXTJOIN(\"\",TRUE,C1:C4)", .expect = .{ .text = "ab3" } },
+};
+
+fn f1cOptions(h: *Harness, cv: run_inputs.CompatibilityVersion) Options {
+    var opts = h.options();
+    opts.text_compat = cv;
+    return opts;
+}
+
+test "M4f: every F1c fixture evaluates to what the spec says, under its version" {
+    for (f1c_cases) |c| {
+        // A case with no version means the same thing under both, and is
+        // asserted under both — which is how a rule that only LOOKS
+        // version-free gets caught.
+        const versions: []const run_inputs.CompatibilityVersion =
+            if (c.cv) |v| &.{v} else &.{ .cv1, .cv2 };
+        for (versions) |cv| {
+            var h: Harness = undefined;
+            try h.init(testing.allocator);
+            defer h.deinit();
+            try putF1cCells(&h);
+
+            const v = h.evalOpts(c.formula, f1cOptions(&h, cv)) catch |e| {
+                std.debug.print("F1c `{s}` ({t}) refused: {t}\n", .{ c.formula, cv, e });
+                return e;
+            };
+            expectValue(c.expect, v) catch |e| {
+                std.debug.print("F1c `{s}` ({s}, {t}): wrong value\n", .{ c.formula, c.func, cv });
+                return e;
+            };
+        }
+    }
+}
+
+test "M4f: all nineteen frozen names resolve, and each has a fixture" {
+    var it = registry.inventory();
+    var batch: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4f")) continue;
+        batch += 1;
+
+        if (registry.lookup(e.name) == null) {
+            std.debug.print("F1c name does not resolve: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        }
+        var fixtures: usize = 0;
+        for (f1c_cases) |c| {
+            if (std.mem.eql(u8, c.func, e.name)) fixtures += 1;
+        }
+        if (fixtures == 0) {
+            std.debug.print("F1c name has no fixture: {s}\n", .{e.name});
+            return error.UnfixturedBatchFunction;
+        }
+    }
+    try testing.expectEqual(@as(usize, 19), batch);
+
+    for (f1c_cases) |c| {
+        var found = false;
+        var it2 = registry.inventory();
+        while (it2.next()) |e| {
+            if (std.mem.eql(u8, e.name, c.func) and std.mem.eql(u8, e.milestone, "M4f")) found = true;
+        }
+        if (!found) {
+            std.debug.print("fixture names a function outside F1c: {s}\n", .{c.func});
+            return error.FixtureOutsideBatch;
+        }
+    }
+}
+
+test "M4f: the evidence label on every fixture is true of the committed manifests" {
+    var oracle_rows: usize = 0;
+    var excluded_rows: usize = 0;
+    for (f1c_cases) |c| {
+        switch (try manifestVerdict(c.formula)) {
+            .decided => {
+                if (c.evidence != .oracle) {
+                    std.debug.print("`{s}` is decided by a manifest but ships spec-pinned\n", .{c.formula});
+                    return error.UnderstatedEvidence;
+                }
+                oracle_rows += 1;
+            },
+            .excluded => {
+                if (c.evidence != .spec_pinned) {
+                    std.debug.print("`{s}` claims evidence from an EXCLUDED manifest cell\n", .{c.formula});
+                    return error.ExcludedCellClaimedAsEvidence;
+                }
+                excluded_rows += 1;
+            },
+            .silent => {
+                if (c.evidence != .spec_pinned) {
+                    std.debug.print("`{s}` claims oracle evidence no manifest holds\n", .{c.formula});
+                    return error.UnbackedOracleClaim;
+                }
+            },
+        }
+    }
+    // Zero again, and for the same reason — but this row's zero carries
+    // more weight than M4e's did. `UPPER("ß")` is the case §5.4b marks
+    // oracle-pinned, and the Excel adapter that would pin it is parked
+    // (§8.2). So it ships spec-pinned and FLAGGED: the count below is
+    // what has to move when that leg runs, and this is the row that
+    // will move it.
+    try testing.expectEqual(@as(usize, 0), oracle_rows);
+    try testing.expectEqual(@as(usize, 0), excluded_rows);
+}
+
+test "M4f: the compatibility version is exactly the seven names that index" {
+    // Registry data, checked in both directions: a name that counts or
+    // positions in §5.4d's units must declare it, and a name that
+    // operates on whole strings must not.
+    const indexing = [_][]const u8{
+        "LEN", "LEFT", "RIGHT", "MID", "REPLACE", "FIND", "SEARCH",
+    };
+    var it = registry.inventory();
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4f")) continue;
+        var listed = false;
+        for (indexing) |n| {
+            if (std.mem.eql(u8, n, e.name)) listed = true;
+        }
+        if (listed != registry.lookup(e.name).?.cv_sensitive) {
+            std.debug.print("{s}: cv_sensitive={} but the list says {}\n", .{
+                e.name,
+                registry.lookup(e.name).?.cv_sensitive,
+                listed,
+            });
+            return error.CvFlagMismatch;
+        }
+    }
+}
+
+test "M4f: the same call, two versions, two right answers" {
+    // The compatibility version end to end, over one cell, in every
+    // function that can see it. Read as a block this is the row's
+    // headline: `a😀b` is four characters to CV1 and three to CV2, and
+    // every position downstream of that shifts with it.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    try putF1cCells(&h);
+
+    const Row = struct { formula: []const u8, cv1: f64, cv2: f64 };
+    for ([_]Row{
+        .{ .formula = "LEN(E1)", .cv1 = 4, .cv2 = 3 },
+        .{ .formula = "FIND(\"b\",E1)", .cv1 = 4, .cv2 = 3 },
+        .{ .formula = "SEARCH(\"B\",E1)", .cv1 = 4, .cv2 = 3 },
+        .{ .formula = "LEN(MID(E1,2,2))", .cv1 = 2, .cv2 = 2 },
+    }) |r| {
+        const a = try h.evalOpts(r.formula, f1cOptions(&h, .cv1));
+        try testing.expectEqual(r.cv1, a.scalar.number);
+        const b = try h.evalOpts(r.formula, f1cOptions(&h, .cv2));
+        try testing.expectEqual(r.cv2, b.scalar.number);
+    }
+
+    // LEFT and RIGHT are not in §5.4d's list of five, and they are
+    // version-dependent all the same: a count of characters cannot mean
+    // one thing in `MID` and another in `LEFT` within one workbook.
+    // Recorded as a decision rather than left as an inconsistency.
+    try testing.expectEqualStrings(
+        "a",
+        (try h.evalOpts("LEFT(E1,1)", f1cOptions(&h, .cv1))).scalar.text,
+    );
+    try testing.expectEqualStrings(
+        "b",
+        (try h.evalOpts("RIGHT(E1,1)", f1cOptions(&h, .cv1))).scalar.text,
+    );
+}
+
+test "M4f: a CV1 index into an astral character refuses rather than halving it" {
+    // §5.4d's one unrepresentable case. Excel hands back a lone
+    // surrogate; UTF-8 has no such thing, so this is a typed refusal —
+    // and it is a refusal only under CV1, because under CV2 there is no
+    // half to ask for.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    try putF1cCells(&h);
+
+    for ([_][]const u8{ "MID(E1,2,1)", "LEFT(E1,2)", "RIGHT(E1,2)", "REPLACE(E1,2,1,\"x\")" }) |f| {
+        try testing.expectError(
+            error.ResultNotRepresentable,
+            h.evalOpts(f, f1cOptions(&h, .cv1)),
+        );
+        // The same formula under CV2 is an ordinary answer.
+        _ = try h.evalOpts(f, f1cOptions(&h, .cv2));
+    }
+}
+
+test "M4f: the match policy is registry data, and behaviour agrees with it" {
+    // §5.4b: every text function's policy is explicit. The four `.raw`
+    // rows are the case-sensitive ones, and the pairing is asserted
+    // against what the functions actually do rather than only against
+    // the table.
+    const raw = [_][]const u8{ "FIND", "SUBSTITUTE", "EXACT", "CODE" };
+    var it = registry.inventory();
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4f")) continue;
+        var listed = false;
+        for (raw) |n| {
+            if (std.mem.eql(u8, n, e.name)) listed = true;
+        }
+        const want: value.MatchPolicy = if (listed) .raw else .folded;
+        try testing.expectEqual(want, registry.lookup(e.name).?.match_policy);
+    }
+
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    try putF1cCells(&h);
+    // The same question, asked of the raw function and the folded one.
+    try testing.expectEqual(value.KnownError.value, (try h.scalar("FIND(\"L\",\"hello\")")).err.known);
+    try testing.expectEqual(@as(f64, 3), (try h.scalar("SEARCH(\"L\",\"hello\")")).number);
+    // …and `SEARCH` is the only M4f name inside the comparator, which is
+    // what `collation_sensitive` is for.
+    var it2 = registry.inventory();
+    while (it2.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4f")) continue;
+        const want = std.mem.eql(u8, e.name, "SEARCH");
+        try testing.expectEqual(want, registry.lookup(e.name).?.collation_sensitive);
+    }
+}
+
+test "M4f: casing_v1 through UPPER and LOWER, including what folding cannot do" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    try putF1cCells(&h);
+
+    // Length-changing, and the reason `casing_v1` is not the fold: the
+    // fold's answer for `ß` is lowercase `ss`.
+    try testing.expectEqualStrings("STRASSE", (try h.scalar("UPPER(\"Straße\")")).text);
+    try testing.expectEqual(@as(f64, 7), (try h.scalar("LEN(UPPER(\"Straße\"))")).number);
+    try testing.expectEqual(@as(f64, 6), (try h.scalar("LEN(\"Straße\")")).number);
+    // Ligature, astral, and the dotted I.
+    try testing.expectEqualStrings("FFI", (try h.scalar("UPPER(\"ﬃ\")")).text);
+    try testing.expectEqualStrings("\u{10400}", (try h.scalar("UPPER(\"\u{10428}\")")).text);
+    try testing.expectEqualStrings("i\u{0307}", (try h.scalar("LOWER(\"İ\")")).text);
+    // Final_Sigma in both positions, from one formula each.
+    try testing.expectEqualStrings("οδο\u{03C2}", (try h.scalar("LOWER(\"ΟΔΟΣ\")")).text);
+    try testing.expectEqualStrings("α\u{03C3}α", (try h.scalar("LOWER(\"ΑΣΑ\")")).text);
+    // Uppercasing is not injective, so it does not round-trip — stated
+    // here so nobody later "fixes" it.
+    try testing.expectEqualStrings("strasse", (try h.scalar("LOWER(UPPER(\"Straße\"))")).text);
+}
+
+test "M4f: text a formula produced can be written back out (the ST_Xstring codec)" {
+    // `CHAR` is the first function in the ladder that can produce a C0
+    // control, which XML cannot carry literally and ST_Xstring exists to
+    // escape. The codec is M4b1's; this is the row that first NEEDS it,
+    // so the round-trip is asserted from a formula result rather than
+    // from a hand-written string.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+
+    for ([_][]const u8{ "CHAR(1)", "CHAR(13)", "CHAR(9)", "CHAR(65)&CHAR(2)" }) |src| {
+        const produced = (try h.scalar(src)).text;
+        const encoded = try decode.encodeAuthoredString(testing.allocator, produced);
+        defer testing.allocator.free(encoded);
+        const back = try decode.decodeCarrier(testing.allocator, .string, encoded);
+        defer testing.allocator.free(back);
+        try testing.expectEqualStrings(produced, back);
+    }
+
+    // A literal `_x0041_` a formula produced must come back as those
+    // seven characters rather than as `A` — the escape of the escape.
+    const literal = (try h.scalar("\"_x0041_\"")).text;
+    const encoded = try decode.encodeAuthoredString(testing.allocator, literal);
+    defer testing.allocator.free(encoded);
+    try testing.expect(std.mem.indexOf(u8, encoded, "_x005F_") != null);
+    const back = try decode.decodeCarrier(testing.allocator, .string, encoded);
+    defer testing.allocator.free(back);
+    try testing.expectEqualStrings("_x0041_", back);
+}
+
+test "M4f: §9's cell cap is Excel's #VALUE!, and it is checked before the allocation" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+
+    // At the cap, under it, and over it. The over-cap call must not
+    // allocate a gigabyte on its way to the answer, which is why the
+    // check is on the count rather than on the result.
+    try testing.expectEqual(@as(f64, 32767), (try h.scalar("LEN(REPT(\"a\",32767))")).number);
+    try testing.expectEqual(value.KnownError.value, (try h.scalar("REPT(\"a\",32768)")).err.known);
+    try testing.expectEqual(value.KnownError.value, (try h.scalar("REPT(\"ab\",1000000000)")).err.known);
+    // Concatenation reaches the same cap by a different road. Before
+    // M4f no formula could: a literal is bounded by the 8 192-byte
+    // formula length, so `REPT` is what made `&` able to overflow a cell
+    // and the cap had to move to the operator with it.
+    try testing.expectEqual(
+        value.KnownError.value,
+        (try h.scalar("REPT(\"a\",20000)&REPT(\"b\",20000)&\"\"")).err.known,
+    );
+
+    // …and TEXTJOIN's dense walk stops at the cap rather than emitting a
+    // delimiter per row of a whole column. The answer is the same
+    // `#VALUE!`; what is under test is that it arrives.
+    try putF1cCells(&h);
+    try testing.expectEqual(
+        value.KnownError.value,
+        (try h.scalar("TEXTJOIN(\"-\",FALSE,C:C)")).err.known,
+    );
+    // With empties skipped the same call is the three cells that are
+    // there, because then a blank and an absence are the same thing.
+    try testing.expectEqualStrings("a-b-3", (try h.scalar("TEXTJOIN(\"-\",TRUE,C:C)")).text);
+}
+
+test "M4f: the batch agrees across both rule tables, everywhere" {
+    // F1c-text computes no floating-point value, so — unlike M4d and
+    // M4e — there is nothing here for the two rule tables to disagree
+    // about. Asserted rather than assumed: `VALUE` parses numbers, and a
+    // parse is exactly where a divergence would hide.
+    for (f1c_cases) |c| {
+        const cv = c.cv orelse .cv1;
+        var excel: Harness = undefined;
+        try excel.init(testing.allocator);
+        defer excel.deinit();
+        try putF1cCells(&excel);
+        var opts_e = f1cOptions(&excel, cv);
+        opts_e.fidelity = .excel;
+
+        var ieee: Harness = undefined;
+        try ieee.init(testing.allocator);
+        defer ieee.deinit();
+        try putF1cCells(&ieee);
+        var opts_i = f1cOptions(&ieee, cv);
+        opts_i.fidelity = .ieee;
+
+        const a = excel.evalOpts(c.formula, opts_e) catch continue;
+        const b = try ieee.evalOpts(c.formula, opts_i);
+        if (a == .scalar and b == .scalar and !a.scalar.eql(b.scalar)) {
+            std.debug.print("`{s}` differs between rule tables\n", .{c.formula});
+            return error.UnexpectedFidelityDivergence;
+        }
+    }
+}
+
+test "M4f: every name against every argument shape, in both versions" {
+    // M4d's and M4e's sweep, run over this batch: each name padded to
+    // its own minimum arity so a function with three required arguments
+    // is actually reached, and each input evaluated twice so nothing is
+    // order-dependent. Refusals are allowed — a wrong SHAPE is a legal
+    // answer — but a panic, a leak or a nondeterministic result is not.
+    const shapes = [_][]const u8{ "\"abc\"", "1", "TRUE", "A5", "A7", "C1:C4", "{1,2}" };
+    var checked: usize = 0;
+    for ([_]run_inputs.CompatibilityVersion{ .cv1, .cv2 }) |cv| {
+        var it = registry.inventory();
+        while (it.next()) |e| {
+            if (!std.mem.eql(u8, e.milestone, "M4f")) continue;
+            const f = registry.lookup(e.name).?;
+            for (shapes) |s| {
+                var buf: [256]u8 = undefined;
+                var w: std.Io.Writer = .fixed(&buf);
+                try w.print("{s}({s}", .{ e.name, s });
+                // Pad by repeating the last shape, so every name is put
+                // in front of its own implementation rather than
+                // refused on arity before it gets there.
+                var k: usize = 1;
+                while (k < f.arity.min) : (k += 1) try w.print(",{s}", .{s});
+                try w.writeAll(")");
+                const src = w.buffered();
+
+                var h: Harness = undefined;
+                try h.init(testing.allocator);
+                defer h.deinit();
+                try putF1cCells(&h);
+                const first = h.evalOpts(src, f1cOptions(&h, cv));
+
+                var h2: Harness = undefined;
+                try h2.init(testing.allocator);
+                defer h2.deinit();
+                try putF1cCells(&h2);
+                const second = h2.evalOpts(src, f1cOptions(&h2, cv));
+
+                if (first) |a| {
+                    const b = second catch {
+                        std.debug.print("`{s}` succeeded then refused\n", .{src});
+                        return error.NondeterministicEvaluation;
+                    };
+                    if (a == .scalar and b == .scalar and !a.scalar.eql(b.scalar)) {
+                        std.debug.print("`{s}` gave two answers\n", .{src});
+                        return error.NondeterministicEvaluation;
+                    }
+                } else |err| {
+                    if (second) |_| {
+                        std.debug.print("`{s}` refused then succeeded\n", .{src});
+                        return error.NondeterministicEvaluation;
+                    } else |err2| {
+                        if (err != err2) return error.NondeterministicEvaluation;
+                    }
+                }
+                checked += 1;
+            }
+        }
+    }
+    // Nineteen names × seven shapes × two versions.
+    try testing.expectEqual(@as(usize, 19 * 7 * 2), checked);
 }
 
 // ─── boundaries and refusals ─────────────────────────────────────
