@@ -3568,6 +3568,59 @@ test "M4e: the Core gate is counted from the file, not read from the ladder" {
     try testing.expectEqual(core, closed);
 }
 
+test "M4f: the ladder's running total is counted from the file too" {
+    // Past the Core gate the ladder still carries a cumulative figure
+    // (`D-2`: 59 + 19 = 78), and it is worth the same treatment — a
+    // number in prose that nothing checks is a number that drifts. Four
+    // milestones, counted, and every name resolving.
+    const rows = [_][]const u8{ "M4c", "M4d", "M4e", "M4f" };
+    var shipped: usize = 0;
+    for (rows) |m| {
+        var it = inventory();
+        while (it.next()) |e| {
+            if (!std.mem.eql(u8, e.milestone, m)) continue;
+            if (lookup(e.name) == null) {
+                std.debug.print("shipped name does not resolve: {s} ({s})\n", .{ e.name, m });
+                return error.LadderTotalIncomplete;
+            }
+            shipped += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 78), shipped);
+}
+
+test "M4f: every F1c row declares all five fields, and its policy explicitly" {
+    // The same five-field check M4d and M4e applied, plus the two pieces
+    // of metadata §5.4b makes this batch responsible for: a match policy
+    // and a compatibility-version flag. Neither may be left to a default
+    // that happens to be right.
+    var it = inventory();
+    var seen: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4f")) continue;
+        const f = lookup(e.name).?;
+        seen += 1;
+
+        try testing.expectEqualStrings(e.name, f.name);
+        try testing.expect(f.arity.min <= f.arity.max orelse 255);
+        try testing.expect(f.arity.fixed.len + f.arity.rest.len > 0);
+        try testing.expectEqual(f.arity.fixed.len, f.coercion.fixed.len);
+        try testing.expectEqual(f.arity.rest.len, f.coercion.rest.len);
+        // Every text row is a plain form with an implementation: nothing
+        // in F1c defers an argument.
+        try testing.expectEqual(Form.plain, f.form);
+        try testing.expect(f.impl != null);
+        // …and none of them is volatile, reference-producing, or
+        // DA-aware, which is worth asserting because all three are
+        // properties a later batch will add to functions that look
+        // like these.
+        try testing.expectEqual(Volatility.stable, f.volatility);
+        try testing.expect(!f.reference_producing);
+        try testing.expect(!f.da_aware);
+    }
+    try testing.expectEqual(@as(usize, 19), seen);
+}
+
 test "M4e: every F1b row declares all five fields, and none of them by default" {
     var it = inventory();
     var seen: usize = 0;

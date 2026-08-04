@@ -78,7 +78,7 @@ Locked 2026-08-02 by Laurent (axioms; changing one reopens the plan):
 | # | Decision | Consequence |
 |---|---|---|
 | D-1 | Both recalc-on-save and standalone eval | `recalculate()` (in-memory transaction) + `saveWithRecalc` (file transaction, §5.7.9) + Writer path via orchestrator; eval at every layer |
-| D-2 | Registry phased to 300+, Core ~60 first | Core gate = M4e ✅ — **59** cumulative (M4c 20 + M4d 17 + M4e 22), counted from the frozen inventory committed at M3a rather than from this row |
+| D-2 | Registry phased to 300+, Core ~60 first | Core gate = M4e ✅ — **59** cumulative (M4c 20 + M4d 17 + M4e 22), counted from the frozen inventory committed at M3a rather than from this row. Past the gate: M4f ✅ adds 19 (F1c-text) → **78** |
 | D-3 | Dual fidelity modes | §5.4; `.excel` carries `platform_profile` + `collation_v1` |
 | D-4 | Dynamic arrays from the start | Array-first eval from M3a with the normative shape/coercion table (§5.3b); persistence staged behind proof gates; authoring via explicit `FormulaWrite.dialect` |
 | D-5 | Iterative calc honoring `calcPr` | CalcState workbook-derived; multi-SCC schedule normative (§5.6c) |
@@ -132,7 +132,7 @@ Verified 2026-08-02 on `main` @ `07c99f0`:
 | `calcPr` partial; `date1904` absent from typed view; CV extension unparsed | `workbook_xml.zig:89,286-318` | **CLOSED (M4b2)**: complete `CT_CalcPr`, `sheetCalcPr`, `date1904` → `t="d"`'s epoch, extensions preserved byte-exact; every corpus `<calcPr>` round-trips (§5.7.6). CV2's feature name stays unpinned until M7b's byte-diff |
 | `cm`/`vm` = one-based metadata indexes; no parser; **spec-vs-Office collection resolution differs** | MS-OE376 | M4a typed reader; **transition rows name the exact collection (cellMetadata vs valueMetadata), record type, indexing, and missing-record behavior — pinned empirically by byte-diffed Excel references at M7b**, not assumed from the base schema |
 | Tables can carry `calculatedColumnFormula`/totals formulas | `table_edit.zig:39` | M4b3 producer inventory + refusal when member cells lack `<f>` |
-| Cached text may need C0 controls; emitters reject forbidden XML bytes | `sheet_plan.zig:1153` | ST_Xstring codec (M4f) |
+| Cached text may need C0 controls; emitters reject forbidden XML bytes | `sheet_plan.zig:1153` | **CLOSED (M4f)**: the codec landed at M4b1 (`decode.zig:596-657`); M4f is the row that first PRODUCES such text — `CHAR(1)` — and round-trips it from a formula result through `encodeAuthoredString` → `decodeCarrier(.string)`, including the `_x005F_` escape of a literal `_x0041_`. M5b1 writes it back |
 | ABI errors today: `0/-1` + error buffer; `write_row_with_formulas` has no dialect param | `c_abi.zig:1837-1920,1927` | New exports keep errbuf + add diag; **FormulaWrite stays Zig-only at M7c; the versioned C export lands at M9a2** |
 | CLI reserves 130/143; flushes completed records on signal | `docs/cli.md:224-227,268`; `cli.zig:1718` | Exit tables include 130/143; **no-output guarantee applies to workbook-file mutation only; eval NDJSON streams may be prefix-valid on cancellation** (§12.2) |
 
@@ -454,7 +454,7 @@ Excel's locale-independent answer for e.g. `"abc"+1`). Every cell of the
 matrix is a fixture. **Ordinary comparisons (`=`, `<>`, `<`, `<=`, `>`,
 `>=`) are case-INsensitive on text** (Excel semantics; `EXACT` is the
 case-sensitive function): equality and ordering use case-folded comparison
-via the full non-Turkic fold (`src/unicode/casefold.zig` — the single
+via the full non-Turkic fold (`unicode/casefold.zig` — the single
 normative algorithm of `collation_v1`, §5.4b) — `A/a` equal, `ß/ss/SS`
 fold-equal (fixtured), no Unicode normalization applied (code points as
 stored); divergences from Excel's locale collation recorded per `collation_v1`.
@@ -568,8 +568,11 @@ open or got wrong, pinned here because M3a2 builds directly on them:
     package tree (`src/xlsx.zig:25` imports it relatively), so a named
     module rooted on the same file collides the moment `zlsx` imports
     the formula engine — the failure M0 hit with `refs/` and M1a with
-    `unicode/xid.zig`. **Verified on 0.16.0**: a file-scope `const`
-    referenced only from a `test` block is not resolved in a non-test
+    `unicode/xid.zig`. (**M4f moved the file to top-level `unicode/`**,
+    which dissolves the collision half of this argument; the parameter
+    stays, because injecting the fold is the better design and not
+    merely the compiling one.) **Verified on 0.16.0**: a file-scope
+    `const` referenced only from a `test` block is not resolved in a non-test
     build, so M3a2+ consumers compile `value.zig` without declaring the
     import and the collision never arises. Injection keeps the
     semantics independent of the build graph regardless.
@@ -602,9 +605,11 @@ below — `> ~1.85e-16` relative — and nothing on disk bounds it above;
 the signed-zero policy is unchanged and still `spec_pinned`. Neither
 can be confirmed until the M1b Excel adapter runs.
 
-**Deferred to M4f:** moving `src/unicode/casefold.zig` to top-level
-`unicode/` (decision 12). M4f ships `casing_v1` from the same directory
-and is the milestone that may touch it.
+**Deferred to M4f — CLOSED (2026-08-04):** moving
+`src/unicode/casefold.zig` to top-level `unicode/` (decision 12). The
+file now sits at `unicode/casefold.zig` beside `nfc.zig`, `xid.zig` and
+M4f's new `casing.zig`; `zlsx` imports it by name like every other
+consumer, and `src/unicode/` no longer exists.
 
 **M3a2 decisions (shipped 2026-08-03).** Seventeen points the row left
 open, got wrong, or discovered — pinned here because M3b, M4b1, and
@@ -792,12 +797,15 @@ fabricated `#VALUE!`). **Locale-sensitive OUTPUT is pinned invariant in v1**
 default to `.`/`,` — each a recorded, fixtured divergence from Excel's
 locale behavior; a locale profile is an M10+ addition that would join every
 fingerprint/cache key when it lands. **`collation_v1`** — ONE comparator, stated once: **lexicographic order of
-full-non-Turkic-folded code-point sequences** (`src/unicode/casefold.zig`;
+full-non-Turkic-folded code-point sequences** (`unicode/casefold.zig`;
 `ß` folds to `ss`) governs ordinary `=` `<>` `<` `<=` `>` `>=`, SEARCH,
 wildcards, lookup equality AND ordering, criteria, and SORT/SORTBY.
 **Positional matching over expanding folds**: the fold keeps a
 folded-unit→original-unit map; `?` consumes **one code point — version-INdependent** (CV changes exactly
-five functions' index units: LEN/MID/FIND/SEARCH/REPLACE — wildcards,
+the index units of LEN/MID/FIND/SEARCH/REPLACE **and, corrected at M4f,
+LEFT/RIGHT — seven, not five**: a count of characters cannot mean UTF-16
+code units in MID and code points in LEFT inside one workbook (M4f
+decision 1) — wildcards,
 criteria, COUNTIF/MATCH/XMATCH are NOT CV-dependent; oracle-pinned);
 `*`/`~` operate on original units; SEARCH returns positions in its
 CV-dependent unit — fixtures: `ß` expansion, ligatures, combining marks,
@@ -809,7 +817,7 @@ compare **full-folded code-point sequences, nothing else** — fold-equal
 strings (`A`/`a`, `ß`/`ss`/`SS`) are EQUAL for `=`, `<>`, `<`, `>`, lookups,
 and sorting semantics alike (a raw tie-break would make them unequal and is
 therefore *not* part of the semantic order; the shipped fold primitive
-defines equality this way, `src/unicode/casefold.zig:47-64`). SORT/SORTBY
+defines equality this way, `unicode/casefold.zig:53-70`). SORT/SORTBY
 use **stable source position** as a private, non-semantic tie-break among
 fold-equal elements. Registry-level **match policies**: `.folded` (default — `=`, SEARCH, wildcard consumers), `.raw` (**FIND and SUBSTITUTE are case-sensitive**, like EXACT; CODE/UNICODE raw), `.arg_selected` (TEXTBEFORE/TEXTAFTER/TEXTSPLIT via `match_mode`). Every text function's policy is explicit registry data. Each divergence from Excel's
 locale collation recorded; `ß`/`SS`/`ST` ordering fixtures included. Registry metadata flags every collation-touching
@@ -824,8 +832,12 @@ Excel-match for top-level multi-area display is M10+ if demanded).
 
 **5.4d Compatibility Version — BOTH versions in v1**: the 2024 workbook CV
 extension changes **surrogate-pair (code-point) handling** — CV2 treats a
-surrogate pair as one character in LEN/MID/FIND/SEARCH/REPLACE (not grapheme
-clustering; variation selectors/modifiers stay separate). **CV2 is the
+surrogate pair as one character in LEN/MID/FIND/SEARCH/REPLACE **plus
+LEFT/RIGHT (M4f decision 1)** (not grapheme
+clustering; variation selectors/modifiers stay separate). **A CV1 index
+that falls between the halves of a surrogate pair is
+`FormulaResultNotRepresentable`** — Excel returns a lone surrogate, which
+UTF-8 cannot carry (M4f decision 2). **CV2 is the
 default for newly created Current-Channel workbooks since April 2026**, so
 refusing it would refuse normal files. Parsed + preserved (M4b2);
 `CalcState.text_compat` v1|v2; **absent CV metadata = CV1** (matches pre-CV workbooks; fresh Writer emits no metadata part, `fresh_emit.zig:45` → CV1; CV2 authoring for fresh files = M10+; oracles: absent/CV1/CV2/fresh); **both semantics implemented in M4f** (the
@@ -1546,7 +1558,10 @@ written down.
     dependency exists only for the TEST sections of `value.zig` and
     `symbols.zig`; declaring it in a compilation that also contains
     `zlsx` claims `src/unicode/casefold.zig` for two modules. Two module
-    objects, one root file, one of them test-only.
+    objects, one root file, one of them test-only. (M4f moved the file
+    out of `src/`, so the claim is no longer contested — but the
+    pkg-facing module DOES now declare `zlsx_casing`, which cannot be
+    test-confined because `UPPER` and `LOWER` compute with it.)
 13. **A refusal is a normal return, so `errdefer` does not fire.** Every
     scan entry point releases its arena through `defer if (!keep)`, and
     the fuzz target is what proves a refused parse frees what it
@@ -1882,7 +1897,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M4c** ✅ | F1a-1 (20: operators; IF, AND, OR, NOT, IFERROR, IFNA, IFS, SWITCH; ISBLANK, ISNUMBER, ISTEXT, ISERROR, ISERR, ISNA, ISLOGICAL, NA, N, T; **TRUE, FALSE** — added at M3a2, see the decisions block) | Oracle-first |
 | **M4d** ✅ | F1a-2 (17: ABS, ROUND, ROUNDUP, ROUNDDOWN, INT, TRUNC, MOD, POWER, SQRT, EXP, LN, LOG, LOG10, SIGN, PI, RAND, RANDBETWEEN — **SQRT and RAND pinned here, registered at M3a2**) + multi-callsite/lazy-branch draw KATs | Oracle-first; KATs |
 | **M4e** ✅ | F1b (22: SUM, COUNT, COUNTA, COUNTBLANK, AVERAGE, MIN, MAX, SUMIF, COUNTIF, AVERAGEIF, SUMPRODUCT; VLOOKUP, HLOOKUP, INDEX, MATCH, XLOOKUP, XMATCH, CHOOSE, ROW, ROWS, COLUMN, COLUMNS — **the seven M3a2 framework subjects pinned here, registered at M3a2**) — **Core gate 59** | Oracle-first |
-| **M4f** | F1c-text (~19: LEFT, RIGHT, MID, LEN, LOWER, UPPER, TRIM, CONCAT, CONCATENATE, TEXTJOIN, SUBSTITUTE, REPLACE, FIND, SEARCH, EXACT, VALUE, REPT, CHAR, CODE) + **CV1/CV2 shared text layer** (§5.4d; collation_v1 landed at M3a) | Oracle-first; codec tests; per-CV fixtures |
+| **M4f** ✅ | F1c-text (19: LEFT, RIGHT, MID, LEN, LOWER, UPPER, TRIM, CONCAT, CONCATENATE, TEXTJOIN, SUBSTITUTE, REPLACE, FIND, SEARCH, EXACT, VALUE, REPT, CHAR, CODE) + **CV1/CV2 shared text layer** (§5.4d; collation_v1 landed at M3a) + **`casing_v1`** + the `unicode/` move | Oracle-first; codec tests; per-CV fixtures |
 | **M4g** | F1c-date (~15: DATE, YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, TODAY, NOW, EOMONTH, EDATE, WEEKDAY, DATEVALUE, TIMEVALUE, TIME) | Oracle-first |
 | **M5a1** | graph.zig: node model, SCC condensation, deterministic order, **seed table**, range-order contract; closure eval semantics | Scaling assertion; order fixtures; **randomized differential test vs a brute-force graph builder** (overlaps, full rows/cols, 3D spans, names, spill resize/invalidation — a missed edge passes perf tests but corrupts caches) |
 | **M5a2** | Iteration engine (multi-SCC schedule, convergence, clamps) + callsite-keyed volatile schedule + rebuild-reuse KATs + dynamic-edge fixpoint + **complete oracle-gated INDIRECT + OFFSET contracts** (the fixpoint's test subjects; registered fully here so M6's public CLI never exposes a half-function) | Iteration oracles; stabilization fuzz; INDIRECT/OFFSET fixtures |
@@ -2312,6 +2327,117 @@ turned out to be unable to state §5.3c for a whole family.
 
 ---
 
+**M4f decisions (shipped 2026-08-04).** Twelve points, in
+`unicode/casing.zig` + `unicode/tables/casing_data.zig` (new),
+`src/formula/text.zig` (new), `src/formula/registry.zig` (nineteen rows,
+their implementations, the batch gates), `criteria.zig` (the substring
+matcher) and `eval.zig` (fixtures, plus the `&` cap). The row where a
+count stopped being a property of a string.
+
+1. **§5.4d's "five affected functions" is an undercount, and the row
+    ships seven.** The prose names LEN/MID/FIND/SEARCH/REPLACE. `LEFT`
+    and `RIGHT` take a count of characters in the same units, and Excel's
+    own CV1 `LEFT` hands back half a surrogate pair exactly as `MID`
+    does — so a build faithful to the list would have had `LEFT("😀",1)`
+    return the whole emoji while `MID("😀",1,1)` refused, inside one
+    workbook, for the same character. `cv_sensitive` is registry data
+    checked against a list **in both directions**, so an eighth name
+    cannot ship uncounted and a whole-string function cannot ship
+    claiming to index.
+2. **A CV1 index into an astral character is `ResultNotRepresentable`,
+    not a fabricated value.** Excel answers with a lone surrogate, which
+    its UTF-16 strings can hold and UTF-8 cannot. The alternatives were
+    U+FFFD (a character the user never had) and rounding to a whole
+    scalar (a length the caller never asked for); both invent. The
+    refusal is typed, fixtured across `MID`/`LEFT`/`RIGHT`/`REPLACE`,
+    and each fixture asserts that the SAME formula under CV2 is an
+    ordinary answer — which is the sharpest available statement that the
+    two versions are different semantics rather than a flag.
+3. **Absent compatibility metadata is CV1, and the code said CV2.**
+    `run_inputs.CalcState.text_compat` defaulted to `.cv2` — the right
+    answer to "what does Excel write into a new workbook" and the wrong
+    one to "what does a workbook that says nothing mean". §5.4d says
+    absent = CV1; the files that say nothing are every pre-2024 workbook
+    **and every file zlsx's own Writer emits** (`fresh_emit.zig` writes
+    no metadata part). `calc.zig`'s parsed `TextCompat` already defaulted
+    to `.v1`, so the two halves of the engine disagreed. Corrected, with
+    the default asserted in a test rather than trusted.
+4. **`casing_v1` is a second table, not a second use of the fold, and
+    the generator says so in the file it writes.** `fold("ß")` is `"ss"`;
+    `UPPER("ß")` is `"SS"`. One is a lowercase comparison key nobody
+    displays, the other is a displayed value — no fold implements
+    `UPPER`, and no one-to-one mapping does either, since one scalar
+    becomes two. The generator's fourth mode layers SpecialCasing's 106
+    unconditional rows over UnicodeData's simple mappings, ships
+    Final_Sigma (the one conditional row with no language tag) with the
+    `Cased`/`Case_Ignorable` intervals it needs, and **rejects the
+    fifteen `tr`/`az`/`lt` rows by name, printing each one it drops**.
+    There is no locale in `RunInputs` to select them with, so Turkish
+    dotless-ı casing is recorded as a divergence rather than implemented.
+5. **`UPPER("ß")` ships `spec_pinned` and FLAGGED.** §5.4b marks it
+    oracle-pinned; the M1b Excel adapter that would pin it is parked on
+    a modal dialog (§8.2). So the batch's oracle-row count is pinned at
+    **zero** like M4c's, M4d's and M4e's, the three-valued checker
+    (`silent`/`decided`/`excluded`) guards the label in both directions,
+    and the test says in as many words which number has to move when
+    that leg runs.
+6. **`title` mappings ship now although nothing calls them.** M8b's
+    `PROPER` is word segmentation *over this table*; shipping the
+    character-level half here means M8b adds a segmenter rather than
+    reopening the generator, and the generated file is one artifact with
+    one pinned revision either way.
+7. **`SEARCH` reuses the criteria matcher; a second one was written and
+    thrown away.** The first attempt gave `casefold.zig` its own
+    folded→original position map. M3b's `criteria.Folded` already had
+    one, keyed by original code point — and two maps is precisely how
+    `SEARCH("~*",…)` and `COUNTIF(…,"~*")` come to disagree about what a
+    literal star is. The anchored matcher gained a **prefix mode and a
+    start offset**, both parameters rather than a fork, and M4e's
+    precedent (lookup equality is the criteria matcher's, decision 8)
+    is the one being followed.
+8. **Half an expansion is not a match, and that rule was inherited
+    rather than chosen.** `SEARCH("ss","aßb")` is 2; `SEARCH("s","aßb")`
+    is `#VALUE!`, because both sides must end on a code-point boundary —
+    the same rule that makes the criterion `"?s"` fail against `"ß"`. A
+    `SEARCH` answering 2 for the second would be claiming a position
+    inside a character.
+9. **The cell-text cap moved to the `&` operator, because M4f is the row
+    that made it reachable.** §9 makes text past 32 767 code points an
+    Excel-domain `#VALUE!` (a catchable error value) rather than a
+    refusal. A string literal is bounded by the 8 192-byte formula
+    length, so before `REPT` no formula could overflow a cell at all;
+    `REPT("a",20000)&REPT("b",20000)` is where that stops being true.
+    One rule, one constant, both sites — and `REPT` checks the COUNT
+    rather than the result, so an absurd repetition is `#VALUE!` without
+    a gigabyte on the way to it.
+10. **`TEXTJOIN` is the first function in the ladder that can tell a
+    blank from an absence, so it gets a dense walk.** §5.6a's sparse
+    iteration is correct for every M4e aggregate — none of them counts a
+    blank — but with `ignore_empty` false each blank is an empty field,
+    and a skipped one drops a delimiter and shifts every position after
+    it. The flag selects the walk, which is honest in both directions:
+    with empties skipped a blank and an absence ARE the same thing and
+    the sparse walk is both correct and cheaper. The dense walk is
+    bounded by the accumulator rather than by the area, so
+    `TEXTJOIN(",",FALSE,C:C)` stops at the cap instead of emitting a
+    million delimiters.
+11. **`VALUE` inherits §5.3b's three-way split rather than defining a
+    fourth.** Numeric text is a number, non-numeric text is `#VALUE!`,
+    and locale-flavoured text — `"1,5"`, `"50%"` — is a typed
+    `LocaleSensitiveInput` refusal, because 1,5 is 1.5 in Germany and 15
+    in the United States and zlsx has no locale to pick with. The
+    consequence worth naming: `VALUE("50%")` refuses where Excel answers
+    0.5. That follows from M3a1's classification, not from this row, and
+    it is fixtured here so the next reader finds it stated.
+12. **`CODE` answers 63 for anything outside the code page.** It reports
+    a position in a 256-entry table, so a character with no position has
+    no number to report and Excel substitutes `?`. `UNICODE` (M8c) is
+    the function that answers the other question. `CHAR`'s five
+    undefined windows-1252 slots (0x81, 0x8D, 0x8F, 0x90, 0x9D) map to
+    the matching C1 control, which is what Windows itself does.
+
+---
+
 ## 8. Testing & oracles
 
 ### 8.1 Fuzz/property targets (wired per PR)
@@ -2319,7 +2445,8 @@ turned out to be unable to state §5.3c for a whole family.
 tokenizer (M1a) · parser + limits (M2) · eval no-panic/leak/non-finite (M3a) ·
 criteria + PRNG KATs (M3b) · metadata (M4a) · decode/symbols (M4b1) ·
 topology + translation (M4b2) · **defined-name attributes + 3D spans
-(M4b3)** · draw KATs (M4d) · SCC + stabilization +
+(M4b3)** · draw KATs (M4d) · **per-version index units + casing tables
+(M4f)** · SCC + stabilization +
 rebuild-reuse (M5a) · patcher confinement + ResolvedSheet round-trip (M5b1) ·
 transaction post-failure + calc-state round-trip + refusal purity (M5b2) ·
 buffer equivalence (M5c) · determinism + scoped idempotence (M5d) · spill
