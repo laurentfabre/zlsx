@@ -288,12 +288,35 @@ fn matchFolded(
     escapes: []const bool,
     target: Folded,
 ) bool {
+    return matchFoldedFrom(pattern, escapes, target, 0, .whole);
+}
+
+/// Whether the pattern has to consume the target to the end.
+///
+/// A criterion matches a whole cell; `SEARCH` finds a substring. That is
+/// the only difference between them, so it is a parameter rather than a
+/// second matcher — a second one would be a second answer to "does `~*`
+/// match a literal star", and §5.4b has one.
+const MatchExtent = enum { whole, prefix };
+
+fn matchFoldedFrom(
+    pattern: Folded,
+    escapes: []const bool,
+    target: Folded,
+    from: usize,
+    extent: MatchExtent,
+) bool {
     var p: usize = 0; // pattern code point
-    var t: usize = 0; // target code point
+    var t: usize = from; // target code point
     var star_p: ?usize = null;
-    var star_t: usize = 0;
+    var star_t: usize = from;
 
     while (t < target.codePoints() or p < pattern.codePoints()) {
+        // A prefix match is done the moment the pattern runs out,
+        // however much target is left. `matchRun` still had to land on a
+        // code-point boundary to get here, so this cannot report a match
+        // that ended halfway through an expansion.
+        if (extent == .prefix and p >= pattern.codePoints()) return true;
         if (p < pattern.codePoints()) {
             const unit = patternUnit(pattern, p);
             const escaped = escapes[p];
@@ -338,6 +361,34 @@ fn matchFolded(
         return false;
     }
     return true;
+}
+
+/// §5.4b's `SEARCH`: the first ORIGINAL code-point index at or after
+/// `from` where `pattern` matches a prefix of `target`. Null when there
+/// is none.
+///
+/// The index is the caller's, not the fold's — `Folded.starts` is keyed
+/// by original code point, which is the whole reason the positional map
+/// exists. Converting that to §5.4d's index unit is `text.zig`'s job,
+/// because it is the compatibility version that decides whether an
+/// astral character counts once or twice.
+///
+/// Both arguments are already folded, so this is case-insensitive by
+/// construction. `FIND` does not come through here: it is `.raw`, and a
+/// raw search over folded strings would quietly become case-insensitive.
+pub fn searchFolded(
+    pattern: Folded,
+    escapes: []const bool,
+    target: Folded,
+    from: usize,
+) ?usize {
+    // An empty pattern matches at the start position, which is Excel's
+    // answer for `SEARCH("",text)` — 1 — rather than "not found".
+    var start = from;
+    while (start <= target.codePoints()) : (start += 1) {
+        if (matchFoldedFrom(pattern, escapes, target, start, .prefix)) return start;
+    }
+    return null;
 }
 
 fn patternUnit(f: Folded, i: usize) []const u8 {
@@ -503,6 +554,34 @@ fn matchWildcard(ctx: Context, pattern: []const u8, target: []const u8) Error!bo
     // the same ones — the flags line up with the folded units.
     assert(stripped.escaped.len == p.codePoints());
     return matchFolded(p, stripped.escaped, t);
+}
+
+/// `SEARCH`'s string half (M4f): the first ORIGINAL code-point index at
+/// or after `from` where `pattern` occurs, folded and with wildcards
+/// active. Null when it does not occur.
+///
+/// It lives here rather than in `text.zig` for the reason M4e gave for
+/// putting lookup equality here: the escape rules, the fold and the
+/// wildcard semantics are one thing, and a second copy of them in a
+/// second module is how `SEARCH("~*",…)` and `COUNTIF(…,"~*")` end up
+/// disagreeing about what a literal star is.
+pub fn searchText(
+    ctx: Context,
+    pattern: []const u8,
+    target: []const u8,
+    from: usize,
+) Error!?usize {
+    const stripped = try stripEscapes(ctx.allocator, pattern);
+    defer ctx.allocator.free(stripped.text);
+    defer ctx.allocator.free(stripped.escaped);
+
+    var p = try fold(ctx.allocator, ctx.collation.fold, stripped.text);
+    defer freeFolded(ctx.allocator, &p);
+    var t = try fold(ctx.allocator, ctx.collation.fold, target);
+    defer freeFolded(ctx.allocator, &t);
+
+    assert(stripped.escaped.len == p.codePoints());
+    return searchFolded(p, stripped.escaped, t, from);
 }
 
 pub fn freeFolded(allocator: std.mem.Allocator, f: *Folded) void {
@@ -732,6 +811,77 @@ test "match: booleans match booleans only" {
     // match the logical TRUE and vice versa.
     try testing.expect(!try matches(ctx, try crit("TRUE"), .{ .text = "TRUE" }));
     try testing.expect(!try matches(ctx, try crit("apple"), .{ .boolean = true }));
+}
+
+test "searchText: a substring, found case-insensitively, at a code-point index" {
+    const ctx = ctxOf();
+    try testing.expectEqual(@as(?usize, 0), try searchText(ctx, "ap", "apple", 0));
+    try testing.expectEqual(@as(?usize, 1), try searchText(ctx, "PP", "apple", 0));
+    try testing.expectEqual(@as(?usize, 4), try searchText(ctx, "e", "apple", 0));
+    try testing.expectEqual(@as(?usize, null), try searchText(ctx, "z", "apple", 0));
+    // Code points, not bytes: `é` is two bytes and one index, so `x`
+    // is the fifth character and the fourth index.
+    try testing.expectEqual(@as(?usize, 4), try searchText(ctx, "x", "caféx", 0));
+}
+
+test "searchText: `from` skips earlier hits without moving the answer" {
+    const ctx = ctxOf();
+    try testing.expectEqual(@as(?usize, 1), try searchText(ctx, "p", "apple", 0));
+    try testing.expectEqual(@as(?usize, 2), try searchText(ctx, "p", "apple", 2));
+    try testing.expectEqual(@as(?usize, null), try searchText(ctx, "p", "apple", 3));
+    // Starting past the end finds nothing rather than wrapping.
+    try testing.expectEqual(@as(?usize, null), try searchText(ctx, "a", "apple", 99));
+}
+
+test "searchText: an empty pattern matches where it starts looking" {
+    // Excel's `SEARCH("",text)` is 1 — the empty string is everywhere,
+    // and the first everywhere is the start position.
+    const ctx = ctxOf();
+    try testing.expectEqual(@as(?usize, 0), try searchText(ctx, "", "apple", 0));
+    try testing.expectEqual(@as(?usize, 3), try searchText(ctx, "", "apple", 3));
+    // Including at the very end, which is a position and not a
+    // character — `SEARCH("","ab",3)` is 3 in Excel.
+    try testing.expectEqual(@as(?usize, 5), try searchText(ctx, "", "apple", 5));
+}
+
+test "searchText: wildcards are active, and `~` still escapes them" {
+    const ctx = ctxOf();
+    try testing.expectEqual(@as(?usize, 1), try searchText(ctx, "p*e", "apple", 0));
+    try testing.expectEqual(@as(?usize, 0), try searchText(ctx, "a?p", "apple", 0));
+    try testing.expectEqual(@as(?usize, null), try searchText(ctx, "a?l", "apple", 0));
+    // A literal star is findable, and only where it literally is.
+    try testing.expectEqual(@as(?usize, 2), try searchText(ctx, "~*", "ab*c", 0));
+    try testing.expectEqual(@as(?usize, null), try searchText(ctx, "~*", "abc", 0));
+    // `*` matching nothing still matches at the earliest position.
+    try testing.expectEqual(@as(?usize, 0), try searchText(ctx, "*", "apple", 0));
+}
+
+test "searchText: an expanding fold reports the original position" {
+    // The reason the positional map exists. `ß` folds to `ss`, so a
+    // search for `ss` matches it — and the answer must be where `ß` is
+    // in the CALLER's string (index 1), not where `ss` is in the fold's
+    // (offset 1 of 4 bytes, which would be index 1 only by accident).
+    const ctx = ctxOf();
+    try testing.expectEqual(@as(?usize, 1), try searchText(ctx, "ss", "aßb", 0));
+    // …and `SS` finds it too, because the search is folded.
+    try testing.expectEqual(@as(?usize, 1), try searchText(ctx, "SS", "aßb", 0));
+    // But HALF an expansion is not a match: both sides must end on a
+    // code-point boundary, which is the same rule that makes the
+    // criterion `"?s"` fail against `"ß"` (M3b). A `SEARCH` that
+    // answered 2 here would be claiming a position inside a character.
+    try testing.expectEqual(@as(?usize, null), try searchText(ctx, "s", "aßb", 0));
+    // `ﬃ` folds to three bytes from one code point; a match after it
+    // reports index 2, not index 4.
+    try testing.expectEqual(@as(?usize, 2), try searchText(ctx, "x", "aﬃx", 0));
+}
+
+test "searchText: `?` consumes one code point, however wide its fold" {
+    // Version-INdependent by §5.4b: the compatibility version changes
+    // what LEN counts, never what `?` consumes.
+    const ctx = ctxOf();
+    try testing.expectEqual(@as(?usize, 0), try searchText(ctx, "a?b", "aßb", 0));
+    // An astral character is one code point, so one `?` takes it.
+    try testing.expectEqual(@as(?usize, 0), try searchText(ctx, "a?b", "a\u{1F600}b", 0));
 }
 
 test "wildcards: `*` and `?` under the ordinary cases" {

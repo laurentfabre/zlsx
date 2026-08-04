@@ -75,7 +75,15 @@ pub const CalcState = struct {
     /// `fullPrecision="0"` always refuses (§10), so a run that gets this
     /// far has it true.
     full_precision: bool = true,
-    text_compat: CompatibilityVersion = .cv2,
+    /// §5.4d: **absent compatibility metadata is CV1**, so that is the
+    /// default here. M4f corrected it from `.cv2`, which was the right
+    /// answer to a different question — CV2 is what Excel writes into
+    /// NEW workbooks, not what a workbook that says nothing means. The
+    /// files that say nothing are every pre-2024 workbook and every file
+    /// zlsx's own Writer emits (`fresh_emit.zig` writes no metadata
+    /// part), and under `.cv2` all of them would have counted an astral
+    /// character once where Excel counts it twice.
+    text_compat: CompatibilityVersion = .cv1,
 };
 
 /// Where a site-dependent construct is being evaluated. The typed
