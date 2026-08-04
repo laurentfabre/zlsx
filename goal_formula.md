@@ -1879,7 +1879,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M4b1** | EvalEnv adapter + decode boundary (**decoding split by carrier class (corrected)**: FORMULA carriers — `<f>` bodies, defined-name bodies, table formulas — **XML-entity decoding ONLY** (ST_Xstring does NOT apply; literal `"_x0041_"` in a formula survives byte-exact, round-trip oracle); STRING carriers — SST, inline, `t="str"` `<v>` — XML-entity THEN ST_Xstring, RICH strings concatenating all visible `<r>/<t>` runs in document order, `<rPh>` excluded (inline reader returns first `<t>` only, `sheet_xml.zig:552-563`; SST rich `sst_xml.zig:56-66`); authored STRING output ST_Xstring-encodes; authored FORMULA output XML-escapes only (raw borrowed XML today: `sheet_xml.zig:522`, `workbook_xml.zig:61`); authored formula text **XML-escapes ONLY — no ST_Xstring stage** (string carriers alone use ST_Xstring); authored-formula tests prove literal `_x0041_` stays literal; fixtures with `_x005F_`, encoded controls, and entity escapes in formulas AND names — `_xHHHH_`, escaped `_x005F_`, C0 controls, across SST/inline/`t="str"`; the SST view decodes XML entities only today, `sst_xml.zig:174-193`) + **input cell-type contract** (§5.7.2) + **implicit-coordinate reconstruction** (a `<c>` without `r` takes the column after the preceding cell — Office semantics, MS-OE376 §2.1.624; the parser SKIPS such cells today, `sheet_xml.zig:507`; fixtures: first-cell-no-r, gaps, formulas, out-of-grid) + symbol layer + namespace preflight | Decode/`'R&D'`/prefixed fixtures |
 | **M4b2** ✅ | Full calc-state parse (`CT_CalcPr` complete, `sheetCalcPr`, `date1904`, extensions byte-exact, `fullPrecision="0"` refuses) + **CT_CellFormula attribute inventory** (13 rows, one fixture each, unknown refuses) + **attribute-based** shared classification + sheet-wide topology validation + **AST copy-translation** (relative halves by (Δrow,Δcol); off-grid collapses the whole operand to `#REF!`) + `t="d"`'s normative lexical table | Slave-shape + topology matrix; attribute fixtures; 2 000-case randomized differential vs an independent translator; corpus `<calcPr>` byte round-trip; attribute/calc-state fuzz |
 | **M4b3** ✅ | Name resolution + table producers + 3D matrix + cache-based `evaluate` | Site semantics; opaque names; 3D fixtures |
-| **M4c** | F1a-1 (20: operators; IF, AND, OR, NOT, IFERROR, IFNA, IFS, SWITCH; ISBLANK, ISNUMBER, ISTEXT, ISERROR, ISERR, ISNA, ISLOGICAL, NA, N, T; **TRUE, FALSE** — added at M3a2, see the decisions block) | Oracle-first |
+| **M4c** ✅ | F1a-1 (20: operators; IF, AND, OR, NOT, IFERROR, IFNA, IFS, SWITCH; ISBLANK, ISNUMBER, ISTEXT, ISERROR, ISERR, ISNA, ISLOGICAL, NA, N, T; **TRUE, FALSE** — added at M3a2, see the decisions block) | Oracle-first |
 | **M4d** | F1a-2 (~17: ABS, ROUND, ROUNDUP, ROUNDDOWN, INT, TRUNC, MOD, POWER, SQRT, EXP, LN, LOG, LOG10, SIGN, PI, RAND, RANDBETWEEN) + multi-callsite/lazy-branch draw KATs | Oracle-first; KATs |
 | **M4e** | F1b (~22: SUM, COUNT, COUNTA, COUNTBLANK, AVERAGE, MIN, MAX, SUMIF, COUNTIF, AVERAGEIF, SUMPRODUCT; VLOOKUP, HLOOKUP, INDEX, MATCH, XLOOKUP, XMATCH, CHOOSE, ROW, ROWS, COLUMN, COLUMNS) — **Core gate 59** | Oracle-first |
 | **M4f** | F1c-text (~19: LEFT, RIGHT, MID, LEN, LOWER, UPPER, TRIM, CONCAT, CONCATENATE, TEXTJOIN, SUBSTITUTE, REPLACE, FIND, SEARCH, EXACT, VALUE, REPT, CHAR, CODE) + **CV1/CV2 shared text layer** (§5.4d; collation_v1 landed at M3a) | Oracle-first; codec tests; per-CV fixtures |
@@ -1932,6 +1932,104 @@ regenerates its count from it. The five metadata fields carry no defaults and
 a `@typeInfo` test proves it. Unregistered calls → typed refusal; `#NAME?`
 only for value-position resolution failure. Batch contents are enumerated in
 the ladder rows above (single source, no duplicate list to drift).
+
+**M4c decisions (shipped 2026-08-04).** Twelve points, in
+`src/formula/registry.zig` (six new rows and their implementations, the
+batch gates) and `eval.zig` (fixtures only). The first F-batch, and the
+row that discovered how little the committed oracle decides about
+functions.
+
+1. **The committed manifests decide exactly one cell of this batch, and
+   the fixtures say so out loud.** `TRUE()+1` = 2, recorded by both the
+   hand-spec excel suite and the LibreOffice one; nothing else in
+   §8.2's evidence touches F1a-1. Every other fixture ships
+   `spec_pinned` — and the label is **checked against the manifests**
+   rather than asserted: a row claiming oracle evidence no manifest
+   holds fails, and so does a row that ships spec-pinned while a
+   manifest decides it. The oracle-row count is pinned at 1, so when
+   the parked Excel leg runs and the suite grows F1a-1 rows, the row
+   that moves the count is the row that re-labels. Same discipline
+   §5.6g's 3D matrix shipped under at M4b3 (decision 14).
+2. **`N` is not the `.number` coercion class, and that is this row's one
+   real trap.** Excel's `N` carries its own conversion table — a number
+   is itself, `TRUE`/`FALSE` are 1 and 0, an error is the error, and
+   *everything else* is 0 — so `N("7")` is **0** where the numeric class
+   answers 7. Its slot is therefore `.value_any` and the table lives in
+   the implementation. `T` mirrors it: text is itself, an error is the
+   error, everything else is `""`, and `T(1)` is `""` rather than `"1"`.
+   Both are fixtured at the row a reasonable reading gets wrong.
+3. **`N` and `T` propagate where the IS-family observes.** §5.3c's
+   `observe` means "looks at an error without becoming one", and N and T
+   *become* it. So they sit two rows from `ISERR` in the same table
+   carrying the opposite class — which is precisely what §5.3c means by
+   provenance-aware **per function, never family-wide**.
+4. **`ISNA` asks by spelling, not by enum tag.** `ErrorValue` has two
+   arms and only `known` carries a `KnownError`; matching the tag alone
+   would answer FALSE for an `#N/A` that reached the evaluator through
+   M1a's extensible-literal rule as a rich spelling. `ISNA` is a
+   question about the error a user sees, and what they see is the
+   spelling.
+5. **The ladder's "lazy forms" is a grouping, not a contract.** The row
+   names IF, IFS, SWITCH, IFERROR and IFNA together, but §5.3a defers
+   three of them and declares the other two **EAGER**: Excel evaluates
+   every `IFS` and `SWITCH` arm, observably through volatiles. So the
+   proof for the eager pair is the *opposite* of the proof for the lazy
+   trio — `IFS(FALSE(),RAND(),TRUE(),RAND())` must draw **twice**, and a
+   fixture proving its untaken arm neither evaluated nor drew would have
+   been a fixture proving zlsx wrong. Both directions are draw-counted,
+   because a draw count is the one instrument a right answer arrived at
+   wrongly cannot satisfy.
+6. **`IFERROR` and `IFNA` invert §5.3c's first-error rule, and one pair
+   of cells proves it.** `IFERROR(A5,A6)` is `#N/A` — the *fallback's*
+   error, not the first argument's — while `IFNA(A5,A6)` is `#DIV/0!`,
+   the first argument's after all, because `#DIV/0!` is not what IFNA
+   catches. Same two cells, two functions, opposite answers; every
+   multi-argument name in the batch is fixtured in both argument orders,
+   and the coverage list is derived from the registry's own arity so a
+   function that gains an argument later cannot slip past unordered.
+7. **The IS-family reduces an array to its top-left, and the spill is
+   deferred to M7a on purpose.** M3a2 shipped `ISERROR`/`ISNUMBER`/
+   `ISBLANK` as `.value_any` with top-left reduction; the four new
+   members follow that convention rather than starting a second one.
+   Excel 365 spills `=ISNUMBER(A1:A3)`, and the registry already carries
+   `da_aware` for exactly that decision — taking it here would have been
+   M7a's call made early and in the wrong file.
+8. **The batch's size is regenerated in both directions and written
+   down in neither.** §7 makes the TSV the count source, so the gates
+   derive the twenty from `milestone == "M4c"`: every tagged row must
+   resolve through `registry.lookup` (no omissions), and every
+   registered function whose inventory row says `M4c` must be listed
+   under `F1a-1` (no substitutions). The ladder's own "20" is checked
+   against the same file by M3a2's per-milestone test, so prose and code
+   meet at the data rather than at each other.
+9. **`TRUE` and `FALSE` are proved ordinary rather than assumed so.**
+   They joined F1a-1 at M3a2 (decision 2) instead of being written for
+   it, and a zero-argument signature is the shape most likely to have
+   been waved through. Their five fields are asserted row by row —
+   including that a no-slot signature is **not** liftable, which is true
+   for a reason (there is nothing to lift) and not by accident.
+10. **The fuzz target varies argument *shapes* and asserts determinism,
+    not merely survival.** `fuzzEvalTarget` already fuzzes formula text;
+    this one fixes the grammar and varies what reaches a registered slot
+    — every §5.3b provenance, references, multi-area sets, both array
+    orientations, an omitted argument, an intersection, a nested call
+    and a locale-flavoured refusal. Each input is evaluated **twice**,
+    by two live evaluators over one arena, and the two results must
+    agree; a refusal must be the same refusal both times. "Evaluates two
+    ways" is the failure a single run cannot see.
+11. **The five conditional names needed no evaluator change.** M3a2
+    built `if_form`, `iferror_form` and `ifna_form` and left
+    `IFS`/`SWITCH` as eager `.plain` implementations, so F1a-1 is six
+    registry rows plus their implementations and `eval.zig` gained
+    fixtures only. The row's scope allowed touching the evaluator "where
+    a lazy form needs it"; nothing did.
+12. **What this row does NOT pin, said here so the table cannot be
+    misread.** The registry holds 29 entries and F1a-1 is 20 of them.
+    The other nine — `SUM`, `COUNT`, `COUNTA`, `COUNTBLANK`, `COUNTIF`,
+    `SUMIF`, `SQRT`, `RAND`, `CHOOSE` — are M3a2's framework test
+    subjects, registered and tested but **not oracle-pinned**; M4d and
+    M4e own them. "The registry has 29 entries" is not "29 functions
+    have shipped".
 
 ---
 

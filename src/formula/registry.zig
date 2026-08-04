@@ -35,10 +35,15 @@
 //! answers a third question entirely. A family-wide rule would get two
 //! of those three wrong, so the class is a required field on every entry.
 //!
-//! Scope note. The functions implemented here are the *framework's* test
-//! subjects, not their ladder rows: M4c/M4d/M4e are the PRs that pin
-//! each of them against the oracle. What M3a2 owes them is a registry
-//! they cannot be added to incorrectly.
+//! Scope note. M3a2 built the framework and registered whichever
+//! functions it needed to exercise it. **M4c closes F1a-1** — the
+//! twenty names the inventory tags `M4c`, each with a fixture, each
+//! pinned to the oracle where a committed manifest decides it and
+//! labelled `spec_pinned` where none does. The functions the framework
+//! borrowed from later rows (SUM, COUNT, COUNTA, COUNTBLANK, COUNTIF,
+//! SUMIF, SQRT, RAND, CHOOSE) are still M4d/M4e's to pin; they are in
+//! the table because the framework needed them, not because their row
+//! has run.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -298,6 +303,59 @@ pub const functions = [_]Function{
         .propagation = .observe,
         .impl = fnIsBlank,
     },
+    .{
+        .name = "ISERR",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &[_]CoercionClass{.value_any}, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .observe,
+        .impl = fnIsErr,
+    },
+    .{
+        .name = "ISNA",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &[_]CoercionClass{.value_any}, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .observe,
+        .impl = fnIsNa,
+    },
+    .{
+        .name = "ISLOGICAL",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &[_]CoercionClass{.value_any}, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .observe,
+        .impl = fnIsLogical,
+    },
+    .{
+        .name = "ISTEXT",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &[_]CoercionClass{.value_any}, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .observe,
+        .impl = fnIsText,
+    },
+
+    // ── N and T: they inspect the value like the IS-family and then
+    //    *become* something else, so they read `.value_any` and
+    //    `.propagate`. Not `.number`/`.text`: those classes coerce, and
+    //    Excel's `N("7")` is 0 where the numeric class would answer 7. ──
+    .{
+        .name = "N",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &[_]CoercionClass{.value_any}, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnN,
+    },
+    .{
+        .name = "T",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &[_]CoercionClass{.value_any}, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnT,
+    },
 
     // ── eager logical folds. Excel does NOT short-circuit these. ──
     .{
@@ -536,6 +594,65 @@ fn fnIsError(ctx: CallCtx, args: []const Value) FnError!Value {
 
 fn fnIsNumber(ctx: CallCtx, args: []const Value) FnError!Value {
     return Value.boolean(try observedScalar(ctx, args[0]) == .number);
+}
+
+/// Whether an error value is `#N/A` — asked by **spelling**, not by
+/// enum tag. `ErrorValue` has two arms and only one of them carries a
+/// `KnownError`; matching on the tag alone would answer FALSE for an
+/// `#N/A` that reached us through the extensible-literal rule as a rich
+/// spelling. `ISNA` is a question about the error a user sees, and what
+/// they see is the spelling.
+fn isNaError(s: value.ScalarValue) bool {
+    if (s != .err) return false;
+    return std.mem.eql(u8, s.err.spelling(), value.KnownError.na.spelling());
+}
+
+fn fnIsErr(ctx: CallCtx, args: []const Value) FnError!Value {
+    const s = try observedScalar(ctx, args[0]);
+    // Every error except `#N/A` — the one distinction that makes `ISERR`
+    // a separate function from `ISERROR` rather than a synonym.
+    return Value.boolean(s == .err and !isNaError(s));
+}
+
+fn fnIsNa(ctx: CallCtx, args: []const Value) FnError!Value {
+    return Value.boolean(isNaError(try observedScalar(ctx, args[0])));
+}
+
+fn fnIsLogical(ctx: CallCtx, args: []const Value) FnError!Value {
+    return Value.boolean(try observedScalar(ctx, args[0]) == .boolean);
+}
+
+fn fnIsText(ctx: CallCtx, args: []const Value) FnError!Value {
+    // `""` is text and a blank cell is not — the same three-way split
+    // `COUNTA`, `COUNTBLANK`, and `ISBLANK` are built on.
+    return Value.boolean(try observedScalar(ctx, args[0]) == .text);
+}
+
+/// `N(value)` — Excel's own conversion table, which is **not** the
+/// `.number` coercion class: a number is itself, `TRUE`/`FALSE` are 1
+/// and 0, an error is the error, and *everything else* — text numeric
+/// or not, and blank — is 0. `N("7")` is 0; the numeric class would say
+/// 7, and that is the whole reason this slot is `.value_any`.
+fn fnN(ctx: CallCtx, args: []const Value) FnError!Value {
+    const s = try observedScalar(ctx, args[0]);
+    return switch (s) {
+        .number => |n| Value.num(n),
+        .boolean => |b| Value.num(if (b) 1 else 0),
+        .err => .{ .scalar = s },
+        .text, .blank => Value.num(0),
+    };
+}
+
+/// `T(value)` — the mirror of `N`: text is itself, an error is the
+/// error, everything else is `""`. A number does NOT format; `T(1)` is
+/// `""`, not `"1"`.
+fn fnT(ctx: CallCtx, args: []const Value) FnError!Value {
+    const s = try observedScalar(ctx, args[0]);
+    return switch (s) {
+        .text => .{ .scalar = s },
+        .err => .{ .scalar = s },
+        .number, .boolean, .blank => .{ .scalar = .{ .text = "" } },
+    };
 }
 
 fn fnIsBlank(ctx: CallCtx, args: []const Value) FnError!Value {
@@ -989,6 +1106,182 @@ test "inventory: per-milestone counts reproduce the ladder" {
     try testing.expectEqual(@as(usize, 59), expected[0].n + expected[1].n + expected[2].n);
 }
 
+// ─── M4c: the F1a-1 batch, against the frozen inventory ──────────
+
+/// The batch this row ships, named the way the inventory names it. Both
+/// halves are checked: a row tagged `M4c` that the registry cannot
+/// answer is a missing function, and a registered function tagged `M4c`
+/// that the file does not list is a substitution. §7 makes the file the
+/// count source, so neither number is written down here.
+const m4c_milestone = "M4c";
+const m4c_batch = "F1a-1";
+
+fn isM4c(e: InventoryEntry) bool {
+    return std.mem.eql(u8, e.milestone, m4c_milestone) and
+        std.mem.eql(u8, e.batch, m4c_batch);
+}
+
+test "M4c: the batch's size is regenerated from the inventory, never from prose" {
+    // The ladder row says "20". This test does not: it counts the file,
+    // and the ladder's number is checked against the same file by
+    // `inventory: per-milestone counts reproduce the ladder`. If someone
+    // adds a 21st F1a-1 row, that test fails on the ladder's count and
+    // this one keeps holding the registry to whatever the file now says.
+    var it = inventory();
+    var counted: usize = 0;
+    while (it.next()) |e| {
+        if (isM4c(e)) counted += 1;
+    }
+    try testing.expect(counted > 0);
+
+    // Every `M4c`/`F1a-1` row resolves. This is the "no additions and no
+    // substitutions" gate in the direction the file decides.
+    var it2 = inventory();
+    var resolved: usize = 0;
+    while (it2.next()) |e| {
+        if (!isM4c(e)) continue;
+        const f = lookup(e.name) orelse {
+            std.debug.print("F1a-1 name not registered: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        };
+        // `lookup` folds case, so a row spelled `Isna` would resolve to
+        // `ISNA`; the table's own spelling is what ships.
+        try testing.expectEqualStrings(e.name, f.name);
+        resolved += 1;
+    }
+    try testing.expectEqual(counted, resolved);
+
+    // …and in the other direction: a registered function whose inventory
+    // row says `M4c` must be one the file lists under this batch. A
+    // function this row invented would be registered, present in the
+    // inventory under some *other* milestone, and caught by neither
+    // half without this.
+    var registered_m4c: usize = 0;
+    for (&functions) |*f| {
+        var it3 = inventory();
+        while (it3.next()) |e| {
+            if (!std.mem.eql(u8, e.name, f.name)) continue;
+            if (std.mem.eql(u8, e.milestone, m4c_milestone)) {
+                if (!isM4c(e)) {
+                    std.debug.print("{s}: tagged {s} but batch {s}\n", .{ f.name, e.milestone, e.batch });
+                    return error.BatchTagMismatch;
+                }
+                registered_m4c += 1;
+            }
+            break;
+        }
+    }
+    try testing.expectEqual(counted, registered_m4c);
+}
+
+test "M4c: every F1a-1 row declares all five fields, and none of them by default" {
+    // The struct-level guarantee is below (`the five required fields
+    // have no defaults`); this is the row-level one. A field with no
+    // default cannot be omitted, so "declared" is the compiler's job —
+    // what is left to check is that what was declared says something.
+    var it = inventory();
+    var seen: usize = 0;
+    while (it.next()) |e| {
+        if (!isM4c(e)) continue;
+        const f = lookup(e.name).?;
+        seen += 1;
+
+        try testing.expect(f.name.len > 0);
+        try testing.expectEqualStrings(e.name, f.name);
+
+        // Arity: a real range, with a repeating slot iff it is unbounded.
+        if (f.arity.max) |max| try testing.expect(f.arity.min <= max);
+        if (f.arity.max == null) try testing.expect(f.arity.rest.len > 0);
+        // Coercion: the two per-slot tables address the same slots, and
+        // a lazy slot lines up with the class that defers.
+        try testing.expectEqual(f.arity.fixed.len, f.coercion.fixed.len);
+        try testing.expectEqual(f.arity.rest.len, f.coercion.rest.len);
+        for (f.arity.fixed, f.coercion.fixed) |l, c| try testing.expectEqual(l == .lazy, c == .lazy_any);
+        for (f.arity.rest, f.coercion.rest) |l, c| try testing.expectEqual(l == .lazy, c == .lazy_any);
+        // Volatility: nothing in F1a-1 is redrawn. Stated per row rather
+        // than assumed, because `.stable` is also what a forgotten field
+        // would have looked like if it had a default — which is why it
+        // does not have one.
+        try testing.expectEqual(Volatility.stable, f.volatility);
+        // Propagation: §5.3c's classes, and F1a-1 uses exactly two of
+        // them. `per_element` is the operators' and
+        // `per_function_provenance` belongs to the counting family.
+        try testing.expect(f.propagation == .observe or f.propagation == .propagate);
+    }
+    try testing.expect(seen > 0);
+}
+
+test "M4c: TRUE and FALSE carry the same five fields as every other row" {
+    // They joined F1a-1 at M3a2 (decision 2) rather than being written
+    // for it, so the row proves they are ordinary entries instead of
+    // assuming it. Zero-argument is the shape most likely to have been
+    // waved through.
+    for ([_][]const u8{ "TRUE", "FALSE" }) |name| {
+        const f = lookup(name).?;
+        try testing.expectEqualStrings(name, f.name);
+        try testing.expectEqual(@as(u8, 0), f.arity.min);
+        try testing.expectEqual(@as(?u8, 0), f.arity.max);
+        try testing.expectEqual(@as(usize, 0), f.arity.fixed.len);
+        try testing.expectEqual(@as(usize, 0), f.coercion.fixed.len);
+        try testing.expectEqual(Volatility.stable, f.volatility);
+        try testing.expectEqual(value.PropagationClass.propagate, f.propagation);
+        try testing.expectEqual(Form.plain, f.form);
+        try testing.expect(f.impl != null);
+        // A no-slot signature is not liftable: there is nothing to lift.
+        try testing.expect(!f.liftable());
+        try testing.expect(inInventory(name));
+    }
+}
+
+test "M4c: the batch's propagation classes are the ones §5.3c assigns" {
+    // Stated name by name because §5.3c's whole point is that the class
+    // is per function: `ISERR` observes and `N` propagates, and they sit
+    // two rows apart in the same table.
+    const observers = [_][]const u8{
+        "ISBLANK",  "ISERR",  "ISERROR", "ISLOGICAL", "ISNA",
+        "ISNUMBER", "ISTEXT", "IF",      "IFERROR",   "IFNA",
+        "IFS",      "SWITCH",
+    };
+    for (observers) |name| {
+        try testing.expectEqual(value.PropagationClass.observe, lookup(name).?.propagation);
+    }
+    const propagators = [_][]const u8{ "AND", "OR", "NOT", "N", "T", "NA", "TRUE", "FALSE" };
+    for (propagators) |name| {
+        try testing.expectEqual(value.PropagationClass.propagate, lookup(name).?.propagation);
+    }
+    // Together they are the whole batch — so a name added to one list
+    // and forgotten in the other cannot pass.
+    var it = inventory();
+    var n: usize = 0;
+    while (it.next()) |e| {
+        if (isM4c(e)) n += 1;
+    }
+    try testing.expectEqual(n, observers.len + propagators.len);
+}
+
+test "M4c: the lazy forms are exactly the three §5.3a defers" {
+    // IFS and SWITCH are in this batch and are **eager** (§5.3a): Excel
+    // evaluates every arm, observably. So they carry an `impl` and no
+    // lazy slot, and IF/IFERROR/IFNA carry a form and no impl.
+    for ([_][]const u8{ "IF", "IFERROR", "IFNA" }) |name| {
+        const f = lookup(name).?;
+        try testing.expect(f.form != .plain);
+        try testing.expect(f.impl == null);
+        var lazy_slots: usize = 0;
+        for (f.arity.fixed) |l| {
+            if (l == .lazy) lazy_slots += 1;
+        }
+        try testing.expect(lazy_slots > 0);
+    }
+    for ([_][]const u8{ "IFS", "SWITCH", "AND", "OR" }) |name| {
+        const f = lookup(name).?;
+        try testing.expectEqual(Form.plain, f.form);
+        try testing.expect(f.impl != null);
+        for (f.arity.fixed) |l| try testing.expectEqual(Laziness.eager, l);
+        for (f.arity.rest) |l| try testing.expectEqual(Laziness.eager, l);
+    }
+}
+
 test "registry: the five required fields have no defaults" {
     // "Declares" is enforced by the type, not by review: a field with a
     // default can be omitted, and an omitted propagation class is how
@@ -1004,6 +1297,17 @@ test "registry: the five required fields have no defaults" {
         }
     }
     try testing.expectEqual(required.len, found);
+
+    // …and they are the ONLY fields without one. Checked in this
+    // direction too because §7 names five: a sixth mandatory field is a
+    // spec change, and a five that quietly became four is the failure
+    // this test exists to catch. Both are `@typeInfo` questions, and
+    // only asking one of them would leave half the claim untested.
+    var mandatory: usize = 0;
+    inline for (@typeInfo(Function).@"struct".fields) |f| {
+        if (f.default_value_ptr == null) mandatory += 1;
+    }
+    try testing.expectEqual(required.len, mandatory);
 }
 
 test "registry: every entry declares all five fields coherently" {

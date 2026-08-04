@@ -2043,6 +2043,7 @@ test "references: `:` spans, ` ` intersects, `,` unions" {
 const Expect = union(enum) {
     number: f64,
     boolean: bool,
+    text: []const u8,
     err: value.KnownError,
     array: Arr,
 
@@ -2058,6 +2059,11 @@ fn expectValue(exp: Expect, v: Value) !void {
         .boolean => |b| {
             try testing.expect(v == .scalar);
             try testing.expectEqual(b, v.scalar.boolean);
+        },
+        .text => |t| {
+            try testing.expect(v == .scalar);
+            try testing.expect(v.scalar == .text);
+            try testing.expectEqualStrings(t, v.scalar.text);
         },
         .err => |e| {
             try testing.expect(v == .scalar);
@@ -2117,6 +2123,9 @@ const form_cases = [_]FormCase{
 
     // ── IFERROR / IFNA: the fallback only on error ──
     .{ .formula = "IFERROR(A1,RAND())", .expect = .{ .number = 10 }, .draws = 0, .runtime = &.{"A1"}, .static = &.{"A1"} },
+    // The dependency half of the same fact: an unevaluated fallback is
+    // not read, which a draw counter alone would not have shown.
+    .{ .formula = "IFERROR(A1,B1)", .expect = .{ .number = 10 }, .draws = 0, .runtime = &.{"A1"}, .absent = &.{"B1"}, .static = &.{ "A1", "B1" } },
     .{ .formula = "IFERROR(C1,RAND())", .expect = .{ .number = 0.5 }, .draws = 1, .runtime = &.{"C1"}, .static = &.{"C1"} },
     .{ .formula = "IFERROR(1/0,B1)", .expect = .{ .number = 20 }, .draws = 0, .runtime = &.{"B1"}, .static = &.{"B1"} },
     .{ .formula = "IFNA(C1,B1)", .expect = .{ .number = 20 }, .draws = 0, .runtime = &.{ "C1", "B1" }, .static = &.{ "C1", "B1" } },
@@ -2352,6 +2361,555 @@ test "propagation: per_element keeps an error in its own cell" {
     try testing.expectEqual(@as(f64, 2), v.array.at(0, 0).number);
     try testing.expectEqual(value.KnownError.na, v.array.at(1, 0).err.known);
     try testing.expectEqual(@as(f64, 6), v.array.at(2, 0).number);
+}
+
+// ─── M4c: the F1a-1 batch (§7, twenty names) ─────────────────────
+//
+// Oracle-first, and honest about how little the oracle decides here.
+// One cell of one committed manifest touches this batch — `TRUE()+1`,
+// recorded 2 by both the hand-spec excel suite and the LibreOffice one
+// (§8.2). Everything else rests on the spec, so every row says which it
+// is and `evidence` is checked against the manifests rather than
+// trusted. That is the discipline §5.6g's 3D matrix shipped under at
+// M4b3, applied to functions.
+
+/// Where an expected value comes from. Same two-member shape as
+/// `value.DivergencePoint.evidence`, and for the same reason: a fixture
+/// that cannot say whether a machine or a paragraph decided it is a
+/// fixture nobody can re-check.
+const Evidence = enum { oracle, spec_pinned };
+
+/// One F1a-1 fixture. `func` is the inventory name the row is a fixture
+/// FOR — the coverage test derives the batch from the frozen TSV and
+/// fails if any of the twenty has no row here.
+const F1a1Case = struct {
+    func: []const u8,
+    formula: []const u8,
+    expect: Expect,
+    evidence: Evidence = .spec_pinned,
+    /// Why the spec says so, where the answer is one a reasonable
+    /// reading could get wrong.
+    note: []const u8 = "",
+};
+
+/// The environment every F1a-1 fixture reads. One cell per §5.3b
+/// provenance row, so a fixture can name the provenance it means
+/// instead of building a bespoke sheet.
+fn putF1a1Cells(h: *Harness) !void {
+    try h.put("A1", num(10)); // number
+    try h.put("A2", .{ .text = "abc" }); // non-numeric text
+    try h.put("A3", .{ .text = "" }); // `=""`, which is text and not blank
+    try h.put("A4", .{ .boolean = true }); // logical
+    try h.put("A5", value.ScalarValue.errorOf(.div0)); // an error that is not #N/A
+    try h.put("A6", value.ScalarValue.errorOf(.na)); // #N/A itself
+    // A7 is a true blank — deliberately not stored.
+    try h.put("A8", .{ .text = "7" }); // numeric text
+}
+
+const f1a1_cases = [_]F1a1Case{
+    // ── TRUE / FALSE: the two names M3a2 added to this batch ──
+    // The one row a committed manifest decides. `TRUE()` is a CALL, not
+    // a boolean literal — which is what put it in the inventory (M3a2
+    // decision 2) — so this is also the proof that the registry answers
+    // for it.
+    .{ .func = "TRUE", .formula = "TRUE()+1", .expect = .{ .number = 2 }, .evidence = .oracle },
+    .{ .func = "TRUE", .formula = "TRUE()", .expect = .{ .boolean = true } },
+    .{ .func = "FALSE", .formula = "FALSE()", .expect = .{ .boolean = false } },
+    .{ .func = "FALSE", .formula = "FALSE()+1", .expect = .{ .number = 1 } },
+
+    // ── NA: the only function whose whole job is to produce an error ──
+    .{ .func = "NA", .formula = "NA()", .expect = .{ .err = .na } },
+    .{ .func = "NA", .formula = "ISNA(NA())", .expect = .{ .boolean = true } },
+
+    // ── NOT / AND / OR ──
+    .{ .func = "NOT", .formula = "NOT(TRUE())", .expect = .{ .boolean = false } },
+    .{ .func = "NOT", .formula = "NOT(A1)", .expect = .{ .boolean = false }, .note = "a non-zero number is a TRUE condition" },
+    .{ .func = "NOT", .formula = "NOT(0)", .expect = .{ .boolean = true } },
+    .{ .func = "NOT", .formula = "NOT(A2)", .expect = .{ .err = .value }, .note = "text never coerces to a condition" },
+    .{ .func = "AND", .formula = "AND(TRUE(),FALSE())", .expect = .{ .boolean = false } },
+    .{ .func = "AND", .formula = "AND(A1,A4)", .expect = .{ .boolean = true } },
+    .{ .func = "AND", .formula = "AND(A2)", .expect = .{ .err = .value }, .note = "a direct text argument is #VALUE!" },
+    .{ .func = "AND", .formula = "AND(A2:A3)", .expect = .{ .err = .value }, .note = "text in a range is ignored, and ignoring everything leaves no logical value" },
+    .{ .func = "OR", .formula = "OR(TRUE(),FALSE())", .expect = .{ .boolean = true } },
+    .{ .func = "OR", .formula = "OR(0,0)", .expect = .{ .boolean = false } },
+
+    // ── the IS-family: `observe`, so an error is data ──
+    .{ .func = "ISBLANK", .formula = "ISBLANK(A7)", .expect = .{ .boolean = true } },
+    .{ .func = "ISBLANK", .formula = "ISBLANK(A3)", .expect = .{ .boolean = false }, .note = "`=\"\"` is text, not blank" },
+    .{ .func = "ISNUMBER", .formula = "ISNUMBER(A1)", .expect = .{ .boolean = true } },
+    .{ .func = "ISNUMBER", .formula = "ISNUMBER(A8)", .expect = .{ .boolean = false }, .note = "numeric text is text" },
+    .{ .func = "ISTEXT", .formula = "ISTEXT(A2)", .expect = .{ .boolean = true } },
+    .{ .func = "ISTEXT", .formula = "ISTEXT(A3)", .expect = .{ .boolean = true }, .note = "`\"\"` is text of length zero" },
+    .{ .func = "ISTEXT", .formula = "ISTEXT(A7)", .expect = .{ .boolean = false }, .note = "a blank cell is not text" },
+    .{ .func = "ISTEXT", .formula = "ISTEXT(A1)", .expect = .{ .boolean = false } },
+    .{ .func = "ISLOGICAL", .formula = "ISLOGICAL(A4)", .expect = .{ .boolean = true } },
+    .{ .func = "ISLOGICAL", .formula = "ISLOGICAL(A1)", .expect = .{ .boolean = false }, .note = "1 and TRUE are not the same value" },
+    .{ .func = "ISERROR", .formula = "ISERROR(A5)", .expect = .{ .boolean = true } },
+    .{ .func = "ISERROR", .formula = "ISERROR(A6)", .expect = .{ .boolean = true }, .note = "#N/A is an error to ISERROR" },
+    .{ .func = "ISERROR", .formula = "ISERROR(A1)", .expect = .{ .boolean = false } },
+    // The one distinction that makes ISERR a function rather than a
+    // synonym, stated in both directions beside ISNA's mirror image.
+    .{ .func = "ISERR", .formula = "ISERR(A5)", .expect = .{ .boolean = true } },
+    .{ .func = "ISERR", .formula = "ISERR(A6)", .expect = .{ .boolean = false }, .note = "every error EXCEPT #N/A" },
+    .{ .func = "ISERR", .formula = "ISERR(A1)", .expect = .{ .boolean = false } },
+    .{ .func = "ISNA", .formula = "ISNA(A6)", .expect = .{ .boolean = true } },
+    .{ .func = "ISNA", .formula = "ISNA(A5)", .expect = .{ .boolean = false } },
+
+    // ── N and T: Excel's own conversion tables, not the coercion classes ──
+    .{ .func = "N", .formula = "N(A1)", .expect = .{ .number = 10 } },
+    .{ .func = "N", .formula = "N(A4)", .expect = .{ .number = 1 }, .note = "TRUE is 1, FALSE is 0" },
+    .{ .func = "N", .formula = "N(FALSE())", .expect = .{ .number = 0 } },
+    .{ .func = "N", .formula = "N(A2)", .expect = .{ .number = 0 }, .note = "anything else is 0, never #VALUE!" },
+    .{ .func = "N", .formula = "N(A7)", .expect = .{ .number = 0 } },
+    // The row most likely to be got wrong by reaching for the `.number`
+    // coercion class: that class coerces numeric text and would answer 7.
+    .{ .func = "N", .formula = "N(A8)", .expect = .{ .number = 0 }, .note = "N does NOT coerce numeric text" },
+    .{ .func = "N", .formula = "N(\"7\")", .expect = .{ .number = 0 } },
+    .{ .func = "N", .formula = "N(A5)", .expect = .{ .err = .div0 }, .note = "an error is the error — N propagates" },
+    .{ .func = "T", .formula = "T(A2)", .expect = .{ .text = "abc" } },
+    .{ .func = "T", .formula = "T(A1)", .expect = .{ .text = "" }, .note = "a number does not format; T(1) is \"\", not \"1\"" },
+    .{ .func = "T", .formula = "T(A4)", .expect = .{ .text = "" } },
+    .{ .func = "T", .formula = "T(A7)", .expect = .{ .text = "" } },
+    .{ .func = "T", .formula = "T(A5)", .expect = .{ .err = .div0 } },
+    .{ .func = "T", .formula = "T(A3)", .expect = .{ .text = "" } },
+
+    // ── the conditional forms ──
+    .{ .func = "IF", .formula = "IF(TRUE(),A1,A2)", .expect = .{ .number = 10 } },
+    .{ .func = "IF", .formula = "IF(A2,1,2)", .expect = .{ .err = .value }, .note = "text is not a condition" },
+    .{ .func = "IFS", .formula = "IFS(FALSE(),1,TRUE(),2)", .expect = .{ .number = 2 } },
+    .{ .func = "IFS", .formula = "IFS(FALSE(),1,FALSE(),2)", .expect = .{ .err = .na }, .note = "nothing matched" },
+    .{ .func = "SWITCH", .formula = "SWITCH(2,1,\"a\",2,\"b\")", .expect = .{ .text = "b" } },
+    .{ .func = "SWITCH", .formula = "SWITCH(9,1,\"a\",2,\"b\")", .expect = .{ .err = .na } },
+    .{ .func = "SWITCH", .formula = "SWITCH(9,1,\"a\",2,\"b\",\"z\")", .expect = .{ .text = "z" }, .note = "a trailing odd argument is the default" },
+    .{ .func = "IFERROR", .formula = "IFERROR(A5,99)", .expect = .{ .number = 99 } },
+    .{ .func = "IFERROR", .formula = "IFERROR(A6,99)", .expect = .{ .number = 99 }, .note = "IFERROR catches #N/A too" },
+    .{ .func = "IFERROR", .formula = "IFERROR(A1,99)", .expect = .{ .number = 10 } },
+    .{ .func = "IFNA", .formula = "IFNA(A6,99)", .expect = .{ .number = 99 } },
+    .{ .func = "IFNA", .formula = "IFNA(A5,99)", .expect = .{ .err = .div0 }, .note = "IFNA catches #N/A ONLY — this is why it is a separate form" },
+    .{ .func = "IFNA", .formula = "IFNA(A1,99)", .expect = .{ .number = 10 } },
+};
+
+test "M4c: every F1a-1 fixture evaluates to what the oracle or the spec says" {
+    for (f1a1_cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF1a1Cells(&h);
+
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("F1a-1 `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectValue(c.expect, v) catch |e| {
+            std.debug.print("F1a-1 `{s}` ({s}): wrong value\n", .{ c.formula, c.func });
+            return e;
+        };
+    }
+}
+
+test "M4c: all twenty frozen names resolve, and each has a fixture" {
+    // The batch is read from `function_inventory_v1.tsv`, never written
+    // down here: §7 makes the file the count source, so a 21st row would
+    // fail this test rather than silently ship unfixtured.
+    var it = registry.inventory();
+    var batch: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4c")) continue;
+        batch += 1;
+
+        if (registry.lookup(e.name) == null) {
+            std.debug.print("F1a-1 name does not resolve: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        }
+        var fixtures: usize = 0;
+        for (f1a1_cases) |c| {
+            if (std.mem.eql(u8, c.func, e.name)) fixtures += 1;
+        }
+        if (fixtures == 0) {
+            std.debug.print("F1a-1 name has no fixture: {s}\n", .{e.name});
+            return error.UnfixturedBatchFunction;
+        }
+    }
+    try testing.expectEqual(@as(usize, 20), batch);
+
+    // …and no fixture names something outside the batch, which would
+    // make the coverage count above pass for the wrong reason.
+    for (f1a1_cases) |c| {
+        var found = false;
+        var it2 = registry.inventory();
+        while (it2.next()) |e| {
+            if (std.mem.eql(u8, e.name, c.func) and std.mem.eql(u8, e.milestone, "M4c")) found = true;
+        }
+        if (!found) {
+            std.debug.print("fixture names a function outside F1a-1: {s}\n", .{c.func});
+            return error.FixtureOutsideBatch;
+        }
+    }
+}
+
+/// Whether any committed manifest records a cell whose formula is this
+/// text. The point of asking the files rather than a list: a row
+/// labelled `.oracle` that no manifest contains is a claim of evidence
+/// that does not exist, and it is exactly the claim nobody re-checks.
+fn manifestsDecide(formula: []const u8) !bool {
+    for ([_][]const u8{ oracle_excel, oracle_ieee, oracle_libreoffice }) |json| {
+        const doc = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+        defer doc.deinit();
+        for (doc.value.object.get("cells").?.array.items) |cell| {
+            const f = cell.object.get("formula") orelse continue;
+            if (std.mem.eql(u8, f.string, formula)) return true;
+        }
+    }
+    return false;
+}
+
+test "M4c: the evidence label on every fixture is true of the committed manifests" {
+    var oracle_rows: usize = 0;
+    for (f1a1_cases) |c| {
+        const decided = try manifestsDecide(c.formula);
+        switch (c.evidence) {
+            .oracle => {
+                if (!decided) {
+                    std.debug.print("`{s}` claims oracle evidence no manifest holds\n", .{c.formula});
+                    return error.UnbackedOracleClaim;
+                }
+                oracle_rows += 1;
+            },
+            .spec_pinned => {
+                if (decided) {
+                    std.debug.print("`{s}` is decided by a manifest but ships spec-pinned\n", .{c.formula});
+                    return error.UnderstatedEvidence;
+                }
+            },
+        }
+    }
+    // Stated as a number so the balance cannot drift silently: the
+    // committed manifests touch this batch exactly once. When the parked
+    // Excel leg runs (§8.2) and the suite grows F1a-1 rows, this count
+    // moves and the row that moves it is the row that re-labels.
+    try testing.expectEqual(@as(usize, 1), oracle_rows);
+}
+
+test "M4c: error order in every multi-argument name of the batch (§5.3c)" {
+    // §5.3c: eager arguments evaluate in declaration order and the first
+    // error wins unless the class says otherwise. Every case below is
+    // run in both argument orders, because a fixture with one error in
+    // it proves propagation and says nothing about order.
+    const Case = struct { formula: []const u8, expect: value.KnownError };
+    const cases = [_]Case{
+        // AND / OR: `propagate`, and the error found first is the answer.
+        .{ .formula = "AND(A5,A6)", .expect = .div0 },
+        .{ .formula = "AND(A6,A5)", .expect = .na },
+        .{ .formula = "OR(A5,A6)", .expect = .div0 },
+        .{ .formula = "OR(A6,A5)", .expect = .na },
+        // …including from inside a range, in §5.6a's iteration order.
+        .{ .formula = "AND(A5:A6)", .expect = .div0 },
+        // IF: the condition is the only argument evaluated before a
+        // branch is chosen, so its error is the whole result and the
+        // arms never run.
+        .{ .formula = "IF(A5,A6,A6)", .expect = .div0 },
+        .{ .formula = "IF(A6,A5,A5)", .expect = .na },
+        // IFS is eager: every arm evaluates, but the FIRST condition's
+        // error still decides, because conditions are read in order.
+        .{ .formula = "IFS(A5,1,A6,2)", .expect = .div0 },
+        .{ .formula = "IFS(A6,1,A5,2)", .expect = .na },
+        // SWITCH: the subject first, then each candidate in order.
+        .{ .formula = "SWITCH(A5,1,2)", .expect = .div0 },
+        .{ .formula = "SWITCH(1,A5,2,A6,3)", .expect = .div0 },
+        .{ .formula = "SWITCH(1,A6,2,A5,3)", .expect = .na },
+        // IFERROR/IFNA are `observe`, which INVERTS the rule: the first
+        // argument's error is caught rather than propagated, so the
+        // answer is the fallback's error and not the first one.
+        .{ .formula = "IFERROR(A5,A6)", .expect = .na },
+        .{ .formula = "IFERROR(A6,A5)", .expect = .div0 },
+        // IFNA only catches #N/A, so a #DIV/0! first argument wins after
+        // all — the same two cells, the opposite answer from IFERROR.
+        .{ .formula = "IFNA(A5,A6)", .expect = .div0 },
+        .{ .formula = "IFNA(A6,A5)", .expect = .div0 },
+    };
+
+    for (cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF1a1Cells(&h);
+
+        const s = h.scalar(c.formula) catch |e| {
+            std.debug.print("error-order case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        if (s != .err or s.err != .known or s.err.known != c.expect) {
+            std.debug.print("error-order case `{s}`: expected {s}\n", .{ c.formula, c.expect.spelling() });
+            return error.WrongErrorOrder;
+        }
+    }
+
+    // Every multi-argument name in the batch appears above. The list is
+    // derived from the registry's arity rather than typed out, so a
+    // function that gains an argument later cannot slip past unordered.
+    var it = registry.inventory();
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4c")) continue;
+        const f = registry.lookup(e.name).?;
+        const multi = f.arity.max == null or f.arity.max.? > 1;
+        if (!multi) continue;
+        var covered = false;
+        for (cases) |c| {
+            if (std.mem.startsWith(u8, c.formula, e.name) and c.formula[e.name.len] == '(') covered = true;
+        }
+        if (!covered) {
+            std.debug.print("multi-argument name with no error-order fixture: {s}\n", .{e.name});
+            return error.MissingErrorOrderFixture;
+        }
+    }
+}
+
+test "M4c: the five conditional names, each proving its own §5.3a contract" {
+    // The ladder row groups IF, IFS, SWITCH, IFERROR and IFNA together
+    // as "the forms". They do NOT share a contract: §5.3a defers three
+    // of them and declares the other two eager, so the proof for each
+    // pair is the opposite of the proof for the other. Both are draw
+    // counts, and a draw count is the one instrument that cannot be
+    // satisfied by a right answer arrived at wrongly.
+    const Case = struct { formula: []const u8, draws: u64, absent: []const []const u8 = &.{} };
+    const lazy = [_]Case{
+        // Three arms written, one evaluated.
+        .{ .formula = "IF(TRUE(),RAND(),RAND())", .draws = 1 },
+        .{ .formula = "IF(FALSE(),RAND(),RAND())", .draws = 1 },
+        .{ .formula = "IF(TRUE(),1,A1)", .draws = 0, .absent = &.{"A1"} },
+        // The fallback is not evaluated when there is nothing to catch.
+        .{ .formula = "IFERROR(1,RAND())", .draws = 0 },
+        .{ .formula = "IFERROR(1,A1)", .draws = 0, .absent = &.{"A1"} },
+        .{ .formula = "IFNA(1,RAND())", .draws = 0 },
+        // …nor when the error is one this form does not catch.
+        .{ .formula = "IFNA(A5,RAND())", .draws = 0 },
+        .{ .formula = "IFNA(A5,A1)", .draws = 0, .absent = &.{"A1"} },
+    };
+    const eager = [_]Case{
+        // Both arms drawn, both conditions drawn: four RAND()s, four
+        // draws, whatever the first condition answered.
+        .{ .formula = "IFS(TRUE(),RAND(),TRUE(),RAND())", .draws = 2 },
+        .{ .formula = "IFS(FALSE(),RAND(),TRUE(),RAND())", .draws = 2 },
+        .{ .formula = "SWITCH(1,1,RAND(),2,RAND())", .draws = 2 },
+        .{ .formula = "SWITCH(2,1,RAND(),2,RAND())", .draws = 2 },
+    };
+
+    for (lazy ++ eager) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF1a1Cells(&h);
+
+        _ = h.eval(c.formula) catch |e| {
+            std.debug.print("form case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        if (h.draws.count != c.draws) {
+            std.debug.print(
+                "`{s}`: expected {d} draws, saw {d}\n",
+                .{ c.formula, c.draws, h.draws.count },
+            );
+            return error.WrongDrawCount;
+        }
+        for (c.absent) |a1| {
+            const cell = cellOf(a1);
+            if (h.ev.deps.hasCell(.{ .sheet = h.sheet, .row = cell.row, .col = cell.col })) {
+                std.debug.print("`{s}`: {s} was read from an arm that never runs\n", .{ c.formula, a1 });
+                return error.UnexpectedRuntimeDependency;
+            }
+        }
+    }
+
+    // And the same fact stated where it is easy to check: the eager pair
+    // draw once per written RAND(), the lazy trio do not.
+    for (eager) |c| try testing.expect(c.draws == 2);
+}
+
+// ─── M4c fuzz: no argument shape panics, leaks, or evaluates twice ──
+
+const f1a1_names = [_][]const u8{
+    "AND",     "FALSE", "IF",      "IFERROR",   "IFNA", "IFS",
+    "ISBLANK", "ISERR", "ISERROR", "ISLOGICAL", "ISNA", "ISNUMBER",
+    "ISTEXT",  "N",     "NA",      "NOT",       "OR",   "SWITCH",
+    "T",       "TRUE",
+};
+
+/// Argument *shapes*, not values: the fuzz is about what a slot can be
+/// handed, so the list spans scalars, every provenance, references,
+/// multi-area sets, arrays of both orientations, an omitted argument, a
+/// nested call, and the two constructs that produce a plane-2 refusal.
+const f1a1_arg_shapes = [_][]const u8{
+    "A1",            "A2",    "A3",     "A5",
+    "A7",            "A8",    "\"\"",   "\"7\"",
+    "TRUE()",        "0",     "-1",     "1/0",
+    "NA()",          "{1,2}", "{1;2}",  "A1:A8",
+    "(A1:A2,A5:A6)", "",      "@A1:A8", "1E+308*10",
+    "A1:B2 B1:B9",   "N(A8)", "S!A1",   "\"1,5\"",
+};
+
+fn valuesAgree(a: Value, b: Value) bool {
+    if (@as(std.meta.Tag(Value), a) != @as(std.meta.Tag(Value), b)) return false;
+    return switch (a) {
+        .scalar => |s| s.eql(b.scalar),
+        .missing_arg => true,
+        .array => |m| blk: {
+            if (m.rows != b.array.rows or m.cols != b.array.cols) break :blk false;
+            for (m.cells, b.array.cells) |x, y| {
+                if (!x.eql(y)) break :blk false;
+            }
+            break :blk true;
+        },
+        .reference => |r| blk: {
+            if (r.areas.len != b.reference.areas.len) break :blk false;
+            if (r.three_d != b.reference.three_d) break :blk false;
+            for (r.areas, b.reference.areas) |x, y| {
+                if (!std.meta.eql(x, y)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
+fn fuzzF1a1Env(fake: *env.Fake) !env.SheetIndex {
+    const sheet = try fake.addSheet("S");
+    try fake.putA1(sheet, .stored, "A1", num(10));
+    try fake.putA1(sheet, .stored, "A2", .{ .text = "abc" });
+    try fake.putA1(sheet, .stored, "A3", .{ .text = "" });
+    try fake.putA1(sheet, .stored, "A4", .{ .boolean = true });
+    try fake.putA1(sheet, .stored, "A5", value.ScalarValue.errorOf(.div0));
+    try fake.putA1(sheet, .stored, "A6", value.ScalarValue.errorOf(.na));
+    try fake.putA1(sheet, .stored, "A8", .{ .text = "7" });
+    return sheet;
+}
+
+fn fuzzF1a1Target(_: void, smith: *std.testing.Smith) anyerror!void {
+    @disableInstrumentation();
+
+    // Build a call to one of the twenty out of the shape alphabet. The
+    // grammar is fixed and the arguments are not, because the property
+    // under test is about argument shapes reaching a registered slot —
+    // malformed *text* is `fuzzEvalTarget`'s job.
+    var buf: [512]u8 = undefined;
+    var w: usize = 0;
+    const name = f1a1_names[smith.index(f1a1_names.len)];
+    @memcpy(buf[w..][0..name.len], name);
+    w += name.len;
+    buf[w] = '(';
+    w += 1;
+    var n: usize = 0;
+    while (n < 6 and !smith.eos()) : (n += 1) {
+        const arg = f1a1_arg_shapes[smith.index(f1a1_arg_shapes.len)];
+        if (w + arg.len + 2 > buf.len) break;
+        if (n > 0) {
+            buf[w] = ',';
+            w += 1;
+        }
+        @memcpy(buf[w..][0..arg.len], arg);
+        w += arg.len;
+    }
+    buf[w] = ')';
+    w += 1;
+    const src = buf[0..w];
+
+    var parsed = parser.parse(std.testing.allocator, src, .{}) catch return;
+    defer parsed.deinit(std.testing.allocator);
+    if (parsed == .refused) return;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var fake = env.Fake.init(std.testing.allocator);
+    defer fake.deinit();
+    const sheet = try fuzzF1a1Env(&fake);
+
+    var draw_value: f64 = 0.5;
+    var draws = DrawSource.constant(&draw_value);
+    const opts: Options = .{
+        .current_sheet = sheet,
+        .collation = .{ .fold = shippedFold },
+        .draws = &draws,
+        .site = .{
+            .row = coords.Row.fromOneBased(2) catch unreachable,
+            .col = coords.Col.fromZeroBased(1) catch unreachable,
+        },
+    };
+
+    // Two evaluators, both alive: results borrow the arena, and the
+    // arena outlives both. "Evaluates two ways" is the failure a single
+    // run cannot see — a registry entry that reads uninitialized
+    // padding, or an implementation whose answer depends on where the
+    // arena happened to be.
+    var first = Evaluator.init(arena_state.allocator(), fake.evalEnv(), opts);
+    defer first.deinit();
+    var second = Evaluator.init(arena_state.allocator(), fake.evalEnv(), opts);
+    defer second.deinit();
+
+    if (first.evaluate(parsed.ok)) |a| {
+        try assertRepresentable(a);
+        const b = second.evaluate(parsed.ok) catch return error.NondeterministicEvaluation;
+        try assertRepresentable(b);
+        if (!valuesAgree(a, b)) {
+            std.debug.print("`{s}` evaluated two ways\n", .{src});
+            return error.NondeterministicEvaluation;
+        }
+    } else |e| {
+        // A typed refusal is a legitimate outcome — but it has to be the
+        // same refusal twice.
+        if (second.evaluate(parsed.ok)) |_| {
+            return error.NondeterministicEvaluation;
+        } else |e2| {
+            if (e != e2) return error.NondeterministicEvaluation;
+        }
+    }
+}
+
+test "fuzz: no F1a-1 argument shape panics, leaks, or evaluates two ways" {
+    // The generator's alphabet is a second copy of the batch, so it gets
+    // the same treatment as every other copy in this row: checked
+    // against the file, not maintained by hand. A name the fuzzer never
+    // builds is a name the fuzzer never covers, and nothing else would
+    // have said so.
+    var it = registry.inventory();
+    var batch: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M4c")) continue;
+        batch += 1;
+        var present = false;
+        for (f1a1_names) |n| {
+            if (std.mem.eql(u8, n, e.name)) present = true;
+        }
+        if (!present) {
+            std.debug.print("fuzz alphabet is missing {s}\n", .{e.name});
+            return error.FuzzAlphabetIncomplete;
+        }
+    }
+    try testing.expectEqual(batch, f1a1_names.len);
+
+    try std.testing.fuzz({}, fuzzF1a1Target, .{
+        .corpus = &[_][]const u8{
+            "IF(A1,A2,A5)",
+            "IFS(A5,A1,A6,A2)",
+            "SWITCH(A1,A1,A2,A5)",
+            "IFERROR(A5,A6)",
+            "IFNA(A6,{1,2})",
+            "AND(A1:A8)",
+            "OR((A1:A2,A5:A6))",
+            "NOT(@A1:A8)",
+            "ISBLANK(A7)",
+            "ISERR(1/0)",
+            "ISNA(NA())",
+            "ISLOGICAL(TRUE())",
+            "ISTEXT(\"\")",
+            "ISNUMBER({1,2})",
+            "ISERROR(A1:B2 B1:B9)",
+            "N(A8)",
+            "T(A2)",
+            "N(\"1,5\")",
+            "T({1;2})",
+            "NA()",
+            "TRUE()",
+            "FALSE()",
+        },
+    });
 }
 
 // ─── boundaries and refusals ─────────────────────────────────────
@@ -2871,6 +3429,19 @@ test "checkAllAllocationFailures: evaluation leaks nothing under OOM" {
         "A2<\"ABC\"",
         "IFERROR(1/0,A1&A2)",
         "COUNTBLANK(A1:B9)",
+        // M4c: every new impl, plus the shapes that make one of them
+        // allocate — a range walk, a multi-area set, and the lifted
+        // array path through a scalar slot.
+        "ISERR(1/0)",
+        "ISNA(A1:B1)",
+        "ISLOGICAL((A1:A2,B1:B1))",
+        "ISTEXT(A2)",
+        "N(A2)&T(A2)",
+        "N(A1:B1)",
+        "IFS(ISERR(1/0),T(A2),TRUE(),N(A1))",
+        "SWITCH(N(A1),2,T(A2),\"z\")",
+        "AND(ISNA(NA()),OR(ISTEXT(A2),ISLOGICAL(A1)))",
+        "NOT(ISBLANK(A1))",
     };
     for (sources) |src| {
         try testing.checkAllAllocationFailures(testing.allocator, evalUnderOom, .{src});
