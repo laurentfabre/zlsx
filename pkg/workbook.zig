@@ -1266,6 +1266,236 @@ pub const Workbook = struct {
         return .{ .ok = .{ .arena = arena, .value = owned } };
     }
 
+    /// **Internal (§5.6f).** Evaluate one formula against this
+    /// workbook's *dependency closure*.
+    ///
+    /// The second of the two behaviours §5.6f names, and the reason it
+    /// says "no silent switch": `evaluate` above reads the `<v>` the
+    /// file already carries, this one recomputes every formula cell the
+    /// target transitively reads, in the graph's order, and then
+    /// evaluates the target against those results. Both ship, both are
+    /// tested, and a caller picks by which function it calls.
+    ///
+    /// **Iteration is M5a2's.** A cycle anywhere in the closure is
+    /// `FormulaCycle` here (§5.6c's iteration-off rule); the workbook's
+    /// `calcPr@iterate` is read but not yet honoured.
+    ///
+    /// **Dynamic-array placement is M7a's.** A planned cell whose result
+    /// is an array contributes its top-left to the computed layer and
+    /// spills nothing: this row models the tails as nodes, which is what
+    /// makes the order right, and leaves what lands in them to the row
+    /// that decides it.
+    ///
+    /// **Purity.** Identical to `evaluate`'s: scratch-only. The graph,
+    /// the plan and every computed value live in the model's arena and
+    /// the returned one; the workbook's logical state and its serialized
+    /// bytes are byte-identical before and after, on success, on refusal
+    /// and under injected allocation failure.
+    pub fn evaluateClosure(
+        self: *Workbook,
+        allocator: Allocator,
+        sheet_index: u32,
+        formula: []const u8,
+        opts: EvaluateOptions,
+    ) Error!EvaluateResult {
+        if (sheet_index >= self.worksheets.len) return Error.SheetNotFound;
+
+        var model = switch (try WorkbookEnv.build(allocator, self, .{
+            .collation = opts.collation,
+            .fidelity = opts.fidelity,
+            .limits = opts.limits,
+        })) {
+            .ok => |m| m,
+            .refused => |r| return .{ .refused = r },
+        };
+        defer model.deinit();
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        var keep = false;
+        defer if (!keep) arena.deinit();
+        const a = arena.allocator();
+
+        var bridge: GraphBridge = .{ .model = &model, .gpa = allocator };
+        const input = try bridge.buildInput(a);
+
+        // §9's parse bounds govern the *stored* bodies too: a workbook
+        // whose cells a caller's limits cannot parse is a refusal, not a
+        // graph with those cells quietly missing.
+        var g = switch (try engine.graph.build(allocator, input, bridge.resolver(), .{
+            .parse_limits = opts.parse_limits,
+        })) {
+            .ok => |x| x,
+            .refused => |r| return .{ .graph_refused = r },
+        };
+        defer g.deinit();
+
+        // The target is parsed once, here, and both refusals it can
+        // raise are the ones `evaluate` raises for the same text: the
+        // two entry points differ in what they read, never in what they
+        // call a refusal.
+        var parsed = try engine.parser.parse(a, formula, .{ .limits = opts.parse_limits });
+        const target_ast = switch (parsed) {
+            .ok => |x| x,
+            .refused => |r| {
+                parsed.deinit(a);
+                return .{ .parse_refused = r };
+            },
+        };
+        if (engine.names.checkThreeD(target_ast, .{ .array_formula = opts.array_formula })) |r| {
+            return .{ .eval_refused = .{
+                .plane = .FormulaUnsupportedConstruct,
+                .three_d = r,
+            } };
+        }
+
+        const site: ?coords.Cell = if (opts.site) |s| .{ .row = s.row, .col = s.col } else null;
+        const roots = try engine.graph.rootsOfAst(allocator, a, input, bridge.resolver(), .{
+            .key = .{ .cell = .{
+                .sheet = engine.env.SheetIndex.fromInt(sheet_index),
+                .row = coords.Row.fromOneBased(1) catch unreachable,
+                .col = coords.Col.fromZeroBased(0) catch unreachable,
+            } },
+            .sheet = engine.env.SheetIndex.fromInt(sheet_index),
+            .site = site,
+            .array_formula = opts.array_formula,
+        }, target_ast);
+
+        var counters: engine.graph.WorkCounters = .{};
+        const plan = switch (try engine.graph.plan(g, a, roots, &counters)) {
+            .ok => |p| p,
+            .refused => |r| return .{ .graph_refused = r },
+        };
+
+        // Every planned cell, in the graph's order, into the computed
+        // layer. `putComputed` writes to the model — which is scratch,
+        // built from the package and thrown away at this function's
+        // `defer` — never to the workbook.
+        for (plan.cells) |node| {
+            const cell = g.keys[node].cell;
+            // The node came from this model's own cells, so the sheet
+            // exists; the read cannot fail for any other reason either.
+            const text = (model.formulaAt(cell) catch |e| switch (e) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.SheetNotFound,
+            }) orelse continue;
+            const v = switch (try self.evaluateOne(a, &model, cell, text, opts)) {
+                .ok => |x| x,
+                .refused => |r| return r,
+            };
+            model.putComputed(cell.sheet, cell.row, cell.col, v) catch |e| switch (e) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.SheetNotFound,
+            };
+        }
+
+        const target = switch (try self.evaluateTarget(a, &model, sheet_index, target_ast, opts)) {
+            .ok => |x| x,
+            .refused => |r| return r,
+        };
+
+        keep = true;
+        return .{ .ok = .{ .arena = arena, .value = target } };
+    }
+
+    const OneCell = union(enum) {
+        ok: engine.value.ScalarValue,
+        refused: EvaluateResult,
+    };
+
+    fn evaluateOne(
+        self: *Workbook,
+        a: Allocator,
+        model: *WorkbookEnv,
+        cell: engine.env.CellRef,
+        text: []const u8,
+        opts: EvaluateOptions,
+    ) Error!OneCell {
+        _ = self;
+        var parsed = try engine.parser.parse(a, text, .{ .limits = opts.parse_limits });
+        const ast = switch (parsed) {
+            .ok => |x| x,
+            .refused => |r| {
+                parsed.deinit(a);
+                return .{ .refused = .{ .parse_refused = r } };
+            },
+        };
+
+        // §5.3b: a *stored* cell's dialect is the workbook's answer, not
+        // the caller's. `evaluate` states one because a standalone
+        // formula has no cell to ask about.
+        const dialect = model.evalEnv().dialectOf(cell) catch |e| switch (e) {
+            error.OutOfMemory => return Error.OutOfMemory,
+            else => return .{ .refused = .{ .eval_refused = .{
+                .plane = .FormulaUnsupportedConstruct,
+                .name = null,
+            } } },
+        };
+
+        var draws = engine.eval.DrawSource.constant(&unreachable_draw);
+        var resolution: engine.NameResolution = .{ .table = &model.symbols, .gpa = model.allocator };
+        var evaluator = engine.eval.Evaluator.init(a, model.evalEnv(), .{
+            .current_sheet = cell.sheet,
+            .collation = opts.collation,
+            .draws = &draws,
+            .fidelity = opts.fidelity,
+            .dialect = dialect,
+            .site = .{ .row = cell.row, .col = cell.col },
+            .names = resolution.resolver(),
+            .limits = opts.parse_limits,
+        });
+        defer evaluator.deinit();
+
+        const v = evaluator.evaluate(ast) catch |e| {
+            if (e == error.OutOfMemory) return Error.OutOfMemory;
+            return .{ .refused = .{ .eval_refused = .{
+                .plane = engine.eval.planeTwo(e),
+                .name = resolution.last_refusal,
+                .three_d = evaluator.last_three_d,
+            } } };
+        };
+        return .{ .ok = try cloneScalar(a, scalarOf(v)) };
+    }
+
+    const OneValue = union(enum) {
+        ok: engine.eval.Value,
+        refused: EvaluateResult,
+    };
+
+    fn evaluateTarget(
+        self: *Workbook,
+        a: Allocator,
+        model: *WorkbookEnv,
+        sheet_index: u32,
+        ast: engine.parser.Ast,
+        opts: EvaluateOptions,
+    ) Error!OneValue {
+        _ = self;
+        var draws = engine.eval.DrawSource.constant(&unreachable_draw);
+        var resolution: engine.NameResolution = .{ .table = &model.symbols, .gpa = model.allocator };
+        var evaluator = engine.eval.Evaluator.init(a, model.evalEnv(), .{
+            .current_sheet = engine.env.SheetIndex.fromInt(sheet_index),
+            .collation = opts.collation,
+            .draws = &draws,
+            .fidelity = opts.fidelity,
+            .dialect = opts.dialect,
+            .site = opts.site,
+            .names = resolution.resolver(),
+            .array_formula = opts.array_formula,
+            .limits = opts.parse_limits,
+        });
+        defer evaluator.deinit();
+
+        const v = evaluator.evaluate(ast) catch |e| {
+            if (e == error.OutOfMemory) return Error.OutOfMemory;
+            return .{ .refused = .{ .eval_refused = .{
+                .plane = engine.eval.planeTwo(e),
+                .name = resolution.last_refusal,
+                .three_d = evaluator.last_three_d,
+            } } };
+        };
+        return .{ .ok = try cloneEvaluated(a, v) };
+    }
+
     /// Register a workbook-level defined name (B3 iter-wr-3 fresh-emit
     /// surface). Validates the name shape against Excel's full rule
     /// set (R1C1 reject, A1-shape reject, illegal char reject,
@@ -7612,6 +7842,10 @@ pub const EvaluateResult = union(enum) {
     refused: FormulaRefusal,
     /// The formula did not parse (§5.2).
     parse_refused: engine.parser.Refusal,
+    /// M5a1: the dependency graph refused. A cycle with iteration off,
+    /// a malformed cache seed, a §9 work limit — all statements about
+    /// the workbook, raised before a single cell was recomputed.
+    graph_refused: engine.graph.Refusal,
     /// It parsed and the evaluator refused it (§10, plane 2). The two
     /// resolvers' typed reasons ride along, because the plane alone
     /// cannot say *which* name or *which* 3D rule.
@@ -7653,12 +7887,241 @@ fn cloneEvaluated(a: Allocator, v: engine.eval.Value) Error!engine.eval.Value {
     };
 }
 
+/// What a planned cell contributes to the computed layer.
+///
+/// An array result gives its top-left and spills nothing: modeling the
+/// tails is this row's, deciding what lands in them is M7a's.
+fn scalarOf(v: engine.eval.Value) engine.value.ScalarValue {
+    return switch (v) {
+        .scalar => |x| x,
+        .array => |m| m.cells[0],
+        .missing_arg => .blank,
+        // `Evaluator.evaluate` dereferences a reference result before
+        // returning, so one cannot arrive here.
+        .reference => unreachable,
+    };
+}
+
 fn cloneScalar(a: Allocator, s: engine.value.ScalarValue) Error!engine.value.ScalarValue {
     return switch (s) {
         .text => |t| .{ .text = try a.dupe(u8, t) },
         else => s,
     };
 }
+
+/// `WorkbookEnv` and `SymbolTable`, as the dependency graph sees them.
+///
+/// The graph module owns no package types by design — `src/formula/`
+/// stays free of `pkg/` — so everything it needs about a real workbook
+/// arrives through this one struct: plain data for the node set, and a
+/// vtable for the three questions a static walk cannot answer from an
+/// AST (which sheet a name means, what a spelling binds to, what area a
+/// structured reference denotes).
+const GraphBridge = struct {
+    model: *WorkbookEnv,
+    gpa: Allocator,
+
+    fn resolver(self: *GraphBridge) engine.graph.Resolver {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    const vtable: engine.graph.Resolver.VTable = .{
+        .resolveSheet = vtSheet,
+        .resolveName = vtName,
+        .resolveStructured = vtStructured,
+    };
+
+    fn of(ctx: *anyopaque) *GraphBridge {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    /// Every formula-bearing coordinate, every defined name, every table
+    /// producer. Allocated into the caller's arena, borrowing the
+    /// model's strings — which is why the model has to outlive the
+    /// graph, and does.
+    fn buildInput(self: *GraphBridge, a: Allocator) Error!engine.graph.Input {
+        var cells: std.ArrayList(engine.graph.CellInput) = .empty;
+        for (self.model.sheets, 0..) |sheet, i| {
+            const idx = engine.env.SheetIndex.fromInt(@intCast(i));
+            // Sorted by (row, col, layer descending), so the first entry
+            // at a coordinate is the merged one and the rest are shadowed.
+            for (sheet.cells.items, 0..) |c, k| {
+                if (k > 0) {
+                    const prev = sheet.cells.items[k - 1];
+                    if (prev.row == c.row and prev.col == c.col) continue;
+                }
+                const text = c.formula_text orelse continue;
+                try cells.append(a, .{
+                    .cell = .{ .sheet = idx, .row = c.row, .col = c.col },
+                    .formula = text,
+                    .cache = c.cache,
+                    .array = c.array_ref,
+                });
+            }
+        }
+
+        const names = try a.alloc(engine.graph.NameInput, self.model.symbols.names.len);
+        for (self.model.symbols.names, names) |src, *dst| {
+            dst.* = .{ .identifier = src.identifier, .body = src.body, .scope = src.scope };
+        }
+
+        var producers: std.ArrayList(engine.graph.ProducerInput) = .empty;
+        for (self.model.symbols.tables) |t| {
+            const geom = geometryOf(t) orelse continue;
+            for (t.columns, 0..) |col, i| {
+                const sheet_col = coords.Col.fromZeroBased(
+                    geom.ref.first.col.zeroBased() + @as(u32, @intCast(i)),
+                ) catch continue;
+                const both = [_]struct {
+                    kind: engine.names.ProducerKind,
+                    body: ?[]const u8,
+                }{
+                    .{ .kind = .calculated_column, .body = col.calculated_formula },
+                    .{ .kind = .totals_row, .body = col.totals_formula },
+                };
+                for (both) |p| {
+                    const body = p.body orelse continue;
+                    const span = engine.names.producerSpan(
+                        p.kind,
+                        geom.ref,
+                        geom.header_rows,
+                        geom.totals_rows,
+                        sheet_col,
+                    ) orelse continue;
+                    try producers.append(a, .{
+                        .table = t.name,
+                        .column = col.name,
+                        .kind = p.kind,
+                        .body = body,
+                        .span = .{ .sheet = t.sheet, .range = .{
+                            .first = .{ .row = span.first_row, .col = span.col },
+                            .last = .{ .row = span.last_row, .col = span.col },
+                        } },
+                    });
+                }
+            }
+        }
+
+        return .{
+            .sheet_count = @intCast(self.model.sheets.len),
+            .cells = cells.items,
+            .names = names,
+            .producers = producers.items,
+        };
+    }
+
+    /// A table's `ref` is stored raw. A `ref` that will not parse leaves
+    /// no geometry to compute against, which is the same answer M4b3's
+    /// member check gives it.
+    fn geometryOf(t: engine.Table) ?engine.graph.TableGeometry {
+        const ref = coords.parseRange(t.ref, .{ .dollar = .accept }) catch return null;
+        return .{
+            .sheet = t.sheet,
+            .ref = ref.normalized(),
+            .header_rows = t.header_rows,
+            .totals_rows = t.totals_rows,
+        };
+    }
+
+    fn vtSheet(ctx: *anyopaque, name: []const u8) engine.graph.Error!?engine.env.SheetIndex {
+        const self = of(ctx);
+        return self.model.symbols.resolveSheet(self.gpa, name);
+    }
+
+    fn vtName(
+        ctx: *anyopaque,
+        from: ?engine.env.SheetIndex,
+        spelling: []const u8,
+    ) engine.graph.Error!engine.graph.NameBinding {
+        const self = of(ctx);
+        const table = &self.model.symbols;
+        return switch (try table.resolveName(self.gpa, from, spelling)) {
+            .name => |ptr| .{ .name = @intCast(ptr - table.names.ptr) },
+            // §5.9's table tier. Evaluating one is M7b's; the *edge* is
+            // this row's, and the area a bare table name denotes is its
+            // data body.
+            .table => |t| blk: {
+                const geom = geometryOf(t.*) orelse break :blk .unresolved;
+                if (t.columns.len == 0) break :blk .unresolved;
+                const area = engine.graph.tableArea(
+                    geom,
+                    .{ .data = true },
+                    0,
+                    @intCast(t.columns.len - 1),
+                    null,
+                ) orelse break :blk .unresolved;
+                break :blk .{ .area = area };
+            },
+            // A refused spelling refuses when it is *referenced*; there
+            // is no value behind it, so there is nothing to depend on.
+            .not_found, .refused => .unresolved,
+        };
+    }
+
+    fn vtStructured(
+        ctx: *anyopaque,
+        from: ?engine.env.SheetIndex,
+        owner: engine.graph.Owner,
+        table: ?[]const u8,
+        items: engine.parser.ItemSet,
+        columns: engine.parser.ColumnSelector,
+    ) engine.graph.Error!?engine.env.RangeRef {
+        const self = of(ctx);
+        const symbols = &self.model.symbols;
+
+        // The bare `[…]` form names the owner's own table, which only a
+        // table producer has.
+        const spelling = table orelse switch (owner.key) {
+            .producer => |p| p.table,
+            else => return null,
+        };
+        const t = switch (try symbols.resolveName(self.gpa, from, spelling)) {
+            .table => |x| x,
+            else => return null,
+        };
+        const geom = geometryOf(t.*) orelse return null;
+
+        const first: u32, const last: u32 = switch (columns) {
+            .none => .{ 0, @intCast(t.columns.len -| 1) },
+            .one => |raw| blk: {
+                const i = (try self.columnIndex(t.*, raw)) orelse return null;
+                break :blk .{ i, i };
+            },
+            .range => |r| blk: {
+                const x = (try self.columnIndex(t.*, r.first)) orelse return null;
+                const y = (try self.columnIndex(t.*, r.last)) orelse return null;
+                break :blk .{ x, y };
+            },
+        };
+        if (t.columns.len == 0) return null;
+        return engine.graph.tableArea(
+            geom,
+            items,
+            first,
+            last,
+            if (owner.site) |c| c.row else null,
+        );
+    }
+
+    /// A structured reference keeps its column names raw, with the `'`
+    /// escapes intact. Decoding then folding is what the symbol layer
+    /// matched on when it built the table, so it is what has to happen
+    /// here too.
+    fn columnIndex(
+        self: *GraphBridge,
+        t: engine.Table,
+        raw: []const u8,
+    ) engine.graph.Error!?u32 {
+        const decoded = try engine.parser.decodeColumnName(self.gpa, raw);
+        defer self.gpa.free(decoded);
+        const folded = self.model.symbols.fold(self.gpa, decoded) catch |e| {
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            return null;
+        };
+        defer self.gpa.free(folded);
+        return t.columnIndex(folded);
+    }
+};
 
 pub const FormulaEnvOptions = struct {
     /// §5.4b's fold, injected rather than imported — `value.zig` keeps
@@ -7708,6 +8171,13 @@ pub const WorkbookEnv = struct {
         vm: u32 = 0,
         /// Decoded `<f>` body (FORMULA carrier), when the cell has one.
         formula_text: ?[]const u8 = null,
+        /// A legacy CSE array's declared range (M5a1's spill tails).
+        array_ref: ?coords.Range = null,
+        /// What the `<v>` was, as §5.6c's seed table sees it. Kept
+        /// alongside the value rather than derived from it: `blank` is
+        /// what both an absent `<v>` and a genuine blank read as, and
+        /// the seed table has to tell them apart.
+        cache: engine.graph.CacheState = .absent,
     };
 
     /// Sorted by (row, col, layer descending), so a merged read is the
@@ -7837,7 +8307,7 @@ pub const WorkbookEnv = struct {
             // Stored cells arrive row-major already, so appending keeps
             // the ordering invariant without a sort.
             try sheets[idx].cells.ensureUnusedCapacity(a, scanned.cells.len);
-            for (scanned.cells, formulas) |c, text| {
+            for (scanned.cells, formulas) |c, f| {
                 sheets[idx].cells.appendAssumeCapacity(.{
                     .row = c.row,
                     .col = c.col,
@@ -7845,7 +8315,9 @@ pub const WorkbookEnv = struct {
                     .v = try dupeValue(a, c.input.scalar(), c.input == .uncached),
                     .cm = c.cm,
                     .vm = c.vm,
-                    .formula_text = text,
+                    .formula_text = f.text,
+                    .array_ref = f.array,
+                    .cache = graphCacheState(c.input),
                 });
             }
 
@@ -8371,11 +8843,20 @@ fn decodeStrings(
     });
 }
 
+/// What one cell's `<f>` resolved to.
+const SharedText = struct {
+    /// Null where the cell has no `<f>`.
+    text: ?[]const u8 = null,
+    /// The declared range of a legacy CSE array (`<f t="array" ref>`).
+    /// M5a1 reads it: the graph's spill tails are the cells inside it.
+    array: ?coords.Range = null,
+};
+
 const SharedTextResult = union(enum) {
-    /// One entry per cell, in the order `scanSheet` produced them; null
-    /// where the cell has no `<f>`. The outer slice is the caller's to
-    /// free, the strings belong to the model arena.
-    ok: []const ?[]const u8,
+    /// One entry per cell, in the order `scanSheet` produced them. The
+    /// outer slice is the caller's to free, the strings belong to the
+    /// model arena.
+    ok: []const SharedText,
     refused: engine.calc.Refusal,
 };
 
@@ -8399,7 +8880,7 @@ const SharedTextResult = union(enum) {
 /// quadratic.
 const ProducerCells = struct {
     cells: []const engine.decode.SheetCell,
-    formulas: []const ?[]const u8,
+    formulas: []const SharedText,
 
     pub fn hasFormula(self: ProducerCells, row: coords.Row, col: coords.Col) bool {
         var lo: usize = 0;
@@ -8418,7 +8899,7 @@ const ProducerCells = struct {
         if (lo >= self.cells.len) return false;
         const hit = self.cells[lo];
         if (hit.row != row or hit.col != col) return false;
-        return self.formulas[lo] != null;
+        return self.formulas[lo].text != null;
     }
 };
 
@@ -8434,7 +8915,7 @@ const ProducerCells = struct {
 fn checkTableProducers(
     table: engine.decode.Table,
     cells: []const engine.decode.SheetCell,
-    formulas: []const ?[]const u8,
+    formulas: []const SharedText,
 ) Error!?engine.names.Refusal {
     // A table whose `ref` will not parse is not this row's refusal —
     // the geometry is unusable, so there is no member set to check.
@@ -8505,10 +8986,10 @@ fn sharedFormulaText(
     };
     defer shared.deinit();
 
-    const out = try gpa.alloc(?[]const u8, cells.len);
+    const out = try gpa.alloc(SharedText, cells.len);
     var keep = false;
     defer if (!keep) gpa.free(out);
-    @memset(out, null);
+    @memset(out, .{});
 
     // One parse per group, not one per slave.
     var masters = switch (try engine.calc.parseMasters(gpa, shared.groups)) {
@@ -8518,18 +8999,43 @@ fn sharedFormulaText(
     defer masters.deinit();
 
     for (shared.entries) |e| {
-        out[e.cell] = switch (e.role) {
-            .slave => |sl| blk: {
-                var t = try masters.translateFor(gpa, sl.group, sl.delta);
-                defer t.deinit();
-                break :blk try arena.dupe(u8, t.text);
+        out[e.cell] = .{
+            .text = switch (e.role) {
+                .slave => |sl| blk: {
+                    var t = try masters.translateFor(gpa, sl.group, sl.delta);
+                    defer t.deinit();
+                    break :blk try arena.dupe(u8, t.text);
+                },
+                else => try arena.dupe(u8, e.formula.text),
             },
-            else => try arena.dupe(u8, e.formula.text),
+            .array = switch (e.role) {
+                .array => |ref| ref.normalized(),
+                else => null,
+            },
         };
     }
 
     keep = true;
     return .{ .ok = out };
+}
+
+/// §5.6c's seed table reads a *cache state*, not a value: an absent
+/// `<v>` and a genuine blank are the same `ScalarValue` and different
+/// seeds. `decode.InputCell` already made that distinction, so the
+/// translation is a switch rather than an inference.
+///
+/// `.malformed` never appears here — `decode.classifyCell` refuses a
+/// malformed cache before a model exists, which is the pre-mutation
+/// half of §5.6c's fourth row. The graph's own row covers a caller that
+/// assembles an `Input` by hand.
+fn graphCacheState(input: engine.decode.InputCell) engine.graph.CacheState {
+    return switch (input) {
+        .number => |n| .{ .number = n },
+        .text => .text,
+        .boolean => .boolean,
+        .err => .err,
+        .blank, .uncached => .absent,
+    };
 }
 
 const MetadataResult = union(enum) {
@@ -16056,6 +16562,216 @@ test "checkAllAllocationFailures: evaluate leaks nothing, and still mutates noth
             // either: the parts are still what they were.
             const part = (try wb.store.part("xl/worksheets/sheet1.xml")) orelse
                 return error.MissingPart;
+            if (std.mem.indexOf(u8, part.bytes, "<v>22</v>") != null) return error.Mutated;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, H.run, .{});
+}
+
+// ─── M5a1: closure evaluation (§5.6f) ─────────────────────────────
+
+test "M5a1: closure evaluation recomputes what cache-based evaluation reads" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // B1's cached value disagrees with its own formula, and C1 has no
+    // cache at all. That disagreement is the instrument: it is exactly
+    // what tells the two behaviours apart.
+    const body =
+        "<row r=\"1\">" ++
+        "<c r=\"A1\"><v>2</v></c>" ++
+        "<c r=\"B1\"><f>A1*10</f><v>999</v></c>" ++
+        "<c r=\"C1\"><f>B1+1</f></c>" ++
+        "</row>";
+    const sheet = try m4b3Sheet(ta, body);
+    defer ta.free(sheet);
+
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+    defer wb.deinit();
+
+    // Cache-based (M4b3): the file's own 999.
+    var cached = try wb.evaluate(ta, 0, "B1", .{ .collation = test_collation });
+    defer cached.deinit();
+    try std.testing.expectEqual(@as(f64, 999), cached.ok.value.scalar.number);
+
+    // Closure (M5a1): `A1*10` recomputed to 20.
+    var closed = try wb.evaluateClosure(ta, 0, "B1", .{ .collation = test_collation });
+    defer closed.deinit();
+    try std.testing.expectEqual(@as(f64, 20), closed.ok.value.scalar.number);
+
+    // Two hops: C1 = B1+1 = 21, from a cell that had no cache at all.
+    var deep = try wb.evaluateClosure(ta, 0, "C1", .{ .collation = test_collation });
+    defer deep.deinit();
+    try std.testing.expectEqual(@as(f64, 21), deep.ok.value.scalar.number);
+
+    // …and the cache-based reading of the same cell is still blank, so
+    // §5.6f's "both behaviours, no silent switch" is observable rather
+    // than asserted.
+    var deep_cached = try wb.evaluate(ta, 0, "SUM(C1,100)", .{ .collation = test_collation });
+    defer deep_cached.deinit();
+    try std.testing.expectEqual(@as(f64, 100), deep_cached.ok.value.scalar.number);
+}
+
+test "M5a1: closure evaluation reads a range through the computed layer" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const body =
+        "<row r=\"1\">" ++
+        "<c r=\"A1\"><v>1</v></c>" ++
+        "<c r=\"B1\"><f>A1*2</f><v>0</v></c>" ++
+        "</row>" ++
+        "<row r=\"2\">" ++
+        "<c r=\"A2\"><v>3</v></c>" ++
+        "<c r=\"B2\"><f>A2*2</f><v>0</v></c>" ++
+        "</row>";
+    const sheet = try m4b3Sheet(ta, body);
+    defer ta.free(sheet);
+
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+    defer wb.deinit();
+
+    // Both caches say 0. Recomputed: 2 + 6.
+    var r = try wb.evaluateClosure(ta, 0, "SUM(B1:B2)", .{ .collation = test_collation });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(f64, 8), r.ok.value.scalar.number);
+}
+
+test "M5a1: a cycle in the closure refuses while iteration is off" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const sheet = try m4b3Sheet(
+        ta,
+        "<row r=\"1\"><c r=\"A1\"><f>B1+1</f><v>0</v></c>" ++
+            "<c r=\"B1\"><f>A1+1</f><v>0</v></c></row>",
+    );
+    defer ta.free(sheet);
+
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+    defer wb.deinit();
+
+    const before = try partSnapshot(ta, &wb);
+    defer freeSnapshot(ta, before);
+
+    var r = try wb.evaluateClosure(ta, 0, "A1", .{ .collation = test_collation });
+    defer r.deinit();
+    try std.testing.expectEqual(engine.graph.Refusal.Reason.cycle, r.graph_refused.reason);
+    try expectSnapshotUnchanged(ta, &wb, before);
+    try std.testing.expectEqual(
+        engine.decode.PlaneTwo.FormulaCycle,
+        r.graph_refused.planeTwo(),
+    );
+
+    // The same workbook is still readable cache-first: the two
+    // behaviours disagree about cycles, and only one of them refuses.
+    var cached = try wb.evaluate(ta, 0, "A1", .{ .collation = test_collation });
+    defer cached.deinit();
+    try std.testing.expectEqual(@as(f64, 0), cached.ok.value.scalar.number);
+}
+
+test "M5a1: closure evaluation mutates neither logical state nor serialized bytes" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const sheet = try m4b3Sheet(
+        ta,
+        "<row r=\"1\"><c r=\"A1\"><v>2</v></c>" ++
+            "<c r=\"B1\"><f>A1*10</f><v>999</v></c></row>",
+    );
+    defer ta.free(sheet);
+    var wb = try testWorkbookFromPartsWithNames(
+        ta,
+        io,
+        &.{.{ .name = "S", .body = sheet }},
+        null,
+        "<definedNames><definedName name=\"R\">S!$A$1</definedName></definedNames>",
+    );
+    defer wb.deinit();
+
+    const before = try partSnapshot(ta, &wb);
+    defer freeSnapshot(ta, before);
+
+    // 1. Success — and the recomputed 20 does NOT reach the part.
+    var ok = try wb.evaluateClosure(ta, 0, "B1+R", .{ .collation = test_collation });
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(f64, 22), ok.ok.value.scalar.number);
+    try expectSnapshotUnchanged(ta, &wb, before);
+    const part = (try wb.store.part("xl/worksheets/sheet1.xml")) orelse return error.MissingPart;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<v>20</v>") == null);
+
+    // 2. Refusal, raised after the closure had already been planned and
+    //    every cell in it recomputed.
+    var refused = try wb.evaluateClosure(ta, 0, "SUMIFS(A1:B1,A1:B1,1)", .{ .collation = test_collation });
+    defer refused.deinit();
+    try std.testing.expectEqual(
+        engine.decode.PlaneTwo.FormulaUnsupportedFunction,
+        refused.eval_refused.plane,
+    );
+    try expectSnapshotUnchanged(ta, &wb, before);
+
+    // 3. A parse refusal, which never reaches the graph at all — and
+    //    the same outcome `evaluate` gives for the same text.
+    var parse_refused = try wb.evaluateClosure(ta, 0, "((((", .{ .collation = test_collation });
+    defer parse_refused.deinit();
+    try std.testing.expect(parse_refused == .parse_refused);
+    try expectSnapshotUnchanged(ta, &wb, before);
+
+    // 4. A graph refusal, raised while the graph was still being built.
+    //    `B1` is one token and parses; the *stored* body `A1*10` is
+    //    three and does not, so the run refuses before a single cell was
+    //    recomputed — which is what makes "pre-mutation" a claim about
+    //    the whole run rather than about one function's return.
+    var starved = try wb.evaluateClosure(ta, 0, "B1", .{
+        .collation = test_collation,
+        .parse_limits = .{ .max_tokens = 2 },
+    });
+    defer starved.deinit();
+    try std.testing.expectEqual(
+        engine.graph.Refusal.Reason.formula_parse_failed,
+        starved.graph_refused.reason,
+    );
+    try expectSnapshotUnchanged(ta, &wb, before);
+}
+
+test "checkAllAllocationFailures: closure evaluation leaks nothing, and still mutates nothing" {
+    const H = struct {
+        fn run(allocator: Allocator) !void {
+            var threaded: std.Io.Threaded = .init(allocator, .{});
+            defer threaded.deinit();
+            const io = threaded.io();
+
+            const sheet = try m4b3Sheet(
+                allocator,
+                "<row r=\"1\"><c r=\"A1\"><v>2</v></c>" ++
+                    "<c r=\"B1\"><f>A1*10</f><v>999</v></c></row>",
+            );
+            defer allocator.free(sheet);
+            var wb = try testWorkbookFromPartsWithNames(
+                allocator,
+                io,
+                &.{.{ .name = "S", .body = sheet }},
+                null,
+                "<definedNames><definedName name=\"R\">S!$A$1</definedName></definedNames>",
+            );
+            defer wb.deinit();
+
+            var r = try wb.evaluateClosure(allocator, 0, "R+B1", .{ .collation = test_collation });
+            defer r.deinit();
+            if (r != .ok) return error.WrongOutcome;
+            if (r.ok.value.scalar.number != 22) return error.WrongValue;
+
+            const part = (try wb.store.part("xl/worksheets/sheet1.xml")) orelse
+                return error.MissingPart;
+            if (std.mem.indexOf(u8, part.bytes, "<v>20</v>") != null) return error.Mutated;
             if (std.mem.indexOf(u8, part.bytes, "<v>22</v>") != null) return error.Mutated;
         }
     };

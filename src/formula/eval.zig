@@ -1585,7 +1585,7 @@ pub const Evaluator = struct {
 /// The area `$A:$B` denotes. A free function because the evaluator and
 /// the static walk must agree on it exactly, and two copies of a grid
 /// bound is one too many.
-fn fullColRange(first: parser.ColBound, last: parser.ColBound) coords.Range {
+pub fn fullColRange(first: parser.ColBound, last: parser.ColBound) coords.Range {
     const lo = @min(first.col.zeroBased(), last.col.zeroBased());
     const hi = @max(first.col.zeroBased(), last.col.zeroBased());
     return .{
@@ -1603,7 +1603,7 @@ fn fullColRange(first: parser.ColBound, last: parser.ColBound) coords.Range {
 }
 
 /// The area `$1:$5` denotes.
-fn fullRowRange(first: parser.RowBound, last: parser.RowBound) coords.Range {
+pub fn fullRowRange(first: parser.RowBound, last: parser.RowBound) coords.Range {
     const lo = @min(first.row.oneBased(), last.row.oneBased());
     const hi = @max(first.row.oneBased(), last.row.oneBased());
     return .{

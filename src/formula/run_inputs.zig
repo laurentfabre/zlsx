@@ -29,8 +29,10 @@
 //! — every allocation on the run arena passes through it, so nothing can
 //! be charged to the wrong budget by forgetting a call. Work (cell
 //! evaluations, SCC passes, comparisons) can burn CPU *without*
-//! allocating, so it needs explicit counters and arrives with the
-//! engine that does the work (M5a2). This file ships the byte half.
+//! allocating, so it needs explicit counters, and each counter lands
+//! with the code that can actually enforce it: `WorkLimits` below ships
+//! the three the dependency graph charges (M5a1), and the iteration
+//! engine's two follow at M5a2.
 //!
 //! An exhausted budget is a **refusal, not an allocation failure**.
 //! `std.mem.Allocator` can only say `OutOfMemory`, so the counter
@@ -231,8 +233,10 @@ pub const category_count = @typeInfo(Category).@"enum".fields.len;
 ///
 /// `parser.Limits` (M2) is the other half of §9 — the *shape* of a
 /// parse. They are separate structs because they are enforced by
-/// separate mechanisms at separate times, and §9's work counters
-/// (cell evals, SCC passes) are a third that arrives with M5a2.
+/// separate mechanisms at separate times, and §9's work counters are a
+/// third: `WorkLimits` below, whose graph three land at M5a1 and whose
+/// iteration two (`max_scc_iterations`, `max_dynamic_passes`) land at
+/// M5a2 with the engine that enforces them.
 pub const ResourceLimits = struct {
     max_run_arena_bytes: u64 = default_run_arena_bytes,
     max_matrix_cells: u64 = default_matrix_cells,
@@ -436,6 +440,149 @@ pub const Budget = struct {
         const h = handleOf(ctx);
         h.owner.backing.rawFree(memory, alignment, ret_addr);
         h.owner.release(h.cat, memory.len);
+    }
+};
+
+// ─── §9 work counters ────────────────────────────────────────────
+
+/// §9's third enforcement mechanism, and the reason it is a third:
+/// `ResourceLimits` counts bytes an allocator hands out and
+/// `parser.Limits` bounds the shape of a parse, but a dependency graph
+/// can burn an unbounded amount of CPU while allocating almost nothing.
+/// A whole-column reference on a sheet with a million stored cells
+/// allocates one node and walks a million coordinates; only an explicit
+/// counter catches that.
+///
+/// M5a1 lands the three counters the graph needs. `max_scc_iterations`
+/// and `max_dynamic_passes` are M5a2's — they bound the iteration
+/// engine, which does not exist yet, and a limit with no enforcement
+/// site is a limit that lies.
+pub const WorkCategory = enum {
+    /// Edges admitted into the dependency graph.
+    dependency_edges,
+    /// Formula-cell evaluations a closure plan will perform.
+    total_cell_evals,
+    /// Cell-to-cell hops on the closure-discovery stack. A *depth*, so
+    /// it is released as the walk unwinds; the other two only ever grow.
+    eval_depth,
+
+    pub fn unit(self: WorkCategory) []const u8 {
+        return switch (self) {
+            .dependency_edges => "edges",
+            .total_cell_evals => "evaluations",
+            .eval_depth => "cells",
+        };
+    }
+};
+
+pub const work_category_count = @typeInfo(WorkCategory).@"enum".fields.len;
+
+/// §9's work limits. Same contract as `ResourceLimits`: caller-adjustable
+/// in Zig and C, fixed at defaults by the CLI and Python in v1, hard
+/// maxima 4× the default, resolved values echoed and fingerprinted.
+pub const WorkLimits = struct {
+    max_dependency_edges: u64 = default_dependency_edges,
+    max_total_cell_evals: u64 = default_total_cell_evals,
+    max_eval_depth: u64 = default_eval_depth,
+
+    pub const default_dependency_edges: u64 = 50_000_000;
+    pub const default_total_cell_evals: u64 = 50_000_000;
+    pub const default_eval_depth: u64 = 512;
+
+    pub const hard_multiplier: u64 = 4;
+
+    pub fn defaultFor(cat: WorkCategory) u64 {
+        return switch (cat) {
+            .dependency_edges => default_dependency_edges,
+            .total_cell_evals => default_total_cell_evals,
+            .eval_depth => default_eval_depth,
+        };
+    }
+
+    pub fn hardMaxFor(cat: WorkCategory) u64 {
+        return defaultFor(cat) * hard_multiplier;
+    }
+
+    pub fn get(self: WorkLimits, cat: WorkCategory) u64 {
+        return switch (cat) {
+            .dependency_edges => self.max_dependency_edges,
+            .total_cell_evals => self.max_total_cell_evals,
+            .eval_depth => self.max_eval_depth,
+        };
+    }
+
+    pub fn set(self: *WorkLimits, cat: WorkCategory, v: u64) void {
+        switch (cat) {
+            .dependency_edges => self.max_dependency_edges = v,
+            .total_cell_evals => self.max_total_cell_evals = v,
+            .eval_depth => self.max_eval_depth = v,
+        }
+    }
+
+    pub fn validate(self: WorkLimits) RunInputsError!void {
+        inline for (@typeInfo(WorkCategory).@"enum".fields) |f| {
+            const cat: WorkCategory = @enumFromInt(f.value);
+            const v = self.get(cat);
+            if (v == 0 or v > hardMaxFor(cat)) return error.LimitOutOfRange;
+        }
+    }
+};
+
+/// The counters themselves.
+///
+/// **Charge and release sites, named per counter** (§9's own
+/// requirement — a counter whose enforcement point is not written down
+/// is a counter nobody can audit):
+///
+/// | counter | charged at | released at |
+/// |---|---|---|
+/// | `dependency_edges` | `graph.Builder.addEdge`, once per admitted edge | never — a built graph keeps its edges |
+/// | `total_cell_evals` | `graph.Graph.plan`, once per cell admitted to the plan | never — the plan is exact, so charging at admission refuses *before* the first evaluation instead of halfway through one |
+/// | `eval_depth` | `graph.Graph.plan`'s closure walk, on pushing a cell-like node | the same walk, on popping it |
+///
+/// Nothing is mutated on a refusal: like `Budget`, the check happens
+/// before the counter moves, so a rejected charge leaves the counter
+/// exactly where it was.
+pub const WorkCounters = struct {
+    limits: WorkLimits = .{},
+    used: [work_category_count]u64 = @splat(0),
+    peak: [work_category_count]u64 = @splat(0),
+    /// The first category to trip, kept for the same reason `Budget`
+    /// keeps its own: the caller's error type says "a limit was hit" and
+    /// this says which.
+    tripped: ?WorkCategory = null,
+
+    pub fn usedBy(self: WorkCounters, cat: WorkCategory) u64 {
+        return self.used[@intFromEnum(cat)];
+    }
+
+    pub fn peakOf(self: WorkCounters, cat: WorkCategory) u64 {
+        return self.peak[@intFromEnum(cat)];
+    }
+
+    pub fn charge(self: *WorkCounters, cat: WorkCategory, n: u64) error{LimitExceeded}!void {
+        const i = @intFromEnum(cat);
+        const limit = self.limits.get(cat);
+        const next = std.math.add(u64, self.used[i], n) catch {
+            if (self.tripped == null) self.tripped = cat;
+            return error.LimitExceeded;
+        };
+        if (next > limit) {
+            if (self.tripped == null) self.tripped = cat;
+            return error.LimitExceeded;
+        }
+        self.used[i] = next;
+        if (next > self.peak[i]) self.peak[i] = next;
+    }
+
+    /// Only `eval_depth` unwinds. The other two are monotone totals, and
+    /// releasing one would let a long run exceed its own limit by
+    /// forgetting work it had already done.
+    pub fn release(self: *WorkCounters, cat: WorkCategory, n: u64) void {
+        assert(cat == .eval_depth);
+        const i = @intFromEnum(cat);
+        assert(self.used[i] >= n);
+        self.used[i] -= n;
     }
 };
 
@@ -668,4 +815,71 @@ test "checkAllAllocationFailures: the budget leaks nothing under OOM" {
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, H.run, .{});
+}
+
+test "work limits: defaults are §9's, and the hard maximum is 4×" {
+    const l: WorkLimits = .{};
+    try testing.expectEqual(@as(u64, 50_000_000), l.max_dependency_edges);
+    try testing.expectEqual(@as(u64, 50_000_000), l.max_total_cell_evals);
+    try testing.expectEqual(@as(u64, 512), l.max_eval_depth);
+    inline for (@typeInfo(WorkCategory).@"enum".fields) |f| {
+        const cat: WorkCategory = @enumFromInt(f.value);
+        try testing.expectEqual(l.get(cat), WorkLimits.defaultFor(cat));
+        try testing.expectEqual(l.get(cat) * 4, WorkLimits.hardMaxFor(cat));
+    }
+}
+
+test "work limits: zero and over-hard-max are both out of range" {
+    inline for (@typeInfo(WorkCategory).@"enum".fields) |f| {
+        const cat: WorkCategory = @enumFromInt(f.value);
+        var l: WorkLimits = .{};
+        try l.validate();
+
+        l.set(cat, 0);
+        try testing.expectError(error.LimitOutOfRange, l.validate());
+
+        l.set(cat, WorkLimits.hardMaxFor(cat));
+        try l.validate();
+
+        l.set(cat, WorkLimits.hardMaxFor(cat) + 1);
+        try testing.expectError(error.LimitOutOfRange, l.validate());
+    }
+}
+
+test "work counters: below, at, and above — per category" {
+    inline for (@typeInfo(WorkCategory).@"enum".fields) |f| {
+        const cat: WorkCategory = @enumFromInt(f.value);
+        var c: WorkCounters = .{};
+        c.limits.set(cat, 3);
+
+        try c.charge(cat, 2); // below
+        try testing.expectEqual(@as(?WorkCategory, null), c.tripped);
+        try c.charge(cat, 1); // at
+        try testing.expectEqual(@as(u64, 3), c.usedBy(cat));
+        try testing.expectEqual(@as(?WorkCategory, null), c.tripped);
+
+        // Above. The counter does not move, so a refusal is observably
+        // non-mutating even in its own bookkeeping.
+        try testing.expectError(error.LimitExceeded, c.charge(cat, 1));
+        try testing.expectEqual(@as(u64, 3), c.usedBy(cat));
+        try testing.expectEqual(@as(?WorkCategory, cat), c.tripped);
+    }
+}
+
+test "work counters: an overflowing charge trips rather than wrapping" {
+    var c: WorkCounters = .{};
+    c.limits.set(.dependency_edges, std.math.maxInt(u64));
+    try c.charge(.dependency_edges, std.math.maxInt(u64) - 1);
+    try testing.expectError(error.LimitExceeded, c.charge(.dependency_edges, 4));
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64) - 1), c.usedBy(.dependency_edges));
+}
+
+test "work counters: depth unwinds, peak does not" {
+    var c: WorkCounters = .{};
+    try c.charge(.eval_depth, 1);
+    try c.charge(.eval_depth, 1);
+    try testing.expectEqual(@as(u64, 2), c.usedBy(.eval_depth));
+    c.release(.eval_depth, 2);
+    try testing.expectEqual(@as(u64, 0), c.usedBy(.eval_depth));
+    try testing.expectEqual(@as(u64, 2), c.peakOf(.eval_depth));
 }
