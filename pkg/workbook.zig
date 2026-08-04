@@ -15827,8 +15827,10 @@ test "M4b3: evaluate mutates neither logical state nor serialized bytes" {
     try std.testing.expectEqual(@as(f64, 22), ok.ok.value.scalar.number);
     try expectSnapshotUnchanged(ta, &wb, before);
 
-    // 2. Refusal — an unregistered function, refused mid-run.
-    var refused = try wb.evaluate(ta, 0, "VLOOKUP(1,A1:B1,2)", .{ .collation = test_collation });
+    // 2. Refusal — an unregistered function, refused mid-run. `SUMIFS`
+    //    is frozen in the inventory for M7b2 and has no row yet;
+    //    `VLOOKUP` stood here until M4e registered it.
+    var refused = try wb.evaluate(ta, 0, "SUMIFS(A1:B1,A1:B1,1)", .{ .collation = test_collation });
     defer refused.deinit();
     try std.testing.expectEqual(
         engine.decode.PlaneTwo.FormulaUnsupportedFunction,

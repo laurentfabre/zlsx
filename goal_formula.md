@@ -78,7 +78,7 @@ Locked 2026-08-02 by Laurent (axioms; changing one reopens the plan):
 | # | Decision | Consequence |
 |---|---|---|
 | D-1 | Both recalc-on-save and standalone eval | `recalculate()` (in-memory transaction) + `saveWithRecalc` (file transaction, §5.7.9) + Writer path via orchestrator; eval at every layer |
-| D-2 | Registry phased to 300+, Core ~60 first | Core gate = M4e (≈57 cumulative from the frozen inventory committed at M3a) |
+| D-2 | Registry phased to 300+, Core ~60 first | Core gate = M4e ✅ — **59** cumulative (M4c 20 + M4d 17 + M4e 22), counted from the frozen inventory committed at M3a rather than from this row |
 | D-3 | Dual fidelity modes | §5.4; `.excel` carries `platform_profile` + `collation_v1` |
 | D-4 | Dynamic arrays from the start | Array-first eval from M3a with the normative shape/coercion table (§5.3b); persistence staged behind proof gates; authoring via explicit `FormulaWrite.dialect` |
 | D-5 | Iterative calc honoring `calcPr` | CalcState workbook-derived; multi-SCC schedule normative (§5.6c) |
@@ -1881,7 +1881,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M4b3** ✅ | Name resolution + table producers + 3D matrix + cache-based `evaluate` | Site semantics; opaque names; 3D fixtures |
 | **M4c** ✅ | F1a-1 (20: operators; IF, AND, OR, NOT, IFERROR, IFNA, IFS, SWITCH; ISBLANK, ISNUMBER, ISTEXT, ISERROR, ISERR, ISNA, ISLOGICAL, NA, N, T; **TRUE, FALSE** — added at M3a2, see the decisions block) | Oracle-first |
 | **M4d** ✅ | F1a-2 (17: ABS, ROUND, ROUNDUP, ROUNDDOWN, INT, TRUNC, MOD, POWER, SQRT, EXP, LN, LOG, LOG10, SIGN, PI, RAND, RANDBETWEEN — **SQRT and RAND pinned here, registered at M3a2**) + multi-callsite/lazy-branch draw KATs | Oracle-first; KATs |
-| **M4e** | F1b (~22: SUM, COUNT, COUNTA, COUNTBLANK, AVERAGE, MIN, MAX, SUMIF, COUNTIF, AVERAGEIF, SUMPRODUCT; VLOOKUP, HLOOKUP, INDEX, MATCH, XLOOKUP, XMATCH, CHOOSE, ROW, ROWS, COLUMN, COLUMNS) — **Core gate 59** | Oracle-first |
+| **M4e** ✅ | F1b (22: SUM, COUNT, COUNTA, COUNTBLANK, AVERAGE, MIN, MAX, SUMIF, COUNTIF, AVERAGEIF, SUMPRODUCT; VLOOKUP, HLOOKUP, INDEX, MATCH, XLOOKUP, XMATCH, CHOOSE, ROW, ROWS, COLUMN, COLUMNS — **the seven M3a2 framework subjects pinned here, registered at M3a2**) — **Core gate 59** | Oracle-first |
 | **M4f** | F1c-text (~19: LEFT, RIGHT, MID, LEN, LOWER, UPPER, TRIM, CONCAT, CONCATENATE, TEXTJOIN, SUBSTITUTE, REPLACE, FIND, SEARCH, EXACT, VALUE, REPT, CHAR, CODE) + **CV1/CV2 shared text layer** (§5.4d; collation_v1 landed at M3a) | Oracle-first; codec tests; per-CV fixtures |
 | **M4g** | F1c-date (~15: DATE, YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, TODAY, NOW, EOMONTH, EDATE, WEEKDAY, DATEVALUE, TIMEVALUE, TIME) | Oracle-first |
 | **M5a1** | graph.zig: node model, SCC condensation, deterministic order, **seed table**, range-order contract; closure eval semantics | Scaling assertion; order fixtures; **randomized differential test vs a brute-force graph builder** (overlaps, full rows/cols, 3D spans, names, spill resize/invalidation — a missed edge passes perf tests but corrupts caches) |
@@ -2161,6 +2161,154 @@ property of the *parser* and become a property of a **function**.
     **exhaustively** — every name against every argument shape at one
     and two arguments, in both modes, each input evaluated twice. A
     sweep that always runs beats a search that runs on one platform.
+
+**M4e decisions (shipped 2026-08-04).** Thirteen points, in
+`src/formula/registry.zig` (fifteen new rows, their implementations,
+the batch gates) and `eval.zig` (fixtures only). The row that closes
+**Core gate 59** — and the row where the dispatcher's first-error rule
+turned out to be unable to state §5.3c for a whole family.
+
+1. **The committed manifests decide NOTHING about this batch, and the
+   row states that as a number rather than as an absence.** Not one
+   cell of the three manifests calls any of the twenty-two — §8.2's
+   evidence is eighteen operator and literal cells plus `SQRT(-1)`. So
+   every fixture ships `spec_pinned`, the oracle-row count is pinned at
+   **zero**, and a second check reads the *manifests* and fails if any
+   cell mentions an F1b name. That second direction is the point: "no
+   manifest decides this" is the one claim a fixture table cannot make
+   about itself, and M4c's one deciding cell and M4d's one were both
+   found by asking the files. The three-valued verdict (`silent` /
+   `decided` / `excluded`, M4d decision 2) is reused rather than
+   re-derived, so this row gets the excluded-cell guard even though it
+   holds no volatile of its own.
+2. **The five lookups are `per_function_provenance`, and finding out
+   why was this row's real discovery.** `propagateAndInvoke` scans
+   *evaluated scalars*. A lookup's key slot is `.value_any` and a key
+   normally arrives as a **reference**, which the scan cannot see at
+   all — so under `.propagate`, `VLOOKUP(A5,table,A6)` answered `#N/A`:
+   the scan found the third argument's scalar error and never saw the
+   first argument's. §5.3c's declaration order was wrong *by
+   construction*. The same slot shape carries the other half: an error
+   inside a lookup TABLE must not propagate, because it is a value the
+   lookup may return. Both are one rule in `lookupPropagate`, which
+   walks the arguments in order with the table slots masked out — and
+   `per_function_provenance` is precisely the class §5.3c provides for
+   a function whose answer depends on **where** an error was found.
+3. **MIN and MAX are the comparator's named exception, and the sharp
+   fixture is MAX rather than MIN.** Under `collation_v1`'s cross-type
+   ranking any text outranks every number, so a `MAX` that used the
+   comparator would answer `"gamma"` over a column holding 1…4 and
+   three words. It answers 4. §5.4b's three-part rule — a direct text
+   argument coerces or is `#VALUE!`, text in a range is ignored, no
+   numbers anywhere is 0 — is fixtured in all three positions. The fold
+   deliberately does **not** use `@min`/`@max`: those are IEEE
+   minNum/maxNum, which treat `-0` and `+0` as interchangeable and
+   would have silently decided the one case N3 makes observable, in
+   whichever direction the hardware felt like.
+4. **The two rule tables reach this batch through the fold, not through
+   a rounding argument.** M4d's divergence was `decimalView`; nothing
+   in F1b rounds to a decimal place, so that seam is untouched. What is
+   left is N2's **additive scope** — and an aggregate is a chain of
+   additions. `SUM(0.1,0.2,-0.3)` snaps to 0 under `excel_fp_rules_v1`
+   and stays `5.551115123125783e-17` under `ieee_fp_rules_v1`;
+   `AVERAGE` and `SUMPRODUCT` inherit it through the same accumulator.
+   N3's half needs a function that RETURNS an input rather than
+   computing one, which in this batch is only MIN and MAX: an
+   accumulator would have added `-0` to `+0` and lost the sign on the
+   way. The converse test proves the rest of the batch agrees.
+5. **§5.6g's frozen six are all here, so the 3D matrix is finally
+   fixtured end to end.** M4b3 shipped it entirely spec-pinned and
+   could only run the three the registry then held (its decision 14);
+   `AVERAGE`, `MIN` and `MAX` arrived at this row. All six now
+   aggregate a real span — six functions, six different right answers
+   over the same two cells, which is also the proof they aggregate the
+   span rather than one member — and the other **sixteen** refuse one
+   *typed*, carrying `three_d_ineligible_function` rather than a
+   generic failure. Neither list is retyped: the eligible one is read
+   from `names.three_d_eligible` and the refusing one is derived from
+   the inventory, so a seventh eligible name cannot ship without a span
+   fixture and a twenty-third batch name cannot ship in neither
+   direction.
+6. **CHOOSE's laziness is proved by a draw count in every arm position,
+   including a dead arm at exactly zero.** §5.3a assigns its fixtures
+   here. A three-arm call draws **once** whichever arm is taken;
+   `CHOOSE(1,7,RAND())` draws **none**, which is the statement a result
+   cannot make — under a constant source a draw that happened and one
+   that did not look identical. An out-of-range selector and an
+   erroring selector each take no arm and draw nothing. An **array**
+   selector switches the whole form to per-element masking, both arms
+   evaluate and both draw, and a per-element `#VALUE!` stays in its own
+   cell — the opposite proof, from the same instrument.
+7. **`Grid` is a materialization, and that is a decision about which
+   failure a lookup is allowed to have.** Aggregate walking is a sparse
+   fold and needs no coordinates; a lookup is a search along an axis
+   and does. So a reference reaching a lookup is materialized under
+   §9's `max_matrix_cells`, which makes an absurd rectangle a **limit**
+   rather than a run that never ends: `MATCH(1,A1:XFD100000,0)` refuses
+   where `SUM` over the same range still answers. Making a
+   whole-column lookup *fast* is M7b2's row; making an impossible one
+   refuse is this one's.
+8. **Lookup equality is the criteria matcher's, and the lookup VALUE is
+   not a criterion.** §5.4b names lookup equality and criteria in one
+   sentence; the matcher is already type-restricted the way a lookup is
+   (a numeric key never matches a text cell), already folds under
+   `collation_v1`, and already implements `*`/`?`/`~`. So the criterion
+   is **built** here rather than parsed — `criteria.parse` would read
+   `VLOOKUP("<5",…)` as "less than 5" where Excel looks for the literal
+   text `<5`. Wildcards are switched per call, which is what makes
+   `XMATCH("t*",…,0)` `#N/A` and `XMATCH("t*",…,2)` a hit.
+9. **An ordered match never crosses a type boundary, and ties go to the
+   last position in array order.** The cross-type ranking is a *total*
+   order, so without a type restriction a text cell would qualify as
+   "≥" a numeric key and `MATCH(5, a_column_of_words, 1)` would find
+   one; with it, that is `#N/A`. Ties resolve by position rather than
+   by scan direction, which is what makes `search_mode` change an exact
+   match's answer and leave an ordered one alone — the way Excel's
+   binary search does over the sorted input it documents as a
+   requirement. Blank and error cells are not ordered candidates: the
+   pass is looking for a value, and `#N/A` in a column is not an answer
+   to "where is 5".
+10. **XLOOKUP's `if_not_found` is masked with the arrays, because it is
+    a value the call may RETURN.** It is not an array, but it is on the
+    same side of decision 2's line for the same reason: propagating it
+    would make a successful lookup fail over a fallback nobody reached.
+    `XLOOKUP(20,…,A5)` is the hit and `XLOOKUP(99,…,A5)` is A5 — one
+    cell, two outcomes, and the pair is the fixture. The reading that
+    propagates it was tried first and failed on a shape rather than on
+    an error: a perfectly ordinary **range** fallback made every hit
+    `#VALUE!`, because a multi-cell reference reduces to `#VALUE!` in a
+    scalar context. Laziness is still NOT the answer here — §5.3a
+    enumerates the deferring forms and XLOOKUP is not among them, so
+    the argument evaluates (and any volatile in it draws); it simply
+    does not propagate. Declaration order is fixtured across slots 0
+    and 4 instead, where both slots do propagate.
+11. **INDEX returns a value, not a reference, and the deferral is
+    stated.** `reference_producing` is `false` on it: Excel's
+    `INDEX(…):INDEX(…)` range form needs the evaluator to carry a
+    reference out of a call, and §7 lists exactly two reference-
+    producing rows — `INDIRECT` and `OFFSET`, both M5a2's. What INDEX
+    ships is the whole of its *value* form, including the zero-index
+    slices that legitimately return an array.
+12. **Every row in the registry is now pinned, and the gate is counted
+    rather than read.** M3a2's seven borrowed framework subjects — SUM,
+    COUNT, COUNTA, COUNTBLANK, COUNTIF, SUMIF, CHOOSE (M4c decision 12)
+    — are held to the same five-field check, fixture-per-name coverage
+    and evidence labelling as the fifteen this row writes, **without
+    moving a table row**: relocating one to demonstrate that it belongs
+    to a batch would demonstrate something about the file rather than
+    about the table, exactly as M4d decided for SQRT and RAND. Core
+    gate 59 is obtained by counting three milestones in the frozen TSV
+    and asserting that all fifty-nine resolve through `registry.lookup`
+    — so the ladder's figure and the implementation meet at the data.
+13. **The exhaustive sweep pads to each name's own minimum arity,
+    because otherwise it would prove nothing about half the batch.**
+    M4d swept one and two arguments, which is every arity F1a-2 has.
+    Ten F1b names have a minimum of three or more and refuse *before*
+    reaching an implementation at one or two — so a sweep built the
+    same way would have enumerated twenty-two names and exercised
+    twelve. Padding by repeating the last shape keeps the enumeration
+    the same size and puts every name in front of its own impl, in both
+    rule tables, each input evaluated twice.
 
 ---
 
