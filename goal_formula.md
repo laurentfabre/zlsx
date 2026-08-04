@@ -1108,9 +1108,21 @@ function that takes a separate range; multi-area union overlap double-counting
 fixture-pinned; `resolveSheet/Name/Table`, `spillShape`, `dialectOf`,
 `calcState`. In-memory fake (M3a); pkg adapter (M4b1).
 
-**5.6b Nodes** (M5a): formula cells; range nodes (interval buckets, no
-O(F×R)); name nodes; spill-anchor nodes (+shape invalidation); table
-producers. Topo order, tie-break (SheetIndex, Row1, Col0).
+**5.6b Nodes** (M5a1, shipped): formula cells; **spill-tail nodes**
+(each depending on its anchor, so a shape change is a node-set change);
+range nodes, one per distinct area, which is what makes the edge count
+readers **+** producers rather than readers × producers; **3D span
+nodes**, one edge per member sheet (§5.6g); name nodes; table producers.
+A reference to a coordinate holding no formula contributes **no edge** —
+a constant cannot be recalculated, so it cannot constrain an order.
+Areas resolve against a producer index sorted **twice** (row-major and
+column-major), probed through whichever order makes the narrower band
+the leading key — the corrected form of "interval buckets", and what
+keeps `SUM(A:A)` and `SUM(1:1)` both proportional to what is stored.
+Order: SCC condensation, then **Kahn with a min-heap** over the
+condensation DAG — canonical, not merely reproducible — tie-break
+(SheetIndex, Row1, Col0), generalized across kinds by a total order on
+node keys whose every term is content rather than an insertion ordinal.
 
 **5.6c Multi-SCC iteration schedule (normative)**: build the condensation DAG;
 process components in topological order; an **SCC iterates to its own
@@ -1909,7 +1921,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M4e** ✅ | F1b (22: SUM, COUNT, COUNTA, COUNTBLANK, AVERAGE, MIN, MAX, SUMIF, COUNTIF, AVERAGEIF, SUMPRODUCT; VLOOKUP, HLOOKUP, INDEX, MATCH, XLOOKUP, XMATCH, CHOOSE, ROW, ROWS, COLUMN, COLUMNS — **the seven M3a2 framework subjects pinned here, registered at M3a2**) — **Core gate 59** | Oracle-first |
 | **M4f** ✅ | F1c-text (19: LEFT, RIGHT, MID, LEN, LOWER, UPPER, TRIM, CONCAT, CONCATENATE, TEXTJOIN, SUBSTITUTE, REPLACE, FIND, SEARCH, EXACT, VALUE, REPT, CHAR, CODE) + **CV1/CV2 shared text layer** (§5.4d; collation_v1 landed at M3a) + **`casing_v1`** + the `unicode/` move | Oracle-first; codec tests; per-CV fixtures |
 | **M4g** ✅ | F1c-date (15: DATE, YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, TODAY, NOW, EOMONTH, EDATE, WEEKDAY, DATEVALUE, TIMEVALUE, TIME) + the **invariant date grammar** (§5.4b) + `RunInputs`' clock reaching the evaluator | Oracle-first; per-epoch fixtures |
-| **M5a1** | graph.zig: node model, SCC condensation, deterministic order, **seed table**, range-order contract; closure eval semantics | Scaling assertion; order fixtures; **randomized differential test vs a brute-force graph builder** (overlaps, full rows/cols, 3D spans, names, spill resize/invalidation — a missed edge passes perf tests but corrupts caches) |
+| **M5a1** ✅ | graph.zig: node model, SCC condensation, deterministic order, **seed table**, range-order contract; closure eval semantics | Scaling assertion; order fixtures; **randomized differential test vs a brute-force graph builder** (overlaps, full rows/cols, 3D spans, names, spill resize/invalidation — a missed edge passes perf tests but corrupts caches) |
 | **M5a2** | Iteration engine (multi-SCC schedule, convergence, clamps) + callsite-keyed volatile schedule + rebuild-reuse KATs + dynamic-edge fixpoint + **complete oracle-gated INDIRECT + OFFSET contracts** (the fixpoint's test subjects; registered fully here so M6's public CLI never exposes a half-function) | Iteration oracles; stabilization fuzz; INDIRECT/OFFSET fixtures |
 | **M5b0** | **`SourceBacking`** — ref-counted file/buffer backing shared across PartStore generations (each store exclusively owns + closes one `std.Io.File`, `store.zig:105-129,326-329`; shallow clone double-closes, moving breaks retention); backing unified; repeated-recalc + ownership tests. **Ladder-ordered FIRST of the M5b group — physically before M5b1/M5b2, because the transaction that requires it cannot land earlier than it** | Ownership tests; double-close fuzz |
 | **M5b1** | `ResolvedSheet` projection + cached-value patcher + transitions (**incl. ST_Xstring output encoding**) + fuzz | Byte-confinement; round-trip |
@@ -2520,6 +2532,97 @@ the calendar and the serial turned out to disagree.
     fields are a running total. One walk with two landings serves
     `EDATE` and `EOMONTH`, which is how Excel documents them and the
     only difference the code has.
+
+---
+
+**M5a1 decisions (shipped 2026-08-04).** Thirteen points, in
+`src/formula/graph.zig` (new — the node model, the walk, the index, the
+condensation, the seed table, the closure plan), `run_inputs.zig` (§9's
+work counters), `symbols.zig` (table geometry, a public fold) and
+`pkg/workbook.zig` (`evaluateClosure` and the bridge). The row where
+the tokenizer's idea of where a reference ends turned out not to be the
+reference.
+
+1. **The left endpoint's qualifier governs the whole range operator, and
+    the tokenizer's split is why that has to be said out loud.**
+    `Sheet3!$C$5:$C$6` arrives as `qualified(Sheet3, C5)` *then* `:` then
+    `C6` — the second endpoint sits **outside** the qualified node — so a
+    walk that resolves each side as an independent reference puts `C6` on
+    the referencing sheet and loses the area entirely. The identical
+    shape governs 3D: `Sheet1:Sheet3!$B$1:$B$2` is one span over `B1:B2`,
+    not a span over `B1` beside a stray `B2`. Both were found by the
+    differential test and neither is visible in a fixture written from
+    the spelling, which is the argument for the gate being what it is.
+2. **Range nodes, not per-reader edges (§5.6b).** Two formulas reading
+    `A1:A100` share one node, so the area is resolved against the
+    producer index once instead of once per reader. That is the whole of
+    "no O(F×R)": without it the edge count is readers × producers, with
+    it it is readers + producers.
+3. **The producer index is sorted twice, and the probe picks.**
+    Row-major and column-major, and each area is probed through whichever
+    of the two makes its *narrower* band the leading key. `SUM(A:A)`
+    costs the cells stored in column A; `SUM(1:1)` costs the cells stored
+    in row 1; neither costs a million coordinates. One order would have
+    made exactly one of those two cheap. The instrument is
+    `stats.index_probes` — a counter, so the assertion is "40 candidates
+    examined", not "it felt fast".
+4. **A reference to a cell holding no formula contributes no edge, and
+    the rule is written in the module header rather than discovered from
+    the code.** A constant cannot be recalculated, so it cannot constrain
+    an order. It has to be stated because the brute-force builder has to
+    share it, and a rule two implementations infer separately is a rule
+    they will eventually infer differently.
+5. **Kahn with a min-heap, not the reverse of Tarjan's output.** Both are
+    deterministic; only one is **canonical**. Kahn emits, at every step,
+    the ready component with the smallest node under `Key.order`, so the
+    result depends on the graph and on nothing else — not on which node a
+    depth-first search happened to start from. That is what makes "the
+    same order across randomized insertion order" a property of the
+    algorithm instead of a property of this seed.
+6. **The seed table's malformed row is checked FIRST, before the
+    array-anchor row.** An anchor with a declared shape never reads its
+    cache, so the other ordering would let an anchor launder a malformed
+    `<v>` into a zero-filled array — the exact substitution §5.6c
+    forbids, arrived at by a path nobody would think to test.
+7. **"No declared shape" and "not an array" are different facts, so
+    `Anchor` is three-valued.** `.none` seeds from the cache, `.shape`
+    seeds zero-filled, and only `.unknown` takes §5.6c's pre-iteration
+    shape pass. A nullable shape would have collapsed the first and third
+    into one, and the third is the only one the shape pass exists for.
+8. **`max_eval_depth` counts cell hops, not node hops.** §9 says
+    "cell → cell" and the counter has to mean it: the range, span, name
+    and producer nodes model *how* one cell reaches another and consume
+    no depth. Counting nodes would have made the effective limit depend
+    on whether a dependency happened to be written as a cell or as a
+    range.
+9. **`max_total_cell_evals` is charged when the plan admits a cell, not
+    when one is evaluated.** The plan is exact, so charging at admission
+    refuses **before the first evaluation** rather than halfway through
+    one — which makes a §9 refusal pre-mutation for free instead of by
+    an unwind that has to be got right.
+10. **The graph resolves structured references even though *evaluating*
+    one is M7b's.** They are different obligations: an evaluator that
+    refuses a construct returns an error value, while a graph that drops
+    the edge writes a stale cache. Conservative wins, so `TableGeometry`
+    and the row-band arithmetic ship here and `symbols.Table` gained
+    `headerRowCount`/`totalsRowCount` to feed them.
+11. **A position-dependent name body draws no edges, deliberately.**
+    Referencing a relative name is refused at M4b3, so no cache can be
+    computed from an edge the graph declines to draw; inventing a sheet
+    for it would be the unsafe direction. The node still exists — a name
+    is a node whether or not anything can be said about its body.
+12. **A tail covered by two declared arrays belongs to the anchor that
+    sorts first.** Overlapping anchors are an M7a obstruction and this
+    row does not decide them — but it does decide that the answer is a
+    *rule* rather than an accident, because "whichever cell arrived
+    first" would make the node set depend on input order and break the
+    determinism this row is gated on.
+13. **A cycle refuses at M5a1 and the seed table ships anyway.** §5.6c's
+    iteration-off rule is `FormulaCycle`, and M5a2 is where a workbook
+    whose `calcPr` asks for iteration gets a schedule instead. The seeds
+    are computed, fixtured per row, and unused — which is the point: the
+    engine that will consume them arrives to a table that has already
+    been tested against something.
 
 ---
 

@@ -783,6 +783,25 @@ pub fn build(b: *std.Build) void {
     const formula_text_tests = b.addTest(.{ .root_module = formula_text_mod });
     test_step.dependOn(&b.addRunArtifact(formula_text_tests).step);
 
+    // M5a1: the dependency graph — nodes, edges, SCC condensation, the
+    // deterministic order, the §5.6c seed table. Its own module and its
+    // own test target, like the text layer above: `graph.zig` imports
+    // `eval.zig` for `DependencyLog` and for the static walk's shape,
+    // but nothing imports `graph.zig` back, so it stays a leaf of the
+    // engine and can be built and tested without the package tree.
+    const formula_graph_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/graph.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_graph_mod.addImport("zlsx_refs", refs_mod);
+    formula_graph_mod.addImport("zlsx_xid", xid_mod);
+    formula_graph_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_graph_mod.addImport("zlsx_casing", casing_mod);
+    addOracleFixtures(b, formula_graph_mod);
+    const formula_graph_tests = b.addTest(.{ .root_module = formula_graph_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_graph_tests).step);
+
     // M3b: the criteria fuzz target (§8.1) — no criterion string may
     // panic, leak, or match non-deterministically.
     const formula_criteria_fuzz_mod = b.createModule(.{

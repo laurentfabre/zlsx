@@ -68,6 +68,11 @@ pub const eval = @import("eval.zig");
 /// path. Same rule, one layer up: `rewriter.zig` and this module both
 /// contain `tokenizer.zig`, so they have to be the same module.
 pub const rewriter = @import("rewriter.zig");
+/// M5a1: the dependency graph. Reached through this module for the same
+/// reason the evaluator is — `pkg/workbook.zig` imports one module, and
+/// `graph.zig` and `eval.zig` share `env.zig`'s types, so they cannot be
+/// two.
+pub const graph = @import("graph.zig");
 
 pub const Refusal = decode.Refusal;
 pub const SheetIndex = env.SheetIndex;
@@ -181,12 +186,29 @@ pub const Table = struct {
     sheet: SheetIndex,
     /// Raw A1 range as written (`ref`), resolved by the consumer.
     ref: []const u8,
+    /// `CT_Table@headerRowCount` / `@totalsRowCount`. Carried from M5a1
+    /// on, because the row bands a structured reference denotes are
+    /// arithmetic over these two numbers and the graph has to draw the
+    /// edge whether or not the evaluator can yet compute the value.
+    header_rows: u32 = 1,
+    totals_rows: u32 = 0,
     columns: []const Column,
 
     /// Column lookup is by folded name, like every other symbol match.
     pub fn column(self: Table, folded_query: []const u8) ?*const Column {
         for (self.columns) |*c| {
             if (std.mem.eql(u8, c.folded, folded_query)) return c;
+        }
+        return null;
+    }
+
+    /// A column's **offset into the table**, which is what a structured
+    /// reference's geometry is expressed in (M5a1). Same comparator as
+    /// `column`; a separate function because a pointer cannot be
+    /// subtracted from a slice the caller does not hold.
+    pub fn columnIndex(self: Table, folded_query: []const u8) ?u32 {
+        for (self.columns, 0..) |c, i| {
+            if (std.mem.eql(u8, c.folded, folded_query)) return @intCast(i);
         }
         return null;
     }
@@ -407,7 +429,12 @@ pub const SymbolTable = struct {
         );
     }
 
-    fn fold(
+    /// The one comparator. Public from M5a1 on, because the graph's
+    /// structured-reference resolver has to match a column spelling the
+    /// same way the evaluator matches a name — and a second, quietly
+    /// different fold is exactly what injecting the collation was meant
+    /// to prevent.
+    pub fn fold(
         self: *const SymbolTable,
         gpa: std.mem.Allocator,
         s: []const u8,
@@ -585,6 +612,8 @@ pub const Builder = struct {
             .folded = folded,
             .sheet = sheet,
             .ref = try a.dupe(u8, table.ref),
+            .header_rows = table.header_rows,
+            .totals_rows = table.totals_rows,
             .columns = columns,
         });
     }
