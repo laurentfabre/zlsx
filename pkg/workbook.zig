@@ -34,6 +34,11 @@ const store_mod = @import("store.zig");
 /// `Workbook` — but only through function bodies on both sides, so
 /// neither type's layout depends on the other.
 const recalc_txn = @import("recalc_txn.zig");
+/// M5d2: §5.7's pipeline and §5.7.9's file transaction. The two entry
+/// points below are thin forwarders — the pipeline lives in its own file
+/// because it composes six layers and because its tests need a root of
+/// their own to run under.
+const recalc_run = @import("recalc_run.zig");
 const typed_parts = @import("typed_parts/root.zig");
 const zlsx = @import("zlsx");
 const drawing_emit = @import("drawing_emit.zig");
@@ -1238,6 +1243,50 @@ pub const Workbook = struct {
         }
     }
 
+    /// §5.7's in-memory transaction (M5d2): recalculate every formula
+    /// cell and swap the result in as the final pipeline operation.
+    ///
+    /// No file is opened. On refusal, cancellation or allocation failure
+    /// the workbook is exactly as it was — the pipeline's three gates all
+    /// run before a candidate exists, and the candidate is abandoned
+    /// rather than swapped if anything after them says no.
+    ///
+    /// The report is the caller's and owns its census; `deinit` it with
+    /// this workbook's allocator, which is what the transaction that
+    /// built it had to use (`recalc_txn.prepare` has no choice — every
+    /// other allocation it makes is installed into the workbook by the
+    /// swap).
+    pub fn recalculate(
+        self: *Workbook,
+        allocator: Allocator,
+        io: std.Io,
+        run: recalc_run.RunInputs,
+        opts: recalc_run.Options,
+    ) Error!recalc_run.Report {
+        return recalc_run.recalculate(self, allocator, io, run, opts);
+    }
+
+    /// §5.7.9's file transaction (M5d2): recalculate, write, commit,
+    /// then swap.
+    ///
+    /// The ordering is normative and is stated where it is implemented
+    /// (`pkg/recalc_run.zig`). What a caller needs from here: any failure
+    /// before the rename leaves BOTH the destination's prior bytes and
+    /// this workbook's memory untouched (or the destination still absent
+    /// if it never existed); a successful rename leaves memory and file
+    /// consistent; and a directory fsync that fails afterwards is a
+    /// `durability_warning` on the returned report, never an error.
+    pub fn saveWithRecalc(
+        self: *Workbook,
+        allocator: Allocator,
+        io: std.Io,
+        path: []const u8,
+        run: recalc_run.RunInputs,
+        opts: recalc_run.Options,
+    ) Error!recalc_run.Report {
+        return recalc_run.saveWithRecalc(self, allocator, io, path, run, opts);
+    }
+
     /// Register a cell style in the workbook-level styles plan and
     /// return its 1-based `s="…"` index. Dedupes by content. Mirrors
     /// `xlsx.Writer.addStyle` byte-for-byte (both ultimately route
@@ -1743,7 +1792,7 @@ pub const Workbook = struct {
 
     /// The plane a package refusal reaches the engine as. The engine
     /// only ever stops the run on it; the detail travels separately.
-    fn planeOfRefusal(r: EvaluateResult) engine.decode.PlaneTwo {
+    pub fn planeOfRefusal(r: EvaluateResult) engine.decode.PlaneTwo {
         return switch (r) {
             .parse_refused => .FormulaMalformedInput,
             .eval_refused => |e| e.plane,
@@ -1752,15 +1801,26 @@ pub const Workbook = struct {
         };
     }
 
-    const OneCell = union(enum) {
+    pub const OneCell = union(enum) {
         ok: struct {
             value: engine.value.ScalarValue,
             reads: engine.iterate.Reads,
+            /// The shape the evaluator produced, before `scalarOf`
+            /// narrowed it to a top-left. The computed layer does not
+            /// want it — a layer holds values — but §5.7.3's pre-M7 gate
+            /// is a statement about the shape, and by the time a
+            /// publication reaches the patcher the array is gone.
+            shape: engine.value.Shape = .{ .rows = 1, .cols = 1 },
         },
         refused: EvaluateResult,
     };
 
-    fn evaluateOne(
+    /// Public for M5d2: the recalc driver in `pkg/recalc_run.zig` is the
+    /// second `iterate.Host` over this model, and it has to evaluate a
+    /// stored cell exactly the way `evaluateClosure` does. Two copies of
+    /// this body would be two dialect lookups, two draw-key wirings and
+    /// two answers to the same formula.
+    pub fn evaluateOne(
         self: *Workbook,
         a: Allocator,
         model: *WorkbookEnv,
@@ -1790,17 +1850,23 @@ pub const Workbook = struct {
             } } },
         };
 
-        var draws = engine.eval.DrawSource.constant(&unreachable_draw);
+        var fixed = engine.eval.DrawSource.constant(&unreachable_draw);
+        const draws = opts.draws orelse &fixed;
         var resolution: engine.NameResolution = .{ .table = &model.symbols, .gpa = model.allocator };
         var evaluator = engine.eval.Evaluator.init(a, model.evalEnv(), .{
             .current_sheet = cell.sheet,
             .collation = opts.collation,
-            .draws = &draws,
+            .draws = draws,
             .fidelity = opts.fidelity,
             .dialect = dialect,
             .site = .{ .row = cell.row, .col = cell.col },
             .names = resolution.resolver(),
             .limits = opts.parse_limits,
+            .now_utc_ms = opts.now_utc_ms,
+            .utc_offset_min = opts.utc_offset_min,
+            .platform_profile = opts.platform_profile,
+            .text_compat = opts.text_compat,
+            .date_system = opts.date_system,
             // §5.6d: the invocation path is rooted at the owning cell,
             // and the pass number travels with the key the engine
             // supplied.
@@ -1825,6 +1891,7 @@ pub const Workbook = struct {
                 .cells = try a.dupe(engine.env.CellRef, evaluator.deps.cells.items),
                 .areas = try a.dupe(engine.env.RangeRef, evaluator.deps.areas.items),
             },
+            .shape = shapeOf(v),
         } };
     }
 
@@ -8204,6 +8271,34 @@ pub const EvaluateOptions = struct {
     /// caller has to lower it deliberately to make a resource ceiling
     /// beat the workbook's own request (§5.6c).
     work_limits: engine.iterate.WorkLimits = .{},
+
+    // ─── M5d2: the rest of what a run is (§5.5) ──────────────────
+    //
+    // Five fields and a pointer that a *recalc* has and a standalone
+    // cache-based read does not. They default to what `evaluate` and
+    // `evaluateClosure` already behaved as, so those two are unchanged;
+    // `pkg/recalc_run.zig` is the caller that fills them from a
+    // `RunInputs` and from the workbook's own calc state.
+
+    /// The instant `NOW()`/`TODAY()` report. An input, never a clock
+    /// read — that is what makes a recalc reproducible from `RunInputs`.
+    now_utc_ms: i64 = 0,
+    utc_offset_min: i32 = 0,
+    /// §5.4b's code page, which `CHAR`/`CODE` resolve through.
+    platform_profile: engine.run_inputs.PlatformProfile = .windows_1252,
+    /// §5.4d. Workbook-derived: absent compatibility metadata IS CV1.
+    text_compat: engine.run_inputs.CompatibilityVersion = .cv1,
+    /// §5.4a's epoch. Workbook-derived (`workbookPr@date1904`), never
+    /// caller-set in a sense that matters — a caller who changed it
+    /// would silently redate every serial in the file.
+    date_system: engine.run_inputs.DateSystem = .d1900,
+    /// `rng_v1`, seeded from the run, plus §5.6d's memo.
+    ///
+    /// Null keeps §5.6f's fixed source: a cache-based read must answer
+    /// the same call the same way twice, and it has no seed to answer it
+    /// from. A recalc does, and volatile determinism is a promise about
+    /// that seed rather than about a constant.
+    draws: ?*engine.eval.DrawSource = null,
 };
 
 /// One evaluation's result, and the arena that owns every byte of it.
@@ -8292,6 +8387,16 @@ fn scalarOf(v: engine.eval.Value) engine.value.ScalarValue {
     };
 }
 
+/// The shape `scalarOf` throws away (M5d2). §5.7.3's pre-M7 gate refuses
+/// a non-1×1 result, and a publication that only carried the top-left
+/// would have nothing left to refuse.
+fn shapeOf(v: engine.eval.Value) engine.value.Shape {
+    return switch (v) {
+        .array => |m| m.shape(),
+        else => .{ .rows = 1, .cols = 1 },
+    };
+}
+
 fn cloneScalar(a: Allocator, s: engine.value.ScalarValue) Error!engine.value.ScalarValue {
     return switch (s) {
         .text => |t| .{ .text = try a.dupe(u8, t) },
@@ -8307,11 +8412,16 @@ fn cloneScalar(a: Allocator, s: engine.value.ScalarValue) Error!engine.value.Sca
 /// vtable for the three questions a static walk cannot answer from an
 /// AST (which sheet a name means, what a spelling binds to, what area a
 /// structured reference denotes).
-const GraphBridge = struct {
+/// Public because M5d2's pipeline lives in `pkg/recalc_run.zig` and needs
+/// the same node set `evaluateClosure` builds. A second bridge written
+/// there would be a second opinion about which coordinates carry
+/// formulas — the recalc would then evaluate a graph the standalone
+/// closure disagrees with, and nothing would say so.
+pub const GraphBridge = struct {
     model: *WorkbookEnv,
     gpa: Allocator,
 
-    fn resolver(self: *GraphBridge) engine.graph.Resolver {
+    pub fn resolver(self: *GraphBridge) engine.graph.Resolver {
         return .{ .ctx = self, .vtable = &vtable };
     }
 
@@ -8329,7 +8439,7 @@ const GraphBridge = struct {
     /// producer. Allocated into the caller's arena, borrowing the
     /// model's strings — which is why the model has to outlive the
     /// graph, and does.
-    fn buildInput(self: *GraphBridge, a: Allocator) Error!engine.graph.Input {
+    pub fn buildInput(self: *GraphBridge, a: Allocator) Error!engine.graph.Input {
         var cells: std.ArrayList(engine.graph.CellInput) = .empty;
         for (self.model.sheets, 0..) |sheet, i| {
             const idx = engine.env.SheetIndex.fromInt(@intCast(i));

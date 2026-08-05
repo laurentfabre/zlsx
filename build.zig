@@ -1639,6 +1639,29 @@ pub fn build(b: *std.Build) void {
     const package_recalc_txn_tests = b.addTest(.{ .root_module = package_recalc_txn_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_recalc_txn_tests).step);
 
+    // pkg/recalc_run.zig — M5d2's pipeline and §5.7.9's file
+    // transaction. Its own root for the same reason `recalc_txn` has
+    // one: `workbook.zig` reaches it through two forwarder bodies, and
+    // a file no analysis reaches is a file whose tests never run.
+    const package_recalc_run_tests_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/recalc_run.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    package_recalc_run_tests_mod.addImport("zlsx_control", control_mod);
+    package_recalc_run_tests_mod.addImport("zlsx", zlsx_mod);
+    package_recalc_run_tests_mod.addImport("zlsx_sst_plan", sst_plan_mod);
+    package_recalc_run_tests_mod.addImport("zlsx_styles_plan", styles_plan_mod);
+    package_recalc_run_tests_mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
+    package_recalc_run_tests_mod.addImport("zlsx_zip", zip_mod);
+    package_recalc_run_tests_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
+    package_recalc_run_tests_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
+    package_recalc_run_tests_mod.addImport("zlsx_nfc", nfc_mod);
+    package_recalc_run_tests_mod.addImport("zlsx_refs", refs_mod);
+    package_recalc_run_tests_mod.addImport("zlsx_formula", formula_pkg_mod);
+    const package_recalc_run_tests = b.addTest(.{ .root_module = package_recalc_run_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(package_recalc_run_tests).step);
+
     // pkg/editor.zig had no test target at all, so its inline tests
     // were never collected: Zig gathers tests from the root file and
     // the files it imports *within the same module*, and nothing that

@@ -1942,7 +1942,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M5b2** ✅ | Prepare/swap transaction (complete state, reports pre-swap) + calcChain rel-resolution + calc-state writes + `markRecalcOnLoad` + diagnostics. **Hard dependency on M5b0** — whole-generation retention (§5.7.4) is unsafe while `PartStore` exclusively owns and closes its own file, so M5b2's gate re-runs M5b0's ownership tests | No-fail-swap proof; post-failure reads; raw-entry identity; refusal purity; **M5b0 ownership tests green** |
 | **M5c** ✅ | `Workbook.openBuffer(alloc, io, bytes)` + **`Writer.saveToOwnedBuffer`** + `zlsx_recalc` **importable shell** (module graph only — its public composition ops land in M5d, where the consumer test moves) | Module-graph gate; buffer≡path byte-equivalence |
 | **M5d1** ✅ | Archive/durability substrate: **`AtomicFile.finish` fsync fix** + commit region + **cancellation-aware serialization seam** (the context-free `DeflateFn` at `pkg/zip.zig:64-68,140-144` AND PartStore's whole-input compression during preparation, `pkg/store.zig:370-385,498-512,638-656` — the shared compressor becomes context/callback-aware with 64 KiB chunks; the same chunking covers **decompression during model materialization** (`store.zig:881-916,1361-1384`), **raw-entry copies at save** (`:783-792`), XML scans, and temp-file writes, so the §5.5 polling bound holds across every long operation; cancel-inside-entry, cancel-inside-replacePart, and cancel-inside-materialization tests. **Control-aware buffer variants** — `saveToOwnedBufferControlled` / `openBufferControlled` (§5.10) wired to these seams, with cancel-mid-fresh-serialization and cancel-mid-buffer-open tests, so the Writer path meets the same bound. **Documented SLA exceptions: the blocking `File.sync` AND the post-commit POSIX directory fsync cannot be polled** — both uncancellable waits (no timeout; post-commit status is already success per §5.7.9), fault-injected tests for each, incl. Python worker-thread wait behavior) | Injected sync/rename failures; cancel-inside-* tests |
-| **M5d2** | `recalculate()` + `saveWithRecalc` (ordering §5.7.9) + report + pre-M7 gate + logical-view gate + embedding-staleness preflight | Determinism; scoped idempotence; no-formula identity; confinement |
+| **M5d2** ✅ | `recalculate()` + `saveWithRecalc` (ordering §5.7.9) + report + pre-M7 gate + logical-view gate + embedding-staleness preflight. **The pipeline itself** (`pkg/recalc_run.zig`): model build → whole-workbook graph → §5.6c/§5.6e run → `ResolvedSheet` projection + patch → `recalc_txn.prepare` → swap (in-memory) or serialize-commit-swap-fsync (file). **`PartStore.saveCommitted`** — a `void`-returning `CommitHook` between rename and directory fsync, which is the only place §5.7.9's swap can go. **`RunInputs` reaches the evaluator** (clock, UTC offset, platform profile, `rng_v1` draw source + §5.6d schedule; epoch and CV workbook-derived). **No-formula identity is a rule, not an accident**: a workbook with no formula cells is left byte-identical, calc state included | Determinism; scoped idempotence; no-formula identity; confinement |
 | **M5d3** | Writer compose + `zlsx_recalc` composition ops + **consumer dependency test** + committed bench workloads | Module-graph gate; bench baseline |
 | **M6** | CLI: NDJSON schemas, exit tables (incl. 130/143 + prefix-valid stream rule), mandatory `--sheet/--name`, `--out` identity | Contract tests |
 | **M7a** | DA evaluation + decision table + ownership + `A1#`/`@` + F2-DA natives (FILTER, SORT, SORTBY, UNIQUE, SEQUENCE, RANDARRAY, TRANSPOSE) + RANDARRAY KATs | Fixtures; obstruction fuzz |
@@ -3251,6 +3251,146 @@ long operation became interruptible.
     final poll, the last instant at which a cancelled save is a save that
     changed nothing.
 
+**M5d2 decisions (shipped 2026-08-05).** Fifteen points, in a new
+pipeline file (`pkg/recalc_run.zig`), one seam in the commit region
+(`pkg/store.zig`), the evaluator's run inputs (`pkg/workbook.zig`,
+`src/formula/symbols.zig`), and two forwarder methods. The row where six
+layers that all existed became one operation a caller can name.
+
+1.  **The swap is a callback, because §5.7.9 puts it between two
+    statements inside `PartStore.save`.** The ordering is rename → swap →
+    directory fsync, and the rename and the fsync are `finish()` and
+    `syncDir()`, two lines apart in a function the caller does not own.
+    Nothing short of a hook reaches that point. `CommitHook` returns
+    `void` rather than an error union, which is the same argument
+    `syncDir` already makes with its return type: after the commit point
+    there is no failure left to report, and a hook that could fail would
+    have reintroduced one. `Candidate.swap` is no-fail anyway, so the
+    restriction costs nothing and states the rule in the type system.
+2.  **`Prepared` has three arms, and the third one is the no-formula
+    rule.** `recalc_txn.Result` has two — a candidate or a refusal — and
+    a workbook with no formula cells is neither. Collapsing it into
+    either would make a no-op a mutation (write `calcId="0"` and
+    `fullCalcOnLoad="1"` into a file with nothing to calculate) or an
+    error. §5.7.6's truthful producer state is a claim about *zlsx's
+    caches*, and a run that produced none has nothing to be truthful
+    about; the byte-identity with a plain staged-state save is the test
+    that keeps it honest. The rule keys on the model — "this workbook has
+    no formula cells" — and not on the output bytes, because "no byte
+    changed" is a much later and much weaker statement.
+3.  **The pipeline is its own file, and that cost three `pub`s.**
+    `GraphBridge`, `Workbook.evaluateOne` and `planeOfRefusal` were
+    private to `evaluateClosure`. Rewriting any of them in the new file
+    would have been a second opinion about which coordinates carry
+    formulas, which dialect a stored cell evaluates in, and how a
+    package refusal projects onto a plane — three places where a recalc
+    silently disagreeing with standalone evaluation would be invisible
+    until a workbook came back wrong. The file is separate for the same
+    reason `recalc_txn.zig` is: two forwarder bodies in `workbook.zig`
+    are all that reach it, and a file no analysis reaches is a file whose
+    tests never run.
+4.  **`evaluateOne` gained a shape it does not use itself.** `scalarOf`
+    narrows an array result to its top-left before the value reaches the
+    computed layer — correct, because a layer holds values — but §5.7.3's
+    pre-M7 gate is a statement about the *shape*, and by the time a
+    publication reaches the patcher the array is gone. So the shape is
+    captured where it still exists and carried alongside. The alternative
+    was to reconstruct it at the patcher from the formula text, which is
+    a second evaluator.
+5.  **Every plane-2 refusal goes through `recalc_txn.prepare`'s census
+    rather than straight out.** §5.7.7's eligibility table — mark-only
+    may suppress exactly `FormulaUnsupportedFunction` and
+    `FormulaUnsupportedConstruct` — already lives in `calc_patch.markEligible`
+    and is applied in one place. A pipeline that decided for itself which
+    refusals `keep_stale_and_mark` may swallow would be that table's
+    second copy, and the two would diverge on the first new plane.
+6.  **The census carries one entry, and that is the engine's shape rather
+    than a shortcut.** `iterate.run` stops the whole run on the first
+    `Produced.refused` and rolls back, so there is no second refusal to
+    record. A full census needs a pass that classifies every formula
+    without evaluating it — worth having, and it belongs with M6's
+    reporting surface rather than hidden inside a transaction.
+    `census_truncated` and `max_census_entries` already exist for the day
+    that pass lands.
+7.  **The logical-view gate refuses appends and fresh-emit bodies, and
+    admits staged deltas.** §5.7.1 builds the model over the logical
+    view, and the three parts of that view are not equally writable:
+    `WorkbookEnv.build` already inserts deltas at the staged layer and
+    they land on `<c>` elements the part has, so they patch. An appended
+    row is a cell the part does not have, and §5.8b's approved mutation
+    set cannot insert one without the `<row spans>` / `<dimension>`
+    maintenance M7b1 owes. Recalculating a model that quietly omitted
+    them would compute `SUM(A:A)` over a column the caller has already
+    added to. The gate runs before the model, so the refusal costs
+    nothing and mutates nothing.
+8.  **The embedding preflight tests overlap against *edits*, not against
+    publications.** A publication that matched the value a cell already
+    cached produces no `Edit`, and an unchanged byte cannot invalidate a
+    hash — which is exactly what makes recalculating an embedded workbook
+    a second time legal rather than a permanent refusal. It also means
+    the preflight needs no canonicalizer of its own: a coverage's hash
+    binds to a canonical row payload, and a rewritten `<v>` or `t`
+    changes that payload by construction, so recomputing the hash would
+    answer a question the edit list has already answered and would add a
+    second implementation of the embedding arc's canonical form to keep
+    in sync.
+9.  **`RunInputs` had never reached the evaluator, and five
+    `eval.Options` fields were the reason.** `now_utc_ms`,
+    `utc_offset_min`, `platform_profile`, `text_compat` and
+    `date_system` were all sitting at their defaults in `evaluateOne`, so
+    before this row a recalculated `TODAY()` would have said 1970 and a
+    `t="d"` cell in a 1904 workbook would have been read four years and a
+    day off. Two of the five are workbook-derived and are filled from
+    `model.calc` rather than from the caller — a caller who could set the
+    epoch would silently redate every serial in the file. The fields
+    default to the old behaviour, so `evaluate` and `evaluateClosure` are
+    byte-for-byte what they were.
+10. **`rng_v1` is wired as a `DrawSource` with §5.6d's schedule;
+    standalone eval keeps its constant.** A cache-based read has no seed
+    to answer from and must answer the same call the same way twice, so
+    its fixed source is a contract rather than a placeholder. A recalc
+    does have a seed, and "equal `RunInputs` ⇒ equal output" is a promise
+    about that seed — a constant would have made the determinism test
+    pass while testing nothing.
+11. **The evaluation phase polls once per cell, and cancellation travels
+    as a failure rather than as a refusal.** `iterate.run` takes no
+    poller and its host may only fail with `OutOfMemory`, so the driver
+    parks `error.Cancelled` and returns `refused` to stop the engine —
+    which then replays its journal backwards, giving §5.6c's zero
+    mutation for free. `prepare` reads the parked failure *before* the
+    outcome, so a cancelled run never reports itself as a limit refusal.
+    One cell is the right interval: below it there is nothing to
+    interrupt, and above it a large workbook is one unpollable stretch —
+    the shape M5d1 removed from the archive layer.
+12. **`has_value` exists because `evaluate` and `publish` are two
+    calls.** The shape is knowable at the first and the value only at the
+    second, so the record is created by one and completed by the other. A
+    cell the engine evaluated and then chose not to publish must not be
+    staged; without the flag its placeholder blank would have published
+    as `<v>0</v>` — a cached zero nothing computed.
+13. **Cancellation placement is proven by counting and then tripping at
+    the count.** A deadline forces a clock read at every poll, so M5d1's
+    injected `now` is an exact poll counter: one pass measures N, the
+    next arms the token on read N — the final pre-rename poll, which
+    checks the token *before* the clock and therefore passes — and the
+    commit runs to completion. The companion test arms it at N−1 and gets
+    a refusal with the destination still absent. Neither test asserts a
+    constant, and the pair is what makes it a statement about placement
+    rather than about luck.
+14. **`cells_written` counts cells whose bytes the patch changed, not
+    publications.** §5.7.8 calls it "cells whose cached value the run
+    wrote", and a cell that already carried the right value was not
+    written. It is also what makes idempotence visible in the report
+    rather than only in a byte diff: the second recalc of a workbook
+    reports zero.
+15. **§12.1 lost `diag` and `save_opts`.** The `RecalcReport` is prepared
+    pre-swap and already carries the census, the counts and §5.7.8's
+    resolved-input echo, so a separate diagnostics parameter would have
+    been a second channel for the same facts; and a save this transaction
+    performs has no option that is not already in `opts` or in
+    `RunInputs`. Shipping a parameter that is always `.{}` is a worse
+    commitment than adding one later.
+
 ---
 
 ## 8. Testing & oracles
@@ -3486,8 +3626,8 @@ constructs.
 ### 12.1 Zig
 
 ```zig
-Workbook.recalculate(alloc, io: std.Io, run: RunInputs, opts, diag) RecalcError!RecalcReport
-Workbook.saveWithRecalc(alloc, io, path, save_opts, run, opts, diag) SaveError!RecalcReport
+Workbook.recalculate(alloc, io: std.Io, run: RunInputs, opts) RecalcError!RecalcReport
+Workbook.saveWithRecalc(alloc, io, path, run: RunInputs, opts) SaveError!RecalcReport
 Workbook.openBuffer(alloc, io: std.Io, bytes: []const u8) OpenError!Workbook  // borrow ends at return
 Workbook.openBufferControlled(alloc, io, bytes, ctl: Control) OpenError!Workbook   // cancel/deadline-aware (§5.10)
 Workbook.evaluate(alloc, current_sheet, site: ?EvalSite, formula, run, diag) EvalError!EvaluatedValue
@@ -3498,7 +3638,13 @@ zlsx_recalc.writerSaveWithRecalc(alloc, io, writer, path, run, opts, diag) SaveE
 ```
 
 CalcState workbook-derived; allocator-explicit; `deinit` everywhere; diag
-pre-error.
+pre-error. **`diag` and `save_opts` are not parameters** (M5d2): the
+`RecalcReport` is prepared pre-swap and carries the census, the counts and
+§5.7.8's resolved-input echo, so a second diagnostics channel would be a
+second copy of the same facts; and a save this transaction performs has no
+option that is not already in `opts` or in `RunInputs`. Both come back if
+and when they carry something — adding a parameter is cheaper than
+shipping one that is always `.{}`.
 
 ### 12.2 CLI
 

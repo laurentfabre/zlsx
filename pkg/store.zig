@@ -31,6 +31,35 @@ pub const Commit = atomic_file_mod.Commit;
 const control = @import("zlsx_control");
 pub const Poller = control.Poller;
 
+/// §5.7.9's one seam *inside* the commit region (M5d2).
+///
+/// The ordering the spec makes normative is rename → swap → directory
+/// fsync, and the swap is the caller's: `saveWithRecalc` installs a
+/// prepared generation the instant the rename has published the bytes it
+/// was serialized from. That instant is inside `saveControlled`, between
+/// two statements, so the only way to reach it is a callback.
+///
+/// **Infallible by signature, and that is the whole design.** §5.7.9 says
+/// nothing after the commit point may report failure as an error;
+/// `AtomicFile.syncDir` obeys that by returning a `Commit` instead of an
+/// error union, and this obeys it by returning `void`. A hook that could
+/// fail would put a second failure mode after the point where there is no
+/// longer a failure to report — and `recalc_txn.Candidate.swap` is
+/// already no-fail, so nothing is being given up.
+pub const CommitHook = struct {
+    ctx: ?*anyopaque = null,
+    call: ?*const fn (?*anyopaque) void = null,
+
+    /// What every plain save passes: the rename is the last thing that
+    /// happens, and nothing needs to run between it and the fsync.
+    pub const none: CommitHook = .{};
+
+    pub inline fn fire(self: CommitHook) void {
+        const f = self.call orelse return;
+        f(self.ctx);
+    }
+};
+
 /// Read exactly `dest.len` bytes at `offset`.
 ///
 /// Zig 0.16 removed `File.seekTo` / `File.readAll`; positional reads go
@@ -1000,6 +1029,25 @@ pub const PartStore = struct {
     /// save can never have renamed anything. Everything from `finish`
     /// onward is the non-cancellable commit region.
     pub fn saveControlled(self: *PartStore, io: std.Io, path: []const u8, poller: Poller) !Commit {
+        return self.saveCommitted(io, path, poller, .none);
+    }
+
+    /// `saveControlled` with §5.7.9's swap point exposed (M5d2).
+    ///
+    /// `hook` runs after the rename has committed and before the
+    /// directory fsync — the position §5.7.9 makes normative for
+    /// `saveWithRecalc`'s in-memory swap. It cannot fail, cannot be
+    /// cancelled, and cannot be skipped: once `finish` returns, the
+    /// destination already names the new bytes, so a memory state that
+    /// still describes the old ones is the inconsistency the ordering
+    /// exists to prevent.
+    pub fn saveCommitted(
+        self: *PartStore,
+        io: std.Io,
+        path: []const u8,
+        poller: Poller,
+        hook: CommitHook,
+    ) !Commit {
         // Preflight ZIP32 limits BEFORE opening the output file. Every
         // offset / size field on the wire is u32 (offsets, CD size,
         // payload sizes) or u16 (name length, comment length, entry
@@ -1184,6 +1232,10 @@ pub const PartStore = struct {
         // is still a save that changed nothing.
         try poller.check();
         try atomic_file.finish();
+        // The commit point has passed. §5.7.9's swap goes here — between
+        // the rename and the directory fsync — so that no observer can
+        // find the file published and the memory stale.
+        hook.fire();
         return atomic_file.syncDir();
     }
 
