@@ -146,6 +146,101 @@ the parts); anything else is refused before a request is made. If the
 warehouse reports the result set as truncated, orphan findings are
 flagged as untrustworthy on stderr rather than silently under-reported.
 
+### Formula (`eval` / `recalc`)
+
+The formula engine on the command line (M6, §12.2 of the design doc).
+Both commands have their own argument grammar, their own NDJSON stream
+contract (below — **not** the row envelope), and their own exit table.
+
+```
+zlsx eval   <file.xlsx> --formula "<formula>" (--sheet N | --name NAME) [--anchor A1]
+            [--dialect da|legacy] [--now ISO8601] [--utc-offset MIN] [--seed N]
+            [--mode excel|ieee] [--profile windows_1252] [--deadline SECONDS]
+zlsx recalc <file.xlsx> --out <out.xlsx> [--now ISO8601] [--utc-offset MIN]
+            [--seed N] [--mode excel|ieee] [--profile windows_1252]
+            [--on-unsupported refuse|keep-stale-and-mark] [--report]
+            [--deadline SECONDS]
+```
+
+- `--formula` carries the text; the next token is taken verbatim, so
+  `-A1`, `--A1`, and other flag-shaped text need no escaping. A leading
+  `=` is accepted and ignored. `--sheet N | --name NAME` is mandatory
+  and exclusive for `eval`.
+- `--anchor A1` supplies the evaluation site for site-dependent
+  constructs (`ROW()`, `COLUMN()`, `@`); absent when one is needed →
+  exit 3 (`FormulaAnchorRequired`).
+- `--now` / `--seed` default to the system wall clock / secure random
+  source; a source that cannot be read is **exit 6** (never conflated
+  with OOM). `--seed` is a decimal u64; in every record it serializes
+  as a **decimal string** (u64 exceeds the JSON/JS safe-integer range).
+- `recalc --out` must not be the input — refused (exit 1) before
+  anything is opened. The write is one atomic transaction (§5.7.9): on
+  every refusal or cancellation path the destination's prior bytes are
+  untouched ("no file" only when it was absent).
+
+#### The stream state machine
+
+Versioned NDJSON: every record carries `"kind"` and `"v":1`. The
+grammars are normative — refusal and cancellation can occur **before**
+any header exists:
+
+```
+eval stream   := refusal | cancelled
+               | eval-header ( eval-cell* ) diagnostic* ( eval-complete | refusal | cancelled )
+recalc stream := diagnostic* ( recalc-report | refusal | cancelled )    (stdout only with --report)
+```
+
+```jsonl
+{"kind":"eval-header","v":1,"type":"number","value":3,"resolved":{"now":"2026-08-05T12:00:00.000Z","utcOffsetMin":0,"seed":"7","mode":"excel","profile":"windows_1252","dialect":"da","anchor":"B7"}}
+{"kind":"eval-header","v":1,"type":"matrix","rows":2,"cols":2,"resolved":{…}}
+{"kind":"eval-cell","v":1,"r":1,"c":1,"type":"number","value":1}
+{"kind":"diagnostic","v":1,"severity":"warning","message":"…"}
+{"kind":"eval-complete","v":1,"cells":4}
+{"kind":"refusal","v":1,"error":"FormulaCycle","cells":["Sheet1!A1"],"truncated":false}
+{"kind":"cancelled","v":1,"after":"eval-cell"}
+{"kind":"recalc-report","v":1,"sheets":1,"cells":1,"passes":1,"nonConverged":0,"dynamicPasses":1,"keptStale":false,"calcChainRemoved":false,"census":[{"error":"FormulaUnsupportedFunction","cell":"Sheet1!B1"}],"censusTruncated":false,"resolved":{…}}
+```
+
+- Scalar results ride in the header (`type` ∈ `number` | `text` | `bool`
+  | `error`) and emit no `eval-cell` records — `eval-complete` then
+  counts 0. Matrix results put the shape in the header and stream cells
+  row-major. **`blank` never appears**: an empty cell publishes as `0`
+  (§5.3a's one mandatory conversion), in both commands.
+- Terminal states are explicit: success = `eval-complete` /
+  `recalc-report`; typed refusal = `refusal` (the `error` field is §10's
+  plane-2 name, verbatim); cancellation = `cancelled`, whose `after`
+  names the last record emitted (`none` when the stream was still
+  empty). Completed records stand — the stream is prefix-valid.
+- **SIGPIPE exception**: a closed pipe cannot receive a terminal record.
+  SIGPIPE ends the stream prefix-valid with **no terminal and exit 0**
+  (`zlsx eval … | head -1` is not an error). Any other EOF without a
+  terminal record exits nonzero — the exit code is what distinguishes
+  the two.
+- `resolved` echoes every input the run actually used (§5.7.8), so a
+  stream is reproducible from its own header. `dialect` / `anchor`
+  appear on `eval` only; a recalc derives dialect per stored cell.
+
+#### Exit codes (`eval` / `recalc`)
+
+| Code | `eval` | `recalc` |
+|---|---|---|
+| 0 | evaluated (Excel error values like `#DIV/0!` are results) | recalced + written |
+| 1 | usage (incl. missing `--sheet`/`--name`) | usage (incl. `--out` = input) |
+| 2 | open/parse (incl. sheet not found) | open/parse |
+| 3 | typed refusal — **incl. `FormulaLimitExceeded`** (limits are refusals at every layer) — or `--deadline` | refusal / cancellation — **destination untouched** |
+| 4 | allocation failure (genuine OOM only) | allocation failure |
+| 5 | stdout write failure | output write/rename failure |
+| 6 | default-context acquisition failure: the wall clock or random source could not be read while resolving an omitted `--now`/`--seed` (never reported as OOM) | same |
+| 130/143 | SIGINT / SIGTERM | same — **before the rename only** |
+
+**Exit mapping is commit-aware** (`recalc`): the rename is the commit,
+and a signal that arrives after it reports **0**, never 130/143 — the
+destination already holds the recalced bytes, and telling a scripted
+caller to retry finished work would be a lie. The cancellation
+guarantee covers workbook-file mutation only; the final cancellation
+poll sits immediately before the rename, and the rename-through-swap
+span is non-cancellable.
+
 ---
 
 ## The NDJSON row envelope
@@ -290,7 +385,9 @@ tracks the intent, but current behaviour is what `parseSharedStrings` /
 
 ## Exit codes
 
-The table below is the contract for the **read family**. The edit, embed,
+The table below is the contract for the **read family**. The formula
+family (`eval` / `recalc`) has its own, richer table — see
+[Formula](#formula-eval--recalc) above. The edit, embed,
 and dbx families reuse the same codes with per-command meanings — e.g.
 `dbx push` returns 3 when the upload preflight refuses a non-workbook, edit
 sub-commands return 3 on a refused structural edit, and the embed family

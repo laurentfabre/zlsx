@@ -64,6 +64,10 @@ pub const resolved = @import("resolved.zig");
 /// M3b: what a run is given and what it may spend. The transaction echoes
 /// the resolved projection into its report (§5.7.8).
 pub const run_inputs = @import("run_inputs.zig");
+/// §5.4a's civil-date math. M6: the CLI's `--now` parser and its
+/// resolved-input echo need the same days↔civil conversion the engine
+/// dates with — a second copy would be a second calendar.
+pub const serial_date = @import("serial_date.zig");
 pub const names = @import("names.zig");
 pub const env = @import("env.zig");
 pub const value = @import("value.zig");

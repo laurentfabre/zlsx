@@ -53,6 +53,14 @@ pub const Workbook = workbook_mod.Workbook;
 pub const Worksheet = workbook_mod.Worksheet;
 pub const ResolvedStyle = workbook_mod.ResolvedStyle;
 pub const WorkbookError = workbook_mod.Error;
+/// M6 (§12.2): what `Workbook.evaluate` returns — the CLI is the first
+/// consumer outside this package that holds one.
+pub const Evaluation = workbook_mod.Evaluation;
+pub const EvaluateResult = workbook_mod.EvaluateResult;
+/// M6: the commit region's one seam (§5.7.9). Exported so a contract
+/// test can inject a signal exactly between the rename and the
+/// directory fsync instead of racing a timer against the transaction.
+pub const CommitHook = store_mod.CommitHook;
 pub const NumberFormatInfo = workbook_mod.NumberFormatInfo;
 pub const EmbeddingView = workbook_mod.EmbeddingView;
 pub const EmbeddingState = workbook_mod.EmbeddingState;

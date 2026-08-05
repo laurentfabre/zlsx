@@ -1,8 +1,10 @@
-//! `zlsx` — read-only command-line interface over the zlsx library.
+//! `zlsx` — command-line interface over the zlsx library.
 //!
-//! Streams rows of the selected sheet to stdout in one of four formats.
-//! Designed as a drop-in openpyxl replacement for reads: shell-friendly,
-//! pipeable into jq / awk, no Python interpreter floor.
+//! Streams rows of the selected sheet to stdout in one of four formats;
+//! the edit/embed families mutate through the package layer; `eval` /
+//! `recalc` (M6, `formula_cli.zig`) put the formula engine on the
+//! command line. Designed as a drop-in openpyxl replacement: shell-
+//! friendly, pipeable into jq / awk, no Python interpreter floor.
 
 const std = @import("std");
 const fuzz_config = @import("fuzz_config");
@@ -10,6 +12,7 @@ const builtin = @import("builtin");
 const xlsx = @import("zlsx");
 const zlsx_pkg = @import("zlsx_pkg");
 const dbx = @import("dbx.zig");
+const formula_cli = @import("formula_cli.zig");
 const coords = @import("zlsx_refs");
 
 const Format = enum {
@@ -794,6 +797,10 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
 fn writeUsage(w: *std.Io.Writer) !void {
     try w.writeAll(
         \\usage: zlsx [<subcommand>] <file.xlsx> [options]
+        \\
+        \\formula sub-commands (M6, own grammars — see each --help):
+        \\  eval              evaluate one formula against a workbook (NDJSON)
+        \\  recalc            recalculate every formula cell into --out
         \\
         \\  --sheet N         0-indexed sheet to read (default: 0)
         \\  --name NAME       select sheet by name (conflicts with --sheet)
@@ -1666,6 +1673,13 @@ const signals = struct {
     var sigint_fired = std.atomic.Value(bool).init(false);
     var sigterm_fired = std.atomic.Value(bool).init(false);
     var sigpipe_fired = std.atomic.Value(bool).init(false);
+    /// M6 (§12.2): `eval` / `recalc` compute their exit codes
+    /// commit-aware — a signal that lands after the rename is a
+    /// success, not a 130/143 — so once they have mapped an exit code
+    /// it is final and `exitCode` below must not re-map it. The
+    /// streaming sub-commands never set this and keep the shipped
+    /// override.
+    var exit_is_final = std.atomic.Value(bool).init(false);
 
     /// 0.16 types the POSIX signal-handler parameter per platform —
     /// Linux uses a generated `SIG` enum, other targets an int — so
@@ -1720,6 +1734,7 @@ const signals = struct {
     /// is user intent, SIGTERM is orderly shutdown, SIGPIPE is normal
     /// pipeline teardown).
     fn exitCode(existing: u8) u8 {
+        if (exit_is_final.load(.acquire)) return existing;
         if (sigint_fired.load(.acquire)) return 130;
         if (sigterm_fired.load(.acquire)) return 143;
         if (sigpipe_fired.load(.acquire)) return 0;
@@ -1829,6 +1844,24 @@ fn runMain(init: std.process.Init) !u8 {
     // scoping matrix.
     if (raw_args.len >= 2 and std.mem.eql(u8, raw_args[1], "dbx")) {
         return try dbx.run(alloc, proc_io, init.minimal.environ, raw_args[2..], out, err);
+    }
+
+    // M6 (§12.2): `eval` / `recalc` delegate the whole tail the same
+    // way — their argument grammar, stream state machine and exit table
+    // live in `formula_cli.zig`. They own their exit mapping completely
+    // (commit-aware; never propagate errors), so latch it as final
+    // before returning it through `signals.exitCode`.
+    if (raw_args.len >= 2 and
+        (std.mem.eql(u8, raw_args[1], "eval") or std.mem.eql(u8, raw_args[1], "recalc")))
+    {
+        const code = formula_cli.run(alloc, proc_io, raw_args[1..], out, err, .{ .sig = .{
+            .stop = &signals.stop_streaming,
+            .sigint = &signals.sigint_fired,
+            .sigterm = &signals.sigterm_fired,
+            .sigpipe = &signals.sigpipe_fired,
+        } });
+        signals.exit_is_final.store(true, .release);
+        return code;
     }
 
     const args = parseArgs(raw_args[1..]) catch |e| switch (e) {
@@ -4686,6 +4719,7 @@ test {
     // this reference was added. Any future src/*.zig that hangs off a
     // command dispatch needs the same line.
     _ = dbx;
+    _ = formula_cli;
 }
 
 test "colLetter A,B,Z,AA,AZ,BA,ZZ,AAA" {

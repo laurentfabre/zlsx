@@ -1273,6 +1273,10 @@ pub fn build(b: *std.Build) void {
     // the `cli_mod` block above where `package_mod` isn't in scope yet.
     cli_mod.addImport("zlsx", zlsx_mod);
     cli_mod.addImport("zlsx_pkg", package_mod);
+    // M6 (§12.2): `formula_cli.zig` publishes evaluated values through
+    // `value.publish` and dates `--now` with `serial_date` — the engine
+    // types themselves, not copies.
+    cli_mod.addImport("zlsx_formula", formula_pkg_mod);
     corpus_mod.addImport("zlsx_pkg", package_mod);
 
     // ─── M5c: `zlsx_recalc`, the third public module (§5.10) ────

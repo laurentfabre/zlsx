@@ -468,8 +468,12 @@ casefold — `café`/`CAFÉ` collapse, cap is 31 scalars not bytes), and the
 
 **Out (by design)**
 
-- **Formula evaluation** — the reader returns the cached `<v>`; the writer
-  accepts formula text + an optional cached result but never computes.
+- **Formula evaluation on the read path** — the reader returns the cached
+  `<v>` untouched; the writer accepts formula text + an optional cached
+  result and never computes behind your back. Since M6, evaluation is its
+  own explicit surface: `zlsx eval` / `zlsx recalc` on the CLI and
+  `Workbook.evaluate` / `Workbook.recalculate` / `saveWithRecalc` in the
+  package layer (see [`docs/cli.md`](docs/cli.md)).
 - **Automatic date decoding** — dates surface as Excel serials; opt in via
   `Rows.parseDate` / `xlsx.fromExcelSerial`.
 - **Pivot-aware edits** — pivots round-trip byte-preserved, but row/col edits

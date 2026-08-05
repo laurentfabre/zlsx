@@ -1520,6 +1520,20 @@ pub const Workbook = struct {
             .names = resolution.resolver(),
             .array_formula = opts.array_formula,
             .limits = opts.parse_limits,
+            // M6: the §5.5 run inputs a standalone caller states. These
+            // defaulted here since M5d2 while `evaluateOne` forwarded
+            // them, so a caller-set `--now` was echoed but never
+            // reached NOW(). The two workbook-derived fields keep the
+            // workbook's answer, exactly as the recalc driver does —
+            // a caller has nothing true to say about either.
+            .now_utc_ms = opts.now_utc_ms,
+            .utc_offset_min = opts.utc_offset_min,
+            .platform_profile = opts.platform_profile,
+            .date_system = model.calc.date_system,
+            .text_compat = switch (model.calc.text_compat) {
+                .v1 => .cv1,
+                .v2 => .cv2,
+            },
         });
         defer evaluator.deinit();
 
@@ -6235,9 +6249,12 @@ fn emitCell(
                 try out.appendSlice(allocator, "</v></c>");
             },
             .formula => |f| {
-                // No cached value — Excel recalcs on open. Future iter
-                // can stash a computed result inside `<v>` once a
-                // formula evaluator (Tier D1) lands.
+                // No cached value — Excel recalcs on open. The engine
+                // exists (M5d/M6: `recalculate` / `saveWithRecalc`
+                // stash computed results through the transaction), but
+                // THIS path deliberately stays cache-free: a set-cell
+                // edit must not imply a recalc the caller didn't ask
+                // for.
                 try out.appendSlice(allocator, "><f>");
                 try appendXmlEscapedText(allocator, out, f);
                 try out.appendSlice(allocator, "</f></c>");
