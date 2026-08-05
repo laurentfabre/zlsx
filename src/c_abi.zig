@@ -2011,7 +2011,7 @@ export fn zlsx_writer_save_to_buffer(
     };
 
     const state: *WriterState = @ptrCast(@alignCast(w));
-    const bytes = state.inner.saveToOwnedBuffer(gpa) catch |e| {
+    const bytes = state.inner.saveToOwnedBuffer(gpa, state.threaded.io()) catch |e| {
         writeError(err_buf, err_buf_len, @errorName(e));
         return -1;
     };

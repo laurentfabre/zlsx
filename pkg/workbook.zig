@@ -1000,6 +1000,37 @@ pub const Workbook = struct {
         return Workbook.open(allocator, io, path);
     }
 
+    /// Open a package that is already in memory (M5c, §5.10).
+    ///
+    /// **The borrow ends when this returns.** `PartStore.openBuffer`
+    /// copies the caller's slice into the backing, so `bytes` may be
+    /// freed, reused or poisoned the moment the call comes back — the
+    /// same contract `Book.openBuffer` has kept since B-cabi-1
+    /// (`xlsx.zig`), and the reason M5b0 made the store dupe rather than
+    /// borrow. A borrowing variant would push the archive's lifetime
+    /// back onto the caller, and the point of a `SourceBacking` is that
+    /// the generations decide when the bytes die.
+    ///
+    /// This is what lets an orchestrator hand a producer's output
+    /// straight to a consumer without a temp file: `Writer` emits into a
+    /// buffer, this reads it, and neither touches the filesystem.
+    /// Everything downstream — lazy part materialization, the typed
+    /// views, `save`, the M5b2 recalc transaction — reaches the same
+    /// code a path-opened workbook does, because the only thing that
+    /// differs is which arm of the backing answers `readAt`.
+    pub fn openBuffer(allocator: Allocator, io: std.Io, bytes: []const u8) Error!Workbook {
+        var store = try PartStore.openBuffer(allocator, io, bytes);
+        // `fromStore` takes ownership INCLUDING on failure, so the
+        // errdefer has to be disarmed before the hand-off. Armed, it
+        // double-frees the arena on every failing open — the exact bug
+        // `Workbook.open` was fixed for at M4b1, reproduced here the day
+        // this function was written by copying it.
+        var owned = true;
+        errdefer if (owned) store.deinit();
+        owned = false;
+        return try fromStore(allocator, store);
+    }
+
     /// Construct a `Workbook` from an already-opened `PartStore`.
     /// Takes ownership of the store; `deinit` will tear it down.
     pub fn fromStore(allocator: Allocator, store: PartStore) Error!Workbook {
@@ -17411,4 +17442,186 @@ test "M5a2: one SCC hitting the ceiling refuses the whole run, on the bytes" {
         1e-9,
     );
     try expectSnapshotUnchanged(ta, &wb, before);
+}
+
+// ─── M5c: Workbook.openBuffer ────────────────────────────────────
+
+/// Everything a buffer-opened workbook has to agree with a path-opened
+/// one about, asserted through the public accessors rather than by
+/// comparing internals: the two stores differ in exactly one thing, and
+/// no reader above the backing is supposed to be able to tell.
+fn expectWorkbooksEquivalent(a: *Workbook, b: *Workbook) !void {
+    try std.testing.expectEqual(a.sheetCount(), b.sheetCount());
+
+    var i: u32 = 0;
+    while (i < a.sheetCount()) : (i += 1) {
+        const wa = try a.sheet(i);
+        const wb2 = try b.sheet(i);
+        try std.testing.expectEqualStrings(wa.name(), wb2.name());
+        try std.testing.expectEqualStrings(
+            try wa.resolvePartName(),
+            try wb2.resolvePartName(),
+        );
+        const va = try wa.ensureParsed();
+        const vb = try wb2.ensureParsed();
+        try std.testing.expectEqual(va.rows.len, vb.rows.len);
+        for (va.rows, vb.rows) |ra, rb| {
+            try std.testing.expectEqual(ra.cells.len, rb.cells.len);
+            for (ra.cells, rb.cells) |ca, cb| {
+                try std.testing.expectEqualStrings(ca.ref, cb.ref);
+                try std.testing.expectEqualStrings(
+                    ca.raw_value orelse "",
+                    cb.raw_value orelse "",
+                );
+            }
+        }
+    }
+
+    // Parts, content types, and rels — the three things `PartStore`
+    // resolves at open, and therefore the three a different source arm
+    // could plausibly get wrong.
+    const names_a = try a.store.partNames();
+    const names_b = try b.store.partNames();
+    try std.testing.expectEqual(names_a.len, names_b.len);
+    for (names_a, names_b) |na, nb| {
+        try std.testing.expectEqualStrings(na, nb);
+        const pa = (try a.store.part(na)) orelse return error.MissingPart;
+        const pb = (try b.store.part(nb)) orelse return error.MissingPart;
+        try std.testing.expectEqualSlices(u8, pa.bytes, pb.bytes);
+        try std.testing.expectEqualStrings(pa.content_type orelse "", pb.content_type orelse "");
+        try std.testing.expectEqual(pa.compression_method, pb.compression_method);
+
+        const ra = a.store.rels(na);
+        const rb = b.store.rels(nb);
+        try std.testing.expectEqual(ra.len, rb.len);
+        for (ra, rb) |x, y| {
+            try std.testing.expectEqualStrings(x.id, y.id);
+            try std.testing.expectEqualStrings(x.type, y.type);
+            try std.testing.expectEqualStrings(x.target, y.target);
+            try std.testing.expectEqual(x.target_mode, y.target_mode);
+        }
+    }
+}
+
+test "M5c: openBuffer and open reach the same workbook, and the borrow ends at return" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+
+    var from_path = try Workbook.open(ta, io, fixture);
+    defer from_path.deinit();
+
+    var from_buffer = blk: {
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, fixture, ta, .limited(1 << 24));
+        defer ta.free(raw);
+        const wb = try Workbook.openBuffer(ta, io, raw);
+        // Poison the caller's slice before a single part is read. If the
+        // store had borrowed rather than copied, everything below would
+        // fail as *content* — not as luck, and not as a crash a later
+        // reader would blame on something else.
+        @memset(raw, 0xAA);
+        break :blk wb;
+    };
+    defer from_buffer.deinit();
+
+    try expectWorkbooksEquivalent(&from_path, &from_buffer);
+}
+
+test "M5c: a buffer-opened workbook saves the bytes a path-opened one does" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", ta);
+    defer ta.free(dir);
+
+    const out_path = try std.fs.path.join(ta, &.{ dir, "from_path.xlsx" });
+    defer ta.free(out_path);
+    const out_buf = try std.fs.path.join(ta, &.{ dir, "from_buffer.xlsx" });
+    defer ta.free(out_buf);
+
+    {
+        var wb = try Workbook.open(ta, io, fixture);
+        defer wb.deinit();
+        try wb.store.save(io, out_path);
+    }
+    {
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, fixture, ta, .limited(1 << 24));
+        defer ta.free(raw);
+        var wb = try Workbook.openBuffer(ta, io, raw);
+        defer wb.deinit();
+        @memset(raw, 0xAA);
+        try wb.store.save(io, out_buf);
+    }
+
+    const a_bytes = try std.Io.Dir.cwd().readFileAlloc(io, out_path, ta, .limited(1 << 24));
+    defer ta.free(a_bytes);
+    const b_bytes = try std.Io.Dir.cwd().readFileAlloc(io, out_buf, ta, .limited(1 << 24));
+    defer ta.free(b_bytes);
+
+    // Byte-identical: both are untouched-LFH + untouched-CDFH copies
+    // through one call, with only the source arm differing. Anything
+    // less would mean the buffer path re-emitted a part.
+    try std.testing.expectEqualSlices(u8, a_bytes, b_bytes);
+}
+
+test "M5c: openBuffer refuses garbage the way open does, and leaks nothing" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    try std.testing.expectError(error.NotPkzip, Workbook.openBuffer(ta, io, "not a zip"));
+    try std.testing.expectError(error.NotPkzip, Workbook.openBuffer(ta, io, &.{}));
+
+    // A well-formed archive with no `xl/workbook.xml` — the failure that
+    // happens INSIDE `fromStore`, after it has taken ownership. The
+    // errdefer disarm is what keeps this a typed error instead of a
+    // double free, and only a test that reaches this branch says so.
+    const bytes = blk: {
+        var store = try PartStore.fresh(ta, io);
+        defer store.deinit();
+        try store.addPart("docProps/core.xml", "application/xml", "<x/>");
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir = try tmp.dir.realPathFileAlloc(io, ".", ta);
+        defer ta.free(dir);
+        const path = try std.fs.path.join(ta, &.{ dir, "nowb.xlsx" });
+        defer ta.free(path);
+        try store.save(io, path);
+        break :blk try std.Io.Dir.cwd().readFileAlloc(io, path, ta, .limited(1 << 20));
+    };
+    defer ta.free(bytes);
+    try std.testing.expectError(error.MissingWorkbookPart, Workbook.openBuffer(ta, io, bytes));
+}
+
+test "M5c: openBuffer leaves nothing allocated under any failure" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, fixture, ta, .limited(1 << 24));
+    defer ta.free(raw);
+
+    try std.testing.checkAllAllocationFailures(ta, struct {
+        fn run(alloc: Allocator, the_io: std.Io, bytes: []const u8) !void {
+            var wb = try Workbook.openBuffer(alloc, the_io, bytes);
+            defer wb.deinit();
+            const ws = try wb.sheet(0);
+            _ = try ws.ensureParsed();
+        }
+    }.run, .{ io, raw });
 }

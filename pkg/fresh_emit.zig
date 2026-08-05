@@ -89,7 +89,19 @@ pub const ArchiveInputs = struct {
     sst_count: u64,
     styles_plan: *const styles_plan_mod.StylesPlan,
     workbook_xml_plan: *const workbook_xml_plan_mod.WorkbookXmlPlan,
+    /// §9's `max_output_archive_bytes`. Carried on the inputs rather
+    /// than passed alongside them so **every** caller of the substrate
+    /// observes the same bound — the path save and the buffer save are
+    /// one emitter, and a limit only one of them consulted would make
+    /// "identical typed outcome at every layer" a coincidence.
+    max_archive_bytes: u64 = max_output_archive_bytes,
 };
+
+/// §9's cap on a serialized output archive: 2³²−1 bytes exactly,
+/// matching the ZIP32 sentinel bounds `pkg/zip.zig` enforces and
+/// `PartStore.save` preflights. Re-exported here because this is the
+/// substrate a producer reaches it through.
+pub const max_output_archive_bytes: u64 = zip.default_max_archive_bytes;
 
 // ─── deflate hookup (broken into a function pointer to keep this
 // module stdlib-only — see `pkg/zip.zig` for the same pattern) ──────
@@ -112,7 +124,7 @@ pub fn emitArchiveBytes(
 ) !void {
     if (inputs.sheets.len == 0) return error.NoSheets;
 
-    var arc = zip.Archive.init(allocator, out);
+    var arc = zip.Archive.initLimited(allocator, out, inputs.max_archive_bytes);
     defer arc.deinit();
 
     const have_styles = !inputs.styles_plan.isEmpty();
