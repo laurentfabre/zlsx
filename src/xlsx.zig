@@ -2,8 +2,10 @@
 //!
 //! Motivated by Alfred's `classify_pdfs` port: we need to read 1,000+ rows
 //! of a single worksheet from a Python-generated xlsx (via openpyxl). Not
-//! a full Office Open XML implementation — no styles, no formulas, no
-//! writes, no multi-sheet streaming, no charts, no comments.
+//! a full Office Open XML implementation. (The blurb above described the
+//! original tier; the repo has since grown styles, writes, comments and —
+//! at M5d/M6 — a formula engine, but each lives in its own module: THIS
+//! file is still the lean read path and never evaluates.)
 //!
 //! Public surface:
 //!   * `Book`    — opens a file, decompresses the few XML parts we care

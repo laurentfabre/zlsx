@@ -2,7 +2,7 @@
 
 `calamine` (Rust, [docs.rs/calamine/0.26.1](https://docs.rs/calamine/0.26.1/)) is the reference pure-native xlsx reader in the ecosystem. This page inventories the gap so you can choose consciously.
 
-> **TL;DR**: zlsx is a narrower tool — xlsx-only, no formula evaluation, "just rows and cells plus styled writes" — deliberately limited to keep the core compact and fast ([10.7 ms / 4.2 MB on a 1,008-row xlsx vs calamine's 15.3 ms / 4.9 MB](benchmarks.md)). Since v0.2.4, zlsx also ships a pragmatic openpyxl-parity **writer** — something calamine doesn't offer at all. If your use case needs `.xls`/`.xlsb`/`.ods`, native `DateTime`, formula evaluation, defined names, or serde deserialization, use calamine. For reading+writing xlsx in Zig (or via C/Python), zlsx is the complete option.
+> **TL;DR**: zlsx is a narrower tool — xlsx-only, "just rows and cells plus styled writes" (formula *evaluation* was out of scope until M6; it now ships as the explicit `zlsx eval` / `zlsx recalc` surface, never on the read path) — deliberately limited to keep the core compact and fast ([10.7 ms / 4.2 MB on a 1,008-row xlsx vs calamine's 15.3 ms / 4.9 MB](benchmarks.md)). Since v0.2.4, zlsx also ships a pragmatic openpyxl-parity **writer** — something calamine doesn't offer at all. If your use case needs `.xls`/`.xlsb`/`.ods`, native `DateTime`, formula evaluation, defined names, or serde deserialization, use calamine. For reading+writing xlsx in Zig (or via C/Python), zlsx is the complete option.
 
 ## Supported file formats
 
@@ -127,7 +127,10 @@ Calamine's `Data` enum vs zlsx's `Cell` union:
 **Pick calamine (or `python-calamine` from Python) if**:
 - You need `.xls` / `.xlsb` / `.ods`.
 - You need native `DateTime` / `DurationIso` / typed error cells.
-- You need formulas, defined names, pictures, or VBA.
+- You need defined names as an API surface, pictures, or VBA. (Formula
+  *text* reads and formula *evaluation* are no longer calamine-only:
+  zlsx ships `zlsx eval` / `zlsx recalc` since M6 — calamine itself
+  does not evaluate either.)
 - You want the serde pipeline (`range.deserialize::<MyStruct>()`).
 - Random-access into the sheet (`get_value((r, c))`) is in your hot path.
 

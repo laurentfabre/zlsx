@@ -1977,7 +1977,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M5d2** ✅ | `recalculate()` + `saveWithRecalc` (ordering §5.7.9) + report + pre-M7 gate + logical-view gate + embedding-staleness preflight. **The pipeline itself** (`pkg/recalc_run.zig`): model build → whole-workbook graph → §5.6c/§5.6e run → `ResolvedSheet` projection + patch → `recalc_txn.prepare` → swap (in-memory) or serialize-commit-swap-fsync (file). **`PartStore.saveCommitted`** — a `void`-returning `CommitHook` between rename and directory fsync, which is the only place §5.7.9's swap can go. **`RunInputs` reaches the evaluator** (clock, UTC offset, platform profile, `rng_v1` draw source + §5.6d schedule; epoch and CV workbook-derived). **No-formula identity is a rule, not an accident**: a workbook with no formula cells is left byte-identical, calc state included | Determinism; scoped idempotence; no-formula identity; confinement |
 | **M5d3** ✅ | `zlsx_recalc.writerSaveWithRecalc` — the orchestrator composition (`saveToOwnedBufferControlled` → `openBufferControlled` → M5d2's `saveWithRecalc`), with §5.10's `Control` threaded into **both** pre-recalc stages and cancellation proven *per stage* by counting the polls each one owes. **`tests/consumer` gains the third module**: a downstream package resolving `zlsx` + `zlsx_pkg` + `zlsx_recalc` through `b.dependency` and driving the composition, which is the only place the module identity a downstream build produces is checked. **Committed bench workloads** (`tests/bench/synth_f1_mix.zig`): a fixed-topology F1-mix generator at three sizes, §9's named 100k-cell workload digest-pinned, plus `zlsx-bench-recalc` (open / recalc / save / phases). **`compare_bench.py --gate`** — median-based, nonzero exit for release cuts; CI's report-only mean path unchanged, both exit behaviours gated. **The hyperfine lane was never ReleaseFast**: the bench modules hardcoded `bench_optimize` (ReleaseSafe) and discarded `-Doptimize` | Module-graph gate; bench baseline |
 | **M5d4** ✅ | **The recalc pipeline made linear.** §9.1's baseline was quadratic in cell count (×4 per row doubling); the profile named two O(n) operations inside per-cell loops, and removing them exposed five more of the same shape. All seven are one bug — **a membership test written as a scan** — and every fix keeps the order its callers depend on. `WorkbookEnv.Sheet` becomes a directory of 64-entry chunks: the (row, col, layer-descending) order is the contract, the flat array never was, and publication stops paying one `memmove` of the tail per cell. `iterate` gains membership indexes **beside** `pass_edges` / `touched` / `previous_reports` (the lists stay — they are what gets handed on), and turns `held`, `scope` and `changedComponents`' signature comparison into maps. `graph.Builder.captureAll` groups §5.6e's flat edge list by owner once instead of rescanning it per formula. `recalc_run.Driver` indexes `published`. **`Index.probe` picks its band by counting stored coordinates rather than by the area's extent** (§5.6a corrected — the extent is right for `SUM(A:A)` and wrong for `SUM(A5:A9)`; both pinned probe counts unchanged). Result on the digest-pinned named workload: `recalc` **133 452 → 905 ms (147×)**, `save` **127 690 → 917 ms**, evaluate 267× over §9's ceiling → **1.81×**, end-to-end 128× over → **under it**, "10k-vs-100k ≤ 15×" ×96.1 → **×11.0** | Determinism; scoped idempotence; no-formula identity; §5.7.9 ordering; workload digest; `compare_bench --gate` |
-| **M6** | CLI: NDJSON schemas, exit tables (incl. 130/143 + prefix-valid stream rule), mandatory `--sheet/--name`, `--out` identity | Contract tests |
+| **M6** ✅ | `zlsx eval` + `zlsx recalc` (`src/formula_cli.zig`), delegated whole-tail like `dbx` so the shipped commands and their row envelope are untouched by construction. **The versioned stream state machine** — `"kind"` + `"v":1` on every record, both grammars normative, refusal and cancellation legal before any header, `cancelled.after` naming the last record out. **The nine-row exit table**, including 6 (default-context acquisition — the wall clock / secure random source behind an omitted `--now`/`--seed`, injectable, never conflated with OOM) and the SIGPIPE exception (prefix-valid, no terminal, exit 0 — distinguishable from abnormal EOF by code). **Commit-aware exit mapping**: `signals.exitCode`'s override-at-exit corrected by an `exit_is_final` latch; a signal after the rename reports 0, proven by a `CommitHook` injection at the §5.7.9 seam (swap + flag between rename and directory fsync), not by timing. `--out` identity refused (1) before the input opens, realpath-aliased spellings included. **`Workbook.evaluate` forwards the caller's clock** — `now_utc_ms`/`utc_offset_min`/`platform_profile` reached `evaluateOne` since M5d2 but were dropped on the standalone path, so `--now` was echoed but never reached `NOW()`; `date_system`/`text_compat` stay workbook-derived. `=A1` on empty A1 publishes 0 through `value.publish`; `seed` a decimal string, pinned above 2^53 | Contract tests (grammar productions ×9, exit table row-by-row, SIGPIPE vs abnormal EOF, commit seam) |
 | **M7a** | DA evaluation + decision table + ownership + `A1#`/`@` + F2-DA natives (FILTER, SORT, SORTBY, UNIQUE, SEQUENCE, RANDARRAY, TRANSPOSE) + RANDARRAY KATs | Fixtures; obstruction fuzz |
 | **M7b1** | DA + CSE **persistence** (approved set; cm/vm collection-pinned transitions; tail ownership; tolerated-state proofs) | Excel-opens-clean per transition |
 | **M7b2** | F2 criteria batch (SUMIFS, COUNTIFS, AVERAGEIFS, MINIFS, MAXIFS; ADDRESS) — INDIRECT/OFFSET completed at M5a2 | Oracle-first; whole-column + multi-criteria benches |
@@ -3641,6 +3641,91 @@ would have to be re-measured at the next size anyway.
     two orders of magnitude — so the remaining factor is a constant to
     be worked on and no longer a shape that gets worse with size.
 
+**M6 decisions (shipped 2026-08-06).** Thirteen points, in
+`src/formula_cli.zig` plus four one-line seams elsewhere.
+
+1.  **Delegated whole-tail dispatch, like `dbx`.** `eval` / `recalc`
+    have their own argument grammar, stream contract and exit table, so
+    they leave `parseArgs`, the `Subcommand` scoping matrix and the row
+    envelope untouched by construction rather than by review.
+2.  **The commands never propagate errors.** `formula_cli.run` returns
+    `u8`, full stop. `main`'s generic classifier cannot know whether a
+    terminal record was already written or a rename already happened,
+    and both facts change what an error means — so every failure is
+    mapped where those facts are in scope.
+3.  **The override-at-exit correction is a latch, not a rewrite.**
+    `signals.exitCode` keeps the shipped behaviour for the streaming
+    family; `exit_is_final`, set by the dispatch after `formula_cli.run`
+    returns, makes it defer to the commit-aware mapping. The correction
+    is one line precisely because the mapping moved to where commit
+    state lives.
+4.  **Injection over timing, everywhere.** `Deps` carries the signal
+    flags (pointers, so the handlers keep writing), the §5.5 context
+    sources, and a before-record hook. "SIGPIPE after the second
+    record", "the clock is unreadable", "OOM at allocation ten" and
+    "SIGTERM at the commit seam" are all statements a test injects; no
+    contract test sleeps, spawns or races. The seam proof composes
+    `recalc_run.prepare` + `saveCommitted` with a hook that swaps AND
+    raises the flag — the same `CommitHook` production wires, now
+    exported from the package root for exactly this.
+5.  **Sheet-not-found is exit 2, not 3.** §10's planes are the engine's
+    refusal vocabulary and the CLI maps them verbatim; it does not
+    invent one for "the workbook has no such sheet". A missing
+    evaluation context is an input problem and sits in the open/parse
+    row, with a stderr diagnostic and no stream record.
+6.  **`--out` identity is usage (1), refused before the input opens.**
+    Nothing has been mutated at that point, so nothing needs a
+    transaction to protect it. Byte-equality catches the literal case;
+    realpath on both sides catches `./in.xlsx` — a destination that
+    does not resolve aliases nothing and proceeds.
+7.  **`Workbook.evaluate` now forwards the caller's clock.** M5d2 added
+    `now_utc_ms` / `utc_offset_min` / `platform_profile` to
+    `EvaluateOptions` and threaded them through `evaluateOne`; the
+    standalone path defaulted them, so a CLI `--now` would have been
+    echoed in `resolved` while `NOW()` answered from 1970. The two
+    workbook-derived fields (`date_system`, `text_compat`) are filled
+    from `model.calc` exactly as the recalc driver fills them — a
+    caller has nothing true to say about either.
+8.  **`cancelled.after` names the last record kind** (`"none"` before
+    any), so a truncated stream is self-describing without the consumer
+    counting lines. `eval-complete.cells` counts `eval-cell` records —
+    what the consumer actually received — which is 0 for a scalar.
+9.  **`recalc` without `--report` is stdout-silent on every outcome**,
+    matching the edit family; the recalc grammar exists only under
+    `--report`, and the exit codes are identical either way. The
+    §5.7.9 durability warning rides as a `diagnostic` ahead of the
+    terminal (where the grammar puts diagnostics) and on stderr in both
+    modes; it is advisory and demotes nothing.
+10. **Recalc errors map by side.** `Formula*` (§10's namespace,
+    verbatim) → 3; `Cancelled` → 130/143/3 by cause (the two flags,
+    else the deadline); `Malformed*` → 2 (input side); OOM → 4;
+    everything else → 5 (output side). §5.7.9 guarantees the
+    destination's prior bytes on every one of these paths, so the table
+    never has to say "maybe".
+11. **ISO 8601 is a strict profile, one spelling per instant.**
+    `YYYY-MM-DD[THH:MM[:SS[.fff]]][Z|±HH:MM]` in; `resolved.now` always
+    `YYYY-MM-DDTHH:MM:SS.mmmZ` out, round-trip pinned. The civil-date
+    math is `engine.serial_date`'s (newly exported from the engine
+    root) — a second calendar would be a second opinion about February.
+12. **The CLI strips no leading `=` — the parser already does.** M2's
+    grammar takes one optional leading `=` (`leading_eq: .optional`)
+    and refuses `==` as `double_equals`. The first draft stripped one
+    in the CLI too, and the E2E check caught what that composes to:
+    `==1` became `=1`, the parser stripped again, and the typo
+    evaluated as `1`. Tolerance layered on tolerance is how a refusal
+    disappears; the CLI now passes the text through verbatim.
+13. **M0's import gate caught this row red-handed — behind a
+    pipe-masked exit code.** The draft's cell labels hand-rolled
+    base-26 column letters, which is exactly the seventh formatter the
+    gate exists to stop; the fix is `coords.writeColLetters` /
+    `writeColNumberLetters`, not an allowlist entry. It went unseen
+    for three consecutive "green" runs because
+    `zig build test 2>&1 | tail` reports *tail's* exit status — the
+    Build Summary said `8058/8058 tests passed` while
+    `run exe import-gate failure` sat one line above it. A gate wired
+    into `test_step` is only as strong as the reading of the exit
+    code; verification runs now land it unpiped.
+
 ---
 
 ## 8. Testing & oracles
@@ -4206,16 +4291,16 @@ classified flip-at / historical-label):
 | `goal_evol.md:48` scope line · `goal.md:219-222` follow-up 4 | out of scope / standalone | **M-1** flip |
 | `docs/plans/formula-literal-masking.md:42-48` | misstates `<v>` preservation | **M-1** correction |
 | `docs/plans/editor-rebase.md:359` · `docs/plans/workbook-overlay.md:287` · `docs/plans/writer-rebase.md:575` · `docs/plans/structural-edits.md:121` ("Excel will recompute") | no-evaluation statements | **M-1** historical labels |
-| `README.md:452-455` | "Out (by design) … never computes" | **M5d/M6** flip |
-| `docs/cli.md` | no eval/recalc | **M6** new sections |
-| `docs/jq-for-excel.md:290-292` | "reader, not a spreadsheet engine" | **M6** historical label |
+| ~~`README.md:452-455`~~ | "Out (by design) … never computes" | **M6 — done**: the bullet now scopes the exclusion to the read path and points at the `eval`/`recalc`/`Workbook.recalculate` surface |
+| ~~`docs/cli.md`~~ | no eval/recalc | **M6 — done**: new **Formula (`eval` / `recalc`)** section — syntax, both stream grammars, record shapes, the nine-row exit table, SIGPIPE exception, commit-aware mapping; read-family exit table cross-links it |
+| ~~`docs/jq-for-excel.md:290-292`~~ | "reader, not a spreadsheet engine" | **M6 — done**: historical label; the read stream still never computes, the pointer goes to `cli.md` § Formula |
 | `docs/vs_calamine.md:64,90` | claims zlsx skips `<f>` / cannot emit formulas — **already false** (`xlsx.zig:2070-2153`, `writer.zig:940-955`) | **M-1** correction |
-| `docs/vs_calamine.md:5,130` | "no formula evaluation" (true until M5d2) | **M6** historical label |
-| `docs/xlsx_test_corpus.md:27,56` | "don't need to evaluate" | **M6** flip |
+| ~~`docs/vs_calamine.md:5,130`~~ | "no formula evaluation" (true until M5d2) | **M6 — done**: TL;DR and the pick-calamine list both labeled — and the list now notes calamine does not evaluate either |
+| ~~`docs/xlsx_test_corpus.md:27,56`~~ | "don't need to evaluate" | **M6 — done**: both rows scoped to the read path with pointers at the engine's own suites |
 | ~~`docs/package-layer.md`~~ | layer description | **M5d3 — done**: title's "read-only" retired with a note saying when it stopped being true (byte-preserving writes → `Workbook` mutation → M5d recalc), and a **Recalculation (M5d)** section added covering `recalculate` / `saveWithRecalc` / `openBuffer(Controlled)` / `markRecalcOnLoad` / `zlsx_recalc.writerSaveWithRecalc`, plus why the composition is a third module |
 | `bindings/python/README.md:252` ("never") + **full new-API docs**: methods, `Matrix`, `ExcelError`, refusal/cancellation semantics | **M9a2** gate (docs land with the code PR) |
 | `bindings/python/README.md:177-179` ("all batch options apply to streaming" — false once recalc refuses streaming) + **Spark option table (batch-only)** | **M9b** gate |
-| `src/xlsx.zig:1-13` · `src/cli.zig:1,1141` · `pkg/workbook.zig:366,5477-5479` | in-source scope comments (incl. the "future evaluator (Tier D1)" promise at the emitCell branch) | with the code that changes them (**M5d/M6**) |
+| ~~`src/xlsx.zig:1-13` · `src/cli.zig:1` · `pkg/workbook.zig` (emitCell branch)~~ | in-source scope comments (incl. the "future evaluator (Tier D1)" promise at the emitCell branch) | **M6 — done**: `cli.zig`'s "read-only" header names all three families; `xlsx.zig`'s blurb marked historical (the file itself still never evaluates); the Tier D1 promise replaced by the real rule — the engine exists, and the set-cell path deliberately stays cache-free |
 | ~~`src/formula/tokenizer.zig:566-575`~~ (scope note made false by the new token kinds) | tokenizer scope comment | **M1a — done**: module doc rewritten with the tokens; `rewriter.zig`'s matching "classifies these as `.unknown`" claim flipped too |
 | ~~`build.zig` ("zlsx and zlsx_pkg cannot coexist" — contradicted by `zlsx_recalc`)~~ | module-graph comment | **M5c — done**: the claim was already false (`cli_mod`, `corpus_mod` and `package_mod` all import both); what could not coexist under 0.15.2 was a *file* claimed by two module trees, which `AGENTS.md` marks history on 0.16. Comment rewritten to the real reason the RSS probes are split (a per-process RSS delta), and the graph is now gated by `assertAcyclicModules`. `build.zig` joins the release rg scan |
 | `src/writer.zig:1645-1647` (claims the reader does not expose formula text — already false, `src/xlsx.zig:2070-2135`) | stale reader claim | **M-1** historical correction; sweep regex extended to read-side formula-text claims |
