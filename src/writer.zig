@@ -128,6 +128,12 @@ const Allocator = std.mem.Allocator;
 /// * `2^53 + 1` does not (54 significant bits).
 /// * `2^54`, `3 * 2^52`, `2^62`, etc. all fit — magnitude is irrelevant,
 ///   only the count of bits after stripping trailing zeros matters.
+/// §9's `max_output_archive_bytes` — 2³²−1 bytes exactly, the ZIP32
+/// sentinel bound. The default for `Writer.max_output_archive_bytes`,
+/// and the value a caller lowering it is tightening from.
+pub const max_output_archive_bytes: u64 = fresh_emit.max_output_archive_bytes;
+const default_max_output_archive_bytes = max_output_archive_bytes;
+
 pub fn fitsExactlyInF64(n: i64) bool {
     if (n == 0) return true;
     // Take absolute value as u64 so std.math.minInt(i64) = -2^63 is
@@ -324,6 +330,14 @@ pub const Writer = struct {
     // `defined_names: ArrayList(DefinedName)`.
     workbook_xml_plan: WorkbookXmlPlan = .{},
 
+    /// §9's `max_output_archive_bytes`. Observed by BOTH `save` and
+    /// `saveToOwnedBuffer` — they are one emitter, so the outcome is the
+    /// same typed error at the same input size whichever destination the
+    /// caller picked. Lowering it is what makes the 4 GiB default a
+    /// boundary a fixture can reach; raising it past the format's own
+    /// ceiling is clamped away in `zip.Archive`.
+    max_output_archive_bytes: u64 = default_max_output_archive_bytes,
+
     pub fn init(allocator: Allocator) Writer {
         return .{ .allocator = allocator };
     }
@@ -390,6 +404,13 @@ pub const Writer = struct {
         const sw = try self.allocator.create(SheetWriter);
         errdefer self.allocator.destroy(sw);
         sw.* = try SheetWriter.init(self, name);
+        // `destroy(sw)` releases the *slot*, not what the sheet writer
+        // put in it. `SheetWriter.init` dupes the name, so a failing
+        // `append` below used to free the struct and leak the string —
+        // found by M5c's `checkAllAllocationFailures` sweep over
+        // `saveToOwnedBuffer`, which builds two sheets and leaked
+        // exactly two names.
+        errdefer sw.deinit();
         try self.sheets.append(self.allocator, sw);
         return sw;
     }
@@ -519,7 +540,18 @@ pub const Writer = struct {
     /// serialisation in one shot. Writer-local registries stay untouched:
     /// this does not consume the Writer, and calling it twice yields two
     /// equal buffers.
-    pub fn saveToOwnedBuffer(self: *Writer, allocator: Allocator) ![]u8 {
+    ///
+    /// Refuses with `error.ZipArchiveTooLarge` past
+    /// `Writer.max_output_archive_bytes` (§9) — the same error, from the
+    /// same check, that `save` gives for the same workbook.
+    ///
+    /// **`io` is unused today, and is a parameter anyway.** M5d1 adds
+    /// `saveToOwnedBufferControlled(allocator, io, ctl)` and makes this
+    /// the null-control forwarder; a deadline needs a clock, so that one
+    /// needs an `Io`. Taking it now is what keeps §12.1's signature
+    /// stable across that row instead of widening a shipped API later.
+    pub fn saveToOwnedBuffer(self: *Writer, allocator: Allocator, io: std.Io) ![]u8 {
+        _ = io;
         if (self.sheets.items.len == 0) return error.NoSheets;
 
         const inputs = try self.projectSheets();
@@ -552,6 +584,7 @@ pub const Writer = struct {
             .sst_count = self.sst_count,
             .styles_plan = &self.styles_plan,
             .workbook_xml_plan = &self.workbook_xml_plan,
+            .max_archive_bytes = self.max_output_archive_bytes,
         };
     }
 };
@@ -5002,7 +5035,7 @@ test "Writer: saveToOwnedBuffer is byte-identical to save" {
     const from_disk = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 24));
     defer a.free(from_disk);
 
-    const from_buffer = try w.saveToOwnedBuffer(a);
+    const from_buffer = try w.saveToOwnedBuffer(a, io);
     defer a.free(from_buffer);
 
     // The archive substrate pins both zip timestamps (pkg/zip.zig writes
@@ -5021,7 +5054,7 @@ test "Writer: saveToOwnedBuffer round-trips through Book.openBuffer" {
     defer w.deinit();
     try buildParityWorkbook(&w);
 
-    const bytes = try w.saveToOwnedBuffer(a);
+    const bytes = try w.saveToOwnedBuffer(a, io);
     defer a.free(bytes);
 
     var book = try xlsx.Book.openBuffer(a, io, bytes);
@@ -5045,14 +5078,17 @@ test "Writer: saveToOwnedBuffer round-trips through Book.openBuffer" {
 
 test "Writer: saveToOwnedBuffer does not consume the Writer" {
     const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
 
     var w = Writer.init(a);
     defer w.deinit();
     try buildParityWorkbook(&w);
 
-    const first = try w.saveToOwnedBuffer(a);
+    const first = try w.saveToOwnedBuffer(a, io);
     defer a.free(first);
-    const second = try w.saveToOwnedBuffer(a);
+    const second = try w.saveToOwnedBuffer(a, io);
     defer a.free(second);
 
     // Emitting must not mutate the registries: a second call sees the
@@ -5061,9 +5097,12 @@ test "Writer: saveToOwnedBuffer does not consume the Writer" {
 }
 
 test "Writer: saveToOwnedBuffer on an empty workbook fails with NoSheets" {
-    var w = Writer.init(std.testing.allocator);
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    var w = Writer.init(a);
     defer w.deinit();
-    try std.testing.expectError(error.NoSheets, w.saveToOwnedBuffer(std.testing.allocator));
+    try std.testing.expectError(error.NoSheets, w.saveToOwnedBuffer(a, threaded.io()));
 }
 
 test "Writer: saveToOwnedBuffer buffer outlives an arena-scoped Writer" {
@@ -5081,7 +5120,7 @@ test "Writer: saveToOwnedBuffer buffer outlives an arena-scoped Writer" {
         var w = Writer.init(arena.allocator());
         defer w.deinit();
         try buildParityWorkbook(&w);
-        break :blk try w.saveToOwnedBuffer(a);
+        break :blk try w.saveToOwnedBuffer(a, io);
     };
     defer a.free(bytes);
     arena.deinit();
@@ -5089,4 +5128,87 @@ test "Writer: saveToOwnedBuffer buffer outlives an arena-scoped Writer" {
     var book = try xlsx.Book.openBuffer(a, io, bytes);
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 2), book.sheets.len);
+}
+
+// ─── M5c: §9's max_output_archive_bytes ──────────────────────────────
+
+test "Writer: max_output_archive_bytes refuses at the boundary, both paths" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(a, io, "capped.xlsx");
+    defer a.free(path);
+
+    var w = Writer.init(a);
+    defer w.deinit();
+    try buildParityWorkbook(&w);
+
+    // Measure first, then bracket. A hard-coded size would be a fixture
+    // that stops testing the boundary the day the emitter's byte format
+    // moves by one byte — which is exactly the kind of change the parity
+    // tests above exist to allow.
+    const exact = blk: {
+        const bytes = try w.saveToOwnedBuffer(a, io);
+        defer a.free(bytes);
+        break :blk bytes.len;
+    };
+    try std.testing.expect(exact > 0);
+
+    // At the size: accepted, and still byte-identical.
+    w.max_output_archive_bytes = exact;
+    const at = try w.saveToOwnedBuffer(a, io);
+    defer a.free(at);
+    try std.testing.expectEqual(exact, at.len);
+    try w.save(io, path);
+
+    // One byte under: refused — and the SAME typed error from the path
+    // save, which is §9's "identical typed outcome at every layer" as a
+    // test rather than as a sentence.
+    w.max_output_archive_bytes = exact - 1;
+    try std.testing.expectError(error.ZipArchiveTooLarge, w.saveToOwnedBuffer(a, io));
+    try std.testing.expectError(error.ZipArchiveTooLarge, w.save(io, path));
+
+    // And a refused save leaves the previously-written file alone: the
+    // path save builds the whole image before it opens anything.
+    const on_disk = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 24));
+    defer a.free(on_disk);
+    try std.testing.expectEqualSlices(u8, at, on_disk);
+}
+
+test "Writer: the cap cannot be raised past what ZIP32 can express" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+
+    var w = Writer.init(a);
+    defer w.deinit();
+    try buildParityWorkbook(&w);
+
+    // A caller may tighten §9's bound; raising it is clamped, because
+    // above 2³²−1 the serialized offsets become Zip64 sentinels and the
+    // archive stops being one zlsx's own reader will open.
+    w.max_output_archive_bytes = std.math.maxInt(u64);
+    const bytes = try w.saveToOwnedBuffer(a, threaded.io());
+    defer a.free(bytes);
+    try std.testing.expect(bytes.len < fresh_emit.max_output_archive_bytes);
+}
+
+test "Writer: saveToOwnedBuffer leaves nothing allocated under any failure" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+
+    try std.testing.checkAllAllocationFailures(a, struct {
+        fn run(alloc: Allocator, io: std.Io) !void {
+            var w = Writer.init(alloc);
+            defer w.deinit();
+            try buildParityWorkbook(&w);
+            const bytes = try w.saveToOwnedBuffer(alloc, io);
+            defer alloc.free(bytes);
+            try std.testing.expect(bytes.len > 0);
+        }
+    }.run, .{threaded.io()});
 }

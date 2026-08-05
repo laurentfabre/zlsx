@@ -1882,8 +1882,11 @@ important finding.
 
 Third public module (importing `zlsx` + `zlsx_pkg`; no cycle;
 `tests/consumer` dependency test): `writerSaveWithRecalc` = Writer
-**`saveToOwnedBuffer(allocator, io)`** (new, gated — allocator-first per `AGENTS.md:194`; ownership documented,
-size-limited, allocation-failure-swept, byte-equivalent to path save) →
+**`saveToOwnedBuffer(allocator, io)`** (**not new — the Databricks track
+shipped it at 0.7.0 without `io` or the cap; M5c added both plus the
+sweep**; allocator-first per `AGENTS.md:194`; ownership documented,
+size-limited by §9's `max_output_archive_bytes`, allocation-failure-swept,
+byte-equivalent to path save) →
 `Workbook.openBuffer(allocator, io, bytes)` (borrow ends at return; store
 copies — Book precedent `xlsx.zig:795-811`) → recalculate → save. CLI, C ABI
 (`zlsx_editor_open_buffer`, `zlsx_writer_save_with_recalc`), Python compose
@@ -1937,7 +1940,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M5b0** ✅ | **`SourceBacking`** — ref-counted file/buffer backing shared across PartStore generations (each store exclusively owns + closes one `std.Io.File`, `store.zig:105-129,326-329`; shallow clone double-closes, moving breaks retention); backing unified; repeated-recalc + ownership tests. **Ladder-ordered FIRST of the M5b group — physically before M5b1/M5b2, because the transaction that requires it cannot land earlier than it** | Ownership tests; double-close fuzz |
 | **M5b1** ✅ | `ResolvedSheet` projection + cached-value patcher + transitions (**incl. ST_Xstring output encoding**) + fuzz | Byte-confinement; round-trip |
 | **M5b2** ✅ | Prepare/swap transaction (complete state, reports pre-swap) + calcChain rel-resolution + calc-state writes + `markRecalcOnLoad` + diagnostics. **Hard dependency on M5b0** — whole-generation retention (§5.7.4) is unsafe while `PartStore` exclusively owns and closes its own file, so M5b2's gate re-runs M5b0's ownership tests | No-fail-swap proof; post-failure reads; raw-entry identity; refusal purity; **M5b0 ownership tests green** |
-| **M5c** | `Workbook.openBuffer(alloc, io, bytes)` + **`Writer.saveToOwnedBuffer`** + `zlsx_recalc` **importable shell** (module graph only — its public composition ops land in M5d, where the consumer test moves) | Module-graph gate; buffer≡path byte-equivalence |
+| **M5c** ✅ | `Workbook.openBuffer(alloc, io, bytes)` + **`Writer.saveToOwnedBuffer`** + `zlsx_recalc` **importable shell** (module graph only — its public composition ops land in M5d, where the consumer test moves) | Module-graph gate; buffer≡path byte-equivalence |
 | **M5d1** | Archive/durability substrate: **`AtomicFile.finish` fsync fix** + commit region + **cancellation-aware serialization seam** (the context-free `DeflateFn` at `pkg/zip.zig:64-68,140-144` AND PartStore's whole-input compression during preparation, `pkg/store.zig:370-385,498-512,638-656` — the shared compressor becomes context/callback-aware with 64 KiB chunks; the same chunking covers **decompression during model materialization** (`store.zig:881-916,1361-1384`), **raw-entry copies at save** (`:783-792`), XML scans, and temp-file writes, so the §5.5 polling bound holds across every long operation; cancel-inside-entry, cancel-inside-replacePart, and cancel-inside-materialization tests. **Control-aware buffer variants** — `saveToOwnedBufferControlled` / `openBufferControlled` (§5.10) wired to these seams, with cancel-mid-fresh-serialization and cancel-mid-buffer-open tests, so the Writer path meets the same bound. **Documented SLA exceptions: the blocking `File.sync` AND the post-commit POSIX directory fsync cannot be polled** — both uncancellable waits (no timeout; post-commit status is already success per §5.7.9), fault-injected tests for each, incl. Python worker-thread wait behavior) | Injected sync/rename failures; cancel-inside-* tests |
 | **M5d2** | `recalculate()` + `saveWithRecalc` (ordering §5.7.9) + report + pre-M7 gate + logical-view gate + embedding-staleness preflight | Determinism; scoped idempotence; no-formula identity; confinement |
 | **M5d3** | Writer compose + `zlsx_recalc` composition ops + **consumer dependency test** + committed bench workloads | Module-graph gate; bench baseline |
@@ -3044,6 +3047,104 @@ happened or did not.
     carries an evaluator's census out to the caller, so a partial set
     would have forced reporting a cycle as malformed input.
 
+**M5c decisions (shipped 2026-08-05).** Eleven points, in
+`src/writer.zig` + `pkg/zip.zig` + `pkg/fresh_emit.zig` (the producer
+half and §9's cap), `pkg/workbook.zig` (`openBuffer`), and
+`recalc/recalc.zig` + `build.zig` (the third module and its graph gate).
+The row where a producer's bytes stopped needing a filesystem to reach a
+consumer.
+
+1.  **`saveToOwnedBuffer` already existed; the row was three of its four
+    clauses.** #146–#154's Databricks track shipped it — Zig, C ABI
+    (`zlsx_writer_save_to_buffer`), Python (`to_bytes()`) — and released
+    it at 0.7.0. §5.10 still calls it "(new)". What M5c actually owed was
+    the `io` parameter §12.1 freezes, §9's `max_output_archive_bytes`,
+    and the allocation-failure sweep. A row that assumes it is writing a
+    function someone already wrote spends its budget on the wrong half.
+2.  **`io` is taken and unused, and that is the point.** M5d1 makes this
+    the null-control forwarder to
+    `saveToOwnedBufferControlled(alloc, io, ctl)`, and a deadline needs a
+    clock. Adding the parameter then would widen a *shipped, released*
+    signature; adding it now costs one discarded binding and a comment
+    saying why. §5.10's own words — "the plain signatures remain … so
+    §12.1 stays stable" — only work if the plain signature is already the
+    final one.
+3.  **The cap belongs in `zip.Archive`, not at the API boundary.** A
+    post-hoc `out.len > cap` check would have to build a 4 GiB archive to
+    refuse one — and the substrate already refused at `>= maxInt(u32)`
+    *structurally*, because `cd_start` is a u32 on the wire and
+    `0xFFFFFFFF` is the Zip64 sentinel. So the constant names a bound
+    that existed, `Archive` gains a field, and the three existing guards
+    read it instead of the literal. A lowered cap then refuses **at the
+    entry that crossed the line**, which is what makes a 4 GiB boundary
+    fixturable and what makes the cap useful to an orchestrator rather
+    than decorative.
+4.  **The cap can only tighten.** `initLimited` clamps to
+    `default_max_archive_bytes`: above 2³²−1 the serialized offsets
+    become sentinels and the archive stops being one zlsx's own reader
+    will open. A caller who raises it gets the format's ceiling, silently
+    and correctly — the alternative is an API that lets a caller ask for
+    an unreadable file.
+5.  **One emitter, so one test rather than two.** `Writer.save` and
+    `saveToOwnedBuffer` both go through `fresh_emit.emitArchiveBytes`, so
+    the cap rides on `ArchiveInputs` rather than being passed alongside
+    it — a caller cannot reach the substrate without it. The boundary
+    fixture measures the exact archive size rather than hard-coding one
+    (a literal stops testing the boundary the day the byte format moves),
+    accepts at it, refuses one byte under **on both paths**, and then
+    checks that the refused path save left the previously-written file
+    intact.
+6.  **The sweep found a live leak in `addSheet`.**
+    `errdefer self.allocator.destroy(sw)` releases the *slot*, not what
+    `SheetWriter.init` put in it — the duped name. A failing
+    `self.sheets.append` freed the struct and leaked the string. Two
+    sheets in the parity fixture, two leaked addresses. Same class as
+    M4b1's double-free and M4b2's two-`toOwnedSlice` leak, found the same
+    way, and the argument for the sweep being a gate rather than a
+    formality.
+7.  **`Workbook.openBuffer` is six lines and one of them is the bug.**
+    `fromStore` takes ownership *including on failure*, so the
+    `errdefer store.deinit()` has to be disarmed before the hand-off;
+    armed, it double-frees the arena on every failing open. That is
+    precisely the bug M4b1 fixed in `Workbook.open` — and writing
+    `openBuffer` by copying `open` reproduces it unless the disarm comes
+    along. The garbage and missing-`xl/workbook.xml` fixtures exist to
+    reach that branch, because a happy path never does.
+8.  **Equivalence is asserted through the accessors, not the
+    internals.** The two stores differ in exactly one thing — which arm
+    of the backing answers `readAt` — and nothing above the backing is
+    supposed to be able to tell. So the fixture compares sheet count,
+    names, resolved part names, every cell's ref and raw value, then
+    every part's bytes, content type, compression method and rels, and
+    finally a `store.save` that is **byte-identical**. The caller's slice
+    is poisoned before the first part is read, so a borrow shows up as
+    content rather than as luck.
+9.  **`zlsx_recalc` is rooted at top-level `recalc/`.** The rule
+    `unicode/` and `refs/` already follow: a root under `src/` or `pkg/`
+    puts the file in that tree's module as well, and a file claimed by
+    two modules is two distinct types. The shell re-exports both halves
+    under the names the composition will use and asserts the identity
+    that makes composition possible at all —
+    `@FieldType(pkg.Edit, "cell") == zlsx.Cell`. Two `zlsx` instances
+    would be two structurally-identical types, and every error message
+    about it would read "expected xlsx.Cell, found xlsx.Cell".
+10. **The cycle gate is a build-time walk, not a test.** A broken module
+    graph is not something a test binary gets far enough to run.
+    `assertAcyclicModules` DFSes `Module.import_table` from all three
+    public roots — not just the new one, since the next bad edge is as
+    likely to point at `zlsx_recalc` as away from it — with a
+    fully-explored set, because the DAG is wide enough that an
+    unmemoized walk is exponential.
+11. **The comment the row was sent to fix was wrong in a more
+    interesting way than "stale".** `build.zig` claimed `zlsx` and
+    `zlsx_pkg` "cannot coexist in one binary", but `cli_mod`,
+    `corpus_mod` and `package_mod` itself already imported both, and had
+    for iterations. The true statement was about a *file* claimed by two
+    module trees, which `AGENTS.md` had already marked as history on
+    0.16. The RSS probes are split for an unrelated reason — a
+    per-process RSS delta is only meaningful against a process that did
+    nothing else — and that is what the comment says now.
+
 ---
 
 ## 8. Testing & oracles
@@ -3229,7 +3330,7 @@ adds a TEXT-heavy bench; M9d adds a mixed full-registry workload
 | `max_matrix_cells` | 4 M | elements |
 | `max_eval_depth` | 512 | dependency-closure recursion (cell → cell; M5a) |
 | `max_expr_depth` | 1024 | **expression-tree walk** (AST nodes on the stack; M3a2, `eval.Options`). Distinct from both `max_parse_depth` (recursing grammar productions) and `max_eval_depth` above. Left-associative operator chains are folded iteratively, so in practice only parenthesis nesting reaches it |
-| `max_output_archive_bytes` | **2³²−1 bytes exactly** (matches the ZIP32 sentinel bounds `pkg/store.zig:720-742`) | serialized output archives — `saveToOwnedBuffer`, `save_to_buffer`, `saveWithRecalc`; identical typed outcome at every layer |
+| `max_output_archive_bytes` | **2³²−1 bytes exactly** (matches the ZIP32 sentinel bounds `pkg/store.zig` preflights and `pkg/zip.zig` already enforced structurally). **LANDED (M5c)** as `zip.Archive.max_archive_bytes`, reached through `ArchiveInputs` and `Writer.max_output_archive_bytes`; caller-lowerable, clamped so it can only tighten, and checked **as the archive grows** rather than after it is built | serialized output archives — `saveToOwnedBuffer`, `save_to_buffer`, `saveWithRecalc`; identical typed outcome at every layer (`Writer.save` and `Writer.saveToOwnedBuffer` are one emitter, fixtured at the boundary on both) |
 | workbook materialization | **`max_workbook_compressed_bytes` 1 GiB; `max_workbook_decompressed_bytes` 4 GiB; `max_modeled_cells` 64M** — PartStore allocations (own arena, 512 MiB/part, `store.zig:105-129,1340-1384`) sit outside `max_run_arena_bytes`; early-refusal tests | pre-model refusal |
 | retained generations | `max_retained_generations` 4; **`max_retained_generation_bytes` 2 GiB; `max_retained_fds` 16** — in resolved limits + fingerprints; projected retention **preflighted before allocating or swapping** | pre-swap refusal |
 | aggregates — **bytes** (counted allocator) | `max_run_arena_bytes` **1 GiB**, live matrix cells 8M, string payload 256 MiB, retained ASTs 128 MiB, diagnostics 1 MiB — defaults; hard maxima 4× each; caller-adjustable via `ResourceLimits` (M3b, `src/formula/run_inputs.zig` — a **separate struct from `parser.Limits`**, which bounds parse shape); resolved values echoed + fingerprinted. An exhausted category is `FormulaLimitExceeded`, never a bare `OutOfMemory`: the budget records which one tripped. `matrix_cells` is charged as a **count**, so the limit does not depend on `@sizeOf(ScalarValue)` | byte accounting; below/at/above per category |
@@ -3497,7 +3598,7 @@ classified flip-at / historical-label):
 | `bindings/python/README.md:177-179` ("all batch options apply to streaming" — false once recalc refuses streaming) + **Spark option table (batch-only)** | **M9b** gate |
 | `src/xlsx.zig:1-13` · `src/cli.zig:1,1141` · `pkg/workbook.zig:366,5477-5479` | in-source scope comments (incl. the "future evaluator (Tier D1)" promise at the emitCell branch) | with the code that changes them (**M5d/M6**) |
 | ~~`src/formula/tokenizer.zig:566-575`~~ (scope note made false by the new token kinds) | tokenizer scope comment | **M1a — done**: module doc rewritten with the tokens; `rewriter.zig`'s matching "classifies these as `.unknown`" claim flipped too |
-| `build.zig:891-893` ("zlsx and zlsx_pkg cannot coexist" — contradicted by `zlsx_recalc`) | module-graph comment | **M5c**; `build.zig` joins the release rg scan |
+| ~~`build.zig` ("zlsx and zlsx_pkg cannot coexist" — contradicted by `zlsx_recalc`)~~ | module-graph comment | **M5c — done**: the claim was already false (`cli_mod`, `corpus_mod` and `package_mod` all import both); what could not coexist under 0.15.2 was a *file* claimed by two module trees, which `AGENTS.md` marks history on 0.16. Comment rewritten to the real reason the RSS probes are split (a per-process RSS delta), and the graph is now gated by `assertAcyclicModules`. `build.zig` joins the release rg scan |
 | `src/writer.zig:1645-1647` (claims the reader does not expose formula text — already false, `src/xlsx.zig:2070-2135`) | stale reader claim | **M-1** historical correction; sweep regex extended to read-side formula-text claims |
 | `AGENTS.md` | add formula conventions + harness how-to | **M4c** |
 

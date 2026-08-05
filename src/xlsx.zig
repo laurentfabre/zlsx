@@ -7387,6 +7387,12 @@ pub const deflateCompress = @import("writer.zig").deflateCompress;
 pub const validateSheetName = @import("writer.zig").validateSheetName;
 pub const fitsExactlyInF64 = @import("writer.zig").fitsExactlyInF64;
 pub const formatCellRef = @import("writer.zig").formatCellRef;
+/// §9's cap on a serialized output archive (M5c). Re-exported here so a
+/// caller that has only the `zlsx` module — the CLI, `zlsx_recalc`, a
+/// downstream producer — can name the bound `Writer.save` and
+/// `Writer.saveToOwnedBuffer` both enforce, without reaching into the
+/// package layer for it.
+pub const max_output_archive_bytes = @import("writer.zig").max_output_archive_bytes;
 
 /// C1 M2 m1 — pure-function A1 cell-formula rewriter. Re-exported
 /// for `zlsx_pkg` so `Workbook.rewriteAllFormulas(edit)` can apply

@@ -74,6 +74,18 @@ pub const Error = error{
     ZipArchiveTooLarge,
 } || Allocator.Error;
 
+/// §9's `max_output_archive_bytes`, and the ZIP32 sentinel bound this
+/// file already enforced structurally.
+///
+/// Not a new restriction: `finalize` rejected `out.items.len >=
+/// maxInt(u32)` before this constant existed, because `cd_start` is a
+/// u32 on the wire and `0xFFFFFFFF` is the Zip64 sentinel a reader
+/// (including zlsx's own) treats as "look for Zip64 extra fields". What
+/// naming it buys is a bound a **caller can lower** — which is the only
+/// way a 4 GiB boundary is fixturable, and the only way an orchestrator
+/// can cap what a producer hands it.
+pub const default_max_archive_bytes: u64 = std.math.maxInt(u32);
+
 /// Minimal zip archive builder. Appends file entries to a byte buffer;
 /// `finalize()` emits the central directory + end-of-central-directory
 /// trailer. Each entry is deflate-compressed unless compression grows
@@ -85,6 +97,12 @@ pub const Archive = struct {
     out: *std.ArrayListUnmanaged(u8),
     /// Per-entry info accumulated for the central directory.
     entries: std.ArrayListUnmanaged(EntryMeta) = .empty,
+    /// The archive may not exceed this many bytes. Defaults to the
+    /// ZIP32 bound; a caller may lower it but not raise it past what
+    /// the format can express — every check below is `@min`ed with
+    /// `default_max_archive_bytes` so a raised limit cannot produce an
+    /// archive whose serialized offsets are sentinels.
+    max_archive_bytes: u64 = default_max_archive_bytes,
 
     const EntryMeta = struct {
         /// Owned copy (arena would also work but the Archive's lifetime
@@ -100,6 +118,22 @@ pub const Archive = struct {
 
     pub fn init(alloc: Allocator, out: *std.ArrayListUnmanaged(u8)) Archive {
         return .{ .allocator = alloc, .out = out };
+    }
+
+    /// `init` with §9's cap lowered. The ceiling is still the format's:
+    /// `max` above `default_max_archive_bytes` is clamped, so this can
+    /// only ever tighten.
+    pub fn initLimited(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), max: u64) Archive {
+        return .{
+            .allocator = alloc,
+            .out = out,
+            .max_archive_bytes = @min(max, default_max_archive_bytes),
+        };
+    }
+
+    /// The bound, as every check site reads it.
+    fn cap(self: *const Archive) u64 {
+        return @min(self.max_archive_bytes, default_max_archive_bytes);
     }
 
     pub fn deinit(self: *Archive) void {
@@ -167,6 +201,14 @@ pub const Archive = struct {
         try self.out.appendSlice(alloc, name);
         try self.out.appendSlice(alloc, payload);
 
+        // Refuse as the archive grows, not only once it is finished.
+        // `finalize` would catch an over-cap archive anyway, but by then
+        // the caller has paid for every byte of it — and a cap whose
+        // whole purpose is to stop an orchestrator being handed more
+        // than it asked for should stop it at the entry that crossed
+        // the line.
+        if (self.out.items.len > self.cap()) return Error.ZipArchiveTooLarge;
+
         const owned_name = try alloc.dupe(u8, name);
         errdefer alloc.free(owned_name);
         try self.entries.append(alloc, .{
@@ -196,7 +238,7 @@ pub const Archive = struct {
         // not on-wire, so a final byte count of 0xFFFFFFFF with a
         // smaller cd_start is fine — only the serialized field
         // matters.)
-        if (self.out.items.len >= std.math.maxInt(u32)) {
+        if (self.out.items.len >= self.cap()) {
             return Error.ZipArchiveTooLarge;
         }
         const cd_start: u32 = @intCast(self.out.items.len);
@@ -238,7 +280,7 @@ pub const Archive = struct {
         // reject when the total written-so-far + EOCD would push
         // past 4 GiB, so we don't generate archives we can't open.
         // EndRecord is fixed-size; we use a generous overhead.
-        if (self.out.items.len + 22 > std.math.maxInt(u32)) {
+        if (self.out.items.len + 22 > self.cap()) {
             return Error.ZipArchiveTooLarge;
         }
 

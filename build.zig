@@ -1197,6 +1197,50 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("zlsx_pkg", package_mod);
     corpus_mod.addImport("zlsx_pkg", package_mod);
 
+    // ─── M5c: `zlsx_recalc`, the third public module (§5.10) ────
+    //
+    // Sits ABOVE both public modules and imports each by name. Putting
+    // the composition in either of them would close a loop that today
+    // runs one way (`zlsx_pkg → zlsx`) — and that direction is load
+    // bearing: `pkg/zip.zig` and `pkg/fresh_emit.zig` are stdlib-only
+    // and take deflate as a function pointer precisely to keep the
+    // graph a DAG.
+    //
+    // Rooted at top-level `recalc/` for the same reason `unicode/` and
+    // `refs/` are: a root inside `src/` or `pkg/` would put the file in
+    // that tree's module too, and a file belongs to exactly one.
+    //
+    // M5c is the shell — the graph, and the buffer handoff it makes
+    // possible. `writerSaveWithRecalc` and the `tests/consumer`
+    // dependency test land at M5d3.
+    const recalc_mod = b.addModule("zlsx_recalc", .{
+        .root_source_file = b.path("recalc/recalc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    recalc_mod.addImport("zlsx", zlsx_mod);
+    recalc_mod.addImport("zlsx_pkg", package_mod);
+
+    // The module-graph gate. Zig would eventually choke on a cyclic
+    // `-M` graph, but "eventually" is a confusing compiler error deep in
+    // a build command; this fails at graph-construction time and names
+    // the edge. Wired for all three public modules, not just the new
+    // one — the cycle a future edit introduces is as likely to be
+    // `zlsx → zlsx_recalc` as the other way round.
+    assertAcyclicModules(b, "zlsx", zlsx_mod);
+    assertAcyclicModules(b, "zlsx_pkg", package_mod);
+    assertAcyclicModules(b, "zlsx_recalc", recalc_mod);
+
+    const recalc_tests_mod = b.createModule(.{
+        .root_source_file = b.path("recalc/recalc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    recalc_tests_mod.addImport("zlsx", zlsx_mod);
+    recalc_tests_mod.addImport("zlsx_pkg", package_mod);
+    const recalc_tests = b.addTest(.{ .root_module = recalc_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(recalc_tests).step);
+
     // C2a: standalone `zlsx-extract-images` binary that drives the
     // package layer (PartStore + imageParts) without going through
     // Editor / Book.
@@ -1672,11 +1716,21 @@ pub fn build(b: *std.Build) void {
     //
     // The orchestrator test (`tests/bench/workbook_rss.zig`) and
     // its three child probes are split into separate compilations
-    // because `zlsx` and `zlsx_pkg` cannot coexist in one binary
-    // (the same `pkg/store.zig` ends up claimed by both — see
-    // `AGENTS.md` "Three-module collision"). The test spawns each
-    // probe as a subprocess; each probe measures its own RSS delta
-    // in isolation. The gate compares the two deltas as a ratio.
+    // because **each probe must measure its own RSS in its own
+    // process** — a delta is only meaningful against a process that
+    // did nothing else. The test spawns each probe as a subprocess
+    // and compares the two deltas as a ratio.
+    //
+    // M5c correction: this comment used to say `zlsx` and `zlsx_pkg`
+    // "cannot coexist in one binary". They can, and did even then —
+    // `cli_mod`, `corpus_mod` and `package_mod` itself all import
+    // both. What could not coexist under Zig 0.15.2 was a *file*
+    // claimed by two module trees, which is a different statement and
+    // is resolved on 0.16 (`AGENTS.md` "Three-module collision",
+    // marked history there). `zlsx_recalc` imports both public modules
+    // by name and is gated on the graph staying acyclic
+    // (`assertAcyclicModules`), so the old claim is not merely stale —
+    // it contradicts a shipped module.
     //
     // ReleaseSafe: keeps reader / writer overflow checks active so
     // we measure code paths a production caller actually runs.
@@ -1873,6 +1927,53 @@ fn addOracleFixtures(b: *std.Build, mod: *std.Build.Module) void {
     mod.addAnonymousImport("oracle_libreoffice_suite", .{
         .root_source_file = b.path("tests/oracle/fixtures/libreoffice_oracle_suite.json"),
     });
+}
+
+/// Fail the build if `root`'s module import graph contains a cycle
+/// (M5c, §5.10's "no cycle" clause).
+///
+/// The one-way edge `zlsx_pkg → zlsx` is what lets `pkg/zip.zig` and
+/// `pkg/fresh_emit.zig` stay stdlib-only and take deflate as a function
+/// pointer. `zlsx_recalc` importing both is safe *because* it sits above
+/// them; the moment something under them imports it back, that argument
+/// is gone — and the symptom would be a compiler error inside a `-M`
+/// command line rather than a sentence naming the edge.
+///
+/// Runs at graph-construction time, so `zig build` — any target — is the
+/// gate. Not a test: a broken module graph is not something a test
+/// binary gets far enough to run.
+fn assertAcyclicModules(b: *std.Build, name: []const u8, root: *std.Build.Module) void {
+    var on_path: std.ArrayListUnmanaged(*std.Build.Module) = .empty;
+    defer on_path.deinit(b.allocator);
+    // Fully-explored nodes. Without it the walk is exponential on a DAG
+    // this wide — `zlsx` alone is reached by a dozen modules.
+    var done: std.AutoHashMapUnmanaged(*std.Build.Module, void) = .empty;
+    defer done.deinit(b.allocator);
+    walkModules(b, name, root, &on_path, &done);
+}
+
+fn walkModules(
+    b: *std.Build,
+    name: []const u8,
+    m: *std.Build.Module,
+    on_path: *std.ArrayListUnmanaged(*std.Build.Module),
+    done: *std.AutoHashMapUnmanaged(*std.Build.Module, void),
+) void {
+    if (done.contains(m)) return;
+    for (on_path.items) |p| {
+        if (p == m) {
+            std.debug.panic(
+                "module import cycle reached from `{s}`: a module imports itself " ++
+                    "through {d} edge(s). §5.10 requires the public module graph to " ++
+                    "stay acyclic.",
+                .{ name, on_path.items.len },
+            );
+        }
+    }
+    on_path.append(b.allocator, m) catch @panic("OOM");
+    for (m.import_table.values()) |dep| walkModules(b, name, dep, on_path, done);
+    _ = on_path.pop();
+    done.put(b.allocator, m, {}) catch @panic("OOM");
 }
 
 /// Parse an optional env-var string that may contain `_` digit
