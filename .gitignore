@@ -17,6 +17,11 @@ docs/kb/
 tests/consumer/zig-out/
 tests/consumer/.zig-cache/
 
+# bench_ci.sh's working directory: rebuilt binaries, emitted fixtures and
+# the run's own hyperfine JSON. A baseline worth keeping goes to
+# tests/bench/baseline_*.json, which is committed.
+bench-out/
+
 # Workspace credentials (Databricks PAT etc.) — never commit
 .env
 .env.*

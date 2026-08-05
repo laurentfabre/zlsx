@@ -490,6 +490,15 @@ pub fn run(gpa: std.mem.Allocator, g: graph.Graph, host: Host, opts: Options) Er
     return r;
 }
 
+/// Set-of-edges and set-of-keys, over the equality `graph.zig` already
+/// defines. Not `AutoHashMap`, which cannot be instantiated over a
+/// `Key` at all: a `Key` carries borrowed spellings, and `autoHash`
+/// refuses a slice rather than silently choosing between the pointer
+/// and the bytes. The bytes are the answer here — two rows naming one
+/// defined name are one node — and `Key.hash` says so explicitly.
+const EdgeSet = std.HashMapUnmanaged(graph.DynamicRef, void, graph.DynamicRef.HashContext, 80);
+const KeySet = std.HashMapUnmanaged(graph.Key, void, graph.Key.HashContext, 80);
+
 const Engine = struct {
     gpa: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -504,13 +513,22 @@ const Engine = struct {
     /// The current value of every published cell, so a pass can compare
     /// against the previous one without asking the host to read back
     /// something it may not be able to represent.
-    held: std.ArrayListUnmanaged(Held) = .empty,
+    ///
+    /// A map, not a list: nothing reads it in publish order — `journal`
+    /// is what a rollback replays — and every publish looked its own
+    /// coordinate up, which made a pass cost O(published²).
+    held: std.AutoHashMapUnmanaged(env.CellRef, Snapshot) = .empty,
     reports: std.ArrayListUnmanaged(ComponentReport) = .empty,
     /// The reports of the pass before this one. A §5.6e pass re-runs
     /// only what changed, so the components it skipped have to restate
     /// what they were rather than be described afresh by a pass that did
     /// not look at them.
     previous_reports: std.ArrayListUnmanaged(ComponentReport) = .empty,
+    /// Where each of those sits, by the key that names its component.
+    /// `execute` asks once per component, so scanning the list made a
+    /// pass cost O(components²) — the list stays because `report` hands
+    /// its order to the caller; only the lookup moved.
+    previous_index: std.HashMapUnmanaged(graph.Key, u32, graph.Key.HashContext, 80) = .empty,
 
     /// §5.6e's runtime edges as they stand right now.
     ///
@@ -531,13 +549,22 @@ const Engine = struct {
     /// nothing".
     pass_edges: std.ArrayListUnmanaged(graph.DynamicRef) = .empty,
     touched: std.ArrayListUnmanaged(graph.Key) = .empty,
+    /// Membership indexes over the two lists above. The **lists** stay
+    /// the record: `foldPassEdges` hands `pass_edges` to the next build
+    /// in the order the run produced it, and a set has no order to hand
+    /// over. These only answer "already?", which is all the two dedupes
+    /// ever asked — and answering it by scanning made a pass cost
+    /// O(edges²), which is what §9.1's profile caught.
+    pass_edge_set: EdgeSet = .empty,
+    touched_set: KeySet = .empty,
     /// §5.6f's closure for the CURRENT graph, as component ids. Rebuilt
     /// every pass, because a rebuild renumbers and a dynamic edge can
     /// widen what the closure covers.
-    scope: std.ArrayListUnmanaged(u32) = .empty,
+    /// A set, not a list: `execute` tests membership once per component
+    /// and never enumerates it, and a scan per test is the same
+    /// O(components²) shape as the two above.
+    scope: std.AutoHashMapUnmanaged(u32, void) = .empty,
     scoped: bool = false,
-
-    const Held = struct { cell: env.CellRef, v: Snapshot };
 
     fn init(gpa: std.mem.Allocator, host: Host, opts: Options) Engine {
         return .{
@@ -555,9 +582,12 @@ const Engine = struct {
         self.held.deinit(self.gpa);
         self.reports.deinit(self.gpa);
         self.previous_reports.deinit(self.gpa);
+        self.previous_index.deinit(self.gpa);
         self.dynamic.deinit(self.gpa);
         self.pass_edges.deinit(self.gpa);
         self.touched.deinit(self.gpa);
+        self.pass_edge_set.deinit(self.gpa);
+        self.touched_set.deinit(self.gpa);
         self.scope.deinit(self.gpa);
         self.arena.deinit();
         self.* = undefined;
@@ -585,20 +615,11 @@ const Engine = struct {
     fn publish(self: *Engine, cell: env.CellRef, v: Snapshot) Error!void {
         try self.host.publish(cell, v);
         try self.journal.append(self.gpa, cell);
-        for (self.held.items) |*h| {
-            if (h.cell.eql(cell)) {
-                h.v = v;
-                return;
-            }
-        }
-        try self.held.append(self.gpa, .{ .cell = cell, .v = v });
+        try self.held.put(self.gpa, cell, v);
     }
 
     fn heldValue(self: Engine, cell: env.CellRef) ?Snapshot {
-        for (self.held.items) |h| {
-            if (h.cell.eql(cell)) return h.v;
-        }
-        return null;
+        return self.held.get(cell);
     }
 
     /// The components this pass covers, re-derived from the roots.
@@ -627,7 +648,7 @@ const Engine = struct {
                 .at = r.at,
                 .limit = r.limit,
             },
-            .ok => |p| try self.scope.appendSlice(self.gpa, p.components),
+            .ok => |p| for (p.components) |cid| try self.scope.put(self.gpa, cid, {}),
         }
         self.scoped = true;
         return null;
@@ -635,10 +656,7 @@ const Engine = struct {
 
     fn inScope(self: Engine, cid: u32) bool {
         if (!self.scoped) return true;
-        for (self.scope.items) |x| {
-            if (x == cid) return true;
-        }
-        return false;
+        return self.scope.contains(cid);
     }
 
     // ─── §5.6e: the outer loop ───────────────────────────────────
@@ -670,6 +688,8 @@ const Engine = struct {
             if (try self.planScope(current)) |r| return .{ .refused = r };
             self.pass_edges.clearRetainingCapacity();
             self.touched.clearRetainingCapacity();
+            self.pass_edge_set.clearRetainingCapacity();
+            self.touched_set.clearRetainingCapacity();
             switch (try self.execute(current, rerun)) {
                 .refused => |r| return .{ .refused = r },
                 .ok => {},
@@ -740,7 +760,7 @@ const Engine = struct {
             keep_next = true;
             owned = next;
             current = next;
-            self.carryReports();
+            try self.carryReports();
         }
     }
 
@@ -751,9 +771,7 @@ const Engine = struct {
         errdefer next.deinit(self.gpa);
         try next.appendSlice(self.gpa, self.pass_edges.items);
         for (self.dynamic.items) |old| {
-            const ran = for (self.touched.items) |k| {
-                if (k.eql(old.owner)) break true;
-            } else false;
+            const ran = self.touched_set.contains(old.owner);
             // A pass that ran an owner restated everything that owner
             // still reads, so its old edges are superseded. A pass that
             // skipped one has said nothing about it, and dropping those
@@ -777,20 +795,34 @@ const Engine = struct {
     /// Keep the reports of components this pass did not re-run, so the
     /// next pass can restate them rather than invent an outcome for a
     /// component it never touched.
-    fn carryReports(self: *Engine) void {
+    fn carryReports(self: *Engine) Error!void {
         std.mem.swap(
             std.ArrayListUnmanaged(ComponentReport),
             &self.reports,
             &self.previous_reports,
         );
         self.reports.clearRetainingCapacity();
+
+        // Rebuilt rather than maintained alongside the appends: the list
+        // is replaced wholesale here, and one O(components) pass per
+        // dynamic pass is the cheap half of the trade.
+        self.previous_index.clearRetainingCapacity();
+        try self.previous_index.ensureTotalCapacity(
+            self.gpa,
+            @intCast(self.previous_reports.items.len),
+        );
+        for (self.previous_reports.items, 0..) |r, i| {
+            // First occurrence wins, which is what a scan from the front
+            // answered. Two reports naming one component would be a bug
+            // upstream; this is not the place that decides so.
+            const gop = self.previous_index.getOrPutAssumeCapacity(r.at);
+            if (!gop.found_existing) gop.value_ptr.* = @intCast(i);
+        }
     }
 
     fn previousReport(self: Engine, at: graph.Key) ?ComponentReport {
-        for (self.previous_reports.items) |r| {
-            if (r.at.eql(at)) return r;
-        }
-        return null;
+        const i = self.previous_index.get(at) orelse return null;
+        return self.previous_reports.items[i];
     }
 
     fn report(self: *Engine, passes: u32) Error!Report {
@@ -842,6 +874,26 @@ const Engine = struct {
             for (x.deps, y.deps) |p, q| if (!p.eql(q)) return false;
             return true;
         }
+
+        /// Every term `eql` compares, in the order it compares them.
+        fn hash(self: Signature, h: *std.hash.Wyhash) void {
+            h.update(&[_]u8{@intFromBool(self.cyclic)});
+            h.update(std.mem.asBytes(&@as(u64, self.members.len)));
+            h.update(std.mem.asBytes(&@as(u64, self.deps.len)));
+            for (self.members) |k| k.hash(h);
+            for (self.deps) |k| k.hash(h);
+        }
+
+        const HashContext = struct {
+            pub fn hash(_: HashContext, s: Signature) u64 {
+                var h: std.hash.Wyhash = .init(0);
+                s.hash(&h);
+                return h.final();
+            }
+            pub fn eql(_: HashContext, x: Signature, y: Signature) bool {
+                return x.eql(y);
+            }
+        };
     };
 
     fn signaturesOf(self: *Engine, g: graph.Graph) Error![]const Signature {
@@ -879,11 +931,19 @@ const Engine = struct {
         const rerun = try self.a().alloc(bool, g.order.len);
         @memset(rerun, false);
 
+        // "Is this signature one of the ones from before?" — a
+        // membership test, asked once per component, and answered by
+        // scanning every previous signature until M5d4. Hashing the
+        // terms `eql` compares answers the same question in one look;
+        // duplicate signatures collapsing in the set is exactly what a
+        // scan-until-first-match already did with them.
+        var was: std.HashMapUnmanaged(Signature, void, Signature.HashContext, 80) = .empty;
+        defer was.deinit(self.a());
+        try was.ensureTotalCapacity(self.a(), @intCast(before.len));
+        for (before) |old| was.putAssumeCapacity(old, {});
+
         for (now, 0..) |sig, i| {
-            const unchanged = for (before) |old| {
-                if (sig.eql(old)) break true;
-            } else false;
-            if (!unchanged) rerun[i] = true;
+            if (!was.contains(sig)) rerun[i] = true;
         }
 
         // `g.order` is topological, so one forward sweep propagates
@@ -1188,10 +1248,13 @@ const Engine = struct {
     /// exactly the disagreement M5a1's differential test exists to catch.
     fn noteReads(self: *Engine, cell: env.CellRef, reads: Reads) Error!void {
         const owner: graph.Key = .{ .cell = cell };
-        const seen = for (self.touched.items) |k| {
-            if (k.eql(owner)) break true;
-        } else false;
-        if (!seen) try self.touched.append(self.gpa, owner);
+        const gop = try self.touched_set.getOrPut(self.gpa, owner);
+        if (!gop.found_existing) {
+            // The set and the list are one record in two shapes, so a
+            // failure between the two halves un-does the first.
+            errdefer _ = self.touched_set.remove(owner);
+            try self.touched.append(self.gpa, owner);
+        }
 
         for (reads.cells) |c| {
             try self.noteEdge(.{ .owner = owner, .target = .{ .cell = c } });
@@ -1202,9 +1265,8 @@ const Engine = struct {
     }
 
     fn noteEdge(self: *Engine, edge: graph.DynamicRef) Error!void {
-        for (self.pass_edges.items) |existing| {
-            if (existing.eql(edge)) return;
-        }
+        if ((try self.pass_edge_set.getOrPut(self.gpa, edge)).found_existing) return;
+        errdefer _ = self.pass_edge_set.remove(edge);
         try self.pass_edges.append(self.gpa, edge);
     }
 };
