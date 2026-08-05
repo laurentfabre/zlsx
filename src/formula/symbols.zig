@@ -55,6 +55,15 @@ const coords = @import("zlsx_refs");
 /// read. One module, one set of types.
 pub const decode = @import("decode.zig");
 pub const calc = @import("calc.zig");
+/// M5b2: §5.7.6's calc-state writes and §5.7.7's mark-only eligibility.
+/// Reached from `pkg/` by the prepare/swap transaction, which is the only
+/// caller that decides what a run wants `<calcPr>` to say.
+pub const calc_patch = @import("calc_patch.zig");
+/// M5b1: the `ResolvedSheet` projection and its byte-confined patcher.
+pub const resolved = @import("resolved.zig");
+/// M3b: what a run is given and what it may spend. The transaction echoes
+/// the resolved projection into its report (§5.7.8).
+pub const run_inputs = @import("run_inputs.zig");
 pub const names = @import("names.zig");
 pub const env = @import("env.zig");
 pub const value = @import("value.zig");

@@ -1001,7 +1001,11 @@ fn offsetOf(i: usize) u32 {
 /// The span a slice the scanner handed out occupies in the part it came
 /// from. Every such slice is a subslice of `xml` — the scanner never
 /// copies — so the arithmetic is exact rather than a search.
-fn spanOfSub(xml: []const u8, sub: []const u8) Span {
+///
+/// Public since M5b2: `calc.zig` records `<calcPr>`'s coordinates the
+/// same way the sheet walk records a `<c>`'s, and a second implementation
+/// of this arithmetic is a second chance to be off by one.
+pub fn spanOfSub(xml: []const u8, sub: []const u8) Span {
     assert(@intFromPtr(sub.ptr) >= @intFromPtr(xml.ptr));
     const start = @intFromPtr(sub.ptr) - @intFromPtr(xml.ptr);
     assert(start + sub.len <= xml.len);
@@ -1011,7 +1015,11 @@ fn spanOfSub(xml: []const u8, sub: []const u8) Span {
 /// The span of one unprefixed attribute inside a start tag's raw
 /// attribute region — the first byte of its name through the closing
 /// quote — or null when the element has no such attribute.
-fn attrSpanIn(xml: []const u8, attrs: []const u8, name: []const u8) ?Span {
+///
+/// Public since M5b2 for the same reason as `spanOfSub`: the calc-state
+/// patcher replaces a whole `calcId="…"` run, and the run it replaces has
+/// to be the one the parser read.
+pub fn attrSpanIn(xml: []const u8, attrs: []const u8, name: []const u8) ?Span {
     const region = spanOfSub(xml, attrs);
     var it: AttrIterator = .{ .attrs = attrs };
     while (it.next()) |a| {

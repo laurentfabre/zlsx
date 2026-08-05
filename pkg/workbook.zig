@@ -29,6 +29,11 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
 const store_mod = @import("store.zig");
+/// M5b2: §5.7.3 step 4's prepare/swap transaction. The import points
+/// back at this file — `recalc_txn` builds a candidate *for* a
+/// `Workbook` — but only through function bodies on both sides, so
+/// neither type's layout depends on the other.
+const recalc_txn = @import("recalc_txn.zig");
 const typed_parts = @import("typed_parts/root.zig");
 const zlsx = @import("zlsx");
 const drawing_emit = @import("drawing_emit.zig");
@@ -345,6 +350,46 @@ pub const Error = error{
     /// future-streaming-API workaround when it lands (v1.1).
     EmbeddingExceedsArchiveLimit,
     WriteFailed,
+
+    // ─── §10's plane-2 taxonomy (M5b2) ───────────────────────────
+    //
+    // §10 names this error set as plane 2's home. The whole vocabulary
+    // lands here at once rather than four names now and ten with M5d2:
+    // the transaction already carries an evaluation's refusal census
+    // through to the caller, so any of the fourteen can already surface,
+    // and a partial set would force a mapping that reports a cycle as
+    // malformed input. The spellings are §10's own.
+    /// Unregistered call.
+    FormulaUnsupportedFunction,
+    /// Unsupported semantics — external ref, R1C1, LAMBDA/LET, ambiguous
+    /// dialect, relative defined name, table formula without a cell
+    /// `<f>`. Mark-eligible (§5.7.7).
+    FormulaUnsupportedConstruct,
+    /// `fullPrecision="0"`. Always refuses; never mark-eligible.
+    FormulaPrecisionAsDisplayed,
+    /// Malformed or unsafe input. Never mark-eligible.
+    FormulaMalformedInput,
+    /// Input outside a pinned locale grammar.
+    FormulaLocaleSensitiveInput,
+    /// Data-table formulas.
+    FormulaDataTableUnsupported,
+    /// Signature parts present at model build — mutation would
+    /// invalidate them.
+    FormulaSignedWorkbook,
+    /// A coverage overlapping the run's staged replacements.
+    FormulaStaleEmbeddings,
+    /// Site-dependent evaluation with no anchor.
+    FormulaAnchorRequired,
+    /// A cycle with iteration off.
+    FormulaCycle,
+    /// §5.6e's fixpoint exhausted.
+    FormulaDynamicRefUnstable,
+    /// Outside the approved mutation set.
+    FormulaSpillPersistUnsupported,
+    /// A top-level multi-area result (v1).
+    FormulaResultNotRepresentable,
+    /// Any §9 limit, including §5.7.4's counted retention.
+    FormulaLimitExceeded,
 } || workbook_xml_mod.Error || sheet_xml_mod.ParseError || sst_xml_mod.Error || styles_xml_mod.Error || store_mod.Error ||
     workbook_xml_plan_mod.Error ||
     embedding_part.Error ||
@@ -787,6 +832,69 @@ const EMBEDDING_PART_MAX_BYTES: usize = 512 * 1024 * 1024;
 const EMBEDDING_RELS_CONTENT_TYPE: []const u8 =
     "application/vnd.openxmlformats-package.relationships+xml";
 
+/// A generation the recalc transaction superseded, kept alive until
+/// `Workbook.deinit` (§5.7.4, borrow-lifetime preservation).
+///
+/// `Workbook.sheet()` hands out pointers and `cellByRef()` promises
+/// Workbook-lifetime validity for the strings it returns — and those
+/// strings borrow **part bytes**, not view arenas (`sheet_xml.zig`'s leaf
+/// slices point into the decompressed part). So retaining the typed views
+/// alone would dangle: the store has to come with them. That is the whole
+/// reason this struct exists rather than a list of stale views.
+///
+/// Nothing here is ever reclaimed early. Reclaiming would require proving
+/// no borrow survives, which is precisely what a Workbook-lifetime promise
+/// says cannot be proven — so the reclamation path is `deinit` and reopen,
+/// and the pressure valve is `max_retained_generations`, which refuses
+/// *before* the swap rather than freeing after it.
+pub const RetainedGeneration = struct {
+    /// The superseded `PartStore`. Its `SourceBacking` is shared with
+    /// every live generation, so retaining it costs an arena, not a file
+    /// descriptor (M5b0).
+    store: PartStore,
+    /// The superseded `xl/workbook.xml` view, when the transaction
+    /// replaced it.
+    workbook: ?workbook_xml_mod.WorkbookXml = null,
+    /// Superseded per-sheet views, parallel to `Workbook.worksheets`.
+    /// A slot is non-null only for a sheet whose view the swap replaced.
+    /// Empty when no sheet view moved.
+    sheets: []?sheet_xml_mod.SheetXml = &.{},
+    /// The superseded workbook-scope lazy views. Taken on **every** swap
+    /// rather than only when their part changed: deciding they were
+    /// untouched means resolving which part backs each one, and being
+    /// wrong means a view describing bytes that moved. Handing them to
+    /// the retained generation costs a re-parse on next access and cannot
+    /// be wrong.
+    sst: ?sst_xml_mod.SstXml = null,
+    styles: ?styles_xml_mod.StylesXml = null,
+    /// What this generation keeps resident, for §5.7.4's byte accounting.
+    bytes: u64 = 0,
+
+    pub fn deinit(self: *RetainedGeneration, allocator: Allocator) void {
+        if (self.workbook) |*v| {
+            var view = v.*;
+            view.deinit(allocator);
+        }
+        for (self.sheets) |*slot| {
+            if (slot.*) |*v| {
+                var view = v.*;
+                view.deinit(allocator);
+            }
+        }
+        if (self.sst) |*v| {
+            var view = v.*;
+            view.deinit(allocator);
+        }
+        if (self.styles) |*v| {
+            var view = v.*;
+            view.deinit(allocator);
+        }
+        allocator.free(self.sheets);
+        self.store.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const Workbook = struct {
     allocator: Allocator,
     store: PartStore,
@@ -850,6 +958,15 @@ pub const Workbook = struct {
     recovery_cov_storage: ?[]recovery_record.RecoveredCoverage = null,
     recovery_text_storage: ?[]u8 = null,
     recovery_opts: RecoveryOptions = .{},
+
+    /// §5.7.4: every generation a recalc superseded, oldest first, held
+    /// until `deinit`. Capacity for the incoming entry is reserved during
+    /// `prepare`, which is what makes the swap's append infallible.
+    retained: std.ArrayListUnmanaged(RetainedGeneration) = .empty,
+    /// Sum of `RetainedGeneration.bytes`. Counted rather than documentary
+    /// — §5.7.4 gates repeated recalc on it, and a number nobody adds up
+    /// is a promise nobody keeps.
+    retained_bytes: u64 = 0,
 
     /// Open an .xlsx file as a typed `Workbook`.
     ///
@@ -1009,7 +1126,44 @@ pub const Workbook = struct {
         if (self.embedding_index_storage) |s| self.allocator.free(s);
         if (self.recovery_cov_storage) |s| self.allocator.free(s);
         if (self.recovery_text_storage) |s| self.allocator.free(s);
+        // §5.7.4: the retained generations go last. Every one of them
+        // holds a reference to the same `SourceBacking` the live store
+        // does, and only the final `release` closes the file — order
+        // among them is therefore free, but they must all outlive any
+        // view still borrowing their part bytes, which is why nothing
+        // above this line reaches into them.
+        for (self.retained.items) |*g| g.deinit(self.allocator);
+        self.retained.deinit(self.allocator);
         self.store.deinit();
+    }
+
+    /// Ask the next consumer to recalculate: set `<calcPr
+    /// fullCalcOnLoad="1">` and change nothing else (§5.7.7).
+    ///
+    /// Honestly named. It does not calculate anything and does not claim
+    /// to have: `calcId` is left alone, because the caches in the file are
+    /// still the ones its original producer wrote, and `calcId="0"` is how
+    /// a zlsx recalc says *it* produced them.
+    ///
+    /// Runs as a real transaction rather than as a `replacePart` on the
+    /// live store — the same prepare/swap, the same retained generation,
+    /// the same no-fail swap. A three-line shortcut would have replaced
+    /// bytes that the workbook's own typed views still described.
+    pub fn markRecalcOnLoad(self: *Workbook) Error!void {
+        var result = recalc_txn.markRecalcOnLoad(self, .{}) catch |e| switch (e) {
+            // No cancellation token was supplied, so nothing can trigger
+            // one. Stated rather than swallowed.
+            error.Cancelled => unreachable,
+            else => |other| return other,
+        };
+        switch (result) {
+            .refused => |r| return r.toWorkbookError(),
+            .ok => |*candidate| {
+                candidate.swap(self);
+                var report = candidate.takeReport();
+                report.deinit(self.allocator);
+            },
+        }
     }
 
     /// Register a cell style in the workbook-level styles plan and

@@ -80,6 +80,7 @@ const serial_date = @import("serial_date.zig");
 /// import `decode.zig` and `metadata.zig` do, for the same reason.
 pub const PlaneTwo = decode.PlaneTwo;
 pub const CellSite = decode.CellSite;
+pub const Span = decode.Span;
 
 // ─── refusals (§10) ──────────────────────────────────────────────
 
@@ -1052,6 +1053,56 @@ pub const Extension = struct {
     raw: []const u8,
 };
 
+/// Where the calc state sits in the part it was read from.
+///
+/// §5.7.6's writes are byte-confined edits, not a re-serialization of
+/// `xl/workbook.xml`, so the patcher needs coordinates — and it takes
+/// them from the parser that already walked past them rather than from a
+/// second scan that could disagree by a byte. Same rule M5b1 applied to
+/// `<c>`: one parser, and it hands out the ranges it used.
+pub const CalcPrSpans = struct {
+    /// `<calcPr` through the `>` that ends the element — the `/>` of a
+    /// self-closing one, the `>` of `</calcPr>` otherwise. Zero-width
+    /// when the workbook has no `<calcPr>`.
+    element: Span = .{},
+    /// The attribute region, between the element name and the closing
+    /// `/>` or `>`. Empty (but positioned) for `<calcPr/>`.
+    attrs: Span = .{},
+    /// `calcId="…"`, name byte through closing quote.
+    calc_id: ?Span = null,
+    /// `fullCalcOnLoad="…"`, same shape.
+    full_calc_on_load: ?Span = null,
+    /// Where a `<calcPr>` that does not exist yet must be inserted:
+    /// before the first `CT_Workbook` child that follows `calcPr` in the
+    /// schema's sequence, or before `</workbook>` when there is none.
+    /// Sequence position is not cosmetic — `CT_Workbook` is an
+    /// `xsd:sequence`, so an element out of order is an invalid document.
+    ///
+    /// Optional rather than zero-defaulted: offset 0 is a real offset,
+    /// and a part with no `</workbook>` and no successor element has no
+    /// insertion point at all. The patcher refuses on `null` instead of
+    /// writing an element before the XML declaration.
+    insert_at: ?u32 = null,
+};
+
+/// The `CT_Workbook` children that follow `calcPr` in the schema's
+/// sequence (ECMA-376 Part 1 §18.2.27 and the surrounding element list).
+///
+/// A table rather than a scan for "the last thing before `</workbook>`":
+/// inserting after `<pivotCaches>` produces a document Excel rejects, and
+/// the failure mode of guessing is a file that will not open.
+pub const calc_pr_successors = [_][]const u8{
+    "oleSize",
+    "customWorkbookViews",
+    "pivotCaches",
+    "smartTagPr",
+    "smartTagTypes",
+    "webPublishing",
+    "fileRecoveryPr",
+    "webPublishObjects",
+    "extLst",
+};
+
 /// Everything `xl/workbook.xml` says about how the workbook calculates.
 ///
 /// Every raw slice borrows the part bytes, so a `CalcState` is valid
@@ -1097,6 +1148,9 @@ pub const CalcState = struct {
     /// `<xcalcf:feature name="…">` names, in document order, borrowed.
     calc_features: []const []const u8 = &.{},
     text_compat: TextCompat = .v1,
+
+    /// Byte coordinates of the calc state in the part (M5b2).
+    spans: CalcPrSpans = .{},
 
     /// Write the `<calcPr>` element back exactly as it was read.
     ///
@@ -1144,12 +1198,18 @@ pub fn parseCalcState(gpa: Allocator, xml: []const u8) error{OutOfMemory}!CalcSt
     var extlst_depth: ?usize = null;
     var ext_open: ?struct { start: usize, depth: usize, uri: []const u8 } = null;
     var in_calc_features = false;
+    // M5b2's coordinates. `calc_pr_depth` is set for a non-self-closing
+    // `<calcPr>` so the matching close can finish `spans.element`;
+    // `insert_seen` latches the first schema successor so a later one
+    // does not move the insertion point back past it.
+    var calc_pr_depth: ?usize = null;
+    var insert_seen = false;
 
     while (sc.next() catch {
         return .{ .refused = .{ .reason = .malformed_calc_part } };
     }) |ev| {
         switch (ev) {
-            .close => {
+            .close => |c| {
                 if (depth == 0) return .{ .refused = .{ .reason = .malformed_calc_part } };
                 if (ext_open) |e| {
                     if (depth == e.depth) {
@@ -1160,6 +1220,18 @@ pub fn parseCalcState(gpa: Allocator, xml: []const u8) error{OutOfMemory}!CalcSt
                 }
                 if (extlst_depth) |d| {
                     if (depth == d) extlst_depth = null;
+                }
+                if (calc_pr_depth) |d| {
+                    if (depth == d) {
+                        out.spans.element.end = offsetOf(sc.i);
+                        calc_pr_depth = null;
+                    }
+                }
+                // `</workbook>` is the last resort insertion point, and
+                // the only one that exists for the many workbooks whose
+                // `<calcPr>` would be the final child.
+                if (!insert_seen and depth == 1 and std.mem.eql(u8, c.local(), "workbook")) {
+                    out.spans.insert_at = closeTagOpen(xml, sc.i);
                 }
                 depth -= 1;
                 continue;
@@ -1179,10 +1251,24 @@ pub fn parseCalcState(gpa: Allocator, xml: []const u8) error{OutOfMemory}!CalcSt
         // own depth is one past the current one.
         const el_depth = if (self_closing) depth + 1 else depth;
 
+        if (el_depth == 2 and !insert_seen and isCalcPrSuccessor(local)) {
+            out.spans.insert_at = offsetOf(el.offset);
+            insert_seen = true;
+        }
+
         if (el_depth == 2 and std.mem.eql(u8, local, "calcPr")) {
             switch (parseCalcPr(el, self_closing, &out)) {
                 .ok => {},
                 .refused => |r| return .{ .refused = r },
+            }
+            out.spans.element.start = offsetOf(el.offset);
+            out.spans.attrs = decode.spanOfSub(xml, el.attrs);
+            out.spans.calc_id = decode.attrSpanIn(xml, el.attrs, "calcId");
+            out.spans.full_calc_on_load = decode.attrSpanIn(xml, el.attrs, "fullCalcOnLoad");
+            if (self_closing) {
+                out.spans.element.end = offsetOf(sc.i);
+            } else {
+                calc_pr_depth = depth;
             }
         } else if (el_depth == 2 and std.mem.eql(u8, local, "workbookPr")) {
             switch (parseWorkbookPr(el, &out)) {
@@ -1208,6 +1294,13 @@ pub fn parseCalcState(gpa: Allocator, xml: []const u8) error{OutOfMemory}!CalcSt
 
     out.extensions = try exts.toOwnedSlice(gpa);
     errdefer gpa.free(out.extensions);
+    // An `<calcPr>` the document opened and never closed leaves
+    // `spans.element` half-written — a start with no end. The scanner
+    // itself is content with a truncated document, so the check belongs
+    // here, and a refusal is the only honest answer: M5b2's patcher
+    // addresses that span, and a span whose end is zero addresses the XML
+    // declaration.
+    if (calc_pr_depth != null) return .{ .refused = .{ .reason = .malformed_calc_part } };
     out.calc_features = try features.toOwnedSlice(gpa);
     out.text_compat = textCompatOf(out.calc_features, &calc_feature_inventory);
     return .{ .ok = out };
@@ -1299,6 +1392,22 @@ fn badCalc() CalcParse {
 
 fn offsetOf(i: usize) u32 {
     return std.math.cast(u32, i) orelse std.math.maxInt(u32);
+}
+
+fn isCalcPrSuccessor(local: []const u8) bool {
+    for (calc_pr_successors) |s| {
+        if (std.mem.eql(u8, local, s)) return true;
+    }
+    return false;
+}
+
+/// The offset of the `<` that opens the close tag ending at `end`.
+///
+/// The scanner reports a close by name and by where it stopped, not by
+/// where it started, and an insertion point one byte inside `</workbook>`
+/// would produce tag soup.
+fn closeTagOpen(xml: []const u8, end: usize) u32 {
+    return offsetOf(std.mem.lastIndexOfScalar(u8, xml[0..end], '<') orelse end);
 }
 
 // ─── the worksheet's half (§5.7.6) ───────────────────────────────
