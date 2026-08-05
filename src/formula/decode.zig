@@ -998,6 +998,42 @@ fn offsetOf(i: usize) u32 {
     return @intCast(@min(i, std.math.maxInt(u32)));
 }
 
+/// The span a slice the scanner handed out occupies in the part it came
+/// from. Every such slice is a subslice of `xml` — the scanner never
+/// copies — so the arithmetic is exact rather than a search.
+fn spanOfSub(xml: []const u8, sub: []const u8) Span {
+    assert(@intFromPtr(sub.ptr) >= @intFromPtr(xml.ptr));
+    const start = @intFromPtr(sub.ptr) - @intFromPtr(xml.ptr);
+    assert(start + sub.len <= xml.len);
+    return .{ .start = offsetOf(start), .end = offsetOf(start + sub.len) };
+}
+
+/// The span of one unprefixed attribute inside a start tag's raw
+/// attribute region — the first byte of its name through the closing
+/// quote — or null when the element has no such attribute.
+fn attrSpanIn(xml: []const u8, attrs: []const u8, name: []const u8) ?Span {
+    const region = spanOfSub(xml, attrs);
+    var it: AttrIterator = .{ .attrs = attrs };
+    while (it.next()) |a| {
+        if (a.prefix().len != 0) continue;
+        if (!std.mem.eql(u8, a.local(), name)) continue;
+        const name_at = spanOfSub(xml, a.qname).start;
+        // `raw_value` stops at the closing quote; the span includes it,
+        // clamped because an unterminated value would otherwise address
+        // a byte past the tag. `indexOfTagEnd` makes that unreachable in
+        // a document the scanner accepted, and clamping is cheaper than
+        // depending on it.
+        const value_end = spanOfSub(xml, a.raw_value).end;
+        return .{ .start = name_at, .end = @min(value_end + 1, region.end) };
+    }
+    return null;
+}
+
+/// The offset of the `<` that opens the close tag ending at `end`.
+fn closeTagStart(xml: []const u8, end: usize) u32 {
+    return offsetOf(std.mem.lastIndexOfScalar(u8, xml[0..end], '<') orelse end);
+}
+
 // ─── shared strings ──────────────────────────────────────────────
 
 /// The decoded shared-string table: one string per `<si>`, in part
@@ -1252,6 +1288,25 @@ pub const CellType = enum {
         if (std.mem.eql(u8, t, "d")) return .date;
         return null;
     }
+
+    /// Whether `classifyCell` *retains* the `<v>` bytes it is handed
+    /// rather than parsing a value out of them.
+    ///
+    /// The walk decodes each `<v>` into one scratch buffer that the next
+    /// `<v>` clears, so a retained slice has to leave that buffer before
+    /// the next cell starts. `t="str"` leaves it through `decodeXstring`,
+    /// which allocates; `t="e"` had nothing to allocate and kept
+    /// pointing at bytes the following cell overwrote — a rich error
+    /// spelling read back as whatever came next.
+    ///
+    /// Exhaustive on purpose: a carrier cannot be added without
+    /// answering the question.
+    pub fn retainsCachedText(self: CellType) bool {
+        return switch (self) {
+            .formula_string, .error_value => true,
+            .number, .shared_string, .boolean, .date, .inline_string => false,
+        };
+    }
 };
 
 /// What a stored cell contributes to the merged view.
@@ -1401,6 +1456,73 @@ fn isExtensibleErrorSpelling(s: []const u8) bool {
 
 // ─── the worksheet walk ──────────────────────────────────────────
 
+/// A byte range in the part, `[start, end)`.
+///
+/// `u32` rather than `usize` because `Limits.max_bytes` already refuses
+/// a part a `u32` could not address, and a span that could not be
+/// compared against a `Refusal.offset` would be a second addressing
+/// scheme for one document.
+pub const Span = struct {
+    start: u32 = 0,
+    end: u32 = 0,
+
+    pub fn slice(self: Span, xml: []const u8) []const u8 {
+        assert(self.end >= self.start);
+        return xml[self.start..self.end];
+    }
+};
+
+/// Where one `<c>` and its interpreted children sit in the part.
+///
+/// Recorded by the walk rather than re-found afterwards. The cached-value
+/// patcher (M5b1) writes into these ranges and nowhere else, and a
+/// locator that disagreed with the classifier by one byte would put a
+/// value in the wrong element — so there is one parser, and it hands out
+/// the coordinates it used.
+pub const CellSpans = struct {
+    /// `<c` through the `>` that closes `</c>`, or through the `>` of a
+    /// self-closing `<c/>`.
+    cell: Span = .{},
+    /// Just past the `>` of the start tag. Equal to `cell.end` exactly
+    /// when the element is self-closing.
+    open_end: u32 = 0,
+    /// The raw attribute region of the start tag — between the element
+    /// name and the `/` or `>` that ends it. An empty span is normal and
+    /// still positional: `<c/>` has no attributes and a place to put one.
+    attrs: Span = .{},
+    /// `t="…"`, first byte of the name through the closing quote. Null
+    /// when the attribute is absent.
+    type_attr: ?Span = null,
+    /// `<v>` … `</v>`, whole element. Null when absent.
+    v: ?Span = null,
+    /// What sits between `<v>` and `</v>`. Null when the element is
+    /// self-closing — a `<v/>` has no content region, and giving it one
+    /// would mean inventing a position between two bytes that are not
+    /// adjacent to any content.
+    v_content: ?Span = null,
+    /// `<f>` … `</f>`, whole element. Null when absent.
+    f: ?Span = null,
+    /// `<is>` … `</is>`, whole element. Null when absent.
+    is: ?Span = null,
+
+    pub fn selfClosing(self: CellSpans) bool {
+        return self.open_end == self.cell.end;
+    }
+};
+
+/// Every `<c>` the part contains, whether or not it contributes a value.
+///
+/// `Sheet.cells` drops an empty styled cell, because blank is the
+/// *absence* of a cell in the merged view. A writer cannot afford the
+/// same simplification: a `<c r="A1" s="3"/>` the model does not carry is
+/// still a run of bytes sitting exactly where a new `<c r="A1">` would
+/// have to go.
+pub const CellSlot = struct {
+    row: coords.Row,
+    col: coords.Col,
+    spans: CellSpans,
+};
+
 /// One `<f>`, decoded. The attribute inventory and the shared/array
 /// classification are M4b2's; what M4b1 owes is the decoded body and the
 /// raw attributes preserved for that row to classify.
@@ -1432,6 +1554,11 @@ pub const Sheet = struct {
     arena: std.heap.ArenaAllocator,
     /// Row-major, one entry per occupied coordinate.
     cells: []SheetCell,
+    /// Row-major, one entry per `<c>` element — a superset of `cells`,
+    /// because an empty styled cell has a position without having a
+    /// value. Document order is preserved among equal coordinates, so a
+    /// consumer that refuses duplicates can name the first one.
+    slots: []CellSlot,
 
     pub fn deinit(self: *Sheet) void {
         self.arena.deinit();
@@ -1479,6 +1606,7 @@ pub fn scanSheet(
     const a = arena.allocator();
 
     var cells: std.ArrayListUnmanaged(SheetCell) = .empty;
+    var slots: std.ArrayListUnmanaged(CellSlot) = .empty;
 
     var ns_buf: [64]NsStack.Binding = undefined;
     const ns_cap = @min(ns_buf.len, opts.limits.max_namespace_bindings);
@@ -1486,9 +1614,11 @@ pub fn scanSheet(
 
     var w: SheetWalk = .{
         .a = a,
+        .xml = xml,
         .opts = opts,
         .strings = strings,
         .cells = &cells,
+        .slots = &slots,
     };
 
     var depth: u32 = 0;
@@ -1511,9 +1641,9 @@ pub fn scanSheet(
                 if (!ns.declare(el, depth)) {
                     return .{ .refused = .{ .reason = .limit_exceeded, .limit = .namespace_bindings } };
                 }
-                try w.onOpen(&ns, el, depth, e == .self_closing);
+                try w.onOpen(&ns, el, depth, e == .self_closing, sc.i);
                 if (e == .self_closing) {
-                    try w.onClose(depth);
+                    try w.onClose(depth, sc.i);
                     ns.popTo(depth - 1);
                     depth -= 1;
                 }
@@ -1522,7 +1652,7 @@ pub fn scanSheet(
                 if (depth == 0) {
                     return .{ .refused = .{ .reason = .malformed_xml, .offset = offsetOf(sc.i) } };
                 }
-                try w.onClose(depth);
+                try w.onClose(depth, sc.i);
                 ns.popTo(depth - 1);
                 depth -= 1;
             },
@@ -1536,6 +1666,10 @@ pub fn scanSheet(
 
     const items = try cells.toOwnedSlice(a);
     std.mem.sortUnstable(SheetCell, items, {}, lessThanCell);
+    // Stable, so two `<c>` claiming one coordinate stay in document
+    // order for the consumer that has to name the first of them.
+    const slot_items = try slots.toOwnedSlice(a);
+    std.mem.sort(CellSlot, slot_items, {}, lessThanSlot);
     // Two `<c>` at one coordinate: last-wins and first-wins are both
     // defensible readings, so neither is chosen silently.
     var i: usize = 1;
@@ -1549,10 +1683,15 @@ pub fn scanSheet(
     }
 
     keep = true;
-    return .{ .ok = .{ .arena = arena, .cells = items } };
+    return .{ .ok = .{ .arena = arena, .cells = items, .slots = slot_items } };
 }
 
 fn lessThanCell(_: void, x: SheetCell, y: SheetCell) bool {
+    if (x.row.oneBased() != y.row.oneBased()) return x.row.oneBased() < y.row.oneBased();
+    return x.col.zeroBased() < y.col.zeroBased();
+}
+
+fn lessThanSlot(_: void, x: CellSlot, y: CellSlot) bool {
     if (x.row.oneBased() != y.row.oneBased()) return x.row.oneBased() < y.row.oneBased();
     return x.col.zeroBased() < y.col.zeroBased();
 }
@@ -1562,9 +1701,13 @@ fn lessThanCell(_: void, x: SheetCell, y: SheetCell) bool {
 /// every branch can quietly desynchronize.
 const SheetWalk = struct {
     a: std.mem.Allocator,
+    /// The part, kept so a slice handed out by the scanner can be turned
+    /// back into the offsets it came from.
+    xml: []const u8,
     opts: Options,
     strings: []const []const u8,
     cells: *std.ArrayListUnmanaged(SheetCell),
+    slots: *std.ArrayListUnmanaged(CellSlot),
 
     refusal: ?Refusal = null,
 
@@ -1602,6 +1745,14 @@ const SheetWalk = struct {
     f_text: std.ArrayListUnmanaged(u8) = .empty,
     is_text: std.ArrayListUnmanaged(u8) = .empty,
     formula: ?Formula = null,
+
+    /// The current `<c>`'s byte ranges, filled in as the walk passes
+    /// each of them and handed to `slots` when the element closes.
+    spans: CellSpans = .{},
+    /// Just past the `>` of the open `<v>` tag, so the content region is
+    /// known before the close tag arrives.
+    v_open_end: u32 = 0,
+    v_self_closing: bool = false,
 
     fn refuse(self: *SheetWalk, reason: Refusal.Reason, offset: usize) void {
         if (self.refusal != null) return;
@@ -1652,6 +1803,8 @@ const SheetWalk = struct {
         el: Element,
         depth: u32,
         self_closing: bool,
+        /// Just past the `>` that ended this start tag.
+        open_end: usize,
     ) error{OutOfMemory}!void {
         if (self.skip_depth != null) return;
 
@@ -1690,7 +1843,7 @@ const SheetWalk = struct {
         // `<c>` — a child of `<row>`.
         if (self.row_depth != null and depth == self.row_depth.? + 1) {
             if (std.mem.eql(u8, local, "c")) {
-                self.startCell(el);
+                self.startCell(el, open_end);
             } else if (std.mem.eql(u8, local, "extLst")) {
                 self.skip_depth = depth;
             } else {
@@ -1705,6 +1858,10 @@ const SheetWalk = struct {
                 self.has_v = true;
                 self.v_depth = depth;
                 self.v_text.clearRetainingCapacity();
+                self.spans.v = .{ .start = offsetOf(el.offset) };
+                self.spans.v_content = null;
+                self.v_open_end = offsetOf(open_end);
+                self.v_self_closing = self_closing;
             } else if (std.mem.eql(u8, local, "f")) {
                 self.has_f = true;
                 self.f_depth = depth;
@@ -1716,10 +1873,12 @@ const SheetWalk = struct {
                     .si = el.attr("si"),
                     .raw_attrs = el.attrs,
                 };
+                self.spans.f = .{ .start = offsetOf(el.offset) };
             } else if (std.mem.eql(u8, local, "is")) {
                 self.has_is = true;
                 self.is_depth = depth;
                 self.is_text.clearRetainingCapacity();
+                self.spans.is = .{ .start = offsetOf(el.offset) };
             } else if (std.mem.eql(u8, local, "extLst")) {
                 self.skip_depth = depth;
             } else {
@@ -1753,7 +1912,12 @@ const SheetWalk = struct {
         self.refuse(.unexpected_element, el.offset);
     }
 
-    fn onClose(self: *SheetWalk, depth: u32) error{OutOfMemory}!void {
+    fn onClose(
+        self: *SheetWalk,
+        depth: u32,
+        /// Just past the `>` that ended this element.
+        end: usize,
+    ) error{OutOfMemory}!void {
         if (self.skip_depth) |sd| {
             if (sd == depth) self.skip_depth = null;
             return;
@@ -1761,13 +1925,32 @@ const SheetWalk = struct {
 
         if (self.t_depth == depth) self.t_depth = null;
         if (self.phonetic_depth == depth) self.phonetic_depth = null;
-        if (self.v_depth == depth) self.v_depth = null;
+        if (self.v_depth == depth) {
+            self.v_depth = null;
+            if (self.spans.v) |*v| {
+                v.end = offsetOf(end);
+                // A `<v/>` has no content region. Everything else does,
+                // and its far edge is the `<` of the close tag: a close
+                // tag carries no attributes, so nothing can quote a `<`
+                // between here and there.
+                if (!self.v_self_closing) {
+                    self.spans.v_content = .{
+                        .start = self.v_open_end,
+                        .end = closeTagStart(self.xml, end),
+                    };
+                }
+            }
+        }
         if (self.f_depth == depth) {
             self.f_depth = null;
             if (self.formula) |*f| f.text = try self.a.dupe(u8, self.f_text.items);
+            if (self.spans.f) |*f| f.end = offsetOf(end);
         }
-        if (self.is_depth == depth) self.is_depth = null;
-        if (self.cell_depth == depth) try self.finishCell();
+        if (self.is_depth == depth) {
+            self.is_depth = null;
+            if (self.spans.is) |*is| is.end = offsetOf(end);
+        }
+        if (self.cell_depth == depth) try self.finishCell(end);
         if (self.row_depth == depth) {
             self.row_depth = null;
             self.cursor.startRow();
@@ -1816,8 +1999,14 @@ const SheetWalk = struct {
         }
     }
 
-    fn startCell(self: *SheetWalk, el: Element) void {
+    fn startCell(self: *SheetWalk, el: Element, open_end: usize) void {
         if (self.unexpectedAttr(el, &cell_attrs)) return;
+        self.spans = .{
+            .cell = .{ .start = offsetOf(el.offset) },
+            .open_end = offsetOf(open_end),
+            .attrs = spanOfSub(self.xml, el.attrs),
+            .type_attr = attrSpanIn(self.xml, el.attrs, "t"),
+        };
         const r_attr = el.attr("r");
         if (self.row_provisional) {
             // The first cell fixes the row for the whole row element;
@@ -1864,13 +2053,25 @@ const SheetWalk = struct {
         self.is_text.clearRetainingCapacity();
     }
 
-    fn finishCell(self: *SheetWalk) error{OutOfMemory}!void {
+    fn finishCell(self: *SheetWalk, end: usize) error{OutOfMemory}!void {
         self.cell_depth = null;
         if (self.refusal != null) return;
-        if (self.cells.items.len >= self.opts.limits.max_modeled_cells) {
+        if (self.cells.items.len >= self.opts.limits.max_modeled_cells or
+            self.slots.items.len >= self.opts.limits.max_modeled_cells)
+        {
             self.refusal = .{ .reason = .limit_exceeded, .limit = .modeled_cells };
             return;
         }
+
+        // The slot is recorded before the classification, because a
+        // `<c>` occupies its bytes whatever the classification decides
+        // — including the empty styled cell the merged view drops.
+        self.spans.cell.end = offsetOf(end);
+        try self.slots.append(self.a, .{
+            .row = coords.Row.fromOneBased(self.cell_row) catch unreachable,
+            .col = self.cell_col,
+            .spans = self.spans,
+        });
 
         // The inline string is a STRING carrier: its runs are already
         // entity-decoded, so what is left is the ST_Xstring pass over
@@ -1884,14 +2085,20 @@ const SheetWalk = struct {
             null;
 
         // `t="str"` is a STRING carrier too; every other `<v>` is
-        // lexical and stops at entity decoding.
+        // lexical and stops at entity decoding. What every arm has in
+        // common is that a value the classification *keeps* must not
+        // still be pointing into the scratch buffer when the next `<v>`
+        // clears it — see `CellType.retainsCachedText`.
         const v_raw: ?[]const u8 = if (self.has_v) blk: {
             const t = CellType.fromAttr(self.cell_type) orelse break :blk self.v_text.items;
-            if (t != .formula_string) break :blk self.v_text.items;
-            break :blk decodeXstring(self.a, self.v_text.items) catch |err| {
-                self.refusal = try textRefusal(err, 0);
-                return;
-            };
+            if (t == .formula_string) {
+                break :blk decodeXstring(self.a, self.v_text.items) catch |err| {
+                    self.refusal = try textRefusal(err, 0);
+                    return;
+                };
+            }
+            if (!t.retainsCachedText()) break :blk self.v_text.items;
+            break :blk try self.a.dupe(u8, self.v_text.items);
         } else null;
 
         const classified = classifyCell(.{
@@ -2584,6 +2791,29 @@ test "contract: a rich error spelling is preserved byte-exact" {
     ), &.{});
     defer sheet.deinit();
     try testing.expectEqualStrings("#BLOCKED!", sheet.cells[0].input.err.rich);
+}
+
+test "contract: a retained cached value survives the cells that follow it" {
+    // A one-cell fixture cannot see this. The walk decodes every `<v>`
+    // into one scratch buffer and clears it per cell, so a value the
+    // classification *keeps* — a rich error spelling, a `t="str"` body —
+    // has to leave that buffer before the next `<c>` starts. It did not,
+    // and a rich error read back as whatever the following cell cached
+    // (found by M5b1's round-trip fuzz target).
+    var sheet = try scanOk(sheetXml(
+        \\<row r="1"><c r="A1" t="e"><v>#POWER_QUERY!</v></c>
+    ++
+        \\<c r="B1" t="str"><v>bbbbbbbbbbbbbbbbbb</v></c>
+    ++
+        \\<c r="C1" t="e"><v>#DIV/0!</v></c>
+    ++
+        \\<c r="D1"><v>12345678901234567890</v></c></row>
+    ), &.{});
+    defer sheet.deinit();
+
+    try testing.expectEqualStrings("#POWER_QUERY!", sheet.cells[0].input.err.rich);
+    try testing.expectEqualStrings("bbbbbbbbbbbbbbbbbb", sheet.cells[1].input.text);
+    try testing.expectEqual(value.KnownError.div0, sheet.cells[2].input.err.known);
 }
 
 test "scan: a prefixed document reads exactly like a default-namespaced one" {

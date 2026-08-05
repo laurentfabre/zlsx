@@ -831,6 +831,44 @@ pub fn build(b: *std.Build) void {
     const formula_iterate_tests = b.addTest(.{ .root_module = formula_iterate_mod });
     test_step.dependOn(&b.addRunArtifact(formula_iterate_tests).step);
 
+    // M5b1: §5.7.3 step 3 — the `ResolvedSheet` projection and the
+    // byte-confined cached-value patcher. It sits above `decode.zig`
+    // (which hands out the spans it writes into) and `calc.zig` (which
+    // classifies the `<f>` its spill gate refuses on), and below the
+    // package tree: nothing here opens a file.
+    const formula_resolved_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/resolved.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_resolved_mod.addImport("zlsx_refs", refs_mod);
+    formula_resolved_mod.addImport("zlsx_xid", xid_mod);
+    formula_resolved_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_resolved_mod.addImport("zlsx_casing", casing_mod);
+    addOracleFixtures(b, formula_resolved_mod);
+    const formula_resolved_tests = b.addTest(.{ .root_module = formula_resolved_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_resolved_tests).step);
+
+    // M5b1: the patcher's two fuzz targets (§8.1) — a patch never writes
+    // outside the ranges it declares, and every value it writes reads
+    // back as itself.
+    const formula_resolved_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/resolved.zig"),
+        .target = target,
+        .optimize = optimize,
+        .fuzz = true,
+    });
+    formula_resolved_fuzz_mod.addImport("zlsx_refs", refs_mod);
+    formula_resolved_fuzz_mod.addImport("zlsx_xid", xid_mod);
+    formula_resolved_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_resolved_fuzz_mod.addImport("zlsx_casing", casing_mod);
+    addOracleFixtures(b, formula_resolved_fuzz_mod);
+    const formula_resolved_fuzz_tests = b.addTest(.{
+        .root_module = formula_resolved_fuzz_mod,
+        .test_runner = fuzz_test_runner,
+    });
+    fuzz_step.dependOn(&b.addRunArtifact(formula_resolved_fuzz_tests).step);
+
     // M3b: the criteria fuzz target (§8.1) — no criterion string may
     // panic, leak, or match non-deterministically.
     const formula_criteria_fuzz_mod = b.createModule(.{

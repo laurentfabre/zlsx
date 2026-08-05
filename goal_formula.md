@@ -1935,7 +1935,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M5a1** ✅ | graph.zig: node model, SCC condensation, deterministic order, **seed table**, range-order contract; closure eval semantics | Scaling assertion; order fixtures; **randomized differential test vs a brute-force graph builder** (overlaps, full rows/cols, 3D spans, names, spill resize/invalidation — a missed edge passes perf tests but corrupts caches) |
 | **M5a2** ✅ | Iteration engine (multi-SCC schedule, convergence, clamps) + callsite-keyed volatile schedule + rebuild-reuse KATs + dynamic-edge fixpoint + **complete oracle-gated INDIRECT + OFFSET contracts** (the fixpoint's test subjects; registered fully here so M6's public CLI never exposes a half-function) | Iteration oracles; stabilization fuzz; INDIRECT/OFFSET fixtures |
 | **M5b0** ✅ | **`SourceBacking`** — ref-counted file/buffer backing shared across PartStore generations (each store exclusively owns + closes one `std.Io.File`, `store.zig:105-129,326-329`; shallow clone double-closes, moving breaks retention); backing unified; repeated-recalc + ownership tests. **Ladder-ordered FIRST of the M5b group — physically before M5b1/M5b2, because the transaction that requires it cannot land earlier than it** | Ownership tests; double-close fuzz |
-| **M5b1** | `ResolvedSheet` projection + cached-value patcher + transitions (**incl. ST_Xstring output encoding**) + fuzz | Byte-confinement; round-trip |
+| **M5b1** ✅ | `ResolvedSheet` projection + cached-value patcher + transitions (**incl. ST_Xstring output encoding**) + fuzz | Byte-confinement; round-trip |
 | **M5b2** | Prepare/swap transaction (complete state, reports pre-swap) + calcChain rel-resolution + calc-state writes + `markRecalcOnLoad` + diagnostics. **Hard dependency on M5b0** — whole-generation retention (§5.7.4) is unsafe while `PartStore` exclusively owns and closes its own file, so M5b2's gate re-runs M5b0's ownership tests | No-fail-swap proof; post-failure reads; raw-entry identity; refusal purity; **M5b0 ownership tests green** |
 | **M5c** | `Workbook.openBuffer(alloc, io, bytes)` + **`Writer.saveToOwnedBuffer`** + `zlsx_recalc` **importable shell** (module graph only — its public composition ops land in M5d, where the consumer test moves) | Module-graph gate; buffer≡path byte-equivalence |
 | **M5d1** | Archive/durability substrate: **`AtomicFile.finish` fsync fix** + commit region + **cancellation-aware serialization seam** (the context-free `DeflateFn` at `pkg/zip.zig:64-68,140-144` AND PartStore's whole-input compression during preparation, `pkg/store.zig:370-385,498-512,638-656` — the shared compressor becomes context/callback-aware with 64 KiB chunks; the same chunking covers **decompression during model materialization** (`store.zig:881-916,1361-1384`), **raw-entry copies at save** (`:783-792`), XML scans, and temp-file writes, so the §5.5 polling bound holds across every long operation; cancel-inside-entry, cancel-inside-replacePart, and cancel-inside-materialization tests. **Control-aware buffer variants** — `saveToOwnedBufferControlled` / `openBufferControlled` (§5.10) wired to these seams, with cancel-mid-fresh-serialization and cancel-mid-buffer-open tests, so the Writer path meets the same bound. **Documented SLA exceptions: the blocking `File.sync` AND the post-commit POSIX directory fsync cannot be polled** — both uncancellable waits (no timeout; post-commit status is already success per §5.7.9), fault-injected tests for each, incl. Python worker-thread wait behavior) | Injected sync/rename failures; cancel-inside-* tests |
@@ -2835,6 +2835,101 @@ stopped owning its file and started holding a reference to it.
     ownership tests were checked against the bug they exist for — a
     `nextGeneration` that shares the pointer without retaining is caught
     by two of them independently.
+
+**M5b1 decisions (shipped 2026-08-05).** Ten points, in
+`src/formula/resolved.zig` (the projection, the transition table, the
+patcher and its confinement checker) and `src/formula/decode.zig` (the
+spans the walk now hands out, and one bug the round-trip fuzz found).
+The row where a recalculated value stopped being a number in memory and
+became a byte range in a file.
+
+1.  **The patcher does not serialize; it emits an edit list, and the
+    kind of each edit names the one range it may address.** "Every byte
+    outside a rewritten `<v>` or `t` survives identically" is not a
+    testable sentence about a serializer — you can only compare two
+    documents and hope. So `patch` returns `[]Edit`, each carrying its
+    range and its `EditKind`, and `approvedRange(source, spans, kind)`
+    maps a kind to the *exact* span it is allowed to touch. Confinement
+    is then two independent statements: every edit equals its approved
+    range, and replaying the list over the source reproduces the output
+    byte for byte. The first rules out an edit that had no business
+    being made; the second rules out a write nobody reported. A fixture
+    proves the checker rejects both failures, because a checker that
+    passed everything would make the fuzz targets decorative.
+2.  **The spans come from the classifier, not from a locator.** A
+    second scanner over the same part is the drift this project refuses
+    everywhere else, and here the drift would be a value written into
+    the wrong element. So `decode.scanSheet` records the byte ranges it
+    already walks past — `<c>`, its attribute region, `t`, `<v>` and its
+    content, `<f>`, `<is>` — and `ResolvedSheet` joins publications to
+    them. One parser, and it hands out the coordinates it used.
+3.  **`Sheet.slots` exists because the merged view drops a cell the
+    document still has.** `scanSheet` discards an empty styled
+    `<c r="A1" s="3"/>`, correctly: blank is the *absence* of a cell.
+    A patcher that inherited that view would see A1 as unoccupied and
+    insert a second `<c r="A1">` on top of the first. `slots` is one
+    entry per `<c>` element, `cells` stays exactly what it was, and the
+    projection asks `slots` where a `<c>` is and `cells` what it means.
+    Duplicate coordinates among slots refuse — `scanSheet` already
+    refuses them among modeled cells, and a duplicate where one side is
+    a dropped blank reaches the patcher instead.
+4.  **A number transition *removes* `t`; it does not write `t="n"`.**
+    `ST_CellType`'s default is `n`, so the attribute's absence already
+    says what `t="n"` would say, and writing it would change bytes to
+    state something the file states. Removal then has to decide about
+    the whitespace separating attributes, and the rule is positional:
+    take the run on the side that has a neighbour. Taking the wrong one
+    leaves `<c  r="A1">`, taking neither leaves `<c r="A1" >`, and
+    taking both when the attribute is first leaves `<cr="A1">`. The only
+    attribute takes the whole region.
+5.  **The table's job is the cell's *shape*, and a cell already in that
+    shape is not rewritten.** Publishing what a cell already caches
+    produces zero edits and a byte-identical part, which is the property
+    a no-op recalc needs. The one place shape and value disagree is
+    `<v/>`: it reads as the empty text a `""` publication produces, and
+    it is still not the `<v></v>` the table names, so it is replaced.
+    Consistency is over the shape, not over the reading.
+6.  **`Published` did not need inventing — `value.PublishedScalar` is
+    it.** §5.7.3's "blank publication → numeric 0" is `value.publish`'s
+    mandatory conversion, which already exists and is already shared by
+    every layer. Taking a `PublishedScalar` means the patcher has no
+    blank arm, cannot have an opinion about one, and cannot become a
+    second place that converts.
+7.  **The spill gate refuses `t="array"`, and the dialect only names
+    which refusal it is.** A dynamic-array anchor and a legacy CSE array
+    are the same shape in the file — `<f t="array" ref=…>` — and differ
+    by the `cm`/`vm` metadata M4a resolves. Both refuse, because in both
+    the declared range is part of the result. What the dialect buys is a
+    diagnostic that says which construct the caller has. A DA-dialect
+    cell whose formula is an ordinary scalar is not an anchor and is not
+    refused; the gate is about the construct, not the dialect.
+8.  **An append is carried and then refused, rather than dropped or
+    inserted.** Inserting a `<c>` the part does not have would leave
+    `<row spans>` and `<dimension>` describing a sheet that no longer
+    exists, and §5.8b puts those maintenances behind M7b1's byte-diffed
+    proofs. But a projection that silently lost a staged publication
+    would make the serializer path (M5c) impossible to write against.
+    So `ResolvedSheet.appends` carries them and `patch` refuses with
+    `FormulaSpillPersistUnsupported` — outside the approved mutation
+    set, which is exactly what that refusal means.
+9.  **"Deltas consumed once" lives on the staged set, and a refusal does
+    not consume.** `StagedDeltas.consume` is called on the success path
+    only, so a projection that refused leaves the set intact for a
+    caller that fixes the cause; a second `project` over a consumed set
+    is `error.DeltasAlreadyConsumed` rather than a refusal, because it
+    is a misuse of the API and not a property of the workbook.
+10. **The round-trip fuzz target found a live M4b1 bug on its first
+    real run, which is the whole argument for the target.** The walk
+    decodes every `<v>` into one scratch buffer it clears per cell.
+    `t="str"` leaves that buffer through `decodeXstring`, which
+    allocates; `t="e"` had nothing to allocate and kept pointing into
+    it, so a **rich error spelling read back as whatever the next cell
+    cached**. Every existing fixture had one error cell and could not
+    see it. Fixed at the source with `CellType.retainsCachedText` — an
+    exhaustive switch, so a carrier cannot be added without answering
+    the question — plus a multi-cell regression fixture. The two targets
+    share one generator and one patched run, and differ only in what
+    they assert: confinement, and round-trip.
 
 ---
 
