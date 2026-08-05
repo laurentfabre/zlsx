@@ -1892,6 +1892,24 @@ copies — Book precedent `xlsx.zig:795-811`) → recalculate → save. CLI, C A
 (`zlsx_editor_open_buffer`, `zlsx_writer_save_with_recalc`), Python compose
 through it.
 
+**Landed M5d3** (`recalc/recalc.zig`), as the three-stage forwarder above
+and nothing else: the composition's value is that the stages compile in
+one module without closing a cycle, so it is asserted byte-for-byte
+against the same three calls made by hand. The buffer is freed before the
+function returns — `openBuffer`'s borrow ends when it returns, and the
+generations own the bytes from there. The returned `RecalcReport` is
+allocated from the caller's `gpa` (the one stage 2 hands the workbook),
+so it outlives the `Workbook` the composition builds and tears down.
+
+**The dependency test is a downstream build, not a unit test.**
+`assertAcyclicModules` walks modules zlsx's own `build.zig` constructed;
+a consumer resolves them through `b.dependency(...)`, and the composition
+only compiles if the `zlsx` reached that way is the same module *object*
+`zlsx_pkg` and `zlsx_recalc` were built against — two instances would be
+two structurally-identical `Cell` types. `tests/consumer` is therefore
+the only place that identity is checked in the shape a downstream project
+actually produces.
+
 **Cancellation reaches BOTH pre-recalc stages (normative)**: fresh
 serialization and buffer open can each process gigabytes *before* recalc
 begins, so an uncontrolled Writer path would violate the §5.5 polling bound
@@ -1907,6 +1925,19 @@ deadline through **both**. They poll on the same M5d1 chunked seams
 stages sit entirely before the commit point (§5.7.9). Tests: cancel
 mid-fresh-serialization, cancel mid-buffer-open, deadline expiry in each, and
 the polling-latency bound measured on a deliberately large fresh workbook.
+
+**The `Control` is `run.cancel` + `run.deadline`, not a parameter**
+(M5d3). Both are excluded from `EffectiveRunInputs` by construction, so
+threading them cannot change what a run fingerprints as; and a separate
+`ctl` argument would let a caller give two different answers to "when
+does this run give up" — one to the pre-recalc stages and one to the
+pipeline. The M5d3 tests assert **which stage** refused rather than only
+that one did: a first pass counts the polls each stage owes (an injected
+clock under an unreachable deadline is an exact poll counter), and the
+second arms the token inside a named stage and checks the counter stopped
+there. Both destination cases are covered per stage — prior bytes intact,
+and a destination that never existed still absent — with no `.ztmp`
+debris beside either.
 
 ---
 
@@ -1943,7 +1974,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M5c** ✅ | `Workbook.openBuffer(alloc, io, bytes)` + **`Writer.saveToOwnedBuffer`** + `zlsx_recalc` **importable shell** (module graph only — its public composition ops land in M5d, where the consumer test moves) | Module-graph gate; buffer≡path byte-equivalence |
 | **M5d1** ✅ | Archive/durability substrate: **`AtomicFile.finish` fsync fix** + commit region + **cancellation-aware serialization seam** (the context-free `DeflateFn` at `pkg/zip.zig:64-68,140-144` AND PartStore's whole-input compression during preparation, `pkg/store.zig:370-385,498-512,638-656` — the shared compressor becomes context/callback-aware with 64 KiB chunks; the same chunking covers **decompression during model materialization** (`store.zig:881-916,1361-1384`), **raw-entry copies at save** (`:783-792`), XML scans, and temp-file writes, so the §5.5 polling bound holds across every long operation; cancel-inside-entry, cancel-inside-replacePart, and cancel-inside-materialization tests. **Control-aware buffer variants** — `saveToOwnedBufferControlled` / `openBufferControlled` (§5.10) wired to these seams, with cancel-mid-fresh-serialization and cancel-mid-buffer-open tests, so the Writer path meets the same bound. **Documented SLA exceptions: the blocking `File.sync` AND the post-commit POSIX directory fsync cannot be polled** — both uncancellable waits (no timeout; post-commit status is already success per §5.7.9), fault-injected tests for each, incl. Python worker-thread wait behavior) | Injected sync/rename failures; cancel-inside-* tests |
 | **M5d2** ✅ | `recalculate()` + `saveWithRecalc` (ordering §5.7.9) + report + pre-M7 gate + logical-view gate + embedding-staleness preflight. **The pipeline itself** (`pkg/recalc_run.zig`): model build → whole-workbook graph → §5.6c/§5.6e run → `ResolvedSheet` projection + patch → `recalc_txn.prepare` → swap (in-memory) or serialize-commit-swap-fsync (file). **`PartStore.saveCommitted`** — a `void`-returning `CommitHook` between rename and directory fsync, which is the only place §5.7.9's swap can go. **`RunInputs` reaches the evaluator** (clock, UTC offset, platform profile, `rng_v1` draw source + §5.6d schedule; epoch and CV workbook-derived). **No-formula identity is a rule, not an accident**: a workbook with no formula cells is left byte-identical, calc state included | Determinism; scoped idempotence; no-formula identity; confinement |
-| **M5d3** | Writer compose + `zlsx_recalc` composition ops + **consumer dependency test** + committed bench workloads | Module-graph gate; bench baseline |
+| **M5d3** ✅ | `zlsx_recalc.writerSaveWithRecalc` — the orchestrator composition (`saveToOwnedBufferControlled` → `openBufferControlled` → M5d2's `saveWithRecalc`), with §5.10's `Control` threaded into **both** pre-recalc stages and cancellation proven *per stage* by counting the polls each one owes. **`tests/consumer` gains the third module**: a downstream package resolving `zlsx` + `zlsx_pkg` + `zlsx_recalc` through `b.dependency` and driving the composition, which is the only place the module identity a downstream build produces is checked. **Committed bench workloads** (`tests/bench/synth_f1_mix.zig`): a fixed-topology F1-mix generator at three sizes, §9's named 100k-cell workload digest-pinned, plus `zlsx-bench-recalc` (open / recalc / save / phases). **`compare_bench.py --gate`** — median-based, nonzero exit for release cuts; CI's report-only mean path unchanged, both exit behaviours gated. **The hyperfine lane was never ReleaseFast**: the bench modules hardcoded `bench_optimize` (ReleaseSafe) and discarded `-Doptimize` | Module-graph gate; bench baseline |
 | **M6** | CLI: NDJSON schemas, exit tables (incl. 130/143 + prefix-valid stream rule), mandatory `--sheet/--name`, `--out` identity | Contract tests |
 | **M7a** | DA evaluation + decision table + ownership + `A1#`/`@` + F2-DA natives (FILTER, SORT, SORTBY, UNIQUE, SEQUENCE, RANDARRAY, TRANSPOSE) + RANDARRAY KATs | Fixtures; obstruction fuzz |
 | **M7b1** | DA + CSE **persistence** (approved set; cm/vm collection-pinned transitions; tail ownership; tolerated-state proofs) | Excel-opens-clean per transition |
@@ -3391,6 +3422,137 @@ layers that all existed became one operation a caller can name.
     `RunInputs`. Shipping a parameter that is always `.{}` is a worse
     commitment than adding one later.
 
+**M5d3 decisions (shipped 2026-08-05).** Twelve points across a
+nine-line composition (`recalc/recalc.zig`), a downstream build
+(`tests/consumer`), a committed bench workload
+(`tests/bench/synth_f1_mix.zig`, `tests/bench/bench_recalc.zig`), and the
+comparator (`scripts/compare_bench.py`). The row that produced the number
+the rest of the ladder is measured against.
+
+1.  **`writerSaveWithRecalc` is nine lines, and that is the whole point.**
+    Serialize to a buffer, open the buffer, save-with-recalc — with no
+    step in between that either half could not have done. The value was
+    never the code: it is that the three stages **compile in one module
+    without closing a cycle**, and a function whose body is exactly the
+    three calls a caller would make is the smallest thing that
+    demonstrates it. So the test asserts precisely that: the same fixture
+    through the orchestrator and through three explicit steps produces
+    byte-identical files — and both hold the computed values rather than
+    the fixture's deliberately wrong caches, without which two runs that
+    recalculated nothing would satisfy the equality just as well.
+2.  **The `Control` is `run.cancel` + `run.deadline`, not a seventh
+    parameter.** Both are outside `EffectiveRunInputs` by construction,
+    so threading them into the two pre-recalc stages cannot change what a
+    run fingerprints as. A separate `ctl` argument would let a caller
+    give two different answers to "when does this run give up" — one to
+    the stages before the pipeline and one to the pipeline — and the
+    §5.5 bound is a statement about the whole operation or it is not a
+    bound.
+3.  **Cancellation is proven *per stage*, by measurement rather than by
+    a constant.** M5d1 established that an injected clock under an
+    unreachable deadline is an exact poll counter; M5d3 uses it twice —
+    once to learn where serialization ends and buffer-open begins, then
+    to arm the token inside a named stage and assert the counter stopped
+    inside it. A hardcoded trip point would have quietly migrated into
+    the wrong stage the first time the chunk size or the part list
+    changed, and the test would still have passed. Both destination
+    cases run per stage (prior bytes intact; never-existed still
+    absent), with no `.ztmp` debris beside either — §5.7.9's promise
+    extended backwards over the two stages that precede it.
+4.  **The consumer test is a downstream build because that is the only
+    place the question exists.** `assertAcyclicModules` walks modules
+    zlsx's own `build.zig` constructed. A consumer resolves them through
+    `b.dependency(...)`, and `zlsx_recalc`'s `@FieldType(pkg.Edit,
+    "cell") == zlsx.Cell` assertion only holds if that resolution yields
+    the same module *object* — two instances would be two
+    structurally-identical types, and every error about it would be a
+    wall of "expected xlsx.Cell, found xlsx.Cell". A unit test inside the
+    repo shares the graph it is trying to check.
+5.  **`build.zig.zon` gained `recalc`.** `.paths` had never listed it,
+    which is invisible for a path dependency and fatal for a packaged
+    tarball: the archive would carry a `build.zig` declaring a module
+    whose root source file is not in it. Found by adding the module to
+    `tests/consumer`, which is exactly the kind of thing that gate is
+    for.
+6.  **The bench workload is a generator; the digest is the artifact.**
+    §9 calls the workloads committed artifacts, and a hundred thousand
+    cells of binary is a cost every clone pays for bytes that are a pure
+    function of the code emitting them. So the fixture is generated and
+    `named_digest_sha256` pins it. That constant is **not** a correctness
+    assertion about the writer — a legitimate writer change moves it, and
+    when it does the workload moved and the recorded numbers describe a
+    different workbook. `zlsx-bench-recalc emit` refuses on drift and
+    says so in those words. It is checked in the ReleaseFast lane rather
+    than on the default test path, where deflating megabytes in a Debug
+    build would tax every `zig build test` for a check only the bench
+    lane acts on; determinism and topology are what run everywhere.
+7.  **The hyperfine lane was never ReleaseFast.** `bench_ci.sh:34` has
+    passed `-Doptimize=ReleaseFast` since it was written, and the bench
+    modules set `.optimize = bench_optimize` — a hardcoded `.ReleaseSafe`
+    that is *correct* for the RSS probes it was introduced for (an RSS
+    number wants the overflow checks a production caller runs) and wrong
+    for a wall-clock lane. The flag was discarded. Every wall-clock
+    number this repo recorded before this row was measured in ReleaseSafe
+    under a ReleaseFast label, and baselines from either side of it are
+    not comparable.
+8.  **Evaluate time is a difference, not a mode.** No process
+    recalculates without first opening the archive, so §9's evaluate
+    ceiling is read as `recalc − open` across two hyperfine means — which
+    is why `open` is a mode at all, and why every size runs all three.
+    It is also why three sizes exist rather than two: a fixed cost and a
+    per-cell cost cannot be separated from one point, and the third makes
+    the *slope between them* visible rather than assumed.
+9.  **`phases` stops where the public surface stops — and every row is a
+    measured span, not a difference of two runs.** §9 asks for model /
+    evaluate / stage / prepare+swap / serialize separately. `prepare` is
+    public (M5d2 exported it for exactly this kind of caller) and hands
+    back the candidate *unswapped*, which is the state §5.7.9 serializes
+    from — so one process times the open, the prepare, the
+    serialize+commit off that candidate, and the swap, in transaction
+    order. The first draft derived serialize+commit as `saveWithRecalc −
+    prepare` across two runs and duly reported **−2 266.86 ms** on the
+    named workload: at two minutes a run, the difference of two
+    measurements is mostly thermal drift. Splitting the prepare span
+    further needs timers *inside* `pkg/recalc_run.zig`; instrumenting
+    M5d2's pipeline to describe it better is a change to the thing being
+    measured, and this row does not make it.
+10. **`--gate` differs from report-only in exactly two places: the
+    statistic and the exit code.** Medians because a blocking lane cannot
+    afford the one run that hit a migration stall, and means stay in the
+    report-only lane because a shared runner's wall clock is not a gate
+    and a bench job that can block a PR on thermal noise gets disabled
+    within a month. Both exit contracts are asserted against synthetic
+    hyperfine JSON (`scripts/ci/check_compare_bench.sh`) — an injected
+    regression, an injected improvement, and the *same* injected
+    regression through the report-only path, so the mode is the only
+    variable. Neither behaviour is visible from a passing bench job: a
+    gate that silently never fires and a report-only lane that has
+    started failing PRs look identical until the day they matter.
+11. **The named workload is not in CI's default size list.** At this
+    baseline one run of it is ~2 minutes, so N=20 is a ~1-hour job per
+    mode. CI runs `tiny` + `small`; recording a baseline adds `named` via
+    `ZLSX_BENCH_RECALC_SIZES`. That split is not new policy — §9 already
+    puts CI on report-only and gating at release cuts, and this is the
+    same line drawn in wall-clock terms.
+12. **The baseline it produced is 267× over §9's evaluate ceiling and
+    128× over end-to-end, and the cost is quadratic.** Recorded, not
+    renegotiated — §9's ceiling values are the previous row's and this
+    row only measures against them (§9.1). Ten times the cells costs
+    68.7× and then 96.1×; a direct row sweep quadruples per doubling
+    (250/500/1000/2000 rows → 0.10/0.35/1.38/5.29 s). A `sample` profile
+    attributes ~76 % of it to two O(n) operations inside per-cell loops:
+    `WorkbookEnv.insertCell`'s sorted-array `memmove`
+    (`pkg/workbook.zig:9278`, 42 %) and `graph.Key.order` under
+    `iterate.Engine.noteEdge` (`src/formula/iterate.zig:1206`, 34 %).
+    Neither is the fixture's doing — any workbook with *n* formula cells
+    hits both *n* times. This is what a baseline is for, and fixing it is
+    an optimisation row with its own gate, not a line item in the row
+    that discovered it. The same measurement also says where the cost is
+    *not*: serialize + commit is 0.99 ms of the named workload's two
+    minutes, and the swap is unmeasurable — which is the empirical form
+    of §5.7.9's claim that a no-fail swap belongs inside the commit
+    region.
+
 ---
 
 ## 8. Testing & oracles
@@ -3582,6 +3744,80 @@ adds a TEXT-heavy bench; M9d adds a mixed full-registry workload
 | aggregates — **bytes** (counted allocator) | `max_run_arena_bytes` **1 GiB**, live matrix cells 8M, string payload 256 MiB, retained ASTs 128 MiB, diagnostics 1 MiB — defaults; hard maxima 4× each; caller-adjustable via `ResourceLimits` (M3b, `src/formula/run_inputs.zig` — a **separate struct from `parser.Limits`**, which bounds parse shape); resolved values echoed + fingerprinted. An exhausted category is `FormulaLimitExceeded`, never a bare `OutOfMemory`: the budget records which one tripped. `matrix_cells` is charged as a **count**, so the limit does not depend on `@sizeOf(ScalarValue)` | byte accounting; below/at/above per category |
 | aggregates — **work** (explicit checked counters; can burn CPU without allocating) | `max_total_cell_evals` **50M**, dependency edges 50M, `max_scc_iterations` = **caller RESOURCE ceiling only, default 32 767 (hard max 32 767)** — never conflated with the workbook's semantic `calcPr@iterateCount`: hitting `iterateCount` = success + non-converged, hitting a lower caller ceiling = `FormulaLimitExceeded` + zero mutation (§5.6c), `max_dynamic_passes` default 3 (caller-adjustable, hard max 10), sort/comparison ops 500M — defaults; hard maxima 4× unless stated; caller-adjustable **in Zig/C only — CLI and Python fix limits at defaults in v1 (declared, no flags)**; resolved values echoed + fingerprinted. **Three shapes of bound, classified (M5a2 `WorkCategory.kind`)**: a *total* only grows (`dependency_edges`, `total_cell_evals`), a *depth* unwinds (`eval_depth`), and a **per-scope** bound is re-counted from zero in every scope it governs (`scc_iterations`, `dynamic_passes`) — §5.6c gives each SCC its own pass counter, so accumulating passes into one running total would refuse a workbook whose every component iterated legally; `WorkCounters.charge` rejects a per-scope category, and the engine that owns the scope reads the limit instead | decrement sites named per counter; below/at/above boundary tests |
 
+### 9.1 The M5d3 baseline (recorded 2026-08-05)
+
+**The named workload** is `tests/bench/synth_f1_mix.zig`'s `named`
+geometry: 10 000 data rows × 10 columns = **100 000 cells**, 80 000 of
+them formulas across all five F1 batches, one header row, 64 distinct
+shared strings (0.64 % unique), archive **797 706 bytes**, fixed topology
+and per-column fan-in documented in that file's header. Its identity is
+
+```
+sha256 = b2b42c0b67703a8a4935ddc525213ebeabf0568507bedded120ac23c32778ad0
+```
+
+and `zlsx-bench-recalc emit … --size named` refuses on drift. The digest
+and the numbers below are **one artifact**: a workload change invalidates
+the baseline whether or not the code changed.
+
+**Host**: Apple M3 Max (16 cores, 128 GiB), macOS 26.5.2, arm64, Zig
+0.16.0, ReleaseFast, warm cache, `hyperfine -N --warmup 5 --runs 20`
+(N=20 per `bench_ci.sh:50`). Recorded on
+`feat/m5d3-recalc-composition`. Laptop-class thermals over a ~2-hour
+sequential run: the `named` figures are the pessimistic end.
+
+Medians are the gating statistic; p95 and σ describe the distribution.
+
+| Workload | Cells | Formula cells | `open` | `recalc` | `save` | p95 (`recalc`) | σ (`recalc`) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `f1_mix_tiny` | 1 000 | 800 | 1.66 ms | 21.90 ms | 22.00 ms | 22.33 ms | 0.24 ms |
+| `f1_mix_small` | 10 000 | 8 000 | 1.65 ms | 1 390.39 ms | 1 430.96 ms | 1 579.88 ms | 88.57 ms |
+| **`f1_mix_named`** | **100 000** | **80 000** | 1.71 ms | **133 452.65 ms** | **127 690.55 ms** | 152 629.57 ms | 9 703.41 ms |
+
+**Read it as follows.** `open` is the fixed cost and is flat across all
+three sizes — the archive is opened and its structural parts
+materialised, nothing more — so **evaluate = recalc − open**: 20.2 ms,
+1 388.7 ms, 133 451 ms. `save` is end-to-end. At the named size `save`
+comes out *below* `recalc`; that is thermal drift over a ~2-hour
+sequential run, not a negative serialize cost — the two differ by less
+than a σ of either.
+
+Serialize + commit is where a difference of two hyperfine means would
+mislead, so it is measured directly instead (`zlsx-bench-recalc phases`,
+one instrumented process, every row a span it timed):
+
+| Phase | `small` | `named` |
+|---|---:|---:|
+| open | 0.16 ms | 0.20 ms |
+| prepare (model + graph + evaluate + stage + txn) | 1 360.03 ms | 131 606.21 ms |
+| serialize + commit | 0.41 ms | 0.99 ms |
+| swap | 0.000 ms | 0.000 ms |
+
+**The pipeline's cost is evaluation, not I/O** — writing the recalculated
+100 000-cell archive costs one millisecond against two minutes of
+evaluating it, and §5.7.9's swap is free, which is what makes it
+legal inside the commit region.
+
+**Against §9's ceilings**: the named workload is **267× over the evaluate
+ceiling** (133.5 s vs 500 ms) and **128× over end-to-end** (127.7 s vs
+1 s). The ceilings are **not renegotiated here**; this row records what
+they are measured against. The gap is not a constant factor either — the
+cost is **quadratic in cell count**: ×10 cells costs ×68.7
+(tiny→small) and ×96.1 (small→named), and a direct row sweep gives
+0.10 / 0.35 / 1.38 / 5.29 s at 250 / 500 / 1 000 / 2 000 rows, ×4 per
+doubling. Per formula cell that is 25 µs, 174 µs, 1 668 µs. §9's own
+"10k-vs-100k ≤ 15×" assertion therefore fails today, and says so here
+rather than at the release cut.
+
+A `sample` profile attributes ~76 % of it to two O(n) operations inside
+per-cell loops: `WorkbookEnv.insertCell`'s sorted-array `memmove`
+(`pkg/workbook.zig:9278`, 42 %) and `graph.Key.order` under
+`iterate.Engine.noteEdge` (`src/formula/iterate.zig:1206`, 34 %). Both
+are structural — any workbook with *n* formula cells hits them *n* times,
+so nothing about the F1-mix topology causes it — which makes closing the
+gap an optimisation row of its own, owed **before** the thresholds
+freeze.
+
 ---
 
 ## 10. Refusal & error taxonomy
@@ -3634,11 +3870,14 @@ Workbook.evaluate(alloc, current_sheet, site: ?EvalSite, formula, run, diag) Eva
 Workbook.markRecalcOnLoad() Error!void
 Writer.saveToOwnedBuffer(alloc, io: std.Io) SaveError![]u8                     // byte≡path-save; capped by max_output_archive_bytes
 Writer.saveToOwnedBufferControlled(alloc, io, ctl: Control) SaveError![]u8     // identical bytes; polls the M5d1 seams
-zlsx_recalc.writerSaveWithRecalc(alloc, io, writer, path, run, opts, diag) SaveError!RecalcReport  // threads Control into BOTH pre-recalc stages
+zlsx_recalc.writerSaveWithRecalc(alloc, io, writer: *Writer, path, run, opts) SaveError!RecalcReport  // threads Control into BOTH pre-recalc stages
 ```
 
 CalcState workbook-derived; allocator-explicit; `deinit` everywhere; diag
-pre-error. **`diag` and `save_opts` are not parameters** (M5d2): the
+pre-error. **`diag` and `save_opts` are not parameters** (M5d2, extended
+to `writerSaveWithRecalc` at M5d3 — the composition returns the same
+`RecalcReport` its last stage does, so a diagnostics channel it did not
+need would have been one the layer beneath it also does not have): the
 `RecalcReport` is prepared pre-swap and carries the census, the counts and
 §5.7.8's resolved-input echo, so a second diagnostics channel would be a
 second copy of the same facts; and a save this transaction performs has no
@@ -3845,7 +4084,7 @@ classified flip-at / historical-label):
 | `docs/vs_calamine.md:64,90` | claims zlsx skips `<f>` / cannot emit formulas — **already false** (`xlsx.zig:2070-2153`, `writer.zig:940-955`) | **M-1** correction |
 | `docs/vs_calamine.md:5,130` | "no formula evaluation" (true until M5d2) | **M6** historical label |
 | `docs/xlsx_test_corpus.md:27,56` | "don't need to evaluate" | **M6** flip |
-| `docs/package-layer.md` | layer description | **M5d** update |
+| ~~`docs/package-layer.md`~~ | layer description | **M5d3 — done**: title's "read-only" retired with a note saying when it stopped being true (byte-preserving writes → `Workbook` mutation → M5d recalc), and a **Recalculation (M5d)** section added covering `recalculate` / `saveWithRecalc` / `openBuffer(Controlled)` / `markRecalcOnLoad` / `zlsx_recalc.writerSaveWithRecalc`, plus why the composition is a third module |
 | `bindings/python/README.md:252` ("never") + **full new-API docs**: methods, `Matrix`, `ExcelError`, refusal/cancellation semantics | **M9a2** gate (docs land with the code PR) |
 | `bindings/python/README.md:177-179` ("all batch options apply to streaming" — false once recalc refuses streaming) + **Spark option table (batch-only)** | **M9b** gate |
 | `src/xlsx.zig:1-13` · `src/cli.zig:1,1141` · `pkg/workbook.zig:366,5477-5479` | in-source scope comments (incl. the "future evaluator (Tier D1)" promise at the emitCell branch) | with the code that changes them (**M5d/M6**) |

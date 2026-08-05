@@ -159,11 +159,13 @@ Under Zig 0.15.2, `cli_mod`, `zlsx_pkg` and `writer` could not coexist in one co
 
 The 0.16 migration retested it directly — adding `cli_mod.addImport("writer", writer_mod)` on top of the existing `zlsx` + `zlsx_pkg` imports builds clean and keeps 1029/1029 tests green. Merging `zlsx-extract-images` back into the CLI is therefore possible now. It has deliberately **not** been done: dropping a shipped binary is a user-visible packaging change and belongs to whoever owns that call, not to a build-graph tidy-up.
 
-What downstream consumers actually depend on — importing `zlsx` and `zlsx_pkg` together — is now a build gate, not a claim: `tests/consumer/` is a standalone package with a path dependency on the repo root that writes a workbook with `zlsx.Writer`, reads it with `zlsx.Book`, mutates it through `zlsx_pkg.Editor`, and re-reads to verify. Run it with:
+What downstream consumers actually depend on — importing the public modules together — is now a build gate, not a claim: `tests/consumer/` is a standalone package with a path dependency on the repo root that writes a workbook with `zlsx.Writer`, reads it with `zlsx.Book`, mutates it through `zlsx_pkg.Editor`, re-reads to verify, and then (M5d3) drives `zlsx_recalc.writerSaveWithRecalc` — all three public modules in one compilation. Run it with:
 
 ```sh
 cd tests/consumer && zig build && ./zig-out/bin/consumer /tmp/in.xlsx /tmp/out.xlsx
 ```
+
+The third module is the reason the gate lives outside the repo's own `build.zig`: `assertAcyclicModules` walks modules zlsx constructed, while a downstream package resolves them through `b.dependency(...)`, and the composition only compiles if the `zlsx` reached that way is the same module object `zlsx_pkg` and `zlsx_recalc` were built against.
 
 ### `-Dsingle-threaded` swaps the allocator
 

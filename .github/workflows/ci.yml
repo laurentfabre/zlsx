@@ -61,10 +61,11 @@ jobs:
 
       # Public-module gate. `tests/consumer/` is a separate package with
       # a path dependency on the repo root, so this exercises zlsx the
-      # way a downstream project does — importing `zlsx` and `zlsx_pkg`
-      # in one compilation, which the pre-0.16 three-module collision
-      # made impossible. It writes, reads, edits and re-reads a
-      # workbook, and exits non-zero on any mismatch.
+      # way a downstream project does — importing `zlsx`, `zlsx_pkg` and
+      # (since M5d3) `zlsx_recalc` in one compilation, which the pre-0.16
+      # three-module collision made impossible. It writes, reads, edits
+      # and re-reads a workbook, then drives §5.10's composition, and
+      # exits non-zero on any mismatch.
       - name: Consumer co-import round-trip
         working-directory: tests/consumer
         run: |
@@ -100,6 +101,13 @@ jobs:
       # PRs); never tolerates a digest mismatch or a table diff.
       - name: Unicode tables match their pinned inputs
         run: scripts/ci/check_unicode_tables.sh
+
+      # §9's two comparator contracts (M5d3): `--gate` fails a release
+      # cut on a regression, report-only never fails anything. Neither
+      # is visible from a passing bench job, so both are asserted
+      # against synthetic hyperfine JSON. No toolchain, no network.
+      - name: compare_bench exit contracts
+        run: scripts/ci/check_compare_bench.sh
 
   cross-compile:
     name: cross / ${{ matrix.target }}

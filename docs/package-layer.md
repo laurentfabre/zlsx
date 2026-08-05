@@ -1,4 +1,4 @@
-# `zlsx_pkg` — read-only OOXML package layer
+# `zlsx_pkg` — OOXML package layer
 
 `zlsx_pkg` is a Zig module sitting alongside the main `zlsx`
 reader/writer. It exposes the OOXML package layer (ZIP entries,
@@ -7,6 +7,11 @@ pulling the full reader into the build. Consumers who want to
 extract images / charts / opaque parts from a workbook can use it
 directly; the reader's overhead (sheet streaming, SST decode,
 style lookup) doesn't apply.
+
+> The title used to say **read-only**. It was true through Tier B0 and
+> stopped being true in stages: the byte-preserving write API below, then
+> the `Workbook` overlay's cell mutation, and at M5d the formula engine's
+> recalculation entry points. See [Recalculation](#recalculation-m5d).
 
 > Lives at `pkg/root.zig` in the repo. Wired into `build.zig` as
 > the `zlsx_pkg` module name. Add it to your own `build.zig.zon`
@@ -121,6 +126,34 @@ try store.save("out.xlsx");
 
 Untouched parts in `out.xlsx` share their compressed payload bytes
 with `in.xlsx` byte-for-byte; only `xl/workbook.xml` re-deflates.
+
+## Recalculation (M5d)
+
+The layer is no longer read-mostly: `zlsx_pkg.Workbook` carries the
+formula engine's two entry points, and a third public module composes
+them with the writer.
+
+| Symbol | Notes |
+|---|---|
+| `Workbook.recalculate(alloc, io, run, opts)` | §5.7's in-memory transaction. Recalculates every formula cell and swaps the result in as the final pipeline operation. No file is opened; on any refusal or cancellation the workbook is exactly as it was. |
+| `Workbook.saveWithRecalc(alloc, io, path, run, opts)` | The same pipeline plus §5.7.9's file transaction: serialize from the *unswapped* candidate → temp write → `File.sync` → final cancellation poll → rename → swap → directory fsync. Any failure before the rename leaves both the destination's prior bytes and the workbook's memory untouched. |
+| `Workbook.openBuffer(alloc, io, bytes)` | Open a package already in memory. The borrow ends when it returns — the store copies. |
+| `Workbook.openBufferControlled(alloc, io, bytes, ctl)` | Same, with §5.5's cancel/deadline reaching the archive scan and the eager part decompression. |
+| `Workbook.markRecalcOnLoad()` | Set `<calcPr fullCalcOnLoad="1">` and change nothing else. Honestly named: it does not calculate. |
+| `zlsx_recalc.writerSaveWithRecalc(alloc, io, writer, path, run, opts)` | The composition, in a **third module** (`zlsx_recalc`) that imports `zlsx` and `zlsx_pkg`. `Writer` bytes → `Workbook.openBuffer` → `saveWithRecalc`, with the `Control` threaded into all three stages. |
+
+`RunInputs` (clock, UTC offset, seed, fidelity, platform profile, plus
+the cancel token and deadline) makes a run reproducible from its inputs;
+`RecalcOptions` carries the policy around it. The returned `RecalcReport`
+is the caller's — `deinit` it with the allocator the workbook was opened
+with.
+
+`zlsx_recalc` is a separate module rather than a method on either of the
+other two because the composition needs both halves at once, and putting
+it in either would close a loop that today runs one way (`zlsx_pkg →
+zlsx`). That direction is load bearing: `pkg/zip.zig` and
+`pkg/fresh_emit.zig` are deliberately stdlib-only and take deflate as a
+function pointer to keep the graph a DAG.
 
 ## Out of scope
 
