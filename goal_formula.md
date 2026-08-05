@@ -1130,9 +1130,18 @@ convergence before any downstream node evaluates** (downstream sees final
 values only); each SCC gets its own pass counter bounded by **both** the
 semantic `iterateCount` (clamped to Excel's max 32 767) **and** the resource
 ceiling `max_scc_iterations` — whichever binds first decides the outcome, and
-the two outcomes differ (see the exhaustion rule below); defaults off/100/0.001; missing/zero/
-out-of-range values per a pinned transition table; Gauss–Seidel visibility
-inside a pass. **Order divergence, declared**: Excel iterates via a mutable
+the two outcomes differ (see the exhaustion rule below); defaults off/100/0.001;
+**the transition table, pinned (M5a2)**: `iterateCount` 0 → 100 (Excel's own
+minimum is 1, so a zero is an unset attribute and an unset attribute is the
+schema default) · `iterateCount` > 32 767 → 32 767 · `iterateDelta` < 0 → 0.001 ·
+**`iterateDelta` = 0 → 0.001, the SAME row as negative** — under a strict
+`< iterateDelta` a zero tolerance is satisfied by nothing at all, not even by a
+value that did not move, so it is an unsatisfiable bound rather than a request
+for exact equality; reading it as exact equality would need an exception inside
+the comparison, and a comparison with an exception in it is one two
+implementations will eventually disagree about · non-finite `iterateDelta` never
+reaches the table (`calc.parseCalcState` refuses the part). Gauss–Seidel
+visibility inside a pass. **Order divergence, declared**: Excel iterates via a mutable
 calculation chain whose order evolves during recalc; zlsx's fixed
 coordinate-order Gauss–Seidel is an **intentional documented divergence**
 (determinism requires it), gated by order-sensitive circular-workbook
@@ -1154,9 +1163,11 @@ exhaustion outcomes — semantic bound vs resource ceiling (normative)**: the
 **semantic** bound is the workbook's own `calcPr@iterateCount` (clamped to
 32 767); reaching it is Excel's documented behavior and returns **success +
 `non_converged_cells`**. The **resource** ceiling `max_scc_iterations` (§9)
-is caller-supplied; when it is lower than the workbook's `iterateCount` and
-is the bound actually hit, the run returns **`FormulaLimitExceeded` with
-zero mutation** — a resource cap must never silently write caches computed
+is caller-supplied; when it is **strictly lower** than the workbook's
+`iterateCount` and is the bound actually hit, the run returns
+**`FormulaLimitExceeded` with zero mutation** (equal bounds are the
+workbook's answer — the caller permitted exactly what the file asked for,
+so calling that a resource refusal would refuse a run nothing constrained) — a resource cap must never silently write caches computed
 with fewer iterations than the workbook requested (that would contradict D-5,
 and §9 limits are Plane-2 refusals at every layer). Which bound fired is
 recorded per SCC. Fixtures: caller ceiling above / equal to / below
@@ -1165,7 +1176,7 @@ SCC while another converges (the whole run refuses, zero mutation).
 Iteration-off cycles → `FormulaCycle`. Idempotence scoped to
 acyclic/converged. Fixtures with interacting cyclic + acyclic components.
 
-**5.6d Volatile draw schedule (rng_v1)**: draws keyed by **(invocation path, stable AST callsite ordinal, SCC-pass, element ordinal)** — the invocation path is the CALLING owner plus the chain of name/table expansion **edges, each segment carrying its reference-occurrence ordinal** (so `A1=N+N` with `N=RAND()` draws twice — the two `N` references are distinct occurrences; nested repeated names and repeated table/RANDARRAY producers likewise), plus the materialized row for table producers; standalone roots use a constant path. **Volatile oracle policy (unified — supersedes any other statement)**: external oracles verify only enumerated observable properties via statistical/property protocol — repeated-reference inequality (`N+N`), per-reference re-execution, result type/range; **draw counts and sequencing are internal-KAT-only** — two `RAND()` in one cell are
+**5.6d Volatile draw schedule (rng_v1)**: draws keyed by **(invocation path, stable AST callsite ordinal, SCC-pass, element ordinal)** — **exactly those four, and no component term (M5a2)**: §5.6e resets a changed SCC's pass counter and re-seeds it, so the same cell re-runs pass 1 while belonging to a *different* component, and a component term would make that a new key and a fresh draw — which is precisely the "a discovery pass cannot perturb a result" §5.6e requires. The path already names the cell and a cell is in one component at a time, so the term buys nothing and costs the property it sits beside. The invocation path is the CALLING owner plus the chain of name/table expansion **edges, each segment carrying its reference-occurrence ordinal** (so `A1=N+N` with `N=RAND()` draws twice — the two `N` references are distinct occurrences; nested repeated names and repeated table/RANDARRAY producers likewise), plus the materialized row for table producers; standalone roots use a constant path. **Volatile oracle policy (unified — supersedes any other statement)**: external oracles verify only enumerated observable properties via statistical/property protocol — repeated-reference inequality (`N+N`), per-reference re-execution, result type/range; **draw counts and sequencing are internal-KAT-only** — two `RAND()` in one cell are
 distinct call sites; `RANDARRAY` elements draw by element ordinal; memoized
 for the rest of the recalc; dynamic-edge rebuild and shape-stabilization
 passes **reuse** memoized draws. KATs: PRNG seed/sequence (M3b);
@@ -1922,7 +1933,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M4f** ✅ | F1c-text (19: LEFT, RIGHT, MID, LEN, LOWER, UPPER, TRIM, CONCAT, CONCATENATE, TEXTJOIN, SUBSTITUTE, REPLACE, FIND, SEARCH, EXACT, VALUE, REPT, CHAR, CODE) + **CV1/CV2 shared text layer** (§5.4d; collation_v1 landed at M3a) + **`casing_v1`** + the `unicode/` move | Oracle-first; codec tests; per-CV fixtures |
 | **M4g** ✅ | F1c-date (15: DATE, YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, TODAY, NOW, EOMONTH, EDATE, WEEKDAY, DATEVALUE, TIMEVALUE, TIME) + the **invariant date grammar** (§5.4b) + `RunInputs`' clock reaching the evaluator | Oracle-first; per-epoch fixtures |
 | **M5a1** ✅ | graph.zig: node model, SCC condensation, deterministic order, **seed table**, range-order contract; closure eval semantics | Scaling assertion; order fixtures; **randomized differential test vs a brute-force graph builder** (overlaps, full rows/cols, 3D spans, names, spill resize/invalidation — a missed edge passes perf tests but corrupts caches) |
-| **M5a2** | Iteration engine (multi-SCC schedule, convergence, clamps) + callsite-keyed volatile schedule + rebuild-reuse KATs + dynamic-edge fixpoint + **complete oracle-gated INDIRECT + OFFSET contracts** (the fixpoint's test subjects; registered fully here so M6's public CLI never exposes a half-function) | Iteration oracles; stabilization fuzz; INDIRECT/OFFSET fixtures |
+| **M5a2** ✅ | Iteration engine (multi-SCC schedule, convergence, clamps) + callsite-keyed volatile schedule + rebuild-reuse KATs + dynamic-edge fixpoint + **complete oracle-gated INDIRECT + OFFSET contracts** (the fixpoint's test subjects; registered fully here so M6's public CLI never exposes a half-function) | Iteration oracles; stabilization fuzz; INDIRECT/OFFSET fixtures |
 | **M5b0** | **`SourceBacking`** — ref-counted file/buffer backing shared across PartStore generations (each store exclusively owns + closes one `std.Io.File`, `store.zig:105-129,326-329`; shallow clone double-closes, moving breaks retention); backing unified; repeated-recalc + ownership tests. **Ladder-ordered FIRST of the M5b group — physically before M5b1/M5b2, because the transaction that requires it cannot land earlier than it** | Ownership tests; double-close fuzz |
 | **M5b1** | `ResolvedSheet` projection + cached-value patcher + transitions (**incl. ST_Xstring output encoding**) + fuzz | Byte-confinement; round-trip |
 | **M5b2** | Prepare/swap transaction (complete state, reports pre-swap) + calcChain rel-resolution + calc-state writes + `markRecalcOnLoad` + diagnostics. **Hard dependency on M5b0** — whole-generation retention (§5.7.4) is unsafe while `PartStore` exclusively owns and closes its own file, so M5b2's gate re-runs M5b0's ownership tests | No-fail-swap proof; post-failure reads; raw-entry identity; refusal purity; **M5b0 ownership tests green** |
@@ -2624,6 +2635,123 @@ reference.
     engine that will consume them arrives to a table that has already
     been tested against something.
 
+**M5a2 decisions (shipped 2026-08-05).** Thirteen points, in
+`src/formula/iterate.zig` (new — the multi-SCC schedule, convergence, the
+two exhaustion outcomes, §5.6e's fixpoint), `src/formula/draws.zig` (new
+— §5.6d's key and its memo), `eval.zig` (the draw seam, `INDIRECT` and
+`OFFSET`), `registry.zig` (the two reference-producing rows),
+`run_inputs.zig` (§9's two new bounds), `graph.zig` (the runtime-edge
+seam and `PlanOptions`) and `pkg/workbook.zig` (the package's `Host`).
+The row where the seed table stopped being a fixture and started being
+load-bearing.
+
+1.  **A zero `iterateDelta` is an unset attribute, not a request for
+    exact equality.** §5.6c's rule is `abs(new − previous) < iterateDelta`,
+    strictly, and at zero nothing satisfies it — not even a value that
+    did not move. The transition table originally read the zero as
+    "iterate until nothing changes at all", which is a coherent thing to
+    want and is not what the spelling means; honouring it would need an
+    exception *inside* the comparison, and a comparison with an
+    exception in it is one two implementations will eventually disagree
+    about. So zero joins the same row as negative, which is also the
+    reasoning that already turns `iterateCount` zero into 100. Found by
+    the signed-zero fixture, which converged at 0.001 and did not at 0.
+2.  **The resource ceiling refuses only when it is STRICTLY lower.** At
+    equality the caller permitted exactly what the file asked for and
+    the file got it, so a refusal there would refuse a run nothing
+    actually constrained. The three fixtures — ceiling above, equal,
+    below — exist because only the middle one distinguishes this reading
+    from the obvious `<=`.
+3.  **Zero mutation is a rollback, not an absence of writing.**
+    Gauss–Seidel visibility means a pass has to publish as it goes, so
+    "the refusal wrote nothing" cannot be true by construction. Every
+    publish is journalled and a refusal retracts them in reverse, and
+    `Host.retract` is infallible for that reason: a rollback that could
+    run out of memory would make the promise conditional on there being
+    memory to keep it. The fixture asserts `publishes == retracts` as
+    well as the empty state, because an engine that never wrote would
+    pass the second assertion and fail the first.
+4.  **The §5.6d key has four terms and deliberately no component.** The
+    obvious spelling of "SCC-pass" is the component beside the pass
+    number, and it is wrong exactly where §5.6e is: a changed SCC resets
+    its pass counter and re-seeds, so the same cell re-runs pass 1 while
+    belonging to a different component. With a component term that is a
+    new key and a fresh draw — and §5.6e says in as many words that a
+    discovery pass must not perturb a result. The path already names the
+    cell.
+5.  **`CallCtx.draw` became fallible, because a memo has to be stored
+    somewhere.** The alternative — swallowing the allocation failure and
+    drawing afresh — would let an out-of-memory condition silently
+    change a result, which is the exact class of bug the memo exists to
+    prevent.
+6.  **The fixpoint test is on the graph, not on the edge set.** A read
+    the static walk already found produces the same edge, so a workbook
+    with no dynamic reference reports edges the graph already had;
+    comparing edge sets would call that a change and cost every ordinary
+    workbook a second pass. Terminating on graph identity is also sound
+    rather than merely cheap: if rebuilding with what was actually read
+    yields the same condensation, every dependency is already in the
+    order the run used, and every cell downstream of a value that moved
+    re-ran.
+7.  **The captured edge set is per-pass, not cumulative** — and that is
+    what makes §5.6e's "split" and "lost edges" possible at all. An
+    accumulating set can never lose an edge, so a component could never
+    split and a reference that stopped pointing somewhere would keep an
+    edge nothing reads. An owner the pass skipped keeps what it last
+    reported, because "not re-evaluated" and "reads nothing" are
+    different facts.
+8.  **A component's signature keeps its INTRA-component edges.**
+    Filtering them out as "implied by the member list" is wrong for the
+    case §5.6e is about: a one-node component is cyclic when the node
+    depends on itself and acyclic when it does not, and those are the
+    same member list. `INDIRECT` closing a self-reference is precisely
+    that, and the filtered signature made the flip invisible to the
+    comparison that has to see it.
+9.  **A closure is held as ROOTS and re-derived every pass.** Held as
+    component ids it freezes at whatever the discovery pass could see,
+    and `A1=INDIRECT("C1")` then reorders a component it declines to
+    run. Two consequences follow: `graph.plan` gained an `iterating`
+    option (M5a1 hardcoded "cycles refuse" because there was no engine
+    to hand one to) and a `charge_evals` option, since the engine
+    re-plans per pass and charges per *evaluation* — the number §9
+    actually bounds for an iterating run is passes times members.
+10. **"Unchanged" is only a reason to skip a component that ran.** A
+    dynamic edge can pull a component into the closure without changing
+    anything about the component itself, and skipping it there leaves
+    the cell the new edge points at unevaluated — the one state the
+    rebuild existed to fix.
+11. **`WorkbookEnv.formulaAt` was reading the merged view, and a second
+    pass would have found no formula.** A computed-layer entry is a
+    value a run produced; it shadows lower layers for `cellValue`
+    because that is what the precedence means, and it carries no `<f>`
+    because a run does not author formulas. M5a1 could never observe it
+    — it evaluated each cell once and published after — and the first
+    iterating fixture converged in two passes on a cell that had
+    silently become blank. A body is now looked up across layers, which
+    is what "the formula at this coordinate" always meant.
+12. **`OFFSET` ships Microsoft's documented contract, and says so.**
+    Height and width are documented as positive numbers, so zero and
+    negative are `#VALUE!`. Excel 365 has since grown an undocumented
+    reverse-extent behaviour for negatives; with the Excel oracle leg
+    parked there is no evidence for it here, and implementing a
+    behaviour no committed manifest records would be a claim about
+    Excel this repo cannot back. `INDIRECT`'s R1C1 request is the
+    mirror-image decision: it refuses as a *construct* rather than
+    answering `#REF!`, because the text was not malformed — it was
+    R1C1, which v1 refuses in written formulas too.
+13. **A declared array range is bounded by the GRID, not by
+    `max_matrix_cells`.** `A1:D1048576` is 4 194 304 cells against a
+    4 000 000 limit, so §5.6c's "zero-filled that shape" seed can be
+    handed a shape it cannot build — which made the obvious
+    `unreachable` a workbook-reachable crash. It is a §9 refusal
+    (`seed_shape_too_large` → `FormulaLimitExceeded`), with the
+    one-column-narrower case fixtured beside it so the refusal is the
+    limit rather than the construct. The same reasoning turned the
+    engine's `assert(max_dynamic_passes >= 1)` into a refusal:
+    `WorkLimits.validate` rejects a zero, but the engine is reachable
+    without a validated set, and a caller-supplied number must not be
+    able to trip an assertion.
+
 ---
 
 ## 8. Testing & oracles
@@ -2812,7 +2940,7 @@ adds a TEXT-heavy bench; M9d adds a mixed full-registry workload
 | workbook materialization | **`max_workbook_compressed_bytes` 1 GiB; `max_workbook_decompressed_bytes` 4 GiB; `max_modeled_cells` 64M** — PartStore allocations (own arena, 512 MiB/part, `store.zig:105-129,1340-1384`) sit outside `max_run_arena_bytes`; early-refusal tests | pre-model refusal |
 | retained generations | `max_retained_generations` 4; **`max_retained_generation_bytes` 2 GiB; `max_retained_fds` 16** — in resolved limits + fingerprints; projected retention **preflighted before allocating or swapping** | pre-swap refusal |
 | aggregates — **bytes** (counted allocator) | `max_run_arena_bytes` **1 GiB**, live matrix cells 8M, string payload 256 MiB, retained ASTs 128 MiB, diagnostics 1 MiB — defaults; hard maxima 4× each; caller-adjustable via `ResourceLimits` (M3b, `src/formula/run_inputs.zig` — a **separate struct from `parser.Limits`**, which bounds parse shape); resolved values echoed + fingerprinted. An exhausted category is `FormulaLimitExceeded`, never a bare `OutOfMemory`: the budget records which one tripped. `matrix_cells` is charged as a **count**, so the limit does not depend on `@sizeOf(ScalarValue)` | byte accounting; below/at/above per category |
-| aggregates — **work** (explicit checked counters; can burn CPU without allocating) | `max_total_cell_evals` **50M**, dependency edges 50M, `max_scc_iterations` = **caller RESOURCE ceiling only, default 32 767 (hard max 32 767)** — never conflated with the workbook's semantic `calcPr@iterateCount`: hitting `iterateCount` = success + non-converged, hitting a lower caller ceiling = `FormulaLimitExceeded` + zero mutation (§5.6c), `max_dynamic_passes` default 3 (caller-adjustable, hard max 10), sort/comparison ops 500M — defaults; hard maxima 4× unless stated; caller-adjustable **in Zig/C only — CLI and Python fix limits at defaults in v1 (declared, no flags)**; resolved values echoed + fingerprinted | decrement sites named per counter; below/at/above boundary tests |
+| aggregates — **work** (explicit checked counters; can burn CPU without allocating) | `max_total_cell_evals` **50M**, dependency edges 50M, `max_scc_iterations` = **caller RESOURCE ceiling only, default 32 767 (hard max 32 767)** — never conflated with the workbook's semantic `calcPr@iterateCount`: hitting `iterateCount` = success + non-converged, hitting a lower caller ceiling = `FormulaLimitExceeded` + zero mutation (§5.6c), `max_dynamic_passes` default 3 (caller-adjustable, hard max 10), sort/comparison ops 500M — defaults; hard maxima 4× unless stated; caller-adjustable **in Zig/C only — CLI and Python fix limits at defaults in v1 (declared, no flags)**; resolved values echoed + fingerprinted. **Three shapes of bound, classified (M5a2 `WorkCategory.kind`)**: a *total* only grows (`dependency_edges`, `total_cell_evals`), a *depth* unwinds (`eval_depth`), and a **per-scope** bound is re-counted from zero in every scope it governs (`scc_iterations`, `dynamic_passes`) — §5.6c gives each SCC its own pass counter, so accumulating passes into one running total would refuse a workbook whose every component iterated legally; `WorkCounters.charge` rejects a per-scope category, and the engine that owns the scope reads the limit instead | decrement sites named per counter; below/at/above boundary tests |
 
 ---
 

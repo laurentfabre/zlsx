@@ -1323,6 +1323,7 @@ pub const Workbook = struct {
         // graph with those cells quietly missing.
         var g = switch (try engine.graph.build(allocator, input, bridge.resolver(), .{
             .parse_limits = opts.parse_limits,
+            .limits = opts.work_limits,
         })) {
             .ok => |x| x,
             .refused => |r| return .{ .graph_refused = r },
@@ -1360,33 +1361,65 @@ pub const Workbook = struct {
             .array_formula = opts.array_formula,
         }, target_ast);
 
-        var counters: engine.graph.WorkCounters = .{};
-        const plan = switch (try engine.graph.plan(g, a, roots, &counters)) {
-            .ok => |p| p,
+        var counters: engine.graph.WorkCounters = .{ .limits = opts.work_limits };
+        // Planned here as well as inside the engine, and the duplication
+        // is deliberate: this call is where a cycle with iteration off
+        // becomes a `graph_refused`, which is the answer M5a1 gave and
+        // the answer §5.6c still requires. It is also the §9 charge
+        // site — the engine re-plans once per §5.6e pass and does not
+        // charge, because it charges per evaluation instead.
+        switch (try engine.graph.plan(g, a, roots, &counters, .{
+            .iterating = model.calc.iterate,
+        })) {
+            .ok => {},
             .refused => |r| return .{ .graph_refused = r },
-        };
-
-        // Every planned cell, in the graph's order, into the computed
-        // layer. `putComputed` writes to the model — which is scratch,
-        // built from the package and thrown away at this function's
-        // `defer` — never to the workbook.
-        for (plan.cells) |node| {
-            const cell = g.keys[node].cell;
-            // The node came from this model's own cells, so the sheet
-            // exists; the read cannot fail for any other reason either.
-            const text = (model.formulaAt(cell) catch |e| switch (e) {
-                error.OutOfMemory => return Error.OutOfMemory,
-                else => return Error.SheetNotFound,
-            }) orelse continue;
-            const v = switch (try self.evaluateOne(a, &model, cell, text, opts)) {
-                .ok => |x| x,
-                .refused => |r| return r,
-            };
-            model.putComputed(cell.sheet, cell.row, cell.col, v) catch |e| switch (e) {
-                error.OutOfMemory => return Error.OutOfMemory,
-                else => return Error.SheetNotFound,
-            };
         }
+
+        // M5a2: the planned components, through the iteration engine.
+        // The engine writes into the model's computed layer — which is
+        // scratch, built from the package and thrown away at this
+        // function's `defer` — never into the workbook. A cyclic
+        // component gets §5.6c's pass counter; an acyclic one evaluates
+        // once, which is exactly what the loop here used to do.
+        var driver: ClosureDriver = .{
+            .wb = self,
+            .model = &model,
+            .arena = a,
+            .opts = opts,
+        };
+        var schedule: engine.draws.Schedule = .{};
+        defer schedule.deinit(allocator);
+
+        const run = try engine.iterate.run(allocator, g, driver.host(), .{
+            .limits = opts.work_limits,
+            .settings = .{
+                .iterate = model.calc.iterate,
+                .iterate_count = model.calc.iterate_count,
+                .iterate_delta = model.calc.iterate_delta,
+            },
+            .schedule = &schedule,
+            .counters = &counters,
+            // The ROOTS, so a §5.6e rebuild re-derives the closure: a
+            // dynamic reference reaches cells no static walk found, and
+            // the closure that did not contain them before the rebuild
+            // has to contain them after it.
+            .closure = .{ .roots = roots, .iterating = model.calc.iterate },
+            .rebuild = .{ .input = input, .resolver = bridge.resolver() },
+        });
+        switch (run) {
+            .ok => |report| {
+                var r = report;
+                r.deinit(allocator);
+            },
+            .refused => |r| {
+                // A refusal the host raised carries the richer diagnosis
+                // the engine's plane cannot; a refusal the engine raised
+                // itself is complete as it stands.
+                if (driver.refusal) |detail| return detail;
+                return .{ .iteration_refused = r };
+            },
+        }
+        if (driver.failure) |e| return e;
 
         const target = switch (try self.evaluateTarget(a, &model, sheet_index, target_ast, opts)) {
             .ok => |x| x,
@@ -1397,8 +1430,107 @@ pub const Workbook = struct {
         return .{ .ok = .{ .arena = arena, .value = target } };
     }
 
+    /// M5a2: the package's implementation of §5.6c's evaluation seam.
+    ///
+    /// Two error channels rather than one, because the engine's is
+    /// deliberately narrow: `Host.evaluate` may only fail with
+    /// `OutOfMemory`, so a workbook refusal that carries a name or a 3D
+    /// diagnosis is parked here and read back after the run. Collapsing
+    /// it into the engine's `PlaneTwo` would lose exactly the part of a
+    /// refusal a caller can act on.
+    const ClosureDriver = struct {
+        wb: *Workbook,
+        model: *WorkbookEnv,
+        arena: Allocator,
+        opts: EvaluateOptions,
+        /// A plane-2 refusal with its detail intact.
+        refusal: ?EvaluateResult = null,
+        /// A package-level failure that is not a refusal at all.
+        failure: ?Error = null,
+
+        fn host(self: *ClosureDriver) engine.iterate.Host {
+            return .{ .ctx = self, .vtable = &host_vtable };
+        }
+
+        const host_vtable: engine.iterate.Host.VTable = .{
+            .evaluate = vtEvaluate,
+            .publish = vtPublish,
+            .retract = vtRetract,
+        };
+
+        fn of(ctx: *anyopaque) *ClosureDriver {
+            return @ptrCast(@alignCast(ctx));
+        }
+
+        fn vtEvaluate(
+            ctx: *anyopaque,
+            cell: engine.env.CellRef,
+            key: engine.draws.Key,
+        ) error{OutOfMemory}!engine.iterate.Produced {
+            const self = of(ctx);
+            const text = (self.model.formulaAt(cell) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    self.failure = Error.SheetNotFound;
+                    return .{ .ok = .{ .value = .{ .scalar = .blank } } };
+                },
+            }) orelse return .{ .ok = .{ .value = .{ .scalar = .blank } } };
+
+            const one = self.wb.evaluateOne(self.arena, self.model, cell, text, self.opts, key) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    self.failure = e;
+                    return .{ .ok = .{ .value = .{ .scalar = .blank } } };
+                },
+            };
+            return switch (one) {
+                .refused => |r| blk: {
+                    self.refusal = r;
+                    break :blk .{ .refused = planeOfRefusal(r) };
+                },
+                .ok => |x| .{ .ok = .{ .value = .{ .scalar = x.value }, .reads = x.reads } },
+            };
+        }
+
+        fn vtPublish(
+            ctx: *anyopaque,
+            cell: engine.env.CellRef,
+            v: engine.iterate.Snapshot,
+        ) error{OutOfMemory}!void {
+            const self = of(ctx);
+            // An array's readable value at its anchor is its top-left
+            // (§5.3b); placing the tails is M7a's.
+            const scalar = switch (v) {
+                .scalar => |s| s,
+                .array => |m| m.topLeft(),
+            };
+            self.model.putComputed(cell.sheet, cell.row, cell.col, scalar) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => self.failure = Error.SheetNotFound,
+            };
+        }
+
+        fn vtRetract(ctx: *anyopaque, cell: engine.env.CellRef) void {
+            of(ctx).model.clearComputed(cell.sheet, cell.row, cell.col);
+        }
+    };
+
+    /// The plane a package refusal reaches the engine as. The engine
+    /// only ever stops the run on it; the detail travels separately.
+    fn planeOfRefusal(r: EvaluateResult) engine.decode.PlaneTwo {
+        return switch (r) {
+            .parse_refused => .FormulaMalformedInput,
+            .eval_refused => |e| e.plane,
+            .graph_refused => |g| g.planeTwo(),
+            else => .FormulaMalformedInput,
+        };
+    }
+
     const OneCell = union(enum) {
-        ok: engine.value.ScalarValue,
+        ok: struct {
+            value: engine.value.ScalarValue,
+            reads: engine.iterate.Reads,
+        },
         refused: EvaluateResult,
     };
 
@@ -1409,6 +1541,7 @@ pub const Workbook = struct {
         cell: engine.env.CellRef,
         text: []const u8,
         opts: EvaluateOptions,
+        key: engine.draws.Key,
     ) Error!OneCell {
         _ = self;
         var parsed = try engine.parser.parse(a, text, .{ .limits = opts.parse_limits });
@@ -1442,7 +1575,12 @@ pub const Workbook = struct {
             .site = .{ .row = cell.row, .col = cell.col },
             .names = resolution.resolver(),
             .limits = opts.parse_limits,
+            // §5.6d: the invocation path is rooted at the owning cell,
+            // and the pass number travels with the key the engine
+            // supplied.
+            .draw_path = key.path,
         });
+        evaluator.opts.draws.key = key;
         defer evaluator.deinit();
 
         const v = evaluator.evaluate(ast) catch |e| {
@@ -1453,7 +1591,15 @@ pub const Workbook = struct {
                 .three_d = evaluator.last_three_d,
             } } };
         };
-        return .{ .ok = try cloneScalar(a, scalarOf(v)) };
+        // §5.6e's runtime capture: what the body ACTUALLY read, which is
+        // the only place a dynamic reference is visible.
+        return .{ .ok = .{
+            .value = try cloneScalar(a, scalarOf(v)),
+            .reads = .{
+                .cells = try a.dupe(engine.env.CellRef, evaluator.deps.cells.items),
+                .areas = try a.dupe(engine.env.RangeRef, evaluator.deps.areas.items),
+            },
+        } };
     }
 
     const OneValue = union(enum) {
@@ -7822,6 +7968,16 @@ pub const EvaluateOptions = struct {
     /// structs because they bound two different things, and M2 named
     /// the second one before the first existed.
     parse_limits: engine.parser.Limits = .{},
+    /// §9's bounds on *work done* — dependency edges, cell evaluations,
+    /// closure depth, and M5a2's two iteration ceilings.
+    ///
+    /// Caller-adjustable in Zig and C only; the CLI and Python fix all
+    /// of these at their defaults in v1. The default
+    /// `max_scc_iterations` is Excel's own maximum `iterateCount`, so
+    /// out of the box this cannot be the bound that fires first — a
+    /// caller has to lower it deliberately to make a resource ceiling
+    /// beat the workbook's own request (§5.6c).
+    work_limits: engine.iterate.WorkLimits = .{},
 };
 
 /// One evaluation's result, and the arena that owns every byte of it.
@@ -7846,6 +8002,14 @@ pub const EvaluateResult = union(enum) {
     /// a malformed cache seed, a §9 work limit — all statements about
     /// the workbook, raised before a single cell was recomputed.
     graph_refused: engine.graph.Refusal,
+    /// M5a2: the iteration engine refused. A caller ceiling that bound
+    /// before the workbook's own `iterateCount` (§5.6c), or an outer
+    /// loop that never reached a fixpoint (§5.6e). Separate from
+    /// `graph_refused` because these are statements about the RUN — the
+    /// graph built fine and the schedule is what could not finish — and
+    /// because both come with zero mutation, which a caller may want to
+    /// rely on by name rather than by plane.
+    iteration_refused: engine.iterate.Refusal,
     /// It parsed and the evaluator refused it (§10, plane 2). The two
     /// resolvers' typed reasons ride along, because the plane alone
     /// cannot say *which* name or *which* 3D rule.
@@ -8407,10 +8571,28 @@ pub const WorkbookEnv = struct {
     /// no engine. Not part of `EvalEnv` — the evaluator reads *values*
     /// through the interface; formulas are the model builder's business
     /// (M5a) and this is where it will get them.
+    /// The formula body at a coordinate, from whichever layer carries
+    /// one.
+    ///
+    /// **Not** the merged read, and the difference is the difference
+    /// between a body and a value. A computed layer entry is a value the
+    /// run produced; it shadows lower layers for `cellValue` because
+    /// that is what "computed > staged > stored" means, and it carries
+    /// no `<f>` because a run does not author formulas. Asking the
+    /// merged view for a body therefore returns null the moment anything
+    /// publishes at that coordinate — which M5a1 could never observe,
+    /// since it evaluated each cell exactly once and published after.
+    /// M5a2 evaluates the same cell once per pass, and the second pass
+    /// would have found no formula to run.
     pub fn formulaAt(self: *WorkbookEnv, cell: engine.env.CellRef) engine.env.Error!?[]const u8 {
         const sheet = try self.sheetConst(cell.sheet);
-        const m = merged(sheet, cell.row, cell.col) orelse return null;
-        return m.formula_text;
+        var at = lowerBound(sheet.cells.items, cell.row, cell.col, .computed);
+        while (at < sheet.cells.items.len) : (at += 1) {
+            const c = sheet.cells.items[at];
+            if (c.row != cell.row or c.col != cell.col) break;
+            if (c.formula_text) |t| return t;
+        }
+        return null;
     }
 
     /// Whether a coordinate holds a formula cell whose cached value is
@@ -8439,6 +8621,28 @@ pub const WorkbookEnv = struct {
             .layer = .computed,
             .v = try dupeValue(a, v, false),
         });
+    }
+
+    /// Remove one coordinate from the computed layer.
+    ///
+    /// Infallible, because it is what a rolled-back run calls (§5.6c's
+    /// "zero mutation"): a rollback that could fail would make the
+    /// promise conditional on there being memory to keep it. Lower
+    /// layers are untouched, so retracting a computed value uncovers the
+    /// stored one — the state a refusal leaves behind is the state it
+    /// started from.
+    pub fn clearComputed(
+        self: *WorkbookEnv,
+        sheet: engine.env.SheetIndex,
+        row: coords.Row,
+        col: coords.Col,
+    ) void {
+        const s = self.sheetMut(sheet) catch return;
+        const at = lowerBound(s.cells.items, row, col, .computed);
+        if (at >= s.cells.items.len) return;
+        const cur = s.cells.items[at];
+        if (cur.row != row or cur.col != col or cur.layer != .computed) return;
+        _ = s.cells.orderedRemove(at);
     }
 
     pub fn evalEnv(self: *WorkbookEnv) engine.env.EvalEnv {
@@ -16776,4 +16980,281 @@ test "checkAllAllocationFailures: closure evaluation leaks nothing, and still mu
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, H.run, .{});
+}
+
+// ─── M5a2: the iteration engine, through the package ─────────────
+
+/// A workbook whose `<calcPr>` says what §5.6c needs it to say. The
+/// helper takes the element where defined names go, and the schema puts
+/// `<calcPr>` after them — one string covers both.
+fn m5a2CalcPr(iterate: bool, count: u32, delta: []const u8) [128]u8 {
+    var buf: [128]u8 = @splat(0);
+    _ = std.fmt.bufPrint(
+        &buf,
+        "<calcPr iterate=\"{s}\" iterateCount=\"{d}\" iterateDelta=\"{s}\"/>",
+        .{ if (iterate) "true" else "false", count, delta },
+    ) catch unreachable;
+    return buf;
+}
+
+fn m5a2Workbook(
+    allocator: Allocator,
+    io: std.Io,
+    body: []const u8,
+    calc_pr: []const u8,
+) !Workbook {
+    const sheet = try m4b3Sheet(allocator, body);
+    defer allocator.free(sheet);
+    return testWorkbookFromPartsWithNames(
+        allocator,
+        io,
+        &.{.{ .name = "S", .body = sheet }},
+        null,
+        calc_pr,
+    );
+}
+
+test "M5a2: a cycle a workbook asks to iterate is scheduled, not refused" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // §5.6c's parity formula, uncached: the seed table's zero, then ten
+    // passes, then a value within `iterateDelta` of where the eleventh
+    // would land.
+    const pr = m5a2CalcPr(true, 100, "0.001");
+    var wb = try m5a2Workbook(
+        ta,
+        io,
+        "<row r=\"1\"><c r=\"A1\"><f>(A1+1)/2</f></c></row>",
+        std.mem.sliceTo(&pr, 0),
+    );
+    defer wb.deinit();
+
+    var r = try wb.evaluateClosure(ta, 0, "A1", .{ .collation = test_collation });
+    defer r.deinit();
+    try std.testing.expectApproxEqAbs(
+        1 - std.math.pow(f64, 2, -10),
+        r.ok.value.scalar.number,
+        1e-12,
+    );
+
+    // The same workbook with iteration OFF is M5a1's answer, unchanged.
+    const off = m5a2CalcPr(false, 100, "0.001");
+    var wb_off = try m5a2Workbook(
+        ta,
+        io,
+        "<row r=\"1\"><c r=\"A1\"><f>(A1+1)/2</f></c></row>",
+        std.mem.sliceTo(&off, 0),
+    );
+    defer wb_off.deinit();
+    var refused = try wb_off.evaluateClosure(ta, 0, "A1", .{ .collation = test_collation });
+    defer refused.deinit();
+    try std.testing.expectEqual(engine.graph.Refusal.Reason.cycle, refused.graph_refused.reason);
+}
+
+test "M5a2: a caller ceiling below the workbook's iterateCount refuses the run" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const pr = m5a2CalcPr(true, 50, "0.001");
+    var wb = try m5a2Workbook(
+        ta,
+        io,
+        "<row r=\"1\"><c r=\"A1\"><f>A1+1</f></c></row>",
+        std.mem.sliceTo(&pr, 0),
+    );
+    defer wb.deinit();
+
+    // Above and equal are the workbook's bound: success, non-converged.
+    for ([_]u64{ 50, 80 }) |ceiling| {
+        var ok = try wb.evaluateClosure(ta, 0, "A1", .{
+            .collation = test_collation,
+            .work_limits = .{ .max_scc_iterations = ceiling },
+        });
+        defer ok.deinit();
+        try std.testing.expectEqual(@as(f64, 50), ok.ok.value.scalar.number);
+    }
+
+    // Below is the caller's, and §9's limits are plane-2 refusals at
+    // every layer.
+    var refused = try wb.evaluateClosure(ta, 0, "A1", .{
+        .collation = test_collation,
+        .work_limits = .{ .max_scc_iterations = 5 },
+    });
+    defer refused.deinit();
+    try std.testing.expectEqual(
+        engine.iterate.Refusal.Reason.scc_iteration_ceiling,
+        refused.iteration_refused.reason,
+    );
+    try std.testing.expectEqual(
+        engine.decode.PlaneTwo.FormulaLimitExceeded,
+        refused.iteration_refused.planeTwo(),
+    );
+}
+
+test "M5a2: the iteration engine mutates neither logical state nor serialized bytes" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // A cache of 999 that no outcome may overwrite, beside a cycle whose
+    // behaviour each leg below changes with nothing but its options.
+    const body =
+        "<row r=\"1\">" ++
+        "<c r=\"A1\"><f>A1+1</f><v>999</v></c>" ++
+        "<c r=\"B1\"><f>A1*2</f><v>888</v></c>" ++
+        "</row>";
+    const pr = m5a2CalcPr(true, 4, "0.001");
+    var wb = try m5a2Workbook(ta, io, body, std.mem.sliceTo(&pr, 0));
+    defer wb.deinit();
+
+    const before = try partSnapshot(ta, &wb);
+    defer freeSnapshot(ta, before);
+
+    // 1. Non-convergence. A success, and the workbook's own bound
+    //    decided it: 999 seeded, four passes, 1003.
+    {
+        var r = try wb.evaluateClosure(ta, 0, "B1", .{ .collation = test_collation });
+        defer r.deinit();
+        try std.testing.expectEqual(@as(f64, 2006), r.ok.value.scalar.number);
+        try expectSnapshotUnchanged(ta, &wb, before);
+    }
+
+    // 2. Convergence. Same workbook, a tolerance nothing can miss.
+    {
+        var r = try wb.evaluateClosure(ta, 0, "B1", .{
+            .collation = test_collation,
+            .work_limits = .{ .max_scc_iterations = 32_767 },
+        });
+        defer r.deinit();
+        try expectSnapshotUnchanged(ta, &wb, before);
+    }
+
+    // 3. Refusal, raised after four passes had already published.
+    {
+        var r = try wb.evaluateClosure(ta, 0, "B1", .{
+            .collation = test_collation,
+            .work_limits = .{ .max_scc_iterations = 2 },
+        });
+        defer r.deinit();
+        try std.testing.expect(r == .iteration_refused);
+        try expectSnapshotUnchanged(ta, &wb, before);
+    }
+
+    // 4. Injected allocation failure, at every step a run can reach one.
+    //    The parts are bytes the store owns and the engine never touches
+    //    — which is the point: purity here is structural, and this is
+    //    what proves the structure holds when the run dies partway.
+    {
+        var i: usize = 0;
+        while (i < 400) : (i += 1) {
+            var failing = std.testing.FailingAllocator.init(ta, .{ .fail_index = i });
+            var r = wb.evaluateClosure(failing.allocator(), 0, "B1", .{
+                .collation = test_collation,
+            }) catch |e| {
+                try std.testing.expectEqual(error.OutOfMemory, e);
+                try expectSnapshotUnchanged(ta, &wb, before);
+                continue;
+            };
+            r.deinit();
+            try expectSnapshotUnchanged(ta, &wb, before);
+        }
+    }
+
+    // …and the caches the workbook shipped with are still the caches it
+    // shipped with, read through the cache-first entry point.
+    var cached = try wb.evaluate(ta, 0, "A1", .{ .collation = test_collation });
+    defer cached.deinit();
+    try std.testing.expectEqual(@as(f64, 999), cached.ok.value.scalar.number);
+}
+
+test "M5a2: a dynamic reference is ordered by the outer loop, through the package" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // `A1` reads `C1` through text no walk over the body could resolve,
+    // and `C1` sorts after it — so the static order evaluates `A1`
+    // first, reads a stale `C1`, and only the rebuild fixes it.
+    const body =
+        "<row r=\"1\">" ++
+        "<c r=\"A1\"><f>INDIRECT(\"C1\")*2</f></c>" ++
+        "<c r=\"C1\"><f>21</f></c>" ++
+        "</row>";
+    const pr = m5a2CalcPr(false, 100, "0.001");
+    var wb = try m5a2Workbook(ta, io, body, std.mem.sliceTo(&pr, 0));
+    defer wb.deinit();
+
+    const before = try partSnapshot(ta, &wb);
+    defer freeSnapshot(ta, before);
+
+    var r = try wb.evaluateClosure(ta, 0, "A1", .{ .collation = test_collation });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(f64, 42), r.ok.value.scalar.number);
+    try expectSnapshotUnchanged(ta, &wb, before);
+}
+
+test "M5a2: one SCC hitting the ceiling refuses the whole run, on the bytes" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // `A1` converges on pass 10 (§5.6c's parity formula); `C1` never
+    // converges. Both cycles are under one `iterateCount`, and the
+    // ceiling sits between what one needs and what the other would.
+    const body =
+        "<row r=\"1\">" ++
+        "<c r=\"A1\"><f>(A1+1)/2</f></c>" ++
+        "<c r=\"C1\"><f>C1+1</f></c>" ++
+        "<c r=\"E1\"><f>A1+C1</f></c>" ++
+        "</row>";
+    const pr = m5a2CalcPr(true, 100, "0.001");
+    var wb = try m5a2Workbook(ta, io, body, std.mem.sliceTo(&pr, 0));
+    defer wb.deinit();
+
+    const before = try partSnapshot(ta, &wb);
+    defer freeSnapshot(ta, before);
+
+    // A ceiling of 20 is above what `A1` needs and below what the
+    // workbook asked for, so `A1` converges and `C1` is the component
+    // that trips it.
+    var refused = try wb.evaluateClosure(ta, 0, "E1", .{
+        .collation = test_collation,
+        .work_limits = .{ .max_scc_iterations = 20 },
+    });
+    defer refused.deinit();
+    try std.testing.expectEqual(
+        engine.iterate.Refusal.Reason.scc_iteration_ceiling,
+        refused.iteration_refused.reason,
+    );
+    // The component that tripped, named — and it is not the one that
+    // reached its answer.
+    try std.testing.expect(refused.iteration_refused.at.?.eql(.{ .cell = .{
+        .sheet = engine.env.SheetIndex.fromInt(0),
+        .row = try coords.Row.fromOneBased(1),
+        .col = try coords.Col.fromZeroBased(2),
+    } }));
+    // The whole run rolled back, `A1`'s converged value with it.
+    try expectSnapshotUnchanged(ta, &wb, before);
+
+    // …and a ceiling above what the workbook asked for is a success, so
+    // the refusal above was the ceiling and not the workbook.
+    var ok = try wb.evaluateClosure(ta, 0, "E1", .{
+        .collation = test_collation,
+        .work_limits = .{ .max_scc_iterations = 32_767 },
+    });
+    defer ok.deinit();
+    try std.testing.expectApproxEqAbs(
+        (1 - std.math.pow(f64, 2, -10)) + 100,
+        ok.ok.value.scalar.number,
+        1e-9,
+    );
+    try expectSnapshotUnchanged(ta, &wb, before);
 }

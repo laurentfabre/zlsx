@@ -56,6 +56,11 @@ const value = @import("value.zig");
 const env = @import("env.zig");
 const registry = @import("registry.zig");
 const run_inputs = @import("run_inputs.zig");
+/// §5.6d's draw schedule. A leaf below this file and below the iteration
+/// engine both, because a draw's key is half in-body (which callsite,
+/// which element — this file's) and half run-level (whose body, which
+/// pass — the engine's).
+const draw_schedule = @import("draws.zig");
 /// Test-only, for M4f: the ST_Xstring codec, so a round-trip can start
 /// from text a formula PRODUCED rather than from a hand-written string.
 /// A file-scope const referenced only from a `test` block is not
@@ -201,15 +206,42 @@ pub const not_yet_implemented = [_][]const u8{};
 /// The counter lives in the seam rather than in a test double on
 /// purpose: "zero draws in the dead branch" is then a statement about
 /// the evaluator, not about how carefully a fixture was wired. M3b
-/// replaces the callback with `rng_v1` seeded from `RunInputs`; the
-/// counter and its meaning do not change.
+/// replaced the callback with `rng_v1` seeded from `RunInputs`; the
+/// counter and its meaning did not change.
+///
+/// M5a2 adds §5.6d's **schedule**. Without one this is what it always
+/// was — every reach draws. With one, a draw is first a *lookup*: the
+/// evaluator maintains `key`'s in-body terms (which callsite, which
+/// element) and whoever runs the evaluator maintains the run's terms
+/// (whose body, which pass), so a second reach at the same key returns
+/// the same number. That is the property §5.6e needs and cannot get any
+/// other way: a graph rebuild re-walks bodies that already drew, and if
+/// they drew again a discovery pass would change an answer.
 pub const DrawSource = struct {
     ctx: *anyopaque,
     draw_fn: *const fn (ctx: *anyopaque) f64,
     count: u64 = 0,
+    /// §5.6d's memo, when the caller wired one. Null is not a degraded
+    /// mode: a single non-iterating evaluation reaches every callsite
+    /// once, so there is nothing for a memo to decide.
+    schedule: ?*draw_schedule.Schedule = null,
+    /// Where the memo lives. Required exactly when `schedule` is set.
+    gpa: ?std.mem.Allocator = null,
+    /// The key the evaluator is currently at. `path`, `component` and
+    /// `pass` belong to whoever drives the evaluator; `callsite` and
+    /// `element` are maintained here.
+    key: draw_schedule.Key = .{},
 
-    pub fn draw(self: *DrawSource) f64 {
+    /// A draw can now fail, because a memo has to be stored somewhere.
+    /// The alternative — swallowing the allocation failure and drawing
+    /// afresh — would make an out-of-memory condition silently change a
+    /// result, which is exactly the class of bug the memo exists to
+    /// prevent.
+    pub fn draw(self: *DrawSource) error{OutOfMemory}!f64 {
         self.count += 1;
+        if (self.schedule) |s| {
+            return s.valueFor(self.gpa.?, self.key, self.ctx, self.draw_fn);
+        }
         const v = self.draw_fn(self.ctx);
         assert(std.math.isFinite(v));
         return v;
@@ -346,6 +378,13 @@ pub const Options = struct {
     /// It lives here rather than in `Limits` because `Limits` is M2's
     /// parse-limit struct; §9's aggregate-limit consolidation is M3b's.
     max_expr_depth: usize = 1024,
+    /// §5.6d's invocation-path root — which owner's body this is.
+    ///
+    /// A recalc passes `draw_schedule.Key.ofCell(…)` for each stored cell it
+    /// evaluates; a standalone `evaluate` leaves the constant root,
+    /// because a formula with no cell has no coordinate to be keyed by
+    /// and inventing one would collide with whatever really lives there.
+    draw_path: u64 = draw_schedule.Key.root,
     /// The §9 byte budget, when the caller wired one — normally by
     /// building the run arena over `Budget.allocator(.run_arena)`.
     ///
@@ -404,6 +443,12 @@ pub const Evaluator = struct {
         self.sheet = self.opts.current_sheet;
         self.depth = 0;
         self.name_depth = 0;
+        // The run-level terms of §5.6d's key (`component`, `pass`)
+        // belong to whoever drives this evaluator and are left alone;
+        // the body-level ones start where this body starts.
+        self.opts.draws.key.path = self.opts.draw_path;
+        self.opts.draws.key.callsite = 0;
+        self.opts.draws.key.element = 0;
         // §5.6g's context legality, **before** anything is evaluated —
         // which is what makes the same check usable pre-persist, where
         // there is no result yet to inspect.
@@ -484,10 +529,14 @@ pub const Evaluator = struct {
             // symbol layer says: `Table[Col]` needs the table's
             // geometry, which is M7b's, and answering `#NAME?` is the
             // answer M3a2 gave — not a new claim about tables.
-            .name => |n| try self.namedValue(n.raw),
+            // The node index travels with the spelling: §5.6d's
+            // invocation path descends by the *occurrence* of the
+            // reference that expanded, which is what makes the two `N`s
+            // of `A1=N+N` two paths rather than one.
+            .name => |n| try self.namedValue(n.raw, i),
             .structured => Value.err(.name),
             .qualified => |n| try self.qualified(n.sheet, n.target),
-            .call => |n| try self.call(n.callee, n.args),
+            .call => |n| try self.call(n.callee, n.args, i),
             .paren => |n| try self.evalNode(n.child),
             .unary => |n| try self.unary(n.op, n.child),
             .postfix => |n| try self.postfix(n.op, n.child),
@@ -690,7 +739,7 @@ pub const Evaluator = struct {
     /// over M2's exported array; what arrives here is one of three
     /// answers. A body is expanded inline — the interim shape, guarded
     /// by depth, until M5a makes bodies graph nodes.
-    fn namedValue(self: *Evaluator, spelling: []const u8) EvalError!Value {
+    fn namedValue(self: *Evaluator, spelling: []const u8, at: parser.Index) EvalError!Value {
         const resolver = self.opts.names orelse return Value.err(.name);
         const binding = try resolver.resolveName(self.sheet, spelling);
         return switch (binding) {
@@ -698,7 +747,7 @@ pub const Evaluator = struct {
             // §5.9's order reaches the table tier so a table can shadow
             // an `_xlnm.` builtin; evaluating one is M7b's.
             .table => error.UnsupportedConstruct,
-            .body => |b| self.expandName(b.text, b.scope),
+            .body => |b| self.expandName(b.text, b.scope, at),
         };
     }
 
@@ -706,12 +755,21 @@ pub const Evaluator = struct {
         self: *Evaluator,
         body: []const u8,
         scope: ?env.SheetIndex,
+        at: parser.Index,
     ) EvalError!Value {
         if (self.name_depth >= name_rules.max_name_expansion_depth) {
             return error.LimitExceeded;
         }
         self.name_depth += 1;
         defer self.name_depth -= 1;
+
+        // §5.6d: expansion descends the invocation path by the
+        // occurrence that expanded. The row is 0 — a defined name
+        // materializes nowhere, unlike a table producer, which is M7b's
+        // and is the only thing that will ever pass a non-zero row.
+        const outer_path = self.opts.draws.key.path;
+        self.opts.draws.key.path = draw_schedule.Key.descend(outer_path, at, 0);
+        defer self.opts.draws.key.path = outer_path;
 
         // Parsed into the run arena: a name body is a formula, and the
         // AST it produces lives exactly as long as the run does.
@@ -1244,10 +1302,23 @@ pub const Evaluator = struct {
 
     // ─── calls (§5.3a per-form contracts, §7 registry) ───────────
 
-    fn call(self: *Evaluator, callee: parser.Index, args: parser.ExtraSlice) EvalError!Value {
+    fn call(self: *Evaluator, callee: parser.Index, args: parser.ExtraSlice, site: parser.Index) EvalError!Value {
         const name_node = self.ast.node(callee);
         if (name_node != .name) return error.NotYetImplemented;
         const f = registry.lookup(name_node.name.bare) orelse return error.UnsupportedFunction;
+
+        // §5.6d's callsite ordinal. Set around the whole call, so a
+        // nested call restores it on the way out and the implementation
+        // always draws under its own index — `RAND()+RAND()` is two
+        // callsites, and `SUM(RAND(),RAND())` is two more.
+        const outer_site = self.opts.draws.key.callsite;
+        const outer_element = self.opts.draws.key.element;
+        self.opts.draws.key.callsite = site;
+        self.opts.draws.key.element = 0;
+        defer {
+            self.opts.draws.key.callsite = outer_site;
+            self.opts.draws.key.element = outer_element;
+        }
 
         const arg_nodes = self.ast.children(args);
         if (arg_nodes.len < f.arity.min) return error.MalformedInput;
@@ -1318,6 +1389,10 @@ pub const Evaluator = struct {
             while (r < shape.rows) : (r += 1) {
                 var c: u32 = 0;
                 while (c < shape.cols) : (c += 1) {
+                    // §5.6d's element ordinal. One call site, N results:
+                    // without this every element of a lifted volatile
+                    // would share a key and the array would be constant.
+                    self.opts.draws.key.element = r * shape.cols + c;
                     for (ops, 0..) |maybe_op, k| {
                         const op = maybe_op orelse continue;
                         const el = op.at(r, c) orelse value.incompatibleBroadcastFill();
@@ -1580,7 +1655,163 @@ pub const Evaluator = struct {
             .text => .{ .err = value.ScalarValue.errorOf(.value) },
         };
     }
+
+    /// A reference an implementation computed rather than a walk found.
+    ///
+    /// The **only** way `INDIRECT` and `OFFSET` produce one, and public
+    /// for exactly that reason: routing them through `refValue` is what
+    /// makes a dynamic reference note its dependency the same way a
+    /// written one does, which is in turn what lets §5.6e see it at all.
+    /// A second construction path would be a reference nothing captured.
+    pub fn computedReference(self: *Evaluator, area: env.RangeRef) EvalError!Value {
+        return self.refValue(area);
+    }
+
+    /// §7's `INDIRECT`: the area a piece of *text* denotes.
+    ///
+    /// Everything it can refuse is a value (`#REF!`) except one thing
+    /// that is a construct: R1C1. The tokenizer refuses `R1C1` wherever
+    /// it appears in a formula (v1 is A1-only), and `INDIRECT(t,FALSE)`
+    /// is a request for the same construct by another spelling — so it
+    /// gets the same answer rather than a `#REF!` that would imply the
+    /// text was malformed. It was not; it was R1C1.
+    pub fn referenceFromText(self: *Evaluator, text: []const u8) EvalError!Value {
+        const split = splitSheetPrefix(text) orelse return Value.err(.ref);
+        var sheet = self.sheet;
+        if (split.sheet) |raw| {
+            const name = unquoteSheetSpelling(raw) orelse return Value.err(.ref);
+            sheet = (try self.environment.resolveSheet(name)) orelse return Value.err(.ref);
+        }
+        const range = parseA1Area(split.rest) orelse return Value.err(.ref);
+        return self.refValue(.{ .sheet = sheet, .range = range.normalized() });
+    }
+
+    /// §7's `OFFSET`: an area displaced from another area, optionally
+    /// resized. `rows`/`cols`/`height`/`width` have already been coerced
+    /// through the numeric column and truncated toward zero by the
+    /// caller, which is where Excel truncates them too.
+    pub fn offsetReference(
+        self: *Evaluator,
+        base: env.RangeRef,
+        row_delta: i64,
+        col_delta: i64,
+        height: i64,
+        width: i64,
+    ) EvalError!Value {
+        // Microsoft documents height and width as positive numbers.
+        // Excel 365 has since grown an undocumented negative-extent
+        // behaviour that extends in the opposite direction; with the
+        // Excel oracle leg parked there is no evidence for it here, and
+        // inventing it would be a claim about Excel this repo cannot
+        // back. The documented contract is what ships.
+        if (height <= 0 or width <= 0) return Value.err(.value);
+
+        const first_row = @as(i64, base.range.first.row.oneBased()) + row_delta;
+        const first_col = @as(i64, base.range.first.col.zeroBased()) + col_delta;
+        const last_row = first_row + height - 1;
+        const last_col = first_col + width - 1;
+        // "If rows and cols offset reference over the edge of the
+        // worksheet, OFFSET returns #REF!" — and so does an extent that
+        // runs off it.
+        if (first_row < 1 or last_row > coords.max_row) return Value.err(.ref);
+        if (first_col < 0 or last_col >= coords.max_col_1based) return Value.err(.ref);
+
+        return self.refValue(.{
+            .sheet = base.sheet,
+            .range = .{
+                .first = .{
+                    .row = coords.Row.fromOneBased(@intCast(first_row)) catch unreachable,
+                    .col = coords.Col.fromZeroBased(@intCast(first_col)) catch unreachable,
+                },
+                .last = .{
+                    .row = coords.Row.fromOneBased(@intCast(last_row)) catch unreachable,
+                    .col = coords.Col.fromZeroBased(@intCast(last_col)) catch unreachable,
+                },
+            },
+        });
+    }
 };
+
+const SheetSplit = struct { sheet: ?[]const u8, rest: []const u8 };
+
+/// Split `Sheet1!A1` / `'My Sheet'!A1:B2` / `A1`.
+///
+/// Null means the text cannot be a reference at all — an unterminated
+/// quote, or a `!` inside a bare (unquoted) name, which no sheet name
+/// may contain.
+fn splitSheetPrefix(text: []const u8) ?SheetSplit {
+    if (text.len == 0) return null;
+    if (text[0] == '\'') {
+        var i: usize = 1;
+        while (i < text.len) : (i += 1) {
+            if (text[i] != '\'') continue;
+            // `''` is one literal quote inside the name, not the end.
+            if (i + 1 < text.len and text[i + 1] == '\'') {
+                i += 1;
+                continue;
+            }
+            if (i + 1 >= text.len or text[i + 1] != '!') return null;
+            return .{ .sheet = text[0 .. i + 1], .rest = text[i + 2 ..] };
+        }
+        return null; // unterminated
+    }
+    const bang = std.mem.indexOfScalar(u8, text, '!') orelse
+        return .{ .sheet = null, .rest = text };
+    return .{ .sheet = text[0..bang], .rest = text[bang + 1 ..] };
+}
+
+/// The sheet name a (possibly quoted) spelling denotes. Returns a
+/// borrowed slice; `''` inside a quoted name is the one escape, and a
+/// name containing one is refused rather than unescaped into an arena
+/// this function does not own — Excel sheet names may contain `'`, but
+/// only as a doubled literal, and `INDIRECT` over one is rare enough
+/// that a `#REF!` is a better answer than an allocation on this path.
+fn unquoteSheetSpelling(raw: []const u8) ?[]const u8 {
+    if (raw.len == 0) return null;
+    if (raw[0] != '\'') return if (std.mem.indexOfScalar(u8, raw, '\'') == null) raw else null;
+    if (raw.len < 2 or raw[raw.len - 1] != '\'') return null;
+    const inner = raw[1 .. raw.len - 1];
+    if (inner.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, inner, '\'') != null) return null;
+    return inner;
+}
+
+/// The area an A1 spelling denotes: a cell, a rectangle, a whole column
+/// span or a whole row span. Null for anything else.
+fn parseA1Area(s: []const u8) ?coords.Range {
+    if (s.len == 0) return null;
+    if (coords.parseRange(s, .{ .dollar = .accept })) |r| {
+        return r;
+    } else |_| {}
+
+    // `A:A` and `1:1`. `parseRange` cannot take them — neither half is
+    // a cell — and they are the two spellings `INDIRECT` is most often
+    // handed after a rectangle.
+    const colon = std.mem.indexOfScalar(u8, s, ':') orelse return null;
+    const left = stripDollar(s[0..colon]);
+    const right = stripDollar(s[colon + 1 ..]);
+    if (left.len == 0 or right.len == 0) return null;
+
+    if (std.ascii.isDigit(left[0]) and std.ascii.isDigit(right[0])) {
+        const lo = std.fmt.parseInt(u32, left, 10) catch return null;
+        const hi = std.fmt.parseInt(u32, right, 10) catch return null;
+        if (lo == 0 or hi == 0 or lo > coords.max_row or hi > coords.max_row) return null;
+        return fullRowRange(
+            .{ .row = coords.Row.fromOneBased(lo) catch return null, .absolute = false },
+            .{ .row = coords.Row.fromOneBased(hi) catch return null, .absolute = false },
+        );
+    }
+    const lo = coords.parseCol(left, .{}) catch return null;
+    const hi = coords.parseCol(right, .{}) catch return null;
+    return fullColRange(
+        .{ .col = lo, .absolute = false },
+        .{ .col = hi, .absolute = false },
+    );
+}
+
+fn stripDollar(s: []const u8) []const u8 {
+    return if (s.len > 0 and s[0] == '$') s[1..] else s;
+}
 
 /// The area `$A:$B` denotes. A free function because the evaluator and
 /// the static walk must agree on it exactly, and two copies of a grid
@@ -7071,4 +7302,239 @@ test "criteria: a locale-flavoured criterion refuses rather than guessing" {
     defer h.deinit();
     try h.put("A1", num(2));
     try testing.expectError(error.LocaleSensitiveInput, h.eval("COUNTIF(A1:A3,\">1,5\")"));
+}
+
+// ─── M5a2: the two reference-producing rows (§7) ─────────────────
+//
+// Oracle-first and, again, honest about how little the oracle decides:
+// no committed manifest records an `INDIRECT` or an `OFFSET` cell, so
+// every row below is spec-pinned and the evidence gate asserts it in
+// both directions. The parked Excel leg (§8.2) is what would move these
+// labels, and the count is stated so that moving them is a visible edit.
+//
+// These are the fixpoint's test subjects (§5.6e), which is why they ship
+// complete at this row rather than at M7b with the rest of the reference
+// family: M6 exposes a public CLI, and a half-function behind it is a
+// promise the ladder would have to take back.
+
+/// One M5a2 fixture. `func` is the inventory name the row is a fixture
+/// FOR, so the coverage test can derive the batch from the frozen TSV.
+const RefCase = struct {
+    func: []const u8,
+    formula: []const u8,
+    expect: Expect,
+    evidence: Evidence = .spec_pinned,
+    note: []const u8 = "",
+};
+
+/// The world every M5a2 fixture reads: a 3×3 block on Sheet1 whose
+/// values encode their own coordinates, so a displaced reference names
+/// which cell it landed on rather than only that it landed somewhere.
+fn putRefCells(h: *Harness) !void {
+    try h.put("A1", num(11));
+    try h.put("A2", num(21));
+    try h.put("A3", num(31));
+    try h.put("B1", num(12));
+    try h.put("B2", num(22));
+    try h.put("B3", num(32));
+    try h.put("C1", num(13));
+    try h.put("C2", num(23));
+    try h.put("C3", num(33));
+    try h.put("D1", .{ .text = "B2" });
+    try h.put("D2", .{ .text = "Sheet1!C3" });
+    try h.put("D3", .{ .text = "not a reference" });
+}
+
+const ref_cases = [_]RefCase{
+    // ── INDIRECT: text becomes an area ──
+    .{ .func = "INDIRECT", .formula = "INDIRECT(\"B2\")", .expect = .{ .number = 22 } },
+    .{ .func = "INDIRECT", .formula = "INDIRECT(D1)", .expect = .{ .number = 22 }, .note = "the spelling may itself come from a cell — which is what makes the reference dynamic" },
+    .{ .func = "INDIRECT", .formula = "INDIRECT(\"$B$2\")", .expect = .{ .number = 22 }, .note = "anchors are part of the spelling and change nothing about where it points" },
+    .{ .func = "INDIRECT", .formula = "SUM(INDIRECT(\"A1:B2\"))", .expect = .{ .number = 66 }, .note = "11+12+21+22" },
+    .{ .func = "INDIRECT", .formula = "SUM(INDIRECT(\"B:B\"))", .expect = .{ .number = 66 }, .note = "a whole column: 12+22+32" },
+    .{ .func = "INDIRECT", .formula = "SUM(INDIRECT(\"2:2\"))", .expect = .{ .number = 66 }, .note = "a whole row: 21+22+23" },
+    .{ .func = "INDIRECT", .formula = "INDIRECT(\"Sheet1!C3\")", .expect = .{ .number = 33 } },
+    .{ .func = "INDIRECT", .formula = "INDIRECT(D2)", .expect = .{ .number = 33 } },
+    .{ .func = "INDIRECT", .formula = "INDIRECT(\"'Sheet1'!C3\")", .expect = .{ .number = 33 }, .note = "a quoted sheet name is the same sheet" },
+    .{ .func = "INDIRECT", .formula = "INDIRECT(\"B2\",TRUE())", .expect = .{ .number = 22 } },
+    // Every way of denoting nothing is `#REF!` — a value, because the
+    // formula is well-formed and simply points nowhere.
+    .{ .func = "INDIRECT", .formula = "INDIRECT(\"not a reference\")", .expect = .{ .err = .ref } },
+    .{ .func = "INDIRECT", .formula = "INDIRECT(D3)", .expect = .{ .err = .ref } },
+    .{ .func = "INDIRECT", .formula = "INDIRECT(\"\")", .expect = .{ .err = .ref } },
+    .{ .func = "INDIRECT", .formula = "INDIRECT(\"Nowhere!A1\")", .expect = .{ .err = .ref }, .note = "an unknown sheet is #REF!, the same answer a deleted one gives" },
+    .{ .func = "INDIRECT", .formula = "INDIRECT(\"A0\")", .expect = .{ .err = .ref }, .note = "row 0 is outside the grid" },
+    .{ .func = "INDIRECT", .formula = "INDIRECT(\"A1048577\")", .expect = .{ .err = .ref }, .note = "one row past the last one" },
+    .{ .func = "INDIRECT", .formula = "INDIRECT(\"XFE1\")", .expect = .{ .err = .ref }, .note = "one column past XFD" },
+    .{ .func = "INDIRECT", .formula = "INDIRECT(A1)", .expect = .{ .err = .ref }, .note = "a number is not a reference spelling" },
+    .{ .func = "INDIRECT", .formula = "INDIRECT(\"B2\")+1", .expect = .{ .number = 23 }, .note = "the reference dereferences into an operator like any other" },
+    .{ .func = "INDIRECT", .formula = "ROW(INDIRECT(\"C3\"))", .expect = .{ .number = 3 }, .note = "…and satisfies a `.reference` slot, which a value could not" },
+
+    // ── OFFSET: an area displaced, and optionally resized ──
+    .{ .func = "OFFSET", .formula = "OFFSET(A1,1,1)", .expect = .{ .number = 22 } },
+    .{ .func = "OFFSET", .formula = "OFFSET(A1,0,0)", .expect = .{ .number = 11 }, .note = "a zero displacement is the reference itself" },
+    .{ .func = "OFFSET", .formula = "OFFSET(C3,-2,-2)", .expect = .{ .number = 11 }, .note = "negative displacements move up and left" },
+    .{ .func = "OFFSET", .formula = "OFFSET(A1,1.9,1.9)", .expect = .{ .number = 22 }, .note = "Excel TRUNCATES the displacement toward zero rather than rounding it" },
+    .{ .func = "OFFSET", .formula = "OFFSET(C3,-1.9,-1.9)", .expect = .{ .number = 22 }, .note = "…toward zero in the negative direction too, so -1.9 is -1" },
+    .{ .func = "OFFSET", .formula = "SUM(OFFSET(A1,0,0,2,2))", .expect = .{ .number = 66 } },
+    .{ .func = "OFFSET", .formula = "SUM(OFFSET(A1:B2,1,1))", .expect = .{ .number = 110 }, .note = "an omitted extent keeps the BASE's shape, so this is the 2x2 at B2: 22+23+32+33" },
+    .{ .func = "OFFSET", .formula = "ROWS(OFFSET(A1,0,0,3,1))", .expect = .{ .number = 3 } },
+    .{ .func = "OFFSET", .formula = "COLUMNS(OFFSET(A1,0,0,1,3))", .expect = .{ .number = 3 } },
+    .{ .func = "OFFSET", .formula = "OFFSET(A1,-1,0)", .expect = .{ .err = .ref }, .note = "off the top edge" },
+    .{ .func = "OFFSET", .formula = "OFFSET(A1,0,-1)", .expect = .{ .err = .ref }, .note = "off the left edge" },
+    .{ .func = "OFFSET", .formula = "OFFSET(A1048576,1,0)", .expect = .{ .err = .ref }, .note = "off the bottom edge" },
+    .{ .func = "OFFSET", .formula = "OFFSET(A1,0,0,2,0)", .expect = .{ .err = .value }, .note = "Microsoft documents height and width as POSITIVE; zero is not" },
+    .{ .func = "OFFSET", .formula = "OFFSET(A1,0,0,-2,1)", .expect = .{ .err = .value }, .note = "and neither is negative — Excel 365's undocumented reverse-extent behaviour is not a claim this repo can back while the Excel oracle leg is parked" },
+    .{ .func = "OFFSET", .formula = "OFFSET(\"A1\",0,0)", .expect = .{ .err = .value }, .note = "the first slot is a reference; text is #VALUE!, not a spelling to parse — that is INDIRECT's job" },
+    .{ .func = "OFFSET", .formula = "SUM(OFFSET(INDIRECT(\"A1\"),1,1,2,2))", .expect = .{ .number = 110 }, .note = "the two compose: OFFSET's reference slot takes INDIRECT's product" },
+};
+
+test "M5a2: every reference fixture evaluates to what the spec says" {
+    for (ref_cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putRefCells(&h);
+
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("M5a2 `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectValue(c.expect, v) catch |e| {
+            std.debug.print("M5a2 `{s}` ({s}): wrong value\n", .{ c.formula, c.func });
+            return e;
+        };
+    }
+}
+
+test "M5a2: INDIRECT's R1C1 request is a refused CONSTRUCT, not a #REF! value" {
+    // The whole point of the distinction: `#REF!` says "this text names
+    // nothing", and `R1C1` names something perfectly well — something v1
+    // refuses everywhere else, including in a written formula, where the
+    // tokenizer has a refusal reason for exactly it. Answering `#REF!`
+    // here would let a caller conclude the text was malformed.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    try putRefCells(&h);
+
+    try testing.expectError(error.UnsupportedConstruct, h.eval("INDIRECT(\"R2C2\",FALSE())"));
+    // Even when the spelling would have been a perfectly good A1
+    // reference: it is the REQUEST that is refused, not the text.
+    try testing.expectError(error.UnsupportedConstruct, h.eval("INDIRECT(\"B2\",FALSE())"));
+    // …and the plane it reaches a caller through is the one every other
+    // R1C1 refusal uses.
+    try testing.expectEqual(
+        parser.PlaneTwo.FormulaUnsupportedConstruct,
+        planeTwo(error.UnsupportedConstruct),
+    );
+    // A written R1C1 reference refuses at the tokenizer, which is the
+    // other half of "the same answer by another spelling".
+    var refused = try parser.parse(testing.allocator, "R2C2", .{});
+    defer refused.deinit(testing.allocator);
+    try testing.expect(refused == .refused);
+}
+
+test "M5a2: a dynamic reference is captured as a dependency, which is what §5.6e reads" {
+    // The property the outer loop rests on. `INDIRECT("C3")` mentions no
+    // coordinate a walk over the text could find, so unless the runtime
+    // read is logged, §5.6e has nothing to recondense on and the graph
+    // would order a cell before something it actually depends on.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    try putRefCells(&h);
+
+    _ = try h.eval("INDIRECT(\"C3\")");
+    try testing.expect(h.ev.deps.hasCell(.{
+        .sheet = h.sheet,
+        .row = try coords.Row.fromOneBased(3),
+        .col = try coords.Col.fromZeroBased(2),
+    }));
+    // …and the static walk over the same text finds nothing, which is
+    // the asymmetry the outer loop exists to close.
+    const ast = try h.parse("INDIRECT(\"C3\")");
+    var statics = DependencyLog.init(testing.allocator);
+    defer statics.deinit();
+    try staticDependencies(testing.allocator, ast, h.sheet, h.fake.evalEnv(), &statics);
+    try testing.expectEqual(@as(usize, 0), statics.cells.items.len);
+    try testing.expectEqual(@as(usize, 0), statics.areas.items.len);
+
+    // An area behaves the same way, through `readRange` rather than
+    // `readCell`.
+    _ = try h.eval("SUM(OFFSET(A1,1,1,2,2))");
+    try testing.expect(h.ev.deps.hasArea(.{
+        .sheet = h.sheet,
+        .range = (try coords.parseRange("B2:C3", .{})).normalized(),
+    }));
+}
+
+test "M5a2: both names resolve, and each has a fixture" {
+    var it = registry.inventory();
+    var batch: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M5a2")) continue;
+        batch += 1;
+
+        if (registry.lookup(e.name) == null) {
+            std.debug.print("M5a2 name does not resolve: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        }
+        var fixtures: usize = 0;
+        for (ref_cases) |c| {
+            if (std.mem.eql(u8, c.func, e.name)) fixtures += 1;
+        }
+        if (fixtures == 0) {
+            std.debug.print("M5a2 name has no fixture: {s}\n", .{e.name});
+            return error.UnfixturedBatchFunction;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), batch);
+
+    for (ref_cases) |c| {
+        var found = false;
+        var it2 = registry.inventory();
+        while (it2.next()) |e| {
+            if (std.mem.eql(u8, e.name, c.func) and std.mem.eql(u8, e.milestone, "M5a2")) found = true;
+        }
+        if (!found) {
+            std.debug.print("fixture names a function outside M5a2: {s}\n", .{c.func});
+            return error.FixtureOutsideBatch;
+        }
+    }
+}
+
+test "M5a2: the evidence label on every fixture is true of the committed manifests" {
+    var oracle_rows: usize = 0;
+    var excluded_rows: usize = 0;
+    for (ref_cases) |c| {
+        switch (try manifestVerdict(c.formula)) {
+            .decided => {
+                if (c.evidence != .oracle) {
+                    std.debug.print("`{s}` is decided by a manifest but ships spec-pinned\n", .{c.formula});
+                    return error.UnderstatedEvidence;
+                }
+                oracle_rows += 1;
+            },
+            .excluded => {
+                if (c.evidence != .spec_pinned) {
+                    std.debug.print("`{s}` claims evidence from an EXCLUDED cell\n", .{c.formula});
+                    return error.ExcludedCellClaimedAsEvidence;
+                }
+                excluded_rows += 1;
+            },
+            .silent => {
+                if (c.evidence != .spec_pinned) {
+                    std.debug.print("`{s}` claims oracle evidence no manifest holds\n", .{c.formula});
+                    return error.UnbackedOracleClaim;
+                }
+            },
+        }
+    }
+    // Stated as numbers so the balance cannot drift silently: the
+    // committed manifests contain no reference-producing cell at all.
+    // When the parked Excel leg runs and the suite grows one, these move
+    // and the row that moves them is the row that re-labels.
+    try testing.expectEqual(@as(usize, 0), oracle_rows);
+    try testing.expectEqual(@as(usize, 0), excluded_rows);
 }

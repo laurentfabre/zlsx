@@ -453,10 +453,16 @@ pub const Budget = struct {
 /// allocates one node and walks a million coordinates; only an explicit
 /// counter catches that.
 ///
-/// M5a1 lands the three counters the graph needs. `max_scc_iterations`
-/// and `max_dynamic_passes` are M5a2's — they bound the iteration
-/// engine, which does not exist yet, and a limit with no enforcement
-/// site is a limit that lies.
+/// M5a1 landed the three counters the graph needs; M5a2 adds the two the
+/// iteration engine needs, which is when they acquired an enforcement
+/// site — a limit with none is a limit that lies.
+///
+/// The five are not the same *shape* of bound, and `kind` says so rather
+/// than leaving a reader to infer it from which functions touch which
+/// member. A total only grows, a depth unwinds, and a per-scope bound is
+/// re-counted from zero in every scope it governs: §5.6c gives each SCC
+/// its own pass counter, so charging passes into one running total would
+/// make two components that each iterate legally refuse together.
 pub const WorkCategory = enum {
     /// Edges admitted into the dependency graph.
     dependency_edges,
@@ -465,12 +471,40 @@ pub const WorkCategory = enum {
     /// Cell-to-cell hops on the closure-discovery stack. A *depth*, so
     /// it is released as the walk unwinds; the other two only ever grow.
     eval_depth,
+    /// §5.6c's resource ceiling on one SCC's iteration passes. The
+    /// caller's, and never the workbook's own `calcPr@iterateCount`:
+    /// reaching the semantic bound is success, reaching this one is a
+    /// refusal, and conflating them would let a resource cap publish
+    /// caches the workbook did not ask for.
+    scc_iterations,
+    /// §5.6e's ceiling on graph-rebuild passes.
+    dynamic_passes,
+
+    pub const Kind = enum {
+        /// Monotone across a whole run.
+        total,
+        /// Charged on the way in, released on the way out.
+        depth,
+        /// Counted from zero inside each scope it governs, and therefore
+        /// read by the engine rather than accumulated in `WorkCounters`.
+        per_scope,
+    };
+
+    pub fn kind(self: WorkCategory) Kind {
+        return switch (self) {
+            .dependency_edges, .total_cell_evals => .total,
+            .eval_depth => .depth,
+            .scc_iterations, .dynamic_passes => .per_scope,
+        };
+    }
 
     pub fn unit(self: WorkCategory) []const u8 {
         return switch (self) {
             .dependency_edges => "edges",
             .total_cell_evals => "evaluations",
             .eval_depth => "cells",
+            .scc_iterations => "passes",
+            .dynamic_passes => "passes",
         };
     }
 };
@@ -484,23 +518,48 @@ pub const WorkLimits = struct {
     max_dependency_edges: u64 = default_dependency_edges,
     max_total_cell_evals: u64 = default_total_cell_evals,
     max_eval_depth: u64 = default_eval_depth,
+    max_scc_iterations: u64 = default_scc_iterations,
+    max_dynamic_passes: u64 = default_dynamic_passes,
 
     pub const default_dependency_edges: u64 = 50_000_000;
     pub const default_total_cell_evals: u64 = 50_000_000;
     pub const default_eval_depth: u64 = 512;
+    /// Excel's own maximum `iterateCount`. The resource ceiling defaults
+    /// to it so that, out of the box, the caller's cap can never be the
+    /// bound that fires first — a default that refused a workbook Excel
+    /// would have calculated would be a default that changes answers.
+    pub const default_scc_iterations: u64 = 32_767;
+    pub const default_dynamic_passes: u64 = 3;
 
     pub const hard_multiplier: u64 = 4;
+
+    /// The two §9 states as exceptions to `hard_multiplier`.
+    ///
+    /// `scc_iterations` cannot be raised at all: 32 767 is the largest
+    /// `iterateCount` a workbook can carry, so a ceiling above it bounds
+    /// nothing that the semantic clamp has not already bounded.
+    /// `dynamic_passes` stops at 10 rather than at 12 because §5.6e
+    /// names 10, and a limit whose hard maximum is derived where the
+    /// spec states one is a limit that disagrees with its own spec.
+    pub const hard_scc_iterations: u64 = 32_767;
+    pub const hard_dynamic_passes: u64 = 10;
 
     pub fn defaultFor(cat: WorkCategory) u64 {
         return switch (cat) {
             .dependency_edges => default_dependency_edges,
             .total_cell_evals => default_total_cell_evals,
             .eval_depth => default_eval_depth,
+            .scc_iterations => default_scc_iterations,
+            .dynamic_passes => default_dynamic_passes,
         };
     }
 
     pub fn hardMaxFor(cat: WorkCategory) u64 {
-        return defaultFor(cat) * hard_multiplier;
+        return switch (cat) {
+            .scc_iterations => hard_scc_iterations,
+            .dynamic_passes => hard_dynamic_passes,
+            else => defaultFor(cat) * hard_multiplier,
+        };
     }
 
     pub fn get(self: WorkLimits, cat: WorkCategory) u64 {
@@ -508,6 +567,8 @@ pub const WorkLimits = struct {
             .dependency_edges => self.max_dependency_edges,
             .total_cell_evals => self.max_total_cell_evals,
             .eval_depth => self.max_eval_depth,
+            .scc_iterations => self.max_scc_iterations,
+            .dynamic_passes => self.max_dynamic_passes,
         };
     }
 
@@ -516,6 +577,8 @@ pub const WorkLimits = struct {
             .dependency_edges => self.max_dependency_edges = v,
             .total_cell_evals => self.max_total_cell_evals = v,
             .eval_depth => self.max_eval_depth = v,
+            .scc_iterations => self.max_scc_iterations = v,
+            .dynamic_passes => self.max_dynamic_passes = v,
         }
     }
 
@@ -539,6 +602,15 @@ pub const WorkLimits = struct {
 /// | `dependency_edges` | `graph.Builder.addEdge`, once per admitted edge | never — a built graph keeps its edges |
 /// | `total_cell_evals` | `graph.Graph.plan`, once per cell admitted to the plan | never — the plan is exact, so charging at admission refuses *before* the first evaluation instead of halfway through one |
 /// | `eval_depth` | `graph.Graph.plan`'s closure walk, on pushing a cell-like node | the same walk, on popping it |
+/// | `scc_iterations` | nowhere — `iterate.Engine` re-counts it per component and refuses on its own | — |
+/// | `dynamic_passes` | nowhere — `iterate.Engine` re-counts it per run of the outer loop | — |
+///
+/// The last two rows say "nowhere" and mean it: they are `.per_scope`
+/// bounds, and `charge` rejects one at compile-nothing-runtime-assert.
+/// Their *limits* still live in `WorkLimits` so a caller configures all
+/// five in one place and one `validate` covers them, but a per-scope
+/// bound accumulated across scopes would refuse a workbook whose every
+/// component iterated legally.
 ///
 /// Nothing is mutated on a refusal: like `Budget`, the check happens
 /// before the counter moves, so a rejected charge leaves the counter
@@ -561,6 +633,7 @@ pub const WorkCounters = struct {
     }
 
     pub fn charge(self: *WorkCounters, cat: WorkCategory, n: u64) error{LimitExceeded}!void {
+        assert(cat.kind() != .per_scope);
         const i = @intFromEnum(cat);
         const limit = self.limits.get(cat);
         const next = std.math.add(u64, self.used[i], n) catch {
@@ -575,11 +648,11 @@ pub const WorkCounters = struct {
         if (next > self.peak[i]) self.peak[i] = next;
     }
 
-    /// Only `eval_depth` unwinds. The other two are monotone totals, and
-    /// releasing one would let a long run exceed its own limit by
-    /// forgetting work it had already done.
+    /// Only a `.depth` unwinds. The totals are monotone — releasing one
+    /// would let a long run exceed its own limit by forgetting work it
+    /// had already done — and a `.per_scope` bound never entered here.
     pub fn release(self: *WorkCounters, cat: WorkCategory, n: u64) void {
-        assert(cat == .eval_depth);
+        assert(cat.kind() == .depth);
         const i = @intFromEnum(cat);
         assert(self.used[i] >= n);
         self.used[i] -= n;
@@ -817,16 +890,36 @@ test "checkAllAllocationFailures: the budget leaks nothing under OOM" {
     try testing.checkAllAllocationFailures(testing.allocator, H.run, .{});
 }
 
-test "work limits: defaults are §9's, and the hard maximum is 4×" {
+test "work limits: defaults are §9's, and the hard maximum is 4× unless stated" {
     const l: WorkLimits = .{};
     try testing.expectEqual(@as(u64, 50_000_000), l.max_dependency_edges);
     try testing.expectEqual(@as(u64, 50_000_000), l.max_total_cell_evals);
     try testing.expectEqual(@as(u64, 512), l.max_eval_depth);
+    try testing.expectEqual(@as(u64, 32_767), l.max_scc_iterations);
+    try testing.expectEqual(@as(u64, 3), l.max_dynamic_passes);
+
     inline for (@typeInfo(WorkCategory).@"enum".fields) |f| {
         const cat: WorkCategory = @enumFromInt(f.value);
         try testing.expectEqual(l.get(cat), WorkLimits.defaultFor(cat));
-        try testing.expectEqual(l.get(cat) * 4, WorkLimits.hardMaxFor(cat));
+        // §9's rule is "4× unless stated", and both M5a2 states one.
+        // Spelled as a switch rather than as an exception list so a
+        // sixth category has to answer the question rather than inherit
+        // an answer.
+        const want: u64 = switch (cat) {
+            .scc_iterations => 32_767,
+            .dynamic_passes => 10,
+            else => l.get(cat) * 4,
+        };
+        try testing.expectEqual(want, WorkLimits.hardMaxFor(cat));
     }
+
+    // `scc_iterations` is the one category whose hard maximum IS its
+    // default: 32 767 is the largest `iterateCount` a workbook can carry,
+    // so there is nothing above it left to permit.
+    try testing.expectEqual(
+        WorkLimits.defaultFor(.scc_iterations),
+        WorkLimits.hardMaxFor(.scc_iterations),
+    );
 }
 
 test "work limits: zero and over-hard-max are both out of range" {
@@ -846,23 +939,28 @@ test "work limits: zero and over-hard-max are both out of range" {
     }
 }
 
-test "work counters: below, at, and above — per category" {
+test "work counters: below, at, and above — per accumulating category" {
     inline for (@typeInfo(WorkCategory).@"enum".fields) |f| {
         const cat: WorkCategory = @enumFromInt(f.value);
-        var c: WorkCounters = .{};
-        c.limits.set(cat, 3);
+        // A per-scope bound is read by the engine that owns the scope,
+        // never charged here. Its own below/at/above boundary tests live
+        // with that engine, where the scope exists to be counted.
+        if (comptime cat.kind() != .per_scope) {
+            var c: WorkCounters = .{};
+            c.limits.set(cat, 3);
 
-        try c.charge(cat, 2); // below
-        try testing.expectEqual(@as(?WorkCategory, null), c.tripped);
-        try c.charge(cat, 1); // at
-        try testing.expectEqual(@as(u64, 3), c.usedBy(cat));
-        try testing.expectEqual(@as(?WorkCategory, null), c.tripped);
+            try c.charge(cat, 2); // below
+            try testing.expectEqual(@as(?WorkCategory, null), c.tripped);
+            try c.charge(cat, 1); // at
+            try testing.expectEqual(@as(u64, 3), c.usedBy(cat));
+            try testing.expectEqual(@as(?WorkCategory, null), c.tripped);
 
-        // Above. The counter does not move, so a refusal is observably
-        // non-mutating even in its own bookkeeping.
-        try testing.expectError(error.LimitExceeded, c.charge(cat, 1));
-        try testing.expectEqual(@as(u64, 3), c.usedBy(cat));
-        try testing.expectEqual(@as(?WorkCategory, cat), c.tripped);
+            // Above. The counter does not move, so a refusal is
+            // observably non-mutating even in its own bookkeeping.
+            try testing.expectError(error.LimitExceeded, c.charge(cat, 1));
+            try testing.expectEqual(@as(u64, 3), c.usedBy(cat));
+            try testing.expectEqual(@as(?WorkCategory, cat), c.tripped);
+        }
     }
 }
 
@@ -872,6 +970,32 @@ test "work counters: an overflowing charge trips rather than wrapping" {
     try c.charge(.dependency_edges, std.math.maxInt(u64) - 1);
     try testing.expectError(error.LimitExceeded, c.charge(.dependency_edges, 4));
     try testing.expectEqual(@as(u64, std.math.maxInt(u64) - 1), c.usedBy(.dependency_edges));
+}
+
+test "work limits: every category declares a kind, and the two M5a2 adds are per-scope" {
+    // The classification is what keeps §5.6c's "each SCC gets its own
+    // pass counter" from being a comment: a per-scope bound that could
+    // be charged into `WorkCounters` would accumulate across components
+    // and refuse a workbook whose every component iterated legally.
+    var totals: usize = 0;
+    var depths: usize = 0;
+    var scoped: usize = 0;
+    inline for (@typeInfo(WorkCategory).@"enum".fields) |f| {
+        const cat: WorkCategory = @enumFromInt(f.value);
+        switch (cat.kind()) {
+            .total => totals += 1,
+            .depth => depths += 1,
+            .per_scope => scoped += 1,
+        }
+        // Every category names its unit, including the two that are not
+        // counters — a §9 report prints all five.
+        try testing.expect(cat.unit().len > 0);
+    }
+    try testing.expectEqual(@as(usize, 2), totals);
+    try testing.expectEqual(@as(usize, 1), depths);
+    try testing.expectEqual(@as(usize, 2), scoped);
+    try testing.expectEqual(WorkCategory.Kind.per_scope, WorkCategory.scc_iterations.kind());
+    try testing.expectEqual(WorkCategory.Kind.per_scope, WorkCategory.dynamic_passes.kind());
 }
 
 test "work counters: depth unwinds, peak does not" {

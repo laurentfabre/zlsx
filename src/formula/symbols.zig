@@ -73,6 +73,12 @@ pub const rewriter = @import("rewriter.zig");
 /// `graph.zig` and `eval.zig` share `env.zig`'s types, so they cannot be
 /// two.
 pub const graph = @import("graph.zig");
+/// M5a2: the iteration engine and §5.6d's draw schedule, for the same
+/// one-module reason as everything above — the engine's `Host` carries
+/// `env.CellRef` and `value.ScalarValue`, and a second copy of either
+/// would be a different type.
+pub const iterate = @import("iterate.zig");
+pub const draws = @import("draws.zig");
 
 pub const Refusal = decode.Refusal;
 pub const SheetIndex = env.SheetIndex;

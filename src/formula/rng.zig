@@ -293,8 +293,8 @@ test "the draw source is the evaluator's seam, counted by it" {
     var r = Rng.init(99);
     var source = r.drawSource();
     try testing.expectEqual(@as(u64, 0), source.count);
-    const first = source.draw();
-    const second = source.draw();
+    const first = try source.draw();
+    const second = try source.draw();
     try testing.expectEqual(@as(u64, 2), source.count);
     try testing.expect(first != second);
 
@@ -373,7 +373,7 @@ test "checkAllAllocationFailures: generation is allocation-free, and stays so" {
                 var r = Rng.init(kat.seed);
                 for (0..8) |_| try out.append(allocator, r.next());
                 var source = r.drawSource();
-                const v = source.draw();
+                const v = try source.draw();
                 if (!(v >= 0 and v < 1)) return error.OutOfUnitInterval;
             }
             if (out.items.len != kats.len * 8) return error.WrongCount;
