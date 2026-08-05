@@ -58,21 +58,34 @@
 //! to emit a ZIP. Std-only — no cycle through `zlsx_pkg`.
 
 const std = @import("std");
+const control = @import("zlsx_control");
 
 const Allocator = std.mem.Allocator;
+
+pub const Poller = control.Poller;
 
 /// Caller-provided deflate function. Must compress `input` (which
 /// the Archive guarantees is non-empty when called) and append the
 /// raw deflate stream into `out`. The canonical implementation is
 /// `xlsx.deflateCompress` (`src/writer.zig`).
-pub const DeflateFn = *const fn (Allocator, []const u8, *std.ArrayListUnmanaged(u8)) anyerror!void;
+///
+/// **M5d1 made it context-aware.** The fourth parameter is the poll seam
+/// (§5.5): an implementation must feed `input` through it in
+/// `control.chunk_bytes` pieces so a cancel token or deadline is observed
+/// while a large sheet compresses, not only once it has. Before this the
+/// signature had nowhere to put a caller's context, which is exactly why
+/// a 200 MiB `sheet1.xml` was an uninterruptible call.
+///
+/// `Poller.none` is the disarmed value; passing it costs one null check
+/// per chunk and no calls.
+pub const DeflateFn = *const fn (Allocator, []const u8, *std.ArrayListUnmanaged(u8), Poller) anyerror!void;
 
 pub const Error = error{
     EntryTooLarge,
     NameTooLong,
     TooManyZipEntries,
     ZipArchiveTooLarge,
-} || Allocator.Error;
+} || Allocator.Error || control.Error;
 
 /// §9's `max_output_archive_bytes`, and the ZIP32 sentinel bound this
 /// file already enforced structurally.
@@ -103,6 +116,11 @@ pub const Archive = struct {
     /// `default_max_archive_bytes` so a raised limit cannot produce an
     /// archive whose serialized offsets are sentinels.
     max_archive_bytes: u64 = default_max_archive_bytes,
+    /// §5.5's seam. Polled once per entry before any work is done and
+    /// handed to `deflate` so the compression of a single large entry is
+    /// interruptible too. Defaults to the disarmed value, so an
+    /// uncontrolled caller pays a null check per entry.
+    poller: Poller = .none,
 
     const EntryMeta = struct {
         /// Owned copy (arena would also work but the Archive's lifetime
@@ -131,6 +149,23 @@ pub const Archive = struct {
         };
     }
 
+    /// `initLimited` with §5.5's poll seam armed. The cap and the seam
+    /// travel together because both are things an *orchestrator* imposes
+    /// on a producer it did not write.
+    pub fn initControlled(
+        alloc: Allocator,
+        out: *std.ArrayListUnmanaged(u8),
+        max: u64,
+        poller: Poller,
+    ) Archive {
+        return .{
+            .allocator = alloc,
+            .out = out,
+            .max_archive_bytes = @min(max, default_max_archive_bytes),
+            .poller = poller,
+        };
+    }
+
     /// The bound, as every check site reads it.
     fn cap(self: *const Archive) u64 {
         return @min(self.max_archive_bytes, default_max_archive_bytes);
@@ -151,6 +186,11 @@ pub const Archive = struct {
         deflate: DeflateFn,
     ) !void {
         const alloc = self.allocator;
+        // Ahead of every allocation and every byte of work, so a cancelled
+        // archive stops at an entry boundary with the buffer holding only
+        // whole entries — which is what lets the caller free it and know
+        // nothing half-written escaped.
+        try self.poller.check();
         if (data.len > std.math.maxInt(u32)) return Error.EntryTooLarge;
         if (name.len > std.math.maxInt(u16)) return Error.NameTooLong;
 
@@ -174,7 +214,7 @@ pub const Archive = struct {
         var method: std.zip.CompressionMethod = .deflate;
         var payload: []const u8 = undefined;
         if (data.len >= COMPRESS_MIN) {
-            try deflate(alloc, data, &compressed);
+            try deflate(alloc, data, &compressed, self.poller);
         }
         if (data.len < COMPRESS_MIN or compressed.items.len >= data.len) {
             method = .store;
@@ -321,10 +361,14 @@ fn stubDeflate(
     alloc: Allocator,
     input: []const u8,
     out: *std.ArrayListUnmanaged(u8),
+    poller: Poller,
 ) anyerror!void {
     // Append at-or-larger than input so the Archive falls back to
-    // STORED (the policy when compressed.len >= data.len).
-    try out.appendSlice(alloc, input);
+    // STORED (the policy when compressed.len >= data.len). Chunked
+    // through the seam like a real deflate so the stub honours the same
+    // §5.5 bound the contract asks of `DeflateFn` implementations.
+    var it = poller.chunks(input);
+    while (try it.next()) |chunk| try out.appendSlice(alloc, chunk);
     try out.append(alloc, 0);
 }
 
@@ -380,6 +424,69 @@ test "Archive: multiple entries preserve order" {
     try testing.expectEqualStrings("a", arc.entries.items[0].name);
     try testing.expectEqualStrings("b", arc.entries.items[1].name);
     try testing.expectEqualStrings("c", arc.entries.items[2].name);
+}
+
+test "Archive: cancel inside an entry stops at the entry boundary" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var flag: u8 = 0;
+    var w: control.Watch = .init(threaded.io(), .{ .cancel = .{ .flag = &flag } });
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var arc = Archive.initControlled(
+        testing.allocator,
+        &buf,
+        default_max_archive_bytes,
+        w.poller(),
+    );
+    defer arc.deinit();
+
+    try arc.addEntry("first", "aaaa", stubDeflate);
+    const after_first = buf.items.len;
+    try testing.expect(after_first > 0);
+
+    flag = 1;
+    try testing.expectError(control.Error.Cancelled, arc.addEntry("second", "bbbb", stubDeflate));
+    // The refused entry appended nothing and registered nothing: the
+    // buffer still holds exactly the first entry, so a caller that frees
+    // it is not freeing a half-written record.
+    try testing.expectEqual(after_first, buf.items.len);
+    try testing.expectEqual(@as(usize, 1), arc.entries.items.len);
+}
+
+test "Archive: cancel lands mid-entry, inside the deflate itself" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    // The clock arms the flag on its third read; with a deadline set,
+    // every chunk poll reads the clock, so "third chunk" is exact rather
+    // than racy.
+    var flag: u8 = 0;
+    const io = control.inject.wrap(threaded.io(), .{ .trip_at = 3, .trip_flag = &flag });
+    var w: control.Watch = .init(io, .{
+        .cancel = .{ .flag = &flag },
+        .deadline = .{ .nanoseconds = std.math.maxInt(i64) },
+    });
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var arc = Archive.initControlled(
+        testing.allocator,
+        &buf,
+        default_max_archive_bytes,
+        w.poller(),
+    );
+    defer arc.deinit();
+
+    const big = try testing.allocator.alloc(u8, control.chunk_bytes * 8);
+    defer testing.allocator.free(big);
+    @memset(big, 'z');
+
+    try testing.expectError(control.Error.Cancelled, arc.addEntry("big.bin", big, stubDeflate));
+    try testing.expectEqual(@as(usize, 0), arc.entries.items.len);
+    try testing.expectEqual(@as(usize, 0), buf.items.len);
 }
 
 test "Archive: stub deflate falls back to STORED" {

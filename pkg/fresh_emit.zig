@@ -108,6 +108,11 @@ pub const max_output_archive_bytes: u64 = zip.default_max_archive_bytes;
 
 pub const DeflateFn = zip.DeflateFn;
 
+/// M5d1's poll seam, re-exported for the same reason `DeflateFn` is: a
+/// producer reaches the archive substrate through this module and should
+/// not have to name a second one to pass a control through.
+pub const Poller = zip.Poller;
+
 // ─── Public API ──────────────────────────────────────────────────────
 
 /// Build a complete OOXML archive byte image into `out`. Caller owns
@@ -121,10 +126,11 @@ pub fn emitArchiveBytes(
     out: *std.ArrayListUnmanaged(u8),
     inputs: ArchiveInputs,
     deflate: DeflateFn,
+    poller: Poller,
 ) !void {
     if (inputs.sheets.len == 0) return error.NoSheets;
 
-    var arc = zip.Archive.initLimited(allocator, out, inputs.max_archive_bytes);
+    var arc = zip.Archive.initControlled(allocator, out, inputs.max_archive_bytes, poller);
     defer arc.deinit();
 
     const have_styles = !inputs.styles_plan.isEmpty();
@@ -435,11 +441,12 @@ pub fn saveArchiveToPath(
     path: []const u8,
     inputs: ArchiveInputs,
     deflate: DeflateFn,
+    poller: Poller,
 ) !void {
     var zip_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer zip_buf.deinit(allocator);
 
-    try emitArchiveBytes(allocator, &zip_buf, inputs, deflate);
+    try emitArchiveBytes(allocator, &zip_buf, inputs, deflate, poller);
 
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = path,
@@ -476,8 +483,10 @@ fn stubDeflate(
     alloc: Allocator,
     input: []const u8,
     out: *std.ArrayListUnmanaged(u8),
+    poller: Poller,
 ) anyerror!void {
-    try out.appendSlice(alloc, input);
+    var it = poller.chunks(input);
+    while (try it.next()) |chunk| try out.appendSlice(alloc, chunk);
     try out.append(alloc, 0);
 }
 
@@ -509,7 +518,7 @@ test "fresh_emit: empty single-sheet archive — no styles, no SST entries" {
         .sst_count = 0,
         .styles_plan = &styles_plan,
         .workbook_xml_plan = &workbook_xml_plan,
-    }, stubDeflate);
+    }, stubDeflate, .none);
 
     // Final output should be a parseable ZIP archive.
     try testing.expect(out.items.len > 22);
@@ -551,7 +560,7 @@ test "fresh_emit: a fresh archive carries no metadata part, so it reads as CV1" 
         .sst_count = 0,
         .styles_plan = &styles_plan,
         .workbook_xml_plan = &workbook_xml_plan,
-    }, stubDeflate);
+    }, stubDeflate, .none);
 
     // The stub deflate stores rather than compresses, so the part names
     // and the content-type overrides are both in the bytes verbatim.
@@ -583,6 +592,6 @@ test "fresh_emit: NoSheets refusal" {
         .sst_count = 0,
         .styles_plan = &styles_plan,
         .workbook_xml_plan = &workbook_xml_plan,
-    }, stubDeflate);
+    }, stubDeflate, .none);
     try testing.expectError(error.NoSheets, result);
 }

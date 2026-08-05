@@ -7384,6 +7384,18 @@ pub const SheetWriter = @import("writer.zig").SheetWriter;
 /// trigger a Zig 0.15.2 module-graph collision (`cli_mod + zlsx_pkg
 /// + writer cannot coexist`, documented in build.zig).
 pub const deflateCompress = @import("writer.zig").deflateCompress;
+
+/// M5d1's control-aware form. Same bytes, same policy; the extra
+/// parameter is §5.5's poll seam, which `pkg/store.zig` needs so a
+/// `replacePart` of a large sheet can be cancelled while it compresses.
+pub const deflateCompressControlled = @import("writer.zig").deflateCompressControlled;
+
+/// M5d1: §5.5's cancellation / deadline seam, re-exported for the same
+/// reason the package layer re-exports it — `Writer.saveToOwnedBufferControlled`
+/// takes a `Control`, so a caller of this module has to be able to name it.
+pub const control = @import("zlsx_control");
+pub const Control = control.Control;
+pub const CancelToken = control.CancelToken;
 pub const validateSheetName = @import("writer.zig").validateSheetName;
 pub const fitsExactlyInF64 = @import("writer.zig").fitsExactlyInF64;
 pub const formatCellRef = @import("writer.zig").formatCellRef;

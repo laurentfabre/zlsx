@@ -17,6 +17,25 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "version", pkg_version);
     const build_options_mod = build_options.createModule();
 
+    // M5d1: the cancellation / deadline / 64 KiB-chunk seam (§5.5,
+    // §5.10). Std-only and imported by name everywhere, which is what
+    // lets it sit beneath BOTH public trees at once: `pkg/zip.zig` polls
+    // it while staying stdlib-only, and `src/formula/run_inputs.zig`
+    // re-exports its `CancelToken` so the evaluator and the archive
+    // layer name one type rather than two structurally identical ones.
+    //
+    // Wired into every module that reaches either consumer — the formula
+    // files that touch `run_inputs.zig` (eval, graph, iterate, registry,
+    // rng, serial_date, symbols, text) and the whole `pkg/` + writer
+    // side. An unused module dep costs nothing; a missing one is a
+    // compile error naming the module, so the list below is checked by
+    // the build itself.
+    const control_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/control.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // B3 iter-wr-1: shared `SstExtensionPlan` substrate. Std-only by
     // design, so wiring it into the writer + xlsx test trees does not
     // form the cycle `writer → zlsx_pkg → workbook → zlsx → writer`
@@ -26,6 +45,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    sst_plan_mod.addImport("zlsx_control", control_mod);
 
     // B3 iter-wr-2: shared `StylesPlan` substrate. Same architectural
     // role as `sst_plan_mod` for the styles axis — std-only,
@@ -38,6 +58,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    styles_plan_mod.addImport("zlsx_control", control_mod);
 
     // B3 iter-wr-3: shared workbook.xml fresh-emit plan substrate
     // (defined-name validator + storage + emitter). Same std-only,
@@ -51,6 +72,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    workbook_xml_plan_mod.addImport("zlsx_control", control_mod);
 
     // B3 iter-wr-5: shared ZIP archive emit substrate. Std-only by
     // the same rationale as `sst_plan_mod` — pkg/zip.zig hosts the
@@ -64,6 +86,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    zip_mod.addImport("zlsx_control", control_mod);
 
     // B3 iter-wr-4: shared per-sheet fresh-emit plan substrate. Same
     // std-only, cycle-free shape as `sst_plan_mod` — hosts the
@@ -76,6 +99,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    sheet_plan_mod.addImport("zlsx_control", control_mod);
 
     // B3 iter-wr-7: fresh-archive emit substrate. Lifts the entire
     // archive orchestration (Content_Types.xml + rels + workbook.xml +
@@ -89,6 +113,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    fresh_emit_mod.addImport("zlsx_control", control_mod);
     fresh_emit_mod.addImport("zlsx_sst_plan", sst_plan_mod);
     fresh_emit_mod.addImport("zlsx_styles_plan", styles_plan_mod);
     fresh_emit_mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
@@ -141,6 +166,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    nfc_mod.addImport("zlsx_control", control_mod);
 
     // M1a (tier D1): UAX #31 `XID_Start` / `XID_Continue` tables — the
     // Unicode half of the formula identifier grammar. Rooted next to
@@ -151,6 +177,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    xid_mod.addImport("zlsx_control", control_mod);
 
     // A1: full case folding (Excel sheet-name dedup, `collation_v1`).
     // M4f moved it out of `src/unicode/` and up here beside the other
@@ -165,6 +192,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    unicode_mod.addImport("zlsx_control", control_mod);
     unicode_mod.addImport("zlsx_nfc", nfc_mod);
 
     // M4f: `casing_v1` — full Unicode casing for UPPER/LOWER, and the
@@ -177,6 +205,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    casing_mod.addImport("zlsx_control", control_mod);
     // For the version cross-check only: casing and folding must be
     // generated from one Unicode revision, and reaching the fold's
     // table file directly would put it in two module trees.
@@ -192,6 +221,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    refs_mod.addImport("zlsx_control", control_mod);
     sheet_plan_mod.addImport("zlsx_refs", refs_mod);
     workbook_xml_plan_mod.addImport("zlsx_refs", refs_mod);
 
@@ -202,6 +232,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    zlsx_mod.addImport("zlsx_control", control_mod);
     zlsx_mod.addImport("zlsx_sst_plan", sst_plan_mod);
     zlsx_mod.addImport("zlsx_styles_plan", styles_plan_mod);
     zlsx_mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
@@ -221,6 +252,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    unit_mod.addImport("zlsx_control", control_mod);
     unit_mod.addImport("zlsx_sst_plan", sst_plan_mod);
     unit_mod.addImport("zlsx_styles_plan", styles_plan_mod);
     unit_mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
@@ -252,6 +284,7 @@ pub fn build(b: *std.Build) void {
         // this directly in Zig 0.15.2 — set it on the module.
         .fuzz = true,
     });
+    unit_fuzz_mod.addImport("zlsx_control", control_mod);
     unit_fuzz_mod.addImport("zlsx_sst_plan", sst_plan_mod);
     unit_fuzz_mod.addImport("zlsx_styles_plan", styles_plan_mod);
     unit_fuzz_mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
@@ -296,6 +329,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    corpus_mod.addImport("zlsx_control", control_mod);
     corpus_mod.addImport("zlsx", zlsx_mod);
     // corpus_mod also needs `zlsx_pkg` for `Editor` post B2 iter-er-0;
     // wired below after `package_mod` is declared.
@@ -318,6 +352,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .single_threaded = single_threaded,
     });
+    cli_mod.addImport("zlsx_control", control_mod);
     cli_mod.addImport("build_options", build_options_mod);
     cli_mod.addImport("fuzz_config", fuzz_config_mod);
     cli_mod.addImport("zlsx_refs", refs_mod);
@@ -344,6 +379,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    writer_mod.addImport("zlsx_control", control_mod);
     writer_mod.addImport("zlsx_sst_plan", sst_plan_mod);
     writer_mod.addImport("zlsx_styles_plan", styles_plan_mod);
     writer_mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
@@ -367,6 +403,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    sst_plan_tests_mod.addImport("zlsx_control", control_mod);
     const sst_plan_tests = b.addTest(.{ .root_module = sst_plan_tests_mod });
     test_step.dependOn(&b.addRunArtifact(sst_plan_tests).step);
 
@@ -379,6 +416,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    styles_plan_tests_mod.addImport("zlsx_control", control_mod);
     const styles_plan_tests = b.addTest(.{ .root_module = styles_plan_tests_mod });
     test_step.dependOn(&b.addRunArtifact(styles_plan_tests).step);
     // B3 iter-wr-3 standalone tests for the workbook.xml fresh-emit
@@ -390,6 +428,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    workbook_xml_plan_tests_mod.addImport("zlsx_control", control_mod);
     workbook_xml_plan_tests_mod.addImport("zlsx_refs", refs_mod);
     const workbook_xml_plan_tests = b.addTest(.{ .root_module = workbook_xml_plan_tests_mod });
     test_step.dependOn(&b.addRunArtifact(workbook_xml_plan_tests).step);
@@ -400,6 +439,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    zip_tests_mod.addImport("zlsx_control", control_mod);
     const zip_tests = b.addTest(.{ .root_module = zip_tests_mod });
     test_step.dependOn(&b.addRunArtifact(zip_tests).step);
 
@@ -412,6 +452,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    sheet_plan_tests_mod.addImport("zlsx_control", control_mod);
     sheet_plan_tests_mod.addImport("zlsx_refs", refs_mod);
     const sheet_plan_tests = b.addTest(.{ .root_module = sheet_plan_tests_mod });
     test_step.dependOn(&b.addRunArtifact(sheet_plan_tests).step);
@@ -432,6 +473,7 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = .Debug,
     });
+    import_gate_mod.addImport("zlsx_control", control_mod);
     const import_gate_exe = b.addExecutable(.{
         .name = "import-gate",
         .root_module = import_gate_mod,
@@ -466,6 +508,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    fresh_emit_tests_mod.addImport("zlsx_control", control_mod);
     fresh_emit_tests_mod.addImport("zlsx_sst_plan", sst_plan_mod);
     fresh_emit_tests_mod.addImport("zlsx_styles_plan", styles_plan_mod);
     fresh_emit_tests_mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
@@ -511,6 +554,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    oracle_mod.addImport("zlsx_control", control_mod);
     // Read by `sentinel_set.zig`, which checks its planted values
     // against the builder script rather than trusting them to stay in
     // sync by convention.
@@ -532,6 +576,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    oracle_record_mod.addImport("zlsx_control", control_mod);
     const oracle_record_exe = b.addExecutable(.{
         .name = "zlsx-oracle-record",
         .root_module = oracle_record_mod,
@@ -547,6 +592,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_tokenizer_mod.addImport("zlsx_control", control_mod);
     formula_tokenizer_mod.addImport("zlsx_refs", refs_mod);
     formula_tokenizer_mod.addImport("zlsx_xid", xid_mod);
     const formula_tokenizer_tests = b.addTest(.{ .root_module = formula_tokenizer_mod });
@@ -561,6 +607,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .fuzz = true,
     });
+    formula_tokenizer_fuzz_mod.addImport("zlsx_control", control_mod);
     formula_tokenizer_fuzz_mod.addImport("zlsx_refs", refs_mod);
     formula_tokenizer_fuzz_mod.addImport("zlsx_xid", xid_mod);
     const formula_tokenizer_fuzz_tests = b.addTest(.{
@@ -583,6 +630,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_parser_mod.addImport("zlsx_control", control_mod);
     formula_parser_mod.addImport("zlsx_refs", refs_mod);
     formula_parser_mod.addImport("zlsx_xid", xid_mod);
     formula_parser_mod.addAnonymousImport("oracle_hand_spec_excel", .{
@@ -606,6 +654,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .fuzz = true,
     });
+    formula_parser_fuzz_mod.addImport("zlsx_control", control_mod);
     formula_parser_fuzz_mod.addImport("zlsx_refs", refs_mod);
     formula_parser_fuzz_mod.addImport("zlsx_xid", xid_mod);
     formula_parser_fuzz_mod.addAnonymousImport("oracle_hand_spec_excel", .{
@@ -645,6 +694,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_value_mod.addImport("zlsx_control", control_mod);
     formula_value_mod.addImport("zlsx_casefold", unicode_mod);
     formula_value_mod.addImport("zlsx_casing", casing_mod);
     formula_value_mod.addAnonymousImport("oracle_hand_spec_excel", .{
@@ -667,6 +717,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .fuzz = true,
     });
+    formula_value_fuzz_mod.addImport("zlsx_control", control_mod);
     formula_value_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
     formula_value_fuzz_mod.addImport("zlsx_casing", casing_mod);
     formula_value_fuzz_mod.addAnonymousImport("oracle_hand_spec_excel", .{
@@ -697,6 +748,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_env_mod.addImport("zlsx_control", control_mod);
     formula_env_mod.addImport("zlsx_refs", refs_mod);
     formula_env_mod.addImport("zlsx_casefold", unicode_mod);
     formula_env_mod.addImport("zlsx_casing", casing_mod);
@@ -714,6 +766,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_eval_mod.addImport("zlsx_control", control_mod);
     formula_eval_mod.addImport("zlsx_refs", refs_mod);
     formula_eval_mod.addImport("zlsx_xid", xid_mod);
     formula_eval_mod.addImport("zlsx_casefold", unicode_mod);
@@ -731,6 +784,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_run_inputs_mod.addImport("zlsx_control", control_mod);
     formula_run_inputs_mod.addImport("zlsx_refs", refs_mod);
     formula_run_inputs_mod.addImport("zlsx_casefold", unicode_mod);
     formula_run_inputs_mod.addImport("zlsx_casing", casing_mod);
@@ -743,6 +797,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_serial_date_mod.addImport("zlsx_control", control_mod);
     formula_serial_date_mod.addImport("zlsx_refs", refs_mod);
     formula_serial_date_mod.addImport("zlsx_casefold", unicode_mod);
     formula_serial_date_mod.addImport("zlsx_casing", casing_mod);
@@ -759,6 +814,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_criteria_mod.addImport("zlsx_control", control_mod);
     formula_criteria_mod.addImport("zlsx_refs", refs_mod);
     formula_criteria_mod.addImport("zlsx_casefold", unicode_mod);
     formula_criteria_mod.addImport("zlsx_casing", casing_mod);
@@ -776,6 +832,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_text_mod.addImport("zlsx_control", control_mod);
     formula_text_mod.addImport("zlsx_refs", refs_mod);
     formula_text_mod.addImport("zlsx_casefold", unicode_mod);
     formula_text_mod.addImport("zlsx_casing", casing_mod);
@@ -794,6 +851,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_graph_mod.addImport("zlsx_control", control_mod);
     formula_graph_mod.addImport("zlsx_refs", refs_mod);
     formula_graph_mod.addImport("zlsx_xid", xid_mod);
     formula_graph_mod.addImport("zlsx_casefold", unicode_mod);
@@ -811,6 +869,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_draws_mod.addImport("zlsx_control", control_mod);
     const formula_draws_tests = b.addTest(.{ .root_module = formula_draws_mod });
     test_step.dependOn(&b.addRunArtifact(formula_draws_tests).step);
 
@@ -823,6 +882,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_iterate_mod.addImport("zlsx_control", control_mod);
     formula_iterate_mod.addImport("zlsx_refs", refs_mod);
     formula_iterate_mod.addImport("zlsx_xid", xid_mod);
     formula_iterate_mod.addImport("zlsx_casefold", unicode_mod);
@@ -841,6 +901,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_resolved_mod.addImport("zlsx_control", control_mod);
     formula_resolved_mod.addImport("zlsx_refs", refs_mod);
     formula_resolved_mod.addImport("zlsx_xid", xid_mod);
     formula_resolved_mod.addImport("zlsx_casefold", unicode_mod);
@@ -858,6 +919,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .fuzz = true,
     });
+    formula_resolved_fuzz_mod.addImport("zlsx_control", control_mod);
     formula_resolved_fuzz_mod.addImport("zlsx_refs", refs_mod);
     formula_resolved_fuzz_mod.addImport("zlsx_xid", xid_mod);
     formula_resolved_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
@@ -878,6 +940,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_calc_patch_mod.addImport("zlsx_control", control_mod);
     formula_calc_patch_mod.addImport("zlsx_refs", refs_mod);
     formula_calc_patch_mod.addImport("zlsx_xid", xid_mod);
     formula_calc_patch_mod.addImport("zlsx_casefold", unicode_mod);
@@ -894,6 +957,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .fuzz = true,
     });
+    formula_criteria_fuzz_mod.addImport("zlsx_control", control_mod);
     formula_criteria_fuzz_mod.addImport("zlsx_refs", refs_mod);
     formula_criteria_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
     formula_criteria_fuzz_mod.addImport("zlsx_casing", casing_mod);
@@ -911,6 +975,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_rng_mod.addImport("zlsx_control", control_mod);
     formula_rng_mod.addImport("zlsx_refs", refs_mod);
     formula_rng_mod.addImport("zlsx_xid", xid_mod);
     formula_rng_mod.addImport("zlsx_casefold", unicode_mod);
@@ -931,6 +996,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_metadata_mod.addImport("zlsx_control", control_mod);
     formula_metadata_mod.addImport("zlsx_refs", refs_mod);
     formula_metadata_mod.addImport("zlsx_xid", xid_mod);
     formula_metadata_mod.addImport("zlsx_casefold", unicode_mod);
@@ -947,6 +1013,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .fuzz = true,
     });
+    formula_metadata_fuzz_mod.addImport("zlsx_control", control_mod);
     formula_metadata_fuzz_mod.addImport("zlsx_refs", refs_mod);
     formula_metadata_fuzz_mod.addImport("zlsx_xid", xid_mod);
     formula_metadata_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
@@ -972,6 +1039,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_decode_mod.addImport("zlsx_control", control_mod);
     formula_decode_mod.addImport("zlsx_refs", refs_mod);
     formula_decode_mod.addImport("zlsx_xid", xid_mod);
     formula_decode_mod.addImport("zlsx_casefold", unicode_mod);
@@ -991,6 +1059,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_calc_mod.addImport("zlsx_control", control_mod);
     formula_calc_mod.addImport("zlsx_refs", refs_mod);
     formula_calc_mod.addImport("zlsx_xid", xid_mod);
     formula_calc_mod.addImport("zlsx_casefold", unicode_mod);
@@ -1007,6 +1076,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .fuzz = true,
     });
+    formula_calc_fuzz_mod.addImport("zlsx_control", control_mod);
     formula_calc_fuzz_mod.addImport("zlsx_refs", refs_mod);
     formula_calc_fuzz_mod.addImport("zlsx_xid", xid_mod);
     formula_calc_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
@@ -1028,6 +1098,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_names_mod.addImport("zlsx_control", control_mod);
     formula_names_mod.addImport("zlsx_refs", refs_mod);
     formula_names_mod.addImport("zlsx_xid", xid_mod);
     formula_names_mod.addImport("zlsx_casefold", unicode_mod);
@@ -1044,6 +1115,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .fuzz = true,
     });
+    formula_names_fuzz_mod.addImport("zlsx_control", control_mod);
     formula_names_fuzz_mod.addImport("zlsx_refs", refs_mod);
     formula_names_fuzz_mod.addImport("zlsx_xid", xid_mod);
     formula_names_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
@@ -1063,6 +1135,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .fuzz = true,
     });
+    formula_decode_fuzz_mod.addImport("zlsx_control", control_mod);
     formula_decode_fuzz_mod.addImport("zlsx_refs", refs_mod);
     formula_decode_fuzz_mod.addImport("zlsx_xid", xid_mod);
     formula_decode_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
@@ -1080,6 +1153,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_symbols_mod.addImport("zlsx_control", control_mod);
     formula_symbols_mod.addImport("zlsx_refs", refs_mod);
     formula_symbols_mod.addImport("zlsx_xid", xid_mod);
     formula_symbols_mod.addImport("zlsx_casefold", unicode_mod);
@@ -1102,6 +1176,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_pkg_mod.addImport("zlsx_control", control_mod);
     formula_pkg_mod.addImport("zlsx_refs", refs_mod);
     formula_pkg_mod.addImport("zlsx_xid", xid_mod);
     // M4f: the package-facing formula module reaches `registry.zig`,
@@ -1125,6 +1200,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .fuzz = true,
     });
+    formula_eval_fuzz_mod.addImport("zlsx_control", control_mod);
     formula_eval_fuzz_mod.addImport("zlsx_refs", refs_mod);
     formula_eval_fuzz_mod.addImport("zlsx_xid", xid_mod);
     formula_eval_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
@@ -1147,6 +1223,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    formula_rewriter_mod.addImport("zlsx_control", control_mod);
     formula_rewriter_mod.addImport("zlsx_refs", refs_mod);
     formula_rewriter_mod.addImport("zlsx_xid", xid_mod);
     const formula_rewriter_tests = b.addTest(.{ .root_module = formula_rewriter_mod });
@@ -1166,6 +1243,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    package_mod.addImport("zlsx_control", control_mod);
     package_mod.addImport("zlsx", zlsx_mod);
     // B3 iter-wr-1: workbook.zig stages strings through the shared
     // SST plan substrate via a named import (`@import("zlsx_sst_plan")`)
@@ -1218,6 +1296,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    recalc_mod.addImport("zlsx_control", control_mod);
     recalc_mod.addImport("zlsx", zlsx_mod);
     recalc_mod.addImport("zlsx_pkg", package_mod);
 
@@ -1236,6 +1315,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    recalc_tests_mod.addImport("zlsx_control", control_mod);
     recalc_tests_mod.addImport("zlsx", zlsx_mod);
     recalc_tests_mod.addImport("zlsx_pkg", package_mod);
     const recalc_tests = b.addTest(.{ .root_module = recalc_tests_mod });
@@ -1266,6 +1346,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    extract_images_mod.addImport("zlsx_control", control_mod);
     extract_images_mod.addImport("zlsx_pkg", package_mod);
     const extract_images_exe = b.addExecutable(.{
         .name = "zlsx-extract-images",
@@ -1284,6 +1365,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    emb4_fixture_mod.addImport("zlsx_control", control_mod);
     emb4_fixture_mod.addImport("zlsx_pkg", package_mod);
     emb4_fixture_mod.addImport("zlsx", zlsx_mod);
     const emb4_fixture_exe = b.addExecutable(.{
@@ -1303,6 +1385,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    emb4_verify_mod.addImport("zlsx_control", control_mod);
     emb4_verify_mod.addImport("zlsx_pkg", package_mod);
     const emb4_verify_exe = b.addExecutable(.{
         .name = "zlsx-emb4-verify",
@@ -1324,6 +1407,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    emb4_passive_mod.addImport("zlsx_control", control_mod);
     emb4_passive_mod.addImport("zlsx_pkg", package_mod);
     const emb4_passive_exe = b.addExecutable(.{
         .name = "zlsx-emb4-passive-save",
@@ -1364,12 +1448,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    emb4b_carriers_mod.addImport("zlsx_control", control_mod);
 
     const emb4b_fixture_mod = b.createModule(.{
         .root_source_file = b.path("tests/emb-4b/carrier_gen.zig"),
         .target = target,
         .optimize = optimize,
     });
+    emb4b_fixture_mod.addImport("zlsx_control", control_mod);
     emb4b_fixture_mod.addImport("zlsx_pkg", package_mod);
     emb4b_fixture_mod.addImport("zlsx", zlsx_mod);
     emb4b_fixture_mod.addImport("emb4b_carriers", emb4b_carriers_mod);
@@ -1390,6 +1476,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    emb4b_verify_mod.addImport("zlsx_control", control_mod);
     emb4b_verify_mod.addImport("zlsx_pkg", package_mod);
     emb4b_verify_mod.addImport("emb4b_carriers", emb4b_carriers_mod);
     const emb4b_verify_exe = b.addExecutable(.{
@@ -1421,6 +1508,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    emb4b_carriers_tests_mod.addImport("zlsx_control", control_mod);
     const emb4b_carriers_tests = b.addTest(.{ .root_module = emb4b_carriers_tests_mod });
     test_step.dependOn(&b.addRunArtifact(emb4b_carriers_tests).step);
 
@@ -1429,6 +1517,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    emb4b_gen_tests_mod.addImport("zlsx_control", control_mod);
     emb4b_gen_tests_mod.addImport("zlsx_pkg", package_mod);
     emb4b_gen_tests_mod.addImport("zlsx", zlsx_mod);
     emb4b_gen_tests_mod.addImport("emb4b_carriers", emb4b_carriers_mod);
@@ -1442,6 +1531,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    package_store_tests_mod.addImport("zlsx_control", control_mod);
     package_store_tests_mod.addImport("zlsx", zlsx_mod);
     const package_store_tests = b.addTest(.{ .root_module = package_store_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_store_tests).step);
@@ -1451,6 +1541,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    package_drawings_tests_mod.addImport("zlsx_control", control_mod);
     package_drawings_tests_mod.addImport("zlsx", zlsx_mod);
     const package_drawings_tests = b.addTest(.{ .root_module = package_drawings_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_drawings_tests).step);
@@ -1464,6 +1555,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    package_typed_parts_tests_mod.addImport("zlsx_control", control_mod);
     const package_typed_parts_tests = b.addTest(.{ .root_module = package_typed_parts_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_typed_parts_tests).step);
 
@@ -1476,6 +1568,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    embedding_part_tests_mod.addImport("zlsx_control", control_mod);
     embedding_part_tests_mod.addImport("zlsx_nfc", nfc_mod);
     embedding_part_tests_mod.addImport("zlsx_refs", refs_mod);
     const embedding_part_tests = b.addTest(.{ .root_module = embedding_part_tests_mod });
@@ -1490,6 +1583,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    recovery_record_tests_mod.addImport("zlsx_control", control_mod);
     const recovery_record_tests = b.addTest(.{ .root_module = recovery_record_tests_mod });
     test_step.dependOn(&b.addRunArtifact(recovery_record_tests).step);
 
@@ -1504,6 +1598,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    package_workbook_tests_mod.addImport("zlsx_control", control_mod);
     package_workbook_tests_mod.addImport("zlsx", zlsx_mod);
     package_workbook_tests_mod.addImport("zlsx_sst_plan", sst_plan_mod);
     package_workbook_tests_mod.addImport("zlsx_styles_plan", styles_plan_mod);
@@ -1530,6 +1625,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    package_recalc_txn_tests_mod.addImport("zlsx_control", control_mod);
     package_recalc_txn_tests_mod.addImport("zlsx", zlsx_mod);
     package_recalc_txn_tests_mod.addImport("zlsx_sst_plan", sst_plan_mod);
     package_recalc_txn_tests_mod.addImport("zlsx_styles_plan", styles_plan_mod);
@@ -1555,6 +1651,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    package_editor_tests_mod.addImport("zlsx_control", control_mod);
     package_editor_tests_mod.addImport("zlsx", zlsx_mod);
     package_editor_tests_mod.addImport("zlsx_sst_plan", sst_plan_mod);
     package_editor_tests_mod.addImport("zlsx_styles_plan", styles_plan_mod);
@@ -1578,6 +1675,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .fuzz = true,
     });
+    package_fuzz_mod.addImport("zlsx_control", control_mod);
     package_fuzz_mod.addImport("zlsx", zlsx_mod);
     const package_fuzz_tests = b.addTest(.{
         .root_module = package_fuzz_mod,
@@ -1627,6 +1725,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    package_corpus_mod.addImport("zlsx_control", control_mod);
     package_corpus_mod.addImport("zlsx_pkg", package_mod);
     const package_corpus_tests = b.addTest(.{ .root_module = package_corpus_mod });
     corpus_step.dependOn(&b.addRunArtifact(package_corpus_tests).step);
@@ -1640,6 +1739,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    typed_parts_corpus_mod.addImport("zlsx_control", control_mod);
     typed_parts_corpus_mod.addImport("zlsx_pkg", package_mod);
     const typed_parts_corpus_tests = b.addTest(.{ .root_module = typed_parts_corpus_mod });
     corpus_step.dependOn(&b.addRunArtifact(typed_parts_corpus_tests).step);
@@ -1654,6 +1754,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    workbook_corpus_mod.addImport("zlsx_control", control_mod);
     workbook_corpus_mod.addImport("zlsx_pkg", package_mod);
     const workbook_corpus_tests = b.addTest(.{ .root_module = workbook_corpus_mod });
     corpus_step.dependOn(&b.addRunArtifact(workbook_corpus_tests).step);
@@ -1667,6 +1768,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .single_threaded = single_threaded,
     });
+    c_abi_mod.addImport("zlsx_control", control_mod);
     c_abi_mod.addImport("build_options", build_options_mod);
     c_abi_mod.addImport("fuzz_config", fuzz_config_mod);
     // After the B2 iter-er-0 Editor relocation, c_abi reaches Editor
@@ -1743,11 +1845,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = bench_optimize,
     });
+    bench_rss_mod.addImport("zlsx_control", control_mod);
     const bench_synth_mod = b.createModule(.{
         .root_source_file = b.path("tests/bench/synth_100k_x_10.zig"),
         .target = target,
         .optimize = bench_optimize,
     });
+    bench_synth_mod.addImport("zlsx_control", control_mod);
     bench_synth_mod.addImport("zlsx", zlsx_mod);
 
     // Probe 1 — synth. Pulls `zlsx` (writer) only; no pkg.
@@ -1756,6 +1860,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = bench_optimize,
     });
+    probe_synth_mod.addImport("zlsx_control", control_mod);
     probe_synth_mod.addImport("synth", bench_synth_mod);
     const probe_synth_exe = b.addExecutable(.{
         .name = "zlsx-bench-rss-synth",
@@ -1769,6 +1874,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = bench_optimize,
     });
+    probe_book_mod.addImport("zlsx_control", control_mod);
     probe_book_mod.addImport("zlsx", zlsx_mod);
     probe_book_mod.addImport("rss", bench_rss_mod);
     const probe_book_exe = b.addExecutable(.{
@@ -1785,6 +1891,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = bench_optimize,
     });
+    probe_wb_mod.addImport("zlsx_control", control_mod);
     probe_wb_mod.addImport("zlsx_pkg", package_mod);
     probe_wb_mod.addImport("rss", bench_rss_mod);
     const probe_wb_exe = b.addExecutable(.{
@@ -1800,6 +1907,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = bench_optimize,
     });
+    bench_workbook_rss_mod.addImport("zlsx_control", control_mod);
     bench_workbook_rss_mod.addImport("rss", bench_rss_mod);
     const bench_workbook_rss_tests = b.addTest(.{ .root_module = bench_workbook_rss_mod });
     const bench_workbook_rss_run = b.addRunArtifact(bench_workbook_rss_tests);
@@ -1831,6 +1939,7 @@ pub fn build(b: *std.Build) void {
         .optimize = bench_optimize,
         .single_threaded = single_threaded,
     });
+    bench_append_rows_mod.addImport("zlsx_control", control_mod);
     bench_append_rows_mod.addImport("zlsx", zlsx_mod);
     bench_append_rows_mod.addImport("zlsx_pkg", package_mod);
     const bench_append_rows_exe = b.addExecutable(.{
@@ -1871,6 +1980,7 @@ pub fn build(b: *std.Build) void {
         .optimize = bench_optimize,
         .single_threaded = single_threaded,
     });
+    bench_read_mod.addImport("zlsx_control", control_mod);
     bench_read_mod.addImport("zlsx", zlsx_mod);
     const bench_read_exe = b.addExecutable(.{
         .name = "zlsx-bench-read",
@@ -1883,6 +1993,7 @@ pub fn build(b: *std.Build) void {
         .optimize = bench_optimize,
         .single_threaded = single_threaded,
     });
+    bench_write_mod.addImport("zlsx_control", control_mod);
     bench_write_mod.addImport("zlsx", zlsx_mod);
     const bench_write_exe = b.addExecutable(.{
         .name = "zlsx-bench-write",

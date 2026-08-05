@@ -101,4 +101,13 @@ pub const recovery_record = @import("recovery_record.zig");
 /// rename, which means the candidate is part of the package's surface
 /// and not an implementation detail of one method.
 pub const recalc_txn = @import("recalc_txn.zig");
+
+/// M5d1: §5.5's cancellation / deadline seam. Re-exported because
+/// `Workbook.openBufferControlled` takes a `Control` and a consumer of
+/// this module has to be able to spell it — the same reason `Edit` is
+/// here. `CancelToken` comes with it: a caller supplying a control has to
+/// construct one of the two token arms.
+pub const control = @import("zlsx_control");
+pub const Control = control.Control;
+pub const CancelToken = control.CancelToken;
 pub const RetainedGeneration = workbook_mod.RetainedGeneration;

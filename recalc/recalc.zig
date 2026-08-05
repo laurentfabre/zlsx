@@ -70,6 +70,20 @@ pub const recalc_txn = pkg.recalc_txn;
 /// only imports the orchestrator can name the bound it is subject to.
 pub const max_output_archive_bytes = zlsx.max_output_archive_bytes;
 
+/// §5.10's `Control`, which M5d3's `writerSaveWithRecalc` threads into
+/// BOTH pre-recalc stages. Nameable from the orchestrator module because
+/// that is where a caller composing the two halves lives; the identity
+/// assertion below is the same argument as the `Edit.cell` one above —
+/// two `Control` types with identical fields would make the threading
+/// uncompilable for reasons no error message would explain.
+pub const Control = zlsx.Control;
+pub const CancelToken = zlsx.CancelToken;
+
+comptime {
+    assert(Control == pkg.Control);
+    assert(@FieldType(Control, "cancel") == ?CancelToken);
+}
+
 // ─── tests ───────────────────────────────────────────────────────
 
 const testing = std.testing;

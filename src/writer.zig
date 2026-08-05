@@ -86,6 +86,12 @@ const sheet_plan = @import("zlsx_sheet_plan");
 // callback so the deflate impl in this file stays downstream.
 const fresh_emit = @import("zlsx_fresh_emit");
 
+// M5d1: the cancellation / deadline / 64 KiB-chunk seam (§5.5, §5.10).
+// Std-only leaf, so importing it here does not put the formula engine in
+// `writer_mod`'s graph — which is the reason `CancelToken` moved out of
+// `src/formula/run_inputs.zig` and into it.
+const control = @import("zlsx_control");
+
 /// Function-pointer adapter wrapping `deflateCompress` with the
 /// `anyerror!void` return type that `zip.Archive.addEntry`'s
 /// `DeflateFn` expects.
@@ -93,8 +99,9 @@ fn deflateCompressErased(
     alloc: Allocator,
     input: []const u8,
     out: *std.ArrayListUnmanaged(u8),
+    poller: control.Poller,
 ) anyerror!void {
-    return deflateCompress(alloc, input, out);
+    return deflateCompressControlled(alloc, input, out, poller);
 }
 
 /// B3 iter-wr-6: `projectConditionalFormat` retired — `Writer.save`
@@ -520,7 +527,7 @@ pub const Writer = struct {
         const inputs = try self.projectSheets();
         defer self.allocator.free(inputs);
 
-        return fresh_emit.saveArchiveToPath(self.allocator, io, path, self.archiveInputs(inputs), deflateCompressErased);
+        return fresh_emit.saveArchiveToPath(self.allocator, io, path, self.archiveInputs(inputs), deflateCompressErased, .none);
     }
 
     /// Serialise everything into a freshly allocated buffer instead of a
@@ -545,13 +552,37 @@ pub const Writer = struct {
     /// `Writer.max_output_archive_bytes` (§9) — the same error, from the
     /// same check, that `save` gives for the same workbook.
     ///
-    /// **`io` is unused today, and is a parameter anyway.** M5d1 adds
-    /// `saveToOwnedBufferControlled(allocator, io, ctl)` and makes this
-    /// the null-control forwarder; a deadline needs a clock, so that one
-    /// needs an `Io`. Taking it now is what keeps §12.1's signature
-    /// stable across that row instead of widening a shipped API later.
+    /// `io` is what M5c reserved the slot for: M5d1's
+    /// `saveToOwnedBufferControlled` needs a clock to read a deadline
+    /// against, and this is now its null-control forwarder. §12.1's
+    /// signature never widened.
     pub fn saveToOwnedBuffer(self: *Writer, allocator: Allocator, io: std.Io) ![]u8 {
-        _ = io;
+        return self.saveToOwnedBufferControlled(allocator, io, .none);
+    }
+
+    /// §5.10's control-aware producer.
+    ///
+    /// Fresh serialization can process gigabytes *before* a recalc even
+    /// begins, so an orchestrator that promised a deadline has to be able
+    /// to reach into it. `ctl` rides the same M5d1 seams the rest of the
+    /// archive layer polls — per entry in `zip.Archive.addEntry`, and per
+    /// 64 KiB inside the deflate of each one.
+    ///
+    /// On `error.Cancelled` the partial buffer is freed and nothing is
+    /// mutated: this stage sits entirely before §5.7.9's commit point, and
+    /// the Writer's own registries are untouched by a save either way.
+    ///
+    /// Under a null control this is `saveToOwnedBuffer` — not "equivalent
+    /// to", but the same instructions: `Watch.poller` returns
+    /// `Poller.none` for a disarmed control, so no callback exists to
+    /// call. The byte-equivalence test below is a regression guard on
+    /// that, not the proof of it.
+    pub fn saveToOwnedBufferControlled(
+        self: *Writer,
+        allocator: Allocator,
+        io: std.Io,
+        ctl: control.Control,
+    ) ![]u8 {
         if (self.sheets.items.len == 0) return error.NoSheets;
 
         const inputs = try self.projectSheets();
@@ -560,7 +591,14 @@ pub const Writer = struct {
         var zip_buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer zip_buf.deinit(allocator);
 
-        try fresh_emit.emitArchiveBytes(allocator, &zip_buf, self.archiveInputs(inputs), deflateCompressErased);
+        const watch: control.Watch = .init(io, ctl);
+        try fresh_emit.emitArchiveBytes(
+            allocator,
+            &zip_buf,
+            self.archiveInputs(inputs),
+            deflateCompressErased,
+            watch.poller(),
+        );
         return zip_buf.toOwnedSlice(allocator);
     }
 
@@ -1332,6 +1370,31 @@ const isForbiddenXmlByte = sheet_plan.isForbiddenXmlByte;
 /// hand-rolled tokenizer / bit-writer / codegen behind this function
 /// are retired in favour of stdlib.
 pub fn deflateCompress(alloc: Allocator, input: []const u8, out: *std.ArrayListUnmanaged(u8)) !void {
+    return deflateCompressControlled(alloc, input, out, .none);
+}
+
+/// `deflateCompress` with §5.5's poll seam threaded through it (M5d1).
+///
+/// The input is fed to the compressor in `control.chunk_bytes` pieces
+/// with a poll before each, which is the whole reason this variant
+/// exists: `writeAll` of a 200 MiB sheet is a single uninterruptible call
+/// no matter what the caller's token says, and a producer that cannot be
+/// interrupted while compressing cannot honour a deadline the orchestrator
+/// promised.
+///
+/// **The chunking is invisible in the output.** `std.compress.flate.Compress`
+/// is a streaming encoder over one window; how the bytes arrive at its
+/// writer does not change the block boundaries it chooses, so the emitted
+/// deflate stream is identical to the one a single `writeAll` produced.
+/// The byte-equivalence tests below hold that claim down — a compressor
+/// that flushed per call would have silently changed every archive zlsx
+/// has ever written.
+pub fn deflateCompressControlled(
+    alloc: Allocator,
+    input: []const u8,
+    out: *std.ArrayListUnmanaged(u8),
+    poller: control.Poller,
+) !void {
     std.debug.assert(input.len > 0);
 
     // `Allocating.fromArrayList` adopts the list's existing buffer, and
@@ -1358,7 +1421,8 @@ pub fn deflateCompress(alloc: Allocator, input: []const u8, out: *std.ArrayListU
         // lazy-matching behaviour the in-house encoder implemented.
         .default,
     );
-    try comp.writer.writeAll(input);
+    var it = poller.chunks(input);
+    while (try it.next()) |chunk| try comp.writer.writeAll(chunk);
     try comp.finish();
 }
 
@@ -5042,6 +5106,116 @@ test "Writer: saveToOwnedBuffer is byte-identical to save" {
     // 0 / 0x21), so identical inputs owe identical bytes — not merely
     // equivalent archives.
     try std.testing.expectEqualSlices(u8, from_disk, from_buffer);
+}
+
+// ─── M5d1: the control-aware producer (§5.10) ────────────────────────
+
+/// A workbook whose sheet body is many `chunk_bytes` long, so the
+/// serialization of it spans enough chunks for a mid-operation trip to
+/// mean something. High-entropy strings, so deflate does not collapse it
+/// back to one chunk.
+fn buildLargeWorkbook(w: *Writer, rows: usize) !void {
+    var s = try w.addSheet("Big");
+    var rng: std.Random.DefaultPrng = .init(0x5d1_5d1);
+    var cell: [64]u8 = undefined;
+    for (0..rows) |_| {
+        rng.random().bytes(&cell);
+        for (&cell) |*c| c.* = 'a' + (c.* % 26);
+        try s.writeRow(&.{ .{ .string = &cell }, .{ .integer = 1 } });
+    }
+}
+
+test "M5d1: saveToOwnedBufferControlled under a null control is byte-identical" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var w = Writer.init(a);
+    defer w.deinit();
+    try buildParityWorkbook(&w);
+
+    const plain = try w.saveToOwnedBuffer(a, io);
+    defer a.free(plain);
+    const controlled = try w.saveToOwnedBufferControlled(a, io, .none);
+    defer a.free(controlled);
+
+    // Not a coincidence of an equivalent archive: the same bytes. A
+    // disarmed control yields `Poller.none`, so the two calls run the
+    // same code — and the chunked deflate produces the same stream as
+    // the single `writeAll` it replaced.
+    try std.testing.expectEqualSlices(u8, plain, controlled);
+}
+
+test "M5d1: cancel mid-fresh-serialization frees the partial buffer" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+
+    var w = Writer.init(a);
+    defer w.deinit();
+    try buildLargeWorkbook(&w, 4000);
+
+    // Trip several polls in — past the first entries, inside the deflate
+    // of the sheet body. The injected clock counts polls; the deadline
+    // is what makes every poll read it.
+    var flag: u8 = 0;
+    const io = control.inject.wrap(threaded.io(), .{ .trip_at = 6, .trip_flag = &flag });
+    try std.testing.expectError(error.Cancelled, w.saveToOwnedBufferControlled(a, io, .{
+        .cancel = .{ .flag = &flag },
+        .deadline = .{ .nanoseconds = std.math.maxInt(i64) },
+    }));
+    try std.testing.expect(control.inject.state.now_calls >= 6);
+
+    // The Writer is untouched by a failed save — it never was consumed
+    // by a successful one either — so it still serialises.
+    const after = try w.saveToOwnedBuffer(a, threaded.io());
+    defer a.free(after);
+    try std.testing.expect(after.len > 22);
+}
+
+test "M5d1: a deadline expires mid-fresh-serialization" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+
+    var w = Writer.init(a);
+    defer w.deinit();
+    try buildLargeWorkbook(&w, 4000);
+
+    // 1 ms per poll against a 5 ms budget: the sixth read is past it.
+    const io = control.inject.wrap(threaded.io(), .{ .step_ns = std.time.ns_per_ms });
+    try std.testing.expectError(error.Cancelled, w.saveToOwnedBufferControlled(a, io, .{
+        .deadline = .{ .nanoseconds = 5 * std.time.ns_per_ms },
+    }));
+}
+
+test "M5d1: fresh serialization polls at least once per 64 KiB" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+
+    var w = Writer.init(a);
+    defer w.deinit();
+    try buildLargeWorkbook(&w, 8000);
+
+    // Baseline: how many uncompressed bytes the emitter feeds through
+    // the seam. The sheet body dominates; measuring it directly avoids
+    // asserting a constant that a format change would silently falsify.
+    const body_len = w.sheets.items[0].body.items.len;
+    try std.testing.expect(control.chunkCount(body_len) > 4);
+
+    // A clock that never advances: the deadline cannot fire, so every
+    // poll is one counted read and nothing ends the run early.
+    const io = control.inject.wrap(threaded.io(), .{});
+    const bytes = try w.saveToOwnedBufferControlled(a, io, .{
+        .deadline = .{ .nanoseconds = std.math.maxInt(i64) },
+    });
+    defer a.free(bytes);
+
+    // §5.5's bound, measured: the sheet part alone owes this many polls,
+    // and the run performed at least that many.
+    try std.testing.expect(control.inject.state.now_calls >= control.chunkCount(body_len));
 }
 
 test "Writer: saveToOwnedBuffer round-trips through Book.openBuffer" {
