@@ -1,0 +1,67 @@
+{
+  "_note": [
+    "§9.1's M5d3 recalc baseline, in hyperfine's export schema, so",
+    "`compare_bench.py --gate <this> <current>` can be run against it.",
+    "",
+    "Transcribed from goal_formula.md §9.1 rather than re-exported: the",
+    "M5d3 measurement predates any committed baseline file, and one run",
+    "of the named workload took ~2 minutes there — re-running N=20 across",
+    "three modes to recover a JSON that already exists as a recorded",
+    "table would cost ~2 hours and measure a different afternoon's",
+    "thermals. Every `median` below is the corresponding cell of that",
+    "table; `stddev` is present only for the `recalc` lane, which is the",
+    "only one §9.1 recorded a σ for. No `times` array: the raw samples",
+    "were never kept, so `compare_bench.py` reports `p95 = —` for the",
+    "base side and gates on the median, which is the statistic §9 names.",
+    "",
+    "Host: Apple M3 Max (16 cores, 128 GiB), macOS 26.5.2, arm64, Zig",
+    "0.16.0, ReleaseFast, warm cache, hyperfine -N --warmup 5 --runs 20.",
+    "Recorded 2026-08-05 on feat/m5d3-recalc-composition @ 44365a9,",
+    "against workload digest",
+    "b2b42c0b67703a8a4935ddc525213ebeabf0568507bedded120ac23c32778ad0.",
+    "The digest and these numbers are one artifact: if",
+    "`zlsx-bench-recalc emit --size named` ever stops agreeing with that",
+    "digest, this file describes a workbook that no longer exists."
+  ],
+  "results": [
+    {
+      "command": "recalc-open:f1_mix_tiny",
+      "median": 0.00166
+    },
+    {
+      "command": "recalc-eval:f1_mix_tiny",
+      "median": 0.02190,
+      "stddev": 0.00024
+    },
+    {
+      "command": "recalc-save:f1_mix_tiny",
+      "median": 0.02200
+    },
+    {
+      "command": "recalc-open:f1_mix_small",
+      "median": 0.00165
+    },
+    {
+      "command": "recalc-eval:f1_mix_small",
+      "median": 1.39039,
+      "stddev": 0.08857
+    },
+    {
+      "command": "recalc-save:f1_mix_small",
+      "median": 1.43096
+    },
+    {
+      "command": "recalc-open:f1_mix_named",
+      "median": 0.00171
+    },
+    {
+      "command": "recalc-eval:f1_mix_named",
+      "median": 133.45265,
+      "stddev": 9.70341
+    },
+    {
+      "command": "recalc-save:f1_mix_named",
+      "median": 127.69055
+    }
+  ]
+}

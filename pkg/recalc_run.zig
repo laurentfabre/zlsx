@@ -527,6 +527,14 @@ const Driver = struct {
     watch: *const control.Watch,
 
     published: std.ArrayListUnmanaged(Published) = .empty,
+    /// Where each cell sits in `published`.
+    ///
+    /// The list keeps its order — `stage` walks it per sheet and the
+    /// projection is handed the result — but a shape note and a publish
+    /// each looked their own cell up by scanning it, which made a run
+    /// cost O(cells²) and was, after M5d4's other fixes, the largest
+    /// single cost left in the pipeline.
+    published_at: std.AutoHashMapUnmanaged(engine.env.CellRef, u32) = .empty,
     /// A plane-2 refusal with the detail the engine's own `PlaneTwo`
     /// cannot carry.
     refused_plane: ?engine.decode.PlaneTwo = null,
@@ -536,6 +544,14 @@ const Driver = struct {
 
     fn deinit(self: *Driver) void {
         self.published.deinit(self.gpa);
+        self.published_at.deinit(self.gpa);
+    }
+
+    /// Append one entry and record where it landed.
+    fn track(self: *Driver, p: Published) error{OutOfMemory}!void {
+        try self.published.append(self.gpa, p);
+        errdefer _ = self.published.pop();
+        try self.published_at.put(self.gpa, p.cell, @intCast(self.published.items.len - 1));
     }
 
     fn host(self: *Driver) engine.iterate.Host {
@@ -602,13 +618,11 @@ const Driver = struct {
     }
 
     fn noteShape(self: *Driver, cell: engine.env.CellRef, shape: engine.value.Shape) !void {
-        for (self.published.items) |*p| {
-            if (p.cell.eql(cell)) {
-                p.shape = shape;
-                return;
-            }
+        if (self.published_at.get(cell)) |i| {
+            self.published.items[i].shape = shape;
+            return;
         }
-        try self.published.append(self.gpa, .{
+        try self.track(.{
             .cell = cell,
             .value = .blank,
             .shape = shape,
@@ -633,18 +647,17 @@ const Driver = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => self.failure = Error.SheetNotFound,
         };
-        for (self.published.items) |*p| {
-            if (p.cell.eql(cell)) {
-                p.value = scalar;
-                p.has_value = true;
-                // `shape` is deliberately not touched: the snapshot the
-                // engine hands back is already narrowed to a scalar, and
-                // the entry `evaluate` made carries the shape the gate
-                // needs.
-                return;
-            }
+        if (self.published_at.get(cell)) |i| {
+            const p = &self.published.items[i];
+            p.value = scalar;
+            p.has_value = true;
+            // `shape` is deliberately not touched: the snapshot the
+            // engine hands back is already narrowed to a scalar, and
+            // the entry `evaluate` made carries the shape the gate
+            // needs.
+            return;
         }
-        try self.published.append(self.gpa, .{
+        try self.track(.{
             .cell = cell,
             .value = scalar,
             .shape = v.shape(),
@@ -659,13 +672,16 @@ const Driver = struct {
     fn vtRetract(ctx: *anyopaque, cell: engine.env.CellRef) void {
         const self = of(ctx);
         self.model.clearComputed(cell.sheet, cell.row, cell.col);
-        var i = self.published.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (self.published.items[i].cell.eql(cell)) {
-                _ = self.published.orderedRemove(i);
-                return;
-            }
+        const found = self.published_at.fetchRemove(cell) orelse return;
+        const at = found.value;
+        _ = self.published.orderedRemove(at);
+        // A rollback replays the journal backwards, so the entry being
+        // dropped is normally the last one and this repairs nothing. It
+        // is a loop because "normally" is not "always": a cell whose
+        // shape was noted but which never published leaves an entry
+        // behind the one being removed.
+        for (self.published.items[at..]) |p| {
+            if (self.published_at.getPtr(p.cell)) |slot| slot.* -= 1;
         }
     }
 };

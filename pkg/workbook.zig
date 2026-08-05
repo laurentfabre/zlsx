@@ -8445,11 +8445,15 @@ pub const GraphBridge = struct {
             const idx = engine.env.SheetIndex.fromInt(@intCast(i));
             // Sorted by (row, col, layer descending), so the first entry
             // at a coordinate is the merged one and the rest are shadowed.
-            for (sheet.cells.items, 0..) |c, k| {
-                if (k > 0) {
-                    const prev = sheet.cells.items[k - 1];
-                    if (prev.row == c.row and prev.col == c.col) continue;
-                }
+            var cur = sheet.start();
+            var previous: ?WorkbookEnv.Cell = null;
+            while (sheet.at(cur)) |c| : (cur = sheet.next(cur)) {
+                const shadowed = if (previous) |p|
+                    p.row == c.row and p.col == c.col
+                else
+                    false;
+                previous = c;
+                if (shadowed) continue;
                 const text = c.formula_text orelse continue;
                 try cells.append(a, .{
                     .cell = .{ .sheet = idx, .row = c.row, .col = c.col },
@@ -8683,8 +8687,200 @@ pub const WorkbookEnv = struct {
     /// Sorted by (row, col, layer descending), so a merged read is the
     /// first hit of a binary search rather than a scan — the same
     /// invariant `env.Fake` keeps, for the same reason.
+    ///
+    /// **The order is the contract; the storage is not.** Held as a
+    /// directory of bounded chunks rather than one flat array, because a
+    /// flat array pays one `memmove` of everything past the insertion
+    /// point per published cell — quadratic in the sheet's cell count,
+    /// and 42 % of §9.1's M5d3 baseline. A chunk bounds that move to
+    /// `chunk_cap` entries no matter how large the sheet is, so
+    /// publication is O(1) in the cell count. Every reader still walks
+    /// exactly one ascending sequence, and it is the same sequence.
     pub const Sheet = struct {
-        cells: std.ArrayListUnmanaged(Cell) = .empty,
+        /// Non-empty chunks, in key order, addressed by pointer. A split
+        /// inserts here too; moving eight bytes per chunk is what keeps
+        /// the split from re-introducing the term it exists to remove.
+        chunks: std.ArrayListUnmanaged(*Chunk) = .empty,
+
+        /// Insertion moves at most `chunk_cap` entries and, amortised,
+        /// `2·len/chunk_cap²` directory slots. The sum is flattest
+        /// around 64 at the sizes §9 measures, and 64 keeps a chunk
+        /// inside a handful of cache lines besides.
+        const chunk_cap = 64;
+
+        pub const Chunk = struct {
+            items: [chunk_cap]Cell,
+            len: usize,
+        };
+
+        /// A position in key order. `chunk == chunks.len` is the end,
+        /// and is the only position `at` answers null for: a chunk is
+        /// dropped the moment it empties, so `off` always addresses a
+        /// live entry.
+        pub const Cursor = struct {
+            chunk: u32 = 0,
+            off: u32 = 0,
+        };
+
+        fn start(_: Sheet) Cursor {
+            return .{};
+        }
+
+        fn end(self: Sheet) Cursor {
+            return .{ .chunk = @intCast(self.chunks.items.len), .off = 0 };
+        }
+
+        fn at(self: Sheet, c: Cursor) ?Cell {
+            if (c.chunk >= self.chunks.items.len) return null;
+            const ch = self.chunks.items[c.chunk];
+            assert(c.off < ch.len);
+            return ch.items[c.off];
+        }
+
+        fn next(self: Sheet, c: Cursor) Cursor {
+            if (c.chunk >= self.chunks.items.len) return c;
+            const ch = self.chunks.items[c.chunk];
+            if (c.off + 1 < ch.len) return .{ .chunk = c.chunk, .off = c.off + 1 };
+            return .{ .chunk = c.chunk + 1, .off = 0 };
+        }
+
+        /// `EvalEnv`'s aligned-iterator cursors are a `[]usize` the
+        /// implementation owns the meaning of, so a two-part position
+        /// travels through one packed into two halves. `maxInt(usize)`
+        /// stays the caller's "not positioned yet" sentinel: it decodes
+        /// to a chunk index `max_modeled_cells` cannot reach.
+        fn pack(c: Cursor) usize {
+            return (@as(usize, c.chunk) << 32) | @as(usize, c.off);
+        }
+
+        fn unpack(x: usize) Cursor {
+            return .{ .chunk = @intCast(x >> 32), .off = @intCast(x & 0xffff_ffff) };
+        }
+
+        /// The first position whose entry is not less than the key.
+        fn lowerBound(
+            self: Sheet,
+            row: coords.Row,
+            col: coords.Col,
+            layer: engine.env.Layer,
+        ) Cursor {
+            var lo: usize = 0;
+            var hi: usize = self.chunks.items.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const ch = self.chunks.items[mid];
+                if (lessThanKey(ch.items[ch.len - 1], row, col, layer)) lo = mid + 1 else hi = mid;
+            }
+            if (lo >= self.chunks.items.len) return self.end();
+
+            const ch = self.chunks.items[lo];
+            var a: usize = 0;
+            var b: usize = ch.len;
+            while (a < b) {
+                const mid = a + (b - a) / 2;
+                if (lessThanKey(ch.items[mid], row, col, layer)) a = mid + 1 else b = mid;
+            }
+            // The chunk was chosen because its last entry is not less
+            // than the key, so the position is inside it.
+            assert(a < ch.len);
+            return .{ .chunk = @intCast(lo), .off = @intCast(a) };
+        }
+
+        /// Append an entry that sorts after everything already held —
+        /// the decode path's row-major run, which needs no search.
+        fn append(self: *Sheet, alloc: Allocator, c: Cell) Allocator.Error!void {
+            if (self.chunks.items.len > 0) {
+                const last = self.chunks.items[self.chunks.items.len - 1];
+                assert(lessThanKey(last.items[last.len - 1], c.row, c.col, c.layer));
+                if (last.len < chunk_cap) {
+                    last.items[last.len] = c;
+                    last.len += 1;
+                    return;
+                }
+            }
+            try self.openChunk(alloc, c);
+        }
+
+        /// Open a chunk past the end of the directory, holding `c`.
+        fn openChunk(self: *Sheet, alloc: Allocator, c: Cell) Allocator.Error!void {
+            try self.chunks.ensureUnusedCapacity(alloc, 1);
+            const ch = try alloc.create(Chunk);
+            ch.* = .{ .items = undefined, .len = 1 };
+            ch.items[0] = c;
+            self.chunks.appendAssumeCapacity(ch);
+        }
+
+        /// Insert or replace one cell in one layer, keeping the ordering
+        /// invariant by construction — there is no code path that could
+        /// return cells in insertion order, because there is no
+        /// insertion order.
+        fn insert(self: *Sheet, alloc: Allocator, c: Cell) Allocator.Error!void {
+            const cur = self.lowerBound(c.row, c.col, c.layer);
+            if (self.at(cur)) |existing| {
+                if (existing.row == c.row and existing.col == c.col and existing.layer == c.layer) {
+                    self.chunks.items[cur.chunk].items[cur.off] = c;
+                    return;
+                }
+            }
+
+            if (self.chunks.items.len == 0) return self.openChunk(alloc, c);
+
+            // Past the last entry: the tail of the last chunk is the
+            // same position in key order, and reusing it keeps an
+            // ascending run filling one chunk instead of opening one per
+            // entry.
+            var ci: usize = cur.chunk;
+            var off: usize = cur.off;
+            if (ci >= self.chunks.items.len) {
+                ci = self.chunks.items.len - 1;
+                off = self.chunks.items[ci].len;
+            }
+
+            if (self.chunks.items[ci].len == chunk_cap) {
+                try self.split(alloc, ci);
+                const left = self.chunks.items[ci].len;
+                // A position at the boundary belongs to either half; the
+                // left one is never full after a split, so take it.
+                if (off > left) {
+                    off -= left;
+                    ci += 1;
+                }
+            }
+
+            const ch = self.chunks.items[ci];
+            assert(ch.len < chunk_cap);
+            assert(off <= ch.len);
+            std.mem.copyBackwards(Cell, ch.items[off + 1 .. ch.len + 1], ch.items[off..ch.len]);
+            ch.items[off] = c;
+            ch.len += 1;
+        }
+
+        fn split(self: *Sheet, alloc: Allocator, ci: usize) Allocator.Error!void {
+            // Capacity first: a directory that could not grow would
+            // leave the right half allocated and unreachable, which is
+            // the one way a split can lose cells.
+            try self.chunks.ensureUnusedCapacity(alloc, 1);
+            const left = self.chunks.items[ci];
+            const half = left.len / 2;
+            assert(half > 0 and half < left.len);
+            const right = try alloc.create(Chunk);
+            right.* = .{ .items = undefined, .len = left.len - half };
+            @memcpy(right.items[0..right.len], left.items[half..left.len]);
+            left.len = half;
+            self.chunks.insertAssumeCapacity(ci + 1, right);
+        }
+
+        fn removeAt(self: *Sheet, cur: Cursor) void {
+            const ch = self.chunks.items[cur.chunk];
+            assert(cur.off < ch.len);
+            std.mem.copyForwards(
+                Cell,
+                ch.items[cur.off .. ch.len - 1],
+                ch.items[cur.off + 1 .. ch.len],
+            );
+            ch.len -= 1;
+            if (ch.len == 0) _ = self.chunks.orderedRemove(cur.chunk);
+        }
     };
 
     pub fn deinit(self: *WorkbookEnv) void {
@@ -8806,9 +9002,8 @@ pub const WorkbookEnv = struct {
 
             // Stored cells arrive row-major already, so appending keeps
             // the ordering invariant without a sort.
-            try sheets[idx].cells.ensureUnusedCapacity(a, scanned.cells.len);
             for (scanned.cells, formulas) |c, f| {
-                sheets[idx].cells.appendAssumeCapacity(.{
+                try sheets[idx].append(a, .{
                     .row = c.row,
                     .col = c.col,
                     .layer = .stored,
@@ -8856,7 +9051,7 @@ pub const WorkbookEnv = struct {
                 const row = coords.Row.fromOneBased(ref.row) catch continue;
                 const col = coords.Col.fromOneBased(ref.col) catch continue;
                 const staged = try stagedCell(a, row, col, entry.value_ptr.*);
-                try insertCell(a, &sheets[idx], staged);
+                try sheets[idx].insert(a, staged);
             }
         }
 
@@ -8922,9 +9117,8 @@ pub const WorkbookEnv = struct {
     /// would have found no formula to run.
     pub fn formulaAt(self: *WorkbookEnv, cell: engine.env.CellRef) engine.env.Error!?[]const u8 {
         const sheet = try self.sheetConst(cell.sheet);
-        var at = lowerBound(sheet.cells.items, cell.row, cell.col, .computed);
-        while (at < sheet.cells.items.len) : (at += 1) {
-            const c = sheet.cells.items[at];
+        var at = sheet.lowerBound(cell.row, cell.col, .computed);
+        while (sheet.at(at)) |c| : (at = sheet.next(at)) {
             if (c.row != cell.row or c.col != cell.col) break;
             if (c.formula_text) |t| return t;
         }
@@ -8951,7 +9145,7 @@ pub const WorkbookEnv = struct {
     ) engine.env.Error!void {
         const s = try self.sheetMut(sheet);
         const a = self.arena.allocator();
-        try insertCell(a, s, .{
+        try s.insert(a, .{
             .row = row,
             .col = col,
             .layer = .computed,
@@ -8974,11 +9168,10 @@ pub const WorkbookEnv = struct {
         col: coords.Col,
     ) void {
         const s = self.sheetMut(sheet) catch return;
-        const at = lowerBound(s.cells.items, row, col, .computed);
-        if (at >= s.cells.items.len) return;
-        const cur = s.cells.items[at];
+        const at = s.lowerBound(row, col, .computed);
+        const cur = s.at(at) orelse return;
         if (cur.row != row or cur.col != col or cur.layer != .computed) return;
-        _ = s.cells.orderedRemove(at);
+        s.removeAt(at);
     }
 
     pub fn evalEnv(self: *WorkbookEnv) engine.env.EvalEnv {
@@ -9015,9 +9208,7 @@ pub const WorkbookEnv = struct {
     /// nothing occupies it. Every accessor goes through this, which is
     /// why `cellValue` and `rangeIterator` cannot disagree.
     fn merged(s: *const Sheet, row: coords.Row, col: coords.Col) ?Cell {
-        const lo = lowerBound(s.cells.items, row, col, .computed);
-        if (lo >= s.cells.items.len) return null;
-        const c = s.cells.items[lo];
+        const c = s.at(s.lowerBound(row, col, .computed)) orelse return null;
         if (c.row != row or c.col != col) return null;
         return c;
     }
@@ -9058,34 +9249,33 @@ pub const WorkbookEnv = struct {
     const RangeState = struct {
         sheet: *const Sheet,
         area: engine.env.RangeRef,
-        idx: usize,
+        cur: Sheet.Cursor,
     };
 
     fn vtRangeIterator(ctx: *anyopaque, area: engine.env.RangeRef) engine.env.Error!engine.env.RangeIterator {
         const self = selfOf(ctx);
         const s = try self.sheetConst(area.sheet);
-        const start = lowerBound(s.cells.items, area.range.first.row, area.range.first.col, .computed);
+        const start = s.lowerBound(area.range.first.row, area.range.first.col, .computed);
         return engine.env.RangeIterator.wrap(
             RangeState,
-            .{ .sheet = s, .area = area, .idx = start },
+            .{ .sheet = s, .area = area, .cur = start },
             rangeNext,
         );
     }
 
     fn rangeNext(it: *engine.env.RangeIterator) engine.env.Error!?engine.env.Entry {
         const st = it.stateOf(RangeState);
-        const items = st.sheet.cells.items;
-        while (st.idx < items.len) {
-            const c = items[st.idx];
+        const s = st.sheet;
+        while (s.at(st.cur)) |c| {
             if (c.row.oneBased() > st.area.range.last.row.oneBased()) return null;
-            st.idx += 1;
+            st.cur = s.next(st.cur);
             const inside = st.area.offsetOf(c.row, c.col) != null;
             // Entries are layer-descending within a coordinate, so the
             // first one seen is the winner and the rest are shadowed.
-            while (st.idx < items.len and
-                items[st.idx].row == c.row and
-                items[st.idx].col == c.col) : (st.idx += 1)
-            {}
+            while (s.at(st.cur)) |shadowed| {
+                if (shadowed.row != c.row or shadowed.col != c.col) break;
+                st.cur = s.next(st.cur);
+            }
             if (!inside) continue;
             // An occupied coordinate with no value contributes nothing
             // to the merged view — but it still shadowed the layers
@@ -9170,12 +9360,11 @@ pub const WorkbookEnv = struct {
             const eff = try engine.env.effectiveArea(ar, st.dims, st.mode);
             const s = try st.env.sheetConst(eff.sheet);
             if (cursor.* == std.math.maxInt(usize)) {
-                cursor.* = lowerBound(
-                    s.cells.items,
+                cursor.* = Sheet.pack(s.lowerBound(
                     eff.range.first.row,
                     eff.range.first.col,
                     .computed,
-                );
+                ));
             }
             const off = advance(s, eff, cursor, st.offset) orelse continue;
             next_occupied = @min(next_occupied, off);
@@ -9217,36 +9406,21 @@ pub const WorkbookEnv = struct {
         cursor: *usize,
         from: u64,
     ) ?u64 {
-        const items = s.cells.items;
-        while (cursor.* < items.len) {
-            const c = items[cursor.*];
+        var cur = Sheet.unpack(cursor.*);
+        defer cursor.* = Sheet.pack(cur);
+        while (s.at(cur)) |c| {
             if (c.row.oneBased() > eff.range.last.row.oneBased()) return null;
             const off = eff.offsetOf(c.row, c.col) orelse {
-                cursor.* += 1;
+                cur = s.next(cur);
                 continue;
             };
             if (off < from or (merged(s, c.row, c.col) orelse c).v == null) {
-                cursor.* += 1;
+                cur = s.next(cur);
                 continue;
             }
             return off;
         }
         return null;
-    }
-
-    fn lowerBound(
-        items: []const Cell,
-        row: coords.Row,
-        col: coords.Col,
-        layer: engine.env.Layer,
-    ) usize {
-        var lo: usize = 0;
-        var hi: usize = items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (lessThanKey(items[mid], row, col, layer)) lo = mid + 1 else hi = mid;
-        }
-        return lo;
     }
 
     fn lessThanKey(
@@ -9260,22 +9434,6 @@ pub const WorkbookEnv = struct {
         // Layer descending: the highest-precedence entry for a
         // coordinate sorts first, so a merged read is the first hit.
         return c.layer.precedence() > layer.precedence();
-    }
-
-    /// Insert or replace one cell in one layer, keeping the ordering
-    /// invariant by construction — there is no code path that could
-    /// return cells in insertion order, because there is no insertion
-    /// order.
-    fn insertCell(a: Allocator, s: *Sheet, c: Cell) Allocator.Error!void {
-        const at = lowerBound(s.cells.items, c.row, c.col, c.layer);
-        if (at < s.cells.items.len) {
-            const cur = s.cells.items[at];
-            if (cur.row == c.row and cur.col == c.col and cur.layer == c.layer) {
-                s.cells.items[at] = c;
-                return;
-            }
-        }
-        try s.cells.insert(a, at, c);
     }
 
     /// Copy a value's text into the model's own arena. A `ScalarValue`

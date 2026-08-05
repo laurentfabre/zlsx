@@ -1116,8 +1116,9 @@ nodes**, one edge per member sheet (§5.6g); name nodes; table producers.
 A reference to a coordinate holding no formula contributes **no edge** —
 a constant cannot be recalculated, so it cannot constrain an order.
 Areas resolve against a producer index sorted **twice** (row-major and
-column-major), probed through whichever order makes the narrower band
-the leading key — the corrected form of "interval buckets", and what
+column-major), probed through whichever order has **fewer stored
+coordinates in the band it would walk** — counted, not inferred from the
+area's extent (M5d4) — the corrected form of "interval buckets", and what
 keeps `SUM(A:A)` and `SUM(1:1)` both proportional to what is stored.
 Order: SCC condensation, then **Kahn with a min-heap** over the
 condensation DAG — canonical, not merely reproducible — tie-break
@@ -1975,6 +1976,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M5d1** ✅ | Archive/durability substrate: **`AtomicFile.finish` fsync fix** + commit region + **cancellation-aware serialization seam** (the context-free `DeflateFn` at `pkg/zip.zig:64-68,140-144` AND PartStore's whole-input compression during preparation, `pkg/store.zig:370-385,498-512,638-656` — the shared compressor becomes context/callback-aware with 64 KiB chunks; the same chunking covers **decompression during model materialization** (`store.zig:881-916,1361-1384`), **raw-entry copies at save** (`:783-792`), XML scans, and temp-file writes, so the §5.5 polling bound holds across every long operation; cancel-inside-entry, cancel-inside-replacePart, and cancel-inside-materialization tests. **Control-aware buffer variants** — `saveToOwnedBufferControlled` / `openBufferControlled` (§5.10) wired to these seams, with cancel-mid-fresh-serialization and cancel-mid-buffer-open tests, so the Writer path meets the same bound. **Documented SLA exceptions: the blocking `File.sync` AND the post-commit POSIX directory fsync cannot be polled** — both uncancellable waits (no timeout; post-commit status is already success per §5.7.9), fault-injected tests for each, incl. Python worker-thread wait behavior) | Injected sync/rename failures; cancel-inside-* tests |
 | **M5d2** ✅ | `recalculate()` + `saveWithRecalc` (ordering §5.7.9) + report + pre-M7 gate + logical-view gate + embedding-staleness preflight. **The pipeline itself** (`pkg/recalc_run.zig`): model build → whole-workbook graph → §5.6c/§5.6e run → `ResolvedSheet` projection + patch → `recalc_txn.prepare` → swap (in-memory) or serialize-commit-swap-fsync (file). **`PartStore.saveCommitted`** — a `void`-returning `CommitHook` between rename and directory fsync, which is the only place §5.7.9's swap can go. **`RunInputs` reaches the evaluator** (clock, UTC offset, platform profile, `rng_v1` draw source + §5.6d schedule; epoch and CV workbook-derived). **No-formula identity is a rule, not an accident**: a workbook with no formula cells is left byte-identical, calc state included | Determinism; scoped idempotence; no-formula identity; confinement |
 | **M5d3** ✅ | `zlsx_recalc.writerSaveWithRecalc` — the orchestrator composition (`saveToOwnedBufferControlled` → `openBufferControlled` → M5d2's `saveWithRecalc`), with §5.10's `Control` threaded into **both** pre-recalc stages and cancellation proven *per stage* by counting the polls each one owes. **`tests/consumer` gains the third module**: a downstream package resolving `zlsx` + `zlsx_pkg` + `zlsx_recalc` through `b.dependency` and driving the composition, which is the only place the module identity a downstream build produces is checked. **Committed bench workloads** (`tests/bench/synth_f1_mix.zig`): a fixed-topology F1-mix generator at three sizes, §9's named 100k-cell workload digest-pinned, plus `zlsx-bench-recalc` (open / recalc / save / phases). **`compare_bench.py --gate`** — median-based, nonzero exit for release cuts; CI's report-only mean path unchanged, both exit behaviours gated. **The hyperfine lane was never ReleaseFast**: the bench modules hardcoded `bench_optimize` (ReleaseSafe) and discarded `-Doptimize` | Module-graph gate; bench baseline |
+| **M5d4** ✅ | **The recalc pipeline made linear.** §9.1's baseline was quadratic in cell count (×4 per row doubling); the profile named two O(n) operations inside per-cell loops, and removing them exposed five more of the same shape. All seven are one bug — **a membership test written as a scan** — and every fix keeps the order its callers depend on. `WorkbookEnv.Sheet` becomes a directory of 64-entry chunks: the (row, col, layer-descending) order is the contract, the flat array never was, and publication stops paying one `memmove` of the tail per cell. `iterate` gains membership indexes **beside** `pass_edges` / `touched` / `previous_reports` (the lists stay — they are what gets handed on), and turns `held`, `scope` and `changedComponents`' signature comparison into maps. `graph.Builder.captureAll` groups §5.6e's flat edge list by owner once instead of rescanning it per formula. `recalc_run.Driver` indexes `published`. **`Index.probe` picks its band by counting stored coordinates rather than by the area's extent** (§5.6a corrected — the extent is right for `SUM(A:A)` and wrong for `SUM(A5:A9)`; both pinned probe counts unchanged). Result on the digest-pinned named workload: `recalc` **133 452 → 905 ms (147×)**, `save` **127 690 → 917 ms**, evaluate 267× over §9's ceiling → **1.81×**, end-to-end 128× over → **under it**, "10k-vs-100k ≤ 15×" ×96.1 → **×11.0** | Determinism; scoped idempotence; no-formula identity; §5.7.9 ordering; workload digest; `compare_bench --gate` |
 | **M6** | CLI: NDJSON schemas, exit tables (incl. 130/143 + prefix-valid stream rule), mandatory `--sheet/--name`, `--out` identity | Contract tests |
 | **M7a** | DA evaluation + decision table + ownership + `A1#`/`@` + F2-DA natives (FILTER, SORT, SORTBY, UNIQUE, SEQUENCE, RANDARRAY, TRANSPOSE) + RANDARRAY KATs | Fixtures; obstruction fuzz |
 | **M7b1** | DA + CSE **persistence** (approved set; cm/vm collection-pinned transitions; tail ownership; tolerated-state proofs) | Excel-opens-clean per transition |
@@ -2605,12 +2607,19 @@ reference.
     it it is readers + producers.
 3. **The producer index is sorted twice, and the probe picks.**
     Row-major and column-major, and each area is probed through whichever
-    of the two makes its *narrower* band the leading key. `SUM(A:A)`
-    costs the cells stored in column A; `SUM(1:1)` costs the cells stored
-    in row 1; neither costs a million coordinates. One order would have
-    made exactly one of those two cheap. The instrument is
-    `stats.index_probes` — a counter, so the assertion is "40 candidates
-    examined", not "it felt fast".
+    of the two holds *fewer stored coordinates* in the band it would
+    walk. `SUM(A:A)` costs the cells stored in column A; `SUM(1:1)` costs
+    the cells stored in row 1; neither costs a million coordinates. One
+    order would have made exactly one of those two cheap. The instrument
+    is `stats.index_probes` — a counter, so the assertion is "40
+    candidates examined", not "it felt fast". **M5d4 corrected how the
+    pick is made**: the original rule took the area's *narrower extent*
+    as a proxy for the cheaper band, which is right for a whole column
+    or a whole row and wrong for `SUM(A5:A9)` — one column and five
+    rows, so the extent calls the column narrow, and the column band is
+    every cell stored in column A. Counting both bands (four binary
+    searches) picks what the extent picked wherever the extent was
+    right, and both pinned probe counts are unchanged.
 4. **A reference to a cell holding no formula contributes no edge, and
     the rule is written in the module header rather than discovered from
     the code.** A constant cannot be recalculated, so it cannot constrain
@@ -3553,6 +3562,85 @@ the rest of the ladder is measured against.
     of §5.7.9's claim that a no-fail swap belongs inside the commit
     region.
 
+**M5d4 decisions (shipped 2026-08-05).** Seven points, one bug. The row
+was scoped to the two costs §9.1's profile named; those two turned out to
+be the two visible members of a family, and the row is not done until the
+curve is straight — a baseline that is 147× faster and still quadratic
+would have to be re-measured at the next size anyway.
+
+1.  **Every one of the seven is a membership test written as a scan, and
+    every fix keeps the order the scan happened to provide.** That is the
+    invariant the whole row turns on. `pass_edges` is handed to the next
+    graph build in the order the run produced it; `previous_reports`
+    feeds the caller's report; `published` is walked per sheet and handed
+    to the projection; the cell store is walked by four readers and by
+    §5.7.9's ordering tests. So in each case the **list stays** and only
+    the lookup moves into a hash index — except where nothing read the
+    order at all (`held`, `scope`), where the list becomes the map it
+    always was. A change that made a run faster by reordering its output
+    would not be an optimisation; it would be a different run.
+2.  **`WorkbookEnv.Sheet` keeps its order and loses its array.** The
+    sorted-array invariant is stated in the type's doc comment and relied
+    on by `merged`, `formulaAt`, the range iterator, the aligned
+    iterator and `GraphBridge.buildInput` — but *sorted array* is two
+    claims, and only the first one is load-bearing. A directory of
+    64-entry chunks keeps the ordering and bounds an insertion's `memmove`
+    to one chunk, so publication is O(1) in the sheet's cell count
+    instead of O(n). 64 is where the per-insert cost (`chunk_cap/2`
+    entry moves) and the amortised split cost (`2·n/chunk_cap²`
+    directory slots, eight bytes each) are jointly flattest at the sizes
+    §9 measures.
+3.  **The two hash contexts live on `graph.Key` and `graph.DynamicRef`,
+    beside `order` and `eql`.** `Key.hash` mirrors `order` field for
+    field — `index` is absent from both, so two rows addressing one
+    defined name neither compare unequal nor land in different buckets —
+    and every variable-length field is length-prefixed so a `producer`
+    cannot collide with one whose table and column split the same bytes
+    elsewhere. `std.AutoHashMap` cannot be instantiated over a `Key` at
+    all: `autoHash` refuses a slice rather than silently choosing
+    between the pointer and the bytes. Putting the hash next to the
+    order is what stops the two from drifting apart later.
+4.  **`captureAll` groups §5.6e's edges by owner once.** The flat
+    `dynamic_edges` list covers every owner, so "which of these are
+    mine?" asked per formula is a walk of the whole list per formula.
+    Grouped once into a map of owner → indices **in input order**, each
+    owner replays exactly the subsequence the scan would have handed it:
+    the order reads enter the dependency log is the order they enter the
+    graph, so this is a change of cost and not of graph.
+5.  **`Index.probe`'s band choice was a proxy, and the proxy was wrong
+    in the common case.** §5.6a said "whichever order makes the narrower
+    band the leading key", meaning "whichever is cheaper to walk" —
+    and the two coincide for `SUM(A:A)` and `SUM(1:1)`, which is why the
+    two pinned probe counts never caught it. They diverge for
+    `SUM(A5:A9)`: five rows and one column, so the extent calls the
+    column narrow, and the column band is every cell stored in column A.
+    A workbook whose every row reads a short window of one column
+    therefore walked the whole column once per row. Counting both bands
+    (four binary searches) picks what the extent picked wherever the
+    extent was right; §5.6a is corrected to say what it meant, and both
+    pinned counts are unchanged, which is the evidence that it is.
+6.  **The base for the gate is a transcription, and says so.** M5d3
+    recorded its baseline as a table in §9.1 and no `bench.json`;
+    `compare_bench.py --gate` needs a file. Re-running the named workload
+    N=20 across three modes to recover one would have cost ~2 hours and
+    measured a different afternoon's thermals against a *slower* build,
+    which is a worse baseline than the recorded one, not a better one.
+    `tests/bench/baseline_m5d3.json` is therefore §9.1's numbers in
+    hyperfine's schema, with its provenance, its host and the workload
+    digest in a `_note` key, and no `times` array — so the report shows
+    `p95 = —` on the base side rather than inventing a distribution.
+    **`tests/bench/baseline_m5d4.json` closes the gap that made this
+    necessary**: it is a real export, samples included, so the next
+    optimisation row gates against a measurement rather than a
+    transcription.
+7.  **The ceilings are still not renegotiated.** End-to-end now passes
+    (916.53 ms against 1 s) and evaluate does not (903.69 ms against
+    500 ms, 1.81× over). The honest thing to record is exactly that: one
+    of the two ceilings is met, the other is a factor away, and the
+    curve is straight — 9.8 / 10.3 / 11.3 µs per formula cell across
+    two orders of magnitude — so the remaining factor is a constant to
+    be worked on and no longer a shape that gets worse with size.
+
 ---
 
 ## 8. Testing & oracles
@@ -3744,7 +3832,7 @@ adds a TEXT-heavy bench; M9d adds a mixed full-registry workload
 | aggregates — **bytes** (counted allocator) | `max_run_arena_bytes` **1 GiB**, live matrix cells 8M, string payload 256 MiB, retained ASTs 128 MiB, diagnostics 1 MiB — defaults; hard maxima 4× each; caller-adjustable via `ResourceLimits` (M3b, `src/formula/run_inputs.zig` — a **separate struct from `parser.Limits`**, which bounds parse shape); resolved values echoed + fingerprinted. An exhausted category is `FormulaLimitExceeded`, never a bare `OutOfMemory`: the budget records which one tripped. `matrix_cells` is charged as a **count**, so the limit does not depend on `@sizeOf(ScalarValue)` | byte accounting; below/at/above per category |
 | aggregates — **work** (explicit checked counters; can burn CPU without allocating) | `max_total_cell_evals` **50M**, dependency edges 50M, `max_scc_iterations` = **caller RESOURCE ceiling only, default 32 767 (hard max 32 767)** — never conflated with the workbook's semantic `calcPr@iterateCount`: hitting `iterateCount` = success + non-converged, hitting a lower caller ceiling = `FormulaLimitExceeded` + zero mutation (§5.6c), `max_dynamic_passes` default 3 (caller-adjustable, hard max 10), sort/comparison ops 500M — defaults; hard maxima 4× unless stated; caller-adjustable **in Zig/C only — CLI and Python fix limits at defaults in v1 (declared, no flags)**; resolved values echoed + fingerprinted. **Three shapes of bound, classified (M5a2 `WorkCategory.kind`)**: a *total* only grows (`dependency_edges`, `total_cell_evals`), a *depth* unwinds (`eval_depth`), and a **per-scope** bound is re-counted from zero in every scope it governs (`scc_iterations`, `dynamic_passes`) — §5.6c gives each SCC its own pass counter, so accumulating passes into one running total would refuse a workbook whose every component iterated legally; `WorkCounters.charge` rejects a per-scope category, and the engine that owns the scope reads the limit instead | decrement sites named per counter; below/at/above boundary tests |
 
-### 9.1 The M5d3 baseline (recorded 2026-08-05)
+### 9.1 The recalc baseline — M5d3 (recorded 2026-08-05), M5d4 after it
 
 **The named workload** is `tests/bench/synth_f1_mix.zig`'s `named`
 geometry: 10 000 data rows × 10 columns = **100 000 cells**, 80 000 of
@@ -3760,13 +3848,18 @@ and `zlsx-bench-recalc emit … --size named` refuses on drift. The digest
 and the numbers below are **one artifact**: a workload change invalidates
 the baseline whether or not the code changed.
 
-**Host**: Apple M3 Max (16 cores, 128 GiB), macOS 26.5.2, arm64, Zig
-0.16.0, ReleaseFast, warm cache, `hyperfine -N --warmup 5 --runs 20`
-(N=20 per `bench_ci.sh:50`). Recorded on
-`feat/m5d3-recalc-composition`. Laptop-class thermals over a ~2-hour
-sequential run: the `named` figures are the pessimistic end.
+**Host** (both rows): Apple M3 Max (16 cores, 128 GiB), macOS 26.5.2,
+arm64, Zig 0.16.0, ReleaseFast, warm cache, `hyperfine -N --warmup 5
+--runs 20` (N=20 per `bench_ci.sh:50`). The M5d3 figures carry one
+caveat M5d4's do not: laptop-class thermals over a ~2-hour sequential
+run put its `named` numbers at the pessimistic end — which flatters the
+ratio between the two tables by however much that drift was worth, and
+is why the ratio is not the claim. The claim is the shape, and that is
+read off the sweep below.
 
 Medians are the gating statistic; p95 and σ describe the distribution.
+
+**M5d3 — the baseline** (`feat/m5d3-recalc-composition`, `44365a9`):
 
 | Workload | Cells | Formula cells | `open` | `recalc` | `save` | p95 (`recalc`) | σ (`recalc`) |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -3774,7 +3867,25 @@ Medians are the gating statistic; p95 and σ describe the distribution.
 | `f1_mix_small` | 10 000 | 8 000 | 1.65 ms | 1 390.39 ms | 1 430.96 ms | 1 579.88 ms | 88.57 ms |
 | **`f1_mix_named`** | **100 000** | **80 000** | 1.71 ms | **133 452.65 ms** | **127 690.55 ms** | 152 629.57 ms | 9 703.41 ms |
 
-**Read it as follows.** `open` is the fixed cost and is flat across all
+**M5d4 — after** (`feat/m5d4-recalc-linear`, same host, same workload
+digest, same N=20 methodology, recorded 2026-08-05). The baseline above
+is kept rather than replaced: a row that only shows the number it
+achieved cannot be checked against the one it started from.
+
+| Workload | Cells | Formula cells | `open` | `recalc` | `save` | p95 (`recalc`) | σ (`recalc`) | `recalc` ÷ M5d3 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `f1_mix_tiny` | 1 000 | 800 | 1.73 ms | 9.60 ms | 10.26 ms | 9.95 ms | 0.16 ms | **2.3× faster** |
+| `f1_mix_small` | 10 000 | 8 000 | 1.60 ms | 83.77 ms | 86.09 ms | 89.70 ms | 2.62 ms | **16.6× faster** |
+| **`f1_mix_named`** | **100 000** | **80 000** | 1.74 ms | **905.43 ms** | **916.53 ms** | 931.90 ms | 15.96 ms | **147× faster** |
+
+`compare_bench.py --gate tests/bench/baseline_m5d3.json …` reports −56.1 %
+/ −94.0 % / −99.3 % on the three `recalc` lanes and exits 0. That JSON is
+the table above it, transcribed into hyperfine's schema so the gate has a
+file to read; M5d3 recorded no bench.json, and re-measuring a two-minute
+workload N=20 to recover one would have taken two hours and measured a
+different afternoon's thermals.
+
+**Read the M5d3 table as follows.** `open` is the fixed cost and is flat across all
 three sizes — the archive is opened and its structural parts
 materialised, nothing more — so **evaluate = recalc − open**: 20.2 ms,
 1 388.7 ms, 133 451 ms. `save` is end-to-end. At the named size `save`
@@ -3786,37 +3897,54 @@ Serialize + commit is where a difference of two hyperfine means would
 mislead, so it is measured directly instead (`zlsx-bench-recalc phases`,
 one instrumented process, every row a span it timed):
 
-| Phase | `small` | `named` |
-|---|---:|---:|
-| open | 0.16 ms | 0.20 ms |
-| prepare (model + graph + evaluate + stage + txn) | 1 360.03 ms | 131 606.21 ms |
-| serialize + commit | 0.41 ms | 0.99 ms |
-| swap | 0.000 ms | 0.000 ms |
+| Phase | `small` M5d3 | `named` M5d3 | `small` **M5d4** | `named` **M5d4** |
+|---|---:|---:|---:|---:|
+| open | 0.16 ms | 0.20 ms | 0.07 ms | 0.16 ms |
+| prepare (model + graph + evaluate + stage + txn) | 1 360.03 ms | 131 606.21 ms | 83.58 ms | 898.77 ms |
+| serialize + commit | 0.41 ms | 0.99 ms | 0.43 ms | 1.08 ms |
+| swap | 0.000 ms | 0.000 ms | 0.000 ms | 0.000 ms |
 
 **The pipeline's cost is evaluation, not I/O** — writing the recalculated
 100 000-cell archive costs one millisecond against two minutes of
 evaluating it, and §5.7.9's swap is free, which is what makes it
-legal inside the commit region.
+legal inside the commit region. M5d4 does not change that reading, it
+sharpens it: serialize + commit is the *only* row that did not move,
+because it was never the problem.
 
-**Against §9's ceilings**: the named workload is **267× over the evaluate
-ceiling** (133.5 s vs 500 ms) and **128× over end-to-end** (127.7 s vs
-1 s). The ceilings are **not renegotiated here**; this row records what
-they are measured against. The gap is not a constant factor either — the
-cost is **quadratic in cell count**: ×10 cells costs ×68.7
-(tiny→small) and ×96.1 (small→named), and a direct row sweep gives
-0.10 / 0.35 / 1.38 / 5.29 s at 250 / 500 / 1 000 / 2 000 rows, ×4 per
-doubling. Per formula cell that is 25 µs, 174 µs, 1 668 µs. §9's own
-"10k-vs-100k ≤ 15×" assertion therefore fails today, and says so here
-rather than at the release cut.
+**Against §9's ceilings, at M5d3**: the named workload was **267× over
+the evaluate ceiling** (133.5 s vs 500 ms) and **128× over end-to-end**
+(127.7 s vs 1 s). The gap was not a constant factor either — the cost was
+**quadratic in cell count**: ×10 cells cost ×68.7 (tiny→small) and ×96.1
+(small→named), and a direct row sweep gave 0.10 / 0.35 / 1.38 / 5.29 s at
+250 / 500 / 1 000 / 2 000 rows, ×4 per doubling. Per formula cell that is
+25 µs, 174 µs, 1 668 µs. §9's own "10k-vs-100k ≤ 15×" assertion therefore
+failed, and said so here rather than at the release cut.
 
-A `sample` profile attributes ~76 % of it to two O(n) operations inside
+A `sample` profile attributed ~76 % of it to two O(n) operations inside
 per-cell loops: `WorkbookEnv.insertCell`'s sorted-array `memmove`
 (`pkg/workbook.zig:9278`, 42 %) and `graph.Key.order` under
 `iterate.Engine.noteEdge` (`src/formula/iterate.zig:1206`, 34 %). Both
-are structural — any workbook with *n* formula cells hits them *n* times,
-so nothing about the F1-mix topology causes it — which makes closing the
-gap an optimisation row of its own, owed **before** the thresholds
-freeze.
+were structural — any workbook with *n* formula cells hits them *n* times,
+so nothing about the F1-mix topology caused it.
+
+**Against §9's ceilings, at M5d4.** Evaluate (= recalc − open) is 7.87 ms
+/ 82.17 ms / **903.69 ms**, so the named workload is **1.81× over the
+evaluate ceiling** (was 267×) and **under the 1 s end-to-end ceiling**
+at 916.53 ms (was 128× over). The ceilings are still **not renegotiated**;
+one of the two is now met and the other is a factor away from it.
+
+**The scaling assertion holds.** ×10 cells costs ×10.4 (tiny→small) and
+**×11.0** (small→named) in evaluate time, against §9's "10k-vs-100k ≤
+15×" — which M5d3 failed at ×96.1. The row sweep is **23.8 / 46.3 / 90.3
+/ 191.0 ms** at 250 / 500 / 1 000 / 2 000 rows: **×1.95 / ×1.95 / ×2.11
+per doubling**, against ×4 before. Per formula cell that is 9.8 µs,
+10.3 µs, 11.3 µs — flat across two orders of magnitude, which is the
+whole claim. The residual drift above ×2 is the model and graph phases'
+`n log n`, not a surviving quadratic term: a profile taken part-way
+through the row, with three of the seven fixed, still put
+`graph.Key.order` at 40.7 % of a 4 000-row run; the same profile at
+8 000 rows with all seven in place puts it at **1.1 %** — a share that
+*fell* while the workload doubled, which a quadratic term's cannot do.
 
 ---
 

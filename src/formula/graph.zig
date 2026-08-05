@@ -39,10 +39,14 @@
 //! Two formulas reading `A1:A100` share one range node, so the area is
 //! resolved against the producer index once rather than once per reader.
 //! The index itself is sorted twice — row-major and column-major — and
-//! each area is probed through whichever of the two makes its *narrower*
-//! band the leading key. That is what keeps `SUM(A:A)` proportional to
-//! the stored cells in column A instead of to 1 048 576 coordinates,
-//! and `stats.index_probes` is the instrument: a counter, not a stopwatch.
+//! each area is probed through whichever of the two has **fewer stored
+//! coordinates in the band it would walk**, counted rather than guessed
+//! from the area's extent (M5d4; the extent is right for `SUM(A:A)` and
+//! wrong for `SUM(A5:A9)`, which is short in the dimension the extent
+//! calls narrow and deep in the one it walks). That is what keeps
+//! `SUM(A:A)` proportional to the stored cells in column A instead of to
+//! 1 048 576 coordinates, and `stats.index_probes` is the instrument: a
+//! counter, not a stopwatch.
 //!
 //! Purity
 //! ------
@@ -185,6 +189,50 @@ pub const Key = union(Kind) {
         return a.order(b) == .eq;
     }
 
+    /// The hash `eql` implies, for the callers that need a membership
+    /// test rather than an order.
+    ///
+    /// It mirrors `order` field for field, which is what makes it a
+    /// *correct* hash rather than merely a plausible one: `index` is
+    /// absent from both, so two rows addressing the same name neither
+    /// compare unequal nor land in different buckets. Every
+    /// variable-length field is length-prefixed, so a `producer` cannot
+    /// collide with one whose table and column split the same bytes at
+    /// a different point.
+    pub fn hash(self: Key, h: *std.hash.Wyhash) void {
+        h.update(&[_]u8{@intFromEnum(self.kind())});
+        switch (self) {
+            .cell, .spill_tail => |c| hashCell(h, c),
+            .range => |r| hashArea(h, r),
+            .span => |x| {
+                hashInt(h, x.first.toInt());
+                hashInt(h, x.last.toInt());
+                hashRange(h, x.range);
+            },
+            .name => |x| {
+                hashInt(h, scopeOrd(x.scope));
+                hashBytes(h, x.identifier);
+            },
+            .producer => |x| {
+                hashBytes(h, x.table);
+                hashBytes(h, x.column);
+                h.update(&[_]u8{@intFromEnum(x.kind)});
+            },
+        }
+    }
+
+    /// `std.HashMapUnmanaged` context over `order`'s equality.
+    pub const HashContext = struct {
+        pub fn hash(_: HashContext, x: Key) u64 {
+            var h: std.hash.Wyhash = .init(0);
+            x.hash(&h);
+            return h.final();
+        }
+        pub fn eql(_: HashContext, x: Key, y: Key) bool {
+            return x.eql(y);
+        }
+    };
+
     /// Whether the node occupies a coordinate — the two kinds the
     /// producer index holds, and the two `max_eval_depth` counts.
     pub fn isCellLike(self: Key) bool {
@@ -231,6 +279,33 @@ fn orderRange(a: coords.Range, b: coords.Range) std.math.Order {
     const lr = std.math.order(a.last.row.oneBased(), b.last.row.oneBased());
     if (lr != .eq) return lr;
     return std.math.order(a.last.col.zeroBased(), b.last.col.zeroBased());
+}
+
+fn hashInt(h: *std.hash.Wyhash, x: anytype) void {
+    h.update(std.mem.asBytes(&@as(u64, x)));
+}
+
+fn hashBytes(h: *std.hash.Wyhash, b: []const u8) void {
+    hashInt(h, b.len);
+    h.update(b);
+}
+
+fn hashCell(h: *std.hash.Wyhash, c: env.CellRef) void {
+    hashInt(h, c.sheet.toInt());
+    hashInt(h, c.row.oneBased());
+    hashInt(h, c.col.zeroBased());
+}
+
+fn hashArea(h: *std.hash.Wyhash, r: env.RangeRef) void {
+    hashInt(h, r.sheet.toInt());
+    hashRange(h, r.range);
+}
+
+fn hashRange(h: *std.hash.Wyhash, r: coords.Range) void {
+    hashInt(h, r.first.row.oneBased());
+    hashInt(h, r.first.col.zeroBased());
+    hashInt(h, r.last.row.oneBased());
+    hashInt(h, r.last.col.zeroBased());
 }
 
 // ─── the SCC seed table (§5.6c) ──────────────────────────────────
@@ -701,6 +776,29 @@ pub const DynamicRef = struct {
             .area => |r| r.eql(y.target.area),
         };
     }
+
+    pub fn hash(self: DynamicRef, h: *std.hash.Wyhash) void {
+        self.owner.hash(h);
+        h.update(&[_]u8{@intFromEnum(std.meta.activeTag(self.target))});
+        switch (self.target) {
+            .cell => |c| hashCell(h, c),
+            .area => |r| hashArea(h, r),
+        }
+    }
+
+    /// `std.HashMapUnmanaged` context, so a caller deduping edges gets
+    /// the membership test the type already defines rather than
+    /// inventing one over the same fields.
+    pub const HashContext = struct {
+        pub fn hash(_: HashContext, x: DynamicRef) u64 {
+            var h: std.hash.Wyhash = .init(0);
+            x.hash(&h);
+            return h.final();
+        }
+        pub fn eql(_: HashContext, x: DynamicRef, y: DynamicRef) bool {
+            return x.eql(y);
+        }
+    };
 };
 
 pub const Options = struct {
@@ -903,6 +1001,29 @@ const Builder = struct {
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
 
+        // §5.6e's edges arrive as one flat list covering every owner, so
+        // asking "which of these are mine?" inside the loop below is a
+        // walk of the whole list per formula — quadratic in the
+        // workbook, and the largest single cost in a rebuild once M5d4
+        // removed the two above it. Grouped once, by owner, here.
+        //
+        // Indices rather than edges, and appended in input order, so
+        // each owner replays exactly the subsequence the scan would have
+        // handed it: the order reads enter the dependency log is the
+        // order they enter the graph, and this is a change of cost, not
+        // of graph.
+        var by_owner: std.HashMapUnmanaged(Key, std.ArrayListUnmanaged(u32), Key.HashContext, 80) = .empty;
+        defer {
+            var vals = by_owner.valueIterator();
+            while (vals.next()) |v| v.deinit(self.gpa);
+            by_owner.deinit(self.gpa);
+        }
+        for (self.opts.dynamic_edges, 0..) |d, i| {
+            const gop = try by_owner.getOrPut(self.gpa, d.owner);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(self.gpa, @intCast(i));
+        }
+
         for (self.owners.items) |bo| {
             _ = scratch.reset(.retain_capacity);
             const s = scratch.allocator();
@@ -946,11 +1067,12 @@ const Builder = struct {
             // than doubling an edge, which is why a rebuild whose
             // dynamic references landed where the text said they would
             // produces the identical graph — the fixpoint's base case.
-            for (self.opts.dynamic_edges) |d| {
-                if (!d.owner.eql(bo.owner.key)) continue;
-                switch (d.target) {
-                    .cell => |c| try cap.deps.noteCell(c),
-                    .area => |x| try cap.deps.noteArea(x),
+            if (by_owner.get(bo.owner.key)) |mine| {
+                for (mine.items) |i| {
+                    switch (self.opts.dynamic_edges[i].target) {
+                        .cell => |c| try cap.deps.noteCell(c),
+                        .area => |x| try cap.deps.noteArea(x),
+                    }
                 }
             }
 
@@ -1613,22 +1735,59 @@ pub const Index = struct {
         return x.row < y.row;
     }
 
+    /// Probe through whichever band holds fewer *stored* coordinates —
+    /// which is what the walk actually pays for.
+    ///
+    /// Counted, not inferred from the area's extent. The extent is a
+    /// proxy, and it misfires exactly where it costs most: `A5:A9` is
+    /// one column and five rows, so the narrower band is the column —
+    /// and the column band is every cell stored in column A, while the
+    /// row band is five rows of a sparse sheet. A workbook whose every
+    /// row reads a short window of one column therefore walked the whole
+    /// column once per row — quadratic in the row count, and one of the
+    /// terms M5d4 had to remove before the recalc pipeline scaled
+    /// linearly. Four binary searches replace it.
+    ///
+    /// Whole-column and whole-row areas pick what they always picked:
+    /// counting agrees with the extent wherever the extent was right.
+    /// The two orders enumerate the same *set* — `next` filters on the
+    /// whole rectangle either way — so this changes what a probe costs,
+    /// not what it finds.
     fn probe(self: Index, area: env.RangeRef, probes: *u64) Probe {
-        const rows = area.range.rowCount();
-        const cols = area.range.colCount();
-        const row_major = rows <= cols;
-        const items = if (row_major) self.by_rc else self.by_cr;
-        const start = lowerBound(items, area.sheet.toInt(), if (row_major)
-            area.range.first.row.oneBased()
-        else
-            area.range.first.col.zeroBased(), row_major);
+        const sheet = area.sheet.toInt();
+        const rows = band(
+            self.by_rc,
+            sheet,
+            area.range.first.row.oneBased(),
+            area.range.last.row.oneBased(),
+            true,
+        );
+        const cols = band(
+            self.by_cr,
+            sheet,
+            area.range.first.col.zeroBased(),
+            area.range.last.col.zeroBased(),
+            false,
+        );
+        const row_major = rows.len <= cols.len;
         return .{
-            .items = items,
-            .i = start,
+            .items = if (row_major) self.by_rc else self.by_cr,
+            .i = if (row_major) rows.start else cols.start,
             .area = area,
             .row_major = row_major,
             .probes = probes,
         };
+    }
+
+    const Band = struct { start: usize, len: usize };
+
+    /// The half-open run of entries on `sheet` whose leading key lies in
+    /// `[lo, hi]`.
+    fn band(items: []const Coord, sheet: u32, lo: u32, hi: u32, row_major: bool) Band {
+        const first = lowerBound(items, sheet, lo, row_major);
+        const past = lowerBound(items, sheet, hi +| 1, row_major);
+        assert(past >= first);
+        return .{ .start = first, .len = past - first };
     }
 
     /// First index whose (sheet, leading key) is >= (sheet, lo).
