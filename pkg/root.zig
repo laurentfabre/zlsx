@@ -25,6 +25,10 @@ const drawings_mod = @import("drawings.zig");
 /// `dbx pull` (write-verify-rename). Same primitive PartStore.save uses.
 pub const AtomicFile = @import("atomic_file.zig").AtomicFile;
 pub const PartStore = store_mod.PartStore;
+/// M5b0: the ref-counted source a `PartStore` reads through. Exported
+/// because it is now part of the store's shape — several generations
+/// may share one, and the last to `deinit` is the one that closes.
+pub const SourceBacking = store_mod.SourceBacking;
 pub const Part = store_mod.Part;
 pub const Relationship = store_mod.Relationship;
 pub const TargetMode = store_mod.TargetMode;
