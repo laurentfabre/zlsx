@@ -802,6 +802,35 @@ pub fn build(b: *std.Build) void {
     const formula_graph_tests = b.addTest(.{ .root_module = formula_graph_mod });
     test_step.dependOn(&b.addRunArtifact(formula_graph_tests).step);
 
+    // M5a2: §5.6d's volatile draw schedule. A leaf below both the
+    // evaluator and the iteration engine — the evaluator knows WHERE a
+    // draw happens and the engine knows WHICH PASS it happens in, so a
+    // file either of them owned would make the other import a cycle.
+    const formula_draws_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/draws.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const formula_draws_tests = b.addTest(.{ .root_module = formula_draws_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_draws_tests).step);
+
+    // M5a2: the iteration engine — the multi-SCC schedule, convergence,
+    // the two exhaustion outcomes and §5.6e's dynamic-edge fixpoint. It
+    // consumes `graph.zig`'s condensation rather than rebuilding one, so
+    // it sits directly above the graph and below the package tree.
+    const formula_iterate_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/iterate.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_iterate_mod.addImport("zlsx_refs", refs_mod);
+    formula_iterate_mod.addImport("zlsx_xid", xid_mod);
+    formula_iterate_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_iterate_mod.addImport("zlsx_casing", casing_mod);
+    addOracleFixtures(b, formula_iterate_mod);
+    const formula_iterate_tests = b.addTest(.{ .root_module = formula_iterate_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_iterate_tests).step);
+
     // M3b: the criteria fuzz target (§8.1) — no criterion string may
     // panic, leak, or match non-deterministically.
     const formula_criteria_fuzz_mod = b.createModule(.{

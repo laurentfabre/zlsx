@@ -94,7 +94,12 @@ pub const CallCtx = struct {
 
     /// The single volatile-draw seam. Counted, so "no draw in the dead
     /// branch" is a property of the evaluator rather than of a fixture.
-    pub fn draw(self: CallCtx) f64 {
+    ///
+    /// Fallible since M5a2: with §5.6d's schedule wired, a draw stores
+    /// its key, and the alternative to failing — drawing afresh when the
+    /// memo cannot be written — would let an out-of-memory condition
+    /// silently change a result.
+    pub fn draw(self: CallCtx) FnError!f64 {
         return self.ev.opts.draws.draw();
     }
 
@@ -895,6 +900,44 @@ pub const functions = [_]Function{
         .impl = fnColumns,
     },
 
+    // ── M5a2: the two reference-PRODUCING rows (§7). They belong
+    //    beside the position family because they answer the same kind
+    //    of question — what a reference is rather than what it holds —
+    //    and they are the only two rows in v1 that carry a reference
+    //    OUT of a call. Both are volatile: Excel recalculates them
+    //    every pass because the reference they name can move without
+    //    anything they depend on changing, which is precisely why
+    //    §5.6e needs an outer loop at all. ──
+    .{
+        .name = "INDIRECT",
+        .arity = .{ .min = 1, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .text, .logical },
+            .rest = &none_c,
+        },
+        .volatility = .volatile_fn,
+        .propagation = .propagate,
+        .impl = fnIndirect,
+        .reference_producing = true,
+    },
+    .{
+        .name = "OFFSET",
+        .arity = .{
+            .min = 3,
+            .max = 5,
+            .fixed = &[_]Laziness{ .eager, .eager, .eager, .eager, .eager },
+            .rest = &none_l,
+        },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .reference, .number, .number, .number, .number },
+            .rest = &none_c,
+        },
+        .volatility = .volatile_fn,
+        .propagation = .propagate,
+        .impl = fnOffset,
+        .reference_producing = true,
+    },
+
     // ── M4f / F1c-text: nineteen names, and the first rows whose
     //    answer depends on what a *character* is (§5.4d). The
     //    `cv_sensitive` flag marks the seven that count or index in
@@ -1357,7 +1400,7 @@ fn fnNa(ctx: CallCtx, args: []const Value) FnError!Value {
 
 fn fnRand(ctx: CallCtx, args: []const Value) FnError!Value {
     _ = args;
-    return Value.num(ctx.draw());
+    return Value.num(try ctx.draw());
 }
 
 fn fnSqrt(ctx: CallCtx, args: []const Value) FnError!Value {
@@ -1658,7 +1701,7 @@ fn fnRandBetween(ctx: CallCtx, args: []const Value) FnError!Value {
     // by at most one part in 2^53.
     const span = hi - lo + 1;
     if (!std.math.isFinite(span)) return Value.err(.num);
-    const u = ctx.draw();
+    const u = try ctx.draw();
     assert(u >= 0 and u < 1);
     // `@min` covers the one case scaling cannot: a draw just under 1
     // against a span large enough for the product to round up to it.
@@ -2715,6 +2758,86 @@ fn fnRows(ctx: CallCtx, args: []const Value) FnError!Value {
 fn fnColumns(ctx: CallCtx, args: []const Value) FnError!Value {
     _ = ctx;
     return Value.num(@floatFromInt(spanOf(args[0], .cols)));
+}
+
+// ── M5a2: the two reference-producing rows ──
+
+/// `INDIRECT(ref_text, [a1])`.
+///
+/// The second argument is not a formatting preference: `a1 = FALSE`
+/// requests an R1C1 reference, which v1 refuses everywhere else (the
+/// tokenizer has a refusal reason for exactly it). So it refuses here
+/// too, as a **construct** rather than as `#REF!` — the text was not
+/// malformed, it was R1C1, and answering `#REF!` would claim otherwise.
+fn fnIndirect(ctx: CallCtx, args: []const Value) FnError!Value {
+    if (args.len > 1) {
+        const a1 = args[1].scalar;
+        // `.logical` already refused text and already propagated an
+        // error; a missing second argument arrives as `blank`, which is
+        // FALSE by coercion — but an OMITTED one is Excel's TRUE. The
+        // dispatcher hands `missing_arg` through untouched, which is why
+        // this asks the `Value` and not just the scalar.
+        const omitted = args[1] == .missing_arg;
+        if (!omitted and a1 == .boolean and !a1.boolean) return error.UnsupportedConstruct;
+    }
+    const spelling = switch (args[0]) {
+        .scalar => |s| switch (s) {
+            .text => |t| t,
+            // A blank or a number is not a reference spelling. Excel
+            // answers `#REF!`, which is a value: the formula is
+            // well-formed and denotes nothing.
+            else => return Value.err(.ref),
+        },
+        else => return Value.err(.ref),
+    };
+    return ctx.ev.referenceFromText(spelling);
+}
+
+/// `OFFSET(reference, rows, cols, [height], [width])`.
+///
+/// Excel truncates the four numeric arguments toward zero rather than
+/// rounding them, so `OFFSET(A1,1.9,0)` is `A2` and not `A3`.
+fn fnOffset(ctx: CallCtx, args: []const Value) FnError!Value {
+    const base = firstArea(args[0]) orelse return Value.err(.value);
+    // A multi-area reference has no single origin to displace, and
+    // picking one would be a guess about which. `#VALUE!` is Excel's
+    // answer and it is also the honest one.
+    if (args[0].reference.areas.len != 1) return Value.err(.value);
+
+    const row_delta = truncArg(args[1]) orelse return Value.err(.value);
+    const col_delta = truncArg(args[2]) orelse return Value.err(.value);
+    const shape = base.shape();
+    const height = if (args.len > 3 and args[3] != .missing_arg)
+        truncArg(args[3]) orelse return Value.err(.value)
+    else
+        @as(i64, shape.rows);
+    const width = if (args.len > 4 and args[4] != .missing_arg)
+        truncArg(args[4]) orelse return Value.err(.value)
+    else
+        @as(i64, shape.cols);
+
+    return ctx.ev.offsetReference(base, row_delta, col_delta, height, width);
+}
+
+/// One numeric argument, truncated toward zero. Null when it is so large
+/// that no coordinate arithmetic could survive it — the caller turns
+/// that into a value, never into a wrapped integer.
+fn truncArg(v: Value) ?i64 {
+    const n = switch (v) {
+        .scalar => |s| switch (s) {
+            .number => |x| x,
+            // A blank slot is zero, which is what an explicitly empty
+            // `OFFSET(A1,,1)` means.
+            .blank => 0,
+            else => return null,
+        },
+        .missing_arg => 0,
+        else => return null,
+    };
+    const t = @trunc(n);
+    const bound = @as(f64, @floatFromInt(env.max_addressable_offset));
+    if (t > bound or t < -bound) return null;
+    return @intFromFloat(t);
 }
 
 // ─── the frozen inventory (committed data) ───────────────────────
@@ -4016,6 +4139,72 @@ test "M4g: the running total moves with the batch, counted from the file" {
     try testing.expectEqual(@as(usize, 93), shipped);
 }
 
+test "M5a2: the running total moves with the two reference-producing rows" {
+    // §7 makes the TSV the count source. `INDIRECT` and `OFFSET` were
+    // always in it; what M5a2 changes is that they now RESOLVE, which is
+    // the half a count cannot see on its own — hence the lookup below
+    // rather than a bigger number alone.
+    const rows = [_][]const u8{ "M4c", "M4d", "M4e", "M4f", "M4g", "M5a2" };
+    var shipped: usize = 0;
+    for (rows) |m| {
+        var it = inventory();
+        while (it.next()) |e| {
+            if (!std.mem.eql(u8, e.milestone, m)) continue;
+            if (lookup(e.name) == null) {
+                std.debug.print("shipped name does not resolve: {s} ({s})\n", .{ e.name, m });
+                return error.LadderTotalIncomplete;
+            }
+            shipped += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 95), shipped);
+}
+
+test "M5a2: both reference-producing rows are complete, and they are the only two" {
+    // §7 lists exactly two reference-producing rows, and M4e's decision
+    // 11 deferred `INDEX`'s range form on the strength of that. If a
+    // third appeared, that deferral would silently stop being true.
+    const expected = [_][]const u8{ "INDIRECT", "OFFSET" };
+    var producing: usize = 0;
+    for (&functions) |*f| {
+        if (!f.reference_producing) continue;
+        producing += 1;
+        var named = false;
+        for (expected) |n| {
+            if (std.mem.eql(u8, n, f.name)) named = true;
+        }
+        if (!named) {
+            std.debug.print("unexpected reference-producing row: {s}\n", .{f.name});
+            return error.UnexpectedReferenceProducer;
+        }
+    }
+    try testing.expectEqual(expected.len, producing);
+    // `INDEX` is the row the deferral is about, so it is asserted by
+    // name rather than left to the count.
+    try testing.expect(!lookup("INDEX").?.reference_producing);
+
+    // "Complete" means every field §7 requires is answered and the
+    // implementation is reachable — not that a name is in the table.
+    for (expected) |n| {
+        const f = lookup(n).?;
+        try testing.expectEqual(Form.plain, f.form);
+        try testing.expect(f.impl != null);
+        try testing.expectEqual(Volatility.volatile_fn, f.volatility);
+        try testing.expectEqual(f.arity.fixed.len, f.coercion.fixed.len);
+        try testing.expectEqual(f.arity.rest.len, f.coercion.rest.len);
+        // Neither reads text through the comparator nor indexes a
+        // string, so neither of M4f's two flags belongs to them.
+        try testing.expect(!f.collation_sensitive);
+        try testing.expect(!f.cv_sensitive);
+        try testing.expect(!f.epoch_sensitive);
+        // A reference producer is never lifted elementwise: its first
+        // slot is a reference or a text spelling of one, and lifting
+        // would ask what `OFFSET({A1,B1},…)` means. Nothing does.
+        try testing.expect(!f.da_aware);
+    }
+    try testing.expect(!lookup("OFFSET").?.liftable());
+}
+
 test "M4g: every F1c-date row declares all five fields, and its epoch honestly" {
     var it = inventory();
     var seen: usize = 0;
@@ -4355,7 +4544,7 @@ test "registry: lookup is case-insensitive and rejects unknown names" {
     try testing.expect(lookup("NOTAFUNCTION") == null);
 }
 
-test "registry: the volatile rows are the two draws and the two clocks" {
+test "registry: the volatile rows are the two draws, the two clocks and the two references" {
     // Both directions, because either alone passes for the wrong reason:
     // naming them proves they are volatile, counting proves nothing
     // else quietly became so. Every volatile row is a cell the M5a2
@@ -4366,7 +4555,13 @@ test "registry: the volatile rows are the two draws and the two clocks" {
     // change between recalculations, where a draw changes at every
     // callsite — but the schedule treats them the same, which is what
     // this flag is for.
-    const expected = [_][]const u8{ "RAND", "RANDBETWEEN", "TODAY", "NOW" };
+    //
+    // M5a2 added a third pair, volatile for a third reason: `INDIRECT`
+    // and `OFFSET` name a reference that can move without anything they
+    // depend on changing. Neither draws — the flag is not "consumes the
+    // RNG", it is "must be recalculated" — and that third reason is
+    // exactly why §5.6e needs an outer loop.
+    const expected = [_][]const u8{ "RAND", "RANDBETWEEN", "TODAY", "NOW", "INDIRECT", "OFFSET" };
     for (expected) |name| {
         try testing.expectEqual(Volatility.volatile_fn, lookup(name).?.volatility);
     }

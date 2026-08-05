@@ -673,6 +673,36 @@ pub const BuildResult = union(enum) {
     refused: Refusal,
 };
 
+/// §5.6e's runtime-captured reference: what a body actually reached,
+/// paired with the body that reached it.
+///
+/// A dynamic reference — `INDIRECT("A1")`, `OFFSET(A1,r,c)` — is
+/// invisible to a walk over the text, so M5a2's outer loop evaluates,
+/// records what was read, and builds again with these in hand. They
+/// enter through the **same dependency log** the static walk fills,
+/// which is what keeps a rebuilt graph identical in kind to a built one:
+/// there is no second edge path, no second node model, and a captured
+/// read the walk had already found dedupes away instead of doubling.
+pub const DynamicRef = struct {
+    /// Whose body produced it.
+    owner: Key,
+    target: Target,
+
+    pub const Target = union(enum) {
+        cell: env.CellRef,
+        area: env.RangeRef,
+    };
+
+    pub fn eql(x: DynamicRef, y: DynamicRef) bool {
+        if (!x.owner.eql(y.owner)) return false;
+        if (@as(std.meta.Tag(Target), x.target) != @as(std.meta.Tag(Target), y.target)) return false;
+        return switch (x.target) {
+            .cell => |c| c.eql(y.target.cell),
+            .area => |r| r.eql(y.target.area),
+        };
+    }
+};
+
 pub const Options = struct {
     limits: WorkLimits = .{},
     parse_limits: parser.Limits = .{},
@@ -680,6 +710,9 @@ pub const Options = struct {
     /// does not care need not thread one; when null the builder uses a
     /// local set and the resolved totals land in `Stats`.
     counters: ?*WorkCounters = null,
+    /// §5.6e. Empty on a first build, by definition: nothing has run
+    /// yet, so nothing has been read yet.
+    dynamic_edges: []const DynamicRef = &.{},
 };
 
 pub fn build(
@@ -907,6 +940,19 @@ const Builder = struct {
             // draw; inventing a sheet for it would be the unsafe choice.
             const relative_name = bo.owner.key == .name and name_rules.bodyIsRelative(ast);
             if (!relative_name) try cap.walk(ast.root);
+
+            // §5.6e's runtime capture, into the same log the walk just
+            // filled. A read the walk already found dedupes here rather
+            // than doubling an edge, which is why a rebuild whose
+            // dynamic references landed where the text said they would
+            // produces the identical graph — the fixpoint's base case.
+            for (self.opts.dynamic_edges) |d| {
+                if (!d.owner.eql(bo.owner.key)) continue;
+                switch (d.target) {
+                    .cell => |c| try cap.deps.noteCell(c),
+                    .area => |x| try cap.deps.noteArea(x),
+                }
+            }
 
             self.refs.appendAssumeCapacity(try cap.take(self.a()));
         }
@@ -1896,6 +1942,29 @@ pub const PlanResult = union(enum) {
     refused: Refusal,
 };
 
+pub const PlanOptions = struct {
+    /// Whether the workbook's `calcPr` asks for iteration.
+    ///
+    /// M5a1 had no engine to hand a cycle to, so this was `false` in
+    /// every line of code that could reach it and §5.6c's "with
+    /// iteration off, a cycle is `FormulaCycle`" was the whole rule.
+    /// M5a2 supplies the other half: with iteration on, a cyclic
+    /// component is admitted to the plan and the iteration engine
+    /// schedules it. Planning is the only thing that changes — the node
+    /// model, the index and the order are what they were.
+    iterating: bool = false,
+    /// Whether admitting a cell charges `total_cell_evals`.
+    ///
+    /// True for a one-shot closure, where the plan IS the work and
+    /// charging at admission refuses before the first evaluation rather
+    /// than halfway through one. False for M5a2's engine, which re-plans
+    /// once per §5.6e pass and charges per evaluation instead — the
+    /// number §9 actually bounds for an iterating run is passes times
+    /// members, and a plan charged per pass would count the same cell
+    /// once for planning and once for running it.
+    charge_evals: bool = true,
+};
+
 /// The transitive closure of `roots`, ordered.
 ///
 /// §9 charge sites, both here: `eval_depth` on pushing a cell-like node
@@ -1909,6 +1978,7 @@ pub fn plan(
     arena: std.mem.Allocator,
     roots: []const Key,
     counters: *WorkCounters,
+    opts: PlanOptions,
 ) Error!PlanResult {
     const n = g.keys.len;
     const reached = try arena.alloc(bool, n);
@@ -2000,20 +2070,22 @@ pub fn plan(
         // reached component: checking the first is checking all of them.
         if (!reached[comp[0]]) continue;
         const cid = g.component[comp[0]];
-        if (g.cyclic[cid]) {
+        if (g.cyclic[cid] and !opts.iterating) {
             // §5.6c: with iteration off, a cycle is `FormulaCycle`.
-            // M5a2 is where a workbook whose `calcPr` asks for iteration
-            // gets a schedule instead.
+            // With it on, the component is planned like any other and
+            // `iterate.zig` gives it a pass counter instead.
             return .{ .refused = .{ .reason = .cycle, .at = g.keys[comp[0]] } };
         }
         try components.append(arena, cid);
         for (comp) |node| {
             if (g.keys[node].kind() != .cell) continue;
-            counters.charge(.total_cell_evals, 1) catch return .{ .refused = .{
-                .reason = .work_limit_exceeded,
-                .limit = .total_cell_evals,
-                .at = g.keys[node],
-            } };
+            if (opts.charge_evals) {
+                counters.charge(.total_cell_evals, 1) catch return .{ .refused = .{
+                    .reason = .work_limit_exceeded,
+                    .limit = .total_cell_evals,
+                    .at = g.keys[node],
+                } };
+            }
             try cells.append(arena, node);
         }
     }
@@ -2783,7 +2855,7 @@ fn planFrom(
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     var counters: WorkCounters = .{ .limits = limits };
-    return switch (try plan(g, arena.allocator(), roots, &counters)) {
+    return switch (try plan(g, arena.allocator(), roots, &counters, .{})) {
         .ok => |p| .{ .ok = .{ .arena = arena, .graph = g, .plan = p, .counters = counters } },
         .refused => |r| {
             arena.deinit();

@@ -54,6 +54,15 @@ const value = @import("value.zig");
 
 // ─── typed coordinates (§5.5) ────────────────────────────────────
 
+/// The largest magnitude a displacement can carry and still be worth
+/// arithmetic (§7's `OFFSET`).
+///
+/// Twice the row count: anything beyond it leaves the grid from any
+/// starting point in it, so the exact value stops mattering and only
+/// its not overflowing does. Named here rather than at the call site
+/// because it is a fact about the grid, and the grid is this file's.
+pub const max_addressable_offset: u32 = coords.max_row * 2;
+
 /// A sheet's position in the workbook's sheet order. Distinct type so it
 /// cannot be swapped with a row, a column, or a raw index.
 pub const SheetIndex = enum(u32) {
@@ -553,6 +562,24 @@ pub const Fake = struct {
             }
         }
         try s.cells.insert(self.allocator, at, c);
+    }
+
+    /// Remove one cell from one layer, if it is there.
+    ///
+    /// Infallible on purpose. It is what a rolled-back run calls
+    /// (§5.6c's "zero mutation"), and a rollback that could itself fail
+    /// would make the promise conditional on there being memory to keep
+    /// it. Lower layers at the same coordinate are untouched, so
+    /// retracting a computed value uncovers the stored one — which is
+    /// the whole point: the state a refusal leaves behind is the state
+    /// it started from.
+    pub fn clear(self: *Fake, sheet: SheetIndex, layer: Layer, cell: CellRef) void {
+        const s = self.sheetMut(sheet) catch return;
+        const at = lowerBound(s.cells.items, cell.row, cell.col, layer);
+        if (at >= s.cells.items.len) return;
+        const cur = s.cells.items[at];
+        if (cur.row != cell.row or cur.col != cell.col or cur.layer != layer) return;
+        _ = s.cells.orderedRemove(at);
     }
 
     /// `put` with A1 text, for tests. Any coordinate the grid accepts.
