@@ -1997,10 +1997,19 @@ pub fn build(b: *std.Build) void {
     // signature change that misses them is a local test failure rather
     // than a CI-only surprise. `bench-exes` installs them for
     // bench_ci.sh to run under hyperfine.
+    //
+    // **These take `optimize`, not `bench_optimize`** (M5d3). The RSS
+    // probes above are pinned to ReleaseSafe on purpose — an RSS number
+    // is only meaningful with the overflow checks a production caller
+    // runs. The hyperfine lane is the opposite case: `bench_ci.sh:34`
+    // passes `-Doptimize=ReleaseFast` and §9 labels the lane
+    // "hyperfine ReleaseFast", and a hardcoded `bench_optimize` silently
+    // discarded that flag — every wall-clock number this repo has
+    // recorded was measured in ReleaseSafe under a ReleaseFast label.
     const bench_read_mod = b.createModule(.{
         .root_source_file = b.path("tests/bench/bench_zlsx.zig"),
         .target = target,
-        .optimize = bench_optimize,
+        .optimize = optimize,
         .single_threaded = single_threaded,
     });
     bench_read_mod.addImport("zlsx_control", control_mod);
@@ -2013,7 +2022,7 @@ pub fn build(b: *std.Build) void {
     const bench_write_mod = b.createModule(.{
         .root_source_file = b.path("tests/bench/bench_write_zlsx.zig"),
         .target = target,
-        .optimize = bench_optimize,
+        .optimize = optimize,
         .single_threaded = single_threaded,
     });
     bench_write_mod.addImport("zlsx_control", control_mod);
@@ -2023,17 +2032,52 @@ pub fn build(b: *std.Build) void {
         .root_module = bench_write_mod,
     });
 
+    // ── M5d3: §9's named workload and the recalc bench over it ───────
+    //
+    // The generator is the committed artifact (§9): a fixed-topology
+    // F1-mix workbook whose digest identifies the workload the absolute
+    // ceilings bind to. It lives in its own module because two things
+    // need it — the bench binary, and the unit tests that keep the
+    // topology honest.
+    const bench_f1_mix_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/synth_f1_mix.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = single_threaded,
+    });
+    bench_f1_mix_mod.addImport("zlsx_control", control_mod);
+    bench_f1_mix_mod.addImport("zlsx", zlsx_mod);
+
+    // Imports `zlsx_recalc`, so the ReleaseFast bench lane compiles the
+    // third public module too — a composition that only ever built in
+    // Debug unit tests would be a surface nothing releases exercises.
+    const bench_recalc_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/bench_recalc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = single_threaded,
+    });
+    bench_recalc_mod.addImport("zlsx_control", control_mod);
+    bench_recalc_mod.addImport("zlsx_recalc", recalc_mod);
+    bench_recalc_mod.addImport("synth_f1_mix", bench_f1_mix_mod);
+    const bench_recalc_exe = b.addExecutable(.{
+        .name = "zlsx-bench-recalc",
+        .root_module = bench_recalc_mod,
+    });
+
     const bench_exes_step = b.step(
         "bench-exes",
-        "Build the read + write bench binaries (consumed by scripts/bench_ci.sh)",
+        "Build the read + write + recalc bench binaries (consumed by scripts/bench_ci.sh)",
     );
     bench_exes_step.dependOn(&b.addInstallArtifact(bench_read_exe, .{}).step);
     bench_exes_step.dependOn(&b.addInstallArtifact(bench_write_exe, .{}).step);
+    bench_exes_step.dependOn(&b.addInstallArtifact(bench_recalc_exe, .{}).step);
 
     // Compile-only on the default test path: catches API drift without
     // paying for a ReleaseFast link on every `zig build test`.
     test_step.dependOn(&bench_read_exe.step);
     test_step.dependOn(&bench_write_exe.step);
+    test_step.dependOn(&bench_recalc_exe.step);
 
     // Per-module unit tests for the bench helpers (rss + synth).
     // These DO go on the default `test` step — they're cheap and
@@ -2043,6 +2087,13 @@ pub fn build(b: *std.Build) void {
 
     const bench_synth_tests = b.addTest(.{ .root_module = bench_synth_mod });
     test_step.dependOn(&b.addRunArtifact(bench_synth_tests).step);
+
+    // The F1-mix generator's own tests: determinism and topology, at a
+    // size the default path can afford. The named workload's digest is
+    // gated by `zlsx-bench-recalc emit` in the ReleaseFast lane instead
+    // — see that file's test-section comment.
+    const bench_f1_mix_tests = b.addTest(.{ .root_module = bench_f1_mix_mod });
+    test_step.dependOn(&b.addRunArtifact(bench_f1_mix_tests).step);
 }
 
 /// The three committed oracle manifests, as anonymous imports.

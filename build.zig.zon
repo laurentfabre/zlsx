@@ -9,6 +9,7 @@
         "build.zig.zon",
         "src",
         "pkg",
+        "recalc",
         "refs",
         "unicode",
         "tests",
