@@ -100,33 +100,192 @@ pub const Error = error{
     /// bytes are written so the atomic-file output is never left in
     /// a partial state.
     ZipArchiveTooLarge,
-} || std.Io.File.OpenError || std.mem.Allocator.Error || std.Io.File.Reader.Error || std.Io.File.SeekError;
+} || std.Io.File.OpenError || std.mem.Allocator.Error || std.Io.File.Reader.Error ||
+    std.Io.File.SeekError || std.Io.File.StatError;
+
+/// Observability seam for the fd-budget invariant. §5.7.4 gates
+/// repeated recalc on "RSS, allocation accounting, borrow validity, and
+/// fd count", and the fd count is the one of those four that cannot be
+/// read off the backing itself — by the time the answer is interesting
+/// the backing has been destroyed. So the counter lives with the
+/// caller: a `SourceBacking` bumps `closes` exactly once, when its last
+/// reference drops. Production constructors pass `null`.
+pub const CloseLedger = struct {
+    closes: usize = 0,
+};
+
+/// Ref-counted source of a package's compressed bytes, shared by every
+/// `PartStore` generation opened over it.
+///
+/// Before M5b0 a store held `?std.Io.File` and closed it in `deinit`,
+/// which made the store the handle's *exclusive* owner: a shallow copy
+/// closed it twice, and moving it out to keep the bytes reachable left
+/// the original store unable to materialize anything. §5.7.4's
+/// prepare/swap transaction retains the entire superseded generation
+/// until `Workbook.deinit`, so several generations are alive at once by
+/// construction — and neither of those outcomes is survivable.
+///
+/// Both variants answer `readAt` and `size`, so nothing above this type
+/// branches on where the bytes live: `open`, `openBuffer` and
+/// `nextGeneration` all funnel into `openOver`, and `materializeAt` and
+/// `save` read through the same call.
+///
+/// Deliberately not atomic. A backing and every generation over it
+/// belong to one thread — the same contract `PartStore` itself has —
+/// and an atomic count would advertise a sharing discipline nothing
+/// here tests.
+pub const SourceBacking = struct {
+    pub const Source = union(enum) {
+        /// The source archive, kept open for the backing's lifetime.
+        file: std.Io.File,
+        /// A backing-owned copy of the source archive. `openBuffer`
+        /// dupes the caller's slice, so the caller's borrow ends when
+        /// the call returns.
+        buffer: []const u8,
+    };
+
+    allocator: std.mem.Allocator,
+    /// The `Io` the backing was created with. Closing a file needs one
+    /// long after `open()` returned, and the generation that goes last
+    /// is not necessarily the one that opened it — so the backing
+    /// carries its own rather than borrowing a generation's.
+    io: std.Io,
+    source: Source,
+    /// Live generations. Starts at 1, for the store the constructor
+    /// hands the backing to.
+    refs: usize,
+    ledger: ?*CloseLedger,
+
+    fn create(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        source: Source,
+        ledger: ?*CloseLedger,
+    ) std.mem.Allocator.Error!*SourceBacking {
+        const self = try allocator.create(SourceBacking);
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .source = source,
+            .refs = 1,
+            .ledger = ledger,
+        };
+        return self;
+    }
+
+    /// Adopt an already-open handle. The backing closes it on last
+    /// release; the caller must not close it itself, and must not keep
+    /// an `errdefer file.close` armed past this call — that pairing is
+    /// the double-close this type exists to remove.
+    fn createFile(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        file: std.Io.File,
+        ledger: ?*CloseLedger,
+    ) std.mem.Allocator.Error!*SourceBacking {
+        return create(allocator, io, .{ .file = file }, ledger);
+    }
+
+    /// Copy `bytes` into backing-owned memory. Duping rather than
+    /// borrowing is what lets the caller's slice die at the call
+    /// boundary, which is the borrow rule `Book` already follows for
+    /// buffer-sourced workbooks.
+    fn createBuffer(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        bytes: []const u8,
+        ledger: ?*CloseLedger,
+    ) std.mem.Allocator.Error!*SourceBacking {
+        const owned = try allocator.dupe(u8, bytes);
+        errdefer allocator.free(owned);
+        return create(allocator, io, .{ .buffer = owned }, ledger);
+    }
+
+    /// Take a reference for a new generation.
+    pub fn retain(self: *SourceBacking) *SourceBacking {
+        self.refs += 1;
+        return self;
+    }
+
+    /// Drop one reference. The last one closes the file (or frees the
+    /// buffer) and destroys the backing — exactly once, whichever
+    /// generation happens to go last, in whatever order they go.
+    pub fn release(self: *SourceBacking) void {
+        std.debug.assert(self.refs > 0);
+        self.refs -= 1;
+        if (self.refs > 0) return;
+
+        switch (self.source) {
+            .file => |f| f.close(self.io),
+            .buffer => |b| self.allocator.free(b),
+        }
+        if (self.ledger) |l| l.closes += 1;
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+
+    pub fn refCount(self: *const SourceBacking) usize {
+        return self.refs;
+    }
+
+    /// Read exactly `dest.len` bytes at `offset`.
+    ///
+    /// Out of range is `BadZip` in both variants: for a file that is
+    /// the short read `seekTo` + `readAll` already produced, and for a
+    /// buffer it is the answer the old `self.file orelse return
+    /// Error.BadZip` gave — a `fresh()` store's backing is the empty
+    /// buffer, so asking it for source bytes it never had still
+    /// refuses, without a null check anywhere above.
+    pub fn readAt(self: *const SourceBacking, offset: u64, dest: []u8) Error!void {
+        switch (self.source) {
+            .file => |f| try readAtExact(f, self.io, offset, dest),
+            .buffer => |b| {
+                if (offset > b.len) return Error.BadZip;
+                const start: usize = @intCast(offset);
+                if (dest.len > b.len - start) return Error.BadZip;
+                @memcpy(dest, b[start..][0..dest.len]);
+            },
+        }
+    }
+
+    /// Total source bytes. `openOver` gates on this for both variants,
+    /// so the ZIP32 size refusal does not depend on where the archive
+    /// came from. (`openBuffer` checks the same bound once more, up
+    /// front, so an oversize slice is refused before it is copied.)
+    fn size(self: *const SourceBacking) std.Io.File.StatError!u64 {
+        return switch (self.source) {
+            .file => |f| (try f.stat(self.io)).size,
+            .buffer => |b| b.len,
+        };
+    }
+};
 
 pub const PartStore = struct {
     allocator: std.mem.Allocator,
-    /// The `Io` this store was opened with. `materializeAt` and the
-    /// byte-preserving `save()` path both re-touch the source handle
-    /// long after `open()` returned, and 0.16 needs an `Io` for each
-    /// of those calls — so the store carries its own.
+    /// The `Io` this store was opened with. `save()` needs one for the
+    /// atomic-file output long after `open()` returned, so the store
+    /// carries its own. Source *reads* go through `backing.io`, which
+    /// is the same value — the backing keeps a copy because it outlives
+    /// any one generation.
     io: std.Io,
     /// Arena-owned storage for every borrowed slice exposed via the
     /// public API (part names, content types, rel attrs, decompressed
     /// part bytes). Caller-visible slices stay valid until `deinit`.
     arena: std.heap.ArenaAllocator,
-    /// Source file kept open for the lifetime of the PartStore. The
-    /// previous design slurped the entire file into `src_buf` at
-    /// open(); now we read CD + EOCD + structural parts at open()
-    /// then close-the-buffer-but-keep-the-handle so RSS doesn't
-    /// retain compressed bytes for parts callers never touch.
-    /// `materializeAt` and the byte-preserving `save()` path both
-    /// re-read from this handle by `seekTo` + `readAll`.
+    /// One reference to the source bytes, shared with every other
+    /// generation opened over the same archive. The previous design
+    /// slurped the entire file into `src_buf` at open(); now we read
+    /// CD + EOCD + structural parts at open() then
+    /// close-the-buffer-but-keep-the-backing so RSS doesn't retain
+    /// compressed bytes for parts callers never touch. `materializeAt`
+    /// and the byte-preserving `save()` path both re-read through it.
     ///
-    /// `null` for stores built via `PartStore.fresh()` — no source
-    /// archive exists, so every part lives in `overrides[i]` and
-    /// `save()` never reads from a source file. Code paths that
-    /// dereference `self.file` are gated on `overrides[i] == null`,
-    /// which can never be true for a fresh store.
-    file: ?std.Io.File,
+    /// Never null: a `PartStore.fresh()` store gets an empty-buffer
+    /// backing rather than an absent one. Every part of a fresh store
+    /// lives in `overrides[i]`, so no source read is ever reached; if
+    /// one were, the backing refuses it the same way the old `?File`
+    /// null check did.
+    backing: *SourceBacking,
     /// Per-part raw ZIP entries (LFH/CDFH/payload offsets). Same
     /// length + ordering as `parts`.
     entries: []ZipEntry,
@@ -141,31 +300,107 @@ pub const PartStore = struct {
     /// Preserved across save() so byte-identical comments survive.
     eocd_comment: []const u8,
 
-    pub fn open(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !PartStore {
+    pub fn open(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error!PartStore {
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        // Hand the handle to the backing immediately, and never arm an
+        // `errdefer file.close` past this point: from here the backing
+        // is the sole closer, and a second one is precisely the bug
+        // M5b0 removes. The one hand-close below covers the only window
+        // where the backing does not exist yet.
+        const backing = SourceBacking.createFile(allocator, io, file, null) catch |err| {
+            file.close(io);
+            return err;
+        };
+        errdefer backing.release();
+        return try openOver(allocator, backing);
+    }
+
+    /// Open a package that is already in memory. The bytes are copied
+    /// into the backing, so the caller's slice may die at the call
+    /// boundary.
+    ///
+    /// This is the substrate for `Workbook.openBuffer` (M5b2), not that
+    /// entry point itself: what lands here is the *backing* half — a
+    /// buffer-sourced store that reaches every read, materialize and
+    /// save path a file-sourced one does.
+    pub fn openBuffer(allocator: std.mem.Allocator, io: std.Io, bytes: []const u8) Error!PartStore {
+        // Same refusal `openOver` makes for both variants, taken before
+        // the copy rather than after it: there is no reason to dupe
+        // 4 GiB in order to reject it.
+        if (bytes.len > std.math.maxInt(u32)) return Error.Zip64NotSupported;
+        const backing = try SourceBacking.createBuffer(allocator, io, bytes, null);
+        errdefer backing.release();
+        return try openOver(allocator, backing);
+    }
+
+    /// Open another `PartStore` over the same source bytes.
+    ///
+    /// The new generation gets its own arena, parts, overrides and
+    /// rels; it shares only the backing, whose reference count this
+    /// call bumps. Both generations stay independently readable and may
+    /// be `deinit`ed in any order — the fd (or buffer) is released
+    /// once, by whichever goes last. That is what lets §5.7.4 retain a
+    /// superseded generation until `Workbook.deinit` on an fd budget of
+    /// one.
+    ///
+    /// Overrides are NOT inherited: a generation is the source archive
+    /// as it was opened, not the previous generation's staged state.
+    /// The transaction that stages new bytes on top (M5b2) is the
+    /// caller's, not this primitive's.
+    ///
+    /// A `fresh()` store has no source archive to re-scan, so this
+    /// returns `error.BadZip` for one — its empty backing has no EOCD.
+    pub fn nextGeneration(self: *const PartStore) Error!PartStore {
+        const backing = self.backing.retain();
+        errdefer backing.release();
+        return try openOver(self.allocator, backing);
+    }
+
+    /// Shared tail of `open` / `openBuffer` / `nextGeneration`: scan and
+    /// parse an archive out of a backing whose reference this call
+    /// consumes on success. On failure the caller's `errdefer` releases.
+    ///
+    /// The only place a variant is named: a file has to be copied into
+    /// a contiguous scratch buffer to be scanned, a buffer already is
+    /// one. Everything downstream of `buildFromArchive` is identical.
+    fn openOver(allocator: std.mem.Allocator, backing: *SourceBacking) Error!PartStore {
+        const size_u64 = try backing.size();
+        if (size_u64 > std.math.maxInt(u32)) return Error.Zip64NotSupported;
+
+        switch (backing.source) {
+            // No scratch copy: the backing's own bytes ARE the
+            // contiguous view, and they outlive this call.
+            .buffer => |b| return try buildFromArchive(allocator, backing, b),
+            .file => {
+                // Read the whole file into a SCRATCH buffer
+                // (page-allocator, not arena). scanCentralDirectory
+                // needs random access to every CDFH + each LFH header
+                // to compute payload offsets; doing that without a
+                // contiguous buffer would require hundreds of small
+                // disk reads. We free the scratch buffer before
+                // returning so RSS doesn't retain it. Pages are mmap'd
+                // by `page_allocator`, so `free` returns them via
+                // munmap rather than holding them inside the process
+                // arena.
+                const scratch = try std.heap.page_allocator.alloc(u8, @intCast(size_u64));
+                defer std.heap.page_allocator.free(scratch);
+                try backing.readAt(0, scratch);
+                return try buildFromArchive(allocator, backing, scratch);
+            },
+        }
+    }
+
+    /// Parse `archive` (a contiguous view of the whole package) into a
+    /// store over `backing`.
+    fn buildFromArchive(
+        allocator: std.mem.Allocator,
+        backing: *SourceBacking,
+        archive: []const u8,
+    ) Error!PartStore {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const ar_alloc = arena.allocator();
-
-        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
-        errdefer file.close(io);
-        const stat = try file.stat(io);
-        if (stat.size > std.math.maxInt(u32)) return Error.Zip64NotSupported;
-        const size: usize = @intCast(stat.size);
-
-        // Read the whole file into a SCRATCH buffer (page-allocator,
-        // not arena). scanCentralDirectory needs random access to
-        // every CDFH + each LFH header to compute payload offsets;
-        // doing that without a contiguous buffer would require
-        // hundreds of small disk reads. We free the scratch buffer
-        // at the end of `open()` so RSS doesn't retain it. Pages are
-        // mmap'd by `page_allocator`, so `free` returns them via
-        // munmap rather than holding them inside the process arena.
-        const scratch = try std.heap.page_allocator.alloc(u8, size);
-        defer std.heap.page_allocator.free(scratch);
-        {
-            var fr = file.reader(io, &.{});
-            fr.interface.readSliceAll(scratch) catch return Error.BadZip;
-        }
+        const scratch = archive;
 
         const entries = try scanCentralDirectory(ar_alloc, scratch);
 
@@ -226,9 +461,9 @@ pub const PartStore = struct {
 
         return .{
             .allocator = allocator,
-            .io = io,
+            .io = backing.io,
             .arena = arena,
-            .file = file,
+            .backing = backing,
             .entries = entries,
             .parts = parts,
             .overrides = overrides,
@@ -255,6 +490,15 @@ pub const PartStore = struct {
     /// store doesn't enforce OOXML well-formedness; that's the
     /// caller's job (Workbook.create or similar).
     pub fn fresh(allocator: std.mem.Allocator, io: std.Io) Error!PartStore {
+        // A fresh store still gets a backing — the empty-buffer one.
+        // Keeping the field non-optional is what removes the "is there
+        // a source?" branch from `materializeAt` and `save`: those
+        // paths are unreachable for a fresh store anyway, and if the
+        // invariant ever breaks, an out-of-range read on an empty
+        // buffer refuses with the same `BadZip` the null check gave.
+        const backing = try SourceBacking.createBuffer(allocator, io, &.{}, null);
+        errdefer backing.release();
+
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const ar_alloc = arena.allocator();
@@ -314,7 +558,7 @@ pub const PartStore = struct {
             .allocator = allocator,
             .io = io,
             .arena = arena,
-            .file = null,
+            .backing = backing,
             .entries = entries,
             .parts = parts,
             .overrides = overrides,
@@ -323,8 +567,12 @@ pub const PartStore = struct {
         };
     }
 
+    /// Drop this generation. Releases one reference to the shared
+    /// backing — the source handle is closed only if this was the last
+    /// generation holding it, so tearing down generation N never
+    /// invalidates generation N+1.
     pub fn deinit(self: *PartStore) void {
-        if (self.file) |*f| f.close(self.io);
+        self.backing.release();
         self.arena.deinit();
     }
 
@@ -693,7 +941,7 @@ pub const PartStore = struct {
     }
 
     /// Atomic write of the package to `path`. Untouched parts are
-    /// emitted verbatim (LFH + payload bytes copied from src_buf,
+    /// emitted verbatim (LFH + payload bytes copied from the backing,
     /// CDFH copied with patched lfh_offset). Overridden parts get
     /// fresh LFH + payload but reuse the source CDFH (with patched
     /// fields). EOCD comment is preserved.
@@ -785,10 +1033,10 @@ pub const PartStore = struct {
                 defer std.heap.page_allocator.free(region);
                 // Source-byte branch: only reachable when `overrides[i]
                 // == null`, which implies the store came from `open()`
-                // and `self.file` is non-null. Fresh stores override
-                // every entry, so this branch never fires for them.
-                const src = self.file orelse return Error.BadZip;
-                try readAtExact(src, io, e.lfh_offset, region);
+                // or `openBuffer()`. Fresh stores override every entry,
+                // so this branch never fires for them — and if it did,
+                // their empty backing would refuse the read.
+                try self.backing.readAt(e.lfh_offset, region);
                 try w.writeAll(region);
                 written += @as(u64, region.len);
             }
@@ -828,10 +1076,9 @@ pub const PartStore = struct {
                 const cdfh = try self.allocator.alloc(u8, e.cdfh_total_len);
                 defer self.allocator.free(cdfh);
                 // Same invariant as the LFH branch above: untouched
-                // entries imply we came from `open()` with a real
-                // source file.
-                const src = self.file orelse return Error.BadZip;
-                try readAtExact(src, io, e.cdfh_offset, cdfh);
+                // entries imply we came from `open()` / `openBuffer()`
+                // with real source bytes.
+                try self.backing.readAt(e.cdfh_offset, cdfh);
                 std.mem.writeInt(u32, cdfh[42..46], new_lfh_offsets[i], .little);
                 try w.writeAll(cdfh);
                 written += @as(u64, cdfh.len);
@@ -890,10 +1137,11 @@ pub const PartStore = struct {
     /// same answer; we just compute it once. Inherently-empty parts
     /// (uncompressed_size == 0) skip the decompress entirely.
     ///
-    /// Reads the compressed payload from `self.file` via `seekTo` +
-    /// `readAll` into a scratch buffer (page-allocator), decompresses
-    /// into the arena, frees the scratch. Decompressed bytes are
-    /// cached on `Part.bytes` for the rest of the store's lifetime.
+    /// Reads the compressed payload through `self.backing` into a
+    /// scratch buffer (page-allocator), decompresses into the arena,
+    /// frees the scratch. Decompressed bytes are cached on
+    /// `Part.bytes` for the rest of THIS generation's lifetime — the
+    /// cache is per-generation, the bytes it is filled from are not.
     fn materializeAt(self: *const PartStore, idx: usize) Error!void {
         const p = &@constCast(self).parts[idx];
         if (p.bytes.len > 0 or p.uncompressed_size == 0) return;
@@ -903,10 +1151,10 @@ pub const PartStore = struct {
         defer std.heap.page_allocator.free(compressed);
         // Fresh stores never have non-materialized parts (every part
         // is either inherently empty or carried in an `overrides[i]`
-        // slot with bytes already in the arena). If we land here with
-        // no source file, the store invariant is violated.
-        const src = self.file orelse return Error.BadZip;
-        try readAtExact(src, self.io, p.payload_offset, compressed);
+        // slot with bytes already in the arena). If we land here on
+        // one, its empty backing refuses the read — the store
+        // invariant is violated and `BadZip` says so.
+        try self.backing.readAt(p.payload_offset, compressed);
 
         const bytes = try decompressPayload(
             ar_alloc,
@@ -2533,8 +2781,11 @@ test "PartStore.fresh: returns empty store" {
     var store = try PartStore.fresh(std.testing.allocator, io);
     defer store.deinit();
 
-    // No source file backing a fresh store.
-    try std.testing.expect(store.file == null);
+    // A fresh store's backing is the empty buffer, not an absent one:
+    // the field is non-optional so no read path needs a null check.
+    try std.testing.expect(store.backing.source == .buffer);
+    try std.testing.expectEqual(@as(usize, 0), store.backing.source.buffer.len);
+    try std.testing.expectEqual(@as(usize, 1), store.backing.refCount());
     // No EOCD comment.
     try std.testing.expectEqual(@as(usize, 0), store.eocd_comment.len);
     // No relationships seeded.
@@ -2659,4 +2910,408 @@ test "PartStore.fresh: save with zero addParts produces a valid 1-entry ZIP" {
         return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, ct.bytes, "<Types") != null);
     try std.testing.expect(std.mem.indexOf(u8, ct.bytes, "</Types>") != null);
+}
+
+// ─── M5b0: SourceBacking ownership ───────────────────────────────────
+//
+// One sentence, tested from four directions: N generations may share
+// one backing, each stays independently readable for as long as it
+// lives, they may be retired in any order, and the source is closed
+// exactly once.
+
+/// Open a backing whose close is reported through `ledger`. Mirrors the
+/// adopt-then-never-arm-a-second-closer shape of `PartStore.open`; the
+/// ledger is the only difference.
+fn openLedgeredBacking(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    ledger: *CloseLedger,
+) Error!*SourceBacking {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    return SourceBacking.createFile(allocator, io, file, ledger) catch |err| {
+        file.close(io);
+        return err;
+    };
+}
+
+fn openLedgered(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    ledger: *CloseLedger,
+) Error!PartStore {
+    const backing = try openLedgeredBacking(allocator, io, path, ledger);
+    errdefer backing.release();
+    return try PartStore.openOver(allocator, backing);
+}
+
+/// Local-file-header signature. Any live backing over a real archive
+/// must still be able to hand these four bytes back.
+const pk_lfh_magic = "PK\x03\x04";
+
+/// Close-order permutations over four generations — §5.7.4's
+/// `max_retained_generations` default, so this is the shape the
+/// transaction will actually produce.
+const close_orders = [_][4]usize{
+    .{ 0, 1, 2, 3 }, // forward: the generation that opened the file goes first
+    .{ 3, 2, 1, 0 }, // reverse
+    .{ 1, 3, 0, 2 }, // interleaved
+};
+
+fn exerciseCloseOrder(io: std.Io, fixture: []const u8, order: [4]usize) !void {
+    const allocator = std.testing.allocator;
+    var ledger: CloseLedger = .{};
+
+    var gens: [order.len]PartStore = undefined;
+    gens[0] = try openLedgered(allocator, io, fixture, &ledger);
+    for (gens[1..], 1..) |*g, i| g.* = try gens[i - 1].nextGeneration();
+
+    // One backing, four references: the fd budget is one for the whole
+    // retained set, not one per generation.
+    try std.testing.expectEqual(gens.len, gens[0].backing.refCount());
+    for (gens[1..]) |g| try std.testing.expect(g.backing == gens[0].backing);
+
+    // Each generation caches into its own arena, so equal bytes here
+    // are four independent reads of one source, not a shared slice.
+    var first_bytes: []const u8 = &.{};
+    for (&gens, 0..) |*g, i| {
+        const p = (try g.part("xl/workbook.xml")) orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expect(p.bytes.len > 0);
+        if (i == 0) {
+            first_bytes = p.bytes;
+        } else {
+            try std.testing.expectEqualSlices(u8, first_bytes, p.bytes);
+            try std.testing.expect(first_bytes.ptr != p.bytes.ptr);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), ledger.closes);
+
+    for (order, 0..) |idx, round| {
+        gens[idx].deinit();
+        const survivors = order.len - round - 1;
+        const last = survivors == 0;
+        try std.testing.expectEqual(@as(usize, if (last) 1 else 0), ledger.closes);
+        if (!last) {
+            try std.testing.expectEqual(survivors, gens[order[round + 1]].backing.refCount());
+        }
+
+        // Every survivor can still reach the source — both raw, and
+        // through the lazy-materialization path with a part name no
+        // generation has touched yet this round.
+        for (order[round + 1 ..]) |alive| {
+            var probe: [4]u8 = undefined;
+            try gens[alive].backing.readAt(0, &probe);
+            try std.testing.expectEqualSlices(u8, pk_lfh_magic, &probe);
+
+            const names = try gens[alive].partNames();
+            const want = names[round % names.len];
+            const p = (try gens[alive].part(want)) orelse
+                return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings(want, p.name);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), ledger.closes);
+}
+
+test "SourceBacking: four generations, closed in every order, close once" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+
+    for (close_orders) |order| try exerciseCloseOrder(io, fixture, order);
+}
+
+/// Drive a retain/release schedule over one backing and prove the close
+/// lands exactly once, at the end. Bit 0 of each op byte picks retain
+/// vs release; a release that would drop the last reference ends the
+/// schedule instead, because reading a destroyed backing is the
+/// caller's bug, not the backing's.
+///
+/// Shared by the fuzz target (buffer backing) and the seeded test (file
+/// backing) so the two variants are held to one refcount discipline.
+fn exerciseRefcountSchedule(
+    backing: *SourceBacking,
+    ledger: *CloseLedger,
+    ops: []const u8,
+    expect_readable: []const u8,
+) !void {
+    var live: usize = 1; // the reference `create` handed us
+    for (ops) |op| {
+        if (op & 1 == 0) {
+            _ = backing.retain();
+            live += 1;
+        } else {
+            if (live == 1) break;
+            backing.release();
+            live -= 1;
+        }
+        try std.testing.expectEqual(live, backing.refCount());
+        try std.testing.expectEqual(@as(usize, 0), ledger.closes);
+
+        // Whatever sequence of retains and releases got us here, a
+        // backing with references outstanding is still readable.
+        var probe: [4]u8 = undefined;
+        try backing.readAt(0, &probe);
+        try std.testing.expectEqualSlices(u8, expect_readable, &probe);
+    }
+    while (live > 0) : (live -= 1) backing.release();
+    try std.testing.expectEqual(@as(usize, 1), ledger.closes);
+}
+
+fn fuzzBackingRefcountTarget(io: std.Io, smith: *std.testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    // 256 ops is well past the depth any real transaction reaches; the
+    // schedule, not the archive, is what varies here.
+    var smith_buf: [256]u8 = undefined;
+    const ops = smith_buf[0..smith.slice(&smith_buf)];
+
+    var ledger: CloseLedger = .{};
+    const backing = try SourceBacking.createBuffer(
+        std.testing.allocator,
+        io,
+        pk_lfh_magic,
+        &ledger,
+    );
+    try exerciseRefcountSchedule(backing, &ledger, ops, pk_lfh_magic);
+}
+
+test "fuzz: SourceBacking never double-closes under randomized clone/drop" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    try std.testing.fuzz(threaded.io(), fuzzBackingRefcountTarget, .{
+        .corpus = &[_][]const u8{
+            "", // no ops: create then release
+            "\x01", // immediate last-release
+            "\x00\x01", // retain, release
+            "\x00\x00", // two retains, both dropped by the tail loop
+            "\x01\x01\x01", // releases that must not underflow
+            "\x00\x01\x00\x01\x00\x01", // alternating
+            "\x00\x00\x00\x00\x01\x01\x01\x01", // fan out, fan in
+            "\x00\x00\x01\x00\x01\x01\x00\x01", // interleaved
+        },
+    });
+}
+
+test "SourceBacking: seeded clone/drop schedules over a file backing" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+
+    // The fuzz target above runs the buffer variant, where "close" is a
+    // free. This runs the same schedule where "close" is an fd close —
+    // the case where getting it wrong is not merely a leak.
+    var prng = std.Random.DefaultPrng.init(0x5b0);
+    for (0..64) |_| {
+        var ops: [32]u8 = undefined;
+        prng.random().bytes(&ops);
+        var ledger: CloseLedger = .{};
+        const backing = try openLedgeredBacking(
+            std.testing.allocator,
+            io,
+            fixture,
+            &ledger,
+        );
+        try exerciseRefcountSchedule(backing, &ledger, &ops, pk_lfh_magic);
+    }
+}
+
+test "PartStore: generation N+1 reads bytes generation N still holds" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var ledger: CloseLedger = .{};
+    var gen0 = try openLedgered(allocator, io, fixture, &ledger);
+
+    const wb0 = (try gen0.part("xl/workbook.xml")) orelse
+        return error.TestUnexpectedResult;
+    const gen0_bytes = wb0.bytes;
+    try std.testing.expect(gen0_bytes.len > 0);
+
+    var gen1 = try gen0.nextGeneration();
+    const wb1 = (try gen1.part("xl/workbook.xml")) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, gen0_bytes, wb1.bytes);
+    try std.testing.expect(gen0_bytes.ptr != wb1.bytes.ptr);
+
+    // Retire the generation that opened the file, first. Under the old
+    // exclusive ownership this closed the fd out from under gen1 and
+    // every later materialization failed.
+    gen0.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ledger.closes);
+    try std.testing.expectEqual(@as(usize, 1), gen1.backing.refCount());
+
+    // gen1 can still lazily materialize a part nobody has touched...
+    const styles = (try gen1.part("xl/styles.xml")) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(styles.bytes.len > 0);
+
+    // ...and still spawn generation 2 from the same source, which is
+    // what makes recalc repeatable rather than once-per-open.
+    var gen2 = try gen1.nextGeneration();
+    const wb2 = (try gen2.part("xl/workbook.xml")) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, wb1.bytes, wb2.bytes);
+
+    gen1.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ledger.closes);
+    const styles2 = (try gen2.part("xl/styles.xml")) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(styles2.bytes.len > 0);
+
+    gen2.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ledger.closes);
+}
+
+test "PartStore.nextGeneration: a fresh store has no source to re-scan" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var store = try PartStore.fresh(std.testing.allocator, io);
+    defer store.deinit();
+
+    // Documented, not accidental: a generation is the source archive
+    // re-scanned, and a fresh store's parts live in overrides. The
+    // empty backing has no EOCD, so the scan refuses.
+    try std.testing.expectError(error.NotPkzip, store.nextGeneration());
+    // The failed attempt released its own reference and nothing else.
+    try std.testing.expectEqual(@as(usize, 1), store.backing.refCount());
+}
+
+test "PartStore: buffer-backed and file-backed stores take the same path" {
+    comptime {
+        // Two variants, both exercised below. A third would make this
+        // test's claim to cover "both paths" false, so break the build
+        // rather than quietly under-test.
+        std.debug.assert(@typeInfo(SourceBacking.Source).@"union".fields.len == 2);
+    }
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var from_file = try PartStore.open(allocator, io, fixture);
+    defer from_file.deinit();
+
+    var from_buf = blk: {
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, fixture, allocator, .limited(1 << 24));
+        defer allocator.free(raw);
+        const s = try PartStore.openBuffer(allocator, io, raw);
+        // Poison the caller's slice before a single part is read: the
+        // backing dupes, so nothing below may depend on these bytes.
+        @memset(raw, 0xAA);
+        break :blk s;
+    };
+    defer from_buf.deinit();
+
+    // The two stores differ in exactly one observable.
+    try std.testing.expect(from_file.backing.source == .file);
+    try std.testing.expect(from_buf.backing.source == .buffer);
+
+    // Identical scan.
+    try std.testing.expectEqual(from_file.entries.len, from_buf.entries.len);
+    for (from_file.entries, from_buf.entries) |a, b| {
+        try std.testing.expectEqualStrings(a.name, b.name);
+        try std.testing.expectEqual(a.lfh_offset, b.lfh_offset);
+        try std.testing.expectEqual(a.lfh_total_len, b.lfh_total_len);
+        try std.testing.expectEqual(a.cdfh_offset, b.cdfh_offset);
+        try std.testing.expectEqual(a.cdfh_total_len, b.cdfh_total_len);
+        try std.testing.expectEqual(a.payload_offset, b.payload_offset);
+        try std.testing.expectEqual(a.compressed_size, b.compressed_size);
+        try std.testing.expectEqual(a.uncompressed_size, b.uncompressed_size);
+        try std.testing.expectEqual(a.compression_method, b.compression_method);
+        try std.testing.expectEqual(a.crc32, b.crc32);
+        try std.testing.expectEqual(a.data_descriptor_len, b.data_descriptor_len);
+        try std.testing.expectEqual(a.has_data_descriptor, b.has_data_descriptor);
+    }
+
+    // Identical lazy materialization, part by part — this is the
+    // `backing.readAt` path in `materializeAt`, once per variant.
+    const names_file = try from_file.partNames();
+    const names_buf = try from_buf.partNames();
+    try std.testing.expectEqual(names_file.len, names_buf.len);
+    for (names_file, names_buf) |nf, nb| {
+        try std.testing.expectEqualStrings(nf, nb);
+        const pf = (try from_file.part(nf)) orelse return error.TestUnexpectedResult;
+        const pb = (try from_buf.part(nb)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualSlices(u8, pf.bytes, pb.bytes);
+        try std.testing.expectEqual(pf.compression_method, pb.compression_method);
+        if (pf.content_type) |ctf| {
+            try std.testing.expectEqualStrings(ctf, pb.content_type.?);
+        } else {
+            try std.testing.expect(pb.content_type == null);
+        }
+        // Identical relationships for every owner that has any.
+        const rf = from_file.rels(nf);
+        const rb = from_buf.rels(nb);
+        try std.testing.expectEqual(rf.len, rb.len);
+        for (rf, rb) |x, y| {
+            try std.testing.expectEqualStrings(x.id, y.id);
+            try std.testing.expectEqualStrings(x.type, y.type);
+            try std.testing.expectEqualStrings(x.target, y.target);
+            try std.testing.expectEqual(x.target_mode, y.target_mode);
+        }
+    }
+    try std.testing.expectEqualSlices(u8, from_file.eocd_comment, from_buf.eocd_comment);
+
+    // Identical output. `save` copies untouched LFH and CDFH bytes
+    // straight out of the backing, so a byte-equal archive from both
+    // is the strongest statement available that the two variants are
+    // one path: the ONLY difference between these stores is which arm
+    // of `Source` answered every one of those reads.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(dir);
+    const out_file = try std.fs.path.join(allocator, &.{ dir, "from_file.xlsx" });
+    defer allocator.free(out_file);
+    const out_buf = try std.fs.path.join(allocator, &.{ dir, "from_buf.xlsx" });
+    defer allocator.free(out_buf);
+
+    try from_file.save(io, out_file);
+    try from_buf.save(io, out_buf);
+
+    const saved_file = try std.Io.Dir.cwd().readFileAlloc(io, out_file, allocator, .limited(1 << 24));
+    defer allocator.free(saved_file);
+    const saved_buf = try std.Io.Dir.cwd().readFileAlloc(io, out_buf, allocator, .limited(1 << 24));
+    defer allocator.free(saved_buf);
+    try std.testing.expectEqualSlices(u8, saved_file, saved_buf);
+}
+
+test "PartStore.openBuffer: generations share one buffer backing" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, fixture, allocator, .limited(1 << 24));
+    defer allocator.free(raw);
+
+    var gen0 = try PartStore.openBuffer(allocator, io, raw);
+    var gen1 = try gen0.nextGeneration();
+    try std.testing.expect(gen0.backing == gen1.backing);
+    try std.testing.expectEqual(@as(usize, 2), gen0.backing.refCount());
+
+    // A generation over a buffer retains bytes the same way one over a
+    // file retains an fd: gen0 goes first, gen1 still materializes.
+    gen0.deinit();
+    const styles = (try gen1.part("xl/styles.xml")) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(styles.bytes.len > 0);
+    gen1.deinit();
 }

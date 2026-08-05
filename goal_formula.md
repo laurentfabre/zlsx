@@ -1934,7 +1934,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M4g** ✅ | F1c-date (15: DATE, YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, TODAY, NOW, EOMONTH, EDATE, WEEKDAY, DATEVALUE, TIMEVALUE, TIME) + the **invariant date grammar** (§5.4b) + `RunInputs`' clock reaching the evaluator | Oracle-first; per-epoch fixtures |
 | **M5a1** ✅ | graph.zig: node model, SCC condensation, deterministic order, **seed table**, range-order contract; closure eval semantics | Scaling assertion; order fixtures; **randomized differential test vs a brute-force graph builder** (overlaps, full rows/cols, 3D spans, names, spill resize/invalidation — a missed edge passes perf tests but corrupts caches) |
 | **M5a2** ✅ | Iteration engine (multi-SCC schedule, convergence, clamps) + callsite-keyed volatile schedule + rebuild-reuse KATs + dynamic-edge fixpoint + **complete oracle-gated INDIRECT + OFFSET contracts** (the fixpoint's test subjects; registered fully here so M6's public CLI never exposes a half-function) | Iteration oracles; stabilization fuzz; INDIRECT/OFFSET fixtures |
-| **M5b0** | **`SourceBacking`** — ref-counted file/buffer backing shared across PartStore generations (each store exclusively owns + closes one `std.Io.File`, `store.zig:105-129,326-329`; shallow clone double-closes, moving breaks retention); backing unified; repeated-recalc + ownership tests. **Ladder-ordered FIRST of the M5b group — physically before M5b1/M5b2, because the transaction that requires it cannot land earlier than it** | Ownership tests; double-close fuzz |
+| **M5b0** ✅ | **`SourceBacking`** — ref-counted file/buffer backing shared across PartStore generations (each store exclusively owns + closes one `std.Io.File`, `store.zig:105-129,326-329`; shallow clone double-closes, moving breaks retention); backing unified; repeated-recalc + ownership tests. **Ladder-ordered FIRST of the M5b group — physically before M5b1/M5b2, because the transaction that requires it cannot land earlier than it** | Ownership tests; double-close fuzz |
 | **M5b1** | `ResolvedSheet` projection + cached-value patcher + transitions (**incl. ST_Xstring output encoding**) + fuzz | Byte-confinement; round-trip |
 | **M5b2** | Prepare/swap transaction (complete state, reports pre-swap) + calcChain rel-resolution + calc-state writes + `markRecalcOnLoad` + diagnostics. **Hard dependency on M5b0** — whole-generation retention (§5.7.4) is unsafe while `PartStore` exclusively owns and closes its own file, so M5b2's gate re-runs M5b0's ownership tests | No-fail-swap proof; post-failure reads; raw-entry identity; refusal purity; **M5b0 ownership tests green** |
 | **M5c** | `Workbook.openBuffer(alloc, io, bytes)` + **`Writer.saveToOwnedBuffer`** + `zlsx_recalc` **importable shell** (module graph only — its public composition ops land in M5d, where the consumer test moves) | Module-graph gate; buffer≡path byte-equivalence |
@@ -2752,6 +2752,90 @@ load-bearing.
     without a validated set, and a caller-supplied number must not be
     able to trip an assertion.
 
+**M5b0 decisions (shipped 2026-08-05).** Nine points, in `pkg/store.zig`
+(the `SourceBacking` type, `openBuffer`, `nextGeneration`, and the
+`openOver` / `buildFromArchive` split that both of them and `open` now
+share) and `pkg/root.zig` (the export). The row where a `PartStore`
+stopped owning its file and started holding a reference to it.
+
+1.  **The field stopped being optional, and the branch was deleted
+    rather than moved.** `?std.Io.File` made "is there a source?" a
+    question three read paths had to answer, and each answered it in its
+    own words — two comments claiming the branch was unreachable and one
+    claiming it meant a violated invariant. A `fresh()` store now gets
+    the empty-buffer backing instead of an absent one, and an
+    out-of-range read on it refuses with exactly the `BadZip` the null
+    check used to return. Nothing above the backing asks the question
+    any more.
+2.  **A file and a buffer are one variant set, not two code paths.**
+    Both arms answer `readAt` and `size`, so `open`, `openBuffer` and
+    `nextGeneration` all funnel into `openOver`, and the single place
+    that names a variant is whether the central-directory scan needs a
+    scratch copy — a file does, a buffer already is one. The ZIP32 size
+    refusal is likewise one gate for both, with `openBuffer` taking it
+    a second time before it copies rather than after. Asserted rather
+    than commented, as the row required: the same
+    fixture opened both ways yields equal entries, equal parts, equal
+    content types, equal rels, and a `save()` output that is
+    **byte-identical** — which is the untouched-LFH and untouched-CDFH
+    copies going through the same call with only the source arm
+    differing. A `comptime` assertion on the variant count fails the
+    build if a third arm ever makes that claim false.
+3.  **`openBuffer` copies the caller's bytes.** Borrowing would push the
+    archive's lifetime back onto the caller, and the point of a backing
+    is that the generations decide when the bytes die. This is the
+    `Book` precedent — §4's "borrow ends at return, store copies" —
+    reaching the package layer ahead of `Workbook.openBuffer`, which
+    stays M5b2's. The test poisons the caller's slice before a single
+    part is read, so a borrow would show up as content, not as luck.
+4.  **The constructor adopts the handle on the line after the open, and
+    never arms a second closer.** The obvious spelling keeps
+    `errdefer file.close(io)` live while the scan runs and hands the
+    handle over at the end; then a late failure fires both closers —
+    reintroducing, inside the constructor, the exact double-close this
+    row exists to remove. So the backing takes the handle immediately,
+    everything after it unwinds through `backing.release()`, and one
+    hand-written `close` covers the only window where the backing does
+    not exist yet.
+5.  **The reference count is deliberately not atomic.** A backing and
+    every generation over it belong to one thread, which is the contract
+    `PartStore` already has. An atomic count would advertise a sharing
+    discipline nothing here tests, and the first caller to believe the
+    advertisement would be right to.
+6.  **Exactly-one-close is asserted through a caller-owned ledger,
+    because a backing cannot report its own death.** §5.7.4 gates
+    repeated recalc on "RSS, allocation accounting, borrow validity, and
+    fd count", and fd count is the one of the four whose answer is only
+    interesting *after* the object holding it is destroyed. So the
+    counter lives with the caller and the backing writes through a
+    `?*CloseLedger` on its way out. That is a test-visible field in a
+    production struct; the alternative was the row's headline invariant
+    asserted by comment.
+7.  **A generation is the source re-scanned, not the previous generation
+    copied.** `nextGeneration` gives the new store its own arena, parts,
+    overrides and rels, and shares only the backing — so staged
+    overrides are explicitly *not* inherited. The transaction that puts
+    new bytes on top is M5b2's; conflating the two here would have made
+    the primitive carry a policy its only caller has not been written
+    yet to want.
+8.  **`nextGeneration` on a fresh store refuses, and the test pins the
+    refusal.** A fresh store's parts live in overrides and its backing is
+    the empty buffer, so the re-scan finds no EOCD and returns
+    `NotPkzip`. That falls out of the design rather than being decided,
+    which is exactly why it needed a fixture: undocumented, it is an
+    accident that a later change could silently turn into a crash.
+9.  **The fuzz target drives a buffer backing and a seeded test replays
+    the same schedule over a file one.** A coverage-guided loop that
+    opens and closes a real fd every iteration spends its budget on the
+    filesystem rather than on the schedule — but a "close" that is only
+    a `free` is not the case where getting it wrong costs a descriptor.
+    So `exerciseRefcountSchedule` is one function with two drivers, and
+    both assert the same thing: however many retains and releases got
+    you here, the backing is still readable, and it closes once. The
+    ownership tests were checked against the bug they exist for — a
+    `nextGeneration` that shares the pointer without retaining is caught
+    by two of them independently.
+
 ---
 
 ## 8. Testing & oracles
@@ -2763,7 +2847,8 @@ criteria + PRNG KATs (M3b) · metadata (M4a) · decode/symbols (M4b1) ·
 topology + translation (M4b2) · **defined-name attributes + 3D spans
 (M4b3)** · draw KATs (M4d) · **per-version index units + casing tables
 (M4f)** · SCC + stabilization +
-rebuild-reuse (M5a) · patcher confinement + ResolvedSheet round-trip (M5b1) ·
+rebuild-reuse (M5a) · **backing refcount / double-close over randomized
+clone-drop schedules (M5b0)** · patcher confinement + ResolvedSheet round-trip (M5b1) ·
 transaction post-failure + calc-state round-trip + refusal purity (M5b2) ·
 buffer equivalence (M5c) · determinism + scoped idempotence (M5d) · spill
 obstruction/ownership (M7a) · packaging transitions (M7b/c) · numfmt (M8) ·
