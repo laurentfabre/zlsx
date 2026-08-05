@@ -94,3 +94,11 @@ pub const WorksheetSpans = editor_mod.WorksheetSpans;
 /// hashes.bin parts under `xl/zlsxEmbeddings/`.
 pub const embedding_part = @import("embedding_part.zig");
 pub const recovery_record = @import("recovery_record.zig");
+
+/// M5b2: §5.7.3 step 4's prepare/swap transaction. Exported because it
+/// is the shape `recalculate()` and `saveWithRecalc` (M5d2) are built on
+/// — `saveWithRecalc` has to hold a prepared candidate across a file
+/// rename, which means the candidate is part of the package's surface
+/// and not an implementation detail of one method.
+pub const recalc_txn = @import("recalc_txn.zig");
+pub const RetainedGeneration = workbook_mod.RetainedGeneration;

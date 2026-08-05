@@ -576,14 +576,6 @@ pub const PartStore = struct {
         self.arena.deinit();
     }
 
-    /// Replace the bytes of an existing part. The replacement is
-    /// queued (compressed via deflate) and applied at `save()` time.
-    /// Calling `part(name)` after `replacePart` continues to return
-    /// the ORIGINAL bytes — overrides are write-only until save.
-    /// Returns `error.PartNotFound` if `name` isn't in the store.
-    ///
-    /// `bytes` is duped into the arena; caller can free its own
-    /// buffer right after the call.
     /// Add a new part to the package. The part name must NOT already
     /// exist (use `replacePart` for that case). Updates
     /// `[Content_Types].xml` to declare the new part's content type
@@ -874,6 +866,19 @@ pub const PartStore = struct {
         self.overrides = new_overrides;
     }
 
+    /// Replace the bytes of an existing part. The compressed payload is
+    /// staged as an override and written at `save()`; `parts[idx].bytes`
+    /// is updated in the same call, so **`part(name)` returns the new
+    /// bytes immediately**. `error.PartNotFound` if `name` is absent.
+    ///
+    /// (This doc block spent several iterations attached to `addPart`
+    /// saying the opposite — that overrides were write-only until save.
+    /// The mirror below has been here since iter-er-4, and M5b2's
+    /// transaction depends on it: the candidate parses its new typed
+    /// views out of the store it just staged into.)
+    ///
+    /// `bytes` is duped into the arena; the caller may free its own
+    /// buffer as soon as the call returns.
     pub fn replacePart(self: *PartStore, name: []const u8, bytes: []const u8) !void {
         const idx = self.findIndex(name) orelse return error.PartNotFound;
         const ar_alloc = self.arena.allocator();

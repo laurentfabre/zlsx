@@ -869,6 +869,23 @@ pub fn build(b: *std.Build) void {
     });
     fuzz_step.dependOn(&b.addRunArtifact(formula_resolved_fuzz_tests).step);
 
+    // M5b2: §5.7.6's calc-state writes and §5.7.7's mark-only
+    // eligibility. Sibling of `resolved.zig` — the same byte-confined
+    // edit-list shape, over `xl/workbook.xml` instead of a worksheet —
+    // and it borrows M5b1's `changedWindow`, so it roots the same tree.
+    const formula_calc_patch_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/calc_patch.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_calc_patch_mod.addImport("zlsx_refs", refs_mod);
+    formula_calc_patch_mod.addImport("zlsx_xid", xid_mod);
+    formula_calc_patch_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_calc_patch_mod.addImport("zlsx_casing", casing_mod);
+    addOracleFixtures(b, formula_calc_patch_mod);
+    const formula_calc_patch_tests = b.addTest(.{ .root_module = formula_calc_patch_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_calc_patch_tests).step);
+
     // M3b: the criteria fuzz target (§8.1) — no criterion string may
     // panic, leak, or match non-deterministically.
     const formula_criteria_fuzz_mod = b.createModule(.{
@@ -1458,6 +1475,29 @@ pub fn build(b: *std.Build) void {
     package_workbook_tests_mod.addImport("zlsx_formula", formula_pkg_mod);
     const package_workbook_tests = b.addTest(.{ .root_module = package_workbook_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_workbook_tests).step);
+
+    // pkg/recalc_txn.zig — M5b2's prepare/swap transaction. Its own test
+    // binary rather than a section of the workbook target: nothing that is
+    // already a test root reaches it (`workbook.zig` imports it, but only
+    // through one method body, and a file no analysis reaches is a file
+    // whose tests never run — the lesson `src/dbx.zig` cost).
+    const package_recalc_txn_tests_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/recalc_txn.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    package_recalc_txn_tests_mod.addImport("zlsx", zlsx_mod);
+    package_recalc_txn_tests_mod.addImport("zlsx_sst_plan", sst_plan_mod);
+    package_recalc_txn_tests_mod.addImport("zlsx_styles_plan", styles_plan_mod);
+    package_recalc_txn_tests_mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
+    package_recalc_txn_tests_mod.addImport("zlsx_zip", zip_mod);
+    package_recalc_txn_tests_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
+    package_recalc_txn_tests_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
+    package_recalc_txn_tests_mod.addImport("zlsx_nfc", nfc_mod);
+    package_recalc_txn_tests_mod.addImport("zlsx_refs", refs_mod);
+    package_recalc_txn_tests_mod.addImport("zlsx_formula", formula_pkg_mod);
+    const package_recalc_txn_tests = b.addTest(.{ .root_module = package_recalc_txn_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(package_recalc_txn_tests).step);
 
     // pkg/editor.zig had no test target at all, so its inline tests
     // were never collected: Zig gathers tests from the root file and

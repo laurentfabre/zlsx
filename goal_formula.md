@@ -128,7 +128,7 @@ Verified 2026-08-02 on `main` @ `07c99f0`:
 | Formula text + identifiers XML-escaped; **`<f>` attributes discarded by the typed parser** | `sheet_xml.zig:489-535`, `workbook_xml.zig:24,58` | M4b1 decode boundary + decoded symbol layer; **CLOSED (M4b2)**: the complete `CT_CellFormula` inventory is a table `classifyFormula` reads, one fixture per row, unknown attribute refuses (§5.7.2) |
 | Scanners literal-match `<sheetData>/<row>/<c>` | `sheet_xml.zig:421` | Namespace preflight refusal (M4b1) |
 | Delta model can't carry formula+cache; **`Writer.save` is path-only; its archive inputs are private** | `workbook.zig:353,5410,6206`; `writer.zig:484-512,940` | `ResolvedSheet` (§5.7.3); **`Writer.saveToOwnedBuffer(allocator, io)`** producer API (M5c; allocator-first per `AGENTS.md:194`) — `pkg/fresh_emit.zig:107` alone cannot serve an external orchestrator |
-| `PartStore.open` path-only, retains `io`; calcChain rels owner-relative (`Target="calcChain.xml"`), `removeRelationshipsTo` matches absolute | `store.zig:105-144,1510`; corpus `phpoi_test1.xlsx` | `Workbook.openBuffer(allocator, io, bytes)` — borrow ends at return, store copies (Book precedent); rel-target resolution relative to `xl/workbook.xml` (M5b2) |
+| `PartStore.open` path-only, retains `io`; calcChain rels owner-relative (`Target="calcChain.xml"`), `removeRelationshipsTo` matches absolute | `store.zig:105-144,1510`; corpus `phpoi_test1.xlsx` | `Workbook.openBuffer(allocator, io, bytes)` — borrow ends at return, store copies (Book precedent); **rel-target half CLOSED (M5b2)**: the recalc transaction resolves the calcChain rel through `PartStore.resolve` (owner-relative to `xl/workbook.xml`) and removes override + relationship by identity, attribute-aware — `removeRelationshipsTo` is left alone for its other callers, and the relative/absolute/noncanonical spellings are fixtured. `Workbook.openBuffer` itself stays M5c |
 | `calcPr` partial; `date1904` absent from typed view; CV extension unparsed | `workbook_xml.zig:89,286-318` | **CLOSED (M4b2)**: complete `CT_CalcPr`, `sheetCalcPr`, `date1904` → `t="d"`'s epoch, extensions preserved byte-exact; every corpus `<calcPr>` round-trips (§5.7.6). CV2's feature name stays unpinned until M7b's byte-diff |
 | `cm`/`vm` = one-based metadata indexes; no parser; **spec-vs-Office collection resolution differs** | MS-OE376 | M4a typed reader; **transition rows name the exact collection (cellMetadata vs valueMetadata), record type, indexing, and missing-record behavior — pinned empirically by byte-diffed Excel references at M7b**, not assumed from the base schema |
 | Tables can carry `calculatedColumnFormula`/totals formulas | `table_edit.zig:39` | M4b3 producer inventory + refusal when member cells lack `<f>` |
@@ -1936,7 +1936,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M5a2** ✅ | Iteration engine (multi-SCC schedule, convergence, clamps) + callsite-keyed volatile schedule + rebuild-reuse KATs + dynamic-edge fixpoint + **complete oracle-gated INDIRECT + OFFSET contracts** (the fixpoint's test subjects; registered fully here so M6's public CLI never exposes a half-function) | Iteration oracles; stabilization fuzz; INDIRECT/OFFSET fixtures |
 | **M5b0** ✅ | **`SourceBacking`** — ref-counted file/buffer backing shared across PartStore generations (each store exclusively owns + closes one `std.Io.File`, `store.zig:105-129,326-329`; shallow clone double-closes, moving breaks retention); backing unified; repeated-recalc + ownership tests. **Ladder-ordered FIRST of the M5b group — physically before M5b1/M5b2, because the transaction that requires it cannot land earlier than it** | Ownership tests; double-close fuzz |
 | **M5b1** ✅ | `ResolvedSheet` projection + cached-value patcher + transitions (**incl. ST_Xstring output encoding**) + fuzz | Byte-confinement; round-trip |
-| **M5b2** | Prepare/swap transaction (complete state, reports pre-swap) + calcChain rel-resolution + calc-state writes + `markRecalcOnLoad` + diagnostics. **Hard dependency on M5b0** — whole-generation retention (§5.7.4) is unsafe while `PartStore` exclusively owns and closes its own file, so M5b2's gate re-runs M5b0's ownership tests | No-fail-swap proof; post-failure reads; raw-entry identity; refusal purity; **M5b0 ownership tests green** |
+| **M5b2** ✅ | Prepare/swap transaction (complete state, reports pre-swap) + calcChain rel-resolution + calc-state writes + `markRecalcOnLoad` + diagnostics. **Hard dependency on M5b0** — whole-generation retention (§5.7.4) is unsafe while `PartStore` exclusively owns and closes its own file, so M5b2's gate re-runs M5b0's ownership tests | No-fail-swap proof; post-failure reads; raw-entry identity; refusal purity; **M5b0 ownership tests green** |
 | **M5c** | `Workbook.openBuffer(alloc, io, bytes)` + **`Writer.saveToOwnedBuffer`** + `zlsx_recalc` **importable shell** (module graph only — its public composition ops land in M5d, where the consumer test moves) | Module-graph gate; buffer≡path byte-equivalence |
 | **M5d1** | Archive/durability substrate: **`AtomicFile.finish` fsync fix** + commit region + **cancellation-aware serialization seam** (the context-free `DeflateFn` at `pkg/zip.zig:64-68,140-144` AND PartStore's whole-input compression during preparation, `pkg/store.zig:370-385,498-512,638-656` — the shared compressor becomes context/callback-aware with 64 KiB chunks; the same chunking covers **decompression during model materialization** (`store.zig:881-916,1361-1384`), **raw-entry copies at save** (`:783-792`), XML scans, and temp-file writes, so the §5.5 polling bound holds across every long operation; cancel-inside-entry, cancel-inside-replacePart, and cancel-inside-materialization tests. **Control-aware buffer variants** — `saveToOwnedBufferControlled` / `openBufferControlled` (§5.10) wired to these seams, with cancel-mid-fresh-serialization and cancel-mid-buffer-open tests, so the Writer path meets the same bound. **Documented SLA exceptions: the blocking `File.sync` AND the post-commit POSIX directory fsync cannot be polled** — both uncancellable waits (no timeout; post-commit status is already success per §5.7.9), fault-injected tests for each, incl. Python worker-thread wait behavior) | Injected sync/rename failures; cancel-inside-* tests |
 | **M5d2** | `recalculate()` + `saveWithRecalc` (ordering §5.7.9) + report + pre-M7 gate + logical-view gate + embedding-staleness preflight | Determinism; scoped idempotence; no-formula identity; confinement |
@@ -2930,6 +2930,119 @@ became a byte range in a file.
     the question — plus a multi-cell regression fixture. The two targets
     share one generator and one patched run, and differ only in what
     they assert: confinement, and round-trip.
+
+**M5b2 decisions (shipped 2026-08-05).** Eleven points, in
+`pkg/recalc_txn.zig` (the candidate, prepare, swap, retention, the
+calcChain removal), `pkg/workbook.zig` (`RetainedGeneration`,
+`markRecalcOnLoad`, §10's plane-2 names) and `src/formula/calc_patch.zig`
+(§5.7.6's writes and §5.7.7's eligibility table). The row where a recalc
+stopped being a sequence of mutations and became one thing that either
+happened or did not.
+
+1.  **"The swap cannot fail" is a bill, and prepare pays it.** The
+    expensive half is not the part bytes — it is the *typed views over
+    them*. A swap that installed a new `PartStore` and nulled the views
+    would leave the next read to parse, which is a read that can fail
+    after the transaction claimed to be finished. So `prepare` parses
+    `xl/workbook.xml` and every already-materialised sheet view whose
+    part changed, builds the report in full, and reserves the one list
+    slot the retained generation goes into. `swap` is then moves and
+    scalar stores: no allocation, no parse, no `try`. A lazy slot stays
+    lazy — its next reader parses the new bytes, which is the same answer
+    for less work.
+2.  **Refusals return successfully, and that is what leaked.** Every
+    refusal after the candidate exists returns `.{ .refused = … }` — a
+    *successful* return, so `errdefer` does not fire for it. Four
+    fixtures found a whole generation leaking per refused run. The fix is
+    `defer if (!keep)` throughout rather than `errdefer`, which is the
+    only spelling that covers both exits. The same reading moved both
+    §5.7.4 gates to the top of the function: neither the generation count
+    nor the retired byte count depends on the candidate, so paying for
+    one to learn them was buying an answer already on the table.
+3.  **The no-fail swap is proven twice, from opposite ends.**
+    `checkAllAllocationFailures` opens a workbook and prepares under every
+    injected failure index, and on each failure asserts that every part is
+    the *same slice* it was — pointer and length, not equal content, since
+    equal content is also what a store that quietly rebuilt itself would
+    show. Then a second fixture runs `swap` under an allocator whose first
+    request fails, and asserts `allocations == 0`. The first says nothing
+    escapes prepare; the second says the swap asks for nothing. Both were
+    checked against a deliberately reintroduced leak, because a gate that
+    cannot fail is not a gate.
+4.  **Retention refuses; it never evicts.** §5.7.4 promises
+    Workbook-lifetime validity for borrowed strings, so reclaiming a
+    generation means deciding a promise is now stale — which is precisely
+    what cannot be decided. `max_retained_generations` (4) and the byte
+    ceiling therefore refuse *before* the swap, and the reclamation path
+    stays `deinit` and reopen. The fixture asserts the refusal frees
+    nothing.
+5.  **The retained generation takes the store *and* the views, because
+    the strings borrow part bytes.** `sheet_xml`'s leaves point into the
+    decompressed part, not into the view's arena, so retaining views
+    alone would dangle. The worksheet slot array is never reallocated, so
+    `&wb.worksheets[i]` survives any number of nonstructural recalcs —
+    asserted by pointer equality across a swap, and by a slice borrowed
+    before the first recalc still reading as itself three generations
+    later.
+6.  **`sst_view` and `styles_view` go with the generation
+    unconditionally.** Keeping them would mean resolving which part backs
+    each and whether that part moved — two chances to be wrong, in
+    exchange for saving a re-parse nobody asked for. Handing them over
+    costs one lazy re-parse and cannot be wrong.
+7.  **The fd budget for a five-deep set is one, and the ledger says so.**
+    M5b0's `CloseLedger` attaches to the live backing post-open (it is
+    only read when the last reference drops), so the fixture runs four
+    recalcs, asserts `refCount() == 5` and `closes == 0`, reads every
+    retained generation's sheet part — generation 0 still holds the
+    original cache — and then tears the workbook down and asserts exactly
+    one close.
+8.  **calcChain removal resolves the target; it does not match the
+    string.** `PartStore.removePart` strips relationships by literal
+    `Target="…"` in bare and leading-slash forms, and real files write
+    `Target="calcChain.xml"` — the one form neither matches. So the
+    transaction resolves the rel through `PartStore.resolve` (owner-
+    relative to `xl/workbook.xml`) and removes the override and the
+    relationship by *identity*, attribute-aware, before handing the
+    compaction back to `removePart`. Fixtured over relative, absolute and
+    two noncanonical spellings, each asserting part, rel and content type
+    are all gone; plus a decoy whose `PartName` merely contains the
+    target, which a substring matcher removes instead of the real one.
+9.  **§5.7.6's write is a patch, not a re-serialization.** `<calcPr>`
+    lives in a part carrying defined names, external references and
+    vendor extensions this engine does not model, and "everything else
+    survived" is not a testable sentence about a serializer. So
+    `calc_patch` emits M5b1's shape — an edit list, an `approvedRange` per
+    kind, and the two independent confinement statements — and preservation
+    becomes *structural*: the preserved attributes are bytes no edit
+    addresses. `calc.zig` records the spans on its way past, so there is
+    one parser and it hands out the ranges it used. A `<calcPr>` the
+    document never closes now refuses rather than leaving a span with a
+    start and no end.
+10. **Absence is not the target state.** `calcId`'s schema default *is*
+    zero, so `<calcPr/>` already means what a recalc wants it to mean —
+    but the point of writing `calcId="0"` is to tell a consumer something
+    about the producer, and a default nobody wrote says nothing about who
+    did. So the condition is over the span and the value together: a file
+    that already states the pair is left alone, a file that merely implies
+    it is not. Created elements go at `CT_Workbook`'s sequence position —
+    before the first successor the part actually has — because appending
+    before `</workbook>` after an `<extLst>` produces a document Excel
+    offers to repair.
+11. **Mark-only may suppress exactly two planes, and it stages nothing
+    else.** `markEligible` is an exhaustive switch over §10's fourteen, so
+    a new plane cannot be added without answering the question, and one
+    ineligible census entry refuses the whole run — a partially-suppressed
+    census leaves a caller believing a marked file was a handled one.
+    `.keep_stale_and_mark` applies no caches and removes no calcChain, so
+    §5.7.7's byte-identity claim is provable as a diff: every other part
+    identical, and `xl/workbook.xml` differing in exactly the inserted
+    ` fullCalcOnLoad="1"`, with `calcId` untouched. `markRecalcOnLoad()`
+    is that path with an empty staged set — a real transaction, because a
+    `replacePart` shortcut would have replaced bytes the workbook's own
+    views still described. §10's plane-2 vocabulary lands in
+    `pkg/workbook.Error` here rather than at M5d2: the transaction already
+    carries an evaluator's census out to the caller, so a partial set
+    would have forced reporting a cycle as malformed input.
 
 ---
 
