@@ -102,6 +102,16 @@ pub const recovery_record = @import("recovery_record.zig");
 /// and not an implementation detail of one method.
 pub const recalc_txn = @import("recalc_txn.zig");
 
+/// M5d2: §5.7's pipeline behind `Workbook.recalculate` /
+/// `Workbook.saveWithRecalc`. Exported for its `Options` and its
+/// `Report` — a caller cannot name what the two methods take and return
+/// otherwise — and for `prepare`, which M5d3's `writerSaveWithRecalc`
+/// composes across a different serialization.
+pub const recalc_run = @import("recalc_run.zig");
+pub const RecalcOptions = recalc_run.Options;
+pub const RecalcReport = recalc_run.Report;
+pub const RunInputs = recalc_run.RunInputs;
+
 /// M5d1: §5.5's cancellation / deadline seam. Re-exported because
 /// `Workbook.openBufferControlled` takes a `Control` and a consumer of
 /// this module has to be able to spell it — the same reason `Edit` is

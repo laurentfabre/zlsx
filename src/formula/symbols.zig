@@ -88,6 +88,14 @@ pub const graph = @import("graph.zig");
 /// would be a different type.
 pub const iterate = @import("iterate.zig");
 pub const draws = @import("draws.zig");
+/// M5d2: `rng_v1`, as the recalc's draw source. Standalone evaluation
+/// hands the evaluator a constant — a cache-based read must answer the
+/// same call the same way twice — but a recalc is given a `RunInputs`
+/// with a seed in it, and "equal inputs ⇒ equal output" is a promise
+/// about *that* seed. It is reached through this module for the reason
+/// everything above is: `Rng.drawSource()` returns an `eval.DrawSource`,
+/// and a second `eval.zig` would make it a different type.
+pub const rng = @import("rng.zig");
 
 pub const Refusal = decode.Refusal;
 pub const SheetIndex = env.SheetIndex;
