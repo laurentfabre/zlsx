@@ -55,6 +55,8 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
 const store_mod = @import("store.zig");
+// M5d1: the commit outcome §5.7.9 hands to the dormant durability slot.
+const atomic_file = @import("atomic_file.zig");
 const workbook_mod = @import("workbook.zig");
 const typed_parts = @import("typed_parts/root.zig");
 const engine = @import("zlsx_formula");
@@ -1701,6 +1703,42 @@ test "report: bounded census, truncation flag, and the dormant durability slot" 
     rep.durability.warn(5);
     try testing.expect(rep.durability.warning);
     try testing.expectEqual(@as(i32, 5), rep.durability.err_code);
+}
+
+test "M5d1: a real AtomicFile.Commit flips the dormant slot without allocating" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa, .{});
+    defer h.deinit(gpa);
+
+    var r = try prepare(&h.wb, &.{}, &.{}, .{});
+    switch (r) {
+        .ok => |*c| c.swap(&h.wb),
+        .refused => return error.UnexpectedRefusal,
+    }
+    var rep = r.ok.takeReport();
+    defer rep.deinit(gpa);
+    try testing.expect(!rep.durability.warning);
+
+    // The value M5d1's commit region actually produces, carried across
+    // the layer boundary as data rather than re-derived here.
+    const commit: atomic_file.Commit = .{
+        .durability_warning = true,
+        .durability_errno = @intFromEnum(std.posix.E.IO),
+    };
+
+    // Under an allocator that fails every request: §5.7.9 discovers a
+    // post-rename fsync failure at the one point where allocation is no
+    // longer permitted, so the transfer has to be pure stores. A `warn`
+    // that ever grew anything would fail here rather than in production
+    // on the day a disk filled up.
+    var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    const never = failing.allocator();
+    try testing.expectError(error.OutOfMemory, never.alloc(u8, 1));
+
+    if (commit.durability_warning) rep.durability.warn(commit.durability_errno);
+    try testing.expect(rep.durability.warning);
+    try testing.expectEqual(@intFromEnum(std.posix.E.IO), rep.durability.err_code);
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
 }
 
 test "report: the resolved run inputs are echoed verbatim" {

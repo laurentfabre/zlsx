@@ -101,18 +101,16 @@ pub const EvalSite = struct {
 /// and a plain volatile flag for a signal handler in a single-threaded
 /// CLI (writing an atomic from a signal handler is not async-signal-safe
 /// in general). One `isTriggered` seam, so every poll site is identical.
-pub const CancelToken = union(enum) {
-    atomic: *const std.atomic.Value(bool),
-    /// `sig_atomic_t`-shaped: written by a signal handler, read here.
-    flag: *const volatile u8,
-
-    pub fn isTriggered(self: CancelToken) bool {
-        return switch (self) {
-            .atomic => |a| a.load(.acquire),
-            .flag => |f| f.* != 0,
-        };
-    }
-};
+///
+/// **Defined in `pkg/control.zig` since M5d1, and re-exported here.** The
+/// archive layer polls the same token the evaluator does — `Writer`'s
+/// `saveToOwnedBufferControlled` takes a `control.Control` whose `cancel`
+/// field has to be assignable from a `RunInputs.cancel` — and
+/// `src/writer.zig` does not import this engine. Two structurally
+/// identical unions would have needed a conversion function kept in sync
+/// by hand, so the definition moved down to a std-only leaf both trees
+/// sit above instead. Nothing in this module changed but the address.
+pub const CancelToken = @import("zlsx_control").CancelToken;
 
 pub const utc_offset_min_min: i32 = -1440;
 pub const utc_offset_min_max: i32 = 1440;

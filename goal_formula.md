@@ -1941,7 +1941,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M5b1** ✅ | `ResolvedSheet` projection + cached-value patcher + transitions (**incl. ST_Xstring output encoding**) + fuzz | Byte-confinement; round-trip |
 | **M5b2** ✅ | Prepare/swap transaction (complete state, reports pre-swap) + calcChain rel-resolution + calc-state writes + `markRecalcOnLoad` + diagnostics. **Hard dependency on M5b0** — whole-generation retention (§5.7.4) is unsafe while `PartStore` exclusively owns and closes its own file, so M5b2's gate re-runs M5b0's ownership tests | No-fail-swap proof; post-failure reads; raw-entry identity; refusal purity; **M5b0 ownership tests green** |
 | **M5c** ✅ | `Workbook.openBuffer(alloc, io, bytes)` + **`Writer.saveToOwnedBuffer`** + `zlsx_recalc` **importable shell** (module graph only — its public composition ops land in M5d, where the consumer test moves) | Module-graph gate; buffer≡path byte-equivalence |
-| **M5d1** | Archive/durability substrate: **`AtomicFile.finish` fsync fix** + commit region + **cancellation-aware serialization seam** (the context-free `DeflateFn` at `pkg/zip.zig:64-68,140-144` AND PartStore's whole-input compression during preparation, `pkg/store.zig:370-385,498-512,638-656` — the shared compressor becomes context/callback-aware with 64 KiB chunks; the same chunking covers **decompression during model materialization** (`store.zig:881-916,1361-1384`), **raw-entry copies at save** (`:783-792`), XML scans, and temp-file writes, so the §5.5 polling bound holds across every long operation; cancel-inside-entry, cancel-inside-replacePart, and cancel-inside-materialization tests. **Control-aware buffer variants** — `saveToOwnedBufferControlled` / `openBufferControlled` (§5.10) wired to these seams, with cancel-mid-fresh-serialization and cancel-mid-buffer-open tests, so the Writer path meets the same bound. **Documented SLA exceptions: the blocking `File.sync` AND the post-commit POSIX directory fsync cannot be polled** — both uncancellable waits (no timeout; post-commit status is already success per §5.7.9), fault-injected tests for each, incl. Python worker-thread wait behavior) | Injected sync/rename failures; cancel-inside-* tests |
+| **M5d1** ✅ | Archive/durability substrate: **`AtomicFile.finish` fsync fix** + commit region + **cancellation-aware serialization seam** (the context-free `DeflateFn` at `pkg/zip.zig:64-68,140-144` AND PartStore's whole-input compression during preparation, `pkg/store.zig:370-385,498-512,638-656` — the shared compressor becomes context/callback-aware with 64 KiB chunks; the same chunking covers **decompression during model materialization** (`store.zig:881-916,1361-1384`), **raw-entry copies at save** (`:783-792`), XML scans, and temp-file writes, so the §5.5 polling bound holds across every long operation; cancel-inside-entry, cancel-inside-replacePart, and cancel-inside-materialization tests. **Control-aware buffer variants** — `saveToOwnedBufferControlled` / `openBufferControlled` (§5.10) wired to these seams, with cancel-mid-fresh-serialization and cancel-mid-buffer-open tests, so the Writer path meets the same bound. **Documented SLA exceptions: the blocking `File.sync` AND the post-commit POSIX directory fsync cannot be polled** — both uncancellable waits (no timeout; post-commit status is already success per §5.7.9), fault-injected tests for each, incl. Python worker-thread wait behavior) | Injected sync/rename failures; cancel-inside-* tests |
 | **M5d2** | `recalculate()` + `saveWithRecalc` (ordering §5.7.9) + report + pre-M7 gate + logical-view gate + embedding-staleness preflight | Determinism; scoped idempotence; no-formula identity; confinement |
 | **M5d3** | Writer compose + `zlsx_recalc` composition ops + **consumer dependency test** + committed bench workloads | Module-graph gate; bench baseline |
 | **M6** | CLI: NDJSON schemas, exit tables (incl. 130/143 + prefix-valid stream rule), mandatory `--sheet/--name`, `--out` identity | Contract tests |
@@ -3144,6 +3144,112 @@ consumer.
     0.16. The RSS probes are split for an unrelated reason — a
     per-process RSS delta is only meaningful against a process that did
     nothing else — and that is what the comment says now.
+
+**M5d1 decisions (shipped 2026-08-05).** Fourteen points, in a new
+std-only leaf (`pkg/control.zig`), the commit region
+(`pkg/atomic_file.zig`), the archive seams (`pkg/zip.zig`,
+`pkg/store.zig`, `pkg/fresh_emit.zig`, `src/writer.zig`), the
+control-aware buffer variants (`src/writer.zig`, `pkg/workbook.zig`), and
+the module graph (`build.zig`). The row where a save became durable and a
+long operation became interruptible.
+
+1.  **`CancelToken` moved out of the evaluator.** It lived in
+    `src/formula/run_inputs.zig`; `saveToOwnedBufferControlled` is a
+    `Writer` method and `writer_mod` does not import the formula engine.
+    The alternatives were to give the writer the whole engine, or to
+    define a second structurally-identical union with a conversion
+    function someone has to keep in sync forever. It moved down to a
+    std-only leaf both trees already sit above, and `run_inputs.zig`
+    re-exports the name — nothing in the engine changed but the address.
+    92 modules gained the dep; an unused module dep costs nothing and a
+    missing one is a compile error that names the module, so the wiring
+    is checked by the build rather than by inspection.
+2.  **The seam is a callback, not a `Control`.** Every long operation
+    takes a `Poller` — an erased `{ ctx, check_fn }` — and only the public
+    signatures take §5.10's `Control`. Two things fall out that a
+    `Control`-typed seam could not give: `pkg/zip.zig` stays stdlib-only
+    (it cannot name a `CancelToken` and does not have to), and a **test
+    can supply its own context** that trips on the Nth poll instead of
+    trying to observe a volatile load it has no hook on.
+3.  **A disarmed control produces `Poller.none`, so the plain form and
+    the controlled form are the same instructions.** `Watch.poller`
+    returns the null value when neither a cancel nor a deadline is set, so
+    there is no callback to call. "Byte-identical under a null control" is
+    therefore true by construction; the equality tests are regression
+    guards on that property, not the proof of it.
+4.  **Chunking the deflate does not change a single byte, and that had to
+    be established rather than assumed.** `std.compress.flate.Compress` is
+    a streaming encoder over one window; block boundaries do not depend on
+    the granularity of the writes feeding it. Had they, every archive zlsx
+    has ever written would have silently changed the day this landed. Same
+    argument on the decompression side: `streamExact64` pulled in 64 KiB
+    slices resumes exactly where the previous call stopped.
+5.  **Fault injection is `std.Io`'s own vtable, so no hook exists in the
+    production path.** The double keeps the base `userdata` and replaces
+    exactly three entries (`now`, `fileSync`, `dirRename`), delegating
+    everything else. One mechanism covers the injected sync failure, the
+    injected rename failure, the post-commit directory fsync, *and* the
+    clock — and the commit region has no test-only branch in it at all.
+6.  **The counting clock is how §5.5's bound is measured rather than
+    asserted.** A cancel token is a volatile load with nothing to count.
+    A *deadline*, though, forces a clock read at every poll — so an
+    injected `now` that counts its calls is an exact poll counter. The
+    large-workbook test compares that count against
+    `control.chunkCount(body_len)` computed from the emitter's own output,
+    not against a hard-coded constant a format change would falsify.
+7.  **The same double makes "cancel arrives *mid*-operation"
+    deterministic.** Arm a deadline (so every poll reads the clock) and
+    have the injected clock set the cancel flag on its Nth read: the poll
+    after that one sees it. No threads, no sleeps, no racy "cancel it and
+    hope". Setting the flag before the call would only ever prove the
+    entry-point check.
+8.  **`syncDir` returns a value, not an error union — and `@typeInfo`
+    says so in a test.** §5.7.9's rule that nothing after the commit point
+    may report failure as an error is otherwise a comment someone can
+    contradict. The SLA-exception test reads the two signatures: `finish`
+    and `syncDir` each take one parameter (nowhere to put a poller), and
+    `syncDir`'s return type is `Commit`, not `!Commit`.
+9.  **The directory fsync goes through `std.Io.File.sync` on the
+    directory handle, not `std.posix.fsync`.** Same vtable seam as every
+    other I/O in the file, which is what lets one injection point reach
+    both SLA exceptions; `std.Io.File` is `{ handle, flags }` and a
+    directory fd is a valid `fsync(2)` target on POSIX. Windows has no
+    equivalent and returns clean — there the rename's own metadata
+    ordering is the guarantee.
+10. **Sync before close, and the destination-untouched property falls out
+    of an invariant that was already there.** `File.sync` needs the
+    descriptor, so it sits above the `close`; a failure there leaves
+    `file_closed == false`, and `deinit` already closes the handle and
+    unlinks the temp file on the unfinished path. Prior bytes intact,
+    absent destination still absent, no debris — with no new cleanup code.
+11. **`error.Cancelled` is not `std.Io.Cancelable`'s `Canceled`.** The
+    spellings differ by one `l` and the outcomes differ by more than that:
+    std's means the `Io` runtime cancelled a syscall, ours means the
+    caller's token fired or their deadline passed (§12.2's C `-5`, CLI
+    130/143). `PartStore.Error` now contributes both, deliberately, with
+    the distinction written at the declaration.
+12. **The raw-entry copy got smaller as well as pollable.**
+    `PartStore.save` allocated `lfh_total_len + compressed_size +
+    data_descriptor_len` from the page allocator *per untouched entry*, so
+    a 200 MiB part was fully resident before one byte reached the temp
+    file — and, being one read and one write, was the longest unpollable
+    stretch in a save. One reused 64 KiB window per save replaces it.
+13. **Three copies of the compression policy became one.** `addPart`,
+    `replacePart` and `stageContentTypeOverride` each carried the same
+    "under 1 KiB stores, otherwise deflate, fall back to STORED if it did
+    not shrink" block. The seam had to reach all three, and threading a
+    poller through three copies is how the fourth copy gets written.
+14. **Poll placement is chosen so a refused operation leaves whole
+    units.** `zip.Archive.addEntry` polls *before* any allocation or byte
+    of work, so a cancelled archive stops at an entry boundary and the
+    buffer a caller frees holds only complete entries. Materialization
+    publishes to `Part.bytes` only after the whole part has inflated and
+    its CRC has matched, so a cancelled inflate cannot leave a partial
+    part visible — the test asserts the slot is still empty *and* that a
+    later uncancelled read still returns the right bytes. And
+    `PartStore.save` polls once more immediately before `finish`: §5.7.9's
+    final poll, the last instant at which a cancelled save is a save that
+    changed nothing.
 
 ---
 

@@ -79,12 +79,17 @@ const engine = @import("zlsx_formula");
 /// to `xlsx.deflateCompress` (the canonical deflate impl). Wrapping
 /// is needed because `pkg/fresh_emit.zig` and `pkg/zip.zig` are
 /// std-only (cycle-avoidance) and accept a `DeflateFn` callback.
+// M5d1's cancellation / deadline / 64 KiB-chunk seam (§5.5). Named
+// import so `pkg/control.zig` belongs to exactly one module tree.
+const control = @import("zlsx_control");
+
 fn freshEmitDeflate(
     alloc: Allocator,
     input: []const u8,
     out: *std.ArrayListUnmanaged(u8),
+    poller: control.Poller,
 ) anyerror!void {
-    return zlsx.deflateCompress(alloc, input, out);
+    return zlsx.deflateCompressControlled(alloc, input, out, poller);
 }
 
 const PartStore = store_mod.PartStore;
@@ -1019,7 +1024,32 @@ pub const Workbook = struct {
     /// code a path-opened workbook does, because the only thing that
     /// differs is which arm of the backing answers `readAt`.
     pub fn openBuffer(allocator: Allocator, io: std.Io, bytes: []const u8) Error!Workbook {
-        var store = try PartStore.openBuffer(allocator, io, bytes);
+        return openBufferControlled(allocator, io, bytes, .none);
+    }
+
+    /// §5.10's control-aware consumer (M5d1).
+    ///
+    /// The mirror of `Writer.saveToOwnedBufferControlled`, and needed for
+    /// the same reason: opening a buffer scans the central directory,
+    /// eagerly decompresses every structural part and materializes
+    /// `xl/workbook.xml`, all *before* a recalc begins. An orchestrator
+    /// that promised a deadline has to be able to reach in here, or the
+    /// §5.5 bound is only true of the half of the pipeline that comes
+    /// after.
+    ///
+    /// `error.Cancelled` leaves nothing behind: the store is torn down,
+    /// the backing released, and the caller's `bytes` — which this only
+    /// ever reads — are untouched. Like the producer side, this stage
+    /// sits entirely before §5.7.9's commit point.
+    pub fn openBufferControlled(
+        allocator: Allocator,
+        io: std.Io,
+        bytes: []const u8,
+        ctl: control.Control,
+    ) Error!Workbook {
+        const watch: control.Watch = .init(io, ctl);
+        const poller = watch.poller();
+        var store = try PartStore.openBufferControlled(allocator, io, bytes, poller);
         // `fromStore` takes ownership INCLUDING on failure, so the
         // errdefer has to be disarmed before the hand-off. Armed, it
         // double-frees the arena on every failing open — the exact bug
@@ -1028,16 +1058,27 @@ pub const Workbook = struct {
         var owned = true;
         errdefer if (owned) store.deinit();
         owned = false;
-        return try fromStore(allocator, store);
+        return try fromStoreControlled(allocator, store, poller);
     }
 
     /// Construct a `Workbook` from an already-opened `PartStore`.
     /// Takes ownership of the store; `deinit` will tear it down.
     pub fn fromStore(allocator: Allocator, store: PartStore) Error!Workbook {
+        return fromStoreControlled(allocator, store, .none);
+    }
+
+    /// `fromStore` with §5.5's poll seam over the one long operation it
+    /// performs: materializing (and therefore decompressing)
+    /// `xl/workbook.xml`.
+    pub fn fromStoreControlled(
+        allocator: Allocator,
+        store: PartStore,
+        poller: control.Poller,
+    ) Error!Workbook {
         var s = store;
         errdefer s.deinit();
 
-        const wb_part = try s.part("xl/workbook.xml") orelse
+        const wb_part = try s.partControlled("xl/workbook.xml", poller) orelse
             return Error.MissingWorkbookPart;
 
         var workbook_view = try workbook_xml_mod.parse(allocator, wb_part.bytes);
@@ -3332,7 +3373,7 @@ pub const Workbook = struct {
             .sst_count = self.fresh_sst_count,
             .styles_plan = &self.styles_plan,
             .workbook_xml_plan = &self.workbook_xml_plan,
-        }, freshEmitDeflate);
+        }, freshEmitDeflate, .none);
     }
 
     /// Stage a plain string into the fresh-emit SST and return the
@@ -17501,6 +17542,74 @@ fn expectWorkbooksEquivalent(a: *Workbook, b: *Workbook) !void {
             try std.testing.expectEqual(x.target_mode, y.target_mode);
         }
     }
+}
+
+// ─── M5d1: the control-aware consumer (§5.10) ────────────────────────
+
+test "M5d1: openBufferControlled under a null control equals openBuffer" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, fixture, ta, .limited(1 << 24));
+    defer ta.free(raw);
+
+    var plain = try Workbook.openBuffer(ta, io, raw);
+    defer plain.deinit();
+    var controlled = try Workbook.openBufferControlled(ta, io, raw, .none);
+    defer controlled.deinit();
+
+    try expectWorkbooksEquivalent(&plain, &controlled);
+}
+
+test "M5d1: cancel mid-buffer-open mutates nothing and leaks nothing" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const base = threaded.io();
+    const ta = std.testing.allocator;
+
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(base, fixture, .{}) catch return error.SkipZigTest;
+    const raw = try std.Io.Dir.cwd().readFileAlloc(base, fixture, ta, .limited(1 << 24));
+    defer ta.free(raw);
+
+    // Trip a few polls in: past the entry-point check, inside the eager
+    // structural-part pass. The deadline makes every poll read the
+    // injected clock, which is what makes "a few polls in" exact.
+    var flag: u8 = 0;
+    const io = control.inject.wrap(base, .{ .trip_at = 3, .trip_flag = &flag });
+    try std.testing.expectError(error.Cancelled, Workbook.openBufferControlled(ta, io, raw, .{
+        .cancel = .{ .flag = &flag },
+        .deadline = .{ .nanoseconds = std.math.maxInt(i64) },
+    }));
+
+    // The caller's bytes are read-only input and survive verbatim — this
+    // is the "mutates nothing" half — and the testing allocator's leak
+    // check at teardown is the other: a cancelled open released the
+    // backing and tore down the arena.
+    var again = try Workbook.openBuffer(ta, base, raw);
+    defer again.deinit();
+    try std.testing.expect(again.sheetCount() > 0);
+}
+
+test "M5d1: a deadline expires mid-buffer-open" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const base = threaded.io();
+    const ta = std.testing.allocator;
+
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(base, fixture, .{}) catch return error.SkipZigTest;
+    const raw = try std.Io.Dir.cwd().readFileAlloc(base, fixture, ta, .limited(1 << 24));
+    defer ta.free(raw);
+
+    const io = control.inject.wrap(base, .{ .step_ns = std.time.ns_per_ms });
+    try std.testing.expectError(error.Cancelled, Workbook.openBufferControlled(ta, io, raw, .{
+        .deadline = .{ .nanoseconds = 3 * std.time.ns_per_ms },
+    }));
 }
 
 test "M5c: openBuffer and open reach the same workbook, and the borrow ends at return" {

@@ -22,7 +22,14 @@
 //! consume the same code.
 
 const std = @import("std");
-const AtomicFile = @import("atomic_file.zig").AtomicFile;
+const atomic_file_mod = @import("atomic_file.zig");
+const AtomicFile = atomic_file_mod.AtomicFile;
+pub const Commit = atomic_file_mod.Commit;
+
+// M5d1: §5.5's cancellation / deadline / 64 KiB-chunk seam. Named import
+// so `pkg/control.zig` belongs to exactly one module tree.
+const control = @import("zlsx_control");
+pub const Poller = control.Poller;
 
 /// Read exactly `dest.len` bytes at `offset`.
 ///
@@ -101,7 +108,12 @@ pub const Error = error{
     /// a partial state.
     ZipArchiveTooLarge,
 } || std.Io.File.OpenError || std.mem.Allocator.Error || std.Io.File.Reader.Error ||
-    std.Io.File.SeekError || std.Io.File.StatError;
+    std.Io.File.SeekError || std.Io.File.StatError || std.Io.File.SyncError ||
+    // §5.5's cooperative cancellation (M5d1). Note the spelling: this is
+    // NOT `std.Io.Cancelable`'s `Canceled`, which the sets above already
+    // contribute and which means "the Io runtime cancelled the syscall".
+    // This one means the caller's token fired.
+    control.Error;
 
 /// Observability seam for the fd-budget invariant. §5.7.4 gates
 /// repeated recalc on "RSS, allocation accounting, borrow validity, and
@@ -312,7 +324,7 @@ pub const PartStore = struct {
             return err;
         };
         errdefer backing.release();
-        return try openOver(allocator, backing);
+        return try openOver(allocator, backing, .none);
     }
 
     /// Open a package that is already in memory. The bytes are copied
@@ -324,13 +336,37 @@ pub const PartStore = struct {
     /// buffer-sourced store that reaches every read, materialize and
     /// save path a file-sourced one does.
     pub fn openBuffer(allocator: std.mem.Allocator, io: std.Io, bytes: []const u8) Error!PartStore {
+        return openBufferControlled(allocator, io, bytes, .none);
+    }
+
+    /// `openBuffer` with §5.5's poll seam armed (M5d1). Substrate for
+    /// `Workbook.openBufferControlled` (§5.10).
+    ///
+    /// Opening a buffer is not free: the central directory is scanned,
+    /// every structural part is decompressed eagerly, and the whole
+    /// archive is copied into the backing first. On a multi-hundred-MiB
+    /// package that is seconds of work happening *before* a recalc
+    /// starts, which is exactly the window §5.10 says an orchestrator's
+    /// deadline has to reach.
+    ///
+    /// Nothing is mutated on the way out: a cancelled open releases the
+    /// backing and tears down the arena, so the caller's `bytes` and
+    /// every other generation over the same archive are untouched.
+    pub fn openBufferControlled(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        bytes: []const u8,
+        poller: Poller,
+    ) Error!PartStore {
+        // Before the dupe: cancelling should not first copy the archive.
+        try poller.check();
         // Same refusal `openOver` makes for both variants, taken before
         // the copy rather than after it: there is no reason to dupe
         // 4 GiB in order to reject it.
         if (bytes.len > std.math.maxInt(u32)) return Error.Zip64NotSupported;
         const backing = try SourceBacking.createBuffer(allocator, io, bytes, null);
         errdefer backing.release();
-        return try openOver(allocator, backing);
+        return try openOver(allocator, backing, poller);
     }
 
     /// Open another `PartStore` over the same source bytes.
@@ -353,7 +389,7 @@ pub const PartStore = struct {
     pub fn nextGeneration(self: *const PartStore) Error!PartStore {
         const backing = self.backing.retain();
         errdefer backing.release();
-        return try openOver(self.allocator, backing);
+        return try openOver(self.allocator, backing, .none);
     }
 
     /// Shared tail of `open` / `openBuffer` / `nextGeneration`: scan and
@@ -363,14 +399,14 @@ pub const PartStore = struct {
     /// The only place a variant is named: a file has to be copied into
     /// a contiguous scratch buffer to be scanned, a buffer already is
     /// one. Everything downstream of `buildFromArchive` is identical.
-    fn openOver(allocator: std.mem.Allocator, backing: *SourceBacking) Error!PartStore {
+    fn openOver(allocator: std.mem.Allocator, backing: *SourceBacking, poller: Poller) Error!PartStore {
         const size_u64 = try backing.size();
         if (size_u64 > std.math.maxInt(u32)) return Error.Zip64NotSupported;
 
         switch (backing.source) {
             // No scratch copy: the backing's own bytes ARE the
             // contiguous view, and they outlive this call.
-            .buffer => |b| return try buildFromArchive(allocator, backing, b),
+            .buffer => |b| return try buildFromArchive(allocator, backing, b, poller),
             .file => {
                 // Read the whole file into a SCRATCH buffer
                 // (page-allocator, not arena). scanCentralDirectory
@@ -384,8 +420,8 @@ pub const PartStore = struct {
                 // arena.
                 const scratch = try std.heap.page_allocator.alloc(u8, @intCast(size_u64));
                 defer std.heap.page_allocator.free(scratch);
-                try backing.readAt(0, scratch);
-                return try buildFromArchive(allocator, backing, scratch);
+                try readChunked(backing, 0, scratch, poller);
+                return try buildFromArchive(allocator, backing, scratch, poller);
             },
         }
     }
@@ -396,6 +432,7 @@ pub const PartStore = struct {
         allocator: std.mem.Allocator,
         backing: *SourceBacking,
         archive: []const u8,
+        poller: Poller,
     ) Error!PartStore {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
@@ -412,6 +449,10 @@ pub const PartStore = struct {
         // surfaces them via `materializeAt` (seek + readAll).
         const parts = try ar_alloc.alloc(Part, entries.len);
         for (entries, 0..) |e, i| {
+            // Per entry, ahead of the decompress: a package with tens of
+            // thousands of parts is a long operation even when each part
+            // is small, and the eager pass touches every one of them.
+            try poller.check();
             const eager = isStructuralPart(e.name) or e.uncompressed_size == 0;
             var bytes: []const u8 = &.{};
             if (eager) {
@@ -421,6 +462,7 @@ pub const PartStore = struct {
                     compressed,
                     e.compression_method,
                     e.uncompressed_size,
+                    poller,
                 );
                 if (std.hash.Crc32.hash(bytes) != e.crc32) return Error.BadZip;
             }
@@ -590,6 +632,19 @@ pub const PartStore = struct {
         content_type: []const u8,
         bytes: []const u8,
     ) !void {
+        return self.addPartControlled(name, content_type, bytes, .none);
+    }
+
+    /// `addPart` with §5.5's poll seam (M5d1). Same atomicity: every
+    /// fallible step runs before the commit block, so a cancelled add
+    /// leaves the store exactly as it was.
+    pub fn addPartControlled(
+        self: *PartStore,
+        name: []const u8,
+        content_type: []const u8,
+        bytes: []const u8,
+        poller: Poller,
+    ) !void {
         if (self.findIndex(name) != null) return error.PartAlreadyExists;
         // Strict `>=`: 0xFFFFFFFF is the Zip64 sentinel — emitting that
         // in compressed_size or uncompressed_size produces an archive
@@ -610,26 +665,14 @@ pub const PartStore = struct {
         // Compress user payload via the same policy as replacePart.
         var compressed: std.ArrayListUnmanaged(u8) = .empty;
         defer compressed.deinit(ar_alloc);
-        var method: u16 = 8;
-        if (bytes.len < 1024 or bytes.len == 0) {
-            method = 0;
-            try compressed.appendSlice(ar_alloc, bytes);
-        } else {
-            const zlsx = @import("zlsx");
-            try zlsx.deflateCompress(ar_alloc, bytes, &compressed);
-            if (compressed.items.len >= bytes.len) {
-                method = 0;
-                compressed.clearRetainingCapacity();
-                try compressed.appendSlice(ar_alloc, bytes);
-            }
-        }
+        const method = try compressInto(ar_alloc, bytes, &compressed, poller);
         if (compressed.items.len >= std.math.maxInt(u32)) return Error.Zip64NotSupported;
         const owned_payload = try compressed.toOwnedSlice(ar_alloc);
 
         // Stage the [Content_Types].xml update WITHOUT calling
         // replacePart — we don't want to commit that mutation until
         // we know the array reallocs below also succeed.
-        const ct_staging = try self.stageContentTypeOverride(name, content_type);
+        const ct_staging = try self.stageContentTypeOverride(name, content_type, poller);
         const ct_idx = ct_staging.idx;
         const ct_new_part_bytes = ct_staging.new_part_bytes;
         const ct_new_override = ct_staging.new_override;
@@ -706,6 +749,7 @@ pub const PartStore = struct {
         self: *PartStore,
         part_name: []const u8,
         content_type: []const u8,
+        poller: Poller,
     ) !StagedContentTypeUpdate {
         const ct_idx = self.findIndex("[Content_Types].xml") orelse
             return error.MissingContentTypes;
@@ -738,19 +782,7 @@ pub const PartStore = struct {
         // Compress the new CT XML — same policy as replacePart.
         var ct_compressed: std.ArrayListUnmanaged(u8) = .empty;
         defer ct_compressed.deinit(ar_alloc);
-        var ct_method: u16 = 8;
-        if (new_xml.len < 1024 or new_xml.len == 0) {
-            ct_method = 0;
-            try ct_compressed.appendSlice(ar_alloc, new_xml);
-        } else {
-            const zlsx = @import("zlsx");
-            try zlsx.deflateCompress(ar_alloc, new_xml, &ct_compressed);
-            if (ct_compressed.items.len >= new_xml.len) {
-                ct_method = 0;
-                ct_compressed.clearRetainingCapacity();
-                try ct_compressed.appendSlice(ar_alloc, new_xml);
-            }
-        }
+        const ct_method = try compressInto(ar_alloc, new_xml, &ct_compressed, poller);
         if (ct_compressed.items.len >= std.math.maxInt(u32)) return Error.Zip64NotSupported;
         const ct_payload = try ct_compressed.toOwnedSlice(ar_alloc);
 
@@ -880,6 +912,24 @@ pub const PartStore = struct {
     /// `bytes` is duped into the arena; the caller may free its own
     /// buffer as soon as the call returns.
     pub fn replacePart(self: *PartStore, name: []const u8, bytes: []const u8) !void {
+        return self.replacePartControlled(name, bytes, .none);
+    }
+
+    /// `replacePart` with §5.5's poll seam (M5d1).
+    ///
+    /// This is the seam that mattered most to reach: the recalc
+    /// transaction stages a rewritten `sheet1.xml` through here, and on a
+    /// large workbook that single call is the longest uninterrupted
+    /// stretch of a recalc after evaluation itself. `error.Cancelled`
+    /// leaves the store byte-identical — the compression happens before
+    /// any field is written, and the arena reclaims the partial output at
+    /// `deinit`.
+    pub fn replacePartControlled(
+        self: *PartStore,
+        name: []const u8,
+        bytes: []const u8,
+        poller: Poller,
+    ) !void {
         const idx = self.findIndex(name) orelse return error.PartNotFound;
         const ar_alloc = self.arena.allocator();
 
@@ -888,26 +938,9 @@ pub const PartStore = struct {
         // the reader treats as Zip64 and rejects.
         if (bytes.len >= std.math.maxInt(u32)) return Error.Zip64NotSupported;
 
-        // Mirror Editor's compression policy:
-        //   - Sub-1 KiB inputs: STORED. Deflate's dynamic-block
-        //     header overhead dominates the gain on tiny XML.
-        //   - Larger inputs: deflate. Fall back to STORED if deflate
-        //     didn't actually shrink the payload.
         var compressed: std.ArrayListUnmanaged(u8) = .empty;
         defer compressed.deinit(ar_alloc);
-        var method: u16 = 8;
-        if (bytes.len < 1024 or bytes.len == 0) {
-            method = 0;
-            try compressed.appendSlice(ar_alloc, bytes);
-        } else {
-            const zlsx = @import("zlsx");
-            try zlsx.deflateCompress(ar_alloc, bytes, &compressed);
-            if (compressed.items.len >= bytes.len) {
-                method = 0;
-                compressed.clearRetainingCapacity();
-                try compressed.appendSlice(ar_alloc, bytes);
-            }
-        }
+        const method = try compressInto(ar_alloc, bytes, &compressed, poller);
         if (compressed.items.len >= std.math.maxInt(u32)) return Error.Zip64NotSupported;
 
         // Build all the new arena-owned values BEFORE installing
@@ -951,6 +984,22 @@ pub const PartStore = struct {
     /// fresh LFH + payload but reuse the source CDFH (with patched
     /// fields). EOCD comment is preserved.
     pub fn save(self: *PartStore, io: std.Io, path: []const u8) !void {
+        // The post-commit durability warning is dropped here and only
+        // here: a bare `save` has no report to carry it in, and §5.7.9 is
+        // explicit that it is not an error. `saveControlled` is what
+        // `saveWithRecalc` (M5d2) calls to get it.
+        _ = try self.saveControlled(io, path, .none);
+    }
+
+    /// `save` with §5.5's poll seam, returning §5.7.9's commit outcome
+    /// (M5d1).
+    ///
+    /// Polls per entry while the archive streams out and once more
+    /// immediately before `AtomicFile.finish` — that last one is the
+    /// final poll §5.7.9 places before the commit point, so a cancelled
+    /// save can never have renamed anything. Everything from `finish`
+    /// onward is the non-cancellable commit region.
+    pub fn saveControlled(self: *PartStore, io: std.Io, path: []const u8, poller: Poller) !Commit {
         // Preflight ZIP32 limits BEFORE opening the output file. Every
         // offset / size field on the wire is u32 (offsets, CD size,
         // payload sizes) or u16 (name length, comment length, entry
@@ -994,6 +1043,12 @@ pub const PartStore = struct {
             @as(u64, eocd_min_size) + @as(u64, self.eocd_comment.len);
         if (total_projected > std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
 
+        // Ahead of creating the temp file: a save that is already
+        // cancelled should not leave the destination's directory holding
+        // even a zero-length `.ztmp-N` for the instant before `deinit`
+        // removes it.
+        try poller.check();
+
         var write_buf: [4096]u8 = undefined;
         var atomic_file = try AtomicFile.init(io, path, &write_buf);
         defer atomic_file.deinit();
@@ -1003,7 +1058,16 @@ pub const PartStore = struct {
         const new_lfh_offsets = try self.allocator.alloc(u32, self.entries.len);
         defer self.allocator.free(new_lfh_offsets);
 
+        // One reusable 64 KiB window for the byte-preserving copies
+        // below. It replaces a per-entry `page_allocator.alloc(total)`,
+        // which meant a 200 MiB untouched part was read fully into RSS
+        // before a single byte reached the temp file — and was, being one
+        // read and one write, the longest unpollable stretch in a save.
+        const copy_buf = try self.allocator.alloc(u8, control.chunk_bytes);
+        defer self.allocator.free(copy_buf);
+
         for (self.entries, 0..) |e, i| {
+            try poller.check();
             new_lfh_offsets[i] = @intCast(written);
             if (self.overrides[i]) |ov| {
                 // Build a fresh LFH with the override's compression
@@ -1024,7 +1088,8 @@ pub const PartStore = struct {
                 std.mem.writeInt(u16, lfh_bytes[28..30], 0, .little); // no extra
                 try w.writeAll(&lfh_bytes);
                 try w.writeAll(e.name);
-                try w.writeAll(ov.payload);
+                var it = poller.chunks(ov.payload);
+                while (try it.next()) |chunk| try w.writeAll(chunk);
                 written += @as(u64, lfh_bytes.len) + @as(u64, e.name.len) + @as(u64, ov.payload.len);
             } else {
                 // Untouched: stream LFH + payload from the source
@@ -1034,16 +1099,20 @@ pub const PartStore = struct {
                 // that flag, so a reader will expect those bytes
                 // after the payload.
                 const total = e.lfh_total_len + e.compressed_size + e.data_descriptor_len;
-                const region = try std.heap.page_allocator.alloc(u8, total);
-                defer std.heap.page_allocator.free(region);
                 // Source-byte branch: only reachable when `overrides[i]
                 // == null`, which implies the store came from `open()`
                 // or `openBuffer()`. Fresh stores override every entry,
                 // so this branch never fires for them — and if it did,
                 // their empty backing would refuse the read.
-                try self.backing.readAt(e.lfh_offset, region);
-                try w.writeAll(region);
-                written += @as(u64, region.len);
+                var copied: usize = 0;
+                while (copied < total) {
+                    try poller.check();
+                    const n = @min(total - copied, copy_buf.len);
+                    try self.backing.readAt(e.lfh_offset + copied, copy_buf[0..n]);
+                    try w.writeAll(copy_buf[0..n]);
+                    copied += n;
+                }
+                written += @as(u64, total);
             }
         }
 
@@ -1052,6 +1121,7 @@ pub const PartStore = struct {
         if (written >= std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
         const new_cd_offset: u32 = @intCast(written);
         for (self.entries, 0..) |e, i| {
+            try poller.check();
             if (self.overrides[i]) |ov| {
                 // Fresh CDFH for the override. 46-byte header + name.
                 var cdfh_bytes: [46]u8 = undefined;
@@ -1108,7 +1178,13 @@ pub const PartStore = struct {
         try w.writeAll(self.eocd_comment);
 
         try w.flush();
+        // §5.7.9's final poll. Everything after it — the `File.sync`, the
+        // rename, the directory fsync — is the non-cancellable commit
+        // region, so this is the last instant at which a cancelled save
+        // is still a save that changed nothing.
+        try poller.check();
         try atomic_file.finish();
+        return atomic_file.syncDir();
     }
 
     fn findIndex(self: *const PartStore, name: []const u8) ?usize {
@@ -1131,8 +1207,16 @@ pub const PartStore = struct {
     }
 
     pub fn part(self: *const PartStore, name: []const u8) Error!?Part {
+        return self.partControlled(name, .none);
+    }
+
+    /// `part` with §5.5's poll seam (M5d1). First access to a part is
+    /// what decompresses it, so "model materialization" is exactly this
+    /// call — and on a workbook whose SST is 120 MiB it is a long
+    /// operation with no other seam in it.
+    pub fn partControlled(self: *const PartStore, name: []const u8, poller: Poller) Error!?Part {
         const idx = self.findIndex(name) orelse return null;
-        try materializeAt(self, idx);
+        try materializeAt(self, idx, poller);
         return self.parts[idx];
     }
 
@@ -1147,7 +1231,7 @@ pub const PartStore = struct {
     /// frees the scratch. Decompressed bytes are cached on
     /// `Part.bytes` for the rest of THIS generation's lifetime — the
     /// cache is per-generation, the bytes it is filled from are not.
-    fn materializeAt(self: *const PartStore, idx: usize) Error!void {
+    fn materializeAt(self: *const PartStore, idx: usize, poller: Poller) Error!void {
         const p = &@constCast(self).parts[idx];
         if (p.bytes.len > 0 or p.uncompressed_size == 0) return;
         const ar_alloc = @constCast(&self.arena).allocator();
@@ -1159,13 +1243,14 @@ pub const PartStore = struct {
         // slot with bytes already in the arena). If we land here on
         // one, its empty backing refuses the read — the store
         // invariant is violated and `BadZip` says so.
-        try self.backing.readAt(p.payload_offset, compressed);
+        try readChunked(self.backing, p.payload_offset, compressed, poller);
 
         const bytes = try decompressPayload(
             ar_alloc,
             compressed,
             p.compression_method,
             p.uncompressed_size,
+            poller,
         );
         if (std.hash.Crc32.hash(bytes) != p.crc32) return Error.BadZip;
         p.bytes = bytes;
@@ -1200,7 +1285,7 @@ pub const PartStore = struct {
                 // the decompressed payload to write the image to disk
                 // or compute its size. Lazy mode means this is a
                 // no-op the second time around.
-                try materializeAt(self, idx);
+                try materializeAt(self, idx, .none);
                 try out.append(ar_alloc, self.parts[idx]);
             }
         }
@@ -1590,6 +1675,65 @@ fn findEocd(buf: []const u8) !usize {
     return Error.NotPkzip;
 }
 
+/// The one compression policy every staging path shares, with §5.5's
+/// poll seam through it (M5d1). Returns the ZIP compression method.
+///
+///   - Sub-1 KiB (and empty) inputs: STORED. Deflate's dynamic-block
+///     header overhead dominates the gain on tiny XML.
+///   - Larger inputs: deflate, falling back to STORED when compression
+///     did not actually shrink the payload.
+///
+/// It was three verbatim copies of that policy before this row — in
+/// `addPart`, `replacePart` and `stageContentTypeOverride` — and the
+/// chunked seam had to reach all three, so they became one.
+fn compressInto(
+    alloc: std.mem.Allocator,
+    bytes: []const u8,
+    out: *std.ArrayListUnmanaged(u8),
+    poller: Poller,
+) !u16 {
+    if (bytes.len < 1024 or bytes.len == 0) {
+        try storeChunked(alloc, bytes, out, poller);
+        return 0;
+    }
+    const zlsx = @import("zlsx");
+    try zlsx.deflateCompressControlled(alloc, bytes, out, poller);
+    if (out.items.len >= bytes.len) {
+        out.clearRetainingCapacity();
+        try storeChunked(alloc, bytes, out, poller);
+        return 0;
+    }
+    return 8;
+}
+
+/// The STORED arm of `compressInto`. Chunked for the same reason the
+/// deflate arm is: a part that fails the shrink test is exactly the part
+/// that is large and incompressible (an embedded PNG, a signature blob),
+/// so the fallback copy is not the cheap case.
+fn storeChunked(
+    alloc: std.mem.Allocator,
+    bytes: []const u8,
+    out: *std.ArrayListUnmanaged(u8),
+    poller: Poller,
+) !void {
+    try out.ensureTotalCapacity(alloc, bytes.len);
+    var it = poller.chunks(bytes);
+    while (try it.next()) |chunk| out.appendSliceAssumeCapacity(chunk);
+}
+
+/// `SourceBacking.readAt` in `chunk_bytes` pieces. The backing read
+/// itself is one `preadv`-shaped call per chunk, so this is a poll seam
+/// rather than a buffering change.
+fn readChunked(backing: *SourceBacking, offset: u64, dest: []u8, poller: Poller) Error!void {
+    var done: usize = 0;
+    while (done < dest.len) {
+        try poller.check();
+        const n = @min(dest.len - done, control.chunk_bytes);
+        try backing.readAt(offset + done, dest[done .. done + n]);
+        done += n;
+    }
+}
+
 // ZIP-bomb defenses for `decompressPayload`. Both checks fire BEFORE
 // the upfront `arena.alloc(declared_uncompressed)` so a crafted CDFH
 // declaring multi-GB uncompressed size can't OOM the process.
@@ -1616,6 +1760,7 @@ fn decompressPayload(
     payload: []const u8,
     method: u16,
     declared_uncompressed: u32,
+    poller: Poller,
 ) ![]u8 {
     if (declared_uncompressed > max_part_size) return Error.BadZip;
     // Saturating multiply guards against `payload.len * ratio`
@@ -1626,14 +1771,34 @@ fn decompressPayload(
 
     if (method == 0) {
         if (payload.len != declared_uncompressed) return Error.BadZip;
-        return try arena.dupe(u8, payload);
+        const out = try arena.alloc(u8, declared_uncompressed);
+        var written: usize = 0;
+        var it = poller.chunks(payload);
+        while (try it.next()) |chunk| {
+            @memcpy(out[written .. written + chunk.len], chunk);
+            written += chunk.len;
+        }
+        return out;
     } else if (method == 8) {
         var src_reader = std.Io.Reader.fixed(payload);
         var flate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
         var dec = std.compress.flate.Decompress.init(&src_reader, .raw, &flate_buffer);
         const out = try arena.alloc(u8, declared_uncompressed);
         var out_writer = std.Io.Writer.fixed(out);
-        dec.reader.streamExact64(&out_writer, declared_uncompressed) catch return Error.BadZip;
+        // §5.5: pull the inflated stream out in `chunk_bytes` pieces
+        // rather than one `streamExact64` of the whole part. The
+        // decompressor is a stream over one window, so the boundaries
+        // change nothing about the bytes produced — `streamExact64`
+        // resumes exactly where the previous call stopped — but they give
+        // a 500 MiB sharedStrings.xml the same poll density a 4 KiB rels
+        // file gets.
+        var remaining: u64 = declared_uncompressed;
+        while (remaining > 0) {
+            try poller.check();
+            const n = @min(remaining, control.chunk_bytes);
+            dec.reader.streamExact64(&out_writer, n) catch return Error.BadZip;
+            remaining -= n;
+        }
         return out;
     }
     return Error.UnsupportedCompression;
@@ -2289,6 +2454,304 @@ test "PartStore.replacePart: large input round-trips through deflate" {
     try std.testing.expectEqualSlices(u8, replacement, wb.bytes);
 }
 
+// ─── M5d1: cancellation at the archive seams ─────────────────────────
+
+/// A `Watch` armed with both a flag and a far-future deadline, plus the
+/// injected clock that arms the flag on its Nth read.
+///
+/// Both halves are needed to make "cancel arrives *during* the operation"
+/// deterministic. The deadline forces a clock read at every poll; the
+/// injected clock counts those reads and sets the flag at a chosen one;
+/// the next poll sees the flag. Without the deadline the flag would have
+/// to be set before the call, which only proves the entry-point check.
+fn tripAfter(base: std.Io, polls: u64, flag: *volatile u8) control.Watch {
+    const io = control.inject.wrap(base, .{ .trip_at = polls, .trip_flag = flag });
+    return .init(io, .{
+        .cancel = .{ .flag = flag },
+        .deadline = .{ .nanoseconds = std.math.maxInt(i64) },
+    });
+}
+
+/// 512 KiB of high-entropy bytes: eight `chunk_bytes` pieces that deflate
+/// cannot shrink, so the STORED fallback keeps the staged payload the
+/// same size as the input and the chunk arithmetic in these tests is the
+/// arithmetic the code actually performs.
+fn incompressible(alloc: std.mem.Allocator) ![]u8 {
+    const buf = try alloc.alloc(u8, control.chunk_bytes * 8);
+    var rng: std.Random.DefaultPrng = .init(0x5d1_5d1);
+    rng.random().bytes(buf);
+    return buf;
+}
+
+test "M5d1: cancel inside replacePart leaves the store byte-identical" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+
+    var store = try PartStore.open(std.testing.allocator, io, fixture);
+    defer store.deinit();
+
+    const idx = store.findIndex("xl/workbook.xml").?;
+    const before = (try store.part("xl/workbook.xml")).?.bytes;
+    try std.testing.expect(store.overrides[idx] == null);
+
+    // Large enough that the compression spans several chunks, so the
+    // trip lands inside the deflate rather than at the entry poll.
+    const replacement = try std.testing.allocator.alloc(u8, control.chunk_bytes * 4);
+    defer std.testing.allocator.free(replacement);
+    @memset(replacement, 'A');
+
+    var flag: u8 = 0;
+    var w = tripAfter(io, 3, &flag);
+    try std.testing.expectError(
+        control.Error.Cancelled,
+        store.replacePartControlled("xl/workbook.xml", replacement, w.poller()),
+    );
+
+    // Nothing staged, nothing mirrored: `part()` still answers with the
+    // source bytes and the override slot is still empty. A partial
+    // deflate output exists in the arena and is reclaimed at `deinit` —
+    // it is unreachable, which is the property that matters.
+    try std.testing.expect(store.overrides[idx] == null);
+    try std.testing.expectEqualSlices(u8, before, (try store.part("xl/workbook.xml")).?.bytes);
+    try std.testing.expect(!store.hasUnsavedChanges());
+}
+
+test "M5d1: cancel inside materialization mutates nothing" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+
+    var store = try PartStore.open(std.testing.allocator, io, fixture);
+    defer store.deinit();
+
+    const name = "xl/worksheets/sheet1.xml";
+    const idx = store.findIndex(name) orelse return error.SkipZigTest;
+    // Must not already be materialized, or there is nothing to cancel.
+    try std.testing.expectEqual(@as(usize, 0), store.parts[idx].bytes.len);
+
+    var flag: u8 = 1; // already up: the first poll refuses
+    var w = tripAfter(io, 1, &flag);
+    try std.testing.expectError(
+        control.Error.Cancelled,
+        store.partControlled(name, w.poller()),
+    );
+
+    // The cache stayed empty, so a later uncancelled read still does the
+    // work — a cancelled materialization must not poison the slot.
+    try std.testing.expectEqual(@as(usize, 0), store.parts[idx].bytes.len);
+    const p = (try store.part(name)).?;
+    try std.testing.expect(p.bytes.len > 0);
+    try std.testing.expectEqual(p.crc32, std.hash.Crc32.hash(p.bytes));
+}
+
+test "M5d1: cancel part-way THROUGH a materialization mutates nothing" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "big_part.xlsx" });
+    defer std.testing.allocator.free(out_path);
+
+    const big = try incompressible(std.testing.allocator);
+    defer std.testing.allocator.free(big);
+
+    // A package whose `xl/workbook.xml` is eight chunks long, written to
+    // disk so the re-open below has something genuinely lazy to inflate.
+    {
+        var src = try PartStore.open(std.testing.allocator, io, fixture);
+        defer src.deinit();
+        try src.replacePart("xl/workbook.xml", big);
+        try src.save(io, out_path);
+    }
+
+    var store = try PartStore.open(std.testing.allocator, io, out_path);
+    defer store.deinit();
+    const idx = store.findIndex("xl/workbook.xml").?;
+    try std.testing.expectEqual(@as(usize, 0), store.parts[idx].bytes.len);
+
+    var flag: u8 = 0;
+    var w = tripAfter(io, 3, &flag);
+    try std.testing.expectError(
+        control.Error.Cancelled,
+        store.partControlled("xl/workbook.xml", w.poller()),
+    );
+    // Cancelled three chunks in, with nothing published: the cache slot
+    // is only written after the whole part has inflated and its CRC has
+    // matched, so a partially-read part can never become visible.
+    try std.testing.expectEqual(@as(usize, 0), store.parts[idx].bytes.len);
+
+    const p = (try store.part("xl/workbook.xml")).?;
+    try std.testing.expectEqualSlices(u8, big, p.bytes);
+}
+
+test "M5d1: cancel during save leaves no temp file and no destination" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "cancelled.xlsx" });
+    defer std.testing.allocator.free(out_path);
+
+    var store = try PartStore.open(std.testing.allocator, io, fixture);
+    defer store.deinit();
+
+    // Trip a few polls in, i.e. part-way through streaming entries out.
+    var flag: u8 = 0;
+    var w = tripAfter(io, 3, &flag);
+    try std.testing.expectError(
+        control.Error.Cancelled,
+        store.saveControlled(io, out_path, w.poller()),
+    );
+
+    // The destination never existed, so §5.7.9's "no output file"
+    // promise applies in its literal form…
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().access(io, out_path, .{}),
+    );
+    // …and the half-written temp file is gone with it.
+    var it = tmp.dir.iterate();
+    try std.testing.expectEqual(@as(?std.Io.Dir.Entry, null), try it.next(io));
+}
+
+test "M5d1: save polls at least once per 64 KiB of archive" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "measured.xlsx" });
+    defer std.testing.allocator.free(out_path);
+
+    var store = try PartStore.open(std.testing.allocator, io, fixture);
+    defer store.deinit();
+
+    // One deliberately large part, so the entry loop is not the only
+    // thing generating polls.
+    const big = try incompressible(std.testing.allocator);
+    defer std.testing.allocator.free(big);
+    try store.replacePart("xl/workbook.xml", big);
+
+    // A deadline that cannot fire (the injected clock never advances)
+    // turns every poll into exactly one counted clock read.
+    const counting = control.inject.wrap(io, .{});
+    const w: control.Watch = .init(counting, .{
+        .deadline = .{ .nanoseconds = std.math.maxInt(i64) },
+    });
+    _ = try store.saveControlled(counting, out_path, w.poller());
+
+    // What §5.5 owes for this save, computed from the code's own shape
+    // rather than eyeballed: one poll before the temp file is created,
+    // one per entry in each of the two passes, one immediately before
+    // the commit region, and one per 64 KiB of the staged payload.
+    const staged = store.overrides[store.findIndex("xl/workbook.xml").?].?;
+    const payload_polls = control.chunkCount(staged.payload.len);
+    const owed = 2 + 2 * store.entries.len + payload_polls;
+    try std.testing.expect(control.inject.state.now_calls >= owed);
+    // Not a vacuous bound: the large part alone accounts for eight of
+    // them, so an unchunked seam cannot reach the total on entry polls.
+    try std.testing.expectEqual(@as(usize, 8), payload_polls);
+}
+
+test "M5d1: an injected rename failure leaves memory AND the destination untouched" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "book.xlsx" });
+    defer std.testing.allocator.free(out_path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "book.xlsx", .data = "PRIOR BYTES" });
+
+    var store = try PartStore.open(std.testing.allocator, io, fixture);
+    defer store.deinit();
+    try store.replacePart("xl/workbook.xml", "<workbook/>");
+    const idx = store.findIndex("xl/workbook.xml").?;
+    const staged = store.overrides[idx].?;
+
+    const faulty = control.inject.wrap(io, .{ .fail_rename = true });
+    try std.testing.expectError(error.AccessDenied, store.saveControlled(faulty, out_path, .none));
+
+    // Destination: the prior bytes, not a truncated or half-written
+    // archive. §5.7.9's promise is precisely "unchanged until the commit
+    // point", and the rename IS the commit point.
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "PRIOR BYTES",
+        try std.Io.Dir.cwd().readFile(io, out_path, &buf),
+    );
+    // Memory: the staged override is still staged, byte-for-byte. A
+    // failed save is not a save that half-consumed the candidate.
+    const after = store.overrides[idx].?;
+    try std.testing.expectEqualSlices(u8, staged.payload, after.payload);
+    try std.testing.expectEqual(staged.crc32, after.crc32);
+    try std.testing.expectEqualStrings("<workbook/>", (try store.part("xl/workbook.xml")).?.bytes);
+    // …and no `.ztmp-N` beside the user's workbook.
+    var it = tmp.dir.iterate();
+    while (try it.next(io)) |entry| {
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".ztmp-"));
+    }
+}
+
+test "M5d1: an injected post-commit dir fsync failure is a warning on a committed save" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "warned.xlsx" });
+    defer std.testing.allocator.free(out_path);
+
+    var store = try PartStore.open(std.testing.allocator, io, fixture);
+    defer store.deinit();
+
+    // Sync #1 is the temp file (must succeed, or the rename never runs);
+    // #2 is the directory, reached only after the commit.
+    const faulty = control.inject.wrap(io, .{ .fail_file_sync_at = 2 });
+    const commit = try store.saveControlled(faulty, out_path, .none);
+
+    try std.testing.expect(commit.durability_warning);
+    try std.testing.expectEqual(@intFromEnum(std.posix.E.IO), commit.durability_errno);
+    // Success, not an error — and the file it committed opens.
+    var reopened = try PartStore.open(std.testing.allocator, io, out_path);
+    defer reopened.deinit();
+    try std.testing.expect((try reopened.part("xl/workbook.xml")) != null);
+}
+
 test "PartStore.replacePart: unknown part name returns PartNotFound" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -2463,21 +2926,21 @@ test "decompressPayload: rejects ZIP-bomb declared sizes" {
     const tiny = "x";
     try std.testing.expectError(
         Error.BadZip,
-        decompressPayload(a, tiny, 8, max_part_size + 1),
+        decompressPayload(a, tiny, 8, max_part_size + 1, .none),
     );
 
     // Tiny payload, declared within hard cap but ratio > 4096:1 → BadZip.
     // tiny is 1 byte so the ratio cap is 4096; declared = 8192 trips it.
     try std.testing.expectError(
         Error.BadZip,
-        decompressPayload(a, tiny, 8, 8192),
+        decompressPayload(a, tiny, 8, 8192, .none),
     );
 
     // Stored (method 0) entries are still validated against the cap so
     // a CDFH claiming 4 GiB stored can't allocate it.
     try std.testing.expectError(
         Error.BadZip,
-        decompressPayload(a, tiny, 0, max_part_size + 1),
+        decompressPayload(a, tiny, 0, max_part_size + 1, .none),
     );
 }
 
@@ -2948,7 +3411,7 @@ fn openLedgered(
 ) Error!PartStore {
     const backing = try openLedgeredBacking(allocator, io, path, ledger);
     errdefer backing.release();
-    return try PartStore.openOver(allocator, backing);
+    return try PartStore.openOver(allocator, backing, .none);
 }
 
 /// Local-file-header signature. Any live backing over a real archive
