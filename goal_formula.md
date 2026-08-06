@@ -1938,6 +1938,97 @@ pinned fixture, per the milestone's own gate.
     pointer-identical, plus an allocation-failure sweep over the
     proven path.
 
+**M7b2 decisions (shipped 2026-08-06).** Twelve points, in
+`src/formula/registry.zig` (six new rows, the five folds and ADDRESS),
+`criteria.zig` (two fields on `ScanResult`, nothing on parse/match),
+`eval.zig` (fixtures only) and `tests/bench/synth_criteria_mix.zig`
+(the workload). Every fixture ships `spec_pinned` — the committed
+manifests predate the batch, and the evidence gate counts 0 oracle
+rows from them rather than declaring it.
+
+1. **The family is one function with five folds.** `runIfs` parses
+   every criterion once, orders the areas the way `criteria.scan`
+   reads them — criteria ranges first, the aggregation range last —
+   and runs ONE N-way aligned pass under `.require_equal`. `COUNTIFS`
+   alone starts its range/criterion cycle at slot zero, having no
+   aggregation range; the registry rows state that as `fixed.len`, not
+   as a comment. Nothing re-derives a matching rule and nothing scans
+   per pair, which is what the module's own docstring promised at M3b.
+2. **`ScanResult` grew extremes, not a second pass.** `numeric_min`
+   and `numeric_max` accumulate in the same numeric branch the
+   total/count always used, and are meaningful only when
+   `numeric_count > 0` — `MINIFS`/`MAXIFS` answer 0 over no matching
+   number, where `AVERAGEIFS` keeps AVERAGEIF's `#DIV/0!` verbatim.
+   The parse/match contract is untouched.
+3. **An unpaired criteria tail is a refusal, not a value.** The
+   registry's arity can bound a tail but cannot state its parity, so
+   the implementations do: `(args.len − lead) % 2 ≠ 0` refuses
+   `MalformedInput`, the same taxonomy as any arity Excel could not
+   have written, fixtured with `expectError` in every fold.
+4. **Mismatched dimensions stay §5.6a's `#VALUE!`.** The typed error
+   is `error.ShapeMismatch` inside the engine; at the value plane the
+   pinned answer is `#VALUE!`, exactly `runScan`'s reading, and the
+   projection SUMIF is allowed is deliberately NOT — a
+   same-count-different-shape fixture (5×1 beside 1×5) pins that the
+   check is dimensions, not cell count.
+5. **Errors in ranges are values, not verdicts.** All five folds are
+   `per_function_provenance`: a criterion can MATCH an error cell
+   (`COUNTIFS(F1:F1,F1)` is 1), an error in the aggregation range is a
+   non-number the fold ignores, and both argument orders are fixtured
+   per §5.3c. ADDRESS is the batch's one `.propagate` row and takes
+   declaration order from the dispatcher — `ADDRESS(F1,F2)` answers
+   `#DIV/0!` and `ADDRESS(F2,F1)` answers `#N/A`.
+6. **ADDRESS is text out, never a reference.** It does not carry
+   `reference_producing` — the M5a2 pair stays exactly two, and the
+   gate that counts them keeps passing untouched. The asymmetry is
+   deliberate: ADDRESS may *produce* R1C1 text while v1 still refuses
+   to *read* R1C1 (INDIRECT's construct refusal), and the
+   `INDIRECT(ADDRESS(2,3))` round trip is fixtured from both sides.
+7. **Sheet quoting is pinned conservatively.** Bare iff ASCII,
+   letter-or-underscore first, alphanumeric-or-underscore throughout;
+   everything else quoted with embedded quotes doubled; the empty
+   sheet text keeps Excel's bare `!`. Quoting too much is safe in a
+   way the reverse is not, and Excel's own documented example
+   (`'[Book1]Sheet1'!R2C3`) lands quoted for free.
+8. **Elided is not omitted, even where the default is famous.**
+   `optNum`'s rule (`LEFT(a,)` is not `LEFT(a)`) reaches ADDRESS
+   through the scalar pipeline, which collapses an elided slot to
+   blank before any all-scalar implementation sees it: an elided `abs`
+   is 0 and therefore `#VALUE!`, an elided `a1` is FALSE and therefore
+   R1C1. Only a slot absent from the call takes the documented
+   default. The first fixture draft assumed `missing_arg` reached the
+   implementation, and the test said otherwise — the pipeline's
+   behavior is the pin, recorded here so nobody re-litigates it.
+9. **The grid bounds the spelling.** Rows 1…1 048 576, columns
+   1…16 384, truncation toward zero, in BOTH styles — `#VALUE!`
+   beyond, and R1C1's zero/negative relative offsets deliberately
+   unreachable. Pinned pending the parked Excel oracle leg, which is
+   the one thing that could move it.
+10. **Evidence stayed honest at zero.** The three-valued
+    `manifestVerdict` gate from M7a runs unchanged over the new batch:
+    0 decided rows and 0 excluded rows, counted from the committed
+    manifests, every fixture `spec_pinned`. `MEDIAN` (frozen, M7b3)
+    replaces `SUMIFS` as the canonical unregistered name in the three
+    places that pinned it — registry, evaluator, workbook.
+11. **The sweep grew a batch, not a hole.** The M4e alphabet, builder
+    and shape-runner are batch-agnostic, so the new sweep is the six
+    names against every shape at one and two arguments, each padded to
+    its own minimum arity (`SUMIFS` runs at three, not the two it
+    would reject), both fidelity tables, every input evaluated twice,
+    floored above 5 000 evaluations.
+12. **The bench prices the cursor, not the graph.**
+    `synth_criteria_mix` keeps 512 whole-column report formulas FIXED
+    across sizes and varies only the stored rows they scan (1 000 /
+    10 000), so the two sizes separate the per-stored-cell cost from
+    everything paid per formula; `small` is the identity size, digest
+    recorded under the F1 mix's own discipline. The wrong cache is −1,
+    not 0, because `MINIFS` over the region holding the value 0 really
+    is 0 — a cache that is accidentally right is a cell the recalc
+    silently leaves out of the measurement, and it did (496 of 512)
+    until the cache moved. Same binary, one `--workload` flag; the
+    M5d4 lanes re-ran beside the new ones and the median gate stayed
+    green.
+
 ### 5.9 Name & identifier resolution
 
 Call position → strip layered prefixes → registry; unregistered →
@@ -2178,7 +2269,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M6** ✅ | `zlsx eval` + `zlsx recalc` (`src/formula_cli.zig`), delegated whole-tail like `dbx` so the shipped commands and their row envelope are untouched by construction. **The versioned stream state machine** — `"kind"` + `"v":1` on every record, both grammars normative, refusal and cancellation legal before any header, `cancelled.after` naming the last record out. **The nine-row exit table**, including 6 (default-context acquisition — the wall clock / secure random source behind an omitted `--now`/`--seed`, injectable, never conflated with OOM) and the SIGPIPE exception (prefix-valid, no terminal, exit 0 — distinguishable from abnormal EOF by code). **Commit-aware exit mapping**: `signals.exitCode`'s override-at-exit corrected by an `exit_is_final` latch; a signal after the rename reports 0, proven by a `CommitHook` injection at the §5.7.9 seam (swap + flag between rename and directory fsync), not by timing. `--out` identity refused (1) before the input opens, realpath-aliased spellings included. **`Workbook.evaluate` forwards the caller's clock** — `now_utc_ms`/`utc_offset_min`/`platform_profile` reached `evaluateOne` since M5d2 but were dropped on the standalone path, so `--now` was echoed but never reached `NOW()`; `date_system`/`text_compat` stay workbook-derived. `=A1` on empty A1 publishes 0 through `value.publish`; `seed` a decimal string, pinned above 2^53 | Contract tests (grammar productions ×9, exit table row-by-row, SIGPIPE vs abnormal EOF, commit seam) |
 | **M7a** ✅ | DA evaluation + decision table + ownership + `A1#`/`@` + F2-DA natives (FILTER, SORT, SORTBY, UNIQUE, SEQUENCE, RANDARRAY, TRANSPOSE) + RANDARRAY KATs | Fixtures; obstruction fuzz |
 | **M7b1** ✅ | DA + CSE **persistence** (approved set §5.8b byte-diff-fixtured: `<v>`+`t`, anchor `f@ref`, owned tail `<c>` create/clear, `<dimension ref>` expansion; `spill_transitions` table — every DA row refuses `transition_unproven` pending its byte-diffed Excel reference, the surfaced park; **legacy CSE live end-to-end**, no metadata byte to transition) | Byte-diff + refusal-enumeration fixtures; Excel-opens-clean per transition **runs as each reference lands** |
-| **M7b2** | F2 criteria batch (SUMIFS, COUNTIFS, AVERAGEIFS, MINIFS, MAXIFS; ADDRESS) — INDIRECT/OFFSET completed at M5a2 | Oracle-first; whole-column + multi-criteria benches |
+| **M7b2** ✅ | F2 criteria batch (SUMIFS, COUNTIFS, AVERAGEIFS, MINIFS, MAXIFS over `criteria.scan`'s one N-way aligned pass; ADDRESS) — INDIRECT/OFFSET completed at M5a2. Every fixture spec_pinned (manifests predate the batch, 0 oracle rows counted); mismatched `*IFS` dimensions stay §5.6a's `#VALUE!`; an unpaired criteria tail refuses `MalformedInput` | Fixtures + §5.3c both-orders + padded sweep; whole-column + multi-criteria benches (`synth_criteria_mix`, digest-pinned) beside the M5d4 baselines, gate green |
 | **M7b3** | F2 statistics batch (MEDIAN, MODE.SNGL, STDEV.P/S, VAR.P/S, PERCENTILE.INC, QUARTILE.INC, RANK.EQ, LARGE, SMALL) | Oracle-first |
 | **M7c** | DA authoring (byte-diffed spec → impl) + `FormulaWrite` (**Zig-only**) | Byte-diff vs references |
 | **M8a** | **`numfmt_v1` versioned grammar + support matrix FIRST** (sections ≤4, conditions, escapes/fills, fractions, scientific, elapsed `[h]`/`[mm]`, locale `[$-409]` tags — each row supported-with-exact-rendering or typed-refusal; the repo has only a date-detection heuristic today, `src/xlsx.zig:3909`) + numfmt + TEXT | Format fuzz; TEXT matrix; per-row grammar fixtures |
@@ -4228,6 +4319,33 @@ through the row, with three of the seven fixed, still put
 `graph.Key.order` at 40.7 % of a 4 000-row run; the same profile at
 8 000 rows with all seven in place puts it at **1.1 %** — a share that
 *fell* while the workload doubled, which a quadratic term's cannot do.
+
+**M7b2 — the criteria lanes** (`feat/m7b2-criteria`, same host, same
+methodology, recorded 2026-08-06; workload
+`synth_criteria_mix` at its recorded digest, 512 whole-column report
+formulas fixed across sizes, only the stored rows they scan differing).
+The baseline JSON is `tests/bench/baseline_m7b2_criteria.json`; the
+F1-mix lanes re-ran in the same session and
+`compare_bench.py --gate tests/bench/baseline_m5d4.json …` stayed green,
+which is the "beside, not instead" half of the row's gate.
+
+| Workload | Stored cells | Formula cells | `open` | `recalc` | `save` | p95 (`recalc`) | σ (`recalc`) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `criteria_mix_tiny` | 3 512 | 512 | 1.80 ms | 122.23 ms | 124.49 ms | 126.39 ms | 2.32 ms |
+| `criteria_mix_small` | 30 512 | 512 | 3.77 ms | 1 383.68 ms | 1 387.66 ms | 1 392.00 ms | 12.55 ms |
+
+**Read it as follows.** The formula count is constant, so evaluate
+(= recalc − open: 120.4 ms and 1 379.9 ms) scales only with the stored
+rows each whole-column pass visits: ×10 stored rows costs **×11.5** —
+linear, with the drift above ×10 being the model/graph share, exactly
+the M5d4 reading. The number the lane exists to watch is what is
+*absent*: every one of the 512 formulas names full 1 048 576-row
+columns, and the million-row blank tail costs nothing measurable,
+because §5.6a's cursor visits it as runs. A cursor that quietly
+degraded to a per-coordinate walk would show up here as a ~100× cliff
+before any correctness test noticed. Per formula that is ~235 µs (tiny)
+against ~2.70 ms (small) — ~2.6 whole-column areas per formula, ~100 ns
+per stored position visited.
 
 ---
 

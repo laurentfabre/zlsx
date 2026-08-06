@@ -2089,6 +2089,16 @@ pub fn build(b: *std.Build) void {
     bench_f1_mix_mod.addImport("zlsx_control", control_mod);
     bench_f1_mix_mod.addImport("zlsx", zlsx_mod);
 
+    // M7b2's criteria workload, same shape and same discipline.
+    const bench_criteria_mix_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/synth_criteria_mix.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = single_threaded,
+    });
+    bench_criteria_mix_mod.addImport("zlsx_control", control_mod);
+    bench_criteria_mix_mod.addImport("zlsx", zlsx_mod);
+
     // Imports `zlsx_recalc`, so the ReleaseFast bench lane compiles the
     // third public module too — a composition that only ever built in
     // Debug unit tests would be a surface nothing releases exercises.
@@ -2101,6 +2111,7 @@ pub fn build(b: *std.Build) void {
     bench_recalc_mod.addImport("zlsx_control", control_mod);
     bench_recalc_mod.addImport("zlsx_recalc", recalc_mod);
     bench_recalc_mod.addImport("synth_f1_mix", bench_f1_mix_mod);
+    bench_recalc_mod.addImport("synth_criteria_mix", bench_criteria_mix_mod);
     const bench_recalc_exe = b.addExecutable(.{
         .name = "zlsx-bench-recalc",
         .root_module = bench_recalc_mod,
@@ -2135,6 +2146,9 @@ pub fn build(b: *std.Build) void {
     // — see that file's test-section comment.
     const bench_f1_mix_tests = b.addTest(.{ .root_module = bench_f1_mix_mod });
     test_step.dependOn(&b.addRunArtifact(bench_f1_mix_tests).step);
+
+    const bench_criteria_mix_tests = b.addTest(.{ .root_module = bench_criteria_mix_mod });
+    test_step.dependOn(&b.addRunArtifact(bench_criteria_mix_tests).step);
 }
 
 /// The three committed oracle manifests, as anonymous imports.
