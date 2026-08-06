@@ -34,6 +34,7 @@
 const std = @import("std");
 const recalc = @import("zlsx_recalc");
 const synth = @import("synth_f1_mix");
+const crit = @import("synth_criteria_mix");
 
 const pkg = recalc.pkg;
 const Workbook = recalc.Workbook;
@@ -50,6 +51,12 @@ const RUN: recalc.RunInputs = .{
 
 const Mode = enum { emit, open, recalc, save, phases };
 
+/// Which generator `emit` runs. Only `emit` cares: the other four modes
+/// take a fixture path and measure whatever workbook is behind it,
+/// which is why the criteria lane (M7b2) needed a flag here and not a
+/// second binary.
+const Workload = enum { f1, criteria };
+
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const gpa = std.heap.smp_allocator;
@@ -62,7 +69,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (args.len < 3) {
         try w.print(
             "usage: {s} <emit|open|recalc|save|phases> <fixture.xlsx>" ++
-                " [--size named|small|tiny] [--rows N] [--out PATH]\n",
+                " [--workload f1|criteria] [--size named|small|tiny] [--rows N] [--out PATH]\n",
             .{args[0]},
         );
         return 2;
@@ -74,19 +81,32 @@ pub fn main(init: std.process.Init) !u8 {
     };
     const path = args[2];
 
+    var workload: Workload = .f1;
     var geometry = synth.named;
     var named_size = true;
+    var crit_geometry = crit.small;
+    var crit_identity = true;
     var out_path: ?[]const u8 = null;
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--size") and i + 1 < args.len) {
+        if (std.mem.eql(u8, args[i], "--workload") and i + 1 < args.len) {
+            i += 1;
+            workload = std.meta.stringToEnum(Workload, args[i]) orelse {
+                try w.print("unknown workload: {s}\n", .{args[i]});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, args[i], "--size") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "small")) {
                 geometry = synth.small;
                 named_size = false;
+                crit_geometry = crit.small;
+                crit_identity = true;
             } else if (std.mem.eql(u8, args[i], "tiny")) {
                 geometry = synth.tiny;
                 named_size = false;
+                crit_geometry = crit.tiny;
+                crit_identity = false;
             } else if (!std.mem.eql(u8, args[i], "named")) {
                 try w.print("unknown size: {s}\n", .{args[i]});
                 return 2;
@@ -100,6 +120,8 @@ pub fn main(init: std.process.Init) !u8 {
             i += 1;
             geometry = .{ .data_rows = try std.fmt.parseInt(u32, args[i], 10) };
             named_size = false;
+            crit_geometry = .{ .data_rows = geometry.data_rows };
+            crit_identity = false;
         } else if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
             i += 1;
             out_path = args[i];
@@ -107,7 +129,20 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     switch (mode) {
-        .emit => return emitFixture(gpa, io, w, path, geometry, named_size),
+        .emit => switch (workload) {
+            .f1 => return emitFixture(gpa, io, w, path, geometry, named_size),
+            .criteria => {
+                // The criteria workload's sizes are `tiny` and `small`
+                // (its identity size); the F1 mix's `named` default has
+                // no counterpart here, so asking for it is a mistake
+                // rather than a mapping.
+                if (named_size) {
+                    try w.writeAll("the criteria workload needs --size small|tiny or --rows N\n");
+                    return 2;
+                }
+                return emitCriteria(gpa, io, w, path, crit_geometry, crit_identity);
+            },
+        },
         .open => {
             var wb = try Workbook.open(gpa, io, path);
             wb.deinit();
@@ -164,6 +199,41 @@ fn emitFixture(
                 "  The fixture IS the baseline's identity: re-measure §9's numbers and\n" ++
                 "  update `named_digest_sha256` in the same commit.\n",
             .{ synth.named_digest_sha256, digest },
+        );
+        return 1;
+    }
+    return 0;
+}
+
+/// The criteria workload's `emit`, under the same digest discipline:
+/// `small` is its identity size, and a baseline measured against
+/// different bytes describes a different workbook.
+fn emitCriteria(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    w: *std.Io.Writer,
+    path: []const u8,
+    geometry: crit.Geometry,
+    identity_size: bool,
+) !u8 {
+    const bytes = try crit.bytes(gpa, io, geometry);
+    defer gpa.free(bytes);
+
+    var hex: [crit.digest_len * 2]u8 = undefined;
+    const digest = crit.digestHex(bytes, &hex);
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+    try w.print(
+        "fixture={s} rows={d} cells={d} formula_cells={d} archive_bytes={d} sha256={s}\n",
+        .{ path, geometry.data_rows, geometry.cells(), geometry.formulaCells(), bytes.len, digest },
+    );
+
+    if (identity_size and !std.mem.eql(u8, digest, crit.small_digest_sha256)) {
+        try w.print(
+            "FAIL: criteria workload digest drifted\n  recorded {s}\n  emitted  {s}\n" ++
+                "  The fixture IS the baseline's identity: re-measure the criteria\n" ++
+                "  numbers and update `small_digest_sha256` in the same commit.\n",
+            .{ crit.small_digest_sha256, digest },
         );
         return 1;
     }
