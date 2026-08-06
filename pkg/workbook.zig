@@ -17300,11 +17300,11 @@ test "M4b3: evaluate mutates neither logical state nor serialized bytes" {
     try std.testing.expectEqual(@as(f64, 22), ok.ok.value.scalar.number);
     try expectSnapshotUnchanged(ta, &wb, before);
 
-    // 2. Refusal — an unregistered function, refused mid-run. `MEDIAN`
-    //    is frozen in the inventory for M7b3 and has no row yet;
+    // 2. Refusal — an unregistered function, refused mid-run. `TEXT`
+    //    is frozen in the inventory for M8a and has no row yet;
     //    `VLOOKUP` stood here until M4e registered it, `SUMIFS` until
-    //    M7b2.
-    var refused = try wb.evaluate(ta, 0, "MEDIAN(A1:B1)", .{ .collation = test_collation });
+    //    M7b2, `MEDIAN` until M7b3.
+    var refused = try wb.evaluate(ta, 0, "TEXT(A1,\"0\")", .{ .collation = test_collation });
     defer refused.deinit();
     try std.testing.expectEqual(
         engine.decode.PlaneTwo.FormulaUnsupportedFunction,
@@ -17989,7 +17989,7 @@ test "M5a1: closure evaluation mutates neither logical state nor serialized byte
 
     // 2. Refusal, raised after the closure had already been planned and
     //    every cell in it recomputed.
-    var refused = try wb.evaluateClosure(ta, 0, "MEDIAN(A1:B1)", .{ .collation = test_collation });
+    var refused = try wb.evaluateClosure(ta, 0, "TEXT(A1,\"0\")", .{ .collation = test_collation });
     defer refused.deinit();
     try std.testing.expectEqual(
         engine.decode.PlaneTwo.FormulaUnsupportedFunction,

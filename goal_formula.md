@@ -2029,6 +2029,91 @@ rows from them rather than declaring it.
     M5d4 lanes re-ran beside the new ones and the median gate stayed
     green.
 
+**M7b3 decisions (shipped 2026-08-06).** Ten points, in
+`src/formula/registry.zig` (eleven new rows, the collection, the one
+sort, the batch gates) and `eval.zig` (fixtures only). The batch where
+a propagation class the plan assumed uniform split in two under its own
+test.
+
+1. **One collection, one sort.** `collectNumbers` is SUM's
+   range/direct split verbatim — a range contributes numbers only, a
+   direct argument coerces, and the first error in §5.6a's iteration
+   order stops the fold — and `sortedNumbers` is the ONE ascending
+   sort every order-statistic name reads: MEDIAN, PERCENTILE.INC,
+   QUARTILE.INC, LARGE, SMALL and RANK.EQ share the view rather than
+   sorting per name. A multi-area union is one collection here
+   (`MEDIAN((A1:A2,A5:A6))` walks both areas) where the criteria
+   family a screen above answers `#VALUE!` — the aggregate walker
+   never needed one rectangle.
+2. **The propagation class splits by shape, and a test discovered
+   it.** The variadic six are `.propagate`: every slot is
+   `.aggregate`, so the dispatcher's scalar scan plus the collector's
+   §5.6a walk ARE declaration order. The fixed five carry a scalar
+   slot beside a reference slot, and the dispatcher cannot see an
+   error inside a reference — under `.propagate`,
+   `PERCENTILE.INC(F1,F2)` answered the SECOND argument's error, and
+   the both-orders fixture caught it. They ship
+   `per_function_provenance` with declaration order taken by the
+   implementations — `lookupPropagate`'s arrangement with the
+   opposite verdict on the collection's interior, because an error
+   inside a stats range is the fold's error where an error inside a
+   lookup table is a value the lookup may return.
+3. **The empty collection has four different answers, each pinned.**
+   MEDIAN, LARGE, SMALL, PERCENTILE.INC and QUARTILE.INC answer
+   `#NUM!`; the four moment names answer `#DIV/0!` (what their
+   division would have said — its mean is 0/0); RANK.EQ answers
+   `#N/A` (absent from the empty collection is still absent); and
+   MODE.SNGL answers `#N/A` by the no-mode route. Nothing anywhere
+   in the batch invents a zero the way MIN and MAX do.
+4. **`#DIV/0!` is spelled by the division, `.P`/`.S` is only the
+   divisor.** `foldMoments` is one computation — mean, then summed
+   squared deviations — and VAR.S over a sample of one divides by
+   `n − 1 = 0`, which really is what a sample of one has no variance
+   BY. `VAR.P(5)` is 0 and `VAR.S(5)` is `#DIV/0!`, one fixture
+   apart. MEDIAN's even case overflows through its addition to
+   `#NUM!` (`MEDIAN(1.7E+308,1.7E+308)`), the same instrument SUM's
+   running total uses.
+5. **INC interpolation is rank `k·(n−1)`, and the fixtures land on
+   exact binary.** Knots answer the sorted element, between-knot
+   ranks interpolate linearly; the battery's percentile column holds
+   five values so `n − 1` is a power of two and every k that is a
+   multiple of 1/8 compares EQUAL, not close. `QUARTILE.INC(a,q)` IS
+   `PERCENTILE.INC(a,q/4)` — one helper — and the q1 fixture pins
+   the same cell to the same answer through both spellings.
+6. **RANK.EQ ties share the top rank in both directions.** One
+   sorted view, two binary searches: descending counts the strictly
+   larger, ascending the strictly smaller, and `.EQ`'s letter is that
+   every tied value answers the count's rank. Zero or an omitted
+   order is descending; any other number is ascending (Excel reads
+   the slot as a logical, so 2 ascends). Absent from the collection
+   is `#N/A`.
+7. **MODE.SNGL's tie-break is §5.6a's first encounter, pinned.** The
+   walk is over the UNSORTED collection with a sorted copy answering
+   "how many"; strictly-greater bookkeeping keeps the first winner,
+   and a starting best of one is why a value seen once is not a
+   mode. Three tied pairs answer the first-seen 5 — pinned pending
+   the parked Excel leg, which is the one thing that could move it.
+8. **Truncation toward zero then bounds — the house rule reaches k
+   and quart.** `LARGE(a,1.9)` reads rank 1, `QUARTILE.INC(c,1.9)`
+   is q1, and `SMALL(a,0.5)` truncates to 0 and answers `#NUM!` —
+   CHOOSE/ADDRESS/SEQUENCE's rule, pinned pending the parked Excel
+   leg. The scalar slot still lifts (M7a's mixed signature):
+   `LARGE(A1:A8,{1;2})` is two ranks down one collection, held, not
+   re-collected.
+9. **Evidence stayed honest at zero.** The three-valued
+   `manifestVerdict` gate runs unchanged over the new batch: 0
+   decided rows and 0 excluded rows, counted from the committed
+   manifests, every fixture `spec_pinned`. `TEXT` (frozen, M8a)
+   replaces `MEDIAN` as the canonical unregistered name in the three
+   places that pinned it — registry, evaluator, workbook.
+10. **The sweep grew a batch, and the floor scaled with it.** The
+    M4e alphabet, builder and shape-runner untouched: eleven names
+    against every shape at one and two arguments, each padded to its
+    own minimum arity (`PERCENTILE.INC` runs at two, not the one it
+    would reject), both fidelity tables, every input evaluated
+    twice, floored above 9 000 where M7b2's six names floored at
+    5 000.
+
 ### 5.9 Name & identifier resolution
 
 Call position → strip layered prefixes → registry; unregistered →
@@ -2270,7 +2355,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M7a** ✅ | DA evaluation + decision table + ownership + `A1#`/`@` + F2-DA natives (FILTER, SORT, SORTBY, UNIQUE, SEQUENCE, RANDARRAY, TRANSPOSE) + RANDARRAY KATs | Fixtures; obstruction fuzz |
 | **M7b1** ✅ | DA + CSE **persistence** (approved set §5.8b byte-diff-fixtured: `<v>`+`t`, anchor `f@ref`, owned tail `<c>` create/clear, `<dimension ref>` expansion; `spill_transitions` table — every DA row refuses `transition_unproven` pending its byte-diffed Excel reference, the surfaced park; **legacy CSE live end-to-end**, no metadata byte to transition) | Byte-diff + refusal-enumeration fixtures; Excel-opens-clean per transition **runs as each reference lands** |
 | **M7b2** ✅ | F2 criteria batch (SUMIFS, COUNTIFS, AVERAGEIFS, MINIFS, MAXIFS over `criteria.scan`'s one N-way aligned pass; ADDRESS) — INDIRECT/OFFSET completed at M5a2. Every fixture spec_pinned (manifests predate the batch, 0 oracle rows counted); mismatched `*IFS` dimensions stay §5.6a's `#VALUE!`; an unpaired criteria tail refuses `MalformedInput` | Fixtures + §5.3c both-orders + padded sweep; whole-column + multi-criteria benches (`synth_criteria_mix`, digest-pinned) beside the M5d4 baselines, gate green |
-| **M7b3** | F2 statistics batch (MEDIAN, MODE.SNGL, STDEV.P/S, VAR.P/S, PERCENTILE.INC, QUARTILE.INC, RANK.EQ, LARGE, SMALL) | Oracle-first |
+| **M7b3** ✅ | F2 statistics batch (MEDIAN, MODE.SNGL, STDEV.P/S, VAR.P/S, PERCENTILE.INC, QUARTILE.INC, RANK.EQ, LARGE, SMALL over ONE numeric collection — SUM's range/direct split — with the order statistics sharing one ascending sort). Every fixture spec_pinned (manifests predate the batch, 0 oracle rows counted); INC interpolation pinned at the 0/0.25/0.5/0.75/1 knots and between them; RANK.EQ ties share the top rank in both directions; the propagation class splits by shape — variadic six `.propagate`, fixed five `per_function_provenance` taking §5.3c's declaration order themselves | Fixtures + §5.3c both-orders + padded sweep (eleven names, floor 9 000) |
 | **M7c** | DA authoring (byte-diffed spec → impl) + `FormulaWrite` (**Zig-only**) | Byte-diff vs references |
 | **M8a** | **`numfmt_v1` versioned grammar + support matrix FIRST** (sections ≤4, conditions, escapes/fills, fractions, scientific, elapsed `[h]`/`[mm]`, locale `[$-409]` tags — each row supported-with-exact-rendering or typed-refusal; the repo has only a date-detection heuristic today, `src/xlsx.zig:3909`) + numfmt + TEXT | Format fuzz; TEXT matrix; per-row grammar fixtures |
 | **M8b** | PROPER (word segmentation over the M4f `casing_v1` module) | Segmentation fixtures |
