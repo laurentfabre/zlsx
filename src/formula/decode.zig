@@ -1567,6 +1567,11 @@ pub const Sheet = struct {
     /// value. Document order is preserved among equal coordinates, so a
     /// consumer that refuses duplicates can name the first one.
     slots: []CellSlot,
+    /// `<mergeCells>`, normalized, in document order. The one thing
+    /// outside `<sheetData>` this scan interprets (M7a): §5.8a's merge
+    /// row needs the geometry, and a spill decided without it would
+    /// land on a merged range.
+    merges: []coords.Range,
 
     pub fn deinit(self: *Sheet) void {
         self.arena.deinit();
@@ -1615,6 +1620,7 @@ pub fn scanSheet(
 
     var cells: std.ArrayListUnmanaged(SheetCell) = .empty;
     var slots: std.ArrayListUnmanaged(CellSlot) = .empty;
+    var merges: std.ArrayListUnmanaged(coords.Range) = .empty;
 
     var ns_buf: [64]NsStack.Binding = undefined;
     const ns_cap = @min(ns_buf.len, opts.limits.max_namespace_bindings);
@@ -1627,6 +1633,7 @@ pub fn scanSheet(
         .strings = strings,
         .cells = &cells,
         .slots = &slots,
+        .merges = &merges,
     };
 
     var depth: u32 = 0;
@@ -1691,7 +1698,12 @@ pub fn scanSheet(
     }
 
     keep = true;
-    return .{ .ok = .{ .arena = arena, .cells = items, .slots = slot_items } };
+    return .{ .ok = .{
+        .arena = arena,
+        .cells = items,
+        .slots = slot_items,
+        .merges = try merges.toOwnedSlice(a),
+    } };
 }
 
 fn lessThanCell(_: void, x: SheetCell, y: SheetCell) bool {
@@ -1721,6 +1733,9 @@ const SheetWalk = struct {
 
     /// Depth of `<sheetData>` once inside it.
     sheet_data_depth: ?u32 = null,
+    /// Depth of `<mergeCells>` once inside it (M7a, §5.8a merge row).
+    merge_depth: ?u32 = null,
+    merges: *std.ArrayListUnmanaged(coords.Range),
     /// Depth of a subtree being skipped wholesale (foreign content or
     /// an inert main-namespace element outside `<sheetData>`).
     skip_depth: ?u32 = null,
@@ -1816,11 +1831,41 @@ const SheetWalk = struct {
     ) error{OutOfMemory}!void {
         if (self.skip_depth != null) return;
 
-        // Outside `<sheetData>` nothing is interpreted: the only thing
-        // this walk wants from the rest of the part is to get past it.
+        // Outside `<sheetData>` almost nothing is interpreted: the one
+        // exception is `<mergeCells>` (M7a) — §5.8a's merge row needs
+        // the geometry, so the two merge elements are read where
+        // everything else is got past.
         const sd = self.sheet_data_depth orelse {
+            if (self.merge_depth) |md| {
+                if (inMainNs(ns, el.name) and depth == md + 1 and
+                    std.mem.eql(u8, el.local(), "mergeCell"))
+                {
+                    try self.mergeCell(el);
+                    // The schema gives `<mergeCell>` no children; skip
+                    // to its close rather than guessing about any.
+                    if (!self_closing) self.skip_depth = depth;
+                } else if (!inMainNs(ns, el.name)) {
+                    // Foreign content inside an interpreted element is
+                    // skipped like foreign content anywhere outside
+                    // `<sheetData>` (M4b1 decision 8).
+                    if (!self_closing) self.skip_depth = depth;
+                } else {
+                    // A main-namespace element the schema does not put
+                    // here could be wrapping merges; refuse rather than
+                    // drop it (M4b1's discipline for interpreted
+                    // elements).
+                    self.refuse(.unexpected_element, el.offset);
+                }
+                return;
+            }
             if (isMain(ns, el, "sheetData")) {
                 self.sheet_data_depth = depth;
+            } else if (isMain(ns, el, "mergeCells") and depth == 2) {
+                // `count` is recorded nowhere and enforced nowhere —
+                // M4a decision 11's rule: producers miscount, and
+                // resolution is by position.
+                if (self.unexpectedAttr(el, &.{"count"})) return;
+                if (!self_closing) self.merge_depth = depth;
             } else if (depth > 1 and !self_closing) {
                 self.skip_depth = depth;
             }
@@ -1964,6 +2009,25 @@ const SheetWalk = struct {
             self.cursor.startRow();
         }
         if (self.sheet_data_depth == depth) self.sheet_data_depth = null;
+        if (self.merge_depth == depth) self.merge_depth = null;
+    }
+
+    /// One `<mergeCell ref="…"/>` (M7a). The schema gives it exactly
+    /// one attribute, and a range this grid cannot address is a
+    /// malformed value — the same refusal a bad `<row r>` takes. A `$`
+    /// is accepted because it is unambiguous: refusing one would refuse
+    /// a file Excel opens.
+    fn mergeCell(self: *SheetWalk, el: Element) error{OutOfMemory}!void {
+        if (self.unexpectedAttr(el, &.{"ref"})) return;
+        const raw = el.attr("ref") orelse {
+            self.refuse(.bad_attribute_value, el.offset);
+            return;
+        };
+        const range = coords.parseRange(raw, .{ .dollar = .accept }) catch {
+            self.refuse(.bad_attribute_value, el.offset);
+            return;
+        };
+        try self.merges.append(self.a, range.normalized());
     }
 
     fn startRow(self: *SheetWalk, el: Element) void {
@@ -2921,6 +2985,70 @@ test "scan: namespaced extension attributes and out-of-sheetData parts are toler
     defer sheet.deinit();
     try testing.expectEqual(@as(usize, 1), sheet.cells.len);
     try testing.expectEqual(@as(f64, 1), sheet.cells[0].input.number);
+}
+
+test "scan: mergeCells is the one interpreted element outside sheetData (M7a)" {
+    const xml =
+        "<worksheet" ++ ns_attr ++ ">" ++
+        "<sheetData><row r=\"1\"><c r=\"A1\"><v>1</v></c></row></sheetData>" ++
+        "<mergeCells count=\"99\">" ++ // miscounted on purpose: recorded nowhere, enforced nowhere
+        "<mergeCell ref=\"B2:C3\"/>" ++
+        "<mergeCell ref=\"$E$1:$F$2\"/>" ++ // `$` is unambiguous; refusing it would refuse a file Excel opens
+        "<mergeCell ref=\"D9\"/>" ++ // a degenerate single-cell spelling
+        "</mergeCells>" ++
+        "</worksheet>";
+    var sheet = try scanOk(xml, &.{});
+    defer sheet.deinit();
+    try testing.expectEqual(@as(usize, 3), sheet.merges.len);
+    try testing.expectEqual(@as(u32, 2), sheet.merges[0].first.row.oneBased());
+    try testing.expectEqual(@as(u32, 2), sheet.merges[0].last.col.zeroBased());
+    try testing.expectEqual(@as(u32, 4), sheet.merges[1].first.col.zeroBased());
+    try testing.expectEqual(@as(u32, 9), sheet.merges[2].first.row.oneBased());
+}
+
+test "scan: a malformed mergeCell refuses like any bad attribute" {
+    const bad_ref =
+        "<worksheet" ++ ns_attr ++ ">" ++
+        "<sheetData/>" ++
+        "<mergeCells><mergeCell ref=\"NOT A RANGE\"/></mergeCells>" ++
+        "</worksheet>";
+    const r = try scanRefusal(bad_ref, &.{});
+    try testing.expectEqual(Refusal.Reason.bad_attribute_value, r.reason);
+
+    const no_ref =
+        "<worksheet" ++ ns_attr ++ ">" ++
+        "<sheetData/>" ++
+        "<mergeCells><mergeCell/></mergeCells>" ++
+        "</worksheet>";
+    const r2 = try scanRefusal(no_ref, &.{});
+    try testing.expectEqual(Refusal.Reason.bad_attribute_value, r2.reason);
+
+    // An unknown attribute on an interpreted element refuses (M4a
+    // decision 12), and so does a main-namespace element the schema
+    // does not put inside `<mergeCells>`.
+    const bad_attr =
+        "<worksheet" ++ ns_attr ++ ">" ++
+        "<sheetData/>" ++
+        "<mergeCells><mergeCell ref=\"A1:B2\" bogus=\"1\"/></mergeCells>" ++
+        "</worksheet>";
+    const r3 = try scanRefusal(bad_attr, &.{});
+    try testing.expectEqual(Refusal.Reason.unexpected_attribute, r3.reason);
+
+    const bad_child =
+        "<worksheet" ++ ns_attr ++ ">" ++
+        "<sheetData/>" ++
+        "<mergeCells><row r=\"1\"/></mergeCells>" ++
+        "</worksheet>";
+    const r4 = try scanRefusal(bad_child, &.{});
+    try testing.expectEqual(Refusal.Reason.unexpected_element, r4.reason);
+}
+
+test "scan: a sheet with no mergeCells answers an empty list" {
+    var sheet = try scanOk(sheetXml(
+        \\<row r="1"><c r="A1"><v>1</v></c></row>
+    ), &.{});
+    defer sheet.deinit();
+    try testing.expectEqual(@as(usize, 0), sheet.merges.len);
 }
 
 test "scan: cells come back row-major regardless of document order" {

@@ -92,6 +92,11 @@ pub const graph = @import("graph.zig");
 /// would be a different type.
 pub const iterate = @import("iterate.zig");
 pub const draws = @import("draws.zig");
+/// M7a: §5.8a's spill decision table and ownership protocol. The hosts
+/// in `pkg/` implement its vtable over their own storage, and a second
+/// `env.zig` behind a second import would make `CellRef` a different
+/// type — the same one-module reason as everything above.
+pub const spill = @import("spill.zig");
 /// M5d2: `rng_v1`, as the recalc's draw source. Standalone evaluation
 /// hands the evaluator a constant — a cache-based read must answer the
 /// same call the same way twice — but a recalc is given a `RunInputs`

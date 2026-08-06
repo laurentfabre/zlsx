@@ -331,6 +331,21 @@ const text_num = [_]CoercionClass{ .text, .number };
 const text_num_num = [_]CoercionClass{ .text, .number, .number };
 const text_text_num = [_]CoercionClass{ .text, .text, .number };
 
+// F2-DA's signatures (M7a). The array-consuming five hand their grids
+// over whole — `.aggregate` and `.value_any` slots are never lifted —
+// while SEQUENCE and RANDARRAY are ordinary liftable producers whose
+// slots are all scalar classes.
+const eager4 = [_]Laziness{ .eager, .eager, .eager, .eager };
+const eager5 = [_]Laziness{ .eager, .eager, .eager, .eager, .eager };
+const num4 = [_]CoercionClass{ .number, .number, .number, .number };
+const agg1 = [_]CoercionClass{.aggregate};
+const filter_c = [_]CoercionClass{ .aggregate, .aggregate, .value_any };
+const sort_c = [_]CoercionClass{ .aggregate, .value_any, .value_any, .logical };
+const sortby_fixed_c = [_]CoercionClass{ .aggregate, .aggregate };
+const sortby_rest_c = [_]CoercionClass{ .number, .aggregate };
+const unique_c = [_]CoercionClass{ .aggregate, .logical, .logical };
+const randarray_c = [_]CoercionClass{ .number, .number, .number, .number, .logical };
+
 pub const functions = [_]Function{
     // ── zero-argument literals and the volatile probe ──
     .{
@@ -1287,6 +1302,78 @@ pub const functions = [_]Function{
         .propagation = .propagate,
         .epoch_sensitive = true,
         .impl = fnNow,
+    },
+
+    // ── M7a / F2-DA: the dynamic-array natives (§5.8a). `da_aware`
+    //    is the literal statement that a function consumes its arrays
+    //    itself: the five that carry it are never lifted, because none
+    //    of their array-bearing slots is a scalar class. SEQUENCE and
+    //    RANDARRAY only *produce* rectangles — their slots are scalar,
+    //    so they lift like any other function and their per-element
+    //    results reduce to top-left (§5.3b's nested-array rule). ──
+    .{
+        .name = "FILTER",
+        .arity = .{ .min = 2, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &filter_c, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .da_aware = true,
+        .impl = fnFilter,
+    },
+    .{
+        .name = "RANDARRAY",
+        .arity = .{ .min = 0, .max = 5, .fixed = &eager5, .rest = &none_l },
+        .coercion = .{ .fixed = &randarray_c, .rest = &none_c },
+        .volatility = .volatile_fn,
+        .propagation = .propagate,
+        .impl = fnRandArray,
+    },
+    .{
+        .name = "SEQUENCE",
+        .arity = .{ .min = 1, .max = 4, .fixed = &eager4, .rest = &none_l },
+        .coercion = .{ .fixed = &num4, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnSequence,
+    },
+    .{
+        .name = "SORT",
+        .arity = .{ .min = 1, .max = 4, .fixed = &eager4, .rest = &none_l },
+        .coercion = .{ .fixed = &sort_c, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .da_aware = true,
+        .collation_sensitive = true,
+        .impl = fnSort,
+    },
+    .{
+        .name = "SORTBY",
+        .arity = .{ .min = 2, .max = null, .fixed = &eager2, .rest = &eager2 },
+        .coercion = .{ .fixed = &sortby_fixed_c, .rest = &sortby_rest_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .da_aware = true,
+        .collation_sensitive = true,
+        .impl = fnSortBy,
+    },
+    .{
+        .name = "TRANSPOSE",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &agg1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .da_aware = true,
+        .impl = fnTranspose,
+    },
+    .{
+        .name = "UNIQUE",
+        .arity = .{ .min = 1, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &unique_c, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .da_aware = true,
+        .collation_sensitive = true,
+        .impl = fnUnique,
     },
 
     // ── the lazy forms. No `impl`: deferring an arm means holding an
@@ -3593,6 +3680,445 @@ fn fnNow(ctx: CallCtx, args: []const Value) FnError!Value {
     return Value.num(try ctx.nowSerial());
 }
 
+// ─── F2-DA (M7a, §5.8a) ──────────────────────────────────────────
+
+/// An optional trailing logical argument, mirroring `optNum`. A present
+/// argument already ran the `.logical` slot class, so it is a boolean
+/// (an error never reaches a `.propagate` implementation).
+fn optBool(args: []const Value, i: usize, absent: bool) bool {
+    if (args.len <= i) return absent;
+    return args[i].scalar.boolean;
+}
+
+/// A ROWS/COLS count. Truncation toward zero is CHOOSE's rule (§5.3a);
+/// negative is `#VALUE!` (spelled `null` here); a single dimension past
+/// §9's matrix cap can never fit a matrix, so it takes the SAME
+/// `error.TooManyCells` the cap itself raises and `invoke` maps to
+/// `FormulaLimitExceeded` — which keeps the u32 cast total.
+fn dimArg(x: f64) error{TooManyCells}!?u32 {
+    const t = @trunc(x);
+    if (t < 0) return null;
+    if (t > @as(f64, @floatFromInt(value.max_matrix_cells + 1))) return error.TooManyCells;
+    return @intFromFloat(t);
+}
+
+fn fnSequence(ctx: CallCtx, args: []const Value) FnError!Value {
+    const rows = (try dimArg(numArg(args, 0))) orelse return Value.err(.value);
+    const cols = (try dimArg(optNum(args, 1, 1))) orelse return Value.err(.value);
+    const start = optNum(args, 2, 1);
+    const step = optNum(args, 3, 1);
+    // A zero extent is the empty rectangle; `Matrix.init` raises
+    // `error.EmptyMatrix` and the call boundary spells it `#CALC!`.
+    const m = try value.Matrix.init(ctx.arena(), rows, cols);
+    for (m.cells, 0..) |*cell, i| {
+        // The closed form `start + i·step`, not repeated addition, so
+        // element (r,c) does not depend on the walk that reached it —
+        // and a non-finite element is that element's `#NUM!`, not the
+        // rectangle's.
+        cell.* = value.ScalarValue.fromArithmetic(start + @as(f64, @floatFromInt(i)) * step);
+    }
+    return .{ .array = m };
+}
+
+fn fnRandArray(ctx: CallCtx, args: []const Value) FnError!Value {
+    const rows = (try dimArg(optNum(args, 0, 1))) orelse return Value.err(.value);
+    const cols = (try dimArg(optNum(args, 1, 1))) orelse return Value.err(.value);
+    const lo_arg = optNum(args, 2, 0);
+    const hi_arg = optNum(args, 3, 1);
+    const whole = optBool(args, 4, false);
+    if (lo_arg > hi_arg) return Value.err(.value);
+
+    const m = try value.Matrix.init(ctx.arena(), rows, cols);
+    if (whole) {
+        // RANDBETWEEN's bounds, per element: non-integer bounds move
+        // INWARD, a range empty only after they moved is `#NUM!`, and
+        // each element is ONE scaled draw — a rejection sampler would
+        // draw a data-dependent number of times and take §5.6d's
+        // counter with it.
+        const lo = @ceil(lo_arg);
+        const hi = @floor(hi_arg);
+        if (lo > hi) return Value.err(.num);
+        const span = hi - lo + 1;
+        if (!std.math.isFinite(span)) return Value.err(.num);
+        for (m.cells, 0..) |*cell, i| {
+            // §5.6d: RANDARRAY elements draw by element ordinal.
+            ctx.ev.opts.draws.key.element = @intCast(i);
+            const u = try ctx.draw();
+            cell.* = value.ScalarValue.fromArithmetic(@min(hi, lo + @floor(u * span)));
+        }
+    } else {
+        const span = hi_arg - lo_arg;
+        if (!std.math.isFinite(span)) return Value.err(.num);
+        for (m.cells, 0..) |*cell, i| {
+            ctx.ev.opts.draws.key.element = @intCast(i);
+            const u = try ctx.draw();
+            cell.* = value.ScalarValue.fromArithmetic(lo_arg + u * span);
+        }
+    }
+    return .{ .array = m };
+}
+
+fn fnTranspose(ctx: CallCtx, args: []const Value) FnError!Value {
+    const g = (try gridOf(ctx, args[0])) orelse return Value.err(.value);
+    var m = try value.Matrix.init(ctx.arena(), g.cols, g.rows);
+    var r: u32 = 0;
+    while (r < g.rows) : (r += 1) {
+        var c: u32 = 0;
+        while (c < g.cols) : (c += 1) m.set(c, r, g.at(r, c));
+    }
+    return .{ .array = m };
+}
+
+/// FILTER's `if_empty`: whatever the caller wrote, materialized the way
+/// a value context would — a reference dereferences, everything else is
+/// already a value.
+fn ifEmptyValue(ctx: CallCtx, v: Value) FnError!Value {
+    const g = (try gridOf(ctx, v)) orelse return Value.err(.value);
+    return switch (g.src) {
+        .scalar => |s| .{ .scalar = s },
+        .matrix => |m| .{ .array = m },
+    };
+}
+
+fn fnFilter(ctx: CallCtx, args: []const Value) FnError!Value {
+    const g = (try gridOf(ctx, args[0])) orelse return Value.err(.value);
+    const inc = (try gridOf(ctx, args[1])) orelse return Value.err(.value);
+
+    // The include vector names ROWS when it runs down a column and
+    // COLUMNS when it runs across a row; a 2-D include or a length
+    // mismatch is `#VALUE!`.
+    const by_rows = inc.cols == 1 and inc.rows == g.rows;
+    const by_cols = !by_rows and inc.rows == 1 and inc.cols == g.cols;
+    if (!by_rows and !by_cols) return Value.err(.value);
+    const n: u32 = if (by_rows) g.rows else g.cols;
+
+    const keep = try ctx.arena().alloc(bool, n);
+    var kept: u32 = 0;
+    for (keep, 0..) |*k, i| {
+        const s = if (by_rows) inc.at(@intCast(i), 0) else inc.at(0, @intCast(i));
+        // Excel's condition coercion, per element: an error in the
+        // include is the whole answer, text refuses, blank is FALSE.
+        switch (try ctx.ev.toLogical(s)) {
+            .b => |b| {
+                k.* = b;
+                kept += @intFromBool(b);
+            },
+            .err => |e| return .{ .scalar = e },
+        }
+    }
+    if (kept == 0) {
+        // The third argument is what an empty result answers; without
+        // one the empty matrix meets the call boundary and becomes
+        // `#CALC!` (§5.3a).
+        if (args.len >= 3 and args[2] != .missing_arg) return ifEmptyValue(ctx, args[2]);
+        return error.EmptyMatrix;
+    }
+    var m = try value.Matrix.init(
+        ctx.arena(),
+        if (by_rows) kept else g.rows,
+        if (by_rows) g.cols else kept,
+    );
+    var out: u32 = 0;
+    for (keep, 0..) |k, i| {
+        if (!k) continue;
+        if (by_rows) {
+            var c: u32 = 0;
+            while (c < g.cols) : (c += 1) m.set(out, c, g.at(@intCast(i), c));
+        } else {
+            var r: u32 = 0;
+            while (r < g.rows) : (r += 1) m.set(r, out, g.at(r, @intCast(i)));
+        }
+        out += 1;
+    }
+    return .{ .array = m };
+}
+
+/// A per-element sort key: the scalar plus, for text, its fold —
+/// computed once, so the comparator below allocates nothing and cannot
+/// fail mid-sort.
+const SortKey = struct {
+    s: value.ScalarValue,
+    folded: []const u8 = "",
+};
+
+fn sortKeyOf(ctx: CallCtx, s: value.ScalarValue) FnError!SortKey {
+    return .{
+        .s = s,
+        .folded = switch (s) {
+            .text => |t| ctx.collation().fold(ctx.arena(), t) catch |e| {
+                if (e == error.OutOfMemory) return error.OutOfMemory;
+                // The injected fold is `collation_v1`'s; nothing else it
+                // could report is a value outcome (the evaluator's own
+                // comparator narrows the same way).
+                return error.MalformedInput;
+            },
+            else => "",
+        },
+    };
+}
+
+/// §5.3b's SORT column as one ascending preorder: blank first, then
+/// number < text < logical (`crossTypeRank`), errors pinned last.
+fn sortClass(s: value.ScalarValue) u3 {
+    return switch (s) {
+        .blank => 0,
+        .number => 1,
+        .text => 2,
+        .boolean => 3,
+        .err => 4,
+    };
+}
+
+/// Fold-equal text is EQUAL here (`collation_v1`), and blanks and
+/// errors tie among themselves — the stable sort's source order is the
+/// only tie-break (`value.sort_tiebreak_policy`), visibly outside this
+/// comparator.
+fn cmpSortKeys(a: SortKey, b: SortKey) std.math.Order {
+    const ca = sortClass(a.s);
+    const cb = sortClass(b.s);
+    if (ca != cb) return std.math.order(ca, cb);
+    return switch (a.s) {
+        .blank, .err => .eq,
+        .number => |x| std.math.order(x, b.s.number),
+        .text => std.mem.order(u8, a.folded, b.folded),
+        .boolean => |x| if (x == b.s.boolean) .eq else if (x) .gt else .lt,
+    };
+}
+
+/// Equality for UNIQUE: the same preorder's `.eq`, except errors —
+/// UNIQUE distinguishes `#REF!` from `#N/A` where SORT only pins their
+/// position.
+fn eqSortKeys(a: SortKey, b: SortKey) bool {
+    if (sortClass(a.s) != sortClass(b.s)) return false;
+    return switch (a.s) {
+        .blank => true,
+        .number => |x| x == b.s.number,
+        .text => std.mem.eql(u8, a.folded, b.folded),
+        .boolean => |x| x == b.s.boolean,
+        .err => |e| e.eql(b.s.err),
+    };
+}
+
+/// The multi-level permutation comparator SORT and SORTBY share. Keys
+/// are level-major (`keys[level*n + pos]`); a descending level flips
+/// every non-tie answer and nothing else.
+const SortCtx = struct {
+    keys: []const SortKey,
+    orders: []const i2,
+    n: usize,
+
+    fn lessThan(self: SortCtx, a: u32, b: u32) bool {
+        for (self.orders, 0..) |ord, lvl| {
+            const c = cmpSortKeys(self.keys[lvl * self.n + a], self.keys[lvl * self.n + b]);
+            if (c == .eq) continue;
+            return if (ord > 0) c == .lt else c == .gt;
+        }
+        return false;
+    }
+};
+
+/// A scalar-or-vector numeric argument (SORT's index and order): the
+/// elements as numbers, or null where the shape is not a vector or an
+/// element is not a number — both `#VALUE!` at the caller.
+fn numVectorOf(ctx: CallCtx, v: Value) FnError!?[]const f64 {
+    const g = (try gridOf(ctx, v)) orelse return null;
+    const vec = vectorOf(g) orelse return null;
+    const out = try ctx.arena().alloc(f64, vec.len);
+    for (out, 0..) |*x, i| {
+        const s = vec.at(@intCast(i));
+        if (s != .number) return null;
+        x.* = s.number;
+    }
+    return out;
+}
+
+fn orderOf(x: f64) ?i2 {
+    if (x == 1) return 1;
+    if (x == -1) return -1;
+    return null;
+}
+
+fn fnSort(ctx: CallCtx, args: []const Value) FnError!Value {
+    const g = (try gridOf(ctx, args[0])) orelse return Value.err(.value);
+    const by_col = optBool(args, 3, false);
+    const n: u32 = if (by_col) g.cols else g.rows;
+    const bound: u32 = if (by_col) g.rows else g.cols;
+
+    const one = [1]f64{1};
+    const raw_indices: []const f64 = if (args.len >= 2 and args[1] != .missing_arg)
+        (try numVectorOf(ctx, args[1])) orelse return Value.err(.value)
+    else
+        &one;
+    const raw_orders: []const f64 = if (args.len >= 3 and args[2] != .missing_arg)
+        (try numVectorOf(ctx, args[2])) orelse return Value.err(.value)
+    else
+        &one;
+    const levels = raw_indices.len;
+    // A single order broadcasts over every level; otherwise the two
+    // vectors pair one-to-one.
+    if (raw_orders.len != 1 and raw_orders.len != levels) return Value.err(.value);
+
+    const orders = try ctx.arena().alloc(i2, levels);
+    for (orders, 0..) |*o, lvl| {
+        const x = raw_orders[if (raw_orders.len == 1) 0 else lvl];
+        o.* = orderOf(x) orelse return Value.err(.value);
+    }
+    const keys = try ctx.arena().alloc(SortKey, levels * n);
+    for (raw_indices, 0..) |raw_ix, lvl| {
+        const t = @trunc(raw_ix);
+        if (t < 1 or t > @as(f64, @floatFromInt(bound))) return Value.err(.value);
+        const ix: u32 = @intFromFloat(t - 1);
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const s = if (by_col) g.at(ix, i) else g.at(i, ix);
+            keys[lvl * n + i] = try sortKeyOf(ctx, s);
+        }
+    }
+    const perm = try ctx.arena().alloc(u32, n);
+    for (perm, 0..) |*p, i| p.* = @intCast(i);
+    std.sort.block(u32, perm, SortCtx{ .keys = keys, .orders = orders, .n = n }, SortCtx.lessThan);
+
+    var m = try value.Matrix.init(ctx.arena(), g.rows, g.cols);
+    for (perm, 0..) |src, dst| {
+        var j: u32 = 0;
+        while (j < bound) : (j += 1) {
+            if (by_col) {
+                m.set(j, @intCast(dst), g.at(j, src));
+            } else {
+                m.set(@intCast(dst), j, g.at(src, j));
+            }
+        }
+    }
+    return .{ .array = m };
+}
+
+fn fnSortBy(ctx: CallCtx, args: []const Value) FnError!Value {
+    const g = (try gridOf(ctx, args[0])) orelse return Value.err(.value);
+    // by/order pairs: by₁ [order₁ by₂ order₂ …]. A trailing by without
+    // an order sorts ascending.
+    // `min = 2` guarantees at least one pair, so `keys` is always set
+    // by the first iteration below.
+    const levels = args.len / 2;
+    assert(levels >= 1);
+    const orders = try ctx.arena().alloc(i2, levels);
+    var by_col = false;
+    var n: u32 = 0;
+    var keys: []SortKey = undefined;
+    for (0..levels) |lvl| {
+        const bg = (try gridOf(ctx, args[1 + 2 * lvl])) orelse return Value.err(.value);
+        const down = bg.cols == 1 and bg.rows == g.rows;
+        const across = !down and bg.rows == 1 and bg.cols == g.cols;
+        if (!down and !across) return Value.err(.value);
+        if (lvl == 0) {
+            // The first by-vector decides the axis; the rest must run
+            // the same way.
+            by_col = across;
+            n = if (across) g.cols else g.rows;
+            keys = try ctx.arena().alloc(SortKey, levels * n);
+        } else if (across != by_col) return Value.err(.value);
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            keys[lvl * n + i] = try sortKeyOf(ctx, if (across) bg.at(0, i) else bg.at(i, 0));
+        }
+        const oi = 2 + 2 * lvl;
+        const x = if (args.len > oi) numArg(args, oi) else 1;
+        orders[lvl] = orderOf(x) orelse return Value.err(.value);
+    }
+    const perm = try ctx.arena().alloc(u32, n);
+    for (perm, 0..) |*p, i| p.* = @intCast(i);
+    std.sort.block(u32, perm, SortCtx{ .keys = keys, .orders = orders, .n = n }, SortCtx.lessThan);
+
+    var m = try value.Matrix.init(ctx.arena(), g.rows, g.cols);
+    const bound: u32 = if (by_col) g.rows else g.cols;
+    for (perm, 0..) |src, dst| {
+        var j: u32 = 0;
+        while (j < bound) : (j += 1) {
+            if (by_col) {
+                m.set(j, @intCast(dst), g.at(j, src));
+            } else {
+                m.set(@intCast(dst), j, g.at(src, j));
+            }
+        }
+    }
+    return .{ .array = m };
+}
+
+fn fnUnique(ctx: CallCtx, args: []const Value) FnError!Value {
+    const g = (try gridOf(ctx, args[0])) orelse return Value.err(.value);
+    const by_col = optBool(args, 1, false);
+    const once = optBool(args, 2, false);
+    const n: u32 = if (by_col) g.cols else g.rows;
+    const w: u32 = if (by_col) g.rows else g.cols;
+
+    // Fold every text element once; row equality is then allocation-free.
+    const keys = try ctx.arena().alloc(SortKey, @as(usize, n) * w);
+    {
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            var j: u32 = 0;
+            while (j < w) : (j += 1) {
+                const s = if (by_col) g.at(j, i) else g.at(i, j);
+                keys[@as(usize, i) * w + j] = try sortKeyOf(ctx, s);
+            }
+        }
+    }
+    // Keep-first order, counted for `exactly_once`.
+    const first_of = try ctx.arena().alloc(u32, n);
+    const counts = try ctx.arena().alloc(u32, n);
+    var uniq_n: u32 = 0;
+    var i: u32 = 0;
+    outer: while (i < n) : (i += 1) {
+        var u: u32 = 0;
+        while (u < uniq_n) : (u += 1) {
+            var same = true;
+            var j: u32 = 0;
+            while (j < w) : (j += 1) {
+                if (!eqSortKeys(
+                    keys[@as(usize, first_of[u]) * w + j],
+                    keys[@as(usize, i) * w + j],
+                )) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) {
+                counts[u] += 1;
+                continue :outer;
+            }
+        }
+        first_of[uniq_n] = i;
+        counts[uniq_n] = 1;
+        uniq_n += 1;
+    }
+    var out_n: u32 = 0;
+    for (0..uniq_n) |u| {
+        if (!once or counts[u] == 1) out_n += 1;
+    }
+    // `exactly_once` over a grid with no singletons is the empty
+    // rectangle — `#CALC!` at the call boundary.
+    if (out_n == 0) return error.EmptyMatrix;
+    var m = try value.Matrix.init(
+        ctx.arena(),
+        if (by_col) g.rows else out_n,
+        if (by_col) out_n else g.cols,
+    );
+    var dst: u32 = 0;
+    for (0..uniq_n) |u| {
+        if (once and counts[u] != 1) continue;
+        const src = first_of[u];
+        var j: u32 = 0;
+        while (j < w) : (j += 1) {
+            if (by_col) {
+                m.set(j, dst, g.at(j, src));
+            } else {
+                m.set(dst, j, g.at(src, j));
+            }
+        }
+        dst += 1;
+    }
+    return .{ .array = m };
+}
+
 // ─── tests ───────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -4160,6 +4686,124 @@ test "M5a2: the running total moves with the two reference-producing rows" {
     try testing.expectEqual(@as(usize, 95), shipped);
 }
 
+const m7a_milestone = "M7a";
+const m7a_batch = "F2-DA";
+
+fn isM7a(e: InventoryEntry) bool {
+    return std.mem.eql(u8, e.milestone, m7a_milestone) and
+        std.mem.eql(u8, e.batch, m7a_batch);
+}
+
+test "M7a: the batch's size is regenerated from the inventory, never from prose" {
+    // The ladder row says "7". This test counts the file instead, the
+    // same both-directions discipline every F-batch since M4c ships
+    // under: every `M7a`/`F2-DA` row resolves, and every registered
+    // function tagged `M7a` is listed under this batch.
+    var it = inventory();
+    var counted: usize = 0;
+    while (it.next()) |e| {
+        if (isM7a(e)) counted += 1;
+    }
+    try testing.expect(counted > 0);
+
+    var it2 = inventory();
+    var resolved: usize = 0;
+    while (it2.next()) |e| {
+        if (!isM7a(e)) continue;
+        const f = lookup(e.name) orelse {
+            std.debug.print("F2-DA name not registered: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        };
+        try testing.expectEqualStrings(e.name, f.name);
+        resolved += 1;
+    }
+    try testing.expectEqual(counted, resolved);
+
+    var registered_m7a: usize = 0;
+    for (&functions) |*f| {
+        var it3 = inventory();
+        while (it3.next()) |e| {
+            if (!std.mem.eql(u8, e.name, f.name)) continue;
+            if (std.mem.eql(u8, e.milestone, m7a_milestone)) {
+                if (!isM7a(e)) {
+                    std.debug.print("{s}: tagged {s} but batch {s}\n", .{ f.name, e.milestone, e.batch });
+                    return error.BatchTagMismatch;
+                }
+                registered_m7a += 1;
+            }
+            break;
+        }
+    }
+    try testing.expectEqual(counted, registered_m7a);
+}
+
+test "M7a: the running total moves with the batch, counted from the file" {
+    const rows = [_][]const u8{ "M4c", "M4d", "M4e", "M4f", "M4g", "M5a2", "M7a" };
+    var shipped: usize = 0;
+    for (rows) |m| {
+        var it = inventory();
+        while (it.next()) |e| {
+            if (!std.mem.eql(u8, e.milestone, m)) continue;
+            if (lookup(e.name) == null) {
+                std.debug.print("shipped name does not resolve: {s} ({s})\n", .{ e.name, m });
+                return error.LadderTotalIncomplete;
+            }
+            shipped += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 102), shipped);
+}
+
+test "M7a: every F2-DA row declares all five fields, and its flags honestly" {
+    // `da_aware` is the literal statement that a function consumes its
+    // arrays itself — exactly the five whose grids arrive whole.
+    // SEQUENCE and RANDARRAY only produce rectangles: their slots are
+    // all scalar classes, so they lift like any other function, and
+    // carrying the flag would claim a consumption that never happens.
+    const da_aware = [_][]const u8{ "FILTER", "SORT", "SORTBY", "TRANSPOSE", "UNIQUE" };
+    // SORT, SORTBY and UNIQUE order and equate text through
+    // `collation_v1`; FILTER's include never compares text (it refuses
+    // it) and TRANSPOSE compares nothing.
+    const collated = [_][]const u8{ "SORT", "SORTBY", "UNIQUE" };
+
+    var it = inventory();
+    var seen: usize = 0;
+    while (it.next()) |e| {
+        if (!isM7a(e)) continue;
+        const f = lookup(e.name).?;
+        seen += 1;
+        try testing.expect(f.form == .plain);
+        try testing.expect(f.impl != null);
+        try testing.expect(!f.reference_producing);
+        try testing.expect(!f.platform_sensitive);
+        try testing.expect(!f.cv_sensitive);
+        try testing.expect(!f.epoch_sensitive);
+        // The one volatile row is the per-element draw; everything else
+        // is stable.
+        const want_volatile = std.mem.eql(u8, e.name, "RANDARRAY");
+        try testing.expectEqual(
+            if (want_volatile) Volatility.volatile_fn else Volatility.stable,
+            f.volatility,
+        );
+        var want_da = false;
+        for (da_aware) |n| {
+            if (std.mem.eql(u8, n, e.name)) want_da = true;
+        }
+        try testing.expectEqual(want_da, f.da_aware);
+        // The flag and the shape it describes cannot disagree: a
+        // da_aware function is precisely one the dispatcher must not
+        // lift wholesale.
+        try testing.expectEqual(want_da, !f.liftable());
+        var want_coll = false;
+        for (collated) |n| {
+            if (std.mem.eql(u8, n, e.name)) want_coll = true;
+        }
+        try testing.expectEqual(want_coll, f.collation_sensitive);
+        try testing.expectEqual(value.PropagationClass.propagate, f.propagation);
+    }
+    try testing.expectEqual(@as(usize, 7), seen);
+}
+
 test "M5a2: both reference-producing rows are complete, and they are the only two" {
     // §7 lists exactly two reference-producing rows, and M4e's decision
     // 11 deferred `INDEX`'s range form on the strength of that. If a
@@ -4544,7 +5188,7 @@ test "registry: lookup is case-insensitive and rejects unknown names" {
     try testing.expect(lookup("NOTAFUNCTION") == null);
 }
 
-test "registry: the volatile rows are the two draws, the two clocks and the two references" {
+test "registry: the volatile rows are the three draws, the two clocks and the two references" {
     // Both directions, because either alone passes for the wrong reason:
     // naming them proves they are volatile, counting proves nothing
     // else quietly became so. Every volatile row is a cell the M5a2
@@ -4561,7 +5205,10 @@ test "registry: the volatile rows are the two draws, the two clocks and the two 
     // depend on changing. Neither draws — the flag is not "consumes the
     // RNG", it is "must be recalculated" — and that third reason is
     // exactly why §5.6e needs an outer loop.
-    const expected = [_][]const u8{ "RAND", "RANDBETWEEN", "TODAY", "NOW", "INDIRECT", "OFFSET" };
+    //
+    // M7a added `RANDARRAY`, a draw like `RAND` — one per ELEMENT,
+    // keyed by §5.6d's element ordinal rather than by callsite alone.
+    const expected = [_][]const u8{ "RAND", "RANDBETWEEN", "RANDARRAY", "TODAY", "NOW", "INDIRECT", "OFFSET" };
     for (expected) |name| {
         try testing.expectEqual(Volatility.volatile_fn, lookup(name).?.volatility);
     }

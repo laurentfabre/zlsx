@@ -1777,7 +1777,7 @@ pub const Workbook = struct {
                     self.refusal = r;
                     break :blk .{ .refused = planeOfRefusal(r) };
                 },
-                .ok => |x| .{ .ok = .{ .value = .{ .scalar = x.value }, .reads = x.reads } },
+                .ok => |x| .{ .ok = .{ .value = x.value, .reads = x.reads } },
             };
         }
 
@@ -1787,20 +1787,20 @@ pub const Workbook = struct {
             v: engine.iterate.Snapshot,
         ) error{OutOfMemory}!void {
             const self = of(ctx);
-            // An array's readable value at its anchor is its top-left
-            // (§5.3b); placing the tails is M7a's.
-            const scalar = switch (v) {
-                .scalar => |s| s,
-                .array => |m| m.topLeft(),
-            };
-            self.model.putComputed(cell.sheet, cell.row, cell.col, scalar) catch |e| switch (e) {
+            // §5.8a (M7a): scalars land in the computed layer, arrays
+            // run the decision table and place their tails — or hold
+            // `#SPILL!` with the class recorded.
+            _ = self.model.publishResult(cell, v) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => self.failure = Error.SheetNotFound,
+                else => blk: {
+                    self.failure = Error.SheetNotFound;
+                    break :blk engine.value.ScalarValue.blank;
+                },
             };
         }
 
         fn vtRetract(ctx: *anyopaque, cell: engine.env.CellRef) void {
-            of(ctx).model.clearComputed(cell.sheet, cell.row, cell.col);
+            of(ctx).model.retractResult(cell);
         }
     };
 
@@ -1817,13 +1817,18 @@ pub const Workbook = struct {
 
     pub const OneCell = union(enum) {
         ok: struct {
-            value: engine.value.ScalarValue,
+            /// The evaluator's result, WHOLE (M7a): a scalar, or the
+            /// matrix a dynamic-array anchor produced. §5.8a's
+            /// placement needs the tails and §5.6c's convergence
+            /// compares shapes and elements, so narrowing here — as
+            /// pre-M7a `scalarOf` did — would hand both of them a
+            /// top-left and call it the result.
+            value: engine.iterate.Snapshot,
             reads: engine.iterate.Reads,
-            /// The shape the evaluator produced, before `scalarOf`
-            /// narrowed it to a top-left. The computed layer does not
-            /// want it — a layer holds values — but §5.7.3's pre-M7 gate
-            /// is a statement about the shape, and by the time a
-            /// publication reaches the patcher the array is gone.
+            /// The result's shape, kept beside the value because the
+            /// recalc driver's `published` record wants it after the
+            /// snapshot has been consumed — §5.7.3's pre-M7 gate is a
+            /// statement about the shape.
             shape: engine.value.Shape = .{ .rows = 1, .cols = 1 },
         },
         refused: EvaluateResult,
@@ -1900,7 +1905,7 @@ pub const Workbook = struct {
         // §5.6e's runtime capture: what the body ACTUALLY read, which is
         // the only place a dynamic reference is visible.
         return .{ .ok = .{
-            .value = try cloneScalar(a, scalarOf(v)),
+            .value = try snapshotOf(a, v),
             .reads = .{
                 .cells = try a.dupe(engine.env.CellRef, evaluator.deps.cells.items),
                 .areas = try a.dupe(engine.env.RangeRef, evaluator.deps.areas.items),
@@ -8389,24 +8394,33 @@ fn cloneEvaluated(a: Allocator, v: engine.eval.Value) Error!engine.eval.Value {
     };
 }
 
-/// What a planned cell contributes to the computed layer.
-///
-/// An array result gives its top-left and spills nothing: modeling the
-/// tails is this row's, deciding what lands in them is M7a's.
-fn scalarOf(v: engine.eval.Value) engine.value.ScalarValue {
+/// What a planned cell contributes, WHOLE (M7a): the snapshot §5.8a's
+/// placement and §5.6c's convergence both consume. The pre-M7a
+/// `scalarOf` narrowed an array to its top-left here, which was the
+/// single point every host lost the tails at.
+fn snapshotOf(a: Allocator, v: engine.eval.Value) Error!engine.iterate.Snapshot {
     return switch (v) {
-        .scalar => |x| x,
-        .array => |m| m.cells[0],
-        .missing_arg => .blank,
+        .scalar => |x| .{ .scalar = try cloneScalar(a, x) },
+        .missing_arg => .{ .scalar = .blank },
+        .array => |m| blk: {
+            const out = engine.value.Matrix.init(a, m.rows, m.cols) catch |e| switch (e) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                // The evaluator built this matrix, so it is non-empty
+                // and inside §9's cap by construction.
+                error.EmptyMatrix, error.TooManyCells => unreachable,
+            };
+            for (m.cells, out.cells) |src, *dst| dst.* = try cloneScalar(a, src);
+            break :blk .{ .array = out };
+        },
         // `Evaluator.evaluate` dereferences a reference result before
         // returning, so one cannot arrive here.
         .reference => unreachable,
     };
 }
 
-/// The shape `scalarOf` throws away (M5d2). §5.7.3's pre-M7 gate refuses
-/// a non-1×1 result, and a publication that only carried the top-left
-/// would have nothing left to refuse.
+/// The shape a publication's record keeps (M5d2). §5.7.3's pre-M7 gate
+/// refuses a non-1×1 result, and a publication that only carried the
+/// top-left would have nothing left to refuse.
 fn shapeOf(v: engine.eval.Value) engine.value.Shape {
     return switch (v) {
         .array => |m| m.shape(),
@@ -8472,11 +8486,20 @@ pub const GraphBridge = struct {
                 previous = c;
                 if (shadowed) continue;
                 const text = c.formula_text orelse continue;
+                // §5.6c (M7a): a dynamic-array cell with NO declared
+                // range is a placer whose shape is not file-recoverable
+                // — in a cycle it takes the pre-iteration shape pass
+                // instead of a scalar seed. A resolver refusal is not
+                // decided here: the cell will meet it again at
+                // evaluation, where the diagnostic has a home.
+                const dynamic = c.array_ref == null and
+                    ((self.model.dialectResolver().dialectOf(c.cm, c.vm) catch .legacy) == .dynamic_array);
                 try cells.append(a, .{
                     .cell = .{ .sheet = idx, .row = c.row, .col = c.col },
                     .formula = text,
                     .cache = c.cache,
                     .array = c.array_ref,
+                    .dynamic_anchor = dynamic,
                 });
             }
         }
@@ -8677,6 +8700,17 @@ pub const WorkbookEnv = struct {
     calc: engine.calc.CalcState,
     /// `<sheetCalcPr>` per worksheet, in workbook order.
     sheet_calc: []engine.calc.SheetCalcPr,
+    /// §5.8a (M7a): the per-anchor spill outcomes. What `spillShape`
+    /// answers — a blocked anchor has NO extent, so `A1#` against it is
+    /// `#REF!` — and what tells the `#SPILL!` classes apart. The map's
+    /// storage is the model arena's; rollback empties it entry by entry
+    /// through `retractResult`.
+    spills: engine.spill.Registry = .{},
+    /// Per sheet, the merged ranges the decode boundary produced —
+    /// §5.8a's merge row.
+    sheet_merges: [][]const coords.Range,
+    /// Per sheet, the declared table rectangles — §5.8a's table row.
+    sheet_tables: [][]const coords.Range,
 
     /// One coordinate in one layer. `v` is null when the coordinate is
     /// *occupied by something with no value*: an uncached formula, a
@@ -8694,6 +8728,11 @@ pub const WorkbookEnv = struct {
         formula_text: ?[]const u8 = null,
         /// A legacy CSE array's declared range (M5a1's spill tails).
         array_ref: ?coords.Range = null,
+        /// §5.8a: a `.spill_tail` entry records the anchor that placed
+        /// it. Ownership is per cell, not inferred from geometry —
+        /// shrink clears exactly the tails carrying this anchor, and a
+        /// foreign tail obstructs because this field names someone else.
+        spill_anchor: ?engine.env.CellRef = null,
         /// What the `<v>` was, as §5.6c's seed table sees it. Kept
         /// alongside the value rather than derived from it: `blank` is
         /// what both an absent `<v>` and a genuine blank read as, and
@@ -8955,6 +8994,12 @@ pub const WorkbookEnv = struct {
         for (sheets) |*s| s.* = .{};
         const sheet_calc = try a.alloc(engine.calc.SheetCalcPr, wb.worksheets.len);
         for (sheet_calc) |*s| s.* = .{};
+        // §5.8a's geometry (M7a): merges from the decode boundary,
+        // table rectangles from the parts the loop below already reads.
+        const sheet_merges = try a.alloc([]const coords.Range, wb.worksheets.len);
+        for (sheet_merges) |*m| m.* = &.{};
+        const sheet_tables = try a.alloc([]const coords.Range, wb.worksheets.len);
+        for (sheet_tables) |*t| t.* = &.{};
 
         var builder = engine.Builder.init(allocator, opts.collation);
         defer builder.deinit();
@@ -9000,6 +9045,7 @@ pub const WorkbookEnv = struct {
             };
             defer scanned.deinit();
             cell_budget -= @intCast(scanned.cells.len);
+            sheet_merges[idx] = try a.dupe(coords.Range, scanned.merges);
 
             sheet_calc[idx] = switch (engine.calc.parseSheetCalcPr(part.bytes)) {
                 .ok => |c| c,
@@ -9035,6 +9081,7 @@ pub const WorkbookEnv = struct {
 
             // Tables live in their own parts, reached through the
             // sheet's `<tableParts>` rels.
+            var table_ranges: std.ArrayListUnmanaged(coords.Range) = .empty;
             var rids = TablePartRidIterator.init(part.bytes);
             const rels = wb.store.rels(part_name);
             while (rids.next()) |rid| {
@@ -9056,8 +9103,16 @@ pub const WorkbookEnv = struct {
                 if (try checkTableProducers(table, scanned.cells, formulas)) |r| {
                     return .{ .refused = .{ .names = r } };
                 }
+                // §5.8a's table row wants the rectangle. The spelling
+                // the symbol layer refuses is refused THERE — a range
+                // this parse cannot read is simply not a rectangle a
+                // spill can meet.
+                if (coords.parseRange(table.ref, .{ .dollar = .accept })) |r| {
+                    try table_ranges.append(a, r.normalized());
+                } else |_| {}
                 try builder.addTable(engine.env.SheetIndex.fromInt(idx), table);
             }
+            sheet_tables[idx] = try table_ranges.toOwnedSlice(a);
 
             // Staged deltas are the second layer. `setCell` has already
             // validated the ref, so a delta that will not parse here is
@@ -9091,6 +9146,8 @@ pub const WorkbookEnv = struct {
             .fidelity = opts.fidelity,
             .calc = calc,
             .sheet_calc = sheet_calc,
+            .sheet_merges = sheet_merges,
+            .sheet_tables = sheet_tables,
         };
         out.dialects = .{ .part = &out.meta, .role = .input };
         return .{ .ok = out };
@@ -9191,6 +9248,183 @@ pub const WorkbookEnv = struct {
         s.removeAt(at);
     }
 
+    // ─── §5.8a: the model half of spill placement (M7a) ────────────
+
+    fn spillHost(self: *WorkbookEnv) engine.spill.Host {
+        return .{ .ctx = self, .vtable = &spill_vtable };
+    }
+
+    const spill_vtable: engine.spill.Host.VTable = .{
+        .occupied = svOccupied,
+        .overlapsTable = svOverlapsTable,
+        .overlapsMerge = svOverlapsMerge,
+        .clearOwnTails = svClearOwnTails,
+        .placeTail = svPlaceTail,
+    };
+
+    fn svOccupied(ctx: *anyopaque, anchor: engine.env.CellRef, cell: engine.env.CellRef) engine.env.Error!bool {
+        const self = selfOf(ctx);
+        const s = try self.sheetConst(cell.sheet);
+        // Every layer at the coordinate, not the merged view: a stored
+        // formula shadowed by a computed value is still a formula, and a
+        // spill may not land on it.
+        var at = s.lowerBound(cell.row, cell.col, .computed);
+        while (s.at(at)) |c| : (at = s.next(at)) {
+            if (c.row != cell.row or c.col != cell.col) break;
+            if (c.layer == .spill_tail) {
+                // A FOREIGN tail is content; the anchor's own tails
+                // were cleared before the decision ran.
+                if (c.spill_anchor == null or !c.spill_anchor.?.eql(anchor)) return true;
+                continue;
+            }
+            // A formula is content wherever it is — the racing-anchor
+            // rule falls out of this line: the anchor later in calc
+            // order meets the earlier one's formula cell or its tails.
+            if (c.formula_text != null) return true;
+            if (c.v) |v| {
+                if (v != .blank) return true;
+            }
+            // `v == null` with no formula is a staged deletion, and a
+            // deleted cell is §5.8a's "empty"; `.blank` is a styled
+            // blank, empty the same way.
+        }
+        return false;
+    }
+
+    fn svOverlapsTable(ctx: *anyopaque, area: engine.env.RangeRef) bool {
+        const self = selfOf(ctx);
+        const i = area.sheet.toInt();
+        if (i >= self.sheet_tables.len) return false;
+        return engine.spill.overlapsAny(self.sheet_tables[i], area);
+    }
+
+    fn svOverlapsMerge(ctx: *anyopaque, area: engine.env.RangeRef) bool {
+        const self = selfOf(ctx);
+        const i = area.sheet.toInt();
+        if (i >= self.sheet_merges.len) return false;
+        return engine.spill.overlapsAny(self.sheet_merges[i], area);
+    }
+
+    fn svClearOwnTails(ctx: *anyopaque, anchor: engine.env.CellRef) void {
+        const self = selfOf(ctx);
+        const shape = self.spills.shapeOf(anchor) orelse return;
+        self.clearTailsIn(anchor, shape);
+    }
+
+    /// Remove `anchor`'s tails inside the extent `shape` names.
+    /// Infallible: both the protocol's clear-before-decide and the
+    /// rollback path call it, and neither may fail.
+    fn clearTailsIn(self: *WorkbookEnv, anchor: engine.env.CellRef, shape: engine.value.Shape) void {
+        const area = engine.spill.extent(anchor, shape) orelse return;
+        const s = self.sheetMut(anchor.sheet) catch return;
+        var off: u64 = 1;
+        const n = area.cellCount();
+        while (off < n) : (off += 1) {
+            const cell = area.cellAtOffset(off);
+            var at = s.lowerBound(cell.row, cell.col, .computed);
+            while (s.at(at)) |c| : (at = s.next(at)) {
+                if (c.row != cell.row or c.col != cell.col) break;
+                if (c.layer == .spill_tail and c.spill_anchor != null and c.spill_anchor.?.eql(anchor)) {
+                    s.removeAt(at);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn svPlaceTail(ctx: *anyopaque, anchor: engine.env.CellRef, cell: engine.env.CellRef, v: engine.value.ScalarValue) engine.env.Error!void {
+        const self = selfOf(ctx);
+        const s = try self.sheetMut(cell.sheet);
+        const a = self.arena.allocator();
+        try s.insert(a, .{
+            .row = cell.row,
+            .col = cell.col,
+            .layer = .spill_tail,
+            .v = try dupeValue(a, v, false),
+            .spill_anchor = anchor,
+        });
+    }
+
+    /// The model half of §5.8a. Scalars land in the computed layer as
+    /// before; a DYNAMIC-dialect anchor's array runs the decision table
+    /// and either spills — anchor top-left, owned tails — or holds
+    /// `#SPILL!` with the class recorded. Both directions clear the
+    /// anchor's previous extent first, so a shape change between passes
+    /// (grow, shrink, array to scalar) leaves no orphaned tail. Returns
+    /// the scalar the anchor's coordinate now reads, for hosts that
+    /// track publications.
+    ///
+    /// A LEGACY cell's array narrows to its top-left, exactly as every
+    /// pre-M7a host did: a legacy CSE's tails are its own STORED slave
+    /// cells — running the decision table over them would obstruct on
+    /// the anchor's own declared range — and §5.6h's declared-range
+    /// placement is not this milestone's. The dialect is the stored
+    /// cell's (§5.3b); a cell that evaluated at all resolved it already,
+    /// so the conservative arm here is unreachable in practice.
+    pub fn publishResult(
+        self: *WorkbookEnv,
+        cell: engine.env.CellRef,
+        v: engine.iterate.Snapshot,
+    ) engine.env.Error!engine.value.ScalarValue {
+        switch (v) {
+            .scalar => |s| {
+                svClearOwnTails(self, cell);
+                self.spills.forget(cell);
+                try self.putComputed(cell.sheet, cell.row, cell.col, s);
+                return s;
+            },
+            .array => |m| {
+                const dialect = self.evalEnv().dialectOf(cell) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => engine.value.Dialect.legacy,
+                };
+                if (dialect == .legacy) {
+                    svClearOwnTails(self, cell);
+                    self.spills.forget(cell);
+                    const top = m.topLeft();
+                    try self.putComputed(cell.sheet, cell.row, cell.col, top);
+                    return top;
+                }
+                // A failed publication retracts itself precisely: the
+                // journal only names cells that published successfully,
+                // so a half-placed spill cannot wait for a rollback that
+                // will never reach it. The new extent's tails are
+                // cleared by shape — the registry may still hold the
+                // OLD outcome at that point.
+                errdefer {
+                    self.clearTailsIn(cell, m.shape());
+                    self.spills.forget(cell);
+                    self.clearComputed(cell.sheet, cell.row, cell.col);
+                }
+                const outcome = try engine.spill.place(self.spillHost(), cell, m);
+                try self.spills.note(self.arena.allocator(), cell, outcome);
+                const anchor_value: engine.value.ScalarValue = switch (outcome) {
+                    .spilled => m.topLeft(),
+                    .blocked => engine.value.ScalarValue.errorOf(.spill),
+                };
+                try self.putComputed(cell.sheet, cell.row, cell.col, anchor_value);
+                return anchor_value;
+            },
+        }
+    }
+
+    /// One publication, undone — tails, outcome record and computed
+    /// value together, which is what "tail mutations ride the
+    /// transaction" means on the rollback side. Infallible for §5.6c's
+    /// zero-mutation promise, like `clearComputed`.
+    pub fn retractResult(self: *WorkbookEnv, cell: engine.env.CellRef) void {
+        svClearOwnTails(self, cell);
+        self.spills.forget(cell);
+        self.clearComputed(cell.sheet, cell.row, cell.col);
+    }
+
+    /// §5.8a's class record, for fixtures and diagnostics: which
+    /// `#SPILL!` row blocked `cell`, or null when it spilled or never
+    /// placed.
+    pub fn spillClassOf(self: *const WorkbookEnv, cell: engine.env.CellRef) ?engine.spill.Class {
+        return self.spills.classOf(cell);
+    }
+
     pub fn evalEnv(self: *WorkbookEnv) engine.env.EvalEnv {
         return .{ .ctx = self, .vtable = &vtable };
     }
@@ -9241,21 +9475,32 @@ pub const WorkbookEnv = struct {
         const self = selfOf(ctx);
         const s = try self.sheetConst(cell.sheet);
         const r = self.dialectResolver();
+        // Dialect is a STORED-cell property (§5.3b), so run-produced
+        // layers are skipped: a computed entry carries `cm = 0`, and
+        // reading it would flip an iterating dynamic-array anchor to
+        // legacy on its second pass (M7a).
+        var at = s.lowerBound(cell.row, cell.col, .computed);
+        while (s.at(at)) |c| : (at = s.next(at)) {
+            if (c.row != cell.row or c.col != cell.col) break;
+            if (c.layer == .computed or c.layer == .spill_tail) continue;
+            return r.dialectOf(c.cm, c.vm);
+        }
         // An unoccupied coordinate carries no metadata, which is what
         // `cm = 0` means — the resolver answers it the same way it
         // answers an unmarked stored cell.
-        const m = merged(s, cell.row, cell.col) orelse return r.dialectOf(0, 0);
-        return r.dialectOf(m.cm, m.vm);
+        return r.dialectOf(0, 0);
     }
 
-    /// No stored spill state exists before M7a: a spill's extent is not
-    /// recoverable from cached `<v>` values, and inventing one would
-    /// make `A1#` resolve to a guess. Null is the honest answer, and it
-    /// is the same answer `A1#` against a non-anchor gets.
+    /// §5.8a's stored spill state (M7a). A cache-based read still
+    /// answers null — a spill's extent is not recoverable from cached
+    /// `<v>` values — but a run that PLACED a spill this session has
+    /// the extent in the registry, and that is what `A1#` resolves
+    /// through. A blocked anchor answers null like a non-anchor: `A1#`
+    /// against it is `#REF!` (M3a2's spec-pinned row).
     fn vtSpillShape(ctx: *anyopaque, cell: engine.env.CellRef) engine.env.Error!?engine.value.Shape {
         const self = selfOf(ctx);
         _ = try self.sheetConst(cell.sheet);
-        return null;
+        return self.spills.shapeOf(cell);
     }
 
     fn vtResolveSheet(ctx: *anyopaque, name: []const u8) engine.env.Error!?engine.env.SheetIndex {
@@ -17244,6 +17489,317 @@ test "M4b3: a table producer whose member cell has no <f> refuses" {
     var env = try expectBuilt(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
     defer env.deinit();
     try std.testing.expectEqual(@as(usize, 1), env.symbols.tables.len);
+}
+
+// ─── M7a: §5.8a in the model — placement, ownership, classes ─────
+
+const m7a_metadata_da =
+    "<metadata xmlns=\"" ++ test_ns_main ++ "\" xmlns:xda=\"http://schemas.microsoft.com/office/spreadsheetml/2017/dynamicarray\">" ++
+    "<metadataTypes count=\"1\"><metadataType name=\"XLDAPR\" minSupportedVersion=\"120000\" copy=\"1\" pasteAll=\"1\" pasteValues=\"1\" merge=\"1\" splitFirst=\"1\" rowColShift=\"1\" clearFormats=\"1\" clearComments=\"1\" assign=\"1\" coerce=\"1\" cellMeta=\"1\"/></metadataTypes>" ++
+    "<futureMetadata name=\"XLDAPR\" count=\"1\"><bk><extLst><ext uri=\"{bdbb8cdc-fa1e-496e-a857-3c3f30c029c3}\">" ++
+    "<xda:dynamicArrayProperties fDynamic=\"1\" fCollapsed=\"0\"/></ext></extLst></bk></futureMetadata>" ++
+    "<cellMetadata count=\"1\"><bk><rc t=\"1\" v=\"0\"/></bk></cellMetadata></metadata>";
+
+const ct_metadata_part = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml";
+
+fn m7aCell(a1: []const u8) engine.env.CellRef {
+    const c = coords.parseCell(a1, .{ .dollar = .accept }) catch unreachable;
+    return .{ .sheet = engine.env.SheetIndex.fromInt(0), .row = c.row, .col = c.col };
+}
+
+fn m7aMatrix(a: Allocator, rows: u32, cols: u32, base: f64) !engine.value.Matrix {
+    const m = try engine.value.Matrix.init(a, rows, cols);
+    for (m.cells, 0..) |*cell, i| {
+        cell.* = engine.value.ScalarValue.fromNumber(base + @as(f64, @floatFromInt(i)));
+    }
+    return m;
+}
+
+test "M7a: §5.8a's decision table over a real workbook, each class recorded" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // Anchors carry `cm="1"` → XLDAPR → dynamic dialect; B6 is the
+    // obstruction; D5:E6 is merged; the table sits at G1:H4.
+    const sheet =
+        "<?xml version=\"1.0\"?><worksheet xmlns=\"" ++ test_ns_main ++ "\"><sheetData>" ++
+        "<row r=\"1\"><c r=\"A1\" cm=\"1\"><v>0</v></c><c r=\"B1\" cm=\"1\"><v>0</v></c>" ++
+        "<c r=\"F1\" cm=\"1\"><v>0</v></c><c r=\"XFD1\" cm=\"1\"><v>0</v></c></row>" ++
+        "<row r=\"5\"><c r=\"B5\" cm=\"1\"><v>0</v></c><c r=\"D5\" cm=\"1\"><v>0</v></c></row>" ++
+        "<row r=\"6\"><c r=\"B6\"><v>7</v></c></row>" ++
+        "</sheetData>" ++
+        "<mergeCells count=\"1\"><mergeCell ref=\"D5:E6\"/></mergeCells>" ++
+        "<tableParts count=\"1\"><tablePart r:id=\"rIdT1\"/></tableParts>" ++
+        "</worksheet>";
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+    defer wb.deinit();
+    try wb.store.addPart(
+        "xl/tables/table1.xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml",
+        "<?xml version=\"1.0\"?><table xmlns=\"" ++ test_ns_main ++
+            "\" id=\"1\" name=\"T\" displayName=\"T\" ref=\"G1:H4\"><tableColumns count=\"2\">" ++
+            "<tableColumn id=\"1\" name=\"In\"/><tableColumn id=\"2\" name=\"Out\"/>" ++
+            "</tableColumns></table>",
+    );
+    try wb.store.addPart(
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "application/vnd.openxmlformats-package.relationships+xml",
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>",
+    );
+    try wb.store.replacePart(
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+            "<Relationship Id=\"rIdT1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/table\" Target=\"../tables/table1.xml\"/>" ++
+            "</Relationships>",
+    );
+    try wb.store.addPart("xl/metadata.xml", ct_metadata_part, m7a_metadata_da);
+
+    var env = try expectBuilt(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(ta);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const read = env.evalEnv();
+
+    // Row 1 — fits + owned/empty spills: the anchor reads the
+    // top-left, every tail is readable through the merged view, and
+    // `spillShape` answers the extent.
+    const b1 = m7aCell("B1");
+    const got = try env.publishResult(b1, .{ .array = try m7aMatrix(a, 2, 2, 1) });
+    try std.testing.expectEqual(@as(f64, 1), got.number);
+    try std.testing.expect(env.spillClassOf(b1) == null);
+    const shape = (try read.spillShape(b1)).?;
+    try std.testing.expectEqual(@as(u32, 2), shape.rows);
+    try std.testing.expectEqual(@as(u32, 2), shape.cols);
+    try std.testing.expectEqual(@as(f64, 4), (try read.cellValue(m7aCell("C2"))).number);
+
+    // Row 2 — foreign non-empty is (obstruction): B5's 2×1 meets B6=7.
+    const b5 = m7aCell("B5");
+    const blocked = try env.publishResult(b5, .{ .array = try m7aMatrix(a, 2, 1, 1) });
+    try std.testing.expectEqual(engine.value.KnownError.spill, blocked.err.known);
+    try std.testing.expectEqual(engine.spill.Class.obstruction, env.spillClassOf(b5).?);
+    try std.testing.expect((try read.spillShape(b5)) == null);
+    // …and the obstruction itself is untouched.
+    try std.testing.expectEqual(@as(f64, 7), (try read.cellValue(m7aCell("B6"))).number);
+
+    // Row 3 — the sheet edge: XFD1 has no second column to spill into.
+    const xfd1 = m7aCell("XFD1");
+    _ = try env.publishResult(xfd1, .{ .array = try m7aMatrix(a, 1, 2, 1) });
+    try std.testing.expectEqual(engine.spill.Class.edge, env.spillClassOf(xfd1).?);
+
+    // Row 4 — a declared table blocks: F1's 1×2 reaches G1.
+    const f1 = m7aCell("F1");
+    _ = try env.publishResult(f1, .{ .array = try m7aMatrix(a, 1, 2, 1) });
+    try std.testing.expectEqual(engine.spill.Class.table, env.spillClassOf(f1).?);
+
+    // Row 5 — a merged range blocks: D5's 2×1 sits on D5:E6.
+    const d5 = m7aCell("D5");
+    _ = try env.publishResult(d5, .{ .array = try m7aMatrix(a, 2, 1, 1) });
+    try std.testing.expectEqual(engine.spill.Class.merge, env.spillClassOf(d5).?);
+
+    // Ownership — shrink clears own tails from every subsequent read.
+    _ = try env.publishResult(b1, .{ .array = try m7aMatrix(a, 2, 1, 10) });
+    try std.testing.expectEqual(@as(f64, 11), (try read.cellValue(m7aCell("B2"))).number);
+    try std.testing.expect((try read.cellValue(m7aCell("C1"))) == .blank);
+    try std.testing.expect((try read.cellValue(m7aCell("C2"))) == .blank);
+    try std.testing.expectEqual(@as(u32, 1), (try read.spillShape(b1)).?.cols);
+
+    // …grow re-places over the freed cells.
+    _ = try env.publishResult(b1, .{ .array = try m7aMatrix(a, 1, 3, 20) });
+    try std.testing.expectEqual(@as(f64, 22), (try read.cellValue(m7aCell("D1"))).number);
+    try std.testing.expect((try read.cellValue(m7aCell("B2"))) == .blank);
+
+    // Racing anchors resolve in calc order: A1's 1×3 now meets B1 —
+    // an anchor's own coordinate is content — and blocks without
+    // touching B1's spill.
+    const a1 = m7aCell("A1");
+    _ = try env.publishResult(a1, .{ .array = try m7aMatrix(a, 1, 3, 1) });
+    try std.testing.expectEqual(engine.spill.Class.obstruction, env.spillClassOf(a1).?);
+    try std.testing.expectEqual(@as(u32, 3), (try read.spillShape(b1)).?.cols);
+
+    // An OVERWRITTEN TAIL obstructs the next placement: a foreign
+    // publication lands where B1's tail sits, and B1's re-place meets
+    // it — after clearing its own previous tails, so the obstruction it
+    // finds is genuinely the newcomer.
+    _ = try env.publishResult(m7aCell("C1"), .{ .scalar = engine.value.ScalarValue.fromNumber(99) });
+    _ = try env.publishResult(b1, .{ .array = try m7aMatrix(a, 1, 3, 30) });
+    try std.testing.expectEqual(engine.spill.Class.obstruction, env.spillClassOf(b1).?);
+    try std.testing.expect((try read.spillShape(b1)) == null);
+    try std.testing.expectEqual(@as(f64, 99), (try read.cellValue(m7aCell("C1"))).number);
+    // The newcomer retracted, the same rectangle spills again.
+    env.retractResult(m7aCell("C1"));
+    _ = try env.publishResult(b1, .{ .array = try m7aMatrix(a, 1, 3, 20) });
+    try std.testing.expectEqual(@as(u32, 3), (try read.spillShape(b1)).?.cols);
+
+    // ANCHOR-ERROR: an anchor whose next result is an error scalar
+    // stops owning anything — the error rides the same clear-first path
+    // as any scalar, and the freed cells read blank again.
+    _ = try env.publishResult(b1, .{ .scalar = engine.value.ScalarValue.errorOf(.ref) });
+    try std.testing.expect((try read.spillShape(b1)) == null);
+    try std.testing.expect(env.spillClassOf(b1) == null);
+    try std.testing.expectEqual(engine.value.KnownError.ref, (try read.cellValue(b1)).err.known);
+    try std.testing.expect((try read.cellValue(m7aCell("C1"))) == .blank);
+    try std.testing.expect((try read.cellValue(m7aCell("D1"))) == .blank);
+
+    // Retract undoes the whole publication — tails, record, value.
+    env.retractResult(b5);
+    try std.testing.expect(env.spillClassOf(b5) == null);
+    try std.testing.expect((try read.cellValue(b5)) == .blank or (try read.cellValue(b5)) == .number);
+}
+
+test "M7a: A1# resolves the owner's current extent, against stored cells" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const sheet =
+        "<?xml version=\"1.0\"?><worksheet xmlns=\"" ++ test_ns_main ++ "\"><sheetData>" ++
+        "<row r=\"1\"><c r=\"A1\" cm=\"1\"><f>SEQUENCE(3)</f><v>0</v></c></row>" ++
+        "</sheetData></worksheet>";
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+    defer wb.deinit();
+    try wb.store.addPart("xl/metadata.xml", ct_metadata_part, m7a_metadata_da);
+
+    // The anchor spills A1:A3 in the closure; `A1#` names that extent.
+    var summed = try wb.evaluateClosure(ta, 0, "SUM(A1#)", .{ .collation = test_collation });
+    defer summed.deinit();
+    try std.testing.expectEqual(@as(f64, 6), summed.ok.value.scalar.number);
+
+    // Bare `A1#` dereferences to the whole rectangle.
+    var whole = try wb.evaluateClosure(ta, 0, "A1#", .{ .collation = test_collation });
+    defer whole.deinit();
+    try std.testing.expectEqual(@as(u32, 3), whole.ok.value.array.rows);
+    try std.testing.expectEqual(@as(f64, 3), whole.ok.value.array.at(2, 0).number);
+
+    // A range dependent sees the tails the same run placed — §5.6a's
+    // same-run spill-grow visibility.
+    var range = try wb.evaluateClosure(ta, 0, "SUM(A1:A9)", .{ .collation = test_collation });
+    defer range.deinit();
+    try std.testing.expectEqual(@as(f64, 6), range.ok.value.scalar.number);
+
+    // `A1#` against a NON-anchor is `#REF!` (M3a2's spec-pinned row).
+    var not_anchor = try wb.evaluateClosure(ta, 0, "SUM(B9#)", .{ .collation = test_collation });
+    defer not_anchor.deinit();
+    try std.testing.expectEqual(engine.value.KnownError.ref, not_anchor.ok.value.scalar.err.known);
+}
+
+test "M7a: the spill extent follows the data, and an obstructed anchor answers #SPILL!" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // A1's extent is B1's number: the same formula, two workbooks, two
+    // extents — what "the owner's CURRENT spill extent" means.
+    inline for (.{ .{ "2", 3.0 }, .{ "4", 10.0 } }) |case| {
+        const sheet =
+            "<?xml version=\"1.0\"?><worksheet xmlns=\"" ++ test_ns_main ++ "\"><sheetData>" ++
+            "<row r=\"1\"><c r=\"A1\" cm=\"1\"><f>SEQUENCE(B1)</f><v>0</v></c>" ++
+            "<c r=\"B1\"><v>" ++ case[0] ++ "</v></c></row>" ++
+            "</sheetData></worksheet>";
+        var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+        defer wb.deinit();
+        try wb.store.addPart("xl/metadata.xml", ct_metadata_part, m7a_metadata_da);
+
+        var r = try wb.evaluateClosure(ta, 0, "SUM(A1:A9)", .{ .collation = test_collation });
+        defer r.deinit();
+        try std.testing.expectEqual(@as(f64, case[1]), r.ok.value.scalar.number);
+    }
+
+    // An anchor whose rectangle meets a stored value answers `#SPILL!`
+    // end to end.
+    const blocked_sheet =
+        "<?xml version=\"1.0\"?><worksheet xmlns=\"" ++ test_ns_main ++ "\"><sheetData>" ++
+        "<row r=\"1\"><c r=\"A1\" cm=\"1\"><f>SEQUENCE(3)</f><v>0</v></c></row>" ++
+        "<row r=\"2\"><c r=\"A2\"><v>5</v></c></row>" ++
+        "</sheetData></worksheet>";
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = blocked_sheet }}, null);
+    defer wb.deinit();
+    try wb.store.addPart("xl/metadata.xml", ct_metadata_part, m7a_metadata_da);
+
+    var r = try wb.evaluateClosure(ta, 0, "A1", .{ .collation = test_collation });
+    defer r.deinit();
+    try std.testing.expectEqual(engine.value.KnownError.spill, r.ok.value.scalar.err.known);
+    // The obstruction itself still reads its stored value.
+    var kept = try wb.evaluateClosure(ta, 0, "A2", .{ .collation = test_collation });
+    defer kept.deinit();
+    try std.testing.expectEqual(@as(f64, 5), kept.ok.value.scalar.number);
+}
+
+test "M7a: a legacy cell's array still narrows — placement is the dynamic dialect's" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // No metadata part: every cell is legacy, which is what a workbook
+    // without the part actually is. The same SEQUENCE narrows to its
+    // top-left exactly as every pre-M7a host behaved.
+    const sheet =
+        "<?xml version=\"1.0\"?><worksheet xmlns=\"" ++ test_ns_main ++ "\"><sheetData>" ++
+        "<row r=\"1\"><c r=\"A1\"><f>SEQUENCE(3)</f><v>0</v></c></row>" ++
+        "</sheetData></worksheet>";
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+    defer wb.deinit();
+
+    var top = try wb.evaluateClosure(ta, 0, "A1", .{ .collation = test_collation });
+    defer top.deinit();
+    try std.testing.expectEqual(@as(f64, 1), top.ok.value.scalar.number);
+
+    var range = try wb.evaluateClosure(ta, 0, "SUM(A1:A3)", .{ .collation = test_collation });
+    defer range.deinit();
+    try std.testing.expectEqual(@as(f64, 1), range.ok.value.scalar.number);
+
+    // A legacy anchor owns no extent: `A1#` is `#REF!`.
+    var spill_ref = try wb.evaluateClosure(ta, 0, "SUM(A1#)", .{ .collation = test_collation });
+    defer spill_ref.deinit();
+    try std.testing.expectEqual(engine.value.KnownError.ref, spill_ref.ok.value.scalar.err.known);
+}
+
+test "M7a: @ applies §5.3b's implicit intersection against stored cells" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const sheet =
+        "<?xml version=\"1.0\"?><worksheet xmlns=\"" ++ test_ns_main ++ "\"><sheetData>" ++
+        "<row r=\"1\"><c r=\"B1\"><v>10</v></c></row>" ++
+        "<row r=\"2\"><c r=\"B2\"><v>20</v></c></row>" ++
+        "<row r=\"3\"><c r=\"B3\"><v>30</v></c></row>" ++
+        "</sheetData></worksheet>";
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+    defer wb.deinit();
+
+    const site2 = m7aCell("D2");
+    // A column vector intersects the evaluation ROW.
+    var v = try wb.evaluate(ta, 0, "@B1:B3", .{
+        .collation = test_collation,
+        .site = .{ .row = site2.row, .col = site2.col },
+    });
+    defer v.deinit();
+    try std.testing.expectEqual(@as(f64, 20), v.ok.value.scalar.number);
+
+    // The single-cell exception precedes intersection: `@B1` is B1
+    // whatever the site's row.
+    var single = try wb.evaluate(ta, 0, "@B1", .{
+        .collation = test_collation,
+        .site = .{ .row = site2.row, .col = site2.col },
+    });
+    defer single.deinit();
+    try std.testing.expectEqual(@as(f64, 10), single.ok.value.scalar.number);
+
+    // No shared axis is `#VALUE!`.
+    const site9 = m7aCell("D9");
+    var off = try wb.evaluate(ta, 0, "@B1:B3", .{
+        .collation = test_collation,
+        .site = .{ .row = site9.row, .col = site9.col },
+    });
+    defer off.deinit();
+    try std.testing.expectEqual(engine.value.KnownError.value, off.ok.value.scalar.err.known);
 }
 
 test "checkAllAllocationFailures: evaluate leaks nothing, and still mutates nothing" {

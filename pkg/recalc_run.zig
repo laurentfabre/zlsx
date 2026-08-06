@@ -608,11 +608,11 @@ const Driver = struct {
                 break :blk .{ .refused = plane };
             },
             .ok => |x| blk: {
-                // Recorded here rather than in `publish` because the
-                // shape does not survive the `Snapshot` the engine
-                // hands back: an array publishes its top-left.
+                // Recorded here rather than in `publish` because a cell
+                // can be evaluated and never published (a refusal
+                // between the two), and the gate still wants its shape.
                 self.noteShape(cell, x.shape) catch return error.OutOfMemory;
-                break :blk .{ .ok = .{ .value = .{ .scalar = x.value }, .reads = x.reads } };
+                break :blk .{ .ok = .{ .value = x.value, .reads = x.reads } };
             },
         };
     }
@@ -636,25 +636,26 @@ const Driver = struct {
         v: engine.iterate.Snapshot,
     ) error{OutOfMemory}!void {
         const self = of(ctx);
-        // §5.3b: an array's readable value at its anchor is its
-        // top-left. Its shape is already in `published` from `evaluate`,
-        // which is what the pre-M7 gate reads.
-        const scalar = switch (v) {
-            .scalar => |s| s,
-            .array => |m| m.topLeft(),
-        };
-        self.model.putComputed(cell.sheet, cell.row, cell.col, scalar) catch |e| switch (e) {
+        // §5.8a (M7a): the model half decides placement — a spilled
+        // array's anchor reads its top-left with owned tails placed, a
+        // blocked one reads `#SPILL!` with the class recorded. The
+        // shape in `published` is still `evaluate`'s, which is what the
+        // pre-M7 persistence gate reads.
+        const scalar = self.model.publishResult(cell, v) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => self.failure = Error.SheetNotFound,
+            else => blk: {
+                self.failure = Error.SheetNotFound;
+                break :blk engine.value.ScalarValue.blank;
+            },
         };
         if (self.published_at.get(cell)) |i| {
             const p = &self.published.items[i];
             p.value = scalar;
             p.has_value = true;
-            // `shape` is deliberately not touched: the snapshot the
-            // engine hands back is already narrowed to a scalar, and
-            // the entry `evaluate` made carries the shape the gate
-            // needs.
+            // `shape` is deliberately not touched: the entry `evaluate`
+            // made carries the result's shape, and that — not the
+            // scalar the anchor's coordinate reads — is what the
+            // pre-M7 gate refuses on.
             return;
         }
         try self.track(.{
@@ -671,7 +672,7 @@ const Driver = struct {
     /// write values the run decided not to keep.
     fn vtRetract(ctx: *anyopaque, cell: engine.env.CellRef) void {
         const self = of(ctx);
-        self.model.clearComputed(cell.sheet, cell.row, cell.col);
+        self.model.retractResult(cell);
         const found = self.published_at.fetchRemove(cell) orelse return;
         const at = found.value;
         _ = self.published.orderedRemove(at);
@@ -1712,6 +1713,19 @@ test "pre-M7 gate: a dynamic-array anchor refuses with zero mutation" {
     try expectGateRefusal(.{
         .sheet = "<worksheet xmlns=\"" ++ ns_main ++ "\"><sheetData><row r=\"1\">" ++
             "<c r=\"A1\" cm=\"1\"><f t=\"array\" ref=\"A1\">1+1</f><v>999</v></c>" ++
+            "</row></sheetData></worksheet>",
+        .metadata = metadata_dynamic_array,
+    });
+}
+
+test "pre-M7 gate: a spill the MODEL placed still refuses persistence (M7a regression)" {
+    // M7a places tails in the model — this run's SEQUENCE(3) spills
+    // A1:A3 before staging is reached — and §5.8b's approved mutation
+    // set is still M7b1's: the persist half stays closed, with zero
+    // mutation, exactly as before placement existed.
+    try expectGateRefusal(.{
+        .sheet = "<worksheet xmlns=\"" ++ ns_main ++ "\"><sheetData><row r=\"1\">" ++
+            "<c r=\"A1\" cm=\"1\"><f>SEQUENCE(3)</f><v>0</v></c>" ++
             "</row></sheetData></worksheet>",
         .metadata = metadata_dynamic_array,
     });
