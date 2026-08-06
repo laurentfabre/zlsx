@@ -40,15 +40,21 @@
 //! does not: `<c r="A1" s="3"/>` carries no value and still occupies the
 //! bytes a new `<c r="A1">` would need.
 //!
-//! What this row does NOT do
-//! -------------------------
-//! Inserting a `<c>` the part does not have is outside the approved
-//! mutation set (§5.8b): it would leave `<row spans>` and `<dimension>`
-//! describing a sheet that no longer exists, and those maintenances are
-//! M7b1's with their own byte-diffed proofs. The projection still
-//! *carries* such a publication — `ResolvedSheet.appends` — because the
-//! serializer path (M5c) will want it; the patcher refuses rather than
-//! dropping it, so a staged delta can never go missing quietly.
+//! The approved mutation set (§5.8b, M7b1)
+//! ---------------------------------------
+//! M5b1's kinds — `<v>`+`t` — plus four §5.8b additions: the anchor's
+//! `f@ref` value, owned tail `<c>` create and clear, and `<dimension
+//! ref>` expansion when created tails extend the used range. The DA
+//! path that would USE the additions is gated per-transition by
+//! `spill_transitions`: a row passes only against a committed
+//! byte-diffed Excel-authored reference, refuses
+//! `FormulaSpillPersistUnsupported` otherwise, and every row refuses
+//! today. A covered legacy CSE passes with `<v>`+`t` alone. A `.plain`
+//! publication with no `<c>` to land on still refuses — the projection
+//! *carries* it (`ResolvedSheet.appends`) because the serializer path
+//! (M5c) will want it, and refusing beats dropping it quietly. Only an
+//! OWNED tail (`Role.spill_tail`) may become a created `<c>`, and only
+//! under its anchor's proven row.
 //!
 //! The transition table is normative and shared
 //! --------------------------------------------
@@ -74,6 +80,7 @@ const coords = @import("zlsx_refs");
 const calc = @import("calc.zig");
 const decode = @import("decode.zig");
 const parser = @import("parser.zig");
+const spill = @import("spill.zig");
 const value = @import("value.zig");
 
 /// §10's plane-2 taxonomy has exactly one home; this file pays the same
@@ -89,26 +96,77 @@ pub const Refusal = struct {
     /// Set when the refusal is about one cell, which is all of them
     /// except the projection-wide ones.
     cell: ?CellSite = null,
+    /// The §5.8b transition row the refusal is about, when it is about
+    /// one — a diagnostic that names WHICH byte-diffed reference is
+    /// missing is one someone can act on.
+    transition: ?SpillTransition.Id = null,
 
     pub const Reason = enum {
-        // ── the pre-M7 spill gate (§5.7.3) ──
-        /// The staged result is not 1×1. Persisting it means writing the
-        /// tail cells it spills into, and the mutation set that covers
-        /// those is M7b1's.
+        // ── the spill gate (§5.7.3 / §5.8b) ──
+        /// The staged result is not 1×1 and the target is not an array
+        /// formula: an ordinary cell publishing an array has no declared
+        /// or placed region to persist into.
         non_scalar_result,
         /// The target's `<f t="array" ref=…>` is a dynamic-array anchor
-        /// (M4a resolved its `cm`/`vm` to the DA dialect). Its cached
-        /// value and its spill region are one construct; writing half of
-        /// it is what §5.8b refuses until the other half is proven.
+        /// (M4a resolved its `cm`/`vm` to the DA dialect) staged WITHOUT
+        /// the model's placement outcome. The patcher never reconstructs
+        /// a placement the model already made (§5.8b), so a role-less DA
+        /// anchor refuses generically.
         dynamic_array_anchor,
-        /// The target's `<f t="array" ref=…>` is a legacy CSE array. The
-        /// same reason, one dialect over: the declared range is part of
-        /// the result.
-        cse_array,
-        /// The publication lands where the part has no `<c>` at all.
-        /// Inserting one is outside the approved mutation set until
-        /// `<row spans>` and `<dimension>` maintenance is proven (M7b1).
+        /// A DA transition row exists for this shape and no committed
+        /// byte-diffed Excel reference pins it (§5.8b). `transition`
+        /// names the row; the missing-reference list is
+        /// `missingReferences()`.
+        transition_unproven,
+        /// The target carries `c@vm`. Value metadata is something this
+        /// engine has never been shown (M4a decision 6), and writing a
+        /// cached value under it would publish beneath semantics we
+        /// cannot read. Permanent, not unlockable by reference.
+        value_metadata_write,
+        /// The target's `<f t="array" ref=…>` is a legacy CSE anchor and
+        /// the projection does not cover its declared range on existing
+        /// `<c>`s — persisting the anchor alone would leave the slaves'
+        /// cached values contradicting it. Also the anchor-not-at-TL
+        /// shape, which is the same statement about a different corner.
+        cse_range_mismatch,
+        /// A CSE anchor's `ref` does not parse as a range. The model
+        /// refuses this at build; a standalone projection meets it here.
+        cse_ref_unparseable,
+        /// The publication lands where the part has no `<c>` at all and
+        /// is not an owned spill tail. Inserting one is outside the
+        /// approved mutation set (§5.8b names only the OWNED tail).
         cell_insertion_unsupported,
+
+        // ── tail geometry the approved set cannot address ──
+        /// An owned tail lands in a row the part has no `<row>` element
+        /// for (or has two of). Creating a `<row>` is a mutation §5.8b
+        /// does not name.
+        tail_row_missing,
+        /// The enclosing `<row>` is self-closing; giving it content is
+        /// a reopen §5.8b does not name.
+        tail_row_self_closing,
+        /// The enclosing `<row>` declares `spans` that would not cover
+        /// the created `<c>`, and spans maintenance is not in the
+        /// approved set — a stale hint we will not write and will not
+        /// leave behind.
+        tail_row_spans_stale,
+        /// A spill extends the used range and the `<dimension ref>` is
+        /// not a canonical parseable range to expand — §5.8b: such a
+        /// spill refuses until the maintenance can be performed.
+        dimension_unparseable,
+        /// The DA anchor has no `ref` attribute to rewrite, or one that
+        /// does not parse — the file's own record of the prior extent
+        /// is the one thing tail clears derive from.
+        anchor_ref_unusable,
+        /// A tail publication whose anchor is not in the projection as
+        /// a DA anchor. Half a construct; the other half is what makes
+        /// a tail writable at all.
+        tail_without_anchor,
+        /// A coordinate the anchor's stored `ref` claims as a tail
+        /// holds a formula, or is simultaneously a staged target —
+        /// clearing either would remove content the ownership record
+        /// does not actually own.
+        tail_clear_foreign,
 
         // ── shapes a patch cannot be confined over ──
         /// Two `<c>` claim one coordinate. `scanSheet` refuses that
@@ -142,10 +200,20 @@ pub const Refusal = struct {
         return switch (self.reason) {
             .non_scalar_result,
             .dynamic_array_anchor,
-            .cse_array,
+            .transition_unproven,
+            .value_metadata_write,
+            .cse_range_mismatch,
             .cell_insertion_unsupported,
+            .tail_row_missing,
+            .tail_row_self_closing,
+            .tail_row_spans_stale,
+            .dimension_unparseable,
+            .anchor_ref_unusable,
+            .tail_without_anchor,
+            .tail_clear_foreign,
             => .FormulaSpillPersistUnsupported,
 
+            .cse_ref_unparseable,
             .duplicate_cell_slot,
             .duplicate_publication,
             .ambiguous_cell_content,
@@ -196,6 +264,24 @@ pub const Publication = struct {
     /// value looks like; it names *which* of the two array refusals a
     /// `t="array"` target takes.
     dialect: value.Dialect = .legacy,
+    /// What the model decided about this publication's placement —
+    /// carried, never re-decided here (§5.8b: `stage()` persists what
+    /// the model placed). `.plain` is every scalar result and setCell;
+    /// the staging layer fills the other arms from `spill.Registry`.
+    role: Role = .plain,
+};
+
+/// A publication's placement role (§5.8b).
+pub const Role = union(enum) {
+    plain,
+    /// A dynamic-array anchor, with the outcome the model placed. A DA
+    /// anchor staged WITHOUT its outcome (`.plain`) refuses generically
+    /// — the patcher will not reconstruct a placement the model already
+    /// made.
+    da_anchor: spill.Outcome,
+    /// A tail cell owned by the anchor at (`row`, `col`) — persisted
+    /// only through the anchor's own transition.
+    spill_tail: struct { row: coords.Row, col: coords.Col },
 };
 
 /// The staged set, foldable into a projection exactly once.
@@ -231,6 +317,13 @@ pub const Target = struct {
     /// What the cell contributed to the merged view before the patch, so
     /// a round-trip has both of its ends in one place.
     was: decode.InputCell,
+    /// `c@cm` / `c@vm` as scanned (0 = absent). Carried for the gate: a
+    /// `vm` names value metadata this engine has never been shown (M4a
+    /// decision 6), and writing under one refuses HERE too, because a
+    /// setCell publication reaches the patcher without ever meeting the
+    /// resolver.
+    cm: u32 = 0,
+    vm: u32 = 0,
 };
 
 /// **Lifetime**: a projection borrows both of its inputs. `source` is
@@ -246,19 +339,46 @@ pub const ResolvedSheet = struct {
     /// coordinate.
     targets: []const Target,
     /// Publications with no `<c>` to land on, ascending by coordinate.
-    /// Carried, never patched — see the module header.
+    /// A `.plain` append is carried, never patched — see the module
+    /// header. A `.spill_tail` append is the one shape M7b1 may turn
+    /// into a created `<c>`, and only under its anchor's proven
+    /// transition.
     appends: []const Publication,
+    /// The scan's slots, borrowed like `source` — an owned tail the
+    /// file stored and this run's shrink clears is not a target, so its
+    /// bytes are findable only here (M7b1).
+    slots: []const decode.CellSlot,
+    /// The scan's row geometry, borrowed like `source` — a created
+    /// `<c>` is confined by it (M7b1).
+    rows: []const decode.RowSlot,
+    /// The scan's `<dimension>` coordinates, or null when the part has
+    /// none.
+    dimension: ?decode.DimensionSpans,
 
     pub fn deinit(self: *ResolvedSheet) void {
         self.arena.deinit();
         self.* = undefined;
     }
 
-    /// The target at a coordinate, or null. Linear because a projection
-    /// stages the cells one run touched, not the sheet.
+    /// The target at a coordinate, or null. Binary over the projection's
+    /// coordinate order — the CSE coverage gate asks this once per
+    /// declared cell, and a declared range is bounded only by
+    /// `max_matrix_cells`.
     pub fn targetAt(self: *const ResolvedSheet, row: coords.Row, col: coords.Col) ?Target {
-        for (self.targets) |t| {
-            if (t.publication.row == row and t.publication.col == col) return t;
+        var lo: usize = 0;
+        var hi: usize = self.targets.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const t = self.targets[mid];
+            if (t.publication.row.oneBased() < row.oneBased() or
+                (t.publication.row == row and t.publication.col.zeroBased() < col.zeroBased()))
+            {
+                lo = mid + 1;
+            } else if (t.publication.row == row and t.publication.col == col) {
+                return t;
+            } else {
+                hi = mid;
+            }
         }
         return null;
     }
@@ -328,6 +448,8 @@ pub fn project(
             // merged view drops, and blank is exactly what it
             // contributed.
             .was = if (modeled) |m| m.input else .blank,
+            .cm = if (modeled) |m| m.cm else 0,
+            .vm = if (modeled) |m| m.vm else 0,
         });
     }
 
@@ -338,6 +460,9 @@ pub fn project(
         .source = source,
         .targets = try targets.toOwnedSlice(a),
         .appends = try appends.toOwnedSlice(a),
+        .slots = scan.slots,
+        .rows = scan.rows,
+        .dimension = scan.dimension,
     } };
 }
 
@@ -439,6 +564,111 @@ pub fn transitionFor(a: Allocator, published: value.PublishedScalar) TransitionE
     }
 }
 
+// ─── §5.8b's cm/vm transition table ──────────────────────────────
+
+/// One enumerated persistence transition (§5.8b): the exact metadata
+/// collection, record type, one-based index rule and missing-record
+/// behavior, plus the committed byte-diffed Excel-authored reference
+/// that pins it. A row whose `reference` is null REFUSES — no
+/// transition ships on a guess — and a `permanent` row refuses by
+/// contract (M4a), unlockable by nothing.
+///
+/// The table is data on purpose: the refusing-rows test enumerates it,
+/// `missingReferences()` is the surfaced park list, and committing a
+/// reference flips exactly one row without touching the gate.
+pub const SpillTransition = struct {
+    id: Id,
+    collection: Collection,
+    /// The record type name, exactly as Office spells it — the match is
+    /// case-sensitive (M4a decision 15).
+    record_type: []const u8,
+    index: IndexRule,
+    missing_record: MissingRecord,
+    /// Repo-relative path of the committed byte-diffed reference pair
+    /// that pins this row, or null while none is committed. Authoring
+    /// one needs Excel — `scripts/oracle/regenerate.sh` is the unblock.
+    reference: ?[]const u8,
+    /// Refuses by contract, not by missing proof.
+    permanent: bool = false,
+
+    pub const Id = enum {
+        /// Anchor was spilled in the part, spills again: `<v>`+`t`, an
+        /// `f@ref` rewrite when the extent moved, owned tail
+        /// create/clear, `<dimension ref>` expansion. `c@cm` stays
+        /// byte-identical, still naming its XLDAPR record.
+        da_spill_rewrite,
+        /// Anchor was spilled, now blocked: the cached value becomes
+        /// `#SPILL!` (`t="e"`), `f@ref` collapses to the anchor, every
+        /// owned tail clears. The cached-value side of the split ONLY —
+        /// rich error metadata (`vm`) is never invented.
+        da_spill_to_blocked,
+        /// Anchor was blocked (`#SPILL!` cached), now spills: the
+        /// recovery — `f@ref` grows from the anchor to the extent,
+        /// tails create, the dimension may expand.
+        da_blocked_to_spill,
+        /// Anchor was blocked, stays blocked: the `#SPILL!` cached
+        /// value and anchor-only `ref` rewrite in place.
+        da_blocked_rewrite,
+        /// Any publication landing on a `vm`-carrying cell. Permanent
+        /// (M4a decision 6): reached through `vm`, a record means
+        /// something this reader has never been shown.
+        value_metadata_present,
+
+        pub fn name(self: Id) []const u8 {
+            return @tagName(self);
+        }
+    };
+
+    pub const Collection = enum { cell_metadata, value_metadata };
+    pub const IndexRule = enum {
+        /// The cell's existing `c@cm`, one-based, preserved
+        /// byte-identically — the patcher never addresses it.
+        existing_cm,
+        /// The cell's existing `c@vm`, one-based.
+        existing_vm,
+    };
+    pub const MissingRecord = enum {
+        /// A dangling index refuses. Upstream the resolver already
+        /// refuses it (M4b1 decision 16), so the patcher never meets
+        /// one; the row records the behavior so the reference can
+        /// re-pin it empirically.
+        refuse,
+    };
+};
+
+/// §5.8b's table. Every DA row awaits its Excel-authored reference;
+/// the `value_metadata_present` row is permanent.
+pub const spill_transitions = [_]SpillTransition{
+    .{ .id = .da_spill_rewrite, .collection = .cell_metadata, .record_type = "XLDAPR", .index = .existing_cm, .missing_record = .refuse, .reference = null },
+    .{ .id = .da_spill_to_blocked, .collection = .cell_metadata, .record_type = "XLDAPR", .index = .existing_cm, .missing_record = .refuse, .reference = null },
+    .{ .id = .da_blocked_to_spill, .collection = .cell_metadata, .record_type = "XLDAPR", .index = .existing_cm, .missing_record = .refuse, .reference = null },
+    .{ .id = .da_blocked_rewrite, .collection = .cell_metadata, .record_type = "XLDAPR", .index = .existing_cm, .missing_record = .refuse, .reference = null },
+    .{ .id = .value_metadata_present, .collection = .value_metadata, .record_type = "*", .index = .existing_vm, .missing_record = .refuse, .reference = null, .permanent = true },
+};
+
+fn rowById(table: []const SpillTransition, id: SpillTransition.Id) ?*const SpillTransition {
+    for (table) |*row| {
+        if (row.id == id) return row;
+    }
+    return null;
+}
+
+/// The park list: every transition that would pass once a byte-diffed
+/// Excel reference is committed, in table order. What the final
+/// summary surfaces, and what `regenerate.sh` + the spill reference
+/// set will empty.
+pub fn missingReferences(table: []const SpillTransition, buf: []SpillTransition.Id) []SpillTransition.Id {
+    var n: usize = 0;
+    for (table) |row| {
+        if (row.permanent or row.reference != null) continue;
+        if (n < buf.len) {
+            buf[n] = row.id;
+            n += 1;
+        }
+    }
+    return buf[0..n];
+}
+
 // ─── the patch ───────────────────────────────────────────────────
 
 /// What one edit did. The kind is not a label: `approvedRange` maps it
@@ -465,6 +695,22 @@ pub const EditKind = enum {
     is_to_v,
     /// `<c …/>` reopened as `<c …>…</c>` so content can follow it.
     reopen_self_closing,
+
+    // ── §5.8b's approved additions (M7b1) ──
+    /// The raw value of an anchor's `<f ref="…">` rewritten — the ONE
+    /// byte range inside `spans.f` any edit may address.
+    f_ref_replace,
+    /// A whole owned tail `<c r="…">…</c>` inserted into an existing
+    /// `<row>`, at the point the row's slots dictate.
+    cell_insert,
+    /// A whole owned tail `<c>…</c>` removed — the clear a shrink or a
+    /// block performs. Whole-element removal is this row's pinned
+    /// spelling of "clear"; a keep-the-styled-shell variant waits for
+    /// the Excel reference that would show Office writing one.
+    cell_remove,
+    /// The `<dimension ref>` value widened when created tails extend
+    /// the used range. Bottom-right only, monotonic, top-left kept.
+    dimension_ref_replace,
 };
 
 pub const Edit = struct {
@@ -499,27 +745,35 @@ pub const PatchResult = union(enum) {
 
 /// Write the projection's cached values back into the part.
 ///
-/// Every refusal happens before a byte of output exists: the gate and
-/// the transition table run over the whole projection first, so a
-/// refused patch has produced nothing to roll back.
+/// Every refusal happens before a byte of output exists: the gate, the
+/// §5.8b transition table and the geometry planning all run over the
+/// whole projection first, so a refused patch has produced nothing to
+/// roll back.
 pub fn patch(self: *const ResolvedSheet, gpa: Allocator) error{OutOfMemory}!PatchResult {
+    return patchWithTable(self, gpa, &spill_transitions);
+}
+
+/// `patch` with the transition table injected — the seam that lets the
+/// builders, the confinement and the transaction ride be PROVEN while
+/// the production table still refuses every row. Production callers
+/// take `patch`; only fixtures pass a table with a reference filled in,
+/// and no reference ships until a byte-diffed Excel pair is committed.
+pub fn patchWithTable(
+    self: *const ResolvedSheet,
+    gpa: Allocator,
+    table: []const SpillTransition,
+) error{OutOfMemory}!PatchResult {
     var arena = std.heap.ArenaAllocator.init(gpa);
     var keep = false;
     defer if (!keep) arena.deinit();
     const a = arena.allocator();
 
-    // A publication with nowhere to land is not something to skip.
-    if (self.appends.len > 0) {
-        const p = self.appends[0];
-        return .{ .refused = refuseAt(.cell_insertion_unsupported, p.row, p.col) };
-    }
-
-    // Pass one: the pre-M7 gate and the transition table, over
-    // everything, before anything is written.
+    // Pass one: the gate and the transition table, over everything,
+    // before anything is written.
     const transitions = try a.alloc(Transition, self.targets.len);
     for (self.targets, transitions) |t, *tr| {
-        if (gateOf(t)) |reason| {
-            return .{ .refused = refuseAt(reason, t.publication.row, t.publication.col) };
+        if (gateOf(self, t, table)) |g| {
+            return .{ .refused = refuseGate(g, t.publication.row, t.publication.col) };
         }
         tr.* = transitionFor(a, t.publication.result) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -536,13 +790,50 @@ pub fn patch(self: *const ResolvedSheet, gpa: Allocator) error{OutOfMemory}!Patc
         };
     }
 
+    // Still pass one: §5.8b's planned extras — anchor `ref` rewrites,
+    // owned tail create/clear, dimension expansion — built and checked
+    // here so every refusal below still precedes any output byte. On
+    // the production table nothing plans: every DA row already refused
+    // above.
+    var extra: std.ArrayListUnmanaged(Edit) = .empty;
+    var created: ?CellSite = null;
+    for (self.targets) |t| {
+        if (try planAnchorExtras(a, self, t, table, &extra)) |g| {
+            return .{ .refused = refuseGate(g, t.publication.row, t.publication.col) };
+        }
+    }
+    for (self.appends) |p| {
+        switch (p.role) {
+            .spill_tail => |owner| {
+                if (tailGateFor(self, owner, table)) |g| {
+                    return .{ .refused = refuseGate(g, p.row, p.col) };
+                }
+                if (try planTailInsert(a, self, p, &extra, &created)) |g| {
+                    return .{ .refused = refuseGate(g, p.row, p.col) };
+                }
+            },
+            // A publication with nowhere to land is not something to
+            // skip, and only an OWNED tail may become a created `<c>`.
+            else => return .{ .refused = refuseAt(.cell_insertion_unsupported, p.row, p.col) },
+        }
+    }
+    if (created) |max| {
+        if (try planDimension(a, self, max, &extra)) |g| {
+            return .{ .refused = .{ .reason = g.reason, .cell = max, .transition = g.transition } };
+        }
+    }
+
     // Pass two: the edits.
     var edits: std.ArrayListUnmanaged(Edit) = .empty;
     for (self.targets, transitions) |t, tr| {
         try appendEdits(a, self.source, t, tr, &edits);
     }
+    try edits.appendSlice(a, extra.items);
     const items = try edits.toOwnedSlice(a);
-    std.mem.sortUnstable(Edit, items, {}, lessThanEdit);
+    // Stable: two tail creations at one insertion point keep the
+    // column order they were planned in — `(start, end)` cannot tell
+    // them apart.
+    std.mem.sort(Edit, items, {}, lessThanEdit);
 
     // Pass three: the splice.
     const bytes = try applyEdits(a, self.source, items);
@@ -556,19 +847,372 @@ fn lessThanEdit(_: void, x: Edit, y: Edit) bool {
     return x.at.end < y.at.end;
 }
 
-/// The pre-M7 spill gate: the three shapes whose persistence needs a
-/// mutation set this row does not have.
-fn gateOf(t: Target) ?Refusal.Reason {
-    if (!t.publication.shape.isScalar()) return .non_scalar_result;
+/// What the gate answered: a reason, and the §5.8b row it is about
+/// when it is about one.
+const GateRefusal = struct {
+    reason: Refusal.Reason,
+    transition: ?SpillTransition.Id = null,
+};
+
+fn refuseGate(g: GateRefusal, row: coords.Row, col: coords.Col) Refusal {
+    return .{
+        .reason = g.reason,
+        .cell = .{ .row = row.oneBased(), .col = col.zeroBased() },
+        .transition = g.transition,
+    };
+}
+
+/// §5.7.3's spill gate, §5.8b-narrowed: a covered legacy CSE passes (it
+/// writes `<v>`+`t` on cells that all exist — M5b1's proven set), a DA
+/// anchor consults the transition table and refuses until its row
+/// carries a committed reference, and every other non-scalar shape
+/// keeps refusing exactly as before M7b1.
+fn gateOf(self: *const ResolvedSheet, t: Target, table: []const SpillTransition) ?GateRefusal {
+    // `vm` first — M4a decision 7's order, for the same reason: a cell
+    // carrying both marks must refuse on the one nothing can unlock.
+    if (t.vm != 0) {
+        return .{ .reason = .value_metadata_write, .transition = .value_metadata_present };
+    }
+
+    if (t.formula) |f| {
+        if (calc.Kind.fromAttr(f.kind) == calc.Kind.array) {
+            return switch (t.publication.dialect) {
+                .legacy => cseGate(self, t, f),
+                .dynamic_array => daGate(t, table),
+            };
+        }
+    }
+    if (t.publication.role == .spill_tail) {
+        return tailGateFor(self, t.publication.role.spill_tail, table);
+    }
+    if (!t.publication.shape.isScalar()) return .{ .reason = .non_scalar_result };
+    return null;
+}
+
+/// A legacy CSE anchor passes only covered: every declared cell staged
+/// this run, on an existing `<c>` (a target) or at least carried (an
+/// append — which the append gate then names precisely). Persisting the
+/// anchor while a slave keeps its old cache would have the range
+/// contradict itself.
+fn cseGate(self: *const ResolvedSheet, t: Target, f: decode.Formula) ?GateRefusal {
+    const raw = f.ref orelse return .{ .reason = .cse_ref_unparseable };
+    const range = (coords.parseRange(raw, .{
+        .dollar = .accept,
+        .case = .insensitive,
+    }) catch return .{ .reason = .cse_ref_unparseable }).normalized();
+
+    // The anchor is the range's top-left, or the file is telling two
+    // stories about where the array starts.
+    if (range.first.row.oneBased() != t.publication.row.oneBased() or
+        range.first.col.zeroBased() != t.publication.col.zeroBased())
+    {
+        return .{ .reason = .cse_range_mismatch };
+    }
+
+    var r = range.first.row.oneBased();
+    while (r <= range.last.row.oneBased()) : (r += 1) {
+        var c = range.first.col.zeroBased();
+        while (c <= range.last.col.zeroBased()) : (c += 1) {
+            if (r == t.publication.row.oneBased() and
+                c == t.publication.col.zeroBased()) continue;
+            const row = coords.Row.fromOneBased(r) catch unreachable;
+            const col = coords.Col.fromZeroBased(c) catch unreachable;
+            if (self.targetAt(row, col) != null) continue;
+            if (appendAt(self, row, col) != null) continue;
+            return .{ .reason = .cse_range_mismatch };
+        }
+    }
+    return null;
+}
+
+/// Which §5.8b row a DA anchor takes: the file's stored state (a cached
+/// `#SPILL!` is the byte record of "was blocked") crossed with the
+/// outcome the model placed. The placement itself is never re-decided
+/// here — an anchor staged without it refuses generically.
+fn daGate(t: Target, table: []const SpillTransition) ?GateRefusal {
+    const outcome = switch (t.publication.role) {
+        .da_anchor => |o| o,
+        else => return .{ .reason = .dynamic_array_anchor },
+    };
+    const id: SpillTransition.Id = switch (outcome) {
+        .spilled => if (wasBlocked(t)) .da_blocked_to_spill else .da_spill_rewrite,
+        .blocked => if (wasBlocked(t)) .da_blocked_rewrite else .da_spill_to_blocked,
+    };
+    const row = rowById(table, id) orelse
+        return .{ .reason = .transition_unproven, .transition = id };
+    if (row.reference == null) {
+        return .{ .reason = .transition_unproven, .transition = id };
+    }
+    return null;
+}
+
+/// A tail passes exactly when its anchor does: same projection, role
+/// `.da_anchor`, proven row. Everything else is half a construct.
+fn tailGateFor(
+    self: *const ResolvedSheet,
+    owner: anytype,
+    table: []const SpillTransition,
+) ?GateRefusal {
+    const anchor = self.targetAt(owner.row, owner.col) orelse
+        return .{ .reason = .tail_without_anchor };
+    if (anchor.publication.role != .da_anchor) {
+        return .{ .reason = .tail_without_anchor };
+    }
+    return daGate(anchor, table);
+}
+
+fn wasBlocked(t: Target) bool {
+    return t.was == .err and t.was.err == .known and t.was.err.known == .spill;
+}
+
+fn appendAt(self: *const ResolvedSheet, row: coords.Row, col: coords.Col) ?Publication {
+    var lo: usize = 0;
+    var hi: usize = self.appends.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const p = self.appends[mid];
+        if (p.row.oneBased() < row.oneBased() or
+            (p.row == row and p.col.zeroBased() < col.zeroBased()))
+        {
+            lo = mid + 1;
+        } else if (p.row == row and p.col == col) {
+            return p;
+        } else {
+            hi = mid;
+        }
+    }
+    return null;
+}
+
+// ─── §5.8b's planned extras (M7b1) ───────────────────────────────
+
+/// The `f@ref` rewrite and the tail clears a PROVEN DA anchor plans.
+/// On the production table this never plans anything — the gate
+/// refused every DA row before it — so a planned edit here is always
+/// downstream of a committed reference.
+fn planAnchorExtras(
+    a: Allocator,
+    self: *const ResolvedSheet,
+    t: Target,
+    table: []const SpillTransition,
+    out: *std.ArrayListUnmanaged(Edit),
+) error{OutOfMemory}!?GateRefusal {
     const f = t.formula orelse return null;
     if (calc.Kind.fromAttr(f.kind) != calc.Kind.array) return null;
-    // Both arms are the same refusal in every way except which
-    // construct it names, and naming it is what makes a diagnostic
-    // worth reading.
-    return switch (t.publication.dialect) {
-        .dynamic_array => .dynamic_array_anchor,
-        .legacy => .cse_array,
+    if (t.publication.dialect != .dynamic_array) return null;
+    const outcome = switch (t.publication.role) {
+        .da_anchor => |o| o,
+        else => return null,
     };
+    const id: SpillTransition.Id = switch (outcome) {
+        .spilled => if (wasBlocked(t)) .da_blocked_to_spill else .da_spill_rewrite,
+        .blocked => if (wasBlocked(t)) .da_blocked_rewrite else .da_spill_to_blocked,
+    };
+    const row = rowById(table, id) orelse return null;
+    if (row.reference == null) return null;
+
+    const anchor_row = t.publication.row;
+    const anchor_col = t.publication.col;
+    const raw = f.ref orelse return .{ .reason = .anchor_ref_unusable };
+    const ref_span = t.spans.f_ref orelse return .{ .reason = .anchor_ref_unusable };
+    const old_range = (coords.parseRange(raw, .{
+        .dollar = .accept,
+        .case = .insensitive,
+    }) catch return .{ .reason = .anchor_ref_unusable }).normalized();
+
+    // The new extent: what the model placed, in file spelling. A
+    // blocked anchor's region is itself alone — Excel's own record of
+    // "nothing landed".
+    const new_range: coords.Range = switch (outcome) {
+        .blocked => .{
+            .first = .{ .row = anchor_row, .col = anchor_col },
+            .last = .{ .row = anchor_row, .col = anchor_col },
+        },
+        .spilled => |s| blk: {
+            const lr = coords.Row.fromOneBased(anchor_row.oneBased() + s.rows - 1) catch
+                return .{ .reason = .anchor_ref_unusable };
+            const lc = coords.Col.fromZeroBased(anchor_col.zeroBased() + s.cols - 1) catch
+                return .{ .reason = .anchor_ref_unusable };
+            break :blk .{
+                .first = .{ .row = anchor_row, .col = anchor_col },
+                .last = .{ .row = lr, .col = lc },
+            };
+        },
+    };
+
+    const spelled = try spellRange(a, new_range);
+    if (!std.mem.eql(u8, raw, spelled)) {
+        try out.append(a, .{
+            .at = ref_span,
+            .replacement = spelled,
+            .kind = .f_ref_replace,
+            .cell = .{ .row = anchor_row.oneBased(), .col = anchor_col.zeroBased() },
+        });
+    }
+
+    // Tail clears: every coordinate the STORED ref claims that the new
+    // extent no longer covers. The stored ref is the file's one record
+    // of the prior extent — the byte side of §5.8a's "shrink clears
+    // own tails".
+    var r = old_range.first.row.oneBased();
+    while (r <= old_range.last.row.oneBased()) : (r += 1) {
+        var c = old_range.first.col.zeroBased();
+        while (c <= old_range.last.col.zeroBased()) : (c += 1) {
+            if (r == anchor_row.oneBased() and c == anchor_col.zeroBased()) continue;
+            const row_ = coords.Row.fromOneBased(r) catch continue;
+            const col_ = coords.Col.fromZeroBased(c) catch continue;
+            if (new_range.contains(.{ .row = row_, .col = col_ })) continue;
+            const slot = slotAt(self.slots, row_, col_) orelse continue;
+            // The record said "tail"; the bytes say formula or staged
+            // target. Clearing either would remove content the record
+            // does not actually own.
+            if (slot.spans.f != null) return .{ .reason = .tail_clear_foreign };
+            if (self.targetAt(row_, col_) != null) return .{ .reason = .tail_clear_foreign };
+            try out.append(a, .{
+                .at = slot.spans.cell,
+                .replacement = "",
+                .kind = .cell_remove,
+                .cell = .{ .row = r, .col = c },
+            });
+        }
+    }
+    return null;
+}
+
+/// One owned tail becoming a created `<c>` inside an existing `<row>`,
+/// plus the running bottom-right the dimension check consumes.
+fn planTailInsert(
+    a: Allocator,
+    self: *const ResolvedSheet,
+    p: Publication,
+    out: *std.ArrayListUnmanaged(Edit),
+    created: *?CellSite,
+) error{OutOfMemory}!?GateRefusal {
+    const row_1 = p.row.oneBased();
+    const col_0 = p.col.zeroBased();
+
+    const rs = uniqueRowIn(self.rows, row_1) orelse return .{ .reason = .tail_row_missing };
+    if (rs.selfClosing()) return .{ .reason = .tail_row_self_closing };
+    if (rs.spans_attr) |sa| {
+        if (!spansCover(sa.slice(self.source), col_0 + 1)) {
+            return .{ .reason = .tail_row_spans_stale };
+        }
+    }
+    const at = tailInsertPoint(self.slots, self.rows, row_1, col_0) orelse
+        return .{ .reason = .tail_row_missing };
+
+    const tr = transitionFor(a, p.result) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnwritableErrorSpelling => return .{ .reason = .unwritable_error_spelling },
+        error.NonFiniteNumber => return .{ .reason = .non_finite_number },
+    };
+    var buf: [coords.format_buf_len]u8 = undefined;
+    const ref = coords.formatCell(&buf, .{ .row = p.row, .col = p.col });
+    const replacement = if (tr.type_attr) |ta|
+        try std.fmt.allocPrint(a, "<c r=\"{s}\" t=\"{s}\"><v>{s}</v></c>", .{ ref, ta, tr.v })
+    else
+        try std.fmt.allocPrint(a, "<c r=\"{s}\"><v>{s}</v></c>", .{ ref, tr.v });
+    try out.append(a, .{
+        .at = .{ .start = at, .end = at },
+        .replacement = replacement,
+        .kind = .cell_insert,
+        .cell = .{ .row = row_1, .col = col_0 },
+    });
+
+    created.* = if (created.*) |m|
+        .{ .row = @max(m.row, row_1), .col = @max(m.col, col_0) }
+    else
+        .{ .row = row_1, .col = col_0 };
+    return null;
+}
+
+/// The `<dimension ref>` expansion created tails require. Absent
+/// dimension: nothing to maintain — the OOXML spec lets a consumer
+/// rescan `<sheetData>` (`docs/plans/structural-edits.md:100`). Present
+/// but unparseable WHEN expansion is needed: the spill refuses, §5.8b's
+/// "refuse until this mutation is proven possible" arm.
+fn planDimension(
+    a: Allocator,
+    self: *const ResolvedSheet,
+    max: CellSite,
+    out: *std.ArrayListUnmanaged(Edit),
+) error{OutOfMemory}!?GateRefusal {
+    const dim = self.dimension orelse return null;
+    const ref_span = dim.ref orelse return .{ .reason = .dimension_unparseable };
+    const raw = ref_span.slice(self.source);
+    const range = (coords.parseRange(raw, .{}) catch
+        return .{ .reason = .dimension_unparseable }).normalized();
+
+    const new_last_row = @max(range.last.row.oneBased(), max.row);
+    const new_last_col = @max(range.last.col.zeroBased(), max.col);
+    if (new_last_row == range.last.row.oneBased() and
+        new_last_col == range.last.col.zeroBased()) return null;
+
+    const lr = coords.Row.fromOneBased(new_last_row) catch
+        return .{ .reason = .dimension_unparseable };
+    const lc = coords.Col.fromZeroBased(new_last_col) catch
+        return .{ .reason = .dimension_unparseable };
+    // Bottom-right only, monotonic; the top-left keeps its own bytes.
+    const tl_raw = if (std.mem.indexOfScalar(u8, raw, ':')) |i| raw[0..i] else raw;
+    var buf: [coords.format_buf_len]u8 = undefined;
+    const br = coords.formatCell(&buf, .{ .row = lr, .col = lc });
+    try out.append(a, .{
+        .at = ref_span,
+        .replacement = try std.fmt.allocPrint(a, "{s}:{s}", .{ tl_raw, br }),
+        .kind = .dimension_ref_replace,
+        .cell = max,
+    });
+    return null;
+}
+
+/// Where a created `<c>` at (`row_1`, `col_0`) goes: after the last
+/// existing `<c>` in its row with a smaller column, else at the row's
+/// open end. Null when the row is missing, duplicated or self-closing —
+/// the shapes §5.8b's tail creation refuses. Pure over the scan's own
+/// coordinates, so the planner and the confinement checker answer from
+/// one derivation.
+pub fn tailInsertPoint(
+    slots: []const decode.CellSlot,
+    rows: []const decode.RowSlot,
+    row_1: u32,
+    col_0: u32,
+) ?u32 {
+    const rs = uniqueRowIn(rows, row_1) orelse return null;
+    if (rs.selfClosing()) return null;
+    var at = rs.open_end;
+    for (slots) |s| {
+        if (s.row.oneBased() != row_1) continue;
+        if (s.col.zeroBased() < col_0) at = s.spans.cell.end;
+    }
+    return at;
+}
+
+fn uniqueRowIn(rows: []const decode.RowSlot, row_1: u32) ?decode.RowSlot {
+    var found: ?decode.RowSlot = null;
+    for (rows) |r| {
+        if (r.number != row_1) continue;
+        if (found != null) return null;
+        found = r;
+    }
+    return found;
+}
+
+/// `spans="lo:hi"`, 1-based inclusive. Unparseable declares nothing —
+/// and proves nothing, so it refuses at the caller.
+fn spansCover(raw: []const u8, col_1: u32) bool {
+    const colon = std.mem.indexOfScalar(u8, raw, ':') orelse return false;
+    const lo = std.fmt.parseInt(u32, raw[0..colon], 10) catch return false;
+    const hi = std.fmt.parseInt(u32, raw[colon + 1 ..], 10) catch return false;
+    return col_1 >= lo and col_1 <= hi;
+}
+
+fn spellRange(a: Allocator, range: coords.Range) error{OutOfMemory}![]const u8 {
+    var buf1: [coords.format_buf_len]u8 = undefined;
+    var buf2: [coords.format_buf_len]u8 = undefined;
+    const first = coords.formatCell(&buf1, range.first);
+    if (range.first.eql(range.last)) return a.dupe(u8, first);
+    const last = coords.formatCell(&buf2, range.last);
+    return std.fmt.allocPrint(a, "{s}:{s}", .{ first, last });
 }
 
 fn appendEdits(
@@ -768,6 +1412,18 @@ pub fn approvedRange(source: []const u8, spans: decode.CellSpans, kind: EditKind
             const at = if (spans.f) |f| f.end else spans.open_end;
             break :blk .{ .start = at, .end = at };
         },
+
+        // §5.8b (M7b1). The anchor-ref exception to "no edit addresses
+        // a byte inside `spans.f`" is exactly this sub-span; a tail
+        // clear owns exactly its element — and an owned tail never
+        // carries a formula, so a `<c>` with an `<f>` has no removable
+        // range at all.
+        .f_ref_replace => spans.f_ref,
+        .cell_remove => if (spans.f == null) spans.cell else null,
+        // Not answerable from one cell's spans: the insert point is the
+        // ROW's geometry and the dimension is the SHEET's —
+        // `verifyConfinement` answers both from `Geometry`.
+        .cell_insert, .dimension_ref_replace => null,
     };
 }
 
@@ -783,6 +1439,15 @@ pub const ConfinementError = error{
     OutOfMemory,
 };
 
+/// What the confinement checker answers from — the scan's own
+/// coordinates, passed rather than looked up through a callback, so the
+/// checker cannot hold a second opinion about where anything is.
+pub const Geometry = struct {
+    slots: []const decode.CellSlot,
+    rows: []const decode.RowSlot = &.{},
+    dimension: ?decode.DimensionSpans = null,
+};
+
 /// Prove a patch changed only what it says it changed.
 ///
 /// Two independent statements, because either alone is satisfiable by a
@@ -796,11 +1461,7 @@ pub fn verifyConfinement(
     source: []const u8,
     out: []const u8,
     edits: []const Edit,
-    /// The scan's slots — the same ones the projection was built from.
-    /// Passed rather than looked up through a callback, so the checker
-    /// answers from the walk's own coordinates and not from a second
-    /// opinion about where a `<c>` is.
-    slots: []const decode.CellSlot,
+    geo: Geometry,
 ) ConfinementError!void {
     var prev_end: u32 = 0;
     for (edits) |e| {
@@ -808,9 +1469,23 @@ pub fn verifyConfinement(
         if (e.at.end < e.at.start or e.at.end > source.len) return error.UnapprovedRange;
         prev_end = e.at.end;
 
-        const spans = spansOfSite(slots, e.cell) orelse return error.UnapprovedRange;
-        const approved = approvedRange(source, spans, e.kind) orelse return error.UnapprovedRange;
-        if (approved.start != e.at.start or approved.end != e.at.end) {
+        const approved: ?Span = switch (e.kind) {
+            // A created `<c>` may claim only the point its row's
+            // geometry dictates — and only where no `<c>` exists.
+            .cell_insert => blk: {
+                if (spansOfSite(geo.slots, e.cell) != null) break :blk null;
+                const at = tailInsertPoint(geo.slots, geo.rows, e.cell.row, e.cell.col) orelse
+                    break :blk null;
+                break :blk .{ .start = at, .end = at };
+            },
+            .dimension_ref_replace => if (geo.dimension) |d| d.ref else null,
+            else => blk: {
+                const spans = spansOfSite(geo.slots, e.cell) orelse break :blk null;
+                break :blk approvedRange(source, spans, e.kind);
+            },
+        };
+        const ap = approved orelse return error.UnapprovedRange;
+        if (ap.start != e.at.start or ap.end != e.at.end) {
             return error.UnapprovedRange;
         }
     }
@@ -941,7 +1616,11 @@ fn patchOk(gpa: Allocator, f: *Fixture) ![]u8 {
     };
     defer p.deinit();
 
-    try verifyConfinement(gpa, f.xml, p.bytes, p.edits, f.scan.slots);
+    try verifyConfinement(gpa, f.xml, p.bytes, p.edits, .{
+        .slots = f.scan.slots,
+        .rows = f.scan.rows,
+        .dimension = f.scan.dimension,
+    });
     return gpa.dupe(u8, p.bytes);
 }
 
@@ -1339,7 +2018,11 @@ test "confinement: every transition changes exactly the ranges it named" {
         };
         defer p.deinit();
 
-        try verifyConfinement(testing.allocator, case.xml, p.bytes, p.edits, f.scan.slots);
+        try verifyConfinement(testing.allocator, case.xml, p.bytes, p.edits, .{
+            .slots = f.scan.slots,
+            .rows = f.scan.rows,
+            .dimension = f.scan.dimension,
+        });
 
         try testing.expectEqual(case.edits.len, p.edits.len);
         for (case.edits, p.edits) |want, got| {
@@ -1626,9 +2309,40 @@ test "gate: a dynamic-array anchor refuses with zero mutation" {
     try expectRefusal(testing.allocator, &f, .dynamic_array_anchor);
 }
 
-test "gate: a legacy CSE array refuses with zero mutation" {
+test "cse: a covered legacy CSE persists — the anchor and its slaves together (M7b1)" {
+    // §5.8c: M7b1 persists EXISTING CSE. Every mutation below is
+    // `<v>`+`t` on a `<c>` the part already has — M5b1's proven set —
+    // and no cm/vm byte exists to transition. The slave keeps its
+    // bodiless place and gains the cache §5.7.3 says slaves gain.
+    const xml = sheetXml(
+        \\<row r="1"><c r="A1"><f t="array" ref="A1:A2">SEQUENCE(2)</f><v>999</v></c></row>
+        \\<row r="2"><c r="A2"><v>999</v></c></row>
+    );
+    var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+        .{
+            .row = cellRef("A1").row,
+            .col = cellRef("A1").col,
+            .result = .{ .number = 1 },
+            .dialect = .legacy,
+            .shape = .{ .rows = 2, .cols = 1 },
+        },
+        pubAt("A2", .{ .number = 2 }),
+    });
+    defer f.deinit();
+
+    const out = try patchOk(testing.allocator, &f);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(sheetXml(
+        \\<row r="1"><c r="A1"><f t="array" ref="A1:A2">SEQUENCE(2)</f><v>1</v></c></row>
+        \\<row r="2"><c r="A2"><v>2</v></c></row>
+    ), out);
+}
+
+test "cse: an uncovered declared range refuses with zero mutation" {
+    // The anchor alone is staged; A2's stale cache would contradict it.
     const xml = sheetXml(
         \\<row r="1"><c r="A1"><f t="array" ref="A1:A2">SUM(B1:B2)</f><v>1</v></c></row>
+        \\<row r="2"><c r="A2"><v>1</v></c></row>
     );
     var f = try buildFixture(testing.allocator, xml, &.{}, &.{
         .{
@@ -1639,7 +2353,28 @@ test "gate: a legacy CSE array refuses with zero mutation" {
         },
     });
     defer f.deinit();
-    try expectRefusal(testing.allocator, &f, .cse_array);
+    try expectRefusal(testing.allocator, &f, .cse_range_mismatch);
+}
+
+test "cse: an anchor away from its declared top-left refuses" {
+    // B1 claims A1:A2 — the file tells two stories about where the
+    // array starts, and the patcher believes neither.
+    const xml = sheetXml(
+        \\<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f t="array" ref="A1:A2">X()</f><v>1</v></c></row>
+        \\<row r="2"><c r="A2"><v>1</v></c></row>
+    );
+    var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+        .{
+            .row = cellRef("B1").row,
+            .col = cellRef("B1").col,
+            .result = .{ .number = 1 },
+            .dialect = .legacy,
+        },
+        pubAt("A1", .{ .number = 1 }),
+        pubAt("A2", .{ .number = 1 }),
+    });
+    defer f.deinit();
+    try expectRefusal(testing.allocator, &f, .cse_range_mismatch);
 }
 
 test "gate: a refused patch produces no bytes, and the source is untouched" {
@@ -1648,18 +2383,23 @@ test "gate: a refused patch produces no bytes, and the source is untouched" {
     // same projection refuses identically — the projection did not
     // half-consume anything on its way out.
     const xml = sheetXml(
-        \\<row r="1"><c r="A1"><f t="array" ref="A1:A2">SUM(B1:B2)</f><v>1</v></c></row>
+        \\<row r="1"><c r="A1" cm="1"><f t="array" ref="A1:A2">SEQUENCE(2)</f><v>1</v></c></row>
     );
     const before = try testing.allocator.dupe(u8, xml);
     defer testing.allocator.free(before);
 
     var f = try buildFixture(testing.allocator, xml, &.{}, &.{
-        pubAt("A1", .{ .number = 9 }),
+        .{
+            .row = cellRef("A1").row,
+            .col = cellRef("A1").col,
+            .result = .{ .number = 9 },
+            .dialect = .dynamic_array,
+        },
     });
     defer f.deinit();
 
-    try expectRefusal(testing.allocator, &f, .cse_array);
-    try expectRefusal(testing.allocator, &f, .cse_array);
+    try expectRefusal(testing.allocator, &f, .dynamic_array_anchor);
+    try expectRefusal(testing.allocator, &f, .dynamic_array_anchor);
     try testing.expectEqualStrings(before, f.resolved.source);
 }
 
@@ -1683,6 +2423,426 @@ test "gate: an ordinary formula in the DA dialect is not an anchor" {
     const out = try patchOk(testing.allocator, &f);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "<v>2</v>") != null);
+}
+
+// ─── §5.8b: the transition table and the DA path (M7b1) ──────────
+
+/// The production table with every non-permanent reference filled in —
+/// the seam fixtures prove the builders through. The path is a
+/// sentinel, not a file: nothing reads it, and the PRODUCTION table is
+/// separately pinned to refuse every row until a real committed
+/// reference replaces a null.
+const proven_table = blk: {
+    var t = spill_transitions;
+    for (&t) |*row| {
+        if (!row.permanent) row.reference = "INJECTED-BY-TEST-not-a-committed-reference";
+    }
+    break :blk t;
+};
+
+fn daAnchorPub(comptime ref: []const u8, result: value.PublishedScalar, outcome: spill.Outcome) Publication {
+    const c = cellRef(ref);
+    return .{
+        .row = c.row,
+        .col = c.col,
+        .result = result,
+        .dialect = .dynamic_array,
+        .role = .{ .da_anchor = outcome },
+        .shape = switch (outcome) {
+            .spilled => |s| s,
+            .blocked => .{ .rows = 1, .cols = 1 },
+        },
+    };
+}
+
+fn tailPub(comptime ref: []const u8, comptime anchor: []const u8, result: value.PublishedScalar) Publication {
+    const c = cellRef(ref);
+    const a = cellRef(anchor);
+    return .{
+        .row = c.row,
+        .col = c.col,
+        .result = result,
+        .role = .{ .spill_tail = .{ .row = a.row, .col = a.col } },
+    };
+}
+
+/// `patchOk` against an injected table — same confinement proof.
+fn patchOkWith(gpa: Allocator, f: *Fixture, table: []const SpillTransition) ![]u8 {
+    var p = switch (try patchWithTable(&f.resolved, gpa, table)) {
+        .ok => |ok| ok,
+        .refused => |r| {
+            std.debug.print("unexpected patch refusal: {any}\n", .{r});
+            return error.TestUnexpectedRefusal;
+        },
+    };
+    defer p.deinit();
+    try verifyConfinement(gpa, f.xml, p.bytes, p.edits, .{
+        .slots = f.scan.slots,
+        .rows = f.scan.rows,
+        .dimension = f.scan.dimension,
+    });
+    return gpa.dupe(u8, p.bytes);
+}
+
+fn expectRefusalWith(
+    gpa: Allocator,
+    f: *Fixture,
+    table: []const SpillTransition,
+    reason: Refusal.Reason,
+) !void {
+    switch (try patchWithTable(&f.resolved, gpa, table)) {
+        .ok => |ok| {
+            var p = ok;
+            p.deinit();
+            return error.TestExpectedRefusal;
+        },
+        .refused => |r| try testing.expectEqual(reason, r.reason),
+    }
+}
+
+test "§5.8b: the production table refuses every row, and each refusal names its row" {
+    // The four (was × now) combinations, each against the SHIPPED
+    // table: this is DONE-WHEN 4's "with none committed, the whole
+    // path's refusal is the pinned fixture".
+    const cases = [_]struct {
+        was_v: []const u8, // the stored cache: a number, or #SPILL!
+        outcome: spill.Outcome,
+        want: SpillTransition.Id,
+    }{
+        .{ .was_v = "<v>9</v>", .outcome = .{ .spilled = .{ .rows = 2, .cols = 1 } }, .want = .da_spill_rewrite },
+        .{ .was_v = "<v>9</v>", .outcome = .{ .blocked = .obstruction }, .want = .da_spill_to_blocked },
+        .{ .was_v = "<v>#SPILL!</v>", .outcome = .{ .spilled = .{ .rows = 2, .cols = 1 } }, .want = .da_blocked_to_spill },
+        .{ .was_v = "<v>#SPILL!</v>", .outcome = .{ .blocked = .obstruction }, .want = .da_blocked_rewrite },
+    };
+    inline for (cases) |case| {
+        const t_attr = if (comptime std.mem.indexOf(u8, case.was_v, "#SPILL!") != null) " t=\"e\"" else "";
+        const xml = sheetXml(
+            "<row r=\"1\"><c r=\"A1\" cm=\"1\"" ++ t_attr ++
+                "><f t=\"array\" ref=\"A1\">SEQUENCE(2)</f>" ++ case.was_v ++ "</c></row>" ++
+                "<row r=\"2\"></row>",
+        );
+        var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+            daAnchorPub("A1", .{ .number = 1 }, case.outcome),
+        });
+        defer f.deinit();
+
+        switch (try patch(&f.resolved, testing.allocator)) {
+            .ok => |ok| {
+                var p = ok;
+                p.deinit();
+                return error.TestExpectedRefusal;
+            },
+            .refused => |r| {
+                try testing.expectEqual(Refusal.Reason.transition_unproven, r.reason);
+                try testing.expectEqual(case.want, r.transition.?);
+                try testing.expectEqual(PlaneTwo.FormulaSpillPersistUnsupported, r.planeTwo());
+            },
+        }
+    }
+}
+
+test "§5.8b: the table enumerates its refusing rows, and the park list is exact" {
+    var buf: [spill_transitions.len]SpillTransition.Id = undefined;
+    const missing = missingReferences(&spill_transitions, &buf);
+    try testing.expectEqual(@as(usize, 4), missing.len);
+    try testing.expectEqual(SpillTransition.Id.da_spill_rewrite, missing[0]);
+    try testing.expectEqual(SpillTransition.Id.da_spill_to_blocked, missing[1]);
+    try testing.expectEqual(SpillTransition.Id.da_blocked_to_spill, missing[2]);
+    try testing.expectEqual(SpillTransition.Id.da_blocked_rewrite, missing[3]);
+
+    // Every DA row is the same §5.8b statement: cellMetadata, XLDAPR,
+    // the cell's own one-based `cm`, dangling refuses. The vm row is
+    // permanent and never in the park list.
+    for (spill_transitions) |row| {
+        if (row.permanent) {
+            try testing.expectEqual(SpillTransition.Collection.value_metadata, row.collection);
+            try testing.expectEqual(SpillTransition.Id.value_metadata_present, row.id);
+            continue;
+        }
+        try testing.expect(row.reference == null);
+        try testing.expectEqual(SpillTransition.Collection.cell_metadata, row.collection);
+        try testing.expectEqualStrings("XLDAPR", row.record_type);
+        try testing.expectEqual(SpillTransition.IndexRule.existing_cm, row.index);
+        try testing.expectEqual(SpillTransition.MissingRecord.refuse, row.missing_record);
+    }
+}
+
+test "§5.8b: a publication under `vm` refuses whatever the table says" {
+    // A setCell publication reaches the patcher without meeting the
+    // resolver — the gate refuses it here, permanently, on BOTH
+    // tables.
+    const xml = sheetXml(
+        \\<row r="1"><c r="A1" vm="1"><v>1</v></c></row>
+    );
+    var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+        pubAt("A1", .{ .number = 2 }),
+    });
+    defer f.deinit();
+    try expectRefusalWith(testing.allocator, &f, &proven_table, .value_metadata_write);
+    try expectRefusal(testing.allocator, &f, .value_metadata_write);
+}
+
+test "§5.8b fixture: a grow rewrites the ref, fills the tail row, and touches nothing else" {
+    // A1:A2 grows to A1:A3 — anchor `<v>` and `f@ref` rewrite, A2's
+    // tail rewrites in place, A3 is CREATED inside its existing row.
+    // `patchOkWith` proves every edit equals its approved span and the
+    // edit list explains every changed byte — prior bytes outside the
+    // approved spans are intact by construction.
+    const xml = sheetXml(
+        \\<row r="1"><c r="A1" cm="1"><f t="array" ref="A1:A2">SEQUENCE(3)</f><v>999</v></c></row>
+        \\<row r="2"><c r="A2"><v>999</v></c></row>
+        \\<row r="3"></row>
+    );
+    var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+        daAnchorPub("A1", .{ .number = 1 }, .{ .spilled = .{ .rows = 3, .cols = 1 } }),
+        tailPub("A2", "A1", .{ .number = 2 }),
+        tailPub("A3", "A1", .{ .number = 3 }),
+    });
+    defer f.deinit();
+
+    const out = try patchOkWith(testing.allocator, &f, &proven_table);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(sheetXml(
+        \\<row r="1"><c r="A1" cm="1"><f t="array" ref="A1:A3">SEQUENCE(3)</f><v>1</v></c></row>
+        \\<row r="2"><c r="A2"><v>2</v></c></row>
+        \\<row r="3"><c r="A3"><v>3</v></c></row>
+    ), out);
+}
+
+test "§5.8b fixture: a shrink clears the owned tail cell whole" {
+    const xml = sheetXml(
+        \\<row r="1"><c r="A1" cm="1"><f t="array" ref="A1:A3">SEQUENCE(2)</f><v>999</v></c></row>
+        \\<row r="2"><c r="A2"><v>999</v></c></row>
+        \\<row r="3"><c r="A3"><v>999</v></c></row>
+    );
+    var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+        daAnchorPub("A1", .{ .number = 1 }, .{ .spilled = .{ .rows = 2, .cols = 1 } }),
+        tailPub("A2", "A1", .{ .number = 2 }),
+    });
+    defer f.deinit();
+
+    const out = try patchOkWith(testing.allocator, &f, &proven_table);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(sheetXml(
+        \\<row r="1"><c r="A1" cm="1"><f t="array" ref="A1:A2">SEQUENCE(2)</f><v>1</v></c></row>
+        \\<row r="2"><c r="A2"><v>2</v></c></row>
+        \\<row r="3"></row>
+    ), out);
+}
+
+test "§5.8b fixture: spill-to-blocked caches #SPILL! and keeps the split" {
+    // The cached value becomes the bare `#SPILL!` (`t="e"`), the ref
+    // collapses to the anchor, the tail clears. `cm` stays
+    // byte-identical — and no `vm`, no rich metadata, is invented:
+    // that is the cached-value vs rich-metadata split held.
+    const xml = sheetXml(
+        \\<row r="1"><c r="A1" cm="1"><f t="array" ref="A1:A2">SEQUENCE(2)</f><v>999</v></c></row>
+        \\<row r="2"><c r="A2"><v>999</v></c></row>
+    );
+    var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+        daAnchorPub("A1", .{ .err = .{ .known = .spill } }, .{ .blocked = .obstruction }),
+    });
+    defer f.deinit();
+
+    const out = try patchOkWith(testing.allocator, &f, &proven_table);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(sheetXml(
+        \\<row r="1"><c r="A1" cm="1" t="e"><f t="array" ref="A1">SEQUENCE(2)</f><v>#SPILL!</v></c></row>
+        \\<row r="2"></row>
+    ), out);
+}
+
+test "§5.8b fixture: blocked-stays-blocked is byte-identical" {
+    const xml = sheetXml(
+        \\<row r="1"><c r="A1" cm="1" t="e"><f t="array" ref="A1">SEQUENCE(2)</f><v>#SPILL!</v></c></row>
+    );
+    var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+        daAnchorPub("A1", .{ .err = .{ .known = .spill } }, .{ .blocked = .obstruction }),
+    });
+    defer f.deinit();
+
+    const out = try patchOkWith(testing.allocator, &f, &proven_table);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(xml, out);
+}
+
+test "§5.8b fixture: blocked-to-spill recovers — ref grows, tails create, in column order" {
+    // Two tails into ONE empty row share an insertion point; the
+    // stable sort keeps their planned column order.
+    const xml = sheetXml(
+        \\<row r="1"><c r="A1" cm="1" t="e"><f t="array" ref="A1">X()</f><v>#SPILL!</v></c></row>
+        \\<row r="2"></row>
+    );
+    var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+        daAnchorPub("A1", .{ .number = 1 }, .{ .spilled = .{ .rows = 2, .cols = 2 } }),
+        tailPub("B1", "A1", .{ .number = 2 }),
+        tailPub("A2", "A1", .{ .number = 3 }),
+        tailPub("B2", "A1", .{ .text = "x" }),
+    });
+    defer f.deinit();
+
+    const out = try patchOkWith(testing.allocator, &f, &proven_table);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(sheetXml(
+        \\<row r="1"><c r="A1" cm="1"><f t="array" ref="A1:B2">X()</f><v>1</v></c><c r="B1"><v>2</v></c></row>
+        \\<row r="2"><c r="A2"><v>3</v></c><c r="B2" t="str"><v>x</v></c></row>
+    ), out);
+}
+
+test "§5.8b fixture: created tails expand the dimension, bottom-right only" {
+    const xml =
+        "<worksheet" ++ ns_attr ++ ">" ++
+        "<dimension ref=\"A1:A2\"/>" ++
+        "<sheetData>" ++
+        "<row r=\"1\"><c r=\"A1\" cm=\"1\"><f t=\"array\" ref=\"A1:A2\">SEQUENCE(3)</f><v>999</v></c></row>" ++
+        "<row r=\"2\"><c r=\"A2\"><v>999</v></c></row>" ++
+        "<row r=\"3\"></row>" ++
+        "</sheetData></worksheet>";
+    var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+        daAnchorPub("A1", .{ .number = 1 }, .{ .spilled = .{ .rows = 3, .cols = 1 } }),
+        tailPub("A2", "A1", .{ .number = 2 }),
+        tailPub("A3", "A1", .{ .number = 3 }),
+    });
+    defer f.deinit();
+
+    const out = try patchOkWith(testing.allocator, &f, &proven_table);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<dimension ref=\"A1:A3\"/>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<c r=\"A3\"><v>3</v></c>") != null);
+
+    // A tail INSIDE the dimension expands nothing: rerun with a
+    // dimension that already covers A3.
+    const covered =
+        "<worksheet" ++ ns_attr ++ ">" ++
+        "<dimension ref=\"A1:B9\"/>" ++
+        "<sheetData>" ++
+        "<row r=\"1\"><c r=\"A1\" cm=\"1\"><f t=\"array\" ref=\"A1:A2\">SEQUENCE(3)</f><v>999</v></c></row>" ++
+        "<row r=\"2\"><c r=\"A2\"><v>999</v></c></row>" ++
+        "<row r=\"3\"></row>" ++
+        "</sheetData></worksheet>";
+    var f2 = try buildFixture(testing.allocator, covered, &.{}, &.{
+        daAnchorPub("A1", .{ .number = 1 }, .{ .spilled = .{ .rows = 3, .cols = 1 } }),
+        tailPub("A2", "A1", .{ .number = 2 }),
+        tailPub("A3", "A1", .{ .number = 3 }),
+    });
+    defer f2.deinit();
+    const out2 = try patchOkWith(testing.allocator, &f2, &proven_table);
+    defer testing.allocator.free(out2);
+    try testing.expect(std.mem.indexOf(u8, out2, "<dimension ref=\"A1:B9\"/>") != null);
+}
+
+test "§5.8b: tail geometry the approved set cannot address refuses, zero mutation" {
+    // Into a missing row.
+    {
+        const xml = sheetXml(
+            \\<row r="1"><c r="A1" cm="1"><f t="array" ref="A1">X()</f><v>9</v></c></row>
+        );
+        var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+            daAnchorPub("A1", .{ .number = 1 }, .{ .spilled = .{ .rows = 2, .cols = 1 } }),
+            tailPub("A2", "A1", .{ .number = 2 }),
+        });
+        defer f.deinit();
+        try expectRefusalWith(testing.allocator, &f, &proven_table, .tail_row_missing);
+    }
+    // Into a self-closing row — reopening it is a mutation §5.8b does
+    // not name.
+    {
+        const xml = sheetXml(
+            \\<row r="1"><c r="A1" cm="1"><f t="array" ref="A1">X()</f><v>9</v></c></row>
+            \\<row r="2"/>
+        );
+        var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+            daAnchorPub("A1", .{ .number = 1 }, .{ .spilled = .{ .rows = 2, .cols = 1 } }),
+            tailPub("A2", "A1", .{ .number = 2 }),
+        });
+        defer f.deinit();
+        try expectRefusalWith(testing.allocator, &f, &proven_table, .tail_row_self_closing);
+    }
+    // Into a row whose `spans` would go stale.
+    {
+        const xml = sheetXml(
+            \\<row r="1"><c r="A1" cm="1"><f t="array" ref="A1">X()</f><v>9</v></c></row>
+            \\<row r="2" spans="1:1"><c r="A2"><v>1</v></c></row>
+        );
+        var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+            daAnchorPub("A1", .{ .number = 1 }, .{ .spilled = .{ .rows = 2, .cols = 2 } }),
+            tailPub("B1", "A1", .{ .number = 2 }),
+            tailPub("A2", "A1", .{ .number = 3 }),
+            tailPub("B2", "A1", .{ .number = 4 }),
+        });
+        defer f.deinit();
+        try expectRefusalWith(testing.allocator, &f, &proven_table, .tail_row_spans_stale);
+    }
+    // A spill that must expand an unparseable dimension refuses —
+    // §5.8b's "refuse until this mutation is proven possible".
+    {
+        const xml =
+            "<worksheet" ++ ns_attr ++ ">" ++
+            "<dimension ref=\"GARBAGE\"/>" ++
+            "<sheetData>" ++
+            "<row r=\"1\"><c r=\"A1\" cm=\"1\"><f t=\"array\" ref=\"A1\">X()</f><v>9</v></c></row>" ++
+            "<row r=\"2\"></row>" ++
+            "</sheetData></worksheet>";
+        var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+            daAnchorPub("A1", .{ .number = 1 }, .{ .spilled = .{ .rows = 2, .cols = 1 } }),
+            tailPub("A2", "A1", .{ .number = 2 }),
+        });
+        defer f.deinit();
+        try expectRefusalWith(testing.allocator, &f, &proven_table, .dimension_unparseable);
+    }
+    // A tail without its anchor in the projection is half a construct.
+    {
+        const xml = sheetXml(
+            \\<row r="1"><c r="A1"><v>1</v></c></row>
+            \\<row r="2"></row>
+        );
+        var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+            tailPub("A2", "A1", .{ .number = 2 }),
+        });
+        defer f.deinit();
+        try expectRefusalWith(testing.allocator, &f, &proven_table, .tail_without_anchor);
+    }
+}
+
+test "§5.8b: a clear the ownership record does not own refuses" {
+    // The stored ref claims A2 as a tail; A2 holds a formula. Clearing
+    // it would delete content the record never owned.
+    const xml = sheetXml(
+        \\<row r="1"><c r="A1" cm="1"><f t="array" ref="A1:A2">X()</f><v>9</v></c></row>
+        \\<row r="2"><c r="A2"><f>1+1</f><v>2</v></c></row>
+    );
+    var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+        daAnchorPub("A1", .{ .number = 1 }, .{ .spilled = .{ .rows = 1, .cols = 1 } }),
+    });
+    defer f.deinit();
+    try expectRefusalWith(testing.allocator, &f, &proven_table, .tail_clear_foreign);
+}
+
+test "§5.8b: the proven path refuses cleanly under allocation failure" {
+    const xml = sheetXml(
+        \\<row r="1"><c r="A1" cm="1"><f t="array" ref="A1:A2">SEQUENCE(3)</f><v>999</v></c></row>
+        \\<row r="2"><c r="A2"><v>999</v></c></row>
+        \\<row r="3"></row>
+    );
+    var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+        daAnchorPub("A1", .{ .number = 1 }, .{ .spilled = .{ .rows = 3, .cols = 1 } }),
+        tailPub("A2", "A1", .{ .number = 2 }),
+        tailPub("A3", "A1", .{ .number = 3 }),
+    });
+    defer f.deinit();
+
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: Allocator, fixture: *Fixture) !void {
+            var result = patchWithTable(&fixture.resolved, gpa, &proven_table) catch |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                return err;
+            };
+            switch (result) {
+                .ok => |*p| p.deinit(),
+                .refused => return error.TestUnexpectedRefusal,
+            }
+        }
+    }.run, .{&f});
 }
 
 // ─── the projection's own refusals ───────────────────────────────
@@ -1823,7 +2983,7 @@ test "refusal: a value no `<v>` can hold refuses rather than being written" {
     }
 }
 
-test "refusals: every reason has a §10 plane, and the gate's four share one" {
+test "refusals: every reason has a §10 plane, and the whole gate family shares one" {
     inline for (@typeInfo(Refusal.Reason).@"enum".fields) |field| {
         const reason: Refusal.Reason = @enumFromInt(field.value);
         _ = (Refusal{ .reason = reason }).planeTwo();
@@ -1831,8 +2991,17 @@ test "refusals: every reason has a §10 plane, and the gate's four share one" {
     inline for (.{
         Refusal.Reason.non_scalar_result,
         Refusal.Reason.dynamic_array_anchor,
-        Refusal.Reason.cse_array,
+        Refusal.Reason.transition_unproven,
+        Refusal.Reason.value_metadata_write,
+        Refusal.Reason.cse_range_mismatch,
         Refusal.Reason.cell_insertion_unsupported,
+        Refusal.Reason.tail_row_missing,
+        Refusal.Reason.tail_row_self_closing,
+        Refusal.Reason.tail_row_spans_stale,
+        Refusal.Reason.dimension_unparseable,
+        Refusal.Reason.anchor_ref_unusable,
+        Refusal.Reason.tail_without_anchor,
+        Refusal.Reason.tail_clear_foreign,
     }) |reason| {
         try testing.expectEqual(
             PlaneTwo.FormulaSpillPersistUnsupported,
@@ -1904,10 +3073,11 @@ test "spans: implicit coordinates get slots at the reconstructed positions" {
     ), p.bytes);
 }
 
-test "spans: a formula's bytes are never inside an approved range" {
+test "spans: a formula's bytes are outside every approved range, except exactly the ref value" {
     // The projection carries the `<f>` and the patcher proves it: for
     // every cell shape, no approved range of any kind intersects the
-    // `<f>` element.
+    // `<f>` element — except §5.8b's ONE carve-out, `f_ref_replace`,
+    // which must sit exactly on the raw ref value and nowhere else.
     const xml = sheetXml(
         \\<row r="1"><c r="A1" t="str"><f t="shared" si="0" ref="A1:A2">_x0041_&amp;"x"</f><v>a</v></c></row>
     );
@@ -1922,10 +3092,16 @@ test "spans: a formula's bytes are never inside an approved range" {
     inline for (@typeInfo(EditKind).@"enum".fields) |field| {
         const kind: EditKind = @enumFromInt(field.value);
         if (approvedRange(xml, spans, kind)) |r| {
-            const disjoint = r.end <= f.start or r.start >= f.end;
-            if (!disjoint) {
-                std.debug.print("{s} may address the formula\n", .{field.name});
-                return error.TestUnexpectedResult;
+            if (kind == .f_ref_replace) {
+                try testing.expectEqual(spans.f_ref.?.start, r.start);
+                try testing.expectEqual(spans.f_ref.?.end, r.end);
+                try testing.expectEqualStrings("A1:A2", r.slice(xml));
+            } else {
+                const disjoint = r.end <= f.start or r.start >= f.end;
+                if (!disjoint) {
+                    std.debug.print("{s} may address the formula\n", .{field.name});
+                    return error.TestUnexpectedResult;
+                }
             }
         }
     }
@@ -2095,7 +3271,11 @@ fn assertConfinement(a: Allocator, run: *const Run) !void {
         run.gen.xml,
         run.patched.bytes,
         run.patched.edits,
-        run.scan.slots,
+        .{
+            .slots = run.scan.slots,
+            .rows = run.scan.rows,
+            .dimension = run.scan.dimension,
+        },
     ) catch |err| {
         std.debug.print(
             "confinement broken ({t})\nsource: {s}\npatched: {s}\n",
@@ -2231,7 +3411,7 @@ test "fuzz: the confinement checker rejects a patch that lied" {
     defer testing.allocator.free(out);
     try testing.expectError(
         error.UnapprovedRange,
-        verifyConfinement(testing.allocator, xml, out, &strayed, scan.slots),
+        verifyConfinement(testing.allocator, xml, out, &strayed, .{ .slots = scan.slots }),
     );
 
     // An honest edit list against an output that has an extra change in
@@ -2246,7 +3426,7 @@ test "fuzz: the confinement checker rejects a patch that lied" {
     defer testing.allocator.free(tampered);
     try testing.expectError(
         error.EditsDoNotExplainOutput,
-        verifyConfinement(testing.allocator, xml, tampered, &honest, scan.slots),
+        verifyConfinement(testing.allocator, xml, tampered, &honest, .{ .slots = scan.slots }),
     );
 }
 
