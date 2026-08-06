@@ -1370,9 +1370,12 @@ pub const Evaluator = struct {
                 // scalar path below needs no separate branch.
                 .top_left_reduction => {},
                 .spill_or_iterate => {
-                    // A mixed signature — a range slot beside a scalar
-                    // one — is M7a's decision table, not this row's.
-                    if (!f.liftable()) return error.NotYetImplemented;
+                    // The mixed-signature answer (M7a): lift over the
+                    // SCALAR slots that carry arrays, hold every
+                    // non-scalar slot fixed — `VLOOKUP({1;2},T,2)` is
+                    // two lookups down one table. `liftable()` is no
+                    // longer a gate, only the statement that a function
+                    // with nothing but scalar slots lifts wholesale.
                     const cur = lift orelse value.Shape{ .rows = 1, .cols = 1 };
                     lift = .{
                         .rows = @max(cur.rows, op.shape.rows),
@@ -1399,10 +1402,19 @@ pub const Evaluator = struct {
                         args[k] = .{ .scalar = try self.coerceSlot(f.coercion.at(k), el) };
                     }
                     const one = try self.propagateAndInvoke(f, args);
-                    // A liftable function's slots are all scalar classes,
-                    // so a per-element call cannot produce an array.
-                    assert(one == .scalar);
-                    m.set(r, c, one.scalar);
+                    // §5.3b's nested-array rule: a per-element result
+                    // that is itself an array reduces to its top-left —
+                    // `SEQUENCE({1,2})` is `{1,1}` — and a per-element
+                    // reference dereferences the same way.
+                    m.set(r, c, switch (one) {
+                        .scalar => |s| s,
+                        .array => |a| a.topLeft(),
+                        .reference => blk: {
+                            const rop = try self.operandOf(one);
+                            break :blk rop.at(0, 0).?;
+                        },
+                        .missing_arg => unreachable,
+                    });
                 }
             }
             return .{ .array = m };
@@ -2317,6 +2329,9 @@ const Expect = union(enum) {
     boolean: bool,
     text: []const u8,
     err: value.KnownError,
+    /// A blank element inside an expected array (M7a: SORT pins §5.3b's
+    /// blanks-first row against a range with an absent cell).
+    blank,
     array: Arr,
 
     const Arr = struct { rows: u32, cols: u32, cells: []const Expect };
@@ -2341,6 +2356,10 @@ fn expectValue(exp: Expect, v: Value) !void {
             try testing.expect(v == .scalar);
             try testing.expect(v.scalar == .err);
             try testing.expectEqual(e, v.scalar.err.known);
+        },
+        .blank => {
+            try testing.expect(v == .scalar);
+            try testing.expect(v.scalar == .blank);
         },
         .array => |a| {
             try testing.expect(v == .array);
@@ -6421,6 +6440,398 @@ test "M4g: every name against every argument shape, in both epochs" {
     // no arguments and refuse every shape on arity, which is itself the
     // assertion that a zero-argument row cannot quietly grow one.
     try testing.expectEqual(@as(usize, 15 * 7 * 2), checked);
+}
+
+// ─── M7a: the F2-DA batch (§7, seven names; §5.8a) ───────────────
+
+/// The battery's grid. Column A is SORT's numeric subject with a
+/// deliberate hole (A5 — §5.3b pins blanks sorting FIRST); column B is
+/// the collation ladder (`A`/`a` fold-equal, `ss`/`ß` fold-equal);
+/// D holds an error ABOVE a number so "errors pinned last" is proved
+/// against source order; E is FILTER's include with an error in it.
+fn putF2Cells(h: *Harness) !void {
+    try h.put("A1", num(3));
+    try h.put("A2", num(1));
+    try h.put("A3", num(2));
+    try h.put("A4", num(2));
+    try h.put("B1", .{ .text = "b" });
+    try h.put("B2", .{ .text = "A" });
+    try h.put("B3", .{ .text = "a" });
+    try h.put("B4", .{ .text = "ss" });
+    try h.put("B5", .{ .text = "ß" });
+    try h.put("C1", .{ .boolean = true });
+    try h.put("C2", value.ScalarValue.errorOf(.ref));
+    try h.put("D1", value.ScalarValue.errorOf(.ref));
+    try h.put("D2", num(7));
+    try h.put("E1", num(1));
+    try h.put("E2", value.ScalarValue.errorOf(.div0));
+    try h.put("E3", num(0));
+    try h.put("E4", num(1));
+}
+
+const F2Case = struct {
+    func: []const u8,
+    formula: []const u8,
+    expect: Expect,
+    evidence: Evidence = .spec_pinned,
+    note: []const u8 = "",
+};
+
+const f2_cases = [_]F2Case{
+    // ── SEQUENCE: the closed form, both dimensions, CHOOSE's trunc ──
+    .{ .func = "SEQUENCE", .formula = "SEQUENCE(2,3)", .expect = .{ .array = .{ .rows = 2, .cols = 3, .cells = &.{ .{ .number = 1 }, .{ .number = 2 }, .{ .number = 3 }, .{ .number = 4 }, .{ .number = 5 }, .{ .number = 6 } } } } },
+    .{ .func = "SEQUENCE", .formula = "SEQUENCE(3)", .expect = .{ .array = .{ .rows = 3, .cols = 1, .cells = &.{ .{ .number = 1 }, .{ .number = 2 }, .{ .number = 3 } } } } },
+    .{ .func = "SEQUENCE", .formula = "SEQUENCE(2,2,10,-1)", .expect = .{ .array = .{ .rows = 2, .cols = 2, .cells = &.{ .{ .number = 10 }, .{ .number = 9 }, .{ .number = 8 }, .{ .number = 7 } } } } },
+    .{ .func = "SEQUENCE", .formula = "SEQUENCE(2.9,1.9)", .expect = .{ .array = .{ .rows = 2, .cols = 1, .cells = &.{ .{ .number = 1 }, .{ .number = 2 } } } }, .note = "dimensions truncate toward zero" },
+    .{ .func = "SEQUENCE", .formula = "SEQUENCE(1,2,0.5,0.25)", .expect = .{ .array = .{ .rows = 1, .cols = 2, .cells = &.{ .{ .number = 0.5 }, .{ .number = 0.75 } } } } },
+    .{ .func = "SEQUENCE", .formula = "SEQUENCE(0)", .expect = .{ .err = .calc }, .note = "a zero extent is the empty rectangle (§5.3a)" },
+    .{ .func = "SEQUENCE", .formula = "SEQUENCE(-1)", .expect = .{ .err = .value } },
+
+    // ── RANDARRAY under the harness's constant 0.5 source: the VALUE
+    //    rows; the draw schedule is the KATs' below ──
+    .{ .func = "RANDARRAY", .formula = "RANDARRAY()", .expect = .{ .array = .{ .rows = 1, .cols = 1, .cells = &.{.{ .number = 0.5 }} } } },
+    .{ .func = "RANDARRAY", .formula = "RANDARRAY(2,2)", .expect = .{ .array = .{ .rows = 2, .cols = 2, .cells = &.{ .{ .number = 0.5 }, .{ .number = 0.5 }, .{ .number = 0.5 }, .{ .number = 0.5 } } } } },
+    .{ .func = "RANDARRAY", .formula = "RANDARRAY(1,1,10,20)", .expect = .{ .array = .{ .rows = 1, .cols = 1, .cells = &.{.{ .number = 15 }} } } },
+    .{ .func = "RANDARRAY", .formula = "RANDARRAY(1,1,1,10,TRUE())", .expect = .{ .array = .{ .rows = 1, .cols = 1, .cells = &.{.{ .number = 6 }} } }, .note = "RANDBETWEEN's scaling: floor(0.5·10)+1" },
+    .{ .func = "RANDARRAY", .formula = "RANDARRAY(1,1,2,1)", .expect = .{ .err = .value }, .note = "min above max" },
+    .{ .func = "RANDARRAY", .formula = "RANDARRAY(1,1,1.2,1.8,TRUE())", .expect = .{ .err = .num }, .note = "empty only after the bounds moved inward — RANDBETWEEN's row" },
+    .{ .func = "RANDARRAY", .formula = "RANDARRAY(0)", .expect = .{ .err = .calc } },
+    .{ .func = "RANDARRAY", .formula = "RANDARRAY(-1)", .expect = .{ .err = .value } },
+
+    // ── TRANSPOSE ──
+    .{ .func = "TRANSPOSE", .formula = "TRANSPOSE({1,2,3})", .expect = .{ .array = .{ .rows = 3, .cols = 1, .cells = &.{ .{ .number = 1 }, .{ .number = 2 }, .{ .number = 3 } } } } },
+    .{ .func = "TRANSPOSE", .formula = "TRANSPOSE({1,2;3,4})", .expect = .{ .array = .{ .rows = 2, .cols = 2, .cells = &.{ .{ .number = 1 }, .{ .number = 3 }, .{ .number = 2 }, .{ .number = 4 } } } } },
+    .{ .func = "TRANSPOSE", .formula = "TRANSPOSE(5)", .expect = .{ .array = .{ .rows = 1, .cols = 1, .cells = &.{.{ .number = 5 }} } } },
+    .{ .func = "TRANSPOSE", .formula = "TRANSPOSE(A1:A3)", .expect = .{ .array = .{ .rows = 1, .cols = 3, .cells = &.{ .{ .number = 3 }, .{ .number = 1 }, .{ .number = 2 } } } } },
+    .{ .func = "TRANSPOSE", .formula = "TRANSPOSE((A1:A2,B1:B2))", .expect = .{ .err = .value }, .note = "a multi-area union is not one rectangle" },
+
+    // ── FILTER ──
+    .{ .func = "FILTER", .formula = "FILTER(A1:A4,{1;0;1;0})", .expect = .{ .array = .{ .rows = 2, .cols = 1, .cells = &.{ .{ .number = 3 }, .{ .number = 2 } } } } },
+    .{ .func = "FILTER", .formula = "FILTER(A1:A4,{0;0;0;0})", .expect = .{ .err = .calc }, .note = "nothing matched and no third argument: the empty matrix meets the call boundary" },
+    .{ .func = "FILTER", .formula = "FILTER(A1:A4,{0;0;0;0},\"none\")", .expect = .{ .text = "none" } },
+    .{ .func = "FILTER", .formula = "FILTER({1;2},{0;0},{9,8})", .expect = .{ .array = .{ .rows = 1, .cols = 2, .cells = &.{ .{ .number = 9 }, .{ .number = 8 } } } }, .note = "if_empty may itself be an array" },
+    .{ .func = "FILTER", .formula = "FILTER(A1:A4,{1;0;1})", .expect = .{ .err = .value }, .note = "include length mismatch" },
+    .{ .func = "FILTER", .formula = "FILTER({1,2,3},{0,1,1})", .expect = .{ .array = .{ .rows = 1, .cols = 2, .cells = &.{ .{ .number = 2 }, .{ .number = 3 } } } }, .note = "a row include names columns" },
+    .{ .func = "FILTER", .formula = "FILTER(A1:A4,{1;\"x\";1;0})", .expect = .{ .err = .value }, .note = "text is not a condition (§5.3b's logical column)" },
+    .{ .func = "FILTER", .formula = "FILTER(A1:A4,E1:E4)", .expect = .{ .err = .div0 }, .note = "an error in the include is the whole answer" },
+    .{ .func = "FILTER", .formula = "FILTER({1,2;3,4},{1;0})", .expect = .{ .array = .{ .rows = 1, .cols = 2, .cells = &.{ .{ .number = 1 }, .{ .number = 2 } } } } },
+
+    // ── SORT ──
+    .{ .func = "SORT", .formula = "SORT({3;1;2})", .expect = .{ .array = .{ .rows = 3, .cols = 1, .cells = &.{ .{ .number = 1 }, .{ .number = 2 }, .{ .number = 3 } } } } },
+    .{ .func = "SORT", .formula = "SORT({3;1;2},1,-1)", .expect = .{ .array = .{ .rows = 3, .cols = 1, .cells = &.{ .{ .number = 3 }, .{ .number = 2 }, .{ .number = 1 } } } } },
+    .{ .func = "SORT", .formula = "SORT({1,3;2,1},2)", .expect = .{ .array = .{ .rows = 2, .cols = 2, .cells = &.{ .{ .number = 2 }, .{ .number = 1 }, .{ .number = 1 }, .{ .number = 3 } } } }, .note = "sort rows by the second column" },
+    .{ .func = "SORT", .formula = "SORT({3,1,2},1,1,TRUE())", .expect = .{ .array = .{ .rows = 1, .cols = 3, .cells = &.{ .{ .number = 1 }, .{ .number = 2 }, .{ .number = 3 } } } }, .note = "by_col sorts columns" },
+    .{ .func = "SORT", .formula = "SORT(A1:A5)", .expect = .{ .array = .{ .rows = 5, .cols = 1, .cells = &.{ .blank, .{ .number = 1 }, .{ .number = 2 }, .{ .number = 2 }, .{ .number = 3 } } } }, .note = "§5.3b: blanks sort first" },
+    .{ .func = "SORT", .formula = "SORT(B1:B5)", .expect = .{ .array = .{ .rows = 5, .cols = 1, .cells = &.{ .{ .text = "A" }, .{ .text = "a" }, .{ .text = "b" }, .{ .text = "ss" }, .{ .text = "ß" } } } }, .note = "fold-equal elements are EQUAL; source order is the only tie-break" },
+    .{ .func = "SORT", .formula = "SORT(D1:D2)", .expect = .{ .array = .{ .rows = 2, .cols = 1, .cells = &.{ .{ .number = 7 }, .{ .err = .ref } } } }, .note = "errors pinned last, from above the number in source order" },
+    .{ .func = "SORT", .formula = "SORT({2;1},2)", .expect = .{ .err = .value }, .note = "sort_index out of bounds" },
+    .{ .func = "SORT", .formula = "SORT({2;1},1,0)", .expect = .{ .err = .value }, .note = "an order is 1 or -1" },
+    .{ .func = "SORT", .formula = "SORT({TRUE;\"x\";2})", .expect = .{ .array = .{ .rows = 3, .cols = 1, .cells = &.{ .{ .number = 2 }, .{ .text = "x" }, .{ .boolean = true } } } }, .note = "number < text < logical" },
+    .{ .func = "SORT", .formula = "SORT({1,2;1,1;0,5},{1,2})", .expect = .{ .array = .{ .rows = 3, .cols = 2, .cells = &.{ .{ .number = 0 }, .{ .number = 5 }, .{ .number = 1 }, .{ .number = 1 }, .{ .number = 1 }, .{ .number = 2 } } } }, .note = "two levels: column 1, then column 2" },
+    .{ .func = "SORT", .formula = "SORT({1,2;2,1;1,1},{1,2},-1)", .expect = .{ .array = .{ .rows = 3, .cols = 2, .cells = &.{ .{ .number = 2 }, .{ .number = 1 }, .{ .number = 1 }, .{ .number = 2 }, .{ .number = 1 }, .{ .number = 1 } } } }, .note = "a single order broadcasts over every level" },
+
+    // ── SORTBY ──
+    .{ .func = "SORTBY", .formula = "SORTBY({\"a\";\"b\";\"c\"},{3;1;2})", .expect = .{ .array = .{ .rows = 3, .cols = 1, .cells = &.{ .{ .text = "b" }, .{ .text = "c" }, .{ .text = "a" } } } } },
+    .{ .func = "SORTBY", .formula = "SORTBY({\"a\";\"b\";\"c\"},{3;1;2},-1)", .expect = .{ .array = .{ .rows = 3, .cols = 1, .cells = &.{ .{ .text = "a" }, .{ .text = "c" }, .{ .text = "b" } } } } },
+    .{ .func = "SORTBY", .formula = "SORTBY({1;2;3},{1;1;1},1,{3;2;1},1)", .expect = .{ .array = .{ .rows = 3, .cols = 1, .cells = &.{ .{ .number = 3 }, .{ .number = 2 }, .{ .number = 1 } } } }, .note = "primary all-ties; the second pair decides" },
+    .{ .func = "SORTBY", .formula = "SORTBY({5,4},{2,1})", .expect = .{ .array = .{ .rows = 1, .cols = 2, .cells = &.{ .{ .number = 4 }, .{ .number = 5 } } } }, .note = "a row by-vector sorts columns" },
+    .{ .func = "SORTBY", .formula = "SORTBY({1;2},{1,2})", .expect = .{ .err = .value }, .note = "the by-vector must run the array's way" },
+    .{ .func = "SORTBY", .formula = "SORTBY({1;2},{1;2},5)", .expect = .{ .err = .value } },
+
+    // ── UNIQUE ──
+    .{ .func = "UNIQUE", .formula = "UNIQUE({1;2;1;3})", .expect = .{ .array = .{ .rows = 3, .cols = 1, .cells = &.{ .{ .number = 1 }, .{ .number = 2 }, .{ .number = 3 } } } } },
+    .{ .func = "UNIQUE", .formula = "UNIQUE({1;2;1;3},FALSE(),TRUE())", .expect = .{ .array = .{ .rows = 2, .cols = 1, .cells = &.{ .{ .number = 2 }, .{ .number = 3 } } } }, .note = "exactly_once" },
+    .{ .func = "UNIQUE", .formula = "UNIQUE({1,2;1,2;3,4})", .expect = .{ .array = .{ .rows = 2, .cols = 2, .cells = &.{ .{ .number = 1 }, .{ .number = 2 }, .{ .number = 3 }, .{ .number = 4 } } } }, .note = "a row is the unit of equality" },
+    .{ .func = "UNIQUE", .formula = "UNIQUE({1,1,2},TRUE())", .expect = .{ .array = .{ .rows = 1, .cols = 2, .cells = &.{ .{ .number = 1 }, .{ .number = 2 } } } }, .note = "by_col dedups columns" },
+    .{ .func = "UNIQUE", .formula = "UNIQUE(B2:B3)", .expect = .{ .array = .{ .rows = 1, .cols = 1, .cells = &.{.{ .text = "A" }} } }, .note = "`A`/`a` fold-equal: keep-first" },
+    .{ .func = "UNIQUE", .formula = "UNIQUE(B4:B5)", .expect = .{ .array = .{ .rows = 1, .cols = 1, .cells = &.{.{ .text = "ss" }} } }, .note = "`ss`/`ß` fold-equal: keep-first" },
+    .{ .func = "UNIQUE", .formula = "UNIQUE({1;1},FALSE(),TRUE())", .expect = .{ .err = .calc }, .note = "no singleton rows: the empty rectangle" },
+    .{ .func = "UNIQUE", .formula = "UNIQUE({1;TRUE})", .expect = .{ .array = .{ .rows = 2, .cols = 1, .cells = &.{ .{ .number = 1 }, .{ .boolean = true } } } }, .note = "cross-type pairs are never equal" },
+};
+
+test "M7a: every F2-DA fixture evaluates to what the spec says" {
+    for (f2_cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF2Cells(&h);
+
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("F2-DA case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectValue(c.expect, v) catch |e| {
+            std.debug.print("F2-DA case `{s}` ({s})\n", .{ c.formula, c.note });
+            return e;
+        };
+    }
+}
+
+test "M7a: all seven frozen names resolve, and each has a fixture" {
+    var it = registry.inventory();
+    var batch: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M7a")) continue;
+        batch += 1;
+
+        if (registry.lookup(e.name) == null) {
+            std.debug.print("F2-DA name does not resolve: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        }
+        var fixtures: usize = 0;
+        for (f2_cases) |c| {
+            if (std.mem.eql(u8, c.func, e.name)) fixtures += 1;
+        }
+        if (fixtures == 0) {
+            std.debug.print("F2-DA name has no fixture: {s}\n", .{e.name});
+            return error.UnfixturedBatchFunction;
+        }
+    }
+    try testing.expectEqual(@as(usize, 7), batch);
+
+    for (f2_cases) |c| {
+        var found = false;
+        var it2 = registry.inventory();
+        while (it2.next()) |e| {
+            if (std.mem.eql(u8, e.name, c.func) and std.mem.eql(u8, e.milestone, "M7a")) found = true;
+        }
+        if (!found) {
+            std.debug.print("fixture names a function outside F2-DA: {s}\n", .{c.func});
+            return error.FixtureOutsideBatch;
+        }
+    }
+}
+
+test "M7a: the evidence label on every fixture is true of the committed manifests" {
+    var oracle_rows: usize = 0;
+    var excluded_rows: usize = 0;
+    for (f2_cases) |c| {
+        switch (try manifestVerdict(c.formula)) {
+            .decided => {
+                if (c.evidence != .oracle) return error.UnderstatedEvidence;
+                oracle_rows += 1;
+            },
+            .excluded => {
+                if (c.evidence != .spec_pinned) return error.ExcludedCellClaimedAsEvidence;
+                excluded_rows += 1;
+            },
+            .silent => {
+                if (c.evidence != .spec_pinned) return error.UnbackedOracleClaim;
+            },
+        }
+    }
+    // The committed manifests predate every F2-DA name; the parked
+    // Excel leg is what would move these.
+    try testing.expectEqual(@as(usize, 0), oracle_rows);
+    try testing.expectEqual(@as(usize, 0), excluded_rows);
+}
+
+test "M7a: the mixed-signature lift — scalar slots lift, whole slots hold" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    try h.put("A1", num(1));
+    try h.put("B1", num(10));
+    try h.put("A2", num(2));
+    try h.put("B2", num(20));
+
+    const Case = struct { formula: []const u8, expect: Expect };
+    const cases = [_]Case{
+        // `INDEX(A1:B2,{1;2},1)` is two INDEXes into ONE table: the
+        // scalar row slot lifts, the `.aggregate` table holds. Before
+        // M7a this was the `error.NotYetImplemented` at the
+        // `.spill_or_iterate` arm.
+        .{ .formula = "INDEX(A1:B2,{1;2},1)", .expect = .{ .array = .{ .rows = 2, .cols = 1, .cells = &.{ .{ .number = 1 }, .{ .number = 2 } } } } },
+        // Both lifted slots at once, broadcast against each other.
+        .{ .formula = "INDEX(A1:B2,{1;2},{1;2})", .expect = .{ .array = .{ .rows = 2, .cols = 1, .cells = &.{ .{ .number = 1 }, .{ .number = 20 } } } } },
+        // §5.3b's nested-array rule: a per-element result that is
+        // itself an array reduces to its top-left — `SEQUENCE({1,2})`
+        // is `{1,1}`.
+        .{ .formula = "SEQUENCE({1,2})", .expect = .{ .array = .{ .rows = 1, .cols = 2, .cells = &.{ .{ .number = 1 }, .{ .number = 1 } } } } },
+    };
+    for (cases) |c| {
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("mixed-lift case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectValue(c.expect, v) catch |e| {
+            std.debug.print("mixed-lift case `{s}`\n", .{c.formula});
+            return e;
+        };
+    }
+
+    // Under `legacy` the same text reduces the array in the scalar slot
+    // to its top-left instead of lifting (§5.3b `array where scalar
+    // expected`).
+    var legacy = h.options();
+    legacy.dialect = .legacy;
+    try expectValue(.{ .number = 1 }, try h.evalOpts("INDEX(A1:B2,{1;2},1)", legacy));
+}
+
+test "M7a: a DA native is a DA native under either dialect" {
+    // Dialect changes how an ARRAY MEETS A SCALAR SLOT, not what a
+    // matrix-producing native returns: `SEQUENCE(3)` is 3×1 under
+    // `legacy` too (a legacy CSE consumes it by declared range, §5.6h).
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    var legacy = h.options();
+    legacy.dialect = .legacy;
+    try expectValue(
+        .{ .array = .{ .rows = 3, .cols = 1, .cells = &.{ .{ .number = 1 }, .{ .number = 2 }, .{ .number = 3 } } } },
+        try h.evalOpts("SEQUENCE(3)", legacy),
+    );
+    // `@SEQUENCE(3)` is §5.3b's own citation for `@` over an array:
+    // top-left, under both dialects.
+    try expectValue(.{ .number = 1 }, try h.eval("@SEQUENCE(3)"));
+    try expectValue(.{ .number = 1 }, try h.evalOpts("@SEQUENCE(3)", legacy));
+}
+
+test "M7a: a rectangle past §9's matrix cap is a LIMIT, not a value" {
+    // §5.8a's last row: > `max_matrix_cells` → `FormulaLimitExceeded`.
+    // The cap is enforced by construction at `Matrix.init`, so the
+    // refusal fires before a single cell is allocated.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    try testing.expectError(error.LimitExceeded, h.eval("SEQUENCE(1,4000001)"));
+    // A dimension the cap can never fit refuses identically — the u32
+    // cast is guarded by the same rule, not by luck.
+    try testing.expectError(error.LimitExceeded, h.eval("SEQUENCE(99999999999)"));
+    try testing.expectError(error.LimitExceeded, h.eval("RANDARRAY(4000001)"));
+    // The boundary itself is a value: exactly `max_matrix_cells` cells.
+    const v = try h.eval("SEQUENCE(2000,2000)");
+    try testing.expect(v == .array);
+    try testing.expectEqual(@as(f64, 1), v.array.at(0, 0).number);
+    try testing.expectEqual(@as(f64, 4_000_000), v.array.at(1999, 1999).number);
+}
+
+// ─── M7a draw KATs (§5.6d: RANDARRAY element ordinals) ───────────
+
+test "M7a: draw counts — one per element, zero before a refused range" {
+    const Case = struct { formula: []const u8, draws: u64 };
+    const cases = [_]Case{
+        .{ .formula = "SEQUENCE(3)", .draws = 0 },
+        .{ .formula = "RANDARRAY()", .draws = 1 },
+        .{ .formula = "RANDARRAY(2,3)", .draws = 6 },
+        .{ .formula = "RANDARRAY(2,2,1,4,TRUE())", .draws = 4 },
+        // The bound check precedes the loop: a refused range consumed
+        // NOTHING, so the schedule cannot have been perturbed by an
+        // answer that never existed.
+        .{ .formula = "RANDARRAY(1,1,2,1)", .draws = 0 },
+        // Laziness still governs: a dead branch's rectangle draws zero.
+        .{ .formula = "IF(TRUE(),1,RANDARRAY(2,2))", .draws = 0 },
+        // An aggregate slot is eager: SORT's subject draws before SORT
+        // reads it.
+        .{ .formula = "SORT(RANDARRAY(2,2))", .draws = 4 },
+    };
+    for (cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+
+        _ = h.eval(c.formula) catch |e| {
+            std.debug.print("draw case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        if (h.draws.count != c.draws) {
+            std.debug.print("`{s}`: expected {d} draws, saw {d}\n", .{ c.formula, c.draws, h.draws.count });
+            return error.WrongDrawCount;
+        }
+    }
+}
+
+test "M7a KAT: RANDARRAY draws by element ordinal, reproducibly from the seed" {
+    const inputs: run_inputs.RunInputs = .{ .now_utc_ms = 0, .rng_seed = 0xDA7A_A44A, .limits = .{} };
+    try inputs.validate();
+
+    var first: [6]f64 = undefined;
+    {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        var generator = rng.Rng.fromRunInputs(inputs);
+        var source = generator.drawSource();
+        var opts = h.options();
+        opts.draws = &source;
+
+        const v = try h.evalOpts("RANDARRAY(2,3)", opts);
+        try testing.expect(v == .array);
+        try testing.expectEqual(@as(u32, 2), v.array.rows);
+        try testing.expectEqual(@as(u32, 3), v.array.cols);
+        // One draw per element, counted — the instrument a right answer
+        // arrived at wrongly cannot satisfy.
+        try testing.expectEqual(@as(u64, 6), source.count);
+        for (&first, 0..) |*slot, i| slot.* = v.array.cells[i].number;
+        // Distinct ordinals, distinct draws: under a per-element key no
+        // two of this seed's six elements collide.
+        for (first, 0..) |a, i| {
+            for (first[i + 1 ..]) |b| try testing.expect(a != b);
+        }
+    }
+    {
+        // Same seed ⇒ the SAME array, bit for bit.
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        var generator = rng.Rng.fromRunInputs(inputs);
+        var source = generator.drawSource();
+        var opts = h.options();
+        opts.draws = &source;
+
+        const v = try h.evalOpts("RANDARRAY(2,3)", opts);
+        for (first, 0..) |a, i| {
+            try testing.expectEqual(
+                @as(u64, @bitCast(a)),
+                @as(u64, @bitCast(v.array.cells[i].number)),
+            );
+        }
+    }
+    {
+        // A different seed names a different stream.
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        var generator = rng.Rng.init(inputs.rng_seed + 1);
+        var source = generator.drawSource();
+        var opts = h.options();
+        opts.draws = &source;
+
+        const v = try h.evalOpts("RANDARRAY(2,3)", opts);
+        var differs = false;
+        for (first, 0..) |a, i| {
+            if (@as(u64, @bitCast(a)) != @as(u64, @bitCast(v.array.cells[i].number))) differs = true;
+        }
+        try testing.expect(differs);
+    }
+}
+
+test "M7a KAT: a decided element key generates nothing on re-evaluation" {
+    // §5.6d's memo at the element level: the second evaluation of the
+    // same text meets six DECIDED keys and reuses every one — the
+    // rebuild-reuse property RANDARRAY's shape passes will lean on.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    var sched: draw_schedule.Schedule = .{};
+    defer sched.deinit(testing.allocator);
+    var generator = rng.Rng.init(0x5EED_DA);
+    var source = generator.drawSource();
+    source.schedule = &sched;
+    source.gpa = testing.allocator;
+    var opts = h.options();
+    opts.draws = &source;
+
+    const a = try h.evalOpts("RANDARRAY(2,3)", opts);
+    try testing.expectEqual(@as(u64, 6), sched.generated);
+    try testing.expectEqual(@as(u64, 0), sched.reused);
+
+    const b = try h.evalOpts("RANDARRAY(2,3)", opts);
+    try testing.expectEqual(@as(u64, 6), sched.generated);
+    try testing.expectEqual(@as(u64, 6), sched.reused);
+    for (a.array.cells, b.array.cells) |x, y| {
+        try testing.expectEqual(@as(u64, @bitCast(x.number)), @as(u64, @bitCast(y.number)));
+    }
 }
 
 // ─── boundaries and refusals ─────────────────────────────────────

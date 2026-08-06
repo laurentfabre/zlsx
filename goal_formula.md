@@ -1740,6 +1740,108 @@ decided five of them.
     every refusal path in this file releases explicitly — a refusal is a
     normal return, so `errdefer` never fires (M4b1 decision 13).
 
+**M7a decisions (shipped 2026-08-06).** Fifteen points the row left
+open, got wrong, or discovered. They span §5.8a (the decision table and
+ownership, `src/formula/spill.zig`), §5.3b (the mixed-signature lift,
+`eval.zig`), §5.6d (RANDARRAY's ordinals), the decode boundary
+(`<mergeCells>`) and the model hosts (`pkg/workbook.zig`,
+`pkg/recalc_run.zig`).
+
+1. **The decision table is one function over a host vtable, and the
+   ownership protocol travels with it.** `spill.decide` and
+   `spill.place` run over `spill.Host` — the workbook model, the
+   closure driver's scratch model and the fuzz's fake grid implement
+   the same five entries — for the reason M4a's classification table IS
+   the parser: a table each host restated would drift in the first
+   commit that changed one of them.
+2. **Decision order, pinned.** The rectangle must FIT the grid before
+   anything else is well-defined — a coordinate past `XFD1048576`
+   cannot be probed — then §5.8a's own listing order: foreign
+   non-empty, table, merge. Both pair cases are fixtured: table+merge
+   answers `table`; a merged range whose covered cell also holds a
+   value answers `obstruction`, because the value check runs first.
+3. **A 1×1 dynamic result is never blocked.** It occupies exactly its
+   own cell; a scalar inside a table or a merge is an ordinary formula
+   result, which is why the early return precedes every probe.
+4. **Placement is the dynamic dialect's, and `cm = 0` is legacy — so
+   spilling is opt-in by metadata.** A legacy cell's array narrows to
+   its top-left exactly as every pre-M7a host behaved: a legacy CSE's
+   tails are its own STORED slave cells, and running the decision table
+   over them would obstruct on the anchor's own declared range. Plain
+   `<f>SEQUENCE(3)</f>` without XLDAPR stays narrowed; only marked
+   anchors place. §5.6h's declared-range placement stays where it was —
+   the stored slaves already carry a CSE's readable tails, so the model
+   has nothing to place for one.
+5. **`dialectOf` skips run-produced layers**, found by this row: the
+   merged read answered the COMPUTED entry, whose `cm` is 0, so an
+   iterating dynamic-array anchor would have flipped to legacy on its
+   second pass. Latent since M5a2 — nothing dynamic iterated until now.
+6. **The `#SPILL!` classes live beside the value, never inside it.**
+   `ErrorValue` is compared non-exhaustively in five files, so a payload
+   arm was a trap; the cell's value stays the bare spelling Excel shows
+   and the class is the model's per-anchor record (`spill.Registry`,
+   `WorkbookEnv.spillClassOf`). `(indeterminate)` keeps its home in the
+   iterate report (§5.6c's shape-change rule) — the one class a
+   placement can never decide, because a placement sees ONE shape.
+7. **A tail is a cell that names its owner** (`Cell.spill_anchor`,
+   layer `.spill_tail`). Shrink clears by the registry's recorded
+   extent rather than by scan, and a failed publication retracts ITSELF
+   by the NEW shape (`errdefer`), because the rollback journal only
+   names cells that published successfully — a half-placed spill cannot
+   wait for a rollback that will never reach it.
+8. **Racing anchors resolve in calc order through occupancy alone.** An
+   anchor's coordinate holds its formula, so the anchor later in calc
+   order meets the earlier one's formula cell or its tails and blocks;
+   no arbitration code exists to disagree with the table. The graph's
+   sorts-first tail-ownership rule (M5a1 decision 12) is untouched — it
+   decides node identity for DECLARED ranges, not placement.
+9. **`A1#` needed no evaluator change, and its grow/shrink visibility
+   is ordinary capture.** M3a2 shipped the postfix complete against
+   `spillShape`; wiring the adapter's registry lit it up. The extent
+   dependency is noted where the returned range is READ (`readRange`),
+   so a dependent's re-evaluation after a grow is §5.6e's ordinary
+   runtime capture, not a special case.
+10. **`OneCell` carries the snapshot whole.** `scalarOf`'s narrowing
+    was the single point every host lost the tails at; it is gone, and
+    the pre-M7 persistence gate still reads the SHAPE from the
+    publication record — regression-pinned with a spill the same run
+    placed (`SEQUENCE(3)` refuses `FormulaSpillPersistUnsupported`
+    with zero mutation, and the CLI's stream grammar carries the
+    matrix unchanged).
+11. **`<mergeCells>` is the one interpreted element outside
+    `<sheetData>`.** §5.8a's merge row needs geometry the scan used to
+    skip wholesale (M4b1 decision 8's stated exception is now real);
+    `count` is recorded nowhere (M4a decision 11), an unknown attribute
+    refuses (decision 12), and `$` is accepted because refusing an
+    unambiguous spelling would refuse a file Excel opens.
+12. **The mixed-signature lift is "scalar slots lift, whole slots
+    hold".** `liftable()` is no longer a gate — `INDEX(A1:B2,{1;2},1)`
+    is two INDEXes down one table — and a per-element result that is
+    itself an array reduces to its top-left (`SEQUENCE({1,2})` is
+    `{1,1}`, §5.3b's nested-array rule). `.value_any` slots deliberately
+    do NOT lift: `VLOOKUP`'s array key keeps M4e's observation
+    semantics, because lifting is a property of SCALAR classes only.
+13. **SEQUENCE and RANDARRAY are not `da_aware`, and the gate proves
+    the flag against the shape.** `da_aware` is the literal statement
+    that a function consumes arrays itself; the producers' slots are all
+    scalar, so they lift like anything else. The batch gate pins
+    `da_aware == !liftable()` for all seven, so the flag and the
+    dispatch it describes cannot disagree.
+14. **RANDARRAY is one scaled draw per element, keyed by §5.6d's
+    ordinal.** RANDBETWEEN's inward bounds and single-draw discipline,
+    generalized; the bound check precedes the loop, so a refused range
+    consumed NOTHING and the schedule is unperturbed. KATs pin same
+    seed ⇒ same array bit-for-bit, element distinctness, the counter,
+    and memo reuse at decided keys.
+15. **SORT's comparator is §5.3b's column as written, and the ladder's
+    benches are the one deferral.** Blanks first (the pinned row —
+    Excel sinks them; recorded divergence), number < text < logical,
+    errors pinned last, fold-equal text EQUAL with stable source
+    position as the only tie-break, descending flipping non-ties only.
+    §9's "M7a adds large-spill and SORT/UNIQUE benches" is NOT in this
+    row's gate and ships in the PR polish round — deferred, dated here
+    so it cannot silently vanish.
+
 ### 5.9 Name & identifier resolution
 
 Call position → strip layered prefixes → registry; unregistered →
@@ -1978,7 +2080,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M5d3** ✅ | `zlsx_recalc.writerSaveWithRecalc` — the orchestrator composition (`saveToOwnedBufferControlled` → `openBufferControlled` → M5d2's `saveWithRecalc`), with §5.10's `Control` threaded into **both** pre-recalc stages and cancellation proven *per stage* by counting the polls each one owes. **`tests/consumer` gains the third module**: a downstream package resolving `zlsx` + `zlsx_pkg` + `zlsx_recalc` through `b.dependency` and driving the composition, which is the only place the module identity a downstream build produces is checked. **Committed bench workloads** (`tests/bench/synth_f1_mix.zig`): a fixed-topology F1-mix generator at three sizes, §9's named 100k-cell workload digest-pinned, plus `zlsx-bench-recalc` (open / recalc / save / phases). **`compare_bench.py --gate`** — median-based, nonzero exit for release cuts; CI's report-only mean path unchanged, both exit behaviours gated. **The hyperfine lane was never ReleaseFast**: the bench modules hardcoded `bench_optimize` (ReleaseSafe) and discarded `-Doptimize` | Module-graph gate; bench baseline |
 | **M5d4** ✅ | **The recalc pipeline made linear.** §9.1's baseline was quadratic in cell count (×4 per row doubling); the profile named two O(n) operations inside per-cell loops, and removing them exposed five more of the same shape. All seven are one bug — **a membership test written as a scan** — and every fix keeps the order its callers depend on. `WorkbookEnv.Sheet` becomes a directory of 64-entry chunks: the (row, col, layer-descending) order is the contract, the flat array never was, and publication stops paying one `memmove` of the tail per cell. `iterate` gains membership indexes **beside** `pass_edges` / `touched` / `previous_reports` (the lists stay — they are what gets handed on), and turns `held`, `scope` and `changedComponents`' signature comparison into maps. `graph.Builder.captureAll` groups §5.6e's flat edge list by owner once instead of rescanning it per formula. `recalc_run.Driver` indexes `published`. **`Index.probe` picks its band by counting stored coordinates rather than by the area's extent** (§5.6a corrected — the extent is right for `SUM(A:A)` and wrong for `SUM(A5:A9)`; both pinned probe counts unchanged). Result on the digest-pinned named workload: `recalc` **133 452 → 905 ms (147×)**, `save` **127 690 → 917 ms**, evaluate 267× over §9's ceiling → **1.81×**, end-to-end 128× over → **under it**, "10k-vs-100k ≤ 15×" ×96.1 → **×11.0** | Determinism; scoped idempotence; no-formula identity; §5.7.9 ordering; workload digest; `compare_bench --gate` |
 | **M6** ✅ | `zlsx eval` + `zlsx recalc` (`src/formula_cli.zig`), delegated whole-tail like `dbx` so the shipped commands and their row envelope are untouched by construction. **The versioned stream state machine** — `"kind"` + `"v":1` on every record, both grammars normative, refusal and cancellation legal before any header, `cancelled.after` naming the last record out. **The nine-row exit table**, including 6 (default-context acquisition — the wall clock / secure random source behind an omitted `--now`/`--seed`, injectable, never conflated with OOM) and the SIGPIPE exception (prefix-valid, no terminal, exit 0 — distinguishable from abnormal EOF by code). **Commit-aware exit mapping**: `signals.exitCode`'s override-at-exit corrected by an `exit_is_final` latch; a signal after the rename reports 0, proven by a `CommitHook` injection at the §5.7.9 seam (swap + flag between rename and directory fsync), not by timing. `--out` identity refused (1) before the input opens, realpath-aliased spellings included. **`Workbook.evaluate` forwards the caller's clock** — `now_utc_ms`/`utc_offset_min`/`platform_profile` reached `evaluateOne` since M5d2 but were dropped on the standalone path, so `--now` was echoed but never reached `NOW()`; `date_system`/`text_compat` stay workbook-derived. `=A1` on empty A1 publishes 0 through `value.publish`; `seed` a decimal string, pinned above 2^53 | Contract tests (grammar productions ×9, exit table row-by-row, SIGPIPE vs abnormal EOF, commit seam) |
-| **M7a** | DA evaluation + decision table + ownership + `A1#`/`@` + F2-DA natives (FILTER, SORT, SORTBY, UNIQUE, SEQUENCE, RANDARRAY, TRANSPOSE) + RANDARRAY KATs | Fixtures; obstruction fuzz |
+| **M7a** ✅ | DA evaluation + decision table + ownership + `A1#`/`@` + F2-DA natives (FILTER, SORT, SORTBY, UNIQUE, SEQUENCE, RANDARRAY, TRANSPOSE) + RANDARRAY KATs | Fixtures; obstruction fuzz |
 | **M7b1** | DA + CSE **persistence** (approved set; cm/vm collection-pinned transitions; tail ownership; tolerated-state proofs) | Excel-opens-clean per transition |
 | **M7b2** | F2 criteria batch (SUMIFS, COUNTIFS, AVERAGEIFS, MINIFS, MAXIFS; ADDRESS) — INDIRECT/OFFSET completed at M5a2 | Oracle-first; whole-column + multi-criteria benches |
 | **M7b3** | F2 statistics batch (MEDIAN, MODE.SNGL, STDEV.P/S, VAR.P/S, PERCENTILE.INC, QUARTILE.INC, RANK.EQ, LARGE, SMALL) | Oracle-first |

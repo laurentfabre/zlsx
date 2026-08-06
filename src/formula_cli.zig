@@ -1549,6 +1549,36 @@ test "eval matrix: header, row-major cells, complete with the cell count" {
     try testing.expect(std.mem.indexOf(u8, r.out, "\"r\":2,\"c\":1,\"type\":\"number\",\"value\":3") != null);
 }
 
+test "eval spill: a dynamic-array native's rectangle rides the SAME matrix grammar (M7a)" {
+    // M6's stream is deliberately untouched by M7a: a spilling formula
+    // is a matrix result, and a matrix result already had a grammar.
+    // The assertions here are the M6 matrix test's, over a native that
+    // did not exist when that grammar shipped.
+    const a = testing.allocator;
+    var env = try TestEnv.init(a);
+    defer env.deinit(a);
+    const path = try writeTestFixture(a, env.io(), env.dir, "v.xlsx", t_sheet_values);
+    defer a.free(path);
+
+    var r = try drive(a, env.io(), &.{ "eval", path, "--formula", "SEQUENCE(2,3)", "--sheet", "0", "--now", t_now, "--seed", t_seed }, .{});
+    defer r.deinit(a);
+    try testing.expectEqual(exit_ok, r.code);
+    try expectKinds(a, r.out, &.{ "eval-header", "eval-cell", "eval-cell", "eval-cell", "eval-cell", "eval-cell", "eval-cell", "eval-complete" });
+    try testing.expect(std.mem.indexOf(u8, r.out, "\"type\":\"matrix\",\"rows\":2,\"cols\":3") != null);
+    try testing.expect(std.mem.indexOf(u8, r.out, "\"cells\":6") != null);
+    // Row-major, the closed form: r2c1 = 4.
+    try testing.expect(std.mem.indexOf(u8, r.out, "\"r\":2,\"c\":1,\"type\":\"number\",\"value\":4") != null);
+    try testing.expect(std.mem.indexOf(u8, r.out, "\"r\":2,\"c\":3,\"type\":\"number\",\"value\":6") != null);
+
+    // FILTER's empty rectangle is `#CALC!`, a successful error value —
+    // exit 0, scalar production.
+    var empty = try drive(a, env.io(), &.{ "eval", path, "--formula", "FILTER(A1:B1,{0,0})", "--sheet", "0", "--now", t_now, "--seed", t_seed }, .{});
+    defer empty.deinit(a);
+    try testing.expectEqual(exit_ok, empty.code);
+    try expectKinds(a, empty.out, &.{ "eval-header", "eval-complete" });
+    try testing.expect(std.mem.indexOf(u8, empty.out, "\"type\":\"error\",\"value\":\"#CALC!\"") != null);
+}
+
 test "eval refusal-before-header: the refusal IS the stream" {
     const a = testing.allocator;
     var env = try TestEnv.init(a);

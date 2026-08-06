@@ -873,6 +873,43 @@ pub fn build(b: *std.Build) void {
     const formula_draws_tests = b.addTest(.{ .root_module = formula_draws_mod });
     test_step.dependOn(&b.addRunArtifact(formula_draws_tests).step);
 
+    // M7a: §5.8a's spill decision table and ownership protocol. Sits
+    // beside `env.zig` (it speaks in `CellRef`/`RangeRef` and nothing
+    // higher), below every host that places a spill. The casefold and
+    // casing imports exist for the same reason env's do: a test build
+    // analyses value.zig's tests through the import chain.
+    const formula_spill_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/spill.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_spill_mod.addImport("zlsx_control", control_mod);
+    formula_spill_mod.addImport("zlsx_refs", refs_mod);
+    formula_spill_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_spill_mod.addImport("zlsx_casing", casing_mod);
+    addOracleFixtures(b, formula_spill_mod);
+    const formula_spill_tests = b.addTest(.{ .root_module = formula_spill_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_spill_tests).step);
+
+    // M7a's obstruction fuzz — the grid-mutation target in spill.zig,
+    // wired exactly like the other formula fuzz binaries.
+    const formula_spill_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/spill.zig"),
+        .target = target,
+        .optimize = optimize,
+        .fuzz = true,
+    });
+    formula_spill_fuzz_mod.addImport("zlsx_control", control_mod);
+    formula_spill_fuzz_mod.addImport("zlsx_refs", refs_mod);
+    formula_spill_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_spill_fuzz_mod.addImport("zlsx_casing", casing_mod);
+    addOracleFixtures(b, formula_spill_fuzz_mod);
+    const formula_spill_fuzz_tests = b.addTest(.{
+        .root_module = formula_spill_fuzz_mod,
+        .test_runner = fuzz_test_runner,
+    });
+    fuzz_step.dependOn(&b.addRunArtifact(formula_spill_fuzz_tests).step);
+
     // M5a2: the iteration engine — the multi-SCC schedule, convergence,
     // the two exhaustion outcomes and §5.6e's dynamic-edge fixpoint. It
     // consumes `graph.zig`'s condensation rather than rebuilding one, so
