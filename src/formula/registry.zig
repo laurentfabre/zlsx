@@ -65,6 +65,7 @@ const text = @import("text.zig");
 const run_inputs = @import("run_inputs.zig");
 const serial_date = @import("serial_date.zig");
 const casing = @import("zlsx_casing");
+const coords = @import("zlsx_refs");
 
 const Value = eval.Value;
 
@@ -770,6 +771,73 @@ pub const functions = [_]Function{
         .impl = fnAverageIf,
     },
 
+    // ── M7b2: the `*IFS` family. One aligned N-way scan each
+    //    (`criteria.scan` under `.require_equal` — §5.6a), never N
+    //    scans; the alternating range/criterion tail is the same
+    //    two-slot cycle `IFS` declares. The aggregation range leads
+    //    where there is one, which is why `COUNTIFS` alone starts its
+    //    cycle at slot zero. ──
+    .{
+        .name = "SUMIFS",
+        .arity = .{ .min = 3, .max = null, .fixed = &eager1, .rest = &eager2 },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{.reference},
+            .rest = &[_]CoercionClass{ .reference, .criteria },
+        },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .collation_sensitive = true,
+        .impl = fnSumIfs,
+    },
+    .{
+        .name = "COUNTIFS",
+        .arity = .{ .min = 2, .max = null, .fixed = &none_l, .rest = &eager2 },
+        .coercion = .{
+            .fixed = &none_c,
+            .rest = &[_]CoercionClass{ .reference, .criteria },
+        },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .collation_sensitive = true,
+        .impl = fnCountIfs,
+    },
+    .{
+        .name = "AVERAGEIFS",
+        .arity = .{ .min = 3, .max = null, .fixed = &eager1, .rest = &eager2 },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{.reference},
+            .rest = &[_]CoercionClass{ .reference, .criteria },
+        },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .collation_sensitive = true,
+        .impl = fnAverageIfs,
+    },
+    .{
+        .name = "MINIFS",
+        .arity = .{ .min = 3, .max = null, .fixed = &eager1, .rest = &eager2 },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{.reference},
+            .rest = &[_]CoercionClass{ .reference, .criteria },
+        },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .collation_sensitive = true,
+        .impl = fnMinIfs,
+    },
+    .{
+        .name = "MAXIFS",
+        .arity = .{ .min = 3, .max = null, .fixed = &eager1, .rest = &eager2 },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{.reference},
+            .rest = &[_]CoercionClass{ .reference, .criteria },
+        },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .collation_sensitive = true,
+        .impl = fnMaxIfs,
+    },
+
     // ── lookups: the five names that take BOTH their equality and
     //    their ordering from `collation_v1` (§5.4b), which is exactly
     //    what MIN and MAX above do not.
@@ -913,6 +981,22 @@ pub const functions = [_]Function{
         .volatility = .stable,
         .propagation = .propagate,
         .impl = fnColumns,
+    },
+    // ADDRESS belongs with the position family: it answers what a
+    // reference is SPELLED like, from numbers. It is deliberately NOT
+    // `reference_producing` — its result is text, and only `INDIRECT`
+    // turns text back into a reference (the M5a2 gate counts on the
+    // pair staying exactly two).
+    .{
+        .name = "ADDRESS",
+        .arity = .{ .min = 2, .max = 5, .fixed = &eager5, .rest = &none_l },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .number, .number, .number, .logical, .text },
+            .rest = &none_c,
+        },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnAddress,
     },
 
     // ── M5a2: the two reference-PRODUCING rows (§7). They belong
@@ -2381,6 +2465,92 @@ fn fnAverageIf(ctx: CallCtx, args: []const Value) FnError!Value {
     return .{ .scalar = value.divide(ctx.rules(), out.numeric_total, @floatFromInt(out.numeric_count)) };
 }
 
+// ── M7b2: the `*IFS` family ──
+
+/// What a `*IFS` name reads out of the one aligned pass they share.
+const IfsFold = enum { count, sum, average, min, max };
+
+/// The family is one function with five folds. Every criterion is
+/// parsed once, up front; every range — criteria ranges and, where the
+/// fold has one, the aggregation range — goes into ONE `criteria.scan`
+/// under `.require_equal` (§5.6a: unequal dimensions are `#VALUE!`, a
+/// value outcome). One aligned multi-range pass, never a scan per
+/// criteria pair.
+fn runIfs(ctx: CallCtx, args: []const Value, fold: IfsFold) FnError!Value {
+    const lead: usize = if (fold == .count) 0 else 1;
+    // A lone trailing range is an argument list Excel refuses at entry,
+    // the same way it refuses a wrong arity — a plane-2 refusal, not a
+    // value (§5.3c has no order for arguments that cannot exist).
+    if ((args.len - lead) % 2 != 0) return error.MalformedInput;
+    const pairs = (args.len - lead) / 2;
+
+    // `criteria.scan` wants the criteria areas first — `areas[0]`
+    // supplies the window — and the aggregation area last. Validation
+    // still runs in declaration order (§5.3c): the aggregation range is
+    // declared first, so its `#VALUE!` wins over a later slot's.
+    const areas = try ctx.arena().alloc(env.RangeRef, pairs + lead);
+    if (fold != .count) {
+        areas[pairs] = singleArea(args[0]) orelse return Value.err(.value);
+    }
+    const crits = try ctx.arena().alloc(criteria.Criterion, pairs);
+    for (0..pairs) |i| {
+        areas[i] = singleArea(args[lead + 2 * i]) orelse return Value.err(.value);
+        crits[i] = criteria.parse(args[lead + 2 * i + 1].scalar, ctx.fidelity()) catch |e|
+            return mapCriteriaError(e);
+    }
+
+    const cursors = try ctx.arena().alloc(usize, areas.len);
+    const scratch = try ctx.arena().alloc(value.ScalarValue, areas.len);
+    var out: criteria.ScanResult = .{};
+    criteria.scan(
+        criteriaContext(ctx),
+        ctx.ev.environment,
+        areas,
+        .require_equal,
+        crits,
+        cursors,
+        scratch,
+        &out,
+    ) catch |e| {
+        // §5.6a: unequal dimensions under `.require_equal` are
+        // `#VALUE!`, a value outcome rather than a refusal.
+        if (e == error.ShapeMismatch or e == error.RefOutOfGrid) return Value.err(.value);
+        return mapCriteriaError(e);
+    };
+
+    return switch (fold) {
+        .count => Value.num(@floatFromInt(out.matched)),
+        .sum => Value.num(out.numeric_total),
+        // `AVERAGEIF`'s rule, verbatim: an average over no matching
+        // number is `#DIV/0!`.
+        .average => .{ .scalar = value.divide(ctx.rules(), out.numeric_total, @floatFromInt(out.numeric_count)) },
+        // …and MIN/MAX over no matching number is 0 — Excel's answer
+        // through the `*IFS` door, unlike AVERAGE's.
+        .min => Value.num(if (out.numeric_count == 0) 0 else out.numeric_min),
+        .max => Value.num(if (out.numeric_count == 0) 0 else out.numeric_max),
+    };
+}
+
+fn fnSumIfs(ctx: CallCtx, args: []const Value) FnError!Value {
+    return runIfs(ctx, args, .sum);
+}
+
+fn fnCountIfs(ctx: CallCtx, args: []const Value) FnError!Value {
+    return runIfs(ctx, args, .count);
+}
+
+fn fnAverageIfs(ctx: CallCtx, args: []const Value) FnError!Value {
+    return runIfs(ctx, args, .average);
+}
+
+fn fnMinIfs(ctx: CallCtx, args: []const Value) FnError!Value {
+    return runIfs(ctx, args, .min);
+}
+
+fn fnMaxIfs(ctx: CallCtx, args: []const Value) FnError!Value {
+    return runIfs(ctx, args, .max);
+}
+
 // ─── lookups (§5.4b: equality AND ordering from `collation_v1`) ──
 
 /// A rectangular view of one argument, with random access.
@@ -2845,6 +3015,109 @@ fn fnRows(ctx: CallCtx, args: []const Value) FnError!Value {
 fn fnColumns(ctx: CallCtx, args: []const Value) FnError!Value {
     _ = ctx;
     return Value.num(@floatFromInt(spanOf(args[0], .cols)));
+}
+
+// ── M7b2: ADDRESS — the spelling of a reference, from numbers ──
+
+/// Whether a sheet name can stand unquoted in a reference. Pinned
+/// conservatively: bare iff ASCII, letter-or-underscore first,
+/// alphanumeric-or-underscore throughout. Everything else — spaces,
+/// leading digits, Unicode, punctuation — is quoted, which every
+/// consumer of the quoted form accepts, so quoting too much is safe in
+/// a way the reverse is not. The empty name is bare: `ADDRESS` with
+/// `sheet_text = ""` answers `!$A$1`, Excel's own spelling for it.
+fn sheetNeedsQuotes(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (!std.ascii.isAlphabetic(name[0]) and name[0] != '_') return true;
+    for (name) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_') return true;
+    }
+    return false;
+}
+
+fn appendInt(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, n: u32) FnError!void {
+    var buf: [10]u8 = undefined;
+    const len = std.fmt.printInt(&buf, n, 10, .lower, .{});
+    try out.appendSlice(a, buf[0..len]);
+}
+
+/// The boolean a `.logical` slot was coerced to — `textArg`'s mirror.
+fn boolArg(args: []const Value, i: usize) bool {
+    const s = args[i].scalar;
+    assert(s == .boolean);
+    return s.boolean;
+}
+
+/// `ADDRESS(row, column, [abs], [a1], [sheet])`. Text out — never a
+/// reference: that door is `INDIRECT`'s, and the M5a2 pair stays two.
+///
+/// `abs` reads 1 = both halves anchored, 2 = row, 3 = column, 4 =
+/// neither; anything else is `#VALUE!`. `a1 = FALSE` spells R1C1 — an
+/// anchored half as `R2`/`C3`, a relative one bracketed as `R[2]`/
+/// `C[3]`, Excel's documented output — and producing that text is not
+/// consuming it: v1 still refuses to *read* R1C1 (`INDIRECT`'s
+/// construct refusal), which `INDIRECT(ADDRESS(…))` fixtures pin from
+/// both sides. Both coordinates truncate toward zero and must land
+/// inside the grid; the spelling of a cell that cannot exist is
+/// `#VALUE!`.
+fn fnAddress(ctx: CallCtx, args: []const Value) FnError!Value {
+    const row_f = @trunc(numArg(args, 0));
+    const col_f = @trunc(numArg(args, 1));
+    if (row_f < 1 or row_f > @as(f64, @floatFromInt(coords.max_row))) return Value.err(.value);
+    if (col_f < 1 or col_f > @as(f64, @floatFromInt(coords.max_col_1based))) return Value.err(.value);
+    const row_1: u32 = @intFromFloat(row_f);
+    const col_1: u32 = @intFromFloat(col_f);
+
+    // An ELIDED argument is not an omitted one (`optNum`'s rule): the
+    // slot became blank and then coerced — 0 for `abs`, which is not a
+    // mode, and FALSE for `a1`. Only a slot that is absent from the
+    // call takes the documented default.
+    const abs_f: f64 = if (args.len > 2) @trunc(numArg(args, 2)) else 1;
+    if (abs_f < 1 or abs_f > 4) return Value.err(.value);
+    const abs: u3 = @intFromFloat(abs_f);
+    const anchor_row = abs == 1 or abs == 2;
+    const anchor_col = abs == 1 or abs == 3;
+
+    const a1_style = if (args.len > 3) boolArg(args, 3) else true;
+
+    const a = ctx.arena();
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    if (args.len > 4) {
+        const sheet = textArg(args, 4);
+        if (sheetNeedsQuotes(sheet)) {
+            try out.append(a, '\'');
+            for (sheet) |c| {
+                if (c == '\'') try out.append(a, '\'');
+                try out.append(a, c);
+            }
+            try out.append(a, '\'');
+        } else {
+            try out.appendSlice(a, sheet);
+        }
+        try out.append(a, '!');
+    }
+
+    if (a1_style) {
+        var buf: [coords.format_buf_len]u8 = undefined;
+        const cell = coords.Cell{
+            // In-grid by the checks above, so neither conversion can
+            // fail.
+            .col = coords.Col.fromOneBased(col_1) catch unreachable,
+            .row = coords.Row.fromOneBased(row_1) catch unreachable,
+            .anchor = .{ .col = anchor_col, .row = anchor_row },
+        };
+        try out.appendSlice(a, coords.formatCell(&buf, cell));
+    } else {
+        try out.append(a, 'R');
+        if (!anchor_row) try out.append(a, '[');
+        try appendInt(&out, a, row_1);
+        if (!anchor_row) try out.append(a, ']');
+        try out.append(a, 'C');
+        if (!anchor_col) try out.append(a, '[');
+        try appendInt(&out, a, col_1);
+        if (!anchor_col) try out.append(a, ']');
+    }
+    return .{ .scalar = .{ .text = out.items } };
 }
 
 // ── M5a2: the two reference-producing rows ──
@@ -4804,6 +5077,118 @@ test "M7a: every F2-DA row declares all five fields, and its flags honestly" {
     try testing.expectEqual(@as(usize, 7), seen);
 }
 
+const m7b2_milestone = "M7b2";
+const m7b2_batch = "F2-criteria";
+
+fn isM7b2(e: InventoryEntry) bool {
+    return std.mem.eql(u8, e.milestone, m7b2_milestone) and
+        std.mem.eql(u8, e.batch, m7b2_batch);
+}
+
+test "M7b2: the batch's size is regenerated from the inventory, never from prose" {
+    // The ladder row says "6". This test counts the file instead, the
+    // same both-directions discipline every F-batch since M4c ships
+    // under: every `M7b2`/`F2-criteria` row resolves, and every
+    // registered function tagged `M7b2` is listed under this batch.
+    var it = inventory();
+    var counted: usize = 0;
+    while (it.next()) |e| {
+        if (isM7b2(e)) counted += 1;
+    }
+    try testing.expect(counted > 0);
+
+    var it2 = inventory();
+    var resolved: usize = 0;
+    while (it2.next()) |e| {
+        if (!isM7b2(e)) continue;
+        const f = lookup(e.name) orelse {
+            std.debug.print("F2-criteria name not registered: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        };
+        try testing.expectEqualStrings(e.name, f.name);
+        resolved += 1;
+    }
+    try testing.expectEqual(counted, resolved);
+
+    var registered_m7b2: usize = 0;
+    for (&functions) |*f| {
+        var it3 = inventory();
+        while (it3.next()) |e| {
+            if (!std.mem.eql(u8, e.name, f.name)) continue;
+            if (std.mem.eql(u8, e.milestone, m7b2_milestone)) {
+                if (!isM7b2(e)) {
+                    std.debug.print("{s}: tagged {s} but batch {s}\n", .{ f.name, e.milestone, e.batch });
+                    return error.BatchTagMismatch;
+                }
+                registered_m7b2 += 1;
+            }
+            break;
+        }
+    }
+    try testing.expectEqual(counted, registered_m7b2);
+}
+
+test "M7b2: the running total moves with the batch, counted from the file" {
+    const rows = [_][]const u8{ "M4c", "M4d", "M4e", "M4f", "M4g", "M5a2", "M7a", "M7b2" };
+    var shipped: usize = 0;
+    for (rows) |m| {
+        var it = inventory();
+        while (it.next()) |e| {
+            if (!std.mem.eql(u8, e.milestone, m)) continue;
+            if (lookup(e.name) == null) {
+                std.debug.print("shipped name does not resolve: {s} ({s})\n", .{ e.name, m });
+                return error.LadderTotalIncomplete;
+            }
+            shipped += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 108), shipped);
+}
+
+test "M7b2: every F2-criteria row declares all five fields, and its flags honestly" {
+    // The five `*IFS` rows carry a `.reference` slot, so the dispatcher
+    // must not lift them wholesale — `liftable()` is false by shape,
+    // with no flag to keep honest. ADDRESS is the opposite: every slot
+    // scalar, lifted like any other function. And only the criteria
+    // matchers read text through `collation_v1`; ADDRESS compares
+    // nothing.
+    var it = inventory();
+    var seen: usize = 0;
+    while (it.next()) |e| {
+        if (!isM7b2(e)) continue;
+        const f = lookup(e.name).?;
+        seen += 1;
+        try testing.expect(f.form == .plain);
+        try testing.expect(f.impl != null);
+        try testing.expect(!f.reference_producing);
+        try testing.expect(!f.da_aware);
+        try testing.expect(!f.platform_sensitive);
+        try testing.expect(!f.cv_sensitive);
+        try testing.expect(!f.epoch_sensitive);
+        try testing.expectEqual(Volatility.stable, f.volatility);
+
+        const is_address = std.mem.eql(u8, e.name, "ADDRESS");
+        try testing.expectEqual(!is_address, f.collation_sensitive);
+        try testing.expectEqual(is_address, f.liftable());
+        try testing.expectEqual(
+            if (is_address) value.PropagationClass.propagate else value.PropagationClass.per_function_provenance,
+            f.propagation,
+        );
+        if (!is_address) {
+            // The alternating range/criterion tail, declared as the
+            // same two-slot cycle `IFS` uses — and `COUNTIFS` alone
+            // starts it at slot zero, having no aggregation range.
+            try testing.expectEqual(@as(usize, 2), f.coercion.rest.len);
+            try testing.expectEqual(CoercionClass.reference, f.coercion.rest[0]);
+            try testing.expectEqual(CoercionClass.criteria, f.coercion.rest[1]);
+            try testing.expectEqual(f.arity.max, null);
+            const leading: usize = if (std.mem.eql(u8, e.name, "COUNTIFS")) 0 else 1;
+            try testing.expectEqual(leading, f.coercion.fixed.len);
+        }
+    }
+    try testing.expectEqual(@as(usize, 6), seen);
+}
+
 test "M5a2: both reference-producing rows are complete, and they are the only two" {
     // §7 lists exactly two reference-producing rows, and M4e's decision
     // 11 deferred `INDEX`'s range form on the strength of that. If a
@@ -5183,8 +5568,8 @@ test "registry: lookup is case-insensitive and rejects unknown names" {
     // `VLOOKUP` stood here until M4e registered it, which is what this
     // line is for: the example has to be a function that is genuinely
     // still ahead of the ladder, and every batch that lands moves it.
-    try testing.expect(lookup("SUMIFS") == null); // frozen, M7b2
-    try testing.expect(inInventory("SUMIFS"));
+    try testing.expect(lookup("MEDIAN") == null); // frozen, M7b3
+    try testing.expect(inInventory("MEDIAN"));
     try testing.expect(lookup("NOTAFUNCTION") == null);
 }
 

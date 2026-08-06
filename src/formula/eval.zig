@@ -6834,6 +6834,310 @@ test "M7a KAT: a decided element key generates nothing on re-evaluation" {
     }
 }
 
+// ─── M7b2: the F2-criteria batch (§7, six names; §5.6a) ──────────
+
+/// The battery's grid: three aligned criteria columns — A numeric with
+/// a deliberate hole at A5 (logical blanks travel as RUNS through the
+/// aligned cursor, and a grid without one would never prove it), B
+/// text, C numeric — and the aggregation column D beside them. E mixes
+/// types for the restriction rows, F holds §5.3c's two errors, G a
+/// logical.
+fn putF2cCells(h: *Harness) !void {
+    try h.put("A1", num(1));
+    try h.put("A2", num(2));
+    try h.put("A3", num(3));
+    try h.put("A4", num(4));
+    try h.put("B1", .{ .text = "x" });
+    try h.put("B2", .{ .text = "y" });
+    try h.put("B3", .{ .text = "x" });
+    try h.put("B4", .{ .text = "y" });
+    try h.put("B5", .{ .text = "x" });
+    try h.put("C1", num(10));
+    try h.put("C2", num(20));
+    try h.put("C3", num(30));
+    try h.put("C4", num(40));
+    try h.put("C5", num(50));
+    try h.put("D1", num(100));
+    try h.put("D2", num(200));
+    try h.put("D3", num(300));
+    try h.put("D4", num(400));
+    try h.put("D5", num(500));
+    try h.put("E1", .{ .text = "x" });
+    try h.put("E2", num(5));
+    try h.put("F1", value.ScalarValue.errorOf(.div0));
+    try h.put("F2", value.ScalarValue.errorOf(.na));
+    try h.put("G1", .{ .boolean = true });
+}
+
+const f2c_cases = [_]F2Case{
+    // ── SUMIFS: one criterion, several, and §5.6a's two refashionings
+    //    of `#VALUE!` — mismatched dimensions and a multi-area union ──
+    .{ .func = "SUMIFS", .formula = "SUMIFS(D1:D5,A1:A5,\">2\")", .expect = .{ .number = 700 } },
+    .{ .func = "SUMIFS", .formula = "SUMIFS(D1:D5,A1:A5,\">1\",B1:B5,\"x\")", .expect = .{ .number = 300 }, .note = "two criteria, one aligned pass" },
+    .{ .func = "SUMIFS", .formula = "SUMIFS(D1:D5,A1:A5,\">0\",B1:B5,\"y\",C1:C5,\"<40\")", .expect = .{ .number = 200 }, .note = "§5.6a's 3+-criteria fixture" },
+    .{ .func = "SUMIFS", .formula = "SUMIFS(D:D,A:A,\">2\")", .expect = .{ .number = 700 }, .note = "whole columns ride the same blank runs the benches time" },
+    .{ .func = "SUMIFS", .formula = "SUMIFS(D:D,A:A,\">2\",B:B,\"y\")", .expect = .{ .number = 400 } },
+    .{ .func = "SUMIFS", .formula = "SUMIFS(D1:D4,A1:A5,\">2\")", .expect = .{ .err = .value }, .note = "`*IFS` requires equal dimensions — no SUMIF projection here (§5.6a)" },
+    .{ .func = "SUMIFS", .formula = "SUMIFS((D1:D2,D3:D5),A1:A5,\">0\")", .expect = .{ .err = .value }, .note = "a multi-area union is not one rectangle" },
+    .{ .func = "SUMIFS", .formula = "SUMIFS(B1:B5,A1:A5,\">0\")", .expect = .{ .number = 0 }, .note = "text in the sum range contributes nothing" },
+    .{ .func = "SUMIFS", .formula = "SUMIFS(D1:D5,B1:B5,\"x*\")", .expect = .{ .number = 900 }, .note = "wildcards reach the family through `criteria.parse`, nowhere else" },
+    .{ .func = "SUMIFS", .formula = "SUMIFS(D1:D5,B1:B5,\"X\")", .expect = .{ .number = 900 }, .note = "`collation_v1`: `X` fold-equals `x`" },
+
+    // ── COUNTIFS: §5.3c's criterion kinds, one each — direct number,
+    //    text, bool, error, `\"\"`, `<>`, and the type restriction ──
+    .{ .func = "COUNTIFS", .formula = "COUNTIFS(A1:A5,\">1\")", .expect = .{ .number = 3 } },
+    .{ .func = "COUNTIFS", .formula = "COUNTIFS(A1:A5,\">1\",B1:B5,\"x\")", .expect = .{ .number = 1 } },
+    .{ .func = "COUNTIFS", .formula = "COUNTIFS(A1:A5,2)", .expect = .{ .number = 1 }, .note = "direct number" },
+    .{ .func = "COUNTIFS", .formula = "COUNTIFS(G1:G1,TRUE())", .expect = .{ .number = 1 }, .note = "bool criterion, bool cell" },
+    .{ .func = "COUNTIFS", .formula = "COUNTIFS(A1:A5,\"\")", .expect = .{ .number = 1 }, .note = "an empty criterion is the COUNTBLANK population — A5 is the hole" },
+    .{ .func = "COUNTIFS", .formula = "COUNTIFS(A1:A5,\"<>\")", .expect = .{ .number = 4 }, .note = "…and `<>` is its complement" },
+    .{ .func = "COUNTIFS", .formula = "COUNTIFS(A:A,\"<>\")", .expect = .{ .number = 4 }, .note = "the whole column answers the same, through runs" },
+    .{ .func = "COUNTIFS", .formula = "COUNTIFS(1:1,\">0\")", .expect = .{ .number = 3 }, .note = "full row: 1, 10, 100 — text, error and TRUE all fail the numeric restriction" },
+    .{ .func = "COUNTIFS", .formula = "COUNTIFS(E1:E2,5)", .expect = .{ .number = 1 }, .note = "a numeric criterion sees only numbers" },
+    .{ .func = "COUNTIFS", .formula = "COUNTIFS(E1:E2,\"x\")", .expect = .{ .number = 1 }, .note = "a text criterion sees only text" },
+    .{ .func = "COUNTIFS", .formula = "COUNTIFS(B1:B5,1)", .expect = .{ .number = 0 }, .note = "type-restricted: no text cell satisfies a numeric criterion" },
+    .{ .func = "COUNTIFS", .formula = "COUNTIFS(F1:F2,\"#DIV/0!\")", .expect = .{ .number = 1 }, .note = "the text spelling of an error is that error as a criterion" },
+    .{ .func = "COUNTIFS", .formula = "COUNTIFS(A1:A5,F1)", .expect = .{ .number = 0 }, .note = "an error criterion matches error cells, of which A has none" },
+    .{ .func = "COUNTIFS", .formula = "COUNTIFS(A1:A5,\">0\",A1:E1,\">0\")", .expect = .{ .err = .value }, .note = "5×1 beside 1×5: same count, different shape, still `#VALUE!`" },
+
+    // ── AVERAGEIFS ──
+    .{ .func = "AVERAGEIFS", .formula = "AVERAGEIFS(D1:D5,B1:B5,\"x\")", .expect = .{ .number = 300 } },
+    .{ .func = "AVERAGEIFS", .formula = "AVERAGEIFS(D1:D5,A1:A5,\">1\",B1:B5,\"x\")", .expect = .{ .number = 300 } },
+    .{ .func = "AVERAGEIFS", .formula = "AVERAGEIFS(D1:D5,A1:A5,\">99\")", .expect = .{ .err = .div0 }, .note = "an average over no match is `#DIV/0!` — AVERAGEIF's rule, verbatim" },
+    .{ .func = "AVERAGEIFS", .formula = "AVERAGEIFS(D1:D4,A1:A5,\">0\")", .expect = .{ .err = .value } },
+
+    // ── MINIFS / MAXIFS: the fold `ScanResult` grew for ──
+    .{ .func = "MINIFS", .formula = "MINIFS(D1:D5,B1:B5,\"y\")", .expect = .{ .number = 200 } },
+    .{ .func = "MAXIFS", .formula = "MAXIFS(D1:D5,B1:B5,\"y\")", .expect = .{ .number = 400 } },
+    .{ .func = "MINIFS", .formula = "MINIFS(D1:D5,A1:A5,\">1\",C1:C5,\"<45\")", .expect = .{ .number = 200 } },
+    .{ .func = "MINIFS", .formula = "MINIFS(D1:D5,A1:A5,\">99\")", .expect = .{ .number = 0 }, .note = "MIN over no match is 0 through the `*IFS` door, unlike AVERAGE's `#DIV/0!`" },
+    .{ .func = "MAXIFS", .formula = "MAXIFS(D1:D5,A1:A5,\">99\")", .expect = .{ .number = 0 } },
+    .{ .func = "MINIFS", .formula = "MINIFS(B1:B5,A1:A5,\">0\")", .expect = .{ .number = 0 }, .note = "matches WITHOUT a number are still the empty numeric set" },
+    .{ .func = "MAXIFS", .formula = "MAXIFS(B1:B5,A1:A5,\">0\")", .expect = .{ .number = 0 } },
+    .{ .func = "MAXIFS", .formula = "MAXIFS(D:D,B:B,\"x\")", .expect = .{ .number = 500 } },
+    .{ .func = "MINIFS", .formula = "MINIFS(D1:D4,A1:A5,\">0\")", .expect = .{ .err = .value } },
+    .{ .func = "MAXIFS", .formula = "MAXIFS(D1:D4,A1:A5,\">0\")", .expect = .{ .err = .value } },
+
+    // ── ADDRESS: four abs modes × two styles, sheet text quoted the
+    //    way the tokenizer reads it back ──
+    .{ .func = "ADDRESS", .formula = "ADDRESS(2,3)", .expect = .{ .text = "$C$2" } },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(2,3,2)", .expect = .{ .text = "C$2" } },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(2,3,3)", .expect = .{ .text = "$C2" } },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(2,3,4)", .expect = .{ .text = "C2" } },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(2,3,1,FALSE())", .expect = .{ .text = "R2C3" } },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(2,3,2,FALSE())", .expect = .{ .text = "R2C[3]" }, .note = "the relative half is the bracketed one" },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(2,3,3,FALSE())", .expect = .{ .text = "R[2]C3" } },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(2,3,4,FALSE())", .expect = .{ .text = "R[2]C[3]" } },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(2,3,1,TRUE(),\"Sheet1\")", .expect = .{ .text = "Sheet1!$C$2" } },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(2,3,1,TRUE(),\"EXCEL SHEET\")", .expect = .{ .text = "'EXCEL SHEET'!$C$2" }, .note = "a space forces the quotes" },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(2,3,1,FALSE(),\"[Book1]Sheet1\")", .expect = .{ .text = "'[Book1]Sheet1'!R2C3" }, .note = "Excel's own documented example" },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(1,1,1,TRUE(),\"\")", .expect = .{ .text = "!$A$1" }, .note = "the empty sheet text keeps its bare `!`" },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(1,1,1,TRUE(),\"O'Brien\")", .expect = .{ .text = "'O''Brien'!$A$1" }, .note = "an embedded quote doubles" },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(2.9,3.9)", .expect = .{ .text = "$C$2" }, .note = "coordinates truncate toward zero" },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(1048576,16384)", .expect = .{ .text = "$XFD$1048576" }, .note = "the grid's far corner spells" },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(1048577,1)", .expect = .{ .err = .value }, .note = "…and one row past it does not" },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(1,16385)", .expect = .{ .err = .value } },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(0,1)", .expect = .{ .err = .value } },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(1,0)", .expect = .{ .err = .value } },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(1,1,0)", .expect = .{ .err = .value } },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(1,1,5)", .expect = .{ .err = .value } },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(1,1,,FALSE())", .expect = .{ .err = .value }, .note = "an elided abs became blank and then 0 (`LEFT(a,)`'s rule), and 0 is not a mode" },
+    .{ .func = "ADDRESS", .formula = "ADDRESS(2,3,1,,\"S\")", .expect = .{ .text = "S!R2C3" }, .note = "an elided a1 is blank, and blank is FALSE — omission's TRUE needs the slot absent" },
+    .{ .func = "ADDRESS", .formula = "INDIRECT(ADDRESS(2,3))", .expect = .{ .number = 20 }, .note = "the round trip: what ADDRESS spells, INDIRECT reads" },
+    .{ .func = "ADDRESS", .formula = "ADDRESS({1;2},1)", .expect = .{ .array = .{ .rows = 2, .cols = 1, .cells = &.{ .{ .text = "$A$1" }, .{ .text = "$A$2" } } } }, .note = "all-scalar slots lift elementwise (M7a)" },
+};
+
+test "M7b2: every F2-criteria fixture evaluates to what the spec says" {
+    for (f2c_cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF2cCells(&h);
+
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("F2-criteria case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectValue(c.expect, v) catch |e| {
+            std.debug.print("F2-criteria case `{s}` ({s})\n", .{ c.formula, c.note });
+            return e;
+        };
+    }
+}
+
+test "M7b2: all six frozen names resolve, and each has a fixture" {
+    var it = registry.inventory();
+    var batch: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M7b2")) continue;
+        batch += 1;
+
+        if (registry.lookup(e.name) == null) {
+            std.debug.print("F2-criteria name does not resolve: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        }
+        var fixtures: usize = 0;
+        for (f2c_cases) |c| {
+            if (std.mem.eql(u8, c.func, e.name)) fixtures += 1;
+        }
+        if (fixtures == 0) {
+            std.debug.print("F2-criteria name has no fixture: {s}\n", .{e.name});
+            return error.UnfixturedBatchFunction;
+        }
+    }
+    try testing.expectEqual(@as(usize, 6), batch);
+
+    for (f2c_cases) |c| {
+        var found = false;
+        var it2 = registry.inventory();
+        while (it2.next()) |e| {
+            if (std.mem.eql(u8, e.name, c.func) and std.mem.eql(u8, e.milestone, "M7b2")) found = true;
+        }
+        if (!found) {
+            std.debug.print("fixture names a function outside F2-criteria: {s}\n", .{c.func});
+            return error.FixtureOutsideBatch;
+        }
+    }
+}
+
+test "M7b2: the evidence label on every fixture is true of the committed manifests" {
+    var oracle_rows: usize = 0;
+    var excluded_rows: usize = 0;
+    for (f2c_cases) |c| {
+        switch (try manifestVerdict(c.formula)) {
+            .decided => {
+                if (c.evidence != .oracle) return error.UnderstatedEvidence;
+                oracle_rows += 1;
+            },
+            .excluded => {
+                if (c.evidence != .spec_pinned) return error.ExcludedCellClaimedAsEvidence;
+                excluded_rows += 1;
+            },
+            .silent => {
+                if (c.evidence != .spec_pinned) return error.UnbackedOracleClaim;
+            },
+        }
+    }
+    // The committed manifests predate every F2-criteria name; the
+    // parked Excel leg is what would move these.
+    try testing.expectEqual(@as(usize, 0), oracle_rows);
+    try testing.expectEqual(@as(usize, 0), excluded_rows);
+}
+
+test "M7b2: error order in every name of the batch (§5.3c)" {
+    // Every case runs in both argument orders, because a fixture with
+    // one error in it proves propagation and says nothing about order.
+    // The five folds are `per_function_provenance` — an error in a
+    // range is a value a criterion may MATCH, never one the call
+    // propagates — and ADDRESS is `.propagate`, taking §5.3c's
+    // declaration order from the dispatcher.
+    const Case = struct { formula: []const u8, expect: Expect, note: []const u8 = "" };
+    const cases = [_]Case{
+        .{ .formula = "SUMIFS(A1:A1,F1:F1,F2)", .expect = .{ .number = 0 }, .note = "criterion #N/A against cell #DIV/0!: no match, no propagation" },
+        .{ .formula = "SUMIFS(F1:F1,A1:A1,1)", .expect = .{ .number = 0 }, .note = "an error in the sum range is ignored by the numeric fold, not propagated" },
+        .{ .formula = "SUMIFS(D1:D1,F1:F1,F1)", .expect = .{ .number = 100 }, .note = "…and a criterion CAN match one" },
+        .{ .formula = "COUNTIFS(F1:F1,F2)", .expect = .{ .number = 0 } },
+        .{ .formula = "COUNTIFS(F2:F2,F1)", .expect = .{ .number = 0 } },
+        .{ .formula = "COUNTIFS(F1:F1,F1)", .expect = .{ .number = 1 } },
+        .{ .formula = "COUNTIFS(A1:A5,1/0)", .expect = .{ .number = 0 }, .note = "a computed error criterion is still a criterion" },
+        .{ .formula = "AVERAGEIFS(F1:F1,A1:A1,1)", .expect = .{ .err = .div0 }, .note = "#DIV/0! from the empty numeric set, NOT from F1" },
+        .{ .formula = "AVERAGEIFS(D1:D1,F1:F1,F2)", .expect = .{ .err = .div0 }, .note = "#DIV/0! from no match — same answer, other route" },
+        .{ .formula = "MINIFS(F1:F1,A1:A1,1)", .expect = .{ .number = 0 } },
+        .{ .formula = "MINIFS(D1:D1,F1:F1,F2)", .expect = .{ .number = 0 } },
+        .{ .formula = "MAXIFS(F1:F1,A1:A1,1)", .expect = .{ .number = 0 } },
+        .{ .formula = "MAXIFS(D1:D1,F1:F1,F2)", .expect = .{ .number = 0 } },
+        .{ .formula = "ADDRESS(F1,F2)", .expect = .{ .err = .div0 }, .note = "`.propagate`: declaration order, first error wins" },
+        .{ .formula = "ADDRESS(F2,F1)", .expect = .{ .err = .na } },
+    };
+
+    for (cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF2cCells(&h);
+
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("error-order case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectValue(c.expect, v) catch |e| {
+            std.debug.print("error-order case `{s}`: wrong value ({s})\n", .{ c.formula, c.note });
+            return e;
+        };
+    }
+
+    // Every name in the batch appears above, derived from the
+    // inventory rather than typed out, at least twice: one order is
+    // not an order.
+    var it = registry.inventory();
+    var covered_names: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M7b2")) continue;
+        var seen: usize = 0;
+        for (cases) |c| {
+            if (std.mem.startsWith(u8, c.formula, e.name) and c.formula[e.name.len] == '(') seen += 1;
+        }
+        if (seen < 2) {
+            std.debug.print("batch name with {d} error-order fixtures: {s}\n", .{ seen, e.name });
+            return error.MissingErrorOrderFixture;
+        }
+        covered_names += 1;
+    }
+    try testing.expectEqual(@as(usize, 6), covered_names);
+}
+
+test "M7b2: an unpaired criteria tail refuses, in every fold" {
+    // A lone trailing range is an argument list Excel refuses at
+    // entry, the same way it refuses a wrong arity — `MalformedInput`,
+    // a plane-2 refusal, not a value. The registry's min/max cannot
+    // say it (the tail is unbounded), so the implementations do.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    try putF2cCells(&h);
+
+    try testing.expectError(error.MalformedInput, h.eval("SUMIFS(D1:D5,A1:A5,\">1\",B1:B5)"));
+    try testing.expectError(error.MalformedInput, h.eval("COUNTIFS(A1:A5,\">1\",B1:B5)"));
+    try testing.expectError(error.MalformedInput, h.eval("AVERAGEIFS(D1:D5,A1:A5,\">1\",B1:B5)"));
+    try testing.expectError(error.MalformedInput, h.eval("MINIFS(D1:D5,A1:A5,\">1\",B1:B5)"));
+    try testing.expectError(error.MalformedInput, h.eval("MAXIFS(D1:D5,A1:A5,\">1\",B1:B5)"));
+}
+
+test "M7b2: every criteria name against every argument shape, exhaustively and in both modes" {
+    // M4e's enumeration, pointed at the six new names: every shape in
+    // the alphabet at one and two arguments, each padded to the name's
+    // own minimum arity (`SUMIFS` runs at three, not at the two it
+    // would reject), both rule tables, every input evaluated twice.
+    const f2c_names = [_][]const u8{
+        "SUMIFS", "COUNTIFS", "AVERAGEIFS", "MINIFS", "MAXIFS", "ADDRESS",
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var fake = env.Fake.init(testing.allocator);
+    defer fake.deinit();
+    const sheet = try fuzzF1bEnv(&fake);
+
+    var checked: usize = 0;
+    for (f2c_names) |name| {
+        for (f1b_arg_shapes) |first_arg| {
+            var buf: [256]u8 = undefined;
+            if (buildF1bCall(&buf, name, &.{first_arg})) |one| {
+                try sweepShape(&arena_state, &fake, sheet, one, &checked);
+            }
+            for (f1b_arg_shapes) |second_arg| {
+                var pair_buf: [256]u8 = undefined;
+                const two = buildF1bCall(&pair_buf, name, &.{ first_arg, second_arg }) orelse continue;
+                try sweepShape(&arena_state, &fake, sheet, two, &checked);
+            }
+            _ = arena_state.reset(.retain_capacity);
+        }
+    }
+    // A sweep that silently stopped enumerating would still pass, so
+    // the count is asserted as a floor rather than left to the loops.
+    try testing.expect(checked > 5_000);
+}
+
 // ─── boundaries and refusals ─────────────────────────────────────
 
 fn emptyMatrixImpl(ctx: registry.CallCtx, args: []const Value) registry.FnError!Value {
@@ -6888,9 +7192,10 @@ test "refusals: an unregistered call refuses, an unresolvable name is #NAME?" {
 
     // §7: unregistered calls refuse rather than inventing `#NAME?` for a
     // function zlsx simply does not implement.
-    // `SUMIFS` is frozen in the inventory for M7b2 and unregistered
-    // today; `VLOOKUP` stood here until M4e registered it.
-    try testing.expectError(error.UnsupportedFunction, h.eval("SUMIFS(A1:B2,A1:B2,1)"));
+    // `MEDIAN` is frozen in the inventory for M7b3 and unregistered
+    // today; `VLOOKUP` stood here until M4e registered it, `SUMIFS`
+    // until M7b2.
+    try testing.expectError(error.UnsupportedFunction, h.eval("MEDIAN(A1:B2)"));
     try testing.expectError(error.UnsupportedFunction, h.eval("NOTAFUNCTION()"));
     // §5.9: a value-position name that provably resolves nowhere is a
     // plane-1 `#NAME?`, which is a successful result.

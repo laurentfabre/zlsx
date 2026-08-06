@@ -667,8 +667,11 @@ pub fn scan(
             }
             result.hit_count += 1;
             if (cells.values[areas.len - 1] == .number) {
-                result.numeric_total += cells.values[areas.len - 1].number;
+                const n = cells.values[areas.len - 1].number;
+                result.numeric_total += n;
                 result.numeric_count += 1;
+                result.numeric_min = @min(result.numeric_min, n);
+                result.numeric_max = @max(result.numeric_max, n);
             }
         },
     };
@@ -683,6 +686,12 @@ pub const ScanResult = struct {
     /// matching positions. `SUMIF` and `AVERAGEIF` need nothing else.
     numeric_total: f64 = 0,
     numeric_count: u64 = 0,
+    /// Extremes of the same numeric values, accumulated in the same
+    /// pass. Meaningful only when `numeric_count > 0` — `MINIFS` and
+    /// `MAXIFS` answer 0 over no match, and reading an infinity out of
+    /// this struct means the caller skipped that check.
+    numeric_min: f64 = std.math.inf(f64),
+    numeric_max: f64 = -std.math.inf(f64),
     /// Optional caller-provided storage for the matching positions.
     hits: []Hit = &.{},
     hit_count: usize = 0,
