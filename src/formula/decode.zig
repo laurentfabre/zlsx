@@ -1510,6 +1510,12 @@ pub const CellSpans = struct {
     v_content: ?Span = null,
     /// `<f>` … `</f>`, whole element. Null when absent.
     f: ?Span = null,
+    /// The raw value of `<f ref="…">`, between the quotes — the one
+    /// byte range §5.8b's anchor-ref mutation may address. Null when
+    /// the formula has no `ref`. The single exception to "no edit
+    /// addresses a byte inside `spans.f`": the exception is this span
+    /// and nothing else in the element.
+    f_ref: ?Span = null,
     /// `<is>` … `</is>`, whole element. Null when absent.
     is: ?Span = null,
 
@@ -1529,6 +1535,52 @@ pub const CellSlot = struct {
     row: coords.Row,
     col: coords.Col,
     spans: CellSpans,
+};
+
+/// Where one `<row>` sits in the part, in document order (M7b1).
+///
+/// A tail `<c>` this run creates has to land INSIDE an existing row
+/// element, and the insertion point is derived from these coordinates
+/// plus the row's slots — recorded by the same walk that classified the
+/// cells, for the reason `CellSpans` is: a second locator would disagree
+/// by one byte and the disagreement would be a corrupted sheet.
+pub const RowSlot = struct {
+    /// One-based, as resolved — a provisional row (no `r`) takes its
+    /// first cell's number; with no cells it keeps the
+    /// predecessor-plus-one guess, exactly as the model placed it.
+    number: u32,
+    /// `<row` through the `>` that closes `</row>`, or through the
+    /// `/>` of a self-closing row.
+    element: Span,
+    /// Just past the `>` of the start tag; `== element.end` exactly
+    /// when the row is self-closing.
+    open_end: u32,
+    /// The `<` of `</row>` — where content can be appended — or
+    /// `open_end` for a self-closing row.
+    content_end: u32,
+    /// The raw `spans="…"` value, between the quotes. A created `<c>`
+    /// outside the declared span range would leave the attribute
+    /// describing a row that no longer exists; §5.8b's approved set has
+    /// no spans maintenance, so that shape refuses at the patcher.
+    spans_attr: ?Span,
+
+    pub fn selfClosing(self: RowSlot) bool {
+        return self.open_end == self.element.end;
+    }
+};
+
+/// Where the worksheet `<dimension>` sits (M7b1). Only the `ref`
+/// value's bytes are ever rewritten — §5.8b's used-range expansion —
+/// and only through these coordinates. Recorded whether or not any
+/// mutation will need it; interpretation waits for the patcher, because
+/// a stale dimension is tolerated everywhere EXCEPT under a spill that
+/// extends the used range (`docs/plans/structural-edits.md:100`).
+pub const DimensionSpans = struct {
+    /// The start tag, `<dimension` through its `>`.
+    element: Span,
+    /// The raw `ref` value, between the quotes. Null when the
+    /// attribute is absent.
+    ref: ?Span,
 };
 
 /// One `<f>`, decoded. The attribute inventory and the shared/array
@@ -1567,11 +1619,18 @@ pub const Sheet = struct {
     /// value. Document order is preserved among equal coordinates, so a
     /// consumer that refuses duplicates can name the first one.
     slots: []CellSlot,
-    /// `<mergeCells>`, normalized, in document order. The one thing
-    /// outside `<sheetData>` this scan interprets (M7a): §5.8a's merge
-    /// row needs the geometry, and a spill decided without it would
-    /// land on a merged range.
+    /// `<mergeCells>`, normalized, in document order. Interpreted
+    /// outside `<sheetData>` since M7a: §5.8a's merge row needs the
+    /// geometry, and a spill decided without it would land on a merged
+    /// range.
     merges: []coords.Range,
+    /// Every `<row>` element, in document order (M7b1) — the geometry a
+    /// tail `<c>` insertion is confined by.
+    rows: []RowSlot,
+    /// The worksheet `<dimension>`, or null when the part has none —
+    /// in which case there is nothing to maintain and nothing to
+    /// expand (M7b1).
+    dimension: ?DimensionSpans,
 
     pub fn deinit(self: *Sheet) void {
         self.arena.deinit();
@@ -1621,6 +1680,7 @@ pub fn scanSheet(
     var cells: std.ArrayListUnmanaged(SheetCell) = .empty;
     var slots: std.ArrayListUnmanaged(CellSlot) = .empty;
     var merges: std.ArrayListUnmanaged(coords.Range) = .empty;
+    var rows: std.ArrayListUnmanaged(RowSlot) = .empty;
 
     var ns_buf: [64]NsStack.Binding = undefined;
     const ns_cap = @min(ns_buf.len, opts.limits.max_namespace_bindings);
@@ -1634,6 +1694,7 @@ pub fn scanSheet(
         .cells = &cells,
         .slots = &slots,
         .merges = &merges,
+        .rows = &rows,
     };
 
     var depth: u32 = 0;
@@ -1703,6 +1764,8 @@ pub fn scanSheet(
         .cells = items,
         .slots = slot_items,
         .merges = try merges.toOwnedSlice(a),
+        .rows = try rows.toOwnedSlice(a),
+        .dimension = w.dimension,
     } };
 }
 
@@ -1736,12 +1799,22 @@ const SheetWalk = struct {
     /// Depth of `<mergeCells>` once inside it (M7a, §5.8a merge row).
     merge_depth: ?u32 = null,
     merges: *std.ArrayListUnmanaged(coords.Range),
+    rows: *std.ArrayListUnmanaged(RowSlot),
+    /// The `<dimension>` once seen (M7b1). A second one refuses — the
+    /// schema allows one, and a patcher with two candidate ranges to
+    /// rewrite would have to pick one silently.
+    dimension: ?DimensionSpans = null,
     /// Depth of a subtree being skipped wholesale (foreign content or
     /// an inert main-namespace element outside `<sheetData>`).
     skip_depth: ?u32 = null,
 
     row_depth: ?u32 = null,
     row_index: u32 = 0,
+    /// The current `<row>`'s start-tag coordinates, pending its close
+    /// (M7b1's geometry record).
+    row_start: u32 = 0,
+    row_open_end: u32 = 0,
+    row_spans_attr: ?Span = null,
     /// True between a `<row>` with no `r` and its first `<c>`, while
     /// the row number is still the predecessor-plus-one guess.
     row_provisional: bool = false,
@@ -1860,6 +1933,22 @@ const SheetWalk = struct {
             }
             if (isMain(ns, el, "sheetData")) {
                 self.sheet_data_depth = depth;
+            } else if (isMain(ns, el, "dimension") and depth == 2) {
+                // Interpreted since M7b1: §5.8b's used-range expansion
+                // rewrites the `ref` value, so the walk records where it
+                // is. `CT_SheetDimension` has exactly one attribute.
+                if (self.unexpectedAttr(el, &.{"ref"})) return;
+                if (self.dimension != null) {
+                    self.refuse(.unexpected_element, el.offset);
+                    return;
+                }
+                self.dimension = .{
+                    .element = .{ .start = offsetOf(el.offset), .end = offsetOf(open_end) },
+                    .ref = if (el.attr("ref")) |rv| spanOfSub(self.xml, rv) else null,
+                };
+                // The schema gives `<dimension>` no children; skip to
+                // its close rather than guessing about any.
+                if (!self_closing) self.skip_depth = depth;
             } else if (isMain(ns, el, "mergeCells") and depth == 2) {
                 // `count` is recorded nowhere and enforced nowhere —
                 // M4a decision 11's rule: producers miscount, and
@@ -1884,7 +1973,7 @@ const SheetWalk = struct {
         // `<row>` — a child of `<sheetData>`.
         if (depth == sd + 1) {
             if (std.mem.eql(u8, local, "row")) {
-                self.startRow(el);
+                self.startRow(el, open_end);
             } else if (std.mem.eql(u8, local, "extLst")) {
                 self.skip_depth = depth;
             } else {
@@ -1927,6 +2016,7 @@ const SheetWalk = struct {
                     .raw_attrs = el.attrs,
                 };
                 self.spans.f = .{ .start = offsetOf(el.offset) };
+                self.spans.f_ref = if (el.attr("ref")) |rv| spanOfSub(self.xml, rv) else null;
             } else if (std.mem.eql(u8, local, "is")) {
                 self.has_is = true;
                 self.is_depth = depth;
@@ -2007,6 +2097,7 @@ const SheetWalk = struct {
         if (self.row_depth == depth) {
             self.row_depth = null;
             self.cursor.startRow();
+            try self.finishRow(end);
         }
         if (self.sheet_data_depth == depth) self.sheet_data_depth = null;
         if (self.merge_depth == depth) self.merge_depth = null;
@@ -2030,10 +2121,13 @@ const SheetWalk = struct {
         try self.merges.append(self.a, range.normalized());
     }
 
-    fn startRow(self: *SheetWalk, el: Element) void {
+    fn startRow(self: *SheetWalk, el: Element, open_end: usize) void {
         if (self.unexpectedAttr(el, &row_attrs)) return;
         self.row_depth = self.sheet_data_depth.? + 1;
         self.cursor.startRow();
+        self.row_start = offsetOf(el.offset);
+        self.row_open_end = offsetOf(open_end);
+        self.row_spans_attr = if (el.attr("spans")) |sv| spanOfSub(self.xml, sv) else null;
 
         if (el.attr("r")) |r| {
             const idx = std.fmt.parseInt(u32, r, 10) catch {
@@ -2123,6 +2217,29 @@ const SheetWalk = struct {
         self.v_text.clearRetainingCapacity();
         self.f_text.clearRetainingCapacity();
         self.is_text.clearRetainingCapacity();
+    }
+
+    /// Record the closed `<row>`'s geometry (M7b1). The number is the
+    /// resolved one — a provisional row was fixed by its first cell
+    /// before any slot was recorded, so the geometry and the slots
+    /// agree on where row N is.
+    fn finishRow(self: *SheetWalk, end: usize) error{OutOfMemory}!void {
+        if (self.refusal != null) return;
+        // Rows are bounded like cells: a part with more row elements
+        // than the cell ceiling is past the shape bound either way.
+        if (self.rows.items.len >= self.opts.limits.max_modeled_cells) {
+            self.refusal = .{ .reason = .limit_exceeded, .limit = .modeled_cells };
+            return;
+        }
+        const e = offsetOf(end);
+        const self_closing = self.row_open_end == e;
+        try self.rows.append(self.a, .{
+            .number = self.row_index,
+            .element = .{ .start = self.row_start, .end = e },
+            .open_end = self.row_open_end,
+            .content_end = if (self_closing) self.row_open_end else closeTagStart(self.xml, end),
+            .spans_attr = self.row_spans_attr,
+        });
     }
 
     fn finishCell(self: *SheetWalk, end: usize) error{OutOfMemory}!void {
@@ -3049,6 +3166,114 @@ test "scan: a sheet with no mergeCells answers an empty list" {
     ), &.{});
     defer sheet.deinit();
     try testing.expectEqual(@as(usize, 0), sheet.merges.len);
+}
+
+test "scan: row geometry is recorded where the cells are (M7b1)" {
+    const xml =
+        "<worksheet" ++ ns_attr ++ "><sheetData>" ++
+        "<row r=\"1\" spans=\"1:2\"><c r=\"A1\"><v>1</v></c><c r=\"B1\"><v>2</v></c></row>" ++
+        "<row r=\"3\"/>" ++
+        "<row><c r=\"A9\"><v>9</v></c></row>" ++
+        "</sheetData></worksheet>";
+    var sheet = try scanOk(xml, &.{});
+    defer sheet.deinit();
+
+    try testing.expectEqual(@as(usize, 3), sheet.rows.len);
+
+    // Row 1: number, spans value, and an open/content pair that brackets
+    // exactly its two cells.
+    const r1 = sheet.rows[0];
+    try testing.expectEqual(@as(u32, 1), r1.number);
+    try testing.expectEqualStrings("1:2", r1.spans_attr.?.slice(xml));
+    try testing.expect(!r1.selfClosing());
+    try testing.expectEqualStrings(
+        "<c r=\"A1\"><v>1</v></c><c r=\"B1\"><v>2</v></c>",
+        xml[r1.open_end..r1.content_end],
+    );
+    try testing.expectEqual(@as(u8, '<'), xml[r1.element.start]);
+    try testing.expectEqual(@as(u8, '>'), xml[r1.element.end - 1]);
+
+    // Row 3: self-closing — no content region at all.
+    const r3 = sheet.rows[1];
+    try testing.expectEqual(@as(u32, 3), r3.number);
+    try testing.expect(r3.selfClosing());
+    try testing.expectEqual(r3.open_end, r3.content_end);
+    try testing.expect(r3.spans_attr == null);
+
+    // The bare row took its number from its first cell — the same
+    // authority the model used, so the geometry cannot disagree with
+    // the slots about where row 9 is.
+    try testing.expectEqual(@as(u32, 9), sheet.rows[2].number);
+}
+
+test "scan: the dimension is recorded, not interpreted (M7b1)" {
+    const xml =
+        "<worksheet" ++ ns_attr ++ ">" ++
+        "<dimension ref=\"A1:B2\"/>" ++
+        "<sheetData><row r=\"1\"><c r=\"A1\"><v>1</v></c></row></sheetData>" ++
+        "</worksheet>";
+    var sheet = try scanOk(xml, &.{});
+    defer sheet.deinit();
+    const dim = sheet.dimension.?;
+    try testing.expectEqualStrings("A1:B2", dim.ref.?.slice(xml));
+    try testing.expectEqualStrings("<dimension ref=\"A1:B2\"/>", dim.element.slice(xml));
+
+    // Absent: nothing to maintain, and nothing invented.
+    var bare = try scanOk(sheetXml(
+        \\<row r="1"><c r="A1"><v>1</v></c></row>
+    ), &.{});
+    defer bare.deinit();
+    try testing.expect(bare.dimension == null);
+
+    // A ref this grid cannot address is still RECORDED — dimension
+    // staleness is tolerated everywhere except under a spill that
+    // needs to expand it, so interpretation is the patcher's, at the
+    // one moment it matters.
+    const odd =
+        "<worksheet" ++ ns_attr ++ ">" ++
+        "<dimension ref=\"NOT A RANGE\"/>" ++
+        "<sheetData/>" ++
+        "</worksheet>";
+    var tolerated = try scanOk(odd, &.{});
+    defer tolerated.deinit();
+    try testing.expectEqualStrings("NOT A RANGE", tolerated.dimension.?.ref.?.slice(odd));
+}
+
+test "scan: two dimensions refuse, and an unknown attribute on one refuses (M7b1)" {
+    const twice =
+        "<worksheet" ++ ns_attr ++ ">" ++
+        "<dimension ref=\"A1\"/><dimension ref=\"A1:B2\"/>" ++
+        "<sheetData/>" ++
+        "</worksheet>";
+    const r = try scanRefusal(twice, &.{});
+    try testing.expectEqual(Refusal.Reason.unexpected_element, r.reason);
+
+    const bad_attr =
+        "<worksheet" ++ ns_attr ++ ">" ++
+        "<dimension ref=\"A1\" bogus=\"1\"/>" ++
+        "<sheetData/>" ++
+        "</worksheet>";
+    const r2 = try scanRefusal(bad_attr, &.{});
+    try testing.expectEqual(Refusal.Reason.unexpected_attribute, r2.reason);
+}
+
+test "scan: the anchor ref value has its own span, inside `spans.f` (M7b1)" {
+    const xml = sheetXml(
+        \\<row r="1"><c r="A1"><f t="array" ref="A1:B3" aca="1">SEQUENCE(3,2)</f><v>1</v></c><c r="B1"><f>1+1</f><v>2</v></c></row>
+    );
+    var sheet = try scanOk(xml, &.{});
+    defer sheet.deinit();
+
+    const anchor = sheet.slots[0].spans;
+    const ref = anchor.f_ref.?;
+    try testing.expectEqualStrings("A1:B3", ref.slice(xml));
+    // Inside the `<f>` element — the one byte range there §5.8b's
+    // anchor-ref mutation may address.
+    const f = anchor.f.?;
+    try testing.expect(ref.start > f.start and ref.end < f.end);
+
+    // A refless formula has no span to address.
+    try testing.expect(sheet.slots[1].spans.f_ref == null);
 }
 
 test "scan: cells come back row-major regardless of document order" {

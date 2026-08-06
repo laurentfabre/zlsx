@@ -9425,6 +9425,13 @@ pub const WorkbookEnv = struct {
         return self.spills.classOf(cell);
     }
 
+    /// The whole per-anchor outcome, for staging (§5.8b): `stage()`
+    /// carries what the model placed into the publication record, and
+    /// the patcher consumes it — placement is decided exactly once.
+    pub fn spillOutcomeOf(self: *const WorkbookEnv, cell: engine.env.CellRef) ?engine.spill.Outcome {
+        return self.spills.map.get(cell);
+    }
+
     pub fn evalEnv(self: *WorkbookEnv) engine.env.EvalEnv {
         return .{ .ctx = self, .vtable = &vtable };
     }

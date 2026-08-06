@@ -1842,6 +1842,102 @@ ownership, `src/formula/spill.zig`), §5.3b (the mixed-signature lift,
     row's gate and ships in the PR polish round — deferred, dated here
     so it cannot silently vanish.
 
+**M7b1 decisions (shipped 2026-08-06).** Fifteen points. They span
+§5.8b (`spill_transitions`, `src/formula/resolved.zig`), the decode
+boundary (`RowSlot`/`DimensionSpans`/`f_ref`), and the staging seam
+(`pkg/recalc_run.zig`, `WorkbookEnv.spillOutcomeOf`). Every DA
+transition refuses today; the row shipped with the refusal as the
+pinned fixture, per the milestone's own gate.
+
+1. **The table is data, and the seam is the proof path.**
+   `spill_transitions` rows carry {collection, record type, one-based
+   index rule, missing-record behavior, reference}; `patch` is
+   `patchWithTable(&spill_transitions)`, fixtures prove the builders
+   through an injected table, and the production rows are all
+   `reference: null` → `transition_unproven`, the refusal NAMING its
+   row. `missingReferences()` is the machine-readable park list.
+2. **Four DA rows, (was × now).** The stored cache (`#SPILL!` or not)
+   crossed with the placed outcome (spilled/blocked):
+   `da_spill_rewrite`, `da_spill_to_blocked`, `da_blocked_to_spill`,
+   `da_blocked_rewrite`. All four are cellMetadata / `XLDAPR` /
+   existing-`cm` / dangling-refuses; each awaits a byte-diffed
+   Excel-authored pair (proposed home
+   `tests/oracle/fixtures/spill_persist/<row>/`), authored via the
+   same Excel unblock as M1b.
+3. **CSE went live without a transition row because no metadata byte
+   exists to transition.** A covered legacy CSE is `<v>`+`t` on cells
+   that all exist — M5b1's proven mutation set applied over the
+   declared range. Coverage IS the gate: anchor at the declared
+   top-left and every declared cell staged this run (target or
+   append), else `cse_range_mismatch`; a slave with no `<c>` still
+   refuses `cell_insertion_unsupported`.
+4. **Four new EditKinds, one equality contract.** `f_ref_replace`,
+   `cell_insert`, `cell_remove`, `dimension_ref_replace` each gained an
+   `approvedRange` arm; `verifyConfinement` gained `Geometry`
+   (slots + rows + dimension) and answers insert points from the same
+   pure `tailInsertPoint` the planner uses — one derivation, so the
+   checker cannot drift from the builder.
+5. **`f@ref` is THE exception to "no edit addresses a byte inside
+   `spans.f`", and it is exactly the raw ref value.** The scan records
+   it (`CellSpans.f_ref`) and the spans invariant test pins the
+   carve-out at attribute-value width.
+6. **Tail clear is whole-`<c>` removal, and a formula-carrying cell
+   has no removable range at all** — `approvedRange` answers null, and
+   `tail_clear_foreign` refuses when the stored ref claims content it
+   does not own (a formula, or a simultaneously staged target). A
+   keep-the-styled-shell clear waits for the reference that would show
+   Office writing one.
+7. **The clear set derives from the anchor's STORED ref — the file's
+   one record of the prior extent — never from a re-decision.**
+   `stage()` carries `spill.Outcome` from the model's registry
+   (`WorkbookEnv.spillOutcomeOf`) into `Publication.role`; a DA anchor
+   staged without its outcome refuses generically
+   (`dynamic_array_anchor`), because the patcher will not reconstruct
+   a placement the model already made.
+8. **Geometry §5.8b does not name refuses by name.** A missing or
+   duplicated `<row>` (`tail_row_missing`), a self-closing row
+   (`tail_row_self_closing`), a `spans` attribute that would go stale
+   (`tail_row_spans_stale`): row creation, row reopening and spans
+   maintenance are not in the approved set, and each is an enumerable
+   refusal rather than a silent widening of it.
+9. **Dimension is recorded always, interpreted once.** The scan
+   records `DimensionSpans` unconditionally; the patcher parses it
+   only when created tails extend it — BR-only monotonic widening, TL
+   bytes kept, absent element = nothing to maintain, unparseable +
+   needed = `dimension_unparseable` (structural-edits.md:100's
+   weakest-obligation row, §5.8b-hardened at exactly the moment
+   staleness stops being tolerable).
+10. **`vm` refuses permanently at the patcher too**
+    (`value_metadata_write`): a setCell publication reaches the write
+    side without ever meeting the resolver, so M4a decision 6's
+    refusal is enforced at both ends.
+11. **The scan grew rows, dimension and `f_ref` the way M7a grew
+    `<mergeCells>`.** Two `<dimension>`s refuse; an unknown
+    main-namespace attribute on one refuses (M4a decision 12); row
+    numbers resolve by the same first-cell authority the model uses,
+    so geometry and slots cannot disagree about where row N is.
+12. **Tail publications from `stage()` land with the first committed
+    reference.** Until one exists the anchor's refusal precedes every
+    tail on every reachable path, and emitting model-side tail values
+    would be plumbing with no reader — dated here so it cannot
+    silently vanish when a reference unlocks its row.
+13. **The `#SPILL!` split held.** A blocked anchor caches the bare
+    `#SPILL!` (`t="e"`) with an anchor-only ref; rich error metadata
+    is never invented; blocked-stays-blocked is byte-identical — zero
+    edits, the fixture's own statement that refusal and no-op are
+    different things.
+14. **The edit sort became stable.** Two created tails in one empty
+    row share a zero-width insertion point, and `(start, end)` cannot
+    order them — the planner's column order is the order, and an
+    unstable sort was free to lose it.
+15. **DONE-WHEN 5 lands on both sides of the file boundary.** File
+    side: M5b2's rename/sync injections re-run over the multi-cell
+    staging M7b1 opened (anchor + slave, destination and memory intact,
+    no temp debris). Model side: the M7a regression stays — a spill
+    the model placed refuses persistence with the part
+    pointer-identical, plus an allocation-failure sweep over the
+    proven path.
+
 ### 5.9 Name & identifier resolution
 
 Call position → strip layered prefixes → registry; unregistered →
@@ -2081,7 +2177,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M5d4** ✅ | **The recalc pipeline made linear.** §9.1's baseline was quadratic in cell count (×4 per row doubling); the profile named two O(n) operations inside per-cell loops, and removing them exposed five more of the same shape. All seven are one bug — **a membership test written as a scan** — and every fix keeps the order its callers depend on. `WorkbookEnv.Sheet` becomes a directory of 64-entry chunks: the (row, col, layer-descending) order is the contract, the flat array never was, and publication stops paying one `memmove` of the tail per cell. `iterate` gains membership indexes **beside** `pass_edges` / `touched` / `previous_reports` (the lists stay — they are what gets handed on), and turns `held`, `scope` and `changedComponents`' signature comparison into maps. `graph.Builder.captureAll` groups §5.6e's flat edge list by owner once instead of rescanning it per formula. `recalc_run.Driver` indexes `published`. **`Index.probe` picks its band by counting stored coordinates rather than by the area's extent** (§5.6a corrected — the extent is right for `SUM(A:A)` and wrong for `SUM(A5:A9)`; both pinned probe counts unchanged). Result on the digest-pinned named workload: `recalc` **133 452 → 905 ms (147×)**, `save` **127 690 → 917 ms**, evaluate 267× over §9's ceiling → **1.81×**, end-to-end 128× over → **under it**, "10k-vs-100k ≤ 15×" ×96.1 → **×11.0** | Determinism; scoped idempotence; no-formula identity; §5.7.9 ordering; workload digest; `compare_bench --gate` |
 | **M6** ✅ | `zlsx eval` + `zlsx recalc` (`src/formula_cli.zig`), delegated whole-tail like `dbx` so the shipped commands and their row envelope are untouched by construction. **The versioned stream state machine** — `"kind"` + `"v":1` on every record, both grammars normative, refusal and cancellation legal before any header, `cancelled.after` naming the last record out. **The nine-row exit table**, including 6 (default-context acquisition — the wall clock / secure random source behind an omitted `--now`/`--seed`, injectable, never conflated with OOM) and the SIGPIPE exception (prefix-valid, no terminal, exit 0 — distinguishable from abnormal EOF by code). **Commit-aware exit mapping**: `signals.exitCode`'s override-at-exit corrected by an `exit_is_final` latch; a signal after the rename reports 0, proven by a `CommitHook` injection at the §5.7.9 seam (swap + flag between rename and directory fsync), not by timing. `--out` identity refused (1) before the input opens, realpath-aliased spellings included. **`Workbook.evaluate` forwards the caller's clock** — `now_utc_ms`/`utc_offset_min`/`platform_profile` reached `evaluateOne` since M5d2 but were dropped on the standalone path, so `--now` was echoed but never reached `NOW()`; `date_system`/`text_compat` stay workbook-derived. `=A1` on empty A1 publishes 0 through `value.publish`; `seed` a decimal string, pinned above 2^53 | Contract tests (grammar productions ×9, exit table row-by-row, SIGPIPE vs abnormal EOF, commit seam) |
 | **M7a** ✅ | DA evaluation + decision table + ownership + `A1#`/`@` + F2-DA natives (FILTER, SORT, SORTBY, UNIQUE, SEQUENCE, RANDARRAY, TRANSPOSE) + RANDARRAY KATs | Fixtures; obstruction fuzz |
-| **M7b1** | DA + CSE **persistence** (approved set; cm/vm collection-pinned transitions; tail ownership; tolerated-state proofs) | Excel-opens-clean per transition |
+| **M7b1** ✅ | DA + CSE **persistence** (approved set §5.8b byte-diff-fixtured: `<v>`+`t`, anchor `f@ref`, owned tail `<c>` create/clear, `<dimension ref>` expansion; `spill_transitions` table — every DA row refuses `transition_unproven` pending its byte-diffed Excel reference, the surfaced park; **legacy CSE live end-to-end**, no metadata byte to transition) | Byte-diff + refusal-enumeration fixtures; Excel-opens-clean per transition **runs as each reference lands** |
 | **M7b2** | F2 criteria batch (SUMIFS, COUNTIFS, AVERAGEIFS, MINIFS, MAXIFS; ADDRESS) — INDIRECT/OFFSET completed at M5a2 | Oracle-first; whole-column + multi-criteria benches |
 | **M7b3** | F2 statistics batch (MEDIAN, MODE.SNGL, STDEV.P/S, VAR.P/S, PERCENTILE.INC, QUARTILE.INC, RANK.EQ, LARGE, SMALL) | Oracle-first |
 | **M7c** | DA authoring (byte-diffed spec → impl) + `FormulaWrite` (**Zig-only**) | Byte-diff vs references |

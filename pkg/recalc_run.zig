@@ -73,6 +73,7 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
 const control = @import("zlsx_control");
+const coords = @import("zlsx_refs");
 const engine = @import("zlsx_formula");
 const zlsx = @import("zlsx");
 
@@ -505,6 +506,12 @@ const Published = struct {
     /// exists to hold its shape, and treating its placeholder as a
     /// result would cache a zero nothing computed.
     has_value: bool = false,
+    /// The whole array the cell last published, when it published one —
+    /// arena-backed, so it outlives the run. `value` is the narrowed
+    /// anchor scalar; §5.6h's slave synthesis (M7b1) is the one reader
+    /// of the rest, because a legacy CSE's tails are not evaluable
+    /// nodes and their file caches are maintained from exactly this.
+    matrix: ?engine.value.Matrix = null,
 };
 
 /// The package's `iterate.Host` for a whole-workbook recalc.
@@ -648,10 +655,15 @@ const Driver = struct {
                 break :blk engine.value.ScalarValue.blank;
             },
         };
+        const matrix: ?engine.value.Matrix = switch (v) {
+            .array => |m| m,
+            .scalar => null,
+        };
         if (self.published_at.get(cell)) |i| {
             const p = &self.published.items[i];
             p.value = scalar;
             p.has_value = true;
+            p.matrix = matrix;
             // `shape` is deliberately not touched: the entry `evaluate`
             // made carries the result's shape, and that — not the
             // scalar the anchor's coordinate reads — is what the
@@ -663,6 +675,7 @@ const Driver = struct {
             .value = scalar,
             .shape = v.shape(),
             .has_value = true,
+            .matrix = matrix,
         });
     }
 
@@ -714,6 +727,100 @@ const StageResult = union(enum) {
     refused: engine.decode.PlaneTwo,
 };
 
+/// The declared range of a legacy CSE anchor, from the scan: a
+/// `<f t="array" ref="…">` whose ref parses and starts at the anchor.
+/// Anything else answers null and the patcher's own gate names the
+/// refusal pre-mutation.
+fn cseDeclaredRange(cells: []const engine.decode.SheetCell, cell: engine.env.CellRef) ?coords.Range {
+    const sc = sheetCellAt(cells, cell.row, cell.col) orelse return null;
+    const f = sc.formula orelse return null;
+    const kind = f.kind orelse return null;
+    if (!std.mem.eql(u8, kind, "array")) return null;
+    const raw = f.ref orelse return null;
+    const range = (coords.parseRange(raw, .{
+        .dollar = .accept,
+        .case = .insensitive,
+    }) catch return null).normalized();
+    if (range.first.row.oneBased() != cell.row.oneBased() or
+        range.first.col.zeroBased() != cell.col.zeroBased()) return null;
+    return range;
+}
+
+fn sheetCellAt(cells: []const engine.decode.SheetCell, row: coords.Row, col: coords.Col) ?engine.decode.SheetCell {
+    var lo: usize = 0;
+    var hi: usize = cells.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const c = cells[mid];
+        if (c.row.oneBased() < row.oneBased() or
+            (c.row == row and c.col.zeroBased() < col.zeroBased()))
+        {
+            lo = mid + 1;
+        } else if (c.row == row and c.col == col) {
+            return c;
+        } else {
+            hi = mid;
+        }
+    }
+    return null;
+}
+
+/// §5.6h at the staging boundary (M7b1): let D be the declared range
+/// and R the anchor's published array. Only a 1×1 R broadcasts — it
+/// fills every cell of D (an error R propagates the same way); a
+/// non-scalar R places by coordinate, `#N/A` wherever D extends beyond
+/// R in either dimension, surplus of R truncated. Applied to the FILE's
+/// slave caches, which §5.7.3 says "keep `<f>` any-shape, gain `<v>`".
+fn synthesizeCseSlaves(
+    a: Allocator,
+    pubs: *std.ArrayListUnmanaged(engine.resolved.Publication),
+    driver: *const Driver,
+    p: Published,
+    decl: coords.Range,
+    run: RunInputs,
+    sheet_idx: u32,
+) error{OutOfMemory}!void {
+    const rows_d = decl.rowCount();
+    const cols_d = decl.colCount();
+    var i: u32 = 0;
+    while (i < rows_d) : (i += 1) {
+        var j: u32 = 0;
+        while (j < cols_d) : (j += 1) {
+            if (i == 0 and j == 0) continue; // the anchor's own cell
+            const row = coords.Row.fromOneBased(decl.first.row.oneBased() + i) catch continue;
+            const col = coords.Col.fromZeroBased(decl.first.col.zeroBased() + j) catch continue;
+            // A covered cell with a formula of its own publishes for
+            // itself — the graph never made it a tail (M7a).
+            const target: engine.env.CellRef = .{
+                .sheet = engine.env.SheetIndex.fromInt(sheet_idx),
+                .row = row,
+                .col = col,
+            };
+            if (driver.published_at.get(target) != null) continue;
+            const elem: engine.value.ScalarValue = if (p.matrix) |m|
+                (if (m.rows == 1 and m.cols == 1)
+                    // A 1×1 R broadcasts — the same rule as a scalar,
+                    // spelled per §5.6h so a one-element array does not
+                    // fill the rest of D with `#N/A`.
+                    m.at(0, 0)
+                else if (i < m.rows and j < m.cols)
+                    m.at(i, j)
+                else
+                    engine.value.ScalarValue.errorOf(.na))
+            else
+                p.value;
+            try pubs.append(a, .{
+                .row = row,
+                .col = col,
+                .result = engine.value.publish(elem, run.fidelity),
+                .origin = .computed,
+                .shape = .{ .rows = 1, .cols = 1 },
+                .dialect = .legacy,
+            });
+        }
+    }
+}
+
 fn stage(
     wb: *Workbook,
     gpa: Allocator,
@@ -729,6 +836,36 @@ fn stage(
 
     var sheet_idx: u32 = 0;
     while (sheet_idx < wb.sheetCount()) : (sheet_idx += 1) {
+        var any = false;
+        for (driver.published.items) |p| {
+            if (p.has_value and p.cell.sheet.toInt() == sheet_idx) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) continue;
+
+        const ws = try wb.sheet(sheet_idx);
+        const part_name = try ws.resolvePartName();
+        const part = (try wb.store.part(part_name)) orelse return Error.MissingSheetPart;
+
+        // The same scan the model was built from, re-run because the
+        // model keeps *cells* and the projection needs *spans*. Same
+        // bytes, same options — `resolved.project` requires the accepted
+        // scan of the source it is patching, and a second scan under
+        // different options would be a second opinion about the document.
+        // It runs BEFORE the publications are built since M7b1: §5.6h's
+        // slave synthesis reads each anchor's declared range from it.
+        var scan = switch (try engine.decode.scanSheet(gpa, part.bytes, model.strings.items, .{
+            .limits = opts.limits,
+            .fidelity = run.fidelity,
+            .date_system = model.calc.date_system,
+        })) {
+            .ok => |s| s,
+            .refused => |r| return .{ .refused = r.planeTwo() },
+        };
+        defer scan.deinit();
+
         var pubs: std.ArrayListUnmanaged(engine.resolved.Publication) = .empty;
         for (driver.published.items) |p| {
             if (!p.has_value) continue;
@@ -746,28 +883,24 @@ fn stage(
                 .origin = .computed,
                 .shape = p.shape,
                 .dialect = dialect,
+                // §5.8b: what the model placed travels with the
+                // publication — the patcher consumes the outcome, never
+                // re-decides it. Tail publications land with the first
+                // committed transition reference; until one exists the
+                // anchor's own refusal precedes every tail on every
+                // reachable path.
+                .role = if (model.spillOutcomeOf(p.cell)) |o| .{ .da_anchor = o } else .plain,
             });
+            // A legacy CSE's slaves are not evaluable nodes; their file
+            // caches are maintained here, from the anchor's own array,
+            // by §5.6h's placement rule — never by re-decision.
+            if (dialect == .legacy) {
+                if (cseDeclaredRange(scan.cells, p.cell)) |decl| {
+                    try synthesizeCseSlaves(a, &pubs, driver, p, decl, run, sheet_idx);
+                }
+            }
         }
         if (pubs.items.len == 0) continue;
-
-        const ws = try wb.sheet(sheet_idx);
-        const part_name = try ws.resolvePartName();
-        const part = (try wb.store.part(part_name)) orelse return Error.MissingSheetPart;
-
-        // The same scan the model was built from, re-run because the
-        // model keeps *cells* and the projection needs *spans*. Same
-        // bytes, same options — `resolved.project` requires the accepted
-        // scan of the source it is patching, and a second scan under
-        // different options would be a second opinion about the document.
-        var scan = switch (try engine.decode.scanSheet(gpa, part.bytes, model.strings.items, .{
-            .limits = opts.limits,
-            .fidelity = run.fidelity,
-            .date_system = model.calc.date_system,
-        })) {
-            .ok => |s| s,
-            .refused => |r| return .{ .refused = r.planeTwo() },
-        };
-        defer scan.deinit();
 
         var deltas: engine.resolved.StagedDeltas = .{ .publications = pubs.items };
         var projected = engine.resolved.project(gpa, part.bytes, &scan, &deltas) catch |e| switch (e) {
@@ -1703,10 +1836,115 @@ test "pre-M7 gate: a non-1x1 result refuses with zero mutation" {
         "</row></sheetData></worksheet>" });
 }
 
-test "pre-M7 gate: a legacy CSE anchor refuses with zero mutation" {
-    try expectGateRefusal(.{ .sheet = "<worksheet xmlns=\"" ++ ns_main ++ "\"><sheetData><row r=\"1\">" ++
-        "<c r=\"A1\"><f t=\"array\" ref=\"A1\">1+1</f><v>999</v></c>" ++
-        "</row></sheetData></worksheet>" });
+/// A stored CSE over `A1:A2` with both caches stale — the shape M7b1
+/// opens: every mutation is `<v>` on a `<c>` that exists.
+const sheet_cse =
+    "<worksheet xmlns=\"" ++ ns_main ++ "\"><sheetData>" ++
+    "<row r=\"1\"><c r=\"A1\"><f t=\"array\" ref=\"A1:A2\">SEQUENCE(2)</f><v>999</v></c></row>" ++
+    "<row r=\"2\"><c r=\"A2\"><v>999</v></c></row>" ++
+    "</sheetData></worksheet>";
+
+test "M7b1: a legacy CSE persists — anchor and slave caches together, through the file transaction" {
+    // The pre-M7 refusal this test replaces is now §5.8b's narrow: a
+    // covered CSE is `<v>`+`t` on existing cells, no cm/vm byte
+    // involved, and it commits.
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const src = try writeFixture(a, io, dir, "in.xlsx", .{ .sheet = sheet_cse });
+    defer a.free(src);
+    const out = try std.fs.path.join(a, &.{ dir, "out.xlsx" });
+    defer a.free(out);
+
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        var r = try wb.saveWithRecalc(a, io, out, fixed_run, .{});
+        defer r.deinit(a);
+        try testing.expectEqual(@as(u32, 2), r.cells_written);
+    }
+
+    var reopened = try Workbook.open(a, io, out);
+    defer reopened.deinit();
+    try testing.expectEqualStrings("1", try cellCache(try reopened.sheet(0), "A1"));
+    try testing.expectEqualStrings("2", try cellCache(try reopened.sheet(0), "A2"));
+    // The declared range survives byte-identically — the patcher never
+    // addresses a byte inside `<f>` except the ref value, and a CSE's
+    // ref does not move.
+    const bytes = (try reopened.store.part(sheet_part)).?.bytes;
+    try testing.expect(std.mem.indexOf(u8, bytes, "<f t=\"array\" ref=\"A1:A2\">SEQUENCE(2)</f>") != null);
+}
+
+test "M7b1: an injected rename failure after multi-cell staging leaves prior bytes intact" {
+    // DONE-WHEN 5, file side: the M5b2 zero-mutation gates extended to
+    // the multi-cell staging M7b1 opened — anchor plus slave staged,
+    // failure injected at the commit point, destination and memory
+    // both untouched.
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const base = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, base, &tmp);
+    defer a.free(dir);
+    const src = try writeFixture(a, base, dir, "in.xlsx", .{ .sheet = sheet_cse });
+    defer a.free(src);
+    const dest = try writeFixture(a, base, dir, "dest.xlsx", .{ .sheet = sheet_no_formula });
+    defer a.free(dest);
+
+    const before = try readAll(a, base, dest);
+    defer a.free(before);
+
+    var wb = try Workbook.open(a, base, src);
+    defer wb.deinit();
+
+    const io = control.inject.wrap(base, .{ .fail_rename = true });
+    try testing.expectError(error.AccessDenied, wb.saveWithRecalc(a, io, dest, fixed_run, .{}));
+
+    try testing.expectEqual(@as(usize, 0), wb.retained.items.len);
+    try testing.expectEqualStrings("999", try cellCache(try wb.sheet(0), "A1"));
+    try testing.expectEqualStrings("999", try cellCache(try wb.sheet(0), "A2"));
+
+    const after = try readAll(a, base, dest);
+    defer a.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+    try expectNoTempFiles(base, dir);
+}
+
+test "M7b1: an injected sync failure after multi-cell staging is pre-commit too" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const base = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, base, &tmp);
+    defer a.free(dir);
+    const src = try writeFixture(a, base, dir, "in.xlsx", .{ .sheet = sheet_cse });
+    defer a.free(src);
+    const dest = try std.fs.path.join(a, &.{ dir, "absent.xlsx" });
+    defer a.free(dest);
+
+    var wb = try Workbook.open(a, base, src);
+    defer wb.deinit();
+
+    const io = control.inject.wrap(base, .{ .fail_file_sync_at = 1 });
+    try testing.expectError(error.InputOutput, wb.saveWithRecalc(a, io, dest, fixed_run, .{}));
+
+    try testing.expectEqual(@as(usize, 0), wb.retained.items.len);
+    try testing.expectEqualStrings("999", try cellCache(try wb.sheet(0), "A1"));
+    try testing.expectEqualStrings("999", try cellCache(try wb.sheet(0), "A2"));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(base, dest, .{}));
+    try expectNoTempFiles(base, dir);
 }
 
 test "pre-M7 gate: a dynamic-array anchor refuses with zero mutation" {
