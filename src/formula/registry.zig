@@ -838,6 +838,122 @@ pub const functions = [_]Function{
         .impl = fnMaxIfs,
     },
 
+    // ── M7b3: the F2-stats family. Eleven names, ONE numeric
+    //    collection with SUM's range/direct split, and the order
+    //    statistics share one ascending sort of it (§7). None compares
+    //    text — MIN/MAX's exception to `collation_v1` (§5.4b) extends
+    //    to the whole family — and an error inside a range is the
+    //    fold's error, found in §5.6a order by the collector, where
+    //    the criteria family above treats it as a matchable value.
+    //    The six variadic names are `.propagate`; the five fixed-slot
+    //    names are `per_function_provenance` for the lookups' reason:
+    //    their collection arrives as a reference the dispatcher cannot
+    //    see an error inside, so §5.3c's declaration order is taken by
+    //    the implementations, collection slot included. ──
+    .{
+        .name = "MEDIAN",
+        .arity = .{ .min = 1, .max = null, .fixed = &none_l, .rest = &eager1 },
+        .coercion = .{ .fixed = &none_c, .rest = &[_]CoercionClass{.aggregate} },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnMedian,
+    },
+    .{
+        .name = "MODE.SNGL",
+        .arity = .{ .min = 1, .max = null, .fixed = &none_l, .rest = &eager1 },
+        .coercion = .{ .fixed = &none_c, .rest = &[_]CoercionClass{.aggregate} },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnModeSngl,
+    },
+    .{
+        .name = "STDEV.P",
+        .arity = .{ .min = 1, .max = null, .fixed = &none_l, .rest = &eager1 },
+        .coercion = .{ .fixed = &none_c, .rest = &[_]CoercionClass{.aggregate} },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnStdevP,
+    },
+    .{
+        .name = "STDEV.S",
+        .arity = .{ .min = 1, .max = null, .fixed = &none_l, .rest = &eager1 },
+        .coercion = .{ .fixed = &none_c, .rest = &[_]CoercionClass{.aggregate} },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnStdevS,
+    },
+    .{
+        .name = "VAR.P",
+        .arity = .{ .min = 1, .max = null, .fixed = &none_l, .rest = &eager1 },
+        .coercion = .{ .fixed = &none_c, .rest = &[_]CoercionClass{.aggregate} },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnVarP,
+    },
+    .{
+        .name = "VAR.S",
+        .arity = .{ .min = 1, .max = null, .fixed = &none_l, .rest = &eager1 },
+        .coercion = .{ .fixed = &none_c, .rest = &[_]CoercionClass{.aggregate} },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnVarS,
+    },
+    .{
+        .name = "PERCENTILE.INC",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .aggregate, .number },
+            .rest = &none_c,
+        },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .impl = fnPercentileInc,
+    },
+    .{
+        .name = "QUARTILE.INC",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .aggregate, .number },
+            .rest = &none_c,
+        },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .impl = fnQuartileInc,
+    },
+    .{
+        .name = "RANK.EQ",
+        .arity = .{ .min = 2, .max = 3, .fixed = &[_]Laziness{ .eager, .eager, .eager }, .rest = &none_l },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .number, .aggregate, .number },
+            .rest = &none_c,
+        },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .impl = fnRankEq,
+    },
+    .{
+        .name = "LARGE",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .aggregate, .number },
+            .rest = &none_c,
+        },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .impl = fnLarge,
+    },
+    .{
+        .name = "SMALL",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{
+            .fixed = &[_]CoercionClass{ .aggregate, .number },
+            .rest = &none_c,
+        },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .impl = fnSmall,
+    },
+
     // ── lookups: the five names that take BOTH their equality and
     //    their ordering from `collation_v1` (§5.4b), which is exactly
     //    what MIN and MAX above do not.
@@ -2549,6 +2665,276 @@ fn fnMinIfs(ctx: CallCtx, args: []const Value) FnError!Value {
 
 fn fnMaxIfs(ctx: CallCtx, args: []const Value) FnError!Value {
     return runIfs(ctx, args, .max);
+}
+
+// ─── M7b3: the F2-stats family (§7) ──────────────────────────────
+
+/// What every stats name reads: the numerics in §5.6a order, or the
+/// first error found there. A range contributes numbers only, a direct
+/// argument coerces — `SUM`'s split verbatim, which is what makes a
+/// text cell invisible to `MEDIAN(E1:E4)` while a direct `MEDIAN("x")`
+/// is `#VALUE!`.
+const Collected = union(enum) {
+    nums: []f64,
+    failed: value.ScalarValue,
+};
+
+fn collectNumbers(ctx: CallCtx, args: []const Value) FnError!Collected {
+    const Acc = struct {
+        ctx: CallCtx,
+        list: std.ArrayListUnmanaged(f64) = .empty,
+        failed: ?value.ScalarValue = null,
+
+        fn visit(self: *@This(), s: value.ScalarValue, via_range: bool) FnError!bool {
+            if (s == .err) {
+                self.failed = s;
+                return false;
+            }
+            const x: f64 = if (via_range) blk: {
+                if (s != .number) return true;
+                break :blk s.number;
+            } else switch (value.coerceToNumber(s, self.ctx.fidelity(), .function_arg)) {
+                .number => |n| n,
+                .value => |v| {
+                    self.failed = v;
+                    return false;
+                },
+                .locale_refusal => return error.LocaleSensitiveInput,
+            };
+            try self.list.append(self.ctx.arena(), x);
+            return true;
+        }
+    };
+    var acc: Acc = .{ .ctx = ctx };
+    try visitArgs(ctx, args, &acc);
+    if (acc.failed) |f| return .{ .failed = f };
+    return .{ .nums = acc.list.items };
+}
+
+/// The ONE ascending sort the order-statistic names share — MEDIAN,
+/// PERCENTILE.INC, QUARTILE.INC, LARGE, SMALL and RANK.EQ all read
+/// this view; the moment names stop at the collection, and MODE.SNGL
+/// keeps the unsorted collection beside a sorted copy because its
+/// tie-break is "first seen", not "smallest".
+fn sortedNumbers(ctx: CallCtx, args: []const Value) FnError!Collected {
+    const c = try collectNumbers(ctx, args);
+    if (c == .nums) std.mem.sort(f64, c.nums, {}, std.sort.asc(f64));
+    return c;
+}
+
+/// First index in sorted `s` not below `x`.
+fn lowerIdx(s: []const f64, x: f64) usize {
+    var lo: usize = 0;
+    var hi: usize = s.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (s[mid] < x) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
+/// First index in sorted `s` above `x`.
+fn upperIdx(s: []const f64, x: f64) usize {
+    var lo: usize = 0;
+    var hi: usize = s.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (s[mid] <= x) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
+/// §5.3c's declaration order for the five fixed-slot names: their
+/// collection is a reference slot the dispatcher cannot see an error
+/// inside, so the implementations read the collection first and each
+/// scalar slot after, in slot order — `lookupPropagate`'s reason,
+/// with the opposite verdict on the collection's interior.
+fn scalarSlotError(args: []const Value, i: usize) ?value.ScalarValue {
+    if (i >= args.len) return null;
+    const s = args[i].scalar;
+    if (s == .err) return s;
+    return null;
+}
+
+fn fnMedian(ctx: CallCtx, args: []const Value) FnError!Value {
+    const s = switch (try sortedNumbers(ctx, args)) {
+        .failed => |f| return .{ .scalar = f },
+        .nums => |n| n,
+    };
+    if (s.len == 0) return Value.err(.num);
+    if (s.len % 2 == 1) return arith(s[s.len / 2]);
+    // The even case is an average of two, and it overflows the way an
+    // average does — through the addition, to `#NUM!`.
+    const sum = value.addSub(ctx.rules(), s[s.len / 2 - 1], s[s.len / 2], .add);
+    if (sum == .err) return .{ .scalar = sum };
+    return .{ .scalar = value.divide(ctx.rules(), sum.number, 2) };
+}
+
+fn fnModeSngl(ctx: CallCtx, args: []const Value) FnError!Value {
+    const nums = switch (try collectNumbers(ctx, args)) {
+        .failed => |f| return .{ .scalar = f },
+        .nums => |n| n,
+    };
+    // The walk is over the UNSORTED collection — the tie between equal
+    // counts goes to §5.6a's first encounter, so the sorted copy only
+    // answers "how many". Strictly-greater keeps the first winner, and
+    // a starting best of one is why a value seen once is not a mode.
+    const sorted = try ctx.arena().dupe(f64, nums);
+    std.mem.sort(f64, sorted, {}, std.sort.asc(f64));
+    var best: ?f64 = null;
+    var best_count: usize = 1;
+    for (nums) |x| {
+        const n = upperIdx(sorted, x) - lowerIdx(sorted, x);
+        if (n > best_count) {
+            best = x;
+            best_count = n;
+        }
+    }
+    return arith(best orelse return Value.err(.na));
+}
+
+const StatMoment = enum { var_p, var_s, stdev_p, stdev_s };
+
+/// The four moment names are one computation — mean, then summed
+/// squared deviations, two passes over the same collection the order
+/// statistics sort. The divisor (`n` or `n − 1`) is the entire
+/// `.P`/`.S` distinction, and the too-few-numbers error is spelled by
+/// the division rather than tested for: one number under `.S` divides
+/// by zero, which really is what a sample of one has no variance BY.
+fn foldMoments(ctx: CallCtx, args: []const Value, mode: StatMoment) FnError!Value {
+    const nums = switch (try collectNumbers(ctx, args)) {
+        .failed => |f| return .{ .scalar = f },
+        .nums => |n| n,
+    };
+    // No numbers anywhere cannot reach the division (its mean is 0/0),
+    // so the empty collection answers what the division would have.
+    if (nums.len == 0) return Value.err(.div0);
+    var total: f64 = 0;
+    for (nums) |x| {
+        const t = value.addSub(ctx.rules(), total, x, .add);
+        if (t == .err) return .{ .scalar = t };
+        total = t.number;
+    }
+    const n: f64 = @floatFromInt(nums.len);
+    const mean = total / n;
+    var ss: f64 = 0;
+    for (nums) |x| {
+        const d = x - mean;
+        ss += d * d;
+    }
+    if (!std.math.isFinite(ss)) return Value.err(.num);
+    const divisor: f64 = switch (mode) {
+        .var_p, .stdev_p => n,
+        .var_s, .stdev_s => n - 1,
+    };
+    const v = value.divide(ctx.rules(), ss, divisor);
+    if (v == .err) return .{ .scalar = v };
+    return switch (mode) {
+        .var_p, .var_s => .{ .scalar = v },
+        .stdev_p, .stdev_s => arith(@sqrt(v.number)),
+    };
+}
+
+fn fnVarP(ctx: CallCtx, args: []const Value) FnError!Value {
+    return foldMoments(ctx, args, .var_p);
+}
+
+fn fnVarS(ctx: CallCtx, args: []const Value) FnError!Value {
+    return foldMoments(ctx, args, .var_s);
+}
+
+fn fnStdevP(ctx: CallCtx, args: []const Value) FnError!Value {
+    return foldMoments(ctx, args, .stdev_p);
+}
+
+fn fnStdevS(ctx: CallCtx, args: []const Value) FnError!Value {
+    return foldMoments(ctx, args, .stdev_s);
+}
+
+/// §7's INC interpolation: rank `k·(n−1)`, split into knot and
+/// fraction — exactly the sorted element when the rank lands on an
+/// integer (the 0/0.25/0.5/0.75/1 knots over `n = 4m + 1` land there),
+/// linear between the two neighbours when it does not.
+fn percentileInc(s: []const f64, k: f64) Value {
+    assert(s.len > 0);
+    assert(k >= 0 and k <= 1);
+    const pos = k * @as(f64, @floatFromInt(s.len - 1));
+    const knot = @trunc(pos);
+    const frac = pos - knot;
+    const lo: usize = @intFromFloat(knot);
+    if (frac == 0) return arith(s[lo]);
+    return arith(s[lo] + frac * (s[lo + 1] - s[lo]));
+}
+
+fn fnPercentileInc(ctx: CallCtx, args: []const Value) FnError!Value {
+    const s = switch (try sortedNumbers(ctx, args[0..1])) {
+        .failed => |f| return .{ .scalar = f },
+        .nums => |n| n,
+    };
+    if (scalarSlotError(args, 1)) |e| return .{ .scalar = e };
+    const k = numArg(args, 1);
+    if (s.len == 0 or k < 0 or k > 1) return Value.err(.num);
+    return percentileInc(s, k);
+}
+
+fn fnQuartileInc(ctx: CallCtx, args: []const Value) FnError!Value {
+    const s = switch (try sortedNumbers(ctx, args[0..1])) {
+        .failed => |f| return .{ .scalar = f },
+        .nums => |n| n,
+    };
+    if (scalarSlotError(args, 1)) |e| return .{ .scalar = e };
+    // Truncation first, bounds second — CHOOSE/ADDRESS's house rule,
+    // pinned pending the parked Excel leg.
+    const q = @trunc(numArg(args, 1));
+    if (s.len == 0 or q < 0 or q > 4) return Value.err(.num);
+    return percentileInc(s, q / 4);
+}
+
+const Tail = enum { largest, smallest };
+
+fn orderStat(ctx: CallCtx, args: []const Value, tail: Tail) FnError!Value {
+    const s = switch (try sortedNumbers(ctx, args[0..1])) {
+        .failed => |f| return .{ .scalar = f },
+        .nums => |n| n,
+    };
+    if (scalarSlotError(args, 1)) |e| return .{ .scalar = e };
+    const k = @trunc(numArg(args, 1));
+    if (s.len == 0 or k < 1 or k > @as(f64, @floatFromInt(s.len))) return Value.err(.num);
+    const i: usize = @intFromFloat(k);
+    return arith(switch (tail) {
+        .largest => s[s.len - i],
+        .smallest => s[i - 1],
+    });
+}
+
+fn fnLarge(ctx: CallCtx, args: []const Value) FnError!Value {
+    return orderStat(ctx, args, .largest);
+}
+
+fn fnSmall(ctx: CallCtx, args: []const Value) FnError!Value {
+    return orderStat(ctx, args, .smallest);
+}
+
+fn fnRankEq(ctx: CallCtx, args: []const Value) FnError!Value {
+    if (scalarSlotError(args, 0)) |e| return .{ .scalar = e };
+    const x = numArg(args, 0);
+    const s = switch (try sortedNumbers(ctx, args[1..2])) {
+        .failed => |f| return .{ .scalar = f },
+        .nums => |n| n,
+    };
+    if (scalarSlotError(args, 2)) |e| return .{ .scalar = e };
+    const lo = lowerIdx(s, x);
+    const hi = upperIdx(s, x);
+    // A number absent from the collection is `#N/A` — including absent
+    // from the empty one.
+    if (lo == hi) return Value.err(.na);
+    // Ties share the TOP rank in both directions (`.EQ`'s letter):
+    // descending counts the strictly larger, ascending the strictly
+    // smaller. Zero or an omitted order is descending; any other
+    // number — Excel reads it as a logical — is ascending.
+    const order: f64 = if (args.len >= 3) numArg(args, 2) else 0;
+    const rank: usize = if (order == 0) s.len - hi + 1 else lo + 1;
+    return Value.num(@floatFromInt(rank));
 }
 
 // ─── lookups (§5.4b: equality AND ordering from `collation_v1`) ──
@@ -5189,6 +5575,132 @@ test "M7b2: every F2-criteria row declares all five fields, and its flags honest
     try testing.expectEqual(@as(usize, 6), seen);
 }
 
+const m7b3_milestone = "M7b3";
+const m7b3_batch = "F2-stats";
+
+fn isM7b3(e: InventoryEntry) bool {
+    return std.mem.eql(u8, e.milestone, m7b3_milestone) and
+        std.mem.eql(u8, e.batch, m7b3_batch);
+}
+
+test "M7b3: the batch's size is regenerated from the inventory, never from prose" {
+    // The ladder row says "11". This test counts the file instead, the
+    // same both-directions discipline every F-batch since M4c ships
+    // under: every `M7b3`/`F2-stats` row resolves, and every
+    // registered function tagged `M7b3` is listed under this batch.
+    var it = inventory();
+    var counted: usize = 0;
+    while (it.next()) |e| {
+        if (isM7b3(e)) counted += 1;
+    }
+    try testing.expect(counted > 0);
+
+    var it2 = inventory();
+    var resolved: usize = 0;
+    while (it2.next()) |e| {
+        if (!isM7b3(e)) continue;
+        const f = lookup(e.name) orelse {
+            std.debug.print("F2-stats name not registered: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        };
+        try testing.expectEqualStrings(e.name, f.name);
+        resolved += 1;
+    }
+    try testing.expectEqual(counted, resolved);
+
+    var registered_m7b3: usize = 0;
+    for (&functions) |*f| {
+        var it3 = inventory();
+        while (it3.next()) |e| {
+            if (!std.mem.eql(u8, e.name, f.name)) continue;
+            if (std.mem.eql(u8, e.milestone, m7b3_milestone)) {
+                if (!isM7b3(e)) {
+                    std.debug.print("{s}: tagged {s} but batch {s}\n", .{ f.name, e.milestone, e.batch });
+                    return error.BatchTagMismatch;
+                }
+                registered_m7b3 += 1;
+            }
+            break;
+        }
+    }
+    try testing.expectEqual(counted, registered_m7b3);
+}
+
+test "M7b3: the running total moves with the batch, counted from the file" {
+    const rows = [_][]const u8{ "M4c", "M4d", "M4e", "M4f", "M4g", "M5a2", "M7a", "M7b2", "M7b3" };
+    var shipped: usize = 0;
+    for (rows) |m| {
+        var it = inventory();
+        while (it.next()) |e| {
+            if (!std.mem.eql(u8, e.milestone, m)) continue;
+            if (lookup(e.name) == null) {
+                std.debug.print("shipped name does not resolve: {s} ({s})\n", .{ e.name, m });
+                return error.LadderTotalIncomplete;
+            }
+            shipped += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 119), shipped);
+}
+
+test "M7b3: every F2-stats row declares all five fields, and its flags honestly" {
+    // Every name carries an `.aggregate` slot, so none lifts wholesale
+    // — `liftable()` is false by shape — and none compares text, so
+    // none is `collation_sensitive`: MIN/MAX's §5.4b exception extends
+    // to the whole family. An error inside a range is the fold's error
+    // — the opposite side of §5.3c's line from the criteria family
+    // beside them — but the CLASS splits by shape: the variadic six
+    // are `.propagate` (every slot is `.aggregate`, so the collector
+    // sees everything in order), while the fixed five carry a scalar
+    // slot beside a reference the dispatcher cannot see inside, and
+    // take declaration order themselves, the lookups' way.
+    var it = inventory();
+    var seen: usize = 0;
+    while (it.next()) |e| {
+        if (!isM7b3(e)) continue;
+        const f = lookup(e.name).?;
+        seen += 1;
+        try testing.expect(f.form == .plain);
+        try testing.expect(f.impl != null);
+        try testing.expect(!f.reference_producing);
+        try testing.expect(!f.da_aware);
+        try testing.expect(!f.platform_sensitive);
+        try testing.expect(!f.cv_sensitive);
+        try testing.expect(!f.epoch_sensitive);
+        try testing.expect(!f.collation_sensitive);
+        try testing.expect(!f.liftable());
+        try testing.expectEqual(Volatility.stable, f.volatility);
+        try testing.expectEqual(
+            if (f.arity.max == null) value.PropagationClass.propagate else value.PropagationClass.per_function_provenance,
+            f.propagation,
+        );
+
+        if (f.arity.max == null) {
+            // The six variadic names: AVERAGE's shape, one `.aggregate`
+            // slot cycling — the shared collection is declared here.
+            try testing.expectEqual(@as(u8, 1), f.arity.min);
+            try testing.expectEqual(@as(usize, 0), f.coercion.fixed.len);
+            try testing.expectEqual(@as(usize, 1), f.coercion.rest.len);
+            try testing.expectEqual(CoercionClass.aggregate, f.coercion.rest[0]);
+        } else if (std.mem.eql(u8, e.name, "RANK.EQ")) {
+            try testing.expectEqual(@as(u8, 2), f.arity.min);
+            try testing.expectEqual(@as(?u8, 3), f.arity.max);
+            try testing.expectEqual(CoercionClass.number, f.coercion.fixed[0]);
+            try testing.expectEqual(CoercionClass.aggregate, f.coercion.fixed[1]);
+            try testing.expectEqual(CoercionClass.number, f.coercion.fixed[2]);
+        } else {
+            // The four fixed order statistics: the collection, then a
+            // scalar rank/knot the mixed-signature lift may still
+            // spread (§5.3b).
+            try testing.expectEqual(@as(u8, 2), f.arity.min);
+            try testing.expectEqual(@as(?u8, 2), f.arity.max);
+            try testing.expectEqual(CoercionClass.aggregate, f.coercion.fixed[0]);
+            try testing.expectEqual(CoercionClass.number, f.coercion.fixed[1]);
+        }
+    }
+    try testing.expectEqual(@as(usize, 11), seen);
+}
+
 test "M5a2: both reference-producing rows are complete, and they are the only two" {
     // §7 lists exactly two reference-producing rows, and M4e's decision
     // 11 deferred `INDEX`'s range form on the strength of that. If a
@@ -5565,11 +6077,12 @@ test "registry: lookup is case-insensitive and rejects unknown names" {
     try testing.expect(lookup("SuM") != null);
     try testing.expectEqualStrings("SUM", lookup("sum").?.name);
     // A name the frozen inventory holds and no row has reached yet.
-    // `VLOOKUP` stood here until M4e registered it, which is what this
-    // line is for: the example has to be a function that is genuinely
-    // still ahead of the ladder, and every batch that lands moves it.
-    try testing.expect(lookup("MEDIAN") == null); // frozen, M7b3
-    try testing.expect(inInventory("MEDIAN"));
+    // `VLOOKUP` stood here until M4e registered it, `MEDIAN` until
+    // M7b3, which is what this line is for: the example has to be a
+    // function that is genuinely still ahead of the ladder, and every
+    // batch that lands moves it.
+    try testing.expect(lookup("TEXT") == null); // frozen, M8a
+    try testing.expect(inInventory("TEXT"));
     try testing.expect(lookup("NOTAFUNCTION") == null);
 }
 

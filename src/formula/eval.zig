@@ -7138,6 +7138,326 @@ test "M7b2: every criteria name against every argument shape, exhaustively and i
     try testing.expect(checked > 5_000);
 }
 
+// ─── M7b3: the F2-stats batch (§7, eleven names; one collection) ──
+
+/// The battery's grid. A is the population set — VAR.P/STDEV.P land
+/// exact, MODE.SNGL's winner lives here, and RANK.EQ's ties do. B is
+/// the sample set (VAR.S/STDEV.S exact). C is the percentile set:
+/// n − 1 = 4, so every k that is a multiple of 1/8 interpolates
+/// exactly and the knot fixtures compare equal rather than close. D is
+/// three tied pairs for MODE.SNGL's tie-break, E the range-restriction
+/// mix with a hole at E4, F §5.3c's two errors in M7b2's spelling.
+fn putF2sCells(h: *Harness) !void {
+    try h.put("A1", num(2));
+    try h.put("A2", num(4));
+    try h.put("A3", num(4));
+    try h.put("A4", num(4));
+    try h.put("A5", num(5));
+    try h.put("A6", num(5));
+    try h.put("A7", num(7));
+    try h.put("A8", num(9));
+    try h.put("B1", num(1));
+    try h.put("B2", num(3));
+    try h.put("B3", num(5));
+    try h.put("C1", num(15));
+    try h.put("C2", num(20));
+    try h.put("C3", num(35));
+    try h.put("C4", num(40));
+    try h.put("C5", num(50));
+    try h.put("D1", num(5));
+    try h.put("D2", num(5));
+    try h.put("D3", num(2));
+    try h.put("D4", num(2));
+    try h.put("D5", num(9));
+    try h.put("D6", num(9));
+    try h.put("E1", .{ .text = "x" });
+    try h.put("E2", num(7));
+    try h.put("E3", .{ .boolean = true });
+    try h.put("F1", value.ScalarValue.errorOf(.div0));
+    try h.put("F2", value.ScalarValue.errorOf(.na));
+}
+
+const f2s_cases = [_]F2Case{
+    // ── MEDIAN: both parities, the range/direct split, the union ──
+    .{ .func = "MEDIAN", .formula = "MEDIAN(B1:B3)", .expect = .{ .number = 3 } },
+    .{ .func = "MEDIAN", .formula = "MEDIAN(A1:A8)", .expect = .{ .number = 4.5 }, .note = "the even case averages the two middles" },
+    .{ .func = "MEDIAN", .formula = "MEDIAN(A:A)", .expect = .{ .number = 4.5 }, .note = "the whole column rides the same blank runs" },
+    .{ .func = "MEDIAN", .formula = "MEDIAN(1,2,3,4)", .expect = .{ .number = 2.5 } },
+    .{ .func = "MEDIAN", .formula = "MEDIAN(E1:E4)", .expect = .{ .number = 7 }, .note = "text, logicals and the hole are invisible through a range" },
+    .{ .func = "MEDIAN", .formula = "MEDIAN(TRUE(),2)", .expect = .{ .number = 1.5 }, .note = "…and a direct logical coerces — SUM's split verbatim" },
+    .{ .func = "MEDIAN", .formula = "MEDIAN(\"3\",1)", .expect = .{ .number = 2 }, .note = "direct numeric text coerces" },
+    .{ .func = "MEDIAN", .formula = "MEDIAN(\"x\")", .expect = .{ .err = .value }, .note = "direct non-numeric text is `#VALUE!`, not ignored" },
+    .{ .func = "MEDIAN", .formula = "MEDIAN(E1:E1)", .expect = .{ .err = .num }, .note = "no numbers anywhere is `#NUM!`" },
+    .{ .func = "MEDIAN", .formula = "MEDIAN((A1:A2,A5:A6))", .expect = .{ .number = 4.5 }, .note = "a multi-area union is one collection here, where the criteria family answers `#VALUE!`" },
+    .{ .func = "MEDIAN", .formula = "MEDIAN(1.7E+308,1.7E+308)", .expect = .{ .err = .num }, .note = "the even case overflows through its addition, to `#NUM!`" },
+
+    // ── MODE.SNGL: the count, the tie, the two `#N/A` routes ──
+    .{ .func = "MODE.SNGL", .formula = "MODE.SNGL(A1:A8)", .expect = .{ .number = 4 } },
+    .{ .func = "MODE.SNGL", .formula = "MODE.SNGL(D1:D6)", .expect = .{ .number = 5 }, .note = "three tied pairs: §5.6a's first encounter wins, pinned pending the parked Excel leg" },
+    .{ .func = "MODE.SNGL", .formula = "MODE.SNGL(2,2,3,3)", .expect = .{ .number = 2 }, .note = "the tie-break through direct arguments" },
+    .{ .func = "MODE.SNGL", .formula = "MODE.SNGL(B1:B3)", .expect = .{ .err = .na }, .note = "all distinct: a value seen once is not a mode" },
+    .{ .func = "MODE.SNGL", .formula = "MODE.SNGL(E1:E4)", .expect = .{ .err = .na }, .note = "…and neither is the collection of one" },
+
+    // ── the four moment names: `.P` exact on A, `.S` exact on B ──
+    .{ .func = "VAR.P", .formula = "VAR.P(A1:A8)", .expect = .{ .number = 4 } },
+    .{ .func = "STDEV.P", .formula = "STDEV.P(A1:A8)", .expect = .{ .number = 2 } },
+    .{ .func = "VAR.S", .formula = "VAR.S(B1:B3)", .expect = .{ .number = 4 } },
+    .{ .func = "STDEV.S", .formula = "STDEV.S(B1:B3)", .expect = .{ .number = 2 } },
+    .{ .func = "VAR.P", .formula = "VAR.P(5)", .expect = .{ .number = 0 }, .note = "a population of one has variance 0…" },
+    .{ .func = "STDEV.P", .formula = "STDEV.P(5)", .expect = .{ .number = 0 } },
+    .{ .func = "VAR.S", .formula = "VAR.S(5)", .expect = .{ .err = .div0 }, .note = "…and a sample of one divides by zero, which is the whole `.P`/`.S` distinction" },
+    .{ .func = "STDEV.S", .formula = "STDEV.S(5)", .expect = .{ .err = .div0 } },
+    .{ .func = "VAR.S", .formula = "VAR.S(E1:E4)", .expect = .{ .err = .div0 }, .note = "one number through the range restriction is still a sample of one" },
+    .{ .func = "VAR.P", .formula = "VAR.P(E1:E1)", .expect = .{ .err = .div0 }, .note = "no numbers anywhere: what the division would have said" },
+    .{ .func = "VAR.P", .formula = "VAR.P(TRUE(),3)", .expect = .{ .number = 1 }, .note = "the direct-argument coercion reaches the moments too" },
+
+    // ── PERCENTILE.INC: the five knots, and between them (§7) ──
+    .{ .func = "PERCENTILE.INC", .formula = "PERCENTILE.INC(C1:C5,0)", .expect = .{ .number = 15 } },
+    .{ .func = "PERCENTILE.INC", .formula = "PERCENTILE.INC(C1:C5,0.25)", .expect = .{ .number = 20 } },
+    .{ .func = "PERCENTILE.INC", .formula = "PERCENTILE.INC(C1:C5,0.5)", .expect = .{ .number = 35 } },
+    .{ .func = "PERCENTILE.INC", .formula = "PERCENTILE.INC(C1:C5,0.75)", .expect = .{ .number = 40 } },
+    .{ .func = "PERCENTILE.INC", .formula = "PERCENTILE.INC(C1:C5,1)", .expect = .{ .number = 50 } },
+    .{ .func = "PERCENTILE.INC", .formula = "PERCENTILE.INC(C1:C5,0.125)", .expect = .{ .number = 17.5 }, .note = "between the 0 and 0.25 knots: rank 0.5, half-way up the first gap" },
+    .{ .func = "PERCENTILE.INC", .formula = "PERCENTILE.INC(C1:C5,0.375)", .expect = .{ .number = 27.5 }, .note = "between 0.25 and 0.5" },
+    .{ .func = "PERCENTILE.INC", .formula = "PERCENTILE.INC(C1:C5,0.875)", .expect = .{ .number = 45 }, .note = "between 0.75 and 1" },
+    .{ .func = "PERCENTILE.INC", .formula = "PERCENTILE.INC(B1:B3,0.75)", .expect = .{ .number = 4 }, .note = "an even gap count interpolates exactly too" },
+    .{ .func = "PERCENTILE.INC", .formula = "PERCENTILE.INC(A2:A2,0.3)", .expect = .{ .number = 4 }, .note = "a single number answers every k" },
+    .{ .func = "PERCENTILE.INC", .formula = "PERCENTILE.INC(C1:C5,-0.1)", .expect = .{ .err = .num } },
+    .{ .func = "PERCENTILE.INC", .formula = "PERCENTILE.INC(C1:C5,1.1)", .expect = .{ .err = .num } },
+    .{ .func = "PERCENTILE.INC", .formula = "PERCENTILE.INC(E1:E1,0.5)", .expect = .{ .err = .num }, .note = "the empty collection is `#NUM!` before k is judged" },
+
+    // ── QUARTILE.INC: the same five knots by their other name ──
+    .{ .func = "QUARTILE.INC", .formula = "QUARTILE.INC(C1:C5,0)", .expect = .{ .number = 15 } },
+    .{ .func = "QUARTILE.INC", .formula = "QUARTILE.INC(C1:C5,1)", .expect = .{ .number = 20 }, .note = "q1 IS the 0.25 knot — same cell, same answer as PERCENTILE.INC" },
+    .{ .func = "QUARTILE.INC", .formula = "QUARTILE.INC(C1:C5,2)", .expect = .{ .number = 35 } },
+    .{ .func = "QUARTILE.INC", .formula = "QUARTILE.INC(C1:C5,3)", .expect = .{ .number = 40 } },
+    .{ .func = "QUARTILE.INC", .formula = "QUARTILE.INC(C1:C5,4)", .expect = .{ .number = 50 } },
+    .{ .func = "QUARTILE.INC", .formula = "QUARTILE.INC(C1:C5,1.9)", .expect = .{ .number = 20 }, .note = "quart truncates toward zero — CHOOSE/ADDRESS's house rule, pinned pending the parked Excel leg" },
+    .{ .func = "QUARTILE.INC", .formula = "QUARTILE.INC(C1:C5,5)", .expect = .{ .err = .num } },
+    .{ .func = "QUARTILE.INC", .formula = "QUARTILE.INC(C1:C5,-1)", .expect = .{ .err = .num } },
+
+    // ── RANK.EQ: ties share the top rank, in both directions ──
+    .{ .func = "RANK.EQ", .formula = "RANK.EQ(4,A1:A8)", .expect = .{ .number = 5 }, .note = "descending by default: 9, 7 and the two 5s outrank every 4" },
+    .{ .func = "RANK.EQ", .formula = "RANK.EQ(4,A1:A8,0)", .expect = .{ .number = 5 } },
+    .{ .func = "RANK.EQ", .formula = "RANK.EQ(4,A1:A8,1)", .expect = .{ .number = 2 }, .note = "ascending: the three 4s share rank 2, the top of the tie" },
+    .{ .func = "RANK.EQ", .formula = "RANK.EQ(5,A1:A8,2)", .expect = .{ .number = 5 }, .note = "any nonzero order is ascending — Excel reads the slot as a logical" },
+    .{ .func = "RANK.EQ", .formula = "RANK.EQ(9,A1:A8)", .expect = .{ .number = 1 } },
+    .{ .func = "RANK.EQ", .formula = "RANK.EQ(2,A1:A8,1)", .expect = .{ .number = 1 } },
+    .{ .func = "RANK.EQ", .formula = "RANK.EQ(A2,A1:A8)", .expect = .{ .number = 5 }, .note = "the number slot dereferences like any scalar slot" },
+    .{ .func = "RANK.EQ", .formula = "RANK.EQ(7,E1:E4)", .expect = .{ .number = 1 }, .note = "non-numbers are invisible to the collection it ranks against" },
+    .{ .func = "RANK.EQ", .formula = "RANK.EQ(6,A1:A8)", .expect = .{ .err = .na }, .note = "absent from the collection is `#N/A`" },
+    .{ .func = "RANK.EQ", .formula = "RANK.EQ(7,E1:E1)", .expect = .{ .err = .na }, .note = "…including absent from the empty one" },
+
+    // ── LARGE / SMALL: the shared sorted view, read from both ends ──
+    .{ .func = "LARGE", .formula = "LARGE(A1:A8,1)", .expect = .{ .number = 9 } },
+    .{ .func = "LARGE", .formula = "LARGE(A1:A8,3)", .expect = .{ .number = 5 }, .note = "duplicates occupy ranks: 9, 7, then the first 5" },
+    .{ .func = "LARGE", .formula = "LARGE(A1:A8,8)", .expect = .{ .number = 2 } },
+    .{ .func = "SMALL", .formula = "SMALL(A1:A8,1)", .expect = .{ .number = 2 } },
+    .{ .func = "SMALL", .formula = "SMALL(A1:A8,4)", .expect = .{ .number = 4 }, .note = "2 and the three 4s" },
+    .{ .func = "LARGE", .formula = "LARGE(A1:A8,1.9)", .expect = .{ .number = 9 }, .note = "k truncates toward zero — the house rule, pinned pending the parked Excel leg" },
+    .{ .func = "SMALL", .formula = "SMALL(A1:A8,2.9)", .expect = .{ .number = 4 } },
+    .{ .func = "LARGE", .formula = "LARGE(A1:A8,0)", .expect = .{ .err = .num } },
+    .{ .func = "LARGE", .formula = "LARGE(A1:A8,9)", .expect = .{ .err = .num }, .note = "one past the collection" },
+    .{ .func = "SMALL", .formula = "SMALL(A1:A8,0.5)", .expect = .{ .err = .num }, .note = "0.5 truncates to 0, and 0 is below the first rank" },
+    .{ .func = "SMALL", .formula = "SMALL(E1:E1,1)", .expect = .{ .err = .num }, .note = "the empty collection has no smallest" },
+    .{ .func = "LARGE", .formula = "LARGE(5,1)", .expect = .{ .number = 5 }, .note = "a direct scalar is a one-element collection" },
+    .{ .func = "SMALL", .formula = "SMALL(E1:E4,1)", .expect = .{ .number = 7 } },
+    .{ .func = "LARGE", .formula = "LARGE(A1:A8,{1;2})", .expect = .{ .array = .{ .rows = 2, .cols = 1, .cells = &.{ .{ .number = 9 }, .{ .number = 7 } } } }, .note = "the scalar slot lifts, the collection holds (M7a)" },
+};
+
+test "M7b3: every F2-stats fixture evaluates to what the spec says" {
+    for (f2s_cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF2sCells(&h);
+
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("F2-stats case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectValue(c.expect, v) catch |e| {
+            std.debug.print("F2-stats case `{s}` ({s})\n", .{ c.formula, c.note });
+            return e;
+        };
+    }
+}
+
+test "M7b3: all eleven frozen names resolve, and each has a fixture" {
+    var it = registry.inventory();
+    var batch: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M7b3")) continue;
+        batch += 1;
+
+        if (registry.lookup(e.name) == null) {
+            std.debug.print("F2-stats name does not resolve: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        }
+        var fixtures: usize = 0;
+        for (f2s_cases) |c| {
+            if (std.mem.eql(u8, c.func, e.name)) fixtures += 1;
+        }
+        if (fixtures == 0) {
+            std.debug.print("F2-stats name has no fixture: {s}\n", .{e.name});
+            return error.UnfixturedBatchFunction;
+        }
+    }
+    try testing.expectEqual(@as(usize, 11), batch);
+
+    for (f2s_cases) |c| {
+        var found = false;
+        var it2 = registry.inventory();
+        while (it2.next()) |e| {
+            if (std.mem.eql(u8, e.name, c.func) and std.mem.eql(u8, e.milestone, "M7b3")) found = true;
+        }
+        if (!found) {
+            std.debug.print("fixture names a function outside F2-stats: {s}\n", .{c.func});
+            return error.FixtureOutsideBatch;
+        }
+    }
+}
+
+test "M7b3: the evidence label on every fixture is true of the committed manifests" {
+    var oracle_rows: usize = 0;
+    var excluded_rows: usize = 0;
+    for (f2s_cases) |c| {
+        switch (try manifestVerdict(c.formula)) {
+            .decided => {
+                if (c.evidence != .oracle) return error.UnderstatedEvidence;
+                oracle_rows += 1;
+            },
+            .excluded => {
+                if (c.evidence != .spec_pinned) return error.ExcludedCellClaimedAsEvidence;
+                excluded_rows += 1;
+            },
+            .silent => {
+                if (c.evidence != .spec_pinned) return error.UnbackedOracleClaim;
+            },
+        }
+    }
+    // The committed manifests predate every F2-stats name; the parked
+    // Excel leg is what would move these.
+    try testing.expectEqual(@as(usize, 0), oracle_rows);
+    try testing.expectEqual(@as(usize, 0), excluded_rows);
+}
+
+test "M7b3: error order in every name of the batch (§5.3c)" {
+    // Every case runs in both argument orders, because a fixture with
+    // one error in it proves propagation and says nothing about order.
+    // An error anywhere in the batch's inputs is the fold's error —
+    // the opposite side of §5.3c's line from the criteria family,
+    // where an error is a value a criterion may match — and the ORDER
+    // is declaration order everywhere: from the dispatcher for the
+    // variadic six (every slot `.aggregate`, the collector reads
+    // §5.6a's order inside), from the implementations for the fixed
+    // five, whose collection is a reference the dispatcher cannot see
+    // an error inside — the lookups' arrangement, opposite verdict.
+    const Case = struct { formula: []const u8, expect: Expect, note: []const u8 = "" };
+    const cases = [_]Case{
+        .{ .formula = "MEDIAN(F1,F2)", .expect = .{ .err = .div0 }, .note = "declaration order, first error wins" },
+        .{ .formula = "MEDIAN(F2,F1)", .expect = .{ .err = .na } },
+        .{ .formula = "MEDIAN(F1:F2)", .expect = .{ .err = .div0 }, .note = "inside a range the collector reads §5.6a's order" },
+        .{ .formula = "MODE.SNGL(F1,F2)", .expect = .{ .err = .div0 } },
+        .{ .formula = "MODE.SNGL(F2,F1)", .expect = .{ .err = .na } },
+        .{ .formula = "STDEV.P(F1,F2)", .expect = .{ .err = .div0 } },
+        .{ .formula = "STDEV.P(F2,F1)", .expect = .{ .err = .na } },
+        .{ .formula = "STDEV.S(F1,F2)", .expect = .{ .err = .div0 } },
+        .{ .formula = "STDEV.S(F2,F1)", .expect = .{ .err = .na } },
+        .{ .formula = "VAR.P(F1,F2)", .expect = .{ .err = .div0 } },
+        .{ .formula = "VAR.P(F2,F1)", .expect = .{ .err = .na } },
+        .{ .formula = "VAR.S(F1,F2)", .expect = .{ .err = .div0 } },
+        .{ .formula = "VAR.S(F2,F1)", .expect = .{ .err = .na } },
+        .{ .formula = "PERCENTILE.INC(F1,F2)", .expect = .{ .err = .div0 } },
+        .{ .formula = "PERCENTILE.INC(F2,F1)", .expect = .{ .err = .na } },
+        .{ .formula = "QUARTILE.INC(F1,F2)", .expect = .{ .err = .div0 } },
+        .{ .formula = "QUARTILE.INC(F2,F1)", .expect = .{ .err = .na } },
+        .{ .formula = "LARGE(F1,F2)", .expect = .{ .err = .div0 } },
+        .{ .formula = "LARGE(F2,F1)", .expect = .{ .err = .na } },
+        .{ .formula = "LARGE(F1:F2,1)", .expect = .{ .err = .div0 }, .note = "an error inside the collection is the fold's error — the anti-criteria pin" },
+        .{ .formula = "SMALL(F1,F2)", .expect = .{ .err = .div0 } },
+        .{ .formula = "SMALL(F2,F1)", .expect = .{ .err = .na } },
+        .{ .formula = "RANK.EQ(F1,F2)", .expect = .{ .err = .div0 } },
+        .{ .formula = "RANK.EQ(F2,F1)", .expect = .{ .err = .na } },
+        .{ .formula = "RANK.EQ(F2,A1:A8,F1)", .expect = .{ .err = .na }, .note = "declaration order across the collection slot: the first SCALAR error wins" },
+        .{ .formula = "RANK.EQ(4,F1:F1)", .expect = .{ .err = .div0 }, .note = "…and an error inside it is found by the collector" },
+    };
+
+    for (cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putF2sCells(&h);
+
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("error-order case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectValue(c.expect, v) catch |e| {
+            std.debug.print("error-order case `{s}`: wrong value ({s})\n", .{ c.formula, c.note });
+            return e;
+        };
+    }
+
+    // Every name in the batch appears above, derived from the
+    // inventory rather than typed out, at least twice: one order is
+    // not an order.
+    var it = registry.inventory();
+    var covered_names: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M7b3")) continue;
+        var seen: usize = 0;
+        for (cases) |c| {
+            if (std.mem.startsWith(u8, c.formula, e.name) and c.formula[e.name.len] == '(') seen += 1;
+        }
+        if (seen < 2) {
+            std.debug.print("batch name with {d} error-order fixtures: {s}\n", .{ seen, e.name });
+            return error.MissingErrorOrderFixture;
+        }
+        covered_names += 1;
+    }
+    try testing.expectEqual(@as(usize, 11), covered_names);
+}
+
+test "M7b3: every stats name against every argument shape, exhaustively and in both modes" {
+    // M4e's enumeration, pointed at the eleven new names: every shape
+    // in the alphabet at one and two arguments, each padded to the
+    // name's own minimum arity (`PERCENTILE.INC` runs at two, not the
+    // one it would reject), both rule tables, every input evaluated
+    // twice.
+    const f2s_names = [_][]const u8{
+        "MEDIAN", "MODE.SNGL",    "STDEV.P",        "STDEV.S",
+        "VAR.P",  "VAR.S",        "RANK.EQ",        "LARGE",
+        "SMALL",  "QUARTILE.INC", "PERCENTILE.INC",
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var fake = env.Fake.init(testing.allocator);
+    defer fake.deinit();
+    const sheet = try fuzzF1bEnv(&fake);
+
+    var checked: usize = 0;
+    for (f2s_names) |name| {
+        for (f1b_arg_shapes) |first_arg| {
+            var buf: [256]u8 = undefined;
+            if (buildF1bCall(&buf, name, &.{first_arg})) |one| {
+                try sweepShape(&arena_state, &fake, sheet, one, &checked);
+            }
+            for (f1b_arg_shapes) |second_arg| {
+                var pair_buf: [256]u8 = undefined;
+                const two = buildF1bCall(&pair_buf, name, &.{ first_arg, second_arg }) orelse continue;
+                try sweepShape(&arena_state, &fake, sheet, two, &checked);
+            }
+            _ = arena_state.reset(.retain_capacity);
+        }
+    }
+    // A sweep that silently stopped enumerating would still pass, so
+    // the count is asserted as a floor rather than left to the loops —
+    // eleven names to M7b2's six, and the floor scales with them.
+    try testing.expect(checked > 9_000);
+}
+
 // ─── boundaries and refusals ─────────────────────────────────────
 
 fn emptyMatrixImpl(ctx: registry.CallCtx, args: []const Value) registry.FnError!Value {
@@ -7192,10 +7512,10 @@ test "refusals: an unregistered call refuses, an unresolvable name is #NAME?" {
 
     // §7: unregistered calls refuse rather than inventing `#NAME?` for a
     // function zlsx simply does not implement.
-    // `MEDIAN` is frozen in the inventory for M7b3 and unregistered
+    // `TEXT` is frozen in the inventory for M8a and unregistered
     // today; `VLOOKUP` stood here until M4e registered it, `SUMIFS`
-    // until M7b2.
-    try testing.expectError(error.UnsupportedFunction, h.eval("MEDIAN(A1:B2)"));
+    // until M7b2, `MEDIAN` until M7b3.
+    try testing.expectError(error.UnsupportedFunction, h.eval("TEXT(A1,\"0\")"));
     try testing.expectError(error.UnsupportedFunction, h.eval("NOTAFUNCTION()"));
     // §5.9: a value-position name that provably resolves nowhere is a
     // plane-1 `#NAME?`, which is a successful result.
