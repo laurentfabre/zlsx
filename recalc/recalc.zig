@@ -92,6 +92,9 @@ comptime {
 pub const RunInputs = pkg.RunInputs;
 pub const Options = pkg.RecalcOptions;
 pub const Report = pkg.RecalcReport;
+/// §5.8c (M7c): the authoring dialect, **Zig-only** — the versioned C
+/// export and the Python binding land at M9a2.
+pub const FormulaWrite = pkg.FormulaWrite;
 
 // ─── the composition (§5.10) ─────────────────────────────────────
 

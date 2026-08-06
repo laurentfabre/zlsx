@@ -56,6 +56,13 @@
 //! OWNED tail (`Role.spill_tail`) may become a created `<c>`, and only
 //! under its anchor's proven row.
 //!
+//! M7c adds §5.8c's one authoring mutation: a whole `<f>…</f>` inserted
+//! into an existing `<c>` that has none (`f_insert`; the self-closing
+//! shape rides `reopen_self_closing`'s replacement). `.scalar`
+//! authoring is live end-to-end on it; `.dynamic_array` and `.cse`
+//! authoring consult the same `spill_transitions` discipline and refuse
+//! `transition_unproven` until their byte-diffed Excel references land.
+//!
 //! The transition table is normative and shared
 //! --------------------------------------------
 //! `transitionFor` is §5.7.3's table as one function, and the blank→0
@@ -137,6 +144,31 @@ pub const Refusal = struct {
         /// approved mutation set (§5.8b names only the OWNED tail).
         cell_insertion_unsupported,
 
+        // ── authoring (§5.8c, M7c) ──
+        /// A `FormulaWrite` targets a cell that already carries an
+        /// `<f>`. Replacing a formula's body would address bytes inside
+        /// `spans.f`, and `f@ref` is THE one exception to that
+        /// invariant (M7b1 decision 5) — authoring writes formulas
+        /// where none exist, and a rewrite waits for its own approved
+        /// mutation.
+        formula_overwrite_unsupported,
+        /// A `FormulaWrite` targets a cell carrying `c@cm`. The record
+        /// describes the formula the cell used to hold; a fresh `<f>`
+        /// under it would leave metadata narrating a formula that is
+        /// no longer there.
+        authored_under_cell_metadata,
+        /// The authored text cannot become a legal `<f>` body: empty,
+        /// or carrying a character the FORMULA carrier cannot encode
+        /// (`decode.encodeAuthoredFormula` — there is no second escape
+        /// layer to put it in).
+        authored_text_unencodable,
+        /// The staged role and the authoring dialect contradict each
+        /// other — a `.scalar`/`.cse` write carrying a placement role,
+        /// or an authored publication staged as someone else's tail.
+        /// Like `duplicate_publication`: two stories about one cell,
+        /// neither chosen silently.
+        authored_role_contradiction,
+
         // ── tail geometry the approved set cannot address ──
         /// An owned tail lands in a row the part has no `<row>` element
         /// for (or has two of). Creating a `<row>` is a mutation §5.8b
@@ -204,6 +236,8 @@ pub const Refusal = struct {
             .value_metadata_write,
             .cse_range_mismatch,
             .cell_insertion_unsupported,
+            .formula_overwrite_unsupported,
+            .authored_under_cell_metadata,
             .tail_row_missing,
             .tail_row_self_closing,
             .tail_row_spans_stale,
@@ -218,6 +252,8 @@ pub const Refusal = struct {
             .duplicate_publication,
             .ambiguous_cell_content,
             .unwritable_error_spelling,
+            .authored_text_unencodable,
+            .authored_role_contradiction,
             => .FormulaMalformedInput,
 
             .non_finite_number => .FormulaResultNotRepresentable,
@@ -245,6 +281,41 @@ pub const Origin = enum {
     set_cell,
 };
 
+/// §5.8c's authoring dialect (M7c, **Zig-only** — the versioned C
+/// export and Python land at M9a2).
+///
+/// `text` is the formula body exactly as the parser reads it: no
+/// leading `=`, FORMULA carrier (XML escaping only, no ST_Xstring
+/// stage — `decode.encodeAuthoredFormula` is the one encoder). The
+/// caller evaluated it before staging — the publication it rides
+/// carries the result — so a text the parser would refuse never gets
+/// this far on the shipped paths; what THIS layer still verifies is
+/// what only bytes can get wrong (encodability, the target's shape,
+/// the dialect's transition row).
+pub const FormulaWrite = struct {
+    text: []const u8,
+    dialect: Dialect = .scalar,
+
+    pub const Dialect = union(enum) {
+        /// An ordinary cell formula. Live end-to-end at M7c: the
+        /// authored `<f>` plus the cached value ride the proven
+        /// mutation set, and the round-trip fixture is the proof.
+        scalar,
+        /// A dynamic-array anchor. Refuses `transition_unproven` at
+        /// M7c: the authored `cm` and its XLDAPR record are part-graph
+        /// mutations whose spec ARRIVES with the byte-diffed Excel
+        /// references (§5.8b), so the rows park in
+        /// `missingReferences()` until then.
+        dynamic_array,
+        /// A legacy CSE anchor over this declared range (A1 notation).
+        /// No metadata byte participates — the anchor's fresh
+        /// `<f t="array" ref>` is the ONE unproven mutation, and its
+        /// row refuses until an Excel-authored reference pins what
+        /// Office writes around one.
+        cse: []const u8,
+    };
+};
+
 /// One staged result, at the coordinate it belongs to.
 ///
 /// `result` is a `PublishedScalar` and not a `ScalarValue`, so the
@@ -269,6 +340,10 @@ pub const Publication = struct {
     /// the model placed). `.plain` is every scalar result and setCell;
     /// the staging layer fills the other arms from `spill.Registry`.
     role: Role = .plain,
+    /// §5.8c (M7c): the formula this publication also WRITES. Null for
+    /// every publication that only caches a value — which is every one
+    /// M7b1 knew about, so the field's default is the old behavior.
+    authored: ?FormulaWrite = null,
 };
 
 /// A publication's placement role (§5.8b).
@@ -614,18 +689,53 @@ pub const SpillTransition = struct {
         /// something this reader has never been shown.
         value_metadata_present,
 
+        // ── authoring (§5.8c, M7c) — appended through the table's own
+        //    seam; the M7b1 rows above are untouched ──
+        /// A fresh `.dynamic_array` anchor the model placed spilled.
+        /// The `cm` attribute, the XLDAPR record and every part-graph
+        /// byte around them (the metadata part, its content type, its
+        /// rel) are exactly what the reference pins — the builder
+        /// LANDS with the reference set, so this row refuses even on
+        /// an injected table (M7c decisions).
+        da_author_spill,
+        /// A fresh `.dynamic_array` anchor the model placed blocked:
+        /// the authored `#SPILL!` shape. Same part-graph gate, same
+        /// arrival.
+        da_author_blocked,
+        /// A fresh `.cse(ref)` anchor. No metadata byte participates —
+        /// the one unproven mutation is the anchor's fresh
+        /// `<f t="array" ref>`, whose sheet-part bytes ECMA-376 names,
+        /// so the builder is provable through an injected table today
+        /// and the reference re-pins empirically what Office writes
+        /// AROUND one (calcChain, `aca`) when it lands.
+        cse_author,
+
         pub fn name(self: Id) []const u8 {
             return @tagName(self);
         }
     };
 
-    pub const Collection = enum { cell_metadata, value_metadata };
+    pub const Collection = enum {
+        cell_metadata,
+        value_metadata,
+        /// No metadata collection participates (M7c: `cse_author`) —
+        /// the row gates a fresh `<f t="array">` element, not a
+        /// metadata transition, and an arm that pretended otherwise
+        /// would name bytes the mutation never touches.
+        none,
+    };
     pub const IndexRule = enum {
         /// The cell's existing `c@cm`, one-based, preserved
         /// byte-identically — the patcher never addresses it.
         existing_cm,
         /// The cell's existing `c@vm`, one-based.
         existing_vm,
+        /// The run must mint or attach the record — which index, which
+        /// record, and every byte it takes is exactly what the row's
+        /// reference pins (M7c: the `da_author_*` rows).
+        authored_cm,
+        /// No index participates (M7c: `cse_author`).
+        none,
     };
     pub const MissingRecord = enum {
         /// A dangling index refuses. Upstream the resolver already
@@ -644,6 +754,11 @@ pub const spill_transitions = [_]SpillTransition{
     .{ .id = .da_blocked_to_spill, .collection = .cell_metadata, .record_type = "XLDAPR", .index = .existing_cm, .missing_record = .refuse, .reference = null },
     .{ .id = .da_blocked_rewrite, .collection = .cell_metadata, .record_type = "XLDAPR", .index = .existing_cm, .missing_record = .refuse, .reference = null },
     .{ .id = .value_metadata_present, .collection = .value_metadata, .record_type = "*", .index = .existing_vm, .missing_record = .refuse, .reference = null, .permanent = true },
+    // §5.8c authoring (M7c), appended — extension happens at the end so
+    // the M7b1 rows keep their positions and their park-list order.
+    .{ .id = .da_author_spill, .collection = .cell_metadata, .record_type = "XLDAPR", .index = .authored_cm, .missing_record = .refuse, .reference = null },
+    .{ .id = .da_author_blocked, .collection = .cell_metadata, .record_type = "XLDAPR", .index = .authored_cm, .missing_record = .refuse, .reference = null },
+    .{ .id = .cse_author, .collection = .none, .record_type = "", .index = .none, .missing_record = .refuse, .reference = null },
 };
 
 fn rowById(table: []const SpillTransition, id: SpillTransition.Id) ?*const SpillTransition {
@@ -711,6 +826,15 @@ pub const EditKind = enum {
     /// The `<dimension ref>` value widened when created tails extend
     /// the used range. Bottom-right only, monotonic, top-left kept.
     dimension_ref_replace,
+
+    // ── §5.8c's authoring addition (M7c) ──
+    /// A whole `<f>…</f>` inserted into an existing `<c>` that has
+    /// none, at the first-child position `CT_Cell` dictates (`f`
+    /// precedes `v`/`is`). The self-closing shape carries its `<f>`
+    /// inside `reopen_self_closing`'s replacement instead — one
+    /// reopened tag, not an insertion into bytes that do not exist
+    /// yet.
+    f_insert,
 };
 
 pub const Edit = struct {
@@ -805,6 +929,12 @@ pub fn patchWithTable(
     for (self.appends) |p| {
         switch (p.role) {
             .spill_tail => |owner| {
+                // §5.8c: a tail is its anchor's — an authored formula
+                // riding one is two stories about whose bytes these
+                // are.
+                if (p.authored != null) {
+                    return .{ .refused = refuseAt(.authored_role_contradiction, p.row, p.col) };
+                }
                 if (tailGateFor(self, owner, table)) |g| {
                     return .{ .refused = refuseGate(g, p.row, p.col) };
                 }
@@ -874,6 +1004,14 @@ fn gateOf(self: *const ResolvedSheet, t: Target, table: []const SpillTransition)
         return .{ .reason = .value_metadata_write, .transition = .value_metadata_present };
     }
 
+    // §5.8c (M7c): an authored publication answers to the authoring
+    // gate and to nothing after it — every shape the arms below judge
+    // is about a formula the part already HAS, and an authored target
+    // was just proven not to have one.
+    if (t.publication.authored != null) {
+        return authorGate(self, t, table);
+    }
+
     if (t.formula) |f| {
         if (calc.Kind.fromAttr(f.kind) == calc.Kind.array) {
             return switch (t.publication.dialect) {
@@ -909,18 +1047,122 @@ fn cseGate(self: *const ResolvedSheet, t: Target, f: decode.Formula) ?GateRefusa
         return .{ .reason = .cse_range_mismatch };
     }
 
+    if (!declaredRangeCovered(self, range, t.publication.row, t.publication.col)) {
+        return .{ .reason = .cse_range_mismatch };
+    }
+    return null;
+}
+
+/// Every declared cell except the anchor staged this run — target or
+/// append. One derivation for the M5b1-era CSE gate and §5.8c's CSE
+/// authoring gate, so the two cannot disagree about what "covered"
+/// means.
+fn declaredRangeCovered(
+    self: *const ResolvedSheet,
+    range: coords.Range,
+    anchor_row: coords.Row,
+    anchor_col: coords.Col,
+) bool {
     var r = range.first.row.oneBased();
     while (r <= range.last.row.oneBased()) : (r += 1) {
         var c = range.first.col.zeroBased();
         while (c <= range.last.col.zeroBased()) : (c += 1) {
-            if (r == t.publication.row.oneBased() and
-                c == t.publication.col.zeroBased()) continue;
+            if (r == anchor_row.oneBased() and c == anchor_col.zeroBased()) continue;
             const row = coords.Row.fromOneBased(r) catch unreachable;
             const col = coords.Col.fromZeroBased(c) catch unreachable;
             if (self.targetAt(row, col) != null) continue;
             if (appendAt(self, row, col) != null) continue;
-            return .{ .reason = .cse_range_mismatch };
+            return false;
         }
+    }
+    return true;
+}
+
+/// §5.8c's authoring gate (M7c). The order is the order of what can
+/// never be unlocked: the shapes no approved mutation addresses first,
+/// then the text's own encodability, then the dialect's transition row.
+fn authorGate(self: *const ResolvedSheet, t: Target, table: []const SpillTransition) ?GateRefusal {
+    const w = t.publication.authored.?;
+
+    // The modeled formula and the raw spans agree by scan construction;
+    // the spans are what the EDITS answer to, and a formula-shaped run
+    // of bytes the model did not carry is still one no insertion may
+    // sit beside.
+    if (t.spans.f != null or t.formula != null) {
+        return .{ .reason = .formula_overwrite_unsupported };
+    }
+    if (t.cm != 0) return .{ .reason = .authored_under_cell_metadata };
+    if (authoredTextRefusal(w.text)) |g| return g;
+
+    switch (w.dialect) {
+        .scalar => {
+            if (t.publication.role != .plain) {
+                return .{ .reason = .authored_role_contradiction };
+            }
+            if (!t.publication.shape.isScalar()) {
+                return .{ .reason = .non_scalar_result };
+            }
+            return null;
+        },
+        .dynamic_array => {
+            const outcome = switch (t.publication.role) {
+                .da_anchor => |o| o,
+                // M7b1 decision 7's statement, at authoring: the
+                // patcher will not reconstruct a placement the model
+                // already made.
+                else => return .{ .reason = .dynamic_array_anchor },
+            };
+            const id: SpillTransition.Id = switch (outcome) {
+                .spilled => .da_author_spill,
+                .blocked => .da_author_blocked,
+            };
+            // Unconditional — reference or not (M7c decisions). The
+            // authored `cm`, its XLDAPR record and the metadata part
+            // around them are part-graph mutations whose BUILDER lands
+            // with the reference set, so a reference alone cannot flip
+            // these rows the way it flips M7b1's; the rows still sit
+            // in the table because `missingReferences()` is the one
+            // park list and these are parked on exactly that unblock.
+            return .{ .reason = .transition_unproven, .transition = id };
+        },
+        .cse => |raw| {
+            if (t.publication.role != .plain) {
+                return .{ .reason = .authored_role_contradiction };
+            }
+            const range = (coords.parseRange(raw, .{
+                .dollar = .accept,
+                .case = .insensitive,
+            }) catch return .{ .reason = .cse_ref_unparseable }).normalized();
+            // The anchor is the declared top-left, and every declared
+            // cell is staged this run — M7b1 decision 3's coverage
+            // gate, applied before the range exists rather than after.
+            if (range.first.row.oneBased() != t.publication.row.oneBased() or
+                range.first.col.zeroBased() != t.publication.col.zeroBased())
+            {
+                return .{ .reason = .cse_range_mismatch };
+            }
+            if (!declaredRangeCovered(self, range, t.publication.row, t.publication.col)) {
+                return .{ .reason = .cse_range_mismatch };
+            }
+            const row = rowById(table, .cse_author) orelse
+                return .{ .reason = .transition_unproven, .transition = .cse_author };
+            if (row.reference == null) {
+                return .{ .reason = .transition_unproven, .transition = .cse_author };
+            }
+            return null;
+        },
+    }
+}
+
+/// What only bytes can get wrong about authored text: the FORMULA
+/// carrier's own predicate (`decode.encodeAuthoredFormula`'s), applied
+/// in pass one so the refusal precedes any output byte, and
+/// allocation-free so the gate stays pure.
+fn authoredTextRefusal(text: []const u8) ?GateRefusal {
+    if (text.len == 0) return .{ .reason = .authored_text_unencodable };
+    for (text) |c| {
+        if (c == '\t' or c == '\n' or c == '\r') continue;
+        if (c < 0x20) return .{ .reason = .authored_text_unencodable };
     }
     return null;
 }
@@ -1215,6 +1457,35 @@ fn spellRange(a: Allocator, range: coords.Range) error{OutOfMemory}![]const u8 {
     return std.fmt.allocPrint(a, "{s}:{s}", .{ first, last });
 }
 
+/// The authored `<f>` element (§5.8c, M7c). The text was proven
+/// encodable in pass one (`authoredTextRefusal`, the same predicate the
+/// encoder applies), and a `.cse` ref was proven parseable at the gate,
+/// so neither refusal arm is reachable here. The declared range is
+/// re-spelled canonically — normalized, upper-case, `$`-free — rather
+/// than echoed in caller bytes, for the same reason `planAnchorExtras`
+/// spells the extent itself: the file records what the engine decided,
+/// not how the caller typed it.
+fn authoredFElement(a: Allocator, w: FormulaWrite) error{OutOfMemory}![]const u8 {
+    const body = decode.encodeAuthoredFormula(a, w.text) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnencodableChar => unreachable,
+    };
+    return switch (w.dialect) {
+        .scalar => std.fmt.allocPrint(a, "<f>{s}</f>", .{body}),
+        .cse => |raw| blk: {
+            const range = (coords.parseRange(raw, .{
+                .dollar = .accept,
+                .case = .insensitive,
+            }) catch unreachable).normalized();
+            const spelled = try spellRange(a, range);
+            break :blk std.fmt.allocPrint(a, "<f t=\"array\" ref=\"{s}\">{s}</f>", .{ spelled, body });
+        },
+        // The gate refuses every `.dynamic_array` authoring at M7c —
+        // the builder lands with the reference set.
+        .dynamic_array => unreachable,
+    };
+}
+
 fn appendEdits(
     a: Allocator,
     source: []const u8,
@@ -1227,6 +1498,28 @@ fn appendEdits(
         .row = t.publication.row.oneBased(),
         .col = t.publication.col.zeroBased(),
     };
+
+    // §5.8c (M7c): the authored `<f>`, emitted BEFORE the value edits.
+    // The list order is load-bearing at exactly one point: a cell with
+    // no `<v>`/`<is>` takes both `f_insert` and `v_insert` at
+    // `open_end`, `(start, end)` cannot order the tie, and the stable
+    // sort (M7b1 decision 14) keeps `<f>` first — `CT_Cell`'s order.
+    // The self-closing shape instead carries its `<f>` inside the
+    // reopen replacement below.
+    const authored_f: ?[]const u8 = if (t.publication.authored) |w|
+        try authoredFElement(a, w)
+    else
+        null;
+    if (authored_f) |f_elem| {
+        if (!spans.selfClosing()) {
+            try out.append(a, .{
+                .at = .{ .start = spans.open_end, .end = spans.open_end },
+                .replacement = f_elem,
+                .kind = .f_insert,
+                .cell = site,
+            });
+        }
+    }
 
     // ── the `t` attribute ──
     if (spans.type_attr) |ts| {
@@ -1303,11 +1596,17 @@ fn appendEdits(
 
     if (spans.selfClosing()) {
         // The last two bytes of a self-closing start tag are `/` and
-        // `>`, whatever whitespace precedes them.
+        // `>`, whatever whitespace precedes them. An authored formula
+        // rides the reopen (§5.8c): the cell's whole content comes
+        // into being in one edit, in `CT_Cell`'s order.
         assert(spans.cell.end >= spans.cell.start + 2);
+        const replacement = if (authored_f) |f_elem|
+            try std.fmt.allocPrint(a, ">{s}<v>{s}</v></c>", .{ f_elem, tr.v })
+        else
+            try std.fmt.allocPrint(a, "><v>{s}</v></c>", .{tr.v});
         try out.append(a, .{
             .at = .{ .start = spans.cell.end - 2, .end = spans.cell.end },
-            .replacement = try std.fmt.allocPrint(a, "><v>{s}</v></c>", .{tr.v}),
+            .replacement = replacement,
             .kind = .reopen_self_closing,
             .cell = site,
         });
@@ -1420,6 +1719,14 @@ pub fn approvedRange(source: []const u8, spans: decode.CellSpans, kind: EditKind
         // range at all.
         .f_ref_replace => spans.f_ref,
         .cell_remove => if (spans.f == null) spans.cell else null,
+        // §5.8c (M7c): only a cell with no `<f>` can receive one, and
+        // only at the point right after its start tag — the reopened
+        // self-closing shape carries its formula inside the reopen
+        // edit, so the kind has no range there.
+        .f_insert => blk: {
+            if (spans.f != null or spans.selfClosing()) break :blk null;
+            break :blk .{ .start = spans.open_end, .end = spans.open_end };
+        },
         // Not answerable from one cell's spans: the insert point is the
         // ROW's geometry and the dimension is the SHEET's —
         // `verifyConfinement` answers both from `Geometry`.
@@ -2542,28 +2849,58 @@ test "§5.8b: the production table refuses every row, and each refusal names its
 }
 
 test "§5.8b: the table enumerates its refusing rows, and the park list is exact" {
+    // The park list is DERIVED here, not restated: the expectation is
+    // the table's own non-permanent reference-null rows in table
+    // order, so a row added through the seam joins the list by
+    // construction and a test that hard-coded four ids would have
+    // gone stale at M7c.
     var buf: [spill_transitions.len]SpillTransition.Id = undefined;
     const missing = missingReferences(&spill_transitions, &buf);
-    try testing.expectEqual(@as(usize, 4), missing.len);
-    try testing.expectEqual(SpillTransition.Id.da_spill_rewrite, missing[0]);
-    try testing.expectEqual(SpillTransition.Id.da_spill_to_blocked, missing[1]);
-    try testing.expectEqual(SpillTransition.Id.da_blocked_to_spill, missing[2]);
-    try testing.expectEqual(SpillTransition.Id.da_blocked_rewrite, missing[3]);
-
-    // Every DA row is the same §5.8b statement: cellMetadata, XLDAPR,
-    // the cell's own one-based `cm`, dangling refuses. The vm row is
-    // permanent and never in the park list.
+    var expected: usize = 0;
     for (spill_transitions) |row| {
-        if (row.permanent) {
-            try testing.expectEqual(SpillTransition.Collection.value_metadata, row.collection);
-            try testing.expectEqual(SpillTransition.Id.value_metadata_present, row.id);
-            continue;
+        if (row.permanent or row.reference != null) continue;
+        try testing.expect(expected < missing.len);
+        try testing.expectEqual(row.id, missing[expected]);
+        expected += 1;
+    }
+    try testing.expectEqual(expected, missing.len);
+    // M7b1's four rows plus M7c's three authoring rows — the one place
+    // the COUNT is pinned, so a silently vanished row cannot hide
+    // behind the derivation.
+    try testing.expectEqual(@as(usize, 7), missing.len);
+    try testing.expectEqual(SpillTransition.Id.da_spill_rewrite, missing[0]);
+    try testing.expectEqual(SpillTransition.Id.cse_author, missing[6]);
+
+    // Every row is one §5.8b/§5.8c statement, and the classification
+    // is per-id: a DA persistence row is cellMetadata/XLDAPR over the
+    // cell's own `cm`; an authoring row minted at the reference set;
+    // the CSE authoring row touches no collection at all; the vm row
+    // is permanent and never in the park list.
+    for (spill_transitions) |row| {
+        switch (row.id) {
+            .da_spill_rewrite, .da_spill_to_blocked, .da_blocked_to_spill, .da_blocked_rewrite => {
+                try testing.expect(row.reference == null);
+                try testing.expectEqual(SpillTransition.Collection.cell_metadata, row.collection);
+                try testing.expectEqualStrings("XLDAPR", row.record_type);
+                try testing.expectEqual(SpillTransition.IndexRule.existing_cm, row.index);
+                try testing.expectEqual(SpillTransition.MissingRecord.refuse, row.missing_record);
+            },
+            .value_metadata_present => {
+                try testing.expect(row.permanent);
+                try testing.expectEqual(SpillTransition.Collection.value_metadata, row.collection);
+            },
+            .da_author_spill, .da_author_blocked => {
+                try testing.expect(row.reference == null);
+                try testing.expectEqual(SpillTransition.Collection.cell_metadata, row.collection);
+                try testing.expectEqualStrings("XLDAPR", row.record_type);
+                try testing.expectEqual(SpillTransition.IndexRule.authored_cm, row.index);
+            },
+            .cse_author => {
+                try testing.expect(row.reference == null);
+                try testing.expectEqual(SpillTransition.Collection.none, row.collection);
+                try testing.expectEqual(SpillTransition.IndexRule.none, row.index);
+            },
         }
-        try testing.expect(row.reference == null);
-        try testing.expectEqual(SpillTransition.Collection.cell_metadata, row.collection);
-        try testing.expectEqualStrings("XLDAPR", row.record_type);
-        try testing.expectEqual(SpillTransition.IndexRule.existing_cm, row.index);
-        try testing.expectEqual(SpillTransition.MissingRecord.refuse, row.missing_record);
     }
 }
 
@@ -3459,6 +3796,475 @@ test "allocation failure: a patch that cannot allocate refuses cleanly" {
             defer p.deinit();
         }
     }.run, .{xml});
+}
+
+// ─── §5.8c: authoring (M7c) ──────────────────────────────────────
+
+const eval = @import("eval.zig");
+const env_mod = @import("env.zig");
+const casefold = @import("zlsx_casefold");
+
+fn testFold(allocator: std.mem.Allocator, s: []const u8) anyerror![]u8 {
+    return casefold.foldString(allocator, s);
+}
+
+fn authoredPub(comptime ref: []const u8, result: value.PublishedScalar, w: FormulaWrite) Publication {
+    const c = cellRef(ref);
+    return .{ .row = c.row, .col = c.col, .result = result, .authored = w };
+}
+
+/// DONE-WHEN 2's loop, at the layer that owns each leg: the patched
+/// part IS the bytes a save writes (the transaction above stages them
+/// verbatim), the re-open is a fresh `scanSheet` over them, and the
+/// evaluation is the real parser and evaluator over the re-opened
+/// stored values — so "agrees" is a statement about the file, not
+/// about the fixture's memory of what it staged.
+fn evaluateReopened(
+    gpa: Allocator,
+    part: []const u8,
+    comptime authored_at: []const u8,
+    formula_text: []const u8,
+) !value.ScalarValue {
+    var rescan = switch (try decode.scanSheet(gpa, part, &.{}, .{})) {
+        .ok => |s| s,
+        .refused => return error.TestUnexpectedRefusal,
+    };
+    defer rescan.deinit();
+
+    const at = cellRef(authored_at);
+    var authored_formula: ?decode.Formula = null;
+    var fake = env_mod.Fake.init(gpa);
+    defer fake.deinit();
+    const sheet = try fake.addSheet("Sheet1");
+    for (rescan.cells) |c| {
+        if (c.row == at.row and c.col == at.col) {
+            authored_formula = c.formula;
+            continue;
+        }
+        const sv = c.input.scalar();
+        if (sv == .blank) continue;
+        try fake.put(sheet, .stored, .{ .row = c.row, .col = c.col, .v = sv });
+    }
+    const f = authored_formula orelse return error.TestExpectedFormula;
+    try testing.expectEqualStrings(formula_text, f.text);
+
+    var parsed = try parser.parse(gpa, f.text, .{});
+    if (parsed == .refused) {
+        parsed.deinit(gpa);
+        return error.TestParseRefused;
+    }
+    var ast = parsed.ok;
+    defer ast.deinit(gpa);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var draw_slot: f64 = 0;
+    var draws = eval.DrawSource.constant(&draw_slot);
+    var ev = eval.Evaluator.init(arena.allocator(), fake.evalEnv(), .{
+        .current_sheet = sheet,
+        .collation = .{ .fold = &testFold },
+        .draws = &draws,
+    });
+    defer ev.deinit();
+    const v = try ev.evaluate(ast);
+    try testing.expect(v == .scalar);
+    return v.scalar;
+}
+
+test "§5.8c: scalar authoring end-to-end — write, save, re-open, evaluate agrees" {
+    // The authored cell is self-closing, so the write is the reopen
+    // shape: `<f>` and `<v>` come into being in one edit, in
+    // `CT_Cell`'s order.
+    const xml = sheetXml(
+        \\<row r="1"><c r="A1"><v>1</v></c><c r="B1"/></row><row r="2"><c r="A2"><v>2</v></c></row>
+    );
+    var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+        authoredPub("B1", .{ .number = 3 }, .{ .text = "SUM(A1:A2)" }),
+    });
+    defer f.deinit();
+
+    const out = try patchOk(testing.allocator, &f);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(sheetXml(
+        \\<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f>SUM(A1:A2)</f><v>3</v></c></row><row r="2"><c r="A2"><v>2</v></c></row>
+    ), out);
+
+    const evaluated = try evaluateReopened(testing.allocator, out, "B1", "SUM(A1:A2)");
+    try testing.expectEqual(@as(f64, 3), evaluated.number);
+
+    // And the re-opened cache says what the evaluation says — the two
+    // ends of "agrees".
+    var rescan = switch (try decode.scanSheet(testing.allocator, out, &.{}, .{})) {
+        .ok => |s| s,
+        .refused => return error.TestUnexpectedRefusal,
+    };
+    defer rescan.deinit();
+    const b1 = cellRef("B1");
+    const cached = cellAt(rescan.cells, b1.row, b1.col) orelse return error.TestExpectedCell;
+    try testing.expectEqual(@as(f64, 3), cached.input.number);
+}
+
+test "§5.8c: authoring onto a cached cell rides the proven kinds, carriers split" {
+    // A `t`-typed text result through an existing `<v>`: the `<f>`
+    // body takes the FORMULA carrier (entities only — `<` survives as
+    // `&lt;`, no ST_Xstring stage) while the cached `<v>` takes the
+    // STRING carrier, and the re-open reads both back to the bytes the
+    // caller authored.
+    const xml = sheetXml(
+        \\<row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>0</v></c></row>
+    );
+    const text = "IF(A1<3,\"y&z\",\"n\")";
+    var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+        authoredPub("B1", .{ .text = "y&z" }, .{ .text = text }),
+    });
+    defer f.deinit();
+
+    const out = try patchOk(testing.allocator, &f);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(sheetXml(
+        \\<row r="1"><c r="A1"><v>1</v></c><c r="B1" t="str"><f>IF(A1&lt;3,&quot;y&amp;z&quot;,&quot;n&quot;)</f><v>y&amp;z</v></c></row>
+    ), out);
+
+    const evaluated = try evaluateReopened(testing.allocator, out, "B1", text);
+    try testing.expectEqualStrings("y&z", evaluated.text);
+}
+
+test "§5.8c: authoring next to an empty <v/> and an <is> keeps CT_Cell's order" {
+    // The two remaining cached-value shapes an authored `<f>` can meet:
+    // a self-closing `<v/>` (element-replaced — legal input only under
+    // `t="str"`, where it caches the empty string) and an inline
+    // string (superseded by `<v>`). In both, the `f_insert` lands at
+    // the first-child point and the value edit stays its own kind.
+    const xml = sheetXml(
+        \\<row r="1"><c r="A1" t="str"><v/></c><c r="B1"><is><t>old</t></is></c></row>
+    );
+    var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+        authoredPub("A1", .{ .number = 7 }, .{ .text = "3+4" }),
+        authoredPub("B1", .{ .number = 9 }, .{ .text = "4+5" }),
+    });
+    defer f.deinit();
+
+    const out = try patchOk(testing.allocator, &f);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(sheetXml(
+        \\<row r="1"><c r="A1"><f>3+4</f><v>7</v></c><c r="B1"><f>4+5</f><v>9</v></c></row>
+    ), out);
+}
+
+test "§5.8c: the shapes authoring refuses, each by name" {
+    const Case = struct {
+        xml: []const u8,
+        pub_: Publication,
+        want: Refusal.Reason,
+    };
+    const cases = [_]Case{
+        // A cell that already carries an `<f>` — even a bodiless one —
+        // is a rewrite, not an authoring.
+        .{
+            .xml = sheetXml(
+                \\<row r="1"><c r="B1"><f>1+1</f><v>2</v></c></row>
+            ),
+            .pub_ = authoredPub("B1", .{ .number = 3 }, .{ .text = "1+2" }),
+            .want = .formula_overwrite_unsupported,
+        },
+        // `cm` names a record about a formula that is no longer there.
+        .{
+            .xml = sheetXml(
+                \\<row r="1"><c r="B1" cm="1"><v>0</v></c></row>
+            ),
+            .pub_ = authoredPub("B1", .{ .number = 3 }, .{ .text = "1+2" }),
+            .want = .authored_under_cell_metadata,
+        },
+        // `vm` refuses first, exactly as it does for a plain write.
+        .{
+            .xml = sheetXml(
+                \\<row r="1"><c r="B1" vm="1"><v>0</v></c></row>
+            ),
+            .pub_ = authoredPub("B1", .{ .number = 3 }, .{ .text = "1+2" }),
+            .want = .value_metadata_write,
+        },
+        // Text that cannot become a legal `<f>` body: empty, then a
+        // control character the FORMULA carrier has no escape for.
+        .{
+            .xml = sheetXml(
+                \\<row r="1"><c r="B1"><v>0</v></c></row>
+            ),
+            .pub_ = authoredPub("B1", .{ .number = 3 }, .{ .text = "" }),
+            .want = .authored_text_unencodable,
+        },
+        .{
+            .xml = sheetXml(
+                \\<row r="1"><c r="B1"><v>0</v></c></row>
+            ),
+            .pub_ = authoredPub("B1", .{ .number = 3 }, .{ .text = "SUM(\x01)" }),
+            .want = .authored_text_unencodable,
+        },
+        // No `<c>` to land on: authoring does not widen §5.8b's "only
+        // an OWNED tail becomes a created cell".
+        .{
+            .xml = sheetXml(
+                \\<row r="1"><c r="A1"><v>1</v></c></row>
+            ),
+            .pub_ = authoredPub("B1", .{ .number = 3 }, .{ .text = "1+2" }),
+            .want = .cell_insertion_unsupported,
+        },
+        // A `.scalar` write carrying a placement role: two stories
+        // about one cell.
+        .{
+            .xml = sheetXml(
+                \\<row r="1"><c r="B1"><v>0</v></c></row>
+            ),
+            .pub_ = .{
+                .row = cellRef("B1").row,
+                .col = cellRef("B1").col,
+                .result = .{ .number = 3 },
+                .role = .{ .da_anchor = .{ .blocked = .obstruction } },
+                .authored = .{ .text = "1+2" },
+            },
+            .want = .authored_role_contradiction,
+        },
+        // A non-1×1 result under a `.scalar` write.
+        .{
+            .xml = sheetXml(
+                \\<row r="1"><c r="B1"><v>0</v></c></row>
+            ),
+            .pub_ = .{
+                .row = cellRef("B1").row,
+                .col = cellRef("B1").col,
+                .result = .{ .number = 3 },
+                .shape = .{ .rows = 2, .cols = 1 },
+                .authored = .{ .text = "SEQUENCE(2)" },
+            },
+            .want = .non_scalar_result,
+        },
+    };
+    for (cases) |case| {
+        var f = try buildFixture(testing.allocator, case.xml, &.{}, &.{case.pub_});
+        defer f.deinit();
+        try expectRefusal(testing.allocator, &f, case.want);
+    }
+}
+
+test "§5.8c: an authored formula staged as someone's tail refuses as a contradiction" {
+    // No anchor is staged on purpose: an anchor target's own refusal
+    // would precede every append (M7b1 decision 12), and what this
+    // fixture pins is that the contradiction outranks even
+    // `tail_without_anchor` — whose bytes these are is settled before
+    // whether the owner exists.
+    const xml = sheetXml(
+        \\<row r="1"><c r="A1" cm="1"><f t="array" ref="A1">SEQUENCE(2)</f><v>9</v></c></row><row r="2"></row>
+    );
+    var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+        .{
+            .row = cellRef("A2").row,
+            .col = cellRef("A2").col,
+            .result = .{ .number = 2 },
+            .role = .{ .spill_tail = .{ .row = cellRef("A1").row, .col = cellRef("A1").col } },
+            .authored = .{ .text = "1+1" },
+        },
+    });
+    defer f.deinit();
+
+    try expectRefusal(testing.allocator, &f, .authored_role_contradiction);
+}
+
+test "§5.8c: DA authoring refuses its row — and a reference alone cannot flip it" {
+    const cases = [_]struct {
+        outcome: spill.Outcome,
+        want: SpillTransition.Id,
+    }{
+        .{ .outcome = .{ .spilled = .{ .rows = 2, .cols = 1 } }, .want = .da_author_spill },
+        .{ .outcome = .{ .blocked = .obstruction }, .want = .da_author_blocked },
+    };
+    inline for (cases) |case| {
+        const xml = sheetXml(
+            \\<row r="1"><c r="B1"/></row><row r="2"></row>
+        );
+        var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+            .{
+                .row = cellRef("B1").row,
+                .col = cellRef("B1").col,
+                .result = .{ .number = 1 },
+                .dialect = .dynamic_array,
+                .role = .{ .da_anchor = case.outcome },
+                .shape = switch (case.outcome) {
+                    .spilled => |s| s,
+                    .blocked => .{ .rows = 1, .cols = 1 },
+                },
+                .authored = .{ .text = "SEQUENCE(2)", .dialect = .dynamic_array },
+            },
+        });
+        defer f.deinit();
+
+        // The production table parks the row…
+        switch (try patch(&f.resolved, testing.allocator)) {
+            .ok => return error.TestExpectedRefusal,
+            .refused => |r| {
+                try testing.expectEqual(Refusal.Reason.transition_unproven, r.reason);
+                try testing.expectEqual(case.want, r.transition.?);
+                try testing.expectEqual(PlaneTwo.FormulaSpillPersistUnsupported, r.planeTwo());
+            },
+        }
+        // …and an injected reference parks it too (M7c decisions): the
+        // authored `cm` is a part-graph mutation whose builder LANDS
+        // with the reference set, so these rows do not flip the way
+        // M7b1's do.
+        try expectRefusalWith(testing.allocator, &f, &proven_table, .transition_unproven);
+    }
+}
+
+test "§5.8c: a DA write staged without its placement refuses generically" {
+    const xml = sheetXml(
+        \\<row r="1"><c r="B1"/></row>
+    );
+    var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+        .{
+            .row = cellRef("B1").row,
+            .col = cellRef("B1").col,
+            .result = .{ .number = 1 },
+            .dialect = .dynamic_array,
+            .authored = .{ .text = "SEQUENCE(2)", .dialect = .dynamic_array },
+        },
+    });
+    defer f.deinit();
+
+    try expectRefusal(testing.allocator, &f, .dynamic_array_anchor);
+}
+
+test "§5.8c: CSE authoring refuses its row on the shipped table" {
+    const xml = sheetXml(
+        \\<row r="1"><c r="B1"/></row><row r="2"><c r="B2"><v>0</v></c></row>
+    );
+    var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+        authoredPub("B1", .{ .number = 1 }, .{ .text = "SEQUENCE(2)", .dialect = .{ .cse = "B1:B2" } }),
+        pubAt("B2", .{ .number = 2 }),
+    });
+    defer f.deinit();
+
+    switch (try patch(&f.resolved, testing.allocator)) {
+        .ok => return error.TestExpectedRefusal,
+        .refused => |r| {
+            try testing.expectEqual(Refusal.Reason.transition_unproven, r.reason);
+            try testing.expectEqual(SpillTransition.Id.cse_author, r.transition.?);
+        },
+    }
+}
+
+test "§5.8c: a proven CSE authoring writes the anchor's declaration and the covered range" {
+    // Injected-table proof of the builder, M7b1's own seam: the anchor
+    // takes `<f t="array" ref>` — spelled canonically, not in caller
+    // bytes — plus its cache; the slave rides M5b1's proven kinds; the
+    // confinement holds over all of it. The committed reference
+    // re-pins what Office writes AROUND one when it lands.
+    const xml = sheetXml(
+        \\<row r="1"><c r="B1"/></row><row r="2"><c r="B2"><v>0</v></c></row>
+    );
+    var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+        authoredPub("B1", .{ .number = 1 }, .{ .text = "SEQUENCE(2)", .dialect = .{ .cse = "b1:b2" } }),
+        pubAt("B2", .{ .number = 2 }),
+    });
+    defer f.deinit();
+
+    const out = try patchOkWith(testing.allocator, &f, &proven_table);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(sheetXml(
+        \\<row r="1"><c r="B1"><f t="array" ref="B1:B2">SEQUENCE(2)</f><v>1</v></c></row><row r="2"><c r="B2"><v>2</v></c></row>
+    ), out);
+}
+
+test "§5.8c: CSE authoring geometry refuses before the row's proof state" {
+    const Case = struct {
+        anchor: []const u8,
+        ref: []const u8,
+        want: Refusal.Reason,
+    };
+    // Uncovered slave, anchor off the top-left, unparseable range —
+    // all contradictions about geometry, so they name themselves on
+    // BOTH tables rather than hiding behind `transition_unproven`.
+    const cases = [_]Case{
+        .{ .anchor = "B1", .ref = "B1:B3", .want = .cse_range_mismatch },
+        .{ .anchor = "B2", .ref = "B1:B2", .want = .cse_range_mismatch },
+        .{ .anchor = "B1", .ref = "not-a-range", .want = .cse_ref_unparseable },
+    };
+    inline for (cases) |case| {
+        const xml = sheetXml(
+            \\<row r="1"><c r="B1"/></row><row r="2"><c r="B2"><v>0</v></c></row>
+        );
+        var f = try buildFixture(testing.allocator, xml, &.{}, &.{
+            authoredPub(case.anchor, .{ .number = 1 }, .{ .text = "SEQUENCE(2)", .dialect = .{ .cse = case.ref } }),
+            pubAt(if (std.mem.eql(u8, case.anchor, "B1")) "B2" else "B1", .{ .number = 2 }),
+        });
+        defer f.deinit();
+
+        try expectRefusal(testing.allocator, &f, case.want);
+        try expectRefusalWith(testing.allocator, &f, &proven_table, case.want);
+    }
+}
+
+/// One authoring attempt per table row, for the enumeration test: the
+/// switch is exhaustive over `SpillTransition.Id`, so a row added to
+/// the table without an attempt here fails to COMPILE — which is what
+/// keeps the refusal enumeration derived from the table rather than
+/// from prose.
+fn expectAuthoringRowRefusal(comptime id: SpillTransition.Id) !void {
+    const xml = sheetXml(
+        \\<row r="1"><c r="B1"/></row><row r="2"><c r="B2"><v>0</v></c></row>
+    );
+    const pubs: []const Publication = switch (id) {
+        .da_author_spill, .da_author_blocked => &.{.{
+            .row = cellRef("B1").row,
+            .col = cellRef("B1").col,
+            .result = .{ .number = 1 },
+            .dialect = .dynamic_array,
+            .role = .{ .da_anchor = if (id == .da_author_spill)
+                .{ .spilled = .{ .rows = 2, .cols = 1 } }
+            else
+                .{ .blocked = .obstruction } },
+            .shape = if (id == .da_author_spill) .{ .rows = 2, .cols = 1 } else .{ .rows = 1, .cols = 1 },
+            .authored = .{ .text = "SEQUENCE(2)", .dialect = .dynamic_array },
+        }},
+        .cse_author => &.{
+            authoredPub("B1", .{ .number = 1 }, .{ .text = "SEQUENCE(2)", .dialect = .{ .cse = "B1:B2" } }),
+            pubAt("B2", .{ .number = 2 }),
+        },
+        else => @compileError("not an authoring row: " ++ @tagName(id)),
+    };
+    var f = try buildFixture(testing.allocator, xml, &.{}, pubs);
+    defer f.deinit();
+
+    switch (try patch(&f.resolved, testing.allocator)) {
+        .ok => return error.TestExpectedRefusal,
+        .refused => |r| {
+            try testing.expectEqual(Refusal.Reason.transition_unproven, r.reason);
+            try testing.expectEqual(id, r.transition.?);
+        },
+    }
+}
+
+test "§5.8c: the unproven-authoring list derives from the table, and each refusal names its row" {
+    var buf: [spill_transitions.len]SpillTransition.Id = undefined;
+    const missing = missingReferences(&spill_transitions, &buf);
+    var authoring_rows: usize = 0;
+    inline for (spill_transitions) |row| {
+        // Exhaustive over `Id` — see `expectAuthoringRowRefusal`.
+        switch (row.id) {
+            // M7b1's persistence rows: their per-row refusals are
+            // pinned in "the production table refuses every row"
+            // above; here they only assert their park-list membership.
+            .da_spill_rewrite, .da_spill_to_blocked, .da_blocked_to_spill, .da_blocked_rewrite => {
+                try testing.expect(std.mem.indexOfScalar(SpillTransition.Id, missing, row.id) != null);
+            },
+            .value_metadata_present => {
+                try testing.expect(std.mem.indexOfScalar(SpillTransition.Id, missing, row.id) == null);
+            },
+            .da_author_spill, .da_author_blocked, .cse_author => {
+                try testing.expect(std.mem.indexOfScalar(SpillTransition.Id, missing, row.id) != null);
+                try expectAuthoringRowRefusal(row.id);
+                authoring_rows += 1;
+            },
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), authoring_rows);
 }
 
 test {

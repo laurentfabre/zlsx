@@ -90,6 +90,11 @@ const Error = workbook_mod.Error;
 pub const Control = control.Control;
 pub const Report = recalc_txn.Report;
 pub const RunInputs = engine.run_inputs.RunInputs;
+/// §5.8c's authoring dialect (M7c, Zig-only until M9a2). Lives at the
+/// projection seam — the same layer setCell publications ride — and is
+/// re-exported here so a caller can spell it without importing the
+/// engine tree.
+pub const FormulaWrite = engine.resolved.FormulaWrite;
 
 /// §5.4b's comparator with the shipped fold wired in.
 ///

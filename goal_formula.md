@@ -2114,6 +2114,100 @@ test.
     twice, floored above 9 000 where M7b2's six names floored at
     5 000.
 
+**M7c decisions (shipped 2026-08-06).** Eleven points, in
+`src/formula/resolved.zig` (the authoring gate, `f_insert`, three
+table rows), with the public spelling re-exported along the
+`RunInputs` chain (`pkg/recalc_run.zig` → `pkg/root.zig` →
+`recalc/recalc.zig`). The row where authoring joined the persistence
+discipline instead of growing a second one.
+
+1. **`FormulaWrite` lives at the projection seam.** `Publication`
+   gained `authored: ?FormulaWrite` — the same layer setCell
+   publications ride, so an authored formula is a staged delta like
+   every other and consumes exactly once. The caller evaluated the
+   text before staging (the result rides the same publication); the
+   patcher verifies what only bytes can get wrong. Zig-only per
+   §5.8c/§12.1 — `zlsx_recalc.FormulaWrite` is the public spelling,
+   and the versioned C export + Python land at M9a2.
+2. **One new approved mutation, not a family.** `f_insert`: a whole
+   `<f>…</f>` into an existing `<c>` that has none, at `CT_Cell`'s
+   first-child point (`open_end`). The self-closing shape carries its
+   `<f>` inside `reopen_self_closing`'s replacement — one reopened
+   tag, not an insertion into bytes that do not exist yet. The one
+   tie — `f_insert` and `v_insert` both at `open_end` — is ordered by
+   the planner's list order under M7b1's stable sort, which is that
+   decision doing new work.
+3. **Authoring writes formulas where none exist.** A target already
+   carrying an `<f>` — any kind, even bodiless — refuses
+   `formula_overwrite_unsupported`. Rewriting a body would address
+   bytes inside `spans.f`, and M7b1 decision 5's carve-out (`f@ref`
+   and nothing else) survives M7c intact; a body-rewrite mutation
+   waits for its own approval.
+4. **Metadata staleness outranks the dialect.** `vm` refuses first
+   (M4a's order, permanently); a `cm`-carrying target refuses
+   `authored_under_cell_metadata` — the record narrates a formula
+   that would no longer be there.
+5. **Text validity is split where the allocator is.** Pass one runs
+   an allocation-free predicate (`authored_text_unencodable`: empty,
+   or a control character) that is exactly
+   `decode.encodeAuthoredFormula`'s, so the refusal precedes any
+   output byte and the emitter's refusal arm is provably
+   unreachable. Parser-level validation lives with the evaluation
+   that produced the staged result, not in the patcher.
+6. **The table extended through its own seam.** Three rows appended —
+   `da_author_spill`, `da_author_blocked`, `cse_author` — M7b1's
+   rows byte-untouched and their park-list order preserved.
+   `Collection.none` and `IndexRule.authored_cm`/`.none` say
+   honestly what each row touches: an arm that pretended a CSE
+   authoring transitions cellMetadata would name bytes the mutation
+   never addresses.
+7. **A reference alone cannot flip the DA authoring rows.** The
+   authored `cm`, its XLDAPR record, the metadata part, its content
+   type and its rel are part-graph mutations whose SPEC — and
+   therefore whose builder — arrives with the byte-diffed reference
+   set (§5.8b's own words). Until then `da_author_*` refuses
+   `transition_unproven` on every table, injected ones included, and
+   the fixture pins that. This is a stated asymmetry with M7b1's
+   "committing a reference flips exactly one row": for authoring,
+   the reference and the builder land together, dated here so the
+   flip cannot happen by accident.
+8. **CSE authoring is geometry-first, and the geometry is shared.**
+   Anchor at the declared top-left, every declared cell staged —
+   `declaredRangeCovered`, one derivation for the M5b1-era CSE gate
+   and the authoring gate, so "covered" cannot mean two things.
+   Geometry contradictions name themselves on BOTH tables;
+   only a clean geometry reaches the `cse_author` row. The builder
+   IS proven through the injected seam — anchor
+   `<f t="array" ref>` spelled canonically (normalized, not caller
+   bytes, `planAnchorExtras`' precedent) plus the covered range on
+   M5b1's proven kinds — and the committed reference re-pins what
+   Office writes AROUND one (`aca`, calcChain) when it lands.
+9. **Role contradictions are staging refusals.**
+   `authored_role_contradiction` (FormulaMalformedInput, the
+   `duplicate_publication` plane): a `.scalar`/`.cse` write carrying
+   a placement role, or an authored publication staged as someone's
+   tail — where the contradiction outranks even
+   `tail_without_anchor`, because whose bytes these are is settled
+   before whether the owner exists. A `.dynamic_array` write staged
+   without its placement keeps refusing generically
+   (`dynamic_array_anchor`, M7b1 decision 7 at authoring).
+10. **The refusal enumeration derives from the table.** The test
+    walks `spill_transitions` under an exhaustive switch on
+    `SpillTransition.Id` — a row added without an authoring attempt
+    fails to COMPILE — and `missingReferences()` surfaces all seven
+    unproven rows in table order; the park-list test derives its
+    expectation from the table too, with the count pinned once so a
+    vanished row cannot hide behind the derivation.
+11. **End-to-end is the file's statement, not the fixture's
+    memory.** The scalar proof: author → patch (the bytes a save
+    stages verbatim) → byte-diff against the expected document →
+    fresh `scanSheet` → the real parser and evaluator over the
+    re-opened stored values → the evaluation agrees with the
+    re-opened cache. The carrier split rides the same fixture: the
+    `<f>` body takes the FORMULA carrier (`&lt;`, `&quot;`, no
+    ST_Xstring stage) while the cached `<v>` takes the STRING
+    carrier, in one cell, and the re-open reads both back.
+
 ### 5.9 Name & identifier resolution
 
 Call position → strip layered prefixes → registry; unregistered →
@@ -2356,7 +2450,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M7b1** ✅ | DA + CSE **persistence** (approved set §5.8b byte-diff-fixtured: `<v>`+`t`, anchor `f@ref`, owned tail `<c>` create/clear, `<dimension ref>` expansion; `spill_transitions` table — every DA row refuses `transition_unproven` pending its byte-diffed Excel reference, the surfaced park; **legacy CSE live end-to-end**, no metadata byte to transition) | Byte-diff + refusal-enumeration fixtures; Excel-opens-clean per transition **runs as each reference lands** |
 | **M7b2** ✅ | F2 criteria batch (SUMIFS, COUNTIFS, AVERAGEIFS, MINIFS, MAXIFS over `criteria.scan`'s one N-way aligned pass; ADDRESS) — INDIRECT/OFFSET completed at M5a2. Every fixture spec_pinned (manifests predate the batch, 0 oracle rows counted); mismatched `*IFS` dimensions stay §5.6a's `#VALUE!`; an unpaired criteria tail refuses `MalformedInput` | Fixtures + §5.3c both-orders + padded sweep; whole-column + multi-criteria benches (`synth_criteria_mix`, digest-pinned) beside the M5d4 baselines, gate green |
 | **M7b3** ✅ | F2 statistics batch (MEDIAN, MODE.SNGL, STDEV.P/S, VAR.P/S, PERCENTILE.INC, QUARTILE.INC, RANK.EQ, LARGE, SMALL over ONE numeric collection — SUM's range/direct split — with the order statistics sharing one ascending sort). Every fixture spec_pinned (manifests predate the batch, 0 oracle rows counted); INC interpolation pinned at the 0/0.25/0.5/0.75/1 knots and between them; RANK.EQ ties share the top rank in both directions; the propagation class splits by shape — variadic six `.propagate`, fixed five `per_function_provenance` taking §5.3c's declaration order themselves | Fixtures + §5.3c both-orders + padded sweep (eleven names, floor 9 000) |
-| **M7c** | DA authoring (byte-diffed spec → impl) + `FormulaWrite` (**Zig-only**) | Byte-diff vs references |
+| **M7c** ✅ | `FormulaWrite` authoring (§5.8c, **Zig-only**, `zlsx_recalc.FormulaWrite`): `.scalar` live end-to-end on ONE new approved mutation (`f_insert` at `CT_Cell`'s first-child point; self-closing rides the reopen; existing-`<f>` targets refuse — `spans.f` stays `f@ref`-only); `.dynamic_array`/`.cse` authoring extend `spill_transitions` through the table's own seam (`da_author_spill`, `da_author_blocked`, `cse_author`), each refusing `transition_unproven` naming its row — the surfaced park; DA rows flip only WITH the part-graph builder the reference set brings; CSE builder proven via the injected seam, canonical `ref` spelling | Scalar byte-diff round-trip (write → save → re-open → evaluate agrees) + table-derived refusal enumeration (exhaustive over `Id`, compile-enforced); Excel-opens-clean per authoring row **runs as each reference lands** |
 | **M8a** | **`numfmt_v1` versioned grammar + support matrix FIRST** (sections ≤4, conditions, escapes/fills, fractions, scientific, elapsed `[h]`/`[mm]`, locale `[$-409]` tags — each row supported-with-exact-rendering or typed-refusal; the repo has only a date-detection heuristic today, `src/xlsx.zig:3909`) + numfmt + TEXT | Format fuzz; TEXT matrix; per-row grammar fixtures |
 | **M8b** | PROPER (word segmentation over the M4f `casing_v1` module) | Segmentation fixtures |
 | **M8c** | F3 batch (NUMBERVALUE, FIXED, DOLLAR, CLEAN, UNICHAR, UNICODE, TEXTBEFORE, TEXTAFTER, TEXTSPLIT; NETWORKDAYS(.INTL), WORKDAY(.INTL), DATEDIF, DAYS, DAYS360, YEARFRAC, ISOWEEKNUM, WEEKNUM) | Oracle-first |
