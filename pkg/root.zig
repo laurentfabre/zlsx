@@ -119,6 +119,7 @@ pub const recalc_run = @import("recalc_run.zig");
 pub const RecalcOptions = recalc_run.Options;
 pub const RecalcReport = recalc_run.Report;
 pub const RunInputs = recalc_run.RunInputs;
+pub const FormulaWrite = recalc_run.FormulaWrite;
 
 /// M5d1: §5.5's cancellation / deadline seam. Re-exported because
 /// `Workbook.openBufferControlled` takes a `Control` and a consumer of
