@@ -110,7 +110,13 @@ pub const AtomicFile = struct {
         const dir_path = std.fs.path.dirname(dest_path) orelse ".";
         const base = std.fs.path.basename(dest_path);
 
-        var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+        // `.iterate` is not for iteration: without it, Linux opens the
+        // directory `O_PATH`, and `fsync(2)` on an `O_PATH` descriptor
+        // fails EBADF — which std's sync path treats as a usage bug and
+        // panics before `syncDir`'s catch can report it as a durability
+        // warning. A readable fd keeps §5.7.9's directory sync actually
+        // executable on Linux; macOS and Windows are unaffected.
+        var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
         errdefer dir.close(io);
 
         var self: AtomicFile = .{
