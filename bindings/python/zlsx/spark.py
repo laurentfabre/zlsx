@@ -32,7 +32,17 @@ Read options: ``sheet`` (default ``"0"``), ``header`` (default true),
 sample when inferring (default 10, ``0`` = all), ``rowsPerPartition``
 (default 0 = one partition per file x sheet), ``mode`` (``permissive``
 nulls cells that don't fit the schema, ``failfast`` raises naming the
-exact file/sheet/row/column). Write options: ``sheet`` (default
+exact file/sheet/row/column).
+
+Batch-only recalc options (§12.4; refused on ``readStream``):
+``zlsx.recalc`` (default false) recomputes every formula with the zlsx
+engine and reads THOSE values instead of the workbook's cached ones —
+source files are never mutated, schema inference runs on the recalced
+snapshot, partitions carry a SHA-256 source digest plus the resolved
+context and engine fingerprint, and executors refuse on file drift or
+engine mismatch; ``zlsx.recalcUtcOffsetMin`` (default 0 = UTC);
+``zlsx.recalcCacheMaxBytes`` (default 512 MiB, 0 = off) bounds the
+per-executor LRU snapshot cache. Write options: ``sheet`` (default
 "Sheet1"), ``header`` (default true). A ``.xlsx`` target path means
 single-file mode and requires a single-partition DataFrame
 (``coalesce(1)``); any other path is a directory of ``part-*.xlsx``
@@ -107,12 +117,17 @@ def _truthy(options, key: str, default: bool) -> bool:
 
 class ZlsxPartition(InputPartition):
     def __init__(self, path: str, sheet_idx: int, sheet_name: str,
-                 start: int = 0, end: Optional[int] = None):
+                 start: int = 0, end: Optional[int] = None,
+                 recalc: Optional[dict] = None):
         self.path = path
         self.sheet_idx = sheet_idx
         self.sheet_name = sheet_name
         self.start = start
         self.end = end  # None = whole sheet (bulk read path)
+        # §12.4: {"digest", "ctx", "fingerprint"} when zlsx.recalc is
+        # on — everything an executor needs to re-derive the driver's
+        # snapshot identically, and nothing more (no snapshot bytes).
+        self.recalc = recalc
 
 
 class ZlsxDataSource(DataSource):
@@ -127,16 +142,62 @@ class ZlsxDataSource(DataSource):
         # across every selected sheet of the first inferFiles workbooks
         # — see _tabular.infer_schema.
         opts = self.options
+        recalc = _tabular.parse_recalc_options(opts)
+        paths = _tabular.expand_paths(opts["path"])
+        infer_files = int(opts.get("inferFiles", "10"))
+        open_book = None
+        if recalc is not None:
+            # §12.4: inference runs on the recalced snapshots, so the
+            # schema describes the values the read will produce. The
+            # prepared snapshots are kept for reader() — one recalc
+            # pass serves inference AND planning — then dropped.
+            import zlsx
+
+            prepared = self._prepare_recalc(
+                paths if infer_files <= 0 else paths[:infer_files], recalc
+            )
+            files = prepared["files"]
+            open_book = lambda p: zlsx.open_bytes(files[p][1])  # noqa: E731
         return _tabular.infer_schema(
-            _tabular.expand_paths(opts["path"]),
+            paths,
             sheet_option=opts.get("sheet", "0"),
             header=_truthy(opts, "header", True),
             infer_rows=int(opts.get("inferRows", "1000")),
-            infer_files=int(opts.get("inferFiles", "10")),
+            infer_files=infer_files,
+            open_book=open_book,
         )
 
+    def _prepare_recalc(self, paths, recalc):
+        """Driver-side snapshot preparation, memoized on this instance
+        so schema inference and partition planning share one resolved
+        context and one recalc per file."""
+        import zlsx
+
+        prepared = getattr(self, "_recalc_prepared", None)
+        if prepared is None:
+            prepared = {
+                "ctx": _tabular.resolve_recalc_context(recalc),
+                "fingerprint": zlsx.engine_fingerprint(),
+                "files": {},
+            }
+            self._recalc_prepared = prepared
+        for p in paths:
+            if p not in prepared["files"]:
+                prepared["files"][p] = _tabular.driver_snapshot(p, prepared["ctx"])
+        return prepared
+
+    def __getstate__(self):
+        # Snapshots are driver-only planning state: potentially large,
+        # and executors must re-derive from verified source bytes, not
+        # trust shipped ones.
+        state = self.__dict__.copy()
+        state.pop("_recalc_prepared", None)
+        return state
+
     def reader(self, schema):
-        return ZlsxBatchReader(self.options, schema)
+        prepared = getattr(self, "_recalc_prepared", None)
+        self._recalc_prepared = None  # reader consumes it; free the bytes
+        return ZlsxBatchReader(self.options, schema, prepared=prepared)
 
     def streamReader(self, schema):
         return ZlsxStreamReader(self.options, schema)
@@ -152,7 +213,7 @@ class _ZlsxReaderBase:
     the flat-inheritance shape the DataSource pickling contract wants.
     """
 
-    def __init__(self, options, schema):
+    def __init__(self, options, schema, *, streaming: bool = False):
         self._path_option = options["path"]
         self._sheet_option = options.get("sheet", "0")
         self._kinds = _kinds_from_schema(schema, what="read")
@@ -163,16 +224,25 @@ class _ZlsxReaderBase:
                 f"mode must be 'permissive' or 'failfast', got {self._mode!r}"
             )
         self._rows_per_part = int(options.get("rowsPerPartition", "0"))
+        # §12.4 — refuses streaming + recalc right here, at option
+        # validation, before any planning.
+        self._recalc = _tabular.parse_recalc_options(options, streaming=streaming)
+        self._recalc_cache_max = (
+            self._recalc["cache_max_bytes"] if self._recalc else 0
+        )
 
-    def _plan_file(self, path):
+    def _plan_file(self, path, snapshot: Optional[bytes] = None):
         """Partitions for one workbook: per selected sheet, optionally
         split into row ranges (one counting pass here on the driver —
-        zlsx parses at C speed, the executor win dwarfs it)."""
+        zlsx parses at C speed, the executor win dwarfs it). Under
+        recalc, planning reads the recalced ``snapshot``, never the
+        source file."""
         import zlsx
 
         out = []
         try:
-            book = zlsx.open(path)
+            book = zlsx.open_bytes(snapshot) if snapshot is not None \
+                else zlsx.open(path)
         except Exception as e:
             raise RuntimeError(
                 f"{path}: not a readable workbook ({e}); land files "
@@ -193,15 +263,30 @@ class _ZlsxReaderBase:
                     out.append(ZlsxPartition(path, si, name, start, end))
         return out
 
-    def read(self, partition):
+    def _open_partition(self, p):
+        """The partition's workbook: the source file directly, or —
+        under recalc — the digest-verified, re-derived snapshot
+        (:func:`zlsx._tabular.executor_snapshot`)."""
         import zlsx  # executor-side import
 
+        if getattr(p, "recalc", None) is not None:
+            snap = _tabular.executor_snapshot(
+                p.path,
+                p.recalc["digest"],
+                p.recalc["ctx"],
+                p.recalc["fingerprint"],
+                self._recalc_cache_max,
+            )
+            return zlsx.open_bytes(snap)
+        return zlsx.open(p.path)
+
+    def read(self, partition):
         p = partition
         ctx = f"{p.path} sheet {p.sheet_name!r}"
         kinds, mode, header = self._kinds, self._mode, self._header
         # 1-based Excel display row of the first data row in this range.
         base = p.start + (2 if header else 1)
-        with zlsx.open(p.path) as book:
+        with self._open_partition(p) as book:
             sheet = book.sheet(p.sheet_idx)
             if p.end is None:
                 # Whole sheet: the bulk-FFI matrix path.
@@ -226,11 +311,43 @@ class _ZlsxReaderBase:
 
 
 class ZlsxBatchReader(_ZlsxReaderBase, DataSourceReader):
-    def __init__(self, options, schema):
+    def __init__(self, options, schema, prepared: Optional[dict] = None):
         super().__init__(options, schema)
         self._partitions: list[ZlsxPartition] = []
-        for path in _tabular.expand_paths(self._path_option):
-            self._partitions.extend(self._plan_file(path))
+        paths = _tabular.expand_paths(self._path_option)
+
+        if self._recalc is None:
+            for path in paths:
+                self._partitions.extend(self._plan_file(path))
+            return
+
+        # §12.4 planning: recalc every file on the driver (reusing the
+        # snapshots schema inference already prepared, when it ran) and
+        # tag each partition with (digest, resolved context, engine
+        # fingerprint). Snapshot bytes stay in this frame — executors
+        # re-derive them from verified source bytes.
+        import zlsx
+
+        if prepared is None:
+            prepared = {
+                "ctx": _tabular.resolve_recalc_context(self._recalc),
+                "fingerprint": zlsx.engine_fingerprint(),
+                "files": {},
+            }
+        for path in paths:
+            if path not in prepared["files"]:
+                prepared["files"][path] = _tabular.driver_snapshot(
+                    path, prepared["ctx"]
+                )
+            digest, snapshot = prepared["files"][path]
+            tag = {
+                "digest": digest,
+                "ctx": prepared["ctx"],
+                "fingerprint": prepared["fingerprint"],
+            }
+            for part in self._plan_file(path, snapshot=snapshot):
+                part.recalc = tag
+                self._partitions.append(part)
 
     def partitions(self):
         return self._partitions
@@ -253,7 +370,7 @@ class ZlsxStreamReader(_ZlsxReaderBase, DataSourceStreamReader):
     """
 
     def __init__(self, options, schema):
-        super().__init__(options, schema)
+        super().__init__(options, schema, streaming=True)
         starting = options.get("startingPosition", "earliest").strip().lower()
         if starting not in ("earliest", "latest"):
             raise ValueError(

@@ -356,6 +356,147 @@ def test_write_leaves_no_temp_files_behind(spark, tmp_path):
     assert got == {("a", 1), ("b", 2)}
 
 
+# ─── batch recalc (§12.4) ─────────────────────────────────────────────
+
+
+def _stale_calc_book(path, a2=1, cached=999.0):
+    """Header + one data row: A2=`a2`, B2='A2+2' with a STALE cached
+    value — the engine computes a2+2, the file claims `cached`."""
+    with zlsx.write(str(path)) as w:
+        s = w.add_sheet("Calc")
+        s.write_row(["a", "b"])
+        s.write_row_with_formulas([a2, cached], [None, "A2+2"])
+
+
+def test_recalc_batch_read_returns_engine_values(spark, tmp_path):
+    """The activation contract: without zlsx.recalc the read trusts the
+    workbook's cached values; with it, every value is one the engine
+    computed — and the source file's bytes are untouched either way."""
+    path = str(tmp_path / "calc.xlsx")
+    _stale_calc_book(path)
+    before = open(path, "rb").read()
+
+    stale = spark.read.format("zlsx").load(path)
+    assert [tuple(r) for r in stale.collect()] == [(1, 999.0)]
+
+    live = (spark.read.format("zlsx")
+            .option("zlsx.recalc", "true")
+            .load(path))
+    assert [tuple(r) for r in live.collect()] == [(1, 3.0)]
+    assert open(path, "rb").read() == before  # read-only guarantee
+
+
+def test_recalc_schema_inference_sees_engine_types(spark, tmp_path):
+    """Inference runs on the recalced snapshot: a formula cell whose
+    stale cache is text but whose computed value is numeric must infer
+    numeric under recalc (integral results read back as ints → bigint),
+    string without it."""
+    path = str(tmp_path / "typed.xlsx")
+    _stale_calc_book(path, cached="TBD")
+
+    stale = spark.read.format("zlsx").load(path)
+    assert dict(stale.dtypes)["b"] == "string"
+
+    live = (spark.read.format("zlsx")
+            .option("zlsx.recalc", "true")
+            .load(path))
+    assert dict(live.dtypes)["b"] == "bigint"
+    assert [tuple(r) for r in live.collect()] == [(1, 3)]
+
+
+def _recalc_reader(path):
+    from pyspark.sql.types import StructType
+
+    from zlsx.spark import ZlsxBatchReader
+
+    schema = StructType.fromDDL("a bigint, b double")
+    return ZlsxBatchReader({"path": path, "zlsx.recalc": "true"}, schema)
+
+
+def test_recalc_partition_carries_identity_and_retry_rederives(tmp_path):
+    """Partition inputs carry (digest, resolved context, fingerprint);
+    reading the same partition twice — a task retry — yields identical
+    rows because everything is re-derived from those inputs."""
+    path = str(tmp_path / "calc.xlsx")
+    _stale_calc_book(path)
+    reader = _recalc_reader(path)
+    parts = reader.partitions()
+    assert len(parts) == 1
+    tag = parts[0].recalc
+    assert set(tag) == {"digest", "ctx", "fingerprint"}
+    assert tag["fingerprint"] == zlsx.engine_fingerprint()
+    assert tag["ctx"]["utc_offset_min"] == 0  # UTC default, like every layer
+
+    rows1 = list(reader.read(parts[0]))
+    rows2 = list(reader.read(parts[0]))
+    assert rows1 == rows2 == [(1, 3.0)]
+
+
+def test_recalc_digest_drift_refuses_identically_on_retry(tmp_path):
+    """A workbook rewritten between planning and execution refuses by
+    digest — and a retry refuses identically instead of silently
+    reading the mutant."""
+    from zlsx import _tabular
+
+    path = str(tmp_path / "calc.xlsx")
+    _stale_calc_book(path)
+    reader = _recalc_reader(path)
+    parts = reader.partitions()
+
+    _stale_calc_book(path, a2=50)  # drifts after planning
+
+    with pytest.raises(_tabular.SnapshotDriftError, match="immutable") as first:
+        list(reader.read(parts[0]))
+    with pytest.raises(_tabular.SnapshotDriftError) as retry:
+        list(reader.read(parts[0]))
+    assert str(retry.value) == str(first.value)
+
+
+def test_recalc_engine_fingerprint_mismatch_refuses(tmp_path):
+    """A partition planned by a different engine build refuses on the
+    executor — mixed-version fleets never mix recalc results."""
+    from zlsx import _tabular
+
+    path = str(tmp_path / "calc.xlsx")
+    _stale_calc_book(path)
+    reader = _recalc_reader(path)
+    parts = reader.partitions()
+    parts[0].recalc = dict(parts[0].recalc, fingerprint="zlsx 0.0.0; bogus")
+
+    with pytest.raises(_tabular.EngineFingerprintMismatch):
+        list(reader.read(parts[0]))
+
+
+def test_recalc_streaming_refused_at_option_validation(spark, tmp_path):
+    from pyspark.sql.types import StructType
+
+    from zlsx.spark import ZlsxStreamReader
+
+    zone = tmp_path / "zone"
+    zone.mkdir()
+    _land_wb(zone / "a.xlsx", ["x1"])
+    schema = StructType.fromDDL("name string, n bigint")
+
+    with pytest.raises(ValueError, match="batch-only"):
+        ZlsxStreamReader({"path": str(zone), "zlsx.recalc": "true"}, schema)
+
+    # And through the real streaming API: the query must fail with the
+    # same refusal, not silently stream stale caches.
+    with pytest.raises(Exception, match="batch-only"):
+        q = (
+            spark.readStream.format("zlsx")
+            .schema("name string, n bigint")
+            .option("zlsx.recalc", "true")
+            .load(str(zone))
+            .writeStream.format("parquet")
+            .option("path", str(tmp_path / "sink"))
+            .option("checkpointLocation", str(tmp_path / "ckpt"))
+            .trigger(availableNow=True)
+            .start()
+        )
+        q.awaitTermination()
+
+
 def test_overwrite_replaces_single_file_completely(spark, tmp_path):
     """Rewriting the same single-file target must leave a valid workbook
     holding only the new rows — not a mix of old and new bytes."""

@@ -2733,7 +2733,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M8c** ✅ | F3 batch (NUMBERVALUE, FIXED, DOLLAR, CLEAN, UNICHAR, UNICODE, TEXTBEFORE, TEXTAFTER, TEXTSPLIT; NETWORKDAYS(.INTL), WORKDAY(.INTL), DATEDIF, DAYS, DAYS360, YEARFRAC, ISOWEEKNUM, WEEKNUM — **19 rows counted from the TSV**, the prose folds the `.INTL` variants). The text half rides the layers earlier rows built — `numfmt_v1` renders FIXED/DOLLAR through ONE derived code, §5.3b's three-way split parses NUMBERVALUE (pinned `.`/`,` defaults, explicit-vs-default separator demotion), `criteria.fold`'s positional map matches the TEXTBEFORE family under `.arg_selected`, TEXTSPLIT is the batch's rectangle producer whose default pad IS `#N/A` — and the date half rides `serial_date` with **weekdays counted over SERIALS batch-wide** (one `mondayDow`, M4g decision 1 applied to ISO weeks, week numbers, and both weekend engines; one 30/360 table under DAYS360 and YEARFRAC's bases 0/4). `PMT` promoted canonical unregistered; running total 140 | Oracle-first (manifests predate F3 → every fixture spec_pinned, checker two-directional, 0 oracle rows pinned; the parked §8.2 Excel leg is what moves it); **TEXT-heavy bench (§9.1) recorded** — `synth_text_mix` digest-pinned, marginal per-row cost stated across two sizes |
 | **M9a1** ✅ | C ABI part 1 (`feat/m9a1-cabi`): `zlsx_status_v1` (0/-1/-2/-3/-5, -4 reserved; ONE error→status mapping — the fourteen-plane vocabulary detected by name against `PlaneTwo` so a fifteenth plane maps itself; ABI-contract violations are -1, never -2) + the six descriptor structs (`run`/`resolved`/`recalc_report`/`value`/`value_elem`/`diag`+`census_entry`, every offset pinned three ways: comptime asserts in `c_abi.zig`, C `static_assert`s in `tests/c_abi_smoke.c`, ctypes `sizeof` asserts in `_ffi.py`) + `zlsx_editor_recalculate`/`zlsx_editor_evaluate` over the M5d2 pipeline (evaluate = M6 CLI semantics exactly) + **`zlsx_engine_fingerprint()`** (`"zlsx <semver>; excel_fp_rules_v1; rng_v1; collation_v1; <triple>; <build-hash>"` — rule versions read from the engine through `recalc_run.rule_versions`, so the identity cannot drift from the code) + **`zlsx_editor_mark_recalc_on_load`** + the cancel-token trio (pulled into part 1: R9-12 is *about* it) + three release fns (`zlsx_buffer_release` stages with M9a2's buffers). **C ABI module hard-set multi-threaded (R9-12)**: comptime assertion, `-Dsingle-threaded` narrowed to CLI-only, both shapes CI-compiled from one invocation. Committed design note `docs/plans/c-abi-status-v1.md` | 3-file txn (header + impl + `_ffi.py` probes `_HAS_FINGERPRINT`/`_HAS_MARK_RECALC`/`_HAS_RECALC`/`_HAS_EVAL`/`_HAS_CANCEL`); header compile gate; narrowing + canary-tail + boundary tests; ABI fuzz green |
 | **M9a2** ✅ | C ABI part 2 (`feat/m9a2-cabi2`): `zlsx_editor_save_to_buffer` + `zlsx_open_buffer` + `zlsx_buffer_release` (status-style, prepped `(NULL,0)` outputs; legacy `zlsx_buffer_free` untouched) over a **new pkg buffer seam** — `PartStore.saveCommitted` split into `checkArchiveBounds` + `emitArchive(w, poller)` shared with `PartStore.saveToOwnedBuffer`, `Workbook.save` split into `applySavePlans` + store save so `Workbook.saveToOwnedBuffer` writes the identical archive, `Editor.openBuffer` (dupe, borrow-ends-at-call per Book precedent) + two-path `Editor.saveToOwnedBuffer` — plus **`zlsx_editor_save_with_recalc`** (the §5.7.9 transaction across the ABI; **durability slot live**, pinned by the injected dir-fsync fixture) and **`zlsx_writer_save_with_recalc`** (= `zlsx_recalc.writerSaveWithRecalc` across the boundary — c_abi gains the `zlsx_recalc` import rather than re-inlining the composition). **`…_with_formulas_v2`**: `zlsx_formula_cell_v1` (40 B, array element, pinned three ways) + the fresh writer's **CSE rectangle state machine** (`FormulaCell` + `writeRowWithFormulaCells`; anchor-only ref, members carry `<v>`/no `<f>`, empty members become bare `<c>` placeholders, overlap/member-formula refusals at write, completeness gate in `projectSheets` on every save path; `dynamic_array` reserved ABI, refused pending §5.8b). **Refusal-census seam honest** (decision M9a1-4 closed): `recalc_txn.Refusal` owns a bounded census, `Options.refusal_out` moves it out, `-2` diags carry the refusing cell. **Python leg per §12.3**: `recalculate` / `save_with_recalc` / `evaluate` / `save_to_buffer` / `from_bytes` / `mark_recalc_on_load`, `Writer.save(recalculate=RecalcOptions(...))`, `FormulaSpec(.cse)` + row-wide `dialect=`, `ExcelError`/`Matrix`/`EvalResult`/`RecalcReport`/`Resolved`/`CensusEntry`, `ZlsxFormulaRefusal(error_name, cells, census)`, worker-thread cancellation (TimeoutError pre-commit only; post-commit ⇒ `cancelled_late`), every release fn in `try/finally` | 3-file txn (probes `_HAS_SAVE_BUFFER`/`_HAS_SAVE_WITH_RECALC`/`_HAS_WRITER_RECALC`/`_HAS_FORMULAS_V2` + smoke.c `#error` gate + boundary/canary tests + M9a2 descriptor fuzz); pytest 174 green |
-| **M9b** | Spark batch recalc: `zlsx.recalc` activation, read-only guarantee, digest-verified partitions, driver-inference-on-recalced-snapshot, per-executor digest-keyed cache note, retry tests, streaming refusal | Integration; retries; serverless verification |
+| **M9b** ✅ | Spark batch recalc (`feat/m9b-spark`): `zlsx.recalc="true"` activation in `zlsx.spark` — the driver reads each source ONCE, SHA-256s THAT buffer, recalcs the SAME buffer (`Editor.from_bytes` → `recalculate` → `save_to_buffer`), and runs schema inference + partition planning on the recalced snapshot; source files never mutated. Partitions carry (path, digest, resolved context — resolved ONCE per read, so one job observes one logical instant and one RNG stream — engine fingerprint); executors re-apply the one-buffer rule and refuse on digest drift (`SnapshotDriftError`) or engine mismatch (`EngineFingerprintMismatch`); retries re-derive identically, pinned by the mutate-between-verify-and-open race fixture over the `_read_file_bytes` seam. Per-executor byte-bounded LRU snapshot cache (`zlsx.recalcCacheMaxBytes` default 512 MiB, 0 = off, entry charged its snapshot length, keyed by digest + every resolved input + on_unsupported + fingerprint — never digest alone). `zlsx.recalcUtcOffsetMin` default 0 (UTC); `zlsx.recalc` parses strictly (a typo refuses, never reads as false); streaming + recalc refused at option validation from `ZlsxStreamReader.__init__`. All mechanism in `_tabular.py` (no pyspark, per the CI rule); snapshots never pickle (`__getstate__` drops the driver memo) | test_basic + test_spark_core 166 green; integration 24/24 vs local Spark 4 (activation, inference-on-snapshot, drift, fingerprint, retry-identity, race, streaming refusal through both paths); serverless leg PARKED — every databricks MCP tool fails pre-workspace with `ModuleNotFoundError: No module named 'rich.traceback'` |
 | **M9c1** | **Shared deterministic solver contract FIRST** (iterations ≤128 charged to a shared **`WorkBudget`** threaded through evaluator + solvers — units: node 1, solver iteration 4, nested callbacks re-charge; combined-exhaustion tests; poll points; Excel-compatible guesses — RATE/IRR 0.1 — and root selection; pinned tolerance; `#NUM!` on domain/convergence failure) + F4a-TVM (7, frozen: PMT, IPMT, PPMT, PV, FV, RATE, NPER) | Oracle-first; convergence/non-convergence/cancellation fixtures |
 | **M9c2** | F4a-flows (8, frozen: NPV, IRR, XNPV, XIRR, SLN, SYD, DB, DDB) | Oracle-first; solver fixtures |
 | **M9d** | F4b engineering (20, frozen: CONVERT, DELTA, GESTEP, BIN2DEC, DEC2BIN, HEX2DEC, DEC2HEX, OCT2DEC, DEC2OCT, BITAND, BITOR, BITXOR, BITLSHIFT, BITRSHIFT, COMPLEX, IMREAL, IMAGINARY, IMABS, IMSUM, IMPRODUCT); **v1 complete**; §13 release gate | Oracle-first; rg allowlist; **absolute + regression perf checks (§9)** |
@@ -5232,6 +5232,67 @@ the driver's zone applies only via the explicit option, recorded in the
 resolved context. Streaming + recalc refused at option validation.
 Serverless-verified before documenting.
 
+**M9b decisions (shipped 2026-08-07).** Eight points, in
+`bindings/python/zlsx/_tabular.py` (every recalc mechanism — option
+validation, context resolution, the one-buffer digest flows, the LRU
+cache; no pyspark import, per the no-pyspark-in-CI rule) +
+`bindings/python/zlsx/spark.py` (the thin shell) +
+`bindings/python/tests/test_spark_core.py` /
+`test_spark_integration.py` + `bindings/python/README.md` (the M9b doc
+gate).
+
+1.  **One resolved context per read.** The driver resolves `now`
+    (clock) and `seed` (OS entropy) once, in the caller per §5.5 —
+    never in the library — before any recalc runs; schema inference
+    and every partition replay exactly those values. One read
+    observes one logical instant and one RNG stream, and a task
+    retry cannot drift by re-defaulting.
+2.  **The one-buffer rule has a named seam.** `_read_file_bytes` is
+    the single read on both driver and executor; digest verification
+    and `Editor.from_bytes` share the buffer it returns. The race
+    fixture monkeypatches it to rewrite the workbook immediately
+    after the read and asserts the recalc still computes from the
+    verified bytes with exactly one read — the
+    verify-then-reopen window is absent by construction, not by
+    timing.
+3.  **Activation parses strictly.** `zlsx.recalc="ture"` raises;
+    the tolerant `_truthy` vocabulary the other boolean options use
+    would silently read a typo as false and hand back stale caches.
+4.  **Snapshots never ship.** Partitions carry (digest, resolved
+    context, fingerprint) only. The driver's prepared snapshots are
+    memoized on the `ZlsxDataSource` so inference and planning share
+    one recalc per file; `reader()` consumes the memo, and
+    `__getstate__` drops it — executors always re-derive from
+    source bytes they verified themselves.
+5.  **Cache admission is charged in snapshot bytes.** One
+    `RecalcCache` per executor process, resized to each read's
+    bound; key = digest + every resolved run input +
+    `on_unsupported` + engine fingerprint, never digest alone. An
+    entry larger than the whole bound is not admitted; `0` bypasses
+    the cache without clearing it (another concurrent read may still
+    be using it).
+6.  **`mode`/`profile`/`on_unsupported` are not Spark options.**
+    Fixed at excel / windows_1252 / refuse: a workbook using a
+    construct the engine refuses fails the read with
+    `ZlsxFormulaRefusal` naming the cells — nothing silently falls
+    back to stale caches.
+7.  **The stream reader is the validation point.**
+    `parse_recalc_options(streaming=True)` raises from
+    `ZlsxStreamReader.__init__`, before any offset or planning work;
+    verified both by direct construction and through a real
+    `readStream…start()` (the refusal text surfaces in the streaming
+    query failure).
+8.  **Serverless leg PARKED (2026-08-07).** Every
+    `mcp__databricks__*` tool fails before reaching the workspace
+    with `ModuleNotFoundError: No module named 'rich.traceback'` —
+    the MCP server's own Python environment is broken (not auth, not
+    the workspace). Blocking ask: repair the databricks MCP server
+    installation (its venv lacks a working `rich`), then run the
+    leg: a serverless batch read with `zlsx.recalc="true"` over a
+    stale-cache workbook in the `zlsx_smoke` Volume (aarch64 wheel
+    built from this branch) must return the engine values in tool
+    output.
+
 ---
 
 ## 13. Documentation flips
@@ -5254,7 +5315,7 @@ classified flip-at / historical-label):
 | ~~`docs/xlsx_test_corpus.md:27,56`~~ | "don't need to evaluate" | **M6 — done**: both rows scoped to the read path with pointers at the engine's own suites |
 | ~~`docs/package-layer.md`~~ | layer description | **M5d3 — done**: title's "read-only" retired with a note saying when it stopped being true (byte-preserving writes → `Workbook` mutation → M5d recalc), and a **Recalculation (M5d)** section added covering `recalculate` / `saveWithRecalc` / `openBuffer(Controlled)` / `markRecalcOnLoad` / `zlsx_recalc.writerSaveWithRecalc`, plus why the composition is a third module |
 | ~~`bindings/python/README.md:252`~~ ("never") + **full new-API docs**: methods, `Matrix`, `ExcelError`, refusal/cancellation semantics | **M9a2 — done**: the Out-list scopes "never" to the read path and points at the new **Recalculate & evaluate** section (methods, `RecalcOptions`, `FormulaSpec.cse`, `ExcelError`/`Matrix`, refusal + worker-thread cancellation semantics, `engine_fingerprint`); the In-list and Thread-safety sections gained the matching entries |
-| `bindings/python/README.md:177-179` ("all batch options apply to streaming" — false once recalc refuses streaming) + **Spark option table (batch-only)** | **M9b** gate |
+| ~~`bindings/python/README.md:177-179`~~ ("all batch options apply to streaming" — false once recalc refuses streaming) + **Spark option table (batch-only)** | **M9b — done**: the streaming bullet now names the batch+streaming subset and refuses the `zlsx.recalc*` namespace by name; the read-option table gained an Applies-to column with the three recalc rows marked batch-only, plus a Batch recalc section stating the §12.4 contract |
 | ~~`src/xlsx.zig:1-13` · `src/cli.zig:1` · `pkg/workbook.zig` (emitCell branch)~~ | in-source scope comments (incl. the "future evaluator (Tier D1)" promise at the emitCell branch) | **M6 — done**: `cli.zig`'s "read-only" header names all three families; `xlsx.zig`'s blurb marked historical (the file itself still never evaluates); the Tier D1 promise replaced by the real rule — the engine exists, and the set-cell path deliberately stays cache-free |
 | ~~`src/formula/tokenizer.zig:566-575`~~ (scope note made false by the new token kinds) | tokenizer scope comment | **M1a — done**: module doc rewritten with the tokens; `rewriter.zig`'s matching "classifies these as `.unknown`" claim flipped too |
 | ~~`build.zig` ("zlsx and zlsx_pkg cannot coexist" — contradicted by `zlsx_recalc`)~~ | module-graph comment | **M5c — done**: the claim was already false (`cli_mod`, `corpus_mod` and `package_mod` all import both); what could not coexist under 0.15.2 was a *file* claimed by two module trees, which `AGENTS.md` marks history on 0.16. Comment rewritten to the real reason the RSS probes are split (a per-process RSS delta), and the graph is now gated by `assertAcyclicModules`. `build.zig` joins the release rg scan |

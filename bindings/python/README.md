@@ -225,19 +225,47 @@ df = (spark.read.format("zlsx")
    .save("/Volumes/cat/schema/vol/report.xlsx"))
 ```
 
-| Read option | Default | Meaning |
-|---|---|---|
-| `sheet` | `"0"` | Sheet name, index, comma list, or `*` for all sheets |
-| `header` | `true` | First row is column names; `false` → `_c0..` |
-| `inferRows` | `1000` | Rows sampled for schema inference (widens across the whole sample, not just the first row) |
-| `rowsPerPartition` | `0` (off) | Also split each sheet into row ranges |
-| `mode` | `permissive` | `permissive` nulls cells that don't fit the schema; `failfast` raises naming the exact file/sheet/row/column |
+| Read option | Applies to | Default | Meaning |
+|---|---|---|---|
+| `sheet` | batch + streaming | `"0"` | Sheet name, index, comma list, or `*` for all sheets |
+| `header` | batch + streaming | `true` | First row is column names; `false` → `_c0..` |
+| `inferRows` | batch + streaming | `1000` | Rows sampled for schema inference (widens across the whole sample, not just the first row) |
+| `rowsPerPartition` | batch + streaming | `0` (off) | Also split each sheet into row ranges |
+| `mode` | batch + streaming | `permissive` | `permissive` nulls cells that don't fit the schema; `failfast` raises naming the exact file/sheet/row/column |
+| `zlsx.recalc` | **batch only** | `false` | Recompute every formula with the zlsx engine and read THOSE values instead of the workbook's cached ones |
+| `zlsx.recalcUtcOffsetMin` | **batch only** | `0` (UTC) | UTC offset for the recalc context — the default is UTC like every other layer; the driver's zone never applies implicitly |
+| `zlsx.recalcCacheMaxBytes` | **batch only** | `536870912` (512 MiB) | Byte bound of the per-executor snapshot cache; `0` disables it |
 
 Reads partition per (file × sheet); paths accept a file, directory, glob, or
 comma list. Writes: a `.xlsx` target is single-file mode and needs a
 single-partition DataFrame (`coalesce(1)`); any other path becomes a directory
 of `part-*.xlsx`. `date`/`timestamp` columns round-trip as styled Excel
 serials. Write options: `sheet` (default `"Sheet1"`), `header`.
+
+### Batch recalc
+
+`zlsx.recalc="true"` makes the read observe the values the formula engine
+computes, not whatever stale caches the workbook carries. The contract
+(§12.4 of the formula plan):
+
+- **Source files are never mutated.** The driver reads each workbook's
+  bytes once, recalculates in memory, and serializes a snapshot buffer;
+  schema inference and partition planning run on that recalced snapshot.
+- **Partitions carry identity, not data**: the source's SHA-256 digest,
+  the fully resolved recalc context (`now`, offset, seed, mode, profile —
+  resolved once per read, so one job observes one logical instant), and
+  the engine fingerprint. Executors read the source bytes once, hash that
+  buffer, and recalc **the same buffer** — a workbook that changed since
+  planning refuses by digest, and a task retry re-derives identical
+  results instead of drifting.
+- **Mixed-version fleets refuse**: an executor whose
+  `zlsx.engine_fingerprint()` differs from the driver's raises rather
+  than mixing results from two engine builds.
+- The per-executor snapshot cache (keyed by digest + full context +
+  fingerprint) is an optimization, never a correctness dependency.
+- A workbook using a construct the engine refuses fails the read with
+  `ZlsxFormulaRefusal` naming the cells — nothing silently falls back to
+  stale caches.
 
 ### Streaming — Auto Loader for Excel
 
@@ -258,9 +286,12 @@ restarted stream resumes from the offset alone. Semantics to know:
   whole workbook (the Auto Loader convention). Deletions are ignored.
 - The offset grows with the file count — sized for a landing zone of
   thousands of workbooks, not millions.
-- All batch read options apply (`sheet`, `header`, `mode`,
-  `rowsPerPartition`); `startingPosition=latest` skips files already present
-  when the stream first starts.
+- The batch read options marked **batch + streaming** above apply
+  (`sheet`, `header`, `mode`, `rowsPerPartition`), plus the
+  streaming-only `startingPosition` (`latest` skips files already present
+  when the stream first starts). The `zlsx.recalc*` options do **not**:
+  streaming + recalc is refused at option validation — recalculate in a
+  batch job, then stream the result.
 
 ## Migration from openpyxl
 

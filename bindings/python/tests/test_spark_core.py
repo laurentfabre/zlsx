@@ -422,3 +422,250 @@ def test_land_atomically_never_exposes_a_partial_file(tmp_path, monkeypatch):
     tab.land_atomically(str(target), b"0123456789")
     assert seen == [(False, 10)]
     assert target.read_bytes() == b"0123456789"
+
+
+# ─── batch recalc (§12.4): option validation ──────────────────────────
+
+
+def test_parse_recalc_options_off_by_default():
+    assert tab.parse_recalc_options({}) is None
+    assert tab.parse_recalc_options({"zlsx.recalc": "false"}) is None
+    assert tab.parse_recalc_options({"zlsx.recalc": " FALSE "}) is None
+    # Off + streaming is fine — only the combination refuses.
+    assert tab.parse_recalc_options({}, streaming=True) is None
+
+
+def test_parse_recalc_options_active_defaults():
+    got = tab.parse_recalc_options({"zlsx.recalc": "true"})
+    assert got == {
+        "utc_offset_min": 0,                       # UTC, like every layer
+        "cache_max_bytes": 512 * 1024 * 1024,
+        "mode": "excel",
+        "profile": "windows_1252",
+        "on_unsupported": "refuse",
+    }
+
+
+def test_parse_recalc_options_rejects_typos():
+    """A typo must not silently read as false and hand back stale
+    caches — unlike the tolerant boolean options elsewhere."""
+    with pytest.raises(ValueError, match="zlsx.recalc"):
+        tab.parse_recalc_options({"zlsx.recalc": "ture"})
+
+
+def test_parse_recalc_options_streaming_refused():
+    with pytest.raises(ValueError, match="batch-only"):
+        tab.parse_recalc_options({"zlsx.recalc": "true"}, streaming=True)
+
+
+def test_parse_recalc_options_knob_validation():
+    base = {"zlsx.recalc": "true"}
+    got = tab.parse_recalc_options(
+        {**base, "zlsx.recalcUtcOffsetMin": "60",
+         "zlsx.recalcCacheMaxBytes": "0"}
+    )
+    assert got["utc_offset_min"] == 60 and got["cache_max_bytes"] == 0
+
+    with pytest.raises(ValueError, match="recalcUtcOffsetMin"):
+        tab.parse_recalc_options({**base, "zlsx.recalcUtcOffsetMin": "PST"})
+    with pytest.raises(ValueError, match="recalcCacheMaxBytes"):
+        tab.parse_recalc_options({**base, "zlsx.recalcCacheMaxBytes": "big"})
+    with pytest.raises(ValueError, match=">= 0"):
+        tab.parse_recalc_options({**base, "zlsx.recalcCacheMaxBytes": "-1"})
+
+
+def test_resolve_recalc_context_echoes_and_defaults():
+    opts = tab.parse_recalc_options(
+        {"zlsx.recalc": "true", "zlsx.recalcUtcOffsetMin": "120"}
+    )
+    ctx = tab.resolve_recalc_context(opts, now=1700000000000, seed=42)
+    assert ctx == {
+        "now": 1700000000000, "utc_offset_min": 120, "seed": 42,
+        "mode": "excel", "profile": "windows_1252",
+        "on_unsupported": "refuse",
+    }
+    # Defaulted clock/entropy resolve to concrete replayable ints, and
+    # the seed always fits u64.
+    d = tab.resolve_recalc_context(opts, seed=-1)
+    assert isinstance(d["now"], int) and d["now"] > 0
+    assert d["seed"] == 0xFFFFFFFFFFFFFFFF
+
+
+# ─── batch recalc: the byte-bounded LRU cache ─────────────────────────
+
+
+def test_recalc_cache_lru_eviction_order():
+    c = tab.RecalcCache(10)
+    c.put("a", b"aaaa")
+    c.put("b", b"bbbb")
+    assert c.get("a") == b"aaaa"        # touches a: b is now the LRU
+    c.put("c", b"cccc")                 # 12 bytes > 10: evict b
+    assert c.get("b") is None
+    assert c.get("a") == b"aaaa" and c.get("c") == b"cccc"
+
+
+def test_recalc_cache_oversized_entry_not_admitted():
+    c = tab.RecalcCache(4)
+    c.put("big", b"12345")
+    assert c.get("big") is None
+    c.put("fits", b"1234")
+    assert c.get("fits") == b"1234"
+
+
+def test_recalc_cache_replacement_and_resize():
+    c = tab.RecalcCache(8)
+    c.put("k", b"1234")
+    c.put("k", b"12345678")             # replace: accounting must not leak
+    c.put("j", b"x")                    # 9 bytes: evicts k, not j
+    assert c.get("k") is None and c.get("j") == b"x"
+    c.put("k", b"1234")
+    assert c.get("j") == b"x"           # touch j: k is now the LRU
+    c.resize(1)                         # shrink evicts k; j still fits
+    assert c.get("k") is None and c.get("j") == b"x"
+
+
+# ─── batch recalc: driver / executor snapshot flows ───────────────────
+
+
+def _stale_book(path, cached=999.0, a1=1):
+    """A1=`a1`, B1='A1+2' with a STALE cached value — the engine
+    computes a1+2, the file claims `cached`."""
+    import zlsx
+
+    with zlsx.write(str(path)) as w:
+        s = w.add_sheet("Calc")
+        s.write_row_with_formulas([a1, cached], [None, "A1+2"])
+    return str(path)
+
+
+def _b1(book_bytes):
+    import zlsx
+
+    with zlsx.open_bytes(book_bytes) as book:
+        _, rows = book.sheet(0).read_all(header=False)
+    return rows[0][1]
+
+
+def _ctx(**over):
+    base = tab.resolve_recalc_context(
+        tab.parse_recalc_options({"zlsx.recalc": "true"}),
+        now=1700000000000, seed=7,
+    )
+    base.update(over)
+    return base
+
+
+def test_driver_snapshot_recalcs_and_never_mutates_source(tmp_path):
+    import hashlib
+
+    path = _stale_book(tmp_path / "m.xlsx")
+    before = open(path, "rb").read()
+    assert _b1(before) == 999.0          # the read path trusts the cache
+
+    digest, snap = tab.driver_snapshot(path, _ctx())
+    assert digest == hashlib.sha256(before).hexdigest()
+    assert _b1(snap) == 3.0              # the snapshot carries engine truth
+    assert open(path, "rb").read() == before  # source bytes untouched
+
+
+def test_executor_snapshot_rederives_the_driver_snapshot(tmp_path):
+    import zlsx
+
+    path = _stale_book(tmp_path / "m.xlsx")
+    ctx = _ctx()
+    digest, driver_snap = tab.driver_snapshot(path, ctx)
+    exec_snap = tab.executor_snapshot(
+        path, digest, ctx, zlsx.engine_fingerprint(), 0
+    )
+    assert exec_snap == driver_snap      # byte-identical re-derivation
+
+
+def test_executor_snapshot_refuses_digest_drift_identically_on_retry(tmp_path):
+    import zlsx
+
+    path = _stale_book(tmp_path / "m.xlsx")
+    ctx = _ctx()
+    digest, _ = tab.driver_snapshot(path, ctx)
+    _stale_book(path, cached=111.0, a1=50)   # the file drifts after planning
+
+    fp = zlsx.engine_fingerprint()
+    with pytest.raises(tab.SnapshotDriftError, match="m.xlsx") as first:
+        tab.executor_snapshot(path, digest, ctx, fp, 0)
+    with pytest.raises(tab.SnapshotDriftError) as retry:
+        tab.executor_snapshot(path, digest, ctx, fp, 0)
+    assert str(retry.value) == str(first.value)  # retries re-derive, not heal
+    assert "immutable" in str(first.value)
+
+
+def test_executor_snapshot_refuses_engine_mismatch(tmp_path):
+    path = _stale_book(tmp_path / "m.xlsx")
+    ctx = _ctx()
+    digest, _ = tab.driver_snapshot(path, ctx)
+    with pytest.raises(tab.EngineFingerprintMismatch, match="0.0.0"):
+        tab.executor_snapshot(
+            path, digest, ctx, "zlsx 0.0.0; bogus_rules; nowhere", 0
+        )
+
+
+def test_executor_snapshot_mutate_between_verify_and_open_race(
+    tmp_path, monkeypatch
+):
+    """The §12.4 race fixture. A writer replaces the workbook at the
+    worst possible instant — right after the executor's single read.
+    Because verification and parsing share that one buffer, the recalc
+    must still be of the verified bytes (B1 = 3), not the mutant's
+    (B1 = 52), and the executor must not re-open the path."""
+    import zlsx
+
+    path = _stale_book(tmp_path / "m.xlsx")
+    ctx = _ctx()
+    digest, _ = tab.driver_snapshot(path, ctx)
+
+    real_read = tab._read_file_bytes
+    reads = []
+
+    def read_then_lose_the_race(p):
+        buf = real_read(p)
+        reads.append(p)
+        _stale_book(p, cached=999.0, a1=50)   # mutant lands immediately after
+        return buf
+
+    monkeypatch.setattr(tab, "_read_file_bytes", read_then_lose_the_race)
+    snap = tab.executor_snapshot(path, digest, ctx, zlsx.engine_fingerprint(), 0)
+    assert _b1(snap) == 3.0
+    assert reads == [path]               # the source was read exactly once
+
+
+def test_executor_snapshot_cache_hit_and_context_isolation(tmp_path):
+    import zlsx
+
+    path = _stale_book(tmp_path / "m.xlsx")
+    ctx = _ctx()
+    digest, _ = tab.driver_snapshot(path, ctx)
+    fp = zlsx.engine_fingerprint()
+
+    calls = []
+    real = tab._recalc_editor_snapshot
+
+    def counting(buf, c):
+        calls.append(c["seed"])
+        return real(buf, c)
+
+    bound = 64 * 1024 * 1024
+    try:
+        tab._recalc_editor_snapshot = counting
+        cache = tab.RecalcCache(bound)
+        a = tab.executor_snapshot(path, digest, ctx, fp, bound, _cache=cache)
+        b = tab.executor_snapshot(path, digest, ctx, fp, bound, _cache=cache)
+        assert a == b
+        assert len(calls) == 1           # second call was a cache hit
+        # A different resolved context must NEVER share the snapshot.
+        tab.executor_snapshot(
+            path, digest, _ctx(seed=8), fp, bound, _cache=cache
+        )
+        assert len(calls) == 2
+        # cache_max_bytes=0 bypasses the cache entirely.
+        tab.executor_snapshot(path, digest, ctx, fp, 0, _cache=cache)
+        assert len(calls) == 3
+    finally:
+        tab._recalc_editor_snapshot = real

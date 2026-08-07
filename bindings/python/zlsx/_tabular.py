@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import datetime as _dt
 import glob as _glob
+import hashlib as _hashlib
 import os
+import time as _time
 import uuid as _uuid
 from itertools import islice as _islice
 
@@ -112,6 +114,7 @@ def infer_schema(
     header: bool = True,
     infer_rows: int = 1000,
     infer_files: int = 10,
+    open_book=None,
 ) -> str:
     """Infer one DDL schema across several workbooks and sheets.
 
@@ -124,9 +127,16 @@ def infer_schema(
     Empty sheets contribute nothing instead of aborting — one blank
     workbook in a landing zone should not fail the stream. Only when NO
     sampled sheet yields a header does this raise.
+
+    ``open_book`` (path → Book context manager) defaults to
+    ``zlsx.open``; the §12.4 recalc path passes one that opens the
+    file's recalced in-memory snapshot instead, so inference sees the
+    values the read will produce, not the stale cached ones.
     """
     import zlsx
 
+    if open_book is None:
+        open_book = zlsx.open
     paths = list(paths)
     if infer_files > 0:
         paths = paths[:infer_files]
@@ -135,7 +145,7 @@ def infer_schema(
     sampled = 0
     empty: list[str] = []
     for path in paths:
-        with zlsx.open(path) as book:
+        with open_book(path) as book:
             for sheet_idx in resolve_sheets(sheet_option, book.sheets):
                 with book.sheet(sheet_idx).rows() as rows:
                     it = iter(rows)
@@ -446,3 +456,253 @@ def plan_row_ranges(n_data_rows: int, rows_per_partition: int):
         (start, min(start + rows_per_partition, n_data_rows))
         for start in range(0, n_data_rows, rows_per_partition)
     ]
+
+
+# ─── Batch recalc (§12.4) ─────────────────────────────────────────────
+#
+# `zlsx.recalc="true"` makes the read observe the values the formula
+# engine computes, not whatever stale <v> caches the workbook carries.
+# Source files are NEVER mutated: recalc happens in memory per open,
+# and the result exists only as a buffer.
+#
+# The one-buffer rule, driver and executor alike: read the source bytes
+# ONCE, SHA-256 THAT buffer, and hand THE SAME buffer to the engine.
+# Verification and parsing share one immutable snapshot, so there is no
+# verify-then-reopen window for a concurrent writer to slip through.
+
+RECALC_DEFAULT_CACHE_BYTES = 512 * 1024 * 1024
+
+_TRUE_WORDS = ("true", "1", "yes")
+_FALSE_WORDS = ("false", "0", "no")
+
+
+class SnapshotDriftError(RuntimeError):
+    """Executor-side refusal: the source bytes no longer match the
+    digest the driver planned against."""
+
+
+class EngineFingerprintMismatch(RuntimeError):
+    """Executor-side refusal: this process's engine identity differs
+    from the one the driver planned with."""
+
+
+def parse_recalc_options(options, *, streaming: bool = False):
+    """Validate the ``zlsx.recalc*`` option namespace.
+
+    Returns ``None`` when recalc is off, else a dict of the resolved
+    knobs. Unlike the boolean options elsewhere in the source, a value
+    outside true/false vocabulary raises instead of reading as false —
+    a typo must not silently hand back stale caches. Streaming + recalc
+    is refused HERE, at option validation, per §12.4.
+    """
+    raw = options.get("zlsx.recalc")
+    if raw is None:
+        active = False
+    else:
+        word = raw.strip().lower()
+        if word in _TRUE_WORDS:
+            active = True
+        elif word in _FALSE_WORDS:
+            active = False
+        else:
+            raise ValueError(f"zlsx.recalc must be true or false, got {raw!r}")
+    if not active:
+        return None
+    if streaming:
+        raise ValueError(
+            "zlsx.recalc is batch-only; streaming + recalc is refused "
+            "(recalculate in a batch job, then stream the result)"
+        )
+    try:
+        utc_offset_min = int(options.get("zlsx.recalcUtcOffsetMin", "0"))
+    except ValueError:
+        raise ValueError(
+            "zlsx.recalcUtcOffsetMin must be an integer number of minutes, "
+            f"got {options['zlsx.recalcUtcOffsetMin']!r}"
+        ) from None
+    try:
+        cache_max = int(
+            options.get("zlsx.recalcCacheMaxBytes", str(RECALC_DEFAULT_CACHE_BYTES))
+        )
+    except ValueError:
+        raise ValueError(
+            "zlsx.recalcCacheMaxBytes must be an integer byte count, "
+            f"got {options['zlsx.recalcCacheMaxBytes']!r}"
+        ) from None
+    if cache_max < 0:
+        raise ValueError(
+            f"zlsx.recalcCacheMaxBytes must be >= 0 (0 disables the "
+            f"cache), got {cache_max}"
+        )
+    return {
+        "utc_offset_min": utc_offset_min,
+        "cache_max_bytes": cache_max,
+        # Fixed at every layer's defaults; not exposed as Spark options.
+        "mode": "excel",
+        "profile": "windows_1252",
+        "on_unsupported": "refuse",
+    }
+
+
+def resolve_recalc_context(recalc_opts, *, now=None, seed=None) -> dict:
+    """Resolve the full run context ONCE, on the driver, before any
+    recalc runs. Every recalc in the job — the driver's inference pass
+    and every executor partition — replays exactly these values, so one
+    read observes one logical instant and one RNG stream, and a task
+    retry cannot drift. The clock/entropy reads live here in the caller,
+    never in the library (§5.5)."""
+    if now is None:
+        now = _time.time_ns() // 1_000_000
+    if seed is None:
+        seed = int.from_bytes(os.urandom(8), "little")
+    return {
+        "now": int(now),
+        "utc_offset_min": recalc_opts["utc_offset_min"],
+        "seed": int(seed) & 0xFFFFFFFFFFFFFFFF,
+        "mode": recalc_opts["mode"],
+        "profile": recalc_opts["profile"],
+        "on_unsupported": recalc_opts["on_unsupported"],
+    }
+
+
+def _read_file_bytes(path: str) -> bytes:
+    # Module-level seam: the race fixture monkeypatches this to mutate
+    # the file immediately after the read, proving digest verification
+    # and parsing share the one buffer this returns.
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def _recalc_editor_snapshot(buf: bytes, ctx: dict) -> bytes:
+    """One in-memory recalc over ``buf`` → the serialized snapshot.
+    The context is replayed verbatim, so equal (bytes, context, engine)
+    means byte-identical snapshots."""
+    import zlsx
+
+    with zlsx.Editor.from_bytes(buf) as ed:
+        ed.recalculate(
+            now=ctx["now"],
+            utc_offset_min=ctx["utc_offset_min"],
+            seed=ctx["seed"],
+            mode=ctx["mode"],
+            profile=ctx["profile"],
+            on_unsupported=ctx["on_unsupported"],
+        )
+        return ed.save_to_buffer()
+
+
+def driver_snapshot(path: str, ctx: dict):
+    """Driver side of §12.4: read the source bytes once, digest that
+    buffer, recalc from the same buffer. Returns
+    ``(digest_hex, snapshot_bytes)`` — the digest is what partition
+    inputs carry, the snapshot is what schema inference and planning
+    read. The source file is never written."""
+    buf = _read_file_bytes(path)
+    return _hashlib.sha256(buf).hexdigest(), _recalc_editor_snapshot(buf, ctx)
+
+
+class RecalcCache:
+    """Byte-bounded LRU of recalced snapshots.
+
+    Keyed by (workbook digest, every resolved run input, engine
+    fingerprint, recalc options) — never by digest alone, so two reads
+    with different contexts can never share a snapshot. An entry is
+    charged its snapshot's byte length; one larger than the whole bound
+    is not admitted. Documented optimization, not a correctness
+    dependency: a miss just recalculates."""
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self._entries: dict = {}  # key -> snapshot bytes, LRU-ordered
+        self._bytes = 0
+
+    def resize(self, max_bytes: int) -> None:
+        self.max_bytes = max_bytes
+        self._evict()
+
+    def get(self, key):
+        snap = self._entries.get(key)
+        if snap is not None:
+            self._entries.pop(key)
+            self._entries[key] = snap  # re-insert = most recently used
+        return snap
+
+    def put(self, key, snap: bytes) -> None:
+        if len(snap) > self.max_bytes:
+            return
+        old = self._entries.pop(key, None)
+        if old is not None:
+            self._bytes -= len(old)
+        self._entries[key] = snap
+        self._bytes += len(snap)
+        self._evict()
+
+    def _evict(self) -> None:
+        while self._bytes > self.max_bytes and self._entries:
+            oldest = next(iter(self._entries))
+            self._bytes -= len(self._entries.pop(oldest))
+
+
+# One cache per executor process; resized to each read's bound on use.
+_EXECUTOR_CACHE = RecalcCache(0)
+
+
+def recalc_cache_key(digest: str, ctx: dict, fingerprint: str) -> tuple:
+    return (
+        digest,
+        ctx["now"],
+        ctx["utc_offset_min"],
+        ctx["seed"],
+        ctx["mode"],
+        ctx["profile"],
+        ctx["on_unsupported"],
+        fingerprint,
+    )
+
+
+def executor_snapshot(
+    path: str,
+    digest: str,
+    ctx: dict,
+    fingerprint: str,
+    cache_max_bytes: int,
+    *,
+    _cache: RecalcCache | None = None,
+) -> bytes:
+    """Executor side of §12.4 — the one-buffer rule.
+
+    Refuses when this process's engine fingerprint differs from the
+    driver's (:class:`EngineFingerprintMismatch`) or when the source
+    bytes no longer hash to the planned digest
+    (:class:`SnapshotDriftError`). Otherwise recalcs THE SAME buffer
+    the digest was computed over. Everything here is a pure function of
+    (partition inputs, file bytes, engine), so a task retry re-derives
+    the identical snapshot or the identical refusal."""
+    import zlsx
+
+    local = zlsx.engine_fingerprint()
+    if local != fingerprint:
+        raise EngineFingerprintMismatch(
+            f"engine fingerprint mismatch: the driver planned with "
+            f"{fingerprint!r} but this executor runs {local!r}; align "
+            "py-zlsx/libzlsx across the cluster before recalc reads"
+        )
+    buf = _read_file_bytes(path)
+    actual = _hashlib.sha256(buf).hexdigest()
+    if actual != digest:
+        raise SnapshotDriftError(
+            f"{path}: source bytes changed since planning (sha256 "
+            f"{actual[:16]}… != planned {digest[:16]}…); workbooks must "
+            "stay immutable while a recalc read runs — land new "
+            "versions atomically under a new name"
+        )
+    if cache_max_bytes <= 0:
+        return _recalc_editor_snapshot(buf, ctx)
+    cache = _EXECUTOR_CACHE if _cache is None else _cache
+    cache.resize(cache_max_bytes)
+    key = recalc_cache_key(digest, ctx, fingerprint)
+    snap = cache.get(key)
+    if snap is None:
+        snap = _recalc_editor_snapshot(buf, ctx)
+        cache.put(key, snap)
+    return snap
