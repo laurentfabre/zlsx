@@ -338,6 +338,27 @@ const text_text_num = [_]CoercionClass{ .text, .text, .number };
 // slot coerces to text so `TEXT(5,0)` formats under the code "0".
 const value_text = [_]CoercionClass{ .value_any, .text };
 
+// M8c / F3 signatures. Same naming discipline as F1a-2's and
+// F1c-text's: each shape is spelled once, so "which slot is the
+// instance and which is the mode" is one thing to read.
+const eager6 = [_]Laziness{ .eager, .eager, .eager, .eager, .eager, .eager };
+const text3 = [_]CoercionClass{ .text, .text, .text };
+const num_num_log = [_]CoercionClass{ .number, .number, .logical };
+const num_num_text = [_]CoercionClass{ .number, .number, .text };
+// NETWORKDAYS/WORKDAY: the holiday slot is an aggregate the
+// implementation folds itself; the `.INTL` weekend slot is `.value_any`
+// because Excel accepts BOTH a number and a "0000011" mask string there,
+// and a coercion class would have to pick one.
+const num_num_agg = [_]CoercionClass{ .number, .number, .aggregate };
+const num_num_any_agg = [_]CoercionClass{ .number, .number, .value_any, .aggregate };
+// TEXTBEFORE/TEXTAFTER: text, delimiter, instance_num, match_mode,
+// match_end, if_not_found. The last slot is `.value_any` — the caller's
+// fallback is returned as itself, whatever it is.
+const textbefore_sig = [_]CoercionClass{ .text, .text, .number, .number, .number, .value_any };
+// TEXTSPLIT: text, col_delimiter, row_delimiter, ignore_empty,
+// match_mode, pad_with.
+const textsplit_sig = [_]CoercionClass{ .text, .text, .text, .logical, .number, .value_any };
+
 // F2-DA's signatures (M7a). The array-consuming five hand their grids
 // over whole — `.aggregate` and `.value_any` slots are never lifted —
 // while SEQUENCE and RANDARRAY are ordinary liftable producers whose
@@ -1655,6 +1676,194 @@ pub const functions = [_]Function{
         .volatility = .stable,
         .propagation = .propagate,
         .impl = fnProper,
+    },
+
+    // ── M8c / F3: the batch that arrives in volume. Nine text names
+    //    and ten date names; the text half rides the layers earlier
+    //    rows built (numfmt_v1 renders FIXED/DOLLAR, §5.3b's split
+    //    parses NUMBERVALUE, criteria's fold matches the TEXTBEFORE
+    //    family), the date half rides `serial_date` and counts
+    //    weekdays over SERIALS, which is M4g decision 1 applied to
+    //    every function that asks what day a serial is. ──
+    .{
+        .name = "CLEAN",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &text1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnClean,
+    },
+    // UNICHAR/UNICODE complete M4f's CHAR/CODE pair: same shapes, no
+    // platform flag — a Unicode scalar is the same character on every
+    // platform, which is the entire difference between the pairs.
+    .{
+        .name = "UNICHAR",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &num1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnUnichar,
+    },
+    .{
+        .name = "UNICODE",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &text1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        // Raw like CODE: it reports the code point that is there, and a
+        // fold would report a different string's.
+        .match_policy = .raw,
+        .impl = fnUnicode,
+    },
+    .{
+        .name = "FIXED",
+        .arity = .{ .min = 1, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &num_num_log, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnFixed,
+    },
+    .{
+        .name = "DOLLAR",
+        .arity = .{ .min = 1, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnDollar,
+    },
+    .{
+        .name = "NUMBERVALUE",
+        .arity = .{ .min = 1, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &text3, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnNumberValue,
+    },
+    .{
+        .name = "TEXTBEFORE",
+        .arity = .{ .min = 2, .max = 6, .fixed = &eager6, .rest = &none_l },
+        .coercion = .{ .fixed = &textbefore_sig, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        // `.arg_selected`: the third pair of eyes is the `match_mode`
+        // argument, not the registry — §5.4b's policy row says exactly
+        // that, and the implementation reads the argument.
+        .match_policy = .arg_selected,
+        .collation_sensitive = true,
+        .impl = fnTextBefore,
+    },
+    .{
+        .name = "TEXTAFTER",
+        .arity = .{ .min = 2, .max = 6, .fixed = &eager6, .rest = &none_l },
+        .coercion = .{ .fixed = &textbefore_sig, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .match_policy = .arg_selected,
+        .collation_sensitive = true,
+        .impl = fnTextAfter,
+    },
+    .{
+        .name = "TEXTSPLIT",
+        .arity = .{ .min = 2, .max = 6, .fixed = &eager6, .rest = &none_l },
+        .coercion = .{ .fixed = &textsplit_sig, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .match_policy = .arg_selected,
+        .collation_sensitive = true,
+        .impl = fnTextSplit,
+    },
+    // The date half. `DAYS` alone stays unflagged: a difference of two
+    // serials is the same number under either epoch — TIME's honesty,
+    // §7's discipline. Everything that reads a calendar field or a
+    // week boundary is epoch-flagged.
+    .{
+        .name = "DAYS",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnDays,
+    },
+    .{
+        .name = "DAYS360",
+        .arity = .{ .min = 2, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &num_num_log, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnDays360,
+    },
+    .{
+        .name = "DATEDIF",
+        .arity = .{ .min = 3, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &num_num_text, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnDatedif,
+    },
+    .{
+        .name = "YEARFRAC",
+        .arity = .{ .min = 2, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &num3, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnYearfrac,
+    },
+    .{
+        .name = "ISOWEEKNUM",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &num1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnIsoWeekNum,
+    },
+    .{
+        .name = "WEEKNUM",
+        .arity = .{ .min = 1, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnWeekNum,
+    },
+    .{
+        .name = "NETWORKDAYS",
+        .arity = .{ .min = 2, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &num_num_agg, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnNetworkdays,
+    },
+    .{
+        .name = "NETWORKDAYS.INTL",
+        .arity = .{ .min = 2, .max = 4, .fixed = &eager4, .rest = &none_l },
+        .coercion = .{ .fixed = &num_num_any_agg, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnNetworkdaysIntl,
+    },
+    .{
+        .name = "WORKDAY",
+        .arity = .{ .min = 2, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &num_num_agg, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnWorkday,
+    },
+    .{
+        .name = "WORKDAY.INTL",
+        .arity = .{ .min = 2, .max = 4, .fixed = &eager4, .rest = &none_l },
+        .coercion = .{ .fixed = &num_num_any_agg, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnWorkdayIntl,
     },
 };
 
@@ -4418,6 +4627,917 @@ fn fnNow(ctx: CallCtx, args: []const Value) FnError!Value {
     return Value.num(try ctx.nowSerial());
 }
 
+// ─── M8c / F3: the implementations ───────────────────────────────
+
+fn fnClean(ctx: CallCtx, args: []const Value) FnError!Value {
+    const s = textArg(args, 0);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.ensureTotalCapacity(ctx.arena(), s.len);
+    // Excel's CLEAN removes exactly the C0 controls 0–31 — not DEL,
+    // not the C1 range CHAR can produce, not the non-breaking space
+    // TRIM also keeps. A C0 byte cannot occur inside a multi-byte
+    // UTF-8 sequence, so the byte filter IS the code-point filter.
+    for (s) |b| {
+        if (b >= 0x20) out.appendAssumeCapacity(b);
+    }
+    return .{ .scalar = .{ .text = try out.toOwnedSlice(ctx.arena()) } };
+}
+
+fn fnUnichar(ctx: CallCtx, args: []const Value) FnError!Value {
+    const code_f = @trunc(numArg(args, 0));
+    // Zero and the supra-Unicode range ask for no character and are
+    // `#VALUE!`; a surrogate half asks for one UTF-8 cannot hold and
+    // is `#N/A` — Excel's split, kept because the two are genuinely
+    // different failures.
+    if (code_f < 1 or code_f > 0x10FFFF) return Value.err(.value);
+    const code: u21 = @intFromFloat(code_f);
+    if (code >= 0xD800 and code <= 0xDFFF) return Value.err(.na);
+    var buf: [4]u8 = undefined;
+    const len = std.unicode.utf8Encode(code, &buf) catch unreachable;
+    return .{ .scalar = .{ .text = try ctx.arena().dupe(u8, buf[0..len]) } };
+}
+
+fn fnUnicode(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const s = textArg(args, 0);
+    if (s.len == 0) return Value.err(.value);
+    // The first code point, raw — the question CODE's 256-entry table
+    // cannot answer (M4f decision 12). The invalid-byte fallback is
+    // CODE's own, so the pair stays total over hand-built values.
+    const seq_len = std.unicode.utf8ByteSequenceLength(s[0]) catch 1;
+    const cp: u21 = if (seq_len <= s.len)
+        std.unicode.utf8Decode(s[0..seq_len]) catch s[0]
+    else
+        s[0];
+    return Value.num(@floatFromInt(cp));
+}
+
+/// The shared front half of FIXED and DOLLAR: truncate the decimals
+/// argument, refuse past Excel's 127-place cap, and fold a NEGATIVE
+/// count into the value itself by rounding left of the point (ROUND's
+/// own `.half_away`) — after which the derived format code only ever
+/// spells zero or more real decimal places.
+const FixedScale = union(enum) { ok: struct { x: f64, frac: usize }, out: Value };
+
+fn fixedScale(ctx: CallCtx, n: f64, decimals: f64) FixedScale {
+    const d = @trunc(decimals);
+    if (d > 127) return .{ .out = Value.err(.value) };
+    if (d < 0) {
+        return switch (roundAt(ctx.rules(), n, d, .half_away)) {
+            .number => |r| .{ .ok = .{ .x = r, .frac = 0 } },
+            else => |rounded| .{ .out = .{ .scalar = rounded } },
+        };
+    }
+    return .{ .ok = .{ .x = n, .frac = @intFromFloat(d) } };
+}
+
+/// FIXED and DOLLAR are TEXT with a derived format code — M8a's "one
+/// derivation, byte-proven" carried forward: every digit they emit is
+/// `numfmt_v1`'s, never a second formatter's. The code is built here
+/// and parsed like any user code; it is grammar-clean by construction
+/// (a digit run under 255 characters), so a refusal is unreachable.
+fn renderDerivedCode(ctx: CallCtx, code: []const u8, n: f64) FnError![]const u8 {
+    const a = ctx.arena();
+    const parsed = switch (try numfmt.parse(a, code)) {
+        .ok => |f| f,
+        .refused => unreachable, // derived, never user-spelled
+    };
+    return numfmt.render(a, &parsed, .{ .number = n }, .{
+        .date_system = ctx.dateSystem(),
+    }) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.SerialOutOfRange => unreachable, // no date tokens in a derived code
+    };
+}
+
+/// "#,##0" or "0", then `frac` zeros behind a point. The buffer bounds
+/// the 127-place cap: 1 + 5 + 1 + 127 < 160.
+fn buildNumericCode(buf: *[160]u8, dollar: bool, grouped: bool, frac: usize) []const u8 {
+    var len: usize = 0;
+    if (dollar) {
+        buf[len] = '$';
+        len += 1;
+    }
+    const head: []const u8 = if (grouped) "#,##0" else "0";
+    @memcpy(buf[len..][0..head.len], head);
+    len += head.len;
+    if (frac > 0) {
+        buf[len] = '.';
+        len += 1;
+        @memset(buf[len..][0..frac], '0');
+        len += frac;
+    }
+    return buf[0..len];
+}
+
+fn fnFixed(ctx: CallCtx, args: []const Value) FnError!Value {
+    const scaled = switch (fixedScale(ctx, numArg(args, 0), optNum(args, 1, 2))) {
+        .ok => |s| s,
+        .out => |v| return v,
+    };
+    const no_commas = optBool(args, 2, false);
+    var buf: [160]u8 = undefined;
+    const code = buildNumericCode(&buf, false, !no_commas, scaled.frac);
+    return producedText(try renderDerivedCode(ctx, code, scaled.x));
+}
+
+fn fnDollar(ctx: CallCtx, args: []const Value) FnError!Value {
+    const scaled = switch (fixedScale(ctx, numArg(args, 0), optNum(args, 1, 2))) {
+        .ok => |s| s,
+        .out => |v| return v,
+    };
+    var buf: [160]u8 = undefined;
+    const code = buildNumericCode(&buf, true, true, scaled.frac);
+    // The parentheses are the negative section of the currency format
+    // DOLLAR mirrors. Rendering |x| under the one positive section and
+    // wrapping keeps the derived code short of `max_format_chars` at
+    // every legal decimals count — a two-section spelling would not be.
+    const digits = try renderDerivedCode(ctx, code, @abs(scaled.x));
+    if (scaled.x < 0) {
+        return producedText(try std.mem.concat(ctx.arena(), u8, &.{ "(", digits, ")" }));
+    }
+    return producedText(digits);
+}
+
+/// The first code point of a separator argument, as its byte slice —
+/// Excel reads only the first character of NUMBERVALUE's separators.
+fn firstCodePointSlice(s: []const u8) []const u8 {
+    assert(s.len > 0);
+    const len = std.unicode.utf8ByteSequenceLength(s[0]) catch 1;
+    return s[0..@min(len, s.len)];
+}
+
+fn fnNumberValue(ctx: CallCtx, args: []const Value) FnError!Value {
+    const raw = textArg(args, 0);
+    // §5.4b's pin: omitted separators default to `.`/`,` — a recorded
+    // divergence from Excel's locale defaults, because zlsx has no
+    // locale to read them from.
+    const dec_arg: []const u8 = if (args.len >= 2) textArg(args, 1) else ".";
+    if (dec_arg.len == 0) return Value.err(.value);
+    const dec = firstCodePointSlice(dec_arg);
+    // One character cannot mean both things — but only two EXPLICIT
+    // separators can collide. An explicit decimal separator that
+    // happens to equal the DEFAULT group separator demotes the
+    // default to "no grouping": `NUMBERVALUE("2,5",",")` is 2.5, not
+    // an error, which is the function's whole reason to exist.
+    const grp: ?[]const u8 = grp: {
+        if (args.len >= 3) {
+            const grp_arg = textArg(args, 2);
+            if (grp_arg.len == 0) return Value.err(.value);
+            const g = firstCodePointSlice(grp_arg);
+            if (std.mem.eql(u8, dec, g)) return Value.err(.value);
+            break :grp g;
+        }
+        if (std.mem.eql(u8, dec, ",")) break :grp null;
+        break :grp ",";
+    };
+
+    const a = ctx.arena();
+    // Whitespace vanishes wherever it stands — Excel's rule, and the
+    // reason `NUMBERVALUE("1 000 000")` parses where VALUE errors.
+    var cleaned: std.ArrayListUnmanaged(u8) = .empty;
+    try cleaned.ensureTotalCapacity(a, raw.len);
+    for (raw) |b| {
+        if (b == ' ' or b == '\t') continue;
+        cleaned.appendAssumeCapacity(b);
+    }
+    var s: []const u8 = cleaned.items;
+    // The empty text is 0 — Excel's pinned answer, and the one case
+    // where nothing parses into something.
+    if (s.len == 0) return Value.num(0);
+
+    // Trailing percents compound: each divides by 100 after the parse.
+    var percents: usize = 0;
+    while (std.mem.endsWith(u8, s, "%")) {
+        s = s[0 .. s.len - 1];
+        percents += 1;
+    }
+    if (s.len == 0) return Value.err(.value);
+
+    // Normalize: group separators stand only left of the decimal
+    // separator and vanish; the decimal separator stands at most once
+    // and becomes `.`. Excel does not check the three-digit grouping,
+    // and neither does this.
+    var norm: std.ArrayListUnmanaged(u8) = .empty;
+    try norm.ensureTotalCapacity(a, s.len);
+    var seen_dec = false;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (std.mem.startsWith(u8, s[i..], dec)) {
+            if (seen_dec) return Value.err(.value);
+            seen_dec = true;
+            norm.appendAssumeCapacity('.');
+            i += dec.len;
+            continue;
+        }
+        if (grp != null and std.mem.startsWith(u8, s[i..], grp.?)) {
+            if (seen_dec) return Value.err(.value);
+            i += grp.?.len;
+            continue;
+        }
+        norm.appendAssumeCapacity(s[i]);
+        i += 1;
+    }
+
+    // §5.3b's three-way split, inherited rather than redefined: the
+    // normalized spelling goes through the SAME parse VALUE uses, so
+    // numeric text is a number, non-numeric text is `#VALUE!`, and a
+    // spelling that is numeric only under some other locale's
+    // convention is the typed refusal.
+    const parsed = value.parseDecimal(ctx.fidelity(), .function_arg, norm.items) catch |e| switch (e) {
+        error.NotNumeric => return Value.err(.value),
+        error.LocaleSensitive => return error.LocaleSensitiveInput,
+    };
+    var out = parsed;
+    var p = percents;
+    while (p > 0) : (p -= 1) out /= 100;
+    return arith(out);
+}
+
+// ── the TEXTBEFORE family: one literal match enumerator, two cuts
+//    and a splitter over it ──
+
+/// A literal (never wildcard) delimiter occurrence, as byte offsets
+/// into the ORIGINAL string.
+const LiteralMatch = struct { start: usize, end: usize };
+
+/// Byte offset where each code point of `s` begins; `starts[cps]` is
+/// `s.len`. Invalid UTF-8 counts by bytes — the same fallback
+/// `criteria.fold` takes, so the two maps can never disagree about a
+/// hand-built value.
+fn cpByteStarts(a: std.mem.Allocator, s: []const u8) ![]usize {
+    var starts: std.ArrayListUnmanaged(usize) = .empty;
+    const view = std.unicode.Utf8View.init(s) catch {
+        const out = try a.alloc(usize, s.len + 1);
+        for (out, 0..) |*o, i| o.* = i;
+        return out;
+    };
+    var it = view.iterator();
+    var i: usize = 0;
+    while (it.nextCodepointSlice()) |cp| {
+        try starts.append(a, i);
+        i += cp.len;
+    }
+    try starts.append(a, i);
+    return starts.toOwnedSlice(a);
+}
+
+/// Every non-overlapping occurrence of `needle` in `hay`, left to
+/// right. `folded` selects §5.4b's comparator: the fold's positional
+/// map converts folded hits back to original byte offsets, and a hit
+/// that begins or ends inside an expansion has not matched whole
+/// characters and does not count.
+fn literalMatches(
+    ctx: CallCtx,
+    hay: []const u8,
+    needle: []const u8,
+    folded: bool,
+) FnError![]LiteralMatch {
+    assert(needle.len > 0);
+    const a = ctx.arena();
+    var out: std.ArrayListUnmanaged(LiteralMatch) = .empty;
+    if (!folded) {
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, hay, i, needle)) |at| {
+            try out.append(a, .{ .start = at, .end = at + needle.len });
+            i = at + needle.len;
+        }
+        return out.toOwnedSlice(a);
+    }
+    const fh = criteria.fold(a, ctx.collation().fold, hay) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // The per-code-point fold cannot fail on the valid slices the
+        // iterator hands it, and invalid UTF-8 takes the byte fallback.
+        else => unreachable,
+    };
+    const fnd = criteria.fold(a, ctx.collation().fold, needle) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => unreachable,
+    };
+    const starts = try cpByteStarts(a, hay);
+    var fo: usize = 0;
+    while (std.mem.indexOfPos(u8, fh.bytes, fo, fnd.bytes)) |at| {
+        const s_cp = fh.boundaryAt(@intCast(at));
+        const e_cp = fh.boundaryAt(@intCast(at + fnd.bytes.len));
+        if (s_cp != null and e_cp != null) {
+            try out.append(a, .{ .start = starts[s_cp.?], .end = starts[e_cp.?] });
+            fo = at + fnd.bytes.len;
+        } else {
+            fo = at + 1;
+        }
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// A 0-or-1 flag argument (`match_mode`, `match_end`). Null is
+/// `#VALUE!` — Excel names exactly two modes.
+fn flag01(args: []const Value, i: usize) ?bool {
+    const v = @trunc(optNum(args, i, 0));
+    if (v == 0) return false;
+    if (v == 1) return true;
+    return null;
+}
+
+fn textBeforeAfterImpl(ctx: CallCtx, args: []const Value, comptime after: bool) FnError!Value {
+    const s = textArg(args, 0);
+    const delim = textArg(args, 1);
+    // The pinned frame (M8c decisions): an empty delimiter is
+    // `#VALUE!`; instance 0 is `#VALUE!`; an instance past the text's
+    // own length is `#VALUE!`; a delimiter merely not found at the
+    // asked instance is `#N/A` — or the caller's own fallback.
+    if (delim.len == 0) return Value.err(.value);
+    const inst_f = @trunc(optNum(args, 2, 1));
+    if (inst_f == 0) return Value.err(.value);
+    if (@abs(inst_f) > @as(f64, @floatFromInt(codePointCount(s)))) return Value.err(.value);
+    const folded = flag01(args, 3) orelse return Value.err(.value);
+    const match_end = flag01(args, 4) orelse return Value.err(.value);
+
+    const matches = try literalMatches(ctx, s, delim, folded);
+    // `match_end` appends one zero-width instance at the end of the
+    // text, for both directions — the "treat the end as a delimiter"
+    // Excel documents.
+    const total = matches.len + @intFromBool(match_end);
+    const idx_f = if (inst_f > 0) inst_f - 1 else @as(f64, @floatFromInt(total)) + inst_f;
+    if (idx_f < 0 or idx_f >= @as(f64, @floatFromInt(total))) {
+        if (args.len >= 6) return .{ .scalar = try observedScalar(ctx, args[5]) };
+        return Value.err(.na);
+    }
+    const idx: usize = @intFromFloat(idx_f);
+    const m: LiteralMatch = if (idx < matches.len)
+        matches[idx]
+    else
+        .{ .start = s.len, .end = s.len };
+    // A slice of the argument, not produced text: a cut cannot be
+    // longer than what it was cut from.
+    return .{ .scalar = .{ .text = if (after) s[m.end..] else s[0..m.start] } };
+}
+
+fn fnTextBefore(ctx: CallCtx, args: []const Value) FnError!Value {
+    return textBeforeAfterImpl(ctx, args, false);
+}
+
+fn fnTextAfter(ctx: CallCtx, args: []const Value) FnError!Value {
+    return textBeforeAfterImpl(ctx, args, true);
+}
+
+/// Split `s` at `matches` into the segments between them, dropping
+/// empty segments when asked — TEXTSPLIT's `ignore_empty`, applied on
+/// both axes.
+fn splitSegments(
+    a: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged([]const u8),
+    s: []const u8,
+    matches: []const LiteralMatch,
+    drop_empty: bool,
+) !void {
+    var prev: usize = 0;
+    for (matches) |m| {
+        const seg = s[prev..m.start];
+        if (!drop_empty or seg.len > 0) try list.append(a, seg);
+        prev = m.end;
+    }
+    const tail = s[prev..];
+    if (!drop_empty or tail.len > 0) try list.append(a, tail);
+}
+
+fn fnTextSplit(ctx: CallCtx, args: []const Value) FnError!Value {
+    const s = textArg(args, 0);
+    const col_d = textArg(args, 1);
+    const row_d: []const u8 = if (args.len >= 3) textArg(args, 2) else "";
+    const ignore_empty = optBool(args, 3, false);
+    const folded = flag01(args, 4) orelse return Value.err(.value);
+    // The pad is used AS an element, never propagated: its default IS
+    // `#N/A`, which is what a ragged split's missing cells answer.
+    const pad: value.ScalarValue = if (args.len >= 6)
+        try observedScalar(ctx, args[5])
+    else
+        value.ScalarValue.errorOf(.na);
+    // Both delimiters absent leaves nothing to split by. One empty
+    // delimiter beside a real one means "no split on this axis" —
+    // which is how `TEXTSPLIT(text,,";")` spells rows-only.
+    if (col_d.len == 0 and row_d.len == 0) return Value.err(.value);
+
+    const a = ctx.arena();
+    var row_slices: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (row_d.len > 0) {
+        const rms = try literalMatches(ctx, s, row_d, folded);
+        try splitSegments(a, &row_slices, s, rms, ignore_empty);
+    } else {
+        try row_slices.append(a, s);
+    }
+
+    var grid: std.ArrayListUnmanaged([]const []const u8) = .empty;
+    var max_cols: usize = 0;
+    for (row_slices.items) |row| {
+        var fields: std.ArrayListUnmanaged([]const u8) = .empty;
+        if (col_d.len > 0) {
+            const cms = try literalMatches(ctx, row, col_d, folded);
+            try splitSegments(a, &fields, row, cms, ignore_empty);
+        } else if (!ignore_empty or row.len > 0) {
+            try fields.append(a, row);
+        }
+        // Under `ignore_empty` a row with nothing left simply is not a
+        // row — the same statement the fields make.
+        if (fields.items.len == 0) continue;
+        max_cols = @max(max_cols, fields.items.len);
+        try grid.append(a, fields.items);
+    }
+
+    // Everything dropped: `Matrix.init` raises the empty rectangle and
+    // the call boundary spells it `#CALC!`, like every empty DA result.
+    var m = try value.Matrix.init(a, @intCast(grid.items.len), @intCast(max_cols));
+    for (grid.items, 0..) |fields, r| {
+        var c: usize = 0;
+        while (c < max_cols) : (c += 1) {
+            m.set(@intCast(r), @intCast(c), if (c < fields.len)
+                .{ .text = fields[c] }
+            else
+                pad);
+        }
+    }
+    return .{ .array = m };
+}
+
+// ── the date half: serials in, weekdays counted over SERIALS ──
+
+/// Monday-zero weekday of a whole serial, counted over serials — the
+/// SAME phase arithmetic `WEEKDAY` pinned at M4g decision 1, restated
+/// here so no M8c function can disagree with `WEEKDAY` about what day
+/// a serial is. Under the 1900 system this diverges from the proleptic
+/// calendar below serial 61, deliberately and everywhere at once.
+fn mondayDow(system: run_inputs.DateSystem, days: i32) u3 {
+    const phase: i64 = switch (system) {
+        .d1900 => 6, // serial 1 is a Sunday
+        .d1904 => 5, // serial 0 is 1904-01-01, a Friday
+    };
+    const sunday_zero = @mod(@as(i64, days) + phase, 7);
+    return @intCast(@mod(sunday_zero + 6, 7));
+}
+
+/// A whole-day serial argument for the date batch: truncated, domain
+/// checked under the ACTIVE system — `clockOf`'s discipline. Null is
+/// `#NUM!`.
+fn wholeSerial(ctx: CallCtx, x: f64) ?i32 {
+    const parts = serialParts(x) orelse return null;
+    if (parts.days > serial_date.maxSerial(ctx.dateSystem())) return null;
+    return parts.days;
+}
+
+fn fnDays(ctx: CallCtx, args: []const Value) FnError!Value {
+    // DAYS(end, start) — end first, which is the one thing about DAYS
+    // worth a fixture on its own.
+    const end = wholeSerial(ctx, numArg(args, 0)) orelse return Value.err(.num);
+    const start = wholeSerial(ctx, numArg(args, 1)) orelse return Value.err(.num);
+    return Value.num(@floatFromInt(@as(i64, end) - @as(i64, start)));
+}
+
+fn lastDayOfMonth(d: serial_date.Date) bool {
+    return d.day == serial_date.daysInMonth(d.year, d.month);
+}
+
+fn lastDayOfFeb(d: serial_date.Date) bool {
+    return d.month == 2 and lastDayOfMonth(d);
+}
+
+/// The 30/360 day count DAYS360 and YEARFRAC's bases 0 and 4 all read
+/// — ONE derivation, so the two functions can never disagree about a
+/// month's length. US is the NASD variant as OpenFormula states it;
+/// Excel's "ending date becomes the 1st of the next month" prose is
+/// arithmetic-identical to leaving a 31 in place, so the shorter rule
+/// is the one written.
+fn days360Count(d1: serial_date.Date, d2: serial_date.Date, european: bool) i64 {
+    var dd1: i64 = d1.day;
+    var dd2: i64 = d2.day;
+    if (european) {
+        if (dd1 == 31) dd1 = 30;
+        if (dd2 == 31) dd2 = 30;
+    } else {
+        if (lastDayOfFeb(d1) and lastDayOfFeb(d2)) dd2 = 30;
+        if (lastDayOfFeb(d1)) dd1 = 30;
+        if (dd2 == 31 and dd1 >= 30) dd2 = 30;
+        if (dd1 == 31) dd1 = 30;
+    }
+    return (@as(i64, d2.year) - d1.year) * 360 +
+        (@as(i64, d2.month) - d1.month) * 30 + (dd2 - dd1);
+}
+
+fn fnDays360(ctx: CallCtx, args: []const Value) FnError!Value {
+    const d1 = dateOf(ctx, numArg(args, 0)) orelse return Value.err(.num);
+    const d2 = dateOf(ctx, numArg(args, 1)) orelse return Value.err(.num);
+    const european = optBool(args, 2, false);
+    return Value.num(@floatFromInt(days360Count(d1, d2, european)));
+}
+
+fn fnDatedif(ctx: CallCtx, args: []const Value) FnError!Value {
+    const s_days = wholeSerial(ctx, numArg(args, 0)) orelse return Value.err(.num);
+    const e_days = wholeSerial(ctx, numArg(args, 1)) orelse return Value.err(.num);
+    if (s_days > e_days) return Value.err(.num);
+    const sys = ctx.dateSystem();
+    const d1 = serial_date.dateFromSerial(sys, s_days) catch return Value.err(.num);
+    const d2 = serial_date.dateFromSerial(sys, e_days) catch return Value.err(.num);
+
+    // The unit alphabet is ASCII by construction, and Excel accepts
+    // `"ym"` and `"YM"` alike.
+    const unit_raw = textArg(args, 2);
+    if (unit_raw.len == 0 or unit_raw.len > 2) return Value.err(.num);
+    var ubuf: [2]u8 = undefined;
+    for (unit_raw, 0..) |b, i| ubuf[i] = std.ascii.toUpper(b);
+    const unit = ubuf[0..unit_raw.len];
+
+    // Complete months, borrowing one when the end's day has not yet
+    // reached the start's — the quantity three of the six units share.
+    var months_total: i64 = (@as(i64, d2.year) - d1.year) * 12 +
+        (@as(i64, d2.month) - d1.month);
+    if (d2.day < d1.day) months_total -= 1;
+
+    if (std.mem.eql(u8, unit, "D")) {
+        // Serial subtraction, like DAYS — not a calendar walk.
+        return Value.num(@floatFromInt(@as(i64, e_days) - s_days));
+    }
+    if (std.mem.eql(u8, unit, "M")) return Value.num(@floatFromInt(months_total));
+    if (std.mem.eql(u8, unit, "Y")) return Value.num(@floatFromInt(@divFloor(months_total, 12)));
+    if (std.mem.eql(u8, unit, "YM")) return Value.num(@floatFromInt(@mod(months_total, 12)));
+    if (std.mem.eql(u8, unit, "MD")) {
+        // Excel's own algorithm, quirks included: a negative day gap
+        // borrows the length of the month BEFORE the end date.
+        var dd: i64 = @as(i64, d2.day) - d1.day;
+        if (dd < 0) {
+            var py: i32 = d2.year;
+            var pm: i64 = @as(i64, d2.month) - 1;
+            if (pm == 0) {
+                pm = 12;
+                py -= 1;
+            }
+            dd += serial_date.daysInMonth(py, @intCast(pm));
+        }
+        return Value.num(@floatFromInt(dd));
+    }
+    if (std.mem.eql(u8, unit, "YD")) {
+        // The start, moved to the last same-side year boundary at or
+        // before the end; a Feb 29 start clamps in a common year.
+        var sy: i32 = d2.year;
+        if (d2.month < d1.month or (d2.month == d1.month and d2.day < d1.day)) sy -= 1;
+        const clamped: u8 = @min(d1.day, serial_date.daysInMonth(sy, d1.month));
+        const anchor = serial_date.serialFromDate(sys, sy, d1.month, clamped) catch
+            return Value.err(.num);
+        return Value.num(@floatFromInt(@as(i64, e_days) - anchor));
+    }
+    return Value.err(.num);
+}
+
+fn fnYearfrac(ctx: CallCtx, args: []const Value) FnError!Value {
+    var a_days = wholeSerial(ctx, numArg(args, 0)) orelse return Value.err(.num);
+    var b_days = wholeSerial(ctx, numArg(args, 1)) orelse return Value.err(.num);
+    const basis_f = @trunc(optNum(args, 2, 0));
+    if (basis_f < 0 or basis_f > 4) return Value.err(.num);
+    const basis: u3 = @intFromFloat(basis_f);
+    // Excel orders the endpoints itself, so the fraction is never
+    // negative.
+    if (a_days > b_days) std.mem.swap(i32, &a_days, &b_days);
+    const sys = ctx.dateSystem();
+    const d1 = serial_date.dateFromSerial(sys, a_days) catch return Value.err(.num);
+    const d2 = serial_date.dateFromSerial(sys, b_days) catch return Value.err(.num);
+    const actual: f64 = @floatFromInt(@as(i64, b_days) - a_days);
+
+    switch (basis) {
+        0 => return Value.num(@as(f64, @floatFromInt(days360Count(d1, d2, false))) / 360),
+        4 => return Value.num(@as(f64, @floatFromInt(days360Count(d1, d2, true))) / 360),
+        2 => return arith(actual / 360),
+        3 => return arith(actual / 365),
+        1 => {},
+        else => unreachable, // range-checked above
+    }
+
+    // actual/actual's denominator, Excel's rule: within one nominal
+    // year it is 366 exactly when the closed interval touches a
+    // Feb 29 (a one-year same-date span in a leap year counts as
+    // touching); across more it is the average length of every year
+    // the interval touches.
+    const within_one_year = d1.year == d2.year or
+        (d2.year == d1.year + 1 and
+            (d2.month < d1.month or (d2.month == d1.month and d2.day <= d1.day)));
+    const den: f64 = den: {
+        if (within_one_year) {
+            if (d1.year == d2.year) {
+                break :den if (serial_date.isLeapYear(d1.year)) 366 else 365;
+            }
+            for ([_]i32{ d1.year, d2.year }) |y| {
+                if (!serial_date.isLeapYear(y)) continue;
+                const feb29 = serial_date.serialFromDate(sys, y, 2, 29) catch continue;
+                if (feb29 >= a_days and feb29 <= b_days) break :den 366;
+            }
+            break :den 365;
+        }
+        var sum: i64 = 0;
+        var y = d1.year;
+        while (y <= d2.year) : (y += 1) {
+            sum += if (serial_date.isLeapYear(y)) 366 else 365;
+        }
+        const n_years: i64 = @as(i64, d2.year) - d1.year + 1;
+        break :den @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(n_years));
+    };
+    return arith(actual / den);
+}
+
+/// The ISO week a whole serial falls in, arithmetic run in SERIAL
+/// space: the week is the one of the serial's own Thursday, and the
+/// Thursday's weekday comes from `mondayDow` — so ISO weeks and
+/// `WEEKDAY` can never disagree about where a week starts. Null is out
+/// of domain.
+fn isoWeekOf(sys: run_inputs.DateSystem, days: i32) ?i64 {
+    const mdow: i64 = mondayDow(sys, days);
+    const thursday: i64 = @as(i64, days) - mdow + 3;
+    const min_serial: i64 = switch (sys) {
+        .d1900 => 1, // serial 0 is 1900-01-00, a day no week owns
+        .d1904 => 0,
+    };
+    if (thursday < min_serial) {
+        // The week closes the year BEFORE the epoch, whose serials do
+        // not exist: its number is that year's last — 52 for 1899
+        // (Jan 1 a Sunday), 53 for 1903 (Jan 1 a Thursday).
+        return switch (sys) {
+            .d1900 => 52,
+            .d1904 => 53,
+        };
+    }
+    const td = serial_date.dateFromSerial(sys, @intCast(thursday)) catch return null;
+    const jan1 = serial_date.serialFromDate(sys, td.year, 1, 1) catch return null;
+    return @divFloor(thursday - jan1, 7) + 1;
+}
+
+fn fnIsoWeekNum(ctx: CallCtx, args: []const Value) FnError!Value {
+    const days = wholeSerial(ctx, numArg(args, 0)) orelse return Value.err(.num);
+    const week = isoWeekOf(ctx.dateSystem(), days) orelse return Value.err(.num);
+    return Value.num(@floatFromInt(week));
+}
+
+fn fnWeekNum(ctx: CallCtx, args: []const Value) FnError!Value {
+    const days = wholeSerial(ctx, numArg(args, 0)) orelse return Value.err(.num);
+    const rt_f = @trunc(optNum(args, 1, 1));
+    if (rt_f < 1 or rt_f > 21) return Value.err(.num);
+    const rt: i64 = @intFromFloat(rt_f);
+    const sys = ctx.dateSystem();
+    // Monday-zero index of the day each return type starts its week
+    // on. System 1: week 1 is the week containing January 1st.
+    const start: i64 = switch (rt) {
+        1, 17 => 6, // Sunday
+        2, 11 => 0, // Monday
+        12 => 1,
+        13 => 2,
+        14 => 3,
+        15 => 4,
+        16 => 5,
+        21 => {
+            const week = isoWeekOf(sys, days) orelse return Value.err(.num);
+            return Value.num(@floatFromInt(week));
+        },
+        else => return Value.err(.num),
+    };
+    const d = serial_date.dateFromSerial(sys, days) catch return Value.err(.num);
+    const jan1 = serial_date.serialFromDate(sys, d.year, 1, 1) catch return Value.err(.num);
+    const w0 = @mod(@as(i64, mondayDow(sys, jan1)) - start + 7, 7);
+    return Value.num(@floatFromInt(@divFloor(@as(i64, days) - jan1 + w0, 7) + 1));
+}
+
+// ── NETWORKDAYS / WORKDAY: one weekend mask, one holiday set ──
+
+const weekend_sat_sun: u7 = (1 << 5) | (1 << 6);
+
+const WeekendArg = union(enum) { mask: u7, invalid, err: value.ScalarValue };
+
+/// The `.INTL` weekend argument: a number picks one of Excel's
+/// seventeen named weekends, a text mask spells one day at a time,
+/// Monday first. `.invalid` is `#VALUE!`.
+fn weekendArg(ctx: CallCtx, args: []const Value, i: usize) FnError!WeekendArg {
+    if (args.len <= i) return .{ .mask = weekend_sat_sun };
+    const s = try observedScalar(ctx, args[i]);
+    switch (s) {
+        // An omitted middle argument became blank; the default weekend
+        // is what it means.
+        .blank => return .{ .mask = weekend_sat_sun },
+        .err => return .{ .err = s },
+        .number => |n| {
+            const k_f = @trunc(n);
+            if (k_f >= 1 and k_f <= 7) {
+                // 1 = Saturday+Sunday, and the pair walks one day
+                // forward per code: 2 = Sunday+Monday … 7 = Friday+
+                // Saturday.
+                const k: i64 = @intFromFloat(k_f);
+                const first: u3 = @intCast(@mod(k + 4, 7));
+                const second: u3 = @intCast(@mod(@as(i64, first) + 1, 7));
+                return .{ .mask = (@as(u7, 1) << first) | (@as(u7, 1) << second) };
+            }
+            if (k_f >= 11 and k_f <= 17) {
+                // 11 = Sunday only, 12 = Monday … 17 = Saturday.
+                const k: i64 = @intFromFloat(k_f);
+                const day: u3 = @intCast(@mod(k - 12 + 7, 7));
+                return .{ .mask = @as(u7, 1) << day };
+            }
+            return .invalid;
+        },
+        .text => |t| {
+            if (t.len != 7) return .invalid;
+            var mask: u7 = 0;
+            for (t, 0..) |ch, di| switch (ch) {
+                '1' => mask |= @as(u7, 1) << @intCast(di),
+                '0' => {},
+                else => return .invalid,
+            };
+            return .{ .mask = mask };
+        },
+        .boolean => return .invalid,
+    }
+}
+
+const Holidays = union(enum) {
+    ok: []const i32,
+    bad_value,
+    bad_serial,
+    err: value.ScalarValue,
+};
+
+/// The holiday set: every numeric element's whole serial, sorted.
+/// Errors propagate, text and logicals are `#VALUE!`, an out-of-domain
+/// serial is `#NUM!`; blanks are a rectangular range's absent cells
+/// and vanish. Duplicates survive here — the counting side skips them,
+/// the walking side never counts a day twice anyway.
+fn holidaySerials(ctx: CallCtx, args: []const Value, i: usize) FnError!Holidays {
+    var list: std.ArrayListUnmanaged(i32) = .empty;
+    if (args.len > i) {
+        const g = (try gridOf(ctx, args[i])) orelse return .bad_value;
+        var r: u32 = 0;
+        while (r < g.rows) : (r += 1) {
+            var c: u32 = 0;
+            while (c < g.cols) : (c += 1) {
+                const s = g.at(r, c);
+                switch (s) {
+                    .blank => {},
+                    .err => return .{ .err = s },
+                    .number => |n| {
+                        const w = wholeSerial(ctx, n) orelse return .bad_serial;
+                        try list.append(ctx.arena(), w);
+                    },
+                    .text, .boolean => return .bad_value,
+                }
+            }
+        }
+        std.mem.sort(i32, list.items, {}, std.sort.asc(i32));
+    }
+    return .{ .ok = list.items };
+}
+
+fn sortedContains(items: []const i32, key: i32) bool {
+    var lo: usize = 0;
+    var hi: usize = items.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (items[mid] < key) lo = mid + 1 else hi = mid;
+    }
+    return lo < items.len and items[lo] == key;
+}
+
+/// Occurrences of the Monday-zero weekday `target` among the serials
+/// [lo, hi] — closed form, no walk.
+fn countDowInRange(sys: run_inputs.DateSystem, lo: i32, hi: i32, target: u3) i64 {
+    if (lo > hi) return 0;
+    const delta = @mod(@as(i64, target) - @as(i64, mondayDow(sys, lo)) + 7, 7);
+    const first = @as(i64, lo) + delta;
+    if (first > hi) return 0;
+    return @divFloor(@as(i64, hi) - first, 7) + 1;
+}
+
+fn networkdaysCount(
+    sys: run_inputs.DateSystem,
+    mask: u7,
+    start: i32,
+    end: i32,
+    holidays: []const i32,
+) i64 {
+    var lo = start;
+    var hi = end;
+    var sign: i64 = 1;
+    // A later start counts the same days backwards — Excel's sign.
+    if (lo > hi) {
+        std.mem.swap(i32, &lo, &hi);
+        sign = -1;
+    }
+    var total: i64 = 0;
+    var w: u3 = 0;
+    while (true) {
+        if (mask & (@as(u7, 1) << w) == 0) total += countDowInRange(sys, lo, hi, w);
+        if (w == 6) break;
+        w += 1;
+    }
+    // Distinct holidays inside the span, standing on workdays. The
+    // list arrives sorted, so "distinct" is one adjacent comparison.
+    var prev: ?i32 = null;
+    for (holidays) |h| {
+        const dup = prev != null and prev.? == h;
+        prev = h;
+        if (dup or h < lo or h > hi) continue;
+        if (mask & (@as(u7, 1) << mondayDow(sys, h)) == 0) total -= 1;
+    }
+    return sign * total;
+}
+
+fn fnNetworkdays(ctx: CallCtx, args: []const Value) FnError!Value {
+    const a = wholeSerial(ctx, numArg(args, 0)) orelse return Value.err(.num);
+    const b = wholeSerial(ctx, numArg(args, 1)) orelse return Value.err(.num);
+    const hol = switch (try holidaySerials(ctx, args, 2)) {
+        .ok => |h| h,
+        .bad_value => return Value.err(.value),
+        .bad_serial => return Value.err(.num),
+        .err => |e| return .{ .scalar = e },
+    };
+    return Value.num(@floatFromInt(
+        networkdaysCount(ctx.dateSystem(), weekend_sat_sun, a, b, hol),
+    ));
+}
+
+fn fnNetworkdaysIntl(ctx: CallCtx, args: []const Value) FnError!Value {
+    const a = wholeSerial(ctx, numArg(args, 0)) orelse return Value.err(.num);
+    const b = wholeSerial(ctx, numArg(args, 1)) orelse return Value.err(.num);
+    const mask = switch (try weekendArg(ctx, args, 2)) {
+        .mask => |m| m,
+        .invalid => return Value.err(.value),
+        .err => |e| return .{ .scalar = e },
+    };
+    // "1111111" is a legal weekend HERE: a week with no workdays
+    // counts zero of them. WORKDAY.INTL refuses it, because it could
+    // never arrive.
+    const hol = switch (try holidaySerials(ctx, args, 3)) {
+        .ok => |h| h,
+        .bad_value => return Value.err(.value),
+        .bad_serial => return Value.err(.num),
+        .err => |e| return .{ .scalar = e },
+    };
+    return Value.num(@floatFromInt(
+        networkdaysCount(ctx.dateSystem(), mask, a, b, hol),
+    ));
+}
+
+fn workdayWalk(
+    ctx: CallCtx,
+    mask: u7,
+    start: i32,
+    days_n: i64,
+    holidays: []const i32,
+) FnError!Value {
+    // Zero moves nowhere, weekend start included — Excel returns the
+    // start serial untouched.
+    if (days_n == 0) return Value.num(@floatFromInt(start));
+    if (mask == 0b1111111) return Value.err(.value);
+    const sys = ctx.dateSystem();
+    const max = serial_date.maxSerial(sys);
+    var cur: i64 = start;
+    var rem: i64 = if (days_n > 0) days_n else -days_n;
+    const step: i64 = if (days_n > 0) 1 else -1;
+    while (rem > 0) {
+        cur += step;
+        // Leaving the serial domain is `#NUM!`, and it bounds the walk.
+        if (cur < 0 or cur > max) return Value.err(.num);
+        const day: i32 = @intCast(cur);
+        if (mask & (@as(u7, 1) << mondayDow(sys, day)) != 0) continue;
+        if (sortedContains(holidays, day)) continue;
+        rem -= 1;
+    }
+    return Value.num(@floatFromInt(cur));
+}
+
+fn fnWorkday(ctx: CallCtx, args: []const Value) FnError!Value {
+    const start = wholeSerial(ctx, numArg(args, 0)) orelse return Value.err(.num);
+    const n_f = @trunc(numArg(args, 1));
+    const max_f: f64 = @floatFromInt(serial_date.maxSerial(ctx.dateSystem()));
+    // More steps than the domain has days can never land inside it.
+    if (@abs(n_f) > max_f) return Value.err(.num);
+    const hol = switch (try holidaySerials(ctx, args, 2)) {
+        .ok => |h| h,
+        .bad_value => return Value.err(.value),
+        .bad_serial => return Value.err(.num),
+        .err => |e| return .{ .scalar = e },
+    };
+    return workdayWalk(ctx, weekend_sat_sun, start, @intFromFloat(n_f), hol);
+}
+
+fn fnWorkdayIntl(ctx: CallCtx, args: []const Value) FnError!Value {
+    const start = wholeSerial(ctx, numArg(args, 0)) orelse return Value.err(.num);
+    const n_f = @trunc(numArg(args, 1));
+    const max_f: f64 = @floatFromInt(serial_date.maxSerial(ctx.dateSystem()));
+    if (@abs(n_f) > max_f) return Value.err(.num);
+    const mask = switch (try weekendArg(ctx, args, 2)) {
+        .mask => |m| m,
+        .invalid => return Value.err(.value),
+        .err => |e| return .{ .scalar = e },
+    };
+    const hol = switch (try holidaySerials(ctx, args, 3)) {
+        .ok => |h| h,
+        .bad_value => return Value.err(.value),
+        .bad_serial => return Value.err(.num),
+        .err => |e| return .{ .scalar = e },
+    };
+    return workdayWalk(ctx, mask, start, @intFromFloat(n_f), hol);
+}
+
 // ─── F2-DA (M7a, §5.8a) ──────────────────────────────────────────
 
 /// An optional trailing logical argument, mirroring `optNum`. A present
@@ -5701,6 +6821,64 @@ test "M8b: the row's one name is regenerated from the inventory, never from pros
     try testing.expect(counted > 0);
 }
 
+// ─── M8c: the F3 batch, against the frozen inventory ────────────
+
+test "M8c: the batch's size is regenerated from the inventory, never from prose" {
+    var it = inventory();
+    var counted: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M8c")) continue;
+        counted += 1;
+        try testing.expectEqualStrings("F3", e.batch);
+        const f = lookup(e.name) orelse {
+            std.debug.print("M8c name not registered: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        };
+        try testing.expectEqualStrings(e.name, f.name);
+    }
+    // Nineteen, counted from the file: the ladder prose folds the two
+    // `.INTL` variants into their parents and says seventeen — the TSV
+    // is the count source, and it holds one row per name.
+    try testing.expectEqual(@as(usize, 19), counted);
+}
+
+test "M8c: every F3 row declares its flags honestly" {
+    // The epoch flag follows what a function READS, not what family it
+    // is in: everything that opens the calendar or a week boundary is
+    // flagged, and the two that are pure serial or code-point
+    // arithmetic are not — DAYS is TIME's honesty (§7), and the
+    // UNICHAR/UNICODE pair is CHAR/CODE without the platform, which is
+    // the entire difference between the pairs.
+    const epoch_flagged = [_][]const u8{
+        "DAYS360",     "DATEDIF",          "YEARFRAC", "ISOWEEKNUM",   "WEEKNUM",
+        "NETWORKDAYS", "NETWORKDAYS.INTL", "WORKDAY",  "WORKDAY.INTL",
+    };
+    var it = inventory();
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M8c")) continue;
+        const f = lookup(e.name).?;
+        var expect_epoch = false;
+        for (epoch_flagged) |n| {
+            if (std.mem.eql(u8, n, e.name)) expect_epoch = true;
+        }
+        try testing.expectEqual(expect_epoch, f.epoch_sensitive);
+        try testing.expectEqual(Volatility.stable, f.volatility);
+        try testing.expect(!f.platform_sensitive);
+        // §5.4b's match-policy row, as registry data: UNICODE raw like
+        // CODE, the TEXTBEFORE family arg-selected, everything else on
+        // the default.
+        const expected_policy: value.MatchPolicy = if (std.mem.eql(u8, e.name, "UNICODE"))
+            .raw
+        else if (std.mem.eql(u8, e.name, "TEXTBEFORE") or
+            std.mem.eql(u8, e.name, "TEXTAFTER") or
+            std.mem.eql(u8, e.name, "TEXTSPLIT"))
+            .arg_selected
+        else
+            .folded;
+        try testing.expectEqual(expected_policy, f.match_policy);
+    }
+}
+
 const m7b3_milestone = "M7b3";
 const m7b3_batch = "F2-stats";
 
@@ -5753,7 +6931,7 @@ test "M7b3: the batch's size is regenerated from the inventory, never from prose
 }
 
 test "M7b3: the running total moves with the batch, counted from the file" {
-    const rows = [_][]const u8{ "M4c", "M4d", "M4e", "M4f", "M4g", "M5a2", "M7a", "M7b2", "M7b3", "M8a", "M8b" };
+    const rows = [_][]const u8{ "M4c", "M4d", "M4e", "M4f", "M4g", "M5a2", "M7a", "M7b2", "M7b3", "M8a", "M8b", "M8c" };
     var shipped: usize = 0;
     for (rows) |m| {
         var it = inventory();
@@ -5766,7 +6944,7 @@ test "M7b3: the running total moves with the batch, counted from the file" {
             shipped += 1;
         }
     }
-    try testing.expectEqual(@as(usize, 121), shipped);
+    try testing.expectEqual(@as(usize, 140), shipped);
 }
 
 test "M7b3: every F2-stats row declares all five fields, and its flags honestly" {
@@ -6204,11 +7382,12 @@ test "registry: lookup is case-insensitive and rejects unknown names" {
     try testing.expectEqualStrings("SUM", lookup("sum").?.name);
     // A name the frozen inventory holds and no row has reached yet.
     // `VLOOKUP` stood here until M4e registered it, `MEDIAN` until
-    // M7b3, `TEXT` until M8a, `PROPER` until M8b, which is what this
-    // line is for: the example has to be a function that is genuinely
-    // still ahead of the ladder, and every batch that lands moves it.
-    try testing.expect(lookup("NUMBERVALUE") == null); // frozen, M8c
-    try testing.expect(inInventory("NUMBERVALUE"));
+    // M7b3, `TEXT` until M8a, `PROPER` until M8b, `NUMBERVALUE` until
+    // M8c, which is what this line is for: the example has to be a
+    // function that is genuinely still ahead of the ladder, and every
+    // batch that lands moves it.
+    try testing.expect(lookup("PMT") == null); // frozen, M9c1
+    try testing.expect(inInventory("PMT"));
     try testing.expect(lookup("NOTAFUNCTION") == null);
 }
 

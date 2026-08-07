@@ -7754,6 +7754,251 @@ test "M8b: the evidence label on every fixture is true of the committed manifest
     try testing.expectEqual(@as(usize, 0), oracle_rows);
 }
 
+// ─── M8c: the F3 batch (§7, nineteen names counted from the TSV) ──
+
+/// The non-literal inputs: a number and a boolean for the coercion
+/// probes, two holiday serials, a text cell where a holiday range
+/// wants numbers, and the propagation probe. A1 stays blank on
+/// purpose.
+fn putM8cCells(h: *Harness) !void {
+    try h.put("B1", num(5));
+    try h.put("B2", .{ .boolean = true });
+    try h.put("C1", num(43831)); // 2020-01-01, a Wednesday
+    try h.put("C2", num(43832)); // 2020-01-02, a Thursday
+    try h.put("E1", .{ .text = "x" });
+    try h.put("F1", value.ScalarValue.errorOf(.div0));
+}
+
+const m8c_cases = [_]F2Case{
+    // ── CLEAN: the C0 filter TRIM deliberately is not ──
+    .{ .func = "CLEAN", .formula = "CLEAN(\"a\"&CHAR(10)&\"b\")", .expect = .{ .text = "ab" } },
+    .{ .func = "CLEAN", .formula = "CLEAN(CHAR(127))", .expect = .{ .text = "\x7f" }, .note = "DEL survives: Excel removes 0-31 only" },
+    .{ .func = "CLEAN", .formula = "CLEAN(B2)", .expect = .{ .text = "TRUE" }, .note = "the boolean coerces to its spelling first" },
+
+    // ── UNICHAR/UNICODE: CHAR/CODE without the code page ──
+    .{ .func = "UNICHAR", .formula = "UNICHAR(65)", .expect = .{ .text = "A" } },
+    .{ .func = "UNICHAR", .formula = "UNICHAR(956)", .expect = .{ .text = "μ" } },
+    .{ .func = "UNICHAR", .formula = "UNICHAR(128512)", .expect = .{ .text = "\u{1F600}" }, .note = "astral: the four-byte encoding CHAR can never reach" },
+    .{ .func = "UNICHAR", .formula = "UNICHAR(0)", .expect = .{ .err = .value }, .note = "no character asked for" },
+    .{ .func = "UNICHAR", .formula = "UNICHAR(1114112)", .expect = .{ .err = .value } },
+    .{ .func = "UNICHAR", .formula = "UNICHAR(55296)", .expect = .{ .err = .na }, .note = "a surrogate half is a character UTF-8 cannot hold — Excel's #N/A, not #VALUE!" },
+    .{ .func = "UNICODE", .formula = "UNICODE(\"A\")", .expect = .{ .number = 65 } },
+    .{ .func = "UNICODE", .formula = "UNICODE(\"μx\")", .expect = .{ .number = 956 }, .note = "the first code point, only" },
+    .{ .func = "UNICODE", .formula = "UNICODE(\"€\")", .expect = .{ .number = 8364 }, .note = "the other question: CODE(\"€\") answers 128, the CP-1252 position" },
+    .{ .func = "UNICODE", .formula = "UNICODE(\"\")", .expect = .{ .err = .value } },
+
+    // ── FIXED/DOLLAR: TEXT with a derived code — numfmt's digits ──
+    .{ .func = "FIXED", .formula = "FIXED(1234.567)", .expect = .{ .text = "1,234.57" } },
+    .{ .func = "FIXED", .formula = "FIXED(1234.567,1)", .expect = .{ .text = "1,234.6" } },
+    .{ .func = "FIXED", .formula = "FIXED(1234.567,-2)", .expect = .{ .text = "1,200" }, .note = "a negative count rounds left of the point, then renders whole" },
+    .{ .func = "FIXED", .formula = "FIXED(1234.567,1,TRUE)", .expect = .{ .text = "1234.6" } },
+    .{ .func = "FIXED", .formula = "FIXED(-1234.567)", .expect = .{ .text = "-1,234.57" } },
+    .{ .func = "FIXED", .formula = "FIXED(0.5,0)", .expect = .{ .text = "1" }, .note = "half away from zero — ROUND's rule, numfmt's rendering" },
+    .{ .func = "FIXED", .formula = "FIXED(5,130)", .expect = .{ .err = .value }, .note = "past the 127-place cap" },
+    .{ .func = "DOLLAR", .formula = "DOLLAR(1234.567)", .expect = .{ .text = "$1,234.57" } },
+    .{ .func = "DOLLAR", .formula = "DOLLAR(-1234.567)", .expect = .{ .text = "($1,234.57)" }, .note = "the negative section wears parentheses" },
+    .{ .func = "DOLLAR", .formula = "DOLLAR(-1234.567,-2)", .expect = .{ .text = "($1,200)" } },
+    .{ .func = "DOLLAR", .formula = "DOLLAR(0.2,1)", .expect = .{ .text = "$0.2" } },
+
+    // ── NUMBERVALUE: §5.3b's split under pinned separators ──
+    .{ .func = "NUMBERVALUE", .formula = "NUMBERVALUE(\"1,000.5\")", .expect = .{ .number = 1000.5 }, .note = "§5.4b's pinned defaults `.`/`,` — a recorded divergence from locale Excel" },
+    .{ .func = "NUMBERVALUE", .formula = "NUMBERVALUE(\"2,5\",\",\")", .expect = .{ .number = 2.5 }, .note = "an explicit decimal separator demotes the colliding DEFAULT group separator" },
+    .{ .func = "NUMBERVALUE", .formula = "NUMBERVALUE(\"2.500,27\",\",\",\".\")", .expect = .{ .number = 2500.27 } },
+    .{ .func = "NUMBERVALUE", .formula = "NUMBERVALUE(\"50\",\".\",\".\")", .expect = .{ .err = .value }, .note = "two EXPLICIT separators may not collide" },
+    .{ .func = "NUMBERVALUE", .formula = "NUMBERVALUE(\"3.5%\")", .expect = .{ .number = 0.035 } },
+    .{ .func = "NUMBERVALUE", .formula = "NUMBERVALUE(\"3.5%%\")", .expect = .{ .number = 0.00035 }, .note = "trailing percents compound" },
+    .{ .func = "NUMBERVALUE", .formula = "NUMBERVALUE(\"1 000\")", .expect = .{ .number = 1000 }, .note = "whitespace vanishes wherever it stands" },
+    .{ .func = "NUMBERVALUE", .formula = "NUMBERVALUE(\"\")", .expect = .{ .number = 0 }, .note = "the empty text is 0 — Excel's pin, nothing else parses into something" },
+    .{ .func = "NUMBERVALUE", .formula = "NUMBERVALUE(\"abc\")", .expect = .{ .err = .value } },
+    .{ .func = "NUMBERVALUE", .formula = "NUMBERVALUE(\"1.2.3\")", .expect = .{ .err = .value }, .note = "a second decimal separator" },
+    .{ .func = "NUMBERVALUE", .formula = "NUMBERVALUE(B1)", .expect = .{ .number = 5 }, .note = "a number's spelling round-trips through the text slot" },
+
+    // ── TEXTBEFORE/TEXTAFTER: one match enumerator, two cuts ──
+    .{ .func = "TEXTBEFORE", .formula = "TEXTBEFORE(\"red-blue-green\",\"-\")", .expect = .{ .text = "red" } },
+    .{ .func = "TEXTBEFORE", .formula = "TEXTBEFORE(\"red-blue-green\",\"-\",2)", .expect = .{ .text = "red-blue" } },
+    .{ .func = "TEXTBEFORE", .formula = "TEXTBEFORE(\"red-blue-green\",\"-\",-1)", .expect = .{ .text = "red-blue" }, .note = "a negative instance counts from the end" },
+    .{ .func = "TEXTBEFORE", .formula = "TEXTBEFORE(\"red-blue\",\"x\")", .expect = .{ .err = .na }, .note = "not found is #N/A — a catchable value, not a refusal" },
+    .{ .func = "TEXTBEFORE", .formula = "TEXTBEFORE(\"red-blue\",\"x\",1,0,0,\"none\")", .expect = .{ .text = "none" }, .note = "the caller's fallback returns as itself" },
+    .{ .func = "TEXTBEFORE", .formula = "TEXTBEFORE(\"saXb\",\"x\",1,1)", .expect = .{ .text = "sa" }, .note = "match_mode 1 folds — §5.4b's comparator, selected by argument" },
+    .{ .func = "TEXTBEFORE", .formula = "TEXTBEFORE(\"red\",\"-\",1,0,1)", .expect = .{ .text = "red" }, .note = "match_end appends one zero-width instance at the end" },
+    .{ .func = "TEXTBEFORE", .formula = "TEXTBEFORE(\"red\",\"-\",0)", .expect = .{ .err = .value }, .note = "instance 0" },
+    .{ .func = "TEXTBEFORE", .formula = "TEXTBEFORE(\"ab\",\"-\",5)", .expect = .{ .err = .value }, .note = "an instance past the text's length is #VALUE!, not #N/A — Excel's split" },
+    .{ .func = "TEXTBEFORE", .formula = "TEXTBEFORE(A1,\"-\")", .expect = .{ .err = .value }, .note = "a blank coerces to the empty text, whose length no instance fits" },
+    .{ .func = "TEXTAFTER", .formula = "TEXTAFTER(\"red-blue-green\",\"-\")", .expect = .{ .text = "blue-green" } },
+    .{ .func = "TEXTAFTER", .formula = "TEXTAFTER(\"red-blue-green\",\"-\",-1)", .expect = .{ .text = "green" } },
+    .{ .func = "TEXTAFTER", .formula = "TEXTAFTER(\"red\",\"-\",1,0,1)", .expect = .{ .text = "" }, .note = "after the zero-width end instance stands nothing" },
+    .{ .func = "TEXTAFTER", .formula = "TEXTAFTER(\"Jones,Bob\",\",\")", .expect = .{ .text = "Bob" } },
+
+    // ── TEXTSPLIT: the batch's one rectangle producer ──
+    .{ .func = "TEXTSPLIT", .formula = "TEXTSPLIT(\"a,b,c\",\",\")", .expect = .{ .array = .{ .rows = 1, .cols = 3, .cells = &.{ .{ .text = "a" }, .{ .text = "b" }, .{ .text = "c" } } } } },
+    .{ .func = "TEXTSPLIT", .formula = "TEXTSPLIT(\"a,b;c,d\",\",\",\";\")", .expect = .{ .array = .{ .rows = 2, .cols = 2, .cells = &.{ .{ .text = "a" }, .{ .text = "b" }, .{ .text = "c" }, .{ .text = "d" } } } } },
+    .{ .func = "TEXTSPLIT", .formula = "TEXTSPLIT(\"a,b;c\",\",\",\";\")", .expect = .{ .array = .{ .rows = 2, .cols = 2, .cells = &.{ .{ .text = "a" }, .{ .text = "b" }, .{ .text = "c" }, .{ .err = .na } } } }, .note = "a ragged row pads with #N/A — the default pad IS the error" },
+    .{ .func = "TEXTSPLIT", .formula = "TEXTSPLIT(\"a,b;c\",\",\",\";\",FALSE,0,\"x\")", .expect = .{ .array = .{ .rows = 2, .cols = 2, .cells = &.{ .{ .text = "a" }, .{ .text = "b" }, .{ .text = "c" }, .{ .text = "x" } } } } },
+    .{ .func = "TEXTSPLIT", .formula = "TEXTSPLIT(\"a,,c\",\",\")", .expect = .{ .array = .{ .rows = 1, .cols = 3, .cells = &.{ .{ .text = "a" }, .{ .text = "" }, .{ .text = "c" } } } } },
+    .{ .func = "TEXTSPLIT", .formula = "TEXTSPLIT(\"a,,c\",\",\",,TRUE)", .expect = .{ .array = .{ .rows = 1, .cols = 2, .cells = &.{ .{ .text = "a" }, .{ .text = "c" } } } }, .note = "ignore_empty drops the field, and with it the delimiter's position" },
+    .{ .func = "TEXTSPLIT", .formula = "TEXTSPLIT(\"a;b\",,\";\")", .expect = .{ .array = .{ .rows = 2, .cols = 1, .cells = &.{ .{ .text = "a" }, .{ .text = "b" } } } }, .note = "an empty column delimiter beside a real row one means rows-only" },
+    .{ .func = "TEXTSPLIT", .formula = "TEXTSPLIT(\"aXbxc\",\"x\",,FALSE,1)", .expect = .{ .array = .{ .rows = 1, .cols = 3, .cells = &.{ .{ .text = "a" }, .{ .text = "b" }, .{ .text = "c" } } } }, .note = "the folded delimiter matches both cases" },
+    .{ .func = "TEXTSPLIT", .formula = "TEXTSPLIT(\"ab\",\"\")", .expect = .{ .err = .value }, .note = "both delimiters absent leaves nothing to split by" },
+
+    // ── DAYS: serial subtraction, end first ──
+    .{ .func = "DAYS", .formula = "DAYS(DATE(2020,1,31),DATE(2020,1,1))", .expect = .{ .number = 30 } },
+    .{ .func = "DAYS", .formula = "DAYS(DATE(2020,1,1),DATE(2020,1,31))", .expect = .{ .number = -30 } },
+    .{ .func = "DAYS", .formula = "DAYS(F1,DATE(2020,1,1))", .expect = .{ .err = .div0 }, .note = "errors propagate before any arithmetic" },
+
+    // ── DAYS360: one 30/360 table, two variants ──
+    .{ .func = "DAYS360", .formula = "DAYS360(DATE(2020,1,15),DATE(2020,3,31))", .expect = .{ .number = 76 }, .note = "US: an end-31 after a start below 30 stands — the 1st-of-next-month clause, arithmetically" },
+    .{ .func = "DAYS360", .formula = "DAYS360(DATE(2020,1,15),DATE(2020,3,31),TRUE)", .expect = .{ .number = 75 }, .note = "European: every 31 becomes 30" },
+    .{ .func = "DAYS360", .formula = "DAYS360(DATE(2020,2,29),DATE(2020,3,31))", .expect = .{ .number = 30 }, .note = "a start on February's last day counts as the 30th" },
+    .{ .func = "DAYS360", .formula = "DAYS360(DATE(2020,3,31),DATE(2020,1,15))", .expect = .{ .number = -75 }, .note = "a later start counts negative through the same POSITIONAL table — the 31 now sits on the start side, so this is not a sign-flipped 76" },
+
+    // ── DATEDIF: six units over one month borrow ──
+    .{ .func = "DATEDIF", .formula = "DATEDIF(DATE(2019,1,15),DATE(2020,3,10),\"Y\")", .expect = .{ .number = 1 } },
+    .{ .func = "DATEDIF", .formula = "DATEDIF(DATE(2019,1,15),DATE(2020,3,10),\"M\")", .expect = .{ .number = 13 }, .note = "the borrow: day 10 has not reached day 15" },
+    .{ .func = "DATEDIF", .formula = "DATEDIF(DATE(2019,1,15),DATE(2020,3,10),\"D\")", .expect = .{ .number = 420 }, .note = "serial subtraction, like DAYS — not a calendar walk" },
+    .{ .func = "DATEDIF", .formula = "DATEDIF(DATE(2019,1,15),DATE(2020,3,10),\"ym\")", .expect = .{ .number = 1 }, .note = "the unit folds case" },
+    .{ .func = "DATEDIF", .formula = "DATEDIF(DATE(2019,1,15),DATE(2020,3,10),\"MD\")", .expect = .{ .number = 24 }, .note = "Excel's own borrow: the month BEFORE the end date — leap February here" },
+    .{ .func = "DATEDIF", .formula = "DATEDIF(DATE(2019,1,15),DATE(2020,3,10),\"YD\")", .expect = .{ .number = 55 } },
+    .{ .func = "DATEDIF", .formula = "DATEDIF(DATE(2020,3,10),DATE(2019,1,15),\"D\")", .expect = .{ .err = .num }, .note = "a later start is #NUM!, never a negative" },
+    .{ .func = "DATEDIF", .formula = "DATEDIF(DATE(2019,1,15),DATE(2020,3,10),\"X\")", .expect = .{ .err = .num } },
+
+    // ── YEARFRAC: five bases, endpoints self-ordering ──
+    .{ .func = "YEARFRAC", .formula = "YEARFRAC(DATE(2020,1,15),DATE(2020,3,31),0)", .expect = .{ .number = 76.0 / 360.0 }, .note = "basis 0 reads the SAME table DAYS360's US arm does" },
+    .{ .func = "YEARFRAC", .formula = "YEARFRAC(DATE(2020,1,15),DATE(2020,3,31),4)", .expect = .{ .number = 75.0 / 360.0 } },
+    .{ .func = "YEARFRAC", .formula = "YEARFRAC(DATE(2020,1,1),DATE(2020,7,1),2)", .expect = .{ .number = 182.0 / 360.0 } },
+    .{ .func = "YEARFRAC", .formula = "YEARFRAC(DATE(2020,1,1),DATE(2020,7,1),3)", .expect = .{ .number = 182.0 / 365.0 } },
+    .{ .func = "YEARFRAC", .formula = "YEARFRAC(DATE(2020,1,1),DATE(2021,1,1),1)", .expect = .{ .number = 1 }, .note = "actual/actual: the interval crosses Feb 29 2020, so both sides say 366" },
+    .{ .func = "YEARFRAC", .formula = "YEARFRAC(DATE(2019,1,1),DATE(2020,1,1),1)", .expect = .{ .number = 1 }, .note = "and this one crosses no leap day, so both sides say 365" },
+    .{ .func = "YEARFRAC", .formula = "YEARFRAC(DATE(2019,1,1),DATE(2021,7,1),1)", .expect = .{ .number = 912.0 / (1096.0 / 3.0) }, .note = "past one year the denominator is the average of every year touched" },
+    .{ .func = "YEARFRAC", .formula = "YEARFRAC(DATE(2020,7,1),DATE(2020,1,1),2)", .expect = .{ .number = 182.0 / 360.0 }, .note = "Excel orders the endpoints itself" },
+    .{ .func = "YEARFRAC", .formula = "YEARFRAC(DATE(2020,1,1),DATE(2020,7,1),5)", .expect = .{ .err = .num } },
+
+    // ── ISOWEEKNUM / WEEKNUM: weeks counted over serials ──
+    .{ .func = "ISOWEEKNUM", .formula = "ISOWEEKNUM(DATE(2020,1,1))", .expect = .{ .number = 1 } },
+    .{ .func = "ISOWEEKNUM", .formula = "ISOWEEKNUM(DATE(2021,1,1))", .expect = .{ .number = 53 }, .note = "2020 has 53 ISO weeks and January 1st still belongs to them" },
+    .{ .func = "ISOWEEKNUM", .formula = "ISOWEEKNUM(DATE(2023,1,1))", .expect = .{ .number = 52 }, .note = "a Sunday belongs to the closing week of the OLD ISO year" },
+    .{ .func = "WEEKNUM", .formula = "WEEKNUM(DATE(2020,1,1))", .expect = .{ .number = 1 } },
+    .{ .func = "WEEKNUM", .formula = "WEEKNUM(DATE(2020,1,5))", .expect = .{ .number = 2 }, .note = "system 1: a Sunday opens the next week under the default return type" },
+    .{ .func = "WEEKNUM", .formula = "WEEKNUM(DATE(2020,1,5),2)", .expect = .{ .number = 1 }, .note = "Monday-start: the same Sunday still closes week 1" },
+    .{ .func = "WEEKNUM", .formula = "WEEKNUM(DATE(2020,1,6),2)", .expect = .{ .number = 2 } },
+    .{ .func = "WEEKNUM", .formula = "WEEKNUM(DATE(2023,1,1),21)", .expect = .{ .number = 52 }, .note = "return type 21 IS the ISO week" },
+    .{ .func = "WEEKNUM", .formula = "WEEKNUM(DATE(2020,1,1),3)", .expect = .{ .err = .num }, .note = "3 names no week system" },
+
+    // ── NETWORKDAYS(.INTL): the closed-form count ──
+    .{ .func = "NETWORKDAYS", .formula = "NETWORKDAYS(DATE(2020,1,1),DATE(2020,1,31))", .expect = .{ .number = 23 } },
+    .{ .func = "NETWORKDAYS", .formula = "NETWORKDAYS(DATE(2020,1,31),DATE(2020,1,1))", .expect = .{ .number = -23 }, .note = "a later start counts the same days, negative" },
+    .{ .func = "NETWORKDAYS", .formula = "NETWORKDAYS(DATE(2020,1,1),DATE(2020,1,31),C1)", .expect = .{ .number = 22 }, .note = "a holiday on a workday leaves the count" },
+    .{ .func = "NETWORKDAYS", .formula = "NETWORKDAYS(DATE(2020,1,1),DATE(2020,1,31),E1)", .expect = .{ .err = .value }, .note = "a text holiday is #VALUE!" },
+    .{ .func = "NETWORKDAYS", .formula = "NETWORKDAYS(DATE(2020,1,1),DATE(2020,1,31),F1)", .expect = .{ .err = .div0 }, .note = "an error in the holiday set propagates" },
+    .{ .func = "NETWORKDAYS.INTL", .formula = "NETWORKDAYS.INTL(DATE(2020,1,1),DATE(2020,1,31),11)", .expect = .{ .number = 27 }, .note = "weekend 11: Sundays only" },
+    .{ .func = "NETWORKDAYS.INTL", .formula = "NETWORKDAYS.INTL(DATE(2020,1,1),DATE(2020,1,31),\"0000011\")", .expect = .{ .number = 23 }, .note = "the mask spelling of the default weekend" },
+    .{ .func = "NETWORKDAYS.INTL", .formula = "NETWORKDAYS.INTL(DATE(2020,1,1),DATE(2020,1,31),\"1111111\")", .expect = .{ .number = 0 }, .note = "a week with no workdays counts zero of them — legal HERE" },
+    .{ .func = "NETWORKDAYS.INTL", .formula = "NETWORKDAYS.INTL(DATE(2020,1,1),DATE(2020,1,31),8)", .expect = .{ .err = .value } },
+
+    // ── WORKDAY(.INTL): the bounded walk ──
+    .{ .func = "WORKDAY", .formula = "WORKDAY(DATE(2020,1,1),3)", .expect = .{ .number = 43836 }, .note = "Thu, Fri, then over the weekend to Monday the 6th" },
+    .{ .func = "WORKDAY", .formula = "WORKDAY(DATE(2020,1,1),0)", .expect = .{ .number = 43831 }, .note = "zero moves nowhere" },
+    .{ .func = "WORKDAY", .formula = "WORKDAY(DATE(2020,1,6),-1)", .expect = .{ .number = 43833 }, .note = "backwards over the weekend to Friday the 3rd" },
+    .{ .func = "WORKDAY", .formula = "WORKDAY(DATE(2020,1,1),1,C2)", .expect = .{ .number = 43833 }, .note = "the holiday pushes Thursday to Friday" },
+    .{ .func = "WORKDAY.INTL", .formula = "WORKDAY.INTL(DATE(2020,1,4),1,11)", .expect = .{ .number = 43836 }, .note = "Sunday-only weekend: Saturday counts, Sunday does not" },
+    .{ .func = "WORKDAY.INTL", .formula = "WORKDAY.INTL(DATE(2020,1,1),1,\"1111111\")", .expect = .{ .err = .value }, .note = "an all-weekend mask can never arrive — #VALUE! here, unlike the count" },
+};
+
+test "M8c: every F3 fixture evaluates to what the spec says" {
+    for (m8c_cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putM8cCells(&h);
+
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("M8c case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectValue(c.expect, v) catch |e| {
+            std.debug.print("M8c case `{s}` ({s})\n", .{ c.formula, c.note });
+            return e;
+        };
+    }
+}
+
+test "M8c: every frozen name resolves, and each fixture stays in the batch" {
+    var it = registry.inventory();
+    var batch: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M8c")) continue;
+        batch += 1;
+        if (registry.lookup(e.name) == null) return error.UnregisteredBatchFunction;
+        var fixtures: usize = 0;
+        for (m8c_cases) |c| {
+            if (std.mem.eql(u8, c.func, e.name)) fixtures += 1;
+        }
+        if (fixtures == 0) {
+            std.debug.print("M8c name unfixtured: {s}\n", .{e.name});
+            return error.UnfixturedBatchFunction;
+        }
+    }
+    // Nineteen — counted from the TSV, never from the ladder prose,
+    // which folds the `.INTL` variants into their parents.
+    try testing.expectEqual(@as(usize, 19), batch);
+    // The reverse direction: no fixture may claim a name outside the
+    // batch.
+    for (m8c_cases) |c| {
+        var it2 = registry.inventory();
+        var found = false;
+        while (it2.next()) |e| {
+            if (std.mem.eql(u8, e.milestone, "M8c") and std.mem.eql(u8, e.name, c.func)) found = true;
+        }
+        try testing.expect(found);
+    }
+}
+
+test "M8c: the evidence label on every fixture is true of the committed manifests" {
+    var oracle_rows: usize = 0;
+    for (m8c_cases) |c| {
+        switch (try manifestVerdict(c.formula)) {
+            .decided => {
+                if (c.evidence != .oracle) return error.UnderstatedEvidence;
+                oracle_rows += 1;
+            },
+            .excluded => return error.ExcludedCellClaimedAsEvidence,
+            .silent => {
+                if (c.evidence != .spec_pinned) return error.UnbackedOracleClaim;
+            },
+        }
+    }
+    // The committed manifests predate F3; the parked Excel leg (§8.2)
+    // is what would move this count.
+    try testing.expectEqual(@as(usize, 0), oracle_rows);
+}
+
+test "M8c: the NUMBERVALUE refusal rides §5.3b's plane, and is not catchable" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+
+    // A spelling that is numeric only under some locale's convention
+    // is the typed refusal VALUE ships — inherited, not redefined.
+    try testing.expectError(error.LocaleSensitiveInput, h.eval("NUMBERVALUE(\"€5\")"));
+    try testing.expectError(error.LocaleSensitiveInput, h.eval("IFERROR(NUMBERVALUE(\"€5\"),0)"));
+}
+
+test "M8c: the 1904 phase reaches the week functions" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+    var opts = h.options();
+    opts.date_system = .d1904;
+
+    // Serial 0 is 1904-01-01, a Friday; serial 2 is the Sunday that
+    // opens week 2 under the default Sunday-start.
+    const wk = try h.evalOpts("WEEKNUM(2,1)", opts);
+    try testing.expectEqual(@as(f64, 2), wk.scalar.number);
+    // Serial 0's ISO week is the one Thursday 1903-12-31 owns — the
+    // 53rd of a year whose serials do not exist.
+    const iso = try h.evalOpts("ISOWEEKNUM(0)", opts);
+    try testing.expectEqual(@as(f64, 53), iso.scalar.number);
+}
+
 test "refusals: an unregistered call refuses, an unresolvable name is #NAME?" {
     var h: Harness = undefined;
     try h.init(testing.allocator);
@@ -7761,11 +8006,11 @@ test "refusals: an unregistered call refuses, an unresolvable name is #NAME?" {
 
     // §7: unregistered calls refuse rather than inventing `#NAME?` for a
     // function zlsx simply does not implement.
-    // `NUMBERVALUE` is frozen in the inventory for M8c and
-    // unregistered today; `VLOOKUP` stood here until M4e registered
-    // it, `SUMIFS` until M7b2, `MEDIAN` until M7b3, `TEXT` until M8a,
-    // `PROPER` until M8b.
-    try testing.expectError(error.UnsupportedFunction, h.eval("NUMBERVALUE(A1)"));
+    // `PMT` is frozen in the inventory for M9c1 and unregistered
+    // today; `VLOOKUP` stood here until M4e registered it, `SUMIFS`
+    // until M7b2, `MEDIAN` until M7b3, `TEXT` until M8a, `PROPER`
+    // until M8b, `NUMBERVALUE` until M8c.
+    try testing.expectError(error.UnsupportedFunction, h.eval("PMT(A1)"));
     try testing.expectError(error.UnsupportedFunction, h.eval("NOTAFUNCTION()"));
     // §5.9: a value-position name that provably resolves nowhere is a
     // plane-1 `#NAME?`, which is a successful result.

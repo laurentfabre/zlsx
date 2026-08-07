@@ -2364,6 +2364,127 @@ learned where words begin.
     canonical unregistered in the four pinned places PROPER vacated
     (registry, eval, workbook ×2) with the running total moved to 121.
 
+**M8c decisions (shipped 2026-08-07).** Thirteen points, in
+`registry.zig` (nineteen rows and their implementations), `eval.zig`
+(the batch fixtures and their evidence check), and `tests/bench/`
+(the §9 TEXT-heavy workload). The row where the batch size itself was
+the first decision.
+
+1. **Nineteen, counted from the TSV.** The ladder prose says
+    seventeen because it folds `NETWORKDAYS.INTL` and `WORKDAY.INTL`
+    into their parents; the frozen inventory holds one row per name
+    and the batch test regenerates 19 from it — the count source §7
+    names, doing exactly the job it was frozen for. Running total 140.
+2. **Weekdays are counted over SERIALS, batch-wide.** One
+    `mondayDow` restates `WEEKDAY`'s phase arithmetic (M4g decision
+    1), and every M8c function that asks what day a serial is —
+    ISOWEEKNUM, WEEKNUM, both NETWORKDAYS, both WORKDAY — reads it,
+    so none of them can disagree with `WEEKDAY` about where a week
+    starts. ISO weeks run in serial space too: the week is the
+    serial's own Thursday's, and a Thursday below the epoch's first
+    serial closes the year BEFORE the epoch — pinned 52 under 1900
+    (1899 opened on a Sunday) and 53 under 1904 (1903 on a Thursday).
+    Below serial 61 all of this diverges from the proleptic calendar
+    exactly as `WEEKDAY` does, deliberately and everywhere at once.
+3. **FIXED and DOLLAR are TEXT with a derived code.** M8a's "one
+    derivation, byte-proven" carried forward: both build a
+    `numfmt_v1` code ("#,##0" + zeros) and render through the one
+    renderer, so no second formatter's digits can disagree with
+    `TEXT`'s. A negative decimals count folds into the VALUE by
+    ROUND's own `.half_away` before the code is built — the grammar
+    has no token for a negative place. DOLLAR renders |x| under the
+    single positive section and wraps the parentheses itself, which
+    keeps the derived code short of `max_format_chars` at every legal
+    decimals count (a two-section spelling would not be at 127).
+    Past 127 places both answer Excel's `#VALUE!`.
+4. **NUMBERVALUE inherits §5.3b's three-way split, and its
+    separators are arguments about the split.** The normalized
+    spelling (whitespace gone everywhere, group separators stripped
+    left of the decimal, the decimal become `.`, trailing percents
+    counted) goes through the SAME `parseDecimal` VALUE uses: numeric
+    → number, non-numeric → `#VALUE!`, numeric-only-under-some-locale
+    → the typed refusal (`NUMBERVALUE("€5")` refuses, uncatchable,
+    fixtured). Omitted separators default to `.`/`,` — §5.4b's pin,
+    a recorded divergence from locale Excel — and an explicit decimal
+    separator that collides with the DEFAULT group separator demotes
+    the default to "no grouping" (`NUMBERVALUE("2,5",",")` is 2.5,
+    the function's whole reason to exist), while two EXPLICIT
+    colliding separators are `#VALUE!`. The empty text is 0.
+5. **The TEXTBEFORE family shares one literal-match enumerator, and
+    its failure planes are Excel's split.** `#VALUE!` for an empty
+    delimiter, instance 0, or an instance past the text's own length;
+    `#N/A` — a catchable value — for a delimiter merely not found at
+    the asked instance, unless the caller's `if_not_found` stands in.
+    `match_end` appends one zero-width instance at the end of the
+    text, both directions. `match_mode` 1 selects §5.4b's comparator
+    through `criteria.fold`'s positional map — a folded hit that
+    begins or ends inside an expansion has not matched whole
+    characters and does not count — which is the `.arg_selected`
+    match policy the registry row declares.
+6. **TEXTSPLIT's pad is used AS an element, never propagated.** Its
+    default IS `#N/A` — what a ragged split's missing cells answer —
+    so an explicit error pad fills cells the same way. An empty
+    delimiter beside a real one means "no split on this axis"
+    (`TEXTSPLIT(text,,";")` spells rows-only); both delimiters absent
+    is `#VALUE!`; `ignore_empty` drops empty fields on both axes and
+    a row with nothing left is not a row; everything dropped is the
+    empty rectangle, `#CALC!` like every empty DA result.
+7. **UNICHAR/UNICODE complete M4f's pair by having no flags.** Same
+    shapes as CHAR/CODE, no `platform_sensitive` — a Unicode scalar
+    is the same character on every platform, which IS the difference
+    between the pairs (M4f decision 12's other half). The failure
+    split is Excel's: zero and the supra-Unicode range ask for no
+    character (`#VALUE!`), a surrogate half asks for one UTF-8 cannot
+    hold (`#N/A`). UNICODE is `.raw` like CODE.
+8. **One weekend mask, one holiday set.** The `.INTL` weekend
+    argument is a Monday-first 7-bit set built from Excel's number
+    codes (1–7 walking pairs, 11–17 single days) or a 7-character
+    `"0000011"` text mask; NETWORKDAYS is the `.INTL` machinery under
+    the Saturday+Sunday constant. `"1111111"` is legal for the count
+    — a week with no workdays counts zero — and `#VALUE!` for the
+    walk, which could never arrive. Holidays fold once: errors
+    propagate, text and logicals are `#VALUE!`, out-of-domain serials
+    `#NUM!`, blanks vanish; the count deduplicates by adjacency in
+    the sorted set and counts weekday occurrences in closed form (no
+    walk), while WORKDAY's walk is bounded by the serial domain and
+    steps past more days than the domain holds refuse `#NUM!` before
+    walking anywhere.
+9. **DAYS360 and YEARFRAC's 30/360 bases read ONE table.** The US
+    arm is OpenFormula's NASD statement — Excel's "ending date
+    becomes the 1st of the next month" prose is arithmetic-identical
+    to leaving a 31 in place, so the shorter rule is the one written,
+    pinned pending the oracle leg. YEARFRAC orders its endpoints
+    itself (never negative) where DAYS360 keeps the sign; basis 1's
+    denominator is 366 within one nominal year exactly when the
+    closed interval touches a Feb 29, and the average length of every
+    year touched past that. DATEDIF keeps Excel's quirks by name:
+    `"D"` is serial subtraction like DAYS, `"MD"` borrows the length
+    of the month before the end date (leap February included), a
+    later start is `#NUM!`, the unit folds ASCII case.
+10. **The epoch flag follows what a function READS.** DAYS is serial
+    subtraction — the same number under either epoch — so it is
+    unflagged like TIME (§7's honesty), though its DOMAIN is still
+    checked under the active system, like the clock functions.
+    Everything that opens the calendar or a week boundary is flagged.
+11. **`PMT` promoted canonical unregistered** in the four pinned
+    places NUMBERVALUE vacated (registry, eval, workbook ×2) — the
+    first name of M9c1's frozen list, the next row that registers.
+12. **The §9 TEXT-heavy bench exists now** (`synth_text_mix`,
+    digest-pinned at its identity size): six row-local text formulas
+    per data row — PROPER over TRIM, TEXTBEFORE raw, TEXTAFTER
+    folded, NUMBERVALUE, FIXED and DOLLAR through numfmt — so the
+    formula count scales WITH the data and the two sizes state the
+    marginal per-row cost of the text stack. Recorded in §9.1;
+    the M8a deferral (decision 14) closes here.
+13. **Evidence at zero, a third time.** The committed manifests
+    predate F3: every fixture ships `spec_pinned`, the three-valued
+    checker guards the label in both directions, and the oracle-row
+    count is pinned at 0. The parked Excel leg (§8.2 — quit `Book1`,
+    run `scripts/oracle/regenerate.sh`) is the one thing that moves
+    it, and the NASD 30/360 pins, the TEXTBEFORE empty-delimiter
+    `#VALUE!`, and NUMBERVALUE's separator-demotion rule are the
+    fixtures that leg would test first.
+
 ### 5.9 Name & identifier resolution
 
 Call position → strip layered prefixes → registry; unregistered →
@@ -2609,7 +2730,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M7c** ✅ | `FormulaWrite` authoring (§5.8c, **Zig-only**, `zlsx_recalc.FormulaWrite`): `.scalar` live end-to-end on ONE new approved mutation (`f_insert` at `CT_Cell`'s first-child point; self-closing rides the reopen; existing-`<f>` targets refuse — `spans.f` stays `f@ref`-only); `.dynamic_array`/`.cse` authoring extend `spill_transitions` through the table's own seam (`da_author_spill`, `da_author_blocked`, `cse_author`), each refusing `transition_unproven` naming its row — the surfaced park; DA rows flip only WITH the part-graph builder the reference set brings; CSE builder proven via the injected seam, canonical `ref` spelling | Scalar byte-diff round-trip (write → save → re-open → evaluate agrees) + table-derived refusal enumeration (exhaustive over `Id`, compile-enforced); Excel-opens-clean per authoring row **runs as each reference lands** |
 | **M8a** ✅ | **`numfmt_v1` versioned grammar + support matrix FIRST** (`src/formula/numfmt.zig`): 42 constructs, one matrix row each — 35 rendered byte-exact, 7 refusing by name (`[$-LCID≠409]`, LCID calendar/shaping flag bits, DBNum/NatNum, era `g`/`e`, Buddhist `b`, localized-weekday `aaa`) — `refusedConstructs()` the derived park list, count pinned. Renderer over the rendered rows: sections ≤4 + conditions, grouping/scale/percent, scientific incl. the engineering step, fractions by continued-fraction search, dates/elapsed/subsecond over `serial_date`, the en-US tables `[$-409]` licenses. **TEXT registered over it and `Workbook.formatCellValue` beside it — ONE derivation, byte-proven**; grammar refusals ride their own planes through TEXT (never a fabricated `#VALUE!`); `PROPER` promoted canonical unregistered; the date-detection heuristic's callers untouched — they flip through `Format.describesDate` at a later row | Format fuzz; TEXT matrix **derived from the support matrix**; per-row grammar fixtures |
 | **M8b** ✅ | **PROPER over `casing_v1` — word segmentation decides WHICH scalars title-case, the M4f tables decide what title-casing IS** (`unicode/casing.zig` `toProper`; `fnProper` is a one-line delegation, so no second caller can disagree about either half). No second casing table: the segmenter reads the SAME `cased`/`case_ignorable` intervals Final_Sigma shipped — `beginsWord` is that backward walk pointed at the start of the word. The invariant boundary rule, pinned: a cased scalar title-cases when the nearest preceding non-case-ignorable scalar is absent or not cased, lowercases otherwise (Final_Sigma included); case-ignorables are transparent; every other non-cased scalar ends the word. Recorded spec_pinned divergences pending the parked oracle leg (§8.2): `don't`→`Don't` where Excel answers `Don'T` (`'` `.` `:` are Case_Ignorable), and uncased letters (Hebrew/CJK) end words — Alphabetic would be a second table. `NUMBERVALUE` promoted canonical unregistered | Segmentation fixtures byte-exact at both seams (ASCII, apostrophes, digits, combining marks, astral); evidence manifest-checked at 0 oracle rows |
-| **M8c** | F3 batch (NUMBERVALUE, FIXED, DOLLAR, CLEAN, UNICHAR, UNICODE, TEXTBEFORE, TEXTAFTER, TEXTSPLIT; NETWORKDAYS(.INTL), WORKDAY(.INTL), DATEDIF, DAYS, DAYS360, YEARFRAC, ISOWEEKNUM, WEEKNUM) | Oracle-first |
+| **M8c** ✅ | F3 batch (NUMBERVALUE, FIXED, DOLLAR, CLEAN, UNICHAR, UNICODE, TEXTBEFORE, TEXTAFTER, TEXTSPLIT; NETWORKDAYS(.INTL), WORKDAY(.INTL), DATEDIF, DAYS, DAYS360, YEARFRAC, ISOWEEKNUM, WEEKNUM — **19 rows counted from the TSV**, the prose folds the `.INTL` variants). The text half rides the layers earlier rows built — `numfmt_v1` renders FIXED/DOLLAR through ONE derived code, §5.3b's three-way split parses NUMBERVALUE (pinned `.`/`,` defaults, explicit-vs-default separator demotion), `criteria.fold`'s positional map matches the TEXTBEFORE family under `.arg_selected`, TEXTSPLIT is the batch's rectangle producer whose default pad IS `#N/A` — and the date half rides `serial_date` with **weekdays counted over SERIALS batch-wide** (one `mondayDow`, M4g decision 1 applied to ISO weeks, week numbers, and both weekend engines; one 30/360 table under DAYS360 and YEARFRAC's bases 0/4). `PMT` promoted canonical unregistered; running total 140 | Oracle-first (manifests predate F3 → every fixture spec_pinned, checker two-directional, 0 oracle rows pinned; the parked §8.2 Excel leg is what moves it); **TEXT-heavy bench (§9.1) recorded** — `synth_text_mix` digest-pinned, marginal per-row cost stated across two sizes |
 | **M9a1** | C ABI part 1: `zlsx_status_v1` + descriptor types + editor recalc/evaluate + release fns + **`zlsx_engine_fingerprint()` export (header + `_HAS_FINGERPRINT` probe — M9b depends on it)** + **`zlsx_editor_mark_recalc_on_load` (header + `_HAS_MARK_RECALC` probe + old-dylib skip)** + narrowing tests + design note | 3-file txn; probes; ABI fuzz |
 | **M9a2** | C ABI part 2: `save_to_buffer`, `open_buffer`, writer exports (incl. `…_with_formulas_v2` dialect) + Python Editor/Writer methods + `finally` cleanup | 3-file txn; probes; boundary tests |
 | **M9b** | Spark batch recalc: `zlsx.recalc` activation, read-only guarantee, digest-verified partitions, driver-inference-on-recalced-snapshot, per-executor digest-keyed cache note, retry tests, streaming refusal | Integration; retries; serverless verification |
@@ -4681,6 +4802,39 @@ degraded to a per-coordinate walk would show up here as a ~100× cliff
 before any correctness test noticed. Per formula that is ~235 µs (tiny)
 against ~2.70 ms (small) — ~2.6 whole-column areas per formula, ~100 ns
 per stored position visited.
+
+**M8c — the TEXT lanes** (`feat/m8c-f3`, same host, same methodology,
+recorded 2026-08-07; workload `synth_text_mix` at its recorded digest —
+six row-local text formulas per data row: PROPER over TRIM, TEXTBEFORE
+raw, TEXTAFTER folded, NUMBERVALUE, FIXED and DOLLAR through numfmt —
+so the formula count scales WITH the data, the opposite of the criteria
+fixture's fixed report). The baseline JSON is
+`tests/bench/baseline_m8c_text.json`; the F1-mix AND criteria lanes
+re-ran in the same session and both
+`compare_bench.py --gate` comparisons stayed green (every lane at or
+under its recorded median), which is the "beside, not instead" half of
+this row's gate.
+
+| Workload | Stored cells | Formula cells | `open` | `recalc` | `save` | p95 (`recalc`) | σ (`recalc`) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `text_mix_tiny` | 9 000 | 6 000 | 1.46 ms | 41.87 ms | 41.93 ms | 42.46 ms | 0.45 ms |
+| `text_mix_small` | 90 000 | 60 000 | 1.48 ms | 423.54 ms | 425.86 ms | 427.02 ms | 1.88 ms |
+
+**Read it as follows — marginal cost, not fixed cost.** The formula
+count scales ×10 with the rows and evaluate (= recalc − open: 40.4 ms
+and 422.1 ms) follows at **×10.45** — the marginal cost of one more
+text formula is `(423.54 − 41.87) / 54 000 ≈ 7.1 µs`, and the
+extrapolated fixed cost at zero rows is within noise of zero, so the
+text stack pays essentially nothing once and ~7 µs per formula cell
+(~42 µs per six-formula row). That 7 µs buys, per row: one
+`casing_v1` segmentation walk over a padded mixed-case name (`'`, `-`,
+`ß` and an uncased CJK tail included), one raw and one FOLDED literal
+match through `criteria.fold`'s positional map, one §5.3b three-way
+parse over a grouped/percent/padded spelling, and two `numfmt_v1`
+renders through derived codes. The lane exists so a later change to
+any of those layers — a fold that starts allocating per code point, a
+renderer that re-parses its code per call — shows up as a slope change
+here before any correctness test notices.
 
 ---
 
