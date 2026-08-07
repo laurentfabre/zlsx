@@ -153,6 +153,14 @@ pub const EvalError = error{
     ResultNotRepresentable,
     /// Any §9 limit.
     LimitExceeded,
+    /// The caller's token or deadline, observed at one of the engine's
+    /// own poll points (M9c1: the `WorkBudget` stride, a solver
+    /// iteration). Before that row the engine had no poll point and
+    /// cancellation was the *driver's* — the per-cell check in
+    /// `pkg/recalc_run.zig` — which cannot see into a 128-iteration
+    /// solve inside one cell. Distinct from `LimitExceeded` because
+    /// only one of them is a property of the formula.
+    Cancelled,
 } || env.Error;
 
 /// The §10 plane-2 error a refusal raises. Exhaustive by construction —
@@ -166,6 +174,13 @@ pub fn planeTwo(e: EvalError) parser.PlaneTwo {
         error.AnchorRequired => .FormulaAnchorRequired,
         error.ResultNotRepresentable => .FormulaResultNotRepresentable,
         error.LimitExceeded => .FormulaLimitExceeded,
+        // The plane a cancelled run wears if a caller flattens it —
+        // the same mapping the recalc driver already made for its
+        // per-cell poll. A driver that armed the poller distinguishes
+        // on the error itself, before any plane conversion; the plane
+        // exists so an unwitting `planeTwo` caller stays exhaustive
+        // without inventing a new §10 refusal for a non-result.
+        error.Cancelled => .FormulaLimitExceeded,
         // The environment's failures are invariant violations by the
         // time they reach here: the evaluator only ever builds a
         // `SheetIndex` from `resolveSheet`, and it converts shape and
@@ -394,6 +409,16 @@ pub const Options = struct {
     /// what the allocator could only call `OutOfMemory` into the typed
     /// `FormulaLimitExceeded` the caller asked for.
     budget: ?*run_inputs.Budget = null,
+    /// M9c1's shared work meter — nodes and solver iterations on ONE
+    /// budget, with §5.5's work-unit poll stride inside it. Optional
+    /// for the same reason `budget` is: a budget is a policy. When
+    /// wired, `evalNode` charges one unit per node and every solver
+    /// iteration charges four through the same pointer, which is what
+    /// makes "combined exhaustion" a property of the meter rather than
+    /// of any caller's bookkeeping. Engine-level in v1: the workbook
+    /// and C layers gain their knobs on the row that can also carry
+    /// the report fields (the C ABI is frozen at M9a1).
+    work: ?*run_inputs.WorkBudget = null,
 };
 
 // ─── the evaluator ───────────────────────────────────────────────
@@ -508,6 +533,12 @@ pub const Evaluator = struct {
 
     fn evalNode(self: *Evaluator, i: parser.Index) EvalError!Value {
         if (self.depth >= self.opts.max_expr_depth) return error.LimitExceeded;
+        // One node, one unit (M9c1). Charged at the dispatcher so no
+        // form or implementation can evaluate below the meter — a
+        // nested callback that re-enters here re-charges by
+        // construction, which is the "nested callbacks re-charge" leg
+        // of the solver contract.
+        if (self.opts.work) |w| try w.charge(run_inputs.WorkBudget.node_units);
         self.depth += 1;
         defer self.depth -= 1;
 
@@ -2006,6 +2037,9 @@ test {
     // a registry nobody touched is a registry whose tests never ran.
     _ = registry;
     _ = env;
+    // M9c1's solver contract: reached at runtime only through `RATE`'s
+    // implementation, which lazy analysis would skip until dispatched.
+    _ = @import("solve.zig");
 }
 
 fn cellOf(a1: []const u8) coords.Cell {
@@ -7999,6 +8033,307 @@ test "M8c: the 1904 phase reaches the week functions" {
     try testing.expectEqual(@as(f64, 53), iso.scalar.number);
 }
 
+// ─── M9c1: the F4a-TVM batch (§7, seven names counted from the TSV) ──
+//
+// The value rows are Excel's own documentation examples where the
+// documentation gives one (PMT −1037.03, IPMT −66.67 and −292.45, PPMT
+// −75.62, PV −59,777.15, FV 2581.40 and 12,682.50, NPER 59.6739 and
+// 60.0821, RATE 0.77%/month), pinned here at full double precision from
+// the closed forms — spec_pinned like all of F3, because the committed
+// manifests predate F4a; the parked §8.2 Excel leg is what would move
+// the evidence, and the `#DIV/0!`-vs-`#NUM!` plane pins are the rows
+// that leg would test first.
+
+const m9c1_cases = [_]F2Case{
+    // ── PMT: the closed form, both period conventions, the rate-0 arm ──
+    .{ .func = "PMT", .formula = "PMT(0.08/12,10,10000)", .expect = .{ .number = -1037.0320893591522 } },
+    .{ .func = "PMT", .formula = "PMT(0.08/12,10,10000,0,1)", .expect = .{ .number = -1030.164327177966 }, .note = "beginning-of-period: one period's less interest" },
+    .{ .func = "PMT", .formula = "PMT(0,10,1000)", .expect = .{ .number = -100 }, .note = "the rate-0 arm is plain division by nper" },
+    .{ .func = "PMT", .formula = "PMT(0.05,10,1000,100)", .expect = .{ .number = -137.45503246200235 } },
+    .{ .func = "PMT", .formula = "PMT(0.05,10,1000,0,2)-PMT(0.05,10,1000,0,1)", .expect = .{ .number = 0 }, .note = "a nonzero type IS beginning — OpenFormula's reading, pinned" },
+    .{ .func = "PMT", .formula = "PMT(0.05,0,1000)", .expect = .{ .err = .div0 }, .note = "the annuity denominator is zero at nper 0 — division, not domain" },
+    .{ .func = "PMT", .formula = "PMT(0,0,1000)", .expect = .{ .err = .div0 } },
+
+    // ── IPMT: the balance engine, and per's closed domain ──
+    .{ .func = "IPMT", .formula = "IPMT(0.1/12,1,36,8000)", .expect = .{ .number = -66.66666666666667 }, .note = "first period: the whole principal's interest" },
+    .{ .func = "IPMT", .formula = "IPMT(0.1,3,3,8000)", .expect = .{ .number = -292.4471299093655 } },
+    .{ .func = "IPMT", .formula = "IPMT(0.1,1,3,8000,0,1)", .expect = .{ .number = 0 }, .note = "nothing has accrued when the first advance payment is due" },
+    .{ .func = "IPMT", .formula = "IPMT(0.1,2,3,8000,0,1)", .expect = .{ .number = -507.5528700906345 } },
+    .{ .func = "IPMT", .formula = "IPMT(0.1,0,3,8000)", .expect = .{ .err = .num }, .note = "per below 1" },
+    .{ .func = "IPMT", .formula = "IPMT(0.1,4,3,8000)", .expect = .{ .err = .num }, .note = "per past nper" },
+
+    // ── PPMT: the payment minus its interest share, exactly ──
+    .{ .func = "PPMT", .formula = "PPMT(0.1/12,1,24,2000)", .expect = .{ .number = -75.62318600836635 } },
+    .{ .func = "PPMT", .formula = "PPMT(0.08,10,10,200000)", .expect = .{ .number = -27598.053462421365 } },
+    .{ .func = "PPMT", .formula = "PPMT(0.05,3,10,1000)+IPMT(0.05,3,10,1000)-PMT(0.05,10,1000)", .expect = .{ .number = 0 }, .note = "PPMT + IPMT = PMT to the last bit — subtraction by construction" },
+    .{ .func = "PPMT", .formula = "PPMT(0.05,11,10,1000)", .expect = .{ .err = .num } },
+
+    // ── PV / FV: the two directions of the same compounding ──
+    .{ .func = "PV", .formula = "PV(0.08/12,240,500)", .expect = .{ .number = -59777.145851188034 } },
+    .{ .func = "PV", .formula = "PV(0,10,100)", .expect = .{ .number = -1000 } },
+    .{ .func = "PV", .formula = "PV(0.1,5,-100,1000)", .expect = .{ .number = -241.84264611831026 }, .note = "an fv leg discounts through the same factor" },
+    .{ .func = "FV", .formula = "FV(0.06/12,10,-200,-500,1)", .expect = .{ .number = 2581.403374060179 } },
+    .{ .func = "FV", .formula = "FV(0.12/12,12,-1000)", .expect = .{ .number = 12682.50301319697 } },
+    .{ .func = "FV", .formula = "FV(0,10,-100)", .expect = .{ .number = 1000 } },
+
+    // ── NPER: the logarithmic closed form and what it refuses ──
+    .{ .func = "NPER", .formula = "NPER(0.12/12,-100,-1000,10000,1)", .expect = .{ .number = 59.67386567429462 } },
+    .{ .func = "NPER", .formula = "NPER(0.12/12,-100,-1000,10000)", .expect = .{ .number = 60.08212285376172 } },
+    .{ .func = "NPER", .formula = "NPER(0,-100,1000)", .expect = .{ .number = 10 } },
+    .{ .func = "NPER", .formula = "NPER(0.1,1,1000)", .expect = .{ .number = -48.422115311462676 }, .note = "negative periods are a documented Excel answer, not a domain failure" },
+    .{ .func = "NPER", .formula = "NPER(0.1,-1,1000)", .expect = .{ .err = .num }, .note = "a payment the interest outruns never pays off — the log has no argument" },
+    .{ .func = "NPER", .formula = "NPER(0,0,1000)", .expect = .{ .err = .div0 }, .note = "the rate-0 arm divides by pmt" },
+
+    // ── RATE: the batch's solver consumer ──
+    .{ .func = "RATE", .formula = "RATE(48,-200,8000)", .expect = .{ .number = 0.00770147248820204 }, .note = "converges from Excel's default 0.1 guess" },
+    .{ .func = "RATE", .formula = "RATE(10,-1000,8000)", .expect = .{ .number = 0.042774978035111454 } },
+    .{ .func = "RATE", .formula = "RATE(2,-500,1000)", .expect = .{ .number = 0 }, .note = "a break-even schedule's rate IS zero — the residual's r = 0 arm is the root" },
+    .{ .func = "RATE", .formula = "RATE(48,-200,8000,0,0,0.1)-RATE(48,-200,8000)", .expect = .{ .number = 0 }, .note = "an absent guess is 0.1 — the same Newton path, to the bit" },
+    .{ .func = "RATE", .formula = "RATE(10,100,1000,100)", .expect = .{ .err = .num }, .note = "all-positive cashflows have no root: 128 honest iterations, then #NUM! — never the fake root at the domain edge" },
+    .{ .func = "RATE", .formula = "RATE(0,-100,1000)", .expect = .{ .err = .num }, .note = "nper at or below zero" },
+};
+
+/// The TVM comparator: relative at 1e-9 — the fixtures pin closed-form
+/// doubles computed outside this implementation, and bit-identity
+/// across two spellings of `expm1`/`log1p` is not a promise worth
+/// making — absolute at the same width for the rows whose pinned
+/// answer IS zero, where a relative test has nothing to scale by.
+fn expectTvmValue(exp: Expect, v: Value) !void {
+    switch (exp) {
+        .number => |n| {
+            try testing.expect(v == .scalar);
+            try testing.expect(v.scalar == .number);
+            if (n == 0) {
+                try testing.expectApproxEqAbs(@as(f64, 0), v.scalar.number, 1e-9);
+            } else {
+                try testing.expectApproxEqRel(n, v.scalar.number, 1e-9);
+            }
+        },
+        else => try expectValue(exp, v),
+    }
+}
+
+test "M9c1: every F4a-TVM fixture evaluates to what the spec says" {
+    for (m9c1_cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("M9c1 case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectTvmValue(c.expect, v) catch |e| {
+            std.debug.print("M9c1 case `{s}` ({s})\n", .{ c.formula, c.note });
+            return e;
+        };
+    }
+}
+
+test "M9c1: every frozen name resolves, and each fixture stays in the batch" {
+    var it = registry.inventory();
+    var batch: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M9c1")) continue;
+        batch += 1;
+        if (registry.lookup(e.name) == null) return error.UnregisteredBatchFunction;
+        var fixtures: usize = 0;
+        for (m9c1_cases) |c| {
+            if (std.mem.eql(u8, c.func, e.name)) fixtures += 1;
+        }
+        if (fixtures == 0) {
+            std.debug.print("M9c1 name unfixtured: {s}\n", .{e.name});
+            return error.UnfixturedBatchFunction;
+        }
+    }
+    // Seven — the frozen list, counted from the TSV.
+    try testing.expectEqual(@as(usize, 7), batch);
+    // The reverse direction: no fixture may claim a name outside the
+    // batch.
+    for (m9c1_cases) |c| {
+        var it2 = registry.inventory();
+        var found = false;
+        while (it2.next()) |e| {
+            if (std.mem.eql(u8, e.milestone, "M9c1") and std.mem.eql(u8, e.name, c.func)) found = true;
+        }
+        try testing.expect(found);
+    }
+}
+
+test "M9c1: the evidence label on every fixture is true of the committed manifests" {
+    var oracle_rows: usize = 0;
+    for (m9c1_cases) |c| {
+        switch (try manifestVerdict(c.formula)) {
+            .decided => {
+                if (c.evidence != .oracle) return error.UnderstatedEvidence;
+                oracle_rows += 1;
+            },
+            .excluded => return error.ExcludedCellClaimedAsEvidence,
+            .silent => {
+                if (c.evidence != .spec_pinned) return error.UnbackedOracleClaim;
+            },
+        }
+    }
+    // The committed manifests predate F4a; the parked Excel leg (§8.2)
+    // is what would move this count — evidence at zero, a fourth time.
+    try testing.expectEqual(@as(usize, 0), oracle_rows);
+}
+
+// ─── M9c1: the shared WorkBudget, threaded through evaluator + solver ──
+
+test "M9c1: a node is one unit on the shared meter" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+
+    var w: run_inputs.WorkBudget = .{};
+    var opts = h.options();
+    opts.work = &w;
+    _ = try h.evalOpts("1+1", opts);
+    // Three nodes — the operator and its two literals — and nothing
+    // else: no solver ran, so the meter IS the node count.
+    try testing.expectEqual(@as(u64, 3), w.used);
+}
+
+test "M9c1: nodes and solver iterations exhaust ONE budget together" {
+    // Reference run: the whole cost of a converging RATE, measured
+    // rather than pinned — the iteration count belongs to the solver's
+    // walk, and pinning it here would break on any 1-ulp libm shift.
+    var whole: u64 = 0;
+    {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        var w: run_inputs.WorkBudget = .{};
+        var opts = h.options();
+        opts.work = &w;
+        const v = try h.evalOpts("RATE(48,-200,8000)", opts);
+        try testing.expect(v.scalar == .number);
+        whole = w.used;
+        // The meter saw both kinds of work: more than the formula's
+        // five nodes, in solver-iteration multiples of four above them.
+        try testing.expect(whole > 5);
+        try testing.expectEqual(@as(u64, 0), (whole - 5) % 4);
+    }
+
+    // One unit short of the whole cost: the SAME run now exhausts —
+    // inside the last solver iteration, against a budget the evaluator
+    // already drew the nodes from. Combined exhaustion, one meter.
+    {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        var w: run_inputs.WorkBudget = .{ .limit = whole - 1 };
+        var opts = h.options();
+        opts.work = &w;
+        try testing.expectError(error.LimitExceeded, h.evalOpts("RATE(48,-200,8000)", opts));
+        try testing.expect(w.tripped);
+    }
+
+    // And at exactly the whole cost, the run completes with nothing to
+    // spare — the boundary is the boundary.
+    {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        var w: run_inputs.WorkBudget = .{ .limit = whole };
+        var opts = h.options();
+        opts.work = &w;
+        _ = try h.evalOpts("RATE(48,-200,8000)", opts);
+        try testing.expectEqual(@as(u64, 0), w.remaining());
+    }
+}
+
+/// The counting/tripping poller the cancellation tests share: counts
+/// every poll, refuses from the Nth on (never, when `at` is 0).
+const TvmTripPoller = struct {
+    n: usize = 0,
+    at: usize = 0,
+    fn check(ctx: ?*const anyopaque) error{Cancelled}!void {
+        const self: *const @This() = @ptrCast(@alignCast(ctx.?));
+        @constCast(self).n += 1;
+        if (self.at != 0 and self.n >= self.at) return error.Cancelled;
+    }
+};
+
+test "M9c1: a solver loop polls every iteration, and a mid-solve cancel aborts the run" {
+    // Calibration: trip on the FIRST poll. The solver polls before any
+    // iteration's work, so the meter at the failure holds exactly the
+    // formula's nodes — the budget is the receipt for where the cancel
+    // landed.
+    var base: u64 = 0;
+    {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        var trip: TvmTripPoller = .{ .at = 1 };
+        var w: run_inputs.WorkBudget = .{ .poller = .{ .ctx = &trip, .check_fn = TvmTripPoller.check } };
+        var opts = h.options();
+        opts.work = &w;
+        try testing.expectError(error.Cancelled, h.evalOpts("RATE(10,100,1000,100)", opts));
+        base = w.used;
+        try testing.expect(base > 0);
+    }
+
+    // Mid-solve: trip on the fifth poll — four iterations of work were
+    // charged, the fifth was refused before it spent anything.
+    {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        var trip: TvmTripPoller = .{ .at = 5 };
+        var w: run_inputs.WorkBudget = .{ .poller = .{ .ctx = &trip, .check_fn = TvmTripPoller.check } };
+        var opts = h.options();
+        opts.work = &w;
+        try testing.expectError(error.Cancelled, h.evalOpts("RATE(10,100,1000,100)", opts));
+        try testing.expectEqual(base + 4 * run_inputs.WorkBudget.solver_iteration_units, w.used);
+        try testing.expectEqual(@as(usize, 5), trip.n);
+    }
+
+    // The bound, measured: a full converging solve polls once per
+    // iteration — 4 units apiece, five orders of magnitude inside
+    // §5.5's one-per-65 536 — and the poll count is the iteration
+    // count the meter reports.
+    {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        var count: TvmTripPoller = .{};
+        var w: run_inputs.WorkBudget = .{ .poller = .{ .ctx = &count, .check_fn = TvmTripPoller.check } };
+        var opts = h.options();
+        opts.work = &w;
+        const v = try h.evalOpts("RATE(48,-200,8000)", opts);
+        try testing.expect(v.scalar == .number);
+        const iterations = (w.used - 5) / run_inputs.WorkBudget.solver_iteration_units;
+        try testing.expectEqual(iterations, count.n);
+        try testing.expect(iterations >= 2);
+        try testing.expect(iterations <= 128);
+    }
+}
+
+test "M9c1: exhaustion is a refusal and non-convergence is a value — never each other" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+
+    // No budget wired: the rootless residual runs its 128 iterations
+    // and answers Excel's #NUM! — a value a caller can catch.
+    const v = try h.eval("IFERROR(RATE(10,100,1000,100),\"caught\")");
+    try testing.expect(v.scalar == .text);
+    try testing.expectEqualStrings("caught", v.scalar.text);
+
+    // Budget wired and too small: the SAME formula now refuses, and
+    // IFERROR cannot catch it — resource exhaustion is not an error
+    // value, exactly as §9 has it everywhere else.
+    var w: run_inputs.WorkBudget = .{ .limit = 40 };
+    var opts = h.options();
+    opts.work = &w;
+    try testing.expectError(
+        error.LimitExceeded,
+        h.evalOpts("IFERROR(RATE(10,100,1000,100),\"caught\")", opts),
+    );
+}
+
 test "refusals: an unregistered call refuses, an unresolvable name is #NAME?" {
     var h: Harness = undefined;
     try h.init(testing.allocator);
@@ -8006,11 +8341,11 @@ test "refusals: an unregistered call refuses, an unresolvable name is #NAME?" {
 
     // §7: unregistered calls refuse rather than inventing `#NAME?` for a
     // function zlsx simply does not implement.
-    // `PMT` is frozen in the inventory for M9c1 and unregistered
+    // `NPV` is frozen in the inventory for M9c2 and unregistered
     // today; `VLOOKUP` stood here until M4e registered it, `SUMIFS`
     // until M7b2, `MEDIAN` until M7b3, `TEXT` until M8a, `PROPER`
-    // until M8b, `NUMBERVALUE` until M8c.
-    try testing.expectError(error.UnsupportedFunction, h.eval("PMT(A1)"));
+    // until M8b, `NUMBERVALUE` until M8c, `PMT` until M9c1.
+    try testing.expectError(error.UnsupportedFunction, h.eval("NPV(A1)"));
     try testing.expectError(error.UnsupportedFunction, h.eval("NOTAFUNCTION()"));
     // §5.9: a value-position name that provably resolves nowhere is a
     // plane-1 `#NAME?`, which is a successful result.
