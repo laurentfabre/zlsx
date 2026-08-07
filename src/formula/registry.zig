@@ -64,6 +64,7 @@ const criteria = @import("criteria.zig");
 const text = @import("text.zig");
 const run_inputs = @import("run_inputs.zig");
 const serial_date = @import("serial_date.zig");
+const numfmt = @import("numfmt.zig");
 const casing = @import("zlsx_casing");
 const coords = @import("zlsx_refs");
 
@@ -331,6 +332,11 @@ const text2 = [_]CoercionClass{ .text, .text };
 const text_num = [_]CoercionClass{ .text, .number };
 const text_num_num = [_]CoercionClass{ .text, .number, .number };
 const text_text_num = [_]CoercionClass{ .text, .text, .number };
+
+// M8a's signature: the value slot arrives untouched (a number must stay
+// a number for the format to see it; text passes through), the format
+// slot coerces to text so `TEXT(5,0)` formats under the code "0".
+const value_text = [_]CoercionClass{ .value_any, .text };
 
 // F2-DA's signatures (M7a). The array-consuming five hand their grids
 // over whole — `.aggregate` and `.value_any` slots are never lifted —
@@ -1622,6 +1628,19 @@ pub const functions = [_]Function{
         .propagation = .observe,
         .form = .ifna_form,
     },
+
+    // ── M8a: TEXT — the one name of its row, over numfmt_v1. The
+    //    format grammar, the support matrix and every rendered byte
+    //    live in `numfmt.zig`; this row is only the wiring. ──
+    .{
+        .name = "TEXT",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &value_text, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnText,
+    },
 };
 
 /// §5.9 call-position resolution: case-folded over the decoded symbol
@@ -2065,6 +2084,43 @@ fn fnT(ctx: CallCtx, args: []const Value) FnError!Value {
         .err => .{ .scalar = s },
         .number, .boolean, .blank => .{ .scalar = .{ .text = "" } },
     };
+}
+
+/// `TEXT(value, format)` — numfmt_v1's evaluator caller (M8a). The
+/// value slot reads `.value_any` for N's reason: a number must reach
+/// the format as a number. What the grammar refuses, TEXT refuses on
+/// the SAME plane — `[$-40C]` is locale-sensitive input here exactly
+/// as it would be at the cell seam, never a fabricated `#VALUE!`. The
+/// one `#VALUE!` TEXT does produce is Excel's own: a serial outside
+/// the date domain under date tokens.
+fn fnText(ctx: CallCtx, args: []const Value) FnError!Value {
+    const s = try observedScalar(ctx, args[0]);
+    if (s == .err) return .{ .scalar = s };
+
+    const a = ctx.arena();
+    const parsed = switch (try numfmt.parse(a, textArg(args, 1))) {
+        .ok => |f| f,
+        .refused => |r| return switch (r.planeTwo()) {
+            .FormulaLimitExceeded => error.LimitExceeded,
+            .FormulaLocaleSensitiveInput => error.LocaleSensitiveInput,
+            .FormulaMalformedInput => error.MalformedInput,
+            else => unreachable, // numfmt raises exactly three planes
+        },
+    };
+    const v: numfmt.RenderValue = switch (s) {
+        .number => |n| .{ .number = n },
+        .text => |t| .{ .text = t },
+        .boolean => |b| .{ .boolean = b },
+        // A blank formats as the number 0 — `TEXT(A1,"0")` over empty
+        // A1 answers "0", the §5.3b numeric column's reading.
+        .blank => .{ .number = 0 },
+        .err => unreachable, // propagated above
+    };
+    const out = numfmt.render(a, &parsed, v, .{ .date_system = ctx.dateSystem() }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SerialOutOfRange => return Value.err(.value),
+    };
+    return .{ .scalar = .{ .text = out } };
 }
 
 fn fnIsBlank(ctx: CallCtx, args: []const Value) FnError!Value {
@@ -5575,6 +5631,30 @@ test "M7b2: every F2-criteria row declares all five fields, and its flags honest
     try testing.expectEqual(@as(usize, 6), seen);
 }
 
+// ─── M8a: TEXT, against the frozen inventory ─────────────────────
+
+test "M8a: the row's one name is regenerated from the inventory, never from prose" {
+    // The ladder row ships exactly the names the file tags `M8a` — the
+    // same both-directions discipline every batch since M4c, at n=1.
+    var it = inventory();
+    var counted: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M8a")) continue;
+        counted += 1;
+        const f = lookup(e.name) orelse {
+            std.debug.print("M8a name not registered: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        };
+        try testing.expectEqualStrings(e.name, f.name);
+        // The wiring facts the fixtures rely on: the value slot is
+        // uncoerced, the epoch reaches the date sections.
+        try testing.expectEqual(CoercionClass.value_any, f.coercion.at(0));
+        try testing.expectEqual(CoercionClass.text, f.coercion.at(1));
+        try testing.expect(f.epoch_sensitive);
+    }
+    try testing.expect(counted > 0);
+}
+
 const m7b3_milestone = "M7b3";
 const m7b3_batch = "F2-stats";
 
@@ -5627,7 +5707,7 @@ test "M7b3: the batch's size is regenerated from the inventory, never from prose
 }
 
 test "M7b3: the running total moves with the batch, counted from the file" {
-    const rows = [_][]const u8{ "M4c", "M4d", "M4e", "M4f", "M4g", "M5a2", "M7a", "M7b2", "M7b3" };
+    const rows = [_][]const u8{ "M4c", "M4d", "M4e", "M4f", "M4g", "M5a2", "M7a", "M7b2", "M7b3", "M8a" };
     var shipped: usize = 0;
     for (rows) |m| {
         var it = inventory();
@@ -5640,7 +5720,7 @@ test "M7b3: the running total moves with the batch, counted from the file" {
             shipped += 1;
         }
     }
-    try testing.expectEqual(@as(usize, 119), shipped);
+    try testing.expectEqual(@as(usize, 120), shipped);
 }
 
 test "M7b3: every F2-stats row declares all five fields, and its flags honestly" {
@@ -6078,11 +6158,11 @@ test "registry: lookup is case-insensitive and rejects unknown names" {
     try testing.expectEqualStrings("SUM", lookup("sum").?.name);
     // A name the frozen inventory holds and no row has reached yet.
     // `VLOOKUP` stood here until M4e registered it, `MEDIAN` until
-    // M7b3, which is what this line is for: the example has to be a
-    // function that is genuinely still ahead of the ladder, and every
-    // batch that lands moves it.
-    try testing.expect(lookup("TEXT") == null); // frozen, M8a
-    try testing.expect(inInventory("TEXT"));
+    // M7b3, `TEXT` until M8a, which is what this line is for: the
+    // example has to be a function that is genuinely still ahead of
+    // the ladder, and every batch that lands moves it.
+    try testing.expect(lookup("PROPER") == null); // frozen, M8b
+    try testing.expect(inInventory("PROPER"));
     try testing.expect(lookup("NOTAFUNCTION") == null);
 }
 

@@ -2208,6 +2208,100 @@ discipline instead of growing a second one.
     ST_Xstring stage) while the cached `<v>` takes the STRING
     carrier, in one cell, and the re-open reads both back.
 
+**M8a decisions (shipped 2026-08-07).** Fourteen points, in
+`src/formula/numfmt.zig` (the grammar, the matrix, the renderer),
+`registry.zig`/`eval.zig` (TEXT and its batteries), and
+`pkg/workbook.zig` (`formatCellValue`). The row where cell display and
+`TEXT()` became one question with one answer.
+
+1. **The support matrix is the surface, and it is data.** One row per
+   grammar construct — 42, walked exhaustively against the `Construct`
+   enum — each `rendered` (byte-exact, per-row fixtures) or `refused`
+   with a typed `Refusal.Reason` naming its own row.
+   `refusedConstructs()` is the surfaced park list, derived from the
+   table with the count pinned once at 7 — `spill_transitions`'
+   discipline verbatim: promoting a construct flips exactly one row
+   and every derived test follows unedited.
+2. **One derivation, two callers.** `TEXT()` renders with the run
+   arena under `RunInputs`' epoch; `Workbook.formatCellValue` renders
+   with its caller's allocator under the epoch it reads from
+   `workbookPr@date1904` itself (a caller-set epoch would silently
+   redate every serial). A byte-equality test pins the two: neither
+   adds a byte the other would not.
+3. **Grammar refusals ride three planes, and TEXT fabricates
+   nothing.** Malformed codes → `FormulaMalformedInput`;
+   locale/calendar/numeral-shaping rows →
+   `FormulaLocaleSensitiveInput`; the §9 length limit →
+   `FormulaLimitExceeded`. The one `#VALUE!` TEXT produces is Excel's
+   own answer: a serial with no date under date tokens
+   (`TEXT(-1,"yyyy")`), surfaced at the display seam as the typed
+   `serial_out_of_range` instead — each caller picks its spelling for
+   the same condition.
+4. **§5.4b's line decides the letters.** Bare `e` refuses as calendar:
+   under a Japanese calendar it counts eras, under en-US it happens to
+   count years — a spelling whose MEANING the locale changes. `aaa`
+   refuses as a locale table zlsx does not carry. An unescaped ASCII
+   byte the grammar gives no meaning refuses `unknown_token` — Excel
+   renders some of these silently; guessing which would be an
+   improvisation, not a grammar.
+5. **General is N5, stated once.** `value.formatNumber` is the repo's
+   one answer to how a number prints, and `numfmt` does not grow a
+   second: `"General"`, the number-through-`@` bridge, and the
+   unmatched-condition fallback all take its bytes. Excel's
+   width-aware 11-digit cell General is column geometry — a consumer
+   concern, M10+ if ever.
+6. **One rounding rule, decimal all the way.** Half away from zero on
+   the shortest-round-trip digit string — never a second float
+   operation. Scale commas divide before rounding; percent multiplies
+   before it; time decomposes AFTER the serial is rounded once at the
+   finest displayed unit (`12:00:59.6` under `hh:mm` is `12:01` with
+   the carry visible everywhere); date-only formats truncate instead
+   (`45000.9` is still `2023-03-15`).
+7. **Explicit conditions switch the sign regime off.** Positional
+   sections abs the negative arm; any `[>n]` condition disables
+   positional handling entirely and the value keeps its sign in every
+   section. No section matching → the General spelling of the raw
+   value, spec_pinned and FLAGGED for the parked Excel leg.
+8. **Fill and skip are TEXT parity.** `*x` emits nothing, `_x` one
+   space — pinned to what `TEXT()` observably does, because one
+   derivation cannot mean two widths. A width-aware fill belongs to
+   the consumer that knows the column.
+9. **Fractions search honestly or fall back honestly.** Dynamic
+   denominators take the continued-fraction best approximation
+   (semiconvergent close, ties to the smaller denominator) —
+   spec_pinned; Excel's own search has undocumented quirks the parked
+   oracle leg will adjudicate. A fixed denominator never blanks
+   (`5 0/8` is information, the caller's ruler) and never carries
+   without an integer part (`?/8` on 0.999 stays `8/8`). Magnitudes
+   the search cannot hold exactly (2^53; 9·10^12 improper) take the
+   General spelling — a saturated fraction would be a lie with a
+   denominator.
+10. **Day names count serials, not the civil calendar.** `ddd` under
+    1900 drifts with Excel's phantom week exactly as `WEEKDAY` does —
+    serial 1 is Sunday, serial 60 is Wednesday on a day that never
+    happened — because two answers to "what day is this cell" is the
+    failure the shared module exists to prevent. Serials 0 and 60
+    render their fictitious dates (M3b decision 8's other half).
+11. **The value arms are total.** Booleans bypass every section as
+    TRUE/FALSE; a blank formats as the number 0; the empty format
+    answers `""` (Excel's own quirk, pinned); text with no `@` section
+    passes through unchanged; a number reaching an `@` section takes
+    its General spelling — the same bytes concatenation would use.
+12. **Two named limits, boundary-tested.** `max_format_chars` = 255
+    code points (Excel-aligned, `max_formula_chars`' counting);
+    subsecond digits ≤ 3 = `serial_date.max_fractional_digits` — the
+    lexical and display layers agree on how fine a serial gets.
+13. **The built-in id table has its canonical copy now.**
+    `numfmt.builtinFormatCode` (0–49, the same deliberate
+    locale-negotiated skips); every id parses under the grammar and
+    `describesDate` reproduces the known date-id set 14–22/45–47. The
+    two existing copies (`pkg/workbook.zig`, `src/xlsx.zig`) stay
+    until the heuristic-flip row retires them onto this one.
+14. **The TEXT-heavy bench (§9) rides M8c.** The F3 batch is where
+    TEXT-family names land in volume; a bench over one function would
+    baseline the wrong mix. Dated here so the deferral is a decision,
+    not an omission.
+
 ### 5.9 Name & identifier resolution
 
 Call position → strip layered prefixes → registry; unregistered →
@@ -2451,7 +2545,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M7b2** ✅ | F2 criteria batch (SUMIFS, COUNTIFS, AVERAGEIFS, MINIFS, MAXIFS over `criteria.scan`'s one N-way aligned pass; ADDRESS) — INDIRECT/OFFSET completed at M5a2. Every fixture spec_pinned (manifests predate the batch, 0 oracle rows counted); mismatched `*IFS` dimensions stay §5.6a's `#VALUE!`; an unpaired criteria tail refuses `MalformedInput` | Fixtures + §5.3c both-orders + padded sweep; whole-column + multi-criteria benches (`synth_criteria_mix`, digest-pinned) beside the M5d4 baselines, gate green |
 | **M7b3** ✅ | F2 statistics batch (MEDIAN, MODE.SNGL, STDEV.P/S, VAR.P/S, PERCENTILE.INC, QUARTILE.INC, RANK.EQ, LARGE, SMALL over ONE numeric collection — SUM's range/direct split — with the order statistics sharing one ascending sort). Every fixture spec_pinned (manifests predate the batch, 0 oracle rows counted); INC interpolation pinned at the 0/0.25/0.5/0.75/1 knots and between them; RANK.EQ ties share the top rank in both directions; the propagation class splits by shape — variadic six `.propagate`, fixed five `per_function_provenance` taking §5.3c's declaration order themselves | Fixtures + §5.3c both-orders + padded sweep (eleven names, floor 9 000) |
 | **M7c** ✅ | `FormulaWrite` authoring (§5.8c, **Zig-only**, `zlsx_recalc.FormulaWrite`): `.scalar` live end-to-end on ONE new approved mutation (`f_insert` at `CT_Cell`'s first-child point; self-closing rides the reopen; existing-`<f>` targets refuse — `spans.f` stays `f@ref`-only); `.dynamic_array`/`.cse` authoring extend `spill_transitions` through the table's own seam (`da_author_spill`, `da_author_blocked`, `cse_author`), each refusing `transition_unproven` naming its row — the surfaced park; DA rows flip only WITH the part-graph builder the reference set brings; CSE builder proven via the injected seam, canonical `ref` spelling | Scalar byte-diff round-trip (write → save → re-open → evaluate agrees) + table-derived refusal enumeration (exhaustive over `Id`, compile-enforced); Excel-opens-clean per authoring row **runs as each reference lands** |
-| **M8a** | **`numfmt_v1` versioned grammar + support matrix FIRST** (sections ≤4, conditions, escapes/fills, fractions, scientific, elapsed `[h]`/`[mm]`, locale `[$-409]` tags — each row supported-with-exact-rendering or typed-refusal; the repo has only a date-detection heuristic today, `src/xlsx.zig:3909`) + numfmt + TEXT | Format fuzz; TEXT matrix; per-row grammar fixtures |
+| **M8a** ✅ | **`numfmt_v1` versioned grammar + support matrix FIRST** (`src/formula/numfmt.zig`): 42 constructs, one matrix row each — 35 rendered byte-exact, 7 refusing by name (`[$-LCID≠409]`, LCID calendar/shaping flag bits, DBNum/NatNum, era `g`/`e`, Buddhist `b`, localized-weekday `aaa`) — `refusedConstructs()` the derived park list, count pinned. Renderer over the rendered rows: sections ≤4 + conditions, grouping/scale/percent, scientific incl. the engineering step, fractions by continued-fraction search, dates/elapsed/subsecond over `serial_date`, the en-US tables `[$-409]` licenses. **TEXT registered over it and `Workbook.formatCellValue` beside it — ONE derivation, byte-proven**; grammar refusals ride their own planes through TEXT (never a fabricated `#VALUE!`); `PROPER` promoted canonical unregistered; the date-detection heuristic's callers untouched — they flip through `Format.describesDate` at a later row | Format fuzz; TEXT matrix **derived from the support matrix**; per-row grammar fixtures |
 | **M8b** | PROPER (word segmentation over the M4f `casing_v1` module) | Segmentation fixtures |
 | **M8c** | F3 batch (NUMBERVALUE, FIXED, DOLLAR, CLEAN, UNICHAR, UNICODE, TEXTBEFORE, TEXTAFTER, TEXTSPLIT; NETWORKDAYS(.INTL), WORKDAY(.INTL), DATEDIF, DAYS, DAYS360, YEARFRAC, ISOWEEKNUM, WEEKNUM) | Oracle-first |
 | **M9a1** | C ABI part 1: `zlsx_status_v1` + descriptor types + editor recalc/evaluate + release fns + **`zlsx_engine_fingerprint()` export (header + `_HAS_FINGERPRINT` probe — M9b depends on it)** + **`zlsx_editor_mark_recalc_on_load` (header + `_HAS_MARK_RECALC` probe + old-dylib skip)** + narrowing tests + design note | 3-file txn; probes; ABI fuzz |

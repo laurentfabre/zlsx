@@ -3330,6 +3330,69 @@ pub const Workbook = struct {
         return null;
     }
 
+    /// What `formatCellValue` answers. Three of the four arms are
+    /// typed conditions the caller picks a spelling for — none of them
+    /// is ever a guessed string.
+    pub const CellDisplay = union(enum) {
+        /// Rendered bytes, owned by the caller's allocator.
+        text: []u8,
+        /// numfmt_v1 refuses this format code — a park-list row
+        /// (locale table, calendar, numeral shaping) or a code outside
+        /// the grammar (§5.4b: typed refusal, never an improvisation).
+        format_refused: engine.numfmt.Refusal,
+        /// The epoch read (`workbookPr@date1904`) refused — malformed
+        /// `xl/workbook.xml`.
+        calc_refused: engine.calc.Refusal,
+        /// The value's serial has no date under the workbook's epoch —
+        /// the condition Excel fills a cell with `#` for.
+        serial_out_of_range,
+    };
+
+    /// M8a's cell-display seam — numfmt_v1's second caller (`TEXT()`
+    /// in the registry is the first, and §5.4b pins both to ONE
+    /// derivation: neither adds a byte the other would not). Resolves
+    /// `style_idx` to its format code (`null` resolves as `General`,
+    /// the fallback Excel applies), parses it under the versioned
+    /// grammar, and renders `v` under the workbook's own epoch — a
+    /// caller-set epoch would silently redate every serial.
+    ///
+    /// The date-detection heuristic (`src/xlsx.zig`) and its callers
+    /// are untouched by this seam; they flip onto the grammar at a
+    /// later row, through `Format.describesDate`.
+    pub fn formatCellValue(
+        self: *Workbook,
+        gpa: std.mem.Allocator,
+        style_idx: u32,
+        v: engine.numfmt.RenderValue,
+    ) Error!CellDisplay {
+        const info = try self.numberFormatFor(style_idx);
+        const code = if (info) |i| i.code else "General";
+
+        const wb_part = (try self.store.part("xl/workbook.xml")) orelse
+            return Error.MissingWorkbookPart;
+        var calc = switch (try engine.calc.parseCalcState(gpa, wb_part.bytes)) {
+            .ok => |c| c,
+            .refused => |r| return .{ .calc_refused = r },
+        };
+        const date_system = calc.date_system;
+        calc.deinit(gpa);
+
+        switch (try engine.numfmt.parse(gpa, code)) {
+            .refused => |r| return .{ .format_refused = r },
+            .ok => |fmt| {
+                var f = fmt;
+                defer f.deinit(gpa);
+                const out = engine.numfmt.render(gpa, &f, v, .{
+                    .date_system = date_system,
+                }) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.SerialOutOfRange => return .serial_out_of_range,
+                };
+                return .{ .text = out };
+            },
+        }
+    }
+
     /// Persist all pending mutations to `path`. For each Worksheet
     /// with a non-empty delta map: regenerate the sheet's `<sheetData>`
     /// block from the typed view + deltas, splice into the source
@@ -10293,6 +10356,60 @@ test "Workbook.numberFormatFor: out-of-range style_idx returns null" {
     // Far-out-of-range too — a u32 the cell_xfs slice will never reach.
     const result2 = try wb.numberFormatFor(std.math.maxInt(u32));
     try std.testing.expect(result2 == null);
+}
+
+test "M8a: formatCellValue and TEXT are one derivation, byte for byte" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const path = "tests/corpus/worldbank_catalog.xlsx";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, io, path);
+    defer wb.deinit();
+
+    const ta = std.testing.allocator;
+
+    // The display seam over an out-of-range style resolves as General —
+    // the documented fallback — and must spell the number exactly the
+    // way TEXT(...,"General") does through the evaluator.
+    const display = try wb.formatCellValue(ta, std.math.maxInt(u32), .{ .number = 1234.5678 });
+    try std.testing.expect(display == .text);
+    defer ta.free(display.text);
+
+    var evaluated = try wb.evaluate(ta, 0, "TEXT(1234.5678,\"General\")", .{ .collation = test_collation });
+    defer evaluated.deinit();
+    try std.testing.expectEqualStrings(evaluated.ok.value.scalar.text, display.text);
+}
+
+test "M8a: formatCellValue over every style of a real workbook is total and typed" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const path = "tests/corpus/worldbank_catalog.xlsx";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, io, path);
+    defer wb.deinit();
+
+    const st = (try wb.styles()).?;
+    var idx: u32 = 0;
+    while (idx < st.cell_xfs.len) : (idx += 1) {
+        // Every style either renders or refuses BY TYPE — no style in
+        // a real workbook may crash the seam or answer with a lie.
+        const r = try wb.formatCellValue(std.testing.allocator, idx, .{ .number = 1234.5678 });
+        switch (r) {
+            .text => |t| std.testing.allocator.free(t),
+            .format_refused, .serial_out_of_range => {},
+            .calc_refused => return error.TestUnexpectedResult,
+        }
+        const d = try wb.formatCellValue(std.testing.allocator, idx, .{ .number = 45000.25 });
+        switch (d) {
+            .text => |t| std.testing.allocator.free(t),
+            .format_refused, .serial_out_of_range => {},
+            .calc_refused => return error.TestUnexpectedResult,
+        }
+    }
 }
 
 test "Workbook.numberFormatFor: custom numFmtId resolves to the styles.xml entry" {
@@ -17300,11 +17417,11 @@ test "M4b3: evaluate mutates neither logical state nor serialized bytes" {
     try std.testing.expectEqual(@as(f64, 22), ok.ok.value.scalar.number);
     try expectSnapshotUnchanged(ta, &wb, before);
 
-    // 2. Refusal — an unregistered function, refused mid-run. `TEXT`
-    //    is frozen in the inventory for M8a and has no row yet;
+    // 2. Refusal — an unregistered function, refused mid-run. `PROPER`
+    //    is frozen in the inventory for M8b and has no row yet;
     //    `VLOOKUP` stood here until M4e registered it, `SUMIFS` until
-    //    M7b2, `MEDIAN` until M7b3.
-    var refused = try wb.evaluate(ta, 0, "TEXT(A1,\"0\")", .{ .collation = test_collation });
+    //    M7b2, `MEDIAN` until M7b3, `TEXT` until M8a.
+    var refused = try wb.evaluate(ta, 0, "PROPER(A1)", .{ .collation = test_collation });
     defer refused.deinit();
     try std.testing.expectEqual(
         engine.decode.PlaneTwo.FormulaUnsupportedFunction,
@@ -17988,8 +18105,9 @@ test "M5a1: closure evaluation mutates neither logical state nor serialized byte
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<v>20</v>") == null);
 
     // 2. Refusal, raised after the closure had already been planned and
-    //    every cell in it recomputed.
-    var refused = try wb.evaluateClosure(ta, 0, "TEXT(A1,\"0\")", .{ .collation = test_collation });
+    //    every cell in it recomputed. `PROPER` is the canonical
+    //    still-unregistered name since M8a registered `TEXT`.
+    var refused = try wb.evaluateClosure(ta, 0, "PROPER(A1)", .{ .collation = test_collation });
     defer refused.deinit();
     try std.testing.expectEqual(
         engine.decode.PlaneTwo.FormulaUnsupportedFunction,

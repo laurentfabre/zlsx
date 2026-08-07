@@ -616,6 +616,26 @@ pub fn build(b: *std.Build) void {
     });
     fuzz_step.dependOn(&b.addRunArtifact(formula_tokenizer_fuzz_tests).step);
 
+    // M8a: the numfmt_v1 format fuzz target — no format code may panic,
+    // leak, or render non-deterministically.
+    const formula_numfmt_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/numfmt.zig"),
+        .target = target,
+        .optimize = optimize,
+        .fuzz = true,
+    });
+    formula_numfmt_fuzz_mod.addImport("zlsx_control", control_mod);
+    formula_numfmt_fuzz_mod.addImport("zlsx_refs", refs_mod);
+    formula_numfmt_fuzz_mod.addImport("zlsx_xid", xid_mod);
+    formula_numfmt_fuzz_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_numfmt_fuzz_mod.addImport("zlsx_casing", casing_mod);
+    addOracleFixtures(b, formula_numfmt_fuzz_mod);
+    const formula_numfmt_fuzz_tests = b.addTest(.{
+        .root_module = formula_numfmt_fuzz_mod,
+        .test_runner = fuzz_test_runner,
+    });
+    fuzz_step.dependOn(&b.addRunArtifact(formula_numfmt_fuzz_tests).step);
+
     // M2: the formula parser — AST, canonical printer, typed refusals.
     // Sits in the same package dir as the tokenizer it consumes, so the
     // relative `@import("tokenizer.zig")` resolves and `@embedFile` can
@@ -839,6 +859,28 @@ pub fn build(b: *std.Build) void {
     addOracleFixtures(b, formula_text_mod);
     const formula_text_tests = b.addTest(.{ .root_module = formula_text_mod });
     test_step.dependOn(&b.addRunArtifact(formula_text_tests).step);
+
+    // M8a: numfmt_v1 — the versioned number-format grammar, support
+    // matrix and renderer. Below the registry like `criteria.zig` and
+    // `text.zig`: TEXT() and the workbook display seam both call it,
+    // and neither may own it. `test-numfmt` exists as its own step
+    // because the grammar iterates faster alone than behind the full
+    // suite.
+    const formula_numfmt_mod = b.createModule(.{
+        .root_source_file = b.path("src/formula/numfmt.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formula_numfmt_mod.addImport("zlsx_control", control_mod);
+    formula_numfmt_mod.addImport("zlsx_refs", refs_mod);
+    formula_numfmt_mod.addImport("zlsx_xid", xid_mod);
+    formula_numfmt_mod.addImport("zlsx_casefold", unicode_mod);
+    formula_numfmt_mod.addImport("zlsx_casing", casing_mod);
+    addOracleFixtures(b, formula_numfmt_mod);
+    const formula_numfmt_tests = b.addTest(.{ .root_module = formula_numfmt_mod });
+    test_step.dependOn(&b.addRunArtifact(formula_numfmt_tests).step);
+    const numfmt_step = b.step("test-numfmt", "Run the numfmt_v1 grammar tests alone");
+    numfmt_step.dependOn(&b.addRunArtifact(formula_numfmt_tests).step);
 
     // M5a1: the dependency graph — nodes, edges, SCC condensation, the
     // deterministic order, the §5.6c seed table. Its own module and its
