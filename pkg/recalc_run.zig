@@ -1576,6 +1576,11 @@ test "ordering: an injected sync failure is pre-commit too" {
 }
 
 test "ordering: a post-rename dir-fsync failure is a warning on a committed save" {
+    // No directory fsync exists on Windows: `syncDir` returns clean
+    // before the injected second sync can fire — same skip as the two
+    // M5d1 siblings (`atomic_file.zig`, `store.zig`).
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
     const a = testing.allocator;
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
