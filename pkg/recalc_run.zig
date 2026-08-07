@@ -109,6 +109,21 @@ fn foldString(allocator: Allocator, s: []const u8) anyerror![]u8 {
     return zlsx.casefold.foldString(allocator, s);
 }
 
+/// M9a1: the rule versions `zlsx_engine_fingerprint()` names, read from
+/// the engine so the exported identity cannot drift from the code that
+/// implements each rule. The C ABI cannot import the engine directly —
+/// this seam is the one place it already reaches recalc semantics.
+pub const rule_versions = .{
+    .excel_fp = engine.value.excel_fp_rules_v1.name,
+    .rng = engine.rng.version,
+    .collation = collation_v1.version,
+};
+
+/// M9a1: §5.3a's publish seam, re-exported for the C ABI. Blank never
+/// crosses a public boundary; this is the one mandatory conversion.
+pub const publish = engine.value.publish;
+pub const PublishedScalar = engine.value.PublishedScalar;
+
 /// Everything about a recalc that is not a `RunInputs`.
 ///
 /// The split follows §5.5: `RunInputs` is what makes a run reproducible

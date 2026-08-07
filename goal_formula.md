@@ -2731,7 +2731,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M8a** ✅ | **`numfmt_v1` versioned grammar + support matrix FIRST** (`src/formula/numfmt.zig`): 42 constructs, one matrix row each — 35 rendered byte-exact, 7 refusing by name (`[$-LCID≠409]`, LCID calendar/shaping flag bits, DBNum/NatNum, era `g`/`e`, Buddhist `b`, localized-weekday `aaa`) — `refusedConstructs()` the derived park list, count pinned. Renderer over the rendered rows: sections ≤4 + conditions, grouping/scale/percent, scientific incl. the engineering step, fractions by continued-fraction search, dates/elapsed/subsecond over `serial_date`, the en-US tables `[$-409]` licenses. **TEXT registered over it and `Workbook.formatCellValue` beside it — ONE derivation, byte-proven**; grammar refusals ride their own planes through TEXT (never a fabricated `#VALUE!`); `PROPER` promoted canonical unregistered; the date-detection heuristic's callers untouched — they flip through `Format.describesDate` at a later row | Format fuzz; TEXT matrix **derived from the support matrix**; per-row grammar fixtures |
 | **M8b** ✅ | **PROPER over `casing_v1` — word segmentation decides WHICH scalars title-case, the M4f tables decide what title-casing IS** (`unicode/casing.zig` `toProper`; `fnProper` is a one-line delegation, so no second caller can disagree about either half). No second casing table: the segmenter reads the SAME `cased`/`case_ignorable` intervals Final_Sigma shipped — `beginsWord` is that backward walk pointed at the start of the word. The invariant boundary rule, pinned: a cased scalar title-cases when the nearest preceding non-case-ignorable scalar is absent or not cased, lowercases otherwise (Final_Sigma included); case-ignorables are transparent; every other non-cased scalar ends the word. Recorded spec_pinned divergences pending the parked oracle leg (§8.2): `don't`→`Don't` where Excel answers `Don'T` (`'` `.` `:` are Case_Ignorable), and uncased letters (Hebrew/CJK) end words — Alphabetic would be a second table. `NUMBERVALUE` promoted canonical unregistered | Segmentation fixtures byte-exact at both seams (ASCII, apostrophes, digits, combining marks, astral); evidence manifest-checked at 0 oracle rows |
 | **M8c** ✅ | F3 batch (NUMBERVALUE, FIXED, DOLLAR, CLEAN, UNICHAR, UNICODE, TEXTBEFORE, TEXTAFTER, TEXTSPLIT; NETWORKDAYS(.INTL), WORKDAY(.INTL), DATEDIF, DAYS, DAYS360, YEARFRAC, ISOWEEKNUM, WEEKNUM — **19 rows counted from the TSV**, the prose folds the `.INTL` variants). The text half rides the layers earlier rows built — `numfmt_v1` renders FIXED/DOLLAR through ONE derived code, §5.3b's three-way split parses NUMBERVALUE (pinned `.`/`,` defaults, explicit-vs-default separator demotion), `criteria.fold`'s positional map matches the TEXTBEFORE family under `.arg_selected`, TEXTSPLIT is the batch's rectangle producer whose default pad IS `#N/A` — and the date half rides `serial_date` with **weekdays counted over SERIALS batch-wide** (one `mondayDow`, M4g decision 1 applied to ISO weeks, week numbers, and both weekend engines; one 30/360 table under DAYS360 and YEARFRAC's bases 0/4). `PMT` promoted canonical unregistered; running total 140 | Oracle-first (manifests predate F3 → every fixture spec_pinned, checker two-directional, 0 oracle rows pinned; the parked §8.2 Excel leg is what moves it); **TEXT-heavy bench (§9.1) recorded** — `synth_text_mix` digest-pinned, marginal per-row cost stated across two sizes |
-| **M9a1** | C ABI part 1: `zlsx_status_v1` + descriptor types + editor recalc/evaluate + release fns + **`zlsx_engine_fingerprint()` export (header + `_HAS_FINGERPRINT` probe — M9b depends on it)** + **`zlsx_editor_mark_recalc_on_load` (header + `_HAS_MARK_RECALC` probe + old-dylib skip)** + narrowing tests + design note | 3-file txn; probes; ABI fuzz |
+| **M9a1** ✅ | C ABI part 1 (`feat/m9a1-cabi`): `zlsx_status_v1` (0/-1/-2/-3/-5, -4 reserved; ONE error→status mapping — the fourteen-plane vocabulary detected by name against `PlaneTwo` so a fifteenth plane maps itself; ABI-contract violations are -1, never -2) + the six descriptor structs (`run`/`resolved`/`recalc_report`/`value`/`value_elem`/`diag`+`census_entry`, every offset pinned three ways: comptime asserts in `c_abi.zig`, C `static_assert`s in `tests/c_abi_smoke.c`, ctypes `sizeof` asserts in `_ffi.py`) + `zlsx_editor_recalculate`/`zlsx_editor_evaluate` over the M5d2 pipeline (evaluate = M6 CLI semantics exactly) + **`zlsx_engine_fingerprint()`** (`"zlsx <semver>; excel_fp_rules_v1; rng_v1; collation_v1; <triple>; <build-hash>"` — rule versions read from the engine through `recalc_run.rule_versions`, so the identity cannot drift from the code) + **`zlsx_editor_mark_recalc_on_load`** + the cancel-token trio (pulled into part 1: R9-12 is *about* it) + three release fns (`zlsx_buffer_release` stages with M9a2's buffers). **C ABI module hard-set multi-threaded (R9-12)**: comptime assertion, `-Dsingle-threaded` narrowed to CLI-only, both shapes CI-compiled from one invocation. Committed design note `docs/plans/c-abi-status-v1.md` | 3-file txn (header + impl + `_ffi.py` probes `_HAS_FINGERPRINT`/`_HAS_MARK_RECALC`/`_HAS_RECALC`/`_HAS_EVAL`/`_HAS_CANCEL`); header compile gate; narrowing + canary-tail + boundary tests; ABI fuzz green |
 | **M9a2** | C ABI part 2: `save_to_buffer`, `open_buffer`, writer exports (incl. `…_with_formulas_v2` dialect) + Python Editor/Writer methods + `finally` cleanup | 3-file txn; probes; boundary tests |
 | **M9b** | Spark batch recalc: `zlsx.recalc` activation, read-only guarantee, digest-verified partitions, driver-inference-on-recalced-snapshot, per-executor digest-keyed cache note, retry tests, streaming refusal | Integration; retries; serverless verification |
 | **M9c1** | **Shared deterministic solver contract FIRST** (iterations ≤128 charged to a shared **`WorkBudget`** threaded through evaluator + solvers — units: node 1, solver iteration 4, nested callbacks re-charge; combined-exhaustion tests; poll points; Excel-compatible guesses — RATE/IRR 0.1 — and root selection; pinned tolerance; `#NUM!` on domain/convergence failure) + F4a-TVM (7, frozen: PMT, IPMT, PPMT, PV, FV, RATE, NPER) | Oracle-first; convergence/non-convergence/cancellation fixtures |
@@ -5053,6 +5053,69 @@ latency is tested with a deliberately long evaluation.
 Python methods named here, with the shipped older-dylib pattern; `test_basic.py`
 skip-guards mirror it. Every call wraps release fns in `try/finally`
 (tested); `Book` stays read-only.
+
+**M9a1 decisions (shipped 2026-08-07).** Eight points, in
+`src/c_abi.zig` + `include/zlsx.h` + `bindings/python/zlsx/_ffi.py` (the
+3-file transaction), `docs/plans/c-abi-status-v1.md` (the committed
+layout note, written before the code), `pkg/recalc_run.zig` +
+`pkg/root.zig` (two seam re-exports), `build.zig` and
+`tests/c_abi_smoke.c`.
+
+1.  **The cancel-token trio ships in part 1.** R9-12 hard-sets this
+    module multi-threaded *because* `-fsingle-threaded` atomics cannot
+    back a cross-thread token — a decision that is only about something
+    that exists. The recalc/evaluate exports take the token parameter,
+    and a parameter no caller can construct is untestable; the three
+    exports are two allocations and a release store.
+2.  **One error→status mapping, detected by name.** `statusOf` walks
+    `@typeInfo(PlaneTwo)` and matches `@errorName` — the fourteen-plane
+    vocabulary maps to -2 without a hand-kept list, so a fifteenth
+    plane maps itself the day it is added. ABI-contract violations
+    (NULL where required, `StructSizeTooSmall`, unknown enum values,
+    `UtcOffsetOutOfRange`, `LimitOutOfRange`) are -1: statements about
+    the call, not the workbook.
+3.  **Outputs are prepped before inputs are validated, each gated on
+    its own `struct_size`.** The ABI fuzz gate caught the first draft
+    releasing canary garbage: prep ran after `checkIn(run)`, so a diag
+    whose *sibling* failed was never zeroed, and its 0xAA `census`
+    pointer reached `free`. Now every ACCEPTED output is zeroed before
+    any failure can return — which is what makes "release fns are
+    no-ops on zeroed structs" a usable contract — and a REJECTED
+    struct is left byte-for-byte untouched (releasing that is the
+    caller's UB, pinned in the note).
+4.  **The refusal-path census is empty in v1.** The pipeline collapses
+    the census into the error before the ABI sees it
+    (`recalc_txn.Refusal` carries reason+plane only), so a -2 diag
+    carries `error_name` + `plane` and census entries cross only on
+    success reports. M9a2's Python `ZlsxFormulaRefusal(cells, census)`
+    leg needs a pkg-level seam through `prepare` — flagged, not
+    silently absorbed.
+5.  **`zlsx_editor_evaluate` is M6's `zlsx eval`, exactly.** Same
+    `Workbook.evaluate`, same fixed draw source, same
+    workbook-derived `date_system`/`text_compat`; `rng_seed` is echoed
+    in `zlsx_resolved_v1`, never drawn from. `formula_len` is bounded
+    *before the slice exists* — one past the parser's byte cap refuses
+    `-2 FormulaLimitExceeded`, limits being Plane-2 at every layer.
+6.  **The fingerprint cannot drift from the engine.**
+    `recalc_run.rule_versions` re-exports
+    `excel_fp_rules_v1.name`/`rng.version`/`collation_v1.version` from
+    the engine tree at comptime; the build hash lives in its own
+    `fingerprint_config` options module imported only by the C ABI, so
+    a new commit does not invalidate the CLI's build cache, and a
+    tarball without git fingerprints as `"unknown"` rather than
+    failing to build.
+7.  **`struct_size` is caller-owned; nested structs get no independent
+    prefix treatment.** The library never writes the field (zero-init
+    skips it), and the embedded `zlsx_resolved_v1` inside the report is
+    governed by the outer struct's rule — v1 minimum is the full
+    `sizeof`, so a nested struct can never be cut mid-field.
+8.  **The layout is pinned three ways in three languages.** Comptime
+    `@offsetOf` asserts where the structs live, C `static_assert`
+    sizes in the compile-gated `tests/c_abi_smoke.c` (which also
+    `#error`s on any missing `ZLSX_HAS_*` macro and takes every
+    export's address), ctypes `sizeof` asserts at `_ffi.py` import.
+    The fourteen `ZLSX_PLANE_*` values are ABI, pinned by a test
+    against the enum's declaration order.
 
 ### 12.4 Spark (batch-only)
 

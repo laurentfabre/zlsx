@@ -10,9 +10,10 @@
 //!   underlying state. Rows retain in `zlsx_rows_open` *before*
 //!   dereferencing any book state, so a refcount bump races cleanly
 //!   with `zlsx_book_close` on the same handle.
-//! * Allocator is `smp_allocator` (pure-Zig, no libc). On single-threaded
-//!   builds this falls back to `page_allocator` since smp_allocator
-//!   asserts `!builtin.single_threaded` at comptime.
+//! * Allocator is `smp_allocator` (pure-Zig, no libc). This module is
+//!   always multi-threaded (R9-12): `zlsx_cancel_token_trigger` is
+//!   documented callable from any thread, and -fsingle-threaded lowers
+//!   atomics to plain ops, so build.zig never forwards the option here.
 //! * Error messages are written into caller-provided buffers — no
 //!   thread-local storage, no static strings.
 //! * String slices returned through cells point into the `Book`'s
@@ -43,8 +44,10 @@ const std = @import("std");
 const fuzz_config = @import("fuzz_config");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const fingerprint_config = @import("fingerprint_config");
 const xlsx = @import("zlsx");
 const zlsx_pkg = @import("zlsx_pkg");
+const refs = @import("zlsx_refs");
 const writer_mod = xlsx.writer_types;
 
 pub const ZLSX_ABI_VERSION: u32 = 1;
@@ -53,14 +56,19 @@ pub const ZLSX_ABI_VERSION: u32 = 1;
 // C ABI export has the right type.
 pub const ZLSX_VERSION_STRING: [*:0]const u8 = std.fmt.comptimePrint("{s}", .{build_options.version});
 
+// R9-12 (M9a1): refuse to compile single-threaded. build.zig hard-sets
+// this module multi-threaded; the assertion catches any other build
+// graph before it can ship a token whose trigger is a plain store.
+comptime {
+    if (builtin.single_threaded) {
+        @compileError("the zlsx C ABI must be multi-threaded (R9-12): zlsx_cancel_token_t is a cross-thread atomic and -fsingle-threaded lowers atomics to plain ops");
+    }
+}
+
 // Allocator used for all handle state. smp_allocator is a singleton —
-// no per-handle allocator lifetime to worry about. smp_allocator asserts
-// !builtin.single_threaded at comptime, so single-threaded builds fall
-// back to page_allocator (also pure-Zig, no libc dep).
-const gpa: std.mem.Allocator = if (builtin.single_threaded)
-    std.heap.page_allocator
-else
-    std.heap.smp_allocator;
+// no per-handle allocator lifetime to worry about. Always available:
+// R9-12 pins this module multi-threaded.
+const gpa: std.mem.Allocator = std.heap.smp_allocator;
 
 // ─── Handle types ────────────────────────────────────────────────────
 
@@ -4711,4 +4719,1201 @@ export fn zlsx_emb_hashes(h: *Emb, i: usize, out: [*]u64, out_len: usize) callco
         out[k] = hp.value(@intCast(k)) catch return -1;
     }
     return 0;
+}
+
+// ─── Formula engine (M9a1) ───────────────────────────────────────────
+//
+// `zlsx_status_v1` + descriptor types + editor recalc/evaluate over the
+// M5d2 pipeline. The committed layout contract is
+// docs/plans/c-abi-status-v1.md; every offset it pins is asserted at
+// comptime below. Legacy exports above keep their shipped 0/-1
+// convention untouched — the status contract applies to NEW exports
+// only.
+
+const recalc_run = zlsx_pkg.recalc_run;
+const RunInputs = zlsx_pkg.RunInputs;
+const ResourceLimits = @FieldType(RunInputs, "limits");
+const Fidelity = @FieldType(RunInputs, "fidelity");
+const PlatformProfile = @FieldType(RunInputs, "platform_profile");
+const FormulaDialect = @FieldType(RunInputs, "dialect");
+const PlaneTwo = zlsx_pkg.recalc_txn.PlaneTwo;
+const EvaluateOptions = zlsx_pkg.EvaluateOptions;
+const EvalValue = @FieldType(zlsx_pkg.Evaluation, "value");
+const ScalarV = @FieldType(EvalValue, "scalar");
+const parse_limits_default: @FieldType(EvaluateOptions, "parse_limits") = .{};
+
+/// `zlsx_status_v1` (§12.3). New exports only.
+pub const ZLSX_OK: i32 = 0;
+pub const ZLSX_ERROR: i32 = -1;
+pub const ZLSX_REFUSED: i32 = -2;
+pub const ZLSX_NOMEM: i32 = -3;
+// -4 reserved, never returned by v1.
+pub const ZLSX_CANCELLED: i32 = -5;
+
+/// `zlsx_diag_v1.plane` when the diag carries no Plane-2 refusal, and
+/// `zlsx_resolved_v1.dialect` for a recalc (which derives dialect per
+/// stored cell and normalizes it out of the fingerprint, §5.3b).
+const plane_none: u32 = 0xFFFF_FFFF;
+const dialect_none: u32 = 0xFFFF_FFFF;
+
+const CCensusEntry = extern struct {
+    plane: u32,
+    sheet: u32,
+    /// One-based, as OOXML writes it; 0 = not about a cell.
+    row: u32,
+    /// Zero-based.
+    col: u32,
+};
+
+const CDiag = extern struct {
+    struct_size: usize,
+    plane: u32,
+    census_truncated: u32,
+    error_name: [64]u8,
+    census: ?[*]const CCensusEntry,
+    census_len: usize,
+};
+
+const CResolved = extern struct {
+    struct_size: usize,
+    now_utc_ms: i64,
+    rng_seed: u64,
+    utc_offset_min: i32,
+    fidelity: u32,
+    profile: u32,
+    dialect: u32,
+    max_run_arena_bytes: u64,
+    max_matrix_cells: u64,
+    max_string_payload_bytes: u64,
+    max_retained_ast_bytes: u64,
+    max_diagnostics_bytes: u64,
+};
+
+const CRun = extern struct {
+    struct_size: usize,
+    now_utc_ms: i64,
+    rng_seed: u64,
+    utc_offset_min: i32,
+    fidelity: u32,
+    profile: u32,
+    dialect: u32,
+    on_unsupported: u32,
+    _reserved0: u32,
+    max_run_arena_bytes: u64,
+    max_matrix_cells: u64,
+    max_string_payload_bytes: u64,
+    max_retained_ast_bytes: u64,
+    max_diagnostics_bytes: u64,
+    timeout_ms: u64,
+    cancel: ?*CancelTok,
+};
+
+const CRecalcReport = extern struct {
+    struct_size: usize,
+    sheets_patched: u32,
+    cells_written: u32,
+    passes: u32,
+    non_converged_cells: u32,
+    dynamic_passes: u32,
+    kept_stale: u32,
+    calc_chain_removed: u32,
+    census_truncated: u32,
+    retained_generations: u64,
+    retained_bytes: u64,
+    /// §5.7.9's dormant durability slot — 0 for the in-memory
+    /// transaction; M9a2's save export fills it.
+    durability_warning: u32,
+    durability_errno: i32,
+    resolved: CResolved,
+    resolved_present: u32,
+    _reserved0: u32,
+    census: ?[*]const CCensusEntry,
+    census_len: usize,
+};
+
+const CValueElem = extern struct {
+    tag: u8,
+    _reserved: [7]u8,
+    num: f64,
+    payload_off: u64,
+    payload_len: u64,
+};
+
+const CValue = extern struct {
+    struct_size: usize,
+    rows: u32,
+    cols: u32,
+    is_matrix: u32,
+    _reserved0: u32,
+    elems: ?[*]const CValueElem,
+    elems_len: usize,
+    payload: ?[*]const u8,
+    payload_len: usize,
+};
+
+const value_tag_number: u8 = 0;
+const value_tag_text: u8 = 1;
+const value_tag_bool: u8 = 2;
+const value_tag_error: u8 = 3;
+
+// Every offset the design note pins, enforced where the layout lives.
+// A drifted field is a compile error, not a corrupted caller.
+comptime {
+    const assert = std.debug.assert;
+    assert(@sizeOf(CCensusEntry) == 16);
+    assert(@offsetOf(CDiag, "plane") == 8);
+    assert(@offsetOf(CDiag, "error_name") == 16);
+    assert(@offsetOf(CDiag, "census") == 80);
+    assert(@offsetOf(CDiag, "census_len") == 88);
+    assert(@sizeOf(CDiag) == 96);
+    assert(@offsetOf(CResolved, "utc_offset_min") == 24);
+    assert(@offsetOf(CResolved, "max_run_arena_bytes") == 40);
+    assert(@sizeOf(CResolved) == 80);
+    assert(@offsetOf(CRun, "utc_offset_min") == 24);
+    assert(@offsetOf(CRun, "on_unsupported") == 40);
+    assert(@offsetOf(CRun, "max_run_arena_bytes") == 48);
+    assert(@offsetOf(CRun, "timeout_ms") == 88);
+    assert(@offsetOf(CRun, "cancel") == 96);
+    assert(@sizeOf(CRun) == 104);
+    assert(@offsetOf(CRecalcReport, "retained_generations") == 40);
+    assert(@offsetOf(CRecalcReport, "durability_warning") == 56);
+    assert(@offsetOf(CRecalcReport, "resolved") == 64);
+    assert(@offsetOf(CRecalcReport, "resolved_present") == 144);
+    assert(@offsetOf(CRecalcReport, "census") == 152);
+    assert(@offsetOf(CRecalcReport, "census_len") == 160);
+    assert(@sizeOf(CRecalcReport) == 168);
+    assert(@offsetOf(CValueElem, "num") == 8);
+    assert(@offsetOf(CValueElem, "payload_off") == 16);
+    assert(@offsetOf(CValueElem, "payload_len") == 24);
+    assert(@sizeOf(CValueElem) == 32);
+    assert(@offsetOf(CValue, "rows") == 8);
+    assert(@offsetOf(CValue, "elems") == 24);
+    assert(@offsetOf(CValue, "payload") == 40);
+    assert(@sizeOf(CValue) == 56);
+}
+
+/// Opaque cancel token. Heap-allocated atomic; `trigger` is a release
+/// store callable from any thread — the reason R9-12 pins this module
+/// multi-threaded.
+pub const CancelTok = extern struct { _opaque: u8 };
+
+const CancelTokenState = struct { flag: std.atomic.Value(bool) };
+
+export fn zlsx_cancel_token_new(
+    out: ?*?*CancelTok,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const slot = out orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    };
+    slot.* = null;
+    const state = gpa.create(CancelTokenState) catch {
+        writeError(err_buf, err_buf_len, "OutOfMemory");
+        return ZLSX_NOMEM;
+    };
+    state.* = .{ .flag = .{ .raw = false } };
+    slot.* = @ptrCast(state);
+    return ZLSX_OK;
+}
+
+/// Thread-safe; any thread. Triggering an already-triggered token is a
+/// no-op. NULL-safe.
+export fn zlsx_cancel_token_trigger(tok: ?*CancelTok) callconv(.c) void {
+    const state: *CancelTokenState = @ptrCast(@alignCast(tok orelse return));
+    state.flag.store(true, .release);
+}
+
+/// Caller-owned lifetime: the token must outlive every call it was
+/// passed to. NULL-safe.
+export fn zlsx_cancel_token_free(tok: ?*CancelTok) callconv(.c) void {
+    const state: *CancelTokenState = @ptrCast(@alignCast(tok orelse return));
+    gpa.destroy(state);
+}
+
+/// §12.4's engine identity: semantic version + the three rule versions
+/// + target triple + build hash, one static string. M9b keys Spark's
+/// mixed-fleet refusal on it; the bare version string above is a
+/// component, not the identity.
+const engine_fingerprint_str = std.fmt.comptimePrint(
+    "zlsx {s}; {s}; {s}; {s}; {s}-{s}-{s}; {s}",
+    .{
+        build_options.version,
+        recalc_run.rule_versions.excel_fp,
+        recalc_run.rule_versions.rng,
+        recalc_run.rule_versions.collation,
+        @tagName(builtin.target.cpu.arch),
+        @tagName(builtin.target.os.tag),
+        @tagName(builtin.target.abi),
+        fingerprint_config.build_hash,
+    },
+);
+
+export fn zlsx_engine_fingerprint() callconv(.c) [*:0]const u8 {
+    return engine_fingerprint_str;
+}
+
+/// §12.3's struct_size discipline for output structs: reject below the
+/// v1 minimum (before any byte is written), then zero exactly
+/// [after struct_size, known) — never a byte beyond the known prefix,
+/// even when the caller declared more.
+fn prepOut(comptime T: type, ptr: *T, err_buf: ?[*]u8, err_buf_len: usize) bool {
+    if (ptr.struct_size < @sizeOf(T)) {
+        writeError(err_buf, err_buf_len, "StructSizeTooSmall");
+        return false;
+    }
+    const bytes: [*]u8 = @ptrCast(ptr);
+    @memset(bytes[@sizeOf(usize)..@sizeOf(T)], 0);
+    return true;
+}
+
+fn checkIn(comptime T: type, ptr: *const T, err_buf: ?[*]u8, err_buf_len: usize) bool {
+    if (ptr.struct_size < @sizeOf(T)) {
+        writeError(err_buf, err_buf_len, "StructSizeTooSmall");
+        return false;
+    }
+    return true;
+}
+
+fn prepDiag(diag: ?*CDiag, err_buf: ?[*]u8, err_buf_len: usize) bool {
+    const d = diag orelse return true;
+    if (!prepOut(CDiag, d, err_buf, err_buf_len)) return false;
+    d.plane = plane_none;
+    return true;
+}
+
+/// One error→status mapping (design note §2): OOM, cancellation, then
+/// exactly the fourteen-plane §10 vocabulary as typed refusals;
+/// everything else is a generic -1 with the error name in errbuf.
+fn statusOf(e: anyerror) i32 {
+    switch (e) {
+        error.OutOfMemory => return ZLSX_NOMEM,
+        error.Cancelled => return ZLSX_CANCELLED,
+        else => {},
+    }
+    inline for (@typeInfo(PlaneTwo).@"enum".fields) |f| {
+        if (std.mem.eql(u8, f.name, @errorName(e))) return ZLSX_REFUSED;
+    }
+    return ZLSX_ERROR;
+}
+
+fn diagSetError(diag: ?*CDiag, name: []const u8) void {
+    const d = diag orelse return;
+    const n = @min(name.len, d.error_name.len - 1);
+    @memcpy(d.error_name[0..n], name[0..n]);
+    d.error_name[n] = 0;
+    inline for (@typeInfo(PlaneTwo).@"enum".fields) |f| {
+        if (std.mem.eql(u8, f.name, name)) d.plane = f.value;
+    }
+}
+
+fn failMapped(e: anyerror, diag: ?*CDiag, err_buf: ?[*]u8, err_buf_len: usize) i32 {
+    const status = statusOf(e);
+    writeError(err_buf, err_buf_len, @errorName(e));
+    if (status == ZLSX_REFUSED) diagSetError(diag, @errorName(e));
+    return status;
+}
+
+fn refuseNamed(name: []const u8, diag: ?*CDiag, err_buf: ?[*]u8, err_buf_len: usize) i32 {
+    writeError(err_buf, err_buf_len, name);
+    diagSetError(diag, name);
+    return ZLSX_REFUSED;
+}
+
+/// Narrow a `zlsx_run_v1` into the engine's `RunInputs`. Unknown enum
+/// values and out-of-range fields are ABI-contract violations (-1),
+/// not refusals — they are statements about the call.
+fn runFromC(crun: *const CRun, io: std.Io, err_buf: ?[*]u8, err_buf_len: usize) ?RunInputs {
+    const fidelity: Fidelity = switch (crun.fidelity) {
+        0 => .excel,
+        1 => .ieee,
+        else => {
+            writeError(err_buf, err_buf_len, "InvalidInput");
+            return null;
+        },
+    };
+    const profile: PlatformProfile = switch (crun.profile) {
+        0 => .windows_1252,
+        else => {
+            writeError(err_buf, err_buf_len, "InvalidInput");
+            return null;
+        },
+    };
+    const dialect: FormulaDialect = switch (crun.dialect) {
+        0 => .dynamic_array,
+        1 => .legacy,
+        else => {
+            writeError(err_buf, err_buf_len, "InvalidInput");
+            return null;
+        },
+    };
+    var limits: ResourceLimits = .{};
+    if (crun.max_run_arena_bytes != 0) limits.max_run_arena_bytes = crun.max_run_arena_bytes;
+    if (crun.max_matrix_cells != 0) limits.max_matrix_cells = crun.max_matrix_cells;
+    if (crun.max_string_payload_bytes != 0) limits.max_string_payload_bytes = crun.max_string_payload_bytes;
+    if (crun.max_retained_ast_bytes != 0) limits.max_retained_ast_bytes = crun.max_retained_ast_bytes;
+    if (crun.max_diagnostics_bytes != 0) limits.max_diagnostics_bytes = crun.max_diagnostics_bytes;
+    var ri: RunInputs = .{
+        .now_utc_ms = crun.now_utc_ms,
+        .rng_seed = crun.rng_seed,
+        .limits = limits,
+        .utc_offset_min = crun.utc_offset_min,
+        .fidelity = fidelity,
+        .platform_profile = profile,
+        .dialect = dialect,
+    };
+    if (crun.cancel) |tok| {
+        const cstate: *CancelTokenState = @ptrCast(@alignCast(tok));
+        ri.cancel = .{ .atomic = &cstate.flag };
+    }
+    if (crun.timeout_ms != 0) {
+        const now = std.Io.Timestamp.now(io, .awake);
+        const Ns = @TypeOf(now.nanoseconds);
+        ri.deadline = .{ .nanoseconds = now.nanoseconds + @as(Ns, @intCast(crun.timeout_ms)) * 1_000_000 };
+    }
+    ri.validate() catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return null;
+    };
+    return ri;
+}
+
+fn fillResolved(dst: *CResolved, eff: anytype) void {
+    dst.struct_size = @sizeOf(CResolved);
+    dst.now_utc_ms = eff.now_utc_ms;
+    dst.rng_seed = eff.rng_seed;
+    dst.utc_offset_min = eff.utc_offset_min;
+    dst.fidelity = switch (eff.fidelity) {
+        .excel => 0,
+        .ieee => 1,
+    };
+    dst.profile = switch (eff.platform_profile) {
+        .windows_1252 => 0,
+    };
+    dst.dialect = if (eff.dialect) |d| switch (d) {
+        .dynamic_array => @as(u32, 0),
+        .legacy => 1,
+    } else dialect_none;
+    dst.max_run_arena_bytes = eff.limits.max_run_arena_bytes;
+    dst.max_matrix_cells = eff.limits.max_matrix_cells;
+    dst.max_string_payload_bytes = eff.limits.max_string_payload_bytes;
+    dst.max_retained_ast_bytes = eff.limits.max_retained_ast_bytes;
+    dst.max_diagnostics_bytes = eff.limits.max_diagnostics_bytes;
+}
+
+fn censusToC(census: anytype) error{OutOfMemory}!?[]CCensusEntry {
+    if (census.len == 0) return null;
+    const arr = try gpa.alloc(CCensusEntry, census.len);
+    for (census, arr) |u, *dst| dst.* = .{
+        .plane = @intFromEnum(u.plane),
+        .sheet = u.sheet,
+        .row = u.row,
+        .col = u.col,
+    };
+    return arr;
+}
+
+fn payloadLenOf(p: recalc_run.PublishedScalar) usize {
+    return switch (p) {
+        .text => |t| t.len,
+        .err => |e| e.spelling().len,
+        else => 0,
+    };
+}
+
+fn pubElem(p: recalc_run.PublishedScalar, payload: []u8, cursor: *usize) CValueElem {
+    var elem: CValueElem = .{
+        .tag = value_tag_number,
+        ._reserved = @splat(0),
+        .num = 0,
+        .payload_off = 0,
+        .payload_len = 0,
+    };
+    switch (p) {
+        .number => |v| elem.num = v,
+        .boolean => |b| {
+            elem.tag = value_tag_bool;
+            elem.num = if (b) 1 else 0;
+        },
+        .text => |t| {
+            elem.tag = value_tag_text;
+            @memcpy(payload[cursor.* .. cursor.* + t.len], t);
+            elem.payload_off = cursor.*;
+            elem.payload_len = t.len;
+            cursor.* += t.len;
+        },
+        .err => |e| {
+            const s = e.spelling();
+            elem.tag = value_tag_error;
+            @memcpy(payload[cursor.* .. cursor.* + s.len], s);
+            elem.payload_off = cursor.*;
+            elem.payload_len = s.len;
+            cursor.* += s.len;
+        },
+    }
+    return elem;
+}
+
+/// Copy an evaluated value into C-owned descriptors. Blank never
+/// crosses: §5.3a's publish seam converts as the elements are copied.
+fn buildValue(out: *CValue, value: EvalValue, fidelity: Fidelity) error{OutOfMemory}!void {
+    switch (value) {
+        .array => |m| {
+            const n = m.cells.len;
+            var payload_bytes: usize = 0;
+            for (m.cells) |s| payload_bytes += payloadLenOf(recalc_run.publish(s, fidelity));
+            const elems = try gpa.alloc(CValueElem, n);
+            errdefer gpa.free(elems);
+            const payload: []u8 = if (payload_bytes > 0) try gpa.alloc(u8, payload_bytes) else &.{};
+            var cursor: usize = 0;
+            for (m.cells, elems) |s, *dst| {
+                dst.* = pubElem(recalc_run.publish(s, fidelity), payload, &cursor);
+            }
+            out.rows = @intCast(m.rows);
+            out.cols = @intCast(m.cols);
+            out.is_matrix = 1;
+            out.elems = elems.ptr;
+            out.elems_len = n;
+            if (payload_bytes > 0) {
+                out.payload = payload.ptr;
+                out.payload_len = payload_bytes;
+            }
+        },
+        .reference => unreachable, // dereferenced before return (§5.3b)
+        else => {
+            const scalar: ScalarV = switch (value) {
+                .scalar => |s| s,
+                .missing_arg => .blank,
+                else => unreachable,
+            };
+            const p = recalc_run.publish(scalar, fidelity);
+            const payload_bytes = payloadLenOf(p);
+            const elems = try gpa.alloc(CValueElem, 1);
+            errdefer gpa.free(elems);
+            const payload: []u8 = if (payload_bytes > 0) try gpa.alloc(u8, payload_bytes) else &.{};
+            var cursor: usize = 0;
+            elems[0] = pubElem(p, payload, &cursor);
+            out.rows = 1;
+            out.cols = 1;
+            out.is_matrix = 0;
+            out.elems = elems.ptr;
+            out.elems_len = 1;
+            if (payload_bytes > 0) {
+                out.payload = payload.ptr;
+                out.payload_len = payload_bytes;
+            }
+        },
+    }
+}
+
+/// Release the library-owned interior of a `zlsx_value_v1`. The struct
+/// itself is the caller's. NULL-safe; safe on a zeroed struct; resets
+/// the released fields so a second call is a no-op.
+export fn zlsx_value_release(v: ?*CValue) callconv(.c) void {
+    const val = v orelse return;
+    if (val.elems) |ptr| gpa.free(ptr[0..val.elems_len]);
+    val.elems = null;
+    val.elems_len = 0;
+    if (val.payload) |ptr| {
+        if (val.payload_len > 0) gpa.free(ptr[0..val.payload_len]);
+    }
+    val.payload = null;
+    val.payload_len = 0;
+}
+
+export fn zlsx_recalc_report_release(r: ?*CRecalcReport) callconv(.c) void {
+    const rep = r orelse return;
+    if (rep.census) |ptr| gpa.free(ptr[0..rep.census_len]);
+    rep.census = null;
+    rep.census_len = 0;
+}
+
+export fn zlsx_diag_release(d: ?*CDiag) callconv(.c) void {
+    const diag = d orelse return;
+    if (diag.census) |ptr| gpa.free(ptr[0..diag.census_len]);
+    diag.census = null;
+    diag.census_len = 0;
+}
+
+/// §5.7.7's mark-only transaction: keep every cache, set
+/// `fullCalcOnLoad="1"`, remove nothing else. Refusals (e.g.
+/// `FormulaPrecisionAsDisplayed`) are typed -2 with the diag populated.
+export fn zlsx_editor_mark_recalc_on_load(
+    ed: ?*Editor,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state: *EditorState = @ptrCast(@alignCast(ed orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    }));
+    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
+    state.inner.workbook.markRecalcOnLoad() catch |e| {
+        return failMapped(e, diag, err_buf, err_buf_len);
+    };
+    return ZLSX_OK;
+}
+
+/// §5.7's in-memory transaction over the M5d2 pipeline: recalculate
+/// every formula cell and swap the result in as the final operation.
+/// On refusal, cancellation or allocation failure the workbook is
+/// exactly as it was. No file is opened or written.
+export fn zlsx_editor_recalculate(
+    ed: ?*Editor,
+    run: ?*const CRun,
+    report: ?*CRecalcReport,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state: *EditorState = @ptrCast(@alignCast(ed orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    }));
+    const crun = run orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    };
+    const out = report orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    };
+    // Prep every output first — each gated on its own struct_size and
+    // zeroed independently, so a failure anywhere (including a sibling
+    // struct's size) leaves every ACCEPTED output zeroed and therefore
+    // releasable. A rejected struct is left byte-for-byte untouched.
+    var outputs_ok = prepOut(CRecalcReport, out, err_buf, err_buf_len);
+    if (outputs_ok) out.resolved.struct_size = @sizeOf(CResolved);
+    if (!prepDiag(diag, err_buf, err_buf_len)) outputs_ok = false;
+    if (!outputs_ok) return ZLSX_ERROR;
+    if (!checkIn(CRun, crun, err_buf, err_buf_len)) return ZLSX_ERROR;
+
+    const io = state.threaded.io();
+    const ri = runFromC(crun, io, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const opts: recalc_run.Options = .{
+        .on_unsupported = switch (crun.on_unsupported) {
+            0 => .refuse,
+            1 => .keep_stale_and_mark,
+            else => {
+                writeError(err_buf, err_buf_len, "InvalidInput");
+                return ZLSX_ERROR;
+            },
+        },
+    };
+
+    var rep = state.inner.workbook.recalculate(gpa, io, ri, opts) catch |e| {
+        return failMapped(e, diag, err_buf, err_buf_len);
+    };
+    defer rep.deinit(gpa);
+
+    out.sheets_patched = rep.sheets_patched;
+    out.cells_written = rep.cells_written;
+    out.passes = rep.passes;
+    out.non_converged_cells = rep.non_converged_cells;
+    out.dynamic_passes = rep.dynamic_passes;
+    out.kept_stale = @intFromBool(rep.kept_stale);
+    out.calc_chain_removed = @intFromBool(rep.calc_chain_removed);
+    out.census_truncated = @intFromBool(rep.census_truncated);
+    out.retained_generations = @intCast(rep.retained_generations);
+    out.retained_bytes = rep.retained_bytes;
+    out.durability_warning = @intFromBool(rep.durability.warning);
+    out.durability_errno = rep.durability.err_code;
+    if (rep.resolved) |eff| {
+        fillResolved(&out.resolved, eff);
+        out.resolved_present = 1;
+    }
+    const census = censusToC(rep.census) catch {
+        writeError(err_buf, err_buf_len, "OutOfMemory");
+        return ZLSX_NOMEM;
+    };
+    if (census) |arr| {
+        out.census = arr.ptr;
+        out.census_len = arr.len;
+    }
+    return ZLSX_OK;
+}
+
+/// M6's `zlsx eval` semantics over `Workbook.evaluate`: a cache-based
+/// standalone read. Scratch-only — the workbook's logical state and
+/// serialized bytes are byte-identical before and after (§5.6f purity);
+/// eval never commits, so an observed trigger is always pre-commit.
+export fn zlsx_editor_evaluate(
+    ed: ?*Editor,
+    formula_ptr: ?[*]const u8,
+    formula_len: usize,
+    sheet_idx: u32,
+    anchor_row: u32,
+    anchor_col: u32,
+    run: ?*const CRun,
+    out_value: ?*CValue,
+    out_resolved: ?*CResolved,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state: *EditorState = @ptrCast(@alignCast(ed orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    }));
+    const crun = run orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    };
+    const out = out_value orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    };
+    // Same output-first discipline as recalculate: every accepted
+    // output is zeroed before any input check can fail the call.
+    var outputs_ok = prepOut(CValue, out, err_buf, err_buf_len);
+    if (out_resolved) |res| {
+        if (!prepOut(CResolved, res, err_buf, err_buf_len)) outputs_ok = false;
+    }
+    if (!prepDiag(diag, err_buf, err_buf_len)) outputs_ok = false;
+    if (!outputs_ok) return ZLSX_ERROR;
+    if (!checkIn(CRun, crun, err_buf, err_buf_len)) return ZLSX_ERROR;
+
+    // Bound before the slice exists: the boundary never constructs a
+    // slice it hasn't checked. One-past-limit is the fixture.
+    if (formula_len > parse_limits_default.max_formula_utf8_bytes) {
+        return refuseNamed("FormulaLimitExceeded", diag, err_buf, err_buf_len);
+    }
+    if (formula_len > 0 and formula_ptr == null) {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    }
+    const formula: []const u8 = if (formula_len == 0) "" else formula_ptr.?[0..formula_len];
+
+    const io = state.threaded.io();
+    const ri = runFromC(crun, io, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+
+    var site: ?@typeInfo(@FieldType(EvaluateOptions, "site")).optional.child = null;
+    if (anchor_row != 0) {
+        const row = refs.Row.fromOneBased(anchor_row) catch |e| {
+            writeError(err_buf, err_buf_len, @errorName(e));
+            return ZLSX_ERROR;
+        };
+        const col = refs.Col.fromZeroBased(anchor_col) catch |e| {
+            writeError(err_buf, err_buf_len, @errorName(e));
+            return ZLSX_ERROR;
+        };
+        site = .{ .row = row, .col = col };
+    }
+
+    // Observed-before-commit, checked the way the M6 CLI checks: at
+    // entry and again before results cross the boundary.
+    const ctl: zlsx_pkg.Control = .{ .cancel = ri.cancel, .deadline = ri.deadline };
+    ctl.check(io) catch {
+        writeError(err_buf, err_buf_len, "Cancelled");
+        return ZLSX_CANCELLED;
+    };
+
+    var result = state.inner.workbook.evaluate(gpa, sheet_idx, formula, .{
+        .collation = recalc_run.collation_v1,
+        .fidelity = ri.fidelity,
+        .dialect = ri.dialect,
+        .site = site,
+        .now_utc_ms = ri.now_utc_ms,
+        .utc_offset_min = ri.utc_offset_min,
+        .platform_profile = ri.platform_profile,
+    }) catch |e| {
+        return failMapped(e, diag, err_buf, err_buf_len);
+    };
+    defer result.deinit();
+
+    switch (result) {
+        .ok => |*evaluation| {
+            ctl.check(io) catch {
+                writeError(err_buf, err_buf_len, "Cancelled");
+                return ZLSX_CANCELLED;
+            };
+            buildValue(out, evaluation.value, ri.fidelity) catch {
+                writeError(err_buf, err_buf_len, "OutOfMemory");
+                return ZLSX_NOMEM;
+            };
+            if (out_resolved) |res| fillResolved(res, ri.effective(.standalone_eval));
+            return ZLSX_OK;
+        },
+        .refused => |r| return refuseNamed(@tagName(r.planeTwo()), diag, err_buf, err_buf_len),
+        .parse_refused => |r| return refuseNamed(@tagName(r.planeTwo()), diag, err_buf, err_buf_len),
+        .graph_refused => |r| return refuseNamed(@tagName(r.planeTwo()), diag, err_buf, err_buf_len),
+        .iteration_refused => |r| return refuseNamed(@tagName(r.planeTwo()), diag, err_buf, err_buf_len),
+        .eval_refused => |r| return refuseNamed(@tagName(r.plane), diag, err_buf, err_buf_len),
+    }
+}
+
+// ─── M9a1 tests ──────────────────────────────────────────────────────
+
+/// A1 = 1 (plain), B1 = formula "A1+2" with cached <v>0</v> — one
+/// stale cell for recalculate to rewrite, written through the C
+/// surface so the test crosses the same boundary a binding does.
+fn writeM9a1Fixture(io: std.Io, tt: *TestTmp) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const path = try tt.path(alloc, io, "m9a1.xlsx");
+    errdefer alloc.free(path);
+    var err_buf: [128]u8 = undefined;
+    const w = zlsx_writer_create(&err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_writer_close(w);
+    const name = "Sheet1";
+    const sw = zlsx_writer_add_sheet(w, name.ptr, name.len, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    const cells = [_]CCell{ toCCell(.{ .number = 1 }), toCCell(.{ .number = 0 }) };
+    const formula = "A1+2";
+    const fptrs = [_]?[*]const u8{ null, formula.ptr };
+    const flens = [_]usize{ 0, formula.len };
+    if (zlsx_sheet_writer_write_row_with_formulas(sw, &cells, &fptrs, &flens, cells.len, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    if (zlsx_writer_save(w, path.ptr, path.len, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    return path;
+}
+
+fn zeroRun() CRun {
+    var crun = std.mem.zeroes(CRun);
+    crun.struct_size = @sizeOf(CRun);
+    return crun;
+}
+
+test "zlsx_status_v1: the fourteen plane values are pinned ABI" {
+    // The C header hard-codes these numbers; the enum's declaration
+    // order is what they pin. A reorder is an ABI break and fails here.
+    const names = [_][]const u8{
+        "FormulaUnsupportedFunction",
+        "FormulaUnsupportedConstruct",
+        "FormulaPrecisionAsDisplayed",
+        "FormulaMalformedInput",
+        "FormulaLocaleSensitiveInput",
+        "FormulaDataTableUnsupported",
+        "FormulaSignedWorkbook",
+        "FormulaStaleEmbeddings",
+        "FormulaAnchorRequired",
+        "FormulaCycle",
+        "FormulaDynamicRefUnstable",
+        "FormulaSpillPersistUnsupported",
+        "FormulaResultNotRepresentable",
+        "FormulaLimitExceeded",
+    };
+    const fields = @typeInfo(PlaneTwo).@"enum".fields;
+    try std.testing.expectEqual(names.len, fields.len);
+    inline for (fields, 0..) |f, i| {
+        try std.testing.expectEqualStrings(names[i], f.name);
+        try std.testing.expectEqual(i, f.value);
+    }
+}
+
+test "zlsx_engine_fingerprint: names every identity component" {
+    const fp = std.mem.span(zlsx_engine_fingerprint());
+    try std.testing.expect(std.mem.indexOf(u8, fp, build_options.version) != null);
+    try std.testing.expect(std.mem.indexOf(u8, fp, "excel_fp_rules_v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fp, "rng_v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fp, "collation_v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fp, @tagName(builtin.target.cpu.arch)) != null);
+    // Two calls, one static string — no allocation to leak.
+    try std.testing.expectEqual(zlsx_engine_fingerprint(), zlsx_engine_fingerprint());
+}
+
+test "cancel token: lifecycle, and a pre-triggered token cancels both entry points" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeM9a1Fixture(io, &tt);
+    defer std.testing.allocator.free(path);
+
+    var err_buf: [128]u8 = undefined;
+    var tok: ?*CancelTok = null;
+    try std.testing.expectEqual(ZLSX_OK, zlsx_cancel_token_new(&tok, &err_buf, err_buf.len));
+    try std.testing.expect(tok != null);
+    defer zlsx_cancel_token_free(tok);
+    zlsx_cancel_token_trigger(tok);
+    zlsx_cancel_token_trigger(tok); // re-trigger is a no-op
+
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+
+    var crun = zeroRun();
+    crun.cancel = tok;
+
+    var report = std.mem.zeroes(CRecalcReport);
+    report.struct_size = @sizeOf(CRecalcReport);
+    try std.testing.expectEqual(ZLSX_CANCELLED, zlsx_editor_recalculate(ed, &crun, &report, null, &err_buf, err_buf.len));
+
+    var val = std.mem.zeroes(CValue);
+    val.struct_size = @sizeOf(CValue);
+    const f = "=1+2";
+    try std.testing.expectEqual(ZLSX_CANCELLED, zlsx_editor_evaluate(ed, f.ptr, f.len, 0, 0, 0, &crun, &val, null, null, &err_buf, err_buf.len));
+
+    // NULL-safety of the token exports.
+    zlsx_cancel_token_trigger(null);
+    zlsx_cancel_token_free(null);
+}
+
+test "M9a1 end-to-end: recalculate rewrites the stale cell, evaluate reads, mark marks" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeM9a1Fixture(io, &tt);
+    defer std.testing.allocator.free(path);
+
+    var err_buf: [128]u8 = undefined;
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+
+    var crun = zeroRun();
+    crun.now_utc_ms = 1_700_000_000_000;
+    crun.rng_seed = 42;
+
+    var report = std.mem.zeroes(CRecalcReport);
+    report.struct_size = @sizeOf(CRecalcReport);
+    var diag = std.mem.zeroes(CDiag);
+    diag.struct_size = @sizeOf(CDiag);
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_recalculate(ed, &crun, &report, &diag, &err_buf, err_buf.len));
+    try std.testing.expect(report.cells_written >= 1);
+    try std.testing.expectEqual(@as(u32, 1), report.resolved_present);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000_000), report.resolved.now_utc_ms);
+    try std.testing.expectEqual(@as(u64, 42), report.resolved.rng_seed);
+    // A recalc derives dialect per stored cell — the echo says so.
+    try std.testing.expectEqual(dialect_none, report.resolved.dialect);
+    // Defaults echo as numbers, never as 0.
+    try std.testing.expect(report.resolved.max_run_arena_bytes > 0);
+    try std.testing.expectEqual(@as(u32, 0), report.kept_stale);
+    try std.testing.expectEqual(@as(u32, 0), report.durability_warning);
+    try std.testing.expectEqual(plane_none, diag.plane);
+    zlsx_recalc_report_release(&report);
+    zlsx_diag_release(&diag);
+
+    // Scalar number.
+    var val = std.mem.zeroes(CValue);
+    val.struct_size = @sizeOf(CValue);
+    var resolved = std.mem.zeroes(CResolved);
+    resolved.struct_size = @sizeOf(CResolved);
+    const f_num = "=A1+2";
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_evaluate(ed, f_num.ptr, f_num.len, 0, 0, 0, &crun, &val, &resolved, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(u32, 0), val.is_matrix);
+    try std.testing.expectEqual(@as(usize, 1), val.elems_len);
+    try std.testing.expectEqual(value_tag_number, val.elems.?[0].tag);
+    try std.testing.expectEqual(@as(f64, 3), val.elems.?[0].num);
+    // Standalone eval states its dialect; the echo carries it.
+    try std.testing.expectEqual(@as(u32, 0), resolved.dialect);
+    zlsx_value_release(&val);
+
+    // Text, through the payload arena.
+    val = std.mem.zeroes(CValue);
+    val.struct_size = @sizeOf(CValue);
+    const f_text = "=\"a\"&\"b\"";
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_evaluate(ed, f_text.ptr, f_text.len, 0, 0, 0, &crun, &val, null, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(value_tag_text, val.elems.?[0].tag);
+    const t = val.elems.?[0];
+    try std.testing.expectEqualStrings("ab", val.payload.?[t.payload_off .. t.payload_off + t.payload_len]);
+    zlsx_value_release(&val);
+
+    // An Excel error VALUE is a successful result (plane 1), not a status.
+    val = std.mem.zeroes(CValue);
+    val.struct_size = @sizeOf(CValue);
+    const f_err = "=1/0";
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_evaluate(ed, f_err.ptr, f_err.len, 0, 0, 0, &crun, &val, null, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(value_tag_error, val.elems.?[0].tag);
+    const e = val.elems.?[0];
+    try std.testing.expectEqualStrings("#DIV/0!", val.payload.?[e.payload_off .. e.payload_off + e.payload_len]);
+    zlsx_value_release(&val);
+
+    // Matrix, row-major.
+    val = std.mem.zeroes(CValue);
+    val.struct_size = @sizeOf(CValue);
+    const f_mat = "={1,2;3,4}";
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_evaluate(ed, f_mat.ptr, f_mat.len, 0, 0, 0, &crun, &val, null, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(u32, 1), val.is_matrix);
+    try std.testing.expectEqual(@as(u32, 2), val.rows);
+    try std.testing.expectEqual(@as(u32, 2), val.cols);
+    try std.testing.expectEqual(@as(usize, 4), val.elems_len);
+    try std.testing.expectEqual(@as(f64, 3), val.elems.?[2].num);
+    zlsx_value_release(&val);
+
+    // Blank publishes as 0 — the word "blank" never crosses.
+    val = std.mem.zeroes(CValue);
+    val.struct_size = @sizeOf(CValue);
+    const f_blank = "=D7";
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_evaluate(ed, f_blank.ptr, f_blank.len, 0, 0, 0, &crun, &val, null, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(value_tag_number, val.elems.?[0].tag);
+    try std.testing.expectEqual(@as(f64, 0), val.elems.?[0].num);
+    zlsx_value_release(&val);
+
+    // Typed refusals populate the diag.
+    diag = std.mem.zeroes(CDiag);
+    diag.struct_size = @sizeOf(CDiag);
+    const f_bad = "=1+";
+    try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_evaluate(ed, f_bad.ptr, f_bad.len, 0, 0, 0, &crun, &val, null, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("FormulaMalformedInput", std.mem.sliceTo(&diag.error_name, 0));
+    try std.testing.expectEqual(@intFromEnum(PlaneTwo.FormulaMalformedInput), diag.plane);
+    zlsx_diag_release(&diag);
+
+    // §5.7.7's mark-only transaction over the same handle.
+    diag = std.mem.zeroes(CDiag);
+    diag.struct_size = @sizeOf(CDiag);
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_mark_recalc_on_load(ed, &diag, &err_buf, err_buf.len));
+}
+
+test "M9a1 narrowing: every boundary rejects what the engine never sees" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeM9a1Fixture(io, &tt);
+    defer std.testing.allocator.free(path);
+
+    var err_buf: [128]u8 = undefined;
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+
+    var report = std.mem.zeroes(CRecalcReport);
+    var val = std.mem.zeroes(CValue);
+    const f = "=1+2";
+
+    // Unknown enum values are contract violations, not refusals.
+    inline for (.{ "fidelity", "profile", "dialect", "on_unsupported" }) |field| {
+        var crun = zeroRun();
+        @field(crun, field) = 99;
+        report = std.mem.zeroes(CRecalcReport);
+        report.struct_size = @sizeOf(CRecalcReport);
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_recalculate(ed, &crun, &report, null, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+    }
+
+    // utc_offset_min outside [-1440, 1440], validated pre-narrowing.
+    inline for (.{ @as(i32, 1441), @as(i32, -1441) }) |off| {
+        var crun = zeroRun();
+        crun.utc_offset_min = off;
+        report = std.mem.zeroes(CRecalcReport);
+        report.struct_size = @sizeOf(CRecalcReport);
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_recalculate(ed, &crun, &report, null, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("UtcOffsetOutOfRange", std.mem.sliceTo(&err_buf, 0));
+    }
+
+    // A limit above the §9 hard ceiling (4× default) is rejected by the
+    // same validator every layer uses.
+    {
+        var crun = zeroRun();
+        crun.max_matrix_cells = std.math.maxInt(u64);
+        report = std.mem.zeroes(CRecalcReport);
+        report.struct_size = @sizeOf(CRecalcReport);
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_recalculate(ed, &crun, &report, null, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("LimitOutOfRange", std.mem.sliceTo(&err_buf, 0));
+    }
+
+    // Field-width extremes on the evaluate boundary.
+    {
+        var crun = zeroRun();
+        val = std.mem.zeroes(CValue);
+        val.struct_size = @sizeOf(CValue);
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_evaluate(ed, f.ptr, f.len, std.math.maxInt(u32), 0, 0, &crun, &val, null, null, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("SheetNotFound", std.mem.sliceTo(&err_buf, 0));
+
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_evaluate(ed, f.ptr, f.len, 0, std.math.maxInt(u32), 0, &crun, &val, null, null, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("InvalidRef", std.mem.sliceTo(&err_buf, 0));
+
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_evaluate(ed, f.ptr, f.len, 0, 1, std.math.maxInt(u32), &crun, &val, null, null, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("InvalidRef", std.mem.sliceTo(&err_buf, 0));
+    }
+
+    // One past the parser's byte limit refuses as the Plane-2 limit —
+    // before the slice is ever formed.
+    {
+        var crun = zeroRun();
+        var diag = std.mem.zeroes(CDiag);
+        diag.struct_size = @sizeOf(CDiag);
+        val = std.mem.zeroes(CValue);
+        val.struct_size = @sizeOf(CValue);
+        const big = try std.testing.allocator.alloc(u8, parse_limits_default.max_formula_utf8_bytes + 1);
+        defer std.testing.allocator.free(big);
+        @memset(big, 'A');
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_evaluate(ed, big.ptr, big.len, 0, 0, 0, &crun, &val, null, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("FormulaLimitExceeded", std.mem.sliceTo(&diag.error_name, 0));
+        try std.testing.expectEqual(@intFromEnum(PlaneTwo.FormulaLimitExceeded), diag.plane);
+    }
+
+    // NULL where required.
+    {
+        var crun = zeroRun();
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_recalculate(ed, &crun, null, null, &err_buf, err_buf.len));
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_recalculate(null, &crun, &report, null, &err_buf, err_buf.len));
+        val = std.mem.zeroes(CValue);
+        val.struct_size = @sizeOf(CValue);
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_evaluate(ed, null, 5, 0, 0, 0, &crun, &val, null, null, &err_buf, err_buf.len));
+    }
+}
+
+test "M9a1 canary-tail: bytes beyond the known prefix are never written" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeM9a1Fixture(io, &tt);
+    defer std.testing.allocator.free(path);
+
+    var err_buf: [128]u8 = undefined;
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    var crun = zeroRun();
+
+    // A "newer caller" declares more than this library knows. Success
+    // path: the tail stays untouched.
+    {
+        var buf: [@sizeOf(CRecalcReport) + 64]u8 align(@alignOf(CRecalcReport)) = undefined;
+        @memset(&buf, 0xAA);
+        const rp: *CRecalcReport = @ptrCast(&buf);
+        rp.struct_size = buf.len;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_recalculate(ed, &crun, rp, null, &err_buf, err_buf.len));
+        for (buf[@sizeOf(CRecalcReport)..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+        zlsx_recalc_report_release(rp);
+    }
+    // Failure path (unknown fidelity): tail still untouched.
+    {
+        var bad = zeroRun();
+        bad.fidelity = 99;
+        var buf: [@sizeOf(CRecalcReport) + 64]u8 align(@alignOf(CRecalcReport)) = undefined;
+        @memset(&buf, 0xAA);
+        const rp: *CRecalcReport = @ptrCast(&buf);
+        rp.struct_size = buf.len;
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_recalculate(ed, &bad, rp, null, &err_buf, err_buf.len));
+        for (buf[@sizeOf(CRecalcReport)..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+    }
+    // Below the v1 minimum: rejected before ANY byte is written — the
+    // zero-init itself must not have happened.
+    {
+        var buf: [@sizeOf(CRecalcReport)]u8 align(@alignOf(CRecalcReport)) = undefined;
+        @memset(&buf, 0xAA);
+        const rp: *CRecalcReport = @ptrCast(&buf);
+        rp.struct_size = @sizeOf(CRecalcReport) - 1;
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_recalculate(ed, &crun, rp, null, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("StructSizeTooSmall", std.mem.sliceTo(&err_buf, 0));
+        for (buf[@sizeOf(usize)..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+    }
+    // Same discipline on the value and diag structs.
+    {
+        var buf: [@sizeOf(CValue) + 32]u8 align(@alignOf(CValue)) = undefined;
+        @memset(&buf, 0xAA);
+        const vp: *CValue = @ptrCast(&buf);
+        vp.struct_size = buf.len;
+        const f = "=1+2";
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_evaluate(ed, f.ptr, f.len, 0, 0, 0, &crun, vp, null, null, &err_buf, err_buf.len));
+        for (buf[@sizeOf(CValue)..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+        zlsx_value_release(vp);
+    }
+    {
+        var buf: [@sizeOf(CDiag) + 32]u8 align(@alignOf(CDiag)) = undefined;
+        @memset(&buf, 0xAA);
+        const dp: *CDiag = @ptrCast(&buf);
+        dp.struct_size = buf.len;
+        var val = std.mem.zeroes(CValue);
+        val.struct_size = @sizeOf(CValue);
+        const f_bad = "=1+";
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_evaluate(ed, f_bad.ptr, f_bad.len, 0, 0, 0, &crun, &val, null, dp, &err_buf, err_buf.len));
+        for (buf[@sizeOf(CDiag)..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+        zlsx_diag_release(dp);
+    }
+}
+
+test "M9a1 release fns: NULL-safe, no-ops on zeroed structs, idempotent" {
+    zlsx_value_release(null);
+    zlsx_recalc_report_release(null);
+    zlsx_diag_release(null);
+
+    var val = std.mem.zeroes(CValue);
+    zlsx_value_release(&val);
+    zlsx_value_release(&val);
+    var report = std.mem.zeroes(CRecalcReport);
+    zlsx_recalc_report_release(&report);
+    zlsx_recalc_report_release(&report);
+    var diag = std.mem.zeroes(CDiag);
+    zlsx_diag_release(&diag);
+    zlsx_diag_release(&diag);
+}
+
+test "fuzz C ABI M9a1: random runs, formulas and anchors never panic, tails stay intact" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeM9a1Fixture(io, &tt);
+    defer std.testing.allocator.free(path);
+
+    var err_buf: [128]u8 = undefined;
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+
+    var tok: ?*CancelTok = null;
+    try std.testing.expectEqual(ZLSX_OK, zlsx_cancel_token_new(&tok, &err_buf, err_buf.len));
+    defer zlsx_cancel_token_free(tok);
+
+    var prng = std.Random.DefaultPrng.init(fuzz_config.seed_override orelse 0x9a1_c_ab1);
+    const random = prng.random();
+
+    var iter: usize = 0;
+    while (iter < fuzzItersCabi()) : (iter += 1) {
+        var crun: CRun = undefined;
+        random.bytes(std.mem.asBytes(&crun));
+        // The only pointer field must be NULL or a real token — a wild
+        // pointer would be the caller's UB, not the boundary's.
+        crun.cancel = if (random.boolean()) null else tok;
+        // Keep the deadline either off or short-lived.
+        if (random.boolean()) crun.timeout_ms = 0;
+        // Exercise both sides of the struct_size gate.
+        if (random.boolean()) crun.struct_size = @sizeOf(CRun);
+
+        var fbuf: [24]u8 = undefined;
+        random.bytes(&fbuf);
+        const flen = random.uintLessThan(usize, fbuf.len + 1);
+
+        var vbuf: [@sizeOf(CValue) + 16]u8 align(@alignOf(CValue)) = undefined;
+        @memset(&vbuf, 0xAA);
+        const vp: *CValue = @ptrCast(&vbuf);
+        vp.struct_size = if (random.boolean()) vbuf.len else random.uintLessThan(usize, vbuf.len);
+
+        var dbuf: [@sizeOf(CDiag) + 16]u8 align(@alignOf(CDiag)) = undefined;
+        @memset(&dbuf, 0xAA);
+        const dp: *CDiag = @ptrCast(&dbuf);
+        dp.struct_size = if (random.boolean()) dbuf.len else random.uintLessThan(usize, dbuf.len);
+        const use_diag = random.boolean();
+
+        const st_eval = zlsx_editor_evaluate(
+            ed,
+            &fbuf,
+            flen,
+            random.uintLessThan(u32, 3),
+            if (random.boolean()) 0 else random.int(u32),
+            random.int(u32),
+            &crun,
+            vp,
+            null,
+            if (use_diag) dp else null,
+            &err_buf,
+            err_buf.len,
+        );
+        try std.testing.expect(st_eval == ZLSX_OK or st_eval == ZLSX_ERROR or
+            st_eval == ZLSX_REFUSED or st_eval == ZLSX_NOMEM or st_eval == ZLSX_CANCELLED);
+        for (vbuf[@sizeOf(CValue)..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+        for (dbuf[@sizeOf(CDiag)..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+        if (st_eval == ZLSX_OK) zlsx_value_release(vp);
+        // Release only what the library accepted: a rejected
+        // struct_size means the interior is still the caller's canary
+        // garbage, and releasing THAT is the caller's UB, not ours.
+        if (use_diag and dp.struct_size >= @sizeOf(CDiag)) zlsx_diag_release(dp);
+
+        var rbuf: [@sizeOf(CRecalcReport) + 16]u8 align(@alignOf(CRecalcReport)) = undefined;
+        @memset(&rbuf, 0xAA);
+        const rp: *CRecalcReport = @ptrCast(&rbuf);
+        rp.struct_size = if (random.boolean()) rbuf.len else random.uintLessThan(usize, rbuf.len);
+        const st_recalc = zlsx_editor_recalculate(ed, &crun, rp, null, &err_buf, err_buf.len);
+        try std.testing.expect(st_recalc == ZLSX_OK or st_recalc == ZLSX_ERROR or
+            st_recalc == ZLSX_REFUSED or st_recalc == ZLSX_NOMEM or st_recalc == ZLSX_CANCELLED);
+        for (rbuf[@sizeOf(CRecalcReport)..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+        if (st_recalc == ZLSX_OK) zlsx_recalc_report_release(rp);
+    }
 }

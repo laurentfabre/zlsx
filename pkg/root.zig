@@ -57,6 +57,7 @@ pub const WorkbookError = workbook_mod.Error;
 /// consumer outside this package that holds one.
 pub const Evaluation = workbook_mod.Evaluation;
 pub const EvaluateResult = workbook_mod.EvaluateResult;
+pub const EvaluateOptions = workbook_mod.EvaluateOptions;
 /// M6: the commit region's one seam (§5.7.9). Exported so a contract
 /// test can inject a signal exactly between the rename and the
 /// directory fsync instead of racing a timer against the transaction.

@@ -1,0 +1,55 @@
+/*
+ * M9a1 header compile gate. Compiled (never linked, never run) as part
+ * of `zig build test`, so the header side of the 3-file transaction is
+ * verified by a C compiler rather than by eye:
+ *   - the header parses as C;
+ *   - every ZLSX_HAS_* feature macro is defined;
+ *   - every M9a1 export has a prototype (their addresses are taken);
+ *   - struct sizes match the layout the design note pins
+ *     (docs/plans/c-abi-status-v1.md) on this target.
+ */
+#include <zlsx.h>
+
+#if !defined(ZLSX_HAS_FINGERPRINT)
+#error "ZLSX_HAS_FINGERPRINT missing"
+#endif
+#if !defined(ZLSX_HAS_MARK_RECALC)
+#error "ZLSX_HAS_MARK_RECALC missing"
+#endif
+#if !defined(ZLSX_HAS_RECALC)
+#error "ZLSX_HAS_RECALC missing"
+#endif
+#if !defined(ZLSX_HAS_EVAL)
+#error "ZLSX_HAS_EVAL missing"
+#endif
+#if !defined(ZLSX_HAS_CANCEL)
+#error "ZLSX_HAS_CANCEL missing"
+#endif
+
+#define ZLSX_STATIC_ASSERT(cond, name) typedef char name[(cond) ? 1 : -1]
+
+ZLSX_STATIC_ASSERT(sizeof(zlsx_census_entry_v1) == 16, census_entry_size);
+ZLSX_STATIC_ASSERT(sizeof(zlsx_diag_v1) == 96, diag_size);
+ZLSX_STATIC_ASSERT(sizeof(zlsx_run_v1) == 104, run_size);
+ZLSX_STATIC_ASSERT(sizeof(zlsx_resolved_v1) == 80, resolved_size);
+ZLSX_STATIC_ASSERT(sizeof(zlsx_recalc_report_v1) == 168, report_size);
+ZLSX_STATIC_ASSERT(sizeof(zlsx_value_elem_v1) == 32, value_elem_size);
+ZLSX_STATIC_ASSERT(sizeof(zlsx_value_v1) == 56, value_size);
+
+/* Taking each export's address forces the prototypes to exist and to
+ * have function type; the array keeps the compiler from eliding them. */
+static const void *const m9a1_exports[] = {
+    (const void *)&zlsx_engine_fingerprint,
+    (const void *)&zlsx_editor_mark_recalc_on_load,
+    (const void *)&zlsx_editor_recalculate,
+    (const void *)&zlsx_editor_evaluate,
+    (const void *)&zlsx_cancel_token_new,
+    (const void *)&zlsx_cancel_token_trigger,
+    (const void *)&zlsx_cancel_token_free,
+    (const void *)&zlsx_value_release,
+    (const void *)&zlsx_recalc_report_release,
+    (const void *)&zlsx_diag_release,
+};
+
+const void *zlsx_c_abi_smoke_anchor(void);
+const void *zlsx_c_abi_smoke_anchor(void) { return m9a1_exports[0]; }
