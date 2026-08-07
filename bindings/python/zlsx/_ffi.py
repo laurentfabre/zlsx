@@ -1322,3 +1322,223 @@ if _HAS_EMB:
         ctypes.c_size_t,
     ]
     lib.zlsx_emb_hashes.restype = ctypes.c_int32
+
+
+# ─── Formula engine (M9a1) ────────────────────────────────────────────
+#
+# zlsx_status_v1 exports. Every struct mirrors include/zlsx.h and the
+# committed layout note (docs/plans/c-abi-status-v1.md). Each symbol
+# group is feature-probed independently — an older dylib simply lacks
+# the export, and the corresponding _HAS_* flag gates whatever the
+# high-level API builds on it (M9a2). Callers set struct_size before
+# every call; the library never writes beyond the v1 size it knows.
+
+ZLSX_OK = 0
+ZLSX_ERROR = -1
+ZLSX_REFUSED = -2
+ZLSX_NOMEM = -3
+ZLSX_CANCELLED = -5
+
+ZLSX_PLANE_NONE = 0xFFFFFFFF
+ZLSX_DIALECT_NONE = 0xFFFFFFFF
+
+cancel_token_handle = ctypes.c_void_p
+
+
+class CensusEntryV1(ctypes.Structure):
+    """Mirrors zlsx_census_entry_v1."""
+
+    _fields_ = [
+        ("plane", ctypes.c_uint32),
+        ("sheet", ctypes.c_uint32),
+        ("row", ctypes.c_uint32),
+        ("col", ctypes.c_uint32),
+    ]
+
+
+class DiagV1(ctypes.Structure):
+    """Mirrors zlsx_diag_v1. census is library-owned: zlsx_diag_release."""
+
+    _fields_ = [
+        ("struct_size", ctypes.c_size_t),
+        ("plane", ctypes.c_uint32),
+        ("census_truncated", ctypes.c_uint32),
+        ("error_name", ctypes.c_char * 64),
+        ("census", ctypes.POINTER(CensusEntryV1)),
+        ("census_len", ctypes.c_size_t),
+    ]
+
+
+class RunV1(ctypes.Structure):
+    """Mirrors zlsx_run_v1. Limit fields: 0 = documented default."""
+
+    _fields_ = [
+        ("struct_size", ctypes.c_size_t),
+        ("now_utc_ms", ctypes.c_int64),
+        ("rng_seed", ctypes.c_uint64),
+        ("utc_offset_min", ctypes.c_int32),
+        ("fidelity", ctypes.c_uint32),
+        ("profile", ctypes.c_uint32),
+        ("dialect", ctypes.c_uint32),
+        ("on_unsupported", ctypes.c_uint32),
+        ("_reserved0", ctypes.c_uint32),
+        ("max_run_arena_bytes", ctypes.c_uint64),
+        ("max_matrix_cells", ctypes.c_uint64),
+        ("max_string_payload_bytes", ctypes.c_uint64),
+        ("max_retained_ast_bytes", ctypes.c_uint64),
+        ("max_diagnostics_bytes", ctypes.c_uint64),
+        ("timeout_ms", ctypes.c_uint64),
+        ("cancel", cancel_token_handle),
+    ]
+
+
+class ResolvedV1(ctypes.Structure):
+    """Mirrors zlsx_resolved_v1 — the §5.5 echo."""
+
+    _fields_ = [
+        ("struct_size", ctypes.c_size_t),
+        ("now_utc_ms", ctypes.c_int64),
+        ("rng_seed", ctypes.c_uint64),
+        ("utc_offset_min", ctypes.c_int32),
+        ("fidelity", ctypes.c_uint32),
+        ("profile", ctypes.c_uint32),
+        ("dialect", ctypes.c_uint32),
+        ("max_run_arena_bytes", ctypes.c_uint64),
+        ("max_matrix_cells", ctypes.c_uint64),
+        ("max_string_payload_bytes", ctypes.c_uint64),
+        ("max_retained_ast_bytes", ctypes.c_uint64),
+        ("max_diagnostics_bytes", ctypes.c_uint64),
+    ]
+
+
+class RecalcReportV1(ctypes.Structure):
+    """Mirrors zlsx_recalc_report_v1. census: zlsx_recalc_report_release."""
+
+    _fields_ = [
+        ("struct_size", ctypes.c_size_t),
+        ("sheets_patched", ctypes.c_uint32),
+        ("cells_written", ctypes.c_uint32),
+        ("passes", ctypes.c_uint32),
+        ("non_converged_cells", ctypes.c_uint32),
+        ("dynamic_passes", ctypes.c_uint32),
+        ("kept_stale", ctypes.c_uint32),
+        ("calc_chain_removed", ctypes.c_uint32),
+        ("census_truncated", ctypes.c_uint32),
+        ("retained_generations", ctypes.c_uint64),
+        ("retained_bytes", ctypes.c_uint64),
+        ("durability_warning", ctypes.c_uint32),
+        ("durability_errno", ctypes.c_int32),
+        ("resolved", ResolvedV1),
+        ("resolved_present", ctypes.c_uint32),
+        ("_reserved0", ctypes.c_uint32),
+        ("census", ctypes.POINTER(CensusEntryV1)),
+        ("census_len", ctypes.c_size_t),
+    ]
+
+
+class ValueElemV1(ctypes.Structure):
+    """Mirrors zlsx_value_elem_v1 — {tag; num; payload_off, payload_len}."""
+
+    _fields_ = [
+        ("tag", ctypes.c_uint8),
+        ("_reserved", ctypes.c_uint8 * 7),
+        ("num", ctypes.c_double),
+        ("payload_off", ctypes.c_uint64),
+        ("payload_len", ctypes.c_uint64),
+    ]
+
+
+class ValueV1(ctypes.Structure):
+    """Mirrors zlsx_value_v1. elems/payload: zlsx_value_release."""
+
+    _fields_ = [
+        ("struct_size", ctypes.c_size_t),
+        ("rows", ctypes.c_uint32),
+        ("cols", ctypes.c_uint32),
+        ("is_matrix", ctypes.c_uint32),
+        ("_reserved0", ctypes.c_uint32),
+        ("elems", ctypes.POINTER(ValueElemV1)),
+        ("elems_len", ctypes.c_size_t),
+        ("payload", ctypes.POINTER(ctypes.c_uint8)),
+        ("payload_len", ctypes.c_size_t),
+    ]
+
+
+# ctypes has no size_t-championed static assert; pin the mirrored sizes
+# so a drifted field order fails at import, not at call time.
+assert ctypes.sizeof(CensusEntryV1) == 16
+assert ctypes.sizeof(DiagV1) == 96
+assert ctypes.sizeof(RunV1) == 104
+assert ctypes.sizeof(ResolvedV1) == 80
+assert ctypes.sizeof(RecalcReportV1) == 168
+assert ctypes.sizeof(ValueElemV1) == 32
+assert ctypes.sizeof(ValueV1) == 56
+
+_HAS_FINGERPRINT = hasattr(lib, "zlsx_engine_fingerprint")
+if _HAS_FINGERPRINT:
+    lib.zlsx_engine_fingerprint.argtypes = []
+    lib.zlsx_engine_fingerprint.restype = ctypes.c_char_p
+
+_HAS_CANCEL = hasattr(lib, "zlsx_cancel_token_new")
+if _HAS_CANCEL:
+    lib.zlsx_cancel_token_new.argtypes = [
+        ctypes.POINTER(cancel_token_handle),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_cancel_token_new.restype = ctypes.c_int32
+
+    lib.zlsx_cancel_token_trigger.argtypes = [cancel_token_handle]
+    lib.zlsx_cancel_token_trigger.restype = None
+
+    lib.zlsx_cancel_token_free.argtypes = [cancel_token_handle]
+    lib.zlsx_cancel_token_free.restype = None
+
+_HAS_MARK_RECALC = hasattr(lib, "zlsx_editor_mark_recalc_on_load")
+if _HAS_MARK_RECALC:
+    lib.zlsx_editor_mark_recalc_on_load.argtypes = [
+        editor_handle,
+        ctypes.POINTER(DiagV1),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_mark_recalc_on_load.restype = ctypes.c_int32
+
+    lib.zlsx_diag_release.argtypes = [ctypes.POINTER(DiagV1)]
+    lib.zlsx_diag_release.restype = None
+
+_HAS_RECALC = hasattr(lib, "zlsx_editor_recalculate")
+if _HAS_RECALC:
+    lib.zlsx_editor_recalculate.argtypes = [
+        editor_handle,
+        ctypes.POINTER(RunV1),
+        ctypes.POINTER(RecalcReportV1),
+        ctypes.POINTER(DiagV1),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_recalculate.restype = ctypes.c_int32
+
+    lib.zlsx_recalc_report_release.argtypes = [ctypes.POINTER(RecalcReportV1)]
+    lib.zlsx_recalc_report_release.restype = None
+
+_HAS_EVAL = hasattr(lib, "zlsx_editor_evaluate")
+if _HAS_EVAL:
+    lib.zlsx_editor_evaluate.argtypes = [
+        editor_handle,
+        ctypes.POINTER(ctypes.c_uint8),  # formula_ptr
+        ctypes.c_size_t,  # formula_len
+        ctypes.c_uint32,  # sheet_idx
+        ctypes.c_uint32,  # anchor_row (1-based; 0 = absent)
+        ctypes.c_uint32,  # anchor_col (0-based)
+        ctypes.POINTER(RunV1),
+        ctypes.POINTER(ValueV1),
+        ctypes.POINTER(ResolvedV1),
+        ctypes.POINTER(DiagV1),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_evaluate.restype = ctypes.c_int32
+
+    lib.zlsx_value_release.argtypes = [ctypes.POINTER(ValueV1)]
+    lib.zlsx_value_release.restype = None

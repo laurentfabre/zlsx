@@ -1418,6 +1418,225 @@ int32_t zlsx_emb_vectors(zlsx_emb_t * emb, size_t i, float * out, size_t out_len
  * was deleted. */
 int32_t zlsx_emb_hashes(zlsx_emb_t * emb, size_t i, uint64_t * out, size_t out_len);
 
+/* ── Formula engine (M9a1) ──────────────────────────────────────────
+ *
+ * zlsx_status_v1 — NEW exports below only; everything above keeps its
+ * shipped 0/-1 convention:
+ *    0  OK
+ *   -1  generic error (Zig error name in errbuf)
+ *   -2  typed Plane-2 refusal (zlsx_diag_v1 populated when supplied)
+ *   -3  allocation failure
+ *   -4  reserved (never returned by v1)
+ *   -5  cancellation/deadline observed before commit
+ *
+ * struct_size discipline: every struct below starts with size_t
+ * struct_size, set by the caller to sizeof() at its compile time.
+ * Readers use min(caller, known); writers touch only that prefix and
+ * NEVER write beyond the known v1 size, even when the caller declares
+ * more. Output structs are zero-initialised (excluding struct_size)
+ * within the known prefix on entry. Sizes below the full v1 struct are
+ * rejected with -1 "StructSizeTooSmall".
+ *
+ * Ownership: fields documented library-owned are released by the
+ * per-type release fn; the structs themselves are the caller's.
+ * Release fns are NULL-safe and no-ops on zeroed/already-released
+ * structs.
+ *
+ * Layout contract: docs/plans/c-abi-status-v1.md; every offset is
+ * pinned by comptime tests in src/c_abi.zig. */
+
+#define ZLSX_OK             0
+#define ZLSX_ERROR        (-1)
+#define ZLSX_REFUSED      (-2)
+#define ZLSX_NOMEM        (-3)
+#define ZLSX_CANCELLED    (-5)
+
+/* §10's fourteen-plane refusal vocabulary. Values are pinned by a Zig
+ * test against the engine enum — they are ABI, not implementation. */
+#define ZLSX_PLANE_UNSUPPORTED_FUNCTION        0u
+#define ZLSX_PLANE_UNSUPPORTED_CONSTRUCT       1u
+#define ZLSX_PLANE_PRECISION_AS_DISPLAYED      2u
+#define ZLSX_PLANE_MALFORMED_INPUT             3u
+#define ZLSX_PLANE_LOCALE_SENSITIVE_INPUT      4u
+#define ZLSX_PLANE_DATA_TABLE_UNSUPPORTED      5u
+#define ZLSX_PLANE_SIGNED_WORKBOOK             6u
+#define ZLSX_PLANE_STALE_EMBEDDINGS            7u
+#define ZLSX_PLANE_ANCHOR_REQUIRED             8u
+#define ZLSX_PLANE_CYCLE                       9u
+#define ZLSX_PLANE_DYNAMIC_REF_UNSTABLE       10u
+#define ZLSX_PLANE_SPILL_PERSIST_UNSUPPORTED  11u
+#define ZLSX_PLANE_RESULT_NOT_REPRESENTABLE   12u
+#define ZLSX_PLANE_LIMIT_EXCEEDED             13u
+#define ZLSX_PLANE_NONE               0xFFFFFFFFu
+
+#define ZLSX_FIDELITY_EXCEL        0u
+#define ZLSX_FIDELITY_IEEE         1u
+#define ZLSX_PROFILE_WINDOWS_1252  0u
+#define ZLSX_DIALECT_DYNAMIC_ARRAY 0u
+#define ZLSX_DIALECT_LEGACY        1u
+#define ZLSX_DIALECT_NONE          0xFFFFFFFFu  /* resolved echo of a recalc */
+#define ZLSX_ON_UNSUPPORTED_REFUSE              0u
+#define ZLSX_ON_UNSUPPORTED_KEEP_STALE_AND_MARK 1u
+
+#define ZLSX_VALUE_NUMBER 0u
+#define ZLSX_VALUE_TEXT   1u
+#define ZLSX_VALUE_BOOL   2u
+#define ZLSX_VALUE_ERROR  3u   /* an Excel error VALUE — a successful result */
+
+/* Cross-thread cancellation token. Caller-owned; must outlive every
+ * call it is passed to. trigger() is callable from any thread. */
+typedef struct zlsx_cancel_token_t zlsx_cancel_token_t;
+
+int32_t zlsx_cancel_token_new(zlsx_cancel_token_t ** out, char * errbuf, size_t errbuf_len);
+void    zlsx_cancel_token_trigger(zlsx_cancel_token_t * tok);
+void    zlsx_cancel_token_free(zlsx_cancel_token_t * tok);
+
+/* One census entry (§5.7.7): a construct the evaluator could not
+ * implement, and where it was. */
+typedef struct zlsx_census_entry_v1 {
+    uint32_t plane;   /* ZLSX_PLANE_* */
+    uint32_t sheet;   /* 0-based */
+    uint32_t row;     /* 1-based; 0 = not about a cell */
+    uint32_t col;     /* 0-based */
+} zlsx_census_entry_v1;
+
+typedef struct zlsx_diag_v1 {
+    size_t   struct_size;            /* caller sets to sizeof(zlsx_diag_v1) */
+    uint32_t plane;                  /* ZLSX_PLANE_NONE when not a refusal */
+    uint32_t census_truncated;       /* 0/1 */
+    char     error_name[64];         /* NUL-terminated, e.g. "FormulaCycle" */
+    const zlsx_census_entry_v1 * census;   /* library-owned; NULL iff census_len == 0 */
+    size_t   census_len;
+} zlsx_diag_v1;
+
+void zlsx_diag_release(zlsx_diag_v1 * d);
+
+/* §5.5 run inputs. now_utc_ms and rng_seed have no defaults on
+ * purpose: a library that defaulted them would read a clock or an
+ * entropy source and "equal inputs => equal output" would be false.
+ * Limit fields: 0 = the documented §9 default (echoed numerically in
+ * zlsx_resolved_v1, never as 0). */
+typedef struct zlsx_run_v1 {
+    size_t   struct_size;
+    int64_t  now_utc_ms;
+    uint64_t rng_seed;
+    int32_t  utc_offset_min;         /* [-1440, 1440] */
+    uint32_t fidelity;               /* ZLSX_FIDELITY_* */
+    uint32_t profile;                /* ZLSX_PROFILE_* */
+    uint32_t dialect;                /* ZLSX_DIALECT_*; standalone eval only */
+    uint32_t on_unsupported;         /* ZLSX_ON_UNSUPPORTED_*; recalc only */
+    uint32_t _reserved0;
+    uint64_t max_run_arena_bytes;
+    uint64_t max_matrix_cells;
+    uint64_t max_string_payload_bytes;
+    uint64_t max_retained_ast_bytes;
+    uint64_t max_diagnostics_bytes;
+    uint64_t timeout_ms;             /* 0 = none; absolute deadline derived at entry */
+    zlsx_cancel_token_t * cancel;    /* NULL = non-cancellable */
+} zlsx_run_v1;
+
+/* The §5.5 echo: exactly what the run resolved to. */
+typedef struct zlsx_resolved_v1 {
+    size_t   struct_size;
+    int64_t  now_utc_ms;
+    uint64_t rng_seed;
+    int32_t  utc_offset_min;
+    uint32_t fidelity;
+    uint32_t profile;
+    uint32_t dialect;                /* ZLSX_DIALECT_NONE for a recalc */
+    uint64_t max_run_arena_bytes;
+    uint64_t max_matrix_cells;
+    uint64_t max_string_payload_bytes;
+    uint64_t max_retained_ast_bytes;
+    uint64_t max_diagnostics_bytes;
+} zlsx_resolved_v1;
+
+typedef struct zlsx_recalc_report_v1 {
+    size_t   struct_size;
+    uint32_t sheets_patched;
+    uint32_t cells_written;
+    uint32_t passes;
+    uint32_t non_converged_cells;
+    uint32_t dynamic_passes;
+    uint32_t kept_stale;             /* 0/1: §5.7.7's mark-only path taken */
+    uint32_t calc_chain_removed;     /* 0/1 */
+    uint32_t census_truncated;       /* 0/1 */
+    uint64_t retained_generations;
+    uint64_t retained_bytes;
+    uint32_t durability_warning;     /* dormant §5.7.9 slot; 0 for in-memory recalc */
+    int32_t  durability_errno;
+    zlsx_resolved_v1 resolved;
+    uint32_t resolved_present;       /* 0/1 */
+    uint32_t _reserved0;
+    const zlsx_census_entry_v1 * census;   /* library-owned */
+    size_t   census_len;
+} zlsx_recalc_report_v1;
+
+void zlsx_recalc_report_release(zlsx_recalc_report_v1 * r);
+
+/* One evaluated element (§12.3's descriptor). Blank never crosses the
+ * boundary — it publishes as number 0 (§5.3a). */
+typedef struct zlsx_value_elem_v1 {
+    uint8_t  tag;                    /* ZLSX_VALUE_* */
+    uint8_t  _reserved[7];
+    double   num;                    /* number, or bool as 0/1 */
+    uint64_t payload_off;            /* into the value's payload arena */
+    uint64_t payload_len;            /* text / error spelling; 0 otherwise */
+} zlsx_value_elem_v1;
+
+typedef struct zlsx_value_v1 {
+    size_t   struct_size;
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t is_matrix;              /* 0 = scalar (rows == cols == 1) */
+    uint32_t _reserved0;
+    const zlsx_value_elem_v1 * elems;      /* library-owned, row-major */
+    size_t   elems_len;
+    const uint8_t * payload;               /* library-owned, one arena */
+    size_t   payload_len;
+} zlsx_value_v1;
+
+void zlsx_value_release(zlsx_value_v1 * v);
+
+/* Engine identity (§12.4): "zlsx <semver>; excel_fp_rules_v1; rng_v1;
+ * collation_v1; <arch>-<os>-<abi>; <build-hash>". Static storage,
+ * never NULL. Feature-probe this symbol (absent export = feature off);
+ * mixed-fingerprint fleets must refuse to share recalc results. */
+const char * zlsx_engine_fingerprint(void);
+
+/* §5.7.7's mark-only transaction: keep every cached value, set
+ * fullCalcOnLoad="1", remove nothing else. Typed refusals (-2) include
+ * FormulaPrecisionAsDisplayed. diag is optional (NULL ok). */
+int32_t zlsx_editor_mark_recalc_on_load(zlsx_editor_t * ed,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
+/* §5.7's in-memory transaction (M5d2 pipeline): recalculate every
+ * formula cell and swap the result in as the final operation. On any
+ * non-zero status the workbook is exactly as it was. No file I/O. */
+int32_t zlsx_editor_recalculate(zlsx_editor_t * ed, const zlsx_run_v1 * run,
+        zlsx_recalc_report_v1 * report, zlsx_diag_v1 * diag,
+        char * errbuf, size_t errbuf_len);
+
+/* Standalone cache-based evaluation (M6 semantics). Scratch-only: the
+ * workbook is byte-identical before and after. anchor_row = 0 means no
+ * anchor; site-dependent formulas (`@`) then refuse rather than guess.
+ * out_resolved and diag are optional (NULL ok). */
+int32_t zlsx_editor_evaluate(zlsx_editor_t * ed,
+        const uint8_t * formula_ptr, size_t formula_len,
+        uint32_t sheet_idx,
+        uint32_t anchor_row,         /* 1-based; 0 = absent */
+        uint32_t anchor_col,         /* 0-based; read only when anchor_row != 0 */
+        const zlsx_run_v1 * run,
+        zlsx_value_v1 * out_value, zlsx_resolved_v1 * out_resolved,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
+/* Feature macros — compile-time counterpart of the dlsym probe. */
+#define ZLSX_HAS_FINGERPRINT 1
+#define ZLSX_HAS_MARK_RECALC 1
+#define ZLSX_HAS_RECALC      1
+#define ZLSX_HAS_EVAL        1
+#define ZLSX_HAS_CANCEL      1
+
 
 #ifdef __cplusplus
 }

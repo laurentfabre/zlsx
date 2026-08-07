@@ -1,0 +1,332 @@
+# C ABI v1, part 1 (M9a1) — `zlsx_status_v1`, descriptors, editor recalc/evaluate
+
+The committed design note §12.3 requires: exact field layouts, the status
+contract, ownership rules, and the staging decisions, reviewed before the
+code that implements them. This document is normative for the M9a1 exports;
+`include/zlsx.h` and `src/c_abi.zig` implement it and pin every offset
+below with comptime tests.
+
+## 1. Scope: what lands at M9a1, what is staged to M9a2
+
+**M9a1 exports** (each lands in header + impl + `_ffi.py` together — the
+3-file transaction):
+
+| Export | Probe (`_ffi.py`) | Header macro |
+|---|---|---|
+| `zlsx_engine_fingerprint` | `_HAS_FINGERPRINT` | `ZLSX_HAS_FINGERPRINT` |
+| `zlsx_editor_mark_recalc_on_load` | `_HAS_MARK_RECALC` | `ZLSX_HAS_MARK_RECALC` |
+| `zlsx_editor_recalculate` + `zlsx_recalc_report_release` | `_HAS_RECALC` | `ZLSX_HAS_RECALC` |
+| `zlsx_editor_evaluate` + `zlsx_value_release` | `_HAS_EVAL` | `ZLSX_HAS_EVAL` |
+| `zlsx_cancel_token_new` / `_trigger` / `_free` | `_HAS_CANCEL` | `ZLSX_HAS_CANCEL` |
+| `zlsx_diag_release` | (rides `_HAS_RECALC`/`_HAS_EVAL`/`_HAS_MARK_RECALC`) | — |
+
+**Staged to M9a2**: `zlsx_editor_save_with_recalc`, `zlsx_editor_save_to_buffer`,
+`zlsx_open_buffer`, the `…_with_formulas_v2` writer export, `zlsx_buffer_release`,
+and every high-level Python method (`Editor.recalculate` etc. — the worker-thread
+cancellation mechanics live there). M9a1's binding leg is the `_ffi.py` symbol
+declarations, structures, and probes; `_HAS_SAVE_BUFFER`, `_HAS_SAVE_WITH_RECALC`,
+`_HAS_WRITER_RECALC`, `_HAS_FORMULAS_V2` stage with their exports.
+
+**Why the cancel token is part 1** (decision M9a1-1): R9-12 hard-sets this
+module multi-threaded *because* `-fsingle-threaded` atomics cannot back a
+cross-thread token — a decision that is only about something that exists.
+The recalc/evaluate exports take the token parameter, and a parameter no
+caller can construct is untestable; the three token exports are two
+allocations and a store.
+
+## 2. `zlsx_status_v1` — the numeric contract
+
+New exports only. Legacy exports (everything shipped before M9a1,
+e.g. the `0/-1` writer/editor surface around `c_abi.zig:1927-1953`) keep
+their `0/-1` contract verbatim; an old binding against a new library sees
+identical behaviour on every symbol it knows.
+
+| Code | Name | Meaning |
+|---|---|---|
+| `0` | `ZLSX_OK` | success |
+| `-1` | `ZLSX_ERROR` | generic error; message (Zig error name) in caller's `errbuf` |
+| `-2` | `ZLSX_REFUSED` | typed Plane-2 refusal; `zlsx_diag_v1` populated when supplied. Includes `FormulaLimitExceeded` — limits are Plane-2 refusals at every layer |
+| `-3` | `ZLSX_NOMEM` | genuine allocation failure |
+| `-4` | — | reserved (never returned by v1) |
+| `-5` | `ZLSX_CANCELLED` | cancellation/deadline observed before commit |
+
+**Zig error → status mapping** (decision M9a1-2, one mapping, no per-layer
+reclassification): `error.OutOfMemory → -3`; `error.Cancelled → -5`; every
+`Formula*` member of `pkg/workbook.Error` (the fourteen-plane §10 vocabulary)
+`→ -2` with diag populated; everything else `→ -1` with `@errorName` in
+`errbuf`. Input-contract violations raised at the ABI boundary itself
+(NULL where required, `struct_size` below minimum, unknown enum value,
+`UtcOffsetOutOfRange`) are `-1`: they are statements about the call, not
+about the workbook.
+
+Every fallible export takes `(char *errbuf, size_t errbuf_len)` (existing
+convention — `errbuf` nullable, truncating write, always NUL-terminated)
+AND, where a refusal is possible, a nullable `zlsx_diag_v1 *`.
+
+## 3. `struct_size` rules
+
+Every caller-allocated struct that crosses the boundary starts with
+`size_t struct_size`, set by the caller to the size it was compiled
+against.
+
+- Readers use `min(caller_size, known_size)`; fields beyond the caller's
+  declared size take their documented defaults.
+- Writers touch only `min(caller_size, known_size)` bytes — **bytes beyond
+  the known prefix are never written**, even when `caller_size` is larger
+  (canary-tail tests pin this).
+- The `struct_size` field itself is caller-owned: the library never writes
+  it, in particular zero-initialisation skips it.
+- Output structs are zero-initialised within `[sizeof(size_t), known_size)`
+  on entry, before any failure can return. Prep is per-struct and runs
+  before input validation: a failure anywhere — including a *sibling*
+  struct's rejected `struct_size` — leaves every accepted output zeroed
+  and therefore releasable. A rejected struct is left byte-for-byte
+  untouched, and releasing an untouched (never-zeroed) struct is the
+  caller's UB.
+- Minimum accepted size = offset+size of the last v1 field, i.e. the full
+  v1 `sizeof`. Below that: `-1`, message `StructSizeTooSmall`, no bytes
+  written beyond the zero-init that never happened (the check precedes it).
+- v1 structs never shrink; future fields append. Nested structs
+  (`zlsx_resolved_v1` inside the report) do not get independent prefix
+  treatment — the outer struct's rule governs; their `struct_size` is
+  written by the library as documentation of the layout it filled.
+
+## 4. Field layouts (LP64 / LLP64; offsets identical on both)
+
+All structs are natural-alignment C structs; every offset is pinned by a
+comptime test in `src/c_abi.zig`. Pointers/`size_t` are 8 bytes on every
+supported target.
+
+### 4.1 `zlsx_census_entry_v1` — 16 bytes
+
+| off | type | field | notes |
+|---|---|---|---|
+| 0 | `uint32_t` | `plane` | `ZLSX_PLANE_*` |
+| 4 | `uint32_t` | `sheet` | 0-based |
+| 8 | `uint32_t` | `row` | 1-based; 0 = not about a cell |
+| 12 | `uint32_t` | `col` | 0-based |
+
+### 4.2 `zlsx_diag_v1` — 96 bytes
+
+| off | type | field | notes |
+|---|---|---|---|
+| 0 | `size_t` | `struct_size` | caller sets |
+| 8 | `uint32_t` | `plane` | leading refusal's plane; `ZLSX_PLANE_NONE` (`0xFFFFFFFF`) when absent |
+| 12 | `uint32_t` | `census_truncated` | 0/1 |
+| 16 | `char[64]` | `error_name` | NUL-terminated Zig error name (`"FormulaCycle"`) |
+| 80 | `const zlsx_census_entry_v1 *` | `census` | library-owned; NULL iff `census_len == 0` |
+| 88 | `size_t` | `census_len` | |
+
+Released with `zlsx_diag_release` (frees `census`, resets it to
+NULL/0; the struct itself is the caller's). Safe on a diag that was never
+populated (zero-init leaves `census == NULL`). Census entries cross only
+on paths that produce a census today: a successful mark-eligible
+recalc report. On a refusal the pkg pipeline collapses the census into
+the error before the ABI sees it (`recalc_txn.Refusal` carries
+reason+plane only), so a `-2` diag carries `error_name` + `plane` with
+an empty census — surfacing the refusing cells through
+`prepare` is flagged for M9a2's Python `ZlsxFormulaRefusal(cells, census)`
+leg (decision M9a1-3).
+
+### 4.3 `zlsx_run_v1` — 104 bytes (input)
+
+| off | type | field | notes |
+|---|---|---|---|
+| 0 | `size_t` | `struct_size` | |
+| 8 | `int64_t` | `now_utc_ms` | no default — §5.5, a library that defaulted it would read a clock |
+| 16 | `uint64_t` | `rng_seed` | no default, same reason |
+| 24 | `int32_t` | `utc_offset_min` | validated in [-1440, 1440] pre-narrowing |
+| 28 | `uint32_t` | `fidelity` | `ZLSX_FIDELITY_*`; unknown → -1 |
+| 32 | `uint32_t` | `profile` | `ZLSX_PROFILE_*` |
+| 36 | `uint32_t` | `dialect` | `ZLSX_DIALECT_*`; standalone eval only, recalc reads stored cells |
+| 40 | `uint32_t` | `on_unsupported` | `ZLSX_ON_UNSUPPORTED_*`; recalc only |
+| 44 | `uint32_t` | `_reserved0` | ignored in v1 |
+| 48 | `uint64_t` | `max_run_arena_bytes` | 0 = default (§9 numeric defaults) |
+| 56 | `uint64_t` | `max_matrix_cells` | 0 = default |
+| 64 | `uint64_t` | `max_string_payload_bytes` | 0 = default |
+| 72 | `uint64_t` | `max_retained_ast_bytes` | 0 = default |
+| 80 | `uint64_t` | `max_diagnostics_bytes` | 0 = default |
+| 88 | `uint64_t` | `timeout_ms` | 0 = none; converted to an absolute `.awake` deadline at entry |
+| 96 | `zlsx_cancel_token_t *` | `cancel` | nullable = non-cancellable |
+
+`deadline`/`cancel` stay outside the fingerprintable projection by
+construction (`EffectiveRunInputs` has no such fields).
+
+### 4.4 `zlsx_resolved_v1` — 80 bytes (§5.5 echo)
+
+| off | type | field |
+|---|---|---|
+| 0 | `size_t` | `struct_size` |
+| 8 | `int64_t` | `now_utc_ms` |
+| 16 | `uint64_t` | `rng_seed` |
+| 24 | `int32_t` | `utc_offset_min` |
+| 28 | `uint32_t` | `fidelity` |
+| 32 | `uint32_t` | `profile` |
+| 36 | `uint32_t` | `dialect` — `ZLSX_DIALECT_NONE` (`0xFFFFFFFF`) for a recalc, which derives dialect per stored cell |
+| 40..79 | `uint64_t ×5` | the five §9 limits, resolved (defaults echoed as numbers, never as 0) |
+
+### 4.5 `zlsx_recalc_report_v1` — 168 bytes
+
+| off | type | field |
+|---|---|---|
+| 0 | `size_t` | `struct_size` |
+| 8 | `uint32_t` | `sheets_patched` |
+| 12 | `uint32_t` | `cells_written` |
+| 16 | `uint32_t` | `passes` |
+| 20 | `uint32_t` | `non_converged_cells` |
+| 24 | `uint32_t` | `dynamic_passes` |
+| 28 | `uint32_t` | `kept_stale` (0/1) |
+| 32 | `uint32_t` | `calc_chain_removed` (0/1) |
+| 36 | `uint32_t` | `census_truncated` (0/1) |
+| 40 | `uint64_t` | `retained_generations` |
+| 48 | `uint64_t` | `retained_bytes` |
+| 56 | `uint32_t` | `durability_warning` (dormant §5.7.9 slot — 0 for the in-memory transaction; M9a2's save fills it) |
+| 60 | `int32_t` | `durability_errno` |
+| 64 | `zlsx_resolved_v1` | `resolved` (embedded by value) |
+| 144 | `uint32_t` | `resolved_present` (0/1) |
+| 148 | `uint32_t` | `_reserved0` |
+| 152 | `const zlsx_census_entry_v1 *` | `census` (library-owned) |
+| 160 | `size_t` | `census_len` |
+
+Released with `zlsx_recalc_report_release` (frees `census`).
+
+### 4.6 `zlsx_value_elem_v1` — 32 bytes (§12.3's descriptor, exactly)
+
+| off | type | field | notes |
+|---|---|---|---|
+| 0 | `uint8_t` | `tag` | `ZLSX_VALUE_*` |
+| 1 | `uint8_t[7]` | `_reserved` | explicit padding, always 0 |
+| 8 | `double` | `num` | number value; bool as 0/1; 0 otherwise |
+| 16 | `uint64_t` | `payload_off` | into the value's payload arena |
+| 24 | `uint64_t` | `payload_len` | text bytes / error spelling; 0 for number+bool |
+
+Tags: `ZLSX_VALUE_NUMBER 0`, `ZLSX_VALUE_TEXT 1`, `ZLSX_VALUE_BOOL 2`,
+`ZLSX_VALUE_ERROR 3` (payload = Excel spelling, e.g. `#DIV/0!` — an error
+*value* is a successful result, plane 1, never a status code). Blank never
+crosses: §12.2's publish rule turns it into number 0 before the boundary.
+
+### 4.7 `zlsx_value_v1` — 56 bytes
+
+| off | type | field |
+|---|---|---|
+| 0 | `size_t` | `struct_size` |
+| 8 | `uint32_t` | `rows` |
+| 12 | `uint32_t` | `cols` |
+| 16 | `uint32_t` | `is_matrix` (0 = scalar, rows=cols=1) |
+| 20 | `uint32_t` | `_reserved0` |
+| 24 | `const zlsx_value_elem_v1 *` | `elems` (library-owned, row-major, `rows*cols`) |
+| 32 | `size_t` | `elems_len` |
+| 40 | `const uint8_t *` | `payload` (library-owned, one arena) |
+| 48 | `size_t` | `payload_len` |
+
+References are dereferenced before crossing (the evaluator already
+guarantees `.reference` cannot reach a result). Released with
+`zlsx_value_release` (frees `elems` + `payload`).
+
+## 5. Export signatures
+
+```c
+const char *zlsx_engine_fingerprint(void);            /* static storage, never NULL */
+
+int32_t zlsx_cancel_token_new(zlsx_cancel_token_t **out, char *errbuf, size_t errbuf_len);
+void    zlsx_cancel_token_trigger(zlsx_cancel_token_t *tok);   /* thread-safe, any thread */
+void    zlsx_cancel_token_free(zlsx_cancel_token_t *tok);      /* NULL-safe */
+
+int32_t zlsx_editor_mark_recalc_on_load(zlsx_editor_t *ed,
+        zlsx_diag_v1 *diag, char *errbuf, size_t errbuf_len);
+
+int32_t zlsx_editor_recalculate(zlsx_editor_t *ed, const zlsx_run_v1 *run,
+        zlsx_recalc_report_v1 *report, zlsx_diag_v1 *diag,
+        char *errbuf, size_t errbuf_len);
+
+int32_t zlsx_editor_evaluate(zlsx_editor_t *ed,
+        const uint8_t *formula_ptr, size_t formula_len,
+        uint32_t sheet_idx,
+        uint32_t anchor_row,   /* 1-based; 0 = no anchor (site-dependent formulas refuse) */
+        uint32_t anchor_col,   /* 0-based; read only when anchor_row != 0 */
+        const zlsx_run_v1 *run,
+        zlsx_value_v1 *out_value, zlsx_resolved_v1 *out_resolved /* nullable */,
+        zlsx_diag_v1 *diag, char *errbuf, size_t errbuf_len);
+
+void zlsx_value_release(zlsx_value_v1 *v);
+void zlsx_recalc_report_release(zlsx_recalc_report_v1 *r);
+void zlsx_diag_release(zlsx_diag_v1 *d);
+```
+
+- `report`, `out_value` are required (`NULL` → -1): an evaluation whose
+  result cannot land anywhere is a call that meant nothing.
+- `formula_len > 32768` (the parser's `max_formula_utf8_bytes`) is refused
+  `-2 FormulaLimitExceeded` **before** the slice is formed — the boundary
+  never constructs a slice it hasn't bounded.
+- `zlsx_editor_evaluate` is M6's `zlsx eval` semantics over the same
+  `Workbook.evaluate`: a cache-based read; the standalone path draws
+  nothing volatile (the engine's fixed-draw seam), `rng_seed` is echoed in
+  `resolved` for reproducibility of the context, and recalc is where a
+  seed actually draws (decision M9a1-4 — matches the shipped M6 CLI
+  behaviour exactly).
+- Cancellation is observed-before-commit. `evaluate` never commits;
+  `recalculate`'s commit point is the in-memory swap, and the pipeline
+  polls the same token/deadline the CLI path does. A trigger observed
+  pre-commit returns `-5` with memory untouched.
+
+## 6. `zlsx_engine_fingerprint()`
+
+```
+zlsx <semver>; excel_fp_rules_v1; rng_v1; collation_v1; <arch>-<os>-<abi>; <build-hash>
+```
+
+- semver from `build.zig.zon` (the bare `c_abi.zig:51-54` version string is
+  a component, not the identity);
+- the three rule versions are read from the engine at comptime
+  (`pkg/recalc_run.zig` re-exports them as `rule_versions` — the string
+  cannot drift from the code that implements the rule);
+- target triple from `builtin.target`;
+- build hash: `-Dbuild-hash=<str>` override, else `git rev-parse --short=12 HEAD`
+  at build time, else `"unknown"` (source tarballs must still build). It
+  lives in its own options module (`fingerprint_config`) imported only by
+  the C ABI module, so a new commit does not invalidate the CLI's build
+  cache.
+
+M9b keys Spark's engine-identity refusal on this string; mismatch refuses.
+
+## 7. R9-12: the C ABI module is multi-threaded, always
+
+`build.zig` stops forwarding `-Dsingle-threaded` into `c_abi_mod`
+(`.single_threaded = false`, stated); the option's description narrows to
+the CLI. `src/c_abi.zig` carries a comptime assertion refusing to compile
+single-threaded — under `-fsingle-threaded` Zig lowers atomics to plain
+ops and the cross-thread cancel token would be silently broken in exactly
+the supported configuration. The CLI keeps its signal-safe `flag` token
+kind. Both configurations stay CI-compiled (`-Dsingle-threaded=true` lane
+builds the CLI single-threaded and the ABI multi-threaded from the same
+invocation). The `gpa` fallback to `page_allocator` for single-threaded
+builds is dead by construction and removed.
+
+## 8. Test matrix (narrowing / canary / boundary / fuzz)
+
+| Gate | What it pins |
+|---|---|
+| comptime offset asserts | every offset in §4, `@sizeOf` of every struct |
+| plane-value pinning test | `ZLSX_PLANE_*` ↔ `@intFromEnum(PlaneTwo.*)` for all fourteen + `NONE` |
+| narrowing tests | unknown `fidelity`/`profile`/`dialect`/`on_unsupported` → -1; `utc_offset_min` ±1441 → -1 (`UtcOffsetOutOfRange`); `sheet_idx = UINT32_MAX` → -1; `formula_len` one-past-limit → -2 `FormulaLimitExceeded` |
+| boundary tests | limit fields at 0 (default), `UINT64_MAX` (rejected by `ResourceLimits.validate`'s 4× hard ceiling → -1 `LimitOutOfRange`) |
+| canary-tail tests | output structs with `struct_size = known + 64`, tail filled `0xAA` — tail intact after success AND after each failure class |
+| `StructSizeTooSmall` | every struct-taking export, `struct_size = known - 1` → -1, output untouched |
+| status tests | 0 / -1 / -2 / -3(via failing allocator N/A at ABI — covered by refusal+generic classes) / -5 (pre-triggered token) |
+| release fns | idempotent-shape: release, then release the zeroed struct again (no-op); NULL-safe |
+| old-binding compat | legacy exports' 0/-1 behaviour unchanged (existing suite already pins); probes absent on old dylibs = feature off (`hasattr` gate in `_ffi.py`) |
+| ABI fuzz | random `zlsx_run_v1` bytes (enums, limits, struct_size), random formula bytes, random anchors against a live editor: status ∈ {0,-1,-2,-3,-5}, no panic, canary tails intact — `fuzzItersCabi()` iterations |
+| header compile gate | `tests/c_abi_smoke.c` compiled as an object in `zig build test`: `#error` unless every `ZLSX_HAS_*` macro is defined; takes the address of every M9a1 export |
+
+## 9. Decisions index (mirrored into `goal_formula.md`'s M9a1 block)
+
+1. Cancel token API ships in part 1 (R9-12 is about it; the token
+   parameter is otherwise untestable).
+2. One error→status mapping; ABI-boundary contract violations are -1.
+3. Refusal-path census stays empty in v1 diag; pkg-level surfacing flagged
+   for M9a2's Python leg.
+4. `zlsx_editor_evaluate` = M6 CLI semantics (fixed draw source, seed
+   echoed); volatile-drawing evaluate is not a thing any shipped layer has.
+5. `zlsx_buffer_release` stages with the buffer exports (M9a2).
+6. Build hash in a dedicated `fingerprint_config` options module; CLI
+   build cache unaffected by commits.

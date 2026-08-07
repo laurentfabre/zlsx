@@ -56,6 +56,11 @@ jobs:
           bash scripts/fetch_test_corpus.sh
           zig build test-corpus
 
+      # Since M9a1 (R9-12) this lane compiles BOTH shapes from one
+      # invocation: the CLI single-threaded, the C ABI multi-threaded —
+      # build.zig never forwards the option into c_abi_mod, because
+      # -fsingle-threaded lowers atomics to plain ops and would silently
+      # break the cross-thread cancel token.
       - name: Single-threaded build compiles
         run: zig build -Doptimize=ReleaseFast -Dsingle-threaded=true
 

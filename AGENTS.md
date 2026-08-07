@@ -66,7 +66,7 @@ zig build fuzz                       # coverage-guided fuzz (Linux x64 only — 
 zig build run -- <args>              # build + run the CLI
 zig build -Doptimize=ReleaseSafe     # production-shape build
 zig build -Dtarget=aarch64-linux-musl  # cross-compile (compile-only — execution requires QEMU)
-zig build -Dsingle-threaded=true     # CLI + C ABI: smp_allocator → page_allocator
+zig build -Dsingle-threaded=true     # CLI only: smp_allocator → page_allocator (C ABI stays multi-threaded, R9-12)
 zig fmt --check src/                 # formatting check
 zig fmt src/                         # auto-format
 ```
@@ -167,9 +167,11 @@ cd tests/consumer && zig build && ./zig-out/bin/consumer /tmp/in.xlsx /tmp/out.x
 
 The third module is the reason the gate lives outside the repo's own `build.zig`: `assertAcyclicModules` walks modules zlsx constructed, while a downstream package resolves them through `b.dependency(...)`, and the composition only compiles if the `zlsx` reached that way is the same module object `zlsx_pkg` and `zlsx_recalc` were built against.
 
-### `-Dsingle-threaded` swaps the allocator
+### `-Dsingle-threaded` swaps the allocator — CLI only
 
-More than a thread-disabling toggle: `smp_allocator` (lock-striped) is swapped for `page_allocator` in the CLI and C ABI. Bench numbers will diverge. Don't blindly compare single-threaded vs default builds.
+More than a thread-disabling toggle: `smp_allocator` (lock-striped) is swapped for `page_allocator` in the CLI. Bench numbers will diverge. Don't blindly compare single-threaded vs default builds.
+
+The C ABI is exempt since M9a1 (decision R9-12): `zlsx_cancel_token_trigger` is documented callable from any thread, and `-fsingle-threaded` lowers atomics to plain ops — which would silently break the token in exactly the supported configuration. `build.zig` hard-sets the module multi-threaded and `src/c_abi.zig` carries a comptime assertion refusing anything else; the `-Dsingle-threaded=true` CI lane still compiles both shapes from one invocation (CLI single-threaded, ABI multi-threaded). The CLI keeps its signal-safe `flag` token kind.
 
 ### Version is a single source of truth
 

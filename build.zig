@@ -8,7 +8,7 @@ const pkg_version: []const u8 = @import("build.zig.zon").version;
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const single_threaded = b.option(bool, "single-threaded", "Build the CLI and C ABI with -fsingle-threaded (smp_allocator is swapped for page_allocator)");
+    const single_threaded = b.option(bool, "single-threaded", "Build the CLI with -fsingle-threaded (smp_allocator is swapped for page_allocator). The C ABI is always multi-threaded (R9-12): its cross-thread cancel token needs real atomics");
 
     // Options module exposes `version` to downstream Zig code via
     // `@import("build_options").version`. We share one instance across
@@ -16,6 +16,25 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", pkg_version);
     const build_options_mod = build_options.createModule();
+
+    // M9a1: build identity for `zlsx_engine_fingerprint()`. Its own
+    // options module, imported only by the C ABI, so a new commit does
+    // not invalidate the CLI's build cache. Tarball builds without git
+    // still build — they fingerprint as "unknown" unless -Dbuild-hash
+    // says otherwise.
+    const build_hash: []const u8 = b.option([]const u8, "build-hash", "Build identity embedded in zlsx_engine_fingerprint() (default: git short hash, else \"unknown\")") orelse blk: {
+        var code: u8 = undefined;
+        const out = b.runAllowFail(
+            &.{ "git", "-C", b.build_root.path orelse ".", "rev-parse", "--short=12", "HEAD" },
+            &code,
+            .ignore,
+        ) catch break :blk "unknown";
+        const trimmed = std.mem.trim(u8, out, " \t\r\n");
+        break :blk if (trimmed.len == 0) "unknown" else trimmed;
+    };
+    const fingerprint_opts = b.addOptions();
+    fingerprint_opts.addOption([]const u8, "build_hash", build_hash);
+    const fingerprint_config_mod = fingerprint_opts.createModule();
 
     // M5d1: the cancellation / deadline / 64 KiB-chunk seam (§5.5,
     // §5.10). Std-only and imported by name everywhere, which is what
@@ -1872,11 +1891,21 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/c_abi.zig"),
         .target = target,
         .optimize = optimize,
-        .single_threaded = single_threaded,
+        // R9-12 (M9a1): never single-threaded, regardless of the option.
+        // Under -fsingle-threaded Zig lowers atomics to plain ops, which
+        // would silently break the cross-thread cancel token in exactly
+        // the supported configuration. The -Dsingle-threaded lane still
+        // compiles this module — multi-threaded — from the same
+        // invocation, so both configurations stay CI-built.
+        .single_threaded = false,
     });
     c_abi_mod.addImport("zlsx_control", control_mod);
     c_abi_mod.addImport("build_options", build_options_mod);
+    c_abi_mod.addImport("fingerprint_config", fingerprint_config_mod);
     c_abi_mod.addImport("fuzz_config", fuzz_config_mod);
+    // M9a1: `zlsx_editor_evaluate` narrows its anchor through the typed
+    // Row/Col constructors rather than re-deriving the bounds checks.
+    c_abi_mod.addImport("zlsx_refs", refs_mod);
     // After the B2 iter-er-0 Editor relocation, c_abi reaches Editor
     // through zlsx_pkg and xlsx via the named `zlsx` dep (no more
     // relative `@import("xlsx.zig")` / `@import("writer.zig")`, so
@@ -1913,6 +1942,20 @@ pub fn build(b: *std.Build) void {
     // and a corpus-gated end-to-end lifecycle smoke test).
     const c_abi_tests = b.addTest(.{ .root_module = c_abi_mod });
     test_step.dependOn(&b.addRunArtifact(c_abi_tests).step);
+
+    // M9a1: header compile gate. A pure-C translation unit that #errors
+    // unless every ZLSX_HAS_* feature macro is defined and takes the
+    // address of every M9a1 export — the header side of the 3-file
+    // transaction is compile-verified, not just eyeballed. Object only;
+    // nothing links it.
+    const c_smoke_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+    });
+    c_smoke_mod.addCSourceFile(.{ .file = b.path("tests/c_abi_smoke.c") });
+    c_smoke_mod.addIncludePath(b.path("include"));
+    const c_smoke = b.addObject(.{ .name = "c_abi_smoke", .root_module = c_smoke_mod });
+    test_step.dependOn(&c_smoke.step);
 
     // ─── B1 iter-wb-6: RSS gate ─────────────────────────────────
     //
