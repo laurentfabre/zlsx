@@ -55,6 +55,7 @@ const parser = @import("parser.zig");
 const value = @import("value.zig");
 const env = @import("env.zig");
 const registry = @import("registry.zig");
+const numfmt = @import("numfmt.zig");
 const run_inputs = @import("run_inputs.zig");
 /// §5.6d's draw schedule. A leaf below this file and below the iteration
 /// engine both, because a draw's key is half in-body (which callsite,
@@ -7505,6 +7506,160 @@ test "refusals: the plane-2 map is total and says what §10 says" {
     try testing.expectEqual(@as(usize, 0), not_yet_implemented.len);
 }
 
+// ─── M8a: TEXT over numfmt_v1 (§7, one name; one grammar) ─────────
+
+/// B carries one value per RenderValue arm plus the fictitious leap
+/// serial; A1 stays blank on purpose (a blank formats as 0); F1 is the
+/// propagation probe.
+fn putM8aCells(h: *Harness) !void {
+    try h.put("B1", num(1234.5678));
+    try h.put("B2", num(-5));
+    try h.put("B3", num(60));
+    try h.put("B4", num(0.75));
+    try h.put("B5", .{ .text = "abc" });
+    try h.put("B6", .{ .boolean = true });
+    try h.put("F1", value.ScalarValue.errorOf(.div0));
+}
+
+const m8a_cases = [_]F2Case{
+    // ── the wiring: each RenderValue arm, blank, and propagation ──
+    .{ .func = "TEXT", .formula = "TEXT(B1,\"0.00\")", .expect = .{ .text = "1234.57" } },
+    .{ .func = "TEXT", .formula = "TEXT(B1,\"#,##0.00\")", .expect = .{ .text = "1,234.57" } },
+    .{ .func = "TEXT", .formula = "TEXT(B2,\"0.00;(0.00)\")", .expect = .{ .text = "(5.00)" }, .note = "the positional negative section renders |v|" },
+    .{ .func = "TEXT", .formula = "TEXT(5,0)", .expect = .{ .text = "5" }, .note = "the format slot coerces to text: 0 is the code \"0\"" },
+    .{ .func = "TEXT", .formula = "TEXT(B5,\"0.00\")", .expect = .{ .text = "abc" }, .note = "text through a numeric-only format passes unchanged" },
+    .{ .func = "TEXT", .formula = "TEXT(12,\"@\")", .expect = .{ .text = "12" }, .note = "a number through @ is its General spelling" },
+    .{ .func = "TEXT", .formula = "TEXT(B6,\"0.00\")", .expect = .{ .text = "TRUE" }, .note = "booleans bypass every section" },
+    .{ .func = "TEXT", .formula = "TEXT(A1,\"0\")", .expect = .{ .text = "0" }, .note = "a blank formats as the number 0" },
+    .{ .func = "TEXT", .formula = "TEXT(F1,\"0\")", .expect = .{ .err = .div0 }, .note = "errors propagate before any formatting" },
+    .{ .func = "TEXT", .formula = "TEXT(5,\"\")", .expect = .{ .text = "" }, .note = "the empty-format quirk, pinned" },
+    .{ .func = "TEXT", .formula = "TEXT(-1,\"yyyy\")", .expect = .{ .err = .value }, .note = "a serial with no date is Excel's own #VALUE!" },
+
+    // ── one fixture per construct family, TEXT-side bytes ──
+    .{ .func = "TEXT", .formula = "TEXT(0.375,\"0.00%\")", .expect = .{ .text = "37.50%" } },
+    .{ .func = "TEXT", .formula = "TEXT(12345.6789,\"0.00E+00\")", .expect = .{ .text = "1.23E+04" } },
+    .{ .func = "TEXT", .formula = "TEXT(5.25,\"# ?/?\")", .expect = .{ .text = "5 1/4" } },
+    .{ .func = "TEXT", .formula = "TEXT(2.5,\"?/?\")", .expect = .{ .text = "5/2" } },
+    .{ .func = "TEXT", .formula = "TEXT(B3,\"yyyy-mm-dd\")", .expect = .{ .text = "1900-02-29" }, .note = "the fictitious leap day reaches TEXT through the epoch" },
+    .{ .func = "TEXT", .formula = "TEXT(45000,\"ddd mmm d\")", .expect = .{ .text = "Wed Mar 15" } },
+    .{ .func = "TEXT", .formula = "TEXT(B4,\"hh:mm AM/PM\")", .expect = .{ .text = "06:00 PM" } },
+    .{ .func = "TEXT", .formula = "TEXT(1.5,\"[h]:mm\")", .expect = .{ .text = "36:00" } },
+    .{ .func = "TEXT", .formula = "TEXT(0.005,\"0.0,,\")", .expect = .{ .text = "0.0" }, .note = "a scaled-away value rounds to the forced zero, unsigned" },
+};
+
+test "M8a: every TEXT fixture evaluates to what the spec says" {
+    for (m8a_cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putM8aCells(&h);
+
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("M8a case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectValue(c.expect, v) catch |e| {
+            std.debug.print("M8a case `{s}` ({s})\n", .{ c.formula, c.note });
+            return e;
+        };
+    }
+}
+
+test "M8a: the TEXT refusals ride the grammar's planes, not fabricated errors" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+
+    try testing.expectError(error.MalformedInput, h.eval("TEXT(5,\"0q\")"));
+    try testing.expectError(error.MalformedInput, h.eval("TEXT(5,\"0.0.0\")"));
+    try testing.expectError(error.LocaleSensitiveInput, h.eval("TEXT(5,\"[$-40C]0\")"));
+    try testing.expectError(error.LocaleSensitiveInput, h.eval("TEXT(5,\"[DBNum1]0\")"));
+    try testing.expectError(error.LocaleSensitiveInput, h.eval("TEXT(5,\"g\")"));
+    const too_long = "TEXT(5,\"" ++ ("0" ** 256) ++ "\")";
+    try testing.expectError(error.LimitExceeded, h.eval(too_long));
+}
+
+test "M8a: the TEXT matrix derives from numfmt's support matrix" {
+    // ONE derivation (the row's own words): every rendered construct
+    // renders through TEXT, every refused construct refuses through
+    // TEXT on the grammar's plane. The loop reads `support_matrix`
+    // directly, so a construct promoted there is exercised here
+    // without this test changing.
+    for (numfmt.support_matrix) |row| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+
+        // Formula-level quoting doubles the quotes inside the example.
+        var formula: std.ArrayListUnmanaged(u8) = .empty;
+        defer formula.deinit(testing.allocator);
+        try formula.appendSlice(testing.allocator, "TEXT(1.5,\"");
+        for (row.example) |ch| {
+            if (ch == '"') try formula.appendSlice(testing.allocator, "\"\"") else try formula.append(testing.allocator, ch);
+        }
+        try formula.appendSlice(testing.allocator, "\")");
+
+        switch (row.status) {
+            .rendered => {
+                const v = h.eval(formula.items) catch |e| {
+                    std.debug.print("matrix row {t} refused through TEXT: {t}\n", .{ row.construct, e });
+                    return e;
+                };
+                try testing.expect(v == .scalar);
+                try testing.expect(v.scalar == .text);
+            },
+            .refused => |reason| {
+                const plane = (numfmt.Refusal{ .reason = reason, .at = 0, .construct = null }).planeTwo();
+                const want: EvalError = switch (plane) {
+                    .FormulaLimitExceeded => error.LimitExceeded,
+                    .FormulaLocaleSensitiveInput => error.LocaleSensitiveInput,
+                    .FormulaMalformedInput => error.MalformedInput,
+                    else => unreachable,
+                };
+                try testing.expectError(want, h.eval(formula.items));
+            },
+        }
+    }
+}
+
+test "M8a: the one frozen name resolves, and each fixture stays in the batch" {
+    var it = registry.inventory();
+    var batch: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M8a")) continue;
+        batch += 1;
+        if (registry.lookup(e.name) == null) return error.UnregisteredBatchFunction;
+        var fixtures: usize = 0;
+        for (m8a_cases) |c| {
+            if (std.mem.eql(u8, c.func, e.name)) fixtures += 1;
+        }
+        if (fixtures == 0) return error.UnfixturedBatchFunction;
+    }
+    try testing.expectEqual(@as(usize, 1), batch);
+    for (m8a_cases) |c| {
+        try testing.expectEqualStrings("TEXT", c.func);
+    }
+}
+
+test "M8a: the evidence label on every fixture is true of the committed manifests" {
+    var oracle_rows: usize = 0;
+    for (m8a_cases) |c| {
+        switch (try manifestVerdict(c.formula)) {
+            .decided => {
+                if (c.evidence != .oracle) return error.UnderstatedEvidence;
+                oracle_rows += 1;
+            },
+            .excluded => return error.ExcludedCellClaimedAsEvidence,
+            .silent => {
+                if (c.evidence != .spec_pinned) return error.UnbackedOracleClaim;
+            },
+        }
+    }
+    // The committed manifests predate TEXT; the parked Excel leg is
+    // what would move this count.
+    try testing.expectEqual(@as(usize, 0), oracle_rows);
+}
+
 test "refusals: an unregistered call refuses, an unresolvable name is #NAME?" {
     var h: Harness = undefined;
     try h.init(testing.allocator);
@@ -7512,10 +7667,10 @@ test "refusals: an unregistered call refuses, an unresolvable name is #NAME?" {
 
     // §7: unregistered calls refuse rather than inventing `#NAME?` for a
     // function zlsx simply does not implement.
-    // `TEXT` is frozen in the inventory for M8a and unregistered
+    // `PROPER` is frozen in the inventory for M8b and unregistered
     // today; `VLOOKUP` stood here until M4e registered it, `SUMIFS`
-    // until M7b2, `MEDIAN` until M7b3.
-    try testing.expectError(error.UnsupportedFunction, h.eval("TEXT(A1,\"0\")"));
+    // until M7b2, `MEDIAN` until M7b3, `TEXT` until M8a.
+    try testing.expectError(error.UnsupportedFunction, h.eval("PROPER(A1)"));
     try testing.expectError(error.UnsupportedFunction, h.eval("NOTAFUNCTION()"));
     // §5.9: a value-position name that provably resolves nowhere is a
     // plane-1 `#NAME?`, which is a successful result.

@@ -105,6 +105,10 @@ pub const spill = @import("spill.zig");
 /// everything above is: `Rng.drawSource()` returns an `eval.DrawSource`,
 /// and a second `eval.zig` would make it a different type.
 pub const rng = @import("rng.zig");
+/// M8a: `numfmt_v1` — the format grammar TEXT and the workbook's
+/// cell-display seam share. Reached through this module so the two
+/// callers hold the SAME `Format` type and the same rendered bytes.
+pub const numfmt = @import("numfmt.zig");
 
 pub const Refusal = decode.Refusal;
 pub const SheetIndex = env.SheetIndex;
