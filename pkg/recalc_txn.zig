@@ -153,6 +153,20 @@ pub const Refusal = struct {
     /// Set when the refusal is a census entry passed through — the plane
     /// the *evaluator* raised, not one this file invented.
     plane: ?PlaneTwo = null,
+    /// §5.7.7's census at the moment of the refusal (M9a2): the entries
+    /// whose constructs refused, bounded by `max_census_entries` and
+    /// owned — `deinit` with the workbook's allocator. Empty for the
+    /// retention and calc-state reasons, which are not about cells.
+    /// This is what makes a refusal's diagnostics honest: before M9a2
+    /// the pipeline collapsed the census into `plane` alone and the
+    /// refusing cells never crossed any boundary (decision M9a1-4).
+    census: []const Unsupported = &.{},
+    census_truncated: bool = false,
+
+    pub fn deinit(self: *Refusal, gpa: Allocator) void {
+        gpa.free(self.census);
+        self.* = undefined;
+    }
 
     pub const Reason = enum {
         /// §5.7.4: the retained set is full. Refused before the swap,
@@ -432,14 +446,20 @@ pub fn prepare(
     var mark_only = false;
     if (census.len > 0) {
         switch (opts.on_unsupported) {
-            .refuse => return .{
-                .refused = .{ .reason = .unsupported_construct, .plane = census[0].plane },
-            },
+            .refuse => return .{ .refused = .{
+                .reason = .unsupported_construct,
+                .plane = census[0].plane,
+                .census = try boundedCensus(gpa, census),
+                .census_truncated = census.len > max_census_entries,
+            } },
             .keep_stale_and_mark => {
                 for (census) |c| {
-                    if (!calc_patch.markEligible(c.plane)) return .{
-                        .refused = .{ .reason = .unsupported_construct, .plane = c.plane },
-                    };
+                    if (!calc_patch.markEligible(c.plane)) return .{ .refused = .{
+                        .reason = .unsupported_construct,
+                        .plane = c.plane,
+                        .census = try boundedCensus(gpa, census),
+                        .census_truncated = census.len > max_census_entries,
+                    } };
                 }
                 mark_only = true;
             },
@@ -1510,12 +1530,20 @@ test "refusal purity: an ineligible plane refuses even under keep-stale-and-mark
     switch (r) {
         .ok => return error.ExpectedRefusal,
         .refused => |ref| {
-            try testing.expectEqual(Refusal.Reason.unsupported_construct, ref.reason);
-            try testing.expectEqual(PlaneTwo.FormulaCycle, ref.planeTwo());
+            var refusal = ref;
+            defer refusal.deinit(gpa);
+            try testing.expectEqual(Refusal.Reason.unsupported_construct, refusal.reason);
+            try testing.expectEqual(PlaneTwo.FormulaCycle, refusal.planeTwo());
             try testing.expectEqual(
                 @as(workbook_mod.Error, error.FormulaCycle),
-                ref.toWorkbookError(),
+                refusal.toWorkbookError(),
             );
+            // M9a2: the refusal carries the census it refused over —
+            // BOTH entries, not just the plane the error names.
+            try testing.expectEqual(@as(usize, 2), refusal.census.len);
+            try testing.expectEqual(PlaneTwo.FormulaUnsupportedConstruct, refusal.census[0].plane);
+            try testing.expectEqual(PlaneTwo.FormulaCycle, refusal.census[1].plane);
+            try testing.expect(!refusal.census_truncated);
         },
     }
     try testing.expectEqual(@as(usize, 0), h.wb.retained.items.len);
@@ -1525,14 +1553,22 @@ test "refusal purity: the default refuses on the first census entry" {
     const gpa = testing.allocator;
     var h = try Harness.init(gpa, .{});
     defer h.deinit(gpa);
-    const census = [_]Unsupported{.{ .plane = .FormulaUnsupportedFunction }};
+    const census = [_]Unsupported{.{ .plane = .FormulaUnsupportedFunction, .sheet = 0, .row = 3, .col = 2 }};
     const r = try prepare(&h.wb, &staged_one, &census, .{});
     switch (r) {
         .ok => return error.ExpectedRefusal,
-        .refused => |ref| try testing.expectEqual(
-            PlaneTwo.FormulaUnsupportedFunction,
-            ref.planeTwo(),
-        ),
+        .refused => |ref| {
+            var refusal = ref;
+            defer refusal.deinit(gpa);
+            try testing.expectEqual(
+                PlaneTwo.FormulaUnsupportedFunction,
+                refusal.planeTwo(),
+            );
+            // M9a2: the refusing cell survives the collapse.
+            try testing.expectEqual(@as(usize, 1), refusal.census.len);
+            try testing.expectEqual(@as(u32, 3), refusal.census[0].row);
+            try testing.expectEqual(@as(u32, 2), refusal.census[0].col);
+        },
     }
 }
 

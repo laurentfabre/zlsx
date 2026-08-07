@@ -1542,3 +1542,122 @@ if _HAS_EVAL:
 
     lib.zlsx_value_release.argtypes = [ctypes.POINTER(ValueV1)]
     lib.zlsx_value_release.restype = None
+
+# ─── Formula engine (M9a2): buffers, file transaction, writer ─────────
+#
+# Part 2 of the zlsx_status_v1 surface. Same probing discipline: each
+# group gates exactly the high-level methods built on it, and an older
+# dylib keeps importing with the flag off.
+
+ZLSX_FORMULA_SCALAR = 0
+ZLSX_FORMULA_DYNAMIC_ARRAY = 1
+ZLSX_FORMULA_CSE = 2
+
+# §10's fourteen-plane vocabulary in ZLSX_PLANE_* order (the enum's
+# declaration order is ABI, pinned by the Zig-side test). Index with a
+# diag/census plane value to get the error name-shaped label.
+PLANE_NAMES = (
+    "FormulaUnsupportedFunction",
+    "FormulaUnsupportedConstruct",
+    "FormulaPrecisionAsDisplayed",
+    "FormulaMalformedInput",
+    "FormulaLocaleSensitiveInput",
+    "FormulaDataTableUnsupported",
+    "FormulaSignedWorkbook",
+    "FormulaStaleEmbeddings",
+    "FormulaAnchorRequired",
+    "FormulaCycle",
+    "FormulaDynamicRefUnstable",
+    "FormulaSpillPersistUnsupported",
+    "FormulaResultNotRepresentable",
+    "FormulaLimitExceeded",
+)
+
+
+class FormulaCellV1(ctypes.Structure):
+    """Mirrors zlsx_formula_cell_v1 — §12.3's per-cell descriptor."""
+
+    _fields_ = [
+        ("text", ctypes.POINTER(ctypes.c_ubyte)),
+        ("text_len", ctypes.c_size_t),
+        ("dialect", ctypes.c_uint32),
+        ("_reserved0", ctypes.c_uint32),
+        ("ref", ctypes.POINTER(ctypes.c_ubyte)),
+        ("ref_len", ctypes.c_size_t),
+    ]
+
+
+assert ctypes.sizeof(FormulaCellV1) == 40
+
+# Composite: Editor.save_to_buffer / Editor.from_bytes need all three
+# symbols, and a dylib carrying one without the others is not a shape
+# any release ever shipped.
+_HAS_SAVE_BUFFER = (
+    hasattr(lib, "zlsx_editor_save_to_buffer")
+    and hasattr(lib, "zlsx_open_buffer")
+    and hasattr(lib, "zlsx_buffer_release")
+)
+if _HAS_SAVE_BUFFER:
+    lib.zlsx_editor_save_to_buffer.argtypes = [
+        editor_handle,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),  # out_ptr
+        ctypes.POINTER(ctypes.c_size_t),                 # out_len
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_save_to_buffer.restype = ctypes.c_int32
+
+    lib.zlsx_open_buffer.argtypes = [
+        ctypes.POINTER(ctypes.c_ubyte),  # data
+        ctypes.c_size_t,                 # data_len
+        ctypes.POINTER(editor_handle),   # out
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_open_buffer.restype = ctypes.c_int32
+
+    lib.zlsx_buffer_release.argtypes = [
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_buffer_release.restype = None
+
+_HAS_SAVE_WITH_RECALC = hasattr(lib, "zlsx_editor_save_with_recalc")
+if _HAS_SAVE_WITH_RECALC:
+    lib.zlsx_editor_save_with_recalc.argtypes = [
+        editor_handle,
+        ctypes.POINTER(ctypes.c_ubyte),  # out_path_ptr
+        ctypes.c_size_t,                 # out_path_len
+        ctypes.POINTER(RunV1),
+        ctypes.POINTER(RecalcReportV1),
+        ctypes.POINTER(DiagV1),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_save_with_recalc.restype = ctypes.c_int32
+
+_HAS_WRITER_RECALC = hasattr(lib, "zlsx_writer_save_with_recalc")
+if _HAS_WRITER_RECALC:
+    lib.zlsx_writer_save_with_recalc.argtypes = [
+        writer_handle,
+        ctypes.POINTER(ctypes.c_ubyte),  # out_path_ptr
+        ctypes.c_size_t,                 # out_path_len
+        ctypes.POINTER(RunV1),
+        ctypes.POINTER(RecalcReportV1),
+        ctypes.POINTER(DiagV1),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_writer_save_with_recalc.restype = ctypes.c_int32
+
+_HAS_FORMULAS_V2 = hasattr(lib, "zlsx_sheet_writer_write_row_with_formulas_v2")
+if _HAS_FORMULAS_V2:
+    lib.zlsx_sheet_writer_write_row_with_formulas_v2.argtypes = [
+        sheet_writer_handle,
+        ctypes.POINTER(Cell),           # cells
+        ctypes.POINTER(FormulaCellV1),  # formulas (parallel)
+        ctypes.c_size_t,                # cells_len
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_sheet_writer_write_row_with_formulas_v2.restype = ctypes.c_int32

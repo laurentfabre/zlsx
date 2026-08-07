@@ -1637,6 +1637,97 @@ int32_t zlsx_editor_evaluate(zlsx_editor_t * ed,
 #define ZLSX_HAS_EVAL        1
 #define ZLSX_HAS_CANCEL      1
 
+/* ── Formula engine (M9a2): buffers, the file transaction, writer ──
+ *
+ * Part 2 of the C ABI (§12.3). Same zlsx_status_v1 contract, same
+ * struct_size discipline as the M9a1 block above; every M9a1 layout
+ * stays frozen. Layout note: docs/plans/c-abi-status-v1.md. */
+
+/* Release a buffer an M9a2 export allocated. NULL-safe. (The legacy
+ * zlsx_buffer_free keeps its shipped contract; this is the status-era
+ * name §12.3 pins.) */
+void zlsx_buffer_release(uint8_t * ptr, size_t len);
+
+/* Serialize the editor's current state — staged mutations included —
+ * into a library-allocated buffer (§5.10). An untouched editor hands
+ * back the source bytes verbatim. On non-zero status *out_ptr is NULL
+ * and *out_len is 0. Release with zlsx_buffer_release. */
+int32_t zlsx_editor_save_to_buffer(zlsx_editor_t * ed,
+        uint8_t ** out_ptr, size_t * out_len,
+        char * errbuf, size_t errbuf_len);
+
+/* Open an editor over a workbook already in memory (§5.10). The
+ * borrow ends when this returns: `data` is copied, so the caller may
+ * free or reuse it immediately — the zlsx_book_open_buffer contract.
+ * On ZLSX_OK *out holds the handle (close with zlsx_editor_close);
+ * on any other status *out is NULL. */
+int32_t zlsx_open_buffer(const uint8_t * data, size_t data_len,
+        zlsx_editor_t ** out, char * errbuf, size_t errbuf_len);
+
+/* §5.7.9's file transaction: recalculate, serialize from the prepared
+ * candidate, rename, swap in memory between the rename and the
+ * directory fsync. Any failure before the rename leaves BOTH the
+ * destination's prior bytes (or its absence) and the editor's memory
+ * untouched. A directory fsync failing after the rename is
+ * report->durability_warning (+ durability_errno) on a ZLSX_OK return
+ * — the §5.7.9 slot goes live here — never an error. A -2 refusal
+ * carries the refusing cells in diag->census. */
+int32_t zlsx_editor_save_with_recalc(zlsx_editor_t * ed,
+        const uint8_t * out_path_ptr, size_t out_path_len,
+        const zlsx_run_v1 * run,
+        zlsx_recalc_report_v1 * report, zlsx_diag_v1 * diag,
+        char * errbuf, size_t errbuf_len);
+
+/* The producer-side file transaction (§12.3 Writer.save(recalculate=)):
+ * emit the writer's archive to memory, open it as a workbook, run the
+ * same §5.7.9 transaction zlsx_editor_save_with_recalc runs. The
+ * writer handle is neither consumed nor mutated. */
+int32_t zlsx_writer_save_with_recalc(zlsx_writer_t * w,
+        const uint8_t * out_path_ptr, size_t out_path_len,
+        const zlsx_run_v1 * run,
+        zlsx_recalc_report_v1 * report, zlsx_diag_v1 * diag,
+        char * errbuf, size_t errbuf_len);
+
+/* Formula dialect tags for zlsx_formula_cell_v1. DYNAMIC_ARRAY is
+ * reserved ABI: the writer currently refuses it (-1) — its authored
+ * metadata's Excel reference set has not arrived (§5.8b). */
+#define ZLSX_FORMULA_SCALAR        0u
+#define ZLSX_FORMULA_DYNAMIC_ARRAY 1u
+#define ZLSX_FORMULA_CSE           2u
+
+/* §12.3's per-cell formula descriptor — the shape a CSE rectangle
+ * needs and the parallel text arrays of
+ * zlsx_sheet_writer_write_row_with_formulas cannot encode. An array
+ * element (no struct_size); the v1 layout is frozen at 40 bytes. */
+typedef struct zlsx_formula_cell_v1 {
+    const uint8_t * text;     /* NULL = plain value slot */
+    size_t   text_len;        /* > 0 when text != NULL */
+    uint32_t dialect;         /* ZLSX_FORMULA_* */
+    uint32_t _reserved0;      /* always 0 */
+    const uint8_t * ref;      /* CSE only: declared range, uppercase A1
+                               * ("A1" or "A1:B2"); NULL otherwise */
+    size_t   ref_len;
+} zlsx_formula_cell_v1;
+
+/* The v2 formula row: `formulas` is parallel to `cells`. A CSE ref is
+ * legal ONLY on the rectangle's top-left (the anchor writes
+ * <f t="array" ref>); the range's other cells arrive as plain value
+ * slots in later rows (empty ones become bare <c> placeholders), a
+ * formula inside an open rectangle refuses, and save refuses while
+ * any rectangle is missing members. Every refusal here is a statement
+ * about the call: -1, never -2. */
+int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
+        const zlsx_cell_t * cells,
+        const zlsx_formula_cell_v1 * formulas,
+        size_t cells_len,
+        char * errbuf, size_t errbuf_len);
+
+/* Feature macros — compile-time counterpart of the dlsym probe. */
+#define ZLSX_HAS_SAVE_BUFFER      1   /* editor save_to_buffer + open_buffer + buffer_release */
+#define ZLSX_HAS_SAVE_WITH_RECALC 1
+#define ZLSX_HAS_WRITER_RECALC    1
+#define ZLSX_HAS_FORMULAS_V2      1
+
 
 #ifdef __cplusplus
 }

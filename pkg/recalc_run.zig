@@ -145,6 +145,14 @@ pub const Options = struct {
     /// §5.7.4's counted retention.
     max_retained_generations: usize = recalc_txn.default_max_retained_generations,
     max_retained_bytes: u64 = recalc_txn.default_max_retained_bytes,
+    /// M9a2's refusal seam (decision M9a1-4): when non-null, a Plane-2
+    /// refusal is MOVED here — census included — before the error
+    /// returns, and the caller owns it (`Refusal.deinit` with the
+    /// workbook's allocator, which is what allocated it). Untouched on
+    /// success, cancellation and non-refusal errors. Null keeps the
+    /// pre-M9a2 behaviour: the census dies with the refusal and only
+    /// the error name crosses.
+    refusal_out: ?*recalc_txn.Refusal = null,
 };
 
 // ─── the entry points (§12.1) ────────────────────────────────────
@@ -165,12 +173,23 @@ pub fn recalculate(
     var prepared = try prepare(wb, gpa, io, run, opts);
     switch (prepared) {
         .none => |r| return r,
-        .refused => |r| return r.toWorkbookError(),
+        .refused => |r| return takeRefusal(wb, opts, r),
         .ok => |*candidate| {
             candidate.swap(wb);
             return candidate.takeReport();
         },
     }
+}
+
+/// The `.refused` arm's single exit: name the error, then either move
+/// the refusal — census and all — into the caller's `refusal_out` slot
+/// or free it. Returning the error *value* keeps both callers a
+/// one-liner.
+fn takeRefusal(wb: *Workbook, opts: Options, refusal: recalc_txn.Refusal) workbook_mod.Error {
+    var r = refusal;
+    const e = r.toWorkbookError();
+    if (opts.refusal_out) |slot| slot.* = r else r.deinit(wb.allocator);
+    return e;
 }
 
 /// §5.7.9's file transaction, in the order §5.7.9 makes normative.
@@ -190,7 +209,7 @@ pub fn saveWithRecalc(
 ) Error!Report {
     var prepared = try prepare(wb, gpa, io, run, opts);
     switch (prepared) {
-        .refused => |r| return r.toWorkbookError(),
+        .refused => |r| return takeRefusal(wb, opts, r),
         // Nothing to recalculate, so nothing to prepare — and a save
         // that writes the staged state is precisely what "byte-identical
         // to a plain save" means.
@@ -2140,4 +2159,44 @@ test "refusal: an unsupported function refuses, and mark-only marks instead" {
         const part = (try wb.store.part("xl/workbook.xml")).?;
         try testing.expect(std.mem.indexOf(u8, part.bytes, "fullCalcOnLoad=\"1\"") != null);
     }
+}
+
+test "refusal_out: the census crosses the seam with the refusing cell" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const unregistered = "<worksheet xmlns=\"" ++ ns_main ++ "\"><sheetData><row r=\"1\">" ++
+        "<c r=\"A1\"><v>1</v></c><c r=\"B1\"><f>NOSUCHFN(A1)</f><v>999</v></c>" ++
+        "</row></sheetData></worksheet>";
+    const src = try writeFixture(a, io, dir, "in.xlsx", .{ .sheet = unregistered });
+    defer a.free(src);
+
+    var wb = try Workbook.open(a, io, src);
+    defer wb.deinit();
+
+    // The M9a2 seam (decision M9a1-4): the same refusal, but the caller
+    // supplied a slot, so the refusing cell arrives instead of dying
+    // inside the pipeline. B1 is row 1, col 1 (0-based).
+    var refusal: recalc_txn.Refusal = undefined;
+    try testing.expectError(
+        error.FormulaUnsupportedFunction,
+        wb.recalculate(a, io, fixed_run, .{ .refusal_out = &refusal }),
+    );
+    defer refusal.deinit(a);
+    try testing.expectEqual(recalc_txn.Refusal.Reason.unsupported_construct, refusal.reason);
+    try testing.expectEqual(@as(usize, 1), refusal.census.len);
+    try testing.expectEqual(engine.decode.PlaneTwo.FormulaUnsupportedFunction, refusal.census[0].plane);
+    try testing.expectEqual(@as(u32, 0), refusal.census[0].sheet);
+    try testing.expectEqual(@as(u32, 1), refusal.census[0].row);
+    try testing.expectEqual(@as(u32, 1), refusal.census[0].col);
+    try testing.expect(!refusal.census_truncated);
+    // And the workbook is untouched, refusal_out or not.
+    try testing.expectEqual(@as(usize, 0), wb.retained.items.len);
+    try testing.expectEqualStrings("999", try cellCache(try wb.sheet(0), "B1"));
 }

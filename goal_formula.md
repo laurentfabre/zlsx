@@ -2732,7 +2732,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M8b** ✅ | **PROPER over `casing_v1` — word segmentation decides WHICH scalars title-case, the M4f tables decide what title-casing IS** (`unicode/casing.zig` `toProper`; `fnProper` is a one-line delegation, so no second caller can disagree about either half). No second casing table: the segmenter reads the SAME `cased`/`case_ignorable` intervals Final_Sigma shipped — `beginsWord` is that backward walk pointed at the start of the word. The invariant boundary rule, pinned: a cased scalar title-cases when the nearest preceding non-case-ignorable scalar is absent or not cased, lowercases otherwise (Final_Sigma included); case-ignorables are transparent; every other non-cased scalar ends the word. Recorded spec_pinned divergences pending the parked oracle leg (§8.2): `don't`→`Don't` where Excel answers `Don'T` (`'` `.` `:` are Case_Ignorable), and uncased letters (Hebrew/CJK) end words — Alphabetic would be a second table. `NUMBERVALUE` promoted canonical unregistered | Segmentation fixtures byte-exact at both seams (ASCII, apostrophes, digits, combining marks, astral); evidence manifest-checked at 0 oracle rows |
 | **M8c** ✅ | F3 batch (NUMBERVALUE, FIXED, DOLLAR, CLEAN, UNICHAR, UNICODE, TEXTBEFORE, TEXTAFTER, TEXTSPLIT; NETWORKDAYS(.INTL), WORKDAY(.INTL), DATEDIF, DAYS, DAYS360, YEARFRAC, ISOWEEKNUM, WEEKNUM — **19 rows counted from the TSV**, the prose folds the `.INTL` variants). The text half rides the layers earlier rows built — `numfmt_v1` renders FIXED/DOLLAR through ONE derived code, §5.3b's three-way split parses NUMBERVALUE (pinned `.`/`,` defaults, explicit-vs-default separator demotion), `criteria.fold`'s positional map matches the TEXTBEFORE family under `.arg_selected`, TEXTSPLIT is the batch's rectangle producer whose default pad IS `#N/A` — and the date half rides `serial_date` with **weekdays counted over SERIALS batch-wide** (one `mondayDow`, M4g decision 1 applied to ISO weeks, week numbers, and both weekend engines; one 30/360 table under DAYS360 and YEARFRAC's bases 0/4). `PMT` promoted canonical unregistered; running total 140 | Oracle-first (manifests predate F3 → every fixture spec_pinned, checker two-directional, 0 oracle rows pinned; the parked §8.2 Excel leg is what moves it); **TEXT-heavy bench (§9.1) recorded** — `synth_text_mix` digest-pinned, marginal per-row cost stated across two sizes |
 | **M9a1** ✅ | C ABI part 1 (`feat/m9a1-cabi`): `zlsx_status_v1` (0/-1/-2/-3/-5, -4 reserved; ONE error→status mapping — the fourteen-plane vocabulary detected by name against `PlaneTwo` so a fifteenth plane maps itself; ABI-contract violations are -1, never -2) + the six descriptor structs (`run`/`resolved`/`recalc_report`/`value`/`value_elem`/`diag`+`census_entry`, every offset pinned three ways: comptime asserts in `c_abi.zig`, C `static_assert`s in `tests/c_abi_smoke.c`, ctypes `sizeof` asserts in `_ffi.py`) + `zlsx_editor_recalculate`/`zlsx_editor_evaluate` over the M5d2 pipeline (evaluate = M6 CLI semantics exactly) + **`zlsx_engine_fingerprint()`** (`"zlsx <semver>; excel_fp_rules_v1; rng_v1; collation_v1; <triple>; <build-hash>"` — rule versions read from the engine through `recalc_run.rule_versions`, so the identity cannot drift from the code) + **`zlsx_editor_mark_recalc_on_load`** + the cancel-token trio (pulled into part 1: R9-12 is *about* it) + three release fns (`zlsx_buffer_release` stages with M9a2's buffers). **C ABI module hard-set multi-threaded (R9-12)**: comptime assertion, `-Dsingle-threaded` narrowed to CLI-only, both shapes CI-compiled from one invocation. Committed design note `docs/plans/c-abi-status-v1.md` | 3-file txn (header + impl + `_ffi.py` probes `_HAS_FINGERPRINT`/`_HAS_MARK_RECALC`/`_HAS_RECALC`/`_HAS_EVAL`/`_HAS_CANCEL`); header compile gate; narrowing + canary-tail + boundary tests; ABI fuzz green |
-| **M9a2** | C ABI part 2: `save_to_buffer`, `open_buffer`, writer exports (incl. `…_with_formulas_v2` dialect) + Python Editor/Writer methods + `finally` cleanup | 3-file txn; probes; boundary tests |
+| **M9a2** ✅ | C ABI part 2 (`feat/m9a2-cabi2`): `zlsx_editor_save_to_buffer` + `zlsx_open_buffer` + `zlsx_buffer_release` (status-style, prepped `(NULL,0)` outputs; legacy `zlsx_buffer_free` untouched) over a **new pkg buffer seam** — `PartStore.saveCommitted` split into `checkArchiveBounds` + `emitArchive(w, poller)` shared with `PartStore.saveToOwnedBuffer`, `Workbook.save` split into `applySavePlans` + store save so `Workbook.saveToOwnedBuffer` writes the identical archive, `Editor.openBuffer` (dupe, borrow-ends-at-call per Book precedent) + two-path `Editor.saveToOwnedBuffer` — plus **`zlsx_editor_save_with_recalc`** (the §5.7.9 transaction across the ABI; **durability slot live**, pinned by the injected dir-fsync fixture) and **`zlsx_writer_save_with_recalc`** (= `zlsx_recalc.writerSaveWithRecalc` across the boundary — c_abi gains the `zlsx_recalc` import rather than re-inlining the composition). **`…_with_formulas_v2`**: `zlsx_formula_cell_v1` (40 B, array element, pinned three ways) + the fresh writer's **CSE rectangle state machine** (`FormulaCell` + `writeRowWithFormulaCells`; anchor-only ref, members carry `<v>`/no `<f>`, empty members become bare `<c>` placeholders, overlap/member-formula refusals at write, completeness gate in `projectSheets` on every save path; `dynamic_array` reserved ABI, refused pending §5.8b). **Refusal-census seam honest** (decision M9a1-4 closed): `recalc_txn.Refusal` owns a bounded census, `Options.refusal_out` moves it out, `-2` diags carry the refusing cell. **Python leg per §12.3**: `recalculate` / `save_with_recalc` / `evaluate` / `save_to_buffer` / `from_bytes` / `mark_recalc_on_load`, `Writer.save(recalculate=RecalcOptions(...))`, `FormulaSpec(.cse)` + row-wide `dialect=`, `ExcelError`/`Matrix`/`EvalResult`/`RecalcReport`/`Resolved`/`CensusEntry`, `ZlsxFormulaRefusal(error_name, cells, census)`, worker-thread cancellation (TimeoutError pre-commit only; post-commit ⇒ `cancelled_late`), every release fn in `try/finally` | 3-file txn (probes `_HAS_SAVE_BUFFER`/`_HAS_SAVE_WITH_RECALC`/`_HAS_WRITER_RECALC`/`_HAS_FORMULAS_V2` + smoke.c `#error` gate + boundary/canary tests + M9a2 descriptor fuzz); pytest 174 green |
 | **M9b** | Spark batch recalc: `zlsx.recalc` activation, read-only guarantee, digest-verified partitions, driver-inference-on-recalced-snapshot, per-executor digest-keyed cache note, retry tests, streaming refusal | Integration; retries; serverless verification |
 | **M9c1** | **Shared deterministic solver contract FIRST** (iterations ≤128 charged to a shared **`WorkBudget`** threaded through evaluator + solvers — units: node 1, solver iteration 4, nested callbacks re-charge; combined-exhaustion tests; poll points; Excel-compatible guesses — RATE/IRR 0.1 — and root selection; pinned tolerance; `#NUM!` on domain/convergence failure) + F4a-TVM (7, frozen: PMT, IPMT, PPMT, PV, FV, RATE, NPER) | Oracle-first; convergence/non-convergence/cancellation fixtures |
 | **M9c2** | F4a-flows (8, frozen: NPV, IRR, XNPV, XIRR, SLN, SYD, DB, DDB) | Oracle-first; solver fixtures |
@@ -5117,6 +5117,93 @@ layout note, written before the code), `pkg/recalc_run.zig` +
     The fourteen `ZLSX_PLANE_*` values are ABI, pinned by a test
     against the enum's declaration order.
 
+**M9a2 decisions (shipped 2026-08-07).** Eight points, in
+`src/c_abi.zig` + `include/zlsx.h` + `bindings/python/zlsx/_ffi.py`
+(the 3-file transaction) + `bindings/python/zlsx/__init__.py` +
+`bindings/python/tests/test_basic.py` + `bindings/python/README.md`
+(the M9a2 doc gate), with the pkg seams in `pkg/store.zig`,
+`pkg/workbook.zig`, `pkg/editor.zig`, `pkg/recalc_txn.zig`,
+`pkg/recalc_run.zig` and the writer machine in `src/writer.zig`.
+
+1.  **One archive stream, two sinks.** `PartStore.saveCommitted`'s
+    body split into `checkArchiveBounds` (the ZIP32 preflight) +
+    `emitArchive(w, poller)`; `saveToOwnedBuffer` runs the same
+    emitter into `std.Io.Writer.Allocating`. `Workbook.save` split
+    the same way (`applySavePlans` + store save), so a buffer save
+    and a subsequent path save are byte-identical — pinned by the
+    Editor round-trip test. §5.7.9's vocabulary deliberately does
+    not apply to the buffer path: no file, no commit point.
+2.  **`Editor.openBuffer` reuses `open`'s whole tail.**
+    `fromOwnedSource(allocator, io, buf, origin)` owns the scan; the
+    origin union only decides how the internal `Book`/`Workbook`
+    views are built (`openBuffer` keeps the sheet-count sanity check
+    against its second parse). The borrow ends at the call — dupe,
+    per the `Book.openBuffer` precedent — and the ABI test poisons
+    the caller's copy immediately after open to hold it there.
+3.  **`zlsx_buffer_release` is a new symbol.** The legacy
+    `zlsx_buffer_free` keeps its shipped contract verbatim (legacy
+    exports are frozen); the status-era name §12.3 pins is the same
+    operation. Both handle-returning M9a2 exports are status-style
+    (`zlsx_open_buffer` writes NULL into `*out` before anything can
+    fail; `zlsx_editor_save_to_buffer` preps the `(NULL, 0)` pair) —
+    the M9a1 outputs-before-inputs discipline extended to pointers.
+4.  **The refusal census crosses, and M9a1 decision 4 is closed.**
+    `recalc_txn.Refusal` now owns a `boundedCensus` dupe made at the
+    collapse sites; `recalc_run.Options.refusal_out` (null = exactly
+    the pre-M9a2 behaviour, census freed internally) moves it to the
+    caller, and `failMappedRefusal` turns it into the `-2` diag's
+    census. Honest scope: `iterate` stops at the first refusing cell
+    under `.refuse`, so today the census names *that* cell (row/col
+    filled only on the evaluator path — model/graph/stage refusals
+    are not about a cell and say so with `row = 0`); exhaustive
+    refusal enumeration would need the driver to keep evaluating
+    past a refusal, which is a different contract.
+5.  **`zlsx_writer_save_with_recalc` is `writerSaveWithRecalc`
+    across the boundary.** `c_abi_mod` gains the `zlsx_recalc`
+    import (acyclic — recalc imports zlsx + zlsx_pkg, never c_abi)
+    rather than re-inlining the composition. Save-generation
+    tracking from §12.3's `Writer.save` row is deferred with a
+    reason: every save with `recalculate=` recomputes through the
+    orchestrator, so no retained artifact exists and stale
+    volatile-cache reuse is impossible *by construction*; the
+    generation-keyed retained artifact is a reuse optimization, not
+    a correctness precondition, and lands with its own row.
+6.  **`zlsx_formula_cell_v1` is an array element, 40 bytes,
+    frozen.** Like `zlsx_census_entry_v1` it carries no
+    `struct_size`; offsets pinned three ways. `ZLSX_FORMULA_
+    DYNAMIC_ARRAY` is reserved ABI the writer refuses (-1) —
+    the authored `cm`/XLDAPR mutations wait on §5.8b's Excel
+    references, the same parked state as the pkg authoring path.
+    Every descriptor violation (NULL-text slot with a dialect or
+    ref, empty text, ref off a non-CSE dialect, unknown tag) is -1:
+    statements about the call.
+7.  **The CSE rectangle state machine lives in the fresh writer,
+    and refuses at three moments.** At declaration: malformed ref
+    (`parseA1Corner` grammar, which also makes the ref XML-safe by
+    construction), anchor ≠ declared top-left, overlap with any open
+    or same-row rectangle. As members arrive: any formula inside an
+    open rectangle (which subsumes the same-row second anchor — its
+    own cell is a member). At save: `projectSheets` refuses while
+    `covered != area` on any rectangle, and both save paths project
+    there. Empty members emit bare `<c>` placeholders — §12.3's
+    "authored members are empty placeholders" made literal — so a
+    1×1 anchor is complete on arrival. The legacy text-array path
+    maps through the same emitter as `.scalar` descriptors,
+    byte-identically.
+8.  **Python cancellation is a worker thread and two truths.** The
+    FFI call moves off the main thread; Ctrl-C triggers the token
+    and keeps waiting for the engine to unwind. `-5` maps to
+    `KeyboardInterrupt` when the binding triggered for an interrupt
+    and `TimeoutError` otherwise — both only ever pre-commit,
+    because that is the only case the engine returns `-5`. `rc == 0`
+    after a trigger (or after the deadline elapsed) returns normally
+    with `report.cancelled_late=True` — binding-level truth, since
+    the frozen 168-byte report has no such field. Every
+    library-owned allocation is released in `try/finally`
+    (`report`/`diag`/`value`/buffer), and `now`/`seed` default in
+    the *binding* (clock/OS entropy), never in the library, with the
+    resolved echo making defaulted runs replayable.
+
 ### 12.4 Spark (batch-only)
 
 `zlsx.recalc="true"` **activates**; source files are **never mutated**
@@ -5166,7 +5253,7 @@ classified flip-at / historical-label):
 | ~~`docs/vs_calamine.md:5,130`~~ | "no formula evaluation" (true until M5d2) | **M6 — done**: TL;DR and the pick-calamine list both labeled — and the list now notes calamine does not evaluate either |
 | ~~`docs/xlsx_test_corpus.md:27,56`~~ | "don't need to evaluate" | **M6 — done**: both rows scoped to the read path with pointers at the engine's own suites |
 | ~~`docs/package-layer.md`~~ | layer description | **M5d3 — done**: title's "read-only" retired with a note saying when it stopped being true (byte-preserving writes → `Workbook` mutation → M5d recalc), and a **Recalculation (M5d)** section added covering `recalculate` / `saveWithRecalc` / `openBuffer(Controlled)` / `markRecalcOnLoad` / `zlsx_recalc.writerSaveWithRecalc`, plus why the composition is a third module |
-| `bindings/python/README.md:252` ("never") + **full new-API docs**: methods, `Matrix`, `ExcelError`, refusal/cancellation semantics | **M9a2** gate (docs land with the code PR) |
+| ~~`bindings/python/README.md:252`~~ ("never") + **full new-API docs**: methods, `Matrix`, `ExcelError`, refusal/cancellation semantics | **M9a2 — done**: the Out-list scopes "never" to the read path and points at the new **Recalculate & evaluate** section (methods, `RecalcOptions`, `FormulaSpec.cse`, `ExcelError`/`Matrix`, refusal + worker-thread cancellation semantics, `engine_fingerprint`); the In-list and Thread-safety sections gained the matching entries |
 | `bindings/python/README.md:177-179` ("all batch options apply to streaming" — false once recalc refuses streaming) + **Spark option table (batch-only)** | **M9b** gate |
 | ~~`src/xlsx.zig:1-13` · `src/cli.zig:1` · `pkg/workbook.zig` (emitCell branch)~~ | in-source scope comments (incl. the "future evaluator (Tier D1)" promise at the emitCell branch) | **M6 — done**: `cli.zig`'s "read-only" header names all three families; `xlsx.zig`'s blurb marked historical (the file itself still never evaluates); the Tier D1 promise replaced by the real rule — the engine exists, and the set-cell path deliberately stays cache-free |
 | ~~`src/formula/tokenizer.zig:566-575`~~ (scope note made false by the new token kinds) | tokenizer scope comment | **M1a — done**: module doc rewritten with the tokens; `rewriter.zig`'s matching "classifies these as `.unknown`" claim flipped too |

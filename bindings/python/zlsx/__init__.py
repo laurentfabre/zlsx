@@ -26,8 +26,11 @@ from __future__ import annotations
 
 import ctypes
 import os
+import threading
+import time
+from datetime import datetime as _datetime
 from pathlib import Path
-from typing import Iterator, Union
+from typing import Iterator, List, Optional, Tuple, Union
 
 from . import _ffi
 
@@ -67,6 +70,16 @@ __all__ = [
     "EmbeddingsStripped",
     "Coverage",
     "embeddings",
+    "ZlsxFormulaRefusal",
+    "FormulaSpec",
+    "RecalcOptions",
+    "RecalcReport",
+    "CensusEntry",
+    "Resolved",
+    "EvalResult",
+    "Matrix",
+    "ExcelError",
+    "engine_fingerprint",
 ]
 
 
@@ -1555,7 +1568,7 @@ class SheetWriter:
         # backing str buffers while the C side is still reading them.
         del keepers
 
-    def write_row_with_formulas(self, values, formulas) -> None:
+    def write_row_with_formulas(self, values, formulas, dialect=None) -> None:
         """Append a row mixing plain value cells with formula cells.
 
         ``values`` is the same iterable accepted by :meth:`write_row` —
@@ -1564,8 +1577,19 @@ class SheetWriter:
         cached value").
 
         ``formulas`` must be an iterable of the same length: each
-        element is either ``None`` (regular value cell) or a ``str``
-        with the formula text (e.g. ``"A1+B1"``, no leading ``=``).
+        element is ``None`` (regular value cell), a ``str`` with the
+        formula text (e.g. ``"A1+B1"``, no leading ``=``), or a
+        :class:`FormulaSpec` (M9a2) carrying a dialect —
+        ``FormulaSpec.cse(text, ref)`` declares a legacy CSE rectangle
+        anchored at that cell; its members (the range's other cells,
+        written by later calls) carry cached values and no formula,
+        and the save refuses while any rectangle is incomplete.
+
+        ``dialect=`` is row-wide sugar applying one dialect to every
+        plain-``str`` formula in the row (``"cse"`` is per-cell only —
+        it needs a ref). Plain-``str`` rows keep the legacy ABI path,
+        so they still work against an older dylib; FormulaSpec or
+        ``dialect=`` requires libzlsx 0.9.0+.
 
         Requires libzlsx 0.2.7+. Raises :class:`RuntimeError` against
         an older dylib that doesn't ship the symbol.
@@ -1584,6 +1608,12 @@ class SheetWriter:
             raise ValueError(
                 f"formulas length {len(formulas_list)} must match values length {n}"
             )
+
+        needs_v2 = dialect is not None or any(
+            isinstance(f, FormulaSpec) for f in formulas_list
+        )
+        if needs_v2:
+            return self._write_row_with_formulas_v2(values_list, formulas_list, dialect)
 
         if n == 0:
             rc = _ffi.lib.zlsx_sheet_writer_write_row_with_formulas(
@@ -1647,6 +1677,86 @@ class SheetWriter:
             )
 
         # Keep the buffers alive until after the C call returns.
+        del keepers
+
+    def _write_row_with_formulas_v2(self, values_list, formulas_list, dialect) -> None:
+        """The M9a2 descriptor path: per-cell zlsx_formula_cell_v1
+        marshalling for FormulaSpec rows and the row-wide ``dialect=``
+        sugar."""
+        if not _ffi._HAS_FORMULAS_V2:
+            raise RuntimeError(
+                "loaded libzlsx does not expose write_row_with_formulas_v2 "
+                "(requires 0.9.0+); upgrade libzlsx"
+            )
+        if dialect is not None:
+            if dialect not in ("scalar", "dynamic_array"):
+                raise ValueError(
+                    "row-wide dialect must be 'scalar' or 'dynamic_array'; "
+                    "'cse' needs a per-cell ref — use FormulaSpec.cse(text, ref)"
+                )
+
+        n = len(values_list)
+        if n == 0:
+            rc = _ffi.lib.zlsx_sheet_writer_write_row_with_formulas_v2(
+                self._handle, None, None, 0, self._err, _ERR_BUF_LEN
+            )
+            if rc != _ffi.ZLSX_OK:
+                raise ZlsxError(
+                    f"zlsx_sheet_writer_write_row_with_formulas_v2 (empty): "
+                    f"{_decode_err(self._err)}"
+                )
+            return
+
+        cell_array = (_ffi.Cell * n)()
+        desc_array = (_ffi.FormulaCellV1 * n)()
+        keepers = []
+        for i, v in enumerate(values_list):
+            cell, keeper = _py_value_to_cell(v)
+            cell_array[i] = cell
+            if keeper is not None:
+                keepers.append(keeper)
+
+            f = formulas_list[i]
+            if f is None:
+                continue  # ctypes zero-init: text NULL = plain slot
+            if isinstance(f, str):
+                if f == "":
+                    raise ValueError(
+                        f"formulas[{i}] is the empty string; pass None for a "
+                        "regular value cell or a non-empty formula like 'A1+B1'"
+                    )
+                f = FormulaSpec(f, dialect or "scalar")
+            elif not isinstance(f, FormulaSpec):
+                raise TypeError(
+                    f"formulas[{i}] must be None, str or FormulaSpec, "
+                    f"got {type(f).__name__}"
+                )
+            tbytes = f.text.encode("utf-8")
+            tbuf = ctypes.create_string_buffer(tbytes, len(tbytes))
+            keepers.append(tbuf)
+            desc_array[i].text = ctypes.cast(tbuf, ctypes.POINTER(ctypes.c_ubyte))
+            desc_array[i].text_len = len(tbytes)
+            desc_array[i].dialect = _FORMULA_DIALECT_CODES[f.dialect]
+            if f.ref is not None:
+                rbytes = f.ref.encode("utf-8")
+                rbuf = ctypes.create_string_buffer(rbytes, len(rbytes))
+                keepers.append(rbuf)
+                desc_array[i].ref = ctypes.cast(rbuf, ctypes.POINTER(ctypes.c_ubyte))
+                desc_array[i].ref_len = len(rbytes)
+
+        rc = _ffi.lib.zlsx_sheet_writer_write_row_with_formulas_v2(
+            self._handle,
+            ctypes.cast(cell_array, _ffi.cell_ptr),
+            desc_array,
+            n,
+            self._err,
+            _ERR_BUF_LEN,
+        )
+        if rc != _ffi.ZLSX_OK:
+            raise ZlsxError(
+                f"zlsx_sheet_writer_write_row_with_formulas_v2: "
+                f"{_decode_err(self._err)}"
+            )
         del keepers
 
     def write_rich_row(self, values) -> None:
@@ -2727,18 +2837,59 @@ class Writer:
             raise ZlsxError(f"zlsx_writer_add_style_ex: {_decode_err(self._err)}")
         return int(out_idx.value)
 
-    def save(self, path: Union[str, Path, None] = None) -> None:
+    def save(
+        self,
+        path: Union[str, Path, None] = None,
+        recalculate: "Optional[RecalcOptions]" = None,
+    ) -> "Optional[RecalcReport]":
         """Write the workbook to disk. Uses the path passed to
-        :func:`zlsx.write` if none is provided here."""
+        :func:`zlsx.write` if none is provided here.
+
+        ``recalculate=RecalcOptions(...)`` routes the save through the
+        recalc orchestrator (§5.7.9): the fresh archive is emitted to
+        memory, opened, recalculated, and committed atomically — every
+        cached formula value in the destination is one the engine
+        computed. Returns the :class:`RecalcReport` then, ``None``
+        otherwise. Requires libzlsx 0.9.0+."""
         target = Path(path) if path is not None else self._path
         if target is None:
             raise ValueError("no save path: pass one to zlsx.write() or Writer.save()")
         raw = str(target).encode("utf-8")
-        rc = _ffi.lib.zlsx_writer_save(
-            self._handle, raw, len(raw), self._err, _ERR_BUF_LEN
-        )
-        if rc != 0:
-            raise ZlsxError(f"zlsx_writer_save({target!r}): {_decode_err(self._err)}")
+        if recalculate is None:
+            rc = _ffi.lib.zlsx_writer_save(
+                self._handle, raw, len(raw), self._err, _ERR_BUF_LEN
+            )
+            if rc != 0:
+                raise ZlsxError(f"zlsx_writer_save({target!r}): {_decode_err(self._err)}")
+            return None
+        if not _ffi._HAS_WRITER_RECALC:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_writer_save_with_recalc "
+                "(requires 0.9.0+); upgrade libzlsx"
+            )
+        opts = recalculate
+        token = _new_cancel_token(self._err)
+        try:
+            run = _build_run(opts.now, opts.utc_offset_min, opts.seed, opts.mode,
+                             opts.profile, "da", opts.on_unsupported, opts.timeout,
+                             token)
+            report, diag = _fresh_report_and_diag()
+            pptr, pkeep = _path_as_ubyte(raw)
+
+            def invoke():
+                return _ffi.lib.zlsx_writer_save_with_recalc(
+                    self._handle, pptr, len(raw), ctypes.byref(run),
+                    ctypes.byref(report), ctypes.byref(diag),
+                    self._err, _ERR_BUF_LEN,
+                )
+
+            result = _drive_recalc("zlsx_writer_save_with_recalc", invoke,
+                                   token, opts.timeout, report, diag, self._err)
+            del pkeep
+            return result
+        finally:
+            if token is not None:
+                _ffi.lib.zlsx_cancel_token_free(token)
 
     def to_bytes(self) -> bytes:
         """Serialise the workbook and return it as ``bytes`` instead of
@@ -2870,6 +3021,359 @@ def write(path: Union[str, Path, None] = None) -> Writer:
             sheet.write_row(["Alice", 42])
     """
     return Writer(path)
+
+
+# ─── Formula engine (M9a2) ───────────────────────────────────────────
+#
+# The Python face of the zlsx_status_v1 exports: recalculate / evaluate
+# / save_with_recalc / save_to_buffer / mark_recalc_on_load on Editor,
+# Writer.save(recalculate=...), and FormulaSpec on
+# SheetWriter.write_row_with_formulas. Every call that receives
+# library-owned memory releases it in a ``finally``; cancellable calls
+# run on a worker thread so Ctrl-C and timeouts reach the engine as a
+# token trigger rather than a blocked signal handler.
+
+
+class ExcelError(str):
+    """An Excel error *value* (e.g. ``#DIV/0!``) — a successful result,
+    never a Python exception (``ZlsxError`` stays the exception type).
+    Behaves as its spelling; ``isinstance(x, ExcelError)`` is the test."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return f"ExcelError({str.__repr__(self)})"
+
+
+@dataclass(frozen=True)
+class CensusEntry:
+    """One §5.7.7 census entry: a construct the engine could not
+    implement, and where it was. ``row`` is 1-based; 0 means the entry
+    is not about a cell. ``col`` is 0-based."""
+
+    plane: str
+    sheet: int
+    row: int
+    col: int
+
+
+class ZlsxFormulaRefusal(ZlsxError):
+    """A typed Plane-2 refusal (status -2): the engine refused the run
+    rather than guessing. ``error_name`` is the Zig error name
+    (e.g. ``"FormulaUnsupportedFunction"``); ``cells`` lists the
+    refusing cells as ``(sheet, row, col)`` (row 1-based, col 0-based);
+    ``census`` carries the full entries."""
+
+    def __init__(
+        self,
+        error_name: str,
+        cells: List[Tuple[int, int, int]],
+        census: List[CensusEntry],
+    ):
+        at = f" at {len(cells)} cell(s)" if cells else ""
+        super().__init__(f"{error_name}{at}")
+        self.error_name = error_name
+        self.cells = cells
+        self.census = census
+
+
+@dataclass(frozen=True)
+class Resolved:
+    """The §5.5 echo: the exact context a run resolved to. Replaying
+    these values reproduces the run exactly — including one whose
+    ``now``/``seed`` were defaulted by the binding."""
+
+    now: int
+    utc_offset_min: int
+    seed: int
+    mode: str
+    profile: str
+    dialect: Optional[str]
+    anchor: Optional[Tuple[int, int]] = None
+
+
+@dataclass(frozen=True)
+class Matrix:
+    """A rectangular evaluation result. ``cells`` is a list of rows;
+    each cell is ``float``/``str``/``bool``/:class:`ExcelError` (blanks
+    publish as 0, §12.2)."""
+
+    rows: int
+    cols: int
+    cells: list
+
+
+@dataclass(frozen=True)
+class EvalResult:
+    """What :meth:`Editor.evaluate` returns: the value plus the
+    resolved-context echo that makes it reproducible."""
+
+    value: object
+    resolved: Resolved
+
+
+@dataclass(frozen=True)
+class RecalcReport:
+    """What a recalculation did (§5.7.8). ``cancelled_late`` is
+    binding-level truth: the cancellation (Ctrl-C or timeout) arrived
+    only after the commit point, so the transaction completed."""
+
+    sheets_patched: int
+    cells_written: int
+    passes: int
+    non_converged_cells: int
+    dynamic_passes: int
+    kept_stale: bool
+    calc_chain_removed: bool
+    census: List[CensusEntry]
+    census_truncated: bool
+    retained_generations: int
+    retained_bytes: int
+    durability_warning: bool
+    durability_errno: int
+    resolved: Optional[Resolved]
+    cancelled_late: bool = False
+
+
+@dataclass(frozen=True)
+class RecalcOptions:
+    """The recalc context :meth:`Writer.save` composes through the
+    orchestrator. Field semantics match :meth:`Editor.recalculate`."""
+
+    now: object = None
+    utc_offset_min: int = 0
+    seed: Optional[int] = None
+    mode: str = "excel"
+    profile: str = "windows_1252"
+    on_unsupported: str = "refuse"
+    timeout: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class FormulaSpec:
+    """One cell's formula for ``write_row_with_formulas``: the text
+    (no leading ``=``), the dialect, and — for ``"cse"`` only — the
+    declared rectangle whose top-left must be the carrying cell."""
+
+    text: str
+    dialect: str = "scalar"
+    ref: Optional[str] = None
+
+    def __post_init__(self):
+        if self.dialect not in ("scalar", "dynamic_array", "cse"):
+            raise ValueError(f"unknown formula dialect {self.dialect!r}")
+        if (self.dialect == "cse") != (self.ref is not None):
+            raise ValueError("ref is required for dialect='cse' and illegal otherwise")
+        if not self.text:
+            raise ValueError("formula text must be non-empty; pass None for a value cell")
+
+    @classmethod
+    def cse(cls, text: str, ref: str) -> "FormulaSpec":
+        return cls(text, "cse", ref)
+
+
+_MODE_CODES = {"excel": 0, "ieee": 1}
+_PROFILE_CODES = {"windows_1252": 0}
+_DIALECT_CODES = {"da": 0, "dynamic_array": 0, "legacy": 1}
+_ON_UNSUPPORTED_CODES = {"refuse": 0, "keep_stale_and_mark": 1}
+_FORMULA_DIALECT_CODES = {
+    "scalar": _ffi.ZLSX_FORMULA_SCALAR,
+    "dynamic_array": _ffi.ZLSX_FORMULA_DYNAMIC_ARRAY,
+    "cse": _ffi.ZLSX_FORMULA_CSE,
+}
+
+
+def engine_fingerprint() -> str:
+    """The engine identity string (§12.4): semver + rule versions +
+    target triple + build hash. Two processes may share recalc results
+    only when these match."""
+    if not _ffi._HAS_FINGERPRINT:
+        raise RuntimeError(
+            "loaded libzlsx does not expose zlsx_engine_fingerprint "
+            "(requires 0.9.0+); upgrade libzlsx"
+        )
+    return _ffi.lib.zlsx_engine_fingerprint().decode("utf-8")
+
+
+def _code_for(table, value, what):
+    try:
+        return table[value]
+    except KeyError:
+        raise ValueError(f"unknown {what} {value!r}; expected one of {sorted(table)}") from None
+
+
+def _resolve_now(now) -> int:
+    """None = the binding reads the clock (caller-side acquisition; the
+    library itself never does — §5.5). datetime = its epoch millis
+    (naive datetimes use the local zone); int/float = epoch millis."""
+    if now is None:
+        return time.time_ns() // 1_000_000
+    if isinstance(now, _datetime):
+        return int(now.timestamp() * 1000)
+    return int(now)
+
+
+def _resolve_seed(seed) -> int:
+    if seed is None:
+        return int.from_bytes(os.urandom(8), "little")
+    return int(seed) & 0xFFFFFFFFFFFFFFFF
+
+
+def _build_run(now, utc_offset_min, seed, mode, profile, dialect, on_unsupported, timeout, token):
+    run = _ffi.RunV1()
+    run.struct_size = ctypes.sizeof(_ffi.RunV1)
+    run.now_utc_ms = _resolve_now(now)
+    run.rng_seed = _resolve_seed(seed)
+    run.utc_offset_min = int(utc_offset_min)
+    run.fidelity = _code_for(_MODE_CODES, mode, "mode")
+    run.profile = _code_for(_PROFILE_CODES, profile, "profile")
+    run.dialect = _code_for(_DIALECT_CODES, dialect, "dialect")
+    run.on_unsupported = _code_for(_ON_UNSUPPORTED_CODES, on_unsupported, "on_unsupported")
+    if timeout is not None:
+        if timeout <= 0:
+            raise ValueError("timeout must be positive seconds")
+        run.timeout_ms = max(1, int(timeout * 1000))
+    if token is not None:
+        run.cancel = token
+    return run
+
+
+def _new_cancel_token(err):
+    """A fresh cancel token, or None when the dylib predates the API
+    (the call then simply runs to completion on the main thread)."""
+    if not _ffi._HAS_CANCEL:
+        return None
+    tok = _ffi.cancel_token_handle()
+    rc = _ffi.lib.zlsx_cancel_token_new(ctypes.byref(tok), err, _ERR_BUF_LEN)
+    if rc != _ffi.ZLSX_OK:
+        raise ZlsxError(f"zlsx_cancel_token_new: {_decode_err(err)}")
+    return tok
+
+
+def _invoke_cancellable(invoke, token):
+    """Run one FFI call on a worker thread and wait interruptibly.
+
+    A Python signal handler cannot run while the main thread sits in a
+    synchronous ctypes call, so the call moves off-thread; Ctrl-C
+    triggers the token and keeps waiting — the engine observes it at
+    its next §5.5 poll point and unwinds. Returns (rc, interrupted).
+    """
+    if token is None:
+        return invoke(), False
+    box = []
+
+    def work():
+        box.append(invoke())
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    interrupted = False
+    while True:
+        try:
+            t.join(0.05)
+            if not t.is_alive():
+                break
+        except KeyboardInterrupt:
+            interrupted = True
+            _ffi.lib.zlsx_cancel_token_trigger(token)
+    if not box:
+        raise ZlsxError("worker thread died without a status")
+    return box[0], interrupted
+
+
+def _decode_census(ptr, n) -> List[CensusEntry]:
+    out = []
+    for i in range(int(n)):
+        e = ptr[i]
+        plane = (
+            _ffi.PLANE_NAMES[e.plane]
+            if e.plane < len(_ffi.PLANE_NAMES)
+            else f"plane_{e.plane}"
+        )
+        out.append(CensusEntry(plane=plane, sheet=e.sheet, row=e.row, col=e.col))
+    return out
+
+
+def _refusal_from_diag(diag) -> ZlsxFormulaRefusal:
+    # ctypes returns a c_char array field as bytes cut at the first NUL.
+    error_name = diag.error_name.decode("utf-8", errors="replace")
+    census = _decode_census(diag.census, diag.census_len)
+    cells = [(e.sheet, e.row, e.col) for e in census if e.row > 0]
+    return ZlsxFormulaRefusal(error_name, cells, census)
+
+
+def _decode_resolved(cres, anchor=None) -> Resolved:
+    dialect = None
+    if cres.dialect != _ffi.ZLSX_DIALECT_NONE:
+        dialect = "da" if cres.dialect == 0 else "legacy"
+    return Resolved(
+        now=cres.now_utc_ms,
+        utc_offset_min=cres.utc_offset_min,
+        seed=cres.rng_seed,
+        mode="ieee" if cres.fidelity == 1 else "excel",
+        profile="windows_1252",
+        dialect=dialect,
+        anchor=anchor,
+    )
+
+
+def _decode_report(rep, cancelled_late) -> RecalcReport:
+    resolved = _decode_resolved(rep.resolved) if rep.resolved_present else None
+    return RecalcReport(
+        sheets_patched=rep.sheets_patched,
+        cells_written=rep.cells_written,
+        passes=rep.passes,
+        non_converged_cells=rep.non_converged_cells,
+        dynamic_passes=rep.dynamic_passes,
+        kept_stale=bool(rep.kept_stale),
+        calc_chain_removed=bool(rep.calc_chain_removed),
+        census=_decode_census(rep.census, rep.census_len),
+        census_truncated=bool(rep.census_truncated),
+        retained_generations=rep.retained_generations,
+        retained_bytes=rep.retained_bytes,
+        durability_warning=bool(rep.durability_warning),
+        durability_errno=rep.durability_errno,
+        resolved=resolved,
+        cancelled_late=cancelled_late,
+    )
+
+
+def _drive_recalc(symbol, invoke, token, timeout, report, diag, err):
+    """The shared tail of every recalc-shaped call: worker thread,
+    status mapping, and release-in-finally (the M9a2 contract)."""
+    started = time.monotonic()
+    rc, interrupted = _invoke_cancellable(invoke, token)
+    elapsed = time.monotonic() - started
+    try:
+        if rc == _ffi.ZLSX_OK:
+            late = interrupted or (timeout is not None and elapsed >= timeout)
+            return _decode_report(report, late)
+        if rc == _ffi.ZLSX_CANCELLED:
+            # Observed before commit, by the engine's own contract.
+            if interrupted:
+                raise KeyboardInterrupt
+            raise TimeoutError(
+                f"{symbol}: cancellation observed before commit (timeout={timeout}s)"
+            )
+        if rc == _ffi.ZLSX_REFUSED:
+            raise _refusal_from_diag(diag)
+        raise ZlsxError(f"{symbol}: {_decode_err(err)}")
+    finally:
+        _ffi.lib.zlsx_recalc_report_release(ctypes.byref(report))
+        _ffi.lib.zlsx_diag_release(ctypes.byref(diag))
+
+
+def _fresh_report_and_diag():
+    report = _ffi.RecalcReportV1()
+    report.struct_size = ctypes.sizeof(_ffi.RecalcReportV1)
+    diag = _ffi.DiagV1()
+    diag.struct_size = ctypes.sizeof(_ffi.DiagV1)
+    return report, diag
+
+
+def _path_as_ubyte(pbytes):
+    buf = ctypes.create_string_buffer(pbytes, len(pbytes))
+    return ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)), buf
 
 
 class Editor:
@@ -3094,6 +3598,269 @@ class Editor:
         )
         if rc != 0:
             raise ZlsxError(f"zlsx_editor_save: {_decode_err(self._err)}")
+
+    # ── Formula engine (M9a2) ──────────────────────────────────────
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "Editor":
+        """Open an editor over a workbook already in memory. ``data``
+        is copied — the borrow ends when this returns."""
+        if not _ffi._HAS_SAVE_BUFFER:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_open_buffer "
+                "(requires 0.9.0+); upgrade libzlsx"
+            )
+        obj = cls.__new__(cls)
+        obj._err = ctypes.create_string_buffer(_ERR_BUF_LEN)
+        buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+        handle = _ffi.editor_handle()
+        rc = _ffi.lib.zlsx_open_buffer(
+            buf, len(data), ctypes.byref(handle), obj._err, _ERR_BUF_LEN
+        )
+        if rc != _ffi.ZLSX_OK:
+            raise ZlsxError(f"zlsx_open_buffer: {_decode_err(obj._err)}")
+        obj._handle = handle.value
+        return obj
+
+    def save_to_buffer(self) -> bytes:
+        """Serialize the editor's current state — staged mutations
+        included — to memory. An untouched editor returns the source
+        bytes verbatim."""
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_SAVE_BUFFER:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_editor_save_to_buffer "
+                "(requires 0.9.0+); upgrade libzlsx"
+            )
+        out_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        out_len = ctypes.c_size_t(0)
+        rc = _ffi.lib.zlsx_editor_save_to_buffer(
+            self._handle, ctypes.byref(out_ptr), ctypes.byref(out_len),
+            self._err, _ERR_BUF_LEN,
+        )
+        if rc != _ffi.ZLSX_OK:
+            raise ZlsxError(f"zlsx_editor_save_to_buffer: {_decode_err(self._err)}")
+        try:
+            # One copy at the reported length; string_at is
+            # length-delimited so deflate's embedded NULs survive.
+            return ctypes.string_at(out_ptr, out_len.value)
+        finally:
+            _ffi.lib.zlsx_buffer_release(out_ptr, out_len)
+
+    def mark_recalc_on_load(self) -> None:
+        """§5.7.7's mark-only transaction: keep every cached value, set
+        ``fullCalcOnLoad="1"``, change nothing else."""
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_MARK_RECALC:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_editor_mark_recalc_on_load "
+                "(requires 0.9.0+); upgrade libzlsx"
+            )
+        _report, diag = _fresh_report_and_diag()
+        rc = _ffi.lib.zlsx_editor_mark_recalc_on_load(
+            self._handle, ctypes.byref(diag), self._err, _ERR_BUF_LEN
+        )
+        try:
+            if rc == _ffi.ZLSX_REFUSED:
+                raise _refusal_from_diag(diag)
+            if rc != _ffi.ZLSX_OK:
+                raise ZlsxError(
+                    f"zlsx_editor_mark_recalc_on_load: {_decode_err(self._err)}"
+                )
+        finally:
+            _ffi.lib.zlsx_diag_release(ctypes.byref(diag))
+
+    def recalculate(
+        self,
+        now=None,
+        utc_offset_min: int = 0,
+        seed: Optional[int] = None,
+        mode: str = "excel",
+        profile: str = "windows_1252",
+        on_unsupported: str = "refuse",
+        timeout: Optional[float] = None,
+    ) -> RecalcReport:
+        """§5.7's in-memory transaction: recalculate every formula cell
+        and swap the result in as the final operation. On refusal
+        (:class:`ZlsxFormulaRefusal`), timeout (:class:`TimeoutError`,
+        observed pre-commit only) or Ctrl-C the workbook is exactly as
+        it was."""
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_RECALC:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_editor_recalculate "
+                "(requires 0.9.0+); upgrade libzlsx"
+            )
+        token = _new_cancel_token(self._err)
+        try:
+            run = _build_run(now, utc_offset_min, seed, mode, profile, "da",
+                             on_unsupported, timeout, token)
+            report, diag = _fresh_report_and_diag()
+
+            def invoke():
+                return _ffi.lib.zlsx_editor_recalculate(
+                    self._handle, ctypes.byref(run), ctypes.byref(report),
+                    ctypes.byref(diag), self._err, _ERR_BUF_LEN,
+                )
+
+            return _drive_recalc("zlsx_editor_recalculate", invoke, token,
+                                 timeout, report, diag, self._err)
+        finally:
+            if token is not None:
+                _ffi.lib.zlsx_cancel_token_free(token)
+
+    def save_with_recalc(
+        self,
+        path: Union[str, Path],
+        now=None,
+        utc_offset_min: int = 0,
+        seed: Optional[int] = None,
+        mode: str = "excel",
+        profile: str = "windows_1252",
+        on_unsupported: str = "refuse",
+        timeout: Optional[float] = None,
+    ) -> RecalcReport:
+        """§5.7.9's atomic file transaction: recalculate, write, rename,
+        then swap in memory. Any pre-commit failure — refusal, timeout,
+        Ctrl-C, I/O error — leaves the destination's prior bytes (or its
+        absence) AND this editor's memory untouched. A cancellation that
+        lands post-commit returns normally with
+        ``report.cancelled_late=True``. A directory fsync failing after
+        the rename is ``report.durability_warning``, never an error."""
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_SAVE_WITH_RECALC:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_editor_save_with_recalc "
+                "(requires 0.9.0+); upgrade libzlsx"
+            )
+        pbytes = str(path).encode("utf-8")
+        token = _new_cancel_token(self._err)
+        try:
+            run = _build_run(now, utc_offset_min, seed, mode, profile, "da",
+                             on_unsupported, timeout, token)
+            report, diag = _fresh_report_and_diag()
+            pptr, pkeep = _path_as_ubyte(pbytes)
+
+            def invoke():
+                return _ffi.lib.zlsx_editor_save_with_recalc(
+                    self._handle, pptr, len(pbytes), ctypes.byref(run),
+                    ctypes.byref(report), ctypes.byref(diag),
+                    self._err, _ERR_BUF_LEN,
+                )
+
+            result = _drive_recalc("zlsx_editor_save_with_recalc", invoke,
+                                   token, timeout, report, diag, self._err)
+            del pkeep
+            return result
+        finally:
+            if token is not None:
+                _ffi.lib.zlsx_cancel_token_free(token)
+
+    def evaluate(
+        self,
+        formula: str,
+        sheet: int = 0,
+        anchor: Optional[Tuple[int, int]] = None,
+        dialect: str = "da",
+        now=None,
+        utc_offset_min: int = 0,
+        seed: Optional[int] = None,
+        mode: str = "excel",
+        profile: str = "windows_1252",
+        timeout: Optional[float] = None,
+    ) -> EvalResult:
+        """Standalone cache-based evaluation (M6 semantics): the
+        workbook is byte-identical before and after; eval never
+        commits. ``anchor`` is ``(row, col)`` with row 1-based and col
+        0-based; without one, site-dependent formulas refuse.
+        ``.value`` is ``float``/``str``/``bool``, an
+        :class:`ExcelError` (a successful *result*, plane 1), or a
+        :class:`Matrix`; ``.resolved`` echoes the exact context, so a
+        defaulted volatile evaluation is reproducible by replay."""
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_EVAL:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_editor_evaluate "
+                "(requires 0.9.0+); upgrade libzlsx"
+            )
+        fbytes = formula.encode("utf-8")
+        fptr, fkeep = _path_as_ubyte(fbytes) if fbytes else (None, None)
+        anchor_row = 0
+        anchor_col = 0
+        if anchor is not None:
+            anchor_row, anchor_col = int(anchor[0]), int(anchor[1])
+            if anchor_row < 1:
+                raise ValueError("anchor row is 1-based and must be >= 1")
+        token = _new_cancel_token(self._err)
+        try:
+            run = _build_run(now, utc_offset_min, seed, mode, profile, dialect,
+                             "refuse", timeout, token)
+            val = _ffi.ValueV1()
+            val.struct_size = ctypes.sizeof(_ffi.ValueV1)
+            res = _ffi.ResolvedV1()
+            res.struct_size = ctypes.sizeof(_ffi.ResolvedV1)
+            diag = _ffi.DiagV1()
+            diag.struct_size = ctypes.sizeof(_ffi.DiagV1)
+
+            def invoke():
+                return _ffi.lib.zlsx_editor_evaluate(
+                    self._handle, fptr, len(fbytes), int(sheet),
+                    anchor_row, anchor_col, ctypes.byref(run),
+                    ctypes.byref(val), ctypes.byref(res), ctypes.byref(diag),
+                    self._err, _ERR_BUF_LEN,
+                )
+
+            rc, interrupted = _invoke_cancellable(invoke, token)
+            try:
+                if rc == _ffi.ZLSX_CANCELLED:
+                    if interrupted:
+                        raise KeyboardInterrupt
+                    raise TimeoutError(
+                        f"zlsx_editor_evaluate: cancelled (timeout={timeout}s)"
+                    )
+                if rc == _ffi.ZLSX_REFUSED:
+                    raise _refusal_from_diag(diag)
+                if rc != _ffi.ZLSX_OK:
+                    raise ZlsxError(
+                        f"zlsx_editor_evaluate: {_decode_err(self._err)}"
+                    )
+                payload = (
+                    ctypes.string_at(val.payload, val.payload_len)
+                    if val.payload_len
+                    else b""
+                )
+
+                def elem_to_py(e):
+                    if e.tag == 0:
+                        return float(e.num)
+                    if e.tag == 2:
+                        return e.num != 0
+                    text = payload[e.payload_off : e.payload_off + e.payload_len].decode("utf-8")
+                    if e.tag == 3:
+                        return ExcelError(text)
+                    return text
+
+                if val.is_matrix:
+                    cells = [
+                        [elem_to_py(val.elems[r * val.cols + c]) for c in range(val.cols)]
+                        for r in range(val.rows)
+                    ]
+                    value = Matrix(rows=val.rows, cols=val.cols, cells=cells)
+                else:
+                    value = elem_to_py(val.elems[0])
+                return EvalResult(value=value, resolved=_decode_resolved(res, anchor))
+            finally:
+                _ffi.lib.zlsx_value_release(ctypes.byref(val))
+                _ffi.lib.zlsx_diag_release(ctypes.byref(diag))
+                del fkeep
+        finally:
+            if token is not None:
+                _ffi.lib.zlsx_cancel_token_free(token)
 
     def close(self) -> None:
         if self._handle:

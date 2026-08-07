@@ -47,6 +47,7 @@ const build_options = @import("build_options");
 const fingerprint_config = @import("fingerprint_config");
 const xlsx = @import("zlsx");
 const zlsx_pkg = @import("zlsx_pkg");
+const zlsx_recalc = @import("zlsx_recalc");
 const refs = @import("zlsx_refs");
 const writer_mod = xlsx.writer_types;
 
@@ -4737,6 +4738,7 @@ const Fidelity = @FieldType(RunInputs, "fidelity");
 const PlatformProfile = @FieldType(RunInputs, "platform_profile");
 const FormulaDialect = @FieldType(RunInputs, "dialect");
 const PlaneTwo = zlsx_pkg.recalc_txn.PlaneTwo;
+const recalc_txn = zlsx_pkg.recalc_txn;
 const EvaluateOptions = zlsx_pkg.EvaluateOptions;
 const EvalValue = @FieldType(zlsx_pkg.Evaluation, "value");
 const ScalarV = @FieldType(EvalValue, "scalar");
@@ -5303,11 +5305,27 @@ export fn zlsx_editor_recalculate(
         },
     };
 
-    var rep = state.inner.workbook.recalculate(gpa, io, ri, opts) catch |e| {
-        return failMapped(e, diag, err_buf, err_buf_len);
+    var refusal: recalc_txn.Refusal = .{ .reason = .unsupported_construct };
+    var seamed = opts;
+    seamed.refusal_out = &refusal;
+    var rep = state.inner.workbook.recalculate(gpa, io, ri, seamed) catch |e| {
+        return failMappedRefusal(e, &refusal, diag, err_buf, err_buf_len);
     };
     defer rep.deinit(gpa);
 
+    reportToC(out, &rep) catch {
+        writeError(err_buf, err_buf_len, "OutOfMemory");
+        return ZLSX_NOMEM;
+    };
+    return ZLSX_OK;
+}
+
+/// The report copy-out shared by `zlsx_editor_recalculate`,
+/// `zlsx_editor_save_with_recalc` and `zlsx_writer_save_with_recalc`.
+/// `out` was prepped (zeroed) by the caller; census allocation is the
+/// only fallible step and lands last, so an OOM here leaves a report
+/// that is complete except for the census and still releasable.
+fn reportToC(out: *CRecalcReport, rep: *const recalc_run.Report) error{OutOfMemory}!void {
     out.sheets_patched = rep.sheets_patched;
     out.cells_written = rep.cells_written;
     out.passes = rep.passes;
@@ -5324,15 +5342,40 @@ export fn zlsx_editor_recalculate(
         fillResolved(&out.resolved, eff);
         out.resolved_present = 1;
     }
-    const census = censusToC(rep.census) catch {
-        writeError(err_buf, err_buf_len, "OutOfMemory");
-        return ZLSX_NOMEM;
-    };
-    if (census) |arr| {
+    if (try censusToC(rep.census)) |arr| {
         out.census = arr.ptr;
         out.census_len = arr.len;
     }
-    return ZLSX_OK;
+}
+
+/// `failMapped` + M9a2's refusal seam: when the pipeline moved a
+/// refusal into `refusal` (`Options.refusal_out`), its cells become
+/// the -2 diag's census. Consumes the refusal on every path. A refusal
+/// that never reached the seam (e.g. `run.validate`'s
+/// `FormulaLimitExceeded`) carries the default empty census, so the
+/// diag stays truthful: error_name + plane, no cells.
+fn failMappedRefusal(
+    e: anyerror,
+    refusal: *recalc_txn.Refusal,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) i32 {
+    const status = failMapped(e, diag, err_buf, err_buf_len);
+    var r = refusal.*;
+    defer r.deinit(gpa);
+    if (status != ZLSX_REFUSED) return status;
+    const d = diag orelse return status;
+    // Best-effort: the refusal already told the truth in error_name;
+    // an OOM copying the census leaves it empty rather than turning a
+    // typed refusal into an allocation failure.
+    const census = censusToC(r.census) catch return status;
+    if (census) |arr| {
+        d.census = arr.ptr;
+        d.census_len = arr.len;
+        d.census_truncated = @intFromBool(r.census_truncated);
+    }
+    return status;
 }
 
 /// M6's `zlsx eval` semantics over `Workbook.evaluate`: a cache-based
@@ -5442,6 +5485,387 @@ export fn zlsx_editor_evaluate(
         .iteration_refused => |r| return refuseNamed(@tagName(r.planeTwo()), diag, err_buf, err_buf_len),
         .eval_refused => |r| return refuseNamed(@tagName(r.plane), diag, err_buf, err_buf_len),
     }
+}
+
+// ─── Formula engine (M9a2): buffers, the file transaction, writer ────
+//
+// Part 2 of the C ABI (§12.3). Same `zlsx_status_v1` contract, same
+// output-prep-before-input-validation discipline as the M9a1 block
+// above. Layouts documented in `docs/plans/c-abi-status-v1.md`; the
+// M9a2 additions keep every M9a1 offset frozen.
+
+/// Release a buffer an M9a2 export allocated
+/// (`zlsx_editor_save_to_buffer`). NULL-safe; zero-length-safe. The
+/// legacy `zlsx_buffer_free` keeps its shipped contract untouched —
+/// this is the same operation under the name §12.3 pins for the
+/// status-era exports.
+export fn zlsx_buffer_release(ptr: ?[*]u8, len: usize) callconv(.c) void {
+    const p = ptr orelse return;
+    if (len == 0) return;
+    gpa.free(p[0..len]);
+}
+
+/// Serialize the editor's current state — staged mutations included —
+/// into a library-allocated buffer (§5.10). An untouched editor hands
+/// back the source bytes verbatim (the passthrough arm `zlsx_editor_save`
+/// has). No file is opened; no commit point exists. Release the buffer
+/// with `zlsx_buffer_release`.
+export fn zlsx_editor_save_to_buffer(
+    ed: ?*Editor,
+    out_ptr: ?*?[*]u8,
+    out_len: ?*usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state: *EditorState = @ptrCast(@alignCast(ed orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    }));
+    const op = out_ptr orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    const ol = out_len orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    // Outputs prepped before anything can fail (the M9a1 fuzz-caught
+    // discipline): a failed save leaves a releasable (NULL, 0) pair.
+    op.* = null;
+    ol.* = 0;
+    const bytes = state.inner.saveToOwnedBuffer(gpa) catch |e| {
+        return failMapped(e, null, err_buf, err_buf_len);
+    };
+    op.* = bytes.ptr;
+    ol.* = bytes.len;
+    return ZLSX_OK;
+}
+
+/// Open an editor over a workbook already in memory (§5.10, B4's
+/// `openBuffer` with the `Book.openBuffer` borrow contract: the borrow
+/// ends when this returns — `data` is duped and may be freed, reused
+/// or poisoned immediately). Status-style like every M9a2 export;
+/// `*out` receives the handle on ZLSX_OK and NULL otherwise. Close
+/// with `zlsx_editor_close`.
+export fn zlsx_open_buffer(
+    data: ?[*]const u8,
+    data_len: usize,
+    out: ?*?*Editor,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const slot = out orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    slot.* = null;
+    const ptr = data orelse {
+        writeError(err_buf, err_buf_len, "NullBuffer");
+        return ZLSX_ERROR;
+    };
+    // Same ownership shape as zlsx_editor_open: the handle owns its Io,
+    // allocated first so the Threaded never moves after init.
+    const state = gpa.create(EditorState) catch {
+        writeError(err_buf, err_buf_len, "OutOfMemory");
+        return ZLSX_NOMEM;
+    };
+    state.threaded = .init(gpa, .{});
+    state.inner = zlsx_pkg.Editor.openBuffer(gpa, state.threaded.io(), ptr[0..data_len]) catch |e| {
+        state.threaded.deinit();
+        gpa.destroy(state);
+        return failMapped(e, null, err_buf, err_buf_len);
+    };
+    slot.* = @ptrCast(state);
+    return ZLSX_OK;
+}
+
+/// §5.7.9's file transaction over the M5d2 pipeline: serialize from
+/// the prepared candidate, rename, swap in memory between the rename
+/// and the directory fsync. Any failure before the rename leaves BOTH
+/// the destination's prior bytes (or its absence) and the editor's
+/// memory untouched; a directory fsync that fails afterwards is the
+/// report's durability warning — the §5.7.9 slot goes live here —
+/// never an error. A -2 refusal carries the refusing cells in the
+/// diag's census (M9a2's seam through `recalc_run.prepare`).
+export fn zlsx_editor_save_with_recalc(
+    ed: ?*Editor,
+    out_path_ptr: ?[*]const u8,
+    out_path_len: usize,
+    run: ?*const CRun,
+    report: ?*CRecalcReport,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state: *EditorState = @ptrCast(@alignCast(ed orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    }));
+    const path_ptr = out_path_ptr orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    };
+    const crun = run orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    };
+    const out = report orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    };
+    // Output prep before input validation, each struct on its own
+    // struct_size — the M9a1 discipline verbatim.
+    var outputs_ok = prepOut(CRecalcReport, out, err_buf, err_buf_len);
+    if (outputs_ok) out.resolved.struct_size = @sizeOf(CResolved);
+    if (!prepDiag(diag, err_buf, err_buf_len)) outputs_ok = false;
+    if (!outputs_ok) return ZLSX_ERROR;
+    if (out_path_len == 0) {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    }
+    if (!checkIn(CRun, crun, err_buf, err_buf_len)) return ZLSX_ERROR;
+
+    const io = state.threaded.io();
+    const ri = runFromC(crun, io, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    var opts: recalc_run.Options = .{
+        .on_unsupported = switch (crun.on_unsupported) {
+            0 => .refuse,
+            1 => .keep_stale_and_mark,
+            else => {
+                writeError(err_buf, err_buf_len, "InvalidInput");
+                return ZLSX_ERROR;
+            },
+        },
+    };
+    var refusal: recalc_txn.Refusal = .{ .reason = .unsupported_construct };
+    opts.refusal_out = &refusal;
+
+    const path = path_ptr[0..out_path_len];
+    var rep = state.inner.workbook.saveWithRecalc(gpa, io, path, ri, opts) catch |e| {
+        return failMappedRefusal(e, &refusal, diag, err_buf, err_buf_len);
+    };
+    defer rep.deinit(gpa);
+
+    reportToC(out, &rep) catch {
+        writeError(err_buf, err_buf_len, "OutOfMemory");
+        return ZLSX_NOMEM;
+    };
+    return ZLSX_OK;
+}
+
+/// The producer-side file transaction (§12.3's `Writer.save(recalculate=)`
+/// leg): emit the writer's archive to memory, open it as a workbook,
+/// then run the same §5.7.9 transaction `zlsx_editor_save_with_recalc`
+/// runs. One composition, shipped in `zlsx_recalc.writerSaveWithRecalc`
+/// — this export is that function across the boundary. The writer
+/// handle itself is not consumed and not mutated.
+export fn zlsx_writer_save_with_recalc(
+    w: ?*Writer,
+    out_path_ptr: ?[*]const u8,
+    out_path_len: usize,
+    run: ?*const CRun,
+    report: ?*CRecalcReport,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state: *WriterState = @ptrCast(@alignCast(w orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    }));
+    const path_ptr = out_path_ptr orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    };
+    const crun = run orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    };
+    const out = report orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    };
+    var outputs_ok = prepOut(CRecalcReport, out, err_buf, err_buf_len);
+    if (outputs_ok) out.resolved.struct_size = @sizeOf(CResolved);
+    if (!prepDiag(diag, err_buf, err_buf_len)) outputs_ok = false;
+    if (!outputs_ok) return ZLSX_ERROR;
+    if (out_path_len == 0) {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    }
+    if (!checkIn(CRun, crun, err_buf, err_buf_len)) return ZLSX_ERROR;
+
+    const io = state.threaded.io();
+    const ri = runFromC(crun, io, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    var opts: zlsx_recalc.Options = .{
+        .on_unsupported = switch (crun.on_unsupported) {
+            0 => .refuse,
+            1 => .keep_stale_and_mark,
+            else => {
+                writeError(err_buf, err_buf_len, "InvalidInput");
+                return ZLSX_ERROR;
+            },
+        },
+    };
+    var refusal: recalc_txn.Refusal = .{ .reason = .unsupported_construct };
+    opts.refusal_out = &refusal;
+
+    const path = path_ptr[0..out_path_len];
+    var rep = zlsx_recalc.writerSaveWithRecalc(gpa, io, &state.inner, path, ri, opts) catch |e| {
+        return failMappedRefusal(e, &refusal, diag, err_buf, err_buf_len);
+    };
+    defer rep.deinit(gpa);
+
+    reportToC(out, &rep) catch {
+        writeError(err_buf, err_buf_len, "OutOfMemory");
+        return ZLSX_NOMEM;
+    };
+    return ZLSX_OK;
+}
+
+/// §12.3's per-cell formula descriptor as it crosses the boundary —
+/// 40 bytes, offsets pinned below, in `tests/c_abi_smoke.c` and in
+/// `_ffi.py`. An array element like `zlsx_census_entry_v1`, so no
+/// `struct_size` field; the v1 layout is frozen.
+const CFormulaCell = extern struct {
+    /// NULL = plain value cell (the slot's `zlsx_cell_t` stands alone).
+    text: ?[*]const u8,
+    text_len: usize,
+    /// ZLSX_FORMULA_* tag.
+    dialect: u32,
+    _reserved0: u32,
+    /// CSE only: the declared range, uppercase A1 (`"A1"` / `"A1:B2"`).
+    /// Must be NULL for every other dialect.
+    ref: ?[*]const u8,
+    ref_len: usize,
+};
+
+const formula_dialect_scalar: u32 = 0;
+const formula_dialect_dynamic_array: u32 = 1;
+const formula_dialect_cse: u32 = 2;
+
+comptime {
+    const assert = std.debug.assert;
+    assert(@offsetOf(CFormulaCell, "text") == 0);
+    assert(@offsetOf(CFormulaCell, "text_len") == 8);
+    assert(@offsetOf(CFormulaCell, "dialect") == 16);
+    assert(@offsetOf(CFormulaCell, "_reserved0") == 20);
+    assert(@offsetOf(CFormulaCell, "ref") == 24);
+    assert(@offsetOf(CFormulaCell, "ref_len") == 32);
+    assert(@sizeOf(CFormulaCell) == 40);
+}
+
+/// The v2 formula row (§12.3): per-cell descriptors instead of the
+/// parallel text arrays `zlsx_sheet_writer_write_row_with_formulas`
+/// ships — the shape a CSE rectangle needs and the text-array shape
+/// cannot encode. `formulas` is parallel to `cells`; `text == NULL`
+/// marks a plain value slot. Follows `zlsx_status_v1`; every refusal
+/// here — malformed ref, mismatched anchor, overlap, member formula,
+/// unknown dialect — is a statement about the call, so -1, never -2.
+export fn zlsx_sheet_writer_write_row_with_formulas_v2(
+    sw: ?*SheetWriter,
+    cells_ptr: ?[*]const CCell,
+    formulas_ptr: ?[*]const CFormulaCell,
+    cells_len: usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const sw_state: *SheetWriterState = @ptrCast(@alignCast(sw orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    }));
+
+    // Same scratch / heap pattern as the legacy formulas shim.
+    var scratch_cells: [128]xlsx.Cell = undefined;
+    var heap_cells: ?[]xlsx.Cell = null;
+    defer if (heap_cells) |h| gpa.free(h);
+    var cells_slice: []xlsx.Cell = &.{};
+
+    var scratch_formulas: [128]?writer_mod.FormulaCell = undefined;
+    var heap_formulas: ?[]?writer_mod.FormulaCell = null;
+    defer if (heap_formulas) |h| gpa.free(h);
+    var formulas_slice: []?writer_mod.FormulaCell = &.{};
+
+    if (cells_len > 0) {
+        const cp = cells_ptr orelse {
+            writeError(err_buf, err_buf_len, "InvalidInput");
+            return ZLSX_ERROR;
+        };
+        const fp = formulas_ptr orelse {
+            writeError(err_buf, err_buf_len, "InvalidInput");
+            return ZLSX_ERROR;
+        };
+        if (cells_len <= scratch_cells.len) {
+            cells_slice = scratch_cells[0..cells_len];
+            formulas_slice = scratch_formulas[0..cells_len];
+        } else {
+            heap_cells = gpa.alloc(xlsx.Cell, cells_len) catch {
+                writeError(err_buf, err_buf_len, "OutOfMemory");
+                return ZLSX_NOMEM;
+            };
+            cells_slice = heap_cells.?;
+            heap_formulas = gpa.alloc(?writer_mod.FormulaCell, cells_len) catch {
+                writeError(err_buf, err_buf_len, "OutOfMemory");
+                return ZLSX_NOMEM;
+            };
+            formulas_slice = heap_formulas.?;
+        }
+        for (0..cells_len) |i| {
+            cells_slice[i] = fromCCell(cp[i]) catch |e| {
+                writeError(err_buf, err_buf_len, @errorName(e));
+                return ZLSX_ERROR;
+            };
+            const d = fp[i];
+            const text_ptr = d.text orelse {
+                // Plain value slot: dialect and ref must be silent too
+                // — a descriptor that says "no formula, but CSE" is a
+                // contract violation, not a no-op.
+                if (d.dialect != formula_dialect_scalar or d.ref != null or d.text_len != 0) {
+                    writeError(err_buf, err_buf_len, "InvalidInput");
+                    return ZLSX_ERROR;
+                }
+                formulas_slice[i] = null;
+                continue;
+            };
+            if (d.text_len == 0) {
+                // The empty formula the legacy shim's length-encoding
+                // could silently drop; here it is an explicit reject
+                // (matches the Zig layer's FormulaTextEmpty).
+                writeError(err_buf, err_buf_len, "InvalidInput");
+                return ZLSX_ERROR;
+            }
+            const dialect: writer_mod.FormulaCell.Dialect = switch (d.dialect) {
+                formula_dialect_scalar, formula_dialect_dynamic_array => blk: {
+                    if (d.ref != null or d.ref_len != 0) {
+                        writeError(err_buf, err_buf_len, "InvalidInput");
+                        return ZLSX_ERROR;
+                    }
+                    break :blk if (d.dialect == formula_dialect_scalar) .scalar else .dynamic_array;
+                },
+                formula_dialect_cse => blk: {
+                    const rp = d.ref orelse {
+                        writeError(err_buf, err_buf_len, "InvalidInput");
+                        return ZLSX_ERROR;
+                    };
+                    if (d.ref_len == 0) {
+                        writeError(err_buf, err_buf_len, "InvalidInput");
+                        return ZLSX_ERROR;
+                    }
+                    break :blk .{ .cse = rp[0..d.ref_len] };
+                },
+                else => {
+                    writeError(err_buf, err_buf_len, "InvalidInput");
+                    return ZLSX_ERROR;
+                },
+            };
+            formulas_slice[i] = .{ .text = text_ptr[0..d.text_len], .dialect = dialect };
+        }
+    }
+
+    sw_state.inner.writeRowWithFormulaCells(cells_slice, formulas_slice) catch |e| {
+        return failMapped(e, null, err_buf, err_buf_len);
+    };
+    return ZLSX_OK;
 }
 
 // ─── M9a1 tests ──────────────────────────────────────────────────────
@@ -5915,5 +6339,385 @@ test "fuzz C ABI M9a1: random runs, formulas and anchors never panic, tails stay
             st_recalc == ZLSX_REFUSED or st_recalc == ZLSX_NOMEM or st_recalc == ZLSX_CANCELLED);
         for (rbuf[@sizeOf(CRecalcReport)..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
         if (st_recalc == ZLSX_OK) zlsx_recalc_report_release(rp);
+    }
+}
+
+// ─── M9a2 tests ──────────────────────────────────────────────────────
+
+/// The M9a1 fixture with the formula swapped for one the engine does
+/// not implement — the refusal-census fixture.
+fn writeM9a2RefusalFixture(io: std.Io, tt: *TestTmp) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const path = try tt.path(alloc, io, "m9a2_refusal.xlsx");
+    errdefer alloc.free(path);
+    var err_buf: [128]u8 = undefined;
+    const w = zlsx_writer_create(&err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_writer_close(w);
+    const name = "Sheet1";
+    const sw = zlsx_writer_add_sheet(w, name.ptr, name.len, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    const cells = [_]CCell{ toCCell(.{ .number = 1 }), toCCell(.{ .number = 999 }) };
+    const formula = "NOSUCHFN(A1)";
+    const fptrs = [_]?[*]const u8{ null, formula.ptr };
+    const flens = [_]usize{ 0, formula.len };
+    if (zlsx_sheet_writer_write_row_with_formulas(sw, &cells, &fptrs, &flens, cells.len, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    if (zlsx_writer_save(w, path.ptr, path.len, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    return path;
+}
+
+fn readFileBytes(io: std.Io, path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, std.testing.allocator, .limited(1 << 24));
+}
+
+test "M9a2 end-to-end: open_buffer, save_to_buffer, save_with_recalc" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeM9a1Fixture(io, &tt);
+    defer alloc.free(path);
+    const src_bytes = try readFileBytes(io, path);
+    defer alloc.free(src_bytes);
+
+    var err_buf: [128]u8 = undefined;
+
+    // open_buffer: the borrow ends at the call — poison a copy after.
+    var ed_slot: ?*Editor = null;
+    {
+        const borrowed = try alloc.dupe(u8, src_bytes);
+        defer alloc.free(borrowed);
+        try std.testing.expectEqual(ZLSX_OK, zlsx_open_buffer(borrowed.ptr, borrowed.len, &ed_slot, &err_buf, err_buf.len));
+        @memset(borrowed, 0xAA);
+    }
+    const ed = ed_slot orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+
+    // save_to_buffer of an untouched editor: the source bytes verbatim.
+    var out_ptr: ?[*]u8 = null;
+    var out_len: usize = 0;
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_save_to_buffer(ed, &out_ptr, &out_len, &err_buf, err_buf.len));
+    try std.testing.expectEqualSlices(u8, src_bytes, out_ptr.?[0..out_len]);
+    zlsx_buffer_release(out_ptr, out_len);
+
+    // save_with_recalc: the destination holds the recalced cache and
+    // the durability slot reports a clean commit.
+    const out_path = try tt.path(alloc, io, "m9a2_out.xlsx");
+    defer alloc.free(out_path);
+    var crun = zeroRun();
+    crun.now_utc_ms = 1_700_000_000_000;
+    crun.rng_seed = 42;
+    var report = std.mem.zeroes(CRecalcReport);
+    report.struct_size = @sizeOf(CRecalcReport);
+    var diag = std.mem.zeroes(CDiag);
+    diag.struct_size = @sizeOf(CDiag);
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_save_with_recalc(ed, out_path.ptr, out_path.len, &crun, &report, &diag, &err_buf, err_buf.len));
+    try std.testing.expect(report.cells_written >= 1);
+    try std.testing.expectEqual(@as(u32, 1), report.resolved_present);
+    try std.testing.expectEqual(@as(u32, 0), report.durability_warning);
+    try std.testing.expectEqual(@as(i32, 0), report.durability_errno);
+    try std.testing.expectEqual(plane_none, diag.plane);
+    zlsx_recalc_report_release(&report);
+    zlsx_diag_release(&diag);
+
+    // And the memory swapped with the file: evaluating on the SAME
+    // handle reads the recalced cache.
+    var val = std.mem.zeroes(CValue);
+    val.struct_size = @sizeOf(CValue);
+    const f_read = "=B1";
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_evaluate(ed, f_read.ptr, f_read.len, 0, 0, 0, &crun, &val, null, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(f64, 3), val.elems.?[0].num);
+    zlsx_value_release(&val);
+
+    // The destination reopens through open_buffer and reads the same.
+    const out_bytes = try readFileBytes(io, out_path);
+    defer alloc.free(out_bytes);
+    var ed2_slot: ?*Editor = null;
+    try std.testing.expectEqual(ZLSX_OK, zlsx_open_buffer(out_bytes.ptr, out_bytes.len, &ed2_slot, &err_buf, err_buf.len));
+    const ed2 = ed2_slot orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed2);
+    val = std.mem.zeroes(CValue);
+    val.struct_size = @sizeOf(CValue);
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_evaluate(ed2, f_read.ptr, f_read.len, 0, 0, 0, &crun, &val, null, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(f64, 3), val.elems.?[0].num);
+    zlsx_value_release(&val);
+}
+
+test "M9a2 refusal: the diag census names the refusing cell across the boundary" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeM9a2RefusalFixture(io, &tt);
+    defer alloc.free(path);
+
+    var err_buf: [128]u8 = undefined;
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+
+    var crun = zeroRun();
+    crun.now_utc_ms = 1_700_000_000_000;
+    crun.rng_seed = 7;
+    var report = std.mem.zeroes(CRecalcReport);
+    report.struct_size = @sizeOf(CRecalcReport);
+    var diag = std.mem.zeroes(CDiag);
+    diag.struct_size = @sizeOf(CDiag);
+    try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_recalculate(ed, &crun, &report, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("FormulaUnsupportedFunction", std.mem.sliceTo(&diag.error_name, 0));
+    try std.testing.expectEqual(@intFromEnum(PlaneTwo.FormulaUnsupportedFunction), diag.plane);
+    // M9a1 shipped this census empty (decision 4); M9a2 makes it name
+    // the refusing cell: B1 = row 1 (1-based), col 1 (0-based).
+    try std.testing.expectEqual(@as(usize, 1), diag.census_len);
+    const entry = diag.census.?[0];
+    try std.testing.expectEqual(@intFromEnum(PlaneTwo.FormulaUnsupportedFunction), entry.plane);
+    try std.testing.expectEqual(@as(u32, 0), entry.sheet);
+    try std.testing.expectEqual(@as(u32, 1), entry.row);
+    try std.testing.expectEqual(@as(u32, 1), entry.col);
+    try std.testing.expectEqual(@as(u32, 0), diag.census_truncated);
+    zlsx_diag_release(&diag);
+    // The same refusal through the file transaction: same census, and
+    // the destination is never created.
+    const out_path = try tt.path(alloc, io, "m9a2_refused_out.xlsx");
+    defer alloc.free(out_path);
+    diag = std.mem.zeroes(CDiag);
+    diag.struct_size = @sizeOf(CDiag);
+    try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_save_with_recalc(ed, out_path.ptr, out_path.len, &crun, &report, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(usize, 1), diag.census_len);
+    try std.testing.expectEqual(@as(u32, 1), diag.census.?[0].row);
+    zlsx_diag_release(&diag);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, out_path, .{}));
+}
+
+test "M9a2 writer: save_with_recalc computes the fresh workbook's caches" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+
+    const w = zlsx_writer_create(&err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_writer_close(w);
+    const name = "Sheet1";
+    const sw = zlsx_writer_add_sheet(w, name.ptr, name.len, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    const cells = [_]CCell{ toCCell(.{ .number = 1 }), toCCell(.{ .number = 0 }) };
+    const formula = "A1+2";
+    const fptrs = [_]?[*]const u8{ null, formula.ptr };
+    const flens = [_]usize{ 0, formula.len };
+    try std.testing.expectEqual(@as(i32, 0), zlsx_sheet_writer_write_row_with_formulas(sw, &cells, &fptrs, &flens, cells.len, &err_buf, err_buf.len));
+
+    const out_path = try tt.path(alloc, io, "m9a2_writer_out.xlsx");
+    defer alloc.free(out_path);
+    var crun = zeroRun();
+    crun.now_utc_ms = 1_700_000_000_000;
+    crun.rng_seed = 9;
+    var report = std.mem.zeroes(CRecalcReport);
+    report.struct_size = @sizeOf(CRecalcReport);
+    var diag = std.mem.zeroes(CDiag);
+    diag.struct_size = @sizeOf(CDiag);
+    try std.testing.expectEqual(ZLSX_OK, zlsx_writer_save_with_recalc(w, out_path.ptr, out_path.len, &crun, &report, &diag, &err_buf, err_buf.len));
+    try std.testing.expect(report.cells_written >= 1);
+    try std.testing.expectEqual(@as(u32, 0), report.durability_warning);
+    zlsx_recalc_report_release(&report);
+    zlsx_diag_release(&diag);
+
+    // The writer handle survives (not consumed): a plain save still works.
+    const plain_path = try tt.path(alloc, io, "m9a2_writer_plain.xlsx");
+    defer alloc.free(plain_path);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w, plain_path.ptr, plain_path.len, &err_buf, err_buf.len));
+
+    // The recalced destination carries B1 = 3.
+    const ed = zlsx_editor_open(out_path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    var val = std.mem.zeroes(CValue);
+    val.struct_size = @sizeOf(CValue);
+    const f_read = "=B1";
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_evaluate(ed, f_read.ptr, f_read.len, 0, 0, 0, &crun, &val, null, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(f64, 3), val.elems.?[0].num);
+    zlsx_value_release(&val);
+}
+
+test "M9a2 v2 rows: the descriptor writes a CSE rectangle and refuses bad shapes" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+
+    const w = zlsx_writer_create(&err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_writer_close(w);
+    const name = "Sheet1";
+    const sw = zlsx_writer_add_sheet(w, name.ptr, name.len, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+
+    const plain: CFormulaCell = .{ .text = null, .text_len = 0, .dialect = formula_dialect_scalar, ._reserved0 = 0, .ref = null, .ref_len = 0 };
+    const cse_text = "TRANSPOSE(A3:B3)";
+    const cse_ref = "A1:B2";
+
+    // Bad shapes first (nothing may land): unknown dialect / CSE
+    // without ref / dynamic-array / anchor mismatch / empty text.
+    const t = "1+2";
+    var bad: [2]CFormulaCell = .{ .{ .text = t.ptr, .text_len = t.len, .dialect = 7, ._reserved0 = 0, .ref = null, .ref_len = 0 }, plain };
+    const two_cells = [_]CCell{ toCCell(.{ .number = 3 }), toCCell(.{ .number = 4 }) };
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_sheet_writer_write_row_with_formulas_v2(sw, &two_cells, &bad, two_cells.len, &err_buf, err_buf.len));
+    bad[0] = .{ .text = t.ptr, .text_len = t.len, .dialect = formula_dialect_cse, ._reserved0 = 0, .ref = null, .ref_len = 0 };
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_sheet_writer_write_row_with_formulas_v2(sw, &two_cells, &bad, two_cells.len, &err_buf, err_buf.len));
+    bad[0] = .{ .text = t.ptr, .text_len = t.len, .dialect = formula_dialect_dynamic_array, ._reserved0 = 0, .ref = null, .ref_len = 0 };
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_sheet_writer_write_row_with_formulas_v2(sw, &two_cells, &bad, two_cells.len, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("FormulaDynamicArrayUnsupported", std.mem.sliceTo(&err_buf, 0));
+    const wrong_ref = "B1:B2";
+    bad[0] = .{ .text = cse_text.ptr, .text_len = cse_text.len, .dialect = formula_dialect_cse, ._reserved0 = 0, .ref = wrong_ref.ptr, .ref_len = wrong_ref.len };
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_sheet_writer_write_row_with_formulas_v2(sw, &two_cells, &bad, two_cells.len, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("FormulaCseAnchorMismatch", std.mem.sliceTo(&err_buf, 0));
+    bad[0] = .{ .text = t.ptr, .text_len = 0, .dialect = formula_dialect_scalar, ._reserved0 = 0, .ref = null, .ref_len = 0 };
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_sheet_writer_write_row_with_formulas_v2(sw, &two_cells, &bad, two_cells.len, &err_buf, err_buf.len));
+
+    // Nothing landed: the sheet still starts at row 1. Now the real
+    // anchor row: A1 anchors A1:B2, B1 is a member with a cached value.
+    const anchor: CFormulaCell = .{ .text = cse_text.ptr, .text_len = cse_text.len, .dialect = formula_dialect_cse, ._reserved0 = 0, .ref = cse_ref.ptr, .ref_len = cse_ref.len };
+    const row1 = [_]CFormulaCell{ anchor, plain };
+    try std.testing.expectEqual(ZLSX_OK, zlsx_sheet_writer_write_row_with_formulas_v2(sw, &two_cells, &row1, two_cells.len, &err_buf, err_buf.len));
+
+    // A formula inside the open rectangle refuses.
+    var member_bad = [_]CFormulaCell{ .{ .text = t.ptr, .text_len = t.len, .dialect = formula_dialect_scalar, ._reserved0 = 0, .ref = null, .ref_len = 0 }, plain };
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_sheet_writer_write_row_with_formulas_v2(sw, &two_cells, &member_bad, two_cells.len, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("FormulaCseMemberFormula", std.mem.sliceTo(&err_buf, 0));
+
+    // An incomplete rectangle refuses the save.
+    const early_path = try tt.path(alloc, io, "m9a2_v2_early.xlsx");
+    defer alloc.free(early_path);
+    try std.testing.expectEqual(@as(i32, -1), zlsx_writer_save(w, early_path.ptr, early_path.len, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("FormulaCseMemberMissing", std.mem.sliceTo(&err_buf, 0));
+
+    // Row 2 completes it: A2 empty (becomes a placeholder), B2 valued.
+    const row2_cells = [_]CCell{ toCCell(.empty), toCCell(.{ .number = 6 }) };
+    const row2 = [_]CFormulaCell{ plain, plain };
+    try std.testing.expectEqual(ZLSX_OK, zlsx_sheet_writer_write_row_with_formulas_v2(sw, &row2_cells, &row2, row2_cells.len, &err_buf, err_buf.len));
+
+    const out_path = try tt.path(alloc, io, "m9a2_v2.xlsx");
+    defer alloc.free(out_path);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_writer_save(w, out_path.ptr, out_path.len, &err_buf, err_buf.len));
+
+    // The archive opens and the anchor's rectangle survives the reader.
+    const book = zlsx_book_open(out_path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_book_close(book);
+}
+
+test "M9a2 boundary: the new exports reject what the library never sees" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeM9a1Fixture(io, &tt);
+    defer alloc.free(path);
+    const src_bytes = try readFileBytes(io, path);
+    defer alloc.free(src_bytes);
+    var err_buf: [128]u8 = undefined;
+
+    // zlsx_buffer_release: NULL-safe, zero-length safe.
+    zlsx_buffer_release(null, 0);
+    zlsx_buffer_release(null, 17);
+
+    // open_buffer contract violations.
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_open_buffer(src_bytes.ptr, src_bytes.len, null, &err_buf, err_buf.len));
+    var slot: ?*Editor = @ptrFromInt(@alignOf(EditorState)); // poisoned: must be nulled
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_open_buffer(null, 0, &slot, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(?*Editor, null), slot);
+    const garbage = "not a zip archive at all";
+    slot = @ptrFromInt(@alignOf(EditorState));
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_open_buffer(garbage.ptr, garbage.len, &slot, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(?*Editor, null), slot);
+
+    // save_to_buffer contract violations, and the prepped (NULL, 0) pair.
+    var out_ptr: ?[*]u8 = @ptrFromInt(8);
+    var out_len: usize = 99;
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_save_to_buffer(null, &out_ptr, &out_len, &err_buf, err_buf.len));
+    var ed_slot: ?*Editor = null;
+    try std.testing.expectEqual(ZLSX_OK, zlsx_open_buffer(src_bytes.ptr, src_bytes.len, &ed_slot, &err_buf, err_buf.len));
+    const ed = ed_slot orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_save_to_buffer(ed, null, &out_len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_save_to_buffer(ed, &out_ptr, null, &err_buf, err_buf.len));
+
+    // save_with_recalc: NULL path / empty path / bad report size — and
+    // a canary tail that survives every failure class.
+    var crun = zeroRun();
+    crun.now_utc_ms = 1;
+    crun.rng_seed = 1;
+    var rbuf: [@sizeOf(CRecalcReport) + 64]u8 align(@alignOf(CRecalcReport)) = undefined;
+    @memset(&rbuf, 0xAA);
+    const rp: *CRecalcReport = @ptrCast(&rbuf);
+    rp.struct_size = rbuf.len;
+    const out_path = try tt.path(alloc, io, "m9a2_boundary_out.xlsx");
+    defer alloc.free(out_path);
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_save_with_recalc(ed, null, 5, &crun, rp, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_save_with_recalc(ed, out_path.ptr, 0, &crun, rp, null, &err_buf, err_buf.len));
+    var bad_run = zeroRun();
+    bad_run.now_utc_ms = 1;
+    bad_run.rng_seed = 1;
+    bad_run.fidelity = 99;
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_save_with_recalc(ed, out_path.ptr, out_path.len, &bad_run, rp, null, &err_buf, err_buf.len));
+    for (rbuf[@sizeOf(CRecalcReport)..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+    // Below-minimum report: byte-for-byte untouched beyond struct_size.
+    @memset(&rbuf, 0xAA);
+    rp.struct_size = @sizeOf(CRecalcReport) - 1;
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_save_with_recalc(ed, out_path.ptr, out_path.len, &crun, rp, null, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("StructSizeTooSmall", std.mem.sliceTo(&err_buf, 0));
+    for (rbuf[@sizeOf(usize)..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+    // And no destination appeared through any of it.
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, out_path, .{}));
+
+    // v2 writer export: NULL handle refuses.
+    const dcell = [_]CCell{toCCell(.{ .number = 1 })};
+    const dform = [_]CFormulaCell{.{ .text = null, .text_len = 0, .dialect = 0, ._reserved0 = 0, .ref = null, .ref_len = 0 }};
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_sheet_writer_write_row_with_formulas_v2(null, &dcell, &dform, 1, &err_buf, err_buf.len));
+}
+
+test "fuzz C ABI M9a2: random formula descriptors never panic" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var err_buf: [128]u8 = undefined;
+
+    const w = zlsx_writer_create(&err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_writer_close(w);
+    const name = "Fuzz";
+    const sw = zlsx_writer_add_sheet(w, name.ptr, name.len, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+
+    var prng = std.Random.DefaultPrng.init(fuzzSeedCabi(io));
+    const random = prng.random();
+    const text_pool = "SUM(A1:B2)";
+    const ref_pool = "A1:B2XYZ:9";
+
+    var iter: usize = 0;
+    while (iter < fuzzItersCabi()) : (iter += 1) {
+        var cells: [4]CCell = undefined;
+        var descs: [4]CFormulaCell = undefined;
+        const n = 1 + random.uintLessThan(usize, cells.len);
+        for (0..n) |i| {
+            cells[i] = toCCell(.{ .number = @floatFromInt(random.uintLessThan(u32, 1000)) });
+            random.bytes(std.mem.asBytes(&descs[i]));
+            // Re-pin every pointer to NULL or a valid pool slice —
+            // the fuzz target is the descriptor grammar, not wild
+            // memory.
+            const text_len = random.uintLessThan(usize, text_pool.len + 1);
+            descs[i].text = if (random.boolean()) text_pool.ptr else null;
+            descs[i].text_len = if (descs[i].text != null) text_len else if (random.boolean()) 0 else text_len;
+            const ref_len = random.uintLessThan(usize, ref_pool.len + 1);
+            descs[i].ref = if (random.boolean()) ref_pool.ptr else null;
+            descs[i].ref_len = if (descs[i].ref != null) ref_len else if (random.boolean()) 0 else ref_len;
+            descs[i].dialect = random.uintLessThan(u32, 5);
+        }
+        const st = zlsx_sheet_writer_write_row_with_formulas_v2(sw, &cells, &descs, n, &err_buf, err_buf.len);
+        try std.testing.expect(st == ZLSX_OK or st == ZLSX_ERROR or st == ZLSX_NOMEM);
     }
 }

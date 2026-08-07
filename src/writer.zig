@@ -608,6 +608,16 @@ pub const Writer = struct {
     /// *inside* it borrows Writer-owned memory and stays valid only as
     /// long as the Writer does.
     fn projectSheets(self: *Writer) ![]fresh_emit.SheetInput {
+        // M9a2's CSE finalization gate: every declared rectangle must
+        // be complete before any archive byte exists — a missing
+        // member would ship a rectangle Excel repairs or rejects.
+        // Runs on every save path (file and buffer) because both
+        // project here.
+        for (self.sheets.items) |sw| {
+            for (sw.cse_rects.items) |rect| {
+                if (rect.covered != rect.area()) return error.FormulaCseMemberMissing;
+            }
+        }
         const inputs = try self.allocator.alloc(fresh_emit.SheetInput, self.sheets.items.len);
         for (self.sheets.items, 0..) |sw, i| {
             inputs[i] = .{ .name = sw.name, .body = sw.body.items, .state = &sw.state };
@@ -628,6 +638,98 @@ pub const Writer = struct {
 };
 
 // ─── SheetWriter ─────────────────────────────────────────────────────
+
+/// §12.3's per-cell formula descriptor (M9a2): what one slot of a
+/// `writeRowWithFormulaCells` row writes. Mirrors the recalc engine's
+/// `FormulaWrite` shape without importing the engine — the fresh
+/// writer stays a leaf module.
+pub const FormulaCell = struct {
+    /// Formula text without the leading `=`.
+    text: []const u8,
+    dialect: Dialect = .scalar,
+
+    pub const Dialect = union(enum) {
+        /// An ordinary `<f>` cell formula — the shipped
+        /// `writeRowWithFormulas` behaviour, byte-identical.
+        scalar,
+        /// A dynamic-array anchor. Refused
+        /// (`error.FormulaDynamicArrayUnsupported`): the authored `cm`
+        /// and its XLDAPR metadata part are mutations whose Excel
+        /// reference set has not arrived (§5.8b) — the same parked
+        /// state as the pkg authoring path.
+        dynamic_array,
+        /// A legacy CSE anchor over this declared range (uppercase A1,
+        /// single cell or `TL:BR`; 1×1 is legal — Excel writes
+        /// single-cell CSE anchors). Legal ONLY on the rectangle's
+        /// top-left: the anchor writes `<f t="array" ref>`, members
+        /// carry `<v>` and no `<f>` (`xlsx.zig`'s reader shape).
+        cse: []const u8,
+    };
+};
+
+/// One open CSE rectangle (M9a2's state machine): declared by an
+/// anchor's `.cse` ref, complete when every cell of the declared range
+/// has been emitted. `first_row`/`last_row` are 1-based,
+/// `first_col`/`last_col` 0-based — the emitter's own coordinates.
+const CseRect = struct {
+    first_row: u32,
+    last_row: u32,
+    first_col: u32,
+    last_col: u32,
+    /// Cells emitted inside the rectangle so far, anchor included.
+    covered: u32 = 0,
+
+    fn area(self: CseRect) u32 {
+        return (self.last_row - self.first_row + 1) * (self.last_col - self.first_col + 1);
+    }
+
+    fn contains(self: CseRect, row: u32, col: u32) bool {
+        return row >= self.first_row and row <= self.last_row and
+            col >= self.first_col and col <= self.last_col;
+    }
+
+    fn overlaps(self: CseRect, other: CseRect) bool {
+        return self.first_row <= other.last_row and other.first_row <= self.last_row and
+            self.first_col <= other.last_col and other.first_col <= self.last_col;
+    }
+};
+
+/// Parse a CSE declared range. Delegates the corner grammar to
+/// `sheet_plan.parseA1Corner` (uppercase-only, no leading-zero rows),
+/// which also makes the ref XML-safe by construction — every accepted
+/// byte is `[A-Z0-9:]`, so the emitter may print it verbatim.
+fn parseCseRef(ref: []const u8) error{FormulaCseRefInvalid}!CseRect {
+    const corner = struct {
+        fn parse(s: []const u8) error{FormulaCseRefInvalid}!sheet_plan.A1Corner {
+            return sheet_plan.parseA1Corner(s) catch error.FormulaCseRefInvalid;
+        }
+    };
+    if (std.mem.indexOfScalar(u8, ref, ':')) |colon| {
+        const tl = try corner.parse(ref[0..colon]);
+        const br = try corner.parse(ref[colon + 1 ..]);
+        if (tl.col > br.col or tl.row > br.row) return error.FormulaCseRefInvalid;
+        return .{ .first_row = tl.row, .last_row = br.row, .first_col = tl.col - 1, .last_col = br.col - 1 };
+    }
+    const c = try corner.parse(ref);
+    return .{ .first_row = c.row, .last_row = c.row, .first_col = c.col - 1, .last_col = c.col - 1 };
+}
+
+/// How a row's formulas arrive: the shipped text-array shape
+/// (`writeRowWithFormulas`) or M9a2's per-cell descriptors. `at`
+/// normalizes both to `?FormulaCell` so the emitter has one path —
+/// and the legacy shape maps to `.scalar`, which emits byte-identical
+/// output to the pre-M9a2 revision.
+const FormulaSource = union(enum) {
+    texts: []const ?[]const u8,
+    cells: []const ?FormulaCell,
+
+    fn at(self: FormulaSource, i: usize) ?FormulaCell {
+        return switch (self) {
+            .texts => |ts| if (ts[i]) |t| .{ .text = t } else null,
+            .cells => |cs| cs[i],
+        };
+    }
+};
 
 /// External-URL hyperlink registered against a cell or range on one
 /// sheet. Both fields are SheetWriter-owned copies.
@@ -791,6 +893,10 @@ pub const SheetWriter = struct {
     /// the same registration + heap-ownership code path.
     /// Replaces 11 fields and the matching deinit branches.
     state: sheet_plan.SheetState = .{},
+    /// M9a2: open CSE rectangles, appended by `.cse` anchors and
+    /// completed by member emission. Save refuses while any is
+    /// incomplete (`projectSheets`).
+    cse_rects: std.ArrayListUnmanaged(CseRect) = .empty,
 
     fn init(parent: *Writer, name: []const u8) !SheetWriter {
         return .{
@@ -803,7 +909,18 @@ pub const SheetWriter = struct {
         self.parent.allocator.free(self.name);
         self.body.deinit(self.parent.allocator);
         self.state.deinit(self.parent.allocator);
+        self.cse_rects.deinit(self.parent.allocator);
         self.* = undefined;
+    }
+
+    /// The open CSE rectangle covering (row, col), if any. Rectangles
+    /// cannot overlap (refused at declaration), so the first match is
+    /// the only one.
+    fn cseRectAt(self: *SheetWriter, row: u32, col: u32) ?*CseRect {
+        for (self.cse_rects.items) |*r| {
+            if (r.contains(row, col)) return r;
+        }
+        return null;
     }
 
     /// Set a column's width in character units (Excel's default is
@@ -1066,7 +1183,34 @@ pub const SheetWriter = struct {
         formulas: []const ?[]const u8,
     ) !void {
         if (formulas.len != cells.len) return error.FormulaCountMismatch;
-        return self.writeRowImpl(cells, null, formulas);
+        return self.writeRowImpl(cells, null, .{ .texts = formulas });
+    }
+
+    /// §12.3's per-cell formula row (M9a2). Like `writeRowWithFormulas`
+    /// but each slot is a full `FormulaCell` descriptor. `.scalar` is
+    /// the shipped `<f>` byte-for-byte. `.cse` declares a legacy CSE
+    /// rectangle anchored at this cell — the ref's top-left must BE
+    /// this cell — whose members (the range's other cells, written by
+    /// later calls) carry cached values and no formula; an empty
+    /// member still gets its placeholder `<c>`. The rectangle state
+    /// machine refuses malformed refs, mismatched anchors and
+    /// overlapping rectangles here, formula-bearing members as they
+    /// arrive, and incomplete rectangles at save. `.dynamic_array`
+    /// refuses — its authored metadata's reference set has not
+    /// arrived (§5.8b).
+    pub fn writeRowWithFormulaCells(
+        self: *SheetWriter,
+        cells: []const xlsx.Cell,
+        formulas: []const ?FormulaCell,
+    ) !void {
+        if (formulas.len != cells.len) return error.FormulaCountMismatch;
+        // The legacy text-array path keeps its lax contract; the
+        // descriptor path refuses an empty text up front — a formula
+        // that says nothing is a caller bug, not an empty `<f>`.
+        for (formulas) |maybe_f| if (maybe_f) |f| {
+            if (f.text.len == 0) return error.FormulaTextEmpty;
+        };
+        return self.writeRowImpl(cells, null, .{ .cells = formulas });
     }
 
     /// Write a row mixing plain cells with rich-text cells. Rich
@@ -1110,6 +1254,11 @@ pub const SheetWriter = struct {
             if (cell == .empty) continue;
             var ref_buf: [16]u8 = undefined;
             const ref = try formatCellRef(&ref_buf, self.next_row, @intCast(col_idx));
+            // A rich cell can land inside an open CSE rectangle as a
+            // (formula-free) member; count it so the rectangle can
+            // complete. Empty cells stay skipped on this path — a rich
+            // row is not where placeholders come from.
+            if (self.cseRectAt(self.next_row, @intCast(col_idx))) |rect| rect.covered += 1;
 
             const type_attr: []const u8 = switch (cell) {
                 .string, .rich => " t=\"s\"",
@@ -1146,7 +1295,7 @@ pub const SheetWriter = struct {
         self: *SheetWriter,
         cells: []const xlsx.Cell,
         styles: ?[]const u32,
-        formulas: ?[]const ?[]const u8,
+        formulas: ?FormulaSource,
     ) !void {
         // Pre-validate the entire row BEFORE mutating `self.body`. This
         // keeps writeRow atomic — caller can catch the error and retry
@@ -1170,11 +1319,53 @@ pub const SheetWriter = struct {
             .string => |s| try assertNoForbiddenXmlBytes(s),
             else => {},
         };
-        if (formulas) |fs| {
-            for (fs) |maybe_f| if (maybe_f) |f| try assertNoForbiddenXmlBytes(f);
-        }
 
         const alloc = self.parent.allocator;
+
+        // M9a2's CSE state machine, still pre-mutation: validate every
+        // formula slot, collect the row's newly-declared rectangles,
+        // and refuse a formula landing inside any rectangle — open or
+        // declared earlier in this same row — that it does not anchor.
+        var pending_rects: std.ArrayListUnmanaged(CseRect) = .empty;
+        defer pending_rects.deinit(alloc);
+        if (formulas) |fs| {
+            for (0..cells.len) |i| {
+                const f = fs.at(i) orelse continue;
+                try assertNoForbiddenXmlBytes(f.text);
+                const col: u32 = @intCast(i);
+                for (self.cse_rects.items) |open| {
+                    if (open.contains(self.next_row, col)) return error.FormulaCseMemberFormula;
+                }
+                for (pending_rects.items) |declared| {
+                    if (declared.contains(self.next_row, col)) return error.FormulaCseMemberFormula;
+                }
+                switch (f.dialect) {
+                    .scalar => {},
+                    .dynamic_array => return error.FormulaDynamicArrayUnsupported,
+                    .cse => |cse_ref| {
+                        const rect = try parseCseRef(cse_ref);
+                        // §12.3: `.cse(ref)` legal ONLY on the anchor —
+                        // the declared range's top-left must be the cell
+                        // carrying it.
+                        if (rect.first_row != self.next_row or rect.first_col != col)
+                            return error.FormulaCseAnchorMismatch;
+                        if (rect.last_row > EXCEL_MAX_ROW) return error.RowOutOfRange;
+                        if (rect.last_col >= EXCEL_MAX_COL) return error.ColumnOutOfRange;
+                        for (self.cse_rects.items) |open| {
+                            if (open.overlaps(rect)) return error.FormulaCseOverlap;
+                        }
+                        for (pending_rects.items) |declared| {
+                            if (declared.overlaps(rect)) return error.FormulaCseOverlap;
+                        }
+                        try pending_rects.append(alloc, rect);
+                    },
+                }
+            }
+            // Validation passed: the row will be emitted. Register the
+            // rectangles now so the emit loop below counts the anchors'
+            // own coverage through the same path members take.
+            try self.cse_rects.appendSlice(alloc, pending_rects.items);
+        }
         // Row index is 0-based inside the height map; next_row is
         // 1-based per xlsx convention, so subtract 1 on lookup.
         if (self.state.row_heights.get(self.next_row - 1)) |h| {
@@ -1185,16 +1376,26 @@ pub const SheetWriter = struct {
 
         for (cells, 0..) |cell, col_idx| {
             const style_id: u32 = if (styles) |s| s[col_idx] else 0;
-            const formula: ?[]const u8 = if (formulas) |fs| fs[col_idx] else null;
+            const formula: ?FormulaCell = if (formulas) |fs| fs.at(col_idx) else null;
+            const in_rect = self.cseRectAt(self.next_row, @intCast(col_idx));
 
             // `<c>` elements for empty cells are only emitted when a
             // non-default style is applied OR a formula is attached —
             // otherwise OOXML's "missing cell = empty" rule keeps the
-            // sheet smaller.
-            if (cell == .empty and style_id == 0 and formula == null) continue;
+            // sheet smaller. M9a2 adds one more reason to emit: a cell
+            // inside an open CSE rectangle is a member, and §12.3 makes
+            // empty members placeholders, not holes.
+            if (cell == .empty and style_id == 0 and formula == null and in_rect == null) continue;
 
             var ref_buf: [16]u8 = undefined;
             const ref = try formatCellRef(&ref_buf, self.next_row, @intCast(col_idx));
+            if (in_rect) |rect| rect.covered += 1;
+
+            // Bare placeholder: an empty, unstyled CSE member.
+            if (cell == .empty and style_id == 0 and formula == null) {
+                try self.body.print(alloc, "<c r=\"{s}\"/>", .{ref});
+                continue;
+            }
 
             // Self-closing fast path: styled but empty, no formula.
             // Preserves byte-for-byte output with the pre-formula
@@ -1226,8 +1427,14 @@ pub const SheetWriter = struct {
             }
 
             if (formula) |f| {
-                try self.body.appendSlice(alloc, "<f>");
-                try appendXmlEscaped(alloc, &self.body, f);
+                switch (f.dialect) {
+                    .scalar => try self.body.appendSlice(alloc, "<f>"),
+                    // parseCseRef admits only [A-Z0-9:], so the ref is
+                    // XML-safe verbatim.
+                    .cse => |cse_ref| try self.body.print(alloc, "<f t=\"array\" ref=\"{s}\">", .{cse_ref}),
+                    .dynamic_array => unreachable, // refused in prevalidation
+                }
+                try appendXmlEscaped(alloc, &self.body, f.text);
                 try self.body.appendSlice(alloc, "</f>");
             }
 
@@ -5385,4 +5592,119 @@ test "Writer: saveToOwnedBuffer leaves nothing allocated under any failure" {
             try std.testing.expect(bytes.len > 0);
         }
     }.run, .{threaded.io()});
+}
+
+test "Writer M9a2: writeRowWithFormulaCells emits the CSE anchor, members and placeholders" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    var sheet = try w.addSheet("Cse");
+
+    // Row 1: anchor A1 declares A1:B2; B1 is a member with a cached
+    // value. Row 2: A2 empty member (placeholder), B2 valued member.
+    try sheet.writeRowWithFormulaCells(
+        &.{ .{ .integer = 1 }, .{ .integer = 2 } },
+        &.{ .{ .text = "TRANSPOSE(D1:E2)", .dialect = .{ .cse = "A1:B2" } }, null },
+    );
+    try sheet.writeRowWithFormulaCells(
+        &.{ .empty, .{ .integer = 4 } },
+        &.{ null, null },
+    );
+
+    const body = sheet.body.items;
+    try std.testing.expect(std.mem.indexOf(u8, body, "<c r=\"A1\"><f t=\"array\" ref=\"A1:B2\">TRANSPOSE(D1:E2)</f><v>1</v></c>") != null);
+    // Members carry <v> and no <f>; the empty member is a bare placeholder.
+    try std.testing.expect(std.mem.indexOf(u8, body, "<c r=\"B1\"><v>2</v></c>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "<c r=\"A2\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "<c r=\"B2\"><v>4</v></c>") != null);
+
+    // Complete rectangle: the save-side gate passes (projectSheets is
+    // what both save paths run; the buffer save proves it without
+    // touching the filesystem).
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const bytes = try w.saveToOwnedBuffer(std.testing.allocator, threaded.io());
+    defer std.testing.allocator.free(bytes);
+    var book = try xlsx.Book.openBuffer(std.testing.allocator, threaded.io(), bytes);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
+}
+
+test "Writer M9a2: the CSE state machine refuses every malformed shape" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    var sheet = try w.addSheet("Bad");
+
+    const cells2 = [_]xlsx.Cell{ .{ .integer = 1 }, .{ .integer = 2 } };
+
+    // Length mismatch and empty text, before anything else.
+    try std.testing.expectError(error.FormulaCountMismatch, sheet.writeRowWithFormulaCells(&cells2, &.{null}));
+    try std.testing.expectError(error.FormulaTextEmpty, sheet.writeRowWithFormulaCells(&cells2, &.{ .{ .text = "" }, null }));
+
+    // Dynamic array is parked (§5.8b).
+    try std.testing.expectError(error.FormulaDynamicArrayUnsupported, sheet.writeRowWithFormulaCells(&cells2, &.{ .{ .text = "A2#", .dialect = .dynamic_array }, null }));
+
+    // Malformed refs: not A1 grammar, lowercase, inverted corners.
+    try std.testing.expectError(error.FormulaCseRefInvalid, sheet.writeRowWithFormulaCells(&cells2, &.{ .{ .text = "1", .dialect = .{ .cse = "nope" } }, null }));
+    try std.testing.expectError(error.FormulaCseRefInvalid, sheet.writeRowWithFormulaCells(&cells2, &.{ .{ .text = "1", .dialect = .{ .cse = "a1:B2" } }, null }));
+    try std.testing.expectError(error.FormulaCseRefInvalid, sheet.writeRowWithFormulaCells(&cells2, &.{ .{ .text = "1", .dialect = .{ .cse = "B2:A1" } }, null }));
+
+    // The anchor must BE the declared top-left.
+    try std.testing.expectError(error.FormulaCseAnchorMismatch, sheet.writeRowWithFormulaCells(&cells2, &.{ .{ .text = "1", .dialect = .{ .cse = "B1:B2" } }, null }));
+    try std.testing.expectError(error.FormulaCseAnchorMismatch, sheet.writeRowWithFormulaCells(&cells2, &.{ .{ .text = "1", .dialect = .{ .cse = "A2:A3" } }, null }));
+
+    // Nothing landed: next_row is still 1. A real anchor now.
+    try std.testing.expectEqual(@as(u32, 1), sheet.next_row);
+    try sheet.writeRowWithFormulaCells(&cells2, &.{ .{ .text = "1+1", .dialect = .{ .cse = "A1:A3" } }, null });
+
+    // A formula may not land inside an open rectangle — a would-be
+    // second anchor there included (the member check subsumes it).
+    try std.testing.expectError(error.FormulaCseMemberFormula, sheet.writeRowWithFormulaCells(&cells2, &.{ .{ .text = "2+2", .dialect = .{ .cse = "A2:A4" } }, null }));
+    try std.testing.expectError(error.FormulaCseMemberFormula, sheet.writeRowWithFormulaCells(&cells2, &.{ .{ .text = "2+2" }, null }));
+    // True overlap: the second anchor sits OUTSIDE the first rectangle
+    // but its declared range reaches in.
+    var sheet2 = try w.addSheet("Bad2");
+    try sheet2.writeRowWithFormulaCells(
+        &.{ .empty, .empty, .{ .integer = 3 } },
+        &.{ null, null, .{ .text = "1", .dialect = .{ .cse = "C1:C3" } } },
+    );
+    try std.testing.expectError(error.FormulaCseOverlap, sheet2.writeRowWithFormulaCells(
+        &.{ .empty, .{ .integer = 2 } },
+        &.{ null, .{ .text = "2", .dialect = .{ .cse = "B2:C3" } } },
+    ));
+    // Same-row double anchor: the second anchor is a member of the
+    // first's pending rectangle, refused by the member check.
+    try sheet2.writeRow(&.{ .empty, .empty, .{ .integer = 5 } });
+    try sheet2.writeRow(&.{ .empty, .empty, .{ .integer = 6 } });
+    try std.testing.expectError(error.FormulaCseMemberFormula, sheet2.writeRowWithFormulaCells(
+        &.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 } },
+        &.{ .{ .text = "1", .dialect = .{ .cse = "A4:C4" } }, null, .{ .text = "2", .dialect = .{ .cse = "C4:D4" } } },
+    ));
+
+    // The single-cell rectangle is legal and complete on arrival; the
+    // three-row one is missing members, so save refuses…
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    try std.testing.expectError(error.FormulaCseMemberMissing, w.saveToOwnedBuffer(std.testing.allocator, threaded.io()));
+
+    // …until the members arrive.
+    try sheet.writeRowWithFormulaCells(&.{ .empty, .empty }, &.{ null, null });
+    try sheet.writeRow(&.{.{ .integer = 9 }});
+    const bytes = try w.saveToOwnedBuffer(std.testing.allocator, threaded.io());
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, sheet.body.items, "<c r=\"A2\"/>") != null);
+}
+
+test "Writer M9a2: a 1x1 CSE anchor is legal and complete on arrival" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    var sheet = try w.addSheet("One");
+    try sheet.writeRowWithFormulaCells(
+        &.{.{ .integer = 6 }},
+        &.{.{ .text = "SUM(B1:B3)", .dialect = .{ .cse = "A1" } }},
+    );
+    try std.testing.expect(std.mem.indexOf(u8, sheet.body.items, "<c r=\"A1\"><f t=\"array\" ref=\"A1\">SUM(B1:B3)</f><v>6</v></c>") != null);
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const bytes = try w.saveToOwnedBuffer(std.testing.allocator, threaded.io());
+    defer std.testing.allocator.free(bytes);
 }
