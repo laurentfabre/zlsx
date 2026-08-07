@@ -551,7 +551,10 @@ test "every corpus workbook extracts or fails with a typed error" {
         defer wb.deinit();
         extracted += 1;
     }
-    try testing.expect(extracted >= 10);
+    // Floor = the committed group-1 corpus (4 workbooks). CI runs this
+    // step before `fetch_test_corpus.sh`, so only those four are
+    // guaranteed present; optional fetches extend coverage, never gate.
+    try testing.expect(extracted >= 4);
 }
 
 const synth_prefix =

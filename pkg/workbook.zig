@@ -16869,9 +16869,11 @@ test "M4b1 corpus: every readable workbook models, and each cell agrees with the
         }
     }
     // The list is not decoration: if the corpus went missing entirely
-    // this test would otherwise pass by doing nothing.
+    // this test would otherwise pass by doing nothing. Floor = the
+    // committed group-1 corpus (4 workbooks) — CI runs before the
+    // optional fetch, so only those four are guaranteed present.
     if (modeled == 0) return error.SkipZigTest;
-    try std.testing.expect(modeled >= 8);
+    try std.testing.expect(modeled >= 4);
 }
 
 test "M4b1 corpus: a zero row index refuses where the reader silently drops it" {
@@ -17097,9 +17099,11 @@ test "M4b2: every corpus `<calcPr>` round-trips byte-identically" {
             return e;
         };
     }
-    // The test must not pass by finding nothing: 22 corpus workbooks
-    // carry a `<calcPr>`, and this list reaches most of them.
-    if (seen < 10) {
+    // The test must not pass by finding nothing. All four committed
+    // group-1 workbooks carry a `<calcPr>` and are the only corpus
+    // guaranteed in CI (the optional fetch runs after this step); the
+    // fetched corpus raises coverage to ~22 but may never gate.
+    if (seen < 4) {
         std.debug.print("only {d} corpus workbooks had a calcPr\n", .{seen});
         return error.TooFewCalcPrWorkbooks;
     }
