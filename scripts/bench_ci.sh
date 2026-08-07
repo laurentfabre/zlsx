@@ -25,6 +25,9 @@
 #                             "tiny small" — `small` is that workload's
 #                             identity size, so the default list is
 #                             already the baseline-recording one.
+#   ZLSX_BENCH_TEXT_SIZES     M8c's TEXT-mix geometries (per-row text
+#                             formulas in volume). Default "tiny small"
+#                             — `small` is the identity size here too.
 #
 # Output:
 #   <out_dir>/bench.json    aggregated hyperfine run results
@@ -38,6 +41,7 @@ mkdir -p "$OUT_DIR"
 ZIG_BIN="${ZIG_BIN:-zig}"
 RECALC_SIZES="${ZLSX_BENCH_RECALC_SIZES:-tiny small}"
 CRITERIA_SIZES="${ZLSX_BENCH_CRITERIA_SIZES:-tiny small}"
+TEXT_SIZES="${ZLSX_BENCH_TEXT_SIZES:-tiny small}"
 
 echo "[bench-ci] building benchmark binaries (ReleaseFast)..."
 # Built through `zig build` rather than hand-rolled `build-exe` lines.
@@ -180,6 +184,36 @@ if [[ -x "$OUT_DIR/bench_zlsx_recalc" ]]; then
         done
     else
         echo "[bench-ci] note: this tree's recalc bench predates --workload; skipping the criteria lane"
+    fi
+
+    # ── text lane (M8c, §9's TEXT-heavy mix) ──
+    #
+    # Same binary again; per-row text formulas in volume, so the two
+    # sizes separate the marginal per-row cost of the text stack from
+    # everything paid once. Guarded on the usage string mentioning the
+    # `text` workload, for the same old-worktree reason as above.
+    if ("$OUT_DIR/bench_zlsx_recalc" 2>&1 || true) | grep -q -- 'criteria|text'; then
+        for size in $TEXT_SIZES; do
+            fixture="$OUT_DIR/text_mix_$size.xlsx"
+            echo "[bench-ci] emitting the text-mix fixture ($size)..."
+            # `emit` verifies the identity size's digest and exits
+            # nonzero on drift, exactly like the other two gates.
+            "$OUT_DIR/bench_zlsx_recalc" emit "$fixture" --workload text --size "$size"
+
+            echo "[bench-ci] running hyperfine on text benchmarks ($size)..."
+            hyperfine -N --warmup 5 --runs 20 \
+                --export-json "$OUT_DIR/hyperfine_text_$size.json" \
+                --command-name "text-open:text_mix_$size" \
+                "$OUT_DIR/bench_zlsx_recalc open $fixture" \
+                --command-name "text-eval:text_mix_$size" \
+                "$OUT_DIR/bench_zlsx_recalc recalc $fixture" \
+                --command-name "text-save:text_mix_$size" \
+                "$OUT_DIR/bench_zlsx_recalc save $fixture --out $RECALC_OUT"
+            RECALC_JSONS+=("$OUT_DIR/hyperfine_text_$size.json")
+            rm -f "$RECALC_OUT" "$fixture"
+        done
+    else
+        echo "[bench-ci] note: this tree's recalc bench predates the text workload; skipping the text lane"
     fi
 fi
 
