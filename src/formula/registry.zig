@@ -1945,6 +1945,86 @@ pub const functions = [_]Function{
         .propagation = .propagate,
         .impl = fnNper,
     },
+
+    // ── M9c2 / F4a-flows: eight names over schedules ─────────────
+    //
+    // The TVM batch above prices ONE level payment; this batch prices
+    // a SCHEDULE — flows folded out of ranges (NPV, IRR), flows paired
+    // with dates (XNPV, XIRR), or a book value walked down a
+    // depreciation table (SLN, SYD, DB, DDB). The four schedule
+    // readers are the milestone's first aggregate consumers of §5.3c's
+    // fold, so they split by shape exactly the way M7b3's statistics
+    // did: collection-first names (IRR, XIRR — a guess slot trails the
+    // collection) take declaration order themselves; scalar-first
+    // names (NPV, XNPV) let the dispatcher propagate. XNPV and XIRR
+    // read date serials under the ACTIVE epoch and say so; nothing
+    // else in the batch touches a date, a code page, or a draw.
+    .{
+        .name = "NPV",
+        .arity = .{ .min = 2, .max = null, .fixed = &eager1, .rest = &eager1 },
+        .coercion = .{ .fixed = &[_]CoercionClass{.number}, .rest = &agg1 },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnNpv,
+    },
+    .{
+        .name = "IRR",
+        .arity = .{ .min = 1, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &[_]CoercionClass{ .aggregate, .number }, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .impl = fnIrr,
+    },
+    .{
+        .name = "XNPV",
+        .arity = .{ .min = 3, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &[_]CoercionClass{ .number, .aggregate, .aggregate }, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .epoch_sensitive = true,
+        .impl = fnXnpv,
+    },
+    .{
+        .name = "XIRR",
+        .arity = .{ .min = 2, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &[_]CoercionClass{ .aggregate, .aggregate, .number }, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .per_function_provenance,
+        .epoch_sensitive = true,
+        .impl = fnXirr,
+    },
+    .{
+        .name = "SLN",
+        .arity = .{ .min = 3, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &num3, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnSln,
+    },
+    .{
+        .name = "SYD",
+        .arity = .{ .min = 4, .max = 4, .fixed = &eager4, .rest = &none_l },
+        .coercion = .{ .fixed = &num4, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnSyd,
+    },
+    .{
+        .name = "DB",
+        .arity = .{ .min = 4, .max = 5, .fixed = &eager5, .rest = &none_l },
+        .coercion = .{ .fixed = &num5, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnDb,
+    },
+    .{
+        .name = "DDB",
+        .arity = .{ .min = 4, .max = 5, .fixed = &eager5, .rest = &none_l },
+        .coercion = .{ .fixed = &num5, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnDdb,
+    },
 };
 
 /// §5.9 call-position resolution: case-folded over the decoded symbol
@@ -6280,6 +6360,283 @@ fn fnRate(ctx: CallCtx, args: []const Value) FnError!Value {
     return arith(r);
 }
 
+// ─── M9c2 / F4a-flows: the implementations ───────────────────────
+//
+// Two discount spellings, on purpose. `NPV` and `IRR` discount by
+// POSITION — integer powers of (1+r), accumulated by multiplication,
+// so a rate below −1 alternates sign and stays an answer (Excel
+// computes it) and the one impossible denominator is r = −1 exactly,
+// a spelled-out `#DIV/0!`. `XNPV` and `XIRR` discount by DATE — a
+// continuous exponent (d − d₀)/365 through the batch's `log1p`/`expm1`
+// spelling, whose domain is 1 + r > 0; at and below −1 the arithmetic
+// goes non-finite and N4a answers `#NUM!` with no explicit gate.
+//
+// The fold is §5.3c's, through `collectNumbers` — `SUM`'s
+// range/direct split verbatim, first error in §5.6a order wins — and
+// the numbers that exist are the schedule: a text cell inside an NPV
+// range consumes no period, and XNPV/XIRR pair flows to dates by
+// position AFTER each side folded (counts must then agree, or #NUM!).
+// Dates are `wholeSerial`'s discipline — truncated, domain-checked
+// under the ACTIVE epoch, `#NUM!` outside it (the date batch's plane,
+// held over XNPV's doc-page `#VALUE!` for the one rulebook) — and
+// every date on or after the first, which anchors the day count.
+//
+// IRR and XIRR are the row's two solver consumers: `solve.newton`
+// exactly as `RATE` drives it — guess 0.1 when absent and 0 when
+// explicitly empty, domain −1, the same 4-unit iterations on the same
+// `WorkBudget` — after Excel's documented precondition that a
+// one-signed schedule has no root (`#NUM!` before any iteration).
+//
+// The depreciation four are closed forms. Failure planes per M9c1's
+// pin: the spelled-out zero denominators answer `#DIV/0!` (`SLN`'s
+// life; `DB`'s cost under `salvage/cost` and life under `1/life`),
+// a period outside [1, life] answers `#NUM!` (IPMT's own bounds pin,
+// which is also why `SYD` and `DDB` have NO `#DIV/0!` plane — the
+// bounds force life ≥ 1 and their denominators cannot be zero), and
+// every other non-finite is `#NUM!` (N4a): a negative `salvage/cost`
+// under a fractional exponent refuses itself, and `DDB`'s cap algebra
+// answers 0 for a factor or salvage Excel's prose calls invalid —
+// arithmetic over intuition, the negative-NPER lesson applied.
+
+fn fnNpv(ctx: CallCtx, args: []const Value) FnError!Value {
+    const rate = numArg(args, 0);
+    const flows = switch (try collectNumbers(ctx, args[1..])) {
+        .failed => |f| return .{ .scalar = f },
+        .nums => |n| n,
+    };
+    // Each accepted flow advances one period: the i-th number found is
+    // discounted by (1+r)^i, i from 1 — the first flow is one period
+    // out, which is NPV's documented difference from PV.
+    var total: f64 = 0;
+    var factor: f64 = 1;
+    for (flows) |v| {
+        factor *= 1 + rate;
+        if (factor == 0) return Value.err(.div0);
+        total += v / factor;
+    }
+    return arith(total);
+}
+
+/// IRR's residual — NPV over flow index at rate r, and its derivative
+/// in r. Position IS time here, with flow 0 undiscounted: IRR's
+/// schedule starts today where NPV's starts one period out, and the
+/// two conventions are each function's documented own.
+const IrrResidual = struct {
+    flows: []const f64,
+
+    fn eval(self: *const IrrResidual, r: f64) solve.Fdf {
+        // The solver's domain keeps 1 + r > 0, so u is finite.
+        const u = 1 / (1 + r);
+        var f: f64 = 0;
+        var df: f64 = 0;
+        var w: f64 = 1; // (1+r)^(−i)
+        for (self.flows, 0..) |v, i| {
+            f += v * w;
+            df -= @as(f64, @floatFromInt(i)) * v * w * u;
+            w *= u;
+        }
+        return .{ .f = f, .df = df };
+    }
+};
+
+/// Excel's documented precondition for both rate solvers: a one-signed
+/// schedule discounts to zero at no rate, and saying so costs less
+/// than 128 iterations of proving it.
+fn mixedSigns(flows: []const f64) bool {
+    var has_pos = false;
+    var has_neg = false;
+    for (flows) |v| {
+        if (v > 0) has_pos = true;
+        if (v < 0) has_neg = true;
+    }
+    return has_pos and has_neg;
+}
+
+/// The one way a solver outcome leaves this batch: roots are answers,
+/// the semantic failures are Excel's `#NUM!`, the resource failures
+/// stay refusals — `RATE`'s seam, verbatim.
+fn solvedRate(outcome: solve.Error!f64) FnError!Value {
+    const r = outcome catch |e| switch (e) {
+        error.BadDomain, error.NoConvergence => return Value.err(.num),
+        error.LimitExceeded => return error.LimitExceeded,
+        error.Cancelled => return error.Cancelled,
+    };
+    return arith(r);
+}
+
+fn fnIrr(ctx: CallCtx, args: []const Value) FnError!Value {
+    // §5.3c by hand (the collection-first shape): the fold reads
+    // before the guess slot.
+    const flows = switch (try collectNumbers(ctx, args[0..1])) {
+        .failed => |f| return .{ .scalar = f },
+        .nums => |n| n,
+    };
+    if (scalarSlotError(args, 1)) |e| return .{ .scalar = e };
+    const guess = optNum(args, 1, 0.1);
+    if (!mixedSigns(flows)) return Value.err(.num);
+    const residual: IrrResidual = .{ .flows = flows };
+    return solvedRate(solve.newton(&residual, IrrResidual.eval, guess, -1.0, ctx.work()));
+}
+
+/// XNPV/XIRR's validated schedule: flows and dates folded per §5.3c,
+/// dates truncated and domain-checked under the ACTIVE epoch, every
+/// date on or after the first. The times are 365-day years from that
+/// first date — the pair's documented day count, epoch-invariant once
+/// the serials themselves are legal.
+const Schedule = struct {
+    flows: []const f64,
+    times: []const f64,
+};
+
+const ScheduleResult = union(enum) {
+    ok: Schedule,
+    failed: value.ScalarValue,
+};
+
+fn xSchedule(ctx: CallCtx, args: []const Value, flows_at: usize) FnError!ScheduleResult {
+    const flows = switch (try collectNumbers(ctx, args[flows_at .. flows_at + 1])) {
+        .failed => |f| return .{ .failed = f },
+        .nums => |n| n,
+    };
+    const dates = switch (try collectNumbers(ctx, args[flows_at + 1 .. flows_at + 2])) {
+        .failed => |f| return .{ .failed = f },
+        .nums => |n| n,
+    };
+    // Pairing is positional AFTER each side folded, so the counts must
+    // agree — and zero pairs leave the day count nothing to anchor at.
+    // Both are Excel's #NUM!.
+    if (flows.len != dates.len or flows.len == 0) {
+        return .{ .failed = value.ScalarValue.errorOf(.num) };
+    }
+    const d0 = wholeSerial(ctx, dates[0]) orelse
+        return .{ .failed = value.ScalarValue.errorOf(.num) };
+    const times = try ctx.arena().alloc(f64, dates.len);
+    for (dates, times) |d, *t| {
+        const dd = wholeSerial(ctx, d) orelse
+            return .{ .failed = value.ScalarValue.errorOf(.num) };
+        if (dd < d0) return .{ .failed = value.ScalarValue.errorOf(.num) };
+        t.* = @as(f64, @floatFromInt(dd - d0)) / 365.0;
+    }
+    return .{ .ok = .{ .flows = flows, .times = times } };
+}
+
+fn fnXnpv(ctx: CallCtx, args: []const Value) FnError!Value {
+    const rate = numArg(args, 0);
+    const sched = switch (try xSchedule(ctx, args, 1)) {
+        .failed => |f| return .{ .scalar = f },
+        .ok => |s| s,
+    };
+    // 1 + rate ≤ 0 needs no gate: log1p answers −inf or NaN, the terms
+    // go non-finite, and N4a's #NUM! is the domain statement.
+    const lr = std.math.log1p(rate);
+    var total: f64 = 0;
+    for (sched.flows, sched.times) |v, t| {
+        total += v * @exp(-t * lr);
+    }
+    return arith(total);
+}
+
+/// XIRR's residual — XNPV at r over the validated schedule, and its
+/// derivative. The same exponential spelling as the evaluation path,
+/// so the root the solver finds is a root of the function XNPV
+/// actually computes.
+const XirrResidual = struct {
+    sched: Schedule,
+
+    fn eval(self: *const XirrResidual, r: f64) solve.Fdf {
+        const lr = std.math.log1p(r);
+        var f: f64 = 0;
+        var df: f64 = 0;
+        for (self.sched.flows, self.sched.times) |v, t| {
+            const term = v * @exp(-t * lr);
+            f += term;
+            df -= t * term / (1 + r);
+        }
+        return .{ .f = f, .df = df };
+    }
+};
+
+fn fnXirr(ctx: CallCtx, args: []const Value) FnError!Value {
+    const sched = switch (try xSchedule(ctx, args, 0)) {
+        .failed => |f| return .{ .scalar = f },
+        .ok => |s| s,
+    };
+    if (scalarSlotError(args, 2)) |e| return .{ .scalar = e };
+    const guess = optNum(args, 2, 0.1);
+    if (!mixedSigns(sched.flows)) return Value.err(.num);
+    const residual: XirrResidual = .{ .sched = sched };
+    return solvedRate(solve.newton(&residual, XirrResidual.eval, guess, -1.0, ctx.work()));
+}
+
+fn fnSln(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const cost = numArg(args, 0);
+    const salvage = numArg(args, 1);
+    const life = numArg(args, 2);
+    if (life == 0) return Value.err(.div0);
+    return arith((cost - salvage) / life);
+}
+
+fn fnSyd(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const cost = numArg(args, 0);
+    const salvage = numArg(args, 1);
+    const life = numArg(args, 2);
+    const per = numArg(args, 3);
+    if (per < 1 or per > life) return Value.err(.num);
+    // per ∈ [1, life] forces life ≥ 1, so the denominator is at least
+    // 2 — the bounds check is why SYD has no #DIV/0! plane.
+    return arith((cost - salvage) * (life - per + 1) * 2 / (life * (life + 1)));
+}
+
+fn fnDb(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const cost = numArg(args, 0);
+    const salvage = numArg(args, 1);
+    // DB's schedule is discrete — whole years around one partial first
+    // year — so its three counters truncate; DDB below stays
+    // continuous because its cap algebra never needs the calendar.
+    const life = @trunc(numArg(args, 2));
+    const per = @trunc(numArg(args, 3));
+    const month = @trunc(optNum(args, 4, 12));
+    if (month < 1 or month > 12) return Value.err(.num);
+    // A partial first year opens a trailing stub: period life+1 exists
+    // exactly when month < 12.
+    const last: f64 = if (month == 12) life else life + 1;
+    if (per < 1 or per > last) return Value.err(.num);
+    if (cost == 0) return Value.err(.div0);
+    if (life == 0) return Value.err(.div0);
+    // The rate rounded to three decimals is Excel's own text, not a
+    // choice — the rounding is why DB and DDB disagree on the same
+    // schedule.
+    const rate = @round((1 - std.math.pow(f64, salvage / cost, 1 / life)) * 1000) / 1000;
+    const first = cost * rate * month / 12;
+    if (per == 1) return arith(first);
+    const book = cost - first;
+    if (per <= life) return arith(book * rate * std.math.pow(f64, 1 - rate, per - 2));
+    return arith(book * std.math.pow(f64, 1 - rate, life - 1) * rate * (12 - month) / 12);
+}
+
+fn fnDdb(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const cost = numArg(args, 0);
+    const salvage = numArg(args, 1);
+    const life = numArg(args, 2);
+    const per = numArg(args, 3);
+    const factor = optNum(args, 4, 2);
+    if (per < 1 or per > life) return Value.err(.num);
+    const q = 1 - factor / life;
+    // The salvage floor IS the memory of every earlier period's cap:
+    // once the uncapped walk crosses salvage, the book value the real
+    // schedule carries is salvage itself, and the min/max pair below
+    // reproduces the documented per-period rule in closed form —
+    // including a first-period factor above life (the whole
+    // depreciable base at once, zero ever after).
+    const book = @max(cost * std.math.pow(f64, q, per - 1), salvage);
+    const dep = @min(book * factor / life, book - salvage);
+    return arith(@max(dep, 0));
+}
+
 // ─── tests ───────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -7258,6 +7615,96 @@ test "M9c1: the running total moves with the batch, counted from the file" {
     try testing.expectEqual(@as(usize, 147), shipped);
 }
 
+// ─── M9c2: the F4a-flows batch, against the frozen inventory ─────
+
+test "M9c2: the batch's size is regenerated from the inventory, never from prose" {
+    var it = inventory();
+    var counted: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M9c2")) continue;
+        counted += 1;
+        try testing.expectEqualStrings("F4a-flows", e.batch);
+        const f = lookup(e.name) orelse {
+            std.debug.print("M9c2 name not registered: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        };
+        try testing.expectEqualStrings(e.name, f.name);
+    }
+    // Eight, counted from the file — the frozen list the ladder calls
+    // by name: NPV, IRR, XNPV, XIRR, SLN, SYD, DB, DDB.
+    try testing.expectEqual(@as(usize, 8), counted);
+
+    // The other direction: a registered function tagged `M9c2` must be
+    // one the file lists under this batch.
+    var registered: usize = 0;
+    for (&functions) |*f| {
+        var it2 = inventory();
+        while (it2.next()) |e| {
+            if (!std.mem.eql(u8, e.name, f.name)) continue;
+            if (std.mem.eql(u8, e.milestone, "M9c2")) registered += 1;
+            break;
+        }
+    }
+    try testing.expectEqual(counted, registered);
+}
+
+fn m9c2NameIn(name: []const u8, list: []const []const u8) bool {
+    for (list) |n| {
+        if (std.mem.eql(u8, name, n)) return true;
+    }
+    return false;
+}
+
+test "M9c2: every F4a-flows row declares its flags honestly" {
+    // The batch splits where M9c1's did not. The four schedule readers
+    // take ranges, so they are NOT liftable — an aggregate slot is a
+    // collection, not a scalar to broadcast over. XNPV and XIRR read
+    // date serials under the active epoch and are the batch's only
+    // `epoch_sensitive` rows. And propagation follows M7b3's
+    // shape rule: collection-first names (IRR, XIRR — a guess slot
+    // trails the fold) take §5.3c's declaration order themselves;
+    // everything else lets the dispatcher propagate.
+    const range_takers = [_][]const u8{ "NPV", "IRR", "XNPV", "XIRR" };
+    const dated = [_][]const u8{ "XNPV", "XIRR" };
+    const collection_first = [_][]const u8{ "IRR", "XIRR" };
+    var it = inventory();
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M9c2")) continue;
+        const f = lookup(e.name).?;
+        try testing.expectEqual(Volatility.stable, f.volatility);
+        try testing.expect(!f.platform_sensitive);
+        try testing.expect(!f.cv_sensitive);
+        try testing.expect(!f.collation_sensitive);
+        try testing.expect(!f.reference_producing);
+        try testing.expect(!f.da_aware);
+        try testing.expectEqual(value.MatchPolicy.folded, f.match_policy);
+        try testing.expectEqual(!m9c2NameIn(e.name, &range_takers), f.liftable());
+        try testing.expectEqual(m9c2NameIn(e.name, &dated), f.epoch_sensitive);
+        const expected: value.PropagationClass = if (m9c2NameIn(e.name, &collection_first))
+            .per_function_provenance
+        else
+            .propagate;
+        try testing.expectEqual(expected, f.propagation);
+    }
+}
+
+test "M9c2: the running total moves with the batch, counted from the file" {
+    const rows = [_][]const u8{ "M4c", "M4d", "M4e", "M4f", "M4g", "M5a2", "M7a", "M7b2", "M7b3", "M8a", "M8b", "M8c", "M9c1", "M9c2" };
+    var shipped: usize = 0;
+    for (rows) |m| {
+        var it = inventory();
+        while (it.next()) |e| {
+            if (!std.mem.eql(u8, e.milestone, m)) continue;
+            if (lookup(e.name) == null) {
+                std.debug.print("shipped name does not resolve: {s} ({s})\n", .{ e.name, m });
+                return error.LadderTotalIncomplete;
+            }
+            shipped += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 155), shipped);
+}
+
 const m7b3_milestone = "M7b3";
 const m7b3_batch = "F2-stats";
 
@@ -7762,11 +8209,11 @@ test "registry: lookup is case-insensitive and rejects unknown names" {
     // A name the frozen inventory holds and no row has reached yet.
     // `VLOOKUP` stood here until M4e registered it, `MEDIAN` until
     // M7b3, `TEXT` until M8a, `PROPER` until M8b, `NUMBERVALUE` until
-    // M8c, `PMT` until M9c1, which is what this line is for: the
-    // example has to be a function that is genuinely still ahead of
-    // the ladder, and every batch that lands moves it.
-    try testing.expect(lookup("NPV") == null); // frozen, M9c2
-    try testing.expect(inInventory("NPV"));
+    // M8c, `PMT` until M9c1, `NPV` until M9c2, which is what this line
+    // is for: the example has to be a function that is genuinely still
+    // ahead of the ladder, and every batch that lands moves it.
+    try testing.expect(lookup("CONVERT") == null); // frozen, M9d
+    try testing.expect(inInventory("CONVERT"));
     try testing.expect(lookup("NOTAFUNCTION") == null);
 }
 
