@@ -206,16 +206,44 @@ pub const Editor = struct {
         // per the plan; documented limit).
         if (stat.size > std.math.maxInt(u32)) return error.ZipTooLarge;
         const buf = try allocator.alloc(u8, @intCast(stat.size));
+        {
+            errdefer allocator.free(buf);
+            // 0.16 reads go through the Reader interface; `readSliceAll`
+            // is the exact-length read that 0.15's `readAll` + length
+            // check expressed.
+            var read_buf: [4096]u8 = undefined;
+            var file_reader = file.reader(io, &read_buf);
+            file_reader.interface.readSliceAll(buf) catch |err| switch (err) {
+                error.EndOfStream => return error.UnexpectedEof,
+                else => return err,
+            };
+        }
+        return fromOwnedSource(allocator, io, buf, .{ .path = path });
+    }
+
+    /// Open a workbook that is already in memory (M9a2, §5.10).
+    ///
+    /// **The borrow ends when this returns** — the same contract
+    /// `Book.openBuffer` and `Workbook.openBuffer` keep: `bytes` is
+    /// duped into editor-owned storage, so the caller may free, reuse
+    /// or poison it the moment the call comes back.
+    pub fn openBuffer(allocator: Allocator, io: std.Io, bytes: []const u8) !Editor {
+        // Same v1 limit the path open enforces on stat.size: the ZIP
+        // scan below trusts u32 offsets.
+        if (bytes.len > std.math.maxInt(u32)) return error.ZipTooLarge;
+        const buf = try allocator.dupe(u8, bytes);
+        return fromOwnedSource(allocator, io, buf, .buffer);
+    }
+
+    /// Where the editor's source bytes came from — decides only how the
+    /// internal `Book` + `Workbook` views are constructed; the ZIP scan
+    /// itself reads `src_buf` either way.
+    const SourceOrigin = union(enum) { path: []const u8, buffer };
+
+    /// The shared tail of `open` / `openBuffer`. Takes ownership of
+    /// `buf` including on failure.
+    fn fromOwnedSource(allocator: Allocator, io: std.Io, buf: []u8, origin: SourceOrigin) !Editor {
         errdefer allocator.free(buf);
-        // 0.16 reads go through the Reader interface; `readSliceAll`
-        // is the exact-length read that 0.15's `readAll` + length
-        // check expressed.
-        var read_buf: [4096]u8 = undefined;
-        var file_reader = file.reader(io, &read_buf);
-        file_reader.interface.readSliceAll(buf) catch |err| switch (err) {
-            error.EndOfStream => return error.UnexpectedEof,
-            else => return err,
-        };
 
         // Scan the source ZIP and capture verbatim spans.
         //
@@ -373,7 +401,10 @@ pub const Editor = struct {
             w.deinit();
         };
         {
-            var b = try Book.open(allocator, io, path);
+            var b = switch (origin) {
+                .path => |src_path| try Book.open(allocator, io, src_path),
+                .buffer => try Book.openBuffer(allocator, io, buf),
+            };
             defer b.deinit();
             const out_paths = try allocator.alloc([]const u8, b.sheets.len);
             errdefer {
@@ -388,8 +419,19 @@ pub const Editor = struct {
             // Workbook.fromBook re-opens the file and sanity-checks
             // sheet_count == book.sheets.len (errors SheetCountMismatch
             // on disagreement). v1 contract — future iters may share
-            // bytes via PartStore-from-bytes.
-            workbook_built = try Workbook.fromBook(allocator, io, &b, path);
+            // bytes via PartStore-from-bytes. The buffer arm keeps the
+            // same sanity check against its second parse of `buf`.
+            workbook_built = switch (origin) {
+                .path => |src_path| try Workbook.fromBook(allocator, io, &b, src_path),
+                .buffer => blk: {
+                    var wb = try Workbook.openBuffer(allocator, io, buf);
+                    if (wb.sheetCount() != b.sheets.len) {
+                        wb.deinit();
+                        return error.SheetCountMismatch;
+                    }
+                    break :blk wb;
+                },
+            };
         }
 
         return .{
@@ -480,6 +522,21 @@ pub const Editor = struct {
             return;
         }
         try self.workbook.save(io, out_path);
+    }
+
+    /// `save` into caller-owned memory (M9a2, §5.10). The same two
+    /// paths: an untouched editor hands back a dupe of the source bytes
+    /// (byte-identical, SHA256-preserving, like the passthrough save);
+    /// a mutated one routes through `Workbook.saveToOwnedBuffer`. The
+    /// returned bytes are the caller's, freed with `allocator`.
+    pub fn saveToOwnedBuffer(self: *Editor, allocator: Allocator) ![]u8 {
+        if (!self.workbookHasAnyDeltas() and
+            !self.workbookHasAnyAppendedRows() and
+            !self.workbook.store.hasUnsavedChanges())
+        {
+            return allocator.dupe(u8, self.src_buf);
+        }
+        return self.workbook.saveToOwnedBuffer(allocator);
     }
 
     pub fn scanWorksheet(self: *Editor, sheet_idx: u32) !WorksheetSpans {
@@ -1264,6 +1321,74 @@ test "Editor: byte-identical passthrough (iter-lms-1)" {
     defer book.deinit();
     try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
     try std.testing.expectEqualStrings("Data", book.sheets[0].name);
+}
+
+test "Editor: openBuffer + saveToOwnedBuffer round-trip (M9a2)" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(a, io, "editor_buf_src.xlsx");
+    defer a.free(src_path);
+
+    {
+        var w = xlsx.Writer.init(a);
+        defer w.deinit();
+        var s = try w.addSheet("Data");
+        try s.writeRow(&.{ .{ .string = "header" }, .{ .integer = 42 } });
+        try w.save(io, src_path);
+    }
+
+    const src_bytes = blk: {
+        const f = try std.Io.Dir.cwd().openFile(io, src_path, .{});
+        defer f.close(io);
+        const buf = try a.alloc(u8, @intCast((try f.stat(io)).size));
+        errdefer a.free(buf);
+        var fr = f.reader(io, &.{});
+        try fr.interface.readSliceAll(buf);
+        break :blk buf;
+    };
+    defer a.free(src_bytes);
+
+    var ed = blk: {
+        // The borrow ends at the call: open from a copy poisoned
+        // immediately after, so a retained pointer would be caught.
+        const borrowed = try a.dupe(u8, src_bytes);
+        defer a.free(borrowed);
+        var e = try Editor.openBuffer(a, io, borrowed);
+        errdefer e.deinit();
+        @memset(borrowed, 0xAA);
+        break :blk e;
+    };
+    defer ed.deinit();
+
+    // Untouched editor: the buffer save is the passthrough arm,
+    // byte-for-byte like the passthrough file save.
+    const passthrough = try ed.saveToOwnedBuffer(a);
+    defer a.free(passthrough);
+    try std.testing.expectEqualSlices(u8, src_bytes, passthrough);
+
+    // Mutated editor: the buffer carries the mutation and still opens.
+    try ed.setCell(0, 1, 1, .{ .integer = 7 }); // B1: 42 -> 7
+    const mutated = try ed.saveToOwnedBuffer(a);
+    defer a.free(mutated);
+    try std.testing.expect(!std.mem.eql(u8, src_bytes, mutated));
+    {
+        var book = try Book.openBuffer(a, io, mutated);
+        defer book.deinit();
+        try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
+    }
+
+    // A path save after the buffer save writes the same bytes: the
+    // buffer emitter and the file emitter share one archive stream.
+    const dst_path = try tt.path(a, io, "editor_buf_dst.xlsx");
+    defer a.free(dst_path);
+    try ed.save(io, dst_path);
+    const dst_bytes = try std.Io.Dir.cwd().readFileAlloc(io, dst_path, a, .limited(1 << 22));
+    defer a.free(dst_bytes);
+    try std.testing.expectEqualSlices(u8, mutated, dst_bytes);
 }
 
 test "Editor: raw-ZIP scanner builds entry table (iter-lms-1b)" {

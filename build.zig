@@ -1912,6 +1912,11 @@ pub fn build(b: *std.Build) void {
     // the iter-wb-3 module-graph collision no longer fires).
     c_abi_mod.addImport("zlsx", zlsx_mod);
     c_abi_mod.addImport("zlsx_pkg", package_mod);
+    // M9a2: `zlsx_writer_save_with_recalc` is `zlsx_recalc`'s
+    // writerSaveWithRecalc across the boundary — the one shipped
+    // composition, not a re-inlining of it. Acyclic: zlsx_recalc
+    // imports zlsx + zlsx_pkg, never c_abi.
+    c_abi_mod.addImport("zlsx_recalc", recalc_mod);
     const dylib = b.addLibrary(.{
         .name = "zlsx",
         .linkage = .dynamic,

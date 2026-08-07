@@ -1234,7 +1234,16 @@ pub const Workbook = struct {
             else => |other| return other,
         };
         switch (result) {
-            .refused => |r| return r.toWorkbookError(),
+            .refused => |r| {
+                // The refusal may own a census since M9a2; this path's
+                // synthetic entry is mark-eligible so in practice it
+                // arrives empty, but freeing is the contract, not a
+                // guess about which arm produced it.
+                var refusal = r;
+                const e = refusal.toWorkbookError();
+                refusal.deinit(self.allocator);
+                return e;
+            },
             .ok => |*candidate| {
                 candidate.swap(self);
                 var report = candidate.takeReport();
@@ -3407,6 +3416,25 @@ pub const Workbook = struct {
     /// iter-wb-4 m1 limits: numeric / boolean / blank values only.
     /// m2: strings + formulas. m4: shared-string mode (`<c t="s">`).
     pub fn save(self: *Workbook, io: std.Io, path: []const u8) Error!void {
+        try self.applySavePlans();
+        try self.store.save(io, path);
+    }
+
+    /// `save` into caller-owned memory (M9a2, §5.10). The same staged
+    /// state the file save writes — deltas, appends, SST extension,
+    /// defined names — lands in the store's override map first, so a
+    /// later `save` to a path writes byte-identical content. The
+    /// returned bytes are the caller's, freed with `allocator`.
+    pub fn saveToOwnedBuffer(self: *Workbook, allocator: Allocator) Error![]u8 {
+        try self.applySavePlans();
+        return self.store.saveToOwnedBuffer(allocator, .none);
+    }
+
+    /// Everything `save` does before bytes leave the process: apply the
+    /// workbook.xml plan, extend the SST, emit per-sheet XML for staged
+    /// deltas / appended rows into `store.replacePart`, and invalidate
+    /// the typed views those bytes made stale.
+    fn applySavePlans(self: *Workbook) Error!void {
         // Phase 0 (B3 iter-wr-3): apply the workbook.xml fresh-emit
         // plan. Today the only axis is staged defined names — splice
         // them into `xl/workbook.xml` BEFORE the SST + per-sheet
@@ -3487,7 +3515,6 @@ pub const Workbook = struct {
                 self.sst_view = null;
             }
         }
-        try self.store.save(io, path);
     }
 
     /// B3 iter-wr-7: emit a fresh `.xlsx` archive from the workbook's

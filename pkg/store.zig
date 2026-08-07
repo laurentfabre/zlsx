@@ -1048,12 +1048,57 @@ pub const PartStore = struct {
         poller: Poller,
         hook: CommitHook,
     ) !Commit {
-        // Preflight ZIP32 limits BEFORE opening the output file. Every
-        // offset / size field on the wire is u32 (offsets, CD size,
-        // payload sizes) or u16 (name length, comment length, entry
-        // count). Compute the projected total saved size and reject
-        // upfront so we never leave a partial archive in the atomic-
-        // file's tmp slot.
+        try self.checkArchiveBounds();
+
+        // Ahead of creating the temp file: a save that is already
+        // cancelled should not leave the destination's directory holding
+        // even a zero-length `.ztmp-N` for the instant before `deinit`
+        // removes it.
+        try poller.check();
+
+        var write_buf: [4096]u8 = undefined;
+        var atomic_file = try AtomicFile.init(io, path, &write_buf);
+        defer atomic_file.deinit();
+
+        try self.emitArchive(&atomic_file.file_writer.interface, poller);
+
+        // §5.7.9's final poll. Everything after it — the `File.sync`, the
+        // rename, the directory fsync — is the non-cancellable commit
+        // region, so this is the last instant at which a cancelled save
+        // is still a save that changed nothing.
+        try poller.check();
+        try atomic_file.finish();
+        // The commit point has passed. §5.7.9's swap goes here — between
+        // the rename and the directory fsync — so that no observer can
+        // find the file published and the memory stale.
+        hook.fire();
+        return atomic_file.syncDir();
+    }
+
+    /// `saveCommitted`'s archive, emitted into caller-owned memory
+    /// instead of a temp file (M9a2, §5.10's producer for a
+    /// store-backed workbook). No file is opened and no commit point
+    /// exists, so §5.7.9's vocabulary does not apply: a cancelled emit
+    /// frees the partial buffer and leaves both the store and the
+    /// caller's view of it untouched. The returned bytes are the
+    /// caller's, freed with `allocator`.
+    pub fn saveToOwnedBuffer(self: *PartStore, allocator: std.mem.Allocator, poller: Poller) ![]u8 {
+        try self.checkArchiveBounds();
+        try poller.check();
+        var sink: std.Io.Writer.Allocating = .init(allocator);
+        defer sink.deinit();
+        try self.emitArchive(&sink.writer, poller);
+        return sink.toOwnedSlice();
+    }
+
+    /// Preflight ZIP32 limits BEFORE any byte is produced. Every
+    /// offset / size field on the wire is u32 (offsets, CD size,
+    /// payload sizes) or u16 (name length, comment length, entry
+    /// count). Compute the projected total saved size and reject
+    /// upfront so the file emitter never leaves a partial archive in
+    /// the atomic-file's tmp slot and the buffer emitter never grows
+    /// an allocation it would have to throw away.
+    fn checkArchiveBounds(self: *const PartStore) !void {
         if (self.entries.len > std.math.maxInt(u16)) return Error.ZipArchiveTooLarge;
         if (self.eocd_comment.len > std.math.maxInt(u16)) return Error.ZipArchiveTooLarge;
         // Compute the serialized ZIP32 fields up front (cd_offset and
@@ -1090,18 +1135,13 @@ pub const PartStore = struct {
         const total_projected = lfh_phase_total + cdfh_phase_total +
             @as(u64, eocd_min_size) + @as(u64, self.eocd_comment.len);
         if (total_projected > std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
+    }
 
-        // Ahead of creating the temp file: a save that is already
-        // cancelled should not leave the destination's directory holding
-        // even a zero-length `.ztmp-N` for the instant before `deinit`
-        // removes it.
-        try poller.check();
-
-        var write_buf: [4096]u8 = undefined;
-        var atomic_file = try AtomicFile.init(io, path, &write_buf);
-        defer atomic_file.deinit();
-        const w = &atomic_file.file_writer.interface;
-
+    /// The archive byte stream itself, shared by `saveCommitted` (into
+    /// the atomic temp file) and `saveToOwnedBuffer` (into memory).
+    /// Callers run `checkArchiveBounds` first; this ends with a flush so
+    /// both sinks hold the complete archive when it returns.
+    fn emitArchive(self: *PartStore, w: *std.Io.Writer, poller: Poller) !void {
         var written: u64 = 0;
         const new_lfh_offsets = try self.allocator.alloc(u32, self.entries.len);
         defer self.allocator.free(new_lfh_offsets);
@@ -1226,17 +1266,6 @@ pub const PartStore = struct {
         try w.writeAll(self.eocd_comment);
 
         try w.flush();
-        // §5.7.9's final poll. Everything after it — the `File.sync`, the
-        // rename, the directory fsync — is the non-cancellable commit
-        // region, so this is the last instant at which a cancelled save
-        // is still a save that changed nothing.
-        try poller.check();
-        try atomic_file.finish();
-        // The commit point has passed. §5.7.9's swap goes here — between
-        // the rename and the directory fsync — so that no observer can
-        // find the file published and the memory stale.
-        hook.fire();
-        return atomic_file.syncDir();
     }
 
     fn findIndex(self: *const PartStore, name: []const u8) ?usize {

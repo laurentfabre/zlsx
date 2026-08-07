@@ -122,6 +122,90 @@ The `Style` dataclass covers every openpyxl-parity style field shipped in Phase 
 
 `BorderSide.style` accepts 14 OOXML border style names: `"none"`, `"thin"`, `"medium"`, `"dashed"`, `"dotted"`, `"thick"`, `"double"`, `"hair"`, `"mediumDashed"`, `"dashDot"`, `"mediumDashDot"`, `"dashDotDot"`, `"mediumDashDotDot"`, `"slantDashDot"`.
 
+## Recalculate & evaluate
+
+libzlsx 0.9.0+ ships the formula engine across the C ABI. The binding
+feature-probes every symbol group, so py-zlsx keeps importing against an
+older dylib — the methods below then raise `RuntimeError`.
+
+```python
+import zlsx
+
+ed = zlsx.Editor("model.xlsx")
+
+# In-memory transaction: every formula cell recomputed, then swapped in
+# as the final operation. On ANY failure the workbook is exactly as it was.
+report = ed.recalculate()                       # RecalcReport
+print(report.cells_written, report.resolved.now, report.resolved.seed)
+
+# Atomic file transaction (§5.7.9): recalc, write, rename, THEN swap.
+# A pre-commit failure leaves the destination's prior bytes (or its
+# absence) and this editor's memory untouched.
+report = ed.save_with_recalc("model_out.xlsx", timeout=30.0)
+
+# Standalone cache-based evaluation — never mutates anything.
+r = ed.evaluate("=SUM(A1:B9)")                  # EvalResult
+r.value                                          # float | str | bool | ExcelError | Matrix
+r.resolved                                       # the exact resolved context — replay it
+                                                 # to reproduce a defaulted evaluation
+
+# Whole-editor state to memory, and back.
+blob = ed.save_to_buffer()                       # bytes
+ed2 = zlsx.Editor.from_bytes(blob)               # copies; the borrow ends at the call
+
+# Keep every cache, set fullCalcOnLoad="1" for the next consumer.
+ed.mark_recalc_on_load()
+```
+
+Writer-side, `save(recalculate=...)` routes the save through the recalc
+orchestrator, so every cached formula value in the destination is one the
+engine computed:
+
+```python
+w = zlsx.Writer("fresh.xlsx")
+s = w.add_sheet("Calc")
+s.write_row_with_formulas([1, 0], [None, "A1+2"])
+report = w.save(recalculate=zlsx.RecalcOptions())   # B1's <v> is now 3
+```
+
+**Context.** `now` (epoch ms or `datetime`) and `seed` default to the
+clock / OS entropy *in the binding* — the library itself never reads
+either, which is what makes "equal inputs ⇒ equal output" true. The
+resolved context is echoed on every report and `EvalResult`, so a
+defaulted run is reproducible by replaying `.resolved`. `mode` is
+`"excel"` (default) or `"ieee"`; `on_unsupported` is `"refuse"`
+(default) or `"keep_stale_and_mark"`.
+
+**Results.** Blank never escapes — it publishes as `0.0` (§12.2). An
+Excel error value (`#DIV/0!`) is a *successful result*: it arrives as
+`ExcelError` (a `str` subclass), never as an exception. Rectangular
+results arrive as `Matrix(rows, cols, cells)`.
+
+**Refusals.** A construct the engine does not implement raises
+`ZlsxFormulaRefusal` (a `ZlsxError` subclass) with `.error_name` (e.g.
+`"FormulaUnsupportedFunction"`), `.cells` — the refusing cells as
+`(sheet, row, col)`, row 1-based / col 0-based — and `.census` (full
+`CensusEntry` records). Nothing is mutated on a refusal.
+
+**Cancellation.** Cancellable calls run the FFI on a worker thread, so
+Ctrl-C reaches the engine as a token trigger instead of a blocked signal
+handler. `timeout=` (seconds) raises `TimeoutError` **only when the
+cancellation is observed before the commit point**; a cancellation that
+lands after the rename returns normally with
+`report.cancelled_late=True` — the transaction completed, and saying
+otherwise would be a lie about the filesystem.
+
+**CSE rectangles.** `write_row_with_formulas` accepts
+`FormulaSpec.cse(text, ref)` on the rectangle's top-left cell only; the
+range's other cells arrive as plain value slots in later rows (empty
+members become bare `<c>` placeholders), and the save refuses while any
+rectangle is missing members. `dialect="dynamic_array"` is reserved and
+currently refused.
+
+`zlsx.engine_fingerprint()` returns the engine identity string (semver,
+rule versions, target triple, build hash). Two processes may share
+recalc results only when their fingerprints match.
+
 ## Spark (PySpark Data Source)
 
 Spark 4.0+ / DBR 15.4+ (including serverless). `pip install py-zlsx[spark]`
@@ -244,7 +328,8 @@ with zlsx.write("out.xlsx") as w:
 - Append-only load-modify-save via `zlsx.edit(path)` — append rows
   to existing sheets (numeric / int / float / bool / str cells)
   with atomic save
-- Formula cells on write (`write_row_with_formulas`) — emits `<f>` + cached `<v>`; Excel recalculates on open
+- Formula cells on write (`write_row_with_formulas`) — emits `<f>` + cached `<v>`; pass `recalculate=RecalcOptions()` to `save()` and the cached values are computed by zlsx's own engine, or leave it off and Excel recalculates on open. `FormulaSpec.cse(text, ref)` authors legacy CSE rectangles
+- Formula engine (0.9.0+): `Editor.recalculate` / `save_with_recalc` (atomic §5.7.9 transaction) / `evaluate` / `save_to_buffer` / `Editor.from_bytes` / `mark_recalc_on_load` — see *Recalculate & evaluate*
 - Data validation (list / numeric / custom) and conditional formatting (cellIs / expression / colorScale / dataBar)
 - Refcounted handles — close the book while rows are still being consumed, the C ABI keeps the state alive until the last reference drops
 - PySpark Data Source (`zlsx.spark`) — batch read with per-(file×sheet) partitions and optional row-range splits, batch write to single-file or `part-*.xlsx` targets
@@ -252,13 +337,15 @@ with zlsx.write("out.xlsx") as w:
 **Out** (by design, or queued)
 
 - `.xls` / `.xlsb` / `.ods` — never
-- Formula evaluation — never (the reader returns the cached `<v>` value Excel stored; zlsx never runs a formula engine)
+- Formula evaluation on the *read* path — the reader still returns the cached `<v>` value byte-for-byte and never computes. Since 0.9.0 the engine lives behind the explicit `recalculate` / `evaluate` / `save_with_recalc` surface (see *Recalculate & evaluate*); a plain read remains exactly what Excel stored
 - Cell mutate / structural edits (insert column, delete row, etc.) on existing workbooks — append-only is shipped via `zlsx.edit(path)`; full round-trip is its own follow-up plan
 - Pictures / charts / pivots — out of scope
 
 ## Thread safety
 
 Distinct `Book` and `Writer` handles are fully independent — call them freely from any threads. Operations on the same handle must be externally synchronized, same as sqlite3 or libcurl. The C ABI's refcount lets a row iterator outlive its Book handle safely; all other cross-thread sharing is the caller's responsibility.
+
+Cancellable formula-engine calls (`recalculate`, `save_with_recalc`, `evaluate`, `Writer.save(recalculate=...)`) run their FFI call on a private worker thread while the calling thread waits interruptibly; the handle-synchronization rule above still applies — the worker is an implementation detail, not a license to share the handle.
 
 ## Lifetime gotchas
 

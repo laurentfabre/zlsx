@@ -2204,3 +2204,351 @@ def test_editor_strip_doc_props_is_a_noop_without_metadata(tmp_path):
     after = zlsx.Editor(dst).doc_props()
     assert after["creator"] is None
     assert after["has_custom_properties"] is False
+
+
+# ─── Formula engine (M9a2) ────────────────────────────────────────────
+
+
+def _write_formula_fixture(path, formula="A1+2", cached=0.0):
+    """A1 = 1 (plain), B1 = formula with a stale cached value — one
+    cell for the engine to rewrite."""
+    with zlsx.write(path) as w:
+        s = w.add_sheet("Sheet1")
+        s.write_row_with_formulas([1, cached], [None, formula])
+
+
+def _skip_unless_recalc():
+    import zlsx._ffi as ffi
+
+    if not (ffi._HAS_RECALC and ffi._HAS_EVAL and ffi._HAS_CANCEL):
+        pytest.skip("loaded libzlsx predates the formula engine ABI (0.9.0+)")
+    return ffi
+
+
+def test_editor_recalculate_rewrites_stale_cache(tmp_path):
+    _skip_unless_recalc()
+    src = tmp_path / "recalc_src.xlsx"
+    _write_formula_fixture(src)
+
+    ed = zlsx.Editor(src)
+    report = ed.recalculate(now=1_700_000_000_000, seed=42)
+    assert report.cells_written >= 1
+    assert report.kept_stale is False
+    assert report.cancelled_late is False
+    assert report.durability_warning is False
+    assert report.resolved is not None
+    assert report.resolved.now == 1_700_000_000_000
+    assert report.resolved.seed == 42
+    # A recalc derives dialect per stored cell; the echo says so.
+    assert report.resolved.dialect is None
+
+    got = ed.evaluate("=B1", now=1_700_000_000_000, seed=1)
+    assert got.value == 3.0
+    ed.close()
+
+
+def test_editor_evaluate_value_shapes(tmp_path):
+    _skip_unless_recalc()
+    src = tmp_path / "eval_src.xlsx"
+    _write_formula_fixture(src)
+
+    ed = zlsx.Editor(src)
+    ctx = dict(now=1_700_000_000_000, seed=7)
+
+    # Scalar float.
+    assert ed.evaluate("=A1+2", **ctx).value == 3.0
+    # Text.
+    assert ed.evaluate('="a"&"b"', **ctx).value == "ab"
+    # Bool.
+    assert ed.evaluate("=1<2", **ctx).value is True
+    # An Excel error VALUE is a successful result, not an exception.
+    err = ed.evaluate("=1/0", **ctx).value
+    assert isinstance(err, zlsx.ExcelError)
+    assert err == "#DIV/0!"
+    # Matrix, row-major, blanks publish as 0.
+    m = ed.evaluate("={1,2;3,4}", **ctx).value
+    assert isinstance(m, zlsx.Matrix)
+    assert (m.rows, m.cols) == (2, 2)
+    assert m.cells == [[1.0, 2.0], [3.0, 4.0]]
+    assert ed.evaluate("=D7", **ctx).value == 0.0
+
+    # Typed refusal raises ZlsxFormulaRefusal (a ZlsxError subclass).
+    with pytest.raises(zlsx.ZlsxFormulaRefusal) as exc_info:
+        ed.evaluate("=1+", **ctx)
+    assert exc_info.value.error_name == "FormulaMalformedInput"
+    ed.close()
+
+
+def test_editor_evaluate_resolved_echo_replays(tmp_path):
+    _skip_unless_recalc()
+    src = tmp_path / "echo_src.xlsx"
+    _write_formula_fixture(src)
+
+    import time
+
+    ed = zlsx.Editor(src)
+    # Two defaulted evaluations resolve different contexts (the binding
+    # reads the clock; the library never does).
+    first = ed.evaluate("=NOW()")
+    time.sleep(0.002)
+    second = ed.evaluate("=NOW()")
+    assert first.resolved.now != second.resolved.now
+    assert first.value != second.value
+
+    # Replaying either resolved context reproduces its result exactly.
+    r = first.resolved
+    replay = ed.evaluate(
+        "=NOW()",
+        now=r.now,
+        utc_offset_min=r.utc_offset_min,
+        seed=r.seed,
+        mode=r.mode,
+        profile=r.profile,
+    )
+    assert replay.value == first.value
+    ed.close()
+
+
+def test_editor_save_with_recalc_atomic(tmp_path):
+    ffi = _skip_unless_recalc()
+    if not ffi._HAS_SAVE_WITH_RECALC:
+        pytest.skip("loaded libzlsx predates save_with_recalc (0.9.0+)")
+    src = tmp_path / "swr_src.xlsx"
+    dst = tmp_path / "swr_dst.xlsx"
+    _write_formula_fixture(src)
+
+    ed = zlsx.Editor(src)
+    report = ed.save_with_recalc(dst, now=1_700_000_000_000, seed=42)
+    assert report.cells_written >= 1
+    assert report.durability_warning is False
+    assert report.cancelled_late is False
+    ed.close()
+
+    # The destination holds the recalced cache; the source is untouched.
+    _header, rows = zlsx.read(dst)
+    assert rows[0][1] == 3.0
+    _header, rows = zlsx.read(src)
+    assert rows[0][1] == 0.0
+
+
+def test_editor_save_to_buffer_and_from_bytes(tmp_path):
+    ffi = _skip_unless_recalc()
+    if not ffi._HAS_SAVE_BUFFER:
+        pytest.skip("loaded libzlsx predates the editor buffer ABI (0.9.0+)")
+    src = tmp_path / "buf_src.xlsx"
+    _write_formula_fixture(src)
+    src_bytes = src.read_bytes()
+
+    # from_bytes copies: mutate the source object after, nothing breaks.
+    blob = bytearray(src_bytes)
+    ed = zlsx.Editor.from_bytes(bytes(blob))
+    for i in range(len(blob)):
+        blob[i] = 0xAA
+
+    # An untouched editor round-trips the source bytes verbatim.
+    assert ed.save_to_buffer() == src_bytes
+
+    # A mutated one carries the mutation, and the buffer reopens.
+    ed.set_cell(0, 1, 0, 7)
+    out = ed.save_to_buffer()
+    assert out != src_bytes
+    ed2 = zlsx.Editor.from_bytes(out)
+    got = ed2.evaluate("=A1", now=1, seed=1)
+    assert got.value == 7.0
+    ed2.close()
+    ed.close()
+
+
+def test_editor_recalc_refusal_carries_census(tmp_path):
+    _skip_unless_recalc()
+    src = tmp_path / "refusal_src.xlsx"
+    _write_formula_fixture(src, formula="NOSUCHFN(A1)", cached=999.0)
+
+    ed = zlsx.Editor(src)
+    with pytest.raises(zlsx.ZlsxFormulaRefusal) as exc_info:
+        ed.recalculate(now=1_700_000_000_000, seed=1)
+    refusal = exc_info.value
+    assert refusal.error_name == "FormulaUnsupportedFunction"
+    # The refusing cell survives to Python: sheet 0, row 1 (1-based),
+    # col 1 (0-based) — the M9a2 seam through recalc_run.prepare.
+    assert refusal.cells == [(0, 1, 1)]
+    assert len(refusal.census) == 1
+    assert refusal.census[0].plane == "FormulaUnsupportedFunction"
+
+    # And the workbook is untouched: the stale cache still reads back.
+    assert ed.evaluate("=B1", now=1, seed=1).value == 999.0
+    ed.close()
+
+
+def test_editor_recalc_keep_stale_and_mark(tmp_path):
+    _skip_unless_recalc()
+    src = tmp_path / "mark_src.xlsx"
+    dst = tmp_path / "mark_dst.xlsx"
+    _write_formula_fixture(src, formula="NOSUCHFN(A1)", cached=999.0)
+
+    ed = zlsx.Editor(src)
+    report = ed.recalculate(
+        now=1_700_000_000_000, seed=1, on_unsupported="keep_stale_and_mark"
+    )
+    assert report.kept_stale is True
+    assert len(report.census) == 1
+    assert report.census[0].plane == "FormulaUnsupportedFunction"
+    ed.save(dst)
+    ed.close()
+
+    import zipfile
+
+    with zipfile.ZipFile(dst) as z:
+        wb_xml = z.read("xl/workbook.xml").decode("utf-8")
+    assert 'fullCalcOnLoad="1"' in wb_xml
+
+
+def test_editor_mark_recalc_on_load(tmp_path):
+    ffi = _skip_unless_recalc()
+    if not ffi._HAS_MARK_RECALC:
+        pytest.skip("loaded libzlsx predates mark_recalc_on_load (0.9.0+)")
+    src = tmp_path / "mrol_src.xlsx"
+    dst = tmp_path / "mrol_dst.xlsx"
+    _write_formula_fixture(src)
+
+    ed = zlsx.Editor(src)
+    ed.mark_recalc_on_load()
+    ed.save(dst)
+    ed.close()
+
+    import zipfile
+
+    with zipfile.ZipFile(dst) as z:
+        wb_xml = z.read("xl/workbook.xml").decode("utf-8")
+    assert 'fullCalcOnLoad="1"' in wb_xml
+
+
+def test_editor_recalc_timeout_pre_commit(tmp_path):
+    ffi = _skip_unless_recalc()
+    if not ffi._HAS_SAVE_WITH_RECALC:
+        pytest.skip("loaded libzlsx predates save_with_recalc (0.9.0+)")
+    src = tmp_path / "timeout_src.xlsx"
+    dst = tmp_path / "timeout_dst.xlsx"
+    # Enough formula cells that a 1 ms deadline reliably trips one of
+    # the engine's §5.5 poll points before the commit.
+    with zlsx.write(src) as w:
+        s = w.add_sheet("Big")
+        s.write_row([1, 1])
+        for i in range(2, 20_002):
+            s.write_row_with_formulas([None, 0], [None, f"B{i - 1}+A$1"])
+
+    ed = zlsx.Editor(src)
+    with pytest.raises(TimeoutError):
+        ed.save_with_recalc(dst, now=1_700_000_000_000, seed=1, timeout=0.001)
+    # Pre-commit by contract: the destination never appeared and the
+    # memory is untouched (the stale cache still reads back).
+    assert not dst.exists()
+    assert ed.evaluate("=B3", now=1, seed=1).value == 0.0
+
+    # And with room to finish, the same transaction commits.
+    report = ed.save_with_recalc(dst, now=1_700_000_000_000, seed=1, timeout=120.0)
+    assert report.cells_written >= 20_000
+    assert dst.exists()
+    ed.close()
+
+
+def test_writer_save_recalculate_option(tmp_path):
+    ffi = _skip_unless_recalc()
+    if not ffi._HAS_WRITER_RECALC:
+        pytest.skip("loaded libzlsx predates writer save-with-recalc (0.9.0+)")
+    dst = tmp_path / "writer_recalc.xlsx"
+
+    w = zlsx.Writer(dst)
+    s = w.add_sheet("Sheet1")
+    s.write_row_with_formulas([1, 0], [None, "A1+2"])
+    report = w.save(recalculate=zlsx.RecalcOptions(now=1_700_000_000_000, seed=5))
+    assert report is not None
+    assert report.cells_written >= 1
+    # The writer is not consumed: a plain save still works after.
+    w.save(tmp_path / "writer_plain.xlsx")
+    w.close()
+
+    _header, rows = zlsx.read(dst)
+    assert rows[0][1] == 3.0
+
+
+def test_write_row_with_formulas_v2_cse_rectangle(tmp_path):
+    ffi = _skip_unless_recalc()
+    if not ffi._HAS_FORMULAS_V2:
+        pytest.skip("loaded libzlsx predates the formulas_v2 ABI (0.9.0+)")
+    dst = tmp_path / "cse.xlsx"
+
+    w = zlsx.Writer(dst)
+    s = w.add_sheet("Sheet1")
+    # A1 anchors A1:B2; B1/A2/B2 are members (A2 stays empty — the
+    # writer emits its placeholder).
+    s.write_row_with_formulas(
+        [1, 2], [zlsx.FormulaSpec.cse("TRANSPOSE(D1:E2)", "A1:B2"), None]
+    )
+    s.write_row_with_formulas([None, 4], [None, None])
+    w.save()
+    w.close()
+
+    import zipfile
+
+    with zipfile.ZipFile(dst) as z:
+        sheet_xml = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+    assert '<f t="array" ref="A1:B2">TRANSPOSE(D1:E2)</f>' in sheet_xml
+    assert '<c r="A2"/>' in sheet_xml
+
+    # The state machine refuses across the boundary: a mismatched
+    # anchor is an error, and an incomplete rectangle refuses the save.
+    w2 = zlsx.Writer(tmp_path / "cse_bad.xlsx")
+    s2 = w2.add_sheet("Sheet1")
+    with pytest.raises(zlsx.ZlsxError):
+        s2.write_row_with_formulas(
+            [1, 2], [zlsx.FormulaSpec.cse("1+1", "B1:B2"), None]
+        )
+    s2.write_row_with_formulas(
+        [1, 2], [zlsx.FormulaSpec.cse("1+1", "A1:A3"), None]
+    )
+    with pytest.raises(zlsx.ZlsxError):
+        w2.save()
+    w2.close()
+
+    # FormulaSpec validates locally: cse needs a ref, others refuse one.
+    with pytest.raises(ValueError):
+        zlsx.FormulaSpec("1+1", "cse")
+    with pytest.raises(ValueError):
+        zlsx.FormulaSpec("1+1", "scalar", ref="A1:B2")
+    with pytest.raises(ValueError):
+        zlsx.FormulaSpec("1+1", "nonsense")
+
+
+def test_write_row_with_formulas_dialect_kwarg(tmp_path):
+    ffi = _skip_unless_recalc()
+    if not ffi._HAS_FORMULAS_V2:
+        pytest.skip("loaded libzlsx predates the formulas_v2 ABI (0.9.0+)")
+    dst = tmp_path / "dialect_kwarg.xlsx"
+
+    w = zlsx.Writer(dst)
+    s = w.add_sheet("Sheet1")
+    # Row-wide scalar dialect is sugar over the same v2 path.
+    s.write_row_with_formulas([1, 3], [None, "A1+2"], dialect="scalar")
+    # Row-wide 'cse' is per-cell only.
+    with pytest.raises(ValueError):
+        s.write_row_with_formulas([1], ["A1"], dialect="cse")
+    # dynamic_array is parked: the writer refuses it (§5.8b).
+    with pytest.raises(zlsx.ZlsxError):
+        s.write_row_with_formulas([1], ["A1#"], dialect="dynamic_array")
+    w.save()
+    w.close()
+
+    b = zlsx.open(dst)
+    assert list(b.sheet(0).rows())[0][1] == 3.0
+    b.close()
+
+
+def test_engine_fingerprint_names_identity():
+    ffi = _skip_unless_recalc()
+    if not ffi._HAS_FINGERPRINT:
+        pytest.skip("loaded libzlsx predates the fingerprint ABI (0.9.0+)")
+    fp = zlsx.engine_fingerprint()
+    assert fp.startswith("zlsx ")
+    for component in ("excel_fp_rules_v1", "rng_v1", "collation_v1"):
+        assert component in fp
