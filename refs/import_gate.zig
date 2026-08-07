@@ -116,9 +116,29 @@ pub fn main(init: std.process.Init) !u8 {
 
 fn allowedFor(path: []const u8) ?[]const u8 {
     for (allowlist) |entry| {
-        if (std.mem.endsWith(u8, path, entry.suffix)) return entry.why;
+        if (endsWithPath(path, entry.suffix)) return entry.why;
     }
     return null;
+}
+
+/// Windows hands the gate `D:\...\src\writer.zig`; the allowlist speaks
+/// `/`. Compare the tail byte-wise with either separator accepted, so
+/// the same allowlist holds on every host.
+fn endsWithPath(path: []const u8, suffix: []const u8) bool {
+    if (suffix.len > path.len) return false;
+    const tail = path[path.len - suffix.len ..];
+    for (tail, suffix) |p, s| {
+        const pc: u8 = if (p == '\\') '/' else p;
+        if (pc != s) return false;
+    }
+    return true;
+}
+
+test "allowlist matches across path separators" {
+    try std.testing.expect(endsWithPath("D:\\a\\zlsx\\zlsx\\src\\writer.zig", "src/writer.zig"));
+    try std.testing.expect(endsWithPath("/home/ci/zlsx/src/writer.zig", "src/writer.zig"));
+    try std.testing.expect(!endsWithPath("src/writer.zig.bak", "src/writer.zig"));
+    try std.testing.expect(!endsWithPath("writer.zig", "src/writer.zig"));
 }
 
 /// How many lines either side of the base-26 arithmetic to search for
