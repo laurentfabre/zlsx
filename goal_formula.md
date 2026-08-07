@@ -2735,7 +2735,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M9a2** ✅ | C ABI part 2 (`feat/m9a2-cabi2`): `zlsx_editor_save_to_buffer` + `zlsx_open_buffer` + `zlsx_buffer_release` (status-style, prepped `(NULL,0)` outputs; legacy `zlsx_buffer_free` untouched) over a **new pkg buffer seam** — `PartStore.saveCommitted` split into `checkArchiveBounds` + `emitArchive(w, poller)` shared with `PartStore.saveToOwnedBuffer`, `Workbook.save` split into `applySavePlans` + store save so `Workbook.saveToOwnedBuffer` writes the identical archive, `Editor.openBuffer` (dupe, borrow-ends-at-call per Book precedent) + two-path `Editor.saveToOwnedBuffer` — plus **`zlsx_editor_save_with_recalc`** (the §5.7.9 transaction across the ABI; **durability slot live**, pinned by the injected dir-fsync fixture) and **`zlsx_writer_save_with_recalc`** (= `zlsx_recalc.writerSaveWithRecalc` across the boundary — c_abi gains the `zlsx_recalc` import rather than re-inlining the composition). **`…_with_formulas_v2`**: `zlsx_formula_cell_v1` (40 B, array element, pinned three ways) + the fresh writer's **CSE rectangle state machine** (`FormulaCell` + `writeRowWithFormulaCells`; anchor-only ref, members carry `<v>`/no `<f>`, empty members become bare `<c>` placeholders, overlap/member-formula refusals at write, completeness gate in `projectSheets` on every save path; `dynamic_array` reserved ABI, refused pending §5.8b). **Refusal-census seam honest** (decision M9a1-4 closed): `recalc_txn.Refusal` owns a bounded census, `Options.refusal_out` moves it out, `-2` diags carry the refusing cell. **Python leg per §12.3**: `recalculate` / `save_with_recalc` / `evaluate` / `save_to_buffer` / `from_bytes` / `mark_recalc_on_load`, `Writer.save(recalculate=RecalcOptions(...))`, `FormulaSpec(.cse)` + row-wide `dialect=`, `ExcelError`/`Matrix`/`EvalResult`/`RecalcReport`/`Resolved`/`CensusEntry`, `ZlsxFormulaRefusal(error_name, cells, census)`, worker-thread cancellation (TimeoutError pre-commit only; post-commit ⇒ `cancelled_late`), every release fn in `try/finally` | 3-file txn (probes `_HAS_SAVE_BUFFER`/`_HAS_SAVE_WITH_RECALC`/`_HAS_WRITER_RECALC`/`_HAS_FORMULAS_V2` + smoke.c `#error` gate + boundary/canary tests + M9a2 descriptor fuzz); pytest 174 green |
 | **M9b** ✅ | Spark batch recalc (`feat/m9b-spark`): `zlsx.recalc="true"` activation in `zlsx.spark` — the driver reads each source ONCE, SHA-256s THAT buffer, recalcs the SAME buffer (`Editor.from_bytes` → `recalculate` → `save_to_buffer`), and runs schema inference + partition planning on the recalced snapshot; source files never mutated. Partitions carry (path, digest, resolved context — resolved ONCE per read, so one job observes one logical instant and one RNG stream — engine fingerprint); executors re-apply the one-buffer rule and refuse on digest drift (`SnapshotDriftError`) or engine mismatch (`EngineFingerprintMismatch`); retries re-derive identically, pinned by the mutate-between-verify-and-open race fixture over the `_read_file_bytes` seam. Per-executor byte-bounded LRU snapshot cache (`zlsx.recalcCacheMaxBytes` default 512 MiB, 0 = off, entry charged its snapshot length, keyed by digest + every resolved input + on_unsupported + fingerprint — never digest alone). `zlsx.recalcUtcOffsetMin` default 0 (UTC); `zlsx.recalc` parses strictly (a typo refuses, never reads as false); streaming + recalc refused at option validation from `ZlsxStreamReader.__init__`. All mechanism in `_tabular.py` (no pyspark, per the CI rule); snapshots never pickle (`__getstate__` drops the driver memo) | test_basic + test_spark_core 166 green; integration 24/24 vs local Spark 4 (activation, inference-on-snapshot, drift, fingerprint, retry-identity, race, streaming refusal through both paths); serverless leg PARKED — every databricks MCP tool fails pre-workspace with `ModuleNotFoundError: No module named 'rich.traceback'` |
 | **M9c1** ✅ | Shared deterministic solver contract FIRST (`feat/m9c1-tvm`): **`solve.zig`** — one Newton driver, ≤128 iterations, pinned \|Δx\| ≤ 1e-10, root selection IS the Newton path from the guess, **a domain-clamped step never converges** (a rootless residual chasing the −1 boundary runs its 128 iterations and answers `#NUM!` — never the fake root thirty-some halvings would fabricate under a bare step test) — every iteration polls THEN charges 4 units to the new **`WorkBudget`** (`run_inputs.zig`: node = 1 at `evalNode`, solver iteration = 4, nested callbacks re-charge by construction; §5.5's ≥1-poll-per-65 536-unit stride inside `charge`; the limit is identity, the poller is not; exhaustion refuses, cancellation is the engine's first own `error.Cancelled`, mapped like the driver's) threaded `Options.work` — evaluator + solvers on ONE meter, engine-level in v1 (the workbook/C knobs ride the row that can carry report fields; the ABI is frozen). + F4a-TVM (7, frozen: PMT, IPMT, PPMT, PV, FV, RATE, NPER) — **one `log1p`/`expm1` exponential spelling** (the annuity factor cancels catastrophically near r = 0 under naive `pow`, exactly where RATE's Newton walks; the residual's r = 0 arm lets Newton walk THROUGH zero), NPER closes through logarithms so RATE is the batch's only solver consumer (guess 0.1 when absent, 0 when explicitly empty), `#DIV/0!` for the spelled-out zero denominators / `#NUM!` for every other non-finite (N4a) / negative NPER is an ANSWER, nonzero type = beginning (OpenFormula). PMT's four canonical-unregistered pins flipped to `NPV`; running total 147 | Oracle-first (manifests predate F4a → every fixture spec_pinned, 0 oracle rows pinned — evidence at zero, a fourth time); convergence fixtures are Excel's own doc examples at full double precision, non-convergence is the all-positive-flows walk, mid-solve cancellation lands on the meter's receipt (base + 4·4 units at the fifth poll); combined-exhaustion: whole-cost−1 refuses inside the last iteration, whole-cost completes at remaining 0; zig 9727 unpiped, pytest 166 |
-| **M9c2** | F4a-flows (8, frozen: NPV, IRR, XNPV, XIRR, SLN, SYD, DB, DDB) | Oracle-first; solver fixtures |
+| **M9c2** ✅ | F4a-flows (8, frozen: NPV, IRR, XNPV, XIRR, SLN, SYD, DB, DDB) (`feat/m9c2-flows`): **two discount spellings, on purpose** — NPV/IRR discount by POSITION (integer powers of 1+r accumulated by multiplication, so a rate below −1 alternates sign and stays an ANSWER; the one impossible denominator is r = −1 exactly, a spelled-out `#DIV/0!`; IRR's flow 0 is today where NPV's first flow is one period out — each function's documented own convention), XNPV/XIRR discount by DATE (the continuous exponent (d−d₀)/365 over the batch's `log1p`/`expm1` spelling, domain 1 + r > 0, N4a's `#NUM!` with no explicit gate). Ranges fold per §5.3c through `collectNumbers` — SUM's range/direct split verbatim, first error in §5.6a order wins, a text cell consumes no period — and XNPV/XIRR pair flows to dates by position AFTER each side folds (counts must agree, zero pairs anchor nothing: both `#NUM!`); date serials truncate + domain-check under the ACTIVE epoch (`wholeSerial` — the date batch's `#NUM!` held over the XNPV doc page's `#VALUE!`, a recorded pin), both rows `epoch_sensitive`. IRR/XIRR consume `solve.newton` exactly as RATE drives it (guess 0.1 absent / 0 explicitly empty, domain −1, 4-unit iterations on the SAME `WorkBudget`, one `solvedRate` seam) behind Excel's documented one-signed-schedule `#NUM!` precondition, read off the FOLDED flows; propagation splits by M7b3's shape rule — collection-first IRR/XIRR take §5.3c's declaration order themselves, scalar-first NPV/XNPV let the dispatcher propagate; the four schedule readers are the batch's not-liftable rows. Depreciation four in closed form: SLN's life is its spelled `#DIV/0!`; SYD/DDB's per ∈ [1, life] `#NUM!` bounds force life ≥ 1 so NEITHER has a `#DIV/0!` plane; DB truncates life/period/month (a discrete schedule around one partial first year — the stub period life+1 exists iff month < 12, per > life at month 12 is `#NUM!`, the 3-decimal rate rounding is Excel's own text, cost and life its two spelled `#DIV/0!`s); DDB stays continuous — `book = max(cost·qᵖᵉʳ⁻¹, salvage)`, the salvage floor IS the memory of every earlier period's cap, factor > life included. NPV's four canonical-unregistered pins flipped to `CONVERT`; running total 155 | Oracle-first (manifests predate F4a → every fixture spec_pinned, 0 oracle rows pinned — evidence at zero, a fifth time); value rows are Excel's own doc examples at full double precision (NPV 1188.44 / 41 922.06, IRR 8.66% / −44.35%, XNPV 2086.65, XIRR 37.34%, SLN 2250, SYD 4090.91 / 409.09, DB's month-7 table incl. the 15 845.10 stub year, DDB 1.32 / 40 / 480 / 306 / 22.12 + the cap-binds-immediately pair); non-convergence is the rootless mixed-sign residual ({−1,3,−3} — no root at ANY rate — 128 honest iterations on BOTH solvers); mid-solve cancellation lands on the meter's receipt (base + 4·4 at the fifth poll), combined-exhaustion whole−1/whole on IRR; a 1904 fixture bounds XNPV's serials by the active epoch; zig 9807 unpiped, pytest 166 |
 | **M9d** | F4b engineering (20, frozen: CONVERT, DELTA, GESTEP, BIN2DEC, DEC2BIN, HEX2DEC, DEC2HEX, OCT2DEC, DEC2OCT, BITAND, BITOR, BITXOR, BITLSHIFT, BITRSHIFT, COMPLEX, IMREAL, IMAGINARY, IMABS, IMSUM, IMPRODUCT); **v1 complete**; §13 release gate | Oracle-first; rg allowlist; **absolute + regression perf checks (§9)** |
 
 **M10+ backlog**: F5 (census-ordered); `<xm:f>` route-through; namespace-aware
@@ -5401,6 +5401,92 @@ suite), and `src/formula/registry.zig` (seven rows over one equation).
     the `#DIV/0!`-vs-`#NUM!` planes, the 1 + r > 0 domain pin, and
     the negative-NPER answer are the fixtures that leg would test
     first.
+
+**M9c2 decisions (shipped 2026-08-07).** Ten points, in
+`src/formula/registry.zig` (eight rows, the fold's first schedule
+consumers, one `solvedRate` seam) and `src/formula/eval.zig` (the batch
+fixtures, the flow solvers' budget suite, the 1904 bound).
+
+1.  **Two discount spellings, on purpose.** `NPV`/`IRR` discount by
+    POSITION — integer powers of 1 + r, accumulated by multiplication,
+    so a rate below −1 alternates sign and stays an ANSWER
+    (`NPV(-2,100,100)` is 0, not a domain failure) and the one
+    impossible denominator is r = −1 exactly, a spelled-out
+    `#DIV/0!`. `XNPV`/`XIRR` discount by DATE — a continuous exponent
+    (d−d₀)/365 over `log1p`/`expm1`, whose domain is 1 + r > 0: at
+    and below −1 the terms go non-finite and N4a answers `#NUM!` with
+    no explicit gate. The same rate at the same schedule wears two
+    different failure planes because the two functions genuinely
+    compute two different expressions.
+2.  **The schedule is the numbers that exist.** The fold is §5.3c's
+    through `collectNumbers` — SUM's range/direct split verbatim — so
+    a text cell inside an NPV range consumes no period, and
+    `XNPV`/`XIRR` pair flows to dates by position AFTER each side
+    folded. Counts must then agree, and zero pairs leave the day count
+    nothing to anchor at: both `#NUM!`.
+3.  **Dates are `wholeSerial`'s discipline, and the flag says so.**
+    Truncated, domain-checked under the ACTIVE epoch, `#NUM!` outside
+    it — the date batch's plane held over the XNPV doc page's
+    `#VALUE!`, a recorded pin the §8.2 leg would arbitrate first. Both
+    rows are `epoch_sensitive`: the same serial pair evaluates under
+    1900 and refuses under 1904 (fixtured at 2 957 100, between the
+    two maxima). Every date sits on or after the FIRST — d₀ anchors
+    the count, order does not reorder it.
+4.  **The solver seam is RATE's, verbatim.** One `solvedRate` helper:
+    roots are answers, `BadDomain`/`NoConvergence` are Excel's
+    `#NUM!`, the resource outcomes stay refusals. Guess 0.1 when
+    absent, 0 when explicitly empty; domain −1; 4-unit iterations on
+    the SAME `WorkBudget` the evaluator drew nodes from. Excel's
+    documented precondition — at least one flow of each sign — is
+    checked on the FOLDED flows before any iteration: a one-signed
+    schedule has no root, and saying so costs less than 128 iterations
+    of proving it.
+5.  **The rootless mixed-sign residual is the honest-iterations
+    fixture.** {−1, 3, −3} clears the sign precondition and still has
+    no root at ANY rate (its NPV in u = 1/(1+r) is −3u² + 3u − 1,
+    discriminant negative, maximum −1/4): both solvers run their 128
+    iterations under the clamp rule and answer `#NUM!`,
+    deterministically — M9c1's all-positive `RATE` walk, one level
+    deeper into the domain.
+6.  **Propagation splits by M7b3's shape rule.** Collection-first
+    names (`IRR`, `XIRR` — a guess slot trails the fold) are
+    `per_function_provenance` and take §5.3c's declaration order
+    themselves; scalar-first names (`NPV`, `XNPV`) let the dispatcher
+    propagate. The four schedule readers are the batch's not-liftable
+    rows — an aggregate slot is a collection, not a scalar to
+    broadcast over.
+7.  **`SYD` and `DDB` have no `#DIV/0!` plane, and that is the bounds'
+    doing.** per ∈ [1, life] (IPMT's own pin) forces life ≥ 1, so
+    SYD's life·(life+1) is at least 2 and DDB's factor/life cannot
+    divide by zero. `SLN`'s life and `DB`'s cost (under salvage/cost)
+    and life (under 1/life) are the batch's spelled-out `#DIV/0!`s —
+    DB's life arm reachable only through the stub period a partial
+    first year opens.
+8.  **`DB` truncates, `DDB` does not.** DB's schedule is discrete —
+    whole years around one partial first year, the stub period life+1
+    existing exactly when month < 12 (per > life at month 12 is
+    `#NUM!`, not a zero-width stub), month bounded to [1, 12], and the
+    3-decimal rate rounding is Excel's own text, not a choice. DDB's
+    cap algebra never needs the calendar:
+    `book = max(cost·q^(per−1), salvage)` — the salvage floor IS the
+    memory of every earlier period's cap — then
+    `max(0, min(book·factor/life, book − salvage))`, which reproduces
+    the documented per-period rule in closed form, a first-period
+    factor above life included (the whole depreciable base at once,
+    zero ever after).
+9.  **Arithmetic over intuition, applied.** DDB answers 0 for a
+    negative factor or a salvage above cost rather than gaining a
+    positivity gate the arithmetic never asked for, and NPV below
+    −1 is a value — the negative-NPER lesson, standing. The planes
+    the prose would have invented are exactly the rows the parked
+    oracle leg exists to arbitrate.
+10. **`NPV` registered; `CONVERT` promoted canonical unregistered** in
+    the same four pinned places (registry, eval, workbook ×2) — the
+    first name of M9d's frozen list, the next row that registers.
+    Running total 155, counted from the TSV. Evidence at zero, a
+    fifth time: the manifests predate F4a, every fixture ships
+    `spec_pinned`, and the parked §8.2 Excel leg (standing ask: quit
+    `Book1`, run `scripts/oracle/regenerate.sh`) is what moves it.
 
 ---
 

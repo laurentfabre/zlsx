@@ -17444,12 +17444,13 @@ test "M4b3: evaluate mutates neither logical state nor serialized bytes" {
     try std.testing.expectEqual(@as(f64, 22), ok.ok.value.scalar.number);
     try expectSnapshotUnchanged(ta, &wb, before);
 
-    // 2. Refusal — an unregistered function, refused mid-run. `NPV`
-    //    is frozen in the inventory for M9c2 and has no row yet;
+    // 2. Refusal — an unregistered function, refused mid-run. `CONVERT`
+    //    is frozen in the inventory for M9d and has no row yet;
     //    `VLOOKUP` stood here until M4e registered it, `SUMIFS` until
     //    M7b2, `MEDIAN` until M7b3, `TEXT` until M8a, `PROPER` until
-    //    M8b, `NUMBERVALUE` until M8c, `PMT` until M9c1.
-    var refused = try wb.evaluate(ta, 0, "NPV(A1)", .{ .collation = test_collation });
+    //    M8b, `NUMBERVALUE` until M8c, `PMT` until M9c1, `NPV` until
+    //    M9c2.
+    var refused = try wb.evaluate(ta, 0, "CONVERT(A1)", .{ .collation = test_collation });
     defer refused.deinit();
     try std.testing.expectEqual(
         engine.decode.PlaneTwo.FormulaUnsupportedFunction,
@@ -18133,9 +18134,9 @@ test "M5a1: closure evaluation mutates neither logical state nor serialized byte
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<v>20</v>") == null);
 
     // 2. Refusal, raised after the closure had already been planned and
-    //    every cell in it recomputed. `NPV` is the canonical
-    //    still-unregistered name since M9c1 registered `PMT`.
-    var refused = try wb.evaluateClosure(ta, 0, "NPV(A1)", .{ .collation = test_collation });
+    //    every cell in it recomputed. `CONVERT` is the canonical
+    //    still-unregistered name since M9c2 registered `NPV`.
+    var refused = try wb.evaluateClosure(ta, 0, "CONVERT(A1)", .{ .collation = test_collation });
     defer refused.deinit();
     try std.testing.expectEqual(
         engine.decode.PlaneTwo.FormulaUnsupportedFunction,

@@ -8334,6 +8334,283 @@ test "M9c1: exhaustion is a refusal and non-convergence is a value — never eac
     );
 }
 
+// ─── M9c2: the F4a-flows batch (§7, eight names counted from the TSV) ──
+//
+// The value rows are Excel's own documentation examples where the
+// documentation gives one (NPV 1188.44 and the 41,922.06 schedule, IRR
+// 8.66% and −44.35%, XNPV 2086.65, XIRR 37.34%, SLN 2250, SYD 4090.91
+// and 409.09, DB's seven-period month-7 table, DDB's five factors),
+// pinned at full double precision from the closed forms and from the
+// solver contract replicated outside this implementation — spec_pinned
+// like all of F4a, because the committed manifests predate it; the
+// parked §8.2 Excel leg is what would move the evidence, and the
+// XNPV/XIRR `#NUM!`-for-invalid-dates plane (the date batch's
+// discipline, held over the doc page's `#VALUE!`) is the first row
+// that leg would arbitrate.
+
+const m9c2_cases = [_]F2Case{
+    // ── NPV: position discounting, the fold, the one denominator ──
+    .{ .func = "NPV", .formula = "NPV(0.1,-10000,3000,4200,6800)", .expect = .{ .number = 1188.4434123352207 } },
+    .{ .func = "NPV", .formula = "NPV(0.08,8000,9200,10000,12000,14500)", .expect = .{ .number = 41922.06155493236 } },
+    .{ .func = "NPV", .formula = "NPV(0,100,200)", .expect = .{ .number = 300 }, .note = "rate 0 discounts nothing" },
+    .{ .func = "NPV", .formula = "NPV(0.1,{100,200})-NPV(0.1,100,200)", .expect = .{ .number = 0 }, .note = "a range and the same numbers direct are one schedule" },
+    .{ .func = "NPV", .formula = "NPV(0.1,{100,\"x\",200})-NPV(0.1,100,200)", .expect = .{ .number = 0 }, .note = "text found in the fold is ignored and consumes no period — §5.3c's split" },
+    .{ .func = "NPV", .formula = "NPV(-1,100)", .expect = .{ .err = .div0 }, .note = "the one impossible denominator: (1+r) is zero exactly at −1" },
+    .{ .func = "NPV", .formula = "NPV(-2,100,100)", .expect = .{ .number = 0 }, .note = "below −1 the integer powers alternate — an answer, not a domain" },
+
+    // ── IRR: the solver over position discounting ──
+    .{ .func = "IRR", .formula = "IRR({-70000,12000,15000,18000,21000,26000})", .expect = .{ .number = 0.08663094803653167 }, .note = "converges from Excel's default 0.1 guess" },
+    .{ .func = "IRR", .formula = "IRR({-70000,12000,15000},-0.1)", .expect = .{ .number = -0.4435069413347405 }, .note = "a caller's guess selects the early-loss root — root selection IS the Newton path" },
+    .{ .func = "IRR", .formula = "IRR({-100,50,60},0.1)-IRR({-100,50,60})", .expect = .{ .number = 0 }, .note = "an absent guess is 0.1 — the same Newton path, to the bit" },
+    .{ .func = "IRR", .formula = "IRR({100,200})", .expect = .{ .err = .num }, .note = "a one-signed schedule has no root, before any iteration" },
+    .{ .func = "IRR", .formula = "IRR({-100,-200})", .expect = .{ .err = .num } },
+    .{ .func = "IRR", .formula = "IRR(A1:A3)", .expect = .{ .err = .num }, .note = "the sign precondition reads the FOLDED range" },
+    .{ .func = "IRR", .formula = "IRR({-1,3,-3})", .expect = .{ .err = .num }, .note = "mixed signs but no root anywhere: 128 honest iterations, then #NUM!" },
+
+    // ── XNPV: date discounting under the active epoch ──
+    .{ .func = "XNPV", .formula = "XNPV(0.09,{-10000,2750,4250,3250,2750},{39448,39508,39751,39859,39904})", .expect = .{ .number = 2086.6476020315367 } },
+    .{ .func = "XNPV", .formula = "XNPV(0.1,{100,100},{39448,39508.9})-XNPV(0.1,{100,100},{39448,39508})", .expect = .{ .number = 0 }, .note = "dates truncate to whole serials" },
+    .{ .func = "XNPV", .formula = "XNPV(0.1,{100,200},{39448})", .expect = .{ .err = .num }, .note = "the fold pairs by position, so the counts must agree" },
+    .{ .func = "XNPV", .formula = "XNPV(0.1,{100,200},{39508,39448})", .expect = .{ .err = .num }, .note = "a date before the first has nothing to anchor to" },
+    .{ .func = "XNPV", .formula = "XNPV(0.1,{100},{-1})", .expect = .{ .err = .num }, .note = "a serial before the epoch — the date batch's plane, not the doc page's #VALUE!" },
+    .{ .func = "XNPV", .formula = "XNPV(-1,{100,200},{39448,39508})", .expect = .{ .err = .num }, .note = "the continuous exponent's domain edge — N4a, unlike NPV's integer powers" },
+    .{ .func = "XNPV", .formula = "XNPV(-1.5,{100},{39448})", .expect = .{ .err = .num } },
+
+    // ── XIRR: the solver over date discounting ──
+    .{ .func = "XIRR", .formula = "XIRR({-10000,2750,4250,3250,2750},{39448,39508,39751,39859,39904})", .expect = .{ .number = 0.37336253351883153 }, .note = "converges from Excel's default 0.1 guess" },
+    .{ .func = "XIRR", .formula = "XIRR({-10000,2750,4250,3250,2750},{39448,39508,39751,39859,39904},0.1)-XIRR({-10000,2750,4250,3250,2750},{39448,39508,39751,39859,39904})", .expect = .{ .number = 0 }, .note = "an absent guess is 0.1" },
+    .{ .func = "XIRR", .formula = "XIRR({-1,3,-3},{39448,39813,40178})", .expect = .{ .err = .num }, .note = "the rootless residual, on dates" },
+    .{ .func = "XIRR", .formula = "XIRR({100,200},{39448,39508})", .expect = .{ .err = .num }, .note = "one-signed" },
+    .{ .func = "XIRR", .formula = "XIRR({-100,200},{39448})", .expect = .{ .err = .num }, .note = "counts disagree" },
+    .{ .func = "XIRR", .formula = "XIRR({-100,200},{39508,39448})", .expect = .{ .err = .num }, .note = "a date before the first" },
+
+    // ── SLN: the one-line closed form ──
+    .{ .func = "SLN", .formula = "SLN(30000,7500,10)", .expect = .{ .number = 2250 } },
+    .{ .func = "SLN", .formula = "SLN(30000,7500,0)", .expect = .{ .err = .div0 }, .note = "life is the spelled-out denominator" },
+    .{ .func = "SLN", .formula = "SLN(100,400,10)", .expect = .{ .number = -30 }, .note = "appreciation is an answer" },
+
+    // ── SYD: the closed form and per's closed domain ──
+    .{ .func = "SYD", .formula = "SYD(30000,7500,10,1)", .expect = .{ .number = 4090.909090909091 } },
+    .{ .func = "SYD", .formula = "SYD(30000,7500,10,10)", .expect = .{ .number = 409.09090909090907 } },
+    .{ .func = "SYD", .formula = "SYD(30000,7500,10,0)", .expect = .{ .err = .num }, .note = "per below 1 — and the bounds are why SYD has no #DIV/0! plane" },
+    .{ .func = "SYD", .formula = "SYD(30000,7500,10,11)", .expect = .{ .err = .num }, .note = "per past life" },
+
+    // ── DB: the documented 3-decimal rate, the stub year ──
+    .{ .func = "DB", .formula = "DB(1000000,100000,6,1,7)", .expect = .{ .number = 186083.33333333334 }, .note = "the partial first year takes month/12 of the rate" },
+    .{ .func = "DB", .formula = "DB(1000000,100000,6,2,7)", .expect = .{ .number = 259639.41666666666 } },
+    .{ .func = "DB", .formula = "DB(1000000,100000,6,7,7)", .expect = .{ .number = 15845.098473848082 }, .note = "the trailing stub the partial first year opens" },
+    .{ .func = "DB", .formula = "DB(1000000,100000,6,6)", .expect = .{ .number = 46722.518280620934 }, .note = "month omitted is 12" },
+    .{ .func = "DB", .formula = "DB(1000000,100000,6,7)", .expect = .{ .err = .num }, .note = "no stub year at month 12" },
+    .{ .func = "DB", .formula = "DB(1000000,100000,6,0,7)", .expect = .{ .err = .num }, .note = "per below 1" },
+    .{ .func = "DB", .formula = "DB(1000000,100000,6,1,13)", .expect = .{ .err = .num }, .note = "month past 12" },
+    .{ .func = "DB", .formula = "DB(1000000,100000,6,1,0)", .expect = .{ .err = .num } },
+    .{ .func = "DB", .formula = "DB(0,100,6,1)", .expect = .{ .err = .div0 }, .note = "cost is a spelled-out denominator under salvage/cost" },
+    .{ .func = "DB", .formula = "DB(1000,100,0,1,6)", .expect = .{ .err = .div0 }, .note = "1/life — reachable only through the stub the partial year opens" },
+
+    // ── DDB: the cap algebra in closed form ──
+    .{ .func = "DDB", .formula = "DDB(2400,300,3650,1)", .expect = .{ .number = 1.3150684931506849 }, .note = "a daily schedule is just a longer life" },
+    .{ .func = "DDB", .formula = "DDB(2400,300,120,1,2)", .expect = .{ .number = 40 } },
+    .{ .func = "DDB", .formula = "DDB(2400,300,10,1)", .expect = .{ .number = 480 }, .note = "an absent factor is the name's own 2" },
+    .{ .func = "DDB", .formula = "DDB(2400,300,10,2,1.5)", .expect = .{ .number = 306 } },
+    .{ .func = "DDB", .formula = "DDB(2400,300,10,10)", .expect = .{ .number = 22.1225472 }, .note = "the salvage cap binds in the last period" },
+    .{ .func = "DDB", .formula = "DDB(2400,2000,10,1)", .expect = .{ .number = 400 }, .note = "the cap can bind immediately" },
+    .{ .func = "DDB", .formula = "DDB(2400,2000,10,2)", .expect = .{ .number = 0 }, .note = "and holds every period after at zero — the salvage floor is the cap's memory" },
+    .{ .func = "DDB", .formula = "DDB(2400,300,10,0.5)", .expect = .{ .err = .num }, .note = "per below 1" },
+    .{ .func = "DDB", .formula = "DDB(2400,300,10,11)", .expect = .{ .err = .num }, .note = "per past life" },
+};
+
+test "M9c2: every F4a-flows fixture evaluates to what the spec says" {
+    for (m9c2_cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("M9c2 case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectTvmValue(c.expect, v) catch |e| {
+            std.debug.print("M9c2 case `{s}` ({s})\n", .{ c.formula, c.note });
+            return e;
+        };
+    }
+}
+
+test "M9c2: every frozen name resolves, and each fixture stays in the batch" {
+    var it = registry.inventory();
+    var batch: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M9c2")) continue;
+        batch += 1;
+        if (registry.lookup(e.name) == null) return error.UnregisteredBatchFunction;
+        var fixtures: usize = 0;
+        for (m9c2_cases) |c| {
+            if (std.mem.eql(u8, c.func, e.name)) fixtures += 1;
+        }
+        if (fixtures == 0) {
+            std.debug.print("M9c2 name unfixtured: {s}\n", .{e.name});
+            return error.UnfixturedBatchFunction;
+        }
+    }
+    // Eight — the frozen list, counted from the TSV.
+    try testing.expectEqual(@as(usize, 8), batch);
+    // The reverse direction: no fixture may claim a name outside the
+    // batch.
+    for (m9c2_cases) |c| {
+        var it2 = registry.inventory();
+        var found = false;
+        while (it2.next()) |e| {
+            if (std.mem.eql(u8, e.milestone, "M9c2") and std.mem.eql(u8, e.name, c.func)) found = true;
+        }
+        try testing.expect(found);
+    }
+}
+
+test "M9c2: the evidence label on every fixture is true of the committed manifests" {
+    var oracle_rows: usize = 0;
+    for (m9c2_cases) |c| {
+        switch (try manifestVerdict(c.formula)) {
+            .decided => {
+                if (c.evidence != .oracle) return error.UnderstatedEvidence;
+                oracle_rows += 1;
+            },
+            .excluded => return error.ExcludedCellClaimedAsEvidence,
+            .silent => {
+                if (c.evidence != .spec_pinned) return error.UnbackedOracleClaim;
+            },
+        }
+    }
+    // The committed manifests predate F4a; the parked Excel leg (§8.2)
+    // is what would move this count — evidence at zero, a fifth time.
+    try testing.expectEqual(@as(usize, 0), oracle_rows);
+}
+
+test "M9c2: the active epoch bounds XNPV's dates" {
+    // Serial 2 957 100 exists under 1900 (max 2 958 465) and not under
+    // 1904 (max 2 957 003): the SAME formula answers a number in one
+    // system and #NUM! in the other, which is what `epoch_sensitive`
+    // on the registry row promises.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+
+    const v = try h.eval("XNPV(0.1,{100,100},{2957000,2957100})");
+    try testing.expect(v.scalar == .number);
+
+    var opts = h.options();
+    opts.date_system = .d1904;
+    const refused = try h.evalOpts("XNPV(0.1,{100,100},{2957000,2957100})", opts);
+    try testing.expectEqual(value.KnownError.num, refused.scalar.err.known);
+}
+
+// ─── M9c2: the flow solvers on the shared WorkBudget ─────────────
+
+test "M9c2: IRR draws its iterations from the meter the evaluator drew nodes from" {
+    // Reference run: the whole cost of a converging IRR, measured with
+    // a counting poller — iterations are the poll count, and the pins
+    // stay off absolute iteration counts (a 1-ulp libm shift must not
+    // break the gate; M9c1's rule, held).
+    var whole: u64 = 0;
+    {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        var count: TvmTripPoller = .{};
+        var w: run_inputs.WorkBudget = .{ .poller = .{ .ctx = &count, .check_fn = TvmTripPoller.check } };
+        var opts = h.options();
+        opts.work = &w;
+        const v = try h.evalOpts("IRR({-100,50,60})", opts);
+        try testing.expect(v.scalar == .number);
+        whole = w.used;
+        // Every solver iteration polled once and charged 4; whatever
+        // remains is the formula's nodes, and there is at least one.
+        try testing.expect(count.n >= 2);
+        try testing.expect(count.n <= 128);
+        try testing.expect(whole > 4 * count.n);
+    }
+
+    // One unit short: the SAME run exhausts inside the last iteration.
+    {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        var w: run_inputs.WorkBudget = .{ .limit = whole - 1 };
+        var opts = h.options();
+        opts.work = &w;
+        try testing.expectError(error.LimitExceeded, h.evalOpts("IRR({-100,50,60})", opts));
+        try testing.expect(w.tripped);
+    }
+
+    // At exactly the whole cost, the run completes with nothing to
+    // spare.
+    {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        var w: run_inputs.WorkBudget = .{ .limit = whole };
+        var opts = h.options();
+        opts.work = &w;
+        _ = try h.evalOpts("IRR({-100,50,60})", opts);
+        try testing.expectEqual(@as(u64, 0), w.remaining());
+    }
+}
+
+test "M9c2: a mid-solve cancel aborts XIRR on the meter's receipt" {
+    // Calibration: trip on the FIRST poll — the meter holds exactly
+    // the formula's nodes, because the solver polls before any
+    // iteration's work.
+    var base: u64 = 0;
+    {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        var trip: TvmTripPoller = .{ .at = 1 };
+        var w: run_inputs.WorkBudget = .{ .poller = .{ .ctx = &trip, .check_fn = TvmTripPoller.check } };
+        var opts = h.options();
+        opts.work = &w;
+        try testing.expectError(error.Cancelled, h.evalOpts("XIRR({-1,3,-3},{39448,39813,40178})", opts));
+        base = w.used;
+        try testing.expect(base > 0);
+    }
+
+    // Mid-solve: trip on the fifth poll — four iterations of work were
+    // charged, the fifth refused before it spent anything.
+    {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        var trip: TvmTripPoller = .{ .at = 5 };
+        var w: run_inputs.WorkBudget = .{ .poller = .{ .ctx = &trip, .check_fn = TvmTripPoller.check } };
+        var opts = h.options();
+        opts.work = &w;
+        try testing.expectError(error.Cancelled, h.evalOpts("XIRR({-1,3,-3},{39448,39813,40178})", opts));
+        try testing.expectEqual(base + 4 * run_inputs.WorkBudget.solver_iteration_units, w.used);
+        try testing.expectEqual(@as(usize, 5), trip.n);
+    }
+}
+
+test "M9c2: exhaustion is a refusal and non-convergence is a value — the flow solvers too" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit();
+
+    // No budget wired: the rootless schedule runs its 128 iterations
+    // and answers Excel's #NUM! — a value a caller can catch.
+    const v = try h.eval("IFERROR(IRR({-1,3,-3}),\"caught\")");
+    try testing.expect(v.scalar == .text);
+    try testing.expectEqualStrings("caught", v.scalar.text);
+
+    // Budget wired and too small: the SAME formula now refuses, and
+    // IFERROR cannot catch it.
+    var w: run_inputs.WorkBudget = .{ .limit = 40 };
+    var opts = h.options();
+    opts.work = &w;
+    try testing.expectError(
+        error.LimitExceeded,
+        h.evalOpts("IFERROR(IRR({-1,3,-3}),\"caught\")", opts),
+    );
+}
+
 test "refusals: an unregistered call refuses, an unresolvable name is #NAME?" {
     var h: Harness = undefined;
     try h.init(testing.allocator);
@@ -8341,11 +8618,12 @@ test "refusals: an unregistered call refuses, an unresolvable name is #NAME?" {
 
     // §7: unregistered calls refuse rather than inventing `#NAME?` for a
     // function zlsx simply does not implement.
-    // `NPV` is frozen in the inventory for M9c2 and unregistered
+    // `CONVERT` is frozen in the inventory for M9d and unregistered
     // today; `VLOOKUP` stood here until M4e registered it, `SUMIFS`
     // until M7b2, `MEDIAN` until M7b3, `TEXT` until M8a, `PROPER`
-    // until M8b, `NUMBERVALUE` until M8c, `PMT` until M9c1.
-    try testing.expectError(error.UnsupportedFunction, h.eval("NPV(A1)"));
+    // until M8b, `NUMBERVALUE` until M8c, `PMT` until M9c1, `NPV`
+    // until M9c2.
+    try testing.expectError(error.UnsupportedFunction, h.eval("CONVERT(A1)"));
     try testing.expectError(error.UnsupportedFunction, h.eval("NOTAFUNCTION()"));
     // §5.9: a value-position name that provably resolves nowhere is a
     // plane-1 `#NAME?`, which is a successful result.
