@@ -8,14 +8,20 @@
 > this document in full — no reference to any prior revision is normative.**
 
 _Created: 2026-08-02 · Revision: **v21** (post Codex rounds 1–20 — 412 findings
-dispositioned; see §15) · Status: **PARKED (2026-08-02)** — the SHIP-READY review
-loop was stopped by owner directive after round 20; this document is committed as
-the design record, not as scheduled work. Round 21 was never run._
+dispositioned; see §15) · Status: **SHIPPED (2026-08-07)** — the 41-row ladder
+(M-1 … M9d) is complete and landed on `main` as one rebase-merged PR
+(`feat/m9d-eng`: 48 ladder commits, plus the Linux `syncDir` EBADF fix the
+ubuntu lane required). All 175 frozen names registered; §13 gate green; the
+four §9 `--gate` lanes green. **The release cut stays open on two ⛔ owner
+decisions** (§9.1, measured at M9d): evaluate 936.98 ms is **1.87×** its
+500 ms ceiling, and first-recalc RSS 506.7 MiB is **33.4×** its 3×-model-bytes
+ceiling — each needs an owner waiver or a perf/memory row before any release._
 
-_**M-1 landed 2026-08-03** (docs-only planning flip; see §13.1). The park still
-holds for M0 and everything above it — landing M-1 discharged the documentation
-debt that made the rest of the tree contradict this plan; it did not schedule the
-ladder._
+_The Codex SHIP-READY review loop remains parked by owner directive after
+round 20; round 21 was never run._
+
+_**M-1 landed 2026-08-03** (docs-only planning flip; see §13.1) and rides in
+the chain as the cherry-pick `b2399f5`._
 
 ---
 

@@ -244,9 +244,9 @@ Next, in value order:
    carrying a sparkline formula. Needs a sheet-name context `sheet_edit.zig`
    does not have. The highest-value remaining lift. **No longer standalone**
    as of 2026-08-02: the D1 ladder (`goal_formula.md`) builds the parser and
-   name-resolution layer this needs, so the route-through is pullable once
-   M2 lands and is carried on that plan's M10+ backlog. Doing it before M2
-   means building the sheet-name context twice.
+   name-resolution layer this needs. **The ladder shipped 2026-08-07** —
+   parser, name resolution, and the full v1 engine are on `main`, so the
+   route-through is now pullable and is carried on that plan's M10+ backlog.
 5. **Cross-part pivot rewriter** — removes #139's refusal. Bigger lift:
    `<location ref>` + cache field ranges across `xl/pivotTables/*` and
    `xl/pivotCache/*`, a ref graph zlsx has never walked.
