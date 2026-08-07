@@ -2302,6 +2302,68 @@ discipline instead of growing a second one.
     baseline the wrong mix. Dated here so the deferral is a decision,
     not an omission.
 
+**M8b decisions (shipped 2026-08-07).** Nine points, in
+`unicode/casing.zig` (`toProper` — the segmenter and its byte-exact
+fixtures), `registry.zig` (one row, one delegation) and `eval.zig`
+(the batch fixtures and their evidence check). The row where casing
+learned where words begin.
+
+1. **One derivation, in the module that owns the tables.** `fnProper`
+    is a one-line delegation to `casing.toProper`: which scalars begin
+    words AND what title-casing does to them are decided in the same
+    walk, so a second caller can never disagree with the first about
+    either half. The registry row is only the wiring — whole-string
+    like UPPER/LOWER, so no compatibility version or collation flag
+    can reach it, and §7's five-field discipline reads all of that
+    off the row.
+2. **The segmenter is Final_Sigma's machinery pointed the other
+    way.** `beginsWord` walks backwards over the SAME
+    `cased`/`case_ignorable` intervals `isFinalSigma` shipped in M4f,
+    asking about the start of the word instead of its end. No new
+    table, generator never reopened — the M4f decision that shipped
+    `title` mappings with nothing calling them pays off exactly here.
+3. **The invariant boundary rule, pinned.** A cased scalar
+    title-cases when the nearest preceding non-case-ignorable scalar
+    is absent or not cased, and lowercases otherwise; a case-ignorable
+    scalar is transparent (it neither starts nor ends a word); every
+    other non-cased scalar ends the word. Digits and hyphens end words
+    without being them — `2-way street` → `2-Way Street`, `76budGET`
+    → `76Budget` — which is also Excel's answer.
+4. **The apostrophe class is the named divergence.** `'` (Single_
+    Quote), `.` (MidNumLet) and `:` (MidLetter) are Case_Ignorable, so
+    they are transparent and `don't` answers `Don't` where Excel
+    answers `Don'T`; `j.r.r. tolkien` answers `J.r.r. Tolkien` where
+    Excel capitalizes after every stop. Recorded spec_pinned pending
+    the parked oracle leg (§8.2) — when that leg runs, these are the
+    fixtures that would move, and the evidence check is the test that
+    would say so.
+5. **An uncased letter ends a word, and the trade is named.** Telling
+    a caseless LETTER (Hebrew, CJK) from a non-letter takes the
+    Alphabetic property — a second table this row refuses to add. So
+    `中文a` answers `中文A` where Excel would treat `文` as a letter.
+    Recorded divergence, same evidence class as the apostrophe.
+6. **Titlecase is the third table, not uppercase.** `ǆungla` →
+    `ǅungla` (U+01C6 → U+01C5, the tri-form digraph; UPPER answers
+    `Ǆ`), and word-initial `ß` → `Ss` under SpecialCasing's full title
+    mapping — length-changing like its uppercase `SS` but not equal
+    to it. The digraph fixture is why `title_entries` and
+    `upper_entries` can never be merged.
+7. **Final_Sigma still decides the lowered tail.** The lower direction
+    inside PROPER is the SAME lower: `ΟΔΟΣ ΣΟΦΟΣ` → `Οδος Σοφος` with
+    a final ς in both words, because the mid-word/final distinction
+    survives being reached through segmentation.
+8. **The byte path is a fast path, not a dialect.** ASCII and
+    invalid-UTF-8 inputs take `properBytes`, whose case-ignorables
+    (`'` `.` `:` `^` `` ` ``) come out of the same table via the same
+    predicate; a fixture pins the same apostrophe answer on both
+    paths. An unreadable byte ends the word and passes through
+    untouched — total, like the fold and the two casings.
+9. **Evidence at zero, again.** The committed manifests predate
+    PROPER, so the batch's oracle-row count is pinned at 0 under the
+    M4d three-valued checker, and `NUMBERVALUE` (M8c) is promoted
+    canonical unregistered in the four pinned places PROPER vacated
+    (registry, eval, workbook ×2) with the running total moved to 121.
+
 ### 5.9 Name & identifier resolution
 
 Call position → strip layered prefixes → registry; unregistered →
@@ -2546,7 +2608,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M7b3** ✅ | F2 statistics batch (MEDIAN, MODE.SNGL, STDEV.P/S, VAR.P/S, PERCENTILE.INC, QUARTILE.INC, RANK.EQ, LARGE, SMALL over ONE numeric collection — SUM's range/direct split — with the order statistics sharing one ascending sort). Every fixture spec_pinned (manifests predate the batch, 0 oracle rows counted); INC interpolation pinned at the 0/0.25/0.5/0.75/1 knots and between them; RANK.EQ ties share the top rank in both directions; the propagation class splits by shape — variadic six `.propagate`, fixed five `per_function_provenance` taking §5.3c's declaration order themselves | Fixtures + §5.3c both-orders + padded sweep (eleven names, floor 9 000) |
 | **M7c** ✅ | `FormulaWrite` authoring (§5.8c, **Zig-only**, `zlsx_recalc.FormulaWrite`): `.scalar` live end-to-end on ONE new approved mutation (`f_insert` at `CT_Cell`'s first-child point; self-closing rides the reopen; existing-`<f>` targets refuse — `spans.f` stays `f@ref`-only); `.dynamic_array`/`.cse` authoring extend `spill_transitions` through the table's own seam (`da_author_spill`, `da_author_blocked`, `cse_author`), each refusing `transition_unproven` naming its row — the surfaced park; DA rows flip only WITH the part-graph builder the reference set brings; CSE builder proven via the injected seam, canonical `ref` spelling | Scalar byte-diff round-trip (write → save → re-open → evaluate agrees) + table-derived refusal enumeration (exhaustive over `Id`, compile-enforced); Excel-opens-clean per authoring row **runs as each reference lands** |
 | **M8a** ✅ | **`numfmt_v1` versioned grammar + support matrix FIRST** (`src/formula/numfmt.zig`): 42 constructs, one matrix row each — 35 rendered byte-exact, 7 refusing by name (`[$-LCID≠409]`, LCID calendar/shaping flag bits, DBNum/NatNum, era `g`/`e`, Buddhist `b`, localized-weekday `aaa`) — `refusedConstructs()` the derived park list, count pinned. Renderer over the rendered rows: sections ≤4 + conditions, grouping/scale/percent, scientific incl. the engineering step, fractions by continued-fraction search, dates/elapsed/subsecond over `serial_date`, the en-US tables `[$-409]` licenses. **TEXT registered over it and `Workbook.formatCellValue` beside it — ONE derivation, byte-proven**; grammar refusals ride their own planes through TEXT (never a fabricated `#VALUE!`); `PROPER` promoted canonical unregistered; the date-detection heuristic's callers untouched — they flip through `Format.describesDate` at a later row | Format fuzz; TEXT matrix **derived from the support matrix**; per-row grammar fixtures |
-| **M8b** | PROPER (word segmentation over the M4f `casing_v1` module) | Segmentation fixtures |
+| **M8b** ✅ | **PROPER over `casing_v1` — word segmentation decides WHICH scalars title-case, the M4f tables decide what title-casing IS** (`unicode/casing.zig` `toProper`; `fnProper` is a one-line delegation, so no second caller can disagree about either half). No second casing table: the segmenter reads the SAME `cased`/`case_ignorable` intervals Final_Sigma shipped — `beginsWord` is that backward walk pointed at the start of the word. The invariant boundary rule, pinned: a cased scalar title-cases when the nearest preceding non-case-ignorable scalar is absent or not cased, lowercases otherwise (Final_Sigma included); case-ignorables are transparent; every other non-cased scalar ends the word. Recorded spec_pinned divergences pending the parked oracle leg (§8.2): `don't`→`Don't` where Excel answers `Don'T` (`'` `.` `:` are Case_Ignorable), and uncased letters (Hebrew/CJK) end words — Alphabetic would be a second table. `NUMBERVALUE` promoted canonical unregistered | Segmentation fixtures byte-exact at both seams (ASCII, apostrophes, digits, combining marks, astral); evidence manifest-checked at 0 oracle rows |
 | **M8c** | F3 batch (NUMBERVALUE, FIXED, DOLLAR, CLEAN, UNICHAR, UNICODE, TEXTBEFORE, TEXTAFTER, TEXTSPLIT; NETWORKDAYS(.INTL), WORKDAY(.INTL), DATEDIF, DAYS, DAYS360, YEARFRAC, ISOWEEKNUM, WEEKNUM) | Oracle-first |
 | **M9a1** | C ABI part 1: `zlsx_status_v1` + descriptor types + editor recalc/evaluate + release fns + **`zlsx_engine_fingerprint()` export (header + `_HAS_FINGERPRINT` probe — M9b depends on it)** + **`zlsx_editor_mark_recalc_on_load` (header + `_HAS_MARK_RECALC` probe + old-dylib skip)** + narrowing tests + design note | 3-file txn; probes; ABI fuzz |
 | **M9a2** | C ABI part 2: `save_to_buffer`, `open_buffer`, writer exports (incl. `…_with_formulas_v2` dialect) + Python Editor/Writer methods + `finally` cleanup | 3-file txn; probes; boundary tests |

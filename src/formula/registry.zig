@@ -1641,6 +1641,21 @@ pub const functions = [_]Function{
         .epoch_sensitive = true,
         .impl = fnText,
     },
+
+    // ── M8b: PROPER — the one name of its row, over casing_v1. Word
+    //    segmentation decides WHICH scalars title-case, the M4f tables
+    //    decide what title-casing IS, and both halves live in
+    //    `unicode/casing.zig` (`toProper`) — this row is only the
+    //    wiring. Whole-string like UPPER/LOWER: no index survives it,
+    //    so no compatibility version or collation can reach it. ──
+    .{
+        .name = "PROPER",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &text1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnProper,
+    },
 };
 
 /// §5.9 call-position resolution: case-folded over the decoded symbol
@@ -3866,6 +3881,14 @@ fn fnLower(ctx: CallCtx, args: []const Value) FnError!Value {
     return producedText(try casing.toLower(ctx.arena(), textArg(args, 0)));
 }
 
+/// `PROPER(text)` — M8b. The whole derivation — which scalars begin
+/// words AND what title-casing does to them — is `casing.toProper`'s,
+/// so a second caller can never disagree with this one about either
+/// half.
+fn fnProper(ctx: CallCtx, args: []const Value) FnError!Value {
+    return producedText(try casing.toProper(ctx.arena(), textArg(args, 0)));
+}
+
 fn fnTrim(ctx: CallCtx, args: []const Value) FnError!Value {
     const s = textArg(args, 0);
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -5655,6 +5678,29 @@ test "M8a: the row's one name is regenerated from the inventory, never from pros
     try testing.expect(counted > 0);
 }
 
+// ─── M8b: PROPER, against the frozen inventory ────────────────────
+
+test "M8b: the row's one name is regenerated from the inventory, never from prose" {
+    var it = inventory();
+    var counted: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M8b")) continue;
+        counted += 1;
+        const f = lookup(e.name) orelse {
+            std.debug.print("M8b name not registered: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        };
+        try testing.expectEqualStrings(e.name, f.name);
+        // The wiring facts the fixtures rely on: one eager text slot,
+        // and nothing epoch-shaped on a whole-string row.
+        try testing.expectEqual(@as(u8, 1), f.arity.min);
+        try testing.expectEqual(@as(?u8, 1), f.arity.max);
+        try testing.expectEqual(CoercionClass.text, f.coercion.at(0));
+        try testing.expect(!f.epoch_sensitive);
+    }
+    try testing.expect(counted > 0);
+}
+
 const m7b3_milestone = "M7b3";
 const m7b3_batch = "F2-stats";
 
@@ -5707,7 +5753,7 @@ test "M7b3: the batch's size is regenerated from the inventory, never from prose
 }
 
 test "M7b3: the running total moves with the batch, counted from the file" {
-    const rows = [_][]const u8{ "M4c", "M4d", "M4e", "M4f", "M4g", "M5a2", "M7a", "M7b2", "M7b3", "M8a" };
+    const rows = [_][]const u8{ "M4c", "M4d", "M4e", "M4f", "M4g", "M5a2", "M7a", "M7b2", "M7b3", "M8a", "M8b" };
     var shipped: usize = 0;
     for (rows) |m| {
         var it = inventory();
@@ -5720,7 +5766,7 @@ test "M7b3: the running total moves with the batch, counted from the file" {
             shipped += 1;
         }
     }
-    try testing.expectEqual(@as(usize, 120), shipped);
+    try testing.expectEqual(@as(usize, 121), shipped);
 }
 
 test "M7b3: every F2-stats row declares all five fields, and its flags honestly" {
@@ -6158,11 +6204,11 @@ test "registry: lookup is case-insensitive and rejects unknown names" {
     try testing.expectEqualStrings("SUM", lookup("sum").?.name);
     // A name the frozen inventory holds and no row has reached yet.
     // `VLOOKUP` stood here until M4e registered it, `MEDIAN` until
-    // M7b3, `TEXT` until M8a, which is what this line is for: the
-    // example has to be a function that is genuinely still ahead of
-    // the ladder, and every batch that lands moves it.
-    try testing.expect(lookup("PROPER") == null); // frozen, M8b
-    try testing.expect(inInventory("PROPER"));
+    // M7b3, `TEXT` until M8a, `PROPER` until M8b, which is what this
+    // line is for: the example has to be a function that is genuinely
+    // still ahead of the ladder, and every batch that lands moves it.
+    try testing.expect(lookup("NUMBERVALUE") == null); // frozen, M8c
+    try testing.expect(inInventory("NUMBERVALUE"));
     try testing.expect(lookup("NOTAFUNCTION") == null);
 }
 
