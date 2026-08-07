@@ -36,6 +36,7 @@ const recalc = @import("zlsx_recalc");
 const synth = @import("synth_f1_mix");
 const crit = @import("synth_criteria_mix");
 const text = @import("synth_text_mix");
+const registry = @import("synth_registry_mix");
 
 const pkg = recalc.pkg;
 const Workbook = recalc.Workbook;
@@ -55,8 +56,9 @@ const Mode = enum { emit, open, recalc, save, phases };
 /// Which generator `emit` runs. Only `emit` cares: the other four modes
 /// take a fixture path and measure whatever workbook is behind it,
 /// which is why the criteria lane (M7b2) needed a flag here and not a
-/// second binary. `text` is M8c's lane, same reasoning.
-const Workload = enum { f1, criteria, text };
+/// second binary. `text` is M8c's lane and `registry` M9d's, same
+/// reasoning.
+const Workload = enum { f1, criteria, text, registry };
 
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
@@ -70,7 +72,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (args.len < 3) {
         try w.print(
             "usage: {s} <emit|open|recalc|save|phases> <fixture.xlsx>" ++
-                " [--workload f1|criteria|text] [--size named|small|tiny] [--rows N] [--out PATH]\n",
+                " [--workload f1|criteria|text|registry] [--size named|small|tiny] [--rows N] [--out PATH]\n",
             .{args[0]},
         );
         return 2;
@@ -89,6 +91,8 @@ pub fn main(init: std.process.Init) !u8 {
     var crit_identity = true;
     var text_geometry = text.small;
     var text_identity = true;
+    var registry_geometry = registry.small;
+    var registry_identity = true;
     var out_path: ?[]const u8 = null;
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
@@ -107,6 +111,8 @@ pub fn main(init: std.process.Init) !u8 {
                 crit_identity = true;
                 text_geometry = text.small;
                 text_identity = true;
+                registry_geometry = registry.small;
+                registry_identity = true;
             } else if (std.mem.eql(u8, args[i], "tiny")) {
                 geometry = synth.tiny;
                 named_size = false;
@@ -114,6 +120,8 @@ pub fn main(init: std.process.Init) !u8 {
                 crit_identity = false;
                 text_geometry = text.tiny;
                 text_identity = false;
+                registry_geometry = registry.tiny;
+                registry_identity = false;
             } else if (!std.mem.eql(u8, args[i], "named")) {
                 try w.print("unknown size: {s}\n", .{args[i]});
                 return 2;
@@ -131,6 +139,8 @@ pub fn main(init: std.process.Init) !u8 {
             crit_identity = false;
             text_geometry = .{ .data_rows = geometry.data_rows };
             text_identity = false;
+            registry_geometry = .{ .data_rows = geometry.data_rows };
+            registry_identity = false;
         } else if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
             i += 1;
             out_path = args[i];
@@ -157,6 +167,13 @@ pub fn main(init: std.process.Init) !u8 {
                     return 2;
                 }
                 return emitText(gpa, io, w, path, text_geometry, text_identity);
+            },
+            .registry => {
+                if (named_size) {
+                    try w.writeAll("the registry workload needs --size small|tiny or --rows N\n");
+                    return 2;
+                }
+                return emitRegistry(gpa, io, w, path, registry_geometry, registry_identity);
             },
         },
         .open => {
@@ -285,6 +302,41 @@ fn emitText(
                 "  The fixture IS the baseline's identity: re-measure the TEXT\n" ++
                 "  numbers and update `small_digest_sha256` in the same commit.\n",
             .{ text.small_digest_sha256, digest },
+        );
+        return 1;
+    }
+    return 0;
+}
+
+/// The registry workload's `emit`, under the same digest discipline:
+/// `small` is its identity size, and a baseline measured against
+/// different bytes describes a different workbook.
+fn emitRegistry(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    w: *std.Io.Writer,
+    path: []const u8,
+    geometry: registry.Geometry,
+    identity_size: bool,
+) !u8 {
+    const bytes = try registry.bytes(gpa, io, geometry);
+    defer gpa.free(bytes);
+
+    var hex: [registry.digest_len * 2]u8 = undefined;
+    const digest = registry.digestHex(bytes, &hex);
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+    try w.print(
+        "fixture={s} rows={d} cells={d} formula_cells={d} archive_bytes={d} sha256={s}\n",
+        .{ path, geometry.data_rows, geometry.cells(), geometry.formulaCells(), bytes.len, digest },
+    );
+
+    if (identity_size and !std.mem.eql(u8, digest, registry.small_digest_sha256)) {
+        try w.print(
+            "FAIL: registry workload digest drifted\n  recorded {s}\n  emitted  {s}\n" ++
+                "  The fixture IS the baseline's identity: re-measure the registry\n" ++
+                "  numbers and update `small_digest_sha256` in the same commit.\n",
+            .{ registry.small_digest_sha256, digest },
         );
         return 1;
     }

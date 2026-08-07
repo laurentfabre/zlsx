@@ -68,7 +68,7 @@ Status vocabulary is fixed by the site's pill styling — use only these:
 | ER | Recovery record | done | 1 wk | E4B, durability decision | The ~200-byte provenance record that makes a stripped vector set detectable. Hidden `<definedName>` + `docProps/custom.xml`; `embeddings()` returns `present`/`stripped`/`absent`. Validated against LibreOffice and openpyxl. |
 | E5 | Embeddings from Python | done | 2-3 wk | ER | Reach the vectors from Python. `zlsx.embeddings(path)` → present / stripped / absent; vectors as NumPy float32, `valid_mask` for tombstones, provenance recovered on a stripped workbook. |
 | E6 | Embeddings from the command line | planned | 2-3 wk | E5 | Add, prune and strip vectors without writing code. |
-| D1 | Compute formulas | planned | 41 PRs | C1 | Work out what the formulas in a workbook come to, and write the answers back where Excel would. Reversed 2026-08-02 — no longer out of scope. The whole ladder, M-1 to M9d, is in `goal_formula.md`; nobody has started it. |
+| D1 | Compute formulas | done | 41 PRs | C1 | Work out what the formulas in a workbook come to, and write the answers back where Excel would. Reversed 2026-08-02 — no longer out of scope. The whole ladder, M-1 to M9d, is in `goal_formula.md`; **v1 complete 2026-08-07** — all 175 frozen names registered, the §13 release gate and §9 perf checks run at M9d. |
 | D2 | Author charts | deferred | — | B1 | Deferred on the same reasoning. |
 
 <!-- ROADMAP:END -->

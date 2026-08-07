@@ -2741,7 +2741,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M9b** ✅ | Spark batch recalc (`feat/m9b-spark`): `zlsx.recalc="true"` activation in `zlsx.spark` — the driver reads each source ONCE, SHA-256s THAT buffer, recalcs the SAME buffer (`Editor.from_bytes` → `recalculate` → `save_to_buffer`), and runs schema inference + partition planning on the recalced snapshot; source files never mutated. Partitions carry (path, digest, resolved context — resolved ONCE per read, so one job observes one logical instant and one RNG stream — engine fingerprint); executors re-apply the one-buffer rule and refuse on digest drift (`SnapshotDriftError`) or engine mismatch (`EngineFingerprintMismatch`); retries re-derive identically, pinned by the mutate-between-verify-and-open race fixture over the `_read_file_bytes` seam. Per-executor byte-bounded LRU snapshot cache (`zlsx.recalcCacheMaxBytes` default 512 MiB, 0 = off, entry charged its snapshot length, keyed by digest + every resolved input + on_unsupported + fingerprint — never digest alone). `zlsx.recalcUtcOffsetMin` default 0 (UTC); `zlsx.recalc` parses strictly (a typo refuses, never reads as false); streaming + recalc refused at option validation from `ZlsxStreamReader.__init__`. All mechanism in `_tabular.py` (no pyspark, per the CI rule); snapshots never pickle (`__getstate__` drops the driver memo) | test_basic + test_spark_core 166 green; integration 24/24 vs local Spark 4 (activation, inference-on-snapshot, drift, fingerprint, retry-identity, race, streaming refusal through both paths); serverless leg PARKED — every databricks MCP tool fails pre-workspace with `ModuleNotFoundError: No module named 'rich.traceback'` |
 | **M9c1** ✅ | Shared deterministic solver contract FIRST (`feat/m9c1-tvm`): **`solve.zig`** — one Newton driver, ≤128 iterations, pinned \|Δx\| ≤ 1e-10, root selection IS the Newton path from the guess, **a domain-clamped step never converges** (a rootless residual chasing the −1 boundary runs its 128 iterations and answers `#NUM!` — never the fake root thirty-some halvings would fabricate under a bare step test) — every iteration polls THEN charges 4 units to the new **`WorkBudget`** (`run_inputs.zig`: node = 1 at `evalNode`, solver iteration = 4, nested callbacks re-charge by construction; §5.5's ≥1-poll-per-65 536-unit stride inside `charge`; the limit is identity, the poller is not; exhaustion refuses, cancellation is the engine's first own `error.Cancelled`, mapped like the driver's) threaded `Options.work` — evaluator + solvers on ONE meter, engine-level in v1 (the workbook/C knobs ride the row that can carry report fields; the ABI is frozen). + F4a-TVM (7, frozen: PMT, IPMT, PPMT, PV, FV, RATE, NPER) — **one `log1p`/`expm1` exponential spelling** (the annuity factor cancels catastrophically near r = 0 under naive `pow`, exactly where RATE's Newton walks; the residual's r = 0 arm lets Newton walk THROUGH zero), NPER closes through logarithms so RATE is the batch's only solver consumer (guess 0.1 when absent, 0 when explicitly empty), `#DIV/0!` for the spelled-out zero denominators / `#NUM!` for every other non-finite (N4a) / negative NPER is an ANSWER, nonzero type = beginning (OpenFormula). PMT's four canonical-unregistered pins flipped to `NPV`; running total 147 | Oracle-first (manifests predate F4a → every fixture spec_pinned, 0 oracle rows pinned — evidence at zero, a fourth time); convergence fixtures are Excel's own doc examples at full double precision, non-convergence is the all-positive-flows walk, mid-solve cancellation lands on the meter's receipt (base + 4·4 units at the fifth poll); combined-exhaustion: whole-cost−1 refuses inside the last iteration, whole-cost completes at remaining 0; zig 9727 unpiped, pytest 166 |
 | **M9c2** ✅ | F4a-flows (8, frozen: NPV, IRR, XNPV, XIRR, SLN, SYD, DB, DDB) (`feat/m9c2-flows`): **two discount spellings, on purpose** — NPV/IRR discount by POSITION (integer powers of 1+r accumulated by multiplication, so a rate below −1 alternates sign and stays an ANSWER; the one impossible denominator is r = −1 exactly, a spelled-out `#DIV/0!`; IRR's flow 0 is today where NPV's first flow is one period out — each function's documented own convention), XNPV/XIRR discount by DATE (the continuous exponent (d−d₀)/365 over the batch's `log1p`/`expm1` spelling, domain 1 + r > 0, N4a's `#NUM!` with no explicit gate). Ranges fold per §5.3c through `collectNumbers` — SUM's range/direct split verbatim, first error in §5.6a order wins, a text cell consumes no period — and XNPV/XIRR pair flows to dates by position AFTER each side folds (counts must agree, zero pairs anchor nothing: both `#NUM!`); date serials truncate + domain-check under the ACTIVE epoch (`wholeSerial` — the date batch's `#NUM!` held over the XNPV doc page's `#VALUE!`, a recorded pin), both rows `epoch_sensitive`. IRR/XIRR consume `solve.newton` exactly as RATE drives it (guess 0.1 absent / 0 explicitly empty, domain −1, 4-unit iterations on the SAME `WorkBudget`, one `solvedRate` seam) behind Excel's documented one-signed-schedule `#NUM!` precondition, read off the FOLDED flows; propagation splits by M7b3's shape rule — collection-first IRR/XIRR take §5.3c's declaration order themselves, scalar-first NPV/XNPV let the dispatcher propagate; the four schedule readers are the batch's not-liftable rows. Depreciation four in closed form: SLN's life is its spelled `#DIV/0!`; SYD/DDB's per ∈ [1, life] `#NUM!` bounds force life ≥ 1 so NEITHER has a `#DIV/0!` plane; DB truncates life/period/month (a discrete schedule around one partial first year — the stub period life+1 exists iff month < 12, per > life at month 12 is `#NUM!`, the 3-decimal rate rounding is Excel's own text, cost and life its two spelled `#DIV/0!`s); DDB stays continuous — `book = max(cost·qᵖᵉʳ⁻¹, salvage)`, the salvage floor IS the memory of every earlier period's cap, factor > life included. NPV's four canonical-unregistered pins flipped to `CONVERT`; running total 155 | Oracle-first (manifests predate F4a → every fixture spec_pinned, 0 oracle rows pinned — evidence at zero, a fifth time); value rows are Excel's own doc examples at full double precision (NPV 1188.44 / 41 922.06, IRR 8.66% / −44.35%, XNPV 2086.65, XIRR 37.34%, SLN 2250, SYD 4090.91 / 409.09, DB's month-7 table incl. the 15 845.10 stub year, DDB 1.32 / 40 / 480 / 306 / 22.12 + the cap-binds-immediately pair); non-convergence is the rootless mixed-sign residual ({−1,3,−3} — no root at ANY rate — 128 honest iterations on BOTH solvers); mid-solve cancellation lands on the meter's receipt (base + 4·4 at the fifth poll), combined-exhaustion whole−1/whole on IRR; a 1904 fixture bounds XNPV's serials by the active epoch; zig 9807 unpiped, pytest 166 |
-| **M9d** | F4b engineering (20, frozen: CONVERT, DELTA, GESTEP, BIN2DEC, DEC2BIN, HEX2DEC, DEC2HEX, OCT2DEC, DEC2OCT, BITAND, BITOR, BITXOR, BITLSHIFT, BITRSHIFT, COMPLEX, IMREAL, IMAGINARY, IMABS, IMSUM, IMPRODUCT); **v1 complete**; §13 release gate | Oracle-first; rg allowlist; **absolute + regression perf checks (§9)** |
+| **M9d** ✅ | F4b engineering (20, frozen: CONVERT, DELTA, GESTEP, BIN2DEC, DEC2BIN, HEX2DEC, DEC2HEX, OCT2DEC, DEC2OCT, BITAND, BITOR, BITXOR, BITLSHIFT, BITRSHIFT, COMPLEX, IMREAL, IMAGINARY, IMABS, IMSUM, IMPRODUCT) (`feat/m9d-eng`) — **v1 complete: all 175 frozen names registered, and the ladder's first batch with NO `#DIV/0!` plane** (nothing divides by a caller's value; the planes are the doc pages' own — CONVERT's three `#N/A` ways, the `#NUM!` domains, `#VALUE!` for coercion and suffixes, N4a for every other non-finite). CONVERT over the frozen doc-page unit table (case-sensitive, exact-name-first — `min` is the minute, `e` the erg; binary prefixes information-only; prefixed powers raised, km2 = (1000 m)²; Kelvin the one prefixable temperature; constants as identities — slug = lbf·s²/ft, psi = lbf/in²; u/eV pinned; the doc's gal→l digits vs its own factor a recorded divergence); the base six over one ten-character two's-complement window (40/30/10 bits, the sign bit reachable only at ten characters, negatives ignore places, places ∈ [1,10] pinned, hex digits fold where unit names do not); BIT* over 48-bit fields (constraint violations `#NUM!` incl. non-integers, coercion `#VALUE!`, \|shift\| ≤ 53 read before the sign flips, BITRSHIFT(n,s) IS BITLSHIFT(n,−s)); the complex six over one exact parse (greedy exponent, lowercase suffixes, no spaces — COMPLEX's output always re-parses) + one `formatNumber` format (unit imaginary bare), the IMSUM/IMPRODUCT suffix conflict pinned `#VALUE!`, IMABS the spelled √(x²+y²). **The canonical-unregistered pin retired**: registry = inventory in both directions (175 from the TSV), the refusal example now the out-of-inventory `IMDIV`, permanent by §7. **M-1 cherry-picked into the chain** (`3bcff95` — the release sweep found its five rows undischarged); §13 gate run, recorded, passes (§13.2 gained class H). §9 run and recorded (§9.1): all four `--gate` lanes green, `synth_registry_mix` lane added (~10.8 µs marginal per mixed formula); end-to-end 908.62 ms UNDER, evaluate 936.98 ms **1.87× OVER**, first-recalc RSS 506.7 MiB **33.4× OVER** — both ⛔ carried to the release cut as owner decisions | Oracle-first (manifests predate F4b → every fixture spec_pinned, 0 oracle rows pinned — evidence at zero, a sixth time); rg allowlist §13.2 A–H, zero unclassified; **absolute + regression perf checks (§9) run with results recorded**; zig 9841 unpiped, pytest 166 |
 
 **M10+ backlog**: F5 (census-ordered); `<xm:f>` route-through; namespace-aware
 scanners; **future compatibility versions beyond CV2** (CV1+CV2 are v1 scope,
@@ -4841,6 +4841,58 @@ any of those layers — a fold that starts allocating per code point, a
 renderer that re-parses its code per call — shows up as a slope change
 here before any correctness test notices.
 
+**M9d — the registry lanes and the v1 absolute checks** (`feat/m9d-eng`,
+same host, same methodology, recorded 2026-08-07; workload
+`synth_registry_mix` at its recorded digest — twelve row-local formulas
+per data row spanning every batch family: F1a arithmetic and logic,
+M7b3's MEDIAN, F1c dates and text, M8a's numfmt under TEXT, F4a's PMT
+and SLN, and F4b's CONVERT / DEC2HEX / BITXOR / IMABS∘COMPLEX — the
+TEXT fixture's scales-with-the-data shape, widened to the whole
+registry). The baseline JSON is `tests/bench/baseline_m9d_registry.json`;
+the F1-mix, criteria AND text lanes re-ran in the same session and all
+three `compare_bench.py --gate` comparisons stayed green (F1 named
+`recalc` within +3.7 % of the M5d4 median — under every flag
+threshold), which is the "beside, not instead" half of this row's gate.
+
+| Workload | Stored cells | Formula cells | `open` | `recalc` | `save` | p95 (`recalc`) | σ (`recalc`) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `registry_mix_tiny` | 17 000 | 12 000 | 1.65 ms | 112.74 ms | 114.74 ms | 114.64 ms | 0.92 ms |
+| `registry_mix_small` | 170 000 | 120 000 | 1.97 ms | 1 276.06 ms | 1 276.02 ms | 1 352.50 ms | 35.84 ms |
+
+**Read it as follows — the registry's mixed marginal cost.** The formula
+count scales ×10 with the rows and evaluate (= recalc − open: 111.1 ms
+and 1 274.1 ms) follows at ×11.5; the marginal cost of one more mixed
+formula is `(1 276.06 − 112.74) / 108 000 ≈ 10.8 µs` (~129 µs per
+twelve-formula row), and the extrapolated fixed cost at zero rows is
+within noise of zero. The 10.8 µs buys, per cell on average, a twelfth
+each of: a CONVERT unit-table resolution, a DEC2HEX window format, a
+BITXOR domain check, a COMPLEX format plus an IMABS re-parse, a PMT
+closed form, an SLN, an EOMONTH serial walk, a numfmt TEXT render, a
+MEDIAN of three, an UPPER, a ROUND and an IF — the widest per-formula
+mix any lane prices, ~1.5× the TEXT lane's 7.1 µs. `save` ≈ `recalc` at
+both sizes: serialize + commit stays the phase that never moved.
+
+**The v1 absolute checks (the ceilings §9 froze at M5d3), run at M9d** —
+ReleaseFast, N=20, medians, the digest-gated named workload:
+
+| Check | Ceiling | Measured | Verdict |
+|---|---:|---:|---|
+| evaluate (recalc − open) | ≤ 500 ms | **936.98 ms** | ⛔ **1.87× over** (M5d4: 1.81×) — owner waiver required at the release cut |
+| end-to-end (`save`) | ≤ 1 s | **908.62 ms** | ✅ under |
+| peak RSS, first recalc, ReleaseSafe lane, baseline-adjusted | ≤ 3 × model bytes = 15.15 MiB (model = 5 294 703 B decompressed) | **506.7 MiB** (533 102 592 B peak − 1.77 MiB process baseline) | ⛔ **33.4× over** — the first measurement this ceiling has ever received; owner waiver or a memory row required at the release cut |
+
+RSS methodology: `zlsx-bench-recalc` built ReleaseSafe (the RSS lane's
+pinned mode); baseline = `/usr/bin/time -l` peak of a usage invocation
+(no file opened); measured = the same probe on `recalc` over the named
+fixture, first recalc, zero retained generations. The evaluate gap did
+not move between M5d4 and M9d — +3.7 % across 20 more registered names
+is under every regression threshold — and the RSS gap is new
+information, not a regression: no §9.1 row ever recorded an RSS number
+before this one. Neither ceiling is renegotiated here. v1 is
+code-complete with two ⛔ rows on the release gate, and both are the
+owner's decision — waive, or spend a perf/memory row — before the
+first release that carries the engine.
+
 ---
 
 ## 10. Refusal & error taxonomy
@@ -5493,6 +5545,119 @@ fixtures, the flow solvers' budget suite, the 1904 bound).
     `spec_pinned`, and the parked §8.2 Excel leg (standing ask: quit
     `Book1`, run `scripts/oracle/regenerate.sh`) is what moves it.
 
+**M9d decisions (shipped 2026-08-07).** Eleven points, in
+`src/formula/registry.zig` (twenty rows, the frozen unit table, the
+ten-character window, the 48-bit field, one complex parse/format pair)
+and `src/formula/eval.zig` (the batch fixtures) — the ladder's last
+batch, and the run that closed the v1 gates.
+
+1.  **F4b is the first batch with no `#DIV/0!` plane.** Nothing in the
+    twenty divides by a value a caller controls — the failure planes
+    are the doc pages' own: `CONVERT`'s three `#N/A` ways (a unit that
+    does not exist, a binary prefix off the information group, a
+    cross-group pair), `#NUM!` for every base-conversion and BIT*
+    domain violation and for complex text not in x+yi form, `#VALUE!`
+    exactly where the docs put it (nonnumeric arguments via the
+    dispatcher's coercion, a suffix that is not lowercase `i`/`j`, a
+    suffix conflict). Every other non-finite is N4a's `#NUM!` — a
+    CONVERT overflow (cubic light-years into cubic angstroms) and an
+    IM* overflow refuse through `arith`/`formatComplex`, never through
+    a gate the arithmetic never asked for.
+2.  **CONVERT's table is the doc page, frozen, with its constants
+    written as the identities they are.** Groups, names and prefixes
+    case-sensitive per the doc's own line; exact factors for the
+    defined units (lbm 453.59237 g, ft 0.3048 m, gal 3.785411784 l,
+    BTU 1055.05585262 J); derived units as products so the identities
+    hold to the bit (slug = lbf·s²/ft, psi = lbf/in², flb = lbf·ft,
+    HPh = HP·3600 s); the two measured constants pinned:
+    u = 1.6605402e-24 g (CODATA-86, the ATP-era interop constant) and
+    eV = 1.602176462e-19 J. Two recorded divergences for the parked
+    §8.2 leg: the doc page's gal→l example digits (22.71741274)
+    disagree with the doc's own exact factor
+    (6 × 3.785411784 = 22.712470704 — the factor wins), and the doc
+    page lists no `pond`, so zlsx answers `#N/A` for it.
+3.  **Unit resolution is exact-name-first, and powers raise the
+    prefix.** `min` is the minute, never milli-`in`; `e` is the erg
+    exactly and the dekao prefix only ahead of a metric unit (the doc
+    spells dekao both `da` and `e`); binary prefixes reach the
+    information group only; Kelvin is the one temperature a prefix
+    attaches to (the group's absolute scale); a prefixed square or
+    cube raises the prefix with the unit — `km2` is (1000 m)², 10⁶ m².
+4.  **The base-conversion six share one ten-character window.** 40
+    bits hex, 30 octal, 10 binary; two's complement applies exactly at
+    ten characters — a shorter string can never reach the sign bit, so
+    no length flag exists; number and places truncate toward zero; a
+    negative emits the full ten characters and ignores places (the
+    doc's own text); places ∈ [1, 10] — the output field is ten
+    characters by definition, and places beyond it is the pinned
+    `#NUM!` (the doc is silent above 10; §8.2 arbitrates). Hex digits
+    fold both cases; unit names and complex suffixes do not — the
+    asymmetry is Excel's own.
+5.  **BIT* constraint violations are `#NUM!`, coercion failures
+    `#VALUE!`.** A negative, fractional or ≥ 2⁴⁸ operand is `#NUM!`
+    (BITAND's doc line held over the BITLSHIFT page's looser wording —
+    one rule for the family); |shift| > 53 reads the CALLER's argument
+    before any sign flips; a left shift past 2⁴⁸ − 1 is `#NUM!`, never
+    a wrap; BITRSHIFT(n, s) IS BITLSHIFT(n, −s) — one arithmetic
+    behind both names.
+6.  **Complex text is the value: one parse, one format.** The grammar
+    is exact — no spaces, lowercase `i`/`j` only, coefficients with an
+    optional exponent taken greedily (`3e+4i` is 30000·i, because a
+    bare `3e` is not a number the other reading could keep) — so
+    COMPLEX's own output always re-parses; the format goes through
+    `formatNumber` (the one general-format seam), writes a unit
+    imaginary bare (`i`, `-i`), drops a zero imaginary and leaves a
+    zero real implicit. COMPLEX's suffix argument is the doc's own
+    `#VALUE!` for anything but lowercase `i`/`j`, checked even when
+    the imaginary is zero and the suffix never prints.
+7.  **A suffix conflict across IMSUM/IMPRODUCT arguments is `#VALUE!`,
+    and it is a pin.** The doc pages are silent; two texts that
+    disagree about the imaginary unit's name are not two numbers in
+    one notation, and notation failures live on the coercion plane.
+    The output suffix is whichever the arguments used, `i` when none
+    spoke. IMABS is the spelled √(x² + y²) — coefficients big enough
+    to overflow the squares refuse through N4a rather than being
+    rescued by a `hypot` the doc never promised; arithmetic over
+    intuition, standing.
+8.  **The canonical-unregistered pin retired into the closed world.**
+    `CONVERT` registered as M9c2 promised, and the pin has no
+    successor name — no frozen name lacks a registry row anymore. The
+    four sites: the registry's lookup test became the
+    inventory ⊆ registry loop (beside the standing
+    registered ⊆ inventory test, registry and inventory are now the
+    same names in both directions), and the eval + workbook ×2 refusal
+    tests moved to `IMDIV` — a real Excel name the v1 inventory
+    deliberately excludes, permanent by construction because §7 makes
+    adding a row a ladder change, not an implementation detail.
+    Running total **175**, counted from the TSV: the inventory is
+    fully registered.
+9.  **M-1 entered the chain at the gate that needed it.** The §13
+    release-cut sweep found five checklist rows still undischarged in
+    the tree; the flip existed the whole time — `3bcff95`, authored
+    2026-08-03 on `docs/m-1-planning-flip` and never stacked into the
+    ladder. Cherry-picked as its own commit (one commit per row,
+    held), conflicts resolved keeping the later checklist states; the
+    sweep then classified every hit (§13's dated run record, class H
+    added per the re-classify rule) and the gate passes.
+10. **The §9 checks ran, and two ceilings say no.** Regression: all
+    four lanes green under `compare_bench.py --gate` (F1 named within
+    +3.7 % of M5d4's median). New lane: `synth_registry_mix`, twelve
+    formulas per row across every batch family, ~10.8 µs marginal per
+    mixed formula, baseline recorded (§9.1). Absolute: end-to-end
+    908.62 ms is **under** its 1 s ceiling; evaluate 936.98 ms is
+    **1.87× over** its 500 ms ceiling (unchanged from M5d4's 1.81×);
+    peak first-recalc RSS 506.7 MiB baseline-adjusted is **33.4×
+    over** the 3×-model-bytes ceiling — the first measurement that
+    ceiling has ever received. Recorded, not renegotiated: both are
+    owner decisions at the release cut — waive, or spend a
+    perf/memory row first.
+11. **Evidence at zero, a sixth time.** The manifests predate F4b,
+    every fixture ships `spec_pinned`, and the parked §8.2 Excel leg
+    (standing ask: quit `Book1`, run `scripts/oracle/regenerate.sh`)
+    is what moves it — the suffix-conflict `#VALUE!`, the
+    places ∈ [1, 10] cap, the doc page's gal→l digits and the u/eV
+    constants are the rows that leg would arbitrate first.
+
 ---
 
 ## 13. Documentation flips
@@ -5526,7 +5691,7 @@ line references and are corrected in place.
 | ~~`src/formula/tokenizer.zig:566-575`~~ (scope note made false by the new token kinds) | tokenizer scope comment | **M1a — done**: module doc rewritten with the tokens; `rewriter.zig`'s matching "classifies these as `.unknown`" claim flipped too |
 | ~~`build.zig` ("zlsx and zlsx_pkg cannot coexist" — contradicted by `zlsx_recalc`)~~ | module-graph comment | **M5c — done**: the claim was already false (`cli_mod`, `corpus_mod` and `package_mod` all import both); what could not coexist under 0.15.2 was a *file* claimed by two module trees, which `AGENTS.md` marks history on 0.16. Comment rewritten to the real reason the RSS probes are split (a per-process RSS delta), and the graph is now gated by `assertAcyclicModules`. `build.zig` joins the release rg scan |
 | ~~`src/writer.zig:1645-1647`~~ (claimed the reader does not expose formula text) | stale reader claim | **M-1: no action — already resolved.** The claim is gone from the tree; `:1645-1647` is now unrelated test code. The extended read-side regex (`reader (does not\|doesn't\|cannot\|can't) (expose\|surface\|return\|read).*formula`, plus `formula text.*(not exposed\|unavailable)`) over `src/ pkg/ include/ bindings/ docs/ README.md` returns zero hits (2026-08-02). The reader does expose it: `Rows.formulaStrings()` / `Rows.formulaRefs()`, `src/xlsx.zig:1739-1770` |
-| `AGENTS.md` | add formula conventions + harness how-to | **M4c** |
+| ~~`AGENTS.md`~~ | add formula conventions + harness how-to | **M4c — done**: the conventions section names the formula modules and the harness |
 
 ### 13.1 M-1 disposition (2026-08-02)
 
@@ -5560,6 +5725,7 @@ a new claim and blocks.
 | **E · `<dimension>` / Excel-recomputes-on-open** | `pkg/sheet_edit.zig:375,650,674,1146,1169,1223` · `docs/plans/load-modify-save.md:27,158,279` · `docs/plans/cell-mutate.md:6,49,67,207,255` · `docs/plans/structural-edits.md:100` · `docs/plans/post-0.2.9-roadmap.md:148` · `docs/plans/refusal-audit.md:62` | Structural-edit behaviour: zlsx leaves `<dimension>`/totals for Excel to fix on open. Not a claim about computing formulas |
 | **F · embedding-digest recompute** | `docs/plans/embeddings-in-xlsx.md:59,564,733,742,744,945` · `docs/plans/emb-4-compat-matrix.md:178,186` · `pkg/recovery_record.zig:132-133` · `pkg/workbook.zig:566,2167` · `include/zlsx.h:1399` · `src/c_abi.zig:4642` · `bindings/python/zlsx/__init__.py:3330` · `goal_plan.md:198` | `xxh3` content-digest recomputation in the embedding arc |
 | **G · factual formula-text description** | `docs/jq-for-excel.md:200` · `src/writer.zig:834,988` · `bindings/python/zlsx/__init__.py:1563` · `bindings/python/README.md:247` | Describes what zlsx does with formula *text* and caller-supplied cached values — accurate today and unaffected by the ladder until the row that owns it flips |
+| **H · the engine itself and its shipped surface** (added by the M9d run) | `src/formula/*` (all hits) · `src/formula_cli.zig` · `src/c_abi.zig` · `src/cli.zig` (eval/recalc families) · `pkg/workbook.zig` · `pkg/recalc_run.zig` · `pkg/recalc_txn.zig` · `pkg/store.zig` (save-path recalc seams) · `pkg/control.zig:59` · `include/zlsx.h` · `build.zig` (formula-module graph + bench lanes) · `bindings/python/zlsx/*.py` + `bindings/python/tests/*` (recalc API + tests) · `tests/bench/*` generators · `docs/cli.md` § Formula · `README.md` eval/recalc bullets · `docs/plans/c-abi-status-v1.md` · the two binding READMEs' recalc sections · `docs/benchmarks.md` recalc lanes | Statements **by** the code that evaluates, describing evaluation it performs, or docs describing the shipped eval/recalc surface. These files did not exist (or had no engine) at the M-1 sweep; none of their hits is a scope claim — the engine talking about evaluating is the opposite of "zlsx never computes" |
 
 **Flagged, not fixed by M-1** (outside its mandate, no formula claim):
 `bindings/python/zlsx/__init__.py:2475` and `src/writer.zig:30-34` both
@@ -5574,6 +5740,25 @@ README.md docs/ bindings/ goal*.md src/ include/ pkg/ build.zig` — every hit o
 **reviewed allowlist** (§13.2, committed at M-1) or on a discharged checklist
 row (§13.1), or the release blocks. `tests/` is deliberately outside the
 scanned set. Re-classify, never widen the regex, when a new hit appears.
+
+**Sweep run 2026-08-07 (M9d — the release-cut run).** The regex over the
+scanned set returns **1 310 hits**. Disposition: every checklist row above
+is struck — the M-1 flip commit (`3bcff95`, authored 2026-08-03 on
+`docs/m-1-planning-flip` and cherry-picked into the ladder chain at M9d,
+where the sweep found its five rows still undischarged in the tree) flips
+`goal_plan.md`'s D1 row, `goal_evol.md`'s scope line, the
+post-0.2.9-roadmap's deferrals, the literal-masking misstatement and the
+four "Excel will recompute" labels; M1a, M4c, M5c, M5d3, M6, M9a2 and M9b
+landed theirs with their code. The remaining hits classify under §13.2
+A–G plus **H**, added by this run per the re-classify rule: the engine
+and its shipped surface did not exist at the M-1 sweep, and the engine
+describing the evaluation it performs is not a scope claim. `goal_plan.md`'s
+D1 row flips a second time at M9d — planned → **done, v1 complete
+2026-08-07** — and the kb site rebuild it triggers ran per
+`goal_plan.md:3-7`. §13.1's one ⛔ (the LICENSE third-party-data
+carve-out) was discharged before M9d: `THIRD_PARTY_NOTICES.md` carries the
+Unicode-License-V3 attribution for the `DerivedCoreProperties.txt` tables.
+Zero unclassified scope claims — **the gate passes**.
 
 ---
 

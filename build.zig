@@ -2199,6 +2199,16 @@ pub fn build(b: *std.Build) void {
     bench_text_mix_mod.addImport("zlsx_control", control_mod);
     bench_text_mix_mod.addImport("zlsx", zlsx_mod);
 
+    // M9d's mixed full-registry workload, same shape and same discipline.
+    const bench_registry_mix_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/synth_registry_mix.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = single_threaded,
+    });
+    bench_registry_mix_mod.addImport("zlsx_control", control_mod);
+    bench_registry_mix_mod.addImport("zlsx", zlsx_mod);
+
     // Imports `zlsx_recalc`, so the ReleaseFast bench lane compiles the
     // third public module too — a composition that only ever built in
     // Debug unit tests would be a surface nothing releases exercises.
@@ -2213,6 +2223,7 @@ pub fn build(b: *std.Build) void {
     bench_recalc_mod.addImport("synth_f1_mix", bench_f1_mix_mod);
     bench_recalc_mod.addImport("synth_criteria_mix", bench_criteria_mix_mod);
     bench_recalc_mod.addImport("synth_text_mix", bench_text_mix_mod);
+    bench_recalc_mod.addImport("synth_registry_mix", bench_registry_mix_mod);
     const bench_recalc_exe = b.addExecutable(.{
         .name = "zlsx-bench-recalc",
         .root_module = bench_recalc_mod,
@@ -2253,6 +2264,9 @@ pub fn build(b: *std.Build) void {
 
     const bench_text_mix_tests = b.addTest(.{ .root_module = bench_text_mix_mod });
     test_step.dependOn(&b.addRunArtifact(bench_text_mix_tests).step);
+
+    const bench_registry_mix_tests = b.addTest(.{ .root_module = bench_registry_mix_mod });
+    test_step.dependOn(&b.addRunArtifact(bench_registry_mix_tests).step);
 }
 
 /// The three committed oracle manifests, as anonymous imports.
