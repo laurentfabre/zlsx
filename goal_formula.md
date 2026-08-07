@@ -2734,7 +2734,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M9a1** ✅ | C ABI part 1 (`feat/m9a1-cabi`): `zlsx_status_v1` (0/-1/-2/-3/-5, -4 reserved; ONE error→status mapping — the fourteen-plane vocabulary detected by name against `PlaneTwo` so a fifteenth plane maps itself; ABI-contract violations are -1, never -2) + the six descriptor structs (`run`/`resolved`/`recalc_report`/`value`/`value_elem`/`diag`+`census_entry`, every offset pinned three ways: comptime asserts in `c_abi.zig`, C `static_assert`s in `tests/c_abi_smoke.c`, ctypes `sizeof` asserts in `_ffi.py`) + `zlsx_editor_recalculate`/`zlsx_editor_evaluate` over the M5d2 pipeline (evaluate = M6 CLI semantics exactly) + **`zlsx_engine_fingerprint()`** (`"zlsx <semver>; excel_fp_rules_v1; rng_v1; collation_v1; <triple>; <build-hash>"` — rule versions read from the engine through `recalc_run.rule_versions`, so the identity cannot drift from the code) + **`zlsx_editor_mark_recalc_on_load`** + the cancel-token trio (pulled into part 1: R9-12 is *about* it) + three release fns (`zlsx_buffer_release` stages with M9a2's buffers). **C ABI module hard-set multi-threaded (R9-12)**: comptime assertion, `-Dsingle-threaded` narrowed to CLI-only, both shapes CI-compiled from one invocation. Committed design note `docs/plans/c-abi-status-v1.md` | 3-file txn (header + impl + `_ffi.py` probes `_HAS_FINGERPRINT`/`_HAS_MARK_RECALC`/`_HAS_RECALC`/`_HAS_EVAL`/`_HAS_CANCEL`); header compile gate; narrowing + canary-tail + boundary tests; ABI fuzz green |
 | **M9a2** ✅ | C ABI part 2 (`feat/m9a2-cabi2`): `zlsx_editor_save_to_buffer` + `zlsx_open_buffer` + `zlsx_buffer_release` (status-style, prepped `(NULL,0)` outputs; legacy `zlsx_buffer_free` untouched) over a **new pkg buffer seam** — `PartStore.saveCommitted` split into `checkArchiveBounds` + `emitArchive(w, poller)` shared with `PartStore.saveToOwnedBuffer`, `Workbook.save` split into `applySavePlans` + store save so `Workbook.saveToOwnedBuffer` writes the identical archive, `Editor.openBuffer` (dupe, borrow-ends-at-call per Book precedent) + two-path `Editor.saveToOwnedBuffer` — plus **`zlsx_editor_save_with_recalc`** (the §5.7.9 transaction across the ABI; **durability slot live**, pinned by the injected dir-fsync fixture) and **`zlsx_writer_save_with_recalc`** (= `zlsx_recalc.writerSaveWithRecalc` across the boundary — c_abi gains the `zlsx_recalc` import rather than re-inlining the composition). **`…_with_formulas_v2`**: `zlsx_formula_cell_v1` (40 B, array element, pinned three ways) + the fresh writer's **CSE rectangle state machine** (`FormulaCell` + `writeRowWithFormulaCells`; anchor-only ref, members carry `<v>`/no `<f>`, empty members become bare `<c>` placeholders, overlap/member-formula refusals at write, completeness gate in `projectSheets` on every save path; `dynamic_array` reserved ABI, refused pending §5.8b). **Refusal-census seam honest** (decision M9a1-4 closed): `recalc_txn.Refusal` owns a bounded census, `Options.refusal_out` moves it out, `-2` diags carry the refusing cell. **Python leg per §12.3**: `recalculate` / `save_with_recalc` / `evaluate` / `save_to_buffer` / `from_bytes` / `mark_recalc_on_load`, `Writer.save(recalculate=RecalcOptions(...))`, `FormulaSpec(.cse)` + row-wide `dialect=`, `ExcelError`/`Matrix`/`EvalResult`/`RecalcReport`/`Resolved`/`CensusEntry`, `ZlsxFormulaRefusal(error_name, cells, census)`, worker-thread cancellation (TimeoutError pre-commit only; post-commit ⇒ `cancelled_late`), every release fn in `try/finally` | 3-file txn (probes `_HAS_SAVE_BUFFER`/`_HAS_SAVE_WITH_RECALC`/`_HAS_WRITER_RECALC`/`_HAS_FORMULAS_V2` + smoke.c `#error` gate + boundary/canary tests + M9a2 descriptor fuzz); pytest 174 green |
 | **M9b** ✅ | Spark batch recalc (`feat/m9b-spark`): `zlsx.recalc="true"` activation in `zlsx.spark` — the driver reads each source ONCE, SHA-256s THAT buffer, recalcs the SAME buffer (`Editor.from_bytes` → `recalculate` → `save_to_buffer`), and runs schema inference + partition planning on the recalced snapshot; source files never mutated. Partitions carry (path, digest, resolved context — resolved ONCE per read, so one job observes one logical instant and one RNG stream — engine fingerprint); executors re-apply the one-buffer rule and refuse on digest drift (`SnapshotDriftError`) or engine mismatch (`EngineFingerprintMismatch`); retries re-derive identically, pinned by the mutate-between-verify-and-open race fixture over the `_read_file_bytes` seam. Per-executor byte-bounded LRU snapshot cache (`zlsx.recalcCacheMaxBytes` default 512 MiB, 0 = off, entry charged its snapshot length, keyed by digest + every resolved input + on_unsupported + fingerprint — never digest alone). `zlsx.recalcUtcOffsetMin` default 0 (UTC); `zlsx.recalc` parses strictly (a typo refuses, never reads as false); streaming + recalc refused at option validation from `ZlsxStreamReader.__init__`. All mechanism in `_tabular.py` (no pyspark, per the CI rule); snapshots never pickle (`__getstate__` drops the driver memo) | test_basic + test_spark_core 166 green; integration 24/24 vs local Spark 4 (activation, inference-on-snapshot, drift, fingerprint, retry-identity, race, streaming refusal through both paths); serverless leg PARKED — every databricks MCP tool fails pre-workspace with `ModuleNotFoundError: No module named 'rich.traceback'` |
-| **M9c1** | **Shared deterministic solver contract FIRST** (iterations ≤128 charged to a shared **`WorkBudget`** threaded through evaluator + solvers — units: node 1, solver iteration 4, nested callbacks re-charge; combined-exhaustion tests; poll points; Excel-compatible guesses — RATE/IRR 0.1 — and root selection; pinned tolerance; `#NUM!` on domain/convergence failure) + F4a-TVM (7, frozen: PMT, IPMT, PPMT, PV, FV, RATE, NPER) | Oracle-first; convergence/non-convergence/cancellation fixtures |
+| **M9c1** ✅ | Shared deterministic solver contract FIRST (`feat/m9c1-tvm`): **`solve.zig`** — one Newton driver, ≤128 iterations, pinned \|Δx\| ≤ 1e-10, root selection IS the Newton path from the guess, **a domain-clamped step never converges** (a rootless residual chasing the −1 boundary runs its 128 iterations and answers `#NUM!` — never the fake root thirty-some halvings would fabricate under a bare step test) — every iteration polls THEN charges 4 units to the new **`WorkBudget`** (`run_inputs.zig`: node = 1 at `evalNode`, solver iteration = 4, nested callbacks re-charge by construction; §5.5's ≥1-poll-per-65 536-unit stride inside `charge`; the limit is identity, the poller is not; exhaustion refuses, cancellation is the engine's first own `error.Cancelled`, mapped like the driver's) threaded `Options.work` — evaluator + solvers on ONE meter, engine-level in v1 (the workbook/C knobs ride the row that can carry report fields; the ABI is frozen). + F4a-TVM (7, frozen: PMT, IPMT, PPMT, PV, FV, RATE, NPER) — **one `log1p`/`expm1` exponential spelling** (the annuity factor cancels catastrophically near r = 0 under naive `pow`, exactly where RATE's Newton walks; the residual's r = 0 arm lets Newton walk THROUGH zero), NPER closes through logarithms so RATE is the batch's only solver consumer (guess 0.1 when absent, 0 when explicitly empty), `#DIV/0!` for the spelled-out zero denominators / `#NUM!` for every other non-finite (N4a) / negative NPER is an ANSWER, nonzero type = beginning (OpenFormula). PMT's four canonical-unregistered pins flipped to `NPV`; running total 147 | Oracle-first (manifests predate F4a → every fixture spec_pinned, 0 oracle rows pinned — evidence at zero, a fourth time); convergence fixtures are Excel's own doc examples at full double precision, non-convergence is the all-positive-flows walk, mid-solve cancellation lands on the meter's receipt (base + 4·4 units at the fifth poll); combined-exhaustion: whole-cost−1 refuses inside the last iteration, whole-cost completes at remaining 0; zig 9727 unpiped, pytest 166 |
 | **M9c2** | F4a-flows (8, frozen: NPV, IRR, XNPV, XIRR, SLN, SYD, DB, DDB) | Oracle-first; solver fixtures |
 | **M9d** | F4b engineering (20, frozen: CONVERT, DELTA, GESTEP, BIN2DEC, DEC2BIN, HEX2DEC, DEC2HEX, OCT2DEC, DEC2OCT, BITAND, BITOR, BITXOR, BITLSHIFT, BITRSHIFT, COMPLEX, IMREAL, IMAGINARY, IMABS, IMSUM, IMPRODUCT); **v1 complete**; §13 release gate | Oracle-first; rg allowlist; **absolute + regression perf checks (§9)** |
 
@@ -5292,6 +5292,115 @@ gate).
     stale-cache workbook in the `zlsx_smoke` Volume (aarch64 wheel
     built from this branch) must return the engine values in tool
     output.
+
+**M9c1 decisions (shipped 2026-08-07).** Eleven points, in
+`src/formula/run_inputs.zig` (the `WorkBudget` beside the mechanisms it
+is not), `src/formula/solve.zig` (a new file: the solver contract,
+shipped BEFORE its first consumer per round-15 decision 13),
+`src/formula/eval.zig` (`Options.work`, the node charge, the engine's
+first `error.Cancelled`, the batch fixtures and the combined-exhaustion
+suite), and `src/formula/registry.zig` (seven rows over one equation).
+
+1.  **`WorkBudget` is a fourth mechanism, and says so.** Bytes are the
+    allocator wrapper's, the graph totals are charged at plan
+    admission, the iteration bounds are per-scope — none of the three
+    prices a Newton iteration, which allocates nothing and is not a
+    cell. Units pinned at the meter: an evaluated AST node is 1
+    (charged at `evalNode`, so no form or implementation can evaluate
+    below it — a nested callback re-charges by construction), a solver
+    iteration is 4. Nothing is mutated on a refusal, like every §9
+    counter before it.
+2.  **The limit is identity; the poller is not.** An exhausted budget
+    changes what a run answers, so `limit` is the caller's policy in
+    the fingerprintable sense; the `Poller` is §5.5 cancellation and
+    stays outside identity for the same reason `RunInputs.cancel`
+    does. `charge` polls at every 65 536-unit stride boundary — the
+    §5.5 work-unit bound, enforced from INSIDE the engine, which until
+    this row polled nowhere (the per-cell poll is the recalc driver's,
+    and a 128-iteration solve inside one cell is exactly the stretch
+    that driver cannot see into).
+3.  **Threading is engine-level in v1.** `Options.work` mirrors
+    `Options.budget` — a budget is a policy, the evaluator is usable
+    without one. The workbook and C layers gain their knobs on the row
+    that can also carry the report fields; the C ABI is frozen at
+    M9a1, and a knob without its receipt would be half a surface.
+4.  **`error.Cancelled` joins `EvalError`, and wears the driver's
+    plane when flattened.** `planeTwo` maps it to
+    `FormulaLimitExceeded` — the mapping `recalc_run.zig`'s per-cell
+    poll already made — so an unwitting caller stays exhaustive
+    without a new §10 refusal for a non-result; a driver that armed
+    the poller distinguishes on the error itself, before any plane
+    conversion.
+5.  **The solver contract, pinned.** ≤128 iterations; convergence is
+    \|Δx\| ≤ 1e-10 — a recorded divergence from Excel's documented
+    20-at-1e-7 in the conservative direction (everything that
+    converges under Excel's test converges under this one, to more
+    digits); root selection IS the Newton path from the guess
+    (Excel's own contract: "try different values for guess"); the
+    poll comes BEFORE each iteration's work, so a mid-solve cancel is
+    observed within one iteration, not one stride.
+6.  **A clamped step never converges.** The domain is an open
+    half-line and a raw step that leaves it is pulled to the midpoint
+    — and that iteration is disqualified from the convergence test,
+    because the equation asked to leave and a shrinking leash is not
+    a shrinking step. Found the honest way: all-positive cashflows
+    (`RATE(10,100,1000,100)`) chase the −1 boundary, and thirty-some
+    halvings shrink \|Δx\| below any tolerance while the residual
+    stands at its plateau — under a bare step test that run
+    "converges" to a point where f ≈ 200. With the rule it runs its
+    128 iterations and answers `#NUM!`, deterministically.
+7.  **One exponential spelling, and why it must be `expm1`.** All
+    seven read the compounding and annuity factors through two
+    helpers spelled over `log1p`/`expm1`, because the annuity factor
+    `((1+r)ⁿ−1)/r` cancels catastrophically under naive `pow` near
+    r = 0 — and RATE's Newton walk LIVES there whenever the true rate
+    is small: the noise stalls the step test and turns a clean root
+    into a fake `#NUM!`. The residual's r = 0 arm is closed-form
+    (`f = pv + pmt·n + fv`, `f′ = pv·n + pmt·(t·n + n(n−1)/2)`), so a
+    break-even schedule's zero rate is a root Newton can land on, not
+    a hole. The spelling's domain is 1 + r > 0; at and below −1 the
+    arithmetic goes non-finite and N4a answers `#NUM!` — a recorded
+    pin the §8.2 leg would arbitrate.
+8.  **The failure planes follow the arithmetic.** The spelled-out
+    zero denominators answer `#DIV/0!` (the rate-0 arms divide by
+    `nper` and by `pmt`; the general PMT arm divides by the annuity
+    factor); every other non-finite intermediate is `#NUM!` (N4a);
+    `per` outside [1, nper] is `#NUM!` by Excel's own doc; and a
+    negative NPER is an ANSWER, not a failure — the batch's one
+    mid-build correction: the "never pays off" intuition pinned
+    `NPER(0.1,1,1000)` as `#NUM!`, but the equation has a legitimate
+    −48.42-period root and Excel documents negative periods; the
+    genuine log-domain refusal needs opposite-sign flows
+    (`NPER(0.1,−1,1000)`).
+9.  **`PPMT` is subtraction, `IPMT`'s engine is `fvValue`.** The
+    balance before payment `per` IS the future value after `per−1` of
+    them, so IPMT is one multiply on the FV closed form (divided by
+    1+r for advance payments, zero for the first advance payment —
+    nothing has accrued when it is due), and PPMT = PMT − IPMT by
+    construction, which makes the identity exact to the bit and a
+    fixture pins it at zero. A nonzero `type` is
+    beginning-of-period — OpenFormula's `type ≠ 0`, not a 0/1 gate.
+10. **Exhaustion is a refusal and non-convergence is a value — never
+    each other.** `IFERROR` catches the rootless residual's `#NUM!`
+    and cannot catch the same formula's `LimitExceeded` under a
+    starved meter: round-20 B2's split between the semantic outcome
+    and the resource ceiling, held at the solver boundary. The
+    combined-exhaustion suite measures the whole cost rather than
+    pinning iteration counts (a 1-ulp libm shift must not break the
+    gate): whole−1 refuses inside the last iteration, whole completes
+    at remaining 0, and the cancellation tests read the meter as the
+    receipt for where the cancel landed (base at the first poll,
+    base + 4·4 at the fifth).
+11. **`PMT` registered; `NPV` promoted canonical unregistered** in
+    the same four pinned places (registry, eval, workbook ×2) — the
+    first name of M9c2's frozen list, the next row that registers.
+    Running total 147, counted from the TSV. Evidence at zero, a
+    fourth time: the manifests predate F4a, every fixture ships
+    `spec_pinned`, and the parked §8.2 Excel leg (standing ask: quit
+    `Book1`, run `scripts/oracle/regenerate.sh`) is what moves it —
+    the `#DIV/0!`-vs-`#NUM!` planes, the 1 + r > 0 domain pin, and
+    the negative-NPER answer are the fixtures that leg would test
+    first.
 
 ---
 

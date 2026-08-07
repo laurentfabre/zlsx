@@ -63,6 +63,7 @@ const eval = @import("eval.zig");
 const criteria = @import("criteria.zig");
 const text = @import("text.zig");
 const run_inputs = @import("run_inputs.zig");
+const solve = @import("solve.zig");
 const serial_date = @import("serial_date.zig");
 const numfmt = @import("numfmt.zig");
 const casing = @import("zlsx_casing");
@@ -157,6 +158,15 @@ pub const CallCtx = struct {
             self.ev.opts.now_utc_ms,
             self.ev.opts.utc_offset_min,
         ) catch error.MalformedInput;
+    }
+
+    /// M9c1's shared work meter, for the solver names. Reached through
+    /// the context for the same reason the collation is: a solver loop
+    /// charging a meter of its own would be work the combined budget
+    /// never saw, and "evaluator + solvers on ONE budget" is the
+    /// contract.
+    pub fn work(self: CallCtx) ?*run_inputs.WorkBudget {
+        return self.ev.opts.work;
     }
 };
 
@@ -366,6 +376,9 @@ const textsplit_sig = [_]CoercionClass{ .text, .text, .text, .logical, .number, 
 const eager4 = [_]Laziness{ .eager, .eager, .eager, .eager };
 const eager5 = [_]Laziness{ .eager, .eager, .eager, .eager, .eager };
 const num4 = [_]CoercionClass{ .number, .number, .number, .number };
+// M9c1 / F4a-TVM signatures: every slot of all seven is a number.
+const num5 = [_]CoercionClass{ .number, .number, .number, .number, .number };
+const num6 = [_]CoercionClass{ .number, .number, .number, .number, .number, .number };
 const agg1 = [_]CoercionClass{.aggregate};
 const filter_c = [_]CoercionClass{ .aggregate, .aggregate, .value_any };
 const sort_c = [_]CoercionClass{ .aggregate, .value_any, .value_any, .logical };
@@ -1864,6 +1877,73 @@ pub const functions = [_]Function{
         .propagation = .propagate,
         .epoch_sensitive = true,
         .impl = fnWorkdayIntl,
+    },
+
+    // ── M9c1 / F4a-TVM: seven names over ONE equation ────────────
+    //
+    // pv·(1+r)ⁿ + pmt·(1+r·type)·((1+r)ⁿ−1)/r + fv = 0, OpenFormula's
+    // statement of Excel's TVM identity. Five of the seven are that
+    // equation solved for a variable in closed form; `NPER` closes
+    // through logarithms; `RATE` is the batch's one solver consumer
+    // and the reason `solve.zig` exists. Every slot is a number and
+    // every function is pure arithmetic — no epoch, no code page, no
+    // collation, no draw — so the flags below are all defaults and
+    // the flags test states that on purpose.
+    .{
+        .name = "PMT",
+        .arity = .{ .min = 3, .max = 5, .fixed = &eager5, .rest = &none_l },
+        .coercion = .{ .fixed = &num5, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnPmt,
+    },
+    .{
+        .name = "IPMT",
+        .arity = .{ .min = 4, .max = 6, .fixed = &eager6, .rest = &none_l },
+        .coercion = .{ .fixed = &num6, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnIpmt,
+    },
+    .{
+        .name = "PPMT",
+        .arity = .{ .min = 4, .max = 6, .fixed = &eager6, .rest = &none_l },
+        .coercion = .{ .fixed = &num6, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnPpmt,
+    },
+    .{
+        .name = "PV",
+        .arity = .{ .min = 3, .max = 5, .fixed = &eager5, .rest = &none_l },
+        .coercion = .{ .fixed = &num5, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnPv,
+    },
+    .{
+        .name = "FV",
+        .arity = .{ .min = 3, .max = 5, .fixed = &eager5, .rest = &none_l },
+        .coercion = .{ .fixed = &num5, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnFv,
+    },
+    .{
+        .name = "RATE",
+        .arity = .{ .min = 3, .max = 6, .fixed = &eager6, .rest = &none_l },
+        .coercion = .{ .fixed = &num6, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnRate,
+    },
+    .{
+        .name = "NPER",
+        .arity = .{ .min = 3, .max = 5, .fixed = &eager5, .rest = &none_l },
+        .coercion = .{ .fixed = &num5, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnNper,
     },
 };
 
@@ -5977,6 +6057,229 @@ fn fnUnique(ctx: CallCtx, args: []const Value) FnError!Value {
     return .{ .array = m };
 }
 
+// ─── M9c1 / F4a-TVM: the implementations ─────────────────────────
+//
+// One equation, one exponential spelling. Every function below reads
+// the compounding factor and the annuity factor through the same two
+// helpers, and both are spelled over `log1p`/`expm1` rather than
+// `pow(1+r, n)` — not style: the annuity factor `((1+r)^n − 1)/r`
+// cancels catastrophically near r = 0 under the naive spelling, and
+// `RATE`'s Newton walk *lives* near r = 0 whenever the true rate is
+// small (a residual noisy at 1e-6 relative stalls the step test and
+// turns a clean root into a fake `#NUM!`). The domain this spelling
+// carries is 1 + r > 0; at and below −1 the arithmetic goes non-finite
+// and N4a answers `#NUM!` — a recorded pin for the parked oracle leg,
+// beside the two spelled-out zero denominators that answer `#DIV/0!`
+// (the rate-0 arms divide by `nper` and by `pmt`, and the general PMT
+// arm divides by the annuity factor; a denominator that IS zero is
+// Excel's division by zero, not a domain surprise).
+//
+// Failure planes, pinned (spec_pinned — the §8.2 leg arbitrates):
+//   - explicit zero denominator → `#DIV/0!`
+//   - any other non-finite intermediate → `#NUM!` (N4a)
+//   - `IPMT`/`PPMT` with per < 1 or per > nper → `#NUM!`
+//   - `NPER` outside the log domain, `RATE` with nper ≤ 0 → `#NUM!`
+//   - solver domain/convergence failure → `#NUM!` (the M9c1 row's own
+//     words); budget exhaustion and cancellation stay REFUSALS.
+//   - a nonzero `type` means beginning-of-period — OpenFormula's
+//     reading (`type ≠ 0`), not a 0/1 gate.
+
+// A trailing slot the caller left off entirely reads through the text
+// batch's `optNum` above — same rule, same reason (`PMT(r,n,pv,,1)`'s
+// explicitly empty slot became blank and then 0 in the dispatcher, and
+// Excel agrees). Only `RATE`'s guess distinguishes absent (0.1) from
+// empty (a guess of 0, and 0 is a legal place to start Newton from).
+
+/// `type ≠ 0` — payments at the beginning of each period.
+fn tvmBegin(args: []const Value, i: usize) bool {
+    return optNum(args, i, 0) != 0;
+}
+
+/// `(1+r)^n`, spelled `exp(n·log1p(r))`.
+fn tvmPow(rate: f64, n: f64) f64 {
+    return @exp(n * std.math.log1p(rate));
+}
+
+/// `(1 + r·type)·((1+r)^n − 1)/r` — the annuity factor. Caller
+/// guarantees r ≠ 0 (the r = 0 limit is each function's own arm).
+fn tvmAnnuity(rate: f64, n: f64, begin: bool) f64 {
+    const growth = std.math.expm1(n * std.math.log1p(rate));
+    const lead: f64 = if (begin) 1 + rate else 1;
+    return lead * growth / rate;
+}
+
+/// PMT's closed form; null is the spelled-out zero denominator.
+fn pmtValue(rate: f64, nper: f64, pv: f64, fv: f64, begin: bool) ?f64 {
+    if (rate == 0) {
+        if (nper == 0) return null;
+        return -(pv + fv) / nper;
+    }
+    const denom = tvmAnnuity(rate, nper, begin);
+    if (denom == 0) return null;
+    return -(pv * tvmPow(rate, nper) + fv) / denom;
+}
+
+/// FV's closed form — also `IPMT`'s balance engine: the balance before
+/// payment `per` IS the future value after `per − 1` of them.
+fn fvValue(rate: f64, nper: f64, pmt: f64, pv: f64, begin: bool) f64 {
+    if (rate == 0) return -(pv + pmt * nper);
+    return -(pv * tvmPow(rate, nper) + pmt * tvmAnnuity(rate, nper, begin));
+}
+
+/// The interest share of payment `per`, given the payment. Zero at a
+/// zero rate, and zero for the first beginning-of-period payment —
+/// nothing has accrued when the first advance payment is due.
+fn ipmtGiven(rate: f64, per: f64, pmt: f64, pv: f64, begin: bool) f64 {
+    if (rate == 0) return 0;
+    if (begin and per == 1) return 0;
+    const balance = fvValue(rate, per - 1, pmt, pv, begin);
+    const interest = balance * rate;
+    return if (begin) interest / (1 + rate) else interest;
+}
+
+fn fnPmt(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const rate = numArg(args, 0);
+    const nper = numArg(args, 1);
+    const pv = numArg(args, 2);
+    const fv = optNum(args, 3, 0);
+    const begin = tvmBegin(args, 4);
+    const p = pmtValue(rate, nper, pv, fv, begin) orelse return Value.err(.div0);
+    return arith(p);
+}
+
+fn fnIpmt(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const rate = numArg(args, 0);
+    const per = numArg(args, 1);
+    const nper = numArg(args, 2);
+    const pv = numArg(args, 3);
+    const fv = optNum(args, 4, 0);
+    const begin = tvmBegin(args, 5);
+    if (per < 1 or per > nper) return Value.err(.num);
+    const p = pmtValue(rate, nper, pv, fv, begin) orelse return Value.err(.div0);
+    return arith(ipmtGiven(rate, per, p, pv, begin));
+}
+
+fn fnPpmt(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const rate = numArg(args, 0);
+    const per = numArg(args, 1);
+    const nper = numArg(args, 2);
+    const pv = numArg(args, 3);
+    const fv = optNum(args, 4, 0);
+    const begin = tvmBegin(args, 5);
+    if (per < 1 or per > nper) return Value.err(.num);
+    // The principal share is the payment MINUS the interest share —
+    // subtraction rather than a third closed form, so the identity
+    // `PPMT + IPMT = PMT` is exact by construction and a fixture can
+    // pin it at zero.
+    const p = pmtValue(rate, nper, pv, fv, begin) orelse return Value.err(.div0);
+    return arith(p - ipmtGiven(rate, per, p, pv, begin));
+}
+
+fn fnPv(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const rate = numArg(args, 0);
+    const nper = numArg(args, 1);
+    const pmt = numArg(args, 2);
+    const fv = optNum(args, 3, 0);
+    const begin = tvmBegin(args, 4);
+    if (rate == 0) return arith(-(fv + pmt * nper));
+    return arith(-(fv + pmt * tvmAnnuity(rate, nper, begin)) / tvmPow(rate, nper));
+}
+
+fn fnFv(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const rate = numArg(args, 0);
+    const nper = numArg(args, 1);
+    const pmt = numArg(args, 2);
+    const pv = optNum(args, 3, 0);
+    const begin = tvmBegin(args, 4);
+    return arith(fvValue(rate, nper, pmt, pv, begin));
+}
+
+fn fnNper(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const rate = numArg(args, 0);
+    const pmt = numArg(args, 1);
+    const pv = numArg(args, 2);
+    const fv = optNum(args, 3, 0);
+    const begin = tvmBegin(args, 4);
+    if (rate == 0) {
+        if (pmt == 0) return Value.err(.div0);
+        return arith(-(pv + fv) / pmt);
+    }
+    if (rate <= -1) return Value.err(.num);
+    // n = log((m − fv)/(m + pv)) / log(1+r), m = pmt·(1+r·type)/r.
+    const lead: f64 = if (begin) 1 + rate else 1;
+    const m = pmt * lead / rate;
+    const ratio = (m - fv) / (m + pv);
+    // Everything the logarithm cannot take — a non-positive ratio, a
+    // zero denominator's infinity — is one #NUM!: the loan cannot be
+    // paid off, which is what Excel's answer means.
+    if (!std.math.isFinite(ratio) or ratio <= 0) return Value.err(.num);
+    return arith(@log(ratio) / std.math.log1p(rate));
+}
+
+/// `RATE`'s residual — the TVM equation and its derivative in r, with
+/// the removable point at r = 0 written as its own arm so Newton can
+/// walk THROUGH zero (the true rate of a break-even schedule IS zero,
+/// and a residual that divides by r would hand the solver a hole
+/// exactly where the root sits).
+const RateResidual = struct {
+    nper: f64,
+    pmt: f64,
+    pv: f64,
+    fv: f64,
+    begin: bool,
+
+    fn eval(self: *const RateResidual, r: f64) solve.Fdf {
+        const n = self.nper;
+        const t: f64 = if (self.begin) 1 else 0;
+        if (r == 0) {
+            return .{
+                .f = self.pv + self.pmt * n + self.fv,
+                .df = self.pv * n + self.pmt * (t * n + n * (n - 1) / 2),
+            };
+        }
+        const growth = std.math.expm1(n * std.math.log1p(r)); // (1+r)^n − 1
+        const g = growth + 1; // (1+r)^n
+        const a = growth / r;
+        const lead = 1 + r * t;
+        const gm1 = tvmPow(r, n - 1); // (1+r)^(n−1)
+        const da = (n * gm1 * r - growth) / (r * r);
+        return .{
+            .f = self.pv * g + self.pmt * lead * a + self.fv,
+            .df = self.pv * n * gm1 + self.pmt * (t * a + lead * da),
+        };
+    }
+};
+
+fn fnRate(ctx: CallCtx, args: []const Value) FnError!Value {
+    const nper = numArg(args, 0);
+    const pmt = numArg(args, 1);
+    const pv = numArg(args, 2);
+    const fv = optNum(args, 3, 0);
+    const begin = tvmBegin(args, 4);
+    // Absent → Excel's 0.1. An explicitly empty slot is a guess of 0,
+    // which the residual's r = 0 arm makes a legal place to start.
+    const guess = optNum(args, 5, 0.1);
+    if (nper <= 0) return Value.err(.num);
+    const residual: RateResidual = .{ .nper = nper, .pmt = pmt, .pv = pv, .fv = fv, .begin = begin };
+    const r = solve.newton(&residual, RateResidual.eval, guess, -1.0, ctx.work()) catch |e| switch (e) {
+        // The semantic outcomes: no root the guess can reach is
+        // Excel's #NUM!, a value.
+        error.BadDomain, error.NoConvergence => return Value.err(.num),
+        // The resource outcomes stay refusals — the M5b split between
+        // "the equation says no" and "the run was not allowed to
+        // finish", held at the solver boundary.
+        error.LimitExceeded => return error.LimitExceeded,
+        error.Cancelled => return error.Cancelled,
+    };
+    return arith(r);
+}
+
 // ─── tests ───────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -6879,6 +7182,82 @@ test "M8c: every F3 row declares its flags honestly" {
     }
 }
 
+// ─── M9c1: the F4a-TVM batch, against the frozen inventory ───────
+
+test "M9c1: the batch's size is regenerated from the inventory, never from prose" {
+    var it = inventory();
+    var counted: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M9c1")) continue;
+        counted += 1;
+        try testing.expectEqualStrings("F4a-TVM", e.batch);
+        const f = lookup(e.name) orelse {
+            std.debug.print("M9c1 name not registered: {s}\n", .{e.name});
+            return error.UnregisteredBatchFunction;
+        };
+        try testing.expectEqualStrings(e.name, f.name);
+    }
+    // Seven, counted from the file — the frozen list the ladder calls
+    // by name: PMT, IPMT, PPMT, PV, FV, RATE, NPER.
+    try testing.expectEqual(@as(usize, 7), counted);
+
+    // The other direction: a registered function tagged `M9c1` must be
+    // one the file lists under this batch — a function this row
+    // invented would be caught by neither half without it.
+    var registered: usize = 0;
+    for (&functions) |*f| {
+        var it2 = inventory();
+        while (it2.next()) |e| {
+            if (!std.mem.eql(u8, e.name, f.name)) continue;
+            if (std.mem.eql(u8, e.milestone, "M9c1")) registered += 1;
+            break;
+        }
+    }
+    try testing.expectEqual(counted, registered);
+}
+
+test "M9c1: every F4a-TVM row declares its flags honestly" {
+    // Pure arithmetic, all seven: no epoch, no code page, no
+    // compatibility version, no collation, no draw — and every slot a
+    // scalar number, so the whole batch lifts elementwise like the
+    // math functions beside it. The interesting flag is the one that
+    // is NOT here: `RATE` iterates, and iteration is charged to the
+    // shared `WorkBudget`, not declared in the table — cost is a
+    // budget's business, not a registry row's.
+    var it = inventory();
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M9c1")) continue;
+        const f = lookup(e.name).?;
+        try testing.expectEqual(Volatility.stable, f.volatility);
+        try testing.expectEqual(value.PropagationClass.propagate, f.propagation);
+        try testing.expect(!f.epoch_sensitive);
+        try testing.expect(!f.platform_sensitive);
+        try testing.expect(!f.cv_sensitive);
+        try testing.expect(!f.collation_sensitive);
+        try testing.expect(!f.reference_producing);
+        try testing.expect(!f.da_aware);
+        try testing.expectEqual(value.MatchPolicy.folded, f.match_policy);
+        try testing.expect(f.liftable());
+    }
+}
+
+test "M9c1: the running total moves with the batch, counted from the file" {
+    const rows = [_][]const u8{ "M4c", "M4d", "M4e", "M4f", "M4g", "M5a2", "M7a", "M7b2", "M7b3", "M8a", "M8b", "M8c", "M9c1" };
+    var shipped: usize = 0;
+    for (rows) |m| {
+        var it = inventory();
+        while (it.next()) |e| {
+            if (!std.mem.eql(u8, e.milestone, m)) continue;
+            if (lookup(e.name) == null) {
+                std.debug.print("shipped name does not resolve: {s} ({s})\n", .{ e.name, m });
+                return error.LadderTotalIncomplete;
+            }
+            shipped += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 147), shipped);
+}
+
 const m7b3_milestone = "M7b3";
 const m7b3_batch = "F2-stats";
 
@@ -7383,11 +7762,11 @@ test "registry: lookup is case-insensitive and rejects unknown names" {
     // A name the frozen inventory holds and no row has reached yet.
     // `VLOOKUP` stood here until M4e registered it, `MEDIAN` until
     // M7b3, `TEXT` until M8a, `PROPER` until M8b, `NUMBERVALUE` until
-    // M8c, which is what this line is for: the example has to be a
-    // function that is genuinely still ahead of the ladder, and every
-    // batch that lands moves it.
-    try testing.expect(lookup("PMT") == null); // frozen, M9c1
-    try testing.expect(inInventory("PMT"));
+    // M8c, `PMT` until M9c1, which is what this line is for: the
+    // example has to be a function that is genuinely still ahead of
+    // the ladder, and every batch that lands moves it.
+    try testing.expect(lookup("NPV") == null); // frozen, M9c2
+    try testing.expect(inInventory("NPV"));
     try testing.expect(lookup("NOTAFUNCTION") == null);
 }
 

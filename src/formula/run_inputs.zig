@@ -112,6 +112,13 @@ pub const EvalSite = struct {
 /// sit above instead. Nothing in this module changed but the address.
 pub const CancelToken = @import("zlsx_control").CancelToken;
 
+/// M5d1's erased poll seam, re-exported for the same reason the token
+/// is: M9c1's `WorkBudget` carries one so the engine's own poll points
+/// (§5.5's work-unit bound) read the seam every other long operation
+/// already reads, and a caller that has a `control.Watch` hands its
+/// `poller()` straight across.
+pub const Poller = @import("zlsx_control").Poller;
+
 pub const utc_offset_min_min: i32 = -1440;
 pub const utc_offset_min_max: i32 = 1440;
 
@@ -657,6 +664,100 @@ pub const WorkCounters = struct {
     }
 };
 
+pub const WorkBudgetError = error{ LimitExceeded, Cancelled };
+
+/// M9c1's shared work budget — the one meter the evaluator and every
+/// solver draw on together (§5.5's work-unit bound, the ladder's
+/// "combined exhaustion").
+///
+/// It is a *fourth* mechanism beside `Budget` and the two `WorkLimits`
+/// kinds, and exists because none of the three says what a solver
+/// costs: bytes are counted by the allocator wrapper, the graph
+/// counters are charged at plan admission, and a Newton iteration
+/// allocates nothing and is not a cell. The units are pinned here —
+/// **an evaluated AST node is 1, a solver iteration is 4** — so
+/// "evaluator work" and "solver work" are commensurable, and a nested
+/// callback re-charges by construction: whatever an implementation
+/// evaluates from inside a solve arrives back at `evalNode`, which
+/// charges this same meter again.
+///
+/// Two fields are policy, not identity. `limit` changes what a run
+/// answers (an exhausted budget is a refusal), so a caller that sets it
+/// owns the consequences; `poller` is §5.5 cancellation and stays
+/// outside identity for the same reason `RunInputs.cancel` does. The
+/// stride guarantees the §5.5 bound — at least one poll per 65 536
+/// work units — from *inside* the engine, which until this row polled
+/// nowhere: the per-cell poll belongs to the recalc driver, and a
+/// 128-iteration solve inside one cell is exactly the stretch that
+/// driver cannot see into.
+///
+/// **Nothing is mutated on a refusal**: the limit is checked before the
+/// counter moves, like `Budget` and `WorkCounters`.
+pub const WorkBudget = struct {
+    limit: u64 = default_limit,
+    used: u64 = 0,
+    /// Set on the charge the limit refused, never cleared: the caller's
+    /// error type says a limit was hit, this says it was THIS meter.
+    tripped: bool = false,
+    /// §5.5's erased poll seam. `.none` costs nothing and polls nowhere,
+    /// which keeps the uncontrolled path byte-identical to the
+    /// controlled one under a disarmed control (M5d1's construction).
+    poller: Poller = .none,
+    since_poll: u64 = 0,
+
+    /// One evaluated AST node.
+    pub const node_units: u64 = 1;
+    /// One solver iteration (§ M9c1: a residual + derivative evaluation
+    /// and the step arithmetic — a few dozen flops, priced at four
+    /// nodes so a full 128-iteration solve is 512 units, visibly more
+    /// than the formula around it and still far under one poll stride).
+    pub const solver_iteration_units: u64 = 4;
+    /// §5.5: at least one poll per this many work units.
+    pub const poll_stride: u64 = 65_536;
+    /// 2^33 units. At the §9 default cell ceiling (50 M admitted
+    /// evaluations) this is 171 units per cell — room for a formula of
+    /// a hundred nodes AND a dozen solver iterations in every single
+    /// cell of a maximal plan — so out of the box the other limits
+    /// bind first and this one is the backstop for solver work in
+    /// volume, which is what it exists to bound.
+    pub const default_limit: u64 = 1 << 33;
+    /// Same ceiling-on-the-ceiling rule as every §9 limit.
+    pub const hard_multiplier: u64 = 4;
+
+    pub fn remaining(self: WorkBudget) u64 {
+        return if (self.used >= self.limit) 0 else self.limit - self.used;
+    }
+
+    /// Charge `n` units, then poll if a stride boundary was crossed.
+    /// The poll sits *after* the charge: the units were spent by the
+    /// work that just happened, and a cancellation is observed at the
+    /// next poll point (§5.5's "observed before commit" — the commit
+    /// point is the run's, not the counter's).
+    pub fn charge(self: *WorkBudget, n: u64) WorkBudgetError!void {
+        const next = std.math.add(u64, self.used, n) catch {
+            self.tripped = true;
+            return error.LimitExceeded;
+        };
+        if (next > self.limit) {
+            self.tripped = true;
+            return error.LimitExceeded;
+        }
+        self.used = next;
+        self.since_poll += n;
+        if (self.since_poll >= poll_stride) {
+            self.since_poll = 0;
+            try self.poll();
+        }
+    }
+
+    /// An explicit poll point — what a solver loop calls once per
+    /// iteration, before the iteration's work, so a token set mid-solve
+    /// is observed within one iteration rather than within one stride.
+    pub fn poll(self: *WorkBudget) error{Cancelled}!void {
+        return self.poller.check();
+    }
+};
+
 // ─── tests ───────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -1004,4 +1105,59 @@ test "work counters: depth unwinds, peak does not" {
     c.release(.eval_depth, 2);
     try testing.expectEqual(@as(u64, 0), c.usedBy(.eval_depth));
     try testing.expectEqual(@as(u64, 2), c.peakOf(.eval_depth));
+}
+
+test "work budget: an exhausting charge refuses with nothing mutated" {
+    var w: WorkBudget = .{ .limit = 10 };
+    try w.charge(7);
+    try testing.expectEqual(@as(u64, 7), w.used);
+    try testing.expectEqual(@as(u64, 3), w.remaining());
+    // The refused charge leaves the counter exactly where it was —
+    // `Budget`'s and `WorkCounters`' rule, held here too.
+    try testing.expectError(error.LimitExceeded, w.charge(4));
+    try testing.expectEqual(@as(u64, 7), w.used);
+    try testing.expect(w.tripped);
+    // The meter still answers what fits.
+    try w.charge(3);
+    try testing.expectEqual(@as(u64, 0), w.remaining());
+}
+
+test "work budget: the poll stride fires at least once per 65 536 units" {
+    const Counter = struct {
+        n: usize = 0,
+        fn check(ctx: ?*const anyopaque) error{Cancelled}!void {
+            const self: *const @This() = @ptrCast(@alignCast(ctx.?));
+            @constCast(self).n += 1;
+        }
+    };
+    var counter: Counter = .{};
+    var w: WorkBudget = .{ .poller = .{ .ctx = &counter, .check_fn = Counter.check } };
+
+    // Three strides and a remainder, charged one node at a time: the
+    // §5.5 bound is a property of accumulation, not of any one charge.
+    var i: u64 = 0;
+    while (i < 3 * WorkBudget.poll_stride + 7) : (i += 1) {
+        try w.charge(WorkBudget.node_units);
+    }
+    try testing.expectEqual(@as(usize, 3), counter.n);
+
+    // …and a single bulk charge that crosses a boundary polls too.
+    try w.charge(WorkBudget.poll_stride);
+    try testing.expectEqual(@as(usize, 4), counter.n);
+}
+
+test "work budget: a tripped poller surfaces Cancelled, distinct from exhaustion" {
+    const Trip = struct {
+        fn check(_: ?*const anyopaque) error{Cancelled}!void {
+            return error.Cancelled;
+        }
+    };
+    var w: WorkBudget = .{ .poller = .{ .ctx = null, .check_fn = Trip.check } };
+    // An explicit poll point sees the token immediately…
+    try testing.expectError(error.Cancelled, w.poll());
+    // …and a stride-crossing charge sees it at the boundary, with the
+    // units already spent — the work happened, the run did not commit.
+    try testing.expectError(error.Cancelled, w.charge(WorkBudget.poll_stride));
+    try testing.expectEqual(WorkBudget.poll_stride, w.used);
+    try testing.expect(!w.tripped);
 }
