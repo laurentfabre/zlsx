@@ -28,6 +28,10 @@
 #   ZLSX_BENCH_TEXT_SIZES     M8c's TEXT-mix geometries (per-row text
 #                             formulas in volume). Default "tiny small"
 #                             — `small` is the identity size here too.
+#   ZLSX_BENCH_REGISTRY_SIZES M9d's mixed full-registry geometries
+#                             (twelve formulas per row across every
+#                             batch family). Default "tiny small" —
+#                             `small` is the identity size here too.
 #
 # Output:
 #   <out_dir>/bench.json    aggregated hyperfine run results
@@ -42,6 +46,7 @@ ZIG_BIN="${ZIG_BIN:-zig}"
 RECALC_SIZES="${ZLSX_BENCH_RECALC_SIZES:-tiny small}"
 CRITERIA_SIZES="${ZLSX_BENCH_CRITERIA_SIZES:-tiny small}"
 TEXT_SIZES="${ZLSX_BENCH_TEXT_SIZES:-tiny small}"
+REGISTRY_SIZES="${ZLSX_BENCH_REGISTRY_SIZES:-tiny small}"
 
 echo "[bench-ci] building benchmark binaries (ReleaseFast)..."
 # Built through `zig build` rather than hand-rolled `build-exe` lines.
@@ -214,6 +219,37 @@ if [[ -x "$OUT_DIR/bench_zlsx_recalc" ]]; then
         done
     else
         echo "[bench-ci] note: this tree's recalc bench predates the text workload; skipping the text lane"
+    fi
+
+    # ── registry lane (M9d, §9's mixed full-registry workload) ──
+    #
+    # Same binary once more; twelve row-local formulas spanning every
+    # batch family, so the two sizes separate the marginal per-row cost
+    # of the mixed registry from everything paid once. Guarded on the
+    # usage string mentioning the `registry` workload, for the same
+    # old-worktree reason as above.
+    if ("$OUT_DIR/bench_zlsx_recalc" 2>&1 || true) | grep -q -- registry; then
+        for size in $REGISTRY_SIZES; do
+            fixture="$OUT_DIR/registry_mix_$size.xlsx"
+            echo "[bench-ci] emitting the registry-mix fixture ($size)..."
+            # `emit` verifies the identity size's digest and exits
+            # nonzero on drift, exactly like the other three gates.
+            "$OUT_DIR/bench_zlsx_recalc" emit "$fixture" --workload registry --size "$size"
+
+            echo "[bench-ci] running hyperfine on registry benchmarks ($size)..."
+            hyperfine -N --warmup 5 --runs 20 \
+                --export-json "$OUT_DIR/hyperfine_registry_$size.json" \
+                --command-name "registry-open:registry_mix_$size" \
+                "$OUT_DIR/bench_zlsx_recalc open $fixture" \
+                --command-name "registry-eval:registry_mix_$size" \
+                "$OUT_DIR/bench_zlsx_recalc recalc $fixture" \
+                --command-name "registry-save:registry_mix_$size" \
+                "$OUT_DIR/bench_zlsx_recalc save $fixture --out $RECALC_OUT"
+            RECALC_JSONS+=("$OUT_DIR/hyperfine_registry_$size.json")
+            rm -f "$RECALC_OUT" "$fixture"
+        done
+    else
+        echo "[bench-ci] note: this tree's recalc bench predates the registry workload; skipping the registry lane"
     fi
 fi
 

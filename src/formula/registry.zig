@@ -2025,6 +2025,182 @@ pub const functions = [_]Function{
         .propagation = .propagate,
         .impl = fnDdb,
     },
+
+    // ── M9d / F4b engineering: the last twenty names ─────────────
+    //
+    // The inventory's final batch, and the registry's closing entries:
+    // after this block every name the v1 inventory freezes resolves.
+    // Four families and a pair: `CONVERT` over one unit table (the doc
+    // page's groups, factors and case-sensitive prefixes — `#N/A` for
+    // a unit that does not exist, a binary prefix off the information
+    // group, or a cross-group pair); the six base-conversion names
+    // over one ten-character two's-complement window (40 bits hex, 30
+    // octal, 10 binary); the five BIT* names over 48-bit nonnegative
+    // integers; the complex six over one parse/format pair whose text
+    // IS the value; and DELTA/GESTEP, the batch's two comparisons
+    // written as numbers. Nothing here draws, reads a date, or touches
+    // a code page — and nothing divides by a value a caller controls:
+    // F4b is the ladder's first batch with NO `#DIV/0!` plane at all.
+    .{
+        .name = "CONVERT",
+        .arity = .{ .min = 3, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &[_]CoercionClass{ .number, .text, .text }, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnConvert,
+    },
+    .{
+        .name = "DELTA",
+        .arity = .{ .min = 1, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnDelta,
+    },
+    .{
+        .name = "GESTEP",
+        .arity = .{ .min = 1, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnGestep,
+    },
+    .{
+        .name = "BIN2DEC",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &text1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnBin2Dec,
+    },
+    .{
+        .name = "DEC2BIN",
+        .arity = .{ .min = 1, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnDec2Bin,
+    },
+    .{
+        .name = "HEX2DEC",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &text1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnHex2Dec,
+    },
+    .{
+        .name = "DEC2HEX",
+        .arity = .{ .min = 1, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnDec2Hex,
+    },
+    .{
+        .name = "OCT2DEC",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &text1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnOct2Dec,
+    },
+    .{
+        .name = "DEC2OCT",
+        .arity = .{ .min = 1, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnDec2Oct,
+    },
+    .{
+        .name = "BITAND",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnBitand,
+    },
+    .{
+        .name = "BITOR",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnBitor,
+    },
+    .{
+        .name = "BITXOR",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnBitxor,
+    },
+    .{
+        .name = "BITLSHIFT",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnBitlshift,
+    },
+    .{
+        .name = "BITRSHIFT",
+        .arity = .{ .min = 2, .max = 2, .fixed = &eager2, .rest = &none_l },
+        .coercion = .{ .fixed = &num2, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnBitrshift,
+    },
+    .{
+        .name = "COMPLEX",
+        .arity = .{ .min = 2, .max = 3, .fixed = &eager3, .rest = &none_l },
+        .coercion = .{ .fixed = &[_]CoercionClass{ .number, .number, .text }, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnComplex,
+    },
+    .{
+        .name = "IMREAL",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &text1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnImreal,
+    },
+    .{
+        .name = "IMAGINARY",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &text1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnImaginary,
+    },
+    .{
+        .name = "IMABS",
+        .arity = .{ .min = 1, .max = 1, .fixed = &eager1, .rest = &none_l },
+        .coercion = .{ .fixed = &text1, .rest = &none_c },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnImabs,
+    },
+    .{
+        .name = "IMSUM",
+        .arity = .{ .min = 1, .max = null, .fixed = &eager1, .rest = &eager1 },
+        .coercion = .{ .fixed = &text1, .rest = &text1 },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnImsum,
+    },
+    .{
+        .name = "IMPRODUCT",
+        .arity = .{ .min = 1, .max = null, .fixed = &eager1, .rest = &eager1 },
+        .coercion = .{ .fixed = &text1, .rest = &text1 },
+        .volatility = .stable,
+        .propagation = .propagate,
+        .impl = fnImproduct,
+    },
 };
 
 /// §5.9 call-position resolution: case-folded over the decoded symbol
@@ -6637,6 +6813,749 @@ fn fnDdb(ctx: CallCtx, args: []const Value) FnError!Value {
     return arith(@max(dep, 0));
 }
 
+// ─── M9d / F4b engineering: the implementations ──────────────────
+//
+// The failure planes are M9c1's pin applied to a batch that never
+// divides by a caller's value: there is no spelled-out denominator
+// anywhere in F4b, so the batch has no `#DIV/0!` plane — its planes
+// are the doc pages' own. `CONVERT` answers `#N/A` three ways (a unit
+// that does not exist, a binary prefix off the information group, a
+// cross-group pair) because that is Excel's text, not a coercion
+// failure. The base-conversion and BIT* names answer `#NUM!` for every
+// domain violation the docs enumerate — an invalid digit, an
+// out-of-range value, a non-integer BIT* operand, a shift past 53, a
+// result past 2^48 − 1 — and the complex names answer `#NUM!` for text
+// that is not in x+yi form. `#VALUE!` appears exactly where the docs
+// put it: a nonnumeric argument (the dispatcher's coercion), a suffix
+// that is not lowercase `i`/`j`, and a suffix conflict across IMSUM /
+// IMPRODUCT arguments. Every other non-finite is N4a's `#NUM!` — a
+// CONVERT overflow and an IM* overflow refuse themselves through
+// `arith`/`formatComplex`, never through a gate the arithmetic did
+// not ask for.
+
+/// CONVERT's measurement groups. Same group or `#N/A` — temperature is
+/// a group like any other, but converts affinely rather than linearly.
+const UnitGroup = enum {
+    mass,
+    distance,
+    time,
+    pressure,
+    force,
+    energy,
+    power,
+    magnetism,
+    temperature,
+    volume,
+    area,
+    information,
+    speed,
+};
+
+const TempKind = enum { none, celsius, fahrenheit, kelvin, rankine, reaumur };
+
+/// One row of the doc page's unit tables. `factor` converts to the
+/// group's base unit (g, m, s, Pa, N, J, W, T, m³, m², bit, m/s);
+/// temperature rows carry 1 and read `temp` instead.
+const Unit = struct {
+    name: []const u8,
+    group: UnitGroup,
+    factor: f64,
+    /// The doc's asterisk: a metric prefix may attach. Case-sensitive,
+    /// like the unit names themselves.
+    metric: bool = false,
+    /// A squared or cubed metric unit raises an attached prefix with
+    /// it — a square kilometer is (1000 m)², not 1000 m².
+    power: u8 = 1,
+    temp: TempKind = .none,
+};
+
+// The exact constants the doc's own examples pin: the international
+// pound and foot, the US gallon, the IT calorie/BTU, the mechanical
+// horsepower. Derived units are written as the products they are, so
+// the identities (a slug is lbf·s²/ft, a psi is lbf/in²) hold to the
+// bit.
+const lbf_newton = 4.4482216152605;
+const gal_m3 = 3.785411784e-3;
+const uk_gal_m3 = 4.54609e-3;
+const ly_meter = 9.4607304725808e15;
+const picapt_meter = 0.0254 / 72.0;
+const survey_mile_meter = 6336000.0 / 3937.0;
+const hp_watt = 745.69987158227022;
+
+const units = [_]Unit{
+    // ── weight and mass, base gram ──
+    .{ .name = "g", .group = .mass, .factor = 1, .metric = true },
+    .{ .name = "sg", .group = .mass, .factor = 1000.0 * lbf_newton / 0.3048 },
+    .{ .name = "lbm", .group = .mass, .factor = 453.59237 },
+    // CODATA-86, the interop constant Excel's ATP era froze.
+    .{ .name = "u", .group = .mass, .factor = 1.6605402e-24, .metric = true },
+    .{ .name = "ozm", .group = .mass, .factor = 28.349523125 },
+    .{ .name = "grain", .group = .mass, .factor = 0.06479891 },
+    .{ .name = "cwt", .group = .mass, .factor = 45359.237 },
+    .{ .name = "shweight", .group = .mass, .factor = 45359.237 },
+    .{ .name = "uk_cwt", .group = .mass, .factor = 50802.34544 },
+    .{ .name = "lcwt", .group = .mass, .factor = 50802.34544 },
+    .{ .name = "hweight", .group = .mass, .factor = 50802.34544 },
+    .{ .name = "stone", .group = .mass, .factor = 6350.29318 },
+    .{ .name = "ton", .group = .mass, .factor = 907184.74 },
+    .{ .name = "uk_ton", .group = .mass, .factor = 1016046.9088 },
+    .{ .name = "LTON", .group = .mass, .factor = 1016046.9088 },
+    .{ .name = "brton", .group = .mass, .factor = 1016046.9088 },
+
+    // ── distance, base meter ──
+    .{ .name = "m", .group = .distance, .factor = 1, .metric = true },
+    .{ .name = "mi", .group = .distance, .factor = 1609.344 },
+    .{ .name = "Nmi", .group = .distance, .factor = 1852 },
+    .{ .name = "in", .group = .distance, .factor = 0.0254 },
+    .{ .name = "ft", .group = .distance, .factor = 0.3048 },
+    .{ .name = "yd", .group = .distance, .factor = 0.9144 },
+    .{ .name = "ang", .group = .distance, .factor = 1e-10, .metric = true },
+    .{ .name = "ell", .group = .distance, .factor = 1.143 },
+    .{ .name = "ly", .group = .distance, .factor = ly_meter },
+    .{ .name = "parsec", .group = .distance, .factor = 3.08567758128155e16 },
+    .{ .name = "pc", .group = .distance, .factor = 3.08567758128155e16 },
+    .{ .name = "Picapt", .group = .distance, .factor = picapt_meter },
+    .{ .name = "Pica", .group = .distance, .factor = picapt_meter },
+    .{ .name = "pica", .group = .distance, .factor = 0.0254 / 6.0 },
+    .{ .name = "survey_mi", .group = .distance, .factor = survey_mile_meter },
+
+    // ── time, base second ──
+    .{ .name = "yr", .group = .time, .factor = 31557600 },
+    .{ .name = "day", .group = .time, .factor = 86400 },
+    .{ .name = "d", .group = .time, .factor = 86400 },
+    .{ .name = "hr", .group = .time, .factor = 3600 },
+    .{ .name = "mn", .group = .time, .factor = 60 },
+    .{ .name = "min", .group = .time, .factor = 60 },
+    .{ .name = "sec", .group = .time, .factor = 1, .metric = true },
+    .{ .name = "s", .group = .time, .factor = 1, .metric = true },
+
+    // ── pressure, base pascal ──
+    .{ .name = "Pa", .group = .pressure, .factor = 1, .metric = true },
+    .{ .name = "p", .group = .pressure, .factor = 1, .metric = true },
+    .{ .name = "atm", .group = .pressure, .factor = 101325, .metric = true },
+    .{ .name = "at", .group = .pressure, .factor = 101325, .metric = true },
+    .{ .name = "mmHg", .group = .pressure, .factor = 101325.0 / 760.0, .metric = true },
+    .{ .name = "psi", .group = .pressure, .factor = lbf_newton / 0.00064516 },
+    .{ .name = "Torr", .group = .pressure, .factor = 101325.0 / 760.0 },
+
+    // ── force, base newton ──
+    .{ .name = "N", .group = .force, .factor = 1, .metric = true },
+    .{ .name = "dyn", .group = .force, .factor = 1e-5, .metric = true },
+    .{ .name = "dy", .group = .force, .factor = 1e-5, .metric = true },
+    .{ .name = "lbf", .group = .force, .factor = lbf_newton },
+
+    // ── energy, base joule ──
+    .{ .name = "J", .group = .energy, .factor = 1, .metric = true },
+    .{ .name = "e", .group = .energy, .factor = 1e-7, .metric = true },
+    .{ .name = "c", .group = .energy, .factor = 4.184, .metric = true },
+    .{ .name = "cal", .group = .energy, .factor = 4.1868, .metric = true },
+    .{ .name = "eV", .group = .energy, .factor = 1.602176462e-19, .metric = true },
+    .{ .name = "ev", .group = .energy, .factor = 1.602176462e-19, .metric = true },
+    .{ .name = "HPh", .group = .energy, .factor = hp_watt * 3600.0 },
+    .{ .name = "hh", .group = .energy, .factor = hp_watt * 3600.0 },
+    .{ .name = "Wh", .group = .energy, .factor = 3600, .metric = true },
+    .{ .name = "wh", .group = .energy, .factor = 3600, .metric = true },
+    .{ .name = "flb", .group = .energy, .factor = lbf_newton * 0.3048 },
+    .{ .name = "BTU", .group = .energy, .factor = 1055.05585262 },
+    .{ .name = "btu", .group = .energy, .factor = 1055.05585262 },
+
+    // ── power, base watt ──
+    .{ .name = "HP", .group = .power, .factor = hp_watt },
+    .{ .name = "h", .group = .power, .factor = hp_watt },
+    .{ .name = "PS", .group = .power, .factor = 735.49875 },
+    .{ .name = "W", .group = .power, .factor = 1, .metric = true },
+    .{ .name = "w", .group = .power, .factor = 1, .metric = true },
+
+    // ── magnetism, base tesla ──
+    .{ .name = "T", .group = .magnetism, .factor = 1, .metric = true },
+    .{ .name = "ga", .group = .magnetism, .factor = 1e-4, .metric = true },
+
+    // ── temperature — affine, so `factor` is unread ──
+    .{ .name = "C", .group = .temperature, .factor = 1, .temp = .celsius },
+    .{ .name = "cel", .group = .temperature, .factor = 1, .temp = .celsius },
+    .{ .name = "F", .group = .temperature, .factor = 1, .temp = .fahrenheit },
+    .{ .name = "fah", .group = .temperature, .factor = 1, .temp = .fahrenheit },
+    .{ .name = "K", .group = .temperature, .factor = 1, .metric = true, .temp = .kelvin },
+    .{ .name = "kel", .group = .temperature, .factor = 1, .metric = true, .temp = .kelvin },
+    .{ .name = "Rank", .group = .temperature, .factor = 1, .temp = .rankine },
+    .{ .name = "Reau", .group = .temperature, .factor = 1, .temp = .reaumur },
+
+    // ── volume, base cubic meter ──
+    .{ .name = "tsp", .group = .volume, .factor = gal_m3 / 768.0 },
+    .{ .name = "tspm", .group = .volume, .factor = 5e-6 },
+    .{ .name = "tbs", .group = .volume, .factor = gal_m3 / 256.0 },
+    .{ .name = "oz", .group = .volume, .factor = gal_m3 / 128.0 },
+    .{ .name = "cup", .group = .volume, .factor = gal_m3 / 16.0 },
+    .{ .name = "pt", .group = .volume, .factor = gal_m3 / 8.0 },
+    .{ .name = "us_pt", .group = .volume, .factor = gal_m3 / 8.0 },
+    .{ .name = "uk_pt", .group = .volume, .factor = uk_gal_m3 / 8.0 },
+    .{ .name = "qt", .group = .volume, .factor = gal_m3 / 4.0 },
+    .{ .name = "uk_qt", .group = .volume, .factor = uk_gal_m3 / 4.0 },
+    .{ .name = "gal", .group = .volume, .factor = gal_m3 },
+    .{ .name = "uk_gal", .group = .volume, .factor = uk_gal_m3 },
+    .{ .name = "l", .group = .volume, .factor = 1e-3, .metric = true },
+    .{ .name = "L", .group = .volume, .factor = 1e-3, .metric = true },
+    .{ .name = "lt", .group = .volume, .factor = 1e-3, .metric = true },
+    .{ .name = "ang3", .group = .volume, .factor = 1e-30, .metric = true, .power = 3 },
+    .{ .name = "ang^3", .group = .volume, .factor = 1e-30, .metric = true, .power = 3 },
+    .{ .name = "barrel", .group = .volume, .factor = gal_m3 * 42.0 },
+    .{ .name = "bushel", .group = .volume, .factor = 2150.42 * 1.6387064e-5 },
+    .{ .name = "ft3", .group = .volume, .factor = 0.028316846592 },
+    .{ .name = "ft^3", .group = .volume, .factor = 0.028316846592 },
+    .{ .name = "in3", .group = .volume, .factor = 1.6387064e-5 },
+    .{ .name = "in^3", .group = .volume, .factor = 1.6387064e-5 },
+    .{ .name = "ly3", .group = .volume, .factor = ly_meter * ly_meter * ly_meter },
+    .{ .name = "ly^3", .group = .volume, .factor = ly_meter * ly_meter * ly_meter },
+    .{ .name = "m3", .group = .volume, .factor = 1, .metric = true, .power = 3 },
+    .{ .name = "m^3", .group = .volume, .factor = 1, .metric = true, .power = 3 },
+    .{ .name = "mi3", .group = .volume, .factor = 1609.344 * 1609.344 * 1609.344 },
+    .{ .name = "mi^3", .group = .volume, .factor = 1609.344 * 1609.344 * 1609.344 },
+    .{ .name = "yd3", .group = .volume, .factor = 0.764554857984 },
+    .{ .name = "yd^3", .group = .volume, .factor = 0.764554857984 },
+    .{ .name = "Nmi3", .group = .volume, .factor = 1852.0 * 1852.0 * 1852.0 },
+    .{ .name = "Nmi^3", .group = .volume, .factor = 1852.0 * 1852.0 * 1852.0 },
+    .{ .name = "Picapt3", .group = .volume, .factor = picapt_meter * picapt_meter * picapt_meter },
+    .{ .name = "Picapt^3", .group = .volume, .factor = picapt_meter * picapt_meter * picapt_meter },
+    .{ .name = "Pica3", .group = .volume, .factor = picapt_meter * picapt_meter * picapt_meter },
+    .{ .name = "Pica^3", .group = .volume, .factor = picapt_meter * picapt_meter * picapt_meter },
+    .{ .name = "GRT", .group = .volume, .factor = 2.8316846592 },
+    .{ .name = "regton", .group = .volume, .factor = 2.8316846592 },
+    .{ .name = "MTON", .group = .volume, .factor = 1.13267386368 },
+
+    // ── area, base square meter ──
+    .{ .name = "uk_acre", .group = .area, .factor = 4046.8564224 },
+    .{ .name = "us_acre", .group = .area, .factor = 4046.87260987425 },
+    .{ .name = "ang2", .group = .area, .factor = 1e-20, .metric = true, .power = 2 },
+    .{ .name = "ang^2", .group = .area, .factor = 1e-20, .metric = true, .power = 2 },
+    .{ .name = "ar", .group = .area, .factor = 100, .metric = true },
+    .{ .name = "ft2", .group = .area, .factor = 0.09290304 },
+    .{ .name = "ft^2", .group = .area, .factor = 0.09290304 },
+    .{ .name = "ha", .group = .area, .factor = 1e4 },
+    .{ .name = "in2", .group = .area, .factor = 6.4516e-4 },
+    .{ .name = "in^2", .group = .area, .factor = 6.4516e-4 },
+    .{ .name = "ly2", .group = .area, .factor = ly_meter * ly_meter },
+    .{ .name = "ly^2", .group = .area, .factor = ly_meter * ly_meter },
+    .{ .name = "m2", .group = .area, .factor = 1, .metric = true, .power = 2 },
+    .{ .name = "m^2", .group = .area, .factor = 1, .metric = true, .power = 2 },
+    .{ .name = "Morgen", .group = .area, .factor = 2500 },
+    .{ .name = "mi2", .group = .area, .factor = 1609.344 * 1609.344 },
+    .{ .name = "mi^2", .group = .area, .factor = 1609.344 * 1609.344 },
+    .{ .name = "Nmi2", .group = .area, .factor = 1852.0 * 1852.0 },
+    .{ .name = "Nmi^2", .group = .area, .factor = 1852.0 * 1852.0 },
+    .{ .name = "Picapt2", .group = .area, .factor = picapt_meter * picapt_meter },
+    .{ .name = "Picapt^2", .group = .area, .factor = picapt_meter * picapt_meter },
+    .{ .name = "Pica2", .group = .area, .factor = picapt_meter * picapt_meter },
+    .{ .name = "Pica^2", .group = .area, .factor = picapt_meter * picapt_meter },
+    .{ .name = "yd2", .group = .area, .factor = 0.83612736 },
+    .{ .name = "yd^2", .group = .area, .factor = 0.83612736 },
+
+    // ── information, base bit — the one group binary prefixes reach ──
+    .{ .name = "bit", .group = .information, .factor = 1, .metric = true },
+    .{ .name = "byte", .group = .information, .factor = 8, .metric = true },
+
+    // ── speed, base meters per second ──
+    .{ .name = "admkn", .group = .speed, .factor = 1853.184 / 3600.0 },
+    .{ .name = "kn", .group = .speed, .factor = 1852.0 / 3600.0 },
+    .{ .name = "m/h", .group = .speed, .factor = 1.0 / 3600.0, .metric = true },
+    .{ .name = "m/hr", .group = .speed, .factor = 1.0 / 3600.0, .metric = true },
+    .{ .name = "m/s", .group = .speed, .factor = 1, .metric = true },
+    .{ .name = "m/sec", .group = .speed, .factor = 1, .metric = true },
+    .{ .name = "mph", .group = .speed, .factor = 1609.344 / 3600.0 },
+};
+
+const UnitPrefix = struct {
+    name: []const u8,
+    factor: f64,
+    /// Binary prefixes attach to the information group ONLY — the
+    /// doc's own `#N/A` for every other unit.
+    binary: bool = false,
+};
+
+const unit_prefixes = [_]UnitPrefix{
+    .{ .name = "Yi", .factor = @floatFromInt(@as(u128, 1) << 80), .binary = true },
+    .{ .name = "Zi", .factor = @floatFromInt(@as(u128, 1) << 70), .binary = true },
+    .{ .name = "Ei", .factor = @floatFromInt(@as(u128, 1) << 60), .binary = true },
+    .{ .name = "Pi", .factor = @floatFromInt(@as(u128, 1) << 50), .binary = true },
+    .{ .name = "Ti", .factor = @floatFromInt(@as(u128, 1) << 40), .binary = true },
+    .{ .name = "Gi", .factor = @floatFromInt(@as(u128, 1) << 30), .binary = true },
+    .{ .name = "Mi", .factor = @floatFromInt(@as(u128, 1) << 20), .binary = true },
+    .{ .name = "ki", .factor = 1024, .binary = true },
+    .{ .name = "Y", .factor = 1e24 },
+    .{ .name = "Z", .factor = 1e21 },
+    .{ .name = "E", .factor = 1e18 },
+    .{ .name = "P", .factor = 1e15 },
+    .{ .name = "T", .factor = 1e12 },
+    .{ .name = "G", .factor = 1e9 },
+    .{ .name = "M", .factor = 1e6 },
+    .{ .name = "k", .factor = 1e3 },
+    .{ .name = "h", .factor = 1e2 },
+    // The doc spells dekao both ways.
+    .{ .name = "da", .factor = 1e1 },
+    .{ .name = "e", .factor = 1e1 },
+    .{ .name = "d", .factor = 1e-1 },
+    .{ .name = "c", .factor = 1e-2 },
+    .{ .name = "m", .factor = 1e-3 },
+    .{ .name = "u", .factor = 1e-6 },
+    .{ .name = "n", .factor = 1e-9 },
+    .{ .name = "p", .factor = 1e-12 },
+    .{ .name = "f", .factor = 1e-15 },
+    .{ .name = "a", .factor = 1e-18 },
+    .{ .name = "z", .factor = 1e-21 },
+    .{ .name = "y", .factor = 1e-24 },
+};
+
+const ResolvedUnit = struct {
+    unit: *const Unit,
+    /// The prefix's contribution, already raised for a squared or
+    /// cubed unit. 1 when no prefix attached.
+    scale: f64,
+};
+
+/// The doc's case-sensitive two-step read of a unit string: an exact
+/// unit name first — `min` is the minute, never milli-`in`, and `e` is
+/// the erg, never a bare dekao — then every prefix whose remainder is
+/// a prefix-capable unit. No fold, no trim: `KG` is `#N/A`.
+fn resolveUnit(s: []const u8) ?ResolvedUnit {
+    for (&units) |*u| {
+        if (std.mem.eql(u8, u.name, s)) return .{ .unit = u, .scale = 1 };
+    }
+    for (&unit_prefixes) |*p| {
+        if (s.len <= p.name.len) continue;
+        if (!std.mem.startsWith(u8, s, p.name)) continue;
+        for (&units) |*u| {
+            if (!std.mem.eql(u8, u.name, s[p.name.len..])) continue;
+            if (!u.metric) continue;
+            if (p.binary and u.group != .information) continue;
+            var scale: f64 = p.factor;
+            var k: u8 = 1;
+            while (k < u.power) : (k += 1) scale *= p.factor;
+            return .{ .unit = u, .scale = scale };
+        }
+    }
+    return null;
+}
+
+fn tempToKelvin(r: ResolvedUnit, x: f64) f64 {
+    return switch (r.unit.temp) {
+        .none => unreachable,
+        .celsius => x + 273.15,
+        .fahrenheit => (x + 459.67) / 1.8,
+        // Kelvin is the group's one absolute scale, which is why it is
+        // the one temperature a prefix can attach to.
+        .kelvin => x * r.scale,
+        .rankine => x / 1.8,
+        .reaumur => x * 1.25 + 273.15,
+    };
+}
+
+fn tempFromKelvin(r: ResolvedUnit, k: f64) f64 {
+    return switch (r.unit.temp) {
+        .none => unreachable,
+        .celsius => k - 273.15,
+        .fahrenheit => k * 1.8 - 459.67,
+        .kelvin => k / r.scale,
+        .rankine => k * 1.8,
+        .reaumur => (k - 273.15) * 0.8,
+    };
+}
+
+fn fnConvert(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const x = numArg(args, 0);
+    const from = resolveUnit(textArg(args, 1)) orelse return Value.err(.na);
+    const to = resolveUnit(textArg(args, 2)) orelse return Value.err(.na);
+    if (from.unit.group != to.unit.group) return Value.err(.na);
+    if (from.unit.group == .temperature) {
+        return arith(tempFromKelvin(to, tempToKelvin(from, x)));
+    }
+    // Factors are compile-time constants and never zero, so the one
+    // division here is not a plane. An overflowing conversion (cubic
+    // light-years into cubic angstroms) goes non-finite and refuses
+    // through `arith` — N4a, no gate.
+    return arith(x * (from.unit.factor * from.scale) / (to.unit.factor * to.scale));
+}
+
+fn fnDelta(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    return arith(if (numArg(args, 0) == optNum(args, 1, 0)) 1 else 0);
+}
+
+fn fnGestep(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    return arith(if (numArg(args, 0) >= optNum(args, 1, 0)) 1 else 0);
+}
+
+// ─── the base-conversion six: one ten-character window ───────────
+
+/// The field width behind each base's ten-character limit: 40 bits
+/// hex, 30 octal, 10 binary. The top bit of the FULL field is the
+/// sign — a shorter string can never reach it, so two's complement
+/// applies exactly to ten-character inputs.
+fn baseFieldBits(base: u8) u6 {
+    return switch (base) {
+        2 => 10,
+        8 => 30,
+        16 => 40,
+        else => unreachable,
+    };
+}
+
+fn digitVal(c: u8, base: u8) ?u8 {
+    // Hex digits fold; unit names and complex suffixes do not. The
+    // asymmetry is Excel's: `HEX2DEC("a5")` is 165, `CONVERT(1,"KG",…)`
+    // is `#N/A`.
+    const d: u8 = switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => return null,
+    };
+    return if (d < base) d else null;
+}
+
+fn baseParse(s: []const u8, base: u8) ?i64 {
+    if (s.len == 0 or s.len > 10) return null;
+    var v: u64 = 0;
+    for (s) |c| {
+        const d = digitVal(c, base) orelse return null;
+        v = v * base + d;
+    }
+    const bits = baseFieldBits(base);
+    const half = @as(u64, 1) << (bits - 1);
+    if (v >= half) return @as(i64, @intCast(v)) - (@as(i64, 1) << bits);
+    return @intCast(v);
+}
+
+fn fromBase(args: []const Value, base: u8) Value {
+    const n = baseParse(textArg(args, 0), base) orelse return Value.err(.num);
+    return arith(@floatFromInt(n));
+}
+
+fn fnBin2Dec(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    return fromBase(args, 2);
+}
+
+fn fnOct2Dec(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    return fromBase(args, 8);
+}
+
+fn fnHex2Dec(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    return fromBase(args, 16);
+}
+
+fn textValue(ctx: CallCtx, s: []const u8) FnError!Value {
+    return .{ .scalar = .{ .text = try ctx.arena().dupe(u8, s) } };
+}
+
+fn toBase(ctx: CallCtx, args: []const Value, base: u8) FnError!Value {
+    const bits = baseFieldBits(base);
+    const digit_chars = "0123456789ABCDEF";
+    const b: u64 = base;
+    const half: f64 = @floatFromInt(@as(u64, 1) << (bits - 1));
+    // Number and places both truncate toward zero — the doc's own
+    // line — and the bounds read the truncated value.
+    const t = @trunc(numArg(args, 0));
+    if (t < -half or t > half - 1) return Value.err(.num);
+    var buf: [10]u8 = undefined;
+    if (t < 0) {
+        // The full ten-character two's complement; places is ignored,
+        // per Excel's own text.
+        var v: u64 = @intCast((@as(i64, 1) << bits) + @as(i64, @intFromFloat(t)));
+        var k: usize = 10;
+        while (k > 0) {
+            k -= 1;
+            buf[k] = digit_chars[@intCast(v % b)];
+            v /= b;
+        }
+        assert(v == 0);
+        return textValue(ctx, buf[0..10]);
+    }
+    var v: u64 = @intFromFloat(t);
+    var k: usize = 10;
+    while (true) {
+        k -= 1;
+        buf[k] = digit_chars[@intCast(v % b)];
+        v /= b;
+        if (v == 0) break;
+    }
+    if (args.len > 1) {
+        // The output field is ten characters by definition, so places
+        // lives in [1, 10] — and a result wider than places is the
+        // doc's own #NUM!.
+        const p = @trunc(numArg(args, 1));
+        if (p < 1 or p > 10) return Value.err(.num);
+        const places: usize = @intFromFloat(p);
+        if (places < 10 - k) return Value.err(.num);
+        const start = 10 - places;
+        @memset(buf[start..k], '0');
+        return textValue(ctx, buf[start..]);
+    }
+    return textValue(ctx, buf[k..]);
+}
+
+fn fnDec2Bin(ctx: CallCtx, args: []const Value) FnError!Value {
+    return toBase(ctx, args, 2);
+}
+
+fn fnDec2Oct(ctx: CallCtx, args: []const Value) FnError!Value {
+    return toBase(ctx, args, 8);
+}
+
+fn fnDec2Hex(ctx: CallCtx, args: []const Value) FnError!Value {
+    return toBase(ctx, args, 16);
+}
+
+// ─── the BIT* five: 48-bit nonnegative integers ──────────────────
+
+const bit_field_max: u64 = (1 << 48) - 1;
+
+/// A BIT* operand — a nonnegative integer below 2^48 — or the
+/// family's documented `#NUM!` for a negative, fractional, or
+/// oversized one. Nonnumeric arguments never reach here: the
+/// dispatcher's `.number` coercion is the doc's `#VALUE!`.
+fn bitOperand(x: f64) ?u64 {
+    if (x < 0 or x > @as(f64, @floatFromInt(bit_field_max)) or x != @trunc(x)) return null;
+    return @intFromFloat(x);
+}
+
+fn fnBitand(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const a = bitOperand(numArg(args, 0)) orelse return Value.err(.num);
+    const b = bitOperand(numArg(args, 1)) orelse return Value.err(.num);
+    return arith(@floatFromInt(a & b));
+}
+
+fn fnBitor(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const a = bitOperand(numArg(args, 0)) orelse return Value.err(.num);
+    const b = bitOperand(numArg(args, 1)) orelse return Value.err(.num);
+    return arith(@floatFromInt(a | b));
+}
+
+fn fnBitxor(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const a = bitOperand(numArg(args, 0)) orelse return Value.err(.num);
+    const b = bitOperand(numArg(args, 1)) orelse return Value.err(.num);
+    return arith(@floatFromInt(a ^ b));
+}
+
+/// Both shift names in one arithmetic: BITRSHIFT(n, s) IS
+/// BITLSHIFT(n, −s), documented on both pages. The magnitude bound
+/// reads the CALLER's argument — |shift| > 53 refuses before the sign
+/// flips — a fractional shift violates the same integer constraint the
+/// operands carry, and a left shift past 2^48 − 1 is the doc's own
+/// `#NUM!` rather than a wrap.
+fn bitShifted(args: []const Value, sign: f64) Value {
+    const n = bitOperand(numArg(args, 0)) orelse return Value.err(.num);
+    const raw = numArg(args, 1);
+    if (raw != @trunc(raw) or @abs(raw) > 53) return Value.err(.num);
+    const s = raw * sign;
+    if (s >= 0) {
+        const sh: u6 = @intFromFloat(s);
+        if (n > bit_field_max >> sh) return Value.err(.num);
+        return arith(@floatFromInt(n << sh));
+    }
+    const sh: u6 = @intFromFloat(-s);
+    return arith(@floatFromInt(n >> sh));
+}
+
+fn fnBitlshift(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    return bitShifted(args, 1);
+}
+
+fn fnBitrshift(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    return bitShifted(args, -1);
+}
+
+// ─── the complex six: one parse, one format ──────────────────────
+
+/// A parsed inumber. `suffix` is `i`, `j`, or 0 for a pure real whose
+/// text never named one — the three-valued field is what lets IMSUM
+/// and IMPRODUCT hold "the arguments must agree" without inventing an
+/// agreement for arguments that never spoke.
+const ComplexVal = struct {
+    re: f64,
+    im: f64,
+    suffix: u8,
+};
+
+/// Scan one signed coefficient at `at`: sign, digits with an optional
+/// point, an optional exponent. The exponent is taken greedily —
+/// `3e+4i` is 30000·i, because a bare `3e` is not a number the other
+/// reading could keep. No spaces, no locale, no thousands separators:
+/// the grammar is the one `COMPLEX` itself writes.
+fn scanCoefficient(s: []const u8, at: usize) ?struct { v: f64, end: usize } {
+    var i = at;
+    if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
+    var digits = false;
+    while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) digits = true;
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) digits = true;
+    }
+    if (!digits) return null;
+    if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
+        var j = i + 1;
+        if (j < s.len and (s[j] == '+' or s[j] == '-')) j += 1;
+        var exp_digits = false;
+        while (j < s.len and std.ascii.isDigit(s[j])) : (j += 1) exp_digits = true;
+        if (exp_digits) i = j;
+    }
+    const v = std.fmt.parseFloat(f64, s[at..i]) catch return null;
+    if (!std.math.isFinite(v)) return null;
+    return .{ .v = v, .end = i };
+}
+
+fn complexSuffix(c: u8) bool {
+    // Lowercase only — the doc's own #VALUE! covers `I` and `J`, and
+    // the parse's #NUM! covers them here.
+    return c == 'i' or c == 'j';
+}
+
+/// The x+yi grammar, exactly: a real, an imaginary with an optional
+/// coefficient, or both with the second term signed. Anything else —
+/// spaces included — is the doc's `#NUM!`.
+fn parseComplex(s: []const u8) ?ComplexVal {
+    if (s.len == 0) return null;
+    // A bare or signed suffix: `i`, `-i`, `+j`.
+    {
+        var i: usize = 0;
+        var sign: f64 = 1;
+        if (s[0] == '+' or s[0] == '-') {
+            if (s[0] == '-') sign = -1;
+            i = 1;
+        }
+        if (i + 1 == s.len and complexSuffix(s[i])) {
+            return .{ .re = 0, .im = sign, .suffix = s[i] };
+        }
+    }
+    const first = scanCoefficient(s, 0) orelse return null;
+    if (first.end == s.len) return .{ .re = first.v, .im = 0, .suffix = 0 };
+    // `<n>i` — a coefficient wearing the suffix directly.
+    if (first.end + 1 == s.len and complexSuffix(s[first.end])) {
+        return .{ .re = 0, .im = first.v, .suffix = s[first.end] };
+    }
+    // Both terms: the separator IS the second coefficient's sign, so
+    // the second scan re-reads it.
+    if (s[first.end] != '+' and s[first.end] != '-') return null;
+    if (first.end + 2 == s.len and complexSuffix(s[first.end + 1])) {
+        const im: f64 = if (s[first.end] == '-') -1 else 1;
+        return .{ .re = first.v, .im = im, .suffix = s[first.end + 1] };
+    }
+    const second = scanCoefficient(s, first.end) orelse return null;
+    if (second.end + 1 != s.len) return null;
+    if (!complexSuffix(s[second.end])) return null;
+    return .{ .re = first.v, .im = second.v, .suffix = s[second.end] };
+}
+
+/// Excel's complex text: coefficients through `formatNumber` — the
+/// same general format every other text seam uses — a unit imaginary
+/// written bare (`i`, `-i`), a zero imaginary dropped, a zero real
+/// with a nonzero imaginary left implicit. A non-finite coefficient is
+/// N4a's `#NUM!` before any byte is written.
+fn formatComplex(ctx: CallCtx, re: f64, im: f64, suffix: u8) FnError!Value {
+    assert(complexSuffix(suffix));
+    if (!std.math.isFinite(re) or !std.math.isFinite(im)) return Value.err(.num);
+    var buf: [value.format_buf_len]u8 = undefined;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    if (im == 0) {
+        try out.appendSlice(ctx.arena(), value.formatNumber(&buf, re));
+        return .{ .scalar = .{ .text = out.items } };
+    }
+    if (re != 0) try out.appendSlice(ctx.arena(), value.formatNumber(&buf, re));
+    if (im == 1) {
+        if (re != 0) try out.append(ctx.arena(), '+');
+    } else if (im == -1) {
+        try out.append(ctx.arena(), '-');
+    } else {
+        const im_text = value.formatNumber(&buf, im);
+        if (re != 0 and im_text[0] != '-') try out.append(ctx.arena(), '+');
+        try out.appendSlice(ctx.arena(), im_text);
+    }
+    try out.append(ctx.arena(), suffix);
+    return .{ .scalar = .{ .text = out.items } };
+}
+
+fn fnComplex(ctx: CallCtx, args: []const Value) FnError!Value {
+    const re = numArg(args, 0);
+    const im = numArg(args, 1);
+    var suffix: u8 = 'i';
+    if (args.len > 2) {
+        // Exactly `i` or `j`, lowercase — the doc's own #VALUE! for
+        // anything else, uppercase included. Checked even when the
+        // imaginary part is zero and the suffix would never print.
+        const s = textArg(args, 2);
+        if (s.len != 1 or !complexSuffix(s[0])) return Value.err(.value);
+        suffix = s[0];
+    }
+    return formatComplex(ctx, re, im, suffix);
+}
+
+fn fnImreal(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const c = parseComplex(textArg(args, 0)) orelse return Value.err(.num);
+    return arith(c.re);
+}
+
+fn fnImaginary(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const c = parseComplex(textArg(args, 0)) orelse return Value.err(.num);
+    return arith(c.im);
+}
+
+fn fnImabs(ctx: CallCtx, args: []const Value) FnError!Value {
+    _ = ctx;
+    const c = parseComplex(textArg(args, 0)) orelse return Value.err(.num);
+    // The doc's own √(x² + y²), spelled: coefficients large enough to
+    // overflow the squares refuse through `arith` — arithmetic over
+    // intuition, not a hypot the doc never promised.
+    return arith(@sqrt(c.re * c.re + c.im * c.im));
+}
+
+/// The suffix the arguments agreed on: 0 stays "none seen yet", a
+/// conflict is the family's `#VALUE!` — two texts that disagree about
+/// the imaginary unit's name are not two numbers in the same notation.
+/// (The doc pages are silent on the conflict; the plane is pinned,
+/// the parked §8.2 leg arbitrates.)
+fn mergeSuffix(seen: u8, c: ComplexVal) ?u8 {
+    if (c.suffix == 0) return seen;
+    if (seen != 0 and seen != c.suffix) return null;
+    return c.suffix;
+}
+
+fn fnImsum(ctx: CallCtx, args: []const Value) FnError!Value {
+    var re: f64 = 0;
+    var im: f64 = 0;
+    var suffix: u8 = 0;
+    for (args, 0..) |_, k| {
+        const c = parseComplex(textArg(args, k)) orelse return Value.err(.num);
+        suffix = mergeSuffix(suffix, c) orelse return Value.err(.value);
+        re += c.re;
+        im += c.im;
+    }
+    return formatComplex(ctx, re, im, if (suffix == 0) 'i' else suffix);
+}
+
+fn fnImproduct(ctx: CallCtx, args: []const Value) FnError!Value {
+    var re: f64 = 1;
+    var im: f64 = 0;
+    var suffix: u8 = 0;
+    for (args, 0..) |_, k| {
+        const c = parseComplex(textArg(args, k)) orelse return Value.err(.num);
+        suffix = mergeSuffix(suffix, c) orelse return Value.err(.value);
+        const nr = re * c.re - im * c.im;
+        const ni = re * c.im + im * c.re;
+        re = nr;
+        im = ni;
+    }
+    return formatComplex(ctx, re, im, if (suffix == 0) 'i' else suffix);
+}
+
 // ─── tests ───────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -8206,15 +9125,51 @@ test "registry: lookup is case-insensitive and rejects unknown names" {
     try testing.expect(lookup("sum") != null);
     try testing.expect(lookup("SuM") != null);
     try testing.expectEqualStrings("SUM", lookup("sum").?.name);
-    // A name the frozen inventory holds and no row has reached yet.
-    // `VLOOKUP` stood here until M4e registered it, `MEDIAN` until
-    // M7b3, `TEXT` until M8a, `PROPER` until M8b, `NUMBERVALUE` until
-    // M8c, `PMT` until M9c1, `NPV` until M9c2, which is what this line
-    // is for: the example has to be a function that is genuinely still
-    // ahead of the ladder, and every batch that lands moves it.
-    try testing.expect(lookup("CONVERT") == null); // frozen, M9d
-    try testing.expect(inInventory("CONVERT"));
+    // The canonical-unregistered pin retired here at M9d. A name the
+    // inventory held with no registry row stood on this line while the
+    // ladder climbed — `VLOOKUP` until M4e, `MEDIAN` until M7b3,
+    // `TEXT` until M8a, `PROPER` until M8b, `NUMBERVALUE` until M8c,
+    // `PMT` until M9c1, `NPV` until M9c2, `CONVERT` until M9d — and
+    // M9d registered the last batch, so the pin has no successor name.
+    // Its retirement is the closed-world assertion: every frozen name
+    // resolves, which with `every implemented function is in the
+    // frozen inventory` above makes registry and inventory the same
+    // 175 names in both directions.
+    var it = inventory();
+    while (it.next()) |e| {
+        if (lookup(e.name) == null) {
+            std.debug.print("frozen but unregistered: {s}\n", .{e.name});
+            return error.UnregisteredInventoryName;
+        }
+    }
+    // The canonical example is now a name the inventory EXCLUDES —
+    // permanent by construction, because §7 makes adding a row a
+    // ladder change, not an implementation detail.
+    try testing.expect(lookup("IMDIV") == null);
+    try testing.expect(!inInventory("IMDIV"));
     try testing.expect(lookup("NOTAFUNCTION") == null);
+}
+
+test "M9d: convert units are unique and resolve exact-name-first" {
+    for (units, 0..) |a, i| {
+        for (units[i + 1 ..]) |b| {
+            try testing.expect(!std.mem.eql(u8, a.name, b.name));
+        }
+    }
+    // `min` is the minute, never milli-`in`; `e` is the erg, never a
+    // bare dekao; `Pa` is the pascal, never peta-`a`.
+    try testing.expectEqual(UnitGroup.time, resolveUnit("min").?.unit.group);
+    try testing.expectEqual(@as(f64, 1), resolveUnit("min").?.scale);
+    try testing.expectEqual(UnitGroup.energy, resolveUnit("e").?.unit.group);
+    try testing.expectEqual(UnitGroup.pressure, resolveUnit("Pa").?.unit.group);
+    // Prefixes stay case-sensitive and binary prefixes stay on the
+    // information group — both misuses are `#N/A`, not a guess.
+    try testing.expect(resolveUnit("KG") == null);
+    try testing.expect(resolveUnit("Mim") == null);
+    try testing.expect(resolveUnit("Mibyte") != null);
+    // A prefixed square is squared: a square kilometer is (1000 m)².
+    try testing.expectEqual(@as(f64, 1e6), resolveUnit("km2").?.scale);
+    try testing.expectEqual(@as(f64, 1e9), resolveUnit("km3").?.scale);
 }
 
 test "registry: the volatile rows are the three draws, the two clocks and the two references" {

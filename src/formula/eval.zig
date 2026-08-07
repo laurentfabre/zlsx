@@ -8611,6 +8611,220 @@ test "M9c2: exhaustion is a refusal and non-convergence is a value — the flow 
     );
 }
 
+// ─── M9d: the F4b engineering batch (§7, twenty names counted from the TSV) ──
+//
+// The value rows are Excel's own documentation examples where the
+// documentation gives one (CONVERT's lbm→kg, F→C and nested-ft², the
+// base-conversion pages' 9/−100/A5/FFFFFFFF5B/54/58 tables, the BIT*
+// pages' five, COMPLEX's four, IMSUM's 8+4i, IMPRODUCT's 27+11i),
+// pinned at full double precision from the frozen unit table and the
+// closed forms — spec_pinned like all of F4, because the committed
+// manifests predate it; the parked §8.2 Excel leg is what would move
+// the evidence, and the IMSUM/IMPRODUCT suffix-conflict `#VALUE!`
+// (the doc pages are silent) plus the DEC2* places ∈ [1, 10] width
+// cap are the first rows that leg would arbitrate.
+
+const m9d_cases = [_]F2Case{
+    // ── CONVERT: the doc's own examples over the frozen table ──
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"lbm\",\"kg\")", .expect = .{ .number = 0.45359237 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(68,\"F\",\"C\")", .expect = .{ .number = 20 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(2.5,\"ft\",\"sec\")", .expect = .{ .err = .na }, .note = "different groups — the doc's own #N/A" },
+    .{ .func = "CONVERT", .formula = "CONVERT(CONVERT(100,\"ft\",\"m\"),\"ft\",\"m\")", .expect = .{ .number = 9.290304 }, .note = "the doc's square-feet-by-nesting example" },
+    .{ .func = "CONVERT", .formula = "CONVERT(6,\"mi\",\"km\")", .expect = .{ .number = 9.656064 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(6,\"km\",\"mi\")", .expect = .{ .number = 3.7282271534240046 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(6,\"in\",\"ft\")", .expect = .{ .number = 0.5 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(6,\"cm\",\"in\")", .expect = .{ .number = 2.3622047244094486 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(6,\"tsp\",\"tbs\")", .expect = .{ .number = 2 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(6,\"gal\",\"l\")", .expect = .{ .number = 22.712470704 }, .note = "six exact 3.785411784 gallons — the doc example's printed digits disagree with the doc's own factor, a recorded pin" },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"uk_gal\",\"l\")", .expect = .{ .number = 4.54609 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"stone\",\"lbm\")", .expect = .{ .number = 14 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"uk_ton\",\"lbm\")", .expect = .{ .number = 2240 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"day\",\"hr\")", .expect = .{ .number = 24 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"yr\",\"day\")", .expect = .{ .number = 365.25 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"HP\",\"W\")", .expect = .{ .number = 745.69987158227022 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"psi\",\"Pa\")", .expect = .{ .number = 6894.757293168361 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(2,\"T\",\"ga\")", .expect = .{ .number = 20000 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"byte\",\"bit\")", .expect = .{ .number = 8 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(0,\"C\",\"K\")", .expect = .{ .number = 273.15 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(0,\"C\",\"F\")", .expect = .{ .number = 32 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(100,\"C\",\"Reau\")", .expect = .{ .number = 80 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(0,\"F\",\"Rank\")", .expect = .{ .number = 459.67 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"K\",\"mK\")", .expect = .{ .number = 1000 }, .note = "Kelvin is the one temperature a prefix attaches to — the absolute scale" },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"m\",\"mm\")", .expect = .{ .number = 1000 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"km2\",\"m2\")", .expect = .{ .number = 1e6 }, .note = "a prefixed square is squared: (1000 m)²" },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"km3\",\"m3\")", .expect = .{ .number = 1e9 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"min\",\"sec\")", .expect = .{ .number = 60 }, .note = "exact names beat prefixes: `min` is the minute, not milli-`in`" },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"e\",\"J\")", .expect = .{ .number = 1e-7 }, .note = "`e` is the erg…" },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"em\",\"m\")", .expect = .{ .number = 10 }, .note = "…and a leading `e` on a metric unit is the dekao the doc also spells `da`" },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"kn\",\"km/h\")", .expect = .{ .number = 1.852 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"Gibyte\",\"Mibyte\")", .expect = .{ .number = 1024 } },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"Mibyte\",\"kbyte\")", .expect = .{ .number = 1048.576 }, .note = "binary and decimal prefixes meet on the one group that takes both" },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"Mim\",\"m\")", .expect = .{ .err = .na }, .note = "a binary prefix off the information group — the doc's own #N/A" },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"XYZ\",\"m\")", .expect = .{ .err = .na }, .note = "a unit that does not exist" },
+    .{ .func = "CONVERT", .formula = "CONVERT(1,\"KG\",\"g\")", .expect = .{ .err = .na }, .note = "unit names and prefixes are case-sensitive — the doc's own line" },
+
+    // ── DELTA / GESTEP: comparisons written as numbers ──
+    .{ .func = "DELTA", .formula = "DELTA(5,4)", .expect = .{ .number = 0 } },
+    .{ .func = "DELTA", .formula = "DELTA(5,5)", .expect = .{ .number = 1 } },
+    .{ .func = "DELTA", .formula = "DELTA(0.5,0)", .expect = .{ .number = 0 } },
+    .{ .func = "DELTA", .formula = "DELTA(0)", .expect = .{ .number = 1 }, .note = "an absent second number is 0" },
+    .{ .func = "GESTEP", .formula = "GESTEP(5,4)", .expect = .{ .number = 1 } },
+    .{ .func = "GESTEP", .formula = "GESTEP(5,5)", .expect = .{ .number = 1 } },
+    .{ .func = "GESTEP", .formula = "GESTEP(-4,-5)", .expect = .{ .number = 1 } },
+    .{ .func = "GESTEP", .formula = "GESTEP(-1)", .expect = .{ .number = 0 } },
+
+    // ── the base-conversion six: one ten-character window ──
+    .{ .func = "BIN2DEC", .formula = "BIN2DEC(1100100)", .expect = .{ .number = 100 } },
+    .{ .func = "BIN2DEC", .formula = "BIN2DEC(1111111111)", .expect = .{ .number = -1 }, .note = "ten characters reach the sign bit — two's complement" },
+    .{ .func = "BIN2DEC", .formula = "BIN2DEC(0)", .expect = .{ .number = 0 } },
+    .{ .func = "BIN2DEC", .formula = "BIN2DEC(\"12\")", .expect = .{ .err = .num }, .note = "an invalid digit" },
+    .{ .func = "BIN2DEC", .formula = "BIN2DEC(\"10000000000\")", .expect = .{ .err = .num }, .note = "eleven characters" },
+    .{ .func = "DEC2BIN", .formula = "DEC2BIN(9,4)", .expect = .{ .text = "1001" } },
+    .{ .func = "DEC2BIN", .formula = "DEC2BIN(-100)", .expect = .{ .text = "1110011100" } },
+    .{ .func = "DEC2BIN", .formula = "DEC2BIN(9.9,4.9)", .expect = .{ .text = "1001" }, .note = "number and places both truncate toward zero" },
+    .{ .func = "DEC2BIN", .formula = "DEC2BIN(-100,4)", .expect = .{ .text = "1110011100" }, .note = "places is ignored for a negative — the doc's own line" },
+    .{ .func = "DEC2BIN", .formula = "DEC2BIN(0)", .expect = .{ .text = "0" } },
+    .{ .func = "DEC2BIN", .formula = "DEC2BIN(512)", .expect = .{ .err = .num } },
+    .{ .func = "DEC2BIN", .formula = "DEC2BIN(-513)", .expect = .{ .err = .num } },
+    .{ .func = "DEC2BIN", .formula = "DEC2BIN(9,3)", .expect = .{ .err = .num }, .note = "the result needs more characters than places gives" },
+    .{ .func = "DEC2BIN", .formula = "DEC2BIN(9,0)", .expect = .{ .err = .num } },
+    .{ .func = "DEC2BIN", .formula = "DEC2BIN(1,11)", .expect = .{ .err = .num }, .note = "the output field is ten characters by definition — places past it is the pinned #NUM!" },
+    .{ .func = "HEX2DEC", .formula = "HEX2DEC(\"A5\")", .expect = .{ .number = 165 } },
+    .{ .func = "HEX2DEC", .formula = "HEX2DEC(\"a5\")", .expect = .{ .number = 165 }, .note = "hex digits fold; unit names do not" },
+    .{ .func = "HEX2DEC", .formula = "HEX2DEC(\"FFFFFFFF5B\")", .expect = .{ .number = -165 } },
+    .{ .func = "HEX2DEC", .formula = "HEX2DEC(\"3DA408B9\")", .expect = .{ .number = 1034160313 } },
+    .{ .func = "HEX2DEC", .formula = "HEX2DEC(\"G5\")", .expect = .{ .err = .num } },
+    .{ .func = "DEC2HEX", .formula = "DEC2HEX(100,4)", .expect = .{ .text = "0064" } },
+    .{ .func = "DEC2HEX", .formula = "DEC2HEX(-54)", .expect = .{ .text = "FFFFFFFFCA" } },
+    .{ .func = "DEC2HEX", .formula = "DEC2HEX(28)", .expect = .{ .text = "1C" }, .note = "uppercase, minimal width" },
+    .{ .func = "DEC2HEX", .formula = "DEC2HEX(549755813888)", .expect = .{ .err = .num }, .note = "one past 2³⁹ − 1" },
+    .{ .func = "OCT2DEC", .formula = "OCT2DEC(54)", .expect = .{ .number = 44 } },
+    .{ .func = "OCT2DEC", .formula = "OCT2DEC(7777777533)", .expect = .{ .number = -165 } },
+    .{ .func = "OCT2DEC", .formula = "OCT2DEC(\"8\")", .expect = .{ .err = .num } },
+    .{ .func = "DEC2OCT", .formula = "DEC2OCT(58,3)", .expect = .{ .text = "072" } },
+    .{ .func = "DEC2OCT", .formula = "DEC2OCT(-100)", .expect = .{ .text = "7777777634" } },
+    .{ .func = "DEC2OCT", .formula = "DEC2OCT(536870912)", .expect = .{ .err = .num }, .note = "one past 2²⁹ − 1" },
+
+    // ── the BIT* five: 48-bit nonnegative integers ──
+    .{ .func = "BITAND", .formula = "BITAND(1,5)", .expect = .{ .number = 1 } },
+    .{ .func = "BITAND", .formula = "BITAND(13,25)", .expect = .{ .number = 9 } },
+    .{ .func = "BITAND", .formula = "BITAND(-1,1)", .expect = .{ .err = .num } },
+    .{ .func = "BITAND", .formula = "BITAND(1.5,1)", .expect = .{ .err = .num }, .note = "a fractional operand violates the integer constraint — #NUM!, not a truncation" },
+    .{ .func = "BITAND", .formula = "BITAND(281474976710656,1)", .expect = .{ .err = .num }, .note = "2⁴⁸ is one past the field" },
+    .{ .func = "BITOR", .formula = "BITOR(23,10)", .expect = .{ .number = 31 } },
+    .{ .func = "BITXOR", .formula = "BITXOR(5,3)", .expect = .{ .number = 6 } },
+    .{ .func = "BITXOR", .formula = "BITXOR(5,9)", .expect = .{ .number = 12 } },
+    .{ .func = "BITLSHIFT", .formula = "BITLSHIFT(4,2)", .expect = .{ .number = 16 } },
+    .{ .func = "BITLSHIFT", .formula = "BITLSHIFT(4,-2)", .expect = .{ .number = 1 }, .note = "a negative shift is the other name — both doc pages say so" },
+    .{ .func = "BITLSHIFT", .formula = "BITLSHIFT(281474976710655,0)", .expect = .{ .number = 281474976710655 }, .note = "the field's top value, accepted at the boundary" },
+    .{ .func = "BITLSHIFT", .formula = "BITLSHIFT(1,48)", .expect = .{ .err = .num }, .note = "the result leaves the field" },
+    .{ .func = "BITLSHIFT", .formula = "BITLSHIFT(1,54)", .expect = .{ .err = .num }, .note = "|shift| past 53" },
+    .{ .func = "BITRSHIFT", .formula = "BITRSHIFT(13,2)", .expect = .{ .number = 3 } },
+    .{ .func = "BITRSHIFT", .formula = "BITRSHIFT(2,-2)", .expect = .{ .number = 8 } },
+    .{ .func = "BITRSHIFT", .formula = "BITRSHIFT(1,-54)", .expect = .{ .err = .num }, .note = "the magnitude bound reads the caller's argument, before the sign flips" },
+
+    // ── the complex six: one parse, one format ──
+    .{ .func = "COMPLEX", .formula = "COMPLEX(3,4)", .expect = .{ .text = "3+4i" } },
+    .{ .func = "COMPLEX", .formula = "COMPLEX(3,4,\"j\")", .expect = .{ .text = "3+4j" } },
+    .{ .func = "COMPLEX", .formula = "COMPLEX(0,1)", .expect = .{ .text = "i" } },
+    .{ .func = "COMPLEX", .formula = "COMPLEX(1,0)", .expect = .{ .text = "1" } },
+    .{ .func = "COMPLEX", .formula = "COMPLEX(0,0)", .expect = .{ .text = "0" } },
+    .{ .func = "COMPLEX", .formula = "COMPLEX(0,-1)", .expect = .{ .text = "-i" } },
+    .{ .func = "COMPLEX", .formula = "COMPLEX(3,-1)", .expect = .{ .text = "3-i" } },
+    .{ .func = "COMPLEX", .formula = "COMPLEX(-3,-4.5)", .expect = .{ .text = "-3-4.5i" } },
+    .{ .func = "COMPLEX", .formula = "COMPLEX(3,4,\"I\")", .expect = .{ .err = .value }, .note = "uppercase is the doc's own #VALUE!" },
+    .{ .func = "COMPLEX", .formula = "COMPLEX(3,4,\"k\")", .expect = .{ .err = .value } },
+    .{ .func = "IMREAL", .formula = "IMREAL(\"6-9i\")", .expect = .{ .number = 6 } },
+    .{ .func = "IMREAL", .formula = "IMREAL(\"3\")", .expect = .{ .number = 3 }, .note = "a real number is a complex number" },
+    .{ .func = "IMREAL", .formula = "IMREAL(\"1.5e2+i\")", .expect = .{ .number = 150 }, .note = "scientific coefficients round-trip COMPLEX's own output" },
+    .{ .func = "IMREAL", .formula = "IMREAL(\"abc\")", .expect = .{ .err = .num } },
+    .{ .func = "IMREAL", .formula = "IMREAL(\"3 + 4i\")", .expect = .{ .err = .num }, .note = "the grammar is exact — no spaces" },
+    .{ .func = "IMAGINARY", .formula = "IMAGINARY(\"3+4i\")", .expect = .{ .number = 4 } },
+    .{ .func = "IMAGINARY", .formula = "IMAGINARY(\"0-j\")", .expect = .{ .number = -1 }, .note = "a bare suffix is a unit coefficient — the doc's own example" },
+    .{ .func = "IMAGINARY", .formula = "IMAGINARY(4)", .expect = .{ .number = 0 }, .note = "a number coerces to its own text and parses real" },
+    .{ .func = "IMAGINARY", .formula = "IMAGINARY(\"i\")", .expect = .{ .number = 1 } },
+    .{ .func = "IMAGINARY", .formula = "IMAGINARY(\"3e+4i\")", .expect = .{ .number = 30000 }, .note = "the exponent is taken greedily — a bare 3e is not a number the other reading could keep" },
+    .{ .func = "IMABS", .formula = "IMABS(\"5+12i\")", .expect = .{ .number = 13 } },
+    .{ .func = "IMABS", .formula = "IMABS(\"3-4j\")", .expect = .{ .number = 5 } },
+    .{ .func = "IMSUM", .formula = "IMSUM(\"3+6i\",\"5-2i\")", .expect = .{ .text = "8+4i" } },
+    .{ .func = "IMSUM", .formula = "IMSUM(\"3+4i\",\"5-3i\")", .expect = .{ .text = "8+i" }, .note = "the unit coefficient drops on the way out" },
+    .{ .func = "IMSUM", .formula = "IMSUM(\"3+1i\")", .expect = .{ .text = "3+i" }, .note = "a single argument reformats — the text is the value" },
+    .{ .func = "IMSUM", .formula = "IMSUM(3,4)", .expect = .{ .text = "7" } },
+    .{ .func = "IMSUM", .formula = "IMSUM(\"2+3i\",\"2j\")", .expect = .{ .err = .value }, .note = "a suffix conflict — pinned #VALUE!, the doc pages are silent; §8.2 arbitrates" },
+    .{ .func = "IMSUM", .formula = "IMSUM(\"x\")", .expect = .{ .err = .num } },
+    .{ .func = "IMPRODUCT", .formula = "IMPRODUCT(\"3+4i\",\"5-3i\")", .expect = .{ .text = "27+11i" } },
+    .{ .func = "IMPRODUCT", .formula = "IMPRODUCT(\"1+2i\",30)", .expect = .{ .text = "30+60i" } },
+    .{ .func = "IMPRODUCT", .formula = "IMPRODUCT(\"i\",\"i\")", .expect = .{ .text = "-1" }, .note = "i² = −1, formatted as the real it is" },
+    .{ .func = "IMPRODUCT", .formula = "IMPRODUCT(\"2+i\")", .expect = .{ .text = "2+i" } },
+};
+
+test "M9d: every F4b engineering fixture evaluates to what the spec says" {
+    for (m9d_cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("M9d case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectTvmValue(c.expect, v) catch |e| {
+            std.debug.print("M9d case `{s}` ({s})\n", .{ c.formula, c.note });
+            return e;
+        };
+    }
+}
+
+test "M9d: every frozen name resolves, and each fixture stays in the batch" {
+    var it = registry.inventory();
+    var batch: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M9d")) continue;
+        batch += 1;
+        if (registry.lookup(e.name) == null) return error.UnregisteredBatchFunction;
+        var fixtures: usize = 0;
+        for (m9d_cases) |c| {
+            if (std.mem.eql(u8, c.func, e.name)) fixtures += 1;
+        }
+        if (fixtures == 0) {
+            std.debug.print("M9d name unfixtured: {s}\n", .{e.name});
+            return error.UnfixturedBatchFunction;
+        }
+    }
+    // Twenty — the frozen list, counted from the TSV, and the
+    // inventory's LAST batch: with it the registry answers all 175.
+    try testing.expectEqual(@as(usize, 20), batch);
+    // The reverse direction: no fixture may claim a name outside the
+    // batch.
+    for (m9d_cases) |c| {
+        var it2 = registry.inventory();
+        var found = false;
+        while (it2.next()) |e| {
+            if (std.mem.eql(u8, e.milestone, "M9d") and std.mem.eql(u8, e.name, c.func)) found = true;
+        }
+        try testing.expect(found);
+    }
+}
+
+test "M9d: the evidence label on every fixture is true of the committed manifests" {
+    var oracle_rows: usize = 0;
+    for (m9d_cases) |c| {
+        switch (try manifestVerdict(c.formula)) {
+            .decided => {
+                if (c.evidence != .oracle) return error.UnderstatedEvidence;
+                oracle_rows += 1;
+            },
+            .excluded => return error.ExcludedCellClaimedAsEvidence,
+            .silent => {
+                if (c.evidence != .spec_pinned) return error.UnbackedOracleClaim;
+            },
+        }
+    }
+    // The committed manifests predate F4b; the parked Excel leg (§8.2)
+    // is what would move this count — evidence at zero, a sixth time.
+    try testing.expectEqual(@as(usize, 0), oracle_rows);
+}
+
 test "refusals: an unregistered call refuses, an unresolvable name is #NAME?" {
     var h: Harness = undefined;
     try h.init(testing.allocator);
@@ -8618,12 +8832,15 @@ test "refusals: an unregistered call refuses, an unresolvable name is #NAME?" {
 
     // §7: unregistered calls refuse rather than inventing `#NAME?` for a
     // function zlsx simply does not implement.
-    // `CONVERT` is frozen in the inventory for M9d and unregistered
-    // today; `VLOOKUP` stood here until M4e registered it, `SUMIFS`
+    // M9d registered the inventory's last batch, so no frozen name is
+    // unregistered anymore and the canonical-unregistered pin retired
+    // (`CONVERT` stood here until M9d; `VLOOKUP` until M4e, `SUMIFS`
     // until M7b2, `MEDIAN` until M7b3, `TEXT` until M8a, `PROPER`
     // until M8b, `NUMBERVALUE` until M8c, `PMT` until M9c1, `NPV`
-    // until M9c2.
-    try testing.expectError(error.UnsupportedFunction, h.eval("CONVERT(A1)"));
+    // until M9c2). The example is now `IMDIV` — a real Excel name the
+    // v1 inventory deliberately excludes, permanent by construction:
+    // §7 makes registering it a ladder change, not a batch.
+    try testing.expectError(error.UnsupportedFunction, h.eval("IMDIV(A1)"));
     try testing.expectError(error.UnsupportedFunction, h.eval("NOTAFUNCTION()"));
     // §5.9: a value-position name that provably resolves nowhere is a
     // plane-1 `#NAME?`, which is a successful result.
