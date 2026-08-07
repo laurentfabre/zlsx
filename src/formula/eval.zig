@@ -7660,6 +7660,100 @@ test "M8a: the evidence label on every fixture is true of the committed manifest
     try testing.expectEqual(@as(usize, 0), oracle_rows);
 }
 
+// ─── M8b: PROPER over casing_v1 (§7, one name; one boundary rule) ─
+
+/// The non-literal inputs: a number and a boolean (their text
+/// spellings get segmented like any other text), the propagation
+/// probe; A1 stays blank on purpose (it coerces to the empty text).
+fn putM8bCells(h: *Harness) !void {
+    try h.put("B1", num(5));
+    try h.put("B2", .{ .boolean = true });
+    try h.put("F1", value.ScalarValue.errorOf(.div0));
+}
+
+const m8b_cases = [_]F2Case{
+    // ── the wiring: coercion, blank, propagation ──
+    .{ .func = "PROPER", .formula = "PROPER(\"hello world\")", .expect = .{ .text = "Hello World" } },
+    .{ .func = "PROPER", .formula = "PROPER(\"EXCEL FILE\")", .expect = .{ .text = "Excel File" }, .note = "non-initial letters LOWER — PROPER is not 'capitalize'" },
+    .{ .func = "PROPER", .formula = "PROPER(B1)", .expect = .{ .text = "5" }, .note = "a number's text spelling has no letters to move" },
+    .{ .func = "PROPER", .formula = "PROPER(B2)", .expect = .{ .text = "True" }, .note = "the boolean coerces to TRUE first, then segments" },
+    .{ .func = "PROPER", .formula = "PROPER(A1)", .expect = .{ .text = "" }, .note = "a blank coerces to the empty text" },
+    .{ .func = "PROPER", .formula = "PROPER(F1)", .expect = .{ .err = .div0 }, .note = "errors propagate before any casing" },
+
+    // ── the boundary rule, byte-exact: ASCII, digits ──
+    .{ .func = "PROPER", .formula = "PROPER(\"2-way street\")", .expect = .{ .text = "2-Way Street" }, .note = "a hyphen ends a word" },
+    .{ .func = "PROPER", .formula = "PROPER(\"76budGET\")", .expect = .{ .text = "76Budget" }, .note = "a digit ends a word without being one" },
+
+    // ── the apostrophe class: the recorded divergence ──
+    .{ .func = "PROPER", .formula = "PROPER(\"don't stop\")", .expect = .{ .text = "Don't Stop" }, .note = "U+0027 is Case_Ignorable (Single_Quote): transparent, no word begins at t. Excel answers Don'T Stop — spec_pinned pending the parked oracle leg" },
+    .{ .func = "PROPER", .formula = "PROPER(\"j.r.r. tolkien\")", .expect = .{ .text = "J.r.r. Tolkien" }, .note = "the full stop (MidNumLet) is transparent too; Excel capitalizes after it" },
+
+    // ── combining marks, title-vs-upper, Final_Sigma, astral ──
+    .{ .func = "PROPER", .formula = "PROPER(\"bru\u{0302}le\u{0301}e day\")", .expect = .{ .text = "Bru\u{0302}le\u{0301}e Day" }, .note = "combining marks ride their base and do not begin words" },
+    .{ .func = "PROPER", .formula = "PROPER(\"ǆungla\")", .expect = .{ .text = "ǅungla" }, .note = "U+01C6 titlecases to U+01C5, not to UPPER's Ǆ — the third table earns its name" },
+    .{ .func = "PROPER", .formula = "PROPER(\"straße\")", .expect = .{ .text = "Straße" } },
+    .{ .func = "PROPER", .formula = "PROPER(\"ΟΔΟΣ ΣΟΦΟΣ\")", .expect = .{ .text = "Οδο\u{03C2} Σοφο\u{03C2}" }, .note = "Final_Sigma still decides the lowered tail" },
+    .{ .func = "PROPER", .formula = "PROPER(\"\u{10428}\u{10428} \u{10428}\")", .expect = .{ .text = "\u{10400}\u{10428} \u{10400}" }, .note = "DESERET: the four-byte path in both roles" },
+    .{ .func = "PROPER", .formula = "PROPER(\"中文a\")", .expect = .{ .text = "中文A" }, .note = "an uncased letter ends a word — telling it from a non-letter takes the Alphabetic property, a second table this row does not add" },
+};
+
+test "M8b: every PROPER fixture evaluates to what the spec says" {
+    for (m8b_cases) |c| {
+        var h: Harness = undefined;
+        try h.init(testing.allocator);
+        defer h.deinit();
+        try putM8bCells(&h);
+
+        const v = h.eval(c.formula) catch |e| {
+            std.debug.print("M8b case `{s}` refused: {t}\n", .{ c.formula, e });
+            return e;
+        };
+        expectValue(c.expect, v) catch |e| {
+            std.debug.print("M8b case `{s}` ({s})\n", .{ c.formula, c.note });
+            return e;
+        };
+    }
+}
+
+test "M8b: the one frozen name resolves, and each fixture stays in the batch" {
+    var it = registry.inventory();
+    var batch: usize = 0;
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.milestone, "M8b")) continue;
+        batch += 1;
+        if (registry.lookup(e.name) == null) return error.UnregisteredBatchFunction;
+        var fixtures: usize = 0;
+        for (m8b_cases) |c| {
+            if (std.mem.eql(u8, c.func, e.name)) fixtures += 1;
+        }
+        if (fixtures == 0) return error.UnfixturedBatchFunction;
+    }
+    try testing.expectEqual(@as(usize, 1), batch);
+    for (m8b_cases) |c| {
+        try testing.expectEqualStrings("PROPER", c.func);
+    }
+}
+
+test "M8b: the evidence label on every fixture is true of the committed manifests" {
+    var oracle_rows: usize = 0;
+    for (m8b_cases) |c| {
+        switch (try manifestVerdict(c.formula)) {
+            .decided => {
+                if (c.evidence != .oracle) return error.UnderstatedEvidence;
+                oracle_rows += 1;
+            },
+            .excluded => return error.ExcludedCellClaimedAsEvidence,
+            .silent => {
+                if (c.evidence != .spec_pinned) return error.UnbackedOracleClaim;
+            },
+        }
+    }
+    // The committed manifests predate PROPER; the parked Excel leg —
+    // the same one that would decide the apostrophe divergence — is
+    // what would move this count.
+    try testing.expectEqual(@as(usize, 0), oracle_rows);
+}
+
 test "refusals: an unregistered call refuses, an unresolvable name is #NAME?" {
     var h: Harness = undefined;
     try h.init(testing.allocator);
@@ -7667,10 +7761,11 @@ test "refusals: an unregistered call refuses, an unresolvable name is #NAME?" {
 
     // §7: unregistered calls refuse rather than inventing `#NAME?` for a
     // function zlsx simply does not implement.
-    // `PROPER` is frozen in the inventory for M8b and unregistered
-    // today; `VLOOKUP` stood here until M4e registered it, `SUMIFS`
-    // until M7b2, `MEDIAN` until M7b3, `TEXT` until M8a.
-    try testing.expectError(error.UnsupportedFunction, h.eval("PROPER(A1)"));
+    // `NUMBERVALUE` is frozen in the inventory for M8c and
+    // unregistered today; `VLOOKUP` stood here until M4e registered
+    // it, `SUMIFS` until M7b2, `MEDIAN` until M7b3, `TEXT` until M8a,
+    // `PROPER` until M8b.
+    try testing.expectError(error.UnsupportedFunction, h.eval("NUMBERVALUE(A1)"));
     try testing.expectError(error.UnsupportedFunction, h.eval("NOTAFUNCTION()"));
     // §5.9: a value-position name that provably resolves nowhere is a
     // plane-1 `#NAME?`, which is a successful result.
