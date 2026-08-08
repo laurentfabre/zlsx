@@ -2702,8 +2702,8 @@ debris beside either.
 
 ## 6. Milestone ladder
 
-Tier **D1**. One PR per row — **42 rows, M-1 … M10a** (count = the table; every v1 function name frozen — no ellipses);
-counts regenerate from the frozen registry inventory (M3a). v1 = M9d; M10a is the first post-v1 row.
+Tier **D1**. One PR per row — **43 rows, M-1 … M10b** (count = the table; every v1 function name frozen — no ellipses);
+counts regenerate from the frozen registry inventory (M3a). v1 = M9d; M10a and M10b are the post-v1 rows.
 `<xm:f>` route-through pullable after M2.
 
 | PR | Ships | Own gate |
@@ -2752,6 +2752,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d; M10a is th
 | **M9d** ✅ | F4b engineering (20, frozen: CONVERT, DELTA, GESTEP, BIN2DEC, DEC2BIN, HEX2DEC, DEC2HEX, OCT2DEC, DEC2OCT, BITAND, BITOR, BITXOR, BITLSHIFT, BITRSHIFT, COMPLEX, IMREAL, IMAGINARY, IMABS, IMSUM, IMPRODUCT) (`feat/m9d-eng`) — **v1 complete: all 175 frozen names registered, and the ladder's first batch with NO `#DIV/0!` plane** (nothing divides by a caller's value; the planes are the doc pages' own — CONVERT's three `#N/A` ways, the `#NUM!` domains, `#VALUE!` for coercion and suffixes, N4a for every other non-finite). CONVERT over the frozen doc-page unit table (case-sensitive, exact-name-first — `min` is the minute, `e` the erg; binary prefixes information-only; prefixed powers raised, km2 = (1000 m)²; Kelvin the one prefixable temperature; constants as identities — slug = lbf·s²/ft, psi = lbf/in²; u/eV pinned; the doc's gal→l digits vs its own factor a recorded divergence); the base six over one ten-character two's-complement window (40/30/10 bits, the sign bit reachable only at ten characters, negatives ignore places, places ∈ [1,10] pinned, hex digits fold where unit names do not); BIT* over 48-bit fields (constraint violations `#NUM!` incl. non-integers, coercion `#VALUE!`, \|shift\| ≤ 53 read before the sign flips, BITRSHIFT(n,s) IS BITLSHIFT(n,−s)); the complex six over one exact parse (greedy exponent, lowercase suffixes, no spaces — COMPLEX's output always re-parses) + one `formatNumber` format (unit imaginary bare), the IMSUM/IMPRODUCT suffix conflict pinned `#VALUE!`, IMABS the spelled √(x²+y²). **The canonical-unregistered pin retired**: registry = inventory in both directions (175 from the TSV), the refusal example now the out-of-inventory `IMDIV`, permanent by §7. **M-1 cherry-picked into the chain** (`3bcff95` — the release sweep found its five rows undischarged); §13 gate run, recorded, passes (§13.2 gained class H). §9 run and recorded (§9.1): all four `--gate` lanes green, `synth_registry_mix` lane added (~10.8 µs marginal per mixed formula); end-to-end 908.62 ms UNDER, evaluate 936.98 ms **1.87× OVER**, first-recalc RSS 506.7 MiB **33.4× OVER** — both ⛔ carried to the release cut as owner decisions | Oracle-first (manifests predate F4b → every fixture spec_pinned, 0 oracle rows pinned — evidence at zero, a sixth time); rg allowlist §13.2 A–H, zero unclassified; **absolute + regression perf checks (§9) run with results recorded**; zig 9841 unpiped, pytest 166 |
 
 | **M10a** ✅ | **The memory row — §9.1's waived RSS figure gets its profile and its first cut** (`feat/m10a-recalc-rss`). The 506.7 MiB is now *attributed*: `zlsx-bench-recalc heap`, an allocator-boundary profiler (`smp_allocator`'s pools are invisible to malloc tooling, so the attribution happens inside the process) that keys every allocation to a call-site stack and snapshots per-site live bytes at each new high-water mark — **643.0 MiB live at peak, and the top of the table was lifetime and arena mechanics, not data**: (1) the prepare-wide arena absorbed every formula's parse + evaluator scratch, ~4.3 KiB per formula cell held to end-of-run for ASTs that are dead the moment `evaluateOne` returns (~42 % of peak); (2) lists growing *inside* arenas stranded every abandoned growth buffer — the scan held ~3× its live bytes — while the ×1.5 chunk policy compounded on its own high water, 121.3 MiB of chunk for ~20 MiB of staged data (~35 %); (3) §5.6e's rebuild held TWO full dependency graphs at the peak instant. The fixes change no output byte: the recalc Driver gains a **per-evaluation scratch arena** (reset `.retain_capacity`; the published value's payload is duped across the seam into the run arena — `reads` stay borrowed, `noteReads` consumes them before the next reset can run); staging gets **its own arena and gpa-backed growth with exact-size arena copies** (stage's lists, the scan's four lists, `resolved.project` sorting a permutation instead of duping 9.16 MiB of publications, `applyEdits` sized to its knowable output, `signaturesOf` counted-then-filled); and **`iterate.run` now owns every graph it runs, the initial one included** — the outgoing graph is freed before its §5.6e replacement is built, at most one ever alive (sound: signatures copy their keys, and a Key's spellings borrow from the Input, never the graph). One latent bug fixed on the way: a result literal's `.arena = arena` copies the arena's state before later field initializers run, so an allocation there that opened a fresh chunk leaked on the returned copy's deinit — `scanSheet` and `project` both materialize before the literal now. **Result (§9.1): peak live 643.0 → 297.9 MiB; first-recalc RSS 506.7 → 271.4 MiB — 17.9× the 15.15 MiB ceiling, from 33.4×.** The ceiling is NOT renegotiated and NOT met; what remains at the new peak (the rebuild instant) is named for the next memory row: the engine's O(cells) records (~128 MiB across the edge sets, `held`/journal, plan scope and signatures), the rebuilt graph (~60 MiB), the model + computed layer (~45 MiB) | Saved archives byte-identical to main across all four workloads; **all four `compare_bench --gate` lanes green with no lane traded for memory** — F1 named `recalc` −3.0 %, `save` −3.8 %, criteria −1.8 %, registry −2.1 %, text +4.6 % (the seam dupes of its text results, under every threshold); zig build + zig build test green; the RSS probe reproducible to the byte across three runs |
+| **M10b** ✅ | **The evaluate row — §9.1's waived evaluate figure gets its profile, and the ceiling is MET** (`feat/m10b-evaluate`). The 876 ms is attributed first (`sample` at 1 ms over the ReleaseFast binary, the digest-pinned named workload): **29.5 % a SECOND full `graph.build` inside `iterate.run`** — §5.6e's fixpoint proof, a parse + link + condensation of all 80 000 formulas whose only product on a workbook without a dynamic reference is "nothing changed" — 25.3 % evaluation proper (a fresh parse of every formula inside it), 11.1 % the txn (~50 samples of it deflate over the rewritten sheet XML, on a lane that never saves), 10.2 % the initial build, 10.0 % staging. And the rebuild was not one build: the runtime read log spells reads differently than the walk (`readRange` notes the raw 1×1 area it iterates where `Capture.note` says cell; an aggregate's cursor notes the stored cells it visits where the walk noted the window), so **~300 spelling artifacts survived the injection's exact-`eql` dedupe, minted range nodes, changed the condensation — a second dynamic pass and a THIRD full build on every named run since M5d4**. The fixes change no output byte: (1) **the graph retains each owner's static walk log** — the captured refs already live in the arena the graph keeps, so retention is bounds and a pointer — and **`noteReads` asks it per read in the walk's own vocabulary** (`walkNoted`): a read the walk noted dedupes inside any rebuild's injection and is not recorded; a cell that is not a node draws no edge in any rebuild (cell/spill-tail nodes derive from the Input alone) and is not recorded; a 1×1 area whose cell the walk noted IS that cell — the fold holds exactly what could change a graph; (2) **the drive gates the rebuild**: folded set == the set the current graph was built from (∅ == ∅ on every ordinary workbook, the same stable set on a converged `INDIRECT`) ⇒ build determinism makes the successor identical ⇒ `sameCondensation` provably true, unbuilt — and the condensation signatures go lazy on the same argument; (3) **override compression deferred**: `replacePart` stages `.pending`, both save paths materialize through `materializeOverrides` before `checkArchiveBounds`, under the save's own poller — same compressor, same policy, same input, same bytes. **Result (§9.1): named evaluate 876.2 → 433.0 ms — 0.87× the 500 ms ceiling, MET, from 267× over at M5d3**; end-to-end 505.06 ms under its second; scaling ×10.2 per decade (≤ 15×, was ×11.0); and the peak the RSS lane measures moved with the rebuild it removed — first-recalc RSS 271.4 → **177.0 MiB** (11.7× the ceiling, from 17.9×), that ceiling still not met and not renegotiated, the next memory row's shortlist updated to the staging instant | Saved archives byte-identical to main across all four workloads; **all four `compare_bench --gate` lanes green with every eval lane faster** — F1 named eval −52.0 % / `save` −44.9 %, registry −48.7 %, text −23.7 %, criteria −2.9 % (its 512 fixed report formulas scan stored rows; the removed fixed costs were never its story); zig build + zig build test green (9 842); the M5d1 cancel seam follows the deflate to the save path, fixture updated; named `dynamic_passes` 2 → 1 — the report describes the run, and the wasted pass was the finding |
 
 **M10+ backlog**: F5 (census-ordered); `<xm:f>` route-through; namespace-aware
 scanners; **future compatibility versions beyond CV2** (CV1+CV2 are v1 scope,
@@ -4968,6 +4969,89 @@ graph (~60 MiB), and the model + computed layer (~45 MiB). The ceiling
 is **not renegotiated and not met**: 271.4 MiB against 15.15 MiB is
 17.9× over, and closing the rest means restructuring the engine's
 per-cell records, not more lifetime hygiene.
+
+**M10b — the evaluate row (recorded 2026-08-08).** The row that acts on
+the waived evaluate figure, the same way M10a acted on the RSS one:
+attribute first, then cut what the attribution names. The probe is a
+`sample` profile at 1 ms over the ReleaseFast binary running `recalc`
+on the digest-gated named fixture — 732 in-process samples ≈ 890 ms,
+taken at the M10a baseline (876.2 ms evaluate, 1.75× the ceiling).
+
+**Where the 876 ms went**, grouped by the subtrees the profile named:
+
+| Sink at the M10a baseline | Samples | Share | What it was |
+|---|---:|---:|---|
+| a SECOND full `graph.build` inside `iterate.run` (§5.6e's fixpoint proof) | 216 | 29.5 % | parse + link + condensation of all 80 000 formulas, again — its only product on a workbook without a dynamic reference is "nothing changed" |
+| evaluation proper (`evaluateOne`) | 185 | 25.3 % | includes a fresh `parser.parse` of every formula (~32 samples) and the per-edge fold bookkeeping (`noteEdge` hashing, ~21) |
+| `recalc_txn.prepare` | 81 | 11.1 % | ~50 of it deflate over the rewritten sheet XML — compression on a lane that never saves |
+| the initial `graph.build` | 75 | 10.2 % | the one build a run actually needs |
+| staging (`stage` + `scanSheet`) | 73 | 10.0 % | serialization of the computed layer |
+| model build + misc | ~45 | 6.2 % | `WorkbookEnv.build`, driver records |
+
+**And the rebuild was not one build.** The runtime read log and the
+walk spell the same read differently: `refValue` normalizes a
+single-cell area to a cell at construction, but `readRange` notes the
+raw 1×1 area it iterates, and an aggregate's cursor notes the stored
+cells it visits where the walk noted the window. ~300 such artifacts
+per named run survived the injection's exact-`eql` dedupe, minted
+range nodes the initial graph did not have, changed the condensation —
+and forced a second dynamic pass plus a THIRD build to converge past
+spellings of dependencies the graph already ordered correctly. Every
+named measurement back to M5d4 paid it.
+
+**The fixes** are M10b's ladder row; none changes an output byte.
+Three, in the order they compound: (1) **the graph retains each
+owner's static walk log** — the captured refs already live in the
+arena the graph keeps, so retention is bounds and a pointer — and
+`noteReads` asks it per read (`walkNoted`), in the walk's own
+vocabulary: a read the walk noted dedupes inside any rebuild's
+injection and is not recorded; a cell that is not a node draws no edge
+in any rebuild (cell and spill-tail nodes derive from the Input alone)
+and is not recorded; a 1×1 area whose cell the walk noted IS that
+cell. What stays folded is exactly what could change a graph. (2)
+**the drive gates the rebuild**: when the folded edge set equals the
+set the current graph was built from — zero against zero on every
+ordinary workbook, the same stable set on a converged `INDIRECT` —
+build determinism makes the successor identical and `sameCondensation`
+provably true without building it; the condensation signatures go lazy
+on the same argument, computed only when a real rebuild needs the
+comparison. (3) **override compression is deferred** (M5d1's seam
+follows the work): `replacePart` stages `.pending`, both save paths
+materialize through `materializeOverrides` — same compressor, same
+stored-vs-deflate policy, same input — before `checkArchiveBounds`,
+under the save's own poller.
+
+The re-measurement, same host, same methodology (ReleaseFast,
+`hyperfine -N --warmup 5 --runs 20`, medians, digest-gated fixtures):
+
+| | M10a (observed above) | **M10b** |
+|---|---:|---:|
+| `open` | 1.7 ms | 1.74 ms |
+| `recalc` | 877.92 ms | **434.74 ms** |
+| `save` | 882.10 ms | **505.06 ms** |
+| evaluate (recalc − open) | 876.2 ms | **433.0 ms** |
+| vs the 500 ms evaluate ceiling | 1.75× over | **0.87× — UNDER** |
+
+**The evaluate ceiling is met** — the first time in the engine's
+history, from 267× over at M5d3. The v0.8.0 waiver on this number is
+now historical; the RSS waiver stands. End-to-end holds under its 1 s
+ceiling at 505.06 ms, and the phases table moves the way the deferral
+says it must: serialize + commit 1.08 → 69.4 ms — the deflate, paid by
+the save that needs it, inside the pollable pre-commit region — with
+prepare 898.8 → 436.2 ms. The scaling assertion tightens: evaluate is
+4.58 / 42.47 / 433.0 ms across tiny/small/named — ×9.3 and **×10.2**
+per decade against §9's ≤ 15× (was ×11.0) — and the named workload's
+`dynamic_passes` now reads 1, because the run now does one pass; the
+report describes the run, and the wasted pass was the bug.
+
+Read as an observation, not a claim: the rebuild instant was also the
+recorded RSS peak, so the memory moved too — profile peak live 297.9 →
+249.6 MiB, first-recalc RSS 271.4 → **177.0 MiB** (11.7× the 15.15 MiB
+ceiling, from 17.9×). The RSS ceiling is **not renegotiated and not
+met**, and the next memory row's shortlist updates: the peak instant
+is now staging/serialization — the stage arena (~99 MiB across its
+sites), `resolved.project` (39.4 MiB), `applyEdits` (18.6 MiB) — over
+the model (~19 MiB) and the computed layer (`putComputed`, 11.1 MiB).
 
 ---
 
