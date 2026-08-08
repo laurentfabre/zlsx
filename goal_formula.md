@@ -12,10 +12,12 @@ dispositioned; see §15) · Status: **SHIPPED (2026-08-07)** — the 41-row ladd
 (M-1 … M9d) is complete and landed on `main` as one rebase-merged PR
 (`feat/m9d-eng`: 48 ladder commits, plus the Linux `syncDir` EBADF fix the
 ubuntu lane required). All 175 frozen names registered; §13 gate green; the
-four §9 `--gate` lanes green. **The release cut stays open on two ⛔ owner
-decisions** (§9.1, measured at M9d): evaluate 936.98 ms is **1.87×** its
-500 ms ceiling, and first-recalc RSS 506.7 MiB is **33.4×** its 3×-model-bytes
-ceiling — each needs an owner waiver or a perf/memory row before any release._
+four §9 `--gate` lanes green. **The two ⛔ owner decisions are closed
+(2026-08-08): both ceilings waived for v0.8.0** (§9.1) — evaluate 936.98 ms
+(**1.87×** its 500 ms ceiling) and first-recalc RSS 506.7 MiB (**33.4×** its
+3×-model-bytes ceiling) ship under recorded owner waivers. Neither ceiling is
+renegotiated; perf/memory rows targeting both stay open candidates for the
+next minor._
 
 _The Codex SHIP-READY review loop remains parked by owner directive after
 round 20; round 21 was never run._
@@ -4883,9 +4885,9 @@ ReleaseFast, N=20, medians, the digest-gated named workload:
 
 | Check | Ceiling | Measured | Verdict |
 |---|---:|---:|---|
-| evaluate (recalc − open) | ≤ 500 ms | **936.98 ms** | ⛔ **1.87× over** (M5d4: 1.81×) — owner waiver required at the release cut |
+| evaluate (recalc − open) | ≤ 500 ms | **936.98 ms** | ⚠️ **1.87× over** (M5d4: 1.81×) — **waived by owner for v0.8.0 (2026-08-08)** |
 | end-to-end (`save`) | ≤ 1 s | **908.62 ms** | ✅ under |
-| peak RSS, first recalc, ReleaseSafe lane, baseline-adjusted | ≤ 3 × model bytes = 15.15 MiB (model = 5 294 703 B decompressed) | **506.7 MiB** (533 102 592 B peak − 1.77 MiB process baseline) | ⛔ **33.4× over** — the first measurement this ceiling has ever received; owner waiver or a memory row required at the release cut |
+| peak RSS, first recalc, ReleaseSafe lane, baseline-adjusted | ≤ 3 × model bytes = 15.15 MiB (model = 5 294 703 B decompressed) | **506.7 MiB** (533 102 592 B peak − 1.77 MiB process baseline) | ⚠️ **33.4× over** — the first measurement this ceiling has ever received; **waived by owner for v0.8.0 (2026-08-08)** |
 
 RSS methodology: `zlsx-bench-recalc` built ReleaseSafe (the RSS lane's
 pinned mode); baseline = `/usr/bin/time -l` peak of a usage invocation
@@ -4898,6 +4900,17 @@ before this one. Neither ceiling is renegotiated here. v1 is
 code-complete with two ⛔ rows on the release gate, and both are the
 owner's decision — waive, or spend a perf/memory row — before the
 first release that carries the engine.
+
+**Owner decision, recorded at the v0.8.0 release cut (2026-08-08): both
+ceilings are waived for v0.8.0.** Rationale as put to and accepted by the
+owner: the evaluate multiple has been stable across two milestones (1.81×
+at M5d4 → 1.87× at M9d while 20 names registered) and end-to-end is under
+its 1 s ceiling; the RSS figure is this ceiling's first-ever measurement —
+new information, not a regression. Neither ceiling is renegotiated by the
+waiver, `compare_bench --gate` stays blocking for release cuts so neither
+number can silently grow, and perf/memory rows targeting both remain open
+candidates for the next minor. The waivers ship named in the v0.8.0
+release notes.
 
 ---
 
