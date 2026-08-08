@@ -618,12 +618,12 @@ pub const PartStore = struct {
             .crc32 = std.hash.Crc32.hash(seed_ct_xml),
         };
         const overrides = try ar_alloc.alloc(?Override, 1);
-        overrides[0] = .{
+        overrides[0] = .{ .compressed = .{
             .payload = owned_payload,
             .compression_method = 0,
             .crc32 = std.hash.Crc32.hash(seed_ct_xml),
             .uncompressed_size = @intCast(seed_ct_xml.len),
-        };
+        } };
 
         return .{
             .allocator = allocator,
@@ -729,12 +729,12 @@ pub const PartStore = struct {
             .bytes = owned_user_bytes,
             .compression_method = method,
         };
-        const new_override: Override = .{
+        const new_override: Override = .{ .compressed = .{
             .payload = owned_payload,
             .compression_method = method,
             .crc32 = std.hash.Crc32.hash(bytes),
             .uncompressed_size = @intCast(bytes.len),
-        };
+        } };
 
         // Grow the parallel arrays via alloc+copy rather than
         // realloc. realloc invalidates the source slice on
@@ -761,7 +761,7 @@ pub const PartStore = struct {
         // Apply the staged content-types update.
         self.overrides[ct_idx] = ct_new_override;
         self.parts[ct_idx].bytes = ct_new_part_bytes;
-        self.parts[ct_idx].compression_method = ct_new_override.compression_method;
+        self.parts[ct_idx].compression_method = ct_new_override.compressed.compression_method;
     }
 
     const StagedContentTypeUpdate = struct {
@@ -818,12 +818,12 @@ pub const PartStore = struct {
         return .{
             .idx = ct_idx,
             .new_part_bytes = new_xml,
-            .new_override = .{
+            .new_override = .{ .compressed = .{
                 .payload = ct_payload,
                 .compression_method = ct_method,
                 .crc32 = std.hash.Crc32.hash(new_xml),
                 .uncompressed_size = @intCast(new_xml.len),
-            },
+            } },
         };
     }
 
@@ -946,13 +946,14 @@ pub const PartStore = struct {
 
     /// `replacePart` with §5.5's poll seam (M5d1).
     ///
-    /// This is the seam that mattered most to reach: the recalc
-    /// transaction stages a rewritten `sheet1.xml` through here, and on a
-    /// large workbook that single call is the longest uninterrupted
-    /// stretch of a recalc after evaluation itself. `error.Cancelled`
-    /// leaves the store byte-identical — the compression happens before
-    /// any field is written, and the arena reclaims the partial output at
-    /// `deinit`.
+    /// Compression is DEFERRED (M10b): this call stages the raw bytes
+    /// and a `.pending` override, and the deflate runs when a save
+    /// path first needs the compressed form — under that save's own
+    /// poller, which keeps M5d1's seam where the work actually is. A
+    /// recalc that is never saved never compresses at all, and every
+    /// in-memory reader was already served by the `parts[idx].bytes`
+    /// mirror rather than the payload. `error.Cancelled` leaves the
+    /// store byte-identical — the poll precedes any field write.
     pub fn replacePartControlled(
         self: *PartStore,
         name: []const u8,
@@ -967,30 +968,25 @@ pub const PartStore = struct {
         // the reader treats as Zip64 and rejects.
         if (bytes.len >= std.math.maxInt(u32)) return Error.Zip64NotSupported;
 
-        var compressed: std.ArrayListUnmanaged(u8) = .empty;
-        defer compressed.deinit(ar_alloc);
-        const method = try compressInto(ar_alloc, bytes, &compressed, poller);
-        if (compressed.items.len >= std.math.maxInt(u32)) return Error.Zip64NotSupported;
+        // The seam's poll survives the deferral: a replace on an
+        // already-cancelled run still refuses before mutating.
+        try poller.check();
 
-        // Build all the new arena-owned values BEFORE installing
-        // any of them so a mid-allocation OOM leaves the store
-        // unchanged (no partial-mutation observable to a caller
-        // that recovers from the error).
-        const owned_payload = try compressed.toOwnedSlice(ar_alloc);
+        // Build the new arena-owned value BEFORE installing anything
+        // so a mid-allocation OOM leaves the store unchanged (no
+        // partial-mutation observable to a caller that recovers from
+        // the error).
         const dupe_bytes = try ar_alloc.dupe(u8, bytes);
-        self.overrides[idx] = .{
-            .payload = owned_payload,
-            .compression_method = method,
-            .crc32 = std.hash.Crc32.hash(bytes),
-            .uncompressed_size = @intCast(bytes.len),
-        };
-        // Mirror the override into parts[idx].bytes so subsequent
-        // part() lookups see the updated content. NOTE: derived
-        // content_type entries inferred from a replaced
-        // [Content_Types].xml are NOT refreshed until the next
-        // open() — same v1 contract as before.
+        self.overrides[idx] = .pending;
+        // Mirror into parts[idx].bytes so subsequent part() lookups see
+        // the updated content. NOTE: derived content_type entries
+        // inferred from a replaced [Content_Types].xml are NOT
+        // refreshed until the next open() — same v1 contract as before.
+        // `compression_method` is the materialization's to fill: no
+        // reader reaches it while `bytes` is non-empty (`materializeAt`
+        // returns on the mirror), and the method does not exist until
+        // the compressor picks it.
         self.parts[idx].bytes = dupe_bytes;
-        self.parts[idx].compression_method = method;
 
         // Rels-cache refresh: when the replaced part is itself a
         // `_rels/<base>.rels` file, re-parse its relationships so
@@ -1048,6 +1044,7 @@ pub const PartStore = struct {
         poller: Poller,
         hook: CommitHook,
     ) !Commit {
+        try self.materializeOverrides(poller);
         try self.checkArchiveBounds();
 
         // Ahead of creating the temp file: a save that is already
@@ -1083,12 +1080,43 @@ pub const PartStore = struct {
     /// caller's view of it untouched. The returned bytes are the
     /// caller's, freed with `allocator`.
     pub fn saveToOwnedBuffer(self: *PartStore, allocator: std.mem.Allocator, poller: Poller) ![]u8 {
+        try self.materializeOverrides(poller);
         try self.checkArchiveBounds();
         try poller.check();
         var sink: std.Io.Writer.Allocating = .init(allocator);
         defer sink.deinit();
         try self.emitArchive(&sink.writer, poller);
         return sink.toOwnedSlice();
+    }
+
+    /// The deferred half of `replacePartControlled` (M10b): compress
+    /// every `.pending` override, under the save's poller — deflate on
+    /// a large sheet is exactly the stretch M5d1's seam exists for.
+    /// Runs before `checkArchiveBounds` on every save path, so the
+    /// bounds are always checked against real compressed sizes and
+    /// the emit loops below never meet a pending slot. The compressor,
+    /// its stored-vs-deflate policy and its input are the ones the
+    /// eager path used, which is why the emitted bytes are identical.
+    fn materializeOverrides(self: *PartStore, poller: Poller) !void {
+        const ar_alloc = self.arena.allocator();
+        for (self.overrides, 0..) |*slot, i| {
+            const ov = slot.* orelse continue;
+            if (ov != .pending) continue;
+            const bytes = self.parts[i].bytes;
+
+            var compressed: std.ArrayListUnmanaged(u8) = .empty;
+            defer compressed.deinit(ar_alloc);
+            const method = try compressInto(ar_alloc, bytes, &compressed, poller);
+            if (compressed.items.len >= std.math.maxInt(u32)) return Error.Zip64NotSupported;
+
+            slot.* = .{ .compressed = .{
+                .payload = try compressed.toOwnedSlice(ar_alloc),
+                .compression_method = method,
+                .crc32 = std.hash.Crc32.hash(bytes),
+                .uncompressed_size = @intCast(bytes.len),
+            } };
+            self.parts[i].compression_method = method;
+        }
     }
 
     /// Preflight ZIP32 limits BEFORE any byte is produced. Every
@@ -1112,8 +1140,12 @@ pub const PartStore = struct {
         for (self.entries, 0..) |e, i| {
             if (e.name.len > std.math.maxInt(u16)) return Error.ZipArchiveTooLarge;
             const lfh_total: u64 = if (self.overrides[i]) |ov| blk: {
-                if (ov.payload.len >= std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
-                break :blk 30 + @as(u64, e.name.len) + @as(u64, ov.payload.len);
+                // Materialization precedes bounds on every save path;
+                // a pending slot here is a caller that skipped it.
+                std.debug.assert(ov != .pending);
+                const c = ov.compressed;
+                if (c.payload.len >= std.math.maxInt(u32)) return Error.ZipArchiveTooLarge;
+                break :blk 30 + @as(u64, e.name.len) + @as(u64, c.payload.len);
             } else blk: {
                 break :blk @as(u64, e.lfh_total_len) +
                     @as(u64, e.compressed_size) +
@@ -1162,23 +1194,25 @@ pub const PartStore = struct {
                 // method + size. Reuses the original LFH name + extra
                 // bytes verbatim so we keep any extension fields the
                 // source carried (timestamps etc.).
+                std.debug.assert(ov != .pending);
+                const c = ov.compressed;
                 var lfh_bytes: [30]u8 = undefined;
                 std.mem.writeInt(u32, lfh_bytes[0..4], lfh_signature, .little);
                 std.mem.writeInt(u16, lfh_bytes[4..6], 20, .little); // version
                 std.mem.writeInt(u16, lfh_bytes[6..8], 0, .little); // flags
-                std.mem.writeInt(u16, lfh_bytes[8..10], ov.compression_method, .little);
+                std.mem.writeInt(u16, lfh_bytes[8..10], c.compression_method, .little);
                 std.mem.writeInt(u16, lfh_bytes[10..12], 0, .little); // mod time
                 std.mem.writeInt(u16, lfh_bytes[12..14], 0x21, .little); // mod date (1980-01-01)
-                std.mem.writeInt(u32, lfh_bytes[14..18], ov.crc32, .little);
-                std.mem.writeInt(u32, lfh_bytes[18..22], @intCast(ov.payload.len), .little);
-                std.mem.writeInt(u32, lfh_bytes[22..26], ov.uncompressed_size, .little);
+                std.mem.writeInt(u32, lfh_bytes[14..18], c.crc32, .little);
+                std.mem.writeInt(u32, lfh_bytes[18..22], @intCast(c.payload.len), .little);
+                std.mem.writeInt(u32, lfh_bytes[22..26], c.uncompressed_size, .little);
                 std.mem.writeInt(u16, lfh_bytes[26..28], @intCast(e.name.len), .little);
                 std.mem.writeInt(u16, lfh_bytes[28..30], 0, .little); // no extra
                 try w.writeAll(&lfh_bytes);
                 try w.writeAll(e.name);
-                var it = poller.chunks(ov.payload);
+                var it = poller.chunks(c.payload);
                 while (try it.next()) |chunk| try w.writeAll(chunk);
-                written += @as(u64, lfh_bytes.len) + @as(u64, e.name.len) + @as(u64, ov.payload.len);
+                written += @as(u64, lfh_bytes.len) + @as(u64, e.name.len) + @as(u64, c.payload.len);
             } else {
                 // Untouched: stream LFH + payload from the source
                 // file byte-for-byte. For entries with a data
@@ -1212,17 +1246,19 @@ pub const PartStore = struct {
             try poller.check();
             if (self.overrides[i]) |ov| {
                 // Fresh CDFH for the override. 46-byte header + name.
+                std.debug.assert(ov != .pending);
+                const c = ov.compressed;
                 var cdfh_bytes: [46]u8 = undefined;
                 std.mem.writeInt(u32, cdfh_bytes[0..4], cdfh_signature, .little);
                 std.mem.writeInt(u16, cdfh_bytes[4..6], 20, .little); // version made by
                 std.mem.writeInt(u16, cdfh_bytes[6..8], 20, .little); // version needed
                 std.mem.writeInt(u16, cdfh_bytes[8..10], 0, .little); // flags
-                std.mem.writeInt(u16, cdfh_bytes[10..12], ov.compression_method, .little);
+                std.mem.writeInt(u16, cdfh_bytes[10..12], c.compression_method, .little);
                 std.mem.writeInt(u16, cdfh_bytes[12..14], 0, .little);
                 std.mem.writeInt(u16, cdfh_bytes[14..16], 0x21, .little);
-                std.mem.writeInt(u32, cdfh_bytes[16..20], ov.crc32, .little);
-                std.mem.writeInt(u32, cdfh_bytes[20..24], @intCast(ov.payload.len), .little);
-                std.mem.writeInt(u32, cdfh_bytes[24..28], ov.uncompressed_size, .little);
+                std.mem.writeInt(u32, cdfh_bytes[16..20], c.crc32, .little);
+                std.mem.writeInt(u32, cdfh_bytes[20..24], @intCast(c.payload.len), .little);
+                std.mem.writeInt(u32, cdfh_bytes[24..28], c.uncompressed_size, .little);
                 std.mem.writeInt(u16, cdfh_bytes[28..30], @intCast(e.name.len), .little);
                 std.mem.writeInt(u16, cdfh_bytes[30..32], 0, .little); // no extra
                 std.mem.writeInt(u16, cdfh_bytes[32..34], 0, .little); // no comment
@@ -1552,15 +1588,27 @@ const ZipEntry = struct {
     has_data_descriptor: bool,
 };
 
-/// Override = caller-supplied replacement bytes for an existing part.
-/// Lazily compressed (deflate) or stored verbatim, with a fresh LFH
-/// + CDFH built at save() time.
-const Override = struct {
-    /// Compressed payload bytes (owned by arena).
-    payload: []const u8,
-    compression_method: u16,
-    crc32: u32,
-    uncompressed_size: u32,
+/// Override = caller-supplied replacement bytes for an existing part,
+/// with a fresh LFH + CDFH built at save() time.
+const Override = union(enum) {
+    /// Compressed and ready to emit.
+    compressed: Compressed,
+    /// Staged with compression deferred (M10b): the raw bytes are the
+    /// mirror in `parts[i].bytes`, and every save path materializes
+    /// through `materializeOverrides` before any bound is checked or
+    /// byte emitted. A recalc that is never saved never pays the
+    /// deflate — §9.1's profile put that at ~7 % of the whole
+    /// evaluate lane — and the bytes a save does emit are identical,
+    /// because the compressor, its policy and its input are.
+    pending,
+
+    const Compressed = struct {
+        /// Compressed payload bytes (owned by arena).
+        payload: []const u8,
+        compression_method: u16,
+        crc32: u32,
+        uncompressed_size: u32,
+    };
 };
 
 const eocd_signature: u32 = 0x06054b50;
@@ -2521,12 +2569,16 @@ test "PartStore.replacePart: large input round-trips through deflate" {
         var store = try PartStore.open(std.testing.allocator, io, fixture);
         defer store.deinit();
         try store.replacePart("xl/workbook.xml", replacement);
+        // Deferred (M10b): the replace stages raw bytes only; the save
+        // below is what compresses.
+        const idx = store.findIndex("xl/workbook.xml").?;
+        try std.testing.expect(store.overrides[idx].? == .pending);
+        try store.save(io, out_path);
         // Compression must shrink the payload — 10 KiB of one byte
         // is the trivial deflate case.
-        const ov = store.overrides[store.findIndex("xl/workbook.xml").?].?;
+        const ov = store.overrides[idx].?.compressed;
         try std.testing.expectEqual(@as(u16, 8), ov.compression_method);
         try std.testing.expect(ov.payload.len < replacement.len);
-        try store.save(io, out_path);
     }
 
     var dst = try PartStore.open(std.testing.allocator, io, out_path);
@@ -2579,25 +2631,60 @@ test "M5d1: cancel inside replacePart leaves the store byte-identical" {
     try std.testing.expect(store.overrides[idx] == null);
 
     // Large enough that the compression spans several chunks, so the
-    // trip lands inside the deflate rather than at the entry poll.
+    // save-side trip below lands inside the deflate rather than at an
+    // entry poll.
     const replacement = try std.testing.allocator.alloc(u8, control.chunk_bytes * 4);
     defer std.testing.allocator.free(replacement);
     @memset(replacement, 'A');
 
-    var flag: u8 = 0;
-    var w = tripAfter(io, 3, &flag);
+    // The replace's own poll (M10b: the deflate moved to the save, so
+    // this is the one check the call still owes): an already-cancelled
+    // run refuses before any field is written.
+    var cancelled: u8 = 1;
+    const w: control.Watch = .init(io, .{ .cancel = .{ .flag = &cancelled } });
     try std.testing.expectError(
         control.Error.Cancelled,
         store.replacePartControlled("xl/workbook.xml", replacement, w.poller()),
     );
 
     // Nothing staged, nothing mirrored: `part()` still answers with the
-    // source bytes and the override slot is still empty. A partial
-    // deflate output exists in the arena and is reclaimed at `deinit` —
-    // it is unreachable, which is the property that matters.
+    // source bytes and the override slot is still empty.
     try std.testing.expect(store.overrides[idx] == null);
     try std.testing.expectEqualSlices(u8, before, (try store.part("xl/workbook.xml")).?.bytes);
     try std.testing.expect(!store.hasUnsavedChanges());
+
+    // The deflate itself now runs under the SAVE's poller
+    // (`materializeOverrides`), and a trip inside it must leave the
+    // destination untouched and the staged replacement intact.
+    try store.replacePart("xl/workbook.xml", replacement);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "book.xlsx" });
+    defer std.testing.allocator.free(out_path);
+
+    var flag: u8 = 0;
+    var w2 = tripAfter(io, 3, &flag);
+    try std.testing.expectError(
+        control.Error.Cancelled,
+        store.saveControlled(io, out_path, w2.poller()),
+    );
+    // The trip precedes `AtomicFile.init`, so not even a temp file
+    // exists, and the mirror still answers with the replacement — a
+    // cancelled save half-materialized at most, it un-staged nothing.
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().access(io, out_path, .{}),
+    );
+    try std.testing.expectEqualSlices(u8, replacement, (try store.part("xl/workbook.xml")).?.bytes);
+
+    // A retry without the trip completes and round-trips the bytes the
+    // cancelled attempt was carrying.
+    _ = try store.saveControlled(io, out_path, .none);
+    var dst = try PartStore.open(std.testing.allocator, io, out_path);
+    defer dst.deinit();
+    try std.testing.expectEqualSlices(u8, replacement, (try dst.part("xl/workbook.xml")).?.bytes);
 }
 
 test "M5d1: cancel inside materialization mutates nothing" {
@@ -2747,7 +2834,7 @@ test "M5d1: save polls at least once per 64 KiB of archive" {
     // rather than eyeballed: one poll before the temp file is created,
     // one per entry in each of the two passes, one immediately before
     // the commit region, and one per 64 KiB of the staged payload.
-    const staged = store.overrides[store.findIndex("xl/workbook.xml").?].?;
+    const staged = store.overrides[store.findIndex("xl/workbook.xml").?].?.compressed;
     const payload_polls = control.chunkCount(staged.payload.len);
     const owed = 2 + 2 * store.entries.len + payload_polls;
     try std.testing.expect(control.inject.state.now_calls >= owed);
@@ -2775,7 +2862,8 @@ test "M5d1: an injected rename failure leaves memory AND the destination untouch
     defer store.deinit();
     try store.replacePart("xl/workbook.xml", "<workbook/>");
     const idx = store.findIndex("xl/workbook.xml").?;
-    const staged = store.overrides[idx].?;
+    // Deferred (M10b): the replace stages raw bytes only.
+    try std.testing.expect(store.overrides[idx].? == .pending);
 
     const faulty = control.inject.wrap(io, .{ .fail_rename = true });
     try std.testing.expectError(error.AccessDenied, store.saveControlled(faulty, out_path, .none));
@@ -2788,11 +2876,13 @@ test "M5d1: an injected rename failure leaves memory AND the destination untouch
         "PRIOR BYTES",
         try std.Io.Dir.cwd().readFile(io, out_path, &buf),
     );
-    // Memory: the staged override is still staged, byte-for-byte. A
-    // failed save is not a save that half-consumed the candidate.
-    const after = store.overrides[idx].?;
-    try std.testing.expectEqualSlices(u8, staged.payload, after.payload);
-    try std.testing.expectEqual(staged.crc32, after.crc32);
+    // Memory: the staged override is still staged — materialized by
+    // the attempt (compression precedes the failing rename) and still
+    // describing the same replacement bytes. A failed save is not a
+    // save that half-consumed the candidate.
+    const after = store.overrides[idx].?.compressed;
+    try std.testing.expectEqual(std.hash.Crc32.hash("<workbook/>"), after.crc32);
+    try std.testing.expectEqual(@as(u32, "<workbook/>".len), after.uncompressed_size);
     try std.testing.expectEqualStrings("<workbook/>", (try store.part("xl/workbook.xml")).?.bytes);
     // …and no `.ztmp-N` beside the user's workbook.
     var it = tmp.dir.iterate();
