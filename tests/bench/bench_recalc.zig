@@ -51,7 +51,7 @@ const RUN: recalc.RunInputs = .{
     .limits = .{},
 };
 
-const Mode = enum { emit, open, recalc, save, phases };
+const Mode = enum { emit, open, recalc, save, phases, heap };
 
 /// Which generator `emit` runs. Only `emit` cares: the other four modes
 /// take a fixture path and measure whatever workbook is behind it,
@@ -71,7 +71,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (args.len < 3) {
         try w.print(
-            "usage: {s} <emit|open|recalc|save|phases> <fixture.xlsx>" ++
+            "usage: {s} <emit|open|recalc|save|phases|heap> <fixture.xlsx>" ++
                 " [--workload f1|criteria|text|registry] [--size named|small|tiny] [--rows N] [--out PATH]\n",
             .{args[0]},
         );
@@ -199,9 +199,254 @@ pub fn main(init: std.process.Init) !u8 {
             try w.print("cells_written={d}\n", .{report.cells_written});
         },
         .phases => return reportPhases(gpa, io, w, path, out_path),
+        .heap => return reportHeap(io, w, path),
     }
     return 0;
 }
+
+/// §9.1's RSS lane, attributed: the same first recalc the
+/// `/usr/bin/time -l` probe measures, run through an allocator that
+/// records which call sites hold how many bytes at the moment of peak
+/// live footprint. macOS heap tooling cannot see these allocations —
+/// `smp_allocator` maps its own pools rather than going through libc
+/// malloc — so the attribution has to happen at the `Allocator`
+/// boundary, inside the process.
+///
+/// The numbers describe *live bytes at peak*, not churn: a site that
+/// allocates gigabytes but frees promptly is invisible to an RSS
+/// ceiling, and a site that allocates once and holds is the whole
+/// problem. Churn is reported alongside because a fix that converts a
+/// holder into a churner shows up there.
+fn reportHeap(io: std.Io, w: *std.Io.Writer, path: []const u8) !u8 {
+    var prof: HeapProfiler = .init(std.heap.smp_allocator);
+    const gpa = prof.allocator();
+
+    var wb = try Workbook.open(gpa, io, path);
+    defer wb.deinit();
+    const open_live = prof.live_total;
+
+    var report = try wb.recalculate(gpa, io, RUN, .{});
+    defer report.deinit(gpa);
+
+    try w.print("live_after_open_bytes={d}\n", .{open_live});
+    try prof.report(w);
+    return 0;
+}
+
+/// Attributing allocator: wraps a backing allocator, keys every
+/// allocation to a call-site stack, and snapshots each site's live
+/// bytes whenever the total live footprint sets a new high-water mark.
+/// Bookkeeping lives in `page_allocator` so the profiler never recurses
+/// into the allocator it is measuring.
+const HeapProfiler = struct {
+    backing: std.mem.Allocator,
+    lock: std.atomic.Value(u8) = .init(0),
+    live: std.AutoHashMapUnmanaged(usize, LiveEntry) = .empty,
+    site_index: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    sites: std.ArrayList(Site) = .empty,
+    live_total: usize = 0,
+    peak_total: usize = 0,
+    last_snapshot: usize = 0,
+
+    /// Deep enough to see past the parser's recursive-descent chain
+    /// (eleven frames of parseX before the caller appears); shallow
+    /// enough that a million-event run stays seconds, not minutes.
+    const max_depth = 32;
+    /// Re-snapshot per-site live bytes when the peak has grown this
+    /// much since the last snapshot. 1 MiB of drift against a >500 MiB
+    /// peak bounds the attribution error at ~0.2 %.
+    const snapshot_step = 1 * 1024 * 1024;
+
+    const LiveEntry = struct { site: u32, size: usize };
+
+    const Site = struct {
+        frames: [max_depth]usize,
+        depth: u8,
+        live: usize = 0,
+        at_peak: usize = 0,
+        allocs: u64 = 0,
+        total: u64 = 0,
+    };
+
+    const meta = std.heap.page_allocator;
+
+    fn init(backing: std.mem.Allocator) HeapProfiler {
+        return .{ .backing = backing };
+    }
+
+    fn allocator(self: *HeapProfiler) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = allocFn,
+        .resize = resizeFn,
+        .remap = remapFn,
+        .free = freeFn,
+    };
+
+    fn acquire(self: *HeapProfiler) void {
+        while (self.lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn release(self: *HeapProfiler) void {
+        self.lock.store(0, .release);
+    }
+
+    /// The stack is captured with `first_address = ret_addr`, so frame 0
+    /// is the caller of the allocator itself — `HashMap.grow`,
+    /// `ArrayList.ensureTotalCapacity` — and the frames above it are
+    /// what make the site nameable.
+    fn siteOf(self: *HeapProfiler, ret_addr: usize) u32 {
+        var buf: [max_depth]usize = undefined;
+        const st = std.debug.captureCurrentStackTrace(.{ .first_address = ret_addr }, &buf);
+        var frames = st.return_addresses;
+        if (frames.len == 0) {
+            // Unwind failed to reach the caller (tail call, missing
+            // frame): key on the raw return address rather than losing
+            // the event.
+            buf[0] = ret_addr;
+            frames = buf[0..1];
+        }
+        const key = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(frames));
+        const gop = self.site_index.getOrPut(meta, key) catch @panic("heap profiler OOM");
+        if (!gop.found_existing) {
+            var site: Site = .{ .frames = undefined, .depth = @intCast(frames.len) };
+            @memcpy(site.frames[0..frames.len], frames);
+            self.sites.append(meta, site) catch @panic("heap profiler OOM");
+            gop.value_ptr.* = @intCast(self.sites.items.len - 1);
+        }
+        return gop.value_ptr.*;
+    }
+
+    fn noteAlloc(self: *HeapProfiler, ptr: usize, len: usize, ret_addr: usize) void {
+        const site_id = self.siteOf(ret_addr);
+        self.live.put(meta, ptr, .{ .site = site_id, .size = len }) catch @panic("heap profiler OOM");
+        const site = &self.sites.items[site_id];
+        site.live += len;
+        site.allocs += 1;
+        site.total += len;
+        self.live_total += len;
+        self.maybeSnapshot();
+    }
+
+    fn noteResize(self: *HeapProfiler, ptr: usize, new_ptr: usize, new_len: usize) void {
+        const entry = self.live.getPtr(ptr) orelse return;
+        const site = &self.sites.items[entry.site];
+        site.live = site.live - entry.size + new_len;
+        if (new_len > entry.size) site.total += new_len - entry.size;
+        self.live_total = self.live_total - entry.size + new_len;
+        if (new_ptr == ptr) {
+            entry.size = new_len;
+        } else {
+            const moved: LiveEntry = .{ .site = entry.site, .size = new_len };
+            _ = self.live.remove(ptr);
+            self.live.put(meta, new_ptr, moved) catch @panic("heap profiler OOM");
+        }
+        self.maybeSnapshot();
+    }
+
+    fn noteFree(self: *HeapProfiler, ptr: usize) void {
+        const kv = self.live.fetchRemove(ptr) orelse return;
+        self.sites.items[kv.value.site].live -= kv.value.size;
+        self.live_total -= kv.value.size;
+    }
+
+    fn maybeSnapshot(self: *HeapProfiler) void {
+        if (self.live_total <= self.peak_total) return;
+        self.peak_total = self.live_total;
+        if (self.peak_total - self.last_snapshot < snapshot_step) return;
+        self.last_snapshot = self.peak_total;
+        for (self.sites.items) |*site| site.at_peak = site.live;
+    }
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *HeapProfiler = @ptrCast(@alignCast(ctx));
+        const p = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.acquire();
+        defer self.release();
+        self.noteAlloc(@intFromPtr(p), len, ret_addr);
+        return p;
+    }
+
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *HeapProfiler = @ptrCast(@alignCast(ctx));
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.acquire();
+        defer self.release();
+        self.noteResize(@intFromPtr(memory.ptr), @intFromPtr(memory.ptr), new_len);
+        return true;
+    }
+
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *HeapProfiler = @ptrCast(@alignCast(ctx));
+        const p = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.acquire();
+        defer self.release();
+        self.noteResize(@intFromPtr(memory.ptr), @intFromPtr(p), new_len);
+        return p;
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *HeapProfiler = @ptrCast(@alignCast(ctx));
+        self.acquire();
+        self.noteFree(@intFromPtr(memory.ptr));
+        self.release();
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+
+    /// Top sites by live-bytes-at-peak, symbolized in-process. Stacks
+    /// go to stderr (`dumpStackTrace`'s stream); the table goes to
+    /// stdout with a `site=` line each so the two can be joined.
+    fn report(self: *HeapProfiler, w: *std.Io.Writer) !void {
+        try w.print(
+            "peak_live_bytes={d} ({d:.1} MiB) live_end_bytes={d} sites={d}\n",
+            .{
+                self.peak_total,
+                @as(f64, @floatFromInt(self.peak_total)) / (1024.0 * 1024.0),
+                self.live_total,
+                self.sites.items.len,
+            },
+        );
+
+        const order = meta.alloc(u32, self.sites.items.len) catch @panic("heap profiler OOM");
+        defer meta.free(order);
+        for (order, 0..) |*slot, idx| slot.* = @intCast(idx);
+        std.mem.sort(u32, order, self.sites.items, siteGreater);
+
+        const top = @min(order.len, 25);
+        for (order[0..top], 0..) |site_id, rank| {
+            const site = self.sites.items[site_id];
+            if (site.at_peak == 0) break;
+            try w.print(
+                "site={d} at_peak_bytes={d} ({d:.1} MiB, {d:.1}%) allocs={d} churn_bytes={d}\n",
+                .{
+                    rank,
+                    site.at_peak,
+                    @as(f64, @floatFromInt(site.at_peak)) / (1024.0 * 1024.0),
+                    @as(f64, @floatFromInt(site.at_peak)) * 100.0 / @as(f64, @floatFromInt(self.peak_total)),
+                    site.allocs,
+                    site.total,
+                },
+            );
+            try w.flush();
+            std.debug.print("--- site {d} ---\n", .{rank});
+            var frames_buf: [max_depth]usize = undefined;
+            @memcpy(frames_buf[0..site.depth], site.frames[0..site.depth]);
+            const st: std.debug.StackTrace = .{
+                .return_addresses = frames_buf[0..site.depth],
+                .skipped = .none,
+            };
+            std.debug.dumpStackTrace(&st);
+        }
+    }
+
+    fn siteGreater(sites: []const Site, a: u32, b: u32) bool {
+        return sites[a].at_peak > sites[b].at_peak;
+    }
+};
 
 fn emitFixture(
     gpa: std.mem.Allocator,

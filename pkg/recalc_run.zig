@@ -393,6 +393,7 @@ pub fn prepare(
         .wb = wb,
         .model = &model,
         .arena = a,
+        .scratch = std.heap.ArenaAllocator.init(gpa),
         .gpa = gpa,
         .opts = eval_opts,
         .watch = &watch,
@@ -563,6 +564,18 @@ const Driver = struct {
     wb: *Workbook,
     model: *WorkbookEnv,
     arena: Allocator,
+    /// Per-evaluation scratch, reset at the top of every `vtEvaluate`.
+    ///
+    /// §9.1's profile: one run-lifetime arena absorbed every formula's
+    /// parse and evaluator scratch — ~4.3 KiB per formula cell held
+    /// until the end of `prepare`, ~350 MiB of the named workload's
+    /// 643 MiB peak — for data that is dead the moment `evaluateOne`
+    /// returns. What must outlive the evaluation (the published value's
+    /// text or matrix) is duped into `arena` at the seam below; the
+    /// `reads` slices are consumed synchronously by the engine's
+    /// `noteReads` before its next `evaluate` call, so the deferred
+    /// reset never invalidates a live borrow.
+    scratch: std.heap.ArenaAllocator,
     gpa: Allocator,
     opts: workbook_mod.EvaluateOptions,
     /// §5.5's seam through the evaluation phase. The engine takes no
@@ -591,6 +604,7 @@ const Driver = struct {
     fn deinit(self: *Driver) void {
         self.published.deinit(self.gpa);
         self.published_at.deinit(self.gpa);
+        self.scratch.deinit();
     }
 
     /// Append one entry and record where it landed.
@@ -639,7 +653,15 @@ const Driver = struct {
             },
         }) orelse return .{ .ok = .{ .value = .{ .scalar = .blank } } };
 
-        const one = self.wb.evaluateOne(self.arena, self.model, cell, text, self.opts, key) catch |e| switch (e) {
+        // The previous evaluation's scratch dies here, not at the end
+        // of the run: its `reads` were consumed by the engine's
+        // `noteReads` before this call could happen, and its value was
+        // duped below before it crossed the seam. `.retain_capacity`
+        // keeps the high-water chunks of one formula, so the steady
+        // state allocates nothing.
+        _ = self.scratch.reset(.retain_capacity);
+
+        const one = self.wb.evaluateOne(self.scratch.allocator(), self.model, cell, text, self.opts, key) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 self.failure = e;
@@ -658,7 +680,15 @@ const Driver = struct {
                 // can be evaluated and never published (a refusal
                 // between the two), and the gate still wants its shape.
                 self.noteShape(cell, x.shape) catch return error.OutOfMemory;
-                break :blk .{ .ok = .{ .value = x.value, .reads = x.reads } };
+                // The one thing that outlives this evaluation. The
+                // engine holds it across passes (`held`), `publish`
+                // hands it to the model, and `stage` reads it back out
+                // of `published` — all after the scratch reset above
+                // has run again. Text and matrix payloads therefore
+                // move to the run arena; numbers, booleans, errors and
+                // blanks are value types and cost nothing.
+                const owned = dupeSnapshot(self.arena, x.value) catch return error.OutOfMemory;
+                break :blk .{ .ok = .{ .value = owned, .reads = x.reads } };
             },
         };
     }
@@ -738,6 +768,32 @@ const Driver = struct {
         }
     }
 };
+
+/// Move a snapshot's borrowed payload out of the evaluation scratch and
+/// into `a` (the run arena). Only `.text` and `.err.rich` carry bytes;
+/// a matrix additionally owns its cell slice. Everything else is a
+/// value type and passes through untouched.
+fn dupeSnapshot(a: Allocator, v: engine.iterate.Snapshot) Allocator.Error!engine.iterate.Snapshot {
+    return switch (v) {
+        .scalar => |s| .{ .scalar = try dupeScalar(a, s) },
+        .array => |m| blk: {
+            const cells = try a.alloc(engine.value.ScalarValue, m.cells.len);
+            for (m.cells, cells) |src, *dst| dst.* = try dupeScalar(a, src);
+            break :blk .{ .array = .{ .rows = m.rows, .cols = m.cols, .cells = cells } };
+        },
+    };
+}
+
+fn dupeScalar(a: Allocator, v: engine.value.ScalarValue) Allocator.Error!engine.value.ScalarValue {
+    return switch (v) {
+        .text => |t| .{ .text = try a.dupe(u8, t) },
+        .err => |e| switch (e) {
+            .known => v,
+            .rich => |spelling| .{ .err = .{ .rich = try a.dupe(u8, spelling) } },
+        },
+        else => v,
+    };
+}
 
 // ─── §5.7.3 step 3: values become bytes ──────────────────────────
 
