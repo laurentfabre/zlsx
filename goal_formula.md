@@ -2702,8 +2702,8 @@ debris beside either.
 
 ## 6. Milestone ladder
 
-Tier **D1**. One PR per row — **41 rows, M-1 … M9d** (count = the table; every v1 function name frozen — no ellipses);
-counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
+Tier **D1**. One PR per row — **42 rows, M-1 … M10a** (count = the table; every v1 function name frozen — no ellipses);
+counts regenerate from the frozen registry inventory (M3a). v1 = M9d; M10a is the first post-v1 row.
 `<xm:f>` route-through pullable after M2.
 
 | PR | Ships | Own gate |
@@ -2750,6 +2750,8 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d.
 | **M9c1** ✅ | Shared deterministic solver contract FIRST (`feat/m9c1-tvm`): **`solve.zig`** — one Newton driver, ≤128 iterations, pinned \|Δx\| ≤ 1e-10, root selection IS the Newton path from the guess, **a domain-clamped step never converges** (a rootless residual chasing the −1 boundary runs its 128 iterations and answers `#NUM!` — never the fake root thirty-some halvings would fabricate under a bare step test) — every iteration polls THEN charges 4 units to the new **`WorkBudget`** (`run_inputs.zig`: node = 1 at `evalNode`, solver iteration = 4, nested callbacks re-charge by construction; §5.5's ≥1-poll-per-65 536-unit stride inside `charge`; the limit is identity, the poller is not; exhaustion refuses, cancellation is the engine's first own `error.Cancelled`, mapped like the driver's) threaded `Options.work` — evaluator + solvers on ONE meter, engine-level in v1 (the workbook/C knobs ride the row that can carry report fields; the ABI is frozen). + F4a-TVM (7, frozen: PMT, IPMT, PPMT, PV, FV, RATE, NPER) — **one `log1p`/`expm1` exponential spelling** (the annuity factor cancels catastrophically near r = 0 under naive `pow`, exactly where RATE's Newton walks; the residual's r = 0 arm lets Newton walk THROUGH zero), NPER closes through logarithms so RATE is the batch's only solver consumer (guess 0.1 when absent, 0 when explicitly empty), `#DIV/0!` for the spelled-out zero denominators / `#NUM!` for every other non-finite (N4a) / negative NPER is an ANSWER, nonzero type = beginning (OpenFormula). PMT's four canonical-unregistered pins flipped to `NPV`; running total 147 | Oracle-first (manifests predate F4a → every fixture spec_pinned, 0 oracle rows pinned — evidence at zero, a fourth time); convergence fixtures are Excel's own doc examples at full double precision, non-convergence is the all-positive-flows walk, mid-solve cancellation lands on the meter's receipt (base + 4·4 units at the fifth poll); combined-exhaustion: whole-cost−1 refuses inside the last iteration, whole-cost completes at remaining 0; zig 9727 unpiped, pytest 166 |
 | **M9c2** ✅ | F4a-flows (8, frozen: NPV, IRR, XNPV, XIRR, SLN, SYD, DB, DDB) (`feat/m9c2-flows`): **two discount spellings, on purpose** — NPV/IRR discount by POSITION (integer powers of 1+r accumulated by multiplication, so a rate below −1 alternates sign and stays an ANSWER; the one impossible denominator is r = −1 exactly, a spelled-out `#DIV/0!`; IRR's flow 0 is today where NPV's first flow is one period out — each function's documented own convention), XNPV/XIRR discount by DATE (the continuous exponent (d−d₀)/365 over the batch's `log1p`/`expm1` spelling, domain 1 + r > 0, N4a's `#NUM!` with no explicit gate). Ranges fold per §5.3c through `collectNumbers` — SUM's range/direct split verbatim, first error in §5.6a order wins, a text cell consumes no period — and XNPV/XIRR pair flows to dates by position AFTER each side folds (counts must agree, zero pairs anchor nothing: both `#NUM!`); date serials truncate + domain-check under the ACTIVE epoch (`wholeSerial` — the date batch's `#NUM!` held over the XNPV doc page's `#VALUE!`, a recorded pin), both rows `epoch_sensitive`. IRR/XIRR consume `solve.newton` exactly as RATE drives it (guess 0.1 absent / 0 explicitly empty, domain −1, 4-unit iterations on the SAME `WorkBudget`, one `solvedRate` seam) behind Excel's documented one-signed-schedule `#NUM!` precondition, read off the FOLDED flows; propagation splits by M7b3's shape rule — collection-first IRR/XIRR take §5.3c's declaration order themselves, scalar-first NPV/XNPV let the dispatcher propagate; the four schedule readers are the batch's not-liftable rows. Depreciation four in closed form: SLN's life is its spelled `#DIV/0!`; SYD/DDB's per ∈ [1, life] `#NUM!` bounds force life ≥ 1 so NEITHER has a `#DIV/0!` plane; DB truncates life/period/month (a discrete schedule around one partial first year — the stub period life+1 exists iff month < 12, per > life at month 12 is `#NUM!`, the 3-decimal rate rounding is Excel's own text, cost and life its two spelled `#DIV/0!`s); DDB stays continuous — `book = max(cost·qᵖᵉʳ⁻¹, salvage)`, the salvage floor IS the memory of every earlier period's cap, factor > life included. NPV's four canonical-unregistered pins flipped to `CONVERT`; running total 155 | Oracle-first (manifests predate F4a → every fixture spec_pinned, 0 oracle rows pinned — evidence at zero, a fifth time); value rows are Excel's own doc examples at full double precision (NPV 1188.44 / 41 922.06, IRR 8.66% / −44.35%, XNPV 2086.65, XIRR 37.34%, SLN 2250, SYD 4090.91 / 409.09, DB's month-7 table incl. the 15 845.10 stub year, DDB 1.32 / 40 / 480 / 306 / 22.12 + the cap-binds-immediately pair); non-convergence is the rootless mixed-sign residual ({−1,3,−3} — no root at ANY rate — 128 honest iterations on BOTH solvers); mid-solve cancellation lands on the meter's receipt (base + 4·4 at the fifth poll), combined-exhaustion whole−1/whole on IRR; a 1904 fixture bounds XNPV's serials by the active epoch; zig 9807 unpiped, pytest 166 |
 | **M9d** ✅ | F4b engineering (20, frozen: CONVERT, DELTA, GESTEP, BIN2DEC, DEC2BIN, HEX2DEC, DEC2HEX, OCT2DEC, DEC2OCT, BITAND, BITOR, BITXOR, BITLSHIFT, BITRSHIFT, COMPLEX, IMREAL, IMAGINARY, IMABS, IMSUM, IMPRODUCT) (`feat/m9d-eng`) — **v1 complete: all 175 frozen names registered, and the ladder's first batch with NO `#DIV/0!` plane** (nothing divides by a caller's value; the planes are the doc pages' own — CONVERT's three `#N/A` ways, the `#NUM!` domains, `#VALUE!` for coercion and suffixes, N4a for every other non-finite). CONVERT over the frozen doc-page unit table (case-sensitive, exact-name-first — `min` is the minute, `e` the erg; binary prefixes information-only; prefixed powers raised, km2 = (1000 m)²; Kelvin the one prefixable temperature; constants as identities — slug = lbf·s²/ft, psi = lbf/in²; u/eV pinned; the doc's gal→l digits vs its own factor a recorded divergence); the base six over one ten-character two's-complement window (40/30/10 bits, the sign bit reachable only at ten characters, negatives ignore places, places ∈ [1,10] pinned, hex digits fold where unit names do not); BIT* over 48-bit fields (constraint violations `#NUM!` incl. non-integers, coercion `#VALUE!`, \|shift\| ≤ 53 read before the sign flips, BITRSHIFT(n,s) IS BITLSHIFT(n,−s)); the complex six over one exact parse (greedy exponent, lowercase suffixes, no spaces — COMPLEX's output always re-parses) + one `formatNumber` format (unit imaginary bare), the IMSUM/IMPRODUCT suffix conflict pinned `#VALUE!`, IMABS the spelled √(x²+y²). **The canonical-unregistered pin retired**: registry = inventory in both directions (175 from the TSV), the refusal example now the out-of-inventory `IMDIV`, permanent by §7. **M-1 cherry-picked into the chain** (`3bcff95` — the release sweep found its five rows undischarged); §13 gate run, recorded, passes (§13.2 gained class H). §9 run and recorded (§9.1): all four `--gate` lanes green, `synth_registry_mix` lane added (~10.8 µs marginal per mixed formula); end-to-end 908.62 ms UNDER, evaluate 936.98 ms **1.87× OVER**, first-recalc RSS 506.7 MiB **33.4× OVER** — both ⛔ carried to the release cut as owner decisions | Oracle-first (manifests predate F4b → every fixture spec_pinned, 0 oracle rows pinned — evidence at zero, a sixth time); rg allowlist §13.2 A–H, zero unclassified; **absolute + regression perf checks (§9) run with results recorded**; zig 9841 unpiped, pytest 166 |
+
+| **M10a** ✅ | **The memory row — §9.1's waived RSS figure gets its profile and its first cut** (`feat/m10a-recalc-rss`). The 506.7 MiB is now *attributed*: `zlsx-bench-recalc heap`, an allocator-boundary profiler (`smp_allocator`'s pools are invisible to malloc tooling, so the attribution happens inside the process) that keys every allocation to a call-site stack and snapshots per-site live bytes at each new high-water mark — **643.0 MiB live at peak, and the top of the table was lifetime and arena mechanics, not data**: (1) the prepare-wide arena absorbed every formula's parse + evaluator scratch, ~4.3 KiB per formula cell held to end-of-run for ASTs that are dead the moment `evaluateOne` returns (~42 % of peak); (2) lists growing *inside* arenas stranded every abandoned growth buffer — the scan held ~3× its live bytes — while the ×1.5 chunk policy compounded on its own high water, 121.3 MiB of chunk for ~20 MiB of staged data (~35 %); (3) §5.6e's rebuild held TWO full dependency graphs at the peak instant. The fixes change no output byte: the recalc Driver gains a **per-evaluation scratch arena** (reset `.retain_capacity`; the published value's payload is duped across the seam into the run arena — `reads` stay borrowed, `noteReads` consumes them before the next reset can run); staging gets **its own arena and gpa-backed growth with exact-size arena copies** (stage's lists, the scan's four lists, `resolved.project` sorting a permutation instead of duping 9.16 MiB of publications, `applyEdits` sized to its knowable output, `signaturesOf` counted-then-filled); and **`iterate.run` now owns every graph it runs, the initial one included** — the outgoing graph is freed before its §5.6e replacement is built, at most one ever alive (sound: signatures copy their keys, and a Key's spellings borrow from the Input, never the graph). One latent bug fixed on the way: a result literal's `.arena = arena` copies the arena's state before later field initializers run, so an allocation there that opened a fresh chunk leaked on the returned copy's deinit — `scanSheet` and `project` both materialize before the literal now. **Result (§9.1): peak live 643.0 → 297.9 MiB; first-recalc RSS 506.7 → 271.4 MiB — 17.9× the 15.15 MiB ceiling, from 33.4×.** The ceiling is NOT renegotiated and NOT met; what remains at the new peak (the rebuild instant) is named for the next memory row: the engine's O(cells) records (~128 MiB across the edge sets, `held`/journal, plan scope and signatures), the rebuilt graph (~60 MiB), the model + computed layer (~45 MiB) | Saved archives byte-identical to main across all four workloads; **all four `compare_bench --gate` lanes green with no lane traded for memory** — F1 named `recalc` −3.0 %, `save` −3.8 %, criteria −1.8 %, registry −2.1 %, text +4.6 % (the seam dupes of its text results, under every threshold); zig build + zig build test green; the RSS probe reproducible to the byte across three runs |
 
 **M10+ backlog**: F5 (census-ordered); `<xm:f>` route-through; namespace-aware
 scanners; **future compatibility versions beyond CV2** (CV1+CV2 are v1 scope,
@@ -4911,6 +4913,61 @@ waiver, `compare_bench --gate` stays blocking for release cuts so neither
 number can silently grow, and perf/memory rows targeting both remain open
 candidates for the next minor. The waivers ship named in the v0.8.0
 release notes.
+
+**M10a — the memory row (recorded 2026-08-08).** The first row to act on
+the waived RSS figure, and the first §9.1 entry with *attribution*
+rather than one number: the probe is `zlsx-bench-recalc heap` — the
+same ReleaseSafe binary, the same digest-gated named fixture, the same
+first recalc, run under an allocator that keys every allocation to a
+call-site stack and snapshots per-site live bytes at each new
+high-water mark (1 MiB snapshot step ⇒ ≤ ~0.2 % attribution drift
+against a > 500 MiB peak). macOS heap tooling cannot produce this
+table: `smp_allocator` maps its own pools, so `malloc_history` and
+Instruments see anonymous regions. The profile is deterministic —
+identical bytes, identical peak, across runs.
+
+**What held the recorded 506.7 MiB** (643.0 MiB live at peak in the
+profile; `/usr/bin/time -l` reads lower because over-committed
+capacity is not all touched), grouped by the sites the profiler named:
+
+| Holder at peak, at the M9d baseline | MiB | Share | Why it held |
+|---|---:|---:|---|
+| the prepare-wide arena's chunks, attributed at the parser / `evaluateOne` sites that exhausted them (`pkg/recalc_run.zig:335` → `pkg/workbook.zig:1861`) | 267.6 | 41.6 % | every formula's parse + evaluator scratch — ~4.3 KiB per formula cell, dead the moment `evaluateOne` returns, unreclaimable per formula by construction; ×1.5 chunk growth compounding on the arena's own high water |
+| `stage` + `scanSheet` staging (`pkg/recalc_run.zig` stage loop, `src/formula/decode.zig:1731` scan lists) | ~222 | 34.5 % | four scan lists + stage outputs growing *inside* arenas, every abandoned growth buffer stranded (~3× live bytes); the sheet XML alive in four copies at once |
+| `resolved.patch` / `applyEdits` (`src/formula/resolved.zig:877`, `:1818`) | 32.7 | 5.1 % | the patch arena: transitions + edits + an output buffer that outgrew its `source.len` guess and stranded it |
+| `graph.build` / `link` (`src/formula/graph.zig:830`, `:1263`) | 31.8 | 4.9 % | two full dependency graphs alive at §5.6e's rebuild instant |
+| model build + `putComputed` + store part cache + driver records | ~75 | 11.7 % | the data and its bookkeeping — the only group whose bytes are the workbook's |
+
+**The fixes** are M10a's ladder row; none changes an output byte. The
+re-measurement, same methodology as the row above (ReleaseSafe,
+`/usr/bin/time -l`, usage-invocation baseline, first recalc, zero
+retained generations, digest-gated fixture):
+
+| | M9d (recorded above) | **M10a** |
+|---|---:|---:|
+| profile peak live | 643.0 MiB | **297.9 MiB** |
+| `/usr/bin/time -l` peak | 533 102 592 B | **286 375 936 B** |
+| process baseline | 1.77 MiB | 1.70 MiB |
+| baseline-adjusted | **506.7 MiB** | **271.4 MiB** |
+| vs the 3 × model-bytes ceiling (15.15 MiB) | 33.4× | **17.9×** |
+
+The four `--gate` lanes re-ran in the same session and stayed green
+with the time moving the right way — F1 named `recalc` 905.43 →
+877.92 ms (−3.0 %), `save` 916.53 → 882.10 ms (−3.8 %), criteria
+−1.8 %, registry −2.1 %, text +4.6 % (the seam dupes of its text
+results; under every threshold) — so no wall-clock was traded for the
+memory. Read as an observation, not a claim: named evaluate
+(recalc − open) lands at 876.2 ms, 1.75× the evaluate ceiling (was
+1.87×); the evaluate row stays open and separate.
+
+**What remains at the new peak** — which is now §5.6e's rebuild
+instant, not staging — is the next memory row's shortlist: the
+engine's O(cells) records (~128 MiB across `pass_edges`/`pass_edge_set`,
+`held` + journal, plan scope and per-pass signatures), the rebuilt
+graph (~60 MiB), and the model + computed layer (~45 MiB). The ceiling
+is **not renegotiated and not met**: 271.4 MiB against 15.15 MiB is
+17.9× over, and closing the rest means restructuring the engine's
+per-cell records, not more lifetime hygiene.
 
 ---
 

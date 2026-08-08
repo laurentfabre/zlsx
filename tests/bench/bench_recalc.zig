@@ -1,7 +1,7 @@
 //! §9's recalc bench harness (M5d3): the baseline v1's absolute
 //! ceilings are measured against.
 //!
-//! One binary, five modes, because hyperfine measures whole processes
+//! One binary, six modes, because hyperfine measures whole processes
 //! and §9 wants two different numbers out of the same workload:
 //!
 //!   emit    write the fixture and print its SHA-256 (and, for the
@@ -10,6 +10,9 @@
 //!   recalc  open + `Workbook.recalculate` — §9's *evaluate* lane
 //!   save    open + `Workbook.saveWithRecalc` — §9's *end-to-end* lane
 //!   phases  one instrumented run, phases reported separately
+//!   heap    §9.1's RSS lane, attributed: the same first recalc under
+//!           an allocator that names which call sites hold how many
+//!           bytes at the moment of peak live footprint
 //!
 //! **Evaluate time is a difference, not a mode.** No process can
 //! recalculate without first opening the archive, so `recalc − open` is
