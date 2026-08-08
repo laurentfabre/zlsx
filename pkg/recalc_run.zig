@@ -352,7 +352,12 @@ pub fn prepare(
         .ok => |x| x,
         .refused => |r| return censusRefusal(wb, run, opts, r.planeTwo(), null),
     };
-    defer g.deinit();
+    // Owned here only until `engine.iterate.run` below: the engine
+    // takes the graph, error paths included, and frees it before
+    // building any §5.6e replacement — the two coexisting was the
+    // run's memory peak (§9.1). The flag covers the returns between.
+    var g_owned = true;
+    defer if (g_owned) g.deinit();
 
     // Every formula cell is a root. A recalc is the whole workbook by
     // definition (§5.7.1), and stating it as roots rather than as "run
@@ -408,6 +413,7 @@ pub fn prepare(
         .refused => |r| return censusRefusal(wb, run, opts, r.planeTwo(), null),
     }
 
+    g_owned = false;
     const outcome = try engine.iterate.run(gpa, g, driver.host(), .{
         .limits = opts.work_limits,
         .settings = .{
@@ -437,7 +443,17 @@ pub fn prepare(
 
     // §5.7.3 step 3 and §5.7.1 step 3b, in that order: stage the bytes,
     // then ask whether staging them invalidated a coverage.
-    var staged = try stage(wb, gpa, a, &model, &driver, run, opts);
+    //
+    // Staging gets its own arena rather than the run's: an arena sizes
+    // each new chunk from its previous one, so a staging request landing
+    // on the run arena's evaluation-era high water bought chunks an
+    // order of magnitude past what staging holds (§9.1's profile:
+    // 121.3 MiB of chunk for ~20 MiB of staged data). Same lifetime —
+    // the candidate copies everything it keeps (`replacePart`
+    // compresses and dupes), so nothing outlives `prepare` either way.
+    var stage_arena = std.heap.ArenaAllocator.init(gpa);
+    defer stage_arena.deinit();
+    var staged = try stage(wb, gpa, stage_arena.allocator(), &model, &driver, run, opts);
     switch (staged) {
         .refused => |plane| return censusRefusal(wb, run, opts, plane, null),
         .ok => |*s| {
@@ -925,20 +941,26 @@ fn stage(
     run: RunInputs,
     opts: Options,
 ) Error!StageResult {
+    // The growing lists live in `gpa` and the arena receives one
+    // exact-size copy of each at the end: a list that grows *inside* an
+    // arena strands every abandoned backing buffer until the arena
+    // dies, which is where a third of §9.1's staging footprint went.
     var parts: std.ArrayListUnmanaged(recalc_txn.StagedPart) = .empty;
+    defer parts.deinit(gpa);
     var touched: std.ArrayListUnmanaged(StagedCell) = .empty;
+    defer touched.deinit(gpa);
     var written: u32 = 0;
 
     var sheet_idx: u32 = 0;
     while (sheet_idx < wb.sheetCount()) : (sheet_idx += 1) {
-        var any = false;
+        // A count rather than an `any` probe: it is the same walk, and
+        // it lets `pubs` allocate its backing once instead of walking
+        // the growth ladder per sheet.
+        var expected: u32 = 0;
         for (driver.published.items) |p| {
-            if (p.has_value and p.cell.sheet.toInt() == sheet_idx) {
-                any = true;
-                break;
-            }
+            if (p.has_value and p.cell.sheet.toInt() == sheet_idx) expected += 1;
         }
-        if (!any) continue;
+        if (expected == 0) continue;
 
         const ws = try wb.sheet(sheet_idx);
         const part_name = try ws.resolvePartName();
@@ -961,7 +983,12 @@ fn stage(
         };
         defer scan.deinit();
 
+        // Consumed by value inside `project` (`Target` embeds each
+        // `Publication`), so the list is loop-local: `gpa`-backed,
+        // pre-sized to the count above, freed before the next sheet.
         var pubs: std.ArrayListUnmanaged(engine.resolved.Publication) = .empty;
+        defer pubs.deinit(gpa);
+        try pubs.ensureTotalCapacityPrecise(gpa, expected);
         for (driver.published.items) |p| {
             if (!p.has_value) continue;
             if (p.cell.sheet.toInt() != sheet_idx) continue;
@@ -971,7 +998,7 @@ fn stage(
                 // pre-mutation refusal, never a guess (§5.3b).
                 else => return .{ .refused = .FormulaUnsupportedConstruct },
             };
-            try pubs.append(a, .{
+            try pubs.append(gpa, .{
                 .row = p.cell.row,
                 .col = p.cell.col,
                 .result = engine.value.publish(p.value, run.fidelity),
@@ -991,7 +1018,7 @@ fn stage(
             // by §5.6h's placement rule — never by re-decision.
             if (dialect == .legacy) {
                 if (cseDeclaredRange(scan.cells, p.cell)) |decl| {
-                    try synthesizeCseSlaves(a, &pubs, driver, p, decl, run, sheet_idx);
+                    try synthesizeCseSlaves(gpa, &pubs, driver, p, decl, run, sheet_idx);
                 }
             }
         }
@@ -1020,7 +1047,7 @@ fn stage(
 
                 if (patched.edits.len == 0) continue;
 
-                try parts.append(a, .{
+                try parts.append(gpa, .{
                     .name = try a.dupe(u8, part_name),
                     .bytes = try a.dupe(u8, patched.bytes),
                 });
@@ -1031,7 +1058,7 @@ fn stage(
                     }
                     last = e.cell;
                     written += 1;
-                    try touched.append(a, .{
+                    try touched.append(gpa, .{
                         .part = part_name,
                         .row = e.cell.row,
                         .col = e.cell.col,
@@ -1042,8 +1069,8 @@ fn stage(
     }
 
     return .{ .ok = .{
-        .parts = try parts.toOwnedSlice(a),
-        .cells = try touched.toOwnedSlice(a),
+        .parts = try a.dupe(recalc_txn.StagedPart, parts.items),
+        .cells = try a.dupe(StagedCell, touched.items),
         .cells_written = written,
     } };
 }

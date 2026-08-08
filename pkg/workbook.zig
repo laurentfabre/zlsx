@@ -1626,7 +1626,11 @@ pub const Workbook = struct {
             .ok => |x| x,
             .refused => |r| return .{ .graph_refused = r },
         };
-        defer g.deinit();
+        // Owned here only until `engine.iterate.run` below takes it,
+        // error paths included (see that function's header). The flag
+        // covers the refusal returns between build and run.
+        var g_owned = true;
+        defer if (g_owned) g.deinit();
 
         // The target is parsed once, here, and both refusals it can
         // raise are the ones `evaluate` raises for the same text: the
@@ -1688,6 +1692,7 @@ pub const Workbook = struct {
         var schedule: engine.draws.Schedule = .{};
         defer schedule.deinit(allocator);
 
+        g_owned = false;
         const run = try engine.iterate.run(allocator, g, driver.host(), .{
             .limits = opts.work_limits,
             .settings = .{

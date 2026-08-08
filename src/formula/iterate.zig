@@ -480,8 +480,15 @@ pub const Closure = struct {
 ///
 /// `g` is M5a1's graph, already built. When `opts.rebuild` is set the
 /// engine may build further graphs from the same input — through
-/// `graph.build`, never through a builder of its own — and the caller
-/// keeps ownership of `g` either way.
+/// `graph.build`, never through a builder of its own.
+///
+/// **The engine owns `g` from this call on, error paths included** —
+/// the caller must not deinit it. §5.6e replaces graphs, and the moment
+/// of replacement was the run's memory peak (§9.1): the outgoing graph
+/// has to be freeable *before* its successor is built, which a
+/// caller-owned graph forbids. Everything compared across the
+/// replacement copies what it needs — signatures copy their keys, and
+/// a Key's spellings borrow from the *Input*, never from the graph.
 pub fn run(gpa: std.mem.Allocator, g: graph.Graph, host: Host, opts: Options) Error!Result {
     var e = Engine.init(gpa, host, opts);
     defer e.deinit();
@@ -662,6 +669,15 @@ const Engine = struct {
     // ─── §5.6e: the outer loop ───────────────────────────────────
 
     fn drive(self: *Engine, initial: graph.Graph) Error!Result {
+        // The engine owns every graph it runs, the initial one included
+        // (see `run`'s header). At most one is ever alive: the outgoing
+        // graph is freed before its successor is built, because the two
+        // coexisting was the run's memory peak (§9.1). Declared before
+        // any early return — ownership starts at the call, not at the
+        // first pass.
+        var current: ?graph.Graph = initial;
+        defer if (current) |*o| o.deinit();
+
         const ceiling: u32 = @intCast(@min(
             self.opts.limits.max_dynamic_passes,
             @as(u64, std.math.maxInt(u32)),
@@ -675,22 +691,16 @@ const Engine = struct {
             .limit = .dynamic_passes,
         } };
 
-        var current = initial;
-        // Only the first graph is the caller's. Every later one is this
-        // engine's and dies with it.
-        var owned: ?graph.Graph = null;
-        defer if (owned) |*o| o.deinit();
-
-        var signatures = try self.signaturesOf(current);
+        var signatures = try self.signaturesOf(current.?);
         var rerun: ?[]const bool = null;
         var pass: u32 = 1;
         while (true) : (pass += 1) {
-            if (try self.planScope(current)) |r| return .{ .refused = r };
+            if (try self.planScope(current.?)) |r| return .{ .refused = r };
             self.pass_edges.clearRetainingCapacity();
             self.touched.clearRetainingCapacity();
             self.pass_edge_set.clearRetainingCapacity();
             self.touched_set.clearRetainingCapacity();
-            switch (try self.execute(current, rerun)) {
+            switch (try self.execute(current.?, rerun)) {
                 .refused => |r| return .{ .refused = r },
                 .ok => {},
             }
@@ -722,8 +732,14 @@ const Engine = struct {
             next_opts.limits = self.opts.limits;
             next_opts.counters = self.counters();
             next_opts.dynamic_edges = self.dynamic.items;
+            // The pass is over and nothing below reads the old graph —
+            // `signatures` copied its keys and the rebuild starts from
+            // the input. Freeing it here is the point of the engine
+            // owning it: the build below is the run's high-water mark.
+            current.?.deinit();
+            current = null;
             const built = try graph.build(self.gpa, rb.input, rb.resolver, next_opts);
-            var next = switch (built) {
+            switch (built) {
                 .refused => |r| return .{ .refused = .{
                     .reason = switch (r.reason) {
                         .malformed_cache_seed => .malformed_cache_seed,
@@ -738,12 +754,10 @@ const Engine = struct {
                         else => r.planeTwo(),
                     },
                 } },
-                .ok => |x| x,
-            };
-            var keep_next = false;
-            defer if (!keep_next) next.deinit();
+                .ok => |x| current = x,
+            }
 
-            const next_signatures = try self.signaturesOf(next);
+            const next_signatures = try self.signaturesOf(current.?);
             if (sameCondensation(signatures, next_signatures)) {
                 return .{ .ok = try self.report(pass) };
             }
@@ -754,12 +768,8 @@ const Engine = struct {
                 } };
             }
 
-            rerun = try self.changedComponents(next, next_signatures, signatures);
+            rerun = try self.changedComponents(current.?, next_signatures, signatures);
             signatures = next_signatures;
-            if (owned) |*o| o.deinit();
-            keep_next = true;
-            owned = next;
-            current = next;
             try self.carryReports();
         }
     }
@@ -902,16 +912,25 @@ const Engine = struct {
             const members = try self.a().alloc(graph.Key, comp.len);
             for (comp, 0..) |n, k| members[k] = g.keys[n];
 
-            var deps: std.ArrayListUnmanaged(graph.Key) = .empty;
+            // Counted, then filled: a list growing inside this arena
+            // strands every buffer it abandons until the engine dies,
+            // once per component per pass (§9.1).
+            var dep_count: usize = 0;
+            for (comp) |n| dep_count += g.deps[n].len;
+            const deps = try self.a().alloc(graph.Key, dep_count);
+            var k: usize = 0;
             for (comp) |n| {
                 // `g.deps[n]` is ascending and deduped already (M5a1),
                 // and members arrive in ascending node order, so the
                 // concatenation is canonical without a sort here.
-                for (g.deps[n]) |d| try deps.append(self.a(), g.keys[d]);
+                for (g.deps[n]) |d| {
+                    deps[k] = g.keys[d];
+                    k += 1;
+                }
             }
             out[i] = .{
                 .members = members,
-                .deps = try deps.toOwnedSlice(self.a()),
+                .deps = deps,
                 .cyclic = g.cyclic[g.component[comp[0]]],
             };
         }
@@ -1666,8 +1685,8 @@ const Fixture = struct {
     }
 
     fn run(f: *Fixture, opts: Options) !Result {
-        var g = try f.build();
-        defer g.deinit();
+        const g = try f.build();
+        // The engine owns `g` from `runOn` onward (see `run`'s header).
         return runOn(f, g, opts);
     }
 
@@ -2414,16 +2433,17 @@ test "M5a2 §5.6d KAT: a second run over the same graph generates nothing new" {
     try f.init(testing.allocator, &volatile_chain);
     defer f.deinit();
 
-    var g = try f.build();
-    defer g.deinit();
-
-    _ = try f.runOn(g, .{});
+    _ = try f.runOn(try f.build(), .{});
     const first_a = (try f.read("A1")).number;
     const first_b = (try f.read("B1")).number;
     const generated = f.schedule.generated;
     try testing.expectEqual(@as(u64, 2), generated);
 
-    _ = try f.runOn(g, .{});
+    // The engine consumed the first graph, so the second run gets a
+    // fresh build of the same specs — which is the identity §5.6e
+    // actually leans on: same bodies at the same keys, not the same
+    // graph object.
+    _ = try f.runOn(try f.build(), .{});
     try testing.expectEqual(generated, f.schedule.generated);
     try testing.expectEqual(@as(u64, 2), f.schedule.reused);
     try expectNumber(&f, "A1", first_a);
@@ -2665,8 +2685,8 @@ test "M5a2 §5.6f: an injected allocation failure leaves the state it found" {
     defer f.deinit();
     f.fail_at_eval = 3; // partway: A1 and B1 have already published
 
-    var g = try f.build();
-    defer g.deinit();
+    // No deinit here: the engine owns the graph even on the error path.
+    const g = try f.build();
     try testing.expectError(error.OutOfMemory, f.runOn(g, .{}));
 
     // `run` rolls back only on a refusal, because an `Error` unwinds
