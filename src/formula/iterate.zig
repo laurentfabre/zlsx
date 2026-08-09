@@ -524,6 +524,13 @@ const Engine = struct {
     /// A map, not a list: nothing reads it in publish order — `journal`
     /// is what a rollback replays — and every publish looked its own
     /// coordinate up, which made a pass cost O(published²).
+    ///
+    /// Recorded only under §5.6c iteration (§9.1 M10g): `heldValue`'s
+    /// one caller sits behind `iterateComponent`'s settings gate, so a
+    /// workbook with iteration off can never read a held value — and
+    /// recording one per publish anyway held 6.9 MB of snapshots at the
+    /// named workload's peak, plus the map's growth ladder in pages the
+    /// allocator kept.
     held: std.AutoHashMapUnmanaged(env.CellRef, Snapshot) = .empty,
     reports: std.ArrayListUnmanaged(ComponentReport) = .empty,
     /// The reports of the pass before this one. A §5.6e pass re-runs
@@ -555,14 +562,21 @@ const Engine = struct {
     /// would make "not re-evaluated" indistinguishable from "reads
     /// nothing".
     pass_edges: std.ArrayListUnmanaged(graph.DynamicRef) = .empty,
-    touched: std.ArrayListUnmanaged(graph.Key) = .empty,
-    /// Membership indexes over the two lists above. The **lists** stay
-    /// the record: `foldPassEdges` hands `pass_edges` to the next build
-    /// in the order the run produced it, and a set has no order to hand
-    /// over. These only answer "already?", which is all the two dedupes
+    /// Membership index over the list above. The **list** stays the
+    /// record: `foldPassEdges` hands `pass_edges` to the next build in
+    /// the order the run produced it, and a set has no order to hand
+    /// over. The set only answers "already?", which is all the dedupe
     /// ever asked — and answering it by scanning made a pass cost
     /// O(edges²), which is what §9.1's profile caught.
     pass_edge_set: EdgeSet = .empty,
+    /// Which owners this pass evaluated — recorded only while `dynamic`
+    /// holds edges (§9.1 M10g). Its one reader is `foldedPassEdges`'
+    /// carry, which asks it once per `dynamic` entry to decide whether
+    /// an owner superseded its old edges; `dynamic` is replaced only
+    /// between passes, so a pass that starts with no edges to carry can
+    /// prove the set unread before recording a single owner. Recording
+    /// unconditionally built a 6.4 MB set nothing read at the named
+    /// workload's peak.
     touched_set: KeySet = .empty,
     /// §5.6f's closure for the CURRENT graph, as component ids. Rebuilt
     /// every pass, because a rebuild renumbers and a dynamic edge can
@@ -596,7 +610,6 @@ const Engine = struct {
         self.previous_index.deinit(self.gpa);
         self.dynamic.deinit(self.gpa);
         self.pass_edges.deinit(self.gpa);
-        self.touched.deinit(self.gpa);
         self.pass_edge_set.deinit(self.gpa);
         self.touched_set.deinit(self.gpa);
         self.scope.deinit(self.gpa);
@@ -626,7 +639,9 @@ const Engine = struct {
     fn publish(self: *Engine, cell: env.CellRef, v: Snapshot) Error!void {
         try self.host.publish(cell, v);
         try self.journal.append(self.gpa, cell);
-        try self.held.put(self.gpa, cell, v);
+        // Only iteration reads a held value, so only iteration pays for
+        // holding one — see the field's header.
+        if (self.settings.iterate) try self.held.put(self.gpa, cell, v);
     }
 
     fn heldValue(self: Engine, cell: env.CellRef) ?Snapshot {
@@ -659,7 +674,14 @@ const Engine = struct {
                 .at = r.at,
                 .limit = r.limit,
             },
-            .ok => |p| for (p.components) |cid| try self.scope.put(self.gpa, cid, {}),
+            .ok => |p| {
+                // Exact, not laddered (§9.1 M10g): the plan's component
+                // list bounds the set precisely — a count, not a bound —
+                // and the growth ladder's freed rungs were pages the
+                // allocator kept against the run.
+                try self.scope.ensureTotalCapacity(self.gpa, @intCast(p.components.len));
+                for (p.components) |cid| self.scope.putAssumeCapacity(cid, {});
+            },
         }
         self.scoped = true;
         return null;
@@ -704,7 +726,6 @@ const Engine = struct {
         while (true) : (pass += 1) {
             if (try self.planScope(current.?)) |r| return .{ .refused = r };
             self.pass_edges.clearRetainingCapacity();
-            self.touched.clearRetainingCapacity();
             self.pass_edge_set.clearRetainingCapacity();
             self.touched_set.clearRetainingCapacity();
             self.run_graph = &current.?;
@@ -1337,12 +1358,11 @@ const Engine = struct {
     /// carry contract `foldedPassEdges` depends on.
     fn noteReads(self: *Engine, cell: env.CellRef, reads: Reads) Error!void {
         const owner: graph.Key = .{ .cell = cell };
-        const gop = try self.touched_set.getOrPut(self.gpa, owner);
-        if (!gop.found_existing) {
-            // The set and the list are one record in two shapes, so a
-            // failure between the two halves un-does the first.
-            errdefer _ = self.touched_set.remove(owner);
-            try self.touched.append(self.gpa, owner);
+        // Recorded only while there are old edges a fold could carry —
+        // see the field's header. An empty `dynamic` folds identically
+        // against an empty set and an unwritten one.
+        if (self.dynamic.items.len != 0) {
+            try self.touched_set.put(self.gpa, owner, {});
         }
 
         // Null only if the evaluated coordinate is somehow not a node
