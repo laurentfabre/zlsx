@@ -662,7 +662,25 @@ pub const Stats = struct {
 };
 
 pub const Graph = struct {
+    /// Owns the capture-phase data: the per-owner ref lists the walk
+    /// logs point into. The fixed-size link arrays live in `block`, not
+    /// here — an arena grows by half-again chunks, and at 90 000 nodes
+    /// the ladder's slack was measurably larger than several of the
+    /// arrays it held.
     arena: std.heap.ArenaAllocator,
+    /// One exact allocation carrying every fixed-size array `link`
+    /// retains (keys, index, walk logs, dep headers, component, order,
+    /// cyclic), carved by a `FixedBufferAllocator`: retention is the sum
+    /// of the arrays, not a chunk ladder's slack.
+    block: []align(block_align) u8,
+    /// The dependency edge storage `deps`' slices point into — one exact
+    /// allocation sized after the edge count is known.
+    edge_data: []const u32,
+    /// Seeds, sparse (M10e): node ids ascending, values parallel. Empty
+    /// on every acyclic workload — the dense `[]?Seed` this replaces
+    /// held one null per node.
+    seed_nodes: []const u32,
+    seed_values: []const Seed,
     /// Canonical order. A node's id **is** its index here, so
     /// `keys[a].order(keys[b]) == order(a, b)` for every pair.
     keys: []const Key,
@@ -676,10 +694,6 @@ pub const Graph = struct {
     order: []const []const u32,
     /// Parallel to `order`'s index space (component id, not position).
     cyclic: []const bool,
-    /// Seeds for cyclic members, indexed by node id. Null for every node
-    /// in an acyclic component — an acyclic node is computed from its
-    /// dependencies and has nothing to resume from.
-    seeds: []const ?Seed,
     /// The producer index, kept rather than discarded with the build:
     /// a closure plan rooted at an area the workbook never mentions
     /// (`evaluate("SUM(B1:B2)")` against a workbook where nothing reads
@@ -689,13 +703,24 @@ pub const Graph = struct {
     /// Per-node static walk log (M10b): for each owner node, the bounds
     /// of what the *walk* of its body noted — the pre-injection prefix
     /// of the dependency log, over the `refs` slice the arena already
-    /// keeps for the graph's lifetime. Null for nodes that own no body.
+    /// keeps for the graph's lifetime. Empty (`refs.len == 0`, zero
+    /// bounds) for nodes that own no body — an owner whose walk noted
+    /// nothing and a non-owner answer every probe the same way, so the
+    /// optional the empty log replaces bought nothing but its padding.
     /// `iterate` probes it per runtime read to decide whether a rebuild
     /// could change anything, which is what lets a run skip the
     /// confirming rebuild instead of paying a full build to prove
     /// nothing did.
-    walk_logs: []const ?WalkLog,
+    walk_logs: []const WalkLog,
     stats: Stats,
+
+    const block_align = @alignOf(Key);
+    const empty_walk_log: WalkLog = .{
+        .refs = &.{},
+        .cells = 0,
+        .walk_cells = 0,
+        .walk_areas = 0,
+    };
 
     /// Bounds over an owner's captured refs, in `Capture.take`'s layout:
     /// cells first, then areas, then names, then spans — so the walk's
@@ -714,8 +739,28 @@ pub const Graph = struct {
     };
 
     pub fn deinit(self: *Graph) void {
+        const gpa = self.arena.child_allocator;
+        gpa.free(self.block);
+        gpa.free(self.edge_data);
+        gpa.free(self.seed_nodes);
+        gpa.free(self.seed_values);
         self.arena.deinit();
         self.* = undefined;
+    }
+
+    /// The seed for a cyclic node, or null. Binary search over the
+    /// sparse node list — acyclic components have no seeds at all, so
+    /// the common case is an empty list and an immediate null.
+    pub fn seedOf(self: Graph, node: u32) ?Seed {
+        var lo: usize = 0;
+        var hi: usize = self.seed_nodes.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const at = self.seed_nodes[mid];
+            if (at == node) return self.seed_values[mid];
+            if (at < node) lo = mid + 1 else hi = mid;
+        }
+        return null;
     }
 
     pub fn nodeCount(self: Graph) u32 {
@@ -749,7 +794,7 @@ pub const Graph = struct {
     /// graph. Exact `eql`, no containment: a cell inside a noted area
     /// is a different log entry, and the builder treats it as one.
     pub fn walkNoted(self: Graph, owner: u32, target: DynamicRef.Target) bool {
-        const log = self.walk_logs[owner] orelse return false;
+        const log = self.walk_logs[owner];
         switch (target) {
             .cell => |c| for (log.refs[0..log.walk_cells]) |r| {
                 if (r.cell.eql(c)) return true;
@@ -1247,7 +1292,32 @@ const Builder = struct {
 
     fn link(self: *Builder) Error!BuildResult {
         const n = self.keys.items.len;
-        const keys = try self.a().dupe(Key, self.keys.items);
+
+        // The block (M10e): every fixed-size array the graph retains,
+        // sized exactly before the first of them is allocated. The two
+        // component-indexed arrays are bounded by `n` (`count ≤ n`, with
+        // equality on every acyclic graph); the order's member data is
+        // exactly `n`. The headroom covers the carver's per-allocation
+        // alignment padding.
+        var cell_like: usize = 0;
+        for (self.keys.items) |k| cell_like += @intFromBool(k.isCellLike());
+        const need =
+            n * @sizeOf(Key) + // keys
+            2 * cell_like * @sizeOf(Coord) + // index, both sort orders
+            n * @sizeOf(Graph.WalkLog) + // walk logs
+            n * @sizeOf([]const u32) + // dep headers
+            n * @sizeOf(u32) + // component
+            n * @sizeOf(bool) + // cyclic
+            n * @sizeOf([]const u32) + // order headers
+            n * @sizeOf(u32) + // order member data
+            128;
+        const block = try self.gpa.alignedAlloc(u8, .of(Key), need);
+        var block_owned = true;
+        defer if (block_owned) self.gpa.free(block);
+        var fixed = std.heap.FixedBufferAllocator.init(block);
+        const fa = fixed.allocator();
+
+        const keys = try fa.dupe(Key, self.keys.items);
 
         // Scratch, not arena: the adjacency *lists* are temporary and the
         // arena outlives the build. An arena that kept every growth step
@@ -1259,14 +1329,14 @@ const Builder = struct {
         const sets = try sa.alloc(std.ArrayListUnmanaged(u32), n);
         for (sets) |*x| x.* = .empty;
 
-        const idx = try Index.build(self.a(), keys);
+        const idx = try Index.build(fa, keys);
 
         // Owner bodies. The walk logs ride along (M10b): `refs` already
         // lives in the arena the graph keeps, so retention is the
         // bounds and a pointer, not a copy.
         assert(self.logs.items.len == self.owners.items.len);
-        const walk_logs = try self.a().alloc(?Graph.WalkLog, n);
-        @memset(walk_logs, null);
+        const walk_logs = try fa.alloc(Graph.WalkLog, n);
+        @memset(walk_logs, Graph.empty_walk_log);
         for (self.owners.items, self.refs.items, self.logs.items) |bo, list, rec| {
             const u = findIn(keys, bo.owner.key).?;
             walk_logs[u] = .{
@@ -1326,15 +1396,28 @@ const Builder = struct {
             }
         }
 
-        const deps = try self.a().alloc([]const u32, n);
+        // Edge storage: one exact allocation now that the count is
+        // known, carved per node — where a per-node dupe left the edge
+        // bytes at the mercy of the arena's chunk ladder.
+        var edge_total: usize = 0;
+        for (sets) |set| edge_total += set.items.len;
+        const edge_data = try self.gpa.alloc(u32, edge_total);
+        var edges_owned = true;
+        defer if (edges_owned) self.gpa.free(edge_data);
+        const deps = try fa.alloc([]const u32, n);
+        var edge_off: usize = 0;
         for (sets, 0..) |*set, i| {
             std.mem.sortUnstable(u32, set.items, {}, std.sort.asc(u32));
-            deps[i] = try self.a().dupe(u32, set.items);
+            const slot = edge_data[edge_off .. edge_off + set.items.len];
+            @memcpy(slot, set.items);
+            deps[i] = slot;
+            edge_off += set.items.len;
         }
+        assert(edge_off == edge_total);
 
-        const comp = try tarjan(self.gpa, self.a(), deps);
-        const cyclic = try classifyComponents(self.gpa, self.a(), deps, comp.of, comp.count);
-        const order = try condensationOrder(self.gpa, self.a(), deps, comp.of, comp.count);
+        const comp = try tarjan(self.gpa, fa, deps);
+        const cyclic = try classifyComponents(self.gpa, fa, deps, comp.of, comp.count);
+        const order = try condensationOrder(self.gpa, fa, deps, comp.of, comp.count);
 
         self.stats.components = comp.count;
         for (cyclic) |c| {
@@ -1348,17 +1431,23 @@ const Builder = struct {
 
         const out: Graph = .{
             .arena = self.arena,
+            .block = block,
+            .edge_data = edge_data,
+            .seed_nodes = seeds.nodes,
+            .seed_values = seeds.values,
             .keys = keys,
             .deps = deps,
             .component = comp.of,
             .order = order,
             .cyclic = cyclic,
-            .seeds = seeds,
             .index = idx,
             .walk_logs = walk_logs,
             .stats = self.stats,
         };
-        // The arena moved into the result; the builder must not free it.
+        // The arena, block and edge storage moved into the result; the
+        // builder must not free them.
+        block_owned = false;
+        edges_owned = false;
         self.arena = std.heap.ArenaAllocator.init(self.gpa);
         return .{ .ok = out };
     }
@@ -1385,16 +1474,30 @@ const Builder = struct {
         return null;
     }
 
-    const SeedResult = union(enum) { ok: []const ?Seed, refused: Refusal };
+    const Seeds = struct { nodes: []const u32, values: []const Seed };
 
+    const SeedResult = union(enum) { ok: Seeds, refused: Refusal };
+
+    /// Sparse (M10e): seeds exist only for cyclic cell nodes, and most
+    /// graphs have none — the dense per-node array this replaces held
+    /// one null for every node in the workbook.
     fn seedAll(
         self: *Builder,
         keys: []const Key,
         comp_of: []const u32,
         cyclic: []const bool,
     ) Error!SeedResult {
-        const seeds = try self.a().alloc(?Seed, keys.len);
-        @memset(seeds, null);
+        var count: usize = 0;
+        for (keys, 0..) |k, i| {
+            count += @intFromBool(cyclic[comp_of[i]] and k == .cell);
+        }
+        if (count == 0) return .{ .ok = .{ .nodes = &.{}, .values = &.{} } };
+
+        const nodes = try self.gpa.alloc(u32, count);
+        errdefer self.gpa.free(nodes);
+        const values = try self.gpa.alloc(Seed, count);
+        errdefer self.gpa.free(values);
+        var at: usize = 0;
         for (keys, 0..) |k, i| {
             if (!cyclic[comp_of[i]]) continue;
             const cell = switch (k) {
@@ -1402,14 +1505,23 @@ const Builder = struct {
                 else => continue,
             };
             const in = self.cellInput(cell).?;
-            seeds[i] = seedFor(in.cache, anchorOfInput(in)) catch |e| switch (e) {
-                error.MalformedCache => return .{ .refused = .{
-                    .reason = .malformed_cache_seed,
-                    .at = k,
-                } },
+            const seed = seedFor(in.cache, anchorOfInput(in)) catch |e| switch (e) {
+                error.MalformedCache => {
+                    self.gpa.free(nodes);
+                    self.gpa.free(values);
+                    return .{ .refused = .{
+                        .reason = .malformed_cache_seed,
+                        .at = k,
+                    } };
+                },
             };
+            // Ascending by construction: `keys` is the canonical sort.
+            nodes[at] = @intCast(i);
+            values[at] = seed;
+            at += 1;
         }
-        return .{ .ok = seeds };
+        assert(at == count);
+        return .{ .ok = .{ .nodes = nodes, .values = values } };
     }
 };
 
@@ -2034,20 +2146,34 @@ fn classifyComponents(
 /// (not on which node a depth-first search happened to start from).
 fn condensationOrder(
     gpa: std.mem.Allocator,
-    arena: std.mem.Allocator,
+    retained: std.mem.Allocator,
     deps: []const []const u32,
     comp_of: []const u32,
     count: u32,
 ) Error![]const []const u32 {
+    const n = comp_of.len;
+
     // Members, ascending. Node ids are canonical, so "ascending" is
-    // "in `Key.order`".
+    // "in `Key.order`". Scratch, not retained: the retained copy is
+    // written at emission — keeping these headers alive for the graph's
+    // lifetime was sixteen dead bytes per component (M10e).
     const sizes = try gpa.alloc(u32, count);
     defer gpa.free(sizes);
     @memset(sizes, 0);
     for (comp_of) |c| sizes[c] += 1;
 
-    const members = try arena.alloc([]u32, count);
-    for (members, sizes) |*m, s| m.* = try arena.alloc(u32, s);
+    const members = try gpa.alloc([]u32, count);
+    defer gpa.free(members);
+    const member_data = try gpa.alloc(u32, n);
+    defer gpa.free(member_data);
+    {
+        var off: usize = 0;
+        for (members, sizes) |*m, s| {
+            m.* = member_data[off .. off + s];
+            off += s;
+        }
+        assert(off == n);
+    }
     const filled = try gpa.alloc(u32, count);
     defer gpa.free(filled);
     @memset(filled, 0);
@@ -2097,11 +2223,19 @@ fn condensationOrder(
         if (needs[c] == 0) try heap.push(gpa, @intCast(c));
     }
 
-    const out = try arena.alloc([]const u32, count);
+    // Retained: the headers and one flat member buffer, written in
+    // emission order — the same bytes the scratch members held.
+    const out = try retained.alloc([]const u32, count);
+    const out_data = try retained.alloc(u32, n);
     var emitted: usize = 0;
+    var off: usize = 0;
     while (heap.pop()) |c| {
-        out[emitted] = members[c];
+        const src = members[c];
+        const dst = out_data[off .. off + src.len];
+        @memcpy(dst, src);
+        out[emitted] = dst;
         emitted += 1;
+        off += src.len;
         for (feeds[c].items) |d| {
             needs[d] -= 1;
             if (needs[d] == 0) try heap.push(gpa, d);
@@ -2109,6 +2243,7 @@ fn condensationOrder(
     }
     // The condensation of any digraph is acyclic, so Kahn always drains.
     assert(emitted == count);
+    assert(off == n);
     return out;
 }
 
@@ -2209,38 +2344,45 @@ pub const PlanOptions = struct {
 /// instead of halfway through one.
 pub fn plan(
     g: Graph,
+    gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     roots: []const Key,
     counters: *WorkCounters,
     opts: PlanOptions,
 ) Error!PlanResult {
     const n = g.keys.len;
-    const reached = try arena.alloc(bool, n);
+
+    // Traversal state is scratch and lives on `gpa` (M10e): on the
+    // arena, the walk's mark array and both growth ladders stayed
+    // resident for the run's lifetime. Only the two result lists are
+    // the plan, and they land in the arena exact-sized at the end.
+    const reached = try gpa.alloc(bool, n);
+    defer gpa.free(reached);
     @memset(reached, false);
 
     const Frame = struct { node: u32, i: u32, charged: bool };
     var stack: std.ArrayListUnmanaged(Frame) = .empty;
-    defer stack.deinit(arena);
+    defer stack.deinit(gpa);
 
     // A root the graph has no node for is not an empty closure. An area
     // no stored formula mentions has no range node, and a coordinate an
     // anchor spilled into is a tail rather than a cell — both resolve to
     // the nodes they cover instead of being dropped.
     var starts: std.ArrayListUnmanaged(u32) = .empty;
-    defer starts.deinit(arena);
+    defer starts.deinit(gpa);
     var probes: u64 = 0;
     for (roots) |root| {
         if (g.find(root)) |node| {
-            try starts.append(arena, node);
+            try starts.append(gpa, node);
             continue;
         }
         switch (root) {
             .cell => |c| {
-                if (g.find(.{ .spill_tail = c })) |node| try starts.append(arena, node);
+                if (g.find(.{ .spill_tail = c })) |node| try starts.append(gpa, node);
             },
             .range => |area| {
                 var probe = g.probeArea(area, &probes);
-                while (probe.next()) |node| try starts.append(arena, node);
+                while (probe.next()) |node| try starts.append(gpa, node);
             },
             .span => |sp| {
                 var sheet = sp.first.toInt();
@@ -2249,7 +2391,7 @@ pub fn plan(
                         .sheet = env.SheetIndex.fromInt(sheet),
                         .range = sp.range,
                     }, &probes);
-                    while (probe.next()) |node| try starts.append(arena, node);
+                    while (probe.next()) |node| try starts.append(gpa, node);
                 }
             },
             else => {},
@@ -2267,7 +2409,7 @@ pub fn plan(
                 .at = g.keys[start],
             } };
         }
-        try stack.append(arena, .{ .node = start, .i = 0, .charged = charged });
+        try stack.append(gpa, .{ .node = start, .i = 0, .charged = charged });
 
         while (stack.items.len > 0) {
             const top = stack.items.len - 1;
@@ -2286,7 +2428,7 @@ pub fn plan(
                         .at = g.keys[v],
                     } };
                 }
-                try stack.append(arena, .{ .node = v, .i = 0, .charged = c });
+                try stack.append(gpa, .{ .node = v, .i = 0, .charged = c });
                 continue;
             }
             if (stack.items[top].charged) counters.release(.eval_depth, 1);
@@ -2295,9 +2437,9 @@ pub fn plan(
     }
 
     var components: std.ArrayListUnmanaged(u32) = .empty;
-    errdefer components.deinit(arena);
+    defer components.deinit(gpa);
     var cells: std.ArrayListUnmanaged(u32) = .empty;
-    errdefer cells.deinit(arena);
+    defer cells.deinit(gpa);
 
     for (g.order) |comp| {
         // A component is strongly connected, so a reached member means a
@@ -2310,7 +2452,7 @@ pub fn plan(
             // `iterate.zig` gives it a pass counter instead.
             return .{ .refused = .{ .reason = .cycle, .at = g.keys[comp[0]] } };
         }
-        try components.append(arena, cid);
+        try components.append(gpa, cid);
         for (comp) |node| {
             if (g.keys[node].kind() != .cell) continue;
             if (opts.charge_evals) {
@@ -2320,13 +2462,13 @@ pub fn plan(
                     .at = g.keys[node],
                 } };
             }
-            try cells.append(arena, node);
+            try cells.append(gpa, node);
         }
     }
 
     return .{ .ok = .{
-        .cells = try cells.toOwnedSlice(arena),
-        .components = try components.toOwnedSlice(arena),
+        .cells = try arena.dupe(u32, cells.items),
+        .components = try arena.dupe(u32, components.items),
     } };
 }
 
@@ -2921,7 +3063,7 @@ fn seedOfCycle(gpa: std.mem.Allocator, cell: CellInput) !Seed {
     defer g.deinit();
     const n = g.find(.{ .cell = cell.cell }).?;
     try testing.expect(g.isCyclic(n));
-    return g.seeds[n].?;
+    return g.seedOf(n).?;
 }
 
 test "seed table row 1: a numeric cache seeds its own value" {
@@ -2999,9 +3141,9 @@ test "seeds: only cyclic members carry one" {
     };
     var g = try buildOk(testing.allocator, .{ .sheet_count = 2, .cells = &cells }, &two_sheets, .{});
     defer g.deinit();
-    try testing.expect(g.seeds[g.find(.{ .cell = cellAt(0, "A1") }).?] != null);
+    try testing.expect(g.seedOf(g.find(.{ .cell = cellAt(0, "A1") }).?) != null);
     // B1 is computed from its dependencies. There is nothing to resume.
-    try testing.expectEqual(@as(?Seed, null), g.seeds[g.find(.{ .cell = cellAt(0, "B1") }).?]);
+    try testing.expectEqual(@as(?Seed, null), g.seedOf(g.find(.{ .cell = cellAt(0, "B1") }).?));
 }
 
 // ─── the sparseness contract (§5.6a) ─────────────────────────────
@@ -3089,7 +3231,7 @@ fn planFrom(
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     var counters: WorkCounters = .{ .limits = limits };
-    return switch (try plan(g, arena.allocator(), roots, &counters, .{})) {
+    return switch (try plan(g, gpa, arena.allocator(), roots, &counters, .{})) {
         .ok => |p| .{ .ok = .{ .arena = arena, .graph = g, .plan = p, .counters = counters } },
         .refused => |r| {
             arena.deinit();

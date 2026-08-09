@@ -645,7 +645,7 @@ const Engine = struct {
             self.scoped = false;
             return null;
         };
-        const planned = try graph.plan(g, self.a(), c.roots, self.counters(), .{
+        const planned = try graph.plan(g, self.gpa, self.a(), c.roots, self.counters(), .{
             .iterating = c.iterating,
             .charge_evals = false,
         });
@@ -1151,7 +1151,7 @@ const Engine = struct {
         for (comp) |node| {
             if (g.keys[node].kind() != .cell) continue;
             const cell = g.keys[node].cell;
-            const seed = g.seeds[node] orelse continue;
+            const seed = g.seedOf(node) orelse continue;
             const snapshot: Snapshot = switch (seed) {
                 .number => |n| Snapshot.number(n),
                 .array_zeros => |s| Snapshot.zeros(self.a(), s) catch |e| switch (e) {
