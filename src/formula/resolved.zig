@@ -897,6 +897,37 @@ pub const PatchResult = union(enum) {
     refused: Refusal,
 };
 
+/// Passes one and two without pass three: the sorted edits, their
+/// replacement bytes arena-owned, and no projection or scan needed
+/// from here on — every `at` addresses the SOURCE and every
+/// `replacement` lives in this arena or is static.
+pub const PlannedPatch = struct {
+    arena: std.heap.ArenaAllocator,
+    /// Ascending and non-overlapping, same contract as `Patch.edits`.
+    edits: []const Edit,
+
+    pub fn deinit(self: *PlannedPatch) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    /// Pass three, separated: splice into `out`, so the caller decides
+    /// where the rewritten part lives — and everything the plan read
+    /// (projection, scan, publications) may already be gone.
+    pub fn splice(
+        self: *const PlannedPatch,
+        out: Allocator,
+        source: []const u8,
+    ) error{OutOfMemory}![]u8 {
+        return applyEdits(out, source, self.edits);
+    }
+};
+
+pub const PlanResult = union(enum) {
+    ok: PlannedPatch,
+    refused: Refusal,
+};
+
 /// Write the projection's cached values back into the part.
 ///
 /// Every refusal happens before a byte of output exists: the gate, the
@@ -905,6 +936,13 @@ pub const PatchResult = union(enum) {
 /// roll back.
 pub fn patch(self: *const ResolvedSheet, gpa: Allocator) error{OutOfMemory}!PatchResult {
     return patchWithTable(self, gpa, &spill_transitions);
+}
+
+/// Passes one and two only — the production entry for callers that
+/// splice separately (§9.1: the projection and the scan can be released
+/// before pass three's output buffer exists).
+pub fn plan(self: *const ResolvedSheet, gpa: Allocator) error{OutOfMemory}!PlanResult {
+    return planWithTable(self, gpa, &spill_transitions);
 }
 
 /// `patch` with the transition table injected — the seam that lets the
@@ -917,6 +955,27 @@ pub fn patchWithTable(
     gpa: Allocator,
     table: []const SpillTransition,
 ) error{OutOfMemory}!PatchResult {
+    var planned = switch (try planWithTable(self, gpa, table)) {
+        .refused => |r| return .{ .refused = r },
+        .ok => |p| p,
+    };
+    // Splice into the plan's own arena: `Patch` keeps its one-arena
+    // ownership story, and the fixture callers see identical bytes.
+    const bytes = planned.splice(planned.arena.allocator(), self.source) catch |err| {
+        planned.deinit();
+        return err;
+    };
+    // `bytes` materialized before the literal: `.arena = planned.arena`
+    // copies the arena's state, so an allocation in a later field
+    // initializer would be known only to the local copy.
+    return .{ .ok = .{ .arena = planned.arena, .bytes = bytes, .edits = planned.edits } };
+}
+
+fn planWithTable(
+    self: *const ResolvedSheet,
+    gpa: Allocator,
+    table: []const SpillTransition,
+) error{OutOfMemory}!PlanResult {
     var arena = std.heap.ArenaAllocator.init(gpa);
     var keep = false;
     defer if (!keep) arena.deinit();
@@ -995,11 +1054,8 @@ pub fn patchWithTable(
     // them apart.
     std.mem.sort(Edit, items, {}, lessThanEdit);
 
-    // Pass three: the splice.
-    const bytes = try applyEdits(a, self.source, items);
-
     keep = true;
-    return .{ .ok = .{ .arena = arena, .bytes = bytes, .edits = items } };
+    return .{ .ok = .{ .arena = arena, .edits = items } };
 }
 
 fn lessThanEdit(_: void, x: Edit, y: Edit) bool {

@@ -966,105 +966,120 @@ fn stage(
         const part_name = try ws.resolvePartName();
         const part = (try wb.store.part(part_name)) orelse return Error.MissingSheetPart;
 
-        // The same scan the model was built from, re-run because the
-        // model keeps *cells* and the projection needs *spans*. Same
-        // bytes, same options — `resolved.project` requires the accepted
-        // scan of the source it is patching, and a second scan under
-        // different options would be a second opinion about the document.
-        // It runs BEFORE the publications are built since M7b1: §5.6h's
-        // slave synthesis reads each anchor's declared range from it.
-        var scan = switch (try engine.decode.scanSheet(gpa, part.bytes, model.strings.items, .{
-            .limits = opts.limits,
-            .fidelity = run.fidelity,
-            .date_system = model.calc.date_system,
-        })) {
-            .ok => |s| s,
-            .refused => |r| return .{ .refused = r.planeTwo() },
-        };
-        defer scan.deinit();
-
-        // Consumed by value inside `project` (`Target` embeds each
-        // `Publication`), so the list is loop-local: `gpa`-backed,
-        // pre-sized to the count above, freed before the next sheet.
-        var pubs: std.ArrayListUnmanaged(engine.resolved.Publication) = .empty;
-        defer pubs.deinit(gpa);
-        try pubs.ensureTotalCapacityPrecise(gpa, expected);
-        for (driver.published.items) |p| {
-            if (!p.has_value) continue;
-            if (p.cell.sheet.toInt() != sheet_idx) continue;
-            const dialect = model.evalEnv().dialectOf(p.cell) catch |e| switch (e) {
-                error.OutOfMemory => return Error.OutOfMemory,
-                // A dialect the metadata layer could not resolve is a
-                // pre-mutation refusal, never a guess (§5.3b).
-                else => return .{ .refused = .FormulaUnsupportedConstruct },
+        // §9.1 (M10c): everything the plan reads — the scan, the
+        // publications, the projection — lives and dies inside this
+        // block. None of it is resident when pass three's output
+        // buffer exists, and the plan itself is bounded by the edits
+        // and their replacement texts.
+        var planned: engine.resolved.PlannedPatch = blk: {
+            // The same scan the model was built from, re-run because the
+            // model keeps *cells* and the projection needs *spans*. Same
+            // bytes, same options — `resolved.project` requires the accepted
+            // scan of the source it is patching, and a second scan under
+            // different options would be a second opinion about the document.
+            // It runs BEFORE the publications are built since M7b1: §5.6h's
+            // slave synthesis reads each anchor's declared range from it.
+            var scan = switch (try engine.decode.scanSheet(gpa, part.bytes, model.strings.items, .{
+                .limits = opts.limits,
+                .fidelity = run.fidelity,
+                .date_system = model.calc.date_system,
+            })) {
+                .ok => |s| s,
+                .refused => |r| return .{ .refused = r.planeTwo() },
             };
-            try pubs.append(gpa, .{
-                .row = p.cell.row,
-                .col = p.cell.col,
-                .result = engine.value.publish(p.value, run.fidelity),
-                .origin = .computed,
-                .shape = p.shape,
-                .dialect = dialect,
-                // §5.8b: what the model placed travels with the
-                // publication — the patcher consumes the outcome, never
-                // re-decides it. Tail publications land with the first
-                // committed transition reference; until one exists the
-                // anchor's own refusal precedes every tail on every
-                // reachable path.
-                .role = if (model.spillOutcomeOf(p.cell)) |o| .{ .da_anchor = o } else .plain,
-            });
-            // A legacy CSE's slaves are not evaluable nodes; their file
-            // caches are maintained here, from the anchor's own array,
-            // by §5.6h's placement rule — never by re-decision.
-            if (dialect == .legacy) {
-                if (cseDeclaredRange(scan.cells, p.cell)) |decl| {
-                    try synthesizeCseSlaves(gpa, &pubs, driver, p, decl, run, sheet_idx);
+            defer scan.deinit();
+
+            // Consumed by value inside `project` (`Target` embeds each
+            // `Publication`), so the list is block-local: `gpa`-backed,
+            // pre-sized to the count above, freed before the splice.
+            var pubs: std.ArrayListUnmanaged(engine.resolved.Publication) = .empty;
+            defer pubs.deinit(gpa);
+            try pubs.ensureTotalCapacityPrecise(gpa, expected);
+            for (driver.published.items) |p| {
+                if (!p.has_value) continue;
+                if (p.cell.sheet.toInt() != sheet_idx) continue;
+                const dialect = model.evalEnv().dialectOf(p.cell) catch |e| switch (e) {
+                    error.OutOfMemory => return Error.OutOfMemory,
+                    // A dialect the metadata layer could not resolve is a
+                    // pre-mutation refusal, never a guess (§5.3b).
+                    else => return .{ .refused = .FormulaUnsupportedConstruct },
+                };
+                try pubs.append(gpa, .{
+                    .row = p.cell.row,
+                    .col = p.cell.col,
+                    .result = engine.value.publish(p.value, run.fidelity),
+                    .origin = .computed,
+                    .shape = p.shape,
+                    .dialect = dialect,
+                    // §5.8b: what the model placed travels with the
+                    // publication — the patcher consumes the outcome, never
+                    // re-decides it. Tail publications land with the first
+                    // committed transition reference; until one exists the
+                    // anchor's own refusal precedes every tail on every
+                    // reachable path.
+                    .role = if (model.spillOutcomeOf(p.cell)) |o| .{ .da_anchor = o } else .plain,
+                });
+                // A legacy CSE's slaves are not evaluable nodes; their file
+                // caches are maintained here, from the anchor's own array,
+                // by §5.6h's placement rule — never by re-decision.
+                if (dialect == .legacy) {
+                    if (cseDeclaredRange(scan.cells, p.cell)) |decl| {
+                        try synthesizeCseSlaves(gpa, &pubs, driver, p, decl, run, sheet_idx);
+                    }
                 }
             }
-        }
-        if (pubs.items.len == 0) continue;
+            if (pubs.items.len == 0) continue;
 
-        var deltas: engine.resolved.StagedDeltas = .{ .publications = pubs.items };
-        var projected = engine.resolved.project(gpa, part.bytes, &scan, &deltas) catch |e| switch (e) {
-            error.OutOfMemory => return Error.OutOfMemory,
-            // The set is fresh per sheet and consumed once; a second
-            // consume is a bookkeeping bug, not a workbook statement.
-            error.DeltasAlreadyConsumed => unreachable,
-        };
-        switch (projected) {
-            .refused => |r| return .{ .refused = r.planeTwo() },
-            .ok => |*projection| {
-                defer projection.deinit();
-                var patched = switch (try engine.resolved.patch(projection, gpa)) {
-                    .ok => |p| p,
-                    // Gate two: the pre-M7 spill gate, plus every shape
-                    // a patch cannot be confined over. Nothing has been
-                    // written — `patch` runs both passes before it
-                    // produces a byte — and no candidate exists yet.
-                    .refused => |r| return .{ .refused = r.planeTwo() },
-                };
-                defer patched.deinit();
+            var deltas: engine.resolved.StagedDeltas = .{ .publications = pubs.items };
+            var projected = engine.resolved.project(gpa, part.bytes, &scan, &deltas) catch |e| switch (e) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                // The set is fresh per sheet and consumed once; a second
+                // consume is a bookkeeping bug, not a workbook statement.
+                error.DeltasAlreadyConsumed => unreachable,
+            };
+            // Consumed: `project` copied every publication by value, so
+            // the list's backing is dead on both variants — released
+            // here rather than at the block's end, because the plan
+            // below runs at the instant §9.1 measures.
+            pubs.clearAndFree(gpa);
 
-                if (patched.edits.len == 0) continue;
-
-                try parts.append(gpa, .{
-                    .name = try a.dupe(u8, part_name),
-                    .bytes = try a.dupe(u8, patched.bytes),
-                });
-                var last: ?engine.resolved.CellSite = null;
-                for (patched.edits) |e| {
-                    if (last) |l| {
-                        if (l.row == e.cell.row and l.col == e.cell.col) continue;
+            switch (projected) {
+                .refused => |r| return .{ .refused = r.planeTwo() },
+                .ok => |*projection| {
+                    defer projection.deinit();
+                    switch (try engine.resolved.plan(projection, gpa)) {
+                        .ok => |p| break :blk p,
+                        // Gate two: the pre-M7 spill gate, plus every shape
+                        // a patch cannot be confined over. Nothing has been
+                        // written — the plan runs both passes before pass
+                        // three produces a byte — and no candidate exists yet.
+                        .refused => |r| return .{ .refused = r.planeTwo() },
                     }
-                    last = e.cell;
-                    written += 1;
-                    try touched.append(gpa, .{
-                        .part = part_name,
-                        .row = e.cell.row,
-                        .col = e.cell.col,
-                    });
-                }
-            },
+                },
+            }
+        };
+        defer planned.deinit();
+
+        if (planned.edits.len == 0) continue;
+
+        try parts.append(gpa, .{
+            .name = try a.dupe(u8, part_name),
+            // Pass three splices straight into the stage arena: the
+            // rewritten part exists once, not twice across the seam.
+            .bytes = try planned.splice(a, part.bytes),
+        });
+        var last: ?engine.resolved.CellSite = null;
+        for (planned.edits) |e| {
+            if (last) |l| {
+                if (l.row == e.cell.row and l.col == e.cell.col) continue;
+            }
+            last = e.cell;
+            written += 1;
+            try touched.append(gpa, .{
+                .part = part_name,
+                .row = e.cell.row,
+                .col = e.cell.col,
+            });
         }
     }
 
