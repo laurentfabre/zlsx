@@ -443,7 +443,22 @@ pub fn decodeEntities(allocator: std.mem.Allocator, raw: []const u8) TextError![
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.ensureTotalCapacity(allocator, raw.len);
+    try decodeEntitiesInto(&out, allocator, raw);
+    return out.toOwnedSlice(allocator);
+}
+
+/// `decodeEntities`, appending into a caller-owned list. The scan's
+/// sinks reuse one scratch buffer per cell (§9.1 M10h), and a decoded
+/// temp that is copied into the sink and dropped would be churn in
+/// whatever allocator held it. On `BadEntity` the list may hold a
+/// partial decode — every caller turns that error into a refusal that
+/// abandons the content.
+pub fn decodeEntitiesInto(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) TextError!void {
+    try out.ensureUnusedCapacity(allocator, raw.len);
 
     var i: usize = 0;
     while (i < raw.len) {
@@ -476,7 +491,6 @@ pub fn decodeEntities(allocator: std.mem.Allocator, raw: []const u8) TextError![
         }
         i = semi + 1;
     }
-    return out.toOwnedSlice(allocator);
 }
 
 fn parseCharRef(digits: []const u8) ?u21 {
@@ -1300,12 +1314,13 @@ pub const CellType = enum {
     /// Whether `classifyCell` *retains* the `<v>` bytes it is handed
     /// rather than parsing a value out of them.
     ///
-    /// The walk decodes each `<v>` into one scratch buffer that the next
-    /// `<v>` clears, so a retained slice has to leave that buffer before
-    /// the next cell starts. `t="str"` leaves it through `decodeXstring`,
-    /// which allocates; `t="e"` had nothing to allocate and kept
-    /// pointing at bytes the following cell overwrote — a rich error
-    /// spelling read back as whatever came next.
+    /// The walk accumulates each `<v>` into one sink that the next
+    /// `<v>` clears, so a retained slice has to leave the sink's
+    /// *scratch* before the next cell starts — by keeping the borrowed
+    /// part slice or arena-duping an owned concatenation (M10h).
+    /// `t="e"` originally had nothing to allocate and kept pointing at
+    /// bytes the following cell overwrote — a rich error spelling read
+    /// back as whatever came next.
     ///
     /// Exhaustive on purpose: a carrier cannot be added without
     /// answering the question.
@@ -1325,8 +1340,9 @@ pub const InputCell = union(enum) {
     /// it as blank before closure evaluation exists.
     uncached,
     number: f64,
-    /// Borrows: from the scan arena for inline and `t="str"` text, from
-    /// the shared-string table for `t="s"`.
+    /// Borrows: from the part bytes for inline and `t="str"` text on
+    /// the common path, from the scan arena when decoding forced a
+    /// copy (§9.1 M10h), from the shared-string table for `t="s"`.
     text: []const u8,
     boolean: bool,
     err: value.ErrorValue,
@@ -1611,6 +1627,10 @@ pub const SheetCell = struct {
 };
 
 pub const Sheet = struct {
+    /// Owns the merges and the few strings whose decoding forced a
+    /// copy. Most of what `cells` points at is NOT here (§9.1 M10h): a
+    /// string that arrived as one entity-free text event is a slice of
+    /// the part bytes the caller handed `scanSheet`.
     arena: std.heap.ArenaAllocator,
     /// Row-major, one entry per occupied coordinate.
     ///
@@ -1687,6 +1707,11 @@ const row_attrs = [_][]const u8{
 /// The scan is one pass and refuses at the first thing it cannot
 /// classify, before any of it reaches a caller — which is what makes
 /// every refusal in this file pre-mutation by construction.
+///
+/// `xml` must outlive the returned Sheet: the raw attribute slices
+/// (`Formula.kind`, `CellSlot.spans`) always borrowed from it, and
+/// since §9.1 M10h the decoded strings do too whenever the content
+/// arrived as one entity-free text event — which is nearly all of it.
 pub fn scanSheet(
     gpa: std.mem.Allocator,
     xml: []const u8,
@@ -1731,6 +1756,15 @@ pub fn scanSheet(
         .merges = &merges,
         .rows = &rows,
     };
+    // The sinks' scratch lists are `gpa`-backed and freed here — the
+    // borrowed common path never touches them, and a growth spike on
+    // one long cell is returned at scan end instead of living in the
+    // arena as a stranded rung until `Sheet.deinit` (§9.1 M10h).
+    defer {
+        w.v_text.list.deinit(gpa);
+        w.f_text.list.deinit(gpa);
+        w.is_text.list.deinit(gpa);
+    }
 
     var depth: u32 = 0;
     var sc: Scanner = .init(xml);
@@ -1780,8 +1814,10 @@ pub fn scanSheet(
     // resident twice, and §9.1 measures that instant. The cell records,
     // slots and rows go to `gpa`, not the arena — `Sheet.releaseCells`
     // is the cells' point, and the two fixed dupes were the requests
-    // that bought the arena's half-again chunks (§9.1 M10f); only the
-    // decoded strings, whose total no count predicts, stay laddered.
+    // that bought the arena's half-again chunks (§9.1 M10f). The
+    // decoded strings, whose total no count predicts, stopped feeding
+    // the ladder in M10h: the common shape borrows the part bytes, and
+    // only a decode-forced copy touches the arena at all.
     const items = try gpa.dupe(SheetCell, cells.items);
     // The duplicate-cell refusal below RETURNS normally, so the same
     // `keep` discipline that guards the arena guards this block too.
@@ -1837,17 +1873,58 @@ fn lessThanSlot(_: void, x: CellSlot, y: CellSlot) bool {
     return x.col.zeroBased() < y.col.zeroBased();
 }
 
+/// One `<v>`/`<f>`/`<is>` content accumulator (§9.1 M10h). The common
+/// shape — the whole content arriving as one entity-free text event —
+/// is kept as a *borrowed* slice of the part, and no byte of it is
+/// copied anywhere until a finisher decides the string is retained.
+/// The scan used to decode every text event into the sheet arena and
+/// copy it out again; on a 100k-cell sheet the temps, the stranded
+/// sink buffers and the chunk ladder they drove held ~10× the strings
+/// the scan actually kept. Only a second event (rich-text runs, a
+/// comment splitting the content) or an entity forces the scratch list.
+const TextSink = struct {
+    /// The single event's slice into the part, meaningful while `owned`
+    /// is false. Empty means no content yet — the scanner never emits
+    /// an empty text event, and even if one arrived, treating it as
+    /// absent concatenates to the same bytes.
+    borrow: []const u8 = "",
+    /// The concatenation, once owning became unavoidable. Backed by the
+    /// scan's `gpa`, cleared per cell, freed at scan end — scratch,
+    /// never handed out (the finishers dupe what they retain).
+    list: std.ArrayListUnmanaged(u8) = .empty,
+    owned: bool = false,
+
+    fn clear(self: *TextSink) void {
+        self.borrow = "";
+        self.owned = false;
+        self.list.clearRetainingCapacity();
+    }
+
+    fn items(self: *const TextSink) []const u8 {
+        return if (self.owned) self.list.items else self.borrow;
+    }
+
+    /// Move whatever is borrowed into the list; further content appends.
+    fn toOwned(self: *TextSink, gpa: std.mem.Allocator) error{OutOfMemory}!void {
+        if (self.owned) return;
+        try self.list.appendSlice(gpa, self.borrow);
+        self.borrow = "";
+        self.owned = true;
+    }
+};
+
 /// The walk's state. Split out of `scanSheet` so the state machine is
 /// one object with named transitions rather than a dozen locals that
 /// every branch can quietly desynchronize.
 const SheetWalk = struct {
     a: std.mem.Allocator,
-    /// Backs the four *growing* lists, while `a` (the sheet arena)
-    /// keeps the payload dupes. A list that grows inside an arena
-    /// strands every backing buffer it abandons until the arena dies —
-    /// on a 100k-cell sheet that held ~3× the scan's live bytes
-    /// (§9.1's profile). The lists move to the arena as one exact-size
-    /// copy each when the scan finishes.
+    /// Backs the four *growing* lists and the sinks' scratch, while
+    /// `a` (the sheet arena) keeps only what the Sheet must own —
+    /// merges and decode-forced string copies. A list that grows
+    /// inside an arena strands every backing buffer it abandons until
+    /// the arena dies — on a 100k-cell sheet that held ~3× the scan's
+    /// live bytes (§9.1's profile). The lists move to the arena as one
+    /// exact-size copy each when the scan finishes.
     gpa: std.mem.Allocator,
     /// The part, kept so a slice handed out by the scanner can be turned
     /// back into the offsets it came from.
@@ -1902,9 +1979,9 @@ const SheetWalk = struct {
     has_v: bool = false,
     has_is: bool = false,
     has_f: bool = false,
-    v_text: std.ArrayListUnmanaged(u8) = .empty,
-    f_text: std.ArrayListUnmanaged(u8) = .empty,
-    is_text: std.ArrayListUnmanaged(u8) = .empty,
+    v_text: TextSink = .{},
+    f_text: TextSink = .{},
+    is_text: TextSink = .{},
     formula: ?Formula = null,
 
     /// The current `<c>`'s byte ranges, filled in as the walk passes
@@ -1914,6 +1991,24 @@ const SheetWalk = struct {
     /// known before the close tag arrives.
     v_open_end: u32 = 0,
     v_self_closing: bool = false,
+
+    /// Hand a sink's content to the Sheet. The borrowed common case is
+    /// returned as-is — the part outlives the Sheet, a contract the raw
+    /// attribute slices (`Formula.kind`, `CellSlot.spans`) imposed on
+    /// every caller long before the strings joined them — and only an
+    /// owned concatenation costs an arena copy.
+    fn retain(self: *SheetWalk, s: *const TextSink) error{OutOfMemory}![]const u8 {
+        return if (s.owned) try self.a.dupe(u8, s.list.items) else s.borrow;
+    }
+
+    /// `decodeXstring` for a sink: content with no `_` in it cannot
+    /// carry an escape and is retained as-is, so the decode allocates
+    /// only when an `_xHHHH_` may actually be present.
+    fn retainXstring(self: *SheetWalk, s: *const TextSink) TextError![]const u8 {
+        const raw = s.items();
+        if (std.mem.indexOfScalar(u8, raw, '_') == null) return self.retain(s);
+        return decodeXstring(self.a, raw);
+    }
 
     fn refuse(self: *SheetWalk, reason: Refusal.Reason, offset: usize) void {
         if (self.refusal != null) return;
@@ -1935,7 +2030,7 @@ const SheetWalk = struct {
         // refusing it would refuse every phonetically annotated
         // workbook.
         if (self.t_depth != null and self.phonetic_depth != null) return;
-        const sink: ?*std.ArrayListUnmanaged(u8) = if (self.v_depth != null)
+        const sink: ?*TextSink = if (self.v_depth != null)
             &self.v_text
         else if (self.f_depth != null)
             &self.f_text
@@ -1943,12 +2038,23 @@ const SheetWalk = struct {
             &self.is_text
         else
             null;
-        if (sink) |list| {
-            const decoded = decodeEntities(self.a, t) catch |err| {
+        if (sink) |s| {
+            // Entity-free first event: the content IS these bytes of
+            // the part, and the sink just points at them (§9.1 M10h).
+            if (std.mem.indexOfScalar(u8, t, '&') == null) {
+                if (!s.owned and s.borrow.len == 0) {
+                    s.borrow = t;
+                } else {
+                    try s.toOwned(self.gpa);
+                    try s.list.appendSlice(self.gpa, t);
+                }
+                return;
+            }
+            try s.toOwned(self.gpa);
+            decodeEntitiesInto(&s.list, self.gpa, t) catch |err| {
                 self.refusal = try textRefusal(err, offset);
                 return;
             };
-            try list.appendSlice(self.a, decoded);
             return;
         }
         // Between elements, only whitespace is legal. Text anywhere else
@@ -2064,7 +2170,7 @@ const SheetWalk = struct {
             if (std.mem.eql(u8, local, "v")) {
                 self.has_v = true;
                 self.v_depth = depth;
-                self.v_text.clearRetainingCapacity();
+                self.v_text.clear();
                 self.spans.v = .{ .start = offsetOf(el.offset) };
                 self.spans.v_content = null;
                 self.v_open_end = offsetOf(open_end);
@@ -2072,7 +2178,7 @@ const SheetWalk = struct {
             } else if (std.mem.eql(u8, local, "f")) {
                 self.has_f = true;
                 self.f_depth = depth;
-                self.f_text.clearRetainingCapacity();
+                self.f_text.clear();
                 self.formula = .{
                     .text = "",
                     .kind = el.attr("t"),
@@ -2085,7 +2191,7 @@ const SheetWalk = struct {
             } else if (std.mem.eql(u8, local, "is")) {
                 self.has_is = true;
                 self.is_depth = depth;
-                self.is_text.clearRetainingCapacity();
+                self.is_text.clear();
                 self.spans.is = .{ .start = offsetOf(el.offset) };
             } else if (std.mem.eql(u8, local, "extLst")) {
                 self.skip_depth = depth;
@@ -2151,7 +2257,7 @@ const SheetWalk = struct {
         }
         if (self.f_depth == depth) {
             self.f_depth = null;
-            if (self.formula) |*f| f.text = try self.a.dupe(u8, self.f_text.items);
+            if (self.formula) |*f| f.text = try self.retain(&self.f_text);
             if (self.spans.f) |*f| f.end = offsetOf(end);
         }
         if (self.is_depth == depth) {
@@ -2279,9 +2385,9 @@ const SheetWalk = struct {
         self.has_is = false;
         self.has_f = false;
         self.formula = null;
-        self.v_text.clearRetainingCapacity();
-        self.f_text.clearRetainingCapacity();
-        self.is_text.clearRetainingCapacity();
+        self.v_text.clear();
+        self.f_text.clear();
+        self.is_text.clear();
     }
 
     /// Record the closed `<row>`'s geometry (M7b1). The number is the
@@ -2331,7 +2437,7 @@ const SheetWalk = struct {
         // entity-decoded, so what is left is the ST_Xstring pass over
         // the concatenation.
         const is_text: ?[]const u8 = if (self.has_is)
-            decodeXstring(self.a, self.is_text.items) catch |err| {
+            self.retainXstring(&self.is_text) catch |err| {
                 self.refusal = try textRefusal(err, 0);
                 return;
             }
@@ -2344,15 +2450,15 @@ const SheetWalk = struct {
         // still be pointing into the scratch buffer when the next `<v>`
         // clears it — see `CellType.retainsCachedText`.
         const v_raw: ?[]const u8 = if (self.has_v) blk: {
-            const t = CellType.fromAttr(self.cell_type) orelse break :blk self.v_text.items;
+            const t = CellType.fromAttr(self.cell_type) orelse break :blk self.v_text.items();
             if (t == .formula_string) {
-                break :blk decodeXstring(self.a, self.v_text.items) catch |err| {
+                break :blk self.retainXstring(&self.v_text) catch |err| {
                     self.refusal = try textRefusal(err, 0);
                     return;
                 };
             }
-            if (!t.retainsCachedText()) break :blk self.v_text.items;
-            break :blk try self.a.dupe(u8, self.v_text.items);
+            if (!t.retainsCachedText()) break :blk self.v_text.items();
+            break :blk try self.retain(&self.v_text);
         } else null;
 
         const classified = classifyCell(.{
