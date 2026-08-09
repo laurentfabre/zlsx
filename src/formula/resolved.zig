@@ -393,17 +393,23 @@ pub const StagedDeltas = struct {
 /// addressing a byte inside `spans.f`. The rare authored write moved
 /// to a side list on the sheet. The prior input collapsed to the one
 /// predicate the tail gate asks of it.
+///
+/// §9.1 (M10f): the publication itself became `pub_idx` into the
+/// borrowed staged set — result, shape, role and dialect were an
+/// 80-byte copy of a record the caller was still holding at the very
+/// instant the profile measures, once per target. The coordinates
+/// stay: `targetAt`'s binary search and every refusal's cell name
+/// would otherwise pay a second indirection on each probe.
 pub const Target = struct {
     row: coords.Row,
     col: coords.Col,
+    /// Index into `ResolvedSheet.pubs` of the publication that landed
+    /// here — where result, shape, role and dialect live.
+    pub_idx: u32,
     /// Index into `ResolvedSheet.slots` of the `<c>` this publication
     /// landed on — where the `<c>` and its interpreted children sit in
     /// the part.
     slot: u32,
-    result: value.PublishedScalar,
-    shape: value.Shape,
-    role: Role,
-    dialect: value.Dialect,
     /// Whether the cell carries an `<f>` at all, and whether that `<f>`
     /// is `t="array"` (`calc.Kind.fromAttr`, folded at projection time
     /// — the gates only ever ask these two questions of the kind).
@@ -430,6 +436,12 @@ pub const Target = struct {
 
     pub const no_authored = std.math.maxInt(u32);
 
+    /// The publication this target stages — borrowed from the caller's
+    /// staged set, like `source` and the scan.
+    pub fn pubOf(t: Target, sheet: *const ResolvedSheet) *const Publication {
+        return &sheet.pubs[t.pub_idx];
+    }
+
     /// The spans of the `<c>` this target landed on.
     pub fn spansOf(t: Target, sheet: *const ResolvedSheet) decode.CellSpans {
         return sheet.slots[t.slot].spans;
@@ -441,11 +453,12 @@ pub const Target = struct {
     }
 };
 
-/// **Lifetime**: a projection borrows both of its inputs. `source` is
-/// the caller's bytes and `Target.formula` points into the scan's arena,
-/// so the part and the `decode.Sheet` it was scanned into must both
-/// outlive this. Copying either would mean holding a second opinion
-/// about a document that has not changed.
+/// **Lifetime**: a projection borrows all three of its inputs. `source`
+/// is the caller's bytes, `Target.fref` points into the scan's arena,
+/// and `pubs` is the consumed staged set (§9.1 M10f) — so the part, the
+/// `decode.Sheet` it was scanned into, and the publications must all
+/// outlive this and any plan built from it. Copying any of them would
+/// mean holding a second opinion about a document that has not changed.
 pub const ResolvedSheet = struct {
     arena: std.heap.ArenaAllocator,
     /// The source part. Borrowed.
@@ -453,6 +466,9 @@ pub const ResolvedSheet = struct {
     /// Publications joined to an existing `<c>`, ascending by
     /// coordinate.
     targets: []const Target,
+    /// The consumed staged set, borrowed — each target names its
+    /// publication by `pub_idx` rather than carrying a copy.
+    pubs: []const Publication,
     /// Publications with no `<c>` to land on, ascending by coordinate.
     /// A `.plain` append is carried, never patched — see the module
     /// header. A `.spill_tail` append is the one shape M7b1 may turn
@@ -537,11 +553,11 @@ pub fn project(
         }
     }
 
-    // Sort a permutation, not a copy: the publications are 120 bytes
-    // each and an index is four, and the copy lived in the projection's
-    // arena until the patch died (§9.1). The keys the walk below sees
-    // are unique — the duplicate check right here refuses otherwise —
-    // so the unstable sort yields the same order the copying sort did.
+    // Sort a permutation, not a copy: a publication is thirty times an
+    // index, and the copy lived in the projection's arena until the
+    // patch died (§9.1). The keys the walk below sees are unique — the
+    // duplicate check right here refuses otherwise — so the unstable
+    // sort yields the same order the copying sort did.
     const order = try gpa.alloc(u32, pubs.len);
     defer gpa.free(order);
     for (order, 0..) |*slot, idx| slot.* = @intCast(idx);
@@ -590,11 +606,8 @@ pub fn project(
         try targets.append(a, .{
             .row = p.row,
             .col = p.col,
+            .pub_idx = idx,
             .slot = slot_idx,
-            .result = p.result,
-            .shape = p.shape,
-            .role = p.role,
-            .dialect = p.dialect,
             .has_formula = modeled != null and modeled.?.formula != null,
             .formula_is_array = if (modeled) |m|
                 (if (m.formula) |f| calc.Kind.fromAttr(f.kind) == calc.Kind.array else false)
@@ -630,6 +643,7 @@ pub fn project(
         .arena = arena,
         .source = source,
         .targets = targets_out,
+        .pubs = pubs,
         .appends = appends_out,
         .slots = scan.slots,
         .rows = scan.rows,
@@ -1066,7 +1080,7 @@ fn planWithTable(
         if (gateOf(self, t, table)) |g| {
             return .{ .refused = refuseGate(g, t.row, t.col) };
         }
-        tr.* = transitionFor(a, t.result) catch |err| switch (err) {
+        tr.* = transitionFor(a, t.pubOf(self).result) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.UnwritableErrorSpelling => return .{ .refused = refuseAt(
                 .unwritable_error_spelling,
@@ -1176,16 +1190,17 @@ fn gateOf(self: *const ResolvedSheet, t: Target, table: []const SpillTransition)
         return authorGate(self, t, table);
     }
 
+    const p = t.pubOf(self);
     if (t.formula_is_array) {
-        return switch (t.dialect) {
+        return switch (p.dialect) {
             .legacy => cseGate(self, t),
-            .dynamic_array => daGate(t, table),
+            .dynamic_array => daGate(self, t, table),
         };
     }
-    if (t.role == .spill_tail) {
-        return tailGateFor(self, t.role.spill_tail, table);
+    if (p.role == .spill_tail) {
+        return tailGateFor(self, p.role.spill_tail, table);
     }
-    if (!t.shape.isScalar()) return .{ .reason = .non_scalar_result };
+    if (!p.shape.isScalar()) return .{ .reason = .non_scalar_result };
     return null;
 }
 
@@ -1256,18 +1271,19 @@ fn authorGate(self: *const ResolvedSheet, t: Target, table: []const SpillTransit
     if (t.cm != 0) return .{ .reason = .authored_under_cell_metadata };
     if (authoredTextRefusal(w.text)) |g| return g;
 
+    const p = t.pubOf(self);
     switch (w.dialect) {
         .scalar => {
-            if (t.role != .plain) {
+            if (p.role != .plain) {
                 return .{ .reason = .authored_role_contradiction };
             }
-            if (!t.shape.isScalar()) {
+            if (!p.shape.isScalar()) {
                 return .{ .reason = .non_scalar_result };
             }
             return null;
         },
         .dynamic_array => {
-            const outcome = switch (t.role) {
+            const outcome = switch (p.role) {
                 .da_anchor => |o| o,
                 // M7b1 decision 7's statement, at authoring: the
                 // patcher will not reconstruct a placement the model
@@ -1288,7 +1304,7 @@ fn authorGate(self: *const ResolvedSheet, t: Target, table: []const SpillTransit
             return .{ .reason = .transition_unproven, .transition = id };
         },
         .cse => |raw| {
-            if (t.role != .plain) {
+            if (p.role != .plain) {
                 return .{ .reason = .authored_role_contradiction };
             }
             const range = (coords.parseRange(raw, .{
@@ -1333,8 +1349,8 @@ fn authoredTextRefusal(text: []const u8) ?GateRefusal {
 /// `#SPILL!` is the byte record of "was blocked") crossed with the
 /// outcome the model placed. The placement itself is never re-decided
 /// here — an anchor staged without it refuses generically.
-fn daGate(t: Target, table: []const SpillTransition) ?GateRefusal {
-    const outcome = switch (t.role) {
+fn daGate(self: *const ResolvedSheet, t: Target, table: []const SpillTransition) ?GateRefusal {
+    const outcome = switch (t.pubOf(self).role) {
         .da_anchor => |o| o,
         else => return .{ .reason = .dynamic_array_anchor },
     };
@@ -1359,10 +1375,10 @@ fn tailGateFor(
 ) ?GateRefusal {
     const anchor = self.targetAt(owner.row, owner.col) orelse
         return .{ .reason = .tail_without_anchor };
-    if (anchor.role != .da_anchor) {
+    if (anchor.pubOf(self).role != .da_anchor) {
         return .{ .reason = .tail_without_anchor };
     }
-    return daGate(anchor, table);
+    return daGate(self, anchor, table);
 }
 
 fn wasBlocked(t: Target) bool {
@@ -1402,8 +1418,9 @@ fn planAnchorExtras(
     out: *std.ArrayListUnmanaged(Edit),
 ) error{OutOfMemory}!?GateRefusal {
     if (!t.formula_is_array) return null;
-    if (t.dialect != .dynamic_array) return null;
-    const outcome = switch (t.role) {
+    const p = t.pubOf(self);
+    if (p.dialect != .dynamic_array) return null;
+    const outcome = switch (p.role) {
         .da_anchor => |o| o,
         else => return null,
     };
@@ -3814,13 +3831,14 @@ fn assertRoundTrip(a: Allocator, run: *const Run) !void {
     for (run.resolved.targets) |t| {
         const cell = cellAt(back.cells, t.row, t.col) orelse
             return error.PublishedCellVanished;
+        const staged_result = t.pubOf(&run.resolved).result;
         const got = value.publish(cell.input.scalar(), .excel);
-        if (!value.PublishedScalar.eql(t.result, got)) {
+        if (!value.PublishedScalar.eql(staged_result, got)) {
             std.debug.print(
                 "round-trip lost a value at r{d}c{d}: {any} -> {any}\nsource: {s}\npatched: {s}\n",
                 .{
                     t.row.oneBased(), t.col.zeroBased(),
-                    t.result,         got,
+                    staged_result,    got,
                     run.gen.xml,      run.patched.bytes,
                 },
             );
@@ -3993,12 +4011,17 @@ fn authoredPub(comptime ref: []const u8, result: value.PublishedScalar, w: Formu
 /// evaluation is the real parser and evaluator over the re-opened
 /// stored values — so "agrees" is a statement about the file, not
 /// about the fixture's memory of what it staged.
+/// Asserts the re-opened evaluation INSIDE: a text result borrows the
+/// scan's arena (through the AST's zero-copy literals), so a returned
+/// scalar would point into memory this function's defers free — a
+/// use-after-free that only ever passed by allocator accident.
 fn evaluateReopened(
     gpa: Allocator,
     part: []const u8,
     comptime authored_at: []const u8,
     formula_text: []const u8,
-) !value.ScalarValue {
+    expected: value.ScalarValue,
+) !void {
     var rescan = switch (try decode.scanSheet(gpa, part, &.{}, .{})) {
         .ok => |s| s,
         .refused => return error.TestUnexpectedRefusal,
@@ -4042,7 +4065,13 @@ fn evaluateReopened(
     defer ev.deinit();
     const v = try ev.evaluate(ast);
     try testing.expect(v == .scalar);
-    return v.scalar;
+    const got = v.scalar;
+    try testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(got));
+    switch (expected) {
+        .number => |n| try testing.expectEqual(n, got.number),
+        .text => |s| try testing.expectEqualStrings(s, got.text),
+        else => return error.TestUnsupportedExpectation,
+    }
 }
 
 test "§5.8c: scalar authoring end-to-end — write, save, re-open, evaluate agrees" {
@@ -4063,8 +4092,7 @@ test "§5.8c: scalar authoring end-to-end — write, save, re-open, evaluate agr
         \\<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f>SUM(A1:A2)</f><v>3</v></c></row><row r="2"><c r="A2"><v>2</v></c></row>
     ), out);
 
-    const evaluated = try evaluateReopened(testing.allocator, out, "B1", "SUM(A1:A2)");
-    try testing.expectEqual(@as(f64, 3), evaluated.number);
+    try evaluateReopened(testing.allocator, out, "B1", "SUM(A1:A2)", .{ .number = 3 });
 
     // And the re-opened cache says what the evaluation says — the two
     // ends of "agrees".
@@ -4099,8 +4127,7 @@ test "§5.8c: authoring onto a cached cell rides the proven kinds, carriers spli
         \\<row r="1"><c r="A1"><v>1</v></c><c r="B1" t="str"><f>IF(A1&lt;3,&quot;y&amp;z&quot;,&quot;n&quot;)</f><v>y&amp;z</v></c></row>
     ), out);
 
-    const evaluated = try evaluateReopened(testing.allocator, out, "B1", text);
-    try testing.expectEqualStrings("y&z", evaluated.text);
+    try evaluateReopened(testing.allocator, out, "B1", text, .{ .text = "y&z" });
 }
 
 test "§5.8c: authoring next to an empty <v/> and an <is> keeps CT_Cell's order" {

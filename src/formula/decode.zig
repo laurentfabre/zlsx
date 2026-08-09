@@ -1624,6 +1624,12 @@ pub const Sheet = struct {
     /// because an empty styled cell has a position without having a
     /// value. Document order is preserved among equal coordinates, so a
     /// consumer that refuses duplicates can name the first one.
+    ///
+    /// **Backed by the scan's `gpa` like `cells`** (§9.1 M10f), but for
+    /// the other half of the reason: the slot dupe was the request that
+    /// minted the arena's next half-again chunk — 16.4 MiB of chunk
+    /// around a 9.2 MiB record. Unlike the cell records the slots live
+    /// to `deinit`: the projection and the patcher borrow them.
     slots: []CellSlot,
     /// `<mergeCells>`, normalized, in document order. Interpreted
     /// outside `<sheetData>` since M7a: §5.8a's merge row needs the
@@ -1631,7 +1637,8 @@ pub const Sheet = struct {
     /// range.
     merges: []coords.Range,
     /// Every `<row>` element, in document order (M7b1) — the geometry a
-    /// tail `<c>` insertion is confined by.
+    /// tail `<c>` insertion is confined by. `gpa`-backed like `slots`,
+    /// same lifetime.
     rows: []RowSlot,
     /// The worksheet `<dimension>`, or null when the part has none —
     /// in which case there is nothing to maintain and nothing to
@@ -1640,6 +1647,9 @@ pub const Sheet = struct {
 
     pub fn deinit(self: *Sheet) void {
         self.releaseCells();
+        const gpa = self.arena.child_allocator;
+        if (self.slots.len != 0) gpa.free(self.slots);
+        if (self.rows.len != 0) gpa.free(self.rows);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -1767,8 +1777,11 @@ pub fn scanSheet(
 
     // Each growing list is dropped the moment its exact-size copy
     // exists: at the copy instant the biggest list would otherwise be
-    // resident twice, and §9.1 measures that instant. The cell records
-    // go to `gpa`, not the arena — `Sheet.releaseCells` is the point.
+    // resident twice, and §9.1 measures that instant. The cell records,
+    // slots and rows go to `gpa`, not the arena — `Sheet.releaseCells`
+    // is the cells' point, and the two fixed dupes were the requests
+    // that bought the arena's half-again chunks (§9.1 M10f); only the
+    // decoded strings, whose total no count predicts, stay laddered.
     const items = try gpa.dupe(SheetCell, cells.items);
     // The duplicate-cell refusal below RETURNS normally, so the same
     // `keep` discipline that guards the arena guards this block too.
@@ -1777,7 +1790,8 @@ pub fn scanSheet(
     std.mem.sortUnstable(SheetCell, items, {}, lessThanCell);
     // Stable, so two `<c>` claiming one coordinate stay in document
     // order for the consumer that has to name the first of them.
-    const slot_items = try a.dupe(CellSlot, slots.items);
+    const slot_items = try gpa.dupe(CellSlot, slots.items);
+    defer if (!keep) gpa.free(slot_items);
     slots.clearAndFree(gpa);
     std.mem.sort(CellSlot, slot_items, {}, lessThanSlot);
     // Two `<c>` at one coordinate: last-wins and first-wins are both
@@ -1798,7 +1812,8 @@ pub fn scanSheet(
     // local copy — and leak when the returned one deinits.
     const merge_items = try a.dupe(coords.Range, merges.items);
     merges.clearAndFree(gpa);
-    const row_items = try a.dupe(RowSlot, rows.items);
+    const row_items = try gpa.dupe(RowSlot, rows.items);
+    defer if (!keep) gpa.free(row_items);
     rows.clearAndFree(gpa);
 
     keep = true;

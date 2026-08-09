@@ -897,8 +897,12 @@ const Engine = struct {
         }
         return .{
             // The caller's allocator, not the arena: the report is the
-            // one thing that outlives this engine.
-            .components = try self.gpa.dupe(ComponentReport, self.reports.items),
+            // one thing that outlives this engine. Moved, not duped
+            // (§9.1 M10f): the dupe minted a second copy of every
+            // component record at the drive's very peak while the list
+            // still held its own buffer — and with `execute`'s exact
+            // pre-size the two lengths agree, so the move is free.
+            .components = try self.reports.toOwnedSlice(self.gpa),
             .non_converged_cells = non_converged,
             .shape_indeterminate_cells = indeterminate,
             .dynamic_passes = passes,
@@ -1048,6 +1052,13 @@ const Engine = struct {
     const Executed = union(enum) { ok, refused: Refusal };
 
     fn execute(self: *Engine, g: graph.Graph, rerun: ?[]const bool) Error!Executed {
+        // Exact, not laddered (§9.1 M10f): every in-scope component
+        // appends exactly one report per pass — run or carried — so the
+        // condensation's component count bounds the list precisely and
+        // the append ladder's churn (three growth doublings retained by
+        // the allocator at the drive's peak) never happens. `report`
+        // then MOVES this buffer out instead of duplicating it.
+        try self.reports.ensureTotalCapacityPrecise(self.gpa, g.order.len);
         for (g.order, 0..) |comp, position| {
             const cid = g.component[comp[0]];
             const cyclic = g.cyclic[cid];
