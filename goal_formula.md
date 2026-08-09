@@ -2702,8 +2702,8 @@ debris beside either.
 
 ## 6. Milestone ladder
 
-Tier **D1**. One PR per row — **43 rows, M-1 … M10b** (count = the table; every v1 function name frozen — no ellipses);
-counts regenerate from the frozen registry inventory (M3a). v1 = M9d; M10a and M10b are the post-v1 rows.
+Tier **D1**. One PR per row — **44 rows, M-1 … M10c** (count = the table; every v1 function name frozen — no ellipses);
+counts regenerate from the frozen registry inventory (M3a). v1 = M9d; M10a–M10c are the post-v1 rows.
 `<xm:f>` route-through pullable after M2.
 
 | PR | Ships | Own gate |
@@ -2753,6 +2753,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d; M10a and M
 
 | **M10a** ✅ | **The memory row — §9.1's waived RSS figure gets its profile and its first cut** (`feat/m10a-recalc-rss`). The 506.7 MiB is now *attributed*: `zlsx-bench-recalc heap`, an allocator-boundary profiler (`smp_allocator`'s pools are invisible to malloc tooling, so the attribution happens inside the process) that keys every allocation to a call-site stack and snapshots per-site live bytes at each new high-water mark — **643.0 MiB live at peak, and the top of the table was lifetime and arena mechanics, not data**: (1) the prepare-wide arena absorbed every formula's parse + evaluator scratch, ~4.3 KiB per formula cell held to end-of-run for ASTs that are dead the moment `evaluateOne` returns (~42 % of peak); (2) lists growing *inside* arenas stranded every abandoned growth buffer — the scan held ~3× its live bytes — while the ×1.5 chunk policy compounded on its own high water, 121.3 MiB of chunk for ~20 MiB of staged data (~35 %); (3) §5.6e's rebuild held TWO full dependency graphs at the peak instant. The fixes change no output byte: the recalc Driver gains a **per-evaluation scratch arena** (reset `.retain_capacity`; the published value's payload is duped across the seam into the run arena — `reads` stay borrowed, `noteReads` consumes them before the next reset can run); staging gets **its own arena and gpa-backed growth with exact-size arena copies** (stage's lists, the scan's four lists, `resolved.project` sorting a permutation instead of duping 9.16 MiB of publications, `applyEdits` sized to its knowable output, `signaturesOf` counted-then-filled); and **`iterate.run` now owns every graph it runs, the initial one included** — the outgoing graph is freed before its §5.6e replacement is built, at most one ever alive (sound: signatures copy their keys, and a Key's spellings borrow from the Input, never the graph). One latent bug fixed on the way: a result literal's `.arena = arena` copies the arena's state before later field initializers run, so an allocation there that opened a fresh chunk leaked on the returned copy's deinit — `scanSheet` and `project` both materialize before the literal now. **Result (§9.1): peak live 643.0 → 297.9 MiB; first-recalc RSS 506.7 → 271.4 MiB — 17.9× the 15.15 MiB ceiling, from 33.4×.** The ceiling is NOT renegotiated and NOT met; what remains at the new peak (the rebuild instant) is named for the next memory row: the engine's O(cells) records (~128 MiB across the edge sets, `held`/journal, plan scope and signatures), the rebuilt graph (~60 MiB), the model + computed layer (~45 MiB) | Saved archives byte-identical to main across all four workloads; **all four `compare_bench --gate` lanes green with no lane traded for memory** — F1 named `recalc` −3.0 %, `save` −3.8 %, criteria −1.8 %, registry −2.1 %, text +4.6 % (the seam dupes of its text results, under every threshold); zig build + zig build test green; the RSS probe reproducible to the byte across three runs |
 | **M10b** ✅ | **The evaluate row — §9.1's waived evaluate figure gets its profile, and the ceiling is MET** (`feat/m10b-evaluate`). The 876 ms is attributed first (`sample` at 1 ms over the ReleaseFast binary, the digest-pinned named workload): **29.5 % a SECOND full `graph.build` inside `iterate.run`** — §5.6e's fixpoint proof, a parse + link + condensation of all 80 000 formulas whose only product on a workbook without a dynamic reference is "nothing changed" — 25.3 % evaluation proper (a fresh parse of every formula inside it), 11.1 % the txn (~50 samples of it deflate over the rewritten sheet XML, on a lane that never saves), 10.2 % the initial build, 10.0 % staging. And the rebuild was not one build: the runtime read log spells reads differently than the walk (`readRange` notes the raw 1×1 area it iterates where `Capture.note` says cell; an aggregate's cursor notes the stored cells it visits where the walk noted the window), so **~300 spelling artifacts survived the injection's exact-`eql` dedupe, minted range nodes, changed the condensation — a second dynamic pass and a THIRD full build on every named run since M5d4**. The fixes change no output byte: (1) **the graph retains each owner's static walk log** — the captured refs already live in the arena the graph keeps, so retention is bounds and a pointer — and **`noteReads` asks it per read in the walk's own vocabulary** (`walkNoted`): a read the walk noted dedupes inside any rebuild's injection and is not recorded; a cell that is not a node draws no edge in any rebuild (cell/spill-tail nodes derive from the Input alone) and is not recorded; a 1×1 area whose cell the walk noted IS that cell — the fold holds exactly what could change a graph; (2) **the drive gates the rebuild**: folded set == the set the current graph was built from (∅ == ∅ on every ordinary workbook, the same stable set on a converged `INDIRECT`) ⇒ build determinism makes the successor identical ⇒ `sameCondensation` provably true, unbuilt — and the condensation signatures go lazy on the same argument; (3) **override compression deferred**: `replacePart` stages `.pending`, both save paths materialize through `materializeOverrides` before `checkArchiveBounds`, under the save's own poller — same compressor, same policy, same input, same bytes. **Result (§9.1): named evaluate 876.2 → 433.0 ms — 0.87× the 500 ms ceiling, MET, from 267× over at M5d3**; end-to-end 505.06 ms under its second; scaling ×10.2 per decade (≤ 15×, was ×11.0); and the peak the RSS lane measures moved with the rebuild it removed — first-recalc RSS 271.4 → **177.0 MiB** (11.7× the ceiling, from 17.9×), that ceiling still not met and not renegotiated, the next memory row's shortlist updated to the staging instant | Saved archives byte-identical to main across all four workloads; **all four `compare_bench --gate` lanes green with every eval lane faster** — F1 named eval −52.0 % / `save` −44.9 %, registry −48.7 %, text −23.7 %, criteria −2.9 % (its 512 fixed report formulas scan stored rows; the removed fixed costs were never its story); zig build + zig build test green (9 842); the M5d1 cancel seam follows the deflate to the save path, fixture updated; named `dynamic_passes` 2 → 1 — the report describes the run, and the wasted pass was the finding |
+| **M10c** ✅ | **The second memory row — the staging instant loses everything the splice never reads, and the peak moves into the records** (`feat/m10c-staging-rss`). The 177.0 MiB is profiled at the M10b baseline first (`zlsx-bench-recalc heap`, same ReleaseSafe binary, same digest-gated named fixture, same first recalc): the peak sat in `stage`'s patch region, where **pass three ran with passes one and two's whole working set still resident** — `resolved.project`'s 39.4 MiB Target array, the scan (its 21.5 MiB cell-record copy plus slots/rows/texts), the 9.2 MiB publications list, all alive under the 18.6 MiB rewritten-XML buffer, which the stage seam then *duplicated* into the stage arena. The splice's operands are the source and the edits alone — every `Edit.at` addresses the source part, every replacement lives in the patch arena, nothing borrows the projection — so the company was never needed. The fixes change no output byte: (1) **`patch` splits into `plan` + `PlannedPatch.splice`** — passes one and two return the sorted edits in their own arena; `patchWithTable` is rebuilt on top, so every fixture caller sees identical bytes; (2) **`stage` scopes scan, publications and projection inside a block that ends before the splice, and splices ONCE, straight into the stage arena** — the rewritten part never exists twice across the seam; (3) **the publications list is released the moment `project` has consumed it** (copied by value into the projection; it was held to the end of the sheet iteration); (4) **`scanSheet` drops each growing list at the instant its exact-size arena copy exists** (the 21.5 MiB cells list was resident twice at the copy instant — a sub-peak, cut on principle). **Result (§9.1): first-recalc RSS 177.0 → 156.4 MiB — 10.3× the 15.15 MiB ceiling, from 11.7×**; profile site-sum at the peak instant 203.0 → 163.8 MiB; the ceiling NOT renegotiated and NOT met. The peak is now the plan instant, and its mass is records, not lifetimes: the Target array (39.4 MiB, ~500 B per formula cell — an embedded 120-B publication, eleven spans, the formula's five slices, the prior input), the engine's per-run records under `prepare` (31.2 MiB across ten gpa allocations), the scan's cell-record copy (21.5 MiB — unreachable from the projection during the plan, but arena-bound), the model + store parts (19.1 MiB) and computed layer (11.1 MiB), the driver's shape records (9.0 MiB). Lifetime hygiene is exhausted here: freeing the scan earlier means deep-copying its geometry and texts into the projection, which adds the dupe back at the project instant. **The next memory row restructures the per-cell records themselves** — `Target`, the scan's `SheetCell`/`CellSlot`, the driver's per-cell set — M10a's closing prediction, now true at the staging instant | Saved archives byte-identical to main across all four workloads; **all four `compare_bench --gate` lanes green with every lane flat-to-faster** — F1 named eval −5.5 % (427.76 ms median; the 500 ms ceiling stays met), named `save` −5.0 %, criteria eval −4.3 %, registry eval −2.3 %, text eval −11.2 %; zig build + zig build test green (61 steps, 9 842); zig fmt --check clean; the RSS probe byte-reproducible across three runs (165 871 616 B each) |
 
 **M10+ backlog**: F5 (census-ordered); `<xm:f>` route-through; namespace-aware
 scanners; **future compatibility versions beyond CV2** (CV1+CV2 are v1 scope,
@@ -5052,6 +5053,71 @@ met**, and the next memory row's shortlist updates: the peak instant
 is now staging/serialization — the stage arena (~99 MiB across its
 sites), `resolved.project` (39.4 MiB), `applyEdits` (18.6 MiB) — over
 the model (~19 MiB) and the computed layer (`putComputed`, 11.1 MiB).
+
+**M10c — the second memory row (recorded 2026-08-09).** Same
+discipline as M10a: attribute the staging peak, cut what the
+attribution names, name what remains. The probe is unchanged —
+`zlsx-bench-recalc heap` (ReleaseSafe, the digest-gated named fixture,
+the first recalc), RSS via `/usr/bin/time -l` minus the
+usage-invocation baseline.
+
+**What held the recorded 177.0 MiB**, grouped by the sites the
+profiler named at the peak instant:
+
+| Holder at peak, at the M10b baseline | MiB | Why it held |
+|---|---:|---|
+| `resolved.project`'s Target array | 39.4 | read only by passes one and two of `patch`, alive through pass three and the stage-arena dupe |
+| the engine's per-run records under `prepare` (ten gpa allocations, inlined stacks) | 31.2 | the run's bookkeeping — untouched by this row, unchanged to the byte across it |
+| the scan's cell-record copy | 21.5 | the scan is borrowed by the projection (slots/rows/texts); the record array itself is unreachable during the plan, but arena-bound |
+| store part materializations + model (`prepare`) | 19.1 | the workbook's own bytes |
+| pass three's output (`applyEdits`) | 18.6 | created in the patch arena, then **duplicated** into the stage arena at the seam — two copies of the rewritten part between the dupe and the patch's deinit |
+| computed layer (`putComputed`) | 11.1 | the results — the row's product |
+| publications list (`stage`) | 9.2 | consumed by value inside `project`; held to the end of the sheet iteration |
+| driver shape records + source part + patch arena + drive | ~30 | reads, texts, and per-pass state |
+
+**The fixes** are M10c's ladder row; none changes an output byte:
+`patch` splits into `plan` (passes one and two, the sorted edits in
+their own arena) and `PlannedPatch.splice` (pass three, output into a
+caller-chosen allocator) — sound because every `Edit.at` addresses the
+SOURCE and every replacement lives in the plan's arena, so pass three
+reads neither the projection nor the scan nor the publications.
+`stage` scopes all three inside a block that ends before the splice
+and splices once, straight into the stage arena. The publications
+list is released the moment `project` returns. `scanSheet` frees each
+growing list at the instant its exact-size arena copy exists.
+`patchWithTable` is rebuilt on plan + splice, so fixture callers see
+identical bytes.
+
+| | M10b (recorded above) | **M10c** |
+|---|---:|---:|
+| profile site-sum at the peak instant | 203.0 MiB | **163.8 MiB** |
+| `/usr/bin/time -l` peak | 187 367 424 B | **165 871 616 B** |
+| process baseline | 1.75 MiB | 1.75 MiB |
+| baseline-adjusted | **177.0 MiB** | **156.4 MiB** |
+| vs the 3 × model-bytes ceiling (15.15 MiB) | 11.7× | **10.3×** |
+
+(The profile row is this session's consistent pair over one probe;
+the RSS lane is §9.1's metric and ties the recorded chain.)
+
+The four `--gate` lanes re-ran against main in the same session and
+stayed green with every lane flat-to-faster — F1 named eval 452.56 →
+427.76 ms median (−5.5 %; the 500 ms ceiling stays met), named `save`
+−5.0 %, criteria eval −4.3 %, registry eval −2.3 %, text eval
+−11.2 % — so no wall-clock was traded for the memory, and all four
+workloads' saved archives are byte-identical to main's.
+
+**What remains at the new peak — the plan instant — is records, not
+lifetimes**: the Target array (39.4 MiB), the per-run records under
+`prepare` (31.2 MiB), the scan's cell-record copy (21.5 MiB,
+unreachable from the projection during the plan but arena-bound —
+separating its storage is a named opportunity), the model + computed
+layer (~30 MiB), the driver's shape records (9.0 MiB). Freeing the
+scan earlier by deep-copying geometry and texts into the projection
+adds that dupe at the project instant — the two instants are within a
+few MiB, so lifetime moves can no longer lower the max. **The next
+memory row restructures the per-cell records** — `Target`, the scan's
+`SheetCell`/`CellSlot`, the driver's per-cell set — which is M10a's
+closing prediction, now true at the staging instant.
 
 ---
 
