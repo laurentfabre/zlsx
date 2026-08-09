@@ -2702,8 +2702,8 @@ debris beside either.
 
 ## 6. Milestone ladder
 
-Tier **D1**. One PR per row — **48 rows, M-1 … M10g** (count = the table; every v1 function name frozen — no ellipses);
-counts regenerate from the frozen registry inventory (M3a). v1 = M9d; M10a–M10g are the post-v1 rows.
+Tier **D1**. One PR per row — **49 rows, M-1 … M10h** (count = the table; every v1 function name frozen — no ellipses);
+counts regenerate from the frozen registry inventory (M3a). v1 = M9d; M10a–M10h are the post-v1 rows.
 `<xm:f>` route-through pullable after M2.
 
 | PR | Ships | Own gate |
@@ -2758,6 +2758,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d; M10a–M10
 | **M10e** ✅ | **The engine row — the evaluation records that owned the RSS peak, and the ladder that held them** (`feat/m10e-engine-records`). The 141.0 MiB is re-profiled at the M10d baseline first (`zlsx-bench-recalc heap`, same ReleaseSafe binary, same digest-gated named fixture, same first recalc), and the attribution reproduces M10d's closing table to the decimal: the run arena 31.2 MiB across ten allocations, the graph's blocks 19.3 + 9.4 + 6.2 MiB, model + computed 30.2 MiB, the per-pass maps (`held` 6.6, `reports` 6.5, `previous_index`/`touched_set` 6.1, `touched` 4.9). **The graph's "link blocks" have a mechanism now**: they are one arena's chunk ladder — 0.16's arena sizes every new chunk at 1.5× (previous chunk + request), so on 89 999 nodes the 4.3 MB `keys` dupe minted a 9.4 MiB chunk and the 3.6 MB walk-log array the 19.3 MiB one: 36.6 MB of chunks holding ~23 MB of records. The restructuring: (1) **the graph's fixed arrays leave the arena for one exact block** (keys, index, walk logs, dep headers, component, cyclic, order — sized at link entry, carved by a `FixedBufferAllocator`), the dependency edges into one exact buffer sized when the count is known, the all-null-when-acyclic `[]?Seed` into a sparse pair that is empty here, the condensation's member headers into scratch they never leave — graph retention 36.6 → 20.4 MB with the capture arena kept for what the walk logs point into; (2) **the run arena's fixed records leave it the same way** — the bridge's cell records were an append ladder retained doubling by doubling (two-pass count, one exact gpa block, freed with the run), the 80 000-root array the request that bought the next half-again chunk (exact, gpa), and `graph.plan`'s traversal state (mark array, DFS stack, both result ladders) moves to gpa scratch with the two result lists arena-duped exact — which every per-pass `planScope` call inherits too; the run arena keeps the published text/matrix payload dupes and drops 31.2 → 9.8 MiB at peak; (3) **the per-pass maps stay pooled, not pre-sized** — they already retain capacity across passes (M10b), and sizing all five from the node bound at drive entry was built and MEASURED at +3.3 MB RSS (a peak-sized floor under the early-evaluation transients the lazy ladders used to dodge), so the row's answer is the measurement, and the reverted sizing is the record of why. **Result (§9.1): first-recalc RSS 141.0 → 122.9 MiB — 8.1× the 15.15 MiB ceiling, from 9.3×**; profile site-sum at the peak instant 150.4 → 118.5 MiB; the ceiling NOT renegotiated and NOT met. **The peak instant returns to staging**: the engine era now runs below it, and what sets the mark is the patcher's records again — the scan's records (16.4 + 13.0 MiB under `scanSheet`), the M10d Target array (11.9 MiB at 104 B), the publications list (9.2 MiB), over model + computed + store (37.8 MiB) and the run arena's remaining 9.8. The next memory row is the stage seam's scan-and-splice records — or the ceiling conversation | Saved archives byte-identical to main across all four workloads; **all four `compare_bench --gate` lanes green with every delta inside the gate's noise band** — F1 named eval +1.5 % (432.0 ms median as recalc − open; the 500 ms ceiling stays met), named `save` +0.9 %, criteria eval +1.5 %, registry eval +1.7 %, text eval +3.5 %; zig build + zig build test green (132 steps, 9 842); zig fmt --check clean; the RSS probe byte-reproducible across three runs (130 695 168 B each) |
 | **M10f** ✅ | **The third staging row — the scan-and-splice records, and the drive-era floor they uncovered** (`feat/m10f-stage-records`). The 122.9 MiB re-profiles at the M10e baseline first and reproduces its closing attribution to the site: the scan's records under `scanSheet` (a 16.4 MiB arena chunk + the 13.6 MB cell array), the projection's Target chunk (12.48 MiB), the publications list (9.6 MB at 120 B each), the run arena's 9.8, the drive report's dupe (5.76 MB), over model + computed + store (37.8 MiB). Three restructurings: (1) **the scan's slot and row dupes leave the scan arena for exact gpa blocks** — the slot dupe (100 B × 100 010) was the request that minted the arena's 16.4 MiB half-again chunk, M10e's mechanism at the patcher's seam; the exact blocks live to `deinit` because the projection borrows them, and only the decoded strings, whose total no count predicts, stay laddered; (2) **the Target record names its publication instead of embedding it** — 104 → 48 B: result, shape, role and dialect live once, in the borrowed staged set (`pub_idx`), the list alive until the plan has rendered every replacement into its own arena (still freed before the splice), and the target array's first-chunk mint drops 12.48 → 5.76 MB; (3) **the drive's component report is moved, not duped** — the 5.76 MB dupe minted at the drive's very peak beside the list's own 6.8 MB ladder buffer becomes `toOwnedSlice` over a list pre-sized exact to the condensation's component count, and `prepare` folds it to its three scalars before staging begins. **The row's finding: §9.1's RSS was already pinned by the drive's era at M10e's close** — the staging cuts alone moved `/usr/bin/time -l` by nothing (the projection instant fell from 118.5 to ~104 MiB live and RSS held to the page) because the drive's end had mapped the same height; only cutting that instant moved the number. **Result (§9.1): first-recalc RSS 122.9 → 119.1 MiB — 7.9× the 15.15 MiB ceiling, from 8.1×**; profile site-sum at the peak instant 118.5 → 107.3 MiB, the peak instant now the drive's end. The restructure also exposed a latent use-after-free in a §5.8c test helper (the returned scalar borrowed helper-freed memory and passed by allocator accident); the helper now asserts while the memory lives. The next memory row is the drive era the peak now names — the per-pass maps' pooled capacities and the ~13 MiB the allocator retains over the live sum — or the ceiling conversation | Saved archives byte-identical to main across all four workloads; **all four `compare_bench --gate` lanes green with every delta inside the gate's noise band** — F1 named eval −2.0 % (416.5 ms median as recalc − open; the 500 ms ceiling stays met), named `save` −2.9 %, criteria eval +0.3 %, registry eval −0.5 %, text eval +1.4 %; zig build + zig build test green (132 steps, 9 842); zig fmt --check clean; the RSS probe byte-reproducible across three runs (126 795 776 B each) |
 | **M10g** ✅ | **The drive-era row — the write-only records, and the build ladders behind the churn gap** (`feat/m10g-drive-era`). The 119.1 MiB re-profiles at the M10f baseline first and reproduces its closing attribution to the site (peak live 107.3 MiB at the drive's end; RSS 126 779 392 B, one page under the recorded run). **The row's finding: the drive's three big per-pass records were write-only on the common path** — each has exactly one reader, and none of the three is reachable here: `touched` has no reader at all (M10b's gate restructure left the list behind; only its sibling set was ever read), `held`'s one reader sits behind `iterateComponent`'s `settings.iterate` refusal, and `touched_set`'s one reader is `foldedPassEdges`' carry over `dynamic.items`, empty without dynamic references. Each now records only when its reader is reachable — the list deleted outright, `held` under iteration only, `touched_set` while `dynamic` holds edges — and the `scope` set pre-sizes exact from the plan's component list. That cut moved the **peak instant upstream into the graph build** (103.1 MiB live), the first pre-drive peak, where the attribution named `condensationOrder`'s per-component `feeds` lists — ~80 000 first blocks at the allocator's cache-line floor (32 × u32), 15.2 MB live at the peak instant for ~400 KB of edge payload — and the build's append ladders (`owners` churned 30.7 MB for a 10.2 MB list, `keys` 15.3 for 5.6, `logs` 5.9 for 3.1). The feeds became one flat (d, c) pair list counting-sorted into a CSR carve; the ladders pre-size from counts known before their loops — counts, not bounds. **Result (§9.1): first-recalc RSS 119.1 → 93.6 MiB — 6.2× the 15.15 MiB ceiling, from 7.9×**; profile site-sum at the peak instant 107.3 → 100.1 MiB, the peak instant now staging's scan. **The churn gap inverted**: M10f's ~13 MiB allocator-retained-over-live was the ladders' freed rungs, not allocator behavior no restructure reaches — with the rungs gone, RSS sits ~6 MiB *below* the live site-sum, the remaining exact blocks' capacity tails allocated but never faulted. The next memory row is the scan arena's string ladder (24.3 MiB at peak, 76.4 MB churned — the decoded strings no count predicts) — or the ceiling conversation | Saved archives byte-identical to main across all four workloads; **all `compare_bench --gate` lanes green, the four workloads improved** — F1 named eval −5.0 % (391.9 ms median as recalc − open; the 500 ms ceiling stays met), named `save` −5.9 %, criteria eval −0.1 %, registry eval −4.6 %, text eval −5.3 %; zig build + zig build test green (132 steps, 9 842); zig fmt --check clean; the RSS probe byte-reproducible across three runs (100 024 320 B each) |
+| **M10h** ✅ | **The scan-strings row — the borrow that emptied the arena, and the site that was never the arena** (`feat/m10h-scan-strings`). The 93.6 MiB re-profiles at the M10g baseline first and reproduces it exactly (RSS 100 024 320 B — the recorded bytes; peak live 100.1 MiB at staging's scan). **The row's finding: the shortlisted 24.3 MiB / 76.4 MB site was never the arena** — re-measuring after the cut returned it byte-identical (25 514 508 B, 59 allocs, 76 434 388 B churned), which no allocation stream containing an arena chunk could have survived; the site is the scan's growing record lists (`cells`, `slots`, `rows`, doubling in `gpa`), attributed through the same inlined `onClose` frame the arena's growth shared. The decoded strings' actual ladder was the two `onText`-attributed sites — 3.8 MiB at peak, 4.0 MB churned — and it was two copies deep: `decodeEntities` duped a temp into the arena for *every* text event (verbatim when entity-free, the common case), the sinks grew inside the arena stranding abandoned buffers, and the finishers copied the sink out again. The cut is the shortlist's borrow option: the scanner hands out subslices of the part and decodes entities *within* an event, so a `TextSink` keeps the one-entity-free-event shape as a borrowed slice of the part — zero copies — and only a second event (rich-text runs, split content) or an actual entity forces `gpa` scratch plus one exact arena dupe; the lifetime was already the contract (`Formula.kind`/`raw_attrs` and the slots' spans are raw part slices). The sheet arena now holds merges and decode-forced copies only: 0.4 MiB / 12 chunks, from 4.0 MB. **Result (§9.1): first-recalc RSS 93.6 → 90.1 MiB — 5.9× the 15.15 MiB ceiling, from 6.2×**; profile site-sum at the peak instant 100.1 → 96.5 MiB, the peak instant still staging's scan. The next memory row is the scan's record-list growth ladder (24.3 MiB of doubling capacity at the peak instant, 76.4 MB churned, coexisting with its own 13.0 MiB exact dupes) — or the ceiling conversation | Saved archives byte-identical to main across all four workloads; **`compare_bench --gate` exit 0, every lane ok** — F1 named eval +1.8 % (406.0 ms median as recalc − open; the 500 ms ceiling stays met), named `save` −2.8 %, criteria eval +0.3 %, text eval −0.1 %, registry eval −2.6 % (largest z 1.5 vs the 3σ line); zig build + zig build test green (132 steps, 9 842); zig fmt --check clean; the RSS probe byte-reproducible across three runs (96 337 920 B each) |
 
 **M10+ backlog**: F5 (census-ordered); `<xm:f>` route-through; namespace-aware
 scanners; **future compatibility versions beyond CV2** (CV1+CV2 are v1 scope,
@@ -5377,6 +5378,75 @@ the run arena's payload dupes (9.8), the published list (4.3) and its
 index (2.1). The engine and build eras now run entirely below the
 staging era, and every counted record on both sides of the seam is
 exact. Cutting further means the scan arena's string ladder — or
+renegotiating the ceiling.
+
+**M10h — the scan-strings row (recorded 2026-08-09).** Same
+discipline: attribute the peak, cut what the attribution names, name
+what remains. The probe is unchanged.
+
+**What held the recorded 93.6 MiB** was M10g's closing table,
+reproduced exactly at re-profiling (RSS 100 024 320 B — the recorded
+bytes; peak live 100.1 MiB at staging's scan). The shortlist named
+the scan arena at 24.3 MiB / 76.4 MB churned. **The row's finding:
+that site was never the arena.** Re-measuring after the cut returned
+it byte-identical (25 514 508 at peak, 59 allocs, 76 434 388 churned)
+— an allocation stream the string fix could not have left untouched
+had one arena chunk been in it. The site is the scan's growing record
+lists — `cells`, `slots`, `rows`, doubling in `gpa`, attributed
+through the same inlined `onClose` frame the arena's growth shared.
+The decoded strings' actual ladder was the two `onText`-attributed
+sites — 3.8 MiB at the peak instant, 4.0 MB churned — and it was two
+copies deep: `decodeEntities` allocated a decoded temp into the arena
+for *every* text event (the entity-free common case dupes verbatim),
+the sink lists grew inside the arena stranding every abandoned
+buffer, and the finishers then copied the sink's content into the
+arena a second time.
+
+The cut is the borrow the shortlist offered. A text event's bytes are
+the part's bytes — the scanner hands out subslices, and entities are
+decoded *within* an event, never split across events — so the common
+shape (the whole content arriving as one entity-free event) needs no
+copy at all:
+
+| the content's shape | before | now |
+|---|---|---|
+| one entity-free event (nearly all of it) | arena temp + arena sink + arena dupe | **a borrowed slice of the part — zero copies** |
+| an entity present | arena temp + arena sink + arena dupe | decoded once into `gpa` scratch, one exact arena dupe |
+| rich-text runs / split content | arena temps + arena sink + arena dupe | `gpa` scratch concatenation, one exact arena dupe |
+
+The lifetime the borrow leans on was already the contract:
+`Formula.kind`/`ref`/`si`/`raw_attrs` and every `CellSlot`'s spans
+have always been raw slices of the part, so no caller exists that
+drops the part before the Sheet — verified across all three
+`scanSheet` call sites and the corpus tests. The sheet arena now owns
+only the merges and the decode-forced copies: 0.4 MiB across 12
+chunks for the whole run, from 4.0 MB.
+
+| | M10g (recorded above) | **M10h** |
+|---|---:|---:|
+| profile site-sum at the peak instant | 100.1 MiB (staging's scan) | **96.5 MiB (staging's scan)** |
+| `/usr/bin/time -l` peak | 100 024 320 B | **96 337 920 B** |
+| process baseline | 1.78 MiB | 1.78 MiB |
+| baseline-adjusted | **93.6 MiB** | **90.1 MiB** |
+| vs the 3 × model-bytes ceiling (15.15 MiB) | 6.2× | **5.9×** |
+
+The lanes re-ran against main in the same session and the gate is
+green across all four workloads — F1 named eval +1.8 % (406.0 ms
+median as recalc − open; the 500 ms ceiling stays met), named `save`
+−2.8 %, criteria eval +0.3 %, text eval −0.1 %, registry eval −2.6 %
+— noise-level deltas both ways (the largest z is 1.5, against the
+gate's 3σ line), and all four workloads' saved archives are
+byte-identical to main's.
+
+**What remains at the peak — which is staging's scan still.** Model +
+computed + store at 40.5 MiB (the workbook's own data), the scan's
+growing record lists (24.3 MiB of doubling capacity at the peak
+instant, 76.4 MB churned — live at the same instant as their own
+13.0 MiB exact dupes, because the copy is what the instant *is*), the
+run arena's payload dupes (9.8), the published list (4.3) and its
+index (2.1). Cutting further means the record lists' growth ladder —
+the same shape M10f cut on the arena side, now on the `gpa` side,
+where shrink-in-place or a counted pre-walk are the candidates — or
 renegotiating the ceiling.
 
 ---
