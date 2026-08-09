@@ -1613,6 +1613,12 @@ pub const SheetCell = struct {
 pub const Sheet = struct {
     arena: std.heap.ArenaAllocator,
     /// Row-major, one entry per occupied coordinate.
+    ///
+    /// **Backed by the scan's `gpa`, not the arena** (§9.1 M10d): the
+    /// records are the scan's biggest single block and the staging path
+    /// is done with them the moment the projection has copied what it
+    /// reads — `releaseCells` lets that caller drop them while the
+    /// arena (which the projection's slices still borrow) lives on.
     cells: []SheetCell,
     /// Row-major, one entry per `<c>` element — a superset of `cells`,
     /// because an empty styled cell has a position without having a
@@ -1633,8 +1639,18 @@ pub const Sheet = struct {
     dimension: ?DimensionSpans,
 
     pub fn deinit(self: *Sheet) void {
+        self.releaseCells();
         self.arena.deinit();
         self.* = undefined;
+    }
+
+    /// Free the cell records ahead of the rest of the scan. Everything
+    /// else — slots, rows, merges, every decoded string the records
+    /// pointed into — stays valid until `deinit`; only the record
+    /// array itself dies. Idempotent, and `deinit` calls it.
+    pub fn releaseCells(self: *Sheet) void {
+        if (self.cells.len != 0) self.arena.child_allocator.free(self.cells);
+        self.cells = &.{};
     }
 };
 
@@ -1751,8 +1767,12 @@ pub fn scanSheet(
 
     // Each growing list is dropped the moment its exact-size copy
     // exists: at the copy instant the biggest list would otherwise be
-    // resident twice, and §9.1 measures that instant.
-    const items = try a.dupe(SheetCell, cells.items);
+    // resident twice, and §9.1 measures that instant. The cell records
+    // go to `gpa`, not the arena — `Sheet.releaseCells` is the point.
+    const items = try gpa.dupe(SheetCell, cells.items);
+    // The duplicate-cell refusal below RETURNS normally, so the same
+    // `keep` discipline that guards the arena guards this block too.
+    defer if (!keep) gpa.free(items);
     cells.clearAndFree(gpa);
     std.mem.sortUnstable(SheetCell, items, {}, lessThanCell);
     // Stable, so two `<c>` claiming one coordinate stay in document

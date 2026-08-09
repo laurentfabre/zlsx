@@ -404,6 +404,12 @@ pub fn prepare(
         .watch = &watch,
     };
     defer driver.deinit();
+    // Every evaluable cell lands exactly one `Published` entry, and the
+    // count is known here — sized once, the list neither walks the
+    // growth ladder (its churn was a §9.1 line) nor holds a last
+    // doubling's overshoot at the staging peak.
+    try driver.published.ensureTotalCapacityPrecise(gpa, input.cells.len);
+    try driver.published_at.ensureTotalCapacity(gpa, @intCast(input.cells.len));
 
     var counters: engine.graph.WorkCounters = .{ .limits = opts.work_limits };
     switch (try engine.graph.plan(g, a, roots, &counters, .{
@@ -562,12 +568,6 @@ const Published = struct {
     /// exists to hold its shape, and treating its placeholder as a
     /// result would cache a zero nothing computed.
     has_value: bool = false,
-    /// The whole array the cell last published, when it published one —
-    /// arena-backed, so it outlives the run. `value` is the narrowed
-    /// anchor scalar; §5.6h's slave synthesis (M7b1) is the one reader
-    /// of the rest, because a legacy CSE's tails are not evaluable
-    /// nodes and their file caches are maintained from exactly this.
-    matrix: ?engine.value.Matrix = null,
 };
 
 /// The package's `iterate.Host` for a whole-workbook recalc.
@@ -610,6 +610,14 @@ const Driver = struct {
     /// cost O(cells²) and was, after M5d4's other fixes, the largest
     /// single cost left in the pipeline.
     published_at: std.AutoHashMapUnmanaged(engine.env.CellRef, u32) = .empty,
+    /// The whole array a cell last published, when it published one —
+    /// run-arena-backed, so it outlives the evaluation. §5.6h's slave
+    /// synthesis (M7b1) is the one reader, because a legacy CSE's
+    /// tails are not evaluable nodes and their file caches are
+    /// maintained from exactly this. Keyed off the record rather than
+    /// carried on it (§9.1 M10d): almost no cell publishes an array,
+    /// and an optional matrix was a third of every `Published`.
+    matrices: std.AutoHashMapUnmanaged(engine.env.CellRef, engine.value.Matrix) = .empty,
     /// A plane-2 refusal with the detail the engine's own `PlaneTwo`
     /// cannot carry.
     refused_plane: ?engine.decode.PlaneTwo = null,
@@ -620,7 +628,13 @@ const Driver = struct {
     fn deinit(self: *Driver) void {
         self.published.deinit(self.gpa);
         self.published_at.deinit(self.gpa);
+        self.matrices.deinit(self.gpa);
         self.scratch.deinit();
+    }
+
+    /// The matrix riding a cell's last publish, or null.
+    fn matrixOf(self: *const Driver, cell: engine.env.CellRef) ?engine.value.Matrix {
+        return self.matrices.get(cell);
     }
 
     /// Append one entry and record where it landed.
@@ -744,11 +758,15 @@ const Driver = struct {
             .array => |m| m,
             .scalar => null,
         };
+        if (matrix) |m| {
+            try self.matrices.put(self.gpa, cell, m);
+        } else {
+            _ = self.matrices.remove(cell);
+        }
         if (self.published_at.get(cell)) |i| {
             const p = &self.published.items[i];
             p.value = scalar;
             p.has_value = true;
-            p.matrix = matrix;
             // `shape` is deliberately not touched: the entry `evaluate`
             // made carries the result's shape, and that — not the
             // scalar the anchor's coordinate reads — is what the
@@ -760,7 +778,6 @@ const Driver = struct {
             .value = scalar,
             .shape = v.shape(),
             .has_value = true,
-            .matrix = matrix,
         });
     }
 
@@ -771,6 +788,7 @@ const Driver = struct {
     fn vtRetract(ctx: *anyopaque, cell: engine.env.CellRef) void {
         const self = of(ctx);
         self.model.retractResult(cell);
+        _ = self.matrices.remove(cell);
         const found = self.published_at.fetchRemove(cell) orelse return;
         const at = found.value;
         _ = self.published.orderedRemove(at);
@@ -908,7 +926,7 @@ fn synthesizeCseSlaves(
                 .col = col,
             };
             if (driver.published_at.get(target) != null) continue;
-            const elem: engine.value.ScalarValue = if (p.matrix) |m|
+            const elem: engine.value.ScalarValue = if (driver.matrixOf(p.cell)) |m|
                 (if (m.rows == 1 and m.cols == 1)
                     // A 1×1 R broadcasts — the same rule as a scalar,
                     // spelled per §5.6h so a one-element array does not
@@ -1040,8 +1058,12 @@ fn stage(
             // Consumed: `project` copied every publication by value, so
             // the list's backing is dead on both variants — released
             // here rather than at the block's end, because the plan
-            // below runs at the instant §9.1 measures.
+            // below runs at the instant §9.1 measures. The scan's cell
+            // records go with it (§9.1 M10d): the projection copied the
+            // per-cell facts it gates on, so only the records' STRINGS
+            // (still arena-owned) and the slots need to outlive this.
             pubs.clearAndFree(gpa);
+            scan.releaseCells();
 
             switch (projected) {
                 .refused => |r| return .{ .refused = r.planeTwo() },
