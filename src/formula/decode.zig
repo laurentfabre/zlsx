@@ -1677,10 +1677,18 @@ pub fn scanSheet(
     defer if (!keep) arena.deinit();
     const a = arena.allocator();
 
+    // `gpa`-backed while they grow, arena-owned once they are done
+    // (the exact-size dupes below): the four lists interleave their
+    // growth, so inside the arena at most one of them could ever
+    // resize in place and every abandoned buffer stayed resident.
     var cells: std.ArrayListUnmanaged(SheetCell) = .empty;
+    defer cells.deinit(gpa);
     var slots: std.ArrayListUnmanaged(CellSlot) = .empty;
+    defer slots.deinit(gpa);
     var merges: std.ArrayListUnmanaged(coords.Range) = .empty;
+    defer merges.deinit(gpa);
     var rows: std.ArrayListUnmanaged(RowSlot) = .empty;
+    defer rows.deinit(gpa);
 
     var ns_buf: [64]NsStack.Binding = undefined;
     const ns_cap = @min(ns_buf.len, opts.limits.max_namespace_bindings);
@@ -1688,6 +1696,7 @@ pub fn scanSheet(
 
     var w: SheetWalk = .{
         .a = a,
+        .gpa = gpa,
         .xml = xml,
         .opts = opts,
         .strings = strings,
@@ -1740,11 +1749,11 @@ pub fn scanSheet(
         return .{ .refused = .{ .reason = .malformed_xml, .offset = offsetOf(sc.i) } };
     }
 
-    const items = try cells.toOwnedSlice(a);
+    const items = try a.dupe(SheetCell, cells.items);
     std.mem.sortUnstable(SheetCell, items, {}, lessThanCell);
     // Stable, so two `<c>` claiming one coordinate stay in document
     // order for the consumer that has to name the first of them.
-    const slot_items = try slots.toOwnedSlice(a);
+    const slot_items = try a.dupe(CellSlot, slots.items);
     std.mem.sort(CellSlot, slot_items, {}, lessThanSlot);
     // Two `<c>` at one coordinate: last-wins and first-wins are both
     // defensible readings, so neither is chosen silently.
@@ -1758,13 +1767,20 @@ pub fn scanSheet(
         }
     }
 
+    // Materialized BEFORE the result literal: `.arena = arena` copies
+    // the arena's state first, so an allocation in a later field
+    // initializer that opens a fresh chunk would be known only to the
+    // local copy — and leak when the returned one deinits.
+    const merge_items = try a.dupe(coords.Range, merges.items);
+    const row_items = try a.dupe(RowSlot, rows.items);
+
     keep = true;
     return .{ .ok = .{
         .arena = arena,
         .cells = items,
         .slots = slot_items,
-        .merges = try merges.toOwnedSlice(a),
-        .rows = try rows.toOwnedSlice(a),
+        .merges = merge_items,
+        .rows = row_items,
         .dimension = w.dimension,
     } };
 }
@@ -1784,6 +1800,13 @@ fn lessThanSlot(_: void, x: CellSlot, y: CellSlot) bool {
 /// every branch can quietly desynchronize.
 const SheetWalk = struct {
     a: std.mem.Allocator,
+    /// Backs the four *growing* lists, while `a` (the sheet arena)
+    /// keeps the payload dupes. A list that grows inside an arena
+    /// strands every backing buffer it abandons until the arena dies —
+    /// on a 100k-cell sheet that held ~3× the scan's live bytes
+    /// (§9.1's profile). The lists move to the arena as one exact-size
+    /// copy each when the scan finishes.
+    gpa: std.mem.Allocator,
     /// The part, kept so a slice handed out by the scanner can be turned
     /// back into the offsets it came from.
     xml: []const u8,
@@ -2118,7 +2141,7 @@ const SheetWalk = struct {
             self.refuse(.bad_attribute_value, el.offset);
             return;
         };
-        try self.merges.append(self.a, range.normalized());
+        try self.merges.append(self.gpa, range.normalized());
     }
 
     fn startRow(self: *SheetWalk, el: Element, open_end: usize) void {
@@ -2233,7 +2256,7 @@ const SheetWalk = struct {
         }
         const e = offsetOf(end);
         const self_closing = self.row_open_end == e;
-        try self.rows.append(self.a, .{
+        try self.rows.append(self.gpa, .{
             .number = self.row_index,
             .element = .{ .start = self.row_start, .end = e },
             .open_end = self.row_open_end,
@@ -2256,7 +2279,7 @@ const SheetWalk = struct {
         // `<c>` occupies its bytes whatever the classification decides
         // — including the empty styled cell the merged view drops.
         self.spans.cell.end = offsetOf(end);
-        try self.slots.append(self.a, .{
+        try self.slots.append(self.gpa, .{
             .row = coords.Row.fromOneBased(self.cell_row) catch unreachable,
             .col = self.cell_col,
             .spans = self.spans,
@@ -2310,7 +2333,7 @@ const SheetWalk = struct {
         // storing one would give two spellings for one state.
         if (input == .blank and !self.has_f) return;
 
-        try self.cells.append(self.a, .{
+        try self.cells.append(self.gpa, .{
             .row = coords.Row.fromOneBased(self.cell_row) catch unreachable,
             .col = self.cell_col,
             .input = input,

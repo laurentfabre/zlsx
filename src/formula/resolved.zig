@@ -493,20 +493,37 @@ pub fn project(
         }
     }
 
-    const ordered = try a.dupe(Publication, pubs);
-    std.mem.sortUnstable(Publication, ordered, {}, lessThanPublication);
+    // Sort a permutation, not a copy: the publications are 120 bytes
+    // each and an index is four, and the copy lived in the projection's
+    // arena until the patch died (§9.1). The keys the walk below sees
+    // are unique — the duplicate check right here refuses otherwise —
+    // so the unstable sort yields the same order the copying sort did.
+    const order = try gpa.alloc(u32, pubs.len);
+    defer gpa.free(order);
+    for (order, 0..) |*slot, idx| slot.* = @intCast(idx);
+    std.mem.sortUnstable(u32, order, pubs, lessThanPublicationAt);
     i = 1;
-    while (i < ordered.len) : (i += 1) {
-        const cur = ordered[i];
-        const prev = ordered[i - 1];
+    while (i < order.len) : (i += 1) {
+        const cur = pubs[order[i]];
+        const prev = pubs[order[i - 1]];
         if (cur.row == prev.row and cur.col == prev.col) {
             return .{ .refused = refuseAt(.duplicate_publication, cur.row, cur.col) };
         }
     }
 
+    // Both splits are knowable before either list exists, so each
+    // backing is one exact-size allocation: a list that grows inside an
+    // arena strands every buffer it abandons until the arena dies.
+    var targets_n: usize = 0;
+    for (pubs) |p| {
+        if (slotAt(scan.slots, p.row, p.col) != null) targets_n += 1;
+    }
     var targets: std.ArrayListUnmanaged(Target) = .empty;
+    try targets.ensureTotalCapacityPrecise(a, targets_n);
     var appends: std.ArrayListUnmanaged(Publication) = .empty;
-    for (ordered) |p| {
+    try appends.ensureTotalCapacityPrecise(a, pubs.len - targets_n);
+    for (order) |idx| {
+        const p = pubs[idx];
         const slot = slotAt(scan.slots, p.row, p.col) orelse {
             try appends.append(a, p);
             continue;
@@ -528,13 +545,22 @@ pub fn project(
         });
     }
 
+    // Materialized BEFORE the result literal: `.arena = arena` copies
+    // the arena's state first, so an allocation in a later field
+    // initializer that opened a fresh chunk would be known only to the
+    // local copy — and leak when the returned one deinits. With the
+    // exact capacities above these are non-allocating today; the order
+    // keeps that from being load-bearing.
+    const targets_out = try targets.toOwnedSlice(a);
+    const appends_out = try appends.toOwnedSlice(a);
+
     _ = try staged.consume();
     keep = true;
     return .{ .ok = .{
         .arena = arena,
         .source = source,
-        .targets = try targets.toOwnedSlice(a),
-        .appends = try appends.toOwnedSlice(a),
+        .targets = targets_out,
+        .appends = appends_out,
         .slots = scan.slots,
         .rows = scan.rows,
         .dimension = scan.dimension,
@@ -544,6 +570,10 @@ pub fn project(
 fn lessThanPublication(_: void, x: Publication, y: Publication) bool {
     if (x.row.oneBased() != y.row.oneBased()) return x.row.oneBased() < y.row.oneBased();
     return x.col.zeroBased() < y.col.zeroBased();
+}
+
+fn lessThanPublicationAt(pubs: []const Publication, x: u32, y: u32) bool {
+    return lessThanPublication({}, pubs[x], pubs[y]);
 }
 
 fn slotAt(slots: []const decode.CellSlot, row: coords.Row, col: coords.Col) ?decode.CellSlot {
@@ -1813,9 +1843,19 @@ fn spansOfSite(slots: []const decode.CellSlot, site: CellSite) ?decode.CellSpans
 
 /// Splice a sorted, non-overlapping edit list into the source.
 pub fn applyEdits(a: Allocator, source: []const u8, edits: []const Edit) error{OutOfMemory}![]u8 {
+    // The output's length is knowable before a byte moves. Sizing to
+    // `source.len` and growing past it — every replacement here is
+    // wider than what it replaces — stranded the whole first buffer in
+    // the patch's arena until it died (§9.1).
+    var total: usize = source.len;
+    for (edits) |e| {
+        total -= e.at.end - e.at.start;
+        total += e.replacement.len;
+    }
+
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(a);
-    try out.ensureTotalCapacity(a, source.len);
+    try out.ensureTotalCapacityPrecise(a, total);
 
     var cursor: u32 = 0;
     for (edits) |e| {
@@ -1825,6 +1865,7 @@ pub fn applyEdits(a: Allocator, source: []const u8, edits: []const Edit) error{O
         cursor = e.at.end;
     }
     try out.appendSlice(a, source[cursor..]);
+    assert(out.items.len == total);
     return out.toOwnedSlice(a);
 }
 
