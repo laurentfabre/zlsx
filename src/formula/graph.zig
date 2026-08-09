@@ -686,7 +686,32 @@ pub const Graph = struct {
     /// `B1:B2`) has no range node to start from and needs the same
     /// sparse lookup the builder used.
     index: Index,
+    /// Per-node static walk log (M10b): for each owner node, the bounds
+    /// of what the *walk* of its body noted — the pre-injection prefix
+    /// of the dependency log, over the `refs` slice the arena already
+    /// keeps for the graph's lifetime. Null for nodes that own no body.
+    /// `iterate` probes it per runtime read to decide whether a rebuild
+    /// could change anything, which is what lets a run skip the
+    /// confirming rebuild instead of paying a full build to prove
+    /// nothing did.
+    walk_logs: []const ?WalkLog,
     stats: Stats,
+
+    /// Bounds over an owner's captured refs, in `Capture.take`'s layout:
+    /// cells first, then areas, then names, then spans — so the walk's
+    /// cells are `refs[0..walk_cells]` and its areas
+    /// `refs[cells .. cells + walk_areas]`. The injected runtime
+    /// entries, when the graph is a rebuild's product, sit *after* each
+    /// prefix, which is exactly why the prefix and not the whole list is
+    /// the membership the gate needs (§5.6e's fold restates a runtime
+    /// read every pass; a probe that saw injected entries would stop
+    /// restating them and starve the fold).
+    const WalkLog = struct {
+        refs: []const Ref,
+        cells: u32,
+        walk_cells: u32,
+        walk_areas: u32,
+    };
 
     pub fn deinit(self: *Graph) void {
         self.arena.deinit();
@@ -715,6 +740,25 @@ pub const Graph = struct {
 
     pub fn isCyclic(self: Graph, node: u32) bool {
         return self.cyclic[self.component[node]];
+    }
+
+    /// Whether the static walk of `owner`'s body noted exactly this
+    /// target — the same membership `DependencyLog.noteCell` /
+    /// `noteArea` would answer during a rebuild's injection, so "yes"
+    /// means the edge would dedupe away there rather than change the
+    /// graph. Exact `eql`, no containment: a cell inside a noted area
+    /// is a different log entry, and the builder treats it as one.
+    pub fn walkNoted(self: Graph, owner: u32, target: DynamicRef.Target) bool {
+        const log = self.walk_logs[owner] orelse return false;
+        switch (target) {
+            .cell => |c| for (log.refs[0..log.walk_cells]) |r| {
+                if (r.cell.eql(c)) return true;
+            },
+            .area => |x| for (log.refs[log.cells .. log.cells + log.walk_areas]) |r| {
+                if (r.area.eql(x)) return true;
+            },
+        }
+        return false;
     }
 
     /// The cell-like nodes inside an area, in area → sheet → row-major
@@ -855,6 +899,10 @@ const Builder = struct {
     owners: std.ArrayListUnmanaged(BodyOwner) = .empty,
     /// `refs[i]` belongs to `owners[i]`.
     refs: std.ArrayListUnmanaged([]const Ref) = .empty,
+    /// `logs[i]` bounds the walk's share of `refs[i]` (M10b): how many
+    /// cells the log held in total, and how many cells/areas of those
+    /// the walk itself noted before any §5.6e injection ran.
+    logs: std.ArrayListUnmanaged(WalkBounds) = .empty,
     keys: std.ArrayListUnmanaged(Key) = .empty,
     /// `Input.cells` indices, sorted by coordinate. A linear scan per
     /// lookup would make the build quadratic in the cell count, which is
@@ -866,6 +914,8 @@ const Builder = struct {
     stats: Stats = .{},
 
     const TailOwner = struct { tail: env.CellRef, anchor: env.CellRef };
+
+    const WalkBounds = struct { cells: u32, walk_cells: u32, walk_areas: u32 };
 
     fn init(
         gpa: std.mem.Allocator,
@@ -887,6 +937,7 @@ const Builder = struct {
     fn deinit(self: *Builder) void {
         self.owners.deinit(self.gpa);
         self.refs.deinit(self.gpa);
+        self.logs.deinit(self.gpa);
         self.keys.deinit(self.gpa);
         self.by_coord.deinit(self.gpa);
         self.tails.deinit(self.gpa);
@@ -1062,6 +1113,13 @@ const Builder = struct {
             const relative_name = bo.owner.key == .name and name_rules.bodyIsRelative(ast);
             if (!relative_name) try cap.walk(ast.root);
 
+            // The gate's snapshot (M10b): everything in the log at this
+            // instant came from the walk of the text, and everything
+            // after it is injected runtime capture. `Graph.walkNoted`
+            // answers membership against exactly this boundary.
+            const walk_cells: u32 = @intCast(cap.deps.cells.items.len);
+            const walk_areas: u32 = @intCast(cap.deps.areas.items.len);
+
             // §5.6e's runtime capture, into the same log the walk just
             // filled. A read the walk already found dedupes here rather
             // than doubling an edge, which is why a rebuild whose
@@ -1077,6 +1135,11 @@ const Builder = struct {
             }
 
             self.refs.appendAssumeCapacity(try cap.take(self.a()));
+            try self.logs.append(self.gpa, .{
+                .cells = @intCast(cap.deps.cells.items.len),
+                .walk_cells = walk_cells,
+                .walk_areas = walk_areas,
+            });
         }
         return null;
     }
@@ -1198,9 +1261,20 @@ const Builder = struct {
 
         const idx = try Index.build(self.a(), keys);
 
-        // Owner bodies.
-        for (self.owners.items, self.refs.items) |bo, list| {
+        // Owner bodies. The walk logs ride along (M10b): `refs` already
+        // lives in the arena the graph keeps, so retention is the
+        // bounds and a pointer, not a copy.
+        assert(self.logs.items.len == self.owners.items.len);
+        const walk_logs = try self.a().alloc(?Graph.WalkLog, n);
+        @memset(walk_logs, null);
+        for (self.owners.items, self.refs.items, self.logs.items) |bo, list, rec| {
             const u = findIn(keys, bo.owner.key).?;
+            walk_logs[u] = .{
+                .refs = list,
+                .cells = rec.cells,
+                .walk_cells = rec.walk_cells,
+                .walk_areas = rec.walk_areas,
+            };
             for (list) |ref| {
                 const target: ?u32 = switch (ref) {
                     .cell => |c| findIn(keys, .{ .cell = c }) orelse
@@ -1281,6 +1355,7 @@ const Builder = struct {
             .cyclic = cyclic,
             .seeds = seeds,
             .index = idx,
+            .walk_logs = walk_logs,
             .stats = self.stats,
         };
         // The arena moved into the result; the builder must not free it.

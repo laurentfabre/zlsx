@@ -572,6 +572,10 @@ const Engine = struct {
     /// O(components²) shape as the two above.
     scope: std.AutoHashMapUnmanaged(u32, void) = .empty,
     scoped: bool = false,
+    /// The graph the currently-executing pass runs over — set for the
+    /// span of `execute`, so `noteReads` can ask `walkNoted` without
+    /// threading the graph through every evaluation frame (M10b).
+    run_graph: ?*const graph.Graph = null,
 
     fn init(gpa: std.mem.Allocator, host: Host, opts: Options) Engine {
         return .{
@@ -691,7 +695,10 @@ const Engine = struct {
             .limit = .dynamic_passes,
         } };
 
-        var signatures = try self.signaturesOf(current.?);
+        // Lazy (M10b): only a real rebuild compares condensations, so a
+        // run whose gate never lets one happen never pays for the
+        // signatures either.
+        var signatures: ?[]const Signature = null;
         var rerun: ?[]const bool = null;
         var pass: u32 = 1;
         while (true) : (pass += 1) {
@@ -700,7 +707,10 @@ const Engine = struct {
             self.touched.clearRetainingCapacity();
             self.pass_edge_set.clearRetainingCapacity();
             self.touched_set.clearRetainingCapacity();
-            switch (try self.execute(current.?, rerun)) {
+            self.run_graph = &current.?;
+            const executed = try self.execute(current.?, rerun);
+            self.run_graph = null;
+            switch (executed) {
                 .refused => |r| return .{ .refused = r },
                 .ok => {},
             }
@@ -711,27 +721,49 @@ const Engine = struct {
                 // reason to refuse a schedule that completed.
                 return .{ .ok = try self.report(pass) };
             };
-            try self.foldPassEdges();
 
-            // The fixpoint test is on the **graph**, not on the edge set,
-            // and the difference is the whole of the common case. A read
-            // the static walk already found produces the same edge, so a
-            // workbook without a dynamic reference reports edges the
-            // graph already had — comparing edge sets would call that a
-            // change and cost a second pass for every ordinary workbook.
+            // The fixpoint test is on the **graph**, not on the edge set
+            // — §5.6e terminates when rebuilding with what was actually
+            // read yields the same condensation: then every dependency
+            // this run has is already in the order it ran under, and
+            // every cell downstream of a value that moved re-ran (that
+            // is what `changedComponents` propagates). A value can only
+            // still be stale if something it depends on is missing from
+            // the graph — and that is precisely the case where the
+            // graph changes.
             //
-            // Terminating on graph identity is also sound and not merely
-            // cheap: if rebuilding with what was actually read yields the
-            // same condensation, then every dependency this run has is
-            // already in the order it ran under, and every cell
-            // downstream of a value that moved re-ran (that is what
-            // `changedComponents` propagates). A value can only still be
-            // stale if something it depends on is missing from the graph
-            // — and that is precisely the case where the graph changes.
+            // The gate (M10b) decides the common case of that test
+            // WITHOUT building anything. `noteReads` records only reads
+            // the walk did not find — everything else would dedupe away
+            // inside a rebuild's injection (`captureAll`) and so cannot
+            // change any graph — and `graph.build` is deterministic in
+            // (input, resolver, injected edges). So when the fold names
+            // exactly the edges the current graph was built from, the
+            // rebuild is provably the identical graph, `sameCondensation`
+            // is provably true, and paying a full parse-and-link to
+            // learn so is the §9.1 profile's single largest cost. The
+            // named workload folds zero edges against zero injected;
+            // a stable dynamic reference folds the same edge set it ran
+            // under; both stop here.
+            const unchanged = blk: {
+                var folded = try self.foldedPassEdges();
+                errdefer folded.deinit(self.gpa);
+                const eq = try self.foldedEqualsInjected(folded.items);
+                self.dynamic.deinit(self.gpa);
+                self.dynamic = folded;
+                break :blk eq;
+            };
+            if (unchanged) return .{ .ok = try self.report(pass) };
+
             var next_opts = rb.options;
             next_opts.limits = self.opts.limits;
             next_opts.counters = self.counters();
             next_opts.dynamic_edges = self.dynamic.items;
+            // The signatures of the outgoing graph, taken only now
+            // (M10b): the gate above answers most runs, and a run it
+            // answers never needs them. After a real rebuild they are
+            // carried forward, so each graph is signed at most once.
+            if (signatures == null) signatures = try self.signaturesOf(current.?);
             // The pass is over and nothing below reads the old graph —
             // `signatures` copied its keys and the rebuild starts from
             // the input. Freeing it here is the point of the engine
@@ -758,7 +790,7 @@ const Engine = struct {
             }
 
             const next_signatures = try self.signaturesOf(current.?);
-            if (sameCondensation(signatures, next_signatures)) {
+            if (sameCondensation(signatures.?, next_signatures)) {
                 return .{ .ok = try self.report(pass) };
             }
             if (pass >= ceiling) {
@@ -768,15 +800,18 @@ const Engine = struct {
                 } };
             }
 
-            rerun = try self.changedComponents(current.?, next_signatures, signatures);
+            rerun = try self.changedComponents(current.?, next_signatures, signatures.?);
             signatures = next_signatures;
             try self.carryReports();
         }
     }
 
     /// Fold this pass's reads into the standing edge set, carrying
-    /// forward whatever an unrun owner last reported.
-    fn foldPassEdges(self: *Engine) Error!void {
+    /// forward whatever an unrun owner last reported. Returned rather
+    /// than installed (M10b): the gate compares the fold against what
+    /// `self.dynamic` still holds — the set the current graph was built
+    /// from — before the caller installs it.
+    fn foldedPassEdges(self: *Engine) Error!std.ArrayListUnmanaged(graph.DynamicRef) {
         var next: std.ArrayListUnmanaged(graph.DynamicRef) = .empty;
         errdefer next.deinit(self.gpa);
         try next.appendSlice(self.gpa, self.pass_edges.items);
@@ -789,8 +824,26 @@ const Engine = struct {
             // "reads nothing".
             if (!ran) try next.append(self.gpa, old);
         }
-        self.dynamic.deinit(self.gpa);
-        self.dynamic = next;
+        return next;
+    }
+
+    /// Whether the fold names exactly the edge set the current graph
+    /// was built from (M10b's gate). Set equality over two lists that
+    /// are both exact-deduped by construction — `noteEdge` dedupes the
+    /// pass's edges, the carry admits only owners the pass did not
+    /// touch, and the injected list is a previous fold — so equal
+    /// lengths plus one-sided membership decide it. The overwhelmingly
+    /// common shape, zero against zero, costs nothing at all.
+    fn foldedEqualsInjected(self: *Engine, folded: []const graph.DynamicRef) Error!bool {
+        const injected = self.dynamic.items;
+        if (folded.len != injected.len) return false;
+        if (folded.len == 0) return true;
+        var set: EdgeSet = .empty;
+        defer set.deinit(self.gpa);
+        try set.ensureTotalCapacity(self.gpa, @intCast(injected.len));
+        for (injected) |e| set.putAssumeCapacity(e, {});
+        for (folded) |e| if (!set.contains(e)) return false;
+        return true;
     }
 
     /// Whether two condensations are the same condensation.
@@ -1259,12 +1312,18 @@ const Engine = struct {
 
     /// §5.6e's runtime-edge capture.
     ///
-    /// Everything a body read is offered to the next build, not only what
-    /// looks dynamic: the builder's own dependency log dedupes, so a read
-    /// the static walk already found produces the same edge and the graph
-    /// comes back identical. Trying to *classify* a read as dynamic here
-    /// would mean this file deciding what the walk can see, which is
-    /// exactly the disagreement M5a1's differential test exists to catch.
+    /// Only reads the walk did NOT note are recorded (M10b). This is
+    /// not the engine *classifying* a read as dynamic — which would
+    /// mean this file deciding what the walk can see, exactly the
+    /// disagreement M5a1's differential test exists to catch — it is
+    /// the engine asking the walk's own record, through `walkNoted`,
+    /// the same membership a rebuild's injection would ask: an edge the
+    /// walk already noted dedupes away inside `captureAll` and can
+    /// never change any graph, so recording it buys nothing and costs
+    /// the fold its emptiness. The probe answers against the walk
+    /// prefix, never the injected tail, so a genuinely dynamic read
+    /// stays novel on every pass and is restated on every pass — the
+    /// carry contract `foldedPassEdges` depends on.
     fn noteReads(self: *Engine, cell: env.CellRef, reads: Reads) Error!void {
         const owner: graph.Key = .{ .cell = cell };
         const gop = try self.touched_set.getOrPut(self.gpa, owner);
@@ -1275,10 +1334,48 @@ const Engine = struct {
             try self.touched.append(self.gpa, owner);
         }
 
+        // Null only if the evaluated coordinate is somehow not a node
+        // of the running graph; recording everything is the fallback
+        // that preserves the pre-gate behavior exactly.
+        const probe: ?struct { g: *const graph.Graph, node: u32 } = blk: {
+            const g = self.run_graph orelse break :blk null;
+            const u = g.find(owner) orelse break :blk null;
+            break :blk .{ .g = g, .node = u };
+        };
+
         for (reads.cells) |c| {
+            if (probe) |p| {
+                // Dedupes in the injection: the walk noted this exact
+                // coordinate.
+                if (p.g.walkNoted(p.node, .{ .cell = c })) continue;
+                // Cannot survive the injection: `collectKeys` makes no
+                // key for a cell ref, so a coordinate that is not
+                // already a node (formula cell or spill tail — both
+                // derived from the Input alone, so absent from every
+                // rebuild too) resolves to no target and `link` draws
+                // no edge. Aggregates note the stored cells they visit
+                // (`readCell` under a cursor), which over a data column
+                // is exactly this shape, ~every window formula.
+                if (p.g.find(.{ .cell = c }) == null and
+                    p.g.find(.{ .spill_tail = c }) == null) continue;
+            }
             try self.noteEdge(.{ .owner = owner, .target = .{ .cell = c } });
         }
         for (reads.areas) |x| {
+            if (probe) |p| {
+                if (p.g.walkNoted(p.node, .{ .area = x })) continue;
+                // The walk's own normalization (`Capture.note`): a
+                // single-cell area IS a cell. The runtime spells the
+                // same read as a raw 1×1 area (`readRange` notes what
+                // it iterates), and asking it in the walk's vocabulary
+                // is what lets it dedupe. The ordering the read implies
+                // is already whatever the static build decided for that
+                // coordinate; the 1×1 range node an injection would
+                // mint carries no edge the run can feel — only the
+                // wasted pass its appearance forces.
+                if (x.isSingleCell() and
+                    p.g.walkNoted(p.node, .{ .cell = x.topLeft() })) continue;
+            }
             try self.noteEdge(.{ .owner = owner, .target = .{ .area = x } });
         }
     }
