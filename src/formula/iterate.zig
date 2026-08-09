@@ -660,7 +660,13 @@ const Engine = struct {
             self.scoped = false;
             return null;
         };
-        const planned = try graph.plan(g, self.gpa, self.a(), c.roots, self.counters(), .{
+        // The plan dies with this call: only its component ids survive,
+        // copied into `scope` below — planned into its own scratch
+        // rather than the engine arena, which held the dead plan for
+        // the drive's lifetime (§9.1 M10j).
+        var plan_scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer plan_scratch.deinit();
+        const planned = try graph.plan(g, self.gpa, plan_scratch.allocator(), c.roots, self.counters(), .{
             .iterating = c.iterating,
             .charge_evals = false,
         });

@@ -424,11 +424,20 @@ pub fn prepare(
     try driver.published_at.ensureTotalCapacity(gpa, @intCast(input.cells.len));
 
     var counters: engine.graph.WorkCounters = .{ .limits = opts.work_limits };
-    switch (try engine.graph.plan(g, gpa, a, roots, &counters, .{
-        .iterating = model.calc.iterate,
-    })) {
-        .ok => {},
-        .refused => |r| return censusRefusal(wb, run, opts, r.planeTwo(), null),
+    {
+        // Pre-flight only: the plan's refusal and its charges are what
+        // this call is for, and the plan itself is discarded — into its
+        // own scratch, not `a`, which would hold the dead plan through
+        // the whole drive (§9.1 M10j: 1.26 MB at the drive's peak
+        // instant).
+        var plan_scratch = std.heap.ArenaAllocator.init(gpa);
+        defer plan_scratch.deinit();
+        switch (try engine.graph.plan(g, gpa, plan_scratch.allocator(), roots, &counters, .{
+            .iterating = model.calc.iterate,
+        })) {
+            .ok => {},
+            .refused => |r| return censusRefusal(wb, run, opts, r.planeTwo(), null),
+        }
     }
 
     g_owned = false;
