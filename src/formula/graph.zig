@@ -1013,6 +1013,15 @@ const Builder = struct {
     // ─── phase 1: who owns a formula body ────────────────────────
 
     fn collectOwners(self: *Builder) Error!?Refusal {
+        // Exact, not laddered (§9.1 M10g): every input row appends
+        // exactly one owner — cells, then names, then producers — so
+        // the input's three lengths ARE the count, and the growth
+        // ladder churned 30.7 MB for this 10.2 MB list on the named
+        // workload, freed rungs the allocator kept as mapped pages.
+        try self.owners.ensureTotalCapacityPrecise(
+            self.gpa,
+            self.input.cells.len + self.input.names.len + self.input.producers.len,
+        );
         try self.by_coord.ensureTotalCapacity(self.gpa, self.input.cells.len);
         for (0..self.input.cells.len) |i| {
             self.by_coord.appendAssumeCapacity(@intCast(i));
@@ -1086,7 +1095,11 @@ const Builder = struct {
     // ─── phase 2: what each body mentions ────────────────────────
 
     fn captureAll(self: *Builder) Error!?Refusal {
-        try self.refs.ensureTotalCapacity(self.gpa, self.owners.items.len);
+        try self.refs.ensureTotalCapacityPrecise(self.gpa, self.owners.items.len);
+        // The log rides in lockstep with `refs` — one entry per owner,
+        // and `link` asserts the lengths agree — so it takes the same
+        // exact pre-size rather than walking its own growth ladder.
+        try self.logs.ensureTotalCapacityPrecise(self.gpa, self.owners.items.len);
 
         // The ASTs die here. Every `Ref` a capture produces is either a
         // coordinate or a slice borrowed from `Input`, so nothing in the
@@ -1192,8 +1205,6 @@ const Builder = struct {
     // ─── phase 3: the node set ───────────────────────────────────
 
     fn collectKeys(self: *Builder) Error!void {
-        for (self.owners.items) |bo| try self.keys.append(self.gpa, bo.owner.key);
-
         // Spill tails. A tail coordinate that itself holds a formula is
         // an obstruction (M7a's decision table); the cell node wins here
         // so the coordinate has exactly one node.
@@ -1210,7 +1221,6 @@ const Builder = struct {
                         .col = coords.Col.fromZeroBased(col) catch continue,
                     };
                     if (self.cellInput(tail) != null) continue;
-                    try self.keys.append(self.gpa, .{ .spill_tail = tail });
                     try self.tails.append(self.gpa, .{ .tail = tail, .anchor = c.cell });
                 }
             }
@@ -1235,13 +1245,23 @@ const Builder = struct {
         }
         self.tails.shrinkRetainingCapacity(w);
 
-        // Range and span nodes, plus the per-member ranges a span needs.
+        // Exact, not laddered (§9.1 M10g): every key appended below is
+        // counted first — one per owner, one per surviving tail, one
+        // per area reference, one per span plus its multi-cell members.
+        // The walk over `refs` mirrors the append walk's arithmetic, so
+        // this is a count, not a bound; the sort below collapses the
+        // duplicates either way, and the append ladder churned 15.3 MB
+        // for this 5.6 MB list on the named workload. Keys for the
+        // tails now append from the deduped list rather than inside the
+        // scan above — `dedupeKeys` collapsed the duplicates before, so
+        // the node set is the same set.
+        var expect: usize = self.owners.items.len + self.tails.items.len;
         for (self.refs.items) |list| {
             for (list) |ref| switch (ref) {
                 .cell, .name => {},
-                .area => |x| try self.keys.append(self.gpa, .{ .range = x }),
+                .area => expect += 1,
                 .span => |s| {
-                    try self.keys.append(self.gpa, .{ .span = s });
+                    expect += 1;
                     var sheet = s.first.toInt();
                     while (sheet <= s.last.toInt()) : (sheet += 1) {
                         const member: env.RangeRef = .{
@@ -1249,7 +1269,33 @@ const Builder = struct {
                             .range = s.range,
                         };
                         if (member.isSingleCell()) continue;
-                        try self.keys.append(self.gpa, .{ .range = member });
+                        expect += 1;
+                    }
+                },
+            };
+        }
+        try self.keys.ensureTotalCapacityPrecise(self.gpa, expect);
+
+        for (self.owners.items) |bo| self.keys.appendAssumeCapacity(bo.owner.key);
+        for (self.tails.items) |t| {
+            self.keys.appendAssumeCapacity(.{ .spill_tail = t.tail });
+        }
+
+        // Range and span nodes, plus the per-member ranges a span needs.
+        for (self.refs.items) |list| {
+            for (list) |ref| switch (ref) {
+                .cell, .name => {},
+                .area => |x| self.keys.appendAssumeCapacity(.{ .range = x }),
+                .span => |s| {
+                    self.keys.appendAssumeCapacity(.{ .span = s });
+                    var sheet = s.first.toInt();
+                    while (sheet <= s.last.toInt()) : (sheet += 1) {
+                        const member: env.RangeRef = .{
+                            .sheet = env.SheetIndex.fromInt(sheet),
+                            .range = s.range,
+                        };
+                        if (member.isSingleCell()) continue;
+                        self.keys.appendAssumeCapacity(.{ .range = member });
                     }
                 },
             };
@@ -2183,16 +2229,20 @@ fn condensationOrder(
     }
 
     // Condensation edges, deduped: `needs[c]` counts distinct components
-    // c depends on, `feeds[c]` lists the components that depend on c.
-    const feeds = try gpa.alloc(std.ArrayListUnmanaged(u32), count);
-    for (feeds) |*f| f.* = .empty;
-    defer {
-        for (feeds) |*f| f.deinit(gpa);
-        gpa.free(feeds);
-    }
+    // c depends on, `feeds` records each edge as a flat (d, c) pair.
+    // Flat, not one list per component (§9.1 M10g): a first-block per
+    // fed component put ~80 000 cache-line-floored buffers live at the
+    // named workload's peak instant — 10 MB held for ~400 KB of edge
+    // payload. One pair list walks one ladder, and the counting sort
+    // below carves the per-component views out of a single exact block.
     const needs = try gpa.alloc(u32, count);
     defer gpa.free(needs);
     @memset(needs, 0);
+    const feed_count = try gpa.alloc(u32, count);
+    defer gpa.free(feed_count);
+    @memset(feed_count, 0);
+    var pairs: std.ArrayListUnmanaged([2]u32) = .empty;
+    defer pairs.deinit(gpa);
 
     var seen: std.ArrayListUnmanaged(u32) = .empty;
     defer seen.deinit(gpa);
@@ -2212,9 +2262,25 @@ fn condensationOrder(
                 if (dup) continue;
                 try seen.append(gpa, d);
                 needs[c] += 1;
-                try feeds[d].append(gpa, @intCast(c));
+                feed_count[d] += 1;
+                try pairs.append(gpa, .{ d, @intCast(c) });
             }
         }
+    }
+
+    // feeds of d = feed_data[feed_off[d]..feed_off[d + 1]], in the same
+    // ascending-c order the per-component appends produced: the pair
+    // list is in c order and the fill below is stable.
+    const feed_off = try gpa.alloc(u32, count + 1);
+    defer gpa.free(feed_off);
+    feed_off[0] = 0;
+    for (0..count) |c| feed_off[c + 1] = feed_off[c] + feed_count[c];
+    const feed_data = try gpa.alloc(u32, pairs.items.len);
+    defer gpa.free(feed_data);
+    @memset(feed_count, 0);
+    for (pairs.items) |p| {
+        feed_data[feed_off[p[0]] + feed_count[p[0]]] = p[1];
+        feed_count[p[0]] += 1;
     }
 
     var heap: MinHeap = .{ .items = .empty, .keys = members };
@@ -2236,7 +2302,7 @@ fn condensationOrder(
         out[emitted] = dst;
         emitted += 1;
         off += src.len;
-        for (feeds[c].items) |d| {
+        for (feed_data[feed_off[c]..feed_off[c + 1]]) |d| {
             needs[d] -= 1;
             if (needs[d] == 0) try heap.push(gpa, d);
         }
