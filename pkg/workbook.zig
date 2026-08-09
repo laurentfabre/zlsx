@@ -1614,7 +1614,7 @@ pub const Workbook = struct {
         const a = arena.allocator();
 
         var bridge: GraphBridge = .{ .model = &model, .gpa = allocator };
-        const input = try bridge.buildInput(a);
+        const input = try bridge.buildInput(a, a);
 
         // §9's parse bounds govern the *stored* bodies too: a workbook
         // whose cells a caller's limits cannot parse is a refusal, not a
@@ -1670,7 +1670,7 @@ pub const Workbook = struct {
         // the answer §5.6c still requires. It is also the §9 charge
         // site — the engine re-plans once per §5.6e pass and does not
         // charge, because it charges per evaluation instead.
-        switch (try engine.graph.plan(g, a, roots, &counters, .{
+        switch (try engine.graph.plan(g, allocator, a, roots, &counters, .{
             .iterating = model.calc.iterate,
         })) {
             .ok => {},
@@ -8565,8 +8565,37 @@ pub const GraphBridge = struct {
     /// producer. Allocated into the caller's arena, borrowing the
     /// model's strings — which is why the model has to outlive the
     /// graph, and does.
-    pub fn buildInput(self: *GraphBridge, a: Allocator) Error!engine.graph.Input {
-        var cells: std.ArrayList(engine.graph.CellInput) = .empty;
+    /// `records` carries the per-formula-cell array — the run's largest
+    /// fixed-size record, sized exactly by a counting pass (M10e). The
+    /// recalc path hands it the gpa and frees it with the run; the
+    /// evaluate path hands it the same arena as everything else. Either
+    /// way the growth ladder the appends used to walk is gone — on an
+    /// arena, every doubling's dead buffer stayed resident for the
+    /// run's lifetime.
+    pub fn buildInput(
+        self: *GraphBridge,
+        a: Allocator,
+        records: Allocator,
+    ) Error!engine.graph.Input {
+        var cell_count: usize = 0;
+        for (self.model.sheets) |sheet| {
+            var cur = sheet.start();
+            var previous: ?WorkbookEnv.Cell = null;
+            while (sheet.at(cur)) |c| : (cur = sheet.next(cur)) {
+                const shadowed = if (previous) |p|
+                    p.row == c.row and p.col == c.col
+                else
+                    false;
+                previous = c;
+                if (shadowed) continue;
+                if (c.formula_text == null) continue;
+                cell_count += 1;
+            }
+        }
+
+        const cells = try records.alloc(engine.graph.CellInput, cell_count);
+        errdefer records.free(cells);
+        var at: usize = 0;
         for (self.model.sheets, 0..) |sheet, i| {
             const idx = engine.env.SheetIndex.fromInt(@intCast(i));
             // Sorted by (row, col, layer descending), so the first entry
@@ -8589,15 +8618,17 @@ pub const GraphBridge = struct {
                 // evaluation, where the diagnostic has a home.
                 const dynamic = c.array_ref == null and
                     ((self.model.dialectResolver().dialectOf(c.cm, c.vm) catch .legacy) == .dynamic_array);
-                try cells.append(a, .{
+                cells[at] = .{
                     .cell = .{ .sheet = idx, .row = c.row, .col = c.col },
                     .formula = text,
                     .cache = c.cache,
                     .array = c.array_ref,
                     .dynamic_anchor = dynamic,
-                });
+                };
+                at += 1;
             }
         }
+        assert(at == cell_count);
 
         const names = try a.alloc(engine.graph.NameInput, self.model.symbols.names.len);
         for (self.model.symbols.names, names) |src, *dst| {
@@ -8643,7 +8674,7 @@ pub const GraphBridge = struct {
 
         return .{
             .sheet_count = @intCast(self.model.sheets.len),
-            .cells = cells.items,
+            .cells = cells,
             .names = names,
             .producers = producers.items,
         };

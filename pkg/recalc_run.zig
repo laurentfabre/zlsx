@@ -336,8 +336,13 @@ pub fn prepare(
     defer arena.deinit();
     const a = arena.allocator();
 
+    // The cell records and the roots are the run's two big fixed-size
+    // records (M10e). They live on the gpa, exact-sized, for exactly
+    // `prepare`'s scope — on the run arena, each landed at the ladder's
+    // high water and bought the next half-again chunk.
     var bridge: workbook_mod.GraphBridge = .{ .model = &model, .gpa = gpa };
-    const input = try bridge.buildInput(a);
+    const input = try bridge.buildInput(a, gpa);
+    defer gpa.free(input.cells);
 
     // §5.7's no-formula rule. Decided on the model rather than on the
     // output bytes: "this workbook has nothing to calculate" is a
@@ -364,7 +369,8 @@ pub fn prepare(
     // the whole graph" is what keeps §5.6e's rebuild honest: a dynamic
     // reference discovered on pass two widens the closure these roots
     // derive, and a frozen component list could not.
-    const roots = try a.alloc(engine.graph.Key, input.cells.len);
+    const roots = try gpa.alloc(engine.graph.Key, input.cells.len);
+    defer gpa.free(roots);
     for (input.cells, roots) |c, *k| k.* = .{ .cell = c.cell };
 
     var rng: engine.rng.Rng = .init(run.rng_seed);
@@ -412,7 +418,7 @@ pub fn prepare(
     try driver.published_at.ensureTotalCapacity(gpa, @intCast(input.cells.len));
 
     var counters: engine.graph.WorkCounters = .{ .limits = opts.work_limits };
-    switch (try engine.graph.plan(g, a, roots, &counters, .{
+    switch (try engine.graph.plan(g, gpa, a, roots, &counters, .{
         .iterating = model.calc.iterate,
     })) {
         .ok => {},
