@@ -381,17 +381,45 @@ pub const StagedDeltas = struct {
 // ─── the projection ──────────────────────────────────────────────
 
 /// A staged publication joined to the `<c>` it lands on.
+///
+/// §9.1 (M10d): this is the projection's per-cell record, and its size
+/// is the Target array's footprint at the plan instant, so it carries
+/// what the two plan passes READ and nothing they don't. The 92-byte
+/// span block became a `u32` into the borrowed `slots` (the spans were
+/// a verbatim copy of that slot's). The formula became the two facts
+/// the gates ask — existence and `t="array"` — plus the one slice the
+/// CSE gate parses; text, `si` and the raw attribute region were
+/// carried and never read, and the patcher still proves it by never
+/// addressing a byte inside `spans.f`. The rare authored write moved
+/// to a side list on the sheet. The prior input collapsed to the one
+/// predicate the tail gate asks of it.
 pub const Target = struct {
-    publication: Publication,
-    /// Where the `<c>` and its interpreted children sit in the part.
-    spans: decode.CellSpans,
-    /// The `<f>` as M4b1 decoded it, raw attribute region included, or
-    /// null when the cell has none. Carried unchanged — and the patcher
-    /// proves it by never addressing a byte inside `spans.f`.
-    formula: ?decode.Formula,
-    /// What the cell contributed to the merged view before the patch, so
-    /// a round-trip has both of its ends in one place.
-    was: decode.InputCell,
+    row: coords.Row,
+    col: coords.Col,
+    /// Index into `ResolvedSheet.slots` of the `<c>` this publication
+    /// landed on — where the `<c>` and its interpreted children sit in
+    /// the part.
+    slot: u32,
+    result: value.PublishedScalar,
+    shape: value.Shape,
+    role: Role,
+    dialect: value.Dialect,
+    /// Whether the cell carries an `<f>` at all, and whether that `<f>`
+    /// is `t="array"` (`calc.Kind.fromAttr`, folded at projection time
+    /// — the gates only ever ask these two questions of the kind).
+    has_formula: bool,
+    formula_is_array: bool,
+    /// Whether the cell's prior merged-view contribution was a known
+    /// `#SPILL!` — the one fact `wasBlocked` reads out of what the cell
+    /// contributed before the patch.
+    was_spill_blocked: bool,
+    /// The `<f ref>` as decoded, or null — parsed by the CSE and anchor
+    /// gates, never written.
+    fref: ?[]const u8,
+    /// Index into `ResolvedSheet.authored`, or `no_authored` — §5.8c's
+    /// formula write, hoisted off the record because nearly every
+    /// publication only caches a value.
+    authored: u32 = no_authored,
     /// `c@cm` / `c@vm` as scanned (0 = absent). Carried for the gate: a
     /// `vm` names value metadata this engine has never been shown (M4a
     /// decision 6), and writing under one refuses HERE too, because a
@@ -399,6 +427,18 @@ pub const Target = struct {
     /// resolver.
     cm: u32 = 0,
     vm: u32 = 0,
+
+    pub const no_authored = std.math.maxInt(u32);
+
+    /// The spans of the `<c>` this target landed on.
+    pub fn spansOf(t: Target, sheet: *const ResolvedSheet) decode.CellSpans {
+        return sheet.slots[t.slot].spans;
+    }
+
+    /// The authored write riding this publication, or null.
+    pub fn authoredOf(t: Target, sheet: *const ResolvedSheet) ?FormulaWrite {
+        return if (t.authored == no_authored) null else sheet.authored[t.authored];
+    }
 };
 
 /// **Lifetime**: a projection borrows both of its inputs. `source` is
@@ -429,6 +469,10 @@ pub const ResolvedSheet = struct {
     /// The scan's `<dimension>` coordinates, or null when the part has
     /// none.
     dimension: ?decode.DimensionSpans,
+    /// §5.8c formula writes, one per target that authors one, indexed by
+    /// `Target.authored`. Arena-owned like the targets; empty on every
+    /// value-only run.
+    authored: []const FormulaWrite,
 
     pub fn deinit(self: *ResolvedSheet) void {
         self.arena.deinit();
@@ -445,11 +489,11 @@ pub const ResolvedSheet = struct {
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
             const t = self.targets[mid];
-            if (t.publication.row.oneBased() < row.oneBased() or
-                (t.publication.row == row and t.publication.col.zeroBased() < col.zeroBased()))
+            if (t.row.oneBased() < row.oneBased() or
+                (t.row == row and t.col.zeroBased() < col.zeroBased()))
             {
                 lo = mid + 1;
-            } else if (t.publication.row == row and t.publication.col == col) {
+            } else if (t.row == row and t.col == col) {
                 return t;
             } else {
                 hi = mid;
@@ -511,35 +555,60 @@ pub fn project(
         }
     }
 
-    // Both splits are knowable before either list exists, so each
+    // All three splits are knowable before any list exists, so each
     // backing is one exact-size allocation: a list that grows inside an
     // arena strands every buffer it abandons until the arena dies.
     var targets_n: usize = 0;
+    var authored_n: usize = 0;
     for (pubs) |p| {
-        if (slotAt(scan.slots, p.row, p.col) != null) targets_n += 1;
+        if (slotIndexAt(scan.slots, p.row, p.col) != null) {
+            targets_n += 1;
+            if (p.authored != null) authored_n += 1;
+        }
     }
     var targets: std.ArrayListUnmanaged(Target) = .empty;
     try targets.ensureTotalCapacityPrecise(a, targets_n);
     var appends: std.ArrayListUnmanaged(Publication) = .empty;
     try appends.ensureTotalCapacityPrecise(a, pubs.len - targets_n);
+    var authored: std.ArrayListUnmanaged(FormulaWrite) = .empty;
+    try authored.ensureTotalCapacityPrecise(a, authored_n);
     for (order) |idx| {
         const p = pubs[idx];
-        const slot = slotAt(scan.slots, p.row, p.col) orelse {
+        const slot_idx = slotIndexAt(scan.slots, p.row, p.col) orelse {
             try appends.append(a, p);
             continue;
         };
+        const slot = scan.slots[slot_idx];
         if (slot.spans.v != null and slot.spans.is != null) {
             return .{ .refused = refuseAt(.ambiguous_cell_content, p.row, p.col) };
         }
         const modeled = cellAt(scan.cells, p.row, p.col);
+        const authored_idx: u32 = if (p.authored) |w| blk: {
+            try authored.append(a, w);
+            break :blk @intCast(authored.items.len - 1);
+        } else Target.no_authored;
         try targets.append(a, .{
-            .publication = p,
-            .spans = slot.spans,
-            .formula = if (modeled) |m| m.formula else null,
+            .row = p.row,
+            .col = p.col,
+            .slot = slot_idx,
+            .result = p.result,
+            .shape = p.shape,
+            .role = p.role,
+            .dialect = p.dialect,
+            .has_formula = modeled != null and modeled.?.formula != null,
+            .formula_is_array = if (modeled) |m|
+                (if (m.formula) |f| calc.Kind.fromAttr(f.kind) == calc.Kind.array else false)
+            else
+                false,
             // A slot with no modeled cell is the empty styled cell the
-            // merged view drops, and blank is exactly what it
-            // contributed.
-            .was = if (modeled) |m| m.input else .blank,
+            // merged view drops, and blank — never a spill block — is
+            // exactly what it contributed.
+            .was_spill_blocked = if (modeled) |m|
+                m.input == .err and m.input.err == .known and m.input.err.known == .spill
+            else
+                false,
+            .fref = if (modeled) |m| (if (m.formula) |f| f.ref else null) else null,
+            .authored = authored_idx,
             .cm = if (modeled) |m| m.cm else 0,
             .vm = if (modeled) |m| m.vm else 0,
         });
@@ -553,6 +622,7 @@ pub fn project(
     // keeps that from being load-bearing.
     const targets_out = try targets.toOwnedSlice(a);
     const appends_out = try appends.toOwnedSlice(a);
+    const authored_out = try authored.toOwnedSlice(a);
 
     _ = try staged.consume();
     keep = true;
@@ -564,6 +634,7 @@ pub fn project(
         .slots = scan.slots,
         .rows = scan.rows,
         .dimension = scan.dimension,
+        .authored = authored_out,
     } };
 }
 
@@ -577,6 +648,13 @@ fn lessThanPublicationAt(pubs: []const Publication, x: u32, y: u32) bool {
 }
 
 fn slotAt(slots: []const decode.CellSlot, row: coords.Row, col: coords.Col) ?decode.CellSlot {
+    return if (slotIndexAt(slots, row, col)) |i| slots[i] else null;
+}
+
+/// The slot's index rather than a copy — what `Target.slot` records
+/// (§9.1 M10d: the 92-byte span block each target carried was a
+/// verbatim copy of its slot's).
+fn slotIndexAt(slots: []const decode.CellSlot, row: coords.Row, col: coords.Col) ?u32 {
     var lo: usize = 0;
     var hi: usize = slots.len;
     while (lo < hi) {
@@ -587,7 +665,7 @@ fn slotAt(slots: []const decode.CellSlot, row: coords.Row, col: coords.Col) ?dec
         {
             lo = mid + 1;
         } else if (s.row == row and s.col == col) {
-            return s;
+            return @intCast(mid);
         } else {
             hi = mid;
         }
@@ -986,19 +1064,19 @@ fn planWithTable(
     const transitions = try a.alloc(Transition, self.targets.len);
     for (self.targets, transitions) |t, *tr| {
         if (gateOf(self, t, table)) |g| {
-            return .{ .refused = refuseGate(g, t.publication.row, t.publication.col) };
+            return .{ .refused = refuseGate(g, t.row, t.col) };
         }
-        tr.* = transitionFor(a, t.publication.result) catch |err| switch (err) {
+        tr.* = transitionFor(a, t.result) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.UnwritableErrorSpelling => return .{ .refused = refuseAt(
                 .unwritable_error_spelling,
-                t.publication.row,
-                t.publication.col,
+                t.row,
+                t.col,
             ) },
             error.NonFiniteNumber => return .{ .refused = refuseAt(
                 .non_finite_number,
-                t.publication.row,
-                t.publication.col,
+                t.row,
+                t.col,
             ) },
         };
     }
@@ -1012,7 +1090,7 @@ fn planWithTable(
     var created: ?CellSite = null;
     for (self.targets) |t| {
         if (try planAnchorExtras(a, self, t, table, &extra)) |g| {
-            return .{ .refused = refuseGate(g, t.publication.row, t.publication.col) };
+            return .{ .refused = refuseGate(g, t.row, t.col) };
         }
     }
     for (self.appends) |p| {
@@ -1045,7 +1123,7 @@ fn planWithTable(
     // Pass two: the edits.
     var edits: std.ArrayListUnmanaged(Edit) = .empty;
     for (self.targets, transitions) |t, tr| {
-        try appendEdits(a, self.source, t, tr, &edits);
+        try appendEdits(a, self, t, tr, &edits);
     }
     try edits.appendSlice(a, extra.items);
     const items = try edits.toOwnedSlice(a);
@@ -1094,22 +1172,20 @@ fn gateOf(self: *const ResolvedSheet, t: Target, table: []const SpillTransition)
     // gate and to nothing after it — every shape the arms below judge
     // is about a formula the part already HAS, and an authored target
     // was just proven not to have one.
-    if (t.publication.authored != null) {
+    if (t.authored != Target.no_authored) {
         return authorGate(self, t, table);
     }
 
-    if (t.formula) |f| {
-        if (calc.Kind.fromAttr(f.kind) == calc.Kind.array) {
-            return switch (t.publication.dialect) {
-                .legacy => cseGate(self, t, f),
-                .dynamic_array => daGate(t, table),
-            };
-        }
+    if (t.formula_is_array) {
+        return switch (t.dialect) {
+            .legacy => cseGate(self, t),
+            .dynamic_array => daGate(t, table),
+        };
     }
-    if (t.publication.role == .spill_tail) {
-        return tailGateFor(self, t.publication.role.spill_tail, table);
+    if (t.role == .spill_tail) {
+        return tailGateFor(self, t.role.spill_tail, table);
     }
-    if (!t.publication.shape.isScalar()) return .{ .reason = .non_scalar_result };
+    if (!t.shape.isScalar()) return .{ .reason = .non_scalar_result };
     return null;
 }
 
@@ -1118,8 +1194,8 @@ fn gateOf(self: *const ResolvedSheet, t: Target, table: []const SpillTransition)
 /// append — which the append gate then names precisely). Persisting the
 /// anchor while a slave keeps its old cache would have the range
 /// contradict itself.
-fn cseGate(self: *const ResolvedSheet, t: Target, f: decode.Formula) ?GateRefusal {
-    const raw = f.ref orelse return .{ .reason = .cse_ref_unparseable };
+fn cseGate(self: *const ResolvedSheet, t: Target) ?GateRefusal {
+    const raw = t.fref orelse return .{ .reason = .cse_ref_unparseable };
     const range = (coords.parseRange(raw, .{
         .dollar = .accept,
         .case = .insensitive,
@@ -1127,13 +1203,13 @@ fn cseGate(self: *const ResolvedSheet, t: Target, f: decode.Formula) ?GateRefusa
 
     // The anchor is the range's top-left, or the file is telling two
     // stories about where the array starts.
-    if (range.first.row.oneBased() != t.publication.row.oneBased() or
-        range.first.col.zeroBased() != t.publication.col.zeroBased())
+    if (range.first.row.oneBased() != t.row.oneBased() or
+        range.first.col.zeroBased() != t.col.zeroBased())
     {
         return .{ .reason = .cse_range_mismatch };
     }
 
-    if (!declaredRangeCovered(self, range, t.publication.row, t.publication.col)) {
+    if (!declaredRangeCovered(self, range, t.row, t.col)) {
         return .{ .reason = .cse_range_mismatch };
     }
     return null;
@@ -1168,13 +1244,13 @@ fn declaredRangeCovered(
 /// never be unlocked: the shapes no approved mutation addresses first,
 /// then the text's own encodability, then the dialect's transition row.
 fn authorGate(self: *const ResolvedSheet, t: Target, table: []const SpillTransition) ?GateRefusal {
-    const w = t.publication.authored.?;
+    const w = t.authoredOf(self).?;
 
     // The modeled formula and the raw spans agree by scan construction;
     // the spans are what the EDITS answer to, and a formula-shaped run
     // of bytes the model did not carry is still one no insertion may
     // sit beside.
-    if (t.spans.f != null or t.formula != null) {
+    if (t.spansOf(self).f != null or t.has_formula) {
         return .{ .reason = .formula_overwrite_unsupported };
     }
     if (t.cm != 0) return .{ .reason = .authored_under_cell_metadata };
@@ -1182,16 +1258,16 @@ fn authorGate(self: *const ResolvedSheet, t: Target, table: []const SpillTransit
 
     switch (w.dialect) {
         .scalar => {
-            if (t.publication.role != .plain) {
+            if (t.role != .plain) {
                 return .{ .reason = .authored_role_contradiction };
             }
-            if (!t.publication.shape.isScalar()) {
+            if (!t.shape.isScalar()) {
                 return .{ .reason = .non_scalar_result };
             }
             return null;
         },
         .dynamic_array => {
-            const outcome = switch (t.publication.role) {
+            const outcome = switch (t.role) {
                 .da_anchor => |o| o,
                 // M7b1 decision 7's statement, at authoring: the
                 // patcher will not reconstruct a placement the model
@@ -1212,7 +1288,7 @@ fn authorGate(self: *const ResolvedSheet, t: Target, table: []const SpillTransit
             return .{ .reason = .transition_unproven, .transition = id };
         },
         .cse => |raw| {
-            if (t.publication.role != .plain) {
+            if (t.role != .plain) {
                 return .{ .reason = .authored_role_contradiction };
             }
             const range = (coords.parseRange(raw, .{
@@ -1222,12 +1298,12 @@ fn authorGate(self: *const ResolvedSheet, t: Target, table: []const SpillTransit
             // The anchor is the declared top-left, and every declared
             // cell is staged this run — M7b1 decision 3's coverage
             // gate, applied before the range exists rather than after.
-            if (range.first.row.oneBased() != t.publication.row.oneBased() or
-                range.first.col.zeroBased() != t.publication.col.zeroBased())
+            if (range.first.row.oneBased() != t.row.oneBased() or
+                range.first.col.zeroBased() != t.col.zeroBased())
             {
                 return .{ .reason = .cse_range_mismatch };
             }
-            if (!declaredRangeCovered(self, range, t.publication.row, t.publication.col)) {
+            if (!declaredRangeCovered(self, range, t.row, t.col)) {
                 return .{ .reason = .cse_range_mismatch };
             }
             const row = rowById(table, .cse_author) orelse
@@ -1258,7 +1334,7 @@ fn authoredTextRefusal(text: []const u8) ?GateRefusal {
 /// outcome the model placed. The placement itself is never re-decided
 /// here — an anchor staged without it refuses generically.
 fn daGate(t: Target, table: []const SpillTransition) ?GateRefusal {
-    const outcome = switch (t.publication.role) {
+    const outcome = switch (t.role) {
         .da_anchor => |o| o,
         else => return .{ .reason = .dynamic_array_anchor },
     };
@@ -1283,14 +1359,14 @@ fn tailGateFor(
 ) ?GateRefusal {
     const anchor = self.targetAt(owner.row, owner.col) orelse
         return .{ .reason = .tail_without_anchor };
-    if (anchor.publication.role != .da_anchor) {
+    if (anchor.role != .da_anchor) {
         return .{ .reason = .tail_without_anchor };
     }
     return daGate(anchor, table);
 }
 
 fn wasBlocked(t: Target) bool {
-    return t.was == .err and t.was.err == .known and t.was.err.known == .spill;
+    return t.was_spill_blocked;
 }
 
 fn appendAt(self: *const ResolvedSheet, row: coords.Row, col: coords.Col) ?Publication {
@@ -1325,10 +1401,9 @@ fn planAnchorExtras(
     table: []const SpillTransition,
     out: *std.ArrayListUnmanaged(Edit),
 ) error{OutOfMemory}!?GateRefusal {
-    const f = t.formula orelse return null;
-    if (calc.Kind.fromAttr(f.kind) != calc.Kind.array) return null;
-    if (t.publication.dialect != .dynamic_array) return null;
-    const outcome = switch (t.publication.role) {
+    if (!t.formula_is_array) return null;
+    if (t.dialect != .dynamic_array) return null;
+    const outcome = switch (t.role) {
         .da_anchor => |o| o,
         else => return null,
     };
@@ -1339,10 +1414,10 @@ fn planAnchorExtras(
     const row = rowById(table, id) orelse return null;
     if (row.reference == null) return null;
 
-    const anchor_row = t.publication.row;
-    const anchor_col = t.publication.col;
-    const raw = f.ref orelse return .{ .reason = .anchor_ref_unusable };
-    const ref_span = t.spans.f_ref orelse return .{ .reason = .anchor_ref_unusable };
+    const anchor_row = t.row;
+    const anchor_col = t.col;
+    const raw = t.fref orelse return .{ .reason = .anchor_ref_unusable };
+    const ref_span = t.spansOf(self).f_ref orelse return .{ .reason = .anchor_ref_unusable };
     const old_range = (coords.parseRange(raw, .{
         .dollar = .accept,
         .case = .insensitive,
@@ -1574,15 +1649,16 @@ fn authoredFElement(a: Allocator, w: FormulaWrite) error{OutOfMemory}![]const u8
 
 fn appendEdits(
     a: Allocator,
-    source: []const u8,
+    self: *const ResolvedSheet,
     t: Target,
     tr: Transition,
     out: *std.ArrayListUnmanaged(Edit),
 ) error{OutOfMemory}!void {
-    const spans = t.spans;
+    const source = self.source;
+    const spans = t.spansOf(self);
     const site: CellSite = .{
-        .row = t.publication.row.oneBased(),
-        .col = t.publication.col.zeroBased(),
+        .row = t.row.oneBased(),
+        .col = t.col.zeroBased(),
     };
 
     // §5.8c (M7c): the authored `<f>`, emitted BEFORE the value edits.
@@ -1592,7 +1668,7 @@ fn appendEdits(
     // sort (M7b1 decision 14) keeps `<f>` first — `CT_Cell`'s order.
     // The self-closing shape instead carries its `<f>` inside the
     // reopen replacement below.
-    const authored_f: ?[]const u8 = if (t.publication.authored) |w|
+    const authored_f: ?[]const u8 = if (t.authoredOf(self)) |w|
         try authoredFElement(a, w)
     else
         null;
@@ -2244,10 +2320,12 @@ test "transition: \"\" is t=\"str\" with an empty `<v></v>`" {
 }
 
 test "projection: the raw `<f>` and its attribute region are carried, not copied" {
-    // §5.7.3 asks step 3 to carry the formula. It is carried by
-    // *reference* into the scan — attribute region included — so the
-    // patcher has the bytes to leave alone rather than a re-rendering of
-    // them it would have to prove equivalent.
+    // §5.7.3 asks step 3 to carry the formula. It is carried where it
+    // already sits — the slot's spans name the `<f>` region of the
+    // SOURCE, attribute region included — so the patcher has the bytes
+    // to leave alone rather than a re-rendering of them it would have
+    // to prove equivalent. What the record itself keeps (§9.1 M10d) is
+    // only what the gates read: existence, the array bit, the `ref`.
     const xml = sheetXml(
         \\<row r="1"><c r="A1" t="str"><f t="shared" si="0" ref="A1:A2" ca="1">_x0041_&amp;"x"</f><v>a</v></c></row>
     );
@@ -2257,19 +2335,18 @@ test "projection: the raw `<f>` and its attribute region are carried, not copied
     defer f.deinit();
 
     const t = f.resolved.targetAt(cellRef("A1").row, cellRef("A1").col).?;
-    try testing.expectEqualStrings(" t=\"shared\" si=\"0\" ref=\"A1:A2\" ca=\"1\"", t.formula.?.raw_attrs);
-    // A FORMULA carrier: entities decoded, ST_Xstring not applied.
-    try testing.expectEqualStrings("_x0041_&\"x\"", t.formula.?.text);
-    try testing.expectEqualStrings("a", t.was.text);
+    try testing.expect(t.has_formula);
+    try testing.expect(!t.formula_is_array);
+    try testing.expectEqualStrings("A1:A2", t.fref.?);
     try testing.expectEqualStrings(
         "<f t=\"shared\" si=\"0\" ref=\"A1:A2\" ca=\"1\">_x0041_&amp;\"x\"</f>",
-        t.spans.f.?.slice(xml),
+        t.spansOf(&f.resolved).f.?.slice(xml),
     );
 
     // And the patch leaves every one of those bytes where it found them.
     const out = try patchOk(testing.allocator, &f);
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, t.spans.f.?.slice(xml)) != null);
+    try testing.expect(std.mem.indexOf(u8, out, t.spansOf(&f.resolved).f.?.slice(xml)) != null);
 }
 
 test "transition: a slave keeps its `<f>` in any shape and gains a `<v>`" {
@@ -3735,16 +3812,16 @@ fn assertRoundTrip(a: Allocator, run: *const Run) !void {
     defer back.deinit();
 
     for (run.resolved.targets) |t| {
-        const cell = cellAt(back.cells, t.publication.row, t.publication.col) orelse
+        const cell = cellAt(back.cells, t.row, t.col) orelse
             return error.PublishedCellVanished;
         const got = value.publish(cell.input.scalar(), .excel);
-        if (!value.PublishedScalar.eql(t.publication.result, got)) {
+        if (!value.PublishedScalar.eql(t.result, got)) {
             std.debug.print(
                 "round-trip lost a value at r{d}c{d}: {any} -> {any}\nsource: {s}\npatched: {s}\n",
                 .{
-                    t.publication.row.oneBased(), t.publication.col.zeroBased(),
-                    t.publication.result,         got,
-                    run.gen.xml,                  run.patched.bytes,
+                    t.row.oneBased(), t.col.zeroBased(),
+                    t.result,         got,
+                    run.gen.xml,      run.patched.bytes,
                 },
             );
             return error.RoundTripLostAValue;
