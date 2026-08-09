@@ -1749,11 +1749,16 @@ pub fn scanSheet(
         return .{ .refused = .{ .reason = .malformed_xml, .offset = offsetOf(sc.i) } };
     }
 
+    // Each growing list is dropped the moment its exact-size copy
+    // exists: at the copy instant the biggest list would otherwise be
+    // resident twice, and §9.1 measures that instant.
     const items = try a.dupe(SheetCell, cells.items);
+    cells.clearAndFree(gpa);
     std.mem.sortUnstable(SheetCell, items, {}, lessThanCell);
     // Stable, so two `<c>` claiming one coordinate stay in document
     // order for the consumer that has to name the first of them.
     const slot_items = try a.dupe(CellSlot, slots.items);
+    slots.clearAndFree(gpa);
     std.mem.sort(CellSlot, slot_items, {}, lessThanSlot);
     // Two `<c>` at one coordinate: last-wins and first-wins are both
     // defensible readings, so neither is chosen silently.
@@ -1772,7 +1777,9 @@ pub fn scanSheet(
     // initializer that opens a fresh chunk would be known only to the
     // local copy — and leak when the returned one deinits.
     const merge_items = try a.dupe(coords.Range, merges.items);
+    merges.clearAndFree(gpa);
     const row_items = try a.dupe(RowSlot, rows.items);
+    rows.clearAndFree(gpa);
 
     keep = true;
     return .{ .ok = .{
