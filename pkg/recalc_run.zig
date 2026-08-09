@@ -449,7 +449,14 @@ pub fn prepare(
             driver.refused_at,
         ),
     };
-    defer iter_report.deinit(gpa);
+    // Everything the candidate's report takes from the drive is these
+    // three numbers, so they fold here and the per-component records
+    // are freed before staging begins — the 72-byte-per-cell list was
+    // resident through the staging peak for three scalars (§9.1 M10f).
+    const drive_passes = totalPasses(iter_report);
+    const drive_non_converged = iter_report.non_converged_cells;
+    const drive_dynamic_passes = iter_report.dynamic_passes;
+    iter_report.deinit(gpa);
 
     watch.poller().check() catch return Error.Cancelled;
 
@@ -486,9 +493,9 @@ pub fn prepare(
                 .refused => |r| return .{ .refused = r },
                 .ok => |*candidate| {
                     candidate.report.cells_written = s.cells_written;
-                    candidate.report.passes = totalPasses(iter_report);
-                    candidate.report.non_converged_cells = iter_report.non_converged_cells;
-                    candidate.report.dynamic_passes = iter_report.dynamic_passes;
+                    candidate.report.passes = drive_passes;
+                    candidate.report.non_converged_cells = drive_non_converged;
+                    candidate.report.dynamic_passes = drive_dynamic_passes;
                     return .{ .ok = candidate.* };
                 },
             }
@@ -1013,9 +1020,11 @@ fn stage(
             };
             defer scan.deinit();
 
-            // Consumed by value inside `project` (`Target` embeds each
-            // `Publication`), so the list is block-local: `gpa`-backed,
-            // pre-sized to the count above, freed before the splice.
+            // Borrowed by the projection (§9.1 M10f: each `Target`
+            // names its publication by index instead of embedding an
+            // 80-byte copy), so the list is block-local: `gpa`-backed,
+            // pre-sized to the count above, alive until the plan is
+            // built, freed before the splice.
             var pubs: std.ArrayListUnmanaged(engine.resolved.Publication) = .empty;
             defer pubs.deinit(gpa);
             try pubs.ensureTotalCapacityPrecise(gpa, expected);
@@ -1061,14 +1070,14 @@ fn stage(
                 // consume is a bookkeeping bug, not a workbook statement.
                 error.DeltasAlreadyConsumed => unreachable,
             };
-            // Consumed: `project` copied every publication by value, so
-            // the list's backing is dead on both variants — released
-            // here rather than at the block's end, because the plan
-            // below runs at the instant §9.1 measures. The scan's cell
-            // records go with it (§9.1 M10d): the projection copied the
-            // per-cell facts it gates on, so only the records' STRINGS
-            // (still arena-owned) and the slots need to outlive this.
-            pubs.clearAndFree(gpa);
+            // The publications stay resident: the projection's targets
+            // read them by index until the plan below has rendered
+            // every replacement into its own arena (§9.1 M10f) — the
+            // block's defer frees them before the splice. The scan's
+            // cell records still drop here (§9.1 M10d): the projection
+            // copied the per-cell facts it gates on, so only the
+            // records' STRINGS (still arena-owned) and the slots need
+            // to outlive this.
             scan.releaseCells();
 
             switch (projected) {
