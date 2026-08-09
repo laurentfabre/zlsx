@@ -1076,8 +1076,9 @@ fn stage(
             // block's defer frees them before the splice. The scan's
             // cell records still drop here (§9.1 M10d): the projection
             // copied the per-cell facts it gates on, so only the
-            // records' STRINGS (still arena-owned) and the slots need
-            // to outlive this.
+            // records' STRINGS (borrowed from `part.bytes` since M10h,
+            // arena-owned when decoding forced a copy) and the slots
+            // need to outlive this.
             scan.releaseCells();
 
             switch (projected) {
