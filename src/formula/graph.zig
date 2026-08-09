@@ -662,12 +662,13 @@ pub const Stats = struct {
 };
 
 pub const Graph = struct {
-    /// Owns the capture-phase data: the per-owner ref lists the walk
-    /// logs point into. The fixed-size link arrays live in `block`, not
-    /// here — an arena grows by half-again chunks, and at 90 000 nodes
-    /// the ladder's slack was measurably larger than several of the
-    /// arrays it held.
-    arena: std.heap.ArenaAllocator,
+    gpa: std.mem.Allocator,
+    /// The capture-phase data: every owner's captured refs, flat in
+    /// owner order — the walk logs' slices point into it. One exact
+    /// block (§9.1 M10j): the graph-lifetime arena this replaces held
+    /// its half-again chunk ladder through every later era, and the
+    /// ladder's slack was live at the build era's peak instant.
+    refs_data: []const Ref,
     /// One exact allocation carrying every fixed-size array `link`
     /// retains (keys, index, walk logs, dep headers, component, order,
     /// cyclic), carved by a `FixedBufferAllocator`: retention is the sum
@@ -702,9 +703,8 @@ pub const Graph = struct {
     index: Index,
     /// Per-node static walk log (M10b): for each owner node, the bounds
     /// of what the *walk* of its body noted — the pre-injection prefix
-    /// of the dependency log, over the `refs` slice the arena already
-    /// keeps for the graph's lifetime. Empty (`refs.len == 0`, zero
-    /// bounds) for nodes that own no body — an owner whose walk noted
+    /// of the dependency log, as a span of `refs_data`. Empty (zero
+    /// span, zero bounds) for nodes that own no body — an owner whose walk noted
     /// nothing and a non-owner answer every probe the same way, so the
     /// optional the empty log replaces bought nothing but its padding.
     /// `iterate` probes it per runtime read to decide whether a rebuild
@@ -716,35 +716,39 @@ pub const Graph = struct {
 
     const block_align = @alignOf(Key);
     const empty_walk_log: WalkLog = .{
-        .refs = &.{},
+        .off = 0,
+        .len = 0,
         .cells = 0,
         .walk_cells = 0,
         .walk_areas = 0,
     };
 
-    /// Bounds over an owner's captured refs, in `Capture.take`'s layout:
-    /// cells first, then areas, then names, then spans — so the walk's
-    /// cells are `refs[0..walk_cells]` and its areas
-    /// `refs[cells .. cells + walk_areas]`. The injected runtime
-    /// entries, when the graph is a rebuild's product, sit *after* each
-    /// prefix, which is exactly why the prefix and not the whole list is
-    /// the membership the gate needs (§5.6e's fold restates a runtime
-    /// read every pass; a probe that saw injected entries would stop
-    /// restating them and starve the fold).
+    /// Bounds over an owner's captured refs, in `Capture.takeInto`'s
+    /// layout: cells first, then areas, then names, then spans — the
+    /// owner's list is `refs_data[off..][0..len]`, its walk cells the
+    /// first `walk_cells` of it and its walk areas
+    /// `[cells .. cells + walk_areas]`. A span into `refs_data`, not a
+    /// slice (§9.1 M10j): five u32s where the slice header alone was
+    /// sixteen bytes of a record the graph keeps per node. The injected
+    /// runtime entries, when the graph is a rebuild's product, sit
+    /// *after* each prefix, which is exactly why the prefix and not the
+    /// whole list is the membership the gate needs (§5.6e's fold
+    /// restates a runtime read every pass; a probe that saw injected
+    /// entries would stop restating them and starve the fold).
     const WalkLog = struct {
-        refs: []const Ref,
+        off: u32,
+        len: u32,
         cells: u32,
         walk_cells: u32,
         walk_areas: u32,
     };
 
     pub fn deinit(self: *Graph) void {
-        const gpa = self.arena.child_allocator;
-        gpa.free(self.block);
-        gpa.free(self.edge_data);
-        gpa.free(self.seed_nodes);
-        gpa.free(self.seed_values);
-        self.arena.deinit();
+        self.gpa.free(self.block);
+        self.gpa.free(self.edge_data);
+        self.gpa.free(self.seed_nodes);
+        self.gpa.free(self.seed_values);
+        self.gpa.free(self.refs_data);
         self.* = undefined;
     }
 
@@ -795,11 +799,12 @@ pub const Graph = struct {
     /// is a different log entry, and the builder treats it as one.
     pub fn walkNoted(self: Graph, owner: u32, target: DynamicRef.Target) bool {
         const log = self.walk_logs[owner];
+        const refs = self.refs_data[log.off..][0..log.len];
         switch (target) {
-            .cell => |c| for (log.refs[0..log.walk_cells]) |r| {
+            .cell => |c| for (refs[0..log.walk_cells]) |r| {
                 if (r.cell.eql(c)) return true;
             },
-            .area => |x| for (log.refs[log.cells .. log.cells + log.walk_areas]) |r| {
+            .area => |x| for (refs[log.cells .. log.cells + log.walk_areas]) |r| {
                 if (r.area.eql(x)) return true;
             },
         }
@@ -935,15 +940,19 @@ const Ref = union(enum) {
 
 const Builder = struct {
     gpa: std.mem.Allocator,
-    arena: std.heap.ArenaAllocator,
     input: Input,
     resolver: Resolver,
     opts: Options,
     counters: *WorkCounters,
 
     owners: std.ArrayListUnmanaged(BodyOwner) = .empty,
-    /// `refs[i]` belongs to `owners[i]`.
-    refs: std.ArrayListUnmanaged([]const Ref) = .empty,
+    /// `refs[i]` belongs to `owners[i]` and spans `refs_data`.
+    refs: std.ArrayListUnmanaged(RefSpan) = .empty,
+    /// Every owner's captured refs, flat, in owner order. Grown on the
+    /// gpa — the doubling ladder hands its rungs back where the
+    /// graph-lifetime arena it replaces retained them (§9.1 M10j) —
+    /// and `link` takes it as the graph's one exact refs block.
+    refs_data: std.ArrayListUnmanaged(Ref) = .empty,
     /// `logs[i]` bounds the walk's share of `refs[i]` (M10b): how many
     /// cells the log held in total, and how many cells/areas of those
     /// the walk itself noted before any §5.6e injection ran.
@@ -960,6 +969,8 @@ const Builder = struct {
 
     const TailOwner = struct { tail: env.CellRef, anchor: env.CellRef };
 
+    const RefSpan = struct { off: u32, len: u32 };
+
     const WalkBounds = struct { cells: u32, walk_cells: u32, walk_areas: u32 };
 
     fn init(
@@ -971,7 +982,6 @@ const Builder = struct {
     ) Builder {
         return .{
             .gpa = gpa,
-            .arena = std.heap.ArenaAllocator.init(gpa),
             .input = input,
             .resolver = resolver,
             .opts = opts,
@@ -982,16 +992,12 @@ const Builder = struct {
     fn deinit(self: *Builder) void {
         self.owners.deinit(self.gpa);
         self.refs.deinit(self.gpa);
+        self.refs_data.deinit(self.gpa);
         self.logs.deinit(self.gpa);
         self.keys.deinit(self.gpa);
         self.by_coord.deinit(self.gpa);
         self.tails.deinit(self.gpa);
-        self.arena.deinit();
         self.* = undefined;
-    }
-
-    fn a(self: *Builder) std.mem.Allocator {
-        return self.arena.allocator();
     }
 
     fn run(self: *Builder) Error!BuildResult {
@@ -1192,7 +1198,12 @@ const Builder = struct {
                 }
             }
 
-            self.refs.appendAssumeCapacity(try cap.take(self.a()));
+            const off: u32 = @intCast(self.refs_data.items.len);
+            try cap.takeInto(self.gpa, &self.refs_data);
+            self.refs.appendAssumeCapacity(.{
+                .off = off,
+                .len = @intCast(self.refs_data.items.len - off),
+            });
             try self.logs.append(self.gpa, .{
                 .cells = @intCast(cap.deps.cells.items.len),
                 .walk_cells = walk_cells,
@@ -1256,24 +1267,22 @@ const Builder = struct {
         // scan above — `dedupeKeys` collapsed the duplicates before, so
         // the node set is the same set.
         var expect: usize = self.owners.items.len + self.tails.items.len;
-        for (self.refs.items) |list| {
-            for (list) |ref| switch (ref) {
-                .cell, .name => {},
-                .area => expect += 1,
-                .span => |s| {
+        for (self.refs_data.items) |ref| switch (ref) {
+            .cell, .name => {},
+            .area => expect += 1,
+            .span => |s| {
+                expect += 1;
+                var sheet = s.first.toInt();
+                while (sheet <= s.last.toInt()) : (sheet += 1) {
+                    const member: env.RangeRef = .{
+                        .sheet = env.SheetIndex.fromInt(sheet),
+                        .range = s.range,
+                    };
+                    if (member.isSingleCell()) continue;
                     expect += 1;
-                    var sheet = s.first.toInt();
-                    while (sheet <= s.last.toInt()) : (sheet += 1) {
-                        const member: env.RangeRef = .{
-                            .sheet = env.SheetIndex.fromInt(sheet),
-                            .range = s.range,
-                        };
-                        if (member.isSingleCell()) continue;
-                        expect += 1;
-                    }
-                },
-            };
-        }
+                }
+            },
+        };
         try self.keys.ensureTotalCapacityPrecise(self.gpa, expect);
 
         for (self.owners.items) |bo| self.keys.appendAssumeCapacity(bo.owner.key);
@@ -1282,24 +1291,22 @@ const Builder = struct {
         }
 
         // Range and span nodes, plus the per-member ranges a span needs.
-        for (self.refs.items) |list| {
-            for (list) |ref| switch (ref) {
-                .cell, .name => {},
-                .area => |x| self.keys.appendAssumeCapacity(.{ .range = x }),
-                .span => |s| {
-                    self.keys.appendAssumeCapacity(.{ .span = s });
-                    var sheet = s.first.toInt();
-                    while (sheet <= s.last.toInt()) : (sheet += 1) {
-                        const member: env.RangeRef = .{
-                            .sheet = env.SheetIndex.fromInt(sheet),
-                            .range = s.range,
-                        };
-                        if (member.isSingleCell()) continue;
-                        self.keys.appendAssumeCapacity(.{ .range = member });
-                    }
-                },
-            };
-        }
+        for (self.refs_data.items) |ref| switch (ref) {
+            .cell, .name => {},
+            .area => |x| self.keys.appendAssumeCapacity(.{ .range = x }),
+            .span => |s| {
+                self.keys.appendAssumeCapacity(.{ .span = s });
+                var sheet = s.first.toInt();
+                while (sheet <= s.last.toInt()) : (sheet += 1) {
+                    const member: env.RangeRef = .{
+                        .sheet = env.SheetIndex.fromInt(sheet),
+                        .range = s.range,
+                    };
+                    if (member.isSingleCell()) continue;
+                    self.keys.appendAssumeCapacity(.{ .range = member });
+                }
+            },
+        };
     }
 
     /// The `Input.cells` row at a coordinate, through the sorted index.
@@ -1364,16 +1371,38 @@ const Builder = struct {
         const fa = fixed.allocator();
 
         const keys = try fa.dupe(Key, self.keys.items);
+        // The dupe above was this list's last read (§9.1 M10j) — held
+        // to the builder's deinit, its exact block was live at the
+        // build era's peak instant.
+        self.keys.clearAndFree(self.gpa);
 
-        // Scratch, not arena: the adjacency *lists* are temporary and the
-        // arena outlives the build. An arena that kept every growth step
-        // of every list would hold on to them for the graph's lifetime.
-        var scratch = std.heap.ArenaAllocator.init(self.gpa);
-        defer scratch.deinit();
-        const sa = scratch.allocator();
+        // The graph's refs block, exact: capture's flat list hands its
+        // own bytes off (page-backed over the slab line, the shrink
+        // remaps in place — M10i's mechanism). Taken before the walk
+        // logs are written so the pointers below are final.
+        const refs_data = try self.refs_data.toOwnedSlice(self.gpa);
+        var refs_owned = true;
+        defer if (refs_owned) self.gpa.free(refs_data);
 
-        const sets = try sa.alloc(std.ArrayListUnmanaged(u32), n);
-        for (sets) |*x| x.* = .empty;
+        // Admitted edges as one flat (u, v) list plus a per-node degree
+        // count, carved into the exact CSR block below by a counting
+        // sort — condensationOrder's own shape (§9.1 M10g). The
+        // per-node adjacency lists this replaces grew inside a scratch
+        // arena that stranded every doubling rung and was still live,
+        // 15.4 MB for 398 KB of admitted edges on the named workload,
+        // at the build era's peak instant (§9.1 M10j). Every edge of a
+        // node is admitted in one contiguous run (an owner's refs in
+        // one walk-log iteration, a range/span/tail node's reach in one
+        // key iteration, and the two loops' node kinds are disjoint),
+        // so `seen`, cleared per run, answers exactly the membership
+        // the per-node list answered — same admits, same charges.
+        const degree = try self.gpa.alloc(u32, n);
+        defer self.gpa.free(degree);
+        @memset(degree, 0);
+        var pairs: std.ArrayListUnmanaged([2]u32) = .empty;
+        defer pairs.deinit(self.gpa);
+        var seen: std.ArrayListUnmanaged(u32) = .empty;
+        defer seen.deinit(self.gpa);
 
         const idx = try Index.build(fa, keys);
 
@@ -1383,14 +1412,17 @@ const Builder = struct {
         assert(self.logs.items.len == self.owners.items.len);
         const walk_logs = try fa.alloc(Graph.WalkLog, n);
         @memset(walk_logs, Graph.empty_walk_log);
-        for (self.owners.items, self.refs.items, self.logs.items) |bo, list, rec| {
+        for (self.owners.items, self.refs.items, self.logs.items) |bo, sp, rec| {
             const u = findIn(keys, bo.owner.key).?;
+            const list = refs_data[sp.off..][0..sp.len];
             walk_logs[u] = .{
-                .refs = list,
+                .off = sp.off,
+                .len = sp.len,
                 .cells = rec.cells,
                 .walk_cells = rec.walk_cells,
                 .walk_areas = rec.walk_areas,
             };
+            seen.clearRetainingCapacity();
             for (list) |ref| {
                 const target: ?u32 = switch (ref) {
                     .cell => |c| findIn(keys, .{ .cell = c }) orelse
@@ -1400,20 +1432,27 @@ const Builder = struct {
                     .span => |x| findIn(keys, .{ .span = x }),
                 };
                 if (target) |v| {
-                    if (try self.addEdge(sa, sets, u, v)) |r| return .{ .refused = r };
+                    if (try self.addEdge(&pairs, &seen, degree, u, v)) |r| return .{ .refused = r };
                 }
             }
         }
+        // The loop above was these lists' last read (§9.1 M10j): the
+        // walk logs hold the spans' slices now, and the owner map alone
+        // was 7.68 MB of the build era's peak instant.
+        self.owners.clearAndFree(self.gpa);
+        self.refs.clearAndFree(self.gpa);
+        self.logs.clearAndFree(self.gpa);
 
         // Range nodes reach their producers; span nodes reach their
         // members; spill tails reach their anchor.
         for (keys, 0..) |k, i| {
             const u: u32 = @intCast(i);
+            seen.clearRetainingCapacity();
             switch (k) {
                 .range => |area| {
                     var probe = idx.probe(area, &self.stats.index_probes);
                     while (probe.next()) |v| {
-                        if (try self.addEdge(sa, sets, u, v)) |r| return .{ .refused = r };
+                        if (try self.addEdge(&pairs, &seen, degree, u, v)) |r| return .{ .refused = r };
                     }
                 },
                 .span => |sp| {
@@ -1429,37 +1468,47 @@ const Builder = struct {
                         else
                             findIn(keys, .{ .range = member });
                         if (v) |w| {
-                            if (try self.addEdge(sa, sets, u, w)) |r| return .{ .refused = r };
+                            if (try self.addEdge(&pairs, &seen, degree, u, w)) |r| return .{ .refused = r };
                         }
                     }
                 },
                 .spill_tail => |tail| {
                     const anchor = self.anchorOf(tail).?;
                     const v = findIn(keys, .{ .cell = anchor }).?;
-                    if (try self.addEdge(sa, sets, u, v)) |r| return .{ .refused = r };
+                    if (try self.addEdge(&pairs, &seen, degree, u, v)) |r| return .{ .refused = r };
                 },
                 .cell, .name, .producer => {},
             }
         }
+        // `anchorOf` above was the tail list's last read (§9.1 M10j).
+        self.tails.clearAndFree(self.gpa);
 
         // Edge storage: one exact allocation now that the count is
-        // known, carved per node — where a per-node dupe left the edge
-        // bytes at the mercy of the arena's chunk ladder.
-        var edge_total: usize = 0;
-        for (sets) |set| edge_total += set.items.len;
-        const edge_data = try self.gpa.alloc(u32, edge_total);
+        // known, carved per node by a counting sort over the pair list.
+        // The fill is stable and a node's pairs are contiguous, so each
+        // node's run reproduces its admit order before the sort below
+        // imposes the ascending one the graph promises.
+        const edge_data = try self.gpa.alloc(u32, pairs.items.len);
         var edges_owned = true;
         defer if (edges_owned) self.gpa.free(edge_data);
         const deps = try fa.alloc([]const u32, n);
         var edge_off: usize = 0;
-        for (sets, 0..) |*set, i| {
-            std.mem.sortUnstable(u32, set.items, {}, std.sort.asc(u32));
-            const slot = edge_data[edge_off .. edge_off + set.items.len];
-            @memcpy(slot, set.items);
-            deps[i] = slot;
-            edge_off += set.items.len;
+        for (deps, degree) |*d, *cursor| {
+            const deg = cursor.*;
+            d.* = edge_data[edge_off .. edge_off + deg];
+            cursor.* = @intCast(edge_off);
+            edge_off += deg;
         }
-        assert(edge_off == edge_total);
+        assert(edge_off == pairs.items.len);
+        for (pairs.items) |p| {
+            edge_data[degree[p[0]]] = p[1];
+            degree[p[0]] += 1;
+        }
+        for (deps, degree) |d, end| {
+            std.mem.sortUnstable(u32, edge_data[end - d.len .. end], {}, std.sort.asc(u32));
+        }
+        pairs.clearAndFree(self.gpa);
+        seen.clearAndFree(self.gpa);
 
         const comp = try tarjan(self.gpa, fa, deps);
         const cyclic = try classifyComponents(self.gpa, fa, deps, comp.of, comp.count);
@@ -1476,7 +1525,8 @@ const Builder = struct {
         };
 
         const out: Graph = .{
-            .arena = self.arena,
+            .gpa = self.gpa,
+            .refs_data = refs_data,
             .block = block,
             .edge_data = edge_data,
             .seed_nodes = seeds.nodes,
@@ -1490,24 +1540,28 @@ const Builder = struct {
             .walk_logs = walk_logs,
             .stats = self.stats,
         };
-        // The arena, block and edge storage moved into the result; the
+        // The refs, block and edge storage moved into the result; the
         // builder must not free them.
         block_owned = false;
         edges_owned = false;
-        self.arena = std.heap.ArenaAllocator.init(self.gpa);
+        refs_owned = false;
         return .{ .ok = out };
     }
 
     /// §9's `dependency_edges` charge site. One charge per **admitted**
     /// edge — a duplicate is not new work and does not pay twice.
+    /// `seen` is the current node's admitted targets — the caller
+    /// clears it at each new `u`, which is the whole membership because
+    /// a node's edges arrive in one contiguous run.
     fn addEdge(
         self: *Builder,
-        sa: std.mem.Allocator,
-        sets: []std.ArrayListUnmanaged(u32),
+        pairs: *std.ArrayListUnmanaged([2]u32),
+        seen: *std.ArrayListUnmanaged(u32),
+        degree: []u32,
         u: u32,
         v: u32,
     ) Error!?Refusal {
-        for (sets[u].items) |existing| {
+        for (seen.items) |existing| {
             if (existing == v) return null;
         }
         self.counters.charge(.dependency_edges, 1) catch {
@@ -1516,7 +1570,9 @@ const Builder = struct {
         // Counted here as well as charged: the counter may be shared
         // across several builds, and `stats` is about *this* graph.
         self.stats.edges += 1;
-        try sets[u].append(sa, v);
+        try seen.append(self.gpa, v);
+        try pairs.append(self.gpa, .{ u, v });
+        degree[u] += 1;
         return null;
     }
 
@@ -1661,31 +1717,22 @@ const Capture = struct {
         self.* = undefined;
     }
 
-    fn take(self: *Capture, arena: std.mem.Allocator) Error![]const Ref {
-        var out = try arena.alloc(
-            Ref,
+    /// Appends this capture's refs to the builder's flat list, in the
+    /// layout `Graph.WalkLog` documents: cells, areas, names, spans.
+    fn takeInto(
+        self: *Capture,
+        gpa: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(Ref),
+    ) Error!void {
+        try out.ensureUnusedCapacity(
+            gpa,
             self.deps.cells.items.len + self.deps.areas.items.len +
                 self.names_seen.items.len + self.spans.items.len,
         );
-        var i: usize = 0;
-        for (self.deps.cells.items) |c| {
-            out[i] = .{ .cell = c };
-            i += 1;
-        }
-        for (self.deps.areas.items) |x| {
-            out[i] = .{ .area = x };
-            i += 1;
-        }
-        for (self.names_seen.items) |x| {
-            out[i] = .{ .name = x };
-            i += 1;
-        }
-        for (self.spans.items) |x| {
-            out[i] = .{ .span = x };
-            i += 1;
-        }
-        assert(i == out.len);
-        return out;
+        for (self.deps.cells.items) |c| out.appendAssumeCapacity(.{ .cell = c });
+        for (self.deps.areas.items) |x| out.appendAssumeCapacity(.{ .area = x });
+        for (self.names_seen.items) |x| out.appendAssumeCapacity(.{ .name = x });
+        for (self.spans.items) |x| out.appendAssumeCapacity(.{ .span = x });
     }
 
     /// A single-cell area is a cell, exactly as `Evaluator.refValue`
@@ -2579,9 +2626,10 @@ pub fn rootsOfAst(
     defer cap.deinit();
     try cap.walk(ast.root);
 
-    const refs = try cap.take(scratch.allocator());
-    const out = try arena.alloc(Key, refs.len);
-    for (refs, out) |r, *dst| {
+    var refs: std.ArrayListUnmanaged(Ref) = .empty;
+    try cap.takeInto(scratch.allocator(), &refs);
+    const out = try arena.alloc(Key, refs.items.len);
+    for (refs.items, out) |r, *dst| {
         dst.* = switch (r) {
             .cell => |c| .{ .cell = c },
             .area => |x| .{ .range = x },
