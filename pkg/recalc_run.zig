@@ -594,15 +594,90 @@ fn logicalViewGate(wb: *Workbook) Error!void {
 /// publication reaches the patcher.
 const Published = struct {
     cell: engine.env.CellRef,
-    value: engine.value.ScalarValue,
     shape: engine.value.Shape,
+    /// The value, flattened (§9.1 M10k): a `ScalarValue` field was 32
+    /// bytes — two nested union tags and their padding around a payload
+    /// that never exceeds a pointer and a length — and with it the
+    /// record was 56. One of these is resident per evaluable cell from
+    /// the drive's publish instant through staging's last sheet, on
+    /// both sides of the era boundary the peak table names.
+    word: u64 = 0,
+    extra: u32 = 0,
+    tag: Tag = .blank,
     /// False between `evaluate` (which is where the shape is knowable)
     /// and `publish` (which is where the value is). A cell the engine
     /// evaluated but chose not to publish must not be staged: the entry
     /// exists to hold its shape, and treating its placeholder as a
     /// result would cache a zero nothing computed.
     has_value: bool = false,
+
+    const Tag = enum(u8) { number, text, boolean, err_known, err_rich, blank };
+
+    fn setValue(self: *Published, v: engine.value.ScalarValue) void {
+        switch (v) {
+            .number => |x| {
+                self.tag = .number;
+                self.word = @bitCast(x);
+            },
+            .text => |t| {
+                assert(t.len <= std.math.maxInt(u32));
+                self.tag = .text;
+                self.word = @intFromPtr(t.ptr);
+                self.extra = @intCast(t.len);
+            },
+            .boolean => |b| {
+                self.tag = .boolean;
+                self.word = @intFromBool(b);
+            },
+            .err => |e| switch (e) {
+                .known => |k| {
+                    self.tag = .err_known;
+                    self.word = @intFromEnum(k);
+                },
+                .rich => |t| {
+                    assert(t.len <= std.math.maxInt(u32));
+                    self.tag = .err_rich;
+                    self.word = @intFromPtr(t.ptr);
+                    self.extra = @intCast(t.len);
+                },
+            },
+            .blank => self.tag = .blank,
+        }
+    }
+
+    fn value(self: Published) engine.value.ScalarValue {
+        return switch (self.tag) {
+            .number => .{ .number = @bitCast(self.word) },
+            .text => .{ .text = self.bytes() },
+            .boolean => .{ .boolean = self.word != 0 },
+            .err_known => .{ .err = .{ .known = @enumFromInt(self.word) } },
+            .err_rich => .{ .err = .{ .rich = self.bytes() } },
+            .blank => .blank,
+        };
+    }
+
+    /// A zero-length text keeps no pointer — `@ptrFromInt(0)` is not a
+    /// slice base — so the empty case answers with a constant.
+    fn bytes(self: Published) []const u8 {
+        if (self.extra == 0) return "";
+        const p: [*]const u8 = @ptrFromInt(self.word);
+        return p[0..self.extra];
+    }
 };
+
+/// A cell's identity in eight bytes: the format bounds a row to
+/// 1 048 576 (< 2²¹) and a column to 16 384 (< 2¹⁴), leaving 29 bits
+/// of sheet index — more parts than any archive that opens can hold.
+/// The asserts keep the packing honest against either bound moving.
+fn cellKey(cell: engine.env.CellRef) u64 {
+    const row: u64 = @intFromEnum(cell.row);
+    const col: u64 = @intFromEnum(cell.col);
+    const sheet: u64 = cell.sheet.toInt();
+    assert(row < (1 << 21));
+    assert(col < (1 << 14));
+    assert(sheet < (1 << 29));
+    return (sheet << 35) | (row << 14) | col;
+}
 
 /// The package's `iterate.Host` for a whole-workbook recalc.
 ///
@@ -642,8 +717,11 @@ const Driver = struct {
     /// projection is handed the result — but a shape note and a publish
     /// each looked their own cell up by scanning it, which made a run
     /// cost O(cells²) and was, after M5d4's other fixes, the largest
-    /// single cost left in the pipeline.
-    published_at: std.AutoHashMapUnmanaged(engine.env.CellRef, u32) = .empty,
+    /// single cost left in the pipeline. Keyed by `cellKey`'s packed
+    /// eight bytes rather than the twelve-byte `CellRef` (§9.1 M10k):
+    /// the map holds an entry per evaluable cell through staging, and
+    /// the format's own bounds leave the wider key restating padding.
+    published_at: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     /// The whole array a cell last published, when it published one —
     /// run-arena-backed, so it outlives the evaluation. §5.6h's slave
     /// synthesis (M7b1) is the one reader, because a legacy CSE's
@@ -675,7 +753,7 @@ const Driver = struct {
     fn track(self: *Driver, p: Published) error{OutOfMemory}!void {
         try self.published.append(self.gpa, p);
         errdefer _ = self.published.pop();
-        try self.published_at.put(self.gpa, p.cell, @intCast(self.published.items.len - 1));
+        try self.published_at.put(self.gpa, cellKey(p.cell), @intCast(self.published.items.len - 1));
     }
 
     fn host(self: *Driver) engine.iterate.Host {
@@ -758,13 +836,12 @@ const Driver = struct {
     }
 
     fn noteShape(self: *Driver, cell: engine.env.CellRef, shape: engine.value.Shape) !void {
-        if (self.published_at.get(cell)) |i| {
+        if (self.published_at.get(cellKey(cell))) |i| {
             self.published.items[i].shape = shape;
             return;
         }
         try self.track(.{
             .cell = cell,
-            .value = .blank,
             .shape = shape,
             .has_value = false,
         });
@@ -797,9 +874,9 @@ const Driver = struct {
         } else {
             _ = self.matrices.remove(cell);
         }
-        if (self.published_at.get(cell)) |i| {
+        if (self.published_at.get(cellKey(cell))) |i| {
             const p = &self.published.items[i];
-            p.value = scalar;
+            p.setValue(scalar);
             p.has_value = true;
             // `shape` is deliberately not touched: the entry `evaluate`
             // made carries the result's shape, and that — not the
@@ -807,12 +884,13 @@ const Driver = struct {
             // pre-M7 gate refuses on.
             return;
         }
-        try self.track(.{
+        var fresh: Published = .{
             .cell = cell,
-            .value = scalar,
             .shape = v.shape(),
             .has_value = true,
-        });
+        };
+        fresh.setValue(scalar);
+        try self.track(fresh);
     }
 
     /// One publish, undone. A refused run replays every one of these in
@@ -823,7 +901,7 @@ const Driver = struct {
         const self = of(ctx);
         self.model.retractResult(cell);
         _ = self.matrices.remove(cell);
-        const found = self.published_at.fetchRemove(cell) orelse return;
+        const found = self.published_at.fetchRemove(cellKey(cell)) orelse return;
         const at = found.value;
         _ = self.published.orderedRemove(at);
         // A rollback replays the journal backwards, so the entry being
@@ -832,7 +910,7 @@ const Driver = struct {
         // shape was noted but which never published leaves an entry
         // behind the one being removed.
         for (self.published.items[at..]) |p| {
-            if (self.published_at.getPtr(p.cell)) |slot| slot.* -= 1;
+            if (self.published_at.getPtr(cellKey(p.cell))) |slot| slot.* -= 1;
         }
     }
 };
@@ -959,7 +1037,7 @@ fn synthesizeCseSlaves(
                 .row = row,
                 .col = col,
             };
-            if (driver.published_at.get(target) != null) continue;
+            if (driver.published_at.get(cellKey(target)) != null) continue;
             const elem: engine.value.ScalarValue = if (driver.matrixOf(p.cell)) |m|
                 (if (m.rows == 1 and m.cols == 1)
                     // A 1×1 R broadcasts — the same rule as a scalar,
@@ -971,7 +1049,7 @@ fn synthesizeCseSlaves(
                 else
                     engine.value.ScalarValue.errorOf(.na))
             else
-                p.value;
+                p.value();
             try pubs.append(a, .{
                 .row = row,
                 .col = col,
@@ -1075,7 +1153,7 @@ fn stage(
                 try pubs.append(gpa, .{
                     .row = p.cell.row,
                     .col = p.cell.col,
-                    .result = engine.value.publish(p.value, run.fidelity),
+                    .result = engine.value.publish(p.value(), run.fidelity),
                     .origin = .computed,
                     .shape = p.shape,
                     .dialect = dialect,

@@ -581,10 +581,10 @@ const Engine = struct {
     /// §5.6f's closure for the CURRENT graph, as component ids. Rebuilt
     /// every pass, because a rebuild renumbers and a dynamic edge can
     /// widen what the closure covers.
-    /// A set, not a list: `execute` tests membership once per component
-    /// and never enumerates it, and a scan per test is the same
-    /// O(components²) shape as the two above.
-    scope: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// A bitset, not a map (§9.1 M10k): `execute` asks one membership
+    /// bit per component, and the u32 map answered that in 655 384
+    /// bytes at the drive's peak instant — an 11 KB fact.
+    scope: std.DynamicBitSetUnmanaged = .{},
     scoped: bool = false,
     /// The graph the currently-executing pass runs over — set for the
     /// span of `execute`, so `noteReads` can ask `walkNoted` without
@@ -655,7 +655,6 @@ const Engine = struct {
     /// evaluation, and a plan charged once per pass would count the same
     /// cell twice.
     fn planScope(self: *Engine, g: graph.Graph) Error!?Refusal {
-        self.scope.clearRetainingCapacity();
         const c = self.opts.closure orelse {
             self.scoped = false;
             return null;
@@ -681,12 +680,11 @@ const Engine = struct {
                 .limit = r.limit,
             },
             .ok => |p| {
-                // Exact, not laddered (§9.1 M10g): the plan's component
-                // list bounds the set precisely — a count, not a bound —
-                // and the growth ladder's freed rungs were pages the
-                // allocator kept against the run.
-                try self.scope.ensureTotalCapacity(self.gpa, @intCast(p.components.len));
-                for (p.components) |cid| self.scope.putAssumeCapacity(cid, {});
+                // Sized to the condensation, cleared, then filled — the
+                // rebuild case renumbers, so stale bits cannot carry.
+                try self.scope.resize(self.gpa, g.componentCount(), false);
+                self.scope.unsetAll();
+                for (p.components) |cid| self.scope.set(cid);
             },
         }
         self.scoped = true;
@@ -695,7 +693,7 @@ const Engine = struct {
 
     fn inScope(self: Engine, cid: u32) bool {
         if (!self.scoped) return true;
-        return self.scope.contains(cid);
+        return self.scope.isSet(cid);
     }
 
     // ─── §5.6e: the outer loop ───────────────────────────────────
@@ -709,6 +707,15 @@ const Engine = struct {
         // first pass.
         var current: ?graph.Graph = initial;
         defer if (current) |*o| o.deinit();
+
+        // One block, not a ladder (§9.1 M10k): a publish comes only
+        // from a node's evaluation, so the node count bounds an acyclic
+        // run's journal exactly — the append ladder held 1 493 928 B
+        // against 959 964 B of entries at the drive's peak instant, in
+        // eighteen growth chunks. Iteration republishes and may append
+        // past the reserve; that is growth from a full block, not from
+        // a ladder's first rung.
+        try self.journal.ensureTotalCapacityPrecise(self.gpa, initial.keys.len);
 
         const ceiling: u32 = @intCast(@min(
             self.opts.limits.max_dynamic_passes,
@@ -991,8 +998,9 @@ const Engine = struct {
     };
 
     fn signaturesOf(self: *Engine, g: graph.Graph) Error![]const Signature {
-        const out = try self.a().alloc(Signature, g.order.len);
-        for (g.order, 0..) |comp, i| {
+        const out = try self.a().alloc(Signature, g.componentCount());
+        for (out, 0..) |*slot, i| {
+            const comp = g.members(i);
             const members = try self.a().alloc(graph.Key, comp.len);
             for (comp, 0..) |n, k| members[k] = g.keys[n];
 
@@ -1000,19 +1008,19 @@ const Engine = struct {
             // strands every buffer it abandons until the engine dies,
             // once per component per pass (§9.1).
             var dep_count: usize = 0;
-            for (comp) |n| dep_count += g.deps[n].len;
+            for (comp) |n| dep_count += g.depsOf(n).len;
             const deps = try self.a().alloc(graph.Key, dep_count);
             var k: usize = 0;
             for (comp) |n| {
-                // `g.deps[n]` is ascending and deduped already (M5a1),
+                // `g.depsOf(n)` is ascending and deduped already (M5a1),
                 // and members arrive in ascending node order, so the
                 // concatenation is canonical without a sort here.
-                for (g.deps[n]) |d| {
+                for (g.depsOf(n)) |d| {
                     deps[k] = g.keys[d];
                     k += 1;
                 }
             }
-            out[i] = .{
+            slot.* = .{
                 .members = members,
                 .deps = deps,
                 .cyclic = g.cyclic[g.component[comp[0]]],
@@ -1031,7 +1039,7 @@ const Engine = struct {
         now: []const Signature,
         before: []const Signature,
     ) Error![]const bool {
-        const rerun = try self.a().alloc(bool, g.order.len);
+        const rerun = try self.a().alloc(bool, g.componentCount());
         @memset(rerun, false);
 
         // "Is this signature one of the ones from before?" — a
@@ -1054,14 +1062,15 @@ const Engine = struct {
         // positions than it does.
         var position: std.AutoHashMapUnmanaged(u32, usize) = .empty;
         defer position.deinit(self.a());
-        for (g.order, 0..) |comp, i| {
-            try position.put(self.a(), g.component[comp[0]], i);
+        for (0..g.componentCount()) |i| {
+            try position.put(self.a(), g.component[g.members(i)[0]], i);
         }
-        for (g.order, 0..) |comp, i| {
+        for (0..g.componentCount()) |i| {
             if (rerun[i]) continue;
+            const comp = g.members(i);
             const depends_on_changed = blk: {
                 for (comp) |n| {
-                    for (g.deps[n]) |d| {
+                    for (g.depsOf(n)) |d| {
                         const cid = g.component[d];
                         if (cid == g.component[n]) continue;
                         if (rerun[position.get(cid).?]) break :blk true;
@@ -1085,8 +1094,9 @@ const Engine = struct {
         // the append ladder's churn (three growth doublings retained by
         // the allocator at the drive's peak) never happens. `report`
         // then MOVES this buffer out instead of duplicating it.
-        try self.reports.ensureTotalCapacityPrecise(self.gpa, g.order.len);
-        for (g.order, 0..) |comp, position| {
+        try self.reports.ensureTotalCapacityPrecise(self.gpa, g.componentCount());
+        for (0..g.componentCount()) |position| {
+            const comp = g.members(position);
             const cid = g.component[comp[0]];
             const cyclic = g.cyclic[cid];
             if (!self.inScope(cid)) continue;
