@@ -1728,10 +1728,11 @@ pub fn scanSheet(
     defer if (!keep) arena.deinit();
     const a = arena.allocator();
 
-    // `gpa`-backed while they grow, arena-owned once they are done
-    // (the exact-size dupes below): the four lists interleave their
-    // growth, so inside the arena at most one of them could ever
-    // resize in place and every abandoned buffer stayed resident.
+    // `gpa`-backed: the four lists interleave their growth, so inside
+    // the arena at most one of them could ever resize in place and
+    // every abandoned buffer stayed resident. Only the merges cross
+    // into the arena at scan end — the other three shrink in place and
+    // ARE the returned record blocks (M10i).
     var cells: std.ArrayListUnmanaged(SheetCell) = .empty;
     defer cells.deinit(gpa);
     var slots: std.ArrayListUnmanaged(CellSlot) = .empty;
@@ -1809,26 +1810,24 @@ pub fn scanSheet(
         return .{ .refused = .{ .reason = .malformed_xml, .offset = offsetOf(sc.i) } };
     }
 
-    // Each growing list is dropped the moment its exact-size copy
-    // exists: at the copy instant the biggest list would otherwise be
-    // resident twice, and §9.1 measures that instant. The cell records,
-    // slots and rows go to `gpa`, not the arena — `Sheet.releaseCells`
-    // is the cells' point, and the two fixed dupes were the requests
-    // that bought the arena's half-again chunks (§9.1 M10f). The
-    // decoded strings, whose total no count predicts, stopped feeding
-    // the ladder in M10h: the common shape borrows the part bytes, and
-    // only a decode-forced copy touches the arena at all.
-    const items = try gpa.dupe(SheetCell, cells.items);
+    // Each growing list is handed off by shrinking ITS OWN block to
+    // length — no exact-size copy, because the copy instant was §9.1's
+    // peak: the biggest list resident twice, beside the other two
+    // ladders (M10i). The lists are page-backed (`gpa`, and far over
+    // `SmpAllocator`'s slab line), so `toOwnedSlice`'s remap releases
+    // the doubling tail in place and the record block the projection
+    // borrows is the block the scan grew. `Sheet.releaseCells` stays
+    // the cells' point, and the decoded strings stopped feeding the
+    // arena's ladder in M10h.
+    const items = try cells.toOwnedSlice(gpa);
     // The duplicate-cell refusal below RETURNS normally, so the same
     // `keep` discipline that guards the arena guards this block too.
     defer if (!keep) gpa.free(items);
-    cells.clearAndFree(gpa);
     std.mem.sortUnstable(SheetCell, items, {}, lessThanCell);
     // Stable, so two `<c>` claiming one coordinate stay in document
     // order for the consumer that has to name the first of them.
-    const slot_items = try gpa.dupe(CellSlot, slots.items);
+    const slot_items = try slots.toOwnedSlice(gpa);
     defer if (!keep) gpa.free(slot_items);
-    slots.clearAndFree(gpa);
     std.mem.sort(CellSlot, slot_items, {}, lessThanSlot);
     // Two `<c>` at one coordinate: last-wins and first-wins are both
     // defensible readings, so neither is chosen silently.
@@ -1848,9 +1847,8 @@ pub fn scanSheet(
     // local copy — and leak when the returned one deinits.
     const merge_items = try a.dupe(coords.Range, merges.items);
     merges.clearAndFree(gpa);
-    const row_items = try gpa.dupe(RowSlot, rows.items);
+    const row_items = try rows.toOwnedSlice(gpa);
     defer if (!keep) gpa.free(row_items);
-    rows.clearAndFree(gpa);
 
     keep = true;
     return .{ .ok = .{

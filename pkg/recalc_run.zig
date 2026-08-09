@@ -342,7 +342,12 @@ pub fn prepare(
     // high water and bought the next half-again chunk.
     var bridge: workbook_mod.GraphBridge = .{ .model = &model, .gpa = gpa };
     const input = try bridge.buildInput(a, gpa);
-    defer gpa.free(input.cells);
+    // Freed the moment the drive returns (§9.1 M10i): the records and
+    // the roots below are the engine's inputs, and holding them through
+    // staging kept 10.2 MB resident at the projection instant for
+    // nothing. The flag covers the refusal returns in between.
+    var input_owned = true;
+    defer if (input_owned) gpa.free(input.cells);
 
     // §5.7's no-formula rule. Decided on the model rather than on the
     // output bytes: "this workbook has nothing to calculate" is a
@@ -370,7 +375,8 @@ pub fn prepare(
     // reference discovered on pass two widens the closure these roots
     // derive, and a frozen component list could not.
     const roots = try gpa.alloc(engine.graph.Key, input.cells.len);
-    defer gpa.free(roots);
+    var roots_owned = true;
+    defer if (roots_owned) gpa.free(roots);
     for (input.cells, roots) |c, *k| k.* = .{ .cell = c.cell };
 
     var rng: engine.rng.Rng = .init(run.rng_seed);
@@ -457,6 +463,12 @@ pub fn prepare(
     const drive_non_converged = iter_report.non_converged_cells;
     const drive_dynamic_passes = iter_report.dynamic_passes;
     iter_report.deinit(gpa);
+    // The engine read its inputs for the last time inside the drive —
+    // the report above retains only its own components (§9.1 M10i).
+    input_owned = false;
+    gpa.free(input.cells);
+    roots_owned = false;
+    gpa.free(roots);
 
     watch.poller().check() catch return Error.Cancelled;
 
@@ -982,6 +994,20 @@ fn stage(
     defer touched.deinit(gpa);
     var written: u32 = 0;
 
+    // The sheet past which the driver's published list and index have
+    // no reader: each sheet's publication build below is their last
+    // read, so on that sheet they die before the projection — the
+    // 6.7 MB pair was resident through §9.1's peak instant duplicating
+    // what `pubs` had already copied (M10i).
+    var last_published_sheet: ?u32 = null;
+    for (driver.published.items) |p| {
+        if (!p.has_value) continue;
+        const s = p.cell.sheet.toInt();
+        if (last_published_sheet == null or s > last_published_sheet.?) {
+            last_published_sheet = s;
+        }
+    }
+
     var sheet_idx: u32 = 0;
     while (sheet_idx < wb.sheetCount()) : (sheet_idx += 1) {
         // A count rather than an `any` probe: it is the same walk, and
@@ -1062,6 +1088,11 @@ fn stage(
                 }
             }
             if (pubs.items.len == 0) continue;
+
+            if (last_published_sheet.? == sheet_idx) {
+                driver.published.clearAndFree(gpa);
+                driver.published_at.clearAndFree(gpa);
+            }
 
             var deltas: engine.resolved.StagedDeltas = .{ .publications = pubs.items };
             var projected = engine.resolved.project(gpa, part.bytes, &scan, &deltas) catch |e| switch (e) {
