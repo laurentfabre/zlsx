@@ -292,6 +292,21 @@ pub const Options = struct {
     /// adapter reads it from `<workbookPr date1904>` — because the same
     /// eight bytes are a different serial under each system.
     date_system: serial_date.DateSystem = .d1900,
+    /// Exact list sizes from a prior accepted scan of the same bytes,
+    /// or null on a first scan (§9.1 M10l). The staging re-scan is the
+    /// model build's scan run again over the same part, so the counts
+    /// are facts, not guesses — each growing list allocates its backing
+    /// once instead of walking the doubling ladder that was the peak
+    /// instant's largest block. A wrong hint costs nothing but the
+    /// growth path it failed to remove.
+    size_hints: ?SizeHints = null,
+};
+
+/// See `Options.size_hints`.
+pub const SizeHints = struct {
+    cells: u32,
+    slots: u32,
+    rows: u32,
 };
 
 // ─── carrier classes ─────────────────────────────────────────────
@@ -1741,6 +1756,15 @@ pub fn scanSheet(
     defer merges.deinit(gpa);
     var rows: std.ArrayListUnmanaged(RowSlot) = .empty;
     defer rows.deinit(gpa);
+    // §9.1 M10l: a caller replaying an accepted scan of these bytes
+    // knows the counts, so the three record lists allocate once. The
+    // merges list is not hinted — it crosses into the arena at scan end
+    // and never held more than a page.
+    if (opts.size_hints) |h| {
+        try cells.ensureTotalCapacityPrecise(gpa, h.cells);
+        try slots.ensureTotalCapacityPrecise(gpa, h.slots);
+        try rows.ensureTotalCapacityPrecise(gpa, h.rows);
+    }
 
     var ns_buf: [64]NsStack.Binding = undefined;
     const ns_cap = @min(ns_buf.len, opts.limits.max_namespace_bindings);

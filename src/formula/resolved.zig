@@ -343,7 +343,12 @@ pub const Publication = struct {
     /// §5.8c (M7c): the formula this publication also WRITES. Null for
     /// every publication that only caches a value — which is every one
     /// M7b1 knew about, so the field's default is the old behavior.
-    authored: ?FormulaWrite = null,
+    /// By pointer since §9.1 M10l: the inline write was 48 of the
+    /// record's 120 bytes, carried once per publication at the staging
+    /// plateau's instants and null on every one of them. The pointee
+    /// must outlive the staged set — the projection copies it into its
+    /// own arena at the one place it is read.
+    authored: ?*const FormulaWrite = null,
 };
 
 /// A publication's placement role (§5.8b).
@@ -419,9 +424,12 @@ pub const Target = struct {
     /// `#SPILL!` — the one fact `wasBlocked` reads out of what the cell
     /// contributed before the patch.
     was_spill_blocked: bool,
-    /// The `<f ref>` as decoded, or null — parsed by the CSE and anchor
-    /// gates, never written.
-    fref: ?[]const u8,
+    /// Index into `ResolvedSheet.frefs` of the `<f ref>` as decoded, or
+    /// `no_fref` — parsed by the CSE and anchor gates, never written.
+    /// Hoisted off the record like `authored` (§9.1 M10l): the inline
+    /// slice was 16 of the record's 72 bytes and null on every cell
+    /// whose formula declares no range — which is nearly all of them.
+    fref: u32 = no_fref,
     /// Index into `ResolvedSheet.authored`, or `no_authored` — §5.8c's
     /// formula write, hoisted off the record because nearly every
     /// publication only caches a value.
@@ -435,6 +443,7 @@ pub const Target = struct {
     vm: u32 = 0,
 
     pub const no_authored = std.math.maxInt(u32);
+    pub const no_fref = std.math.maxInt(u32);
 
     /// The publication this target stages — borrowed from the caller's
     /// staged set, like `source` and the scan.
@@ -451,14 +460,21 @@ pub const Target = struct {
     pub fn authoredOf(t: Target, sheet: *const ResolvedSheet) ?FormulaWrite {
         return if (t.authored == no_authored) null else sheet.authored[t.authored];
     }
+
+    /// The decoded `<f ref>` of the formula this target landed on, or
+    /// null.
+    pub fn frefOf(t: Target, sheet: *const ResolvedSheet) ?[]const u8 {
+        return if (t.fref == no_fref) null else sheet.frefs[t.fref];
+    }
 };
 
 /// **Lifetime**: a projection borrows all three of its inputs. `source`
-/// is the caller's bytes, `Target.fref` points into the scan's arena,
-/// and `pubs` is the consumed staged set (§9.1 M10f) — so the part, the
-/// `decode.Sheet` it was scanned into, and the publications must all
-/// outlive this and any plan built from it. Copying any of them would
-/// mean holding a second opinion about a document that has not changed.
+/// is the caller's bytes, each `frefs` entry points into the scan's
+/// arena, and `pubs` is the consumed staged set (§9.1 M10f) — so the
+/// part, the `decode.Sheet` it was scanned into, and the publications
+/// must all outlive this and any plan built from it. Copying any of
+/// them would mean holding a second opinion about a document that has
+/// not changed.
 pub const ResolvedSheet = struct {
     arena: std.heap.ArenaAllocator,
     /// The source part. Borrowed.
@@ -489,6 +505,12 @@ pub const ResolvedSheet = struct {
     /// `Target.authored`. Arena-owned like the targets; empty on every
     /// value-only run.
     authored: []const FormulaWrite,
+    /// The decoded `<f ref>` values, one per target whose formula
+    /// declares a range, indexed by `Target.fref` (§9.1 M10l). The
+    /// slice headers are arena-owned; the bytes borrow from the scan
+    /// like everything else here. Empty unless the sheet carries CSE
+    /// or DA anchors.
+    frefs: []const []const u8,
 
     pub fn deinit(self: *ResolvedSheet) void {
         self.arena.deinit();
@@ -588,6 +610,11 @@ pub fn project(
     try appends.ensureTotalCapacityPrecise(a, pubs.len - targets_n);
     var authored: std.ArrayListUnmanaged(FormulaWrite) = .empty;
     try authored.ensureTotalCapacityPrecise(a, authored_n);
+    // Not pre-counted like the three above: knowing the count would
+    // cost every publication a second cell lookup, and the list holds
+    // one 16-byte header per CSE/DA anchor — zero on a value-only
+    // sheet, so there is no ladder for the arena to strand.
+    var frefs: std.ArrayListUnmanaged([]const u8) = .empty;
     for (order) |idx| {
         const p = pubs[idx];
         const slot_idx = slotIndexAt(scan.slots, p.row, p.col) orelse {
@@ -600,9 +627,16 @@ pub fn project(
         }
         const modeled = cellAt(scan.cells, p.row, p.col);
         const authored_idx: u32 = if (p.authored) |w| blk: {
-            try authored.append(a, w);
+            try authored.append(a, w.*);
             break :blk @intCast(authored.items.len - 1);
         } else Target.no_authored;
+        const fref_idx: u32 = blk: {
+            const m = modeled orelse break :blk Target.no_fref;
+            const f = m.formula orelse break :blk Target.no_fref;
+            const r = f.ref orelse break :blk Target.no_fref;
+            try frefs.append(a, r);
+            break :blk @intCast(frefs.items.len - 1);
+        };
         try targets.append(a, .{
             .row = p.row,
             .col = p.col,
@@ -620,7 +654,7 @@ pub fn project(
                 m.input == .err and m.input.err == .known and m.input.err.known == .spill
             else
                 false,
-            .fref = if (modeled) |m| (if (m.formula) |f| f.ref else null) else null,
+            .fref = fref_idx,
             .authored = authored_idx,
             .cm = if (modeled) |m| m.cm else 0,
             .vm = if (modeled) |m| m.vm else 0,
@@ -636,6 +670,7 @@ pub fn project(
     const targets_out = try targets.toOwnedSlice(a);
     const appends_out = try appends.toOwnedSlice(a);
     const authored_out = try authored.toOwnedSlice(a);
+    const frefs_out = try frefs.toOwnedSlice(a);
 
     _ = try staged.consume();
     keep = true;
@@ -649,6 +684,7 @@ pub fn project(
         .rows = scan.rows,
         .dimension = scan.dimension,
         .authored = authored_out,
+        .frefs = frefs_out,
     } };
 }
 
@@ -1210,7 +1246,7 @@ fn gateOf(self: *const ResolvedSheet, t: Target, table: []const SpillTransition)
 /// anchor while a slave keeps its old cache would have the range
 /// contradict itself.
 fn cseGate(self: *const ResolvedSheet, t: Target) ?GateRefusal {
-    const raw = t.fref orelse return .{ .reason = .cse_ref_unparseable };
+    const raw = t.frefOf(self) orelse return .{ .reason = .cse_ref_unparseable };
     const range = (coords.parseRange(raw, .{
         .dollar = .accept,
         .case = .insensitive,
@@ -1433,7 +1469,7 @@ fn planAnchorExtras(
 
     const anchor_row = t.row;
     const anchor_col = t.col;
-    const raw = t.fref orelse return .{ .reason = .anchor_ref_unusable };
+    const raw = t.frefOf(self) orelse return .{ .reason = .anchor_ref_unusable };
     const ref_span = t.spansOf(self).f_ref orelse return .{ .reason = .anchor_ref_unusable };
     const old_range = (coords.parseRange(raw, .{
         .dollar = .accept,
@@ -2354,7 +2390,7 @@ test "projection: the raw `<f>` and its attribute region are carried, not copied
     const t = f.resolved.targetAt(cellRef("A1").row, cellRef("A1").col).?;
     try testing.expect(t.has_formula);
     try testing.expect(!t.formula_is_array);
-    try testing.expectEqualStrings("A1:A2", t.fref.?);
+    try testing.expectEqualStrings("A1:A2", t.frefOf(&f.resolved).?);
     try testing.expectEqualStrings(
         "<f t=\"shared\" si=\"0\" ref=\"A1:A2\" ca=\"1\">_x0041_&amp;\"x\"</f>",
         t.spansOf(&f.resolved).f.?.slice(xml),
@@ -4000,9 +4036,11 @@ fn testFold(allocator: std.mem.Allocator, s: []const u8) anyerror![]u8 {
     return casefold.foldString(allocator, s);
 }
 
-fn authoredPub(comptime ref: []const u8, result: value.PublishedScalar, w: FormulaWrite) Publication {
+fn authoredPub(comptime ref: []const u8, result: value.PublishedScalar, comptime w: FormulaWrite) Publication {
     const c = cellRef(ref);
-    return .{ .row = c.row, .col = c.col, .result = result, .authored = w };
+    // `&w` on a comptime-known value points into static memory, which
+    // is what lets the returned Publication outlive this frame.
+    return .{ .row = c.row, .col = c.col, .result = result, .authored = &w };
 }
 
 /// DONE-WHEN 2's loop, at the layer that owns each leg: the patched
@@ -4220,7 +4258,7 @@ test "§5.8c: the shapes authoring refuses, each by name" {
                 .col = cellRef("B1").col,
                 .result = .{ .number = 3 },
                 .role = .{ .da_anchor = .{ .blocked = .obstruction } },
-                .authored = .{ .text = "1+2" },
+                .authored = &.{ .text = "1+2" },
             },
             .want = .authored_role_contradiction,
         },
@@ -4234,7 +4272,7 @@ test "§5.8c: the shapes authoring refuses, each by name" {
                 .col = cellRef("B1").col,
                 .result = .{ .number = 3 },
                 .shape = .{ .rows = 2, .cols = 1 },
-                .authored = .{ .text = "SEQUENCE(2)" },
+                .authored = &.{ .text = "SEQUENCE(2)" },
             },
             .want = .non_scalar_result,
         },
@@ -4261,7 +4299,7 @@ test "§5.8c: an authored formula staged as someone's tail refuses as a contradi
             .col = cellRef("A2").col,
             .result = .{ .number = 2 },
             .role = .{ .spill_tail = .{ .row = cellRef("A1").row, .col = cellRef("A1").col } },
-            .authored = .{ .text = "1+1" },
+            .authored = &.{ .text = "1+1" },
         },
     });
     defer f.deinit();
@@ -4292,7 +4330,7 @@ test "§5.8c: DA authoring refuses its row — and a reference alone cannot flip
                     .spilled => |s| s,
                     .blocked => .{ .rows = 1, .cols = 1 },
                 },
-                .authored = .{ .text = "SEQUENCE(2)", .dialect = .dynamic_array },
+                .authored = &.{ .text = "SEQUENCE(2)", .dialect = .dynamic_array },
             },
         });
         defer f.deinit();
@@ -4324,7 +4362,7 @@ test "§5.8c: a DA write staged without its placement refuses generically" {
             .col = cellRef("B1").col,
             .result = .{ .number = 1 },
             .dialect = .dynamic_array,
-            .authored = .{ .text = "SEQUENCE(2)", .dialect = .dynamic_array },
+            .authored = &.{ .text = "SEQUENCE(2)", .dialect = .dynamic_array },
         },
     });
     defer f.deinit();
@@ -4422,7 +4460,7 @@ fn expectAuthoringRowRefusal(comptime id: SpillTransition.Id) !void {
             else
                 .{ .blocked = .obstruction } },
             .shape = if (id == .da_author_spill) .{ .rows = 2, .cols = 1 } else .{ .rows = 1, .cols = 1 },
-            .authored = .{ .text = "SEQUENCE(2)", .dialect = .dynamic_array },
+            .authored = &.{ .text = "SEQUENCE(2)", .dialect = .dynamic_array },
         }},
         .cse_author => &.{
             authoredPub("B1", .{ .number = 1 }, .{ .text = "SEQUENCE(2)", .dialect = .{ .cse = "B1:B2" } }),

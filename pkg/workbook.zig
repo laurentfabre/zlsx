@@ -8837,6 +8837,11 @@ pub const WorkbookEnv = struct {
     sheet_merges: [][]const coords.Range,
     /// Per sheet, the declared table rectangles — §5.8a's table row.
     sheet_tables: [][]const coords.Range,
+    /// Per sheet, the accepted scan's exact list sizes (§9.1 M10l) —
+    /// replayed as `decode.Options.size_hints` when staging re-scans
+    /// the same bytes, so the re-scan's record lists allocate once
+    /// instead of walking the doubling ladder at the peak instant.
+    sheet_scan_counts: []engine.decode.SizeHints,
 
     /// One coordinate in one layer. `v` is null when the coordinate is
     /// *occupied by something with no value*: an uncached formula, a
@@ -9126,6 +9131,8 @@ pub const WorkbookEnv = struct {
         for (sheet_merges) |*m| m.* = &.{};
         const sheet_tables = try a.alloc([]const coords.Range, wb.worksheets.len);
         for (sheet_tables) |*t| t.* = &.{};
+        const sheet_scan_counts = try a.alloc(engine.decode.SizeHints, wb.worksheets.len);
+        for (sheet_scan_counts) |*c| c.* = .{ .cells = 0, .slots = 0, .rows = 0 };
 
         var builder = engine.Builder.init(allocator, opts.collation);
         defer builder.deinit();
@@ -9172,6 +9179,13 @@ pub const WorkbookEnv = struct {
             defer scanned.deinit();
             cell_budget -= @intCast(scanned.cells.len);
             sheet_merges[idx] = try a.dupe(coords.Range, scanned.merges);
+            // Each count fits u32: a slot or row is at least four part
+            // bytes and a part is capped at u32 bytes.
+            sheet_scan_counts[idx] = .{
+                .cells = @intCast(scanned.cells.len),
+                .slots = @intCast(scanned.slots.len),
+                .rows = @intCast(scanned.rows.len),
+            };
 
             sheet_calc[idx] = switch (engine.calc.parseSheetCalcPr(part.bytes)) {
                 .ok => |c| c,
@@ -9274,6 +9288,7 @@ pub const WorkbookEnv = struct {
             .sheet_calc = sheet_calc,
             .sheet_merges = sheet_merges,
             .sheet_tables = sheet_tables,
+            .sheet_scan_counts = sheet_scan_counts,
         };
         out.dialects = .{ .part = &out.meta, .role = .input };
         return .{ .ok = out };
