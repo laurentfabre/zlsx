@@ -313,6 +313,17 @@ pub const PartStore = struct {
     /// public API (part names, content types, rel attrs, decompressed
     /// part bytes). Caller-visible slices stay valid until `deinit`.
     arena: std.heap.ArenaAllocator,
+    /// Replaced payloads too large to take through `arena` (§9.1 M10m).
+    ///
+    /// A 0.16 arena sizes a new chunk at 1.5 × (what it already holds +
+    /// what was asked for), so the recalc's one 8.37 MB sheet body
+    /// bought a 20.27 MB chunk — 11.9 MB of headroom nothing else in
+    /// the store would ever ask for, alive from the swap to `deinit`.
+    /// Above the threshold the payload gets an exact block instead and
+    /// is freed here. Same lifetime the arena gave it: valid until
+    /// `deinit`, and a re-replace of the same part strands its
+    /// predecessor exactly as an arena reset-free would.
+    big_parts: std.ArrayListUnmanaged([]u8) = .empty,
     /// One reference to the source bytes, shared with every other
     /// generation opened over the same archive. The previous design
     /// slurped the entire file into `src_buf` at open(); now we read
@@ -644,6 +655,8 @@ pub const PartStore = struct {
     /// invalidates generation N+1.
     pub fn deinit(self: *PartStore) void {
         self.backing.release();
+        for (self.big_parts.items) |b| self.allocator.free(b);
+        self.big_parts.deinit(self.allocator);
         self.arena.deinit();
     }
 
@@ -938,10 +951,33 @@ pub const PartStore = struct {
     /// transaction depends on it: the candidate parses its new typed
     /// views out of the store it just staged into.)
     ///
-    /// `bytes` is duped into the arena; the caller may free its own
-    /// buffer as soon as the call returns.
+    /// `bytes` is duped into store-owned storage; the caller may free
+    /// its own buffer as soon as the call returns.
     pub fn replacePart(self: *PartStore, name: []const u8, bytes: []const u8) !void {
         return self.replacePartControlled(name, bytes, .none);
+    }
+
+    /// Payloads at or above this get an exact block instead of the
+    /// arena. The threshold is about the arena's chunk arithmetic, not
+    /// about the part: below it a payload generally fits the chunk the
+    /// store already has and costs nothing beyond its own bytes, above
+    /// it the request is itself what sizes the next chunk.
+    const big_payload_bytes = 1 << 20;
+
+    fn dupePayload(
+        self: *PartStore,
+        ar_alloc: std.mem.Allocator,
+        bytes: []const u8,
+    ) ![]u8 {
+        if (bytes.len < big_payload_bytes) return ar_alloc.dupe(u8, bytes);
+        // Capacity first, so the block's existence is the last fallible
+        // step: an append that failed after the dupe would have to undo
+        // it, and the callers state their atomicity as "every
+        // allocation succeeded before anything is installed".
+        try self.big_parts.ensureUnusedCapacity(self.allocator, 1);
+        const block = try self.allocator.dupe(u8, bytes);
+        self.big_parts.appendAssumeCapacity(block);
+        return block;
     }
 
     /// `replacePart` with §5.5's poll seam (M5d1).
@@ -976,7 +1012,7 @@ pub const PartStore = struct {
         // so a mid-allocation OOM leaves the store unchanged (no
         // partial-mutation observable to a caller that recovers from
         // the error).
-        const dupe_bytes = try ar_alloc.dupe(u8, bytes);
+        const dupe_bytes = try self.dupePayload(ar_alloc, bytes);
         self.overrides[idx] = .pending;
         // Mirror into parts[idx].bytes so subsequent part() lookups see
         // the updated content. NOTE: derived content_type entries
@@ -2585,6 +2621,53 @@ test "PartStore.replacePart: large input round-trips through deflate" {
     defer dst.deinit();
     const wb = try dst.part("xl/workbook.xml") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, replacement, wb.bytes);
+}
+
+test "PartStore.replacePart: a payload past the exact-block threshold round-trips (§9.1 M10m)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "big_block.xlsx" });
+    defer std.testing.allocator.free(out_path);
+
+    // Straddle the threshold in one test: the small replace rides the
+    // arena, the large one gets its own exact block, and both must be
+    // readable through `part()` afterwards and land in the saved
+    // archive. The allocator's leak check is the other half of the
+    // assertion — the block is freed by `deinit`, not by the arena.
+    const big = try std.testing.allocator.alloc(u8, PartStore.big_payload_bytes + 7);
+    defer std.testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @intCast('a' + (i % 26));
+    const small: []const u8 = "<workbook/>";
+
+    {
+        var store = try PartStore.open(std.testing.allocator, io, fixture);
+        defer store.deinit();
+        try store.replacePart("xl/workbook.xml", small);
+        try std.testing.expectEqual(@as(usize, 0), store.big_parts.items.len);
+        try store.replacePart("xl/worksheets/sheet1.xml", big);
+        try std.testing.expectEqual(@as(usize, 1), store.big_parts.items.len);
+
+        const staged = try store.part("xl/worksheets/sheet1.xml") orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expectEqualSlices(u8, big, staged.bytes);
+        try store.save(io, out_path);
+    }
+
+    var dst = try PartStore.open(std.testing.allocator, io, out_path);
+    defer dst.deinit();
+    const sheet = try dst.part("xl/worksheets/sheet1.xml") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, big, sheet.bytes);
+    const wb = try dst.part("xl/workbook.xml") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, small, wb.bytes);
 }
 
 // ─── M5d1: cancellation at the archive seams ─────────────────────────
