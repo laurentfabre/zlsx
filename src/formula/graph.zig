@@ -685,14 +685,20 @@ pub const Graph = struct {
     /// Canonical order. A node's id **is** its index here, so
     /// `keys[a].order(keys[b]) == order(a, b)` for every pair.
     keys: []const Key,
-    /// `deps[u]` — the nodes `u` depends on, ascending and deduped.
-    deps: []const []const u32,
+    /// `depsOf(u)` — the nodes `u` depends on, ascending and deduped —
+    /// as offsets into `edge_data` (§9.1 M10k): the slice headers this
+    /// replaces were sixteen bytes per node held for the graph's whole
+    /// lifetime, twelve of them reconstructible from a four-byte
+    /// offset and the neighbor's.
+    dep_offs: []const u32,
     /// `component[u]` — which SCC `u` belongs to.
     component: []const u32,
     /// The condensation DAG in evaluation order: dependencies first,
     /// ties broken by each component's smallest node. Members are
-    /// ascending.
-    order: []const []const u32,
+    /// ascending, flat in `order_data`, carved by `order_offs` exactly
+    /// as `dep_offs` carves `edge_data` (§9.1 M10k).
+    order_offs: []const u32,
+    order_data: []const u32,
     /// Parallel to `order`'s index space (component id, not position).
     cyclic: []const bool,
     /// The producer index, kept rather than discarded with the build:
@@ -771,6 +777,22 @@ pub const Graph = struct {
         return @intCast(self.keys.len);
     }
 
+    /// The nodes `u` depends on, ascending and deduped.
+    pub fn depsOf(self: Graph, u: usize) []const u32 {
+        return self.edge_data[self.dep_offs[u]..self.dep_offs[u + 1]];
+    }
+
+    pub fn componentCount(self: Graph) u32 {
+        return @intCast(self.order_offs.len - 1);
+    }
+
+    /// The members of the component at `position` in evaluation order,
+    /// ascending. Position, not component id — the same index space the
+    /// retired `order[position]` answered.
+    pub fn members(self: Graph, position: usize) []const u32 {
+        return self.order_data[self.order_offs[position]..self.order_offs[position + 1]];
+    }
+
     /// The node id for a key, or null. Binary search — the keys are
     /// canonically sorted, which is the whole point of sorting them.
     pub fn find(self: Graph, key: Key) ?u32 {
@@ -823,14 +845,9 @@ pub const Graph = struct {
     /// component structure is what an engine actually wants.
     pub fn flatOrder(self: Graph, gpa: std.mem.Allocator) Error![]u32 {
         const out = try gpa.alloc(u32, self.keys.len);
-        var i: usize = 0;
-        for (self.order) |comp| {
-            for (comp) |n| {
-                out[i] = n;
-                i += 1;
-            }
-        }
-        assert(i == out.len);
+        // `order_data` is already every node in evaluation order — the
+        // component boundaries are the only thing a flat copy drops.
+        @memcpy(out, self.order_data);
         return out;
     }
 };
@@ -1358,10 +1375,10 @@ const Builder = struct {
             n * @sizeOf(Key) + // keys
             2 * cell_like * @sizeOf(Coord) + // index, both sort orders
             n * @sizeOf(Graph.WalkLog) + // walk logs
-            n * @sizeOf([]const u32) + // dep headers
+            (n + 1) * @sizeOf(u32) + // dep offsets
             n * @sizeOf(u32) + // component
             n * @sizeOf(bool) + // cyclic
-            n * @sizeOf([]const u32) + // order headers
+            (n + 1) * @sizeOf(u32) + // order offsets (count + 1 ≤ n + 1)
             n * @sizeOf(u32) + // order member data
             128;
         const block = try self.gpa.alignedAlloc(u8, .of(Key), need);
@@ -1491,14 +1508,22 @@ const Builder = struct {
         const edge_data = try self.gpa.alloc(u32, pairs.items.len);
         var edges_owned = true;
         defer if (edges_owned) self.gpa.free(edge_data);
-        const deps = try fa.alloc([]const u32, n);
+        const dep_offs = try fa.alloc(u32, n + 1);
+        // The fat headers are link scratch now (§9.1 M10k): Tarjan and
+        // the condensation walk them hard, but the graph itself retains
+        // only the offsets — twelve of every header's sixteen bytes
+        // restate the neighbor's offset.
+        const deps = try self.gpa.alloc([]const u32, n);
+        defer self.gpa.free(deps);
         var edge_off: usize = 0;
-        for (deps, degree) |*d, *cursor| {
+        for (deps, dep_offs[0..n], degree) |*d, *o, *cursor| {
             const deg = cursor.*;
             d.* = edge_data[edge_off .. edge_off + deg];
+            o.* = @intCast(edge_off);
             cursor.* = @intCast(edge_off);
             edge_off += deg;
         }
+        dep_offs[n] = @intCast(edge_off);
         assert(edge_off == pairs.items.len);
         for (pairs.items) |p| {
             edge_data[degree[p[0]]] = p[1];
@@ -1532,9 +1557,10 @@ const Builder = struct {
             .seed_nodes = seeds.nodes,
             .seed_values = seeds.values,
             .keys = keys,
-            .deps = deps,
+            .dep_offs = dep_offs,
             .component = comp.of,
-            .order = order,
+            .order_offs = order.offs,
+            .order_data = order.data,
             .cyclic = cyclic,
             .index = idx,
             .walk_logs = walk_logs,
@@ -2237,13 +2263,21 @@ fn classifyComponents(
 /// every step, the ready component with the smallest node under
 /// `Key.order`, so the result depends on the graph and on nothing else
 /// (not on which node a depth-first search happened to start from).
+/// The retained emission: member data flat in evaluation order, carved
+/// by offsets — the per-component slice headers the offsets replace
+/// were §9.1 M10k's line item.
+const CondensationOrder = struct {
+    offs: []const u32,
+    data: []const u32,
+};
+
 fn condensationOrder(
     gpa: std.mem.Allocator,
     retained: std.mem.Allocator,
     deps: []const []const u32,
     comp_of: []const u32,
     count: u32,
-) Error![]const []const u32 {
+) Error!CondensationOrder {
     const n = comp_of.len;
 
     // Members, ascending. Node ids are canonical, so "ascending" is
@@ -2336,19 +2370,19 @@ fn condensationOrder(
         if (needs[c] == 0) try heap.push(gpa, @intCast(c));
     }
 
-    // Retained: the headers and one flat member buffer, written in
+    // Retained: the offsets and one flat member buffer, written in
     // emission order — the same bytes the scratch members held.
-    const out = try retained.alloc([]const u32, count);
+    const out_offs = try retained.alloc(u32, count + 1);
     const out_data = try retained.alloc(u32, n);
+    out_offs[0] = 0;
     var emitted: usize = 0;
     var off: usize = 0;
     while (heap.pop()) |c| {
         const src = members[c];
-        const dst = out_data[off .. off + src.len];
-        @memcpy(dst, src);
-        out[emitted] = dst;
+        @memcpy(out_data[off .. off + src.len], src);
         emitted += 1;
         off += src.len;
+        out_offs[emitted] = @intCast(off);
         for (feed_data[feed_off[c]..feed_off[c + 1]]) |d| {
             needs[d] -= 1;
             if (needs[d] == 0) try heap.push(gpa, d);
@@ -2357,7 +2391,7 @@ fn condensationOrder(
     // The condensation of any digraph is acyclic, so Kahn always drains.
     assert(emitted == count);
     assert(off == n);
-    return out;
+    return .{ .offs = out_offs, .data = out_data };
 }
 
 /// A binary min-heap over component ids, ordered by each component's
@@ -2528,9 +2562,10 @@ pub fn plan(
             const top = stack.items.len - 1;
             const u = stack.items[top].node;
             const i = stack.items[top].i;
-            if (i < g.deps[u].len) {
+            const du = g.depsOf(u);
+            if (i < du.len) {
                 stack.items[top].i = i + 1;
-                const v = g.deps[u][i];
+                const v = du[i];
                 if (reached[v]) continue;
                 reached[v] = true;
                 const c = g.keys[v].isCellLike();
@@ -2554,7 +2589,8 @@ pub fn plan(
     var cells: std.ArrayListUnmanaged(u32) = .empty;
     defer cells.deinit(gpa);
 
-    for (g.order) |comp| {
+    for (0..g.componentCount()) |position| {
+        const comp = g.members(position);
         // A component is strongly connected, so a reached member means a
         // reached component: checking the first is checking all of them.
         if (!reached[comp[0]]) continue;
@@ -2794,7 +2830,7 @@ fn buildRefused(gpa: std.mem.Allocator, input: Input, world: *const World, opts:
 fn hasEdge(g: Graph, a: Key, b: Key) bool {
     const u = g.find(a) orelse return false;
     const v = g.find(b) orelse return false;
-    for (g.deps[u]) |w| {
+    for (g.depsOf(u)) |w| {
         if (w == v) return true;
     }
     return false;
@@ -3163,8 +3199,8 @@ test "order: a range's dependencies are area → sheet → row-major, whatever t
 
     const r = g.find(.{ .range = areaAt(0, "A1:C3") }).?;
     const want = [_][]const u8{ "A1", "C1", "B2", "A3", "C3" };
-    try testing.expectEqual(want.len, g.deps[r].len);
-    for (want, g.deps[r]) |w, node| {
+    try testing.expectEqual(want.len, g.depsOf(r).len);
+    for (want, g.depsOf(r)) |w, node| {
         try testing.expect(g.keys[node].eql(.{ .cell = cellAt(0, w) }));
     }
 }
@@ -3302,7 +3338,7 @@ test "scaling: a whole-column dependency is bounded by stored cells, not by 1 04
     try testing.expectEqual(@as(u64, 40), g.stats.index_probes);
     try testing.expect(g.stats.index_probes < coords.max_row);
     try testing.expect(g.stats.index_probes <= input.cells.len);
-    try testing.expectEqual(@as(u64, 40), g.deps[g.find(.{ .range = areaAt(0, "A1:A1048576") }).?].len);
+    try testing.expectEqual(@as(u64, 40), g.depsOf(g.find(.{ .range = areaAt(0, "A1:A1048576") }).?).len);
 }
 
 test "scaling: a whole-row dependency is bounded the same way" {
@@ -4055,8 +4091,8 @@ fn ownerKeysOfNames(a: std.mem.Allocator, spec: Spec) ![]Key {
 
 fn realEdges(a: std.mem.Allocator, g: Graph) ![]Edge {
     var out: std.ArrayListUnmanaged(Edge) = .empty;
-    for (g.deps, 0..) |list, u| {
-        for (list) |v| try out.append(a, .{ .u = g.keys[u], .v = g.keys[v] });
+    for (0..g.keys.len) |u| {
+        for (g.depsOf(u)) |v| try out.append(a, .{ .u = g.keys[u], .v = g.keys[v] });
     }
     std.mem.sortUnstable(Edge, out.items, {}, edgeLess);
     return out.items;

@@ -250,6 +250,17 @@ const HeapProfiler = struct {
     live_total: usize = 0,
     peak_total: usize = 0,
     last_snapshot: usize = 0,
+    /// Chronological local maxima of the live curve (M10k). The peak
+    /// table names one instant; §9.1 M10j's lesson is that cutting it
+    /// moves RSS only down to the *runner-up* instant, so the probe has
+    /// to name every era's height, not just the winner's. A climb's
+    /// high-water mark is recorded once the curve falls `era_dip` below
+    /// it, then the tracker re-arms at the current level so a later,
+    /// lower era still registers.
+    era_local_max: usize = 0,
+    era_recorded: bool = true,
+    era_last_snapshot: usize = 0,
+    eras: std.ArrayList(EraRecord) = .empty,
 
     /// Deep enough to see past the parser's recursive-descent chain
     /// (eleven frames of parseX before the caller appears); shallow
@@ -259,14 +270,28 @@ const HeapProfiler = struct {
     /// much since the last snapshot. 1 MiB of drift against a >500 MiB
     /// peak bounds the attribution error at ~0.2 %.
     const snapshot_step = 1 * 1024 * 1024;
+    /// A descent this deep ends an era. Deep enough that a scratch
+    /// arena's per-formula churn cannot split an era in two; shallow
+    /// enough that the pipeline's real phase frees all register.
+    const era_dip = 2 * 1024 * 1024;
 
     const LiveEntry = struct { site: u32, size: usize };
+
+    /// One era: its height and the sites that held it, snapshotted with
+    /// the same ≤`snapshot_step` lag the global peak table carries.
+    const EraRecord = struct {
+        height: usize,
+        top: [12]EraSite,
+        n: u8,
+    };
+    const EraSite = struct { site: u32, bytes: usize };
 
     const Site = struct {
         frames: [max_depth]usize,
         depth: u8,
         live: usize = 0,
         at_peak: usize = 0,
+        at_era: usize = 0,
         allocs: u64 = 0,
         total: u64 = 0,
     };
@@ -355,14 +380,55 @@ const HeapProfiler = struct {
         const kv = self.live.fetchRemove(ptr) orelse return;
         self.sites.items[kv.value.site].live -= kv.value.size;
         self.live_total -= kv.value.size;
+        self.noteEra();
     }
 
     fn maybeSnapshot(self: *HeapProfiler) void {
+        self.noteEra();
         if (self.live_total <= self.peak_total) return;
         self.peak_total = self.live_total;
         if (self.peak_total - self.last_snapshot < snapshot_step) return;
         self.last_snapshot = self.peak_total;
         for (self.sites.items) |*site| site.at_peak = site.live;
+    }
+
+    fn noteEra(self: *HeapProfiler) void {
+        if (self.live_total > self.era_local_max) {
+            self.era_local_max = self.live_total;
+            self.era_recorded = false;
+            if (self.era_local_max - self.era_last_snapshot >= snapshot_step) {
+                self.era_last_snapshot = self.era_local_max;
+                for (self.sites.items) |*site| site.at_era = site.live;
+            }
+        } else if (!self.era_recorded and
+            self.era_local_max - self.live_total >= era_dip)
+        {
+            self.eras.append(meta, self.eraRecord()) catch @panic("heap profiler OOM");
+            self.era_recorded = true;
+            self.era_local_max = self.live_total;
+            self.era_last_snapshot = self.live_total;
+        }
+    }
+
+    /// The era's top sites by their lagging snapshot, by selection into
+    /// the record's fixed-width table.
+    fn eraRecord(self: *HeapProfiler) EraRecord {
+        var rec: EraRecord = .{ .height = self.era_local_max, .top = undefined, .n = 0 };
+        for (self.sites.items, 0..) |site, id| {
+            if (site.at_era == 0) continue;
+            var candidate: EraSite = .{ .site = @intCast(id), .bytes = site.at_era };
+            var i: usize = 0;
+            while (i < rec.n) : (i += 1) {
+                if (candidate.bytes > rec.top[i].bytes) {
+                    std.mem.swap(EraSite, &candidate, &rec.top[i]);
+                }
+            }
+            if (rec.n < rec.top.len) {
+                rec.top[rec.n] = candidate;
+                rec.n += 1;
+            }
+        }
+        return rec;
     }
 
     fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
@@ -413,6 +479,26 @@ const HeapProfiler = struct {
                 self.sites.items.len,
             },
         );
+        for (self.eras.items, 0..) |rec, i| {
+            try w.print(
+                "era={d} peak_bytes={d} ({d:.1} MiB) top=",
+                .{ i, rec.height, @as(f64, @floatFromInt(rec.height)) / (1024.0 * 1024.0) },
+            );
+            for (rec.top[0..rec.n], 0..) |s, j| {
+                try w.print("{s}id{d}:{d}", .{ if (j == 0) "" else ",", s.site, s.bytes });
+            }
+            try w.writeAll("\n");
+        }
+        if (!self.era_recorded) {
+            try w.print(
+                "era={d} peak_bytes={d} ({d:.1} MiB) (open at exit)\n",
+                .{
+                    self.eras.items.len,
+                    self.era_local_max,
+                    @as(f64, @floatFromInt(self.era_local_max)) / (1024.0 * 1024.0),
+                },
+            );
+        }
 
         const order = meta.alloc(u32, self.sites.items.len) catch @panic("heap profiler OOM");
         defer meta.free(order);
@@ -420,13 +506,17 @@ const HeapProfiler = struct {
         std.mem.sort(u32, order, self.sites.items, siteGreater);
 
         const top = @min(order.len, 25);
+        var printed: std.ArrayList(u32) = .empty;
+        defer printed.deinit(meta);
         for (order[0..top], 0..) |site_id, rank| {
             const site = self.sites.items[site_id];
             if (site.at_peak == 0) break;
+            printed.append(meta, site_id) catch @panic("heap profiler OOM");
             try w.print(
-                "site={d} at_peak_bytes={d} ({d:.1} MiB, {d:.1}%) allocs={d} churn_bytes={d}\n",
+                "site={d} id={d} at_peak_bytes={d} ({d:.1} MiB, {d:.1}%) allocs={d} churn_bytes={d}\n",
                 .{
                     rank,
+                    site_id,
                     site.at_peak,
                     @as(f64, @floatFromInt(site.at_peak)) / (1024.0 * 1024.0),
                     @as(f64, @floatFromInt(site.at_peak)) * 100.0 / @as(f64, @floatFromInt(self.peak_total)),
@@ -444,10 +534,39 @@ const HeapProfiler = struct {
             };
             std.debug.dumpStackTrace(&st);
         }
+        self.dumpEraOnlySites(printed.items);
     }
 
     fn siteGreater(sites: []const Site, a: u32, b: u32) bool {
         return sites[a].at_peak > sites[b].at_peak;
+    }
+
+    /// Stacks for sites the era tables name but the global top-25 does
+    /// not — without these an `idN` in an era row is a number with no
+    /// name.
+    fn dumpEraOnlySites(self: *HeapProfiler, printed: []const u32) void {
+        var dumped: std.ArrayList(u32) = .empty;
+        defer dumped.deinit(meta);
+        for (self.eras.items) |rec| {
+            for (rec.top[0..rec.n]) |s| {
+                const already = for (printed) |p| {
+                    if (p == s.site) break true;
+                } else for (dumped.items) |p| {
+                    if (p == s.site) break true;
+                } else false;
+                if (already) continue;
+                dumped.append(meta, s.site) catch @panic("heap profiler OOM");
+                const site = self.sites.items[s.site];
+                std.debug.print("--- id {d} (era-only) ---\n", .{s.site});
+                var frames_buf: [max_depth]usize = undefined;
+                @memcpy(frames_buf[0..site.depth], site.frames[0..site.depth]);
+                const st: std.debug.StackTrace = .{
+                    .return_addresses = frames_buf[0..site.depth],
+                    .skipped = .none,
+                };
+                std.debug.dumpStackTrace(&st);
+            }
+        }
     }
 };
 
