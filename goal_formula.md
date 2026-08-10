@@ -2702,8 +2702,8 @@ debris beside either.
 
 ## 6. Milestone ladder
 
-Tier **D1**. One PR per row — **55 rows, M-1 … M10n** (count = the table; every v1 function name frozen — no ellipses);
-counts regenerate from the frozen registry inventory (M3a). v1 = M9d; M10a–M10n are the post-v1 rows.
+Tier **D1**. One PR per row — **56 rows, M-1 … M10o** (count = the table; every v1 function name frozen — no ellipses);
+counts regenerate from the frozen registry inventory (M3a). v1 = M9d; M10a–M10o are the post-v1 rows.
 `<xm:f>` route-through pullable after M2.
 
 | PR | Ships | Own gate |
@@ -2765,6 +2765,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d; M10a–M10
 | **M10l** ✅ | **The staging row — the splice scan pays only the gap** (`feat/m10l-staging-scan`). The 74.2 MiB re-profiles at the M10k baseline first and reproduces it exactly (RSS 79 577 088 B ×3; peak live 82 759 347; the era table byte-for-byte). The era trace's first pre-flight outing does its job: the peak is staging's splice-side `scanSheet` scratch (35 188 868 at its top, 76 434 388 of churn over 59 allocations), the projection instant 300 KB behind — and the drive's publish era sits **2.13 MB below both**, so staging-side cuts pay at most that gap no matter how much staging mass they remove; the budget was spent exactly, and no fourth cut (the scan's 136-byte cell records, the projection arena's 1.5× chunk) was taken because it would move zero RSS. Three cuts, each named by the attribution (output bytes unchanged): (1) **the re-scan allocates once** — the model build's scan of the same bytes already produced the counts, recorded per sheet (`WorkbookEnv.sheet_scan_counts`) and replayed as `decode.Options.size_hints`, so cells/slots/rows are three exact blocks (13 601 360 + 10 001 000 + 320 032, one allocation each; the doubling ladder's 52 MB of re-copied rungs retired, and the scan instant stops being a local maximum at all); (2) `Publication.authored` **by pointer** — the inline `FormulaWrite` was 48 of the record's 120 bytes and null on every value-only publication (staged set 9 600 000 → 6 400 000); (3) `Target.fref` **hoisted to a `frefs` side list** like `authored` — 16 of 72 bytes, absent on every formula without a declared range (targets 5 760 072 → 2 880 036). **Result (§9.1): first-recalc RSS 74.2 → 72.2 MiB — 4.8× the 15.15 MiB ceiling, from 4.9×.** Peak live 82 759 347 → 80 634 991: **the peak is the DRIVE'S PUBLISH again** — staging's highest instant (78 087 308) sits 2.5 MB under it, the txn-prepare era (79 030 153, held up by `replacePart`'s 20 274 118 arena chunk around an 8 365 638 dupe) 1.6 MB behind. M10k's "the drive's records are at their RSS floor" now binds at the peak: the next memory row is the drive-era blocks the trace names (the evaluate store's 10 240 000, the iterate execute block 5 759 936, the graph build residual 5 587 480) and the txn chunk behind them — or the ceiling conversation, which at 4.8× is overdue | Saved archives byte-identical to main across all four workloads (+ f1 small/tiny; fixtures and saves both); **`compare_bench --gate` exit 0, every lane ok on the first pass — no flag, so no interleaved re-measure owed** — F1 named eval +0.1 % (398.32 ms median; the 500 ms ceiling stays met), named `save` −0.4 %, criteria/text/registry eval improved or flat (the largest mover, criteria-open tiny −59 %, is an improvement); zig build + zig build test green; zig fmt --check clean; the RSS probe byte-reproducible across three runs (77 496 320 B each) |
 | **M10m** ✅ | **The drive-blocks row — two eras cut to reach one floor** (`feat/m10m-drive-blocks`). The 72.2 MiB re-profiles at the M10l baseline first and reproduces it exactly (RSS 77 496 320 B ×3; peak live 80 634 991; every era byte-for-byte). **The pre-flight read decided the shape of the row before a line changed**: the peak is the drive's publish (80 634 991), the txn-prepare era sits 1.60 MB under it (79 030 153) and staging's plateau 2.55 MB under (78 087 308) — so cutting the drive era *alone* pays at most 1.60 MB, and only cutting **both** the drive era and the txn era reaches staging's floor. Budget for the whole row: **2 547 683 B, and it was spent exactly**. Two cuts, one per era (output bytes unchanged): (1) **the roots stop being materialized** — §5.7.1 roots a full recalc at every formula cell, and `prepare` spelled that out as one `graph.Key` per cell: 3 840 000 B alive across the entire drive, 48 bytes of union per root (the `producer` variant is two slices wide) to restate coordinates `input.cells` was already holding beside it. `graph.Roots` states the rule instead — `.{ .cells = input.cells }` — and `plan` mints each key at the instant it probes for it; (2) **the replaced part gets an exact block** — a 0.16 arena sizes a new chunk at 1.5 × (held + requested), so the one 8 365 638 B sheet body bought a 20 274 118 B chunk (M10e's ladder, the txn era's whole margin), and payloads at or above 1 MiB now take an exact `gpa` block freed at `deinit`. **Result (§9.1): first-recalc RSS 72.2 → 69.5 MiB — 4.6× the 15.15 MiB ceiling, from 4.8×.** Peak live 80 634 991 → **78 087 308, which is staging's plateau**: the drive era fell to 76 794 991 and the txn era stopped registering as a local maximum at all. **Nothing further was cut on the drive side and that is the finding** — with the drive era now 1.29 MB *below* the new peak, the evaluate store (6 400 000), the iterate `reports` list (5 759 936) and the graph build residual (5 587 480) are all still there and all still worth zero RSS, exactly as M10k's ComponentReport was one row ago. The next row is staging's plateau (13 601 360 + 10 001 000 scan lists, the 6 400 000 staged set) with only 264 KB of runner-up gap behind it — or the ceiling conversation, which at 4.6× is well overdue | Fixtures **and** saved archives byte-identical to the M10l baseline across all four workloads + f1 small/tiny — 12/12; **`compare_bench --gate` exit 0 in both directions**, no lane flagged either way; a same-binary re-measure was run before believing any lane, and it found the window itself worth 2–4 % (every lane 2.2–4.2 % faster on a second run of the *identical* binary, z to −6.3), so the two brackets (+0.1 % / −3.8 % on F1 named eval) bracket a neutral change — named eval 377–392 ms, the 500 ms ceiling stays met; zig build + zig build test green (9850 tests, +8); zig fmt --check clean; the RSS probe byte-reproducible across three runs (74 711 040 B each) |
 | **M10n** ✅ | **The staging-plateau row — the 264 KB gap that was not the price** (`feat/m10n-cell-spans`). The 69.5 MiB re-profiles at the M10m baseline first and reproduces it exactly (RSS 74 711 040 B ×3; peak live 78 087 308; every era byte-for-byte). **The pre-flight read answered the row's only real question, which was whether to spend it at all.** M10m handed this row a runner-up gap of 264 KB — staging's plateau at 78 087 308 with the projection instant 263 894 B behind it — and a 264 KB row is noise. The trace says that reading is wrong, and says why: the projection era is *the same phase*, holding the same records, so a cut at the plateau lands on both eras at once and neither can become the peak by surviving. **The era that sets the price is the first one the cut does not touch — the drive's publish at 76 794 991.** Budget therefore **1 292 317 B, not 263 894**, and the distinction is structural rather than lucky: an era is only a runner-up if the cut misses it. (The published pair, 3 200 000 + 1 703 960, is the shape that would have been trapped by the 264 KB reading — it lives at the plateau *and* in the drive era, so cutting it pays exactly the gap and stops. It was left alone.) One cut, sized to the budget (output bytes unchanged): **`CellSpans` stops paying the optional's tag.** A `Span` is two `u32`s, so `?Span` costs twelve bytes for eight of content — and `CellSpans` carries six of them (`type_attr`, `v`, `v_content`, `f`, `f_ref`, `is`) while the splice scan keeps one `CellSpans` per `<c>` element, 100 010 of them on the named workload. `OptSpan` states absence as `end < start` — a shape no present span can take, since every span the scanner records runs from an opening byte to a byte at or after it, which `Span.slice` already asserts — and the six fields become eight bytes each: `CellSpans` 92 → 68 B, `CellSlot` 100 → 76 B, the slot block **10 001 000 → 7 600 760**. The same idiom `Target.no_fref` uses one layer up. **Result (§9.1): first-recalc RSS 69.5 → 68.5 MiB — 4.5× the 15.15 MiB ceiling, from 4.6×.** Peak live 78 087 308 → **76 794 991, which is the drive's publish, unmoved to the byte** — the budget spent exactly, for the third row running. **The finding is the leftover: the cut removed 2 400 240 B and only 1 292 317 of them were purchasable**, so 1.1 MB of real reduction bought nothing, and staging's plateau now sits 1 107 923 B *below* the peak with its retained cells (13 601 360), its slots (7 600 760) and the staged set (6 400 000) all still resident and all worth zero RSS. Two rows in a row have ended with the loser's mass intact; the next row is the drive's publish era again — where M10m's protected blocks (evaluate store 6 400 000, iterate `reports` 5 759 936, graph residual 5 587 480) have finally become budget — or the ceiling conversation, which at 4.5× and fourteen rows in is overdue | Fixtures **and** saved archives byte-identical to the M10m baseline across all four workloads + f1 small/tiny — 12/12; **`compare_bench --gate` exit 0 in both directions**, all 30 lanes ok either way; the same-binary control was taken before believing any lane and this window was quiet (F1 named eval +0.2 % on the identical binary, no lane flagged), so the two brackets against the base (−1.4 % and +0.6 % on F1 named eval) straddle a neutral change — named eval 387.6–395.3 ms, the 500 ms ceiling stays met; zig build + zig build test green (9870 tests, +20); zig fmt --check clean; the RSS probe byte-reproducible across three runs (73 596 928 B each), and the M10m binary re-measured in the same window at 74 711 040 B each |
+| **M10o** ✅ | **The drive-publish row — the block that spans the whole curve** (`feat/m10o-cell-extras`). The 68.5 MiB re-profiles at the M10n baseline first and reproduces it exactly (RSS 73 596 928 B ×3; peak live 76 794 991; every era byte-for-byte). **The pre-flight read corrected the row's premise before a byte was cut.** The row was scoped around the four blocks M10m protected and M10n freed — the evaluate store 6 400 000, iterate `reports` 5 759 936, the graph build residual 5 587 480, the graph's linked edges 10 210 051 — priced against the plan era at 72 740 090, a budget of ~4.05 MB. The trace says 1 107 923 B. **Staging's plateau (75 687 068) holds none of the four either**, so it is the first era a drive-exclusive cut fails to reach, and it takes the peak the moment they go: 29 436 199 B of mass standing on 1 107 923 B of budget. Applying M10n's rule *before* cutting is what the rule is for. The row was won instead by a block none of the four is. **`WorkbookEnv.Cell` is the run's most-multiplied record** — one per coordinate per layer, held in 64-entry chunks, and the drive publishes a *second* entry at every formula cell, so the named workload carries 100 010 of them into the drive and 180 010 out of it (every full chunk splits exactly once; fill lands at 57.6/64). Four of its ten fields — `cm`, `vm`, `array_ref`, `spill_anchor` — are 52 of its 136 bytes and are zero-or-null on every cell of every §9 workload: cell metadata, a legacy CSE array's declared range, a spill tail's owning anchor. **They move behind a `u32` index into a model-arena `extras` list** (`Cell.no_extra` = `maxInt(u32)`, the idiom `Target.no_fref` and M10n's `OptSpan` already use), and a cell that carries none reads the all-default record without branching. `Cell` **136 → 88 B**, `Chunk` 8712 → 5640 B, the sheet directory's chunk bytes **27 233 712 → 17 630 640** at the drive's peak instant. The width is a test: a byte added there costs 180 KB. **Result (§9.1): first-recalc RSS 68.5 → 59.3 MiB — 3.9× the 15.15 MiB ceiling, from 4.5×, the first sub-4× reading the ladder has produced** and 9 617 408 B in one row against 2–3.5 MB for each of its five predecessors. Peak live 76 794 991 → **65 181 445**, still the drive's publish. **The finding is why it is nine megabytes and not two: a phase-local block's budget is bounded by the next phase; a record held across every phase is bounded only by the phases that predate it.** The model's cell record is live continuously from era 12 to era 23, so the first era it does not reach is era 10 — the decode phase, 52 684 820, measured identical before and after — and the budget is **24 110 171 B, the largest any row in the series has had**. 11 613 546 of it was spent; what stopped the row was the record, not the budget. (Second-order, and M10e's mechanism paying out for once: chunk *demand* fell 9 603 072 B and the model arena returned 11 611 854, because a shrinking demand curve crosses a ladder rung on the way down.) The peak is the drive's publish again with staging's plateau 1 107 923 B behind it, and the six drive-exclusive blocks that could collect it are each floored by a contract this row may not move — `Report.components` is public and read by twenty tests, `CellInput.array` is an input-API shape, `Key.Producer`'s two spellings set the canonical producer order, `Ref` and the graph block are floored by `Key.Span`, and the journal is 27 935 B short even if it were free | Fixtures **and** saved archives byte-identical to the M10n baseline across all four workloads × tiny/small/named — 24/24; **`compare_bench --gate` exit 0 in both directions**, all 30 lanes ok either way; the same-binary control was taken first and the first attempt at it flagged a lane at +29.9 % — a concurrent `zig build test`, not the binary, which is the lesson M10k's window-drift rule exists to catch — so the window was cleared and re-taken, and the identical binary then reproduced within ±1 % on every substantial lane (F1 named eval −0.0 %, criteria-eval small −0.1 %); against that control the base bracket is −0.7 % on F1 named eval, **378.5 ms, the 500 ms ceiling stays met**; zig build + zig build test green (9878 tests, +8); zig fmt --check clean; the RSS probe reproducible across three runs (63 979 520 B), and the M10n binary re-measured in the same window at 73 596 928 B each |
 
 **M10+ backlog**: F5 (census-ordered); `<xm:f>` route-through; namespace-aware
 scanners; **future compatibility versions beyond CV2** (CV1+CV2 are v1 scope,
@@ -5896,6 +5897,113 @@ memory, but whichever era is currently tallest. The three drive-era
 blocks M10m named and protected are now the budget, because the drive
 era is now the peak. Below 68.5 MiB is that row — or renegotiating the
 ceiling, which at 4.5× and fourteen rows in is overdue.
+
+**M10o — the drive-publish row (recorded 2026-08-10).** Same
+discipline. The M10n baseline reproduced exactly first: RSS
+73 596 928 B ×3, peak live 76 794 991, every era byte-for-byte.
+
+**The pre-flight read, and the premise it corrected.** This row was
+scoped around the four blocks M10m protected and M10n freed, priced
+against the plan era: peak 76 794 991, plan era 72 740 090, budget
+~4.05 MB. The trace does not support that reading. Between the two
+sits an era that holds none of the four:
+
+| era | height | phase | holds any of the four? | gap under the peak |
+|---:|---:|---|---|---:|
+| 20 | **76 794 991** | the drive's publish | all four | — |
+| 21 | 75 687 068 | staging's plateau | **no** | **1 107 923** |
+| 22 | 75 423 174 | the projection | no | 1 371 817 |
+| 23 | 72 740 090 | the plan | no | 4 054 901 |
+
+Era 21 is the first era a drive-exclusive cut fails to reach, so it
+takes the peak the moment the four go, and **the budget for all four
+together is 1 107 923 B — not 4 054 901.** Their combined mass is
+29 436 199 B. That is M10n's rule applied *before* the cut rather than
+discovered after it, which is the only place it pays.
+
+**The block the row was won with is none of the four.** `WorkbookEnv.Cell`
+is the run's most-multiplied record — one per coordinate per layer,
+held in 64-entry chunks — and the drive publishes a *second* entry at
+every formula cell:
+
+| instant | chunks | entries | `Chunk` | chunk bytes |
+|---|---:|---:|---:|---:|
+| pre-drive | 1 563 | 100 010 | 8 712 B | 13 616 856 |
+| post-drive (the peak) | 3 126 | 180 010 | 8 712 B | **27 233 712** |
+
+Every full chunk splits exactly once and fill settles at 57.6/64, so
+the directory doubles and the width of one record is paid 180 010
+times.
+
+**The cut** (output bytes unchanged — fixtures and saved archives
+byte-identical to the M10n baseline across all four workloads ×
+tiny/small/named, 24 comparisons):
+
+| record | before | after | mechanism |
+|---|---:|---:|---|
+| `WorkbookEnv.Cell` (180 010 of them at the peak) | 136 B — 27 233 712 | 88 B — **17 630 640** | Four of ten fields — `cm`, `vm`, `array_ref`, `spill_anchor` — are 52 of the 136 bytes and are zero-or-null on every cell of every §9 workload: cell metadata, a legacy CSE array's declared range, a spill tail's owning anchor. They move behind a `u32` index into a model-arena `extras` list, and `Cell.no_extra` = `maxInt(u32)` states absence — the idiom `Target.no_fref` and M10n's `OptSpan` already use. A cell carrying no `Extra` reads the all-default record, so no caller branches on the index. The width is now a test (`WorkbookEnv.Cell stays at its recorded width`): a byte added here costs 180 KB |
+
+**Result.** Same methodology (ReleaseSafe — the flag is load-bearing —
+`/usr/bin/time -l`, usage-invocation baseline, first recalc,
+digest-gated fixture):
+
+| | M10n (recorded above) | **M10o** |
+|---|---:|---:|
+| peak live at the peak instant | 76 794 991 (the drive's publish) | **65 181 445 (the drive's publish)** |
+| `/usr/bin/time -l` peak | 73 596 928 B | **63 979 520 B** |
+| process baseline | 1.75 MiB | 1.73 MiB |
+| baseline-adjusted | 68.5 MiB | **59.3 MiB** |
+| vs the 3 × model-bytes ceiling (15.15 MiB) | 4.5× | **3.9×** |
+
+**The first sub-4× reading the ladder has produced**, and 9 617 408 B
+of RSS in one row against 2–3.5 MB for each of its five predecessors.
+
+**The finding — why this row is nine megabytes and its predecessors
+were two.** Not a cleverer cut. *A phase-local block's budget is
+bounded by the next phase; a record held across every phase is bounded
+only by the phases that predate it.* Every row from M10j to M10n cut a
+block one phase owned, and each was priced by whichever neighbouring
+era survived it. The model's cell record is live continuously from
+era 12 to era 23, so the eras that price it are the ones from before
+the model exists — era 10, the decode phase, at 52 684 820, **measured
+identical before and after the cut**. The budget is 24 110 171 B, the
+largest the series has had; 11 613 546 of it was spent, and what
+stopped the row was the record's remaining width, not the budget.
+
+Second-order, and M10e's arena ladder paying out for once instead of
+costing: chunk *demand* fell 9 603 072 B while the model arena
+returned 11 611 854, because a shrinking demand curve crosses a ladder
+rung on the way down.
+
+The gate is exit 0 in both directions, all 30 lanes ok either way,
+with the same-binary control taken first as M10k's window-drift lesson
+requires — and the first attempt at that control earned the lesson
+again: it flagged `criteria-eval:criteria_mix_small` at +29.9 % on the
+*identical binary*, because a `zig build test` was running beside it.
+The window was cleared and the control re-taken, at which point the
+same binary reproduced within ±1 % on every substantial lane (F1 named
+eval −0.0 %, criteria-eval small −0.1 %). Against that control the
+bracket versus the base is −0.7 % on F1 named eval — 378.5 ms, and the
+500 ms ceiling stays met. The RSS side was quiet throughout: the M10n
+binary re-measured at its recorded 73 596 928 B on all three runs.
+
+**What remains at the peak — the drive's publish, again, with
+staging's plateau 1 107 923 B behind it.** The model 12 343 488, the
+graph's linked edges 10 210 051, the part bytes 7 951 114, the
+publish's own arena chunk 7 720 630, `input.cells` 6 400 000, iterate
+`reports` 5 759 936, the graph build residual 5 587 480, the published
+pair 3 200 000 + 1 703 960, the shared texts 2 778 502, the drive
+journal 1 079 988, the CSR edge data 398 744. The six drive-exclusive
+blocks among them carry 29 436 199 B for 1 107 923 B of budget, and
+none yields 1.1 MB without moving something this row may not:
+`Report.components` is a public contract twenty tests read;
+`CellInput.array` is an input-API shape; `Key.Producer`'s two
+spellings set the canonical producer order; `Ref` and the graph block
+are floored by `Key.Span`; the journal is 27 935 B short even if it
+were free. Below 59.3 MiB is a shared cut — the model record again,
+where `?ScalarValue` still pays 40 bytes for 32 of content — or the
+ceiling conversation, which at 3.9× and fifteen rows in is well past
+due.
 
 ---
 
