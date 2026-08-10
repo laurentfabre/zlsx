@@ -1127,6 +1127,10 @@ fn stage(
                 .limits = opts.limits,
                 .fidelity = run.fidelity,
                 .date_system = model.calc.date_system,
+                // §9.1 M10l: the model's scan of the same bytes already
+                // produced these counts, so the re-scan's record lists
+                // allocate once instead of doubling to the peak.
+                .size_hints = model.sheet_scan_counts[sheet_idx],
             })) {
                 .ok => |s| s,
                 .refused => |r| return .{ .refused = r.planeTwo() },
