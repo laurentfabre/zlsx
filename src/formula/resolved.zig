@@ -622,7 +622,7 @@ pub fn project(
             continue;
         };
         const slot = scan.slots[slot_idx];
-        if (slot.spans.v != null and slot.spans.is != null) {
+        if (slot.spans.v.present() and slot.spans.is.present()) {
             return .{ .refused = refuseAt(.ambiguous_cell_content, p.row, p.col) };
         }
         const modeled = cellAt(scan.cells, p.row, p.col);
@@ -1301,7 +1301,7 @@ fn authorGate(self: *const ResolvedSheet, t: Target, table: []const SpillTransit
     // the spans are what the EDITS answer to, and a formula-shaped run
     // of bytes the model did not carry is still one no insertion may
     // sit beside.
-    if (t.spansOf(self).f != null or t.has_formula) {
+    if (t.spansOf(self).f.present() or t.has_formula) {
         return .{ .reason = .formula_overwrite_unsupported };
     }
     if (t.cm != 0) return .{ .reason = .authored_under_cell_metadata };
@@ -1470,7 +1470,7 @@ fn planAnchorExtras(
     const anchor_row = t.row;
     const anchor_col = t.col;
     const raw = t.frefOf(self) orelse return .{ .reason = .anchor_ref_unusable };
-    const ref_span = t.spansOf(self).f_ref orelse return .{ .reason = .anchor_ref_unusable };
+    const ref_span = t.spansOf(self).f_ref.get() orelse return .{ .reason = .anchor_ref_unusable };
     const old_range = (coords.parseRange(raw, .{
         .dollar = .accept,
         .case = .insensitive,
@@ -1522,7 +1522,7 @@ fn planAnchorExtras(
             // The record said "tail"; the bytes say formula or staged
             // target. Clearing either would remove content the record
             // does not actually own.
-            if (slot.spans.f != null) return .{ .reason = .tail_clear_foreign };
+            if (slot.spans.f.present()) return .{ .reason = .tail_clear_foreign };
             if (self.targetAt(row_, col_) != null) return .{ .reason = .tail_clear_foreign };
             try out.append(a, .{
                 .at = slot.spans.cell,
@@ -1737,7 +1737,7 @@ fn appendEdits(
     }
 
     // ── the `t` attribute ──
-    if (spans.type_attr) |ts| {
+    if (spans.type_attr.get()) |ts| {
         if (tr.type_attr) |want| {
             // Compared by value, not by spelling: a `t='str'` cell
             // publishing text is already the type the table asks for,
@@ -1773,8 +1773,8 @@ fn appendEdits(
     //
     // The order below is the order `CT_Cell` allows the shapes to occur
     // in, so exactly one arm can be taken.
-    if (spans.v) |vs| {
-        if (spans.v_content) |vc| {
+    if (spans.v.get()) |vs| {
+        if (spans.v_content.get()) |vc| {
             if (!std.mem.eql(u8, vc.slice(source), tr.v)) {
                 try out.append(a, .{
                     .at = vc,
@@ -1799,7 +1799,7 @@ fn appendEdits(
         return;
     }
 
-    if (spans.is) |is| {
+    if (spans.is.get()) |is| {
         try out.append(a, .{
             .at = is,
             .replacement = try vElement(a, tr.v),
@@ -1830,7 +1830,7 @@ fn appendEdits(
 
     // `<v>` follows `<f>` when there is one, and opens the content
     // otherwise.
-    const at = if (spans.f) |f| f.end else spans.open_end;
+    const at = if (spans.f.get()) |f| f.end else spans.open_end;
     try out.append(a, .{
         .at = .{ .start = at, .end = at },
         .replacement = try vElement(a, tr.v),
@@ -1907,23 +1907,23 @@ fn isSpace(c: u8) bool {
 /// claims it.
 pub fn approvedRange(source: []const u8, spans: decode.CellSpans, kind: EditKind) ?Span {
     return switch (kind) {
-        .type_attr_replace => spans.type_attr,
-        .type_attr_remove => if (spans.type_attr) |t| removalSpan(source, spans, t) else null,
+        .type_attr_replace => spans.type_attr.get(),
+        .type_attr_remove => if (spans.type_attr.get()) |t| removalSpan(source, spans, t) else null,
         .type_attr_insert => blk: {
-            if (spans.type_attr != null) break :blk null;
+            if (spans.type_attr.present()) break :blk null;
             const at = attrInsertPoint(source, spans.attrs);
             break :blk .{ .start = at, .end = at };
         },
-        .v_content_replace => spans.v_content,
-        .v_element_replace => if (spans.v != null and spans.v_content == null) spans.v else null,
-        .is_to_v => if (spans.v == null) spans.is else null,
+        .v_content_replace => spans.v_content.get(),
+        .v_element_replace => if (spans.v.present() and !spans.v_content.present()) spans.v.get() else null,
+        .is_to_v => if (!spans.v.present()) spans.is.get() else null,
         .reopen_self_closing => blk: {
-            if (spans.v != null or spans.is != null or !spans.selfClosing()) break :blk null;
+            if (spans.v.present() or spans.is.present() or !spans.selfClosing()) break :blk null;
             break :blk .{ .start = spans.cell.end - 2, .end = spans.cell.end };
         },
         .v_insert => blk: {
-            if (spans.v != null or spans.is != null or spans.selfClosing()) break :blk null;
-            const at = if (spans.f) |f| f.end else spans.open_end;
+            if (spans.v.present() or spans.is.present() or spans.selfClosing()) break :blk null;
+            const at = if (spans.f.get()) |f| f.end else spans.open_end;
             break :blk .{ .start = at, .end = at };
         },
 
@@ -1932,14 +1932,14 @@ pub fn approvedRange(source: []const u8, spans: decode.CellSpans, kind: EditKind
         // clear owns exactly its element — and an owned tail never
         // carries a formula, so a `<c>` with an `<f>` has no removable
         // range at all.
-        .f_ref_replace => spans.f_ref,
-        .cell_remove => if (spans.f == null) spans.cell else null,
+        .f_ref_replace => spans.f_ref.get(),
+        .cell_remove => if (!spans.f.present()) spans.cell else null,
         // §5.8c (M7c): only a cell with no `<f>` can receive one, and
         // only at the point right after its start tag — the reopened
         // self-closing shape carries its formula inside the reopen
         // edit, so the kind has no range there.
         .f_insert => blk: {
-            if (spans.f != null or spans.selfClosing()) break :blk null;
+            if (spans.f.present() or spans.selfClosing()) break :blk null;
             break :blk .{ .start = spans.open_end, .end = spans.open_end };
         },
         // Not answerable from one cell's spans: the insert point is the
@@ -2393,13 +2393,13 @@ test "projection: the raw `<f>` and its attribute region are carried, not copied
     try testing.expectEqualStrings("A1:A2", t.frefOf(&f.resolved).?);
     try testing.expectEqualStrings(
         "<f t=\"shared\" si=\"0\" ref=\"A1:A2\" ca=\"1\">_x0041_&amp;\"x\"</f>",
-        t.spansOf(&f.resolved).f.?.slice(xml),
+        t.spansOf(&f.resolved).f.get().?.slice(xml),
     );
 
     // And the patch leaves every one of those bytes where it found them.
     const out = try patchOk(testing.allocator, &f);
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, t.spansOf(&f.resolved).f.?.slice(xml)) != null);
+    try testing.expect(std.mem.indexOf(u8, out, t.spansOf(&f.resolved).f.get().?.slice(xml)) != null);
 }
 
 test "transition: a slave keeps its `<f>` in any shape and gains a `<v>`" {
@@ -3597,8 +3597,8 @@ test "spans: every `<c>` gets a slot, including the ones the model drops" {
     }
     try testing.expect(scan.slots[0].spans.selfClosing());
     try testing.expect(!scan.slots[1].spans.selfClosing());
-    try testing.expectEqualStrings("<v>1</v>", scan.slots[1].spans.v.?.slice(xml));
-    try testing.expectEqualStrings("1", scan.slots[1].spans.v_content.?.slice(xml));
+    try testing.expectEqualStrings("<v>1</v>", scan.slots[1].spans.v.get().?.slice(xml));
+    try testing.expectEqualStrings("1", scan.slots[1].spans.v_content.get().?.slice(xml));
 }
 
 test "spans: implicit coordinates get slots at the reconstructed positions" {
@@ -3618,7 +3618,7 @@ test "spans: implicit coordinates get slots at the reconstructed positions" {
     try testing.expectEqual(@as(u32, 1), scan.slots[0].row.oneBased());
     try testing.expectEqual(@as(u32, 0), scan.slots[0].col.zeroBased());
     try testing.expectEqual(@as(u32, 1), scan.slots[1].col.zeroBased());
-    try testing.expectEqualStrings("t=\"str\"", scan.slots[1].spans.type_attr.?.slice(xml));
+    try testing.expectEqualStrings("t=\"str\"", scan.slots[1].spans.type_attr.get().?.slice(xml));
 
     var staged: StagedDeltas = .{ .publications = &.{pubAt("B1", .{ .number = 2 })} };
     var resolved = switch (try project(testing.allocator, xml, &scan, &staged)) {
@@ -3652,13 +3652,13 @@ test "spans: a formula's bytes are outside every approved range, except exactly 
     defer scan.deinit();
 
     const spans = scan.slots[0].spans;
-    const f = spans.f.?;
+    const f = spans.f.get().?;
     inline for (@typeInfo(EditKind).@"enum".fields) |field| {
         const kind: EditKind = @enumFromInt(field.value);
         if (approvedRange(xml, spans, kind)) |r| {
             if (kind == .f_ref_replace) {
-                try testing.expectEqual(spans.f_ref.?.start, r.start);
-                try testing.expectEqual(spans.f_ref.?.end, r.end);
+                try testing.expectEqual(spans.f_ref.get().?.start, r.start);
+                try testing.expectEqual(spans.f_ref.get().?.end, r.end);
                 try testing.expectEqualStrings("A1:A2", r.slice(xml));
             } else {
                 const disjoint = r.end <= f.start or r.start >= f.end;
@@ -3967,7 +3967,7 @@ test "fuzz: the confinement checker rejects a patch that lied" {
     // One byte to the left of the content region — inside the `<v>`
     // element, and still not the range the kind approves.
     const strayed = [_]Edit{.{
-        .at = .{ .start = spans.v_content.?.start - 1, .end = spans.v_content.?.end },
+        .at = .{ .start = spans.v_content.get().?.start - 1, .end = spans.v_content.get().?.end },
         .replacement = "x",
         .kind = .v_content_replace,
         .cell = site,
@@ -3982,7 +3982,7 @@ test "fuzz: the confinement checker rejects a patch that lied" {
     // An honest edit list against an output that has an extra change in
     // it the list never mentions.
     const honest = [_]Edit{.{
-        .at = spans.v_content.?,
+        .at = spans.v_content.get().?,
         .replacement = "b",
         .kind = .v_content_replace,
         .cell = site,

@@ -1511,6 +1511,63 @@ pub const Span = struct {
     }
 };
 
+/// A `Span` that may be absent, in the eight bytes the span itself
+/// occupies rather than the twelve `?Span` costs.
+///
+/// §9.1 M10n: a `Span` is two `u32`s, so `?Span` pays a tag byte plus
+/// three of padding — and `CellSpans` carries six of them while the
+/// staging scan keeps one `CellSpans` per `<c>` element. On the named
+/// workload that is 24 bytes of every 100-byte slot record over 100 010
+/// records: 2.4 MB, resident across the whole splice.
+///
+/// Absence is `end < start`, a shape no present span can take — every
+/// span this scanner records runs from an opening byte to a byte at or
+/// after it, which `slice` already asserts. `Target.no_fref` is the same
+/// idiom one layer up.
+pub const OptSpan = struct {
+    start: u32 = 1,
+    end: u32 = 0,
+
+    pub const none: OptSpan = .{ .start = 1, .end = 0 };
+
+    pub fn some(s: Span) OptSpan {
+        assert(s.end >= s.start);
+        return .{ .start = s.start, .end = s.end };
+    }
+
+    pub fn from(s: ?Span) OptSpan {
+        return if (s) |v| .some(v) else .none;
+    }
+
+    /// An element whose opening byte is known and whose end is filled in
+    /// when its close tag is seen. Present from this instant: the walk
+    /// asks `present` to decide whether the close it is handling belongs
+    /// to an element it recorded.
+    pub fn opening(at: u32) OptSpan {
+        return .{ .start = at, .end = at };
+    }
+
+    /// The close tag arrived. Asserted rather than assigned bare: `end`
+    /// is what presence is read off, so a close that ran backwards
+    /// would not corrupt the span — it would silently *delete* it, and
+    /// the patcher would then write a cached value into a cell it no
+    /// longer believed had a `<v>`.
+    pub fn close(self: *OptSpan, at: u32) void {
+        assert(self.present());
+        assert(at >= self.start);
+        self.end = at;
+    }
+
+    pub fn get(self: OptSpan) ?Span {
+        if (!self.present()) return null;
+        return .{ .start = self.start, .end = self.end };
+    }
+
+    pub fn present(self: OptSpan) bool {
+        return self.end >= self.start;
+    }
+};
+
 /// Where one `<c>` and its interpreted children sit in the part.
 ///
 /// Recorded by the walk rather than re-found afterwards. The cached-value
@@ -1529,26 +1586,26 @@ pub const CellSpans = struct {
     /// name and the `/` or `>` that ends it. An empty span is normal and
     /// still positional: `<c/>` has no attributes and a place to put one.
     attrs: Span = .{},
-    /// `t="…"`, first byte of the name through the closing quote. Null
-    /// when the attribute is absent.
-    type_attr: ?Span = null,
-    /// `<v>` … `</v>`, whole element. Null when absent.
-    v: ?Span = null,
-    /// What sits between `<v>` and `</v>`. Null when the element is
+    /// `t="…"`, first byte of the name through the closing quote. Absent
+    /// when the attribute is.
+    type_attr: OptSpan = .none,
+    /// `<v>` … `</v>`, whole element. Absent when there is none.
+    v: OptSpan = .none,
+    /// What sits between `<v>` and `</v>`. Absent when the element is
     /// self-closing — a `<v/>` has no content region, and giving it one
     /// would mean inventing a position between two bytes that are not
     /// adjacent to any content.
-    v_content: ?Span = null,
-    /// `<f>` … `</f>`, whole element. Null when absent.
-    f: ?Span = null,
+    v_content: OptSpan = .none,
+    /// `<f>` … `</f>`, whole element. Absent when there is none.
+    f: OptSpan = .none,
     /// The raw value of `<f ref="…">`, between the quotes — the one
-    /// byte range §5.8b's anchor-ref mutation may address. Null when
+    /// byte range §5.8b's anchor-ref mutation may address. Absent when
     /// the formula has no `ref`. The single exception to "no edit
     /// addresses a byte inside `spans.f`": the exception is this span
     /// and nothing else in the element.
-    f_ref: ?Span = null,
-    /// `<is>` … `</is>`, whole element. Null when absent.
-    is: ?Span = null,
+    f_ref: OptSpan = .none,
+    /// `<is>` … `</is>`, whole element. Absent when there is none.
+    is: OptSpan = .none,
 
     pub fn selfClosing(self: CellSpans) bool {
         return self.open_end == self.cell.end;
@@ -2193,8 +2250,8 @@ const SheetWalk = struct {
                 self.has_v = true;
                 self.v_depth = depth;
                 self.v_text.clear();
-                self.spans.v = .{ .start = offsetOf(el.offset) };
-                self.spans.v_content = null;
+                self.spans.v = .opening(offsetOf(el.offset));
+                self.spans.v_content = .none;
                 self.v_open_end = offsetOf(open_end);
                 self.v_self_closing = self_closing;
             } else if (std.mem.eql(u8, local, "f")) {
@@ -2208,13 +2265,13 @@ const SheetWalk = struct {
                     .si = el.attr("si"),
                     .raw_attrs = el.attrs,
                 };
-                self.spans.f = .{ .start = offsetOf(el.offset) };
-                self.spans.f_ref = if (el.attr("ref")) |rv| spanOfSub(self.xml, rv) else null;
+                self.spans.f = .opening(offsetOf(el.offset));
+                self.spans.f_ref = if (el.attr("ref")) |rv| .some(spanOfSub(self.xml, rv)) else .none;
             } else if (std.mem.eql(u8, local, "is")) {
                 self.has_is = true;
                 self.is_depth = depth;
                 self.is_text.clear();
-                self.spans.is = .{ .start = offsetOf(el.offset) };
+                self.spans.is = .opening(offsetOf(el.offset));
             } else if (std.mem.eql(u8, local, "extLst")) {
                 self.skip_depth = depth;
             } else {
@@ -2263,28 +2320,28 @@ const SheetWalk = struct {
         if (self.phonetic_depth == depth) self.phonetic_depth = null;
         if (self.v_depth == depth) {
             self.v_depth = null;
-            if (self.spans.v) |*v| {
-                v.end = offsetOf(end);
+            if (self.spans.v.present()) {
+                self.spans.v.close(offsetOf(end));
                 // A `<v/>` has no content region. Everything else does,
                 // and its far edge is the `<` of the close tag: a close
                 // tag carries no attributes, so nothing can quote a `<`
                 // between here and there.
                 if (!self.v_self_closing) {
-                    self.spans.v_content = .{
+                    self.spans.v_content = .some(.{
                         .start = self.v_open_end,
                         .end = closeTagStart(self.xml, end),
-                    };
+                    });
                 }
             }
         }
         if (self.f_depth == depth) {
             self.f_depth = null;
             if (self.formula) |*f| f.text = try self.retain(&self.f_text);
-            if (self.spans.f) |*f| f.end = offsetOf(end);
+            if (self.spans.f.present()) self.spans.f.close(offsetOf(end));
         }
         if (self.is_depth == depth) {
             self.is_depth = null;
-            if (self.spans.is) |*is| is.end = offsetOf(end);
+            if (self.spans.is.present()) self.spans.is.close(offsetOf(end));
         }
         if (self.cell_depth == depth) try self.finishCell(end);
         if (self.row_depth == depth) {
@@ -2364,7 +2421,7 @@ const SheetWalk = struct {
             .cell = .{ .start = offsetOf(el.offset) },
             .open_end = offsetOf(open_end),
             .attrs = spanOfSub(self.xml, el.attrs),
-            .type_attr = attrSpanIn(self.xml, el.attrs, "t"),
+            .type_attr = .from(attrSpanIn(self.xml, el.attrs, "t")),
         };
         const r_attr = el.attr("r");
         if (self.row_provisional) {
@@ -3458,15 +3515,50 @@ test "scan: the anchor ref value has its own span, inside `spans.f` (M7b1)" {
     defer sheet.deinit();
 
     const anchor = sheet.slots[0].spans;
-    const ref = anchor.f_ref.?;
+    const ref = anchor.f_ref.get().?;
     try testing.expectEqualStrings("A1:B3", ref.slice(xml));
     // Inside the `<f>` element — the one byte range there §5.8b's
     // anchor-ref mutation may address.
-    const f = anchor.f.?;
+    const f = anchor.f.get().?;
     try testing.expect(ref.start > f.start and ref.end < f.end);
 
     // A refless formula has no span to address.
-    try testing.expect(sheet.slots[1].spans.f_ref == null);
+    try testing.expect(!sheet.slots[1].spans.f_ref.present());
+}
+
+test "OptSpan: absence is a shape no present span can take (M10n)" {
+    // The whole saving rests on `end < start` being unreachable for a
+    // real span, so the round-trip is asserted over the edges rather
+    // than a happy middle: the empty span (an attribute region a `<c/>`
+    // has a place for but no bytes in) and the widest span a `u32`
+    // offset can name both have to survive as PRESENT.
+    try testing.expect(!OptSpan.none.present());
+    try testing.expectEqual(@as(?Span, null), OptSpan.none.get());
+    try testing.expectEqual(@as(?Span, null), OptSpan.from(null).get());
+
+    const edges = [_]Span{
+        .{ .start = 0, .end = 0 },
+        .{ .start = 7, .end = 7 },
+        .{ .start = 0, .end = std.math.maxInt(u32) },
+        .{ .start = std.math.maxInt(u32), .end = std.math.maxInt(u32) },
+    };
+    for (edges) |s| {
+        const o: OptSpan = .some(s);
+        try testing.expect(o.present());
+        try testing.expectEqual(s, o.get().?);
+        try testing.expectEqual(s, OptSpan.from(s).get().?);
+    }
+}
+
+test "CellSlot stays at its recorded width (M10n)" {
+    // §9.1 M10n: the staging scan keeps one slot per `<c>`, so the
+    // record's width is a memory ceiling with a number on it — 100 010
+    // of them on the named workload. A field added here costs 100 KB per
+    // byte, and this is where that trade gets noticed rather than in the
+    // next RSS profile.
+    try testing.expectEqual(@as(usize, 8), @sizeOf(OptSpan));
+    try testing.expectEqual(@as(usize, 68), @sizeOf(CellSpans));
+    try testing.expectEqual(@as(usize, 76), @sizeOf(CellSlot));
 }
 
 test "scan: cells come back row-major regardless of document order" {
