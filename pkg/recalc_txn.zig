@@ -322,7 +322,17 @@ pub const Candidate = struct {
     /// Empty slots for the superseded views, allocated here so the swap's
     /// `RetainedGeneration` needs no allocator.
     retired_slots: []?sheet_xml_mod.SheetXml,
-    /// Bytes the superseded generation will hold once retained.
+    /// What `prepare` measured the superseded generation at, and what
+    /// its ceiling check was made against.
+    ///
+    /// **The swap does not trust this for the accounting** — it
+    /// re-measures. The interval between `prepare` and `swap` is public
+    /// (`prepare` is exported for callers that inspect a recalc before
+    /// committing it), and during it the live store can still grow: a
+    /// plain `Workbook.save` materializes its pending overrides, and
+    /// M10b's deferred deflate allocates the compressed copy right
+    /// there. Kept because it is the figure the refusal was based on,
+    /// which is worth being able to state.
     retired_bytes: u64,
     report: Report,
     swapped: bool = false,
@@ -366,7 +376,15 @@ pub const Candidate = struct {
             // nobody has asked for.
             .sst = wb.sst_view,
             .styles = wb.styles_view,
-            .bytes = self.retired_bytes,
+            // Re-measured, not `self.retired_bytes`: see that field. The
+            // ceiling check at `prepare` necessarily used the older
+            // figure, so a caller who grew the live store in between
+            // gets at most a one-generation overshoot — but
+            // `wb.retained_bytes`, the next prepare's check and the
+            // report all read what is actually retained. Keeping the
+            // stale figure would compound the error across every
+            // generation instead of bounding it to one.
+            .bytes = generationBytes(&wb.store),
         };
         wb.sst_view = null;
         wb.styles_view = null;
@@ -1218,6 +1236,40 @@ test "retention: a large replaced part counts against the byte ceiling" {
         ),
     }
     try testing.expectEqual(@as(usize, 0), h.wb.retained.items.len);
+}
+
+test "retention: the swap re-measures the generation it retires" {
+    // The prepare→swap interval is public, and the live store can grow
+    // inside it: a plain save materializes its pending overrides, and
+    // M10b's deferred deflate allocates the compressed copy right
+    // there. A swap that recorded `prepare`'s snapshot would understate
+    // every generation retired that way, and the error would compound
+    // across generations rather than stop at one.
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa, .{});
+    defer h.deinit(gpa);
+
+    const r = try prepare(&h.wb, &staged_one, &.{}, .{});
+    var candidate = switch (r) {
+        .refused => return error.UnexpectedRefusal,
+        .ok => |c| c,
+    };
+
+    // Grow the store that is about to be retired, after its snapshot.
+    const big = try gpa.alloc(u8, PartStore.big_payload_bytes + 7);
+    defer gpa.free(big);
+    @memset(big, ' ');
+    try h.wb.store.replacePart("xl/workbook.xml", big);
+
+    const snapshot = candidate.retired_bytes;
+    const truth = generationBytes(&h.wb.store);
+    try testing.expect(truth > snapshot);
+
+    candidate.swap(&h.wb);
+    // What the workbook now says it retains is the re-measured figure,
+    // not the stale one.
+    try testing.expectEqual(truth, h.wb.retained_bytes);
+    try testing.expect(h.wb.retained_bytes > snapshot);
 }
 
 test "post-failure reads: a refused prepare leaves every part byte-identical" {
