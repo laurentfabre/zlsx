@@ -8616,13 +8616,14 @@ pub const GraphBridge = struct {
                 // instead of a scalar seed. A resolver refusal is not
                 // decided here: the cell will meet it again at
                 // evaluation, where the diagnostic has a home.
-                const dynamic = c.array_ref == null and
-                    ((self.model.dialectResolver().dialectOf(c.cm, c.vm) catch .legacy) == .dynamic_array);
+                const extra = self.model.extraOf(c);
+                const dynamic = extra.array_ref == null and
+                    ((self.model.dialectResolver().dialectOf(extra.cm, extra.vm) catch .legacy) == .dynamic_array);
                 cells[at] = .{
                     .cell = .{ .sheet = idx, .row = c.row, .col = c.col },
                     .formula = text,
                     .cache = c.cache,
-                    .array = c.array_ref,
+                    .array = extra.array_ref,
                     .dynamic_anchor = dynamic,
                 };
                 at += 1;
@@ -8842,6 +8843,11 @@ pub const WorkbookEnv = struct {
     /// the same bytes, so the re-scan's record lists allocate once
     /// instead of walking the doubling ladder at the peak instant.
     sheet_scan_counts: []engine.decode.SizeHints,
+    /// The `Extra` records `Cell.extra` indexes, in the model arena.
+    /// Append-only for the model's lifetime: a replaced cell abandons
+    /// its entry rather than reclaiming it, which costs nothing an
+    /// arena would give back and keeps every live index valid.
+    extras: std.ArrayListUnmanaged(Extra) = .empty,
 
     /// One coordinate in one layer. `v` is null when the coordinate is
     /// *occupied by something with no value*: an uncached formula, a
@@ -8853,10 +8859,35 @@ pub const WorkbookEnv = struct {
         col: coords.Col,
         layer: engine.env.Layer,
         v: ?engine.value.ScalarValue,
-        cm: u32 = 0,
-        vm: u32 = 0,
         /// Decoded `<f>` body (FORMULA carrier), when the cell has one.
         formula_text: ?[]const u8 = null,
+        /// What the `<v>` was, as §5.6c's seed table sees it. Kept
+        /// alongside the value rather than derived from it: `blank` is
+        /// what both an absent `<v>` and a genuine blank read as, and
+        /// the seed table has to tell them apart.
+        cache: engine.graph.CacheState = .absent,
+        /// Index into the model's `extras`, or `no_extra`. See `Extra`.
+        extra: u32 = no_extra,
+
+        /// Absence, as an index no `extras` entry can occupy — the same
+        /// idiom as `Target.no_fref` and `OptSpan`'s `end < start`.
+        pub const no_extra: u32 = std.math.maxInt(u32);
+    };
+
+    /// The rare half of a cell.
+    ///
+    /// `cm`/`vm` are zero and both refs are null on every cell of a
+    /// workbook that uses neither cell metadata, nor legacy CSE arrays,
+    /// nor spilling — which is most of them, and all of §9's workloads.
+    /// Inline they cost 52 bytes on every entry; behind an index they
+    /// cost four, and 52 only on the cells that carry one. `Cell` is the
+    /// run's most-multiplied record — one per coordinate per layer, and
+    /// the drive publishes a second one at every formula cell — so the
+    /// per-entry width is what the model's footprint is made of (§9.1
+    /// M10o).
+    pub const Extra = struct {
+        cm: u32 = 0,
+        vm: u32 = 0,
         /// A legacy CSE array's declared range (M5a1's spill tails).
         array_ref: ?coords.Range = null,
         /// §5.8a: a `.spill_tail` entry records the anchor that placed
@@ -8864,11 +8895,6 @@ pub const WorkbookEnv = struct {
         /// shrink clears exactly the tails carrying this anchor, and a
         /// foreign tail obstructs because this field names someone else.
         spill_anchor: ?engine.env.CellRef = null,
-        /// What the `<v>` was, as §5.6c's seed table sees it. Kept
-        /// alongside the value rather than derived from it: `blank` is
-        /// what both an absent `<v>` and a genuine blank read as, and
-        /// the seed table has to tell them apart.
-        cache: engine.graph.CacheState = .absent,
     };
 
     /// Sorted by (row, col, layer descending), so a merged read is the
@@ -9133,6 +9159,7 @@ pub const WorkbookEnv = struct {
         for (sheet_tables) |*t| t.* = &.{};
         const sheet_scan_counts = try a.alloc(engine.decode.SizeHints, wb.worksheets.len);
         for (sheet_scan_counts) |*c| c.* = .{ .cells = 0, .slots = 0, .rows = 0 };
+        var extras: std.ArrayListUnmanaged(Extra) = .empty;
 
         var builder = engine.Builder.init(allocator, opts.collation);
         defer builder.deinit();
@@ -9206,16 +9233,22 @@ pub const WorkbookEnv = struct {
             // Stored cells arrive row-major already, so appending keeps
             // the ordering invariant without a sort.
             for (scanned.cells, formulas) |c, f| {
+                // The common cell carries no metadata and no array
+                // range, and pays four bytes for saying so.
+                const extra: u32 = if (c.cm == 0 and c.vm == 0 and f.array == null)
+                    Cell.no_extra
+                else blk: {
+                    try extras.append(a, .{ .cm = c.cm, .vm = c.vm, .array_ref = f.array });
+                    break :blk @intCast(extras.items.len - 1);
+                };
                 try sheets[idx].append(a, .{
                     .row = c.row,
                     .col = c.col,
                     .layer = .stored,
                     .v = try dupeValue(a, c.input.scalar(), c.input == .uncached),
-                    .cm = c.cm,
-                    .vm = c.vm,
                     .formula_text = f.text,
-                    .array_ref = f.array,
                     .cache = graphCacheState(c.input),
+                    .extra = extra,
                 });
             }
 
@@ -9288,6 +9321,7 @@ pub const WorkbookEnv = struct {
             .sheet_calc = sheet_calc,
             .sheet_merges = sheet_merges,
             .sheet_tables = sheet_tables,
+            .extras = extras,
             .sheet_scan_counts = sheet_scan_counts,
         };
         out.dialects = .{ .part = &out.meta, .role = .input };
@@ -9346,6 +9380,13 @@ pub const WorkbookEnv = struct {
         const sheet = try self.sheetConst(cell.sheet);
         const m = merged(sheet, cell.row, cell.col) orelse return false;
         return m.v == null and m.formula_text != null;
+    }
+
+    /// The rare fields of one cell. A cell with no `Extra` reads as the
+    /// all-default record, so callers never branch on the index.
+    pub fn extraOf(self: *const WorkbookEnv, c: Cell) Extra {
+        if (c.extra == Cell.no_extra) return .{};
+        return self.extras.items[c.extra];
     }
 
     /// Write a value computed earlier in this run. The `.computed`
@@ -9415,7 +9456,8 @@ pub const WorkbookEnv = struct {
             if (c.layer == .spill_tail) {
                 // A FOREIGN tail is content; the anchor's own tails
                 // were cleared before the decision ran.
-                if (c.spill_anchor == null or !c.spill_anchor.?.eql(anchor)) return true;
+                const own = self.extraOf(c).spill_anchor;
+                if (own == null or !own.?.eql(anchor)) return true;
                 continue;
             }
             // A formula is content wherever it is — the racing-anchor
@@ -9465,7 +9507,8 @@ pub const WorkbookEnv = struct {
             var at = s.lowerBound(cell.row, cell.col, .computed);
             while (s.at(at)) |c| : (at = s.next(at)) {
                 if (c.row != cell.row or c.col != cell.col) break;
-                if (c.layer == .spill_tail and c.spill_anchor != null and c.spill_anchor.?.eql(anchor)) {
+                const own = if (c.layer == .spill_tail) self.extraOf(c).spill_anchor else null;
+                if (own != null and own.?.eql(anchor)) {
                     s.removeAt(at);
                     break;
                 }
@@ -9477,12 +9520,13 @@ pub const WorkbookEnv = struct {
         const self = selfOf(ctx);
         const s = try self.sheetMut(cell.sheet);
         const a = self.arena.allocator();
+        try self.extras.append(a, .{ .spill_anchor = anchor });
         try s.insert(a, .{
             .row = cell.row,
             .col = cell.col,
             .layer = .spill_tail,
             .v = try dupeValue(a, v, false),
-            .spill_anchor = anchor,
+            .extra = @intCast(self.extras.items.len - 1),
         });
     }
 
@@ -9631,7 +9675,8 @@ pub const WorkbookEnv = struct {
         while (s.at(at)) |c| : (at = s.next(at)) {
             if (c.row != cell.row or c.col != cell.col) break;
             if (c.layer == .computed or c.layer == .spill_tail) continue;
-            return r.dialectOf(c.cm, c.vm);
+            const extra = self.extraOf(c);
+            return r.dialectOf(extra.cm, extra.vm);
         }
         // An unoccupied coordinate carries no metadata, which is what
         // `cm = 0` means — the resolver answers it the same way it
@@ -10287,6 +10332,37 @@ fn writeMinimalSstLessXlsx(allocator: Allocator, io: std.Io, path: []const u8) !
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────
+
+test "WorkbookEnv.Cell stays at its recorded width (M10o)" {
+    // §9.1 M10o: the model holds one `Cell` per coordinate per layer and
+    // the drive publishes a second one at every formula cell — 180 010 of
+    // them on the named workload, in 64-entry chunks. A byte added here
+    // costs 180 KB there, and this is where that trade gets noticed
+    // rather than in the next RSS profile. `Extra` is the release valve:
+    // a rare field belongs behind the index, not in the record.
+    try std.testing.expectEqual(@as(usize, 88), @sizeOf(WorkbookEnv.Cell));
+    try std.testing.expectEqual(@as(usize, 5640), @sizeOf(WorkbookEnv.Sheet.Chunk));
+}
+
+test "WorkbookEnv.Extra: the default record is what a cell with no index reads" {
+    const c: WorkbookEnv.Cell = .{
+        .row = try coords.Row.fromOneBased(1),
+        .col = try coords.Col.fromOneBased(1),
+        .layer = .stored,
+        .v = null,
+    };
+    try std.testing.expectEqual(WorkbookEnv.Cell.no_extra, c.extra);
+    // Only `extras` is read on this path, and `no_extra` short-circuits
+    // before it — but define it anyway, so the test is asserting the
+    // short-circuit rather than relying on undefined memory.
+    var env: WorkbookEnv = undefined;
+    env.extras = .empty;
+    const e = env.extraOf(c);
+    try std.testing.expectEqual(@as(u32, 0), e.cm);
+    try std.testing.expectEqual(@as(u32, 0), e.vm);
+    try std.testing.expect(e.array_ref == null);
+    try std.testing.expect(e.spill_anchor == null);
+}
 
 test "Workbook.open: minimal corpus fixture exposes sheets" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
