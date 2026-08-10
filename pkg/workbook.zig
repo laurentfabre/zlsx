@@ -1670,7 +1670,7 @@ pub const Workbook = struct {
         // the answer §5.6c still requires. It is also the §9 charge
         // site — the engine re-plans once per §5.6e pass and does not
         // charge, because it charges per evaluation instead.
-        switch (try engine.graph.plan(g, allocator, a, roots, &counters, .{
+        switch (try engine.graph.plan(g, allocator, a, .{ .keys = roots }, &counters, .{
             .iterating = model.calc.iterate,
         })) {
             .ok => {},
@@ -1706,7 +1706,7 @@ pub const Workbook = struct {
             // dynamic reference reaches cells no static walk found, and
             // the closure that did not contain them before the rebuild
             // has to contain them after it.
-            .closure = .{ .roots = roots, .iterating = model.calc.iterate },
+            .closure = .{ .roots = .{ .keys = roots }, .iterating = model.calc.iterate },
             .rebuild = .{ .input = input, .resolver = bridge.resolver() },
         });
         switch (run) {

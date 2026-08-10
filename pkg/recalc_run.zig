@@ -336,16 +336,16 @@ pub fn prepare(
     defer arena.deinit();
     const a = arena.allocator();
 
-    // The cell records and the roots are the run's two big fixed-size
-    // records (M10e). They live on the gpa, exact-sized, for exactly
-    // `prepare`'s scope — on the run arena, each landed at the ladder's
-    // high water and bought the next half-again chunk.
+    // The cell records are the run's big fixed-size record (M10e). They
+    // live on the gpa, exact-sized, for exactly `prepare`'s scope — on
+    // the run arena they landed at the ladder's high water and bought
+    // the next half-again chunk.
     var bridge: workbook_mod.GraphBridge = .{ .model = &model, .gpa = gpa };
     const input = try bridge.buildInput(a, gpa);
-    // Freed the moment the drive returns (§9.1 M10i): the records and
-    // the roots below are the engine's inputs, and holding them through
-    // staging kept 10.2 MB resident at the projection instant for
-    // nothing. The flag covers the refusal returns in between.
+    // Freed the moment the drive returns (§9.1 M10i): the records are
+    // the engine's input, and holding them through staging kept 10.2 MB
+    // resident at the projection instant for nothing. The flag covers
+    // the refusal returns in between.
     var input_owned = true;
     defer if (input_owned) gpa.free(input.cells);
 
@@ -374,10 +374,13 @@ pub fn prepare(
     // the whole graph" is what keeps §5.6e's rebuild honest: a dynamic
     // reference discovered on pass two widens the closure these roots
     // derive, and a frozen component list could not.
-    const roots = try gpa.alloc(engine.graph.Key, input.cells.len);
-    var roots_owned = true;
-    defer if (roots_owned) gpa.free(roots);
-    for (input.cells, roots) |c, *k| k.* = .{ .cell = c.cell };
+    //
+    // Stated, not materialized (§9.1 M10m): one `graph.Key` per cell was
+    // 3.84 MB alive across the whole drive to hold coordinates
+    // `input.cells` already carries, and `plan` mints each key at the
+    // moment it probes for it. The rule outlives a rebuild exactly as
+    // the array did — both read the same records.
+    const roots: engine.graph.Roots = .{ .cells = input.cells };
 
     var rng: engine.rng.Rng = .init(run.rng_seed);
     var draws = rng.drawSource();
@@ -476,8 +479,6 @@ pub fn prepare(
     // the report above retains only its own components (§9.1 M10i).
     input_owned = false;
     gpa.free(input.cells);
-    roots_owned = false;
-    gpa.free(roots);
 
     watch.poller().check() catch return Error.Cancelled;
 

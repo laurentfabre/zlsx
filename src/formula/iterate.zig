@@ -468,7 +468,7 @@ pub const Options = struct {
 };
 
 pub const Closure = struct {
-    roots: []const graph.Key,
+    roots: graph.Roots,
     /// What `graph.plan` needs to know to admit a cyclic component
     /// instead of refusing it (§5.6c).
     iterating: bool = false,
