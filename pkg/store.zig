@@ -962,7 +962,26 @@ pub const PartStore = struct {
     /// about the part: below it a payload generally fits the chunk the
     /// store already has and costs nothing beyond its own bytes, above
     /// it the request is itself what sizes the next chunk.
-    const big_payload_bytes = 1 << 20;
+    pub const big_payload_bytes = 1 << 20;
+
+    /// Bytes this store keeps resident: the arena's capacity **plus**
+    /// every out-of-arena block `dupePayload` carved for a large
+    /// payload.
+    ///
+    /// Retention accounting has to see both. Before M10m every replaced
+    /// payload was duped into the arena, so `arena.queryCapacity()` was
+    /// the whole figure; M10m moved payloads ≥ `big_payload_bytes` out
+    /// of it to stop the chunk ladder doubling around them, and a
+    /// generation holding hundreds of MiB of replaced parts would
+    /// otherwise report only the few KiB its arena still spans —
+    /// letting `max_retained_bytes` be overshot by however much the
+    /// blocks weigh. Saturating, because this bounds a ceiling check
+    /// and a wrap would read as "plenty of room".
+    pub fn residentBytes(self: *const PartStore) u64 {
+        var total: u64 = self.arena.queryCapacity();
+        for (self.big_parts.items) |b| total +|= b.len;
+        return total;
+    }
 
     fn dupePayload(
         self: *PartStore,
@@ -2668,6 +2687,36 @@ test "PartStore.replacePart: a payload past the exact-block threshold round-trip
     try std.testing.expectEqualSlices(u8, big, sheet.bytes);
     const wb = try dst.part("xl/workbook.xml") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, small, wb.bytes);
+}
+
+test "PartStore.residentBytes counts the out-of-arena blocks too" {
+    // The retention ceiling reads this figure. M10m moved payloads
+    // ≥ `big_payload_bytes` out of the arena, so a store that reported
+    // only `arena.queryCapacity()` would say a 1 MiB replaced part
+    // weighs nothing and let `max_retained_bytes` be overshot by the
+    // whole block. Guard it where the block is created.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+
+    var store = try PartStore.open(std.testing.allocator, io, fixture);
+    defer store.deinit();
+
+    const before = store.residentBytes();
+    try std.testing.expectEqual(@as(usize, 0), store.big_parts.items.len);
+
+    const big = try std.testing.allocator.alloc(u8, PartStore.big_payload_bytes + 7);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'z');
+    try store.replacePart("xl/worksheets/sheet1.xml", big);
+
+    try std.testing.expectEqual(@as(usize, 1), store.big_parts.items.len);
+    // The block is out of the arena, so the growth has to come from the
+    // `big_parts` term — arena capacity alone could not account for it.
+    const after = store.residentBytes();
+    try std.testing.expect(after - before >= big.len);
 }
 
 // ─── M5d1: cancellation at the archive seams ─────────────────────────

@@ -587,7 +587,12 @@ fn boundedCensus(gpa: Allocator, census: []const Unsupported) Allocator.Error![]
 /// fraction of the payloads they index, and counting them would mean
 /// asking every view type for a size it does not track.
 fn generationBytes(s: *const PartStore) u64 {
-    return s.arena.queryCapacity();
+    // Not `arena.queryCapacity()` alone: M10m moved replaced payloads
+    // ≥ 1 MiB out of the arena into their own blocks, and a retained
+    // generation holds those blocks just as long as it holds the arena.
+    // Counting only the arena would let `max_retained_bytes` be
+    // overshot by the whole weight of the large parts.
+    return s.residentBytes();
 }
 
 // ─── the views the swap installs ─────────────────────────────────
@@ -1173,6 +1178,38 @@ test "retention: the byte ceiling refuses too" {
     defer h.deinit(gpa);
 
     const r = try prepare(&h.wb, &staged_one, &.{}, .{ .max_retained_bytes = 1 });
+    switch (r) {
+        .ok => return error.ExpectedRefusal,
+        .refused => |ref| try testing.expectEqual(
+            Refusal.Reason.retained_bytes_exhausted,
+            ref.reason,
+        ),
+    }
+    try testing.expectEqual(@as(usize, 0), h.wb.retained.items.len);
+}
+
+test "retention: a large replaced part counts against the byte ceiling" {
+    // M10m moved payloads ≥ 1 MiB out of the store's arena into their
+    // own blocks. A generation retains those blocks exactly as long as
+    // it retains the arena, so `generationBytes` has to see them — when
+    // it read `arena.queryCapacity()` alone, a megabyte of replaced part
+    // reported as near-nothing and the ceiling could be overshot without
+    // ever refusing.
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa, .{});
+    defer h.deinit(gpa);
+
+    const big = try gpa.alloc(u8, PartStore.big_payload_bytes + 7);
+    defer gpa.free(big);
+    @memset(big, ' ');
+    try h.wb.store.replacePart("xl/workbook.xml", big);
+
+    // The store now holds a block the arena knows nothing about, and the
+    // figure the ceiling reads must include it.
+    try testing.expect(generationBytes(&h.wb.store) >= big.len);
+
+    // A ceiling just under that weight has to refuse.
+    const r = try prepare(&h.wb, &staged_one, &.{}, .{ .max_retained_bytes = big.len - 1 });
     switch (r) {
         .ok => return error.ExpectedRefusal,
         .refused => |ref| try testing.expectEqual(

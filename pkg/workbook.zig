@@ -9280,10 +9280,8 @@ pub const WorkbookEnv = struct {
                 // range, and pays four bytes for saying so.
                 const extra: u32 = if (c.cm == 0 and c.vm == 0 and f.array == null)
                     Cell.no_extra
-                else blk: {
-                    try extras.append(a, .{ .cm = c.cm, .vm = c.vm, .array_ref = f.array });
-                    break :blk @intCast(extras.items.len - 1);
-                };
+                else
+                    try appendExtra(&extras, a, .{ .cm = c.cm, .vm = c.vm, .array_ref = f.array });
                 try sheets[idx].append(a, .{
                     .row = c.row,
                     .col = c.col,
@@ -9432,6 +9430,25 @@ pub const WorkbookEnv = struct {
         return self.extras.items[c.extra];
     }
 
+    /// Append one `Extra` and return the index that names it.
+    ///
+    /// The list holds at most `Cell.no_extra` entries, because the
+    /// sentinel *is* an index: the entry that landed on it would be
+    /// indistinguishable from "this cell has no extra" and would read
+    /// back as the all-default record — a spill anchor or an array
+    /// range lost with no diagnostic. Refusing is the only honest
+    /// answer, and it costs one compare on a path that runs once per
+    /// rare cell.
+    fn appendExtra(
+        list: *std.ArrayListUnmanaged(Extra),
+        a: Allocator,
+        e: Extra,
+    ) Allocator.Error!u32 {
+        if (list.items.len >= Cell.no_extra) return error.OutOfMemory;
+        try list.append(a, e);
+        return @intCast(list.items.len - 1);
+    }
+
     /// Write a value computed earlier in this run. The `.computed`
     /// layer shadows both others, which is what makes `C1=SUM(A1:B2)`
     /// read a 2×2 this run produced rather than the stale cache.
@@ -9561,13 +9578,13 @@ pub const WorkbookEnv = struct {
         const self = selfOf(ctx);
         const s = try self.sheetMut(cell.sheet);
         const a = self.arena.allocator();
-        try self.extras.append(a, .{ .spill_anchor = anchor });
+        const extra = try appendExtra(&self.extras, a, .{ .spill_anchor = anchor });
         try s.insert(a, .{
             .row = cell.row,
             .col = cell.col,
             .layer = .spill_tail,
             .v = try dupeValue(a, v, false),
-            .extra = @intCast(self.extras.items.len - 1),
+            .extra = extra,
         });
     }
 
