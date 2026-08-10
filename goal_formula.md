@@ -2702,8 +2702,8 @@ debris beside either.
 
 ## 6. Milestone ladder
 
-Tier **D1**. One PR per row — **53 rows, M-1 … M10l** (count = the table; every v1 function name frozen — no ellipses);
-counts regenerate from the frozen registry inventory (M3a). v1 = M9d; M10a–M10l are the post-v1 rows.
+Tier **D1**. One PR per row — **54 rows, M-1 … M10m** (count = the table; every v1 function name frozen — no ellipses);
+counts regenerate from the frozen registry inventory (M3a). v1 = M9d; M10a–M10m are the post-v1 rows.
 `<xm:f>` route-through pullable after M2.
 
 | PR | Ships | Own gate |
@@ -2763,6 +2763,7 @@ counts regenerate from the frozen registry inventory (M3a). v1 = M9d; M10a–M10
 | **M10j** ✅ | **The graph row — the era that wasn't the pin, and the drive era that was** (`feat/m10j-graph-records`). The 80.0 MiB re-profiles at the M10i baseline first and reproduces it exactly on all three probes (RSS 85 721 088 B ×3 — the recorded bytes; peak live 93 003 295; every shortlisted site byte-for-byte). A Debug-granularity profile de-inlines the two sites ReleaseSafe left unnamed and corrects one of M10i's names: the "CSR edge pair" was the edge-accumulation *scratch* — per-node adjacency lists growing inside a scratch arena, 15 449 982 B at the peak instant (two growth chunks at 12 205 998 plus the 3 243 984 chunk minted by the 24 B × 89 999 list-header array) for **398 744 B of admitted edges**, `defer`-held through Tarjan and the condensation though dead the moment the CSR copy ends — and the era's other held mass was the builder's own lists past their last read: the owner map (7 680 000, dead after the walk-log loop), the keys' exact block (4 319 952, dead after the block dupe), the refs headers (1 280 000) and logs (960 000), plus the capture arena's 17-chunk ladder (6 551 868 held for 5 587 480 of refs payload). Three restructurings, each named by the attribution: (1) **edges accumulate as one flat admitted-pair list plus a per-node degree, carved into the exact CSR block by a counting sort** — condensationOrder's own shape (M10g) — with a per-run `seen` answering exactly the membership the per-node list answered (a node's edges arrive in one contiguous run; the two loops' node kinds are disjoint), so admits, charges and `stats.edges` are identical; (2) **every builder list dies at its last read** (M10f's fold pattern, five more seams); (3) **the capture arena is retired** — `takeInto` appends each owner's refs to one flat gpa list and `link` takes it as the graph's exact refs block via `toOwnedSlice`. **The row's finding: the graph era was never the pin.** Its cuts moved peak live 93 003 295 → 90 958 663 and `/usr/bin/time -l` moved *sixteen kilobytes* — the drive era had mapped within 2.0 MB of the same height (M10f's finding, one era later), and the at-peak table, now naming the drive's publish instant, held **two byte-identical 1 260 124 B plans** nothing would read again — `prepare`'s pre-flight plan (discarded at the call site, arena-held to prepare's end) and `planScope`'s (dead once the scope set is filled, engine-arena-held for the drive's lifetime) — plus twelve slice-header bytes per node in the walk logs. Both plans die at their calls now (own scratch arenas), and `WalkLog` records a span of the refs block instead of a slice, five u32s (32 → 20 B; the link block 13 450 007 → 12 370 019, and the block's Δ names the node count: n = 89 999). **Result (§9.1): first-recalc RSS 80.0 → 77.7 MiB — 5.1× the 15.15 MiB ceiling, from 5.3×**; profile site-sum at the peak instant 88.7 → 82.4 MiB, the peak instant now the drive's publish. The next memory row is the drive era the peak names — its records (reports 64 B × components, published pair, the graph block's remaining slice headers) — or the ceiling conversation, which at 5.1× is due | Saved archives byte-identical to main across all four workloads (+ f1 small/tiny); **`compare_bench --gate` exit 0, every lane ok** — F1 named eval −0.5 % (391.19 ms median; the 500 ms ceiling stays met), named `save` −0.8 %, criteria/text/registry eval all improved or flat (largest z 1.3, registry-open tiny at +23.4 % on a 1.6 ms lane, under the gate's compound threshold); zig build + zig build test green (132 steps, 9 842); zig fmt --check clean; the RSS probe byte-reproducible across three runs (83 296 256 B each) |
 | **M10k** ✅ | **The drive-records row — the pin that moved before it was cut** (`feat/m10k-drive-records`). The 77.7 MiB re-profiles at the M10j baseline first and reproduces it exactly on all probes (RSS 83 296 256 B ×3 — the recorded bytes; peak live 86 398 295; every shortlisted site byte-for-byte). The probe grows an **era trace** — the profiler records every era's local maximum with a lagging per-site snapshot — turning M10j's lesson from a post-mortem into a pre-flight, and the pre-flight finding is that **the runner-up instant sat 1.8 MB under the peak**: the staging plateau (splice-scan instant 84 563 635, projection instant 82 457 168) holds the published pair but none of the drive's other records, so the published pair pays on both sides of the era boundary, drive-exclusive cuts pay only the 1.8 MB gap, and **narrowing ComponentReport pays zero** — pkg folds it to three scalars before staging (M10f), and after the gap-covering cuts the publish instant sits below the plateau; the shortlisted report row is deliberately not cut. Five cuts, each named by the attribution (output bytes unchanged): (1) `Published` 56 → 40 B — the `ScalarValue` field was two nested union tags and their padding around a payload never wider than a pointer and a length, flattened to tag+word+extra (4 480 000 → 3 200 000); (2) `published_at` keyed by a packed u64 — row < 2²¹ and col < 2¹⁴ are the format's own bounds, so the twelve-byte key restated padding (2 228 248 → 1 703 960); (3) the graph block's deps/order slice headers → **CSR offsets** — twelve of every header's sixteen bytes restate the neighbor's offset; the fat headers Tarjan and the condensation walk are link scratch now (link block 12 370 019 → 10 210 051); (4) the engine journal reserves the node count exactly (1 493 928 in 18 growth chunks → 1 079 988 in one); (5) the scope set is one bit per component (655 384 → 11 KB). **Result (§9.1): first-recalc RSS 77.7 → 74.2 MiB — 4.9× the 15.15 MiB ceiling, from 5.1×; the ladder's first sub-5× row.** Peak live 86 398 295 → 82 759 347; the drive's publish fell to 80 628 739, **below the staging plateau**, and the peak instant is now staging's splice-side `scanSheet` scratch (35 188 868 at its top, 76 434 388 of churn), the projection instant 300 KB behind. The next memory row is the staging era the peak names — its splice-side re-scan and per-cell records — or the ceiling conversation, which at 4.9× is overdue | Saved archives byte-identical to main across all four workloads (+ f1 small/tiny; fixtures and saves both); **`compare_bench --gate` exit 0, every lane ok** — F1 named eval −1.9 % (391.38 ms median; the 500 ms ceiling stays met), named `save` −5.0 %, criteria/text/registry eval improved or flat (registry-eval small +18.3 % at z 1.6, under the gate's compound threshold; a first branch suite drifted its criteria window +17 % — the untouched criteria-open lanes drifted +35–41 % in the same window — and an interleaved same-binary re-measure read +0.6 %/−0.4 %, the rerun clean); zig build + zig build test green; zig fmt --check clean; the RSS probe byte-reproducible across three runs (79 577 088 B each) |
 | **M10l** ✅ | **The staging row — the splice scan pays only the gap** (`feat/m10l-staging-scan`). The 74.2 MiB re-profiles at the M10k baseline first and reproduces it exactly (RSS 79 577 088 B ×3; peak live 82 759 347; the era table byte-for-byte). The era trace's first pre-flight outing does its job: the peak is staging's splice-side `scanSheet` scratch (35 188 868 at its top, 76 434 388 of churn over 59 allocations), the projection instant 300 KB behind — and the drive's publish era sits **2.13 MB below both**, so staging-side cuts pay at most that gap no matter how much staging mass they remove; the budget was spent exactly, and no fourth cut (the scan's 136-byte cell records, the projection arena's 1.5× chunk) was taken because it would move zero RSS. Three cuts, each named by the attribution (output bytes unchanged): (1) **the re-scan allocates once** — the model build's scan of the same bytes already produced the counts, recorded per sheet (`WorkbookEnv.sheet_scan_counts`) and replayed as `decode.Options.size_hints`, so cells/slots/rows are three exact blocks (13 601 360 + 10 001 000 + 320 032, one allocation each; the doubling ladder's 52 MB of re-copied rungs retired, and the scan instant stops being a local maximum at all); (2) `Publication.authored` **by pointer** — the inline `FormulaWrite` was 48 of the record's 120 bytes and null on every value-only publication (staged set 9 600 000 → 6 400 000); (3) `Target.fref` **hoisted to a `frefs` side list** like `authored` — 16 of 72 bytes, absent on every formula without a declared range (targets 5 760 072 → 2 880 036). **Result (§9.1): first-recalc RSS 74.2 → 72.2 MiB — 4.8× the 15.15 MiB ceiling, from 4.9×.** Peak live 82 759 347 → 80 634 991: **the peak is the DRIVE'S PUBLISH again** — staging's highest instant (78 087 308) sits 2.5 MB under it, the txn-prepare era (79 030 153, held up by `replacePart`'s 20 274 118 arena chunk around an 8 365 638 dupe) 1.6 MB behind. M10k's "the drive's records are at their RSS floor" now binds at the peak: the next memory row is the drive-era blocks the trace names (the evaluate store's 10 240 000, the iterate execute block 5 759 936, the graph build residual 5 587 480) and the txn chunk behind them — or the ceiling conversation, which at 4.8× is overdue | Saved archives byte-identical to main across all four workloads (+ f1 small/tiny; fixtures and saves both); **`compare_bench --gate` exit 0, every lane ok on the first pass — no flag, so no interleaved re-measure owed** — F1 named eval +0.1 % (398.32 ms median; the 500 ms ceiling stays met), named `save` −0.4 %, criteria/text/registry eval improved or flat (the largest mover, criteria-open tiny −59 %, is an improvement); zig build + zig build test green; zig fmt --check clean; the RSS probe byte-reproducible across three runs (77 496 320 B each) |
+| **M10m** ✅ | **The drive-blocks row — two eras cut to reach one floor** (`feat/m10m-drive-blocks`). The 72.2 MiB re-profiles at the M10l baseline first and reproduces it exactly (RSS 77 496 320 B ×3; peak live 80 634 991; every era byte-for-byte). **The pre-flight read decided the shape of the row before a line changed**: the peak is the drive's publish (80 634 991), the txn-prepare era sits 1.60 MB under it (79 030 153) and staging's plateau 2.55 MB under (78 087 308) — so cutting the drive era *alone* pays at most 1.60 MB, and only cutting **both** the drive era and the txn era reaches staging's floor. Budget for the whole row: **2 547 683 B, and it was spent exactly**. Two cuts, one per era (output bytes unchanged): (1) **the roots stop being materialized** — §5.7.1 roots a full recalc at every formula cell, and `prepare` spelled that out as one `graph.Key` per cell: 3 840 000 B alive across the entire drive, 48 bytes of union per root (the `producer` variant is two slices wide) to restate coordinates `input.cells` was already holding beside it. `graph.Roots` states the rule instead — `.{ .cells = input.cells }` — and `plan` mints each key at the instant it probes for it; (2) **the replaced part gets an exact block** — a 0.16 arena sizes a new chunk at 1.5 × (held + requested), so the one 8 365 638 B sheet body bought a 20 274 118 B chunk (M10e's ladder, the txn era's whole margin), and payloads at or above 1 MiB now take an exact `gpa` block freed at `deinit`. **Result (§9.1): first-recalc RSS 72.2 → 69.5 MiB — 4.6× the 15.15 MiB ceiling, from 4.8×.** Peak live 80 634 991 → **78 087 308, which is staging's plateau**: the drive era fell to 76 794 991 and the txn era stopped registering as a local maximum at all. **Nothing further was cut on the drive side and that is the finding** — with the drive era now 1.29 MB *below* the new peak, the evaluate store (6 400 000), the iterate `reports` list (5 759 936) and the graph build residual (5 587 480) are all still there and all still worth zero RSS, exactly as M10k's ComponentReport was one row ago. The next row is staging's plateau (13 601 360 + 10 001 000 scan lists, the 6 400 000 staged set) with only 264 KB of runner-up gap behind it — or the ceiling conversation, which at 4.6× is well overdue | Fixtures **and** saved archives byte-identical to the M10l baseline across all four workloads + f1 small/tiny — 12/12; **`compare_bench --gate` exit 0 in both directions**, no lane flagged either way; a same-binary re-measure was run before believing any lane, and it found the window itself worth 2–4 % (every lane 2.2–4.2 % faster on a second run of the *identical* binary, z to −6.3), so the two brackets (+0.1 % / −3.8 % on F1 named eval) bracket a neutral change — named eval 377–392 ms, the 500 ms ceiling stays met; zig build + zig build test green (9850 tests, +8); zig fmt --check clean; the RSS probe byte-reproducible across three runs (74 711 040 B each) |
 
 **M10+ backlog**: F5 (census-ordered); `<xm:f>` route-through; namespace-aware
 scanners; **future compatibility versions beyond CV2** (CV1+CV2 are v1 scope,
@@ -5744,6 +5745,74 @@ block). M10k's "the drive's records are at their RSS floor" now binds
 at the peak: cutting below 72.2 MiB means the drive-era blocks named
 above and the txn chunk 1.6 MB behind them — or renegotiating the
 ceiling, which at 4.8× is overdue.
+
+**M10m — the drive-blocks row (recorded 2026-08-10).** Same
+discipline, and the first row whose *shape* the era trace decided
+rather than merely informed. The M10l baseline reproduced exactly
+first: RSS 77 496 320 B ×3, peak live 80 634 991, every era
+byte-for-byte.
+
+**The pre-flight read, and what it forced.** Three eras stood within
+2.6 MB of each other: the drive's publish at 80 634 991 (the peak),
+the txn-prepare era 1.60 MB under it at 79 030 153, and staging's
+plateau 2.55 MB under at 78 087 308. Two consequences, both binding
+before any code changed. First, cutting the drive era alone could
+never pay more than 1.60 MB, however much drive-era mass came out —
+the txn era would simply become the peak. Second, cutting *both*
+bought the whole 2 547 683 B down to staging's floor, and not one
+byte more. So this row is deliberately two cuts in two different
+eras, sized to a budget rather than to the mass available: the drive
+era alone holds 17.7 MB of cuttable blocks, and 15.2 MB of them would
+have been free work.
+
+**The cuts** (output bytes unchanged — fixtures and saved archives
+byte-identical to the M10l baseline across all four workloads plus f1
+small/tiny, 12 comparisons):
+
+| record | before | after | mechanism |
+|---|---:|---:|---|
+| the closure's roots | 3 840 000 (80 000 × 48 B), alive across the whole drive | 0 | §5.7.1 roots a full recalc at every formula cell, and `prepare` materialized that rule as one `graph.Key` each — 48 bytes of union per root, because the `producer` variant is two slices wide, to restate coordinates `input.cells` was holding beside it. `graph.Roots` states the rule (`.{ .cells = input.cells }`) and `plan` mints each key at the instant it probes for it. The rule survives a §5.6e rebuild exactly as the array did: both read the same records |
+| the replaced part's arena chunk | 20 274 118 around an 8 365 638 payload | 8 365 638 exact | A 0.16 arena sizes a new chunk at 1.5 × (what it holds + what was asked for), so the run's single largest `replacePart` bought 11.9 MB of headroom nothing else in the store would ever ask for (M10e's ladder, and the txn era's entire margin). Payloads at or above 1 MiB take an exact `gpa` block, tracked and freed at `deinit` — the same "valid until `deinit`" lifetime the arena gave them |
+
+**Result.** Same methodology (ReleaseSafe — the flag is load-bearing —
+`/usr/bin/time -l`, usage-invocation baseline, first recalc,
+digest-gated fixture):
+
+| | M10l (recorded above) | **M10m** |
+|---|---:|---:|
+| peak live at the peak instant | 80 634 991 (the drive's publish) | **78 087 308 (staging's plateau)** |
+| `/usr/bin/time -l` peak | 77 496 320 B | **74 711 040 B** |
+| process baseline | 1.73 MiB | 1.73 MiB |
+| baseline-adjusted | 72.2 MiB | **69.5 MiB** |
+| vs the 3 × model-bytes ceiling (15.15 MiB) | 4.8× | **4.6×** |
+
+The gate is exit 0 in both directions with no lane flagged either way,
+and this row is also where M10k's window-drift warning earned its
+keep. The first comparison showed a uniform +2–4 % across lanes the
+change does not touch while F1 named eval — the lane with all 80 000
+roots — sat at +0.1 %, which is the wrong ordering for a real
+per-root cost. Re-running the *identical* binary in a fresh window
+answered it: every lane came back 2.2–4.2 % faster than itself, z as
+far as −6.3. The two brackets (+0.1 % and −3.8 % on F1 named eval)
+therefore straddle a neutral change, and named eval at 377–392 ms
+keeps the 500 ms ceiling met.
+
+**What remains at the peak — which is staging's plateau.** The
+workbook's own data (model 20 069 890, computed-so-far 11 606 082,
+part bytes 7 951 114, shared texts 2 780 194); the splice scan's
+retained cells 13 601 360 and slots 10 001 000; the staged set
+6 400 000; the published pair 3 200 000 + 1 703 960. **The drive era
+was not cut to its floor and that is the point**: it now sits at
+76 794 991, 1.29 MB *below* the peak, so the evaluate store
+(6 400 000), the iterate `reports` list (5 759 936 — 64 B × 89 999
+components, of which 48 is a `graph.Key` the graph already holds) and
+the graph build residual (5 587 480) are all still resident and all
+still worth exactly zero RSS. That is M10k's ComponentReport lesson
+arriving one era later, and it is now the ladder's standing pattern:
+mass is not budget, and the runner-up era sets the price. Cutting
+below 69.5 MiB means staging's plateau — where the runner-up gap is
+264 KB, the thinnest this ladder has seen — or renegotiating the
+ceiling, which at 4.6× and thirteen rows in is well overdue.
 
 ---
 
