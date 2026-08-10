@@ -8849,8 +8849,51 @@ pub const WorkbookEnv = struct {
     /// arena would give back and keeps every live index valid.
     extras: std.ArrayListUnmanaged(Extra) = .empty,
 
-    /// One coordinate in one layer. `v` is null when the coordinate is
-    /// *occupied by something with no value*: an uncached formula, a
+    /// `Cell.v`'s optional, in band.
+    ///
+    /// `?ScalarValue` costs 40 bytes to carry 32 of content: the payload
+    /// is eight-aligned, so the presence flag cannot share the union's
+    /// tag word and opens a new one instead. Absence is a sixth case of
+    /// that tag here — the idiom `Target.no_fref` and M10n's `OptSpan`
+    /// already use, and it pays for the same reason `Extra` did: `Cell`
+    /// is the run's most-multiplied record, so eight bytes is 1.4 MB at
+    /// the drive's peak instant (§9.1 M10p).
+    ///
+    /// **`absent` is not `blank`.** Absent is the coordinate being
+    /// *occupied by something with no value* — an uncached formula, a
+    /// staged blank, a staged deletion — which shadows lower layers
+    /// while contributing nothing to the merged view. `blank` is a
+    /// value. This is the same distinction `ScalarValue`'s own doc
+    /// comment protects, held one level up.
+    pub const OptValue = union(enum) {
+        absent,
+        number: f64,
+        text: []const u8,
+        boolean: bool,
+        err: engine.value.ErrorValue,
+        blank,
+
+        /// The `?ScalarValue` this stands for.
+        pub fn get(self: OptValue) ?engine.value.ScalarValue {
+            return switch (self) {
+                .absent => null,
+                .number => |n| .{ .number = n },
+                .text => |t| .{ .text = t },
+                .boolean => |b| .{ .boolean = b },
+                .err => |e| .{ .err = e },
+                .blank => .blank,
+            };
+        }
+
+        /// What the merged view reads: a coordinate holding no value
+        /// contributes `blank` to it.
+        pub fn orBlank(self: OptValue) engine.value.ScalarValue {
+            return self.get() orelse .blank;
+        }
+    };
+
+    /// One coordinate in one layer. `v` is `.absent` when the coordinate
+    /// is *occupied by something with no value*: an uncached formula, a
     /// staged blank, a staged deletion. That is not the same as a blank
     /// value and not the same as an absent cell — it shadows lower
     /// layers while contributing nothing to the merged view.
@@ -8858,7 +8901,7 @@ pub const WorkbookEnv = struct {
         row: coords.Row,
         col: coords.Col,
         layer: engine.env.Layer,
-        v: ?engine.value.ScalarValue,
+        v: OptValue,
         /// Decoded `<f>` body (FORMULA carrier), when the cell has one.
         formula_text: ?[]const u8 = null,
         /// What the `<v>` was, as §5.6c's seed table sees it. Kept
@@ -9379,7 +9422,7 @@ pub const WorkbookEnv = struct {
     pub fn isUncached(self: *WorkbookEnv, cell: engine.env.CellRef) engine.env.Error!bool {
         const sheet = try self.sheetConst(cell.sheet);
         const m = merged(sheet, cell.row, cell.col) orelse return false;
-        return m.v == null and m.formula_text != null;
+        return m.v == .absent and m.formula_text != null;
     }
 
     /// The rare fields of one cell. A cell with no `Extra` reads as the
@@ -9464,10 +9507,8 @@ pub const WorkbookEnv = struct {
             // rule falls out of this line: the anchor later in calc
             // order meets the earlier one's formula cell or its tails.
             if (c.formula_text != null) return true;
-            if (c.v) |v| {
-                if (v != .blank) return true;
-            }
-            // `v == null` with no formula is a staged deletion, and a
+            if (c.v != .absent and c.v != .blank) return true;
+            // `v == .absent` with no formula is a staged deletion, and a
             // deleted cell is §5.8a's "empty"; `.blank` is a styled
             // blank, empty the same way.
         }
@@ -9660,7 +9701,7 @@ pub const WorkbookEnv = struct {
         const self = selfOf(ctx);
         const s = try self.sheetConst(cell.sheet);
         const m = merged(s, cell.row, cell.col) orelse return .blank;
-        return m.v orelse .blank;
+        return m.v.orBlank();
     }
 
     fn vtDialectOf(ctx: *anyopaque, cell: engine.env.CellRef) engine.env.Error!engine.value.Dialect {
@@ -9736,7 +9777,7 @@ pub const WorkbookEnv = struct {
             // to the merged view — but it still shadowed the layers
             // below it, which is why the skip happens here and not at
             // insert time.
-            const v = c.v orelse continue;
+            const v = c.v.get() orelse continue;
             return .{ .row = c.row, .col = c.col, .value = v, .layer = c.layer };
         }
         return null;
@@ -9841,7 +9882,7 @@ pub const WorkbookEnv = struct {
             const eff = try engine.env.effectiveArea(ar, st.dims, st.mode);
             const s = try st.env.sheetConst(eff.sheet);
             const cell = eff.cellAtOffset(at);
-            slot.* = if (merged(s, cell.row, cell.col)) |m| (m.v orelse .blank) else .blank;
+            slot.* = if (merged(s, cell.row, cell.col)) |m| m.v.orBlank() else .blank;
         }
         st.offset = at + 1;
         return .{ .cells = .{
@@ -9869,7 +9910,7 @@ pub const WorkbookEnv = struct {
                 cur = s.next(cur);
                 continue;
             };
-            if (off < from or (merged(s, c.row, c.col) orelse c).v == null) {
+            if (off < from or (merged(s, c.row, c.col) orelse c).v == .absent) {
                 cur = s.next(cur);
                 continue;
             }
@@ -9898,16 +9939,17 @@ pub const WorkbookEnv = struct {
         a: Allocator,
         v: engine.value.ScalarValue,
         uncached: bool,
-    ) Allocator.Error!?engine.value.ScalarValue {
-        if (uncached) return null;
+    ) Allocator.Error!WorkbookEnv.OptValue {
+        if (uncached) return .absent;
         return switch (v) {
-            .blank => null,
+            .blank => .absent,
             .text => |t| .{ .text = try a.dupe(u8, t) },
             .err => |e| switch (e) {
-                .known => v,
+                .known => .{ .err = e },
                 .rich => |spelling| .{ .err = .{ .rich = try a.dupe(u8, spelling) } },
             },
-            else => v,
+            .number => |n| .{ .number = n },
+            .boolean => |b| .{ .boolean = b },
         };
     }
 
@@ -9932,12 +9974,12 @@ pub const WorkbookEnv = struct {
                 .row = row,
                 .col = col,
                 .layer = .staged,
-                .v = null,
+                .v = .absent,
                 .formula_text = try a.dupe(u8, f),
             },
             // Both shadow whatever the stored layer had, and neither
             // contributes a value.
-            .blank, .deleted => .{ .row = row, .col = col, .layer = .staged, .v = null },
+            .blank, .deleted => .{ .row = row, .col = col, .layer = .staged, .v = .absent },
         };
     }
 };
@@ -10333,15 +10375,51 @@ fn writeMinimalSstLessXlsx(allocator: Allocator, io: std.Io, path: []const u8) !
 
 // ─── Tests ────────────────────────────────────────────────────────────
 
-test "WorkbookEnv.Cell stays at its recorded width (M10o)" {
+test "WorkbookEnv.Cell stays at its recorded width (M10p)" {
     // §9.1 M10o: the model holds one `Cell` per coordinate per layer and
     // the drive publishes a second one at every formula cell — 180 010 of
     // them on the named workload, in 64-entry chunks. A byte added here
     // costs 180 KB there, and this is where that trade gets noticed
     // rather than in the next RSS profile. `Extra` is the release valve:
     // a rare field belongs behind the index, not in the record.
-    try std.testing.expectEqual(@as(usize, 88), @sizeOf(WorkbookEnv.Cell));
-    try std.testing.expectEqual(@as(usize, 5640), @sizeOf(WorkbookEnv.Sheet.Chunk));
+    //
+    // §9.1 M10p took `v` from `?ScalarValue` to the in-band `OptValue`,
+    // 40 bytes to 32. The union below is the guard on that: a payload
+    // wider than `ErrorValue`'s would grow every cell, so a new variant
+    // is a width decision, not a local one.
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(WorkbookEnv.OptValue));
+    try std.testing.expectEqual(@as(usize, 80), @sizeOf(WorkbookEnv.Cell));
+    try std.testing.expectEqual(@as(usize, 5128), @sizeOf(WorkbookEnv.Sheet.Chunk));
+}
+
+test "WorkbookEnv.OptValue: absent and blank stay distinct through the seam" {
+    // The whole point of the in-band optional is that it loses nothing.
+    // `absent` is the coordinate occupied with no value; `blank` is a
+    // value. `get` tells them apart and `orBlank` deliberately does not
+    // — that collapse is the merged view's rule (§5.6f), not a property
+    // of the storage, and it belongs at the read site.
+    const absent: WorkbookEnv.OptValue = .absent;
+    const blank: WorkbookEnv.OptValue = .blank;
+    try std.testing.expect(absent.get() == null);
+    try std.testing.expect(blank.get() != null);
+    try std.testing.expect(blank.get().? == .blank);
+    try std.testing.expect(absent.orBlank() == .blank);
+    try std.testing.expect(blank.orBlank() == .blank);
+
+    // Every carrying variant round-trips to the `ScalarValue` it stands
+    // for, payload included.
+    const cases = [_]WorkbookEnv.OptValue{
+        .{ .number = 1.5 },
+        .{ .text = "x" },
+        .{ .boolean = true },
+        .{ .err = .{ .known = .na } },
+        .{ .err = .{ .rich = "#GETTING_DATA" } },
+        .blank,
+    };
+    for (cases) |c| {
+        const round = c.get() orelse return error.UnexpectedAbsent;
+        try std.testing.expect(round.eql(c.orBlank()));
+    }
 }
 
 test "WorkbookEnv.Extra: the default record is what a cell with no index reads" {
@@ -10349,7 +10427,7 @@ test "WorkbookEnv.Extra: the default record is what a cell with no index reads" 
         .row = try coords.Row.fromOneBased(1),
         .col = try coords.Col.fromOneBased(1),
         .layer = .stored,
-        .v = null,
+        .v = .absent,
     };
     try std.testing.expectEqual(WorkbookEnv.Cell.no_extra, c.extra);
     // Only `extras` is read on this path, and `no_extra` short-circuits
