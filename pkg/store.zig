@@ -97,6 +97,14 @@ pub const Part = struct {
     /// ZIP compression method as recorded in the central directory
     /// (0 = stored, 8 = deflate). Useful for callers that want to
     /// re-emit byte-for-byte later.
+    ///
+    /// **Stale while a replacement is pending.** M10b defers the
+    /// deflate to the save that needs it, so between `replacePart` and
+    /// that save this field still names the method of the bytes the
+    /// replacement *displaced* — the method for the new bytes does not
+    /// exist yet, because no compressor has chosen it. Re-emission is a
+    /// post-save concern and reads a coherent pair there; a caller that
+    /// wants the pair coherent earlier has to save first.
     compression_method: u16,
 
     // ─── Lazy-materialization metadata ────────────────────────────────
@@ -1037,10 +1045,12 @@ pub const PartStore = struct {
         // the updated content. NOTE: derived content_type entries
         // inferred from a replaced [Content_Types].xml are NOT
         // refreshed until the next open() — same v1 contract as before.
-        // `compression_method` is the materialization's to fill: no
-        // reader reaches it while `bytes` is non-empty (`materializeAt`
-        // returns on the mirror), and the method does not exist until
-        // the compressor picks it.
+        // `compression_method` is the materialization's to fill: the
+        // method does not exist until the compressor picks it, which
+        // M10b defers to the save that needs it. It therefore still
+        // names the DISPLACED bytes' method until then — documented on
+        // the field, because a caller reading the public `Part` can see
+        // that pair before any save makes it coherent.
         self.parts[idx].bytes = dupe_bytes;
 
         // Rels-cache refresh: when the replaced part is itself a
@@ -1405,6 +1415,15 @@ pub const PartStore = struct {
     /// cache is per-generation, the bytes it is filled from are not.
     fn materializeAt(self: *const PartStore, idx: usize, poller: Poller) Error!void {
         const p = &@constCast(self).parts[idx];
+        // An override IS this part's content, the empty one included.
+        // `bytes.len == 0` alone cannot mean "not materialized yet":
+        // a caller who replaced a part with `""` leaves exactly that
+        // shape behind, and reloading the source over it would hand
+        // back the original. Since M10b defers the deflate to save,
+        // that reloaded original is also what would be WRITTEN — a
+        // blanked part silently reverting. The override slot is the
+        // authoritative signal; the byte length is not.
+        if (self.overrides[idx] != null) return;
         if (p.bytes.len > 0 or p.uncompressed_size == 0) return;
         const ar_alloc = @constCast(&self.arena).allocator();
 
@@ -2717,6 +2736,49 @@ test "PartStore.residentBytes counts the out-of-arena blocks too" {
     // `big_parts` term — arena capacity alone could not account for it.
     const after = store.residentBytes();
     try std.testing.expect(after - before >= big.len);
+}
+
+test "PartStore.replacePart: an EMPTY replacement survives a read before save" {
+    // `materializeAt` treated `bytes.len == 0` as "not materialized yet"
+    // and reloaded the source part over it. Before M10b that was only a
+    // wrong `part()` read, because save compressed the override eagerly
+    // at replace time; once M10b deferred the deflate to save, the
+    // reloaded ORIGINAL became what got written — a caller that blanked
+    // a part silently got the original back. The override slot, not the
+    // byte length, says whether a part has content of its own.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "blanked.xlsx" });
+    defer std.testing.allocator.free(out_path);
+
+    const target = "xl/worksheets/sheet1.xml";
+    {
+        var store = try PartStore.open(std.testing.allocator, io, fixture);
+        defer store.deinit();
+
+        const original = try store.part(target) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(original.bytes.len > 0);
+
+        try store.replacePart(target, "");
+        // The read is the trigger: it is what used to reload the source.
+        const staged = try store.part(target) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 0), staged.bytes.len);
+
+        try store.save(io, out_path);
+    }
+
+    var dst = try PartStore.open(std.testing.allocator, io, out_path);
+    defer dst.deinit();
+    const round = try dst.part(target) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), round.bytes.len);
 }
 
 // ─── M5d1: cancellation at the archive seams ─────────────────────────
