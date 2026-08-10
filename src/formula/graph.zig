@@ -2481,6 +2481,34 @@ pub const PlanOptions = struct {
     charge_evals: bool = true,
 };
 
+/// What a plan starts from.
+///
+/// `cells` is not a convenience. §5.7.1 makes every input cell a root of
+/// a full recalc, and spelling that out as one `Key` each cost 3.84 MB
+/// at the drive's peak instant (§9.1 M10m) to restate coordinates the
+/// cell records already held — 48 bytes of union per root because the
+/// `producer` variant is two slices wide, for a key that is always a
+/// `.cell`. Stating the rule instead lets `plan` mint each key at the
+/// moment it probes for it and free it on the next iteration.
+pub const Roots = union(enum) {
+    keys: []const Key,
+    cells: []const CellInput,
+
+    pub fn len(self: Roots) usize {
+        return switch (self) {
+            .keys => |k| k.len,
+            .cells => |c| c.len,
+        };
+    }
+
+    pub fn at(self: Roots, i: usize) Key {
+        return switch (self) {
+            .keys => |k| k[i],
+            .cells => |c| .{ .cell = c[i].cell },
+        };
+    }
+};
+
 /// The transitive closure of `roots`, ordered.
 ///
 /// §9 charge sites, both here: `eval_depth` on pushing a cell-like node
@@ -2493,7 +2521,7 @@ pub fn plan(
     g: Graph,
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
-    roots: []const Key,
+    roots: Roots,
     counters: *WorkCounters,
     opts: PlanOptions,
 ) Error!PlanResult {
@@ -2518,7 +2546,8 @@ pub fn plan(
     var starts: std.ArrayListUnmanaged(u32) = .empty;
     defer starts.deinit(gpa);
     var probes: u64 = 0;
-    for (roots) |root| {
+    for (0..roots.len()) |ri| {
+        const root = roots.at(ri);
         if (g.find(root)) |node| {
             try starts.append(gpa, node);
             continue;
@@ -3381,7 +3410,7 @@ fn planFrom(
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     var counters: WorkCounters = .{ .limits = limits };
-    return switch (try plan(g, gpa, arena.allocator(), roots, &counters, .{})) {
+    return switch (try plan(g, gpa, arena.allocator(), .{ .keys = roots }, &counters, .{})) {
         .ok => |p| .{ .ok = .{ .arena = arena, .graph = g, .plan = p, .counters = counters } },
         .refused => |r| {
             arena.deinit();
@@ -3422,6 +3451,68 @@ test "closure: the plan is the transitive closure, ordered, cells only" {
     try testing.expectEqual(@as(u64, 4), out.counters.usedBy(.total_cell_evals));
     // Depth unwinds completely.
     try testing.expectEqual(@as(u64, 0), out.counters.usedBy(.eval_depth));
+}
+
+test "closure: `Roots.cells` plans exactly what one key per cell plans (§9.1 M10m)" {
+    // §5.7.1 roots a full recalc at every input cell. The union states
+    // that rule where `prepare` used to materialize a `Key` per cell;
+    // the one thing it must not do is plan something different, charges
+    // included — §9 bills per cell admitted, so a root form that billed
+    // differently would move a limit rather than only a footprint.
+    const cells = [_]CellInput{
+        .{ .cell = cellAt(0, "A1"), .formula = "SUM(B1:B2)" },
+        .{ .cell = cellAt(0, "B1"), .formula = "C1" },
+        .{ .cell = cellAt(0, "B2"), .formula = "1" },
+        .{ .cell = cellAt(0, "C1"), .formula = "1" },
+        .{ .cell = cellAt(0, "Z9"), .formula = "1" },
+    };
+    var g = try buildOk(
+        testing.allocator,
+        .{ .sheet_count = 2, .cells = &cells },
+        &two_sheets,
+        .{},
+    );
+    defer g.deinit();
+
+    var keys: [cells.len]Key = undefined;
+    for (&keys, cells) |*k, c| k.* = .{ .cell = c.cell };
+
+    var keyed_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer keyed_arena.deinit();
+    var keyed_counters: WorkCounters = .{ .limits = .{} };
+    const keyed = switch (try plan(
+        g,
+        testing.allocator,
+        keyed_arena.allocator(),
+        .{ .keys = &keys },
+        &keyed_counters,
+        .{},
+    )) {
+        .ok => |p| p,
+        .refused => return error.UnexpectedRefusal,
+    };
+
+    var stated_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer stated_arena.deinit();
+    var stated_counters: WorkCounters = .{ .limits = .{} };
+    const stated = switch (try plan(
+        g,
+        testing.allocator,
+        stated_arena.allocator(),
+        .{ .cells = &cells },
+        &stated_counters,
+        .{},
+    )) {
+        .ok => |p| p,
+        .refused => return error.UnexpectedRefusal,
+    };
+
+    try testing.expectEqualSlices(u32, keyed.cells, stated.cells);
+    try testing.expectEqualSlices(u32, keyed.components, stated.components);
+    try testing.expectEqual(
+        keyed_counters.usedBy(.total_cell_evals),
+        stated_counters.usedBy(.total_cell_evals),
+    );
 }
 
 test "closure: a cycle refuses while iteration is off (§5.6c)" {
