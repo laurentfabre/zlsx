@@ -2409,6 +2409,43 @@ test "M10r: in-place publication through an iterative cycle" {
     try testing.expect(@abs(got - 1.0) < 0.001);
 }
 
+test "M10s: the seed table reads the cached number back out of the value" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    // §9.1 M10s dropped `CacheState`'s f64 from the model's `Cell` and
+    // recovers it from `v`. Every iterative fixture already in the suite
+    // seeds from `<v>0</v>`, which cannot witness that: the seed table
+    // sends `.absent` to zero as well, so a cut that lost the payload
+    // entirely would still pass them.
+    //
+    // `A1=A1` converges on its seed in one pass and reports it — the
+    // only cycle whose *result* is the cached number rather than a
+    // fixed point independent of it. Seeded from the cache it is 42;
+    // seeded from a lost payload it is 0.
+    const path = try writeFixture(a, io, dir, "in.xlsx", .{
+        .sheet = "<worksheet xmlns=\"" ++ ns_main ++ "\"><sheetData><row r=\"1\">" ++
+            "<c r=\"A1\"><f>A1</f><v>42</v></c>" ++
+            "</row></sheetData></worksheet>",
+        .calc_pr = "<calcPr calcId=\"191029\" iterate=\"1\" iterateCount=\"60\" iterateDelta=\"0.0001\"/>",
+    });
+    defer a.free(path);
+
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+
+    var report = try wb.recalculate(a, io, fixed_run, .{});
+    defer report.deinit(a);
+    const got = try std.fmt.parseFloat(f64, try cellCache(try wb.sheet(0), "A1"));
+    try testing.expectEqual(@as(f64, 42), got);
+}
+
 test "M10r: in-place publication under a zero-retention limit" {
     const a = testing.allocator;
     var threaded: std.Io.Threaded = .init(a, .{});

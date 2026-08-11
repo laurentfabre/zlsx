@@ -8624,7 +8624,7 @@ pub const GraphBridge = struct {
                 cells[at] = .{
                     .cell = .{ .sheet = idx, .row = c.row, .col = c.col },
                     .formula = text,
-                    .cache = c.cache,
+                    .cache = c.cacheState(),
                     .array = extra.array_ref,
                     .dynamic_anchor = dynamic,
                 };
@@ -8920,7 +8920,37 @@ pub const WorkbookEnv = struct {
         pub fn orBlank(self: OptValue) engine.value.ScalarValue {
             return self.get() orelse .blank;
         }
+
+        /// The `CacheTag` a record holding this value must carry.
+        ///
+        /// `.blank` maps to `.absent` for the same reason `dupeValue`
+        /// folds it: a blank contributes no cached number to seed from,
+        /// and the seed table reads `.absent` as "start from zero".
+        pub fn cacheTag(self: OptValue) CacheTag {
+            return switch (self) {
+                .absent, .blank => .absent,
+                .number => .number,
+                .text => .text,
+                .boolean => .boolean,
+                .err => .err,
+            };
+        }
     };
+
+    /// `graph.CacheState`'s tag, without its `number` payload.
+    ///
+    /// **The payload is an f64 the record already holds.** `v` and
+    /// `cache` are both derived from the same `decode.InputCell` at the
+    /// one site that builds a stored cell, so a `.number` cache is
+    /// always the `.number` in `v` — the same number, not merely the
+    /// same type. Carrying it twice cost 15 of `CacheState`'s 16 bytes
+    /// on the run's most-multiplied record (§9.1 M10s).
+    ///
+    /// **The tag stays, because the tag is not derivable.** `.absent` is
+    /// what both a missing `<v>` and a genuine blank read as, and
+    /// §5.6c's seed table has to tell those apart from a cached value;
+    /// `v` alone cannot say which of them a record came from.
+    pub const CacheTag = enum(u8) { number, text, boolean, err, absent, malformed };
 
     /// One coordinate in one layer. `v` is `.absent` when the coordinate
     /// is *occupied by something with no value*: an uncached formula, a
@@ -8934,17 +8964,45 @@ pub const WorkbookEnv = struct {
         v: OptValue,
         /// Decoded `<f>` body (FORMULA carrier), when the cell has one.
         formula_text: ?[]const u8 = null,
-        /// What the `<v>` was, as §5.6c's seed table sees it. Kept
-        /// alongside the value rather than derived from it: `blank` is
-        /// what both an absent `<v>` and a genuine blank read as, and
-        /// the seed table has to tell them apart.
-        cache: engine.graph.CacheState = .absent,
+        /// What the `<v>` was, as §5.6c's seed table sees it — the tag
+        /// only. `cacheState` puts the number back; see `CacheTag`.
+        cache: CacheTag = .absent,
         /// Index into the model's `extras`, or `no_extra`. See `Extra`.
         extra: u32 = no_extra,
 
         /// Absence, as an index no `extras` entry can occupy — the same
         /// idiom as `Target.no_fref` and `OptSpan`'s `end < start`.
         pub const no_extra: u32 = std.math.maxInt(u32);
+
+        /// The `graph.CacheState` this record stands for.
+        ///
+        /// `.number`'s payload comes back out of `v`, which is the only
+        /// place it was ever stored twice. Two writers keep the pairing
+        /// and there are no others: the decode site sets `v` and `cache`
+        /// from one `InputCell`, and `putComputed`'s in-place overwrite
+        /// re-tags as it writes.
+        ///
+        /// The `else` arm is unreachable, not a fallback: a wrong seed
+        /// is a wrong number, whereas reading `v.number` off a record
+        /// holding text is a misread union. The assertion is the real
+        /// answer; the arm only decides which of the two a build with
+        /// assertions off gets.
+        pub fn cacheState(self: Cell) engine.graph.CacheState {
+            return switch (self.cache) {
+                .number => blk: {
+                    assert(self.v == .number);
+                    break :blk if (self.v == .number)
+                        .{ .number = self.v.number }
+                    else
+                        .absent;
+                },
+                .text => .text,
+                .boolean => .boolean,
+                .err => .err,
+                .absent => .absent,
+                .malformed => .malformed,
+            };
+        }
     };
 
     /// The rare half of a cell.
@@ -9318,7 +9376,7 @@ pub const WorkbookEnv = struct {
                     .layer = .stored,
                     .v = try dupeValue(a, c.input.scalar(), c.input == .uncached),
                     .formula_text = f.text,
-                    .cache = graphCacheState(c.input),
+                    .cache = cacheTagOf(c.input),
                     .extra = extra,
                 });
             }
@@ -9493,16 +9551,27 @@ pub const WorkbookEnv = struct {
         const a = self.arena.allocator();
         if (self.publish_in_place and v != .blank) {
             if (inPlaceTarget(s, row, col)) |cur| {
-                // Only `v`. `layer` is the identity of the record in key
-                // order and moving it would reorder the coordinate;
-                // `formula_text`, `cache` and `extra` are read *after*
-                // publication — by `formulaAt`, §5.6c's seed table and
-                // `dialectOf` respectively — and a computed record never
-                // carried them, so preserving them is what makes one
-                // record answer for two. Duped first: a failure must not
-                // leave the record half-written.
+                // `layer` is the identity of the record in key order and
+                // moving it would reorder the coordinate; `formula_text`
+                // and `extra` are read *after* publication — by
+                // `formulaAt` and `dialectOf` — and a computed record
+                // never carried them, so preserving them is what makes
+                // one record answer for two. Duped first: a failure must
+                // not leave the record half-written.
+                //
+                // `cache` is re-tagged rather than preserved (§9.1
+                // M10s). It no longer carries its own f64: `cacheState`
+                // reads that out of `v`, so a `cache` left saying
+                // `.number` over a `v` this run just made text would
+                // describe a record that no longer exists. Nothing reads
+                // it between here and the model's death — `buildInput`
+                // is its only reader and it has already run — so this
+                // costs a byte-store to keep an invariant true rather
+                // than to fix an observable bug.
                 const dup = try dupeValue(a, v, false);
-                s.chunks.items[cur.chunk].items[cur.off].v = dup;
+                const target = &s.chunks.items[cur.chunk].items[cur.off];
+                target.v = dup;
+                target.cache = dup.cacheTag();
                 return;
             }
         }
@@ -10344,9 +10413,9 @@ fn sharedFormulaText(
 /// malformed cache before a model exists, which is the pre-mutation
 /// half of §5.6c's fourth row. The graph's own row covers a caller that
 /// assembles an `Input` by hand.
-fn graphCacheState(input: engine.decode.InputCell) engine.graph.CacheState {
+fn cacheTagOf(input: engine.decode.InputCell) WorkbookEnv.CacheTag {
     return switch (input) {
-        .number => |n| .{ .number = n },
+        .number => .number,
         .text => .text,
         .boolean => .boolean,
         .err => .err,
@@ -10496,11 +10565,11 @@ fn writeMinimalSstLessXlsx(allocator: Allocator, io: std.Io, path: []const u8) !
 
 // ─── Tests ────────────────────────────────────────────────────────────
 
-test "WorkbookEnv.Cell stays at its recorded width (M10p)" {
-    // §9.1 M10o: the model holds one `Cell` per coordinate per layer and
-    // the drive publishes a second one at every formula cell — 180 010 of
-    // them on the named workload, in 64-entry chunks. A byte added here
-    // costs 180 KB there, and this is where that trade gets noticed
+test "WorkbookEnv.Cell stays at its recorded width (M10s)" {
+    // §9.1 M10o: the model holds one `Cell` per coordinate per layer —
+    // 100 010 of them on the named workload since M10r stopped the drive
+    // publishing a second one, in 64-entry chunks. A byte added here
+    // costs 100 KB there, and this is where that trade gets noticed
     // rather than in the next RSS profile. `Extra` is the release valve:
     // a rare field belongs behind the index, not in the record.
     //
@@ -10508,9 +10577,68 @@ test "WorkbookEnv.Cell stays at its recorded width (M10p)" {
     // 40 bytes to 32. The union below is the guard on that: a payload
     // wider than `ErrorValue`'s would grow every cell, so a new variant
     // is a width decision, not a local one.
+    //
+    // §9.1 M10s took `cache` from `graph.CacheState` to the 1-byte
+    // `CacheTag`, 80 bytes to 64, by reading the payload f64 back out of
+    // `v` — where it was already stored. The `CacheTag` guard is the one
+    // that matters for the next reader: giving a tag a payload puts the
+    // 15 bytes straight back.
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(WorkbookEnv.OptValue));
-    try std.testing.expectEqual(@as(usize, 80), @sizeOf(WorkbookEnv.Cell));
-    try std.testing.expectEqual(@as(usize, 5128), @sizeOf(WorkbookEnv.Sheet.Chunk));
+    try std.testing.expectEqual(@as(usize, 1), @sizeOf(WorkbookEnv.CacheTag));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(WorkbookEnv.Cell));
+    try std.testing.expectEqual(@as(usize, 4104), @sizeOf(WorkbookEnv.Sheet.Chunk));
+}
+
+test "WorkbookEnv.Cell.cacheState: the f64 survives the narrowing" {
+    // The whole cut rests on one claim — that `cache`'s number and `v`'s
+    // number were the same number. This is that claim, stated where a
+    // change to either side breaks it.
+    const c: WorkbookEnv.Cell = .{
+        .row = try coords.Row.fromOneBased(1),
+        .col = try coords.Col.fromZeroBased(0),
+        .layer = .stored,
+        .v = .{ .number = 1.5 },
+        .cache = .number,
+    };
+    try std.testing.expectEqual(
+        engine.graph.CacheState{ .number = 1.5 },
+        c.cacheState(),
+    );
+
+    // The payload-free tags round-trip unchanged, and `.absent` is the
+    // one that has to stay distinguishable from a cached zero: a missing
+    // `<v>` seeds zero *because the table says so*, not because it holds
+    // one.
+    const text: WorkbookEnv.Cell = .{
+        .row = try coords.Row.fromOneBased(1),
+        .col = try coords.Col.fromZeroBased(0),
+        .layer = .stored,
+        .v = .{ .text = "x" },
+        .cache = .text,
+    };
+    try std.testing.expectEqual(engine.graph.CacheState.text, text.cacheState());
+
+    const uncached: WorkbookEnv.Cell = .{
+        .row = try coords.Row.fromOneBased(1),
+        .col = try coords.Col.fromZeroBased(0),
+        .layer = .stored,
+        .v = .absent,
+        .cache = .absent,
+    };
+    try std.testing.expectEqual(engine.graph.CacheState.absent, uncached.cacheState());
+}
+
+test "WorkbookEnv.OptValue.cacheTag: every value maps to the tag a record would carry" {
+    // `putComputed`'s in-place overwrite re-tags through this, so a new
+    // `OptValue` variant that lands here wrong makes `cacheState` read a
+    // union field the record does not hold.
+    try std.testing.expectEqual(WorkbookEnv.CacheTag.number, (WorkbookEnv.OptValue{ .number = 1 }).cacheTag());
+    try std.testing.expectEqual(WorkbookEnv.CacheTag.text, (WorkbookEnv.OptValue{ .text = "x" }).cacheTag());
+    try std.testing.expectEqual(WorkbookEnv.CacheTag.boolean, (WorkbookEnv.OptValue{ .boolean = true }).cacheTag());
+    try std.testing.expectEqual(WorkbookEnv.CacheTag.err, (WorkbookEnv.OptValue{ .err = .{ .known = .value } }).cacheTag());
+    try std.testing.expectEqual(WorkbookEnv.CacheTag.absent, (@as(WorkbookEnv.OptValue, .absent)).cacheTag());
+    // Blank folds to `.absent`: it carries no number to resume from.
+    try std.testing.expectEqual(WorkbookEnv.CacheTag.absent, (@as(WorkbookEnv.OptValue, .blank)).cacheTag());
 }
 
 test "WorkbookEnv.OptValue: absent and blank stay distinct through the seam" {
