@@ -4672,6 +4672,15 @@ whole-column criteria (`SUMIF(A:A,…,B:B)`) and multi-criteria benches; M8
 adds a TEXT-heavy bench; M9d adds a mixed full-registry workload
 — each report-only against its own recorded baseline, same methodology. **Release gating**: once the M5d baseline is frozen, the local `compare_bench` regression check becomes **blocking for release cuts** (CI stays report-only), and v1 carries **absolute ceilings on ONE named workload — the 100k-cell F1-mix fixture, digest recorded at M5d3**: evaluate ≤ 500 ms and end-to-end ≤ 1 s in **ReleaseFast** (**warm-cache; N=20 runs matching `bench_ci.sh:50`; comparison via `compare_bench.py` EXTENDED in M5d3 with a `--gate` mode** — median-based, nonzero exit on regression for release cuts (today it compares means and always exits 0, `compare_bench.py:88,146`); CI keeps report-only mode; both exit behaviors tested; distribution + baseline commit reported; thermal/load controls); peak RSS ≤ 3× **model bytes = sum of the fixture's decompressed part bytes**, **baseline-adjusted** (pre-open process RSS subtracted), in the **ReleaseSafe RSS lane**; FIRST recalc, zero retained generations; host recorded at baseline. Owner waiver required to exceed; M9d runs absolute + regression checks.
 
+> **Amended 2026-08-11 — the RSS clause only.** The sentence above is
+> kept verbatim for auditability, but the **3 × model bytes ceiling no
+> longer gates a release.** By owner decision (§9.1b) the blocking gate
+> is an absolute ratcheted budget of **53 813 576 B** on the
+> digest-gated named fixture, and 15.15 MiB survives as a non-blocking
+> research hypothesis expressed per modeled cell (158.8 B/cell against
+> 532 B/cell measured). The evaluate ≤ 500 ms and end-to-end ≤ 1 s
+> ceilings are **unchanged** by this amendment.
+
 **Limits (each named, typed refusal, boundary-tested; units explicit)**:
 
 | Limit | Value | Unit |
@@ -6289,6 +6298,176 @@ and the only scheduled row that does is goal_codex.md §6's columnar
 model. Era 10 (decode, 52 684 820) is unchanged and still the
 programme's floor: **7 757 007 B of peak live remain before decode
 wins.** At 3.5× the ceiling conversation is still the overdue row.
+
+**M10s — the model-record row (recorded 2026-08-11).** Same discipline,
+same methodology. `Cell.cache` was a 16-byte `graph.CacheState` carrying
+a tag and an f64 the record already held; it becomes a 1-byte
+`CacheTag`, `Cell` **80 → 64 B**, `Chunk` 5128 → 4104 B. The row took
+§6's narrowing branch, not its structure-of-arrays branch; nothing was
+made columnar and the SoA half is still unspent. Full derivation in
+goal_codex.md §6.
+
+| | M10r | **M10s** |
+|---|---:|---:|
+| peak live at the peak instant | 60 441 827 (the graph build) | **55 311 851 (still the graph build)** |
+| `/usr/bin/time -l` peak ×3 | 56 672 256 B | **55 066 624 B** |
+| process baseline | 1 802 240 B | 1 785 856 B |
+| **baseline-adjusted** | **54 886 400 B — 52.34 MiB** | **53 280 768 B — 50.81 MiB** |
+| vs the 3 × model-bytes ceiling (15.15 MiB) | 3.46× | **3.35×** |
+
+**The finding — the trace over-reported by 3.2× and RSS took the fill.**
+1 600 512 B of fill left the model arena, predicted to the byte, and the
+era trace showed 5 129 952: the ×1.5 ladder stepped down a generation
+and `unfilled` fell 4 992 435 → 1 462 995, so `backing = fill +
+unfilled` exactly. Against M10p — the identical 1 600 512 B of fill with
+a trace delta of **zero** — the pair settles the instrument question §3
+was built to answer: **the era trace prices the ladder, the fill probe
+prices the pages, and it is the pages that are resident.** Price a row
+by the probe.
+
+### 9.1a The ceiling position, seventeen rows in (recorded 2026-08-11)
+
+The row that decides a number rather than cutting one. Everything below
+was re-measured on the shipped M10s binary in one window; the ceiling
+itself is **not renegotiated here** — this section states the position
+the owner is deciding from.
+
+**The denominator, verified.** The fixture's decompressed part bytes were
+listed entry by entry: sheet1.xml 5 288 922 + sharedStrings.xml 4 068 +
+the four structural parts 1 713 = **5 294 703 B**, so the frozen ceiling
+is **15 884 109 B = 15.148 MiB — 158.8 bytes per modeled cell for the
+whole process at its peak instant.**
+
+**Where the programme stands.** RSS reproduced at 55 066 624 B across
+three runs, byte-identical to M10s. The usage-invocation baseline has
+drifted three pages since that session (1 785 856 → 1 835 008), so the
+same measurement reads **53 231 616 B = 50.77 MiB = 3.351×** today
+against M10s's recorded 53 280 768 B / 50.81 MiB / 3.354×. The M10s
+figure stands; the drift is 0.09 %. Against the denominator, RSS is
+**10.06 × model bytes**, or 532 B per modeled cell against the ceiling's
+159.
+
+**What is still scheduled: one row.** goal_codex.md §6b, the
+structure-of-arrays half. Its budget is the gap from era 15 (55 311 851)
+to era 10 (52 684 820) = **2 627 031 B — and that is a peak-live trace
+cap, not an RSS prediction and not an expected saving.** It is ≤ 4.9 %
+of adjusted RSS. Era 10 bounds it because the allocations §6b targets
+are not live there: era 10's twelve tabulated sites sum to 52 683 576 of
+52 684 820, so every untabulated site together holds **at most 1 244 B**
+at that instant, and the model arena (id21) first appears at era 12.
+
+**The peak is a plateau.** The full 24-era vector puts six eras within
+**4 359 643 B — 8.2 % of adjusted RSS**:
+
+| rank | era | phase | peak live |
+|---:|---:|---|---:|
+| 1 | 15 | graph build | **55 311 851** |
+| 2 | 10 | decode | **52 684 820** |
+| 3 | 16 | — | 51 810 883 |
+| 4 | 20 | drive publish | 51 245 809 |
+| 5 | 21 | staging | 51 216 102 |
+| 6 | 22 | — | 50 952 208 |
+
+M10m's lesson — three eras within 2.6 MB, so cutting one alone could
+never pay — now governs the whole programme, and no next increment can
+be priced in advance: §6b is a whole-model change and the model is live
+at eras 12–23, so it moves era 16 as well as era 15. **After §6b the
+entire era vector has to be re-measured before another row can be
+budgeted.**
+
+**Era 10 decomposed — the floor is a floor of scope, not of the engine.**
+
+| site | bytes at era 10 | share | what it is |
+|---|---:|---:|---|
+| id19 | 22 763 520 | 43.2 % | `sharedFormulaText` output (`workbook.zig:9358`), freed at the end of the per-sheet loop body (`:9430`) — with one sheet it lives through the whole model build |
+| id15 + id14 + id18 + id16 | 21 939 540 | 41.6 % | four `decode.zig:1882` scan lists, including an abandoned growth generation |
+| id7 | 7 951 114 | 15.1 % | `store.materializeAt` — 5 288 922 B of sheet XML in a 7 951 114 B arena request |
+| rest | 30 646 | 0.1 % | |
+
+None of it is model data. **id7 is the only site live in all 24 eras** —
+the only single allocation whose removal could lower the envelope rather
+than expose the next era — and it is goal_codex.md §4, already retracted
+on `Part.bytes` lifetime-contract grounds.
+
+**And era 0 is already over the ceiling**: 17 705 157 B — the
+decompressed input plus the scan's own lists, **1.11× the ceiling,
+before a model record exists.**
+
+**The Codex round, and what it refuted.** Two rounds on the framing
+(gpt-5.6-sol, high effort), and the first round killed the option set
+this section was going to carry.
+
+| claim put to it | ruling | what it was |
+|---|---|---|
+| "RSS now tracks peak live (residual 245 227 B), so §6b lands the programme at 48.3 MiB" | **WRONG** | the ladder's recurring cross-currency error. A near-zero residual between two maxima that need not occur at the same instant is not a slope. Quotable only as a scenario: *if* §6b exhausts its cap *and* it translates 1:1 into resident pages, 50 604 585 B = 48.26 MiB = 3.19× |
+| the 10–12 MiB advisory floor for a general engine | **RETIRED** | no bottom-up representation budget behind it. At 10–12 MiB the whole process gets 105–126 B/cell while the sheet XML alone is 52.9 B/cell; it was intuition, never reconciled with a measured per-cell budget. **It is not quoted to the owner and should not be quoted again without one** |
+| "83 % of era 10 is transient, therefore cuttable" | **UNSUPPORTED** | transient ≠ removable, and a decode-only cut can expose era 15 and move RSS by nothing — M10j's outcome exactly |
+| "era 0 proves 3× needs a streaming decode" | **WRONG, with a counterexample** | id7 is an arena request around a smaller payload. Exact-size it and era 0 reads `17 705 157 − (7 951 114 − 5 288 922) =` **15 042 965 B, already below the 15 884 109 ceiling** — no eviction, no streaming. Era 0 licenses "decode/input lifetime is a mandatory feasibility area", not an impossibility proof |
+
+What survives is weaker and truer: **the scheduled ladder has no
+demonstrated route to 3×.** Not that the architecture forbids it.
+
+**A defect in the measurement contract itself, confirmed.** §9 freezes
+the figure as baseline-adjusted with "pre-open process RSS" subtracted,
+while the method above subtracts "the `/usr/bin/time -l` peak of a usage
+invocation". Those are different execution states — the profiler build
+reads 1 769 472 B in-process pre-open against the usage invocation's
+1 835 008 B, a 65 536 B gap. It is 0.12 % of the number and changes no
+verdict on this page, but the two definitions should not coexist: the
+wording should be reconciled to the measurement actually performed.
+
+### 9.1b The owner's decision (recorded 2026-08-11)
+
+Put to the owner with the option set above, after both Codex rounds had
+been applied to it. All three answers taken as given:
+
+**1. The release gate becomes an absolute ratcheted budget; 3× is
+demoted to a non-blocking research hypothesis.**
+
+| | value |
+|---|---|
+| gate | peak RSS, first recalc, zero retained generations, ReleaseSafe lane, baseline-adjusted, on the digest-gated `f1_mix_named` fixture (sha256 `b2b42c0b…8ad0`) |
+| **budget** | **53 813 576 B** — the M10s figure 53 280 768 B **+ 1 %** |
+| tolerance | the 1 % above. The same binary reproduces byte-identically ×3; the slack is for host drift, which moved the usage baseline 49 152 B in three days, and for the cross-binary page sensitivity M10p logged |
+| pinned | host and toolchain recorded with the figure; a breach is **re-measured on an idle host before it is believed** — M10o's concurrent-build artifact faked +29.9 % on an identical binary |
+| ratchet | a row that measures a lower figure lowers the budget to its own figure + 1 %. The budget never rises |
+| blocking | yes, for release cuts, alongside `compare_bench --gate` |
+
+The 15.15 MiB / 3 × model-bytes figure is **kept, not deleted** — it
+becomes a documented research hypothesis with no release authority, and
+§9's frozen wording is annotated rather than rewritten so the history
+stays auditable.
+
+**2. A bounded feasibility spike comes before any further ladder row.**
+Its shape, and the reason for each part:
+
+- **Measure, do not infer.** Resident pages and touched-fill *per era
+  checkpoint* — the whole point is to stop deriving RSS from traced live
+  bytes, which is the error two Codex rounds refuted here and which the
+  ladder has now made four times.
+- **Then compare, in this order**: exact-sized part storage (id7 holds
+  5 288 922 B of XML in a 7 951 114 B request, and it is the only site
+  live in all 24 eras); scan-list fill vs capacity and phase overlap;
+  a fused or narrower **non-streaming** decode. Only after those, part
+  release or a parallel streaming API — the order matters because era
+  0's counterexample shows the cheap option was never tried.
+- **Go/no-go at the end**, explicitly. The spike may conclude that no
+  further row is worth its complexity; that is a legitimate outcome, not
+  a failure.
+
+§6b stays available but is **not** the next thing done: it is a
+whole-model change touching eras 12–23, so spending it first would
+invalidate the very era vector the spike needs to read.
+
+**3. The research target's unit becomes bytes per modeled cell, plus a
+scaling matrix.** Today that reads **532 B/cell measured against the
+hypothesis's 158.8 B/cell.** The matrix measures slopes against cells,
+retained text bytes and dependency-edge density across several fixture
+shapes and sizes — non-blocking, and the only thing that would let zlsx
+make a memory claim from more than one point on one curve. The ratio
+against decompressed XML bytes is retired as a *unit* for the same
+reason it was always suspect: it loosens for a verbose workbook and
+tightens for a compact one carrying identical content.
 
 ---
 
