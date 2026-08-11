@@ -4670,16 +4670,43 @@ full-column sparse-range benches (§5.6a). **Milestone-local perf gates after
 M5d** (a tree walker can pass M5d and regress later): M7a adds large-spill AND SORT/UNIQUE benches (they ship there); M7b2 adds
 whole-column criteria (`SUMIF(A:A,…,B:B)`) and multi-criteria benches; M8
 adds a TEXT-heavy bench; M9d adds a mixed full-registry workload
-— each report-only against its own recorded baseline, same methodology. **Release gating**: once the M5d baseline is frozen, the local `compare_bench` regression check becomes **blocking for release cuts** (CI stays report-only), and v1 carries **absolute ceilings on ONE named workload — the 100k-cell F1-mix fixture, digest recorded at M5d3**: evaluate ≤ 500 ms and end-to-end ≤ 1 s in **ReleaseFast** (**warm-cache; N=20 runs matching `bench_ci.sh:50`; comparison via `compare_bench.py` EXTENDED in M5d3 with a `--gate` mode** — median-based, nonzero exit on regression for release cuts (today it compares means and always exits 0, `compare_bench.py:88,146`); CI keeps report-only mode; both exit behaviors tested; distribution + baseline commit reported; thermal/load controls); peak RSS ≤ 3× **model bytes = sum of the fixture's decompressed part bytes**, **baseline-adjusted** (pre-open process RSS subtracted), in the **ReleaseSafe RSS lane**; FIRST recalc, zero retained generations; host recorded at baseline. Owner waiver required to exceed; M9d runs absolute + regression checks.
+— each report-only against its own recorded baseline, same methodology. **Release gating**: once the M5d baseline is frozen, the local `compare_bench` regression check becomes **blocking for release cuts** (CI stays report-only), and v1 carries **absolute ceilings on ONE named workload — the 100k-cell F1-mix fixture, digest recorded at M5d3**: evaluate ≤ 500 ms and end-to-end ≤ 1 s in **ReleaseFast** (**warm-cache; N=20 runs matching `bench_ci.sh:50`; comparison via `compare_bench.py` EXTENDED in M5d3 with a `--gate` mode** — median-based, nonzero exit on regression for release cuts (today it compares means and always exits 0, `compare_bench.py:88,146`); CI keeps report-only mode; both exit behaviors tested; distribution + baseline commit reported; thermal/load controls); peak RSS ≤ 3× **model bytes = sum of the fixture's decompressed part bytes**, **baseline-adjusted** (the `/usr/bin/time -l` *maximum resident set size* of a **usage invocation of the same binary** subtracted — see the second amendment below), in the **ReleaseSafe RSS lane**; FIRST recalc, zero retained generations; host recorded at baseline. Owner waiver required to exceed; M9d runs absolute + regression checks.
 
-> **Amended 2026-08-11 — the RSS clause only.** The sentence above is
-> kept verbatim for auditability, but the **3 × model bytes ceiling no
-> longer gates a release.** By owner decision (§9.1b) the blocking gate
-> is an absolute ratcheted budget of **53 813 576 B** on the
-> digest-gated named fixture, and 15.15 MiB survives as a non-blocking
+> **Amended 2026-08-11 — the RSS clause only.** The sentence above keeps
+> its decision wording verbatim for auditability (the one exception is
+> the baseline-adjustment parenthetical, corrected by the second
+> amendment below), but the **3 × model bytes ceiling no longer gates a
+> release.** By owner decision (§9.1b) the blocking gate is an absolute
+> ratcheted budget on the digest-gated named fixture — opened at
+> **53 813 576 B**, ratcheted to **53 631 549 B** by M10t (§9.1c) and
+> re-affirmed by M10u (§9.1d) — and 15.15 MiB survives as a non-blocking
 > research hypothesis expressed per modeled cell (158.8 B/cell against
 > 532 B/cell measured). The evaluate ≤ 500 ms and end-to-end ≤ 1 s
 > ceilings are **unchanged** by this amendment.
+>
+> **Amended 2026-08-11 (second) — the baseline-adjustment wording.**
+> §9.1a logged a defect in the measurement contract itself: this section
+> said the figure was baseline-adjusted by subtracting **"pre-open
+> process RSS"**, while every row from M10a to M10t subtracted *the
+> `/usr/bin/time -l` peak of a usage invocation of the same binary*.
+> Those are different execution states, and they do not read the same:
+> on the M10s binary the profiler build measured 1 769 472 B in-process
+> before `open` against the usage invocation's 1 835 008 B, a 65 536 B
+> gap — 0.12 % of the figure, no verdict changed, but two definitions
+> that must not coexist under one gate. **The parenthetical above is now
+> the method actually performed**, and it is the method §9.1b's budget
+> gates on. The old wording is preserved in this note; nothing was
+> re-measured, because nothing measured had ever used it.
+>
+> *Why a usage invocation and not an in-process reading:* the gate is an
+> external, whole-process figure (`maximum resident set size`, the same
+> `ru_maxrss` M10t validated its sampler against to the byte). A usage
+> invocation is the same binary reaching the same `main`, allocating
+> nothing the workload needs — so the subtraction removes exactly the
+> loader, the runtime and the binary's own image, which is what a
+> baseline is for. An in-process pre-`open` reading would additionally
+> remove whatever the process had already touched, which drifts with
+> code that has nothing to do with the workload.
 
 **Limits (each named, typed refusal, boundary-tested; units explicit)**:
 
@@ -6415,6 +6442,8 @@ reads 1 769 472 B in-process pre-open against the usage invocation's
 1 835 008 B, a 65 536 B gap. It is 0.12 % of the number and changes no
 verdict on this page, but the two definitions should not coexist: the
 wording should be reconciled to the measurement actually performed.
+**Done in M10u** — §9 now carries the usage-invocation definition in the
+clause itself, with the old wording preserved in its second amendment.
 
 ### 9.1b The owner's decision (recorded 2026-08-11)
 
@@ -6694,6 +6723,206 @@ small cuts cannot be priced closer than one page. What did **not** move
 is the adjusted figure: 53 100 544 B on both, because the usage baseline
 drifted the same page. That is the number the gate reads, and it is the
 reason the gate is defined baseline-adjusted.)*
+
+### 9.1d M10u — the scaling matrix: three shapes, three sizes (2026-08-11)
+
+§9.1b's third decision made the research unit **bytes per modeled cell**
+and ordered a matrix behind it, "the only thing that would let zlsx make
+a memory claim from more than one point on one curve." This is that
+matrix. It measures nine points on three curves, in both optimize lanes,
+and it answers a question the ladder had never put: **of the three
+things §9.1b named as predictors — cells, retained text bytes,
+dependency-edge density — which one actually carries the memory?**
+
+One of them does.
+
+**Method.** Identical to the gate's, per §9's corrected wording (second
+amendment above): adjusted = `/usr/bin/time -l` *maximum resident set
+size* of `zlsx-bench-recalc recalc <fixture>`, minus the same field for
+a **usage invocation of the same binary**. Three repetitions per cell,
+the baseline re-read immediately before every measurement — M10t
+measured 49 152 B of host drift inside one hour. **All 54 peaks and all
+54 baselines reproduced byte-identically**, so the medians below are the
+values, not estimates of them. `pages` mode was run beside every cell as
+a second currency; it is reported separately because it is not the gate.
+
+Sizes are 1 000 / 10 000 / 40 000 data rows. The middle size of each
+shape is that shape's **digest-gated identity fixture**, and all three
+digests reproduced: `b2b42c0b…8ad0` (f1_mix named), `63eddc8f…9899`
+(text small), `31dbe2bd…4e2` (criteria small).
+
+#### The matrix
+
+| shape | size | cells | lane | adjusted RSS | B/cell | edges | edges/cell | text B |
+|---|---|---:|---|---:|---:|---:|---:|---:|
+| f1 | 1k | 10 000 | ReleaseSafe | 7 372 800 | 737.3 | 9 967 | 0.997 | 4 067 |
+| f1 | 1k | 10 000 | ReleaseFast | 7 143 424 | 714.3 | 9 967 | 0.997 | 4 067 |
+| **f1** | **10k** | **100 000** | **ReleaseSafe** | **53 116 928** | **531.2** | 99 686 | 0.997 | 4 068 |
+| f1 | 10k | 100 000 | ReleaseFast | 49 496 064 | 495.0 | 99 686 | 0.997 | 4 068 |
+| f1 | 40k | 400 000 | ReleaseSafe | 203 898 880 | 509.7 | 398 749 | 0.997 | 4 068 |
+| f1 | 40k | 400 000 | ReleaseFast | 192 249 856 | 480.6 | 398 749 | 0.997 | 4 068 |
+| text | 1k | 9 000 | ReleaseSafe | 7 012 352 | 779.2 | 2 000 | 0.222 | 82 016 |
+| text | 1k | 9 000 | ReleaseFast | 7 012 352 | 779.2 | 2 000 | 0.222 | 82 016 |
+| text | 10k | 90 000 | ReleaseSafe | 45 367 296 | 504.1 | 20 000 | 0.222 | 483 441 |
+| text | 10k | 90 000 | ReleaseFast | 45 236 224 | 502.6 | 20 000 | 0.222 | 483 441 |
+| text | 40k | 360 000 | ReleaseSafe | 173 211 648 | 481.1 | 80 000 | 0.222 | 1 541 402 |
+| text | 40k | 360 000 | ReleaseFast | 173 080 576 | 480.8 | 80 000 | 0.222 | 1 541 402 |
+| crit | 1k | 3 512 | ReleaseSafe | 3 457 024 | 984.3 | 1 088 | 0.310 | 1 141 |
+| crit | 1k | 3 512 | ReleaseFast | 3 538 944 | 1 007.7 | 1 088 | 0.310 | 1 141 |
+| crit | 10k | 30 512 | ReleaseSafe | 12 877 824 | 422.1 | 1 088 | 0.036 | 1 142 |
+| crit | 10k | 30 512 | ReleaseFast | 12 910 592 | 423.1 | 1 088 | 0.036 | 1 142 |
+| crit | 40k | 120 512 | ReleaseSafe | 55 869 440 | 463.6 | 1 088 | 0.009 | 1 142 |
+| crit | 40k | 120 512 | ReleaseFast | 46 809 088 | 388.4 | 1 088 | 0.009 | 1 142 |
+
+`text B` is the text the run *retains*: the input shared-string payload
+plus the string-typed results it computed (0 for f1 and criteria, which
+produce numbers; 200 000 string results totalling 1 410 640 B at
+text/40k). `edges` is `graph.Stats.edges` — admitted, deduplicated,
+between graph nodes — newly carried on `RecalcReport.dependency_edges`,
+because no property of a fixture's geometry predicts it: a whole-column
+criterion compiles to a **bounded** edge set, and the criteria column
+below proves it by not moving.
+
+#### The answer: cells predict memory; the other two predict nothing
+
+| predictor | range across the nine ReleaseSafe cells | spread |
+|---|---|---:|
+| **B/cell** | 422.1 → 984.3 | **2.33×** |
+| edges per cell | 0.0090 → 0.9969 | 110.4× |
+| retained text B per cell | 0.0095 → 9.1129 | 961.7× |
+
+**Edge density varies 110-fold and text mass 962-fold across these nine
+workbooks, and per-cell memory moves 2.3× — most of which is the fixed
+cost at the smallest size.** Read as slopes rather than ratios the point
+is sharper still:
+
+| shape | lane | slope (B/cell) | intercept | R² | marginals (1k→10k, 10k→40k) |
+|---|---|---:|---:|---:|---|
+| f1 | ReleaseSafe | **503.6** | 2 520 248 | 1.00000 | 508.3, 502.6 |
+| f1 | ReleaseFast | 474.9 | 2 223 725 | 1.00000 | 470.6, 475.8 |
+| text | ReleaseSafe | **473.5** | 2 751 432 | 1.00000 | 473.5, 473.5 |
+| text | ReleaseFast | 473.2 | 2 706 798 | 1.00000 | 471.9, 473.5 |
+| crit | ReleaseSafe | 455.5 | 606 872 | 0.99722 | 348.9, **477.7** |
+| crit | ReleaseFast | 371.5 | 1 947 055 | 0.99978 | 347.1, 376.6 |
+
+**Three shapes with nothing in common — 1.25 edges per formula against
+0.33 against a constant 1 088; 4 KB of text against 1.5 MB; eight
+arithmetic columns against six TEXT columns against 512 whole-column
+criteria — land within 1.10× of each other on the per-cell slope, at
+455–504 B/cell in the gate lane.** f1 and text are linear to five
+decimal places over a 40× size range. That is the memory claim §9.1b
+asked whether zlsx could make, and it is *per cell*, with a fixed cost
+of 0.6–2.8 MB beside it.
+
+**Why B/cell falls with size, and why that is not an improvement.**
+Every shape's B/cell drops from 1k to 10k (737→531, 779→504, 984→422)
+and then flattens. That is the intercept being amortized, not the engine
+getting cheaper: at f1/1k the 2.52 MB fixed cost is 34 % of the figure
+and at f1/40k it is 1.2 %. **A B/cell quoted without its size is a
+statement about how big the fixture was.** The named fixture's 531.2 sits
+5.5 % above f1's own asymptote for exactly this reason.
+
+#### Two findings that qualify recorded numbers
+
+**1. The 6.7 % safety-memset tax is a property of f1_named, not of the
+lane.** §9.1c measured ReleaseSafe against ReleaseFast on one fixture at
+one size and reported the gap as a share of the gate figure. Across the
+matrix that gap is:
+
+| | 1k | 10k | 40k |
+|---|---:|---:|---:|
+| f1 | +3.1 % | **+6.8 %** | +5.7 % |
+| text | **+0.0 %** (byte-identical) | +0.3 % | +0.1 % |
+| crit | −2.4 % | −0.3 % | **+16.2 %** |
+
+**Zero to sixteen percent.** The mechanism §9.1c established explains
+the spread exactly: `alloc` memsets, so the tax is paid on *capacity
+that is allocated and not written*. The text shape allocates what it
+writes — 0 B of tax at 1k, where the two lanes' raw peaks were
+byte-identical. The criteria shape's whole-column scan buffers grow with
+data rows and are largely untouched — 9 060 352 B of tax at 40k, 226 B
+per data row. **The negative cells are not noise either**: the two lanes'
+raw peaks were identical there and only the usage baselines differed
+(1 867 776 vs 1 785 856), which is what a baseline-adjusted figure is
+supposed to expose.
+
+**2. The retired XML-bytes unit, falsified on a coincidence.** §9.1b
+retired the ratio against decompressed part bytes on the argument that
+it "loosens for a verbose workbook and tightens for a compact one
+carrying identical content". The fixtures handed us the experiment:
+
+| | decompressed part bytes | cells | adjusted RSS | × model bytes | B/cell |
+|---|---:|---:|---:|---:|---:|
+| f1 / 10k | 5 294 703 | 100 000 | 53 116 928 | **10.03×** | 531.2 |
+| text / 10k | 5 287 426 | 90 000 | 45 367 296 | **8.58×** | 504.1 |
+
+**Two workbooks whose decompressed bytes differ by 7 277 — 0.14 % — and
+whose RSS differs by 7 749 632, or 17.1 %.** In B/cell they are 5.4 %
+apart. Across the whole matrix the ratio spans **8.14× to 24.32×**: a
+ceiling written in that unit would be a different ceiling on every
+fixture, which is precisely why the 3× figure could be simultaneously
+"missed by 3.3×" on f1_named and meaningless as a general claim.
+
+#### The `pages` currency beside the gate currency
+
+Every cell was also run under M10t's off-thread resident sampler.
+
+| cell | gate-adjusted | pages-adjusted | difference | eras | coverage |
+|---|---:|---:|---:|---:|---:|
+| f1/1k | 7 372 800 | 7 487 488 | +114 688 | 5 | 1.0000 |
+| f1/10k | 53 116 928 | 53 231 616 | +114 688 | 23 | 1.0000 |
+| f1/40k | 203 898 880 | 189 480 960 | −14 417 920 | 18 | **0.9296** |
+| text/1k | 7 012 352 | 7 127 040 | +114 688 | 3 | 1.0000 |
+| text/10k | 45 367 296 | 45 481 984 | +114 688 | 17 | 1.0000 |
+| text/40k | 173 211 648 | 155 205 632 | −18 006 016 | 24 | **0.8970** |
+| crit/1k | 3 457 024 | 3 571 712 | +114 688 | 1 | 1.0000 |
+| crit/10k | 12 877 824 | 12 992 512 | +114 688 | 5 | 1.0000 |
+| crit/40k | 55 869 440 | 55 984 128 | +114 688 | 13 | 1.0000 |
+
+**Where the sampler caught the peak the two currencies differ by exactly
+114 688 B — the same constant in all seven cells** — and that constant
+is the instrument's baseline definition, not noise: `pages` subtracts an
+in-process pre-`open` reading (2 555 904 B, its own 786 432 B sample
+buffer included) where the gate subtracts a usage invocation's peak.
+**This is §9.1a's wording defect, measured.** The two 40k cells that
+disagree by megabytes are the two whose own `coverage` check says the
+thread missed the kernel's maximum — the sampler declares its own
+invalidity, and their era heights are floors. Era counts scale with the
+workload (1 for crit/1k, 24 for text/40k), so the 24-era vector §9.1c
+tabulated is a property of the named fixture too, not a constant of the
+pipeline.
+
+#### The gate, re-measured
+
+| | value |
+|---|---:|
+| f1_mix named, ReleaseSafe, ×3 byte-identical | 54 984 704 |
+| usage-invocation baseline | 1 867 776 |
+| **baseline-adjusted** | **53 116 928** |
+| ratcheted budget (§9.1c) | 53 631 549 |
+| headroom | 514 621 B (0.96 %) |
+
+**Within budget.** Against M10t's 53 100 544 this reads +16 384 B —
+**exactly one page**, the binary-layout sensitivity M10t recorded and
+the reason the gate is defined on the adjusted figure. It is *not* a
+lower figure, so **the budget does not ratchet: it stays 53 631 549 B.**
+
+#### What this does and does not say about the research target
+
+The hypothesis is 158.8 B/cell. The matrix replaces "532 B/cell
+measured" with something a target can actually be set against:
+
+- the **marginal** cost is 455–504 B/cell in the gate lane and 371–475
+  in ReleaseFast, across three unrelated shapes;
+- the **fixed** cost is 0.6–2.8 MB and is already small at 100 000 cells;
+- so reaching 158.8 B/cell requires the *slope* to fall ~3×, and no
+  amount of amortization gets there — the intercept is not the problem.
+
+It also says the target is **shape-independent to within 10 %**, which
+is new: a 3× reduction cannot be found in one workload's peculiarities,
+because the three workloads agree. §9.1c's no-go stands unchanged — this
+row measured curves, it did not cut bytes, and the 2 048 000 B budget it
+left for any further row is untouched.
 
 ---
 

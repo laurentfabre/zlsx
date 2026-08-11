@@ -380,6 +380,12 @@ pub fn prepare(
     // run's memory peak (§9.1). The flag covers the returns between.
     var g_owned = true;
     defer if (g_owned) g.deinit();
+    // Read here because the drive takes the graph below, and §9.1d wants
+    // the number before it is gone. `build` charges its own local
+    // counter set (`graph.build` only shares one when the caller passes
+    // it), so the run-level `counters` further down never sees these
+    // edges — `stats` is the only place they exist.
+    const built_edges = g.stats.edges;
 
     // Every formula cell is a root. A recalc is the whole workbook by
     // definition (§5.7.1), and stating it as roots rather than as "run
@@ -531,6 +537,7 @@ pub fn prepare(
                     candidate.report.passes = drive_passes;
                     candidate.report.non_converged_cells = drive_non_converged;
                     candidate.report.dynamic_passes = drive_dynamic_passes;
+                    candidate.report.dependency_edges = built_edges;
                     return .{ .ok = candidate.* };
                 },
             }
@@ -1522,6 +1529,63 @@ test "recalculate: a stale cache becomes the value the formula says" {
     const part = (try wb.store.part("xl/workbook.xml")).?;
     try testing.expect(std.mem.indexOf(u8, part.bytes, "calcId=\"0\"") != null);
     try testing.expect(std.mem.indexOf(u8, part.bytes, "fullCalcOnLoad=\"1\"") != null);
+}
+
+test "§9.1d: the report carries the run's admitted dependency edges" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+
+    // One formula whose only precedent is a literal. The graph carries
+    // no node for a constant, so a formula that ran contributes zero
+    // edges — the field counts edges, not formulas.
+    {
+        const path = try writeFixture(a, io, dir, "one.xlsx", .{});
+        defer a.free(path);
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        var report = try wb.recalculate(a, io, fixed_run, .{});
+        defer report.deinit(a);
+        try testing.expectEqual(@as(u64, 1), report.cells_written);
+        try testing.expectEqual(@as(u64, 0), report.dependency_edges);
+    }
+
+    // Three formulas, and the literal `A1` still contributes nothing:
+    // C1→B1, D1→{C1,B1} — three edges over three formula cells.
+    {
+        const path = try writeFixture(a, io, dir, "chain.xlsx", .{
+            .sheet = "<worksheet xmlns=\"" ++ ns_main ++ "\"><sheetData><row r=\"1\">" ++
+                "<c r=\"A1\"><v>1</v></c>" ++
+                "<c r=\"B1\"><f>A1+1</f><v>999</v></c>" ++
+                "<c r=\"C1\"><f>B1+A1</f><v>999</v></c>" ++
+                "<c r=\"D1\"><f>C1+B1</f><v>999</v></c>" ++
+                "</row></sheetData></worksheet>",
+        });
+        defer a.free(path);
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        var report = try wb.recalculate(a, io, fixed_run, .{});
+        defer report.deinit(a);
+        try testing.expectEqual(@as(u64, 3), report.dependency_edges);
+    }
+
+    // No formula, no graph, and the field says so rather than carrying a
+    // stale count from a previous run's counters.
+    {
+        const path = try writeFixture(a, io, dir, "flat.xlsx", .{ .sheet = sheet_no_formula });
+        defer a.free(path);
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        var report = try wb.recalculate(a, io, fixed_run, .{});
+        defer report.deinit(a);
+        try testing.expectEqual(@as(u64, 0), report.dependency_edges);
+    }
 }
 
 test "saveWithRecalc: the file holds what the recalc computed" {
