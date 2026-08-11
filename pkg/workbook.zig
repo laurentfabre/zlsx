@@ -8857,6 +8857,28 @@ pub const WorkbookEnv = struct {
     /// arena would give back and keeps every live index valid.
     extras: std.ArrayListUnmanaged(Extra) = .empty,
 
+    /// §9.1 M10r: publish by overwriting the formula record's value
+    /// instead of laying a second `Cell` over it.
+    ///
+    /// Off by default, and it must stay off for every host that can
+    /// retract. The two records the drive kept at each formula cell were
+    /// never both *read*: the computed one shadowed the stored one for
+    /// every merged read, and the stored one answered `formulaAt`,
+    /// `dialectOf` and `svOccupied` from fields the computed record does
+    /// not carry. Overwriting `v` on the record that already holds
+    /// `layer`, `formula_text`, `cache` and `extra` gives every one of
+    /// those readers the same answer from one record.
+    ///
+    /// **The cost is retraction, and it is not negotiable.** The
+    /// overwritten value is gone; `retractResult` can uncover a lower
+    /// layer but cannot restore an overwritten one, and the engine's
+    /// journal holds only `CellRef`. So a host that sets this must
+    /// discard the whole model on refusal — `iterate.Options.retraction
+    /// = .candidate_discard` — which is exactly what `recalc_run`'s
+    /// per-run `WorkbookEnv` already does at `defer model.deinit()`.
+    /// `retractResult` asserts the pairing rather than trusting it.
+    publish_in_place: bool = false,
+
     /// `Cell.v`'s optional, in band.
     ///
     /// `?ScalarValue` costs 40 bytes to carry 32 of content: the payload
@@ -9469,12 +9491,70 @@ pub const WorkbookEnv = struct {
     ) engine.env.Error!void {
         const s = try self.sheetMut(sheet);
         const a = self.arena.allocator();
+        if (self.publish_in_place and v != .blank) {
+            if (inPlaceTarget(s, row, col)) |cur| {
+                // Only `v`. `layer` is the identity of the record in key
+                // order and moving it would reorder the coordinate;
+                // `formula_text`, `cache` and `extra` are read *after*
+                // publication — by `formulaAt`, §5.6c's seed table and
+                // `dialectOf` respectively — and a computed record never
+                // carried them, so preserving them is what makes one
+                // record answer for two. Duped first: a failure must not
+                // leave the record half-written.
+                const dup = try dupeValue(a, v, false);
+                s.chunks.items[cur.chunk].items[cur.off].v = dup;
+                return;
+            }
+        }
         try s.insert(a, .{
             .row = row,
             .col = col,
             .layer = .computed,
             .v = try dupeValue(a, v, false),
         });
+    }
+
+    /// The record `publish_in_place` may overwrite at a coordinate, or
+    /// null when the publication has to lay a `.computed` record instead.
+    ///
+    /// Only the **topmost** record is a candidate, because only the
+    /// topmost record is what a merged read returns — overwriting
+    /// anything below it would publish a value nothing can see. Two
+    /// exclusions make the rest safe:
+    ///
+    /// - **Never a spill tail.** A tail's `v` belongs to the anchor that
+    ///   placed it, and `retractResult` on the cell that published over
+    ///   it must reveal the tail again (the C1-over-B1's-tail fixture).
+    ///   A tail carries no `formula_text`, so the formula test below
+    ///   already excludes it; it is spelled out anyway, because the
+    ///   reason is ownership rather than the absence of a body.
+    /// - **A formula record only.** The value being published is that
+    ///   formula's own result, so overwriting it restates what the cell
+    ///   already means. A stored *value* has no such relationship to the
+    ///   run, and a model whose stored values were silently rewritten
+    ///   would be a different document, not a recalculated one.
+    ///
+    /// An existing `.computed` record is left to `Sheet.insert`, which
+    /// replaces a same-key entry in place already — the record this
+    /// exists to avoid was allocated on some earlier pass and cannot be
+    /// un-allocated now.
+    ///
+    /// The caller adds a third exclusion the cursor cannot see: **a
+    /// published `.blank`**. `dupeValue` folds blank to `.absent`, and
+    /// `.absent` on a record carrying `formula_text` is this type's
+    /// spelling of *uncached* — so writing it in place would say "never
+    /// computed" about a cell that just computed, and `isUncached` would
+    /// answer the opposite of the truth. A separate `.computed` record
+    /// carries no `formula_text`, so it can hold `.absent` without
+    /// claiming that; the blank-producing cells keep it.
+    fn inPlaceTarget(s: *const Sheet, row: coords.Row, col: coords.Col) ?Sheet.Cursor {
+        const cur = s.lowerBound(row, col, .computed);
+        const top = s.at(cur) orelse return null;
+        if (top.row.oneBased() != row.oneBased()) return null;
+        if (top.col.zeroBased() != col.zeroBased()) return null;
+        if (top.layer == .computed or top.layer == .spill_tail) return null;
+        if (top.formula_text == null) return null;
+        return cur;
     }
 
     /// Remove one coordinate from the computed layer.
@@ -9642,6 +9722,17 @@ pub const WorkbookEnv = struct {
                 // will never reach it. The new extent's tails are
                 // cleared by shape — the registry may still hold the
                 // OLD outcome at that point.
+                //
+                // Under `publish_in_place` the third line is weaker —
+                // `clearComputed` finds no computed record to remove and
+                // the anchor keeps whatever `v` an earlier pass wrote.
+                // That is sound only because reaching this `errdefer` at
+                // all means the run is failing: the error leaves
+                // `publishResult`, `vtPublish` turns it into
+                // `driver.failure`, and `prepare` returns before staging.
+                // The model is discarded either way; what this block
+                // still buys there is a consistent *registry* for the
+                // remainder of the unwinding.
                 errdefer {
                     self.clearTailsIn(cell, m.shape());
                     self.spills.forget(cell);
@@ -9664,6 +9755,11 @@ pub const WorkbookEnv = struct {
     /// transaction" means on the rollback side. Infallible for §5.6c's
     /// zero-mutation promise, like `clearComputed`.
     pub fn retractResult(self: *WorkbookEnv, cell: engine.env.CellRef) void {
+        // §9.1 M10r's pairing, checked rather than documented: in-place
+        // publication overwrote the record this would have to restore,
+        // so a host that reaches here with the flag set has kept a
+        // journal it cannot replay. The two are one decision.
+        assert(!self.publish_in_place);
         svClearOwnTails(self, cell);
         self.spills.forget(cell);
         self.clearComputed(cell.sheet, cell.row, cell.col);
@@ -18038,6 +18134,157 @@ test "M7a: §5.8a's decision table over a real workbook, each class recorded" {
     env.retractResult(b5);
     try std.testing.expect(env.spillClassOf(b5) == null);
     try std.testing.expect((try read.cellValue(b5)) == .blank or (try read.cellValue(b5)) == .number);
+}
+
+// ─── §9.1 M10r: in-place publication ─────────────────────────────
+
+/// Every record a coordinate carries, and the topmost one. The count is
+/// what M10r is *about* — one record where the drive used to keep two —
+/// so a fixture that only compared read-back values could not see the
+/// row at all.
+const CoordRecords = struct { count: usize, top: WorkbookEnv.Cell };
+
+fn recordsAt(s: *const WorkbookEnv.Sheet, row: coords.Row, col: coords.Col) CoordRecords {
+    var cur = s.lowerBound(row, col, .computed);
+    var out: CoordRecords = .{ .count = 0, .top = undefined };
+    while (s.at(cur)) |c| : (cur = s.next(cur)) {
+        if (c.row.oneBased() != row.oneBased()) break;
+        if (c.col.zeroBased() != col.zeroBased()) break;
+        if (out.count == 0) out.top = c;
+        out.count += 1;
+    }
+    return out;
+}
+
+test "M10r: in-place publication overwrites `v` and preserves the rest of the record" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const sheet = try testSheetXml(
+        ta,
+        "<row r=\"1\"><c r=\"A1\"><v>5</v></c><c r=\"B1\"><f>A1+1</f><v>6</v></c></row>",
+    );
+    defer ta.free(sheet);
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+    defer wb.deinit();
+
+    var env = try expectBuilt(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    defer env.deinit();
+    const e = env.evalEnv();
+    const s0 = engine.env.SheetIndex.fromInt(0);
+    const row1 = try coords.Row.fromOneBased(1);
+    const col_b = try coords.Col.fromZeroBased(1);
+    const b1: engine.env.CellRef = .{ .sheet = s0, .row = row1, .col = col_b };
+
+    const before = recordsAt(&env.sheets[0], row1, col_b);
+    try std.testing.expectEqual(@as(usize, 1), before.count);
+
+    env.publish_in_place = true;
+    try env.putComputed(s0, row1, col_b, engine.value.ScalarValue.fromNumber(42));
+
+    // The row itself: one record, where the drive used to leave two.
+    const after = recordsAt(&env.sheets[0], row1, col_b);
+    try std.testing.expectEqual(@as(usize, 1), after.count);
+    // …and it is the SAME record, with one field moved. `layer` is its
+    // position in key order, `cache` is what §5.6c seeded from, `extra`
+    // names its metadata — a publication that disturbed any of them
+    // would have answered a later reader with a different cell.
+    try std.testing.expectEqual(engine.env.Layer.stored, after.top.layer);
+    try std.testing.expectEqualStrings("A1+1", after.top.formula_text.?);
+    try std.testing.expectEqual(before.top.cache, after.top.cache);
+    try std.testing.expectEqual(before.top.extra, after.top.extra);
+    try std.testing.expectEqual(@as(f64, 42), after.top.v.number);
+
+    // Every reader answers as it did when a second record carried the
+    // value — which is the whole claim.
+    try std.testing.expectEqual(@as(f64, 42), (try e.cellValue(b1)).number);
+    try std.testing.expectEqualStrings("A1+1", (try env.formulaAt(b1)).?);
+    try std.testing.expectEqual(engine.value.Dialect.legacy, try e.dialectOf(b1));
+    try std.testing.expect(!try env.isUncached(b1));
+}
+
+test "M10r: a published blank keeps its own record, so `isUncached` stays honest" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // `<f>` with no `<v>`: the record's `v` is already `.absent`, which
+    // on a formula record is this type's spelling of *uncached*.
+    const sheet = try testSheetXml(ta, "<row r=\"1\"><c r=\"A1\"><f>B1</f></c></row>");
+    defer ta.free(sheet);
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+    defer wb.deinit();
+
+    var env = try expectBuilt(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    defer env.deinit();
+    const s0 = engine.env.SheetIndex.fromInt(0);
+    const row1 = try coords.Row.fromOneBased(1);
+    const col_a = try coords.Col.fromZeroBased(0);
+    const a1: engine.env.CellRef = .{ .sheet = s0, .row = row1, .col = col_a };
+    try std.testing.expect(try env.isUncached(a1));
+
+    // Publishing blank folds to `.absent` (`dupeValue`). Written onto
+    // the formula record it would say "never computed" about a cell that
+    // just computed, so this one publication declines the saving and
+    // lays a `.computed` record — which carries no `formula_text` and
+    // therefore cannot make that claim.
+    env.publish_in_place = true;
+    try env.putComputed(s0, row1, col_a, engine.value.ScalarValue.blank);
+
+    const at = recordsAt(&env.sheets[0], row1, col_a);
+    try std.testing.expectEqual(@as(usize, 2), at.count);
+    try std.testing.expectEqual(engine.env.Layer.computed, at.top.layer);
+    try std.testing.expect(!try env.isUncached(a1));
+    try std.testing.expectEqual(
+        engine.value.ScalarValue.blank,
+        try env.evalEnv().cellValue(a1),
+    );
+}
+
+test "M10r: in-place publication never overwrites a foreign spill tail" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const sheet = try testSheetXml(ta, "<row r=\"1\"><c r=\"B1\" cm=\"1\"><v>0</v></c></row>");
+    defer ta.free(sheet);
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+    defer wb.deinit();
+    try wb.store.addPart("xl/metadata.xml", ct_metadata_part, m7a_metadata_da);
+
+    var env = try expectBuilt(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(ta);
+    defer arena.deinit();
+    const read = env.evalEnv();
+
+    const b1 = m7aCell("B1");
+    const c1 = m7aCell("C1");
+    _ = try env.publishResult(b1, .{ .array = try m7aMatrix(arena.allocator(), 1, 3, 10) });
+    try std.testing.expectEqual(@as(f64, 11), (try read.cellValue(c1)).number);
+
+    // C1 now holds a tail whose value belongs to B1. A publication
+    // landing on it must shadow it, never absorb it — the tail carries
+    // no formula of its own, and the value being published is not the
+    // one it was placed with.
+    env.publish_in_place = true;
+    _ = try env.publishResult(c1, .{ .scalar = engine.value.ScalarValue.fromNumber(99) });
+    const at = recordsAt(&env.sheets[0], c1.row, c1.col);
+    try std.testing.expectEqual(@as(usize, 2), at.count);
+    try std.testing.expectEqual(engine.env.Layer.computed, at.top.layer);
+    try std.testing.expectEqual(@as(f64, 99), (try read.cellValue(c1)).number);
+
+    // The proof that the tail survived intact: uncover it. (A host that
+    // publishes in place does not retract — that is M10r's other half —
+    // so the flag comes off first, exactly as the assertion in
+    // `retractResult` requires.)
+    env.publish_in_place = false;
+    env.retractResult(c1);
+    try std.testing.expectEqual(@as(f64, 11), (try read.cellValue(c1)).number);
 }
 
 test "M7a: A1# resolves the owner's current extent, against stored cells" {
