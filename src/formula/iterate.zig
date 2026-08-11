@@ -55,6 +55,12 @@
 //! rollback that could run out of memory would make the promise
 //! conditional on there being memory to keep it.
 //!
+//! §9.1 M10r adds the other way to keep the same promise, for the host
+//! that can: `Options.retraction = .candidate_discard` says the host
+//! publishes into state it will throw away whole, so the engine keeps no
+//! journal and never retracts. The promise is unchanged and the default
+//! is unchanged — what moves is who keeps it. See `Retraction`.
+//!
 //! What this row does NOT do
 //! -------------------------
 //! It does not place a spill (M7a), does not write a cache back to a
@@ -465,6 +471,31 @@ pub const Options = struct {
     /// declines to run. Holding component ids would have frozen the
     /// closure at whatever the discovery pass could see.
     closure: ?Closure = null,
+    /// How a refused run undoes what it published (§9.1 M10r).
+    retraction: Retraction = .journal,
+};
+
+/// The two ways a host can make a refusal leave nothing behind.
+///
+/// The engine's own promise is §5.6c's "zero mutation", and it is the
+/// same promise either way; what differs is who keeps it. The `Host`
+/// contract cannot choose for the host, because a host whose published
+/// state IS the live document has no candidate to throw away.
+pub const Retraction = enum {
+    /// Every publish is journalled and replayed backwards through
+    /// `Host.retract`. The default, and the only correct choice for a
+    /// host that publishes into state it does not own.
+    journal,
+    /// The host publishes into a candidate it discards whole on refusal,
+    /// so the engine keeps no journal and never calls `retract`.
+    ///
+    /// **The host must be able to say so truthfully.** Choosing this
+    /// with a host that mutates shared state turns a refusal into a
+    /// silent half-write. `recalc_run` qualifies because its
+    /// `WorkbookEnv` is built per run and dies at `defer model.deinit()`
+    /// on every path, refusals included; the live workbook is touched
+    /// only at `Candidate.swap`, which a refusal never reaches.
+    candidate_discard,
 };
 
 pub const Closure = struct {
@@ -626,7 +657,16 @@ const Engine = struct {
     }
 
     /// §5.6c's "zero mutation": every publish, undone in reverse.
+    ///
+    /// Under `.candidate_discard` the journal was never written, so this
+    /// walks nothing — the host's own discard is the rollback, and the
+    /// empty list is the assertion that the two never mixed.
     fn rollback(self: *Engine) void {
+        if (self.opts.retraction == .candidate_discard) {
+            assert(self.journal.items.len == 0);
+            self.held.clearRetainingCapacity();
+            return;
+        }
         var i = self.journal.items.len;
         while (i > 0) {
             i -= 1;
@@ -638,7 +678,11 @@ const Engine = struct {
 
     fn publish(self: *Engine, cell: env.CellRef, v: Snapshot) Error!void {
         try self.host.publish(cell, v);
-        try self.journal.append(self.gpa, cell);
+        // The journal exists to be replayed; a host that discards its
+        // candidate never replays it, and recording 80 000 entries for a
+        // walk that cannot happen was 1 079 988 B live across the
+        // drive's peak instant (§9.1 M10r).
+        if (self.opts.retraction == .journal) try self.journal.append(self.gpa, cell);
         // Only iteration reads a held value, so only iteration pays for
         // holding one — see the field's header.
         if (self.settings.iterate) try self.held.put(self.gpa, cell, v);
@@ -715,7 +759,9 @@ const Engine = struct {
         // eighteen growth chunks. Iteration republishes and may append
         // past the reserve; that is growth from a full block, not from
         // a ladder's first rung.
-        try self.journal.ensureTotalCapacityPrecise(self.gpa, initial.keys.len);
+        if (self.opts.retraction == .journal) {
+            try self.journal.ensureTotalCapacityPrecise(self.gpa, initial.keys.len);
+        }
 
         const ceiling: u32 = @intCast(@min(
             self.opts.limits.max_dynamic_passes,
@@ -2180,6 +2226,32 @@ test "M5a2 §5.6c: a caller ceiling BELOW iterateCount refuses, and writes nothi
     // …and it got there by retracting, not by never having written.
     try testing.expect(f.publishes > 0);
     try testing.expectEqual(f.publishes, f.retracts);
+}
+
+test "M10r: candidate-discard refuses without journalling or retracting" {
+    // The same refusal as the test above, under the other retraction
+    // policy — and the point is that the engine does the OPPOSITE thing
+    // and is still correct. It publishes, refuses, and retracts nothing;
+    // §5.6c's zero mutation is kept by the host throwing its candidate
+    // away, which is why the flag is not something a host may set
+    // casually. Asserted on both halves: no retraction ran, AND the
+    // published state is still there for the host to discard — a policy
+    // that quietly rolled back anyway would pass the first half alone.
+    var f: Fixture = undefined;
+    try f.init(testing.allocator, &forever);
+    defer f.deinit();
+
+    const r = try f.run(.{
+        .settings = iterating(10, 0.001),
+        .limits = .{ .max_scc_iterations = 4 },
+        .retraction = .candidate_discard,
+    });
+    try testing.expect(r == .refused);
+    try testing.expectEqual(Refusal.Reason.scc_iteration_ceiling, r.refused.reason);
+
+    try testing.expect(f.publishes > 0);
+    try testing.expectEqual(@as(u32, 0), f.retracts);
+    try testing.expect((try f.read("A1")) == .number);
 }
 
 test "M5a2 §5.6c: a ceiling hit in ONE component refuses the whole run" {

@@ -334,6 +334,15 @@ pub fn prepare(
         .refused => |r| return censusRefusal(wb, run, opts, r.planeTwo(), null),
     };
     defer model.deinit();
+    // §9.1 M10r, and the `defer` above is the whole argument for it: this
+    // model is a candidate nobody outside `prepare` can see, so a refused
+    // run does not have to be able to undo its publications — it throws
+    // the model away instead. That buys the drive the right to overwrite
+    // each formula record's value rather than lay a second `Cell` over
+    // it, and the engine the right to keep no journal. The two flags are
+    // one decision (`publish_in_place`'s header); `retractResult`
+    // asserts they were made together.
+    model.publish_in_place = true;
 
     var arena: workbook_mod.fill_probe.Arena = .init(gpa, .run);
     defer arena.deinit();
@@ -458,6 +467,7 @@ pub fn prepare(
         .counters = &counters,
         .closure = .{ .roots = roots, .iterating = model.calc.iterate },
         .rebuild = .{ .input = input, .resolver = bridge.resolver() },
+        .retraction = .candidate_discard,
     });
     if (driver.failure) |e| return e;
     var iter_report = switch (outcome) {
@@ -2273,6 +2283,167 @@ test "pre-M7 gate: a spill the MODEL placed still refuses persistence (M7a regre
             "</row></sheetData></worksheet>",
         .metadata = metadata_dynamic_array,
     });
+}
+
+// ─── §9.1 M10r: the in-place-publication verification matrix ─────
+//
+// `prepare` is the ONE caller that turns in-place publication on
+// (`model.publish_in_place`), so these are the only tests that can see
+// it. The axes are goal_codex §8's matrix; cancellation, spill arrays
+// and the refusal paths are covered by their own sections above and are
+// not restated here.
+
+test "M10r: in-place publication over an openBuffer workbook" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const path = try writeFixture(a, io, dir, "in.xlsx", .{});
+    defer a.free(path);
+    const raw = try readAll(a, io, path);
+    defer a.free(raw);
+
+    // The buffer path keeps a backing-owned copy of the archive
+    // (`store.zig:238`), so it is a different ownership story from the
+    // file-backed one and worth its own run.
+    var wb = try Workbook.openBuffer(a, io, raw);
+    defer wb.deinit();
+
+    var report = try wb.recalculate(a, io, fixed_run, .{});
+    defer report.deinit(a);
+    try testing.expectEqual(@as(u32, 1), report.cells_written);
+    try testing.expectEqualStrings("2", try cellCache(try wb.sheet(0), "B1"));
+}
+
+test "M10r: in-place publication under an already-parsed Worksheet" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const path = try writeFixture(a, io, dir, "in.xlsx", .{});
+    defer a.free(path);
+
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+
+    // A parsed view alive across the run: it reads the OLD bytes until
+    // the swap, and the swap has to reach it.
+    const before = try (try wb.sheet(0)).ensureParsed();
+    try testing.expect(before.rows.len > 0);
+
+    var report = try wb.recalculate(a, io, fixed_run, .{});
+    defer report.deinit(a);
+    try testing.expectEqualStrings("2", try cellCache(try wb.sheet(0), "B1"));
+}
+
+test "M10r: in-place publication through a §5.6e dynamic rebuild" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    // `INDIRECT` reaches a cell no static walk finds, so the outer loop
+    // rebuilds — and the rebuild reads the model *after* publications,
+    // which is the case in-place publication has to survive.
+    const path = try writeFixture(a, io, dir, "in.xlsx", .{
+        .sheet = "<worksheet xmlns=\"" ++ ns_main ++ "\"><sheetData><row r=\"1\">" ++
+            "<c r=\"A1\"><v>4</v></c>" ++
+            "<c r=\"B1\"><f>INDIRECT(\"A1\")+1</f><v>999</v></c>" ++
+            "<c r=\"C1\"><f>B1*2</f><v>999</v></c>" ++
+            "</row></sheetData></worksheet>",
+    });
+    defer a.free(path);
+
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+
+    var report = try wb.recalculate(a, io, fixed_run, .{});
+    defer report.deinit(a);
+    try testing.expectEqual(@as(u32, 2), report.cells_written);
+    try testing.expectEqualStrings("5", try cellCache(try wb.sheet(0), "B1"));
+    try testing.expectEqualStrings("10", try cellCache(try wb.sheet(0), "C1"));
+}
+
+test "M10r: in-place publication through an iterative cycle" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    // §5.6c iteration republishes the same coordinate pass after pass —
+    // the one shape where in-place overwrites a record it wrote itself.
+    // `(A1+1)/2` converges on 1.
+    const path = try writeFixture(a, io, dir, "in.xlsx", .{
+        .sheet = "<worksheet xmlns=\"" ++ ns_main ++ "\"><sheetData><row r=\"1\">" ++
+            "<c r=\"A1\"><f>(A1+1)/2</f><v>0</v></c>" ++
+            "</row></sheetData></worksheet>",
+        .calc_pr = "<calcPr calcId=\"191029\" iterate=\"1\" iterateCount=\"60\" iterateDelta=\"0.0001\"/>",
+    });
+    defer a.free(path);
+
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+
+    var report = try wb.recalculate(a, io, fixed_run, .{});
+    defer report.deinit(a);
+    try testing.expectEqual(@as(u32, 1), report.cells_written);
+    const got = try std.fmt.parseFloat(f64, try cellCache(try wb.sheet(0), "A1"));
+    try testing.expect(@abs(got - 1.0) < 0.001);
+}
+
+test "M10r: in-place publication under a zero-retention limit" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const path = try writeFixture(a, io, dir, "in.xlsx", .{});
+    defer a.free(path);
+
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+
+    // A zero ceiling refuses at the transaction gate — *after* the drive
+    // has published every cell in place. That is the axis worth testing:
+    // the run mutated a model it can no longer un-mutate, and the
+    // workbook still has to read exactly as it did before. Candidate
+    // discard is what makes that true, and `retractResult`'s assertion
+    // is what would have caught the other arrangement.
+    try testing.expectError(
+        error.FormulaLimitExceeded,
+        wb.recalculate(a, io, fixed_run, .{ .max_retained_generations = 0 }),
+    );
+    try testing.expectEqual(@as(usize, 0), wb.retained.items.len);
+    try testing.expectEqualStrings("999", try cellCache(try wb.sheet(0), "B1"));
+
+    // …and the same workbook still recalculates correctly afterwards,
+    // so the refused run left nothing behind that a later one inherits.
+    var report = try wb.recalculate(a, io, fixed_run, .{});
+    defer report.deinit(a);
+    try testing.expectEqual(@as(u32, 1), report.cells_written);
+    try testing.expectEqualStrings("2", try cellCache(try wb.sheet(0), "B1"));
 }
 
 // ─── the logical-view gate ───────────────────────────────────────

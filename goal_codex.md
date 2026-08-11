@@ -175,6 +175,94 @@ from allocator-boundary era heights at all.
 
 ---
 
+### §2 SHIPPED — M10r (measured 2026-08-11)
+
+The M10q baseline reproduced exactly before any edit: RSS 62 439 424 ×3,
+peak live 65 181 995, eras 10 = 52 684 820 / 15 = 60 441 827 /
+20 = 65 181 995 / 21 = 64 074 072, model arena capacity_end 22 842 794 /
+fill_peak 18 157 309 / unfilled 4 685 485.
+
+**The change, as landed.** `WorkbookEnv.publish_in_place` makes
+`putComputed` overwrite the topmost record's `v` instead of inserting a
+`.computed` `Cell`, and `iterate.Options.retraction = .candidate_discard`
+makes the engine keep no journal and never retract. `recalc_run.prepare`
+sets both; nothing else does, and `retractResult` asserts the pairing.
+Three exclusions decide when the overwrite is legal — never a spill tail,
+a **formula record** only, and never a published `.blank` (`dupeValue`
+folds blank to `.absent`, and `.absent` on a record carrying
+`formula_text` is this type's spelling of *uncached*, so writing it there
+would make `isUncached` answer the opposite of the truth). Each of the
+three has a test that fails without it.
+
+**The four quantities, predicted against measured.**
+
+| quantity | predicted | measured |
+|---|---:|---:|
+| gross fill demand removed | 8 975 064 | **8 994 920** |
+| trace-side backing reduction (era 20) | 8 800 104 | **8 806 210** |
+| peak-live cap (era 15) | 4 740 168 | **4 740 168** |
+| RSS effect | unknown | **−5 767 168** |
+
+- **Gross fill.** The model arena's `fill_peak` fell 18 157 309 →
+  10 122 389, −8 034 920, against 8 015 064 predicted for the arena side
+  (1 563 × 5 128); the extra 19 856 is the sheet directory's own growth,
+  which the prediction did not name. Plus the journal's 960 000 (80 000 ×
+  12), which is gpa-side and outside the arena tally.
+- **Trace side.** Era 20 loses exactly the three allocations the
+  prediction named: `id82` 7 720 116 (the publication chunk), `id68`
+  1 079 988 (the journal's reserve), and `id21`'s publication-triggered
+  step of 7 878 — 8 807 982 against 8 806 210 measured, 1 772 of residual
+  churn elsewhere.
+- **Peak live.** 65 181 995 → 60 441 827: the budget spent **to the
+  byte**, and the new peak is era 15 at its unchanged height, which is
+  what the budget rule predicted and what the park condition was watching
+  for. Eras 10 and 15 are byte-identical across the cut.
+- **RSS.** 62 439 424 → 56 672 256 ×3, same usage baseline (1 851 392) on
+  both binaries, so baseline-adjusted 60 588 032 → **54 820 864 B**
+  (57.78 → **52.28 MiB**, 3.45× the 15.15 MiB ceiling, from 3.81×).
+
+**The finding: a cut can pay MORE than its peak-live budget.** RSS fell
+5 767 168 against a peak-live fall of 4 740 168 — **1 027 000 B past the
+cap**. The cap was never wrong; it bounds the *trace*. RSS sat 2 742 571
+below peak live before the cut and 3 769 571 below it after, and that
+widening gap is the whole extra: the removed bytes were touched fill
+inside chunks whose ladder did not step, so their pages left residency
+while the era heights that hold them did not move. M10p was this
+mechanism with the budget spent at **zero** and 1.57 MB collected; this
+row is the same mechanism with the budget spent **exactly** and 1.03 MB
+collected past it. Between them they close the question §3 was built to
+answer: **the peak-live budget is a bound on what the era trace will
+show, and it is not a bound in either direction on what RSS will give.**
+
+The model arena's unfilled capacity *rose*, 4 685 485 → 4 992 435
+(+306 950), which is the same statement from the other side — the ×1.5
+ladder gave back less than the fill did.
+
+| arena | capacity_end | fill_peak | unfilled |
+|---|---:|---:|---:|
+| model | 22 842 794 → **15 114 824** | 18 157 309 → **10 122 389** | 4 685 485 → 4 992 435 |
+| stage | 8 365 688 → 8 365 688 | 7 496 961 → 7 496 961 | 868 727 (unmoved) |
+| **totals** | 31 214 100 → **23 486 130** | 25 657 254 → **17 622 334** | 5 556 846 → 5 863 796 |
+
+**Wall clock, for once, moves with it.** Fewer records to insert, no
+chunk split at the publish and no journal append makes the drive faster
+too: `--gate` is exit 0 in both directions, all 30 lanes, and every
+substantial lane is faster — F1 named eval −3.3 %, named `save` −2.6 %,
+criteria/registry/text eval −0.8 % to −3.8 %. The **absolute** 500 ms
+evaluate ceiling was not measurable in this window and the row does not
+claim it: M10p's own commit, rebuilt and measured beside this one, reads
+542.65 ms against the 375.09 ms its row recorded, with `611f5c7` at
+541.34 and main at 543.38 — three commits inside 2.0 ms, so the ~1.45×
+is host state, not code. See §9.1 of goal_formula.md for the full table.
+
+**What §2 leaves for §6.** The peak is era 15, the graph-build era, and
+nothing on the result side reaches it. Era 10 (decode, 52 684 820) is
+still the programme floor, so the remaining scheduled headroom is
+**7 757 007 B** of peak live — §6's number, and unchanged by this row
+because §2 spent only what era 15 allowed.
+
+---
+
 ## 3. Instrumentation — the fill/capacity split
 
 **The change.** Report per pipeline checkpoint: arena capacity, arena
@@ -341,9 +429,9 @@ R3's arithmetic makes this short: **§3 → §2 → re-profile.**
 
 | # | row | reaches | peak-live cap | predictable? |
 |---|---|---|---:|---|
-| 1 | **§3** instrumentation | — | — | makes the rest priceable |
-| 2 | **§2** in-place publication | eras 20 + 21 | **4 740 168 B** (era 15) | ❌ arena-backed |
-| — | **re-profile** | | | mandatory |
+| 1 | ✅ **§3** instrumentation (M10q) | — | — | makes the rest priceable |
+| 2 | ✅ **§2** in-place publication (M10r) | eras 20 + 21 | **4 740 168 B** (era 15) — spent exactly | ❌ arena-backed; RSS gave 5 767 168 |
+| — | ✅ **re-profile** — done; the peak is era 15 | | | |
 | 3 | **§6** columnar model | eras 15 + 20 + 21 | reaches era 15 | ❌ |
 | — | **§1** summary reports | era 20 only | 1 107 923 B | ✅ but temporary |
 | — | **§7** staging rope | era 21 only | — | parked |
@@ -376,6 +464,12 @@ all four workloads × tiny/small/named.
 predictions; §2's RSS effect is unknowable until §3 measures used
 capacity and checkpoint RSS. An earlier draft claimed "≈48.7 MiB" and a
 later one "≈9.1 MB realizable" — both withdrawn.
+
+_Settled by M10r: §2 spent its 4 740 168 B cap exactly and RSS gave
+5 767 168 B — **1 027 000 more than the cap**. The caution above was
+right to refuse a total, and for a reason it had only half of: a
+peak-live cap does not bound RSS from **either** side. The programme
+bound below is therefore also a peak-live bound, not an RSS floor._
 
 **The programme bound is the number that matters to the ceiling
 decision.** Everything proposed here is model- or result-held, and the
