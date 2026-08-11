@@ -277,11 +277,11 @@ pub const Report = struct {
     /// all literals contributes none). §5.6e rebuilds are *not* added:
     /// each builds its own graph and the drive owns them.
     ///
-    /// §9.1d reads it as the density denominator a scaling matrix needs,
-    /// because a whole-column criterion compiles to a bounded number of
-    /// edges rather than one per scanned cell, and no property of the
-    /// fixture's geometry can predict which. Zero on the mark-only path,
-    /// which builds no graph.
+    /// §9.1d reads it as the numerator of the edge density a scaling
+    /// matrix needs (cells are the denominator), because a whole-column
+    /// criterion compiles to a bounded number of edges rather than one
+    /// per scanned cell, and no property of the fixture's geometry can
+    /// predict which. Zero on the mark-only path, which builds no graph.
     dependency_edges: u64 = 0,
     /// §5.7.7's census, bounded by `max_census_entries`.
     census: []const Unsupported = &.{},
