@@ -50,6 +50,9 @@ pub const typed_parts = @import("typed_parts/root.zig");
 /// Read-only in this iter; mutation lands in iter-wb-4.
 const workbook_mod = @import("workbook.zig");
 pub const Workbook = workbook_mod.Workbook;
+/// §9.1 M10q's arena-fill probe. Public so the bench harness can install
+/// tallies; inert in every build that does not (`pkg/fill.zig`).
+pub const fill_probe = workbook_mod.fill_probe;
 pub const Worksheet = workbook_mod.Worksheet;
 pub const ResolvedStyle = workbook_mod.ResolvedStyle;
 pub const WorkbookError = workbook_mod.Error;

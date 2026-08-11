@@ -81,6 +81,9 @@ const embedding_part = @import("embedding_part.zig");
 const recalc_txn = @import("recalc_txn.zig");
 const store_mod = @import("store.zig");
 const workbook_mod = @import("workbook.zig");
+/// §9.1 M10q's fill probe, re-exported so the bench harness can install
+/// tallies without reaching through a private import.
+pub const fill_probe = workbook_mod.fill_probe;
 
 const Workbook = workbook_mod.Workbook;
 const Worksheet = workbook_mod.Worksheet;
@@ -332,7 +335,7 @@ pub fn prepare(
     };
     defer model.deinit();
 
-    var arena = std.heap.ArenaAllocator.init(gpa);
+    var arena: workbook_mod.fill_probe.Arena = .init(gpa, .run);
     defer arena.deinit();
     const a = arena.allocator();
 
@@ -413,7 +416,7 @@ pub fn prepare(
         .wb = wb,
         .model = &model,
         .arena = a,
-        .scratch = std.heap.ArenaAllocator.init(gpa),
+        .scratch = workbook_mod.fill_probe.Arena.init(gpa, .scratch),
         .gpa = gpa,
         .opts = eval_opts,
         .watch = &watch,
@@ -492,7 +495,7 @@ pub fn prepare(
     // 121.3 MiB of chunk for ~20 MiB of staged data). Same lifetime —
     // the candidate copies everything it keeps (`replacePart`
     // compresses and dupes), so nothing outlives `prepare` either way.
-    var stage_arena = std.heap.ArenaAllocator.init(gpa);
+    var stage_arena: workbook_mod.fill_probe.Arena = .init(gpa, .stage);
     defer stage_arena.deinit();
     var staged = try stage(wb, gpa, stage_arena.allocator(), &model, &driver, run, opts);
     switch (staged) {
@@ -701,7 +704,7 @@ const Driver = struct {
     /// `reads` slices are consumed synchronously by the engine's
     /// `noteReads` before its next `evaluate` call, so the deferred
     /// reset never invalidates a live borrow.
-    scratch: std.heap.ArenaAllocator,
+    scratch: workbook_mod.fill_probe.Arena,
     gpa: Allocator,
     opts: workbook_mod.EvaluateOptions,
     /// §5.5's seam through the evaluation phase. The engine takes no
