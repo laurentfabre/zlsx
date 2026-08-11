@@ -6469,6 +6469,232 @@ against decompressed XML bytes is retired as a *unit* for the same
 reason it was always suspect: it loosens for a verbose workbook and
 tightens for a compact one carrying identical content.
 
+### 9.1c M10t — the feasibility spike: resident pages, measured (2026-08-11)
+
+§9.1b's decision ordered a bounded spike before any further ladder row,
+and told it to *measure* residency rather than infer it from traced live
+bytes — the error two Codex rounds refuted and the ladder had made four
+times. This is that spike. It ends in a **no-go**.
+
+**The instrument.** `zlsx-bench-recalc pages` (new mode). A sampling
+thread reads the kernel's **current** resident set — `resident_size`
+from `mach_task_basic_info`, not `getrusage`'s monotonic `maxrss` —
+while the same first recalc the gate measures runs under the production
+allocator. No heap profiler, so nothing inflates it; the sampler's own
+786 432 B buffer is allocated and written *before* the baseline reading,
+so every figure below is net of it. Eras come from the resident curve by
+the same rule the heap profiler applies to the live curve (a 2 MiB dip
+ends an era), so the two vectors are read side by side without the
+threshold itself explaining a difference.
+
+*It is validated, not asserted.* `sampled_peak` equalled
+`getrusage_maxrss` **to the byte on every run** — coverage 1.0000 — so
+the thread did not miss the instant the kernel's own counter caught.
+
+**`mincore` was tried first and is unusable on this platform.** macOS
+reports `MINCORE_INCORE` for every anonymous page whether or not it has
+been touched: an 8 MiB mapping with 3 MiB written back 512 of 512 pages
+resident, raw vector byte `0x87`. `task_info` was then validated against
+a raw `mmap`, which behaves correctly — 512 MiB mapped moved RSS 245 760
+B, and touching 64 MiB of it moved RSS 67 108 864 B, to the byte.
+
+#### The mechanism behind fill-vs-capacity, finally stated
+
+`std.mem.Allocator.alloc` writes `undefined` — 0xaa — across the whole
+allocation in Debug and ReleaseSafe, and not at all in ReleaseFast. Same
+512 MiB request through `page_allocator`:
+
+| mode | RSS delta on `alloc(512 MiB)` |
+|---|---:|
+| Debug | +536 936 448 |
+| ReleaseSafe | +536 887 296 |
+| ReleaseFast | **+16 384** |
+
+**In the ReleaseSafe gate lane every byte an allocator hands out is
+touched at the instant it is handed out, whether the program writes it
+or not.** That single fact explains the whole §9.1 fill-vs-capacity
+story the ladder had been describing empirically since M10p:
+
+- arena **fill** is exactly resident, because it came through `alloc` —
+  which is why M10s found `backing = fill + unfilled` **exactly**;
+- an arena's **unfilled chunk tail** is *not* resident, because a chunk
+  is taken by `rawAlloc`, which does not memset;
+- but an `ArrayList`'s **unused capacity** *is* resident, because it
+  came through `alloc` like any other block.
+
+It also means **6.7 % of the gate figure is the safety memset, not the
+program's data**: the identical workload in ReleaseFast reads
+**49 528 832 B** baseline-adjusted against ReleaseSafe's 53 100 544 —
+495.3 B/cell against 531.0. §9.1b's research unit should be quoted with
+its lane attached.
+
+#### The per-era checkpoint table
+
+Twenty-four resident eras beside the twenty-four traced ones. **The two
+sequences are not paired instants** — each detector segments its own
+curve — so this compares *shapes*, not rows. `arena fill` is the fill
+probe's five owners only; everything else is `gpa`, where in this lane
+allocated *is* touched.
+
+| era | adjusted resident | MiB | arena fill | traced live |
+|---:|---:|---:|---:|---:|
+| 0 | 16 252 928 | 15.50 | 8 352 | 15 043 109 |
+| 1 | 17 055 744 | 16.27 | 8 352 | 15 887 671 |
+| 2 | 21 102 592 | 20.13 | 8 352 | 19 934 475 |
+| 3 | 22 331 392 | 21.30 | 8 352 | 21 124 073 |
+| 4 | 28 409 856 | 27.09 | 8 352 | 27 194 361 |
+| 5 | 30 244 864 | 28.84 | 8 352 | 29 071 243 |
+| 6 | 39 354 368 | 37.53 | 8 352 | 38 176 863 |
+| 7 | 35 143 680 | 33.52 | 8 352 | 34 003 188 |
+| 8 | 38 518 784 | 36.73 | 8 352 | 37 375 732 |
+| 9 | 43 581 440 | 41.56 | 8 352 | 42 434 548 |
+| **10** | **51 167 232** | **48.80** | 8 352 | 50 022 772 |
+| 11 | 42 074 112 | 40.13 | 8 352 | 45 068 028 |
+| 12 | 45 481 984 | 43.38 | 1 913 052 | 42 044 932 |
+| 13 | 41 910 272 | 39.97 | 8 525 907 | 38 864 374 |
+| 14 | 37 126 144 | 35.41 | 8 530 137 | 42 561 854 |
+| 15 | 39 370 752 | 37.55 | 8 530 137 | **52 649 803** |
+| 16 | 43 073 536 | 41.08 | 8 530 137 | 49 148 835 |
+| **17** | **53 215 232** | **50.75** | 8 530 137 | 45 386 043 |
+| 18 | 49 823 744 | 47.52 | 8 530 137 | 45 812 020 |
+| 19 | 46 202 880 | 44.06 | 8 530 137 | 45 812 020 |
+| 20 | 49 889 280 | 47.58 | 8 533 121 | 48 583 761 |
+| 21 | 49 676 288 | 47.38 | 8 533 121 | 48 554 054 |
+| 22 | 47 955 968 | 45.73 | 8 533 121 | 48 290 160 |
+| 23 | 40 927 232 | 39.03 | 8 533 121 | 45 607 076 |
+
+**Through the decode half the two currencies agree to ~1.15 MB and then
+they part.** Across eras 0–10 the difference stays between 1 140 492 and
+1 215 495 B — a constant offset, not a slope. From
+era 11 they diverge by up to 13 279 051 B, and — the finding the spike exists
+to produce — **the resident maximum and the traced maximum are not the
+same instant**: resident peaks at 53 215 232, traced live peaks at
+52 649 803, and neither peak's era holds the other's. A row budgeted off
+the traced peak is budgeting off the wrong instant.
+
+#### The three candidates, each with a measured price
+
+**(1) Exact-sized part storage — measured: 114 688 B.** Implemented, not
+argued: `materializeAt` now takes M10m's exact-block path (`big_parts`)
+for payloads ≥ 1 MiB, which until now only the *replace* path had. The
+arena sizes a chunk at 1.5 × (held + asked), so `id7` was a 5 288 922 B
+sheet body inside a 7 951 114 B chunk.
+
+| | before | after |
+|---|---:|---:|
+| `parts` arena capacity | 15 913 018 | **22 868** |
+| peak **live** | 55 311 851 | **52 649 803** |
+| `/usr/bin/time -l` peak ×3, interleaved | 55 083 008 | **54 984 704** |
+| **baseline-adjusted** | 53 198 848 | **53 100 544** |
+
+**5 312 306 B of capacity removed bought 98 304 B of resident pages —
+1.9 %.** Peak live fell 2 662 048 in the same change: a **27 : 1**
+currency gap, measured on both sides of one cut for the first time. The
+unfilled arena tail was never resident, exactly as the memset mechanism
+above predicts. §9.1a's own framing — "id7 holds 5 288 922 B of XML in a
+7 951 114 B request" — implied ~2.66 MB was recoverable; **it was the
+cross-currency error a fifth time, and this time it was measured instead
+of refuted.**
+
+Kept anyway, and explicitly **not as a ladder row**: it costs nothing, it
+reuses proven machinery under an unchanged `Part.bytes` lifetime, and it
+removes a 1.5× virtual-address multiplier that is unbounded in the
+general case — a 100 MB sheet was buying a 150 MB chunk.
+
+**And it settles §9.1a's open counterexample by running it.** The Codex
+round that killed "era 0 proves 3× needs a streaming decode" argued
+arithmetically that exact-sizing `id7` would put era 0 at
+`17 705 157 − (7 951 114 − 5 288 922) =` **15 042 965 B**, under the
+15 884 109 B ceiling, with no eviction and no streaming. Building it
+reads traced era 0 = **15 043 109 B** — the prediction was right to
+**144 bytes**. Era 0 is now below the research ceiling. That does not
+make 3× reachable; it does retire the last argument that the *input
+lifetime* makes it impossible.
+
+**(2) Scan-list fill vs capacity at `decode.zig:1882` — measured budget:
+zero.** The four lists were probed directly at scan end:
+
+| scan | fill | capacity | waste |
+|---|---:|---:|---:|
+| first (unhinted) | 21 522 152 | 22 953 588 | **1 431 436** |
+| second (hinted) | 21 522 152 | 21 522 152 | **0** |
+
+M10l's `size_hints` already make the replay scan exact, so the waste
+exists once, is 6.2 %, and — decisively — **it lives in era 10, which is
+not the peak.** By M10l's budget read a cut pays at most the gap from its
+own era down to the next, and era 10 is already 2 048 000 B *below* the
+maximum. Its budget is zero pages. The scan's surviving record blocks
+weigh 480 128 B at the traced peak.
+
+Also settled here, against §9.1a's reading: the sheet body is
+decompressed **once**, not once per generation (`id8 allocs=1`). The
+second scan replays bytes that are already materialized.
+
+**(3) A fused or narrower non-streaming decode — measured budget:
+zero,** and for the same reason, which is why it was not built. Every
+decode-side era (0–11) sits below the peak; era 10 is the highest of
+them at 51 167 232 against the maximum's 53 215 232. Narrowing decode
+cannot move a maximum it does not set. This is M10j's outcome stated in
+advance instead of after the fact.
+
+Part release and a streaming API were **not** reached, which is the
+answer §9.1b asked for: the cheap options were tried first and the
+expensive ones are not licensed by anything measured here.
+
+#### The verdict: no further ladder row
+
+**The next row's entire budget is 2 048 000 B — 3.9 %.** That is the gap
+from the resident maximum (era 17) to the runner-up (era 10, decode).
+Spend all of it and decode becomes the ceiling — and candidates 2 and 3
+have just been measured as unable to cut decode profitably. The plateau
+is flatter than §9.1a could see: **five eras within 3 538 944 B, 6.7 %,
+of the maximum.**
+
+So a materially lower figure needs the graph/stage region **and** the
+decode plateau cut together — two structural changes whose interaction
+cannot be priced from this era vector, because either one invalidates it.
+That is not a row. It is a redesign, and §9.1b already demoted the target
+that would have justified one.
+
+**goal_codex.md §6b remains available and remains unspent.** Nothing here
+argues against it; it is simply no longer a step on a ladder, and its
+2 627 031 B live-currency cap should now be read against the 2 048 000 B
+resident budget above — the cap is the larger number, so §6b cannot be
+worth more than 2 048 000 B of RSS however well it lands.
+
+**The gate.** Baseline-adjusted RSS on the digest-gated `f1_mix_named`
+fixture (sha256 `b2b42c0b…8ad0`), ReleaseSafe, byte-identical ×3,
+interleaved against a rebuilt pre-spike binary: **53 100 544 B**, against
+a budget of 53 813 576. §9.1b's ratchet applies — a row that measures
+lower lowers the budget to its own figure + 1 % — so the **budget becomes
+53 631 549 B**.
+
+| | value |
+|---|---:|
+| `/usr/bin/time -l` peak ×3 | 54 984 704 |
+| usage-invocation baseline | 1 884 160 |
+| **baseline-adjusted** | **53 100 544 — 50.64 MiB** |
+| vs the 15.15 MiB research hypothesis | 3.34× |
+| B/cell (ReleaseSafe / ReleaseFast) | 531.0 / **495.3** |
+| **ratcheted budget** | **53 631 549** |
+
+*(Two method notes, both of which moved a number.*
+
+*The single-binary reading taken earlier in the same session was
+55 033 856 against an interleaved 55 083 008 for the identical build —
+49 152 B of host drift inside one hour, which is half this cut's whole
+effect. M10r's rule held: rebuild the old commit's binary and measure it
+beside the new one, alternating.*
+
+*And the cut was measured twice against the same base, on two builds of
+this branch that differ only in dead cross-platform code and a comment:
+−114 688 B then −98 304 B. **The raw peak is sensitive to binary layout
+at ±1 page**, which M10p logged and which is 17 % of this effect —
+small cuts cannot be priced closer than one page. What did **not** move
+is the adjusted figure: 53 100 544 B on both, because the usage baseline
+drifted the same page. That is the number the gate reads, and it is the
+reason the gate is defined baseline-adjusted.)*
+
 ---
 
 ## 10. Refusal & error taxonomy

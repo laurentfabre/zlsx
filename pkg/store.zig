@@ -31,6 +31,10 @@ pub const Commit = atomic_file_mod.Commit;
 const control = @import("zlsx_control");
 pub const Poller = control.Poller;
 
+// §9.1 M10q's fill accounting. Zero cost with no tally installed: the
+// arena's own allocator is returned untouched.
+const fill = @import("fill.zig");
+
 /// §5.7.9's one seam *inside* the commit region (M5d2).
 ///
 /// The ordering the spec makes normative is rename → swap → directory
@@ -320,7 +324,7 @@ pub const PartStore = struct {
     /// Arena-owned storage for every borrowed slice exposed via the
     /// public API (part names, content types, rel attrs, decompressed
     /// part bytes). Caller-visible slices stay valid until `deinit`.
-    arena: std.heap.ArenaAllocator,
+    arena: fill.Arena,
     /// Replaced payloads too large to take through `arena` (§9.1 M10m).
     ///
     /// A 0.16 arena sizes a new chunk at 1.5 × (what it already holds +
@@ -482,7 +486,7 @@ pub const PartStore = struct {
         archive: []const u8,
         poller: Poller,
     ) Error!PartStore {
-        var arena = std.heap.ArenaAllocator.init(allocator);
+        var arena: fill.Arena = .init(allocator, .parts);
         errdefer arena.deinit();
         const ar_alloc = arena.allocator();
         const scratch = archive;
@@ -589,7 +593,7 @@ pub const PartStore = struct {
         const backing = try SourceBacking.createBuffer(allocator, io, &.{}, null);
         errdefer backing.release();
 
-        var arena = std.heap.ArenaAllocator.init(allocator);
+        var arena: fill.Arena = .init(allocator, .parts);
         errdefer arena.deinit();
         const ar_alloc = arena.allocator();
 
@@ -1436,14 +1440,38 @@ pub const PartStore = struct {
         // invariant is violated and `BadZip` says so.
         try readChunked(self.backing, p.payload_offset, compressed, poller);
 
+        // §9.1c M10t, candidate 1 — the READ path gets M10m's exact
+        // block, which until now only the *replace* path had. The arena
+        // sizes a chunk at 1.5 × (what it holds + what was asked for),
+        // so a 5 288 922 B sheet body bought a 7 951 114 B chunk: `id7`,
+        // the only site live in all 24 eras. `decompressPayload`
+        // allocates `declared_uncompressed` exactly, so handing it the
+        // raw allocator gives the payload its own block and no ladder.
+        //
+        // Same lifetime the arena gave it — `deinit` frees `big_parts` —
+        // so `Part.bytes` still means "valid until this generation
+        // dies", which is the contract goal_codex.md §4 was retracted
+        // for breaking. Nothing is released early here; the block is
+        // only shaped differently.
+        const exact = p.uncompressed_size >= big_payload_bytes;
+        const target = if (exact) self.allocator else ar_alloc;
+        if (exact) {
+            // Capacity first, so the block's existence is the last
+            // fallible step — `dupePayload`'s discipline, for the same
+            // reason: an append that failed after the decompress would
+            // have to undo it.
+            try @constCast(self).big_parts.ensureUnusedCapacity(self.allocator, 1);
+        }
         const bytes = try decompressPayload(
-            ar_alloc,
+            target,
             compressed,
             p.compression_method,
             p.uncompressed_size,
             poller,
         );
+        errdefer if (exact) self.allocator.free(bytes);
         if (std.hash.Crc32.hash(bytes) != p.crc32) return Error.BadZip;
+        if (exact) @constCast(self).big_parts.appendAssumeCapacity(bytes);
         p.bytes = bytes;
     }
 
@@ -2706,6 +2734,58 @@ test "PartStore.replacePart: a payload past the exact-block threshold round-trip
     try std.testing.expectEqualSlices(u8, big, sheet.bytes);
     const wb = try dst.part("xl/workbook.xml") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, small, wb.bytes);
+}
+
+test "materializeAt: a large part is decompressed into an exact block, not the arena (§9.1c M10t)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "big_read.xlsx" });
+    defer std.testing.allocator.free(out_path);
+
+    const big = try std.testing.allocator.alloc(u8, PartStore.big_payload_bytes + 7);
+    defer std.testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @intCast('a' + (i % 26));
+
+    // Build an archive that HAS a large part, then read it back. M10m
+    // gave the replace path its exact block; the read path kept the
+    // arena, and the arena sizes a chunk at 1.5 × (held + asked) — so
+    // materializing this part bought half a megabyte of chunk nothing
+    // else would ever ask for. `id7`, live in all 24 eras.
+    {
+        var src = try PartStore.open(std.testing.allocator, io, fixture);
+        defer src.deinit();
+        try src.replacePart("xl/worksheets/sheet1.xml", big);
+        try src.save(io, out_path);
+    }
+
+    var dst = try PartStore.open(std.testing.allocator, io, out_path);
+    defer dst.deinit();
+    // Nothing is materialized yet: `open` decompresses only the
+    // structural parts, and this one is neither.
+    try std.testing.expectEqual(@as(usize, 0), dst.big_parts.items.len);
+    const before = dst.arena.queryCapacity();
+
+    const sheet = try dst.part("xl/worksheets/sheet1.xml") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, big, sheet.bytes);
+
+    // The block exists and the arena did not grow to hold it. Both
+    // halves matter: the first says the payload took the exact path,
+    // the second says the ladder never stepped. The testing
+    // allocator's leak check is the third — `deinit` frees
+    // `big_parts`, and a payload that took this path without being
+    // recorded there would leak.
+    try std.testing.expectEqual(@as(usize, 1), dst.big_parts.items.len);
+    try std.testing.expectEqual(before, dst.arena.queryCapacity());
+    try std.testing.expect(dst.residentBytes() >= big.len);
 }
 
 test "PartStore.residentBytes counts the out-of-arena blocks too" {
