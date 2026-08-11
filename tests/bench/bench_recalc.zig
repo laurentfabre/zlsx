@@ -266,9 +266,12 @@ fn reportHeap(io: std.Io, w: *std.Io.Writer, path: []const u8) !u8 {
     // times the production one. `fill` mode is where RSS means what a
     // user would see. Printing it anyway because a reader comparing the
     // two modes deserves to be told why they disagree.
+    var b0: [24]u8 = undefined;
+    var b1: [24]u8 = undefined;
+    var b2: [24]u8 = undefined;
     try w.print(
-        "rss_peak_bytes_PROFILER_INFLATED start={d} after_open={d} after_recalc={d}\n",
-        .{ rss_before, rss_after_open, rss_after_recalc },
+        "rss_peak_bytes_PROFILER_INFLATED start={s} after_open={s} after_recalc={s}\n",
+        .{ fmtRss(rss_before, &b0), fmtRss(rss_after_open, &b1), fmtRss(rss_after_recalc, &b2) },
     );
     return 0;
 }
@@ -316,21 +319,40 @@ fn reportFill(io: std.Io, w: *std.Io.Writer, path: []const u8) !u8 {
         "arena_totals capacity_end={d} fill_peak={d} unfilled={d}\n",
         .{ cap_total, fill_total, cap_total -| fill_total },
     );
+    var b0: [24]u8 = undefined;
+    var b1: [24]u8 = undefined;
+    var b2: [24]u8 = undefined;
     try w.print(
-        "rss_peak_bytes start={d} after_open={d} after_recalc={d}\n",
-        .{ rss_start, rss_open, rss_recalc },
+        "rss_peak_bytes start={s} after_open={s} after_recalc={s}\n",
+        .{ fmtRss(rss_start, &b0), fmtRss(rss_open, &b1), fmtRss(rss_recalc, &b2) },
     );
     return 0;
 }
 
-/// Peak RSS so far, in bytes. `maxrss` is monotonic, which is what makes
-/// it useful at a checkpoint: it says *which phase* set the high-water
-/// mark, which is the question the era trace answers in the wrong
-/// currency. macOS reports bytes; Linux reports kilobytes.
-fn peakRssBytes() u64 {
+/// Peak RSS so far, in bytes, or null where the platform has no
+/// `getrusage`. `maxrss` is monotonic, which is what makes it useful at a
+/// checkpoint: it says *which phase* set the high-water mark, which is
+/// the question the era trace answers in the wrong currency. macOS
+/// reports bytes; Linux reports kilobytes.
+///
+/// **Null on Windows, not zero.** `std.posix.rusage` is `void` there, and
+/// a zero would read as "no memory resident" in a table whose whole
+/// purpose is comparing residency against capacity. §9's RSS lane is
+/// POSIX-only anyway; this keeps the binary compiling for the
+/// windows-runtime lane, which builds every bench exe.
+fn peakRssBytes() ?u64 {
+    const os = @import("builtin").os.tag;
+    if (os == .windows) return null;
     const ru = std.posix.getrusage(std.posix.rusage.SELF);
     const raw: u64 = @intCast(ru.maxrss);
-    return if (@import("builtin").os.tag == .macos) raw else raw * 1024;
+    return if (os == .macos) raw else raw * 1024;
+}
+
+/// Render an optional RSS reading. `unavailable` rather than a number the
+/// reader would have to know to distrust.
+fn fmtRss(v: ?u64, buf: []u8) []const u8 {
+    const n = v orelse return "unavailable";
+    return std.fmt.bufPrint(buf, "{d}", .{n}) catch "overflow";
 }
 
 /// Attributing allocator: wraps a backing allocator, keys every

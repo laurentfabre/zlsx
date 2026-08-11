@@ -249,11 +249,19 @@ calls against a 2 984 B high-water — enormous churn, negligible fill.
 2. **`run` reports zero** — that arena is initialised and torn down
    without a single allocation on this workload. Worth confirming before
    any row prices it.
-3. **The probe costs 65 536 B of RSS** (62 406 656 → 62 472 192,
-   +0.105 %) — the vtable and module text, compiled in even when the
+3. **The probe costs 32 768 B of RSS** (62 406 656 → 62 439 424,
+   +0.052 %) — the vtable and module text, compiled in even when the
    sinks are null. Peak live and every era height are byte-identical, and
    output is 24/24 identical. A build option would compile it out
    entirely if production byte-identity is ever required.
+
+**Platform note.** `peakRssBytes` returns *null*, not zero, where the
+platform has no `getrusage` — `std.posix.rusage` is `void` on Windows,
+and a zero would read as "nothing resident" in a table whose whole point
+is residency against capacity. The first push failed the
+`windows-runtime` lane on exactly this (that lane builds every bench
+exe); `zig build bench-exes -Dtarget=x86_64-windows-gnu` reproduces it
+locally in seconds and is worth running before any bench-harness push.
 
 ---
 
