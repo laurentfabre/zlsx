@@ -661,6 +661,106 @@ pub const Stats = struct {
     cyclic_components: u32 = 0,
 };
 
+/// §9.1f M10w — what `link`'s retained block is made of, and what the
+/// builder still holds at the instant it is allocated.
+///
+/// The era trace prices a *phase*; the fill probe prices an *arena*. The
+/// build era's peak is neither: it is one `gpa` block whose regions are
+/// carved at different times, beside builder lists that die at different
+/// times. Pricing a cut there needs the block's terms named separately,
+/// which no instrument in §9.1 could report — M10t had to infer them
+/// from a `need` expression by hand, and §9.1c's own candidate table is
+/// the poorer for it.
+///
+/// `carved_before_last_read` is the field a cut is priced against: bytes
+/// of the block already handed out when the walk-log loop starts, which
+/// is the loop that holds `owners`, `refs` and `logs` alive. Every byte
+/// of the block *not* in it is a byte whose residency can move to a
+/// later, lower instant. It is a measurement, not a target — a term
+/// carved early because a reader needs it early cannot be deferred, and
+/// this field cannot tell the difference.
+pub const Census = struct {
+    /// Every `*_bytes` field below is a **byte count of a region**, not a
+    /// page measurement. A region's boundaries are not page-aligned and
+    /// two regions share the page they meet on, so a term here converts
+    /// to resident pages only at ±1 page, and only because §9.1f measured
+    /// the conversion rate on this block and found it 1.000 B/B. Do not
+    /// quote a term as a measured page price.
+    nodes: u32 = 0,
+    cell_like: u32 = 0,
+    keys_bytes: usize = 0,
+    index_bytes: usize = 0,
+    walk_log_bytes: usize = 0,
+    dep_offs_bytes: usize = 0,
+    component_bytes: usize = 0,
+    cyclic_bytes: usize = 0,
+    order_offs_bytes: usize = 0,
+    order_data_bytes: usize = 0,
+    headroom_bytes: usize = 0,
+    /// `probe_block_padding` as it stood for this build — zero unless a
+    /// page-rate probe is running, and reported so the terms above still
+    /// sum to `block_bytes` when one is.
+    padding_bytes: usize = 0,
+    /// The single request `link` makes — the sum of every term above.
+    block_bytes: usize = 0,
+    /// Of `block_bytes`, how much the carver had handed out when
+    /// `owners`/`refs`/`logs` were last read.
+    carved_before_last_read: usize = 0,
+    /// And how much it had handed out immediately after those three lists
+    /// were given back. **Both readings are needed to pin a placement**:
+    /// the one above alone is satisfied by carving between the loop and
+    /// the frees, which would hold the same 9 280 000 B alive that
+    /// §9.1f's cut exists to stop holding.
+    carved_after_lists_freed: usize = 0,
+    /// And at the end of `link`, so a reader can see the slack the
+    /// headroom covers rather than trust it.
+    carved_at_return: usize = 0,
+    /// Builder scratch alive at the instant the block is requested, by
+    /// list capacity rather than length — capacity is what was handed
+    /// out, and in the gate lane what is handed out is touched.
+    owners_bytes: usize = 0,
+    refs_bytes: usize = 0,
+    logs_bytes: usize = 0,
+    refs_data_bytes: usize = 0,
+    by_coord_bytes: usize = 0,
+    tails_bytes: usize = 0,
+    builder_keys_bytes: usize = 0,
+};
+
+/// Process-wide opt-in, null by default and in every build that does not
+/// install one — the `fill_probe` pattern, for the one region that probe
+/// cannot see because it is not an arena. `link` tests it at **four**
+/// points — once for the block's terms and once per carver position it
+/// records — so the cost when it is null is four branches per graph
+/// build, not per allocation.
+///
+/// Not thread-safe, by construction and for the same reason
+/// `fill_probe.sinks` is not: a build is single-threaded and the probe
+/// runs one workload at a time. Two builds sharing a sink would write
+/// each other's terms, which is why installing one is the bench's job
+/// and not a library entry point's.
+pub var census_sink: ?*Census = null;
+
+/// §9.1f M10w — extra bytes added to the retained block's request, so the
+/// block's **marginal page cost at the build era's peak** can be measured
+/// instead of assumed.
+///
+/// Zero **by default** — it is a public mutable global, so zero is not an
+/// invariant a released build enforces, only what nothing having set it
+/// leaves behind. `link` reads it once and adds it with checked
+/// arithmetic, so the worst a caller can do is turn a graph build into
+/// `error.OutOfMemory`. The padding is never carved: it is slack past the
+/// last region, which is what makes it a clean probe of one thing.
+///
+/// **Why a runtime knob and not a rebuild.** M10t priced one cut at
+/// −114 688 B and then −98 304 B on two builds differing only in dead
+/// code and a comment: the raw peak moves ±1 page with binary layout, 17 %
+/// of that effect. A knob turns the same binary into both arms of the
+/// comparison, so layout cancels exactly rather than approximately. The
+/// cost in production is one load and one add per graph build — not per
+/// allocation — which is the same trade `fill_probe`'s null check makes.
+pub var probe_block_padding: usize = 0;
+
 pub const Graph = struct {
     gpa: std.mem.Allocator,
     /// The capture-phase data: every owner's captured refs, flat in
@@ -673,6 +773,14 @@ pub const Graph = struct {
     /// retains (keys, index, walk logs, dep headers, component, order,
     /// cyclic), carved by a `FixedBufferAllocator`: retention is the sum
     /// of the arrays, not a chunk ladder's slack.
+    ///
+    /// **Read the typed fields, not this.** Zig has no private fields, so
+    /// this one is reachable, but its contents outside the typed slices
+    /// above are **unspecified** — alignment padding between regions, and
+    /// the headroom past the last of them. Since §9.1f the block is
+    /// requested with `rawAlloc`, so those bytes hold whatever the backing
+    /// allocator supplied rather than `undefined`'s poison; nothing in the
+    /// graph reads them, and no caller should.
     block: []align(block_align) u8,
     /// The dependency edge storage `deps`' slices point into — one exact
     /// allocation sized after the edge count is known.
@@ -1371,7 +1479,7 @@ const Builder = struct {
         // alignment padding.
         var cell_like: usize = 0;
         for (self.keys.items) |k| cell_like += @intFromBool(k.isCellLike());
-        const need =
+        const regions =
             n * @sizeOf(Key) + // keys
             2 * cell_like * @sizeOf(Coord) + // index, both sort orders
             n * @sizeOf(Graph.WalkLog) + // walk logs
@@ -1381,11 +1489,67 @@ const Builder = struct {
             (n + 1) * @sizeOf(u32) + // order offsets (count + 1 ≤ n + 1)
             n * @sizeOf(u32) + // order member data
             128;
-        const block = try self.gpa.alignedAlloc(u8, .of(Key), need);
+        // Read once and added with checked arithmetic. The knob is a
+        // `pub var`, so a caller can set it to anything a `usize` holds,
+        // and `regions + maxInt(usize)` is a panic in ReleaseSafe and
+        // undefined behaviour in ReleaseFast. Snapshotting also keeps the
+        // census below in agreement with the request that was actually
+        // made, which a second read of a mutable global would not.
+        const padding = probe_block_padding;
+        const need = std.math.add(usize, regions, padding) catch
+            return error.OutOfMemory;
+        // Requested raw, and this is the whole of §9.1f's cut: `alloc`
+        // memsets its result to `undefined` in Debug and ReleaseSafe, so
+        // an `alloc` of this block would make **all** of it resident at
+        // this line — including the six regions no reader touches until
+        // the owner lists below have been freed. `rawAlloc` does not
+        // write, and each `fa.alloc` below poisons its own region as it is
+        // carved, so the pages arrive with their first carve instead of
+        // all at once.
+        //
+        // Two limits on that, both of which §9.1f states rather than
+        // assumes. **The interface promises nothing about untouched
+        // pages** — a backing allocator is free to write what it hands
+        // back, and `StampingAllocator` in the tests below does exactly
+        // that; the page saving is a measured property of the allocator
+        // this runs on, not of `rawAlloc`. And **the slack is no longer
+        // poisoned**: every byte `fa.alloc` hands out is memset exactly as
+        // before, but the alignment padding and the headroom now hold
+        // whatever the backing allocator supplied, where an `alloc` of the
+        // whole block would have poisoned them too. Nothing in the graph
+        // reads them — `Graph.block` documents them as unspecified — and
+        // the tests below read the tail deliberately, to prove the
+        // request was not written.
+        const block_ptr = self.gpa.rawAlloc(need, .of(Key), @returnAddress()) orelse
+            return error.OutOfMemory;
+        const block: []align(Graph.block_align) u8 = @alignCast(block_ptr[0..need]);
         var block_owned = true;
         defer if (block_owned) self.gpa.free(block);
         var fixed = std.heap.FixedBufferAllocator.init(block);
         const fa = fixed.allocator();
+
+        if (census_sink) |c| c.* = .{
+            .nodes = @intCast(n),
+            .cell_like = @intCast(cell_like),
+            .keys_bytes = n * @sizeOf(Key),
+            .index_bytes = 2 * cell_like * @sizeOf(Coord),
+            .walk_log_bytes = n * @sizeOf(Graph.WalkLog),
+            .dep_offs_bytes = (n + 1) * @sizeOf(u32),
+            .component_bytes = n * @sizeOf(u32),
+            .cyclic_bytes = n * @sizeOf(bool),
+            .order_offs_bytes = (n + 1) * @sizeOf(u32),
+            .order_data_bytes = n * @sizeOf(u32),
+            .headroom_bytes = 128,
+            .padding_bytes = padding,
+            .block_bytes = need,
+            .owners_bytes = self.owners.capacity * @sizeOf(BodyOwner),
+            .refs_bytes = self.refs.capacity * @sizeOf(RefSpan),
+            .logs_bytes = self.logs.capacity * @sizeOf(WalkBounds),
+            .refs_data_bytes = self.refs_data.capacity * @sizeOf(Ref),
+            .by_coord_bytes = self.by_coord.capacity * @sizeOf(u32),
+            .tails_bytes = self.tails.capacity * @sizeOf(TailOwner),
+            .builder_keys_bytes = self.keys.capacity * @sizeOf(Key),
+        };
 
         const keys = try fa.dupe(Key, self.keys.items);
         // The dupe above was this list's last read (§9.1 M10j) — held
@@ -1421,14 +1585,16 @@ const Builder = struct {
         var seen: std.ArrayListUnmanaged(u32) = .empty;
         defer seen.deinit(self.gpa);
 
-        const idx = try Index.build(fa, keys);
-
         // Owner bodies. The walk logs ride along (M10b): `refs` already
         // lives in the arena the graph keeps, so retention is the
         // bounds and a pointer, not a copy.
         assert(self.logs.items.len == self.owners.items.len);
         const walk_logs = try fa.alloc(Graph.WalkLog, n);
         @memset(walk_logs, Graph.empty_walk_log);
+        // Read here, not after the loop: this is the instant the owner
+        // lists and the block are both at their largest, which is the
+        // instant the build era's peak is measured at (§9.1f).
+        if (census_sink) |c| c.carved_before_last_read = fixed.end_index;
         for (self.owners.items, self.refs.items, self.logs.items) |bo, sp, rec| {
             const u = findIn(keys, bo.owner.key).?;
             const list = refs_data[sp.off..][0..sp.len];
@@ -1459,6 +1625,17 @@ const Builder = struct {
         self.owners.clearAndFree(self.gpa);
         self.refs.clearAndFree(self.gpa);
         self.logs.clearAndFree(self.gpa);
+        if (census_sink) |c| c.carved_after_lists_freed = fixed.end_index;
+
+        // Carved *after* the three frees above, and that placement is the
+        // other half of §9.1f's cut. `Index.build` reads nothing but
+        // `keys`, and its first reader is the range arm below — so its
+        // 2 560 000 B on the named workload used to be resident through a
+        // loop that had no use for them, beside 9.28 MB of owner lists
+        // that had not been given back yet. Moving the call moves the
+        // pages to an instant 9.28 MB lower, which is the only reason the
+        // move is here and not a tidying.
+        const idx = try Index.build(fa, keys);
 
         // Range nodes reach their producers; span nodes reach their
         // members; spill tails reach their anchor.
@@ -1548,6 +1725,8 @@ const Builder = struct {
             .ok => |s| s,
             .refused => |r| return .{ .refused = r },
         };
+
+        if (census_sink) |c| c.carved_at_return = fixed.end_index;
 
         const out: Graph = .{
             .gpa = self.gpa,
@@ -4340,4 +4519,193 @@ fn resizedVariant(a: std.mem.Allocator, spec: Spec) !?Input {
         };
     }
     return null;
+}
+
+// ─── §9.1f M10w: the block's carve order, and its poison ─────────
+
+/// An allocator that stamps every block it hands out, so a test can ask
+/// whether anything wrote to a region afterwards.
+///
+/// The stamp goes in `rawAlloc`, which is *below* the layer that memsets
+/// to `undefined` — so a caller reaching this through `Allocator.alloc`
+/// overwrites the stamp and a caller reaching it through `rawAlloc` does
+/// not. That difference is the whole discriminator in the first test
+/// below.
+const StampingAllocator = struct {
+    child: std.mem.Allocator,
+    stamp: u8,
+
+    fn allocator(self: *StampingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *StampingAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(len, a, ra) orelse return null;
+        @memset(p[0..len], self.stamp);
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *StampingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(buf, a, new_len, ra);
+    }
+
+    fn remap(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *StampingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(buf, a, new_len, ra);
+    }
+
+    fn free(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *StampingAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(buf, a, ra);
+    }
+};
+
+/// Three cells and a range, which is the smallest input that produces
+/// every region the block carries: cell nodes, a range node (so
+/// `cell_like < nodes` and the index is non-empty), edges, one component
+/// per node and an order over them.
+fn censusInput() Input {
+    return .{ .sheet_count = 2, .cells = &census_cells };
+}
+const census_cells = [_]CellInput{
+    .{ .cell = cellAt(0, "D1"), .formula = "SUM(A1:B2)" },
+    .{ .cell = cellAt(0, "A1"), .formula = "1" },
+    .{ .cell = cellAt(0, "B2"), .formula = "2" },
+};
+
+test "§9.1f the retained block is not written before it is carved" {
+    // Wrapping the testing allocator rather than the page allocator, so a
+    // leak in the path under test is still a failure — the stamp only
+    // needs a layer below `Allocator.alloc`'s memset, not a raw mapping.
+    var stamper: StampingAllocator = .{ .child = std.testing.allocator, .stamp = 0x5a };
+    const gpa = stamper.allocator();
+
+    var census: Census = .{};
+    census_sink = &census;
+    defer census_sink = null;
+
+    var g = try buildOk(gpa, censusInput(), &two_sheets, .{});
+    defer g.deinit();
+
+    // There is slack: the 128 B headroom covers the carver's alignment
+    // padding and is never handed to anyone.
+    try testing.expect(census.carved_at_return < g.block.len);
+
+    // And nothing wrote it. Before this row the block came from
+    // `Allocator.alloc`, which memsets the whole request to `undefined`
+    // — 0xaa here, not 0x5a — so this loop is what fails if the
+    // `rawAlloc` is ever reverted. In ReleaseFast the memset is elided,
+    // so there the assertion holds either way and this test only
+    // guards the two lanes the gate is measured in.
+    for (g.block[census.carved_at_return..]) |b| {
+        try testing.expectEqual(@as(u8, 0x5a), b);
+    }
+}
+
+test "§9.1f the index is carved after the owner lists are freed" {
+    var census: Census = .{};
+    census_sink = &census;
+    defer census_sink = null;
+
+    var g = try buildOk(testing.allocator, censusInput(), &two_sheets, .{});
+    defer g.deinit();
+
+    // The instant the era trace prices: the block's carved prefix beside
+    // the owner lists, which the walk-log loop still needs. Only the
+    // keys and the walk logs may be in it — the index is read for the
+    // first time by the range arm, which runs after those lists are
+    // given back, so carving it here would hold 2 560 000 B on the named
+    // workload through a loop with no use for them (§9.1f).
+    try testing.expectEqual(
+        census.keys_bytes + census.walk_log_bytes,
+        census.carved_before_last_read,
+    );
+
+    // **And still nothing more once they are freed**, which is the
+    // assertion that actually pins the placement: the reading above alone
+    // is satisfied by carving the index between the loop and the frees,
+    // where it would hold the same 9 280 000 B alive that the cut exists
+    // to stop holding. Only both readings together put the carve below
+    // all three `clearAndFree` calls.
+    try testing.expectEqual(
+        census.keys_bytes + census.walk_log_bytes,
+        census.carved_after_lists_freed,
+    );
+
+    // Stated as the complement too, so the figure §9.1f quotes as the
+    // cut's price is the one this test pins.
+    try testing.expectEqual(
+        census.index_bytes + census.dep_offs_bytes + census.component_bytes +
+            census.cyclic_bytes + census.order_offs_bytes + census.order_data_bytes +
+            census.headroom_bytes + census.padding_bytes,
+        census.block_bytes - census.carved_before_last_read,
+    );
+
+    // The census is a census: its terms account for the whole request.
+    try testing.expectEqual(census.block_bytes, census.keys_bytes +
+        census.index_bytes + census.walk_log_bytes + census.dep_offs_bytes +
+        census.component_bytes + census.cyclic_bytes + census.order_offs_bytes +
+        census.order_data_bytes + census.headroom_bytes + census.padding_bytes);
+    try testing.expectEqual(g.block.len, census.block_bytes);
+}
+
+test "§9.1f the padding probe grows the block and is never carved" {
+    // Wrapping the testing allocator rather than the page allocator, so a
+    // leak in the path under test is still a failure — the stamp only
+    // needs a layer below `Allocator.alloc`'s memset, not a raw mapping.
+    var stamper: StampingAllocator = .{ .child = std.testing.allocator, .stamp = 0x5a };
+    const gpa = stamper.allocator();
+
+    // Installed with its cleanup registered on the same line, not after
+    // the fallible build below it: an early return between the two would
+    // leave a global pointing at a dead stack frame.
+    var plain: Census = .{};
+    census_sink = &plain;
+    defer census_sink = null;
+    var g0 = try buildOk(gpa, censusInput(), &two_sheets, .{});
+    const carved_plain = plain.carved_at_return;
+    const block_plain = plain.block_bytes;
+    g0.deinit();
+
+    const pad = 4096;
+    probe_block_padding = pad;
+    defer probe_block_padding = 0;
+
+    var padded: Census = .{};
+    census_sink = &padded;
+    var g1 = try buildOk(gpa, censusInput(), &two_sheets, .{});
+    defer g1.deinit();
+
+    // The knob moves the request and nothing else: same carve, `pad`
+    // more slack. A knob that changed what was carved would price the
+    // wrong thing.
+    try testing.expectEqual(block_plain + pad, padded.block_bytes);
+    try testing.expectEqual(carved_plain, padded.carved_at_return);
+    try testing.expectEqual(@as(usize, pad), padded.padding_bytes);
+    try testing.expect(g1.block.len - padded.carved_at_return >= pad);
+    for (g1.block[padded.carved_at_return..]) |b| {
+        try testing.expectEqual(@as(u8, 0x5a), b);
+    }
+}
+
+test "§9.1f a padding that cannot be added is an error, not a panic" {
+    // The knob is a public `pub var`, so the reachable states include the
+    // ones that overflow the request. Unchecked, `regions + padding` is a
+    // panic in ReleaseSafe and undefined behaviour in ReleaseFast; the
+    // contract is that it degrades to the error any allocation can
+    // already return.
+    probe_block_padding = std.math.maxInt(usize);
+    defer probe_block_padding = 0;
+
+    try testing.expectError(
+        error.OutOfMemory,
+        build(testing.allocator, censusInput(), two_sheets.resolver(), .{}),
+    );
 }
