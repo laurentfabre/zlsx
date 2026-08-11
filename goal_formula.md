@@ -8030,7 +8030,7 @@ byte-identical across its three**:
 | vs the 15.15 MiB research hypothesis | 3.13× |
 | B/cell (ReleaseSafe / ReleaseFast) | 496.9 / **496.1** |
 
-**−1 458 176 reproduced on three independently built pairs**, across two
+**−1 458 176 reproduced on four independently built pairs**, across two
 different (raw peak, baseline) splits — 52 985 856/1 835 008 and
 52 969 472/1 818 624 on the reverted side, 51 527 680/1 835 008 and
 51 511 296/1 818 624 on the cut side. The §9.1f tip reproduced its own
