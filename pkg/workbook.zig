@@ -9350,12 +9350,27 @@ pub const WorkbookEnv = struct {
                 .refused => |r| return .{ .refused = .{ .calc = r } },
             };
 
+            // §9.1g M10x: what stands beside the list `sharedFormulaText`
+            // is about to grow. Recorded here because the scan's blocks
+            // are this scope's, not that function's.
+            if (engine.calc.census_sink) |c| {
+                c.scan_cells_bytes = scanned.cells.len * @sizeOf(engine.decode.SheetCell);
+                c.scan_slots_bytes = scanned.slots.len * @sizeOf(engine.decode.CellSlot);
+                c.scan_rows_bytes = scanned.rows.len * @sizeOf(engine.decode.RowSlot);
+                c.sheet_xml_bytes = part.bytes.len;
+            }
+
             // M4b2: the `<f>` attribute inventory and the shared
             // topology, over the cells the boundary just produced. A
             // slave's formula is its master's, translated — which is why
             // this runs before the cells are copied into the layer and
             // not after.
-            const formulas = switch (try sharedFormulaText(allocator, a, scanned.cells)) {
+            const formulas = switch (try sharedFormulaText(
+                allocator,
+                a,
+                scanned.cells,
+                scanned.formula_cells,
+            )) {
                 .ok => |f| f,
                 .refused => |r| return .{ .refused = .{ .calc = r } },
             };
@@ -10364,8 +10379,14 @@ fn sharedFormulaText(
     gpa: Allocator,
     arena: Allocator,
     cells: []const engine.decode.SheetCell,
+    /// The scan's own count of the `<f>`-carrying cells in `cells`
+    /// (§9.1g M10x). Taken as a parameter rather than re-counted: the
+    /// walk that produced these records already knew it.
+    formula_cells: u32,
 ) Error!SharedTextResult {
-    var shared = switch (try engine.calc.classifySheet(gpa, cells)) {
+    var shared = switch (try engine.calc.classifySheet(gpa, cells, .{
+        .formula_cells = formula_cells,
+    })) {
         .ok => |s| s,
         .refused => |r| return .{ .refused = r },
     };
@@ -10382,6 +10403,18 @@ fn sharedFormulaText(
         .refused => |r| return .{ .refused = r },
     };
     defer masters.deinit();
+
+    // §9.1g M10x: the two terms that arrive after `classifySheet` has
+    // handed its list back, so neither of them stands at the maximum.
+    if (engine.calc.census_sink) |c| {
+        c.out_bytes = out.len * @sizeOf(SharedText);
+        var master_bytes: usize = masters.asts.len * @sizeOf(engine.parser.Ast);
+        for (masters.asts) |ast| {
+            master_bytes += ast.nodes.len * @sizeOf(engine.parser.Node);
+            master_bytes += ast.extra.len * @sizeOf(engine.parser.Index);
+        }
+        c.masters_bytes = master_bytes;
+    }
 
     for (shared.entries) |e| {
         out[e.cell] = .{

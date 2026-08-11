@@ -79,6 +79,35 @@ pub const graph_probe = struct {
         graph.probe_block_padding = bytes;
     }
 };
+/// §9.1g M10x's census and the two padding knobs for the **decode** half
+/// — the half §9.1f's cut left holding the resident maximum. Public on
+/// `graph_probe`'s terms and as named symbols only, for the same reason:
+/// re-exporting the modules to reach a probe would put the whole formula
+/// engine in this package's public API.
+pub const shared_probe = struct {
+    const calc = @import("zlsx_formula").calc;
+    const decode = @import("zlsx_formula").decode;
+
+    pub const Census = calc.SharedCensus;
+
+    /// Install a census sink, or clear it with `null`. Not thread-safe;
+    /// see `calc.census_sink`.
+    pub fn install(sink: ?*Census) void {
+        calc.census_sink = sink;
+    }
+
+    /// N never-written bytes held for exactly one `scanSheet` — the span
+    /// §9.1c's candidate 2 lives in.
+    pub fn setScanPadding(bytes: usize) void {
+        decode.probe_scan_padding = bytes;
+    }
+
+    /// N never-written bytes held for exactly one `classifySheet` — the
+    /// span the resident maximum falls in.
+    pub fn setClassifyPadding(bytes: usize) void {
+        calc.probe_classify_padding = bytes;
+    }
+};
 pub const Worksheet = workbook_mod.Worksheet;
 pub const ResolvedStyle = workbook_mod.ResolvedStyle;
 pub const WorkbookError = workbook_mod.Error;
