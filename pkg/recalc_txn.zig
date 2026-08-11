@@ -271,6 +271,18 @@ pub const Report = struct {
     non_converged_cells: u32 = 0,
     /// §5.6e: how many times the outer loop rebuilt the graph.
     dynamic_passes: u32 = 1,
+    /// Edges the graph builder **admitted** for the run's first graph —
+    /// `graph.Stats.edges`, deduplicated per node, counting only
+    /// dependencies between graph nodes (a formula whose precedents are
+    /// all literals contributes none). §5.6e rebuilds are *not* added:
+    /// each builds its own graph and the drive owns them.
+    ///
+    /// §9.1d reads it as the numerator of the edge density a scaling
+    /// matrix needs (cells are the denominator), because a whole-column
+    /// criterion compiles to a bounded number of edges rather than one
+    /// per scanned cell, and no property of the fixture's geometry can
+    /// predict which. Zero on the mark-only path, which builds no graph.
+    dependency_edges: u64 = 0,
     /// §5.7.7's census, bounded by `max_census_entries`.
     census: []const Unsupported = &.{},
     census_truncated: bool = false,

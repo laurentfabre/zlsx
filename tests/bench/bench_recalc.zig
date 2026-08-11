@@ -197,6 +197,11 @@ pub fn main(init: std.process.Init) !u8 {
             var report = try wb.recalculate(gpa, io, RUN, .{});
             defer report.deinit(gpa);
             try w.print("cells_written={d}\n", .{report.cells_written});
+            // §9.1d's density denominator. Printed after the run so the
+            // timed span and the peak instant are both behind us — this
+            // lane is measured by `/usr/bin/time -l` around the whole
+            // process, and a print cannot move either number.
+            try w.print("dependency_edges={d}\n", .{report.dependency_edges});
         },
         .save => {
             const dest = out_path orelse {

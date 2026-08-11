@@ -4670,16 +4670,43 @@ full-column sparse-range benches (§5.6a). **Milestone-local perf gates after
 M5d** (a tree walker can pass M5d and regress later): M7a adds large-spill AND SORT/UNIQUE benches (they ship there); M7b2 adds
 whole-column criteria (`SUMIF(A:A,…,B:B)`) and multi-criteria benches; M8
 adds a TEXT-heavy bench; M9d adds a mixed full-registry workload
-— each report-only against its own recorded baseline, same methodology. **Release gating**: once the M5d baseline is frozen, the local `compare_bench` regression check becomes **blocking for release cuts** (CI stays report-only), and v1 carries **absolute ceilings on ONE named workload — the 100k-cell F1-mix fixture, digest recorded at M5d3**: evaluate ≤ 500 ms and end-to-end ≤ 1 s in **ReleaseFast** (**warm-cache; N=20 runs matching `bench_ci.sh:50`; comparison via `compare_bench.py` EXTENDED in M5d3 with a `--gate` mode** — median-based, nonzero exit on regression for release cuts (today it compares means and always exits 0, `compare_bench.py:88,146`); CI keeps report-only mode; both exit behaviors tested; distribution + baseline commit reported; thermal/load controls); peak RSS ≤ 3× **model bytes = sum of the fixture's decompressed part bytes**, **baseline-adjusted** (pre-open process RSS subtracted), in the **ReleaseSafe RSS lane**; FIRST recalc, zero retained generations; host recorded at baseline. Owner waiver required to exceed; M9d runs absolute + regression checks.
+— each report-only against its own recorded baseline, same methodology. **Release gating**: once the M5d baseline is frozen, the local `compare_bench` regression check becomes **blocking for release cuts** (CI stays report-only), and v1 carries **absolute ceilings on ONE named workload — the 100k-cell F1-mix fixture, digest recorded at M5d3**: evaluate ≤ 500 ms and end-to-end ≤ 1 s in **ReleaseFast** (**warm-cache; N=20 runs matching `bench_ci.sh:50`; comparison via `compare_bench.py` EXTENDED in M5d3 with a `--gate` mode** — median-based, nonzero exit on regression for release cuts (today it compares means and always exits 0, `compare_bench.py:88,146`); CI keeps report-only mode; both exit behaviors tested; distribution + baseline commit reported; thermal/load controls); peak RSS ≤ 3× **model bytes = sum of the fixture's decompressed part bytes**, **baseline-adjusted** (the `/usr/bin/time -l` *maximum resident set size* of a **usage invocation of the same binary** subtracted — see the second amendment below), in the **ReleaseSafe RSS lane**; FIRST recalc, zero retained generations; host recorded at baseline. Owner waiver required to exceed; M9d runs absolute + regression checks.
 
-> **Amended 2026-08-11 — the RSS clause only.** The sentence above is
-> kept verbatim for auditability, but the **3 × model bytes ceiling no
-> longer gates a release.** By owner decision (§9.1b) the blocking gate
-> is an absolute ratcheted budget of **53 813 576 B** on the
-> digest-gated named fixture, and 15.15 MiB survives as a non-blocking
+> **Amended 2026-08-11 — the RSS clause only.** The sentence above keeps
+> its decision wording verbatim for auditability (the one exception is
+> the baseline-adjustment parenthetical, corrected by the second
+> amendment below), but the **3 × model bytes ceiling no longer gates a
+> release.** By owner decision (§9.1b) the blocking gate is an absolute
+> ratcheted budget on the digest-gated named fixture — opened at
+> **53 813 576 B**, ratcheted to **53 631 549 B** by M10t (§9.1c) and
+> re-affirmed by M10u (§9.1d) — and 15.15 MiB survives as a non-blocking
 > research hypothesis expressed per modeled cell (158.8 B/cell against
 > 532 B/cell measured). The evaluate ≤ 500 ms and end-to-end ≤ 1 s
 > ceilings are **unchanged** by this amendment.
+>
+> **Amended 2026-08-11 (second) — the baseline-adjustment wording.**
+> §9.1a logged a defect in the measurement contract itself: this section
+> said the figure was baseline-adjusted by subtracting **"pre-open
+> process RSS"**, while every row from M10a to M10t subtracted *the
+> `/usr/bin/time -l` peak of a usage invocation of the same binary*.
+> Those are different execution states, and they do not read the same:
+> on the M10s binary the profiler build measured 1 769 472 B in-process
+> before `open` against the usage invocation's 1 835 008 B, a 65 536 B
+> gap — 0.12 % of the figure, no verdict changed, but two definitions
+> that must not coexist under one gate. **The parenthetical above is now
+> the method actually performed**, and it is the method §9.1b's budget
+> gates on. The old wording is preserved in this note; nothing was
+> re-measured, because nothing measured had ever used it.
+>
+> *Why a usage invocation and not an in-process reading:* the gate is an
+> external, whole-process figure (`maximum resident set size`, the same
+> `ru_maxrss` M10t validated its sampler against to the byte). A usage
+> invocation is the same binary reaching the same `main`, allocating
+> nothing the workload needs — so the subtraction removes exactly the
+> loader, the runtime and the binary's own image, which is what a
+> baseline is for. An in-process pre-`open` reading would additionally
+> remove whatever the process had already touched, which drifts with
+> code that has nothing to do with the workload.
 
 **Limits (each named, typed refusal, boundary-tested; units explicit)**:
 
@@ -6415,6 +6442,8 @@ reads 1 769 472 B in-process pre-open against the usage invocation's
 1 835 008 B, a 65 536 B gap. It is 0.12 % of the number and changes no
 verdict on this page, but the two definitions should not coexist: the
 wording should be reconciled to the measurement actually performed.
+**Done in M10u** — §9 now carries the usage-invocation definition in the
+clause itself, with the old wording preserved in its second amendment.
 
 ### 9.1b The owner's decision (recorded 2026-08-11)
 
@@ -6694,6 +6723,307 @@ small cuts cannot be priced closer than one page. What did **not** move
 is the adjusted figure: 53 100 544 B on both, because the usage baseline
 drifted the same page. That is the number the gate reads, and it is the
 reason the gate is defined baseline-adjusted.)*
+
+### 9.1d M10u — the scaling matrix: three shapes, three sizes (2026-08-11)
+
+§9.1b's third decision made the research unit **bytes per modeled cell**
+and ordered a matrix behind it, "the only thing that would let zlsx make
+a memory claim from more than one point on one curve." This is that
+matrix. It measures nine points on three curves, in both optimize lanes,
+and it answers a question the ladder had never put: **of the three
+things §9.1b named as predictors — cells, retained text bytes,
+dependency-edge density — which one actually carries the memory?**
+
+One of them does.
+
+**Method.** Identical to the gate's, per §9's corrected wording (second
+amendment above): adjusted = `/usr/bin/time -l` *maximum resident set
+size* of `zlsx-bench-recalc recalc <fixture>`, minus the same field for
+a **usage invocation of the same binary**. Three repetitions per cell,
+the baseline re-read immediately before every measurement — M10t
+measured 49 152 B of host drift inside one hour. **All 54 peaks and all
+54 baselines reproduced byte-identically**, so the medians below are the
+values, not estimates of them. `pages` mode was run beside every cell as
+a second currency; it is reported separately because it is not the gate.
+
+Sizes are 1 000 / 10 000 / 40 000 data rows. The middle size of each
+shape is that shape's **digest-gated identity fixture**, and all three
+digests reproduced: `b2b42c0b…8ad0` (f1_mix named), `63eddc8f…9899`
+(text small), `31dbe2bd…4e2` (criteria small).
+
+#### The matrix
+
+| shape | size | cells | lane | adjusted RSS | B/cell | edges | edges/cell | text B |
+|---|---|---:|---|---:|---:|---:|---:|---:|
+| f1 | 1k | 10 000 | ReleaseSafe | 7 372 800 | 737.3 | 9 967 | 0.997 | 4 067 |
+| f1 | 1k | 10 000 | ReleaseFast | 7 143 424 | 714.3 | 9 967 | 0.997 | 4 067 |
+| **f1** | **10k** | **100 000** | **ReleaseSafe** | **53 116 928** | **531.2** | 99 686 | 0.997 | 4 068 |
+| f1 | 10k | 100 000 | ReleaseFast | 49 496 064 | 495.0 | 99 686 | 0.997 | 4 068 |
+| f1 | 40k | 400 000 | ReleaseSafe | 203 898 880 | 509.7 | 398 749 | 0.997 | 4 068 |
+| f1 | 40k | 400 000 | ReleaseFast | 192 249 856 | 480.6 | 398 749 | 0.997 | 4 068 |
+| text | 1k | 9 000 | ReleaseSafe | 7 012 352 | 779.2 | 2 000 | 0.222 | 82 016 |
+| text | 1k | 9 000 | ReleaseFast | 7 012 352 | 779.2 | 2 000 | 0.222 | 82 016 |
+| text | 10k | 90 000 | ReleaseSafe | 45 367 296 | 504.1 | 20 000 | 0.222 | 483 441 |
+| text | 10k | 90 000 | ReleaseFast | 45 236 224 | 502.6 | 20 000 | 0.222 | 483 441 |
+| text | 40k | 360 000 | ReleaseSafe | 173 211 648 | 481.1 | 80 000 | 0.222 | 1 541 402 |
+| text | 40k | 360 000 | ReleaseFast | 173 080 576 | 480.8 | 80 000 | 0.222 | 1 541 402 |
+| crit | 1k | 3 512 | ReleaseSafe | 3 457 024 | 984.3 | 1 088 | 0.310 | 1 141 |
+| crit | 1k | 3 512 | ReleaseFast | 3 538 944 | 1 007.7 | 1 088 | 0.310 | 1 141 |
+| crit | 10k | 30 512 | ReleaseSafe | 12 877 824 | 422.1 | 1 088 | 0.036 | 1 142 |
+| crit | 10k | 30 512 | ReleaseFast | 12 910 592 | 423.1 | 1 088 | 0.036 | 1 142 |
+| crit | 40k | 120 512 | ReleaseSafe | 55 869 440 | 463.6 | 1 088 | 0.009 | 1 142 |
+| crit | 40k | 120 512 | ReleaseFast | 46 809 088 | 388.4 | 1 088 | 0.009 | 1 142 |
+
+`text B` is the text the run *retains*: the input shared-string payload
+plus the string-typed results it computed (0 for f1 and criteria, which
+produce numbers; 200 000 string results totalling 1 410 640 B at
+text/40k). `edges` is `graph.Stats.edges` — admitted, deduplicated,
+between graph nodes — newly carried on `RecalcReport.dependency_edges`,
+because no property of a fixture's geometry predicts it: a whole-column
+criterion compiles to a **bounded** edge set, and the criteria column
+below proves it by not moving.
+
+#### The answer: a per-cell term dominates, and it is stable across shape
+
+| shape | lane | OLS slope (B/cell) | intercept | R² | marginals (1k→10k, 10k→40k) |
+|---|---|---:|---:|---:|---|
+| f1 | ReleaseSafe | 503.6 | 2 520 248 | 1.00000 | 508.3, **502.6** |
+| f1 | ReleaseFast | 474.9 | 2 223 725 | 1.00000 | 470.6, 475.8 |
+| text | ReleaseSafe | 473.5 | 2 751 432 | 1.00000 | 473.5, **473.5** |
+| text | ReleaseFast | 473.2 | 2 706 798 | 1.00000 | 471.9, 473.5 |
+| crit | ReleaseSafe | *455.5* | *606 872* | *0.99722* | 348.9, **477.7** |
+| crit | ReleaseFast | *371.5* | *1 947 055* | *0.99978* | 347.1, 376.6 |
+
+**The criteria rows' OLS slope and intercept are set in italics because
+they are descriptive only.** Its marginals move 348.9 → 477.7, a 36.9 %
+change: the curve is not linear, three unequally-spaced points let the
+widest interval dominate the fit, and its R² of 0.997 reflects the range
+covered, not linearity. Quoting 455.5 as criteria's *marginal* cost
+would launder the very non-linearity the same row displays, so it is not
+quoted that way anywhere below.
+
+Compared on the one quantity all three define the same way — **the
+marginal cost over the largest size step, 10k→40k** — the shapes are:
+
+| shape (ReleaseSafe, 10k→40k) | marginal | edges/cell | retained text B/cell |
+|---|---:|---:|---:|
+| f1 | 502.6 | 0.997 | 0.010 |
+| text | 473.5 | 0.222 | 4.281 |
+| crit | 477.7 | 0.009 | 0.009 |
+
+**Three shapes with nothing in common — 1.25 edges per formula against
+0.33 against a constant 1 088; 4 KB of retained text against 1.5 MB;
+eight arithmetic columns against six TEXT columns against 512
+whole-column criteria — agree on the marginal per-cell cost to within
+1.06×.** f1 and text are linear to five decimal places over a 40× size
+range. That is the shape of memory claim §9.1b asked whether zlsx could
+make: **per cell**, with a fixed cost of 0.6–2.8 MB beside it.
+
+**What this does NOT establish, stated because the ladder's habit is to
+overreach here.** The three shapes vary *many* things at once — formula
+density (14.6 % of cells at crit/1k against 0.42 % at crit/40k), formula
+kind, scan workspace, XML representation — so similar totals can hide
+components that offset. In particular the experiment **had no power to
+price retained text at all**: the largest retained-text density in the
+matrix is 9.11 B/cell against a ~473 B/cell slope, so text mass could
+cost three times what it occupies and still hide inside 6 % of the
+figure. **A 962× spread of a quantity that never exceeds 1.9 % of the
+budget cannot show that text is free** — it shows only that these
+fixtures do not carry enough text to test it. The residual spread after
+the per-cell term is 29.1 B/cell (6 %), and it does not order
+consistently with edge density either: f1 sits 29.1 B/cell above text on
+0.775 more edges per cell (≈ 38 B per edge), but criteria sits 4.2
+B/cell *above* text on 0.213 *fewer* (≈ −20 B per edge). **No per-edge
+cost is identifiable from these nine points, and none is claimed.**
+
+The honest summary: *for the three shapes measured, cells carry the
+memory and the residual is 6 %.* A one-cell-per-row workbook, unique
+multi-kilobyte strings, or very long formulas could each break it, and
+none is in this matrix.
+
+**Why B/cell falls with size, and why that is not an improvement.**
+Every shape's B/cell drops from 1k to 10k (737→531, 779→504, 984→422)
+and then flattens. That is the intercept being amortized, not the engine
+getting cheaper: at f1/1k the 2.52 MB fixed cost is 34 % of the figure
+and at f1/40k it is 1.2 %. **A B/cell quoted without its size is a
+statement about how big the fixture was.** The named fixture's 531.2 sits
+5.5 % above f1's own asymptote for exactly this reason.
+
+#### Two findings that qualify recorded numbers
+
+**1. The 6.7 % safety-memset tax is a property of f1_named, not of the
+lane.** §9.1c measured ReleaseSafe against ReleaseFast on one fixture at
+one size and reported the gap as a share of the gate figure. Across the
+matrix that gap is:
+
+| | 1k | 10k | 40k |
+|---|---:|---:|---:|
+| f1 | +3.1 % | **+6.8 %** | +5.7 % |
+| text | **+0.0 %** (byte-identical) | +0.3 % | +0.1 % |
+| crit | −2.4 % | −0.3 % | **+16.2 %** |
+
+**Zero to sixteen percent**, and the narrow claim is the safe one: 6.7 %
+is not a lane constant, it is one fixture's reading at one size. The
+mechanism §9.1c established is *consistent* with the spread — `alloc`
+memsets, so a tax is paid on capacity that is allocated and not written,
+and criteria's whole-column scan buffers grow with data rows while
+text's allocations are written — but **this matrix does not measure
+capacity or residency per site, so it cannot attribute crit/40k's
+9 060 352 B to the scan buffers specifically.** That attribution is a
+hypothesis the matrix is compatible with, not a result it produced.
+
+**The two negative cells are an artifact of the subtraction, not a
+negative tax.** At crit/1k the raw peaks are *identical* — 5 324 800 in
+both lanes — and only the usage baselines differ (1 867 776 against
+1 785 856), so the sign comes entirely from the baseline. The correct
+reading of those cells is **a tax of zero**: on that workload the
+ReleaseSafe memset produced no observable increase in the process
+maximum at all. A figure this small is at the edge of what a
+baseline-adjusted number can resolve, which is the same ±1-page caution
+M10t recorded.
+
+**2. The retired XML-bytes unit, falsified on a coincidence.** §9.1b
+retired the ratio against decompressed part bytes on the argument that
+it "loosens for a verbose workbook and tightens for a compact one
+carrying identical content". The fixtures handed us the experiment:
+
+| | decompressed part bytes | cells | adjusted RSS | × model bytes | B/cell |
+|---|---:|---:|---:|---:|---:|
+| f1 / 10k | 5 294 703 | 100 000 | 53 116 928 | **10.03×** | 531.2 |
+| text / 10k | 5 287 426 | 90 000 | 45 367 296 | **8.58×** | 504.1 |
+
+**Two workbooks whose decompressed bytes differ by 7 277 — 0.14 % — and
+whose RSS differs by 7 749 632, or 17.1 %.** Across the whole matrix the
+ratio spans **8.14× to 24.32×**: a ceiling written in that unit would be
+a different ceiling on every fixture, which is precisely why the 3×
+figure could be simultaneously "missed by 3.3×" on f1_named and
+meaningless as a general claim.
+
+**What the pair does and does not show.** It is *not* the controlled
+"identical content, verbose against compact" experiment §9.1b described,
+and it should not be read as one: these two workbooks also differ by
+10 000 modeled cells (11.1 %), which at ~500 B/cell accounts for roughly
+5 041 000 of the 7 749 632 B gap. What it establishes is the negative
+result — **equal decompressed bytes do not imply equal memory, so that
+quantity cannot normalize a memory ceiling on its own.** It does not
+independently prove cells are the right normalizer; the slope tables
+above are what argue that, and they argue it for three shapes only.
+
+#### The `pages` currency beside the gate currency
+
+Every cell was also run under M10t's off-thread resident sampler, in the
+**ReleaseSafe** lane — `pages` is a diagnostic, so it is measured in the
+lane the gate is measured in and not in both.
+
+| cell | gate-adjusted | pages-adjusted | difference | eras | coverage |
+|---|---:|---:|---:|---:|---:|
+| f1/1k | 7 372 800 | 7 487 488 | +114 688 | 5 | 1.0000 |
+| f1/10k | 53 116 928 | 53 231 616 | +114 688 | 23 | 1.0000 |
+| f1/40k | 203 898 880 | 189 480 960 | −14 417 920 | 18 | **0.9296** |
+| text/1k | 7 012 352 | 7 127 040 | +114 688 | 3 | 1.0000 |
+| text/10k | 45 367 296 | 45 481 984 | +114 688 | 17 | 1.0000 |
+| text/40k | 173 211 648 | 155 205 632 | −18 006 016 | 24 | **0.8970** |
+| crit/1k | 3 457 024 | 3 571 712 | +114 688 | 1 | 1.0000 |
+| crit/10k | 12 877 824 | 12 992 512 | +114 688 | 5 | 1.0000 |
+| crit/40k | 55 869 440 | 55 984 128 | +114 688 | 13 | 1.0000 |
+
+**Where the sampler caught the peak the two currencies differ by exactly
+114 688 B — the same constant in all seven cells.** It decomposes, and
+the decomposition matters more than the constant does. Taking f1/1k:
+
+| | value |
+|---|---:|
+| `pages` raw peak (7 487 488 + 2 555 904) | 10 043 392 |
+| gate raw peak (7 372 800 + 1 867 776) | 9 240 576 |
+| **raw difference** | **802 816** = 786 432 sampler buffer + 16 384 (one page) |
+| baseline difference (2 555 904 − 1 867 776) | 688 128 |
+| **adjusted difference** | 802 816 − 688 128 = **114 688** |
+
+So the constant is **the sampler's own fixed cost net of the two
+baseline definitions** — *not* the baseline definition alone, which is
+what an earlier draft of this section claimed. The two are not even the
+same sign: if the raw peaks were equal and only the baselines differed,
+`pages` would read **688 128 B lower**, not 114 688 B higher. The
+sampler's 786 432 B buffer is written before its own baseline reading
+but the thread is spawned after it (`bench_recalc.zig:526`), so the
+thread's residency is in the peak and out of the baseline — which is why
+the raw gap is the buffer plus exactly one page.
+
+**§9.1a's wording defect is visible here** — the two modes really do
+subtract different things — but it is 688 128 B of this gap, not the
+whole of it, and no reading in this file is derived from the `pages`
+adjusted figure. The two 40k cells that
+disagree by megabytes are the two whose own `coverage` check says the
+thread missed the kernel's maximum — the sampler declares its own
+invalidity, and their era heights are floors. Era counts scale with the
+workload (1 for crit/1k, 24 for text/40k), so the 24-era vector §9.1c
+tabulated is a property of the named fixture too, not a constant of the
+pipeline.
+
+#### The gate, re-measured
+
+| | value |
+|---|---:|
+| f1_mix named, ReleaseSafe, ×3 byte-identical | 54 984 704 |
+| usage-invocation baseline | 1 867 776 |
+| **baseline-adjusted** | **53 116 928** |
+| ratcheted budget (§9.1c) | 53 631 549 |
+| headroom | 514 621 B (0.96 %) |
+
+**Within budget.** Against M10t's 53 100 544 this reads +16 384 B —
+**exactly one page**, the binary-layout sensitivity M10t recorded and
+the reason the gate is defined on the adjusted figure. It is *not* a
+lower figure, so **the budget does not ratchet: it stays 53 631 549 B.**
+
+#### The Codex round, and what it refuted
+
+One round (gpt-5.6-sol, high effort) on the six load-bearing claims of
+the draft above, asked to rule and to show counter-arithmetic. **Four of
+six came back WRONG or OVERCLAIMED, and every number it disputed
+verified.** The corrections are already applied above; the record is
+here because three of the four are the ladder's own recurring failure.
+
+| claim as drafted | ruling | what was wrong |
+|---|---|---|
+| "cells predict memory; edge density and text mass predict **nothing**" | **WRONG** | a 962× spread of a quantity that never exceeds 1.9 % of the figure is not evidence of no effect — the design had **no power** to price text. And the three shapes co-vary in formula density, formula kind and scan workspace, so similar totals can hide offsetting components. Retracted to "for these three shapes, cells carry it and the residual is 6 %" |
+| three shapes "within **1.10×**" on the per-cell slope | **WRONG**, arithmetically | 503.6 / 455.5 = **1.1056**. And 455.5 was criteria's OLS slope over a curve whose marginals move 36.9 % — quoting it as a marginal launders the non-linearity the same row displays. Restated on the 10k→40k marginals, where all three define the same quantity: 502.6 / 473.5 / 477.7, **1.06×** |
+| the memset tax's spread is "explained **exactly**" by scan-buffer capacity, and two cells show a *negative* tax | **OVERCLAIMED** | the matrix measures neither capacity nor per-site residency, so the attribution is a compatible hypothesis, not a result. And at crit/1k the two lanes' **raw peaks are identical** (5 324 800): the negative sign is the baseline subtraction, and the honest reading is a tax of **zero** |
+| the near-identical-XML pair "falsifies" the retired unit | **OVERCLAIMED** | it falsifies *sufficiency* — equal XML bytes, unequal memory. But the pair also differs by 10 000 cells (11.1 %), which accounts for ~5 041 000 of the 7 749 632 B gap, so it cannot also prove cells are the right normalizer |
+| the constant 114 688 B "**is** the baseline definition" | **WRONG** | it is the sampler's fixed cost *net* of the baseline difference. Raw gap 802 816 = 786 432 buffer + one page; baseline gap 688 128; 802 816 − 688 128 = 114 688. Baselines alone would have put `pages` **688 128 B lower**, the opposite sign |
+| `dependency_edges` documented as first-graph-only | **SOUND** | no §5.6e rebuild occurs on these fixtures, and the docstring states both the semantics and the exclusion. One wording fix: edges are the density's **numerator**, not its denominator |
+
+**The pattern, for the sixth time.** Three of the four hits are the same
+error the ladder has now made in every form: taking a difference in one
+currency and attributing it to a single cause without decomposing it.
+M10p's peak-live-versus-RSS, M10t's capacity-versus-pages, and now a
+114 688 B constant that had two components of opposite sign. The
+discipline that catches it is arithmetic, not intuition: **decompose
+every difference into named terms that sum to it before naming its
+cause.**
+
+#### What this does and does not say about the research target
+
+The hypothesis is 158.8 B/cell. The matrix replaces "532 B/cell
+measured" with something a target can actually be set against:
+
+- the **marginal** cost is 455–504 B/cell in the gate lane and 371–475
+  in ReleaseFast, across three unrelated shapes;
+- the **fixed** cost is 0.6–2.8 MB and is already small at 100 000 cells;
+- so reaching 158.8 B/cell requires the *slope* to fall ~3×, and no
+  amount of amortization gets there — the intercept is not the problem.
+
+It also says that **across the three shapes measured** the marginal cost
+agrees to within 6 %, which is new and which cuts a specific hope: a 3×
+reduction is not going to be found in one workload's peculiarities,
+because three unrelated workloads price a cell the same. The claim is
+bounded by its evidence — a workbook with one cell per row, or with
+unique multi-kilobyte strings, is untested, and §9.1b's matrix should
+grow those shapes before the per-cell figure is quoted as a property of
+the engine rather than of these nine points.
+
+§9.1c's no-go stands unchanged — this row measured curves, it did not
+cut bytes, and the 2 048 000 B budget it left for any further row is
+untouched.
 
 ---
 
