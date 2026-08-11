@@ -28,6 +28,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
+/// §9.1 M10q's fill probe. Zero-cost unless a tally is installed.
+pub const fill_probe = @import("fill.zig");
 const store_mod = @import("store.zig");
 /// M5b2: §5.7.3 step 4's prepare/swap transaction. The import points
 /// back at this file — `recalc_txn` builds a candidate *for* a
@@ -8813,7 +8815,13 @@ pub const WorkbookEnv = struct {
     allocator: Allocator,
     workbook: *Workbook,
     /// Owns every cell and every decoded string the model kept.
-    arena: std.heap.ArenaAllocator,
+    ///
+    /// A `fill.Arena` rather than a bare `ArenaAllocator` so §9.1 M10q's
+    /// probe can read the bytes handed *out* of it, not just the chunks
+    /// it requested — the two diverge, and for this arena M10p measured
+    /// the divergence at 1.57 MB. Costs nothing when no tally is
+    /// installed (`pkg/fill.zig`).
+    arena: fill_probe.Arena,
     sheets: []Sheet,
     strings: engine.decode.Strings,
     symbols: engine.SymbolTable,
@@ -9186,7 +9194,7 @@ pub const WorkbookEnv = struct {
         };
         defer if (!keep) calc.deinit(allocator);
 
-        var arena = std.heap.ArenaAllocator.init(allocator);
+        var arena: fill_probe.Arena = .init(allocator, .model);
         defer if (!keep) arena.deinit();
         const a = arena.allocator();
 

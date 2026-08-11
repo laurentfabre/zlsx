@@ -54,7 +54,7 @@ const RUN: recalc.RunInputs = .{
     .limits = .{},
 };
 
-const Mode = enum { emit, open, recalc, save, phases, heap };
+const Mode = enum { emit, open, recalc, save, phases, heap, fill };
 
 /// Which generator `emit` runs. Only `emit` cares: the other four modes
 /// take a fixture path and measure whatever workbook is behind it,
@@ -74,7 +74,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (args.len < 3) {
         try w.print(
-            "usage: {s} <emit|open|recalc|save|phases|heap> <fixture.xlsx>" ++
+            "usage: {s} <emit|open|recalc|save|phases|heap|fill> <fixture.xlsx>" ++
                 " [--workload f1|criteria|text|registry] [--size named|small|tiny] [--rows N] [--out PATH]\n",
             .{args[0]},
         );
@@ -203,6 +203,7 @@ pub fn main(init: std.process.Init) !u8 {
         },
         .phases => return reportPhases(gpa, io, w, path, out_path),
         .heap => return reportHeap(io, w, path),
+        .fill => return reportFill(io, w, path),
     }
     return 0;
 }
@@ -224,16 +225,112 @@ fn reportHeap(io: std.Io, w: *std.Io.Writer, path: []const u8) !u8 {
     var prof: HeapProfiler = .init(std.heap.smp_allocator);
     const gpa = prof.allocator();
 
+    // §9.1 M10q: the profiler above sees an arena's chunk REQUESTS. These
+    // tallies see what the arena hands out. The gap between them is
+    // where M10p's 1.57 MB came from, and no era height can show it.
+    const fill = pkg.fill_probe;
+    var tallies: [std.meta.fields(fill.Owner).len]fill.Tally = @splat(.{});
+    inline for (std.meta.fields(fill.Owner), 0..) |f, i| {
+        _ = fill.install(@field(fill.Owner, f.name), &tallies[i]);
+    }
+    defer fill.clear();
+
+    const rss_before = peakRssBytes();
+
     var wb = try Workbook.open(gpa, io, path);
     defer wb.deinit();
     const open_live = prof.live_total;
+    const rss_after_open = peakRssBytes();
 
     var report = try wb.recalculate(gpa, io, RUN, .{});
     defer report.deinit(gpa);
+    const rss_after_recalc = peakRssBytes();
 
     try w.print("live_after_open_bytes={d}\n", .{open_live});
     try prof.report(w);
+
+    // Four quantities, named separately, because every §9.1 mispricing
+    // from M10k onward was one of them wearing another's number:
+    // capacity is what the trace sees, fill is what the pages are,
+    // handed is churn, and RSS is the only one a user experiences.
+    try w.print("\n--- arena fill (M10q) ---\n", .{});
+    inline for (std.meta.fields(fill.Owner), 0..) |f, i| {
+        const t = tallies[i];
+        try w.print(
+            "arena={s} capacity_end={d} fill_peak={d} unfilled={d} handed={d} calls={d}\n",
+            .{ f.name, t.capacity_end, t.peak, t.capacity_end -| t.peak, t.handed, t.calls },
+        );
+    }
+    // Labelled, not reported plainly: in THIS mode the profiler's own
+    // site table and live map are resident too, so the figure is tens of
+    // times the production one. `fill` mode is where RSS means what a
+    // user would see. Printing it anyway because a reader comparing the
+    // two modes deserves to be told why they disagree.
+    try w.print(
+        "rss_peak_bytes_PROFILER_INFLATED start={d} after_open={d} after_recalc={d}\n",
+        .{ rss_before, rss_after_open, rss_after_recalc },
+    );
     return 0;
+}
+
+/// §9.1 M10q's four quantities, uncontaminated.
+///
+/// The same first recalc as `recalc` mode, with fill tallies installed
+/// but **no heap profiler** — so `capacity`, `fill`, `unfilled` and RSS
+/// are all measured on the process a user would run. `heap` mode cannot
+/// do this: its own bookkeeping is resident and moves RSS by an order of
+/// magnitude. A separate mode rather than a flag on `recalc`, because
+/// `recalc` is the hyperfine timing lane and counting every arena
+/// allocation would perturb the evaluate ceiling it exists to measure.
+fn reportFill(io: std.Io, w: *std.Io.Writer, path: []const u8) !u8 {
+    const gpa = std.heap.smp_allocator;
+
+    const fill = pkg.fill_probe;
+    var tallies: [std.meta.fields(fill.Owner).len]fill.Tally = @splat(.{});
+    inline for (std.meta.fields(fill.Owner), 0..) |f, i| {
+        _ = fill.install(@field(fill.Owner, f.name), &tallies[i]);
+    }
+    defer fill.clear();
+
+    const rss_start = peakRssBytes();
+    var wb = try Workbook.open(gpa, io, path);
+    defer wb.deinit();
+    const rss_open = peakRssBytes();
+
+    var report = try wb.recalculate(gpa, io, RUN, .{});
+    defer report.deinit(gpa);
+    const rss_recalc = peakRssBytes();
+
+    var cap_total: usize = 0;
+    var fill_total: usize = 0;
+    inline for (std.meta.fields(fill.Owner), 0..) |f, i| {
+        const t = tallies[i];
+        cap_total += t.capacity_end;
+        fill_total += t.peak;
+        try w.print(
+            "arena={s} capacity_end={d} fill_peak={d} unfilled={d} handed={d} calls={d}\n",
+            .{ f.name, t.capacity_end, t.peak, t.capacity_end -| t.peak, t.handed, t.calls },
+        );
+    }
+    try w.print(
+        "arena_totals capacity_end={d} fill_peak={d} unfilled={d}\n",
+        .{ cap_total, fill_total, cap_total -| fill_total },
+    );
+    try w.print(
+        "rss_peak_bytes start={d} after_open={d} after_recalc={d}\n",
+        .{ rss_start, rss_open, rss_recalc },
+    );
+    return 0;
+}
+
+/// Peak RSS so far, in bytes. `maxrss` is monotonic, which is what makes
+/// it useful at a checkpoint: it says *which phase* set the high-water
+/// mark, which is the question the era trace answers in the wrong
+/// currency. macOS reports bytes; Linux reports kilobytes.
+fn peakRssBytes() u64 {
+    const ru = std.posix.getrusage(std.posix.rusage.SELF);
+    const raw: u64 = @intCast(ru.maxrss);
+    return if (@import("builtin").os.tag == .macos) raw else raw * 1024;
 }
 
 /// Attributing allocator: wraps a backing allocator, keys every

@@ -191,6 +191,72 @@ this, §2 ships blind.
 
 ---
 
+### §3 SHIPPED — M10q (measured 2026-08-11)
+
+`pkg/fill.zig` gives each named arena owner a `Tally` and a drop-in
+`fill.Arena`. Runtime opt-in: `sinks` is null in production, `allocator()`
+then returns the inner arena's allocator untouched, and the branch is paid
+once per `allocator()` call rather than per allocation. A new
+`zlsx-bench-recalc fill` mode reports the four quantities **without** the
+heap profiler — `heap` mode cannot, because its own site table and live
+map are resident and move RSS by an order of magnitude (471 728 128 B
+there against 62 488 576 here; the polluted figure is printed under an
+explicit `_PROFILER_INFLATED` label rather than suppressed).
+
+**The gate — M10p's 8-byte `Cell` delta, replayed.**
+
+| | 80 B (main) | 88 B (replay) | Δ |
+|---|---:|---:|---:|
+| model arena **fill**_peak | 18 157 309 | 19 757 821 | **+1 600 512** |
+| model arena **capacity**_end | 22 842 794 | 22 842 244 | **−550** |
+| RSS, `fill` mode | 62 488 576 | 64 061 440 | **1 572 864** |
+| RSS, `/usr/bin/time` ×3 | 62 406 656 | 64 061 440 | 1 654 784 |
+
+Fill predicts **1 600 512** against a measured **1 572 864** — **1.76 %
+error**, inside the 5 % gate (3.28 % against the `time -l` bracket).
+
+**And it explains M10p rather than restating it.** Capacity moved
+**−550 bytes** while fill moved 1 600 512. −550 is exactly the `+550`
+peak-live figure M10p recorded, sign-flipped for the reversed direction.
+The chunk ladder did not step; the saving came out of fill inside chunks
+already mapped. The two currencies are now measured side by side instead
+of inferred apart.
+
+**The request-vs-fill table, per arena owner** (named workload, first
+recalc, ReleaseSafe):
+
+| arena | capacity_end | fill_peak | **unfilled** | handed | calls |
+|---|---:|---:|---:|---:|---:|
+| model | 22 842 794 | 18 157 309 | **4 685 485** | 18 224 933 | 93 153 |
+| stage | 8 365 688 | 7 496 961 | **868 727** | 7 496 961 | 4 |
+| scratch | 5 618 | 2 984 | 2 634 | 191 595 060 | 1 099 375 |
+| run | 0 | 0 | 0 | 0 | 0 |
+| **totals** | **31 214 100** | **25 657 254** | **5 556 846** | | |
+
+**What this re-prices.** The model arena carries **4 685 485 B of
+unfilled capacity** and staging **868 727** — 5 556 846 B in total that
+is mapped, counted by the era trace, and not resident. That is headroom a
+fill-shaped cut can collect while the trace shows nothing, and it is the
+same shape of gap M10p fell into. The scratch arena is M10a's design
+working exactly as intended: 191 595 060 B handed out over 1 099 375
+calls against a 2 984 B high-water — enormous churn, negligible fill.
+
+**Three limitations, stated rather than discovered later.**
+1. **Per-owner, not per-site.** The model tally covers the whole model
+   arena, so it cannot split era 20's `id21` (12 338 604) from the
+   publication chunk `id82` (7 720 116). Pricing §2 exactly needs either
+   a per-site fill split or a checkpoint sampled at the publish instant.
+2. **`run` reports zero** — that arena is initialised and torn down
+   without a single allocation on this workload. Worth confirming before
+   any row prices it.
+3. **The probe costs 65 536 B of RSS** (62 406 656 → 62 472 192,
+   +0.105 %) — the vtable and module text, compiled in even when the
+   sinks are null. Peak live and every era height are byte-identical, and
+   output is 24/24 identical. A build option would compile it out
+   entirely if production byte-identity is ever required.
+
+---
+
 ## 4. Releasing the decompressed parts — ⚠️ mostly retracted
 
 The original premise is wrong. **Formula text is already owned**:
