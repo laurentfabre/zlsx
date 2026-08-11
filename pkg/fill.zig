@@ -37,6 +37,14 @@ pub const Owner = enum {
     /// The per-evaluation scratch arena (M10a), reset `.retain_capacity`
     /// between cells — its *peak* fill is the interesting figure.
     scratch,
+    /// `PartStore.arena` — decompressed part bytes and every borrowed
+    /// slice the store exposes. §9.1's `id7`, and the **only site live in
+    /// all 24 eras** (§9.1a): the one allocation whose removal could
+    /// lower the envelope rather than expose the next era. It was the
+    /// last big owner still uncounted, which is why M10t's first
+    /// checkpoint run read `fill=92` through eleven eras that had already
+    /// climbed to 48.9 MiB — the bytes were all here.
+    parts,
 };
 
 /// Bytes handed out of one arena, as opposed to the bytes its chunks
@@ -91,6 +99,17 @@ pub fn clear() void {
 pub const Arena = struct {
     inner: std.heap.ArenaAllocator,
     tally: ?*Tally,
+    /// What THIS arena instance is holding, as opposed to what the
+    /// owner's tally holds. An `Owner` is a role, not an object, and
+    /// `parts` proved the two are different: a recalc opens a second
+    /// `PartStore` generation over the same archive, so two `parts`
+    /// arenas are alive at once and a third has already died. Without a
+    /// per-instance figure the tally could not give back what a dead
+    /// arena had taken, and M10t's first run with `.parts` installed
+    /// read `fill_peak=10 590 591` against `capacity_end=7 944 604` —
+    /// a fill larger than the capacity that held it, which is not a
+    /// quantity.
+    own_fill: usize = 0,
 
     pub fn init(child: std.mem.Allocator, owner: Owner) Arena {
         return .{
@@ -103,16 +122,28 @@ pub const Arena = struct {
         // Queried once, here: `queryCapacity` walks the chunk list, so
         // sampling it per allocation would make the probe the thing
         // being measured.
-        if (self.tally) |t| t.capacity_end = self.inner.queryCapacity();
+        //
+        // Accumulated, not assigned: with several generations of one
+        // owner the last one to die is not the only one that asked its
+        // backing for chunks, and `capacity_end` is read against
+        // `fill_peak` — a sum against a high-water mark of a sum.
+        if (self.tally) |t| {
+            t.capacity_end += self.inner.queryCapacity();
+            t.live -= self.own_fill;
+        }
+        self.own_fill = 0;
         self.inner.deinit();
     }
 
     pub fn reset(self: *Arena, mode: std.heap.ArenaAllocator.ResetMode) bool {
-        // Fill is not reclaimed on the tally: `scratch` resets per cell,
-        // and a counter that fell back to zero each time would report
-        // the last cell's fill rather than the arena's high water, which
-        // is the only figure a page-resident argument can use.
-        if (self.tally) |t| t.live = 0;
+        // Fill is not reclaimed on the tally's `peak`: `scratch` resets
+        // per cell, and a high-water mark that fell back to zero each
+        // time would report the last cell's fill rather than the arena's
+        // high water, which is the only figure a page-resident argument
+        // can use. `live` gives back exactly what this instance held —
+        // no more, so a sibling arena on the same owner keeps its own.
+        if (self.tally) |t| t.live -= self.own_fill;
+        self.own_fill = 0;
         return self.inner.reset(mode);
     }
 
@@ -135,6 +166,7 @@ pub const Arena = struct {
 
     fn note(self: *Arena, delta_add: usize, delta_sub: usize) void {
         const t = self.tally.?;
+        self.own_fill = self.own_fill + delta_add - delta_sub;
         t.live = t.live + delta_add - delta_sub;
         if (t.live > t.peak) t.peak = t.live;
     }
@@ -228,6 +260,35 @@ test "fill.Arena: capacity_end records the gap fill cannot see" {
     // touched — invisible to the heap profiler, and exactly what an
     // RSS-priced cut comes out of.
     try std.testing.expectEqual(@as(usize, 3000), t.peak);
+    try std.testing.expect(t.capacity_end >= t.peak);
+}
+
+test "fill.Arena: one owner, several generations — fill never exceeds capacity" {
+    clear();
+    var t: Tally = .{};
+    _ = install(.parts, &t);
+    defer clear();
+
+    // The `parts` shape: a generation is opened, a second is opened over
+    // it, the first dies. Before `own_fill` the dead one's bytes stayed
+    // on `live` forever, so `peak` accumulated across generations and
+    // could exceed the capacity that ever existed at one instant.
+    {
+        var gen1: Arena = .init(std.testing.allocator, .parts);
+        _ = try gen1.allocator().alloc(u8, 4000);
+        {
+            var gen2: Arena = .init(std.testing.allocator, .parts);
+            defer gen2.deinit();
+            _ = try gen2.allocator().alloc(u8, 1000);
+            // Both alive: the owner really is holding 5000 here.
+            try std.testing.expectEqual(@as(usize, 5000), t.live);
+            try std.testing.expectEqual(@as(usize, 5000), t.peak);
+        }
+        try std.testing.expectEqual(@as(usize, 4000), t.live);
+        gen1.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 0), t.live);
+    try std.testing.expectEqual(@as(usize, 5000), t.peak);
     try std.testing.expect(t.capacity_end >= t.peak);
 }
 

@@ -1,7 +1,7 @@
 //! §9's recalc bench harness (M5d3): the baseline v1's absolute
 //! ceilings are measured against.
 //!
-//! One binary, six modes, because hyperfine measures whole processes
+//! One binary, eight modes, because hyperfine measures whole processes
 //! and §9 wants two different numbers out of the same workload:
 //!
 //!   emit    write the fixture and print its SHA-256 (and, for the
@@ -13,6 +13,14 @@
 //!   heap    §9.1's RSS lane, attributed: the same first recalc under
 //!           an allocator that names which call sites hold how many
 //!           bytes at the moment of peak live footprint
+//!   fill    M10q's four quantities uncontaminated — capacity, fill,
+//!           churn and RSS with no profiler resident beside them
+//!   pages   M10t's resident-page curve, sampled off-thread from the
+//!           kernel: the only mode that measures pages rather than
+//!           inferring them from bytes an allocator was asked for
+//!
+//! The last three are diagnostics, not lanes: `recalc` under
+//! `/usr/bin/time -l` is what the §9.1b budget gates on.
 //!
 //! **Evaluate time is a difference, not a mode.** No process can
 //! recalculate without first opening the archive, so `recalc − open` is
@@ -54,7 +62,7 @@ const RUN: recalc.RunInputs = .{
     .limits = .{},
 };
 
-const Mode = enum { emit, open, recalc, save, phases, heap, fill };
+const Mode = enum { emit, open, recalc, save, phases, heap, fill, pages };
 
 /// Which generator `emit` runs. Only `emit` cares: the other four modes
 /// take a fixture path and measure whatever workbook is behind it,
@@ -74,7 +82,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (args.len < 3) {
         try w.print(
-            "usage: {s} <emit|open|recalc|save|phases|heap|fill> <fixture.xlsx>" ++
+            "usage: {s} <emit|open|recalc|save|phases|heap|fill|pages> <fixture.xlsx>" ++
                 " [--workload f1|criteria|text|registry] [--size named|small|tiny] [--rows N] [--out PATH]\n",
             .{args[0]},
         );
@@ -204,6 +212,7 @@ pub fn main(init: std.process.Init) !u8 {
         .phases => return reportPhases(gpa, io, w, path, out_path),
         .heap => return reportHeap(io, w, path),
         .fill => return reportFill(io, w, path),
+        .pages => return reportPages(io, w, path),
     }
     return 0;
 }
@@ -353,6 +362,276 @@ fn peakRssBytes() ?u64 {
 fn fmtRss(v: ?u64, buf: []u8) []const u8 {
     const n = v orelse return "unavailable";
     return std.fmt.bufPrint(buf, "{d}", .{n}) catch "overflow";
+}
+
+/// **Current** resident set, not the high-water mark — the quantity
+/// `getrusage` cannot report and every §9.1 row so far had to infer.
+///
+/// `maxrss` is monotonic, so it answers "how high did this process ever
+/// go" and nothing else; an era is a *local* maximum, which needs a
+/// curve that can come back down. macOS carries it in
+/// `mach_task_basic_info`, Linux in field 2 of `/proc/self/statm`
+/// (pages). Null elsewhere, so the windows-runtime lane still builds
+/// this binary — a zero would read as "nothing resident" in a table
+/// whose whole subject is residency.
+fn residentBytes() ?u64 {
+    const os = @import("builtin").os.tag;
+    switch (os) {
+        .macos => {
+            var info: std.c.mach_task_basic_info = undefined;
+            var count: std.c.mach_msg_type_number_t = std.c.MACH.TASK.BASIC.INFO_COUNT;
+            const kr = std.c.task_info(
+                std.c.mach_task_self(),
+                std.c.MACH.TASK.BASIC.INFO,
+                @ptrCast(&info),
+                &count,
+            );
+            if (kr != 0) return null;
+            return info.resident_size;
+        },
+        .linux => {
+            // Raw syscalls: 0.16's `std.posix` has neither `open` nor
+            // `close`, and the file layer wants an `std.Io` this
+            // sampling thread does not have and must not borrow from
+            // the process it is measuring.
+            const linux = std.os.linux;
+            const rc = linux.openat(linux.AT.FDCWD, "/proc/self/statm", .{ .ACCMODE = .RDONLY }, 0);
+            if (linux.errno(rc) != .SUCCESS) return null;
+            const fd: i32 = @intCast(rc);
+            defer _ = linux.close(fd);
+            var buf: [128]u8 = undefined;
+            const rn = linux.read(fd, &buf, buf.len);
+            if (linux.errno(rn) != .SUCCESS) return null;
+            const n: usize = @intCast(rn);
+            var it = std.mem.tokenizeScalar(u8, buf[0..n], ' ');
+            _ = it.next() orelse return null;
+            const rss_pages = it.next() orelse return null;
+            const pages = std.fmt.parseInt(u64, rss_pages, 10) catch return null;
+            return pages * std.heap.pageSize();
+        },
+        else => return null,
+    }
+}
+
+/// Sum of every installed fill tally's high-water mark — "touched fill"
+/// in one number, so a sample can carry it beside the resident reading.
+///
+/// Read off `peak` rather than `live` deliberately: `peak` only ever
+/// rises, so a sampling thread reading it while the pipeline writes it
+/// sees a value that was true at some instant at or before the sample,
+/// never a torn one. `live` would need synchronisation the measured
+/// process should not be paying for.
+fn fillPeakTotal() u64 {
+    const fill = pkg.fill_probe;
+    var total: u64 = 0;
+    inline for (std.meta.fields(fill.Owner)) |f| {
+        if (fill.sinks[@intFromEnum(@field(fill.Owner, f.name))]) |t| total += t.peak;
+    }
+    return total;
+}
+
+/// §9.1c M10t — the resident-page curve, sampled off-thread.
+///
+/// Every §9.1 figure from M10k to M10s is denominated in one of two
+/// currencies, and the ladder mispriced a row each time it read one as
+/// the other: traced **live bytes** (the heap profiler wraps the
+/// *backing* allocator, so for an arena it sees a chunk REQUEST) and
+/// arena **fill** (what the arena hands out). Neither is a page. This
+/// samples the third quantity directly, from the kernel, under the
+/// production allocator — no profiler, nothing to inflate it.
+///
+/// **Why a sampling thread and not checkpoints in the pipeline.** An era
+/// is a *local maximum of a curve*, and a curve needs samples between
+/// the phase boundaries rather than at them. The public seams are four
+/// (`open`, `prepare`, `serialize`, `swap`); the era vector has
+/// twenty-four. Sampling finds maxima no seam brackets, and it needs no
+/// production hook at all — which also means this mode measures exactly
+/// the binary the gate measures.
+///
+/// The sampler's own buffer is allocated and touched *before* the
+/// baseline reading, so every delta below is net of it.
+const Sampler = struct {
+    samples: []Sample,
+    n: std.atomic.Value(usize) = .init(0),
+    stop: std.atomic.Value(bool) = .init(false),
+    phase: std.atomic.Value(u8) = .init(0),
+    polls: std.atomic.Value(u64) = .init(0),
+    dropped: std.atomic.Value(u64) = .init(0),
+
+    const Sample = struct { rss: u64, fill: u64, phase: u8 };
+
+    /// Phase labels. Coarse by construction — they name which public
+    /// span a sample fell in, and the era structure comes from the
+    /// curve itself, not from these.
+    const phase_names = [_][]const u8{ "pre-open", "open", "recalc", "post" };
+
+    /// Record only when the reading MOVES. RSS steps a page at a time
+    /// and then sits flat for millions of instructions; storing every
+    /// poll would need a buffer big enough to distort the thing being
+    /// measured. A phase change always records, so every span has at
+    /// least one sample.
+    fn run(self: *Sampler) void {
+        var last_rss: u64 = std.math.maxInt(u64);
+        var last_phase: u8 = 255;
+        while (!self.stop.load(.acquire)) {
+            self.polls.store(self.polls.load(.monotonic) + 1, .monotonic);
+            const r = residentBytes() orelse return;
+            const ph = self.phase.load(.monotonic);
+            if (r == last_rss and ph == last_phase) {
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            last_rss = r;
+            last_phase = ph;
+            const i = self.n.load(.monotonic);
+            if (i >= self.samples.len) {
+                self.dropped.store(self.dropped.load(.monotonic) + 1, .monotonic);
+                continue;
+            }
+            self.samples[i] = .{ .rss = r, .fill = fillPeakTotal(), .phase = ph };
+            self.n.store(i + 1, .release);
+        }
+    }
+};
+
+fn reportPages(io: std.Io, w: *std.Io.Writer, path: []const u8) !u8 {
+    const gpa = std.heap.smp_allocator;
+
+    if (residentBytes() == null) {
+        try w.writeAll("pages mode needs a resident-set probe; this platform has none\n");
+        return 2;
+    }
+
+    // 32 768 change-points is ~10× what a 55 MiB climb can produce at
+    // 16 KiB page granularity, and 786 KiB of buffer — allocated and
+    // written here so the baseline below already contains it.
+    const cap = 32 * 1024;
+    const buf = try std.heap.page_allocator.alloc(Sampler.Sample, cap);
+    defer std.heap.page_allocator.free(buf);
+    @memset(buf, .{ .rss = 0, .fill = 0, .phase = 0 });
+
+    const fill = pkg.fill_probe;
+    var tallies: [std.meta.fields(fill.Owner).len]fill.Tally = @splat(.{});
+    inline for (std.meta.fields(fill.Owner), 0..) |f, i| {
+        _ = fill.install(@field(fill.Owner, f.name), &tallies[i]);
+    }
+    defer fill.clear();
+
+    var sampler: Sampler = .{ .samples = buf };
+    const baseline = residentBytes().?;
+
+    const thread = try std.Thread.spawn(.{}, Sampler.run, .{&sampler});
+
+    sampler.phase.store(1, .monotonic);
+    var wb = try Workbook.open(gpa, io, path);
+    sampler.phase.store(2, .monotonic);
+    var report = try wb.recalculate(gpa, io, RUN, .{});
+    sampler.phase.store(3, .monotonic);
+
+    const rss_end = residentBytes().?;
+    sampler.stop.store(true, .release);
+    thread.join();
+
+    report.deinit(gpa);
+    wb.deinit();
+
+    const n = sampler.n.load(.acquire);
+    const taken = buf[0..n];
+
+    try w.print(
+        "baseline_rss={d} end_rss={d} samples={d} polls={d} dropped={d} sampler_buffer_bytes={d}\n",
+        .{ baseline, rss_end, n, sampler.polls.load(.monotonic), sampler.dropped.load(.monotonic), cap * @sizeOf(Sampler.Sample) },
+    );
+
+    var peak: u64 = 0;
+    for (taken) |s| peak = @max(peak, s.rss);
+    const maxrss = peakRssBytes() orelse 0;
+    // The sampler's validity check, and it is not optional: if the thread
+    // missed the instant the kernel's own monotonic counter caught, every
+    // era height below is a floor rather than a height. Reported as a
+    // ratio so a reader can see how close, not just whether.
+    try w.print(
+        "sampled_peak={d} getrusage_maxrss={d} coverage={d:.4}\n",
+        .{ peak, maxrss, if (maxrss == 0) 0.0 else @as(f64, @floatFromInt(peak)) / @as(f64, @floatFromInt(maxrss)) },
+    );
+
+    try reportResidentEras(w, taken, baseline);
+
+    try w.writeAll("\n--- arena fill at exit ---\n");
+    var cap_total: usize = 0;
+    var fill_total: usize = 0;
+    inline for (std.meta.fields(fill.Owner), 0..) |f, i| {
+        const t = tallies[i];
+        cap_total += t.capacity_end;
+        fill_total += t.peak;
+        try w.print(
+            "arena={s} capacity_end={d} fill_peak={d} unfilled={d} handed={d} calls={d}\n",
+            .{ f.name, t.capacity_end, t.peak, t.capacity_end -| t.peak, t.handed, t.calls },
+        );
+    }
+    try w.print(
+        "arena_totals capacity_end={d} fill_peak={d} unfilled={d}\n",
+        .{ cap_total, fill_total, cap_total -| fill_total },
+    );
+    return 0;
+}
+
+/// The same era rule the heap profiler applies to the live curve
+/// (`era_dip` below a local maximum ends an era), applied to the
+/// **resident** curve instead. Same threshold on purpose: the two
+/// vectors are meant to be read side by side, and a different dip would
+/// make a difference in era count an artefact of the instrument.
+fn reportResidentEras(w: *std.Io.Writer, taken: []const Sampler.Sample, baseline: u64) !void {
+    const era_dip = HeapProfiler.era_dip;
+
+    try w.writeAll("\n--- resident eras (M10t) ---\n");
+    try w.writeAll("era phase resident_bytes adjusted_bytes fill_at_era unfilled_vs_resident\n");
+
+    var local_max: u64 = 0;
+    var max_fill: u64 = 0;
+    var max_phase: u8 = 0;
+    var recorded = true;
+    var era: usize = 0;
+
+    for (taken) |s| {
+        if (s.rss > local_max) {
+            local_max = s.rss;
+            max_fill = s.fill;
+            max_phase = s.phase;
+            recorded = false;
+        } else if (!recorded and local_max - s.rss >= era_dip) {
+            try printEra(w, era, max_phase, local_max, baseline, max_fill);
+            era += 1;
+            recorded = true;
+            local_max = s.rss;
+            max_fill = s.fill;
+            max_phase = s.phase;
+        }
+    }
+    if (!recorded) try printEra(w, era, max_phase, local_max, baseline, max_fill);
+}
+
+fn printEra(
+    w: *std.Io.Writer,
+    era: usize,
+    phase: u8,
+    resident: u64,
+    baseline: u64,
+    fill: u64,
+) !void {
+    const adjusted = resident -| baseline;
+    try w.print(
+        "era={d} phase={s} resident={d} adjusted={d} ({d:.2} MiB) fill={d} resident_minus_fill={d}\n",
+        .{
+            era,
+            Sampler.phase_names[@min(phase, Sampler.phase_names.len - 1)],
+            resident,
+            adjusted,
+            @as(f64, @floatFromInt(adjusted)) / (1024.0 * 1024.0),
+            fill,
+            @as(i64, @intCast(adjusted)) - @as(i64, @intCast(fill)),
+        },
+    );
 }
 
 /// Attributing allocator: wraps a backing allocator, keys every
