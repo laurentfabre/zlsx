@@ -48,6 +48,9 @@ const synth = @import("synth_f1_mix");
 const crit = @import("synth_criteria_mix");
 const text = @import("synth_text_mix");
 const registry = @import("synth_registry_mix");
+const sparse = @import("synth_sparse_mix");
+const bigtext = @import("synth_bigtext_mix");
+const longform = @import("synth_longform_mix");
 
 const pkg = recalc.pkg;
 const Workbook = recalc.Workbook;
@@ -68,8 +71,9 @@ const Mode = enum { emit, open, recalc, save, phases, heap, fill, pages };
 /// take a fixture path and measure whatever workbook is behind it,
 /// which is why the criteria lane (M7b2) needed a flag here and not a
 /// second binary. `text` is M8c's lane and `registry` M9d's, same
-/// reasoning.
-const Workload = enum { f1, criteria, text, registry };
+/// reasoning; `sparse`, `bigtext` and `longform` are M10v's three shape
+/// probes (§9.1e).
+const Workload = enum { f1, criteria, text, registry, sparse, bigtext, longform };
 
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
@@ -83,7 +87,9 @@ pub fn main(init: std.process.Init) !u8 {
     if (args.len < 3) {
         try w.print(
             "usage: {s} <emit|open|recalc|save|phases|heap|fill|pages> <fixture.xlsx>" ++
-                " [--workload f1|criteria|text|registry] [--size named|small|tiny] [--rows N] [--out PATH]\n",
+                " [--workload f1|criteria|text|registry|sparse|bigtext|longform]" ++
+                " [--size named|small|tiny] [--rows N] [--cols N] [--text-bytes N]" ++
+                " [--terms N] [--out PATH]\n",
             .{args[0]},
         );
         return 2;
@@ -104,6 +110,15 @@ pub fn main(init: std.process.Init) !u8 {
     var text_identity = true;
     var registry_geometry = registry.small;
     var registry_identity = true;
+    var sparse_geometry = sparse.small;
+    var sparse_identity = true;
+    var bigtext_geometry = bigtext.small;
+    var bigtext_identity = true;
+    var longform_geometry = longform.small;
+    var longform_identity = true;
+    var text_bytes_opt: ?u32 = null;
+    var terms_opt: ?u32 = null;
+    var cols_opt: ?u32 = null;
     var out_path: ?[]const u8 = null;
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
@@ -124,6 +139,12 @@ pub fn main(init: std.process.Init) !u8 {
                 text_identity = true;
                 registry_geometry = registry.small;
                 registry_identity = true;
+                sparse_geometry = sparse.small;
+                sparse_identity = true;
+                bigtext_geometry = bigtext.small;
+                bigtext_identity = true;
+                longform_geometry = longform.small;
+                longform_identity = true;
             } else if (std.mem.eql(u8, args[i], "tiny")) {
                 geometry = synth.tiny;
                 named_size = false;
@@ -133,6 +154,12 @@ pub fn main(init: std.process.Init) !u8 {
                 text_identity = false;
                 registry_geometry = registry.tiny;
                 registry_identity = false;
+                sparse_geometry = sparse.tiny;
+                sparse_identity = false;
+                bigtext_geometry = bigtext.tiny;
+                bigtext_identity = false;
+                longform_geometry = longform.tiny;
+                longform_identity = false;
             } else if (!std.mem.eql(u8, args[i], "named")) {
                 try w.print("unknown size: {s}\n", .{args[i]});
                 return 2;
@@ -152,10 +179,53 @@ pub fn main(init: std.process.Init) !u8 {
             text_identity = false;
             registry_geometry = .{ .data_rows = geometry.data_rows };
             registry_identity = false;
+            sparse_geometry = .{ .data_rows = geometry.data_rows };
+            sparse_identity = false;
+            bigtext_geometry = .{ .data_rows = geometry.data_rows };
+            bigtext_identity = false;
+            longform_geometry = .{ .data_rows = geometry.data_rows };
+            longform_identity = false;
+        } else if (std.mem.eql(u8, args[i], "--text-bytes") and i + 1 < args.len) {
+            // §9.1e's text-density sweep: the row count stays where
+            // `--size`/`--rows` put it and only the bytes per string
+            // move, so ΔRSS over the sweep has exactly one cause.
+            //
+            // Recorded here and applied after the loop, because every
+            // size flag assigns a whole `Geometry` — applying it inline
+            // would make `--text-bytes 512 --rows 5000` and
+            // `--rows 5000 --text-bytes 512` two different fixtures.
+            i += 1;
+            text_bytes_opt = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--terms") and i + 1 < args.len) {
+            // The same knob for AST mass, and the same reasoning.
+            i += 1;
+            terms_opt = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--cols") and i + 1 < args.len) {
+            // And the same knob for row density: `--rows 40000 --cols 10`
+            // holds the sparse fixture's 400 000 cells and its formula
+            // fraction while cutting its rows tenfold.
+            i += 1;
+            cols_opt = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
             i += 1;
             out_path = args[i];
         }
+    }
+
+    // The two density knobs, applied after every size flag has had its
+    // say. Off their defaults the fixture is a sweep point and not the
+    // identity, whatever `--size` asked for.
+    if (text_bytes_opt) |n| {
+        bigtext_geometry.string_bytes = n;
+        if (n != bigtext.default_string_bytes) bigtext_identity = false;
+    }
+    if (terms_opt) |n| {
+        longform_geometry.terms = n;
+        if (n != longform.default_terms) longform_identity = false;
+    }
+    if (cols_opt) |n| {
+        sparse_geometry.cols = n;
+        if (n != sparse.default_cols) sparse_identity = false;
     }
 
     switch (mode) {
@@ -185,6 +255,27 @@ pub fn main(init: std.process.Init) !u8 {
                     return 2;
                 }
                 return emitRegistry(gpa, io, w, path, registry_geometry, registry_identity);
+            },
+            .sparse => {
+                if (named_size) {
+                    try w.writeAll("the sparse workload needs --size small|tiny or --rows N\n");
+                    return 2;
+                }
+                return emitSparse(gpa, io, w, path, sparse_geometry, sparse_identity);
+            },
+            .bigtext => {
+                if (named_size) {
+                    try w.writeAll("the bigtext workload needs --size small|tiny or --rows N\n");
+                    return 2;
+                }
+                return emitBigtext(gpa, io, w, path, bigtext_geometry, bigtext_identity);
+            },
+            .longform => {
+                if (named_size) {
+                    try w.writeAll("the longform workload needs --size small|tiny or --rows N\n");
+                    return 2;
+                }
+                return emitLongform(gpa, io, w, path, longform_geometry, longform_identity);
             },
         },
         .open => {
@@ -1107,6 +1198,137 @@ fn emitRegistry(
                 "  The fixture IS the baseline's identity: re-measure the registry\n" ++
                 "  numbers and update `small_digest_sha256` in the same commit.\n",
             .{ registry.small_digest_sha256, digest },
+        );
+        return 1;
+    }
+    return 0;
+}
+
+/// M10v's three shape probes, same digest discipline as the four above.
+/// One function each rather than one generic: the four existing emitters
+/// are already written this way because the generators are separate
+/// modules with separate `Geometry` types, and a comptime fold over them
+/// would trade a readable failure message for nothing measurable.
+fn emitSparse(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    w: *std.Io.Writer,
+    path: []const u8,
+    geometry: sparse.Geometry,
+    identity_size: bool,
+) !u8 {
+    const bytes = try sparse.bytes(gpa, io, geometry);
+    defer gpa.free(bytes);
+
+    var hex: [sparse.digest_len * 2]u8 = undefined;
+    const digest = sparse.digestHex(bytes, &hex);
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+    try w.print(
+        "fixture={s} rows={d} cols={d} cells={d} formula_cells={d}" ++
+            " archive_bytes={d} sha256={s}\n",
+        .{
+            path,                    geometry.data_rows,
+            geometry.cols,           geometry.cells(),
+            geometry.formulaCells(), bytes.len,
+            digest,
+        },
+    );
+
+    if (identity_size and !std.mem.eql(u8, digest, sparse.small_digest_sha256)) {
+        try w.print(
+            "FAIL: sparse workload digest drifted\n  recorded {s}\n  emitted  {s}\n" ++
+                "  The fixture IS the §9.1e row's identity: re-measure the sparse\n" ++
+                "  numbers and update `small_digest_sha256` in the same commit.\n",
+            .{ sparse.small_digest_sha256, digest },
+        );
+        return 1;
+    }
+    return 0;
+}
+
+fn emitBigtext(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    w: *std.Io.Writer,
+    path: []const u8,
+    geometry: bigtext.Geometry,
+    identity_size: bool,
+) !u8 {
+    const bytes = try bigtext.bytes(gpa, io, geometry);
+    defer gpa.free(bytes);
+
+    var hex: [bigtext.digest_len * 2]u8 = undefined;
+    const digest = bigtext.digestHex(bytes, &hex);
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+    // `retained_text_bytes` is the whole point of this fixture and the
+    // denominator §9.1e's text-term arithmetic divides by, so it is
+    // printed where the row is emitted rather than recomputed by hand.
+    try w.print(
+        "fixture={s} rows={d} cells={d} formula_cells={d} archive_bytes={d}" ++
+            " retained_text_bytes={d} sha256={s}\n",
+        .{
+            path,             geometry.data_rows,
+            geometry.cells(), geometry.formulaCells(),
+            bytes.len,        geometry.retainedTextBytes(),
+            digest,
+        },
+    );
+
+    if (identity_size and !std.mem.eql(u8, digest, bigtext.small_digest_sha256)) {
+        try w.print(
+            "FAIL: bigtext workload digest drifted\n  recorded {s}\n  emitted  {s}\n" ++
+                "  The fixture IS the §9.1e row's identity: re-measure the bigtext\n" ++
+                "  numbers and update `small_digest_sha256` in the same commit.\n",
+            .{ bigtext.small_digest_sha256, digest },
+        );
+        return 1;
+    }
+    return 0;
+}
+
+fn emitLongform(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    w: *std.Io.Writer,
+    path: []const u8,
+    geometry: longform.Geometry,
+    identity_size: bool,
+) !u8 {
+    const bytes = try longform.bytes(gpa, io, geometry);
+    defer gpa.free(bytes);
+
+    var hex: [longform.digest_len * 2]u8 = undefined;
+    const digest = longform.digestHex(bytes, &hex);
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+    // `ast_nodes` and `formula_text_bytes` are §9.1e's two named terms
+    // for this shape's marginal, printed at emit for the same reason
+    // `bigtext` prints its retained text: a number the row divides by
+    // should come from the generator, not from a reader's arithmetic.
+    try w.print(
+        "fixture={s} rows={d} cells={d} formula_cells={d} archive_bytes={d}" ++
+            " terms={d} ast_nodes_per_formula={d} formula_text_bytes={d} sha256={s}\n",
+        .{
+            path,
+            geometry.data_rows,
+            geometry.cells(),
+            geometry.formulaCells(),
+            bytes.len,
+            geometry.terms,
+            geometry.astNodesPerFormula(),
+            geometry.formulaTextBytes(),
+            digest,
+        },
+    );
+
+    if (identity_size and !std.mem.eql(u8, digest, longform.small_digest_sha256)) {
+        try w.print(
+            "FAIL: longform workload digest drifted\n  recorded {s}\n  emitted  {s}\n" ++
+                "  The fixture IS the §9.1e row's identity: re-measure the longform\n" ++
+                "  numbers and update `small_digest_sha256` in the same commit.\n",
+            .{ longform.small_digest_sha256, digest },
         );
         return 1;
     }

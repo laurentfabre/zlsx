@@ -2209,6 +2209,38 @@ pub fn build(b: *std.Build) void {
     bench_registry_mix_mod.addImport("zlsx_control", control_mod);
     bench_registry_mix_mod.addImport("zlsx", zlsx_mod);
 
+    // M10v's three shape fixtures (§9.1e): one cell per row, unique
+    // multi-kilobyte strings, and very long formulas. Same shape and
+    // same discipline as the four above — they exist because §9.1d's
+    // per-cell claim was explicitly bounded by the shapes that produced
+    // it, and these are the three it named as untested.
+    const bench_sparse_mix_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/synth_sparse_mix.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = single_threaded,
+    });
+    bench_sparse_mix_mod.addImport("zlsx_control", control_mod);
+    bench_sparse_mix_mod.addImport("zlsx", zlsx_mod);
+
+    const bench_bigtext_mix_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/synth_bigtext_mix.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = single_threaded,
+    });
+    bench_bigtext_mix_mod.addImport("zlsx_control", control_mod);
+    bench_bigtext_mix_mod.addImport("zlsx", zlsx_mod);
+
+    const bench_longform_mix_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/synth_longform_mix.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = single_threaded,
+    });
+    bench_longform_mix_mod.addImport("zlsx_control", control_mod);
+    bench_longform_mix_mod.addImport("zlsx", zlsx_mod);
+
     // Imports `zlsx_recalc`, so the ReleaseFast bench lane compiles the
     // third public module too — a composition that only ever built in
     // Debug unit tests would be a surface nothing releases exercises.
@@ -2224,6 +2256,9 @@ pub fn build(b: *std.Build) void {
     bench_recalc_mod.addImport("synth_criteria_mix", bench_criteria_mix_mod);
     bench_recalc_mod.addImport("synth_text_mix", bench_text_mix_mod);
     bench_recalc_mod.addImport("synth_registry_mix", bench_registry_mix_mod);
+    bench_recalc_mod.addImport("synth_sparse_mix", bench_sparse_mix_mod);
+    bench_recalc_mod.addImport("synth_bigtext_mix", bench_bigtext_mix_mod);
+    bench_recalc_mod.addImport("synth_longform_mix", bench_longform_mix_mod);
     const bench_recalc_exe = b.addExecutable(.{
         .name = "zlsx-bench-recalc",
         .root_module = bench_recalc_mod,
@@ -2267,6 +2302,15 @@ pub fn build(b: *std.Build) void {
 
     const bench_registry_mix_tests = b.addTest(.{ .root_module = bench_registry_mix_mod });
     test_step.dependOn(&b.addRunArtifact(bench_registry_mix_tests).step);
+
+    const bench_sparse_mix_tests = b.addTest(.{ .root_module = bench_sparse_mix_mod });
+    test_step.dependOn(&b.addRunArtifact(bench_sparse_mix_tests).step);
+
+    const bench_bigtext_mix_tests = b.addTest(.{ .root_module = bench_bigtext_mix_mod });
+    test_step.dependOn(&b.addRunArtifact(bench_bigtext_mix_tests).step);
+
+    const bench_longform_mix_tests = b.addTest(.{ .root_module = bench_longform_mix_mod });
+    test_step.dependOn(&b.addRunArtifact(bench_longform_mix_tests).step);
 }
 
 /// The three committed oracle manifests, as anonymous imports.

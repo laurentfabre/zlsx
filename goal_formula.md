@@ -7027,6 +7027,472 @@ untouched.
 
 ---
 
+### 9.1e M10v — the three shapes that could break it (2026-08-11)
+
+§9.1d ended by naming the fixtures its own claim was blind to: "a
+workbook with one cell per row, or with unique multi-kilobyte strings, or
+with very long formulas could each break it, and none is in this matrix"
+— and it asked for them before the per-cell figure was "quoted as a
+property of the engine rather than of these nine points."
+
+This row is those three shapes, at three sizes each, in both lanes. It
+also brings a second instrument, because §9.1d's own post-mortem said
+what the matrix could not do: nine points that vary many things at once
+can only ever offer a residual to attribute. Each new shape therefore
+carries a **density knob** — bytes per string, terms per formula, cells
+per row — turned at a **fixed cell count**, so what it moves is not
+confounded with the quantity §9.1b made the research unit.
+
+**Two of the three shapes break the claim and the third extends it.**
+§9.1d's per-cell figure is **narrowed on content and widened on row
+density**; the sweeps say by how much, in what currency, and — the part
+that took a review round to get right — where the arithmetic stops
+licensing a cause.
+
+#### The three fixtures
+
+| shape | one line | cells/row | formula cells | edges | identity size | digest |
+|---|---|---:|---:|---:|---|---|
+| `sparse` | one cell per row; literal and formula rows alternate | 1 | ½ of cells | 0 | 100 000 rows | `31d0342e…37f2` |
+| `bigtext` | a unique 2 048-byte string per row, plus `UPPER` of it | 2 | ½ of cells | 0 | 5 000 rows | `cc36c810…4b79` |
+| `longform` | two integers and one 128-term flat sum | 3 | ⅓ of cells | 0 | 10 000 rows | `719628e8…c02f` |
+
+`sparse`'s sizes are chosen to land on **f1's cell counts** — 10 000 /
+100 000 / 400 000 — not on its row counts, so the comparison against
+§9.1d's f1 column is at equal cells with ten times the rows.
+
+All three carry **zero dependency edges**: every precedent is a literal
+cell and the graph has no node for a constant (§9.1d). They sit at the
+floor of the edge-density axis, extending §9.1d's 0.997 → 0.009 span to
+0.000, and they are silent about edges by construction.
+
+**Method.** §9.1d's exactly: adjusted = `/usr/bin/time -l` *maximum
+resident set size* of `zlsx-bench-recalc recalc <fixture>` minus the same
+field for a usage invocation of the same binary, three repetitions, the
+baseline re-read immediately before every measurement. **All 75
+(baseline, peak) pairs reproduced byte-identically**, so every figure
+below is the value and not an estimate of it. Every number in this
+section comes from one pair of binaries — M10t recorded that the raw peak
+is ±1 page sensitive to binary layout, so a table mixing builds would be
+quoting two different experiments — and the whole matrix was then
+measured again on a *second* build, with the result reported under "the
+gate" below. The three identity digests reproduced across two emissions
+each before anything was measured.
+
+#### The matrix
+
+| shape | size | cells | lane | adjusted RSS | B/cell | B/row | retained text B/cell |
+|---|---|---:|---|---:|---:|---:|---:|
+| sparse | 10k | 10 000 | ReleaseSafe | 6 815 744 | 681.6 | 681.6 | 0.0 |
+| sparse | 10k | 10 000 | ReleaseFast | 6 815 744 | 681.6 | 681.6 | 0.0 |
+| **sparse** | **100k** | **100 000** | **ReleaseSafe** | **46 399 488** | **464.0** | 464.0 | 0.0 |
+| sparse | 100k | 100 000 | ReleaseFast | 45 891 584 | 458.9 | 458.9 | 0.0 |
+| sparse | 400k | 400 000 | ReleaseSafe | 200 654 848 | 501.6 | 501.6 | 0.0 |
+| sparse | 400k | 400 000 | ReleaseFast | 178 339 840 | 445.8 | 445.8 | 0.0 |
+| bigtext | 1k | 2 000 | ReleaseSafe | 21 331 968 | 10 666.0 | 21 332.0 | 2 048.0 |
+| bigtext | 1k | 2 000 | ReleaseFast | 21 463 040 | 10 731.5 | 21 463.0 | 2 048.0 |
+| **bigtext** | **5k** | **10 000** | **ReleaseSafe** | **97 894 400** | **9 789.4** | 19 578.9 | 2 048.0 |
+| bigtext | 5k | 10 000 | ReleaseFast | 97 959 936 | 9 796.0 | 19 592.0 | 2 048.0 |
+| bigtext | 20k | 40 000 | ReleaseSafe | 383 238 144 | 9 581.0 | 19 161.9 | 2 048.0 |
+| bigtext | 20k | 40 000 | ReleaseFast | 383 107 072 | 9 577.7 | 19 155.4 | 2 048.0 |
+| longform | 1k | 3 000 | ReleaseSafe | 7 962 624 | 2 654.2 | 7 962.6 | 0.0 |
+| longform | 1k | 3 000 | ReleaseFast | 8 142 848 | 2 714.3 | 8 142.8 | 0.0 |
+| **longform** | **10k** | **30 000** | **ReleaseSafe** | **66 600 960** | **2 220.0** | 6 660.1 | 0.0 |
+| longform | 10k | 30 000 | ReleaseFast | 66 584 576 | 2 219.5 | 6 658.5 | 0.0 |
+| longform | 40k | 120 000 | ReleaseSafe | 281 526 272 | 2 346.1 | 7 038.2 | 0.0 |
+| longform | 40k | 120 000 | ReleaseFast | 281 493 504 | 2 345.8 | 7 037.3 | 0.0 |
+
+Marginals over the largest size step — the one quantity §9.1d defines the
+same way for every shape — beside §9.1d's own three:
+
+| shape | marginal B/cell (ReleaseSafe) | vs the §9.1d band |
+|---|---:|---|
+| text (§9.1d) | 473.5 | — |
+| crit (§9.1d) | 477.7 | — |
+| f1 (§9.1d) | 502.6 | — |
+| **sparse** | **514.2** | **2.3 % above f1 — extends the top of the band** |
+| **longform** | **2 388.1** | **4.8×** |
+| **bigtext** | **9 511.5** | **20.1×** |
+
+#### The verdict, stated: NARROWED on content, WIDENED on row density
+
+The claim moves in **both** directions and the row records which is
+which, because reporting only the half that shrank would be its own kind
+of overreach.
+
+**Widened, on row density.** One cell per row costs what ten cells per
+row cost. The comparison is as matched as two fixtures get: `sparse` and
+f1 are measured over the *same* 100 000 → 400 000 cell interval, and
+their marginals are **514.2 against 502.6 B/cell, 2.3 % apart** (at the
+400 000-cell point itself, 501.6 against f1's 509.7 — 1.6 %). §9.1d's
+band now covers a tenfold change in rows per cell.
+
+**Narrowed, on content.** The other two shapes break it outright. As
+point values the same "cell" is 464.0 B in `sparse` and 9 789.4 B in
+`bigtext` — **21.1×**; as marginals over each shape's largest step, 473.5
+(text) against 9 511.5 (bigtext) — **20.1×**. No amount of size
+amortization touches either spread.
+
+**So "cells carry the memory" is not a property of the engine.** It is a
+reading taken at four points whose per-cell content is now measurable and
+narrow. Stated in **marginal** densities, the same estimand as the
+figures themselves: **0.00–21.08 formula-source bytes per cell and
+0.000–3.918 retained text bytes per cell**. Two shapes measured *outside*
+that box read far higher — `longform` at 433 source B/cell reads
+**4.8×** the band, `bigtext` at 2 048 text B/cell reads **20.1×**.
+Nothing here says a workbook inside the box shares the figure either; the
+box is where the evidence is, not a region the figure has been shown to
+hold over. What replaces it is
+not a law but three separately measured quotients, each valid **inside
+the sweep that produced it** and demonstrably *not* composable across
+shapes (the additive check below fails, and this row does not repair it):
+
+> Over 512–8 192-byte strings, RSS moves **4.506 B per byte of retained
+> text**. Over 32–512-term formulas, it moves **5.014 B per byte of
+> formula source** (5.008 and 5.016 on the two constituent steps).
+> Turning 40 000 ten-cell rows into 400 000 one-cell rows costs
+> **54.20 B per added row**, or 48.78 B per cell of the contrast, coupled
+> layout effects included. None of these is a per-cell cost, and their
+> sum is not a model of one.
+
+Why §9.1d saw none of this is a question about its *design*, not about
+how big the terms are. Its three fixtures carry **21.08, 15.11 and 0.00
+formula-source bytes per cell** and **0.010, 4.281 and 0.009 retained
+text bytes per cell** (measured by summing their `<f>` payloads and their
+string results). Both quantities do vary across those shapes — but in
+nine points where formula kind, formula length, formula density, cell
+type and scan workspace all move together, **no variation is attributable
+to any one of them**. Freezing the cell count and turning a single knob
+buys exactly one thing: variation that the cell count cannot explain. It
+does not name a physical term either, and this section does not convert
+those densities into attributed shares of §9.1d's figures — that would
+export a quotient across fixtures, which the additive check below shows
+is exactly what fails.
+
+#### The retained-text density reached, and whether it prices anything
+
+§9.1d recorded that its design had no power to price text, and its
+densest fixture — **text/1k, at 9.11 retained bytes per cell** — is the
+whole of the range it had to work with. The densities here:
+
+| | retained text B/cell | × §9.1d's densest |
+|---|---:|---:|
+| §9.1d's densest (text/1k) | 9.11 | 1× |
+| §9.1d's largest step (text/40k) | 4.28 | 0.47× |
+| `bigtext` fixture default | **2 048.0** | **225×** |
+| `bigtext` top sweep point | **8 192.0** | **900×** |
+
+(The right column compares two densities in the same unit; it is not a
+share of RSS, and nothing here divides text bytes by RSS bytes.)
+
+**Yes — large enough, and the demonstration needs no model and no
+attribution: at a frozen cell count, moving this density from 512 to
+8 192 B moves adjusted RSS 13.07×**, from 28 672 000 to 374 751 232. A
+quantity that moves the figure thirteenfold with the research unit held
+constant is a quantity this design can put a number on. What that number
+*is* — 4.506 B of RSS per retained byte, over this range, on this fixture
+— is the next subsection, and it stays a quotient of a controlled
+contrast rather than a share attributed to text.
+
+#### The three sweeps: one knob moved, and what moves with it
+
+Each sweep turns **one generator knob at a fixed cell count** — the
+research unit §9.1b chose — so no part of any contrast below can be a
+per-cell term. The text and AST sweeps hold the row count fixed as well;
+the row sweep is the one that moves rows, at 400 000 cells throughout.
+Each knob is covered by a unit test asserting exactly the invariance its
+measurement depends on. What the knob drags along with it is named per
+sweep below and is *not* pretended away:
+`--terms` moves source bytes and AST nodes together, and `--cols` moves
+row count, sheet XML and cell-reference widths together. A sweep isolates
+far more than nine mixed points do; it does not isolate a single physical
+cause. Gate lane only — like §9.1d's `pages` column these are
+diagnostics, and a diagnostic is measured in the lane the gate is.
+
+**Text density** — 5 000 rows, 10 000 cells, `--text-bytes`:
+
+| string bytes | retained text B | adjusted RSS | B/cell |
+|---:|---:|---:|---:|
+| 512 | 5 120 000 | 28 672 000 | 2 867.2 |
+| 2 048 | 20 480 000 | 97 894 400 | 9 789.4 |
+| 8 192 | 81 920 000 | 374 751 232 | 37 475.1 |
+
+| step | ΔRSS | Δretained text | **B of RSS per retained byte** |
+|---|---:|---:|---:|
+| 512 → 2 048 | 69 222 400 | 15 360 000 | **4.507** |
+| 2 048 → 8 192 | 276 856 832 | 61 440 000 | **4.506** |
+
+Two adjacent steps over a 16× range agree to **0.012 %** (they share
+their middle measurement, so they are a consistency check across the
+range and not two independent estimates). The cell count never moves, so
+**no part of this variation can come from a per-cell term** — which is a
+statement about what the contrast can and cannot contain, not a claim
+about what any particular allocation holds.
+
+**AST mass** — 10 000 rows, 30 000 cells, `--terms`:
+
+| terms | AST nodes/formula | formula source B | adjusted RSS | B/cell |
+|---:|---:|---:|---:|---:|
+| 32 | 127 | 2 744 736 | 22 413 312 | 747.1 |
+| 128 | 511 | 11 568 944 | 66 600 960 | 2 220.0 |
+| 512 | 2 047 | 49 545 776 | 257 081 344 | 8 569.4 |
+
+| step | ΔRSS | per AST node | **per formula-source byte** |
+|---|---:|---:|---:|
+| 32 → 128 | 44 187 648 | 11.51 | **5.008** |
+| 128 → 512 | 190 480 384 | 12.40 | **5.016** |
+
+**Source bytes are the better empirical normalizer of the two: the
+quotient holds to 0.16 % in bytes and drifts 7.8 % in nodes** — a term's
+text widens with its coefficient while its node count does not. Across
+the full 32 → 512 range the quotient is **5.014** B per source byte
+(234 668 032 / 46 801 040); 5.016 is the 128 → 512 step alone, and this
+section quotes 5.014 wherever the whole range is meant. So this row
+quotes **bytes of formula source** and never nodes. That is a
+statement about which denominator fits three collinear points, **not** a
+claim that storing the source text is what costs 5.014 B: source bytes
+and node count move together here, and nothing in this design separates
+them. An identity check that the knob did what it claims: Δ decompressed
+`sheet1.xml` over the last step is **37 976 832 B, exactly equal** to
+Δ formula-source bytes — no other XML moved.
+
+**Row density** — 400 000 cells and 200 000 formula cells in both, the
+rows and what a taller sheet drags with them differ (`--cols`):
+
+| layout | rows | adjusted RSS | B/cell |
+|---|---:|---:|---:|
+| 400 000 × 1 | 400 000 | 200 654 848 | 501.6 |
+| 40 000 × 10 | 40 000 | 181 141 504 | 452.9 |
+
+Difference **19 513 344 B over 360 000 net additional rows = 54.20 B per
+row**, and that is the whole of the claim: **the RSS cost of turning
+40 000 ten-cell rows into 400 000 one-cell rows, coupled layout effects
+included.** One coupled quantity is measurable and worth stating beside
+it rather than subtracted from it — the two are different currencies and
+subtracting one from the other would name a remainder nothing measured:
+
+| quantity | tall | wide | difference | per net row |
+|---|---:|---:|---:|---:|
+| adjusted RSS | 200 654 848 | 181 141 504 | 19 513 344 | 54.20 |
+| decompressed `sheet1.xml` | 23 300 541 | 14 840 911 | 8 459 630 | 23.50 |
+
+The XML difference is not purely `<row>` elements: a 400 000-row sheet
+also spells wider cell references than a 40 000-row one. This row does
+not split them, and it does not claim the RSS difference *is* the row
+record.
+
+**Converted into the section's own unit, the whole contrast is
+19 513 344 / 400 000 = 48.78 B per cell — 9.5 % of `sparse`'s 514.2
+B/cell marginal, 9.7 % of its 501.6 B/cell point value.** That is what
+the measurement says and where it stops. It does not apportion those
+48.78 B between rows, row markup and reference widths, and it does not
+explain `sparse`'s 2.3 % distance from f1 — two fixtures that differ in
+much more than row density. And the two
+sweeps together kill one tempting normalizer outright: **RSS per
+decompressed byte is 5.014 in the AST sweep and 2.307 here
+(19 513 344 / 8 459 630)**. A single decompressed-byte coefficient cannot
+be true of both, so decompressed byte count is not a universal
+normalizer — which is the negative result, and all of it. Ordering the
+two rates into "formula source costs more than sheet skeleton" would
+need the contributions to be additive and non-negative, and this design
+establishes neither.
+
+#### Where the growth shows up
+
+`heap` mode attributes live bytes at peak to call sites. Running it at
+both ends of a sweep and differencing names the terms, and they sum to
+the total by construction — the point is which names carry it. What a
+named site's growth *consists of* is a separate question this instrument
+does not answer.
+
+**AST sweep, 32 → 512 terms**, total live-at-peak delta **258 421 022 B**
+over 46 801 040 formula-source bytes:
+
+| Δ live bytes | per source byte | site |
+|---:|---:|---|
+| 70 236 510 | 1.501 | `resolved.zig:2043` — the stage arena |
+| 47 134 708 | 1.007 | `workbook.zig:9358` — the model's copy |
+| 46 824 340 | 1.001 | `recalc_txn.zig:519` — the serialized candidate |
+| 46 801 040 | **1.000** | `store.zig:1465` ← `recalc_run.zig:328` — the part, as opened |
+| 46 801 040 | **1.000** | `store.zig:1465` ← `recalc_run.zig:526` — the part, again, in the transaction |
+| 623 384 | 0.013 | everything else |
+| **258 421 022** | **5.522** | |
+
+**Live allocations at five named sites grow 5.522 B per added source
+byte, and two of them grow by exactly one Δ-source-bytes each** — the
+same decompressed part, held once as opened and once inside the
+transaction. Those two are an equality, not an inference. The other three
+are **not**: a site's growth can be the source text, or the AST built
+from it, or arena slack, or serialization overhead, and this instrument
+does not tell them apart. "The source text is resident five times over"
+is the reading the table *suggests* and is not what it shows.
+
+**Text sweep, 512 → 8 192 B strings**, total live-at-peak delta
+**466 134 680 B** over 76 800 000 retained bytes (**6.069** per byte),
+led by `decodeSharedStrings`/`decodeXstring` at 96 767 082 (20.8 %),
+`decode.zig:667` under `resolved.zig:1119` at 68 540 288 (14.7 %), and
+six further sites; `store.zig:1465` contributes exactly **38 400 000** —
+the input text, held once as the decompressed SST part.
+
+**The two instruments disagree and are not forced to agree.** Live-at-
+peak grows 6.069 per retained byte where RSS grows 4.506, and 5.522 per
+source byte where RSS grows 5.014. They are different quantities read at
+different instants — the profiler's peak-live instant against the
+kernel's maximum — and M10p recorded that the two decouple. The RSS
+figures are the ones this section quotes; the site table is evidence
+about *where*, not a second estimate of *how much*.
+
+#### The additive check, which does not close
+
+With three coefficients measured, the obvious next step is to predict
+every shape's marginal from them. It half works, and the half that fails
+is worth more than the half that works:
+
+**Every quantity in the table is a marginal**, computed from raw adjusted
+deltas over each shape's largest size step — including the densities.
+That distinction is not cosmetic: over the step being measured, f1's and
+crit's retained text does not grow at all (4 068 and 1 142 B at both 10k
+and 40k — they move by one byte from 1k and then stop), so their marginal
+text density is **0.000** even though their point density is not, and
+text's is 35.265 B/row rather than the 38.5 its endpoint suggests. The three
+subtracted columns are the sweep quotients **imported** into shapes that
+did not produce them — which is the extrapolation on trial. Source
+densities are measured per shape by summing `<f>` payloads.
+
+| shape | marginal B/row | − row 54.2 | − text @4.506 | − source @5.014 | residual | cells | **residual B/cell** |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| crit (§9.1d) | 1 433.1 | 54.2 | 0.0 | 0.0 | 1 378.9 | 3 | **459.6** |
+| sparse | 514.2 | 54.2 | 0.0 | 27.6 | 432.4 | 1 | **432.4** |
+| f1 (§9.1d) | 5 026.1 | 54.2 | 0.0 | 1 056.9 | 3 915.0 | 10 | **391.5** |
+| text (§9.1d) | 4 261.5 | 54.2 | 158.9 | 681.9 | 3 366.5 | 9 | **374.1** |
+| bigtext | 19 022.9 | 54.2 | 18 456.6 | 63.5 | 448.6 | 2 | **224.3** |
+| longform | 7 164.2 | 54.2 | 0.0 | 6 513.2 | 596.8 | 3 | **198.9** |
+
+Importing the three quotients takes the **multiplicative span** of the
+marginals from **20.09×** (473.5 → 9 511.5) down to **2.31×** (198.9 →
+459.6) in the residual. That is a large reduction in spread — no variance
+was decomposed and none is claimed — and it is emphatically not closure:
+**a single additive model with one per-cell constant does not reconcile
+these six shapes, and none is claimed here.** Each quotient is
+trustworthy *inside the sweep that produced it*, where the knob was
+turned and the cell count held; carrying them across shapes is an
+extrapolation this design does not license, and the table is here as the
+evidence that it fails rather than as a model that works.
+
+#### Two §9.1d readings, extended
+
+**1. The ReleaseSafe−ReleaseFast gap, now over six fixtures.** §9.1c
+named this gap "the memset tax" after measuring that mechanism directly;
+on the fixtures below the gap is measured and, as the paragraph after the
+table says, *not* attributed. §9.1d's nine cells span **−2.4 % to
++16.2 %** — it quoted the range as "0.0 % to +16.2 %" because it read its
+two negative cells as a tax of zero, which is an interpretation and not
+the signed range — and it concluded the 6.7 % figure was one fixture's
+reading. The new
+shapes hold that and add a case with an answer:
+
+| | small | middle | large |
+|---|---:|---:|---:|
+| sparse | +0.00 % (byte-identical) | +1.11 % | **+12.51 %** |
+| bigtext | −0.61 % | −0.07 % | +0.03 % |
+| longform | −2.21 % | +0.02 % | +0.01 % |
+
+`sparse/400k`'s +12.51 % is **22 315 008 B** in the gate lane
+(200 654 848 − 178 339 840, both baseline-adjusted). A `fill`-mode run
+adds one fact and does **not** locate it: **all five arenas report
+byte-identical capacity, fill and unfilled totals in both lanes**
+(capacity 70 098 912, fill 56 450 976, unfilled 13 647 936) while that
+run's own raw RSS differs by 22 396 928 — a different measurement in a
+different mode, 81 920 B from the gate-lane figure and not the same
+number.
+
+**Equal arena tallies do not put the gap outside the arenas, and an
+earlier draft of this paragraph said they did.** The tallies are logical
+byte counts; residency is pages. ReleaseSafe memsets every byte an
+arena hands out, so the *same* capacity and the *same* fill can be
+resident in one lane and untouched in the other. Both the location and
+the mechanism of the 22 315 008 B are **unresolved**: M10t's memset
+mechanism is compatible with it, the arena numbers neither confirm nor
+exclude it, and nothing here measures per-site residency.
+
+**2. The retired XML-bytes unit, on a new axis.** Across these nine
+points the RSS-to-decompressed-bytes ratio spans **5.13× (longform/40k)
+to 12.65× (sparse/10k)**, widening §9.1d's 8.14–24.32 band downward — so
+the unit remains no general normalizer. But on the text sweep, where
+cells are frozen and RSS moves 13.1×, the ratio holds at **8.70 / 8.92 /
+8.99** (3.3 % drift). **On that axis the retired unit tracks and the
+per-cell unit predicts nothing at all.** Neither is a normalizer; each is
+wrong in a different place.
+
+#### The gate, re-measured
+
+| | value |
+|---|---:|
+| f1_mix named, ReleaseSafe, ×3 byte-identical | 55 001 088 |
+| usage-invocation baseline | 1 835 008 |
+| **baseline-adjusted** | **53 166 080** |
+| ratcheted budget (§9.1c) | 53 631 549 |
+| headroom | 465 469 B (0.87 %) |
+
+**Within budget.** Against M10u's 53 116 928 this reads **+49 152 B**,
+which decomposes into two page-sized terms that sum to it: the raw peak
+is **+16 384** (55 001 088 against 54 984 704) and the usage baseline is
+**−32 768** (1 835 008 against 1 867 776), and 16 384 − (−32 768) =
+49 152. Both are whole pages of binary layout, the sensitivity M10t
+recorded. It is **not** a lower figure, so **the budget does not ratchet:
+it stays 53 631 549 B.**
+
+**A cross-build check.** The matrix was measured twice, on two
+ReleaseSafe binaries differing only in test blocks, and the gate a third
+time on a third build (a `zig fmt` whitespace change). Every one of the
+25 gate-lane raw peaks moved by **+16 384 B — exactly one page, the same
+page, in all 25** — and the usage baseline moved by the same page, so
+**all 25 adjusted figures came out identical to the byte**; the third
+build landed back on the first build's raw peak and baseline and, again,
+on 53 166 080. Two distinct (peak, baseline) pairs one page apart, one
+adjusted figure. The
+cancellation itself is arithmetic, not a discovery: equal shifts in both
+terms must cancel. The **measured** part is that a whole-binary layout
+change did land as one page in the peak *and* one page in the baseline,
+across 25 workloads spanning 6.8 MB to 383 MB. That is one controlled
+demonstration of what M10t's "quote the adjusted figure" assumes, not a
+proof that every layout change behaves this way.
+
+§9.1c's no-go stands. This row cut no bytes and spent none of the
+2 048 000 B it left.
+
+#### What this does and does not say
+
+- The three quotients — **54.20 B per net additional row (48.78 B per
+  cell of that contrast), 4.506 B per retained text byte, 5.014 B per
+  formula-source byte** — are measured with the cell count held and one
+  generator knob turned. They are the row's result, and they are
+  quotients of a controlled contrast, not prices of a physical thing:
+  what each knob drags with it is named beside it above.
+- The text and AST quotients hold across two adjacent steps to 0.012 %
+  and 0.16 %; those steps **share their middle measurement**, so they are
+  a consistency check over a 16× range rather than two independent
+  estimates. The row quotient rests on **one** contrast and has no such
+  check at all.
+- They are measured **on these fixtures, over these ranges** (512–8 192 B
+  strings; 32–512 terms; 1–10 cells per row). Nothing here says the
+  quotients hold outside them, and the additive check above shows they do
+  not compose across shapes — so no sentence in this section may add them
+  together, including the summary block above, which deliberately does
+  not.
+- **The research unit takes damage.** §9.1b made it bytes per modeled
+  cell and §9.1d reported 455–504 B/cell across three shapes; a fourth
+  shape agrees, and two more read 2 388 and 9 512. A hypothesis of
+  158.8 B/cell is a statement about a workbook's *content*, not only
+  about the engine, and any future target has to name the content it
+  binds to — as this row's fixtures do, by digest.
+- Still untested, and now the honest end of the list: sheets with real
+  cross-sheet edges at scale, workbooks whose formulas are deeply nested
+  rather than flat, styled/rich-text-heavy workbooks, and any shape at
+  all above 400 000 cells.
+
+---
+
 ## 10. Refusal & error taxonomy
 
 Plane 1: producible classic errors + preserved rich errors; **Excel error
