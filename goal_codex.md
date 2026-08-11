@@ -403,6 +403,99 @@ contract**, with many readers — `merged`, `advance`, `lowerBound`, `at`,
 `next`, the range iterators, the spill host. Largest and least de-risked;
 arena-backed, so unpriceable until §3.
 
+### §6 SHIPPED — M10s (measured 2026-08-11)
+
+**It took the narrowing branch, not the structure-of-arrays branch, and
+the row is named for what it did.** Nothing was made columnar. The
+order-is-the-contract readers above were re-checked and none of them
+needed to change, because the record stayed a record: `merged`,
+`advance`, `lowerBound`, `at`, `next`, the range iterators,
+`vtDialectOf`, `svOccupied`, `clearTailsIn`, the spill host, and M10r's
+`inPlaceTarget` — whose caller writes through the returned `Sheet.Cursor`
+— all read the same struct at a different width. The SoA half of §6 is
+untouched and still available.
+
+The M10r baseline reproduced before any edit: peak live **60 441 827**,
+eras 10 = 52 684 820 / 15 = 60 441 827 / 20 = 56 375 785 /
+21 = 56 346 078 byte-for-byte, and the fill probe's model arena at
+capacity_end 15 114 824 / fill_peak 10 122 389 / unfilled 4 992 435 —
+every figure exact. RSS read 56 688 640 ×3 against the 56 672 256 M10r
+recorded: **one 16 KiB page**, on a host whose own usage-invocation
+baseline has moved 589 824 B since that session (`/usr/bin/time -l` on
+`true` reads 1 261 568 here against M10r's 1 851 392). M10p logged this
+exact page-sensitivity. The deltas below are measured against the
+56 688 640 reproduced here, same build recipe on both sides.
+
+**The cut.** `Cell.cache` was a `graph.CacheState` — 16 bytes to carry a
+tag and an f64 the record already held. `v` and `cache` are both derived
+from the same `decode.InputCell` at the one site that builds a stored
+cell, so a `.number` cache is always the `.number` in `v`: the same
+number, not merely the same type. The tag stays at one byte because the
+tag is *not* derivable — `.absent` is what both a missing `<v>` and a
+genuine blank read as, and the seed table has to tell those apart from a
+cached value. `Cell` **80 → 64 B**, `Chunk` 5128 → 4104 B.
+
+Two writers keep the pairing and there are no others: decode sets both
+from one `InputCell`, and M10r's in-place `putComputed` re-tags as it
+overwrites `v`. `buildInput` is `cache`'s only reader and has already
+run by then, so the re-tag keeps an invariant true rather than fixing an
+observable bug.
+
+**The four quantities, predicted against measured.**
+
+| quantity | predicted | measured |
+|---|---:|---:|
+| gross fill demand removed | 1 600 512 | **1 600 512** |
+| trace-side backing | ≈0 (M10p analogy) | **−5 129 952** |
+| peak-live cap (era 15 → era 10) | 7 757 007 | 5 129 976 spent |
+| RSS effect | ≈1.5 MB | **−1 622 016** |
+
+- **Gross fill.** 1563 chunks × 1024 B, predicted **to the byte**: model
+  `fill_peak` 10 122 389 → 8 521 877 and `handed` 10 150 853 → 8 550 341,
+  both −1 600 512.
+- **Trace side.** `capacity_end` 15 114 824 → 9 984 872, showing as
+  `id21` 12 330 726 → 7 201 034 and `id20` −284.
+- **Peak live.** 60 441 827 → **55 311 851**, and the peak is **still
+  era 15**; era 10 (decode) is byte-identical at 52 684 820 and now sits
+  2 627 031 B below it. Neither park condition fired.
+- **RSS.** 56 688 640 → 55 066 624 ×3. Usage baseline 1 802 240 →
+  1 785 856, so baseline-adjusted 54 886 400 → **53 280 768 B**
+  (52.34 → **50.81 MiB**, 3.35× the 15.15 MiB ceiling, from 3.46×).
+
+**The finding: the trace over-reported by 3.2×, and RSS took the fill.**
+This is M10p's experiment run again with the same fill delta and the
+opposite trace outcome. M10p removed 1 600 512 B of fill and the era
+trace showed **nothing**; this row removes 1 600 512 B of fill — the
+same number — and the trace shows **5 129 952**, 3.2× the bytes actually
+freed. The excess is entirely unfilled capacity: the ×1.5 ladder stepped
+down a generation, and `unfilled` fell 4 992 435 → 1 462 995. The
+identity is exact:
+
+> backing 5 129 952 = fill 1 600 512 + unfilled 3 529 440
+
+A mapped page that is never written is never resident, so the 3 529 440
+cost nothing to give up and earned nothing back. Across the pair — M10p
+(trace 0, RSS −1 572 864) and M10s (trace −5 129 976, RSS −1 622 016) —
+the fill deltas are identical to the byte, the RSS deltas agree within
+3 %, and the trace deltas differ by 5.1 MB. Baseline-adjusted, RSS falls
+1 605 632 against 1 600 512 of fill: **0.32 %**.
+
+M10r established that the peak-live budget bounds RSS in neither
+direction. This row says which instrument *does* bind: **the era trace
+prices the ladder, the fill probe prices the pages, and it is the pages
+that are resident.** Price a row by the fill probe; the trace only says
+what the trace will show. That is the answer §3 was built to produce,
+and it is now three rows of evidence rather than two.
+
+**A second-order result worth keeping.** The narrower record is also
+*faster*, by more than the same-binary control's noise: the criteria
+lanes — whole-column scans, the pattern most exposed to record width —
+came in at −8.2 % (eval) and −7.9 % (save, z −22.6) against a control
+of ±3.7 %. 20 % less memory traffic per chunk scanned is the obvious
+mechanism. (The `read:` lanes also read −7.9 %, but those are confounded:
+the two legs read their corpus fixtures from different directories.
+Generated-fixture lanes are symmetric and are the ones worth quoting.)
+
 ---
 
 ## 7. Staging into a compressed override or rope
@@ -432,7 +525,9 @@ R3's arithmetic makes this short: **§3 → §2 → re-profile.**
 | 1 | ✅ **§3** instrumentation (M10q) | — | — | makes the rest priceable |
 | 2 | ✅ **§2** in-place publication (M10r) | eras 20 + 21 | **4 740 168 B** (era 15) — spent exactly | ❌ arena-backed; RSS gave 5 767 168 |
 | — | ✅ **re-profile** — done; the peak is era 15 | | | |
-| 3 | **§6** columnar model | eras 15 + 20 + 21 | reaches era 15 | ❌ |
+| 3 | ✅ **§6** model record (M10s) | eras 15 + 20 + 21 | 7 757 007 B (era 15) — 5 129 976 spent | ❌ trace over-read 3.2×; RSS gave 1 622 016 |
+| — | ✅ **re-profile** — done; the peak is **still era 15** | | | |
+| 4 | **§6b** the SoA half, still unspent | eras 15 + 20 + 21 | 2 627 031 B (era 15 → era 10) | ❌ |
 | — | **§1** summary reports | era 20 only | 1 107 923 B | ✅ but temporary |
 | — | **§7** staging rope | era 21 only | — | parked |
 | — | **§5** `input.cells` | era 20 only | ≈ 0 | parked |
