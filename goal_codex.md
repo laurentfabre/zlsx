@@ -576,15 +576,28 @@ qualitative conclusion is safe: **this programme cannot approach 32 MiB,
 and reaching further means attacking the decode era, which nothing here
 does.**
 
-The advisory floor for a general non-specializing engine was
+~~The advisory floor for a general non-specializing engine was
 **10–12 MiB**, which makes 15.15 MiB a *stretch goal* rather than an
-impossibility — but reaching it requires a decode-era change on top of
-§6, not the result-side work.
+impossibility.~~ **RETIRED at the ceiling row (2026-08-11).** A Codex
+round ruled the 10–12 MiB figure indefensible: it has no bottom-up
+representation budget behind it, and at 10–12 MiB the whole process
+would get 105–126 B/cell while the fixture's sheet XML alone is
+52.9 B/cell. It was an intuition never reconciled with a measured
+per-cell budget, and **it is not quoted to the owner.** Reviving it
+requires exact record widths and cardinalities, formula-text ownership,
+edge density, part-retention policy and a prototype trace.
 
-**Recommendation to the owner (§9.1 unchanged by this file):** a
-**64 MiB hard ceiling**, and **no numeric target yet**. Land §3, then §2,
-then re-profile. A target set before that trace exists would repeat the
-error that produced 15.15.
+**Recommendation to the owner — superseded.** This file previously
+recommended a 64 MiB hard ceiling and no numeric target until §3 and §2
+had landed. Both landed (M10q, M10r), §6 landed after them (M10s), and
+the position is now stated in **goal_formula.md §9.1a**: 3.35×,
+50.81 MiB baseline-adjusted, a six-era plateau spanning 4 359 643 B, and
+§6b the one scheduled row left at a 2 627 031 B peak-live cap. What
+survived two adversarial rounds is narrower than what this file used to
+claim: **the scheduled ladder has no demonstrated route to 3×** — not
+that the architecture forbids it. Era 0's own counterexample (an
+exact-sized `id7` puts that era at 15 042 965 B, under the ceiling) is
+the reason the stronger claim was withdrawn.
 
 ---
 
