@@ -4328,3 +4328,20 @@ test "parseRelationships: accepts Eq whitespace around = (Codex r2)" {
     try std.testing.expectEqualStrings("rId1", rels[0].id);
     try std.testing.expectEqualStrings("../drawings/drawing1.xml", rels[0].target);
 }
+
+test "xmlAttrValue: representative legal attributes across repo parsers (Codex r3)" {
+    const rel = "<Relationship xml:space=\"preserve\" Id=\"rId1\" Target=\"O'Brien=a>b\" TargetMode=\"External\"";
+    try std.testing.expectEqualStrings("rId1", xmlAttrValue(rel, "Id").?);
+    try std.testing.expectEqualStrings("O'Brien=a>b", xmlAttrValue(rel, "Target").?);
+    try std.testing.expectEqualStrings("preserve", xmlAttrValue(rel, "xml:space").?);
+    const override = "<Override ext:flag='true' PartName='/xl/a.xml' ContentType='application/xml'";
+    try std.testing.expectEqualStrings("/xl/a.xml", xmlAttrValue(override, "PartName").?);
+    const default = "<Default ns:flag=\"1\" Extension = 'xml' ContentType = \"application/xml\"";
+    try std.testing.expectEqualStrings("xml", xmlAttrValue(default, "Extension").?);
+}
+
+test "xmlStartTagEnd: a quote in following text cannot extend a valid start tag" {
+    const xml = "<Relationship Id=\"rId1\">text with a stray \" quote > after</Relationship>";
+    const end = xmlStartTagEnd(xml, 0).?;
+    try std.testing.expectEqualStrings("<Relationship Id=\"rId1\"", xml[0..end]);
+}

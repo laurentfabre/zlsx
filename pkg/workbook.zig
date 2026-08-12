@@ -4667,16 +4667,13 @@ pub const Workbook = struct {
         assert(std.mem.startsWith(u8, sheet_part_name, "xl/worksheets/"));
         assert(std.mem.endsWith(u8, sheet_part_name, ".xml"));
 
-        // Sheets that already have a drawing take the append path.
-        // Substring check is good-enough as a pre-filter: a `<drawing`
-        // token only appears at the worksheet level on a sheet that's
-        // already wired one up.
+        // Sheets that already carry a LIVE `<drawing>` element take
+        // the append path; the detection is name-boundary and
+        // comment-aware, so a commented-out drawing element neither
+        // diverts a fresh add nor gets spliced into.
         const sheet_part = (try self.store.part(sheet_part_name)) orelse
             return error.MissingSheetPart;
-        if (std.mem.indexOf(u8, sheet_part.bytes, "<drawing ") != null or
-            std.mem.indexOf(u8, sheet_part.bytes, "<drawing/>") != null or
-            std.mem.indexOf(u8, sheet_part.bytes, "<drawing>") != null)
-        {
+        if (drawing_emit.hasDrawingElement(sheet_part.bytes)) {
             return self.appendImageToDrawing(
                 sheet_part_name,
                 sheet_part.bytes,
@@ -13453,6 +13450,47 @@ test "Workbook.addImage: a Strict sheet gets a Strict fresh drawing part" {
     try std.testing.expect(std.mem.indexOf(u8, drawing_rels, drawing_emit.image_rel_type_strict) != null);
     const sheet_rels = (try wb.store.part("xl/worksheets/_rels/sheet1.xml.rels")).?.bytes;
     try std.testing.expect(std.mem.indexOf(u8, sheet_rels, drawing_emit.drawing_rel_type_strict) != null);
+}
+
+test "Workbook.addImage: a commented-out drawing element still takes the fresh path" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const allocator = std.testing.allocator;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var src_buf: [128]u8 = undefined;
+    const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-addimg-comment-{d}.xlsx", .{prng.random().int(u32)});
+    try writeMinimalSstLessXlsx(allocator, io, src_path);
+    defer std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
+
+    var wb = try Workbook.open(allocator, io, src_path);
+    defer wb.deinit();
+
+    // A stale commented-out drawing element is legal XML a rewriter
+    // may leave behind. It is NOT wiring: the add must go down the
+    // fresh path, not refuse (or splice into an unreferenced part) on
+    // the append path (Codex r3).
+    {
+        const sheet_part = (try wb.store.part("xl/worksheets/sheet1.xml")).?;
+        const patched = try std.mem.concat(allocator, u8, &.{
+            sheet_part.bytes[0..std.mem.lastIndexOf(u8, sheet_part.bytes, "</worksheet>").?],
+            "<!-- <drawing r:id=\"rId9\"/> -->",
+            "</worksheet>",
+        });
+        defer allocator.free(patched);
+        try wb.store.replacePart("xl/worksheets/sheet1.xml", patched);
+    }
+
+    try wb.addImage(0, .{ .col = 1, .row = 1 }, &tiny_png_1x1, .png);
+
+    // The fresh path ran: image + drawing part exist, and the sheet
+    // gained exactly one LIVE drawing element next to the comment.
+    try std.testing.expect((try wb.store.part("xl/media/image1.png")) != null);
+    try std.testing.expect((try wb.store.part("xl/drawings/drawing1.xml")) != null);
+    const sheet = (try wb.store.part("xl/worksheets/sheet1.xml")).?.bytes;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, sheet, "<drawing r:id="));
+    try std.testing.expect(drawing_emit.hasDrawingElement(sheet));
 }
 
 test "Workbook.addImage: rejects 0-based anchor with InvalidAnchor" {

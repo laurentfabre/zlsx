@@ -535,13 +535,15 @@ pub const WsDrDialect = enum {
     }
 };
 
-/// Index of the document's root start-tag `<`, skipping the XML
-/// declaration, processing instructions, comments, a doctype, and
-/// whitespace. Null when no element follows the prolog. Keeps a
+/// Index of the document's root start-tag `<`, skipping a UTF-8 BOM,
+/// the XML declaration, processing instructions, comments, a doctype,
+/// and whitespace. Null when no element follows the prolog. Keeps a
 /// commented-out pseudo-root (`<!-- <xdr:wsDr …> -->`) from being
 /// mistaken for the real one.
 fn rootElementStart(xml: []const u8) ?usize {
     var i: usize = 0;
+    // Some producers write parts with a UTF-8 BOM; XML permits it.
+    if (std.mem.startsWith(u8, xml, "\xEF\xBB\xBF")) i = 3;
     while (i < xml.len) {
         if (std.ascii.isWhitespace(xml[i])) {
             i += 1;
@@ -980,12 +982,46 @@ pub fn nextFreeRelId(rels: []const store_mod.Relationship) Error!u32 {
     return max_seen + 1;
 }
 
-/// Extract the `r:id` of a worksheet's `<drawing>` element, or null
-/// when the sheet has none (or carries one without an `r:id`, which
-/// is schema-invalid and unresolvable either way). Returns a slice
-/// into `sheet_xml`. Attribute reads go through the shared
+/// When index `i` falls inside an XML comment, return the index just
+/// past that comment's `-->` (or `xml.len` for an unterminated one)
+/// so scanners can resume after it; null when `i` is live markup.
+/// Comments cannot nest, so the nearest `<!--` before `i` decides.
+fn commentSkip(xml: []const u8, i: usize) ?usize {
+    const lo = std.mem.lastIndexOf(u8, xml[0..i], "<!--") orelse return null;
+    const close = std.mem.indexOfPos(u8, xml, lo + "<!--".len, "-->") orelse
+        return xml.len;
+    if (close + "-->".len <= i) return null;
+    return close + "-->".len;
+}
+
+/// Whether the sheet carries a LIVE `<drawing>` element — the
+/// append/fresh branch decision. Name-boundary aware (`<drawingHF>`
+/// never matches) and comment-aware: a commented-out
+/// `<!-- <drawing r:id="…"/> -->` must not divert an image onto the
+/// append path, which would either refuse or splice into a part the
+/// sheet never references.
+pub fn hasDrawingElement(sheet_xml: []const u8) bool {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, sheet_xml, pos, "<drawing")) |i| {
+        if (commentSkip(sheet_xml, i)) |resume_at| {
+            pos = resume_at;
+            continue;
+        }
+        const after_idx = i + "<drawing".len;
+        if (after_idx >= sheet_xml.len) return false;
+        const after = sheet_xml[after_idx];
+        if (std.ascii.isWhitespace(after) or after == '/' or after == '>') return true;
+        pos = after_idx;
+    }
+    return false;
+}
+
+/// Extract the `r:id` of a worksheet's live `<drawing>` element, or
+/// null when the sheet has none (or carries one without an `r:id`,
+/// which is schema-invalid and unresolvable either way). Returns a
+/// slice into `sheet_xml`. Attribute reads go through the shared
 /// `store.xmlAttrValue` lexer (both quote styles, `Eq` whitespace,
-/// `=`/`>`-in-value safe).
+/// `=`/`>`-in-value safe); commented-out lookalikes are skipped.
 ///
 /// The name test requires XML whitespace after `<drawing` so that
 /// `<drawingHF>` (header/footer images) and a bare `<drawing/>` never
@@ -993,6 +1029,10 @@ pub fn nextFreeRelId(rels: []const store_mod.Relationship) Error!u32 {
 pub fn extractDrawingRelId(sheet_xml: []const u8) ?[]const u8 {
     var pos: usize = 0;
     while (std.mem.indexOfPos(u8, sheet_xml, pos, "<drawing")) |i| {
+        if (commentSkip(sheet_xml, i)) |resume_at| {
+            pos = resume_at;
+            continue;
+        }
         const after_idx = i + "<drawing".len;
         if (after_idx >= sheet_xml.len) return null;
         if (!std.ascii.isWhitespace(sheet_xml[after_idx])) {
@@ -1017,6 +1057,13 @@ pub fn nextFreeCnvprId(drawing_xml: []const u8) Error!u32 {
     var max_seen: u32 = 0;
     var pos: usize = 0;
     while (std.mem.indexOfPos(u8, drawing_xml, pos, "cNvPr")) |i| {
+        // A commented-out anchor is not markup: counting its id could
+        // fake exhaustion (a commented maxInt id) or inflate the
+        // allocation.
+        if (commentSkip(drawing_xml, i)) |resume_at| {
+            pos = resume_at;
+            continue;
+        }
         pos = i + "cNvPr".len;
         // Element-name boundary on both sides: `<cNvPr` (no prefix) or
         // `:cNvPr` (prefixed) before, whitespace after (`id` is a
@@ -1577,6 +1624,13 @@ test "detectWsDrDialect: a commented pseudo-root cannot spoof the dialect" {
     const only_comment =
         "<!-- <xdr:wsDr xmlns:xdr=\"" ++ ns_xdr_strict ++ "\"> -->";
     try std.testing.expect(detectWsDrDialect(only_comment) == null);
+
+    // A UTF-8 BOM before the declaration is legal and must not turn a
+    // resolvable drawing into an UnsupportedDrawingPart refusal.
+    const bom_prefixed =
+        "\xEF\xBB\xBF<?xml version=\"1.0\"?>" ++
+        "<xdr:wsDr xmlns:xdr=\"" ++ ns_xdr_transitional ++ "\"></xdr:wsDr>";
+    try std.testing.expectEqual(@as(?WsDrDialect, .transitional), detectWsDrDialect(bom_prefixed));
 }
 
 test "detectSheetDialect: reads the worksheet root's default namespace" {
@@ -1590,6 +1644,13 @@ test "detectSheetDialect: reads the worksheet root's default namespace" {
     // mainstream producer writes.
     try std.testing.expectEqual(WsDrDialect.transitional, detectSheetDialect("<chartsheet/>"));
     try std.testing.expectEqual(WsDrDialect.transitional, detectSheetDialect(""));
+
+    // A UTF-8 BOM must not silently downgrade a Strict sheet to
+    // Transitional (Codex r3): that would re-open the mixed-
+    // conformance hole for BOM-emitting producers.
+    try std.testing.expectEqual(WsDrDialect.strict, detectSheetDialect(
+        "\xEF\xBB\xBF<?xml version=\"1.0\"?><worksheet xmlns=\"" ++ ns_main_strict ++ "\"><sheetData/></worksheet>",
+    ));
 }
 
 test "nextFreeCnvprId: a '>' inside an attribute value cannot truncate the scan" {
@@ -1599,6 +1660,46 @@ test "nextFreeCnvprId: a '>' inside an attribute value cannot truncate the scan"
     try std.testing.expectEqual(@as(u32, 8), try nextFreeCnvprId(
         "<xdr:wsDr><xdr:cNvPr name=\"a>b\" id=\"7\"/></xdr:wsDr>",
     ));
+}
+
+test "nextFreeCnvprId: a commented-out anchor is not markup" {
+    // A legal comment carrying a maxInt id must neither fake
+    // exhaustion nor inflate the allocation (Codex r3): only the live
+    // id 7 counts.
+    try std.testing.expectEqual(@as(u32, 8), try nextFreeCnvprId(
+        "<xdr:wsDr>" ++
+            "<!-- <xdr:cNvPr id=\"4294967295\" name=\"ghost\"/> -->" ++
+            "<xdr:oneCellAnchor><xdr:pic><xdr:nvPicPr>" ++
+            "<xdr:cNvPr id=\"7\" name=\"P\"/>" ++
+            "</xdr:nvPicPr></xdr:pic></xdr:oneCellAnchor>" ++
+            "</xdr:wsDr>",
+    ));
+}
+
+test "hasDrawingElement / extractDrawingRelId: commented drawing elements are not wiring" {
+    // Only a commented-out drawing: the sheet is drawing-less and must
+    // take the fresh path, not refuse on the append path (Codex r3).
+    const commented_only =
+        "<worksheet><sheetData/>" ++
+        "<!-- <drawing r:id=\"rId9\"/> -->" ++
+        "</worksheet>";
+    try std.testing.expect(!hasDrawingElement(commented_only));
+    try std.testing.expect(extractDrawingRelId(commented_only) == null);
+
+    // A live element next to a commented one: the live rid wins.
+    const both =
+        "<worksheet><sheetData/>" ++
+        "<!-- <drawing r:id=\"rId9\"/> -->" ++
+        "<drawing r:id=\"rId2\"/>" ++
+        "</worksheet>";
+    try std.testing.expect(hasDrawingElement(both));
+    try std.testing.expectEqualStrings("rId2", extractDrawingRelId(both).?);
+
+    // Boundary forms: bare and self-closing live elements are wiring
+    // (unresolvable wiring, but wiring); <drawingHF> is not.
+    try std.testing.expect(hasDrawingElement("<worksheet><drawing/></worksheet>"));
+    try std.testing.expect(hasDrawingElement("<worksheet><drawing r:id=\"rId1\"/></worksheet>"));
+    try std.testing.expect(!hasDrawingElement("<worksheet><drawingHF r:id=\"rId1\"/></worksheet>"));
 }
 
 test "appendAnchorToDrawing: splices before </xdr:wsDr>, keeping the first anchor" {
